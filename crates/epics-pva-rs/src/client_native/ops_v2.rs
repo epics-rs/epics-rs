@@ -1919,6 +1919,21 @@ fn classify_raw_monitor_frame(payload: &[u8], order: ByteOrder) -> RawMonitorFra
     RawMonitorFrameKind::Skip
 }
 
+/// Serialize a pvRequest VALUE to its on-wire `descriptor + value`
+/// form in `order`. This is the byte shape a MONITOR INIT pvRequest
+/// takes (pvxs `clientget.cpp:351-352` writes
+/// `to_wire_type_value(M, pvRequest)`), so the result is suitable both
+/// as a [`crate::codec::PvaCodec::build_monitor_init`] argument and as
+/// a stable cache key for "same pvRequest" deduplication. Two equal
+/// pvRequest values produce identical bytes for a fixed `order`.
+pub fn encode_pv_request_value(req: &PvField, order: ByteOrder) -> Vec<u8> {
+    let desc = req.descriptor();
+    let mut out = Vec::new();
+    encode_type_desc(&desc, order, &mut out);
+    encode_pv_field(req, &desc, order, &mut out);
+    out
+}
+
 /// Raw-frame monitor entry: like [`op_monitor`] but the
 /// callback receives the **raw MONITOR DATA body bytes** (the
 /// `changed | value | overrun` triplet from the wire) instead of a
@@ -1958,6 +1973,7 @@ where
             server.clone(),
             sid,
             &fields_owned,
+            None,
             pipeline_size,
             &mut callback,
             None,
@@ -1990,12 +2006,53 @@ pub fn op_monitor_raw_frames_handle<F>(
     channel: Arc<Channel>,
     fields: &[&str],
     pipeline_size: u32,
-    mut callback: F,
+    callback: F,
 ) -> SubscriptionHandle
 where
     F: FnMut(&FieldDesc, bytes::Bytes, ByteOrder) + Send + 'static,
 {
     let fields_owned: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
+    spawn_raw_frames_handle(channel, fields_owned, None, pipeline_size, callback)
+}
+
+/// Raw-frame monitor handle that forwards a caller-supplied pvRequest
+/// VALUE verbatim (re-encoded per upstream connection) instead of
+/// deriving the request from a field-name list. The PVA gateway uses
+/// this to open an upstream monitor carrying the DOWNSTREAM client's
+/// MONITOR INIT pvRequest, so the upstream server applies the same field
+/// projection / `record._options._filter` chain the client asked for —
+/// pva2pva `p2pApp/channel.cpp:157-193` forwards the serialized
+/// downstream pvRequest rather than a gateway-default request, and
+/// `moncache.cpp:34-37` caches one upstream monitor per distinct
+/// request.
+pub fn op_monitor_raw_frames_handle_with_request<F>(
+    channel: Arc<Channel>,
+    pv_request: PvField,
+    pipeline_size: u32,
+    callback: F,
+) -> SubscriptionHandle
+where
+    F: FnMut(&FieldDesc, bytes::Bytes, ByteOrder) + Send + 'static,
+{
+    spawn_raw_frames_handle(
+        channel,
+        Vec::new(),
+        Some(pv_request),
+        pipeline_size,
+        callback,
+    )
+}
+
+fn spawn_raw_frames_handle<F>(
+    channel: Arc<Channel>,
+    fields_owned: Vec<String>,
+    pv_request: Option<PvField>,
+    pipeline_size: u32,
+    mut callback: F,
+) -> SubscriptionHandle
+where
+    F: FnMut(&FieldDesc, bytes::Bytes, ByteOrder) + Send + 'static,
+{
     let state = Arc::new(SubscriptionState {
         active: parking_lot::Mutex::new(None),
         paused: std::sync::atomic::AtomicBool::new(false),
@@ -2035,6 +2092,7 @@ where
                 server.clone(),
                 sid,
                 &fields_owned,
+                pv_request.as_ref(),
                 pipeline_size,
                 &mut callback,
                 Some(state_for_task.clone()),
@@ -2068,6 +2126,7 @@ async fn run_raw_monitor_loop<F>(
     server: Arc<super::server_conn::ServerConn>,
     sid: u32,
     fields: &[String],
+    pv_request: Option<&PvField>,
     pipeline_size: u32,
     callback: &mut F,
     state: Option<Arc<SubscriptionState>>,
@@ -2087,7 +2146,19 @@ where
     // sent the pipeline size on START as a trailer the server never
     // read.
     let refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
-    let pv_req: std::borrow::Cow<'_, [u8]> = if pipeline_size > 0 {
+    let pv_req: std::borrow::Cow<'_, [u8]> = if let Some(req) = pv_request {
+        // A caller-supplied pvRequest (e.g. the PVA gateway forwarding a
+        // downstream's MONITOR INIT request so the upstream applies the
+        // same field projection / `_filter` chain) is encoded verbatim
+        // in THIS connection's byte order. Re-encoding per reconnect is
+        // why it is carried as a decoded value, not pre-serialized bytes
+        // (a reconnect may land on a peer of the opposite endianness).
+        // The pipeline INIT bit / nack below stays driven by
+        // `pipeline_size` — the gateway's own upstream credit window for
+        // its `Pauser`-based backpressure — independent of the
+        // downstream's options that the forwarded request also carries.
+        std::borrow::Cow::Owned(encode_pv_request_value(req, order))
+    } else if pipeline_size > 0 {
         // Empty field list → empty `field {}` sub-structure, which
         // `request_to_mask` reads as "select the whole structure"
         // (pv_request.rs `request_field.is_empty()`). Forcing a

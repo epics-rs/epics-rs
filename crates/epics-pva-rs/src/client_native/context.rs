@@ -29,8 +29,9 @@ use crate::pvdata::{FieldDesc, PvField};
 use super::channel::{Channel, ConnectionPool};
 use super::ops_v2::{
     DEFAULT_PIPELINE_SIZE, MonitorEvent, MonitorEventMask, SubscriptionHandle, op_get, op_monitor,
-    op_monitor_events, op_monitor_handle, op_monitor_raw_frames_handle, op_process,
-    op_process_with_request, op_put, op_put_get, op_rpc,
+    op_monitor_events, op_monitor_handle, op_monitor_raw_frames_handle,
+    op_monitor_raw_frames_handle_with_request, op_process, op_process_with_request, op_put,
+    op_put_get, op_rpc,
 };
 use super::search_engine::SearchEngine;
 
@@ -1202,6 +1203,35 @@ impl PvaClient {
         Ok(op_monitor_raw_frames_handle(
             ch,
             &[],
+            self.inner.pipeline_size,
+            callback,
+        ))
+    }
+
+    /// Like [`Self::pvmonitor_raw_frames_handle`] but opens the upstream
+    /// monitor with a caller-supplied pvRequest VALUE rather than the
+    /// default all-fields request. The PVA gateway forwards a downstream
+    /// client's decoded MONITOR INIT pvRequest here so the upstream
+    /// server applies the same field projection / `record._options.
+    /// _filter` chain the client requested. The request value is
+    /// re-encoded in the upstream connection's byte order on every
+    /// (re)connect (so a reconnect to an opposite-endian peer stays
+    /// correct). pvxs `p2pApp/channel.cpp:157-193` forwards the
+    /// serialized downstream pvRequest; `moncache.cpp:34-37` caches one
+    /// upstream monitor per distinct request.
+    pub async fn pvmonitor_raw_frames_handle_with_request<F>(
+        &self,
+        pv_name: &str,
+        pv_request: crate::pvdata::PvField,
+        callback: F,
+    ) -> PvaResult<SubscriptionHandle>
+    where
+        F: FnMut(&FieldDesc, bytes::Bytes, crate::proto::ByteOrder) + Send + 'static,
+    {
+        let ch = self.channel(pv_name).await?;
+        Ok(op_monitor_raw_frames_handle_with_request(
+            ch,
+            pv_request,
             self.inner.pipeline_size,
             callback,
         ))

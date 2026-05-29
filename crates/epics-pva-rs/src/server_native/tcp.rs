@@ -4564,7 +4564,27 @@ async fn handle_op(
             let chain_json = req_value.as_ref().and_then(monitor_filter_chain_json);
             match chain_json {
                 Some(j) => {
-                    Arc::new(epics_base_rs::server::database::filters::parse_filter_chain(&j))
+                    // A `record._options._filter` that is syntactically
+                    // present but unparseable rejects the MONITOR INIT,
+                    // mirroring EPICS `dbChannelCreate()`
+                    // (`dbChannel.c:512-529`) and pvxs filter setup.
+                    // Fail-open to an unfiltered stream would silently
+                    // drop the requested throttling/slicing semantics.
+                    match epics_base_rs::server::database::filters::try_parse_filter_chain(&j) {
+                        Ok(chain) => Arc::new(chain),
+                        Err(e) => {
+                            send_chan_op_error(
+                                &chan_tx,
+                                kind,
+                                ioid,
+                                subcmd,
+                                &format!("invalid channel filter: {e}"),
+                                order,
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                    }
                 }
                 None => Arc::new(epics_base_rs::server::database::filters::FilterChain::new()),
             }

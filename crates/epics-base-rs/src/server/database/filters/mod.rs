@@ -39,7 +39,10 @@ pub mod ts;
 pub use arr::{ArrayFilter, ArrayFilterConfig};
 pub use dbnd::{DeadbandFilter, DeadbandMode};
 pub use decimate::DecimateFilter;
-pub use parser::{ParsedChannelName, parse_filter_chain, split_channel_name};
+pub use parser::{
+    FilterParseError, ParsedChannelName, parse_filter_chain, split_channel_name,
+    try_parse_filter_chain,
+};
 pub use sync::{DbState, DbStateRegistry, SyncFilter, SyncMode, db_state_registry};
 pub use ts::TimestampFilter;
 

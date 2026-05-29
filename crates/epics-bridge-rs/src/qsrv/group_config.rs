@@ -172,7 +172,16 @@ pub fn parse_group_config(json: &str) -> BridgeResult<Vec<GroupPvDef>> {
 
     let mut groups = Vec::new();
     for (name, raw) in root {
-        groups.push(raw_to_group_def(name, raw)?);
+        // pvxs validates groups one by one and catches per-group
+        // exceptions, printing "ignoring invalid group" while preserving
+        // sibling groups (ioc/groupconfigprocessor.cpp:128-163, :170-201).
+        // A semantic error in one group must not hide valid siblings in
+        // the same file; the JSON *syntax* error above still rejects the
+        // whole file (matching the strict-parse boundary).
+        match raw_to_group_def(name.clone(), raw) {
+            Ok(def) => groups.push(def),
+            Err(e) => tracing::warn!(group = %name, error = %e, "ignoring invalid QSRV group"),
+        }
     }
     groups.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(groups)
@@ -199,7 +208,16 @@ pub fn parse_info_group(record_name: &str, json: &str) -> BridgeResult<Vec<Group
 
     let mut groups = Vec::new();
     for (name, raw) in root {
-        let mut def = raw_to_group_def(name, raw)?;
+        // Per-group recovery, as in `parse_group_config` — one invalid
+        // group in an info(Q:group) body must not drop its siblings
+        // (pvxs groupconfigprocessor.cpp:128-163).
+        let mut def = match raw_to_group_def(name.clone(), raw) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(group = %name, error = %e, "ignoring invalid QSRV info(Q:group) group");
+                continue;
+            }
+        };
         // Apply channel prefix: bare field names get record_name prefix
         for member in &mut def.members {
             // Structure/Const have empty channels — skip prefix.
@@ -376,9 +394,18 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
         Some("structure") => FieldMapping::Structure,
         Some("const") => FieldMapping::Const,
         Some(other) => {
-            return Err(BridgeError::GroupConfigError(format!(
-                "unknown +type '{other}' for field '{field_name}'"
-            )));
+            // pvxs logs an unknown mapping +type and keeps the default
+            // (scalar) mapping rather than rejecting the config
+            // (ioc/groupprocessorcontext.cpp:43-63; the default mapping
+            // type is Scalar, fieldconfig.h:24-37). Warn and fall back to
+            // Scalar — the normal +channel validation below then decides
+            // whether the member (and so the group) is usable.
+            tracing::warn!(
+                field = field_name,
+                bad_type = other,
+                "unknown QSRV group member +type; defaulting to scalar"
+            );
+            FieldMapping::Scalar
         }
     };
 
@@ -622,6 +649,42 @@ mod tests {
         } else {
             panic!("expected TriggerDef::Fields");
         }
+    }
+
+    /// A semantically invalid group (here: a plain member with no
+    /// +channel) is skipped with a warning while valid sibling groups in
+    /// the same JSON survive — pvxs groupconfigprocessor.cpp:128-163.
+    #[test]
+    fn parse_group_config_skips_invalid_group_keeps_siblings() {
+        let json = r#"{
+            "BADGRP": { "v": { "+type": "plain" } },
+            "OKGRP":  { "v": { "+channel": "X.VAL", "+type": "plain" } }
+        }"#;
+        let defs = parse_group_config(json).expect("syntactically valid JSON must parse");
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["OKGRP"],
+            "the valid sibling must survive a bad group"
+        );
+    }
+
+    /// An unknown member +type warns and falls back to the default
+    /// scalar mapping rather than aborting the load — pvxs
+    /// groupprocessorcontext.cpp:43-63.
+    #[test]
+    fn parse_member_unknown_type_defaults_to_scalar() {
+        let json = r#"{ "G": { "v": { "+channel": "X.VAL", "+type": "bogus" } } }"#;
+        let defs = parse_group_config(json).expect("unknown +type must not abort the load");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].members[0].mapping, FieldMapping::Scalar);
+    }
+
+    /// A syntactically malformed JSON body still rejects the whole file
+    /// (the strict-parse boundary is preserved).
+    #[test]
+    fn parse_group_config_rejects_malformed_json() {
+        assert!(parse_group_config("{ not json").is_err());
     }
 
     #[test]
@@ -869,6 +932,9 @@ mod tests {
 
     #[test]
     fn parse_error_missing_channel() {
+        // A scalar/plain member with no +channel is invalid: the group
+        // is skipped (with a warning), not an all-or-nothing file abort
+        // — pvxs groupconfigprocessor.cpp:128-163.
         let json = r#"{
             "GRP:bad": {
                 "val": {
@@ -877,7 +943,8 @@ mod tests {
             }
         }"#;
 
-        assert!(parse_group_config(json).is_err());
+        let defs = parse_group_config(json).expect("file parses; invalid group skipped");
+        assert!(defs.is_empty(), "the only (invalid) group must be skipped");
     }
 
     #[test]
@@ -1337,7 +1404,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_const_missing_value_is_error() {
+    fn parse_const_missing_value_is_skipped() {
+        // A const member without +const/+value is invalid: the group is
+        // skipped rather than aborting the load.
         let json = r#"{
             "GRP:bad": {
                 "label": {
@@ -1346,10 +1415,11 @@ mod tests {
             }
         }"#;
 
-        let result = parse_group_config(json);
-        assert!(result.is_err());
-        let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("+value"), "expected error about +value: {err}");
+        let defs = parse_group_config(json).expect("file parses; invalid group skipped");
+        assert!(
+            defs.is_empty(),
+            "const member without +const/+value → group skipped"
+        );
     }
 
     #[test]

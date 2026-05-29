@@ -1416,30 +1416,52 @@ impl Default for MonitorEventMask {
     }
 }
 
-/// Per-subscription metrics. Mirrors pvxs `SubscriptionStat`
-/// (client.h:166). Values are observable via [`SubscriptionHandle::stats`]
-/// — queue counters reflect the local async pipeline; client-squash
-/// is the count of `MonitorOp::Data` frames the loop coalesced
-/// because the consumer was slower than the network feed.
+/// Per-subscription metrics, mirroring pvxs `SubscriptionStat`
+/// (client.h:165-178).
+///
+/// pvxs's queue fields describe a client-side monitor queue the consumer
+/// pops from (`Subscription::pop()`). This client instead delivers every
+/// update synchronously through the user callback inside the monitor loop,
+/// so there is no pop()-able queue — the pvxs queue fields (`n_queue`,
+/// `n_cli_squash`, `max_queue`) are therefore 0 *by construction*, not
+/// merely unimplemented. The remaining counters are Rust-specific delivery
+/// / ACK telemetry pvxs does not define and are named distinctly so they
+/// are not mistaken for the pvxs queue surface — in particular
+/// `max_events_per_ack` is the ACK-window high-water mark that the previous
+/// `max_queue` field conflated with pvxs `maxQueue`.
 #[derive(Debug, Clone, Default)]
 pub struct SubscriptionStat {
+    // ── pvxs `SubscriptionStat` surface ──
+    /// pvxs `nQueue`: updates currently queued awaiting consumer pop().
+    /// Always 0 — this client has no pop()-able queue (callback delivery).
+    pub n_queue: u32,
+    /// pvxs `nSrvSquash`: count of value updates where the server reported
+    /// at least one update dropped/squashed (overrun bitset non-empty).
+    /// Populated by the decoded monitor loop. The RAW monitor loop forwards
+    /// bytes without decoding the trailing overrun bitset, so raw-handle
+    /// stats leave this 0 (the raw stream still carries the overrun bits to
+    /// the consumer; see `op_monitor_raw*`).
+    pub n_srv_squash: u64,
+    /// pvxs `nCliSquash`: updates dropped due to client queue overflow.
+    /// Always 0 — there is no client queue to overflow.
+    pub n_cli_squash: u64,
+    /// pvxs `maxQueue`: max client queue depth observed. Always 0 (no
+    /// client queue). For the ACK-window high-water mark see
+    /// `max_events_per_ack`.
+    pub max_queue: u32,
+    /// pvxs `limitQueue`: the configured pipeline/queue limit
+    /// (`pipeline_size`). Preserved across `stats(reset)`.
+    pub limit_queue: u32,
+
+    // ── Rust-specific delivery / ACK telemetry (not in pvxs) ──
     /// Total updates delivered to the user callback.
     pub n_delivered: u64,
-    /// Total events dropped due to consumer back-pressure (when the
-    /// callback can't keep up — currently always zero since the user
-    /// callback is synchronous and serial; reserved for future async
-    /// flow control).
-    pub n_cli_squash: u64,
-    /// Number of squash-on-server events reported by the wire (CMD
-    /// MONITOR overrun bitset). pvxs surfaces the same field.
-    pub n_srv_squash: u64,
     /// Number of MONITOR_ACK frames sent (pipelined window cycles).
     pub n_acks: u64,
-    /// Highest events-since-ack value the loop saw. With a healthy
-    /// `pipeline_size` this stays close to `pipeline_size`.
-    pub max_queue: u32,
-    /// Configured `pipeline_size` (call it `limitQueue` in pvxs).
-    pub limit_queue: u32,
+    /// Highest `events_since_ack` value the loop observed between ACKs.
+    /// This is ACK-window telemetry, NOT pvxs `maxQueue`; with a healthy
+    /// `pipeline_size` it stays close to `pipeline_size`.
+    pub max_events_per_ack: u32,
 }
 
 /// Internal shared state — the monitor loop publishes to this on every
@@ -2083,8 +2105,8 @@ where
             // downstream consumer; the typed `run_monitor_loop` path
             // populates `n_srv_squash`. Adding a full value decode purely
             // to read the overrun would defeat this path's purpose.
-            if events_since_ack > st.max_queue {
-                st.max_queue = events_since_ack;
+            if events_since_ack > st.max_events_per_ack {
+                st.max_events_per_ack = events_since_ack;
             }
         }
         if pipeline_size > 0 && events_since_ack >= ack_threshold(pipeline_size) {
@@ -2528,8 +2550,8 @@ where
                     if srv_squash {
                         st.n_srv_squash += 1;
                     }
-                    if events_since_ack > st.max_queue {
-                        st.max_queue = events_since_ack;
+                    if events_since_ack > st.max_events_per_ack {
+                        st.max_events_per_ack = events_since_ack;
                     }
                 }
                 // (d was destructured above when computing `value`.)

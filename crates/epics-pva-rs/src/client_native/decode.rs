@@ -1189,7 +1189,7 @@ mod tests {
         // The monitor loop increments these.
         stat.n_srv_squash = 3;
         stat.n_delivered = 10;
-        stat.max_queue = 8;
+        stat.max_events_per_ack = 8;
         // Mirror the reset arm of SubscriptionHandle::stats(true).
         let reset = SubscriptionStat {
             limit_queue: stat.limit_queue,
@@ -1197,8 +1197,12 @@ mod tests {
         };
         assert_eq!(reset.n_srv_squash, 0);
         assert_eq!(reset.n_delivered, 0);
-        assert_eq!(reset.max_queue, 0);
+        assert_eq!(reset.max_events_per_ack, 0);
         assert_eq!(reset.limit_queue, 16, "configured queue limit preserved");
+        // pvxs queue fields are 0 by construction (no pop()-able queue).
+        assert_eq!(reset.n_queue, 0);
+        assert_eq!(reset.max_queue, 0);
+        assert_eq!(reset.n_cli_squash, 0);
     }
 
     /// A frame with no type-cache markers — i.e. the introspection

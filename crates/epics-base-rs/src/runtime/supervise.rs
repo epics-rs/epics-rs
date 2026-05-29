@@ -25,7 +25,13 @@ use std::time::{Duration, Instant};
 /// pausing `delay` between consecutive restarts.
 #[derive(Debug, Clone, Copy)]
 pub struct RestartPolicy {
-    /// Maximum restart attempts within `window`.
+    /// Maximum number of launch attempts within `window`, counted at the
+    /// launch boundary. C ca-gateway's master records each child's start
+    /// time and refuses the next fork once `NRESTARTS` starts already sit
+    /// inside `RESTART_INTERVAL` (`gateway.cc:1506-1539`), so at most this
+    /// many launches occur per window and the next is refused. The initial
+    /// launch consumes the first slot — this is the total launch count,
+    /// not "restarts after the first".
     pub max_restarts: u32,
     /// Sliding window over which `max_restarts` is counted.
     pub window: Duration,
@@ -126,6 +132,12 @@ impl<E: std::fmt::Display + std::fmt::Debug> std::error::Error for SuperviseErro
 /// `Err(SuperviseError::TooManyRestarts)` once the policy refuses
 /// another attempt.
 ///
+/// The restart-window admission check runs at the **launch boundary** —
+/// before each launch, not after a launch has failed — so a fast
+/// crash-loop performs at most `policy.max_restarts` launches per window,
+/// matching C ca-gateway's master, which checks `RESTART_INTERVAL` before
+/// forking the next child (`gateway.cc:1506-1539`).
+///
 /// ```ignore
 /// use epics_base_rs::runtime::supervise::{supervise, RestartPolicy};
 ///
@@ -144,40 +156,67 @@ where
 {
     let mut tracker = RestartTracker::new();
     let mut attempt = 0u32;
+    let mut last_error: Option<E> = None;
 
     loop {
-        attempt += 1;
-        tracing::info!(attempt, "supervise: starting attempt");
-        let result = task_factory().await;
+        // Admission at the LAUNCH boundary. C ca-gateway's master records
+        // each child's start time and, once the window already holds
+        // `NRESTARTS` starts, prints "too many [N+1] restarts" and exits
+        // *before* forking the next child (`gateway.cc:1506-1539`).
+        // `try_record` admits iff fewer than `max_restarts` starts sit
+        // inside `window`, recording this start on success — so the cap
+        // counts launches and a fast crash-loop performs at most
+        // `max_restarts` launches per window. (The pre-fix loop recorded
+        // on failure *after* the launch, comparing the cap against
+        // completed failures, which let one extra launch through.)
+        if let Err((max, win)) = tracker.try_record(&policy) {
+            match last_error {
+                Some(last_error) => {
+                    tracing::error!(max, window_secs = win, "supervise: too many restarts");
+                    // Carry the final inner error so the caller sees the
+                    // root cause of the abandoned supervision, not the cap.
+                    return Err(SuperviseError::TooManyRestarts {
+                        max_restarts: max,
+                        window_secs: win,
+                        last_error,
+                    });
+                }
+                // `max_restarts == 0` refuses even the first start (no C
+                // analog — C's NRESTARTS is a fixed `10`). The supervisor's
+                // contract is to run the task at least once, so launch this
+                // one time rather than return a TooManyRestarts with no
+                // root-cause error to report.
+                None => tracing::warn!(
+                    max,
+                    "supervise: max_restarts=0 is degenerate; running the task once"
+                ),
+            }
+        }
 
-        let last_error = match result {
+        attempt += 1;
+        if attempt > 1 {
+            // Delay between consecutive launches (never before the first),
+            // applied after passing the admission gate — C sleeps
+            // RESTART_DELAY right before each refork (`gateway.cc:1532-1539`).
+            tracing::info!(
+                attempt,
+                delay_ms = policy.delay.as_millis() as u64,
+                "supervise: scheduling restart"
+            );
+            tokio::time::sleep(policy.delay).await;
+        }
+
+        tracing::info!(attempt, "supervise: starting attempt");
+        match task_factory().await {
             Ok(()) => {
                 tracing::info!(attempt, "supervise: task exited normally");
                 return Ok(());
             }
             Err(e) => {
                 tracing::warn!(attempt, error = ?e, "supervise: task failed");
-                e
+                last_error = Some(e);
             }
-        };
-
-        if let Err((max, win)) = tracker.try_record(&policy) {
-            tracing::error!(max, window_secs = win, "supervise: too many restarts");
-            // Carry the final inner error so the caller sees the root
-            // cause of the abandoned supervision, not just the cap.
-            return Err(SuperviseError::TooManyRestarts {
-                max_restarts: max,
-                window_secs: win,
-                last_error,
-            });
         }
-
-        tracing::info!(
-            attempt,
-            delay_ms = policy.delay.as_millis() as u64,
-            "supervise: scheduling restart"
-        );
-        tokio::time::sleep(policy.delay).await;
     }
 }
 
@@ -275,5 +314,71 @@ mod tests {
             }
             other => panic!("expected TooManyRestarts, got {other:?}"),
         }
+    }
+
+    /// C parity: a fast crash-loop performs at most `max_restarts`
+    /// launches per window before the supervisor gives up — the admission
+    /// check sits at the launch boundary, not after a failed launch. The
+    /// pre-fix loop recorded on failure and admitted `max_restarts + 1`
+    /// launches (one extra full gateway start vs C NRESTARTS).
+    #[tokio::test]
+    async fn supervise_launch_count_equals_max_restarts() {
+        for max in [1u32, 2, 3, 10] {
+            let launches = Arc::new(AtomicU32::new(0));
+            let policy = RestartPolicy {
+                max_restarts: max,
+                window: Duration::from_secs(60),
+                delay: Duration::ZERO,
+            };
+            let launches_clone = launches.clone();
+            let result: Result<(), SuperviseError<&str>> = supervise(policy, || {
+                let c = launches_clone.clone();
+                async move {
+                    c.fetch_add(1, Ordering::Relaxed);
+                    Err::<(), &str>("always fails")
+                }
+            })
+            .await;
+            assert!(
+                matches!(result, Err(SuperviseError::TooManyRestarts { .. })),
+                "max_restarts={max} must end in TooManyRestarts"
+            );
+            assert_eq!(
+                launches.load(Ordering::Relaxed),
+                max,
+                "exactly max_restarts={max} launches must occur, not {} (the pre-fix off-by-one)",
+                max + 1
+            );
+        }
+    }
+
+    /// `max_restarts == 0` has no C analog (NRESTARTS is a fixed 10). The
+    /// supervisor's contract is to run the task at least once, so it must
+    /// launch exactly once and then honor the cap — never panic on the
+    /// missing root-cause error.
+    #[tokio::test]
+    async fn supervise_zero_max_runs_task_once() {
+        let launches = Arc::new(AtomicU32::new(0));
+        let policy = RestartPolicy {
+            max_restarts: 0,
+            window: Duration::from_secs(60),
+            delay: Duration::ZERO,
+        };
+        let launches_clone = launches.clone();
+        let result: Result<(), SuperviseError<&str>> = supervise(policy, || {
+            let c = launches_clone.clone();
+            async move {
+                c.fetch_add(1, Ordering::Relaxed);
+                Err::<(), &str>("boom")
+            }
+        })
+        .await;
+        match result {
+            Err(SuperviseError::TooManyRestarts { last_error, .. }) => {
+                assert_eq!(last_error, "boom");
+            }
+            other => panic!("expected TooManyRestarts, got {other:?}"),
+        }
+        assert_eq!(launches.load(Ordering::Relaxed), 1);
     }
 }

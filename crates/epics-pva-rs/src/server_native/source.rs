@@ -336,6 +336,31 @@ pub trait ChannelSource: Send + Sync + 'static {
         self.get_introspection(name)
     }
 
+    /// Resolve the source that OWNS `name` for this peer, to be bound
+    /// into the channel at CREATE_CHANNEL so every later operation
+    /// dispatches to the same source that accepted the channel — never
+    /// re-resolving the registry per operation.
+    ///
+    /// pvxs iterates server sources at CREATE_CHANNEL and stops at the
+    /// first that accepts, then installs THAT source's `onOp`/`onRPC`/
+    /// `onSubscribe` callbacks into the `ServerChan`
+    /// (`serverchan.cpp:295-322`, `serverchan.cpp:70-112`); a later
+    /// `Server::removeSource` does not rewrite callbacks already
+    /// installed on existing channels (`server.cpp:100-112`). A
+    /// terminal/leaf source IS its own owner, so the default returns
+    /// `None` and the caller binds the top-level source itself.
+    /// [`CompositeSource`](crate::server_native::CompositeSource)
+    /// overrides this to return the matched inner source (descending
+    /// through nested composites to the leaf), so a live channel never
+    /// silently changes owner when the registry is mutated.
+    fn resolve_owner(
+        &self,
+        _name: &str,
+        _ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Option<DynSource>> + Send {
+        async { None }
+    }
+
     /// Fetch the current value of a PV.
     fn get_value(&self, name: &str) -> impl std::future::Future<Output = Option<PvField>> + Send;
 
@@ -925,6 +950,12 @@ pub trait ChannelSourceObj: Send + Sync {
         name: &'a str,
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<FieldDesc>> + Send + 'a>>;
+    /// dyn forwarder for CREATE_CHANNEL owner resolution.
+    fn resolve_owner<'a>(
+        &'a self,
+        name: &'a str,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<DynSource>> + Send + 'a>>;
     fn get_value<'a>(
         &'a self,
         name: &'a str,
@@ -1102,6 +1133,13 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         Box::pin(<Self as ChannelSource>::get_introspection_checked(
             self, name, ctx,
         ))
+    }
+    fn resolve_owner<'a>(
+        &'a self,
+        name: &'a str,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<DynSource>> + Send + 'a>> {
+        Box::pin(<Self as ChannelSource>::resolve_owner(self, name, ctx))
     }
     fn get_value<'a>(
         &'a self,

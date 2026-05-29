@@ -756,15 +756,40 @@ fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
     Some(MonitorPipelineRequest::Options(opts))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[allow(dead_code)]
 struct ChannelState {
     name: String,
     cid: u32,
     sid: u32,
     introspection: Option<FieldDesc>,
+    /// Source bound at CREATE_CHANNEL that owns this channel. Every
+    /// operation (GET/PUT/MONITOR/RPC/PROCESS/GET_FIELD) dispatches
+    /// through this owner instead of re-resolving the top-level source
+    /// registry per operation, so a live channel cannot silently change
+    /// owner when a source is added or removed. pvxs binds the accepting
+    /// source's callbacks into the `ServerChan` at CREATE_CHANNEL
+    /// (`serverchan.cpp:70-112`); a later `removeSource` does not rewrite
+    /// them (`server.cpp:100-112`).
+    source: DynSource,
     /// ioid → (introspection negotiated for this op, kind)
     ops: HashMap<u32, OpState>,
+}
+
+// `source` is a `dyn ChannelSourceObj` trait object with no `Debug`
+// bound, so `ChannelState` cannot derive `Debug`; print the bound
+// owner as an opaque marker instead.
+impl std::fmt::Debug for ChannelState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChannelState")
+            .field("name", &self.name)
+            .field("cid", &self.cid)
+            .field("sid", &self.sid)
+            .field("introspection", &self.introspection)
+            .field("source", &"<bound owner>")
+            .field("ops", &self.ops)
+            .finish()
+    }
 }
 
 /// Shared abort guard: when the last clone is dropped (HashMap removal,
@@ -1969,9 +1994,20 @@ struct CreateChannelCompletion {
     cid: u32,
     sid: u32,
     name: String,
+    /// `Some` → PV was found; carries the negotiated descriptor and the
+    /// owner source bound into the channel. `None` → not found; emit an
+    /// error response and insert no channel. Folding "found" and "owner"
+    /// into one optional makes the invariant "a found channel always has
+    /// a bound owner" hold by construction — there is no `found == true`
+    /// state without an owner to bind.
+    resolved: Option<ResolvedChannel>,
+}
+
+/// Successful CREATE_CHANNEL resolution: the descriptor negotiated for
+/// the channel plus the owner source that accepted it.
+struct ResolvedChannel {
     intro: Option<FieldDesc>,
-    /// false → PV was not found; emit error response, no channel inserted.
-    found: bool,
+    owner: DynSource,
 }
 /// Sender half of the CREATE_CHANNEL completion channel.
 type CcTx = mpsc::Sender<CreateChannelCompletion>;
@@ -2195,14 +2231,15 @@ async fn handle_connection_io(
                     pending_channel_spawns = pending_channel_spawns.saturating_sub(1);
                     let mut payload = Vec::new();
                     payload.put_u32(cc.cid, order);
-                    if cc.found {
+                    if let Some(resolved) = cc.resolved {
                         payload.put_u32(cc.sid, order);
                         Status::ok().write_into(order, &mut payload);
                         channels.insert(cc.sid, ChannelState {
                             name: cc.name,
                             cid: cc.cid,
                             sid: cc.sid,
-                            introspection: cc.intro,
+                            introspection: resolved.intro,
+                            source: resolved.owner,
                             ops: HashMap::new(),
                         });
                         peer_entry.channel_added();
@@ -2509,7 +2546,6 @@ async fn handle_connection_io(
             Some(Command::Get) => {
                 peer_entry.op_init();
                 handle_op(
-                    &source,
                     &frame,
                     &tx,
                     &mut channels,
@@ -2527,7 +2563,6 @@ async fn handle_connection_io(
             Some(Command::Put) => {
                 peer_entry.op_init();
                 handle_op(
-                    &source,
                     &frame,
                     &tx,
                     &mut channels,
@@ -2545,7 +2580,6 @@ async fn handle_connection_io(
             Some(Command::Monitor) => {
                 peer_entry.op_init();
                 handle_op(
-                    &source,
                     &frame,
                     &tx,
                     &mut channels,
@@ -2563,7 +2597,6 @@ async fn handle_connection_io(
             Some(Command::Rpc) => {
                 peer_entry.op_init();
                 handle_op(
-                    &source,
                     &frame,
                     &tx,
                     &mut channels,
@@ -2580,7 +2613,7 @@ async fn handle_connection_io(
             }
             Some(Command::GetField) => {
                 if let Some(guard) =
-                    handle_get_field(&source, &frame, &tx, &channels, order, peer, &cred).await?
+                    handle_get_field(&frame, &tx, &channels, order, peer, &cred).await?
                 {
                     // GET_FIELD is a one-shot op with no IOID-keyed slot to
                     // be removed from on completion, so its guard cannot be
@@ -2623,7 +2656,6 @@ async fn handle_connection_io(
                 // a PUT_GET-capable client gets a real round trip.
                 peer_entry.op_init();
                 handle_put_get(
-                    &source,
                     &frame,
                     &tx,
                     &mut channels,
@@ -2643,7 +2675,6 @@ async fn handle_connection_io(
                 // `process_checked` (WRITE-class ACF gate).
                 peer_entry.op_init();
                 handle_process(
-                    &source,
                     &frame,
                     &tx,
                     &mut channels,
@@ -2850,7 +2881,6 @@ fn non_monitor_op_state(intro: FieldDesc, kind: OpKind, mask: BitSet) -> OpState
 /// properly per the wire spec so a PUT_GET-capable client works.
 #[allow(clippy::too_many_arguments)]
 async fn handle_put_get(
-    source: &DynSource,
     frame: &Frame,
     tx: &SrvTx,
     channels: &mut HashMap<u32, ChannelState>,
@@ -2892,6 +2922,11 @@ async fn handle_put_get(
             return Ok(());
         }
     };
+
+    // Dispatch to the CREATE_CHANNEL-bound owner, not the registry
+    // (pvxs serverchan.cpp:70-112 / server.cpp:100-112; see `handle_op`).
+    let source = ch.source.clone();
+    let source = &source;
 
     if subcmd & QosFlags::INIT != 0 {
         // duplicate INIT on a live IOID is connection-fatal
@@ -3186,7 +3221,6 @@ async fn handle_put_get(
 ///   destruction is `CMD_DESTROY_REQUEST`, handled elsewhere.
 #[allow(clippy::too_many_arguments)]
 async fn handle_process(
-    source: &DynSource,
     frame: &Frame,
     tx: &SrvTx,
     channels: &mut HashMap<u32, ChannelState>,
@@ -3227,6 +3261,11 @@ async fn handle_process(
             return Ok(());
         }
     };
+
+    // Dispatch to the CREATE_CHANNEL-bound owner, not the registry
+    // (pvxs serverchan.cpp:70-112 / server.cpp:100-112; see `handle_op`).
+    let source = ch.source.clone();
+    let source = &source;
 
     if subcmd & QosFlags::INIT != 0 {
         // duplicate INIT on a live IOID is connection-fatal
@@ -3604,9 +3643,20 @@ async fn handle_create_channel(
         };
         tokio::spawn(async move {
             for (cid, sid, nm) in batch {
-                let found = src.has_pv_checked(&nm, conn_ctx.clone()).await;
-                let intro = if found {
-                    src.get_introspection_checked(&nm, conn_ctx.clone()).await
+                let resolved = if src.has_pv_checked(&nm, conn_ctx.clone()).await {
+                    // Bind the owner that accepted this channel so every
+                    // later op dispatches there, never re-resolving the
+                    // registry (pvxs serverchan.cpp:70-112). A leaf source
+                    // is its own owner (`resolve_owner` returns `None`);
+                    // a composite returns the matched inner.
+                    let owner = match src.resolve_owner(&nm, conn_ctx.clone()).await {
+                        Some(inner) => inner,
+                        None => src.clone(),
+                    };
+                    // Negotiate the descriptor through the bound owner, so
+                    // it matches the source that will serve the operations.
+                    let intro = owner.get_introspection_checked(&nm, conn_ctx.clone()).await;
+                    Some(ResolvedChannel { intro, owner })
                 } else {
                     None
                 };
@@ -3615,8 +3665,7 @@ async fn handle_create_channel(
                         cid,
                         sid,
                         name: nm,
-                        intro,
-                        found,
+                        resolved,
                     })
                     .await;
             }
@@ -3867,7 +3916,6 @@ async fn handle_tcp_search(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_op(
-    source: &DynSource,
     frame: &Frame,
     tx: &SrvTx,
     channels: &mut HashMap<u32, ChannelState>,
@@ -3914,6 +3962,14 @@ async fn handle_op(
             return Ok(());
         }
     };
+
+    // Dispatch every operation to the source bound at CREATE_CHANNEL,
+    // not the top-level registry. pvxs installs the accepting source's
+    // callbacks into the ServerChan (serverchan.cpp:70-112) and a later
+    // removeSource never rewrites them (server.cpp:100-112), so a live
+    // channel keeps its owner even when the registry changes underneath.
+    let source = ch.source.clone();
+    let source = &source;
 
     if subcmd & 0x08 != 0 {
         // duplicate INIT on a live IOID is connection-fatal
@@ -5672,7 +5728,6 @@ async fn handle_op(
 /// Returns `Some(AbortOnDrop)` when a slow-path task was spawned so the
 /// caller can store it for connection-lifetime abort on teardown.
 async fn handle_get_field(
-    source: &DynSource,
     frame: &Frame,
     tx: &SrvTx,
     channels: &HashMap<u32, ChannelState>,
@@ -5735,10 +5790,12 @@ async fn handle_get_field(
             Ok(None)
         }
         None => {
-            // Slow path: introspection not yet cached; fetch from source without blocking
-            // the read loop.
+            // Slow path: introspection not yet cached; fetch from the
+            // CREATE_CHANNEL-bound owner without blocking the read loop —
+            // not the top-level registry (pvxs serverchan.cpp:70-112 /
+            // server.cpp:100-112; see `handle_op`).
             let pv_name = chan.name.clone();
-            let src = source.clone();
+            let src = chan.source.clone();
             let tx_clone = tx.clone();
             // introspect under the downstream connection's
             // identity. pvxs builds the GET_FIELD ConnectOp with
@@ -7313,6 +7370,7 @@ mod tests {
                 cid: 0,
                 sid,
                 introspection: Some(intro.clone()),
+                source: source.clone(),
                 ops: HashMap::new(),
             },
         );
@@ -7338,7 +7396,6 @@ mod tests {
         crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
         let init_frame = synth_frame(Command::Monitor, order, init_payload);
         handle_op(
-            &source,
             &init_frame,
             &tx,
             &mut channels,
@@ -7363,7 +7420,6 @@ mod tests {
         start_payload.put_u8(0x44);
         let start_frame = synth_frame(Command::Monitor, order, start_payload);
         handle_op(
-            &source,
             &start_frame,
             &tx,
             &mut channels,
@@ -7408,6 +7464,7 @@ mod tests {
         sid: u32,
         ioid: u32,
         window: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        source: DynSource,
     ) -> HashMap<u32, ChannelState> {
         let mut ops = HashMap::new();
         ops.insert(
@@ -7445,6 +7502,7 @@ mod tests {
                 cid: 0,
                 sid,
                 introspection: None,
+                source,
                 ops,
             },
         );
@@ -7464,8 +7522,8 @@ mod tests {
         let ioid: u32 = 88;
 
         let window = Arc::new(AtomicU32::new(0));
-        let mut channels = ack_test_channels(sid, ioid, window.clone());
         let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
+        let mut channels = ack_test_channels(sid, ioid, window.clone(), source.clone());
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
@@ -7479,7 +7537,6 @@ mod tests {
         payload.put_u8(0x80);
         let frame = synth_frame(Command::Monitor, order, payload);
         let err = handle_op(
-            &source,
             &frame,
             &tx,
             &mut channels,
@@ -7515,9 +7572,9 @@ mod tests {
         let ioid: u32 = 88;
 
         let window = Arc::new(AtomicU32::new(0));
-        let mut channels = ack_test_channels(sid, ioid, window.clone());
-
         let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
+        let mut channels = ack_test_channels(sid, ioid, window.clone(), source.clone());
+
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
@@ -7531,7 +7588,6 @@ mod tests {
         payload.put_u32(3, order); // ack-count
         let frame = synth_frame(Command::Monitor, order, payload);
         handle_op(
-            &source,
             &frame,
             &tx,
             &mut channels,
@@ -7567,9 +7623,9 @@ mod tests {
 
         // Window already near the cap; a large ACK would wrap a raw u32.
         let window = Arc::new(AtomicU32::new(u32::MAX - 1));
-        let mut channels = ack_test_channels(sid, ioid, window.clone());
-
         let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
+        let mut channels = ack_test_channels(sid, ioid, window.clone(), source.clone());
+
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let config = crate::server_native::runtime::PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
@@ -7583,7 +7639,6 @@ mod tests {
         payload.put_u32(100, order); // would overflow (MAX-1) + 100
         let frame = synth_frame(Command::Monitor, order, payload);
         handle_op(
-            &source,
             &frame,
             &tx,
             &mut channels,
@@ -7662,6 +7717,7 @@ mod tests {
         let abort = Arc::new(AbortOnDrop(task.abort_handle()));
         let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+        let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
         let mut channels: HashMap<u32, ChannelState> = HashMap::new();
         let mut ops = HashMap::new();
         ops.insert(
@@ -7698,6 +7754,7 @@ mod tests {
                 cid: 1,
                 sid,
                 introspection: None,
+                source: source.clone(),
                 ops,
             },
         );
@@ -8021,6 +8078,7 @@ mod tests {
         let sid: u32 = 11;
         let cid: u32 = 22;
 
+        let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
         let mut channels: HashMap<u32, ChannelState> = HashMap::new();
         channels.insert(
             sid,
@@ -8029,6 +8087,7 @@ mod tests {
                 cid,
                 sid,
                 introspection: None,
+                source: source.clone(),
                 ops: HashMap::new(),
             },
         );
@@ -8097,6 +8156,7 @@ mod tests {
                 cid: 0,
                 sid,
                 introspection: Some(intro.clone()),
+                source: source.clone(),
                 ops: HashMap::new(),
             },
         );
@@ -8122,7 +8182,6 @@ mod tests {
         crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
         let init_frame = synth_frame(Command::Put, order, init_payload);
         handle_op(
-            &source,
             &init_frame,
             &tx,
             &mut channels,
@@ -8158,7 +8217,6 @@ mod tests {
         let exec_frame = synth_frame(Command::Put, order, exec_payload);
 
         handle_op(
-            &source,
             &exec_frame,
             &tx,
             &mut channels,
@@ -8225,6 +8283,7 @@ mod tests {
                 cid: 0,
                 sid,
                 introspection: Some(intro.clone()),
+                source: source.clone(),
                 ops: HashMap::new(),
             },
         );
@@ -8248,7 +8307,6 @@ mod tests {
         crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
         let init_frame = synth_frame(Command::Put, order, init_payload);
         handle_op(
-            &source,
             &init_frame,
             &tx,
             &mut channels,
@@ -8282,7 +8340,6 @@ mod tests {
         let exec_frame = synth_frame(Command::Put, order, exec_payload);
 
         handle_op(
-            &source,
             &exec_frame,
             &tx,
             &mut channels,
@@ -8365,6 +8422,7 @@ mod tests {
                     cid: 0,
                     sid,
                     introspection: Some(intro.clone()),
+                    source: source.clone(),
                     ops,
                 },
             );
@@ -8385,7 +8443,6 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let (exec_fin_tx, mut exec_fin_rx) = mpsc::unbounded_channel::<ExecFinished>();
         handle_op(
-            &source,
             &exec_frame(0x50),
             &tx,
             &mut channels,
@@ -8445,7 +8502,6 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let (exec_fin_tx, mut exec_fin_rx) = mpsc::unbounded_channel::<ExecFinished>();
         handle_op(
-            &source,
             &exec_frame(0x00),
             &tx,
             &mut channels,
@@ -8688,6 +8744,7 @@ mod tests {
                 cid: 0,
                 sid,
                 introspection: Some(intro.clone()),
+                source: source.clone(),
                 ops: HashMap::new(),
             },
         );
@@ -8712,7 +8769,6 @@ mod tests {
         crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
         let init_frame = synth_frame(Command::Put, order, init_payload);
         handle_op(
-            &source,
             &init_frame,
             &tx,
             &mut channels,
@@ -8753,7 +8809,6 @@ mod tests {
         );
         let exec_frame = synth_frame(Command::Put, order, exec_payload);
         handle_op(
-            &source,
             &exec_frame,
             &tx,
             &mut channels,
@@ -8813,6 +8868,7 @@ mod tests {
                 cid: 0,
                 sid,
                 introspection: Some(intro.clone()),
+                source: source.clone(),
                 ops: HashMap::new(),
             },
         );
@@ -8837,7 +8893,6 @@ mod tests {
         crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
         let init_frame = synth_frame(Command::PutGet, order, init_payload);
         handle_put_get(
-            &source,
             &init_frame,
             &tx,
             &mut channels,
@@ -8873,7 +8928,6 @@ mod tests {
         );
         let data_frame = synth_frame(Command::PutGet, order, data_payload);
         handle_put_get(
-            &source,
             &data_frame,
             &tx,
             &mut channels,
@@ -9114,7 +9168,11 @@ mod tests {
     /// for `ioid`, so a PROCESS data-phase frame dispatches straight
     /// into the WRITE-gate check.
     #[cfg(test)]
-    fn primed_process_channels(sid: u32, ioid: u32) -> HashMap<u32, ChannelState> {
+    fn primed_process_channels(
+        sid: u32,
+        ioid: u32,
+        source: DynSource,
+    ) -> HashMap<u32, ChannelState> {
         let intro = three_field_intro();
         let mut ops = HashMap::new();
         let mask = BitSet::all_set(intro.total_bits());
@@ -9130,6 +9188,7 @@ mod tests {
                 cid: 0,
                 sid,
                 introspection: Some(intro),
+                source,
                 ops,
             },
         );
@@ -9268,7 +9327,7 @@ mod tests {
         let process_hits = std::sync::Arc::clone(&src.process_hits);
         let source: DynSource = std::sync::Arc::new(src);
 
-        let mut channels = primed_process_channels(sid, ioid);
+        let mut channels = primed_process_channels(sid, ioid, source.clone());
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let config = PvaServerConfig::default();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -9282,7 +9341,6 @@ mod tests {
 
         // Peer presents the matching root CA — WRITE must be granted.
         handle_process(
-            &source,
             &frame,
             &tx,
             &mut channels,
@@ -9328,7 +9386,7 @@ mod tests {
         let process_hits = std::sync::Arc::clone(&src.process_hits);
         let source: DynSource = std::sync::Arc::new(src);
 
-        let mut channels = primed_process_channels(sid, ioid);
+        let mut channels = primed_process_channels(sid, ioid, source.clone());
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let config = PvaServerConfig::default();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -9340,7 +9398,6 @@ mod tests {
         let frame = synth_frame(Command::Process, order, payload);
 
         handle_process(
-            &source,
             &frame,
             &tx,
             &mut channels,
@@ -9375,7 +9432,12 @@ mod tests {
     /// Build a channel whose `ioid` op was initialised as `kind`,
     /// so a wrong-kind data frame can be driven against it.
     #[cfg(test)]
-    fn primed_channels_with_kind(sid: u32, ioid: u32, kind: OpKind) -> HashMap<u32, ChannelState> {
+    fn primed_channels_with_kind(
+        sid: u32,
+        ioid: u32,
+        kind: OpKind,
+        source: DynSource,
+    ) -> HashMap<u32, ChannelState> {
         let intro = three_field_intro();
         let mask = BitSet::all_set(intro.total_bits());
         let mut ops = HashMap::new();
@@ -9388,6 +9450,7 @@ mod tests {
                 cid: 0,
                 sid,
                 introspection: Some(intro),
+                source,
                 ops,
             },
         );
@@ -9412,7 +9475,7 @@ mod tests {
         let source: DynSource = std::sync::Arc::new(src);
 
         // IOID initialised as a GET, not a PROCESS.
-        let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Get);
+        let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Get, source.clone());
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let config = PvaServerConfig::default();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -9424,7 +9487,6 @@ mod tests {
         let frame = synth_frame(Command::Process, order, payload);
 
         let res = handle_process(
-            &source,
             &frame,
             &tx,
             &mut channels,
@@ -9457,7 +9519,7 @@ mod tests {
         let process_hits = std::sync::Arc::clone(&src.process_hits);
         let source: DynSource = std::sync::Arc::new(src);
 
-        let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Monitor);
+        let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Monitor, source.clone());
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let config = PvaServerConfig::default();
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
@@ -9469,7 +9531,6 @@ mod tests {
         let frame = synth_frame(Command::Process, order, payload);
 
         let res = handle_process(
-            &source,
             &frame,
             &tx,
             &mut channels,
@@ -9495,7 +9556,7 @@ mod tests {
     /// registered ops, so a PROCESS INIT frame exercises the INIT
     /// pvRequest decode + registration path.
     #[cfg(test)]
-    fn process_channels_no_op(sid: u32) -> HashMap<u32, ChannelState> {
+    fn process_channels_no_op(sid: u32, source: DynSource) -> HashMap<u32, ChannelState> {
         let intro = three_field_intro();
         let mut channels = HashMap::new();
         channels.insert(
@@ -9505,6 +9566,7 @@ mod tests {
                 cid: 0,
                 sid,
                 introspection: Some(intro),
+                source,
                 ops: HashMap::new(),
             },
         );
@@ -9533,14 +9595,13 @@ mod tests {
         order: ByteOrder,
     ) -> (bool, bool) {
         let source: DynSource = std::sync::Arc::new(AuthorityGatedSource::new());
-        let mut channels = process_channels_no_op(sid);
+        let mut channels = process_channels_no_op(sid, source.clone());
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let config = PvaServerConfig::default();
         let peer: SocketAddr = "127.0.0.1:5076".parse().unwrap();
         let frame = process_init_frame(sid, ioid, pv_request, order);
 
         handle_process(
-            &source,
             &frame,
             &tx,
             &mut channels,
@@ -9643,7 +9704,7 @@ mod tests {
         let ioid: u32 = 602;
         let source: DynSource = std::sync::Arc::new(AuthorityGatedSource::new());
 
-        let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Get);
+        let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Get, source.clone());
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
@@ -9670,7 +9731,6 @@ mod tests {
         let frame = synth_frame(Command::PutGet, order, payload);
 
         let res = handle_put_get(
-            &source,
             &frame,
             &tx,
             &mut channels,
@@ -9697,7 +9757,7 @@ mod tests {
         let ioid: u32 = 603;
         let source: DynSource = std::sync::Arc::new(AuthorityGatedSource::new());
 
-        let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Put);
+        let mut channels = primed_channels_with_kind(sid, ioid, OpKind::Put, source.clone());
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
@@ -9723,7 +9783,6 @@ mod tests {
         let frame = synth_frame(Command::PutGet, order, payload);
 
         let res = handle_put_get(
-            &source,
             &frame,
             &tx,
             &mut channels,
@@ -9773,6 +9832,7 @@ mod tests {
                 cid: 0,
                 sid,
                 introspection: Some(intro.clone()),
+                source: source.clone(),
                 ops,
             },
         );
@@ -9803,7 +9863,6 @@ mod tests {
         let frame = synth_frame(Command::PutGet, order, payload);
 
         handle_put_get(
-            &source,
             &frame,
             &tx,
             &mut channels,
@@ -9860,7 +9919,7 @@ mod tests {
         let process_hits = std::sync::Arc::clone(&src.process_hits);
         let source: DynSource = std::sync::Arc::new(src);
 
-        let mut channels = primed_process_channels(sid, ioid);
+        let mut channels = primed_process_channels(sid, ioid, source.clone());
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let (exec_fin_tx, mut exec_fin_rx) = mpsc::unbounded_channel::<ExecFinished>();
         let config = PvaServerConfig::default();
@@ -9874,7 +9933,6 @@ mod tests {
         let frame = synth_frame(Command::Process, order, payload);
 
         handle_process(
-            &source,
             &frame,
             &tx,
             &mut channels,
@@ -9954,6 +10012,7 @@ mod tests {
                 cid: 0,
                 sid,
                 introspection: Some(intro.clone()),
+                source: source.clone(),
                 ops,
             },
         );
@@ -9984,7 +10043,6 @@ mod tests {
         let frame = synth_frame(Command::PutGet, order, payload);
 
         handle_put_get(
-            &source,
             &frame,
             &tx,
             &mut channels,
@@ -10090,6 +10148,7 @@ mod tests {
                 cid: 0,
                 sid,
                 introspection: Some(FieldDesc::Variant),
+                source: source.clone(),
                 ops,
             },
         );
@@ -10105,7 +10164,7 @@ mod tests {
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let cred = ClientCredentials::anonymous();
-        handle_get_field(&source, &frame, &tx, &channels, order, peer, &cred)
+        handle_get_field(&frame, &tx, &channels, order, peer, &cred)
             .await
             .expect("handler returns Ok");
 
@@ -10139,6 +10198,7 @@ mod tests {
                 cid: 0,
                 sid,
                 introspection: Some(FieldDesc::Variant),
+                source: source.clone(),
                 ops: HashMap::new(),
             },
         );
@@ -10152,7 +10212,7 @@ mod tests {
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let cred = ClientCredentials::anonymous();
-        handle_get_field(&source, &frame, &tx, &channels, order, peer, &cred)
+        handle_get_field(&frame, &tx, &channels, order, peer, &cred)
             .await
             .expect("handler returns Ok");
 
@@ -10191,6 +10251,7 @@ mod tests {
                 cid: 0,
                 sid,
                 introspection: None,
+                source: source.clone(),
                 ops: HashMap::new(),
             },
         );
@@ -10205,7 +10266,7 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let cred = ClientCredentials::anonymous();
         // Keep the guard alive until after the slow-path reply is received.
-        let _guard = handle_get_field(&source, &frame, &tx, &channels, order, peer, &cred)
+        let _guard = handle_get_field(&frame, &tx, &channels, order, peer, &cred)
             .await
             .expect("handler returns Ok");
 
@@ -10262,6 +10323,7 @@ mod tests {
                 cid: 0,
                 sid,
                 introspection: None,
+                source: source.clone(),
                 ops: HashMap::new(),
             },
         );
@@ -10276,7 +10338,7 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let cred = ClientCredentials::anonymous();
         // Keep the guard alive until after the slow-path reply is received.
-        let _guard = handle_get_field(&source, &frame, &tx, &channels, order, peer, &cred)
+        let _guard = handle_get_field(&frame, &tx, &channels, order, peer, &cred)
             .await
             .expect("handler returns Ok");
 
@@ -10645,6 +10707,7 @@ mod tests {
                 cid: 0,
                 sid,
                 introspection: Some(intro.clone()),
+                source: src.clone(),
                 ops,
             },
         );
@@ -10782,6 +10845,7 @@ mod tests {
                 cid: 0,
                 sid,
                 introspection: Some(intro.clone()),
+                source: source.clone(),
                 ops: HashMap::new(),
             },
         );
@@ -10807,7 +10871,6 @@ mod tests {
         crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
         let init_frame = synth_frame(Command::Monitor, order, init_payload);
         handle_op(
-            &source,
             &init_frame,
             &tx,
             &mut channels,
@@ -10835,7 +10898,6 @@ mod tests {
         start_payload.put_u8(0x44);
         let start_frame = synth_frame(Command::Monitor, order, start_payload);
         handle_op(
-            &source,
             &start_frame,
             &tx,
             &mut channels,
@@ -10944,7 +11006,7 @@ mod tests {
     }
 
     /// One channel `sid=1`/`dut` with the supplied prototype.
-    fn bfr13_channels(intro: Option<FieldDesc>) -> HashMap<u32, ChannelState> {
+    fn bfr13_channels(intro: Option<FieldDesc>, source: DynSource) -> HashMap<u32, ChannelState> {
         let mut channels = HashMap::new();
         channels.insert(
             1,
@@ -10953,6 +11015,7 @@ mod tests {
                 cid: 0,
                 sid: 1,
                 introspection: intro,
+                source,
                 ops: HashMap::new(),
             },
         );
@@ -10998,7 +11061,7 @@ mod tests {
         let order = ByteOrder::Little;
         let (sid, ioid) = (1u32, 700u32);
         let source: DynSource = Arc::new(Bfr13FailSource);
-        let mut channels = bfr13_channels(Some(three_field_intro()));
+        let mut channels = bfr13_channels(Some(three_field_intro()), source.clone());
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
@@ -11013,7 +11076,6 @@ mod tests {
         bfr13_init_pv_request(order, &mut init_payload);
         let init_frame = synth_frame(Command::Get, order, init_payload);
         handle_op(
-            &source,
             &init_frame,
             &tx,
             &mut channels,
@@ -11037,7 +11099,6 @@ mod tests {
         exec_payload.put_u8(0x00);
         let exec_frame = synth_frame(Command::Get, order, exec_payload);
         handle_op(
-            &source,
             &exec_frame,
             &tx,
             &mut channels,
@@ -11068,7 +11129,7 @@ mod tests {
     /// build a two-channel connection (sid 1 and sid 2), each advertising
     /// `three_field_intro`, with no ops yet. Mirrors the connection-wide IOID
     /// scope of pvxs `ServerConn` (one `opByIOID` across all channels).
-    fn two_channel_conn() -> HashMap<u32, ChannelState> {
+    fn two_channel_conn(source: DynSource) -> HashMap<u32, ChannelState> {
         let mut channels = HashMap::new();
         for sid in [1u32, 2u32] {
             channels.insert(
@@ -11078,6 +11139,7 @@ mod tests {
                     cid: sid - 1,
                     sid,
                     introspection: Some(three_field_intro()),
+                    source: source.clone(),
                     ops: HashMap::new(),
                 },
             );
@@ -11096,7 +11158,7 @@ mod tests {
         let order = ByteOrder::Little;
         let ioid = 5u32;
         let source: DynSource = Arc::new(Bfr13FailSource);
-        let mut channels = two_channel_conn();
+        let mut channels = two_channel_conn(source.clone());
         // A live GET op on channel sid=1 reserves ioid=5 connection-wide.
         channels.get_mut(&1).unwrap().ops.insert(
             ioid,
@@ -11121,7 +11183,6 @@ mod tests {
         bfr13_init_pv_request(order, &mut init_payload);
         let init_frame = synth_frame(Command::Get, order, init_payload);
         let err = handle_op(
-            &source,
             &init_frame,
             &tx,
             &mut channels,
@@ -11150,7 +11211,8 @@ mod tests {
     async fn pva_conn_wide_destroy_request_routes_by_ioid_ignoring_sid() {
         let order = ByteOrder::Little;
         let ioid = 9u32;
-        let mut channels = two_channel_conn();
+        let source: DynSource = Arc::new(Bfr13FailSource);
+        let mut channels = two_channel_conn(source.clone());
         channels.get_mut(&1).unwrap().ops.insert(
             ioid,
             non_monitor_op_state(
@@ -11185,7 +11247,7 @@ mod tests {
         let order = ByteOrder::Little;
         let (sid, ioid) = (1u32, 701u32);
         let source: DynSource = Arc::new(Bfr13FailSource);
-        let mut channels = bfr13_channels(Some(three_field_intro()));
+        let mut channels = bfr13_channels(Some(three_field_intro()), source.clone());
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
@@ -11200,7 +11262,6 @@ mod tests {
         bfr13_init_pv_request(order, &mut init_payload);
         let init_frame = synth_frame(Command::Put, order, init_payload);
         handle_op(
-            &source,
             &init_frame,
             &tx,
             &mut channels,
@@ -11225,7 +11286,6 @@ mod tests {
         exec_payload.put_u8(0x40);
         let exec_frame = synth_frame(Command::Put, order, exec_payload);
         handle_op(
-            &source,
             &exec_frame,
             &tx,
             &mut channels,
@@ -11267,7 +11327,7 @@ mod tests {
         let (sid, ioid) = (1u32, 702u32);
         let source: DynSource = Arc::new(Bfr13FailSource);
         // No prototype on the channel → INIT fails "must provide prototype".
-        let mut channels = bfr13_channels(None);
+        let mut channels = bfr13_channels(None, source.clone());
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
@@ -11280,7 +11340,6 @@ mod tests {
         init_payload.put_u8(0x08);
         let init_frame = synth_frame(Command::Get, order, init_payload);
         handle_op(
-            &source,
             &init_frame,
             &tx,
             &mut channels,
@@ -11500,6 +11559,7 @@ mod r14_tests {
                 cid: 1,
                 sid,
                 introspection: Some(intro),
+                source: source.clone(),
                 ops,
             },
         );
@@ -11521,7 +11581,6 @@ mod r14_tests {
         let (mon_fin_tx, _mon_fin_rx) = mpsc::unbounded_channel::<MonitorFinished>();
         let (exec_fin_tx, _exec_fin_rx) = mpsc::unbounded_channel::<ExecFinished>();
         handle_op(
-            &source,
             &frame,
             &tx,
             &mut channels,
@@ -11661,7 +11720,12 @@ mod bfr15_tests {
     }
 
     /// Channel map with a single `Idle` op of `kind` bound to `ioid`.
-    fn channels_with_op(sid: u32, ioid: u32, kind: OpKind) -> HashMap<u32, ChannelState> {
+    fn channels_with_op(
+        sid: u32,
+        ioid: u32,
+        kind: OpKind,
+        source: DynSource,
+    ) -> HashMap<u32, ChannelState> {
         let intro = nt_scalar_desc();
         let mut ops: HashMap<u32, OpState> = HashMap::new();
         ops.insert(
@@ -11676,6 +11740,7 @@ mod bfr15_tests {
                 cid: 1,
                 sid,
                 introspection: Some(intro),
+                source,
                 ops,
             },
         );
@@ -11763,7 +11828,7 @@ mod bfr15_tests {
             block_get: true,
             block_put: false,
         });
-        let mut channels = channels_with_op(sid, ioid, OpKind::Get);
+        let mut channels = channels_with_op(sid, ioid, OpKind::Get, source.clone());
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
@@ -11773,7 +11838,6 @@ mod bfr15_tests {
 
         // First EXEC: op was Idle → accepted, now Executing, source read spawned.
         handle_op(
-            &source,
             &get_exec_frame(sid, ioid, order),
             &tx,
             &mut channels,
@@ -11794,7 +11858,6 @@ mod bfr15_tests {
 
         // Second EXEC while Executing: ignored.
         handle_op(
-            &source,
             &get_exec_frame(sid, ioid, order),
             &tx,
             &mut channels,
@@ -11846,7 +11909,7 @@ mod bfr15_tests {
             block_get: false,
             block_put: true,
         });
-        let mut channels = channels_with_op(sid, ioid, OpKind::Put);
+        let mut channels = channels_with_op(sid, ioid, OpKind::Put, source.clone());
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
@@ -11855,7 +11918,6 @@ mod bfr15_tests {
         let (exec_tx, _exec_rx) = mpsc::unbounded_channel::<ExecFinished>();
 
         handle_op(
-            &source,
             &put_exec_frame(sid, ioid, order),
             &tx,
             &mut channels,
@@ -11875,7 +11937,6 @@ mod bfr15_tests {
         assert!(op_abort_armed(&channels, sid, ioid));
 
         handle_op(
-            &source,
             &put_exec_frame(sid, ioid, order),
             &tx,
             &mut channels,
@@ -11924,7 +11985,7 @@ mod bfr15_tests {
             block_get: true,
             block_put: false,
         });
-        let mut channels = channels_with_op(sid, ioid, OpKind::Get);
+        let mut channels = channels_with_op(sid, ioid, OpKind::Get, source.clone());
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
@@ -11933,7 +11994,6 @@ mod bfr15_tests {
         let (exec_tx, _exec_rx) = mpsc::unbounded_channel::<ExecFinished>();
 
         handle_op(
-            &source,
             &get_exec_frame(sid, ioid, order),
             &tx,
             &mut channels,
@@ -11979,7 +12039,7 @@ mod bfr15_tests {
             block_get: false, // completes immediately
             block_put: false,
         });
-        let mut channels = channels_with_op(sid, ioid, OpKind::Get);
+        let mut channels = channels_with_op(sid, ioid, OpKind::Get, source.clone());
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let config = PvaServerConfig::default();
         let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
@@ -11990,7 +12050,6 @@ mod bfr15_tests {
         // First EXEC completes; the task sends its response, then its
         // ExecFinishGuard drops and signals the owner.
         handle_op(
-            &source,
             &get_exec_frame(sid, ioid, order),
             &tx,
             &mut channels,
@@ -12016,7 +12075,6 @@ mod bfr15_tests {
 
         // Re-EXEC against the now-Idle op is accepted and runs a fresh read.
         handle_op(
-            &source,
             &get_exec_frame(sid, ioid, order),
             &tx,
             &mut channels,
@@ -12045,7 +12103,8 @@ mod bfr15_tests {
     #[tokio::test]
     async fn bfr15_apply_exec_finish_ignores_stale_op_id() {
         let (sid, ioid) = (1u32, 500u32);
-        let mut channels = channels_with_op(sid, ioid, OpKind::Get);
+        let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
+        let mut channels = channels_with_op(sid, ioid, OpKind::Get, source.clone());
         // Drive the op to Executing and capture its instance id.
         let op_id =
             begin_exec(channels.get_mut(&sid).unwrap(), ioid).expect("Idle op accepts the exec");

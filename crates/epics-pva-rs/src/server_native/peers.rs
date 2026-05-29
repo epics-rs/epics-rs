@@ -20,6 +20,54 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
+/// Per-channel report entry — mirrors pvxs `Report::Channel`
+/// (`netcommon.h:43-52`): the served PV name plus per-channel transmit /
+/// receive byte counters and source-supplied contextual info. One
+/// `ChannelStat` is shared (via `Arc`) between the connection task's
+/// channel table and the [`PeerEntry`] so the report can read the live
+/// counters the handlers mutate without copying names every create/destroy.
+///
+/// pvxs accumulates `chan->statTx`/`chan->statRx` at each op's send/recv
+/// (`serverget.cpp:124/386`, `servermon.cpp:186/513`, `serverchan.cpp:151`,
+/// `serverintrospect.cpp:45/164`) and copies them into the report at
+/// `server.cpp:260-268`, zeroing per-channel when `report(true)`.
+#[derive(Debug)]
+pub struct ChannelStat {
+    /// Served PV name (aka channel name).
+    pub name: String,
+    /// Bytes transmitted to the peer for this channel.
+    pub tx: AtomicU64,
+    /// Bytes received from the peer for this channel.
+    pub rx: AtomicU64,
+    /// Source-supplied contextual info (pvxs `ReportInfo`). Sources do not
+    /// yet populate this; the field exists so the report SHAPE can carry it
+    /// once a source hook does. `None` until then.
+    pub(crate) report_info: parking_lot::Mutex<Option<String>>,
+}
+
+impl ChannelStat {
+    pub(crate) fn new(name: String) -> Arc<Self> {
+        Arc::new(Self {
+            name,
+            tx: AtomicU64::new(0),
+            rx: AtomicU64::new(0),
+            report_info: parking_lot::Mutex::new(None),
+        })
+    }
+
+    /// Attribute `n` transmitted bytes to this channel (pvxs
+    /// `chan->statTx += enqueueTxBody(cmd)`).
+    pub(crate) fn add_tx(&self, n: usize) {
+        self.tx.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    /// Attribute `n` received bytes to this channel (pvxs
+    /// `chan->statRx += rxlen`).
+    pub(crate) fn add_rx(&self, n: usize) {
+        self.rx.fetch_add(n as u64, Ordering::Relaxed);
+    }
+}
+
 /// Per-connection counters held in [`PeerRegistry`].
 ///
 /// Counters are [`AtomicU64`] so the connection handler can update them
@@ -49,10 +97,13 @@ pub struct PeerEntry {
     /// connection-validation handshake establishes them. pvxs
     /// `Server::report` includes `ReportInfo`/credentials per peer.
     pub(crate) credentials: parking_lot::Mutex<Option<(String, String)>>,
-    /// live PV names of the channels currently open on this
-    /// connection, mirrored from the per-connection channel table on
-    /// every create/destroy so the report carries per-channel detail.
-    pub(crate) channel_names: parking_lot::Mutex<Vec<String>>,
+    /// Live channels currently open on this connection, keyed by server
+    /// channel id (SID). Each value is the SAME `Arc<ChannelStat>` the
+    /// connection task holds in its channel table, so the report reads the
+    /// live per-channel tx/rx counters the handlers mutate. Inserted on
+    /// CREATE_CHANNEL success, removed on DESTROY_CHANNEL / teardown
+    /// (pvxs iterates `conn->chanBySID`, server.cpp:260).
+    pub(crate) channels_by_sid: parking_lot::Mutex<HashMap<u32, Arc<ChannelStat>>>,
 }
 
 impl PeerEntry {
@@ -67,7 +118,7 @@ impl PeerEntry {
             bytes_out: AtomicU64::new(0),
             tls,
             credentials: parking_lot::Mutex::new(None),
-            channel_names: parking_lot::Mutex::new(Vec::new()),
+            channels_by_sid: parking_lot::Mutex::new(HashMap::new()),
         })
     }
 
@@ -86,20 +137,24 @@ impl PeerEntry {
         *self.credentials.lock() = Some((account.to_string(), method.to_string()));
     }
 
-    /// mirror the connection's current open-channel PV names
-    /// (the per-connection channel table is the source of truth; this
-    /// snapshot is read by the report).
-    pub(crate) fn set_channel_names(&self, names: Vec<String>) {
-        *self.channel_names.lock() = names;
-    }
-
-    pub(crate) fn channel_added(&self) {
+    /// Register a newly-opened channel: bump the live + lifetime counts
+    /// and store its shared `ChannelStat` keyed by SID so the report can
+    /// read its per-channel tx/rx counters. The same `Arc` is held by the
+    /// connection task's channel table, so handler-side `add_tx`/`add_rx`
+    /// are visible to the report without re-mirroring.
+    pub(crate) fn channel_opened(&self, sid: u32, stat: Arc<ChannelStat>) {
         self.channels.fetch_add(1, Ordering::Relaxed);
         self.channels_created.fetch_add(1, Ordering::Relaxed);
+        self.channels_by_sid.lock().insert(sid, stat);
     }
 
-    pub(crate) fn channel_removed(&self) {
-        self.channels.fetch_sub(1, Ordering::Relaxed);
+    /// Deregister a channel on DESTROY / teardown: drop its report entry
+    /// and decrement the live count. Mirrors pvxs dropping the channel
+    /// from `conn->chanBySID`.
+    pub(crate) fn channel_closed(&self, sid: u32) {
+        if self.channels_by_sid.lock().remove(&sid).is_some() {
+            self.channels.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn op_init(&self) {
@@ -153,6 +208,21 @@ impl PeerRegistry {
                     // after the `From` load would drop it.
                     snap.bytes_in = e.bytes_in.swap(0, Ordering::Relaxed);
                     snap.bytes_out = e.bytes_out.swap(0, Ordering::Relaxed);
+                    // Per-channel counters reset under the SAME report path
+                    // as the connection counters (pvxs `server.cpp:270-271`
+                    // zeroes `chan->statTx`/`statRx` when `zero`). Rebuild the
+                    // per-channel snapshot from the swapped (pre-reset) values
+                    // so per-PV deltas are neither lost nor double-counted.
+                    let chans = e.channels_by_sid.lock();
+                    snap.channels_detail = chans
+                        .values()
+                        .map(|c| ChannelReport {
+                            name: c.name.clone(),
+                            tx: c.tx.swap(0, Ordering::Relaxed),
+                            rx: c.rx.swap(0, Ordering::Relaxed),
+                            report_info: c.report_info.lock().clone(),
+                        })
+                        .collect();
                 }
                 (*addr, snap)
             })
@@ -169,6 +239,22 @@ impl PeerRegistry {
     }
 }
 
+/// Per-channel entry in a [`PeerSnapshot`] — mirrors pvxs
+/// `Report::Channel` (`netcommon.h:43-52`): name + per-channel tx/rx byte
+/// counters + optional source-supplied `ReportInfo`.
+#[derive(Debug, Clone)]
+pub struct ChannelReport {
+    /// Served PV name (aka channel name).
+    pub name: String,
+    /// Bytes transmitted to the peer for this channel.
+    pub tx: u64,
+    /// Bytes received from the peer for this channel.
+    pub rx: u64,
+    /// Source-supplied contextual info (pvxs `ReportInfo`); `None` until a
+    /// source populates it.
+    pub report_info: Option<String>,
+}
+
 /// Lock-free snapshot returned by [`PeerRegistry::snapshot`].
 #[derive(Debug, Clone)]
 pub struct PeerSnapshot {
@@ -183,8 +269,10 @@ pub struct PeerSnapshot {
     /// validated peer credentials `(account, method)`, or
     /// `None` before the connection-validation handshake completes.
     pub credentials: Option<(String, String)>,
-    /// PV names of the channels currently open on this peer.
-    pub channel_names: Vec<String>,
+    /// Per-channel report entries for the channels currently open on this
+    /// peer — name + per-channel tx/rx counters + optional `ReportInfo`
+    /// (pvxs `Report::Connection::channels`, server.cpp:260-268).
+    pub channels_detail: Vec<ChannelReport>,
 }
 
 impl From<&PeerEntry> for PeerSnapshot {
@@ -199,7 +287,17 @@ impl From<&PeerEntry> for PeerSnapshot {
             bytes_out: e.bytes_out.load(Ordering::Relaxed),
             tls: e.tls,
             credentials: e.credentials.lock().clone(),
-            channel_names: e.channel_names.lock().clone(),
+            channels_detail: e
+                .channels_by_sid
+                .lock()
+                .values()
+                .map(|c| ChannelReport {
+                    name: c.name.clone(),
+                    tx: c.tx.load(Ordering::Relaxed),
+                    rx: c.rx.load(Ordering::Relaxed),
+                    report_info: c.report_info.lock().clone(),
+                })
+                .collect(),
         }
     }
 }
@@ -221,7 +319,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         assert!(reg.is_empty());
         let entry = PeerEntry::new(false);
-        entry.channel_added();
+        entry.channel_opened(1, ChannelStat::new("X:PV".into()));
         entry.touch_rx(64);
         reg.insert(addr, entry.clone());
         let snap = reg.snapshot();
@@ -234,46 +332,84 @@ mod tests {
         assert!(reg.is_empty());
     }
 
-    /// the snapshot carries per-peer credentials and live
-    /// channel names, and `snapshot_zeroed(true)` resets only the byte
-    /// counters (not channels/credentials) so the next report is a delta.
+    /// the snapshot carries per-peer credentials and structured
+    /// per-channel entries with their own tx/rx counters, and
+    /// `snapshot_zeroed(true)` resets BOTH the connection AND the
+    /// per-channel byte counters (not channels/credentials) so the next
+    /// report is a delta — pvxs `server.cpp:256-271`.
     #[test]
-    fn snapshot_carries_credentials_channels_and_zeroes_bytes() {
+    fn snapshot_carries_credentials_per_channel_counters_and_zeroes_bytes() {
         let reg = PeerRegistry::new();
         let addr: SocketAddr = "127.0.0.1:5076".parse().unwrap();
         let e = PeerEntry::new(true);
         e.set_credentials("op", "ca");
-        e.channel_added();
-        e.set_channel_names(vec!["X:PV".into(), "Y:PV".into()]);
+        let x = ChannelStat::new("X:PV".into());
+        let y = ChannelStat::new("Y:PV".into());
+        e.channel_opened(1, x.clone());
+        e.channel_opened(2, y.clone());
+        // per-channel attribution (what the handlers do on send/recv).
+        x.add_rx(70);
+        x.add_tx(30);
+        y.add_rx(30);
+        y.add_tx(10);
         e.touch_rx(100);
         e.touch_tx(40);
         reg.insert(addr, e);
 
-        // report(false): credentials + channel names + non-zero bytes.
+        // report(false): credentials + per-channel detail + non-zero bytes.
         let s = &reg.snapshot()[0].1;
         assert_eq!(s.credentials, Some(("op".into(), "ca".into())));
-        assert_eq!(
-            s.channel_names,
-            vec!["X:PV".to_string(), "Y:PV".to_string()]
-        );
+        let mut names: Vec<&str> = s.channels_detail.iter().map(|c| c.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["X:PV", "Y:PV"]);
+        let xr = s.channels_detail.iter().find(|c| c.name == "X:PV").unwrap();
+        assert_eq!((xr.tx, xr.rx), (30, 70), "per-channel X counters");
+        let yr = s.channels_detail.iter().find(|c| c.name == "Y:PV").unwrap();
+        assert_eq!((yr.tx, yr.rx), (10, 30), "per-channel Y counters");
         assert_eq!((s.bytes_in, s.bytes_out), (100, 40));
-        assert_eq!(s.channels, 1);
+        assert_eq!(s.channels, 2);
 
-        // report(true): byte counters reset; channels/credentials kept.
+        // report(true): connection AND per-channel byte counters reset;
+        // channels/credentials kept.
         let s = &reg.snapshot_zeroed(true)[0].1;
         assert_eq!((s.bytes_in, s.bytes_out), (100, 40), "snapshot is pre-zero");
+        let xr = s.channels_detail.iter().find(|c| c.name == "X:PV").unwrap();
+        assert_eq!((xr.tx, xr.rx), (30, 70), "per-channel snapshot is pre-zero");
         let s = &reg.snapshot()[0].1;
         assert_eq!(
             (s.bytes_in, s.bytes_out),
             (0, 0),
-            "next report sees zeroed bytes"
+            "next report sees zeroed connection bytes"
         );
-        assert_eq!(s.channels, 1, "channel count not reset");
+        let xr = s.channels_detail.iter().find(|c| c.name == "X:PV").unwrap();
+        assert_eq!(
+            (xr.tx, xr.rx),
+            (0, 0),
+            "next report sees zeroed per-channel bytes"
+        );
+        assert_eq!(s.channels, 2, "channel count not reset");
         assert_eq!(
             s.credentials,
             Some(("op".into(), "ca".into())),
             "creds not reset"
         );
+
+        // channel_closed drops the per-channel report entry + live count.
+        reg.snapshot(); // no-op read
+        e_close(&reg, addr, 1);
+        let s = &reg.snapshot()[0].1;
+        assert_eq!(s.channels, 1, "closing SID 1 drops the live count");
+        let names: Vec<&str> = s.channels_detail.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Y:PV"],
+            "closed channel drops out of the report"
+        );
+    }
+
+    /// Helper: close a channel via the registry's live entry.
+    fn e_close(reg: &PeerRegistry, addr: SocketAddr, sid: u32) {
+        reg.inner.read().get(&addr).unwrap().channel_closed(sid);
     }
 
     /// `snapshot_zeroed(true)` must not lose a byte increment

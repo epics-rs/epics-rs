@@ -723,18 +723,18 @@ impl PvaServer {
     }
 
     /// Snapshot summary-level diagnostics. pvxs `Server::report`
-    /// counterpart at the "is the server up, how is it configured"
-    /// level. Per-peer / per-channel counters require book-keeping the
-    /// TCP loop doesn't yet maintain; surface what we have today.
+    /// counterpart: server liveness/config plus per-peer connection
+    /// counters and per-channel tx/rx byte counters (see
+    /// [`crate::server_native::PeerSnapshot::channels_detail`]).
     pub fn report(&self) -> ServerReport {
         self.report_zeroed(false)
     }
 
-    /// like [`Self::report`] but, when `zero` is true, resets
-    /// each peer's byte counters after the snapshot — pvxs
-    /// `Server::report(bool zero)`, so a subsequent report returns the
-    /// deltas since this one. Channel counts and credentials are not
-    /// reset.
+    /// like [`Self::report`] but, when `zero` is true, resets each peer's
+    /// connection byte counters AND every per-channel tx/rx counter after
+    /// the snapshot — pvxs `Server::report(bool zero)` (server.cpp:256-272),
+    /// so a subsequent report returns the deltas since this one. Channel
+    /// membership and credentials are not reset.
     pub fn report_zeroed(&self, zero: bool) -> ServerReport {
         ServerReport {
             tcp_port: self.bound_tcp_port,

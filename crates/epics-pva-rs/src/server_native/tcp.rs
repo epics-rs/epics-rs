@@ -794,6 +794,13 @@ struct ChannelState {
     /// (`serverchan.cpp:70-112`); a later `removeSource` does not rewrite
     /// them (`server.cpp:100-112`).
     source: DynSource,
+    /// Shared per-channel report counters (name + tx/rx + ReportInfo),
+    /// the SAME `Arc` registered in this connection's `PeerEntry` under
+    /// the channel's SID. Handlers attribute per-PV traffic through this
+    /// (`stat.add_tx`/`add_rx`) so [`crate::server_native::PvaServer::report`]
+    /// can show per-channel byte counters (pvxs `chan->statTx/statRx`,
+    /// server.cpp:260-268).
+    stat: Arc<crate::server_native::peers::ChannelStat>,
     /// ioid → (introspection negotiated for this op, kind)
     ops: HashMap<u32, OpState>,
 }
@@ -809,6 +816,7 @@ impl std::fmt::Debug for ChannelState {
             .field("sid", &self.sid)
             .field("introspection", &self.introspection)
             .field("source", &"<bound owner>")
+            .field("stat", &self.stat)
             .field("ops", &self.ops)
             .finish()
     }
@@ -2022,6 +2030,54 @@ type SrvWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
 /// observes the dead socket and tears down.
 type SrvTx = tokio::sync::mpsc::Sender<Vec<u8>>;
 
+/// Connection writer handle bound to one channel's byte accounting.
+///
+/// pvxs increments `chan->statTx` by the encoded length at *every*
+/// per-channel send site (`serverget.cpp:124`, `servermon.cpp:186`,
+/// `serverintrospect.cpp:45`, `serverchan.cpp:151-152`). The writer
+/// task here owns only an opaque `Vec<u8>` stream and cannot recover
+/// the owning channel, so the count has to be taken where the channel
+/// is known. Threading a raw `SrvTx` plus a manual `stat.add_tx(..)`
+/// before each `send` re-opens the exact defect this finding names —
+/// a missed site silently under-counts. `ChannelTx` is the single
+/// owner of that accounting: holding one is the only way an op task
+/// can emit a per-channel frame, so the count cannot be skipped by
+/// construction. Connection-level frames (heartbeat, SET_BYTE_ORDER,
+/// validation, pre-resolution errors) keep the raw `SrvTx` — they
+/// belong to no channel.
+#[derive(Clone)]
+struct ChannelTx {
+    tx: SrvTx,
+    stat: Arc<crate::server_native::peers::ChannelStat>,
+}
+
+impl ChannelTx {
+    fn new(tx: SrvTx, stat: Arc<crate::server_native::peers::ChannelStat>) -> Self {
+        Self { tx, stat }
+    }
+
+    /// Emit a per-channel frame, charging its length to the channel's
+    /// `statTx` first so the report stays exact even if the send races
+    /// a writer-task shutdown.
+    async fn send(&self, buf: Vec<u8>) -> Result<(), tokio::sync::mpsc::error::SendError<Vec<u8>>> {
+        self.stat.add_tx(buf.len());
+        self.tx.send(buf).await
+    }
+
+    /// Current free capacity of the underlying writer channel — used by
+    /// the monitor outbound-queue-depth diagnostic. Delegates to the
+    /// wrapped `Sender`; carries no byte accounting.
+    fn capacity(&self) -> usize {
+        self.tx.capacity()
+    }
+
+    /// Total capacity of the underlying writer channel (see
+    /// [`Self::capacity`]).
+    fn max_capacity(&self) -> usize {
+        self.tx.max_capacity()
+    }
+}
+
 /// result of a spawned CREATE_CHANNEL resolver task. The read
 /// loop's `channels` HashMap is owned by the loop task; spawned
 /// resolver tasks cannot touch it directly. Instead they send this
@@ -2284,21 +2340,32 @@ async fn handle_connection_io(
                     pending_channel_spawns = pending_channel_spawns.saturating_sub(1);
                     let mut payload = Vec::new();
                     payload.put_u32(cc.cid, order);
+                    // On success the CREATE_CHANNEL reply is charged to the
+                    // newly-created channel (pvxs serverchan.cpp:151-152
+                    // `ch->statTx += 16u`); the failure reply belongs to no
+                    // channel and stays connection-level.
+                    let mut reply_stat: Option<Arc<crate::server_native::peers::ChannelStat>> = None;
                     if let Some(resolved) = cc.resolved {
                         payload.put_u32(cc.sid, order);
                         Status::ok().write_into(order, &mut payload);
+                        // One shared per-channel report counter, held by both
+                        // the connection's channel table and the PeerEntry
+                        // (keyed by SID) so handler-side tx/rx attribution is
+                        // visible to the report (pvxs chan->statTx/statRx).
+                        let stat = crate::server_native::peers::ChannelStat::new(cc.name.clone());
+                        reply_stat = Some(stat.clone());
                         channels.insert(cc.sid, ChannelState {
                             name: cc.name,
                             cid: cc.cid,
                             sid: cc.sid,
                             introspection: resolved.intro,
                             source: resolved.owner,
+                            stat: stat.clone(),
                             ops: HashMap::new(),
                         });
-                        peer_entry.channel_added();
-                        // mirror live channel names for the report.
-                        peer_entry
-                            .set_channel_names(channels.values().map(|c| c.name.clone()).collect());
+                        // Register the channel (live + lifetime counts and
+                        // the per-channel report entry) in one owner call.
+                        peer_entry.channel_opened(cc.sid, stat);
                         // Notify the bound source that a channel attached,
                         // matching pvxs `SharedPV::attach` running
                         // `onFirstConnect` on the empty→non-empty edge
@@ -2326,6 +2393,9 @@ async fn handle_connection_io(
                     let mut buf = Vec::new();
                     h.write_into(&mut buf);
                     buf.extend_from_slice(&payload);
+                    if let Some(stat) = &reply_stat {
+                        stat.add_tx(buf.len());
+                    }
                     let _ = tx.send(buf).await;
                 }
                 continue;
@@ -2587,8 +2657,9 @@ async fn handle_connection_io(
                 // spawning version. Resolver tasks run
                 // has_pv() + get_introspection() in the background;
                 // results arrive via cc_rx and are applied at the top
-                // of the loop. channel_added() is called there, so we
-                // do not track it here.
+                // of the loop. `peer_entry.channel_opened()` registers the
+                // channel (and its report stat) there, so we do not track
+                // it here.
                 handle_create_channel(
                     &source,
                     &frame,
@@ -2604,13 +2675,12 @@ async fn handle_connection_io(
                 .await?;
             }
             Some(Command::DestroyChannel) => {
-                let before = channels.len();
-                handle_destroy_channel(&frame, &tx, &mut channels, order, peer, &cred).await?;
-                if channels.len() < before {
-                    peer_entry.channel_removed();
-                    // keep the report's channel-name mirror current.
-                    peer_entry
-                        .set_channel_names(channels.values().map(|c| c.name.clone()).collect());
+                if let Some(removed_sid) =
+                    handle_destroy_channel(&frame, &tx, &mut channels, order, peer, &cred).await?
+                {
+                    // Drop the per-channel report entry + live count in one
+                    // owner call (pvxs removes from conn->chanBySID).
+                    peer_entry.channel_closed(removed_sid);
                 }
             }
             Some(Command::Get) => {
@@ -3011,6 +3081,12 @@ async fn handle_put_get(
         }
     };
 
+    // Attribute the inbound PUT_GET frame to the channel and route every
+    // reply through `chan_tx` (pvxs `chan->statRx`/`statTx`; see
+    // `handle_op`).
+    ch.stat.add_rx(frame.payload.len());
+    let chan_tx = ChannelTx::new(tx.clone(), ch.stat.clone());
+
     // Dispatch to the CREATE_CHANNEL-bound owner, not the registry
     // (pvxs serverchan.cpp:70-112 / server.cpp:100-112; see `handle_op`).
     let source = ch.source.clone();
@@ -3025,8 +3101,8 @@ async fn handle_put_get(
             )));
         }
         if ch.ops.len() >= config.max_ops_per_channel {
-            send_op_error(
-                tx,
+            send_chan_op_error(
+                &chan_tx,
                 OpKind::PutGet,
                 ioid,
                 subcmd,
@@ -3040,8 +3116,8 @@ async fn handle_put_get(
         let intro = match ch.introspection.clone() {
             Some(d) => d,
             None => {
-                send_op_error(
-                    tx,
+                send_chan_op_error(
+                    &chan_tx,
                     OpKind::PutGet,
                     ioid,
                     subcmd,
@@ -3077,8 +3153,8 @@ async fn handle_put_get(
         let mask = match crate::pv_request::request_to_mask(&intro, &req_desc) {
             Ok(m) => m,
             Err(e) => {
-                send_op_error(
-                    tx,
+                send_chan_op_error(
+                    &chan_tx,
                     OpKind::PutGet,
                     ioid,
                     subcmd,
@@ -3120,7 +3196,7 @@ async fn handle_put_get(
         let mut buf = Vec::new();
         h.write_into(&mut buf);
         buf.extend_from_slice(&payload);
-        let _ = tx.send(buf).await;
+        let _ = chan_tx.send(buf).await;
         return Ok(());
     }
 
@@ -3148,8 +3224,8 @@ async fn handle_put_get(
             (o.intro, o.mask, o.pv_request)
         }
         None => {
-            send_op_error(
-                tx,
+            send_chan_op_error(
+                &chan_tx,
                 OpKind::PutGet,
                 ioid,
                 subcmd,
@@ -3179,7 +3255,7 @@ async fn handle_put_get(
     };
 
     let src = source.clone();
-    let tx_clone = tx.clone();
+    let tx_clone = chan_tx.clone();
     // run this PUT_GET exec only when the op is `Idle`, and ignore a
     // second EXEC while the first is in flight rather than aborting it (pvxs
     // `serverget.cpp:467-476`/`:511-514`).
@@ -3352,6 +3428,12 @@ async fn handle_process(
         }
     };
 
+    // Attribute the inbound PROCESS frame to the channel and route every
+    // reply through `chan_tx` (pvxs `chan->statRx`/`statTx`; see
+    // `handle_op`).
+    ch.stat.add_rx(frame.payload.len());
+    let chan_tx = ChannelTx::new(tx.clone(), ch.stat.clone());
+
     // Dispatch to the CREATE_CHANNEL-bound owner, not the registry
     // (pvxs serverchan.cpp:70-112 / server.cpp:100-112; see `handle_op`).
     let source = ch.source.clone();
@@ -3366,8 +3448,8 @@ async fn handle_process(
             )));
         }
         if ch.ops.len() >= config.max_ops_per_channel {
-            send_op_error(
-                tx,
+            send_chan_op_error(
+                &chan_tx,
                 OpKind::Process,
                 ioid,
                 subcmd,
@@ -3385,8 +3467,8 @@ async fn handle_process(
         let intro = match ch.introspection.clone() {
             Some(d) => d,
             None => {
-                send_op_error(
-                    tx,
+                send_chan_op_error(
+                    &chan_tx,
                     OpKind::Process,
                     ioid,
                     subcmd,
@@ -3438,7 +3520,7 @@ async fn handle_process(
         let mut buf = Vec::new();
         h.write_into(&mut buf);
         buf.extend_from_slice(&payload);
-        let _ = tx.send(buf).await;
+        let _ = chan_tx.send(buf).await;
         return Ok(());
     }
 
@@ -3477,7 +3559,7 @@ async fn handle_process(
         pv_request: None,
     };
     let src = source.clone();
-    let tx_clone = tx.clone();
+    let tx_clone = chan_tx.clone();
     // run this PROCESS exec only when the op is `Idle`, and ignore a
     // second EXEC while the first is in flight rather than aborting it (pvxs
     // `serverget.cpp:467-476`/`:511-514`).
@@ -3794,6 +3876,9 @@ fn close_channel(ch: ChannelState, peer: SocketAddr, cred: &ClientCredentials) {
     source.notify_channel_close(&name, &ctx);
 }
 
+/// Returns the SID actually removed (`Some`) so the connection owner can
+/// drop its `PeerEntry` report entry, or `None` when the SID was unknown
+/// (no-op, no reply — pvxs serverchan.cpp:382-386).
 async fn handle_destroy_channel(
     frame: &Frame,
     tx: &SrvTx,
@@ -3801,7 +3886,7 @@ async fn handle_destroy_channel(
     order: ByteOrder,
     peer: SocketAddr,
     cred: &ClientCredentials,
-) -> PvaResult<()> {
+) -> PvaResult<Option<u32>> {
     // Inbound payload decodes with the frame's own header order (pvxs
     // latches `peerBE` per received message, conn.cpp:195-198); `order`
     // (config) is used only for the outbound reply below.
@@ -3824,7 +3909,7 @@ async fn handle_destroy_channel(
     // remove + reply only on hit.
     if !channels.contains_key(&sid) {
         debug!(sid, cid, "DESTROY_CHANNEL on unknown SID: dropping");
-        return Ok(());
+        return Ok(None);
     }
     // pvxs also warns when `chan->cid != cid` (line 390-393) but proceeds
     // with the destroy. We don't keep the wire CID alongside the SID
@@ -3849,6 +3934,12 @@ async fn handle_destroy_channel(
     let ch = channels
         .remove(&sid)
         .expect("SID presence verified by contains_key above");
+    // The DESTROY_CHANNEL reply is charged to the channel being torn
+    // down (pvxs serverchan.cpp:409 `statTx += 16u`); capture its
+    // counter before `close_channel` consumes the state. pvxs charges no
+    // per-channel `statRx` for CREATE/DESTROY (serverchan.cpp has only
+    // statTx) — only the reply is attributed here.
+    let stat = ch.stat.clone();
     close_channel(ch, peer, cred);
     let mut payload = Vec::new();
     payload.put_u32(sid, order);
@@ -3862,8 +3953,9 @@ async fn handle_destroy_channel(
     let mut buf = Vec::new();
     h.write_into(&mut buf);
     buf.extend_from_slice(&payload);
+    stat.add_tx(buf.len());
     let _ = tx.send(buf).await;
-    Ok(())
+    Ok(Some(sid))
 }
 
 /// Handle CANCEL_REQUEST (cmd 21). pvxs serverconn.cpp:262 — moves the op
@@ -4164,6 +4256,14 @@ async fn handle_op(
         }
     };
 
+    // Attribute this inbound op frame's body to the channel's report
+    // counter (pvxs `chan->statRx += rxlen`, serverget.cpp:386 /
+    // servermon.cpp:513). All per-channel reply/data frames go out
+    // through `chan_tx`, the single owner of `statTx` accounting, so the
+    // outbound count cannot be skipped at any send site.
+    ch.stat.add_rx(frame.payload.len());
+    let chan_tx = ChannelTx::new(tx.clone(), ch.stat.clone());
+
     // Dispatch every operation to the source bound at CREATE_CHANNEL,
     // not the top-level registry. pvxs installs the accepting source's
     // callbacks into the ServerChan (serverchan.cpp:70-112) and a later
@@ -4193,8 +4293,8 @@ async fn handle_op(
         // so a malicious peer can't accumulate IOID state forever
         // by sending INIT … INIT … without ever issuing DESTROY.
         if ch.ops.len() >= config.max_ops_per_channel {
-            send_op_error(
-                tx,
+            send_chan_op_error(
+                &chan_tx,
                 kind,
                 ioid,
                 subcmd,
@@ -4217,7 +4317,15 @@ async fn handle_op(
             (OpKind::Rpc, None) => FieldDesc::Variant,
             (_, Some(d)) => d,
             (_, None) => {
-                send_op_error(tx, kind, ioid, subcmd, "must provide prototype", order).await?;
+                send_chan_op_error(
+                    &chan_tx,
+                    kind,
+                    ioid,
+                    subcmd,
+                    "must provide prototype",
+                    order,
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -4264,8 +4372,8 @@ async fn handle_op(
                 // (`pvrequest.cpp:61-62`). Pre-fix Rust silently
                 // fell back to all-fields, leaking fields the client
                 // didn't request.
-                send_op_error(
-                    tx,
+                send_chan_op_error(
+                    &chan_tx,
                     kind,
                     ioid,
                     subcmd,
@@ -4303,8 +4411,8 @@ async fn handle_op(
         // `serverget` ignores these options), so the reject is
         // monitor-only.
         if kind == OpKind::Monitor && matches!(pipeline_req, Some(MonitorPipelineRequest::Reject)) {
-            send_op_error(
-                tx,
+            send_chan_op_error(
+                &chan_tx,
                 kind,
                 ioid,
                 subcmd,
@@ -4473,7 +4581,9 @@ async fn handle_op(
         let mut buf = Vec::new();
         h.write_into(&mut buf);
         buf.extend_from_slice(&payload);
-        let _ = tx.send(buf).await;
+        // Attribute the op INIT reply to the channel (pvxs
+        // `chan->statTx += enqueueTxBody(cmd)`, serverget.cpp:124).
+        let _ = chan_tx.send(buf).await;
         return Ok(());
     }
 
@@ -4512,7 +4622,7 @@ async fn handle_op(
             // continue parsing frames while the source future runs.
             let pv_name = ch.name.clone();
             let src = source.clone();
-            let tx_clone = tx.clone();
+            let tx_clone = chan_tx.clone();
             let intro_t = intro.clone();
             let mask_t = mask.clone();
             let cred_account = cred.account.clone();
@@ -4569,7 +4679,7 @@ async fn handle_op(
                 let value = match catch_handler_panic(src.get_value_checked(checked, ctx)).await {
                     Ok(Some(v)) => v,
                     Ok(None) => {
-                        let _ = send_op_error(
+                        let _ = send_chan_op_error(
                             &tx_clone,
                             OpKind::Get,
                             ioid,
@@ -4582,13 +4692,14 @@ async fn handle_op(
                     }
                     Err(msg) => {
                         let _ =
-                            send_op_error(&tx_clone, OpKind::Get, ioid, subcmd, &msg, order).await;
+                            send_chan_op_error(&tx_clone, OpKind::Get, ioid, subcmd, &msg, order)
+                                .await;
                         return;
                     }
                 };
                 // source-side mismatch gate.
                 if let Err(e) = crate::pvdata::value_matches_descriptor(&value, &intro_t) {
-                    let _ = send_op_error(
+                    let _ = send_chan_op_error(
                         &tx_clone,
                         OpKind::Get,
                         ioid,
@@ -4639,7 +4750,7 @@ async fn handle_op(
                 // source.get_value_checked which can be slow.
                 let pv_name = ch.name.clone();
                 let src = source.clone();
-                let tx_clone = tx.clone();
+                let tx_clone = chan_tx.clone();
                 let intro_t = intro.clone();
                 let mask_t = mask.clone();
                 let cred_account = cred.account.clone();
@@ -4694,7 +4805,7 @@ async fn handle_op(
                     {
                         Ok(Some(v)) => v,
                         Ok(None) => {
-                            let _ = send_op_error(
+                            let _ = send_chan_op_error(
                                 &tx_clone,
                                 OpKind::Put,
                                 ioid,
@@ -4706,9 +4817,15 @@ async fn handle_op(
                             return;
                         }
                         Err(msg) => {
-                            let _ =
-                                send_op_error(&tx_clone, OpKind::Put, ioid, subcmd, &msg, order)
-                                    .await;
+                            let _ = send_chan_op_error(
+                                &tx_clone,
+                                OpKind::Put,
+                                ioid,
+                                subcmd,
+                                &msg,
+                                order,
+                            )
+                            .await;
                             return;
                         }
                     };
@@ -4769,7 +4886,7 @@ async fn handle_op(
             // Decode frame data synchronously (above) so the cursor is
             // consumed before returning; source calls happen in the task.
             let src = source.clone();
-            let tx_clone = tx.clone();
+            let tx_clone = chan_tx.clone();
             let intro_t = intro.clone();
             let cred_account = cred.account.clone();
             let cred_method = cred.method.clone();
@@ -5066,7 +5183,7 @@ async fn handle_op(
                 let pv_name = ch.name.clone();
                 let intro_clone = intro.clone();
                 let mask_clone = mask.clone();
-                let tx_clone = tx.clone();
+                let tx_clone = chan_tx.clone();
                 let src = source.clone();
                 // Per-operation monitor queue depth: the client-requested
                 // `record._options.queueSize` (captured at INIT into
@@ -5877,7 +5994,7 @@ async fn handle_op(
             let pv_name = ch.name.clone();
             let _ = intro;
             let src = source.clone();
-            let tx_clone = tx.clone();
+            let tx_clone = chan_tx.clone();
             let rpc_ctx_val = crate::server_native::source::ChannelContext {
                 peer,
                 account: cred.account.clone(),
@@ -6011,6 +6128,13 @@ async fn handle_get_field(
         );
         return Ok(None);
     }
+    // Attribute the GET_FIELD request and its reply to the channel
+    // (pvxs serverintrospect.cpp:164 `chan->statRx += rxlen`, :45
+    // `ch->statTx += enqueueTxBody(CMD_GET_FIELD)`); both the cached
+    // fast-path reply and the spawned slow-path reply go through
+    // `chan_tx`.
+    chan.stat.add_rx(frame.payload.len());
+    let chan_tx = ChannelTx::new(tx.clone(), chan.stat.clone());
     match chan.introspection.clone() {
         Some(intro) => {
             // Fast path: introspection already cached on the channel; no source call needed.
@@ -6023,7 +6147,7 @@ async fn handle_get_field(
             let mut buf = Vec::new();
             h.write_into(&mut buf);
             buf.extend_from_slice(&payload);
-            let _ = tx.send(buf).await;
+            let _ = chan_tx.send(buf).await;
             Ok(None)
         }
         None => {
@@ -6033,7 +6157,7 @@ async fn handle_get_field(
             // server.cpp:100-112; see `handle_op`).
             let pv_name = chan.name.clone();
             let src = chan.source.clone();
-            let tx_clone = tx.clone();
+            let tx_clone = chan_tx.clone();
             // introspect under the downstream connection's
             // identity. pvxs builds the GET_FIELD ConnectOp with
             // `conn->cred` (`serverintrospect.cpp:66`); a gateway must
@@ -6112,6 +6236,40 @@ async fn send_op_error(
     msg: &str,
     order: ByteOrder,
 ) -> PvaResult<()> {
+    let buf = build_op_error_frame(kind, ioid, subcmd, msg, order);
+    let _ = tx.send(buf).await;
+    Ok(())
+}
+
+/// Per-channel op error reply. pvxs charges every error reply to the
+/// owning channel's counter too (the reply leaves via the same
+/// `enqueueTxBody` → `chan->statTx` primitive as the success reply),
+/// so any error path on a resolved channel must go through `chan_tx`
+/// — the unknown-SID path has no channel and uses [`send_op_error`].
+async fn send_chan_op_error(
+    chan_tx: &ChannelTx,
+    kind: OpKind,
+    ioid: u32,
+    subcmd: u8,
+    msg: &str,
+    order: ByteOrder,
+) -> PvaResult<()> {
+    let buf = build_op_error_frame(kind, ioid, subcmd, msg, order);
+    let _ = chan_tx.send(buf).await;
+    Ok(())
+}
+
+/// Encode a single op error reply frame (`kind` command, `ioid`,
+/// `subcmd`, error `Status`). Shared by the connection-level
+/// [`send_op_error`] and the per-channel [`send_chan_op_error`] so the
+/// two cannot drift on framing.
+fn build_op_error_frame(
+    kind: OpKind,
+    ioid: u32,
+    subcmd: u8,
+    msg: &str,
+    order: ByteOrder,
+) -> Vec<u8> {
     let cmd = kind.command();
     let mut payload = Vec::new();
     payload.put_u32(ioid, order);
@@ -6121,8 +6279,7 @@ async fn send_op_error(
     let mut buf = Vec::new();
     h.write_into(&mut buf);
     buf.extend_from_slice(&payload);
-    let _ = tx.send(buf).await;
-    Ok(())
+    buf
 }
 
 #[allow(unused_imports)]
@@ -7426,6 +7583,7 @@ mod tests {
                     sid,
                     introspection: Some(intro),
                     source,
+                    stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     ops: HashMap::new(),
                 },
             );
@@ -7785,6 +7943,7 @@ mod tests {
                 sid,
                 introspection: Some(intro.clone()),
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -7907,6 +8066,7 @@ mod tests {
                 sid,
                 introspection: Some(intro.clone()),
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -8005,6 +8165,7 @@ mod tests {
                 sid,
                 introspection: Some(intro.clone()),
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -8175,6 +8336,7 @@ mod tests {
                 sid,
                 introspection: None,
                 source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops,
             },
         );
@@ -8402,6 +8564,7 @@ mod tests {
                 sid: 1,
                 introspection: Some(FieldDesc::Scalar(ScalarType::Int)),
                 source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops,
             },
         );
@@ -8479,6 +8642,7 @@ mod tests {
                 sid,
                 introspection: None,
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops,
             },
         );
@@ -8575,6 +8739,7 @@ mod tests {
                 sid,
                 introspection: Some(FieldDesc::Variant),
                 source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops,
             },
         );
@@ -8899,6 +9064,7 @@ mod tests {
                 sid,
                 introspection: None,
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -8949,6 +9115,7 @@ mod tests {
                 sid,
                 introspection: None,
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -9088,6 +9255,7 @@ mod tests {
                 sid,
                 introspection: None,
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -9174,6 +9342,7 @@ mod tests {
                 sid,
                 introspection: Some(intro.clone()),
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -9301,6 +9470,7 @@ mod tests {
                 sid,
                 introspection: Some(intro.clone()),
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -9440,6 +9610,7 @@ mod tests {
                     sid,
                     introspection: Some(intro.clone()),
                     source: source.clone(),
+                    stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     ops,
                 },
             );
@@ -9762,6 +9933,7 @@ mod tests {
                 sid,
                 introspection: Some(intro.clone()),
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -9886,6 +10058,7 @@ mod tests {
                 sid,
                 introspection: Some(intro.clone()),
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -10208,6 +10381,7 @@ mod tests {
                 sid,
                 introspection: Some(intro),
                 source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops,
             },
         );
@@ -10595,6 +10769,7 @@ mod tests {
                 sid,
                 introspection: Some(intro),
                 source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops,
             },
         );
@@ -10711,6 +10886,7 @@ mod tests {
                 sid,
                 introspection: Some(intro),
                 source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -10989,6 +11165,7 @@ mod tests {
                 sid,
                 introspection: Some(intro.clone()),
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops,
             },
         );
@@ -11169,6 +11346,7 @@ mod tests {
                 sid,
                 introspection: Some(intro.clone()),
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops,
             },
         );
@@ -11305,6 +11483,7 @@ mod tests {
                 sid,
                 introspection: Some(FieldDesc::Variant),
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops,
             },
         );
@@ -11355,6 +11534,7 @@ mod tests {
                 sid,
                 introspection: Some(FieldDesc::Variant),
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -11377,6 +11557,73 @@ mod tests {
             .expect("clean GET_FIELD must emit introspection reply");
         // ioid (4) + status (1 + ...) + type descriptor
         assert!(resp.len() > PvaHeader::SIZE + 4);
+    }
+
+    /// Per-channel report attribution wiring: a GET_FIELD request charges
+    /// the inbound body to the channel's `statRx` and the reply to its
+    /// `statTx` (pvxs serverintrospect.cpp:45/164). Drives the real
+    /// handler and reads back the SHARED `ChannelStat` Arc the report
+    /// would observe, so a future send site that bypasses `chan_tx` (or a
+    /// missing rx charge) regresses this test.
+    #[tokio::test]
+    async fn get_field_attributes_tx_rx_to_channel_stat() {
+        use crate::pvdata::FieldDesc;
+        use crate::server_native::SharedSource;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 7;
+        let ioid: u32 = 4242;
+
+        let source: DynSource = Arc::new(SharedSource::new());
+        // Keep our own handle on the channel's stat — this is the exact
+        // Arc a `PeerEntry::channel_opened` registration would share with
+        // the report.
+        let stat = crate::server_native::peers::ChannelStat::new("dut".into());
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(FieldDesc::Variant),
+                source: source.clone(),
+                stat: stat.clone(),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        crate::proto::encode_string_into("", order, &mut payload);
+        let frame = synth_frame(Command::GetField, order, payload);
+        let inbound_body = frame.payload.len();
+
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+        handle_get_field(&frame, &tx, &channels, order, peer, &cred)
+            .await
+            .expect("handler returns Ok");
+
+        let resp = rx
+            .try_recv()
+            .expect("clean GET_FIELD must emit introspection reply");
+
+        assert_eq!(
+            stat.rx.load(Ordering::Relaxed),
+            inbound_body as u64,
+            "GET_FIELD inbound body must be charged to the channel statRx"
+        );
+        assert_eq!(
+            stat.tx.load(Ordering::Relaxed),
+            resp.len() as u64,
+            "GET_FIELD reply must be charged to the channel statTx"
+        );
     }
 
     /// GET_FIELD slow path on a channel whose source returns no
@@ -11408,6 +11655,7 @@ mod tests {
                 sid,
                 introspection: None,
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -11480,6 +11728,7 @@ mod tests {
                 sid,
                 introspection: None,
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -11864,6 +12113,7 @@ mod tests {
                 sid,
                 introspection: Some(intro.clone()),
                 source: src.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops,
             },
         );
@@ -12002,6 +12252,7 @@ mod tests {
                 sid,
                 introspection: Some(intro.clone()),
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -12172,6 +12423,7 @@ mod tests {
                 sid: 1,
                 introspection: intro,
                 source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops: HashMap::new(),
             },
         );
@@ -12296,6 +12548,7 @@ mod tests {
                     sid,
                     introspection: Some(three_field_intro()),
                     source: source.clone(),
+                    stat: crate::server_native::peers::ChannelStat::new(String::new()),
                     ops: HashMap::new(),
                 },
             );
@@ -12716,6 +12969,7 @@ mod r14_tests {
                 sid,
                 introspection: Some(intro),
                 source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops,
             },
         );
@@ -12897,6 +13151,7 @@ mod bfr15_tests {
                 sid,
                 introspection: Some(intro),
                 source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
                 ops,
             },
         );

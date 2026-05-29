@@ -695,6 +695,53 @@ async fn pva_fr_2_client_report_has_connection_byte_counters() {
     h.abort();
 }
 
+/// Two PVs monitored through ONE shared client share a single server
+/// connection — the property the `pvmonitor-rs` command relies on after
+/// it was changed to build one client for the whole command instead of
+/// one `PvaClient` per PV. pvxs starts every subscription from a single
+/// `client::Context` whose `connByAddr` reuses one connection per server
+/// (clientconn.cpp:44-56). Before the CLI fix, two PVs on the same IOC
+/// opened two clients and could open two connections.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pva_fr_166_shared_client_one_connection_for_two_monitors() {
+    let source = Arc::new(MemSource::new());
+    source.add_pv("STAB:MON166A", 1.0).await;
+    source.add_pv("STAB:MON166B", 2.0).await;
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let client = client_for(tcp);
+
+    // Both monitors come from the SAME client (as the CLI now clones one
+    // shared client into every task).
+    let a = client
+        .pvmonitor_handle("STAB:MON166A", |_d, _v| {})
+        .await
+        .expect("subscribe A");
+    let b = client
+        .pvmonitor_handle("STAB:MON166B", |_d, _v| {})
+        .await
+        .expect("subscribe B");
+
+    // Let both subscriptions reach Active on the shared connection.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let r = client.report();
+    assert_eq!(
+        r.connections.len(),
+        1,
+        "two PVs on one server via one client must share one connection, got {}",
+        r.connections.len()
+    );
+    assert_eq!(
+        r.connections[0].channels.len(),
+        2,
+        "both monitored channels ride the single shared connection"
+    );
+
+    a.stop();
+    b.stop();
+    h.abort();
+}
+
 /// Regression: commit c3f286c added a server-side pipeline
 /// credit window unconditionally for every Monitor op, but pvxs only
 /// applies flow control when the client's pvRequest explicitly

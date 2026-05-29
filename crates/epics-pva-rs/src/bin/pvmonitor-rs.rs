@@ -94,20 +94,24 @@ async fn main() {
         cli::print_effective_config();
     }
 
+    // One client for the whole command, shared by every monitor task —
+    // not one PvaClient per PV. pvxs builds a single client::Context and
+    // starts every subscription from it (tools/monitor.cpp:95-122), so PVs
+    // on the same IOC share one channel cache, connection pool, and search
+    // engine, and one coherent hurryUp() can follow the install loop. `-w`
+    // bounds the connect/operation timeout (pvxs monitor has none; threaded
+    // per finding 23) rather than being silently dropped.
+    let client = PvaClient::builder()
+        .timeout(epics_pva_rs::cli::timeout_duration(args.timeout))
+        .build();
+
     let mut handles = Vec::new();
 
     for pv_name in args.pv_names {
         let mode = args.mode.clone();
         let request = request.clone();
-        let timeout = args.timeout;
+        let client = client.clone();
         let handle = tokio::spawn(async move {
-            // `-w` bounds the connect/operation timeout (pvxs monitor
-            // has none; thread it into the client per finding 23's
-            // connect-timeout option) rather than being silently dropped.
-            let client = PvaClient::builder()
-                .timeout(epics_pva_rs::cli::timeout_duration(timeout))
-                .build();
-
             // Get introspection once for typed formatting
             let desc = client.pvinfo(&pv_name).await.ok();
 
@@ -137,6 +141,11 @@ async fn main() {
         });
         handles.push(handle);
     }
+
+    // All subscriptions registered — hurry discovery once from the shared
+    // client, matching pvxs `ctxt.hurryUp()` after the install loop
+    // (tools/monitor.cpp:120-122).
+    client.hurry_up().await;
 
     for handle in handles {
         let _ = handle.await;

@@ -512,7 +512,7 @@ impl PvaLinkResolver {
         let sevr = cfg.sevr;
         self.registry
             .try_get_inp(bare, cfg.pipeline, cfg.queue_size)?
-            .link_alarm_severity_with(sevr)
+            .link_alarm_severity_with(&cfg.field, sevr)
     }
 
     /// Wait until the link for `pv_name` has received at least one
@@ -973,11 +973,12 @@ impl LinkSet for PvaLinkResolver {
         }
         let cfg = self.inp_cfg_for(full);
         let sevr = cfg.sevr;
+        let field = cfg.field.clone();
         let link = block_in_place_or_warn(|| {
             self.handle
                 .block_on(async { self.registry.get_or_open(cfg).await.ok() })
         })?;
-        link.alarm_message_with(sevr)
+        link.alarm_message_with(&field, sevr)
     }
 
     fn alarm_severity(&self, name: &str) -> Option<i32> {
@@ -995,11 +996,12 @@ impl LinkSet for PvaLinkResolver {
         }
         let cfg = self.inp_cfg_for(full);
         let sevr = cfg.sevr;
+        let field = cfg.field.clone();
         let link = block_in_place_or_warn(|| {
             self.handle
                 .block_on(async { self.registry.get_or_open(cfg).await.ok() })
         })?;
-        link.link_alarm_severity_with(sevr)
+        link.link_alarm_severity_with(&field, sevr)
     }
 
     fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
@@ -1021,6 +1023,7 @@ impl LinkSet for PvaLinkResolver {
         // wrong link's option. pvxs `pvaLinkConfig::time` is per-link.
         let cfg = self.inp_cfg_for(full);
         let want_time = cfg.time;
+        let field = cfg.field.clone();
         let link = block_in_place_or_warn(|| {
             self.handle
                 .block_on(async { self.registry.get_or_open(cfg).await.ok() })
@@ -1034,7 +1037,7 @@ impl LinkSet for PvaLinkResolver {
         if !want_time {
             return None;
         }
-        link.time_stamp()
+        link.time_stamp(&field)
     }
 
     fn link_metadata(&self, name: &str) -> Option<epics_base_rs::server::database::LinkMetadata> {

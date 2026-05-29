@@ -595,13 +595,20 @@ impl PvaLink {
         }
     }
 
-    /// Raw remote NT `alarm.severity` of the latest cached value, in
-    /// EPICS severity numbering (`0 = NO_ALARM` … `3 = INVALID`).
-    /// `None` when no value is cached or the structure carries no
-    /// alarm sub-field.
-    fn remote_alarm_severity(&self) -> Option<i32> {
+    /// Raw remote NT `alarm.severity` of the latest cached value, read
+    /// relative to the link's selected field root, in EPICS severity
+    /// numbering (`0 = NO_ALARM` … `3 = INVALID`). `None` when no value
+    /// is cached or the selected root carries no alarm sub-field.
+    ///
+    /// `field` selects the metadata root exactly as pvxs does: a
+    /// non-empty `fieldName` rebinds `root = lchan->root[fieldName]` and
+    /// `fld_severity` is then resolved relative to that selected root
+    /// (`pvxs/ioc/pvalink_link.cpp:90-110`,
+    /// `pvxs/ioc/pvalink_lset.cpp:412-430`). `field=""` keeps the
+    /// top-level root.
+    fn remote_alarm_severity(&self, field: &str) -> Option<i32> {
         let v = self.latest.lock().clone()?;
-        let PvField::Structure(s) = v else {
+        let PvField::Structure(s) = select_target(&v, field) else {
             return None;
         };
         let PvField::Structure(a) = s.get_field("alarm")? else {
@@ -643,7 +650,7 @@ impl PvaLink {
     /// gate that propagates `snap_severity` into `LINK_ALARM` only
     /// when `(sevr==MS && sev!=NO_ALARM) || (sevr==MSI && sev==INVALID)`.
     pub fn link_alarm_severity(&self) -> Option<i32> {
-        self.link_alarm_severity_with(self.config.sevr)
+        self.link_alarm_severity_with(&self.config.field, self.config.sevr)
     }
 
     /// Like [`Self::link_alarm_severity`] but gates on a
@@ -657,7 +664,11 @@ impl PvaLink {
     /// gate. The resolver passes the caller's own parsed `sevr` so
     /// each link applies its own maximize-severity mode (pvxs
     /// `pvaLinkConfig::sevr` is per-link, `pvxs/ioc/pvalink.h:65`).
-    pub fn link_alarm_severity_with(&self, sevr: super::config::SevrMode) -> Option<i32> {
+    pub fn link_alarm_severity_with(
+        &self,
+        field: &str,
+        sevr: super::config::SevrMode,
+    ) -> Option<i32> {
         // a disconnected monitor link is INVALID
         // regardless of the MS/NMS/MSI gate — a broken link is a local
         // failure, not a remote-severity propagation that NMS would
@@ -670,7 +681,7 @@ impl PvaLink {
         if self.monitor_disconnected_stale() {
             return Some(3); // INVALID
         }
-        let sev = self.remote_alarm_severity()?;
+        let sev = self.remote_alarm_severity(field)?;
         if sevr.propagates(sev) {
             Some(sev)
         } else {
@@ -694,7 +705,7 @@ impl PvaLink {
     /// the severity does propagate, a synthetic message is returned so
     /// the alarm is still observable.
     pub fn alarm_message(&self) -> Option<String> {
-        self.alarm_message_with(self.config.sevr)
+        self.alarm_message_with(&self.config.field, self.config.sevr)
     }
 
     /// Like [`Self::alarm_message`] but gates on a caller-supplied
@@ -703,7 +714,7 @@ impl PvaLink {
     /// same rationale as [`Self::link_alarm_severity_with`] —
     /// the alarm-message gate must use the caller's per-link `sevr`,
     /// not whichever cached link's mode happens to be shared.
-    pub fn alarm_message_with(&self, sevr: super::config::SevrMode) -> Option<String> {
+    pub fn alarm_message_with(&self, field: &str, sevr: super::config::SevrMode) -> Option<String> {
         // disconnect dominates — report the link failure,
         // not the stale remote alarm message. Pairs with the INVALID
         // severity `link_alarm_severity_with` returns for the same
@@ -715,9 +726,14 @@ impl PvaLink {
         }
         // Severity gate first — NMS / sub-threshold links report
         // nothing.
-        let sev = self.link_alarm_severity_with(sevr)?;
+        let sev = self.link_alarm_severity_with(field, sevr)?;
         let v = self.latest.lock().clone()?;
-        let PvField::Structure(s) = v else {
+        // Resolve the alarm string relative to the link's selected
+        // field root, matching `remote_alarm_severity` — pvxs reads
+        // `fld_message` from the same selected `root[fieldName]`
+        // (`pvxs/ioc/pvalink_link.cpp:90-110`,
+        // `pvxs/ioc/pvalink_lset.cpp:412-430`).
+        let PvField::Structure(s) = select_target(&v, field) else {
             return None;
         };
         let msg = s.get_field("alarm").and_then(|alarm| {
@@ -745,7 +761,7 @@ impl PvaLink {
     /// `pvaGetTimeStampTag`. The `userTag` is the remote
     /// `timeStamp.userTag` widened to the 64-bit tag WITHOUT sign
     /// extension (see the read below); `0` when the field is absent.
-    pub fn time_stamp(&self) -> Option<(i64, i32, u64)> {
+    pub fn time_stamp(&self, field: &str) -> Option<(i64, i32, u64)> {
         // a disconnected monitor link must not serve its
         // stale latched timestamp — pvxs gates every lset getter
         // through `CHECK_VALID` (`valid() = connected && root`), so
@@ -757,7 +773,12 @@ impl PvaLink {
             return None;
         }
         let v = self.latest.lock().clone()?;
-        let PvField::Structure(s) = v else {
+        // Resolve `timeStamp` relative to the selected field root —
+        // pvxs reads `fld_seconds`/`fld_nanoseconds`/`fld_usertag` from
+        // the same `root[fieldName]` selected by `onTypeChange`
+        // (`pvxs/ioc/pvalink_link.cpp:90-110`,
+        // `pvxs/ioc/pvalink_lset.cpp:399-409`).
+        let PvField::Structure(s) = select_target(&v, field) else {
             return None;
         };
         let ts = s.get_field("timeStamp")?;
@@ -1405,6 +1426,121 @@ mod tests {
         );
     }
 
+    /// A link whose `field` selects a nested structure must read its
+    /// alarm severity, alarm message AND timestamp from that selected
+    /// root — not from the top-level NT alarm/timeStamp. pvxs rebinds
+    /// `root = lchan->root[fieldName]` in `onTypeChange`
+    /// (`pvxs/ioc/pvalink_link.cpp:90-110`) and then resolves
+    /// `fld_severity`/`fld_message`/`fld_seconds`/`fld_nanoseconds`/
+    /// `fld_usertag` relative to that root
+    /// (`pvxs/ioc/pvalink_lset.cpp:399-430`). Pre-fix every one of
+    /// these getters read the top-level alarm/timeStamp regardless of
+    /// the selected field, so a link selecting a nested member adopted
+    /// the wrong member's (or the container's) alarm and time.
+    #[test]
+    fn alarm_and_timestamp_resolve_at_selected_field_root() {
+        // Top-level alarm is NO_ALARM and timeStamp is secs=1; the
+        // selected `member` sub-structure carries MAJOR(2)/"member hot"
+        // and a distinct timeStamp secs=999, ns=7, userTag=5.
+        let mut top_alarm = PvStructure::new("alarm_t");
+        top_alarm
+            .fields
+            .push(("severity".into(), PvField::Scalar(ScalarValue::Int(0))));
+        let mut top_ts = PvStructure::new("time_t");
+        top_ts.fields.push((
+            "secondsPastEpoch".into(),
+            PvField::Scalar(ScalarValue::Long(1)),
+        ));
+        top_ts
+            .fields
+            .push(("nanoseconds".into(), PvField::Scalar(ScalarValue::Int(0))));
+
+        let mut mem_alarm = PvStructure::new("alarm_t");
+        mem_alarm
+            .fields
+            .push(("severity".into(), PvField::Scalar(ScalarValue::Int(2))));
+        mem_alarm.fields.push((
+            "message".into(),
+            PvField::Scalar(ScalarValue::String("member hot".into())),
+        ));
+        let mut mem_ts = PvStructure::new("time_t");
+        mem_ts.fields.push((
+            "secondsPastEpoch".into(),
+            PvField::Scalar(ScalarValue::Long(999)),
+        ));
+        mem_ts
+            .fields
+            .push(("nanoseconds".into(), PvField::Scalar(ScalarValue::Int(7))));
+        mem_ts
+            .fields
+            .push(("userTag".into(), PvField::Scalar(ScalarValue::Int(5))));
+        let mut member = PvStructure::new("epics:nt/NTScalar:1.0");
+        member
+            .fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(7.0))));
+        member
+            .fields
+            .push(("alarm".into(), PvField::Structure(mem_alarm)));
+        member
+            .fields
+            .push(("timeStamp".into(), PvField::Structure(mem_ts)));
+
+        let mut root = PvStructure::new("epics:nt/NTScalar:1.0");
+        root.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+        root.fields
+            .push(("alarm".into(), PvField::Structure(top_alarm)));
+        root.fields
+            .push(("timeStamp".into(), PvField::Structure(top_ts)));
+        root.fields
+            .push(("member".into(), PvField::Structure(member)));
+        let value = PvField::Structure(root);
+
+        // field="member", MS: alarm/message/timestamp come from member.
+        let cfg = PvaLinkConfig {
+            field: "member".to_string(),
+            monitor: true,
+            sevr: SevrMode::Ms,
+            ..PvaLinkConfig::defaults_for("SEL:PV", LinkDirection::Inp)
+        };
+        let link = PvaLink::for_test(cfg, Some(value.clone()));
+        assert_eq!(
+            link.link_alarm_severity(),
+            Some(2),
+            "severity must come from the selected member, not top-level NO_ALARM"
+        );
+        assert_eq!(
+            link.alarm_message().as_deref(),
+            Some("member hot"),
+            "message must come from the selected member"
+        );
+        assert_eq!(
+            link.time_stamp("member"),
+            Some((999, 7, 5)),
+            "timestamp/userTag must come from the selected member"
+        );
+
+        // field="" reads the top-level root: NO_ALARM does not
+        // propagate (None), and the timestamp is the top-level secs=1.
+        let cfg_top = PvaLinkConfig {
+            monitor: true,
+            sevr: SevrMode::Ms,
+            ..PvaLinkConfig::defaults_for("SEL:PV", LinkDirection::Inp)
+        };
+        let link_top = PvaLink::for_test(cfg_top, Some(value));
+        assert_eq!(
+            link_top.link_alarm_severity(),
+            None,
+            "top-level NO_ALARM under MS propagates nothing"
+        );
+        assert_eq!(link_top.alarm_message(), None);
+        assert_eq!(
+            link_top.time_stamp(""),
+            Some((1, 0, 0)),
+            "empty field reads the top-level timeStamp"
+        );
+    }
+
     use super::super::config::LinkDirection;
     use super::super::config::{PvaLinkConfig, SevrMode};
 
@@ -1788,12 +1924,12 @@ mod tests {
         // Alarm hooks report INVALID(3) + a disconnect message even
         // though the link is NMS (which suppresses remote severities).
         assert_eq!(
-            link.link_alarm_severity_with(SevrMode::Nms),
+            link.link_alarm_severity_with("", SevrMode::Nms),
             Some(3),
             "disconnect must surface INVALID regardless of NMS"
         );
         assert_eq!(
-            link.alarm_message_with(SevrMode::Nms).as_deref(),
+            link.alarm_message_with("", SevrMode::Nms).as_deref(),
             Some("pvalink monitor disconnected"),
             "disconnect message, not the stale remote alarm string"
         );
@@ -1823,9 +1959,9 @@ mod tests {
             "live monitor fast path returns the cached value"
         );
         // MS link, remote MAJOR(2) → propagates 2, not the disconnect INVALID.
-        assert_eq!(link.link_alarm_severity_with(SevrMode::Ms), Some(2));
+        assert_eq!(link.link_alarm_severity_with("", SevrMode::Ms), Some(2));
         assert_eq!(
-            link.alarm_message_with(SevrMode::Ms).as_deref(),
+            link.alarm_message_with("", SevrMode::Ms).as_deref(),
             Some("hot")
         );
     }
@@ -1847,11 +1983,11 @@ mod tests {
         );
         assert!(link.try_read_cached().is_none());
         assert_eq!(
-            link.link_alarm_severity_with(SevrMode::Ms),
+            link.link_alarm_severity_with("", SevrMode::Ms),
             None,
             "never-connected link must not claim INVALID via the alarm hook"
         );
-        assert_eq!(link.alarm_message_with(SevrMode::Ms), None);
+        assert_eq!(link.alarm_message_with("", SevrMode::Ms), None);
     }
 
     /// Boundary (cached=Some, connected=false): the FR-13 stale gate is
@@ -1892,7 +2028,7 @@ mod tests {
         // (the FR-13 gate is inert while connected).
         flag.store(true, Ordering::Release);
         assert_eq!(
-            link.time_stamp(),
+            link.time_stamp(""),
             Some((1_700_000_000, 42, 0)),
             "connected monitor surfaces the cached timestamp; no userTag \
              field in the fixture, so the tag defaults to 0"
@@ -1906,7 +2042,7 @@ mod tests {
         // is still cached for diagnostics.
         flag.store(false, Ordering::Release);
         assert!(
-            link.time_stamp().is_none(),
+            link.time_stamp("").is_none(),
             "disconnected monitor must not serve the stale latched timestamp"
         );
         assert!(
@@ -1952,7 +2088,7 @@ mod tests {
                 Some(PvField::Structure(root)),
             );
             flag.store(true, Ordering::Release);
-            link.time_stamp().map(|(_, _, utag)| utag)
+            link.time_stamp("").map(|(_, _, utag)| utag)
         };
 
         // Absent userTag → 0 (pvxs `else snap_tag = 0`).

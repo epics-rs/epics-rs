@@ -17,7 +17,7 @@
 //! expose this `ServerSource` PV; the query therefore works against
 //! them even though the Rust server does not yet host the `server` PV.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -235,6 +235,83 @@ async fn query_server(
     }
 }
 
+/// Decides what `pvlist-rs` prints for each discovery event, matching
+/// pvxs `tools/list.cpp:129-148`.
+///
+/// Non-verbose mode is pipe-compatible: it emits only the raw TCP
+/// server address (so `pvlist-rs $(pvlist-rs -w 5)` works — the address
+/// feeds straight back into query mode), prints one address per
+/// `(guid, proto)` even when a server is reachable through several
+/// interfaces (`:139-147`), and suppresses Timeout/offline events
+/// (`:136`). Verbose mode keeps the detailed `ONLINE`/`OFFLINE` status
+/// lines.
+struct DiscoveryPrinter {
+    verbose: bool,
+    /// Non-verbose dedup: one printed address per `(guid, proto)`.
+    tcp_seen: HashSet<([u8; 12], String)>,
+    /// Verbose dedup + "servers seen" summary count, keyed `(server, guid)`.
+    online_seen: HashMap<(SocketAddr, [u8; 12]), ()>,
+}
+
+impl DiscoveryPrinter {
+    fn new(verbose: bool) -> Self {
+        Self {
+            verbose,
+            tcp_seen: HashSet::new(),
+            online_seen: HashMap::new(),
+        }
+    }
+
+    /// Line to print for an `Online` event, or `None` to suppress.
+    fn on_online(
+        &mut self,
+        server: SocketAddr,
+        guid: [u8; 12],
+        peer: SocketAddr,
+        proto: &str,
+    ) -> Option<String> {
+        if self.verbose {
+            // Detailed status line; dedup by (server, guid).
+            if self.online_seen.insert((server, guid), ()).is_some() {
+                return None;
+            }
+            Some(format!(
+                "ONLINE   {server:24}  guid={}  proto={proto}  peer={peer}",
+                fmt_guid(&guid)
+            ))
+        } else if proto == "tcp" {
+            // pvxs prints just one interface per (guid, proto) because
+            // the list is piped back to fetch PVs (list.cpp:139-147).
+            if self.tcp_seen.insert((guid, proto.to_string())) {
+                Some(server.to_string())
+            } else {
+                None
+            }
+        } else {
+            // Non-verbose suppresses non-TCP endpoints (list.cpp:133).
+            None
+        }
+    }
+
+    /// Line to print for a `Timeout` (offline) event, or `None`.
+    fn on_timeout(&mut self, server: SocketAddr, guid: [u8; 12]) -> Option<String> {
+        if self.verbose {
+            Some(format!("OFFLINE  {server:24}  guid={}", fmt_guid(&guid)))
+        } else {
+            // pvxs erases the (guid, "tcp") entry on Timeout so a later
+            // re-Online reprints the address (list.cpp:136). Our Timeout
+            // event carries no proto and non-verbose only tracks tcp.
+            self.tcp_seen.remove(&(guid, "tcp".to_string()));
+            None
+        }
+    }
+
+    /// Distinct servers seen, for the verbose summary line.
+    fn seen_count(&self) -> usize {
+        self.online_seen.len()
+    }
+}
+
 /// Discovery mode — active by default (broadcast ping + beacon
 /// listen); `-p` makes it passive (beacon listen only).
 async fn discover_mode(args: &Args) {
@@ -259,8 +336,7 @@ async fn discover_mode(args: &Args) {
         engine.ping_all().await;
     }
 
-    // De-dup by (server, guid) so a chatty IOC doesn't spam.
-    let mut seen: HashMap<(SocketAddr, [u8; 12]), bool> = HashMap::new();
+    let mut printer = DiscoveryPrinter::new(args.verbose);
     // `args.timeout <= 0` means "wait forever" by design. Non-finite
     // (NaN / ±Inf) also collapses to "no deadline".
     let deadline = if args.timeout.is_finite() && args.timeout > 0.0 {
@@ -288,30 +364,20 @@ async fn discover_mode(args: &Args) {
                 peer,
                 proto,
             } => {
-                if seen.insert((server, guid), true).is_some() {
-                    continue;
-                }
-                if args.verbose {
-                    println!(
-                        "ONLINE   {server:24}  guid={}  proto={proto}  peer={peer}",
-                        fmt_guid(&guid)
-                    );
-                } else {
-                    println!("ONLINE   {server}");
+                if let Some(line) = printer.on_online(server, guid, peer, &proto) {
+                    println!("{line}");
                 }
             }
             Discovered::Timeout { server, guid } => {
-                if args.verbose {
-                    println!("OFFLINE  {server:24}  guid={}", fmt_guid(&guid));
-                } else {
-                    println!("OFFLINE  {server}");
+                if let Some(line) = printer.on_timeout(server, guid) {
+                    println!("{line}");
                 }
             }
         }
     }
 
-    if args.verbose && !seen.is_empty() {
-        println!("\n{} server(s) seen.", seen.len());
+    if args.verbose && printer.seen_count() > 0 {
+        println!("\n{} server(s) seen.", printer.seen_count());
     }
 }
 
@@ -396,5 +462,77 @@ mod tests {
     #[test]
     fn active_and_passive_conflict() {
         assert!(Args::try_parse_from(["pvlist-rs", "-A", "-p"]).is_err());
+    }
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// Non-verbose discovery prints only the raw TCP address (no
+    /// ONLINE/OFFLINE label), and that line round-trips through
+    /// query-mode address parsing — the `pvlist-rs $(pvlist-rs)` form.
+    #[test]
+    fn nonverbose_prints_pipeable_tcp_address() {
+        let mut p = DiscoveryPrinter::new(false);
+        let line = p
+            .on_online(
+                addr("10.0.0.5:5075"),
+                [1u8; 12],
+                addr("10.0.0.5:34000"),
+                "tcp",
+            )
+            .expect("new tcp server prints its address");
+        assert_eq!(line, "10.0.0.5:5075");
+        // The printed token must parse back as a query-mode address.
+        assert_eq!(
+            parse_server_addr(&line, 5075).unwrap(),
+            addr("10.0.0.5:5075")
+        );
+    }
+
+    /// Non-verbose mode prints one address per (guid, proto), even
+    /// across interfaces, and suppresses Timeout/offline events.
+    #[test]
+    fn nonverbose_dedups_and_suppresses_offline() {
+        let mut p = DiscoveryPrinter::new(false);
+        let guid = [2u8; 12];
+        assert!(
+            p.on_online(addr("10.0.0.5:5075"), guid, addr("10.0.0.5:1"), "tcp")
+                .is_some()
+        );
+        // Same (guid, proto) via a different interface address: suppressed.
+        assert!(
+            p.on_online(addr("192.168.1.5:5075"), guid, addr("192.168.1.5:1"), "tcp")
+                .is_none()
+        );
+        // Offline event prints nothing in non-verbose mode.
+        assert!(p.on_timeout(addr("10.0.0.5:5075"), guid).is_none());
+        // After timeout cleared the entry, a re-Online reprints.
+        assert!(
+            p.on_online(addr("10.0.0.5:5075"), guid, addr("10.0.0.5:1"), "tcp")
+                .is_some()
+        );
+    }
+
+    /// Non-verbose mode suppresses non-TCP endpoints (e.g. tls).
+    #[test]
+    fn nonverbose_suppresses_non_tcp() {
+        let mut p = DiscoveryPrinter::new(false);
+        assert!(
+            p.on_online(addr("10.0.0.5:5076"), [3u8; 12], addr("10.0.0.5:1"), "tls")
+                .is_none()
+        );
+    }
+
+    /// Verbose mode keeps the detailed ONLINE/OFFLINE status lines.
+    #[test]
+    fn verbose_keeps_status_labels() {
+        let mut p = DiscoveryPrinter::new(true);
+        let on = p
+            .on_online(addr("10.0.0.5:5075"), [4u8; 12], addr("10.0.0.5:1"), "tcp")
+            .unwrap();
+        assert!(on.starts_with("ONLINE"));
+        let off = p.on_timeout(addr("10.0.0.5:5075"), [4u8; 12]).unwrap();
+        assert!(off.starts_with("OFFLINE"));
     }
 }

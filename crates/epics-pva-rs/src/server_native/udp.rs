@@ -1203,7 +1203,13 @@ pub(crate) fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
     }
     let mut cur = Cursor::new(frame);
     let header = PvaHeader::decode(&mut cur).ok()?;
-    if header.command != Command::Search.code() || header.flags.is_control() {
+    // UDP datagrams can carry neither control messages nor segmentation —
+    // segment bits are a TCP reassembly feature only. pvxs drops such a
+    // datagram before SEARCH matching (udp_collector.cpp:329-340).
+    if header.command != Command::Search.code()
+        || header.flags.is_control()
+        || !header.flags.unsegmented()
+    {
         return None;
     }
     let order = header.flags.byte_order();
@@ -1314,7 +1320,13 @@ fn parse_beacon(frame: &[u8]) -> Option<BeaconForward> {
     }
     let mut cur = Cursor::new(frame);
     let header = PvaHeader::decode(&mut cur).ok()?;
-    if header.command != Command::Beacon.code() || header.flags.is_control() {
+    // UDP datagrams can carry neither control messages nor segmentation
+    // (segment bits are TCP-only). pvxs drops a segmented UDP datagram
+    // before decode (udp_collector.cpp:329-340).
+    if header.command != Command::Beacon.code()
+        || header.flags.is_control()
+        || !header.flags.unsegmented()
+    {
         return None;
     }
     let order = header.flags.byte_order();
@@ -2275,6 +2287,57 @@ mod tests {
         let req_any = parse_search_request(&frame_any).expect("parse ok");
         assert_eq!(req_any.reply_addr, None);
         assert_eq!(req_any.reply_port, 5076);
+    }
+
+    /// Segment bits are a TCP reassembly feature; a UDP datagram must
+    /// never carry them. pvxs drops a segmented UDP datagram before
+    /// SEARCH matching (`udp_collector.cpp:329-340`). Each segment-bit
+    /// combination on an otherwise-valid SEARCH must yield `None`, while
+    /// the same frame un-segmented parses — so the reject is the segment
+    /// bits, not a malformed payload.
+    #[test]
+    fn parse_search_request_rejects_segmented_datagram() {
+        use crate::proto::header::HeaderFlags;
+        let codec = PvaCodec { big_endian: false };
+        // Sanity: the un-segmented frame parses.
+        let base = codec.build_search(7, 42, "MY:PV", [192, 168, 5, 10], 9999, false);
+        assert!(parse_search_request(&base).is_some());
+        // Flags byte lives at frame offset 2.
+        for seg in [
+            HeaderFlags::SEGMENT_FIRST,
+            HeaderFlags::SEGMENT_LAST,
+            HeaderFlags::SEGMENT_MASK,
+        ] {
+            let mut frame = base.clone();
+            frame[2] |= seg;
+            assert!(
+                parse_search_request(&frame).is_none(),
+                "segmented SEARCH (bits {seg:#04x}) must be dropped"
+            );
+        }
+    }
+
+    /// As above for BEACON: a segmented UDP beacon datagram must be
+    /// dropped (`udp_collector.cpp:329-340`), never decoded or
+    /// re-forwarded.
+    #[test]
+    fn parse_beacon_rejects_segmented_datagram() {
+        use crate::proto::header::HeaderFlags;
+        let guid = [0x11; 12];
+        let base = build_beacon(guid, 5075, ByteOrder::Little, 42, 0xBEEF, "tcp");
+        assert!(parse_beacon(&base).is_some());
+        for seg in [
+            HeaderFlags::SEGMENT_FIRST,
+            HeaderFlags::SEGMENT_LAST,
+            HeaderFlags::SEGMENT_MASK,
+        ] {
+            let mut frame = base.clone();
+            frame[2] |= seg;
+            assert!(
+                parse_beacon(&frame).is_none(),
+                "segmented BEACON (bits {seg:#04x}) must be dropped"
+            );
+        }
     }
 
     /// `resolve_reply_dest` invariant boundaries: an explicit advertised

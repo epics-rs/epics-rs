@@ -155,6 +155,10 @@ impl Record for LsoRecord {
         LSO_FIELDS
     }
 
+    fn long_string_fields(&self) -> &'static [&'static str] {
+        &["VAL", "OVAL"]
+    }
+
     // C recLso.c IVOA=set_to_IVOV: oval = ivov (string copy); val = oval.
     fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
         self.put_field("OVAL", ivov.clone())?;

@@ -40,6 +40,14 @@ pub enum NtType {
     Enum,
     /// waveform, compress, histogram
     ScalarArray,
+    /// A long-string field (`lsi`/`lso` VAL/OVAL, `printf` VAL): a
+    /// `DBF_CHAR` array that semantically holds a NUL-terminated string.
+    /// Served as a scalar-string NTScalar — the `CharArray` storage is
+    /// decoded to a `pvString` value at the QSRV boundary, matching
+    /// pvxs's `form = "String"` view (`ioc/iocsource.cpp:619-643`). This
+    /// removes the dual meaning of a `CharArray` snapshot (byte array vs.
+    /// string) by making the channel's intent explicit.
+    LongString,
 }
 
 impl NtType {
@@ -169,32 +177,31 @@ pub fn snapshot_to_nt_scalar(snapshot: &Snapshot) -> PvStructure {
         PvField::Structure(build_timestamp(snapshot.timestamp, snapshot.user_tag)),
     ));
 
-    // display
-    if let Some(ref disp) = snapshot.display {
+    // pvxs always emits the metadata fields the NTScalar descriptor
+    // advertises: `display` for every value, plus `control`/`valueAlarm`
+    // for numeric values (src/nt.cpp:58-112). When the record's metadata
+    // cache never populated display/control (e.g. stringin/stringout, and
+    // histogram — record types absent from the metadata allowlist), the
+    // fields are still present with descriptor defaults rather than
+    // disappearing (iocsource.cpp:254-309). Emitting them only when the
+    // snapshot carried metadata made the runtime value shape diverge from
+    // the `getField` descriptor; build them unconditionally from the
+    // snapshot metadata or its default so value and descriptor agree.
+    let disp = snapshot.display.clone().unwrap_or_default();
+    pv.fields.push((
+        "display".into(),
+        PvField::Structure(build_display(&disp, scalar_type, numeric)),
+    ));
+    if numeric {
+        let ctrl = snapshot.control.clone().unwrap_or_default();
         pv.fields.push((
-            "display".into(),
-            PvField::Structure(build_display(disp, scalar_type, numeric)),
+            "control".into(),
+            PvField::Structure(build_control(&ctrl, scalar_type)),
         ));
-    }
-
-    // control — pvxs emits this only for numeric values (src/nt.cpp:87).
-    if numeric {
-        if let Some(ref ctrl) = snapshot.control {
-            pv.fields.push((
-                "control".into(),
-                PvField::Structure(build_control(ctrl, scalar_type)),
-            ));
-        }
-    }
-
-    // valueAlarm — pvxs emits this only for numeric values (src/nt.cpp:97).
-    if numeric {
-        if let Some(ref disp) = snapshot.display {
-            pv.fields.push((
-                "valueAlarm".into(),
-                PvField::Structure(build_value_alarm(disp, scalar_type)),
-            ));
-        }
+        pv.fields.push((
+            "valueAlarm".into(),
+            PvField::Structure(build_value_alarm(&disp, scalar_type)),
+        ));
     }
 
     pv
@@ -298,35 +305,66 @@ pub fn snapshot_to_nt_scalar_array(snapshot: &Snapshot) -> PvStructure {
         PvField::Structure(build_timestamp(snapshot.timestamp, snapshot.user_tag)),
     ));
 
-    // display
-    if let Some(ref disp) = snapshot.display {
+    // Same descriptor/value consistency rule as the scalar builder:
+    // pvxs reuses the NTScalar builder for arrays, so a numeric array
+    // value carries `display` plus `control`/`valueAlarm` unconditionally
+    // (with descriptor defaults when the record has no metadata, e.g.
+    // histogram), and a string array carries `display` only. Emitting
+    // them only when the snapshot had metadata diverged from the
+    // `getField` descriptor (src/nt.cpp:44-112, iocsource.cpp:254-309).
+    let disp = snapshot.display.clone().unwrap_or_default();
+    pv.fields.push((
+        "display".into(),
+        PvField::Structure(build_display(&disp, scalar_type, numeric)),
+    ));
+    if numeric {
+        let ctrl = snapshot.control.clone().unwrap_or_default();
         pv.fields.push((
-            "display".into(),
-            PvField::Structure(build_display(disp, scalar_type, numeric)),
+            "control".into(),
+            PvField::Structure(build_control(&ctrl, scalar_type)),
+        ));
+        pv.fields.push((
+            "valueAlarm".into(),
+            PvField::Structure(build_value_alarm(&disp, scalar_type)),
         ));
     }
 
-    // control — numeric arrays only (pvxs src/nt.cpp:87).
-    if numeric {
-        if let Some(ref ctrl) = snapshot.control {
-            pv.fields.push((
-                "control".into(),
-                PvField::Structure(build_control(ctrl, scalar_type)),
-            ));
-        }
-    }
-
-    // valueAlarm — numeric arrays only (pvxs src/nt.cpp:97).
-    if numeric {
-        if let Some(ref disp) = snapshot.display {
-            pv.fields.push((
-                "valueAlarm".into(),
-                PvField::Structure(build_value_alarm(disp, scalar_type)),
-            ));
-        }
-    }
-
     pv
+}
+
+/// Decode a long-string field's stored value into a Rust `String`.
+///
+/// The record keeps the string as a `DBF_CHAR` `CharArray` (its native CA
+/// representation); the QSRV boundary reads it back as a NUL-terminated,
+/// UTF-8 string, matching the record's own `put_field` decode (e.g.
+/// `lsiRecord` `String::from_utf8_lossy(&bytes[..first_nul])`).
+fn long_string_value(value: &EpicsValue) -> String {
+    match value {
+        EpicsValue::CharArray(bytes) => {
+            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            String::from_utf8_lossy(&bytes[..end]).into_owned()
+        }
+        EpicsValue::String(s) => s.clone(),
+        // Any other shape is unexpected for a long-string channel; fall
+        // back to the scalar rendering so a value is still produced.
+        other => match epics_to_scalar(other) {
+            ScalarValue::String(s) => s,
+            sv => sv.to_string(),
+        },
+    }
+}
+
+/// Convert a long-string Snapshot into a scalar-string NTScalar.
+///
+/// pvxs serves a `form = "String"` `DBF_CHAR` view as a `pvString`
+/// NTScalar (`ioc/iocsource.cpp:123-137`, `singlesource.cpp:189-205`).
+/// We decode the `CharArray` to a `String` and reuse the standard
+/// NTScalar builder, which emits the string-scalar metadata set
+/// (`display = {description, units}`, no numeric `control`/`valueAlarm`).
+fn snapshot_to_nt_long_string(snapshot: &Snapshot) -> PvStructure {
+    let mut snap = snapshot.clone();
+    snap.value = EpicsValue::String(long_string_value(&snapshot.value));
+    snapshot_to_nt_scalar(&snap)
 }
 
 /// Convert a Snapshot to the appropriate NormativeType based on NtType.
@@ -335,6 +373,7 @@ pub fn snapshot_to_pv_structure(snapshot: &Snapshot, nt_type: NtType) -> PvStruc
         NtType::Scalar => snapshot_to_nt_scalar(snapshot),
         NtType::Enum => snapshot_to_nt_enum(snapshot),
         NtType::ScalarArray => snapshot_to_nt_scalar_array(snapshot),
+        NtType::LongString => snapshot_to_nt_long_string(snapshot),
     }
 }
 
@@ -536,6 +575,10 @@ pub fn build_field_desc_for_nt(nt_type: NtType, scalar_type: ScalarType) -> Fiel
         NtType::Scalar => build_nt_scalar_desc(scalar_type),
         NtType::Enum => build_nt_enum_desc(),
         NtType::ScalarArray => build_nt_scalar_array_desc(scalar_type),
+        // A long-string field is advertised as a scalar-string NTScalar,
+        // independent of the bound field's `DBF_CHAR` storage type, so
+        // the descriptor matches the `pvString` value the GET path emits.
+        NtType::LongString => build_nt_scalar_desc(ScalarType::String),
     }
 }
 
@@ -957,6 +1000,63 @@ mod tests {
         snap
     }
 
+    /// A long-string `DBF_CHAR` field (`lsi`/`lso` VAL, `printf` VAL) is
+    /// served as a scalar-string NTScalar: the `CharArray` storage is
+    /// decoded to a `pvString` value, and the descriptor advertises
+    /// `value` as `String`, not `pvByte`. Before the fix the byte-array
+    /// snapshot was collapsed to a single `pvByte` (the first byte).
+    #[test]
+    fn long_string_field_builds_string_ntscalar() {
+        let text = "abc"; // 3 bytes; byte-collapse would yield 97 ('a')
+        let snap = Snapshot::new(
+            EpicsValue::CharArray(text.as_bytes().to_vec()),
+            0,
+            0,
+            UNIX_EPOCH,
+        );
+        let pv = snapshot_to_pv_structure(&snap, NtType::LongString);
+        assert_eq!(pv.struct_id, "epics:nt/NTScalar:1.0");
+        match pv.get_field("value") {
+            Some(PvField::Scalar(ScalarValue::String(s))) => assert_eq!(s, text),
+            other => panic!("expected scalar string value, got {other:?}"),
+        }
+
+        // Descriptor must advertise a string `value`, matching the GET
+        // value shape (no pvByte, no numeric control/valueAlarm).
+        let desc = build_field_desc_for_nt(NtType::LongString, ScalarType::Byte);
+        match desc {
+            FieldDesc::Structure { struct_id, fields } => {
+                assert_eq!(struct_id, "epics:nt/NTScalar:1.0");
+                let value_desc = fields.iter().find(|(n, _)| n == "value").map(|(_, d)| d);
+                assert!(
+                    matches!(value_desc, Some(FieldDesc::Scalar(ScalarType::String))),
+                    "value must be advertised as pvString, got {value_desc:?}"
+                );
+                // String scalars carry no numeric control/valueAlarm.
+                assert!(!fields.iter().any(|(n, _)| n == "control"));
+                assert!(!fields.iter().any(|(n, _)| n == "valueAlarm"));
+            }
+            other => panic!("expected NTScalar structure descriptor, got {other:?}"),
+        }
+    }
+
+    /// A NUL terminator inside the `CharArray` truncates the decoded
+    /// string, mirroring the record's own `put_field` decode.
+    #[test]
+    fn long_string_value_stops_at_nul() {
+        let snap = Snapshot::new(
+            EpicsValue::CharArray(b"hi\0junk".to_vec()),
+            0,
+            0,
+            UNIX_EPOCH,
+        );
+        let pv = snapshot_to_pv_structure(&snap, NtType::LongString);
+        match pv.get_field("value") {
+            Some(PvField::Scalar(ScalarValue::String(s))) => assert_eq!(s, "hi"),
+            other => panic!("expected scalar string value, got {other:?}"),
+        }
+    }
+
     fn alarm_scalar_int(s: &PvStructure, name: &str) -> i32 {
         match s.fields.iter().find(|(n, _)| n == name).map(|(_, f)| f) {
             Some(PvField::Scalar(ScalarValue::Int(v))) => *v,
@@ -1376,6 +1476,58 @@ mod tests {
         } else {
             panic!("expected structure descriptor");
         }
+    }
+
+    /// BR-112: a record whose metadata cache was never populated
+    /// (`display`/`control` are `None`, as for stringin/stringout and
+    /// histogram) must still emit exactly the metadata members its
+    /// `getField` descriptor advertises — built from descriptor defaults
+    /// — so the runtime GET value shape equals the descriptor shape.
+    #[test]
+    fn metadata_absent_value_member_set_matches_descriptor() {
+        let names = |pv: &PvStructure| -> Vec<String> {
+            pv.fields.iter().map(|(n, _)| n.clone()).collect()
+        };
+        let desc_names = |d: &FieldDesc| -> Vec<String> {
+            match d {
+                FieldDesc::Structure { fields, .. } => {
+                    fields.iter().map(|(n, _)| n.clone()).collect()
+                }
+                other => panic!("expected structure descriptor, got {other:?}"),
+            }
+        };
+
+        // Numeric scalar, no display/control metadata.
+        let snap = Snapshot::new(EpicsValue::Double(1.0), 0, 0, UNIX_EPOCH);
+        assert!(snap.display.is_none() && snap.control.is_none());
+        let pv = snapshot_to_nt_scalar(&snap);
+        assert_eq!(
+            names(&pv),
+            desc_names(&build_field_desc_for_nt(NtType::Scalar, ScalarType::Double)),
+            "numeric scalar value member set must equal descriptor"
+        );
+
+        // Numeric array (histogram-like), no metadata.
+        let snap_arr = Snapshot::new(EpicsValue::LongArray(vec![1, 2, 3]), 0, 0, UNIX_EPOCH);
+        let pv_arr = snapshot_to_nt_scalar_array(&snap_arr);
+        assert_eq!(
+            names(&pv_arr),
+            desc_names(&build_field_desc_for_nt(
+                NtType::ScalarArray,
+                ScalarType::Int
+            )),
+            "numeric array value member set must equal descriptor"
+        );
+
+        // String scalar (stringin-like), no metadata: `display` present,
+        // no numeric `control`/`valueAlarm`.
+        let snap_s = Snapshot::new(EpicsValue::String("x".into()), 0, 0, UNIX_EPOCH);
+        let pv_s = snapshot_to_nt_scalar(&snap_s);
+        assert_eq!(
+            names(&pv_s),
+            desc_names(&build_field_desc_for_nt(NtType::Scalar, ScalarType::String)),
+            "string scalar value member set must equal descriptor"
+        );
     }
 
     #[test]

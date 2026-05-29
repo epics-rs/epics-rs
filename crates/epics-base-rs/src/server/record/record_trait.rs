@@ -239,6 +239,24 @@ pub trait Record: Send + Sync + 'static {
     /// Return the list of field descriptors.
     fn field_list(&self) -> &'static [FieldDesc];
 
+    /// Field names this record serves as a *long string*: a `DBF_CHAR`
+    /// array field that semantically holds a NUL-terminated string.
+    ///
+    /// In EPICS such a field is declared `DBF_NOACCESS` (or carries a `$`
+    /// modifier) and is accessed through a `DBR_CHAR` array view whose
+    /// `form` is `"String"`; pvxs maps that view to a scalar `pvString`
+    /// rather than an `int8[]` (`ioc/channel.cpp:58-68`,
+    /// `ioc/iocsource.cpp:619-643`). QSRV uses this list to serve those
+    /// fields as scalar-string NTScalar values instead of byte scalars.
+    ///
+    /// The record keeps its `CharArray` storage; the QSRV boundary does
+    /// the `CharArray <-> String` conversion. Default empty — only
+    /// long-string record types (`lsi`/`lso` VAL/OVAL, `printf` VAL)
+    /// override this. Names are matched case-insensitively.
+    fn long_string_fields(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Field names declared `pp(TRUE)` in this record type's DBD, or
     /// `None` if the type's pp-flags have not been modeled.
     ///

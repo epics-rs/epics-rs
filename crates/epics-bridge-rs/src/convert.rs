@@ -73,7 +73,16 @@ pub fn scalar_to_epics(val: &ScalarValue) -> EpicsValue {
         ScalarValue::Byte(v) => EpicsValue::Char(*v as u8),
         ScalarValue::UByte(v) => EpicsValue::Short(*v as i16),
         ScalarValue::UShort(v) => EpicsValue::Enum(*v),
-        ScalarValue::UInt(v) => EpicsValue::Long(*v as i32),
+        // PVA `uint` (unsigned-32) has no unsigned-32 `EpicsValue`
+        // variant. Carry the full range losslessly through `Int64` (a
+        // `u32` always fits an `i64`), matching the documented C
+        // `DBF_ULONG` convention in `filters/ts.rs` and symmetric with
+        // the `ULong -> UInt64` / `Long -> Int64` arms. Folding it into
+        // `Long(*v as i32)` sign-wrapped any value above `i32::MAX`
+        // before the bound-field retype could observe its true
+        // magnitude, so a `uint = 0x8000_0000` PUT became a negative
+        // `Long` and could not be recovered for a wider unsigned target.
+        ScalarValue::UInt(v) => EpicsValue::Int64(*v as i64),
         ScalarValue::ULong(v) => EpicsValue::UInt64(*v),
         ScalarValue::Boolean(v) => EpicsValue::Short(if *v { 1 } else { 0 }),
     }
@@ -358,6 +367,18 @@ pub fn pv_field_to_epics(field: &PvField) -> Option<EpicsValue> {
                         })
                         .collect(),
                 )),
+                // PVA `uint[]` ↔ C `DBF_ULONG[]` — preserve the full
+                // unsigned-32 range through `Int64Array` (no unsigned-32
+                // `EpicsValue` variant exists), matching the `ts.rs`
+                // `DBF_ULONG` convention and the scalar `UInt` arm. The
+                // prior fallthrough folded `uint[]` into `DoubleArray`,
+                // losing the unsigned-32 element type.
+                ScalarValue::UInt(_) => Some(EpicsValue::Int64Array(
+                    arr.iter()
+                        .map(scalar_to_i64)
+                        .collect::<Result<_, _>>()
+                        .ok()?,
+                )),
                 // PVA `ulong[]` ↔ C `DBF_UINT64[]` — preserve the full
                 // unsigned range instead of folding into DoubleArray.
                 ScalarValue::ULong(_) => Some(EpicsValue::UInt64Array(
@@ -423,6 +444,46 @@ mod tests {
         }
         let back = pv_field_to_epics(&pf).unwrap();
         assert_eq!(back, arr);
+    }
+
+    /// A PVA `uint` above `i32::MAX` must survive context-free
+    /// extraction with its magnitude intact. The lossy
+    /// `UInt(v) => Long(v as i32)` arm sign-wrapped `0x8000_0000` to
+    /// `-2147483648`, so a later retype into a wider unsigned target
+    /// recovered a completely different number. `Int64` carries the full
+    /// unsigned-32 range (a `u32` always fits an `i64`).
+    #[test]
+    fn uint_scalar_preserves_full_unsigned32_range() {
+        let v: u32 = 0x8000_0000; // above i32::MAX
+        let ev = scalar_to_epics(&ScalarValue::UInt(v));
+        assert_eq!(ev, EpicsValue::Int64(2_147_483_648));
+
+        // The single-record PUT chain: extracted Int64 -> ScalarValue::Long
+        // -> typed retype into a DBF_UINT64 target preserves the value,
+        // unlike the old path that produced 18446744071562067968.
+        let sv = epics_to_scalar(&ev);
+        assert_eq!(sv, ScalarValue::Long(2_147_483_648));
+        let typed = scalar_to_epics_typed(&sv, DbFieldType::UInt64).unwrap();
+        assert_eq!(typed, EpicsValue::UInt64(2_147_483_648));
+    }
+
+    /// A PVA `uint[]` must round-trip through `Int64Array` (the
+    /// `DBF_ULONG[]` carrier), not collapse into `DoubleArray`. The prior
+    /// missing arm folded the array into `DoubleArray`, losing the
+    /// unsigned-32 element type and, for values above `2^53`, precision.
+    #[test]
+    fn uint_array_preserves_element_type_and_range() {
+        let big: u32 = 0xFFFF_FFFF;
+        let pf = PvField::ScalarArray(vec![
+            ScalarValue::UInt(0),
+            ScalarValue::UInt(0x8000_0000),
+            ScalarValue::UInt(big),
+        ]);
+        let ev = pv_field_to_epics(&pf).unwrap();
+        assert_eq!(
+            ev,
+            EpicsValue::Int64Array(vec![0, 2_147_483_648, 4_294_967_295])
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ use std::sync::Arc;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::longin::LonginRecord;
+use epics_base_rs::server::records::lsi::LsiRecord;
 use epics_base_rs::server::records::stringin::StringinRecord;
 use epics_base_rs::server::records::waveform::WaveformRecord;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
@@ -256,6 +257,102 @@ async fn channel_filter_suffix_strips_before_resolution() {
     assert!(matches!(value, PvField::Scalar(ScalarValue::Double(v)) if (*v - 1.5).abs() < 1e-9));
 }
 
+/// pvxs wraps every QSRV GET in a `LocalFieldLog` and runs the
+/// field-log chain before serialization (ioc/singlesource.cpp:278-292,
+/// ioc/localfieldlog.cpp:15-24), so an `arr` channel filter reshapes
+/// the GET read value exactly as it reshapes a monitor event. This
+/// asserts the three-way parity: filtered GET == filtered monitor
+/// event == the arr slice, and that an unfiltered channel on the same
+/// record still returns the full array (proving the slice comes from
+/// the filter chain, not the record state).
+#[tokio::test]
+async fn arr_channel_filter_applies_to_get_matching_monitor() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_bridge_rs::qsrv::provider::{BridgeProvider, PvaMonitor};
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record(
+        "TEST:filt_wf",
+        Box::new(WaveformRecord::new(8, DbFieldType::Double)),
+    )
+    .await
+    .unwrap();
+    db.put_pv(
+        "TEST:filt_wf",
+        EpicsValue::DoubleArray(vec![10.0, 20.0, 30.0, 40.0, 50.0]),
+    )
+    .await
+    .expect("seed");
+
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+
+    // `arr` slice [1..=3] over the 5-element seed selects 20,30,40.
+    let any = provider
+        .create_channel_for(r#"TEST:filt_wf.VAL{"arr":{"s":1,"e":3}}"#, "u", "h")
+        .await
+        .expect("filtered channel resolves");
+    let ch = match any {
+        epics_bridge_rs::qsrv::AnyChannel::Single(c) => c,
+        _ => panic!("expected single-record channel"),
+    };
+
+    let doubles = |s: &PvStructure| -> Vec<f64> {
+        match extract_value(s).expect("value") {
+            PvField::ScalarArray(a) => a
+                .iter()
+                .map(|v| match v {
+                    ScalarValue::Double(d) => *d,
+                    other => panic!("expected double element, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected scalar array, got {other:?}"),
+        }
+    };
+
+    // GET applies the chain in read context.
+    let get_result = ch.get(&empty_request()).await.expect("get");
+    let get_slice = doubles(&get_result);
+    assert_eq!(
+        get_slice,
+        vec![20.0, 30.0, 40.0],
+        "filtered GET must return the arr slice, not the full array"
+    );
+
+    // The monitor event on the same filtered channel carries the
+    // identical slice.
+    let mut mon = ch.create_monitor().await.expect("monitor");
+    mon.start().await.expect("start");
+    {
+        let rec = db.get_record("TEST:filt_wf").await.expect("rec");
+        rec.read().await.notify_field("VAL", EventMask::VALUE);
+    }
+    let ev = tokio::time::timeout(std::time::Duration::from_secs(2), mon.poll())
+        .await
+        .expect("monitor event within 2s")
+        .expect("snapshot");
+    assert_eq!(
+        doubles(&ev.value),
+        get_slice,
+        "monitor event slice must match the filtered GET slice"
+    );
+
+    // An unfiltered channel on the same record returns the full array.
+    let plain = BridgeChannel::from_cached(
+        db.clone(),
+        "TEST:filt_wf".into(),
+        "TEST:filt_wf".into(),
+        "VAL".into(),
+        NtType::ScalarArray,
+        DbFieldType::Double,
+    );
+    let plain_result = plain.get(&empty_request()).await.expect("get");
+    assert_eq!(
+        doubles(&plain_result),
+        vec![10.0, 20.0, 30.0, 40.0, 50.0],
+        "an unfiltered channel must return all 5 seeded elements"
+    );
+}
+
 /// a `record.FIELD` PV name binds to that field, not to VAL.
 /// GET on `test:ai.EGU` returns the EGU string, not the AI VAL double.
 /// PUT through the channel writes EGU, not VAL.
@@ -318,4 +415,64 @@ async fn channel_with_field_suffix_binds_to_field() {
         matches!(val_after, Some(EpicsValue::Double(v)) if (v - 3.125).abs() < 1e-9),
         "VAL must NOT have been overwritten, got {val_after:?}"
     );
+}
+
+/// BR-56 parity: an `lsi` long-string record's VAL is a `DBF_CHAR` array
+/// that semantically holds a string. pvxs serves it as a `pvString`
+/// NTScalar (`form = "String"`); the Rust bridge must too, instead of
+/// collapsing the byte array to a single `pvByte` (the first byte).
+#[tokio::test]
+async fn lsi_long_string_get_put_round_trips_as_string() {
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("TEST:lsi", Box::new(LsiRecord::new("abcdef")))
+        .await
+        .unwrap();
+
+    // `BridgeChannel::new` classifies the channel from the record's
+    // `long_string_fields` declaration.
+    let ch = BridgeChannel::new(db.clone(), "TEST:lsi")
+        .await
+        .expect("new");
+    assert_eq!(ch.nt_type(), NtType::LongString);
+
+    // Descriptor advertises `value` as a string scalar.
+    let desc = ch.get_field().await.expect("get_field");
+    match desc {
+        epics_pva_rs::pvdata::FieldDesc::Structure { fields, .. } => {
+            let v = fields.iter().find(|(n, _)| n == "value").map(|(_, d)| d);
+            assert!(
+                matches!(
+                    v,
+                    Some(epics_pva_rs::pvdata::FieldDesc::Scalar(
+                        epics_pva_rs::pvdata::ScalarType::String
+                    ))
+                ),
+                "value descriptor must be pvString, got {v:?}"
+            );
+        }
+        other => panic!("expected NTScalar descriptor, got {other:?}"),
+    }
+
+    // GET returns the full string, not the first byte.
+    let result = ch.get(&empty_request()).await.expect("get");
+    let value = extract_value(&result).expect("NTScalar.value");
+    match value {
+        PvField::Scalar(ScalarValue::String(s)) => assert_eq!(s, "abcdef"),
+        other => panic!("expected scalar string value, got {other:?}"),
+    }
+
+    // PUT a scalar string; the record stores it (no DBF_CHAR retype that
+    // would reject the multi-character string), and GET sees the update.
+    let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+    put.fields.push((
+        "value".into(),
+        PvField::Scalar(ScalarValue::String("hello world".into())),
+    ));
+    ch.put(&put).await.expect("put string");
+
+    let after = ch.get(&empty_request()).await.expect("get after put");
+    match extract_value(&after).expect("value") {
+        PvField::Scalar(ScalarValue::String(s)) => assert_eq!(s, "hello world"),
+        other => panic!("expected updated string, got {other:?}"),
+    }
 }

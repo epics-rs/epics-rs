@@ -132,6 +132,10 @@ impl Record for LsiRecord {
         LSI_FIELDS
     }
 
+    fn long_string_fields(&self) -> &'static [&'static str] {
+        &["VAL", "OVAL"]
+    }
+
     fn uses_monitor_deadband(&self) -> bool {
         false
     }

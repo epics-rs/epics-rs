@@ -3,6 +3,8 @@
 //! `mshim`): timeout parsing, the `-v` effective-config diagnostic,
 //! and the `-V` version-information text.
 
+use std::time::Duration;
+
 /// Default PVA CLI timeout in seconds when a user-supplied `-w`
 /// is missing or non-finite. Matches `pvget-rs` default of 5.0 s
 /// (epics-base `pvget` likewise defaults to 5 s, vs CA tools' 1 s).
@@ -15,13 +17,79 @@ pub const DEFAULT_CLI_TIMEOUT_SECS: f64 = 5.0;
 /// non-finite-or-non-positive input. Mirrors the
 /// `epics_ca_rs::cli::timeout_duration` analog (epics-base 1655d68e
 /// — defensive handling of pathological floats in tool timeouts).
-pub fn timeout_duration(secs: f64) -> std::time::Duration {
+pub fn timeout_duration(secs: f64) -> Duration {
     let s = if secs.is_finite() && secs > 0.0 {
         secs
     } else {
         DEFAULT_CLI_TIMEOUT_SECS
     };
-    std::time::Duration::from_secs_f64(s)
+    Duration::from_secs_f64(s)
+}
+
+/// CLI `-w` timeout policy for tools whose pvxs semantics treat a
+/// non-positive `-w` as **no deadline** rather than the 5 s clamp of
+/// [`timeout_duration`].
+///
+/// pvxs `-w 0` does not mean one thing across the tools, so a single
+/// duration-valued helper cannot serve all of them. `pvxlist` documents
+/// `-w 0` as "disables timeout" and waits with `done.wait()` (no
+/// deadline) in BOTH discovery and query mode
+/// (`tools/list.cpp:55-58,154-203`). This type names that regime so a
+/// tool derives one consistent policy from `-w` and applies it
+/// identically in every mode, instead of one mode treating `-w 0` as
+/// no-deadline while another clamps it to 5 s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeoutPolicy {
+    /// A bounded operation deadline.
+    Finite(Duration),
+    /// No deadline — wait until the operation completes or the user
+    /// interrupts.
+    Forever,
+}
+
+impl TimeoutPolicy {
+    /// `-w 0` ("no timeout") cannot be expressed as a truly unbounded
+    /// wait on the Duration-based client builder
+    /// ([`crate::client::PvaClient`]'s `timeout` takes a `Duration`, fed
+    /// to `tokio::time::timeout`), so [`TimeoutPolicy::Forever`] is
+    /// encoded as a ~10-year sentinel the operation timeout cannot
+    /// realistically reach — operationally a no-deadline wait for an
+    /// interactive CLI, and far below any `Instant` overflow. Matches
+    /// pvxs `pvxlist`'s `done.wait()` (`tools/list.cpp:154-203`).
+    const FOREVER_SENTINEL: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
+
+    /// `pvxlist`'s `-w` rule: a finite, strictly-positive value is a
+    /// bounded deadline; `0`, a negative, or a non-finite value
+    /// (NaN/±Inf) is "no timeout" (`tools/list.cpp:55-58,154-203`). This
+    /// is the no-timeout-on-zero regime — the inverse of `pvxcall`'s
+    /// immediate-on-zero and distinct from the 5 s clamp
+    /// ([`timeout_duration`]).
+    pub fn wait_or_forever(secs: f64) -> Self {
+        if secs.is_finite() && secs > 0.0 {
+            TimeoutPolicy::Finite(Duration::from_secs_f64(secs))
+        } else {
+            TimeoutPolicy::Forever
+        }
+    }
+
+    /// The bounded wait duration, or `None` for [`TimeoutPolicy::Forever`].
+    /// A discovery loop maps this to an `Option<Instant>` deadline so
+    /// `Forever` becomes a genuinely unbounded receive wait.
+    pub fn finite_duration(self) -> Option<Duration> {
+        match self {
+            TimeoutPolicy::Finite(d) => Some(d),
+            TimeoutPolicy::Forever => None,
+        }
+    }
+
+    /// The operation timeout to hand the Duration-based client builder.
+    /// `Forever` maps to [`Self::FOREVER_SENTINEL`].
+    pub fn op_timeout(self) -> Duration {
+        match self {
+            TimeoutPolicy::Finite(d) => d,
+            TimeoutPolicy::Forever => Self::FOREVER_SENTINEL,
+        }
+    }
 }
 
 /// The shared `-V` / `--version` text for the PVA CLI tools, the
@@ -152,6 +220,37 @@ mod tests {
     fn timeout_duration_preserves_positive_finite() {
         let d = timeout_duration(3.5);
         assert!((d.as_secs_f64() - 3.5).abs() < 1e-9);
+    }
+
+    /// `pvxlist` `-w 0` means "no timeout": the policy is `Forever`, and
+    /// non-positive / non-finite inputs collapse the same way
+    /// (`tools/list.cpp:55-58,154-203`). This is the inverse of the
+    /// `timeout_duration` 5 s clamp above.
+    #[test]
+    fn wait_or_forever_treats_nonpositive_as_forever() {
+        for secs in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                TimeoutPolicy::wait_or_forever(secs),
+                TimeoutPolicy::Forever,
+                "secs={secs}"
+            );
+        }
+        // Forever has no finite deadline (discovery → unbounded wait)
+        // and a far-future operation timeout (query → effectively no
+        // deadline).
+        assert_eq!(TimeoutPolicy::Forever.finite_duration(), None);
+        assert!(TimeoutPolicy::Forever.op_timeout() >= Duration::from_secs(365 * 24 * 3600));
+    }
+
+    /// A finite, strictly-positive `-w` is a bounded deadline, applied
+    /// identically by discovery (`finite_duration`) and query
+    /// (`op_timeout`).
+    #[test]
+    fn wait_or_forever_preserves_positive_finite() {
+        let p = TimeoutPolicy::wait_or_forever(3.0);
+        assert_eq!(p, TimeoutPolicy::Finite(Duration::from_secs(3)));
+        assert_eq!(p.finite_duration(), Some(Duration::from_secs(3)));
+        assert_eq!(p.op_timeout(), Duration::from_secs(3));
     }
 
     /// The shared `-v` verbose path emits the pvxs `Effective config`

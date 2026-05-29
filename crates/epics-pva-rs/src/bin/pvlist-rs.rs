@@ -19,7 +19,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::time::Duration;
 
 use clap::Parser;
 use futures_util::future::join_all;
@@ -341,13 +340,13 @@ async fn discover_mode(args: &Args) {
     }
 
     let mut printer = DiscoveryPrinter::new(args.verbose);
-    // `args.timeout <= 0` means "wait forever" by design. Non-finite
-    // (NaN / ±Inf) also collapses to "no deadline".
-    let deadline = if args.timeout.is_finite() && args.timeout > 0.0 {
-        Some(tokio::time::Instant::now() + Duration::from_secs_f64(args.timeout))
-    } else {
-        None
-    };
+    // `-w 0` (and any non-positive / non-finite value) means "wait
+    // forever". Derived from the same `TimeoutPolicy::wait_or_forever`
+    // the query path uses, so the two modes cannot diverge on what `-w`
+    // means; `Forever` → no deadline → unbounded receive wait.
+    let deadline = epics_pva_rs::cli::TimeoutPolicy::wait_or_forever(args.timeout)
+        .finite_duration()
+        .map(|d| tokio::time::Instant::now() + d);
 
     loop {
         let recv_fut = rx.recv();
@@ -418,8 +417,13 @@ async fn main() {
         }
     }
 
+    // Query mode shares discovery's `-w` policy: `pvxlist -w 0 SERVER`
+    // waits indefinitely for the server RPCs (`tools/list.cpp:154-203`),
+    // it does not fall back to a finite per-RPC timeout. Route `-w`
+    // through the same `TimeoutPolicy::wait_or_forever` so `-w 0` is a
+    // no-deadline operation timeout here too, not a 5 s clamp.
     let client = PvaClient::builder()
-        .timeout(epics_pva_rs::cli::timeout_duration(args.timeout))
+        .timeout(epics_pva_rs::cli::TimeoutPolicy::wait_or_forever(args.timeout).op_timeout())
         .build();
 
     // pvxs `tools/list.cpp:156-197` `exec()`s every server RPC before
@@ -476,6 +480,41 @@ mod tests {
     #[test]
     fn active_and_passive_conflict() {
         assert!(Args::try_parse_from(["pvlist-rs", "-A", "-p"]).is_err());
+    }
+
+    /// `pvlist-rs -w 0` is "no timeout" in BOTH discovery and query
+    /// modes (pvxs `tools/list.cpp:55-58,154-203`). Both modes derive the
+    /// policy from the same parsed `-w`, so `-w 0` → `Forever` (no
+    /// finite deadline) for either argument shape; the prior query-mode
+    /// 5 s clamp is gone.
+    #[test]
+    fn w_zero_is_no_timeout_in_both_modes() {
+        use epics_pva_rs::cli::TimeoutPolicy;
+        // Discovery argument shape (no server) and query argument shape
+        // (server present) parse the same `-w 0`.
+        for argv in [
+            vec!["pvlist-rs", "-w", "0"],
+            vec!["pvlist-rs", "-w", "0", "1.2.3.4"],
+        ] {
+            let args = Args::parse_from(argv.clone());
+            let policy = TimeoutPolicy::wait_or_forever(args.timeout);
+            assert_eq!(policy, TimeoutPolicy::Forever, "argv={argv:?}");
+            // Discovery: Forever → no deadline.
+            assert_eq!(policy.finite_duration(), None, "argv={argv:?}");
+        }
+    }
+
+    /// A positive `-w` is a bounded deadline in both modes.
+    #[test]
+    fn w_positive_is_finite_in_both_modes() {
+        use epics_pva_rs::cli::TimeoutPolicy;
+        let args = Args::parse_from(["pvlist-rs", "-w", "3", "1.2.3.4"]);
+        let policy = TimeoutPolicy::wait_or_forever(args.timeout);
+        assert_eq!(
+            policy,
+            TimeoutPolicy::Finite(std::time::Duration::from_secs(3))
+        );
+        assert_eq!(policy.op_timeout(), std::time::Duration::from_secs(3));
     }
 
     /// The `server` RPC request advertises all four normative NTURI

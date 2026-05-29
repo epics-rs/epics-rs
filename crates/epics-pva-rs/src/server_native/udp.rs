@@ -106,7 +106,11 @@ fn bind_beacon_send_v6() -> Option<Arc<tokio::net::UdpSocket>> {
     }
 }
 
-fn bind_udp(port: u16, interfaces: &[Ipv4Addr]) -> PvaResult<AsyncUdpV4> {
+fn bind_udp(
+    port: u16,
+    interfaces: &[Ipv4Addr],
+    beacon_dests: &[SocketAddr],
+) -> PvaResult<AsyncUdpV4> {
     // `EPICS_PVAS_INTF_ADDR_LIST` constrains the responder to the listed
     // interfaces (pvxs `server.cpp:407-439` binds UDP search listeners
     // only on the effective interface set). Empty list = the historical
@@ -119,13 +123,52 @@ fn bind_udp(port: u16, interfaces: &[Ipv4Addr]) -> PvaResult<AsyncUdpV4> {
         AsyncUdpV4::bind_on_interfaces(interfaces, port, true)
     }
     .map_err(PvaError::Io)?;
-    // pvxs server.cpp joins multicast groups listed in
-    // EPICS_PVAS_INTF_ADDR_LIST / EPICS_PVA_ADDR_LIST so SEARCH packets
-    // sent to those groups reach the responder. We do the same here —
-    // the call is idempotent on each restart and silently skips
-    // non-multicast entries.
-    crate::client_native::search_engine::join_addr_list_multicast(&sock);
+    // pvxs `config.cpp:512-518` calls `addGroups(ifaces, beaconDestinations,
+    // ifmap)` after resolving the server's beacon destinations, so every
+    // multicast address the server beacons to also becomes a search-listener
+    // interface (`config.cpp:310-335`); `server.cpp:411-423` then starts a
+    // UDP listener — joining the group — for each. The join source is the
+    // server's *effective beacon destinations*, which already encode the
+    // `EPICS_PVAS_BEACON_ADDR_LIST` → `EPICS_PVA_ADDR_LIST` precedence and
+    // any programmatic `PvaServerConfig::beacon_destinations`. (The
+    // client-side `join_addr_list_multicast` reads `EPICS_PVA_ADDR_LIST`
+    // directly because that is the client search-target list; for the
+    // server, the raw client var is the wrong source — it ignores the
+    // PVAS-specific list and programmatic destinations.)
+    join_beacon_multicast_groups(&sock, beacon_dests);
     Ok(sock)
+}
+
+/// Select the IPv4 multicast groups the responder must join from the
+/// server's effective beacon destinations (pvxs `addGroups`,
+/// `config.cpp:310-335`). Non-multicast and IPv6 destinations are dropped —
+/// the v4 socket cannot join a v6 group, and broadcast/unicast destinations
+/// need no membership. Pure so the destination-source decision (the PVA-33
+/// fix: beacon destinations, not the raw client `EPICS_PVA_ADDR_LIST`) is
+/// testable without real NIC multicast.
+fn multicast_v4_groups(beacon_dests: &[SocketAddr]) -> Vec<Ipv4Addr> {
+    beacon_dests
+        .iter()
+        .filter_map(|dest| match dest {
+            SocketAddr::V4(v4) if v4.ip().is_multicast() => Some(*v4.ip()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Join every IPv4 multicast group in the server's effective beacon
+/// destinations on the responder socket, so SEARCH packets sent to those
+/// groups reach us (pvxs `addGroups` / `server.cpp:411-423`). Idempotent
+/// across restarts; a single failed join is logged but does not disable the
+/// rest.
+fn join_beacon_multicast_groups(sock: &AsyncUdpV4, beacon_dests: &[SocketAddr]) {
+    for ip in multicast_v4_groups(beacon_dests) {
+        if let Err(e) = sock.join_multicast_v4(ip) {
+            debug!("join_multicast_v4 for beacon destination {ip} failed: {e}");
+        } else {
+            debug!("joined beacon multicast group {ip}");
+        }
+    }
 }
 
 /// Run the UDP search responder + beacon emitter until the runtime is dropped.
@@ -188,7 +231,7 @@ pub async fn run_udp_responder_with_config(
     // discovered NIC. Empty = all-NIC default.
     interfaces: Vec<Ipv4Addr>,
 ) -> PvaResult<()> {
-    let socket = bind_udp(udp_port, &interfaces)?;
+    let socket = bind_udp(udp_port, &interfaces, &destinations)?;
     let socket = Arc::new(socket);
     debug!(?udp_port, "UDP search responder started");
 
@@ -2690,6 +2733,74 @@ mod tests {
         assert!(
             ForwardableDatagram::decode_all(&cc).is_empty(),
             "only SEARCH/BEACON are forwardable"
+        );
+    }
+
+    /// The server's multicast SEARCH-listener joins are derived from its
+    /// effective beacon destinations (pvxs `addGroups`): only IPv4
+    /// multicast destinations become group joins. Broadcast, unicast, and
+    /// IPv6 destinations are dropped.
+    #[test]
+    fn multicast_v4_groups_selects_only_v4_multicast_beacon_destinations() {
+        use std::net::{Ipv6Addr, SocketAddrV6};
+        let dests = vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 1, 1, 1)), 5076), // mcast
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 255)), 5076), // broadcast
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), 5076),  // unicast
+            SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::new(0xff0e, 0, 0, 0, 0, 0, 0, 0x400),
+                5076,
+                0,
+                0,
+            )), // v6 mcast — not joinable on the v4 socket
+        ];
+        assert_eq!(
+            multicast_v4_groups(&dests),
+            vec![Ipv4Addr::new(224, 1, 1, 1)]
+        );
+        assert!(multicast_v4_groups(&[]).is_empty());
+    }
+
+    /// PVA-33 regression: a server configured with
+    /// `EPICS_PVAS_BEACON_ADDR_LIST` and NO `EPICS_PVA_ADDR_LIST` must
+    /// still join the configured multicast group for inbound SEARCH. The
+    /// old join read `EPICS_PVA_ADDR_LIST` directly, so the PVAS-specific
+    /// beacon list never produced a join. Drive the real config path
+    /// (`server_beacon_addr_list_opt`) and assert the group is selected.
+    #[test]
+    fn pvas_beacon_addr_list_without_pva_addr_list_joins_multicast() {
+        // nextest isolates each test in its own process, so mutating the
+        // process environment here cannot leak into a sibling test.
+        // SAFETY: std::env::{set,remove}_var are unsafe in the 2024
+        // edition; the per-process isolation makes the mutation sound.
+        unsafe {
+            std::env::remove_var("EPICS_PVA_ADDR_LIST");
+            std::env::set_var("EPICS_PVAS_BEACON_ADDR_LIST", "224.0.7.7");
+        }
+        let dests =
+            crate::config::env::server_beacon_addr_list_opt().expect("PVAS beacon list present");
+        unsafe {
+            std::env::remove_var("EPICS_PVAS_BEACON_ADDR_LIST");
+        }
+        assert_eq!(
+            multicast_v4_groups(&dests),
+            vec![Ipv4Addr::new(224, 0, 7, 7)],
+            "PVAS_BEACON_ADDR_LIST multicast group must be joined even with PVA_ADDR_LIST unset"
+        );
+    }
+
+    /// PVA-33 regression: a programmatic `PvaServerConfig::beacon_destinations`
+    /// (no env at all) must also produce the multicast join — the old
+    /// env-only join ignored programmatic destinations entirely.
+    #[test]
+    fn programmatic_beacon_destinations_join_multicast() {
+        let dests = vec![SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(239, 1, 2, 3)),
+            5076,
+        )];
+        assert_eq!(
+            multicast_v4_groups(&dests),
+            vec![Ipv4Addr::new(239, 1, 2, 3)]
         );
     }
 }

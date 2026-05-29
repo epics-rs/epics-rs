@@ -43,6 +43,13 @@ pub struct PvGetResult {
     pub server_addr: SocketAddr,
 }
 
+/// A single `pvinfo` describe result: the channel's introspection, the
+/// server that replied, and the server's verified X.509 identity (the
+/// credentials pvxs `pvxinfo -v` prints; `None` for a plain `pva://`
+/// connection). Names the shape returned per-PV by the concurrent
+/// [`PvaClient::pvinfo_many_full_with_credentials`] batch.
+pub type PvInfoResult = (FieldDesc, SocketAddr, Option<crate::auth::X509Credentials>);
+
 /// Records that this `PvaClient`'s upstream credentials are a
 /// gateway-asserted identity derived from a *downstream* connection
 /// that authenticated with a method this client cannot forward
@@ -1890,20 +1897,75 @@ impl PvaClient {
     }
 
     /// Same as [`Self::pvget_many`] but returns full introspection +
-    /// server address for each PV.
-    pub async fn pvget_many_full(&self, pv_names: &[&str]) -> Vec<PvaResult<PvGetResult>> {
+    /// server address for each PV, and applies an optional custom
+    /// pvRequest (`None` = the default all-fields GET) to every PV.
+    ///
+    /// Every GET is *started* before any is awaited: one tokio task per
+    /// PV issues the operation concurrently, then the client's UDP
+    /// search is hurried so siblings discover in parallel, and the whole
+    /// set is awaited under the per-op timeout. A slow or missing PV no
+    /// longer blocks its siblings from starting, and the batch is bounded
+    /// by one timeout instead of N. Mirrors pvxs `tools/get.cpp:102-133`,
+    /// which `exec()`s every operation, calls `ctxt.hurryUp()`, and waits
+    /// once on the shared completion event. Results are in input order;
+    /// a failed PV maps to `Err`.
+    pub async fn pvget_many_full(
+        &self,
+        pv_names: &[&str],
+        request: Option<&crate::pv_request::PvRequestExpr>,
+    ) -> Vec<PvaResult<PvGetResult>> {
         let n = pv_names.len();
         let mut set = tokio::task::JoinSet::new();
         for (idx, name) in pv_names.iter().enumerate() {
             let client = self.clone();
             let name = name.to_string();
-            set.spawn(async move { (idx, client.pvget_full(&name).await) });
+            let request = request.cloned();
+            set.spawn(async move {
+                let r = match &request {
+                    Some(req) => client.pvget_with_request_full(&name, req).await,
+                    None => client.pvget_full(&name).await,
+                };
+                (idx, r)
+            });
         }
+        // All ops started — hurry discovery so the spawned channels
+        // search immediately instead of waiting for the periodic tick
+        // (pvxs `ctxt.hurryUp()` after the exec loop).
+        self.hurry_up().await;
         let mut results: Vec<PvaResult<PvGetResult>> =
             (0..n).map(|_| Err(PvaError::Timeout)).collect();
         while let Some(join_result) = set.join_next().await {
             if let Ok((idx, pva_result)) = join_result {
                 results[idx] = pva_result;
+            }
+        }
+        results
+    }
+
+    /// Concurrent multi-PV `pvinfo`. Starts a GET_FIELD describe op for
+    /// every PV at once, hurries discovery, then awaits the whole set
+    /// under the per-op timeout — the same start-all-then-wait structure
+    /// as [`Self::pvget_many_full`], mirroring pvxs `tools/info.cpp:81-112`
+    /// (`exec()` every op, `hurryUp()`, one shared wait). A slow or
+    /// missing PV does not block its siblings, and the batch is bounded by
+    /// one timeout. Results are in input order; a failed PV maps to `Err`.
+    pub async fn pvinfo_many_full_with_credentials(
+        &self,
+        pv_names: &[&str],
+    ) -> Vec<PvaResult<PvInfoResult>> {
+        let n = pv_names.len();
+        let mut set = tokio::task::JoinSet::new();
+        for (idx, name) in pv_names.iter().enumerate() {
+            let client = self.clone();
+            let name = name.to_string();
+            set.spawn(async move { (idx, client.pvinfo_full_with_credentials(&name).await) });
+        }
+        self.hurry_up().await;
+        let mut results: Vec<PvaResult<PvInfoResult>> =
+            (0..n).map(|_| Err(PvaError::Timeout)).collect();
+        while let Some(join_result) = set.join_next().await {
+            if let Ok((idx, r)) = join_result {
+                results[idx] = r;
             }
         }
         results

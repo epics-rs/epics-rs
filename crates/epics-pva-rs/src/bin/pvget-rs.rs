@@ -93,12 +93,17 @@ async fn main() {
     let client = PvaClient::new().expect("failed to create PVA client");
     let mode = args.mode.as_str();
 
+    // Start a GET for every PV before awaiting any, then await the whole
+    // set under one command-level timeout. A slow or missing PV must not
+    // prevent its siblings from even starting (pvxs `tools/get.cpp:102-133`
+    // exec()s all ops, hurryUp()s, and waits once). The serial await-per-PV
+    // loop this replaces spent one timeout per PV and hid later successes
+    // behind an earlier slow one.
+    let names: Vec<&str> = args.pv_names.iter().map(String::as_str).collect();
+    let results = client.pvget_many_full(&names, request.as_ref()).await;
+
     let mut failed = false;
-    for pv_name in &args.pv_names {
-        let result = match &request {
-            None => client.pvget_full(pv_name).await,
-            Some(req) => client.pvget_with_request_full(pv_name, req).await,
-        };
+    for (pv_name, result) in args.pv_names.iter().zip(results) {
         match result {
             Ok(result) => {
                 // `-q` is a deprecated no-op (see Args::quiet); successful

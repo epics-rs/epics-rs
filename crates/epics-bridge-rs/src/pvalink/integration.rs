@@ -155,37 +155,28 @@ impl MonitorKey {
 #[derive(Default)]
 struct ScanFanout {
     /// Records to process on every monitor event. Each entry mirrors
-    /// one INP pvalink whose `proc` is `CP` (always) or `CPP`
-    /// (passive). At our integration granularity both reduce to
-    /// "process this record"; `always` widens it to fire even when
-    /// the value did not change.
+    /// one INP pvalink whose `proc` is `CP` (scans always) or `CPP`
+    /// (scans when the owner is Passive). At our integration
+    /// granularity both reduce to "process this record on each event".
     records: Vec<ScanTarget>,
 }
 
 /// One record bound to a CP/CPP pvalink (B3).
 struct ScanTarget {
     record: String,
-    /// pvxs `pvaLinkConfig::always` — process even on a no-op update.
-    always: bool,
     /// pvxs `pvaLinkConfig::monorder` — lower scans first within one
     /// monitor batch.
     monorder: i32,
     /// pvxs `pvaLinkConfig::atomic` — atomic links scan as one
     /// contiguous group ahead of the non-atomic targets in the same
-    /// monitor batch, and an atomic group scans whenever *any* of its
-    /// members changed (so siblings stay consistent within the batch).
+    /// monitor batch, under one multi-record lock so siblings stay
+    /// mutually consistent within the batch.
     atomic: bool,
     /// pvxs distinguishes `CP` (scanOnUpdateYes) from `CPP`
     /// (scanOnUpdatePassive). `CPP` is gated by the owning record's
     /// SCAN being Passive (pvalink_channel.cpp:313). True here means
     /// "skip processing when the owning record's SCAN != Passive".
     passive_only: bool,
-    /// per-link sub-field selector. Mirrors pvxs
-    /// `pvaLink::fieldName` resolved per-link from the shared channel
-    /// root (`pvalink_link.cpp:91`). Change detection in
-    /// `run_notify_forwarder` uses this field so targets with
-    /// different sub-fields track changes independently.
-    field: String,
 }
 
 impl PvaLinkResolver {
@@ -368,11 +359,9 @@ impl PvaLinkResolver {
                     .records
                     .push(ScanTarget {
                         record: rec,
-                        always: cfg.always,
                         monorder: cfg.monorder,
                         atomic: cfg.atomic,
                         passive_only: cfg.scan_on_passive,
-                        field: cfg.field.clone(),
                     });
             }
         }
@@ -703,65 +692,51 @@ type ScanTargetMap = Arc<parking_lot::RwLock<std::collections::HashMap<MonitorKe
 /// B3 monitor-notification forwarder loop.
 ///
 /// Drains `rx` (fed by the link's monitor task) and, for every event,
-/// processes the records registered as scan-on-update targets for
-/// `pv_name`.
+/// processes the records registered as scan-on-update targets for this
+/// monitor variant.
 ///
-/// Ordering (B4): `atomic` targets scan first as one contiguous
-/// group, then the non-atomic targets; within each group `monorder`
-/// (low → high) decides the order. A `CPP` target (`always=false`) is
-/// skipped on a no-op update, *except* an atomic target scans
-/// whenever any atomic sibling in the same batch changed — so atomic
-/// links stay mutually consistent. Mirrors pvxs `pvaLinkConfig`
-/// `atomic` / `monorder` / `always`. The loop ends when every sender
-/// is dropped (i.e. the link is closed).
+/// pvxs scans every CP target and every eligible CPP target on EVERY
+/// monitor event — and on disconnect — with no value-difference
+/// comparison: the `always` option is parsed but ignored at scan time
+/// (`pvxs/documentation/pvalink.rst:102`;
+/// `pvxs/ioc/pvalink_channel.cpp:389-431` rebuilds and scans the
+/// atomic/non-atomic target lists unconditionally after both the
+/// value-update branch and the `catch(client::Disconnect&)` branch,
+/// `:335-373`). A `Value` and a `Disconnected` event therefore drive
+/// the identical scan loop — there is no no-op suppression and no
+/// per-field change tracking.
+///
+/// Ordering (B4): `atomic` targets scan first as one contiguous group
+/// under a single multi-record lock, then the non-atomic targets;
+/// within each group `monorder` (low → high) decides the order. A `CPP`
+/// (`passive_only`) target is skipped only when its owning record's
+/// SCAN is not Passive. The loop ends when every sender is dropped
+/// (i.e. the link is closed).
 async fn run_notify_forwarder(
     monitor_key: MonitorKey,
     mut rx: tokio::sync::mpsc::Receiver<ScanEvent>,
     scan_targets: ScanTargetMap,
     db: Arc<parking_lot::RwLock<Option<PvDatabase>>>,
 ) {
-    // per-(record, field) last delivered leaf, so each target
-    // tracks changes against its own sub-field independently. Mirrors
-    // pvxs per-`pvaLink` change tracking (`pvalink_link.cpp:91`).
-    let mut last: std::collections::HashMap<(String, String), PvField> =
-        std::collections::HashMap::new();
-    while let Some(event) = rx.recv().await {
-        // A `Value` event carries a fresh monitor value and drives
-        // per-field change detection; a `Disconnected` lifecycle event
-        // carries no value and scans every CP / eligible-CPP target
-        // unconditionally. pvxs runs the SAME scan loop
-        // (`pvxs/ioc/pvalink_channel.cpp:420-432`) after both the
-        // value-update branch and the `catch(client::Disconnect&)`
-        // branch (`:359-373`), so a CP/CPP record observes the
-        // upstream disconnect (LINK_ALARM/INVALID) even when no new
-        // value arrives.
-        let value_opt: Option<PvField> = match event {
-            ScanEvent::Value(v) => Some(v),
-            ScanEvent::Disconnected => None,
-        };
+    // Every event — `Value` or `Disconnected` — drives the same scan
+    // loop. The event payload is intentionally unused: pvxs does not
+    // value-diff before scanning (see the doc comment above), and the
+    // cached value itself is updated by the monitor task, not here.
+    while rx.recv().await.is_some() {
         // Snapshot the fan-out, then order it: atomic group first,
         // then non-atomic; `monorder` within each group.
-        let mut targets: Vec<(String, bool, i32, bool, bool, String)> =
+        let mut targets: Vec<(String, i32, bool, bool)> =
             match scan_targets.read().get(&monitor_key) {
                 Some(fanout) => fanout
                     .records
                     .iter()
-                    .map(|t| {
-                        (
-                            t.record.clone(),
-                            t.always,
-                            t.monorder,
-                            t.atomic,
-                            t.passive_only,
-                            t.field.clone(),
-                        )
-                    })
+                    .map(|t| (t.record.clone(), t.monorder, t.atomic, t.passive_only))
                     .collect(),
                 None => Vec::new(),
             };
         // Sort key: (!atomic, monorder) → atomic (false sorts first),
         // then ascending monorder.
-        targets.sort_by_key(|(_, _, order, atomic, _, _)| (!*atomic, *order));
+        targets.sort_by_key(|(_, order, atomic, _)| (!*atomic, *order));
 
         let Some(db_handle) = db.read().clone() else {
             continue;
@@ -786,8 +761,8 @@ async fn run_notify_forwarder(
         // atomic link is locked exactly once.
         let atomic_records: Vec<String> = targets
             .iter()
-            .filter(|(_, _, _, atomic, _, _)| *atomic)
-            .map(|(record, _, _, _, _, _)| record.clone())
+            .filter(|(_, _, atomic, _)| *atomic)
+            .map(|(record, _, _, _)| record.clone())
             .collect();
 
         // The epoch guard is held only across the atomic group. pvxs
@@ -803,42 +778,13 @@ async fn run_notify_forwarder(
             Some(db_handle.lock_records(&atomic_records).await)
         };
 
-        for (record, always, _order, atomic, passive_only, field) in &targets {
+        for (record, _order, atomic, passive_only) in &targets {
             // `targets` is sorted atomic-first; the first non-atomic
             // target marks the end of the atomic group, so release
             // the epoch here — exactly where pvxs's `DBManyLocker`
             // goes out of scope before the non-atomic loop.
             if !*atomic {
                 atomic_epoch = None;
-            }
-            // per-target change detection using each target's
-            // own field selector. pvxs `pvaLinkConfig::always` — CP
-            // scans unconditionally; atomic scans whenever any atomic
-            // sibling changed; CPP (`always=false`, non-atomic) only
-            // scans when this target's field leaf changed.
-            let changed = match &value_opt {
-                Some(value) => {
-                    let leaf = extract_leaf(value, field);
-                    let key = (record.clone(), field.clone());
-                    let prev = last.get(&key);
-                    let did_change = prev != Some(&leaf);
-                    last.insert(key, leaf);
-                    did_change
-                }
-                // Lifecycle (disconnect) event: there is no value to
-                // compare, so the per-field change gate does not apply
-                // — every CP and atomic target scans, and the
-                // `passive_only` gate below still restricts CPP to
-                // passive owners. pvxs scans the full atomic/non-atomic
-                // target lists on the disconnect path with no
-                // value-difference test (`pvalink_channel.cpp:420-432`).
-                // `last` is intentionally left untouched so the first
-                // post-reconnect value still change-detects against the
-                // pre-disconnect leaf.
-                None => true,
-            };
-            if !changed && !*always && !*atomic {
-                continue;
             }
             // `CPP` (passive_only) only fires when the owning
             // record's SCAN is Passive. pvxs `pvalink_channel.cpp:313`
@@ -892,22 +838,6 @@ async fn run_notify_forwarder(
         // the non-atomic boundary above).
         drop(atomic_epoch);
     }
-}
-
-/// Walk a dotted field path and return the leaf [`PvField`]. Mirror
-/// of `link::extract_field` for the B3 forwarder's change detection.
-fn extract_leaf(root: &PvField, path: &str) -> PvField {
-    if path.is_empty() {
-        return root.clone();
-    }
-    let mut cursor = root.clone();
-    for segment in path.split('.') {
-        cursor = match cursor {
-            PvField::Structure(s) => s.get_field(segment).cloned().unwrap_or(PvField::Null),
-            other => return other,
-        };
-    }
-    cursor
 }
 
 impl LinkSet for PvaLinkResolver {
@@ -1884,15 +1814,13 @@ mod tests {
         .await
         .unwrap();
 
-        // CP-style target: always=true so every event scans.
+        // CP target: scans on every event.
         let mut fanout = ScanFanout::default();
         fanout.records.push(ScanTarget {
             record: "DEST".to_string(),
-            always: true,
             monorder: 0,
             atomic: false,
             passive_only: false,
-            field: String::new(),
         });
         let scan_targets: ScanTargetMap =
             Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
@@ -1912,10 +1840,16 @@ mod tests {
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
-    /// B3: with `always=false` (a `CPP` link) a no-op update — same
-    /// leaf value — does NOT re-process the record.
+    /// BRIDGE-RS-2026-05-28-51: repeated *identical* monitor values still
+    /// process a CP target on EVERY event. pvxs has no value-difference
+    /// gate and ignores the `always` option at scan time
+    /// (`pvxs/documentation/pvalink.rst:102`,
+    /// `pvxs/ioc/pvalink_channel.cpp:389-431`), so event-driven side
+    /// effects (timestamps, counters, FLNK chains) fire on every post.
+    /// Pre-fix the forwarder suppressed no-op updates unless `always`,
+    /// diverging from upstream.
     #[tokio::test]
-    async fn b3_forwarder_skips_unchanged_value_when_not_always() {
+    async fn br51_repeated_identical_values_still_scan() {
         let db = PvDatabase::new();
         let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
         db.add_record(
@@ -1930,11 +1864,9 @@ mod tests {
         let mut fanout = ScanFanout::default();
         fanout.records.push(ScanTarget {
             record: "DEST".to_string(),
-            always: false,
             monorder: 0,
             atomic: false,
             passive_only: false,
-            field: String::new(),
         });
         let scan_targets: ScanTargetMap =
             Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
@@ -1945,15 +1877,18 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<ScanEvent>(8);
         let forwarder = tokio::spawn(run_notify_forwarder(mk("SRC"), rx, scan_targets, db_slot));
 
-        // 1.0 (change), 1.0 (no-op → skipped), 3.0 (change).
+        // Three identical values — pvxs processes all three.
         tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
         tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
-        tx.send(ScanEvent::Value(nt_scalar(3.0))).await.unwrap();
+        tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
         drop(tx);
         forwarder.await.unwrap();
 
-        // Only the two changed events scanned.
-        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "every identical monitor event must still scan (no no-op suppression)"
+        );
     }
 
     /// A `Disconnected` lifecycle event scans CP and passive-CPP
@@ -1992,24 +1927,19 @@ mod tests {
         .unwrap();
 
         let mut fanout = ScanFanout::default();
-        // CP: always=false (subject to the value change-gate), not
-        // passive-restricted.
+        // CP: scans on every event, not passive-restricted.
         fanout.records.push(ScanTarget {
             record: "CP_REC".to_string(),
-            always: false,
             monorder: 0,
             atomic: false,
             passive_only: false,
-            field: String::new(),
         });
         // CPP: passive-restricted; owner is Passive so it is eligible.
         fanout.records.push(ScanTarget {
             record: "CPP_REC".to_string(),
-            always: false,
             monorder: 1,
             atomic: false,
             passive_only: true,
-            field: String::new(),
         });
         let scan_targets: ScanTargetMap =
             Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
@@ -2077,11 +2007,9 @@ mod tests {
         let mut fanout = ScanFanout::default();
         fanout.records.push(ScanTarget {
             record: "DEST".to_string(),
-            always: true,
             monorder: 0,
             atomic: false,
             passive_only: false,
-            field: String::new(),
         });
         let scan_targets: ScanTargetMap =
             Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
@@ -2206,19 +2134,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn extract_leaf_walks_dotted_path() {
-        let mut alarm = PvStructure::new("alarm_t");
-        alarm
-            .fields
-            .push(("severity".into(), PvField::Scalar(ScalarValue::Int(2))));
-        let mut root = PvStructure::new("epics:nt/NTScalar:1.0");
-        root.fields
-            .push(("alarm".into(), PvField::Structure(alarm)));
-        let leaf = extract_leaf(&PvField::Structure(root), "alarm.severity");
-        assert!(matches!(leaf, PvField::Scalar(ScalarValue::Int(2))));
-    }
-
     // ---- B4: local / atomic / monorder forwarder effects ----
 
     /// A record that appends its name to a shared log on `process()`,
@@ -2272,36 +2187,28 @@ mod tests {
         // Non-atomic, monorder 1 / -1.
         fanout.records.push(ScanTarget {
             record: "C".into(),
-            always: true,
             monorder: 1,
             atomic: false,
             passive_only: false,
-            field: String::new(),
         });
         fanout.records.push(ScanTarget {
             record: "D".into(),
-            always: true,
             monorder: -1,
             atomic: false,
             passive_only: false,
-            field: String::new(),
         });
         // Atomic, monorder 5 / 0.
         fanout.records.push(ScanTarget {
             record: "A".into(),
-            always: true,
             monorder: 5,
             atomic: true,
             passive_only: false,
-            field: String::new(),
         });
         fanout.records.push(ScanTarget {
             record: "B".into(),
-            always: true,
             monorder: 0,
             atomic: true,
             passive_only: false,
-            field: String::new(),
         });
         let scan_targets: ScanTargetMap =
             Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
@@ -2320,8 +2227,12 @@ mod tests {
         assert_eq!(*log.lock(), vec!["B", "A", "D", "C"]);
     }
 
-    /// B4 `atomic`: an atomic CPP-style target (`always=false`) still
-    /// scans on a no-op update — atomic siblings stay consistent.
+    /// B4 `atomic`: an atomic target scans on every monitor event,
+    /// including a repeated identical value. Post-BRIDGE-RS-2026-05-28-51
+    /// this is the same rule that governs every CP/CPP target (no no-op
+    /// suppression); the test is retained to guard the atomic path
+    /// specifically, since atomic targets run under the shared
+    /// multi-record lock.
     #[tokio::test]
     async fn b4_atomic_scans_even_on_no_op_update() {
         let db = PvDatabase::new();
@@ -2337,11 +2248,9 @@ mod tests {
         let mut fanout = ScanFanout::default();
         fanout.records.push(ScanTarget {
             record: "DEST".into(),
-            always: false, // CPP
             monorder: 0,
             atomic: true, // but atomic → scans anyway
             passive_only: false,
-            field: String::new(),
         });
         let scan_targets: ScanTargetMap =
             Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
@@ -2350,8 +2259,7 @@ mod tests {
         let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
         let (tx, rx) = tokio::sync::mpsc::channel::<ScanEvent>(4);
         let forwarder = tokio::spawn(run_notify_forwarder(mk("SRC"), rx, scan_targets, db_slot));
-        // Two identical values: the 2nd is a no-op. A plain CPP link
-        // would scan once; atomic makes it scan both times.
+        // Two identical values: both scan (pvxs does no value-diff).
         tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
         tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
         drop(tx);
@@ -2540,11 +2448,10 @@ mod tests {
             .expect("CPP target must be registered");
         assert_eq!(fanout.records[0].record, "MY:RECORD");
         assert!(fanout.records[0].passive_only, "CPP must set passive_only");
-        // ScanTarget carries per-link field.
-        assert_eq!(
-            fanout.records[0].field, "display.precision",
-            "ScanTarget.field must reflect the per-link field selector"
-        );
+        // The per-link `field` selector lives in the link config
+        // (applied at read time), asserted via `cfg.field` above — pvxs
+        // resolves `fieldName` per-link at the lset getter, not in the
+        // scan fan-out.
     }
 
     /// a DB record can write a pvalink in the *legacy
@@ -2678,7 +2585,9 @@ mod tests {
         );
 
         // ScanTargets must also be independent per-link — each record
-        // gets its own entry with its own field.
+        // gets its own entry with its own proc mode (CPP vs CP). The
+        // per-link `field` is verified at the `cfg` level above (it is
+        // applied at read time, not in the scan fan-out).
         let targets = resolver.scan_targets.read();
         let fanout = targets
             .get(&mk("TARGET:PV"))
@@ -2693,11 +2602,6 @@ mod tests {
             .iter()
             .find(|t| t.record == "RECORD:B")
             .expect("RECORD:B must be in scan targets");
-        assert_eq!(
-            rec_a.field, "alarm.severity",
-            "RECORD:A ScanTarget.field wrong"
-        );
-        assert_eq!(rec_b.field, "value", "RECORD:B ScanTarget.field wrong");
         assert!(rec_a.passive_only, "RECORD:A must be CPP (passive_only)");
         assert!(
             !rec_b.passive_only,
@@ -2940,19 +2844,15 @@ mod tests {
         let mut fanout = ScanFanout::default();
         fanout.records.push(ScanTarget {
             record: "AT:A".into(),
-            always: true,
             monorder: 0,
             atomic: true,
             passive_only: false,
-            field: "value".into(),
         });
         fanout.records.push(ScanTarget {
             record: "AT:B".into(),
-            always: true,
             monorder: 1,
             atomic: true,
             passive_only: false,
-            field: "value".into(),
         });
         let scan_targets: ScanTargetMap =
             Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([

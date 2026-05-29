@@ -336,6 +336,31 @@ pub trait ChannelSource: Send + Sync + 'static {
         self.get_introspection(name)
     }
 
+    /// Resolve the source that OWNS `name` for this peer, to be bound
+    /// into the channel at CREATE_CHANNEL so every later operation
+    /// dispatches to the same source that accepted the channel — never
+    /// re-resolving the registry per operation.
+    ///
+    /// pvxs iterates server sources at CREATE_CHANNEL and stops at the
+    /// first that accepts, then installs THAT source's `onOp`/`onRPC`/
+    /// `onSubscribe` callbacks into the `ServerChan`
+    /// (`serverchan.cpp:295-322`, `serverchan.cpp:70-112`); a later
+    /// `Server::removeSource` does not rewrite callbacks already
+    /// installed on existing channels (`server.cpp:100-112`). A
+    /// terminal/leaf source IS its own owner, so the default returns
+    /// `None` and the caller binds the top-level source itself.
+    /// [`CompositeSource`](crate::server_native::CompositeSource)
+    /// overrides this to return the matched inner source (descending
+    /// through nested composites to the leaf), so a live channel never
+    /// silently changes owner when the registry is mutated.
+    fn resolve_owner(
+        &self,
+        _name: &str,
+        _ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Option<DynSource>> + Send {
+        async { None }
+    }
+
     /// Fetch the current value of a PV.
     fn get_value(&self, name: &str) -> impl std::future::Future<Output = Option<PvField>> + Send;
 
@@ -777,6 +802,42 @@ pub trait ChannelSource: Send + Sync + 'static {
         let _ = (name, ctx, start);
     }
 
+    /// A peer channel to `name` has been admitted — CREATE_CHANNEL
+    /// resolved the PV and the channel was inserted into the connection's
+    /// channel table. Fired exactly once per opened channel by the
+    /// channel-lifecycle owner, matching pvxs `SharedPV::attach()` which
+    /// inserts each `ChannelControl` into `impl->channels` and runs
+    /// `onFirstConnect` on the empty→non-empty transition
+    /// (`sharedpv.cpp:299-313`). This is a *channel* edge, distinct from
+    /// the *monitor-operation* edge [`Self::notify_monitor_start`]: it
+    /// fires for a channel that only ever carries GET/PUT/RPC/GET_FIELD
+    /// traffic and never opens a monitor, which is exactly the
+    /// lazy-resource pattern pvxs tests (`testget.cpp:204-234`). A source
+    /// uses it to acquire per-channel leases or open lazily on first
+    /// attach. `ctx` is credential-scoped (no `pv_request`). Paired with
+    /// [`Self::notify_channel_close`]. Default impl ignores it.
+    fn notify_channel_open(&self, name: &str, ctx: &ChannelContext) {
+        let _ = (name, ctx);
+    }
+
+    /// A peer channel to `name` has closed — the client sent
+    /// `DESTROY_CHANNEL` or the TCP connection dropped. Fired exactly
+    /// once per opened channel by the channel-lifecycle owner AFTER the
+    /// channel's operations have been torn down, matching pvxs
+    /// `ServerChan::cleanup()` which cleans every channel op and then
+    /// invokes the moved `onClose` callback once
+    /// (`serverchan.cpp:43-60`, `:115-127`). Unlike
+    /// [`Self::notify_monitor_start`] — a *monitor-operation* edge — this
+    /// is a *channel* edge: it fires even for a channel that only ever
+    /// carried GET/PUT/RPC traffic and never had a monitor. A source uses
+    /// it to release per-channel leases, upstream identities, diagnostics,
+    /// or credential-scoped caches. `ctx` is credential-scoped (no
+    /// `pv_request`) like [`Self::notify_monitor_start`]. Default impl
+    /// ignores it.
+    fn notify_channel_close(&self, name: &str, ctx: &ChannelContext) {
+        let _ = (name, ctx);
+    }
+
     /// the per-PV pipeline-window watermark levels `(low,
     /// high)` for `name`, in window-credit units. The monitor loop fires
     /// [`Self::notify_watermark`] with [`WatermarkKind::Resume`] when an
@@ -925,6 +986,12 @@ pub trait ChannelSourceObj: Send + Sync {
         name: &'a str,
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<FieldDesc>> + Send + 'a>>;
+    /// dyn forwarder for CREATE_CHANNEL owner resolution.
+    fn resolve_owner<'a>(
+        &'a self,
+        name: &'a str,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<DynSource>> + Send + 'a>>;
     fn get_value<'a>(
         &'a self,
         name: &'a str,
@@ -1057,6 +1124,8 @@ pub trait ChannelSourceObj: Send + Sync {
     fn monitor_emits_partial(&self, name: &str) -> bool;
     fn notify_watermark(&self, name: &str, ctx: &ChannelContext, ev: WatermarkEvent);
     fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool);
+    fn notify_channel_open(&self, name: &str, ctx: &ChannelContext);
+    fn notify_channel_close(&self, name: &str, ctx: &ChannelContext);
     fn monitor_watermarks<'a>(
         &'a self,
         name: &'a str,
@@ -1102,6 +1171,13 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         Box::pin(<Self as ChannelSource>::get_introspection_checked(
             self, name, ctx,
         ))
+    }
+    fn resolve_owner<'a>(
+        &'a self,
+        name: &'a str,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<DynSource>> + Send + 'a>> {
+        Box::pin(<Self as ChannelSource>::resolve_owner(self, name, ctx))
     }
     fn get_value<'a>(
         &'a self,
@@ -1291,6 +1367,12 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     }
     fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool) {
         <Self as ChannelSource>::notify_monitor_start(self, name, ctx, start);
+    }
+    fn notify_channel_open(&self, name: &str, ctx: &ChannelContext) {
+        <Self as ChannelSource>::notify_channel_open(self, name, ctx);
+    }
+    fn notify_channel_close(&self, name: &str, ctx: &ChannelContext) {
+        <Self as ChannelSource>::notify_channel_close(self, name, ctx);
     }
     fn monitor_watermarks<'a>(
         &'a self,

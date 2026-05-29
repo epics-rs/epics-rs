@@ -556,13 +556,18 @@ fn try_build_forward_frame(frame: &[u8], reply_dest: SocketAddrV4) -> Option<Vec
 /// blocklist. Mirrors pvxs `udp_collector.cpp::handle_one` mcast-source
 /// drop and `serverconn.cpp` ignoreAddrs check.
 ///
+/// The multicast-source test is family-generic, matching pvxs
+/// `SockAddr::isMCast()` which reports multicast for both `AF_INET` and
+/// `AF_INET6` (`util.cpp:570-577`). `IpAddr::is_multicast()` dispatches to
+/// the V4 or V6 predicate, so IPv6 multicast sources (e.g. `ff02::/16`)
+/// are dropped by the same uniform rule rather than slipping past a
+/// V4-only branch.
+///
 /// Returns `true` if the packet should be processed.
 fn filter_inbound(peer: SocketAddr, ignore_addrs: &[(IpAddr, u16)]) -> bool {
-    if let std::net::IpAddr::V4(v4) = peer.ip() {
-        if v4.is_multicast() {
-            debug!("ignoring UDP with mcast source {peer}");
-            return false;
-        }
+    if peer.ip().is_multicast() {
+        debug!("ignoring UDP with mcast source {peer}");
+        return false;
     }
     let ignored = ignore_addrs
         .iter()
@@ -903,7 +908,17 @@ pub(crate) async fn search_matched_cids(
     req: &SearchRequest,
     protocol: &str,
 ) -> Vec<u32> {
-    let protocol_ok = req.protocols.is_empty() || req.protocols.iter().any(|p| p == protocol);
+    // Byte-exact protocol gate (pvxs udp_collector.cpp:408-421 compares
+    // the raw wire string to "tcp"). An empty list is a legacy SEARCH
+    // that omitted the field → wildcard; a non-empty list with no entry
+    // equal to our protocol does not match, including a present-but-
+    // undecodable (e.g. invalid-UTF-8) protocol, which must NOT collapse
+    // to wildcard.
+    let protocol_ok = req.protocols.is_empty()
+        || req
+            .protocols
+            .iter()
+            .any(|p| p.as_slice() == protocol.as_bytes());
     if !protocol_ok {
         return Vec::new();
     }
@@ -1027,11 +1042,15 @@ pub(crate) struct SearchRequest {
     /// (`if(nreply==0 && !msg.mustReply) return;`).
     pub(crate) must_reply: bool,
     /// the transport protocols the client requested in this
-    /// SEARCH. pvxs `udp_collector.cpp:408-421` records whether
-    /// "tcp" appeared and `:424-443` only queues channel matches
-    /// when it did. Empty = legacy SEARCH that omitted the field
-    /// (tolerate as "tcp by default").
-    pub(crate) protocols: Vec<String>,
+    /// SEARCH, stored as RAW BYTES. pvxs `udp_collector.cpp:408-421`
+    /// reads each as a `std::string` without UTF-8 validation and only
+    /// equality-checks it against "tcp"; `:424-443` queues matches only
+    /// when "tcp" appeared. Keeping bytes (not `String`) mirrors that: an
+    /// invalid-UTF-8 protocol is a non-"tcp" entry, never dropped into an
+    /// empty list (which `search_matched_cids` would treat as a
+    /// wildcard). Empty = legacy SEARCH that omitted the field (tolerate
+    /// as "tcp by default").
+    pub(crate) protocols: Vec<Vec<u8>>,
     /// Total bytes consumed from the input slice (header + payload),
     /// used by the multi-message drain loop to advance to the next
     /// chained message in the same datagram.
@@ -1100,11 +1119,20 @@ pub(crate) fn parse_search_request(frame: &[u8]) -> Option<SearchRequest> {
     // did. Pre-fix Rust read-and-discarded the list, then answered
     // every SEARCH regardless of the protocols the client asked
     // for.
-    let mut protocols: Vec<String> = Vec::with_capacity(n_proto.min(8));
+    let mut protocols: Vec<Vec<u8>> = Vec::with_capacity(n_proto.min(8));
     for _ in 0..n_proto {
-        if let Ok(Some(s)) = decode_string(&mut p, order) {
-            protocols.push(s);
-        }
+        // Read each protocol as a length-prefixed RAW byte string. pvxs
+        // does not UTF-8-validate (`from_wire` into std::string), so an
+        // invalid-UTF-8 protocol is preserved as a non-"tcp" entry rather
+        // than being silently swallowed into an empty (wildcard) list.
+        // A truncated length or body, by contrast, is a malformed frame:
+        // the `?` aborts the whole parse (UDP drops it; the TCP circuit
+        // treats the `None` as a decode fault and closes).
+        let len = match decode_size(&mut p, order) {
+            Ok(Some(n)) => n as usize,
+            Ok(None) | Err(_) => return None,
+        };
+        protocols.push(p.get_bytes(len).ok()?);
     }
     let n = p.get_u16(order).ok()? as usize;
     // cap pre-alloc against attacker-announced
@@ -1582,7 +1610,7 @@ mod tests {
         }
 
         let source: DynSource = Arc::new(PresentSource);
-        let req = |protocols: Vec<String>| SearchRequest {
+        let req = |protocols: Vec<Vec<u8>>| SearchRequest {
             seq: 1,
             byte_order: ByteOrder::Little,
             queries: vec![(7, "MY:PV".into())],
@@ -1596,12 +1624,12 @@ mod tests {
 
         // Server speaks "tcp". Matching protocol → searchable CID returned.
         assert_eq!(
-            search_matched_cids(&source, &req(vec!["tcp".into()]), "tcp").await,
+            search_matched_cids(&source, &req(vec![b"tcp".to_vec()]), "tcp").await,
             vec![7]
         );
         // Client asks for "tls" only → no match off a tcp server.
         assert!(
-            search_matched_cids(&source, &req(vec!["tls".into()]), "tcp")
+            search_matched_cids(&source, &req(vec![b"tls".to_vec()]), "tcp")
                 .await
                 .is_empty()
         );
@@ -1609,6 +1637,18 @@ mod tests {
         assert_eq!(
             search_matched_cids(&source, &req(vec![]), "tcp").await,
             vec![7]
+        );
+        // A protocol entry that is not valid UTF-8 must compare as raw
+        // bytes (≠ "tcp") and therefore NOT match — pvxs preserves the
+        // wire bytes (serverconn.cpp SearchOp) rather than collapsing a
+        // failed-decode entry into a wildcard. Regression for the bug
+        // where a non-UTF-8 protocol downgraded to an empty list and
+        // matched every tcp server.
+        assert!(
+            search_matched_cids(&source, &req(vec![vec![0xff, 0xfe]]), "tcp")
+                .await
+                .is_empty(),
+            "non-UTF-8 protocol must not be treated as a wildcard match"
         );
     }
 
@@ -1668,9 +1708,17 @@ mod tests {
         // Plain unicast peer passes.
         let ok = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5076);
         assert!(filter_inbound(ok, &blocklist));
-        // Multicast source dropped.
+        // Multicast source dropped (IPv4).
         let mcast = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 128)), 5076);
         assert!(!filter_inbound(mcast, &blocklist));
+        // Multicast source dropped (IPv6) — pvxs `SockAddr::isMCast()` is
+        // family-generic (`util.cpp:570-577`); `ff02::1` is the v6
+        // all-nodes link-local multicast group.
+        let mcast_v6 = SocketAddr::new(
+            IpAddr::V6(std::net::Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)),
+            5076,
+        );
+        assert!(!filter_inbound(mcast_v6, &blocklist));
         // Blocklisted peer dropped on matching port.
         let blocked = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99)), 5076);
         assert!(!filter_inbound(blocked, &blocklist));

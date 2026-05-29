@@ -267,12 +267,31 @@ impl MonitorInbox {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Open/closed lifecycle of a SharedPV's published type + value.
+///
+/// pvxs keys the entire open-state on a single member, `impl->current`
+/// (`sharedpv.cpp:391` `isOpen() = !!impl->current`): `open()` sets it,
+/// `close()` clears it (`:404-405`), and `fetch()` throws `"open() first"`
+/// whenever it is empty (`:443-469`). Modelling the descriptor and value
+/// only inside the `Open` variant reproduces that single source of truth:
+/// "closed ⟹ nothing readable" holds by construction, because there is no
+/// desc/value field to read while `Closed`. This is what stops a closed PV
+/// from surfacing a stale descriptor/value through `current()` /
+/// `introspection()` (and hence GET / GET_FIELD), the way three independent
+/// `desc`/`value`/`is_open` fields allowed when `close()` only flipped the
+/// flag.
+enum PvState {
+    /// Not opened (or closed): no descriptor or value exists.
+    Closed,
+    /// Opened: both the declared type and the most recent value are present.
+    Open { desc: FieldDesc, value: PvField },
+}
+
 /// Per-PV state stored inside [`SharedPV`].
 struct Inner {
-    /// Type descriptor declared at open() — None when not opened.
-    desc: Option<FieldDesc>,
-    /// Most recent value (defaulted from desc on open).
-    value: Option<PvField>,
+    /// Published type + value, or `Closed`. Single source of truth for
+    /// open-state (pvxs `impl->current`).
+    state: PvState,
     /// Open subscribers. Each slot holds a MonitorOutbox for squash-to-tail delivery.
     subscribers: Vec<MonitorOutbox>,
     /// Optional flow-control watermark: monitor stream sends MORE
@@ -282,8 +301,6 @@ struct Inner {
     /// Pause sending updates when the monitor outbox depth is at or
     /// above `high_watermark`. Currently advisory.
     pub high_watermark: usize,
-    /// `is_open` is required to reject GETs after close().
-    is_open: bool,
     /// Optional user put handler; when None the default "store and
     /// post" behavior runs. pvxs `onPut` parity.
     on_put: Option<OnPutFn>,
@@ -298,9 +315,17 @@ struct Inner {
     /// (`#[pva_service]`) so dispatch can run on the calling task's
     /// own runtime without `block_in_place`/`block_on`.
     on_rpc_async: Option<OnRpcAsyncFn>,
-    /// First-subscriber-arrived hook.
+    /// Count of currently-attached client channels (pvxs
+    /// `impl->channels.size()`). Driven by [`SharedPV::attach_channel`] /
+    /// [`SharedPV::detach_channel`] from the server's CREATE_CHANNEL /
+    /// channel-teardown owner — NOT by monitor subscriptions. The
+    /// first/last-channel hooks key off its 0↔1 transitions.
+    channel_count: usize,
+    /// First-channel-attached hook (pvxs `onFirstConnect`). Fires on the
+    /// channel-count 0→1 transition, independent of monitor subscribers.
     on_first_connect: Option<LifecycleFn>,
-    /// Last-subscriber-left hook.
+    /// Last-channel-detached hook (pvxs `onLastDisconnect`). Fires on the
+    /// channel-count 1→0 transition, independent of monitor subscribers.
     on_last_disconnect: Option<LifecycleFn>,
     /// Outbox crossed `high_watermark` going up. Producer throttle
     /// hint. See [`WatermarkFn`].
@@ -316,16 +341,15 @@ struct Inner {
 impl Default for Inner {
     fn default() -> Self {
         Self {
-            desc: None,
-            value: None,
+            state: PvState::Closed,
             subscribers: Vec::new(),
             low_watermark: 4,
             high_watermark: 64,
-            is_open: false,
             on_put: None,
             on_rpc: None,
             on_process: None,
             on_rpc_async: None,
+            channel_count: 0,
             on_first_connect: None,
             on_last_disconnect: None,
             on_high_mark: None,
@@ -356,32 +380,44 @@ impl SharedPV {
     /// the new value on next post().
     pub fn open(&self, desc: FieldDesc, initial: PvField) {
         let mut g = self.inner.lock();
-        g.desc = Some(desc);
-        g.value = Some(initial);
-        g.is_open = true;
+        g.state = PvState::Open {
+            desc,
+            value: initial,
+        };
     }
 
     /// Returns true iff the PV has been opened.
     pub fn is_open(&self) -> bool {
-        self.inner.lock().is_open
+        matches!(self.inner.lock().state, PvState::Open { .. })
     }
 
-    /// Drop all subscribers; subsequent GETs return `None` until
-    /// open() is called again.
+    /// Close the PV: clear its descriptor and value and drop all
+    /// subscribers. After close, `current()` / `introspection()` (and
+    /// thus GET / GET_FIELD) return `None` until `open()` is called
+    /// again — pvxs `sharedpv.cpp:404-405` clears `impl->current`, which
+    /// is exactly what makes `fetch()` throw `"open() first"` afterwards
+    /// (`:443-469`). Channel-lifecycle teardown of attached clients
+    /// (pvxs `:411-414`) is a separate lifecycle concern.
     pub fn close(&self) {
         let mut g = self.inner.lock();
-        g.is_open = false;
+        g.state = PvState::Closed;
         g.subscribers.clear();
     }
 
-    /// Type descriptor (None until opened).
+    /// Type descriptor (None while closed).
     pub fn introspection(&self) -> Option<FieldDesc> {
-        self.inner.lock().desc.clone()
+        match &self.inner.lock().state {
+            PvState::Open { desc, .. } => Some(desc.clone()),
+            PvState::Closed => None,
+        }
     }
 
-    /// Current value (None until opened).
+    /// Current value (None while closed).
     pub fn current(&self) -> Option<PvField> {
-        self.inner.lock().value.clone()
+        match &self.inner.lock().state {
+            PvState::Open { value, .. } => Some(value.clone()),
+            PvState::Closed => None,
+        }
     }
 
     /// Push a new value to all subscribers; lossy semantics — drops
@@ -419,22 +455,21 @@ impl SharedPV {
     /// value only on `Ok`.
     pub fn try_post_checked(&self, value: PvField) -> crate::error::PvaResult<usize> {
         let mut g = self.inner.lock();
-        if !g.is_open {
+        let inner = &mut *g;
+        let PvState::Open { desc, value: cur } = &mut inner.state else {
             return Err(crate::error::PvaError::Protocol(
                 "SharedPV not open".to_string(),
             ));
+        };
+        if let Err(e) = crate::pvdata::value_matches_descriptor(&value, desc) {
+            return Err(crate::error::PvaError::InvalidValue(format!(
+                "SharedPV::try_post: value does not fit opened descriptor ({e})"
+            )));
         }
-        if let Some(desc) = g.desc.as_ref() {
-            if let Err(e) = crate::pvdata::value_matches_descriptor(&value, desc) {
-                return Err(crate::error::PvaError::InvalidValue(format!(
-                    "SharedPV::try_post: value does not fit opened descriptor ({e})"
-                )));
-            }
-        }
-        g.value = Some(value.clone());
+        *cur = value.clone();
         // pvxs servermon.cpp:283-286: normal post squashes tail when queue full.
-        g.subscribers.retain(|tx| tx.post(value.clone(), false));
-        Ok(g.subscribers.len())
+        inner.subscribers.retain(|tx| tx.post(value.clone(), false));
+        Ok(inner.subscribers.len())
     }
 
     /// Add a subscriber. Returns a [`MonitorInbox`] that yields posted values
@@ -445,32 +480,21 @@ impl SharedPV {
     /// `limit` is the maximum number of unread events; pvxs default is 4
     /// (`servermon.cpp:66`). Values ≥ 1 are accepted; 0 is clamped to 1.
     pub fn subscribe(&self, limit: usize) -> Option<MonitorInbox> {
-        // Latch onFirstConnect callback to run *after* releasing the
-        // lock — handlers may call back into post() / current() and we
-        // can't recurse on parking_lot Mutex.
-        let cb = {
-            let mut g = self.inner.lock();
-            if !g.is_open {
-                return None;
-            }
-            let (outbox, inbox) = make_monitor_queue(limit);
-            if let Some(v) = &g.value {
-                // Initial value: queue is empty so limit not yet reached.
-                outbox.post(v.clone(), false);
-            }
-            let was_empty = g.subscribers.is_empty();
-            g.subscribers.push(outbox);
-            let cb = if was_empty {
-                g.on_first_connect.clone()
-            } else {
-                None
-            };
-            (inbox, cb)
+        // A monitor subscription is NOT a channel-lifecycle edge: pvxs
+        // tracks monitor `subscribers` separately from `impl->channels`
+        // and does NOT run onFirstConnect/onLastDisconnect off subscriber
+        // counts (sharedpv.cpp:252-275). The first/last hooks are driven
+        // by `attach_channel`/`detach_channel` instead.
+        let mut g = self.inner.lock();
+        let PvState::Open { value, .. } = &g.state else {
+            return None;
         };
-        if let Some(f) = cb.1 {
-            f(self);
-        }
-        Some(cb.0)
+        // Initial value: queue is empty so limit not yet reached.
+        let initial = value.clone();
+        let (outbox, inbox) = make_monitor_queue(limit);
+        outbox.post(initial, false);
+        g.subscribers.push(outbox);
+        Some(inbox)
     }
 
     /// Apply a PUT. By default, the new value is posted to all
@@ -538,44 +562,40 @@ impl SharedPV {
         }
         let applied = {
             let mut g = self.inner.lock();
-            if !g.is_open {
+            let inner = &mut *g;
+            let PvState::Open {
+                desc: opened,
+                value: prior,
+            } = &mut inner.state
+            else {
                 return Err("SharedPV not open".into());
-            }
-            let merged = match &g.value {
-                Some(prior) => {
-                    crate::pvdata::encode::fill_unmarked_from_prior(desc, changed, 0, delta, prior)
-                }
-                // No prior value yet: the delta is all we have.
-                None => delta,
             };
-            match g.on_put.clone() {
+            let merged =
+                crate::pvdata::encode::fill_unmarked_from_prior(desc, changed, 0, delta, prior);
+            match inner.on_put.clone() {
                 Some(handler) => Applied::Handler {
                     handler,
                     value: merged,
                 },
                 None => {
-                    // descriptor enforcement for the
-                    // no-handler store path. Without a check the
-                    // merged value could carry a shape unrelated
-                    // to the opened descriptor (pvxs `sharedpv.cpp:
-                    // 417-431` rejects this). Compare against
-                    // `g.desc` (the opened descriptor, not the
-                    // per-put `desc` parameter — the wire request
-                    // may carry a stale descriptor cached by the
-                    // peer).
-                    if let Some(opened) = g.desc.as_ref() {
-                        if let Err(e) = crate::pvdata::value_matches_descriptor(&merged, opened) {
-                            return Err(format!(
-                                "SharedPV::put_delta: merged value does not fit opened descriptor ({e})"
-                            ));
-                        }
+                    // descriptor enforcement for the no-handler store
+                    // path. Without a check the merged value could carry
+                    // a shape unrelated to the opened descriptor (pvxs
+                    // `sharedpv.cpp:417-431` rejects this). Compare
+                    // against the opened descriptor (`opened`), not the
+                    // per-put `desc` parameter — the wire request may
+                    // carry a stale descriptor cached by the peer.
+                    if let Err(e) = crate::pvdata::value_matches_descriptor(&merged, opened) {
+                        return Err(format!(
+                            "SharedPV::put_delta: merged value does not fit opened descriptor ({e})"
+                        ));
                     }
                     // Store atomically with the read above so a
                     // concurrent put_delta sees this as its prior.
-                    g.value = Some(merged.clone());
+                    *prior = merged.clone();
                     Applied::Posted {
                         value: merged,
-                        subscribers: g.subscribers.clone(),
+                        subscribers: inner.subscribers.clone(),
                     }
                 }
             }
@@ -695,9 +715,12 @@ impl SharedPV {
         self.inner.lock().on_rpc_async = Some(arc);
     }
 
-    /// Hook fired when the *first* subscriber connects (subscribers
-    /// 0 → 1). Mirrors pvxs `SharedPV::onFirstConnect` —
-    /// applications hook here to start a producer task on demand.
+    /// Hook fired when the *first client channel* attaches (channel
+    /// count 0 → 1). Mirrors pvxs `SharedPV::onFirstConnect`
+    /// (`sharedpv.cpp:299-313`): applications hook here to open the PV /
+    /// start a producer on demand. Driven by [`Self::attach_channel`],
+    /// NOT by monitor subscriptions — a GET/PUT/RPC/GET_FIELD-only client
+    /// triggers it just like a monitoring one.
     pub fn on_first_connect<F>(&self, handler: F)
     where
         F: Fn(&SharedPV) + Send + Sync + 'static,
@@ -705,15 +728,64 @@ impl SharedPV {
         self.inner.lock().on_first_connect = Some(Arc::new(handler));
     }
 
-    /// Hook fired when the *last* subscriber leaves (subscribers
-    /// N → 0). Mirrors pvxs `SharedPV::onLastDisconnect` — pair with
-    /// `on_first_connect` to gate cost-of-production on actual
-    /// listener interest.
+    /// Hook fired when the *last client channel* detaches (channel count
+    /// N → 0). Mirrors pvxs `SharedPV::onLastDisconnect`
+    /// (`sharedpv.cpp:278-296`) — pair with `on_first_connect` to gate
+    /// cost-of-production on actual channel interest. Driven by
+    /// [`Self::detach_channel`], NOT by monitor subscriptions.
     pub fn on_last_disconnect<F>(&self, handler: F)
     where
         F: Fn(&SharedPV) + Send + Sync + 'static,
     {
         self.inner.lock().on_last_disconnect = Some(Arc::new(handler));
+    }
+
+    /// Record that a client channel attached, firing `on_first_connect`
+    /// on the channel-count 0 → 1 transition. Called by the server's
+    /// CREATE_CHANNEL owner via `SharedSource::notify_channel_open`,
+    /// mirroring pvxs `SharedPV::attach` inserting into `impl->channels`
+    /// and running `onFirstConnect` on empty→non-empty
+    /// (`sharedpv.cpp:299-313`). The callback runs after the lock is
+    /// released so it may re-enter `open`/`post`/`current`.
+    pub fn attach_channel(&self) {
+        let cb = {
+            let mut g = self.inner.lock();
+            g.channel_count += 1;
+            if g.channel_count == 1 {
+                g.on_first_connect.clone()
+            } else {
+                None
+            }
+        };
+        if let Some(f) = cb {
+            f(self);
+        }
+    }
+
+    /// Record that a client channel detached, firing `on_last_disconnect`
+    /// on the channel-count 1 → 0 transition. Called by the server's
+    /// channel-teardown owner via `SharedSource::notify_channel_close`,
+    /// mirroring pvxs erasing from `impl->channels` and running
+    /// `onLastDisconnect` on the non-empty→empty edge
+    /// (`sharedpv.cpp:278-296`). Saturating so a stray close never
+    /// underflows the count.
+    pub fn detach_channel(&self) {
+        let cb = {
+            let mut g = self.inner.lock();
+            if g.channel_count == 0 {
+                None
+            } else {
+                g.channel_count -= 1;
+                if g.channel_count == 0 {
+                    g.on_last_disconnect.clone()
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(f) = cb {
+            f(self);
+        }
     }
 
     /// Non-allocating snapshot — copies the current value into `out`
@@ -722,33 +794,23 @@ impl SharedPV {
     /// `SharedPV::fetch`.
     pub fn fetch(&self, out: &mut Option<PvField>) -> bool {
         let g = self.inner.lock();
-        match (&g.value, g.is_open) {
-            (Some(v), true) => {
-                *out = Some(v.clone());
+        match &g.state {
+            PvState::Open { value, .. } => {
+                *out = Some(value.clone());
                 true
             }
-            _ => false,
+            PvState::Closed => false,
         }
     }
 
-    /// Drop dead (closed-receiver) subscribers and fire
-    /// `on_last_disconnect` if the set just became empty. Called by
-    /// the per-channel TCP task on monitor close so SharedPV can
-    /// notice subscribers leaving without waiting for the next post().
+    /// Drop dead (closed-receiver) monitor subscribers so a long-idle PV
+    /// doesn't retain closed outboxes until the next `post()`. This is a
+    /// monitor-subscriber cleanup only: it does NOT fire
+    /// `on_last_disconnect`, which is a *channel*-lifecycle edge driven by
+    /// [`Self::detach_channel`] (pvxs keeps `subscribers` and
+    /// `impl->channels` separate, sharedpv.cpp:252-296).
     pub fn prune_subscribers(&self) {
-        let cb = {
-            let mut g = self.inner.lock();
-            let was_nonempty = !g.subscribers.is_empty();
-            g.subscribers.retain(|tx| !tx.is_closed());
-            if was_nonempty && g.subscribers.is_empty() {
-                g.on_last_disconnect.clone()
-            } else {
-                None
-            }
-        };
-        if let Some(f) = cb {
-            f(self);
-        }
+        self.inner.lock().subscribers.retain(|tx| !tx.is_closed());
     }
 
     /// Set the low watermark hint (advisory).
@@ -1088,6 +1150,30 @@ impl super::source::ChannelSource for SharedSource {
         }
     }
 
+    /// Override default no-op: route the channel-attach edge to the named
+    /// `SharedPV` so it can fire `on_first_connect` on the first channel.
+    /// This is the channel-lifecycle path pvxs drives through
+    /// `SharedPV::attach` (`sharedpv.cpp:299-313`), kept separate from
+    /// monitor subscription. A GET/PUT/RPC/GET_FIELD-only channel opens
+    /// the producer here, not only a monitoring one.
+    fn notify_channel_open(&self, name: &str, _ctx: &super::source::ChannelContext) {
+        let pv = self.pvs.lock().get(name).cloned();
+        if let Some(p) = pv {
+            p.attach_channel();
+        }
+    }
+
+    /// Override default no-op: route the channel-detach edge to the named
+    /// `SharedPV` so it can fire `on_last_disconnect` on the last channel
+    /// leaving (pvxs `sharedpv.cpp:278-296`). Mirror of
+    /// [`Self::notify_channel_open`].
+    fn notify_channel_close(&self, name: &str, _ctx: &super::source::ChannelContext) {
+        let pv = self.pvs.lock().get(name).cloned();
+        if let Some(p) = pv {
+            p.detach_channel();
+        }
+    }
+
     /// expose the per-PV `(low, high)` watermark levels so the
     /// monitor loop fires the callbacks off the pipeline window rather
     /// than server-queue occupancy.
@@ -1151,6 +1237,214 @@ mod tests {
         pv.close();
         assert!(!pv.is_open());
         assert_eq!(pv.try_post(nt_scalar_int_value(1)), 0);
+    }
+
+    /// Regression: pvxs runs `onFirstConnect`/`onLastDisconnect` off the
+    /// *channel* set (`impl->channels`, sharedpv.cpp:278-313), which is
+    /// tracked separately from monitor `subscribers` (`:252-275`). The
+    /// Rust hooks previously fired off the monitor-subscriber count, so a
+    /// GET/PUT/RPC/GET_FIELD-only client never opened a lazy PV and
+    /// `on_last_disconnect` (only reachable via the never-called
+    /// `prune_subscribers`) never fired at all. They must now key off
+    /// `attach_channel`/`detach_channel` 0↔1 transitions, and a monitor
+    /// `subscribe()` must NOT fire them.
+    #[test]
+    fn channel_lifecycle_hooks_track_channels_not_subscribers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let first = Arc::new(AtomicUsize::new(0));
+        let last = Arc::new(AtomicUsize::new(0));
+        let pv = SharedPV::new();
+        {
+            let f = first.clone();
+            pv.on_first_connect(move |p| {
+                f.fetch_add(1, Ordering::SeqCst);
+                // pvxs lazy-open pattern: open the PV when the first
+                // channel attaches (testget.cpp:204-234).
+                p.open(nt_scalar_int_desc(), nt_scalar_int_value(1));
+            });
+        }
+        {
+            let l = last.clone();
+            pv.on_last_disconnect(move |p| {
+                l.fetch_add(1, Ordering::SeqCst);
+                p.close();
+            });
+        }
+
+        // A monitor subscribe on a still-closed PV returns None and must
+        // NOT fire on_first_connect — it is a subscriber edge.
+        assert!(pv.subscribe(4).is_none(), "closed PV: no subscription");
+        assert_eq!(
+            first.load(Ordering::SeqCst),
+            0,
+            "subscribe() must not fire on_first_connect"
+        );
+        assert!(!pv.is_open());
+
+        // First channel attach fires on_first_connect → lazy open.
+        pv.attach_channel();
+        assert_eq!(first.load(Ordering::SeqCst), 1);
+        assert!(pv.is_open(), "on_first_connect opened the PV");
+        // A GET-only client (no monitor) now sees the value.
+        assert!(pv.current().is_some());
+
+        // Second channel attach: no re-fire (only the 0→1 edge counts).
+        pv.attach_channel();
+        assert_eq!(
+            first.load(Ordering::SeqCst),
+            1,
+            "on_first_connect fires once on 0→1"
+        );
+
+        // One detach with a channel still left: on_last must NOT fire.
+        pv.detach_channel();
+        assert_eq!(last.load(Ordering::SeqCst), 0);
+        assert!(pv.is_open());
+
+        // Last detach: on_last_disconnect fires and closes the PV.
+        pv.detach_channel();
+        assert_eq!(
+            last.load(Ordering::SeqCst),
+            1,
+            "on_last_disconnect fires on 1→0"
+        );
+        assert!(!pv.is_open());
+
+        // A stray extra detach must not underflow the count or re-fire.
+        pv.detach_channel();
+        assert_eq!(
+            last.load(Ordering::SeqCst),
+            1,
+            "saturating detach: no re-fire below zero"
+        );
+    }
+
+    /// Regression: the server's CREATE_CHANNEL / teardown owner drives
+    /// the channel lifecycle through `ChannelSource::notify_channel_open`
+    /// / `notify_channel_close`. `SharedSource` must route those to the
+    /// named `SharedPV`'s attach/detach so a lazy PV opens for a
+    /// GET-only client (no monitor) on first channel and closes on last,
+    /// matching pvxs lazy GET/PUT/RPC/GET_FIELD coverage.
+    #[tokio::test]
+    async fn shared_source_channel_open_close_drives_lazy_lifecycle() {
+        use crate::server_native::source::{ChannelContext, ChannelSource};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let src = SharedSource::new();
+        let pv = SharedPV::new();
+        let opened = Arc::new(AtomicUsize::new(0));
+        {
+            let o = opened.clone();
+            pv.on_first_connect(move |p| {
+                o.fetch_add(1, Ordering::SeqCst);
+                p.open(nt_scalar_int_desc(), nt_scalar_int_value(5));
+            });
+        }
+        pv.on_last_disconnect(|p| p.close());
+        src.add("dut", pv);
+
+        let ctx = ChannelContext {
+            peer: "127.0.0.1:5075".parse().unwrap(),
+            account: String::new(),
+            method: "anonymous".into(),
+            host: String::new(),
+            authority: String::new(),
+            roles: Vec::new(),
+            pv_request: None,
+        };
+
+        // No channel yet: a GET-only path sees a closed PV.
+        assert!(src.get_value("dut").await.is_none());
+
+        // Channel attach (the CREATE_CHANNEL owner's hook) drives lazy
+        // open — no monitor subscription involved.
+        src.notify_channel_open("dut", &ctx);
+        assert_eq!(opened.load(Ordering::SeqCst), 1);
+        assert!(
+            src.get_value("dut").await.is_some(),
+            "lazy GET sees value after first channel attaches"
+        );
+
+        // Channel close drives onLastDisconnect → PV closes again.
+        src.notify_channel_close("dut", &ctx);
+        assert!(
+            src.get_value("dut").await.is_none(),
+            "PV closed after last channel detaches"
+        );
+    }
+
+    /// Regression: pvxs `close()` clears `impl->current`
+    /// (`sharedpv.cpp:404-405`), so afterwards the descriptor and value
+    /// are gone and `fetch()` throws `"open() first"` (`:443-469`). The
+    /// Rust `close()` previously only flipped `is_open` and left
+    /// `desc`/`value` populated, so `current()` / `introspection()` (and
+    /// the GET / GET_FIELD wire paths that read them) surfaced the stale
+    /// pre-close state. After the close all of `current()`,
+    /// `introspection()`, `fetch()`, and a new `subscribe()` must report
+    /// withdrawn; a fresh `open()` must restore them.
+    #[test]
+    fn shared_pv_close_withdraws_descriptor_value_and_fetch() {
+        let pv = SharedPV::new();
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(42));
+        assert!(pv.current().is_some());
+        assert!(pv.introspection().is_some());
+
+        pv.close();
+
+        assert!(!pv.is_open());
+        assert!(
+            pv.current().is_none(),
+            "closed SharedPV must not surface a stale value"
+        );
+        assert!(
+            pv.introspection().is_none(),
+            "closed SharedPV must not surface a stale descriptor"
+        );
+        let mut snap = None;
+        assert!(
+            !pv.fetch(&mut snap),
+            "fetch() on a closed SharedPV must report no value"
+        );
+        assert!(snap.is_none());
+        assert!(
+            pv.subscribe(8).is_none(),
+            "subscribe() on a closed SharedPV must be rejected"
+        );
+
+        // Reopen restores the lifecycle.
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(7));
+        assert!(pv.is_open());
+        assert!(pv.current().is_some());
+        assert!(pv.introspection().is_some());
+    }
+
+    /// Regression: the GET / GET_FIELD wire paths read through
+    /// `SharedSource::get_value` / `get_introspection`, which forward to
+    /// `SharedPV::current()` / `introspection()`. A closed PV must report
+    /// `None` on both, matching pvxs withdrawing `impl->current` so a
+    /// post-close fetch throws `"open() first"` (`sharedpv.cpp:443-469`).
+    #[tokio::test]
+    async fn shared_source_get_paths_withdraw_after_close() {
+        use crate::server_native::source::ChannelSource;
+
+        let src = SharedSource::new();
+        let pv = SharedPV::new();
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(42));
+        src.add("X", pv.clone());
+
+        assert!(src.get_value("X").await.is_some());
+        assert!(src.get_introspection("X").await.is_some());
+
+        pv.close();
+
+        assert!(
+            src.get_value("X").await.is_none(),
+            "GET on a closed SharedPV must not return a stale value"
+        );
+        assert!(
+            src.get_introspection("X").await.is_none(),
+            "GET_FIELD on a closed SharedPV must not return a stale descriptor"
+        );
     }
 
     fn extract_int(v: &PvField) -> i32 {

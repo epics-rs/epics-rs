@@ -339,6 +339,38 @@ impl ChannelSource for CompositeSource {
         }
     }
 
+    /// CREATE_CHANNEL owner binding: return the matched inner source so
+    /// the channel dispatches every later operation to the source that
+    /// accepted it, instead of re-resolving the registry per operation.
+    /// Selection uses `has_pv_checked` — the same credentialed find as
+    /// [`Self::resolve_checked`] — so the owner is chosen under the
+    /// downstream peer's identity. Descends through a nested composite
+    /// to its leaf owner so the bound source is always terminal.
+    ///
+    /// pvxs binds the accepting source's callbacks into the `ServerChan`
+    /// at CREATE_CHANNEL (`serverchan.cpp:295-322`, `serverchan.cpp:70-112`)
+    /// and a later `removeSource` does not rewrite them
+    /// (`server.cpp:100-112`).
+    fn resolve_owner(
+        &self,
+        name: &str,
+        ctx: crate::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Option<DynSource>> + Send {
+        let name = name.to_string();
+        let this = self.snapshot();
+        async move {
+            for src in this {
+                if src.has_pv_checked(&name, ctx.clone()).await {
+                    return Some(match src.resolve_owner(&name, ctx).await {
+                        Some(leaf) => leaf,
+                        None => src,
+                    });
+                }
+            }
+            None
+        }
+    }
+
     fn get_value(&self, name: &str) -> impl std::future::Future<Output = Option<PvField>> + Send {
         let name = name.to_string();
         let this = self.snapshot();
@@ -1219,6 +1251,89 @@ mod tests {
         assert!(
             !plain_seen.load(Ordering::SeqCst),
             "composite *_checked find-loop must NOT call credential-free has_pv"
+        );
+    }
+
+    /// CREATE_CHANNEL binds the OWNING source so later operations cannot
+    /// silently re-route to a different source when the registry changes.
+    /// pvxs installs the accepting source's callbacks into the
+    /// `ServerChan` (`serverchan.cpp:70-112`) and a later `removeSource`
+    /// does not rewrite them (`server.cpp:100-112`).
+    ///
+    /// `resolve_owner` returns the matched inner source; a held clone of
+    /// that owner keeps serving the original source even after the same
+    /// name is removed and re-registered to a different source. A fresh
+    /// resolve sees the new registry — proving the binding, not the
+    /// registry, is what a live channel dispatches through.
+    #[tokio::test]
+    async fn resolve_owner_binds_accepting_source_across_registry_change() {
+        use crate::server_native::source::ChannelContext;
+        let ctx = ChannelContext {
+            peer: "127.0.0.1:5075".parse().unwrap(),
+            account: "alice".into(),
+            method: "ca".into(),
+            host: "h".into(),
+            authority: String::new(),
+            roles: Vec::new(),
+            pv_request: None,
+        };
+
+        let comp = CompositeSource::new();
+        let src_a: DynSource = Arc::new(PvSrc {
+            name: "pv",
+            value: 1,
+        });
+        comp.add_source("pv", src_a, 0).unwrap();
+
+        // CREATE_CHANNEL binds the owner that accepted the channel.
+        let owner = comp
+            .resolve_owner("pv", ctx.clone())
+            .await
+            .expect("composite resolves an owner for a known PV");
+        assert!(
+            matches!(
+                owner.get_value("pv").await,
+                Some(PvField::Structure(ref s))
+                    if matches!(s.fields.first(),
+                        Some((_, PvField::Scalar(ScalarValue::Int(1)))))
+            ),
+            "bound owner must be source A (value=1)"
+        );
+
+        // Registry mutates: A is removed and the SAME name is re-registered
+        // to a different source B.
+        comp.remove_source("pv", 0).expect("source A removed");
+        let src_b: DynSource = Arc::new(PvSrc {
+            name: "pv",
+            value: 2,
+        });
+        comp.add_source("pv", src_b, 0).unwrap();
+
+        // The already-bound owner still dispatches to A — a live channel
+        // keeps its CREATE_CHANNEL owner.
+        assert!(
+            matches!(
+                owner.get_value("pv").await,
+                Some(PvField::Structure(ref s))
+                    if matches!(s.fields.first(),
+                        Some((_, PvField::Scalar(ScalarValue::Int(1)))))
+            ),
+            "bound owner must remain source A after registry change"
+        );
+
+        // A fresh CREATE_CHANNEL sees the new registry and binds B.
+        let fresh = comp
+            .resolve_owner("pv", ctx)
+            .await
+            .expect("composite resolves the new owner");
+        assert!(
+            matches!(
+                fresh.get_value("pv").await,
+                Some(PvField::Structure(ref s))
+                    if matches!(s.fields.first(),
+                        Some((_, PvField::Scalar(ScalarValue::Int(2)))))
+            ),
+            "a new channel must bind the replacement source B (value=2)"
         );
     }
 }

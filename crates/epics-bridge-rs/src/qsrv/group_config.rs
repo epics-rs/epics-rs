@@ -673,7 +673,15 @@ fn json_to_pv_field(v: &serde_json::Value) -> Result<epics_pva_rs::pvdata::PvFie
         serde_json::Value::Bool(b) => Ok(PvField::Scalar(ScalarValue::Boolean(*b))),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                Ok(PvField::Scalar(ScalarValue::Int(i as i32)))
+                // pvxs builds a JSON integer const as `TypeDef(TypeCode::
+                // Int64)` and assigns the full `int64_t`
+                // (groupconfigprocessor.cpp:680-686); the group field
+                // descriptor is then derived from that const's type
+                // (596-603), so a JSON integer const is a PVA `long`, not
+                // `int`. The prior `i as i32` truncated large constants
+                // (version IDs, table labels) and advertised the wrong
+                // field type. Keep the full width as `Long`.
+                Ok(PvField::Scalar(ScalarValue::Long(i)))
             } else if let Some(f) = n.as_f64() {
                 Ok(PvField::Scalar(ScalarValue::Double(f)))
             } else {
@@ -1469,12 +1477,12 @@ mod tests {
         assert!(version.channel.is_empty());
         assert!(version.const_value.is_some());
         if let Some(epics_pva_rs::pvdata::PvField::Scalar(
-            epics_pva_rs::pvdata::ScalarValue::Int(v),
+            epics_pva_rs::pvdata::ScalarValue::Long(v),
         )) = &version.const_value
         {
             assert_eq!(*v, 42);
         } else {
-            panic!("expected Int(42), got {:?}", version.const_value);
+            panic!("expected Long(42), got {:?}", version.const_value);
         }
     }
 
@@ -1499,12 +1507,12 @@ mod tests {
             .unwrap();
         assert_eq!(version.mapping, FieldMapping::Const);
         if let Some(epics_pva_rs::pvdata::PvField::Scalar(
-            epics_pva_rs::pvdata::ScalarValue::Int(v),
+            epics_pva_rs::pvdata::ScalarValue::Long(v),
         )) = &version.const_value
         {
             assert_eq!(*v, 7);
         } else {
-            panic!("expected Int(7) via +const, got {:?}", version.const_value);
+            panic!("expected Long(7) via +const, got {:?}", version.const_value);
         }
     }
 
@@ -1528,13 +1536,59 @@ mod tests {
             .find(|m| m.field_name == "k")
             .unwrap();
         if let Some(epics_pva_rs::pvdata::PvField::Scalar(
-            epics_pva_rs::pvdata::ScalarValue::Int(v),
+            epics_pva_rs::pvdata::ScalarValue::Long(v),
         )) = &k.const_value
         {
             assert_eq!(*v, 100, "+const should take precedence over +value");
         } else {
-            panic!("expected Int(100), got {:?}", k.const_value);
+            panic!("expected Long(100), got {:?}", k.const_value);
         }
+    }
+
+    /// A `+const` integer above the int32 range must survive at its
+    /// full int64 width — pvxs builds it as `TypeCode::Int64`
+    /// (groupconfigprocessor.cpp:680-686), so narrowing to i32 (the
+    /// prior bug) corrupted large constants such as version IDs.
+    #[test]
+    fn parse_const_large_integer_preserved_at_int64() {
+        use epics_pva_rs::pvdata::{PvField, ScalarValue};
+        // i32::MAX + 1, i64::MIN, and a plain in-range value.
+        let big = i64::from(i32::MAX) + 1;
+        let json = format!(
+            r#"{{
+                "GRP:c": {{
+                    "hi": {{ "+type": "const", "+const": {big} }},
+                    "lo": {{ "+type": "const", "+const": {} }},
+                    "mid": {{ "+type": "const", "+const": 5 }}
+                }}
+            }}"#,
+            i64::MIN
+        );
+        let groups = parse_group_config(&json).unwrap();
+        let members = &groups[0].members;
+        let get = |name: &str| {
+            members
+                .iter()
+                .find(|m| m.field_name == name)
+                .and_then(|m| m.const_value.clone())
+        };
+        // Every JSON integer const is a `Long`, regardless of magnitude,
+        // and retains its exact value (no i32 truncation/wraparound).
+        assert!(
+            matches!(get("hi"), Some(PvField::Scalar(ScalarValue::Long(v))) if v == big),
+            "i32::MAX+1 const must stay Long({big}), got {:?}",
+            get("hi")
+        );
+        assert!(
+            matches!(get("lo"), Some(PvField::Scalar(ScalarValue::Long(v))) if v == i64::MIN),
+            "i64::MIN const must stay Long, got {:?}",
+            get("lo")
+        );
+        assert!(
+            matches!(get("mid"), Some(PvField::Scalar(ScalarValue::Long(5)))),
+            "in-range const is still Long (not Int), got {:?}",
+            get("mid")
+        );
     }
 
     #[test]
@@ -1575,7 +1629,7 @@ mod tests {
         match &m.const_value {
             Some(PvField::ScalarArray(items)) => {
                 assert_eq!(items.len(), 3);
-                assert!(matches!(items[0], ScalarValue::Int(1)));
+                assert!(matches!(items[0], ScalarValue::Long(1)));
             }
             other => panic!("expected ScalarArray, got {other:?}"),
         }

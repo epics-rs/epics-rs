@@ -309,12 +309,33 @@ fn try_parse_json_link(s: &str) -> Option<ParsedLink> {
             }
         }
         "ca" | "pva" => {
-            // Form: { pva: { pv: "name", field: "F", proc: "CP", ... } }
-            // For CA: only the PV name is needed (CA links bypass pvalink).
-            // For PVA: preserve all pvxs JSON options as a query string so
-            // the pvalink bridge can reconstruct the full PvaLinkConfig.
-            // pvxs parity: pvalink_jlif.cpp:24-41, :69-196.
-            let (pv, query) = extract_pv_and_opts_from_subobject(rest)?;
+            // pvxs accepts the link value in two forms (pvalink_jlif.cpp:24-31
+            // documents the string shorthand; pva_parse_string at :143-149
+            // takes a string value at depth 0 as the channel name and a `pv`
+            // string inside a map):
+            //   shorthand  { pva: "name" }             — string IS the PV name
+            //   longhand   { pva: { pv: "name", ... } } — map with a `pv`
+            //              member; for PVA the other keys are preserved as a
+            //              query string so the pvalink bridge can reconstruct
+            //              the full PvaLinkConfig (pvalink_jlif.cpp:69-196).
+            // For CA only the PV name matters (CA links bypass pvalink).
+            //
+            // Branch on the value's JSON shape so the recognized string
+            // shorthand is routed to the PVA/CA resolver instead of falling
+            // through to legacy DB parsing (which would treat the raw JSON
+            // text as a record name).
+            let value = rest.trim_end_matches(',').trim();
+            let (pv, query) = if value.starts_with('{') {
+                extract_pv_and_opts_from_subobject(rest)?
+            } else {
+                // String shorthand: the value itself is the PV name. Strip the
+                // surrounding quotes; an empty name is not a usable link.
+                let name = value.trim_matches('"').trim_matches('\'').trim();
+                if name.is_empty() {
+                    return None;
+                }
+                (name.to_string(), String::new())
+            };
             if key == "ca" {
                 // JSON CA links carry no plain-text MS modifier; the
                 // alarm policy defaults to NoMaximize.
@@ -726,6 +747,46 @@ mod json_link_tests {
         assert_eq!(
             parse_link_v2(r#"{ca: { pv: 'BAR' }}"#),
             ParsedLink::Ca(CaLink::new("BAR"))
+        );
+    }
+
+    // pvxs string shorthand `{ pva: "PV" }` / `{ ca: "PV" }`
+    // (pvalink_jlif.cpp:24-31, :143-149). Before the fix these fell through
+    // to legacy DB parsing because the value is a string, not a `{pv:...}`
+    // sub-object — the link silently became a DB link to a record whose name
+    // was the raw JSON text.
+
+    #[test]
+    fn json_pva_link_string_shorthand() {
+        assert_eq!(
+            parse_link_v2(r#"{pva: "TARGET:AI"}"#),
+            ParsedLink::Pva("TARGET:AI".to_string())
+        );
+    }
+
+    #[test]
+    fn json_ca_link_string_shorthand() {
+        assert_eq!(
+            parse_link_v2(r#"{ca: "TARGET:AI"}"#),
+            ParsedLink::Ca(CaLink::new("TARGET:AI"))
+        );
+    }
+
+    #[test]
+    fn json_pva_link_string_shorthand_single_quotes() {
+        assert_eq!(
+            parse_link_v2(r#"{pva: 'invalid:pv:name'}"#),
+            ParsedLink::Pva("invalid:pv:name".to_string())
+        );
+    }
+
+    #[test]
+    fn json_pva_link_longhand_still_preserves_options() {
+        // The longhand map form must keep working unchanged: a `pv` member
+        // plus options preserved as a query string.
+        assert_eq!(
+            parse_link_v2(r#"{pva: { pv: "FOO:bar", Q: "4" }}"#),
+            ParsedLink::Pva("FOO:bar?Q=4".to_string())
         );
     }
 

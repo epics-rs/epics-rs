@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::runtime::sync::{Mutex, RwLock, mpsc};
 
 use crate::error::CaError;
-use crate::server::snapshot::Snapshot;
+use crate::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, Snapshot};
 use crate::types::{DbFieldType, EpicsValue};
 
 /// Per-subscriber bounded mpsc depth. Lifted from
@@ -228,11 +228,43 @@ impl Subscriber {
     }
 }
 
+/// Shadow `DBR_GR_*` / `DBR_CTRL_*` / enum metadata for a
+/// non-record-backed PV.
+///
+/// A bare [`ProcessVariable`] has no record engine to derive units /
+/// precision / display+alarm+control limits / enum labels from, so a
+/// proxy that fronts an upstream IOC (the CA / PVA gateway) fetches the
+/// upstream's control metadata and installs it here via
+/// [`ProcessVariable::set_metadata`]. Every snapshot the PV emits —
+/// the GET path ([`ProcessVariable::snapshot`]) and every monitor
+/// event ([`ProcessVariable::post_property`], value, alarm, and
+/// gateway snapshot posts) — then carries it, so a downstream client
+/// that requested a `DBR_GR_*` / `DBR_CTRL_*` type receives the
+/// upstream metadata instead of zeroed limits.
+///
+/// Mirrors the C ca-gateway, where `gatePvData` subscribes to
+/// `DBE_PROPERTY` and issues a control-type `ca_array_get_callback`
+/// (`gatePv.cc:850-934`) then copies units / precision / graphic +
+/// control limits into the gateway's gdd attributes
+/// (`gatePv.cc:1916-2007`).
+#[derive(Debug, Clone, Default)]
+pub struct PvMetadata {
+    pub display: Option<DisplayInfo>,
+    pub control: Option<ControlInfo>,
+    pub enums: Option<EnumInfo>,
+}
+
 /// A process variable hosted by the server.
 pub struct ProcessVariable {
     pub name: String,
     pub value: RwLock<EpicsValue>,
     pub subscribers: Mutex<Vec<Subscriber>>,
+    /// Shadow DBR_GR_*/DBR_CTRL_*/enum metadata, installed by a proxy
+    /// (CA / PVA gateway) via [`Self::set_metadata`]. Empty for a plain
+    /// local PV. Stored under the same sync `parking_lot::RwLock` slot
+    /// rationale as the hooks: every snapshot builder reads it without
+    /// an `.await`. See [`PvMetadata`].
+    metadata: parking_lot::RwLock<PvMetadata>,
     /// Optional hook consulted on client-originated writes. When set,
     /// the CA TCP write path delegates to the hook instead of doing a
     /// local `pv.set()`. See [`WriteHook`].
@@ -258,8 +290,43 @@ impl ProcessVariable {
             name,
             value: RwLock::new(initial),
             subscribers: Mutex::new(Vec::new()),
+            metadata: parking_lot::RwLock::new(PvMetadata::default()),
             write_hook: parking_lot::RwLock::new(None),
             access_hook: parking_lot::RwLock::new(None),
+        }
+    }
+
+    /// Install (or replace) the shadow DBR_GR_*/DBR_CTRL_*/enum
+    /// metadata served on this PV's snapshots. Used by the CA / PVA
+    /// gateway after fetching the upstream IOC's control metadata. See
+    /// [`PvMetadata`]. To publish the change to downstream property
+    /// monitors, follow with [`Self::post_property`].
+    pub fn set_metadata(&self, metadata: PvMetadata) {
+        *self.metadata.write() = metadata;
+    }
+
+    /// Snapshot (clone) of the installed shadow metadata; empty
+    /// (`Default`) for a plain local PV.
+    pub fn metadata(&self) -> PvMetadata {
+        self.metadata.read().clone()
+    }
+
+    /// Fill any metadata field the snapshot leaves `None` from the
+    /// installed shadow metadata. A field the caller already populated
+    /// (e.g. a gateway snapshot that carried its own metadata) wins —
+    /// this only supplies what is otherwise absent, so every emission
+    /// path serves the upstream metadata uniformly without clobbering a
+    /// richer source.
+    fn apply_metadata(&self, snap: &mut Snapshot) {
+        let meta = self.metadata.read();
+        if snap.display.is_none() {
+            snap.display = meta.display.clone();
+        }
+        if snap.control.is_none() {
+            snap.control = meta.control.clone();
+        }
+        if snap.enums.is_none() {
+            snap.enums = meta.enums.clone();
         }
     }
 
@@ -303,20 +370,22 @@ impl ProcessVariable {
     /// Build a Snapshot for this bare PV.
     ///
     /// A `ProcessVariable` is a non-record-backed channel: it has no
-    /// alarm engine, no DESC/EGU/PREC metadata, no timestamp user
-    /// tag and no enum/control limits. The snapshot is therefore
-    /// deliberately minimal — value + `NO_ALARM` + wall-clock now,
-    /// with `display`/`control`/`enums` = `None` and `user_tag` = 0.
-    /// These zeros are correct, not placeholder: there is no source
-    /// to draw richer metadata from. Record-backed channels build
-    /// their snapshot via `RecordInstance::snapshot_for_field`, which
-    /// carries the record's alarm/metadata. The only path that
-    /// injects a non-zero alarm onto a bare PV is [`Self::post_alarm`]
-    /// (used by the CA/PVA gateway adapter to surface upstream
-    /// disconnect).
+    /// alarm engine, no DESC/EGU/PREC metadata and no timestamp user
+    /// tag of its own. The snapshot is therefore value + `NO_ALARM` +
+    /// wall-clock now, with `user_tag` = 0. Display / control / enum
+    /// metadata is `None` *unless* a proxy installed it via
+    /// [`Self::set_metadata`] (the CA / PVA gateway shadowing an
+    /// upstream IOC) — see [`Self::apply_metadata`]. Record-backed
+    /// channels build their snapshot via
+    /// `RecordInstance::snapshot_for_field`, which carries the record's
+    /// own alarm/metadata. The only path that injects a non-zero alarm
+    /// onto a bare PV is [`Self::post_alarm`] (used by the gateway
+    /// adapter to surface upstream disconnect).
     pub async fn snapshot(&self) -> Snapshot {
         let value = self.value.read().await.clone();
-        Snapshot::new(value, 0, 0, crate::runtime::time::now_wall())
+        let mut snap = Snapshot::new(value, 0, 0, crate::runtime::time::now_wall());
+        self.apply_metadata(&mut snap);
+        snap
     }
 
     /// Set a new value and notify all subscribers.
@@ -341,82 +410,36 @@ impl ProcessVariable {
         self.notify_subscribers_from_snapshot(snapshot).await;
     }
 
-    /// Push a fresh monitor event holding the current value but with
-    /// the supplied alarm severity/status. Used by the PVA / CA
-    /// gateway adapter to surface upstream-disconnect to downstream
-    /// monitor subscribers without dropping the simple PV (which
-    /// would force every downstream client into ECA_DISCONN +
-    /// reconnect storms when the upstream is just briefly
-    /// unreachable). Mirrors gatePvData::death's "alarm-post"
-    /// alternative discussed in the C++ ca-gateway audit.
-    pub async fn post_alarm(&self, severity: u16, status: u16) {
+    /// Single delivery owner: emit `snapshot` to every live subscriber
+    /// whose `DBE_*` mask intersects `post`.
+    ///
+    /// Every emission path ([`Self::notify_subscribers`] value posts,
+    /// [`Self::post_alarm`], [`Self::notify_subscribers_from_snapshot`]
+    /// gateway posts, [`Self::post_property`]) routes through here so the
+    /// mask gate (`caEventMask & pevent->select`, `dbEvent.c:892-900`),
+    /// the per-subscriber channel-filter chain, and the slow-consumer
+    /// coalesce-overflow accounting are applied identically — one event
+    /// class differs per caller, nothing else. The snapshot is built once
+    /// by the caller (one timestamp per logical event) and cloned per
+    /// subscriber.
+    async fn deliver(&self, post: crate::server::recgbl::EventMask, snapshot: Snapshot) {
         use crate::server::database::filters::FilteredMonitorEvent;
-        use crate::server::recgbl::EventMask;
-        let value = self.value.read().await.clone();
         let mut subs = self.subscribers.lock().await;
+        // Remove subscribers whose channel has been dropped.
         subs.retain(|sub| !sub.tx.is_closed());
-        // ALARM|LOG so DBE_LOG (archiver) subscribers receive alarm events.
-        let post = EventMask::ALARM | EventMask::LOG;
         for sub in subs.iter() {
-            // Skip subscribers that did not request alarm events
-            // (`caEventMask & pevent->select == 0`).
+            // Skip subscribers whose requested class does not intersect
+            // this post's event class.
             if !sub.accepts(post) {
                 continue;
             }
-            let snapshot = Snapshot::new(
-                value.clone(),
-                status,
-                severity,
-                crate::runtime::time::now_wall(),
-            );
             let event = MonitorEvent {
-                snapshot,
+                snapshot: snapshot.clone(),
                 origin: 0,
             };
-            // `FilteredMonitorEvent` with `mask = ALARM` tells
-            // value filters (e.g. `dbnd`) to pass through (446e0d4a).
-            let filtered = if sub.filters.is_empty() {
-                Some(event)
-            } else {
-                sub.filters
-                    .apply(FilteredMonitorEvent::new(event, post))
-                    .map(|fe| fe.event)
-            };
-            let Some(event) = filtered else {
-                continue;
-            };
-            if sub.tx.try_send(event.clone()).is_err() {
-                // L4 / an alarm event overwriting an unconsumed
-                // coalesced slot is genuinely lost. Route through the
-                // single coalesce-overflow owner so alarm-event loss to
-                // a slow consumer is counted exactly like value events.
-                sub.coalesce_overflow(event);
-            }
-        }
-    }
-
-    /// Notify all subscribers of a new value.
-    async fn notify_subscribers(&self, value: EpicsValue) {
-        use crate::server::database::filters::FilteredMonitorEvent;
-        use crate::server::recgbl::EventMask;
-        let mut subs = self.subscribers.lock().await;
-        // Remove subscribers whose channel has been dropped
-        subs.retain(|sub| !sub.tx.is_closed());
-        // VALUE|LOG so DBE_LOG (archiver) subscribers receive value events.
-        let post = EventMask::VALUE | EventMask::LOG;
-        for sub in subs.iter() {
-            // Skip subscribers that did not request value events
-            // (e.g. a `DBE_ALARM`-only monitor).
-            if !sub.accepts(post) {
-                continue;
-            }
-            let snapshot = Snapshot::new(value.clone(), 0, 0, crate::runtime::time::now_wall());
-            let event = MonitorEvent {
-                snapshot,
-                origin: 0,
-            };
-            // Value-changed emission — channel filters may suppress
-            // this event when (e.g.) the deadband isn't crossed.
+            // The channel-filter chain may suppress this event (e.g.
+            // `dbnd` deadband not crossed); `post` tells value filters
+            // whether to pass through (446e0d4a).
             let filtered = if sub.filters.is_empty() {
                 Some(event)
             } else {
@@ -429,50 +452,78 @@ impl ProcessVariable {
             };
             if sub.tx.try_send(event.clone()).is_err() {
                 // Queue full — overwrite any prior pending overflow with
-                // the newest event (consumer picks it up via
-                // `pop_coalesced` after the next normal recv). The single
-                // coalesce-overflow owner counts a value that the
-                // consumer never observed as a dropped monitor event.
+                // the newest event (consumer drains it via `pop_coalesced`
+                // after the next normal recv). The single coalesce-overflow
+                // owner counts a value the consumer never observed as a
+                // dropped monitor event, uniformly across event classes.
                 sub.coalesce_overflow(event);
             }
         }
     }
 
+    /// Push a fresh monitor event holding the current value but with
+    /// the supplied alarm severity/status. Used by the PVA / CA
+    /// gateway adapter to surface upstream-disconnect to downstream
+    /// monitor subscribers without dropping the simple PV (which
+    /// would force every downstream client into ECA_DISCONN +
+    /// reconnect storms when the upstream is just briefly
+    /// unreachable). Mirrors gatePvData::death's "alarm-post"
+    /// alternative discussed in the C++ ca-gateway audit.
+    pub async fn post_alarm(&self, severity: u16, status: u16) {
+        use crate::server::recgbl::EventMask;
+        let value = self.value.read().await.clone();
+        let mut snapshot = Snapshot::new(value, status, severity, crate::runtime::time::now_wall());
+        self.apply_metadata(&mut snapshot);
+        // ALARM|LOG so DBE_LOG (archiver) subscribers receive alarm events.
+        self.deliver(EventMask::ALARM | EventMask::LOG, snapshot)
+            .await;
+    }
+
+    /// Post a `DBE_PROPERTY` monitor event carrying the current value and
+    /// the installed shadow metadata, so downstream property-change
+    /// monitors re-read the units / precision / limits / enum labels.
+    ///
+    /// Used by the CA / PVA gateway when an upstream `DBE_PROPERTY` event
+    /// fires (metadata changed) after it has refreshed the shadow PV via
+    /// [`Self::set_metadata`]. Mirrors the C ca-gateway posting on its
+    /// control type following a `DBE_PROPERTY` callback
+    /// (`gatePv.cc:850-860`, `:920-934`). Property events are a distinct
+    /// class from value/alarm: only `DBE_PROPERTY` subscribers receive
+    /// them.
+    pub async fn post_property(&self) {
+        use crate::server::recgbl::EventMask;
+        let value = self.value.read().await.clone();
+        let mut snapshot = Snapshot::new(value, 0, 0, crate::runtime::time::now_wall());
+        self.apply_metadata(&mut snapshot);
+        self.deliver(EventMask::PROPERTY, snapshot).await;
+    }
+
+    /// Notify all subscribers of a new value.
+    async fn notify_subscribers(&self, value: EpicsValue) {
+        use crate::server::recgbl::EventMask;
+        let mut snapshot = Snapshot::new(value, 0, 0, crate::runtime::time::now_wall());
+        self.apply_metadata(&mut snapshot);
+        // VALUE|LOG so DBE_LOG (archiver) subscribers receive value events.
+        self.deliver(EventMask::VALUE | EventMask::LOG, snapshot)
+            .await;
+    }
+
     /// Notify all subscribers using a pre-built Snapshot (value + alarm +
     /// timestamp). Used by `set_snapshot` to propagate the upstream alarm
     /// and IOC timestamp without synthesising a new zero-alarm local-time
-    /// snapshot.
-    async fn notify_subscribers_from_snapshot(&self, snapshot: Snapshot) {
-        use crate::server::database::filters::FilteredMonitorEvent;
+    /// snapshot. Installed shadow metadata fills any metadata field the
+    /// gateway snapshot left absent (see [`Self::apply_metadata`]).
+    async fn notify_subscribers_from_snapshot(&self, mut snapshot: Snapshot) {
         use crate::server::recgbl::EventMask;
-        let mut subs = self.subscribers.lock().await;
-        subs.retain(|sub| !sub.tx.is_closed());
+        self.apply_metadata(&mut snapshot);
         // C gateway fires postEvent(VALUE|ALARM|LOG) for every
-        // upstream event (gateVc.cc:374-376); widen to match so DBE_LOG
+        // upstream event (gateVc.cc:374-376); match it so DBE_LOG
         // archivers and DBE_ALARM-only monitors receive gateway snapshot posts.
-        let post = EventMask::VALUE | EventMask::LOG | EventMask::ALARM;
-        for sub in subs.iter() {
-            if !sub.accepts(post) {
-                continue;
-            }
-            let event = MonitorEvent {
-                snapshot: snapshot.clone(),
-                origin: 0,
-            };
-            let filtered = if sub.filters.is_empty() {
-                Some(event)
-            } else {
-                sub.filters
-                    .apply(FilteredMonitorEvent::new(event, post))
-                    .map(|fe| fe.event)
-            };
-            let Some(event) = filtered else {
-                continue;
-            };
-            if sub.tx.try_send(event.clone()).is_err() {
-                sub.coalesce_overflow(event);
-            }
-        }
+        self.deliver(
+            EventMask::VALUE | EventMask::LOG | EventMask::ALARM,
+            snapshot,
+        )
+        .await;
     }
 
     /// Add a subscriber. Returns the receiver for monitor events,
@@ -722,6 +773,137 @@ mod mask_gate_tests {
         assert!(
             rx.try_recv().is_ok(),
             "DBE_LOG subscriber must receive an alarm post"
+        );
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    fn meta() -> PvMetadata {
+        PvMetadata {
+            display: Some(DisplayInfo {
+                units: "degC".into(),
+                precision: 2,
+                upper_disp_limit: 100.0,
+                lower_disp_limit: -50.0,
+                upper_alarm_limit: 90.0,
+                upper_warning_limit: 80.0,
+                lower_warning_limit: -20.0,
+                lower_alarm_limit: -40.0,
+                ..Default::default()
+            }),
+            control: Some(ControlInfo {
+                upper_ctrl_limit: 95.0,
+                lower_ctrl_limit: -45.0,
+            }),
+            enums: None,
+        }
+    }
+
+    fn pv() -> ProcessVariable {
+        ProcessVariable::new("m:pv".into(), EpicsValue::Double(1.0))
+    }
+
+    /// A bare PV serves no metadata until a proxy installs it; after
+    /// `set_metadata`, the GET snapshot carries the shadow DBR_GR/DBR_CTRL.
+    #[tokio::test]
+    async fn set_metadata_serves_on_get_snapshot() {
+        let pv = pv();
+        assert!(
+            pv.snapshot().await.display.is_none(),
+            "bare PV must carry no metadata before install"
+        );
+        pv.set_metadata(meta());
+        let snap = pv.snapshot().await;
+        let d = snap.display.expect("display installed");
+        assert_eq!(d.units, "degC");
+        assert_eq!(d.precision, 2);
+        assert_eq!(
+            snap.control.expect("control installed").upper_ctrl_limit,
+            95.0
+        );
+    }
+
+    /// A CTRL-type monitor must see the installed limits on every value
+    /// event, not only the initial GET — value posts carry the metadata.
+    #[tokio::test]
+    async fn installed_metadata_rides_value_posts() {
+        const DBE_VALUE: u16 = 1;
+        let pv = pv();
+        pv.set_metadata(meta());
+        let mut rx = pv
+            .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
+            .await
+            .expect("subscriber added");
+        pv.set(EpicsValue::Double(2.0)).await;
+        let ev = rx.try_recv().expect("value event delivered");
+        assert_eq!(
+            ev.snapshot.display.expect("metadata on value post").units,
+            "degC"
+        );
+    }
+
+    /// `apply_metadata` only supplies fields the caller left absent: a
+    /// gateway snapshot that already carries its own display wins.
+    #[tokio::test]
+    async fn apply_metadata_does_not_clobber_caller_metadata() {
+        const DBE_VALUE: u16 = 1;
+        let pv = pv();
+        pv.set_metadata(meta()); // installed units = degC
+        let mut rx = pv
+            .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
+            .await
+            .expect("subscriber added");
+        let mut snap = Snapshot::new(
+            EpicsValue::Double(3.0),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        snap.display = Some(DisplayInfo {
+            units: "volts".into(),
+            ..Default::default()
+        });
+        pv.set_snapshot(snap).await;
+        let ev = rx.try_recv().expect("snapshot delivered");
+        assert_eq!(
+            ev.snapshot.display.expect("caller display kept").units,
+            "volts"
+        );
+    }
+
+    /// `post_property` reaches DBE_PROPERTY subscribers (carrying the
+    /// metadata) and not DBE_VALUE-only subscribers.
+    #[tokio::test]
+    async fn post_property_reaches_only_property_subscribers() {
+        const DBE_VALUE: u16 = 1;
+        const DBE_PROPERTY: u16 = 8;
+        let pv = pv();
+        pv.set_metadata(meta());
+        let mut prop_rx = pv
+            .add_subscriber(1, DbFieldType::Double, DBE_PROPERTY)
+            .await
+            .expect("subscriber added");
+        let mut val_rx = pv
+            .add_subscriber(2, DbFieldType::Double, DBE_VALUE)
+            .await
+            .expect("subscriber added");
+        pv.post_property().await;
+        let ev = prop_rx
+            .try_recv()
+            .expect("DBE_PROPERTY subscriber receives property post");
+        assert_eq!(
+            ev.snapshot
+                .display
+                .expect("property post carries metadata")
+                .units,
+            "degC"
+        );
+        assert!(
+            val_rx.try_recv().is_err(),
+            "DBE_VALUE-only subscriber must not receive a property post"
         );
     }
 }

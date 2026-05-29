@@ -32,7 +32,16 @@ use crate::error::{BridgeError, BridgeResult};
 pub struct GroupPvDef {
     pub name: String,
     pub struct_id: Option<String>,
+    /// Resolved runtime atomicity. pvxs builds the group with
+    /// `atomicPutGet = (tristate != False)` (groupconfigprocessor.cpp:436),
+    /// so an unspecified `+atomic` resolves to atomic (`true`) — the
+    /// default is applied here at materialization, not during parse/merge.
     pub atomic: bool,
+    /// pvxs `atomicIsSet` presence bit (groupconfig.h:25). `true` iff some
+    /// fragment explicitly carried `+atomic`. Used only by
+    /// [`merge_group_defs`] so a later `+atomic`-less fragment cannot
+    /// overwrite an earlier explicit setting; not consumed at runtime.
+    pub atomic_is_set: bool,
     pub members: Vec<GroupMember>,
     /// Serializes concurrent PUTs to the same `atomic` group so an
     /// atomic-flagged group cannot be observed half-applied by another
@@ -72,11 +81,14 @@ pub struct GroupMember {
     /// pvxs defaults the missing-field sentinel to
     /// `i64::MIN` (`fieldconfig.h:37`) and treats that value as
     /// not-putable (`groupsource.cpp:503`). Wire parity therefore
-    /// requires `Option<i32>` here, not a defaulted i32 — a
+    /// requires `Option<i64>` here, not a defaulted value — a
     /// member without an explicit `+putorder` must be silently
     /// dropped from the PUT ordering, NOT written under an
-    /// implicit `0`.
-    pub put_order: Option<i32>,
+    /// implicit `0`. The width is the full pvxs `int64_t`
+    /// (`fieldconfig.h:37`): a config may use `+putorder` values
+    /// outside the `i32` range, and narrowing them would silently
+    /// re-order record processing.
+    pub put_order: Option<i64>,
     /// Optional structure ID for this member (from `+id`).
     pub struct_id: Option<String>,
     /// Constant value for `Const` mapping. Sourced from `+const`
@@ -163,16 +175,127 @@ pub enum TriggerDef {
     None,
 }
 
+/// Normalize the relaxed JSON dialect that upstream QSRV accepts into
+/// the strict JSON `serde_json` requires.
+///
+/// pva2pva enables YAJL `allow_comments` for both external group files
+/// and record `info(Q:group, ...)` bodies (pva2pva
+/// `pdbApp/configparse.cpp:224-254`), and EPICS-base db-file
+/// `info(Q:group, ...)` bodies additionally use unquoted `+`-prefixed
+/// option keys — e.g. `{+channel:"VAL", +putorder:0}` (pva2pva
+/// `testApp/testpdb-groups.db:4-5`) and `+id`/`+type`/`+trigger`
+/// (`iocBoot/iocimagedemo/image.db:38-44`). The shipped `image.json`
+/// example also opens with a C-style block comment
+/// (`iocBoot/iocimagedemo/image.json:1`). All of these are valid for the
+/// reference parser but rejected by strict `serde_json`, so the same
+/// configuration text that loads under pva2pva fails to load here before
+/// any group semantics are reached.
+///
+/// Two string-literal-aware transformations (quoted payloads such as a
+/// channel value `"a/*b*/c"` or `"+notakey"` are never rewritten):
+///   1. strip `/* block */` and `// line` comments;
+///   2. wrap bare `+ident` object keys in double quotes.
+///
+/// Group names and member field names are always quoted in the upstream
+/// dialect, so only `+`-prefixed option keys are ever unquoted; this
+/// keeps the transform minimal rather than guessing at arbitrary bare
+/// keys. The existing typed validation runs unchanged on the parsed
+/// result, so parser leniency never hides an invalid group field.
+fn normalize_relaxed_group_json(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < n {
+        let c = chars[i];
+        match c {
+            // String literal: copy verbatim, honoring backslash escapes,
+            // so comment markers or `+` inside a quoted value are untouched.
+            '"' => {
+                out.push(c);
+                i += 1;
+                while i < n {
+                    let d = chars[i];
+                    out.push(d);
+                    i += 1;
+                    if d == '\\' {
+                        if i < n {
+                            out.push(chars[i]);
+                            i += 1;
+                        }
+                    } else if d == '"' {
+                        break;
+                    }
+                }
+            }
+            // Block comment `/* ... */`.
+            '/' if i + 1 < n && chars[i + 1] == '*' => {
+                i += 2;
+                while i + 1 < n && !(chars[i] == '*' && chars[i + 1] == '/') {
+                    i += 1;
+                }
+                i += 2; // consume the closing `*/` (or run off the end)
+            }
+            // Line comment `// ...`.
+            '/' if i + 1 < n && chars[i + 1] == '/' => {
+                i += 2;
+                while i < n && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            // Bare `+ident` option key → `"+ident"`. Only quoted when an
+            // identifier follows and the next non-space token is `:` (an
+            // object-key position); otherwise emitted verbatim — the
+            // dialect uses a leading `+` exclusively for option keys, so
+            // the else branch is defensive.
+            '+' => {
+                let mut j = i + 1;
+                while j < n && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                let mut k = j;
+                while k < n && chars[k].is_whitespace() {
+                    k += 1;
+                }
+                if j > i + 1 && k < n && chars[k] == ':' {
+                    out.push('"');
+                    out.extend(chars[i..j].iter());
+                    out.push('"');
+                    i = j;
+                } else {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// Parse group definitions from a JSON string.
 ///
 /// The JSON is a top-level object where each key is a group name.
 pub fn parse_group_config(json: &str) -> BridgeResult<Vec<GroupPvDef>> {
-    let root: HashMap<String, RawGroupDef> =
-        serde_json::from_str(json).map_err(|e| BridgeError::GroupConfigError(e.to_string()))?;
+    let normalized = normalize_relaxed_group_json(json);
+    let root: HashMap<String, RawGroupDef> = serde_json::from_str(&normalized)
+        .map_err(|e| BridgeError::GroupConfigError(e.to_string()))?;
 
     let mut groups = Vec::new();
     for (name, raw) in root {
-        groups.push(raw_to_group_def(name, raw)?);
+        // pvxs validates groups one by one and catches per-group
+        // exceptions, printing "ignoring invalid group" while preserving
+        // sibling groups (ioc/groupconfigprocessor.cpp:128-163, :170-201).
+        // A semantic error in one group must not hide valid siblings in
+        // the same file; the JSON *syntax* error above still rejects the
+        // whole file (matching the strict-parse boundary).
+        match raw_to_group_def(name.clone(), raw) {
+            Ok(def) => groups.push(def),
+            Err(e) => tracing::warn!(group = %name, error = %e, "ignoring invalid QSRV group"),
+        }
     }
     groups.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(groups)
@@ -194,19 +317,34 @@ pub fn parse_group_config(json: &str) -> BridgeResult<Vec<GroupPvDef>> {
 /// The `record_name` is used as channel prefix: if `+channel` is a bare field
 /// name (no `:` separator), it becomes `"record_name.FIELD"`.
 pub fn parse_info_group(record_name: &str, json: &str) -> BridgeResult<Vec<GroupPvDef>> {
-    let root: HashMap<String, RawGroupDef> =
-        serde_json::from_str(json).map_err(|e| BridgeError::GroupConfigError(e.to_string()))?;
+    let normalized = normalize_relaxed_group_json(json);
+    let root: HashMap<String, RawGroupDef> = serde_json::from_str(&normalized)
+        .map_err(|e| BridgeError::GroupConfigError(e.to_string()))?;
 
     let mut groups = Vec::new();
     for (name, raw) in root {
-        let mut def = raw_to_group_def(name, raw)?;
-        // Apply channel prefix: bare field names get record_name prefix
+        // Per-group recovery, as in `parse_group_config` — one invalid
+        // group in an info(Q:group) body must not drop its siblings
+        // (pvxs groupconfigprocessor.cpp:128-163).
+        let mut def = match raw_to_group_def(name.clone(), raw) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(group = %name, error = %e, "ignoring invalid QSRV info(Q:group) group");
+                continue;
+            }
+        };
+        // pvxs prefixes EVERY `+channel` in a record's info(Q:group) with
+        // `"{record}."` — `channelPrefix = dbRecordName + "."` is applied
+        // unconditionally (groupprocessorcontext.cpp:65-66,
+        // groupconfigprocessor.cpp:810-818); it does NOT skip values that
+        // already contain ':' or '.'. Record-info group JSON is always
+        // record-relative; absolute PV names are reachable only through the
+        // file-based dbLoadGroup path (the empty-prefix case). The earlier
+        // ':'/'.' scan let an info(Q:group) member reference an unrelated
+        // absolute PV that pvxs would not model. Skip only the channel-less
+        // Structure/Const members (empty channel).
         for member in &mut def.members {
-            // Structure/Const have empty channels — skip prefix.
-            if !member.channel.is_empty()
-                && !member.channel.contains(':')
-                && !member.channel.contains('.')
-            {
+            if !member.channel.is_empty() {
                 member.channel = format!("{}.{}", record_name, member.channel);
             }
         }
@@ -224,8 +362,31 @@ pub fn parse_info_group(record_name: &str, json: &str) -> BridgeResult<Vec<Group
 pub fn merge_group_defs(existing: &mut HashMap<String, GroupPvDef>, new_defs: Vec<GroupPvDef>) {
     for def in new_defs {
         if let Some(existing_def) = existing.get_mut(&def.name) {
-            // Merge members into existing group
-            existing_def.members.extend(def.members);
+            // Merge members, keyed by group field name. pvxs holds one
+            // field per group field name (`groupDefinition.fieldMap`,
+            // groupdefinition.h:36-37); when a later fragment maps a field
+            // name already defined, `defineFields` warns "ignoring
+            // duplicate mapping" and skips it (groupconfigprocessor.cpp:
+            // 221-225) — first definition wins. A blind `extend` instead
+            // kept BOTH members, so GET composed the field twice and an
+            // atomic PUT could drive two backing writes for one client
+            // field. Skip duplicates here so the runtime group has exactly
+            // one member per field name, matching pvxs.
+            let mut seen: std::collections::HashSet<String> = existing_def
+                .members
+                .iter()
+                .map(|m| m.field_name.clone())
+                .collect();
+            for member in def.members {
+                if !seen.insert(member.field_name.clone()) {
+                    eprintln!(
+                        "warning: group '{}': ignoring duplicate mapping for field '{}'",
+                        def.name, member.field_name
+                    );
+                    continue;
+                }
+                existing_def.members.push(member);
+            }
             // re-sort the combined member list — the merge appends
             // a second source's members, so the canonical (put_order,
             // field_name) order must be re-established over the union.
@@ -239,15 +400,25 @@ pub fn merge_group_defs(existing: &mut HashMap<String, GroupPvDef>, new_defs: Ve
             if def.struct_id.is_some() {
                 existing_def.struct_id = def.struct_id;
             }
-            // atomic: last-wins with warning on conflict
-            // (pvxs groupconfigprocessor.cpp:274-288)
-            if existing_def.atomic != def.atomic {
-                eprintln!(
-                    "warning: group '{}' atomic setting inconsistent, using latest ({})",
-                    def.name, def.atomic
-                );
+            // atomic: pvxs runs `defineAtomicity` ONLY when the incoming
+            // fragment explicitly set `+atomic` (groupconfigprocessor.cpp:
+            // 194 gates on `atomicIsSet`); a fragment that omits `+atomic`
+            // leaves the merged TriState untouched. The conflict warning
+            // fires only when the group's atomicity was ALREADY explicitly
+            // set and the new explicit value differs (`atomic != Unset &&
+            // atomic != atomicity`, :279). A plain last-wins assignment let
+            // an `+atomic`-less later fragment revert an earlier explicit
+            // `+atomic:false`.
+            if def.atomic_is_set {
+                if existing_def.atomic_is_set && existing_def.atomic != def.atomic {
+                    eprintln!(
+                        "warning: group '{}' atomic setting inconsistent, using latest ({})",
+                        def.name, def.atomic
+                    );
+                }
+                existing_def.atomic = def.atomic;
+                existing_def.atomic_is_set = true;
             }
-            existing_def.atomic = def.atomic;
         } else {
             existing.insert(def.name.clone(), def);
         }
@@ -262,18 +433,22 @@ pub fn merge_group_defs(existing: &mut HashMap<String, GroupPvDef>, new_defs: Ve
 struct RawGroupDef {
     #[serde(rename = "+id")]
     id: Option<String>,
-    #[serde(rename = "+atomic", default = "default_atomic")]
-    atomic: bool,
+    // pvxs tracks `+atomic` as a value plus a presence bit
+    // (`groupconfig.h:24-31`: `atomic` defaults true, `atomicIsSet`
+    // defaults false; groupprocessorcontext.cpp:27-30 sets the bit only
+    // when the JSON actually carries `+atomic`). `Option<bool>` is the
+    // faithful model: `None` == not specified by THIS fragment, so a
+    // later fragment that omits `+atomic` must not clobber an earlier
+    // explicit setting during merge. A plain `bool` with a `true`
+    // default erased that distinction.
+    #[serde(rename = "+atomic", default)]
+    atomic: Option<bool>,
     #[serde(flatten)]
     fields: HashMap<String, serde_json::Value>,
 }
 
-fn default_atomic() -> bool {
-    true
-}
-
 /// canonical group-member ordering — `put_order` primary,
-/// `field_name` secondary. `put_order` is `Option<i32>`; `None`
+/// `field_name` secondary. `put_order` is `Option<i64>`; `None`
 /// (no `+putorder`, "not putable") sorts before any `Some`, matching
 /// pvxs's `i64::MIN` sentinel ordering (`fieldconfig.h:37`). The
 /// field-name tiebreak makes the order a pure function of the config,
@@ -297,6 +472,22 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
         }
 
         let member = parse_member(field_name, value)?;
+        // pvxs `defineFields` only permits an empty top-level field name
+        // for a metadata mapping: `+type:"meta"` merges alarm/timeStamp at
+        // the struct root, every other mapping must be named
+        // (groupconfigprocessor.cpp:215-231 logs `only +type:"meta" can be
+        // mapped at struct top` and skips that field). Without this guard
+        // an empty-key scalar/plain/any/const/structure/proc member was
+        // accepted, then reached `set_nested_field` with an empty path
+        // (group.rs) and silently produced no runtime value AND no
+        // descriptor member — a misconfigured group that loaded clean.
+        if member.field_name.is_empty() && member.mapping != FieldMapping::Meta {
+            eprintln!(
+                "warning: group '{}': only +type:\"meta\" can be mapped at struct top; ignoring empty-named field with mapping {:?}",
+                name, member.mapping
+            );
+            continue;
+        }
         members.push(member);
     }
 
@@ -352,7 +543,11 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
     let mut def = GroupPvDef {
         name,
         struct_id: raw.id,
-        atomic: raw.atomic,
+        // Resolve the TriState to pvxs's runtime rule `atomic != False`
+        // (groupconfigprocessor.cpp:436): unset (`None`) and explicit
+        // `true` both resolve atomic, only explicit `false` is non-atomic.
+        atomic: raw.atomic != Some(false),
+        atomic_is_set: raw.atomic.is_some(),
         members,
         atomic_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
     };
@@ -376,9 +571,18 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
         Some("structure") => FieldMapping::Structure,
         Some("const") => FieldMapping::Const,
         Some(other) => {
-            return Err(BridgeError::GroupConfigError(format!(
-                "unknown +type '{other}' for field '{field_name}'"
-            )));
+            // pvxs logs an unknown mapping +type and keeps the default
+            // (scalar) mapping rather than rejecting the config
+            // (ioc/groupprocessorcontext.cpp:43-63; the default mapping
+            // type is Scalar, fieldconfig.h:24-37). Warn and fall back to
+            // Scalar — the normal +channel validation below then decides
+            // whether the member (and so the group) is usable.
+            tracing::warn!(
+                field = field_name,
+                bad_type = other,
+                "unknown QSRV group member +type; defaulting to scalar"
+            );
+            FieldMapping::Scalar
         }
     };
 
@@ -461,16 +665,32 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
             // silent. `GroupPvDef::resolve_self_trigger_default` demotes
             // `SelfOnly` → `None` for such mixed groups after all members
             // are assembled.
-            None => TriggerDef::SelfOnly,
-            Some("") => TriggerDef::None,
+            // An explicit `+trigger:""` is NOT distinct from a missing
+            // `+trigger`: pvxs stores both as the empty string
+            // (`fieldconfig.h:50-54`) and sets `hasTriggers` only for a
+            // NON-empty trigger string (`groupconfigprocessor.cpp:297-309`).
+            // So an empty trigger gets the same provisional self-trigger
+            // default and is resolved at group scope — a one-member
+            // `"+trigger":""` group, or an all-empty group, still
+            // self-triggers (`:317-339`). Materializing `None` here made an
+            // explicit `""` permanent silence even with no non-empty sibling
+            // trigger, diverging from pvxs. `None` (silence) is produced
+            // only by `resolve_self_trigger_default` (mixed groups) and for
+            // channel-less Structure/Const members above.
+            None | Some("") => TriggerDef::SelfOnly,
             Some(s) => TriggerDef::Fields(s.split(',').map(|f| f.trim().to_string()).collect()),
         }
     };
 
+    // pvxs reads `+putorder` as the full `int64_t`
+    // (groupprocessorcontext.cpp:74-78); when the explicit value equals
+    // the absent-sentinel `i64::MIN` it increments to `i64::MIN + 1` so
+    // an explicit minimum order is never confused with "no +putorder".
+    // We keep the value at full width and apply the same sentinel bump.
     let put_order = obj
         .get("+putorder")
         .and_then(|v| v.as_i64())
-        .map(|n| n as i32);
+        .map(|n| if n == i64::MIN { i64::MIN + 1 } else { n });
 
     let struct_id = obj
         .get("+id")
@@ -491,28 +711,40 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
     })
 }
 
-/// Convert a JSON value to a PvField for Const mapping.
+/// Convert a JSON value to a PvField for a Const mapping.
 ///
-/// Const values support the full recursive pvData value space:
+/// pvxs's group JSON parser can only assign a SCALAR or `null` to a
+/// `+const`. It registers no array callbacks — "arrays are not used"
+/// (groupconfigprocessor.cpp:772-790) — and rejects object nesting below
+/// a field-definition object with "Group field def. can't contain Object
+/// (too deep)" (:733-739). The const template then builds a `TypeDef`
+/// directly from the parsed scalar/null `Value` (:596-604).
+///
+/// The earlier Rust port accepted the full recursive pvData space
+/// (scalar/structure/variant arrays and nested objects). Those forms
+/// produced const descriptors and payloads that pvxs rejects at IOC
+/// startup, so a group authored against Rust was not portable upstream.
+/// Restrict const values to the node kinds pvxs's parser can actually
+/// assign; an array or nested object is a hard error so the group is
+/// skipped (per-group recovery), matching pvxs's startup rejection.
 ///
 /// * Scalars (`bool`/number/string) map to [`PvField::Scalar`].
-/// * `null` maps to [`PvField::Null`] — pvxs accepts a JSON `null`
-///   const (an empty/unset value), so rejecting it was a gap.
-/// * Arrays map to the tightest container that fits their elements:
-///   an all-scalar array becomes a [`PvField::ScalarArray`], an
-///   all-object array becomes a [`PvField::StructureArray`], and an
-///   array with nested arrays or mixed element kinds becomes a
-///   [`PvField::VariantArray`] (each element kept as a `Variant`).
-///   This lifts the prior "nested arrays/structures not supported in
-///   const array" restriction.
-/// * Objects map to [`PvField::Structure`], recursively.
+/// * `null` maps to [`PvField::Null`] (pvxs accepts an empty/unset const).
 fn json_to_pv_field(v: &serde_json::Value) -> Result<epics_pva_rs::pvdata::PvField, String> {
-    use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue, VariantValue};
+    use epics_pva_rs::pvdata::{PvField, ScalarValue};
     match v {
         serde_json::Value::Bool(b) => Ok(PvField::Scalar(ScalarValue::Boolean(*b))),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                Ok(PvField::Scalar(ScalarValue::Int(i as i32)))
+                // pvxs builds a JSON integer const as `TypeDef(TypeCode::
+                // Int64)` and assigns the full `int64_t`
+                // (groupconfigprocessor.cpp:680-686); the group field
+                // descriptor is then derived from that const's type
+                // (596-603), so a JSON integer const is a PVA `long`, not
+                // `int`. The prior `i as i32` truncated large constants
+                // (version IDs, table labels) and advertised the wrong
+                // field type. Keep the full width as `Long`.
+                Ok(PvField::Scalar(ScalarValue::Long(i)))
             } else if let Some(f) = n.as_f64() {
                 Ok(PvField::Scalar(ScalarValue::Double(f)))
             } else {
@@ -520,56 +752,17 @@ fn json_to_pv_field(v: &serde_json::Value) -> Result<epics_pva_rs::pvdata::PvFie
             }
         }
         serde_json::Value::String(s) => Ok(PvField::Scalar(ScalarValue::String(s.clone()))),
-        serde_json::Value::Array(arr) => {
-            // Decode every element first, then pick the tightest
-            // container that holds all of them.
-            let elems: Vec<PvField> = arr.iter().map(json_to_pv_field).collect::<Result<_, _>>()?;
-
-            if elems.iter().all(|e| matches!(e, PvField::Scalar(_))) {
-                let scalars = elems
-                    .into_iter()
-                    .map(|e| match e {
-                        PvField::Scalar(sv) => sv,
-                        _ => unreachable!("checked all-scalar above"),
-                    })
-                    .collect();
-                Ok(PvField::ScalarArray(scalars))
-            } else if !elems.is_empty() && elems.iter().all(|e| matches!(e, PvField::Structure(_)))
-            {
-                // JSON array elements are all present, so each
-                // maps to a `Some` element.
-                let structs = elems
-                    .into_iter()
-                    .map(|e| match e {
-                        PvField::Structure(s) => Some(s),
-                        _ => unreachable!("checked all-structure above"),
-                    })
-                    .collect();
-                Ok(PvField::StructureArray(structs))
-            } else {
-                // Nested arrays, null elements, or mixed kinds — keep
-                // each element verbatim inside a Variant. All present
-                // (`Some`) here; JSON `null` is handled elsewhere.
-                let items = elems
-                    .into_iter()
-                    .map(|e| {
-                        Some(VariantValue {
-                            desc: Some(e.descriptor()),
-                            value: e,
-                        })
-                    })
-                    .collect();
-                Ok(PvField::VariantArray(items))
-            }
-        }
-        serde_json::Value::Object(map) => {
-            let mut pv = PvStructure::new("");
-            for (key, val) in map {
-                pv.fields.push((key.clone(), json_to_pv_field(val)?));
-            }
-            Ok(PvField::Structure(pv))
-        }
         serde_json::Value::Null => Ok(PvField::Null),
+        serde_json::Value::Array(_) => Err(
+            "group +const cannot be an array: pvxs registers no array callbacks \
+             (groupconfigprocessor.cpp:772-790)"
+                .to_string(),
+        ),
+        serde_json::Value::Object(_) => Err(
+            "group +const cannot be a nested object: pvxs rejects object nesting below a \
+             field definition (groupconfigprocessor.cpp:733-739)"
+                .to_string(),
+        ),
     }
 }
 
@@ -624,6 +817,125 @@ mod tests {
         }
     }
 
+    /// A semantically invalid group (here: a plain member with no
+    /// +channel) is skipped with a warning while valid sibling groups in
+    /// the same JSON survive — pvxs groupconfigprocessor.cpp:128-163.
+    #[test]
+    fn parse_group_config_skips_invalid_group_keeps_siblings() {
+        let json = r#"{
+            "BADGRP": { "v": { "+type": "plain" } },
+            "OKGRP":  { "v": { "+channel": "X.VAL", "+type": "plain" } }
+        }"#;
+        let defs = parse_group_config(json).expect("syntactically valid JSON must parse");
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["OKGRP"],
+            "the valid sibling must survive a bad group"
+        );
+    }
+
+    /// An unknown member +type warns and falls back to the default
+    /// scalar mapping rather than aborting the load — pvxs
+    /// groupprocessorcontext.cpp:43-63.
+    #[test]
+    fn parse_member_unknown_type_defaults_to_scalar() {
+        let json = r#"{ "G": { "v": { "+channel": "X.VAL", "+type": "bogus" } } }"#;
+        let defs = parse_group_config(json).expect("unknown +type must not abort the load");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].members[0].mapping, FieldMapping::Scalar);
+    }
+
+    /// A syntactically malformed JSON body still rejects the whole file
+    /// (the strict-parse boundary is preserved). The relaxed-JSON
+    /// normalizer must not turn invalid input into something that parses.
+    #[test]
+    fn parse_group_config_rejects_malformed_json() {
+        assert!(parse_group_config("{ not json").is_err());
+    }
+
+    /// pva2pva accepts EPICS db-file `info(Q:group, ...)` bodies that
+    /// carry unquoted `+`-prefixed option keys — pva2pva
+    /// `testApp/testpdb-groups.db:4-5`
+    /// (`{+channel:"VAL", +putorder:0}`) and `image.db:38-44`
+    /// (`+id`/`+type`/`+trigger`). The relaxed-JSON normalizer must quote
+    /// them so the same text loads here.
+    #[test]
+    fn parse_group_config_accepts_unquoted_plus_keys() {
+        let json = r#"{
+            "grp1": {
+                +id: "epics:nt/NTGroup:1.0",
+                +atomic: true,
+                "fld1": {+channel:"VAL", +putorder:0},
+                "fld2": {+channel:"RVAL", +trigger:"fld1,fld2"}
+            }
+        }"#;
+        let defs = parse_group_config(json).expect("unquoted +keys must parse");
+        assert_eq!(defs.len(), 1);
+        let g = &defs[0];
+        assert_eq!(g.name, "grp1");
+        assert_eq!(g.struct_id.as_deref(), Some("epics:nt/NTGroup:1.0"));
+        assert!(g.atomic);
+        let f1 = g.members.iter().find(|m| m.field_name == "fld1").unwrap();
+        assert_eq!(f1.channel, "VAL");
+        assert_eq!(f1.put_order, Some(0));
+        let f2 = g.members.iter().find(|m| m.field_name == "fld2").unwrap();
+        assert_eq!(f2.channel, "RVAL");
+        match &f2.triggers {
+            TriggerDef::Fields(t) => assert_eq!(t, &vec!["fld1".to_string(), "fld2".to_string()]),
+            other => panic!("expected named trigger fields, got {other:?}"),
+        }
+    }
+
+    /// pva2pva enables YAJL `allow_comments` (pva2pva
+    /// `configparse.cpp:231/249`); the shipped `image.json` example opens
+    /// with a C-style block comment (`image.json:1`). Both `/* */` and
+    /// `//` comments must be stripped before strict parsing.
+    #[test]
+    fn parse_group_config_strips_comments() {
+        let json = r#"/* leading block comment, as in image.json:1 */
+        {
+            // line comment
+            "grp": {
+                "v": { "+channel": "X.VAL" /* trailing */ }
+            }
+        }"#;
+        let defs = parse_group_config(json).expect("comments must be stripped");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].members[0].channel, "X.VAL");
+    }
+
+    /// The normalizer is string-literal aware: comment markers and a
+    /// leading `+` inside a quoted value must survive verbatim, never
+    /// mistaken for a comment or a bare key.
+    #[test]
+    fn parse_group_config_preserves_comment_markers_inside_strings() {
+        let json = r#"{
+            "grp": {
+                "v": { "+channel": "A/*not a comment*/B//x", "+id": "+literal" }
+            }
+        }"#;
+        let defs = parse_group_config(json).expect("strings with markers must parse");
+        assert_eq!(defs[0].members[0].channel, "A/*not a comment*/B//x");
+    }
+
+    /// The relaxed normalizer applies to the record `info(Q:group, ...)`
+    /// path too, not only standalone files — pvxs routes record info tags
+    /// through the same relaxed parser, and the Rust bridge feeds them via
+    /// `parse_info_group` (provider.rs).
+    #[test]
+    fn parse_info_group_accepts_unquoted_plus_keys() {
+        let json = r#"{
+            "grp1": {
+                "fld1": {+channel:"VAL", +putorder:0}
+            }
+        }"#;
+        let groups = parse_info_group("rec3", json).expect("unquoted +keys must parse");
+        assert_eq!(groups.len(), 1);
+        // bare field-name channel gets the record-name prefix applied.
+        assert_eq!(groups[0].members[0].channel, "rec3.VAL");
+    }
+
     #[test]
     fn parse_minimal_member() {
         let json = r#"{
@@ -643,6 +955,49 @@ mod tests {
         // missing `+putorder` → `None` (not putable),
         // mirroring pvxs `fieldconfig.h:37` sentinel.
         assert_eq!(m.put_order, None);
+    }
+
+    /// `+putorder` is stored at full pvxs `int64_t` width
+    /// (fieldconfig.h:37): a value outside the `i32` range must not wrap,
+    /// and members order by the full `i64` value. Pre-fix the parser cast
+    /// `n as i32`, silently re-ordering record processing.
+    #[test]
+    fn putorder_preserves_int64_width_and_orders_by_full_value() {
+        let big = i32::MAX as i64 + 1; // 2147483648, wraps to negative as i32
+        let json = format!(
+            r#"{{ "G": {{
+                "hi":  {{ "+channel": "R:hi.VAL",  "+putorder": {big} }},
+                "lo":  {{ "+channel": "R:lo.VAL",  "+putorder": -5 }},
+                "mid": {{ "+channel": "R:mid.VAL", "+putorder": 0 }}
+            }} }}"#
+        );
+        let defs = parse_group_config(&json).unwrap();
+        let g = &defs[0];
+        let po = |name: &str| {
+            g.members
+                .iter()
+                .find(|m| m.field_name == name)
+                .unwrap()
+                .put_order
+        };
+        assert_eq!(po("hi"), Some(big), "i32::MAX+1 must not wrap to negative");
+        assert_eq!(po("lo"), Some(-5));
+        // Canonical order is by full i64 put_order: lo(-5), mid(0), hi(big).
+        let names: Vec<&str> = g.members.iter().map(|m| m.field_name.as_str()).collect();
+        assert_eq!(names, vec!["lo", "mid", "hi"]);
+    }
+
+    /// An explicit `+putorder` equal to the absent-sentinel `i64::MIN` is
+    /// bumped to `i64::MIN + 1` so it stays distinct from "no +putorder"
+    /// (`None`), matching pvxs `groupprocessorcontext.cpp:74-78`.
+    #[test]
+    fn putorder_explicit_min_is_bumped_off_the_sentinel() {
+        let json = format!(
+            r#"{{ "G": {{ "x": {{ "+channel": "R:x.VAL", "+putorder": {} }} }} }}"#,
+            i64::MIN
+        );
+        let defs = parse_group_config(&json).unwrap();
+        assert_eq!(defs[0].members[0].put_order, Some(i64::MIN + 1));
     }
 
     /// A group whose members all use the default
@@ -753,6 +1108,64 @@ mod tests {
         }
     }
 
+    /// pvxs treats an explicit `+trigger:""` identically to a missing
+    /// `+trigger`: when a group has NO non-empty trigger string, every
+    /// channeled member self-triggers (groupconfigprocessor.cpp:317-339).
+    /// A one-member `""` group and an all-empty multi-member group must
+    /// both self-trigger; an empty `""` alongside a non-empty sibling
+    /// stays silent.
+    #[test]
+    fn br_64_empty_trigger_self_triggers_without_nonempty_sibling() {
+        // One member, explicit empty trigger → self-trigger (not silent).
+        let one =
+            parse_group_config(r#"{ "GRP:e1": { "a": {"+channel": "R:a", "+trigger": ""} } }"#)
+                .unwrap();
+        assert!(
+            matches!(one[0].members[0].triggers, TriggerDef::SelfOnly),
+            "single empty-trigger member must self-trigger, got {:?}",
+            one[0].members[0].triggers
+        );
+        assert!(one[0].is_pure_self_trigger());
+
+        // All-empty two-member group (one explicit "", one missing) → both
+        // self-trigger.
+        let all_empty = parse_group_config(
+            r#"{ "GRP:e2": {
+                "a": {"+channel": "R:a", "+trigger": ""},
+                "b": {"+channel": "R:b"}
+            }}"#,
+        )
+        .unwrap();
+        for m in &all_empty[0].members {
+            assert!(
+                matches!(m.triggers, TriggerDef::SelfOnly),
+                "all-empty group member {} must self-trigger, got {:?}",
+                m.field_name,
+                m.triggers
+            );
+        }
+
+        // Mixed group: explicit "" alongside a non-empty trigger → the ""
+        // member is silent (pvxs empty-trigger inside a hasTriggers group).
+        let mixed = parse_group_config(
+            r#"{ "GRP:e3": {
+                "a": {"+channel": "R:a", "+trigger": ""},
+                "b": {"+channel": "R:b", "+trigger": "*"}
+            }}"#,
+        )
+        .unwrap();
+        let a = mixed[0]
+            .members
+            .iter()
+            .find(|m| m.field_name == "a")
+            .unwrap();
+        assert!(
+            matches!(a.triggers, TriggerDef::None),
+            "explicit empty trigger alongside a non-empty sibling stays silent, got {:?}",
+            a.triggers
+        );
+    }
+
     /// the same demotion must happen when a group is assembled
     /// across multiple sources via `merge_group_defs` — a later source
     /// adding an explicit-trigger member demotes the earlier no-trigger
@@ -780,6 +1193,68 @@ mod tests {
         assert!(
             matches!(a.triggers, TriggerDef::None),
             "merge that introduces an explicit-trigger member must demote the earlier no-trigger member to silent"
+        );
+    }
+
+    /// An unspecified `+atomic` resolves to atomic (`true`) but leaves
+    /// the presence bit clear — pvxs `atomicPutGet = (TriState != False)`
+    /// with `atomicIsSet=false` (groupconfig.h:25, groupconfigprocessor
+    /// .cpp:436).
+    #[test]
+    fn group_without_atomic_resolves_true_but_unset() {
+        let g = &parse_group_config(r#"{ "G:d": { "a": { "+channel": "R.A" } } }"#).unwrap()[0];
+        assert!(
+            g.atomic,
+            "omitted +atomic resolves atomic (TriState != False)"
+        );
+        assert!(
+            !g.atomic_is_set,
+            "presence bit must stay clear when +atomic omitted"
+        );
+    }
+
+    /// A later `info(Q:group)` fragment that omits `+atomic` must not
+    /// revert an earlier explicit `+atomic:false`. pvxs only runs
+    /// `defineAtomicity` when the incoming fragment set `atomicIsSet`
+    /// (groupconfigprocessor.cpp:194); an omitting fragment leaves the
+    /// merged TriState untouched. Verified in both merge orders.
+    #[test]
+    fn br_63_omitted_atomic_preserves_explicit_false() {
+        use std::collections::HashMap;
+        let explicit_false = parse_group_config(
+            r#"{ "G:split": { "+atomic": false, "a": { "+channel": "R.A" } } }"#,
+        )
+        .unwrap();
+        let omits_atomic =
+            parse_group_config(r#"{ "G:split": { "b": { "+channel": "R.B" } } }"#).unwrap();
+
+        // Order 1: explicit-false first, omitting fragment merged on top.
+        let mut map: HashMap<String, GroupPvDef> = explicit_false
+            .iter()
+            .cloned()
+            .map(|d| (d.name.clone(), d))
+            .collect();
+        merge_group_defs(&mut map, omits_atomic.clone());
+        assert!(
+            !map["G:split"].atomic,
+            "omitted +atomic must not revert explicit +atomic:false (explicit-first)"
+        );
+
+        // Order 2: omitting fragment first (resolves to default atomic),
+        // explicit-false merged on top — the explicit setting wins.
+        let mut map2: HashMap<String, GroupPvDef> = omits_atomic
+            .iter()
+            .cloned()
+            .map(|d| (d.name.clone(), d))
+            .collect();
+        merge_group_defs(&mut map2, explicit_false.clone());
+        assert!(
+            !map2["G:split"].atomic,
+            "explicit +atomic:false must win over an earlier default (omit-first)"
+        );
+        assert!(
+            map2["G:split"].atomic_is_set,
+            "presence bit set after an explicit +atomic merges in"
         );
     }
 
@@ -864,11 +1339,18 @@ mod tests {
         let groups = parse_group_config(json).unwrap();
         let m = &groups[0].members[0];
         assert_eq!(m.mapping, FieldMapping::Proc);
-        assert!(matches!(m.triggers, TriggerDef::None));
+        // `+trigger:""` in a group with no non-empty trigger is treated
+        // exactly like a missing `+trigger`: pvxs defaults every channeled
+        // field to self-trigger (groupconfigprocessor.cpp:317-339), so this
+        // resolves to `SelfOnly`, not permanent silence.
+        assert!(matches!(m.triggers, TriggerDef::SelfOnly));
     }
 
     #[test]
     fn parse_error_missing_channel() {
+        // A scalar/plain member with no +channel is invalid: the group
+        // is skipped (with a warning), not an all-or-nothing file abort
+        // — pvxs groupconfigprocessor.cpp:128-163.
         let json = r#"{
             "GRP:bad": {
                 "val": {
@@ -877,7 +1359,8 @@ mod tests {
             }
         }"#;
 
-        assert!(parse_group_config(json).is_err());
+        let defs = parse_group_config(json).expect("file parses; invalid group skipped");
+        assert!(defs.is_empty(), "the only (invalid) group must be skipped");
     }
 
     #[test]
@@ -943,8 +1426,12 @@ mod tests {
         assert_eq!(groups[0].members[0].channel, "TEMP:sensor.VAL");
     }
 
+    /// pvxs prefixes the owning record name onto EVERY info(Q:group)
+    /// `+channel`, including values that contain ':' or '.' — record-info
+    /// group JSON is always record-relative (groupprocessorcontext.cpp:
+    /// 65-66). A ':'-bearing value is NOT treated as an absolute PV here.
     #[test]
-    fn parse_info_group_absolute_channel() {
+    fn br_65_info_group_prefixes_colon_bearing_channel() {
         let json = r#"{
             "TEMP:group": {
                 "pressure": {
@@ -955,8 +1442,27 @@ mod tests {
         }"#;
 
         let groups = parse_info_group("TEMP:sensor", json).unwrap();
-        // Absolute channel (contains ':') should be kept as-is
-        assert_eq!(groups[0].members[0].channel, "PRESS:ai");
+        assert_eq!(
+            groups[0].members[0].channel, "TEMP:sensor.PRESS:ai",
+            "info(Q:group) channel must be record-relative even when it contains ':'"
+        );
+    }
+
+    /// The prefix rule must not depend on '.' scanning either: a dotted
+    /// relative field string is still prefixed with the owning record.
+    #[test]
+    fn br_65_info_group_prefixes_dotted_channel() {
+        let json = r#"{
+            "TEMP:group": {
+                "sub": {
+                    "+channel": "A.B",
+                    "+type": "scalar"
+                }
+            }
+        }"#;
+
+        let groups = parse_info_group("TEMP:sensor", json).unwrap();
+        assert_eq!(groups[0].members[0].channel, "TEMP:sensor.A.B");
     }
 
     #[test]
@@ -1010,6 +1516,37 @@ mod tests {
 
         let grp = existing.get("GRP:a").unwrap();
         assert_eq!(grp.members.len(), 2);
+    }
+
+    /// Two info(Q:group) fragments contributing the SAME group field
+    /// name collapse to one member — pvxs keeps one field per name
+    /// (`groupdefinition.h:36-37`) and `defineFields`
+    /// (groupconfigprocessor.cpp:221-225) skips the duplicate with
+    /// "ignoring duplicate mapping" (first definition wins). A blind
+    /// member append would compose the field twice on GET and double the
+    /// backing write on an atomic PUT.
+    #[test]
+    fn merge_collapses_duplicate_field_name_first_wins() {
+        let mut existing = HashMap::new();
+        let defs1 =
+            parse_group_config(r#"{ "GRP:d": { "x": { "+channel": "R1:x", "+putorder": 0 } } }"#)
+                .unwrap();
+        merge_group_defs(&mut existing, defs1);
+
+        // A second fragment maps the same field name `x` to a different
+        // channel — pvxs ignores it; the first definition stands.
+        let defs2 =
+            parse_group_config(r#"{ "GRP:d": { "x": { "+channel": "R2:x", "+putorder": 1 } } }"#)
+                .unwrap();
+        merge_group_defs(&mut existing, defs2);
+
+        let grp = existing.get("GRP:d").unwrap();
+        assert_eq!(grp.members.len(), 1, "duplicate field must collapse");
+        assert_eq!(grp.members[0].field_name, "x");
+        assert_eq!(
+            grp.members[0].channel, "R1:x",
+            "first definition must win (pvxs ignores the duplicate)"
+        );
     }
 
     #[test]
@@ -1111,12 +1648,12 @@ mod tests {
         assert!(version.channel.is_empty());
         assert!(version.const_value.is_some());
         if let Some(epics_pva_rs::pvdata::PvField::Scalar(
-            epics_pva_rs::pvdata::ScalarValue::Int(v),
+            epics_pva_rs::pvdata::ScalarValue::Long(v),
         )) = &version.const_value
         {
             assert_eq!(*v, 42);
         } else {
-            panic!("expected Int(42), got {:?}", version.const_value);
+            panic!("expected Long(42), got {:?}", version.const_value);
         }
     }
 
@@ -1141,12 +1678,12 @@ mod tests {
             .unwrap();
         assert_eq!(version.mapping, FieldMapping::Const);
         if let Some(epics_pva_rs::pvdata::PvField::Scalar(
-            epics_pva_rs::pvdata::ScalarValue::Int(v),
+            epics_pva_rs::pvdata::ScalarValue::Long(v),
         )) = &version.const_value
         {
             assert_eq!(*v, 7);
         } else {
-            panic!("expected Int(7) via +const, got {:?}", version.const_value);
+            panic!("expected Long(7) via +const, got {:?}", version.const_value);
         }
     }
 
@@ -1170,13 +1707,108 @@ mod tests {
             .find(|m| m.field_name == "k")
             .unwrap();
         if let Some(epics_pva_rs::pvdata::PvField::Scalar(
-            epics_pva_rs::pvdata::ScalarValue::Int(v),
+            epics_pva_rs::pvdata::ScalarValue::Long(v),
         )) = &k.const_value
         {
             assert_eq!(*v, 100, "+const should take precedence over +value");
         } else {
-            panic!("expected Int(100), got {:?}", k.const_value);
+            panic!("expected Long(100), got {:?}", k.const_value);
         }
+    }
+
+    /// A `+const` integer above the int32 range must survive at its
+    /// full int64 width — pvxs builds it as `TypeCode::Int64`
+    /// (groupconfigprocessor.cpp:680-686), so narrowing to i32 (the
+    /// prior bug) corrupted large constants such as version IDs.
+    #[test]
+    fn parse_const_large_integer_preserved_at_int64() {
+        use epics_pva_rs::pvdata::{PvField, ScalarValue};
+        // i32::MAX + 1, i64::MIN, and a plain in-range value.
+        let big = i64::from(i32::MAX) + 1;
+        let json = format!(
+            r#"{{
+                "GRP:c": {{
+                    "hi": {{ "+type": "const", "+const": {big} }},
+                    "lo": {{ "+type": "const", "+const": {} }},
+                    "mid": {{ "+type": "const", "+const": 5 }}
+                }}
+            }}"#,
+            i64::MIN
+        );
+        let groups = parse_group_config(&json).unwrap();
+        let members = &groups[0].members;
+        let get = |name: &str| {
+            members
+                .iter()
+                .find(|m| m.field_name == name)
+                .and_then(|m| m.const_value.clone())
+        };
+        // Every JSON integer const is a `Long`, regardless of magnitude,
+        // and retains its exact value (no i32 truncation/wraparound).
+        assert!(
+            matches!(get("hi"), Some(PvField::Scalar(ScalarValue::Long(v))) if v == big),
+            "i32::MAX+1 const must stay Long({big}), got {:?}",
+            get("hi")
+        );
+        assert!(
+            matches!(get("lo"), Some(PvField::Scalar(ScalarValue::Long(v))) if v == i64::MIN),
+            "i64::MIN const must stay Long, got {:?}",
+            get("lo")
+        );
+        assert!(
+            matches!(get("mid"), Some(PvField::Scalar(ScalarValue::Long(5)))),
+            "in-range const is still Long (not Int), got {:?}",
+            get("mid")
+        );
+    }
+
+    /// pvxs `defineFields` only allows an empty top-level field name for a
+    /// metadata mapping (groupconfigprocessor.cpp:215-231). Empty-keyed
+    /// scalar / plain / const mappings must be skipped, not silently
+    /// accepted as zero-value members.
+    #[test]
+    fn parse_empty_field_name_non_meta_is_skipped() {
+        // Default (scalar) mapping with an empty key, plus a valid sibling.
+        for empty_member in [
+            r#""": { "+channel": "REC.VAL" }"#,
+            r#""": { "+type": "plain", "+channel": "REC.VAL" }"#,
+            r#""": { "+type": "any", "+channel": "REC.VAL" }"#,
+            r#""": { "+type": "const", "+const": 1 }"#,
+            r#""": { "+type": "structure" }"#,
+            r#""": { "+type": "proc", "+channel": "REC.PROC" }"#,
+        ] {
+            let json =
+                format!(r#"{{ "GRP:e": {{ {empty_member}, "ok": {{ "+channel": "R.VAL" }} }} }}"#);
+            let groups = parse_group_config(&json).unwrap();
+            let names: Vec<&str> = groups[0]
+                .members
+                .iter()
+                .map(|m| m.field_name.as_str())
+                .collect();
+            assert!(
+                !names.contains(&""),
+                "empty-named non-meta member must be skipped for `{empty_member}`, got {names:?}"
+            );
+            assert!(
+                names.contains(&"ok"),
+                "valid sibling must survive for `{empty_member}`, got {names:?}"
+            );
+        }
+    }
+
+    /// The one allowed empty key: `+type:"meta"` is preserved so its
+    /// alarm/timeStamp members flatten to the struct root (pvxs
+    /// groupconfigprocessor.cpp:940-952).
+    #[test]
+    fn parse_empty_field_name_meta_is_kept() {
+        let json = r#"{ "GRP:m": { "": { "+type": "meta", "+channel": "REC" } } }"#;
+        let groups = parse_group_config(json).unwrap();
+        let m = groups[0]
+            .members
+            .iter()
+            .find(|m| m.field_name.is_empty())
+            .expect("empty-named meta member must be kept");
+        assert_eq!(m.mapping, FieldMapping::Meta);
     }
 
     #[test]
@@ -1203,96 +1835,31 @@ mod tests {
         }
     }
 
-    /// B8: a const array of scalars stays a `ScalarArray`.
+    /// BR-81: pvxs's group JSON parser can only assign a scalar or `null`
+    /// to a `+const` — it has no array callbacks
+    /// (groupconfigprocessor.cpp:772-790) and rejects nested objects
+    /// (:733-739). A const whose value is an array (scalar, nested,
+    /// object-element, or null-element) or a nested object is rejected; the
+    /// group is skipped via per-group recovery, matching pvxs's startup
+    /// rejection. The cited values were previously accepted as Rust-only
+    /// `ScalarArray` / `VariantArray` / `StructureArray` / `Structure`
+    /// const forms that pvxs cannot represent.
     #[test]
-    fn parse_const_scalar_array() {
-        use epics_pva_rs::pvdata::{PvField, ScalarValue};
-        let json = r#"{
-            "GRP:c": {
-                "list": { "+type": "const", "+value": [1, 2, 3] }
-            }
-        }"#;
-        let groups = parse_group_config(json).unwrap();
-        let m = &groups[0].members[0];
-        match &m.const_value {
-            Some(PvField::ScalarArray(items)) => {
-                assert_eq!(items.len(), 3);
-                assert!(matches!(items[0], ScalarValue::Int(1)));
-            }
-            other => panic!("expected ScalarArray, got {other:?}"),
-        }
-    }
-
-    /// B8: a const array containing nested arrays is accepted as a
-    /// `VariantArray` instead of being rejected.
-    #[test]
-    fn parse_const_nested_array() {
-        use epics_pva_rs::pvdata::PvField;
-        let json = r#"{
-            "GRP:c": {
-                "matrix": { "+type": "const", "+value": [[1, 2], [3, 4]] }
-            }
-        }"#;
-        let groups = parse_group_config(json).unwrap();
-        let m = &groups[0].members[0];
-        match &m.const_value {
-            Some(PvField::VariantArray(items)) => {
-                assert_eq!(items.len(), 2, "two nested rows");
-                assert!(
-                    matches!(items[0].as_ref().unwrap().value, PvField::ScalarArray(_)),
-                    "each nested element is a scalar array"
-                );
-            }
-            other => panic!("expected VariantArray of nested arrays, got {other:?}"),
-        }
-    }
-
-    /// B8: a const array of objects is accepted as a `StructureArray`.
-    #[test]
-    fn parse_const_array_of_structures() {
-        use epics_pva_rs::pvdata::PvField;
-        let json = r#"{
-            "GRP:c": {
-                "rows": {
-                    "+type": "const",
-                    "+value": [{"a": 1}, {"a": 2}]
-                }
-            }
-        }"#;
-        let groups = parse_group_config(json).unwrap();
-        let m = &groups[0].members[0];
-        match &m.const_value {
-            Some(PvField::StructureArray(items)) => {
-                assert_eq!(items.len(), 2);
-                assert_eq!(items[0].as_ref().unwrap().fields[0].0, "a");
-            }
-            other => panic!("expected StructureArray, got {other:?}"),
-        }
-    }
-
-    /// B8: a nested structure const value is accepted recursively.
-    #[test]
-    fn parse_const_nested_structure() {
-        use epics_pva_rs::pvdata::PvField;
-        let json = r#"{
-            "GRP:c": {
-                "cfg": {
-                    "+type": "const",
-                    "+value": {"limits": {"low": 0, "high": 10}}
-                }
-            }
-        }"#;
-        let groups = parse_group_config(json).unwrap();
-        let m = &groups[0].members[0];
-        match &m.const_value {
-            Some(PvField::Structure(s)) => {
-                assert_eq!(s.fields[0].0, "limits");
-                match &s.fields[0].1 {
-                    PvField::Structure(inner) => assert_eq!(inner.fields.len(), 2),
-                    other => panic!("expected nested structure, got {other:?}"),
-                }
-            }
-            other => panic!("expected Structure, got {other:?}"),
+    fn br_81_const_array_and_nested_object_rejected() {
+        for body in [
+            r#""list": { "+type": "const", "+const": [1, 2, 3] }"#,
+            r#""matrix": { "+type": "const", "+const": [[1, 2], [3, 4]] }"#,
+            r#""rows": { "+type": "const", "+const": [{"a": 1}, {"a": 2}] }"#,
+            r#""mixed": { "+type": "const", "+const": [1, null, 3] }"#,
+            r#""cfg": { "+type": "const", "+const": {"limits": {"low": 0}} }"#,
+        ] {
+            let json = format!(r#"{{ "GRP:c": {{ {body} }} }}"#);
+            let groups =
+                parse_group_config(&json).expect("file still parses; the invalid group is skipped");
+            assert!(
+                groups.is_empty(),
+                "array / nested-object const must be rejected (group skipped) for `{body}`, got {groups:?}"
+            );
         }
     }
 
@@ -1315,29 +1882,10 @@ mod tests {
         );
     }
 
-    /// B8: a `null` element inside a const array forces the
-    /// `VariantArray` container (mixed kinds), not a rejection.
     #[test]
-    fn parse_const_array_with_null_element() {
-        use epics_pva_rs::pvdata::PvField;
-        let json = r#"{
-            "GRP:c": {
-                "mixed": { "+type": "const", "+value": [1, null, 3] }
-            }
-        }"#;
-        let groups = parse_group_config(json).unwrap();
-        let m = &groups[0].members[0];
-        match &m.const_value {
-            Some(PvField::VariantArray(items)) => {
-                assert_eq!(items.len(), 3);
-                assert!(matches!(items[1].as_ref().unwrap().value, PvField::Null));
-            }
-            other => panic!("expected VariantArray with a Null element, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_const_missing_value_is_error() {
+    fn parse_const_missing_value_is_skipped() {
+        // A const member without +const/+value is invalid: the group is
+        // skipped rather than aborting the load.
         let json = r#"{
             "GRP:bad": {
                 "label": {
@@ -1346,10 +1894,11 @@ mod tests {
             }
         }"#;
 
-        let result = parse_group_config(json);
-        assert!(result.is_err());
-        let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("+value"), "expected error about +value: {err}");
+        let defs = parse_group_config(json).expect("file parses; invalid group skipped");
+        assert!(
+            defs.is_empty(),
+            "const member without +const/+value → group skipped"
+        );
     }
 
     #[test]

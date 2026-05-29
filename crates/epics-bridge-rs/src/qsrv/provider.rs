@@ -541,6 +541,35 @@ pub struct BridgeProvider {
     /// their *next* check (matches C++ QSRV — ACF reload takes effect
     /// without recreating channels).
     access_cell: Arc<parking_lot::RwLock<Arc<dyn AccessControl>>>,
+    /// Source registry for file-loaded group definitions:
+    /// `(filename, raw-macros)` → the group names that load placed into
+    /// `groups`. pvxs keeps a `groupConfigFiles` list so
+    /// `dbLoadGroup("-file.json")` can remove a previously added file
+    /// and `dbLoadGroup("-*")` can clear them all
+    /// (ioc/groupsourcehooks.cpp:133-183). The Rust port parses eagerly
+    /// into `groups` (the daemon serves without `processGroups`), so the
+    /// source identity is retained here to make the same add / replace /
+    /// remove contract expressible without a deferred-parse rearchitecture.
+    group_files: parking_lot::RwLock<Vec<GroupFileEntry>>,
+    /// QSRV2 serving gate. pvxs adds the single-record and group sources
+    /// to the PVA server only when `enable2()` returns true
+    /// (`ioc/iochooks.cpp:461-496`, gated by `PVXS_QSRV_ENABLE` /
+    /// `EPICS_IOC_IGNORE_SERVERS=qsrv2`). When `false`, every database /
+    /// group resolution entry point answers "absent" so no DB-backed PVA
+    /// channel is served — matching a pvxs IOC that loaded QSRV2 but had
+    /// it disabled. Native PVA PVs (NDPluginPva) are owned by
+    /// `QsrvPvStore`, not here, so they remain served (pvxs serves those
+    /// through a separate `SharedPV`, ungated by `enable2()`).
+    enabled: bool,
+}
+
+/// One `dbLoadGroup(filename, macros)` registration: its source
+/// identity plus the group names that load placed into the live
+/// registry, so the same file can later be removed.
+struct GroupFileEntry {
+    filename: String,
+    macros: String,
+    names: Vec<String>,
 }
 
 /// Proxy that re-reads the live access-control policy on every check.
@@ -569,6 +598,14 @@ impl AccessControl for LiveAccessProxy {
 
 impl BridgeProvider {
     pub fn new(db: Arc<PvDatabase>) -> Self {
+        Self::new_with_serving(db, true)
+    }
+
+    /// Construct a provider whose QSRV2 database/group serving is gated by
+    /// `enabled`. The runner passes the result of the pvxs-compatible
+    /// `enable2()` decision; `new` defaults to `true` (serving on) for the
+    /// common in-process and test paths.
+    pub fn new_with_serving(db: Arc<PvDatabase>, enabled: bool) -> Self {
         Self {
             db,
             groups: parking_lot::RwLock::new(HashMap::new()),
@@ -578,6 +615,8 @@ impl BridgeProvider {
             ops_get: std::sync::atomic::AtomicU64::new(0),
             ops_put: std::sync::atomic::AtomicU64::new(0),
             ops_subscribe: std::sync::atomic::AtomicU64::new(0),
+            group_files: parking_lot::RwLock::new(Vec::new()),
+            enabled,
         }
     }
 
@@ -697,9 +736,18 @@ impl BridgeProvider {
     pub fn load_group_config(&self, json: &str) -> BridgeResult<()> {
         let defs = super::group_config::parse_group_config(json)?;
         let mut g = self.groups.write();
-        for def in defs {
-            g.insert(def.name.clone(), def);
-        }
+        // Accumulate field-by-field, not replace. pvxs loads every DB
+        // `info(Q:group)` entry and every queued `dbLoadGroup` file into
+        // one `GroupConfigProcessor` (groupsourcehooks.cpp:192-207) whose
+        // `fieldConfigMap` (groupprocessorcontext.cpp:25-42) collects
+        // distinct fields for the same group name across all sources. A
+        // bare `insert` here dropped a same-named group loaded earlier
+        // (whether from another file or a record `info(Q:group)` tag),
+        // turning a valid modular config into an order-dependent partial
+        // group. `merge_group_defs` is the same field-keyed path
+        // `load_info_group` already uses, so cross-source duplicate field
+        // names collapse first-wins (groupconfigprocessor.cpp:221-225).
+        super::group_config::merge_group_defs(&mut g, defs);
         Ok(())
     }
 
@@ -707,6 +755,87 @@ impl BridgeProvider {
     pub fn load_group_file(&self, path: &str) -> BridgeResult<()> {
         let content = std::fs::read_to_string(path)?;
         self.load_group_config(&content)
+    }
+
+    /// Load a group config under its `dbLoadGroup` source identity
+    /// `(filename, macros)`, recording which group names this load
+    /// places so the same file can later be removed. Mirrors pvxs
+    /// `dbLoadGroup(file, macros)` (ioc/groupsourcehooks.cpp:147-183):
+    /// re-loading the same `(filename, macros)` first removes the groups
+    /// the previous load of that identity placed (pvxs erases the
+    /// matching entry before appending), then installs the freshly
+    /// parsed definitions. Parsing happens before any mutation so a
+    /// parse error leaves the existing registry untouched.
+    pub fn load_group_file_tracked(
+        &self,
+        filename: &str,
+        macros: &str,
+        json: &str,
+    ) -> BridgeResult<()> {
+        let defs = super::group_config::parse_group_config(json)?;
+        // Drop a prior load of the same source identity (pvxs erases
+        // the matching entry before appending the new one).
+        self.remove_group_file(filename, macros);
+        let names: Vec<String> = defs.iter().map(|d| d.name.clone()).collect();
+        {
+            let mut g = self.groups.write();
+            // Accumulate across files rather than replace — a second file
+            // contributing distinct fields to the same group name must add
+            // them, not drop the first file's group (finding 40 /
+            // groupsourcehooks.cpp:192-207, fieldConfigMap accumulation).
+            // Same field-keyed merge as `load_group_config` /
+            // `load_info_group`.
+            super::group_config::merge_group_defs(&mut g, defs);
+        }
+        self.group_files.write().push(GroupFileEntry {
+            filename: filename.to_string(),
+            macros: macros.to_string(),
+            names,
+        });
+        Ok(())
+    }
+
+    /// Remove every group placed by a prior `dbLoadGroup(filename,
+    /// macros)` with the matching source identity. Mirrors pvxs
+    /// `dbLoadGroup("-file.json", "MAC")` (groupsourcehooks.cpp:174-179),
+    /// which compares the raw filename and raw macros string. Returns the
+    /// number of group definitions removed.
+    pub fn remove_group_file(&self, filename: &str, macros: &str) -> usize {
+        let mut files = self.group_files.write();
+        let mut groups = self.groups.write();
+        let mut removed = 0;
+        files.retain(|e| {
+            if e.filename == filename && e.macros == macros {
+                for n in &e.names {
+                    if groups.remove(n).is_some() {
+                        removed += 1;
+                    }
+                }
+                false
+            } else {
+                true
+            }
+        });
+        removed
+    }
+
+    /// Remove every file-loaded group. Mirrors pvxs `dbLoadGroup("-*")`
+    /// (groupsourcehooks.cpp:140-143), which clears the registered file
+    /// list. `info(Q:group)` groups are not file-sourced and are left
+    /// intact; use [`Self::reset_groups`] to clear everything. Returns
+    /// the number of group definitions removed.
+    pub fn clear_group_files(&self) -> usize {
+        let mut files = self.group_files.write();
+        let mut groups = self.groups.write();
+        let mut removed = 0;
+        for e in files.drain(..) {
+            for n in &e.names {
+                if groups.remove(n).is_some() {
+                    removed += 1;
+                }
+            }
+        }
+        removed
     }
 
     /// Load group definitions from a record's info(Q:group, ...) tag.
@@ -805,6 +934,39 @@ impl BridgeProvider {
         self.channel_find(name).await
     }
 
+    /// True iff a backing record, alias, or simple PV named `name`
+    /// exists locally — the resolver-free existence test used to
+    /// detect group/record name collisions. Mirrors pvxs
+    /// `dbChannelTest(name)` (ioc/groupconfigprocessor.cpp:177):
+    /// records + aliases via [`PvDatabase::get_record`], simple PVs
+    /// via [`PvDatabase::find_pv`]. Deliberately does NOT invoke the
+    /// search resolver (no upstream gateway subscription) — a name
+    /// only conflicts when it is *locally* a record, exactly as
+    /// `dbChannelTest` tests the local database.
+    async fn record_exists(&self, name: &str) -> bool {
+        self.db.get_record(name).await.is_some() || self.db.find_pv(name).await.is_some()
+    }
+
+    /// Resolve `name` to a group definition only when no backing
+    /// record shadows it. pvxs ignores a configured group whose name
+    /// collides with a real record name — the record wins and the
+    /// group is dropped at `defineGroups`
+    /// (ioc/groupconfigprocessor.cpp:170-181), so the surviving
+    /// group map (ioc/groupsource.cpp:75-89) never contains a
+    /// shadowed name. The Rust daemon (`bin/qsrv_rs.rs`) never runs
+    /// the `processGroups` finalize, so the same invariant — a name
+    /// is a record OR a group, never both — is enforced here at the
+    /// single serving owner. Every group lookup on the serve path
+    /// (`channel_find`, `create_channel*`, `channel_list`) goes
+    /// through this gate, so the dual meaning cannot reach a client.
+    async fn servable_group(&self, name: &str) -> Option<GroupPvDef> {
+        let def = self.groups.read().get(name).cloned()?;
+        if self.record_exists(name).await {
+            return None;
+        }
+        Some(def)
+    }
+
     /// Drop every registered group definition. Mirrors pvxs
     /// `resetGroups` (groupsourcehooks.cpp:222) — used between
     /// `iocInit` cycles in tests so the second run starts clean. The
@@ -813,6 +975,9 @@ impl BridgeProvider {
         let mut g = self.groups.write();
         let n = g.len();
         g.clear();
+        // Drop the file-source registry too, so a later
+        // remove/clear or re-load starts from a clean slate.
+        self.group_files.write().clear();
         n
     }
 
@@ -897,20 +1062,42 @@ impl ChannelProvider for BridgeProvider {
     }
 
     async fn channel_find(&self, name: &str) -> bool {
-        if self.groups.read().contains_key(name) {
+        // QSRV2 disabled: no DB-backed or group channel is served.
+        if !self.enabled {
+            return false;
+        }
+        // A servable group answers as a group; a group name shadowed
+        // by a record falls through to the database, so the record is
+        // what answers (and resolves on create). See `servable_group`.
+        if self.servable_group(name).await.is_some() {
             return true;
         }
         self.db.has_name(name).await
     }
 
     async fn channel_list(&self) -> Vec<String> {
+        // QSRV2 disabled: advertise no DB record / alias / group names.
+        if !self.enabled {
+            return Vec::new();
+        }
         let mut names = self.db.all_record_names().await;
         // PR #336 aliases are independently addressable channel
         // names — a PVA client running channelList expects them so
         // it can connect by alias. `channel_find` / `create_channel`
         // already resolve aliases via has_name/get_record.
         names.extend(self.db.all_alias_names().await);
-        names.extend(self.groups.read().keys().cloned());
+        // A group name that collides with a record/alias/simple PV is
+        // ignored (the record wins), so list it once — as the record.
+        // Mirrors pvxs: a shadowed name never enters groupMap at
+        // `defineGroups` (ioc/groupconfigprocessor.cpp:177), so
+        // groupsource.cpp:75-89 lists only the surviving groups.
+        let existing: std::collections::HashSet<String> = names.iter().cloned().collect();
+        let group_keys: Vec<String> = self.groups.read().keys().cloned().collect();
+        for k in group_keys {
+            if !existing.contains(&k) && self.db.find_pv(&k).await.is_none() {
+                names.push(k);
+            }
+        }
         names.sort();
         names
     }
@@ -958,14 +1145,28 @@ impl BridgeProvider {
         name: &str,
         creds: ClientCreds,
     ) -> BridgeResult<AnyChannel> {
+        // QSRV2 disabled: refuse to construct any DB-backed / group
+        // channel. Mirrors pvxs not registering the single/group sources
+        // (iochooks.cpp:461-496); the not-counted early return keeps the
+        // `qsrvStats` channel tally honest about what was actually served.
+        if !self.enabled {
+            return Err(BridgeError::ChannelNotFound(name.to_string()));
+        }
         self.note_channel_created();
         let access_ctx = AccessContext::with_creds(self.live_access(), creds);
 
-        // Check group PVs first
-        if let Some(def) = self.groups.read().get(name).cloned() {
+        // Check group PVs first — but a group name that collides with
+        // a real record is ignored (the record wins), matching pvxs
+        // `defineGroups` dbChannelTest (ioc/groupconfigprocessor.cpp:177).
+        if let Some(def) = self.servable_group(name).await {
             return Ok(AnyChannel::Group(
                 GroupChannel::new(self.db.clone(), def).with_access(access_ctx),
             ));
+        } else if self.groups.read().contains_key(name) {
+            tracing::warn!(
+                group = %name,
+                "QSRV group name conflicts with record name; serving the record and ignoring the group"
+            );
         }
 
         // Single record (or `record.FIELD`) channel.
@@ -1029,6 +1230,128 @@ impl BridgeProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A QSRV group whose name collides with a real record must be
+    /// ignored — the record wins, mirroring pvxs `defineGroups`
+    /// dbChannelTest (ioc/groupconfigprocessor.cpp:177). A non-colliding
+    /// group stays servable.
+    #[tokio::test]
+    async fn group_name_conflicting_with_record_is_ignored() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("REC", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        let provider = BridgeProvider::new(db);
+        // "REC" shadows the record; "GRP:ONLY" has no backing record.
+        provider
+            .load_group_config(
+                r#"{
+                    "REC":      { "value": { "+channel": "REC.VAL",   "+type": "plain" } },
+                    "GRP:ONLY": { "value": { "+channel": "OTHER.VAL", "+type": "plain" } }
+                }"#,
+            )
+            .unwrap();
+
+        // create_channel resolves the record, not the group.
+        match provider.create_channel("REC").await.unwrap() {
+            AnyChannel::Single(_) => {}
+            AnyChannel::Group(_) => panic!("REC must resolve to the record, not the group"),
+        }
+        // The non-colliding group is still served as a group.
+        match provider.create_channel("GRP:ONLY").await.unwrap() {
+            AnyChannel::Group(_) => {}
+            AnyChannel::Single(_) => panic!("GRP:ONLY has no backing record; must be a group"),
+        }
+
+        assert!(provider.channel_find("REC").await);
+
+        // channel_list emits exactly one "REC" (the record), not a
+        // duplicate from the shadowed group; the live group survives.
+        let list = provider.channel_list().await;
+        assert_eq!(
+            list.iter().filter(|n| n.as_str() == "REC").count(),
+            1,
+            "REC must appear once (record), not duplicated by the group"
+        );
+        assert!(
+            list.iter().any(|n| n == "GRP:ONLY"),
+            "the non-colliding group must still be listed"
+        );
+    }
+
+    /// `dbLoadGroup` source identity: a tracked file load can later be
+    /// removed by its `(filename, macros)` identity, re-loading the same
+    /// identity replaces rather than duplicates, and `-*` clears all
+    /// file-loaded groups — mirroring pvxs groupsourcehooks.cpp:133-183.
+    #[tokio::test]
+    async fn group_file_load_is_removable_by_source_identity() {
+        use epics_base_rs::server::database::PvDatabase;
+
+        let provider = BridgeProvider::new(Arc::new(PvDatabase::new()));
+        let ga = r#"{ "GA": { "v": { "+channel": "X.VAL", "+type": "plain" } } }"#;
+        let gb = r#"{ "GB": { "v": { "+channel": "Y.VAL", "+type": "plain" } } }"#;
+
+        provider.load_group_file_tracked("a.json", "", ga).unwrap();
+        provider
+            .load_group_file_tracked("b.json", "M=1", gb)
+            .unwrap();
+        assert_eq!(provider.group_count(), 2);
+
+        // Removal is identity-based: wrong macros string does not match.
+        assert_eq!(provider.remove_group_file("b.json", ""), 0);
+        assert_eq!(provider.group_count(), 2);
+
+        // Exact (filename, macros) removes only that file's groups.
+        assert_eq!(provider.remove_group_file("b.json", "M=1"), 1);
+        assert!(provider.has_group_pv("GA"));
+        assert!(!provider.has_group_pv("GB"));
+
+        // Re-loading the same identity replaces (no duplicate entry).
+        provider.load_group_file_tracked("a.json", "", ga).unwrap();
+        assert_eq!(provider.group_count(), 1);
+
+        // `-*` clears every file-loaded group.
+        assert_eq!(provider.clear_group_files(), 1);
+        assert_eq!(provider.group_count(), 0);
+    }
+
+    /// Two `dbLoadGroup` files each contribute a distinct field to the
+    /// SAME group name; pvxs accumulates both into one runtime group
+    /// (all files loaded into one GroupConfigProcessor,
+    /// groupsourcehooks.cpp:192-207). Before the fix the second file's
+    /// load did a bare `insert` that replaced the first, dropping file
+    /// A's field and making the group order-dependent and partial.
+    #[tokio::test]
+    async fn group_files_accumulate_distinct_fields_for_same_group() {
+        use epics_base_rs::server::database::PvDatabase;
+
+        let provider = BridgeProvider::new(Arc::new(PvDatabase::new()));
+        let file_a = r#"{ "GRP": { "a": { "+channel": "RA.VAL", "+type": "plain" } } }"#;
+        let file_b = r#"{ "GRP": { "b": { "+channel": "RB.VAL", "+type": "plain" } } }"#;
+
+        provider
+            .load_group_file_tracked("a.json", "", file_a)
+            .unwrap();
+        provider
+            .load_group_file_tracked("b.json", "", file_b)
+            .unwrap();
+
+        let def = provider.groups().get("GRP").cloned().expect("GRP exists");
+        let names: Vec<&str> = def.members.iter().map(|m| m.field_name.as_str()).collect();
+        assert_eq!(
+            def.members.len(),
+            2,
+            "both fields must be present: {names:?}"
+        );
+        assert!(names.contains(&"a"), "file A field must survive: {names:?}");
+        assert!(
+            names.contains(&"b"),
+            "file B field must be added: {names:?}"
+        );
+    }
 
     /// Access control that denies all writes, allows all reads.
     struct ReadOnly;

@@ -195,8 +195,9 @@ pub fn negotiated_queue_size(pv_request: &PvStructure) -> i32 {
 /// `_options` already exists (e.g. composed by an earlier read).
 ///
 /// `queue_size` is the negotiated monitor queue depth (see
-/// [`negotiated_queue_size`]); the GET path passes
-/// [`GROUP_DEFAULT_QUEUE_SIZE`] since a GET has no subscription queue.
+/// [`negotiated_queue_size`]) on the MONITOR path; the GET path passes
+/// `0` — pvxs's GET stamps the value-template default and never a queue
+/// depth (groupsource.cpp:480-485, test/testqgroup.cpp:60-66).
 pub fn push_record_options(pv: &mut PvStructure, atomic: bool, queue_size: i32) {
     use epics_pva_rs::pvdata::ScalarValue;
     let mut options = PvStructure::new("");
@@ -217,6 +218,27 @@ pub fn push_record_options(pv: &mut PvStructure, atomic: bool, queue_size: i32) 
         pv.fields[pos].1 = record_field;
     } else {
         pv.fields.push(("record".into(), record_field));
+    }
+}
+
+/// Descriptor twin of [`push_record_options`]: the introspection shape
+/// of the built-in `record._options` subtree (`queueSize` int,
+/// `atomic` boolean). pvxs builds this branch into `group.valueTemplate`
+/// (ioc/groupconfigprocessor.cpp:499-523), so CREATE_CHANNEL / GET_FIELD
+/// negotiation advertises it and every GET/MONITOR value conforms.
+/// Keep the field names and scalar types here in lockstep with
+/// `push_record_options` so the descriptor never diverges from the value.
+fn record_options_field_desc() -> FieldDesc {
+    let options = FieldDesc::Structure {
+        struct_id: String::new(),
+        fields: vec![
+            ("queueSize".into(), FieldDesc::Scalar(ScalarType::Int)),
+            ("atomic".into(), FieldDesc::Scalar(ScalarType::Boolean)),
+        ],
+    };
+    FieldDesc::Structure {
+        struct_id: String::new(),
+        fields: vec![("_options".into(), options)],
     }
 }
 
@@ -491,6 +513,21 @@ pub struct GroupChannel {
     /// `Some(n)` when a `GroupMonitor` built this channel from the
     /// MONITOR INIT pvRequest's negotiated `queueSize`.
     monitor_queue_size: Option<i32>,
+    /// Marks this channel as a MONITOR source, selecting pvxs's
+    /// monitor-path `record._options` stamping over the GET path:
+    ///   - `atomic` is stamped `true` unconditionally
+    ///     (ioc/groupsource.cpp:401-405), whereas GET stamps the
+    ///     *selected* operation atomicity (groupsource.cpp:480-485);
+    ///   - `queueSize` is stamped with the negotiated monitor queue
+    ///     depth (groupsource.cpp:359 `stats.limitQueue`), whereas GET
+    ///     leaves the value-template default `0` — pvxs's GET path
+    ///     (groupsource.cpp:480-485) stamps only `atomic` and never
+    ///     `queueSize`, so a GET reports `queueSize int32_t = 0`
+    ///     (test/testqgroup.cpp:60-66), not a monitor queue depth.
+    ///
+    /// Only a `GroupMonitor`-built channel sets this; the GET path leaves
+    /// it `false`.
+    monitor_stamp: bool,
 }
 
 impl GroupChannel {
@@ -500,6 +537,7 @@ impl GroupChannel {
             def,
             access: super::provider::AccessContext::allow_all(),
             monitor_queue_size: None,
+            monitor_stamp: false,
         }
     }
 
@@ -518,6 +556,17 @@ impl GroupChannel {
         self
     }
 
+    /// Mark this channel as a MONITOR source so composed values use pvxs's
+    /// monitor-path `record._options` stamping (`atomic = true`
+    /// unconditionally per ioc/groupsource.cpp:401-405, and the negotiated
+    /// `queueSize` per groupsource.cpp:359). The GET path never calls this,
+    /// so GET stamps the request/default atomicity and the `queueSize=0`
+    /// value-template default (groupsource.cpp:480-485).
+    pub fn with_monitor_stamp(mut self) -> Self {
+        self.monitor_stamp = true;
+        self
+    }
+
     /// Read all member values and compose into a single PvStructure.
     ///
     /// Internal method. Both `Channel::get()` and `GroupMonitor::poll()`
@@ -526,6 +575,21 @@ impl GroupChannel {
     /// new caller is added later this guarantees the policy still holds.
     pub(crate) async fn read_group(&self) -> BridgeResult<PvStructure> {
         self.read_group_atomic(self.def.atomic).await
+    }
+
+    /// Root structure ID advertised for this group's value and descriptor.
+    ///
+    /// pvxs leaves `GroupDefinition::structureId` an empty `std::string`
+    /// unless a top-level `+id` is configured (groupdefinition.h:30-40,
+    /// groupconfigprocessor.cpp:183-189) and builds the group type as
+    /// `TypeDef(TypeCode::Struct, structureId, {})` — the empty string when
+    /// no `+id` (groupconfigprocessor.cpp:517-523). A non-empty Rust-only
+    /// fallback (`"structure"`) would change the group's public type
+    /// identity, so clients keying type adapters/caches on the structure ID
+    /// would see a different type than the same pvxs group. Single source of
+    /// truth so the value and descriptor paths never diverge on the ID.
+    fn root_struct_id(&self) -> &str {
+        self.def.struct_id.as_deref().unwrap_or("")
     }
 
     /// read with a caller-specified atomic mode, overriding
@@ -539,7 +603,7 @@ impl GroupChannel {
             )));
         }
 
-        let struct_id = self.def.struct_id.as_deref().unwrap_or("structure");
+        let struct_id = self.root_struct_id();
         let mut pv = PvStructure::new(struct_id);
 
         // For atomic groups, hold all record locks simultaneously to
@@ -564,8 +628,14 @@ impl GroupChannel {
                 .map(|(name, g)| (name.as_str(), &**g))
                 .collect();
             for member in &self.def.members {
-                if member.mapping == FieldMapping::Proc || member.mapping == FieldMapping::Structure
-                {
+                // Only `proc` places no value field. A `+type:"structure"`
+                // member emits an empty struct branch (resolved by
+                // read_member -> read_member_channelless), matching the
+                // advertised descriptor. pvxs adds the empty Struct to the
+                // value template (groupconfigprocessor.cpp:922-930) and
+                // clones it into every GET/MONITOR snapshot
+                // (groupsource.cpp:480-518).
+                if member.mapping == FieldMapping::Proc {
                     continue;
                 }
                 let field = self.read_member_locked(member, &guard_map)?;
@@ -573,8 +643,14 @@ impl GroupChannel {
             }
         } else {
             for member in &self.def.members {
-                if member.mapping == FieldMapping::Proc || member.mapping == FieldMapping::Structure
-                {
+                // Only `proc` places no value field. A `+type:"structure"`
+                // member emits an empty struct branch (resolved by
+                // read_member -> read_member_channelless), matching the
+                // advertised descriptor. pvxs adds the empty Struct to the
+                // value template (groupconfigprocessor.cpp:922-930) and
+                // clones it into every GET/MONITOR snapshot
+                // (groupsource.cpp:480-518).
+                if member.mapping == FieldMapping::Proc {
                     continue;
                 }
                 let field = self.read_member(member).await?;
@@ -582,23 +658,35 @@ impl GroupChannel {
             }
         }
 
-        // pvxs `groupsource.cpp:359` stamps
-        // `record._options.queueSize` (negotiated monitor queue depth)
-        // and `record._options.atomic` (operation atomicity) into the
-        // group monitor value. Clients that introspect these branches
-        // — strict pvRequest matchers, archiver appliances tracking
-        // the negotiated queue — would otherwise see a structure-shape
-        // mismatch and reject the operation.
+        // `record._options` stamping differs between the MONITOR and GET
+        // paths in pvxs; `monitor_stamp` selects between them (only the
+        // cached monitor `group_channel` sets it).
         //
-        // `queueSize` is now the *per-operation
-        // negotiated* depth. A `GroupMonitor` resolves it from the
-        // MONITOR INIT pvRequest (`negotiated_queue_size`,
-        // mirroring pvxs `servermon.cpp:533-540`) and threads it in
-        // via `with_monitor_queue_size`. The GET path keeps
-        // `GROUP_DEFAULT_QUEUE_SIZE` — a GET has no subscription
-        // queue, matching pvxs's monitor-only `limitQueue`.
-        let queue_size = self.monitor_queue_size.unwrap_or(GROUP_DEFAULT_QUEUE_SIZE);
-        push_record_options(&mut pv, atomic, queue_size);
+        // queueSize: a MONITOR stamps the negotiated subscription queue
+        // depth (`groupsource.cpp:359` `stats.limitQueue`), resolved from
+        // the MONITOR INIT pvRequest via `negotiated_queue_size`
+        // (`servermon.cpp:533-540`) and threaded in by
+        // `with_monitor_queue_size`. A GET has no subscription queue, so
+        // pvxs leaves the value-template default `0` —
+        // `groupsource.cpp:480-485` (GroupSource::onOp) stamps only
+        // `atomic`, never `queueSize`, and `test/testqgroup.cpp:60-66`
+        // confirms a GET reports `record._options.queueSize int32_t = 0`.
+        // Before this split a GET stamped GROUP_DEFAULT_QUEUE_SIZE (4),
+        // reporting a monitor-looking depth for an operation with none.
+        //
+        // atomic: a MONITOR stamps `true` unconditionally
+        // (`groupsource.cpp:401-405`, GroupMonitor::onStart — a monitor
+        // delivers a single consistent snapshot, so it reports itself
+        // atomic), while a GET stamps the *operation* atomicity (the
+        // pvRequest value, defaulting to the group default). Locking still
+        // uses the real `atomic` mode resolved above.
+        let queue_size = if self.monitor_stamp {
+            self.monitor_queue_size.unwrap_or(GROUP_DEFAULT_QUEUE_SIZE)
+        } else {
+            0
+        };
+        let stamp_atomic = if self.monitor_stamp { true } else { atomic };
+        push_record_options(&mut pv, stamp_atomic, queue_size);
 
         Ok(pv)
     }
@@ -614,11 +702,13 @@ impl GroupChannel {
             )));
         }
 
-        let struct_id = self.def.struct_id.as_deref().unwrap_or("structure");
+        let struct_id = self.root_struct_id();
         let mut pv = PvStructure::new(struct_id);
 
         for member in &self.def.members {
-            if member.mapping == FieldMapping::Proc || member.mapping == FieldMapping::Structure {
+            // Only `proc` places no value field; a `+type:"structure"`
+            // member emits an empty struct branch like the full read path.
+            if member.mapping == FieldMapping::Proc {
                 continue;
             }
             if !field_names.contains(&member.field_name) {
@@ -643,7 +733,13 @@ impl GroupChannel {
                     .clone()
                     .unwrap_or(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Int(0))),
             ),
-            FieldMapping::Structure => Some(PvField::Structure(PvStructure::new(""))),
+            // Empty struct branch carrying the member `+id` so the value
+            // matches the descriptor built in `get_field`
+            // (pvxs adds `Struct(id)` to the value template,
+            // groupconfigprocessor.cpp:922-930).
+            FieldMapping::Structure => Some(PvField::Structure(PvStructure::new(
+                member.struct_id.as_deref().unwrap_or(""),
+            ))),
             FieldMapping::Proc => Some(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Int(0))),
             _ => None,
         }
@@ -875,17 +971,29 @@ impl GroupChannel {
         // group default when the option is absent.
         let atomic = atomic_override.unwrap_or(self.def.atomic);
 
-        // only members with an explicit `+putorder` are
-        // writable. pvxs sentinel `i64::MIN` (fieldconfig.h:37)
-        // → "not putable" (groupsource.cpp:503); a member without
-        // `+putorder` must be ignored, NOT written under an
-        // implicit `0`. Drop None-order members from the PUT path
-        // up-front so the apply loops below never see them.
-        let mut ordered: Vec<(&GroupMember, i32)> = self
+        // Build the PUT apply order. A *value* member is putable only
+        // with an explicit `+putorder`: pvxs's sentinel `i64::MIN`
+        // (fieldconfig.h:37) means "not putable" (groupsource.cpp:503),
+        // so a no-`+putorder` value member is ignored, never written
+        // under an implicit `0`.
+        //
+        // A `proc` member is the exception: pvxs's `doPostProcessing`
+        // returns true for `MappingInfo::Proc` independent of putable
+        // (groupsource.cpp:547-573), so a proc hook runs on every group
+        // PUT even without `+putorder`. Keep proc members in the apply
+        // list regardless; a no-`+putorder` proc sorts at the sentinel
+        // position (first), matching the absent-putOrder ordering. Before
+        // this fix the `filter_map` dropped them, so a proc-only save/apply
+        // hook without `+putorder` silently never ran.
+        let mut ordered: Vec<(&GroupMember, i64)> = self
             .def
             .members
             .iter()
-            .filter_map(|m| m.put_order.map(|po| (m, po)))
+            .filter_map(|m| match m.put_order {
+                Some(po) => Some((m, po)),
+                None if m.mapping == FieldMapping::Proc => Some((m, i64::MIN)),
+                None => None,
+            })
             .collect();
         ordered.sort_by_key(|(_, po)| *po);
         let ordered: Vec<&GroupMember> = ordered.into_iter().map(|(m, _)| m).collect();
@@ -1169,7 +1277,7 @@ impl super::provider::Channel for GroupChannel {
     }
 
     async fn get_field(&self) -> BridgeResult<FieldDesc> {
-        let struct_id = self.def.struct_id.as_deref().unwrap_or("structure");
+        let struct_id = self.root_struct_id();
         let mut fields: Vec<(String, FieldDesc)> = Vec::new();
 
         for member in &self.def.members {
@@ -1214,6 +1322,17 @@ impl super::provider::Channel for GroupChannel {
             // The read side uses set_member_field — introspection must
             // emit the same shape so clients see consistent type info.
             set_member_field_desc(&mut fields, member, desc);
+        }
+
+        // Advertise the built-in `record._options` branch the value
+        // side stamps via push_record_options, placed last to match the
+        // value's field order (the value adds `record` after members).
+        // pvxs carries it in group.valueTemplate so descriptor and
+        // payload agree (groupconfigprocessor.cpp:499-523).
+        if let Some(pos) = fields.iter().position(|(n, _)| n == "record") {
+            fields[pos].1 = record_options_field_desc();
+        } else {
+            fields.push(("record".into(), record_options_field_desc()));
         }
 
         Ok(FieldDesc::Structure {
@@ -1636,7 +1755,8 @@ impl super::provider::PvaMonitor for GroupMonitor {
         // (pvxs `groupsource.cpp:359` `stats.limitQueue`).
         let group_channel = GroupChannel::new(self.db.clone(), self.def.clone())
             .with_access(self.access.clone())
-            .with_monitor_queue_size(self.monitor_queue_size);
+            .with_monitor_queue_size(self.monitor_queue_size)
+            .with_monitor_stamp();
 
         // Check if all members are already primed (e.g., all Const/Structure).
         let all_primed = self
@@ -2438,6 +2558,63 @@ mod tests {
         (db, def)
     }
 
+    /// A `proc` group member WITHOUT `+putorder` must still process its
+    /// target record on every group PUT, on both the atomic and
+    /// non-atomic paths. pvxs's `doPostProcessing` returns true for
+    /// `MappingInfo::Proc` independent of putable (groupsource.cpp:
+    /// 547-573); a no-`+putorder` proc keeps the sentinel order
+    /// (fieldconfig.h:37) and is still processed. Before the fix the
+    /// PUT-candidate `filter_map(put_order)` dropped it, so a proc-only
+    /// save/apply hook silently never ran. Observable: a freshly added
+    /// AiRecord has `INIT=0`; its first process sets `INIT=1`.
+    #[tokio::test]
+    async fn proc_member_without_putorder_is_processed_atomic_and_nonatomic() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_base_rs::types::EpicsValue;
+
+        async fn init_flag(db: &Arc<PvDatabase>, rec: &str) -> i64 {
+            match db.get_pv(&format!("{rec}.INIT")).await.unwrap() {
+                EpicsValue::Char(c) => c as i64,
+                EpicsValue::Long(v) => v as i64,
+                other => panic!("unexpected INIT type: {other:?}"),
+            }
+        }
+
+        for atomic in [false, true] {
+            let db = Arc::new(PvDatabase::new());
+            db.add_record("HOOK:rec", Box::new(AiRecord::new(0.0)))
+                .await
+                .unwrap();
+            // A proc-only member, no `+putorder`.
+            let cfg = format!(
+                r#"{{ "PROC:GRP": {{ "+atomic": {atomic},
+                    "go": {{ "+type": "proc", "+channel": "HOOK:rec" }} }} }}"#
+            );
+            let mut defs = super::super::group_config::parse_group_config(&cfg).unwrap();
+            let def = defs.pop().unwrap();
+            let channel = GroupChannel::new(db.clone(), def);
+
+            assert_eq!(
+                init_flag(&db, "HOOK:rec").await,
+                0,
+                "fresh record not processed"
+            );
+
+            // An empty PUT still fires the proc hook (proc runs regardless
+            // of which value fields the client supplied).
+            channel
+                .put(&PvStructure::new("structure"))
+                .await
+                .expect("proc-only group PUT must succeed");
+
+            assert_eq!(
+                init_flag(&db, "HOOK:rec").await,
+                1,
+                "proc member without +putorder must process its record (atomic={atomic})"
+            );
+        }
+    }
+
     /// Regression. Two boundaries in one
     /// fixture:
     ///
@@ -2666,6 +2843,59 @@ mod tests {
                 assert_eq!(*v, 9.25)
             }
             other => panic!("member b: expected Double(9.25), got {other:?}"),
+        }
+    }
+
+    /// BR-123: a group with no top-level `+id` advertises an EMPTY root
+    /// structure ID on BOTH the value and the descriptor — pvxs leaves
+    /// `GroupDefinition::structureId` empty and builds
+    /// `TypeDef(TypeCode::Struct, "", {})` (groupconfigprocessor.cpp:
+    /// 517-523). The prior Rust-only `"structure"` literal changed the
+    /// group's public type identity. An explicit `+id` still wins.
+    #[tokio::test]
+    async fn br_123_group_root_struct_id_empty_without_plus_id() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("R:rec", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+
+        // No top-level +id → empty root struct ID on value and descriptor.
+        let cfg = r#"{ "G:noid": { "a": {"+type":"plain","+channel":"R:rec.VAL"} } }"#;
+        let def = super::super::group_config::parse_group_config(cfg)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let channel = GroupChannel::new(db.clone(), def);
+        let pv = channel.read_group().await.unwrap();
+        assert_eq!(
+            pv.struct_id, "",
+            "value root struct ID must be empty without +id"
+        );
+        match channel.get_field().await.unwrap() {
+            FieldDesc::Structure { struct_id, .. } => {
+                assert_eq!(
+                    struct_id, "",
+                    "descriptor root struct ID must be empty without +id"
+                );
+            }
+            other => panic!("expected root Structure descriptor, got {other:?}"),
+        }
+
+        // Explicit +id wins on both value and descriptor.
+        let cfg2 = r#"{ "G:id": { "+id": "epics:nt/NTScalar:1.0", "a": {"+type":"plain","+channel":"R:rec.VAL"} } }"#;
+        let def2 = super::super::group_config::parse_group_config(cfg2)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let channel2 = GroupChannel::new(db.clone(), def2);
+        let pv2 = channel2.read_group().await.unwrap();
+        assert_eq!(pv2.struct_id, "epics:nt/NTScalar:1.0");
+        match channel2.get_field().await.unwrap() {
+            FieldDesc::Structure { struct_id, .. } => {
+                assert_eq!(struct_id, "epics:nt/NTScalar:1.0");
+            }
+            other => panic!("expected root Structure descriptor, got {other:?}"),
         }
     }
 

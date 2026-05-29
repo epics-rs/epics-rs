@@ -318,9 +318,11 @@ async fn group_get_carries_record_options_queue_size_and_atomic() {
         PvField::Structure(s) => s,
         other => panic!("expected _options to be structure, got {other:?}"),
     };
-    // queueSize: pvxs stamps a positive int; we don't pin the
-    // exact value because per-op negotiation lands later, but it
-    // must be present and > 0.
+    // queueSize: a GET has no monitor subscription queue, so pvxs leaves
+    // the value-template default 0 — `groupsource.cpp:480-485` stamps only
+    // `atomic`, and `test/testqgroup.cpp:60-66` shows GET reports
+    // `record._options.queueSize int32_t = 0`. The negotiated depth is a
+    // monitor-only concern (see br_r33_group_monitor_stamps_negotiated_queue_size).
     let qs = options_struct
         .fields
         .iter()
@@ -329,7 +331,10 @@ async fn group_get_carries_record_options_queue_size_and_atomic() {
         .expect("queueSize must be present");
     match qs {
         PvField::Scalar(ScalarValue::Int(n)) => {
-            assert!(*n > 0, "queueSize must be positive, got {n}")
+            assert_eq!(
+                *n, 0,
+                "GET must report the template-default queueSize 0, got {n}"
+            )
         }
         other => panic!("expected int queueSize, got {other:?}"),
     }
@@ -457,6 +462,89 @@ async fn br_r33_group_monitor_stamps_negotiated_queue_size() {
     assert_eq!(
         qs_default, GROUP_DEFAULT_QUEUE_SIZE,
         "absent queueSize → monitor stamps the default"
+    );
+}
+
+/// a group MONITOR stamps `record._options.atomic = true`
+/// unconditionally, regardless of the group's `+atomic:false`
+/// default, while a GET on the same group reports the actual
+/// operation atomicity (`false`). pvxs `groupsource.cpp:401-405`
+/// (GroupMonitor::onStart) always sets the monitor value's atomic
+/// flag true — a monitor delivers one consistent snapshot, so it
+/// reports itself atomic — whereas `groupsource.cpp:480-485`
+/// (GroupSource::onOp, the GET path) stamps the per-operation
+/// atomicity. Before the fix both paths reported the group default,
+/// so a `+atomic:false` group's monitor wrongly advertised `false`.
+#[tokio::test]
+async fn group_monitor_stamps_atomic_true_while_get_reports_operation_atomicity() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_bridge_rs::qsrv::group::GroupMonitor;
+    use epics_bridge_rs::qsrv::provider::PvaMonitor;
+    use std::time::Duration;
+
+    // Extract `record._options.atomic` from a posted/returned value.
+    fn atomic_of(s: &PvStructure) -> bool {
+        let record = match s.fields.iter().find(|(n, _)| n == "record").map(|(_, v)| v) {
+            Some(PvField::Structure(r)) => r,
+            other => panic!("record sub-structure missing: {other:?}"),
+        };
+        let options = match record
+            .fields
+            .iter()
+            .find(|(n, _)| n == "_options")
+            .map(|(_, v)| v)
+        {
+            Some(PvField::Structure(o)) => o,
+            other => panic!("record._options missing: {other:?}"),
+        };
+        match options
+            .fields
+            .iter()
+            .find(|(n, _)| n == "atomic")
+            .map(|(_, v)| v)
+        {
+            Some(PvField::Scalar(ScalarValue::Boolean(b))) => *b,
+            other => panic!("record._options.atomic missing: {other:?}"),
+        }
+    }
+
+    // GET path: a `+atomic:false` group reports the operation
+    // atomicity, which defaults to the group default (false).
+    let db = make_db_na().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider
+        .load_group_config(GROUP_JSON_NONATOMIC)
+        .expect("load");
+    let def = provider
+        .groups()
+        .get("TEST:grp_na")
+        .cloned()
+        .expect("grp_na registered");
+    assert!(!def.atomic, "fixture must be a non-atomic group");
+
+    let ch = GroupChannel::new(db.clone(), def.clone());
+    let get_result = ch.get(&empty_request()).await.expect("get");
+    assert!(
+        !atomic_of(&get_result),
+        "GET on a +atomic:false group must report operation atomicity (false)"
+    );
+
+    // MONITOR path: the same group's monitor snapshot reports
+    // atomic = true unconditionally.
+    let mut mon = GroupMonitor::new(db.clone(), def);
+    mon.start().await.expect("start");
+    for rec_name in ["TEST:level_na", "TEST:count_na"] {
+        let rec = db.get_record(rec_name).await.expect("rec exists");
+        rec.read().await.notify_field("VAL", EventMask::VALUE);
+    }
+    let snap = tokio::time::timeout(Duration::from_secs(2), mon.poll())
+        .await
+        .expect("priming snapshot within 2s")
+        .expect("snapshot");
+    mon.stop().await;
+    assert!(
+        atomic_of(&snap.value),
+        "group MONITOR must stamp record._options.atomic = true even for a +atomic:false group"
     );
 }
 
@@ -723,4 +811,165 @@ async fn group_config_parses_and_finalizes() {
     let names: Vec<&str> = def.members.iter().map(|m| m.field_name.as_str()).collect();
     assert!(names.contains(&"level"));
     assert!(names.contains(&"count"));
+}
+
+const GROUP_JSON_STRUCT_MEMBER: &str = r#"{
+    "TEST:sgrp": {
+        "+id": "epics:nt/NTGroup:1.0",
+        "+atomic": true,
+        "value": { "+channel": "TEST:level.VAL", "+type": "plain" },
+        "meta":  { "+type": "structure", "+id": "alpha/v1" }
+    }
+}"#;
+
+const GROUP_JSON_STRUCT_MEMBER_NA: &str = r#"{
+    "TEST:sgrp_na": {
+        "+atomic": false,
+        "value": { "+channel": "TEST:level.VAL", "+type": "plain" },
+        "meta":  { "+type": "structure", "+id": "alpha/v1" }
+    }
+}"#;
+
+fn find_field<'a>(s: &'a PvStructure, name: &str) -> Option<&'a PvField> {
+    s.fields.iter().find(|(n, _)| n == name).map(|(_, v)| v)
+}
+
+/// A `+type:"structure"` member must appear in the GET value as an
+/// empty structure carrying its `+id`, matching the advertised
+/// descriptor. pvxs adds the empty `Struct(id)` to the value template
+/// (groupconfigprocessor.cpp:922-930) and clones it into every GET /
+/// MONITOR snapshot (groupsource.cpp:480-518).
+#[tokio::test]
+async fn structure_member_appears_in_atomic_group_value_and_descriptor() {
+    use epics_pva_rs::pvdata::FieldDesc;
+
+    let db = make_db().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider
+        .load_group_config(GROUP_JSON_STRUCT_MEMBER)
+        .expect("load");
+    let def = provider
+        .groups()
+        .get("TEST:sgrp")
+        .cloned()
+        .expect("registered");
+    let ch = GroupChannel::new(db, def);
+
+    // GET value carries the empty structure branch with the member +id.
+    let result = ch.get(&empty_request()).await.expect("get");
+    match find_field(&result, "meta") {
+        Some(PvField::Structure(s)) => {
+            assert!(s.fields.is_empty(), "structure member value must be empty");
+            assert_eq!(
+                s.struct_id, "alpha/v1",
+                "value struct id must carry member +id"
+            );
+        }
+        other => panic!("group value must contain empty `meta` structure, got {other:?}"),
+    }
+    // The backed member is still present.
+    assert_eq!(extract_double(&result, "value"), Some(1.5));
+
+    // Descriptor advertises the same empty structure with the +id.
+    let desc = ch.get_field().await.expect("get_field");
+    let fields = match &desc {
+        FieldDesc::Structure { fields, .. } => fields,
+        other => panic!("group descriptor must be a structure, got {other:?}"),
+    };
+    match fields.iter().find(|(n, _)| n == "meta").map(|(_, d)| d) {
+        Some(FieldDesc::Structure { struct_id, fields }) => {
+            assert_eq!(struct_id, "alpha/v1");
+            assert!(fields.is_empty(), "structure descriptor must be empty");
+        }
+        other => panic!("descriptor must contain empty `meta` structure with +id, got {other:?}"),
+    }
+}
+
+/// Same as above for a non-atomic group, exercising the non-atomic
+/// read loop which also skipped Structure members before the fix.
+#[tokio::test]
+async fn structure_member_appears_in_nonatomic_group_value() {
+    let db = make_db().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider
+        .load_group_config(GROUP_JSON_STRUCT_MEMBER_NA)
+        .expect("load");
+    let def = provider
+        .groups()
+        .get("TEST:sgrp_na")
+        .cloned()
+        .expect("registered");
+    let ch = GroupChannel::new(db, def);
+
+    let result = ch.get(&empty_request()).await.expect("get");
+    match find_field(&result, "meta") {
+        Some(PvField::Structure(s)) => {
+            assert!(s.fields.is_empty());
+            assert_eq!(s.struct_id, "alpha/v1");
+        }
+        other => {
+            panic!("non-atomic group value must contain empty `meta` structure, got {other:?}")
+        }
+    }
+    assert_eq!(extract_double(&result, "value"), Some(1.5));
+}
+
+/// GET_FIELD / CREATE_CHANNEL must advertise the built-in
+/// `record._options` branch (queueSize int, atomic boolean) that GET
+/// and MONITOR values carry, matching pvxs `group.valueTemplate`
+/// (groupconfigprocessor.cpp:499-523).
+#[tokio::test]
+async fn group_descriptor_advertises_record_options() {
+    use epics_pva_rs::pvdata::{FieldDesc, ScalarType};
+
+    let db = make_db().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(GROUP_JSON).expect("load");
+    let def = provider
+        .groups()
+        .get("TEST:grp")
+        .cloned()
+        .expect("registered");
+    let ch = GroupChannel::new(db, def);
+
+    let desc = ch.get_field().await.expect("get_field");
+    let root = match &desc {
+        FieldDesc::Structure { fields, .. } => fields,
+        other => panic!("group descriptor must be a structure, got {other:?}"),
+    };
+    let opts = match root.iter().find(|(n, _)| n == "record").map(|(_, d)| d) {
+        Some(FieldDesc::Structure { fields, .. }) => {
+            fields.iter().find(|(n, _)| n == "_options").map(|(_, d)| d)
+        }
+        other => panic!("descriptor must contain a `record` structure, got {other:?}"),
+    };
+    match opts {
+        Some(FieldDesc::Structure { fields, .. }) => {
+            assert!(
+                matches!(
+                    fields
+                        .iter()
+                        .find(|(n, _)| n == "queueSize")
+                        .map(|(_, d)| d),
+                    Some(FieldDesc::Scalar(ScalarType::Int))
+                ),
+                "record._options.queueSize must be advertised as int"
+            );
+            assert!(
+                matches!(
+                    fields.iter().find(|(n, _)| n == "atomic").map(|(_, d)| d),
+                    Some(FieldDesc::Scalar(ScalarType::Boolean))
+                ),
+                "record._options.atomic must be advertised as boolean"
+            );
+        }
+        other => panic!("descriptor must contain `record._options`, got {other:?}"),
+    }
+
+    // The GET value conforms: it carries the same record._options branch.
+    let val = ch.get(&empty_request()).await.expect("get");
+    assert!(
+        matches!(find_field(&val, "record"), Some(PvField::Structure(_))),
+        "GET value must carry the record._options branch the descriptor advertises"
+    );
 }

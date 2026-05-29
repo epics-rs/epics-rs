@@ -10,12 +10,20 @@ use epics_pva_rs::{config, format};
 )]
 struct Args {
     /// PV names to query
-    #[arg(required = true)]
+    #[arg(required_unless_present = "describe")]
     pv_names: Vec<String>,
 
     /// Wait time in seconds
     #[arg(short = 'w', default_value = "5.0")]
     timeout: f64,
+
+    /// Print host network troubleshooting info (local interfaces,
+    /// broadcast targets, effective config) and exit, without
+    /// contacting any server. pvxs `tools/info.cpp:62-64` implements
+    /// `-D` as `target_information(std::cout)` followed by an immediate
+    /// `return 0` — so no PV name is required.
+    #[arg(short = 'D')]
+    describe: bool,
 
     /// Verbose: print the effective PVA client configuration before
     /// the type output. pvxs `tools/info.cpp:76-79` implements `-v` as
@@ -64,9 +72,39 @@ fn print_effective_config() {
     println!("  interfaces={interfaces}");
 }
 
+/// Print host network troubleshooting info and return, mirroring pvxs
+/// `target_information` (`src/describe.cpp:27`) as invoked by `-D`
+/// (`tools/info.cpp:62-64`). pvxs additionally dumps C++ toolchain/ABI
+/// details that have no Rust analogue; the operationally meaningful
+/// part for "why can't I reach my IOC" is the local interfaces,
+/// broadcast targets, and effective client config, which is what we
+/// reproduce here.
+fn target_information() {
+    let interfaces = config::list_intf_addresses();
+    println!("Network targets");
+    println!("  interfaces:");
+    for addr in &interfaces {
+        println!("    {addr}");
+    }
+    println!("  broadcast addresses (port {}):", config::broadcast_port());
+    for addr in config::list_broadcast_addresses(config::broadcast_port()) {
+        println!("    {addr}");
+    }
+    print_effective_config();
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+
+    // pvxs `-D` prints host troubleshooting info and exits before any
+    // server contact (`tools/info.cpp:62-64`: `target_information();
+    // return 0;`). No PV name is required (enforced by
+    // `required_unless_present`).
+    if args.describe {
+        target_information();
+        return;
+    }
 
     // pvxs `pvxinfo -v` prints the effective client config once, before
     // the per-PV type output (`tools/info.cpp:76-79`), not per channel.
@@ -147,5 +185,22 @@ mod tests {
 
         let both = Args::parse_from(["pvinfo-rs", "-v", "--show-credentials", "PV"]);
         assert!(both.verbose && both.show_credentials);
+    }
+
+    /// `-D` is a self-contained host-info dump: pvxs exits before
+    /// requiring a PV name (`tools/info.cpp:62-64`). So `pvinfo-rs -D`
+    /// with no PV must parse, while a bare invocation with no PV and no
+    /// `-D` must still error.
+    #[test]
+    fn describe_flag_requires_no_pv_name() {
+        let d = Args::try_parse_from(["pvinfo-rs", "-D"]).expect("-D needs no PV name");
+        assert!(d.describe);
+        assert!(d.pv_names.is_empty());
+
+        // Without -D, at least one PV name is still required.
+        assert!(
+            Args::try_parse_from(["pvinfo-rs"]).is_err(),
+            "no PV and no -D must be a usage error"
+        );
     }
 }

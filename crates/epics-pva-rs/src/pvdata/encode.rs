@@ -1716,6 +1716,74 @@ pub fn fill_unmarked_from_prior(
     }
 }
 
+/// Reduce a wire PUT delta to exactly its marked leaves, dropping every
+/// unmarked field/subtree, so a *present* field means "the client
+/// marked it" and an absent one means "unchanged".
+///
+/// This is the structural representation of the pvxs mark-bit contract
+/// (`Value::isMarked`, `data.cpp:213-251`): a group apply that selects
+/// members by field presence then writes only the members the client
+/// actually marked, matching `groupsource.cpp:547-567` (write only when
+/// `marked = leafNode.isMarked(true,true) && field.value`). It differs
+/// from [`fill_unmarked_from_prior`], which keeps every leaf (filling
+/// unmarked ones from a prior snapshot) and is the read-merge-write
+/// shape correct for whole-PV sources but wrong for groups.
+///
+/// `bit_offset` uses the same depth-first numbering as
+/// [`fill_unmarked_from_prior`] / `decode_pv_field_with_bitset`. Returns
+/// `None` when the whole subtree is unmarked (nothing to apply).
+pub fn prune_to_marked(
+    desc: &FieldDesc,
+    bitset: &crate::proto::BitSet,
+    bit_offset: usize,
+    decoded: PvField,
+) -> Option<PvField> {
+    match desc {
+        FieldDesc::Scalar(_)
+        | FieldDesc::ScalarArray(_)
+        | FieldDesc::Variant
+        | FieldDesc::VariantArray
+        | FieldDesc::Union { .. }
+        | FieldDesc::UnionArray { .. }
+        | FieldDesc::StructureArray { .. } => {
+            if bitset.get(bit_offset) {
+                Some(decoded)
+            } else {
+                None
+            }
+        }
+        FieldDesc::Structure { .. } if bitset.get(bit_offset) => {
+            // Own bit set → the whole subtree was sent fresh (pvxs
+            // BitSet compression); every descendant is marked.
+            Some(decoded)
+        }
+        FieldDesc::Structure { struct_id, fields } => {
+            let mut decoded_children: Vec<(String, PvField)> = match decoded {
+                PvField::Structure(s) => s.fields,
+                _ => Vec::new(),
+            };
+            let mut out = PvStructure::new(struct_id);
+            let mut child_bit = bit_offset + 1;
+            for (name, child_desc) in fields {
+                let decoded_child = decoded_children
+                    .iter()
+                    .position(|(n, _)| n == name)
+                    .map(|idx| decoded_children.swap_remove(idx).1)
+                    .unwrap_or_else(|| default_value_for(child_desc));
+                if let Some(kept) = prune_to_marked(child_desc, bitset, child_bit, decoded_child) {
+                    out.fields.push((name.clone(), kept));
+                }
+                child_bit += child_desc.total_bits();
+            }
+            if out.fields.is_empty() {
+                None
+            } else {
+                Some(PvField::Structure(out))
+            }
+        }
+    }
+}
+
 /// Decode a `PvField` matching `desc` — assumes every field is present
 /// on the wire (i.e. bitset is "all bits set"). Used for cases like
 /// CONNECTION_VALIDATION authnz where there's no bitset.
@@ -3217,5 +3285,72 @@ mod tests {
             err.is_err(),
             "must fail: 0xFE ref without prior 0xFD define in same call"
         );
+    }
+
+    // ---- prune_to_marked: mark-bit-driven group apply primitive ----
+
+    fn two_member_group_desc() -> FieldDesc {
+        // Depth-first bit numbering: root = 0, member `a` = 1, `b` = 2.
+        FieldDesc::Structure {
+            struct_id: "group".into(),
+            fields: vec![
+                ("a".into(), FieldDesc::Scalar(ScalarType::Long)),
+                ("b".into(), FieldDesc::Scalar(ScalarType::Long)),
+            ],
+        }
+    }
+
+    fn two_member_delta() -> PvField {
+        let mut s = PvStructure::new("group");
+        s.fields
+            .push(("a".into(), PvField::Scalar(ScalarValue::Long(11))));
+        s.fields
+            .push(("b".into(), PvField::Scalar(ScalarValue::Long(0))));
+        PvField::Structure(s)
+    }
+
+    #[test]
+    fn prune_to_marked_keeps_only_marked_member() {
+        let desc = two_member_group_desc();
+        let mut changed = crate::proto::BitSet::new();
+        changed.set(1); // member `a` only
+        let pruned = prune_to_marked(&desc, &changed, 0, two_member_delta());
+        let s = match pruned {
+            Some(PvField::Structure(s)) => s,
+            other => panic!("expected a structure, got {other:?}"),
+        };
+        assert!(
+            s.get_field("a").is_some(),
+            "marked member a must be present"
+        );
+        assert!(
+            s.get_field("b").is_none(),
+            "unmarked member b must be dropped"
+        );
+    }
+
+    #[test]
+    fn prune_to_marked_nothing_marked_is_none() {
+        let desc = two_member_group_desc();
+        let changed = crate::proto::BitSet::new(); // nothing set
+        assert!(
+            prune_to_marked(&desc, &changed, 0, two_member_delta()).is_none(),
+            "an unmarked delta prunes to None (nothing to apply)"
+        );
+    }
+
+    #[test]
+    fn prune_to_marked_root_bit_keeps_whole_subtree() {
+        // Own structure bit set → pvxs BitSet compression: the whole
+        // subtree was sent fresh, so every member is kept.
+        let desc = two_member_group_desc();
+        let mut changed = crate::proto::BitSet::new();
+        changed.set(0);
+        let pruned = prune_to_marked(&desc, &changed, 0, two_member_delta());
+        let s = match pruned {
+            Some(PvField::Structure(s)) => s,
+            other => panic!("expected a structure, got {other:?}"),
+        };
+        assert!(s.get_field("a").is_some() && s.get_field("b").is_some());
     }
 }

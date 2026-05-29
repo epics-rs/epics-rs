@@ -522,6 +522,113 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         }
     }
 
+    /// BitSet-delta PUT (PVA PUT / PUT_GET data phase).
+    ///
+    /// The generic default (`source.rs` `put_delta_checked`) reads the
+    /// PV's current full value and overlays the marked leaves
+    /// (`fill_unmarked_from_prior`) before writing. That is correct for
+    /// a single record, but for a QSRV *group* the merged full structure
+    /// makes every putorder member look client-supplied, so
+    /// `GroupChannel::put_with_options` would access-check and
+    /// write/process every member — not just the ones the client marked.
+    ///
+    /// pvxs decodes a PUT into a value carrying mark bits
+    /// (`from_wire_valid`, serverget.cpp:443-452) and the group apply
+    /// writes only marked members (`marked = leafNode.isMarked(true,true)
+    /// && field.value`, groupsource.cpp:547-567). Match that: for a
+    /// group, prune the delta to its marked leaves so field presence ==
+    /// marked, then hand that to the group apply (which now selects,
+    /// access-checks, and writes only present/marked members). Single
+    /// records keep the read-merge-write default so unmarked metadata
+    /// leaves carry over from the prior value.
+    fn put_delta_checked(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        desc: FieldDesc,
+        changed: epics_pva_rs::proto::BitSet,
+        delta: PvField,
+        ctx: epics_pva_rs::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+        let provider = self.provider.clone();
+        async move {
+            if !checked.allows_write() {
+                return Err(OpError::denied(format!(
+                    "PUT denied by access security: '{}' from {}@{}",
+                    checked.pv_name(),
+                    ctx.account,
+                    ctx.host
+                )));
+            }
+            let name = checked.pv_name().to_string();
+            let init_req = match ctx.pv_request {
+                Some(PvField::Structure(ref req)) => Some(req),
+                _ => None,
+            };
+            let channel = provider
+                .create_channel_with_creds(&name, ctx_to_creds(&ctx))
+                .await
+                .map_err(|e| OpError::failed(e.to_string()))?;
+            match channel {
+                crate::qsrv::AnyChannel::Group(group) => {
+                    // Prune to the client's marked members (presence ==
+                    // marked). Nothing marked → empty apply, which the
+                    // group's own "No fields changed" logic treats as a
+                    // silent no-op (pvxs `value.isMarked` false).
+                    let pv = match epics_pva_rs::pvdata::encode::prune_to_marked(
+                        &desc, &changed, 0, delta,
+                    ) {
+                        Some(PvField::Structure(s)) => s,
+                        Some(other) => {
+                            return Err(OpError::failed(format!(
+                                "qsrv group PUT expects a structure value, got {other}"
+                            )));
+                        }
+                        None => PvStructure::new(""),
+                    };
+                    let opts = match init_req {
+                        Some(req) => crate::qsrv::channel::PutOptions::from_pv_request(req),
+                        None => crate::qsrv::channel::PutOptions::from_pv_request(&pv),
+                    };
+                    let atomic_override = match init_req {
+                        Some(req) => crate::qsrv::channel::atomic_from_pv_request(req),
+                        None => crate::qsrv::channel::atomic_from_pv_request(&pv),
+                    };
+                    group
+                        .put_with_options(&pv, opts, atomic_override)
+                        .await
+                        .map_err(|e| OpError::failed(e.to_string()))
+                }
+                crate::qsrv::AnyChannel::Single(single) => {
+                    // Single-record: generic read-merge-write under the
+                    // same identity (the record put consumes only the
+                    // value leaf, so the whole-structure write is fine).
+                    let merged = match self.get_value_checked(checked.clone(), ctx.clone()).await {
+                        Some(prior) => epics_pva_rs::pvdata::encode::fill_unmarked_from_prior(
+                            &desc, &changed, 0, delta, &prior,
+                        ),
+                        None => delta,
+                    };
+                    let pv = match merged {
+                        PvField::Structure(s) => s,
+                        other => {
+                            return Err(OpError::failed(format!(
+                                "qsrv PUT expects a structure value, got {other}"
+                            )));
+                        }
+                    };
+                    let opts = match init_req {
+                        Some(req) => crate::qsrv::channel::PutOptions::from_pv_request(req),
+                        None => crate::qsrv::channel::PutOptions::from_pv_request(&pv),
+                    };
+                    single
+                        .put_with_options(&pv, opts)
+                        .await
+                        .map_err(|e| OpError::failed(e.to_string()))
+                }
+            }
+        }
+    }
+
     /// PVA `PROCESS` against a QSRV record runs the record's
     /// `dbProcess`-equivalent path. The default `ChannelSource::process`
     /// returns `Ok(())` unconditionally — a client calling
@@ -555,65 +662,6 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 .process_record(record_name)
                 .await
                 .map_err(|e| OpError::failed(format!("PROCESS on '{name}': {e}")))
-        }
-    }
-
-    /// RPC-with-query is a record WRITE in QSRV's
-    /// "set fields, read back" idiom. The default trait
-    /// `rpc_checked` gates only on READ access, so a READ-only
-    /// client could mutate records through `pvcall PV
-    /// field=value`. Override to require WRITE access whenever
-    /// the request carries any query fields (NTURI.query or a
-    /// bare structure with members).
-    #[allow(clippy::manual_async_fn)]
-    fn rpc_checked(
-        &self,
-        checked: epics_pva_rs::server_native::source::AccessChecked,
-        request_desc: FieldDesc,
-        request_value: PvField,
-        ctx: epics_pva_rs::server_native::source::ChannelContext,
-    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send {
-        async move {
-            if !checked.allows_read() {
-                return Err(OpError::denied(format!(
-                    "RPC denied by access security: '{}' from {}@{}",
-                    checked.pv_name(),
-                    ctx.account,
-                    ctx.host,
-                )));
-            }
-            // Inspect the request to determine whether it carries
-            // query arguments that would land as a PUT inside
-            // `rpc()`. NTURI shape: `query` substructure with one
-            // or more fields. Bare-structure shape: any non-empty
-            // top-level fields list.
-            let has_writes = match &request_value {
-                PvField::Structure(root) => {
-                    if let Some((_, PvField::Structure(q))) =
-                        root.fields.iter().find(|(n, _)| n == "query")
-                    {
-                        !q.fields.is_empty()
-                    } else if root.struct_id == "epics:nt/NTURI:1.0" {
-                        false
-                    } else {
-                        root.fields
-                            .iter()
-                            .any(|(n, _)| !n.starts_with("scheme") && !n.starts_with("path"))
-                    }
-                }
-                _ => false,
-            };
-            if has_writes && !checked.allows_write() {
-                return Err(OpError::denied(format!(
-                    "RPC write denied by access security: '{}' from {}@{} \
-                     (RPC query arguments require WRITE access in QSRV)",
-                    checked.pv_name(),
-                    ctx.account,
-                    ctx.host,
-                )));
-            }
-            self.rpc(checked.pv_name(), request_desc, request_value)
-                .await
         }
     }
 
@@ -809,130 +857,6 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 return false;
             }
             provider.is_writable(&name).await
-        }
-    }
-
-    /// PVA RPC against a QSRV-served record or group PV.
-    ///
-    /// pvxs QSRV2 supports RPC on records and group PVs; the prior
-    /// `QsrvPvStore` left `ChannelSource::rpc` at its default
-    /// ("RPC not supported"). This override gives QSRV records and
-    /// group PVs the standard NTURI-shaped RPC contract:
-    ///
-    /// * The request is parsed as `epics:nt/NTURI:1.0` — RPC arguments
-    ///   live in the `query` substructure (`pvcall PV field=value`).
-    ///   A non-NTURI top-level structure is also accepted: its own
-    ///   fields are treated as the query set.
-    /// * Every query field is PUT into the target PV before the
-    ///   response is assembled. A query field named `value` (the
-    ///   common `pvcall PV value=...` case) maps onto the record's
-    ///   canonical `value` subfield; a field whose name is a known
-    ///   group member is routed to that member. This makes RPC a
-    ///   process-and-read primitive — pvxs `pvxcall`-style.
-    /// * The response is the PV's current value after the writes
-    ///   (`(FieldDesc, PvField::Structure)`), so a parameterless RPC
-    ///   degenerates to a plain GET. Native PVA plugin PVs
-    ///   (NTNDArray etc.) are read-only: their RPC is GET-only and a
-    ///   non-empty query is rejected.
-    fn rpc(
-        &self,
-        name: &str,
-        request_desc: FieldDesc,
-        request_value: PvField,
-    ) -> impl std::future::Future<Output = Result<(FieldDesc, PvField), OpError>> + Send {
-        let name_owned = name.to_string();
-        let pva_pvs = self.pva_pvs.clone();
-        async move {
-            let _ = request_desc;
-            // Pull RPC arguments: NTURI puts them under `query`,
-            // a bare structure exposes them at top level.
-            let query: Vec<(String, PvField)> = match &request_value {
-                PvField::Structure(s) => match s.get_field("query") {
-                    Some(PvField::Structure(q)) => q.fields.clone(),
-                    _ => s.fields.clone(),
-                },
-                PvField::Null => Vec::new(),
-                other => {
-                    return Err(OpError::failed(format!(
-                        "qsrv RPC on {name_owned:?}: expected an NTURI or structure \
-                         request, got {other}"
-                    )));
-                }
-            };
-
-            // Native PVA plugin PVs (NTNDArray from NDPluginPva) are
-            // produced server-side and have no record to write into.
-            if let Some(handle) = pva_pvs.read().await.get(&name_owned).cloned() {
-                if !query.is_empty() {
-                    return Err(OpError::failed(format!(
-                        "qsrv RPC on {name_owned:?}: native PVA PV is read-only, \
-                         RPC query arguments are not accepted"
-                    )));
-                }
-                let value = handle.latest.lock().clone().ok_or_else(|| {
-                    format!("qsrv RPC on {name_owned:?}: native PVA PV has no value yet")
-                })?;
-                let desc = handle
-                    .descriptor
-                    .clone()
-                    .unwrap_or_else(|| value.descriptor());
-                return Ok((desc, value));
-            }
-
-            let channel = self
-                .channel(&name_owned)
-                .await
-                .ok_or_else(|| format!("qsrv RPC: PV not found: {name_owned}"))?;
-
-            // Apply the query as a single PUT before the read-back.
-            // Each query field is placed at its own path in the put
-            // structure: for a single-record channel the only writable
-            // path is `value` (`pvcall PV value=...`); for a group PV
-            // every query field name is a member field path, resolved
-            // the same way `GroupChannel::put` reads members via
-            // `get_nested_field`. One `put` call so atomic groups stay
-            // atomic.
-            //
-            // B1: a single-record channel's put extracts only the
-            // `value` field (`pv_structure_to_epics`). A query field
-            // named anything else would be placed at a dead path and
-            // silently dropped — reject it with a clear error so the
-            // caller learns the contract instead of seeing a no-op.
-            // Group channels accept arbitrary member paths, so the
-            // check is scoped to `AnyChannel::Single`.
-            if !query.is_empty() {
-                if let AnyChannel::Single(_) = &channel {
-                    for (field, _) in &query {
-                        let top = field.split('.').next().unwrap_or(field);
-                        if top != "value" {
-                            return Err(OpError::failed(format!(
-                                "qsrv RPC on {name_owned:?}: single-record channel \
-                                 accepts only the `value` query field, got {field:?}"
-                            )));
-                        }
-                    }
-                }
-                let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
-                for (field, field_value) in &query {
-                    super::group::set_nested_field(&mut put, field, field_value.clone());
-                }
-                channel
-                    .put(&put)
-                    .await
-                    .map_err(|e| format!("qsrv RPC put on {name_owned} failed: {e}"))?;
-            }
-
-            // Read back the post-write value as the RPC response.
-            let empty_request = PvStructure::new("");
-            let value = channel
-                .get(&empty_request)
-                .await
-                .map_err(|e| format!("qsrv RPC get-back on {name_owned} failed: {e}"))?;
-            let desc = channel
-                .get_field()
-                .await
-                .map_err(|e| format!("qsrv RPC introspection on {name_owned} failed: {e}"))?;
-            Ok((desc, PvField::Structure(value)))
         }
     }
 
@@ -1525,49 +1449,14 @@ mod tests {
         );
     }
 
-    /// B1: PVA RPC against a QSRV-served record. A parameterless RPC
-    /// degenerates to a GET — the response is the record's current
-    /// NTScalar value. Closes the doc gap "QsrvPvStore missing rpc".
+    /// pvxs installs no `onRPC` for QSRV records (singlesource.cpp:427-460);
+    /// an RPC EXEC replies "RPC Not Implemented" (serverget.cpp:482-486).
+    /// QsrvPvStore must inherit the default "RPC not supported": RPC must
+    /// NOT become a write-through, so `pvcall PV value=...` cannot mutate a
+    /// record and a parameterless RPC is rejected rather than acting as a
+    /// GET.
     #[tokio::test]
-    async fn rpc_on_qsrv_record_without_args_returns_current_value() {
-        use epics_base_rs::server::database::PvDatabase;
-        use epics_base_rs::server::records::ai::AiRecord;
-        use epics_pva_rs::pvdata::{PvField, ScalarValue};
-        use epics_pva_rs::server_native::ChannelSource;
-
-        let db = Arc::new(PvDatabase::new());
-        db.add_record("RPC:AI", Box::new(AiRecord::new(2.5)))
-            .await
-            .unwrap();
-        let provider = Arc::new(BridgeProvider::new(db));
-        let store = QsrvPvStore::new(provider);
-
-        let (desc, value) = store
-            .rpc("RPC:AI", FieldDesc::Variant, PvField::Null)
-            .await
-            .expect("RPC on a QSRV record must succeed");
-
-        assert!(
-            matches!(desc, FieldDesc::Structure { .. }),
-            "RPC response descriptor must be the record's NT structure"
-        );
-        let s = match value {
-            PvField::Structure(s) => s,
-            other => panic!("RPC response must be a structure, got {other}"),
-        };
-        match s.get_field("value") {
-            Some(PvField::Scalar(ScalarValue::Double(v))) => {
-                assert_eq!(*v, 2.5, "RPC must read back the record's current value")
-            }
-            other => panic!("expected scalar value field, got {other:?}"),
-        }
-    }
-
-    /// B1: an RPC carrying NTURI query arguments writes them into the
-    /// record before reading back — process-and-read, pvxs `pvxcall`
-    /// style. `pvcall RPC:AO value=7.0` must leave the record at 7.0.
-    #[tokio::test]
-    async fn rpc_on_qsrv_record_with_query_args_writes_then_reads() {
+    async fn rpc_on_qsrv_record_is_rejected_and_leaves_value_unchanged() {
         use epics_base_rs::server::database::PvDatabase;
         use epics_base_rs::server::records::ao::AoRecord;
         use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
@@ -1580,120 +1469,61 @@ mod tests {
         let provider = Arc::new(BridgeProvider::new(db));
         let store = QsrvPvStore::new(provider);
 
-        // Build an NTURI request: query.value = 7.0.
+        // Parameterless RPC: rejected (pvxs has no RPC-as-GET for records).
+        let err = store
+            .rpc("RPC:AO", FieldDesc::Variant, PvField::Null)
+            .await
+            .expect_err("parameterless RPC on a QSRV record must be rejected");
+        assert!(
+            err.message.contains("RPC not supported"),
+            "expected unsupported-RPC error, got: {err}"
+        );
+
+        // RPC carrying a write must be rejected AND must not mutate.
         let mut query = PvStructure::new("");
         query
             .fields
             .push(("value".into(), PvField::Scalar(ScalarValue::Double(7.0))));
         let mut nturi = PvStructure::new("epics:nt/NTURI:1.0");
-        nturi.fields.push((
-            "scheme".into(),
-            PvField::Scalar(ScalarValue::String("pva".into())),
-        ));
-        nturi.fields.push((
-            "path".into(),
-            PvField::Scalar(ScalarValue::String("RPC:AO".into())),
-        ));
         nturi
             .fields
             .push(("query".into(), PvField::Structure(query)));
-
         let request = PvField::Structure(nturi);
-        let (_desc, value) = store
+        let err = store
             .rpc("RPC:AO", request.descriptor(), request)
             .await
-            .expect("RPC with query args must succeed");
+            .expect_err("RPC write-through on a QSRV record must be rejected");
+        assert!(
+            err.message.contains("RPC not supported"),
+            "expected unsupported-RPC error, got: {err}"
+        );
 
-        let s = match value {
-            PvField::Structure(s) => s,
-            other => panic!("RPC response must be a structure, got {other}"),
+        // The record value is untouched: RPC never wrote.
+        let value = store
+            .get_value("RPC:AO")
+            .await
+            .expect("record GET must return a value");
+        let PvField::Structure(s) = value else {
+            panic!("expected NTScalar structure");
         };
-        match s.get_field("value") {
-            Some(PvField::Scalar(ScalarValue::Double(v))) => {
-                assert_eq!(
-                    *v, 7.0,
-                    "RPC query arg must have been written to the record"
-                )
-            }
-            other => panic!("expected scalar value field, got {other:?}"),
-        }
-    }
-
-    /// B1: RPC against an unknown PV is a clean error, not a panic.
-    #[tokio::test]
-    async fn rpc_on_unknown_pv_errors() {
-        use epics_base_rs::server::database::PvDatabase;
-        use epics_pva_rs::server_native::ChannelSource;
-
-        let db = Arc::new(PvDatabase::new());
-        let provider = Arc::new(BridgeProvider::new(db));
-        let store = QsrvPvStore::new(provider);
-
-        let err = store
-            .rpc("NOPE:NOPV", FieldDesc::Variant, PvField::Null)
-            .await
-            .expect_err("RPC on a missing PV must error");
-        assert!(
-            err.message.contains("PV not found"),
-            "error must name the missing PV: {err}"
+        assert_eq!(
+            s.get_field("value"),
+            Some(&PvField::Scalar(ScalarValue::Double(0.0))),
+            "rejected RPC must not have written the record"
         );
     }
 
-    /// B1: an RPC query field named anything other than `value` on a
-    /// single-record channel must be rejected — `pv_structure_to_epics`
-    /// only extracts `value`, so a stray field name would otherwise be
-    /// silently dropped (a no-op put). The caller deserves a clear
-    /// error naming the offending field.
+    /// pvxs installs no `onRPC` for QSRV group PVs
+    /// (groupsource.cpp:108-130); RPC against a group is rejected, so a
+    /// member cannot be written through `pvcall GRP member=...`.
     #[tokio::test]
-    async fn rpc_single_record_rejects_non_value_query_field() {
-        use epics_base_rs::server::database::PvDatabase;
-        use epics_base_rs::server::records::ao::AoRecord;
-        use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
-        use epics_pva_rs::server_native::ChannelSource;
-
-        let db = Arc::new(PvDatabase::new());
-        db.add_record("RPC:AO2", Box::new(AoRecord::new(0.0)))
-            .await
-            .unwrap();
-        let provider = Arc::new(BridgeProvider::new(db));
-        let store = QsrvPvStore::new(provider);
-
-        // NTURI with query.freq=1.0 — `freq` is not a record field.
-        let mut query = PvStructure::new("");
-        query
-            .fields
-            .push(("freq".into(), PvField::Scalar(ScalarValue::Double(1.0))));
-        let mut nturi = PvStructure::new("epics:nt/NTURI:1.0");
-        nturi
-            .fields
-            .push(("query".into(), PvField::Structure(query)));
-        let request = PvField::Structure(nturi);
-
-        let err = store
-            .rpc("RPC:AO2", request.descriptor(), request)
-            .await
-            .expect_err("non-`value` query field must be rejected");
-        assert!(
-            err.message.contains("freq") && err.message.contains("value"),
-            "error must name the bad field and the accepted one: {err}"
-        );
-    }
-
-    /// B1: an RPC against a group PV accepts member field names as
-    /// query arguments (the `Single`-only `value` restriction must not
-    /// fire for `AnyChannel::Group`). `pvcall GRP level=.. count=..`
-    /// writes both members and reads the group back.
-    #[tokio::test]
-    async fn rpc_on_group_pv_writes_members() {
+    async fn rpc_on_qsrv_group_is_rejected_and_leaves_members_unchanged() {
         use epics_base_rs::server::database::PvDatabase;
         use epics_base_rs::server::records::ai::AiRecord;
         use epics_base_rs::server::records::longin::LonginRecord;
         use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
         use epics_pva_rs::server_native::ChannelSource;
 
-        // members must declare `+putorder` to be writable
-        // through group PUT/RPC. Without it pvxs (and now Rust)
-        // skip the write silently with a warning.
         const GROUP_JSON: &str = r#"{
             "RPC:GRP": {
                 "+id": "epics:nt/NTGroup:1.0",
@@ -1715,7 +1545,6 @@ mod tests {
         provider.process_groups();
         let store = QsrvPvStore::new(provider);
 
-        // NTURI: query.level=9.0, query.count=8 — both are member paths.
         let mut query = PvStructure::new("");
         query
             .fields
@@ -1729,24 +1558,32 @@ mod tests {
             .push(("query".into(), PvField::Structure(query)));
         let request = PvField::Structure(nturi);
 
-        let (_desc, value) = store
+        let err = store
             .rpc("RPC:GRP", request.descriptor(), request)
             .await
-            .expect("RPC on a group PV must accept member query fields");
+            .expect_err("RPC on a QSRV group must be rejected");
+        assert!(
+            err.message.contains("RPC not supported"),
+            "expected unsupported-RPC error, got: {err}"
+        );
 
-        let s = match value {
-            PvField::Structure(s) => s,
-            other => panic!("group RPC response must be a structure, got {other}"),
+        // Members untouched: the rejected RPC wrote nothing.
+        let value = store
+            .get_value("RPC:GRP")
+            .await
+            .expect("group GET must return a value");
+        let PvField::Structure(s) = value else {
+            panic!("expected group structure");
         };
         assert_eq!(
             s.get_field("level"),
-            Some(&PvField::Scalar(ScalarValue::Double(9.0))),
-            "group member `level` must reflect the RPC write"
+            Some(&PvField::Scalar(ScalarValue::Double(1.0))),
+            "rejected group RPC must not have written member `level`"
         );
         match s.get_field("count") {
-            Some(PvField::Scalar(ScalarValue::Long(v))) => assert_eq!(*v, 8),
-            Some(PvField::Scalar(ScalarValue::Int(v))) => assert_eq!(*v as i64, 8),
-            other => panic!("group member `count` mismatch: {other:?}"),
+            Some(PvField::Scalar(ScalarValue::Long(v))) => assert_eq!(*v, 2),
+            Some(PvField::Scalar(ScalarValue::Int(v))) => assert_eq!(*v as i64, 2),
+            other => panic!("group member `count` changed or missing: {other:?}"),
         }
     }
 
@@ -2186,6 +2023,207 @@ mod tests {
             "member b TIME must NOT advance: process=false in the INIT \
              pvRequest must suppress member processing (got {b_before:?} \
              -> {b_after:?})"
+        );
+    }
+
+    /// Partial group PUT must write/process only the marked member.
+    /// The generic `put_delta_checked` default reads the full group and
+    /// overlays marked leaves, so every putorder member ends up present
+    /// in the merged structure and gets written/processed. The override
+    /// prunes the delta to the marked members (pvxs
+    /// groupsource.cpp:547-567 writes only marked members). Discriminator:
+    /// a member record's `common.time` advances only when processed.
+    #[tokio::test]
+    async fn bridge_rs_120_partial_group_put_writes_only_marked_member() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::longin::LonginRecord;
+        use epics_pva_rs::proto::BitSet;
+        use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+        use epics_pva_rs::server_native::ChannelSource;
+        use epics_pva_rs::server_native::source::{AccessGate, ChannelContext};
+
+        const GROUP_JSON: &str = r#"{
+            "BR120:grp": {
+                "+atomic": false,
+                "a": { "+channel": "BR120:a.VAL", "+type": "plain", "+putorder": 0 },
+                "b": { "+channel": "BR120:b.VAL", "+type": "plain", "+putorder": 1 }
+            }
+        }"#;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("BR120:a", Box::new(LonginRecord::new(0)))
+            .await
+            .unwrap();
+        db.add_record("BR120:b", Box::new(LonginRecord::new(0)))
+            .await
+            .unwrap();
+        let provider = Arc::new(BridgeProvider::new(db.clone()));
+        provider.load_group_config(GROUP_JSON).expect("load group");
+        let store = QsrvPvStore::new(provider);
+
+        let member_time = |db: Arc<PvDatabase>, rec: &'static str| async move {
+            let rec = db.get_record(rec).await.unwrap();
+            let inst = rec.read().await;
+            inst.common.time
+        };
+        let a_before = member_time(db.clone(), "BR120:a").await;
+        let b_before = member_time(db.clone(), "BR120:b").await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Group value descriptor: depth-first bits root=0, a=1, b=2.
+        let desc = FieldDesc::Structure {
+            struct_id: "structure".into(),
+            fields: vec![
+                ("a".into(), FieldDesc::Scalar(ScalarType::Long)),
+                ("b".into(), FieldDesc::Scalar(ScalarType::Long)),
+            ],
+        };
+        // Mark ONLY member a; b carries its unmarked type default.
+        let mut changed = BitSet::new();
+        changed.set(1);
+        let mut delta = PvStructure::new("structure");
+        delta
+            .fields
+            .push(("a".into(), PvField::Scalar(ScalarValue::Long(11))));
+        delta
+            .fields
+            .push(("b".into(), PvField::Scalar(ScalarValue::Long(0))));
+
+        let ctx = ChannelContext {
+            peer: "127.0.0.1:5075".parse().unwrap(),
+            account: "anonymous".into(),
+            method: "anonymous".into(),
+            host: "127.0.0.1".into(),
+            authority: String::new(),
+            roles: Vec::new(),
+            pv_request: None,
+        };
+        let checked = AccessGate::open()
+            .check("BR120:grp", "127.0.0.1", "anonymous", "anonymous", "")
+            .await;
+
+        store
+            .put_delta_checked(checked, desc, changed, PvField::Structure(delta), ctx)
+            .await
+            .expect("partial group PUT must succeed");
+
+        let a_val = {
+            let rec = db.get_record("BR120:a").await.unwrap();
+            let inst = rec.read().await;
+            inst.snapshot_for_field("VAL").map(|s| s.value)
+        };
+        assert!(
+            matches!(a_val, Some(epics_base_rs::types::EpicsValue::Long(11))),
+            "marked member a must be written to 11, got {a_val:?}"
+        );
+        let a_after = member_time(db.clone(), "BR120:a").await;
+        assert_ne!(
+            a_after, a_before,
+            "marked member a must be processed (time advances)"
+        );
+
+        // Pre-fix the merge made b present, so every member was written
+        // and processed; post-fix b is unmarked and must be untouched.
+        let b_val = {
+            let rec = db.get_record("BR120:b").await.unwrap();
+            let inst = rec.read().await;
+            inst.snapshot_for_field("VAL").map(|s| s.value)
+        };
+        assert!(
+            matches!(b_val, Some(epics_base_rs::types::EpicsValue::Long(0))),
+            "unmarked member b must stay 0, got {b_val:?}"
+        );
+        let b_after = member_time(db.clone(), "BR120:b").await;
+        assert_eq!(
+            b_after, b_before,
+            "unmarked member b must NOT be processed (time unchanged)"
+        );
+    }
+
+    /// An empty changed BitSet (nothing marked) must write/process no
+    /// member — "No fields changed" follows the BitSet. Pre-fix the
+    /// read-merge-write default made every member present in the merged
+    /// value and processed them all.
+    #[tokio::test]
+    async fn bridge_rs_120_empty_bitset_group_put_writes_nothing() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::longin::LonginRecord;
+        use epics_pva_rs::proto::BitSet;
+        use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+        use epics_pva_rs::server_native::ChannelSource;
+        use epics_pva_rs::server_native::source::{AccessGate, ChannelContext};
+
+        const GROUP_JSON: &str = r#"{
+            "BR120E:grp": {
+                "+atomic": false,
+                "a": { "+channel": "BR120E:a.VAL", "+type": "plain", "+putorder": 0 },
+                "b": { "+channel": "BR120E:b.VAL", "+type": "plain", "+putorder": 1 }
+            }
+        }"#;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("BR120E:a", Box::new(LonginRecord::new(0)))
+            .await
+            .unwrap();
+        db.add_record("BR120E:b", Box::new(LonginRecord::new(0)))
+            .await
+            .unwrap();
+        let provider = Arc::new(BridgeProvider::new(db.clone()));
+        provider.load_group_config(GROUP_JSON).expect("load group");
+        let store = QsrvPvStore::new(provider);
+
+        let member_time = |db: Arc<PvDatabase>, rec: &'static str| async move {
+            let rec = db.get_record(rec).await.unwrap();
+            let inst = rec.read().await;
+            inst.common.time
+        };
+        let a_before = member_time(db.clone(), "BR120E:a").await;
+        let b_before = member_time(db.clone(), "BR120E:b").await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let desc = FieldDesc::Structure {
+            struct_id: "structure".into(),
+            fields: vec![
+                ("a".into(), FieldDesc::Scalar(ScalarType::Long)),
+                ("b".into(), FieldDesc::Scalar(ScalarType::Long)),
+            ],
+        };
+        let changed = BitSet::new(); // nothing marked
+        let mut delta = PvStructure::new("structure");
+        delta
+            .fields
+            .push(("a".into(), PvField::Scalar(ScalarValue::Long(0))));
+        delta
+            .fields
+            .push(("b".into(), PvField::Scalar(ScalarValue::Long(0))));
+
+        let ctx = ChannelContext {
+            peer: "127.0.0.1:5075".parse().unwrap(),
+            account: "anonymous".into(),
+            method: "anonymous".into(),
+            host: "127.0.0.1".into(),
+            authority: String::new(),
+            roles: Vec::new(),
+            pv_request: None,
+        };
+        let checked = AccessGate::open()
+            .check("BR120E:grp", "127.0.0.1", "anonymous", "anonymous", "")
+            .await;
+
+        store
+            .put_delta_checked(checked, desc, changed, PvField::Structure(delta), ctx)
+            .await
+            .expect("empty-marked group PUT is a silent no-op");
+
+        assert_eq!(
+            member_time(db.clone(), "BR120E:a").await,
+            a_before,
+            "member a must not be processed when nothing is marked"
+        );
+        assert_eq!(
+            member_time(db.clone(), "BR120E:b").await,
+            b_before,
+            "member b must not be processed when nothing is marked"
         );
     }
 }

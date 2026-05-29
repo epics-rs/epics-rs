@@ -15,9 +15,17 @@
 //!   the `preserve_order` feature is off — pvxs callers should use
 //!   one filter per chain entry in the literal order they want).
 //!
-//! Unrecognised filter names are silently skipped with a tracing
-//! warning so a forward-compatible client that emits a `sync` filter
-//! today doesn't error out the whole subscription.
+//! Two parse entry points with different contracts:
+//!
+//! * [`try_parse_filter_chain`] is the channel-creation contract — it
+//!   mirrors EPICS `dbChannelCreate()` and returns a
+//!   [`FilterParseError`] (so the caller rejects the channel) on
+//!   malformed JSON, a non-object body, an unknown filter name, or a
+//!   filter whose configuration its own parser rejects.
+//! * [`parse_filter_chain`] is the permissive forward-compatibility
+//!   path retained for the CA server: it downgrades an unparseable
+//!   suffix to an unfiltered subscription, skipping bad entries with a
+//!   `tracing::warn!`.
 
 use std::sync::Arc;
 
@@ -78,14 +86,166 @@ pub fn split_channel_name(raw: &str) -> ParsedChannelName {
     }
 }
 
-/// Parse the JSON suffix into a [`FilterChain`]. Returns an empty
-/// chain on parse failure (invalid JSON, unknown filter keys, etc.)
-/// — the caller's subscription proceeds with no filter rather than
-/// failing outright. Per-filter parse failures inside a valid
-/// object are logged via `tracing::warn!` and skipped.
+/// Error returned by [`try_parse_filter_chain`] when a channel-filter
+/// suffix is syntactically present but cannot be turned into the
+/// requested chain.
+///
+/// EPICS base `dbChannelCreate()` aborts channel creation whenever its
+/// filter parser reports a status (`dbChannel.c:512-529`): a malformed
+/// body, an unknown filter name (`parse_stop` → `S_db_notFound`,
+/// `dbChannel.c:176-182`), or a filter whose own parser rejects its
+/// configuration (`chf_value` turns `parse_end` failure into
+/// `parse_stop`, `dbChannel.c:72-85`). This type names which of those
+/// hard failures occurred so the channel-creation boundary can reject
+/// rather than silently downgrade to an unfiltered stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilterParseError {
+    /// The suffix was not valid JSON (after JSON5 key normalization).
+    InvalidJson { suffix: String, message: String },
+    /// The suffix parsed but its top-level value is not an object.
+    NotObject { suffix: String },
+    /// A requested filter name is not implemented (EPICS `parse_stop`
+    /// → `S_db_notFound`).
+    UnknownFilter { name: String },
+    /// A known filter rejected its configuration body (EPICS
+    /// `chf_value` / `parse_end` failure → `parse_stop`).
+    BadConfig { name: String, config: String },
+}
+
+impl std::fmt::Display for FilterParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidJson { suffix, message } => {
+                write!(f, "invalid channel-filter JSON `{suffix}`: {message}")
+            }
+            Self::NotObject { suffix } => {
+                write!(f, "channel-filter body `{suffix}` is not a JSON object")
+            }
+            Self::UnknownFilter { name } => write!(f, "unknown channel filter `{name}`"),
+            Self::BadConfig { name, config } => {
+                write!(
+                    f,
+                    "channel filter `{name}` rejected its configuration `{config}`"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for FilterParseError {}
+
+/// Rewrite the documented EPICS JSON5 channel-filter forms into the
+/// strict JSON that `serde_json` accepts.
+///
+/// EPICS base parses filter suffixes with a JSON5-capable yajl, and its
+/// own documentation and shipped examples use unquoted object keys,
+/// e.g. `{"arr":{s:2,i:2,e:8}}` (`filters.dbd.pod:73-99, 415-419`). The
+/// only JSON5 extension the documented filter grammar relies on is
+/// unquoted identifier keys, so this quotes bareword keys — an
+/// identifier token in key position (the next non-whitespace char is
+/// `:`) that is not already quoted — and leaves string contents,
+/// numbers, and bareword values (`true` / `false` / `null`) untouched.
+/// Already-strict JSON round-trips unchanged.
+fn json5_filter_to_json(src: &str) -> String {
+    let mut out = String::with_capacity(src.len() + 16);
+    let mut chars = src.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                // Copy a string literal verbatim, honouring `\`-escapes
+                // so an embedded `"` or `:` is never mistaken for
+                // structure.
+                out.push('"');
+                while let Some(sc) = chars.next() {
+                    out.push(sc);
+                    if sc == '\\' {
+                        if let Some(esc) = chars.next() {
+                            out.push(esc);
+                        }
+                    } else if sc == '"' {
+                        break;
+                    }
+                }
+            }
+            c if c.is_ascii_alphabetic() || c == '_' || c == '$' => {
+                let mut word = String::new();
+                word.push(c);
+                while let Some(&pc) = chars.peek() {
+                    if pc.is_ascii_alphanumeric() || pc == '_' || pc == '$' {
+                        word.push(pc);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                // Buffer trailing whitespace so a `key :` form still
+                // resolves as a key without dropping the spacing.
+                let mut ws = String::new();
+                while let Some(&pc) = chars.peek() {
+                    if pc.is_whitespace() {
+                        ws.push(pc);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if chars.peek() == Some(&':') {
+                    out.push('"');
+                    out.push_str(&word);
+                    out.push('"');
+                } else {
+                    out.push_str(&word);
+                }
+                out.push_str(&ws);
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Parse the JSON suffix into a [`FilterChain`], rejecting any
+/// syntactically-present-but-unparseable filter request.
+///
+/// This is the channel-creation contract: it mirrors EPICS base
+/// `dbChannelCreate()` / `chf_parse()`, which abort channel creation on
+/// malformed JSON, a non-object body, an unknown filter name, or a
+/// filter whose own parser rejects its configuration. An empty object
+/// (`{}`) is a valid no-filter request and yields an empty chain. The
+/// documented JSON5 unquoted-key forms are accepted via
+/// [`json5_filter_to_json`].
+pub fn try_parse_filter_chain(json: &str) -> Result<FilterChain, FilterParseError> {
+    let normalized = json5_filter_to_json(json);
+    let value: serde_json::Value =
+        serde_json::from_str(&normalized).map_err(|e| FilterParseError::InvalidJson {
+            suffix: json.to_string(),
+            message: e.to_string(),
+        })?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| FilterParseError::NotObject {
+            suffix: json.to_string(),
+        })?;
+    let mut chain = FilterChain::new();
+    for (key, cfg) in obj {
+        chain.push(build_filter(key, cfg)?);
+    }
+    Ok(chain)
+}
+
+/// Permissive parse retained for the CA-server forward-compatibility
+/// path (`epics-ca-rs` server `tcp.rs`), which historically downgrades
+/// an unparseable suffix to an unfiltered subscription rather than
+/// failing the request. Returns an empty chain on JSON / non-object
+/// failure and skips individual unparseable entries with a
+/// `tracing::warn!`. New channel-creation boundaries must use
+/// [`try_parse_filter_chain`] so a bad suffix rejects the channel
+/// (EPICS `dbChannelCreate` parity) instead of silently changing the
+/// requested semantics. JSON5 unquoted keys are accepted here too.
 pub fn parse_filter_chain(json: &str) -> FilterChain {
     let mut chain = FilterChain::new();
-    let value: serde_json::Value = match serde_json::from_str(json) {
+    let normalized = json5_filter_to_json(json);
+    let value: serde_json::Value = match serde_json::from_str(&normalized) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(
@@ -102,28 +262,38 @@ pub fn parse_filter_chain(json: &str) -> FilterChain {
     };
     for (key, cfg) in obj {
         match build_filter(key, cfg) {
-            Some(filt) => chain.push(filt),
-            None => {
-                tracing::warn!(
-                    filter = %key,
-                    config = %cfg,
-                    "unrecognised channel filter; skipped",
-                );
+            Ok(filt) => chain.push(filt),
+            Err(e) => {
+                tracing::warn!(error = %e, "channel filter skipped");
             }
         }
     }
     chain
 }
 
-fn build_filter(name: &str, cfg: &serde_json::Value) -> Option<Arc<dyn SubscriptionFilter>> {
-    match name {
+/// Build one filter from its name + config, distinguishing an unknown
+/// filter name from a known filter whose configuration is rejected so
+/// the strict path can mirror EPICS `S_db_notFound` vs `parse_stop`.
+fn build_filter(
+    name: &str,
+    cfg: &serde_json::Value,
+) -> Result<Arc<dyn SubscriptionFilter>, FilterParseError> {
+    let built = match name {
         "dbnd" => build_dbnd(cfg),
         "arr" => build_arr(cfg),
         "ts" => build_ts(cfg),
         "dec" => build_decimate(cfg),
         "sync" => build_sync(cfg),
-        _ => None,
-    }
+        _ => {
+            return Err(FilterParseError::UnknownFilter {
+                name: name.to_string(),
+            });
+        }
+    };
+    built.ok_or_else(|| FilterParseError::BadConfig {
+        name: name.to_string(),
+        config: cfg.to_string(),
+    })
 }
 
 /// C `ts.c` JSON schema:
@@ -418,5 +588,87 @@ mod tests {
     fn empty_object_yields_empty_chain() {
         let chain = parse_filter_chain("{}");
         assert!(chain.is_empty());
+    }
+
+    // ---- try_parse_filter_chain: dbChannelCreate-parity reject contract ----
+
+    #[test]
+    fn try_parse_rejects_malformed_json() {
+        let err = try_parse_filter_chain("{not json").unwrap_err();
+        assert!(matches!(err, FilterParseError::InvalidJson { .. }));
+    }
+
+    #[test]
+    fn try_parse_rejects_non_object_body() {
+        let err = try_parse_filter_chain("[1,2,3]").unwrap_err();
+        assert!(matches!(err, FilterParseError::NotObject { .. }));
+    }
+
+    #[test]
+    fn try_parse_rejects_unknown_filter() {
+        // EPICS `dbChannel.c:176-182` `parse_stop` → `S_db_notFound`.
+        let err = try_parse_filter_chain(r#"{"no_such":{}}"#).unwrap_err();
+        assert!(matches!(err, FilterParseError::UnknownFilter { .. }));
+    }
+
+    #[test]
+    fn try_parse_rejects_bad_dec_config() {
+        // `dec` without `n` is a configuration the filter parser rejects
+        // (EPICS `chf_value` / `parse_end` failure → `parse_stop`).
+        let err = try_parse_filter_chain(r#"{"dec":{}}"#).unwrap_err();
+        assert!(matches!(err, FilterParseError::BadConfig { .. }));
+    }
+
+    #[test]
+    fn try_parse_empty_object_is_valid_empty_chain() {
+        // `{}` is a valid no-filter request, not a parse failure.
+        let chain = try_parse_filter_chain("{}").expect("empty object is valid");
+        assert!(chain.is_empty());
+    }
+
+    #[test]
+    fn try_parse_accepts_documented_json5_unquoted_keys() {
+        // `filters.dbd.pod:415-419` ships `{"arr":{s:2,i:2,e:8}}`.
+        let chain = try_parse_filter_chain(r#"{"arr":{s:2,i:2,e:8}}"#)
+            .expect("documented JSON5 array filter must parse");
+        let names: Vec<&'static str> = chain.iter().map(|f| f.name()).collect();
+        assert_eq!(names, vec!["arr"]);
+    }
+
+    #[test]
+    fn try_parse_accepts_fully_unquoted_keys() {
+        let chain = try_parse_filter_chain(r#"{dbnd:{d:0.5}}"#)
+            .expect("unquoted filter + parameter keys must parse");
+        assert_eq!(chain.len(), 1);
+    }
+
+    #[test]
+    fn try_parse_chained_filters_preserve_order() {
+        let chain = try_parse_filter_chain(r#"{"dec":{"n":2},"dbnd":{"d":0.1},"ts":{}}"#).unwrap();
+        let names: Vec<&'static str> = chain.iter().map(|f| f.name()).collect();
+        assert_eq!(names, vec!["dec", "dbnd", "ts"]);
+    }
+
+    #[test]
+    fn try_parse_rejects_chain_with_one_unknown_entry() {
+        // A mixed chain with one unknown filter is a hard reject of the
+        // whole channel — matching `dbChannelCreate` aborting on the
+        // first `parse_stop`, not a silently-reduced chain.
+        let err = try_parse_filter_chain(r#"{"dbnd":{"d":0.1},"no_such":{}}"#).unwrap_err();
+        assert!(matches!(err, FilterParseError::UnknownFilter { .. }));
+    }
+
+    #[test]
+    fn json5_normalizer_leaves_quoted_json_untouched() {
+        let strict = r#"{"arr":{"s":2,"i":2,"e":8}}"#;
+        assert_eq!(json5_filter_to_json(strict), strict);
+    }
+
+    #[test]
+    fn json5_normalizer_does_not_quote_string_values() {
+        // Only bareword KEYS are quoted; quoted string values (and the
+        // `:` inside them) are preserved verbatim.
+        let src = r#"{"sync":{"m":"after","s":"SYS:TRIG"}}"#;
+        assert_eq!(json5_filter_to_json(src), src);
     }
 }

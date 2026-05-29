@@ -998,6 +998,28 @@ impl GroupChannel {
         ordered.sort_by_key(|(_, po)| *po);
         let ordered: Vec<&GroupMember> = ordered.into_iter().map(|(m, _)| m).collect();
 
+        // A member participates in *this* PUT iff it is a proc hook
+        // (runs on every group PUT, allowProc — pvxs
+        // groupsource.cpp:547-573) or a value member whose field is
+        // present in the incoming value. On the native PVA path the
+        // value is pruned to the client's marked members (presence ==
+        // marked), so this mirrors pvxs writing only marked members
+        // (`marked = leafNode.isMarked(true,true) && field.value`,
+        // groupsource.cpp:547-567). An absent (unmarked) value member
+        // must not be link-rejected, access-checked, or written — the
+        // up-front per-member pre-checks otherwise let an unmarked,
+        // unwritable, or link-targeting member reject a partial PUT to
+        // an unrelated marked member. Whole-value callers (in-process
+        // put()) supply every member, so all stay active — same rule,
+        // no special case.
+        let member_is_active = |m: &GroupMember| -> bool {
+            match m.mapping {
+                FieldMapping::Proc => true,
+                FieldMapping::Structure | FieldMapping::Const => false,
+                _ => get_nested_field(value, &m.field_name).is_some(),
+            }
+        };
+
         // pvxs's `groupsource.cpp:548` rejects group PUT
         // preparation for `DBF_INLINK..DBF_FWDLINK` fields —
         // writing into a record's link field via group PUT is
@@ -1005,8 +1027,13 @@ impl GroupChannel {
         // value state) and was a wire compatibility gap. EPICS
         // link fields have well-known names (FLNK, DOL, INP,
         // INP*, OUT, OUT*, SDIS). Reject any member whose target
-        // field is in that set before any write fires.
+        // field is in that set before any write fires — but only for
+        // members this PUT actually acts on, so an unmarked
+        // link-targeting member cannot reject a partial PUT.
         for m in &ordered {
+            if !member_is_active(m) {
+                continue;
+            }
             if member_targets_link_field(&m.channel) {
                 return Err(BridgeError::PutRejected(format!(
                     "group {} PUT: member '{}' targets link field '{}' \
@@ -1023,8 +1050,14 @@ impl GroupChannel {
         // backing dbChannel under the caller's identity (already
         // captured in `self.access`). A single denial fails the whole
         // PUT — matching pvxs's "any member denied → operation
-        // rejected" remote-error behavior.
+        // rejected" remote-error behavior. Only members this PUT acts
+        // on are checked: pvxs builds the SecurityClient over the
+        // changed fields, so an unmarked, unwritable member must not
+        // reject a partial PUT to an unrelated marked one.
         for m in &ordered {
+            if !member_is_active(m) {
+                continue;
+            }
             if m.channel.is_empty() {
                 // Structure / Const members have no backing channel
                 // to security-check; pvxs skips these in the
@@ -3090,5 +3123,83 @@ mod tests {
             }
             other => panic!("unexpected member values: {other:?}"),
         }
+    }
+
+    /// A partial group PUT must not access-check unmarked members. pvxs
+    /// builds the per-field SecurityClient over the *changed* fields
+    /// (groupsource.cpp:161,515,547-567), so an unwritable member that
+    /// the client did not mark cannot reject a PUT to an unrelated
+    /// marked member. Whole-value callers still check every member.
+    #[tokio::test]
+    async fn br120_partial_put_skips_access_check_for_unmarked_member() {
+        use super::super::provider::{AccessContext, AccessControl};
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_pva_rs::pvdata::ScalarValue;
+
+        // Deny writes to member b's backing channel only.
+        struct DenyChannel(&'static str);
+        impl AccessControl for DenyChannel {
+            fn can_write(&self, channel: &str, _user: &str, _host: &str) -> bool {
+                channel != self.0
+            }
+        }
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("PA:rec", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        db.add_record("PB:rec", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        let cfg = r#"{
+            "DENY:GRP": {
+                "+atomic": false,
+                "a": {"+type":"plain","+channel":"PA:rec.VAL","+putorder":0},
+                "b": {"+type":"plain","+channel":"PB:rec.VAL","+putorder":1}
+            }
+        }"#;
+        let mut defs = super::super::group_config::parse_group_config(cfg).unwrap();
+        let def = defs.pop().unwrap();
+
+        let access = AccessContext::with_identity(
+            Arc::new(DenyChannel("PB:rec.VAL")),
+            "u".into(),
+            "h".into(),
+        );
+        let channel = GroupChannel::new(db.clone(), def).with_access(access);
+
+        // Partial PUT marking only `a` (b absent): b is unmarked, so its
+        // write-deny must not be checked and the PUT must succeed.
+        let mut partial = PvStructure::new("structure");
+        partial
+            .fields
+            .push(("a".into(), PvField::Scalar(ScalarValue::Double(5.0))));
+        channel
+            .put_with_options(
+                &partial,
+                super::super::channel::PutOptions::default(),
+                Some(false),
+            )
+            .await
+            .expect("partial PUT to writable a must not be blocked by unwritable unmarked b");
+
+        // Full PUT (both present): b is now acted on, so its write-deny
+        // rejects the whole PUT.
+        let mut full = PvStructure::new("structure");
+        full.fields
+            .push(("a".into(), PvField::Scalar(ScalarValue::Double(6.0))));
+        full.fields
+            .push(("b".into(), PvField::Scalar(ScalarValue::Double(7.0))));
+        let res = channel
+            .put_with_options(
+                &full,
+                super::super::channel::PutOptions::default(),
+                Some(false),
+            )
+            .await;
+        assert!(
+            matches!(res, Err(BridgeError::PutRejected(_))),
+            "full PUT including denied member b must be rejected, got {res:?}"
+        );
     }
 }

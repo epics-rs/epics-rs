@@ -352,9 +352,15 @@ impl BridgeChannel {
     /// `create_monitor` attaches it to the subscription.
     pub async fn new(db: Arc<PvDatabase>, name: &str) -> BridgeResult<Self> {
         let parsed = epics_base_rs::server::database::filters::split_channel_name(name);
+        // A syntactically-present filter suffix that cannot be parsed
+        // into the requested chain aborts channel creation, mirroring
+        // EPICS `dbChannelCreate()` (`dbChannel.c:512-529`). Fail-open
+        // to an unfiltered monitor would silently drop the requested
+        // throttling/slicing semantics.
         let monitor_filters = match parsed.json_suffix.as_deref() {
             Some(json) => std::sync::Arc::new(
-                epics_base_rs::server::database::filters::parse_filter_chain(json),
+                epics_base_rs::server::database::filters::try_parse_filter_chain(json)
+                    .map_err(|e| BridgeError::ChannelFilterError(e.to_string()))?,
             ),
             None => {
                 std::sync::Arc::new(epics_base_rs::server::database::filters::FilterChain::new())
@@ -875,5 +881,68 @@ mod tests {
     fn atomic_option_absent_returns_none() {
         let req = PvStructure::new("request");
         assert!(atomic_from_pv_request(&req).is_none());
+    }
+
+    // ---- channel-filter accept/reject parity with dbChannelCreate ----
+
+    async fn db_with_rec() -> Arc<PvDatabase> {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("REC", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        db
+    }
+
+    /// A documented JSON5 array filter (`filters.dbd.pod:415-419`,
+    /// unquoted parameter keys) is accepted — the channel is created
+    /// with the parsed filter chain rather than rejected.
+    #[tokio::test]
+    async fn channel_filter_accepts_documented_json5_arr() {
+        let db = db_with_rec().await;
+        let ch = BridgeChannel::new(db, r#"REC.{"arr":{s:2,i:2,e:8}}"#)
+            .await
+            .expect("documented JSON5 arr filter must create the channel");
+        assert_eq!(ch.monitor_filters.len(), 1);
+    }
+
+    /// An unknown filter name aborts channel creation, matching
+    /// `dbChannel.c:176-182` `parse_stop` → `S_db_notFound`.
+    #[tokio::test]
+    async fn channel_filter_rejects_unknown_filter() {
+        // `BridgeChannel` is not `Debug`, so match the `Result` rather
+        // than `expect_err` (which would require `Ok: Debug`).
+        let db = db_with_rec().await;
+        let res = BridgeChannel::new(db, r#"REC.{"no_such":{}}"#).await;
+        assert!(matches!(res, Err(BridgeError::ChannelFilterError(_))));
+    }
+
+    /// Malformed JSON aborts channel creation rather than failing open
+    /// to an unfiltered monitor (`dbChannel.c:512-529`).
+    #[tokio::test]
+    async fn channel_filter_rejects_malformed_json() {
+        let db = db_with_rec().await;
+        let res = BridgeChannel::new(db, r#"REC.{not json}"#).await;
+        assert!(matches!(res, Err(BridgeError::ChannelFilterError(_))));
+    }
+
+    /// An invalid `dec` body (missing required `n`) is a hard reject,
+    /// matching `chf_value` / `parse_end` failure → `parse_stop`.
+    #[tokio::test]
+    async fn channel_filter_rejects_invalid_dec_body() {
+        let db = db_with_rec().await;
+        let res = BridgeChannel::new(db, r#"REC.{"dec":{}}"#).await;
+        assert!(matches!(res, Err(BridgeError::ChannelFilterError(_))));
+    }
+
+    /// A plain (unfiltered) channel still creates with an empty chain —
+    /// the reject path must not regress the no-suffix common case.
+    #[tokio::test]
+    async fn channel_without_filter_suffix_still_creates() {
+        let db = db_with_rec().await;
+        let ch = BridgeChannel::new(db, "REC")
+            .await
+            .expect("unfiltered channel must create");
+        assert!(ch.monitor_filters.is_empty());
     }
 }

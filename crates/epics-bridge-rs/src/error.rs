@@ -23,6 +23,9 @@ pub enum BridgeError {
     #[error("group config parse error: {0}")]
     GroupConfigError(String),
 
+    #[error("channel filter parse error: {0}")]
+    ChannelFilterError(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }

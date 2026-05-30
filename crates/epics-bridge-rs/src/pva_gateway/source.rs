@@ -1592,7 +1592,14 @@ impl ChannelSource for GatewayChannelSource {
         // carries the `type_changed` boundary; forward it as the
         // seed's update stream so the server's decoded loop emits MONITOR
         // FINISH on an upstream descriptor change.
-        Some(epics_pva_rs::server_native::source::SubscriptionSeed { initial, updates })
+        // The gateway suspends its single upstream subscription per
+        // `(name, ctx)` cache layer via `notify_monitor_start`, not per
+        // downstream op, so no per-op `MonitorGate` here.
+        Some(epics_pva_rs::server_native::source::SubscriptionSeed {
+            initial,
+            updates,
+            on_start: None,
+        })
     }
 
     /// Raw-path counterpart of [`Self::subscribe_seeded`]. Same cached
@@ -1619,7 +1626,11 @@ impl ChannelSource for GatewayChannelSource {
                 ctx.pv_request.as_ref(),
             )
             .await?;
-        Some(epics_pva_rs::server_native::source::SubscriptionSeed { initial, updates })
+        Some(epics_pva_rs::server_native::source::SubscriptionSeed {
+            initial,
+            updates,
+            on_start: None,
+        })
     }
 
     /// expose pipeline-window watermark levels so the

@@ -722,7 +722,11 @@ pub trait ChannelSource: Send + Sync + 'static {
                 .subscribe_checked_opts_marked(checked.clone(), ctx.clone(), opts)
                 .await?;
             let initial = self.get_value_checked(checked, ctx).await;
-            Some(SubscriptionSeed { initial, updates })
+            Some(SubscriptionSeed {
+                initial,
+                updates,
+                on_start: None,
+            })
         }
     }
 
@@ -743,7 +747,11 @@ pub trait ChannelSource: Send + Sync + 'static {
                 .subscribe_raw_checked_opts(checked.clone(), ctx.clone(), opts)
                 .await?;
             let initial = self.get_value_checked(checked, ctx).await;
-            Some(SubscriptionSeed { initial, updates })
+            Some(SubscriptionSeed {
+                initial,
+                updates,
+                on_start: None,
+            })
         }
     }
 
@@ -1109,6 +1117,58 @@ pub struct SubscriptionSeed<T> {
     /// Post-seed update stream. By contract this MUST NOT repeat
     /// `initial`.
     pub updates: mpsc::Receiver<T>,
+    /// Optional per-op MONITOR START/STOP gate. When the source backs
+    /// this op with real upstream subscriptions it can no longer serve
+    /// while the client has the monitor *stopped* (QSRV's per-record
+    /// `DbSubscription`s), it returns a [`MonitorGate`] here. The wire
+    /// layer drives it on this op's Executing↔Idle edge (the same edge
+    /// that fires [`ChannelSource::notify_monitor_start`]) so the source
+    /// disables those subscriptions on STOP/PAUSE and re-enables on
+    /// START/RESUME — pvxs `MonitorControlOp::onStart` ⇒ `db_event_enable`
+    /// / `db_event_disable` parity (`singlesource.cpp:151`). `None` (the
+    /// default for sources that own no suspendable upstream — direct
+    /// records, the fanout gateway) leaves the stream ungated.
+    pub on_start: Option<MonitorGate>,
+}
+
+/// Per-op MONITOR START/STOP gate carried on a [`SubscriptionSeed`]. Wraps
+/// a type-erased async setter the source supplies (e.g. QSRV toggling its
+/// value+PROPERTY `DbSubscription`s); the wire layer's per-op edge owner
+/// invokes [`Self::set_active`] with `true` on START/RESUME and `false` on
+/// STOP/PAUSE. The setter is boxed (not a concrete handle) so this crate
+/// stays free of any backend/record dependency.
+#[derive(Clone)]
+pub struct MonitorGate {
+    set: Arc<
+        dyn Fn(bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            + Send
+            + Sync,
+    >,
+}
+
+impl MonitorGate {
+    /// Build a gate from an async setter. `set(true)` resumes / `set(false)`
+    /// suspends the source's backing event flow for this op.
+    pub fn new<F, Fut>(set: F) -> Self
+    where
+        F: Fn(bool) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        Self {
+            set: Arc::new(move |active| Box::pin(set(active))),
+        }
+    }
+
+    /// Drive the gate: `active == true` resumes, `false` suspends.
+    pub async fn set_active(&self, active: bool) {
+        (self.set)(active).await
+    }
+}
+
+impl std::fmt::Debug for MonitorGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MonitorGate").finish_non_exhaustive()
+    }
 }
 
 /// Type-erased handle so the server runtime can hold heterogeneous sources

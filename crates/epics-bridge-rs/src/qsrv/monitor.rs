@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::database::db_access::DbSubscription;
+use epics_base_rs::server::database::db_access::{DbSubscription, SubscriptionActivation};
 use epics_base_rs::server::recgbl::EventMask;
 use epics_pva_rs::pvdata::PvStructure;
 
@@ -124,6 +124,24 @@ impl BridgeMonitor {
     /// Get the number of overflow events (events lost due to queue full).
     pub fn overflow_count(&self) -> u64 {
         self.overflow_count.load(Ordering::Relaxed)
+    }
+
+    /// Detachable enable/disable handles for this monitor's backing
+    /// subscriptions — the value (VALUE|ALARM) and PROPERTY `dbChannel`s
+    /// pvxs QSRV opens per single-record monitor. Used by the per-op
+    /// MONITOR START/STOP gate: on a client STOP the gate
+    /// calls `set_active(false)` on each, the in-process equivalent of
+    /// pvxs `onStart(false)` ⇒ `db_event_disable` on both `dbChannel`s.
+    /// Valid after [`PvaMonitor::start`]; empty before.
+    pub fn activation_handles(&self) -> Vec<SubscriptionActivation> {
+        let mut handles = Vec::new();
+        if let Some(sub) = &self.subscription {
+            handles.push(sub.activation_handle());
+        }
+        if let Some(sub) = &self.property_subscription {
+            handles.push(sub.activation_handle());
+        }
+        handles
     }
 }
 

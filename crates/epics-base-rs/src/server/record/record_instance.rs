@@ -2057,6 +2057,11 @@ impl RecordInstance {
                 // Build a full snapshot once per field (with display metadata)
                 let mon_snap = self.make_monitor_snapshot(value.clone());
                 for sub in subs {
+                    // Paused subscriber (`db_event_disable`): suppress at
+                    // the source — no delivery, no coalesce.
+                    if !sub.active {
+                        continue;
+                    }
                     let sub_mask = EventMask::from_bits(sub.mask);
                     // Only send when posting mask intersects subscriber mask.
                     // Empty posting mask means nothing changed — skip.
@@ -2109,6 +2114,11 @@ impl RecordInstance {
             if let Some(value) = self.resolve_field(field) {
                 let mon_snap = self.make_monitor_snapshot(value);
                 for sub in subs {
+                    // Paused subscriber (`db_event_disable`): suppress at
+                    // the source — no delivery, no coalesce.
+                    if !sub.active {
+                        continue;
+                    }
                     let sub_mask = crate::server::recgbl::EventMask::from_bits(sub.mask);
                     if mask.is_empty() || sub_mask.intersects(mask) {
                         let event = MonitorEvent {
@@ -2188,6 +2198,7 @@ impl RecordInstance {
             tx,
             coalesced: std::sync::Arc::new(std::sync::Mutex::new(None)),
             filters: crate::server::database::filters::FilterChain::new(),
+            active: true,
         });
         // Initialize last_posted with current value so the first process cycle
         // doesn't treat it as "changed" (the initial value is already sent
@@ -2223,6 +2234,27 @@ impl RecordInstance {
     pub fn remove_subscriber(&mut self, sid: u32) {
         for subs in self.subscribers.values_mut() {
             subs.retain(|s| s.sid != sid);
+        }
+    }
+
+    /// Pause / resume one subscriber's event flow at the source
+    /// (`db_event_disable` / `db_event_enable`). `active == false`
+    /// suppresses every subsequent post to this subscriber AND drops any
+    /// pending coalesced overflow, so a resumed monitor restarts from the
+    /// source-side edge rather than replaying a value captured while it
+    /// was paused. No-op if no subscriber has this `sid`. The caller holds
+    /// the record write lock, so this is exclusive with the read-locked
+    /// post paths that consult `Subscriber::active`.
+    pub fn set_subscriber_active(&mut self, sid: u32, active: bool) {
+        for subs in self.subscribers.values_mut() {
+            for sub in subs.iter_mut() {
+                if sub.sid == sid {
+                    sub.active = active;
+                    if !active && let Ok(mut slot) = sub.coalesced.lock() {
+                        *slot = None;
+                    }
+                }
+            }
         }
     }
 

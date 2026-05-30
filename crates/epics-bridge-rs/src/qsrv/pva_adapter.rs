@@ -385,6 +385,32 @@ async fn open_monitor(
     Some(OpenedMonitor::Db(monitor))
 }
 
+/// Spawn the forward task that drains a started DB/group monitor's
+/// `poll()` into a cooked [`MonitorUpdate`] stream. Shared by
+/// `subscribe_checked_opts_marked` and the gated `subscribe_seeded` so the
+/// poll→update conversion lives once. The task ends (and `stop()`s the
+/// monitor, dropping its `DbSubscription`s) when the downstream receiver is
+/// dropped — i.e. when the PVA op tears down.
+fn spawn_db_monitor_updates(
+    mut monitor: super::group::AnyMonitor,
+) -> mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate> {
+    let (tx, rx) = mpsc::channel::<epics_pva_rs::server_native::MonitorUpdate>(64);
+    tokio::spawn(async move {
+        while let Some(poll) = monitor.poll().await {
+            let update = epics_pva_rs::server_native::MonitorUpdate {
+                value: PvField::Structure(poll.value),
+                marked: poll.marked,
+                type_changed: false,
+            };
+            if tx.send(update).await.is_err() {
+                break;
+            }
+        }
+        monitor.stop().await;
+    });
+    rx
+}
+
 // ── ChannelSource impl (native PvAccess server) ──────────────────────────
 //
 // In addition to the legacy spvirit `PvStore` impl above, expose the same
@@ -725,22 +751,69 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 OpenedMonitor::Native(rx) => {
                     Some(epics_pva_rs::server_native::plain_monitor_updates(rx))
                 }
-                OpenedMonitor::Db(mut monitor) => {
-                    let (tx, rx) = mpsc::channel::<epics_pva_rs::server_native::MonitorUpdate>(64);
-                    tokio::spawn(async move {
-                        while let Some(poll) = monitor.poll().await {
-                            let update = epics_pva_rs::server_native::MonitorUpdate {
-                                value: PvField::Structure(poll.value),
-                                marked: poll.marked,
-                                type_changed: false,
-                            };
-                            if tx.send(update).await.is_err() {
-                                break;
+                OpenedMonitor::Db(monitor) => Some(spawn_db_monitor_updates(monitor)),
+            }
+        }
+    }
+
+    /// MONITOR seed entry the native PVA server actually uses. QSRV
+    /// overrides it (rather than relying on the default
+    /// `subscribe_checked_opts_marked` + `get_value` wrapper) so a
+    /// DB/group monitor can return a per-op [`MonitorGate`] on the seed:
+    /// the wire layer drives it on this op's MONITOR START/STOP edge, and
+    /// the gate `db_event_disable`/`db_event_enable`s the backing
+    /// `DbSubscription`s — pvxs `onStart(false)` parity
+    /// (`singlesource.cpp:151`, `groupsource.cpp`). Native-registered PVA
+    /// PVs and the seed for them have no suspendable upstream, so they
+    /// return `on_start: None`.
+    fn subscribe_seeded(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: epics_pva_rs::server_native::source::ChannelContext,
+        _opts: epics_pva_rs::server_native::MonitorOptions,
+    ) -> impl std::future::Future<
+        Output = Option<
+            epics_pva_rs::server_native::source::SubscriptionSeed<
+                epics_pva_rs::server_native::MonitorUpdate,
+            >,
+        >,
+    > + Send {
+        let provider = self.provider.clone();
+        let pva_pvs = self.pva_pvs.clone();
+        async move {
+            let opened = open_monitor(provider, pva_pvs, checked.clone(), ctx.clone()).await?;
+            // Seed AFTER the subscription is armed (open_monitor started it),
+            // matching the default `subscribe_seeded` ordering so no event
+            // between seed and stream is lost or doubled.
+            let initial = self.get_value_checked(checked, ctx).await;
+            match opened {
+                OpenedMonitor::Native(rx) => {
+                    Some(epics_pva_rs::server_native::source::SubscriptionSeed {
+                        initial,
+                        updates: epics_pva_rs::server_native::plain_monitor_updates(rx),
+                        on_start: None,
+                    })
+                }
+                OpenedMonitor::Db(monitor) => {
+                    // Capture the enable/disable handles before the monitor
+                    // moves into its forward task; `Arc` so the gate closure
+                    // (invoked once per START/STOP edge) reuses them.
+                    let handles = std::sync::Arc::new(monitor.activation_handles());
+                    let updates = spawn_db_monitor_updates(monitor);
+                    let gate =
+                        epics_pva_rs::server_native::source::MonitorGate::new(move |active| {
+                            let handles = handles.clone();
+                            async move {
+                                for h in handles.iter() {
+                                    h.set_active(active).await;
+                                }
                             }
-                        }
-                        monitor.stop().await;
-                    });
-                    Some(rx)
+                        });
+                    Some(epics_pva_rs::server_native::source::SubscriptionSeed {
+                        initial,
+                        updates,
+                        on_start: Some(gate),
+                    })
                 }
             }
         }

@@ -1414,6 +1414,33 @@ impl Drop for WatermarkWithdrawOnDrop {
     }
 }
 
+/// Drive a per-op MONITOR gate ([`crate::server_native::source::
+/// MonitorGate`], supplied by the source on its `SubscriptionSeed`) from
+/// this op's executing-state watch. Applies the current state
+/// immediately on spawn — so a STOP that fired before this driver started
+/// is not missed — then re-applies on every edge [`MonitorStartControl`]
+/// publishes, coalescing to the latest executing state (idempotent
+/// `set_active`, so net state always matches `executing`). Runs in its own
+/// task so the hot monitor update loop is untouched; ends when the op tears
+/// down and drops the watch sender (the backing subscriptions are then
+/// removed with the aborted monitor — STOP=disable, teardown=remove).
+fn spawn_monitor_gate_driver(
+    gate: crate::server_native::source::MonitorGate,
+    mut exec_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        let mut cur = *exec_rx.borrow_and_update();
+        gate.set_active(cur).await;
+        while exec_rx.changed().await.is_ok() {
+            let desired = *exec_rx.borrow_and_update();
+            if desired != cur {
+                cur = desired;
+                gate.set_active(desired).await;
+            }
+        }
+    });
+}
+
 /// single owner of one MONITOR op's Executing<->Idle edge.
 /// pvxs fires `MonitorControlOp::onStart(bool)` once when a monitor
 /// begins producing and once when it stops (`servermon.cpp:677-683`); we
@@ -1443,6 +1470,14 @@ struct MonitorStartControl {
     pv_name: String,
     ctx: crate::server_native::source::ChannelContext,
     executing: std::sync::atomic::AtomicBool,
+    /// Publishes each Executing<->Idle edge to this op's subscriber task,
+    /// which drives the source-supplied [`crate::server_native::source::
+    /// MonitorGate`] (QSRV `db_event_enable`/`db_event_disable`
+    /// on STOP/RESUME). Sending the same edge `notify_monitor_start` fires,
+    /// so the source-level pause-vote path and the per-op subscription gate
+    /// stay in lockstep. On teardown this `Sender` drops with the op,
+    /// ending the gate-driver task.
+    exec_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl std::fmt::Debug for MonitorStartControl {
@@ -1462,17 +1497,20 @@ impl MonitorStartControl {
         src: DynSource,
         pv_name: String,
         ctx: crate::server_native::source::ChannelContext,
+        exec_tx: tokio::sync::watch::Sender<bool>,
     ) -> Self {
         Self {
             src,
             pv_name,
             ctx,
             executing: std::sync::atomic::AtomicBool::new(false),
+            exec_tx,
         }
     }
 
-    /// Edge-triggered: fire `notify_monitor_start(desired)` only when the
-    /// executing state actually changes to `desired`.
+    /// Edge-triggered: fire `notify_monitor_start(desired)` and publish the
+    /// edge to the per-op gate driver only when the executing state actually
+    /// changes to `desired`.
     fn set(&self, desired: bool) {
         if self
             .executing
@@ -1481,6 +1519,10 @@ impl MonitorStartControl {
         {
             self.src
                 .notify_monitor_start(&self.pv_name, &self.ctx, desired);
+            // Publish to this op's gate driver. Ignore send
+            // errors: a closed receiver means the subscriber task already
+            // ended, in which case its backing subscriptions are gone too.
+            let _ = self.exec_tx.send(desired);
         }
     }
 }
@@ -5528,6 +5570,15 @@ async fn handle_op(
                     op_id: monitor_op_id,
                 };
                 let mon_fin_tx_task = mon_fin_tx.clone();
+                // Per-op executing-state channel for the monitor START/STOP
+                // gate. `MonitorStartControl` (read-loop side) publishes each
+                // Executing<->Idle edge here; the spawned task drives the
+                // source-supplied `SubscriptionSeed::on_start` gate from it.
+                // Starts `false` (Idle) — the first MONITOR START fires the
+                // edge to `true`. Created before the spawn so the receiver is
+                // captured by the task and the sender reaches the op's
+                // `MonitorStartControl` below.
+                let (monitor_exec_tx, monitor_exec_rx) = tokio::sync::watch::channel(false);
                 let join = tokio::spawn(async move {
                     // terminal finalizer — see `MonitorFinishGuard`.
                     // A single local at the top of the body so no exit (source
@@ -5589,6 +5640,10 @@ async fn handle_op(
                         let crate::server_native::source::SubscriptionSeed {
                             initial: seed_raw_initial,
                             updates: mut rx_raw,
+                            // raw fast path is the fanout gateway, which gates
+                            // its shared upstream per `(name, ctx)` via
+                            // `notify_monitor_start`, not per op — no per-op gate.
+                            on_start: _,
                         } = seed_raw;
                         // Revalidate ACL BEFORE sending the
                         // initial snapshot. Between the spawn's
@@ -5775,7 +5830,20 @@ async fn handle_op(
                     let crate::server_native::source::SubscriptionSeed {
                         initial: seed_initial,
                         updates: mut rx,
+                        on_start: seed_on_start,
                     } = seed;
+                    // Per-op MONITOR START/STOP gate. When the source backs
+                    // this op with suspendable upstream subscriptions (QSRV
+                    // DbSubscriptions), drive its enable/disable from this op's
+                    // Executing<->Idle edge — published on `monitor_exec_rx` by
+                    // `MonitorStartControl` (read-loop side). The driver lives
+                    // in its own task so the hot update loop below is untouched;
+                    // it ends when the op tears down and drops `monitor_exec_tx`
+                    // (the backing subscriptions are then removed with the
+                    // aborted monitor, so STOP=disable / teardown=remove).
+                    if let Some(gate) = seed_on_start {
+                        spawn_monitor_gate_driver(gate, monitor_exec_rx);
+                    }
                     // Diagnostic-only outbound-queue-depth crossing flag.
                     let mut queue_over_high = false;
                     // per-PV pipeline-window watermark levels
@@ -6216,6 +6284,7 @@ async fn handle_op(
                         roles: cred.roles.clone(),
                         pv_request: None,
                     },
+                    monitor_exec_tx,
                 ));
                 if let Some(s) = ch.ops.get_mut(&ioid) {
                     s.monitor_started = true;
@@ -12960,10 +13029,12 @@ mod tests {
         );
         op.monitor_op_id = op_id;
         op.monitor_started = true;
+        let (exec_tx, _exec_rx) = tokio::sync::watch::channel(false);
         let ctl = Arc::new(MonitorStartControl::new(
             src.clone(),
             "dut".into(),
             bfr12_anon_ctx(),
+            exec_tx,
         ));
         ctl.set(true); // record the Idle→Executing edge
         op.monitor_start_ctl = Some(ctl); // op now holds the only Arc ref
@@ -12983,6 +13054,72 @@ mod tests {
             },
         );
         channels
+    }
+
+    /// Per-op MONITOR gate wiring: `MonitorStartControl::set` publishes each
+    /// Executing<->Idle edge to the per-op gate driver, which calls
+    /// `MonitorGate::set_active` accordingly. Drives START -> STOP -> START
+    /// and asserts the gate observed the initial Idle state plus each edge
+    /// in order — waiting between edges so the watch does not coalesce
+    /// them (coalescing is correct for the production net-state, but a
+    /// per-edge assertion needs them separated). The source-level
+    /// `notify_monitor_start` edges stay in lockstep.
+    #[tokio::test]
+    async fn bridge118_gate_driver_follows_executing_edges() {
+        use crate::server_native::source::MonitorGate;
+
+        let intro = three_field_intro();
+        let starts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let src: DynSource = Arc::new(Bfr12Source {
+            intro: intro.clone(),
+            value: three_field_value(0, 0, 0),
+            starts: starts.clone(),
+        });
+
+        // Recording gate: every set_active(active) call lands here.
+        let gate_log = Arc::new(parking_lot::Mutex::new(Vec::<bool>::new()));
+        let gate_log_w = gate_log.clone();
+        let gate = MonitorGate::new(move |active| {
+            let log = gate_log_w.clone();
+            async move {
+                log.lock().push(active);
+            }
+        });
+
+        let (exec_tx, exec_rx) = tokio::sync::watch::channel(false);
+        spawn_monitor_gate_driver(gate, exec_rx);
+        let ctl = MonitorStartControl::new(src.clone(), "dut".into(), bfr12_anon_ctx(), exec_tx);
+
+        async fn wait_len(log: &Arc<parking_lot::Mutex<Vec<bool>>>, n: usize) {
+            for _ in 0..200 {
+                if log.lock().len() >= n {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            panic!("gate log never reached {n} entries: {:?}", log.lock());
+        }
+
+        // Initial: the driver applies the watch's starting state (Idle =
+        // false). Wait for it BEFORE the first edge so it is not coalesced.
+        wait_len(&gate_log, 1).await;
+        ctl.set(true); // START  (Idle -> Executing)
+        wait_len(&gate_log, 2).await;
+        ctl.set(false); // STOP / PAUSE  (Executing -> Idle)
+        wait_len(&gate_log, 3).await;
+        ctl.set(true); // RESUME  (Idle -> Executing)
+        wait_len(&gate_log, 4).await;
+
+        assert_eq!(
+            *gate_log.lock(),
+            vec![false, true, false, true],
+            "gate must observe initial Idle then each Executing<->Idle edge in order"
+        );
+        assert_eq!(
+            *starts.lock(),
+            vec![true, false, true],
+            "notify_monitor_start fires the same edges (only real edges, no initial apply)"
+        );
     }
 
     /// The guard's `Drop` reports completion to the owner — the mechanism

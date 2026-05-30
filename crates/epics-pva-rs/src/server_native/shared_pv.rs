@@ -1271,6 +1271,7 @@ impl super::source::ChannelSource for SharedSource {
             Some(super::source::SubscriptionSeed {
                 initial,
                 updates: super::source::plain_monitor_updates(rx),
+                on_start: None,
             })
         }
     }

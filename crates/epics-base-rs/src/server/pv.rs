@@ -194,6 +194,17 @@ pub struct Subscriber {
     /// by the subscription path when the channel name carries a
     /// `.{filter:opts}` JSON suffix (`dbnd`, `arr`, `ts`, ...).
     pub filters: crate::server::database::filters::FilterChain,
+    /// Delivery gate. `true` (the default) delivers events normally;
+    /// `false` suppresses every post to this subscriber at the source —
+    /// no `try_send`, no coalesce-overflow, no filter evaluation — so a
+    /// paused monitor stops the record-event work entirely, not just the
+    /// downstream frame. Mirrors EPICS `db_event_disable` / pvxs
+    /// `onStart(false)` (singlesource.cpp:151-173, groupsource.cpp:151-281):
+    /// the subscription object survives, only its event flow is gated, so
+    /// the same subscriber resumes on re-enable. Flipped only under the
+    /// owner's write lock via [`super::record::record_instance::RecordInstance::set_subscriber_active`]
+    /// (records) — the post paths read it under the matching read lock.
+    pub active: bool,
 }
 
 impl Subscriber {
@@ -476,6 +487,12 @@ impl ProcessVariable {
         // Remove subscribers whose channel has been dropped.
         subs.retain(|sub| !sub.tx.is_closed());
         for sub in subs.iter() {
+            // Paused subscribers (`db_event_disable`) receive nothing —
+            // skip before any work so a disabled monitor stops the event
+            // flow at the source.
+            if !sub.active {
+                continue;
+            }
             // Skip subscribers whose requested class does not intersect
             // this post's event class.
             if !sub.accepts(post) {
@@ -603,6 +620,7 @@ impl ProcessVariable {
             tx,
             coalesced: Arc::new(StdMutex::new(None)),
             filters: crate::server::database::filters::FilterChain::new(),
+            active: true,
         };
         let mut subs = self.subscribers.lock().await;
         // Reap dead Senders BEFORE counting

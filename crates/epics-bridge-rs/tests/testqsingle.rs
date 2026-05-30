@@ -691,3 +691,71 @@ async fn non_val_enum_field_is_ntenum() {
         .expect("new");
     assert_eq!(desc.nt_type(), NtType::Scalar, ".DESC must stay NTScalar");
 }
+
+/// A client STOP on a single-record monitor disables its
+/// backing value+PROPERTY `DbSubscription`s — the in-process equivalent of
+/// pvxs `MonitorControlOp::onStart(false)` ⇒ `db_event_disable`
+/// (`singlesource.cpp:151`). Posts made while stopped are not delivered;
+/// RESUME (`onStart(true)` ⇒ `db_event_enable`) restores delivery on the
+/// same handles.
+#[tokio::test]
+async fn monitor_stop_disables_backing_subscription() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_bridge_rs::qsrv::provider::{BridgeProvider, PvaMonitor};
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("TEST:gate_ai", Box::new(AiRecord::new(1.0)))
+        .await
+        .unwrap();
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+
+    let any = provider
+        .create_channel_for("TEST:gate_ai", "u", "h")
+        .await
+        .expect("channel resolves");
+    let ch = match any {
+        epics_bridge_rs::qsrv::AnyChannel::Single(c) => c,
+        _ => panic!("expected single-record channel"),
+    };
+
+    let mut mon = ch.create_monitor().await.expect("monitor");
+    mon.start().await.expect("start");
+    let handles = mon.activation_handles();
+    assert!(
+        !handles.is_empty(),
+        "a started single-record monitor must expose its subscription gate handles"
+    );
+
+    async fn post(db: &Arc<PvDatabase>, mask: EventMask) {
+        let rec = db.get_record("TEST:gate_ai").await.expect("rec");
+        rec.read().await.notify_field("VAL", mask);
+    }
+
+    // Active (post-START): a VALUE post is delivered.
+    post(&db, EventMask::VALUE).await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), mon.poll())
+        .await
+        .expect("event must be delivered while the monitor is active")
+        .expect("snapshot");
+
+    // STOP: disable both subscriptions. A subsequent post is NOT delivered.
+    for h in &handles {
+        h.set_active(false).await;
+    }
+    post(&db, EventMask::VALUE).await;
+    let stopped = tokio::time::timeout(std::time::Duration::from_millis(300), mon.poll()).await;
+    assert!(
+        stopped.is_err(),
+        "no event may be delivered while the monitor is stopped"
+    );
+
+    // RESUME: re-enable the same handles. A post is delivered again.
+    for h in &handles {
+        h.set_active(true).await;
+    }
+    post(&db, EventMask::VALUE).await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), mon.poll())
+        .await
+        .expect("event must be delivered after the monitor resumes")
+        .expect("snapshot");
+}

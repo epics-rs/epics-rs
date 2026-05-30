@@ -1253,3 +1253,69 @@ async fn br52_indexed_member_builds_heterogeneous_structure_array() {
         other => panic!("`a[N]` value must be a StructureArray, got {other:?}"),
     }
 }
+
+/// A client STOP on a group monitor disables every
+/// member `DbSubscription` it opened — pvxs `groupsource.cpp` `onStart`
+/// toggles each member `dbChannel` via `db_event_disable`/`enable`. While
+/// stopped, a post on any member is not delivered; RESUME restores
+/// delivery on the same handles.
+#[tokio::test]
+async fn group_monitor_stop_disables_member_subscriptions() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_bridge_rs::qsrv::group::GroupMonitor;
+    use epics_bridge_rs::qsrv::provider::PvaMonitor;
+    use std::time::Duration;
+
+    let db = make_db().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(GROUP_JSON).expect("load");
+    let def = provider
+        .groups()
+        .get("TEST:grp")
+        .cloned()
+        .expect("grp registered");
+
+    let mut mon = GroupMonitor::new(db.clone(), def);
+    mon.start().await.expect("start");
+    let handles = mon.activation_handles();
+    assert!(
+        !handles.is_empty(),
+        "a started group monitor must expose its member subscription gate handles"
+    );
+
+    async fn post(db: &Arc<PvDatabase>) {
+        let rec = db.get_record("TEST:level").await.expect("rec exists");
+        rec.read().await.notify_field("VAL", EventMask::VALUE);
+    }
+
+    // Active (post-START): a member post wakes the group poll.
+    post(&db).await;
+    tokio::time::timeout(Duration::from_secs(2), mon.poll())
+        .await
+        .expect("event must be delivered while the group monitor is active")
+        .expect("snapshot");
+
+    // STOP: disable every member subscription. A member post is NOT
+    // delivered.
+    for h in &handles {
+        h.set_active(false).await;
+    }
+    post(&db).await;
+    let stopped = tokio::time::timeout(Duration::from_millis(300), mon.poll()).await;
+    assert!(
+        stopped.is_err(),
+        "no event may be delivered while the group monitor is stopped"
+    );
+
+    // RESUME: re-enable. A member post is delivered again.
+    for h in &handles {
+        h.set_active(true).await;
+    }
+    post(&db).await;
+    tokio::time::timeout(Duration::from_secs(2), mon.poll())
+        .await
+        .expect("event must be delivered after the group monitor resumes")
+        .expect("snapshot");
+
+    mon.stop().await;
+}

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::database::db_access::DbSubscription;
+use epics_base_rs::server::database::db_access::{DbSubscription, SubscriptionActivation};
 use epics_base_rs::types::DbFieldType;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, VariantValue};
 
@@ -1692,6 +1692,13 @@ pub struct GroupMonitor {
     /// the abort guard those tasks survive group-monitor teardown
     /// until the parent record's broadcast disconnects.
     _tasks: Vec<MemberTaskGuard>,
+    /// Detachable enable/disable handles for every member `DbSubscription`
+    /// (value + PROPERTY) opened in [`start`]. Collected before each
+    /// subscription is moved into its member task so the per-op MONITOR
+    /// START/STOP gate can `db_event_disable`/`enable` the
+    /// whole group's upstream on a client STOP/RESUME — pvxs
+    /// `groupsource.cpp` `onStart` toggles every member `dbChannel`.
+    activation_handles: Vec<SubscriptionActivation>,
     /// Access control context propagated from the parent GroupChannel.
     access: super::provider::AccessContext,
     /// negotiated monitor queue depth, resolved from
@@ -1727,6 +1734,7 @@ impl GroupMonitor {
             group_channel: None,
             event_rx: None,
             _tasks: Vec::new(),
+            activation_handles: Vec::new(),
             access: super::provider::AccessContext::allow_all(),
             monitor_queue_size: GROUP_DEFAULT_QUEUE_SIZE,
         }
@@ -1746,6 +1754,15 @@ impl GroupMonitor {
     pub fn with_queue_size(mut self, queue_size: i32) -> Self {
         self.monitor_queue_size = queue_size;
         self
+    }
+
+    /// Detachable enable/disable handles for every member subscription
+    /// opened in [`PvaMonitor::start`] (value + PROPERTY per channeled
+    /// member). Used by the per-op MONITOR START/STOP gate so
+    /// a client STOP suspends the whole group's upstream event flow.
+    /// Empty before `start()`.
+    pub fn activation_handles(&self) -> Vec<SubscriptionActivation> {
+        self.activation_handles.clone()
     }
 
     /// resolve the marked-leaf field paths for a *value*
@@ -1912,6 +1929,10 @@ impl super::provider::PvaMonitor for GroupMonitor {
             if let Some(mut sub) =
                 DbSubscription::subscribe_with_mask(&self.db, &member.channel, 0, value_mask).await
             {
+                // Capture the enable/disable handle BEFORE the subscription
+                // moves into its member task, so the per-op gate
+                // can toggle this member's event flow without owning the sub.
+                self.activation_handles.push(sub.activation_handle());
                 let tx = tx.clone();
                 let handle = tokio::spawn(async move {
                     while sub.recv_snapshot().await.is_some() {
@@ -1943,6 +1964,7 @@ impl super::provider::PvaMonitor for GroupMonitor {
                     DbSubscription::subscribe_with_mask(&self.db, &member.channel, 0, prop_mask)
                         .await
                 {
+                    self.activation_handles.push(sub.activation_handle());
                     let tx = tx.clone();
                     let handle = tokio::spawn(async move {
                         while sub.recv_snapshot().await.is_some() {
@@ -2065,6 +2087,16 @@ impl AnyMonitor {
         match self {
             Self::Group(m) => Self::Group(Box::new(m.with_queue_size(queue_size))),
             single => single,
+        }
+    }
+
+    /// Detachable enable/disable handles for this monitor's backing
+    /// `DbSubscription`s, for the per-op MONITOR START/STOP gate.
+    /// Valid after [`PvaMonitor::start`].
+    pub fn activation_handles(&self) -> Vec<SubscriptionActivation> {
+        match self {
+            Self::Single(m) => m.activation_handles(),
+            Self::Group(m) => m.activation_handles(),
         }
     }
 }

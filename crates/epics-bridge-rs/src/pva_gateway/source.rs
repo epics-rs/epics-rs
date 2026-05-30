@@ -666,10 +666,12 @@ impl GatewayChannelSource {
     /// returns `Some(_)` only on a real aggregate edge; on an edge the
     /// applier calls `reconcile_pause`, which re-reads the level and drives
     /// the installed `Pauser` through the entry's single serialized owner.
-    /// That owner is shared with the reconnect loop's Pauser re-install, so
-    /// a fresh upstream subscription installed mid-backpressure is paused
-    /// immediately rather than running unthrottled until the next HIGH→LOW
-    /// cycle. Because this is the sole writer of the entry's
+    /// That owner is shared with the reconnect loop's Pauser re-install.
+    /// pvxs monitor pause is per-connection (`clientmon.cpp:379-414`,
+    /// `:633-635`): a reconnect installs against an empty aggregate (the
+    /// prior connection's votes were dropped at disconnect) and the fresh
+    /// subscription runs, so this applier re-pauses only on a fresh HIGH from
+    /// a live downstream op. Because this is the sole writer of the entry's
     /// votes, the fold has no competing writer.
     fn spawn_watermark_applier(mut rx: mpsc::UnboundedReceiver<WmCommand>) {
         tokio::spawn(async move {

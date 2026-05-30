@@ -165,11 +165,13 @@ async fn main() {
     // fields so the server renders the value at record precision
     // (C `camonitor.c:162-166`).
     let float_as_string = args.string_format;
-    // C `camonitor.c:169` applies the user's `-#` count to the
+    // C `camonitor.c:168-169` applies the user's `-#` count to the
     // `ca_create_subscription` request count (clamped to the native element
-    // count at connect); `None` (no `-#`) requests the full count. Carried
-    // into the subscription so each monitor event transfers only the
-    // requested slice instead of the whole waveform.
+    // count at connect); `None` (no `-#`) leaves `reqElems == 0`, the CA
+    // autosize request, so the server reports each event at the record's
+    // current element count. Carried into the subscription so each monitor
+    // event transfers only the requested slice (or the autosized current
+    // count) instead of the native capacity.
     let req_count = args.max_elements.map(|n| n as u32);
     let start = SystemTime::now();
     // `tsFirst` (`tool_lib.c:40`): the first SERVER stamp seen across all

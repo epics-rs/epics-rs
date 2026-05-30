@@ -1127,6 +1127,17 @@ pub async fn run_ca_pva_qsrv_ioc(
         tracing::info!("qsrv: ACF installed on BridgeProvider");
     }
 
+    // ── QSRV group loading (pvxs `processGroups()` parity) ──
+    // The runner is the single owner that builds the served provider's
+    // group set, from BOTH pvxs group sources, BEFORE the PVA server
+    // accepts any connection — the epics-rs iocRun-handoff equivalent of
+    // pvxs running `processGroups()` at `initHookAfterInitDatabase`
+    // (iochooks.cpp:343-345). Gated on the QSRV2 enable decision, matching
+    // pvxs only adding the group source when `enable2()` is true.
+    if qsrv2_on {
+        load_qsrv_groups(&provider, &db).await;
+    }
+
     let store = Arc::new(QsrvPvStore::new(provider));
 
     // Register native PVA PVs (NTNDArray from NDPvaConfigure, etc.).
@@ -1150,10 +1161,20 @@ pub async fn run_ca_pva_qsrv_ioc(
     // resolves through the monitor-backed caches, and register the
     // matching `caxr` / `dbcaxr` and `pvxr` / `dbpvxr` /
     // `pvalink_enable` / `pvalink_disable` iocsh commands.
-    #[cfg(any(feature = "calink", feature = "pvalink"))]
     let mut shell_commands = config.shell_commands;
-    #[cfg(not(any(feature = "calink", feature = "pvalink")))]
-    let shell_commands = config.shell_commands;
+
+    // Register the QSRV runtime (interactive-shell) commands —
+    // `processGroups`, `qsrvStats`, `pvxsl`, `pvxgl`, `resetGroups` —
+    // bound to the SAME `BridgeProvider` the served store wraps, so a
+    // post-iocInit `processGroups` / `pvxgl` acts on the served groups
+    // rather than a throwaway provider (pvxs registers these from
+    // `group_enable()` / `singlesourcehooks.cpp`). `dbLoadGroup` is the
+    // base startup command (pvxs only permits it before iocInit), so it
+    // is intentionally absent from this runtime set.
+    shell_commands.extend(super::iocsh::register_qsrv_runtime_commands(
+        store.provider().clone(),
+    ));
+
     #[cfg(feature = "calink")]
     {
         match crate::calink::install_calink_resolver(&db, tokio::runtime::Handle::current()).await {
@@ -1217,6 +1238,61 @@ pub async fn run_ca_pva_qsrv_ioc(
         })
         .await
         .map_err(|e| CaError::InvalidValue(e.to_string()))
+}
+
+/// Build the served provider's group set from both pvxs group sources,
+/// then finalize it — the QSRV equivalent of pvxs `processGroups()`
+/// (ioc/groupsourcehooks.cpp:192-213), run here before the PVA server
+/// accepts connections so the first client GET already sees finalized
+/// group PVs.
+///
+/// Source order matches pvxs `GroupConfigProcessor`:
+///
+///  1. DB `info(Q:group, ...)` records (`loadConfigFromDb`) — every record
+///     carrying the tag contributes its group definition.
+///  2. Queued `dbLoadGroup` files (`loadConfigFiles`) — drained from the
+///     base startup queue ([`take_group_load_requests`]) in st.cmd order.
+///  3. `process_groups()` — validate/resolve trigger references
+///     (`resolveTriggerReferences` / `createGroups`).
+///
+/// Cross-source duplicate fields collapse first-wins inside the provider's
+/// field-keyed merge, matching pvxs `fieldConfigMap` accumulation. A
+/// failing source logs a warning and is skipped — a malformed group must
+/// not abort an otherwise-serviceable IOC.
+async fn load_qsrv_groups(
+    provider: &Arc<BridgeProvider>,
+    db: &Arc<epics_base_rs::server::database::PvDatabase>,
+) {
+    use epics_base_rs::server::ioc_app::take_group_load_requests;
+
+    // 1. DB info(Q:group) records (pvxs loadConfigFromDb).
+    for name in db.all_record_names().await {
+        let json = match db.get_record(&name).await {
+            Some(rec) => rec.read().await.get_info("Q:group").map(str::to_string),
+            None => None,
+        };
+        if let Some(json) = json {
+            if let Err(e) = provider.load_info_group(&name, &json) {
+                tracing::warn!(record = %name, "qsrv: info(Q:group) load failed: {e}");
+            }
+        }
+    }
+
+    // 2. Queued dbLoadGroup files (pvxs loadConfigFiles), in st.cmd order.
+    for req in take_group_load_requests() {
+        match super::iocsh::apply_group_file(provider, &req.filename, &req.macros) {
+            Ok(total) => {
+                tracing::info!(file = %req.filename, "qsrv: dbLoadGroup loaded ({total} groups total)");
+            }
+            Err(e) => {
+                tracing::warn!(file = %req.filename, "qsrv: dbLoadGroup failed: {e}");
+            }
+        }
+    }
+
+    // 3. Finalize (pvxs resolveTriggerReferences / createGroups).
+    let n = provider.process_groups();
+    tracing::info!("qsrv: processGroups finalized {n} group(s)");
 }
 
 #[cfg(test)]
@@ -2528,5 +2604,82 @@ mod tests {
             b_before,
             "member b must not be processed when nothing is marked"
         );
+    }
+
+    /// End-to-end: a pvxs-compatible st.cmd `dbLoadGroup(...)` run BEFORE
+    /// iocInit, plus a record carrying `info(Q:group, ...)`,
+    /// both end up served by the SAME provider the `QsrvPvStore` wraps —
+    /// the bug was that group-loading was unwired into the IOC startup and
+    /// the runner served a throwaway provider. Exercises the real base
+    /// `dbLoadGroup` startup command (queue) and the runner's single-owner
+    /// `load_qsrv_groups` build (info records + queued files + finalize).
+    #[tokio::test]
+    async fn dbloadgroup_before_iocinit_is_served_by_the_same_store() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::ioc_app::{
+            db_load_group_startup_command, take_group_load_requests,
+        };
+        use epics_base_rs::server::iocsh::IocShell;
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        // Isolate from any leftover process-global queue state.
+        let _ = take_group_load_requests();
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("GRP:fileval", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        db.add_record("GRP:infoval", Box::new(AiRecord::new(2.0)))
+            .await
+            .unwrap();
+
+        // A record carrying info(Q:group) — pvxs `loadConfigFromDb` source.
+        {
+            let rec = db.get_record("GRP:infoval").await.unwrap();
+            rec.write().await.set_info(
+                "Q:group",
+                r#"{ "INFO:grp": { "+id": "epics:nt/NTScalar:1.0",
+                     "value": { "+channel": "VAL", "+type": "plain" } } }"#,
+            );
+        }
+
+        // st.cmd `dbLoadGroup("file.json")` BEFORE iocInit: run the REAL
+        // base startup command through an iocsh shell on a std::thread (the
+        // off-runtime execution model `IocApplication::run` itself uses),
+        // queueing the request into the process-global dbLoadGroup queue.
+        let json = r#"{ "FILE:grp": { "+id": "epics:nt/NTScalar:1.0",
+            "value": { "+channel": "GRP:fileval.VAL", "+type": "plain" } } }"#;
+        let path = std::env::temp_dir().join("qsrv_e2e_dbloadgroup.json");
+        std::fs::write(&path, json).unwrap();
+        {
+            let db_t = db.clone();
+            let handle = tokio::runtime::Handle::current();
+            let line = format!("dbLoadGroup(\"{}\")", path.display());
+            std::thread::spawn(move || {
+                let shell = IocShell::new(db_t, handle);
+                shell.register(db_load_group_startup_command());
+                shell.execute_line(&line).expect("dbLoadGroup must queue");
+            })
+            .join()
+            .unwrap();
+        }
+
+        // Runner single-owner build into the SERVED provider, before serving.
+        let provider = Arc::new(BridgeProvider::new_with_serving(db.clone(), true));
+        load_qsrv_groups(&provider, &db).await;
+        let store = Arc::new(QsrvPvStore::new(provider));
+
+        // Both pvxs group sources are served by the same store/provider.
+        let groups = store.provider().groups();
+        assert!(
+            groups.contains_key("FILE:grp"),
+            "dbLoadGroup file group must be served by the same store"
+        );
+        assert!(
+            groups.contains_key("INFO:grp"),
+            "info(Q:group) record group must be served by the same store"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

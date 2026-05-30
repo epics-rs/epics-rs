@@ -95,9 +95,6 @@ pub struct GroupMember {
     /// (pvxs canonical key, `test/qgroup.json`) with a legacy
     /// `+value` fallback for older Rust-authored configs.
     pub const_value: Option<epics_pva_rs::pvdata::PvField>,
-    /// Nanosecond mask: lower bits of nsec are extracted as userTag
-    /// (pvxs `MappingInfo::nsecMask`, from `+nsecmask` in JSON).
-    pub nsec_mask: u32,
 }
 
 impl GroupPvDef {
@@ -697,8 +694,6 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let nsec_mask = obj.get("+nsecmask").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-
     Ok(GroupMember {
         field_name: field_name.to_string(),
         channel,
@@ -707,7 +702,6 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
         put_order,
         struct_id,
         const_value,
-        nsec_mask,
     })
 }
 
@@ -1926,8 +1920,14 @@ mod tests {
         assert!(matches!(fixed.triggers, TriggerDef::None));
     }
 
+    /// `+nsecmask` is not an upstream pvxs group-JSON key — pvxs derives
+    /// the nanosecond split solely from the record's `info(Q:time:tag)`
+    /// (`ioc/typeutils.cpp:79-87`, `ioc/groupprocessorcontext.cpp:43-83`
+    /// has no `+nsecmask` branch). A config still carrying it must load
+    /// cleanly with the key silently ignored, leaving timestamp behaviour
+    /// driven entirely by the already-masked record snapshot.
     #[test]
-    fn parse_nsecmask() {
+    fn nsecmask_key_is_ignored() {
         let json = r#"{
             "GRP:ns": {
                 "val": {
@@ -1938,19 +1938,9 @@ mod tests {
         }"#;
 
         let groups = parse_group_config(json).unwrap();
-        assert_eq!(groups[0].members[0].nsec_mask, 255);
-    }
-
-    #[test]
-    fn nsecmask_defaults_to_zero() {
-        let json = r#"{
-            "GRP:ns": {
-                "val": { "+channel": "R:val" }
-            }
-        }"#;
-
-        let groups = parse_group_config(json).unwrap();
-        assert_eq!(groups[0].members[0].nsec_mask, 0);
+        assert_eq!(groups[0].members.len(), 1);
+        assert_eq!(groups[0].members[0].field_name, "val");
+        assert_eq!(groups[0].members[0].channel, "R:val");
     }
 
     #[test]

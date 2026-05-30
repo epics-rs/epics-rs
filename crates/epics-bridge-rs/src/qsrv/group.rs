@@ -964,10 +964,7 @@ impl GroupChannel {
                 ));
                 meta.fields.push((
                     "timeStamp".into(),
-                    PvField::Structure(build_timestamp_from_snapshot_masked(
-                        &snapshot,
-                        member.nsec_mask,
-                    )),
+                    PvField::Structure(build_timestamp_from_snapshot(&snapshot)),
                 ));
                 Ok(PvField::Structure(meta))
             }
@@ -2344,35 +2341,27 @@ fn build_alarm_from_snapshot(snapshot: &epics_base_rs::server::snapshot::Snapsho
     alarm
 }
 
-/// Build a timestamp PvStructure with optional nsecMask.
+/// Build a `timeStamp` PvStructure directly from the record snapshot.
 ///
-/// When `nsec_mask` is non-zero, the lower bits of nanoseconds are
-/// extracted and placed in `userTag` (pvxs iocsource.cpp:241-247).
-fn build_timestamp_from_snapshot_masked(
+/// The nanosecond / userTag split for `info(Q:time:tag, "nsec:lsb:N")`
+/// is applied once, at the record level, when the snapshot is built
+/// (`epics_base_rs` `record_instance.rs` via `apply_nsec_lsb_split`), so
+/// `snapshot.timestamp` already carries the masked nanoseconds and
+/// `snapshot.user_tag` already carries the split bits / `common.utag`.
+/// The group encoder therefore serves them verbatim and must not remask
+/// — pvxs derives the same split from the record's `Q:time:tag`
+/// (`ioc/typeutils.cpp:79-87`, `ioc/iocsource.cpp:240-248`), never from
+/// group JSON.
+fn build_timestamp_from_snapshot(
     snapshot: &epics_base_rs::server::snapshot::Snapshot,
-    nsec_mask: u32,
 ) -> PvStructure {
     use epics_pva_rs::pvdata::ScalarValue;
     use std::time::UNIX_EPOCH;
 
     let mut ts = PvStructure::new("time_t");
-    let (secs, raw_nanos) = match snapshot.timestamp.duration_since(UNIX_EPOCH) {
-        Ok(d) => (d.as_secs() as i64, d.subsec_nanos()),
+    let (secs, nanos) = match snapshot.timestamp.duration_since(UNIX_EPOCH) {
+        Ok(d) => (d.as_secs() as i64, d.subsec_nanos() as i32),
         Err(_) => (0, 0),
-    };
-    let nanos = if nsec_mask != 0 {
-        (raw_nanos & !nsec_mask) as i32
-    } else {
-        raw_nanos as i32
-    };
-    let user_tag = if nsec_mask != 0 {
-        (raw_nanos & nsec_mask) as i32
-    } else {
-        // No group `+nsecmask`: serve the snapshot's userTag, which the
-        // record snapshot builder defaults to `common.utag` (pvxs
-        // `iocsource.cpp:245`). Pre-fix this hard-coded 0, dropping the
-        // record's utag on group serve.
-        snapshot.user_tag
     };
     ts.fields.push((
         "secondsPastEpoch".into(),
@@ -2384,7 +2373,7 @@ fn build_timestamp_from_snapshot_masked(
     ));
     ts.fields.push((
         "userTag".into(),
-        PvField::Scalar(ScalarValue::Int(user_tag)),
+        PvField::Scalar(ScalarValue::Int(snapshot.user_tag)),
     ));
     ts
 }
@@ -2406,23 +2395,25 @@ mod tests {
         assert!(pv.get_field("x").is_some());
     }
 
-    /// a group `meta` timeStamp serves the record's userTag (carried in
-    /// `Snapshot.user_tag`, which the record snapshot builder defaults to
-    /// `common.utag`) when the group field has no `+nsecmask` — pvxs
-    /// `iocsource.cpp:245`. Pre-fix the no-mask branch hard-coded 0,
-    /// dropping the record's tag. A `+nsecmask` overrides with the masked
-    /// nanosecond bits (:247). The bit-31 tag also pins that the
-    /// snapshot's i32 userTag passes through unchanged.
+    /// a group `meta` timeStamp serves the record snapshot's userTag and
+    /// nanoseconds verbatim. The `Q:time:tag` nsec-LSB split is applied
+    /// once at the record level (`record_instance.rs`
+    /// `apply_nsec_lsb_split`), so the group encoder must not remask —
+    /// pvxs derives the split from the record, never from group JSON
+    /// (`ioc/iocsource.cpp:240-248`). `Snapshot.user_tag` defaults to the
+    /// record's `common.utag` (pvxs `iocsource.cpp:245`); the bit-31 tag
+    /// pins that the snapshot's i32 userTag passes through unchanged and
+    /// nanoseconds are not stripped by any group-level mask.
     #[test]
-    fn group_timestamp_serves_record_usertag_without_nsecmask() {
+    fn group_timestamp_serves_record_snapshot_verbatim() {
         use epics_base_rs::server::snapshot::Snapshot;
         use epics_base_rs::types::EpicsValue;
         use epics_pva_rs::pvdata::{PvField, ScalarValue};
         use std::time::UNIX_EPOCH;
 
-        let tag = |s: &PvStructure| match s.get_field("userTag") {
+        let int_field = |s: &PvStructure, name: &str| match s.get_field(name) {
             Some(PvField::Scalar(ScalarValue::Int(v))) => *v,
-            other => panic!("userTag must be Int, got {other:?}"),
+            other => panic!("{name} must be Int, got {other:?}"),
         };
 
         let mut snap = Snapshot::new(
@@ -2433,17 +2424,18 @@ mod tests {
         );
         snap.user_tag = 0x9000_0000u32 as i32;
 
-        // No `+nsecmask` → serve the snapshot's (record) userTag, not 0.
+        let ts = build_timestamp_from_snapshot(&snap);
+        // userTag is the snapshot's (record) utag, not 0 and not remasked.
         assert_eq!(
-            tag(&build_timestamp_from_snapshot_masked(&snap, 0)),
+            int_field(&ts, "userTag"),
             0x9000_0000u32 as i32,
-            "no-nsecmask group member must serve the record's utag"
+            "group member must serve the record's utag verbatim"
         );
-        // `+nsecmask` → userTag is the masked nanosecond bits (override).
+        // nanoseconds pass through unmasked at the group level.
         assert_eq!(
-            tag(&build_timestamp_from_snapshot_masked(&snap, 0xFF)),
+            int_field(&ts, "nanoseconds"),
             0x0000_00FF,
-            "nsecmask group member must serve the masked nanosecond bits"
+            "group member must serve the snapshot nanoseconds verbatim"
         );
     }
 

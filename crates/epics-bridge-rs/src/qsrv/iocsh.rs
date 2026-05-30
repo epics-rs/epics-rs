@@ -96,32 +96,47 @@ pub fn db_load_group_command(provider: Arc<BridgeProvider>) -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             }
 
-            let raw = match std::fs::read_to_string(&filename) {
-                Ok(s) => s,
-                Err(e) => return Err(format!("dbLoadGroup '{filename}': {e}")),
-            };
-            // pvxs only builds a MAC_HANDLE (and so only expands macros)
-            // when the macros argument is non-empty; an empty argument
-            // means the JSON is used verbatim.
-            let expanded = if macros_str.is_empty() {
-                raw
-            } else {
-                expand_macros(&raw, &parse_macros(&macros_str))
-            };
-            // Track under the raw (filename, macros) identity so a later
-            // `dbLoadGroup("-filename", macros)` can remove these groups.
-            match provider.load_group_file_tracked(&filename, &macros_str, &expanded) {
-                Ok(()) => {
+            match apply_group_file(&provider, &filename, &macros_str) {
+                Ok(total) => {
                     ctx.println(&format!(
-                        "dbLoadGroup: loaded '{filename}' ({} groups total)",
-                        provider.group_count()
+                        "dbLoadGroup: loaded '{filename}' ({total} groups total)"
                     ));
                     Ok(CommandOutcome::Continue)
                 }
-                Err(e) => Err(format!("dbLoadGroup '{filename}' failed: {e}")),
+                Err(e) => Err(e),
             }
         },
     )
+}
+
+/// Apply one `dbLoadGroup(filename, macros)` to `provider`: read the file,
+/// run it through macLib **only when `macros` is non-empty** (matching
+/// pvxs's `macros[0]!='\0'` guard, groupsourcehooks.cpp:153), and merge the
+/// parsed groups into the provider under the `(filename, macros)` source
+/// identity so a later `dbLoadGroup("-file", macros)` can remove them.
+/// Returns the running group count.
+///
+/// This is the single load path shared by the standalone
+/// [`db_load_group_command`] and the QSRV protocol runner, which calls it
+/// for every entry drained from the base `dbLoadGroup` startup queue
+/// (pvxs `GroupConfigProcessor::loadConfigFiles`,
+/// groupsourcehooks.cpp:200-207).
+pub(crate) fn apply_group_file(
+    provider: &BridgeProvider,
+    filename: &str,
+    macros: &str,
+) -> Result<usize, String> {
+    let raw =
+        std::fs::read_to_string(filename).map_err(|e| format!("dbLoadGroup '{filename}': {e}"))?;
+    let expanded = if macros.is_empty() {
+        raw
+    } else {
+        expand_macros(&raw, &parse_macros(macros))
+    };
+    provider
+        .load_group_file_tracked(filename, macros, &expanded)
+        .map_err(|e| format!("dbLoadGroup '{filename}' failed: {e}"))?;
+    Ok(provider.group_count())
 }
 
 /// Parse a `name=value,name=value` string into a map. Whitespace
@@ -723,6 +738,26 @@ pub fn reset_groups_command(provider: Arc<BridgeProvider>) -> CommandDef {
 pub fn register_qsrv_commands(provider: Arc<BridgeProvider>) -> Vec<CommandDef> {
     vec![
         db_load_group_command(provider.clone()),
+        process_groups_command(provider.clone()),
+        qsrv_stats_command(provider.clone()),
+        pvxsl_command(provider.clone()),
+        pvxgl_command(provider.clone()),
+        reset_groups_command(provider),
+    ]
+}
+
+/// Build the QSRV **runtime** (interactive-shell) command set bound to
+/// `provider`: `processGroups`, `qsrvStats`, `pvxsl`, `pvxgl`,
+/// `resetGroups`. Deliberately excludes `dbLoadGroup` — that command is
+/// registered as a base startup command (it queues group files for the
+/// runner before iocInit, pvxs only permits it before `iocInit`,
+/// groupsourcehooks.cpp:99-123). The QSRV protocol runner registers this
+/// set into the post-iocInit interactive shell, bound to the *same*
+/// `BridgeProvider` that the served `QsrvPvStore` wraps — so post-init
+/// `processGroups` / `pvxgl` act on the served groups, not a throwaway
+/// provider.
+pub fn register_qsrv_runtime_commands(provider: Arc<BridgeProvider>) -> Vec<CommandDef> {
+    vec![
         process_groups_command(provider.clone()),
         qsrv_stats_command(provider.clone()),
         pvxsl_command(provider.clone()),

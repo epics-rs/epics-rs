@@ -568,6 +568,41 @@ pub trait ChannelSource: Send + Sync + 'static {
         }
     }
 
+    /// Type-state-enforced atomic **PUT_GET**: apply the BitSet-delta PUT,
+    /// then return the post-put readback — the two legs of a PVA PUT_GET
+    /// (cmd 12) as one source operation.
+    ///
+    /// The default impl composes the existing primitives: the WRITE-gated
+    /// [`Self::put_delta_checked`] followed by the READ-gated
+    /// [`Self::get_value_checked`], reusing the same authenticated
+    /// `checked` token and `ctx` for both legs (the readback runs under the
+    /// identical identity as the write, exactly as `put_delta_checked`'s
+    /// own prior-value read does — a `ReadWrite` token allows both). Every
+    /// source that owns its record directly is therefore unchanged by
+    /// construction: its PUT_GET stays put-then-get over the same backing
+    /// store.
+    ///
+    /// Sources that front a *remote* server override this to issue a single
+    /// upstream PUT_GET, so the put-then-get stays atomic upstream instead
+    /// of collapsing to a local put plus a separately-read (possibly
+    /// cached) get. The pva-gateway forwards `ctx.pv_request` + value as one
+    /// upstream `ChannelPutGet` (pva2pva `p2pApp/channel.cpp:129-137`) and
+    /// returns its readback.
+    fn put_get_checked(
+        &self,
+        checked: AccessChecked,
+        desc: FieldDesc,
+        changed: crate::proto::BitSet,
+        delta: PvField,
+        ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Result<Option<PvField>, OpError>> + Send {
+        async move {
+            self.put_delta_checked(checked.clone(), desc, changed, delta, ctx.clone())
+                .await?;
+            Ok(self.get_value_checked(checked, ctx).await)
+        }
+    }
+
     /// True iff PUT is allowed against this PV (for ACL gating).
     fn is_writable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send;
 
@@ -1260,6 +1295,17 @@ pub trait ChannelSourceObj: Send + Sync {
         delta: PvField,
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>>;
+    /// Dyn forwarder for type-state atomic PUT_GET.
+    fn put_get_checked<'a>(
+        &'a self,
+        checked: AccessChecked,
+        desc: FieldDesc,
+        changed: crate::proto::BitSet,
+        delta: PvField,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<PvField>, OpError>> + Send + 'a>,
+    >;
     fn is_writable<'a>(
         &'a self,
         name: &'a str,
@@ -1496,6 +1542,20 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::put_delta_checked(
+            self, checked, desc, changed, delta, ctx,
+        ))
+    }
+    fn put_get_checked<'a>(
+        &'a self,
+        checked: AccessChecked,
+        desc: FieldDesc,
+        changed: crate::proto::BitSet,
+        delta: PvField,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<PvField>, OpError>> + Send + 'a>,
+    > {
+        Box::pin(<Self as ChannelSource>::put_get_checked(
             self, checked, desc, changed, delta, ctx,
         ))
     }

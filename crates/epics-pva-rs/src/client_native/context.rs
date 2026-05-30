@@ -1720,6 +1720,54 @@ impl PvaClient {
         op_put_get(&ch, value_str, self.inner.timeout).await
     }
 
+    /// Atomic `PUT_GET` (cmd 12) of a pre-built [`PvField`] using the
+    /// default `field(value)` pvRequest — the typed-value counterpart of
+    /// [`Self::pvput_get`] (which parses a string). Returns the post-put
+    /// readback `(introspection, value)`.
+    pub async fn pvput_get_pv_field(
+        &self,
+        pv_name: &str,
+        value: &crate::pvdata::PvField,
+    ) -> PvaResult<(FieldDesc, PvField)> {
+        let ch = self.channel(pv_name).await?;
+        crate::client_native::ops_v2::op_put_get_value(&ch, value, self.inner.timeout).await
+    }
+
+    /// Atomic `PUT_GET` (cmd 12) of a pre-built [`PvField`] carrying the
+    /// caller's decoded pvRequest (e.g. a PVA gateway's preserved
+    /// `ChannelContext.pv_request`): one upstream operation that applies
+    /// the put and returns the post-put readback. Like
+    /// [`Self::pvput_pv_field_with_request_value`] but the round trip is a
+    /// single PVA `PUT_GET` rather than a plain PUT — the value is written
+    /// and the server's post-put value returned atomically, with the
+    /// pvRequest's `record._options.process`/`block` honored. The
+    /// pvRequest is serialized in the connection's negotiated byte order at
+    /// INIT; the value targets the `value` bit as in
+    /// [`Self::pvput_pv_field_with_request_value`].
+    ///
+    /// pvxs `p2pApp/channel.cpp:129-137` (`GWChannel::createChannelPutGet`)
+    /// forwards the original pvRequest verbatim and returns the upstream
+    /// readback.
+    pub async fn pvput_get_pv_field_with_request_value(
+        &self,
+        pv_name: &str,
+        pv_request: &crate::pvdata::PvField,
+        value: &crate::pvdata::PvField,
+    ) -> PvaResult<(FieldDesc, PvField)> {
+        let ch = self.channel(pv_name).await?;
+        let order =
+            crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
+                .await?
+                .0
+                .byte_order;
+        let mut bytes = Vec::new();
+        let desc = pv_request.descriptor();
+        crate::pvdata::encode::encode_type_desc(&desc, order, &mut bytes);
+        crate::pvdata::encode::encode_pv_field(pv_request, &desc, order, &mut bytes);
+        crate::client_native::ops_v2::op_put_get_value_raw(&ch, &bytes, value, self.inner.timeout)
+            .await
+    }
+
     /// PVA `PUT_GET` `getGet` subcommand (`QOS_GET`, 0x40) — read the
     /// channel's current get-side data with no put leg, returning the
     /// readback `(introspection, value)`. The EPICS pvAccess

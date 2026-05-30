@@ -121,6 +121,20 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     ) -> Result<(), OpError> {
         Err(OpError::denied("read-only mode: PUT rejected"))
     }
+    // A PUT_GET writes — reject it exactly as `put_delta_checked` does, so
+    // a PUT_GET never reaches the inner source under read-only mode. The
+    // trait default would call `put_delta_checked` (which rejects), but make
+    // the rejection explicit and skip the wasted readback path.
+    async fn put_get_checked(
+        &self,
+        _checked: epics_pva_rs::server_native::source::AccessChecked,
+        _desc: FieldDesc,
+        _changed: epics_pva_rs::proto::BitSet,
+        _delta: PvField,
+        _ctx: ChannelContext,
+    ) -> Result<Option<PvField>, OpError> {
+        Err(OpError::denied("read-only mode: PUT rejected"))
+    }
     // PROCESS mutates upstream record state — it is a WRITE-class op,
     // so reject it here exactly the way `put_value` does. Without this
     // override the trait-default `process` (`Ok(())`) would falsely
@@ -572,6 +586,30 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
         }
         self.inner
             .put_delta_checked(checked, desc, changed, delta, ctx)
+            .await
+    }
+    // A PUT_GET writes — gate it by the same static allowlist as
+    // `put_value_checked`/`put_delta_checked`, then forward to the inner's
+    // atomic `put_get_checked`. Without this override the trait default
+    // decomposes into `put_delta_checked` + `get_value_checked` on THIS
+    // layer, bypassing the inner source's single-op PUT_GET (the gateway's
+    // one-upstream-PUT_GET forward).
+    async fn put_get_checked(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        desc: FieldDesc,
+        changed: epics_pva_rs::proto::BitSet,
+        delta: PvField,
+        ctx: ChannelContext,
+    ) -> Result<Option<PvField>, OpError> {
+        if !self.config.allowed(checked.pv_name()) {
+            return Err(OpError::denied(format!(
+                "ACL: PV '{}' denied",
+                checked.pv_name()
+            )));
+        }
+        self.inner
+            .put_get_checked(checked, desc, changed, delta, ctx)
             .await
     }
     async fn is_writable(&self, name: &str) -> bool {
@@ -1109,6 +1147,35 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
             .await;
         self.sink
             .record(make_audit_event(&pv, &user, &host, &result));
+        result
+    }
+    // Atomic PUT_GET writes the record — audit it with the same Put row
+    // shape as `put_delta_checked` and forward through the inner's
+    // `put_get_checked` so the inner's single-op PUT_GET (the pva-gateway's
+    // one-upstream-PUT_GET forward) is preserved. Without this override the
+    // trait default decomposes into `put_delta_checked` + `get_value_checked`
+    // on THIS layer, bypassing that atomic forward (and recording a Put plus
+    // a Get audit row instead of one Put).
+    async fn put_get_checked(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        desc: FieldDesc,
+        changed: epics_pva_rs::proto::BitSet,
+        delta: PvField,
+        ctx: ChannelContext,
+    ) -> Result<Option<PvField>, OpError> {
+        let pv = checked.pv_name().to_string();
+        let user = ctx.account.clone();
+        let host = ctx.host.clone();
+        let result = self
+            .inner
+            .put_get_checked(checked, desc, changed, delta, ctx)
+            .await;
+        // Audit the write outcome (the readback payload is not logged),
+        // preserving the Denied/Failed bucket the inner reported.
+        let outcome: Result<(), OpError> = result.as_ref().map(|_| ()).map_err(|e| e.clone());
+        self.sink
+            .record(make_audit_event(&pv, &user, &host, &outcome));
         result
     }
     // PROCESS is a record-state mutation — audit it with the same

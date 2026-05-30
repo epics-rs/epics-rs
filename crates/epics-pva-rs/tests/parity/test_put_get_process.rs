@@ -191,6 +191,60 @@ async fn put_get_round_trip() {
     let _ = tokio::time::timeout(Duration::from_secs(2), server.wait()).await;
 }
 
+/// PUT_GET of a typed [`PvField`] carrying a caller-supplied pvRequest
+/// (the PVA-gateway forward path). The source stores twice the put int,
+/// so a readback of 42 proves the typed value reached `put_value` through
+/// the request-carrying client helper and the GET leg ran after it. The
+/// explicit `field(value)` pvRequest is encoded at INIT — a malformed
+/// encoding would fail the server's `request_to_mask` rather than return
+/// the readback, so a successful 42 also proves the pvRequest reached the
+/// server.
+#[tokio::test]
+async fn put_get_with_request_value_round_trips() {
+    let (port, udp) = alloc_port();
+    let cfg = PvaServerConfig {
+        tcp_port: port,
+        udp_port: udp,
+        ..Default::default()
+    };
+    let src = DoublingSource::new();
+    let server = PvaServer::start(Arc::new(src.clone()), cfg).expect("test server must start");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = client_to(port);
+
+    let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
+    s.fields
+        .push(("value".into(), PvField::Scalar(ScalarValue::Int(21))));
+    let value = PvField::Structure(s);
+    let req = epics_pva_rs::pv_request::PvRequestBuilder::new()
+        .field("value")
+        .build()
+        .to_pv_field();
+
+    let (_intro, readback) = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.pvput_get_pv_field_with_request_value("dut", &req, &value),
+    )
+    .await
+    .expect("pvput_get_pv_field_with_request_value timed out")
+    .expect("pvput_get_pv_field_with_request_value failed");
+
+    assert_eq!(
+        int_value(&readback),
+        42,
+        "typed PUT_GET readback should be the doubled (post-put) value"
+    );
+    assert_eq!(
+        *src.value.lock(),
+        42,
+        "source should hold the doubled value"
+    );
+
+    server.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(2), server.wait()).await;
+}
+
 /// PUT_GET then a plain GET observe the same post-put value — the
 /// PUT_GET op leaves the channel in a consistent state.
 #[tokio::test]

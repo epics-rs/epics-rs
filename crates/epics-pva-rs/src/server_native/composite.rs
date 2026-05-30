@@ -571,6 +571,33 @@ impl ChannelSource for CompositeSource {
         }
     }
 
+    /// Atomic PUT_GET routed to the resolving owner's `put_get_checked`.
+    /// Without this override the trait default would decompose the op into
+    /// `put_delta_checked` + `get_value_checked` on the composite itself,
+    /// bypassing an owner source's single-op PUT_GET (e.g. the pva-gateway's
+    /// one-upstream-PUT_GET forward). Re-mints the inner token through the
+    /// owner's gate exactly as the other `_checked` forwarders do.
+    fn put_get_checked(
+        &self,
+        checked: AccessChecked,
+        desc: FieldDesc,
+        changed: crate::proto::BitSet,
+        delta: PvField,
+        ctx: crate::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Result<Option<PvField>, OpError>> + Send {
+        let name = checked.pv_name().to_string();
+        let this = self.snapshot();
+        async move {
+            match Self::resolve_checked(this, &name, &ctx).await {
+                Some((src, inner_checked)) => {
+                    src.put_get_checked(inner_checked, desc, changed, delta, ctx)
+                        .await
+                }
+                None => Err(OpError::failed(format!("no source serves '{name}'"))),
+            }
+        }
+    }
+
     fn subscribe_checked(
         &self,
         checked: AccessChecked,

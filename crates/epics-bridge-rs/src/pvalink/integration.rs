@@ -24,7 +24,7 @@ use epics_base_rs::types::EpicsValue;
 use epics_pva_rs::pvdata::{PvField, ScalarValue};
 
 use super::config::{LinkDirection, PvaLinkConfig};
-use super::link::{PvaLink, PvaLinkError, PvaLinkResult, ScanEvent};
+use super::link::{PvaLink, PvaLinkError, PvaLinkResult, ScanEvent, ScanOverrun};
 use super::registry::PvaLinkRegistry;
 
 /// Wrap `tokio::task::block_in_place(f)` with a runtime-flavour check.
@@ -432,10 +432,19 @@ impl PvaLinkResolver {
         };
         let scan_targets = self.scan_targets.clone();
         let db = self.db.clone();
+        // The link's coalescing overrun accounting: the monitor task arms
+        // it on a full queue, the forwarder drains the owed scan, so no
+        // CP/CPP scan is silently lost under a saturated queue.
+        let scan_overrun = link.scan_overrun();
         // field is now per-ScanTarget (not shared across all
         // targets). `run_notify_forwarder` reads each target's own field.
-        self.handle
-            .spawn(run_notify_forwarder(key, rx, scan_targets, db));
+        self.handle.spawn(run_notify_forwarder(
+            key,
+            rx,
+            scan_targets,
+            db,
+            scan_overrun,
+        ));
     }
 
     /// Whether `pv_name` names a channel hosted by the attached
@@ -847,127 +856,162 @@ async fn run_notify_forwarder(
     mut rx: tokio::sync::mpsc::Receiver<ScanEvent>,
     scan_targets: ScanTargetMap,
     db: Arc<parking_lot::RwLock<Option<PvDatabase>>>,
+    scan_overrun: Arc<ScanOverrun>,
 ) {
     // Every event — `Value` or `Disconnected` — drives the same scan
-    // loop. The event payload is intentionally unused: pvxs does not
+    // pass. The event payload is intentionally unused: pvxs does not
     // value-diff before scanning (see the doc comment above), and the
     // cached value itself is updated by the monitor task, not here.
-    while rx.recv().await.is_some() {
-        // Snapshot the fan-out, then order it: atomic group first,
-        // then non-atomic; `monorder` within each group.
-        let mut targets: Vec<(String, i32, bool, bool)> =
-            match scan_targets.read().get(&monitor_key) {
-                Some(fanout) => fanout
-                    .records
-                    .iter()
-                    .map(|t| (t.record.clone(), t.monorder, t.atomic, t.passive_only))
-                    .collect(),
-                None => Vec::new(),
-            };
-        // Sort key: (!atomic, monorder) → atomic (false sorts first),
-        // then ascending monorder.
-        targets.sort_by_key(|(_, order, atomic, _)| (!*atomic, *order));
+    //
+    // After each pass, drain any coalesced overruns: when the bounded
+    // queue filled, the monitor task armed `scan_overrun` instead of
+    // dropping the event (EPICS `db_queue_event_log`,
+    // `dbEvent.c:808-826`) — each armed flag owes one more scan with the
+    // latest cached value, so a saturated queue never silently skips a
+    // CP/CPP process. The queue was full when the flag was set, so the
+    // backlog `recv` already woke this task (no lost wakeup), matching
+    // EPICS skipping the re-signal because "the event task has already
+    // been notified" (`dbEvent.c:823`). A channel-close (`recv` => None)
+    // still drains a final owed scan before exiting.
+    loop {
+        let event = rx.recv().await;
+        if event.is_some() {
+            scan_once(&monitor_key, &scan_targets, &db).await;
+        }
+        while scan_overrun.take_pending() {
+            scan_once(&monitor_key, &scan_targets, &db).await;
+        }
+        if event.is_none() {
+            break;
+        }
+    }
+}
 
-        let Some(db_handle) = db.read().clone() else {
-            continue;
-        };
-
-        // pvxs builds a `DBManyLock` over every atomic
-        // scan-on-update target record and holds a `DBManyLocker`
-        // across the whole atomic scan (`pvxs/ioc/pvalink_channel.cpp:386`
-        // and `:422`). Acquire the database-level multi-record epoch
-        // lock over the atomic target set *before* scanning any of
-        // them, and hold it across the whole atomic group, so a
-        // direct writer, another scan, or an atomic sibling cannot
-        // interleave between the atomic target records. Non-atomic
-        // targets are scanned individually afterwards — matching
-        // pvxs, which gives each non-atomic record its own per-record
-        // `DBLocker` rather than the shared many-lock.
-        //
-        // The atomic record set is the same for every monitor event
-        // on this PV, so it is collected from the already-sorted
-        // `targets` list. `lock_records` itself alias-resolves,
-        // deduplicates and sorts, so a record bound by more than one
-        // atomic link is locked exactly once.
-        let atomic_records: Vec<String> = targets
+/// Run one CP/CPP scan pass for `monitor_key`'s registered targets.
+/// Atomic targets scan first as one contiguous group under a single
+/// multi-record lock, then non-atomic targets; `monorder` orders within
+/// each group. The scan trigger carries no value — each target reads the
+/// link's `latest` cache through its own INP read (see
+/// [`run_notify_forwarder`]).
+async fn scan_once(
+    monitor_key: &MonitorKey,
+    scan_targets: &ScanTargetMap,
+    db: &Arc<parking_lot::RwLock<Option<PvDatabase>>>,
+) {
+    // Snapshot the fan-out, then order it: atomic group first,
+    // then non-atomic; `monorder` within each group.
+    let mut targets: Vec<(String, i32, bool, bool)> = match scan_targets.read().get(monitor_key) {
+        Some(fanout) => fanout
+            .records
             .iter()
-            .filter(|(_, _, atomic, _)| *atomic)
-            .map(|(record, _, _, _)| record.clone())
-            .collect();
+            .map(|t| (t.record.clone(), t.monorder, t.atomic, t.passive_only))
+            .collect(),
+        None => Vec::new(),
+    };
+    // Sort key: (!atomic, monorder) → atomic (false sorts first),
+    // then ascending monorder.
+    targets.sort_by_key(|(_, order, atomic, _)| (!*atomic, *order));
 
-        // The epoch guard is held only across the atomic group. pvxs
-        // scopes `DBManyLocker L(atomic_lock)` to the atomic-target
-        // loop and gives non-atomic targets their own per-record
-        // `DBLocker` afterwards — so the epoch must be dropped at the
-        // atomic→non-atomic boundary, not at the end of the batch.
-        // Held in an `Option`; `None` once dropped (or when there are
-        // no atomic targets at all).
-        let mut atomic_epoch = if atomic_records.is_empty() {
-            None
-        } else {
-            Some(db_handle.lock_records(&atomic_records).await)
-        };
+    let Some(db_handle) = db.read().clone() else {
+        // No database attached yet — skip this scan pass.
+        return;
+    };
 
-        for (record, _order, atomic, passive_only) in &targets {
-            // `targets` is sorted atomic-first; the first non-atomic
-            // target marks the end of the atomic group, so release
-            // the epoch here — exactly where pvxs's `DBManyLocker`
-            // goes out of scope before the non-atomic loop.
-            if !*atomic {
-                atomic_epoch = None;
-            }
-            // `CPP` (passive_only) only fires when the owning
-            // record's SCAN is Passive. pvxs `pvalink_channel.cpp:313`
-            // checks `prec->scan != 0` and skips processing; non-zero
-            // SCAN (Event, IO Intr, periodic) means the record has
-            // its own scan source and must not be re-fired from CPP.
-            if *passive_only {
-                let is_passive = match db_handle.get_record(record).await {
-                    Some(rec) => matches!(
-                        rec.read().await.common.scan,
-                        epics_base_rs::server::record::ScanType::Passive
-                    ),
-                    None => continue,
-                };
-                if !is_passive {
-                    continue;
-                }
-            }
-            // B3: process WITH links so the CP/CPP-driven scan fans
-            // out via INP/OUT/FLNK — a pvalink feeding a calc record
-            // must propagate to the calc's FLNK chain. Bare
-            // `process_record` runs only `process_local` and would
-            // drop the chain. Fresh `visited` set + depth 0: this is
-            // the foreign-caller entry, like the scan loop and FLNK
-            // dispatch.
-            //
-            // an atomic target runs while `atomic_epoch`
-            // (`lock_records` over the atomic member set) is still
-            // held — its advisory write gate is already owned by this
-            // transaction. The gate `Mutex` is not reentrant, so an
-            // atomic target MUST process through the `_already_locked`
-            // entry; processing it via the gate-acquiring
-            // `process_record_with_links` would dead-lock the epoch
-            // against itself. A non-atomic target is reached only
-            // after the epoch was dropped at the atomic→non-atomic
-            // boundary above, so it is a genuine fresh foreign entry
-            // and takes the gate normally.
-            let mut visited = std::collections::HashSet::new();
-            if *atomic {
-                let _ = db_handle
-                    .process_record_with_links_already_locked(record, &mut visited, 0)
-                    .await;
-            } else {
-                let _ = db_handle
-                    .process_record_with_links(record, &mut visited, 0)
-                    .await;
+    // pvxs builds a `DBManyLock` over every atomic
+    // scan-on-update target record and holds a `DBManyLocker`
+    // across the whole atomic scan (`pvxs/ioc/pvalink_channel.cpp:386`
+    // and `:422`). Acquire the database-level multi-record epoch
+    // lock over the atomic target set *before* scanning any of
+    // them, and hold it across the whole atomic group, so a
+    // direct writer, another scan, or an atomic sibling cannot
+    // interleave between the atomic target records. Non-atomic
+    // targets are scanned individually afterwards — matching
+    // pvxs, which gives each non-atomic record its own per-record
+    // `DBLocker` rather than the shared many-lock.
+    //
+    // The atomic record set is the same for every monitor event
+    // on this PV, so it is collected from the already-sorted
+    // `targets` list. `lock_records` itself alias-resolves,
+    // deduplicates and sorts, so a record bound by more than one
+    // atomic link is locked exactly once.
+    let atomic_records: Vec<String> = targets
+        .iter()
+        .filter(|(_, _, atomic, _)| *atomic)
+        .map(|(record, _, _, _)| record.clone())
+        .collect();
+
+    // The epoch guard is held only across the atomic group. pvxs
+    // scopes `DBManyLocker L(atomic_lock)` to the atomic-target
+    // loop and gives non-atomic targets their own per-record
+    // `DBLocker` afterwards — so the epoch must be dropped at the
+    // atomic→non-atomic boundary, not at the end of the batch.
+    // Held in an `Option`; `None` once dropped (or when there are
+    // no atomic targets at all).
+    let mut atomic_epoch = if atomic_records.is_empty() {
+        None
+    } else {
+        Some(db_handle.lock_records(&atomic_records).await)
+    };
+
+    for (record, _order, atomic, passive_only) in &targets {
+        // `targets` is sorted atomic-first; the first non-atomic
+        // target marks the end of the atomic group, so release
+        // the epoch here — exactly where pvxs's `DBManyLocker`
+        // goes out of scope before the non-atomic loop.
+        if !*atomic {
+            atomic_epoch = None;
+        }
+        // `CPP` (passive_only) only fires when the owning
+        // record's SCAN is Passive. pvxs `pvalink_channel.cpp:313`
+        // checks `prec->scan != 0` and skips processing; non-zero
+        // SCAN (Event, IO Intr, periodic) means the record has
+        // its own scan source and must not be re-fired from CPP.
+        if *passive_only {
+            let is_passive = match db_handle.get_record(record).await {
+                Some(rec) => matches!(
+                    rec.read().await.common.scan,
+                    epics_base_rs::server::record::ScanType::Passive
+                ),
+                None => continue,
+            };
+            if !is_passive {
+                continue;
             }
         }
-
-        // Drop any still-held epoch (an all-atomic batch never hit
-        // the non-atomic boundary above).
-        drop(atomic_epoch);
+        // B3: process WITH links so the CP/CPP-driven scan fans
+        // out via INP/OUT/FLNK — a pvalink feeding a calc record
+        // must propagate to the calc's FLNK chain. Bare
+        // `process_record` runs only `process_local` and would
+        // drop the chain. Fresh `visited` set + depth 0: this is
+        // the foreign-caller entry, like the scan loop and FLNK
+        // dispatch.
+        //
+        // an atomic target runs while `atomic_epoch`
+        // (`lock_records` over the atomic member set) is still
+        // held — its advisory write gate is already owned by this
+        // transaction. The gate `Mutex` is not reentrant, so an
+        // atomic target MUST process through the `_already_locked`
+        // entry; processing it via the gate-acquiring
+        // `process_record_with_links` would dead-lock the epoch
+        // against itself. A non-atomic target is reached only
+        // after the epoch was dropped at the atomic→non-atomic
+        // boundary above, so it is a genuine fresh foreign entry
+        // and takes the gate normally.
+        let mut visited = std::collections::HashSet::new();
+        if *atomic {
+            let _ = db_handle
+                .process_record_with_links_already_locked(record, &mut visited, 0)
+                .await;
+        } else {
+            let _ = db_handle
+                .process_record_with_links(record, &mut visited, 0)
+                .await;
+        }
     }
+
+    // Drop any still-held epoch (an all-atomic batch never hit
+    // the non-atomic boundary above).
+    drop(atomic_epoch);
 }
 
 impl LinkSet for PvaLinkResolver {
@@ -2050,7 +2094,13 @@ mod tests {
         let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
 
         let (tx, rx) = tokio::sync::mpsc::channel::<ScanEvent>(8);
-        let forwarder = tokio::spawn(run_notify_forwarder(mk("SRC"), rx, scan_targets, db_slot));
+        let forwarder = tokio::spawn(run_notify_forwarder(
+            mk("SRC"),
+            rx,
+            scan_targets,
+            db_slot,
+            Arc::new(ScanOverrun::default()),
+        ));
 
         // Two distinct values → two scans.
         tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
@@ -2059,6 +2109,75 @@ mod tests {
         forwarder.await.unwrap();
 
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// Scan-trigger overrun, consumer half: with `Q=1` and a saturated
+    /// scan-trigger queue, two monitor events must NOT collapse into one
+    /// silent missing CP/CPP process. The first event sits in the full
+    /// `Q=1` channel; the second overran and coalesced into an overrun
+    /// marker (`ScanOverrun::mark`, as `enqueue_scan_trigger` does on a
+    /// full queue). The forwarder drains BOTH — the queued event and the
+    /// coalesced owed scan — so the owning record processes twice, with
+    /// the overrun explicitly counted, never silently dropped.
+    #[tokio::test]
+    async fn br69_full_queue_overrun_still_scans_no_silent_loss() {
+        let db = PvDatabase::new();
+        let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        db.add_record(
+            "DEST",
+            Box::new(CountingRecord {
+                count: count.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut fanout = ScanFanout::default();
+        fanout.records.push(ScanTarget {
+            record: "DEST".to_string(),
+            monorder: 0,
+            atomic: false,
+            passive_only: false,
+        });
+        let scan_targets: ScanTargetMap =
+            Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
+                (mk("SRC"), fanout),
+            ])));
+        let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
+
+        // Q=1: the queue holds exactly one trigger.
+        let (tx, rx) = tokio::sync::mpsc::channel::<ScanEvent>(1);
+        let overrun = Arc::new(ScanOverrun::default());
+
+        // First monitor event fills the Q=1 queue.
+        tx.try_send(ScanEvent::Value(nt_scalar(1.0))).unwrap();
+        // Second monitor event finds the queue full → coalesces to the
+        // latest cache + overrun marker instead of a silent drop. This is
+        // exactly what `enqueue_scan_trigger` does on a full queue.
+        overrun.mark();
+
+        let forwarder = tokio::spawn(run_notify_forwarder(
+            mk("SRC"),
+            rx,
+            scan_targets,
+            db_slot,
+            overrun.clone(),
+        ));
+        drop(tx); // close so the forwarder loop ends after draining
+        forwarder.await.unwrap();
+
+        // Two events delivered to the callback → two record processes
+        // (one queued, one coalesced), NOT one silent miss.
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the overrun-coalesced event must still drive a CP scan"
+        );
+        assert_eq!(
+            overrun.count(),
+            1,
+            "the overrun is explicitly counted, not silently dropped"
+        );
     }
 
     /// BRIDGE-RS-2026-05-28-51: repeated *identical* monitor values still
@@ -2096,7 +2215,13 @@ mod tests {
         let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
 
         let (tx, rx) = tokio::sync::mpsc::channel::<ScanEvent>(8);
-        let forwarder = tokio::spawn(run_notify_forwarder(mk("SRC"), rx, scan_targets, db_slot));
+        let forwarder = tokio::spawn(run_notify_forwarder(
+            mk("SRC"),
+            rx,
+            scan_targets,
+            db_slot,
+            Arc::new(ScanOverrun::default()),
+        ));
 
         // Three identical values — pvxs processes all three.
         tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
@@ -2169,7 +2294,13 @@ mod tests {
         let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
 
         let (tx, rx) = tokio::sync::mpsc::channel::<ScanEvent>(8);
-        let forwarder = tokio::spawn(run_notify_forwarder(mk("SRC"), rx, scan_targets, db_slot));
+        let forwarder = tokio::spawn(run_notify_forwarder(
+            mk("SRC"),
+            rx,
+            scan_targets,
+            db_slot,
+            Arc::new(ScanOverrun::default()),
+        ));
 
         // One value (each target scans once), then a disconnect with no
         // trailing value (each target must scan again).
@@ -2239,7 +2370,13 @@ mod tests {
         let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
 
         let (tx, rx) = tokio::sync::mpsc::channel::<ScanEvent>(8);
-        let forwarder = tokio::spawn(run_notify_forwarder(mk("SRC"), rx, scan_targets, db_slot));
+        let forwarder = tokio::spawn(run_notify_forwarder(
+            mk("SRC"),
+            rx,
+            scan_targets,
+            db_slot,
+            Arc::new(ScanOverrun::default()),
+        ));
 
         tx.send(ScanEvent::Value(nt_scalar(5.0))).await.unwrap();
         drop(tx);
@@ -2438,7 +2575,13 @@ mod tests {
         let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
 
         let (tx, rx) = tokio::sync::mpsc::channel::<ScanEvent>(4);
-        let forwarder = tokio::spawn(run_notify_forwarder(mk("SRC"), rx, scan_targets, db_slot));
+        let forwarder = tokio::spawn(run_notify_forwarder(
+            mk("SRC"),
+            rx,
+            scan_targets,
+            db_slot,
+            Arc::new(ScanOverrun::default()),
+        ));
         tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
         drop(tx);
         forwarder.await.unwrap();
@@ -2479,7 +2622,13 @@ mod tests {
             ])));
         let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
         let (tx, rx) = tokio::sync::mpsc::channel::<ScanEvent>(4);
-        let forwarder = tokio::spawn(run_notify_forwarder(mk("SRC"), rx, scan_targets, db_slot));
+        let forwarder = tokio::spawn(run_notify_forwarder(
+            mk("SRC"),
+            rx,
+            scan_targets,
+            db_slot,
+            Arc::new(ScanOverrun::default()),
+        ));
         // Two identical values: both scan (pvxs does no value-diff).
         tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
         tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
@@ -3179,7 +3328,13 @@ mod tests {
         let db_slot = Arc::new(parking_lot::RwLock::new(Some(db.clone())));
 
         let (tx, rx) = tokio::sync::mpsc::channel::<ScanEvent>(4);
-        let forwarder = tokio::spawn(run_notify_forwarder(mk("SRC"), rx, scan_targets, db_slot));
+        let forwarder = tokio::spawn(run_notify_forwarder(
+            mk("SRC"),
+            rx,
+            scan_targets,
+            db_slot,
+            Arc::new(ScanOverrun::default()),
+        ));
 
         // Competing party: contends for an epoch over an atomic
         // target record (AT:B). It waits until the forwarder is

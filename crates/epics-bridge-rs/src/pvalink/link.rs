@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -64,6 +64,72 @@ pub enum ScanEvent {
     /// I/O). Carries no value; the forwarder scans CP/CPP targets
     /// unconditionally so the owning record processes the disconnect.
     Disconnected,
+}
+
+/// Overrun accounting for the INP-monitor scan-trigger queue.
+///
+/// The bounded `mpsc` between the monitor task and the scan forwarder
+/// holds up to the link's `Q` triggers. When it is full, the surplus
+/// monitor event is NOT dropped: its value has already coalesced into
+/// the link's `latest` cache (the forwarder reads `latest`, never the
+/// event payload), and this records that ONE more CP/CPP scan is owed
+/// plus increments an overrun counter — so the owning record still
+/// processes the newest value and the loss-of-intermediate-events is
+/// explicit, never silent.
+///
+/// This mirrors EPICS `db_queue_event_log`'s replace-last-on-full
+/// coalescing (`modules/database/src/ioc/db/dbEvent.c:808-826`): on a
+/// full event ring it replaces the last queued event for the monitor
+/// (latest-wins), bumps `evSubscrip::nreplace`, and skips re-signalling
+/// the event task because "the event task has already been notified"
+/// (`dbEvent.c:823`) — exactly the no-extra-wakeup property relied on
+/// here (a full queue means a backlog `recv` will wake the forwarder).
+#[derive(Debug, Default)]
+pub(crate) struct ScanOverrun {
+    /// A coalesced scan trigger is owed: the forwarder must run one more
+    /// scan pass against the `latest` cache. Set by the monitor task on
+    /// a full queue, cleared by the forwarder when it runs the pass.
+    pending: AtomicBool,
+    /// Total monitor events that overran the queue and coalesced — the
+    /// EPICS `evSubscrip::nreplace` overrun marker, surfaced for
+    /// diagnostics/tests.
+    replaced: AtomicU64,
+}
+
+impl ScanOverrun {
+    /// Record a coalesced overrun: arm the owed scan and bump the
+    /// overrun counter. Called by [`enqueue_scan_trigger`] when the
+    /// scan-trigger queue is full.
+    pub(crate) fn mark(&self) {
+        self.replaced.fetch_add(1, Ordering::Relaxed);
+        // Release so the forwarder's `Acquire` swap observes the arm
+        // together with the `latest` write that preceded it.
+        self.pending.store(true, Ordering::Release);
+    }
+
+    /// Forwarder side: take the owed scan trigger (`true` => run one more
+    /// scan pass). Idempotent — clears the flag.
+    pub(crate) fn take_pending(&self) -> bool {
+        self.pending.swap(false, Ordering::AcqRel)
+    }
+
+    /// Total coalesced overruns observed since the link opened.
+    pub(crate) fn count(&self) -> u64 {
+        self.replaced.load(Ordering::Relaxed)
+    }
+}
+
+/// Enqueue one scan trigger onto the bounded forwarder channel,
+/// coalescing on a full queue instead of dropping. This is the single
+/// owner of the "deliver a scan trigger, never lose one" rule: both the
+/// value path and the disconnect path of the monitor task route through
+/// it, so a saturated queue coalesces to the latest cache + overrun
+/// marker uniformly (EPICS `db_queue_event_log`, `dbEvent.c:808-826`),
+/// never a silent best-effort drop.
+fn enqueue_scan_trigger(tx: &mpsc::Sender<ScanEvent>, overrun: &ScanOverrun, event: ScanEvent) {
+    if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(event) {
+        overrun.mark();
+    }
 }
 
 /// A live PVA link.
@@ -153,6 +219,12 @@ pub struct PvaLink {
     /// on the invalid read (`pvalink_lset.cpp:268-270`). `None` until the
     /// first disconnect; shared with the monitor task, so it is an `Arc`.
     disconnect_time: Arc<Mutex<Option<(i64, i32)>>>,
+    /// Coalescing overrun accounting for the scan-trigger queue. Shared
+    /// with the monitor task (producer, marks on a full queue) and the
+    /// scan forwarder (consumer, drains the owed scan), so a full local
+    /// queue coalesces to `latest` + an overrun marker rather than
+    /// silently dropping a CP/CPP scan. `Arc` because it is shared.
+    scan_overrun: Arc<ScanOverrun>,
 }
 
 /// A queued OUT-link Put, preserving the caller's original value
@@ -205,17 +277,20 @@ impl PvaLink {
 
         let latest = Arc::new(Mutex::new(None));
         let disconnect_time: Arc<Mutex<Option<(i64, i32)>>> = Arc::new(Mutex::new(None));
+        let scan_overrun = Arc::new(ScanOverrun::default());
         let mut notify_rx = None;
         let mut monitor_abort = None;
         let mut monitor_connected = None;
 
         if matches!(config.direction, LinkDirection::Inp) && config.monitor {
             // B3 / B4-Q: the channel buffer is sized to the link's
-            // `Q` (monitor queue depth) so a slow record-side
-            // consumer back-pressures rather than silently dropping
-            // events. `try_send` below still tolerates a full
-            // channel (the `latest` cache is authoritative for the
-            // value itself; the channel only drives scan-on-update).
+            // `Q` (monitor queue depth). When it fills, the monitor
+            // task does NOT silently drop the event — it coalesces to
+            // the `latest` cache and arms an overrun marker via
+            // `enqueue_scan_trigger`, so the forwarder still runs one
+            // CP/CPP scan with the newest value (EPICS
+            // `db_queue_event_log` replace-last-on-full,
+            // `dbEvent.c:808-826`).
             let (tx, rx) = mpsc::channel::<ScanEvent>(config.queue_size.max(1));
             notify_rx = Some(rx);
 
@@ -226,6 +301,7 @@ impl PvaLink {
             let connected_for_task = connected.clone();
             monitor_connected = Some(connected);
             let disconnect_time_task = disconnect_time.clone();
+            let scan_overrun_task = scan_overrun.clone();
             // B4-pipeline / B4-Q: when the link asks for pipeline
             // flow-control or a non-default queue depth, build a
             // pvRequest carrying `record[pipeline=...,queueSize=N]`
@@ -248,6 +324,7 @@ impl PvaLink {
                     let tx_inner = tx.clone();
                     let latest_inner = latest_clone.clone();
                     let connected_inner = connected_for_task.clone();
+                    let overrun_inner = scan_overrun_task.clone();
                     // Liveness is proven by a delivered event, not by
                     // entering `pvmonitor` (which may fail immediately
                     // against a down IOC). The callback flips the flag
@@ -256,7 +333,16 @@ impl PvaLink {
                     let on_event = move |value: &PvField| {
                         connected_inner.store(true, Ordering::Release);
                         *latest_inner.lock() = Some(value.clone());
-                        let _ = tx_inner.try_send(ScanEvent::Value(value.clone()));
+                        // The value is now cached in `latest`; enqueue a
+                        // scan trigger, coalescing to the cache + overrun
+                        // marker if the queue is full rather than dropping
+                        // the CP/CPP scan (EPICS `db_queue_event_log`,
+                        // `dbEvent.c:808-826`).
+                        enqueue_scan_trigger(
+                            &tx_inner,
+                            &overrun_inner,
+                            ScanEvent::Value(value.clone()),
+                        );
                     };
                     let result = match &request {
                         Some(req) => {
@@ -297,11 +383,13 @@ impl PvaLink {
                         // atomic/non-atomic target lists after the
                         // `catch(client::Disconnect&)` branch
                         // (`pvalink_channel.cpp:359-373` + `:420-432`).
-                        // `try_send` matches the value path: the channel
-                        // is drained promptly and a single disconnect
-                        // event sits alone, so a drop here is only
-                        // possible under an already-saturated backlog.
-                        let _ = tx.try_send(ScanEvent::Disconnected);
+                        // Same coalescing rule as the value path: if the
+                        // channel is saturated, mark an owed scan instead
+                        // of dropping the disconnect trigger. The owed scan
+                        // is payload-less, so the forwarder still reads
+                        // `is_connected() == false` and raises
+                        // LINK_ALARM/INVALID on the CP/CPP targets.
+                        enqueue_scan_trigger(&tx, &scan_overrun_task, ScanEvent::Disconnected);
                     }
                     match &result {
                         Ok(()) => tracing::debug!(
@@ -331,8 +419,26 @@ impl PvaLink {
             out_scratch: Mutex::new(HashMap::new()),
             retry_pending: AtomicBool::new(false),
             disconnect_time,
+            scan_overrun,
             _monitor_abort: monitor_abort,
         })
+    }
+
+    /// The shared scan-trigger overrun accounting for this link's INP
+    /// monitor. Handed to the scan forwarder so a full-queue coalesce
+    /// still drives one CP/CPP scan, and read by diagnostics/tests.
+    pub(crate) fn scan_overrun(&self) -> Arc<ScanOverrun> {
+        self.scan_overrun.clone()
+    }
+
+    /// Total monitor events that overran the bounded scan-trigger queue
+    /// and coalesced into the latest value (EPICS `evSubscrip::nreplace`,
+    /// `dbEvent.c:821`). A non-zero count means intermediate events were
+    /// folded into the newest — not silently dropped — and the owning
+    /// record still scanned. Surfaced for diagnostics and regression
+    /// tests.
+    pub fn monitor_overrun_count(&self) -> u64 {
+        self.scan_overrun.count()
     }
 
     /// Take the INP-monitor notification receiver (B3). Returns the
@@ -1196,6 +1302,7 @@ impl PvaLink {
             out_scratch: Mutex::new(HashMap::new()),
             retry_pending: AtomicBool::new(false),
             disconnect_time: Arc::new(Mutex::new(None)),
+            scan_overrun: Arc::new(ScanOverrun::default()),
         }
     }
 
@@ -1216,6 +1323,7 @@ impl PvaLink {
             out_scratch: Mutex::new(HashMap::new()),
             retry_pending: AtomicBool::new(false),
             disconnect_time: Arc::new(Mutex::new(None)),
+            scan_overrun: Arc::new(ScanOverrun::default()),
         }
     }
 
@@ -1241,6 +1349,7 @@ impl PvaLink {
             out_scratch: Mutex::new(HashMap::new()),
             retry_pending: AtomicBool::new(false),
             disconnect_time: Arc::new(Mutex::new(None)),
+            scan_overrun: Arc::new(ScanOverrun::default()),
         };
         (link, flag)
     }
@@ -1684,6 +1793,57 @@ fn _suppress(_: &PvStructure) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scan-trigger overrun, producer half: a full scan-trigger queue
+    /// does NOT silently drop the monitor event. `enqueue_scan_trigger`
+    /// coalesces to the `latest` cache (already updated by the caller)
+    /// and marks an overrun (EPICS `db_queue_event_log` replace-last,
+    /// `dbEvent.c:808-826`), so the forwarder still owes one CP/CPP scan.
+    #[tokio::test]
+    async fn enqueue_scan_trigger_coalesces_on_full_queue() {
+        let val = PvField::Scalar(ScalarValue::Double(1.0));
+        let (tx, mut rx) = mpsc::channel::<ScanEvent>(1);
+        let overrun = ScanOverrun::default();
+
+        // First trigger fits the Q=1 queue — no overrun.
+        enqueue_scan_trigger(&tx, &overrun, ScanEvent::Value(val.clone()));
+        assert_eq!(overrun.count(), 0, "first send must not overrun");
+        assert!(!overrun.take_pending(), "no owed scan after a fitting send");
+
+        // Re-fill the (now empty after take? no — we didn't recv) queue.
+        // The queue still holds the first event, so the next send finds
+        // it full and must coalesce, not drop.
+        enqueue_scan_trigger(&tx, &overrun, ScanEvent::Value(val.clone()));
+        assert_eq!(overrun.count(), 1, "second send onto a full queue overruns");
+        assert!(
+            overrun.take_pending(),
+            "a full-queue overrun owes exactly one more scan (no silent loss)"
+        );
+        // Idempotent: the owed scan is consumed exactly once.
+        assert!(!overrun.take_pending(), "owed scan is taken only once");
+
+        // The single queued event is still deliverable (the surplus
+        // coalesced into the overrun marker, it did not evict the queued
+        // one).
+        assert!(matches!(rx.try_recv(), Ok(ScanEvent::Value(_))));
+        assert!(rx.try_recv().is_err(), "exactly one event was queued");
+    }
+
+    /// Scan-trigger overrun, producer half, disconnect path: the same
+    /// coalescing rule covers a `Disconnected` trigger — a full queue
+    /// marks an owed (payload-less) scan instead of dropping it.
+    #[tokio::test]
+    async fn enqueue_scan_trigger_coalesces_disconnect_on_full_queue() {
+        let (tx, _rx) = mpsc::channel::<ScanEvent>(1);
+        let overrun = ScanOverrun::default();
+        enqueue_scan_trigger(&tx, &overrun, ScanEvent::Disconnected); // fills Q=1
+        enqueue_scan_trigger(&tx, &overrun, ScanEvent::Disconnected); // full → coalesce
+        assert_eq!(overrun.count(), 1);
+        assert!(
+            overrun.take_pending(),
+            "a dropped disconnect still owes a scan"
+        );
+    }
 
     #[test]
     fn extract_top_level_value() {

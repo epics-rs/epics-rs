@@ -125,6 +125,8 @@ async fn gateway_get_forwards_upstream_value() {
         read_only: false,
         acl: None,
         audit: None,
+        control_acf_path: None,
+        control_reload_acf_path: None,
     };
     let gw = PvaGateway::start(cfg).expect("gateway start");
 
@@ -182,6 +184,8 @@ async fn gateway_monitor_fans_out_to_two_clients() {
         read_only: false,
         acl: None,
         audit: None,
+        control_acf_path: None,
+        control_reload_acf_path: None,
     };
     let gw = PvaGateway::start(cfg).expect("gateway start");
 
@@ -301,6 +305,8 @@ async fn gateway_155_monitor_seeds_current_value_once() {
         read_only: false,
         acl: None,
         audit: None,
+        control_acf_path: None,
+        control_reload_acf_path: None,
     };
     let gw = PvaGateway::start(cfg).expect("gateway start");
     let client = gw.client_config();
@@ -427,6 +433,8 @@ async fn gateway_control_prefix_cache_size() {
         read_only: false,
         acl: None,
         audit: None,
+        control_acf_path: None,
+        control_reload_acf_path: None,
     };
     let gw = PvaGateway::start(cfg).expect("gateway start");
 
@@ -738,6 +746,8 @@ fn gateway_cfg(upstream: Arc<PvaClient>) -> PvaGatewayConfig {
         read_only: false,
         acl: None,
         audit: None,
+        control_acf_path: None,
+        control_reload_acf_path: None,
     }
 }
 

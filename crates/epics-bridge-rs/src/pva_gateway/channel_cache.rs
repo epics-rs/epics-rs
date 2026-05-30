@@ -144,15 +144,20 @@ impl PauseSink {
 /// Two things can move either side of that equation: a vote changes
 /// (`apply_vote`, written solely by the gateway's single applier task) or
 /// the physical sink is *replaced* on an upstream reconnect (`install`),
-/// which resets the wire pipeline to flowing while the standing votes
-/// survive. Both paths end in [`Self::reconcile`], which re-reads the
-/// aggregate **at drive time** (level-triggered, not edge-triggered) and
-/// drives the *currently-installed* sink to it. `drive` serializes every
-/// reconcile so the applier's edge-drive and a reconnect's re-install can
-/// never interleave a stale pause/resume — the last reconcile to run reads
-/// the final level and drives the final sink. This is why a fresh,
-/// unpaused subscription installed mid-backpressure is paused immediately
-/// instead of running unthrottled until the next full HIGH→LOW cycle.
+/// which resets the wire pipeline to flowing. pvxs monitor pause is
+/// per-connection (`clientmon.cpp:379-414`, `:633-635`), so a disconnect
+/// ([`Self::clear`]) drops the standing votes together with the sink; a
+/// reconnect therefore installs against an empty aggregate and the fresh
+/// subscription runs. Both vote-change and install end in
+/// [`Self::reconcile`], which re-reads the aggregate **at drive time**
+/// (level-triggered, not edge-triggered) and drives the
+/// *currently-installed* sink to it. `drive` serializes every reconcile so
+/// the applier's edge-drive and a reconnect's re-install can never
+/// interleave a stale pause/resume — the last reconcile to run reads the
+/// final level and drives the final sink. This is why a backpressure vote
+/// that lands during the reconnect gap still pauses the fresh sink at
+/// install time instead of running unthrottled until the next HIGH→LOW
+/// cycle.
 struct PauseControl {
     /// Per-downstream-op pause votes: `op_id -> (last seq, wants_pause)`.
     /// One upstream monitor fans out to N downstream subscriber ops (same
@@ -245,20 +250,32 @@ impl PauseControl {
         }
     }
 
-    /// Install a freshly-(re)connected upstream sink AND immediately
-    /// reconcile it to the current aggregate vote. A reconnect resets the
-    /// wire pipeline to flowing, but standing pause votes survive in
-    /// `votes`; without this re-application the new subscription would run
-    /// unpaused until a full HIGH→LOW cycle re-fired an aggregate edge.
+    /// Install a freshly-(re)connected upstream sink and reconcile it to the
+    /// current aggregate vote. After a reconnect the previous connection's
+    /// votes were dropped at disconnect ([`Self::clear`]) — pvxs per-
+    /// connection pause semantics — so the aggregate is empty and the fresh
+    /// subscription starts flowing; only a backpressure vote that arrived
+    /// during the reconnect gap pauses it. The reconcile still matters: it
+    /// drives that gap-vote onto the new sink at install time rather than
+    /// waiting for the next HIGH→LOW edge.
     async fn install(&self, pauser: Pauser) {
         *self.sink.lock() = Some(PauseSink::Real(pauser));
         self.reconcile().await;
     }
 
-    /// Drop the installed sink (upstream disconnected). No physical drive —
-    /// there is nothing connected to pause; the next [`Self::install`]
-    /// reconciles the replacement.
+    /// Drop the installed sink AND the standing per-connection backpressure
+    /// votes (upstream disconnected). pvxs monitor pause is per-connection:
+    /// a disconnect returns the monitor to `Connecting` with no paused flag
+    /// preserved (`clientmon.cpp:379-414`) and the reconnect autostarts the
+    /// fresh subscription (`clientmon.cpp:633-635`). The previous
+    /// connection's pause votes are therefore void here — dropping them lets
+    /// the next [`Self::install`] reconcile an EMPTY aggregate and start the
+    /// replacement flowing instead of carrying the old pause forward. A
+    /// downstream op still short of window re-asserts HIGH on the new
+    /// connection and re-pauses then. No physical drive — there is nothing
+    /// connected to pause.
     fn clear(&self) {
+        self.votes.lock().clear();
         *self.sink.lock() = None;
     }
 
@@ -1029,17 +1046,19 @@ impl ChannelCache {
                         continue;
                     }
                 };
-                // Install the fresh Pauser AND immediately reconcile it to
-                // the standing aggregate vote: a reconnect resets the wire
-                // pipeline to flowing, but co-subscribers' pause votes
-                // survive across the disconnect, and no watermark edge
-                // re-fires after reconnect (each op's per-op hysteresis is
-                // unchanged). Without this re-application the new
-                // subscription would run unthrottled until a full HIGH→LOW
-                // cycle. Routed through the single owner so the
-                // installed-Pauser-matches-aggregate invariant holds.
+                // Install the fresh Pauser and reconcile it to the current
+                // aggregate. pvxs monitor pause is per-connection: the prior
+                // connection's votes were dropped at its disconnect (`clear`,
+                // below), so a reconnect installs against an empty aggregate
+                // and the new subscription runs — clientmon.cpp:379-414 drops
+                // the paused flag on disconnect, :633-635 autostarts on
+                // reconnect. Only a backpressure vote that landed during the
+                // reconnect gap pauses it. Routed through the single owner so
+                // the installed-Pauser-matches-aggregate invariant holds.
                 pause_for_task.install(handle.pauser()).await;
                 let raw_result = handle.wait().await;
+                // Disconnect: drop the sink AND the per-connection votes so
+                // the next reconnect starts flowing (see `clear`).
                 pause_for_task.clear();
                 // Upstream disconnected — surface it to downstream PVA
                 // monitors as a subscription boundary (MONITOR FINISH →
@@ -1423,35 +1442,45 @@ mod tests {
         assert_eq!(entry.wm_vote_count(), 0, "all votes withdrawn");
     }
 
-    /// An upstream reconnect
-    /// installs a fresh, UNPAUSED Pauser, but co-subscribers' standing pause
-    /// votes survive the disconnect and no watermark edge re-fires after
-    /// reconnect. The fresh Pauser must therefore be reconciled to the
-    /// current aggregate at install time, else backpressure is silently lost
-    /// for the whole reconnect-to-recovery window. Boundary: install while
-    /// the aggregate is "all paused" → the new sink is driven to paused.
+    /// pvxs monitor pause is per-connection: a disconnect drops the paused
+    /// flag (`clientmon.cpp:379-414`) and the reconnect autostarts the fresh
+    /// subscription (`clientmon.cpp:633-635`). The gateway mirrors that — the
+    /// standing per-connection backpressure votes are dropped at disconnect
+    /// (`clear`), so the reconnect installs a FLOWING subscription rather
+    /// than carrying the previous connection's pause forward (which would
+    /// strand the new upstream monitor idle until a later resume). A
+    /// downstream op still short of window re-asserts HIGH on the new
+    /// connection. Boundary: a standing all-paused aggregate at disconnect →
+    /// the reconnect sink is driven to unpaused.
     #[tokio::test]
-    async fn fr11_reconnect_reinstall_reapplies_standing_pause() {
+    async fn fr11_reconnect_drops_standing_pause_per_connection() {
         let client = Arc::new(PvaClient::builder().build());
         let cache = ChannelCache::new(client, Duration::from_secs(60));
         cache.insert_test_entry("WM:PV").await;
         let entry = cache.peek("WM:PV").await.expect("entry present");
 
-        // A standing pause vote exists (the sole op wants pause).
+        // A standing pause vote exists on the live connection.
         assert_eq!(
             entry.apply_watermark_vote(1, 2, WatermarkKind::Pause),
             Some(true)
         );
 
-        // Reconnect: a fresh sink is installed. install() must reconcile it
-        // to the standing aggregate — drive it to paused — with NO new vote
-        // edge.
+        // Upstream disconnects: the per-connection pause state is dropped.
+        entry.pause.clear();
+        assert_eq!(
+            entry.wm_vote_count(),
+            0,
+            "disconnect drops the standing per-connection votes"
+        );
+
+        // Reconnect installs a fresh sink: it must start FLOWING (unpaused),
+        // not re-apply the previous connection's pause.
         let rec = Arc::new(parking_lot::Mutex::new(Vec::<bool>::new()));
         entry.pause.install_fake(rec.clone()).await;
         assert_eq!(
             *rec.lock(),
-            vec![true],
-            "reconnect must re-apply the standing pause to the fresh Pauser"
+            vec![false],
+            "reconnect resumes delivery; the old connection's pause does not persist"
         );
     }
 

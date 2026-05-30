@@ -81,7 +81,7 @@ pub mod multi_gateway;
 pub mod source;
 
 pub use channel_cache::{ChannelCache, DEFAULT_CLEANUP_INTERVAL, UpstreamEntry};
-pub use control::{ControlSource, CredentialCheck};
+pub use control::ControlSource;
 pub use error::{GwError, GwResult};
 pub use gateway::{PvaGateway, PvaGatewayConfig};
 pub use middleware::{

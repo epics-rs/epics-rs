@@ -9,6 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use epics_base_rs::server::access_security::{AccessSecurityConfig, parse_acf};
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::error::PvaResult;
 use epics_pva_rs::server_native::source::{ChannelSource, DynSource};
@@ -23,6 +24,16 @@ use super::middleware::{
     AclConfig, AclLayer, AuditLayer, AuditSink, Layer, NoopAudit, ReadOnlyLayer,
 };
 use super::source::GatewayChannelSource;
+
+/// Read + parse an ACF file into an [`AccessSecurityConfig`], mapping
+/// I/O and parse failures into [`GwError::Other`] so a misconfigured
+/// control ACF fails the gateway at startup instead of silently leaving
+/// the writable control surface closed.
+pub(super) fn load_acf_file(path: &str) -> GwResult<AccessSecurityConfig> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| GwError::Other(format!("control ACF '{path}': {e}")))?;
+    parse_acf(&content).map_err(|e| GwError::Other(format!("control ACF '{path}': {e}")))
+}
 
 /// Configuration for [`PvaGateway::start`]. All fields have sensible
 /// defaults that mirror pvxs gateway behaviour; override only what
@@ -83,6 +94,22 @@ pub struct PvaGatewayConfig {
     /// PUT, carrying the downstream peer's credentials and the
     /// outcome. `None` installs no audit layer.
     pub audit: Option<Arc<dyn AuditSink>>,
+
+    /// B6: ACF file gating the writable control RPCs
+    /// (`<prefix>:flush` / `:drop` / `:reload`). Read and parsed at
+    /// [`PvaGateway::start`]; a flush/drop/reload is then allowed iff
+    /// this ACF grants WRITE to the caller. `None` (the default)
+    /// leaves the writable control surface closed — every control RPC
+    /// is denied — so destructive controls are strictly opt-in. Only
+    /// meaningful together with `control_prefix`. Override via
+    /// `EPICS_PVA_GW_CONTROL_ACF`.
+    pub control_acf_path: Option<String>,
+
+    /// B6: default ACF file path the `<prefix>:reload` RPC re-parses
+    /// (for the PROXIED-PV policy) when the caller omits an explicit
+    /// `path` argument. `None` ⇒ `reload` requires the `path` argument.
+    /// Override via `EPICS_PVA_GW_CONTROL_RELOAD_ACF`.
+    pub control_reload_acf_path: Option<String>,
 }
 
 impl Default for PvaGatewayConfig {
@@ -106,6 +133,8 @@ impl Default for PvaGatewayConfig {
             read_only: false,
             acl: None,
             audit: None,
+            control_acf_path: None,
+            control_reload_acf_path: None,
         }
     }
 }
@@ -118,6 +147,10 @@ impl PvaGatewayConfig {
     /// - `EPICS_PVA_GW_CONNECT_TMO` (seconds, float)
     /// - `EPICS_PVA_GW_MAX_CACHE_ENTRIES` (usize)
     /// - `EPICS_PVA_GW_MAX_SUBSCRIBERS` (usize)
+    /// - `EPICS_PVA_GW_CONTROL_PREFIX` (string)
+    /// - `EPICS_PVA_GW_READONLY` (`YES`/`TRUE`/`1`)
+    /// - `EPICS_PVA_GW_CONTROL_ACF` (path — control-RPC authorization)
+    /// - `EPICS_PVA_GW_CONTROL_RELOAD_ACF` (path — `:reload` default)
     ///
     /// The underlying `PvaServerConfig` is left untouched — call
     /// `.with_env()` on it separately if you also want
@@ -164,6 +197,18 @@ impl PvaGatewayConfig {
             let t = s.trim();
             self.read_only =
                 t.eq_ignore_ascii_case("YES") || t.eq_ignore_ascii_case("TRUE") || t == "1";
+        }
+        if let Ok(s) = std::env::var("EPICS_PVA_GW_CONTROL_ACF") {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                self.control_acf_path = Some(trimmed.to_string());
+            }
+        }
+        if let Ok(s) = std::env::var("EPICS_PVA_GW_CONTROL_RELOAD_ACF") {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                self.control_reload_acf_path = Some(trimmed.to_string());
+            }
         }
         self
     }
@@ -233,6 +278,15 @@ impl PvaGateway {
 
         let acl_layer = AclLayer::new(acl_cfg).layer(source.clone());
 
+        // B6: parse the control-RPC authorization ACF up front so a
+        // bad path / unparseable file fails the gateway at startup
+        // rather than silently leaving the writable surface closed.
+        // `None` ⇒ the writable control surface stays closed-by-default.
+        let control_acf = match &config.control_acf_path {
+            Some(path) => Some(load_acf_file(path)?),
+            None => None,
+        };
+
         // when control_prefix is set, run the proxy and the
         // diagnostic PVs through a CompositeSource. The control source
         // is registered at order=-100 so its PV-name lookups always
@@ -246,6 +300,8 @@ impl PvaGateway {
                 layered,
                 &source,
                 &config.control_prefix,
+                control_acf,
+                config.control_reload_acf_path,
                 config.server_config,
             )?
         } else {
@@ -254,6 +310,8 @@ impl PvaGateway {
                 layered,
                 &source,
                 &config.control_prefix,
+                control_acf,
+                config.control_reload_acf_path,
                 config.server_config,
             )?
         };
@@ -273,6 +331,8 @@ impl PvaGateway {
         layered: S,
         source: &GatewayChannelSource,
         control_prefix: &Option<String>,
+        control_acf: Option<AccessSecurityConfig>,
+        control_reload_acf_path: Option<String>,
         server_config: PvaServerConfig,
     ) -> GwResult<PvaServer>
     where
@@ -281,7 +341,16 @@ impl PvaGateway {
         match control_prefix {
             Some(prefix) if !prefix.is_empty() => {
                 let composite = CompositeSource::new();
-                let control = ControlSource::new(prefix, source.clone());
+                let mut control = ControlSource::new(prefix, source.clone());
+                // B6: gate the writable RPCs through the configured
+                // control ACF (closed when absent); wire the `:reload`
+                // default path so an operator need not pass it per RPC.
+                if let Some(cfg) = control_acf {
+                    control = control.with_control_acf(cfg);
+                }
+                if let Some(path) = control_reload_acf_path {
+                    control = control.with_acf_path(path);
+                }
                 composite
                     .add_source("__gw_control", Arc::new(control) as DynSource, -100)
                     .map_err(|e| GwError::Other(format!("control source registration: {e}")))?;
@@ -359,5 +428,63 @@ impl PvaGateway {
         for name in pv_names {
             let _ = self.cache.lookup(name, self.source.connect_timeout).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn isolated_cfg() -> PvaGatewayConfig {
+        PvaGatewayConfig {
+            server_config: PvaServerConfig::isolated(),
+            ..PvaGatewayConfig::default()
+        }
+    }
+
+    #[test]
+    fn load_acf_file_errors_on_missing_path() {
+        let err = load_acf_file("/no/such/pva_gw_control.acf").unwrap_err();
+        assert!(
+            matches!(err, GwError::Other(_)),
+            "missing ACF must surface as GwError::Other, got {err:?}"
+        );
+    }
+
+    /// B6: an unreadable `control_acf_path` must fail the gateway at
+    /// startup, not silently leave the writable control surface closed.
+    #[tokio::test]
+    async fn start_fails_when_control_acf_path_unreadable() {
+        let cfg = PvaGatewayConfig {
+            control_prefix: Some("gw".to_string()),
+            control_acf_path: Some("/no/such/pva_gw_control.acf".to_string()),
+            ..isolated_cfg()
+        };
+        let res = PvaGateway::start(cfg);
+        assert!(
+            res.is_err(),
+            "unreadable control ACF must fail startup, not silently close the surface"
+        );
+    }
+
+    /// B6: a valid `control_acf_path` is parsed and threaded into the
+    /// control source; the gateway starts.
+    #[tokio::test]
+    async fn start_succeeds_with_valid_control_acf() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("pva_gw_b6_start_{}.acf", std::process::id()));
+        std::fs::write(
+            &path,
+            "ASG(DEFAULT) {\n  RULE(1, READ)\n  RULE(1, WRITE)\n}\n",
+        )
+        .unwrap();
+        let cfg = PvaGatewayConfig {
+            control_prefix: Some("gw".to_string()),
+            control_acf_path: Some(path.to_str().unwrap().to_string()),
+            ..isolated_cfg()
+        };
+        let gw = PvaGateway::start(cfg).expect("gateway with a valid control ACF must start");
+        gw.stop();
+        let _ = std::fs::remove_file(&path);
     }
 }

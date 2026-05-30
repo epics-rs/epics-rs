@@ -21,10 +21,14 @@
 //! ## B6: writable control via RPC
 //!
 //! Three additional PVs accept **RPC** calls (not PUT) that mutate
-//! gateway state. Every RPC is gated by a credential predicate
-//! ([`ControlSource::with_credential_check`]); the default predicate
-//! denies every caller, so an operator MUST opt in explicitly before
-//! the control surface does anything destructive.
+//! gateway state. Every RPC is gated by the gateway's ACF policy
+//! ([`ControlSource::with_control_acf`]): a flush/drop/reload is allowed
+//! iff the configured control ACF grants WRITE to the caller's
+//! `(host, account, method, roles)` under the control ASG — the same
+//! [`AccessGate`] machinery the proxied namespace uses, not a bespoke
+//! host/account allow-list. With no control ACF configured the writable
+//! surface is closed (every caller denied), so an operator MUST opt in
+//! explicitly before the control surface does anything destructive.
 //!
 //! | PV | RPC args | Effect |
 //! |----|----------|--------|
@@ -36,29 +40,24 @@
 //! empty structure ID carrying the operation result (`value`) plus a
 //! human-readable `message`. The top-level `message` is a gateway
 //! extension absent from `epics:nt/NTScalar:1.0`, so the reply does not
-//! claim that normative ID. RPC is used (not PUT) because the wire layer
-//! routes RPC through `rpc_checked`, which
-//! threads the downstream peer's `(account, method, host)` credentials
-//! — PUT's type-state token carries only the resolved access level,
-//! not the raw identity needed for the operator allow-list.
+//! claim that normative ID. RPC is used (not PUT) because each control
+//! operation takes structured arguments (`drop`'s target `pv`,
+//! `reload`'s ACF `path`) and returns a structured result; PUT has no
+//! request-argument channel. Authorization still flows through the same
+//! per-op AccessGate WRITE check the wire layer performs for PUT —
+//! `rpc_checked` evaluates the control ACF against the peer's
+//! `(host, account, method, roles)`.
 
 use std::sync::Arc;
 
+use epics_base_rs::server::access_security::{AccessGate, AccessSecurityConfig, AsgAslResolver};
 use epics_pva_rs::nt::NTScalar;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+use epics_pva_rs::server::native_source::AcfCell;
 use epics_pva_rs::server_native::source::{AccessChecked, ChannelContext, ChannelSource, OpError};
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 
 use super::source::GatewayChannelSource;
-
-/// Operator credential predicate for the writable control RPCs (B6).
-///
-/// Called once per control RPC with the downstream peer's
-/// `(account, method, host)`. Returns `true` to allow the mutation.
-/// The default predicate (installed by [`ControlSource::new`]) denies
-/// everyone — the writable surface is inert until an operator calls
-/// [`ControlSource::with_credential_check`] with a real policy.
-pub type CredentialCheck = Arc<dyn Fn(&ChannelContext) -> bool + Send + Sync>;
 
 /// Diagnostic + control PV source that lives behind the gateway's
 /// `control_prefix`. Owned by the gateway alongside the proxy
@@ -79,9 +78,20 @@ pub struct ControlSource {
     /// cache/status paths are client-aware, iterating every configured
     /// client (`p2pApp/server.cpp:102-138`, `:158-310`).
     gateway_sources: Vec<GatewayChannelSource>,
-    /// B6: credential predicate gating the writable RPCs. Defaults to
-    /// deny-all.
-    credential_check: CredentialCheck,
+    /// B6: ACF authorization gate for the writable control RPCs. `None`
+    /// = the writable surface is closed (every flush/drop/reload
+    /// denied) — the safe default that reproduces the original
+    /// deny-all posture without a bespoke account/host predicate.
+    /// `Some(gate)` = a flush/drop/reload is allowed iff the configured
+    /// control ACF grants WRITE to the caller, evaluated through the
+    /// same [`AccessGate::required`] / ASG machinery the proxied
+    /// namespace uses ([`GatewayChannelSource`]'s `build_gate`).
+    /// Installed at startup from `PvaGatewayConfig::control_acf_path`
+    /// via [`Self::with_control_acf`]; the gate's cell is seeded with
+    /// the policy, so its permissive-when-empty path is never the
+    /// authority here — `None` is the only "no policy" state and it is
+    /// closed.
+    control_gate: Option<AccessGate>,
     /// B6: ACF file path used by the `<prefix>:reload` RPC when the
     /// caller does not supply an explicit `path` argument. `None`
     /// means "no default path configured" — `reload` then requires
@@ -89,14 +99,21 @@ pub struct ControlSource {
     acf_path: Option<String>,
 }
 
+/// ASG every writable control PV resolves to under the control gate.
+/// A dedicated control ACF file is expected to grant WRITE here (its
+/// `ASG(DEFAULT)`), independently of the proxied namespace's per-PV
+/// ASGs. `check_with_roles` falls back to `DEFAULT` for an unknown ASG,
+/// so this also matches a minimal single-`ASG(DEFAULT)` file.
+const CONTROL_ASG: &str = "DEFAULT";
+
 impl ControlSource {
     pub fn new(prefix: impl Into<String>, gateway_source: GatewayChannelSource) -> Self {
         Self {
             prefix: prefix.into(),
             gateway_sources: vec![gateway_source],
-            // Deny-all default: the writable surface does nothing
-            // until an operator installs a real predicate.
-            credential_check: Arc::new(|_ctx| false),
+            // Closed-by-default: with no control ACF the writable
+            // surface denies every caller (see `control_gate`).
+            control_gate: None,
             acf_path: None,
         }
     }
@@ -111,12 +128,24 @@ impl ControlSource {
         self
     }
 
-    /// B6: install the operator credential predicate that gates the
-    /// writable control RPCs (`flush` / `drop` / `reload`). Without
-    /// this the control RPCs reject every caller.
-    pub fn with_credential_check(mut self, check: CredentialCheck) -> Self {
-        self.credential_check = check;
+    /// B6: install the ACF policy that gates the writable control RPCs
+    /// (`flush` / `drop` / `reload`). A flush/drop/reload is then
+    /// allowed iff this ACF grants WRITE to the caller's
+    /// `(host, account, method, roles)` under the control ASG
+    /// ([`CONTROL_ASG`]) — the same [`AccessGate`] machinery the
+    /// proxied namespace uses, NOT a host/account allow-list. Without
+    /// this the writable surface stays closed (every RPC denied).
+    pub fn with_control_acf(mut self, cfg: AccessSecurityConfig) -> Self {
+        let acf: AcfCell = Arc::new(RwLock::new(Some(cfg)));
+        self.control_gate = Some(AccessGate::required(acf, Self::control_asg_resolver()));
         self
+    }
+
+    /// ASG/ASL resolver for the control gate: every writable control PV
+    /// resolves to [`CONTROL_ASG`] with ASL 0, so an operator grants
+    /// WRITE to it independently of the proxied namespace's per-PV ASGs.
+    fn control_asg_resolver() -> AsgAslResolver {
+        Arc::new(|_pv_name| Box::pin(async { (CONTROL_ASG.to_string(), 0u8) }))
     }
 
     /// B6: set the default ACF file path the `<prefix>:reload` RPC
@@ -534,8 +563,8 @@ impl ChannelSource for ControlSource {
     }
 
     /// B6: credentialed control RPC. `ctx` carries the downstream
-    /// peer's `(account, method, host)`; the operator credential
-    /// predicate decides whether the mutation is allowed.
+    /// peer's `(host, account, method, roles)`; the configured control
+    /// ACF decides whether the mutation is allowed.
     async fn rpc_checked(
         &self,
         checked: AccessChecked,
@@ -549,17 +578,40 @@ impl ChannelSource for ControlSource {
             // ctx-less path's error messages.
             return self.rpc(&name, request_desc, request_value).await;
         }
-        if !(self.credential_check)(&ctx) {
+        // Authorization: the writable control surface is gated by the
+        // configured control ACF. No policy configured ⇒ closed (the
+        // safe default; reproduces the original deny-all). With a
+        // policy, the caller must hold WRITE under the control ASG —
+        // evaluated through the same AccessGate the proxied namespace
+        // uses, so there is no bespoke host/account allow-list. The
+        // passed `checked` was minted by this source's permissive
+        // (diagnostic) gate, so it is NOT consulted for the WRITE
+        // decision; the control gate is the sole authority.
+        let granted = match &self.control_gate {
+            None => false,
+            Some(gate) => gate
+                .check_with_roles(
+                    name.clone(),
+                    &ctx.host,
+                    &ctx.account,
+                    &ctx.roles,
+                    &ctx.method,
+                    &ctx.authority,
+                )
+                .await
+                .allows_write(),
+        };
+        if !granted {
             tracing::warn!(
                 gateway_control = %name,
                 account = %ctx.account,
                 method = %ctx.method,
                 host = %ctx.host,
-                "pva-gateway: control RPC denied — credential check failed"
+                "pva-gateway: control RPC denied — no WRITE grant under the control ACF"
             );
             return Err(OpError::denied(format!(
                 "control RPC '{name}' denied: {account}/{method} from {host} \
-                 is not an authorised gateway operator",
+                 holds no WRITE grant under the gateway control ACF",
                 account = ctx.account,
                 method = ctx.method,
                 host = ctx.host,
@@ -628,6 +680,24 @@ mod tests {
         let client = Arc::new(PvaClient::builder().build());
         let cache = ChannelCache::new(client, DEFAULT_CLEANUP_INTERVAL);
         GatewayChannelSource::new(cache)
+    }
+
+    /// Control ACF granting WRITE to everyone (the old allow-all
+    /// predicate's ACF equivalent).
+    fn allow_all_acf() -> AccessSecurityConfig {
+        epics_base_rs::server::access_security::parse_acf(
+            "ASG(DEFAULT) {\n  RULE(1, READ)\n  RULE(1, WRITE)\n}\n",
+        )
+        .unwrap()
+    }
+
+    /// Control ACF granting WRITE only to account `ops` (the old
+    /// `c.account == "ops"` predicate's ACF equivalent).
+    fn ops_only_acf() -> AccessSecurityConfig {
+        epics_base_rs::server::access_security::parse_acf(
+            "UAG(operators) { ops }\nASG(DEFAULT) {\n  RULE(1, READ)\n  RULE(1, WRITE) { UAG(operators) }\n}\n",
+        )
+        .unwrap()
     }
 
     fn ctx(account: &str, method: &str) -> ChannelContext {
@@ -713,7 +783,7 @@ mod tests {
         s1.cache().insert_test_entry("B:PV2").await;
         let ctrl = ControlSource::new("gw", s0)
             .with_source(s1)
-            .with_credential_check(Arc::new(|_| true));
+            .with_control_acf(allow_all_acf());
 
         let empty_req = || FieldDesc::Structure {
             struct_id: String::new(),
@@ -861,8 +931,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_rpc_denied_without_credential_predicate() {
+    async fn control_rpc_denied_when_no_control_acf() {
         let gw = make_source();
+        // No control ACF configured ⇒ writable surface closed-by-default.
         let ctrl = ControlSource::new("gw", gw);
         let res = ctrl
             .rpc_checked(
@@ -875,14 +946,20 @@ mod tests {
                 ctx("ops", "ca"),
             )
             .await;
-        assert!(res.is_err(), "deny-all default must reject control RPC");
+        assert!(
+            res.is_err(),
+            "closed-by-default (no control ACF) must reject control RPC"
+        );
         let err = res.unwrap_err();
         assert_eq!(
             err.kind,
             OpErrorKind::Denied,
             "credential refusal must classify as Denied: {err:?}"
         );
-        assert!(err.message.contains("not an authorised gateway operator"));
+        assert!(
+            err.message
+                .contains("no WRITE grant under the gateway control ACF")
+        );
     }
 
     #[tokio::test]
@@ -890,7 +967,7 @@ mod tests {
         let gw = make_source();
         // Even with an allow-all predicate the ctx-less `rpc` path
         // must refuse — it carries no credentials.
-        let ctrl = ControlSource::new("gw", gw).with_credential_check(Arc::new(|_| true));
+        let ctrl = ControlSource::new("gw", gw).with_control_acf(allow_all_acf());
         let res = ctrl
             .rpc(
                 "gw:flush",
@@ -914,8 +991,7 @@ mod tests {
     #[tokio::test]
     async fn flush_rpc_clears_cache_for_authorised_operator() {
         let gw = make_source();
-        let ctrl =
-            ControlSource::new("gw", gw).with_credential_check(Arc::new(|c| c.account == "ops"));
+        let ctrl = ControlSource::new("gw", gw).with_control_acf(ops_only_acf());
         let (desc, reply) = ctrl
             .rpc_checked(
                 checked("gw:flush").await,
@@ -937,8 +1013,7 @@ mod tests {
     #[tokio::test]
     async fn flush_rpc_denied_for_unlisted_account() {
         let gw = make_source();
-        let ctrl =
-            ControlSource::new("gw", gw).with_credential_check(Arc::new(|c| c.account == "ops"));
+        let ctrl = ControlSource::new("gw", gw).with_control_acf(ops_only_acf());
         let res = ctrl
             .rpc_checked(
                 checked("gw:flush").await,
@@ -956,7 +1031,7 @@ mod tests {
     #[tokio::test]
     async fn drop_rpc_requires_pv_argument() {
         let gw = make_source();
-        let ctrl = ControlSource::new("gw", gw).with_credential_check(Arc::new(|_| true));
+        let ctrl = ControlSource::new("gw", gw).with_control_acf(allow_all_acf());
         let res = ctrl
             .rpc_checked(
                 checked("gw:drop").await,
@@ -975,7 +1050,7 @@ mod tests {
     #[tokio::test]
     async fn drop_rpc_reports_missing_entry() {
         let gw = make_source();
-        let ctrl = ControlSource::new("gw", gw).with_credential_check(Arc::new(|_| true));
+        let ctrl = ControlSource::new("gw", gw).with_control_acf(allow_all_acf());
         let (_desc, reply) = ctrl
             .rpc_checked(
                 checked("gw:drop").await,
@@ -996,7 +1071,7 @@ mod tests {
     #[tokio::test]
     async fn reload_rpc_without_path_or_default_fails() {
         let gw = make_source();
-        let ctrl = ControlSource::new("gw", gw).with_credential_check(Arc::new(|_| true));
+        let ctrl = ControlSource::new("gw", gw).with_control_acf(allow_all_acf());
         let res = ctrl
             .rpc_checked(
                 checked("gw:reload").await,
@@ -1015,7 +1090,7 @@ mod tests {
     #[tokio::test]
     async fn reload_rpc_parses_acf_from_explicit_path() {
         let gw = make_source();
-        let ctrl = ControlSource::new("gw", gw).with_credential_check(Arc::new(|_| true));
+        let ctrl = ControlSource::new("gw", gw).with_control_acf(allow_all_acf());
         // Write a minimal valid ACF file.
         let dir = std::env::temp_dir();
         let path = dir.join(format!("pva_gw_b6_reload_{}.acf", std::process::id()));
@@ -1047,7 +1122,7 @@ mod tests {
         let path = dir.join(format!("pva_gw_b6_default_{}.acf", std::process::id()));
         std::fs::write(&path, "ASG(DEFAULT) {\n  RULE(1, READ)\n}\n").unwrap();
         let ctrl = ControlSource::new("gw", gw)
-            .with_credential_check(Arc::new(|_| true))
+            .with_control_acf(allow_all_acf())
             .with_acf_path(path.to_str().unwrap());
         let res = ctrl
             .rpc_checked(
@@ -1067,7 +1142,7 @@ mod tests {
     #[tokio::test]
     async fn reload_rpc_rejects_unparseable_acf() {
         let gw = make_source();
-        let ctrl = ControlSource::new("gw", gw).with_credential_check(Arc::new(|_| true));
+        let ctrl = ControlSource::new("gw", gw).with_control_acf(allow_all_acf());
         let dir = std::env::temp_dir();
         let path = dir.join(format!("pva_gw_b6_bad_{}.acf", std::process::id()));
         std::fs::write(&path, "this is not valid ACF (((").unwrap();

@@ -172,6 +172,17 @@ struct ServerSpec {
     bcastport: u16,
     #[serde(default)]
     control_prefix: Option<String>,
+    /// B6 (gateway-rs extension): ACF file gating the writable control
+    /// RPCs (`<prefix>:flush` / `:drop` / `:reload`). Absent ⇒ the
+    /// writable control surface stays closed; destructive controls are
+    /// opt-in. Only meaningful with `control_prefix`.
+    #[serde(default)]
+    control_acf: Option<String>,
+    /// B6 (gateway-rs extension): default ACF path the `:reload` RPC
+    /// re-parses (for the PROXIED-PV policy) when the caller omits an
+    /// explicit `path` argument.
+    #[serde(default)]
+    control_reload_acf: Option<String>,
 }
 
 fn default_provider() -> String {
@@ -334,6 +345,12 @@ fn build_gateway(
         };
         let upstream_refs: Vec<&str> = s.clients.iter().map(String::as_str).collect();
         let control_prefix = s.control_prefix.as_ref().filter(|p| !p.is_empty()).cloned();
+        let control_acf = s.control_acf.as_ref().filter(|p| !p.is_empty()).cloned();
+        let control_reload_acf = s
+            .control_reload_acf
+            .as_ref()
+            .filter(|p| !p.is_empty())
+            .cloned();
         builder = builder
             .add_downstream(
                 s.name.clone(),
@@ -344,7 +361,11 @@ fn build_gateway(
             // Top-level readOnly applies to every downstream (gwmain.cpp
             // sets the global `p2pReadOnly` at :117). No ACL / audit from
             // the pva2pva schema.
-            .downstream_access(None, cfg.read_only, None);
+            .downstream_access(None, cfg.read_only, None)
+            // B6: gate the writable control RPCs through the configured
+            // control ACF (closed when absent); wire the `:reload`
+            // default path. Parse errors surface at `builder.start()`.
+            .downstream_control_acf(control_acf, control_reload_acf);
     }
 
     builder.start().map_err(|e| e.to_string())

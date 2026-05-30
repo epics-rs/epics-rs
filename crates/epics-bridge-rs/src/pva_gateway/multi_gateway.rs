@@ -101,6 +101,13 @@ struct DownstreamSpec {
     read_only: bool,
     /// `None` ⇒ [`NoopAudit`].
     audit: Option<Arc<dyn AuditSink>>,
+    /// B6: control-RPC authorization ACF path. `None` ⇒ the writable
+    /// control surface (`<prefix>:flush` / `:drop` / `:reload`) stays
+    /// closed for this downstream; destructive controls are opt-in.
+    control_acf_path: Option<String>,
+    /// B6: default ACF path the `<prefix>:reload` RPC re-parses (for
+    /// the PROXIED-PV policy) when the caller omits an explicit `path`.
+    control_reload_acf_path: Option<String>,
 }
 
 /// Builder for [`MultiTenantPvaGateway`]. Add upstreams first, then
@@ -162,7 +169,30 @@ impl MultiTenantPvaGatewayBuilder {
             acl: None,
             read_only: false,
             audit: None,
+            control_acf_path: None,
+            control_reload_acf_path: None,
         });
+        self
+    }
+
+    /// B6: configure the writable-control authorization for the
+    /// most-recently-added downstream. `control_acf_path` gates the
+    /// `<prefix>:flush` / `:drop` / `:reload` RPCs through the ACF it
+    /// names (closed when `None` — destructive controls are opt-in);
+    /// `control_reload_acf_path` is the `:reload` default path applied
+    /// when the caller omits an explicit `path`. Panics if called
+    /// before any [`Self::add_downstream`].
+    pub fn downstream_control_acf(
+        mut self,
+        control_acf_path: Option<String>,
+        control_reload_acf_path: Option<String>,
+    ) -> Self {
+        let spec = self
+            .downstreams
+            .last_mut()
+            .expect("downstream_control_acf called before add_downstream");
+        spec.control_acf_path = control_acf_path;
+        spec.control_reload_acf_path = control_reload_acf_path;
         self
     }
 
@@ -346,6 +376,19 @@ impl MultiTenantPvaGatewayBuilder {
                         for src in rest {
                             control = control.with_source(src.clone());
                         }
+                        // B6: gate the writable RPCs through the
+                        // configured control ACF (closed when absent);
+                        // wire the `:reload` default path. A bad path /
+                        // unparseable file fails this downstream's
+                        // build rather than silently closing the
+                        // surface.
+                        if let Some(path) = ds.control_acf_path.as_deref() {
+                            control =
+                                control.with_control_acf(super::gateway::load_acf_file(path)?);
+                        }
+                        if let Some(path) = ds.control_reload_acf_path.clone() {
+                            control = control.with_acf_path(path);
+                        }
                         composite
                             .add_source("__gw_control", Arc::new(control), -100)
                             .map_err(|e| {
@@ -414,5 +457,33 @@ impl MultiTenantPvaGateway {
         for h in &self.servers {
             h.server.stop();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// B6: an unreadable downstream control ACF must fail the
+    /// multi-tenant build, not silently leave the writable surface
+    /// closed — the same fail-fast contract the single-tenant gateway
+    /// applies.
+    #[tokio::test]
+    async fn build_fails_when_downstream_control_acf_unreadable() {
+        let client = Arc::new(PvaClient::builder().build());
+        let res = MultiTenantPvaGatewayBuilder::new()
+            .add_upstream("up", client)
+            .add_downstream(
+                "down",
+                PvaServerConfig::isolated(),
+                &["up"],
+                Some("gw".to_string()),
+            )
+            .downstream_control_acf(Some("/no/such/pva_gw_control.acf".to_string()), None)
+            .start();
+        assert!(
+            res.is_err(),
+            "unreadable control ACF must fail the multi-tenant build"
+        );
     }
 }

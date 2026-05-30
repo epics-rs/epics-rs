@@ -692,7 +692,36 @@ pub async fn op_put_tokens(
     op_timeout: Duration,
 ) -> PvaResult<()> {
     op_put_inner_build(channel, raw_pv_req, op_timeout, |intro| {
-        build_put_value_from_tokens(intro, tokens)
+        Ok((
+            build_put_value_from_tokens(intro, tokens)?,
+            value_only_bit_set(intro),
+        ))
+    })
+    .await
+}
+
+/// PUT the raw CLI value tokens, deferring every field-vs-bare
+/// classification to the server PUT prototype. This is the single
+/// prototype-aware classifier the `pvput-rs` CLI uses: a `field=value`
+/// token is a field assignment only when `field` exists in the
+/// prototype, otherwise it is a bare string value (when `.value` is a
+/// string) or warned-and-ignored — exactly pvAccessCPP
+/// `pvtoolsSrc/pvput.cpp:109-235`. No CLI-side guess is made before the
+/// structure is known. When `raw_pv_req` is `None` the INIT pvRequest
+/// selects all fields (pvAccessCPP's empty default request), so the
+/// full writable prototype is available to classify against.
+pub async fn op_put_args(
+    channel: &Arc<Channel>,
+    tokens: &[String],
+    raw_pv_req: Option<&[u8]>,
+    op_timeout: Duration,
+) -> PvaResult<()> {
+    // Default to the select-all sentinel (not value-only) so the server
+    // returns every writable field for classification, matching
+    // pvAccessCPP's empty default request (pvutils.cpp:31).
+    let pv_req = raw_pv_req.unwrap_or_else(|| sentinel_all_fields());
+    op_put_inner_build(channel, Some(pv_req), op_timeout, |intro| {
+        build_put_from_args(intro, tokens)
     })
     .await
 }
@@ -895,23 +924,11 @@ pub async fn op_put_fields(
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
 
-    // Build the delta from the prototype default, then overwrite just
-    // the assigned leaves and mark just their bits.
-    let mut value = crate::pvdata::encode::default_value_for(&intro);
-    let mut changed = BitSet::new();
-    for (path, value_str) in assignments {
-        let parts: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
-        let bit = intro.bit_for_path(path).ok_or_else(|| {
-            PvaError::InvalidValue(format!("field path '{path}' not present in introspection"))
-        })?;
-        // Reuse the single-path builder (parse + tree shape), then lift
-        // just this path's leaf into the shared accumulator.
-        let one = build_put_value_for_path(&intro, &parts, value_str)?;
-        let leaf = value_at_path(&one, &parts)
-            .ok_or_else(|| PvaError::InvalidValue(format!("could not build field '{path}'")))?;
-        assign_at_path(&mut value, &parts, leaf);
-        changed.set(bit);
-    }
+    // Build the delta from the prototype default, marking only the
+    // assigned fields' bits. Shared with the deferred CLI token
+    // classifier (`build_put_from_args`) so both produce identical wire
+    // deltas for the same assignments.
+    let (value, changed) = build_field_delta(&intro, assignments)?;
 
     let mut payload = Vec::new();
     payload.put_u32(sid, order);
@@ -1458,7 +1475,10 @@ async fn op_put_inner(
     op_timeout: Duration,
 ) -> PvaResult<()> {
     op_put_inner_build(channel, raw_pv_req, op_timeout, |intro| {
-        build_put_value(intro, value_str)
+        Ok((
+            build_put_value(intro, value_str)?,
+            value_only_bit_set(intro),
+        ))
     })
     .await
 }
@@ -1478,7 +1498,7 @@ async fn op_put_inner_build<FB>(
     build_value: FB,
 ) -> PvaResult<()>
 where
-    FB: FnOnce(&FieldDesc) -> PvaResult<PvField>,
+    FB: FnOnce(&FieldDesc) -> PvaResult<(PvField, BitSet)>,
 {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
     let order = server.byte_order;
@@ -1520,21 +1540,17 @@ where
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
 
-    // Build value matching introspection. The builder may classify
-    // its input against the prototype (see `op_put_inner_build`).
-    let value = build_value(&intro)?;
+    // Build the value AND its changed-bitset against the prototype. The
+    // builder owns the changed-bit decision because only it knows which
+    // fields it actually wrote: a bare `.value` write marks the value
+    // bit, a deferred field=value delta marks each assigned path's bit.
+    let (value, changed) = build_value(&intro)?;
 
     // DATA
     let mut payload = Vec::new();
     payload.put_u32(sid, order);
     payload.put_u32(ioid, order);
     payload.put_u8(0x00);
-    let mut changed = BitSet::new();
-    if let Some(bit) = intro.bit_for_path("value") {
-        changed.set(bit);
-    } else {
-        changed.set(0);
-    }
     changed.write_into(order, &mut payload);
     // pvxs `from_wire_valid` (serverget.cpp:451) decodes a BitSet delta —
     // only the fields whose bit is set. Encode consistently.
@@ -3650,6 +3666,120 @@ fn build_put_value_from_tokens(intro: &FieldDesc, tokens: &[String]) -> PvaResul
     }
 }
 
+/// The changed-bitset for a bare `.value` write: the `value` field's
+/// bit, or the root bit (0) when the prototype is itself a bare leaf
+/// with no `value` member.
+fn value_only_bit_set(intro: &FieldDesc) -> BitSet {
+    let mut changed = BitSet::new();
+    if let Some(bit) = intro.bit_for_path("value") {
+        changed.set(bit);
+    } else {
+        changed.set(0);
+    }
+    changed
+}
+
+/// Build a `(value, changed-bits)` delta from explicit dotted-path
+/// assignments against the prototype: start from the prototype default,
+/// overwrite each assigned leaf, and mark exactly the assigned bits.
+/// Single owner of "assignments → wire delta", shared by the typed
+/// multi-field PUT ([`op_put_fields`]) and the deferred CLI token
+/// classifier ([`build_put_from_args`]).
+fn build_field_delta(
+    intro: &FieldDesc,
+    assignments: &[(String, String)],
+) -> PvaResult<(PvField, BitSet)> {
+    let mut value = crate::pvdata::encode::default_value_for(intro);
+    let mut changed = BitSet::new();
+    for (path, value_str) in assignments {
+        let parts: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
+        let bit = intro.bit_for_path(path).ok_or_else(|| {
+            PvaError::InvalidValue(format!("field path '{path}' not present in introspection"))
+        })?;
+        // Reuse the single-path builder (parse + tree shape), then lift
+        // just this path's leaf into the shared accumulator.
+        let one = build_put_value_for_path(intro, &parts, value_str)?;
+        let leaf = value_at_path(&one, &parts)
+            .ok_or_else(|| PvaError::InvalidValue(format!("could not build field '{path}'")))?;
+        assign_at_path(&mut value, &parts, leaf);
+        changed.set(bit);
+    }
+    Ok((value, changed))
+}
+
+/// Classify the raw CLI PUT tokens against the server prototype and
+/// build the `(value, changed-bits)` delta — deferring every
+/// field-vs-bare decision until the prototype is known, exactly like
+/// pvAccessCPP `pvtoolsSrc/pvput.cpp:109-235`. The pre-fix CLI guessed
+/// at parse time (any `=` token forced field mode, mixed input was
+/// rejected before contacting the server); this runs from inside the
+/// PUT op after INIT, where `intro` is the real structure.
+///
+/// Rules (pvput.cpp:109-148):
+/// - a token without `=` is a bare value;
+/// - `f=v` where `f` resolves in the prototype is a field assignment;
+/// - `f=v` where `f` does NOT resolve is a bare value carrying a literal
+///   `=` IF the prototype's `.value` is a `string` scalar (pvput.cpp:123-130),
+///   otherwise a warning is printed and the token is ignored
+///   (pvput.cpp:131-134);
+/// - bare values and field pairs both present → "Can't mix" (pvput.cpp:139-140);
+/// - everything ignored → "No valid value(s)" (pvput.cpp:141-143).
+///
+/// Bare values lower through [`build_put_value_from_tokens`] (legacy
+/// positional array length-drop + lone `[...]` shortcut); field pairs
+/// lower through [`build_field_delta`].
+fn build_put_from_args(intro: &FieldDesc, tokens: &[String]) -> PvaResult<(PvField, BitSet)> {
+    // pvput.cpp:124-130: an unresolved `f=v` is a bare string value only
+    // when the writable `.value` target is a `string` scalar.
+    let value_is_string = matches!(
+        value_target_desc(intro),
+        FieldDesc::Scalar(crate::pvdata::ScalarType::String)
+    );
+
+    let mut bare: Vec<String> = Vec::new();
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for tok in tokens {
+        match tok.split_once('=') {
+            // No `=`: a plain bare value (pvput.cpp:112-114).
+            None => bare.push(tok.clone()),
+            // `f=v` with `f` present in the prototype: a field assignment
+            // (pvput.cpp:116-121).
+            Some((fname, val)) if !fname.is_empty() && intro.bit_for_path(fname).is_some() => {
+                pairs.push((fname.to_string(), val.to_string()));
+            }
+            // `f=v` with `f` absent (or an empty field name): either a
+            // bare string value containing `=`, or warn-and-ignore.
+            Some((fname, _)) => {
+                if value_is_string {
+                    bare.push(tok.clone());
+                } else {
+                    eprintln!("{fname} : Warning: no such field. Ignoring it.");
+                }
+            }
+        }
+    }
+
+    if !bare.is_empty() && !pairs.is_empty() {
+        return Err(PvaError::InvalidValue(
+            "Can't mix bare values and field=value pairs".to_string(),
+        ));
+    }
+    if bare.is_empty() && pairs.is_empty() {
+        return Err(PvaError::InvalidValue(
+            "No valid value(s) specified".to_string(),
+        ));
+    }
+
+    if pairs.is_empty() {
+        // Plain value mode → `.value` (pvput.cpp:155-207).
+        let value = build_put_value_from_tokens(intro, &bare)?;
+        Ok((value, value_only_bit_set(intro)))
+    } else {
+        // Field=value mode (pvput.cpp:209-235).
+        build_field_delta(intro, &pairs)
+    }
+}
+
 fn build_put_value(desc: &FieldDesc, value_str: &str) -> PvaResult<PvField> {
     match desc {
         FieldDesc::Scalar(st) => ScalarValue::parse(*st, value_str)
@@ -3999,6 +4129,139 @@ mod tests {
                 matches!(err, PvaError::InvalidValue(ref m) if m.contains("multiple values to scalar")),
                 "got: {err:?}"
             );
+        }
+    }
+
+    /// Deferred CLI PUT-token classification (`build_put_from_args`):
+    /// the field-vs-bare decision is made against the server prototype,
+    /// NOT guessed at parse time. pvAccessCPP `pvtoolsSrc/pvput.cpp:109-235`.
+    mod put_from_args {
+        use super::*;
+        use crate::pvdata::ScalarType;
+
+        /// NTScalar with a typed `.value` plus an `alarm.severity` field,
+        /// so `alarm.severity=2` resolves to a real field while an
+        /// unknown name does not.
+        fn nt(value_type: ScalarType) -> FieldDesc {
+            FieldDesc::Structure {
+                struct_id: "epics:nt/NTScalar:1.0".to_string(),
+                fields: vec![
+                    ("value".to_string(), FieldDesc::Scalar(value_type)),
+                    (
+                        "alarm".to_string(),
+                        FieldDesc::Structure {
+                            struct_id: "alarm_t".to_string(),
+                            fields: vec![
+                                ("severity".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+                                ("status".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+                            ],
+                        },
+                    ),
+                ],
+            }
+        }
+        fn t(args: &[&str]) -> Vec<String> {
+            args.iter().map(|s| s.to_string()).collect()
+        }
+        fn scalar_at<'a>(v: &'a PvField, path: &[&str]) -> &'a ScalarValue {
+            let mut cur = v;
+            for seg in path {
+                match cur {
+                    PvField::Structure(s) => {
+                        cur = &s.fields.iter().find(|(n, _)| n == seg).unwrap().1;
+                    }
+                    other => panic!("expected structure at {seg}, got {other:?}"),
+                }
+            }
+            match cur {
+                PvField::Scalar(sv) => sv,
+                other => panic!("expected scalar at {path:?}, got {other:?}"),
+            }
+        }
+
+        /// A bare token (no `=`) writes `.value` and marks only the
+        /// value bit (pvput.cpp:155-169).
+        #[test]
+        fn bare_token_targets_value() {
+            let intro = nt(ScalarType::Double);
+            let (value, changed) = build_put_from_args(&intro, &t(&["42"])).unwrap();
+            assert_eq!(scalar_at(&value, &["value"]), &ScalarValue::Double(42.0));
+            assert!(changed.get(intro.bit_for_path("value").unwrap()));
+            assert!(!changed.get(intro.bit_for_path("alarm.severity").unwrap()));
+        }
+
+        /// THE PVA-08 case: `a=b` where `a` is not a field and `.value`
+        /// is a string scalar is a bare string value, not a field
+        /// assignment — `pvput STR:PV a=b` writes the literal `"a=b"`
+        /// (pvput.cpp:123-130). The pre-fix CLI rejected this outright.
+        #[test]
+        fn equals_token_on_string_value_is_bare_string() {
+            let intro = nt(ScalarType::String);
+            let (value, changed) = build_put_from_args(&intro, &t(&["a=b"])).unwrap();
+            assert_eq!(
+                scalar_at(&value, &["value"]),
+                &ScalarValue::String("a=b".to_string())
+            );
+            assert!(changed.get(intro.bit_for_path("value").unwrap()));
+        }
+
+        /// `field=value` whose field resolves in the prototype is a real
+        /// assignment, marking only that field's bit (pvput.cpp:116-121).
+        #[test]
+        fn existing_field_is_assignment() {
+            let intro = nt(ScalarType::Double);
+            let (value, changed) = build_put_from_args(&intro, &t(&["alarm.severity=2"])).unwrap();
+            assert_eq!(
+                scalar_at(&value, &["alarm", "severity"]),
+                &ScalarValue::Int(2)
+            );
+            assert!(changed.get(intro.bit_for_path("alarm.severity").unwrap()));
+            assert!(!changed.get(intro.bit_for_path("value").unwrap()));
+        }
+
+        /// An unknown field on a NON-string `.value` is warned-and-ignored,
+        /// not a hard error mid-classification; with nothing left it is
+        /// "No valid value(s)" (pvput.cpp:131-134,141-143).
+        #[test]
+        fn unknown_field_on_nonstring_value_is_ignored() {
+            let intro = nt(ScalarType::Double);
+            let err = build_put_from_args(&intro, &t(&["nope=1"])).unwrap_err();
+            assert!(
+                matches!(err, PvaError::InvalidValue(ref m) if m.contains("No valid value")),
+                "got: {err:?}"
+            );
+        }
+
+        /// Genuine bare values and genuine field pairs cannot mix
+        /// (pvput.cpp:139-140) — but this is decided AFTER prototype-aware
+        /// classification, not by the mere presence of `=`.
+        #[test]
+        fn mix_bare_and_field_pair_is_rejected() {
+            let intro = nt(ScalarType::Double);
+            let err = build_put_from_args(&intro, &t(&["42", "alarm.severity=2"])).unwrap_err();
+            assert!(
+                matches!(err, PvaError::InvalidValue(ref m) if m.contains("Can't mix")),
+                "got: {err:?}"
+            );
+        }
+
+        /// Multiple field pairs each mark their own bit in one delta.
+        #[test]
+        fn multiple_field_pairs_each_marked() {
+            let intro = nt(ScalarType::Double);
+            let (value, changed) =
+                build_put_from_args(&intro, &t(&["alarm.severity=2", "alarm.status=1"])).unwrap();
+            assert_eq!(
+                scalar_at(&value, &["alarm", "severity"]),
+                &ScalarValue::Int(2)
+            );
+            assert_eq!(
+                scalar_at(&value, &["alarm", "status"]),
+                &ScalarValue::Int(1)
+            );
+            assert!(changed.get(intro.bit_for_path("alarm.severity").unwrap()));
+            assert!(changed.get(intro.bit_for_path("alarm.status").unwrap()));
+            assert!(!changed.get(intro.bit_for_path("value").unwrap()));
         }
     }
 

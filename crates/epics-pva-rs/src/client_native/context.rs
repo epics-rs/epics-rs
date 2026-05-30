@@ -1025,6 +1025,52 @@ impl PvaClient {
         }
     }
 
+    /// PUT the raw `pvput` CLI value tokens, deferring every
+    /// field-vs-bare classification to the server PUT prototype instead
+    /// of guessing at parse time. A `field=value` token is a field
+    /// assignment only when `field` exists in the prototype; otherwise
+    /// it is a bare string value (when `.value` is a `string`) or warned
+    /// and ignored — matching pvAccessCPP `pvtoolsSrc/pvput.cpp:109-235`.
+    /// So `pvput STR:PV a=b` writes the literal `"a=b"` to a string PV,
+    /// and an unknown field warns rather than failing the command.
+    /// `request` supplies the INIT pvRequest (`-r`); when `None` the
+    /// request selects all fields so the full writable prototype is
+    /// available for classification.
+    pub async fn pvput_args(
+        &self,
+        pv_name: &str,
+        tokens: &[String],
+        request: Option<&crate::pv_request::PvRequestExpr>,
+    ) -> PvaResult<()> {
+        let ch = self.channel(pv_name).await?;
+        match request {
+            None => {
+                crate::client_native::ops_v2::op_put_args(&ch, tokens, None, self.inner.timeout)
+                    .await
+            }
+            Some(req) => {
+                let big_endian = matches!(
+                    crate::client_native::ops_v2::ensure_active_with_op_timeout(
+                        &ch,
+                        self.inner.timeout
+                    )
+                    .await?
+                    .0
+                    .byte_order,
+                    crate::proto::ByteOrder::Big
+                );
+                let bytes = req.encode(big_endian);
+                crate::client_native::ops_v2::op_put_args(
+                    &ch,
+                    tokens,
+                    Some(&bytes),
+                    self.inner.timeout,
+                )
+                .await
+            }
+        }
+    }
+
     /// Value-only read-modify-write — fetch the channel's `.value`
     /// subfield, hand it to `build` as a mutable [`PvField`], then PUT
     /// the modified value back. Mirrors pvxs

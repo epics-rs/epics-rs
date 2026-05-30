@@ -80,11 +80,14 @@ struct Args {
     ///   `pvput <PV> <size/ignored> <value> [<value> ...]`
     ///   `pvput <PV> <field>=<value> ...`
     ///   `pvput <PV> <json>`
-    /// The bare forms are classified against the server PUT prototype:
-    /// a scalar-array `.value` drops the leading `<size/ignored>` token
-    /// and writes the rest (a lone `[...]` token is the JSON-array
-    /// shortcut), and a scalar `.value` takes exactly one token —
-    /// matching pvAccessCPP `pvput.cpp:144-178`.
+    /// EVERY token is forwarded raw and classified against the server
+    /// PUT prototype (pvAccessCPP `pvput.cpp:109-235`): a `field=value`
+    /// token is a field assignment only if `field` exists in the
+    /// prototype, otherwise it is a bare string value (when `.value` is
+    /// a string) or warned-and-ignored. A scalar-array `.value` drops
+    /// the leading `<size/ignored>` token (a lone `[...]` token is the
+    /// JSON-array shortcut); a scalar `.value` takes exactly one token.
+    /// The CLI makes no field-vs-bare guess before contacting the server.
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
     values: Vec<String>,
 }
@@ -129,17 +132,6 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // pvxs `pvxput` (tools/put.cpp:83-104): a single bare token is
-    // shorthand for `value=<token>`; otherwise every token must be
-    // `<field>=<value>`. Mixed bare/field input is rejected.
-    let input = match parse_put_args(&args.values) {
-        Ok(i) => i,
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
-    };
-
     // Build the client with the parsed `-w` as the operation timeout,
     // applied once at construction so the optional readback GET, the PUT
     // wait, and the post-PUT GET all use the same owner. Before this, `-w`
@@ -178,24 +170,14 @@ async fn main() {
         None
     };
 
-    // 2. Do the put. Field assignments build one prototype-based delta;
-    //    a bare value targets `.value` via the existing helpers.
-    let put_result = match &input {
-        PutInput::Fields(assignments) => {
-            client
-                .pvput_fields(&pv_name, assignments, request.as_ref())
-                .await
-        }
-        // Bare positional tokens are classified against the server PUT
-        // prototype inside the client (legacy `<size> <v>...` array form
-        // + `[...]` shortcut), so the raw token list is forwarded rather
-        // than pre-joined into one string. pvAccessCPP pvput.cpp:144-178.
-        PutInput::Bare(tokens) => {
-            client
-                .pvput_tokens(&pv_name, tokens, request.as_ref())
-                .await
-        }
-    };
+    // 2. Do the put. ALL value tokens are forwarded raw; the client
+    //    classifies them against the server PUT prototype (field=value
+    //    vs bare string, unknown-field warn, array length-drop) so the
+    //    CLI makes no guess before the structure is known. pvAccessCPP
+    //    pvput.cpp:109-235.
+    let put_result = client
+        .pvput_args(&pv_name, &args.values, request.as_ref())
+        .await;
     if let Err(e) = put_result {
         eprintln!("error: {e}");
         std::process::exit(1);
@@ -263,47 +245,6 @@ fn check_provider(provider: &str) -> Result<(), String> {
     }
 }
 
-/// Parsed CLI value tokens. pvxs `pvxput` accepts either one bare
-/// value (→ `value=<token>`) or one-or-more `<field>=<value>` pairs;
-/// the two forms must not be mixed.
-#[derive(Debug)]
-enum PutInput {
-    /// One or more bare positional tokens written to `.value`. The
-    /// tokens are NOT joined here: the array-vs-scalar decision (and
-    /// the legacy "first token is a length to drop" rule) needs the
-    /// server PUT prototype, so the raw list is carried into the client
-    /// and classified there. pvAccessCPP `pvput.cpp:144-178`.
-    Bare(Vec<String>),
-    /// One or more `field=value` assignments, written as a delta.
-    Fields(Vec<(String, String)>),
-}
-
-/// Classify the value tokens. A token containing `=` switches the whole
-/// invocation into field-assignment mode (mirrors pvxs put.cpp:83-104):
-/// then *every* token must be `<field>=<value>`, else it is an error.
-fn parse_put_args(values: &[String]) -> Result<PutInput, String> {
-    if !values.iter().any(|v| v.contains('=')) {
-        // No assignment syntax — legacy bare/positional-array form. The
-        // tokens are carried verbatim; the client classifies them once
-        // the PUT prototype is known (pvAccessCPP pvput.cpp:144-178).
-        return Ok(PutInput::Bare(values.to_vec()));
-    }
-    let mut assignments = Vec::with_capacity(values.len());
-    for tok in values {
-        match tok.split_once('=') {
-            Some((field, value)) if !field.is_empty() => {
-                assignments.push((field.to_string(), value.to_string()));
-            }
-            _ => {
-                return Err(format!(
-                    "expected <field>=<value>, got {tok:?} (do not mix bare and field assignments)"
-                ));
-            }
-        }
-    }
-    Ok(PutInput::Fields(assignments))
-}
-
 /// Label for the post-PUT `New :` echo line. pvAccessCPP `pvput -q`
 /// (pvput.cpp:403-428) drops the `New :` label but still prints the
 /// value, so quiet mode uses an empty label.
@@ -324,54 +265,12 @@ fn format_old_new_line(label: &str, s: &PvStructure) -> String {
 mod tests {
     use super::*;
 
-    fn v(args: &[&str]) -> Vec<String> {
-        args.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn bare_single_value_maps_to_value() {
-        match parse_put_args(&v(&["42"])).unwrap() {
-            PutInput::Bare(toks) => assert_eq!(toks, vec!["42".to_string()]),
-            PutInput::Fields(_) => panic!("single bare token must be Bare"),
-        }
-    }
-
-    /// Bare positional tokens are carried verbatim (NOT joined): the
-    /// legacy `<size> <value>...` array form needs the prototype to
-    /// decide that the first token is a length to drop, so classification
-    /// is deferred to the client (pvAccessCPP pvput.cpp:171-178).
-    #[test]
-    fn bare_array_tokens_carried_verbatim() {
-        match parse_put_args(&v(&["3", "1.0", "2.0"])).unwrap() {
-            PutInput::Bare(toks) => assert_eq!(
-                toks,
-                vec!["3".to_string(), "1.0".to_string(), "2.0".to_string()]
-            ),
-            PutInput::Fields(_) => panic!("no '=' tokens must be Bare"),
-        }
-    }
-
-    #[test]
-    fn field_assignments_parse_each_pair() {
-        match parse_put_args(&v(&["alarm.severity=2", "timeStamp.nanoseconds=5"])).unwrap() {
-            PutInput::Fields(f) => {
-                assert_eq!(
-                    f,
-                    vec![
-                        ("alarm.severity".to_string(), "2".to_string()),
-                        ("timeStamp.nanoseconds".to_string(), "5".to_string()),
-                    ]
-                );
-            }
-            PutInput::Bare(_) => panic!("'=' tokens must be Fields"),
-        }
-    }
-
-    #[test]
-    fn mixed_bare_and_field_is_rejected() {
-        let err = parse_put_args(&v(&["42", "alarm.severity=2"])).unwrap_err();
-        assert!(err.contains("expected <field>=<value>"), "got: {err}");
-    }
+    // pvput token classification (field=value vs bare, unknown-field
+    // warn, mix rejection) is no longer guessed at the CLI — it is
+    // deferred to the server PUT prototype. Those contract tests now
+    // live next to the classifier `build_put_from_args` in
+    // `client_native::ops_v2` (pvAccessCPP pvput.cpp:109-235), where the
+    // prototype is available; the CLI just forwards `args.values` raw.
 
     #[test]
     fn pva_provider_is_accepted() {

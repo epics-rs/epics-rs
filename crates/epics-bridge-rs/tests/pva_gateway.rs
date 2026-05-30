@@ -882,7 +882,11 @@ async fn br_r6_gateway_typed_put_passthrough() {
     // Upstream: a structure with a "value: String[]" sub-field.
     // request_to_mask succeeds for field(value) on this shape (server
     // finds the "value" entry), so the upstream monitor starts cleanly.
-    let pv = SharedPV::new();
+    // A plain SharedPV::new() rejects writes ("PUT not supported by this
+    // PV", PutPolicy::Reject — pvxs has no implicit-writable SharedPV);
+    // the gateway PUT must land in the upstream for the passthrough to be
+    // observable, so the simulated upstream IOC is a writable mailbox.
+    let pv = SharedPV::build_mailbox();
     let desc = FieldDesc::Structure {
         struct_id: "test:strarray/1.0".to_string(),
         fields: vec![(

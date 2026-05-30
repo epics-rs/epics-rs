@@ -168,6 +168,131 @@ pub mod init_hooks {
 
 pub use init_hooks::{InitHookFunction, InitHookState, init_hook_announce, init_hook_register};
 
+// ── QSRV `dbLoadGroup` startup queue ──────────────────────────────────
+//
+// `dbLoadGroup("file.json", "macros")` is the pvxs/QSRV iocsh command that
+// adds DB group definitions before `iocInit`. pvxs registers it from its
+// `epicsExportRegistrar` (ioc/groupsourcehooks.cpp:233-244, run before the
+// startup script) and its only startup-time effect is to *queue* the file:
+// the JSON is parsed and the group built only later, by `processGroups()`
+// at `initHookAfterInitDatabase` (groupsourcehooks.cpp:99-188 append to
+// `IOCGroupConfig::groupConfigFiles`; :192-213 process them).
+//
+// epics-rs has no link-time registrar, and the served `BridgeProvider`
+// (the QSRV group source) is created by the PVA protocol runner *after*
+// the startup script has already executed. So the iocsh `dbLoadGroup`
+// command itself must live in this base layer — the owner of the startup
+// shell — while the group *semantics* (JSON parse, macLib expansion,
+// serving) stay entirely in the QSRV bridge: this command only records the
+// request, and the QSRV runner drains [`take_group_load_requests`] and
+// applies each entry to the provider it serves. A non-QSRV runner simply
+// never drains the queue, so the command is a harmless no-op there.
+
+/// One queued `dbLoadGroup(filename, macros)` invocation, recorded during
+/// st.cmd for the QSRV protocol runner to apply to the served provider.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupLoadRequest {
+    pub filename: String,
+    pub macros: String,
+}
+
+static GROUP_LOAD_REQUESTS: std::sync::LazyLock<Mutex<Vec<GroupLoadRequest>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Drain every queued `dbLoadGroup` request, in invocation order. The
+/// QSRV protocol runner calls this once before the PVA server accepts
+/// connections — the epics-rs iocRun-handoff equivalent of pvxs running
+/// `processGroups()` at `initHookAfterInitDatabase`.
+pub fn take_group_load_requests() -> Vec<GroupLoadRequest> {
+    std::mem::take(&mut *GROUP_LOAD_REQUESTS.lock().unwrap())
+}
+
+/// Build the `dbLoadGroup <jsonFilename> [<macros>]` startup command.
+///
+/// Mirrors pvxs `dbLoadGroup` (ioc/groupsourcehooks.cpp:99-188): a leading
+/// `-` removes a previously queued identity (`-*` clears all, `-file`
+/// removes the matching `(filename, macros)` entry); otherwise the pair is
+/// appended after first erasing any prior entry of the same identity (pvxs
+/// erases the matching entry before re-appending, :160-184). The file is
+/// opened here only to surface pvxs's early "Error opening" diagnostic at
+/// the st.cmd line; the JSON parse and macLib expansion happen later in the
+/// QSRV runner when the queue is drained.
+///
+/// [`IocApplication::run`] already registers this command into every
+/// startup shell, so applications using the standard lifecycle need not
+/// call it. It is public for harnesses that build their own iocsh shell
+/// and want the pvxs-compatible `dbLoadGroup` command (its queue is
+/// consumed via [`take_group_load_requests`]).
+pub fn db_load_group_startup_command() -> CommandDef {
+    use crate::server::iocsh::registry::{
+        ArgDesc, ArgType, ArgValue, CommandContext, CommandOutcome,
+    };
+    CommandDef::new(
+        "dbLoadGroup",
+        vec![
+            ArgDesc {
+                name: "filename",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "macros",
+                arg_type: ArgType::String,
+                optional: true,
+            },
+        ],
+        "dbLoadGroup <jsonFilename> [<macros>]",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let filename = match args.first() {
+                Some(ArgValue::String(s)) => s.clone(),
+                _ => return Err("dbLoadGroup: missing filename".into()),
+            };
+            let macros = match args.get(1) {
+                Some(ArgValue::String(s)) => s.clone(),
+                _ => String::new(),
+            };
+            let mut queue = GROUP_LOAD_REQUESTS.lock().unwrap();
+            // Leading `-`: removal by identity, applied to the queue (pvxs
+            // groupsourcehooks.cpp:140-179 — never touches the filesystem).
+            if let Some(rest) = filename.strip_prefix('-') {
+                if rest == "*" {
+                    let n = queue.len();
+                    queue.clear();
+                    ctx.println(&format!(
+                        "dbLoadGroup: cleared all queued group files ({n} removed)"
+                    ));
+                } else {
+                    let before = queue.len();
+                    queue.retain(|r| !(r.filename == rest && r.macros == macros));
+                    let dropped = before - queue.len();
+                    ctx.println(&format!(
+                        "dbLoadGroup: removed '{rest}' ({dropped} queued entr{} dropped)",
+                        if dropped == 1 { "y" } else { "ies" }
+                    ));
+                }
+                return Ok(CommandOutcome::Continue);
+            }
+            // pvxs opens the file at command time (early error); mirror that
+            // with a readability probe. The QSRV runner re-reads and parses.
+            if let Err(e) = std::fs::metadata(&filename) {
+                return Err(format!("dbLoadGroup: error opening \"{filename}\": {e}"));
+            }
+            // Re-load of the same identity first drops the prior queue entry
+            // (pvxs erases the matching `(fname, macros)` before appending).
+            queue.retain(|r| !(r.filename == filename && r.macros == macros));
+            queue.push(GroupLoadRequest {
+                filename: filename.clone(),
+                macros,
+            });
+            ctx.println(&format!(
+                "dbLoadGroup: queued '{filename}' ({} group file(s) queued)",
+                queue.len()
+            ));
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
 /// Context passed to dynamic device support factories during iocInit wiring.
 pub struct DeviceSupportContext<'a> {
     pub dtyp: &'a str,
@@ -453,6 +578,14 @@ impl IocApplication {
             let cmds = AutosaveStartupConfig::register_startup_commands(config.clone());
             startup_commands.extend(cmds);
         }
+
+        // Register the QSRV `dbLoadGroup` startup command so a
+        // pvxs-compatible st.cmd can queue group definition files before
+        // iocInit (pvxs registers it from its registrar before the
+        // startup script). The QSRV protocol runner drains the queue and
+        // applies it to the served provider; a non-QSRV runner never
+        // drains it, leaving the command a harmless no-op.
+        startup_commands.push(db_load_group_startup_command());
 
         // Add inline records (Phase 7 declarative builder)
         for (name, record) in inline_records {
@@ -970,6 +1103,71 @@ mod tests {
     /// two tests announcing at once would observe each other's
     /// callbacks. The state machine here is small; a mutex is enough.
     static INIT_HOOK_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// The `dbLoadGroup` startup command queues `(filename, macros)`
+    /// pairs (NOT bound to any provider), with pvxs removal
+    /// semantics applied to the queue (`-file` by identity, `-*` clears),
+    /// and a re-load of the same identity nets to a single entry. The QSRV
+    /// runner later drains [`take_group_load_requests`] to build the
+    /// served provider.
+    #[test]
+    fn dbloadgroup_startup_command_queues_and_removes() {
+        // Process-global queue: drain any leftover so this test is isolated.
+        let _ = take_group_load_requests();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = Arc::new(PvDatabase::new());
+        let shell = iocsh::IocShell::new(db, rt.handle().clone());
+        shell.register(db_load_group_startup_command());
+
+        // Two distinct group files (the command probes existence early).
+        let a = std::env::temp_dir().join("qsrv_q_a.json");
+        let b = std::env::temp_dir().join("qsrv_q_b.json");
+        std::fs::write(&a, "{}").unwrap();
+        std::fs::write(&b, "{}").unwrap();
+
+        shell
+            .execute_line(&format!("dbLoadGroup(\"{}\")", a.display()))
+            .unwrap();
+        shell
+            .execute_line(&format!("dbLoadGroup(\"{}\",\"M=1\")", b.display()))
+            .unwrap();
+        // Re-load of the same identity nets to one entry (pvxs erases first).
+        shell
+            .execute_line(&format!("dbLoadGroup(\"{}\")", a.display()))
+            .unwrap();
+
+        // Missing file → early error at the st.cmd line (pvxs parity).
+        assert!(
+            shell
+                .execute_line("dbLoadGroup(\"/no/such/group.json\")")
+                .is_err(),
+            "a missing group file must error at command time"
+        );
+
+        // `-file` removes only the matching identity (a, macros="").
+        shell
+            .execute_line(&format!("dbLoadGroup(\"-{}\")", a.display()))
+            .unwrap();
+
+        let reqs = take_group_load_requests();
+        assert_eq!(reqs.len(), 1, "only the (b, M=1) entry must remain");
+        assert_eq!(reqs[0].filename, b.to_string_lossy());
+        assert_eq!(reqs[0].macros, "M=1");
+
+        // `-*` clears the whole queue.
+        shell
+            .execute_line(&format!("dbLoadGroup(\"{}\")", b.display()))
+            .unwrap();
+        shell.execute_line("dbLoadGroup(\"-*\")").unwrap();
+        assert!(
+            take_group_load_requests().is_empty(),
+            "dbLoadGroup(\"-*\") must clear the queue"
+        );
+
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
 
     /// H1 regression: a callback registered via `init_hook_register`
     /// fires for every announced state, and `init_hook_announce`

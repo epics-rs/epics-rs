@@ -1435,15 +1435,15 @@ fn is_disconnect(e: &epics_pva_rs::error::PvaError) -> bool {
 fn build_put_request(proc: ProcMode, block: bool) -> PvRequestExpr {
     PvRequestExpr {
         fields: vec![],
+        // pvxs `pvalink_channel.cpp:34-36`: `String("process")` carries
+        // the "true"/"false"/"passive" word; `Bool("block")` is a typed
+        // boolean. Match those wire types exactly.
         record_options: vec![
             (
                 "process".to_string(),
-                proc.put_process_request().to_string(),
+                ScalarValue::String(proc.put_process_request().to_string()),
             ),
-            (
-                "block".to_string(),
-                if block { "true" } else { "false" }.to_string(),
-            ),
+            ("block".to_string(), ScalarValue::Boolean(block)),
         ],
         field_options: vec![],
     }
@@ -1523,17 +1523,19 @@ fn put_field_path(field: &str) -> String {
 /// returning a request with all three fields populated.
 fn monitor_request(config: &PvaLinkConfig) -> Option<epics_pva_rs::pv_request::PvRequestExpr> {
     let mut req = epics_pva_rs::pv_request::PvRequestExpr::default();
+    // pvxs `pvalink_link.cpp:56-65 makeRequest`: `Bool("pipeline")`,
+    // `Bool("atomic")`, `UInt32("queueSize")` — typed, not strings.
     req.record_options.push((
         "pipeline".to_string(),
-        if config.pipeline { "true" } else { "false" }.to_string(),
+        ScalarValue::Boolean(config.pipeline),
     ));
     // pvxs `pvalink_link.cpp:64`: forced true on the remote request,
     // independent of `cfg.atomic` (the local scan-batch flag).
     req.record_options
-        .push(("atomic".to_string(), "true".to_string()));
+        .push(("atomic".to_string(), ScalarValue::Boolean(true)));
     req.record_options.push((
         "queueSize".to_string(),
-        config.queue_size.max(1).to_string(),
+        ScalarValue::UInt(u32::try_from(config.queue_size.max(1)).unwrap_or(u32::MAX)),
     ));
     Some(req)
 }
@@ -2369,18 +2371,18 @@ mod tests {
         assert!(
             req.record_options
                 .iter()
-                .any(|(k, v)| k == "pipeline" && v == "false")
+                .any(|(k, v)| k == "pipeline" && *v == ScalarValue::Boolean(false))
         );
         assert!(
             req.record_options
                 .iter()
-                .any(|(k, v)| k == "atomic" && v == "true"),
+                .any(|(k, v)| k == "atomic" && *v == ScalarValue::Boolean(true)),
             "atomic must be hard-coded true on remote pvalink monitor requests"
         );
         assert!(
             req.record_options
                 .iter()
-                .any(|(k, v)| k == "queueSize" && v == "4"),
+                .any(|(k, v)| k == "queueSize" && *v == ScalarValue::UInt(4)),
             "queueSize must default to pvxs's 4 on no-options links"
         );
     }
@@ -2395,7 +2397,7 @@ mod tests {
         assert!(
             req.record_options
                 .iter()
-                .any(|(k, v)| k == "queueSize" && v == "16")
+                .any(|(k, v)| k == "queueSize" && *v == ScalarValue::UInt(16))
         );
     }
 
@@ -2409,7 +2411,7 @@ mod tests {
         assert!(
             req.record_options
                 .iter()
-                .any(|(k, v)| k == "pipeline" && v == "true")
+                .any(|(k, v)| k == "pipeline" && *v == ScalarValue::Boolean(true))
         );
         // pvxs `makeRequest` always sends queueSize alongside pipeline.
         assert!(req.record_options.iter().any(|(k, _)| k == "queueSize"));
@@ -3233,12 +3235,12 @@ mod tests {
     ///   pvalink_channel.cpp:138 (field targeting via top[fieldName])
     #[test]
     fn br_r11_pvalink_out_options_preserved() {
-        // proc=PP → process="true"
+        // proc=PP → process="true" (typed String wire descriptor)
         let req = build_put_request(ProcMode::Pp, false);
         assert!(
             req.record_options
                 .iter()
-                .any(|(k, v)| k == "process" && v == "true"),
+                .any(|(k, v)| k == "process" && *v == ScalarValue::String("true".into())),
             "proc=PP must produce process=true in pvRequest"
         );
 
@@ -3247,25 +3249,25 @@ mod tests {
         assert!(
             req.record_options
                 .iter()
-                .any(|(k, v)| k == "process" && v == "passive"),
+                .any(|(k, v)| k == "process" && *v == ScalarValue::String("passive".into())),
             "proc=Default must produce process=passive in pvRequest"
         );
 
-        // block=true must appear in pvRequest
+        // block=true must appear in pvRequest as a typed boolean
         let req = build_put_request(ProcMode::Pp, true);
         assert!(
             req.record_options
                 .iter()
-                .any(|(k, v)| k == "block" && v == "true"),
+                .any(|(k, v)| k == "block" && *v == ScalarValue::Boolean(true)),
             "block=true must appear in pvRequest"
         );
 
-        // block=false must appear in pvRequest
+        // block=false must appear in pvRequest as a typed boolean
         let req = build_put_request(ProcMode::Default, false);
         assert!(
             req.record_options
                 .iter()
-                .any(|(k, v)| k == "block" && v == "false"),
+                .any(|(k, v)| k == "block" && *v == ScalarValue::Boolean(false)),
             "block=false must appear in pvRequest"
         );
 

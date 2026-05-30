@@ -17,7 +17,7 @@
 
 use crate::proto::ByteOrder;
 use crate::pvdata::encode::encode_type_desc;
-use crate::pvdata::{FieldDesc, PvField};
+use crate::pvdata::{FieldDesc, PvField, ScalarValue};
 
 /// Build a pvRequest selecting `fields` at the top level of "field(...)".
 fn build(fields: &[&str], order: ByteOrder) -> Vec<u8> {
@@ -116,16 +116,20 @@ fn build_with_pipeline(fields: &[&str], queue_size: u32, order: ByteOrder) -> Ve
         struct_id: String::new(),
         fields: build_nested(&owned),
     };
+    // Typed options, matching pvxs `.record("pipeline", true)` /
+    // `.record("queueSize", N)` (clientreq.cpp:312-323): `bool pipeline`
+    // and `uint queueSize`, not the string form a parsed `record[...]`
+    // would yield.
     let options_struct = FieldDesc::Structure {
         struct_id: String::new(),
         fields: vec![
             (
                 "pipeline".to_string(),
-                FieldDesc::Scalar(crate::pvdata::ScalarType::String),
+                FieldDesc::Scalar(crate::pvdata::ScalarType::Boolean),
             ),
             (
                 "queueSize".to_string(),
-                FieldDesc::Scalar(crate::pvdata::ScalarType::String),
+                FieldDesc::Scalar(crate::pvdata::ScalarType::UInt),
             ),
         ],
     };
@@ -150,11 +154,11 @@ fn build_with_pipeline(fields: &[&str], queue_size: u32, order: ByteOrder) -> Ve
         fields: vec![
             (
                 "pipeline".to_string(),
-                PvField::Scalar(ScalarValue::String("true".to_string())),
+                PvField::Scalar(ScalarValue::Boolean(true)),
             ),
             (
                 "queueSize".to_string(),
-                PvField::Scalar(ScalarValue::String(queue_size.to_string())),
+                PvField::Scalar(ScalarValue::UInt(queue_size)),
             ),
         ],
     });
@@ -309,7 +313,7 @@ pub enum RequestMaskError {
 /// let req = PvRequestBuilder::new()
 ///     .field("value")
 ///     .field("alarm.severity")
-///     .record("pipeline", "true")
+///     .record("pipeline", true)
 ///     .build();
 /// ```
 ///
@@ -331,8 +335,15 @@ impl PvRequestBuilder {
         self
     }
 
-    /// Set a record-level option (key=value). pvxs `RequestBuilder::record`.
-    pub fn record(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+    /// Set a record-level option with a *typed* scalar value. Generic
+    /// over [`Into<ScalarValue>`] (bool, the integer types, f32/f64,
+    /// `&str`/`String`) so the wire descriptor carries the caller's real
+    /// type — `record("pipeline", true)` emits `bool pipeline = true`,
+    /// `record("queueSize", 8u32)` emits `uint queueSize = 8`. pvxs
+    /// `CommonBuilder::record<T>` (client.h:661-675). Distinct from the
+    /// string-parser path ([`pv_request`](Self::pv_request)), where every
+    /// option value is a string.
+    pub fn record(mut self, key: impl Into<String>, value: impl Into<ScalarValue>) -> Self {
         self.expr.record_options.push((key.into(), value.into()));
         self
     }
@@ -345,18 +356,48 @@ impl PvRequestBuilder {
         Ok(self)
     }
 
-    /// Replace the builder state with a hand-built [`PvRequestExpr`].
-    /// Mirrors pvxs `RequestBuilder::rawRequest(Value)` — the escape
-    /// hatch for callers who already constructed the request tree.
-    pub fn raw_request(mut self, expr: PvRequestExpr) -> Self {
-        self.expr = expr;
-        self
-    }
-
     /// Materialize the parsed expression. Equivalent to chaining
     /// `.encode(big_endian)` on the result.
     pub fn build(self) -> PvRequestExpr {
         self.expr
+    }
+}
+
+/// A hand-assembled raw pvRequest: an explicit descriptor + value tree
+/// that bypasses the [`PvRequestExpr`] field/option assembly. This is
+/// the true pvxs `rawRequest(Value)` escape hatch (client.h:683) — for
+/// requests `PvRequestExpr` cannot express (arbitrary typed value trees,
+/// nested non-option structures). The former `PvRequestBuilder::raw_request`
+/// only re-seated a parsed `PvRequestExpr`, so it could never carry a
+/// hand-built typed `Value`; `PvRequestExpr` is now one construction path
+/// rather than the only raw representation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawPvRequest {
+    /// The pvRequest type descriptor (root structure).
+    pub desc: FieldDesc,
+    /// The pvRequest value tree, structurally matching `desc`.
+    pub value: PvField,
+}
+
+impl RawPvRequest {
+    /// Wrap a caller-built descriptor + value pair.
+    pub fn new(desc: FieldDesc, value: PvField) -> Self {
+        Self { desc, value }
+    }
+
+    /// Encode to wire-format pvRequest bytes: the type descriptor
+    /// followed by the full value, exactly as [`PvRequestExpr::encode`]
+    /// does for the assembled path.
+    pub fn encode(&self, big_endian: bool) -> Vec<u8> {
+        let order = if big_endian {
+            ByteOrder::Big
+        } else {
+            ByteOrder::Little
+        };
+        let mut out = Vec::new();
+        encode_type_desc(&self.desc, order, &mut out);
+        crate::pvdata::encode::encode_pv_field(&self.value, &self.desc, order, &mut out);
+        out
     }
 }
 
@@ -367,13 +408,24 @@ impl PvRequestBuilder {
 /// Use [`PvRequestExpr::to_field_desc`] to materialize a wire-encodable
 /// [`FieldDesc`] mirror, or read [`PvRequestExpr::fields`] for just the
 /// dotted field paths.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// `Eq` is intentionally not derived: `record_options` now holds typed
+/// [`ScalarValue`]s, which include `f32`/`f64` and so are only
+/// `PartialEq`. `assert_eq!`-style comparisons (`PartialEq`) are
+/// unaffected.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PvRequestExpr {
     /// Dotted field paths the caller is interested in. A `None` entry
     /// means "everything"; an empty list means "everything" too.
     pub fields: Vec<String>,
-    /// Record-level options (`record[k=v,...]`).
-    pub record_options: Vec<(String, String)>,
+    /// Record-level options (`record[k=v,...]`), each carrying a *typed*
+    /// scalar value. pvxs `CommonBuilder::record<T>` preserves the
+    /// caller's scalar type (`bool pipeline = true`, `uint queueSize = 8`)
+    /// via `Value::Helper::build` (client.h:661-675, clientreq.cpp:85-90);
+    /// the string-parser path (`record[pipeline=true]`) instead yields
+    /// `String("true")` so the typed-builder and parsed-text wire shapes
+    /// stay distinct, exactly as pvxs `testpvreq.cpp:172-256` requires.
+    pub record_options: Vec<(String, ScalarValue)>,
     /// Per-field option brackets, mirroring pvDataCPP `createRequest`'s
     /// `field(value[deadband=abs:1.0])` / `field(value[array=1:3])`
     /// syntax. Each entry pairs a dotted field path with its
@@ -466,15 +518,14 @@ impl PvRequestExpr {
         };
         let mut top_fields: Vec<(String, FieldDesc)> = vec![("field".to_string(), inner)];
         if !self.record_options.is_empty() {
+            // Each option's descriptor carries its *own* scalar type
+            // (pvxs `TypeDef(pair.second).as(pair.first)`,
+            // clientreq.cpp:312-316), so a typed `bool pipeline` stays a
+            // bool on the wire rather than collapsing to `string`.
             let opts: Vec<(String, FieldDesc)> = self
                 .record_options
                 .iter()
-                .map(|(k, _v)| {
-                    (
-                        k.clone(),
-                        FieldDesc::Scalar(crate::pvdata::ScalarType::String),
-                    )
-                })
+                .map(|(k, v)| (k.clone(), FieldDesc::Scalar(v.scalar_type())))
                 .collect();
             top_fields.push((
                 "record".to_string(),
@@ -602,9 +653,13 @@ impl PvRequestExpr {
                     let mut record_s = PvStructure::new("");
                     let mut options_s = PvStructure::new("");
                     for (k, v) in &self.record_options {
+                        // The typed value goes on the wire verbatim,
+                        // matching the per-option descriptor emitted by
+                        // `to_field_desc` (pvxs `opt[name].assign(value)`,
+                        // clientreq.cpp:320-322).
                         options_s
                             .fields
-                            .push((k.clone(), PvField::Scalar(ScalarValue::String(v.clone()))));
+                            .push((k.clone(), PvField::Scalar(v.clone())));
                     }
                     record_s
                         .fields
@@ -1247,9 +1302,13 @@ impl<'a> Parser<'a> {
                     self.expect(Token::Equal)?;
                     // Record option values, like per-field option
                     // values, may contain `:` (`record[deadband=abs:1.0]`),
-                    // so lex them with the permissive value scanner.
+                    // so lex them with the permissive value scanner. The
+                    // parsed-text path is always string-typed (pvxs
+                    // PVRParser stores `string pipeline = "true"`,
+                    // testpvreq.cpp:232-256) — only the typed builder
+                    // carries bool/int.
                     let val = self.lex_value()?;
-                    out.record_options.push((key, val));
+                    out.record_options.push((key, ScalarValue::String(val)));
                 }
                 other => {
                     return Err(PvRequestParseError::UnexpectedChar {
@@ -1328,6 +1387,86 @@ mod tests {
 
     fn fields(expr: &str) -> Vec<String> {
         PvRequestExpr::parse(expr).expect("parse ok").fields
+    }
+
+    /// A parsed-text record option: the string parser is always
+    /// string-typed (pvxs PVRParser `string k = "v"`), so test
+    /// expectations wrap the value in `ScalarValue::String`.
+    fn rec_s(key: &str, val: &str) -> (String, ScalarValue) {
+        (key.to_string(), ScalarValue::String(val.to_string()))
+    }
+
+    /// The `record._options.<name>` member *types* a built pvRequest
+    /// carries on the wire. This is where the typed-builder vs
+    /// parsed-text distinction is observable: the typed builder emits
+    /// `bool`/`uint`, the string parser emits `string`.
+    fn option_descs(expr: &PvRequestExpr) -> Vec<(String, crate::pvdata::ScalarType)> {
+        let FieldDesc::Structure { fields: top, .. } = expr.to_field_desc() else {
+            panic!("pvRequest root is a structure");
+        };
+        let (_, record) = top
+            .iter()
+            .find(|(n, _)| n == "record")
+            .expect("record sub-structure present");
+        let FieldDesc::Structure {
+            fields: rfields, ..
+        } = record
+        else {
+            panic!("record is a structure");
+        };
+        let (_, options) = rfields
+            .iter()
+            .find(|(n, _)| n == "_options")
+            .expect("_options sub-structure present");
+        let FieldDesc::Structure {
+            fields: ofields, ..
+        } = options
+        else {
+            panic!("_options is a structure");
+        };
+        ofields
+            .iter()
+            .map(|(k, d)| {
+                let FieldDesc::Scalar(t) = d else {
+                    panic!("option {k} must be a scalar descriptor");
+                };
+                (k.clone(), *t)
+            })
+            .collect()
+    }
+
+    /// The `record._options.<name>` member *values* a built pvRequest
+    /// puts on the wire, twin of [`option_descs`].
+    fn option_values(expr: &PvRequestExpr) -> Vec<(String, ScalarValue)> {
+        let PvField::Structure(top) = expr.to_pv_field() else {
+            panic!("pvRequest root value is a structure");
+        };
+        let (_, record) = top
+            .fields
+            .iter()
+            .find(|(n, _)| n == "record")
+            .expect("record value present");
+        let PvField::Structure(rfields) = record else {
+            panic!("record value is a structure");
+        };
+        let (_, options) = rfields
+            .fields
+            .iter()
+            .find(|(n, _)| n == "_options")
+            .expect("_options value present");
+        let PvField::Structure(ofields) = options else {
+            panic!("_options value is a structure");
+        };
+        ofields
+            .fields
+            .iter()
+            .map(|(k, v)| {
+                let PvField::Scalar(sv) = v else {
+                    panic!("option {k} must be a scalar value");
+                };
+                (k.clone(), sv.clone())
+            })
+            .collect()
     }
 
     #[test]
@@ -1535,10 +1674,7 @@ mod tests {
     fn brace_groups_coexist_with_record_options() {
         let expr = PvRequestExpr::parse("field(value{a,b})record[pipeline=true]").unwrap();
         assert_eq!(expr.fields, ["value.a", "value.b"]);
-        assert_eq!(
-            expr.record_options,
-            [("pipeline".to_string(), "true".to_string())]
-        );
+        assert_eq!(expr.record_options, [rec_s("pipeline", "true")]);
     }
 
     #[test]
@@ -1590,6 +1726,102 @@ mod tests {
             .expect("parse ok")
             .build();
         assert_eq!(built.fields, ["value.LMT_l", "value.LTM_h"]);
+    }
+
+    // ── typed builder vs parsed-text wire descriptor (pvxs
+    //    testpvreq.cpp:172-256: testAssemble's typed `record(...)` vs
+    //    testParse*'s string `record[...]`) ───────────────────────────
+
+    #[test]
+    fn builder_record_pipeline_emits_typed_bool() {
+        // pvxs `CommonBuilder::record("pipeline", true)` →
+        // `bool pipeline = true` (client.h:661-675, clientreq.cpp:312-323).
+        use crate::pvdata::ScalarType;
+        let req = PvRequestBuilder::new().record("pipeline", true).build();
+        assert_eq!(req.record_options, [("pipeline".to_string(), true.into())]);
+        assert_eq!(
+            option_descs(&req),
+            [("pipeline".to_string(), ScalarType::Boolean)]
+        );
+        assert_eq!(
+            option_values(&req),
+            [("pipeline".to_string(), ScalarValue::Boolean(true))]
+        );
+    }
+
+    #[test]
+    fn builder_record_queue_size_emits_typed_uint() {
+        // pvxs `record("queueSize", 8u32)` → `uint queueSize = 8`.
+        use crate::pvdata::ScalarType;
+        let req = PvRequestBuilder::new().record("queueSize", 8u32).build();
+        assert_eq!(
+            option_descs(&req),
+            [("queueSize".to_string(), ScalarType::UInt)]
+        );
+        assert_eq!(
+            option_values(&req),
+            [("queueSize".to_string(), ScalarValue::UInt(8))]
+        );
+    }
+
+    #[test]
+    fn builder_record_block_emits_typed_bool() {
+        // pvxs PUT INIT pvRequest carries `bool block` (pvalink_channel.cpp:36).
+        use crate::pvdata::ScalarType;
+        let req = PvRequestBuilder::new().record("block", true).build();
+        assert_eq!(
+            option_descs(&req),
+            [("block".to_string(), ScalarType::Boolean)]
+        );
+        assert_eq!(
+            option_values(&req),
+            [("block".to_string(), ScalarValue::Boolean(true))]
+        );
+    }
+
+    #[test]
+    fn parsed_text_record_pipeline_is_string() {
+        // pvxs PVRParser `record[pipeline=true]` → `string pipeline = "true"`
+        // (testpvreq.cpp:232-256). The parsed-text path never types options.
+        use crate::pvdata::ScalarType;
+        let req = PvRequestExpr::parse("record[pipeline=true]").unwrap();
+        assert_eq!(req.record_options, [rec_s("pipeline", "true")]);
+        assert_eq!(
+            option_descs(&req),
+            [("pipeline".to_string(), ScalarType::String)]
+        );
+        assert_eq!(
+            option_values(&req),
+            [(
+                "pipeline".to_string(),
+                ScalarValue::String("true".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn typed_builder_and_parsed_text_pipeline_differ_on_the_wire() {
+        // The whole point of PVA-92: `record("pipeline", true)` (typed bool)
+        // and `record[pipeline=true]` (parsed string) must produce DISTINCT
+        // wire descriptors — same option name, different type code/value.
+        use crate::pvdata::ScalarType;
+        let typed = PvRequestBuilder::new().record("pipeline", true).build();
+        let parsed = PvRequestExpr::parse("record[pipeline=true]").unwrap();
+
+        assert_eq!(
+            option_descs(&typed),
+            [("pipeline".to_string(), ScalarType::Boolean)]
+        );
+        assert_eq!(
+            option_descs(&parsed),
+            [("pipeline".to_string(), ScalarType::String)]
+        );
+        assert_ne!(option_descs(&typed), option_descs(&parsed));
+
+        // The full encoded pvRequest bytes differ in both byte orders: the
+        // type code (0x00 bool vs 0x60 string) and the value body differ.
+        assert_ne!(typed.encode(false), parsed.encode(false));
+        assert_ne!(typed.encode(true), parsed.encode(true));
     }
 
     // ── per-field option brackets (pvDataCPP createRequest) ──────────
@@ -1757,10 +1989,7 @@ mod tests {
                 vec![("deadband".to_string(), "abs:1.0".to_string())]
             )]
         );
-        assert_eq!(
-            expr.record_options,
-            [("pipeline".to_string(), "true".to_string())]
-        );
+        assert_eq!(expr.record_options, [rec_s("pipeline", "true")]);
     }
 
     #[test]
@@ -1768,10 +1997,7 @@ mod tests {
         // The permissive value lexer also lets `record[...]` carry
         // non-identifier values like `abs:1.0`.
         let expr = PvRequestExpr::parse("record[deadband=abs:1.0]").unwrap();
-        assert_eq!(
-            expr.record_options,
-            [("deadband".to_string(), "abs:1.0".to_string())]
-        );
+        assert_eq!(expr.record_options, [rec_s("deadband", "abs:1.0")]);
     }
 
     #[test]
@@ -1850,7 +2076,7 @@ mod tests {
         let expr = PvRequestExpr::parse(&req).expect("quoted _filter must parse");
         assert_eq!(
             expr.record_options,
-            [("_filter".to_string(), json.to_string())],
+            [rec_s("_filter", json)],
             "the unescaped JSON must reach record_options verbatim"
         );
 
@@ -1881,13 +2107,10 @@ mod tests {
     #[test]
     fn ex_r11_quoted_value_escapes() {
         let expr = PvRequestExpr::parse(r#"record[k="x\\y\"z"]"#).unwrap();
-        assert_eq!(
-            expr.record_options,
-            [("k".to_string(), "x\\y\"z".to_string())]
-        );
+        assert_eq!(expr.record_options, [rec_s("k", "x\\y\"z")]);
         // Empty quoted value is valid.
         let empty = PvRequestExpr::parse(r#"record[k=""]"#).unwrap();
-        assert_eq!(empty.record_options, [("k".to_string(), String::new())]);
+        assert_eq!(empty.record_options, [rec_s("k", "")]);
     }
 
     /// An unterminated quote and an invalid escape are parse errors.
@@ -1906,10 +2129,7 @@ mod tests {
         let expr = PvRequestExpr::parse("record[deadband=abs:1.0,pipeline=true]").unwrap();
         assert_eq!(
             expr.record_options,
-            [
-                ("deadband".to_string(), "abs:1.0".to_string()),
-                ("pipeline".to_string(), "true".to_string()),
-            ]
+            [rec_s("deadband", "abs:1.0"), rec_s("pipeline", "true")]
         );
     }
 
@@ -1934,20 +2154,14 @@ mod tests {
             .expect("record[name=name] is pvxs grammar");
         assert_eq!(
             r.record_options,
-            [
-                ("k".to_string(), "v".to_string()),
-                ("pipeline".to_string(), "true".to_string()),
-            ]
+            [rec_s("k", "v"), rec_s("pipeline", "true")]
         );
 
         // Combined field + record, like a real pvxs request string.
         let both = PvRequestExpr::parse_pvxs_compat("field(value)record[block=true]")
             .expect("field(...)record[...] is pvxs grammar");
         assert_eq!(both.fields, ["value"]);
-        assert_eq!(
-            both.record_options,
-            [("block".to_string(), "true".to_string())]
-        );
+        assert_eq!(both.record_options, [rec_s("block", "true")]);
     }
 
     /// Brace member groups are a pvDataCPP extension — strict mode rejects

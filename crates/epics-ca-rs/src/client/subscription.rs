@@ -255,17 +255,20 @@ pub(crate) struct SubscriptionRecord {
     pub subid: u32,
     pub cid: u32,
     pub data_type: Option<u16>,
+    /// The resolved wire element count for the current connection: a
+    /// positive clamped `-#` cap, or `0` for autosize (no cap). See
+    /// [`resolve_subscription_count`].
     pub count: Option<u32>,
     /// The caller's requested element-count cap (`camonitor -#`), or
-    /// `None` for the full native count. Unlike the resolved [`Self::count`]
-    /// (which caches the clamped wire count for the current connection),
-    /// this is a persistent *preference* — carried across reconnects and
-    /// re-clamped against the fresh native element count on each connect,
-    /// mirroring C `camonitor.c:169`
-    /// (`reqElems = reqElems > nElems ? nElems : reqElems`, run inside the
-    /// connect handler). Orthogonal to [`Self::type_user_supplied`]: the
-    /// cap survives a `NativeTypeChanged` reset because it is the user's
-    /// intent, not an auto-derived value.
+    /// `None` for autosize (wire count `0`, the standard CA-tool default).
+    /// Unlike the resolved [`Self::count`] (which caches the wire count for
+    /// the current connection), this is a persistent *preference* — carried
+    /// across reconnects and re-resolved against the fresh native element
+    /// count on each connect via [`resolve_subscription_count`] (a positive
+    /// cap re-clamps per C `camonitor.c:169`; `None` stays autosize).
+    /// Orthogonal to [`Self::type_user_supplied`]: the cap survives a
+    /// `NativeTypeChanged` reset because it is the user's intent, not an
+    /// auto-derived value.
     pub req_count: Option<u32>,
     /// `true` when `data_type`/`count` were chosen explicitly by the
     /// caller, `false` when they were auto-derived from the channel's
@@ -328,17 +331,33 @@ pub(crate) struct SubscriptionRegistry {
 
 /// Resolve a subscription's wire element count from the caller's requested
 /// cap and the channel's native element count. Single owner of the
-/// `reqElems → wire count` rule for monitors, mirroring C
-/// `camonitor.c:169` (`ppv->reqElems = reqElems > nElems ? nElems :
-/// reqElems`): a cap larger than the array is clamped to the array, and
-/// "no cap" (`None`, or an explicit `0` as C treats `reqElems == 0`)
-/// requests the full native count. Re-run on every connect against the
-/// fresh native count, exactly as C runs the clamp inside its connect
-/// handler.
+/// `reqElems → wire count` rule for monitors.
+///
+/// "No cap" (`None`, or an explicit `0` — C treats `reqElems == 0` the
+/// same) resolves to wire `count = 0`, the CA *autosize* request, NOT the
+/// native capacity. With a zero count the server reports the record's
+/// CURRENT element count in every event's response header and sends only
+/// that many elements: `rsrv/camessage.c:504-509` reads `m_count == 0` as
+/// "all available", then `:537-538` fetches the actual `item_count` and
+/// `:563-568` rewrites the response header count to it (non-autosize pads
+/// the tail instead). This is exactly what the standard CA tools request
+/// with no `-#`: `camonitor.c:39,168-169` and `caget.c:200` default
+/// `reqElems` to `0` and pass it straight to `ca_create_subscription` /
+/// `ca_array_get_callback`, and ca-gateway subscribes with count `0`
+/// (`gatePv.cc:765-774`). Requesting the native capacity instead makes a
+/// dynamic waveform (`NORD < NELM`) deliver a max-capacity array with a
+/// padded/stale tail.
+///
+/// A positive cap (`camonitor -#N`) is clamped to the native element count
+/// (C `camonitor.c:169` `reqElems = reqElems > nElems ? nElems : reqElems`)
+/// and sent as a concrete non-zero count, so an over-large `-#` requests the
+/// native count rather than triggering autosize. Re-run on every connect
+/// against the fresh native count, exactly as C runs the clamp inside its
+/// connect handler.
 pub(crate) fn resolve_subscription_count(req_count: Option<u32>, element_count: u32) -> u32 {
     match req_count {
         Some(n) if n > 0 => n.min(element_count),
-        _ => element_count,
+        _ => 0,
     }
 }
 
@@ -589,11 +608,12 @@ impl SubscriptionRegistry {
                     })
                     .unwrap_or(native_type + 14);
                 let data_type = *rec.data_type.get_or_insert(derived);
-                // Single owner of the auto-derived count seed: clamp the
-                // requested `-#` cap to the native element count
-                // (`resolve_subscription_count`, C `camonitor.c:169`). Cached
-                // like `data_type` via `get_or_insert`, so it is computed at
-                // first connect and re-derived only when a native-type change
+                // Single owner of the auto-derived count seed: a `-#` cap is
+                // clamped to the native element count, no cap resolves to
+                // wire 0 (autosize) (`resolve_subscription_count`, C
+                // `camonitor.c:168-169` / `caget.c:200`). Cached like
+                // `data_type` via `get_or_insert`, so it is computed at first
+                // connect and re-derived only when a native-type change
                 // cleared it above — keeping count and type re-derivation
                 // uniform. User-supplied counts (already `Some`) are kept.
                 let count = *rec
@@ -786,18 +806,19 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         // First connect: native type DBR_SHORT(1), count 1.
-        // data_type derives to STS-class 1 + 14 = 15.
+        // data_type derives to STS-class 1 + 14 = 15. This record has no
+        // `-#` cap, so the wire count is 0 (autosize) regardless of native.
         let (restored, failed) = reg.restore_for_channel(100, 7, 1, 1, false, addr(), &tx);
         assert_eq!((restored, failed), (1, 0));
-        assert_eq!(drained_type(&mut rx), (15, 1));
+        assert_eq!(drained_type(&mut rx), (15, 0));
 
         // IOC redefines the record: reconnect with native type
         // DBR_DOUBLE(6), count 3, native_changed = true.
         reg.subscriptions.get_mut(&1).unwrap().needs_restore = true;
         let (restored, failed) = reg.restore_for_channel(100, 8, 6, 3, true, addr(), &tx);
         assert_eq!((restored, failed), (1, 0));
-        // data_type must re-derive to 6 + 14 = 20, count to 3.
-        assert_eq!(drained_type(&mut rx), (20, 3));
+        // data_type must re-derive to 6 + 14 = 20; count stays 0 (autosize).
+        assert_eq!(drained_type(&mut rx), (20, 0));
     }
 
     /// A subscription created with an explicit user-chosen type keeps
@@ -868,9 +889,37 @@ mod tests {
         assert_eq!(drained_type(&mut rx).1, 2, "native change re-clamps cap");
     }
 
-    /// No `-#` cap (`req_count == None`) requests the full native count.
+    /// Direct branch coverage for the wire-count owner: no cap and an
+    /// explicit `0` both autosize (wire 0); a positive cap clamps to the
+    /// native count (C `camonitor.c:168-169`). The `element_count` argument
+    /// is consulted only on the positive-cap branch.
     #[test]
-    fn auto_derived_count_without_cap_requests_full_native() {
+    fn resolve_subscription_count_autosizes_no_cap_and_clamps_positive() {
+        assert_eq!(resolve_subscription_count(None, 7), 0, "no cap ⇒ autosize");
+        assert_eq!(
+            resolve_subscription_count(Some(0), 7),
+            0,
+            "explicit 0 ⇒ autosize (C reqElems==0)"
+        );
+        assert_eq!(
+            resolve_subscription_count(Some(3), 7),
+            3,
+            "cap below native ⇒ cap"
+        );
+        assert_eq!(
+            resolve_subscription_count(Some(9), 7),
+            7,
+            "cap above native ⇒ native (concrete, not autosize)"
+        );
+    }
+
+    /// No `-#` cap (`req_count == None`) requests wire count 0 (CA
+    /// autosize), NOT the native capacity — even when the native count is
+    /// non-trivial (4 here). Matches C `camonitor.c:168-169` / `caget.c:200`
+    /// (default `reqElems == 0`) so a dynamic waveform reports `NORD`, not a
+    /// padded `NELM` array.
+    #[test]
+    fn auto_derived_count_without_cap_requests_autosize_zero() {
         let mut reg = SubscriptionRegistry::new();
         let (rec, _cb_rx) = record(1, 100, /* type_user_supplied */ false);
         assert_eq!(rec.req_count, None);
@@ -878,7 +927,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (restored, _) = reg.restore_for_channel(100, 7, 6, 4, false, addr(), &tx);
         assert_eq!(restored, 1);
-        assert_eq!(drained_type(&mut rx).1, 4, "no cap ⇒ full native count");
+        assert_eq!(drained_type(&mut rx).1, 0, "no cap ⇒ autosize (wire 0)");
     }
 
     /// Regression: pre-fix `on_monitor_data` did `try_send → drop` on a
@@ -1408,12 +1457,14 @@ mod tests {
 
         let (restored, _) = reg.restore_for_channel(100, 7, 1, 1, false, addr(), &tx);
         assert_eq!(restored, 1);
-        assert_eq!(drained_type(&mut rx), (15, 1));
+        // No `-#` cap → count is autosize (0); type derives to 15.
+        assert_eq!(drained_type(&mut rx), (15, 0));
 
         reg.subscriptions.get_mut(&1).unwrap().needs_restore = true;
         let (restored, _) = reg.restore_for_channel(100, 8, 6, 3, false, addr(), &tx);
         assert_eq!(restored, 1);
-        // native_changed = false → type/count stay at first-connect values.
-        assert_eq!(drained_type(&mut rx), (15, 1));
+        // native_changed = false → type stays at the first-connect value;
+        // count stays autosize (0).
+        assert_eq!(drained_type(&mut rx), (15, 0));
     }
 }

@@ -29,8 +29,8 @@
 //!
 //! ## Auto-restart
 //!
-//! The monitor-forwarding task wraps `channel.subscribe_with_mask(..)`
-//! (the configured `-mask` event mask) in an
+//! The monitor-forwarding task wraps `channel.subscribe_with_mask_autosize(..)`
+//! (autosize wire count=0 + the configured `-mask` event mask) in an
 //! exponential-backoff retry loop so a transient upstream disconnect
 //! does not strand the cache entry forever (the entry's `cached`
 //! snapshot would otherwise be served indefinitely while no further
@@ -616,16 +616,23 @@ impl UpstreamManager {
         }
 
         // Subscribe (monitor receiver is independent of the channel handle).
-        // Use the configured `-mask` event mask (default DBE_VALUE|DBE_ALARM)
-        // rather than the CaChannel default (which also requests DBE_LOG):
-        // ca-gateway passes `GR->eventMask()` to `ca_create_subscription`
-        // (gatePv.cc:771-774). `deadband` is 0.0 — ca-gateway applies no
-        // client-side deadband, the server-side mask alone gates events.
+        // Autosize (wire count=0) + the configured `-mask` event mask: this
+        // mirrors ca-gateway's
+        // `ca_create_subscription(eventType(), 0, chID, GR->eventMask(), ...)`
+        // (gatePv.cc:765-774) exactly — count 0 so the IOC reports each
+        // event at the record's CURRENT element count, not its native
+        // capacity, and the configured mask (default DBE_VALUE|DBE_ALARM)
+        // rather than the CaChannel default that also requests DBE_LOG.
+        // `deadband` is 0.0 — ca-gateway applies no client-side deadband,
+        // the server-side mask alone gates events.
         // On failure we MUST also remove the just-added shadow PV — otherwise
         // it lingers in `simple_pvs` with a hook pointing at a dead channel,
         // and the next downstream search resolves it without re-running
         // the resolver, leaving the gateway in a stuck state.
-        let mut monitor = match channel.subscribe_with_mask(0.0, self.event_mask).await {
+        let mut monitor = match channel
+            .subscribe_with_mask_autosize(0.0, self.event_mask)
+            .await
+        {
             Ok(m) => m,
             Err(e) => {
                 self.shadow_db.remove_simple_pv(served_name).await;
@@ -670,9 +677,9 @@ impl UpstreamManager {
         let channel_for_task = channel.clone();
         let stats_for_task = self.write_env.stats.clone();
         let beacon_anomaly_for_task = self.write_env.beacon_anomaly.clone();
-        // The reconnect re-subscribe below must use the same configured
-        // `-mask` event mask as the initial subscribe, not the DBE_LOG-
-        // bearing CaChannel default.
+        // The reconnect re-subscribe below must use the same autosize
+        // (wire count=0) + configured `-mask` event mask as the initial
+        // subscribe, not the DBE_LOG-bearing CaChannel default.
         let event_mask = self.event_mask;
         // the forwarding task addresses the cache entry,
         // shadow PV, and alarm post by `served_name` — the same key the
@@ -788,7 +795,10 @@ impl UpstreamManager {
                     return;
                 }
 
-                match channel_for_task.subscribe_with_mask(0.0, event_mask).await {
+                match channel_for_task
+                    .subscribe_with_mask_autosize(0.0, event_mask)
+                    .await
+                {
                     Ok(new_monitor) => {
                         monitor = new_monitor;
                         // The next successful event will flip state

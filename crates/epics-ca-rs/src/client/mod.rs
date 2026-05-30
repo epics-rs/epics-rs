@@ -2516,11 +2516,41 @@ impl CaChannel {
     /// transitions. `deadband` applies client-side deadband filtering as
     /// in [`Self::subscribe_with_deadband`].
     ///
+    /// No element-count cap is given, so the wire request uses CA autosize
+    /// (`count = 0`): the server reports each event at the record's current
+    /// element count rather than its native capacity — the standard CA-tool
+    /// default (`camonitor.c:168-169`). For an explicit `-#` cap use
+    /// [`Self::subscribe_with_mask_readback_count`].
+    ///
     /// ENUM fields are monitored in their native type (numeric index).
     /// For the `camonitor` state-label default use
     /// [`Self::subscribe_with_mask_enum_as_string`].
     pub async fn subscribe_with_mask(&self, deadband: f64, mask: u16) -> CaResult<MonitorHandle> {
         self.subscribe_with_mask_enum_as_string(deadband, mask, false)
+            .await
+    }
+
+    /// Subscribe with an explicit `DBE_*` event mask and CA *autosize*
+    /// element count (`count = 0` on the wire), the count-zero subscription
+    /// standard CA tools and ca-gateway use (`gatePv.cc:765-774`
+    /// `ca_create_subscription(eventType(), 0, chID, GR->eventMask(), ...)`).
+    ///
+    /// The server reports the record's CURRENT element count in every
+    /// event's response header and sends only that many elements
+    /// (`rsrv/camessage.c:504-509,537-568`), so a dynamic waveform
+    /// (`NORD < NELM`) delivers `NORD` elements per event instead of a
+    /// max-capacity array with a padded/stale tail. Identical wire
+    /// behaviour to [`Self::subscribe_with_mask`] (which also requests no
+    /// cap); this is the intent-revealing entry for callers — like the CA
+    /// gateway — whose correctness depends on autosize, so the count-zero
+    /// contract is explicit at the call site and a future edit cannot
+    /// silently introduce a fixed-capacity cap.
+    pub async fn subscribe_with_mask_autosize(
+        &self,
+        deadband: f64,
+        mask: u16,
+    ) -> CaResult<MonitorHandle> {
+        self.subscribe_with_mask_readback_count(deadband, mask, false, false, None)
             .await
     }
 
@@ -3098,10 +3128,11 @@ async fn run_coordinator(
                             let data_type = ch
                                 .native_type
                                 .map(|t| subscription_readback_dbr(t, enum_as_string, float_as_string));
-                            // Single owner of the reqElems→wire-count rule:
-                            // clamp the requested cap to the native element
-                            // count (C camonitor.c:169). Reconnect re-clamps
-                            // via restore_for_channel against the fresh count.
+                            // Single owner of the reqElems→wire-count rule: a
+                            // `-#` cap is clamped to the native element count,
+                            // no cap resolves to wire 0 (autosize) (C
+                            // camonitor.c:168-169). Reconnect re-resolves via
+                            // restore_for_channel against the fresh count.
                             let count = ch
                                 .native_type
                                 .map(|_| subscription::resolve_subscription_count(req_count, ch.element_count));

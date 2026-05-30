@@ -171,8 +171,11 @@ mod tests {
         let req = PvRequestExpr::parse(args.request.trim()).expect("valid pvRequest");
         assert_eq!(
             req.record_options,
-            vec![("process".to_string(), "true".to_string())],
-            "record[...] options must be preserved, not parsed as a field"
+            vec![(
+                "process".to_string(),
+                epics_pva_rs::pvdata::ScalarValue::String("true".to_string())
+            )],
+            "record[...] options must be preserved as the parsed-text string form"
         );
         assert_eq!(req.fields, vec!["value".to_string()]);
     }

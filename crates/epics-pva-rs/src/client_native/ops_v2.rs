@@ -170,16 +170,23 @@ impl MonitorFlow {
     /// `default_window` is the client's configured pipeline window
     /// (`PvaClientBuilder::pipeline_size`), used as the `queueSize`
     /// fallback the way pvxs uses its `MonitorBuilder` default of 4.
-    pub fn from_record_options(record_options: &[(String, String)], default_window: u32) -> Self {
+    pub fn from_record_options(
+        record_options: &[(String, crate::pvdata::ScalarValue)],
+        default_window: u32,
+    ) -> Self {
+        // Record options are now typed (`bool pipeline`, `uint queueSize`)
+        // or string (parsed-text path). Normalise each to its display
+        // string so one parser handles both shapes — `Boolean(true)` and
+        // `String("true")` both render `"true"`, `UInt(8)` renders `"8"`.
         let get = |key: &str| {
             record_options
                 .iter()
                 .find(|(k, _)| k == key)
-                .map(|(_, v)| v.trim())
+                .map(|(_, v)| v.to_string())
         };
         // pvxs `options["pipeline"].as(op->pipeline)` — absent ⟹ false.
         let pipeline = get("pipeline")
-            .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
             .unwrap_or(false);
         if !pipeline {
             // No pipeline ⟹ no credit window and no ACK trailer. A
@@ -203,10 +210,10 @@ impl MonitorFlow {
             DEFAULT_PIPELINE_SIZE
         };
         let queue_size = get("queueSize")
-            .and_then(|v| v.parse::<u32>().ok())
+            .and_then(|v| v.trim().parse::<u32>().ok())
             .filter(|&q| q > 1)
             .unwrap_or(fallback);
-        let ack_at = ack_at_from_request(get("ackAny"), queue_size);
+        let ack_at = ack_at_from_request(get("ackAny").as_deref(), queue_size);
         Self {
             pipeline: true,
             queue_size,
@@ -4459,10 +4466,18 @@ mod tests {
         assert_eq!(ack_threshold(33), 16);
     }
 
-    fn opts(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    fn opts(pairs: &[(&str, &str)]) -> Vec<(String, crate::pvdata::ScalarValue)> {
+        // The parsed-text option form: every value is string-typed.
+        // `from_record_options` normalises typed and string options
+        // through `to_string()`, so these still exercise the same paths.
         pairs
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|(k, v)| {
+                (
+                    k.to_string(),
+                    crate::pvdata::ScalarValue::String(v.to_string()),
+                )
+            })
             .collect()
     }
 

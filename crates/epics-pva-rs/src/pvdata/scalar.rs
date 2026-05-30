@@ -124,6 +124,41 @@ pub enum ScalarValue {
     String(String),
 }
 
+/// Typed conversions into [`ScalarValue`], so the pvRequest builder's
+/// `record(key, value)` preserves the caller's scalar type — pvxs
+/// `CommonBuilder::record<T>` stores `Value::Helper::build(value, vtype)`
+/// (client.h:661-675), giving `bool pipeline = true` / `uint queueSize = 8`
+/// rather than collapsing every option to a string.
+macro_rules! scalar_from {
+    ($($t:ty => $variant:ident),+ $(,)?) => {$(
+        impl From<$t> for ScalarValue {
+            fn from(v: $t) -> Self {
+                Self::$variant(v)
+            }
+        }
+    )+};
+}
+scalar_from! {
+    bool => Boolean,
+    i8 => Byte,
+    i16 => Short,
+    i32 => Int,
+    i64 => Long,
+    u8 => UByte,
+    u16 => UShort,
+    u32 => UInt,
+    u64 => ULong,
+    f32 => Float,
+    f64 => Double,
+    String => String,
+}
+
+impl From<&str> for ScalarValue {
+    fn from(v: &str) -> Self {
+        Self::String(v.to_string())
+    }
+}
+
 impl fmt::Display for ScalarValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

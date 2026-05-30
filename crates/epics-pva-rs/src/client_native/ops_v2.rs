@@ -3098,7 +3098,46 @@ pub async fn op_put_get(
     op_timeout: Duration,
 ) -> PvaResult<(FieldDesc, PvField)> {
     // Default putGet (data subcmd 0x00): write `value_str`, then read back.
-    op_put_get_data(channel, 0x00, Some(value_str), op_timeout).await
+    op_put_get_data(channel, 0x00, None, PutGetPut::Str(value_str), op_timeout).await
+}
+
+/// Atomic `PUT_GET` (cmd 12) writing a typed [`PvField`] with the default
+/// `field(value)` pvRequest — the typed-value counterpart of
+/// [`op_put_get`] (which parses a string). Returns the get-leg
+/// `(FieldDesc, PvField)` readback.
+pub async fn op_put_get_value(
+    channel: &Arc<Channel>,
+    value: &PvField,
+    op_timeout: Duration,
+) -> PvaResult<(FieldDesc, PvField)> {
+    op_put_get_data(channel, 0x00, None, PutGetPut::Typed(value), op_timeout).await
+}
+
+/// Atomic `PUT_GET` (cmd 12) carrying a caller-supplied pvRequest and a
+/// typed [`PvField`]. INIT sends `pv_req` bytes (e.g. a PVA gateway's
+/// preserved downstream `ChannelContext.pv_request`, carrying
+/// `record._options.process`/`block`) instead of the default
+/// `field(value)` selector; the put leg encodes the typed `value`.
+/// Returns the get-leg `(FieldDesc, PvField)` readback.
+///
+/// pvxs `p2pApp/channel.cpp:129-137`: `GWChannel::createChannelPutGet`
+/// forwards the original pvRequest verbatim to the upstream channel and
+/// returns its readback — one upstream operation, not a local put plus a
+/// separately-read cached get.
+pub async fn op_put_get_value_raw(
+    channel: &Arc<Channel>,
+    pv_req: &[u8],
+    value: &PvField,
+    op_timeout: Duration,
+) -> PvaResult<(FieldDesc, PvField)> {
+    op_put_get_data(
+        channel,
+        0x00,
+        Some(pv_req),
+        PutGetPut::Typed(value),
+        op_timeout,
+    )
+    .await
 }
 
 /// EPICS ChannelPutGet `getGet` (`QOS_GET`, 0x40): read the current
@@ -3109,7 +3148,7 @@ pub async fn op_get_get(
     channel: &Arc<Channel>,
     op_timeout: Duration,
 ) -> PvaResult<(FieldDesc, PvField)> {
-    op_put_get_data(channel, QosFlags::GET, None, op_timeout).await
+    op_put_get_data(channel, QosFlags::GET, None, PutGetPut::None, op_timeout).await
 }
 
 /// EPICS ChannelPutGet `getPut` (`QOS_GET_PUT`, 0x80): read the current
@@ -3118,19 +3157,40 @@ pub async fn op_get_put(
     channel: &Arc<Channel>,
     op_timeout: Duration,
 ) -> PvaResult<(FieldDesc, PvField)> {
-    op_put_get_data(channel, QosFlags::GET_PUT, None, op_timeout).await
+    op_put_get_data(
+        channel,
+        QosFlags::GET_PUT,
+        None,
+        PutGetPut::None,
+        op_timeout,
+    )
+    .await
 }
 
-/// Shared PUT_GET data-phase driver: INIT, then a single data frame whose
-/// subcommand selects putGet (`Some(value)` → put BitSet + value) or the
-/// read-only getGet/getPut (`None` → no payload, pvAccess
-/// `clientContextImpl.cpp:1100-1112`), then decode the readback. Factored
-/// so the three subcommands share one INIT/destroy lifecycle and cannot
-/// drift apart.
+/// The put leg of a [`op_put_get_data`] round trip. The read-only
+/// getGet/getPut subcommands carry no payload (`None`); the default
+/// putGet writes a string-parsed value (`Str`); the typed putGet (gateway
+/// forward / typed clients) writes a pre-built [`PvField`] (`Typed`). One
+/// enum so every PUT_GET variant shares the single INIT/data/destroy
+/// lifecycle below and cannot drift apart.
+enum PutGetPut<'a> {
+    None,
+    Str(&'a str),
+    Typed(&'a PvField),
+}
+
+/// Shared PUT_GET data-phase driver: INIT (with `req` bytes when the
+/// caller supplies a pvRequest, else the default `field(value)`
+/// selector), then a single data frame whose subcommand selects putGet
+/// (`Str`/`Typed` → put BitSet + value) or the read-only getGet/getPut
+/// (`None` → no payload, pvAccess `clientContextImpl.cpp:1100-1112`), then
+/// decode the readback. Factored so every subcommand and value form shares
+/// one INIT/destroy lifecycle and cannot drift apart.
 async fn op_put_get_data(
     channel: &Arc<Channel>,
     data_subcmd: u8,
-    value_str: Option<&str>,
+    req: Option<&[u8]>,
+    put: PutGetPut<'_>,
     op_timeout: Duration,
 ) -> PvaResult<(FieldDesc, PvField)> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
@@ -3139,7 +3199,16 @@ async fn op_put_get_data(
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
 
-    let pv_req = build_pv_request_value_only(big_endian);
+    // INIT pvRequest: the caller's bytes (preserved downstream request)
+    // when supplied, else the default value-only `field(value)` selector.
+    let default_req;
+    let pv_req: &[u8] = match req {
+        Some(b) => b,
+        None => {
+            default_req = build_pv_request_value_only(big_endian);
+            &default_req
+        }
+    };
     let mut stream = server.register_ioid_stream(sid, ioid, Command::PutGet.code());
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
     let cache = server.type_cache();
@@ -3149,7 +3218,7 @@ async fn op_put_get_data(
     init.put_u32(sid, order);
     init.put_u32(ioid, order);
     init.put_u8(QosFlags::INIT);
-    init.extend_from_slice(&pv_req);
+    init.extend_from_slice(pv_req);
     let init_h = PvaHeader::application(false, order, Command::PutGet.code(), init.len() as u32);
     let mut init_frame = Vec::with_capacity(8 + init.len());
     init_h.write_into(&mut init_frame);
@@ -3180,8 +3249,14 @@ async fn op_put_get_data(
     data.put_u32(sid, order);
     data.put_u32(ioid, order);
     data.put_u8(data_subcmd);
-    if let Some(value_str) = value_str {
-        let value = build_put_value(&intro, value_str)?;
+    // putGet carries a put payload (string-parsed or typed); getGet/getPut
+    // (`None`) send none.
+    let put_value = match put {
+        PutGetPut::None => None,
+        PutGetPut::Str(value_str) => Some(build_put_value(&intro, value_str)?),
+        PutGetPut::Typed(value) => Some(coerce_typed_put_value(&intro, value)?),
+    };
+    if let Some(value) = put_value {
         let mut changed = BitSet::new();
         if let Some(bit) = intro.bit_for_path("value") {
             changed.set(bit);

@@ -27,9 +27,11 @@ use epics_bridge_rs::pva_gateway::{
     ChannelCache, GatewayChannelSource, MultiTenantPvaGatewayBuilder, PvaGateway, PvaGatewayConfig,
 };
 use epics_pva_rs::client::PvaClient;
+use epics_pva_rs::proto::BitSet;
 use epics_pva_rs::pvdata::{
     FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray,
 };
+use epics_pva_rs::server_native::source::{AccessChecked, ChannelContext, OpError};
 use epics_pva_rs::server_native::{
     ChannelSource, PvaServer, PvaServerConfig, SharedPV, SharedSource,
 };
@@ -1226,4 +1228,266 @@ async fn br_99_decoded_monitor_gets_finish_on_upstream_descriptor_change() {
 
     h_raw.abort();
     h_pipe.abort();
+}
+
+// ---------------------------------------------------------------------
+// BRIDGE-RS-2026-05-28-27 (PUT_GET leg): the gateway must forward a
+// downstream PUT_GET as ONE upstream PUT_GET — preserving the downstream
+// pvRequest — and return the *upstream* post-put readback, not a local
+// put plus a cached GET.
+// ---------------------------------------------------------------------
+
+/// Upstream test source whose `put_get_checked` override (1) records the
+/// pvRequest it received — proving the gateway forwarded the downstream
+/// request — and (2) stores TWICE the put double, returning the doubled
+/// value as the readback. A downstream PUT_GET that comes back doubled
+/// therefore proves the gateway ran a real upstream PUT_GET (post-put
+/// readback), since the gateway never cached a doubled value of its own.
+#[derive(Clone)]
+struct RecordingDoublingSource {
+    pv_name: String,
+    value: Arc<std::sync::Mutex<f64>>,
+    captured_req: Arc<std::sync::Mutex<Option<PvField>>>,
+}
+
+impl RecordingDoublingSource {
+    fn new(pv_name: &str, initial: f64) -> Self {
+        Self {
+            pv_name: pv_name.to_string(),
+            value: Arc::new(std::sync::Mutex::new(initial)),
+            captured_req: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+}
+
+/// Extract the `.value` double from an NTScalar structure (or a bare
+/// scalar).
+fn double_of(field: &PvField) -> Option<f64> {
+    match field {
+        PvField::Structure(s) => s.fields.iter().find_map(|(k, v)| {
+            (k == "value").then_some(v).and_then(|v| match v {
+                PvField::Scalar(ScalarValue::Double(d)) => Some(*d),
+                _ => None,
+            })
+        }),
+        PvField::Scalar(ScalarValue::Double(d)) => Some(*d),
+        _ => None,
+    }
+}
+
+/// True iff the pvRequest carries a top-level `record` member. The
+/// gateway's default value-only request (`field(value)`) has none, so a
+/// captured request with `record` proves the *downstream* request — built
+/// here with a record option — travelled through the gateway verbatim.
+fn has_record_member(req: &PvField) -> bool {
+    matches!(req, PvField::Structure(s) if s.fields.iter().any(|(k, _)| k == "record"))
+}
+
+impl ChannelSource for RecordingDoublingSource {
+    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+        let n = self.pv_name.clone();
+        async move { vec![n] }
+    }
+    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
+        let want = self.pv_name.clone();
+        let got = n.to_string();
+        async move { got == want }
+    }
+    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+        Some(nt_double_desc())
+    }
+    fn get_value(&self, _: &str) -> impl std::future::Future<Output = Option<PvField>> + Send {
+        let v = *self.value.lock().unwrap();
+        async move { Some(nt_double_value(v)) }
+    }
+    fn put_value(
+        &self,
+        _: &str,
+        value: PvField,
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+        let store = self.value.clone();
+        async move {
+            let incoming =
+                double_of(&value).ok_or_else(|| OpError::failed("no double .value field"))?;
+            *store.lock().unwrap() = incoming * 2.0;
+            Ok(())
+        }
+    }
+    async fn is_writable(&self, _: &str) -> bool {
+        true
+    }
+    async fn subscribe(&self, _: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+        None
+    }
+    fn put_get_checked(
+        &self,
+        checked: AccessChecked,
+        _desc: FieldDesc,
+        _changed: BitSet,
+        delta: PvField,
+        ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Result<Option<PvField>, OpError>> + Send {
+        let store = self.value.clone();
+        let captured = self.captured_req.clone();
+        async move {
+            // Record the forwarded pvRequest, then apply the doubling put
+            // and return the post-put readback as ONE operation.
+            *captured.lock().unwrap() = ctx.pv_request.clone();
+            if !checked.allows_write() {
+                return Err(OpError::denied("write denied"));
+            }
+            let incoming =
+                double_of(&delta).ok_or_else(|| OpError::failed("no double .value field"))?;
+            let doubled = incoming * 2.0;
+            *store.lock().unwrap() = doubled;
+            Ok(Some(nt_double_value(doubled)))
+        }
+    }
+}
+
+/// Build a 1-PV upstream PvaServer backed by a [`RecordingDoublingSource`].
+fn spawn_recording_upstream(
+    pv_name: &str,
+    initial: f64,
+) -> (PvaServer, SocketAddr, RecordingDoublingSource) {
+    let src = RecordingDoublingSource::new(pv_name, initial);
+    let pick = || {
+        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let pick_udp = || {
+        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let cfg = PvaServerConfig {
+        tcp_port: pick(),
+        udp_port: pick_udp(),
+        ..PvaServerConfig::isolated()
+    };
+    let bound = SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        cfg.tcp_port,
+    );
+    let server = PvaServer::start(Arc::new(src.clone()), cfg).expect("test server must start");
+    (server, bound, src)
+}
+
+/// End-to-end: a downstream PUT_GET carrying a typed value AND a custom
+/// pvRequest (with a `record` option) is forwarded by the gateway as ONE
+/// upstream PUT_GET. The doubling upstream returns the post-put value, so
+/// a readback of 42 proves the gateway returned the *upstream* PUT_GET
+/// readback (not a cached snapshot — the gateway never holds a doubled
+/// value), and the captured upstream pvRequest carrying `record` proves
+/// the downstream request travelled verbatim rather than being dropped
+/// for the gateway's default `field(value)`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gateway_put_get_forwards_pvrequest_and_returns_upstream_readback() {
+    let (_us_server, us_addr, us_src) = spawn_recording_upstream("GW:PUTGET:PV", 1.0);
+    let upstream_client = Arc::new(
+        PvaClient::builder()
+            .server_addr(us_addr)
+            .timeout(Duration::from_secs(2))
+            .build(),
+    );
+    let cfg = gateway_cfg(upstream_client);
+    let gw = PvaGateway::start(cfg).expect("gateway start");
+
+    let ds = gw.client_config();
+
+    // Custom downstream pvRequest: field(value) plus a record option, so
+    // it is structurally distinct from the gateway's default request.
+    let req = epics_pva_rs::pv_request::PvRequestBuilder::new()
+        .field("value")
+        .record("block", true)
+        .build()
+        .to_pv_field();
+
+    let (_intro, readback) = tokio::time::timeout(
+        Duration::from_secs(5),
+        ds.pvput_get_pv_field_with_request_value("GW:PUTGET:PV", &req, &nt_double_value(21.0)),
+    )
+    .await
+    .expect("downstream PUT_GET timed out")
+    .expect("downstream PUT_GET failed");
+
+    assert_eq!(
+        double_of(&readback),
+        Some(42.0),
+        "PUT_GET readback must be the upstream post-put (doubled) value"
+    );
+    assert_eq!(
+        *us_src.value.lock().unwrap(),
+        42.0,
+        "upstream source must hold the doubled value (a real upstream PUT_GET ran)"
+    );
+
+    let captured = us_src
+        .captured_req
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("upstream PUT_GET must have received a forwarded pvRequest");
+    assert!(
+        has_record_member(&captured),
+        "the downstream pvRequest (carrying a record option) must reach upstream \
+         verbatim, not be replaced by the gateway's default field(value): {captured:?}"
+    );
+}
+
+/// Same atomic PUT_GET forward, but with `control_prefix` set so the
+/// downstream source is a `CompositeSource(ControlSource, layered gateway)`.
+/// A data-PV PUT_GET must resolve to the gateway owner and reach its
+/// `put_get_checked` as ONE operation — proving `CompositeSource` forwards
+/// PUT_GET rather than decomposing it into put_delta + cached get.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gateway_put_get_forwards_through_composite_with_control_prefix() {
+    let (_us_server, us_addr, us_src) = spawn_recording_upstream("GW:PUTGET:CMP", 1.0);
+    let upstream_client = Arc::new(
+        PvaClient::builder()
+            .server_addr(us_addr)
+            .timeout(Duration::from_secs(2))
+            .build(),
+    );
+    // gateway_cfg picks fresh ports; override control_prefix so the
+    // CompositeSource + ControlSource wrap the layered gateway source.
+    let cfg = PvaGatewayConfig {
+        control_prefix: Some("gw".into()),
+        ..gateway_cfg(upstream_client)
+    };
+    let gw = PvaGateway::start(cfg).expect("gateway start");
+
+    let ds = gw.client_config();
+    let req = epics_pva_rs::pv_request::PvRequestBuilder::new()
+        .field("value")
+        .record("block", true)
+        .build()
+        .to_pv_field();
+
+    let (_intro, readback) = tokio::time::timeout(
+        Duration::from_secs(5),
+        ds.pvput_get_pv_field_with_request_value("GW:PUTGET:CMP", &req, &nt_double_value(21.0)),
+    )
+    .await
+    .expect("downstream PUT_GET timed out")
+    .expect("downstream PUT_GET failed");
+
+    assert_eq!(
+        double_of(&readback),
+        Some(42.0),
+        "PUT_GET through CompositeSource must return the upstream post-put (doubled) value"
+    );
+    let captured = us_src
+        .captured_req
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("upstream PUT_GET must have received a forwarded pvRequest via the composite");
+    assert!(
+        has_record_member(&captured),
+        "the downstream pvRequest must reach upstream verbatim through CompositeSource: {captured:?}"
+    );
 }

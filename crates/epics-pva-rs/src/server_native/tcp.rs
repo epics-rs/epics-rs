@@ -3462,10 +3462,18 @@ async fn handle_put_get(
         payload.put_u32(ioid, order);
         payload.put_u8(subcmd);
 
-        // PUT leg — WRITE-gated. Skipped for getGet/getPut (read-only):
-        // those subcommands carry no put payload and only read back.
-        if let Some((changed, put_delta)) = put_payload {
-            let put_result = {
+        // putGet (0x00) is the atomic WRITE+READ round trip; getGet/getPut
+        // (read-only) carry no put payload and only read back. The default
+        // `put_get_checked` composes put_delta_checked + get_value_checked
+        // over the same backing store, but a remote-fronting source (the
+        // pva-gateway) overrides it to issue ONE upstream PUT_GET so the
+        // put-then-get stays atomic upstream (pva2pva
+        // `p2pApp/channel.cpp:129-137`) instead of a local put plus a
+        // separately-read cached get. The read-only legs stay a plain
+        // READ-gated `get_value_checked`. A panic in either user handler
+        // becomes an error reply instead of skipping the reply below.
+        let read_value: Result<Option<PvField>, String> =
+            if let Some((changed, put_delta)) = put_payload {
                 let checked = src
                     .access_gate()
                     .check_with_roles(
@@ -3477,9 +3485,7 @@ async fn handle_put_get(
                         &ctx.authority,
                     )
                     .await;
-                // a panic in the user PUT handler becomes an error
-                // reply instead of skipping the reply below.
-                catch_handler_panic(src.put_delta_checked(
+                match catch_handler_panic(src.put_get_checked(
                     checked,
                     intro.clone(),
                     changed,
@@ -3487,40 +3493,27 @@ async fn handle_put_get(
                     ctx.clone(),
                 ))
                 .await
-                .map_err(|e| OpError::failed(e))
-                .and_then(|r| r)
+                {
+                    Ok(Ok(v)) => Ok(v),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(panic) => Err(panic),
+                }
+            } else {
+                let read_checked = src
+                    .access_gate()
+                    .check_with_roles(
+                        &pv_name,
+                        &ctx.host,
+                        &ctx.account,
+                        &ctx.roles,
+                        &ctx.method,
+                        &ctx.authority,
+                    )
+                    .await;
+                catch_handler_panic(src.get_value_checked(read_checked, ctx)).await
             };
-            if let Err(msg) = put_result {
-                Status::error(msg).write_into(order, &mut payload);
-                let h = PvaHeader::application(
-                    true,
-                    order,
-                    Command::PutGet.code(),
-                    payload.len() as u32,
-                );
-                let mut buf = Vec::new();
-                h.write_into(&mut buf);
-                buf.extend_from_slice(&payload);
-                let _ = tx_clone.send(buf).await;
-                return;
-            }
-        }
 
-        // GET leg — READ-gated. For getGet/getPut this is the only leg.
-        let read_checked = src
-            .access_gate()
-            .check_with_roles(
-                &pv_name,
-                &ctx.host,
-                &ctx.account,
-                &ctx.roles,
-                &ctx.method,
-                &ctx.authority,
-            )
-            .await;
-        // a panic in the user GET handler becomes an error reply
-        // instead of skipping the reply below.
-        match catch_handler_panic(src.get_value_checked(read_checked, ctx)).await {
+        match read_value {
             Ok(Some(v)) => {
                 Status::ok().write_into(order, &mut payload);
                 let wire_changed = crate::pvdata::encode::canonical_changed_bitset(&intro, &mask);

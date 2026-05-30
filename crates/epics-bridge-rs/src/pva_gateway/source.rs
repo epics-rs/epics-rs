@@ -1255,6 +1255,75 @@ impl ChannelSource for GatewayChannelSource {
         result.map_err(|e| OpError::failed(e.to_string()))
     }
 
+    /// Credential-aware atomic **PUT_GET** — forward the whole operation
+    /// as ONE upstream PVA `ChannelPutGet` and return its upstream
+    /// readback, instead of the default local put-then-(cached)-get.
+    ///
+    /// pva2pva `p2pApp/channel.cpp:129-137` implements
+    /// `GWChannel::createChannelPutGet` by forwarding
+    /// `createChannelPutGet(..., pvRequest)` verbatim to the upstream
+    /// channel: the upstream IOC applies the put and produces the readback
+    /// atomically under the downstream's own pvRequest
+    /// (`record._options.process`/`block`). The default
+    /// `put_delta_checked` + `get_value_checked` composition instead merged
+    /// the delta against this gateway's cached monitor snapshot and read the
+    /// post-put value back from that same cache, losing upstream atomicity
+    /// and the original request. Routing through the per-(account, method)
+    /// `upstream_client_for` keeps the downstream identity, exactly as
+    /// `put_value_checked`/`get_value_checked`/`rpc_checked` do. Plain GET
+    /// still returns the cached snapshot — this override is the only place
+    /// the PUT_GET readback diverges from that cache.
+    async fn put_get_checked(
+        &self,
+        checked: AccessChecked,
+        _desc: FieldDesc,
+        _changed: epics_pva_rs::proto::BitSet,
+        delta: PvField,
+        ctx: ChannelContext,
+    ) -> Result<Option<PvField>, OpError> {
+        if !checked.allows_write() {
+            tracing::debug!(
+                pv = %checked.pv_name(),
+                account = %ctx.account,
+                method = %ctx.method,
+                "pva-gateway: PUT_GET denied by gateway ACF"
+            );
+            return Err(OpError::denied(format!(
+                "PUT_GET denied by gateway access security: \
+                 PV '{pv}' from {host}/{account}/{method}",
+                pv = checked.pv_name(),
+                host = ctx.host,
+                account = ctx.account,
+                method = ctx.method,
+            )));
+        }
+
+        let name = checked.pv_name();
+        let client = self.upstream_client_for(&ctx);
+        tracing::debug!(
+            pv = %name,
+            account = %ctx.account,
+            method = %ctx.method,
+            "pva-gateway: forwarding PUT_GET with downstream credentials"
+        );
+        // One upstream PUT_GET carrying the downstream's preserved INIT
+        // pvRequest (process/block) and the put value; the value targets the
+        // `value` bit (typed pass-through, matching the plain-PUT path) and
+        // the upstream post-put readback is returned verbatim. Falls back to
+        // the default request when the downstream sent none.
+        let result = match ctx.pv_request.as_ref() {
+            Some(req) => {
+                client
+                    .pvput_get_pv_field_with_request_value(name, req, &delta)
+                    .await
+            }
+            None => client.pvput_get_pv_field(name, &delta).await,
+        };
+        result
+            .map(|(_desc, value)| Some(value))
+            .map_err(|e| OpError::failed(e.to_string()))
+    }
+
     async fn is_writable(&self, name: &str) -> bool {
         // Peek-only: report writable iff the entry is already in the
         // cache. We deliberately do NOT trigger a fresh upstream

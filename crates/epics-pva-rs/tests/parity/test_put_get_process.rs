@@ -23,6 +23,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use epics_base_rs::server::access_security::{AccessGate, AsgAslResolver, parse_acf};
+use epics_pva_rs::PvaError;
 use epics_pva_rs::client_native::context::PvaClient;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServer, PvaServerConfig};
@@ -291,6 +292,69 @@ async fn get_get_and_get_put_read_without_writing() {
         *src.value.lock(),
         42,
         "getGet must not mutate the stored value"
+    );
+
+    server.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(2), server.wait()).await;
+}
+
+/// PUT_GET (cmd 12) is a Rust extension. With `serve_put_get`
+/// disabled (the strict pvxs-compat posture) the server rejects every
+/// cmd-12 frame — putGet, getGet, getPut — with a deterministic error
+/// `Status` instead of running the round trip. The client fails fast
+/// with a server error, NOT a `PvaError::Timeout`: a gated-off server
+/// replies immediately, so the op never waits out its `op_timeout` the
+/// way pvxs's silent `handle_PUT_GET` stub would force it to. The gate
+/// fires before any put leg, so the source is never mutated.
+#[tokio::test]
+async fn put_get_rejected_when_serve_put_get_disabled() {
+    let (port, udp) = alloc_port();
+    let cfg = PvaServerConfig {
+        tcp_port: port,
+        udp_port: udp,
+        serve_put_get: false,
+        ..Default::default()
+    };
+    let src = DoublingSource::new();
+    let server = PvaServer::start(Arc::new(src.clone()), cfg).expect("test server must start");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = client_to(port);
+
+    // putGet (write leg + readback).
+    let pg = tokio::time::timeout(Duration::from_secs(3), client.pvput_get("dut", "21"))
+        .await
+        .expect("pvput_get hung instead of returning a deterministic error");
+    let pg_err = pg.expect_err("putGet must be rejected when serve_put_get=false");
+    assert!(
+        !matches!(pg_err, PvaError::Timeout),
+        "putGet rejection must be a deterministic server error, not a timeout: {pg_err:?}"
+    );
+
+    // getGet (read-only cmd-12 subcommand) routes through the same gate.
+    let gg = tokio::time::timeout(Duration::from_secs(3), client.pvget_get("dut"))
+        .await
+        .expect("pvget_get hung instead of returning a deterministic error");
+    let gg_err = gg.expect_err("getGet must be rejected when serve_put_get=false");
+    assert!(
+        !matches!(gg_err, PvaError::Timeout),
+        "getGet rejection must be a deterministic server error, not a timeout: {gg_err:?}"
+    );
+
+    // getPut (read-only cmd-12 subcommand) — same gate.
+    let gp = tokio::time::timeout(Duration::from_secs(3), client.pvget_put("dut"))
+        .await
+        .expect("pvget_put hung instead of returning a deterministic error");
+    let gp_err = gp.expect_err("getPut must be rejected when serve_put_get=false");
+    assert!(
+        !matches!(gp_err, PvaError::Timeout),
+        "getPut rejection must be a deterministic server error, not a timeout: {gp_err:?}"
+    );
+
+    assert_eq!(
+        *src.value.lock(),
+        1,
+        "a gated-off PUT_GET must not write the source value"
     );
 
     server.stop();

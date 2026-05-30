@@ -3149,6 +3149,30 @@ async fn handle_put_get(
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
 
+    // PUT_GET (cmd 12) is a Rust extension — pvxs leaves `handle_PUT_GET`
+    // an empty stub (serverconn.cpp:259-260) and its client never sends
+    // cmd 12 (clientimpl.h:143). `serve_put_get` (default true) gates
+    // whether this server serves the operation; a deployment that wants
+    // strict pvxs-compatible behavior sets it false and every cmd-12
+    // frame — putGet, getGet, getPut — is answered with a deterministic
+    // error `Status` rather than the Rust round trip. We reply with an
+    // explicit error (not pvxs's silent drop) so the policy is visible at
+    // the wire level and a client fails fast instead of waiting out its
+    // `op_timeout`. Gated before the channel borrow, like the unknown-sid
+    // path below, so it needs no resolved channel.
+    if !config.serve_put_get {
+        send_op_error(
+            tx,
+            OpKind::PutGet,
+            ioid,
+            subcmd,
+            "PUT_GET not served (serve_put_get disabled for pvxs compatibility)",
+            order,
+        )
+        .await?;
+        return Ok(());
+    }
+
     // Connection-wide IOID uniqueness (pvxs `ServerConn::opByIOID`),
     // evaluated before the per-channel borrow below.
     let dup_ioid = subcmd & QosFlags::INIT != 0 && ioid_live_on_conn(channels, ioid);

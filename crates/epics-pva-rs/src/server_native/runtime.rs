@@ -165,6 +165,18 @@ pub struct PvaServerConfig {
     /// (e.g. a hardened deployment that wants to reject any header
     /// claiming more than `n` bytes and drop the connection).
     pub max_message_size: Option<usize>,
+    /// Serve the `PUT_GET` operation (PVA cmd 12). `PUT_GET` is a Rust
+    /// extension: pvxs declares the command but leaves `handle_PUT_GET`
+    /// an empty stub (`serverconn.cpp:259-260`) and its client never
+    /// sends cmd 12 (`clientimpl.h:143`). When `true` (the default) this
+    /// server implements the full INIT/put/readback/destroy lifecycle so
+    /// a PUT_GET-capable client gets a real round trip. Set `false` for
+    /// strict pvxs-compatible behavior: every cmd-12 frame is answered
+    /// with a deterministic error `Status` instead of the Rust round
+    /// trip. We reply with an explicit error rather than pvxs's silent
+    /// drop so the policy is visible at the wire level and a client fails
+    /// fast instead of waiting out its `op_timeout`.
+    pub serve_put_get: bool,
     /// UDP-SEARCH ignore list. Each entry is `(IpAddr, port_or_zero)` —
     /// matching UDP SEARCH datagrams are silently dropped before
     /// admission. `port == 0` matches any port from that IP. Mirrors
@@ -266,6 +278,7 @@ impl Default for PvaServerConfig {
             send_timeout: Duration::from_secs(5),
             tls_handshake_timeout: Duration::from_secs(10),
             max_message_size: None,
+            serve_put_get: true,
         }
     }
 }

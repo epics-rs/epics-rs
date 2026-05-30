@@ -50,6 +50,29 @@ pub struct ClientCreds {
     pub roles: Vec<String>,
 }
 
+/// Outcome of a QSRV write authorization.
+///
+/// Produced once by the access layer — the SINGLE source of both "may
+/// this client write" (`allowed`) and "did the matched ACF/ASG rule
+/// carry `TRAPWRITE`" (`rule_was_trap`). The QSRV PUT path emits the
+/// `asTrapWrite` put-log event iff `rule_was_trap`, and never re-derives
+/// the trap flag at the emission site (see [`super::trap_write`]).
+///
+/// Mirrors C `asComputePvt` tracking `access` and `trapMask` together
+/// (`asLibRoutines.c:983-1048`) and pvxs `SecurityClient` exposing both
+/// `canWrite()` and the trap mask its `SecurityLogger` consults
+/// (`pvxs/ioc/securityclient.cpp`, `pvxs/ioc/securitylogger.h:44`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WriteGrant {
+    /// True iff the matched ACF/ASG rule grants write access.
+    pub allowed: bool,
+    /// True iff the matched (granting) rule carried the `TRAPWRITE`
+    /// option. Always `false` when `!allowed` (C `asComputePvt` copies
+    /// `trapMask` only on a rule that raises access, `asLibRoutines.c:
+    /// 1041-1048`).
+    pub rule_was_trap: bool,
+}
+
 /// Access control interface for PVA channels.
 ///
 /// Corresponds to C++ QSRV's per-channel ASCLIENT checks.
@@ -78,6 +101,23 @@ pub trait AccessControl: Send + Sync {
     /// Method/authority/roles-aware write check.
     fn can_write_creds(&self, channel: &str, creds: &ClientCreds) -> bool {
         self.can_write(channel, &creds.user, &creds.host)
+    }
+
+    /// Authorize a write and surface the matched ACF/ASG rule's
+    /// `TRAPWRITE` flag in one result — the single source the QSRV PUT
+    /// path uses both to gate the write and to decide `asTrapWrite`
+    /// put-logging (see [`WriteGrant`] and [`super::trap_write`]).
+    ///
+    /// Default: forward to [`Self::can_write_creds`] with
+    /// `rule_was_trap = false` — an impl with no ACF rule has no trap
+    /// mask, matching C `asComputePvt` leaving `trapMask = 0`.
+    /// [`AcfAccessControl`] overrides this to read the granting rule's
+    /// trap flag via `check_access_method_trap`.
+    fn write_grant(&self, channel: &str, creds: &ClientCreds) -> WriteGrant {
+        WriteGrant {
+            allowed: self.can_write_creds(channel, creds),
+            rule_was_trap: false,
+        }
     }
 }
 
@@ -220,6 +260,49 @@ impl AcfAccessControl {
         }
         best
     }
+
+    /// Write authorization plus the matched (granting) rule's
+    /// `TRAPWRITE` flag, in one pass.
+    ///
+    /// pvxs `SecurityClient::canWrite` is `any_of` over the credential
+    /// list (`pvxs/ioc/securityclient.cpp:42-45`): the first credential
+    /// that grants `ReadWrite` wins, and that rule's `trapMask` is the
+    /// grant's trap flag — C `asComputePvt` copies `trapMask` from the
+    /// rule that set the granted access (`asLibRoutines.c:1041-1048`).
+    /// A denied write carries `rule_was_trap = false` (`asComputePvt`
+    /// leaves `trapMask = 0` on a `NoAccess` outcome).
+    fn grant_for_creds(&self, channel: &str, creds: &ClientCreds) -> WriteGrant {
+        use epics_base_rs::server::access_security::AccessLevel;
+        let (asg, asl) = self.resolve_asg_and_asl_blocking(channel);
+        let cred_strings = Self::credential_strings(creds);
+        // Same empty-method → "anonymous" normalization as
+        // `level_for_creds` (see that method for the rationale).
+        let method = if creds.method.is_empty() {
+            "anonymous"
+        } else {
+            creds.method.as_str()
+        };
+        for cred_user in &cred_strings {
+            let (lvl, trap) = self.cfg.check_access_method_trap(
+                &asg,
+                &creds.host,
+                cred_user,
+                asl,
+                method,
+                &creds.authority,
+            );
+            if lvl == AccessLevel::ReadWrite {
+                return WriteGrant {
+                    allowed: true,
+                    rule_was_trap: trap,
+                };
+            }
+        }
+        WriteGrant {
+            allowed: false,
+            rule_was_trap: false,
+        }
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -257,7 +340,14 @@ impl AccessControl for AcfAccessControl {
     }
 
     fn can_write_creds(&self, channel: &str, creds: &ClientCreds) -> bool {
-        self.level_for_creds(channel, creds) == AccessLevelLite::ReadWrite
+        // Route through `grant_for_creds` (the trap-carrying path) so the
+        // allow/deny decision and the trap flag come from one rule
+        // evaluation — `write_grant` cannot disagree with `can_write_creds`.
+        self.grant_for_creds(channel, creds).allowed
+    }
+
+    fn write_grant(&self, channel: &str, creds: &ClientCreds) -> WriteGrant {
+        self.grant_for_creds(channel, creds)
     }
 }
 
@@ -332,6 +422,15 @@ impl AccessContext {
     pub fn can_write(&self, channel: &str) -> bool {
         self.access
             .can_write_creds(channel, &self.to_client_creds())
+    }
+
+    /// Authorize a write to `channel` and surface the matched rule's
+    /// `TRAPWRITE` flag (see [`WriteGrant`]). The QSRV PUT path calls
+    /// this once and uses the result both to gate the write and to gate
+    /// `asTrapWrite` put-logging — the grant is the single source of the
+    /// trap decision.
+    pub fn write_grant(&self, channel: &str) -> WriteGrant {
+        self.access.write_grant(channel, &self.to_client_creds())
     }
 
     fn to_client_creds(&self) -> ClientCreds {
@@ -593,6 +692,12 @@ impl AccessControl for LiveAccessProxy {
     }
     fn can_write_creds(&self, channel: &str, creds: &ClientCreds) -> bool {
         self.cell.read().can_write_creds(channel, creds)
+    }
+    fn write_grant(&self, channel: &str, creds: &ClientCreds) -> WriteGrant {
+        // Forward to the live inner policy so a swapped-in
+        // `AcfAccessControl`'s trap flag is observed; the default impl
+        // would drop it to `rule_was_trap = false`.
+        self.cell.read().write_grant(channel, creds)
     }
 }
 

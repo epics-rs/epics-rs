@@ -33,6 +33,7 @@ pub mod provider;
 #[cfg(feature = "qsrv")]
 pub mod pva_adapter;
 pub mod pvif;
+pub(crate) mod trap_write;
 
 pub use channel::{BridgeChannel, ProcessMode, PutOptions};
 pub use group::{AnyMonitor, GroupChannel, GroupMonitor};
@@ -40,7 +41,7 @@ pub use group_config::GroupPvDef;
 pub use monitor::BridgeMonitor;
 pub use provider::{
     AccessContext, AccessControl, AcfAccessControl, AllowAllAccess, AnyChannel, BridgeProvider,
-    Channel, ChannelProvider, ClientCreds, PvaMonitor,
+    Channel, ChannelProvider, ClientCreds, PvaMonitor, WriteGrant,
 };
 #[cfg(feature = "qsrv")]
 pub use pva_adapter::{

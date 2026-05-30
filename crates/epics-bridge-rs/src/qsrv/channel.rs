@@ -554,7 +554,12 @@ impl BridgeChannel {
         value: &PvStructure,
         opts: PutOptions,
     ) -> BridgeResult<()> {
-        if !self.access.can_write(&self.pv_name) {
+        // One access evaluation yields both the allow/deny decision and
+        // the matched rule's TRAPWRITE flag (`WriteGrant`). The grant is
+        // the single source of "is this a trapped write" — the PUT below
+        // routes through it and never re-derives the trap flag.
+        let grant = self.access.write_grant(&self.pv_name);
+        if !grant.allowed {
             return Err(BridgeError::PutRejected(format!(
                 "write denied for {} (user='{}' host='{}')",
                 self.pv_name, self.access.user, self.access.host
@@ -631,39 +636,55 @@ impl BridgeChannel {
         // re-enters; the bare `process_record` (process_local + notify)
         // would reply success after only the local record body ran,
         // skipping the link chain.
-        match opts.process {
-            ProcessMode::Inhibit => {
-                self.db
-                    .put_pv(&format!("{}.{}", self.record_name, self.field), epics_val)
-                    .await
-                    .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-            }
-            ProcessMode::Passive => {
-                let notify_rx = self
-                    .db
-                    .put_record_field_from_ca(&self.record_name, &self.field, epics_val)
-                    .await
-                    .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-                if opts.block
-                    && let Some(rx) = notify_rx
-                {
-                    let _ = rx.await;
+        // Bracket the backing write with the EPICS `asTrapWrite`
+        // put-logging hook (pvxs wraps every QSRV put in a
+        // `SecurityLogger`, singlesource.cpp:354-360). The `grant`
+        // gates emission; a non-trapped put runs the write unbracketed.
+        // `dbr_type` is the channel's final field type
+        // (`dbChannelFinalCAType`); `value_str`/`no_elements` are
+        // rendered from the value inside the helper.
+        let meta = super::trap_write::TrapWriteMeta {
+            pv_name: &self.pv_name,
+            user: &self.access.user,
+            host: &self.access.host,
+            peer: &self.access.host,
+            dbr_type: self.value_dbf as u16,
+        };
+        super::trap_write::put_with_trap(grant, meta, epics_val, |value| async move {
+            match opts.process {
+                ProcessMode::Inhibit => {
+                    self.db
+                        .put_pv(&format!("{}.{}", self.record_name, self.field), value)
+                        .await
+                        .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
+                }
+                ProcessMode::Passive => {
+                    let notify_rx = self
+                        .db
+                        .put_record_field_from_ca(&self.record_name, &self.field, value)
+                        .await
+                        .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
+                    if opts.block
+                        && let Some(rx) = notify_rx
+                    {
+                        let _ = rx.await;
+                    }
+                }
+                ProcessMode::Force => {
+                    self.db
+                        .put_pv(&format!("{}.{}", self.record_name, self.field), value)
+                        .await
+                        .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
+                    let mut visited = std::collections::HashSet::new();
+                    self.db
+                        .process_record_with_links(&self.record_name, &mut visited, 0)
+                        .await
+                        .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
                 }
             }
-            ProcessMode::Force => {
-                self.db
-                    .put_pv(&format!("{}.{}", self.record_name, self.field), epics_val)
-                    .await
-                    .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-                let mut visited = std::collections::HashSet::new();
-                self.db
-                    .process_record_with_links(&self.record_name, &mut visited, 0)
-                    .await
-                    .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-            }
-        }
-
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 }
 

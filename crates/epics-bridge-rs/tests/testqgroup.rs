@@ -1319,3 +1319,89 @@ async fn group_monitor_stop_disables_member_subscriptions() {
 
     mon.stop().await;
 }
+
+/// A trapped group PUT fires one asTrapWrite Before/After pair per
+/// backing member write — pvxs builds one `SecurityLogger` per group
+/// field (ioc/groupsource.cpp:594-602), not one for the outer group PV.
+#[tokio::test]
+async fn trapped_group_put_emits_per_member_astrapwrite() {
+    use std::sync::Mutex;
+
+    use epics_base_rs::server::access_security::{
+        TrapWriteMessage, TrapWriteOp, register_trap_write_listener,
+    };
+    use epics_bridge_rs::qsrv::{AccessContext, AccessControl, ClientCreds, WriteGrant};
+
+    /// Grant every write with the `TRAPWRITE` flag set.
+    struct TrapAll;
+    impl AccessControl for TrapAll {
+        fn write_grant(&self, _channel: &str, _creds: &ClientCreds) -> WriteGrant {
+            WriteGrant {
+                allowed: true,
+                rule_was_trap: true,
+            }
+        }
+    }
+
+    let db = make_db().await;
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider.load_group_config(GROUP_JSON).expect("load");
+    let def = provider
+        .groups()
+        .get("TEST:grp")
+        .cloned()
+        .expect("grp registered");
+    let ch = GroupChannel::new(db.clone(), def).with_access(AccessContext::with_identity(
+        Arc::new(TrapAll),
+        "op".into(),
+        "h1".into(),
+    ));
+
+    // Capture (op, pv, status) for both member channels AND the group PV
+    // name, so a stray emission on the outer group PV would be observed.
+    let sink: Arc<Mutex<Vec<(TrapWriteOp, String, Option<String>)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let cap = sink.clone();
+    let _handle = register_trap_write_listener(Arc::new(move |msg: &TrapWriteMessage<'_>| {
+        if matches!(
+            msg.pv_name,
+            "TEST:level.VAL" | "TEST:count.VAL" | "TEST:grp"
+        ) {
+            cap.lock().unwrap().push((
+                msg.op,
+                msg.pv_name.to_string(),
+                msg.status.map(|s| s.to_string()),
+            ));
+        }
+    }));
+
+    let mut put = PvStructure::new("epics:nt/NTGroup:1.0");
+    put.fields
+        .push(("level".into(), PvField::Scalar(ScalarValue::Double(42.0))));
+    put.fields
+        .push(("count".into(), PvField::Scalar(ScalarValue::Long(13))));
+    ch.put(&put).await.expect("trapped group put");
+
+    let events = sink.lock().unwrap().clone();
+    assert_eq!(
+        events.len(),
+        4,
+        "two members × (Before + After), none for the group PV: {events:?}"
+    );
+    assert!(
+        events.iter().all(|(_, pv, _)| pv != "TEST:grp"),
+        "the outer group PV must not emit asTrapWrite — only backing members do: {events:?}"
+    );
+    for member in ["TEST:level.VAL", "TEST:count.VAL"] {
+        let pairs: Vec<_> = events.iter().filter(|(_, pv, _)| pv == member).collect();
+        assert_eq!(
+            pairs.len(),
+            2,
+            "{member}: one Before + one After: {pairs:?}"
+        );
+        assert_eq!(pairs[0].0, TrapWriteOp::BeforeWrite);
+        assert_eq!(pairs[0].2, None);
+        assert_eq!(pairs[1].0, TrapWriteOp::AfterWrite);
+        assert_eq!(pairs[1].2, Some("ok".to_string()));
+    }
+}

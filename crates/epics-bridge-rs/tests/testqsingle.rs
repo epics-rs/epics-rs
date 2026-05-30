@@ -907,3 +907,267 @@ async fn monitor_stop_disables_backing_subscription() {
         .expect("event must be delivered after the monitor resumes")
         .expect("snapshot");
 }
+
+// ---------------------------------------------------------------------------
+// asTrapWrite put-logging parity
+//
+// A QSRV PUT must fire the EPICS access-security put-logging hook
+// (`asTrapWrite`) exactly when the matched ACF/ASG rule carries
+// `TRAPWRITE`, mirroring pvxs's per-put `SecurityLogger`
+// (ioc/singlesource.cpp:354-360) and C `asTrapWriteWithData` gating on
+// the rule `trapMask` (libcom/src/as/asLib.h:57-60). A non-trapped or
+// access-denied PUT fires nothing. The `WriteGrant` from the access
+// layer is the single source of the trap decision.
+// ---------------------------------------------------------------------------
+
+use std::sync::Mutex;
+
+use epics_base_rs::server::access_security::{
+    TrapWriteListenerHandle, TrapWriteMessage, TrapWriteOp, register_trap_write_listener,
+};
+use epics_bridge_rs::qsrv::{AccessContext, AccessControl, ClientCreds, WriteGrant};
+
+#[derive(Clone, Debug)]
+struct CapturedTrap {
+    op: TrapWriteOp,
+    pv_name: String,
+    user: String,
+    host: String,
+    value_str: String,
+    dbr_type: u16,
+    no_elements: u32,
+    event_id: u64,
+    status: Option<String>,
+}
+
+/// Test access policy: always grants write, with a configurable
+/// `TRAPWRITE` flag on the returned [`WriteGrant`].
+struct TrapStub {
+    rule_was_trap: bool,
+}
+impl AccessControl for TrapStub {
+    fn write_grant(&self, _channel: &str, _creds: &ClientCreds) -> WriteGrant {
+        WriteGrant {
+            allowed: true,
+            rule_was_trap: self.rule_was_trap,
+        }
+    }
+}
+
+/// Register a trap-write listener that captures events for one PV.
+/// nextest isolates each test in its own process, but filtering by PV
+/// keeps the assertion sound even under a single-process `cargo test`.
+fn capture_listener_for(
+    pv: &'static str,
+    sink: Arc<Mutex<Vec<CapturedTrap>>>,
+) -> TrapWriteListenerHandle {
+    register_trap_write_listener(Arc::new(move |msg: &TrapWriteMessage<'_>| {
+        if msg.pv_name != pv {
+            return;
+        }
+        sink.lock().unwrap().push(CapturedTrap {
+            op: msg.op,
+            pv_name: msg.pv_name.to_string(),
+            user: msg.user.to_string(),
+            host: msg.host.to_string(),
+            value_str: msg.value_str.to_string(),
+            dbr_type: msg.dbr_type,
+            no_elements: msg.no_elements,
+            event_id: msg.event_id,
+            status: msg.status.map(|s| s.to_string()),
+        });
+    }))
+}
+
+/// A trapped PUT emits exactly one BeforeWrite and one AfterWrite, both
+/// carrying the writing identity, value, and field DBR type.
+#[tokio::test]
+async fn trapped_single_put_emits_before_after_astrapwrite() {
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("TEST:trap_li", Box::new(LonginRecord::new(0)))
+        .await
+        .unwrap();
+    let ch = BridgeChannel::from_cached(
+        db.clone(),
+        "TEST:trap_li.VAL".into(),
+        "TEST:trap_li".into(),
+        "VAL".into(),
+        NtType::Scalar,
+        DbFieldType::Long,
+    )
+    .with_access(AccessContext::with_identity(
+        Arc::new(TrapStub {
+            rule_was_trap: true,
+        }),
+        "operator".into(),
+        "host.acme".into(),
+    ));
+
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    let _handle = capture_listener_for("TEST:trap_li.VAL", sink.clone());
+
+    let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+    put.fields
+        .push(("value".into(), PvField::Scalar(ScalarValue::Long(42))));
+    ch.put(&put).await.expect("trapped put");
+
+    let events = sink.lock().unwrap().clone();
+    assert_eq!(events.len(), 2, "one Before + one After: {events:?}");
+    let before = &events[0];
+    let after = &events[1];
+    assert_eq!(before.op, TrapWriteOp::BeforeWrite);
+    assert_eq!(after.op, TrapWriteOp::AfterWrite);
+    assert_eq!(
+        before.event_id, after.event_id,
+        "the Before/After pair shares one event id"
+    );
+    for e in [before, after] {
+        assert_eq!(e.pv_name, "TEST:trap_li.VAL");
+        assert_eq!(e.user, "operator");
+        assert_eq!(e.host, "host.acme");
+        assert_eq!(e.value_str, "42");
+        assert_eq!(e.dbr_type, DbFieldType::Long as u16);
+        assert_eq!(e.no_elements, 1);
+    }
+    assert_eq!(before.status, None, "BeforeWrite carries no status");
+    assert_eq!(after.status, Some("ok".to_string()), "successful put → ok");
+}
+
+/// A non-trapped PUT (matched rule has no `TRAPWRITE`) dispatches no
+/// asTrapWrite event, but still performs the write.
+#[tokio::test]
+async fn non_trap_single_put_emits_nothing() {
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("TEST:notrap_li", Box::new(LonginRecord::new(0)))
+        .await
+        .unwrap();
+    let ch = BridgeChannel::from_cached(
+        db.clone(),
+        "TEST:notrap_li.VAL".into(),
+        "TEST:notrap_li".into(),
+        "VAL".into(),
+        NtType::Scalar,
+        DbFieldType::Long,
+    )
+    .with_access(AccessContext::with_identity(
+        Arc::new(TrapStub {
+            rule_was_trap: false,
+        }),
+        "operator".into(),
+        "host.acme".into(),
+    ));
+
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    let _handle = capture_listener_for("TEST:notrap_li.VAL", sink.clone());
+
+    let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+    put.fields
+        .push(("value".into(), PvField::Scalar(ScalarValue::Long(7))));
+    ch.put(&put).await.expect("non-trap put");
+
+    assert!(
+        sink.lock().unwrap().is_empty(),
+        "a non-trapped PUT must dispatch no asTrapWrite event"
+    );
+    // The write itself still happened.
+    let got = ch.get(&empty_request()).await.expect("get");
+    let n = match extract_value(&got).expect("value") {
+        PvField::Scalar(ScalarValue::Long(x)) => *x,
+        PvField::Scalar(ScalarValue::Int(x)) => *x as i64,
+        other => panic!("unexpected scalar variant: {other:?}"),
+    };
+    assert_eq!(n, 7);
+}
+
+/// An access-denied PUT emits nothing — not even a BeforeWrite. The
+/// grant gates emission before any dispatch.
+#[tokio::test]
+async fn denied_single_put_emits_nothing() {
+    struct DenyAll;
+    impl AccessControl for DenyAll {
+        fn can_write(&self, _: &str, _: &str, _: &str) -> bool {
+            false
+        }
+    }
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("TEST:deny_li", Box::new(LonginRecord::new(0)))
+        .await
+        .unwrap();
+    let ch = BridgeChannel::from_cached(
+        db,
+        "TEST:deny_li.VAL".into(),
+        "TEST:deny_li".into(),
+        "VAL".into(),
+        NtType::Scalar,
+        DbFieldType::Long,
+    )
+    .with_access(AccessContext::with_identity(
+        Arc::new(DenyAll),
+        "u".into(),
+        "h".into(),
+    ));
+
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    let _handle = capture_listener_for("TEST:deny_li.VAL", sink.clone());
+
+    let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+    put.fields
+        .push(("value".into(), PvField::Scalar(ScalarValue::Long(1))));
+    ch.put(&put).await.expect_err("denied put must reject");
+
+    assert!(
+        sink.lock().unwrap().is_empty(),
+        "a denied PUT must emit nothing (no BeforeWrite)"
+    );
+}
+
+/// A trapped PUT whose backing write fails still emits exactly one
+/// BeforeWrite and one AfterWrite, the latter with `status = "fail"`.
+/// The channel points at a record that was never added, so the backing
+/// `put` returns `ChannelNotFound` after the grant passes.
+#[tokio::test]
+async fn trapped_single_put_failure_emits_one_after_fail() {
+    let db = Arc::new(PvDatabase::new());
+    let ch = BridgeChannel::from_cached(
+        db,
+        "TEST:trap_missing.VAL".into(),
+        "TEST:trap_missing".into(),
+        "VAL".into(),
+        NtType::Scalar,
+        DbFieldType::Long,
+    )
+    .with_access(AccessContext::with_identity(
+        Arc::new(TrapStub {
+            rule_was_trap: true,
+        }),
+        "operator".into(),
+        "host.acme".into(),
+    ));
+
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    let _handle = capture_listener_for("TEST:trap_missing.VAL", sink.clone());
+
+    let mut put = PvStructure::new("epics:nt/NTScalar:1.0");
+    put.fields
+        .push(("value".into(), PvField::Scalar(ScalarValue::Long(5))));
+    ch.put(&put)
+        .await
+        .expect_err("put into missing record fails");
+
+    let events = sink.lock().unwrap().clone();
+    assert_eq!(
+        events.len(),
+        2,
+        "exactly one Before + one After even on failure: {events:?}"
+    );
+    assert_eq!(events[0].op, TrapWriteOp::BeforeWrite);
+    assert_eq!(events[0].status, None);
+    assert_eq!(events[1].op, TrapWriteOp::AfterWrite);
+    assert_eq!(
+        events[1].status,
+        Some("fail".to_string()),
+        "failed put → fail"
+    );
+    assert_eq!(events[0].event_id, events[1].event_id);
+}

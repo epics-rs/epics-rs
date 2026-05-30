@@ -1132,53 +1132,73 @@ impl GroupChannel {
         value: epics_base_rs::types::EpicsValue,
         process: super::channel::ProcessMode,
         already_locked: bool,
+        grant: super::provider::WriteGrant,
     ) -> BridgeResult<()> {
         use super::channel::ProcessMode;
-        let to_err = |e: epics_base_rs::error::CaError| BridgeError::PutRejected(e.to_string());
-        match process {
-            ProcessMode::Inhibit => {
-                let pv = format!("{record_name}.{field_name}");
-                if already_locked {
-                    self.db.put_pv_already_locked(&pv, value).await
-                } else {
-                    self.db.put_pv(&pv, value).await
+        // Bracket this member's backing write with the EPICS
+        // `asTrapWrite` put-logging hook. pvxs builds one
+        // `SecurityLogger` per group field (groupsource.cpp:594-602), so
+        // each member value write emits its own Before/After pair (a
+        // `proc` hook writes no value and is not routed here). The
+        // member `grant` gates emission; `dbr_type` is the value's final
+        // field type — `convert_member_value` already typed it to the
+        // member DBF.
+        let pv_name = format!("{record_name}.{field_name}");
+        let meta = super::trap_write::TrapWriteMeta {
+            pv_name: &pv_name,
+            user: &self.access.user,
+            host: &self.access.host,
+            peer: &self.access.host,
+            dbr_type: value.dbr_type() as u16,
+        };
+        super::trap_write::put_with_trap(grant, meta, value, |value| async move {
+            let to_err = |e: epics_base_rs::error::CaError| BridgeError::PutRejected(e.to_string());
+            match process {
+                ProcessMode::Inhibit => {
+                    let pv = format!("{record_name}.{field_name}");
+                    if already_locked {
+                        self.db.put_pv_already_locked(&pv, value).await
+                    } else {
+                        self.db.put_pv(&pv, value).await
+                    }
+                    .map_err(to_err)?;
                 }
-                .map_err(to_err)?;
+                ProcessMode::Passive => {
+                    if already_locked {
+                        self.db
+                            .put_record_field_from_ca_already_locked(record_name, field_name, value)
+                            .await
+                    } else {
+                        self.db
+                            .put_record_field_from_ca(record_name, field_name, value)
+                            .await
+                    }
+                    .map_err(to_err)?;
+                }
+                ProcessMode::Force => {
+                    let pv = format!("{record_name}.{field_name}");
+                    if already_locked {
+                        self.db.put_pv_already_locked(&pv, value).await
+                    } else {
+                        self.db.put_pv(&pv, value).await
+                    }
+                    .map_err(to_err)?;
+                    let mut visited = std::collections::HashSet::new();
+                    if already_locked {
+                        self.db
+                            .process_record_with_links_already_locked(record_name, &mut visited, 0)
+                            .await
+                    } else {
+                        self.db
+                            .process_record_with_links(record_name, &mut visited, 0)
+                            .await
+                    }
+                    .map_err(to_err)?;
+                }
             }
-            ProcessMode::Passive => {
-                if already_locked {
-                    self.db
-                        .put_record_field_from_ca_already_locked(record_name, field_name, value)
-                        .await
-                } else {
-                    self.db
-                        .put_record_field_from_ca(record_name, field_name, value)
-                        .await
-                }
-                .map_err(to_err)?;
-            }
-            ProcessMode::Force => {
-                let pv = format!("{record_name}.{field_name}");
-                if already_locked {
-                    self.db.put_pv_already_locked(&pv, value).await
-                } else {
-                    self.db.put_pv(&pv, value).await
-                }
-                .map_err(to_err)?;
-                let mut visited = std::collections::HashSet::new();
-                if already_locked {
-                    self.db
-                        .process_record_with_links_already_locked(record_name, &mut visited, 0)
-                        .await
-                } else {
-                    self.db
-                        .process_record_with_links(record_name, &mut visited, 0)
-                        .await
-                }
-                .map_err(to_err)?;
-            }
-        }
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     /// group PUT with explicit per-operation options.
@@ -1300,6 +1320,15 @@ impl GroupChannel {
         // on are checked: pvxs builds the SecurityClient over the
         // changed fields, so an unmarked, unwritable member must not
         // reject a partial PUT to an unrelated marked one.
+        //
+        // The grant per member also carries the matched rule's
+        // TRAPWRITE flag (`WriteGrant::rule_was_trap`), the single
+        // source the member write below uses to gate `asTrapWrite`
+        // put-logging — pvxs builds one `SecurityLogger` per group
+        // field (groupsource.cpp:594-602). Resolve it once here and key
+        // it by the member's backing channel so the write phase emits
+        // without re-deriving the trap flag.
+        let mut member_grants: HashMap<String, super::provider::WriteGrant> = HashMap::new();
         for m in &ordered {
             if !member_is_active(m) {
                 continue;
@@ -1310,7 +1339,8 @@ impl GroupChannel {
                 // SecurityClient list as well.
                 continue;
             }
-            if !self.access.can_write(&m.channel) {
+            let grant = self.access.write_grant(&m.channel);
+            if !grant.allowed {
                 return Err(BridgeError::PutRejected(format!(
                     "group {} PUT: member '{}' field '{}' write denied for \
                      user='{}' host='{}' (per-member ACF, pvxs \
@@ -1318,6 +1348,7 @@ impl GroupChannel {
                     self.def.name, m.field_name, m.channel, self.access.user, self.access.host
                 )));
             }
+            member_grants.insert(m.channel.clone(), grant);
         }
 
         // track whether any member write/proc actually fired so a
@@ -1428,9 +1459,21 @@ impl GroupChannel {
                     did_something = true;
                 } else if let Some(epics_val) = val {
                     // `_already_locked` — this atomic PUT owns every
-                    // member-record gate via `lock_records`.
-                    self.apply_member_value(record_name, field_name, epics_val, opts.process, true)
-                        .await?;
+                    // member-record gate via `lock_records`. The member's
+                    // trap grant (resolved in the per-member ACF pass)
+                    // gates `asTrapWrite` emission for this write.
+                    self.apply_member_value(
+                        record_name,
+                        field_name,
+                        epics_val,
+                        opts.process,
+                        true,
+                        member_grants
+                            .get(member.channel.as_str())
+                            .copied()
+                            .unwrap_or_default(),
+                    )
+                    .await?;
                     did_something = true;
                 }
             }
@@ -1493,8 +1536,20 @@ impl GroupChannel {
                 };
 
                 // non-atomic per-member write — gate-acquiring variants.
-                self.apply_member_value(record_name, field_name, epics_val, opts.process, false)
-                    .await?;
+                // The member's trap grant (resolved in the per-member ACF
+                // pass) gates `asTrapWrite` emission for this write.
+                self.apply_member_value(
+                    record_name,
+                    field_name,
+                    epics_val,
+                    opts.process,
+                    false,
+                    member_grants
+                        .get(member.channel.as_str())
+                        .copied()
+                        .unwrap_or_default(),
+                )
+                .await?;
                 did_something = true;
             }
         }

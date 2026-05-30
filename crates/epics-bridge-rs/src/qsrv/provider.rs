@@ -1072,7 +1072,18 @@ impl ChannelProvider for BridgeProvider {
         if self.servable_group(name).await.is_some() {
             return true;
         }
-        self.db.has_name(name).await
+        // Peel the EPICS `$` long-string modifier (C `dbChannel.c:486-505`)
+        // before the existence check so a record-level `REC$` (default
+        // `VAL`) answers the search; `split_channel_name` leaves the `$`
+        // on the record path (the CA server detects it there too).
+        // `has_name` strips any remaining `{json}` / `[range]` suffix
+        // itself, so this only removes the trailing modifier.
+        let parsed = epics_base_rs::server::database::filters::split_channel_name(name);
+        let core = parsed
+            .record_path
+            .strip_suffix('$')
+            .unwrap_or(&parsed.record_path);
+        self.db.has_name(core).await
     }
 
     async fn channel_list(&self) -> Vec<String> {
@@ -1178,7 +1189,16 @@ impl BridgeProvider {
         // chain stays on `BridgeChannel`; resolution and cache
         // lookup use the record-path-only form.
         let parsed = epics_base_rs::server::database::filters::split_channel_name(name);
-        let resolution_name = parsed.record_path.as_str();
+        // Peel the EPICS `$` long-string modifier (C `dbChannel.c:486-505`)
+        // off the record path so the underlying record/field resolves at
+        // the `has_name` gate below; `BridgeChannel::new` re-reads the
+        // modifier from the full name to select the long-string view. The
+        // `$` is left on the record path by `split_channel_name` (the CA
+        // server detects it there as well).
+        let resolution_name = parsed
+            .record_path
+            .strip_suffix('$')
+            .unwrap_or(parsed.record_path.as_str());
         let (record_name, field) = epics_base_rs::server::database::parse_pv_name(resolution_name);
         let field_upper = field.to_ascii_uppercase();
 

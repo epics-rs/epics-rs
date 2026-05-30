@@ -407,7 +407,21 @@ impl BridgeChannel {
                 std::sync::Arc::new(epics_base_rs::server::database::filters::FilterChain::new())
             }
         };
+        // EPICS `$` long-string field modifier (C `dbChannel.c:486-505`):
+        // a trailing `$` re-views a `DBF_STRING` or link field as a
+        // `DBR_CHAR` character array, which pvxs serves as the
+        // `form = "String"` long-string `NTScalar`
+        // (`ioc/iocsource.cpp:133-136`, `ioc/channel.cpp:62-74`). The `$`
+        // is innermost in the channel name (`REC.FIELD$[range]{json}`) and
+        // `split_channel_name` has already peeled `{json}` and `[range]`,
+        // so the modifier is the final character of the record path. It is
+        // left there (the CA server detects it on the record path too,
+        // `epics-ca-rs` `tcp.rs`) and peeled here for field resolution.
         let resolution_name = parsed.record_path.as_str();
+        let (resolution_name, string_view) = match resolution_name.strip_suffix('$') {
+            Some(core) => (core, true),
+            None => (resolution_name, false),
+        };
         let (record_name, field) = epics_base_rs::server::database::parse_pv_name(resolution_name);
         let field_upper = field.to_ascii_uppercase();
 
@@ -423,23 +437,44 @@ impl BridgeChannel {
         // truth for both the served DBF type and (below) the NT shape,
         // so the advertised descriptor cannot drift from the value the
         // GET path will serialize.
-        let resolved = instance.resolve_field(&field_upper);
-        // A long-string field (`lsi`/`lso` VAL/OVAL, `printf` VAL) is a
-        // `DBF_CHAR` array that semantically holds a NUL-terminated
-        // string. Serve it as a scalar-string NTScalar (pvxs's
-        // `form = "String"` view), not the byte scalar the `DBF_CHAR`
-        // type would otherwise select. The record declares these fields
-        // via `Record::long_string_fields`, so the bridge does not have
-        // to hard-code record-type names.
-        let nt_type = if instance
-            .record
-            .long_string_fields()
-            .iter()
-            .any(|f| f.eq_ignore_ascii_case(&field_upper))
-        {
-            NtType::LongString
+        let (resolved, nt_type) = if string_view {
+            // The `$` modifier is valid only on a `DBF_STRING` or link
+            // field; every other field type is `S_dbLib_fieldNotFound` and
+            // aborts channel creation, matching `dbChannelCreate`
+            // (`dbChannel.c:500-503`). An eligible field is served as the
+            // long-string string view — the same `form = "String"`
+            // `NTScalar` as an `lsi`/`lso`/`printf` long-string field —
+            // because pvxs collapses the `DBR_CHAR` `$` view to a
+            // NUL-terminated `pvString` (`ioc/iocsource.cpp:133-136`), so
+            // the `$` view reuses the existing string-view path rather than
+            // a parallel byte array that would diverge from the wire.
+            let v = instance
+                .resolve_string_view_field(&field_upper)
+                .ok_or_else(|| BridgeError::FieldNotFound {
+                    record: record_name.to_string(),
+                    field: format!("{field_upper}$"),
+                })?;
+            (Some(v), NtType::LongString)
         } else {
-            pvif::nt_type_for_field(rtyp, &field_upper, resolved.as_ref())
+            let resolved = instance.resolve_field(&field_upper);
+            // A long-string field (`lsi`/`lso` VAL/OVAL, `printf` VAL) is a
+            // `DBF_CHAR` array that semantically holds a NUL-terminated
+            // string. Serve it as a scalar-string NTScalar (pvxs's
+            // `form = "String"` view), not the byte scalar the `DBF_CHAR`
+            // type would otherwise select. The record declares these fields
+            // via `Record::long_string_fields`, so the bridge does not have
+            // to hard-code record-type names.
+            let nt_type = if instance
+                .record
+                .long_string_fields()
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(&field_upper))
+            {
+                NtType::LongString
+            } else {
+                pvif::nt_type_for_field(rtyp, &field_upper, resolved.as_ref())
+            };
+            (resolved, nt_type)
         };
 
         // DBF type for the bound field, taken from the field's actual

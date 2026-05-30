@@ -155,6 +155,154 @@ async fn put_then_get_round_trips_string() {
     }
 }
 
+/// EPICS `$` long-string field modifier (C `dbChannel.c:486-505`): a
+/// `DBF_STRING` field named with a trailing `$` is re-viewed as a
+/// `DBR_CHAR` character array, which pvxs serves as the `form = "String"`
+/// long-string `NTScalar` (`ioc/iocsource.cpp:133-136`). `REC.VAL$`
+/// therefore resolves (it no longer becomes a bogus field `VAL$`) and is
+/// served as a string scalar via [`NtType::LongString`].
+#[tokio::test]
+async fn dollar_modifier_serves_string_field_as_long_string() {
+    use epics_bridge_rs::qsrv::provider::{BridgeProvider, ChannelProvider};
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("TEST:str", Box::new(StringinRecord::new("init")))
+        .await
+        .unwrap();
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+
+    // Search must answer for the `$`-modified channel name.
+    assert!(
+        provider.channel_find("TEST:str.VAL$").await,
+        "`REC.VAL$` must resolve at search"
+    );
+
+    let any = provider
+        .create_channel_for("TEST:str.VAL$", "u", "h")
+        .await
+        .expect("`REC.VAL$` must resolve through the `$` modifier");
+    let ch = match any {
+        epics_bridge_rs::qsrv::AnyChannel::Single(c) => c,
+        _ => panic!("expected single-record channel"),
+    };
+
+    // Resolved field drops the `$`; the channel serves the string view.
+    assert_eq!(ch.record_name(), "TEST:str");
+    assert_eq!(ch.field(), "VAL");
+    assert!(
+        matches!(ch.nt_type(), NtType::LongString),
+        "`$` string field must be served as the long-string NTScalar view"
+    );
+
+    let result = ch.get(&empty_request()).await.expect("get");
+    let value = extract_value(&result).expect("NTScalar.value");
+    match value {
+        PvField::Scalar(ScalarValue::String(s)) => assert_eq!(s, "init"),
+        other => panic!("expected string scalar from `$` char view, got {other:?}"),
+    }
+}
+
+/// `$` on a link field: C views a link (`DBF_INLINK..DBF_FWDLINK`) as a
+/// `PVLINK_STRINGSZ` `DBR_CHAR` array (`dbChannel.c:494-498`), and pvxs
+/// gives link fields the same string-form view (`ioc/channel.cpp:62-74`).
+/// `REC.FLNK$` must resolve the link's textual form as a string scalar
+/// rather than rejecting the `$` suffix as an unknown field.
+#[tokio::test]
+async fn dollar_modifier_serves_link_field_as_string() {
+    use epics_bridge_rs::qsrv::provider::BridgeProvider;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("TEST:lnk", Box::new(AiRecord::new(1.0)))
+        .await
+        .unwrap();
+    // Seed the forward link so the `$` view has a non-empty char string.
+    db.put_pv("TEST:lnk.FLNK", EpicsValue::String("TEST:other".into()))
+        .await
+        .expect("seed FLNK");
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+
+    let any = provider
+        .create_channel_for("TEST:lnk.FLNK$", "u", "h")
+        .await
+        .expect("`REC.FLNK$` must resolve the link as a char-array string view");
+    let ch = match any {
+        epics_bridge_rs::qsrv::AnyChannel::Single(c) => c,
+        _ => panic!("expected single-record channel"),
+    };
+    assert_eq!(ch.field(), "FLNK");
+    assert!(
+        matches!(ch.nt_type(), NtType::LongString),
+        "`$` link field must be served as the long-string NTScalar view"
+    );
+
+    let result = ch.get(&empty_request()).await.expect("get");
+    let value = extract_value(&result).expect("NTScalar.value");
+    match value {
+        PvField::Scalar(ScalarValue::String(s)) => assert_eq!(s, "TEST:other"),
+        other => panic!("expected link string from `$` char view, got {other:?}"),
+    }
+}
+
+/// `$` is innermost in the channel name (`REC.FIELD$[range]{json}`), so it
+/// must coexist with a trailing channel-filter suffix (C parses `$` then
+/// `[range]` then `{json}`, `dbChannel.c:486-516`). A `$` channel that
+/// also carries a JSON filter still resolves to the long-string view, and
+/// the filter chain is attached for the read path.
+#[tokio::test]
+async fn dollar_modifier_with_filter_suffix_resolves() {
+    use epics_bridge_rs::qsrv::provider::BridgeProvider;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("TEST:fstr", Box::new(StringinRecord::new("seed")))
+        .await
+        .unwrap();
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+
+    let any = provider
+        .create_channel_for(r#"TEST:fstr.VAL${"dbnd":{"d":0.5}}"#, "u", "h")
+        .await
+        .expect("`$` combined with a filter suffix must resolve");
+    let ch = match any {
+        epics_bridge_rs::qsrv::AnyChannel::Single(c) => c,
+        _ => panic!("expected single-record channel"),
+    };
+    assert_eq!(ch.field(), "VAL");
+    assert!(
+        matches!(ch.nt_type(), NtType::LongString),
+        "`$`+filter string channel must still be the long-string view"
+    );
+    // The stream-only `dbnd` filter short-circuits in read context, so the
+    // GET still returns the underlying string.
+    let result = ch.get(&empty_request()).await.expect("get");
+    let value = extract_value(&result).expect("NTScalar.value");
+    match value {
+        PvField::Scalar(ScalarValue::String(s)) => assert_eq!(s, "seed"),
+        other => panic!("expected string scalar, got {other:?}"),
+    }
+}
+
+/// `$` on a non-string, non-link field is `S_dbLib_fieldNotFound` in C
+/// (`dbChannel.c:500-503`), which aborts channel creation. A numeric
+/// `ai.VAL$` must therefore fail to create, not silently fall back to a
+/// numeric scalar channel.
+#[tokio::test]
+async fn dollar_modifier_on_non_string_field_rejects_channel() {
+    use epics_bridge_rs::qsrv::provider::BridgeProvider;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("TEST:num", Box::new(AiRecord::new(2.5)))
+        .await
+        .unwrap();
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+
+    let result = provider.create_channel_for("TEST:num.VAL$", "u", "h").await;
+    assert!(
+        result.is_err(),
+        "`$` on a numeric DBF_DOUBLE field must reject the channel \
+         (S_dbLib_fieldNotFound parity), got Ok"
+    );
+}
+
 /// pvxs `testGetArray` parity: NTScalarArray over a waveform.
 #[tokio::test]
 async fn waveform_array_round_trips() {

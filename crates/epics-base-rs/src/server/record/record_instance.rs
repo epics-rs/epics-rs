@@ -397,6 +397,32 @@ impl RecordInstance {
             .or_else(|| self.get_virtual_field(&name))
     }
 
+    /// Resolve a field for EPICS `$` long-string (character-array) access.
+    ///
+    /// The `$` channel-name modifier (C `dbChannel.c:486-505`) re-views a
+    /// field as a `DBR_CHAR` array: a `DBF_STRING` field becomes a char
+    /// array of `field_size` elements, a link field a char array of
+    /// `PVLINK_STRINGSZ`, and every other field type is rejected with
+    /// `S_dbLib_fieldNotFound`. pvxs serves that char view as a
+    /// `form = "String"` long-string `NTScalar` — it reads the `DBR_CHAR`
+    /// bytes and NUL-terminates them back into a string
+    /// (`ioc/iocsource.cpp:133-136`, `ioc/channel.cpp:62-74`).
+    ///
+    /// Both `DBF_STRING` fields and link fields resolve to an
+    /// [`EpicsValue::String`] in this database (a link resolves to its
+    /// textual form, see [`Self::get_common_field`]), so a field is
+    /// `$`-eligible exactly when it resolves to a string value. Returns
+    /// that string value for an eligible field, or `None` for a field the
+    /// `$` modifier cannot view as a char array (the
+    /// `S_dbLib_fieldNotFound` case) — the single owner of the
+    /// dbChannel `$`-eligibility rule for the channel-resolution layer.
+    pub fn resolve_string_view_field(&self, name: &str) -> Option<EpicsValue> {
+        match self.resolve_field(name)? {
+            v @ EpicsValue::String(_) => Some(v),
+            _ => None,
+        }
+    }
+
     /// Build a Snapshot with full metadata for the given field.
     pub fn snapshot_for_field(&self, field: &str) -> Option<super::super::snapshot::Snapshot> {
         let value = self.resolve_field(field)?;

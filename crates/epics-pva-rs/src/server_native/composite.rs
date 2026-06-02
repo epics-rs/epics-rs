@@ -883,6 +883,20 @@ impl ChannelSource for CompositeSource {
             src.notify_monitor_start(name, ctx, start);
         }
     }
+
+    fn set_channel_invalidator(&self, invalidator: tokio::sync::broadcast::Sender<String>) {
+        // The server's bound source is a CompositeSource (and the PVA
+        // gateway nests another composite under it), so the trait-default
+        // no-op would strand the sender at the wrapper and never reach the
+        // leaf source(s) that publish invalidations. Fan the SAME sender
+        // out to every child — including nested composites, which forward
+        // again — so multi-tenant gateways (N `GatewayChannelSource`s under
+        // one composite, `multi_gateway.rs`) all publish onto the one
+        // server-wide stream the per-connection tasks subscribe to.
+        for src in self.snapshot() {
+            src.set_channel_invalidator(invalidator.clone());
+        }
+    }
 }
 
 #[cfg(test)]

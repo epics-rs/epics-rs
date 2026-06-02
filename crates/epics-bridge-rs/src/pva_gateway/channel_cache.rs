@@ -14,8 +14,9 @@
 //! re-set `drop_poke = true` so a repeatedly-asked PV stays alive even
 //! between bursts.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -607,6 +608,18 @@ pub struct ChannelCache {
     /// `cleanerDust`, same path). Distinguishes "cache shrank because
     /// idle entries aged out" from "downstream dropped its interest".
     cleaner_removed: AtomicU64,
+    /// Server-wide channel-invalidation sender, wired once by the bound
+    /// `GatewayChannelSource` from the native server (see
+    /// `ChannelSource::set_channel_invalidator`). An operator
+    /// `<prefix>:drop` / `:flush` removes cache entries through [`Self::flush`]
+    /// / [`Self::drop_entry`] — the single removal owner — which then
+    /// publishes each removed PV name here so every connection task
+    /// force-disconnects the matching downstream channel. This is the
+    /// downstream effect of pva2pva dropping a `ChannelCacheEntry`
+    /// (`channel->destroy()` → `channelStateChange(DESTROYED)` fanout,
+    /// chancache.cpp:76-99). `None` until wired (standalone caches in
+    /// tests, or before the server attaches).
+    invalidator: OnceLock<broadcast::Sender<String>>,
 }
 
 /// One cached channel's status row for the control report.
@@ -659,6 +672,7 @@ impl ChannelCache {
             max_entries,
             cleaner_runs: AtomicU64::new(0),
             cleaner_removed: AtomicU64::new(0),
+            invalidator: OnceLock::new(),
         });
         let weak = Arc::downgrade(&cache);
         let task = tokio::spawn(async move {
@@ -1237,6 +1251,35 @@ impl ChannelCache {
         }
     }
 
+    /// Wire the server-wide channel-invalidation sender (see the
+    /// [`Self::invalidator`] field). Called by the bound
+    /// `GatewayChannelSource` when the native server hands it the sender.
+    /// Idempotent — a second set is ignored (`OnceLock`), so
+    /// re-registration of the shared cache on `<prefix>:reload` is
+    /// harmless.
+    pub fn set_invalidator(&self, invalidator: broadcast::Sender<String>) {
+        let _ = self.invalidator.set(invalidator);
+    }
+
+    /// Publish each PV name removed by an operator-driven [`Self::flush`] /
+    /// [`Self::drop_entry`] onto the server-wide invalidation stream, so
+    /// every per-connection task force-disconnects the matching downstream
+    /// channel (the downstream effect of dropping the cache entry, pva2pva
+    /// `channel->destroy()` fanout). A send error means there are no live
+    /// connections to notify — harmless. No-op when the cache is not wired
+    /// to a server (standalone caches in tests). Only operator-driven
+    /// removal publishes: the idle cleanup tick evicts entries that have no
+    /// downstream interest, so disconnecting on eviction would needlessly
+    /// kill idle-but-open channels and defeat the cache.
+    fn publish_invalidation(&self, names: impl IntoIterator<Item = String>) {
+        let Some(tx) = self.invalidator.get() else {
+            return;
+        };
+        for name in names {
+            let _ = tx.send(name);
+        }
+    }
+
     /// B6: operator-driven cache flush. Drops every cached
     /// `UpstreamEntry`, then returns the number of entries removed.
     ///
@@ -1246,10 +1289,32 @@ impl ChannelCache {
     /// stops receiving events (the next downstream search re-opens a
     /// fresh upstream monitor). This mirrors `pva2pva`'s manual
     /// channel-cache drop.
+    ///
+    /// As the single removal owner, flush also publishes each
+    /// dropped PV name on the channel-invalidation stream so every
+    /// downstream channel bound to a dropped entry is force-disconnected,
+    /// not merely starved of events. pva2pva drops the `ChannelCacheEntry`
+    /// and `channel->destroy()` fans `DESTROYED` to every `GWChannel`
+    /// (chancache.cpp:76-99); previously a Rust downstream channel stayed
+    /// open and silently bound to a re-created entry on the next event.
     pub async fn flush(&self) -> usize {
-        let mut map = self.entries.lock().await;
-        let removed = map.len();
-        map.clear();
+        let (removed, names) = {
+            let mut map = self.entries.lock().await;
+            let removed = map.len();
+            // An entry exists per distinct pvRequest, but the downstream
+            // channel is keyed by name only — dedup to one invalidation
+            // per name.
+            let names: Vec<String> = map
+                .keys()
+                .map(|k| k.pv_name.clone())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            map.clear();
+            (removed, names)
+        };
+        // Publish after releasing the entries lock.
+        self.publish_invalidation(names);
         removed
     }
 
@@ -1257,11 +1322,21 @@ impl ChannelCache {
     /// several entries (one per distinct downstream pvRequest); an
     /// operator-driven drop targets the name, so all of them go.
     /// Returns `true` if at least one entry was present and removed.
+    ///
+    /// On a removal, also publishes the name on the
+    /// channel-invalidation stream so the matching downstream channel is
+    /// force-disconnected (same rationale as [`Self::flush`]).
     pub async fn drop_entry(&self, pv_name: &str) -> bool {
-        let mut map = self.entries.lock().await;
-        let before = map.len();
-        map.retain(|k, _| k.pv_name != pv_name);
-        map.len() != before
+        let removed = {
+            let mut map = self.entries.lock().await;
+            let before = map.len();
+            map.retain(|k, _| k.pv_name != pv_name);
+            map.len() != before
+        };
+        if removed {
+            self.publish_invalidation(std::iter::once(pv_name.to_string()));
+        }
+        removed
     }
 
     /// Test-only: insert a synthetic, parked entry under `pv_name` so
@@ -1906,5 +1981,68 @@ mod tests {
             rx.try_recv().is_err(),
             "second call within one outage must not re-emit decoded"
         );
+    }
+
+    /// As the single removal owner, `drop_entry` publishes the
+    /// removed PV name on the wired channel-invalidation stream so the
+    /// native server force-disconnects the downstream channel (the
+    /// downstream effect of dropping the cache entry). A drop that removes
+    /// nothing publishes nothing.
+    #[tokio::test]
+    async fn drop_entry_publishes_removed_name_on_invalidator() {
+        let client = Arc::new(PvaClient::builder().build());
+        let cache = ChannelCache::new(client, Duration::from_secs(60));
+        let (tx, mut rx) = broadcast::channel::<String>(16);
+        cache.set_invalidator(tx.clone());
+        cache.insert_test_entry("WM:PV").await;
+
+        assert!(cache.drop_entry("WM:PV").await, "entry was present");
+        assert_eq!(
+            rx.try_recv().expect("name published on drop"),
+            "WM:PV".to_string()
+        );
+
+        // A drop that matches no entry removes nothing and publishes nothing.
+        assert!(!cache.drop_entry("WM:PV").await, "already gone");
+        assert!(
+            rx.try_recv().is_err(),
+            "a no-op drop must not publish an invalidation"
+        );
+    }
+
+    /// `flush` publishes every distinct removed name so all
+    /// downstream channels bound to dropped entries are force-disconnected,
+    /// not merely starved of events.
+    #[tokio::test]
+    async fn flush_publishes_each_removed_name() {
+        let client = Arc::new(PvaClient::builder().build());
+        let cache = ChannelCache::new(client, Duration::from_secs(60));
+        let (tx, mut rx) = broadcast::channel::<String>(16);
+        cache.set_invalidator(tx.clone());
+        cache.insert_test_entry("A:PV").await;
+        cache.insert_test_entry("B:PV").await;
+
+        assert_eq!(cache.flush().await, 2, "both entries removed");
+        // HashSet iteration order is unspecified, so sort before comparing.
+        let mut got = vec![
+            rx.try_recv().expect("first name published on flush"),
+            rx.try_recv().expect("second name published on flush"),
+        ];
+        got.sort();
+        assert_eq!(got, vec!["A:PV".to_string(), "B:PV".to_string()]);
+        assert!(rx.try_recv().is_err(), "exactly two names, no more");
+    }
+
+    /// A cache with no invalidator wired (standalone, outside a server)
+    /// still flushes / drops correctly and publishes nothing — the
+    /// `OnceLock`-guarded publish path is a clean no-op rather than a panic.
+    #[tokio::test]
+    async fn unwired_cache_drop_and_flush_are_silent() {
+        let client = Arc::new(PvaClient::builder().build());
+        let cache = ChannelCache::new(client, Duration::from_secs(60));
+        cache.insert_test_entry("WM:PV").await;
+        assert!(cache.drop_entry("WM:PV").await);
+        cache.insert_test_entry("WM:PV2").await;
+        assert_eq!(cache.flush().await, 1);
     }
 }

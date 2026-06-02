@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::time::interval;
 use tracing::{debug, error, warn};
 
@@ -1600,7 +1600,18 @@ pub async fn run_tcp_server_with_peers(
     peers: Arc<crate::server_native::peers::PeerRegistry>,
 ) -> PvaResult<()> {
     let listener = TcpListener::bind(bind_addr).await.map_err(PvaError::Io)?;
-    run_tcp_server_on_listener(source, listener, config, peers).await
+    // Standalone single-listener path (not driven by `PvaServer`): create
+    // and wire the channel-invalidation broadcast here so a source served
+    // this way — e.g. a PVA gateway — still force-disconnects downstream
+    // channels on an operator `:drop`/`:flush`. `PvaServer`'s multi-listener
+    // path creates it once in `run_pva_server` and shares the one sender
+    // across every TCP/UDP listener; here there is a single listener, so a
+    // local sender is sufficient. The initial receiver is dropped; the
+    // sender stays alive for the accept loop's lifetime.
+    let (channel_invalidator, _inv_rx0) =
+        broadcast::channel::<String>(crate::server_native::runtime::CHANNEL_INVALIDATION_CAPACITY);
+    source.set_channel_invalidator(channel_invalidator.clone());
+    run_tcp_server_on_listener(source, listener, config, peers, channel_invalidator).await
 }
 
 /// Variant that takes a pre-bound [`TcpListener`]. Lets
@@ -1615,6 +1626,11 @@ pub async fn run_tcp_server_on_listener(
     listener: TcpListener,
     config: PvaServerConfig,
     peers: Arc<crate::server_native::peers::PeerRegistry>,
+    // Server-wide channel-invalidation broadcast. Each accepted connection
+    // subscribes a receiver; a source publishes the PV name of any channel
+    // that must be force-disconnected out of band (PVA gateway operator
+    // `:drop`/`:flush`). See [`ChannelSource::set_channel_invalidator`].
+    channel_invalidator: broadcast::Sender<String>,
 ) -> PvaResult<()> {
     let bind_addr = listener.local_addr().map_err(PvaError::Io)?;
     debug!(?bind_addr, "TCP listener up");
@@ -1669,6 +1685,7 @@ pub async fn run_tcp_server_on_listener(
                 let active_dec = active.clone();
                 let acceptor = tls_acceptor.clone();
                 let peers_for_task = peers.clone();
+                let conn_invalidator = channel_invalidator.clone();
                 conn_tasks.spawn(async move {
                     stream.set_nodelay(true).ok();
                     // Enable OS-level TCP keepalive so half-open connections
@@ -1781,8 +1798,11 @@ pub async fn run_tcp_server_on_listener(
                                         Box::new(w),
                                         peer,
                                         cfg,
-                                        peer_entry.clone(),
-                                        x509_id,
+                                        ConnInit {
+                                            peer_entry: peer_entry.clone(),
+                                            x509_identity: x509_id,
+                                            channel_invalidator: conn_invalidator,
+                                        },
                                     )
                                     .await
                                 }
@@ -1810,8 +1830,11 @@ pub async fn run_tcp_server_on_listener(
                                 Box::new(w),
                                 peer,
                                 cfg,
-                                peer_entry.clone(),
-                                None,
+                                ConnInit {
+                                    peer_entry: peer_entry.clone(),
+                                    x509_identity: None,
+                                    channel_invalidator: conn_invalidator,
+                                },
                             )
                             .await
                         }
@@ -2297,20 +2320,39 @@ struct ResolvedChannel {
 /// Sender half of the CREATE_CHANNEL completion channel.
 type CcTx = mpsc::Sender<CreateChannelCompletion>;
 
+/// Per-connection context the accept loop establishes before handing the
+/// split stream to [`handle_connection_io`]: the peer's report entry, the
+/// verified mTLS identity (if any), and the server-wide channel-invalidation
+/// sender. Bundled to keep the IO handler's argument count within budget.
+struct ConnInit {
+    peer_entry: Arc<crate::server_native::peers::PeerEntry>,
+    /// x509 identity from the verified TLS peer chain, when this connection
+    /// arrived over mutually-authenticated TLS. `None` for plain TCP or TLS
+    /// without a client cert. When present it is the authoritative identity
+    /// and overrides the CONNECTION_VALIDATION claim — mirrors pvxs
+    /// `SSLContext::fill_credentials`.
+    x509_identity: Option<crate::auth::X509Credentials>,
+    /// Server-wide channel-invalidation broadcast (see
+    /// [`ChannelSource::set_channel_invalidator`]). Subscribed once below; a
+    /// published PV name force-disconnects every channel this connection
+    /// currently serves under that name with a server-initiated
+    /// DESTROY_CHANNEL.
+    channel_invalidator: broadcast::Sender<String>,
+}
+
 async fn handle_connection_io(
     source: DynSource,
     mut reader: SrvRead,
     mut writer_raw: SrvWrite,
     peer: SocketAddr,
     config: PvaServerConfig,
-    peer_entry: Arc<crate::server_native::peers::PeerEntry>,
-    // x509 identity from the verified TLS peer chain, when this
-    // connection arrived over mutually-authenticated TLS. `None` for
-    // plain TCP or TLS without a client cert. When present it is the
-    // authoritative identity and overrides the CONNECTION_VALIDATION
-    // claim — mirrors pvxs `SSLContext::fill_credentials`.
-    x509_identity: Option<crate::auth::X509Credentials>,
+    init: ConnInit,
 ) -> PvaResult<()> {
+    let ConnInit {
+        peer_entry,
+        x509_identity,
+        channel_invalidator,
+    } = init;
     let op_timeout = config.op_timeout;
     let idle_timeout = config.idle_timeout;
 
@@ -2424,6 +2466,19 @@ async fn handle_connection_io(
     // Step 3+: drive the read loop.
     let mut rx_buf: Vec<u8> = Vec::with_capacity(8192);
     let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+    // Receiver on the server-wide channel-invalidation broadcast. A source
+    // publishes the PV name of a channel that must be force-disconnected
+    // out of band (PVA gateway operator `:drop`/`:flush`); the read-loop
+    // arm below force-disconnects every channel in `channels` serving that
+    // name with a server-initiated DESTROY_CHANNEL. Subscribing here (post-
+    // accept, pre-handshake) is sufficient: no channel exists until after
+    // CONNECTION_VALIDATION, so any invalidation during the handshake names
+    // a PV this connection cannot yet be serving and is harmlessly missed.
+    let mut inv_rx = channel_invalidator.subscribe();
+    // Disables the invalidation select! arm once every sender has dropped
+    // (server shutdown). Without the guard a closed `broadcast::Receiver`
+    // resolves `recv()` immediately and forever, busy-looping the select.
+    let mut inv_closed = false;
     let mut handshake_complete = false;
     // Client identity carried for the rest of the connection lifetime.
     //
@@ -2640,6 +2695,56 @@ async fn handle_connection_io(
                 }
                 continue;
             }
+            inv_res = inv_rx.recv(), if !inv_closed => {
+                // A source invalidated a channel out of band (PVA gateway
+                // operator `<prefix>:drop` / `:flush`). Force-disconnect
+                // every channel this connection currently serves under the
+                // published PV name with a server-initiated DESTROY_CHANNEL
+                // — the downstream effect of pva2pva dropping a
+                // `ChannelCacheEntry`: `channel->destroy()` →
+                // `channelStateChange(DESTROYED)` fanout to every interested
+                // `GWChannel` (chancache.cpp:76-99, server.cpp:133-135).
+                match inv_res {
+                    Ok(pv) => {
+                        // Tear down every channel this connection serves
+                        // under the published name through the single
+                        // teardown owner. A channel hosts every op under one
+                        // name, so destroying it ends that name's GET/PUT/
+                        // MONITOR alike — matching pva2pva's per-channel,
+                        // not per-pvRequest, destroy granularity.
+                        let teardown = ChannelTeardownCtx {
+                            tx: &tx,
+                            order,
+                            peer,
+                            cred: &cred,
+                            peer_entry: &peer_entry,
+                        };
+                        invalidate_named_channels(&pv, &mut channels, &teardown).await;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        // The invalidation stream overflowed this
+                        // connection's buffer (a very large `:flush` while
+                        // this task was busy in its read loop). Some names
+                        // were dropped before this task could act; the
+                        // operator can re-issue. Log loudly — silently
+                        // missing a force-disconnect would leave a channel
+                        // bound to a dropped cache entry, the exact defect
+                        // this path closes.
+                        warn!(
+                            ?peer,
+                            dropped = n,
+                            "channel-invalidation receiver lagged; some force-disconnects missed, re-issue :drop/:flush"
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Every sender dropped (server shutting down). Stop
+                        // polling this arm so it cannot busy-loop; this
+                        // connection keeps serving until its own teardown.
+                        inv_closed = true;
+                    }
+                }
+                continue;
+            }
             frame_result = read_frame(&mut reader, &mut rx_buf, op_timeout, max_msg_size) => {
                 frame_result?
             }
@@ -2779,13 +2884,18 @@ async fn handle_connection_io(
                 .await?;
             }
             Some(Command::DestroyChannel) => {
-                if let Some(removed_sid) =
-                    handle_destroy_channel(&frame, &tx, &mut channels, order, peer, &cred).await?
-                {
-                    // Drop the per-channel report entry + live count in one
-                    // owner call (pvxs removes from conn->chanBySID).
-                    peer_entry.channel_closed(removed_sid);
-                }
+                // Teardown + report bookkeeping (`channel_closed`) is owned
+                // by `finalize_channel_destroy`, reached via the validation
+                // wrapper — the same owner the server-initiated invalidation
+                // arm uses, so neither path can partially tear a channel down.
+                let teardown = ChannelTeardownCtx {
+                    tx: &tx,
+                    order,
+                    peer,
+                    cred: &cred,
+                    peer_entry: &peer_entry,
+                };
+                handle_destroy_channel(&frame, &mut channels, &teardown).await?;
             }
             Some(Command::Get) => {
                 peer_entry.op_init();
@@ -4076,19 +4186,124 @@ fn close_channel(ch: ChannelState, peer: SocketAddr, cred: &ClientCredentials) {
     source.notify_channel_close(&name, &ctx);
 }
 
-/// Returns the SID actually removed (`Some`) so the connection owner can
-/// drop its `PeerEntry` report entry, or `None` when the SID was unknown
-/// (no-op, no reply — pvxs serverchan.cpp:382-386).
-async fn handle_destroy_channel(
-    frame: &Frame,
-    tx: &SrvTx,
-    channels: &mut HashMap<u32, ChannelState>,
+/// Connection-scoped context for a channel teardown that emits a
+/// DESTROY_CHANNEL frame: the writer handle, the outbound byte order, the
+/// peer's address + credentials (to reconstruct the channel's lifecycle
+/// identity for the source `onClose`), and the per-peer report registry.
+/// Bundling these five keeps the teardown helpers
+/// ([`finalize_channel_destroy`], [`handle_destroy_channel`],
+/// [`invalidate_named_channels`]) within the argument-count budget and lets
+/// the read loop build the context once per use (built per-use rather than
+/// once per connection because the connection's `cred` is reassigned during
+/// the validation handshake, so a borrow cannot outlive a single arm).
+struct ChannelTeardownCtx<'a> {
+    tx: &'a SrvTx,
     order: ByteOrder,
     peer: SocketAddr,
-    cred: &ClientCredentials,
-) -> PvaResult<Option<u32>> {
+    cred: &'a ClientCredentials,
+    peer_entry: &'a Arc<crate::server_native::peers::PeerEntry>,
+}
+
+/// Single owner of a channel teardown that notifies the peer with a
+/// DESTROY_CHANNEL frame. EVERY teardown path that emits DESTROY_CHANNEL —
+/// the client-initiated [`handle_destroy_channel`] and the server-initiated
+/// out-of-band invalidation (PVA gateway operator `:drop`/`:flush`, the
+/// read loop's invalidation arm) — funnels through here, so the ordering
+/// and the report bookkeeping cannot drift between callers. In one place it:
+///
+/// 1. removes `sid` from the connection table (dropping every `OpState`,
+///    which aborts monitor subscriber tasks and releases source-side
+///    subscriptions),
+/// 2. runs [`close_channel`] (op teardown → bound source `onClose`, pvxs
+///    `ServerChan::cleanup` serverchan.cpp:43-60),
+/// 3. emits the DESTROY_CHANNEL frame (`sid + cid`, charged to the
+///    channel's stat — pvxs serverchan.cpp:409 `statTx += 16u`), and
+/// 4. drops the `PeerEntry` report entry (`channel_closed`, pvxs removes
+///    from `conn->chanBySID`).
+///
+/// Returns `true` when a channel was actually present and torn down,
+/// `false` for an unknown SID (no-op, no reply). `ctx.order` is the
+/// outbound reply order.
+async fn finalize_channel_destroy(
+    sid: u32,
+    cid: u32,
+    channels: &mut HashMap<u32, ChannelState>,
+    ctx: &ChannelTeardownCtx<'_>,
+) -> bool {
+    // Removing the channel drops every OpState in `ops`, which drops each
+    // `monitor_abort: Option<Arc<AbortOnDrop>>` and cancels the associated
+    // subscriber task — preventing orphaned spawns from holding the
+    // source's broadcast subscription. `close_channel` does that op
+    // teardown first, then notifies the bound source's `onClose`.
+    let Some(ch) = channels.remove(&sid) else {
+        return false;
+    };
+    // Charge the DESTROY_CHANNEL reply to the channel being torn down;
+    // capture its counter before `close_channel` consumes the state. pvxs
+    // charges no per-channel `statRx` for CREATE/DESTROY — only the reply.
+    let stat = ch.stat.clone();
+    close_channel(ch, ctx.peer, ctx.cred);
+    let mut payload = Vec::new();
+    payload.put_u32(sid, ctx.order);
+    payload.put_u32(cid, ctx.order);
+    let h = PvaHeader::application(
+        true,
+        ctx.order,
+        Command::DestroyChannel.code(),
+        payload.len() as u32,
+    );
+    let mut buf = Vec::new();
+    h.write_into(&mut buf);
+    buf.extend_from_slice(&payload);
+    stat.add_tx(buf.len());
+    let _ = ctx.tx.send(buf).await;
+    // Drop the per-channel report entry + live count in one owner call
+    // (pvxs removes from conn->chanBySID). Folded into this finalizer so no
+    // teardown caller can forget it — a no-op for a SID never registered
+    // (`channel_closed` is gated on a successful map removal).
+    ctx.peer_entry.channel_closed(sid);
+    true
+}
+
+/// Force-disconnect every channel this connection serves under
+/// `pv`, each through the single teardown owner [`finalize_channel_destroy`]
+/// (server-initiated DESTROY_CHANNEL). Called by the read loop's
+/// channel-invalidation arm for every PV name a source publishes on an
+/// operator `:drop`/`:flush`. Collects matching SIDs first (immutable
+/// borrow) so the per-victim mutable teardown does not alias the map.
+/// Returns the number of channels torn down (0 when this connection holds
+/// none under that name — the common case, since the invalidation is
+/// server-wide). A channel hosts every op under one name, so this ends that
+/// name's GET/PUT/MONITOR together, matching pva2pva's per-channel destroy.
+async fn invalidate_named_channels(
+    pv: &str,
+    channels: &mut HashMap<u32, ChannelState>,
+    ctx: &ChannelTeardownCtx<'_>,
+) -> usize {
+    let victims: Vec<(u32, u32)> = channels
+        .iter()
+        .filter(|(_, ch)| ch.name == pv)
+        .map(|(&sid, ch)| (sid, ch.cid))
+        .collect();
+    let mut torn_down = 0;
+    for (sid, cid) in victims {
+        if finalize_channel_destroy(sid, cid, channels, ctx).await {
+            torn_down += 1;
+        }
+    }
+    torn_down
+}
+
+/// Client-initiated DESTROY_CHANNEL (cmd 8). Validates the SID against the
+/// connection table, then delegates the teardown to the single owner
+/// [`finalize_channel_destroy`].
+async fn handle_destroy_channel(
+    frame: &Frame,
+    channels: &mut HashMap<u32, ChannelState>,
+    ctx: &ChannelTeardownCtx<'_>,
+) -> PvaResult<()> {
     // Inbound payload decodes with the frame's own header order (pvxs
-    // latches `peerBE` per received message, conn.cpp:195-198); `order`
+    // latches `peerBE` per received message, conn.cpp:195-198); `ctx.order`
     // (config) is used only for the outbound reply below.
     let inbound_order = frame.order();
     let mut cur = frame.cursor();
@@ -4109,7 +4324,7 @@ async fn handle_destroy_channel(
     // remove + reply only on hit.
     if !channels.contains_key(&sid) {
         debug!(sid, cid, "DESTROY_CHANNEL on unknown SID: dropping");
-        return Ok(None);
+        return Ok(());
     }
     // pvxs also warns when `chan->cid != cid` (line 390-393) but proceeds
     // with the destroy. We don't keep the wire CID alongside the SID
@@ -4125,37 +4340,8 @@ async fn handle_destroy_channel(
             "DESTROY_CHANNEL CID mismatch"
         );
     }
-    // Removing the channel drops every OpState in `ops`, which drops
-    // each `monitor_abort: Option<Arc<AbortOnDrop>>` and cancels the
-    // associated subscriber task — preventing orphaned spawns from
-    // holding the source's broadcast subscription. `close_channel` does
-    // that op teardown first, then notifies the bound source's `onClose`
-    // (pvxs `ServerChan::cleanup`, serverchan.cpp:43-60).
-    let ch = channels
-        .remove(&sid)
-        .expect("SID presence verified by contains_key above");
-    // The DESTROY_CHANNEL reply is charged to the channel being torn
-    // down (pvxs serverchan.cpp:409 `statTx += 16u`); capture its
-    // counter before `close_channel` consumes the state. pvxs charges no
-    // per-channel `statRx` for CREATE/DESTROY (serverchan.cpp has only
-    // statTx) — only the reply is attributed here.
-    let stat = ch.stat.clone();
-    close_channel(ch, peer, cred);
-    let mut payload = Vec::new();
-    payload.put_u32(sid, order);
-    payload.put_u32(cid, order);
-    let h = PvaHeader::application(
-        true,
-        order,
-        Command::DestroyChannel.code(),
-        payload.len() as u32,
-    );
-    let mut buf = Vec::new();
-    h.write_into(&mut buf);
-    buf.extend_from_slice(&payload);
-    stat.add_tx(buf.len());
-    let _ = tx.send(buf).await;
-    Ok(Some(sid))
+    finalize_channel_destroy(sid, cid, channels, ctx).await;
+    Ok(())
 }
 
 /// Handle CANCEL_REQUEST (cmd 21). pvxs serverconn.cpp:262 — moves the op
@@ -9438,7 +9624,15 @@ mod tests {
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let cred = ClientCredentials::anonymous();
-        handle_destroy_channel(&frame, &tx, &mut channels, order, peer, &cred)
+        let peer_entry = crate::server_native::peers::PeerEntry::new(false);
+        let teardown = ChannelTeardownCtx {
+            tx: &tx,
+            order,
+            peer,
+            cred: &cred,
+            peer_entry: &peer_entry,
+        };
+        handle_destroy_channel(&frame, &mut channels, &teardown)
             .await
             .expect("handler returns Ok");
 
@@ -9484,7 +9678,15 @@ mod tests {
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let cred = ClientCredentials::anonymous();
-        handle_destroy_channel(&frame, &tx, &mut channels, order, peer, &cred)
+        let peer_entry = crate::server_native::peers::PeerEntry::new(false);
+        let teardown = ChannelTeardownCtx {
+            tx: &tx,
+            order,
+            peer,
+            cred: &cred,
+            peer_entry: &peer_entry,
+        };
+        handle_destroy_channel(&frame, &mut channels, &teardown)
             .await
             .expect("handler returns Ok");
 
@@ -9536,9 +9738,17 @@ mod tests {
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let cred = ClientCredentials::anonymous();
+        let peer_entry = crate::server_native::peers::PeerEntry::new(false);
         // Server configured little-endian (config_order) for its OWN
         // outbound frames; the inbound frame is big-endian.
-        handle_destroy_channel(&frame, &tx, &mut channels, config_order, peer, &cred)
+        let teardown = ChannelTeardownCtx {
+            tx: &tx,
+            order: config_order,
+            peer,
+            cred: &cred,
+            peer_entry: &peer_entry,
+        };
+        handle_destroy_channel(&frame, &mut channels, &teardown)
             .await
             .expect("handler returns Ok");
 
@@ -9676,7 +9886,15 @@ mod tests {
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let cred = ClientCredentials::anonymous();
-        handle_destroy_channel(&frame, &tx, &mut channels, order, peer, &cred)
+        let peer_entry = crate::server_native::peers::PeerEntry::new(false);
+        let teardown = ChannelTeardownCtx {
+            tx: &tx,
+            order,
+            peer,
+            cred: &cred,
+            peer_entry: &peer_entry,
+        };
+        handle_destroy_channel(&frame, &mut channels, &teardown)
             .await
             .expect("handler returns Ok");
 
@@ -9692,13 +9910,146 @@ mod tests {
         payload2.put_u32(sid, order);
         payload2.put_u32(cid, order);
         let frame2 = synth_frame(Command::DestroyChannel, order, payload2);
-        handle_destroy_channel(&frame2, &tx, &mut channels, order, peer, &cred)
+        handle_destroy_channel(&frame2, &mut channels, &teardown)
             .await
             .expect("handler returns Ok");
         assert_eq!(
             *closed.lock(),
             vec!["dut".to_string()],
             "a destroy on an already-removed SID must not re-fire onClose"
+        );
+    }
+
+    /// A source's out-of-band channel invalidation (PVA gateway
+    /// operator `:drop`/`:flush`) force-disconnects exactly the downstream
+    /// channels serving the named PV with a server-initiated DESTROY_CHANNEL,
+    /// leaving channels under other names untouched. Before this fix a
+    /// drop/flush only ended the upstream monitor; the downstream channel
+    /// lingered and silently rebound to a re-created cache entry on the next
+    /// event. Asserts the single-owner teardown removed only the match, sent
+    /// a DESTROY_CHANNEL addressing it, and released only its report count.
+    #[tokio::test]
+    async fn invalidate_named_channels_force_disconnects_only_matching_name() {
+        let order = ByteOrder::Little;
+        let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
+
+        // Two live channels: "X" (sid 1) is the invalidation target; "Y"
+        // (sid 2), a different name, must survive.
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let peer_entry = crate::server_native::peers::PeerEntry::new(false);
+        for (sid, cid, name) in [(1u32, 10u32, "X"), (2u32, 20u32, "Y")] {
+            let stat = crate::server_native::peers::ChannelStat::new(name.into());
+            channels.insert(
+                sid,
+                ChannelState {
+                    name: name.into(),
+                    cid,
+                    sid,
+                    introspection: None,
+                    source: source.clone(),
+                    stat: stat.clone(),
+                    ops: HashMap::new(),
+                },
+            );
+            peer_entry.channel_opened(sid, stat);
+        }
+        assert_eq!(
+            peer_entry
+                .channels
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+        let teardown = ChannelTeardownCtx {
+            tx: &tx,
+            order,
+            peer,
+            cred: &cred,
+            peer_entry: &peer_entry,
+        };
+
+        let torn = invalidate_named_channels("X", &mut channels, &teardown).await;
+
+        assert_eq!(torn, 1, "exactly the one channel named X is torn down");
+        assert!(!channels.contains_key(&1), "X (sid 1) removed");
+        assert!(channels.contains_key(&2), "Y (sid 2) survives a drop of X");
+        assert_eq!(
+            peer_entry
+                .channels
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only X's live-channel count is released"
+        );
+
+        // A server-initiated DESTROY_CHANNEL addressing sid 1 / cid 10 was
+        // emitted (header + sid + cid, little-endian).
+        let frame = rx.try_recv().expect("DESTROY_CHANNEL frame emitted for X");
+        assert_eq!(frame.len(), PvaHeader::SIZE + 8);
+        let body = &frame[PvaHeader::SIZE..];
+        let got_sid = u32::from_le_bytes(body[0..4].try_into().unwrap());
+        let got_cid = u32::from_le_bytes(body[4..8].try_into().unwrap());
+        assert_eq!(
+            (got_sid, got_cid),
+            (1, 10),
+            "the emitted frame addresses the X channel"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no frame emitted for the surviving Y channel"
+        );
+    }
+
+    /// A published name this connection does not serve is a
+    /// no-op — no teardown, no frame. The invalidation broadcast is
+    /// server-wide, so most connections hold no channel under a given
+    /// dropped name and must not be disturbed.
+    #[tokio::test]
+    async fn invalidate_named_channels_unknown_name_is_noop() {
+        let order = ByteOrder::Little;
+        let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let peer_entry = crate::server_native::peers::PeerEntry::new(false);
+        let stat = crate::server_native::peers::ChannelStat::new("X".into());
+        channels.insert(
+            1,
+            ChannelState {
+                name: "X".into(),
+                cid: 10,
+                sid: 1,
+                introspection: None,
+                source: source.clone(),
+                stat: stat.clone(),
+                ops: HashMap::new(),
+            },
+        );
+        peer_entry.channel_opened(1, stat);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+        let teardown = ChannelTeardownCtx {
+            tx: &tx,
+            order,
+            peer,
+            cred: &cred,
+            peer_entry: &peer_entry,
+        };
+
+        let torn = invalidate_named_channels("Z", &mut channels, &teardown).await;
+        assert_eq!(torn, 0);
+        assert!(channels.contains_key(&1), "non-matching channel untouched");
+        assert_eq!(
+            peer_entry
+                .channels
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no frame emitted for a name this connection does not serve"
         );
     }
 

@@ -9,6 +9,15 @@ use crate::error::{PvaError, PvaResult};
 use super::source::{ChannelSource, ChannelSourceObj, DynSource};
 use super::udp::{random_guid, run_udp_responder_v6, run_udp_responder_with_config};
 
+/// Capacity of the server-wide channel-invalidation broadcast (see
+/// [`ChannelSource::set_channel_invalidator`]). Each per-connection task
+/// holds one receiver; a one-shot operator `:flush` publishes one name per
+/// dropped cache entry, so the buffer must comfortably absorb a large flush
+/// without lagging a connection task that is briefly busy in its read loop.
+/// Shared with the standalone `run_tcp_server_with_peers` entry point so
+/// both server paths size the broadcast identically.
+pub(crate) const CHANNEL_INVALIDATION_CAPACITY: usize = 1024;
+
 /// Runtime configuration for [`run_pva_server`].
 #[derive(Clone)]
 pub struct PvaServerConfig {
@@ -614,6 +623,22 @@ impl PvaServer {
             })?;
         let dyn_source: DynSource = composite as Arc<dyn ChannelSourceObj>;
 
+        // One server-wide channel-invalidation broadcast. A source that can
+        // invalidate a channel out of band (the PVA gateway, on an operator
+        // `<prefix>:drop` / `:flush`) publishes the affected PV name here;
+        // every per-connection task subscribes and force-disconnects any
+        // channel it currently serves under that name with a server-initiated
+        // DESTROY_CHANNEL — the downstream effect of pva2pva's cache-entry
+        // `channel->destroy()` fanout. The initial receiver is dropped: the
+        // channel stays open as long as this sender (held by the source(s)
+        // and the accept loop) lives, and per-connection receivers are minted
+        // at accept. Capacity is generous so a one-shot `:flush` of a large
+        // cache does not lag a connection task that is briefly busy; a lagging
+        // receiver logs and the operator can re-issue (see the read-loop arm).
+        let (channel_invalidator, _inv_rx0) =
+            tokio::sync::broadcast::channel::<String>(CHANNEL_INVALIDATION_CAPACITY);
+        dyn_source.set_channel_invalidator(channel_invalidator.clone());
+
         // TCP bind addresses derived from `EPICS_PVAS_INTF_ADDR_LIST`
         // (empty → single `bind_ip` default); see [`tcp_bind_addresses`].
         let tcp_bind_ips = tcp_bind_addresses(&config.interfaces, config.bind_ip);
@@ -744,6 +769,7 @@ impl PvaServer {
         let tcp_source = dyn_source;
         let tcp_config = config.clone();
         let tcp_peers = peers.clone();
+        let tcp_invalidator = channel_invalidator;
         let tcp_handle = tokio::spawn(async move {
             let mut set: tokio::task::JoinSet<PvaResult<()>> = tokio::task::JoinSet::new();
             for listener in tcp_listeners {
@@ -752,6 +778,7 @@ impl PvaServer {
                     listener,
                     tcp_config.clone(),
                     tcp_peers.clone(),
+                    tcp_invalidator.clone(),
                 ));
             }
             while let Some(joined) = set.join_next().await {

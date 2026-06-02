@@ -981,6 +981,26 @@ pub trait ChannelSource: Send + Sync + 'static {
         let _ = (name, ctx);
     }
 
+    /// Register the server's channel-invalidation broadcast sender with
+    /// this source. The server creates one sender per
+    /// [`crate::server_native::PvaServer`] and hands it here before
+    /// accepting connections. A source that can invalidate a channel
+    /// out-of-band keeps the sender and publishes the PV name of every
+    /// channel that must be force-disconnected; each per-connection task
+    /// subscribes to a receiver and, for a name it currently serves, tears
+    /// that channel down with a server-initiated `DESTROY_CHANNEL`. That is
+    /// the downstream effect of pva2pva dropping a `ChannelCacheEntry` —
+    /// `channel->destroy()` → `channelStateChange(DESTROYED)` fanout to
+    /// every interested downstream `GWChannel` (`p2pApp/server.cpp:133-135`,
+    /// `chancache.cpp:30-35,76-99`). The PVA gateway uses this so an
+    /// operator `<prefix>:drop` / `:flush` actually disconnects the live
+    /// downstream channels instead of leaving them bound to a silently
+    /// re-created upstream entry. Default impl ignores it (a source that
+    /// never invalidates channels out of band).
+    fn set_channel_invalidator(&self, invalidator: tokio::sync::broadcast::Sender<String>) {
+        let _ = invalidator;
+    }
+
     /// the per-PV pipeline-window watermark levels `(low,
     /// high)` for `name`, in window-credit units. The monitor loop fires
     /// [`Self::notify_watermark`] with [`WatermarkKind::Resume`] when an
@@ -1425,6 +1445,7 @@ pub trait ChannelSourceObj: Send + Sync {
     fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool);
     fn notify_channel_open(&self, name: &str, ctx: &ChannelContext);
     fn notify_channel_close(&self, name: &str, ctx: &ChannelContext);
+    fn set_channel_invalidator(&self, invalidator: tokio::sync::broadcast::Sender<String>);
     fn monitor_watermarks<'a>(
         &'a self,
         name: &'a str,
@@ -1727,6 +1748,9 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     }
     fn notify_channel_close(&self, name: &str, ctx: &ChannelContext) {
         <Self as ChannelSource>::notify_channel_close(self, name, ctx);
+    }
+    fn set_channel_invalidator(&self, invalidator: tokio::sync::broadcast::Sender<String>) {
+        <Self as ChannelSource>::set_channel_invalidator(self, invalidator);
     }
     fn monitor_watermarks<'a>(
         &'a self,

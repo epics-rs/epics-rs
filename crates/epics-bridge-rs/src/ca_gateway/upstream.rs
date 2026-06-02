@@ -47,7 +47,7 @@ use epics_base_rs::error::CaError;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::pv::{WriteContext, WriteHook};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
-use epics_ca_rs::client::{CaChannel, CaClient, EventWatcher};
+use epics_ca_rs::client::{CaChannel, CaClient, EventWatcher, MonitorHandle};
 use epics_ca_rs::server::AccessRightsNotifier;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
@@ -58,6 +58,7 @@ use super::access::AccessConfig;
 use super::cache::{PvCache, PvState};
 use super::putlog::{PutLog, PutLogScope, PutOutcome};
 use super::pvlist::PvList;
+use super::server::CacheMode;
 use super::stats::Stats;
 
 /// Build a zero-initialised [`EpicsValue`] of the upstream channel's
@@ -138,7 +139,15 @@ type PvAclCell = Arc<ArcSwap<PvAcl>>;
 /// channel is reused across the gateway's lifetime.
 struct UpstreamSubscription {
     channel: Arc<CaChannel>,
-    task: JoinHandle<()>,
+    /// The monitor-forwarding task. `Some` whenever an upstream
+    /// subscription is live: always in [`CacheMode::Cached`], and in
+    /// [`CacheMode::NoCache`] only while ≥1 downstream client is
+    /// monitoring (created by [`UpstreamManager::ensure_monitor`], torn
+    /// down by [`UpstreamManager::release_monitor`]). `None` for a
+    /// no-cache PV with no current monitor interest — GETs are still
+    /// served via the shadow PV's read hook (fresh upstream fetch), no
+    /// persistent subscription needed.
+    task: Option<JoinHandle<()>>,
     /// Live `.pvlist` ASG/ASL for this shadow PV, shared by-`Arc` with
     /// the read and write hook closures so a `AS`/`PVL` reload can swap
     /// the group/level in place. Replaces the previous by-value
@@ -206,6 +215,12 @@ pub struct UpstreamManagerConfig {
     pub putlog_scope: PutLogScope,
     pub stats: Arc<Stats>,
     pub read_only: bool,
+    /// Cache mode (C `cacheMode` / `-no_cache`). In
+    /// [`CacheMode::NoCache`] `ensure_subscribed` installs a read hook
+    /// that forwards each downstream GET to upstream and defers the
+    /// upstream monitor until [`UpstreamManager::ensure_monitor`] is
+    /// called on the first downstream subscription.
+    pub cache_mode: CacheMode,
     /// Upstream connect-timeout budget for lazy search resolution.
     /// Threaded from `GatewayConfig::timeouts.connect_timeout` so the
     /// CLI/API connect-timeout knob also governs first-search resolution,
@@ -261,6 +276,12 @@ pub struct UpstreamManager {
     /// (gateServer.cc:1294-1356, set once via setConnectTimeout,
     /// gateway.cc:1147) rather than a second hard-coded clock.
     connect_timeout: Duration,
+    /// Cache mode (C `cacheMode` / `-no_cache`). Gates whether
+    /// `ensure_subscribed` holds a persistent upstream monitor and serves
+    /// GETs from the shadow snapshot (`Cached`) or forwards each GET to
+    /// upstream and creates the monitor lazily per downstream-monitor
+    /// interest (`NoCache`).
+    cache_mode: CacheMode,
     /// Upstream monitor event mask (C `-mask`, default
     /// `DBE_VALUE|DBE_ALARM`). Both the initial `ensure_subscribed`
     /// subscribe and the reconnect re-subscribe inside the forwarding
@@ -334,6 +355,7 @@ impl UpstreamManager {
             subs: parking_lot::Mutex::new(HashMap::new()),
             pending: parking_lot::Mutex::new(HashMap::new()),
             connect_timeout: cfg.connect_timeout,
+            cache_mode: cfg.cache_mode,
             event_mask: cfg.event_mask,
             access_notifier: Arc::new(ArcSwapOption::empty()),
         })
@@ -604,10 +626,36 @@ impl UpstreamManager {
         // registered under `served_name` (the alias) so a
         // downstream lookup of the alias resolves; the hook above still
         // forwards puts to `upstream_name` (the real PV).
+        // In no-cache mode (C `-no_cache`), serve each downstream GET
+        // from a FRESH upstream fetch instead of the shadow snapshot:
+        // install a read hook that forwards to the shared upstream
+        // channel's `get()`. It captures the same `Arc<CaChannel>` the
+        // write hook reuses, so a GET costs one upstream get with no
+        // fresh CREATE_CHAN. The hook lands ATOMICALLY with registration
+        // (`add_pv_with_hooks_full`), closing the same CREATE_CHAN+READ
+        // race the write/access hooks close. Cached mode installs no read
+        // hook — GETs serve the monitor-fed shadow value as before.
+        // Mirrors `gateVc.cc:1361-1369` forwarding the read to the IOC.
+        let read_hook: Option<epics_base_rs::server::pv::ReadHook> =
+            if self.cache_mode.is_no_cache() {
+                let ch = channel.clone();
+                Some(Arc::new(move || {
+                    let ch = ch.clone();
+                    Box::pin(async move { ch.get().await.map(|(_dbf, v)| v) })
+                }))
+            } else {
+                None
+            };
         self.shadow_db.remove_simple_pv(served_name).await;
         if let Err(e) = self
             .shadow_db
-            .add_pv_with_hooks(served_name, initial_value, hook, Some(access_hook))
+            .add_pv_with_hooks_full(
+                served_name,
+                initial_value,
+                hook,
+                Some(access_hook),
+                read_hook,
+            )
             .await
         {
             return Err(BridgeError::PutRejected(format!(
@@ -615,28 +663,43 @@ impl UpstreamManager {
             )));
         }
 
-        // Subscribe (monitor receiver is independent of the channel handle).
-        // Autosize (wire count=0) + the configured `-mask` event mask: this
-        // mirrors ca-gateway's
+        // Subscribe the persistent upstream monitor — CACHED mode only.
+        //
+        // Cached: subscribe now. Autosize (wire count=0) + the configured
+        // `-mask` event mask mirrors ca-gateway's
         // `ca_create_subscription(eventType(), 0, chID, GR->eventMask(), ...)`
-        // (gatePv.cc:765-774) exactly — count 0 so the IOC reports each
-        // event at the record's CURRENT element count, not its native
-        // capacity, and the configured mask (default DBE_VALUE|DBE_ALARM)
-        // rather than the CaChannel default that also requests DBE_LOG.
-        // `deadband` is 0.0 — ca-gateway applies no client-side deadband,
-        // the server-side mask alone gates events.
-        // On failure we MUST also remove the just-added shadow PV — otherwise
-        // it lingers in `simple_pvs` with a hook pointing at a dead channel,
-        // and the next downstream search resolves it without re-running
-        // the resolver, leaving the gateway in a stuck state.
-        let mut monitor = match channel
-            .subscribe_with_mask_autosize(0.0, self.event_mask)
-            .await
-        {
-            Ok(m) => m,
-            Err(e) => {
-                self.shadow_db.remove_simple_pv(served_name).await;
-                return Err(BridgeError::PutRejected(format!("subscribe failed: {e}")));
+        // (gatePv.cc:765-774) — count 0 so the IOC reports each event at
+        // the record's CURRENT element count, and the configured mask
+        // (default DBE_VALUE|DBE_ALARM) rather than the CaChannel default
+        // that also requests DBE_LOG. `deadband` is 0.0 — ca-gateway
+        // applies no client-side deadband. On failure we MUST remove the
+        // just-added shadow PV — otherwise it lingers in `simple_pvs`
+        // with a hook pointing at a dead channel and the next search
+        // resolves it without re-running the resolver, stuck.
+        //
+        // No-cache: hold NO persistent monitor. Mark the entry existent
+        // (Inactive) so the search resolver advertises it and the
+        // connect-timeout reaper does not evict it (no monitor event will
+        // arrive to flip Connecting→Inactive). The upstream monitor is
+        // created lazily by `ensure_monitor` on the first downstream
+        // subscription (C `getCB` no-cache `needPosting()` gate,
+        // gatePv.cc:1737-1753); GETs meanwhile forward fresh via the read
+        // hook installed above.
+        let initial_monitor: Option<MonitorHandle> = if self.cache_mode.is_no_cache() {
+            if let Some(entry) = self.cache.read().await.get(served_name) {
+                entry.write().await.set_state(PvState::Inactive);
+            }
+            None
+        } else {
+            match channel
+                .subscribe_with_mask_autosize(0.0, self.event_mask)
+                .await
+            {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    self.shadow_db.remove_simple_pv(served_name).await;
+                    return Err(BridgeError::PutRejected(format!("subscribe failed: {e}")));
+                }
             }
         };
 
@@ -665,30 +728,104 @@ impl UpstreamManager {
             }
         });
 
-        // Spawn forwarding task — does NOT borrow the channel, so the
-        // direct put()/get() path can use the same channel without
-        // contention. Auto-restart is handled by the loop below: if
-        // the upstream monitor ends (closed channel, transient I/O
-        // error), we re-subscribe with exponential backoff so the
-        // shadow PV resumes receiving updates without the search
-        // resolver having to re-issue the entire create_channel.
+        // Spawn the monitor-forwarding task. CACHED: spawn now, seeded
+        // with the monitor subscribed above. NO-CACHE: `initial_monitor`
+        // is `None`, so no task spawns here — `ensure_monitor` creates it
+        // (self-subscribing) on the first downstream monitor, and
+        // `release_monitor` aborts it when the last monitor leaves.
+        let task = initial_monitor
+            .map(|monitor| self.spawn_forward_task(served_name, channel.clone(), Some(monitor)));
+
+        // subscription dedup keys on `served_name` so a
+        // repeat search for the same alias is a no-op (fast path above)
+        // and a `.pvlist` reload prunes by the served name it admits.
+        self.subs.lock().insert(
+            served_name.to_string(),
+            UpstreamSubscription {
+                channel,
+                task,
+                acl,
+                _access_rights_watcher: access_rights_watcher,
+            },
+        );
+        Ok(())
+    }
+
+    /// Spawn the upstream monitor-forwarding task for `served_name`.
+    ///
+    /// The single owner of one PV's upstream-subscription lifetime:
+    /// subscribes (autosize count=0 + configured `-mask` event mask),
+    /// forwards every event into the gateway cache + shadow PvDatabase,
+    /// surfaces an INVALID alarm on upstream disconnect, and re-subscribes
+    /// with exponential backoff. Used by `ensure_subscribed` (cached
+    /// mode, seeded with `initial_monitor`) and by `ensure_monitor`
+    /// (no-cache, `initial_monitor = None` → the task subscribes itself).
+    ///
+    /// Does NOT borrow the channel, so the direct put()/get() path uses
+    /// the same channel without contention. `release_monitor` (no-cache)
+    /// aborts the returned handle; aborting only drops the in-memory
+    /// monitor stream and stops the loop — no external truth changes and
+    /// the last cached value stays put, so no finalizer is needed.
+    fn spawn_forward_task(
+        &self,
+        served_name: &str,
+        channel: Arc<CaChannel>,
+        initial_monitor: Option<MonitorHandle>,
+    ) -> JoinHandle<()> {
         let cache_clone = self.cache.clone();
         let db_clone = self.shadow_db.clone();
-        let channel_for_task = channel.clone();
         let stats_for_task = self.write_env.stats.clone();
         let beacon_anomaly_for_task = self.write_env.beacon_anomaly.clone();
-        // The reconnect re-subscribe below must use the same autosize
-        // (wire count=0) + configured `-mask` event mask as the initial
-        // subscribe, not the DBE_LOG-bearing CaChannel default.
+        // The reconnect / first-subscribe re-arm must use the same
+        // autosize (wire count=0) + configured `-mask` event mask as the
+        // seeded subscribe, not the DBE_LOG-bearing CaChannel default.
         let event_mask = self.event_mask;
-        // the forwarding task addresses the cache entry,
-        // shadow PV, and alarm post by `served_name` — the same key the
-        // shadow PV and cache were registered under above.
+        // the forwarding task addresses the cache entry, shadow PV, and
+        // alarm post by `served_name` — the same key the shadow PV and
+        // cache were registered under above.
         let name = served_name.to_string();
-        let task = tokio::spawn(async move {
+        tokio::spawn(async move {
             let mut backoff = Duration::from_millis(250);
             let max_backoff = Duration::from_secs(30);
+            // Seed the first iteration with the monitor the caller
+            // subscribed (cached mode); `None` (no-cache) subscribes at
+            // the top of the loop. Every reconnect re-subscribes the same
+            // way, so there is ONE subscribe site, not two.
+            let mut next_monitor = initial_monitor;
             loop {
+                let mut monitor = match next_monitor.take() {
+                    Some(m) => m,
+                    None => match channel.subscribe_with_mask_autosize(0.0, event_mask).await {
+                        Ok(m) => m,
+                        // `CaError::Shutdown` means the CA client
+                        // coordinator is gone — `subscribe()` will never
+                        // succeed again, so retrying just spins at the
+                        // backoff cap forever. Exit cleanly; the cache
+                        // entry stays in Disconnect and the next search
+                        // resolver pass re-creates the channel against a
+                        // live client.
+                        Err(CaError::Shutdown) => {
+                            tracing::debug!(
+                                pv = %name,
+                                "ca-gateway-rs: CA coordinator gone, \
+                                 stopping upstream monitor task"
+                            );
+                            return;
+                        }
+                        Err(_) => {
+                            // Transient subscribe failure (e.g. upstream
+                            // still reconnecting). Back off and retry,
+                            // unless the cache entry was evicted meanwhile
+                            // (nobody cares anymore).
+                            if cache_clone.read().await.get(&name).is_none() {
+                                return;
+                            }
+                            tokio::time::sleep(backoff).await;
+                            backoff = std::cmp::min(backoff * 2, max_backoff);
+                            continue;
+                        }
+                    },
+                };
                 while let Some(result) = monitor.recv().await {
                     let snapshot = match result {
                         Ok(s) => s,
@@ -783,65 +920,79 @@ impl UpstreamManager {
                     )
                     .await;
 
-                // Try to re-subscribe with exponential backoff. The
-                // CaChannel itself drives reconnect under the hood;
-                // this loop merely re-arms the monitor stream once
-                // the channel is back up. Bail out only if the cache
-                // entry has been evicted (i.e. nobody cares anymore).
+                // Back off, then loop: the top of the loop re-subscribes
+                // (the single subscribe site). Bail out if the cache
+                // entry has been evicted (nobody cares anymore). The
+                // CaChannel itself drives reconnect under the hood; this
+                // loop merely re-arms the monitor stream once it is back.
                 tokio::time::sleep(backoff).await;
                 backoff = std::cmp::min(backoff * 2, max_backoff);
-
                 if cache_clone.read().await.get(&name).is_none() {
                     return;
                 }
-
-                match channel_for_task
-                    .subscribe_with_mask_autosize(0.0, event_mask)
-                    .await
-                {
-                    Ok(new_monitor) => {
-                        monitor = new_monitor;
-                        // The next successful event will flip state
-                        // back to Inactive (see top of inner loop).
-                    }
-                    // `CaError::Shutdown` means the CA client
-                    // coordinator is gone — `subscribe()` will never
-                    // succeed again, so re-trying just spins this task
-                    // at the backoff cap forever. Exit cleanly; the
-                    // cache entry stays in Disconnect and the next
-                    // search resolver pass re-creates the channel
-                    // against a live client.
-                    Err(CaError::Shutdown) => {
-                        tracing::debug!(
-                            pv = %name,
-                            "ca-gateway-rs: CA coordinator gone, \
-                             stopping upstream monitor task"
-                        );
-                        return;
-                    }
-                    Err(_) => {
-                        // Transient failure — stay in Disconnect;
-                        // another iteration of the outer loop will
-                        // retry after the next sleep.
-                        continue;
-                    }
-                }
             }
-        });
+        })
+    }
 
-        // subscription dedup keys on `served_name` so a
-        // repeat search for the same alias is a no-op (fast path above)
-        // and a `.pvlist` reload prunes by the served name it admits.
-        self.subs.lock().insert(
-            served_name.to_string(),
-            UpstreamSubscription {
-                channel,
-                task,
-                acl,
-                _access_rights_watcher: access_rights_watcher,
-            },
-        );
-        Ok(())
+    /// No-cache: ensure the upstream monitor for `served_name` is live.
+    ///
+    /// Called by the connection-event owner when the FIRST downstream
+    /// client opens a monitor (`EVENT_ADD`) on this PV. Spawns the
+    /// forwarding task (which subscribes itself) iff no task is currently
+    /// running for the subscription. Idempotent: a second concurrent
+    /// monitor-open is a no-op because the task already exists.
+    ///
+    /// No-op in [`CacheMode::Cached`] — there the persistent monitor is
+    /// created eagerly at `ensure_subscribed`, so it is always present.
+    /// Mirrors C ca-gateway's no-cache `getCB` creating `pv->monitor()`
+    /// only when `vc->needPosting()` (gatePv.cc:1737-1753).
+    pub fn ensure_monitor(&self, served_name: &str) {
+        if !self.cache_mode.is_no_cache() {
+            return;
+        }
+        // Take the channel under the lock, then spawn outside the lock
+        // (spawn is sync but keep the critical section minimal), then
+        // store the handle under the lock — re-checking no peer raced a
+        // task in between.
+        let channel = {
+            let subs = self.subs.lock();
+            match subs.get(served_name) {
+                Some(sub) if sub.task.is_none() => sub.channel.clone(),
+                // No subscription (evicted) or a task already runs.
+                _ => return,
+            }
+        };
+        let handle = self.spawn_forward_task(served_name, channel, None);
+        let mut subs = self.subs.lock();
+        match subs.get_mut(served_name) {
+            // Re-check: another caller may have raced a task in, or the
+            // subscription may have been evicted, while we spawned.
+            Some(sub) if sub.task.is_none() => sub.task = Some(handle),
+            _ => handle.abort(),
+        }
+    }
+
+    /// No-cache: drop the upstream monitor for `served_name`.
+    ///
+    /// Called by the connection-event owner when the LAST downstream
+    /// monitor on this PV closes. Aborts the forwarding task; the shadow
+    /// PV and upstream channel stay (GETs still forward fresh via the
+    /// read hook). Idempotent: a no-op if no task is running.
+    ///
+    /// No-op in [`CacheMode::Cached`] — the persistent monitor must
+    /// outlive any single downstream subscriber.
+    pub fn release_monitor(&self, served_name: &str) {
+        if !self.cache_mode.is_no_cache() {
+            return;
+        }
+        let task = self
+            .subs
+            .lock()
+            .get_mut(served_name)
+            .and_then(|sub| sub.task.take());
+        if let Some(task) = task {
+            task.abort();
+        }
     }
 
     /// Remove an upstream subscription and abort its task. Also
@@ -857,8 +1008,10 @@ impl UpstreamManager {
     /// pass the served name they read from the cache / subs map.
     pub async fn unsubscribe(&self, served_name: &str) {
         let removed = self.subs.lock().remove(served_name);
-        if let Some(sub) = removed {
-            sub.task.abort();
+        if let Some(sub) = removed
+            && let Some(task) = sub.task
+        {
+            task.abort();
         }
         // Best-effort: if the PV is gone already (concurrent reload
         // path) `remove_simple_pv` returns None; we don't care.
@@ -981,7 +1134,9 @@ impl UpstreamManager {
         let drained: Vec<UpstreamSubscription> =
             self.subs.lock().drain().map(|(_, sub)| sub).collect();
         for sub in drained {
-            sub.task.abort();
+            if let Some(task) = sub.task {
+                task.abort();
+            }
         }
         self.client.shutdown().await;
     }
@@ -1525,9 +1680,20 @@ mod tests {
     /// the ambient `EPICS_CA_*` env — call [`pin_env`] first so the client
     /// is pinned to the test server.
     async fn pinned_manager(db: Arc<PvDatabase>) -> UpstreamManager {
+        pinned_manager_full(db, Arc::new(RwLock::new(PvCache::new())), CacheMode::Cached).await
+    }
+
+    /// Like [`pinned_manager`] but with a caller-supplied cache (so a test
+    /// can inspect per-PV state) and an explicit cache mode (so a test can
+    /// exercise the no-cache GET-forward + lazy-monitor paths).
+    async fn pinned_manager_full(
+        db: Arc<PvDatabase>,
+        cache: Arc<RwLock<PvCache>>,
+        cache_mode: CacheMode,
+    ) -> UpstreamManager {
         let env = dummy_env();
         UpstreamManager::new(UpstreamManagerConfig {
-            cache: Arc::new(RwLock::new(PvCache::new())),
+            cache,
             shadow_db: db,
             access: env.access.clone(),
             pvlist: env.pvlist.clone(),
@@ -1535,6 +1701,7 @@ mod tests {
             putlog_scope: PutLogScope::default(),
             stats: env.stats.clone(),
             read_only: false,
+            cache_mode,
             connect_timeout: Duration::from_secs(1),
             event_mask: crate::ca_gateway::server::DEFAULT_EVENT_MASK,
             beacon_anomaly: env.beacon_anomaly.clone(),
@@ -1561,6 +1728,7 @@ mod tests {
             putlog_scope: PutLogScope::default(),
             stats: env.stats.clone(),
             read_only: false,
+            cache_mode: CacheMode::Cached,
             connect_timeout: Duration::from_secs(1),
             event_mask: crate::ca_gateway::server::DEFAULT_EVENT_MASK,
             beacon_anomaly: env.beacon_anomaly.clone(),
@@ -1603,6 +1771,7 @@ mod tests {
             putlog_scope: PutLogScope::default(),
             stats: env.stats.clone(),
             read_only: false,
+            cache_mode: CacheMode::Cached,
             connect_timeout: Duration::from_secs(1),
             event_mask: crate::ca_gateway::server::DEFAULT_EVENT_MASK,
             beacon_anomaly: env.beacon_anomaly.clone(),
@@ -1929,6 +2098,251 @@ ASG(NewGroup) {
         mgr.shutdown().await;
     }
 
+    /// No-cache mode: a downstream GET must serve a FRESH upstream fetch,
+    /// not the stored shadow snapshot. After subscribe, overwrite the
+    /// shadow's stored value with a sentinel; the read hook (no-cache only)
+    /// must return the upstream value, while `snapshot` still returns the
+    /// sentinel — proving the GET path forwards and the monitor path does
+    /// not. Mirrors C `-no_cache` forwarding the read to the IOC
+    /// (gateVc.cc:1361-1369).
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial(epics_env)]
+    async fn br24_no_cache_get_forwards_to_upstream() {
+        let name = "NC:get";
+        const UPSTREAM: f64 = 3.0;
+        const SENTINEL: f64 = 999.0;
+
+        let port = free_port();
+        let server = CaServer::builder()
+            .port(port)
+            .pv(name, EpicsValue::Double(UPSTREAM))
+            .build()
+            .await
+            .expect("CA server");
+        let _server = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        pin_env(port);
+        let db = Arc::new(PvDatabase::new());
+        let mgr = pinned_manager_full(
+            db.clone(),
+            Arc::new(RwLock::new(PvCache::new())),
+            CacheMode::NoCache,
+        )
+        .await;
+
+        mgr.ensure_subscribed(name, name, None, 0)
+            .await
+            .expect("ensure_subscribed connects to the hosted upstream");
+
+        let pv = db.find_pv(name).await.expect("shadow PV registered");
+        // Make the stored shadow value a sentinel the fresh fetch must
+        // override — proving the GET goes upstream, not to the cache.
+        pv.set(EpicsValue::Double(SENTINEL)).await;
+
+        let read = pv.read_snapshot().await.expect("no-cache GET forwards");
+        assert_eq!(
+            read.value,
+            EpicsValue::Double(UPSTREAM),
+            "no-cache GET must serve the fresh upstream value, not the sentinel"
+        );
+        // The monitor/stored path still serves the sentinel — the read
+        // hook is GET-path only.
+        assert_eq!(
+            pv.snapshot().await.value,
+            EpicsValue::Double(SENTINEL),
+            "snapshot (monitor path) must still serve the stored shadow value"
+        );
+
+        mgr.shutdown().await;
+    }
+
+    /// Cached mode regression: NO read hook is installed, so a GET serves
+    /// the stored shadow value even when the upstream differs — the
+    /// no-cache forwarding is opt-in and does not leak into cached mode.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial(epics_env)]
+    async fn br24_cached_get_serves_shadow_value() {
+        let name = "C:get";
+        const SENTINEL: f64 = 999.0;
+
+        let port = free_port();
+        let server = CaServer::builder()
+            .port(port)
+            .pv(name, EpicsValue::Double(3.0))
+            .build()
+            .await
+            .expect("CA server");
+        let _server = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        pin_env(port);
+        let db = Arc::new(PvDatabase::new());
+        let mgr = pinned_manager(db.clone()).await; // Cached
+
+        mgr.ensure_subscribed(name, name, None, 0)
+            .await
+            .expect("ensure_subscribed connects to the hosted upstream");
+
+        let pv = db.find_pv(name).await.expect("shadow PV registered");
+        pv.set(EpicsValue::Double(SENTINEL)).await;
+
+        let read = pv.read_snapshot().await.expect("cached GET never errors");
+        assert_eq!(
+            read.value,
+            EpicsValue::Double(SENTINEL),
+            "cached GET must serve the stored shadow value (no read hook)"
+        );
+
+        mgr.shutdown().await;
+    }
+
+    /// No-cache mode: the upstream monitor is lazy. After `ensure_subscribed`
+    /// no forwarding task runs; `ensure_monitor` (first downstream monitor)
+    /// spawns one; `release_monitor` (last downstream monitor) aborts it.
+    /// Mirrors C no-cache `getCB` creating the monitor only on
+    /// `needPosting()` (gatePv.cc:1737-1753).
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial(epics_env)]
+    async fn br24_no_cache_monitor_is_lazy() {
+        let name = "NC:mon";
+
+        let port = free_port();
+        let server = CaServer::builder()
+            .port(port)
+            .pv(name, EpicsValue::Double(1.0))
+            .build()
+            .await
+            .expect("CA server");
+        let _server = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        pin_env(port);
+        let db = Arc::new(PvDatabase::new());
+        let mgr = pinned_manager_full(
+            db.clone(),
+            Arc::new(RwLock::new(PvCache::new())),
+            CacheMode::NoCache,
+        )
+        .await;
+
+        mgr.ensure_subscribed(name, name, None, 0)
+            .await
+            .expect("ensure_subscribed connects");
+
+        // No monitor task until a downstream client subscribes.
+        assert!(
+            mgr.subs
+                .lock()
+                .get(name)
+                .expect("sub tracked")
+                .task
+                .is_none(),
+            "no-cache: no forwarding task before the first downstream monitor"
+        );
+
+        // First downstream monitor → task spawned.
+        mgr.ensure_monitor(name);
+        assert!(
+            mgr.subs
+                .lock()
+                .get(name)
+                .expect("sub tracked")
+                .task
+                .is_some(),
+            "ensure_monitor must spawn the forwarding task"
+        );
+
+        // A second monitor-open is idempotent (task already present).
+        mgr.ensure_monitor(name);
+        assert!(
+            mgr.subs
+                .lock()
+                .get(name)
+                .expect("sub tracked")
+                .task
+                .is_some(),
+            "second ensure_monitor is a no-op while a task runs"
+        );
+
+        // Last downstream monitor → task aborted.
+        mgr.release_monitor(name);
+        assert!(
+            mgr.subs
+                .lock()
+                .get(name)
+                .expect("sub tracked")
+                .task
+                .is_none(),
+            "release_monitor must abort the forwarding task"
+        );
+
+        mgr.shutdown().await;
+    }
+
+    /// Cached mode regression: the monitor is eager (spawned at
+    /// `ensure_subscribed`) and `ensure_monitor`/`release_monitor` are
+    /// no-ops — the persistent monitor must outlive any single downstream
+    /// subscriber.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial(epics_env)]
+    async fn br24_cached_monitor_eager_ensure_release_noop() {
+        let name = "C:mon";
+
+        let port = free_port();
+        let server = CaServer::builder()
+            .port(port)
+            .pv(name, EpicsValue::Double(1.0))
+            .build()
+            .await
+            .expect("CA server");
+        let _server = tokio::spawn(async move { server.run().await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        pin_env(port);
+        let db = Arc::new(PvDatabase::new());
+        let mgr = pinned_manager(db.clone()).await; // Cached
+
+        mgr.ensure_subscribed(name, name, None, 0)
+            .await
+            .expect("ensure_subscribed connects");
+
+        // Cached: forwarding task exists immediately.
+        assert!(
+            mgr.subs
+                .lock()
+                .get(name)
+                .expect("sub tracked")
+                .task
+                .is_some(),
+            "cached: forwarding task is spawned eagerly at ensure_subscribed"
+        );
+
+        // ensure_monitor / release_monitor are no-ops in cached mode.
+        mgr.ensure_monitor(name);
+        assert!(
+            mgr.subs
+                .lock()
+                .get(name)
+                .expect("sub tracked")
+                .task
+                .is_some(),
+            "cached: ensure_monitor is a no-op (task stays)"
+        );
+        mgr.release_monitor(name);
+        assert!(
+            mgr.subs
+                .lock()
+                .get(name)
+                .expect("sub tracked")
+                .task
+                .is_some(),
+            "cached: release_monitor must NOT abort the persistent monitor"
+        );
+
+        mgr.shutdown().await;
+    }
+
     /// the lazy-resolution connect gate must honor the configured
     /// `CacheTimeouts::connect_timeout`, not a hard-coded constant. Build
     /// a manager with a short 150 ms budget against a dead port and assert
@@ -1951,6 +2365,7 @@ ASG(NewGroup) {
             putlog_scope: PutLogScope::default(),
             stats: env.stats.clone(),
             read_only: false,
+            cache_mode: CacheMode::Cached,
             connect_timeout: Duration::from_millis(150),
             event_mask: crate::ca_gateway::server::DEFAULT_EVENT_MASK,
             beacon_anomaly: env.beacon_anomaly.clone(),

@@ -93,6 +93,13 @@ struct Args {
     #[arg(long)]
     read_only: bool,
 
+    /// Disable caching (C `-no_cache`): forward every get request to the
+    /// IOC and create the upstream monitor only while a downstream client
+    /// is monitoring the PV. Default is caching on (a persistent upstream
+    /// monitor per PV, GETs served from the cached value).
+    #[arg(long)]
+    no_cache: bool,
+
     /// Upstream monitor event mask (C `-mask`). A string of DBE selector
     /// characters: `v`=value, `a`=alarm, `l`=log/archive, `p`=property
     /// (case-insensitive; e.g. `va`, `v`, `vap`). Unset — or a value that
@@ -380,6 +387,14 @@ async fn async_main(args: Args) -> ExitCode {
             Some(std::time::Duration::from_secs(args.heartbeat_interval))
         },
         read_only: args.read_only,
+        // C `cacheMode` / `-no_cache` (gateway.cc:238/1162): NoCache
+        // forwards each get to the IOC and gates the upstream monitor on
+        // live downstream monitor interest.
+        cache_mode: if args.no_cache {
+            epics_bridge_rs::ca_gateway::CacheMode::NoCache
+        } else {
+            epics_bridge_rs::ca_gateway::CacheMode::Cached
+        },
         // C `-mask` resolution (gateway.cc:736-766 char→DBE, :1146
         // keep-default-if-empty): an absent/unrecognised spec keeps the
         // DBE_VALUE|DBE_ALARM default rather than the DBE_LOG-bearing

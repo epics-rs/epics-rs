@@ -77,6 +77,16 @@ pub struct GwPvEntry {
     /// Used as a reference count: when empty, the PV transitions
     /// from `Active` to `Inactive`.
     pub subscribers: Vec<u32>,
+    /// Synthetic IDs of downstream clients that have an *open monitor*
+    /// (`CA_PROTO_EVENT_ADD`) on this PV — a strict subset of
+    /// [`Self::subscribers`] (a plain `caget` opens a channel but no
+    /// monitor). Drives the no-cache lazy upstream monitor: the upstream
+    /// subscription exists only while this is non-empty. Empty (and
+    /// unused) in [`CacheMode::Cached`](super::server::CacheMode::Cached),
+    /// where the upstream monitor is always present. Mirrors C ca-gateway
+    /// `vc->needPosting()` gating `pv->monitor()` under `-no_cache`
+    /// (`gatePv.cc:1737-1753`).
+    pub monitor_interest: Vec<u32>,
     /// When the current state was entered. Used by cleanup to evict
     /// PVs that have been Inactive/Dead/Disconnect for too long.
     pub state_since: Instant,
@@ -99,6 +109,7 @@ impl GwPvEntry {
             state: PvState::Connecting,
             cached: None,
             subscribers: Vec::new(),
+            monitor_interest: Vec::new(),
             state_since: Instant::now(),
             event_count: 0,
             total_alive: Duration::ZERO,
@@ -146,6 +157,35 @@ impl GwPvEntry {
     /// How many downstream subscribers are currently attached.
     pub fn subscriber_count(&self) -> usize {
         self.subscribers.len()
+    }
+
+    /// Record a downstream monitor (`EVENT_ADD`) opening on this PV.
+    /// Returns `true` when this is the *first* monitor — the no-cache
+    /// owner uses that edge to create the upstream subscription. No-op
+    /// (returns `false`) if `sid` is already counted, so a duplicate or
+    /// replayed event cannot double-create the upstream monitor.
+    pub fn add_monitor_interest(&mut self, sid: u32) -> bool {
+        if self.monitor_interest.contains(&sid) {
+            return false;
+        }
+        let was_empty = self.monitor_interest.is_empty();
+        self.monitor_interest.push(sid);
+        was_empty
+    }
+
+    /// Record a downstream monitor (`EVENT_CANCEL` / channel teardown)
+    /// closing on this PV. Returns `true` when this was the *last*
+    /// monitor — the no-cache owner uses that edge to drop the upstream
+    /// subscription. No-op (returns `false`) if `sid` was not counted.
+    pub fn remove_monitor_interest(&mut self, sid: u32) -> bool {
+        let before = self.monitor_interest.len();
+        self.monitor_interest.retain(|s| *s != sid);
+        before != self.monitor_interest.len() && self.monitor_interest.is_empty()
+    }
+
+    /// How many downstream monitors are currently open on this PV.
+    pub fn monitor_interest_count(&self) -> usize {
+        self.monitor_interest.len()
     }
 
     /// Update cached snapshot from a new upstream event.
@@ -410,6 +450,64 @@ mod tests {
         e.remove_subscriber(2);
         assert_eq!(e.state, PvState::Inactive);
         assert_eq!(e.subscriber_count(), 0);
+    }
+
+    /// `add_monitor_interest` returns `true` only on the empty→first edge;
+    /// `remove_monitor_interest` returns `true` only on the last→empty edge.
+    /// These two booleans are what the no-cache owner uses to create and
+    /// drop the upstream subscription exactly once.
+    #[test]
+    fn monitor_interest_edge_transitions() {
+        let mut e = GwPvEntry::new_connecting("TEMP");
+        assert_eq!(e.monitor_interest_count(), 0);
+
+        // empty → first: became-first edge fires
+        assert!(
+            e.add_monitor_interest(1),
+            "first monitor is the create edge"
+        );
+        assert_eq!(e.monitor_interest_count(), 1);
+
+        // first → second: no edge
+        assert!(
+            !e.add_monitor_interest(2),
+            "second monitor must not re-fire the create edge"
+        );
+        assert_eq!(e.monitor_interest_count(), 2);
+
+        // duplicate add: no-op, no edge
+        assert!(
+            !e.add_monitor_interest(2),
+            "duplicate sid cannot double-create the upstream monitor"
+        );
+        assert_eq!(e.monitor_interest_count(), 2);
+
+        // second → first: not the last, no drop edge
+        assert!(
+            !e.remove_monitor_interest(1),
+            "removing one of two monitors must not fire the drop edge"
+        );
+        assert_eq!(e.monitor_interest_count(), 1);
+
+        // remove uncounted sid: no-op, no edge
+        assert!(
+            !e.remove_monitor_interest(999),
+            "removing an uncounted sid is a no-op"
+        );
+        assert_eq!(e.monitor_interest_count(), 1);
+
+        // first → empty: last→empty edge fires
+        assert!(
+            e.remove_monitor_interest(2),
+            "removing the last monitor is the drop edge"
+        );
+        assert_eq!(e.monitor_interest_count(), 0);
+
+        // remove from empty: no-op, no edge
+        assert!(
+            !e.remove_monitor_interest(2),
+            "removing from an empty set is a no-op"
+        );
     }
 
     #[test]

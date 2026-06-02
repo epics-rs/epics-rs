@@ -746,12 +746,36 @@ impl PvDatabase {
         write_hook: crate::server::pv::WriteHook,
         access_hook: Option<crate::server::pv::AccessHook>,
     ) -> CaResult<()> {
+        self.add_pv_with_hooks_full(name, initial, write_hook, access_hook, None)
+            .await
+    }
+
+    /// like [`Self::add_pv_with_hooks`] but also installs an optional
+    /// [`ReadHook`](crate::server::pv::ReadHook) so a proxy (the CA
+    /// gateway in no-cache mode) can serve each downstream GET from a
+    /// fresh upstream fetch instead of the stored value. All three hooks
+    /// are attached before the PV is inserted into `simple_pvs`, so a
+    /// downstream `CREATE_CHAN` cannot observe the PV without its hooks
+    /// bound — the read hook lands atomically with registration, closing
+    /// the same race the write/access hooks already close. `read_hook:
+    /// None` is identical to [`Self::add_pv_with_hooks`].
+    pub async fn add_pv_with_hooks_full(
+        &self,
+        name: &str,
+        initial: EpicsValue,
+        write_hook: crate::server::pv::WriteHook,
+        access_hook: Option<crate::server::pv::AccessHook>,
+        read_hook: Option<crate::server::pv::ReadHook>,
+    ) -> CaResult<()> {
         let _gate = self.inner.registration_mutex.lock().await;
         self.check_name_free(name).await?;
         let pv = Arc::new(ProcessVariable::new(name.to_string(), initial));
         pv.set_write_hook(write_hook);
         if let Some(access) = access_hook {
             pv.set_access_hook(access);
+        }
+        if let Some(read) = read_hook {
+            pv.set_read_hook(read);
         }
         self.inner
             .simple_pvs

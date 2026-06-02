@@ -326,7 +326,7 @@ impl Drop for IoidGuard {
             // byte-order. Failure to enqueue is benign: the server
             // reaps stranded ops when the TCP circuit drops.
             let codec = PvaCodec {
-                big_endian: matches!(self.server.byte_order, ByteOrder::Big),
+                big_endian: matches!(self.server.byte_order(), ByteOrder::Big),
             };
             let frame = codec.build_destroy_request(sid, self.ioid);
             let _ = self.server.try_send(frame);
@@ -402,7 +402,7 @@ async fn op_get_inner(
     op_timeout: Duration,
 ) -> PvaResult<(FieldDesc, PvField)> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
-    let order = server.byte_order;
+    let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
 
@@ -437,7 +437,7 @@ async fn op_get_inner(
                     // 188-200` — send DESTROY_REQUEST and unregister
                     // the IOID before the cold INIT allocates a new
                     // one.
-                    let order = server.byte_order;
+                    let order = server.byte_order();
                     let dr = codec.build_destroy_request(sid, warm_ioid);
                     let _ = server.send_for_channel(sid, dr).await;
                     server.unregister_ioid(warm_ioid);
@@ -623,7 +623,7 @@ pub async fn op_get_field(
     op_timeout: Duration,
 ) -> PvaResult<FieldDesc> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
-    let order = server.byte_order;
+    let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
@@ -742,7 +742,7 @@ pub async fn op_put_field(
     op_timeout: Duration,
 ) -> PvaResult<()> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
-    let order = server.byte_order;
+    let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
@@ -880,7 +880,7 @@ pub async fn op_put_fields(
         return Err(PvaError::InvalidValue("no field assignments".into()));
     }
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
-    let order = server.byte_order;
+    let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
@@ -985,7 +985,7 @@ pub async fn op_put_field_with_request(
     op_timeout: Duration,
 ) -> PvaResult<()> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
-    let order = server.byte_order;
+    let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
@@ -1090,7 +1090,7 @@ pub async fn op_put_value_field_with_request(
     op_timeout: Duration,
 ) -> PvaResult<()> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
-    let order = server.byte_order;
+    let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
@@ -1296,7 +1296,7 @@ pub async fn op_put_value(
     op_timeout: Duration,
 ) -> PvaResult<()> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
-    let order = server.byte_order;
+    let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
@@ -1390,7 +1390,7 @@ pub async fn op_put_value_raw(
     op_timeout: Duration,
 ) -> PvaResult<()> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
-    let order = server.byte_order;
+    let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
@@ -1501,7 +1501,7 @@ where
     FB: FnOnce(&FieldDesc) -> PvaResult<(PvField, BitSet)>,
 {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
-    let order = server.byte_order;
+    let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
@@ -1719,7 +1719,7 @@ impl SubscriptionState {
         let snapshot = self.active.lock().take();
         if let Some((server, sid, ioid)) = snapshot {
             let codec = PvaCodec {
-                big_endian: matches!(server.byte_order, ByteOrder::Big),
+                big_endian: matches!(server.byte_order(), ByteOrder::Big),
             };
             let _ = server.try_send(codec.build_destroy_request(sid, ioid));
             server.unregister_ioid(ioid);
@@ -1756,7 +1756,7 @@ impl SubscriptionHandle {
         }
         let snapshot = self.state.active.lock().clone();
         if let Some((server, sid, ioid)) = snapshot {
-            let big_endian = matches!(server.byte_order, ByteOrder::Big);
+            let big_endian = matches!(server.byte_order(), ByteOrder::Big);
             let codec = PvaCodec { big_endian };
             let _ = server
                 .send_for_channel(sid, codec.build_monitor_pause(sid, ioid))
@@ -1776,7 +1776,7 @@ impl SubscriptionHandle {
         }
         let snapshot = self.state.active.lock().clone();
         if let Some((server, sid, ioid)) = snapshot {
-            let big_endian = matches!(server.byte_order, ByteOrder::Big);
+            let big_endian = matches!(server.byte_order(), ByteOrder::Big);
             let codec = PvaCodec { big_endian };
             let _ = server
                 .send_for_channel(sid, codec.build_monitor_resume(sid, ioid))
@@ -1902,7 +1902,7 @@ impl Pauser {
         }
         let snapshot = self.state.active.lock().clone();
         if let Some((server, sid, ioid)) = snapshot {
-            let big_endian = matches!(server.byte_order, ByteOrder::Big);
+            let big_endian = matches!(server.byte_order(), ByteOrder::Big);
             let codec = PvaCodec { big_endian };
             let _ = server
                 .send_for_channel(sid, codec.build_monitor_pause(sid, ioid))
@@ -1921,7 +1921,7 @@ impl Pauser {
         }
         let snapshot = self.state.active.lock().clone();
         if let Some((server, sid, ioid)) = snapshot {
-            let big_endian = matches!(server.byte_order, ByteOrder::Big);
+            let big_endian = matches!(server.byte_order(), ByteOrder::Big);
             let codec = PvaCodec { big_endian };
             let _ = server
                 .send_for_channel(sid, codec.build_monitor_resume(sid, ioid))
@@ -2204,7 +2204,7 @@ async fn run_raw_monitor_loop<F>(
 where
     F: FnMut(&FieldDesc, bytes::Bytes, ByteOrder) + Send,
 {
-    let order = server.byte_order;
+    let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
@@ -2696,7 +2696,7 @@ async fn run_monitor_loop<F>(
 where
     F: FnMut(&FieldDesc, &PvField) + Send,
 {
-    let order = server.byte_order;
+    let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
@@ -2982,7 +2982,7 @@ pub async fn op_rpc(
     op_timeout: Duration,
 ) -> PvaResult<(FieldDesc, PvField)> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
-    let order = server.byte_order;
+    let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
@@ -3194,7 +3194,7 @@ async fn op_put_get_data(
     op_timeout: Duration,
 ) -> PvaResult<(FieldDesc, PvField)> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
-    let order = server.byte_order;
+    let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
@@ -3425,7 +3425,7 @@ async fn op_array_data(
     op_timeout: Duration,
 ) -> PvaResult<(FieldDesc, ArrayResp)> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
-    let order = server.byte_order;
+    let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
@@ -3706,7 +3706,7 @@ pub async fn op_array_describe(
     op_timeout: Duration,
 ) -> PvaResult<FieldDesc> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
-    let order = server.byte_order;
+    let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
@@ -3887,7 +3887,7 @@ pub async fn op_process_with_request(
     op_timeout: Duration,
 ) -> PvaResult<()> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
-    let order = server.byte_order;
+    let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
@@ -3958,7 +3958,7 @@ pub async fn op_process_with_request_value(
     op_timeout: Duration,
 ) -> PvaResult<()> {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
-    let order = server.byte_order;
+    let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();

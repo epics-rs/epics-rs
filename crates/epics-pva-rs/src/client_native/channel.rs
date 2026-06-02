@@ -942,7 +942,7 @@ impl Channel {
         use super::decode::decode_create_channel_response;
         use crate::codec::PvaCodec;
 
-        let big_endian = matches!(server.byte_order, crate::proto::ByteOrder::Big);
+        let big_endian = matches!(server.byte_order(), crate::proto::ByteOrder::Big);
         let codec = PvaCodec { big_endian };
         let req = codec.build_create_channel(self.cid, &self.pv_name);
 

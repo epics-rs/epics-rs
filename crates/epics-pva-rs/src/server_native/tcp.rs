@@ -2415,11 +2415,22 @@ async fn handle_connection_io(
     // server-side echo heartbeat task.
     let last_rx = Arc::new(AtomicU64::new(now_nanos()));
 
+    // Outbound byte order as a shared, mutable per-connection cell, seeded
+    // from the configured wire order. The read loop latches a new value if
+    // the peer sends a SET_BYTE_ORDER control frame mid-stream (pvxs
+    // conn.cpp:169-188 `sendBE`; old pvAccess accepts it from either peer
+    // at any time). `true` = Big. Single writer (the read loop, which also
+    // keeps an in-sync local `order` for the synchronous dispatch path it
+    // owns); one reader (the heartbeat task).
+    let out_order = Arc::new(std::sync::atomic::AtomicBool::new(
+        config.wire_byte_order.is_big(),
+    ));
+
     // Spawn server-side heartbeat: send ECHO_REQUEST every 15 s; close if
     // we've been idle for `idle_timeout`.
     let last_rx_hb = last_rx.clone();
     let tx_hb = tx.clone();
-    let order_hb = config.wire_byte_order;
+    let out_order_hb = out_order.clone();
     let hb_handle = tokio::spawn(async move {
         let mut tick = interval(Duration::from_secs(15));
         tick.tick().await;
@@ -2431,6 +2442,14 @@ async fn handle_connection_io(
                 warn!(?peer, "PVA client idle > {idle_timeout:?}; closing");
                 break;
             }
+            // Read the current outbound order — the peer may have
+            // re-negotiated it via a mid-stream SET_BYTE_ORDER
+            // (pvxs conn.cpp:169-188).
+            let order_hb = if out_order_hb.load(Ordering::Relaxed) {
+                ByteOrder::Big
+            } else {
+                ByteOrder::Little
+            };
             let h = PvaHeader::control(true, order_hb, ControlCommand::EchoRequest.code(), 0);
             let mut buf = Vec::with_capacity(8);
             h.write_into(&mut buf);
@@ -2441,7 +2460,11 @@ async fn handle_connection_io(
     });
     let _hb_guard = AbortOnDrop(hb_handle.abort_handle());
 
-    let order = config.wire_byte_order;
+    // Outbound order owner: this read loop. Mutable so a mid-stream
+    // SET_BYTE_ORDER from the peer re-latches it (pvxs conn.cpp:169-188);
+    // every synchronous handler call below passes the current value and
+    // the shared `out_order` cell mirrors it for the heartbeat task.
+    let mut order = config.wire_byte_order;
 
     // Step 1: send SET_BYTE_ORDER (control message). Per pvxs, the byte order
     // we want to use is encoded in the control header's flag bit 7.
@@ -2760,6 +2783,22 @@ async fn handle_connection_io(
         peer_entry.touch_rx(PvaHeader::SIZE + frame.payload.len());
         last_rx.store(now_nanos(), Ordering::SeqCst);
         if frame.header.flags.is_control() {
+            // A peer may re-negotiate the connection byte order mid-stream
+            // with another SET_BYTE_ORDER control frame. pvxs latches
+            // `sendBE = header[2] & pva_flags::MSB` on every received
+            // SetEndian (conn.cpp:169-188) and uses it for all subsequent
+            // sends; old pvAccess accepts it from either peer at any time.
+            // Latch it into the local owner `order` and the shared cell so
+            // the next outbound frame (echo response, op replies, heartbeat)
+            // adopts the new order. The flag is the control frame's own
+            // header bit 7 (`frame.order()`), not the size field —
+            // pvAccessCPP/Java ignore the size field and assume the
+            // 0x00000000 ("use this order") behaviour.
+            if frame.header.command == ControlCommand::SetByteOrder.code() {
+                order = frame.order();
+                out_order.store(order.is_big(), Ordering::Relaxed);
+                continue;
+            }
             // Handle echo etc., otherwise ignore.
             if frame.header.command == ControlCommand::EchoRequest.code() {
                 let mut buf = Vec::new();

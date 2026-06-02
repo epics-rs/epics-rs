@@ -109,7 +109,15 @@ pub(crate) enum IoidSlot {
 /// A persistent server connection.
 pub struct ServerConn {
     pub addr: SocketAddr,
-    pub byte_order: ByteOrder,
+    /// Current outbound byte order, latched from the most recent
+    /// SET_BYTE_ORDER control frame the server sent. pvxs latches
+    /// `sendBE = header[2] & pva_flags::MSB` on every received SetEndian
+    /// (conn.cpp:169-188) and reads it at each send, so a server that
+    /// re-negotiates the order mid-connection is honoured on the next
+    /// outbound frame. `true` = Big. Written only by the reader task
+    /// (single owner, on SET_BYTE_ORDER arrival); read by every op
+    /// builder via [`ServerConn::byte_order`] and by the heartbeat task.
+    out_order: Arc<AtomicBool>,
     /// X.509 identity of the *server* peer, derived from the verified
     /// TLS certificate chain (`pvas://` only — `None` for a plain
     /// `pva://` TCP connection). Mirrors pvxs `Connected::cred`, which
@@ -301,6 +309,13 @@ impl ServerConn {
         // Spawn background tasks.
         let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let cancel = CancellationToken::new();
+        // Outbound byte order as a shared, mutable per-connection cell,
+        // seeded from the handshake SET_BYTE_ORDER. The reader task latches
+        // a new value if the server sends another SET_BYTE_ORDER mid-stream
+        // (pvxs conn.cpp:169-188 `sendBE`); op builders and the heartbeat
+        // read it at each send. `true` = Big. Single writer (reader task),
+        // many readers.
+        let out_order = Arc::new(AtomicBool::new(byte_order.is_big()));
         let alive = Arc::new(AtomicBool::new(true));
         let last_rx_nanos = Arc::new(AtomicU64::new(now_nanos()));
         let bytes_rx = Arc::new(AtomicU64::new(0));
@@ -356,7 +371,7 @@ impl ServerConn {
         let ioid_to_cmd_reader = ioid_to_cmd.clone();
         let chan_stats_reader = chan_stats.clone();
         let writer_tx_reader = writer_tx.clone();
-        let order_reader = byte_order;
+        let out_order_reader = out_order.clone();
         tokio::spawn(async move {
             let mut buf = rx_buf;
             let mut chunk = vec![0u8; 4096];
@@ -469,7 +484,11 @@ impl ServerConn {
                                     };
                                 buf.drain(..fn_);
                                 if frame.header.flags.is_control() {
-                                    handle_control_frame(&frame, &writer_tx_reader, order_reader);
+                                    handle_control_frame(
+                                        &frame,
+                                        &writer_tx_reader,
+                                        &out_order_reader,
+                                    );
                                     continue;
                                 }
                                 // segmentation gate (mirrors
@@ -593,7 +612,7 @@ impl ServerConn {
         let alive_hb = alive.clone();
         let last_rx_hb = last_rx_nanos.clone();
         let writer_tx_hb = writer_tx.clone();
-        let order_hb = byte_order;
+        let out_order_hb = out_order.clone();
         tokio::spawn(async move {
             // pvxs clientconn.cpp:163-165: echo interval = max(1, min(15, tcpTimeout * 3/8))
             // pvxs clientconn.cpp:73-74: socket inactivity timeout = tcpTimeout
@@ -624,6 +643,14 @@ impl ServerConn {
                         // healthy connection. Any inbound frame — including
                         // the echo reply — refreshes `last_rx`; control echo
                         // stays supported inbound as a Rust-only extension.
+                        // Read the current outbound order — the server may
+                        // have re-negotiated it via a mid-stream
+                        // SET_BYTE_ORDER (pvxs conn.cpp:169-188).
+                        let order_hb = if out_order_hb.load(Ordering::Relaxed) {
+                            ByteOrder::Big
+                        } else {
+                            ByteOrder::Little
+                        };
                         let h = PvaHeader::application(false, order_hb, Command::Echo.code(), 0);
                         let mut bytes = Vec::with_capacity(8);
                         h.write_into(&mut bytes);
@@ -639,7 +666,7 @@ impl ServerConn {
 
         Ok(Arc::new(Self {
             addr: target,
-            byte_order,
+            out_order,
             server_identity,
             writer_tx,
             cancel,
@@ -659,6 +686,19 @@ impl ServerConn {
 
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
+    }
+
+    /// Current negotiated outbound byte order. Latched from the server's
+    /// most recent SET_BYTE_ORDER control frame (pvxs conn.cpp:169-188
+    /// `sendBE`). Every op builder reads this per-send rather than caching
+    /// a handshake-time value, so a mid-connection re-negotiation is
+    /// honoured on the very next outbound frame.
+    pub fn byte_order(&self) -> ByteOrder {
+        if self.out_order.load(Ordering::Relaxed) {
+            ByteOrder::Big
+        } else {
+            ByteOrder::Little
+        }
     }
 
     /// snapshot `(bytes_rx, bytes_tx)` for this connection,
@@ -1032,11 +1072,30 @@ async fn read_one_frame<R: tokio::io::AsyncRead + Unpin>(
 fn handle_control_frame(
     frame: &Frame,
     writer_tx: &mpsc::UnboundedSender<Vec<u8>>,
-    order: ByteOrder,
+    out_order: &Arc<AtomicBool>,
 ) {
+    // A server may re-negotiate the connection byte order mid-stream with
+    // another SET_BYTE_ORDER control frame. pvxs latches
+    // `sendBE = header[2] & pva_flags::MSB` on every received SetEndian
+    // (conn.cpp:169-188) and uses it for all subsequent sends; old
+    // pvAccess accepts it from either peer at any time. Latch it here so
+    // every later outbound frame (echo response, ops, heartbeat) adopts
+    // the new order. The flag is read from the control frame's own header
+    // bit 7 (`frame.order()`), not the size field — pvAccessCPP/Java
+    // ignore the size field and assume the 0x00000000 ("use this order")
+    // behaviour.
+    if frame.header.command == ControlCommand::SetByteOrder.code() {
+        out_order.store(frame.order().is_big(), Ordering::Relaxed);
+        return;
+    }
     if frame.header.command == ControlCommand::EchoRequest.code() {
         // Server pinged us — bounce back. Direct unbounded send: no
         // scheduler hop, mirrors the CA `DirectServerWriter` pattern.
+        let order = if out_order.load(Ordering::Relaxed) {
+            ByteOrder::Big
+        } else {
+            ByteOrder::Little
+        };
         let resp = PvaHeader::control(
             false,
             order,
@@ -1927,6 +1986,84 @@ mod tests {
         assert!(
             rx.try_recv().is_ok(),
             "a big-endian CREATE_CHANNEL response must route to the CID peeked with the frame's own order"
+        );
+    }
+
+    /// Regression (client side): a server may re-negotiate the connection
+    /// byte order mid-stream with another SET_BYTE_ORDER control frame.
+    /// pvxs latches `sendBE = header[2] & pva_flags::MSB` on every received
+    /// SetEndian (conn.cpp:169-188) and uses it for all subsequent sends.
+    /// `handle_control_frame` is the single owner of that latch on the
+    /// client side: it updates the shared outbound-order cell on
+    /// SET_BYTE_ORDER, and every later outbound frame (here, the echo
+    /// response it emits) must adopt the new order. Drives two
+    /// SET_BYTE_ORDER frames (LE → BE → LE) and asserts both the latched
+    /// cell and the echo-response frame order follow each.
+    #[test]
+    fn handle_control_frame_latches_mid_stream_set_byte_order() {
+        let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        // Seeded little-endian (the handshake default).
+        let out_order = Arc::new(AtomicBool::new(false));
+
+        // Build an 8-byte control frame carrying `order` in its header.
+        let control = |cmd: u8, order: ByteOrder| Frame {
+            header: PvaHeader::control(true, order, cmd, 0),
+            payload: Vec::new(),
+        };
+        // Decode the byte order of the next frame the writer emitted.
+        let sent_order = |rx: &mut mpsc::UnboundedReceiver<Vec<u8>>| -> ByteOrder {
+            let bytes = rx.try_recv().expect("a response frame must be queued");
+            let hdr = PvaHeader::decode(&mut std::io::Cursor::new(&bytes[..]))
+                .expect("decode response header");
+            hdr.flags.byte_order()
+        };
+
+        // 1st SET_BYTE_ORDER: Big. Latch flips LE → BE.
+        handle_control_frame(
+            &control(ControlCommand::SetByteOrder.code(), ByteOrder::Big),
+            &writer_tx,
+            &out_order,
+        );
+        assert!(
+            out_order.load(Ordering::Relaxed),
+            "SET_BYTE_ORDER(Big) must latch the outbound order to Big"
+        );
+
+        // EchoRequest → response must use the latched Big order. The
+        // request's own header order is intentionally the OPPOSITE (Little)
+        // to prove the response order comes from the latch, not the request.
+        handle_control_frame(
+            &control(ControlCommand::EchoRequest.code(), ByteOrder::Little),
+            &writer_tx,
+            &out_order,
+        );
+        assert_eq!(
+            sent_order(&mut writer_rx),
+            ByteOrder::Big,
+            "echo response must adopt the latched Big order, not the request frame's order"
+        );
+
+        // 2nd SET_BYTE_ORDER: Little. Latch flips BE → LE.
+        handle_control_frame(
+            &control(ControlCommand::SetByteOrder.code(), ByteOrder::Little),
+            &writer_tx,
+            &out_order,
+        );
+        assert!(
+            !out_order.load(Ordering::Relaxed),
+            "a 2nd SET_BYTE_ORDER(Little) must re-latch the outbound order to Little"
+        );
+
+        // EchoRequest with an opposite (Big) request header → response Little.
+        handle_control_frame(
+            &control(ControlCommand::EchoRequest.code(), ByteOrder::Big),
+            &writer_tx,
+            &out_order,
+        );
+        assert_eq!(
+            sent_order(&mut writer_rx),
+            ByteOrder::Little,
+            "echo response must follow the re-latched Little order after the 2nd SET_BYTE_ORDER"
         );
     }
 

@@ -346,21 +346,21 @@ impl Record for BoRecord {
             "RBV" => Some(EpicsValue::Long(self.rbv)),
             "ORBV" => Some(EpicsValue::Long(self.orbv)),
             "MASK" => Some(EpicsValue::Long(self.mask)),
-            "ZNAM" => Some(EpicsValue::String(self.znam.clone())),
-            "ONAM" => Some(EpicsValue::String(self.onam.clone())),
+            "ZNAM" => Some(EpicsValue::String(self.znam.clone().into())),
+            "ONAM" => Some(EpicsValue::String(self.onam.clone().into())),
             "ZSV" => Some(EpicsValue::Short(self.zsv)),
             "OSV" => Some(EpicsValue::Short(self.osv)),
             "COSV" => Some(EpicsValue::Short(self.cosv)),
             "LALM" => Some(EpicsValue::Enum(self.lalm)),
             "MLST" => Some(EpicsValue::Enum(self.mlst)),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
-            "DOL" => Some(EpicsValue::String(self.dol.clone())),
+            "DOL" => Some(EpicsValue::String(self.dol.clone().into())),
             "HIGH" => Some(EpicsValue::Double(self.high)),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
             "IVOV" => Some(EpicsValue::Enum(self.ivov)),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
-            "SIML" => Some(EpicsValue::String(self.siml.clone())),
-            "SIOL" => Some(EpicsValue::String(self.siol.clone())),
+            "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
+            "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             _ => None,
         }
@@ -413,14 +413,14 @@ impl Record for BoRecord {
             },
             "ZNAM" => match value {
                 EpicsValue::String(v) => {
-                    self.znam = v;
+                    self.znam = v.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "ONAM" => match value {
                 EpicsValue::String(v) => {
-                    self.onam = v;
+                    self.onam = v.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -469,7 +469,7 @@ impl Record for BoRecord {
             },
             "DOL" => match value {
                 EpicsValue::String(v) => {
-                    self.dol = v;
+                    self.dol = v.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -504,14 +504,14 @@ impl Record for BoRecord {
             },
             "SIML" => match value {
                 EpicsValue::String(v) => {
-                    self.siml = v;
+                    self.siml = v.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "SIOL" => match value {
                 EpicsValue::String(v) => {
-                    self.siol = v;
+                    self.siol = v.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

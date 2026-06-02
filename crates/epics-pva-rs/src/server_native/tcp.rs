@@ -98,6 +98,7 @@ fn ack_at_from(ack_any: Option<&PvField>, queue_size: u32) -> u32 {
     if let Some(PvField::Scalar(sv)) = ack_any {
         match sv {
             ScalarValue::String(s) => {
+                let s = s.as_str_lossy();
                 if let Some(pct) = s.strip_suffix('%').filter(|p| !p.is_empty()) {
                     if let Ok(percent) = pct.trim().parse::<f64>() {
                         // pvxs `servermon.cpp:563` historically
@@ -204,7 +205,7 @@ fn pv_field_to_filter_event(
 /// `arr` filter needs the real array, not a scalar fallback).
 fn pv_value_leaf_to_epics(f: &PvField) -> Option<epics_base_rs::types::EpicsValue> {
     use crate::pvdata::ScalarValue;
-    use epics_base_rs::types::EpicsValue;
+    use epics_base_rs::types::{EpicsValue, PvString};
 
     fn scalar(sv: &ScalarValue) -> Option<EpicsValue> {
         Some(match sv {
@@ -275,7 +276,7 @@ fn pv_value_leaf_to_epics(f: &PvField) -> Option<epics_base_rs::types::EpicsValu
                     .iter()
                     .map(|s| match s {
                         ScalarValue::String(v) => v.clone(),
-                        _ => String::new(),
+                        _ => PvString::new(),
                     })
                     .collect(),
             ),
@@ -558,7 +559,7 @@ fn monitor_filter_chain_json(req: &PvField) -> Option<String> {
     };
     let json = opt_s.fields.iter().find_map(|(k, v)| {
         (k == "_filter").then_some(v).and_then(|v| match v {
-            PvField::Scalar(ScalarValue::String(s)) => Some(s.clone()),
+            PvField::Scalar(ScalarValue::String(s)) => Some(s.as_str_lossy().into_owned()),
             _ => None,
         })
     })?;
@@ -598,7 +599,9 @@ fn put_autoexec_from_request(req: Option<&PvField>) -> Option<bool> {
     };
     let raw = opt_s.fields.iter().find_map(|(k, v)| {
         (k == "autoExec").then_some(v).and_then(|v| match v {
-            PvField::Scalar(ScalarValue::String(s)) => Some(s.trim().to_ascii_lowercase()),
+            PvField::Scalar(ScalarValue::String(s)) => {
+                Some(s.as_str_lossy().trim().to_ascii_lowercase())
+            }
             _ => None,
         })
     })?;
@@ -684,7 +687,7 @@ fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
             (k == "pipeline").then_some(v).and_then(|v| match v {
                 PvField::Scalar(ScalarValue::Boolean(b)) => Some(*b),
                 PvField::Scalar(ScalarValue::String(s)) => Some(matches!(
-                    s.to_ascii_lowercase().as_str(),
+                    s.as_str_lossy().to_ascii_lowercase().as_str(),
                     "true" | "1" | "yes"
                 )),
                 PvField::Scalar(ScalarValue::Byte(i)) => Some(*i != 0),
@@ -711,7 +714,7 @@ fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
         .find_map(|(k, v)| (k == "queueSize").then_some(v));
     let queue_size_present = queue_size_field.is_some();
     let queue_size = queue_size_field.and_then(|v| match v {
-        PvField::Scalar(ScalarValue::String(s)) => s.parse::<u32>().ok(),
+        PvField::Scalar(ScalarValue::String(s)) => s.as_str_lossy().parse::<u32>().ok(),
         PvField::Scalar(ScalarValue::Byte(i)) => u32::try_from(*i).ok(),
         PvField::Scalar(ScalarValue::UByte(i)) => Some(u32::from(*i)),
         PvField::Scalar(ScalarValue::Short(i)) => u32::try_from(*i).ok(),
@@ -2198,10 +2201,10 @@ fn parse_client_credentials(
             for (name, field) in &s.fields {
                 match (name.as_str(), field) {
                     ("user", PvField::Scalar(crate::pvdata::ScalarValue::String(v))) => {
-                        creds.account = v.clone();
+                        creds.account = v.as_str_lossy().into_owned();
                     }
                     ("host", PvField::Scalar(crate::pvdata::ScalarValue::String(v))) => {
-                        creds.host = v.clone();
+                        creds.host = v.as_str_lossy().into_owned();
                     }
                     // A `groups`/`roles` field MAY be advertised here, but the
                     // server MUST NOT trust it (ACL bypass — see the `roles`

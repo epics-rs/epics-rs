@@ -510,7 +510,7 @@ fn format_nt_table(pv_name: &str, s: &PvStructure) -> Option<String> {
         .map(|(i, (name, cells))| {
             let label_len = labels
                 .get(i)
-                .map(|l| csv_escape(l).len())
+                .map(|l| csv_escape(l.as_bytes()).len())
                 .unwrap_or_else(|| name.len());
             cells.iter().map(String::len).fold(label_len, usize::max)
         })
@@ -547,7 +547,7 @@ fn format_nt_table(pv_name: &str, s: &PvStructure) -> Option<String> {
         columns.iter().enumerate().map(|(i, (name, _))| {
             labels
                 .get(i)
-                .map(|l| csv_escape(l))
+                .map(|l| csv_escape(l.as_bytes()))
                 .unwrap_or_else(|| (*name).to_string())
         }),
     );
@@ -581,17 +581,22 @@ fn write_table_row<I: Iterator<Item = String>>(out: &mut String, widths: &[usize
     out.push('\n');
 }
 
-/// Extract a scalar-array column as per-element strings, or `None` if the
-/// field is not a scalar array (the case printTable refuses).
-fn scalar_array_cells(field: &PvField) -> Option<Vec<String>> {
+/// Extract a scalar-array column as per-element raw bytes, or `None` if the
+/// field is not a scalar array (the case printTable refuses). Byte-valued
+/// so a non-UTF-8 string cell reaches [`csv_escape`] intact (pvxs escapes
+/// the original bytes, not a lossy text view); numeric cells are ASCII.
+fn scalar_array_cells(field: &PvField) -> Option<Vec<Vec<u8>>> {
+    let cell_bytes = |sv: &ScalarValue| -> Vec<u8> {
+        match sv {
+            ScalarValue::String(s) => s.as_bytes().to_vec(),
+            other => scalar_cell_text(other).into_bytes(),
+        }
+    };
     match field {
-        PvField::ScalarArray(items) => Some(items.iter().map(scalar_cell_text).collect()),
-        PvField::ScalarArrayTyped(arr) => Some(
-            arr.to_scalar_values()
-                .iter()
-                .map(scalar_cell_text)
-                .collect(),
-        ),
+        PvField::ScalarArray(items) => Some(items.iter().map(cell_bytes).collect()),
+        PvField::ScalarArrayTyped(arr) => {
+            Some(arr.to_scalar_values().iter().map(cell_bytes).collect())
+        }
         _ => None,
     }
 }
@@ -604,7 +609,7 @@ fn string_array_values(field: Option<&PvField>) -> Vec<String> {
         items
             .iter()
             .map(|sv| match sv {
-                ScalarValue::String(x) => x.clone(),
+                ScalarValue::String(x) => x.as_str_lossy().into_owned(),
                 other => other.to_string(),
             })
             .collect()
@@ -626,9 +631,9 @@ fn string_array_values(field: Option<&PvField>) -> Vec<String> {
 /// a non-ASCII UTF-8 byte becomes `\xHH`. Hex digits are emitted
 /// correctly as `{:02X}`; Base's `hexdigit` has an off-by-one that maps a
 /// nibble value of 9 to `@`, which this does not reproduce.
-fn csv_escape(s: &str) -> String {
+fn csv_escape(s: &[u8]) -> String {
     let mut esc = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
+    for &b in s {
         match b {
             0x07 => esc.push_str("\\a"),
             0x08 => esc.push_str("\\b"),
@@ -646,8 +651,8 @@ fn csv_escape(s: &str) -> String {
             }
         }
     }
-    if s.bytes()
-        .any(|b| b == b'"' || b == b' ' || b == b',' || b == b'\\')
+    if s.iter()
+        .any(|&b| b == b'"' || b == b' ' || b == b',' || b == b'\\')
     {
         format!("\"{esc}\"")
     } else {
@@ -742,7 +747,7 @@ fn structure_to_json(s: &PvStructure) -> String {
 
 fn scalar_to_json(v: &ScalarValue) -> String {
     match v {
-        ScalarValue::String(s) => json_string(s),
+        ScalarValue::String(s) => json_string(&s.as_str_lossy()),
         ScalarValue::Float(f) => {
             if f.fract() == 0.0 {
                 format!("{f:.1}")
@@ -790,7 +795,7 @@ fn enum_choice_for_index(choices: Option<&PvField>, index: usize) -> String {
             .unwrap_or_else(|| "<undefined>".to_string()),
         Some(PvField::ScalarArrayTyped(TypedScalarArray::String(items))) => items
             .get(index)
-            .map(|s| maybe_quote(s))
+            .map(|s| maybe_quote(s.as_bytes()))
             .unwrap_or_else(|| "<undefined>".to_string()),
         // No `choices`, or a non-string array (a malformed enum_t): Base's
         // `getSubField<PVStringArray>` would be null and `printEnumT`
@@ -806,7 +811,7 @@ fn enum_choice_for_index(choices: Option<&PvField>, index: usize) -> String {
 /// enum) falls back to its plain scalar text.
 fn enum_choice_text(v: &ScalarValue) -> String {
     match v {
-        ScalarValue::String(s) => maybe_quote(s),
+        ScalarValue::String(s) => maybe_quote(s.as_bytes()),
         other => scalar_cell_text(other),
     }
 }
@@ -953,7 +958,7 @@ fn format_scalar_array_inline(items: &[ScalarValue]) -> String {
 /// `precision(6)` (printer.cpp:428-440); other scalars print exact text.
 fn scalar_to_inline(v: &ScalarValue) -> String {
     match v {
-        ScalarValue::String(s) => maybe_quote(s),
+        ScalarValue::String(s) => maybe_quote(s.as_bytes()),
         ScalarValue::Double(f) => format_g(*f, 6),
         ScalarValue::Float(f) => format_g(*f as f64, 6),
         other => scalar_cell_text(other),
@@ -981,7 +986,7 @@ fn scalar_cell_text(v: &ScalarValue) -> String {
                 format!("{f}")
             }
         }
-        ScalarValue::String(s) => s.clone(),
+        ScalarValue::String(s) => s.as_str_lossy().into_owned(),
         ScalarValue::Boolean(b) => (if *b { "true" } else { "false" }).to_string(),
         other => format!("{other}"),
     }
@@ -995,8 +1000,8 @@ fn scalar_cell_text(v: &ScalarValue) -> String {
 /// (non-CSV) `escape` style, so a literal `"` becomes `\"` (printer.cpp:
 /// 485-516) — distinct from the CSV style [`csv_escape`] uses, where `"`
 /// is doubled.
-fn maybe_quote(s: &str) -> String {
-    let needs_quote = s.bytes().any(|b| {
+fn maybe_quote(s: &[u8]) -> String {
+    let needs_quote = s.iter().any(|&b| {
         matches!(
             b,
             0x07 | 0x08 | 0x0c | b'\n' | b'\r' | b'\t' | b' ' | 0x0b | b'\\' | b'\'' | b'"'
@@ -1005,7 +1010,9 @@ fn maybe_quote(s: &str) -> String {
     if needs_quote {
         format!("\"{}\"", escape_display(s))
     } else {
-        s.to_string()
+        // Not quoted ⟹ every byte is printable ASCII, so the lossy view is
+        // exact here (no replacement characters are introduced).
+        String::from_utf8_lossy(s).into_owned()
     }
 }
 
@@ -1016,9 +1023,9 @@ fn maybe_quote(s: &str) -> String {
 /// match Base's `isprint((unsigned char)C)`, so a non-ASCII UTF-8 byte
 /// becomes `\xHH`. Base's `hexdigit` off-by-one (nibble 9 → `@`) is not
 /// reproduced; correct `{:02X}` hex is emitted.
-fn escape_display(s: &str) -> String {
+fn escape_display(s: &[u8]) -> String {
     let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
+    for &b in s {
         match b {
             0x07 => out.push_str("\\a"),
             0x08 => out.push_str("\\b"),
@@ -1259,7 +1266,7 @@ fn pvxs_array(items: &[ScalarValue], limit: usize) -> String {
 fn pvxs_array_elem(v: &ScalarValue) -> String {
     match v {
         ScalarValue::Boolean(b) => (if *b { "1" } else { "0" }).to_string(),
-        ScalarValue::String(s) => format!("\"{}\"", escape_display(s)),
+        ScalarValue::String(s) => format!("\"{}\"", escape_display(s.as_bytes())),
         ScalarValue::Float(f) => format_g(*f as f64, 6),
         ScalarValue::Double(f) => format_g(*f, 6),
         // signed / unsigned integer types print as decimal via Display.
@@ -1334,7 +1341,7 @@ fn tree_show_value(out: &mut String, value: &PvField, fmt: &ValueFmt) {
             ScalarValue::Float(f) => out.push_str(&format_g(*f as f64, 6)),
             ScalarValue::Double(f) => out.push_str(&format_g(*f, 6)),
             ScalarValue::String(s) => {
-                let _ = write!(out, "\"{}\"", escape_display(s));
+                let _ = write!(out, "\"{}\"", escape_display(s.as_bytes()));
             }
             other => {
                 let _ = write!(out, "{other}");
@@ -1564,7 +1571,7 @@ fn delta_field(
     if let FieldDesc::Structure { struct_id, .. } = desc {
         if !struct_id.is_empty() {
             // Delta escapes the id (datafmt.cpp:27: `escape(val.id())`).
-            let _ = write!(out, " \"{}\"", escape_display(struct_id));
+            let _ = write!(out, " \"{}\"", escape_display(struct_id.as_bytes()));
         }
     }
     if fmt.show_value {
@@ -1662,7 +1669,7 @@ fn delta_show_value(out: &mut String, value: Option<&PvField>, fmt: &ValueFmt) {
                 let _ = write!(out, " = {}", if *b { "true" } else { "false" });
             }
             ScalarValue::String(s) => {
-                let _ = write!(out, " = \"{}\"", escape_display(s));
+                let _ = write!(out, " = \"{}\"", escape_display(s.as_bytes()));
             }
             other => {
                 let _ = write!(out, " = {other}");
@@ -1975,7 +1982,7 @@ mod tests {
     #[test]
     fn json_escapes_string_control_characters() {
         let raw = "line1\nline2\tx\r\0\"q\\z";
-        let v = PvField::Scalar(ScalarValue::String(raw.to_string()));
+        let v = PvField::Scalar(ScalarValue::String(raw.into()));
         let out = format_json("X", &v);
         let payload = json_payload(&out);
         let parsed: serde_json::Value = serde_json::from_str(payload).expect("must be strict JSON");
@@ -1989,8 +1996,8 @@ mod tests {
     #[test]
     fn json_escapes_string_array_elements() {
         let v = PvField::ScalarArray(vec![
-            ScalarValue::String("a\nb".to_string()),
-            ScalarValue::String("c\"d".to_string()),
+            ScalarValue::String("a\nb".into()),
+            ScalarValue::String("c\"d".into()),
         ]);
         let out = format_json("X", &v);
         let parsed: serde_json::Value =
@@ -2017,7 +2024,7 @@ mod tests {
                 PvField::ScalarArray(
                     labels
                         .iter()
-                        .map(|l| ScalarValue::String((*l).to_string()))
+                        .map(|l| ScalarValue::String((*l).into()))
                         .collect(),
                 ),
             );
@@ -2080,14 +2087,16 @@ mod tests {
     /// only when the original held `"`, space, `,`, or `\`.
     #[test]
     fn csv_escape_matches_base_rules() {
-        assert_eq!(csv_escape("plain"), "plain");
-        assert_eq!(csv_escape("a,b"), "\"a,b\"");
-        assert_eq!(csv_escape("a b"), "\"a b\"");
-        assert_eq!(csv_escape("he\"llo"), "\"he\"\"llo\"");
+        assert_eq!(csv_escape(b"plain"), "plain");
+        assert_eq!(csv_escape(b"a,b"), "\"a,b\"");
+        assert_eq!(csv_escape(b"a b"), "\"a b\"");
+        assert_eq!(csv_escape(b"he\"llo"), "\"he\"\"llo\"");
         // tab is escaped to \t, but no quote/space/comma/backslash → no wrap.
-        assert_eq!(csv_escape("tab\there"), "tab\\there");
+        assert_eq!(csv_escape(b"tab\there"), "tab\\there");
         // a non-printable byte (0x01) → \x01.
-        assert_eq!(csv_escape("\u{01}"), "\\x01");
+        assert_eq!(csv_escape(b"\x01"), "\\x01");
+        // a raw non-UTF-8 byte (0xFF) → \xFF (pvxs byte-wise, not U+FFFD).
+        assert_eq!(csv_escape(b"\xff"), "\\xFF");
     }
 
     /// A CSV-significant cell (comma) is quoted in the grid, and the
@@ -2118,14 +2127,16 @@ mod tests {
     /// (default style), not the CSV `""`.
     #[test]
     fn maybe_quote_matches_base_rules() {
-        assert_eq!(maybe_quote("plain"), "plain");
-        assert_eq!(maybe_quote("a b"), "\"a b\"");
-        assert_eq!(maybe_quote("a\tb"), "\"a\\tb\"");
-        assert_eq!(maybe_quote("a\nb"), "\"a\\nb\"");
-        assert_eq!(maybe_quote("a\"b"), "\"a\\\"b\"");
-        assert_eq!(maybe_quote("a\\b"), "\"a\\\\b\"");
-        assert_eq!(maybe_quote("a'b"), "\"a\\'b\"");
-        assert_eq!(maybe_quote("\u{01}"), "\"\\x01\"");
+        assert_eq!(maybe_quote(b"plain"), "plain");
+        assert_eq!(maybe_quote(b"a b"), "\"a b\"");
+        assert_eq!(maybe_quote(b"a\tb"), "\"a\\tb\"");
+        assert_eq!(maybe_quote(b"a\nb"), "\"a\\nb\"");
+        assert_eq!(maybe_quote(b"a\"b"), "\"a\\\"b\"");
+        assert_eq!(maybe_quote(b"a\\b"), "\"a\\\\b\"");
+        assert_eq!(maybe_quote(b"a'b"), "\"a\\'b\"");
+        assert_eq!(maybe_quote(b"\x01"), "\"\\x01\"");
+        // a raw non-UTF-8 byte (0xFF) → quoted "\xFF" (pvxs byte-wise).
+        assert_eq!(maybe_quote(b"\xff"), "\"\\xFF\"");
     }
 
     /// Inline/raw display of a string scalar applies `maybeQuote`: a value
@@ -2183,7 +2194,7 @@ mod tests {
         e.set(
             "choices",
             PvField::ScalarArrayTyped(TypedScalarArray::String(
-                vec!["OFF".to_string(), "ON".to_string()].into(),
+                ["OFF", "ON"].iter().map(|s| (*s).into()).collect(),
             )),
         );
         assert_eq!(format_enum_summary(&e), "(1) ON");

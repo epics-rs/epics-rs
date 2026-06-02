@@ -426,7 +426,7 @@ fn alarm_value(a: &NdAlarm) -> PvField {
         .push(("status".into(), PvField::Scalar(ScalarValue::Int(a.status))));
     s.fields.push((
         "message".into(),
-        PvField::Scalar(ScalarValue::String(a.message.clone())),
+        PvField::Scalar(ScalarValue::String(a.message.clone().into())),
     ));
     PvField::Structure(s)
 }
@@ -485,7 +485,7 @@ fn attribute_value(attrs: &[NdAttribute]) -> PvField {
                 let mut s = PvStructure::new("epics:nt/NTAttribute:1.0");
                 s.fields.push((
                     "name".into(),
-                    PvField::Scalar(ScalarValue::String(a.name.clone())),
+                    PvField::Scalar(ScalarValue::String(a.name.clone().into())),
                 ));
                 // The attribute `value` is the advertised `any` slot: emit
                 // the caller's variant verbatim so a scalar-array,
@@ -498,13 +498,13 @@ fn attribute_value(attrs: &[NdAttribute]) -> PvField {
                     PvField::ScalarArray(
                         a.tags
                             .iter()
-                            .map(|t| ScalarValue::String(t.clone()))
+                            .map(|t| ScalarValue::String(t.clone().into()))
                             .collect(),
                     ),
                 ));
                 s.fields.push((
                     "descriptor".into(),
-                    PvField::Scalar(ScalarValue::String(a.descriptor.clone())),
+                    PvField::Scalar(ScalarValue::String(a.descriptor.clone().into())),
                 ));
                 s.fields.push(("alarm".into(), alarm_value(&a.alarm)));
                 s.fields
@@ -515,7 +515,7 @@ fn attribute_value(attrs: &[NdAttribute]) -> PvField {
                 ));
                 s.fields.push((
                     "source".into(),
-                    PvField::Scalar(ScalarValue::String(a.source.clone())),
+                    PvField::Scalar(ScalarValue::String(a.source.clone().into())),
                 ));
                 Some(s)
             })
@@ -527,7 +527,7 @@ fn codec_value(c: &NdCodec) -> PvField {
     let mut s = PvStructure::new("codec_t");
     s.fields.push((
         "name".into(),
-        PvField::Scalar(ScalarValue::String(c.name.clone())),
+        PvField::Scalar(ScalarValue::String(c.name.clone().into())),
     ));
     let parameters = match &c.parameters {
         Some(v) => PvField::Variant(Box::new(v.clone())),

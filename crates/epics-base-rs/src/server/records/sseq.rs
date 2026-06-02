@@ -488,7 +488,7 @@ impl Record for SseqRecord {
             "VAL" => Some(EpicsValue::Long(self.val)),
             "SELM" => Some(EpicsValue::Short(self.selm)),
             "SELN" => Some(EpicsValue::Short(self.seln as i16)),
-            "SELL" => Some(EpicsValue::String(self.sell.clone())),
+            "SELL" => Some(EpicsValue::String(self.sell.clone().into())),
             "PREC" => Some(EpicsValue::Short(self.prec)),
             "ABORT" => Some(EpicsValue::Short(self.abort)),
             "BUSY" => Some(EpicsValue::Short(self.busy)),
@@ -497,10 +497,10 @@ impl Record for SseqRecord {
                     let step = &self.steps[idx];
                     return match prefix {
                         "DLY" => Some(EpicsValue::Double(step.dly)),
-                        "DOL" => Some(EpicsValue::String(step.dol.clone())),
+                        "DOL" => Some(EpicsValue::String(step.dol.clone().into())),
                         "DO" => Some(EpicsValue::Double(step.dov)),
-                        "LNK" => Some(EpicsValue::String(step.lnk.clone())),
-                        "STR" => Some(EpicsValue::String(step.str_val.clone())),
+                        "LNK" => Some(EpicsValue::String(step.lnk.clone().into())),
+                        "STR" => Some(EpicsValue::String(step.str_val.clone().into())),
                         "WAIT" => Some(EpicsValue::Short(step.wait)),
                         _ => None,
                     };
@@ -544,7 +544,7 @@ impl Record for SseqRecord {
             },
             "SELL" => match value {
                 EpicsValue::String(s) => {
-                    self.sell = s;
+                    self.sell = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SELL".into())),
@@ -575,7 +575,7 @@ impl Record for SseqRecord {
                         }
                         "DOL" => match value {
                             EpicsValue::String(s) => {
-                                step.dol = s;
+                                step.dol = s.as_str_lossy().into_owned();
                                 Ok(())
                             }
                             _ => Err(CaError::TypeMismatch(name.into())),
@@ -588,14 +588,14 @@ impl Record for SseqRecord {
                         }
                         "LNK" => match value {
                             EpicsValue::String(s) => {
-                                step.lnk = s;
+                                step.lnk = s.as_str_lossy().into_owned();
                                 Ok(())
                             }
                             _ => Err(CaError::TypeMismatch(name.into())),
                         },
                         "STR" => match value {
                             EpicsValue::String(s) => {
-                                step.str_val = s;
+                                step.str_val = s.as_str_lossy().into_owned();
                                 Ok(())
                             }
                             _ => Err(CaError::TypeMismatch(name.into())),

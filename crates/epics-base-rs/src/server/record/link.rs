@@ -248,7 +248,7 @@ impl ParsedLink {
             if let Ok(v) = s.parse::<f64>() {
                 Some(EpicsValue::Double(v))
             } else {
-                Some(EpicsValue::String(s.clone()))
+                Some(EpicsValue::String(s.clone().into()))
             }
         } else {
             None

@@ -24,6 +24,8 @@
 
 use std::io::Cursor;
 
+use epics_base_rs::types::PvString;
+
 use super::TypedScalarArray;
 use super::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, UnionItem, VariantValue};
 use crate::decode_err;
@@ -40,7 +42,7 @@ use crate::decode_err;
 /// - Boolean is encoded as 1-byte 0/1; we still use a tight loop
 ///   because Rust `bool` and wire `Boolean` have the same layout but
 ///   strict spec says only 0x00/0x01 are valid.
-/// - String falls back to per-element `encode_string_into`.
+/// - String falls back to per-element `encode_string_bytes_into`.
 #[inline]
 pub(crate) fn encode_typed_scalar_array(
     arr: &TypedScalarArray,
@@ -125,7 +127,7 @@ pub(crate) fn encode_typed_scalar_array(
         }),
         TypedScalarArray::String(a) => {
             for s in a.iter() {
-                encode_string_into(s, order, out);
+                encode_string_bytes_into(s.as_bytes(), order, out);
             }
         }
     }
@@ -241,9 +243,9 @@ pub(crate) fn decode_typed_scalar_array(
             })?)
         }
         ScalarType::String => {
-            let mut v: Vec<String> = Vec::with_capacity(safe_capacity(n, cur));
+            let mut v: Vec<PvString> = Vec::with_capacity(safe_capacity(n, cur));
             for _ in 0..n {
-                v.push(decode_string(cur, order)?.unwrap_or_default());
+                v.push(decode_string_value(cur, order)?.unwrap_or_default());
             }
             TypedScalarArray::String(v.into())
         }
@@ -330,8 +332,8 @@ where
     }
 }
 use crate::proto::{
-    ByteOrder, DecodeError, ReadExt, WriteExt, decode_size, decode_string, encode_size_into,
-    encode_string_into,
+    ByteOrder, DecodeError, ReadExt, WriteExt, decode_size, decode_string, decode_string_value,
+    encode_size_into, encode_string_bytes_into, encode_string_into,
 };
 
 const TAG_STRUCTURE: u8 = 0x80;
@@ -832,7 +834,7 @@ pub fn encode_scalar_value(v: &ScalarValue, order: ByteOrder, out: &mut Vec<u8>)
         ScalarValue::ULong(x) => out.put_u64(*x, order),
         ScalarValue::Float(x) => out.put_f32(*x, order),
         ScalarValue::Double(x) => out.put_f64(*x, order),
-        ScalarValue::String(s) => encode_string_into(s, order, out),
+        ScalarValue::String(s) => encode_string_bytes_into(s.as_bytes(), order, out),
     }
 }
 
@@ -853,7 +855,9 @@ pub fn decode_scalar_value(
         ScalarType::ULong => ScalarValue::ULong(cur.get_u64(order)?),
         ScalarType::Float => ScalarValue::Float(cur.get_f32(order)?),
         ScalarType::Double => ScalarValue::Double(cur.get_f64(order)?),
-        ScalarType::String => ScalarValue::String(decode_string(cur, order)?.unwrap_or_default()),
+        ScalarType::String => {
+            ScalarValue::String(decode_string_value(cur, order)?.unwrap_or_default())
+        }
     })
 }
 
@@ -1155,11 +1159,11 @@ fn coerce_scalar(v: &ScalarValue, st: ScalarType) -> ScalarValue {
         return v.clone();
     }
     if st == ScalarType::String {
-        return ScalarValue::String(scalar_to_string(v));
+        return ScalarValue::String(scalar_to_string(v).into());
     }
     if let ScalarValue::String(s) = v {
         // String → numeric: parse, falling back to the zero value.
-        return ScalarValue::parse(st, s).unwrap_or_else(|_| zero_scalar(st));
+        return ScalarValue::parse(st, &s.as_str_lossy()).unwrap_or_else(|_| zero_scalar(st));
     }
     // Numeric → numeric: route through f64 / i64 to preserve magnitude.
     let as_f64 = scalar_as_f64(v);
@@ -1175,7 +1179,7 @@ fn coerce_scalar(v: &ScalarValue, st: ScalarType) -> ScalarValue {
         ScalarType::ULong => ScalarValue::ULong(as_f64 as u64),
         ScalarType::Float => ScalarValue::Float(as_f64 as f32),
         ScalarType::Double => ScalarValue::Double(as_f64),
-        ScalarType::String => ScalarValue::String(scalar_to_string(v)),
+        ScalarType::String => ScalarValue::String(scalar_to_string(v).into()),
     }
 }
 
@@ -1200,7 +1204,7 @@ fn scalar_as_f64(v: &ScalarValue) -> f64 {
         ScalarValue::ULong(x) => *x as f64,
         ScalarValue::Float(x) => *x as f64,
         ScalarValue::Double(x) => *x,
-        ScalarValue::String(s) => s.trim().parse().unwrap_or(0.0),
+        ScalarValue::String(s) => s.as_str_lossy().trim().parse().unwrap_or(0.0),
     }
 }
 
@@ -2099,7 +2103,7 @@ fn zero_scalar(st: ScalarType) -> ScalarValue {
         ScalarType::ULong => ScalarValue::ULong(0),
         ScalarType::Float => ScalarValue::Float(0.0),
         ScalarType::Double => ScalarValue::Double(0.0),
-        ScalarType::String => ScalarValue::String(String::new()),
+        ScalarType::String => ScalarValue::String(PvString::new()),
     }
 }
 
@@ -3555,5 +3559,75 @@ mod tests {
             other => panic!("expected a structure, got {other:?}"),
         };
         assert!(s.get_field("a").is_some() && s.get_field("b").is_some());
+    }
+
+    /// PVA-89: a `ScalarValue::String` carrying non-UTF-8 bytes must
+    /// survive `encode_scalar_value` → `decode_scalar_value` byte-for-byte.
+    /// pvxs stores `std::string((char*)buf,len)` with no UTF-8 validation
+    /// (`pvaproto.h:403`); the Rust port preserves the raw bytes in
+    /// `PvString` so a gateway pass-through is lossless. Covers both
+    /// endianesses (the size prefix is the only endian-sensitive part).
+    #[test]
+    fn scalar_string_value_round_trips_non_utf8_losslessly() {
+        // 0xFF would be the null marker as a *size* byte, but here it is
+        // payload (the size prefix precedes it), so it must come back verbatim.
+        let raw = vec![0xff, 0x00, 0x80, b'h', b'i', 0xfe, 0xc3, 0x28];
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            let original = ScalarValue::String(PvString::from_bytes(raw.clone()));
+            let mut out = Vec::new();
+            encode_scalar_value(&original, order, &mut out);
+            let mut cur = Cursor::new(out.as_slice());
+            let decoded = decode_scalar_value(ScalarType::String, &mut cur, order).unwrap();
+            match &decoded {
+                ScalarValue::String(s) => assert_eq!(
+                    s.as_bytes(),
+                    raw.as_slice(),
+                    "scalar String value must round-trip raw bytes ({order:?})"
+                ),
+                other => panic!("expected String, got {other:?}"),
+            }
+            assert_eq!(original, decoded, "value equality preserved ({order:?})");
+        }
+    }
+
+    /// PVA-89: a `TypedScalarArray::String` element carrying non-UTF-8
+    /// bytes must survive `encode_typed_scalar_array` →
+    /// `decode_typed_scalar_array` byte-for-byte, including an empty
+    /// element (single `0x00` size byte) and a mixed UTF-8 element.
+    #[test]
+    fn string_array_value_round_trips_non_utf8_losslessly() {
+        let elems: Vec<PvString> = vec![
+            PvString::from_bytes(vec![0xff, 0xfe, 0x80]),
+            PvString::new(),
+            PvString::from_bytes("ascii".as_bytes().to_vec()),
+            PvString::from_bytes(vec![0xc3, 0x28, 0x00, b'z']),
+        ];
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            let arr = TypedScalarArray::String(elems.clone().into());
+            let mut out = Vec::new();
+            encode_typed_scalar_array(&arr, order, &mut out);
+            let mut cur = Cursor::new(out.as_slice());
+            let decoded =
+                decode_typed_scalar_array(ScalarType::String, elems.len(), &mut cur, order)
+                    .unwrap()
+                    .expect("String element type is covered by the typed fast path");
+            match decoded {
+                TypedScalarArray::String(got) => {
+                    assert_eq!(
+                        got.len(),
+                        elems.len(),
+                        "element count preserved ({order:?})"
+                    );
+                    for (i, (g, e)) in got.iter().zip(elems.iter()).enumerate() {
+                        assert_eq!(
+                            g.as_bytes(),
+                            e.as_bytes(),
+                            "String array element {i} must round-trip raw bytes ({order:?})"
+                        );
+                    }
+                }
+                other => panic!("expected String array, got {other:?}"),
+            }
+        }
     }
 }

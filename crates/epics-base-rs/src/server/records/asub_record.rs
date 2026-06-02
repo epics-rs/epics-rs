@@ -218,16 +218,16 @@ impl Record for ASubRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => return Some(EpicsValue::Double(self.val)),
-            "SNAM" => return Some(EpicsValue::String(self.snam.clone())),
-            "INAM" => return Some(EpicsValue::String(self.inam.clone())),
+            "SNAM" => return Some(EpicsValue::String(self.snam.clone().into())),
+            "INAM" => return Some(EpicsValue::String(self.inam.clone().into())),
             _ => {}
         }
         let (prefix, idx) = parse_channel(name)?;
         Some(match prefix {
             "" => self.a[idx].clone(), // input value A..U
-            "INP" => EpicsValue::String(self.inp[idx].clone()),
+            "INP" => EpicsValue::String(self.inp[idx].clone().into()),
             "VAL" => channel_get(&self.vala[idx]),
-            "OUT" => EpicsValue::String(self.out[idx].clone()),
+            "OUT" => EpicsValue::String(self.out[idx].clone().into()),
             "FT" => EpicsValue::Short(self.fta[idx]),
             "FTV" => EpicsValue::Short(self.ftva[idx]),
             "NO" => EpicsValue::Long(self.noa[idx]),
@@ -249,7 +249,7 @@ impl Record for ASubRecord {
             "SNAM" => {
                 return match value {
                     EpicsValue::String(s) => {
-                        self.snam = s;
+                        self.snam = s.as_str_lossy().into_owned();
                         Ok(())
                     }
                     _ => Err(CaError::TypeMismatch(name.into())),
@@ -258,7 +258,7 @@ impl Record for ASubRecord {
             "INAM" => {
                 return match value {
                     EpicsValue::String(s) => {
-                        self.inam = s;
+                        self.inam = s.as_str_lossy().into_owned();
                         Ok(())
                     }
                     _ => Err(CaError::TypeMismatch(name.into())),
@@ -276,7 +276,7 @@ impl Record for ASubRecord {
             }
             "INP" | "OUT" => {
                 let s = match value {
-                    EpicsValue::String(s) => s,
+                    EpicsValue::String(s) => s.as_str_lossy().into_owned(),
                     _ => return Err(CaError::TypeMismatch(name.into())),
                 };
                 if prefix == "INP" {

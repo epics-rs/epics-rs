@@ -165,7 +165,7 @@ fn dbr_boundary_values() {
 
 #[test]
 fn dbr_empty_string() {
-    let val = EpicsValue::String(String::new());
+    let val = EpicsValue::String(String::new().into());
     let bytes = val.to_bytes();
     let back = EpicsValue::from_bytes(DbFieldType::String, &bytes).unwrap();
     assert_eq!(back, val);
@@ -173,7 +173,7 @@ fn dbr_empty_string() {
 
 #[test]
 fn dbr_max_string() {
-    let val = EpicsValue::String("A".repeat(39));
+    let val = EpicsValue::String("A".repeat(39).into());
     let bytes = val.to_bytes();
     let back = EpicsValue::from_bytes(DbFieldType::String, &bytes).unwrap();
     assert_eq!(back, val);
@@ -384,7 +384,7 @@ fn autosave_parse_save_value_long() {
 fn autosave_parse_save_value_string() {
     use epics_base_rs::server::autosave::save_file::parse_save_value;
 
-    let template = EpicsValue::String(String::new());
+    let template = EpicsValue::String(String::new().into());
     let result = parse_save_value("hello world", &template);
     assert_eq!(result, Some(EpicsValue::String("hello world".into())));
 }

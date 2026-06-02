@@ -106,7 +106,7 @@ pub fn dbe_mask_from_pv_request(request: &PvStructure) -> Option<u16> {
     // PROPERTY / out-of-class bits are stripped here so they cannot
     // leak into the value subscription.
     let raw = match dbe {
-        PvField::Scalar(ScalarValue::String(s)) => s.clone(),
+        PvField::Scalar(ScalarValue::String(s)) => s.as_str_lossy().into_owned(),
         PvField::Scalar(ScalarValue::Int(n)) => {
             return Some(dbe_value_class_mask((*n as u32 & 0xFFFF) as u16));
         }
@@ -169,11 +169,13 @@ pub fn atomic_from_pv_request(request: &PvStructure) -> Option<bool> {
 
     match options.get_field("atomic")? {
         PvField::Scalar(ScalarValue::Boolean(b)) => Some(*b),
-        PvField::Scalar(ScalarValue::String(s)) => match s.to_ascii_lowercase().as_str() {
-            "true" => Some(true),
-            "false" => Some(false),
-            _ => None,
-        },
+        PvField::Scalar(ScalarValue::String(s)) => {
+            match s.as_str_lossy().to_ascii_lowercase().as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -201,7 +203,7 @@ fn process_mode_from_scalar(sv: &ScalarValue) -> ProcessMode {
         ScalarValue::UShort(n) => force(*n != 0),
         ScalarValue::UInt(n) => force(*n != 0),
         ScalarValue::ULong(n) => force(*n != 0),
-        ScalarValue::String(s) => match s.trim() {
+        ScalarValue::String(s) => match s.as_str_lossy().trim() {
             "true" => ProcessMode::Force,
             "false" => ProcessMode::Inhibit,
             // "passive" and any other string fall back to passive,
@@ -242,7 +244,7 @@ fn scalar_as_bool(sv: &ScalarValue) -> Option<bool> {
         ScalarValue::ULong(n) => Some(*n != 0),
         ScalarValue::Float(v) => Some(*v != 0.0),
         ScalarValue::Double(v) => Some(*v != 0.0),
-        ScalarValue::String(s) => match s.as_str() {
+        ScalarValue::String(s) => match s.as_str_lossy().as_ref() {
             "true" => Some(true),
             "false" => Some(false),
             _ => None,
@@ -586,7 +588,7 @@ impl BridgeChannel {
                 // the record then stores it.
                 other => EpicsValue::String(match crate::convert::epics_to_scalar(&other) {
                     ScalarValue::String(s) => s,
-                    sv => sv.to_string(),
+                    sv => sv.to_string().into(),
                 }),
             }
         } else {

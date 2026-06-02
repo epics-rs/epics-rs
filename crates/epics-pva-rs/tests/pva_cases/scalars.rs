@@ -10,6 +10,7 @@
 //! (captured from pvxs's own `to_wire` at run time, not derived by
 //! reading dataencode.cpp).
 
+use epics_base_rs::types::PvString;
 use epics_pva_rs::proto::ByteOrder;
 use epics_pva_rs::pvdata::encode::encode_pv_field;
 use epics_pva_rs::pvdata::{FieldDesc, PvField, ScalarType, ScalarValue};
@@ -263,7 +264,7 @@ fn golden_pvxs_scalar_double_le() {
 fn golden_pvxs_scalar_string_empty() {
     assert_eq!(
         encode(
-            PvField::Scalar(ScalarValue::String(String::new())),
+            PvField::Scalar(ScalarValue::String(PvString::new())),
             FieldDesc::Scalar(ScalarType::String),
             ByteOrder::Big,
         ),
@@ -277,7 +278,7 @@ fn golden_pvxs_scalar_string_253_last_single_byte_size() {
     let s = "x".repeat(253);
     assert_eq!(
         encode(
-            PvField::Scalar(ScalarValue::String(s)),
+            PvField::Scalar(ScalarValue::String(s.into())),
             FieldDesc::Scalar(ScalarType::String),
             ByteOrder::Big,
         ),
@@ -291,7 +292,7 @@ fn golden_pvxs_scalar_string_254_extended_size_be() {
     let s = "x".repeat(254);
     assert_eq!(
         encode(
-            PvField::Scalar(ScalarValue::String(s)),
+            PvField::Scalar(ScalarValue::String(s.into())),
             FieldDesc::Scalar(ScalarType::String),
             ByteOrder::Big,
         ),
@@ -355,7 +356,7 @@ fn golden_pvxs_scalar_string_utf8_korean() {
     assert_eq!(s.len(), 6, "test premise: 6 UTF-8 bytes");
     assert_eq!(
         encode(
-            PvField::Scalar(ScalarValue::String(s)),
+            PvField::Scalar(ScalarValue::String(s.into())),
             FieldDesc::Scalar(ScalarType::String),
             ByteOrder::Big,
         ),

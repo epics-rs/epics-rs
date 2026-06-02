@@ -1034,7 +1034,7 @@ async fn wire_subroutines(db: &PvDatabase, registry: &HashMap<String, Arc<Subrou
                 if let Some(crate::types::EpicsValue::String(snam)) =
                     instance.record.get_field("SNAM")
                 {
-                    if let Some(sub_fn) = registry.get(&snam) {
+                    if let Some(sub_fn) = registry.get(snam.as_str_lossy().as_ref()) {
                         instance.subroutine = Some(sub_fn.clone());
                     }
                 }

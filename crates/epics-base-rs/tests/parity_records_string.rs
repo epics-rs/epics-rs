@@ -101,7 +101,7 @@ fn h9_lso_process_olen_tracks_last_posted_length() {
 #[test]
 fn h10_stringin_stringout_truncate_at_40() {
     let mut si = StringinRecord::default();
-    si.put_field("VAL", EpicsValue::String("a".repeat(100)))
+    si.put_field("VAL", EpicsValue::String("a".repeat(100).into()))
         .unwrap();
     if let Some(EpicsValue::String(s)) = si.get_field("VAL") {
         assert_eq!(s.len(), 39);
@@ -110,7 +110,7 @@ fn h10_stringin_stringout_truncate_at_40() {
     }
 
     let mut so = StringoutRecord::default();
-    so.put_field("VAL", EpicsValue::String("b".repeat(60)))
+    so.put_field("VAL", EpicsValue::String("b".repeat(60).into()))
         .unwrap();
     if let Some(EpicsValue::String(s)) = so.get_field("VAL") {
         assert_eq!(s.len(), 39);
@@ -123,7 +123,7 @@ fn h10_stringin_stringout_truncate_at_40() {
 fn h10_lsi_dbr_string_put_capped_at_40_even_with_large_sizv() {
     let mut rec = LsiRecord::default(); // SIZV=256
     // A DBR_STRING-typed put (EpicsValue::String) is capped at 40.
-    rec.put_field("VAL", EpicsValue::String("c".repeat(100)))
+    rec.put_field("VAL", EpicsValue::String("c".repeat(100).into()))
         .unwrap();
     if let Some(EpicsValue::CharArray(bytes)) = rec.get_field("VAL") {
         assert_eq!(bytes.len(), 39, "DBR_STRING put capped at 40 (39+NUL)");

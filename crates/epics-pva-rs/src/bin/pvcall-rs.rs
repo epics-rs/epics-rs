@@ -76,7 +76,7 @@ fn parse_arg(arg: &str) -> Result<(String, ScalarValue), String> {
     let (k, v) = arg
         .split_once('=')
         .ok_or_else(|| format!("expected key=value, got {arg:?}"))?;
-    Ok((k.to_string(), ScalarValue::String(v.to_string())))
+    Ok((k.to_string(), ScalarValue::String(v.to_string().into())))
 }
 
 /// Parse all `field=value` tokens, rejecting a duplicate field name the
@@ -196,7 +196,11 @@ mod tests {
         ] {
             let (k, v) = parse_arg(raw).expect("valid key=value");
             assert_eq!(k, key);
-            assert_eq!(v, ScalarValue::String(want.to_string()), "for {raw:?}");
+            assert_eq!(
+                v,
+                ScalarValue::String(want.to_string().into()),
+                "for {raw:?}"
+            );
         }
     }
 
@@ -205,7 +209,10 @@ mod tests {
     /// pre-fix hand-rolled descriptor omitted `authority`.
     #[test]
     fn nturi_descriptor_includes_authority() {
-        let args = [("op".to_string(), ScalarValue::String("x".to_string()))];
+        let args = [(
+            "op".to_string(),
+            ScalarValue::String("x".to_string().into()),
+        )];
         let (desc, value) = build_nturi("svc", &args);
         let FieldDesc::Structure { struct_id, fields } = &desc else {
             panic!("expected NTURI structure descriptor");
@@ -227,8 +234,14 @@ mod tests {
     #[test]
     fn nturi_query_members_are_string_typed() {
         let args = [
-            ("gain".to_string(), ScalarValue::String("2".to_string())),
-            ("rate".to_string(), ScalarValue::String("2.5".to_string())),
+            (
+                "gain".to_string(),
+                ScalarValue::String("2".to_string().into()),
+            ),
+            (
+                "rate".to_string(),
+                ScalarValue::String("2.5".to_string().into()),
+            ),
         ];
         let (desc, _value) = build_nturi("svc", &args);
         let FieldDesc::Structure { fields, .. } = desc else {

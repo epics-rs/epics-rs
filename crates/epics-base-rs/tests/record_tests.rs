@@ -1229,7 +1229,7 @@ fn test_snapshot_stringin_no_metadata() {
     let inst = RecordInstance::new("SI:TEST".into(), rec);
 
     let snap = inst.snapshot_for_field("VAL").unwrap();
-    assert_eq!(snap.value, EpicsValue::String("hello".to_string()));
+    assert_eq!(snap.value, EpicsValue::String("hello".into()));
     assert!(snap.display.is_none());
     assert!(snap.control.is_none());
     assert!(snap.enums.is_none());

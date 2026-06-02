@@ -2,11 +2,12 @@ use crate::error::{CaError, CaResult};
 use std::fmt;
 
 use super::DbFieldType;
+use super::PvString;
 
 /// Runtime value from an EPICS PV
 #[derive(Debug, Clone, PartialEq)]
 pub enum EpicsValue {
-    String(String),
+    String(PvString),
     Short(i16),
     Float(f32),
     Enum(u16),
@@ -35,7 +36,7 @@ pub enum EpicsValue {
     /// per the DBR_STRING spec; the wire layout is `count * 40` bytes
     /// of NUL-padded strings. Used by `mbbo`/`mbbi` choice arrays
     /// (ZNAM..FFNAM as a single read), NTNDArray dim labels, etc.
-    StringArray(Vec<String>),
+    StringArray(Vec<PvString>),
 }
 
 impl fmt::Display for EpicsValue {
@@ -154,9 +155,11 @@ impl EpicsValue {
                     .iter()
                     .position(|&b| b == 0)
                     .unwrap_or(bounded.len());
-                let s = std::str::from_utf8(&bounded[..end])
-                    .map_err(|e| CaError::Protocol(format!("invalid UTF-8: {e}")))?;
-                Ok(Self::String(s.to_string()))
+                // Preserve the bytes verbatim — no UTF-8 validation. CA
+                // DBR_STRING fields are historically Latin-1 / arbitrary
+                // bytes and pvxs stores them raw, so rejecting non-UTF-8
+                // here would drop legal wire values.
+                Ok(Self::String(PvString::from_bytes(&bounded[..end])))
             }
             DbFieldType::Short => {
                 if data.len() < 2 {
@@ -472,9 +475,9 @@ impl EpicsValue {
                     }
                     let slot = &data[start..end];
                     let nul = slot.iter().position(|&b| b == 0).unwrap_or(slot.len());
-                    let s = std::str::from_utf8(&slot[..nul])
-                        .map_err(|e| CaError::Protocol(format!("invalid UTF-8: {e}")))?;
-                    arr.push(s.to_string());
+                    // Bytes preserved verbatim — see the scalar DBR_STRING
+                    // branch in `from_bytes`.
+                    arr.push(PvString::from_bytes(&slot[..nul]));
                 }
                 Ok(Self::StringArray(arr))
             }
@@ -624,7 +627,7 @@ impl EpicsValue {
                 }
                 DbFieldType::Char => EpicsValue::CharArray(nums.iter().map(|&v| v as u8).collect()),
                 DbFieldType::String => {
-                    EpicsValue::StringArray(nums.iter().map(|v| v.to_string()).collect())
+                    EpicsValue::StringArray(nums.iter().map(|v| v.to_string().into()).collect())
                 }
             };
         }
@@ -651,10 +654,9 @@ impl EpicsValue {
                 DbFieldType::UInt64 => {
                     EpicsValue::UInt64Array(bytes.iter().map(|&b| b as i8 as u64).collect())
                 }
-                // CharArray as text: decode the byte buffer as UTF-8.
-                DbFieldType::String => {
-                    EpicsValue::String(String::from_utf8_lossy(bytes).into_owned())
-                }
+                // CharArray as text: preserve the byte buffer verbatim
+                // (no UTF-8 validation), matching pvxs raw-byte storage.
+                DbFieldType::String => EpicsValue::String(PvString::from_bytes(bytes.clone())),
                 DbFieldType::Char => EpicsValue::CharArray(bytes.clone()),
             };
         }
@@ -662,14 +664,15 @@ impl EpicsValue {
         // Menu string resolution: when converting String to Short/Enum,
         // try resolve_menu_string first (e.g. "MINOR" -> 1).
         if let EpicsValue::String(s) = self {
+            let s = s.as_str_lossy();
             match target {
                 DbFieldType::Short => {
-                    if let Some(idx) = Self::resolve_menu_string(s) {
+                    if let Some(idx) = Self::resolve_menu_string(&s) {
                         return EpicsValue::Short(idx);
                     }
                 }
                 DbFieldType::Enum => {
-                    if let Some(idx) = Self::resolve_menu_string(s) {
+                    if let Some(idx) = Self::resolve_menu_string(&s) {
                         return EpicsValue::Enum(idx as u16);
                     }
                 }
@@ -677,7 +680,7 @@ impl EpicsValue {
             }
         }
         match target {
-            DbFieldType::String => EpicsValue::String(format!("{self}")),
+            DbFieldType::String => EpicsValue::String(format!("{self}").into()),
             DbFieldType::Short => EpicsValue::Short(self.to_f64().unwrap_or(0.0) as i16),
             DbFieldType::Float => EpicsValue::Float(self.to_f64().unwrap_or(0.0) as f32),
             DbFieldType::Enum => EpicsValue::Enum(self.to_f64().unwrap_or(0.0) as u16),
@@ -760,7 +763,7 @@ impl EpicsValue {
             // parse as `0.0`. Try integer auto-detect first so CA puts of
             // `"0x1A"` to a DBF_LONG field produce `26`, then fall back to
             // decimal float parse for normal numeric strings.
-            Self::String(s) => parse_string_to_f64(s),
+            Self::String(s) => parse_string_to_f64(&s.as_str_lossy()),
             _ => None,
         }
     }
@@ -841,7 +844,7 @@ impl EpicsValue {
         let s = s.trim();
         if s.is_empty() {
             return match dbr_type {
-                DbFieldType::String => Ok(Self::String(String::new())),
+                DbFieldType::String => Ok(Self::String(PvString::new())),
                 DbFieldType::Short => Ok(Self::Short(0)),
                 DbFieldType::Float => Ok(Self::Float(0.0)),
                 DbFieldType::Enum => Ok(Self::Enum(0)),
@@ -853,7 +856,7 @@ impl EpicsValue {
             };
         }
         match dbr_type {
-            DbFieldType::String => Ok(Self::String(s.to_string())),
+            DbFieldType::String => Ok(Self::String(s.into())),
             DbFieldType::Short => Self::parse_int(s)
                 .map(|v| Self::Short(v as i16))
                 .or_else(|_| {

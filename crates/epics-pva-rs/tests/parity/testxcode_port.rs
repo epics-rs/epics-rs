@@ -14,6 +14,8 @@ use epics_pva_rs::pvdata::encode::{
 };
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 
+use epics_base_rs::types::PvString;
+
 // ── String wire format (testDeserializeString) ─────────────────────
 
 #[test]
@@ -95,7 +97,7 @@ fn nt_scalar_uint32_value() -> PvField {
         .push(("status".into(), PvField::Scalar(ScalarValue::Int(0))));
     alarm.fields.push((
         "message".into(),
-        PvField::Scalar(ScalarValue::String(String::new())),
+        PvField::Scalar(ScalarValue::String(PvString::new())),
     ));
     s.fields.push(("alarm".into(), PvField::Structure(alarm)));
     let mut ts = PvStructure::new("time_t");
@@ -194,7 +196,7 @@ fn pvxs_serialize_valid_alarm_message_and_nanoseconds() {
                 if let PvField::Structure(alarm) = v {
                     for (n2, v2) in &mut alarm.fields {
                         if n2 == "message" {
-                            *v2 = PvField::Scalar(ScalarValue::String("hello world".to_string()));
+                            *v2 = PvField::Scalar(ScalarValue::String("hello world".into()));
                         }
                     }
                 }

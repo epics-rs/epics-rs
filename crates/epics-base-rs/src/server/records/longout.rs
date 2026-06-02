@@ -334,7 +334,7 @@ impl Record for LongoutRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Long(self.val)),
-            "EGU" => Some(EpicsValue::String(self.egu.clone())),
+            "EGU" => Some(EpicsValue::String(self.egu.clone().into())),
             "HOPR" => Some(EpicsValue::Long(self.hopr)),
             "LOPR" => Some(EpicsValue::Long(self.lopr)),
             "DRVH" => Some(EpicsValue::Long(self.drvh)),
@@ -356,10 +356,10 @@ impl Record for LongoutRecord {
             "ALST" => Some(EpicsValue::Double(self.alst)),
             "MLST" => Some(EpicsValue::Double(self.mlst)),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
-            "DOL" => Some(EpicsValue::String(self.dol.clone())),
+            "DOL" => Some(EpicsValue::String(self.dol.clone().into())),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
-            "SIML" => Some(EpicsValue::String(self.siml.clone())),
-            "SIOL" => Some(EpicsValue::String(self.siol.clone())),
+            "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
+            "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             "OOPT" => Some(EpicsValue::Short(self.oopt)),
             "PVAL" => Some(EpicsValue::Long(self.pval)),
@@ -378,7 +378,7 @@ impl Record for LongoutRecord {
             }
             "EGU" => {
                 if let EpicsValue::String(v) = value {
-                    self.egu = v;
+                    self.egu = v.as_str_lossy().into_owned();
                 }
             }
             "HOPR" => {
@@ -488,7 +488,7 @@ impl Record for LongoutRecord {
             }
             "DOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.dol = v;
+                    self.dol = v.as_str_lossy().into_owned();
                 }
             }
             "SIMM" => {
@@ -498,12 +498,12 @@ impl Record for LongoutRecord {
             }
             "SIML" => {
                 if let EpicsValue::String(v) = value {
-                    self.siml = v;
+                    self.siml = v.as_str_lossy().into_owned();
                 }
             }
             "SIOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.siol = v;
+                    self.siol = v.as_str_lossy().into_owned();
                 }
             }
             "SIMS" => {

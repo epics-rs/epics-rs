@@ -138,15 +138,15 @@ impl Record for StringoutRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL" => Some(EpicsValue::String(self.val.clone())),
-            "OVAL" => Some(EpicsValue::String(self.oval.clone())),
+            "VAL" => Some(EpicsValue::String(self.val.clone().into())),
+            "OVAL" => Some(EpicsValue::String(self.oval.clone().into())),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
-            "IVOV" => Some(EpicsValue::String(self.ivov.clone())),
+            "IVOV" => Some(EpicsValue::String(self.ivov.clone().into())),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
-            "DOL" => Some(EpicsValue::String(self.dol.clone())),
+            "DOL" => Some(EpicsValue::String(self.dol.clone().into())),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
-            "SIML" => Some(EpicsValue::String(self.siml.clone())),
-            "SIOL" => Some(EpicsValue::String(self.siol.clone())),
+            "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
+            "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             _ => None,
         }
@@ -157,14 +157,14 @@ impl Record for StringoutRecord {
             // C truncates VAL/OVAL/IVOV copies at MAX_STRING_SIZE (40).
             "VAL" => match value {
                 EpicsValue::String(s) => {
-                    self.val = truncate_string(&s);
+                    self.val = truncate_string(&s.as_str_lossy());
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("VAL".into())),
             },
             "OVAL" => match value {
                 EpicsValue::String(s) => {
-                    self.oval = truncate_string(&s);
+                    self.oval = truncate_string(&s.as_str_lossy());
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("OVAL".into())),
@@ -178,7 +178,7 @@ impl Record for StringoutRecord {
             },
             "IVOV" => match value {
                 EpicsValue::String(s) => {
-                    self.ivov = truncate_string(&s);
+                    self.ivov = truncate_string(&s.as_str_lossy());
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("IVOV".into())),
@@ -192,7 +192,7 @@ impl Record for StringoutRecord {
             },
             "DOL" => match value {
                 EpicsValue::String(s) => {
-                    self.dol = s;
+                    self.dol = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("DOL".into())),
@@ -206,14 +206,14 @@ impl Record for StringoutRecord {
             },
             "SIML" => match value {
                 EpicsValue::String(s) => {
-                    self.siml = s;
+                    self.siml = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SIML".into())),
             },
             "SIOL" => match value {
                 EpicsValue::String(s) => {
-                    self.siol = s;
+                    self.siol = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SIOL".into())),
@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn val_truncated_to_max_string_size() {
         let mut rec = StringoutRecord::default();
-        rec.put_field("VAL", EpicsValue::String("z".repeat(80)))
+        rec.put_field("VAL", EpicsValue::String("z".repeat(80).into()))
             .unwrap();
         assert_eq!(rec.val.len(), 39);
     }

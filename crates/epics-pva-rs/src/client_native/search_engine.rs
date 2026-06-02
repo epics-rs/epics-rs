@@ -2107,14 +2107,18 @@ fn handle_beacon(
     };
     // pvxs decodes the BEACON protocol with `from_wire(M, beaconMsg.proto)`
     // and only invokes the beacon callbacks when the decode buffer is
-    // still good afterward (udp_collector.cpp:464-488). A truncated or
-    // invalid-UTF8 protocol string leaves the buffer bad — that is a
-    // malformed BEACON and must be dropped, NOT coerced to a fabricated
-    // `"tcp"` that enters the tracker and fires a false
-    // `Discovered::Online`. Map the decode outcome to pvxs's `M.good()`:
-    // a decode error drops the beacon; a successfully decoded string
-    // (including the empty/null-marker case, where the buffer stays
-    // good) proceeds with the decoded value verbatim.
+    // still good afterward (udp_collector.cpp:478-488). pvxs's
+    // `from_wire(Buffer&, std::string&)` faults the buffer ONLY when the
+    // claimed length runs past the datagram (`!buf.ensure(len)`,
+    // pvaproto.h:399-400); it copies the bytes verbatim with no UTF-8
+    // validation otherwise (pvaproto.h:403). So a *truncated* protocol
+    // string is the malformed case that must drop the beacon, whereas an
+    // *invalid-UTF8 but length-complete* string is well-formed — pvxs
+    // keeps M good and `onBeacon` announces it (the tracker keys on
+    // (server, proto) with no `proto=="tcp"` filter, client.cpp:780).
+    // `decode_string` mirrors this exactly: a short read is `Err` (drop);
+    // a complete run decodes lossily (label path, PVA-89) and proceeds.
+    // The empty/null-marker case stays good and decodes to "".
     let proto = match decode_string(&mut cur, order) {
         Ok(Some(p)) => p,
         Ok(None) => String::new(),
@@ -3186,13 +3190,21 @@ mod tests {
         );
     }
 
-    /// PVA-RS-2026-05-28-128: a BEACON whose protocol string fails to
-    /// decode (truncated, or invalid UTF-8) is malformed and must be
-    /// dropped — it must NOT enter the beacon tracker, announce the
-    /// server, or emit `Discovered::Online`. pvxs only invokes beacon
-    /// callbacks when the buffer is still good after the protocol decode
-    /// (udp_collector.cpp:464-488). The pre-fix code coerced any decode
+    /// A BEACON whose protocol string is *truncated* (claimed length runs
+    /// past the datagram) is malformed and must be dropped — it must NOT
+    /// enter the beacon tracker, announce the server, or emit
+    /// `Discovered::Online`. pvxs faults the decode buffer only on that
+    /// truncation (`!buf.ensure(len)`, pvaproto.h:399-400) and invokes the
+    /// beacon callbacks only while the buffer is good
+    /// (udp_collector.cpp:478-488). The pre-fix code coerced any decode
     /// failure to a fabricated `"tcp"` protocol and proceeded.
+    ///
+    /// An *invalid-UTF8 but length-complete* protocol string is, by
+    /// contrast, well-formed on the wire: pvxs copies the raw bytes with no
+    /// UTF-8 validation (pvaproto.h:403), the buffer stays good, and the
+    /// beacon announces (the tracker keys on (server, proto) with no
+    /// `proto=="tcp"` filter, client.cpp:780). PVA-89 made `decode_string`
+    /// lossy to match, so this case must announce — not drop.
     #[test]
     fn malformed_beacon_protocol_is_dropped() {
         use crate::proto::{WriteExt, encode_size_into, encode_string_into};
@@ -3242,14 +3254,24 @@ mod tests {
         assert!(!online, "truncated-protocol BEACON must not announce");
         assert!(!tracked, "truncated-protocol BEACON must be dropped");
 
-        // Invalid UTF-8 protocol payload (0xC3 0x28 is not valid UTF-8).
+        // Invalid UTF-8 protocol payload (0xC3 0x28 is not valid UTF-8) but
+        // length-complete: pvxs copies the raw bytes (pvaproto.h:403), the
+        // buffer stays good, and onBeacon announces with no "tcp" filter
+        // (client.cpp:780). PVA-89's lossy `decode_string` matches — the
+        // beacon must announce and enter the tracker, NOT be dropped.
         let bad_utf8 = build_beacon(&|p| {
             encode_size_into(2, order, p);
             p.extend_from_slice(&[0xC3, 0x28]);
         });
         let (online, tracked) = run(&bad_utf8);
-        assert!(!online, "invalid-UTF8-protocol BEACON must not announce");
-        assert!(!tracked, "invalid-UTF8-protocol BEACON must be dropped");
+        assert!(
+            online,
+            "length-complete invalid-UTF8-protocol BEACON must announce (pvxs parity)"
+        );
+        assert!(
+            tracked,
+            "length-complete invalid-UTF8-protocol BEACON must enter the tracker"
+        );
     }
 
     /// pvxs `Channel::disconnect` (client.cpp:213) parity: a

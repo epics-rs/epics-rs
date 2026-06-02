@@ -146,7 +146,7 @@ fn gated(severity: AlarmSeverity, limit: f64) -> f64 {
 fn parse_alarm_severity(value: &EpicsValue) -> AlarmSeverity {
     match value {
         EpicsValue::Short(v) => AlarmSeverity::from_u16(*v as u16),
-        EpicsValue::String(s) => AlarmSeverity::from_u16(match s.as_str() {
+        EpicsValue::String(s) => AlarmSeverity::from_u16(match s.as_str_lossy().as_ref() {
             "NO_ALARM" => 0,
             "MINOR" => 1,
             "MAJOR" => 2,
@@ -528,7 +528,7 @@ impl RecordInstance {
                     .unwrap_or(0.0);
                 let (hihi, high, low, lolo) = self.alarm_limits();
                 snap.display = Some(super::super::snapshot::DisplayInfo {
-                    units: egu,
+                    units: egu.as_str_lossy().into_owned(),
                     precision: prec,
                     upper_disp_limit: hopr,
                     lower_disp_limit: lopr,
@@ -569,7 +569,7 @@ impl RecordInstance {
                     _ => self.alarm_limits(),
                 };
                 snap.display = Some(super::super::snapshot::DisplayInfo {
-                    units: egu,
+                    units: egu.as_str_lossy().into_owned(),
                     precision: 0,
                     upper_disp_limit: hopr,
                     lower_disp_limit: lopr,
@@ -610,7 +610,7 @@ impl RecordInstance {
                     .and_then(|v| v.to_f64())
                     .unwrap_or(0.0);
                 snap.display = Some(super::super::snapshot::DisplayInfo {
-                    units: egu,
+                    units: egu.as_str_lossy().into_owned(),
                     precision: prec,
                     upper_disp_limit: hopr,
                     lower_disp_limit: lopr,
@@ -651,7 +651,7 @@ impl RecordInstance {
                     .and_then(|v| v.to_f64())
                     .unwrap_or(0.0);
                 snap.display = Some(super::super::snapshot::DisplayInfo {
-                    units: egu,
+                    units: egu.as_str_lossy().into_owned(),
                     precision: prec,
                     upper_disp_limit: hopr,
                     lower_disp_limit: lopr,
@@ -690,7 +690,7 @@ impl RecordInstance {
                     .and_then(|v| v.to_f64())
                     .unwrap_or(0.0);
                 snap.display = Some(super::super::snapshot::DisplayInfo {
-                    units: egu,
+                    units: egu.as_str_lossy().into_owned(),
                     precision: prec,
                     upper_disp_limit: hlm,
                     lower_disp_limit: llm,
@@ -827,7 +827,10 @@ impl RecordInstance {
                     })
                     .unwrap_or_default();
                 let no_str_1 = !znam.is_empty() && onam.is_empty();
-                let mut strings = vec![znam, onam];
+                let mut strings = vec![
+                    znam.as_str_lossy().into_owned(),
+                    onam.as_str_lossy().into_owned(),
+                ];
                 if no_str_1 {
                     strings.truncate(1);
                 }
@@ -851,6 +854,7 @@ impl RecordInstance {
                                     None
                                 }
                             })
+                            .map(|s| s.as_str_lossy().into_owned())
                             .unwrap_or_default()
                     })
                     .collect();
@@ -934,8 +938,8 @@ impl RecordInstance {
             "NSEV" => Some(EpicsValue::Short(self.common.nsev as i16)),
             "NSTA" => Some(EpicsValue::Short(self.common.nsta as i16)),
             // epics-base PR #568 / #566 — alarm message string.
-            "AMSG" => Some(EpicsValue::String(self.common.amsg.clone())),
-            "NAMSG" => Some(EpicsValue::String(self.common.namsg.clone())),
+            "AMSG" => Some(EpicsValue::String(self.common.amsg.clone().into())),
+            "NAMSG" => Some(EpicsValue::String(self.common.namsg.clone().into())),
             "ACKS" => Some(EpicsValue::Short(self.common.acks as i16)),
             "ACKT" => Some(EpicsValue::Char(if self.common.ackt { 1 } else { 0 })),
             "UDF" => Some(EpicsValue::Char(if self.common.udf { 1 } else { 0 })),
@@ -945,24 +949,24 @@ impl RecordInstance {
             "PINI" => Some(EpicsValue::Char(if self.common.pini { 1 } else { 0 })),
             "TPRO" => Some(EpicsValue::Char(if self.common.tpro { 1 } else { 0 })),
             "BKPT" => Some(EpicsValue::Char(self.common.bkpt)),
-            "FLNK" => Some(EpicsValue::String(self.common.flnk.clone())),
-            "INP" => Some(EpicsValue::String(self.common.inp.clone())),
-            "OUT" => Some(EpicsValue::String(self.common.out.clone())),
-            "DTYP" => Some(EpicsValue::String(self.common.dtyp.clone())),
+            "FLNK" => Some(EpicsValue::String(self.common.flnk.clone().into())),
+            "INP" => Some(EpicsValue::String(self.common.inp.clone().into())),
+            "OUT" => Some(EpicsValue::String(self.common.out.clone().into())),
+            "DTYP" => Some(EpicsValue::String(self.common.dtyp.clone().into())),
             "TSE" => Some(EpicsValue::Short(self.common.tse)),
-            "TSEL" => Some(EpicsValue::String(self.common.tsel.clone())),
+            "TSEL" => Some(EpicsValue::String(self.common.tsel.clone().into())),
             // C `UTAG` is DBF_UINT64 — exposed natively as the unsigned
             // 64-bit value variant so values above i64::MAX round-trip.
             "UTAG" => Some(EpicsValue::UInt64(self.common.utag)),
-            "ASG" => Some(EpicsValue::String(self.common.asg.clone())),
+            "ASG" => Some(EpicsValue::String(self.common.asg.clone().into())),
             "ASL" => Some(EpicsValue::Char(self.common.asl)),
-            "DESC" => Some(EpicsValue::String(self.common.desc.clone())),
+            "DESC" => Some(EpicsValue::String(self.common.desc.clone().into())),
             "PHAS" => Some(EpicsValue::Short(self.common.phas)),
-            "EVNT" => Some(EpicsValue::String(self.common.evnt.clone())),
+            "EVNT" => Some(EpicsValue::String(self.common.evnt.clone().into())),
             "PRIO" => Some(EpicsValue::Short(self.common.prio)),
             "DISV" => Some(EpicsValue::Short(self.common.disv)),
             "DISA" => Some(EpicsValue::Short(self.common.disa)),
-            "SDIS" => Some(EpicsValue::String(self.common.sdis.clone())),
+            "SDIS" => Some(EpicsValue::String(self.common.sdis.clone().into())),
             "DISS" => Some(EpicsValue::Short(self.common.diss as i16)),
             "HYST" => Some(EpicsValue::Double(self.common.hyst)),
             "LCNT" => Some(EpicsValue::Short(self.common.lcnt)),
@@ -1021,7 +1025,7 @@ impl RecordInstance {
             // swait OUTN is aliased to common.out
             "OUTN" => {
                 if self.record.record_type() == "swait" {
-                    Some(EpicsValue::String(self.common.out.clone()))
+                    Some(EpicsValue::String(self.common.out.clone().into()))
                 } else {
                     None
                 }
@@ -1062,12 +1066,12 @@ impl RecordInstance {
             }
             "AMSG" => {
                 if let EpicsValue::String(s) = value {
-                    self.common.amsg = s;
+                    self.common.amsg = s.as_str_lossy().into_owned();
                 }
             }
             "NAMSG" => {
                 if let EpicsValue::String(s) = value {
-                    self.common.namsg = s;
+                    self.common.namsg = s.as_str_lossy().into_owned();
                 }
             }
             "ACKS" => {
@@ -1120,7 +1124,7 @@ impl RecordInstance {
                 let new_scan = match &value {
                     EpicsValue::Short(v) => ScanType::from_u16(*v as u16),
                     EpicsValue::Enum(v) => ScanType::from_u16(*v),
-                    EpicsValue::String(s) => ScanType::from_str(s)?,
+                    EpicsValue::String(s) => ScanType::from_str(s.as_str_lossy().as_ref())?,
                     _ => return Ok(CommonFieldPutResult::NoChange),
                 };
                 self.common.scan = new_scan;
@@ -1139,7 +1143,7 @@ impl RecordInstance {
                 let new_sscn = match &value {
                     EpicsValue::Short(v) => ScanType::from_u16(*v as u16),
                     EpicsValue::Enum(v) => ScanType::from_u16(*v),
-                    EpicsValue::String(s) => ScanType::from_str(s)?,
+                    EpicsValue::String(s) => ScanType::from_str(s.as_str_lossy().as_ref())?,
                     _ => return Ok(CommonFieldPutResult::NoChange),
                 };
                 self.common.sscn = new_sscn;
@@ -1163,18 +1167,19 @@ impl RecordInstance {
             }
             "FLNK" => {
                 if let EpicsValue::String(s) = value {
-                    self.common.flnk = s;
+                    self.common.flnk = s.as_str_lossy().into_owned();
                     self.parsed_flnk = parse_link_v2(&self.common.flnk);
                 }
             }
             "INP" => {
                 if let EpicsValue::String(s) = value {
-                    self.common.inp = s;
+                    self.common.inp = s.as_str_lossy().into_owned();
                     self.parsed_inp = parse_link_v2(&self.common.inp);
                 }
             }
             "OUT" => {
                 if let EpicsValue::String(s) = value {
+                    let s = s.as_str_lossy();
                     // C parity (acd1aef): CP/CPP modifiers on output links are
                     // meaningless (they request "process on change" semantics
                     // that only apply to input links). dbParseLink in C strips
@@ -1189,7 +1194,7 @@ impl RecordInstance {
                             "CP/CPP modifier ignored on output link"
                         );
                     }
-                    self.common.out = s;
+                    self.common.out = s.into_owned();
                     // C `dbDbPutValue` (dbDbLink.c:386-389): an OUT
                     // link processes its target only on an explicit
                     // ` PP` token (or a `.PROC` destination). A bare
@@ -1208,7 +1213,7 @@ impl RecordInstance {
             }
             "DTYP" => {
                 if let EpicsValue::String(s) = value {
-                    self.common.dtyp = s;
+                    self.common.dtyp = s.as_str_lossy().into_owned();
                 }
             }
             "TSE" => {
@@ -1218,7 +1223,7 @@ impl RecordInstance {
             }
             "TSEL" => {
                 if let EpicsValue::String(s) = value {
-                    self.common.tsel = s;
+                    self.common.tsel = s.as_str_lossy().into_owned();
                     self.parsed_tsel = parse_link_v2(&self.common.tsel);
                 }
             }
@@ -1237,7 +1242,7 @@ impl RecordInstance {
             }
             "ASG" => {
                 if let EpicsValue::String(s) = value {
-                    self.common.asg = s;
+                    self.common.asg = s.as_str_lossy().into_owned();
                 }
             }
             "ASL" => {
@@ -1253,14 +1258,14 @@ impl RecordInstance {
                     EpicsValue::Short(v) => v as i64,
                     EpicsValue::Long(v) => v as i64,
                     EpicsValue::Int64(v) => v,
-                    EpicsValue::String(s) => s.trim().parse().unwrap_or(0),
+                    EpicsValue::String(s) => s.as_str_lossy().trim().parse().unwrap_or(0),
                     _ => return Ok(CommonFieldPutResult::NoChange),
                 };
                 self.common.asl = if n != 0 { 1 } else { 0 };
             }
             "DESC" => {
                 if let EpicsValue::String(s) = value {
-                    self.common.desc = s;
+                    self.common.desc = s.as_str_lossy().into_owned();
                 }
             }
             "PHAS" => {
@@ -1285,7 +1290,7 @@ impl RecordInstance {
                 // backward compatibility (numeric events / a calc
                 // record driving EVNT) by formatting it as a string.
                 match value {
-                    EpicsValue::String(s) => self.common.evnt = s,
+                    EpicsValue::String(s) => self.common.evnt = s.as_str_lossy().into_owned(),
                     EpicsValue::Short(v) => self.common.evnt = v.to_string(),
                     EpicsValue::Long(v) => self.common.evnt = v.to_string(),
                     EpicsValue::Enum(v) => self.common.evnt = v.to_string(),
@@ -1314,7 +1319,7 @@ impl RecordInstance {
             }
             "SDIS" => {
                 if let EpicsValue::String(s) = value {
-                    self.common.sdis = s;
+                    self.common.sdis = s.as_str_lossy().into_owned();
                     self.parsed_sdis = parse_link_v2(&self.common.sdis);
                 }
             }
@@ -1351,7 +1356,7 @@ impl RecordInstance {
                 if let Some(a) = &mut self.common.analog_alarm {
                     if let Some(v) = value.to_f64().or_else(|| {
                         if let EpicsValue::String(s) = &value {
-                            s.parse::<f64>().ok()
+                            s.as_str_lossy().parse::<f64>().ok()
                         } else {
                             None
                         }
@@ -1364,7 +1369,7 @@ impl RecordInstance {
                 if let Some(a) = &mut self.common.analog_alarm {
                     if let Some(v) = value.to_f64().or_else(|| {
                         if let EpicsValue::String(s) = &value {
-                            s.parse::<f64>().ok()
+                            s.as_str_lossy().parse::<f64>().ok()
                         } else {
                             None
                         }
@@ -1377,7 +1382,7 @@ impl RecordInstance {
                 if let Some(a) = &mut self.common.analog_alarm {
                     if let Some(v) = value.to_f64().or_else(|| {
                         if let EpicsValue::String(s) = &value {
-                            s.parse::<f64>().ok()
+                            s.as_str_lossy().parse::<f64>().ok()
                         } else {
                             None
                         }
@@ -1390,7 +1395,7 @@ impl RecordInstance {
                 if let Some(a) = &mut self.common.analog_alarm {
                     if let Some(v) = value.to_f64().or_else(|| {
                         if let EpicsValue::String(s) = &value {
-                            s.parse::<f64>().ok()
+                            s.as_str_lossy().parse::<f64>().ok()
                         } else {
                             None
                         }
@@ -1424,7 +1429,7 @@ impl RecordInstance {
             "OUTN" => {
                 if self.record.record_type() == "swait" {
                     if let EpicsValue::String(s) = value {
-                        self.common.out = s;
+                        self.common.out = s.as_str_lossy().into_owned();
                         // Bare OUT link is NPP — see the "OUT" arm.
                         self.parsed_out = parse_output_link_v2(&self.common.out);
                     }
@@ -1440,8 +1445,10 @@ impl RecordInstance {
     /// Get virtual fields (NAME, RTYP).
     pub fn get_virtual_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "NAME" => Some(EpicsValue::String(self.name.clone())),
-            "RTYP" => Some(EpicsValue::String(self.record.record_type().to_string())),
+            "NAME" => Some(EpicsValue::String(self.name.clone().into())),
+            "RTYP" => Some(EpicsValue::String(
+                self.record.record_type().to_string().into(),
+            )),
             _ => None,
         }
     }
@@ -2657,7 +2664,7 @@ mod metadata_cache_tests {
         fn get_field(&self, name: &str) -> Option<EpicsValue> {
             match name {
                 "VAL" => Some(EpicsValue::Double(self.val)),
-                "EGU" => Some(EpicsValue::String(self.egu.clone())),
+                "EGU" => Some(EpicsValue::String(self.egu.clone().into())),
                 "PREC" => Some(EpicsValue::Short(0)),
                 "HOPR" => Some(EpicsValue::Double(0.0)),
                 "LOPR" => Some(EpicsValue::Double(0.0)),
@@ -2671,7 +2678,7 @@ mod metadata_cache_tests {
                     Ok(())
                 }
                 ("EGU", EpicsValue::String(s)) => {
-                    self.egu = s;
+                    self.egu = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::FieldNotFound(name.to_string())),

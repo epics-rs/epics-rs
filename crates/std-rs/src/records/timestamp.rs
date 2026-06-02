@@ -194,8 +194,8 @@ impl Record for TimestampRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL" => Some(EpicsValue::String(self.val.clone())),
-            "OVAL" => Some(EpicsValue::String(self.oval.clone())),
+            "VAL" => Some(EpicsValue::String(self.val.clone().into())),
+            "OVAL" => Some(EpicsValue::String(self.oval.clone().into())),
             "RVAL" => Some(EpicsValue::Long(self.rval)),
             "TST" => Some(EpicsValue::Short(self.tst)),
             _ => None,
@@ -208,7 +208,7 @@ impl Record for TimestampRecord {
                 EpicsValue::String(v) => {
                     // VAL is a `char[40]` field in C; the last byte is the
                     // NUL terminator, so 39 visible bytes at most.
-                    self.val = truncate_to(v, VAL_VISIBLE_MAX);
+                    self.val = truncate_to(v.as_str_lossy().into_owned(), VAL_VISIBLE_MAX);
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

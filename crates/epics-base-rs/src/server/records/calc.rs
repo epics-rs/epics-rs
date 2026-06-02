@@ -745,8 +745,8 @@ impl Record for CalcRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
-            "CALC" => Some(EpicsValue::String(self.calc.clone())),
-            "EGU" => Some(EpicsValue::String(self.egu.clone())),
+            "CALC" => Some(EpicsValue::String(self.calc.clone().into())),
+            "EGU" => Some(EpicsValue::String(self.egu.clone().into())),
             "PREC" => Some(EpicsValue::Short(self.prec)),
             "HOPR" => Some(EpicsValue::Double(self.hopr)),
             "LOPR" => Some(EpicsValue::Double(self.lopr)),
@@ -758,27 +758,27 @@ impl Record for CalcRecord {
             "ALST" => Some(EpicsValue::Double(self.alst)),
             "MLST" => Some(EpicsValue::Double(self.mlst)),
             "CALC_ALARM" => Some(EpicsValue::Char(if self.calc_alarm { 1 } else { 0 })),
-            "INPA" => Some(EpicsValue::String(self.inpa.clone())),
-            "INPB" => Some(EpicsValue::String(self.inpb.clone())),
-            "INPC" => Some(EpicsValue::String(self.inpc.clone())),
-            "INPD" => Some(EpicsValue::String(self.inpd.clone())),
-            "INPE" => Some(EpicsValue::String(self.inpe.clone())),
-            "INPF" => Some(EpicsValue::String(self.inpf.clone())),
-            "INPG" => Some(EpicsValue::String(self.inpg.clone())),
-            "INPH" => Some(EpicsValue::String(self.inph.clone())),
-            "INPI" => Some(EpicsValue::String(self.inpi.clone())),
-            "INPJ" => Some(EpicsValue::String(self.inpj.clone())),
-            "INPK" => Some(EpicsValue::String(self.inpk.clone())),
-            "INPL" => Some(EpicsValue::String(self.inpl.clone())),
-            "INPM" => Some(EpicsValue::String(self.inpm.clone())),
-            "INPN" => Some(EpicsValue::String(self.inpn.clone())),
-            "INPO" => Some(EpicsValue::String(self.inpo.clone())),
-            "INPP" => Some(EpicsValue::String(self.inpp.clone())),
-            "INPQ" => Some(EpicsValue::String(self.inpq.clone())),
-            "INPR" => Some(EpicsValue::String(self.inpr.clone())),
-            "INPS" => Some(EpicsValue::String(self.inps.clone())),
-            "INPT" => Some(EpicsValue::String(self.inpt.clone())),
-            "INPU" => Some(EpicsValue::String(self.inpu.clone())),
+            "INPA" => Some(EpicsValue::String(self.inpa.clone().into())),
+            "INPB" => Some(EpicsValue::String(self.inpb.clone().into())),
+            "INPC" => Some(EpicsValue::String(self.inpc.clone().into())),
+            "INPD" => Some(EpicsValue::String(self.inpd.clone().into())),
+            "INPE" => Some(EpicsValue::String(self.inpe.clone().into())),
+            "INPF" => Some(EpicsValue::String(self.inpf.clone().into())),
+            "INPG" => Some(EpicsValue::String(self.inpg.clone().into())),
+            "INPH" => Some(EpicsValue::String(self.inph.clone().into())),
+            "INPI" => Some(EpicsValue::String(self.inpi.clone().into())),
+            "INPJ" => Some(EpicsValue::String(self.inpj.clone().into())),
+            "INPK" => Some(EpicsValue::String(self.inpk.clone().into())),
+            "INPL" => Some(EpicsValue::String(self.inpl.clone().into())),
+            "INPM" => Some(EpicsValue::String(self.inpm.clone().into())),
+            "INPN" => Some(EpicsValue::String(self.inpn.clone().into())),
+            "INPO" => Some(EpicsValue::String(self.inpo.clone().into())),
+            "INPP" => Some(EpicsValue::String(self.inpp.clone().into())),
+            "INPQ" => Some(EpicsValue::String(self.inpq.clone().into())),
+            "INPR" => Some(EpicsValue::String(self.inpr.clone().into())),
+            "INPS" => Some(EpicsValue::String(self.inps.clone().into())),
+            "INPT" => Some(EpicsValue::String(self.inpt.clone().into())),
+            "INPU" => Some(EpicsValue::String(self.inpu.clone().into())),
             "A" => Some(EpicsValue::Double(self.a)),
             "B" => Some(EpicsValue::Double(self.b)),
             "C" => Some(EpicsValue::Double(self.c)),
@@ -836,6 +836,7 @@ impl Record for CalcRecord {
             },
             "CALC" => match value {
                 EpicsValue::String(s) => {
+                    let s = s.as_str_lossy().into_owned();
                     // Recompile on CALC change (like C special SPC_CALC)
                     self.rpcl = crate::calc::compile(&s).ok();
                     self.calc = s;
@@ -845,7 +846,7 @@ impl Record for CalcRecord {
             },
             "EGU" => match value {
                 EpicsValue::String(s) => {
-                    self.egu = s;
+                    self.egu = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -922,147 +923,147 @@ impl Record for CalcRecord {
             },
             "INPA" => match value {
                 EpicsValue::String(s) => {
-                    self.inpa = s;
+                    self.inpa = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPA".into())),
             },
             "INPB" => match value {
                 EpicsValue::String(s) => {
-                    self.inpb = s;
+                    self.inpb = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPB".into())),
             },
             "INPC" => match value {
                 EpicsValue::String(s) => {
-                    self.inpc = s;
+                    self.inpc = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPC".into())),
             },
             "INPD" => match value {
                 EpicsValue::String(s) => {
-                    self.inpd = s;
+                    self.inpd = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPD".into())),
             },
             "INPE" => match value {
                 EpicsValue::String(s) => {
-                    self.inpe = s;
+                    self.inpe = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPE".into())),
             },
             "INPF" => match value {
                 EpicsValue::String(s) => {
-                    self.inpf = s;
+                    self.inpf = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPF".into())),
             },
             "INPG" => match value {
                 EpicsValue::String(s) => {
-                    self.inpg = s;
+                    self.inpg = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPG".into())),
             },
             "INPH" => match value {
                 EpicsValue::String(s) => {
-                    self.inph = s;
+                    self.inph = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPH".into())),
             },
             "INPI" => match value {
                 EpicsValue::String(s) => {
-                    self.inpi = s;
+                    self.inpi = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPI".into())),
             },
             "INPJ" => match value {
                 EpicsValue::String(s) => {
-                    self.inpj = s;
+                    self.inpj = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPJ".into())),
             },
             "INPK" => match value {
                 EpicsValue::String(s) => {
-                    self.inpk = s;
+                    self.inpk = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPK".into())),
             },
             "INPL" => match value {
                 EpicsValue::String(s) => {
-                    self.inpl = s;
+                    self.inpl = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPL".into())),
             },
             "INPM" => match value {
                 EpicsValue::String(s) => {
-                    self.inpm = s;
+                    self.inpm = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPM".into())),
             },
             "INPN" => match value {
                 EpicsValue::String(s) => {
-                    self.inpn = s;
+                    self.inpn = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPN".into())),
             },
             "INPO" => match value {
                 EpicsValue::String(s) => {
-                    self.inpo = s;
+                    self.inpo = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPO".into())),
             },
             "INPP" => match value {
                 EpicsValue::String(s) => {
-                    self.inpp = s;
+                    self.inpp = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPP".into())),
             },
             "INPQ" => match value {
                 EpicsValue::String(s) => {
-                    self.inpq = s;
+                    self.inpq = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPQ".into())),
             },
             "INPR" => match value {
                 EpicsValue::String(s) => {
-                    self.inpr = s;
+                    self.inpr = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPR".into())),
             },
             "INPS" => match value {
                 EpicsValue::String(s) => {
-                    self.inps = s;
+                    self.inps = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPS".into())),
             },
             "INPT" => match value {
                 EpicsValue::String(s) => {
-                    self.inpt = s;
+                    self.inpt = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPT".into())),
             },
             "INPU" => match value {
                 EpicsValue::String(s) => {
-                    self.inpu = s;
+                    self.inpu = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("INPU".into())),

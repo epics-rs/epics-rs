@@ -35,4 +35,7 @@ pub use ip::{ip_from_bytes, ip_from_bytes_allow_unspec, ip_to_bytes};
 pub use selector::Selector;
 pub use size::{NULL_MARKER, decode_size, encode_size, encode_size_into};
 pub use status::{Status, StatusKind};
-pub use string::{decode_string, encode_string, encode_string_into};
+pub use string::{
+    decode_string, decode_string_bytes, decode_string_value, encode_string,
+    encode_string_bytes_into, encode_string_into,
+};

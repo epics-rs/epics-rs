@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Which EPICS record-type name an [`ArrayRecord`] reports. The four
 /// upstream array record types (`waveform`, `aai`, `aao`, `subArray`)
@@ -168,7 +168,7 @@ impl WaveformRecord {
             EpicsValue::FloatArray(v) => v.resize(n, 0.0),
             EpicsValue::DoubleArray(v) => v.resize(n, 0.0),
             EpicsValue::EnumArray(v) => v.resize(n, 0),
-            EpicsValue::StringArray(v) => v.resize(n, String::new()),
+            EpicsValue::StringArray(v) => v.resize(n, PvString::new()),
             // VAL is not currently an array variant — fall back to a
             // fresh allocation sized to the new NELM.
             _ => {
@@ -376,7 +376,7 @@ impl Record for WaveformRecord {
             // record type that doesn't declare the field).
             "INDX" if matches!(self.kind, ArrayKind::SubArray) => Some(EpicsValue::Long(self.indx)),
             "MALM" if matches!(self.kind, ArrayKind::SubArray) => Some(EpicsValue::Long(self.malm)),
-            "EGU" => Some(EpicsValue::String(self.egu.clone())),
+            "EGU" => Some(EpicsValue::String(self.egu.clone().into())),
             "HOPR" => Some(EpicsValue::Double(self.hopr)),
             "LOPR" => Some(EpicsValue::Double(self.lopr)),
             "PREC" => Some(EpicsValue::Short(self.prec)),
@@ -519,7 +519,7 @@ impl Record for WaveformRecord {
             }
             "EGU" => {
                 if let EpicsValue::String(s) = value {
-                    self.egu = s;
+                    self.egu = s.as_str_lossy().into_owned();
                     Ok(())
                 } else {
                     Err(CaError::TypeMismatch("EGU".into()))

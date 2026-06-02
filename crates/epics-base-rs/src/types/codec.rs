@@ -1,7 +1,7 @@
 use crate::error::{CaError, CaResult};
 use std::time::{Duration, SystemTime};
 
-use super::{DbFieldType, EpicsValue};
+use super::{DbFieldType, EpicsValue, PvString};
 
 // db_access.h constants
 const MAX_UNITS_SIZE: usize = 8;
@@ -99,20 +99,24 @@ fn convert_value_to_dbr_string(
         .map(|d| d.precision.max(0) as u16)
         .unwrap_or(6);
     match value {
-        EpicsValue::Double(v) => EpicsValue::String(cvt_double_to_string(*v, prec)),
-        EpicsValue::Float(v) => EpicsValue::String(cvt_float_to_string(*v, prec)),
-        EpicsValue::DoubleArray(a) => {
-            EpicsValue::StringArray(a.iter().map(|v| cvt_double_to_string(*v, prec)).collect())
-        }
-        EpicsValue::FloatArray(a) => {
-            EpicsValue::StringArray(a.iter().map(|v| cvt_float_to_string(*v, prec)).collect())
-        }
+        EpicsValue::Double(v) => EpicsValue::String(cvt_double_to_string(*v, prec).into()),
+        EpicsValue::Float(v) => EpicsValue::String(cvt_float_to_string(*v, prec).into()),
+        EpicsValue::DoubleArray(a) => EpicsValue::StringArray(
+            a.iter()
+                .map(|v| cvt_double_to_string(*v, prec).into())
+                .collect(),
+        ),
+        EpicsValue::FloatArray(a) => EpicsValue::StringArray(
+            a.iter()
+                .map(|v| cvt_float_to_string(*v, prec).into())
+                .collect(),
+        ),
         // C `getEnumString` (dbConvert.c, `[DBF_ENUM][DBR_STRING]`)
         // returns the state LABEL via `get_enum_str`, not the index. Map each
         // index to `snapshot.enums.strings[idx]`; see `enum_label`.
-        EpicsValue::Enum(v) => EpicsValue::String(enum_label(snapshot, *v)),
+        EpicsValue::Enum(v) => EpicsValue::String(enum_label(snapshot, *v).into()),
         EpicsValue::EnumArray(a) => {
-            EpicsValue::StringArray(a.iter().map(|v| enum_label(snapshot, *v)).collect())
+            EpicsValue::StringArray(a.iter().map(|v| enum_label(snapshot, *v).into()).collect())
         }
         other => other.convert_to(DbFieldType::String),
     }
@@ -819,14 +823,29 @@ fn read_f64(data: &[u8], off: usize) -> CaResult<f64> {
     ]))
 }
 
+/// Decode a NUL-terminated fixed-width CA string field into a lossy `String`.
+/// Used for metadata **labels** (units, enum-state strings) that are internal
+/// ASCII-grammar identifiers, not arbitrary wire values — lossy decoding is
+/// the documented policy for labels. For string **values** use
+/// [`read_pv_string`], which preserves the raw bytes.
 fn read_string(data: &[u8], off: usize, max_len: usize) -> String {
+    read_pv_string(data, off, max_len)
+        .as_str_lossy()
+        .into_owned()
+}
+
+/// Decode a NUL-terminated fixed-width CA string field into a byte-preserving
+/// [`PvString`]. CA `DBR_STRING` slots are historically Latin-1 / arbitrary
+/// bytes; preserving them verbatim (no UTF-8 validation) matches pvxs and
+/// keeps a gateway pass-through lossless.
+fn read_pv_string(data: &[u8], off: usize, max_len: usize) -> PvString {
     let end = data.len().min(off + max_len);
     if off >= end {
-        return String::new();
+        return PvString::new();
     }
     let slice = &data[off..end];
     let nul = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
-    String::from_utf8_lossy(&slice[..nul]).into_owned()
+    PvString::from_bytes(&slice[..nul])
 }
 
 fn epics_secs_to_system_time(secs: u32, nanos: u32) -> SystemTime {
@@ -851,14 +870,14 @@ pub fn decode_dbr(dbr_type: u16, data: &[u8], count: usize) -> CaResult<Snapshot
                 data.len()
             )));
         }
-        let name = read_string(data, 0, 40);
+        let name = read_pv_string(data, 0, 40);
         let mut snap = Snapshot::new(
             EpicsValue::String(name.clone()),
             0,
             0,
             SystemTime::UNIX_EPOCH,
         );
-        snap.class_name = Some(name);
+        snap.class_name = Some(name.as_str_lossy().into_owned());
         return Ok(snap);
     }
     // DBR_STSACK_STRING (37): alarm-acknowledge string. Layout per
@@ -877,7 +896,7 @@ pub fn decode_dbr(dbr_type: u16, data: &[u8], count: usize) -> CaResult<Snapshot
         let severity = read_u16(data, 2)?;
         let ackt = read_u16(data, 4)?;
         let acks = read_u16(data, 6)?;
-        let value = read_string(data, 8, 40);
+        let value = read_pv_string(data, 8, 40);
         let mut snap = Snapshot::new(
             EpicsValue::String(value),
             status,
@@ -1504,12 +1523,12 @@ mod r58_enum_label_tests {
         let s = snap_with_enum(EpicsValue::Enum(1), &["Off", "On"]);
         assert_eq!(
             convert_value_to_dbr_string(&s.value, &s),
-            EpicsValue::String("On".to_string())
+            EpicsValue::String("On".into())
         );
         let s0 = snap_with_enum(EpicsValue::Enum(0), &["Off", "On"]);
         assert_eq!(
             convert_value_to_dbr_string(&s0.value, &s0),
-            EpicsValue::String("Off".to_string())
+            EpicsValue::String("Off".into())
         );
     }
 
@@ -1518,7 +1537,7 @@ mod r58_enum_label_tests {
         let s = snap_with_enum(EpicsValue::EnumArray(vec![0, 1, 0]), &["Off", "On"]);
         assert_eq!(
             convert_value_to_dbr_string(&s.value, &s),
-            EpicsValue::StringArray(vec!["Off".to_string(), "On".to_string(), "Off".to_string()])
+            EpicsValue::StringArray(vec!["Off".into(), "On".into(), "Off".into()])
         );
     }
 
@@ -1527,7 +1546,7 @@ mod r58_enum_label_tests {
         let s = snap_with_enum(EpicsValue::Enum(5), &["Off", "On"]);
         assert_eq!(
             convert_value_to_dbr_string(&s.value, &s),
-            EpicsValue::String("5".to_string())
+            EpicsValue::String("5".into())
         );
     }
 
@@ -1536,7 +1555,7 @@ mod r58_enum_label_tests {
         let s = Snapshot::new(EpicsValue::Enum(1), 0, 0, SystemTime::UNIX_EPOCH);
         assert_eq!(
             convert_value_to_dbr_string(&s.value, &s),
-            EpicsValue::String("1".to_string())
+            EpicsValue::String("1".into())
         );
     }
 }

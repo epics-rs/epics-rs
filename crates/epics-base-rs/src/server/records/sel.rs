@@ -480,19 +480,19 @@ impl Record for SelRecord {
             "VAL" => Some(EpicsValue::Double(self.val)),
             "SELM" => Some(EpicsValue::Short(self.selm)),
             "SELN" => Some(EpicsValue::Short(self.seln)),
-            "NVL" => Some(EpicsValue::String(self.nvl.clone())),
-            "INPA" => Some(EpicsValue::String(self.inpa.clone())),
-            "INPB" => Some(EpicsValue::String(self.inpb.clone())),
-            "INPC" => Some(EpicsValue::String(self.inpc.clone())),
-            "INPD" => Some(EpicsValue::String(self.inpd.clone())),
-            "INPE" => Some(EpicsValue::String(self.inpe.clone())),
-            "INPF" => Some(EpicsValue::String(self.inpf.clone())),
-            "INPG" => Some(EpicsValue::String(self.inpg.clone())),
-            "INPH" => Some(EpicsValue::String(self.inph.clone())),
-            "INPI" => Some(EpicsValue::String(self.inpi.clone())),
-            "INPJ" => Some(EpicsValue::String(self.inpj.clone())),
-            "INPK" => Some(EpicsValue::String(self.inpk.clone())),
-            "INPL" => Some(EpicsValue::String(self.inpl.clone())),
+            "NVL" => Some(EpicsValue::String(self.nvl.clone().into())),
+            "INPA" => Some(EpicsValue::String(self.inpa.clone().into())),
+            "INPB" => Some(EpicsValue::String(self.inpb.clone().into())),
+            "INPC" => Some(EpicsValue::String(self.inpc.clone().into())),
+            "INPD" => Some(EpicsValue::String(self.inpd.clone().into())),
+            "INPE" => Some(EpicsValue::String(self.inpe.clone().into())),
+            "INPF" => Some(EpicsValue::String(self.inpf.clone().into())),
+            "INPG" => Some(EpicsValue::String(self.inpg.clone().into())),
+            "INPH" => Some(EpicsValue::String(self.inph.clone().into())),
+            "INPI" => Some(EpicsValue::String(self.inpi.clone().into())),
+            "INPJ" => Some(EpicsValue::String(self.inpj.clone().into())),
+            "INPK" => Some(EpicsValue::String(self.inpk.clone().into())),
+            "INPL" => Some(EpicsValue::String(self.inpl.clone().into())),
             "A" => Some(EpicsValue::Double(self.a)),
             "B" => Some(EpicsValue::Double(self.b)),
             "C" => Some(EpicsValue::Double(self.c)),
@@ -544,7 +544,7 @@ impl Record for SelRecord {
             },
             "NVL" => match value {
                 EpicsValue::String(s) => {
-                    self.nvl = s;
+                    self.nvl = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("NVL".into())),
@@ -552,6 +552,7 @@ impl Record for SelRecord {
             "INPA" | "INPB" | "INPC" | "INPD" | "INPE" | "INPF" | "INPG" | "INPH" | "INPI"
             | "INPJ" | "INPK" | "INPL" => match value {
                 EpicsValue::String(s) => {
+                    let s = s.as_str_lossy().into_owned();
                     match name {
                         "INPA" => self.inpa = s,
                         "INPB" => self.inpb = s,

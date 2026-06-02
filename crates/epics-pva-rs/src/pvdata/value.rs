@@ -24,6 +24,8 @@
 
 use std::sync::Arc;
 
+use epics_base_rs::types::PvString;
+
 use crate::proto::BitSet;
 use crate::pvdata::{
     FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, UnionItem, VariantValue,
@@ -530,7 +532,7 @@ fn default_scalar(t: ScalarType) -> ScalarValue {
         ScalarType::ULong => ScalarValue::ULong(0),
         ScalarType::Float => ScalarValue::Float(0.0),
         ScalarType::Double => ScalarValue::Double(0.0),
-        ScalarType::String => ScalarValue::String(String::new()),
+        ScalarType::String => ScalarValue::String(PvString::new()),
     }
 }
 
@@ -750,12 +752,12 @@ fn coerce_scalar(sv: &ScalarValue, target: ScalarType) -> Option<ScalarValue> {
         ULong(x) => Some(*x as i64),
         Float(x) => Some(*x as i64),
         Double(x) => Some(*x as i64),
-        String(s) => s.parse::<i64>().ok(),
+        String(s) => s.as_str_lossy().parse::<i64>().ok(),
     };
     let as_f64: Option<f64> = match sv {
         Float(x) => Some(*x as f64),
         Double(x) => Some(*x),
-        String(s) => s.parse::<f64>().ok(),
+        String(s) => s.as_str_lossy().parse::<f64>().ok(),
         _ => as_i64.map(|i| i as f64),
     };
     let as_string: std::string::String = match sv {
@@ -770,7 +772,7 @@ fn coerce_scalar(sv: &ScalarValue, target: ScalarType) -> Option<ScalarValue> {
         ULong(x) => x.to_string(),
         Float(x) => x.to_string(),
         Double(x) => x.to_string(),
-        String(s) => s.clone(),
+        String(s) => s.as_str_lossy().into_owned(),
     };
     Some(match target {
         ScalarType::Boolean => Boolean(as_i64? != 0),
@@ -784,7 +786,7 @@ fn coerce_scalar(sv: &ScalarValue, target: ScalarType) -> Option<ScalarValue> {
         ScalarType::ULong => ULong(as_i64? as u64),
         ScalarType::Float => Float(as_f64? as f32),
         ScalarType::Double => Double(as_f64?),
-        ScalarType::String => String(as_string),
+        ScalarType::String => String(as_string.into()),
     })
 }
 
@@ -874,7 +876,7 @@ impl FromScalarValue for String {
     fn from_scalar(sv: ScalarValue) -> Result<Self, ()> {
         let coerced = coerce_scalar(&sv, ScalarType::String).ok_or(())?;
         if let ScalarValue::String(s) = coerced {
-            Ok(s)
+            Ok(s.as_str_lossy().into_owned())
         } else {
             Err(())
         }
@@ -913,13 +915,13 @@ impl IntoScalarValue for bool {
 
 impl IntoScalarValue for &str {
     fn into_scalar(self, target: ScalarType) -> Result<ScalarValue, ()> {
-        coerce_scalar(&ScalarValue::String(self.to_string()), target).ok_or(())
+        coerce_scalar(&ScalarValue::String(self.into()), target).ok_or(())
     }
 }
 
 impl IntoScalarValue for String {
     fn into_scalar(self, target: ScalarType) -> Result<ScalarValue, ()> {
-        coerce_scalar(&ScalarValue::String(self), target).ok_or(())
+        coerce_scalar(&ScalarValue::String(self.into()), target).ok_or(())
     }
 }
 

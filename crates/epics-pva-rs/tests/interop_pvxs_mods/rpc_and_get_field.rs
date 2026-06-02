@@ -68,7 +68,9 @@ async fn interop_rpc_pvxcall_against_rust_server() {
                         return None;
                     };
                     q.fields.iter().find_map(|(qn, qv)| match qv {
-                        PvField::Scalar(ScalarValue::String(s)) if qn == "x" => s.parse().ok(),
+                        PvField::Scalar(ScalarValue::String(s)) if qn == "x" => {
+                            s.as_str_lossy().parse().ok()
+                        }
                         PvField::Scalar(ScalarValue::Int(i)) if qn == "x" => Some(*i),
                         _ => None,
                     })

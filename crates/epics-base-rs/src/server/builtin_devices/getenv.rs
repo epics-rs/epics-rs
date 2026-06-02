@@ -60,6 +60,7 @@ impl GetenvDeviceSupport {
                 _ => None,
             })
             .unwrap_or_default();
+        let inp = inp.as_str_lossy();
         let name = Self::resolve_var_name(&inp);
         if name.is_empty() {
             return None;
@@ -89,6 +90,7 @@ impl DeviceSupport for GetenvDeviceSupport {
                 _ => None,
             })
             .unwrap_or_default();
+        let inp = inp.as_str_lossy();
         let name = Self::resolve_var_name(&inp);
         if !name.is_empty() {
             self.cached_var = Some(name.to_string());
@@ -102,7 +104,7 @@ impl DeviceSupport for GetenvDeviceSupport {
             .and_then(|var| std::env::var(var).ok());
         match value {
             Some(s) => {
-                record.put_field("VAL", EpicsValue::String(s))?;
+                record.put_field("VAL", EpicsValue::String(s.into()))?;
                 Ok(())
             }
             None => {
@@ -114,7 +116,7 @@ impl DeviceSupport for GetenvDeviceSupport {
                 // healthy-looking record with no alarm while the
                 // same condition on a later `read()` raised
                 // READ_ALARM. C flags the alarm at init too.
-                record.put_field("VAL", EpicsValue::String(String::new()))?;
+                record.put_field("VAL", EpicsValue::String(String::new().into()))?;
                 Err(CaError::InvalidValue(format!(
                     "getenv: variable '{}' is unset",
                     self.cached_var.as_deref().unwrap_or("")
@@ -131,7 +133,7 @@ impl DeviceSupport for GetenvDeviceSupport {
         };
         match val {
             Some(s) => {
-                record.put_field("VAL", EpicsValue::String(s))?;
+                record.put_field("VAL", EpicsValue::String(s.into()))?;
                 Ok(DeviceReadOutcome::ok())
             }
             None => {
@@ -141,7 +143,7 @@ impl DeviceSupport for GetenvDeviceSupport {
                 // and reflects the current (empty) value. Clear VAL
                 // to empty, then signal the framework via a soft Err
                 // so it sets READ_ALARM / INVALID severity.
-                record.put_field("VAL", EpicsValue::String(String::new()))?;
+                record.put_field("VAL", EpicsValue::String(String::new().into()))?;
                 Err(CaError::InvalidValue(format!(
                     "getenv: variable '{}' is unset",
                     self.cached_var.as_deref().unwrap_or("")

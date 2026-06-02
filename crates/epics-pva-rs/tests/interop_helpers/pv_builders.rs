@@ -160,10 +160,7 @@ fn struct_array_points() -> (FieldDesc, PvField) {
         struct_id: "point_t".into(),
         fields: vec![
             ("x".into(), PvField::Scalar(ScalarValue::Int(x))),
-            (
-                "y".into(),
-                PvField::Scalar(ScalarValue::String(y.to_string())),
-            ),
+            ("y".into(), PvField::Scalar(ScalarValue::String(y.into()))),
         ],
     };
     let root = PvField::Structure(PvStructure {

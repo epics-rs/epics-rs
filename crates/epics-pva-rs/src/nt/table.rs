@@ -67,7 +67,7 @@ impl NTTable {
         let labels = self
             .columns
             .iter()
-            .map(|c| ScalarValue::String(c.label.clone()))
+            .map(|c| ScalarValue::String(c.label.clone().into()))
             .collect::<Vec<_>>();
         root.fields
             .push(("labels".into(), PvField::ScalarArray(labels)));
@@ -81,7 +81,7 @@ impl NTTable {
             .push(("value".into(), PvField::Structure(value_struct)));
         root.fields.push((
             "descriptor".into(),
-            PvField::Scalar(ScalarValue::String(String::new())),
+            PvField::Scalar(ScalarValue::String(String::new().into())),
         ));
         root.fields.push(("alarm".into(), alarm_default()));
         root.fields.push(("timeStamp".into(), time_default()));
@@ -133,11 +133,11 @@ mod tests {
             .create();
         if let PvField::Structure(root) = v {
             if let Some(PvField::ScalarArray(labels)) = root.get_field("labels") {
-                let strs: Vec<&str> = labels
+                let strs: Vec<String> = labels
                     .iter()
                     .filter_map(|v| {
                         if let ScalarValue::String(s) = v {
-                            Some(s.as_str())
+                            Some(s.as_str_lossy().into_owned())
                         } else {
                             None
                         }

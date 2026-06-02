@@ -209,7 +209,7 @@ impl Record for Int64outRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Int64(self.val)),
-            "EGU" => Some(EpicsValue::String(self.egu.clone())),
+            "EGU" => Some(EpicsValue::String(self.egu.clone().into())),
             "HOPR" => Some(EpicsValue::Double(self.hopr)),
             "LOPR" => Some(EpicsValue::Double(self.lopr)),
             "DRVH" => Some(EpicsValue::Double(self.drvh)),
@@ -223,10 +223,10 @@ impl Record for Int64outRecord {
             "ALST" => Some(EpicsValue::Double(self.alst)),
             "MLST" => Some(EpicsValue::Double(self.mlst)),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
-            "DOL" => Some(EpicsValue::String(self.dol.clone())),
+            "DOL" => Some(EpicsValue::String(self.dol.clone().into())),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
-            "SIML" => Some(EpicsValue::String(self.siml.clone())),
-            "SIOL" => Some(EpicsValue::String(self.siol.clone())),
+            "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
+            "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             _ => None,
         }
@@ -244,7 +244,7 @@ impl Record for Int64outRecord {
             }
             "EGU" => {
                 if let EpicsValue::String(v) = value {
-                    self.egu = v;
+                    self.egu = v.as_str_lossy().into_owned();
                 } else {
                     return Err(CaError::TypeMismatch("EGU".into()));
                 }
@@ -320,7 +320,7 @@ impl Record for Int64outRecord {
             }
             "DOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.dol = v;
+                    self.dol = v.as_str_lossy().into_owned();
                 } else {
                     return Err(CaError::TypeMismatch("DOL".into()));
                 }
@@ -334,14 +334,14 @@ impl Record for Int64outRecord {
             }
             "SIML" => {
                 if let EpicsValue::String(v) = value {
-                    self.siml = v;
+                    self.siml = v.as_str_lossy().into_owned();
                 } else {
                     return Err(CaError::TypeMismatch("SIML".into()));
                 }
             }
             "SIOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.siol = v;
+                    self.siol = v.as_str_lossy().into_owned();
                 } else {
                     return Err(CaError::TypeMismatch("SIOL".into()));
                 }

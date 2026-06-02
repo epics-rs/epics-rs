@@ -450,7 +450,7 @@ impl Record for CompressRecord {
                 // client sees on read.
                 Some(EpicsValue::DoubleArray(self.linearise_val()))
             }
-            "INP" => Some(EpicsValue::String(self.inp.clone())),
+            "INP" => Some(EpicsValue::String(self.inp.clone().into())),
             "NSAM" => Some(EpicsValue::Long(self.nsam)),
             "NUSE" => Some(EpicsValue::Long(self.nuse)),
             "RES" => Some(EpicsValue::Short(self.res)),
@@ -463,7 +463,7 @@ impl Record for CompressRecord {
             "IHIL" => Some(EpicsValue::Double(self.ihil)),
             "INX" => Some(EpicsValue::Long(self.inx)),
             "CVB" => Some(EpicsValue::Double(self.cvb)),
-            "EGU" => Some(EpicsValue::String(self.egu.clone())),
+            "EGU" => Some(EpicsValue::String(self.egu.clone().into())),
             "HOPR" => Some(EpicsValue::Double(self.hopr)),
             "LOPR" => Some(EpicsValue::Double(self.lopr)),
             "PREC" => Some(EpicsValue::Short(self.prec)),
@@ -541,7 +541,7 @@ impl Record for CompressRecord {
                 }
                 EpicsValue::String(s) => {
                     // epics-base menu field accepts YES/NO strings.
-                    self.pbuf = match s.to_ascii_uppercase().as_str() {
+                    self.pbuf = match s.as_str_lossy().to_ascii_uppercase().as_str() {
                         "YES" => 1,
                         "NO" | "" => 0,
                         _ => return Err(CaError::TypeMismatch(format!("PBUF: {s}"))),
@@ -569,7 +569,7 @@ impl Record for CompressRecord {
             }
             "EGU" => {
                 if let EpicsValue::String(s) = value {
-                    self.egu = s;
+                    self.egu = s.as_str_lossy().into_owned();
                     Ok(())
                 } else {
                     Err(CaError::TypeMismatch("EGU".into()))

@@ -171,7 +171,7 @@ pub fn negotiated_queue_size(pv_request: &PvStructure) -> i32 {
             // Same scalar shapes the native PVA server accepts in
             // `monitor_pipeline_options` — typed-builder INT/UINT/…
             // and the `record[queueSize=N]` STRING form.
-            PvField::Scalar(ScalarValue::String(s)) => s.parse::<i32>().ok(),
+            PvField::Scalar(ScalarValue::String(s)) => s.as_str_lossy().parse::<i32>().ok(),
             PvField::Scalar(ScalarValue::Byte(i)) => Some(i32::from(*i)),
             PvField::Scalar(ScalarValue::UByte(i)) => Some(i32::from(*i)),
             PvField::Scalar(ScalarValue::Short(i)) => Some(i32::from(*i)),
@@ -2443,7 +2443,9 @@ fn build_alarm_from_snapshot(snapshot: &epics_base_rs::server::snapshot::Snapsho
     alarm.fields.push((
         "message".into(),
         PvField::Scalar(ScalarValue::String(
-            pvif::alarm_condition_string(snapshot.alarm.status).to_string(),
+            pvif::alarm_condition_string(snapshot.alarm.status)
+                .to_string()
+                .into(),
         )),
     ));
     alarm

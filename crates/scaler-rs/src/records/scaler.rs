@@ -875,14 +875,14 @@ impl Record for ScalerRecord {
             "T" => return Some(EpicsValue::Double(self.t)),
             "VERS" => return Some(EpicsValue::Float(self.vers)),
             "PREC" => return Some(EpicsValue::Short(self.prec)),
-            "EGU" => return Some(EpicsValue::String(self.egu.clone())),
-            "OUT" => return Some(EpicsValue::String(self.out.clone())),
-            "COUT" => return Some(EpicsValue::String(self.cout.clone())),
-            "COUTP" => return Some(EpicsValue::String(self.coutp.clone())),
+            "EGU" => return Some(EpicsValue::String(self.egu.clone().into())),
+            "OUT" => return Some(EpicsValue::String(self.out.clone().into())),
+            "COUT" => return Some(EpicsValue::String(self.cout.clone().into())),
+            "COUTP" => return Some(EpicsValue::String(self.coutp.clone().into())),
             _ => {}
         }
         if let Some(i) = parse_indexed_field(name, "NM") {
-            return Some(EpicsValue::String(self.nm[i].clone()));
+            return Some(EpicsValue::String(self.nm[i].clone().into()));
         }
         if let Some(i) = parse_indexed_field(name, "PR") {
             return Some(EpicsValue::Long(self.pr[i] as i32));
@@ -980,28 +980,28 @@ impl Record for ScalerRecord {
             },
             "EGU" => match value {
                 EpicsValue::String(v) => {
-                    self.egu = v;
+                    self.egu = v.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "OUT" => match value {
                 EpicsValue::String(v) => {
-                    self.out = v;
+                    self.out = v.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "COUT" => match value {
                 EpicsValue::String(v) => {
-                    self.cout = v;
+                    self.cout = v.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "COUTP" => match value {
                 EpicsValue::String(v) => {
-                    self.coutp = v;
+                    self.coutp = v.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -1011,7 +1011,7 @@ impl Record for ScalerRecord {
                 if let Some(i) = parse_indexed_field(name, "NM") {
                     match value {
                         EpicsValue::String(v) => {
-                            self.nm[i] = v;
+                            self.nm[i] = v.as_str_lossy().into_owned();
                             Ok(())
                         }
                         _ => Err(CaError::TypeMismatch(name.into())),

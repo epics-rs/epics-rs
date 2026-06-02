@@ -72,7 +72,7 @@ fn nturi_request(args: &[(&str, ScalarValue)]) -> (FieldDesc, PvField) {
     ));
     root.fields.push((
         "path".into(),
-        PvField::Scalar(ScalarValue::String(String::new())),
+        PvField::Scalar(ScalarValue::String("".into())),
     ));
     root.fields
         .push(("query".into(), PvField::Structure(query)));

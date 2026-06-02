@@ -46,7 +46,7 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use epics_base_rs::error::CaError;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::pv::{WriteContext, WriteHook};
-use epics_base_rs::types::{DbFieldType, EpicsValue};
+use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 use epics_ca_rs::client::{CaChannel, CaClient, EventWatcher, MonitorHandle};
 use epics_ca_rs::server::AccessRightsNotifier;
 use tokio::sync::RwLock;
@@ -81,8 +81,8 @@ fn native_placeholder(native_type: DbFieldType, element_count: u32) -> EpicsValu
     let n = element_count.max(1) as usize;
     let scalar = element_count <= 1;
     match native_type {
-        DbFieldType::String if scalar => EpicsValue::String(String::new()),
-        DbFieldType::String => EpicsValue::StringArray(vec![String::new(); n]),
+        DbFieldType::String if scalar => EpicsValue::String(PvString::new()),
+        DbFieldType::String => EpicsValue::StringArray(vec![PvString::new(); n]),
         DbFieldType::Short if scalar => EpicsValue::Short(0),
         DbFieldType::Short => EpicsValue::ShortArray(vec![0; n]),
         DbFieldType::Float if scalar => EpicsValue::Float(0.0),

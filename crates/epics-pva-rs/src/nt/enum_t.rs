@@ -62,7 +62,7 @@ impl NTEnum {
         let choices_arr = self
             .choices
             .iter()
-            .map(|s| ScalarValue::String(s.clone()))
+            .map(|s| ScalarValue::String(s.clone().into()))
             .collect::<Vec<_>>();
         value
             .fields
@@ -74,7 +74,7 @@ impl NTEnum {
         let mut display = PvStructure::new("");
         display.fields.push((
             "description".into(),
-            PvField::Scalar(ScalarValue::String(String::new())),
+            PvField::Scalar(ScalarValue::String(String::new().into())),
         ));
         root.fields
             .push(("display".into(), PvField::Structure(display)));

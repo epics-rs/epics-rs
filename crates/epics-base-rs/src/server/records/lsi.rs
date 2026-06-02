@@ -166,8 +166,8 @@ impl Record for LsiRecord {
             "LEN" => Some(EpicsValue::Long(self.len as i32)),
             "OLEN" => Some(EpicsValue::Long(self.olen as i32)),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
-            "SIML" => Some(EpicsValue::String(self.siml.clone())),
-            "SIOL" => Some(EpicsValue::String(self.siol.clone())),
+            "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
+            "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             _ => None,
         }
@@ -182,7 +182,7 @@ impl Record for LsiRecord {
                 // cap. A DBR_CHAR long-string put (CharArray) is only
                 // bounded by SIZV.
                 let mut s = match value {
-                    EpicsValue::String(s) => truncate_utf8(&s, MAX_STRING_SIZE - 1),
+                    EpicsValue::String(s) => truncate_utf8(&s.as_str_lossy(), MAX_STRING_SIZE - 1),
                     EpicsValue::CharArray(bytes) => {
                         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
                         String::from_utf8_lossy(&bytes[..end]).into_owned()
@@ -213,14 +213,14 @@ impl Record for LsiRecord {
             }
             "SIML" => {
                 if let EpicsValue::String(v) = value {
-                    self.siml = v;
+                    self.siml = v.as_str_lossy().into_owned();
                 } else {
                     return Err(CaError::TypeMismatch("SIML".into()));
                 }
             }
             "SIOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.siol = v;
+                    self.siol = v.as_str_lossy().into_owned();
                 } else {
                     return Err(CaError::TypeMismatch("SIOL".into()));
                 }

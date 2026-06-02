@@ -59,7 +59,7 @@ impl DeviceSupport for TimeOfDayStringDeviceSupport {
             now.format("%b %d, %Y %H:%M:%S").to_string()
         };
 
-        record.put_field("VAL", EpicsValue::String(formatted))?;
+        record.put_field("VAL", EpicsValue::String(formatted.into()))?;
         Ok(DeviceReadOutcome::computed())
     }
 
@@ -153,7 +153,7 @@ mod tests {
         dev.set_process_context(&ctx_with_phas(0));
         dev.read(&mut rec).unwrap();
         let val = match rec.get_field("VAL") {
-            Some(EpicsValue::String(s)) => s,
+            Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
             other => panic!("expected String VAL, got {other:?}"),
         };
         // "%b %d, %Y %H:%M:%S" — contains a comma, no slashes.
@@ -174,7 +174,7 @@ mod tests {
         dev.set_process_context(&ctx_with_phas(1));
         dev.read(&mut rec).unwrap();
         let val = match rec.get_field("VAL") {
-            Some(EpicsValue::String(s)) => s,
+            Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
             other => panic!("expected String VAL, got {other:?}"),
         };
         // "%m/%d/%y %H:%M:%S" — two slashes, no comma.

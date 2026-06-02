@@ -264,7 +264,7 @@ fn cmd_dbpf() -> CommandDef {
                     .map_err(|e| format!("cannot parse '{value_str}' as {dbf:?}: {e}"))?
             } else {
                 // No type info available, try as string
-                EpicsValue::String(value_str.clone())
+                EpicsValue::String(value_str.clone().into())
             };
 
             // Use put_record_field_from_ca for records (triggers process like CA put).

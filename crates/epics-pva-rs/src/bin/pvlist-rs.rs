@@ -167,7 +167,7 @@ fn build_server_query(op: &str) -> (FieldDesc, PvField) {
 /// Extract a string scalar field by name from a structure.
 fn str_field(s: &PvStructure, name: &str) -> Option<String> {
     match s.get_field(name)? {
-        PvField::Scalar(ScalarValue::String(v)) => Some(v.clone()),
+        PvField::Scalar(ScalarValue::String(v)) => Some(v.as_str_lossy().into_owned()),
         _ => None,
     }
 }
@@ -186,7 +186,7 @@ fn channel_names(value: &PvField) -> Vec<String> {
         PvField::ScalarArray(items) => items
             .iter()
             .filter_map(|v| match v {
-                ScalarValue::String(s) => Some(s.clone()),
+                ScalarValue::String(s) => Some(s.as_str_lossy().into_owned()),
                 _ => None,
             })
             .collect(),
@@ -194,7 +194,7 @@ fn channel_names(value: &PvField) -> Vec<String> {
             .to_scalar_values()
             .into_iter()
             .filter_map(|v| match v {
-                ScalarValue::String(s) => Some(s),
+                ScalarValue::String(s) => Some(s.as_str_lossy().into_owned()),
                 _ => None,
             })
             .collect(),

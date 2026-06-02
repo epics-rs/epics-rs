@@ -766,9 +766,12 @@ fn dfanout_output_links() {
     ];
     for (i, field) in link_fields.iter().enumerate() {
         let target = format!("REC{i}");
-        rec.put_field(field, EpicsValue::String(target.clone()))
+        rec.put_field(field, EpicsValue::String(target.clone().into()))
             .unwrap();
-        assert_eq!(rec.get_field(field), Some(EpicsValue::String(target)));
+        assert_eq!(
+            rec.get_field(field),
+            Some(EpicsValue::String(target.into()))
+        );
     }
 }
 
@@ -1946,7 +1949,7 @@ async fn process_chain_depth_limit() {
     for i in 0..19 {
         if let Some(rec) = db.get_record(&format!("chain{i}")).await {
             let mut inst = rec.write().await;
-            inst.put_common_field("FLNK", EpicsValue::String(format!("chain{}", i + 1)))
+            inst.put_common_field("FLNK", EpicsValue::String(format!("chain{}", i + 1).into()))
                 .unwrap();
         }
     }

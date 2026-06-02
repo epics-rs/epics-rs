@@ -61,7 +61,7 @@ fn bench_epics_value(c: &mut Criterion) {
     });
 
     c.bench_function("epics_value_string_to_bytes", |b| {
-        let val = EpicsValue::String("Hello EPICS".to_string());
+        let val = EpicsValue::String("Hello EPICS".into());
         b.iter(|| black_box(&val).to_bytes())
     });
 }

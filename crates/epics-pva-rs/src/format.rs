@@ -1114,6 +1114,26 @@ pub fn parse_value_format(arg: Option<&str>) -> Option<ValueFormat> {
     })
 }
 
+/// pvxs `pvinfo` per-PV output block (info.cpp:90-94):
+/// `cout << argv[n] << " from " << peerName << "\n" <<
+/// result().format().showValue(false)`. Emits the `<pv> from <peer>` header
+/// line, then the type tree with values hidden — `Tree` mode, `base_depth=0`
+/// (info.cpp streams the formatter with no `Indented` wrapper, unlike
+/// get/monitor which pass 1), and `value=None` because a describe carries
+/// only the introspection, not data. This is the pvxs-compatible replacement
+/// for the prior Rust-specific `<pv>` / `Server:` / `Type:` label block.
+pub fn format_info_value(pv_name: &str, peer: std::net::SocketAddr, desc: &FieldDesc) -> String {
+    let fmt = ValueFmt {
+        format: ValueFormat::Tree,
+        array_limit: 0,
+        show_value: false,
+    };
+    format!(
+        "{pv_name} from {peer}\n{}",
+        format_value(desc, None, &fmt, None, 0)
+    )
+}
+
 /// Render a descriptor + value the way pvxs `operator<<(ostream, Value::Fmt)`
 /// does (datafmt.cpp:312-326).
 ///
@@ -2523,6 +2543,29 @@ mod tests {
         assert_eq!(
             out,
             "struct \"x\" {\n    int32_t[] value = {3}[10, 20, ...]\n}\n"
+        );
+    }
+
+    /// pvinfo's full per-PV block (info.cpp:90-94): the `<pv> from <peer>`
+    /// header line, then the values-hidden type tree at `base_depth=0`. Locks
+    /// the pvxs-compatible shape that replaced the Rust `<pv>`/`Server:`/
+    /// `Type:` labels.
+    #[test]
+    fn pvxs_pvinfo_block_golden() {
+        let (desc, _val) = nt_scalar_double(0.0, 0, 0);
+        let peer: std::net::SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let out = format_info_value("TST:ai", peer, &desc);
+        assert_eq!(
+            out,
+            "TST:ai from 127.0.0.1:5075\n\
+             struct \"epics:nt/NTScalar:1.0\" {\n\
+             \x20   double value\n\
+             \x20   struct \"time_t\" {\n\
+             \x20       int64_t secondsPastEpoch\n\
+             \x20       int32_t nanoseconds\n\
+             \x20       int32_t userTag\n\
+             \x20   } timeStamp\n\
+             }\n"
         );
     }
 

@@ -123,10 +123,7 @@ async fn main() {
     let results = client.pvinfo_many_full_with_credentials(&names).await;
 
     let mut failed = false;
-    for (i, (pv_name, result)) in args.pv_names.iter().zip(results).enumerate() {
-        if i > 0 {
-            println!();
-        }
+    for (pv_name, result) in args.pv_names.iter().zip(results) {
         match result {
             Ok((desc, server_addr, cred)) => {
                 // Under `--show-credentials`, print the server's peer
@@ -153,12 +150,12 @@ async fn main() {
                         }
                     }
                 }
-                println!("{pv_name}");
-                if server_addr.port() != 0 {
-                    println!("Server: {server_addr}");
-                }
-                println!("Type:");
-                print!("{}", format::format_info_indented(&desc, 1));
+                // pvxs `pvinfo` prints "<pv> from <peer>" then the type tree
+                // with values hidden (info.cpp:90-94). This replaces the
+                // Rust-specific `<pv>` / `Server:` / `Type:` label block; the
+                // `--show-credentials` `#` line above is a Rust-only
+                // diagnostic kept ahead of the pvxs-format block.
+                print!("{}", format::format_info_value(pv_name, server_addr, &desc));
             }
             Err(e) => {
                 eprintln!("{pv_name}: {e}");

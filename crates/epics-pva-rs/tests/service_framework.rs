@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServer, SharedSource};
-use epics_pva_rs::service::pva_service;
+use epics_pva_rs::service::{Status, pva_service};
 
 #[derive(Default)]
 struct Counter {
@@ -32,6 +32,20 @@ impl Counter {
     /// Square the input. Pure compute, no state.
     async fn square(&self, x: f64) -> Result<f64, String> {
         Ok(x * x)
+    }
+
+    /// Always fails — exercises the RPC operation-error path. The
+    /// method's `Err` must surface to the client as an RPC error
+    /// (wire `Status::error`), NOT a success NTRPCStatus payload.
+    async fn boom(&self) -> Result<i64, String> {
+        Err("intentional failure".into())
+    }
+
+    /// Returns an explicit app-level status payload. `Ok(Status::error)`
+    /// is a successful RPC carrying a not-ok NTRPCStatus body — distinct
+    /// from a method `Err`, which is an operation error.
+    async fn app_status(&self) -> Result<Status, String> {
+        Ok(Status::error("app-level not-ok"))
     }
 }
 
@@ -84,10 +98,12 @@ async fn pva_service_dispatch_round_trip() {
     let source = SharedSource::new();
     let registered = epics_pva_rs::service::add_rpc_service(&source, "counter", Counter::default())
         .expect("first registration must succeed");
-    assert_eq!(registered.len(), 3);
+    assert_eq!(registered.len(), 5);
     assert!(registered.contains(&"counter:add".to_string()));
     assert!(registered.contains(&"counter:reset".to_string()));
     assert!(registered.contains(&"counter:square".to_string()));
+    assert!(registered.contains(&"counter:boom".to_string()));
+    assert!(registered.contains(&"counter:app_status".to_string()));
 
     let server = PvaServer::isolated(Arc::new(source)).expect("isolated test server must start");
     let client = server.client_config();
@@ -144,6 +160,71 @@ async fn pva_service_dispatch_round_trip() {
         other => panic!("wrapper: {other:?}"),
     };
     assert_eq!(v2, 8); // 5 + 3
+}
+
+/// A service method that returns `Err(...)` must surface to the client
+/// as an RPC **operation error** (wire `Status::error`), NOT a success
+/// NTRPCStatus payload. Pre-fix the macro wrapped every return in
+/// `Ok(...)` and the blanket `IntoServiceResponse for Result` turned
+/// `Err` into a success NTRPCStatus{ok=false} body, so `pvrpc`
+/// resolved to `Ok`. Now the macro routes `Err` to
+/// `ServiceError::Method` → wire `Status::error`, so `pvrpc` resolves
+/// to `Err` — pvxs `op->error`, client `RemoteError`
+/// (`test/testrpc.cpp:193-209`). The companion case pins the other
+/// boundary: an explicit `Ok(Status::error(...))` is still a
+/// SUCCESSFUL RPC carrying a not-ok status body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pva_service_method_err_surfaces_as_rpc_error() {
+    let source = SharedSource::new();
+    epics_pva_rs::service::add_rpc_service(&source, "counter", Counter::default())
+        .expect("registration must succeed");
+    let server = PvaServer::isolated(Arc::new(source)).expect("isolated test server must start");
+    let client = server.client_config();
+
+    // counter:boom always returns Err — the client RPC must error.
+    let (desc, value) = nturi_request(&[]);
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.pvrpc("counter:boom", &desc, &value),
+    )
+    .await
+    .expect("rpc timeout")
+    .expect_err("a method Err must surface as an RPC operation error, not Ok");
+    assert!(
+        err.to_string().contains("intentional failure"),
+        "the RPC error must carry the method's message, got: {err}"
+    );
+
+    // counter:app_status returns Ok(Status::error(..)) — an explicit
+    // app-level status payload is still a SUCCESSFUL RPC carrying a
+    // not-ok NTRPCStatus body (distinct from a method Err).
+    let (desc, value) = nturi_request(&[]);
+    let (_, resp) = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.pvrpc("counter:app_status", &desc, &value),
+    )
+    .await
+    .expect("rpc timeout")
+    .expect("an explicit Ok(Status) is a successful RPC");
+    match resp {
+        PvField::Structure(s) => {
+            assert!(
+                matches!(
+                    s.get_field("ok"),
+                    Some(PvField::Scalar(ScalarValue::Boolean(false)))
+                ),
+                "app_status body must carry ok=false"
+            );
+            assert!(
+                matches!(
+                    s.get_field("message"),
+                    Some(PvField::Scalar(ScalarValue::String(m))) if m == "app-level not-ok"
+                ),
+                "app_status body must carry the message"
+            );
+        }
+        other => panic!("unexpected app_status response: {other:?}"),
+    }
 }
 
 /// Direct-struct RPC request shape: arguments live at the top
@@ -224,7 +305,7 @@ async fn add_rpc_service_rejects_colliding_registration() {
     let source = SharedSource::new();
     let first = epics_pva_rs::service::add_rpc_service(&source, "counter", Counter::default())
         .expect("first registration must succeed");
-    assert_eq!(first.len(), 3);
+    assert_eq!(first.len(), 5);
 
     // A second service under the same prefix collides on the very
     // first method (`counter:add`). pvxs `StaticSource::add()` rejects
@@ -234,14 +315,20 @@ async fn add_rpc_service_rejects_colliding_registration() {
         .expect_err("colliding registration must be rejected");
     assert!(err.0.contains("counter:add"), "unexpected error: {err}");
 
-    // All three original PVs are still present and exactly three exist:
+    // All five original PVs are still present and exactly five exist:
     // the rejected call rolled itself back, adding nothing.
-    for name in ["counter:add", "counter:reset", "counter:square"] {
+    for name in [
+        "counter:add",
+        "counter:reset",
+        "counter:square",
+        "counter:boom",
+        "counter:app_status",
+    ] {
         assert!(source.has_pv(name).await, "{name} must remain registered");
     }
     assert_eq!(
         source.list_pvs().await.len(),
-        3,
+        5,
         "no extra PVs from the rejected call"
     );
 }

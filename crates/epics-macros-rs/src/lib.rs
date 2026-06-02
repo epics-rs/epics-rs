@@ -772,16 +772,44 @@ pub fn derive_nt_scalar(input: TokenStream) -> TokenStream {
     expanded.into()
 }
 
+/// True when a method's return type is a `Result<…>` (matched by the
+/// path's last segment, so `Result`, `std::result::Result`,
+/// `anyhow::Result`, … all qualify). A `Result`-returning service
+/// method routes its `Err` to the RPC operation-error path; any other
+/// return type is encoded directly as a success response.
+fn method_returns_result(output: &syn::ReturnType) -> bool {
+    let syn::ReturnType::Type(_, ty) = output else {
+        return false;
+    };
+    let syn::Type::Path(tp) = &**ty else {
+        return false;
+    };
+    tp.path
+        .segments
+        .last()
+        .is_some_and(|seg| seg.ident == "Result")
+}
+
 /// `#[pva_service]` — turn an `impl Block` for a service struct
 /// into a [`PvaService`] (in `epics_pva_rs::service`). Every async
 /// method becomes a wire-callable RPC; positional parameters are
-/// extracted from the request struct's named fields, the return
-/// value is encoded via [`IntoServiceResponse`].
+/// extracted from the request struct's named fields.
+///
+/// Return-value contract:
+/// - a method returning `Result<T, E>` (`T: IntoServiceResponse`,
+///   `E: Display`) is the idiomatic form: `Ok(T)` is encoded as the
+///   success response, and `Err(e)` becomes an **RPC operation error**
+///   (wire `Status::error`), so the client's call resolves to an error
+///   — matching pvxs `op->error(...)` (`sharedpv.cpp:162-180`,
+///   `test/testrpc.cpp:193-209`). An app that wants an explicit
+///   non-error status payload returns `Ok(Status::error(...))`.
+/// - a method returning a plain `T: IntoServiceResponse` is always a
+///   success response.
 ///
 /// Restrictions:
 /// - methods must be `&self` async
 /// - parameters must implement `ServiceArg`
-/// - return type must implement `IntoServiceResponse`
+/// - the success type must implement `IntoServiceResponse`
 ///
 /// ```ignore
 /// struct MotorService { driver: Arc<Driver> }
@@ -831,6 +859,34 @@ pub fn pva_service(_attr: TokenStream, item: TokenStream) -> TokenStream {
             arg_tys.push((*pat_ty.ty).clone());
         }
 
+        // A `Result`-returning method routes `Err` to the RPC
+        // operation-error path (`ServiceError::Method` → wire
+        // `Status::error`, pvxs `op->error`); `Ok(T)` is encoded as the
+        // success response. A non-`Result` return is always a success
+        // response. The branch lives here, not in an `IntoServiceResponse
+        // for Result` impl, so an `Err` can never be silently encoded as
+        // a success NTRPCStatus payload.
+        let return_handling = if method_returns_result(&m.sig.output) {
+            quote! {
+                match __out {
+                    ::core::result::Result::Ok(__v) => ::core::result::Result::Ok(
+                        #krate::service::types::IntoServiceResponse::into_service_response(__v),
+                    ),
+                    ::core::result::Result::Err(__e) => ::core::result::Result::Err(
+                        #krate::service::ServiceError::Method(
+                            ::std::string::ToString::to_string(&__e),
+                        ),
+                    ),
+                }
+            }
+        } else {
+            quote! {
+                ::core::result::Result::Ok(
+                    #krate::service::types::IntoServiceResponse::into_service_response(__out),
+                )
+            }
+        };
+
         let dispatch_arm = quote! {
             {
                 let __svc: ::std::sync::Arc<#self_ty> = self.clone();
@@ -845,7 +901,7 @@ pub fn pva_service(_attr: TokenStream, item: TokenStream) -> TokenStream {
                                     .get_named::<#arg_tys>(#arg_names)?;
                             )*
                             let __out = __svc.#method_ident(#( #arg_idents ),*).await;
-                            Ok(#krate::service::types::IntoServiceResponse::into_service_response(__out))
+                            #return_handling
                         })
                     }),
                 }

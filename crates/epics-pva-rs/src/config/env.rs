@@ -164,62 +164,173 @@ fn pick_v4_preferred(iter: impl Iterator<Item = SocketAddr>) -> Option<SocketAdd
     v4.or(v6)
 }
 
-/// Parse a `EPICS_PVA_ADDR_LIST`-style string (comma/whitespace
-/// separated) into a list of `SocketAddr`. Accepts plain IPs (gets
-/// `default_port` appended), `ip:port`, DNS hostnames (resolves via
-/// `ToSocketAddrs`), and `hostname:port`. Unresolvable entries are
-/// dropped with a debug log so operators can spot the silent miss.
+/// Parse a `EPICS_PVA_ADDR_LIST`-style string into a list of
+/// `SocketAddr`, discarding any per-entry multicast modifiers. Entries are
+/// **whitespace-separated** (pvxs `split_addr_into`, `config.cpp:151-169`);
+/// each is an `<addr>[,ttl][@iface]` [`Endpoint`] whose address is kept.
+/// Accepts plain IPs (gets `default_port` appended), `ip:port`, DNS
+/// hostnames, and `hostname:port`; unresolvable entries are dropped with a
+/// debug log.
+///
+/// The comma is **not** a separator — it is multicast-TTL syntax inside an
+/// entry, matching pvxs. Callers that must honour the TTL / interface
+/// modifiers on the UDP send path use [`parse_endpoints_with_port`]
+/// instead.
+pub fn parse_addr_list_with_port(env: &str, default_port: u16) -> Vec<SocketAddr> {
+    parse_endpoints_with_port(env, default_port)
+        .into_iter()
+        .map(|e| e.addr)
+        .collect()
+}
+
+/// A parsed address-list entry: a destination socket address plus the
+/// optional multicast modifiers pvxs carries in a `SockEndpoint`
+/// (`config.cpp:32-61`):
+///
+/// ```text
+/// <IP46>
+/// <IP46>,<ttl#>
+/// <IP46>@ifacename
+/// <IP46>,<ttl#>@ifacename
+/// ```
+///
+/// The comma (multicast TTL) must precede the `@` (outgoing interface).
+/// `ttl`/`iface` are only meaningful for multicast destinations: pvxs's
+/// `operator<<` re-prints them only when `addr.isMCast()`, and the send
+/// path applies `IP_MULTICAST_TTL` / `IP_MULTICAST_IF` only for multicast
+/// (`evhelper.cpp:556-577`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoint {
+    /// Resolved destination (IP + port).
+    pub addr: SocketAddr,
+    /// Multicast TTL (`,<n>` modifier). `None` = OS default. Applied only
+    /// when `addr` is a multicast group.
+    pub ttl: Option<u32>,
+    /// Outgoing interface (`@name-or-ip` modifier), verbatim from the
+    /// token. `None` = OS default route. Applied only for multicast.
+    pub iface: Option<String>,
+}
+
+impl Endpoint {
+    /// Parse one whitespace-delimited address-list token into an
+    /// [`Endpoint`], appending `default_port` when the address carries no
+    /// port. Mirrors pvxs `SockEndpoint::SockEndpoint` (`config.cpp:32-61`)
+    /// for the `<addr>[,ttl][@iface]` grammar; the address itself resolves
+    /// through the same IP / `host:port` / DNS path as the rest of the list
+    /// (so a hostname endpoint still resolves). Returns `None` when the
+    /// address fails to resolve or the grammar is violated (comma after
+    /// `@`, unparseable TTL), logging at `debug` so an operator can spot
+    /// the dropped token — matching the existing drop-with-log behaviour
+    /// for unresolvable entries.
+    pub fn parse(token: &str, default_port: u16) -> Option<Endpoint> {
+        let token = token.trim();
+        if token.is_empty() {
+            return None;
+        }
+        let comma = token.find(',');
+        let at = token.find('@');
+        // pvxs: "comma expected before @" — a `@iface,ttl` ordering is a
+        // syntax error, not a silent reinterpretation.
+        if let (Some(c), Some(a)) = (comma, at) {
+            if c > a {
+                tracing::debug!(
+                    token = %token,
+                    "EPICS_PVA addr-list: comma after @ (expected addr,ttl@iface)"
+                );
+                return None;
+            }
+        }
+        let (addr_str, ttl_str, iface) = match comma.or(at) {
+            // No modifiers — the whole token is the address.
+            None => (token, None, None),
+            Some(first) => {
+                let addr_str = &token[..first];
+                let ttl_str = match (comma, at) {
+                    (Some(c), Some(a)) => Some(&token[c + 1..a]),
+                    (Some(c), None) => Some(&token[c + 1..]),
+                    _ => None,
+                };
+                let iface = at.and_then(|a| {
+                    let s = token[a + 1..].trim();
+                    (!s.is_empty()).then(|| s.to_string())
+                });
+                (addr_str, ttl_str, iface)
+            }
+        };
+        let ttl = match ttl_str {
+            Some(s) => match s.trim().parse::<u32>() {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::debug!(
+                        token = %token,
+                        ttl = %s,
+                        error = %e,
+                        "EPICS_PVA addr-list: bad multicast TTL"
+                    );
+                    return None;
+                }
+            },
+            None => None,
+        };
+        let addr = resolve_token_addr(addr_str.trim(), default_port)?;
+        Some(Endpoint { addr, ttl, iface })
+    }
+}
+
+/// Resolve a single address token (no multicast modifiers) to a
+/// `SocketAddr`, appending `default_port` when no port is present. Shared
+/// by [`Endpoint::parse`] and [`parse_addr_list_with_port`].
 ///
 /// P-6 (BUG_ARCHAEOLOGY libca a8e8d22c3): the previous parser only
-/// accepted literal IPs, silently dropping every DNS hostname. C
-/// libca had a 32-byte buffer truncation bug; we had a stricter
-/// "drop the whole token" bug — same operator-visible symptom of
-/// "Empty PV search address list" with no actionable error.
-pub fn parse_addr_list_with_port(env: &str, default_port: u16) -> Vec<SocketAddr> {
+/// accepted literal IPs, silently dropping every DNS hostname. C libca had
+/// a 32-byte buffer truncation bug; we had a stricter "drop the whole
+/// token" bug — same operator-visible symptom of "Empty PV search address
+/// list" with no actionable error. Accepts a bracketed `[v6]:port`, a bare
+/// IP, or a `host[:port]` / bare hostname resolved via DNS (IPv4 preferred
+/// — this stack's `AsyncUdpV4` is IPv4-only and would reject a V6
+/// destination at send time; macOS commonly orders `::1` before
+/// `127.0.0.1`, so taking the first answer would silently drop unicast
+/// SEARCH to localhost). Returns `None` (with a `debug` log) for an
+/// unresolvable token.
+fn resolve_token_addr(s: &str, default_port: u16) -> Option<SocketAddr> {
     use std::net::ToSocketAddrs;
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(sa) = s.parse::<SocketAddr>() {
+        return Some(sa);
+    }
+    if let Ok(ip) = s.parse::<IpAddr>() {
+        return Some(SocketAddr::new(ip, default_port));
+    }
+    let with_port = if s.contains(':') {
+        s.to_string()
+    } else {
+        format!("{s}:{default_port}")
+    };
+    match with_port.to_socket_addrs() {
+        Ok(iter) => pick_v4_preferred(iter).or_else(|| {
+            tracing::debug!(token = %s, "EPICS_PVA addr-list: empty resolution");
+            None
+        }),
+        Err(e) => {
+            tracing::debug!(token = %s, error = %e, "EPICS_PVA addr-list: resolve failed");
+            None
+        }
+    }
+}
+
+/// Endpoint-preserving variant of [`parse_addr_list_with_port`]: splits on
+/// WHITESPACE only (pvxs `split_addr_into`, `config.cpp:151-169` — the
+/// comma is multicast-TTL syntax, never a list separator) and keeps each
+/// entry's multicast TTL / interface modifiers for the UDP send path.
+pub fn parse_endpoints_with_port(env: &str, default_port: u16) -> Vec<Endpoint> {
     // PVA-466: pre-expand $(VAR) refs so callers can write
     // `EPICS_PVA_ADDR_LIST="$(IOC_HOST):5076"` (matching the dbLoad
     // macro-expansion convention).
     let env = expand_dollar_vars(env);
-    let env = env.as_str();
-    env.split(|c: char| c == ',' || c.is_whitespace())
-        .filter_map(|s| {
-            let s = s.trim();
-            if s.is_empty() {
-                return None;
-            }
-            // 1. Bracketed IPv6 with port: `[::1]:5064`.
-            if let Ok(sa) = s.parse::<SocketAddr>() {
-                return Some(sa);
-            }
-            // 2. Bare IP (v4 or v6) — append default port.
-            if let Ok(ip) = s.parse::<IpAddr>() {
-                return Some(SocketAddr::new(ip, default_port));
-            }
-            // 3. `host:port` or bare hostname — synchronous DNS
-            //    resolve via ToSocketAddrs. Prefer the first IPv4
-            //    answer over IPv6: this stack's `AsyncUdpV4` is
-            //    IPv4-only and would reject a V6 destination at
-            //    send time. macOS commonly orders IPv6 ahead of
-            //    IPv4 (e.g. `localhost` → `::1` before `127.0.0.1`)
-            //    so taking the first answer unconditionally would
-            //    silently drop unicast SEARCH to localhost.
-            let with_port = if s.contains(':') {
-                s.to_string()
-            } else {
-                format!("{s}:{default_port}")
-            };
-            match with_port.to_socket_addrs() {
-                Ok(iter) => pick_v4_preferred(iter).or_else(|| {
-                    tracing::debug!(token = %s, "EPICS_PVA addr-list: empty resolution");
-                    None
-                }),
-                Err(e) => {
-                    tracing::debug!(token = %s, error = %e, "EPICS_PVA addr-list: resolve failed");
-                    None
-                }
-            }
-        })
+    env.split_whitespace()
+        .filter_map(|tok| Endpoint::parse(tok, default_port))
         .collect()
 }
 
@@ -635,7 +746,10 @@ pub fn list_intf_addresses() -> Vec<IpAddr> {
         .ok()
         .map(|s| {
             let s = expand_dollar_vars(&s);
-            s.split(|c: char| c == ',' || c.is_whitespace())
+            // pvxs splits address lists on WHITESPACE only (`split_addr_into`,
+            // config.cpp:151-169); the comma is endpoint syntax, never a list
+            // separator. Interface lists carry no multicast modifiers.
+            s.split_whitespace()
                 .filter_map(|t| t.trim().parse::<IpAddr>().ok())
                 .collect()
         })
@@ -658,8 +772,10 @@ pub fn server_intf_addr_list() -> Vec<IpAddr> {
     if let Ok(s) = std::env::var("EPICS_PVAS_INTF_ADDR_LIST") {
         // PVA-466: expand $(VAR) refs before tokenising.
         let s = expand_dollar_vars(&s);
+        // Whitespace-only split (pvxs `split_addr_into`, config.cpp:151-169):
+        // the comma is endpoint syntax, not a list separator.
         return s
-            .split(|c: char| c == ',' || c.is_whitespace())
+            .split_whitespace()
             .filter_map(|t| {
                 let t = t.trim();
                 if t.is_empty() {
@@ -704,7 +820,9 @@ pub fn server_ignore_addr_list() -> Vec<(IpAddr, u16)> {
     };
     // PVA-466: expand $(VAR) refs before tokenising.
     let raw = expand_dollar_vars(&raw);
-    raw.split(|c: char| c == ',' || c.is_whitespace())
+    // Whitespace-only split (pvxs `split_addr_into`, config.cpp:151-169):
+    // the comma is endpoint syntax, not a list separator.
+    raw.split_whitespace()
         .filter_map(|s| {
             let s = s.trim();
             if s.is_empty() {
@@ -1015,6 +1133,72 @@ mod tests {
         assert_eq!(addrs.len(), 2);
         assert_eq!(addrs[0].port(), 1234);
         assert_eq!(addrs[1].port(), 9876);
+    }
+
+    /// pvxs `SockEndpoint` grammar (`config.cpp:32-61`): the four legal
+    /// forms `<addr>`, `<addr>,<ttl>`, `<addr>@iface`, `<addr>,<ttl>@iface`,
+    /// plus an explicit port carried in the address part.
+    #[test]
+    fn endpoint_parse_all_grammar_forms() {
+        let plain = Endpoint::parse("224.0.2.3", 5076).expect("plain addr");
+        assert_eq!(plain.addr, "224.0.2.3:5076".parse().unwrap());
+        assert_eq!(plain.ttl, None);
+        assert_eq!(plain.iface, None);
+
+        let ttl = Endpoint::parse("224.0.2.3,5", 5076).expect("addr,ttl");
+        assert_eq!(ttl.addr, "224.0.2.3:5076".parse().unwrap());
+        assert_eq!(ttl.ttl, Some(5));
+        assert_eq!(ttl.iface, None);
+
+        let iface = Endpoint::parse("224.0.2.3@eth0", 5076).expect("addr@iface");
+        assert_eq!(iface.ttl, None);
+        assert_eq!(iface.iface.as_deref(), Some("eth0"));
+
+        let both = Endpoint::parse("224.0.2.3,5@eth0", 5076).expect("addr,ttl@iface");
+        assert_eq!(both.addr, "224.0.2.3:5076".parse().unwrap());
+        assert_eq!(both.ttl, Some(5));
+        assert_eq!(both.iface.as_deref(), Some("eth0"));
+
+        // An explicit port in the address part survives the modifiers.
+        let ported = Endpoint::parse("224.0.2.3:9999,5@eth0", 5076).expect("addr:port,ttl@iface");
+        assert_eq!(ported.addr, "224.0.2.3:9999".parse().unwrap());
+        assert_eq!(ported.ttl, Some(5));
+        assert_eq!(ported.iface.as_deref(), Some("eth0"));
+    }
+
+    /// Grammar violations and empties are dropped (return `None`), matching
+    /// pvxs which rejects rather than silently reinterpreting.
+    #[test]
+    fn endpoint_parse_rejects_malformed() {
+        // pvxs: the comma (TTL) must precede the `@` (iface).
+        assert_eq!(Endpoint::parse("224.0.2.3@eth0,5", 5076), None);
+        // Non-numeric TTL.
+        assert_eq!(Endpoint::parse("224.0.2.3,abc", 5076), None);
+        // Empty address part.
+        assert_eq!(Endpoint::parse(",5", 5076), None);
+        assert_eq!(Endpoint::parse("@eth0", 5076), None);
+        // Empty / whitespace token.
+        assert_eq!(Endpoint::parse("", 5076), None);
+        assert_eq!(Endpoint::parse("   ", 5076), None);
+    }
+
+    /// The list splits on WHITESPACE only (pvxs `split_addr_into`); a comma
+    /// is endpoint syntax, so it never multiplies the entry count.
+    #[test]
+    fn parse_endpoints_whitespace_only_split() {
+        let eps = parse_endpoints_with_port("224.0.2.3,5@eth0 10.0.0.1 192.168.0.1:9", 5076);
+        assert_eq!(eps.len(), 3, "three whitespace-separated endpoints");
+        assert_eq!(eps[0].addr, "224.0.2.3:5076".parse().unwrap());
+        assert_eq!(eps[0].ttl, Some(5));
+        assert_eq!(eps[0].iface.as_deref(), Some("eth0"));
+        assert_eq!(eps[1].addr, "10.0.0.1:5076".parse().unwrap());
+        assert_eq!(eps[2].addr, "192.168.0.1:9".parse().unwrap());
+
+        // `parse_addr_list_with_port` is the addr-only projection: same
+        // count, modifiers discarded.
+        let addrs = parse_addr_list_with_port("224.0.2.3,5@eth0 10.0.0.1", 5076);
+        assert_eq!(addrs.len(), 2);
+        assert_eq!(addrs[0], "224.0.2.3:5076".parse().unwrap());
     }
 
     #[test]

@@ -34,36 +34,26 @@ use epics_pva_rs::server_native::{ChannelSource, OpError, PvaServer, PvaServerCo
 struct EmptySource;
 
 impl ChannelSource for EmptySource {
-    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
-        async { Vec::new() }
+    async fn list_pvs(&self) -> Vec<String> {
+        Vec::new()
     }
-    fn has_pv(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
-        async { false }
+    async fn has_pv(&self, _: &str) -> bool {
+        false
     }
-    fn get_introspection(
-        &self,
-        _: &str,
-    ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
-        async { None }
+    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+        None
     }
-    fn get_value(&self, _: &str) -> impl std::future::Future<Output = Option<PvField>> + Send {
-        async { None }
+    async fn get_value(&self, _: &str) -> Option<PvField> {
+        None
     }
-    fn put_value(
-        &self,
-        _: &str,
-        _: PvField,
-    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
-        async { Err("read-only".into()) }
+    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+        Err("read-only".into())
     }
-    fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
-        async { false }
+    async fn is_writable(&self, _: &str) -> bool {
+        false
     }
-    fn subscribe(
-        &self,
-        _: &str,
-    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
-        async { None }
+    async fn subscribe(&self, _: &str) -> Option<mpsc::Receiver<PvField>> {
+        None
     }
 }
 
@@ -127,10 +117,20 @@ async fn server_relatches_outbound_order_on_mid_stream_set_byte_order() {
         // server bit is clear (client → server). EchoRequest's own order is
         // Little so the response order can only come from the latch.
         let mut out = Vec::new();
-        PvaHeader::control(false, ByteOrder::Big, ControlCommand::SetByteOrder.code(), 0)
-            .write_into(&mut out);
-        PvaHeader::control(false, ByteOrder::Little, ControlCommand::EchoRequest.code(), 0)
-            .write_into(&mut out);
+        PvaHeader::control(
+            false,
+            ByteOrder::Big,
+            ControlCommand::SetByteOrder.code(),
+            0,
+        )
+        .write_into(&mut out);
+        PvaHeader::control(
+            false,
+            ByteOrder::Little,
+            ControlCommand::EchoRequest.code(),
+            0,
+        )
+        .write_into(&mut out);
         stream.write_all(&out).expect("write control frames");
 
         // The server's echo response must adopt the re-latched Big order.

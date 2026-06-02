@@ -305,9 +305,14 @@ impl SearchEngine {
         let env_has_dest = env_addrs
             .as_deref()
             .map(|s| crate::config::env::expand_dollar_vars(s))
+            // Whitespace-only token test (pvxs `split_addr_into`): the comma
+            // and `@` are endpoint modifiers, so a token contributes a
+            // destination only when its address part (before any `,`/`@`) is
+            // non-empty — matching `Endpoint::parse`, which drops a token
+            // with an empty address. A bare-comma string is still "no dest".
             .map(|s| {
-                s.split(|c: char| c == ',' || c.is_whitespace())
-                    .any(|t| !t.trim().is_empty())
+                s.split_whitespace()
+                    .any(|t| !t.split([',', '@']).next().unwrap_or("").is_empty())
             })
             .unwrap_or(false);
         if extra_targets.is_empty() && !env_has_dest && !auto_on {
@@ -712,20 +717,18 @@ pub(crate) fn join_addr_list_multicast(sock: &AsyncUdpV4) {
     let Ok(env) = std::env::var("EPICS_PVA_ADDR_LIST") else {
         return;
     };
-    // PVA-466: expand $(VAR) so multicast joins for templated addrs
-    // (e.g. EPICS_PVA_ADDR_LIST="$(MCAST_GROUP):5076") resolve
-    // consistently with the active-SEARCH path which already
-    // expands via parse_addr_list_with_port.
-    let env = crate::config::env::expand_dollar_vars(&env);
-    for tok in env.split(|c: char| c == ',' || c.is_whitespace()) {
-        let tok = tok.trim();
-        if tok.is_empty() {
-            continue;
-        }
-        let ip_str = tok.split(':').next().unwrap_or(tok);
-        let Ok(ip) = ip_str.parse::<Ipv4Addr>() else {
+    // Route through the single address-list parser
+    // (`parse_endpoints_with_port`) instead of a private comma-split +
+    // `:`-split: it splits on WHITESPACE only (pvxs `split_addr_into` —
+    // the comma is endpoint syntax, not a list separator), expands
+    // `$(VAR)` macros, and resolves DNS / bracketed-v6 the same way the
+    // active-SEARCH path does. We keep only the V4 multicast groups.
+    let bport = crate::config::env::broadcast_port();
+    for ep in crate::config::env::parse_endpoints_with_port(&env, bport) {
+        let SocketAddr::V4(v4) = ep.addr else {
             continue;
         };
+        let ip = *v4.ip();
         if ip.is_multicast() {
             if let Err(e) = sock.join_multicast_v4(ip) {
                 debug!("join_multicast_v4 for {ip} failed: {e}");

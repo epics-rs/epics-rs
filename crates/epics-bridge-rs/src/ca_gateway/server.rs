@@ -667,6 +667,13 @@ impl GatewayServer {
     /// existent upstream connection state (`Inactive`/`Active`) — a
     /// disconnected shadow PV answers does-not-exist without being removed.
     ///
+    /// The host-scoped `.pvlist` admission (1) applies to the gateway's own
+    /// stat / heartbeat / control PVs too, not just cached shadow PVs: C
+    /// runs `findEntry` on every name before its stat-prefix branch
+    /// (gateServer.cc:1564-1573), so under a restrictive `.pvlist` that
+    /// omits the stat prefix those PVs answer does-not-exist as in C. They
+    /// skip only the connection-state check (2), having no upstream entry.
+    ///
     /// Called once during build().
     async fn install_existence_gate(&self) {
         let pvlist = self.pvlist.clone();
@@ -679,19 +686,19 @@ impl GatewayServer {
                 let pvlist = pvlist.clone();
                 let cache = cache.clone();
                 Box::pin(async move {
-                    // Stats / heartbeat PVs are not gateway-managed (they
-                    // are published straight into the shadow DB and never
-                    // enter the upstream cache); they always exist and are
-                    // subject to neither `.pvlist` admission nor upstream
-                    // connection state.
-                    let entry = match cache.read().await.get(&name) {
-                        Some(e) => e,
-                        None => return true,
-                    };
-                    // Gateway-managed shadow PV: re-run host-scoped
-                    // `.pvlist` admission for this requester. A host-less
-                    // internal lookup (`peer: None`) falls back to the
-                    // global rule decision, matching the search resolver.
+                    // Host-scoped `.pvlist` admission runs FIRST on every
+                    // name — gateway-managed shadow PVs AND the gateway's
+                    // own stat / heartbeat / control PVs alike. C runs
+                    // `gateAs::findEntry(pvname, host)` (gateAs.h:270-276)
+                    // on every name in `pvExistTest` before the stat-prefix
+                    // branch is even reached (gateServer.cc:1564-1573), so a
+                    // restrictive `.pvlist` that omits the stat prefix yields
+                    // does-not-exist for the stat PVs too. A host-less
+                    // internal lookup (`peer: None`) falls back to the global
+                    // rule decision, matching the search resolver. With no
+                    // `.pvlist` configured the implicit `.* ALLOW` admits
+                    // everything, so a pass-through gateway still serves its
+                    // stats.
                     let admitted = {
                         let pvlist = pvlist.load_full();
                         match peer {
@@ -704,9 +711,20 @@ impl GatewayServer {
                     if !admitted {
                         return false;
                     }
-                    // Upstream connection state: a disconnected shadow PV
-                    // must answer does-not-exist. C `pvExistTest` replies
-                    // `pverExistsHere` only for `gatePvInactive` /
+                    // Stat / heartbeat / control PVs are published straight
+                    // into the shadow DB and never enter the upstream cache.
+                    // They carry no upstream connection state, so once
+                    // `.pvlist`-admitted they exist unconditionally — no
+                    // `is_existent()` check is owed (C's stat branch returns
+                    // `pverExistsHere` directly once findEntry passes,
+                    // gateServer.cc:1586-1616).
+                    let entry = match cache.read().await.get(&name) {
+                        Some(e) => e,
+                        None => return true,
+                    };
+                    // Gateway-managed shadow PV: additionally require an
+                    // existent upstream connection state. C `pvExistTest`
+                    // replies `pverExistsHere` only for `gatePvInactive` /
                     // `gatePvActive`; `gatePvDisconnect` (and Connecting /
                     // Dead) reply `pverDoesNotExistHere`
                     // (gateServer.cc:1618-1637). The shadow PV stays in the
@@ -1510,6 +1528,65 @@ mod tests {
                 .set_state(crate::ca_gateway::PvState::Inactive);
         }
         assert!(server.shadow_db.has_name_from("PV:y", Some(peer)).await);
+    }
+
+    /// A restrictive `.pvlist` that omits the stat prefix must hide the
+    /// gateway's own stat / heartbeat / control PVs too. C runs
+    /// `gateAs::findEntry` (gateAs.h:270-276) on every name before its
+    /// stat-prefix branch (gateServer.cc:1564-1573), so a stat PV not
+    /// admitted by `.pvlist` answers does-not-exist. Pre-fix the gate's
+    /// cache-miss path returned `true` unconditionally — stat PVs live in
+    /// `simple_pvs` and never in the upstream cache, so the gate always
+    /// cache-misses on them and leaked them past a restrictive pvlist.
+    #[tokio::test]
+    async fn existence_gate_applies_pvlist_admission_to_stat_pvs() {
+        use std::net::SocketAddr;
+
+        let peer: SocketAddr = "192.0.2.5:5064".parse().unwrap();
+
+        // Restrictive pvlist: only `PV.*` is allowed; the `gateway:` stat
+        // prefix is NOT. `build()` publishes the stat PVs into the shadow
+        // DB, so `gateway:heartbeat` is in `simple_pvs` but must not be
+        // advertised under this pvlist.
+        let config = GatewayConfig {
+            pvlist_content: Some("PV.* ALLOW\n".to_string()),
+            stats_prefix: "gateway".to_string(),
+            ..Default::default()
+        };
+        let server = GatewayServer::build(config).await.unwrap();
+        // Registered in the shadow DB (gate-independent lookup).
+        assert!(
+            server
+                .shadow_db
+                .find_pv("gateway:heartbeat")
+                .await
+                .is_some(),
+            "build() must register the stat PV in the shadow DB"
+        );
+        // But hidden by the restrictive pvlist that omits the stat prefix.
+        assert!(
+            !server
+                .shadow_db
+                .has_name_from("gateway:heartbeat", Some(peer))
+                .await,
+            "restrictive pvlist omitting the stat prefix must hide stat PVs (C findEntry)"
+        );
+
+        // Permissive pvlist that DOES admit the stat prefix: the same stat
+        // PV is advertised.
+        let config = GatewayConfig {
+            pvlist_content: Some("PV.* ALLOW\ngateway.* ALLOW\n".to_string()),
+            stats_prefix: "gateway".to_string(),
+            ..Default::default()
+        };
+        let server = GatewayServer::build(config).await.unwrap();
+        assert!(
+            server
+                .shadow_db
+                .has_name_from("gateway:heartbeat", Some(peer))
+                .await,
+            "a pvlist admitting the stat prefix must serve stat PVs"
+        );
     }
 
     #[tokio::test]

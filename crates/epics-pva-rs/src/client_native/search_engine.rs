@@ -779,14 +779,16 @@ const N_SEARCH_BUCKETS: usize = 30;
 const POKE_HOLDOFF: Duration = Duration::from_secs(30);
 
 /// pvxs fixed SEARCH sequence id `search_seq` (client.cpp:71-73): the
-/// ASCII bytes `"find"` (0x66 0x69 0x6e 0x64). pvxs stamps this value
-/// into every discovery SEARCH and only treats a `found=false`,
-/// zero-channel UDP SEARCH_RESPONSE as a discovery pong when its decoded
-/// sequence equals `search_seq` (client.cpp:889). Using a fixed,
-/// recognizable value lets the pong path reject stray/unrelated
-/// `found=false` replies instead of promoting any of them to a fake
-/// beacon.
-const DISCOVER_SEQ: u32 = 0x6669_6e64;
+/// ASCII bytes `"find"` (0x66 0x69 0x6e 0x64). pvxs stamps this single
+/// value into EVERY outgoing SEARCH — regular and discovery alike — via
+/// the shared `tickSearch` emit loop (client.cpp:1072), with the comment
+/// "searchSequenceID in CMD_SEARCH is redundant. So we use a static
+/// value". It also only treats a `found=false`, zero-channel UDP
+/// SEARCH_RESPONSE as a discovery pong when its decoded sequence equals
+/// `search_seq` (client.cpp:889). Using a fixed, recognizable value lets
+/// the pong path reject stray/unrelated `found=false` replies instead of
+/// promoting any of them to a fake beacon.
+const SEARCH_SEQ: u32 = 0x6669_6e64;
 
 /// Decide which bucket to drop a fresh search into based on the
 /// caller's intent. Pure function so the production handlers and
@@ -1224,7 +1226,7 @@ async fn run_engine(
                     // gates on this exact value (client.cpp:889) so an
                     // unrelated found=false reply is not promoted to a fake
                     // beacon.
-                    let pkt = codec.build_discover_search(DISCOVER_SEQ, response_port);
+                    let pkt = codec.build_discover_search(SEARCH_SEQ, response_port);
                     broadcast(&search_socket, search_socket_v6.as_ref(), &pkt, &extra_targets, &client_interfaces, &mut search_send_errs).await;
                 }
                 None => break,
@@ -1972,7 +1974,7 @@ fn handle_search_response(
     // backoff — fabricating discovery activity nobody requested.
     //
     // pvxs additionally gates on `seq==search_seq` (client.cpp:889): the
-    // discovery pong must echo the fixed `DISCOVER_SEQ` we stamped into the
+    // discovery pong must echo the fixed `SEARCH_SEQ` we stamped into the
     // outgoing discovery SEARCH. A `found=false`/zero-cid reply carrying any
     // other sequence is some other server's SEARCH_RESPONSE, not a reply to
     // our DiscoverPing, and must NOT be promoted to a fake beacon.
@@ -1980,7 +1982,7 @@ fn handle_search_response(
         if !subscribers.is_empty()
             && !is_tcp
             && resp.cids.is_empty()
-            && resp.seq == DISCOVER_SEQ
+            && resp.seq == SEARCH_SEQ
             && !ignore_guids.contains(&resp.guid)
         {
             let server = rewrite_loopback(resp.server_addr, peer);
@@ -2245,7 +2247,10 @@ fn pack_search_frames(
     unicast: bool,
 ) -> Vec<Vec<u8>> {
     let build = |batch: &[(u32, &str)]| {
-        codec.build_search_batch(0, batch, [0, 0, 0, 0], response_port, unicast)
+        // pvxs stamps the fixed `search_seq` ("find") into EVERY SEARCH,
+        // not just discovery (client.cpp:1072, shared `tickSearch` loop);
+        // the searchSequenceID is redundant but must match the contract.
+        codec.build_search_batch(SEARCH_SEQ, batch, [0, 0, 0, 0], response_port, unicast)
     };
     let mut frames = Vec::new();
     let mut batch: Vec<(u32, &str)> = Vec::new();
@@ -2605,12 +2610,12 @@ mod tests {
     /// Build a server→client `SEARCH_RESPONSE` frame with `found=false`
     /// and zero channel IDs — the on-wire shape of a discovery pong
     /// (the reply to a `DiscoverPing`). The sequence echoes the fixed
-    /// `DISCOVER_SEQ` we stamp into the discovery SEARCH, which the pong
+    /// `SEARCH_SEQ` we stamp into the discovery SEARCH, which the pong
     /// path requires (pvxs client.cpp:889).
     fn found_false_response() -> Vec<u8> {
         crate::server_native::udp::build_search_response_proto(
             [0x42u8; 12],
-            DISCOVER_SEQ,
+            SEARCH_SEQ,
             5075,
             &[], // empty cids ⇒ found byte encodes false
             ByteOrder::Little,
@@ -2708,7 +2713,7 @@ mod tests {
 
     /// pvxs gates the discovery-pong fake-beacon branch on
     /// `seq==search_seq` (client.cpp:889). A `found=false`/zero-cid UDP
-    /// reply whose sequence is NOT our `DISCOVER_SEQ` is some other
+    /// reply whose sequence is NOT our `SEARCH_SEQ` is some other
     /// server's not-found reply, not a reply to our DiscoverPing, and
     /// must not be promoted to a fake beacon — even with an active
     /// `discover()` subscriber.
@@ -2717,7 +2722,7 @@ mod tests {
         // Same shape as found_false_response() but with a stray sequence.
         let frame = crate::server_native::udp::build_search_response_proto(
             [0x42u8; 12],
-            DISCOVER_SEQ ^ 0x1,
+            SEARCH_SEQ ^ 0x1,
             5075,
             &[],
             ByteOrder::Little,
@@ -2819,7 +2824,7 @@ mod tests {
         let mut poke2 = false;
         let pong = crate::server_native::udp::build_search_response_proto(
             IG,
-            DISCOVER_SEQ,
+            SEARCH_SEQ,
             5075,
             &[],
             ByteOrder::Little,
@@ -4542,5 +4547,29 @@ mod tests {
         }
         // Empty input produces no frames.
         assert!(pack_search_frames(&codec, &[], 5076, false).is_empty());
+    }
+
+    /// Every regular SEARCH carries the fixed pvxs `search_seq` ("find",
+    /// 0x6669_6e64) in its searchSequenceID, not 0. pvxs stamps this single
+    /// value on EVERY search via the shared `tickSearch` loop
+    /// (client.cpp:1072); the field is redundant but the contract is a
+    /// fixed value, not zero.
+    #[test]
+    fn pack_search_frames_stamps_search_seq() {
+        let codec = PvaCodec { big_endian: false };
+        let entries = vec![(7u32, "PV:SEQ".to_string())];
+        let frames = pack_search_frames(&codec, &entries, 5076, false);
+        assert_eq!(frames.len(), 1);
+        // The PVA payload begins after the 8-byte frame header; its first
+        // u32 is the searchSequenceID.
+        let seq = u32::from_le_bytes([frames[0][8], frames[0][9], frames[0][10], frames[0][11]]);
+        assert_eq!(
+            seq, SEARCH_SEQ,
+            "regular SEARCH must stamp search_seq, not 0"
+        );
+        assert_eq!(
+            SEARCH_SEQ, 0x6669_6e64,
+            "search_seq is the ASCII bytes \"find\""
+        );
     }
 }

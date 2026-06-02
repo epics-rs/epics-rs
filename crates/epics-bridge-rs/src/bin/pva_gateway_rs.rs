@@ -328,8 +328,11 @@ fn build_gateway(
             .map_err(|_| format!("server '{}': invalid interface '{}'", s.name, s.interface))?;
         // server addrlist × bcastport → beacon destinations
         // (EPICS_PVAS_BEACON_ADDR_LIST; gwmain.cpp:160-166 configure_server).
-        let beacon = parse_addr_list(&s.addrlist, s.bcastport)
-            .map_err(|e| format!("server '{}' addrlist: {e}", s.name))?;
+        // Use the endpoint-preserving parser so a multicast beacon target's
+        // `,ttl@iface` modifiers (pvxs SockEndpoint grammar) reach the UDP
+        // send path. Malformed tokens are dropped with a debug log — pvxs
+        // parity: a bad beacon address never aborts server startup.
+        let beacon = epics_pva_rs::config::parse_endpoints_with_port(&s.addrlist, s.bcastport);
         let server_config = PvaServerConfig {
             tcp_port: s.serverport,
             udp_port: s.bcastport,

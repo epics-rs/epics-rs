@@ -119,10 +119,12 @@ pub struct PvaServerConfig {
     /// notice the new server; further short-interval beacons just
     /// burn UDP bandwidth without informational gain.
     pub beacon_burst_count: u8,
-    /// Explicit beacon destinations. When empty (and `auto_beacon` is
-    /// true), emit per-NIC limited broadcast. From
-    /// `EPICS_PVAS_BEACON_ADDR_LIST`.
-    pub beacon_destinations: Vec<std::net::SocketAddr>,
+    /// Explicit beacon destinations, each carrying optional pvxs multicast
+    /// modifiers (TTL / outgoing interface; see [`crate::config::Endpoint`]).
+    /// When empty (and `auto_beacon` is true), emit per-NIC limited broadcast.
+    /// From `EPICS_PVAS_BEACON_ADDR_LIST`. A plain `SocketAddr` converts via
+    /// `.into()` (no modifiers).
+    pub beacon_destinations: Vec<crate::config::Endpoint>,
     /// Auto-discover per-NIC broadcast addresses for beacons. From
     /// `EPICS_PVAS_AUTO_BEACON_ADDR_LIST` (default true).
     pub auto_beacon: bool,
@@ -362,7 +364,7 @@ impl PvaServerConfig {
                 .saturating_mul(12)
                 .max(self.beacon_period + Duration::from_secs(1));
         }
-        if let Some(v) = env::server_beacon_addr_list_opt() {
+        if let Some(v) = env::server_beacon_endpoints_opt() {
             self.beacon_destinations = v;
         }
         if let Some(v) = env::auto_beacon_addr_list_enabled_opt() {

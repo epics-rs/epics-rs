@@ -508,6 +508,92 @@ impl AsyncUdpV4 {
         Ok(ok_count)
     }
 
+    /// Send a multicast datagram applying the pvxs per-endpoint options
+    /// (`evhelper.cpp:556-577`): the multicast TTL and the outgoing interface.
+    ///
+    /// - **Outgoing interface** is selected structurally by sending from the
+    ///   NIC socket bound to `iface_ip` — each NIC socket is bound to its NIC's
+    ///   address, so source-address routing forces multicast egress out that
+    ///   interface, making an `IP_MULTICAST_IF` setsockopt redundant (it is not
+    ///   set). `iface_ip == None` fans the datagram out every eligible NIC,
+    ///   matching the modifier-less multicast/broadcast behaviour of
+    ///   [`Self::fanout_to`].
+    /// - **TTL** (`IP_MULTICAST_TTL`) is applied to each target NIC socket
+    ///   immediately before its send and re-applied on every call, so a
+    ///   previous endpoint's TTL never sticks to a later one (pvxs sets it
+    ///   per-send too).
+    ///
+    /// CONTRACT: `IP_MULTICAST_TTL` is per-socket sticky state, not a
+    /// per-datagram option, so the caller MUST be the sole multicast sender on
+    /// the selected NIC socket(s). The PVA beacon task satisfies this: it is
+    /// the only task that issues multicast sends on the responder sockets and
+    /// its send loop is sequential; every other send on those sockets is
+    /// unicast, which ignores `IP_MULTICAST_TTL`. Do not call this from
+    /// multiple tasks sharing a NIC socket without external serialisation.
+    ///
+    /// Returns the number of NIC sockets the datagram was sent on; errors only
+    /// when no eligible NIC sent it (e.g. `iface_ip` matched no bound NIC).
+    pub async fn send_multicast_v4(
+        &self,
+        buf: &[u8],
+        dest: SocketAddr,
+        ttl: u32,
+        iface_ip: Option<Ipv4Addr>,
+    ) -> io::Result<usize> {
+        let mut ok_count = 0usize;
+        let mut last_err: Option<io::Error> = None;
+        for nic in &self.sockets {
+            if nic.is_loopback || nic.rx_only_bcast {
+                continue;
+            }
+            if let Some(want) = iface_ip {
+                if nic.iface_ip != want {
+                    continue;
+                }
+            }
+            // Apply IP_MULTICAST_TTL on this NIC immediately before the send
+            // (re-applied every call; see the method contract). A failure here
+            // is non-fatal — the datagram still egresses, at the prior TTL.
+            if let Err(e) = nic.sock.set_multicast_ttl_v4(ttl) {
+                tracing::debug!(
+                    target: "epics_base_rs::net",
+                    iface_ip = %nic.iface_ip,
+                    ttl,
+                    error = %e,
+                    "per-endpoint set_multicast_ttl_v4 failed; sending at prior TTL"
+                );
+            }
+            match nic.sock.send_to(buf, dest).await {
+                Ok(_) => ok_count += 1,
+                Err(e) => {
+                    tracing::debug!(
+                        target: "epics_base_rs::net",
+                        iface_ip = %nic.iface_ip,
+                        %dest,
+                        ttl,
+                        error = %e,
+                        "multicast send failed"
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+        if ok_count == 0 {
+            return Err(last_err.unwrap_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    match iface_ip {
+                        Some(ip) => {
+                            format!("AsyncUdpV4: no eligible NIC bound to {ip} for multicast")
+                        }
+                        None => "AsyncUdpV4: multicast had no eligible NICs".to_string(),
+                    },
+                )
+            }));
+        }
+        Ok(ok_count)
+    }
+
     /// Receive on whichever NIC's socket becomes ready first. Returns
     /// [`RecvMeta`] with the receiving NIC info synthesised.
     pub async fn recv_with_meta(&self, buf: &mut [u8]) -> io::Result<RecvMeta> {
@@ -1271,6 +1357,44 @@ mod tests {
             .await
             .expect_err("unknown iface must fail");
         assert_eq!(err.kind(), io::ErrorKind::AddrNotAvailable);
+    }
+
+    #[tokio::test]
+    async fn send_multicast_v4_unknown_iface_returns_addr_not_available() {
+        // An `@iface` that matches no bound NIC selects nothing → error,
+        // never a silent no-op (mirrors `send_via`'s unknown-iface contract).
+        let sock = AsyncUdpV4::bind(0, true).expect("bind");
+        let bogus = Ipv4Addr::new(203, 0, 113, 99);
+        let group = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(239, 1, 2, 3), 9999));
+        let err = sock
+            .send_multicast_v4(b"x", group, 1, Some(bogus))
+            .await
+            .expect_err("unknown iface must fail");
+        assert_eq!(err.kind(), io::ErrorKind::AddrNotAvailable);
+    }
+
+    #[tokio::test]
+    async fn send_multicast_v4_no_iface_matches_fanout_nic_set() {
+        // `iface_ip == None` must target exactly the eligible NIC set that the
+        // proven `fanout_to` uses (non-loopback, non-rx-only) — adding only the
+        // per-NIC TTL setsockopt, which never changes which NICs are reached.
+        // Comparing the two best-effort counts is robust to a host NIC that
+        // can't route the group (both paths skip the same failures); asserting
+        // an absolute count would be flaky. On a loopback-only host both error.
+        let sock = AsyncUdpV4::bind(0, true).expect("bind");
+        let group = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(239, 1, 2, 3), 9999));
+        let mc = sock.send_multicast_v4(b"x", group, 1, None).await;
+        let fo = sock.fanout_to(b"x", group).await;
+        match (mc, fo) {
+            (Ok(a), Ok(b)) => assert_eq!(
+                a, b,
+                "send_multicast_v4(None) must reach the same NIC set as fanout_to"
+            ),
+            (Err(_), Err(_)) => {} // loopback-only host: no eligible NIC either way
+            (a, b) => {
+                panic!("send_multicast_v4 and fanout_to disagreed on eligibility: {a:?} vs {b:?}")
+            }
+        }
     }
 
     #[tokio::test]

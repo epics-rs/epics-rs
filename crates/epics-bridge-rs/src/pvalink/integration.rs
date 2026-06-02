@@ -392,23 +392,43 @@ impl PvaLinkResolver {
         // (BRIDGE-RS-2026-05-28-128; pvxs keys links onto their channel
         // by `(channelName, pvRequest)`, `pvxs/ioc/pvalink.h:115-120`).
         let monitor_key = MonitorKey::from_config(&cfg);
-        if let Some(rec) = record {
-            if cfg.scan_on_update {
+        // Track the newly-attached scan target so an attach-time scan
+        // can fire below once the (possibly reused) channel is known
+        // connected. `(record, passive_only)`.
+        let attach_target: Option<(String, bool)> = match record {
+            Some(rec) if cfg.scan_on_update => {
                 self.scan_targets
                     .write()
                     .entry(monitor_key.clone())
                     .or_default()
                     .records
                     .push(ScanTarget {
-                        record: rec,
+                        record: rec.clone(),
                         monorder: cfg.monorder,
                         atomic: cfg.atomic,
                         passive_only: cfg.scan_on_passive,
                     });
+                Some((rec, cfg.scan_on_passive))
             }
-        }
+            _ => None,
+        };
         let link = self.registry.get_or_open(cfg).await?;
         self.spawn_notify_forwarder(monitor_key, &link);
+        // Attach-time scan (pvxs `pvalink_lset.cpp:148-167`,
+        // `scanOnce(plink->precord)`): when the shared channel is
+        // ALREADY connected at attach, fire one immediate scan of just
+        // the newly attached record. This is observably needed on the
+        // reuse-of-an-already-connected-monitor path —
+        // `spawn_notify_forwarder` returned early without wiring a
+        // fresh first-event scan for this record, so without this the
+        // record stays unprocessed until the next upstream update. A
+        // freshly-opened monitor variant is not yet connected here and
+        // gets its first scan from the monitor task's `on_event`.
+        if let Some((rec, passive_only)) = attach_target {
+            if link.is_connected() {
+                self.scan_attached_record(&rec, passive_only).await;
+            }
+        }
         Ok(link)
     }
 
@@ -445,6 +465,27 @@ impl PvaLinkResolver {
             db,
             scan_overrun,
         ));
+    }
+
+    /// Fire one immediate scan of a single newly-attached scan target —
+    /// the attach-time scan pvxs runs when the shared channel is already
+    /// connected at link-open (`pvalink_lset.cpp:148-167`). Applies the
+    /// same CPP passive gate + PACT pre-check as the steady-state
+    /// forwarder, then processes the one record through the
+    /// gate-acquiring entry. There is no atomic group and no epoch is
+    /// held at attach time, so the link's `atomic` flag does not change
+    /// the entry here — it governs only the multi-record group locking
+    /// inside [`scan_once`].
+    async fn scan_attached_record(&self, record: &str, passive_only: bool) {
+        let Some(db_handle) = self.db.read().clone() else {
+            return;
+        };
+        if scan_target_should_process(&db_handle, record, passive_only).await {
+            let mut visited = std::collections::HashSet::new();
+            let _ = db_handle
+                .process_record_with_links(record, &mut visited, 0)
+                .await;
+        }
     }
 
     /// Whether `pv_name` names a channel hosted by the attached
@@ -893,6 +934,47 @@ async fn run_notify_forwarder(
 /// each group. The scan trigger carries no value — each target reads the
 /// link's `latest` cache through its own INP read (see
 /// [`run_notify_forwarder`]).
+/// CPP passive gate + PACT pre-check for one scan target, evaluated
+/// under the target's write lock — pvxs `ScanTrack::scan`
+/// (`pvalink_channel.cpp:313-323`). Returns `true` if the record should
+/// be processed now, `false` if it was gated out:
+///   - a `CPP` (`passive_only`) target whose SCAN is not Passive is
+///     skipped (pvxs `check_passive && prec->scan != 0`); a non-zero
+///     SCAN (Event, I/O Intr, periodic) means the record has its own
+///     scan source and must not be re-fired from CPP.
+///   - an already-processing (PACT) target gets `rpro = true` and is
+///     NOT processed; the standard RPRO mechanism reprocesses it once
+///     the async cycle completes (pvxs `else if (prec->pact) {
+///     prec->rpro = TRUE; }`). pvxs intercepts PACT *before*
+///     `dbProcess` because `dbProcess` on PACT only counts toward
+///     SCAN_ALARM and never sets RPRO; without this a fast monitor
+///     stream onto a stuck async target drives it to SCAN_ALARM/INVALID
+///     after MAX_LOCK consecutive busy attempts.
+///
+/// This is the single owner of the scan-time `rpro` set, shared by the
+/// steady-state forwarder ([`scan_once`]) and the attach-time scan
+/// ([`PvaLinkResolver::scan_attached_record`]). The write guard is
+/// released before returning so the caller's process call can take its
+/// own locks. A missing record returns `false`.
+async fn scan_target_should_process(
+    db_handle: &PvDatabase,
+    record: &str,
+    passive_only: bool,
+) -> bool {
+    let Some(rec) = db_handle.get_record(record).await else {
+        return false;
+    };
+    let mut tg = rec.write().await;
+    if passive_only && tg.common.scan != epics_base_rs::server::record::ScanType::Passive {
+        return false;
+    }
+    if tg.is_processing() {
+        tg.common.rpro = true;
+        return false;
+    }
+    true
+}
+
 async fn scan_once(
     monitor_key: &MonitorKey,
     scan_targets: &ScanTargetMap,
@@ -961,38 +1043,12 @@ async fn scan_once(
         if !*atomic {
             atomic_epoch = None;
         }
-        // CPP passive gate + PACT pre-check, taken under one target
-        // write lock — mirrors pvxs `ScanTrack::scan`
-        // (`pvalink_channel.cpp:313-323`) and the in-db CP fan-out:
-        //   - `CPP` (passive_only) fires only when the owning record's
-        //     SCAN is Passive. pvxs checks `prec->scan != 0` and skips
-        //     processing; a non-zero SCAN (Event, I/O Intr, periodic)
-        //     means the record has its own scan source and must not be
-        //     re-fired from CPP.
-        //   - an already-processing (PACT) target gets `rpro = true`
-        //     and is NOT re-processed here; the standard RPRO mechanism
-        //     reprocesses it exactly once when the async cycle
-        //     completes (pvxs `else if (prec->pact) { prec->rpro =
-        //     TRUE; }`). pvxs intercepts PACT *before* `dbProcess`
-        //     because `dbProcess` on PACT only counts toward SCAN_ALARM
-        //     and never sets RPRO; without this branch a fast monitor
-        //     stream onto a stuck async target drives it to
-        //     SCAN_ALARM/INVALID after MAX_LOCK consecutive busy
-        //     attempts.
-        // The guard is dropped before the process call below, which
-        // takes its own per-record locks.
-        {
-            let Some(rec) = db_handle.get_record(record).await else {
-                continue;
-            };
-            let mut tg = rec.write().await;
-            if *passive_only && tg.common.scan != epics_base_rs::server::record::ScanType::Passive {
-                continue;
-            }
-            if tg.is_processing() {
-                tg.common.rpro = true;
-                continue;
-            }
+        // CPP passive gate + PACT pre-check (pvxs `ScanTrack::scan`);
+        // see `scan_target_should_process`. The target write lock is
+        // released before the process call below, which takes its own
+        // per-record locks.
+        if !scan_target_should_process(&db_handle, record, *passive_only).await {
+            continue;
         }
         // B3: process WITH links so the CP/CPP-driven scan fans
         // out via INP/OUT/FLNK — a pvalink feeding a calc record
@@ -2199,6 +2255,102 @@ mod tests {
         assert!(
             dest.read().await.common.rpro,
             "a PACT target must get rpro=true (pvxs prec->rpro = TRUE)"
+        );
+    }
+
+    /// Attach-time scan (pvxs `pvalink_lset.cpp:148-167`): attaching a
+    /// record to an ALREADY-connected, reused monitor variant fires one
+    /// immediate scan, so the record does not stay unprocessed until the
+    /// next upstream update. Reuse is simulated by seeding the registry
+    /// with a connected link and marking its forwarder already started
+    /// (so `spawn_notify_forwarder` takes the early-return reuse path).
+    /// Pre-fix no attach scan fired and the record processed zero times.
+    #[tokio::test]
+    async fn attach_time_scan_fires_on_reused_connected_monitor() {
+        let db = PvDatabase::new();
+        let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        db.add_record(
+            "DEST",
+            Box::new(CountingRecord {
+                count: count.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+        resolver.attach_database(db);
+
+        // A connected, already-open CP monitor variant for SRC.
+        let cfg = PvaLinkConfig {
+            monitor: true,
+            scan_on_update: true,
+            ..PvaLinkConfig::defaults_for("SRC", LinkDirection::Inp)
+        };
+        let (link, connected) = PvaLink::for_test_with_monitor_flag(cfg.clone(), None);
+        connected.store(true, std::sync::atomic::Ordering::Release);
+        resolver.registry.insert_for_test(&cfg, Arc::new(link));
+        // Mark the forwarder already started → reuse path (no fresh
+        // first-event scan is wired for the newly attached record).
+        resolver
+            .forwarders
+            .lock()
+            .insert(MonitorKey::from_config(&cfg));
+
+        resolver
+            .open_inp_cfg(cfg, "SRC".to_string(), Some("DEST".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "attaching to a connected reused monitor must fire one immediate scan"
+        );
+    }
+
+    /// The attach-time scan is gated on `is_connected()`: attaching to a
+    /// monitor variant that has NOT yet connected fires no scan (the
+    /// record's first scan comes from `on_event` once the monitor
+    /// connects), matching pvxs's `if(self->lchan->connected)` guard.
+    #[tokio::test]
+    async fn attach_time_scan_skipped_when_not_connected() {
+        let db = PvDatabase::new();
+        let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        db.add_record(
+            "DEST",
+            Box::new(CountingRecord {
+                count: count.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+        resolver.attach_database(db);
+
+        let cfg = PvaLinkConfig {
+            monitor: true,
+            scan_on_update: true,
+            ..PvaLinkConfig::defaults_for("SRC", LinkDirection::Inp)
+        };
+        // Connection flag left FALSE → not connected at attach.
+        let (link, _connected) = PvaLink::for_test_with_monitor_flag(cfg.clone(), None);
+        resolver.registry.insert_for_test(&cfg, Arc::new(link));
+        resolver
+            .forwarders
+            .lock()
+            .insert(MonitorKey::from_config(&cfg));
+
+        resolver
+            .open_inp_cfg(cfg, "SRC".to_string(), Some("DEST".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a not-yet-connected monitor must not fire an attach-time scan"
         );
     }
 

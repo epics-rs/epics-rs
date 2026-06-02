@@ -24,28 +24,18 @@ use crate::error::{PvaError, PvaResult};
 
 use super::decode::{PeerRole, SearchResponse, decode_search_response, try_parse_frame_role};
 
-/// Parse `EPICS_PVA_ADDR_LIST` style strings into a list of IPs/SocketAddrs.
+/// Parse `EPICS_PVA_ADDR_LIST` style strings into a list of `SocketAddr`.
+///
+/// Thin wrapper over [`crate::config::env::parse_addr_list`], the single
+/// owner of the address-list grammar — so this legacy public entry point
+/// can never diverge from the config path. Entries are
+/// **whitespace-separated** (pvxs `split_addr_into`, config.cpp:151-169);
+/// the comma is per-entry multicast-TTL syntax (`<addr>,<ttl>@<iface>`),
+/// never a list separator. Plain IPs get `EPICS_PVA_BROADCAST_PORT`
+/// appended; `host:port` and bare hostnames resolve via DNS, IPv4
+/// preferred. `$(VAR)`/`${VAR}` refs are expanded first (PVA-466).
 pub fn parse_addr_list(env: &str) -> Vec<SocketAddr> {
-    // PVA-466: $(VAR) / ${VAR} expansion against the process env
-    // so callers of this legacy public parser see the same shell
-    // macro semantics as the config::env path. Unset → empty.
-    let env = crate::config::env::expand_dollar_vars(env);
-    env.split(|c: char| c == ',' || c.is_whitespace())
-        .filter_map(|s| {
-            let s = s.trim();
-            if s.is_empty() {
-                return None;
-            }
-            // Accept "host:port" first, then plain IP.
-            if let Ok(sa) = s.parse::<SocketAddr>() {
-                return Some(sa);
-            }
-            if let Ok(ip) = s.parse::<IpAddr>() {
-                return Some(SocketAddr::new(ip, default_broadcast_port()));
-            }
-            None
-        })
-        .collect()
+    crate::config::env::parse_addr_list(env)
 }
 
 pub fn default_broadcast_port() -> u16 {
@@ -227,7 +217,9 @@ mod tests {
 
     #[test]
     fn parse_simple_list() {
-        let v = parse_addr_list("127.0.0.1, 192.168.1.1:5076 , 10.0.0.1");
+        // Whitespace-separated (pvxs `split_addr_into`): plain IPs get the
+        // default broadcast port, `host:port` keeps its explicit port.
+        let v = parse_addr_list("127.0.0.1 192.168.1.1:5076 10.0.0.1");
         assert_eq!(v.len(), 3);
         assert_eq!(v[0].port(), 5076);
         assert_eq!(v[1].port(), 5076);
@@ -235,8 +227,23 @@ mod tests {
     }
 
     #[test]
+    fn comma_is_endpoint_syntax_not_a_list_separator() {
+        // The comma introduces a multicast TTL inside ONE endpoint
+        // (`<addr>,<ttl>`), so `224.0.0.1,5` is a single address (TTL 5,
+        // discarded by this addr-only parser), not two addresses.
+        let v = parse_addr_list("224.0.0.1,5");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].ip(), IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)));
+        // A non-numeric "TTL" makes the whole token malformed → dropped,
+        // matching pvxs (it does not silently treat the comma as a split).
+        assert!(parse_addr_list("1.2.3.4,5.6.7.8").is_empty());
+    }
+
+    #[test]
     fn parse_skips_empty() {
         assert!(parse_addr_list("").is_empty());
+        assert!(parse_addr_list("   ").is_empty());
+        // Bare commas have no address part → no endpoints.
         assert!(parse_addr_list(" , ,").is_empty());
     }
 }

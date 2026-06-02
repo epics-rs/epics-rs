@@ -47,7 +47,23 @@
 //! | `<prefix>connecting` | Double | connectingCount |
 //! | `<prefix>disconnected` | Double | disconnect-state count (statDisconnected) |
 //! | `<prefix>clientEventRate` | Double | eventRate |
+//! | `<prefix>clientPostRate` | Double | postEventCount rate — monitor posts fanned downstream/sec |
 //! | `<prefix>existTestRate` | Double | pvExistTest (search) resolutions/sec — separate from eventRate |
+//! | `<prefix>loopRate` | Double | loopCount rate — maintenance-tick iterations/sec |
+//! | `<prefix>cpuFract` | Double | 0.0 placeholder — no tokio CPU-fraction source |
+//! | `<prefix>load` | Double | 0.0 placeholder — no tokio system-load source |
+//! | `<prefix>serverEventRate` | Double | 0.0 placeholder — no CAS server-event counter |
+//! | `<prefix>serverPostRate` | Double | 0.0 placeholder — no CAS server-post counter |
+//!
+//! C ca-gateway compiles `RATE_STATS` and `CAS_DIAGNOSTICS` on by
+//! default (`configure/CONFIG_SITE:60,69`), so its `initStats`
+//! (`gateServer.cc:1976-2028`) always registers all eight rate/diag
+//! names above. `clientEventRate`/`clientPostRate`/`existTestRate`/
+//! `loopRate` map onto live tokio-side counters; `cpuFract`/`load`/
+//! `serverEventRate`/`serverPostRate` have no source in the tokio model
+//! and are served as a constant `0.0` so a C-compat dashboard
+//! camonitoring the full default set resolves every name rather than
+//! getting does-not-exist.
 //!
 //! RATE_STATS internals (B5) — tokio-model equivalents of the C++
 //! ca-gateway `gateServer` RATE_STATS counters from `gateServer.cc`.
@@ -143,6 +159,12 @@ pub struct Stats {
     last_total_events: AtomicU64,
     /// Last exist_count value at refresh time, for existTestRate delta.
     last_exist_count: AtomicU64,
+    /// Last post_event_count at refresh time, for clientPostRate delta
+    /// (C `statPostEventRate`, gateServer.cc:2189-2195).
+    last_post_event_count: AtomicU64,
+    /// Last loop_count at refresh time, for loopRate delta
+    /// (C `statLoopRate`, gateServer.cc:2204-2205).
+    last_loop_count: AtomicU64,
 }
 
 impl Stats {
@@ -160,6 +182,8 @@ impl Stats {
             last_refresh: Mutex::new(Instant::now()),
             last_total_events: AtomicU64::new(0),
             last_exist_count: AtomicU64::new(0),
+            last_post_event_count: AtomicU64::new(0),
+            last_loop_count: AtomicU64::new(0),
         }
     }
 
@@ -262,6 +286,22 @@ impl Stats {
             // `existTestRate` (gateServer.cc:1991) from a counter
             // separate from the upstream event counters.
             ("existTestRate", EpicsValue::Double(0.0)),
+            // The remaining C RATE_STATS / CAS_DIAGNOSTICS rate names.
+            // Both build macros are default-on (CONFIG_SITE:60,69), so a
+            // default C build's initStats (gateServer.cc:1976-2028)
+            // registers all eight rate/diag names; omitting these six
+            // made a C-compat dashboard camonitoring them get
+            // does-not-exist. clientPostRate/loopRate map onto the
+            // post_event_count/loop_count counters in refresh; cpuFract/
+            // load/serverEventRate/serverPostRate have no tokio-model
+            // source and stay a constant 0.0 (served, not absent). All
+            // are DBR_DOUBLE to match gateStat STAT_DOUBLE.
+            ("clientPostRate", EpicsValue::Double(0.0)),
+            ("loopRate", EpicsValue::Double(0.0)),
+            ("cpuFract", EpicsValue::Double(0.0)),
+            ("load", EpicsValue::Double(0.0)),
+            ("serverEventRate", EpicsValue::Double(0.0)),
+            ("serverPostRate", EpicsValue::Double(0.0)),
             // B5: RATE_STATS internals — tokio-model equivalents of
             // the C++ ca-gateway gateServer counters. `fd` is Rust-native:
             // C's `statFd` is compiled in only under the non-default
@@ -344,16 +384,34 @@ impl Stats {
         // B5 RATE_STATS internals.
         let post_event_count = self.post_event_count.load(Ordering::Relaxed);
         let loop_count = self.loop_count.load(Ordering::Relaxed);
+        // clientPostRate (C `statPostEventRate`) and loopRate (C
+        // `statLoopRate`) are the delta-over-elapsed rates of the same
+        // post_event_count / loop_count counters, computed exactly like
+        // event_rate / exist_test_rate above (gateServer.cc:2189-2205).
+        let last_post = self
+            .last_post_event_count
+            .swap(post_event_count, Ordering::Relaxed);
+        let client_post_rate = if elapsed > 0.0 {
+            post_event_count.saturating_sub(last_post) as f64 / elapsed
+        } else {
+            0.0
+        };
+        let last_loop = self.last_loop_count.swap(loop_count, Ordering::Relaxed);
+        let loop_rate = if elapsed > 0.0 {
+            loop_count.saturating_sub(last_loop) as f64 / elapsed
+        } else {
+            0.0
+        };
         // `clientEventCount` is the same upstream-event source as
         // `total_events` — the C++ gateway exposes both the rate PV
         // (`clientEventRate`) and the raw count (`clientEventCount`)
         // from one counter.
         let client_event_count = total_events;
 
-        // Fan all 12 stats PV writes out concurrently. Each
+        // Fan all stats PV writes out concurrently. Each
         // `put_pv_and_post` is independent (no shared lock between them
         // beyond the per-PV `RwLock`), so a single `tokio::join!` cuts
-        // refresh latency from `12 × put_latency` to `max(put_latency)`.
+        // refresh latency from `N × put_latency` to `max(put_latency)`.
         let p = &self.prefix;
         // Bind names to locals so the futures inside `join!` borrow them
         // for long enough; bare `&format!(...)` would be dropped at the
@@ -387,6 +445,13 @@ impl Stats {
         let n_client_event_count = format!("{p}clientEventCount");
         let n_post_event_count = format!("{p}postEventCount");
         let n_loop_count = format!("{p}loopCount");
+        // Remaining C RATE_STATS / CAS_DIAGNOSTICS rate names.
+        let n_client_post_rate = format!("{p}clientPostRate");
+        let n_loop_rate = format!("{p}loopRate");
+        let n_cpu_fract = format!("{p}cpuFract");
+        let n_load = format!("{p}load");
+        let n_server_event_rate = format!("{p}serverEventRate");
+        let n_server_post_rate = format!("{p}serverPostRate");
         // C `connected` = statAlive = active + inactive (gatePv.cc bumps
         // total_alive only for those two states). `unconnected` =
         // statUnconnected, which C increments for Connecting, Dead AND
@@ -439,6 +504,17 @@ impl Stats {
                 EpicsValue::Long(post_event_count as i32),
             ),
             db.put_pv_and_post(&n_loop_count, EpicsValue::Long(loop_count as i32)),
+            // C RATE_STATS / CAS_DIAGNOSTICS rate PVs. clientPostRate and
+            // loopRate carry the live rates computed above; cpuFract/load/
+            // serverEventRate/serverPostRate have no tokio-model source
+            // and are posted as a constant 0.0 (served, not absent) for
+            // C-name resolution parity.
+            db.put_pv_and_post(&n_client_post_rate, EpicsValue::Double(client_post_rate)),
+            db.put_pv_and_post(&n_loop_rate, EpicsValue::Double(loop_rate)),
+            db.put_pv_and_post(&n_cpu_fract, EpicsValue::Double(0.0)),
+            db.put_pv_and_post(&n_load, EpicsValue::Double(0.0)),
+            db.put_pv_and_post(&n_server_event_rate, EpicsValue::Double(0.0)),
+            db.put_pv_and_post(&n_server_post_rate, EpicsValue::Double(0.0)),
         );
 
         // `fd` is posted separately because it is only available when
@@ -687,6 +763,36 @@ mod tests {
         assert!(db.has_name("g:loopCount").await);
     }
 
+    /// C ca-gateway ships RATE_STATS and CAS_DIAGNOSTICS on by default
+    /// (CONFIG_SITE:60,69), so its initStats (gateServer.cc:1976-2028)
+    /// registers all eight rate/diag names. Pre-fix only clientEventRate
+    /// and existTestRate were served — the other six cache-missed at
+    /// CREATE_CHANNEL, so a C-compat dashboard camonitoring the full set
+    /// got does-not-exist. This asserts every default-build rate/diag
+    /// name now resolves.
+    #[tokio::test]
+    async fn publish_initial_serves_all_c_rate_diag_names() {
+        let stats = Stats::new("g:".into());
+        let db = PvDatabase::new();
+        stats.publish_initial(&db).await;
+
+        for name in [
+            "g:clientEventRate",
+            "g:clientPostRate",
+            "g:existTestRate",
+            "g:loopRate",
+            "g:cpuFract",
+            "g:load",
+            "g:serverEventRate",
+            "g:serverPostRate",
+        ] {
+            assert!(
+                db.has_name(name).await,
+                "{name} must be served (C default RATE_STATS/CAS_DIAGNOSTICS name)"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn refresh_publishes_rate_stats() {
         let stats = Stats::new("g:".into());
@@ -718,6 +824,33 @@ mod tests {
         // supported platform. It is a C gateStat PV → DBR_DOUBLE.
         if let Ok(EpicsValue::Double(fd)) = db.get_pv("g:fd").await {
             assert!(fd >= 0.0);
+        }
+
+        // clientPostRate / loopRate carry the delta-over-elapsed rate of
+        // the post_event_count / loop_count counters driven above. On the
+        // first refresh the previous-count baseline is 0, so the deltas
+        // are 1 and 3 over a tiny but positive elapsed → strictly > 0.
+        match db.get_pv("g:clientPostRate").await.unwrap() {
+            EpicsValue::Double(r) => assert!(r > 0.0, "clientPostRate should be > 0, got {r}"),
+            other => panic!("clientPostRate must be DBR_DOUBLE, got {other:?}"),
+        }
+        match db.get_pv("g:loopRate").await.unwrap() {
+            EpicsValue::Double(r) => assert!(r > 0.0, "loopRate should be > 0, got {r}"),
+            other => panic!("loopRate must be DBR_DOUBLE, got {other:?}"),
+        }
+        // cpuFract / load / serverEventRate / serverPostRate have no
+        // tokio-model source and are posted as a constant 0.0.
+        for name in [
+            "g:cpuFract",
+            "g:load",
+            "g:serverEventRate",
+            "g:serverPostRate",
+        ] {
+            assert_eq!(
+                db.get_pv(name).await.unwrap(),
+                EpicsValue::Double(0.0),
+                "{name} is a 0.0 placeholder (no tokio source)"
+            );
         }
     }
 
@@ -848,6 +981,14 @@ mod tests {
             "g:connecting",
             "g:disconnected",
             "g:fd",
+            // C RATE_STATS / CAS_DIAGNOSTICS rate names — all gateStat
+            // STAT_DOUBLE, including the four served as 0.0 placeholders.
+            "g:clientPostRate",
+            "g:loopRate",
+            "g:cpuFract",
+            "g:load",
+            "g:serverEventRate",
+            "g:serverPostRate",
         ] {
             assert!(
                 matches!(db.get_pv(name).await.unwrap(), EpicsValue::Double(_)),

@@ -31,6 +31,20 @@ struct Args {
     #[arg(short = 'M', default_value = "nt")]
     mode: String,
 
+    /// Output format mode (pvxs `-F`): `tree` or `delta`. When set, this
+    /// selects the pvxs `Value::format()` formatter (get.cpp:80-86,114-117)
+    /// instead of `-M`. pvxs defaults this to `delta`; here it is opt-in so
+    /// the established `-M nt` default is preserved. An unknown value warns
+    /// and falls back to `delta`, like pvxs.
+    #[arg(short = 'F', long = "format")]
+    format: Option<String>,
+
+    /// Array element limit for the `-F tree|delta` formatter (pvxs `-#`,
+    /// get.cpp:77-78). `0` (the default) is unlimited. Only affects the
+    /// `-F` formatter — the `-M` modes are unchanged.
+    #[arg(short = '#', long = "array-limit", default_value = "0")]
+    array_limit: usize,
+
     /// Verbose ("make more noise"): print the effective PVA client
     /// configuration before the GET. pvxs `tools/get.cpp:65-67,99-100`
     /// sets `verbose=true` and prints `Effective config` + the client
@@ -128,10 +142,33 @@ async fn main() {
             Ok(result) => {
                 // `-q` is a deprecated no-op (see Args::quiet); successful
                 // values are always printed, matching pvAccessCPP pvget.
-                let output = match mode {
-                    "json" => format::format_json(pv_name, &result.value),
-                    "raw" => format::format_raw(pv_name, &result.introspection, &result.value),
-                    _ => format::format_nt(pv_name, &result.introspection, &result.value),
+                let output = if let Some(vfmt) = format::parse_value_format(args.format.as_deref())
+                {
+                    // pvxs `-F` path (get.cpp:112-117): print the PV-name
+                    // line, then the `Value::format()` output wrapped in one
+                    // `Indented` level (base_depth=1). A GET marks every
+                    // field it returns, so Delta shows them all (marked=None).
+                    let fmt = format::ValueFmt {
+                        format: vfmt,
+                        array_limit: args.array_limit,
+                        show_value: true,
+                    };
+                    format!(
+                        "{pv_name}\n{}",
+                        format::format_value(
+                            &result.introspection,
+                            Some(&result.value),
+                            &fmt,
+                            None,
+                            1,
+                        )
+                    )
+                } else {
+                    match mode {
+                        "json" => format::format_json(pv_name, &result.value),
+                        "raw" => format::format_raw(pv_name, &result.introspection, &result.value),
+                        _ => format::format_nt(pv_name, &result.introspection, &result.value),
+                    }
                 };
                 print!("{output}");
             }
@@ -195,5 +232,41 @@ mod tests {
     fn debug_flag_parses() {
         assert!(Args::parse_from(["pvget-rs", "-d", "PV"]).debug);
         assert!(!Args::parse_from(["pvget-rs", "PV"]).debug);
+    }
+
+    /// `-F`/`--format` parses into `format` and routes through
+    /// `parse_value_format` to select the pvxs `Value::format()` output
+    /// (get.cpp:80-86). Absent by default so the established `-M nt` output
+    /// is preserved; present it overrides `-M`.
+    #[test]
+    fn format_flag_parses_and_selects_value_formatter() {
+        assert_eq!(Args::parse_from(["pvget-rs", "PV"]).format, None);
+        let tree = Args::parse_from(["pvget-rs", "-F", "tree", "PV"]);
+        assert_eq!(tree.format.as_deref(), Some("tree"));
+        assert_eq!(
+            format::parse_value_format(tree.format.as_deref()),
+            Some(format::ValueFormat::Tree)
+        );
+        let delta = Args::parse_from(["pvget-rs", "--format", "delta", "PV"]);
+        assert_eq!(
+            format::parse_value_format(delta.format.as_deref()),
+            Some(format::ValueFormat::Delta)
+        );
+    }
+
+    /// `-#`/`--array-limit` parses the pvxs per-array element cap
+    /// (get.cpp:77-78). Default `0` = unlimited; it only affects the `-F`
+    /// formatter, never the `-M` modes.
+    #[test]
+    fn array_limit_flag_parses_with_unlimited_default() {
+        assert_eq!(Args::parse_from(["pvget-rs", "PV"]).array_limit, 0);
+        assert_eq!(
+            Args::parse_from(["pvget-rs", "-#", "5", "PV"]).array_limit,
+            5
+        );
+        assert_eq!(
+            Args::parse_from(["pvget-rs", "--array-limit", "12", "PV"]).array_limit,
+            12
+        );
     }
 }

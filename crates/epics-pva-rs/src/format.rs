@@ -1054,6 +1054,747 @@ fn value_type_name(v: &PvField) -> &'static str {
     }
 }
 
+// ─── pvxs `Value::format()` — Tree / Delta output (datafmt.cpp) ──────────────
+//
+// A faithful port of pvxs `operator<<(ostream, Value::Fmt)` and its two
+// helper visitors `FmtTree` / `FmtDelta` (src/datafmt.cpp). These drive the
+// `-F tree` / `-F delta` output of `pvget`/`pvmonitor` and the type tree of
+// `pvinfo` (`Value::format().showValue(false)`). They are kept separate from
+// the EPICS-Base `-M raw|nt|json` formatters above: the pvxs formatter uses
+// the pvxs `TypeCode::name()` strings (`int32_t`, not `int`), the pvxs array
+// dump (`{N}[a, b, ...]`), and the pvxs default-`escape` string style.
+
+/// pvxs `Value::Fmt::format_t` (data.h:788-791): the two `-F` output modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueFormat {
+    /// Full nested structure with `{ }` braces (pvxs `Tree`, the
+    /// `Value::Fmt` default). `pvinfo` uses this with values hidden.
+    Tree,
+    /// Flat, dotted-path lines (pvxs `Delta`); the `pvget`/`pvmonitor`
+    /// default. Only the *marked* fields are shown.
+    Delta,
+}
+
+/// pvxs `Value::Fmt` builder state (data.h:785-805): output mode, the
+/// per-array element limit (`-#`; 0 = unlimited, matching pvxs `_limit`),
+/// and whether scalar values are shown (`pvinfo` clears this).
+#[derive(Debug, Clone, Copy)]
+pub struct ValueFmt {
+    pub format: ValueFormat,
+    pub array_limit: usize,
+    pub show_value: bool,
+}
+
+impl Default for ValueFmt {
+    fn default() -> Self {
+        // pvxs `Value::Fmt` defaults (data.h:787-792): Tree, no array
+        // limit, showValue=true.
+        Self {
+            format: ValueFormat::Tree,
+            array_limit: 0,
+            show_value: true,
+        }
+    }
+}
+
+/// Parse a `-F` argument (pvxs get.cpp/monitor.cpp:78-86) into a
+/// [`ValueFormat`]. A `None` input (the flag is absent) yields `None`, so the
+/// caller keeps its `-M` mode. `tree`/`delta` map directly; any other value
+/// warns on stderr and falls back to `Delta`, mirroring pvxs's
+/// "Warning: ignoring unknown format '…'".
+pub fn parse_value_format(arg: Option<&str>) -> Option<ValueFormat> {
+    let s = arg?;
+    Some(match s {
+        "tree" => ValueFormat::Tree,
+        "delta" => ValueFormat::Delta,
+        other => {
+            eprintln!("Warning: ignoring unknown format '{other}'");
+            ValueFormat::Delta
+        }
+    })
+}
+
+/// pvxs `pvinfo` per-PV output block (info.cpp:90-94):
+/// `cout << argv[n] << " from " << peerName << "\n" <<
+/// result().format().showValue(false)`. Emits the `<pv> from <peer>` header
+/// line, then the type tree with values hidden — `Tree` mode, `base_depth=0`
+/// (info.cpp streams the formatter with no `Indented` wrapper, unlike
+/// get/monitor which pass 1), and `value=None` because a describe carries
+/// only the introspection, not data. This is the pvxs-compatible replacement
+/// for the prior Rust-specific `<pv>` / `Server:` / `Type:` label block.
+pub fn format_info_value(pv_name: &str, peer: std::net::SocketAddr, desc: &FieldDesc) -> String {
+    let fmt = ValueFmt {
+        format: ValueFormat::Tree,
+        array_limit: 0,
+        show_value: false,
+    };
+    format!(
+        "{pv_name} from {peer}\n{}",
+        format_value(desc, None, &fmt, None, 0)
+    )
+}
+
+/// Render a descriptor + value the way pvxs `operator<<(ostream, Value::Fmt)`
+/// does (datafmt.cpp:312-326).
+///
+/// `base_depth` is the ambient indent the caller has already established:
+/// `pvget`/`pvmonitor` print the PV-name line and then wrap the formatter in
+/// `Indented I(std::cout)` (get.cpp:112-113, monitor.cpp:142-143), so they
+/// pass `1`; `pvinfo` streams the formatter with no wrapper
+/// (info.cpp:90-94), so it passes `0`.
+///
+/// `value` is optional so a type-only `pvinfo` describe (introspection but
+/// no data) can render the `Tree` with `show_value=false`. `Delta` requires
+/// a value (it walks the marked fields); with `value=None` it yields an
+/// empty string.
+///
+/// `marked` selects which leaves the `Delta` format prints (pvxs
+/// `Value::imarked()`): `None` treats every present leaf as marked — a GET
+/// marks every field it returns, and a monitor's first update is full — while
+/// `Some(set)` restricts to the dotted leaf paths in `set` (a monitor's
+/// per-update changed-field set).
+pub fn format_value(
+    desc: &FieldDesc,
+    value: Option<&PvField>,
+    fmt: &ValueFmt,
+    marked: Option<&std::collections::HashSet<String>>,
+    base_depth: usize,
+) -> String {
+    let mut out = String::new();
+    match fmt.format {
+        ValueFormat::Tree => {
+            // datafmt.cpp:315-317: leading indent{}, then show(top, "").
+            out.push_str(&pvxs_indent(base_depth));
+            tree_show(&mut out, desc, value, "", fmt, base_depth);
+        }
+        ValueFormat::Delta => {
+            // datafmt.cpp:319-320: FmtDelta{}.top("", *top, true).
+            if value.is_some() {
+                delta_top(&mut out, "", desc, value, true, fmt, marked, base_depth);
+            }
+        }
+    }
+    out
+}
+
+/// pvxs `indent{}` (util.cpp:128-139): four spaces per `Indented` level.
+fn pvxs_indent(depth: usize) -> String {
+    "    ".repeat(depth)
+}
+
+/// pvxs `TypeCode::name()` (type.cpp:126-166) — note these differ from the
+/// EPICS-Base names [`type_name`] uses (`int32_t`, not `int`).
+fn pvxs_type_name(desc: &FieldDesc) -> String {
+    match desc {
+        FieldDesc::Scalar(st) => pvxs_scalar_name(*st).to_string(),
+        FieldDesc::ScalarArray(st) => format!("{}[]", pvxs_scalar_name(*st)),
+        FieldDesc::Variant => "any".to_string(),
+        FieldDesc::VariantArray => "any[]".to_string(),
+        FieldDesc::Structure { .. } => "struct".to_string(),
+        FieldDesc::StructureArray { .. } => "struct[]".to_string(),
+        FieldDesc::Union { .. } => "union".to_string(),
+        FieldDesc::UnionArray { .. } => "union[]".to_string(),
+    }
+}
+
+fn pvxs_scalar_name(st: ScalarType) -> &'static str {
+    match st {
+        ScalarType::Boolean => "bool",
+        ScalarType::Byte => "int8_t",
+        ScalarType::Short => "int16_t",
+        ScalarType::Int => "int32_t",
+        ScalarType::Long => "int64_t",
+        ScalarType::UByte => "uint8_t",
+        ScalarType::UShort => "uint16_t",
+        ScalarType::UInt => "uint32_t",
+        ScalarType::ULong => "uint64_t",
+        ScalarType::Float => "float",
+        ScalarType::Double => "double",
+        ScalarType::String => "string",
+    }
+}
+
+/// The struct/union id of a compound descriptor (`Value::id()`), or `None`
+/// for a scalar / `any`.
+fn compound_id(desc: &FieldDesc) -> Option<&str> {
+    match desc {
+        FieldDesc::Structure { struct_id, .. }
+        | FieldDesc::StructureArray { struct_id, .. }
+        | FieldDesc::Union { struct_id, .. }
+        | FieldDesc::UnionArray { struct_id, .. } => Some(struct_id.as_str()),
+        _ => None,
+    }
+}
+
+/// pvxs `type.kind()==Kind::Compound` — struct / union / any (and their
+/// arrays); false for scalars and scalar arrays.
+fn is_compound(desc: &FieldDesc) -> bool {
+    !matches!(desc, FieldDesc::Scalar(_) | FieldDesc::ScalarArray(_))
+}
+
+/// pvxs `shared_array::format().limit(n)` (sharedarray.cpp `showArr`):
+/// `{count}[e, e, ...]` with a `", "` separator for every element type, a
+/// `limit==0` meaning unlimited, and `...` when the limit is reached. `int8`
+/// / `uint8` render as signed / unsigned integers (not chars), `bool` as
+/// `1`/`0` (default `ostream<<bool`, no `boolalpha`), float / double with the
+/// six-significant-digit C++ stream default, and strings as `"<escape>"`.
+fn pvxs_array(items: &[ScalarValue], limit: usize) -> String {
+    let count = items.len();
+    let lim = if limit == 0 { usize::MAX } else { limit };
+    let mut out = format!("{{{count}}}[");
+    for (i, v) in items.iter().enumerate() {
+        if i != 0 {
+            out.push_str(", ");
+        }
+        if i >= lim {
+            out.push_str("...");
+            break;
+        }
+        out.push_str(&pvxs_array_elem(v));
+    }
+    out.push(']');
+    out
+}
+
+fn pvxs_array_elem(v: &ScalarValue) -> String {
+    match v {
+        ScalarValue::Boolean(b) => (if *b { "1" } else { "0" }).to_string(),
+        ScalarValue::String(s) => format!("\"{}\"", escape_display(s)),
+        ScalarValue::Float(f) => format_g(*f as f64, 6),
+        ScalarValue::Double(f) => format_g(*f, 6),
+        // signed / unsigned integer types print as decimal via Display.
+        other => other.to_string(),
+    }
+}
+
+// ── FmtTree (datafmt.cpp:124-308) ───────────────────────────────────────────
+
+/// pvxs `FmtTree::show` (datafmt.cpp:187-307): emit at least one full line
+/// for `desc`/`value` under field name `member`. Desc-driven so a type-only
+/// `pvinfo` describe renders without a value; the value (when present) feeds
+/// `show_value`.
+fn tree_show(
+    out: &mut String,
+    desc: &FieldDesc,
+    value: Option<&PvField>,
+    member: &str,
+    fmt: &ValueFmt,
+    depth: usize,
+) {
+    // type name + struct/union id. The Tree format streams the id verbatim
+    // (datafmt.cpp:198-201: `strm<<id`, no escaping) — unlike Delta.
+    out.push_str(&pvxs_type_name(desc));
+    if let Some(id) = compound_id(desc) {
+        if !id.is_empty() {
+            let _ = write!(out, " \"{id}\"");
+        }
+    }
+
+    // Scalar / scalar-array: `type member = value` (datafmt.cpp:203-212).
+    if !is_compound(desc) {
+        if !member.is_empty() {
+            out.push(' ');
+            out.push_str(member);
+        }
+        if fmt.show_value {
+            if let Some(v) = value {
+                out.push_str(" = ");
+                tree_show_value(out, v, fmt);
+            }
+        }
+        out.push('\n');
+        return;
+    }
+
+    // Compound branches (datafmt.cpp:214-306), in the same precedence order.
+    let sv = fmt.show_value;
+    let inline = matches!(desc, FieldDesc::Variant)
+        || (!sv && matches!(desc, FieldDesc::VariantArray))
+        || (sv && matches!(desc, FieldDesc::Union { .. }));
+    let braced = matches!(desc, FieldDesc::Structure { .. })
+        || matches!(desc, FieldDesc::Union { .. })
+        || (!sv && matches!(desc, FieldDesc::StructureArray { .. }))
+        || (!sv && matches!(desc, FieldDesc::UnionArray { .. }));
+
+    if inline {
+        tree_show_inline(out, desc, value, fmt, depth);
+    } else if braced {
+        tree_show_braced(out, desc, value, member, fmt, depth);
+    } else {
+        tree_show_array(out, desc, value, member, fmt, depth);
+    }
+}
+
+/// pvxs scalar value rendering for the Tree format (datafmt.cpp:128-184,
+/// `FmtTree::show_value`).
+fn tree_show_value(out: &mut String, value: &PvField, fmt: &ValueFmt) {
+    match value {
+        PvField::Scalar(sv) => match sv {
+            ScalarValue::Boolean(b) => out.push_str(if *b { "true" } else { "false" }),
+            ScalarValue::Float(f) => out.push_str(&format_g(*f as f64, 6)),
+            ScalarValue::Double(f) => out.push_str(&format_g(*f, 6)),
+            ScalarValue::String(s) => {
+                let _ = write!(out, "\"{}\"", escape_display(s));
+            }
+            other => {
+                let _ = write!(out, "{other}");
+            }
+        },
+        PvField::ScalarArray(items) => out.push_str(&pvxs_array(items, fmt.array_limit)),
+        PvField::ScalarArrayTyped(arr) => {
+            out.push_str(&pvxs_array(&arr.to_scalar_values(), fmt.array_limit))
+        }
+        _ => {}
+    }
+}
+
+/// pvxs Tree inline branch (datafmt.cpp:214-238): `any NAME = VAL` /
+/// `union NAME.MEM TYPE = VAL`. `member` and the type name have already been
+/// emitted by [`tree_show`].
+fn tree_show_inline(
+    out: &mut String,
+    desc: &FieldDesc,
+    value: Option<&PvField>,
+    member_already_emitted: &ValueFmt,
+    depth: usize,
+) {
+    let fmt = member_already_emitted;
+    match desc {
+        // (showValue is implied true for the Union inline branch.)
+        FieldDesc::Union { variants, .. } => match value {
+            Some(PvField::Union {
+                selector,
+                variant_name,
+                value: inner,
+            }) if *selector >= 0 => {
+                out.push('.');
+                out.push_str(variant_name);
+                out.push(' ');
+                let cdesc = variants
+                    .iter()
+                    .find(|(n, _)| n == variant_name)
+                    .map(|(_, d)| d.clone())
+                    .unwrap_or_else(|| inner.descriptor());
+                tree_show(out, &cdesc, Some(inner), "", fmt, depth);
+            }
+            // null union → pvxs `show(empty)` prints " null".
+            _ => out.push_str(" null\n"),
+        },
+        FieldDesc::Variant => {
+            if fmt.show_value {
+                out.push(' ');
+                match value {
+                    Some(PvField::Variant(v)) => {
+                        let cdesc = v.desc.clone().unwrap_or_else(|| v.value.descriptor());
+                        tree_show(out, &cdesc, Some(&v.value), "", fmt, depth);
+                    }
+                    Some(other) if !matches!(other, PvField::Null) => {
+                        let cdesc = other.descriptor();
+                        tree_show(out, &cdesc, Some(other), "", fmt, depth);
+                    }
+                    _ => out.push_str("null\n"),
+                }
+            } else {
+                out.push('\n');
+            }
+        }
+        // `any[]` with showValue=false: just terminate the line.
+        _ => out.push('\n'),
+    }
+}
+
+/// pvxs Tree braced branch (datafmt.cpp:239-277): `struct "id" { ... } NAME`.
+fn tree_show_braced(
+    out: &mut String,
+    desc: &FieldDesc,
+    value: Option<&PvField>,
+    member: &str,
+    fmt: &ValueFmt,
+    depth: usize,
+) {
+    out.push_str(" {");
+    let children: Vec<(&String, &FieldDesc)> = match desc {
+        FieldDesc::Structure { fields, .. } | FieldDesc::StructureArray { fields, .. } => {
+            fields.iter().map(|(n, d)| (n, d)).collect()
+        }
+        FieldDesc::Union { variants, .. } | FieldDesc::UnionArray { variants, .. } => {
+            variants.iter().map(|(n, d)| (n, d)).collect()
+        }
+        _ => Vec::new(),
+    };
+    // A Structure WITH show_value supplies child values for the recursion;
+    // the !show_value union/array members carry no value.
+    let parent = match value {
+        Some(PvField::Structure(s)) => Some(s),
+        _ => None,
+    };
+    let mut first = true;
+    for (name, cdesc) in &children {
+        if first {
+            out.push('\n');
+        }
+        out.push_str(&pvxs_indent(depth + 1));
+        let cval = parent.and_then(|s| s.get_field(name));
+        tree_show(out, cdesc, cval, name, fmt, depth + 1);
+        first = false;
+    }
+    if !first {
+        out.push_str(&pvxs_indent(depth));
+    }
+    out.push('}');
+    if !member.is_empty() {
+        out.push(' ');
+        out.push_str(member);
+    }
+    out.push('\n');
+}
+
+/// pvxs Tree array-of-compound branch (datafmt.cpp:278-306):
+/// `struct[] NAME = {N}[ ... ]`.
+fn tree_show_array(
+    out: &mut String,
+    desc: &FieldDesc,
+    value: Option<&PvField>,
+    member: &str,
+    fmt: &ValueFmt,
+    depth: usize,
+) {
+    if !member.is_empty() {
+        out.push(' ');
+        out.push_str(member);
+    }
+    let elems = array_elements(desc, value);
+    let _ = write!(out, " = {{{}}}[", elems.len());
+    let lim = if fmt.array_limit == 0 {
+        usize::MAX
+    } else {
+        fmt.array_limit
+    };
+    let mut shown = 0usize;
+    for (edesc, eval) in &elems {
+        if shown == 0 {
+            out.push('\n');
+        }
+        out.push_str(&pvxs_indent(depth + 1));
+        if shown >= lim {
+            out.push_str("...\n");
+            break;
+        }
+        match eval {
+            Some(v) => tree_show(out, edesc, Some(v), "", fmt, depth + 1),
+            None => out.push_str("null\n"),
+        }
+        shown += 1;
+    }
+    if shown > 0 {
+        out.push_str(&pvxs_indent(depth));
+    }
+    out.push_str("]\n");
+}
+
+// ── FmtDelta (datafmt.cpp:13-122) ───────────────────────────────────────────
+
+/// pvxs `FmtDelta::top` (datafmt.cpp:100-121). All Delta lines sit at the
+/// caller's `base_depth` (Delta does not nest indentation).
+#[allow(clippy::too_many_arguments)]
+fn delta_top(
+    out: &mut String,
+    prefix: &str,
+    desc: &FieldDesc,
+    value: Option<&PvField>,
+    verytop: bool,
+    fmt: &ValueFmt,
+    marked: Option<&std::collections::HashSet<String>>,
+    base_depth: usize,
+) {
+    if matches!(value, None | Some(PvField::Null)) {
+        out.push_str(&pvxs_indent(base_depth));
+        out.push_str(prefix);
+        if !verytop {
+            out.push(' ');
+        }
+        out.push_str("null\n");
+        return;
+    }
+
+    delta_field(out, prefix, desc, value, verytop, fmt, marked, base_depth);
+
+    // datafmt.cpp:112-120: for a struct, emit each marked descendant leaf as
+    // its own flat dotted-path line (pvxs iterates `val.imarked()`).
+    if let (FieldDesc::Structure { .. }, Some(PvField::Structure(_))) = (desc, value) {
+        let mut leaves: Vec<(String, &FieldDesc)> = Vec::new();
+        collect_leaves(desc, "", &mut leaves);
+        for (path, ldesc) in &leaves {
+            if !is_marked(marked, path) {
+                continue;
+            }
+            let cprefix = if verytop {
+                path.clone()
+            } else {
+                format!("{prefix}.{path}")
+            };
+            let lval = value.and_then(|v| value_at_path(v, path));
+            delta_field(out, &cprefix, ldesc, lval, false, fmt, marked, base_depth);
+        }
+    }
+}
+
+/// pvxs `FmtDelta::field` (datafmt.cpp:17-98).
+#[allow(clippy::too_many_arguments)]
+fn delta_field(
+    out: &mut String,
+    prefix: &str,
+    desc: &FieldDesc,
+    value: Option<&PvField>,
+    verytop: bool,
+    fmt: &ValueFmt,
+    marked: Option<&std::collections::HashSet<String>>,
+    base_depth: usize,
+) {
+    // datafmt.cpp:19-20: at the very top, print nothing if nothing is marked.
+    if verytop && !any_marked(marked, desc) {
+        return;
+    }
+    out.push_str(&pvxs_indent(base_depth));
+    out.push_str(prefix);
+    if !verytop {
+        out.push(' ');
+    }
+    out.push_str(&pvxs_type_name(desc));
+    if let FieldDesc::Structure { struct_id, .. } = desc {
+        if !struct_id.is_empty() {
+            // Delta escapes the id (datafmt.cpp:27: `escape(val.id())`).
+            let _ = write!(out, " \"{}\"", escape_display(struct_id));
+        }
+    }
+    if fmt.show_value {
+        delta_show_value(out, value, fmt);
+    }
+    out.push('\n');
+
+    // datafmt.cpp:53-97: recurse into union/any (`->`) and arrays-of-value.
+    match desc {
+        FieldDesc::Union { variants, .. } => {
+            let mut cprefix = String::from(prefix);
+            cprefix.push_str("->");
+            let (cdesc, cval) = match value {
+                Some(PvField::Union {
+                    selector,
+                    variant_name,
+                    value: inner,
+                }) if *selector >= 0 => {
+                    cprefix.push_str(variant_name);
+                    let d = variants
+                        .iter()
+                        .find(|(n, _)| n == variant_name)
+                        .map(|(_, d)| d.clone())
+                        .unwrap_or_else(|| inner.descriptor());
+                    (d, Some(inner.as_ref()))
+                }
+                _ => (FieldDesc::Variant, None),
+            };
+            delta_top(out, &cprefix, &cdesc, cval, false, fmt, marked, base_depth);
+        }
+        FieldDesc::Variant => {
+            let mut cprefix = String::from(prefix);
+            cprefix.push_str("->");
+            match value {
+                Some(PvField::Variant(v)) => {
+                    let d = v.desc.clone().unwrap_or_else(|| v.value.descriptor());
+                    delta_top(
+                        out,
+                        &cprefix,
+                        &d,
+                        Some(&v.value),
+                        false,
+                        fmt,
+                        marked,
+                        base_depth,
+                    );
+                }
+                _ => delta_top(
+                    out,
+                    &cprefix,
+                    &FieldDesc::Variant,
+                    None,
+                    false,
+                    fmt,
+                    marked,
+                    base_depth,
+                ),
+            }
+        }
+        FieldDesc::StructureArray { .. }
+        | FieldDesc::UnionArray { .. }
+        | FieldDesc::VariantArray => {
+            for (idx, (edesc, eval)) in array_elements(desc, value).into_iter().enumerate() {
+                let p = format!("{prefix}[{idx}]");
+                delta_top(
+                    out,
+                    &p,
+                    &edesc,
+                    eval.as_ref(),
+                    false,
+                    fmt,
+                    marked,
+                    base_depth,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+/// pvxs Delta inline value (datafmt.cpp:30-48). Scalar arrays render through
+/// [`pvxs_array`]; struct / union / any / value-arrays print no inline value
+/// (their contents come from the recursion).
+fn delta_show_value(out: &mut String, value: Option<&PvField>, fmt: &ValueFmt) {
+    let Some(v) = value else { return };
+    match v {
+        PvField::Scalar(sv) => match sv {
+            ScalarValue::Float(f) => {
+                let _ = write!(out, " = {}", format_g(*f as f64, 6));
+            }
+            ScalarValue::Double(f) => {
+                let _ = write!(out, " = {}", format_g(*f, 6));
+            }
+            ScalarValue::Boolean(b) => {
+                let _ = write!(out, " = {}", if *b { "true" } else { "false" });
+            }
+            ScalarValue::String(s) => {
+                let _ = write!(out, " = \"{}\"", escape_display(s));
+            }
+            other => {
+                let _ = write!(out, " = {other}");
+            }
+        },
+        PvField::ScalarArray(items) => {
+            let _ = write!(out, " = {}", pvxs_array(items, fmt.array_limit));
+        }
+        PvField::ScalarArrayTyped(arr) => {
+            let _ = write!(
+                out,
+                " = {}",
+                pvxs_array(&arr.to_scalar_values(), fmt.array_limit)
+            );
+        }
+        _ => {}
+    }
+}
+
+// ── shared desc/value navigation ────────────────────────────────────────────
+
+/// Collect the dotted leaf paths of a descriptor in declaration order
+/// (pvxs flattens marked descendants via `imarked`). A plain `Structure` is
+/// a container — recurse into it; every other field (scalar, scalar-array,
+/// union, any, array-of-compound) is a leaf.
+fn collect_leaves<'a>(desc: &'a FieldDesc, prefix: &str, out: &mut Vec<(String, &'a FieldDesc)>) {
+    if let FieldDesc::Structure { fields, .. } = desc {
+        for (name, child) in fields {
+            let p = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}.{name}")
+            };
+            match child {
+                FieldDesc::Structure { .. } => collect_leaves(child, &p, out),
+                _ => out.push((p, child)),
+            }
+        }
+    }
+}
+
+/// Navigate a value by a dotted leaf path through nested structures.
+fn value_at_path<'a>(value: &'a PvField, path: &str) -> Option<&'a PvField> {
+    let mut cur = value;
+    for seg in path.split('.') {
+        match cur {
+            PvField::Structure(s) => cur = s.get_field(seg)?,
+            _ => return None,
+        }
+    }
+    Some(cur)
+}
+
+/// Whether a dotted leaf path is marked. `None` = every leaf is marked
+/// (a GET / a monitor's first update); `Some(set)` = only the listed paths.
+fn is_marked(marked: Option<&std::collections::HashSet<String>>, path: &str) -> bool {
+    match marked {
+        None => true,
+        Some(set) => set.contains(path),
+    }
+}
+
+/// pvxs `Value::isMarked(false)` at the very top: is any descendant leaf
+/// marked? `None` (all-marked) is true when the descriptor has any leaf.
+fn any_marked(marked: Option<&std::collections::HashSet<String>>, desc: &FieldDesc) -> bool {
+    let mut leaves = Vec::new();
+    collect_leaves(desc, "", &mut leaves);
+    match marked {
+        None => !leaves.is_empty() || !is_compound(desc),
+        Some(set) => leaves.iter().any(|(p, _)| set.contains(p)),
+    }
+}
+
+/// Element `(descriptor, value)` pairs of an array-of-compound field, used by
+/// both the Tree array branch and the Delta array recursion. A `None` value
+/// is a pvxs `0x00` null (absent) element.
+fn array_elements(desc: &FieldDesc, value: Option<&PvField>) -> Vec<(FieldDesc, Option<PvField>)> {
+    match (desc, value) {
+        (FieldDesc::StructureArray { struct_id, fields }, Some(PvField::StructureArray(items))) => {
+            let ed = FieldDesc::Structure {
+                struct_id: struct_id.clone(),
+                fields: fields.clone(),
+            };
+            items
+                .iter()
+                .map(|it| {
+                    (
+                        ed.clone(),
+                        it.as_ref().map(|s| PvField::Structure(s.clone())),
+                    )
+                })
+                .collect()
+        }
+        (
+            FieldDesc::UnionArray {
+                struct_id,
+                variants,
+            },
+            Some(PvField::UnionArray(items)),
+        ) => {
+            let ed = FieldDesc::Union {
+                struct_id: struct_id.clone(),
+                variants: variants.clone(),
+            };
+            items
+                .iter()
+                .map(|it| {
+                    (
+                        ed.clone(),
+                        it.as_ref().map(|u| PvField::Union {
+                            selector: u.selector,
+                            variant_name: u.variant_name.clone(),
+                            value: Box::new(u.value.clone()),
+                        }),
+                    )
+                })
+                .collect()
+        }
+        (FieldDesc::VariantArray, Some(PvField::VariantArray(items))) => items
+            .iter()
+            .map(|it| match it {
+                Some(v) => (
+                    v.desc.clone().unwrap_or_else(|| v.value.descriptor()),
+                    Some(v.value.clone()),
+                ),
+                None => (FieldDesc::Variant, None),
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1611,5 +2352,236 @@ mod tests {
         let out = format_info(&desc);
         assert!(out.contains("epics:nt/NTScalar:1.0"));
         assert!(out.contains("double value"));
+    }
+
+    // ── pvxs Value::format() Tree / Delta golden output ─────────────────────
+
+    fn tree(desc: &FieldDesc, value: Option<&PvField>, show_value: bool) -> String {
+        format_value(
+            desc,
+            value,
+            &ValueFmt {
+                format: ValueFormat::Tree,
+                array_limit: 0,
+                show_value,
+            },
+            None,
+            0,
+        )
+    }
+
+    /// pvget `-F tree` of an NTScalar: nested `{ }` blocks, pvxs `TypeCode`
+    /// names (`int64_t`, not `long`), four-space indent per level, and
+    /// `member = value` leaves (datafmt.cpp FmtTree::show).
+    #[test]
+    fn pvxs_tree_nt_scalar_golden() {
+        let (desc, val) = nt_scalar_double(42.5, 0, 0);
+        let out = tree(&desc, Some(&val), true);
+        assert_eq!(
+            out,
+            "struct \"epics:nt/NTScalar:1.0\" {\n\
+             \x20   double value = 42.5\n\
+             \x20   struct \"time_t\" {\n\
+             \x20       int64_t secondsPastEpoch = 0\n\
+             \x20       int32_t nanoseconds = 0\n\
+             \x20       int32_t userTag = 0\n\
+             \x20   } timeStamp\n\
+             }\n"
+        );
+    }
+
+    /// pvinfo's `Value::format().showValue(false)` (info.cpp:92-94): the same
+    /// Tree structure with no `= value` on the leaves.
+    #[test]
+    fn pvxs_tree_show_value_false_is_type_only() {
+        let (desc, _val) = nt_scalar_double(42.5, 0, 0);
+        let out = tree(&desc, None, false);
+        assert_eq!(
+            out,
+            "struct \"epics:nt/NTScalar:1.0\" {\n\
+             \x20   double value\n\
+             \x20   struct \"time_t\" {\n\
+             \x20       int64_t secondsPastEpoch\n\
+             \x20       int32_t nanoseconds\n\
+             \x20       int32_t userTag\n\
+             \x20   } timeStamp\n\
+             }\n"
+        );
+    }
+
+    /// pvget `-F delta`: flat dotted-path lines, `path type = value`, with
+    /// every leaf shown when nothing restricts the marked set (a GET marks
+    /// every field it returns). Mirrors datafmt.cpp FmtDelta.
+    #[test]
+    fn pvxs_delta_nt_scalar_all_marked_golden() {
+        let (desc, val) = nt_scalar_double(42.5, 0, 0);
+        let out = format_value(
+            &desc,
+            Some(&val),
+            &ValueFmt {
+                format: ValueFormat::Delta,
+                array_limit: 0,
+                show_value: true,
+            },
+            None,
+            0,
+        );
+        assert_eq!(
+            out,
+            "struct \"epics:nt/NTScalar:1.0\"\n\
+             value double = 42.5\n\
+             timeStamp.secondsPastEpoch int64_t = 0\n\
+             timeStamp.nanoseconds int32_t = 0\n\
+             timeStamp.userTag int32_t = 0\n"
+        );
+    }
+
+    /// A restricted marked set (pvxs `imarked()` for a monitor's changed
+    /// fields) prints only those leaves under the top struct line. This is
+    /// the wiring point for the monitor changed-set; the formatter already
+    /// honours it.
+    #[test]
+    fn pvxs_delta_marked_subset_shows_only_marked() {
+        let (desc, val) = nt_scalar_double(42.5, 0, 0);
+        let mut marked = std::collections::HashSet::new();
+        marked.insert("value".to_string());
+        let out = format_value(
+            &desc,
+            Some(&val),
+            &ValueFmt {
+                format: ValueFormat::Delta,
+                array_limit: 0,
+                show_value: true,
+            },
+            Some(&marked),
+            0,
+        );
+        assert_eq!(
+            out,
+            "struct \"epics:nt/NTScalar:1.0\"\nvalue double = 42.5\n"
+        );
+    }
+
+    /// The `Indented I(std::cout)` wrapper pvget/pvmonitor apply
+    /// (get.cpp:112-113) is the `base_depth=1` argument: every line gains
+    /// one four-space level.
+    #[test]
+    fn pvxs_delta_base_depth_indents_every_line() {
+        let (desc, val) = nt_scalar_double(1.0, 0, 0);
+        let out = format_value(
+            &desc,
+            Some(&val),
+            &ValueFmt {
+                format: ValueFormat::Delta,
+                array_limit: 0,
+                show_value: true,
+            },
+            None,
+            1,
+        );
+        for line in out.lines() {
+            assert!(
+                line.starts_with("    "),
+                "base_depth=1 must indent every delta line, got: {line:?}"
+            );
+        }
+    }
+
+    /// pvxs array dump (`shared_array::format()`, sharedarray.cpp showArr):
+    /// `{count}[e, e, ...]`, `", "` separator for every type, `int8`/`uint8`
+    /// as numbers, `bool` as `1`/`0`, strings quoted+escaped, and `...` once
+    /// the `-#` limit is reached (limit 0 = unlimited).
+    #[test]
+    fn pvxs_array_format_matches_showarr() {
+        let ints = [
+            ScalarValue::Int(1),
+            ScalarValue::Int(2),
+            ScalarValue::Int(3),
+        ];
+        assert_eq!(pvxs_array(&ints, 0), "{3}[1, 2, 3]");
+        assert_eq!(pvxs_array(&ints, 2), "{3}[1, 2, ...]");
+        let bytes = [ScalarValue::Byte(-3), ScalarValue::UByte(200)];
+        assert_eq!(pvxs_array(&bytes, 0), "{2}[-3, 200]");
+        let bools = [ScalarValue::Boolean(true), ScalarValue::Boolean(false)];
+        assert_eq!(pvxs_array(&bools, 0), "{2}[1, 0]");
+        let strs = [
+            ScalarValue::String("a b".into()),
+            ScalarValue::String("c".into()),
+        ];
+        assert_eq!(pvxs_array(&strs, 0), "{2}[\"a b\", \"c\"]");
+    }
+
+    /// A scalar-array leaf renders through the pvxs array dump in both Tree
+    /// and Delta, and `-#` truncates it.
+    #[test]
+    fn pvxs_tree_scalar_array_uses_limit() {
+        let desc = FieldDesc::Structure {
+            struct_id: "x".into(),
+            fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Int))],
+        };
+        let mut s = PvStructure::new("x");
+        s.set(
+            "value",
+            PvField::ScalarArray(vec![
+                ScalarValue::Int(10),
+                ScalarValue::Int(20),
+                ScalarValue::Int(30),
+            ]),
+        );
+        let val = PvField::Structure(s);
+        let out = format_value(
+            &desc,
+            Some(&val),
+            &ValueFmt {
+                format: ValueFormat::Tree,
+                array_limit: 2,
+                show_value: true,
+            },
+            None,
+            0,
+        );
+        assert_eq!(
+            out,
+            "struct \"x\" {\n    int32_t[] value = {3}[10, 20, ...]\n}\n"
+        );
+    }
+
+    /// pvinfo's full per-PV block (info.cpp:90-94): the `<pv> from <peer>`
+    /// header line, then the values-hidden type tree at `base_depth=0`. Locks
+    /// the pvxs-compatible shape that replaced the Rust `<pv>`/`Server:`/
+    /// `Type:` labels.
+    #[test]
+    fn pvxs_pvinfo_block_golden() {
+        let (desc, _val) = nt_scalar_double(0.0, 0, 0);
+        let peer: std::net::SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let out = format_info_value("TST:ai", peer, &desc);
+        assert_eq!(
+            out,
+            "TST:ai from 127.0.0.1:5075\n\
+             struct \"epics:nt/NTScalar:1.0\" {\n\
+             \x20   double value\n\
+             \x20   struct \"time_t\" {\n\
+             \x20       int64_t secondsPastEpoch\n\
+             \x20       int32_t nanoseconds\n\
+             \x20       int32_t userTag\n\
+             \x20   } timeStamp\n\
+             }\n"
+        );
+    }
+
+    /// `parse_value_format` is the `-F` entry point shared by pvget/pvmonitor
+    /// (and the future pvinfo wiring). It must: map `tree`/`delta` directly,
+    /// treat an absent flag (`None`) as "keep the `-M` mode" by returning
+    /// `None`, and — like pvxs — fall back to `Delta` (with a stderr warning)
+    /// on any unknown value rather than erroring out.
+    #[test]
+    fn parse_value_format_maps_known_and_falls_back() {
+        assert_eq!(parse_value_format(Some("tree")), Some(ValueFormat::Tree));
+        assert_eq!(parse_value_format(Some("delta")), Some(ValueFormat::Delta));
+        // Unknown -> Delta (pvxs "Warning: ignoring unknown format").
+        assert_eq!(parse_value_format(Some("bogus")), Some(ValueFormat::Delta));
+        assert_eq!(parse_value_format(Some("")), Some(ValueFormat::Delta));
+        // Flag absent -> None, so the caller keeps its `-M` mode.
+        assert_eq!(parse_value_format(None), None);
     }
 }

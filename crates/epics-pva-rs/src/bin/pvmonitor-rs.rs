@@ -28,6 +28,20 @@ struct Args {
     #[arg(short = 'M', default_value = "nt")]
     mode: String,
 
+    /// Output format mode (pvxs `-F`): `tree` or `delta`. When set, this
+    /// selects the pvxs `Value::format()` formatter (monitor.cpp:78-84,
+    /// 144-146) instead of `-M`. pvxs defaults this to `delta`; here it is
+    /// opt-in so the established `-M nt` default is preserved. An unknown
+    /// value warns and falls back to `delta`, like pvxs.
+    #[arg(short = 'F', long = "format")]
+    format: Option<String>,
+
+    /// Array element limit for the `-F tree|delta` formatter (pvxs `-#`,
+    /// monitor.cpp:75-76). `0` (the default) is unlimited. Only affects the
+    /// `-F` formatter — the `-M` modes are unchanged.
+    #[arg(short = '#', long = "array-limit", default_value = "0")]
+    array_limit: usize,
+
     /// Verbose ("make more noise"): print the effective PVA client
     /// configuration before the subscription. pvxs
     /// `tools/monitor.cpp:65-67,97-98` sets `verbose=true` and prints
@@ -121,6 +135,8 @@ async fn main() {
 
     for pv_name in args.pv_names {
         let mode = args.mode.clone();
+        let format_mode = args.format.clone();
+        let array_limit = args.array_limit;
         let request = request.clone();
         let client = client.clone();
         let verbose = args.verbose > 0;
@@ -136,11 +152,31 @@ async fn main() {
                 MonitorEvent::Data { intro, value } => {
                     // `-q` is a deprecated no-op (see Args::quiet); monitor
                     // updates are always printed, matching pvAccessCPP.
-                    let output = match mode.as_str() {
-                        "json" => format::format_json(&pv_name, &value),
-                        "raw" => format::format_raw(&pv_name, &intro, &value),
-                        _ => format::format_nt(&pv_name, &intro, &value),
-                    };
+                    let output =
+                        if let Some(vfmt) = format::parse_value_format(format_mode.as_deref()) {
+                            // pvxs `-F` path (monitor.cpp:142-146): the PV-name
+                            // line, then `Value::format()` wrapped in one
+                            // `Indented` level. The decoded monitor value is the
+                            // full reconstructed snapshot, so Delta shows every
+                            // present leaf (marked=None) rather than only the
+                            // server-marked changed subset — see the crate-level
+                            // note on the monitor changed-set.
+                            let fmt = format::ValueFmt {
+                                format: vfmt,
+                                array_limit,
+                                show_value: true,
+                            };
+                            format!(
+                                "{pv_name}\n{}",
+                                format::format_value(&intro, Some(&value), &fmt, None, 1)
+                            )
+                        } else {
+                            match mode.as_str() {
+                                "json" => format::format_json(&pv_name, &value),
+                                "raw" => format::format_raw(&pv_name, &intro, &value),
+                                _ => format::format_nt(&pv_name, &intro, &value),
+                            }
+                        };
                     print!("{output}");
                 }
                 MonitorEvent::Connected { peer } => {
@@ -215,5 +251,41 @@ mod tests {
     fn debug_flag_parses() {
         assert!(Args::parse_from(["pvmonitor-rs", "-d", "PV"]).debug);
         assert!(!Args::parse_from(["pvmonitor-rs", "PV"]).debug);
+    }
+
+    /// `-F`/`--format` parses into `format` and routes through
+    /// `parse_value_format` to select the pvxs `Value::format()` output
+    /// (monitor.cpp:78-84). Absent by default so the established `-M nt`
+    /// output is preserved; present it overrides `-M`.
+    #[test]
+    fn format_flag_parses_and_selects_value_formatter() {
+        assert_eq!(Args::parse_from(["pvmonitor-rs", "PV"]).format, None);
+        let tree = Args::parse_from(["pvmonitor-rs", "-F", "tree", "PV"]);
+        assert_eq!(tree.format.as_deref(), Some("tree"));
+        assert_eq!(
+            format::parse_value_format(tree.format.as_deref()),
+            Some(format::ValueFormat::Tree)
+        );
+        let delta = Args::parse_from(["pvmonitor-rs", "--format", "delta", "PV"]);
+        assert_eq!(
+            format::parse_value_format(delta.format.as_deref()),
+            Some(format::ValueFormat::Delta)
+        );
+    }
+
+    /// `-#`/`--array-limit` parses the pvxs per-array element cap
+    /// (monitor.cpp:75-76). Default `0` = unlimited; it only affects the
+    /// `-F` formatter, never the `-M` modes.
+    #[test]
+    fn array_limit_flag_parses_with_unlimited_default() {
+        assert_eq!(Args::parse_from(["pvmonitor-rs", "PV"]).array_limit, 0);
+        assert_eq!(
+            Args::parse_from(["pvmonitor-rs", "-#", "5", "PV"]).array_limit,
+            5
+        );
+        assert_eq!(
+            Args::parse_from(["pvmonitor-rs", "--array-limit", "12", "PV"]).array_limit,
+            12
+        );
     }
 }

@@ -22,7 +22,7 @@
 //!   `"%s %s@%s %s %s old=%s\n"` (`gateResources.cc:486`):
 //!
 //!   ```text
-//!   2026-04-09T14:35:21.123Z user@host TEMP:setpoint 25.0 old=24.8
+//!   Apr 09 14:35:21 user@host TEMP:setpoint 25.0 old=24.8
 //!   ```
 //!
 //! - [`PutLogScope::AllWrites`] (opt-in, broader audit): record *every*
@@ -31,7 +31,7 @@
 //!   superset that is not the C contract:
 //!
 //!   ```text
-//!   2026-04-09T14:35:22.456Z guest@1.2.3.4 PRESSURE:cmd 100.0 old=? DENIED
+//!   Apr 09 14:35:22 guest@1.2.3.4 PRESSURE:cmd 100.0 old=? DENIED
 //!   ```
 //!
 //! The line format is selected by the `outcome` argument to [`PutLog::log`]:
@@ -56,7 +56,7 @@ pub enum PutLogScope {
 
 use std::path::PathBuf;
 
-use chrono::Utc;
+use chrono::Local;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
@@ -150,7 +150,12 @@ impl PutLog {
         old: &str,
         outcome: Option<PutOutcome>,
     ) -> BridgeResult<()> {
-        let timestamp = Utc::now().to_rfc3339();
+        // Match C ca-gateway's `timeStamp()` (gateResources.cc:73-84):
+        // `localtime()` + `strftime("%b %d %H:%M:%S")` → e.g.
+        // `Apr 09 14:35:21` — local time, abbreviated month + day +
+        // HH:MM:SS, NO year, NO subseconds. Use `Local` (not `Utc`) to
+        // mirror `localtime()`.
+        let timestamp = Local::now().format("%b %d %H:%M:%S").to_string();
         let line = match outcome {
             // AllWrites: outcome-tagged audit line.
             Some(o) => format!(
@@ -291,6 +296,51 @@ mod tests {
             !lines[3].contains("OK") && !lines[3].contains("DENIED"),
             "TrapWrite line must not carry an outcome token"
         );
+
+        let _ = std::fs::remove_file(&temp);
+    }
+
+    /// The leading timestamp matches C ca-gateway's `timeStamp()`
+    /// (`gateResources.cc:81` `strftime("%b %d %H:%M:%S")`): abbreviated
+    /// month + day + HH:MM:SS, local time, NO year, NO subseconds — not
+    /// the pre-fix ISO-8601 `Utc::now().to_rfc3339()`.
+    #[tokio::test]
+    async fn timestamp_matches_c_strftime_format() {
+        let temp =
+            std::env::temp_dir().join(format!("ca_gateway_putlog_ts_{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&temp);
+
+        let log = PutLog::new(temp.clone());
+        log.log("alice", "host1", "TEMP", "25.0", "24.8", None)
+            .await
+            .unwrap();
+
+        let content = std::fs::read_to_string(&temp).unwrap();
+        let line = content.lines().next().expect("one log line");
+        // C `timeStamp()` is three space-separated tokens before the body:
+        // "Mon DD HH:MM:SS user@host ...".
+        let toks: Vec<&str> = line.split(' ').collect();
+        // tok[0] = abbreviated month (3 alpha chars), parseable by chrono.
+        assert_eq!(toks[0].len(), 3, "month abbrev, got {:?}", toks[0]);
+        assert!(
+            toks[0].chars().all(|c| c.is_ascii_alphabetic()),
+            "month abbrev must be alphabetic, got {:?}",
+            toks[0]
+        );
+        // tok[2] = HH:MM:SS (two colons, eight chars).
+        assert_eq!(toks[2].len(), 8, "HH:MM:SS, got {:?}", toks[2]);
+        assert_eq!(
+            toks[2].matches(':').count(),
+            2,
+            "HH:MM:SS has two colons, got {:?}",
+            toks[2]
+        );
+        // The body follows the timestamp's three tokens.
+        assert_eq!(toks[3], "alice@host1");
+        // NOT RFC3339: no 'T' date-time separator, no '+00:00' offset.
+        let ts = format!("{} {} {}", toks[0], toks[1], toks[2]);
+        assert!(!ts.contains('T'), "must not be ISO-8601, got {ts:?}");
+        assert!(!ts.contains('+'), "must not carry a tz offset, got {ts:?}");
 
         let _ = std::fs::remove_file(&temp);
     }

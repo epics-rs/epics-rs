@@ -1614,8 +1614,11 @@ pub enum MonitorEvent {
 pub struct MonitorEventMask {
     /// When true, suppress [`MonitorEvent::Connected`].
     pub mask_connected: bool,
-    /// When true, suppress [`MonitorEvent::Disconnected`] and
-    /// [`MonitorEvent::Finished`].
+    /// When true, suppress [`MonitorEvent::Disconnected`]. It does NOT
+    /// suppress [`MonitorEvent::Finished`]: pvxs gates only the
+    /// `Disconnect()` push on `maskDiscon` (clientmon.cpp:397) and pushes
+    /// `Finished()` unconditionally on a clean end-of-stream
+    /// (clientmon.cpp:706).
     pub mask_disconnected: bool,
 }
 
@@ -2648,9 +2651,12 @@ where
         .await;
         match result {
             Ok(()) => {
-                if !mask.mask_disconnected {
-                    callback(MonitorEvent::Finished);
-                }
+                // pvxs pushes `Finished()` unconditionally on a clean
+                // end-of-stream (clientmon.cpp:701-707); only the
+                // `Disconnect()` push below is gated by `maskDiscon`
+                // (clientmon.cpp:397). A caller that set mask_disconnected
+                // must still receive the legitimate end-of-stream.
+                callback(MonitorEvent::Finished);
                 return Ok(());
             }
             Err(MonitorEnd::ChannelClosed) => {

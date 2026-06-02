@@ -196,7 +196,7 @@ impl ControlSource {
     fn nt_scalar_string(v: String) -> PvField {
         let mut value = NTScalar::new(ScalarType::String).create();
         if let PvField::Structure(s) = &mut value {
-            s.set("value", PvField::Scalar(ScalarValue::String(v)));
+            s.set("value", PvField::Scalar(ScalarValue::String(v.into())));
         }
         value
     }
@@ -271,6 +271,9 @@ impl ControlSource {
         let mut s = PvStructure::new("");
         s.fields
             .push(("value".into(), PvField::Scalar(ScalarValue::Long(value))));
+        // `message: impl Into<String>` yields a `String`; the NT value field
+        // wants a `PvString` (PVA-89 byte-string newtype), so convert.
+        let message: String = message.into();
         s.fields.push((
             "message".into(),
             PvField::Scalar(ScalarValue::String(message.into())),
@@ -299,7 +302,7 @@ impl ControlSource {
     fn rpc_string_arg(request_value: &PvField, arg: &str) -> Option<String> {
         fn scalar_string(f: &PvField) -> Option<String> {
             match f {
-                PvField::Scalar(ScalarValue::String(s)) => Some(s.clone()),
+                PvField::Scalar(ScalarValue::String(s)) => Some(s.to_string()),
                 _ => None,
             }
         }
@@ -729,7 +732,7 @@ mod tests {
             panic!("reply not a structure");
         };
         match s.fields.iter().find(|(n, _)| n == "message") {
-            Some((_, PvField::Scalar(ScalarValue::String(m)))) => m.clone(),
+            Some((_, PvField::Scalar(ScalarValue::String(m)))) => m.to_string(),
             _ => panic!("reply has no message field"),
         }
     }
@@ -749,7 +752,7 @@ mod tests {
             panic!("reply not a structure");
         };
         match s.fields.iter().find(|(n, _)| n == "value") {
-            Some((_, PvField::Scalar(ScalarValue::String(v)))) => v.clone(),
+            Some((_, PvField::Scalar(ScalarValue::String(v)))) => v.to_string(),
             _ => panic!("reply has no string value field"),
         }
     }

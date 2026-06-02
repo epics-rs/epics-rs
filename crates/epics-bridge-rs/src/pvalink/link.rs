@@ -916,7 +916,7 @@ impl PvaLink {
             alarm
                 .and_then(|a| a.get_field("message"))
                 .and_then(|m| match m {
-                    PvField::Scalar(ScalarValue::String(m)) if !m.is_empty() => Some(m.clone()),
+                    PvField::Scalar(ScalarValue::String(m)) if !m.is_empty() => Some(m.to_string()),
                     _ => None,
                 })
                 .unwrap_or_default()
@@ -1077,7 +1077,9 @@ impl PvaLink {
                 return None;
             };
             match a.get_field("message") {
-                Some(PvField::Scalar(ScalarValue::String(m))) if !m.is_empty() => Some(m.clone()),
+                Some(PvField::Scalar(ScalarValue::String(m))) if !m.is_empty() => {
+                    Some(m.to_string())
+                }
                 _ => None,
             }
         });
@@ -1450,7 +1452,7 @@ fn build_put_request(proc: ProcMode, block: bool) -> PvRequestExpr {
         record_options: vec![
             (
                 "process".to_string(),
-                ScalarValue::String(proc.put_process_request().to_string()),
+                ScalarValue::String(proc.put_process_request().into()),
             ),
             ("block".to_string(), ScalarValue::Boolean(block)),
         ],
@@ -1640,7 +1642,7 @@ fn scalar_value_to_f64(v: &ScalarValue) -> f64 {
         ScalarValue::ULong(x) => *x as f64,
         ScalarValue::Float(x) => *x as f64,
         ScalarValue::Double(x) => *x,
-        ScalarValue::String(s) => s.parse().unwrap_or(0.0),
+        ScalarValue::String(s) => s.as_str_lossy().parse().unwrap_or(0.0),
     }
 }
 
@@ -1792,7 +1794,7 @@ fn limit_pair(root: &PvField, lo_path: &str, hi_path: &str) -> Option<(f64, f64)
 /// empty `display.units` does not override a record's local EGU.
 fn string_field(root: &PvField, path: &str) -> Option<String> {
     match extract_field(root, path) {
-        PvField::Scalar(ScalarValue::String(s)) if !s.is_empty() => Some(s),
+        PvField::Scalar(ScalarValue::String(s)) if !s.is_empty() => Some(s.to_string()),
         _ => None,
     }
 }
@@ -2205,7 +2207,7 @@ mod tests {
         if let Some(m) = message {
             alarm.fields.push((
                 "message".into(),
-                PvField::Scalar(ScalarValue::String(m.to_string())),
+                PvField::Scalar(ScalarValue::String(m.into())),
             ));
         }
         let mut root = PvStructure::new("epics:nt/NTScalar:1.0");
@@ -2982,11 +2984,11 @@ mod tests {
             .push(("limitHigh".into(), PvField::Scalar(ScalarValue::Double(hi))));
         d.fields.push((
             "units".into(),
-            PvField::Scalar(ScalarValue::String(units.to_string())),
+            PvField::Scalar(ScalarValue::String(units.into())),
         ));
         d.fields.push((
             "description".into(),
-            PvField::Scalar(ScalarValue::String(desc.to_string())),
+            PvField::Scalar(ScalarValue::String(desc.into())),
         ));
         d.fields
             .push(("precision".into(), PvField::Scalar(ScalarValue::Int(prec))));

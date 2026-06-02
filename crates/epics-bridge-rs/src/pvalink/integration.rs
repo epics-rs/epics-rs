@@ -1898,7 +1898,7 @@ mod tests {
         );
         assert_eq!(
             pvfield_to_epics_value(&PvField::ScalarArrayTyped(TypedScalarArray::String(
-                vec!["x".to_string(), "y".to_string()].into()
+                vec!["x".into(), "y".into()].into()
             ))),
             Some(EpicsValue::StringArray(vec!["x".into(), "y".into()]))
         );

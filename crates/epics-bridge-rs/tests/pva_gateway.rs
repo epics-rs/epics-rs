@@ -910,7 +910,7 @@ async fn br_r6_gateway_typed_put_passthrough() {
         let mut s = PvStructure::new("test:strarray/1.0");
         s.set(
             "value",
-            PvField::ScalarArray(vec![ScalarValue::String("init".to_string())]),
+            PvField::ScalarArray(vec![ScalarValue::String("init".into())]),
         );
         s
     });
@@ -961,8 +961,8 @@ async fn br_r6_gateway_typed_put_passthrough() {
         s.set(
             "value",
             PvField::ScalarArray(vec![
-                ScalarValue::String("hello world".to_string()),
-                ScalarValue::String("foo bar".to_string()),
+                ScalarValue::String("hello world".into()),
+                ScalarValue::String("foo bar".into()),
             ]),
         );
         s
@@ -977,12 +977,14 @@ async fn br_r6_gateway_typed_put_passthrough() {
     // ScalarArray (Vec-backed) is the client-side construction form.
     let stored_strs: Option<Vec<String>> = match stored {
         PvField::Structure(ref s) => match s.get_field("value") {
-            Some(PvField::ScalarArrayTyped(TypedScalarArray::String(arr))) => Some(arr.to_vec()),
+            Some(PvField::ScalarArrayTyped(TypedScalarArray::String(arr))) => {
+                Some(arr.iter().map(|s| s.to_string()).collect())
+            }
             Some(PvField::ScalarArray(vals)) => Some(
                 vals.iter()
                     .filter_map(|v| {
                         if let ScalarValue::String(s) = v {
-                            Some(s.clone())
+                            Some(s.to_string())
                         } else {
                             None
                         }

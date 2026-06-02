@@ -57,8 +57,10 @@ struct PipelineOptions {
     /// (`servermon.cpp:533-543`), so a non-pipeline monitor's queue depth
     /// is the requested value too. `None` means absent/invalid → the
     /// server keeps its configured default depth. `queue_size` above is
-    /// the pipeline credit window (defaults to 4 when absent) and is a
-    /// separate concept from this squash-threshold override.
+    /// the negotiated pipeline queue depth (`op->limit`, defaults to 4);
+    /// it is NOT the initial credit window — that is the separate per-INIT
+    /// `nack` rider (see [`parse_monitor_init_nack`]), which defaults to 0
+    /// when absent. Both are separate from this squash-threshold override.
     requested_queue_size: Option<u32>,
     /// pvxs `MonitorOp::ackAt` (`servermon.cpp:68`) — the pipeline
     /// ACK-refill threshold parsed from `record._options.ackAny`. It
@@ -621,10 +623,14 @@ fn put_autoexec_from_request(req: Option<&PvField>) -> Option<bool> {
 /// - bit set but the four bytes are truncated → `Err` (FATAL). pvxs
 ///   reads the nack unconditionally once the bit is set and resets the
 ///   connection on `!M.good()` (`servermon.cpp:494-503`), so a truncated
-///   nack is a framing violation, not a legacy omission. (The "pipeline
-///   monitor w/o initial nack incompatible" warn-but-accept in pvxs is
-///   for a PRESENT `nack == 0`, not a missing one —
-///   `servermon.cpp:546-552`.)
+///   nack is a framing violation, not a legacy omission.
+///
+/// A missing rider (`Ok(None)`) seeds the credit window to 0 at the call
+/// site, matching pvxs `nack = 0` default + `op->window = nack`. pvxs
+/// logs "pipeline monitor w/o initial nack incompatible" whenever the
+/// negotiated window is 0 (`op->pipeline && !nack`, `servermon.cpp:546-552`)
+/// — that covers both an absent rider and a present `nack == 0`, since
+/// both leave `nack == 0`; the caller emits the same warning.
 fn parse_monitor_init_nack(
     kind: OpKind,
     subcmd: u8,
@@ -764,9 +770,10 @@ fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
     } else {
         // Non-pipeline: a valid `queueSize` sets the queue depth
         // (pvxs sets `op->limit` regardless of pipeline); an invalid or
-        // absent one keeps the default 4 for the pipeline-window field
-        // (unused here) while `requested_queue_size` carries the squash
-        // override to the send loop.
+        // absent one keeps the default depth 4. The pipeline credit
+        // window does not apply to a non-pipeline monitor, while
+        // `requested_queue_size` carries the squash override to the send
+        // loop.
         let queue_size = match queue_size {
             Some(n) if n >= 2 => n,
             _ => 4,
@@ -5268,22 +5275,38 @@ async fn handle_op(
             _ => None,
         }
         .filter(|o| o.enabled);
-        // pvxs `servermon.cpp:494-503` — when the client sets the
+        // pvxs `servermon.cpp:483-552` — when the client sets the
         // pipeline bit on MONITOR INIT (`subcmd & 0x80`) it appends a u32
         // `nack` (initial window credit) after the pvRequest. Read and
         // consume those bytes so any data following INIT in the same
-        // segment decodes from the correct offset, and prefer the wire
-        // value over the pvRequest `queueSize` so the negotiated initial
-        // window matches what the client requested. A truncated nack with
-        // the bit set is FATAL: pvxs reads it unconditionally and resets
-        // the connection on `!M.good()`, so propagating the decode error
-        // here tears down the connection (matches `bev.reset()`). It is a
-        // framing violation, not a legacy omission.
+        // segment decodes from the correct offset. pvxs initialises
+        // `nack = 0` and reads it from the wire only when the bit is set
+        // (`:494-496`), then assigns `op->window = nack` unconditionally
+        // (`:519`); the negotiated `queueSize` feeds `op->limit`/queue
+        // depth only, never the initial window. So an absent initial-nack
+        // rider must leave the credit window at 0 — a pipelined monitor
+        // then sends nothing until the client grants credit, exactly as
+        // pvxs does (which also logs "pipeline monitor w/o initial nack
+        // incompatible", `:546-552`). A truncated nack with the bit set is
+        // FATAL: pvxs reads it unconditionally and resets the connection
+        // on `!M.good()`, so propagating the decode error here tears down
+        // the connection (matches `bev.reset()`). It is a framing
+        // violation, not a legacy omission.
         let pipeline_initial_nack = parse_monitor_init_nack(kind, subcmd, &mut cur, inbound_order)?;
         let (monitor_window, monitor_window_notify) = if kind == OpKind::Monitor
             && let Some(opt) = pipeline_opt.as_ref()
         {
-            let initial = pipeline_initial_nack.unwrap_or(opt.queue_size);
+            // Match pvxs `nack = 0` default + `op->window = nack`: an
+            // absent 0x80 initial-nack rider seeds the window to 0 (stall
+            // until first MONITOR_ACK), never to `queueSize`.
+            let initial = pipeline_initial_nack.unwrap_or(0);
+            if initial == 0 {
+                warn!(
+                    ioid,
+                    queue_size = opt.queue_size,
+                    "pipeline monitor w/o initial nack incompatible (window starts at 0 until first MONITOR_ACK)"
+                );
+            }
             debug!(
                 ioid,
                 queue_size = opt.queue_size,
@@ -8493,7 +8516,7 @@ mod tests {
         });
         let opts = parsed_opts(&req);
         assert!(opts.enabled, "absent queueSize must NOT disable pipeline");
-        assert_eq!(opts.queue_size, 4, "absent queueSize → default window 4");
+        assert_eq!(opts.queue_size, 4, "absent queueSize → default depth 4");
     }
 
     #[test]
@@ -8981,8 +9004,11 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
         let cred = ClientCredentials::anonymous();
 
-        // MONITOR INIT with pipeline=true, queueSize=2 (no nack byte —
-        // window initialises to queueSize).
+        // MONITOR INIT with pipeline=true, queueSize=2 and an explicit
+        // initial nack rider of 2 (subcmd 0x88 sets the 0x80 pipeline bit,
+        // a u32 `nack` follows the pvRequest) — the window initialises to
+        // the rider value 2. An ABSENT rider seeds the window to 0
+        // (covered by `pipeline_absent_nack_stalls_until_ack`).
         let req_val = make_pipeline_request(
             PvField::Scalar(ScalarValue::Boolean(true)),
             PvField::Scalar(ScalarValue::Int(2)),
@@ -8991,9 +9017,10 @@ mod tests {
         let mut init_payload = Vec::new();
         init_payload.put_u32(sid, order);
         init_payload.put_u32(ioid, order);
-        init_payload.put_u8(0x08);
+        init_payload.put_u8(0x88);
         crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init_payload);
         crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
+        init_payload.put_u32(2, order);
         let init_frame = synth_frame(Command::Monitor, order, init_payload);
         handle_op(
             &init_frame,
@@ -9057,6 +9084,131 @@ mod tests {
             "with queueSize=2 and no ACK the server must send exactly 2 DATA \
              frames (the initial snapshot consumes one credit); got \
              {data_frames} — the initial snapshot bypassed the pipeline window"
+        );
+    }
+
+    /// A pipelined MONITOR INIT that omits the 0x80 initial-nack
+    /// rider must seed the credit window to 0, NOT to the negotiated
+    /// `queueSize`. pvxs initialises `nack = 0` and assigns
+    /// `op->window = nack` (`servermon.cpp:483,519`); `queueSize` feeds
+    /// `op->limit`/queue depth only. So a conforming-but-rider-less
+    /// pipeline monitor must STALL — zero DATA frames flow until the
+    /// client grants credit with a MONITOR_ACK. The pre-fix
+    /// `unwrap_or(queue_size)` shipped up to `queueSize` unacked frames,
+    /// re-opening the non-zero-initial-window hazard pvxs warns against.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pipeline_absent_nack_stalls_until_ack() {
+        use crate::server_native::SharedSource;
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::shared_pv::SharedPV;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 701;
+
+        let intro = three_field_intro();
+        let pv = SharedPV::new();
+        pv.open(intro.clone(), three_field_value(0, 0, 0)).unwrap();
+        let pusher = pv.clone();
+
+        let shared = SharedSource::new();
+        shared.add("dut", pv);
+        let source: DynSource = Arc::new(shared);
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // MONITOR INIT with pipeline=true, queueSize=2, but subcmd 0x08:
+        // the 0x80 bit is CLEAR, so NO initial-nack rider follows the
+        // pvRequest. The credit window must seed to 0.
+        let req_val = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(2)),
+        );
+        let req_desc = req_val.descriptor();
+        let mut init_payload = Vec::new();
+        init_payload.put_u32(sid, order);
+        init_payload.put_u32(ioid, order);
+        init_payload.put_u8(0x08);
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init_payload);
+        crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
+        let init_frame = synth_frame(Command::Monitor, order, init_payload);
+        handle_op(
+            &init_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Monitor,
+            &config,
+            &mut encode_cache,
+            &mut TypeCache::new(),
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("MONITOR INIT ok");
+        let _ = rx.recv().await.expect("INIT reply");
+
+        // MONITOR START (subcmd 0x44 = start | process).
+        let mut start_payload = Vec::new();
+        start_payload.put_u32(sid, order);
+        start_payload.put_u32(ioid, order);
+        start_payload.put_u8(0x44);
+        let start_frame = synth_frame(Command::Monitor, order, start_payload);
+        handle_op(
+            &start_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Monitor,
+            &config,
+            &mut encode_cache,
+            &mut TypeCache::new(),
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("MONITOR START ok");
+
+        // Let the task subscribe; with a zero window the initial snapshot
+        // cannot be sent. Push updates with NO ACK — all must stall.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for i in 1..=8 {
+            pusher.try_post(three_field_value(i, 0, 0));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut data_frames = 0usize;
+        while rx.try_recv().is_ok() {
+            data_frames += 1;
+        }
+        assert_eq!(
+            data_frames, 0,
+            "absent initial-nack rider must seed the window to 0, so a \
+             pipeline monitor with no ACK sends ZERO DATA frames; got \
+             {data_frames} — the window was pre-credited to queueSize"
         );
     }
 
@@ -9940,12 +10092,19 @@ mod tests {
     fn parse_monitor_init_nack_consumes_window_and_faults_on_truncation() {
         let order = ByteOrder::Little;
 
-        // Bit clear → Ok(None) even on Monitor; cursor untouched.
+        // Bit clear → Ok(None) even on Monitor; cursor untouched. The
+        // call site seeds the credit window with `None.unwrap_or(0)` == 0
+        // (pvxs `nack = 0` default + `op->window = nack`), NOT the
+        // pvRequest queueSize — an absent rider stalls the pipeline until
+        // the first MONITOR_ACK rather than pre-crediting queueSize frames.
         let bytes = [0u8; 8];
         let mut cur = std::io::Cursor::new(bytes.as_slice());
+        let absent = parse_monitor_init_nack(OpKind::Monitor, 0x08, &mut cur, order).unwrap();
+        assert_eq!(absent, None);
         assert_eq!(
-            parse_monitor_init_nack(OpKind::Monitor, 0x08, &mut cur, order).unwrap(),
-            None
+            absent.unwrap_or(0),
+            0,
+            "absent rider must seed window 0, not queueSize"
         );
         assert_eq!(cur.position(), 0, "cursor must not advance when bit clear");
 

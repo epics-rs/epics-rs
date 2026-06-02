@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use parking_lot::RwLock;
@@ -585,6 +585,41 @@ fn pv_request_key(pv_request: Option<&PvField>) -> Vec<u8> {
     }
 }
 
+/// Decide the re-subscribe delay for [`ChannelCache::spawn_upstream_monitor`]'s
+/// reconnect loop after an upstream monitor subscription ends.
+///
+/// The returned `delay` is slept UNCONDITIONALLY before the loop re-issues
+/// the upstream monitor — on a clean `MONITOR FINISH` (the wait returned
+/// `Ok`) exactly as on a disconnect/error (`Err`). Without it a clean
+/// FINISH (the upstream channel stays Active, only the IOID is
+/// unregistered) would tight-loop INIT→FINISH→resubscribe with zero delay,
+/// spinning the CPU. pva2pva treats unlisten as terminal
+/// (moncache.cpp:214-236); the gateway reconnects transparently but must
+/// never do so with zero delay.
+///
+/// `event_seen` is whether the just-ended subscription delivered at least
+/// one upstream event during its lifetime:
+/// - `true` (a healthy connection that dropped): the delay re-arms the
+///   `floor` so the reconnect is prompt — mirrors ca_gateway/upstream.rs:896.
+/// - `false` (a clean FINISH that ended without ever delivering an event,
+///   or an immediate end): the delay keeps the grown `backoff` so repeated
+///   immediate ends back off geometrically instead of spinning.
+///
+/// Returns `(delay, next_backoff)`: `delay` is slept now; `next_backoff` is
+/// the running backoff for the following iteration, doubled toward `max`.
+/// The delay is never zero — `floor` and `backoff` are both positive — so a
+/// clean FINISH cannot busy-loop.
+fn resubscribe_backoff(
+    event_seen: bool,
+    backoff: Duration,
+    floor: Duration,
+    max: Duration,
+) -> (Duration, Duration) {
+    let delay = if event_seen { floor } else { backoff };
+    let next_backoff = std::cmp::min(delay * 2, max);
+    (delay, next_backoff)
+}
+
 /// Process-wide cache. Handed to the gateway server source as an
 /// `Arc<ChannelCache>`; cheap to clone (only the Arc is bumped).
 pub struct ChannelCache {
@@ -906,6 +941,13 @@ impl ChannelCache {
         let join = tokio::spawn(async move {
             let mut backoff = Duration::from_millis(250);
             let max_backoff = Duration::from_secs(30);
+            // Whether the current subscription delivered any upstream event
+            // before it ended. Set by `raw_cb` on the first frame, read +
+            // reset after `handle.wait()` to decide whether to re-arm the
+            // backoff floor (healthy connection that dropped) or keep the
+            // grown backoff (a clean MONITOR FINISH that ended without ever
+            // delivering an event must not tight-loop).
+            let event_seen = Arc::new(AtomicBool::new(false));
             loop {
                 let tx_inner = tx_for_task.clone();
                 let state_inner = state_for_task.clone();
@@ -931,6 +973,7 @@ impl ChannelCache {
                 let tx_raw_inner = tx_raw_for_task.clone();
                 let pv_clone = pv_name_owned.clone();
                 let latest_raw_inner = latest_raw_for_task.clone();
+                let event_seen_inner = event_seen.clone();
                 // tx_inner moves into the callback so decoded
                 // events fan out to typed subscribers (subscribe_inner /
                 // subscribe_checked fallback path). Pre-fix this sender
@@ -941,6 +984,11 @@ impl ChannelCache {
                     move |desc: &FieldDesc,
                           body: bytes::Bytes,
                           order: epics_pva_rs::proto::ByteOrder| {
+                        // An upstream frame arrived: this subscription is
+                        // delivering events, so the reconnect loop may re-arm
+                        // its backoff floor when it ends (vs. a clean FINISH
+                        // that returns without ever delivering one).
+                        event_seen_inner.store(true, Ordering::Relaxed);
                         let outcome = apply_monitor_event(&state_inner, desc, &body, order);
                         use crate::pva_gateway::source::RawEvent;
                         if outcome.type_changed {
@@ -1094,12 +1142,30 @@ impl ChannelCache {
                         backoff_ms = backoff.as_millis() as u64,
                         "pva-gateway: raw upstream monitor failed, will retry"
                     );
-                    // guard removed — cleanup_tick aborts via AbortOnDrop.
-                    tokio::time::sleep(backoff).await;
-                    backoff = std::cmp::min(backoff * 2, max_backoff);
-                    continue;
                 }
-                backoff = Duration::from_millis(250);
+                // Unconditional re-subscribe delay. The loop top re-issues
+                // the upstream monitor; sleeping on EVERY iteration — clean
+                // FINISH (Ok) and disconnect/error (Err) alike — is what
+                // stops a clean MONITOR FINISH from tight-looping
+                // INIT→FINISH→resubscribe with zero delay. The channel stays
+                // Active after a FINISH (only the IOID is unregistered), so
+                // without this a complete-then-finish PV spins at the CPU's
+                // mercy. pva2pva treats unlisten as terminal
+                // (moncache.cpp:214-236); we reconnect transparently but
+                // never with zero delay, matching the ca_gateway and pvalink
+                // sibling loops that always sleep before re-opening. A
+                // subscription that delivered an event re-arms the floor for
+                // a prompt reconnect; one that never delivered one keeps the
+                // grown backoff (see `resubscribe_backoff`).
+                let (delay, next_backoff) = resubscribe_backoff(
+                    event_seen.swap(false, Ordering::Relaxed),
+                    backoff,
+                    Duration::from_millis(250),
+                    max_backoff,
+                );
+                tokio::time::sleep(delay).await;
+                backoff = next_backoff;
+                // guard removed — cleanup_tick aborts via AbortOnDrop.
 
                 // Both typed (PvField) and raw-frame channels feed
                 // downstreams; raw-forwarding is default-on so
@@ -1385,6 +1451,55 @@ mod tests {
     use super::*;
     use epics_pva_rs::proto::{BitSet, ByteOrder};
     use epics_pva_rs::pvdata::{ScalarType, ScalarValue};
+
+    /// The reconnect loop's re-subscribe delay must be applied on EVERY
+    /// path — a clean MONITOR FINISH (Ok) as well as an error (Err) — so a
+    /// completing upstream PV cannot tight-loop INIT→FINISH→resubscribe with
+    /// zero delay (the BRPVAGW-1 busy-loop). Pre-fix the Ok path slept 0 and
+    /// reset the floor unconditionally. By invariant boundary:
+    /// - delivered an event → re-arm the floor (prompt reconnect);
+    /// - no event, grown backoff → keep it and STILL sleep it (never 0);
+    /// - doubling saturates at `max`.
+    #[test]
+    fn resubscribe_backoff_never_zero_and_floors_only_after_event() {
+        let floor = Duration::from_millis(250);
+        let max = Duration::from_secs(30);
+
+        // Delivered an event then dropped (healthy): a grown backoff
+        // collapses back to the floor for a prompt reconnect.
+        let (delay, next) = resubscribe_backoff(true, Duration::from_secs(8), floor, max);
+        assert_eq!(delay, floor, "event-bearing subscription re-arms the floor");
+        assert_eq!(
+            next,
+            Duration::from_millis(500),
+            "next backoff doubles the floor"
+        );
+
+        // Clean FINISH with NO event: keep the grown backoff and still sleep
+        // it. This is the busy-loop fix — the delay is never zero.
+        let (delay, next) = resubscribe_backoff(false, Duration::from_secs(4), floor, max);
+        assert_eq!(
+            delay,
+            Duration::from_secs(4),
+            "no-event end keeps the grown backoff"
+        );
+        assert_ne!(
+            delay,
+            Duration::ZERO,
+            "a clean FINISH must never re-subscribe with zero delay"
+        );
+        assert_eq!(next, Duration::from_secs(8), "backoff doubles toward max");
+
+        // First end with no event still sleeps the floor (> 0), not zero.
+        let (delay, _next) = resubscribe_backoff(false, floor, floor, max);
+        assert_eq!(delay, floor);
+        assert!(delay > Duration::ZERO);
+
+        // Doubling saturates at `max`.
+        let (delay, next) = resubscribe_backoff(false, Duration::from_secs(20), floor, max);
+        assert_eq!(delay, Duration::from_secs(20));
+        assert_eq!(next, max, "next backoff saturates at max");
+    }
 
     /// Encode a wire monitor body (`changed | value`) for `value`
     /// against `desc`, marking the bits in `set_bits` as changed.

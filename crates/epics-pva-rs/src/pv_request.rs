@@ -589,7 +589,7 @@ impl PvRequestExpr {
                     }
                     PvField::Structure(s)
                 }
-                _ => PvField::Scalar(ScalarValue::String(String::new())),
+                _ => PvField::Scalar(ScalarValue::String(String::new().into())),
             }
         }
         // Fill the `field` subtree: empty structs everywhere, except an
@@ -614,7 +614,7 @@ impl PvRequestExpr {
                             for (k, v) in opts {
                                 opt_s.fields.push((
                                     k.clone(),
-                                    PvField::Scalar(ScalarValue::String(v.clone())),
+                                    PvField::Scalar(ScalarValue::String(v.clone().into())),
                                 ));
                             }
                             s.fields
@@ -631,7 +631,7 @@ impl PvRequestExpr {
                     }
                     PvField::Structure(s)
                 }
-                _ => PvField::Scalar(ScalarValue::String(String::new())),
+                _ => PvField::Scalar(ScalarValue::String(String::new().into())),
             }
         }
         let desc = self.to_field_desc();
@@ -688,7 +688,7 @@ fn empty_struct_value(desc: &FieldDesc) -> crate::pvdata::PvField {
             }
             PvField::Structure(s)
         }
-        _ => PvField::Scalar(ScalarValue::String(String::new())),
+        _ => PvField::Scalar(ScalarValue::String(String::new().into())),
     }
 }
 
@@ -1308,7 +1308,8 @@ impl<'a> Parser<'a> {
                     // testpvreq.cpp:232-256) — only the typed builder
                     // carries bool/int.
                     let val = self.lex_value()?;
-                    out.record_options.push((key, ScalarValue::String(val)));
+                    out.record_options
+                        .push((key, ScalarValue::String(val.into())));
                 }
                 other => {
                     return Err(PvRequestParseError::UnexpectedChar {
@@ -1393,7 +1394,7 @@ mod tests {
     /// string-typed (pvxs PVRParser `string k = "v"`), so test
     /// expectations wrap the value in `ScalarValue::String`.
     fn rec_s(key: &str, val: &str) -> (String, ScalarValue) {
-        (key.to_string(), ScalarValue::String(val.to_string()))
+        (key.to_string(), ScalarValue::String(val.to_string().into()))
     }
 
     /// The `record._options.<name>` member *types* a built pvRequest
@@ -1792,10 +1793,7 @@ mod tests {
         );
         assert_eq!(
             option_values(&req),
-            [(
-                "pipeline".to_string(),
-                ScalarValue::String("true".to_string())
-            )]
+            [("pipeline".to_string(), ScalarValue::String("true".into()))]
         );
     }
 

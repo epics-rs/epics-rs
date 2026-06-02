@@ -38,6 +38,8 @@
 use std::fmt;
 use std::sync::Arc;
 
+use epics_base_rs::types::PvString;
+
 use super::scalar::{ScalarType, ScalarValue};
 
 /// Typed, reference-counted scalar array. Each variant wraps an
@@ -61,7 +63,7 @@ pub enum TypedScalarArray {
     ULong(Arc<[u64]>),
     Float(Arc<[f32]>),
     Double(Arc<[f64]>),
-    String(Arc<[String]>),
+    String(Arc<[PvString]>),
 }
 
 impl TypedScalarArray {

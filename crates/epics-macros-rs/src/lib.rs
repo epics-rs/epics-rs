@@ -426,7 +426,7 @@ fn value_to_epics(
         "Int64" => quote! { #krate::types::EpicsValue::Int64(#field_expr) },
         "Char" => quote! { #krate::types::EpicsValue::Char(#field_expr) },
         "Enum" => quote! { #krate::types::EpicsValue::Enum(#field_expr) },
-        "String" => quote! { #krate::types::EpicsValue::String(#field_expr.clone()) },
+        "String" => quote! { #krate::types::EpicsValue::String(#field_expr.clone().into()) },
         _ => quote! { compile_error!("unknown field type") },
     }
 }
@@ -465,9 +465,17 @@ fn value_from_epics(
 
     let variant_ident = proc_macro2::Ident::new(variant, proc_macro2::Span::call_site());
 
+    // String fields are declared as `String` in Rust but the
+    // `EpicsValue::String` variant now wraps `PvString`; convert on assign.
+    let assign = if dbf_type == "String" {
+        quote! { self.#field_ident = v.as_str_lossy().into_owned(); }
+    } else {
+        quote! { self.#field_ident = v; }
+    };
+
     quote! {
         if let #krate::types::EpicsValue::#variant_ident(v) = value {
-            self.#field_ident = v;
+            #assign
         } else {
             return Err(#krate::error::CaError::TypeMismatch(
                 stringify!(#field_ident).to_uppercase().to_string()

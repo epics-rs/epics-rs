@@ -382,7 +382,7 @@ impl Record for SwaitRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
-            "CALC" => Some(EpicsValue::String(self.calc.clone())),
+            "CALC" => Some(EpicsValue::String(self.calc.clone().into())),
             "OOPT" => Some(EpicsValue::Short(self.oopt)),
             "DOPT" => Some(EpicsValue::Short(self.dopt)),
             "DOLD" => Some(EpicsValue::Double(self.dold)),
@@ -394,7 +394,7 @@ impl Record for SwaitRecord {
                     return Some(EpicsValue::Double(self.num_vals[idx]));
                 }
                 if let Some(idx) = Self::inp_name_index(name) {
-                    return Some(EpicsValue::String(self.inp_names[idx].clone()));
+                    return Some(EpicsValue::String(self.inp_names[idx].clone().into()));
                 }
                 if let Some(idx) = Self::inp_passive_index(name) {
                     return Some(EpicsValue::Short(self.inp_passive[idx]));
@@ -413,7 +413,7 @@ impl Record for SwaitRecord {
             }
             "CALC" => {
                 if let EpicsValue::String(s) = value {
-                    self.calc = s;
+                    self.calc = s.as_str_lossy().into_owned();
                     self.recompile();
                 } else {
                     return Err(CaError::TypeMismatch("CALC".into()));
@@ -447,7 +447,7 @@ impl Record for SwaitRecord {
                         .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
                 } else if let Some(idx) = Self::inp_name_index(name) {
                     if let EpicsValue::String(s) = value {
-                        self.inp_names[idx] = s;
+                        self.inp_names[idx] = s.as_str_lossy().into_owned();
                     } else {
                         return Err(CaError::TypeMismatch(name.into()));
                     }

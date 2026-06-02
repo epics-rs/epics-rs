@@ -504,16 +504,16 @@ impl Record for ScalcoutRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
-            "SVAL" => Some(EpicsValue::String(self.sval.clone())),
-            "CALC" => Some(EpicsValue::String(self.calc.clone())),
+            "SVAL" => Some(EpicsValue::String(self.sval.clone().into())),
+            "CALC" => Some(EpicsValue::String(self.calc.clone().into())),
             "OOPT" => Some(EpicsValue::Short(self.oopt)),
             "DOPT" => Some(EpicsValue::Short(self.dopt)),
-            "OCAL" => Some(EpicsValue::String(self.ocal.clone())),
+            "OCAL" => Some(EpicsValue::String(self.ocal.clone().into())),
             "OVAL" => Some(EpicsValue::Double(self.oval)),
-            "OSV" => Some(EpicsValue::String(self.osv.clone())),
+            "OSV" => Some(EpicsValue::String(self.osv.clone().into())),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
             "IVOV" => Some(EpicsValue::Double(self.ivov)),
-            "OUT" => Some(EpicsValue::String(self.out.clone())),
+            "OUT" => Some(EpicsValue::String(self.out.clone().into())),
             "WAIT" => Some(EpicsValue::Short(self.wait)),
             "PREC" => Some(EpicsValue::Short(self.prec)),
             "CALC_ALARM" => Some(EpicsValue::Char(if self.calc_alarm { 1 } else { 0 })),
@@ -522,10 +522,10 @@ impl Record for ScalcoutRecord {
                     return Some(EpicsValue::Double(self.num_vals[idx]));
                 }
                 if let Some(idx) = Self::str_var_index(name) {
-                    return Some(EpicsValue::String(self.str_vals[idx].clone()));
+                    return Some(EpicsValue::String(self.str_vals[idx].clone().into()));
                 }
                 if let Some(idx) = Self::inp_index(name) {
-                    return Some(EpicsValue::String(self.inp_links[idx].clone()));
+                    return Some(EpicsValue::String(self.inp_links[idx].clone().into()));
                 }
                 None
             }
@@ -542,14 +542,14 @@ impl Record for ScalcoutRecord {
             }
             "SVAL" => match value {
                 EpicsValue::String(s) => {
-                    self.sval = s;
+                    self.sval = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SVAL".into())),
             },
             "CALC" => match value {
                 EpicsValue::String(s) => {
-                    self.calc = s;
+                    self.calc = s.as_str_lossy().into_owned();
                     self.recompile_calc();
                     Ok(())
                 }
@@ -571,7 +571,7 @@ impl Record for ScalcoutRecord {
             },
             "OCAL" => match value {
                 EpicsValue::String(s) => {
-                    self.ocal = s;
+                    self.ocal = s.as_str_lossy().into_owned();
                     self.recompile_ocal();
                     Ok(())
                 }
@@ -585,7 +585,7 @@ impl Record for ScalcoutRecord {
             }
             "OSV" => match value {
                 EpicsValue::String(s) => {
-                    self.osv = s;
+                    self.osv = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("OSV".into())),
@@ -605,7 +605,7 @@ impl Record for ScalcoutRecord {
             }
             "OUT" => {
                 if let EpicsValue::String(s) = value {
-                    self.out = s;
+                    self.out = s.as_str_lossy().into_owned();
                     Ok(())
                 } else {
                     Err(CaError::TypeMismatch("OUT".into()))
@@ -632,7 +632,7 @@ impl Record for ScalcoutRecord {
                 if let Some(idx) = Self::str_var_index(name) {
                     match value {
                         EpicsValue::String(s) => {
-                            self.str_vals[idx] = s;
+                            self.str_vals[idx] = s.as_str_lossy().into_owned();
                             return Ok(());
                         }
                         _ => return Err(CaError::TypeMismatch(name.into())),
@@ -641,7 +641,7 @@ impl Record for ScalcoutRecord {
                 if let Some(idx) = Self::inp_index(name) {
                     match value {
                         EpicsValue::String(s) => {
-                            self.inp_links[idx] = s;
+                            self.inp_links[idx] = s.as_str_lossy().into_owned();
                             return Ok(());
                         }
                         _ => return Err(CaError::TypeMismatch(name.into())),

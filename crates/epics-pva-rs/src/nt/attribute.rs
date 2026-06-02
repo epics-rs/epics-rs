@@ -61,7 +61,7 @@ impl NTAttribute {
         let mut s = PvStructure::new("epics:nt/NTAttribute:1.0");
         s.fields.push((
             "name".into(),
-            PvField::Scalar(ScalarValue::String(self.name.clone())),
+            PvField::Scalar(ScalarValue::String(self.name.clone().into())),
         ));
         let variant = match &self.value {
             Some((d, v)) => VariantValue {
@@ -79,7 +79,7 @@ impl NTAttribute {
             .push(("tags".into(), PvField::ScalarArray(Vec::new())));
         s.fields.push((
             "descriptor".into(),
-            PvField::Scalar(ScalarValue::String(self.descriptor.clone())),
+            PvField::Scalar(ScalarValue::String(self.descriptor.clone().into())),
         ));
         s.fields.push(("alarm".into(), alarm_default()));
         s.fields.push(("timeStamp".into(), time_default()));
@@ -87,7 +87,7 @@ impl NTAttribute {
             .push(("sourceType".into(), PvField::Scalar(ScalarValue::Int(0))));
         s.fields.push((
             "source".into(),
-            PvField::Scalar(ScalarValue::String(String::new())),
+            PvField::Scalar(ScalarValue::String(String::new().into())),
         ));
         PvField::Structure(s)
     }

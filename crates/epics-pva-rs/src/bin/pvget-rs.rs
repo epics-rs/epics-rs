@@ -210,7 +210,7 @@ mod tests {
             req.record_options,
             vec![(
                 "process".to_string(),
-                epics_pva_rs::pvdata::ScalarValue::String("true".to_string())
+                epics_pva_rs::pvdata::ScalarValue::String("true".into())
             )],
             "record[...] options must be preserved as the parsed-text string form"
         );

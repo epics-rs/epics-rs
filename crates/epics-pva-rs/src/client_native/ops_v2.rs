@@ -4502,7 +4502,7 @@ fn build_put_variant(value_str: &str) -> PvaResult<PvField> {
     } else if let Ok(d) = trimmed.parse::<f64>() {
         (ScalarType::Double, ScalarValue::Double(d))
     } else {
-        (ScalarType::String, ScalarValue::String(trimmed.to_string()))
+        (ScalarType::String, ScalarValue::String(trimmed.into()))
     };
     Ok(PvField::Variant(Box::new(VariantValue {
         desc: Some(FieldDesc::Scalar(st)),
@@ -4738,7 +4738,7 @@ mod tests {
             let (value, changed) = build_put_from_args(&intro, &t(&["a=b"])).unwrap();
             assert_eq!(
                 scalar_at(&value, &["value"]),
-                &ScalarValue::String("a=b".to_string())
+                &ScalarValue::String("a=b".into())
             );
             assert!(changed.get(intro.bit_for_path("value").unwrap()));
         }
@@ -5276,7 +5276,7 @@ mod tests {
             .map(|(k, v)| {
                 (
                     k.to_string(),
-                    crate::pvdata::ScalarValue::String(v.to_string()),
+                    crate::pvdata::ScalarValue::String(v.to_string().into()),
                 )
             })
             .collect()

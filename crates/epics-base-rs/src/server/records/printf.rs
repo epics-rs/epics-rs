@@ -62,7 +62,7 @@ impl PrintfRecord {
     /// Mirrors C reading the link as `DBR_STRING` / `DBR_CHAR`.
     fn val_as_string(v: &EpicsValue) -> String {
         match v {
-            EpicsValue::String(s) => s.clone(),
+            EpicsValue::String(s) => s.as_str_lossy().into_owned(),
             EpicsValue::CharArray(bytes) => {
                 let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
                 String::from_utf8_lossy(&bytes[..end]).into_owned()
@@ -295,7 +295,9 @@ impl PrintfRecord {
                     // %c: the input value as a single character (C reads
                     // DBR_CHAR). Numeric value → its code point.
                     let ch = match arg {
-                        Some(EpicsValue::String(s)) => s.chars().next().unwrap_or(' '),
+                        Some(EpicsValue::String(s)) => {
+                            s.as_str_lossy().chars().next().unwrap_or(' ')
+                        }
                         Some(v) => {
                             let code = Self::val_as_f64(v) as u32;
                             char::from_u32(code).unwrap_or('\u{0}')
@@ -586,10 +588,10 @@ impl Record for PrintfRecord {
         match name {
             "VAL" => Some(EpicsValue::CharArray(self.val.as_bytes().to_vec())),
             "SIZV" => Some(EpicsValue::Short(self.sizv as i16)),
-            "FMT" => Some(EpicsValue::String(self.fmt.clone())),
+            "FMT" => Some(EpicsValue::String(self.fmt.clone().into())),
             _ => {
                 if let Some(idx) = Self::inp_index(name) {
-                    return Some(EpicsValue::String(self.inp_links[idx].clone()));
+                    return Some(EpicsValue::String(self.inp_links[idx].clone().into()));
                 }
                 if let Some(idx) = Self::val_index(name) {
                     return Some(self.vals[idx].clone());
@@ -610,7 +612,7 @@ impl Record for PrintfRecord {
             }
             "FMT" => {
                 if let EpicsValue::String(s) = value {
-                    self.fmt = s;
+                    self.fmt = s.as_str_lossy().into_owned();
                 } else {
                     return Err(CaError::TypeMismatch("FMT".into()));
                 }
@@ -618,7 +620,7 @@ impl Record for PrintfRecord {
             _ => {
                 if let Some(idx) = Self::inp_index(name) {
                     if let EpicsValue::String(s) = value {
-                        self.inp_links[idx] = s;
+                        self.inp_links[idx] = s.as_str_lossy().into_owned();
                     } else {
                         return Err(CaError::TypeMismatch(name.into()));
                     }

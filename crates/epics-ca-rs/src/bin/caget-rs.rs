@@ -477,7 +477,7 @@ fn specified_dbr_report(
             .class_name
             .clone()
             .or_else(|| match &snap.value {
-                EpicsValue::String(s) => Some(s.clone()),
+                EpicsValue::String(s) => Some(s.as_str_lossy().into_owned()),
                 _ => None,
             })
             .unwrap_or_default();
@@ -958,7 +958,7 @@ mod tests {
     #[test]
     fn specified_report_class_name_prints_class_line_only() {
         let mut snap = Snapshot::new(
-            EpicsValue::String("ai".to_string()),
+            EpicsValue::String("ai".into()),
             0,
             0,
             SystemTime::UNIX_EPOCH,

@@ -158,7 +158,7 @@ impl SubscriptionFilter for TimestampFilter {
             }
             TsMode::StringEpics => {
                 event.event.snapshot.value =
-                    EpicsValue::String(format_epics_string(event.event.snapshot.timestamp));
+                    EpicsValue::String(format_epics_string(event.event.snapshot.timestamp).into());
             }
         }
         Some(event)
@@ -315,6 +315,7 @@ mod tests {
         match out.event.snapshot.value {
             EpicsValue::String(s) => {
                 // Sanity: contains the date and the microsecond fraction.
+                let s = s.as_str_lossy();
                 assert!(
                     s.starts_with("2024-01-15") && s.contains(".123456"),
                     "unexpected format: {s}"

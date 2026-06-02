@@ -212,7 +212,8 @@ fn test_out_of_range_tst_uses_format_0() {
 fn test_val_truncated_to_39_visible_bytes() {
     let mut rec = TimestampRecord::default();
     let long = "x".repeat(100);
-    rec.put_field("VAL", EpicsValue::String(long)).unwrap();
+    rec.put_field("VAL", EpicsValue::String(long.into()))
+        .unwrap();
     assert_eq!(
         rec.val.len(),
         39,

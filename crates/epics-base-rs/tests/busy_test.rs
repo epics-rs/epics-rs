@@ -34,7 +34,7 @@ record(busy, "TEST:BUSY") {
     let val: EpicsValue = server.get("TEST:BUSY").await.unwrap();
     assert_eq!(val, EpicsValue::Enum(0));
     let znam: EpicsValue = server.get("TEST:BUSY.ZNAM").await.unwrap();
-    assert_eq!(znam, EpicsValue::String("Idle".to_string()));
+    assert_eq!(znam, EpicsValue::String("Idle".into()));
 }
 
 #[test]

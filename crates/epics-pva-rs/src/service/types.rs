@@ -88,7 +88,7 @@ impl_arg_scalar!(bool, Boolean, |_: &ScalarValue| None);
 impl ServiceArg for String {
     fn from_pv_field(field: &PvField) -> Result<Self, String> {
         match field {
-            PvField::Scalar(ScalarValue::String(s)) => Ok(s.clone()),
+            PvField::Scalar(ScalarValue::String(s)) => Ok(s.as_str_lossy().into_owned()),
             other => Err(format!("expected String scalar, got {other:?}")),
         }
     }
@@ -150,7 +150,7 @@ impl IntoServiceResponse for String {
         let descriptor = builder.build();
         let mut value = builder.create();
         if let PvField::Structure(s) = &mut value {
-            s.set("value", PvField::Scalar(ScalarValue::String(self)));
+            s.set("value", PvField::Scalar(ScalarValue::String(self.into())));
         }
         ServiceResponse { descriptor, value }
     }
@@ -186,7 +186,7 @@ impl IntoServiceResponse for Status {
             .push(("ok".into(), PvField::Scalar(ScalarValue::Boolean(self.ok))));
         s.fields.push((
             "message".into(),
-            PvField::Scalar(ScalarValue::String(self.message)),
+            PvField::Scalar(ScalarValue::String(self.message.into())),
         ));
         ServiceResponse {
             descriptor: FieldDesc::Structure {

@@ -571,7 +571,10 @@ record(timestamp, "TEST:TS") {
     match val {
         EpicsValue::String(s) => {
             assert!(!s.is_empty(), "Timestamp should be non-empty");
-            assert!(s.contains(':'), "Format 4 (HH:MM:SS) should contain ':'");
+            assert!(
+                s.as_str_lossy().contains(':'),
+                "Format 4 (HH:MM:SS) should contain ':'"
+            );
         }
         other => panic!("expected String, got {:?}", other),
     }

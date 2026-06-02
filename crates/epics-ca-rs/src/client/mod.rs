@@ -24,7 +24,9 @@ use crate::protocol::*;
 use crate::repeater;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
-use epics_base_rs::types::{DBR_STRING, DBR_TIME_STRING, DbFieldType, EpicsValue, decode_dbr};
+use epics_base_rs::types::{
+    DBR_STRING, DBR_TIME_STRING, DbFieldType, EpicsValue, PvString, decode_dbr,
+};
 
 pub use state::{ChannelState, ConnectionEvent};
 
@@ -1353,13 +1355,15 @@ fn validate_put_count(snap: &types::ChannelSnapshotPublic, count: u32) -> CaResu
 /// `put_string()` could write a different value than the caller
 /// supplied. Validate up front so the call fails synchronously.
 const MAX_STRING_SIZE: usize = 40;
-fn validate_string_length(s: &str) -> CaResult<()> {
-    // C requires room for the trailing NUL: payload >= s.len() + 1.
-    if s.len() >= MAX_STRING_SIZE {
+fn validate_string_length(s: impl AsRef<[u8]>) -> CaResult<()> {
+    // The CA cap is a byte cap (DBR_STRING is a fixed 40-byte field, 39 + NUL),
+    // so measure the raw bytes — a lossy text view would mis-count non-UTF-8.
+    // C requires room for the trailing NUL: payload >= len + 1.
+    let len = s.as_ref().len();
+    if len >= MAX_STRING_SIZE {
         return Err(CaError::Protocol(format!(
-            "string of {} bytes exceeds MAX_STRING_SIZE - 1 = 39 \
-             (matches libca nciu::stringVerify ECA_STRTOBIG)",
-            s.len()
+            "string of {len} bytes exceeds MAX_STRING_SIZE - 1 = 39 \
+             (matches libca nciu::stringVerify ECA_STRTOBIG)"
         )));
     }
     Ok(())
@@ -2419,7 +2423,7 @@ impl CaChannel {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.in_flight.writes.insert(ioid, (self.cid, reply_tx));
 
-        let payload = EpicsValue::String(value.to_string()).to_bytes();
+        let payload = EpicsValue::String(value.into()).to_bytes();
         // DBR_STRING = 0; count 1. The server interprets the bytes
         // against its own field type (e.g. ENUM menu resolution).
         if let Err(e) = self.send_write_notify_fast(&snap, 0, 1, ioid, payload) {
@@ -2444,7 +2448,7 @@ impl CaChannel {
         let snap = self.snapshot()?;
         validate_put_count(&snap, 1)?;
         validate_string_length(value)?;
-        let payload = EpicsValue::String(value.to_string()).to_bytes();
+        let payload = EpicsValue::String(value.into()).to_bytes();
         self.send_write_nowait_fast(&snap, 0, 1, payload)
     }
 
@@ -2468,7 +2472,8 @@ impl CaChannel {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.in_flight.writes.insert(ioid, (self.cid, reply_tx));
 
-        let payload = EpicsValue::StringArray(values.to_vec()).to_bytes();
+        let payload =
+            EpicsValue::StringArray(values.iter().map(PvString::from).collect()).to_bytes();
         let count = values.len() as u32;
         // DBR_STRING = 0. The server interprets each 40-byte element
         // against its own field type (e.g. ENUM menu resolution).
@@ -2494,7 +2499,8 @@ impl CaChannel {
         for s in values {
             validate_string_length(s)?;
         }
-        let payload = EpicsValue::StringArray(values.to_vec()).to_bytes();
+        let payload =
+            EpicsValue::StringArray(values.iter().map(PvString::from).collect()).to_bytes();
         let count = values.len() as u32;
         self.send_write_nowait_fast(&snap, 0, count, payload)
     }
@@ -5316,7 +5322,7 @@ mod typed_string_put_tests {
     /// the way `put_string_nowait` does and asserts the header field.
     #[test]
     fn put_string_frame_uses_dbr_string_type() {
-        let payload = EpicsValue::String("Running".to_string()).to_bytes();
+        let payload = EpicsValue::String("Running".into()).to_bytes();
         let frame = CaChannel::build_write_frame(
             CA_PROTO_WRITE,
             /* sid */ 77,
@@ -5366,12 +5372,13 @@ mod typed_string_put_tests {
     /// string. Drives the same `build_write_frame` builder.
     #[test]
     fn put_string_array_frame_uses_dbr_string_type_and_count() {
-        let values = vec![
+        let values = [
             "Running".to_string(),
             "Stopped".to_string(),
             "Paused".to_string(),
         ];
-        let payload = EpicsValue::StringArray(values.clone()).to_bytes();
+        let payload =
+            EpicsValue::StringArray(values.iter().map(|s| s.clone().into()).collect()).to_bytes();
         assert_eq!(
             payload.len(),
             values.len() * 40,

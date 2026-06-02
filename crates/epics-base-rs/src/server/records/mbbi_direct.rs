@@ -239,8 +239,8 @@ impl Record for MbbiDirectRecord {
             "NOBT" => Some(EpicsValue::Short(self.nobt)),
             "MLST" => Some(EpicsValue::Long(self.mlst as i32)),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
-            "SIML" => Some(EpicsValue::String(self.siml.clone())),
-            "SIOL" => Some(EpicsValue::String(self.siol.clone())),
+            "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
+            "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             _ => BIT_NAMES
                 .iter()
@@ -297,14 +297,14 @@ impl Record for MbbiDirectRecord {
             }
             "SIML" => {
                 if let EpicsValue::String(v) = value {
-                    self.siml = v;
+                    self.siml = v.as_str_lossy().into_owned();
                 } else {
                     return Err(CaError::TypeMismatch("SIML".into()));
                 }
             }
             "SIOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.siol = v;
+                    self.siol = v.as_str_lossy().into_owned();
                 } else {
                     return Err(CaError::TypeMismatch("SIOL".into()));
                 }

@@ -5,7 +5,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use epics_base_rs::server::snapshot::{ControlInfo, DisplayInfo, Snapshot};
-use epics_base_rs::types::EpicsValue;
+use epics_base_rs::types::{EpicsValue, PvString};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 
 use crate::convert::{epics_to_pv_field, epics_to_scalar};
@@ -177,7 +177,7 @@ fn limit_scalar(t: ScalarType, v: f64) -> ScalarValue {
         ScalarType::Double => ScalarValue::Double(v),
         // String values are non-numeric and never reach the limit
         // builders; fall back to the textual rendering for completeness.
-        ScalarType::String => ScalarValue::String(v.to_string()),
+        ScalarType::String => ScalarValue::String(v.to_string().into()),
     }
 }
 
@@ -279,7 +279,7 @@ pub fn snapshot_to_nt_enum(snapshot: &Snapshot) -> PvStructure {
         .map(|e| {
             e.strings
                 .iter()
-                .map(|s| ScalarValue::String(s.clone()))
+                .map(|s| ScalarValue::String(s.clone().into()))
                 .collect()
         })
         .unwrap_or_default();
@@ -312,7 +312,8 @@ pub fn snapshot_to_nt_enum(snapshot: &Snapshot) -> PvStructure {
                 .display
                 .as_ref()
                 .map(|d| d.description.clone())
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .into(),
         )),
     ));
     pv.fields
@@ -378,24 +379,26 @@ pub fn snapshot_to_nt_scalar_array(snapshot: &Snapshot) -> PvStructure {
     pv
 }
 
-/// Decode a long-string field's stored value into a Rust `String`.
+/// Decode a long-string field's stored value into a byte-preserving
+/// [`PvString`].
 ///
 /// The record keeps the string as a `DBF_CHAR` `CharArray` (its native CA
-/// representation); the QSRV boundary reads it back as a NUL-terminated,
-/// UTF-8 string, matching the record's own `put_field` decode (e.g.
-/// `lsiRecord` `String::from_utf8_lossy(&bytes[..first_nul])`).
-fn long_string_value(value: &EpicsValue) -> String {
+/// representation); the QSRV boundary reads it back as the NUL-terminated
+/// byte run verbatim — pvxs serves the `DBF_CHAR` `form="String"` view as a
+/// `pvString` of the raw bytes up to NUL with no UTF-8 validation
+/// (`singlesource.cpp:189-205`), so the bytes pass through unmodified.
+fn long_string_value(value: &EpicsValue) -> PvString {
     match value {
         EpicsValue::CharArray(bytes) => {
             let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-            String::from_utf8_lossy(&bytes[..end]).into_owned()
+            PvString::from_bytes(&bytes[..end])
         }
         EpicsValue::String(s) => s.clone(),
         // Any other shape is unexpected for a long-string channel; fall
         // back to the scalar rendering so a value is still produced.
         other => match epics_to_scalar(other) {
             ScalarValue::String(s) => s,
-            sv => sv.to_string(),
+            sv => sv.to_string().into(),
         },
     }
 }
@@ -648,7 +651,9 @@ fn build_alarm(snapshot: &Snapshot) -> PvStructure {
     alarm.fields.push((
         "message".into(),
         PvField::Scalar(ScalarValue::String(
-            alarm_condition_string(snapshot.alarm.status).to_string(),
+            alarm_condition_string(snapshot.alarm.status)
+                .to_string()
+                .into(),
         )),
     ));
     alarm
@@ -678,7 +683,7 @@ fn build_alarm_overlay(snapshot: &Snapshot, severity: u16, status: u16) -> PvStr
     alarm.fields.push((
         "message".into(),
         PvField::Scalar(ScalarValue::String(
-            alarm_condition_string(eff_status).to_string(),
+            alarm_condition_string(eff_status).to_string().into(),
         )),
     ));
     alarm
@@ -752,7 +757,7 @@ fn build_form(form: i16) -> PvStructure {
         PvField::ScalarArray(
             FORM_CHOICES
                 .iter()
-                .map(|s| ScalarValue::String((*s).to_string()))
+                .map(|s| ScalarValue::String((*s).to_string().into()))
                 .collect(),
         ),
     ));
@@ -779,11 +784,11 @@ fn build_display(disp: &DisplayInfo, scalar_type: ScalarType, numeric: bool) -> 
     }
     d.fields.push((
         "description".into(),
-        PvField::Scalar(ScalarValue::String(disp.description.clone())),
+        PvField::Scalar(ScalarValue::String(disp.description.clone().into())),
     ));
     d.fields.push((
         "units".into(),
-        PvField::Scalar(ScalarValue::String(disp.units.clone())),
+        PvField::Scalar(ScalarValue::String(disp.units.clone().into())),
     ));
     if numeric {
         d.fields.push((
@@ -1103,6 +1108,33 @@ mod tests {
         }
     }
 
+    /// PVA-89: a long-string (`DBF_CHAR` `form="String"`) gateway
+    /// pass-through must preserve non-UTF-8 bytes verbatim. pvxs reads the
+    /// raw byte run up to NUL with no UTF-8 validation
+    /// (`singlesource.cpp:189-205`); the port keeps the bytes in
+    /// `PvString::from_bytes`, so a Latin-1 / binary CharArray reaches the
+    /// PVA client unmangled rather than as U+FFFD replacements.
+    #[test]
+    fn long_string_value_preserves_non_utf8_bytes() {
+        // 0xFF / 0x80 are invalid standalone UTF-8; the byte path keeps
+        // each as one byte. A NUL still truncates (C buffer semantics).
+        let snap = Snapshot::new(
+            EpicsValue::CharArray(vec![0xff, 0x80, b'a', 0xc3, 0x28, 0x00, b'x']),
+            0,
+            0,
+            UNIX_EPOCH,
+        );
+        let pv = snapshot_to_pv_structure(&snap, NtType::LongString);
+        match pv.get_field("value") {
+            Some(PvField::Scalar(ScalarValue::String(s))) => assert_eq!(
+                s.as_bytes(),
+                &[0xff, 0x80, b'a', 0xc3, 0x28],
+                "non-UTF-8 long-string bytes must pass through verbatim, up to NUL"
+            ),
+            other => panic!("expected scalar string value, got {other:?}"),
+        }
+    }
+
     fn alarm_scalar_int(s: &PvStructure, name: &str) -> i32 {
         match s.fields.iter().find(|(n, _)| n == name).map(|(_, f)| f) {
             Some(PvField::Scalar(ScalarValue::Int(v))) => *v,
@@ -1112,7 +1144,7 @@ mod tests {
 
     fn alarm_scalar_str(s: &PvStructure, name: &str) -> String {
         match s.fields.iter().find(|(n, _)| n == name).map(|(_, f)| f) {
-            Some(PvField::Scalar(ScalarValue::String(v))) => v.clone(),
+            Some(PvField::Scalar(ScalarValue::String(v))) => v.as_str_lossy().into_owned(),
             other => panic!("expected String field {name}, got {other:?}"),
         }
     }

@@ -648,7 +648,7 @@ mod tests {
         // String scalar through format_value is escaped.
         assert_eq!(
             format_value(
-                &EpicsValue::String("x\ty".to_string()),
+                &EpicsValue::String("x\ty".into()),
                 &fmt_default(),
                 None,
                 false
@@ -656,7 +656,7 @@ mod tests {
             "x\\ty"
         );
         // StringArray elements escaped; count prefix preserved.
-        let a = EpicsValue::StringArray(vec!["a\nb".to_string(), "c".to_string()]);
+        let a = EpicsValue::StringArray(vec!["a\nb".into(), "c".into()]);
         assert_eq!(format_value(&a, &fmt_default(), None, false), "2 a\\nb c");
         // `-S` long-string: escape the printable prefix up to NUL.
         let mut sfmt = fmt_default();

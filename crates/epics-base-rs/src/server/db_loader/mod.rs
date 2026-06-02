@@ -979,7 +979,7 @@ pub fn apply_fields(
             record.put_field(&upper_name, value)?;
         } else {
             // Store as common field for RecordInstance to handle
-            common_fields.push((upper_name, EpicsValue::String(value_str.clone())));
+            common_fields.push((upper_name, EpicsValue::String(value_str.clone().into())));
         }
     }
     Ok(())

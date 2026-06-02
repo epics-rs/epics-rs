@@ -532,13 +532,13 @@ impl Record for TransformRecord {
             return Some(EpicsValue::Double(self.vals[idx]));
         }
         if let Some(idx) = Self::calc_field_index(name) {
-            return Some(EpicsValue::String(self.calcs[idx].clone()));
+            return Some(EpicsValue::String(self.calcs[idx].clone().into()));
         }
         if let Some(idx) = Self::inp_field_index(name) {
-            return Some(EpicsValue::String(self.inp_links[idx].clone()));
+            return Some(EpicsValue::String(self.inp_links[idx].clone().into()));
         }
         if let Some(idx) = Self::out_field_index(name) {
-            return Some(EpicsValue::String(self.out_links[idx].clone()));
+            return Some(EpicsValue::String(self.out_links[idx].clone().into()));
         }
         None
     }
@@ -586,7 +586,7 @@ impl Record for TransformRecord {
         if let Some(idx) = Self::calc_field_index(name) {
             match value {
                 EpicsValue::String(s) => {
-                    self.calcs[idx] = s;
+                    self.calcs[idx] = s.as_str_lossy().into_owned();
                     self.recompile(idx);
                     return Ok(());
                 }
@@ -596,7 +596,7 @@ impl Record for TransformRecord {
         if let Some(idx) = Self::inp_field_index(name) {
             match value {
                 EpicsValue::String(s) => {
-                    self.inp_links[idx] = s;
+                    self.inp_links[idx] = s.as_str_lossy().into_owned();
                     return Ok(());
                 }
                 _ => return Err(CaError::TypeMismatch(name.into())),
@@ -605,7 +605,7 @@ impl Record for TransformRecord {
         if let Some(idx) = Self::out_field_index(name) {
             match value {
                 EpicsValue::String(s) => {
-                    self.out_links[idx] = s;
+                    self.out_links[idx] = s.as_str_lossy().into_owned();
                     return Ok(());
                 }
                 _ => return Err(CaError::TypeMismatch(name.into())),

@@ -547,16 +547,32 @@ pub(crate) fn is_state_table_field(field: &str) -> bool {
 
 /// Helper macro: maps EPICS field name strings to struct fields.
 macro_rules! mbb_get_field {
+    // `String`-variant fields store a Rust `String`; `EpicsValue::String`
+    // now wraps `PvString`, so convert with `.into()` (lossy text record).
+    (@get $self:expr, $field:ident, String) => {
+        Some(EpicsValue::String($self.$field.clone().into()))
+    };
+    (@get $self:expr, $field:ident, $variant:ident) => {
+        Some(EpicsValue::$variant($self.$field.clone()))
+    };
     ($self:expr, $name:expr, $( $str:literal => $field:ident : $variant:ident ),* $(,)?) => {
         match $name {
             "VAL" => Some(EpicsValue::Enum($self.val)),
-            $( $str => Some(EpicsValue::$variant($self.$field.clone())), )*
+            $( $str => mbb_get_field!(@get $self, $field, $variant), )*
             _ => None,
         }
     };
 }
 
 macro_rules! mbb_put_field {
+    // `String`-variant fields store a Rust `String`; the extracted payload
+    // is a `PvString`, so convert with `.as_str_lossy().into_owned()`.
+    (@put $self:expr, $field:ident, String, $v:expr) => {
+        $self.$field = $v.as_str_lossy().into_owned();
+    };
+    (@put $self:expr, $field:ident, $variant:ident, $v:expr) => {
+        $self.$field = $v;
+    };
     ($self:expr, $name:expr, $value:expr, $( $str:literal => $field:ident : $variant:ident ),* $(,)?) => {
         match $name {
             "VAL" => {
@@ -569,7 +585,7 @@ macro_rules! mbb_put_field {
             }
             $( $str => {
                 if let EpicsValue::$variant(v) = $value {
-                    $self.$field = v;
+                    mbb_put_field!(@put $self, $field, $variant, v);
                 } else {
                     return Err(CaError::TypeMismatch($str.into()));
                 }

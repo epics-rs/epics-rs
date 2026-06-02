@@ -201,10 +201,10 @@ record(scaler, "TEST:SC5") {
         .unwrap();
 
     let nm1 = server.get("TEST:SC5.NM1").await.unwrap();
-    assert_eq!(nm1, EpicsValue::String("clock".to_string()));
+    assert_eq!(nm1, EpicsValue::String("clock".into()));
 
     let nm2 = server.get("TEST:SC5.NM2").await.unwrap();
-    assert_eq!(nm2, EpicsValue::String("detector".to_string()));
+    assert_eq!(nm2, EpicsValue::String("detector".into()));
 
     let s1 = server.get("TEST:SC5.S1").await.unwrap();
     assert_eq!(s1, EpicsValue::Long(0));

@@ -374,7 +374,7 @@ impl PvDatabase {
                 // together when `stat_mask` is non-zero).
                 changed_fields.push((
                     "AMSG".to_string(),
-                    EpicsValue::String(instance.common.amsg.clone()),
+                    EpicsValue::String(instance.common.amsg.clone().into()),
                 ));
                 let snapshot = crate::server::record::ProcessSnapshot {
                     changed_fields,
@@ -660,7 +660,9 @@ impl PvDatabase {
                                     None
                                 }
                             })
-                            .map(|s| crate::server::record::parse_link_v2(&s))
+                            .map(|s| {
+                                crate::server::record::parse_link_v2(s.as_str_lossy().as_ref())
+                            })
                             .unwrap_or(crate::server::record::ParsedLink::None);
                         Some((dol_parsed, oif))
                     } else {
@@ -804,7 +806,7 @@ impl PvDatabase {
                                 }
                             })
                             .unwrap_or_default();
-                        (link_str, *lf, vf.to_string())
+                        (link_str.as_str_lossy().into_owned(), *lf, vf.to_string())
                     })
                     .collect()
             }; // read lock dropped
@@ -880,7 +882,8 @@ impl PvDatabase {
                     .unwrap_or_default();
                 if !nvl_str.is_empty() {
                     drop(instance); // release read lock before async read
-                    let parsed = crate::server::record::parse_link_v2(&nvl_str);
+                    let parsed =
+                        crate::server::record::parse_link_v2(nvl_str.as_str_lossy().as_ref());
                     self.read_link_value(&parsed, visited, depth).await
                 } else {
                     None
@@ -1873,7 +1876,9 @@ impl PvDatabase {
                     // OUT link is routed through the link set's
                     // `putValue` (C `dbLink.c::dbPutLink`,
                     // dbLink.c:434-448).
-                    let parsed = crate::server::record::parse_output_link_v2(&link_str);
+                    let parsed = crate::server::record::parse_output_link_v2(
+                        link_str.as_str_lossy().as_ref(),
+                    );
                     self.write_out_link_value(&parsed, val, src.putf, src.notify, visited, depth)
                         .await;
                 }
@@ -1995,7 +2000,7 @@ impl PvDatabase {
                 if link_str.is_empty() {
                     continue;
                 }
-                let parsed = crate::server::record::parse_link_v2(&link_str);
+                let parsed = crate::server::record::parse_link_v2(link_str.as_str_lossy().as_ref());
                 if let Some(value) = self.read_link_value(&parsed, visited, depth).await {
                     let mut instance = rec.write().await;
                     let _ = instance.record.put_field_internal(target_field, value);
@@ -2046,7 +2051,8 @@ impl PvDatabase {
                         continue;
                     }
                     // 2. Parse and read the linked PV
-                    let parsed = crate::server::record::parse_link_v2(&link_str);
+                    let parsed =
+                        crate::server::record::parse_link_v2(link_str.as_str_lossy().as_ref());
                     if let Some(value) = self.read_link_value(&parsed, visited, depth).await {
                         // 3. Write into the record field (internal put bypasses read-only)
                         let mut instance = rec.write().await;
@@ -2081,7 +2087,8 @@ impl PvDatabase {
                     // link, which C `dbPutLink` routes through the link
                     // set's `putValue` identically to a DB link
                     // (dbLink.c:434-448).
-                    let parsed = crate::server::record::parse_link_v2(&link_str);
+                    let parsed =
+                        crate::server::record::parse_link_v2(link_str.as_str_lossy().as_ref());
                     self.write_out_link_value(
                         &parsed,
                         value,
@@ -2554,7 +2561,9 @@ impl PvDatabase {
                     // NPP default; an external `ca://`/`pva://` link is
                     // routed through the link set's `putValue` — see the
                     // sync-path twin above.
-                    let parsed = crate::server::record::parse_output_link_v2(&link_str);
+                    let parsed = crate::server::record::parse_output_link_v2(
+                        link_str.as_str_lossy().as_ref(),
+                    );
                     self.write_out_link_value(
                         &parsed,
                         val,
@@ -2787,8 +2796,8 @@ impl PvDatabase {
                 return SimOutcome::NotSimulated; // No simulation configured
             }
 
-            let siml_parsed = crate::server::record::parse_link_v2(&siml);
-            let siol_parsed = crate::server::record::parse_link_v2(&siol);
+            let siml_parsed = crate::server::record::parse_link_v2(siml.as_str_lossy().as_ref());
+            let siol_parsed = crate::server::record::parse_link_v2(siol.as_str_lossy().as_ref());
 
             (siml_parsed, siol_parsed, sims, rtype, is_input)
         };

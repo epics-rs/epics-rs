@@ -125,7 +125,7 @@ async fn enum_default_readback_is_state_label() {
         .expect("DBR_STRING get on enum");
     assert_eq!(
         snap.value,
-        EpicsValue::String("On".to_string()),
+        EpicsValue::String("On".into()),
         "default enum readback must be the state label, not the index"
     );
 }
@@ -170,7 +170,7 @@ async fn enum_monitor_as_string_delivers_label() {
         .expect("monitor snapshot");
     assert_eq!(
         snap.value,
-        EpicsValue::String("On".to_string()),
+        EpicsValue::String("On".into()),
         "camonitor default must deliver the state label"
     );
 }

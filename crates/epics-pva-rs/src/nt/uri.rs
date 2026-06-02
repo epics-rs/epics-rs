@@ -127,7 +127,7 @@ impl NTURI {
         ));
         root.fields.push((
             "authority".into(),
-            PvField::Scalar(ScalarValue::String(String::new())),
+            PvField::Scalar(ScalarValue::String(String::new().into())),
         ));
         root.fields.push((
             "path".into(),

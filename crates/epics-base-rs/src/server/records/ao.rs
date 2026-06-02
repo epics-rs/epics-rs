@@ -460,7 +460,7 @@ impl Record for AoRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
-            "EGU" => Some(EpicsValue::String(self.egu.clone())),
+            "EGU" => Some(EpicsValue::String(self.egu.clone().into())),
             "HOPR" => Some(EpicsValue::Double(self.hopr)),
             "LOPR" => Some(EpicsValue::Double(self.lopr)),
             "PREC" => Some(EpicsValue::Short(self.prec)),
@@ -480,7 +480,7 @@ impl Record for AoRecord {
             "ASLO" => Some(EpicsValue::Double(self.aslo)),
             "AOFF" => Some(EpicsValue::Double(self.aoff)),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
-            "DOL" => Some(EpicsValue::String(self.dol.clone())),
+            "DOL" => Some(EpicsValue::String(self.dol.clone().into())),
             "OIF" => Some(EpicsValue::Short(self.oif)),
             "OROC" => Some(EpicsValue::Double(self.oroc)),
             "PVAL" => Some(EpicsValue::Double(self.pval)),
@@ -493,8 +493,8 @@ impl Record for AoRecord {
             "MLST" => Some(EpicsValue::Double(self.mlst)),
             "INIT" => Some(EpicsValue::Char(if self.init { 1 } else { 0 })),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
-            "SIML" => Some(EpicsValue::String(self.siml.clone())),
-            "SIOL" => Some(EpicsValue::String(self.siol.clone())),
+            "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
+            "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             _ => None,
         }
@@ -515,7 +515,7 @@ impl Record for AoRecord {
             },
             "EGU" => match value {
                 EpicsValue::String(v) => {
-                    self.egu = v;
+                    self.egu = v.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -651,7 +651,7 @@ impl Record for AoRecord {
             },
             "DOL" => match value {
                 EpicsValue::String(v) => {
-                    self.dol = v;
+                    self.dol = v.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -728,14 +728,14 @@ impl Record for AoRecord {
             },
             "SIML" => match value {
                 EpicsValue::String(v) => {
-                    self.siml = v;
+                    self.siml = v.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "SIOL" => match value {
                 EpicsValue::String(v) => {
-                    self.siol = v;
+                    self.siol = v.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

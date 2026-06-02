@@ -42,6 +42,8 @@
 
 use std::sync::Arc;
 
+use epics_base_rs::types::PvString;
+
 use crate::nt::NTScalar;
 use crate::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue, TypedScalarArray};
 
@@ -117,7 +119,7 @@ impl ServerInfoSource {
         ));
         s.fields.push((
             "version".into(),
-            PvField::Scalar(ScalarValue::String(crate::VERSION.to_string())),
+            PvField::Scalar(ScalarValue::String(crate::VERSION.into())),
         ));
         PvField::Structure(s)
     }
@@ -165,7 +167,9 @@ impl ServerInfoSource {
         if let PvField::Structure(s) = &mut value {
             s.set(
                 "value",
-                PvField::ScalarArrayTyped(TypedScalarArray::String(Arc::from(names))),
+                PvField::ScalarArrayTyped(TypedScalarArray::String(
+                    names.into_iter().map(PvString::from).collect(),
+                )),
             );
         }
         value
@@ -211,7 +215,7 @@ impl ServerInfoSource {
 /// Read a `PvField` as a string scalar, if it is one.
 fn scalar_string(field: Option<&PvField>) -> Option<String> {
     match field {
-        Some(PvField::Scalar(ScalarValue::String(s))) => Some(s.clone()),
+        Some(PvField::Scalar(ScalarValue::String(s))) => Some(s.as_str_lossy().into_owned()),
         _ => None,
     }
 }

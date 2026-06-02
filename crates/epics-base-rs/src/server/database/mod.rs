@@ -637,7 +637,7 @@ impl PvDatabase {
                 continue;
             }
             let raw = match inst.record.get_field(fd.name) {
-                Some(EpicsValue::String(s)) => s,
+                Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
                 _ => continue,
             };
             if raw.is_empty() {

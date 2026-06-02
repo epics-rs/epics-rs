@@ -155,11 +155,11 @@ impl Record for SubRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => return Some(EpicsValue::Double(self.val)),
-            "SNAM" => return Some(EpicsValue::String(self.snam.clone())),
+            "SNAM" => return Some(EpicsValue::String(self.snam.clone().into())),
             _ => {}
         }
         if let Some(idx) = INP_NAMES.iter().position(|&n| n == name) {
-            return Some(EpicsValue::String(self.inp[idx].clone()));
+            return Some(EpicsValue::String(self.inp[idx].clone().into()));
         }
         if let Some(idx) = VAL_NAMES.iter().position(|&n| n == name) {
             return Some(EpicsValue::Double(self.a[idx]));
@@ -181,7 +181,7 @@ impl Record for SubRecord {
             "SNAM" => {
                 return match value {
                     EpicsValue::String(s) => {
-                        self.snam = s;
+                        self.snam = s.as_str_lossy().into_owned();
                         Ok(())
                     }
                     _ => Err(CaError::TypeMismatch("SNAM".into())),
@@ -192,7 +192,7 @@ impl Record for SubRecord {
         if let Some(idx) = INP_NAMES.iter().position(|&n| n == name) {
             return match value {
                 EpicsValue::String(s) => {
-                    self.inp[idx] = s;
+                    self.inp[idx] = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

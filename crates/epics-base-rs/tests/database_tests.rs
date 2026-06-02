@@ -1608,8 +1608,11 @@ async fn test_depth_limit() {
     for i in 0..19 {
         if let Some(rec) = db.get_record(&format!("CHAIN_{i}")).await {
             let mut inst = rec.write().await;
-            inst.put_common_field("FLNK", EpicsValue::String(format!("CHAIN_{}", i + 1)))
-                .unwrap();
+            inst.put_common_field(
+                "FLNK",
+                EpicsValue::String(format!("CHAIN_{}", i + 1).into()),
+            )
+            .unwrap();
         }
     }
 
@@ -3799,11 +3802,11 @@ async fn test_sseq_bare_lnk_does_not_process_passive_target() {
     sseq.selm = 0;
     // Step 1: bare LNK — must NOT process the Passive target.
     sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
-    sseq.put_field("LNK1", EpicsValue::String("SSEQ_BARE_TGT".to_string()))
+    sseq.put_field("LNK1", EpicsValue::String("SSEQ_BARE_TGT".into()))
         .unwrap();
     // Step 2: explicit PP LNK — must process the Passive target.
     sseq.put_field("DO2", EpicsValue::Double(22.0)).unwrap();
-    sseq.put_field("LNK2", EpicsValue::String("SSEQ_PP_TGT PP".to_string()))
+    sseq.put_field("LNK2", EpicsValue::String("SSEQ_PP_TGT PP".into()))
         .unwrap();
     db.add_record("SSEQ_NPP_REC", Box::new(sseq)).await.unwrap();
 
@@ -3848,12 +3851,12 @@ async fn test_sseq_per_step_dly_delays_step_write() {
     // Step 1: delayed write.
     sseq.put_field("DLY1", EpicsValue::Double(0.3)).unwrap();
     sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
-    sseq.put_field("LNK1", EpicsValue::String("SSEQ_DLY_TGT1 PP".to_string()))
+    sseq.put_field("LNK1", EpicsValue::String("SSEQ_DLY_TGT1 PP".into()))
         .unwrap();
     // Step 2: no delay (but dispatched only after step 1 completes).
     sseq.put_field("DLY2", EpicsValue::Double(0.0)).unwrap();
     sseq.put_field("DO2", EpicsValue::Double(22.0)).unwrap();
-    sseq.put_field("LNK2", EpicsValue::String("SSEQ_DLY_TGT2 PP".to_string()))
+    sseq.put_field("LNK2", EpicsValue::String("SSEQ_DLY_TGT2 PP".into()))
         .unwrap();
     db.add_record("SSEQ_DLY_REC", Box::new(sseq)).await.unwrap();
 
@@ -4458,7 +4461,7 @@ async fn test_new_common_fields_get_put() {
         let inst = rec.read().await;
         assert_eq!(
             inst.get_common_field("TSEL"),
-            Some(EpicsValue::String(String::new()))
+            Some(EpicsValue::String(String::new().into()))
         );
     }
 

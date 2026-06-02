@@ -26,7 +26,7 @@ pub fn alarm_default() -> PvField {
         .push(("status".into(), PvField::Scalar(ScalarValue::Int(0))));
     s.fields.push((
         "message".into(),
-        PvField::Scalar(ScalarValue::String(String::new())),
+        PvField::Scalar(ScalarValue::String(String::new().into())),
     ));
     PvField::Structure(s)
 }

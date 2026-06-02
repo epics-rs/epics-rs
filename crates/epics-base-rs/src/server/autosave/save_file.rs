@@ -259,7 +259,10 @@ fn parse_c_array_elements(s: &str) -> Vec<String> {
 /// Convert an EpicsValue to a save file string.
 pub fn value_to_save_str(value: &EpicsValue) -> String {
     match value {
-        EpicsValue::String(s) => format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")),
+        EpicsValue::String(s) => format!(
+            "\"{}\"",
+            s.as_str_lossy().replace('\\', "\\\\").replace('"', "\\\"")
+        ),
         EpicsValue::Double(v) => format!("{:.14e}", v),
         EpicsValue::Float(v) => format!("{:.7e}", v),
         EpicsValue::Short(v) => v.to_string(),
@@ -303,7 +306,12 @@ pub fn value_to_save_str(value: &EpicsValue) -> String {
         EpicsValue::StringArray(arr) => {
             let parts: Vec<_> = arr
                 .iter()
-                .map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
+                .map(|s| {
+                    format!(
+                        "\"{}\"",
+                        s.as_str_lossy().replace('\\', "\\\\").replace('"', "\\\"")
+                    )
+                })
                 .collect();
             format!("[{}]", parts.join(","))
         }
@@ -340,7 +348,7 @@ pub fn value_to_save_str_c(value: &EpicsValue) -> String {
     }
     match value {
         // Scalars: plain printf form, strings unquoted.
-        EpicsValue::String(s) => s.clone(),
+        EpicsValue::String(s) => s.as_str_lossy().into_owned(),
         EpicsValue::Double(v) => format!("{:.14e}", v),
         EpicsValue::Float(v) => format!("{:.7e}", v),
         EpicsValue::Short(v) => v.to_string(),
@@ -370,9 +378,9 @@ pub fn parse_save_value(s: &str, template: &EpicsValue) -> Option<EpicsValue> {
             if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
                 let inner = &s[1..s.len() - 1];
                 let unescaped = inner.replace("\\\"", "\"").replace("\\\\", "\\");
-                Some(EpicsValue::String(unescaped))
+                Some(EpicsValue::String(unescaped.into()))
             } else {
-                Some(EpicsValue::String(s.to_string()))
+                Some(EpicsValue::String(s.to_string().into()))
             }
         }
         EpicsValue::Double(_) => s.parse::<f64>().ok().map(EpicsValue::Double),
@@ -424,7 +432,9 @@ pub fn parse_save_value(s: &str, template: &EpicsValue) -> Option<EpicsValue> {
                 };
                 out.push(unq);
             }
-            Some(EpicsValue::StringArray(out))
+            Some(EpicsValue::StringArray(
+                out.into_iter().map(Into::into).collect(),
+            ))
         }
     }
 }
@@ -450,7 +460,7 @@ mod tests {
     /// treats everything after the first space as the literal value).
     #[test]
     fn c_format_scalar_string_unquoted() {
-        let v = EpicsValue::String("hello world".to_string());
+        let v = EpicsValue::String("hello world".to_string().into());
         assert_eq!(value_to_save_str_c(&v), "hello world");
         // Native quotes it.
         assert_eq!(value_to_save_str(&v), "\"hello world\"");

@@ -745,7 +745,7 @@ fn json_to_pv_field(v: &serde_json::Value) -> Result<epics_pva_rs::pvdata::PvFie
                 Err(format!("unsupported number: {n}"))
             }
         }
-        serde_json::Value::String(s) => Ok(PvField::Scalar(ScalarValue::String(s.clone()))),
+        serde_json::Value::String(s) => Ok(PvField::Scalar(ScalarValue::String(s.clone().into()))),
         serde_json::Value::Null => Ok(PvField::Null),
         serde_json::Value::Array(_) => Err(
             "group +const cannot be an array: pvxs registers no array callbacks \

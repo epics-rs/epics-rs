@@ -5586,7 +5586,7 @@ mod non_graceful_disconnect_teardown_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn simple_pv_dollar_advertises_char_array() {
         let db = Arc::new(PvDatabase::new());
-        db.add_pv("longstr:simple", EpicsValue::String("hi".to_string()))
+        db.add_pv("longstr:simple", EpicsValue::String("hi".into()))
             .await
             .expect("add string pv");
         let acf = Arc::new(tokio::sync::RwLock::new(None));

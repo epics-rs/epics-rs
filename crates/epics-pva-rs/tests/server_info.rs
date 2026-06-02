@@ -104,16 +104,16 @@ async fn rpc_channels_lists_hosted_pvs() {
     };
 
     assert!(
-        names.contains(&"test:alpha".to_string()),
+        names.contains(&"test:alpha".into()),
         "channel list must include test:alpha — got {names:?}"
     );
     assert!(
-        names.contains(&"test:beta".to_string()),
+        names.contains(&"test:beta".into()),
         "channel list must include test:beta — got {names:?}"
     );
     // The built-in `server` PV must NOT self-list.
     assert!(
-        !names.contains(&"server".to_string()),
+        !names.contains(&"server".into()),
         "built-in 'server' PV must not appear in its own channel list"
     );
 

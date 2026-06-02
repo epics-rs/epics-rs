@@ -104,7 +104,7 @@ impl DbChannel {
 
     pub async fn get_string(&self) -> String {
         match self.db.get_pv(&self.name).await {
-            Ok(EpicsValue::String(s)) => s,
+            Ok(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
             Ok(v) => v.to_string(),
             Err(_) => String::new(),
         }
@@ -124,7 +124,7 @@ impl DbChannel {
     /// Write a value without triggering record processing.
     pub async fn put_string(&self, v: &str) -> CaResult<()> {
         self.db
-            .put_pv(&self.name, EpicsValue::String(v.to_string()))
+            .put_pv(&self.name, EpicsValue::String(v.to_string().into()))
             .await
     }
 
@@ -148,7 +148,11 @@ impl DbChannel {
     /// Write a string value and post monitor events (without processing).
     pub async fn put_string_post(&self, v: &str) -> CaResult<()> {
         self.db
-            .put_pv_and_post_with_origin(&self.name, EpicsValue::String(v.to_string()), self.origin)
+            .put_pv_and_post_with_origin(
+                &self.name,
+                EpicsValue::String(v.to_string().into()),
+                self.origin,
+            )
             .await
     }
 
@@ -188,7 +192,7 @@ impl DbChannel {
         let (record_name, field) = parse_pv_name(&self.name);
         let _ = self
             .db
-            .put_record_field_from_ca(record_name, field, EpicsValue::String(v.to_string()))
+            .put_record_field_from_ca(record_name, field, EpicsValue::String(v.to_string().into()))
             .await?;
         Ok(())
     }

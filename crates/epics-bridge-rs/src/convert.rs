@@ -141,7 +141,7 @@ pub fn scalar_to_epics_typed(
         DbFieldType::Enum => EpicsValue::Enum(scalar_to_i64(val)? as u16),
         DbFieldType::String => match val {
             ScalarValue::String(s) => EpicsValue::String(s.clone()),
-            other => EpicsValue::String(other.to_string()),
+            other => EpicsValue::String(other.to_string().into()),
         },
     })
 }
@@ -172,10 +172,15 @@ fn scalar_to_f64(val: &ScalarValue) -> Result<f64, ScalarConvertError> {
                 0.0
             }
         }
-        ScalarValue::String(s) => s.trim().parse().map_err(|_| ScalarConvertError {
-            value: s.clone(),
-            target: "f64",
-        })?,
+        ScalarValue::String(s) => {
+            s.as_str_lossy()
+                .trim()
+                .parse()
+                .map_err(|_| ScalarConvertError {
+                    value: s.as_str_lossy().into_owned(),
+                    target: "f64",
+                })?
+        }
     })
 }
 
@@ -204,10 +209,15 @@ fn scalar_to_i64(val: &ScalarValue) -> Result<i64, ScalarConvertError> {
                 0
             }
         }
-        ScalarValue::String(s) => s.trim().parse().map_err(|_| ScalarConvertError {
-            value: s.clone(),
-            target: "i64",
-        })?,
+        ScalarValue::String(s) => {
+            s.as_str_lossy()
+                .trim()
+                .parse()
+                .map_err(|_| ScalarConvertError {
+                    value: s.as_str_lossy().into_owned(),
+                    target: "i64",
+                })?
+        }
     })
 }
 
@@ -234,10 +244,15 @@ fn scalar_to_u64(val: &ScalarValue) -> Result<u64, ScalarConvertError> {
                 0
             }
         }
-        ScalarValue::String(s) => s.trim().parse().map_err(|_| ScalarConvertError {
-            value: s.clone(),
-            target: "u64",
-        })?,
+        ScalarValue::String(s) => {
+            s.as_str_lossy()
+                .trim()
+                .parse()
+                .map_err(|_| ScalarConvertError {
+                    value: s.as_str_lossy().into_owned(),
+                    target: "u64",
+                })?
+        }
     })
 }
 
@@ -404,7 +419,7 @@ pub fn pv_field_to_epics(field: &PvField) -> Option<EpicsValue> {
                     arr.iter()
                         .map(|v| match v {
                             ScalarValue::String(s) => s.clone(),
-                            other => other.to_string(),
+                            other => other.to_string().into(),
                         })
                         .collect(),
                 )),
@@ -541,6 +556,37 @@ mod tests {
         let sv = epics_to_scalar(&orig);
         let back = scalar_to_epics(&sv);
         assert_eq!(orig, back);
+    }
+
+    /// PVA-89: the gateway string-value pass-through
+    /// (`epics_to_scalar` ⇄ `scalar_to_epics`) clones the `PvString`, so a
+    /// non-UTF-8 / Latin-1 byte run survives the EPICS⇆PVA round-trip
+    /// verbatim — pvxs stores wire strings as raw bytes with no UTF-8
+    /// validation (`pvaproto.h:403`), and the gateway must not mangle them.
+    #[test]
+    fn roundtrip_string_non_utf8_bytes() {
+        use epics_base_rs::types::PvString;
+        let raw = vec![0xff, 0x80, b'a', 0xc3, 0x28];
+        let orig = EpicsValue::String(PvString::from_bytes(raw.clone()));
+        let sv = epics_to_scalar(&orig);
+        match &sv {
+            ScalarValue::String(s) => assert_eq!(
+                s.as_bytes(),
+                raw.as_slice(),
+                "EPICS→PVA leg must preserve raw bytes"
+            ),
+            other => panic!("expected ScalarValue::String, got {other:?}"),
+        }
+        let back = scalar_to_epics(&sv);
+        match &back {
+            EpicsValue::String(s) => assert_eq!(
+                s.as_bytes(),
+                raw.as_slice(),
+                "PVA→EPICS leg must preserve raw bytes"
+            ),
+            other => panic!("expected EpicsValue::String, got {other:?}"),
+        }
+        assert_eq!(orig, back, "full gateway round-trip is byte-lossless");
     }
 
     #[test]
@@ -767,12 +813,13 @@ mod tests {
     /// (iocsource.cpp:538-567).
     #[test]
     fn empty_typed_array_preserves_element_type() {
+        use epics_base_rs::types::PvString;
         use epics_pva_rs::pvdata::TypedScalarArray;
         use std::sync::Arc;
 
         let cases: &[(TypedScalarArray, EpicsValue)] = &[
             (
-                TypedScalarArray::String(Arc::from([] as [String; 0])),
+                TypedScalarArray::String(Arc::from([] as [PvString; 0])),
                 EpicsValue::StringArray(vec![]),
             ),
             (

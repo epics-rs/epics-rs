@@ -309,10 +309,10 @@ impl Record for MbboDirectRecord {
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
             "IVOV" => Some(EpicsValue::Long(self.ivov as i32)),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
-            "DOL" => Some(EpicsValue::String(self.dol.clone())),
+            "DOL" => Some(EpicsValue::String(self.dol.clone().into())),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
-            "SIML" => Some(EpicsValue::String(self.siml.clone())),
-            "SIOL" => Some(EpicsValue::String(self.siol.clone())),
+            "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
+            "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             _ => BIT_NAMES
                 .iter()
@@ -390,7 +390,7 @@ impl Record for MbboDirectRecord {
             }
             "DOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.dol = v;
+                    self.dol = v.as_str_lossy().into_owned();
                 } else {
                     return Err(CaError::TypeMismatch("DOL".into()));
                 }
@@ -404,14 +404,14 @@ impl Record for MbboDirectRecord {
             }
             "SIML" => {
                 if let EpicsValue::String(v) = value {
-                    self.siml = v;
+                    self.siml = v.as_str_lossy().into_owned();
                 } else {
                     return Err(CaError::TypeMismatch("SIML".into()));
                 }
             }
             "SIOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.siol = v;
+                    self.siol = v.as_str_lossy().into_owned();
                 } else {
                     return Err(CaError::TypeMismatch("SIOL".into()));
                 }

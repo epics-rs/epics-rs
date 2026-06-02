@@ -298,7 +298,9 @@ impl IocBuilder {
                 // Subroutine resolution for sub records
                 if instance.record.record_type() == "sub" {
                     if let Some(EpicsValue::String(snam)) = instance.record.get_field("SNAM") {
-                        if let Some(sub_fn) = self.subroutine_registry.get(&snam) {
+                        if let Some(sub_fn) =
+                            self.subroutine_registry.get(snam.as_str_lossy().as_ref())
+                        {
                             instance.subroutine = Some(sub_fn.clone());
                         }
                     }

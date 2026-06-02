@@ -444,15 +444,15 @@ impl Record for DfanoutRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         if let Some(s) = self.out_slot(name) {
-            return Some(EpicsValue::String(s.to_string()));
+            return Some(EpicsValue::String(s.to_string().into()));
         }
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
             "SELM" => Some(EpicsValue::Short(self.selm)),
             "SELN" => Some(EpicsValue::Short(self.seln)),
-            "DOL" => Some(EpicsValue::String(self.dol.clone())),
+            "DOL" => Some(EpicsValue::String(self.dol.clone().into())),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
-            "SELL" => Some(EpicsValue::String(self.sell.clone())),
+            "SELL" => Some(EpicsValue::String(self.sell.clone().into())),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
             "IVOV" => Some(EpicsValue::Double(self.ivov)),
             "HIHI" => Some(EpicsValue::Double(self.hihi)),
@@ -477,7 +477,7 @@ impl Record for DfanoutRecord {
         if self.out_slot(name).is_some() {
             return match value {
                 EpicsValue::String(s) => {
-                    *self.out_slot_mut(name).unwrap() = s;
+                    *self.out_slot_mut(name).unwrap() = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -526,8 +526,8 @@ impl Record for DfanoutRecord {
             "DOL" | "SELL" => match value {
                 EpicsValue::String(s) => {
                     match name {
-                        "DOL" => self.dol = s,
-                        "SELL" => self.sell = s,
+                        "DOL" => self.dol = s.as_str_lossy().into_owned(),
+                        "SELL" => self.sell = s.as_str_lossy().into_owned(),
                         _ => unreachable!(),
                     }
                     Ok(())

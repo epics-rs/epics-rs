@@ -543,7 +543,7 @@ fn test_encode_invalid_type() {
 #[test]
 fn test_encode_stsack_string_layout() {
     // STSACK_STRING wire layout: status(2) severity(2) ackt(2) acks(2) value(40) = 48 bytes
-    let mut snap = bare_snapshot(EpicsValue::String("warn".to_string()));
+    let mut snap = bare_snapshot(EpicsValue::String("warn".into()));
     snap.alarm = AlarmInfo {
         status: 5,
         severity: 1,
@@ -563,7 +563,7 @@ fn test_encode_stsack_string_layout() {
 fn test_encode_stsack_string_default_ackt_acks() {
     // ackt/acks default to None → encoded as zero so SimplePvs without
     // record-backed alarm fields still produce a valid response.
-    let snap = bare_snapshot(EpicsValue::String("ok".to_string()));
+    let snap = bare_snapshot(EpicsValue::String("ok".into()));
     let data = encode_dbr(epics_base_rs::types::DBR_STSACK_STRING, &snap).unwrap();
     assert_eq!(data.len(), 48);
     assert_eq!(&data[4..6], &0u16.to_be_bytes());
@@ -897,7 +897,7 @@ fn test_dbr_per_variant_constants_match_layer_arithmetic() {
 #[test]
 fn test_dbr_class_name_round_trip() {
     use epics_base_rs::types::{DBR_CLASS_NAME, decode_dbr};
-    let mut snap = bare_snapshot(EpicsValue::String(String::new()));
+    let mut snap = bare_snapshot(EpicsValue::String(PvString::new()));
     snap.class_name = Some("ai".to_string());
     let data = encode_dbr(DBR_CLASS_NAME, &snap).unwrap();
     // Always 40 bytes regardless of the actual string length
@@ -913,7 +913,7 @@ fn test_dbr_class_name_round_trip() {
 #[test]
 fn test_dbr_class_name_truncates_long_record_type() {
     use epics_base_rs::types::DBR_CLASS_NAME;
-    let mut snap = bare_snapshot(EpicsValue::String(String::new()));
+    let mut snap = bare_snapshot(EpicsValue::String(PvString::new()));
     // 50 chars; 40-byte wire layout truncates to 39 + NUL
     snap.class_name = Some("a".repeat(50));
     let data = encode_dbr(DBR_CLASS_NAME, &snap).unwrap();
@@ -925,7 +925,7 @@ fn test_dbr_class_name_truncates_long_record_type() {
 #[test]
 fn test_dbr_class_name_empty_when_unpopulated() {
     use epics_base_rs::types::DBR_CLASS_NAME;
-    let snap = bare_snapshot(EpicsValue::String(String::new()));
+    let snap = bare_snapshot(EpicsValue::String(PvString::new()));
     // class_name is None — server emits an all-zero (empty) response,
     // matching what C IOC does for non-record-backed channels.
     let data = encode_dbr(DBR_CLASS_NAME, &snap).unwrap();

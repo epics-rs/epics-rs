@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use epics_base_rs::types::PvString;
+
 /// PVA scalar types. The wire encoding uses the type-code lookup table from
 /// pvData (`FieldCreateFactory.cpp`), not the enum's discriminant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -121,7 +123,7 @@ pub enum ScalarValue {
     ULong(u64),
     Float(f32),
     Double(f64),
-    String(String),
+    String(PvString),
 }
 
 /// Typed conversions into [`ScalarValue`], so the pvRequest builder's
@@ -150,12 +152,17 @@ scalar_from! {
     u64 => ULong,
     f32 => Float,
     f64 => Double,
-    String => String,
+}
+
+impl From<String> for ScalarValue {
+    fn from(v: String) -> Self {
+        Self::String(v.into())
+    }
 }
 
 impl From<&str> for ScalarValue {
     fn from(v: &str) -> Self {
-        Self::String(v.to_string())
+        Self::String(v.into())
     }
 }
 
@@ -220,7 +227,7 @@ impl ScalarValue {
                 .parse::<f64>()
                 .map(Self::Double)
                 .map_err(|e| e.to_string()),
-            ScalarType::String => Ok(Self::String(s.to_string())),
+            ScalarType::String => Ok(Self::String(s.into())),
         }
     }
 }

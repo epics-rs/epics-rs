@@ -195,10 +195,10 @@ impl Record for LsoRecord {
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
             "IVOV" => Some(EpicsValue::CharArray(self.ivov.clone().into_bytes())),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
-            "DOL" => Some(EpicsValue::String(self.dol.clone())),
+            "DOL" => Some(EpicsValue::String(self.dol.clone().into())),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
-            "SIML" => Some(EpicsValue::String(self.siml.clone())),
-            "SIOL" => Some(EpicsValue::String(self.siol.clone())),
+            "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
+            "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             _ => None,
         }
@@ -210,7 +210,7 @@ impl Record for LsoRecord {
                 // DBR_STRING-typed put caps at MAX_STRING_SIZE (40);
                 // DBR_CHAR long-string put is bounded only by SIZV.
                 let mut s = match value {
-                    EpicsValue::String(s) => truncate_utf8(&s, MAX_STRING_SIZE - 1),
+                    EpicsValue::String(s) => truncate_utf8(&s.as_str_lossy(), MAX_STRING_SIZE - 1),
                     EpicsValue::CharArray(bytes) => {
                         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
                         String::from_utf8_lossy(&bytes[..end]).into_owned()
@@ -240,7 +240,7 @@ impl Record for LsoRecord {
                 }
             }
             "IVOV" => match value {
-                EpicsValue::String(s) => self.ivov = s,
+                EpicsValue::String(s) => self.ivov = s.as_str_lossy().into_owned(),
                 EpicsValue::CharArray(bytes) => {
                     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
                     self.ivov = String::from_utf8_lossy(&bytes[..end]).into_owned();
@@ -256,7 +256,7 @@ impl Record for LsoRecord {
             }
             "DOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.dol = v;
+                    self.dol = v.as_str_lossy().into_owned();
                 } else {
                     return Err(CaError::TypeMismatch("DOL".into()));
                 }
@@ -270,14 +270,14 @@ impl Record for LsoRecord {
             }
             "SIML" => {
                 if let EpicsValue::String(v) = value {
-                    self.siml = v;
+                    self.siml = v.as_str_lossy().into_owned();
                 } else {
                     return Err(CaError::TypeMismatch("SIML".into()));
                 }
             }
             "SIOL" => {
                 if let EpicsValue::String(v) = value {
-                    self.siol = v;
+                    self.siol = v.as_str_lossy().into_owned();
                 } else {
                     return Err(CaError::TypeMismatch("SIOL".into()));
                 }

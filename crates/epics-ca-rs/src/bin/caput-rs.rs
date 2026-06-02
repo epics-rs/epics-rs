@@ -404,12 +404,13 @@ enum WriteValue {
         value: epics_ca_rs::EpicsValue,
     },
     /// A scalar ENUM value written by name. The server resolves it
-    /// against the record's menu — see `CaChannel::put_string`.
-    EnumString(String),
+    /// against the record's menu — see `CaChannel::put_string`. Carried as
+    /// a byte-preserving [`PvString`] so a non-UTF-8 escape survives.
+    EnumString(epics_ca_rs::PvString),
     /// An ENUM waveform written by name — each element a `DBR_STRING`
     /// the server resolves against the record's menu. See
     /// `CaChannel::put_string_array`.
-    EnumStringArray(Vec<String>),
+    EnumStringArray(Vec<epics_ca_rs::PvString>),
 }
 
 impl WriteValue {
@@ -515,13 +516,13 @@ fn raw_from_escaped(s: &str) -> Vec<u8> {
 /// `rem = 40`, then NUL-terminates — epicsString.c:55-118).
 const DBR_STRING_PAYLOAD_MAX: usize = 39;
 
-/// `raw_from_escaped` decoded into a `String` for the DBR_STRING / ENUM-
-/// by-name put paths. The common escapes (`\n`, `\t`, `\\`, …) decode to
-/// ASCII; a high-byte `\xNN` that is not valid UTF-8 falls back to lossy
-/// decoding (the Rust `EpicsValue::String` is UTF-8, whereas C carries a
-/// raw byte buffer).
+/// `raw_from_escaped` decoded into a byte-preserving [`PvString`] for the
+/// DBR_STRING / ENUM-by-name put paths. The common escapes (`\n`, `\t`,
+/// `\\`, …) decode to ASCII; a high-byte `\xNN` reaches the wire as its
+/// literal byte — `EpicsValue::String` now carries raw bytes ([`PvString`]),
+/// matching C's byte buffer with no UTF-8 lossy fixup.
 ///
-/// The decoded value is truncated to [`DBR_STRING_PAYLOAD_MAX`] bytes, the
+/// The decoded byte run is truncated to [`DBR_STRING_PAYLOAD_MAX`] bytes, the
 /// way C `caput` decodes into its fixed `EpicsStr` buffer and forces a
 /// trailing NUL (caput.c:484-489 for ENUM names, caput.c:523-528 for
 /// native DBR_STRING): an overlong CLI value is written as its 39-byte
@@ -529,19 +530,12 @@ const DBR_STRING_PAYLOAD_MAX: usize = 39;
 /// libca's `nciu::stringVerify` reject `>= 40`, so the cap must happen in
 /// the CLI builder to keep C-tool parity. `-S` long strings take the
 /// DBR_CHAR path (`raw_from_escaped`, not this helper) and stay uncapped.
-/// The truncation lands on a UTF-8 char boundary — C's buffer is
-/// byte-oriented, but for the printable/ASCII values this targets the two
-/// coincide.
-fn raw_from_escaped_string(s: &str) -> String {
-    let mut decoded = String::from_utf8_lossy(&raw_from_escaped(s)).into_owned();
-    if decoded.len() > DBR_STRING_PAYLOAD_MAX {
-        let mut end = DBR_STRING_PAYLOAD_MAX;
-        while !decoded.is_char_boundary(end) {
-            end -= 1;
-        }
-        decoded.truncate(end);
-    }
-    decoded
+/// The cut is byte-oriented, exactly matching C's byte buffer — no UTF-8
+/// char-boundary fixup, since the value is bytes, not text.
+fn raw_from_escaped_string(s: &str) -> epics_ca_rs::PvString {
+    let mut bytes = raw_from_escaped(s);
+    bytes.truncate(DBR_STRING_PAYLOAD_MAX);
+    epics_ca_rs::PvString::from_bytes(bytes)
 }
 
 /// Build the value to write, in C `caput`'s precedence order
@@ -597,7 +591,8 @@ fn build_write_value(
         // Non-ENUM array: C sends every element as a DBR_STRING after
         // epicsStrnRawFromEscaped (caput.c:540-552), regardless of the
         // native numeric or string field type — the server converts each.
-        let escaped: Vec<String> = tokens.iter().map(|t| raw_from_escaped_string(t)).collect();
+        let escaped: Vec<epics_ca_rs::PvString> =
+            tokens.iter().map(|t| raw_from_escaped_string(t)).collect();
         return Ok(WriteValue::Wire {
             dbr_type: epics_ca_rs::DbFieldType::String as u16,
             value: epics_ca_rs::EpicsValue::StringArray(escaped),
@@ -729,13 +724,15 @@ fn parse_array(
                 .map(|t| t.parse::<u8>().unwrap_or(0))
                 .collect(),
         )),
-        DT::String => Ok(EpicsValue::StringArray(tokens.to_vec())),
+        DT::String => Ok(EpicsValue::StringArray(
+            tokens.iter().map(|t| t.clone().into()).collect(),
+        )),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{WriteValue, build_write_value, raw_from_escaped};
+    use super::{WriteValue, build_write_value, raw_from_escaped, raw_from_escaped_string};
     use epics_ca_rs::{DbFieldType, EpicsValue};
 
     fn vals(s: &[&str]) -> Vec<String> {
@@ -1084,6 +1081,73 @@ mod tests {
                 assert_eq!(b.len(), 51, "-S keeps all 50 bytes + NUL, uncapped");
             }
             other => panic!("expected uncapped DBR_CHAR Wire, got {other:?}"),
+        }
+    }
+
+    /// PVA-89 / CA Latin-1 parity: a `\xNN` escape with a high byte must
+    /// reach the wire as that literal byte. C `caput` decodes into a raw
+    /// `EpicsStr` byte buffer (epicsString.c:55-118) with no UTF-8 fixup;
+    /// the Rust port carries the bytes in `PvString::from_bytes`, so a
+    /// non-UTF-8 byte run round-trips verbatim instead of being mangled
+    /// into U+FFFD replacement sequences.
+    #[test]
+    fn escaped_high_bytes_reach_wire_verbatim_not_lossy() {
+        // `\xff` and `\x80` are not valid standalone UTF-8; a lossy
+        // `from_utf8_lossy` would turn each into the 3-byte U+FFFD. The
+        // byte-preserving path keeps them as single 0xFF / 0x80 bytes.
+        let pv = raw_from_escaped_string("\\xff\\x80\\x41");
+        assert_eq!(
+            pv.as_bytes(),
+            &[0xff, 0x80, 0x41],
+            "high-byte escapes must survive as literal bytes, not U+FFFD"
+        );
+        // The full Latin-1 range (0x00 excluded — a literal NUL stops the
+        // decoder) is representable byte-for-byte.
+        let pv = raw_from_escaped_string("\\xc3\\x28");
+        assert_eq!(pv.as_bytes(), &[0xc3, 0x28], "invalid UTF-8 pair preserved");
+    }
+
+    /// PVA-89: the byte truncation to `DBR_STRING_PAYLOAD_MAX` (39) is
+    /// byte-oriented, never a UTF-8 char-boundary fixup. 40 raw high bytes
+    /// must cut to exactly 39 bytes — C decodes into a fixed byte buffer
+    /// (`rem = 40`, NUL-terminated), so the cut is on bytes, not chars.
+    #[test]
+    fn escaped_high_bytes_truncate_on_byte_boundary() {
+        // 40 `\xff` escapes → 40 raw 0xFF bytes, capped to 39.
+        let input: String = "\\xff".repeat(40);
+        let pv = raw_from_escaped_string(&input);
+        assert_eq!(pv.as_bytes().len(), 39, "byte-oriented cut at 39");
+        assert!(
+            pv.as_bytes().iter().all(|&b| b == 0xff),
+            "every surviving byte is the literal 0xFF, no UTF-8 fixup"
+        );
+    }
+
+    /// PVA-89 end-to-end: `build_write_value` for a DBR_STRING put must
+    /// carry the decoded high bytes into `EpicsValue::String(PvString)`
+    /// verbatim — the gateway/server sees the same bytes a C `caput` sends.
+    #[test]
+    fn build_write_value_dbr_string_preserves_high_bytes() {
+        match build_write_value(
+            &vals(&["\\xff\\x80"]),
+            DbFieldType::String,
+            false,
+            false,
+            false,
+            false,
+        ) {
+            Ok(WriteValue::Wire {
+                dbr_type,
+                value: EpicsValue::String(s),
+            }) => {
+                assert_eq!(dbr_type, DbFieldType::String as u16, "DBR_STRING wire type");
+                assert_eq!(
+                    s.as_bytes(),
+                    &[0xff, 0x80],
+                    "DBR_STRING put carries raw high bytes to the wire"
+                );
+            }
+            other => panic!("expected DBR_STRING Wire with raw bytes, got {other:?}"),
         }
     }
 }

@@ -116,7 +116,7 @@ impl Alarm {
         ));
         s.fields.push((
             "message".into(),
-            PvField::Scalar(ScalarValue::String(self.message.clone())),
+            PvField::Scalar(ScalarValue::String(self.message.clone().into())),
         ));
         PvField::Structure(s)
     }
@@ -297,7 +297,7 @@ pub mod __rt {
             "epics:nt/NTTable:1.0" => ::std::vec![
                 (
                     "descriptor",
-                    PvField::Scalar(ScalarValue::String(String::new()))
+                    PvField::Scalar(ScalarValue::String(String::new().into()))
                 ),
                 ("alarm", meta::alarm_default()),
                 ("timeStamp", meta::time_default()),
@@ -318,7 +318,7 @@ pub mod __rt {
         let mut s = PvStructure::new("");
         s.fields.push((
             "description".into(),
-            PvField::Scalar(ScalarValue::String(String::new())),
+            PvField::Scalar(ScalarValue::String(String::new().into())),
         ));
         PvField::Structure(s)
     }
@@ -425,7 +425,7 @@ fn get_bool(s: &PvStructure, name: &str) -> Option<bool> {
 
 fn get_str(s: &PvStructure, name: &str) -> Option<String> {
     match s.get_field(name)? {
-        PvField::Scalar(ScalarValue::String(v)) => Some(v.clone()),
+        PvField::Scalar(ScalarValue::String(v)) => Some(v.as_str_lossy().into_owned()),
         _ => None,
     }
 }
@@ -521,16 +521,16 @@ impl TypedNT for String {
             "epics:nt/NTScalar:1.0",
             vec![(
                 "value".into(),
-                PvField::Scalar(ScalarValue::String(self.clone())),
+                PvField::Scalar(ScalarValue::String(self.clone().into())),
             )],
         );
         PvField::Structure(s)
     }
     fn from_pv_field(field: &PvField) -> Result<Self, TypedNTError> {
         match field {
-            PvField::Scalar(ScalarValue::String(v)) => Ok(v.clone()),
+            PvField::Scalar(ScalarValue::String(v)) => Ok(v.as_str_lossy().into_owned()),
             PvField::Structure(s) => match nt_scalar_value(s)? {
-                PvField::Scalar(ScalarValue::String(v)) => Ok(v.clone()),
+                PvField::Scalar(ScalarValue::String(v)) => Ok(v.as_str_lossy().into_owned()),
                 other => Err(TypedNTError::WrongType {
                     field: "value".into(),
                     detail: format!("expected String scalar, got {other:?}"),
@@ -562,6 +562,16 @@ fn nt_scalar_array_root(elem_type: crate::pvdata::ScalarType) -> FieldDesc {
 }
 
 macro_rules! impl_typed_nt_scalar_array {
+    // Element decode helper: the String variant now stores a `PvString`, so
+    // take a lossy text view to land back in `Vec<String>`; numeric variants
+    // are identity. (Encode is uniform `.into()` — String→PvString or
+    // numeric identity — so only decode needs the per-variant split.)
+    (@from_elem String, $x:expr) => {
+        $x.as_str_lossy().into_owned()
+    };
+    (@from_elem $sv:ident, $x:expr) => {
+        $x.clone()
+    };
     ($t:ty, $st:ident, $sv:ident) => {
         impl TypedNT for ::std::vec::Vec<$t> {
             fn descriptor() -> FieldDesc {
@@ -570,7 +580,7 @@ macro_rules! impl_typed_nt_scalar_array {
             fn to_pv_field(&self) -> PvField {
                 let mut s = PvStructure::new("epics:nt/NTScalarArray:1.0");
                 let items: ::std::vec::Vec<ScalarValue> =
-                    self.iter().map(|v| ScalarValue::$sv(v.clone())).collect();
+                    self.iter().map(|v| ScalarValue::$sv(v.clone().into())).collect();
                 s.fields = __rt::ensure_nt_meta_value(
                     "epics:nt/NTScalarArray:1.0",
                     ::std::vec![("value".into(), PvField::ScalarArray(items))],
@@ -600,7 +610,9 @@ macro_rules! impl_typed_nt_scalar_array {
                 let mut out = ::std::vec::Vec::with_capacity(items.len());
                 for v in items {
                     match v {
-                        ScalarValue::$sv(x) => out.push(x.clone()),
+                        ScalarValue::$sv(x) => {
+                            out.push(impl_typed_nt_scalar_array!(@from_elem $sv, x))
+                        }
                         other => {
                             return Err(TypedNTError::WrongType {
                                 field: "value[]".into(),
@@ -673,7 +685,7 @@ impl TypedNT for EnumValue {
         let choices_items: ::std::vec::Vec<ScalarValue> = self
             .choices
             .iter()
-            .map(|c| ScalarValue::String(c.clone()))
+            .map(|c| ScalarValue::String(c.clone().into()))
             .collect();
         value_struct
             .fields
@@ -712,7 +724,7 @@ impl TypedNT for EnumValue {
             Some(PvField::ScalarArray(items)) => items
                 .iter()
                 .map(|v| match v {
-                    ScalarValue::String(s) => Ok(s.clone()),
+                    ScalarValue::String(s) => Ok(s.as_str_lossy().into_owned()),
                     other => Err(TypedNTError::WrongType {
                         field: "choices[]".into(),
                         detail: format!("expected string, got {other:?}"),

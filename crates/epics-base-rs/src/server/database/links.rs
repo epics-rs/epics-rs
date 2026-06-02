@@ -785,7 +785,7 @@ impl PvDatabase {
     /// Read a record String field, defaulting to empty.
     fn field_str(instance: &RecordInstance, field: &str) -> String {
         match instance.record.get_field(field) {
-            Some(EpicsValue::String(s)) => s,
+            Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
             _ => String::new(),
         }
     }
@@ -1277,7 +1277,7 @@ impl PvDatabase {
                         let dol_parsed = crate::server::record::parse_link_v2(&grp.dol);
                         self.read_link_value(&dol_parsed, visited, depth).await
                     } else if !grp.str_val.is_empty() {
-                        Some(EpicsValue::String(grp.str_val.clone()))
+                        Some(EpicsValue::String(grp.str_val.clone().into()))
                     } else {
                         Some(EpicsValue::Double(grp.do_val))
                     };
@@ -1319,7 +1319,7 @@ impl PvDatabase {
                 return;
             }
             match instance.record.get_field("VAL") {
-                Some(EpicsValue::String(s)) => s,
+                Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
                 _ => return,
             }
         };
@@ -1415,7 +1415,8 @@ impl PvDatabase {
                 for (lf, _vf) in instance.record.multi_input_links() {
                     if let Some(EpicsValue::String(link_str)) = instance.record.get_field(lf) {
                         if !link_str.is_empty() {
-                            let parsed = crate::server::record::parse_link_v2(&link_str);
+                            let parsed =
+                                crate::server::record::parse_link_v2(&link_str.as_str_lossy());
                             if let crate::server::record::ParsedLink::Db(ref db) = parsed {
                                 if let Some(passive_only) = db.policy.cp_passive_only() {
                                     links_to_register.push((
@@ -1441,7 +1442,8 @@ impl PvDatabase {
                         instance.record.get_field(field_name)
                     {
                         if !link_str.is_empty() {
-                            let parsed = crate::server::record::parse_link_v2(&link_str);
+                            let parsed =
+                                crate::server::record::parse_link_v2(&link_str.as_str_lossy());
                             if let crate::server::record::ParsedLink::Db(ref db) = parsed {
                                 if let Some(passive_only) = db.policy.cp_passive_only() {
                                     links_to_register.push((

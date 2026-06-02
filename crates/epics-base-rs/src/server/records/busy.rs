@@ -398,8 +398,8 @@ impl Record for BusyRecord {
         match name {
             "VAL" => Some(EpicsValue::Enum(self.val)),
             "OVAL" => Some(EpicsValue::Enum(self.oval)),
-            "ZNAM" => Some(EpicsValue::String(self.znam.clone())),
-            "ONAM" => Some(EpicsValue::String(self.onam.clone())),
+            "ZNAM" => Some(EpicsValue::String(self.znam.clone().into())),
+            "ONAM" => Some(EpicsValue::String(self.onam.clone().into())),
             "HIGH" => Some(EpicsValue::Double(self.high)),
             "ZSV" => Some(EpicsValue::Short(self.zsv.into())),
             "OSV" => Some(EpicsValue::Short(self.osv.into())),
@@ -408,7 +408,7 @@ impl Record for BusyRecord {
             "IVOA" => Some(EpicsValue::Short(self.ivoa.into())),
             "IVOV" => Some(EpicsValue::Enum(self.ivov)),
             "OMSL" => Some(EpicsValue::Short(self.omsl.into())),
-            "DOL" => Some(EpicsValue::String(self.dol.clone())),
+            "DOL" => Some(EpicsValue::String(self.dol.clone().into())),
             "MLST" => Some(EpicsValue::Enum(self.mlst)),
             "RVAL" => Some(EpicsValue::Long(self.rval as i32)),
             "ORAW" => Some(EpicsValue::Long(self.oraw as i32)),
@@ -428,6 +428,7 @@ impl Record for BusyRecord {
                     EpicsValue::Long(v) => v as u16,
                     EpicsValue::Double(v) => v as u16,
                     EpicsValue::String(ref s) => {
+                        let s = s.as_str_lossy();
                         if s.eq_ignore_ascii_case(&self.znam) {
                             0
                         } else if s.eq_ignore_ascii_case(&self.onam) {
@@ -442,7 +443,7 @@ impl Record for BusyRecord {
             }
             "ZNAM" => {
                 if let EpicsValue::String(s) = value {
-                    self.znam = s;
+                    self.znam = s.as_str_lossy().into_owned();
                     Ok(())
                 } else {
                     Err(CaError::TypeMismatch(name.to_string()))
@@ -450,7 +451,7 @@ impl Record for BusyRecord {
             }
             "ONAM" => {
                 if let EpicsValue::String(s) = value {
-                    self.onam = s;
+                    self.onam = s.as_str_lossy().into_owned();
                     Ok(())
                 } else {
                     Err(CaError::TypeMismatch(name.to_string()))
@@ -514,7 +515,7 @@ impl Record for BusyRecord {
             }
             "DOL" => {
                 if let EpicsValue::String(s) = value {
-                    self.dol = s;
+                    self.dol = s.as_str_lossy().into_owned();
                     Ok(())
                 } else {
                     Err(CaError::TypeMismatch(name.to_string()))
@@ -606,18 +607,18 @@ mod tests {
         let mut rec = BusyRecord::new();
 
         // String fields
-        rec.put_field("ZNAM", EpicsValue::String("Idle".to_string()))
+        rec.put_field("ZNAM", EpicsValue::String("Idle".into()))
             .unwrap();
         assert_eq!(
             rec.get_field("ZNAM"),
-            Some(EpicsValue::String("Idle".to_string()))
+            Some(EpicsValue::String("Idle".into()))
         );
 
-        rec.put_field("ONAM", EpicsValue::String("Active".to_string()))
+        rec.put_field("ONAM", EpicsValue::String("Active".into()))
             .unwrap();
         assert_eq!(
             rec.get_field("ONAM"),
-            Some(EpicsValue::String("Active".to_string()))
+            Some(EpicsValue::String("Active".into()))
         );
 
         // Double field
@@ -643,11 +644,11 @@ mod tests {
         rec.put_field("OMSL", EpicsValue::Short(1)).unwrap();
         assert_eq!(rec.get_field("OMSL"), Some(EpicsValue::Short(1)));
 
-        rec.put_field("DOL", EpicsValue::String("some:link".to_string()))
+        rec.put_field("DOL", EpicsValue::String("some:link".into()))
             .unwrap();
         assert_eq!(
             rec.get_field("DOL"),
-            Some(EpicsValue::String("some:link".to_string()))
+            Some(EpicsValue::String("some:link".into()))
         );
 
         rec.put_field("MASK", EpicsValue::Long(0xFF)).unwrap();
@@ -659,31 +660,31 @@ mod tests {
         let mut rec = BusyRecord::new();
 
         // String "Done" → val=0
-        rec.put_field("VAL", EpicsValue::String("Done".to_string()))
+        rec.put_field("VAL", EpicsValue::String("Done".into()))
             .unwrap();
         assert_eq!(rec.val, 0);
 
         // String "Busy" → val=1
-        rec.put_field("VAL", EpicsValue::String("Busy".to_string()))
+        rec.put_field("VAL", EpicsValue::String("Busy".into()))
             .unwrap();
         assert_eq!(rec.val, 1);
 
         // Case insensitive
-        rec.put_field("VAL", EpicsValue::String("done".to_string()))
+        rec.put_field("VAL", EpicsValue::String("done".into()))
             .unwrap();
         assert_eq!(rec.val, 0);
 
-        rec.put_field("VAL", EpicsValue::String("busy".to_string()))
+        rec.put_field("VAL", EpicsValue::String("busy".into()))
             .unwrap();
         assert_eq!(rec.val, 1);
 
         // Custom ZNAM/ONAM
         rec.znam = "Off".to_string();
         rec.onam = "On".to_string();
-        rec.put_field("VAL", EpicsValue::String("Off".to_string()))
+        rec.put_field("VAL", EpicsValue::String("Off".into()))
             .unwrap();
         assert_eq!(rec.val, 0);
-        rec.put_field("VAL", EpicsValue::String("On".to_string()))
+        rec.put_field("VAL", EpicsValue::String("On".into()))
             .unwrap();
         assert_eq!(rec.val, 1);
     }

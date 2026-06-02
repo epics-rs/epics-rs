@@ -107,11 +107,11 @@ impl Record for StringinRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL" => Some(EpicsValue::String(self.val.clone())),
-            "OVAL" => Some(EpicsValue::String(self.oval.clone())),
+            "VAL" => Some(EpicsValue::String(self.val.clone().into())),
+            "OVAL" => Some(EpicsValue::String(self.oval.clone().into())),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
-            "SIML" => Some(EpicsValue::String(self.siml.clone())),
-            "SIOL" => Some(EpicsValue::String(self.siol.clone())),
+            "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
+            "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
             _ => None,
         }
@@ -122,14 +122,14 @@ impl Record for StringinRecord {
             "VAL" => match value {
                 // C truncates every VAL copy at MAX_STRING_SIZE (40).
                 EpicsValue::String(s) => {
-                    self.val = truncate_string(&s);
+                    self.val = truncate_string(&s.as_str_lossy());
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("VAL".into())),
             },
             "OVAL" => match value {
                 EpicsValue::String(s) => {
-                    self.oval = truncate_string(&s);
+                    self.oval = truncate_string(&s.as_str_lossy());
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("OVAL".into())),
@@ -143,14 +143,14 @@ impl Record for StringinRecord {
             },
             "SIML" => match value {
                 EpicsValue::String(s) => {
-                    self.siml = s;
+                    self.siml = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SIML".into())),
             },
             "SIOL" => match value {
                 EpicsValue::String(s) => {
-                    self.siol = s;
+                    self.siol = s.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SIOL".into())),
@@ -176,7 +176,8 @@ mod tests {
     fn val_truncated_to_max_string_size() {
         let long = "x".repeat(100);
         let mut rec = StringinRecord::default();
-        rec.put_field("VAL", EpicsValue::String(long)).unwrap();
+        rec.put_field("VAL", EpicsValue::String(long.into()))
+            .unwrap();
         assert_eq!(rec.val.len(), 39, "VAL capped at MAX_STRING_SIZE-1");
     }
 

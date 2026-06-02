@@ -287,7 +287,7 @@ fn build_nt_enum(index: i32, snap: &Snapshot) -> PvField {
         .map(|e| {
             e.strings
                 .iter()
-                .map(|s| ScalarValue::String(s.clone()))
+                .map(|s| ScalarValue::String(s.clone().into()))
                 .collect()
         })
         .unwrap_or_default();
@@ -310,7 +310,7 @@ fn build_nt_enum(index: i32, snap: &Snapshot) -> PvField {
         .unwrap_or_default();
     display.fields.push((
         "description".into(),
-        PvField::Scalar(ScalarValue::String(description)),
+        PvField::Scalar(ScalarValue::String(description.into())),
     ));
 
     let mut s = PvStructure::new("epics:nt/NTEnum:1.0");
@@ -440,7 +440,7 @@ fn build_alarm(snap: &Snapshot) -> PvField {
     };
     a.fields.push((
         "message".into(),
-        PvField::Scalar(ScalarValue::String(message)),
+        PvField::Scalar(ScalarValue::String(message.into())),
     ));
     PvField::Structure(a)
 }
@@ -528,10 +528,12 @@ fn build_display(snap: &Snapshot) -> PvField {
         .push(("limitHigh".into(), PvField::Scalar(ScalarValue::Double(hi))));
     d.fields.push((
         "description".into(),
-        PvField::Scalar(ScalarValue::String(desc)),
+        PvField::Scalar(ScalarValue::String(desc.into())),
     ));
-    d.fields
-        .push(("units".into(), PvField::Scalar(ScalarValue::String(units))));
+    d.fields.push((
+        "units".into(),
+        PvField::Scalar(ScalarValue::String(units.into())),
+    ));
     d.fields
         .push(("precision".into(), PvField::Scalar(ScalarValue::Int(prec))));
     PvField::Structure(d)
@@ -1068,6 +1070,7 @@ mod tests {
     use super::*;
     use crate::server_native::ChannelContext;
     use epics_base_rs::server::access_security::parse_acf;
+    use epics_base_rs::types::PvString;
 
     fn make_ctx(host: &str, account: &str, method: &str) -> ChannelContext {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -2024,7 +2027,8 @@ ASG(LOCKED) {
         .unwrap();
         let source = PvDatabaseSource::new(db.clone());
 
-        let put = PvField::ScalarArrayTyped(TypedScalarArray::String(Arc::from([] as [String; 0])));
+        let put =
+            PvField::ScalarArrayTyped(TypedScalarArray::String(Arc::from([] as [PvString; 0])));
         source
             .put_value_ctx("EMPTY:STR", put, make_ctx("h", "anyone", "anonymous"))
             .await

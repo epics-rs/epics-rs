@@ -1,4 +1,5 @@
 use epics_base_rs::types::EpicsValue;
+use epics_base_rs::types::PvString;
 
 use epics_base_rs::server::autosave::save_file::{
     SaveEntry, parse_save_value, read_save_file, validate_save_file, value_to_save_str,
@@ -106,7 +107,7 @@ async fn test_string_with_special_chars() {
     write_save_file(&path, &entries).await.unwrap();
     let loaded = read_save_file(&path).await.unwrap().unwrap();
 
-    let parsed = parse_save_value(&loaded[0].value, &EpicsValue::String(String::new())).unwrap();
+    let parsed = parse_save_value(&loaded[0].value, &EpicsValue::String(PvString::new())).unwrap();
     match parsed {
         EpicsValue::String(s) => assert_eq!(s, "test \"quoted\" with\\backslash"),
         _ => panic!("expected String"),

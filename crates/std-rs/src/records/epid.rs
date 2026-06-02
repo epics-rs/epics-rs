@@ -899,10 +899,10 @@ impl Record for EpidRecord {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
             "SMSL" => Some(EpicsValue::Short(self.smsl)),
-            "STPL" => Some(EpicsValue::String(self.stpl.clone())),
-            "INP" => Some(EpicsValue::String(self.inp.clone())),
-            "OUTL" => Some(EpicsValue::String(self.outl.clone())),
-            "TRIG" => Some(EpicsValue::String(self.trig.clone())),
+            "STPL" => Some(EpicsValue::String(self.stpl.clone().into())),
+            "INP" => Some(EpicsValue::String(self.inp.clone().into())),
+            "OUTL" => Some(EpicsValue::String(self.outl.clone().into())),
+            "TRIG" => Some(EpicsValue::String(self.trig.clone().into())),
             "TVAL" => Some(EpicsValue::Double(self.tval)),
             "CVAL" => Some(EpicsValue::Double(self.cval)),
             "CVLP" => Some(EpicsValue::Double(self.cvlp)),
@@ -927,7 +927,7 @@ impl Record for EpidRecord {
             "FBOP" => Some(EpicsValue::Short(self.fbop)),
             "ODEL" => Some(EpicsValue::Double(self.odel)),
             "PREC" => Some(EpicsValue::Short(self.prec)),
-            "EGU" => Some(EpicsValue::String(self.egu.clone())),
+            "EGU" => Some(EpicsValue::String(self.egu.clone().into())),
             "HOPR" => Some(EpicsValue::Double(self.hopr)),
             "LOPR" => Some(EpicsValue::Double(self.lopr)),
             "DRVH" => Some(EpicsValue::Double(self.drvh)),
@@ -968,28 +968,28 @@ impl Record for EpidRecord {
             },
             "STPL" => match value {
                 EpicsValue::String(v) => {
-                    self.stpl = v;
+                    self.stpl = v.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "INP" => match value {
                 EpicsValue::String(v) => {
-                    self.inp = v;
+                    self.inp = v.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "OUTL" => match value {
                 EpicsValue::String(v) => {
-                    self.outl = v;
+                    self.outl = v.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "TRIG" => match value {
                 EpicsValue::String(v) => {
-                    self.trig = v;
+                    self.trig = v.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -1080,7 +1080,7 @@ impl Record for EpidRecord {
             },
             "EGU" => match value {
                 EpicsValue::String(v) => {
-                    self.egu = v;
+                    self.egu = v.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

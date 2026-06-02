@@ -595,14 +595,14 @@ impl Record for ThrottleRecord {
             "DRVLL" => Some(EpicsValue::Double(self.drvll)),
             "DRVLS" => Some(EpicsValue::Short(self.drvls)),
             "DRVLC" => Some(EpicsValue::Short(self.drvlc)),
-            "VER" => Some(EpicsValue::String(self.ver.clone())),
+            "VER" => Some(EpicsValue::String(self.ver.clone().into())),
             "STS" => Some(EpicsValue::Short(self.sts)),
             "PREC" => Some(EpicsValue::Short(self.prec)),
             "DPREC" => Some(EpicsValue::Short(self.dprec)),
             "DLY" => Some(EpicsValue::Double(self.dly)),
-            "OUT" => Some(EpicsValue::String(self.out.clone())),
+            "OUT" => Some(EpicsValue::String(self.out.clone().into())),
             "OV" => Some(EpicsValue::Short(self.ov)),
-            "SINP" => Some(EpicsValue::String(self.sinp.clone())),
+            "SINP" => Some(EpicsValue::String(self.sinp.clone().into())),
             "SIV" => Some(EpicsValue::Short(self.siv)),
             "SYNC" => Some(EpicsValue::Short(self.sync)),
             _ => None,
@@ -690,14 +690,14 @@ impl Record for ThrottleRecord {
             },
             "OUT" => match value {
                 EpicsValue::String(v) => {
-                    self.out = v;
+                    self.out = v.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "SINP" => match value {
                 EpicsValue::String(v) => {
-                    self.sinp = v;
+                    self.sinp = v.as_str_lossy().into_owned();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

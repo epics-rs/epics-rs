@@ -130,8 +130,16 @@ pub async fn publish_control_pvs(
     for (suffix, trigger) in CONTROL_FLAGS {
         let pv = format!("{prefix}{suffix}");
         let hook = control_write_hook(*trigger, pv.clone(), tx.clone());
+        // C ca-gateway creates the control flag PVs (statCommandFlag /
+        // statReport1..3Flag / statNewAsFlag / statQuitFlag /
+        // statQuitServerFlag) as plain `gateStat` (gateServer.cc:1768),
+        // whose `bestExternalType()` is DBR_DOUBLE (gateStat.cc:27
+        // `#define STAT_DOUBLE` → aitEnumFloat64, gateStat.cc:235-242) —
+        // NOT the write-disabled string `gateStatDesc`. Register as Double
+        // so the native type seen at CREATE_CHANNEL matches C (same
+        // contract stats.rs:246-250 enforces for the gateStat aliases).
         if let Err(e) = db
-            .add_pv_with_hooks(&pv, EpicsValue::Long(0), hook, None)
+            .add_pv_with_hooks(&pv, EpicsValue::Double(0.0), hook, None)
             .await
         {
             tracing::warn!(
@@ -196,14 +204,17 @@ pub fn spawn_control_owner(
                     );
                     // Reset the flag, then signal shutdown and stop the
                     // owner — the run loop performs the actual teardown.
-                    let _ = db.put_pv_and_post(&ev.pv, EpicsValue::Long(0)).await;
+                    // Double(0.0) matches the DBR_DOUBLE native type the
+                    // flag was registered with (gateStat parity).
+                    let _ = db.put_pv_and_post(&ev.pv, EpicsValue::Double(0.0)).await;
                     shutdown.notify_one();
                     return;
                 }
             }
             // Reset the flag PV to zero after handling so a later write
             // re-triggers (C resets value to 0 in the main loop).
-            if let Err(e) = db.put_pv_and_post(&ev.pv, EpicsValue::Long(0)).await {
+            // Double(0.0) matches the DBR_DOUBLE registration (gateStat).
+            if let Err(e) = db.put_pv_and_post(&ev.pv, EpicsValue::Double(0.0)).await {
                 tracing::debug!(pv = %ev.pv, error = %e, "ca-gateway-rs: control flag reset failed");
             }
         }
@@ -249,6 +260,26 @@ mod tests {
         assert!(!is_positive(&EpicsValue::Long(-1)));
         assert!(!is_positive(&EpicsValue::Double(0.0)));
         assert!(!is_positive(&EpicsValue::String("1".into())));
+    }
+
+    /// Every control flag PV is registered as DBR_DOUBLE, matching C
+    /// ca-gateway which creates them as `gateStat` (gateServer.cc:1768 →
+    /// STAT_DOUBLE/aitEnumFloat64). Mirrors
+    /// `compat_alias_stats_are_double_native_type` (stats.rs). A downstream
+    /// caget/dbpr must see DBR_DOUBLE, not the pre-fix DBR_LONG.
+    #[tokio::test]
+    async fn control_flags_are_double_native_type() {
+        let db = PvDatabase::new();
+        publish_control_pvs(&db, "gw:")
+            .await
+            .expect("non-empty prefix publishes control PVs");
+        for (suffix, _) in CONTROL_FLAGS {
+            let name = format!("gw:{suffix}");
+            assert!(
+                matches!(db.get_pv(&name).await, Ok(EpicsValue::Double(v)) if v == 0.0),
+                "control flag {name} must register as DBR_DOUBLE (gateStat parity)"
+            );
+        }
     }
 
     /// publishing registers every control flag PV under the prefix, and a
@@ -305,10 +336,14 @@ mod tests {
         let pv = db.find_pv("gw:report2Flag").await.unwrap();
         fire(&pv, EpicsValue::Long(1)).await.unwrap();
 
-        // The owner resets the flag back to 0 after handling.
+        // The owner resets the flag back to 0 after handling. The flag is
+        // a DBR_DOUBLE gateStat PV, so the reset value is Double(0.0).
         let mut reset = false;
         for _ in 0..50 {
-            if let Ok(EpicsValue::Long(0)) = db.get_pv("gw:report2Flag").await {
+            if matches!(
+                db.get_pv("gw:report2Flag").await,
+                Ok(EpicsValue::Double(v)) if v == 0.0
+            ) {
                 reset = true;
                 break;
             }

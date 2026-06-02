@@ -13,6 +13,15 @@
 //! broadcast sender has zero receivers. Downstream `subscribe()` calls
 //! re-set `drop_poke = true` so a repeatedly-asked PV stays alive even
 //! between bursts.
+//!
+//! "Interest" here means downstream MONITOR interest specifically — a
+//! narrower predicate than C's `interested` (the set of ALL open
+//! downstream channels, `chancache.cpp:121`). This is deliberate: the
+//! gateway's one-shot GET / PUT / RPC / introspection ops bypass this
+//! cache entirely (they would otherwise spawn a shared-identity upstream
+//! monitor as a side effect), so only the MONITOR path ever creates an
+//! entry. See `UpstreamEntry::is_retained` for the full rationale and
+//! the (Low) cost of the narrowing.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -482,9 +491,25 @@ impl UpstreamEntry {
 
     /// Single keep-predicate for both eviction paths: an entry is retained
     /// when it still holds its one-tick `drop_poke` grace (freshly spawned /
-    /// recently looked up) or has at least one live downstream subscriber.
-    /// Mirrors pva2pva `cacheClean::expire` (`!dropPoke &&
-    /// interested.empty()` → evict; `chancache.cpp:121`).
+    /// recently looked up) or has at least one live downstream MONITOR
+    /// subscriber.
+    ///
+    /// Deliberate deviation from C, NOT a mirror of it. pva2pva
+    /// `cacheClean::expire` evicts on `!dropPoke && interested.empty()`
+    /// (`chancache.cpp:121`), where `interested` is the set of ALL open
+    /// downstream `GWChannel`s — every channel inserted at `createChannel`
+    /// (`server.cpp:62-78`) regardless of whether it does GET/PUT/MONITOR/
+    /// RPC. The Rust gateway cannot key retention on that set: its one-shot
+    /// GET / PUT / RPC / introspection ops deliberately bypass this cache
+    /// (`source.rs` `get_value` / `put_value*` / `get_introspection*` go
+    /// straight to `cache.client()`), because routing them through a cache
+    /// entry would spawn a shared-identity upstream monitor as a side effect
+    /// — the leak removed in `source.rs` `put_value_checked`. Only the
+    /// MONITOR path creates an entry, so retention here is exactly "monitor
+    /// interest", by construction. The sole consequence of the narrowing is
+    /// that a MONITOR opened after a monitor-less idle gap re-searches and
+    /// reconnects the upstream (Low cost); no in-flight op can be stranded,
+    /// because non-monitor ops never consult this cache.
     ///
     /// Pure read — it does NOT consume the grace; only `cleanup_tick` resets
     /// `drop_poke`. The cache-full emergency sweep in [`Self::lookup`] used

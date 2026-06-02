@@ -11,11 +11,13 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tokio::sync::RwLock;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 
 use epics_base_rs::server::access_security::AccessSecurityConfig;
@@ -358,6 +360,17 @@ pub struct GatewayChannelSource {
     /// feed the one applier); the applier exits when the last clone
     /// drops.
     wm_tx: mpsc::UnboundedSender<WmCommand>,
+    /// Server-wide channel-invalidation sender, wired once by
+    /// the native server through [`ChannelSource::set_channel_invalidator`].
+    /// Stored so it reaches not only the shared [`Self::cache`] but every
+    /// per-credential cache built lazily in [`Self::upstream_cache_for`] —
+    /// each must publish onto the SAME server-wide stream so an operator
+    /// `<prefix>:drop` / `:flush` disconnects downstream channels regardless
+    /// of which cache held the entry. `Arc<OnceLock<…>>` so all `Clone`s of
+    /// the source share one slot, consistent with the other Arc-shared
+    /// fields. Unset until a server attaches (or never, for a source used
+    /// outside a `PvaServer`).
+    channel_invalidator: Arc<OnceLock<broadcast::Sender<String>>>,
 }
 
 impl GatewayChannelSource {
@@ -386,6 +399,7 @@ impl GatewayChannelSource {
             gate,
             upstream_caches: Arc::new(Mutex::new(BoundedPool::new(256))),
             wm_tx,
+            channel_invalidator: Arc::new(OnceLock::new()),
         }
     }
 
@@ -570,6 +584,14 @@ impl GatewayChannelSource {
             self.cleanup_interval,
             self.per_credential_max_entries,
         );
+        // Wire the server-wide channel-invalidation sender into the
+        // per-credential cache so its operator-driven `:drop`/`:flush`
+        // disconnects downstream channels too, publishing onto
+        // the same stream as the shared cache. Applied before publishing the
+        // cache below, so it is wired no matter which racing caller wins.
+        if let Some(tx) = self.channel_invalidator.get() {
+            new_cache.set_invalidator(tx.clone());
+        }
         // Double-checked insert under lock: a racing caller may have won.
         let mut pool = self.upstream_caches.lock();
         if let Some(c) = pool.get(&key) {
@@ -1044,6 +1066,27 @@ fn monitor_updates_to_values(
 impl ChannelSource for GatewayChannelSource {
     fn access(&self) -> &epics_base_rs::server::access_security::AccessGate {
         &self.gate
+    }
+
+    fn set_channel_invalidator(&self, invalidator: broadcast::Sender<String>) {
+        // Keep the server-wide invalidation sender so every
+        // per-credential cache built later in `upstream_cache_for` publishes
+        // onto the same stream, and wire it into the shared cache plus any
+        // per-credential caches that already exist right now. An operator
+        // `<prefix>:drop` / `:flush` then disconnects the live downstream
+        // channels (server-initiated DESTROY_CHANNEL) instead of merely
+        // ending their monitors — the downstream effect of pva2pva dropping a
+        // `ChannelCacheEntry` (`channel->destroy()` fanout, server.cpp:133).
+        if self.channel_invalidator.set(invalidator.clone()).is_err() {
+            // Already wired (a second attach, e.g. the same source bound to
+            // two servers). The caches hold idempotent `OnceLock`s of their
+            // own; nothing to re-apply.
+            return;
+        }
+        self.cache.set_invalidator(invalidator.clone());
+        for c in self.upstream_caches.lock().values() {
+            c.set_invalidator(invalidator.clone());
+        }
     }
 
     async fn list_pvs(&self) -> Vec<String> {
@@ -1829,6 +1872,40 @@ mod tests {
         // Flush clears the remaining shared entry too.
         assert_eq!(src.flush_all_caches().await, 1);
         assert_eq!(src.total_cached_entry_count().await, 0);
+    }
+
+    /// `set_channel_invalidator` wires the server-wide sender
+    /// into the shared cache AND every per-credential cache built afterward,
+    /// so an operator `<prefix>:drop` routed through the gateway publishes
+    /// the dropped name — the downstream effect being a server-initiated
+    /// DESTROY_CHANNEL of the live channel, not just a silently-ended
+    /// monitor. Asserts both cache layers publish onto the one stream.
+    #[tokio::test]
+    async fn set_channel_invalidator_wires_shared_and_per_credential_caches() {
+        let src = make_source();
+        let (tx, mut rx) = broadcast::channel::<String>(16);
+        src.set_channel_invalidator(tx.clone());
+
+        // Shared (anonymous) cache publishes on a drop routed through the
+        // gateway-level all-caches API the control RPC uses.
+        src.cache.insert_test_entry("SHARED:PV").await;
+        assert!(src.drop_entry_all_caches("SHARED:PV").await);
+        assert_eq!(
+            rx.try_recv().expect("shared-cache drop published"),
+            "SHARED:PV".to_string()
+        );
+
+        // A per-credential cache built AFTER wiring inherits the SAME sender
+        // (upstream_cache_for applies the stored sender to fresh caches), so
+        // a credentialed drop publishes onto the same stream.
+        let ctx = make_ctx("h", "alice", "ca");
+        let cred_cache = src.upstream_cache_for_test(&ctx);
+        cred_cache.insert_test_entry("CRED:PV").await;
+        assert!(src.drop_entry_all_caches("CRED:PV").await);
+        assert_eq!(
+            rx.try_recv().expect("per-credential-cache drop published"),
+            "CRED:PV".to_string()
+        );
     }
 
     /// pva2pva exposes no `channelList`, so a gateway's `server`

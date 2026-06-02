@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use epics_base_rs::server::database::{ExternalPvResolver, LinkSet, PvDatabase};
+use epics_base_rs::server::database::{ExternalPvResolver, LinkPutOp, LinkSet, PvDatabase};
 use epics_base_rs::types::EpicsValue;
 use epics_pva_rs::pvdata::{PvField, ScalarValue};
 
@@ -1084,10 +1084,16 @@ impl LinkSet for PvaLinkResolver {
         pvfield_to_epics_value(&value)
     }
 
-    fn put_value(&self, name: &str, value: EpicsValue) -> Result<(), String> {
+    fn put_value(&self, name: &str, value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
         if !self.is_enabled() {
             return Err("pvalink disabled".into());
         }
+        // An `Async` op marks a put-notify / blocking-put chain: the
+        // source record's processing is held until the downstream put
+        // completes, so the PUT must carry the block option
+        // (`record._options.block`) — pvxs `pvaPutValueAsync`. A plain
+        // OUT write is fire-and-forget (`pvaPutValue`, block off).
+        let block = matches!(op, LinkPutOp::Async);
         let full = strip_scheme(name).ok_or_else(|| {
             format!("pvalink rejects ca:// scheme: {name} (use the CA-link path instead)")
         })?;
@@ -1127,12 +1133,12 @@ impl LinkSet for PvaLinkResolver {
                     .map_err(|e| e.to_string())?;
                 if array_path {
                     let pv_field = crate::convert::epics_to_pv_field(&value);
-                    link.put_out_field(&cfg, &pv_field)
+                    link.put_out_field(&cfg, &pv_field, block)
                         .await
                         .map_err(|e| e.to_string())
                 } else {
                     let value_str = value.to_string();
-                    link.put_out_str(&cfg, &value_str)
+                    link.put_out_str(&cfg, &value_str, block)
                         .await
                         .map_err(|e| e.to_string())
                 }
@@ -3572,7 +3578,7 @@ mod tests {
 
         // Drive the OUT path through the resolver's LinkSet impl.
         let scheme_name = format!("pva://{pv_name}");
-        LinkSet::put_value(&resolver, &scheme_name, value)
+        LinkSet::put_value(&resolver, &scheme_name, value, LinkPutOp::Plain)
             .expect("typed array OUT write must succeed");
 
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;

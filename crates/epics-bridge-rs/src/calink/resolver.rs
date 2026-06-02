@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwap;
-use epics_base_rs::server::database::{LinkDbfType, LinkMetadata, LinkSet, PvDatabase};
+use epics_base_rs::server::database::{LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, PvDatabase};
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::EpicsValue;
 use epics_ca_rs::DbFieldType;
@@ -654,7 +654,16 @@ impl LinkSet for CaLinkResolver {
         self.link_for(name)?.value()
     }
 
-    fn put_value(&self, name: &str, value: EpicsValue) -> Result<(), String> {
+    fn put_value(&self, name: &str, value: EpicsValue, _op: LinkPutOp) -> Result<(), String> {
+        // `_op` is accepted for the trait but does not alter CA
+        // delivery: `CaChannel::put` always issues a CA WRITE_NOTIFY and
+        // awaits the server's put-completion reply, so a CA OUT-link
+        // write is already completion-aware — the C `dbCaPutLinkCallback`
+        // path that `LinkPutOp::Async` names. A `LinkPutOp::Plain` write
+        // is delivered with the same completion wait (stricter than C's
+        // fire-and-forget `dbCaPutLink`/`ca_array_put`), which never
+        // weakens correctness, so both ops route through the one
+        // write-notify path.
         let name = strip_ca_scheme(name);
         let link = self
             .link_for(name)

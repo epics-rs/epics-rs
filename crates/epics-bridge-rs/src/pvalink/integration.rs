@@ -961,20 +961,36 @@ async fn scan_once(
         if !*atomic {
             atomic_epoch = None;
         }
-        // `CPP` (passive_only) only fires when the owning
-        // record's SCAN is Passive. pvxs `pvalink_channel.cpp:313`
-        // checks `prec->scan != 0` and skips processing; non-zero
-        // SCAN (Event, IO Intr, periodic) means the record has
-        // its own scan source and must not be re-fired from CPP.
-        if *passive_only {
-            let is_passive = match db_handle.get_record(record).await {
-                Some(rec) => matches!(
-                    rec.read().await.common.scan,
-                    epics_base_rs::server::record::ScanType::Passive
-                ),
-                None => continue,
+        // CPP passive gate + PACT pre-check, taken under one target
+        // write lock — mirrors pvxs `ScanTrack::scan`
+        // (`pvalink_channel.cpp:313-323`) and the in-db CP fan-out:
+        //   - `CPP` (passive_only) fires only when the owning record's
+        //     SCAN is Passive. pvxs checks `prec->scan != 0` and skips
+        //     processing; a non-zero SCAN (Event, I/O Intr, periodic)
+        //     means the record has its own scan source and must not be
+        //     re-fired from CPP.
+        //   - an already-processing (PACT) target gets `rpro = true`
+        //     and is NOT re-processed here; the standard RPRO mechanism
+        //     reprocesses it exactly once when the async cycle
+        //     completes (pvxs `else if (prec->pact) { prec->rpro =
+        //     TRUE; }`). pvxs intercepts PACT *before* `dbProcess`
+        //     because `dbProcess` on PACT only counts toward SCAN_ALARM
+        //     and never sets RPRO; without this branch a fast monitor
+        //     stream onto a stuck async target drives it to
+        //     SCAN_ALARM/INVALID after MAX_LOCK consecutive busy
+        //     attempts.
+        // The guard is dropped before the process call below, which
+        // takes its own per-record locks.
+        {
+            let Some(rec) = db_handle.get_record(record).await else {
+                continue;
             };
-            if !is_passive {
+            let mut tg = rec.write().await;
+            if *passive_only && tg.common.scan != epics_base_rs::server::record::ScanType::Passive {
+                continue;
+            }
+            if tg.is_processing() {
+                tg.common.rpro = true;
                 continue;
             }
         }
@@ -2115,6 +2131,75 @@ mod tests {
         forwarder.await.unwrap();
 
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// PACT pre-check: a CP scan onto a target already processing async
+    /// (PACT) must set `rpro = true` and NOT re-process it, mirroring
+    /// pvxs `ScanTrack::scan` (`pvalink_channel.cpp:316-323`,
+    /// `else if (prec->pact) { prec->rpro = TRUE; }`). Pre-fix the scan
+    /// drove the PACT target through the `dbProcess` entry guard, which
+    /// bumps LCNT toward SCAN_ALARM and never sets RPRO — so a fast
+    /// monitor stream onto a stuck async target eventually alarmed.
+    #[tokio::test]
+    async fn scan_sets_rpro_and_skips_pact_target() {
+        let db = PvDatabase::new();
+        let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        db.add_record(
+            "DEST",
+            Box::new(CountingRecord {
+                count: count.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Hold the record Arc and drive it into PACT (async in
+        // progress) before the db moves into the forwarder slot.
+        let dest = db.get_record("DEST").await.unwrap();
+        dest.write()
+            .await
+            .processing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // CP target: scans on every event.
+        let mut fanout = ScanFanout::default();
+        fanout.records.push(ScanTarget {
+            record: "DEST".to_string(),
+            monorder: 0,
+            atomic: false,
+            passive_only: false,
+        });
+        let scan_targets: ScanTargetMap =
+            Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
+                (mk("SRC"), fanout),
+            ])));
+        let db_slot = Arc::new(parking_lot::RwLock::new(Some(db)));
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<ScanEvent>(8);
+        let forwarder = tokio::spawn(run_notify_forwarder(
+            mk("SRC"),
+            rx,
+            scan_targets,
+            db_slot,
+            Arc::new(ScanOverrun::default()),
+        ));
+
+        tx.send(ScanEvent::Value(nt_scalar(1.0))).await.unwrap();
+        drop(tx);
+        forwarder.await.unwrap();
+
+        // The async target was NOT re-processed by the CP scan ...
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a PACT target must not be re-processed by a CP scan"
+        );
+        // ... and RPRO was armed so the standard RPRO mechanism
+        // reprocesses it once the async cycle completes.
+        assert!(
+            dest.read().await.common.rpro,
+            "a PACT target must get rpro=true (pvxs prec->rpro = TRUE)"
+        );
     }
 
     /// Scan-trigger overrun, consumer half: with `Q=1` and a saturated

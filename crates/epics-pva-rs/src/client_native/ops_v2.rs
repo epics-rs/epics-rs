@@ -3420,6 +3420,7 @@ enum ArrayResp {
 /// - getLength: data (none); reply `status + length`.
 async fn op_array_data(
     channel: &Arc<Channel>,
+    pv_request: Option<&PvField>,
     req: ArrayReq<'_>,
     op_timeout: Duration,
 ) -> PvaResult<(FieldDesc, ArrayResp)> {
@@ -3429,7 +3430,15 @@ async fn op_array_data(
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
 
-    let pv_req = build_pv_request_value_only(big_endian);
+    // INIT pvRequest: forward the caller's verbatim (the gateway's
+    // preserved downstream ARRAY pvRequest, which selects the bound array
+    // field) or the default `field(value)` selection when none was supplied
+    // (pvAccessCPP `clientContextImpl.cpp:1567` sends the create-time
+    // pvRequest on the QOS_INIT frame).
+    let pv_req = match pv_request {
+        Some(req) => encode_pv_request_value(req, order),
+        None => build_pv_request_value_only(big_endian),
+    };
     let mut stream = server.register_ioid_stream(sid, ioid, Command::Array.code());
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
     let cache = server.type_cache();
@@ -3610,6 +3619,7 @@ pub async fn op_array_get(
 ) -> PvaResult<(FieldDesc, PvField)> {
     let (desc, resp) = op_array_data(
         channel,
+        None,
         ArrayReq::Get {
             offset,
             count,
@@ -3638,6 +3648,7 @@ pub async fn op_array_put(
 ) -> PvaResult<()> {
     op_array_data(
         channel,
+        None,
         ArrayReq::Put {
             offset,
             stride,
@@ -3656,7 +3667,7 @@ pub async fn op_array_set_length(
     length: u32,
     op_timeout: Duration,
 ) -> PvaResult<()> {
-    op_array_data(channel, ArrayReq::SetLength { length }, op_timeout)
+    op_array_data(channel, None, ArrayReq::SetLength { length }, op_timeout)
         .await
         .map(|_| ())
 }
@@ -3665,7 +3676,158 @@ pub async fn op_array_set_length(
 /// element count of the channel's array field (pvAccessCPP
 /// `clientContextImpl.cpp:1784-1810`).
 pub async fn op_array_get_length(channel: &Arc<Channel>, op_timeout: Duration) -> PvaResult<u32> {
-    let (_desc, resp) = op_array_data(channel, ArrayReq::GetLength, op_timeout).await?;
+    let (_desc, resp) = op_array_data(channel, None, ArrayReq::GetLength, op_timeout).await?;
+    match resp {
+        ArrayResp::Length(n) => Ok(n),
+        _ => Err(PvaError::Protocol(
+            "ARRAY getLength: unexpected reply body".into(),
+        )),
+    }
+}
+
+// ── ARRAY request-carrying variants (gateway pvRequest forwarding) ──────
+//
+// A PVA-to-PVA gateway must forward the downstream's ARRAY INIT pvRequest
+// to the upstream IOC verbatim (pva2pva `GWChannel::createChannelArray`
+// forwards `pvRequest` unchanged, `channel.cpp:227-232`) so the upstream
+// resolves the same bound array field the downstream selected. These mirror
+// the default-pvRequest functions above but thread the caller's pvRequest
+// into the INIT frame via [`op_array_data`].
+
+/// ChannelArray INIT-only probe: open the array op with `pv_request` (or the
+/// default `field(value)` when `None`), read back the bound array field's
+/// introspection, then DESTROY without a data sub-op. The gateway uses this
+/// to answer a downstream ARRAY INIT — pvAccessCPP's INIT reply carries the
+/// array introspection (`responseHandlers.cpp:2347-2360`), which the gateway
+/// must resolve from the upstream rather than fabricate.
+pub async fn op_array_describe(
+    channel: &Arc<Channel>,
+    pv_request: Option<&PvField>,
+    op_timeout: Duration,
+) -> PvaResult<FieldDesc> {
+    let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
+    let order = server.byte_order;
+    let big_endian = matches!(order, ByteOrder::Big);
+    let codec = PvaCodec { big_endian };
+    let ioid = alloc_ioid();
+
+    let pv_req = match pv_request {
+        Some(req) => encode_pv_request_value(req, order),
+        None => build_pv_request_value_only(big_endian),
+    };
+    let mut stream = server.register_ioid_stream(sid, ioid, Command::Array.code());
+    let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
+    let cache = server.type_cache();
+
+    let mut init = Vec::with_capacity(9 + pv_req.len());
+    init.put_u32(sid, order);
+    init.put_u32(ioid, order);
+    init.put_u8(QosFlags::INIT);
+    init.extend_from_slice(&pv_req);
+    let init_h = PvaHeader::application(false, order, Command::Array.code(), init.len() as u32);
+    let mut init_frame = Vec::with_capacity(8 + init.len());
+    init_h.write_into(&mut init_frame);
+    init_frame.extend_from_slice(&init);
+    server.send_for_channel(sid, init_frame).await?;
+
+    let init_resp = await_frame(&mut stream, op_timeout).await?;
+    let array_desc = match decode_array_init(&init_resp, &mut cache.lock()) {
+        Ok(Ok(desc)) => desc,
+        Ok(Err(status)) => {
+            server.unregister_ioid(ioid);
+            return Err(PvaError::Protocol(format!("ARRAY INIT failed: {status:?}")));
+        }
+        Err(e) => {
+            server.close();
+            return Err(e);
+        }
+    };
+    // INIT succeeded → the op is registered upstream; arm the destroy so the
+    // guard tears it down on the (immediate) drop below.
+    ioid_guard.arm_destroy(sid);
+    ioid_guard.disarm();
+    let destroy = codec.build_destroy_request(sid, ioid);
+    let _ = server.send_for_channel(sid, destroy).await;
+    server.unregister_ioid(ioid);
+    Ok(array_desc)
+}
+
+/// [`op_array_get`] carrying a preserved INIT `pv_request`.
+pub async fn op_array_get_with_request(
+    channel: &Arc<Channel>,
+    pv_request: &PvField,
+    offset: u32,
+    count: u32,
+    stride: u32,
+    op_timeout: Duration,
+) -> PvaResult<(FieldDesc, PvField)> {
+    let (desc, resp) = op_array_data(
+        channel,
+        Some(pv_request),
+        ArrayReq::Get {
+            offset,
+            count,
+            stride,
+        },
+        op_timeout,
+    )
+    .await?;
+    match resp {
+        ArrayResp::Value(v) => Ok((desc, v)),
+        _ => Err(PvaError::Protocol(
+            "ARRAY getArray: unexpected reply body".into(),
+        )),
+    }
+}
+
+/// [`op_array_put`] carrying a preserved INIT `pv_request`.
+pub async fn op_array_put_with_request(
+    channel: &Arc<Channel>,
+    pv_request: &PvField,
+    value: &PvField,
+    offset: u32,
+    stride: u32,
+    op_timeout: Duration,
+) -> PvaResult<()> {
+    op_array_data(
+        channel,
+        Some(pv_request),
+        ArrayReq::Put {
+            offset,
+            stride,
+            value,
+        },
+        op_timeout,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// [`op_array_set_length`] carrying a preserved INIT `pv_request`.
+pub async fn op_array_set_length_with_request(
+    channel: &Arc<Channel>,
+    pv_request: &PvField,
+    length: u32,
+    op_timeout: Duration,
+) -> PvaResult<()> {
+    op_array_data(
+        channel,
+        Some(pv_request),
+        ArrayReq::SetLength { length },
+        op_timeout,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// [`op_array_get_length`] carrying a preserved INIT `pv_request`.
+pub async fn op_array_get_length_with_request(
+    channel: &Arc<Channel>,
+    pv_request: &PvField,
+    op_timeout: Duration,
+) -> PvaResult<u32> {
+    let (_desc, resp) =
+        op_array_data(channel, Some(pv_request), ArrayReq::GetLength, op_timeout).await?;
     match resp {
         ArrayResp::Length(n) => Ok(n),
         _ => Err(PvaError::Protocol(

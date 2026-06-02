@@ -792,6 +792,109 @@ impl ChannelSource for CompositeSource {
         }
     }
 
+    // ChannelArray routed to the resolving owner. Without these the trait
+    // default ("not supported") would mask a wrapped inner's array support
+    // whenever a composite wraps it (e.g. the PVA gateway under a
+    // `control_prefix`, where `CompositeSource` wraps the layered gateway
+    // source) — the wrapper-severs-override defect family. INIT picks the
+    // owner by credentialed existence (matching `resolve_owner`); the
+    // sub-ops re-mint the access token through the owner's gate via
+    // `resolve_checked`, exactly as `put_get_checked` / `process_checked` do.
+    fn channel_array_init(
+        &self,
+        name: &str,
+        ctx: crate::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Result<FieldDesc, OpError>> + Send {
+        let name = name.to_string();
+        let this = self.snapshot();
+        async move {
+            for src in this {
+                if src.has_pv_checked(&name, ctx.clone()).await {
+                    return src.channel_array_init(&name, ctx).await;
+                }
+            }
+            Err(OpError::failed(format!("no source serves '{name}'")))
+        }
+    }
+
+    fn channel_array_get(
+        &self,
+        checked: AccessChecked,
+        offset: u32,
+        count: u32,
+        stride: u32,
+        ctx: crate::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Result<PvField, OpError>> + Send {
+        let name = checked.pv_name().to_string();
+        let this = self.snapshot();
+        async move {
+            match Self::resolve_checked(this, &name, &ctx).await {
+                Some((src, inner_checked)) => {
+                    src.channel_array_get(inner_checked, offset, count, stride, ctx)
+                        .await
+                }
+                None => Err(OpError::failed(format!("no source serves '{name}'"))),
+            }
+        }
+    }
+
+    fn channel_array_put(
+        &self,
+        checked: AccessChecked,
+        offset: u32,
+        stride: u32,
+        value: PvField,
+        ctx: crate::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+        let name = checked.pv_name().to_string();
+        let this = self.snapshot();
+        async move {
+            match Self::resolve_checked(this, &name, &ctx).await {
+                Some((src, inner_checked)) => {
+                    src.channel_array_put(inner_checked, offset, stride, value, ctx)
+                        .await
+                }
+                None => Err(OpError::failed(format!("no source serves '{name}'"))),
+            }
+        }
+    }
+
+    fn channel_array_set_length(
+        &self,
+        checked: AccessChecked,
+        length: u32,
+        ctx: crate::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+        let name = checked.pv_name().to_string();
+        let this = self.snapshot();
+        async move {
+            match Self::resolve_checked(this, &name, &ctx).await {
+                Some((src, inner_checked)) => {
+                    src.channel_array_set_length(inner_checked, length, ctx)
+                        .await
+                }
+                None => Err(OpError::failed(format!("no source serves '{name}'"))),
+            }
+        }
+    }
+
+    fn channel_array_get_length(
+        &self,
+        checked: AccessChecked,
+        ctx: crate::server_native::source::ChannelContext,
+    ) -> impl std::future::Future<Output = Result<u32, OpError>> + Send {
+        let name = checked.pv_name().to_string();
+        let this = self.snapshot();
+        async move {
+            match Self::resolve_checked(this, &name, &ctx).await {
+                Some((src, inner_checked)) => {
+                    src.channel_array_get_length(inner_checked, ctx).await
+                }
+                None => Err(OpError::failed(format!("no source serves '{name}'"))),
+            }
+        }
+    }
+
     fn monitor_watermarks(
         &self,
         name: &str,

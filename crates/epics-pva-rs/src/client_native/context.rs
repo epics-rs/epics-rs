@@ -1871,6 +1871,105 @@ impl PvaClient {
         crate::client_native::ops_v2::op_array_get_length(&ch, self.inner.timeout).await
     }
 
+    /// ChannelArray INIT-only descriptor probe: open the array op (default
+    /// `field(value)` selection), read back the bound array field's
+    /// introspection, then DESTROY. Used by a PVA gateway to resolve the
+    /// upstream array descriptor it must report on a downstream ARRAY INIT.
+    pub async fn pvarray_describe(&self, pv_name: &str) -> PvaResult<FieldDesc> {
+        let ch = self.channel(pv_name).await?;
+        crate::client_native::ops_v2::op_array_describe(&ch, None, self.inner.timeout).await
+    }
+
+    /// [`Self::pvarray_describe`] forwarding the caller's `pv_request`
+    /// (selects the bound array field) verbatim into the INIT frame.
+    pub async fn pvarray_describe_with_request_value(
+        &self,
+        pv_name: &str,
+        pv_request: &PvField,
+    ) -> PvaResult<FieldDesc> {
+        let ch = self.channel(pv_name).await?;
+        crate::client_native::ops_v2::op_array_describe(&ch, Some(pv_request), self.inner.timeout)
+            .await
+    }
+
+    /// [`Self::pvarray_get`] forwarding the caller's `pv_request` (selects
+    /// the bound array field) verbatim into the INIT frame.
+    pub async fn pvarray_get_with_request_value(
+        &self,
+        pv_name: &str,
+        pv_request: &PvField,
+        offset: u32,
+        count: u32,
+        stride: u32,
+    ) -> PvaResult<(FieldDesc, PvField)> {
+        let ch = self.channel(pv_name).await?;
+        crate::client_native::ops_v2::op_array_get_with_request(
+            &ch,
+            pv_request,
+            offset,
+            count,
+            stride,
+            self.inner.timeout,
+        )
+        .await
+    }
+
+    /// [`Self::pvarray_put`] forwarding the caller's `pv_request` (selects
+    /// the bound array field) verbatim into the INIT frame.
+    pub async fn pvarray_put_with_request_value(
+        &self,
+        pv_name: &str,
+        pv_request: &PvField,
+        value: &PvField,
+        offset: u32,
+        stride: u32,
+    ) -> PvaResult<()> {
+        let ch = self.channel(pv_name).await?;
+        crate::client_native::ops_v2::op_array_put_with_request(
+            &ch,
+            pv_request,
+            value,
+            offset,
+            stride,
+            self.inner.timeout,
+        )
+        .await
+    }
+
+    /// [`Self::pvarray_set_length`] forwarding the caller's `pv_request`
+    /// (selects the bound array field) verbatim into the INIT frame.
+    pub async fn pvarray_set_length_with_request_value(
+        &self,
+        pv_name: &str,
+        pv_request: &PvField,
+        length: u32,
+    ) -> PvaResult<()> {
+        let ch = self.channel(pv_name).await?;
+        crate::client_native::ops_v2::op_array_set_length_with_request(
+            &ch,
+            pv_request,
+            length,
+            self.inner.timeout,
+        )
+        .await
+    }
+
+    /// [`Self::pvarray_get_length`] forwarding the caller's `pv_request`
+    /// (selects the bound array field) verbatim into the INIT frame.
+    pub async fn pvarray_get_length_with_request_value(
+        &self,
+        pv_name: &str,
+        pv_request: &PvField,
+    ) -> PvaResult<u32> {
+        let ch = self.channel(pv_name).await?;
+        crate::client_native::ops_v2::op_array_get_length_with_request(
+            &ch,
+            pv_request,
+            self.inner.timeout,
+        )
+        .await
+    }
+
     /// Snapshot of the client's current state — channel cache size,
     /// connection-pool peers, name-server count, and per-connection /
     /// per-channel byte counters. Mirrors pvxs `Context::report`

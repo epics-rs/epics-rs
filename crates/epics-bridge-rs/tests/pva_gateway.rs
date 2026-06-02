@@ -1260,6 +1260,357 @@ impl RecordingDoublingSource {
     }
 }
 
+// ── BRIDGE-31: ChannelArray (cmd 14) gateway forwarding ─────────────────
+//
+// A downstream ChannelArray op must reach the upstream IOC through the
+// gateway, preserving the downstream INIT pvRequest (pva2pva
+// `GWChannel::createChannelArray` forwards `pvRequest` unchanged). The
+// upstream here is a source that serves a real windowed double array; the
+// gateway forwards getLength/getArray/putArray/setLength to it.
+
+/// Upstream source backing one PV with an in-memory `Vec<f64>`, serving the
+/// full ChannelArray surface plus the existence/introspection a gateway
+/// `pvconnect` / `pvinfo` resolves a channel through.
+struct UpstreamArraySource {
+    pv: String,
+    data: std::sync::Mutex<Vec<f64>>,
+}
+
+impl UpstreamArraySource {
+    fn new(pv: &str, initial: Vec<f64>) -> Self {
+        Self {
+            pv: pv.to_string(),
+            data: std::sync::Mutex::new(initial),
+        }
+    }
+}
+
+fn doubles_field(values: &[f64]) -> PvField {
+    PvField::ScalarArray(values.iter().copied().map(ScalarValue::Double).collect())
+}
+
+/// Normalise a getArray reply (the wire-decode path yields either the
+/// generic `ScalarArray` or the packed `ScalarArrayTyped`) to `Vec<f64>`.
+fn array_doubles(field: &PvField) -> Vec<f64> {
+    let items = match field {
+        PvField::ScalarArray(items) => items.clone(),
+        PvField::ScalarArrayTyped(arr) => arr.to_scalar_values(),
+        other => panic!("expected ScalarArray, got {other:?}"),
+    };
+    items
+        .iter()
+        .map(|v| match v {
+            ScalarValue::Double(d) => *d,
+            other => panic!("expected Double element, got {other:?}"),
+        })
+        .collect()
+}
+
+impl ChannelSource for UpstreamArraySource {
+    async fn list_pvs(&self) -> Vec<String> {
+        vec![self.pv.clone()]
+    }
+    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
+        let matches = n == self.pv;
+        async move { matches }
+    }
+    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+        Some(FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalarArray:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::ScalarArray(ScalarType::Double))],
+        })
+    }
+    async fn get_value(&self, _: &str) -> Option<PvField> {
+        Some(doubles_field(&self.data.lock().unwrap()))
+    }
+    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+        Ok(())
+    }
+    async fn is_writable(&self, _: &str) -> bool {
+        true
+    }
+    async fn subscribe(&self, _: &str) -> Option<tokio::sync::mpsc::Receiver<PvField>> {
+        None
+    }
+
+    async fn channel_array_init(&self, _: &str, _: ChannelContext) -> Result<FieldDesc, OpError> {
+        Ok(FieldDesc::ScalarArray(ScalarType::Double))
+    }
+    async fn channel_array_get(
+        &self,
+        checked: AccessChecked,
+        offset: u32,
+        count: u32,
+        stride: u32,
+        _: ChannelContext,
+    ) -> Result<PvField, OpError> {
+        if !checked.allows_read() {
+            return Err(OpError::denied("read denied"));
+        }
+        let data = self.data.lock().unwrap();
+        let stride = stride.max(1) as usize;
+        let want = count as usize; // 0 => to the end
+        let mut out = Vec::new();
+        let mut i = offset as usize;
+        while i < data.len() && (want == 0 || out.len() < want) {
+            out.push(ScalarValue::Double(data[i]));
+            i += stride;
+        }
+        Ok(PvField::ScalarArray(out))
+    }
+    async fn channel_array_put(
+        &self,
+        checked: AccessChecked,
+        offset: u32,
+        stride: u32,
+        value: PvField,
+        _: ChannelContext,
+    ) -> Result<(), OpError> {
+        if !checked.allows_write() {
+            return Err(OpError::denied("write denied"));
+        }
+        let new = array_doubles(&value);
+        let stride = stride.max(1) as usize;
+        let mut data = self.data.lock().unwrap();
+        let mut idx = offset as usize;
+        for d in new {
+            if idx >= data.len() {
+                data.resize(idx + 1, 0.0);
+            }
+            data[idx] = d;
+            idx += stride;
+        }
+        Ok(())
+    }
+    async fn channel_array_set_length(
+        &self,
+        checked: AccessChecked,
+        length: u32,
+        _: ChannelContext,
+    ) -> Result<(), OpError> {
+        if !checked.allows_write() {
+            return Err(OpError::denied("write denied"));
+        }
+        self.data.lock().unwrap().resize(length as usize, 0.0);
+        Ok(())
+    }
+    async fn channel_array_get_length(
+        &self,
+        checked: AccessChecked,
+        _: ChannelContext,
+    ) -> Result<u32, OpError> {
+        if !checked.allows_read() {
+            return Err(OpError::denied("read denied"));
+        }
+        Ok(self.data.lock().unwrap().len() as u32)
+    }
+}
+
+/// Spawn an upstream PvaServer serving `source` on a random loopback port;
+/// return (server, addr). Mirrors `spawn_upstream`'s port-pick / isolation.
+fn spawn_upstream_source<S: ChannelSource + 'static>(source: S) -> (PvaServer, SocketAddr) {
+    let pick = || {
+        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let pick_udp = || {
+        let l = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let cfg = PvaServerConfig {
+        tcp_port: pick(),
+        udp_port: pick_udp(),
+        ..PvaServerConfig::isolated()
+    };
+    let bound = SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        cfg.tcp_port,
+    );
+    let server = PvaServer::start(Arc::new(source), cfg).expect("upstream array server must start");
+    (server, bound)
+}
+
+/// The full ChannelArray surface round-trips through the gateway to the
+/// upstream array source: getLength, getArray (full + sliced + strided),
+/// putArray (mutates the upstream `Vec`), setLength.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bridge31_gateway_array_round_trip_forwards_upstream() {
+    let (_us, us_addr) = spawn_upstream_source(UpstreamArraySource::new(
+        "GW:ARR:PV",
+        vec![10.0, 20.0, 30.0, 40.0, 50.0],
+    ));
+    let upstream = Arc::new(
+        PvaClient::builder()
+            .server_addr(us_addr)
+            .timeout(Duration::from_secs(2))
+            .build(),
+    );
+    let gw = PvaGateway::start(gateway_cfg(upstream)).expect("gateway start");
+    let ds = gw.client_config();
+
+    // getLength
+    let len = tokio::time::timeout(Duration::from_secs(5), ds.pvarray_get_length("GW:ARR:PV"))
+        .await
+        .expect("getLength through gateway must not hang")
+        .expect("getLength must succeed");
+    assert_eq!(len, 5, "initial upstream length");
+
+    // getArray full (count == 0 → to end)
+    let (_d, full) =
+        tokio::time::timeout(Duration::from_secs(5), ds.pvarray_get("GW:ARR:PV", 0, 0, 1))
+            .await
+            .expect("getArray must not hang")
+            .expect("getArray must succeed");
+    assert_eq!(array_doubles(&full), vec![10.0, 20.0, 30.0, 40.0, 50.0]);
+
+    // getArray slice: offset 1, count 2, stride 1
+    let (_d, slice) = ds
+        .pvarray_get("GW:ARR:PV", 1, 2, 1)
+        .await
+        .expect("sliced getArray must succeed");
+    assert_eq!(array_doubles(&slice), vec![20.0, 30.0]);
+
+    // getArray strided: offset 0, count 0, stride 2
+    let (_d, strided) = ds
+        .pvarray_get("GW:ARR:PV", 0, 0, 2)
+        .await
+        .expect("strided getArray must succeed");
+    assert_eq!(array_doubles(&strided), vec![10.0, 30.0, 50.0]);
+
+    // putArray: write [99, 98] at offset 1 → upstream Vec becomes
+    // [10, 99, 98, 40, 50]
+    ds.pvarray_put("GW:ARR:PV", &doubles_field(&[99.0, 98.0]), 1, 1)
+        .await
+        .expect("putArray through gateway must succeed");
+    let (_d, after_put) = ds
+        .pvarray_get("GW:ARR:PV", 0, 0, 1)
+        .await
+        .expect("getArray after put must succeed");
+    assert_eq!(
+        array_doubles(&after_put),
+        vec![10.0, 99.0, 98.0, 40.0, 50.0],
+        "putArray must splice at offset on the upstream"
+    );
+
+    // setLength: shrink to 3 → [10, 99, 98]
+    ds.pvarray_set_length("GW:ARR:PV", 3)
+        .await
+        .expect("setLength through gateway must succeed");
+    let len = ds
+        .pvarray_get_length("GW:ARR:PV")
+        .await
+        .expect("getLength after resize must succeed");
+    assert_eq!(len, 3, "length after setLength on the upstream");
+}
+
+/// A `read_only` gateway forwards read-class array sub-ops (getLength,
+/// getArray) but rejects write-class sub-ops (putArray, setLength) at the
+/// `ReadOnly` layer — the same write-class refusal the layer applies to
+/// PUT/PUT_GET/PROCESS/RPC, extended to the new array op family.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bridge31_read_only_gateway_rejects_array_write() {
+    let (_us, us_addr) =
+        spawn_upstream_source(UpstreamArraySource::new("GW:ROARR:PV", vec![1.0, 2.0, 3.0]));
+    let upstream = Arc::new(
+        PvaClient::builder()
+            .server_addr(us_addr)
+            .timeout(Duration::from_secs(2))
+            .build(),
+    );
+    let mut cfg = gateway_cfg(upstream);
+    cfg.read_only = true;
+    let gw = PvaGateway::start(cfg).expect("read-only gateway start");
+    let ds = gw.client_config();
+
+    // Read-class sub-ops still pass through.
+    let len = tokio::time::timeout(Duration::from_secs(5), ds.pvarray_get_length("GW:ROARR:PV"))
+        .await
+        .expect("getLength must not hang")
+        .expect("read-only gateway must still forward getLength");
+    assert_eq!(len, 3);
+    let (_d, full) = ds
+        .pvarray_get("GW:ROARR:PV", 0, 0, 1)
+        .await
+        .expect("read-only gateway must still forward getArray");
+    assert_eq!(array_doubles(&full), vec![1.0, 2.0, 3.0]);
+
+    // putArray is rejected at the ReadOnly layer.
+    let err = ds
+        .pvarray_put("GW:ROARR:PV", &doubles_field(&[9.0]), 0, 1)
+        .await
+        .expect_err("putArray through a read-only gateway must be rejected");
+    assert!(
+        err.to_string().to_lowercase().contains("read-only"),
+        "putArray rejection must come from the ReadOnly layer: {err}"
+    );
+
+    // setLength is rejected at the ReadOnly layer.
+    let err = ds
+        .pvarray_set_length("GW:ROARR:PV", 1)
+        .await
+        .expect_err("setLength through a read-only gateway must be rejected");
+    assert!(
+        err.to_string().to_lowercase().contains("read-only"),
+        "setLength rejection must come from the ReadOnly layer: {err}"
+    );
+}
+
+/// With a `control_prefix` set the gateway wraps the layered proxy source
+/// in a `CompositeSource` (alongside the `ControlSource` diagnostic PVs).
+/// A regular (non-control) array PV must still round-trip through the
+/// composite to the upstream — proving `CompositeSource` forwards the
+/// `channel_array_*` family rather than masking it with the trait default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bridge31_gateway_array_through_composite_control_prefix() {
+    let (_us, us_addr) = spawn_upstream_source(UpstreamArraySource::new(
+        "GW:CMPARR:PV",
+        vec![3.0, 6.0, 9.0],
+    ));
+    let upstream = Arc::new(
+        PvaClient::builder()
+            .server_addr(us_addr)
+            .timeout(Duration::from_secs(2))
+            .build(),
+    );
+    // control_prefix "gw" inserts the CompositeSource + ControlSource; the
+    // "GW:CMPARR:PV" name is not a control/diag PV, so the composite routes
+    // it to the layered gateway source → upstream.
+    let cfg = PvaGatewayConfig {
+        control_prefix: Some("gw".into()),
+        ..gateway_cfg(upstream)
+    };
+    let gw = PvaGateway::start(cfg).expect("control-prefix gateway start");
+    let ds = gw.client_config();
+
+    let len = tokio::time::timeout(
+        Duration::from_secs(5),
+        ds.pvarray_get_length("GW:CMPARR:PV"),
+    )
+    .await
+    .expect("getLength through the composite must not hang")
+    .expect("getLength through the composite must succeed");
+    assert_eq!(len, 3, "initial upstream length via composite");
+
+    let (_d, full) = ds
+        .pvarray_get("GW:CMPARR:PV", 0, 0, 1)
+        .await
+        .expect("getArray through the composite must succeed");
+    assert_eq!(array_doubles(&full), vec![3.0, 6.0, 9.0]);
+
+    ds.pvarray_put("GW:CMPARR:PV", &doubles_field(&[60.0]), 1, 1)
+        .await
+        .expect("putArray through the composite must succeed");
+    let (_d, after) = ds
+        .pvarray_get("GW:CMPARR:PV", 0, 0, 1)
+        .await
+        .expect("getArray after put through the composite must succeed");
+    assert_eq!(array_doubles(&after), vec![3.0, 60.0, 9.0]);
+}
+
 /// Extract the `.value` double from an NTScalar structure (or a bare
 /// scalar).
 fn double_of(field: &PvField) -> Option<f64> {

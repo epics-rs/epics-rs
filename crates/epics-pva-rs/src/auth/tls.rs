@@ -103,6 +103,21 @@ pub enum TlsConfigError {
         "{0:?} is not a PEM bundle and PKCS#12 support is disabled (enable the `pkcs12` feature)"
     )]
     Pkcs12Disabled(PathBuf),
+    /// The loaded keychain leaf is a CA certificate, but an end-entity
+    /// certificate is required for the local TLS identity. Mirrors pvxs
+    /// `ossl.cpp:269` (`flags & EXFLAG_CA` → "Found CA Certificate when
+    /// End Entity expected").
+    #[error("keychain {0:?} leaf is a CA certificate; an end-entity certificate is required")]
+    LeafIsCa(PathBuf),
+    /// The loaded keychain leaf's `extendedKeyUsage` does not permit the
+    /// required SSL role. Mirrors pvxs `ossl.cpp:272-275`
+    /// ("extendedKeyUsage does not permit usage by SSL Client/Server").
+    #[error("keychain {path:?} leaf extendedKeyUsage does not permit usage by {role}")]
+    LeafEkuForbidsRole { path: PathBuf, role: &'static str },
+    /// The loaded keychain leaf failed to parse as X.509 for the
+    /// config-time role/CA sanity check.
+    #[error("keychain {path:?} leaf is not a valid X.509 certificate: {reason}")]
+    LeafInvalid { path: PathBuf, reason: String },
 }
 
 /// Server-side TLS configuration.
@@ -163,6 +178,13 @@ pub fn load_server_config() -> Result<Option<TlsServerConfig>, TlsConfigError> {
         ca_certs,
     } = load_keychain(&path, password.as_deref())?;
     let key = key.ok_or_else(|| TlsConfigError::NoKey(path.to_path_buf()))?;
+
+    // pvxs ossl.cpp:264-275 — config-time sanity check on the loaded
+    // server identity leaf: reject a CA cert (EXFLAG_CA) or a cert whose
+    // extendedKeyUsage forbids the SSL Server role.
+    if let Some(leaf) = certs.first() {
+        validate_leaf_cert(leaf, &path, false)?;
+    }
 
     // PVAS-priority fallback (pvxs `config.cpp:501`): server reads
     // `EPICS_PVAS_TLS_OPTIONS` first, then shared `EPICS_PVA_TLS_OPTIONS`.
@@ -265,6 +287,12 @@ pub fn load_client_config() -> Result<Option<TlsClientConfig>, TlsConfigError> {
             ca_certs,
         } = load_keychain(&path, password.as_deref())?;
         let key = key.ok_or_else(|| TlsConfigError::NoKey(path.to_path_buf()))?;
+        // pvxs ossl.cpp:264-275 — config-time sanity check on the loaded
+        // client identity leaf: reject a CA cert (EXFLAG_CA) or a cert
+        // whose extendedKeyUsage forbids the SSL Client role.
+        if let Some(leaf) = certs.first() {
+            validate_leaf_cert(leaf, &path, true)?;
+        }
         // Present leaf + carried CA chain (see server-side rationale).
         let chain: Vec<CertificateDer<'static>> = certs.into_iter().chain(ca_certs).collect();
         builder
@@ -1190,6 +1218,80 @@ fn is_self_signed_ca(der: &[u8]) -> bool {
     is_ca && cert.subject() == cert.issuer()
 }
 
+/// Validate a freshly-loaded keychain leaf certificate the way pvxs
+/// `ossl.cpp:264-275` does before installing it as the local TLS
+/// identity, a config-time fail-fast sanity check:
+///
+/// - **Reject a CA certificate** presented as the end-entity (pvxs
+///   `flags & EXFLAG_CA` → "Found CA Certificate when End Entity
+///   expected"). x509-parser surfaces this as `basicConstraints.ca`.
+/// - **Require `extendedKeyUsage` to permit the SSL role** (pvxs reads
+///   `X509_get_extended_key_usage` and rejects when the role bit is
+///   absent: `XKU_SSL_SERVER` for a server identity, `XKU_SSL_CLIENT`
+///   for a client identity). Two OpenSSL semantics matched exactly:
+///   - An **absent** EKU extension is ACCEPTED. OpenSSL's
+///     `X509_get_extended_key_usage` returns `UINT32_MAX` (all usages)
+///     when the extension is missing, so `kusage & XKU_SSL_*` is
+///     non-zero. Here `extended_key_usage()` returns `Ok(None)` for that
+///     case, which we treat as "no restriction → accept".
+///   - `anyExtendedKeyUsage` does NOT satisfy the role. OpenSSL maps it
+///     to `XKU_ANYEKU` only, never to the SSL_CLIENT/SSL_SERVER bits, so
+///     pvxs rejects an any-only EKU. We check `server_auth`/`client_auth`
+///     alone, not `any`.
+///
+/// `is_client` selects the required role (`true` = client identity).
+/// rustls/webpki validates the PEER's certificate at handshake but never
+/// the locally-loaded own leaf, so without this check a misissued CA or
+/// wrong-EKU cert installed as the local identity is silently accepted at
+/// config time and only fails (if at all) as a peer-side handshake error.
+fn validate_leaf_cert(
+    leaf: &CertificateDer<'_>,
+    path: &Path,
+    is_client: bool,
+) -> Result<(), TlsConfigError> {
+    let (_, cert) = x509_parser::parse_x509_certificate(leaf.as_ref()).map_err(|e| {
+        TlsConfigError::LeafInvalid {
+            path: path.to_path_buf(),
+            reason: e.to_string(),
+        }
+    })?;
+
+    // pvxs ossl.cpp:269 — EXFLAG_CA: a CA cert is not a valid end-entity
+    // identity. Absent basicConstraints ⇒ not a CA.
+    let is_ca = cert
+        .basic_constraints()
+        .ok()
+        .flatten()
+        .map(|bc| bc.value.ca)
+        .unwrap_or(false);
+    if is_ca {
+        return Err(TlsConfigError::LeafIsCa(path.to_path_buf()));
+    }
+
+    // pvxs ossl.cpp:272-275 — extendedKeyUsage must permit the SSL role.
+    // Absent EKU (`Ok(None)`) ⇒ accept (OpenSSL UINT32_MAX). A present
+    // EKU must carry the specific role bit; anyExtendedKeyUsage alone
+    // does not count (matches pvxs's literal XKU_SSL_* check).
+    if let Some(eku) = cert.extended_key_usage().ok().flatten() {
+        let permitted = if is_client {
+            eku.value.client_auth
+        } else {
+            eku.value.server_auth
+        };
+        if !permitted {
+            return Err(TlsConfigError::LeafEkuForbidsRole {
+                path: path.to_path_buf(),
+                role: if is_client {
+                    "SSL Client"
+                } else {
+                    "SSL Server"
+                },
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Map a verified TLS peer certificate chain to authorization
 /// credentials, mirroring pvxs `SSLContext::fill_credentials`.
 ///
@@ -2079,6 +2181,157 @@ mod tests {
         assert!(
             !is_self_signed_ca(&leaf),
             "CA-signed leaf must not be treated as root"
+        );
+    }
+
+    /// Build a self-signed DER cert with explicit CA flag and EKU set,
+    /// for the `validate_leaf_cert` boundary tests.
+    fn leaf_with(
+        cn: &str,
+        is_ca: bool,
+        ekus: &[rcgen::ExtendedKeyUsagePurpose],
+    ) -> CertificateDer<'static> {
+        let mut params =
+            rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("leaf params");
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        params.is_ca = if is_ca {
+            rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained)
+        } else {
+            rcgen::IsCa::ExplicitNoCa
+        };
+        params.extended_key_usages = ekus.to_vec();
+        let key = rcgen::KeyPair::generate().expect("leaf key");
+        let cert = params.self_signed(&key).expect("self-signed leaf");
+        CertificateDer::from(cert.der().to_vec())
+    }
+
+    /// pvxs ossl.cpp:269 — a CA certificate is rejected as the local
+    /// end-entity identity (EXFLAG_CA), regardless of role.
+    #[test]
+    fn validate_leaf_rejects_ca_certificate() {
+        let leaf = leaf_with("ca-as-identity", true, &[]);
+        let p = Path::new("ca.p12");
+        assert!(
+            matches!(
+                validate_leaf_cert(&leaf, p, false),
+                Err(TlsConfigError::LeafIsCa(_))
+            ),
+            "CA cert must be rejected as a server identity"
+        );
+        assert!(
+            matches!(
+                validate_leaf_cert(&leaf, p, true),
+                Err(TlsConfigError::LeafIsCa(_))
+            ),
+            "CA cert must be rejected as a client identity"
+        );
+    }
+
+    /// pvxs/OpenSSL: an ABSENT extendedKeyUsage is accepted
+    /// (`X509_get_extended_key_usage` returns UINT32_MAX = all usages).
+    #[test]
+    fn validate_leaf_absent_eku_is_accepted() {
+        let leaf = leaf_with("no-eku", false, &[]);
+        let p = Path::new("noeku.p12");
+        assert!(validate_leaf_cert(&leaf, p, false).is_ok(), "server");
+        assert!(validate_leaf_cert(&leaf, p, true).is_ok(), "client");
+    }
+
+    /// pvxs ossl.cpp:272-275 — a present EKU must carry the role bit:
+    /// serverAuth-only is valid as a server identity, rejected as client.
+    #[test]
+    fn validate_leaf_server_auth_eku_role_gated() {
+        let leaf = leaf_with(
+            "server-only",
+            false,
+            &[rcgen::ExtendedKeyUsagePurpose::ServerAuth],
+        );
+        let p = Path::new("srv.p12");
+        assert!(
+            validate_leaf_cert(&leaf, p, false).is_ok(),
+            "server accepts"
+        );
+        assert!(
+            matches!(
+                validate_leaf_cert(&leaf, p, true),
+                Err(TlsConfigError::LeafEkuForbidsRole {
+                    role: "SSL Client",
+                    ..
+                })
+            ),
+            "serverAuth-only must be rejected as a client identity"
+        );
+    }
+
+    /// Symmetric: clientAuth-only is valid as a client identity, rejected
+    /// as a server identity.
+    #[test]
+    fn validate_leaf_client_auth_eku_role_gated() {
+        let leaf = leaf_with(
+            "client-only",
+            false,
+            &[rcgen::ExtendedKeyUsagePurpose::ClientAuth],
+        );
+        let p = Path::new("cli.p12");
+        assert!(validate_leaf_cert(&leaf, p, true).is_ok(), "client accepts");
+        assert!(
+            matches!(
+                validate_leaf_cert(&leaf, p, false),
+                Err(TlsConfigError::LeafEkuForbidsRole {
+                    role: "SSL Server",
+                    ..
+                })
+            ),
+            "clientAuth-only must be rejected as a server identity"
+        );
+    }
+
+    /// A cert carrying both serverAuth and clientAuth is valid for both
+    /// roles.
+    #[test]
+    fn validate_leaf_both_eku_accepted_for_both_roles() {
+        let leaf = leaf_with(
+            "dual",
+            false,
+            &[
+                rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+                rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+            ],
+        );
+        let p = Path::new("dual.p12");
+        assert!(validate_leaf_cert(&leaf, p, false).is_ok(), "server");
+        assert!(validate_leaf_cert(&leaf, p, true).is_ok(), "client");
+    }
+
+    /// pvxs/OpenSSL: `anyExtendedKeyUsage` maps to `XKU_ANYEKU` only, never
+    /// the SSL_CLIENT/SSL_SERVER bits, so an any-only EKU is REJECTED for
+    /// both roles (we match the literal pvxs `XKU_SSL_*` check, not "any").
+    #[test]
+    fn validate_leaf_any_eku_only_is_rejected() {
+        let leaf = leaf_with("any-only", false, &[rcgen::ExtendedKeyUsagePurpose::Any]);
+        let p = Path::new("any.p12");
+        assert!(
+            matches!(
+                validate_leaf_cert(&leaf, p, false),
+                Err(TlsConfigError::LeafEkuForbidsRole {
+                    role: "SSL Server",
+                    ..
+                })
+            ),
+            "anyExtendedKeyUsage alone must not satisfy the server role"
+        );
+        assert!(
+            matches!(
+                validate_leaf_cert(&leaf, p, true),
+                Err(TlsConfigError::LeafEkuForbidsRole {
+                    role: "SSL Client",
+                    ..
+                })
+            ),
+            "anyExtendedKeyUsage alone must not satisfy the client role"
         );
     }
 

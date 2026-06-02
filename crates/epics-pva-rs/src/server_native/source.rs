@@ -603,6 +603,160 @@ pub trait ChannelSource: Send + Sync + 'static {
         }
     }
 
+    // ── ChannelArray (PVA cmd 14) operation surface ────────────────────
+    //
+    // ChannelArray is the windowed array operation: an INIT binds an
+    // array-typed field of the PV, then `get`/`put` transfer a
+    // `[offset, count, stride]` slice and `getLength`/`setLength` query or
+    // resize it (pvAccessCPP `responseHandlers.cpp:2115-2208`,
+    // `clientContextImpl.cpp:1567-1666`). pvxs has no server-side
+    // ChannelArray handler at all — its connection dispatch drops CMD_ARRAY
+    // into the `default:` "ignore unexpected command" arm
+    // (`conn.cpp:248-253`), so a client hangs. These methods give every
+    // source a *defined* answer instead: the default rejects with a
+    // protocol `Status` error (no silent drop), and the wire layer always
+    // replies. A source that genuinely serves windowed arrays (the PVA
+    // gateway forwarding to an upstream pvAccessCPP IOC; pva2pva
+    // `GWChannel::createChannelArray`, `p2pApp/channel.cpp:226-232`)
+    // overrides them.
+    //
+    // The INIT pvRequest (which selects the array field) is threaded to
+    // every sub-op through [`ChannelContext::pv_request`] — the wire layer
+    // stashes it at INIT and re-supplies it on each get/put/length call —
+    // so the trait stays stateless per call, matching how PROCESS / PUT_GET
+    // forward their create-time `record._options`.
+
+    /// ChannelArray INIT — bind the array-typed field this operation
+    /// windows over and return its [`FieldDesc`] introspection (serialised
+    /// into the INIT reply, pvAccessCPP `responseHandlers.cpp:2381-2385`
+    /// `cachedSerialize(_pvArray->getArray())`). `ctx.pv_request` carries
+    /// the decoded INIT pvRequest selecting the field. The default refuses:
+    /// the source serves no windowed array, so the wire layer answers the
+    /// client with the returned error as an INIT `Status::error` rather than
+    /// dropping the frame.
+    fn channel_array_init(
+        &self,
+        name: &str,
+        ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Result<FieldDesc, OpError>> + Send {
+        let _ = (name, ctx);
+        async {
+            Err(OpError::failed(
+                "channel array not supported by this source",
+            ))
+        }
+    }
+
+    /// ChannelArray `getArray` — return the `[offset, count, stride]` slice
+    /// of the bound array as a [`PvField`] (pvAccessCPP
+    /// `responseHandlers.cpp:2172-2178`). READ-gated: a token without read
+    /// access is refused. `count == 0` means "to the end of the array"
+    /// (pvAccessCPP `getArray` API contract). Default refuses after the
+    /// read gate.
+    fn channel_array_get(
+        &self,
+        checked: AccessChecked,
+        offset: u32,
+        count: u32,
+        stride: u32,
+        ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Result<PvField, OpError>> + Send {
+        async move {
+            if !checked.allows_read() {
+                return Err(OpError::denied(format!(
+                    "ARRAY get denied by access security: '{}' from {}/{}/{}",
+                    checked.pv_name(),
+                    ctx.host,
+                    ctx.account,
+                    ctx.method,
+                )));
+            }
+            let _ = (offset, count, stride);
+            Err(OpError::failed(
+                "channel array get not supported by this source",
+            ))
+        }
+    }
+
+    /// ChannelArray `putArray` — splice `value` into the bound array at
+    /// `offset` with `stride` (pvAccessCPP `responseHandlers.cpp:2190-2206`).
+    /// WRITE-gated. Default refuses after the write gate.
+    fn channel_array_put(
+        &self,
+        checked: AccessChecked,
+        offset: u32,
+        stride: u32,
+        value: PvField,
+        ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+        async move {
+            if !checked.allows_write() {
+                return Err(OpError::denied(format!(
+                    "ARRAY put denied by access security: '{}' from {}/{}/{}",
+                    checked.pv_name(),
+                    ctx.host,
+                    ctx.account,
+                    ctx.method,
+                )));
+            }
+            let _ = (offset, stride, value);
+            Err(OpError::failed(
+                "channel array put not supported by this source",
+            ))
+        }
+    }
+
+    /// ChannelArray `setLength` — resize the bound array (pvAccessCPP
+    /// `responseHandlers.cpp:2180-2184`). WRITE-gated. Default refuses after
+    /// the write gate.
+    fn channel_array_set_length(
+        &self,
+        checked: AccessChecked,
+        length: u32,
+        ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+        async move {
+            if !checked.allows_write() {
+                return Err(OpError::denied(format!(
+                    "ARRAY setLength denied by access security: '{}' from {}/{}/{}",
+                    checked.pv_name(),
+                    ctx.host,
+                    ctx.account,
+                    ctx.method,
+                )));
+            }
+            let _ = length;
+            Err(OpError::failed(
+                "channel array setLength not supported by this source",
+            ))
+        }
+    }
+
+    /// ChannelArray `getLength` — return the current element count of the
+    /// bound array (pvAccessCPP `responseHandlers.cpp:2186-2188`,
+    /// `:2376-2380` `writeSize(_length)`). READ-gated. Default refuses after
+    /// the read gate.
+    fn channel_array_get_length(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Result<u32, OpError>> + Send {
+        async move {
+            if !checked.allows_read() {
+                return Err(OpError::denied(format!(
+                    "ARRAY getLength denied by access security: '{}' from {}/{}/{}",
+                    checked.pv_name(),
+                    ctx.host,
+                    ctx.account,
+                    ctx.method,
+                )));
+            }
+            Err(OpError::failed(
+                "channel array getLength not supported by this source",
+            ))
+        }
+    }
+
     /// True iff PUT is allowed against this PV (for ACL gating).
     fn is_writable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send;
 
@@ -1326,6 +1480,43 @@ pub trait ChannelSourceObj: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Option<PvField>, OpError>> + Send + 'a>,
     >;
+    /// Dyn forwarder for ChannelArray INIT.
+    fn channel_array_init<'a>(
+        &'a self,
+        name: &'a str,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<FieldDesc, OpError>> + Send + 'a>>;
+    /// Dyn forwarder for ChannelArray `getArray`.
+    fn channel_array_get<'a>(
+        &'a self,
+        checked: AccessChecked,
+        offset: u32,
+        count: u32,
+        stride: u32,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<PvField, OpError>> + Send + 'a>>;
+    /// Dyn forwarder for ChannelArray `putArray`.
+    fn channel_array_put<'a>(
+        &'a self,
+        checked: AccessChecked,
+        offset: u32,
+        stride: u32,
+        value: PvField,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>>;
+    /// Dyn forwarder for ChannelArray `setLength`.
+    fn channel_array_set_length<'a>(
+        &'a self,
+        checked: AccessChecked,
+        length: u32,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>>;
+    /// Dyn forwarder for ChannelArray `getLength`.
+    fn channel_array_get_length<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u32, OpError>> + Send + 'a>>;
     fn is_writable<'a>(
         &'a self,
         name: &'a str,
@@ -1578,6 +1769,59 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     > {
         Box::pin(<Self as ChannelSource>::put_get_checked(
             self, checked, desc, changed, delta, ctx,
+        ))
+    }
+    fn channel_array_init<'a>(
+        &'a self,
+        name: &'a str,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<FieldDesc, OpError>> + Send + 'a>>
+    {
+        Box::pin(<Self as ChannelSource>::channel_array_init(self, name, ctx))
+    }
+    fn channel_array_get<'a>(
+        &'a self,
+        checked: AccessChecked,
+        offset: u32,
+        count: u32,
+        stride: u32,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<PvField, OpError>> + Send + 'a>>
+    {
+        Box::pin(<Self as ChannelSource>::channel_array_get(
+            self, checked, offset, count, stride, ctx,
+        ))
+    }
+    fn channel_array_put<'a>(
+        &'a self,
+        checked: AccessChecked,
+        offset: u32,
+        stride: u32,
+        value: PvField,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>> {
+        Box::pin(<Self as ChannelSource>::channel_array_put(
+            self, checked, offset, stride, value, ctx,
+        ))
+    }
+    fn channel_array_set_length<'a>(
+        &'a self,
+        checked: AccessChecked,
+        length: u32,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OpError>> + Send + 'a>> {
+        Box::pin(<Self as ChannelSource>::channel_array_set_length(
+            self, checked, length, ctx,
+        ))
+    }
+    fn channel_array_get_length<'a>(
+        &'a self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u32, OpError>> + Send + 'a>>
+    {
+        Box::pin(<Self as ChannelSource>::channel_array_get_length(
+            self, checked, ctx,
         ))
     }
     fn is_writable<'a>(

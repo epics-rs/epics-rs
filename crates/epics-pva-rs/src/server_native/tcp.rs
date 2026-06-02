@@ -1549,6 +1549,11 @@ enum OpKind {
     PutGet,
     /// PVA `PROCESS` (cmd 16): trigger record processing, no value.
     Process,
+    /// PVA `ARRAY` (cmd 14): ChannelArray windowed-array operation
+    /// (INIT binds an array field, then get/put a `[offset,count,stride]`
+    /// slice or get/set its length). pvAccessCPP
+    /// `responseHandlers.cpp:2115-2208`.
+    Array,
     /// PVA `GET_FIELD` (cmd 17): one-shot introspection. pvxs models this
     /// as a real `ServerIntrospect` op in `opByIOID`
     /// (serverintrospect.cpp:141-178); the Rust slow path reserves its
@@ -1567,6 +1572,7 @@ impl OpKind {
             OpKind::Rpc => Command::Rpc,
             OpKind::PutGet => Command::PutGet,
             OpKind::Process => Command::Process,
+            OpKind::Array => Command::Array,
             OpKind::GetField => Command::GetField,
         }
     }
@@ -3039,6 +3045,31 @@ async fn handle_connection_io(
                 )
                 .await?;
             }
+            Some(Command::Array) => {
+                // ChannelArray windowed-array op (PVA cmd 14). Full
+                // INIT / getArray / putArray / setLength / getLength /
+                // DESTROY lifecycle routed through the source's
+                // `channel_array_*` methods (READ/WRITE-class ACF gates).
+                // Pre-fix this command had no arm and the frame fell
+                // through to the silent default — a ChannelArray client
+                // hung waiting for the INIT reply. The default source
+                // impl rejects with a protocol `Status` error so the
+                // client always gets an answer.
+                peer_entry.op_init();
+                handle_channel_array(
+                    &frame,
+                    &tx,
+                    &mut channels,
+                    order,
+                    &config,
+                    &mut encode_type_cache,
+                    &mut rx_type_cache,
+                    peer,
+                    &cred,
+                    &exec_fin_tx,
+                )
+                .await?;
+            }
             Some(Command::OriginTag) => {
                 // I-5: pvxs origin-tag is an optional payload for
                 // tracing/debugging that the spec lets servers
@@ -3926,6 +3957,379 @@ async fn handle_process(
     // (see [`finish_exec_data_task`]).
     finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
     Ok(())
+}
+
+/// One decoded ChannelArray data-phase sub-operation, selected by the
+/// `subcmd` QOS bits (pvAccessCPP `responseHandlers.cpp:2148-2207`). The
+/// windowing parameters and put value are decoded from the frame *before*
+/// the exec task is spawned, so the task moves owned values rather than
+/// borrowing the frame cursor.
+enum ChannelArraySubOp {
+    /// `getArray` (`QOS_GET`): read the `[offset, count, stride]` slice.
+    Get {
+        offset: u32,
+        count: u32,
+        stride: u32,
+    },
+    /// `putArray` (no get/length bits): splice `value` at `offset`/`stride`.
+    Put {
+        offset: u32,
+        stride: u32,
+        value: PvField,
+    },
+    /// `setLength` (`QOS_GET_PUT`): resize to `length`.
+    SetLength { length: u32 },
+    /// `getLength` (`QOS_PROCESS`): query the current element count.
+    GetLength,
+}
+
+/// The success body a ChannelArray sub-op contributes to its reply after
+/// the leading `ioid + subcmd + Status` (pvAccessCPP
+/// `responseHandlers.cpp:2368-2385`).
+enum ChannelArrayReply {
+    /// `putArray` / `setLength`: status only, no trailing body.
+    Empty,
+    /// `getArray`: the sliced array value, serialised full (no BitSet).
+    Value(PvField),
+    /// `getLength`: the element count as a PVA `Size`.
+    Length(u32),
+}
+
+/// PVA `ARRAY` (cmd 14) handler — ChannelArray windowed-array operation.
+///
+/// Sub-command lifecycle (QOS bits, pvAccessCPP
+/// `responseHandlers.cpp:2115-2208` request decode /
+/// `:2347-2393` reply encode; client `clientContextImpl.cpp:1567-1666`):
+/// - INIT (`QOS_INIT 0x08`): decode the pvRequest selecting the array
+///   field, call [`ChannelSource::channel_array_init`], and reply
+///   `ioid + subcmd + status [+ array introspection]`. The default source
+///   refuses with a protocol `Status` error — the client always gets an
+///   answer, never the pre-fix silent drop.
+/// - getArray (`QOS_GET 0x40`): `offset + count + stride` → READ-gated
+///   [`ChannelSource::channel_array_get`] → `status + array value`.
+/// - setLength (`QOS_GET_PUT 0x80`): `length` → WRITE-gated
+///   [`ChannelSource::channel_array_set_length`] → `status`.
+/// - getLength (`QOS_PROCESS 0x04`): no payload → READ-gated
+///   [`ChannelSource::channel_array_get_length`] → `status + length`.
+/// - putArray (no get/length bits): `offset + stride + array value` →
+///   WRITE-gated [`ChannelSource::channel_array_put`] → `status`.
+///
+/// The op stays alive across sub-ops (pvAccessCPP keeps one
+/// `ChannelArray`), reusing the same `begin_exec` / `ExecFinishGuard` /
+/// `finish_exec_data_task` completion owner GET/PUT/PROCESS use; a
+/// `QOS_DESTROY 0x10` rider on any sub-op frees the op after its reply.
+/// The INIT pvRequest is stashed in the op state and re-supplied on every
+/// sub-op through `ChannelContext.pv_request`, so the source knows which
+/// array field to act on without the trait holding per-op state.
+#[allow(clippy::too_many_arguments)]
+async fn handle_channel_array(
+    frame: &Frame,
+    tx: &SrvTx,
+    channels: &mut HashMap<u32, ChannelState>,
+    order: ByteOrder,
+    config: &PvaServerConfig,
+    encode_cache: &mut EncodeTypeCache,
+    decode_cache: &mut TypeCache,
+    peer: std::net::SocketAddr,
+    cred: &ClientCredentials,
+    exec_fin_tx: &mpsc::UnboundedSender<ExecFinished>,
+) -> PvaResult<()> {
+    // Inbound payload decodes with the frame's own header order; `order`
+    // (config) drives only outbound reply frames (see [`handle_process`]).
+    let inbound_order = frame.order();
+    let mut cur = frame.cursor();
+    let sid = cur
+        .get_u32(inbound_order)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
+    let ioid = cur
+        .get_u32(inbound_order)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
+    let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
+
+    let dup_ioid = subcmd & QosFlags::INIT != 0 && ioid_live_on_conn(channels, ioid);
+
+    let ch = match channels.get_mut(&sid) {
+        Some(c) => c,
+        None => {
+            send_op_error(
+                tx,
+                OpKind::Array,
+                ioid,
+                subcmd,
+                "unknown channel sid",
+                order,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    ch.stat.add_rx(frame.payload.len());
+    let chan_tx = ChannelTx::new(tx.clone(), ch.stat.clone());
+
+    // Dispatch to the CREATE_CHANNEL-bound owner, not the registry.
+    let source = ch.source.clone();
+    let source = &source;
+    let pv_name = ch.name.clone();
+
+    if subcmd & QosFlags::INIT != 0 {
+        if dup_ioid {
+            return Err(PvaError::Decode(format!(
+                "duplicate ARRAY INIT on live IOID {ioid}"
+            )));
+        }
+        if ch.ops.len() >= config.max_ops_per_channel {
+            send_chan_op_error(
+                &chan_tx,
+                OpKind::Array,
+                ioid,
+                subcmd,
+                "max ops per channel exceeded",
+                order,
+            )
+            .await?;
+            return Ok(());
+        }
+        // Decode the pvRequest selecting the array field, through the same
+        // structured boundary as GET/PUT/PROCESS INIT. A present-but-
+        // malformed descriptor or value is a connection-fatal peer wire
+        // fault (pvxs `from_wire_type_value`); an absent body is tolerated.
+        let req_desc = match decode_type_desc_cached(&mut cur, inbound_order, decode_cache) {
+            Ok(d) => d,
+            Err(e) => {
+                return Err(PvaError::Decode(format!(
+                    "ARRAY INIT pvRequest descriptor: {e}"
+                )));
+            }
+        };
+        let req_value =
+            match decode_init_pv_request_value(&mut cur, &req_desc, inbound_order, decode_cache) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(PvaError::Decode(format!("ARRAY INIT pvRequest value: {e}")));
+                }
+            };
+        let ctx = crate::server_native::source::ChannelContext {
+            peer,
+            account: cred.account.clone(),
+            method: cred.method.clone(),
+            host: cred.host.clone(),
+            authority: cred.authority.clone(),
+            roles: cred.roles.clone(),
+            pv_request: req_value.clone(),
+        };
+        // INIT resolves the array field's introspection (or refuses). No
+        // access check here — pvAccessCPP gates per sub-op, not at create.
+        match source.channel_array_init(&pv_name, ctx).await {
+            Ok(array_desc) => {
+                let mask = BitSet::all_set(array_desc.total_bits());
+                let mut array_op = non_monitor_op_state(array_desc.clone(), OpKind::Array, mask);
+                array_op.pv_request = req_value;
+                ch.ops.insert(ioid, array_op);
+
+                let mut payload = Vec::new();
+                payload.put_u32(ioid, order);
+                payload.put_u8(subcmd);
+                Status::ok().write_into(order, &mut payload);
+                // INIT reply carries the array introspection
+                // (pvAccessCPP `cachedSerialize(_pvArray->getArray())`).
+                if config.emit_type_cache {
+                    encode_type_desc_cached(&array_desc, order, encode_cache, &mut payload);
+                } else {
+                    encode_type_desc(&array_desc, order, &mut payload);
+                }
+                let h = PvaHeader::application(
+                    true,
+                    order,
+                    Command::Array.code(),
+                    payload.len() as u32,
+                );
+                let mut buf = Vec::new();
+                h.write_into(&mut buf);
+                buf.extend_from_slice(&payload);
+                let _ = chan_tx.send(buf).await;
+            }
+            Err(e) => {
+                // Not supported / resolution failure: reply with the error
+                // Status on the INIT frame (pvAccessCPP `send`: a creation
+                // error still answers QOS_INIT). No op registered.
+                send_chan_op_error(&chan_tx, OpKind::Array, ioid, subcmd, &e.message, order)
+                    .await?;
+            }
+        }
+        return Ok(());
+    }
+
+    // Data phase. Bind to the INIT-registered op (kind must match).
+    let init_pv_request = match ch.ops.get(&ioid) {
+        None => {
+            // DESTROY_REQUEST race — drop silently, as the other handlers do.
+            return Ok(());
+        }
+        Some(o) => {
+            if o.kind != OpKind::Array {
+                return Err(PvaError::Decode(format!(
+                    "ARRAY data-phase frame for IOID {ioid} initialised as {:?} \
+                     (pvxs serverget.cpp:421-436 protocol error)",
+                    o.kind
+                )));
+            }
+            o.pv_request.clone()
+        }
+    };
+    // Array introspection bound at INIT — drives the put-value decode and
+    // the get-value encode.
+    let array_desc = ch
+        .ops
+        .get(&ioid)
+        .map(|o| o.intro.clone())
+        .expect("op present");
+
+    // Decode the sub-op + its windowing params from the frame body now,
+    // before the borrow of `cur` ends and the exec task is spawned. A
+    // truncated size / value is a connection-fatal wire fault.
+    let sub_op = if subcmd & QosFlags::GET != 0 {
+        let offset = read_array_size(&mut cur, inbound_order, "getArray offset")?;
+        let count = read_array_size(&mut cur, inbound_order, "getArray count")?;
+        let stride = read_array_size(&mut cur, inbound_order, "getArray stride")?;
+        ChannelArraySubOp::Get {
+            offset,
+            count,
+            stride,
+        }
+    } else if subcmd & QosFlags::GET_PUT != 0 {
+        let length = read_array_size(&mut cur, inbound_order, "setLength length")?;
+        ChannelArraySubOp::SetLength { length }
+    } else if subcmd & QosFlags::PROCESS != 0 {
+        ChannelArraySubOp::GetLength
+    } else {
+        let offset = read_array_size(&mut cur, inbound_order, "putArray offset")?;
+        let stride = read_array_size(&mut cur, inbound_order, "putArray stride")?;
+        let value = decode_pv_field_cached(&array_desc, &mut cur, inbound_order, decode_cache)
+            .map_err(|e| PvaError::Decode(format!("ARRAY putArray value: {e}")))?;
+        ChannelArraySubOp::Put {
+            offset,
+            stride,
+            value,
+        }
+    };
+
+    let ctx = crate::server_native::source::ChannelContext {
+        peer,
+        account: cred.account.clone(),
+        method: cred.method.clone(),
+        host: cred.host.clone(),
+        authority: cred.authority.clone(),
+        roles: cred.roles.clone(),
+        // INIT pvRequest re-supplied so the source knows the bound field.
+        pv_request: init_pv_request,
+    };
+    let src = source.clone();
+    let tx_clone = chan_tx.clone();
+    // Run this sub-op only when the op is `Idle`; ignore a second EXEC while
+    // one is in flight rather than aborting it (pvxs serverget.cpp:511-514).
+    let op_id = match begin_exec(ch, ioid) {
+        Some(id) => id,
+        None => {
+            debug!(ioid, "ARRAY sub-op ignored: op already executing");
+            return Ok(());
+        }
+    };
+    let exec_fin = ExecFinished { sid, ioid, op_id };
+    let exec_fin_tx_task = exec_fin_tx.clone();
+    let join = tokio::spawn(async move {
+        let _exec_fin_guard = ExecFinishGuard {
+            tx: exec_fin_tx_task,
+            fin: exec_fin,
+        };
+        let checked = src
+            .access_gate()
+            .check_with_roles(
+                &pv_name,
+                &ctx.host,
+                &ctx.account,
+                &ctx.roles,
+                &ctx.method,
+                &ctx.authority,
+            )
+            .await;
+        // A panic in the (user / gateway) source handler becomes an error
+        // reply instead of a skipped reply.
+        let result: Result<ChannelArrayReply, OpError> = match sub_op {
+            ChannelArraySubOp::Get {
+                offset,
+                count,
+                stride,
+            } => catch_handler_panic(src.channel_array_get(checked, offset, count, stride, ctx))
+                .await
+                .map_err(OpError::failed)
+                .and_then(|r| r)
+                .map(ChannelArrayReply::Value),
+            ChannelArraySubOp::Put {
+                offset,
+                stride,
+                value,
+            } => catch_handler_panic(src.channel_array_put(checked, offset, stride, value, ctx))
+                .await
+                .map_err(OpError::failed)
+                .and_then(|r| r)
+                .map(|()| ChannelArrayReply::Empty),
+            ChannelArraySubOp::SetLength { length } => {
+                catch_handler_panic(src.channel_array_set_length(checked, length, ctx))
+                    .await
+                    .map_err(OpError::failed)
+                    .and_then(|r| r)
+                    .map(|()| ChannelArrayReply::Empty)
+            }
+            ChannelArraySubOp::GetLength => {
+                catch_handler_panic(src.channel_array_get_length(checked, ctx))
+                    .await
+                    .map_err(OpError::failed)
+                    .and_then(|r| r)
+                    .map(ChannelArrayReply::Length)
+            }
+        };
+
+        let mut payload = Vec::new();
+        payload.put_u32(ioid, order);
+        payload.put_u8(subcmd);
+        match result {
+            Ok(reply) => {
+                Status::ok().write_into(order, &mut payload);
+                match reply {
+                    ChannelArrayReply::Empty => {}
+                    ChannelArrayReply::Value(v) => {
+                        encode_pv_field(&v, &array_desc, order, &mut payload);
+                    }
+                    ChannelArrayReply::Length(n) => {
+                        encode_size_into(n, order, &mut payload);
+                    }
+                }
+            }
+            Err(e) => Status::error(e.message).write_into(order, &mut payload),
+        }
+        let h = PvaHeader::application(true, order, Command::Array.code(), payload.len() as u32);
+        let mut buf = Vec::new();
+        h.write_into(&mut buf);
+        buf.extend_from_slice(&payload);
+        let _ = tx_clone.send(buf).await;
+    });
+    finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
+    Ok(())
+}
+
+/// Read one PVA `Size` from a ChannelArray data-phase body, mapping the
+/// null marker / truncation to a connection-fatal decode error (a
+/// ChannelArray offset/count/stride/length is never the nullable form).
+fn read_array_size(
+    cur: &mut std::io::Cursor<&[u8]>,
+    order: ByteOrder,
+    what: &str,
+) -> PvaResult<u32> {
+    match crate::proto::decode_size(cur, order) {
+        Ok(Some(n)) => Ok(n),
+        Ok(None) => Err(PvaError::Decode(format!("ARRAY {what}: null size marker"))),
+        Err(e) => Err(PvaError::Decode(format!("ARRAY {what}: {e}"))),
+    }
 }
 
 async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
@@ -6582,9 +6986,9 @@ async fn handle_op(
         // PUT_GET / PROCESS / GET_FIELD have dedicated handlers
         // (`handle_put_get`, `handle_process`, `handle_get_field`) and are
         // never dispatched into `handle_op`.
-        OpKind::PutGet | OpKind::Process | OpKind::GetField => {
+        OpKind::PutGet | OpKind::Process | OpKind::Array | OpKind::GetField => {
             unreachable!(
-                "PUT_GET / PROCESS / GET_FIELD are routed to their own handlers, not handle_op"
+                "PUT_GET / PROCESS / ARRAY / GET_FIELD are routed to their own handlers, not handle_op"
             )
         }
     }

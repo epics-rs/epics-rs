@@ -110,7 +110,22 @@ impl PvaCodec {
     ) -> Vec<u8> {
         let order = self.order();
         let flags: u8 = if unicast { 0x80 } else { 0x00 };
-        let addr = ip_to_bytes(IpAddr::V4(Ipv4Addr::from(response_addr)));
+        // pvxs `tickSearch` writes the search-response address as
+        // `IN6ADDR_ANY_INIT` — 16 raw zero bytes (`::`) — directly, NOT
+        // through `to_wire(SockAddr)` (client.cpp:1082-1085). So a wildcard
+        // response address must be raw zeros, not the IPv4-mapped
+        // `::ffff:0.0.0.0` that `ip_to_bytes` produces for an AF_INET
+        // address. A concrete (relay-substituted) responder address keeps
+        // the v4-mapped form, matching pvxs `to_wire(SockAddr)`
+        // (evhelper.cpp:896-901). The server SEARCH_RESPONSE / beacon addr
+        // fields are a separate path: pvxs writes `to_wire(SockAddr::
+        // any(AF_INET))` there, which IS v4-mapped — see
+        // `build_search_response_proto`/`build_beacon`.
+        let addr = if response_addr == [0, 0, 0, 0] {
+            [0u8; 16]
+        } else {
+            ip_to_bytes(IpAddr::V4(Ipv4Addr::from(response_addr)))
+        };
 
         let mut p = Vec::new();
         p.put_u32(sequence_id, order);
@@ -395,6 +410,40 @@ mod tests {
         assert_eq!(bytes[1], PVA_VERSION);
         assert_eq!(bytes[2] & 0x80, 0); // little-endian
         assert_eq!(bytes[3], CMD_SEARCH);
+    }
+
+    #[test]
+    fn search_wildcard_response_addr_is_in6addr_any_raw_zeros() {
+        // pvxs writes the search response-address field as IN6ADDR_ANY —
+        // 16 raw zero bytes — directly (client.cpp:1082-1085), NOT the
+        // IPv4-mapped `::ffff:0.0.0.0` that an AF_INET addr would produce
+        // through `to_wire(SockAddr)`. The addr field sits at frame[16..32]
+        // (header 8 + seq 4 + flags 1 + reserved 3).
+        let bytes = codec(false).build_search_batch(
+            0x6669_6e64,
+            &[(7, "MY:PV")],
+            [0, 0, 0, 0],
+            5076,
+            false,
+        );
+        assert_eq!(
+            &bytes[16..32],
+            &[0u8; 16],
+            "wildcard response addr must be 16 raw zeros (IN6ADDR_ANY), not v4-mapped"
+        );
+
+        // A concrete responder address keeps the v4-mapped form, matching
+        // pvxs `to_wire(SockAddr)` (evhelper.cpp:896-901).
+        let bytes = codec(false).build_search_batch(
+            0x6669_6e64,
+            &[(7, "MY:PV")],
+            [192, 168, 1, 5],
+            5076,
+            false,
+        );
+        assert_eq!(&bytes[16..26], &[0u8; 10]);
+        assert_eq!(&bytes[26..28], &[0xff, 0xff]);
+        assert_eq!(&bytes[28..32], &[192, 168, 1, 5]);
     }
 
     #[test]

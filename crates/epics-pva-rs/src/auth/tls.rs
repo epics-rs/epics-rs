@@ -147,11 +147,16 @@ pub fn load_server_config() -> Result<Option<TlsServerConfig>, TlsConfigError> {
     let Some(keychain) = crate::config::env::server_tls_keychain() else {
         return Ok(None);
     };
-    let path = PathBuf::from(keychain);
-
-    // PKCS#12 keychains carry the password from the env; PEM keys in
-    // our pipeline are unencrypted so the password is harmless there.
-    let password = crate::config::env::server_tls_keychain_password();
+    // pvxs (`ossl.cpp:232-238`) splits the keychain spec at the first
+    // `;`: the path precedes it, the PKCS#12 password follows. The
+    // inline suffix is the pvxs source of truth and takes precedence;
+    // the non-pvxs EPICS_PVAS/PVA_TLS_KEYCHAIN_PASSWORD env var is a
+    // Rust-only fallback consulted only when the spec carries no `;`.
+    // (PEM keys in our pipeline are unencrypted, so the password is
+    // harmless there.)
+    let (keychain_path, inline_password) = crate::config::env::split_keychain_spec(&keychain);
+    let path = PathBuf::from(keychain_path);
+    let password = inline_password.or_else(crate::config::env::server_tls_keychain_password);
     let Keychain {
         certs,
         key,
@@ -231,8 +236,11 @@ pub fn load_client_config() -> Result<Option<TlsClientConfig>, TlsConfigError> {
     if let Ok(ca_path) = std::env::var("EPICS_PVA_TLS_CA_KEYCHAIN") {
         // PVA-466: expand $(VAR) / ${VAR} in path env.
         let ca_path = crate::config::env::expand_dollar_vars(&ca_path);
-        let path = PathBuf::from(&ca_path);
-        let password = crate::config::env::client_tls_keychain_password();
+        // pvxs splits the keychain spec at the first `;` (`ossl.cpp:232-238`):
+        // inline password wins; the env var is the non-pvxs fallback.
+        let (ca_keychain_path, inline_password) = crate::config::env::split_keychain_spec(&ca_path);
+        let path = PathBuf::from(&ca_keychain_path);
+        let password = inline_password.or_else(crate::config::env::client_tls_keychain_password);
         // A CA keychain may have no private key (PEM cert-only or a
         // PKCS#12 trust store) — that is fine, we only want the certs.
         let kc = load_keychain(&path, password.as_deref())?;
@@ -246,8 +254,11 @@ pub fn load_client_config() -> Result<Option<TlsClientConfig>, TlsConfigError> {
     let config = if let Ok(keychain) = std::env::var("EPICS_PVA_TLS_KEYCHAIN") {
         // PVA-466: expand $(VAR) / ${VAR} in path env.
         let keychain = crate::config::env::expand_dollar_vars(&keychain);
-        let path = PathBuf::from(keychain);
-        let password = crate::config::env::client_tls_keychain_password();
+        // pvxs splits the keychain spec at the first `;` (`ossl.cpp:232-238`):
+        // inline password wins; the env var is the non-pvxs fallback.
+        let (keychain_path, inline_password) = crate::config::env::split_keychain_spec(&keychain);
+        let path = PathBuf::from(keychain_path);
+        let password = inline_password.or_else(crate::config::env::client_tls_keychain_password);
         let Keychain {
             certs,
             key,
@@ -1807,6 +1818,68 @@ mod tests {
              verifier (request + verify-if-present); the pre-fix no_client_auth \
              path left trust_roots empty and never requested a client cert"
         );
+    }
+
+    /// Regression: pvxs (`ossl.cpp:232-238`) sources the PKCS#12 password
+    /// from the `;password` suffix of the keychain spec. A pvxs-style
+    /// `EPICS_PVAS_TLS_KEYCHAIN=<path>;<password>` with NO separate
+    /// `_PASSWORD` env var must open. Pre-fix the whole `<path>;<password>`
+    /// string was fed to `PathBuf::from`, so the file never opened.
+    #[test]
+    #[cfg(feature = "pkcs12")]
+    #[serial(epics_env)]
+    fn server_config_inline_keychain_password_splits_at_semicolon() {
+        let pem = gen_self_signed("epics-pkcs12-server");
+        let Some(p12) = make_p12(&pem, None, "kc-pw") else {
+            eprintln!("skipping: `openssl` not available");
+            return;
+        };
+        let (_dir, path) = write_temp(&p12);
+        let spec = format!("{};kc-pw", path.to_str().unwrap());
+
+        // Inline `;password`, NO separate _PASSWORD env var.
+        let _g = EnvGuard::set(&[
+            ("EPICS_PVAS_TLS_KEYCHAIN", Some(spec.as_str())),
+            ("EPICS_PVAS_TLS_KEYCHAIN_PASSWORD", None),
+            ("EPICS_PVA_TLS_KEYCHAIN_PASSWORD", None),
+            ("EPICS_PVA_TLS_DISABLE", None),
+            ("EPICS_PVAS_TLS_OPTIONS", None),
+            ("EPICS_PVA_TLS_OPTIONS", None),
+        ]);
+        let cfg = load_server_config()
+            .expect("inline `;password` keychain spec must open (pvxs ossl.cpp:232-238)")
+            .expect("Some(config)");
+        assert!(!cfg.require_client_cert);
+    }
+
+    /// The inline `;password` suffix is the pvxs source of truth and takes
+    /// precedence over the non-pvxs `_PASSWORD` env fallback: a correct
+    /// inline password opens even when a WRONG `_PASSWORD` env var is set.
+    #[test]
+    #[cfg(feature = "pkcs12")]
+    #[serial(epics_env)]
+    fn server_config_inline_keychain_password_beats_env_fallback() {
+        let pem = gen_self_signed("epics-pkcs12-server");
+        let Some(p12) = make_p12(&pem, None, "kc-pw") else {
+            eprintln!("skipping: `openssl` not available");
+            return;
+        };
+        let (_dir, path) = write_temp(&p12);
+        let spec = format!("{};kc-pw", path.to_str().unwrap());
+
+        let _g = EnvGuard::set(&[
+            ("EPICS_PVAS_TLS_KEYCHAIN", Some(spec.as_str())),
+            // Wrong env-var password: inline must win, so this is ignored.
+            ("EPICS_PVAS_TLS_KEYCHAIN_PASSWORD", Some("not-the-password")),
+            ("EPICS_PVA_TLS_KEYCHAIN_PASSWORD", None),
+            ("EPICS_PVA_TLS_DISABLE", None),
+            ("EPICS_PVAS_TLS_OPTIONS", None),
+            ("EPICS_PVA_TLS_OPTIONS", None),
+        ]);
+        let cfg = load_server_config()
+            .expect("inline password must take precedence over the env fallback")
+            .expect("Some(config)");
+        assert!(!cfg.require_client_cert);
     }
 
     #[test]

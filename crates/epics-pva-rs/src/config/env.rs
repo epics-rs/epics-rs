@@ -695,16 +695,20 @@ pub fn tls_handshake_timeout_secs_opt() -> Option<f64> {
         .map(|v| v.max(1.0))
 }
 
-/// Keychain password for a server-side TLS keychain.
+/// Non-pvxs fallback password for a server-side TLS keychain.
 ///
-/// Reads `EPICS_PVAS_TLS_KEYCHAIN_PASSWORD`, falling back to
-/// `EPICS_PVA_TLS_KEYCHAIN_PASSWORD` when the server-specific form is
-/// unset — matching pvxs's `Config::server()` env fallback chain.
-/// `$(VAR)` / `${VAR}` refs are expanded (PVA-466 parity) so operators
-/// can template `EPICS_PVAS_TLS_KEYCHAIN_PASSWORD="$(SECRET_DIR)/..."`
-/// style indirections. Returns `None` when neither variable is set;
-/// an empty string is preserved as `Some("")` (a deliberately
-/// password-less PKCS#12 is distinct from "unset").
+/// pvxs has no `*_TLS_KEYCHAIN_PASSWORD` variable: it sources the
+/// PKCS#12 password solely from the `;password` suffix of the keychain
+/// spec (`ossl.cpp:232-238`, see [`split_keychain_spec`]). This helper
+/// is a Rust-only convenience consulted ONLY when the keychain spec
+/// carries no inline `;` suffix. It reads
+/// `EPICS_PVAS_TLS_KEYCHAIN_PASSWORD`, falling back to
+/// `EPICS_PVA_TLS_KEYCHAIN_PASSWORD`. `$(VAR)` / `${VAR}` refs are
+/// expanded (PVA-466) so operators can template
+/// `EPICS_PVAS_TLS_KEYCHAIN_PASSWORD="$(SECRET_DIR)/..."` style
+/// indirections. Returns `None` when neither variable is set; an empty
+/// string is preserved as `Some("")` (a deliberately password-less
+/// PKCS#12 is distinct from "unset").
 pub fn server_tls_keychain_password() -> Option<String> {
     std::env::var("EPICS_PVAS_TLS_KEYCHAIN_PASSWORD")
         .or_else(|_| std::env::var("EPICS_PVA_TLS_KEYCHAIN_PASSWORD"))
@@ -749,14 +753,38 @@ pub fn server_tls_options() -> String {
         .unwrap_or_default()
 }
 
-/// Keychain password for a client-side TLS keychain.
+/// Non-pvxs fallback password for a client-side TLS keychain.
 ///
-/// Reads `EPICS_PVA_TLS_KEYCHAIN_PASSWORD`. `$(VAR)` / `${VAR}` refs
-/// are expanded. Returns `None` when unset.
+/// pvxs sources the PKCS#12 password from the `;password` suffix of the
+/// keychain spec (`ossl.cpp:232-238`, see [`split_keychain_spec`]), not
+/// from a dedicated env var. This Rust-only convenience is consulted
+/// ONLY when the keychain spec carries no inline `;` suffix. Reads
+/// `EPICS_PVA_TLS_KEYCHAIN_PASSWORD`; `$(VAR)` / `${VAR}` refs are
+/// expanded. Returns `None` when unset.
 pub fn client_tls_keychain_password() -> Option<String> {
     std::env::var("EPICS_PVA_TLS_KEYCHAIN_PASSWORD")
         .ok()
         .map(|s| expand_dollar_vars(&s))
+}
+
+/// Split a TLS keychain spec into `(path, inline_password)` the way pvxs
+/// `ossl.cpp:232-238` does: text before the FIRST `;` is the keychain
+/// path, text after it (when a `;` is present) is the PKCS#12 password.
+///
+/// - `"cert.p12"`        → `("cert.p12", None)`     (no inline password)
+/// - `"cert.p12;secret"` → `("cert.p12", Some("secret"))`
+/// - `"cert.p12;"`       → `("cert.p12", Some(""))` (explicit empty password)
+/// - `"cert.p12;a;b"`    → `("cert.p12", Some("a;b"))` (split at FIRST `;`)
+///
+/// `Some("")` (a deliberately password-less PKCS#12) is distinct from
+/// `None` (no inline password — the caller may then consult the non-pvxs
+/// `*_TLS_KEYCHAIN_PASSWORD` fallback). The inline suffix is the pvxs
+/// source of truth and takes precedence at the call sites.
+pub fn split_keychain_spec(spec: &str) -> (String, Option<String>) {
+    match spec.split_once(';') {
+        Some((path, password)) => (path.to_string(), Some(password.to_string())),
+        None => (spec.to_string(), None),
+    }
 }
 
 /// Parse `EPICS_PVA_NAME_SERVERS` into TCP socket addresses. Default
@@ -1536,6 +1564,40 @@ mod tests {
                 None => std::env::remove_var("EPICS_PVA_TLS_KEYCHAIN"),
             }
         }
+    }
+
+    /// `split_keychain_spec` matches pvxs `ossl.cpp:232-238`: split at the
+    /// FIRST `;`, path before, password after; no `;` → no inline password;
+    /// trailing `;` → explicit empty password. One case per boundary.
+    #[test]
+    fn split_keychain_spec_matches_pvxs_first_semicolon() {
+        // No `;`: whole spec is the path, no inline password.
+        assert_eq!(
+            split_keychain_spec("cert.p12"),
+            ("cert.p12".to_string(), None)
+        );
+        // `;secret`: path + non-empty password.
+        assert_eq!(
+            split_keychain_spec("cert.p12;secret"),
+            ("cert.p12".to_string(), Some("secret".to_string()))
+        );
+        // Trailing `;`: explicit empty password (distinct from None).
+        assert_eq!(
+            split_keychain_spec("cert.p12;"),
+            ("cert.p12".to_string(), Some(String::new()))
+        );
+        // Multiple `;`: split at the FIRST only; the rest is the password
+        // verbatim (pvxs find_first_of + substr(sep+1)).
+        assert_eq!(
+            split_keychain_spec("cert.p12;a;b"),
+            ("cert.p12".to_string(), Some("a;b".to_string()))
+        );
+        // Leading `;`: empty path, password is the remainder (pvxs would
+        // then fail to open the empty path — we preserve the same split).
+        assert_eq!(
+            split_keychain_spec(";onlypw"),
+            (String::new(), Some("onlypw".to_string()))
+        );
     }
 
     /// `EPICS_PVA_CONN_TMO` keeps fractional seconds. pvxs parses it as a

@@ -264,6 +264,61 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     ) -> Result<(FieldDesc, PvField), OpError> {
         Err(OpError::denied("read-only mode: RPC rejected"))
     }
+    // ChannelArray: forward the read-class sub-ops (INIT descriptor probe,
+    // getArray, getLength) to the inner so a wrapped gateway source still
+    // serves them; reject the write-class sub-ops (putArray, setLength)
+    // exactly as `put_*_checked` reject PUT. Without these overrides the
+    // trait default ("not supported") would mask a wrapped inner's array
+    // support entirely (the wrapper-severs-override defect family). This is
+    // stricter than pva2pva, whose `createChannelArray` lacks the
+    // `p2pReadOnly` guard its Put/PutGet/Process/RPC creates carry
+    // (`channel.cpp:227-232` vs `:118-148`) and so leaks array writes under
+    // read-only mode; putArray/setLength mutate upstream array state and are
+    // WRITE-class here, so a read-only gateway must refuse them.
+    async fn channel_array_init(
+        &self,
+        name: &str,
+        ctx: ChannelContext,
+    ) -> Result<FieldDesc, OpError> {
+        self.inner.channel_array_init(name, ctx).await
+    }
+    async fn channel_array_get(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        offset: u32,
+        count: u32,
+        stride: u32,
+        ctx: ChannelContext,
+    ) -> Result<PvField, OpError> {
+        self.inner
+            .channel_array_get(checked, offset, count, stride, ctx)
+            .await
+    }
+    async fn channel_array_get_length(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+    ) -> Result<u32, OpError> {
+        self.inner.channel_array_get_length(checked, ctx).await
+    }
+    async fn channel_array_put(
+        &self,
+        _checked: epics_pva_rs::server_native::source::AccessChecked,
+        _offset: u32,
+        _stride: u32,
+        _value: PvField,
+        _ctx: ChannelContext,
+    ) -> Result<(), OpError> {
+        Err(OpError::denied("read-only mode: ARRAY putArray rejected"))
+    }
+    async fn channel_array_set_length(
+        &self,
+        _checked: epics_pva_rs::server_native::source::AccessChecked,
+        _length: u32,
+        _ctx: ChannelContext,
+    ) -> Result<(), OpError> {
+        Err(OpError::denied("read-only mode: ARRAY setLength rejected"))
+    }
     // forward the per-PV watermark levels so the inner
     // gateway source's `monitor_watermarks` override is reachable
     // through the wrapper stack. Without this the server's monitor loop
@@ -749,6 +804,87 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
             )));
         }
         self.inner.process_checked(checked, ctx).await
+    }
+    // ChannelArray: gate each sub-op by the static allowlist BEFORE
+    // forwarding to the inner, mirroring `put_*_checked` / `rpc_checked` /
+    // `process_checked`. Without these the trait default ("not supported")
+    // would mask a wrapped inner's array support (the wrapper-severs-override
+    // defect family). The inner source still gets the full AccessChecked +
+    // ctx and applies its own ACF read/write gate on top.
+    async fn channel_array_init(
+        &self,
+        name: &str,
+        ctx: ChannelContext,
+    ) -> Result<FieldDesc, OpError> {
+        if !self.config.allowed(name) {
+            return Err(OpError::denied(format!("ACL: PV '{name}' denied")));
+        }
+        self.inner.channel_array_init(name, ctx).await
+    }
+    async fn channel_array_get(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        offset: u32,
+        count: u32,
+        stride: u32,
+        ctx: ChannelContext,
+    ) -> Result<PvField, OpError> {
+        if !self.config.allowed(checked.pv_name()) {
+            return Err(OpError::denied(format!(
+                "ACL: PV '{}' denied",
+                checked.pv_name()
+            )));
+        }
+        self.inner
+            .channel_array_get(checked, offset, count, stride, ctx)
+            .await
+    }
+    async fn channel_array_put(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        offset: u32,
+        stride: u32,
+        value: PvField,
+        ctx: ChannelContext,
+    ) -> Result<(), OpError> {
+        if !self.config.allowed(checked.pv_name()) {
+            return Err(OpError::denied(format!(
+                "ACL: PV '{}' denied",
+                checked.pv_name()
+            )));
+        }
+        self.inner
+            .channel_array_put(checked, offset, stride, value, ctx)
+            .await
+    }
+    async fn channel_array_set_length(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        length: u32,
+        ctx: ChannelContext,
+    ) -> Result<(), OpError> {
+        if !self.config.allowed(checked.pv_name()) {
+            return Err(OpError::denied(format!(
+                "ACL: PV '{}' denied",
+                checked.pv_name()
+            )));
+        }
+        self.inner
+            .channel_array_set_length(checked, length, ctx)
+            .await
+    }
+    async fn channel_array_get_length(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+    ) -> Result<u32, OpError> {
+        if !self.config.allowed(checked.pv_name()) {
+            return Err(OpError::denied(format!(
+                "ACL: PV '{}' denied",
+                checked.pv_name()
+            )));
+        }
+        self.inner.channel_array_get_length(checked, ctx).await
     }
     // forward the per-PV watermark levels so the inner
     // gateway source's `monitor_watermarks` override is reachable
@@ -1465,6 +1601,101 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
             ev.event = AuditEventKind::Rpc;
             self.sink.record(ev);
         }
+        result
+    }
+    // ChannelArray: forward every sub-op through the inner (so a wrapped
+    // gateway source's array support survives the audit layer — the
+    // wrapper-severs-override defect family) and emit an audit row matching
+    // the sub-op's class. The INIT descriptor probe carries no audit row
+    // (like `has_pv`/`get_introspection`). putArray/setLength are WRITE-class
+    // → `AuditEventKind::Put` (always audited, alongside PUT/PROCESS).
+    // getArray/getLength are READ-class → `AuditEventKind::Get` (gated by
+    // `audit_get`, like GET/MONITOR). There is no dedicated Array audit kind;
+    // the Put/Get buckets capture the operation's mutate-vs-read intent,
+    // which is what an audit log records.
+    async fn channel_array_init(
+        &self,
+        name: &str,
+        ctx: ChannelContext,
+    ) -> Result<FieldDesc, OpError> {
+        self.inner.channel_array_init(name, ctx).await
+    }
+    async fn channel_array_get(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        offset: u32,
+        count: u32,
+        stride: u32,
+        ctx: ChannelContext,
+    ) -> Result<PvField, OpError> {
+        let pv = checked.pv_name().to_string();
+        let user = ctx.account.clone();
+        let host = ctx.host.clone();
+        let result = self
+            .inner
+            .channel_array_get(checked, offset, count, stride, ctx)
+            .await;
+        if self.audit_get {
+            let outcome: Result<(), OpError> = result.as_ref().map(|_| ()).map_err(|e| e.clone());
+            let mut ev = make_audit_event(&pv, &user, &host, &outcome);
+            ev.event = AuditEventKind::Get;
+            self.sink.record(ev);
+        }
+        result
+    }
+    async fn channel_array_get_length(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        ctx: ChannelContext,
+    ) -> Result<u32, OpError> {
+        let pv = checked.pv_name().to_string();
+        let user = ctx.account.clone();
+        let host = ctx.host.clone();
+        let result = self.inner.channel_array_get_length(checked, ctx).await;
+        if self.audit_get {
+            let outcome: Result<(), OpError> = result.as_ref().map(|_| ()).map_err(|e| e.clone());
+            let mut ev = make_audit_event(&pv, &user, &host, &outcome);
+            ev.event = AuditEventKind::Get;
+            self.sink.record(ev);
+        }
+        result
+    }
+    async fn channel_array_put(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        offset: u32,
+        stride: u32,
+        value: PvField,
+        ctx: ChannelContext,
+    ) -> Result<(), OpError> {
+        let pv = checked.pv_name().to_string();
+        let user = ctx.account.clone();
+        let host = ctx.host.clone();
+        let result = self
+            .inner
+            .channel_array_put(checked, offset, stride, value, ctx)
+            .await;
+        let mut ev = make_audit_event(&pv, &user, &host, &result);
+        ev.event = AuditEventKind::Put;
+        self.sink.record(ev);
+        result
+    }
+    async fn channel_array_set_length(
+        &self,
+        checked: epics_pva_rs::server_native::source::AccessChecked,
+        length: u32,
+        ctx: ChannelContext,
+    ) -> Result<(), OpError> {
+        let pv = checked.pv_name().to_string();
+        let user = ctx.account.clone();
+        let host = ctx.host.clone();
+        let result = self
+            .inner
+            .channel_array_set_length(checked, length, ctx)
+            .await;
+        let mut ev = make_audit_event(&pv, &user, &host, &result);
+        ev.event = AuditEventKind::Put;
+        self.sink.record(ev);
         result
     }
     // forward the per-PV watermark levels so the inner

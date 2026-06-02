@@ -1540,6 +1540,160 @@ impl ChannelSource for GatewayChannelSource {
         result.map_err(|e| OpError::failed(e.to_string()))
     }
 
+    // ── ChannelArray (cmd 14) — forward to the per-credential upstream ──
+    //
+    // pva2pva `GWChannel::createChannelArray` (`channel.cpp:227-232`)
+    // forwards the array op to the upstream channel with the downstream's
+    // pvRequest unchanged. We mirror that: every sub-op runs through the
+    // per-credential client (so the upstream IOC sees the real downstream
+    // identity, like `put_value_checked` / `rpc_checked` / `process_checked`)
+    // and carries the downstream INIT pvRequest — captured in
+    // `ctx.pv_request` — so the upstream resolves the same bound array field
+    // the downstream selected. Each forward is one upstream
+    // INIT+sub-op+DESTROY (the gateway holds no upstream array op state),
+    // matching the stateless one-shot forward the other write/process paths
+    // use. ACF is applied per sub-op by the read/write gate below, mirroring
+    // pvAccessCPP's per-sub-op gating (`responseHandlers.cpp` gates each
+    // ChannelArray request, not the create).
+
+    async fn channel_array_init(
+        &self,
+        name: &str,
+        ctx: ChannelContext,
+    ) -> Result<FieldDesc, OpError> {
+        // INIT only resolves the bound array field's introspection — no
+        // access check here, exactly as the native server gates per sub-op
+        // rather than at create. Forward an upstream describe carrying the
+        // downstream pvRequest so the reported descriptor is the upstream's.
+        let client = self.upstream_client_for(&ctx);
+        let result = match ctx.pv_request.as_ref() {
+            Some(req) => client.pvarray_describe_with_request_value(name, req).await,
+            None => client.pvarray_describe(name).await,
+        };
+        result.map_err(|e| OpError::failed(e.to_string()))
+    }
+
+    async fn channel_array_get(
+        &self,
+        checked: AccessChecked,
+        offset: u32,
+        count: u32,
+        stride: u32,
+        ctx: ChannelContext,
+    ) -> Result<PvField, OpError> {
+        if !checked.allows_read() {
+            return Err(OpError::denied(format!(
+                "ARRAY getArray denied by gateway access security: \
+                 PV '{pv}' from {host}/{account}/{method}",
+                pv = checked.pv_name(),
+                host = ctx.host,
+                account = ctx.account,
+                method = ctx.method,
+            )));
+        }
+        let name = checked.pv_name();
+        let client = self.upstream_client_for(&ctx);
+        let result = match ctx.pv_request.as_ref() {
+            Some(req) => {
+                client
+                    .pvarray_get_with_request_value(name, req, offset, count, stride)
+                    .await
+            }
+            None => client.pvarray_get(name, offset, count, stride).await,
+        };
+        result
+            .map(|(_desc, value)| value)
+            .map_err(|e| OpError::failed(e.to_string()))
+    }
+
+    async fn channel_array_put(
+        &self,
+        checked: AccessChecked,
+        offset: u32,
+        stride: u32,
+        value: PvField,
+        ctx: ChannelContext,
+    ) -> Result<(), OpError> {
+        if !checked.allows_write() {
+            return Err(OpError::denied(format!(
+                "ARRAY putArray denied by gateway access security: \
+                 PV '{pv}' from {host}/{account}/{method}",
+                pv = checked.pv_name(),
+                host = ctx.host,
+                account = ctx.account,
+                method = ctx.method,
+            )));
+        }
+        let name = checked.pv_name();
+        let client = self.upstream_client_for(&ctx);
+        let result = match ctx.pv_request.as_ref() {
+            Some(req) => {
+                client
+                    .pvarray_put_with_request_value(name, req, &value, offset, stride)
+                    .await
+            }
+            None => client.pvarray_put(name, &value, offset, stride).await,
+        };
+        result.map_err(|e| OpError::failed(e.to_string()))
+    }
+
+    async fn channel_array_set_length(
+        &self,
+        checked: AccessChecked,
+        length: u32,
+        ctx: ChannelContext,
+    ) -> Result<(), OpError> {
+        if !checked.allows_write() {
+            return Err(OpError::denied(format!(
+                "ARRAY setLength denied by gateway access security: \
+                 PV '{pv}' from {host}/{account}/{method}",
+                pv = checked.pv_name(),
+                host = ctx.host,
+                account = ctx.account,
+                method = ctx.method,
+            )));
+        }
+        let name = checked.pv_name();
+        let client = self.upstream_client_for(&ctx);
+        let result = match ctx.pv_request.as_ref() {
+            Some(req) => {
+                client
+                    .pvarray_set_length_with_request_value(name, req, length)
+                    .await
+            }
+            None => client.pvarray_set_length(name, length).await,
+        };
+        result.map_err(|e| OpError::failed(e.to_string()))
+    }
+
+    async fn channel_array_get_length(
+        &self,
+        checked: AccessChecked,
+        ctx: ChannelContext,
+    ) -> Result<u32, OpError> {
+        if !checked.allows_read() {
+            return Err(OpError::denied(format!(
+                "ARRAY getLength denied by gateway access security: \
+                 PV '{pv}' from {host}/{account}/{method}",
+                pv = checked.pv_name(),
+                host = ctx.host,
+                account = ctx.account,
+                method = ctx.method,
+            )));
+        }
+        let name = checked.pv_name();
+        let client = self.upstream_client_for(&ctx);
+        let result = match ctx.pv_request.as_ref() {
+            Some(req) => {
+                client
+                    .pvarray_get_length_with_request_value(name, req)
+                    .await
+            }
+            None => client.pvarray_get_length(name).await,
+        };
+        result.map_err(|e| OpError::failed(e.to_string()))
+    }
+
     async fn subscribe_raw(
         &self,
         name: &str,

@@ -1828,6 +1828,49 @@ impl PvaClient {
         op_process_with_request_value(&ch, pv_request, self.inner.timeout).await
     }
 
+    /// ChannelArray `getArray` (cmd 14): read the `[offset, count, stride]`
+    /// slice of `pv_name`'s array field. `count == 0` reads to the end.
+    /// Returns the array `(introspection, value)`. Errors with a protocol
+    /// status when the server's source does not serve a windowed array.
+    pub async fn pvarray_get(
+        &self,
+        pv_name: &str,
+        offset: u32,
+        count: u32,
+        stride: u32,
+    ) -> PvaResult<(FieldDesc, PvField)> {
+        let ch = self.channel(pv_name).await?;
+        crate::client_native::ops_v2::op_array_get(&ch, offset, count, stride, self.inner.timeout)
+            .await
+    }
+
+    /// ChannelArray `putArray` (cmd 14): splice `value` into `pv_name`'s
+    /// array field at `offset` with `stride`.
+    pub async fn pvarray_put(
+        &self,
+        pv_name: &str,
+        value: &PvField,
+        offset: u32,
+        stride: u32,
+    ) -> PvaResult<()> {
+        let ch = self.channel(pv_name).await?;
+        crate::client_native::ops_v2::op_array_put(&ch, value, offset, stride, self.inner.timeout)
+            .await
+    }
+
+    /// ChannelArray `setLength` (cmd 14): resize `pv_name`'s array field.
+    pub async fn pvarray_set_length(&self, pv_name: &str, length: u32) -> PvaResult<()> {
+        let ch = self.channel(pv_name).await?;
+        crate::client_native::ops_v2::op_array_set_length(&ch, length, self.inner.timeout).await
+    }
+
+    /// ChannelArray `getLength` (cmd 14): query the element count of
+    /// `pv_name`'s array field.
+    pub async fn pvarray_get_length(&self, pv_name: &str) -> PvaResult<u32> {
+        let ch = self.channel(pv_name).await?;
+        crate::client_native::ops_v2::op_array_get_length(&ch, self.inner.timeout).await
+    }
+
     /// Snapshot of the client's current state — channel cache size,
     /// connection-pool peers, name-server count, and per-connection /
     /// per-channel byte counters. Mirrors pvxs `Context::report`

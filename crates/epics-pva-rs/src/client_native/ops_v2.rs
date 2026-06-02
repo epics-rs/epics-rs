@@ -3373,6 +3373,307 @@ fn decode_put_get_data(
     Ok(Ok(value))
 }
 
+// ── ARRAY (cmd 14) — ChannelArray windowed-array operation ──────────────
+
+/// One ChannelArray data-phase sub-request, mirroring the QOS-bit selection
+/// in pvAccessCPP `clientContextImpl.cpp:1580-1612`.
+enum ArrayReq<'a> {
+    /// `getArray` (`QOS_GET`): read the `[offset, count, stride]` slice.
+    Get {
+        offset: u32,
+        count: u32,
+        stride: u32,
+    },
+    /// `putArray` (subcmd 0): splice `value` at `offset`/`stride`.
+    Put {
+        offset: u32,
+        stride: u32,
+        value: &'a PvField,
+    },
+    /// `setLength` (`QOS_GET_PUT`): resize to `length`.
+    SetLength { length: u32 },
+    /// `getLength` (`QOS_PROCESS`): query the element count.
+    GetLength,
+}
+
+/// The decoded body of a ChannelArray sub-op reply.
+enum ArrayResp {
+    /// `getArray`: the sliced array value.
+    Value(PvField),
+    /// `getLength`: the element count.
+    Length(u32),
+    /// `putArray` / `setLength`: status-only success.
+    Empty,
+}
+
+/// Shared ChannelArray driver: INIT (binding the array field via a
+/// `field(value)` pvRequest), one sub-op data frame, decode the reply, then
+/// DESTROY_REQUEST. Factored so every sub-op shares one INIT/destroy
+/// lifecycle and cannot drift apart (mirrors [`op_put_get_data`]).
+///
+/// Wire format — pvAccessCPP `clientContextImpl.cpp:1567-1666` (send) and
+/// `responseHandlers.cpp:2347-2393` (server reply):
+/// - INIT reply: `ioid + subcmd + status + array introspection`.
+/// - getArray: data `offset + count + stride`; reply `status + array value`.
+/// - putArray: data `offset + stride + array value`; reply `status`.
+/// - setLength: data `length`; reply `status`.
+/// - getLength: data (none); reply `status + length`.
+async fn op_array_data(
+    channel: &Arc<Channel>,
+    req: ArrayReq<'_>,
+    op_timeout: Duration,
+) -> PvaResult<(FieldDesc, ArrayResp)> {
+    let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
+    let order = server.byte_order;
+    let big_endian = matches!(order, ByteOrder::Big);
+    let codec = PvaCodec { big_endian };
+    let ioid = alloc_ioid();
+
+    let pv_req = build_pv_request_value_only(big_endian);
+    let mut stream = server.register_ioid_stream(sid, ioid, Command::Array.code());
+    let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
+    let cache = server.type_cache();
+
+    // INIT — `sid + ioid + 0x08 + pvRequest`.
+    let mut init = Vec::with_capacity(9 + pv_req.len());
+    init.put_u32(sid, order);
+    init.put_u32(ioid, order);
+    init.put_u8(QosFlags::INIT);
+    init.extend_from_slice(&pv_req);
+    let init_h = PvaHeader::application(false, order, Command::Array.code(), init.len() as u32);
+    let mut init_frame = Vec::with_capacity(8 + init.len());
+    init_h.write_into(&mut init_frame);
+    init_frame.extend_from_slice(&init);
+    server.send_for_channel(sid, init_frame).await?;
+
+    let init_resp = await_frame(&mut stream, op_timeout).await?;
+    let array_desc = match decode_array_init(&init_resp, &mut cache.lock()) {
+        Ok(Ok(desc)) => desc,
+        Ok(Err(status)) => {
+            server.unregister_ioid(ioid);
+            return Err(PvaError::Protocol(format!("ARRAY INIT failed: {status:?}")));
+        }
+        Err(e) => {
+            server.close();
+            return Err(e);
+        }
+    };
+    ioid_guard.arm_destroy(sid);
+
+    // Data frame — `sid + ioid + subcmd [+ params]`.
+    let (data_subcmd, body): (u8, Vec<u8>) = match &req {
+        ArrayReq::Get {
+            offset,
+            count,
+            stride,
+        } => {
+            let mut b = Vec::new();
+            crate::proto::encode_size_into(*offset, order, &mut b);
+            crate::proto::encode_size_into(*count, order, &mut b);
+            crate::proto::encode_size_into(*stride, order, &mut b);
+            (QosFlags::GET, b)
+        }
+        ArrayReq::Put {
+            offset,
+            stride,
+            value,
+        } => {
+            let mut b = Vec::new();
+            crate::proto::encode_size_into(*offset, order, &mut b);
+            crate::proto::encode_size_into(*stride, order, &mut b);
+            encode_pv_field(value, &array_desc, order, &mut b);
+            (0x00, b)
+        }
+        ArrayReq::SetLength { length } => {
+            let mut b = Vec::new();
+            crate::proto::encode_size_into(*length, order, &mut b);
+            (QosFlags::GET_PUT, b)
+        }
+        ArrayReq::GetLength => (QosFlags::PROCESS, Vec::new()),
+    };
+    let mut data = Vec::with_capacity(9 + body.len());
+    data.put_u32(sid, order);
+    data.put_u32(ioid, order);
+    data.put_u8(data_subcmd);
+    data.extend_from_slice(&body);
+    let data_h = PvaHeader::application(false, order, Command::Array.code(), data.len() as u32);
+    let mut data_frame = Vec::with_capacity(8 + data.len());
+    data_h.write_into(&mut data_frame);
+    data_frame.extend_from_slice(&data);
+    server.send_for_channel(sid, data_frame).await?;
+
+    let resp_frame = await_frame(&mut stream, op_timeout).await?;
+    let result = match decode_array_data(&resp_frame, &req, &array_desc, &mut cache.lock()) {
+        Ok(Ok(resp)) => Ok(resp),
+        Ok(Err(status)) => Err(PvaError::Protocol(format!("ARRAY: {status:?}"))),
+        Err(e) => {
+            server.close();
+            Err(e)
+        }
+    };
+
+    ioid_guard.disarm();
+    let destroy = codec.build_destroy_request(sid, ioid);
+    let _ = server.send_for_channel(sid, destroy).await;
+    server.unregister_ioid(ioid);
+    result.map(|resp| (array_desc, resp))
+}
+
+/// Decode a ChannelArray INIT reply: `ioid + subcmd + status + array
+/// introspection`. Two-level result (see [`decode_put_get_init`]): outer
+/// `Err` is connection-fatal, inner `Ok(Err(status))` a per-op failure.
+fn decode_array_init(
+    frame: &super::decode::Frame,
+    type_cache: &mut crate::pvdata::encode::TypeCache,
+) -> PvaResult<Result<FieldDesc, crate::proto::Status>> {
+    if frame.header.command != Command::Array.code() {
+        return Err(PvaError::Protocol(format!(
+            "expected ARRAY INIT, got command {}",
+            frame.header.command
+        )));
+    }
+    let order = frame.order();
+    let mut cur = frame.cursor();
+    let _ioid = cur
+        .get_u32(order)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
+    let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
+    if subcmd & QosFlags::INIT == 0 {
+        return Err(PvaError::Protocol(format!(
+            "expected ARRAY INIT subcmd, got 0x{subcmd:02x}"
+        )));
+    }
+    let status = crate::proto::Status::decode(&mut cur, order)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
+    if !status.is_success() {
+        return Ok(Err(status));
+    }
+    let array_desc = crate::pvdata::encode::decode_type_desc_cached(&mut cur, order, type_cache)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
+    Ok(Ok(array_desc))
+}
+
+/// Decode a ChannelArray data reply. The trailing body depends on the
+/// sub-op: getArray → array value; getLength → size; put/setLength → none.
+fn decode_array_data(
+    frame: &super::decode::Frame,
+    req: &ArrayReq<'_>,
+    array_desc: &FieldDesc,
+    type_cache: &mut crate::pvdata::encode::TypeCache,
+) -> PvaResult<Result<ArrayResp, crate::proto::Status>> {
+    if frame.header.command != Command::Array.code() {
+        return Err(PvaError::Protocol(format!(
+            "expected ARRAY data, got command {}",
+            frame.header.command
+        )));
+    }
+    let order = frame.order();
+    let mut cur = frame.cursor();
+    let _ioid = cur
+        .get_u32(order)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
+    let _subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
+    let status = crate::proto::Status::decode(&mut cur, order)
+        .map_err(|e| PvaError::Decode(e.to_string()))?;
+    if !status.is_success() {
+        return Ok(Err(status));
+    }
+    let resp = match req {
+        ArrayReq::Get { .. } => {
+            let value = crate::pvdata::encode::decode_pv_field_cached(
+                array_desc, &mut cur, order, type_cache,
+            )
+            .map_err(|e| PvaError::Decode(e.to_string()))?;
+            ArrayResp::Value(value)
+        }
+        ArrayReq::GetLength => {
+            let n = crate::proto::decode_size(&mut cur, order)
+                .map_err(|e| PvaError::Decode(e.to_string()))?
+                .ok_or_else(|| PvaError::Decode("ARRAY getLength: null size marker".into()))?;
+            ArrayResp::Length(n)
+        }
+        ArrayReq::Put { .. } | ArrayReq::SetLength { .. } => ArrayResp::Empty,
+    };
+    Ok(Ok(resp))
+}
+
+/// ChannelArray `getArray` (cmd 14, `QOS_GET`): read the
+/// `[offset, count, stride]` slice of the channel's array field. `count == 0`
+/// reads to the end (pvAccessCPP `clientContextImpl.cpp:1669-1704`). Returns
+/// the array `(FieldDesc, PvField)`.
+pub async fn op_array_get(
+    channel: &Arc<Channel>,
+    offset: u32,
+    count: u32,
+    stride: u32,
+    op_timeout: Duration,
+) -> PvaResult<(FieldDesc, PvField)> {
+    let (desc, resp) = op_array_data(
+        channel,
+        ArrayReq::Get {
+            offset,
+            count,
+            stride,
+        },
+        op_timeout,
+    )
+    .await?;
+    match resp {
+        ArrayResp::Value(v) => Ok((desc, v)),
+        _ => Err(PvaError::Protocol(
+            "ARRAY getArray: unexpected reply body".into(),
+        )),
+    }
+}
+
+/// ChannelArray `putArray` (cmd 14, subcmd 0): splice `value` into the
+/// channel's array field at `offset` with `stride` (pvAccessCPP
+/// `clientContextImpl.cpp:1706-1748`).
+pub async fn op_array_put(
+    channel: &Arc<Channel>,
+    value: &PvField,
+    offset: u32,
+    stride: u32,
+    op_timeout: Duration,
+) -> PvaResult<()> {
+    op_array_data(
+        channel,
+        ArrayReq::Put {
+            offset,
+            stride,
+            value,
+        },
+        op_timeout,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// ChannelArray `setLength` (cmd 14, `QOS_GET_PUT`): resize the channel's
+/// array field (pvAccessCPP `clientContextImpl.cpp:1750-1782`).
+pub async fn op_array_set_length(
+    channel: &Arc<Channel>,
+    length: u32,
+    op_timeout: Duration,
+) -> PvaResult<()> {
+    op_array_data(channel, ArrayReq::SetLength { length }, op_timeout)
+        .await
+        .map(|_| ())
+}
+
+/// ChannelArray `getLength` (cmd 14, `QOS_PROCESS`): query the current
+/// element count of the channel's array field (pvAccessCPP
+/// `clientContextImpl.cpp:1784-1810`).
+pub async fn op_array_get_length(channel: &Arc<Channel>, op_timeout: Duration) -> PvaResult<u32> {
+    let (_desc, resp) = op_array_data(channel, ArrayReq::GetLength, op_timeout).await?;
+    match resp {
+        ArrayResp::Length(n) => Ok(n),
+        _ => Err(PvaError::Protocol(
+            "ARRAY getLength: unexpected reply body".into(),
+        )),
+    }
+}
+
 // ── PROCESS (cmd 16) ────────────────────────────────────────────────────
 
 /// Build a PROCESS INIT frame (`sid + ioid + 0x08 + pvRequest`) carrying

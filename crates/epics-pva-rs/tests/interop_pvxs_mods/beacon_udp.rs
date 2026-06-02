@@ -49,7 +49,12 @@ async fn interop_beacon_a_pvxlist_discovers_rust_server() {
             drop(s);
             p
         },
-        beacon_destinations: vec![format!("127.0.0.1:{beacon_port}").parse().unwrap()],
+        beacon_destinations: vec![
+            format!("127.0.0.1:{beacon_port}")
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+                .into(),
+        ],
         // Burst cadence: send 10 beacons at the short interval, so
         // pvxlist's 2 s listen window catches at least one even
         // when the test process is briefly preempted.

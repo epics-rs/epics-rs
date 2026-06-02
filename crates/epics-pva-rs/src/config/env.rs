@@ -277,6 +277,45 @@ impl Endpoint {
     }
 }
 
+impl From<SocketAddr> for Endpoint {
+    /// A programmatically-supplied address carries no multicast modifiers
+    /// (a `SocketAddr` cannot express `,ttl`/`@iface`), so it maps to a
+    /// modifier-less endpoint. Lets callers that still build `Vec<SocketAddr>`
+    /// (e.g. the gateway's own parser, test fixtures) feed the endpoint-typed
+    /// beacon/destination lists with `.into()`.
+    fn from(addr: SocketAddr) -> Self {
+        Endpoint {
+            addr,
+            ttl: None,
+            iface: None,
+        }
+    }
+}
+
+/// Resolve an `@iface` modifier — an interface NAME (`eth0`) or a literal
+/// IPv4 address — to the interface's IPv4 address, for selecting the
+/// outgoing multicast interface on the UDP send path. Mirrors pvxs
+/// `IfaceMap::address_of` (`evhelper.cpp:872-879`): a name is looked up in
+/// the live interface table; a dotted IPv4 address is accepted verbatim
+/// (pvxs normalises a dotted iface address back to a name in the
+/// `SockEndpoint` ctor, `config.cpp:76-79`, but the address itself is a
+/// valid spec). Errs when the name has no IPv4 address so the caller can
+/// fall back (best-effort) rather than silently mis-route.
+pub fn resolve_iface_v4(spec: &str) -> Result<Ipv4Addr, String> {
+    if let Ok(v4) = spec.parse::<Ipv4Addr>() {
+        return Ok(v4);
+    }
+    let ifaces = if_addrs::get_if_addrs().map_err(|e| format!("get_if_addrs failed: {e}"))?;
+    for iface in ifaces {
+        if iface.name == spec {
+            if let if_addrs::IfAddr::V4(v4) = iface.addr {
+                return Ok(v4.ip);
+            }
+        }
+    }
+    Err(format!("interface {spec:?} has no IPv4 address"))
+}
+
 /// Resolve a single address token (no multicast modifiers) to a
 /// `SocketAddr`, appending `default_port` when no port is present. Shared
 /// by [`Endpoint::parse`] and [`parse_addr_list_with_port`].
@@ -896,12 +935,22 @@ pub fn server_beacon_addr_list() -> Vec<SocketAddr> {
 
 /// Presence-aware [`server_beacon_addr_list`] — `None` when neither
 /// `EPICS_PVAS_BEACON_ADDR_LIST` nor `EPICS_PVA_ADDR_LIST` is set, so
-/// `with_env` preserves caller-supplied `beacon_destinations`.
+/// `with_env` preserves caller-supplied `beacon_destinations`. Address-only
+/// projection of [`server_beacon_endpoints_opt`].
 pub fn server_beacon_addr_list_opt() -> Option<Vec<SocketAddr>> {
+    server_beacon_endpoints_opt().map(|eps| eps.into_iter().map(|e| e.addr).collect())
+}
+
+/// Endpoint-preserving variant of [`server_beacon_addr_list_opt`]: keeps each
+/// beacon destination's multicast TTL / interface modifiers so the UDP send
+/// path can apply `IP_MULTICAST_TTL` / outgoing-interface selection per pvxs
+/// (`evhelper.cpp:556-577`). Same env source + fallback
+/// (`EPICS_PVAS_BEACON_ADDR_LIST` → `EPICS_PVA_ADDR_LIST`, `config.cpp:426-431`).
+pub fn server_beacon_endpoints_opt() -> Option<Vec<Endpoint>> {
     std::env::var("EPICS_PVAS_BEACON_ADDR_LIST")
         .ok()
         .or_else(|| std::env::var("EPICS_PVA_ADDR_LIST").ok())
-        .map(|s| parse_addr_list_with_port(&s, server_broadcast_port()))
+        .map(|s| parse_endpoints_with_port(&s, server_broadcast_port()))
 }
 
 /// Discover per-NIC IPv4 broadcast addresses. Used to fan SEARCH
@@ -1180,6 +1229,37 @@ mod tests {
         // Empty / whitespace token.
         assert_eq!(Endpoint::parse("", 5076), None);
         assert_eq!(Endpoint::parse("   ", 5076), None);
+    }
+
+    /// A programmatic `SocketAddr` carries no multicast modifiers, so the
+    /// `From` shim that lets `Vec<SocketAddr>` callers feed the endpoint-typed
+    /// beacon list must yield a modifier-less endpoint.
+    #[test]
+    fn endpoint_from_socket_addr_has_no_modifiers() {
+        let sa: SocketAddr = "224.0.2.3:5076".parse().unwrap();
+        let ep: Endpoint = sa.into();
+        assert_eq!(ep.addr, sa);
+        assert_eq!(ep.ttl, None);
+        assert_eq!(ep.iface, None);
+    }
+
+    /// `resolve_iface_v4` accepts a literal IPv4 address verbatim (the egress
+    /// NIC is later selected by source-bind), so a dotted `@iface` spec needs
+    /// no interface-table lookup.
+    #[test]
+    fn resolve_iface_v4_literal_passthrough() {
+        assert_eq!(
+            resolve_iface_v4("192.168.7.42"),
+            Ok(Ipv4Addr::new(192, 168, 7, 42))
+        );
+    }
+
+    /// A name with no IPv4 address (here a non-existent interface) errors so
+    /// the send path can fall back to the OS default route rather than
+    /// silently mis-routing.
+    #[test]
+    fn resolve_iface_v4_unknown_name_errors() {
+        assert!(resolve_iface_v4("nonexistent-iface-zzz").is_err());
     }
 
     /// The list splits on WHITESPACE only (pvxs `split_addr_into`); a comma

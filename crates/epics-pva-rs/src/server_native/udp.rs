@@ -18,6 +18,7 @@ use std::net::SocketAddrV4;
 use tracing::{debug, warn};
 
 use crate::codec::PvaCodec;
+use crate::config::Endpoint;
 use crate::error::{PvaError, PvaResult};
 use crate::proto::{
     ByteOrder, Command, PvaHeader, ReadExt, WriteExt, decode_size, decode_string, encode_size_into,
@@ -109,7 +110,7 @@ fn bind_beacon_send_v6() -> Option<Arc<tokio::net::UdpSocket>> {
 fn bind_udp(
     port: u16,
     interfaces: &[Ipv4Addr],
-    beacon_dests: &[SocketAddr],
+    beacon_dests: &[Endpoint],
 ) -> PvaResult<AsyncUdpV4> {
     // `EPICS_PVAS_INTF_ADDR_LIST` constrains the responder to the listed
     // interfaces (pvxs `server.cpp:407-439` binds UDP search listeners
@@ -146,10 +147,10 @@ fn bind_udp(
 /// need no membership. Pure so the destination-source decision (the PVA-33
 /// fix: beacon destinations, not the raw client `EPICS_PVA_ADDR_LIST`) is
 /// testable without real NIC multicast.
-fn multicast_v4_groups(beacon_dests: &[SocketAddr]) -> Vec<Ipv4Addr> {
+fn multicast_v4_groups(beacon_dests: &[Endpoint]) -> Vec<Ipv4Addr> {
     beacon_dests
         .iter()
-        .filter_map(|dest| match dest {
+        .filter_map(|dest| match dest.addr {
             SocketAddr::V4(v4) if v4.ip().is_multicast() => Some(*v4.ip()),
             _ => None,
         })
@@ -161,7 +162,7 @@ fn multicast_v4_groups(beacon_dests: &[SocketAddr]) -> Vec<Ipv4Addr> {
 /// groups reach us (pvxs `addGroups` / `server.cpp:411-423`). Idempotent
 /// across restarts; a single failed join is logged but does not disable the
 /// rest.
-fn join_beacon_multicast_groups(sock: &AsyncUdpV4, beacon_dests: &[SocketAddr]) {
+fn join_beacon_multicast_groups(sock: &AsyncUdpV4, beacon_dests: &[Endpoint]) {
     for ip in multicast_v4_groups(beacon_dests) {
         if let Err(e) = sock.join_multicast_v4(ip) {
             debug!("join_multicast_v4 for beacon destination {ip} failed: {e}");
@@ -217,7 +218,7 @@ pub async fn run_udp_responder_with_config(
     beacon_period: Duration,
     beacon_period_long: Duration,
     beacon_burst_count: u8,
-    destinations: Vec<SocketAddr>,
+    destinations: Vec<Endpoint>,
     auto_beacon: bool,
     ignore_addrs: Vec<(IpAddr, u16)>,
     // PR #205 IPv6 Stage 5: when true, also emit beacons to the
@@ -244,10 +245,15 @@ pub async fn run_udp_responder_with_config(
     // (matching pvxs `EPICS_PVAS_AUTO_BEACON_ADDR_LIST=NO` semantics).
     // Pre-fix this branch fell through to limited broadcast, leaking
     // beacon frames against site policy. Mirror the CA fix.
-    let mut beacon_destinations: Vec<SocketAddr> = if !destinations.is_empty() {
+    let mut beacon_destinations: Vec<Endpoint> = if !destinations.is_empty() {
         destinations
     } else if auto_beacon {
+        // Auto NIC-broadcast destinations carry no TTL/iface qualifier —
+        // they are limited/subnet broadcasts, not multicast endpoints.
         crate::config::env::list_broadcast_addresses(udp_port)
+            .into_iter()
+            .map(Endpoint::from)
+            .collect()
     } else {
         Vec::new()
     };
@@ -256,13 +262,14 @@ pub async fn run_udp_responder_with_config(
     // emission), add the default v6 multicast group as a beacon
     // destination. Mirrors pvxs' v6 group `ff0e::400`.
     if enable_ipv6_udp && auto_beacon {
-        let v6_mcast = SocketAddr::V6(std::net::SocketAddrV6::new(
+        let v6_mcast: Endpoint = SocketAddr::V6(std::net::SocketAddrV6::new(
             std::net::Ipv6Addr::new(0xff0e, 0, 0, 0, 0, 0, 0, 0x0400),
             udp_port,
             0,
             0,
-        ));
-        if !beacon_destinations.contains(&v6_mcast) {
+        ))
+        .into();
+        if !beacon_destinations.iter().any(|e| e.addr == v6_mcast.addr) {
             beacon_destinations.push(v6_mcast);
         }
     }
@@ -377,25 +384,45 @@ pub async fn run_udp_responder_with_config(
                 change_count,
                 protocol,
             );
-            for dest in &beacon_destinations {
-                // Limited broadcast / multicast destinations need
-                // explicit per-NIC fanout. Per-subnet broadcast and
-                // unicast route via AsyncUdpV4::send_to's NIC pick.
-                // PR #205 IPv6 Stage 5: v6 destinations route through
-                // the dedicated v6 send socket. The `enable_ipv6_udp`
-                // false path will never queue v6 destinations here, so
-                // the missing-v6-socket branch is defensive.
+            for ep in &beacon_destinations {
+                let dest = ep.addr;
+                // Per-destination dispatch:
+                // - V4 multicast → `send_multicast_v4`, which applies the
+                //   endpoint TTL (`,ttl`) and selects the egress NIC by
+                //   `@iface` (pvxs `mcast_prep_sendto`, evhelper.cpp:556-577).
+                //   No `@iface` fans out every eligible NIC, matching the old
+                //   `fanout_to` behaviour but now at the correct TTL.
+                // - V4 limited broadcast → per-NIC `fanout_to` (TTL-agnostic).
+                // - V4 subnet-broadcast / unicast → `send_to`'s source-bind
+                //   NIC pick.
+                // PR #205 IPv6 Stage 5: v6 destinations route through the
+                // dedicated v6 send socket. The `enable_ipv6_udp` false path
+                // never queues v6 destinations here, so the missing-v6-socket
+                // branch is defensive.
                 let result = match dest {
-                    SocketAddr::V4(v4) => {
-                        let needs_fanout = v4.ip().is_broadcast() || v4.ip().is_multicast();
-                        if needs_fanout {
-                            beacon_socket.fanout_to(&beacon, *dest).await.map(|_| ())
-                        } else {
-                            beacon_socket.send_to(&beacon, *dest).await.map(|_| ())
-                        }
+                    SocketAddr::V4(v4) if v4.ip().is_multicast() => {
+                        // pvxs multicast TTL default is 1 (link-local); an
+                        // absent `,ttl` qualifier stays link-local.
+                        let ttl = ep.ttl.unwrap_or(1);
+                        // Resolve the optional `@iface` to the egress NIC's
+                        // IPv4 at send time (pvxs IfaceMap parity). A bad spec
+                        // disables the NIC filter (fan out every eligible NIC)
+                        // rather than dropping the beacon.
+                        let iface_ip = ep
+                            .iface
+                            .as_deref()
+                            .and_then(|spec| crate::config::env::resolve_iface_v4(spec).ok());
+                        beacon_socket
+                            .send_multicast_v4(&beacon, dest, ttl, iface_ip)
+                            .await
+                            .map(|_| ())
                     }
+                    SocketAddr::V4(v4) if v4.ip().is_broadcast() => {
+                        beacon_socket.fanout_to(&beacon, dest).await.map(|_| ())
+                    }
+                    SocketAddr::V4(_) => beacon_socket.send_to(&beacon, dest).await.map(|_| ()),
                     SocketAddr::V6(_) => match &beacon_socket_v6_for_task {
-                        Some(s6) => s6.send_to(&beacon, *dest).await.map(|_| ()),
+                        Some(s6) => s6.send_to(&beacon, dest).await.map(|_| ()),
                         None => Err(std::io::Error::new(
                             std::io::ErrorKind::AddrNotAvailable,
                             "v6 beacon destination configured without a v6 send socket",
@@ -404,10 +431,10 @@ pub async fn run_udp_responder_with_config(
                 };
                 match result {
                     Ok(()) => {
-                        beacon_send_errs.remove(dest);
+                        beacon_send_errs.remove(&dest);
                     }
                     Err(e) => {
-                        if beacon_send_errs.insert(*dest) {
+                        if beacon_send_errs.insert(dest) {
                             warn!("beacon TX to {dest} failed: {e}");
                         } else {
                             debug!("beacon TX to {dest} failed: {e}");
@@ -2508,7 +2535,7 @@ mod tests {
             std::time::Duration::from_millis(50),
             std::time::Duration::from_secs(10),
             3,
-            vec![v6_dest],
+            vec![Endpoint::from(v6_dest)],
             false, // auto_beacon=false: only the explicit v6 dest
             Vec::new(),
             true,       // enable_ipv6_udp
@@ -2743,16 +2770,17 @@ mod tests {
     #[test]
     fn multicast_v4_groups_selects_only_v4_multicast_beacon_destinations() {
         use std::net::{Ipv6Addr, SocketAddrV6};
-        let dests = vec![
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 1, 1, 1)), 5076), // mcast
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 255)), 5076), // broadcast
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), 5076),  // unicast
+        let dests: Vec<Endpoint> = vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 1, 1, 1)), 5076).into(), // mcast
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 255)), 5076).into(), // broadcast
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), 5076).into(),  // unicast
             SocketAddr::V6(SocketAddrV6::new(
                 Ipv6Addr::new(0xff0e, 0, 0, 0, 0, 0, 0, 0x400),
                 5076,
                 0,
                 0,
-            )), // v6 mcast — not joinable on the v4 socket
+            ))
+            .into(), // v6 mcast — not joinable on the v4 socket
         ];
         assert_eq!(
             multicast_v4_groups(&dests),
@@ -2778,7 +2806,7 @@ mod tests {
             std::env::set_var("EPICS_PVAS_BEACON_ADDR_LIST", "224.0.7.7");
         }
         let dests =
-            crate::config::env::server_beacon_addr_list_opt().expect("PVAS beacon list present");
+            crate::config::env::server_beacon_endpoints_opt().expect("PVAS beacon list present");
         unsafe {
             std::env::remove_var("EPICS_PVAS_BEACON_ADDR_LIST");
         }
@@ -2794,10 +2822,8 @@ mod tests {
     /// env-only join ignored programmatic destinations entirely.
     #[test]
     fn programmatic_beacon_destinations_join_multicast() {
-        let dests = vec![SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(239, 1, 2, 3)),
-            5076,
-        )];
+        let dests: Vec<Endpoint> =
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 1, 2, 3)), 5076).into()];
         assert_eq!(
             multicast_v4_groups(&dests),
             vec![Ipv4Addr::new(239, 1, 2, 3)]

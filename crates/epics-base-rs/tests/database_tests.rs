@@ -340,6 +340,42 @@ async fn test_pva_link_no_alarm_when_lset_reports_none() {
     );
 }
 
+/// Mock lset shared by the external-OUT-link dispatch tests: records
+/// every `(name, value, op)` triple the database routes through
+/// `put_value`, so a test can assert both the delivered value and the
+/// chosen [`LinkPutOp`] (plain vs put-notify `Async`).
+struct CapturingLset {
+    writes: Arc<
+        std::sync::Mutex<
+            Vec<(
+                String,
+                EpicsValue,
+                epics_base_rs::server::database::LinkPutOp,
+            )>,
+        >,
+    >,
+}
+impl epics_base_rs::server::database::LinkSet for CapturingLset {
+    fn is_connected(&self, _: &str) -> bool {
+        true
+    }
+    fn get_value(&self, _: &str) -> Option<EpicsValue> {
+        None
+    }
+    fn put_value(
+        &self,
+        name: &str,
+        value: EpicsValue,
+        op: epics_base_rs::server::database::LinkPutOp,
+    ) -> Result<(), String> {
+        self.writes
+            .lock()
+            .unwrap()
+            .push((name.to_string(), value, op));
+        Ok(())
+    }
+}
+
 /// A record whose OUT link is an external `pva://` link must drive
 /// the processed value through the registered link set's `put_value`.
 ///
@@ -354,24 +390,7 @@ async fn test_pva_link_no_alarm_when_lset_reports_none() {
 async fn test_pva_out_link_writes_value_through_link_set() {
     use std::sync::Mutex;
 
-    use epics_base_rs::server::database::LinkSet;
-
-    /// Mock lset that records every `put_value` call.
-    struct CapturingLset {
-        writes: Arc<Mutex<Vec<(String, EpicsValue)>>>,
-    }
-    impl LinkSet for CapturingLset {
-        fn is_connected(&self, _: &str) -> bool {
-            true
-        }
-        fn get_value(&self, _: &str) -> Option<EpicsValue> {
-            None
-        }
-        fn put_value(&self, name: &str, value: EpicsValue) -> Result<(), String> {
-            self.writes.lock().unwrap().push((name.to_string(), value));
-            Ok(())
-        }
-    }
+    use epics_base_rs::server::database::LinkPutOp;
 
     let writes = Arc::new(Mutex::new(Vec::new()));
     let db = PvDatabase::new();
@@ -419,6 +438,12 @@ async fn test_pva_out_link_writes_value_through_link_set() {
         Some(3.5),
         "put_value must receive the record's processed value"
     );
+    assert_eq!(
+        captured[0].2,
+        LinkPutOp::Plain,
+        "a plain record-processing OUT write (no put-notify chain) must \
+         deliver a Plain put, not a completion-aware Async put"
+    );
 }
 
 /// A record with a `pva://` OUT link and NO registered link set must
@@ -453,6 +478,71 @@ async fn test_pva_out_link_no_link_set_fails_gracefully() {
         inst.record.val().and_then(|v| v.to_f64()),
         Some(1.0),
         "the record itself still holds its value"
+    );
+}
+
+/// Boundary twin of `test_pva_out_link_writes_value_through_link_set`:
+/// when the originating record is part of a put-notify / blocking-put
+/// chain (it carries a completion wait-set), its external OUT-link
+/// write must be delivered as [`LinkPutOp::Async`] — the C
+/// `dbPutLinkAsync` / pvxs `pvaPutValueAsync` path. The plain-process
+/// twin asserts the `Plain` boundary; this asserts `Async`, so the
+/// notify→op mapping (`PvDatabase::external_put_op`) is pinned on both
+/// sides of its single branch.
+#[tokio::test]
+async fn test_pva_out_link_put_notify_chain_uses_async_op() {
+    use std::sync::Mutex;
+
+    use epics_base_rs::server::database::LinkPutOp;
+
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let db = PvDatabase::new();
+    db.register_link_set(
+        "pva",
+        Arc::new(CapturingLset {
+            writes: writes.clone(),
+        }),
+    )
+    .await;
+
+    db.add_record("AO_PVAOUT_NOTIFY", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    // Keep the receiver alive so the completion `send` at the tail of
+    // processing never observes a dropped channel; the test only
+    // inspects the op captured at OUT-write time.
+    let (tx, _rx) = epics_base_rs::runtime::sync::oneshot::channel();
+    if let Some(rec) = db.get_record("AO_PVAOUT_NOTIFY").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("OUT", EpicsValue::String("pva://REMOTE:OUT".into()))
+            .unwrap();
+        inst.common.udf = false;
+        inst.record
+            .put_field("VAL", EpicsValue::Double(7.0))
+            .unwrap();
+        // Arm a put-notify wait-set: the source record is now in a
+        // blocking-put chain, so its OUT-link write must use Async.
+        inst.notify = Some(NotifyWaitSet::new(tx));
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("AO_PVAOUT_NOTIFY", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let captured = writes.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "the pva OUT link must drive exactly one put_value"
+    );
+    assert_eq!(captured[0].0, "REMOTE:OUT");
+    assert_eq!(
+        captured[0].2,
+        LinkPutOp::Async,
+        "an OUT-link write from a put-notify chain must be a \
+         completion-aware Async put (C dbPutLinkAsync / pvxs \
+         pvaPutValueAsync)"
     );
 }
 

@@ -605,17 +605,23 @@ impl PvaLink {
     /// representative config and never drives a sibling's PUT behavior
     /// (pvxs keeps the per-link options on the child `pvaLink`,
     /// `pvalink.h:65`).
+    ///
+    /// `block` requests a completion-aware PUT (`record._options.block`)
+    /// — set when the originating record is in a put-notify /
+    /// blocking-put chain (pvxs `pvaPutValueAsync`); a plain OUT write
+    /// passes `false` (`pvaPutValue`).
     pub async fn put_out_str(
         &self,
         link_cfg: &PvaLinkConfig,
         value_str: &str,
+        block: bool,
     ) -> PvaLinkResult<()> {
         self.stage_and_flush(
             &link_cfg.field,
             link_cfg.proc,
             link_cfg.defer,
             link_cfg.retry,
-            false,
+            block,
             QueuedPut::Str(value_str.to_string()),
         )
         .await
@@ -623,17 +629,20 @@ impl PvaLink {
 
     /// Typed-`PvField` twin of [`Self::put_out_str`] — keeps a large
     /// array on the typed PUT path instead of a string round-trip.
+    /// `block` carries the same put-notify / blocking-put semantics as
+    /// [`Self::put_out_str`].
     pub async fn put_out_field(
         &self,
         link_cfg: &PvaLinkConfig,
         value: &PvField,
+        block: bool,
     ) -> PvaLinkResult<()> {
         self.stage_and_flush(
             &link_cfg.field,
             link_cfg.proc,
             link_cfg.defer,
             link_cfg.retry,
-            false,
+            block,
             QueuedPut::Field(value.clone()),
         )
         .await
@@ -3489,7 +3498,7 @@ mod tests {
             defer: true,
             ..PvaLinkConfig::defaults_for("COAL:PV", LinkDirection::Out)
         };
-        link.put_out_str(&cfg_value, "10")
+        link.put_out_str(&cfg_value, "10", false)
             .await
             .expect("deferred stage is Ok");
         assert_eq!(link.staged_count(), 1, "deferred write staged, not sent");
@@ -3507,7 +3516,7 @@ mod tests {
             proc: ProcMode::Pp,
             ..PvaLinkConfig::defaults_for("COAL:PV", LinkDirection::Out)
         };
-        link.put_out_str(&cfg_setpoint, "20")
+        link.put_out_str(&cfg_setpoint, "20", false)
             .await
             .expect("trigger write flushes the channel");
         assert_eq!(
@@ -3565,8 +3574,10 @@ mod tests {
             defer: true,
             ..PvaLinkConfig::defaults_for("DEFER:PV", LinkDirection::Out)
         };
-        link.put_out_str(&defer_value, "11").await.unwrap();
-        link.put_out_str(&defer_setpoint, "22").await.unwrap();
+        link.put_out_str(&defer_value, "11", false).await.unwrap();
+        link.put_out_str(&defer_setpoint, "22", false)
+            .await
+            .unwrap();
         assert_eq!(
             link.staged_count(),
             2,

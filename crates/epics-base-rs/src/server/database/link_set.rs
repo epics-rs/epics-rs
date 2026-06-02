@@ -57,6 +57,38 @@ pub enum LinkDbfType {
     Enum,
 }
 
+/// How an external OUT-link write should be delivered to the lset.
+///
+/// Mirrors the C dbCore split between a plain link put and a
+/// put-notify-aware put: `dbPutLink` (synchronous, no completion
+/// callback) vs `dbPutLinkAsync` (issued from `dbNotify`, where the
+/// source record's processing is held until the downstream put
+/// completes). pvxs's pvalink lset realises the same split as
+/// `pvaPutValue` (plain, `wait=false`) vs `pvaPutValueAsync`
+/// (`wait=true`, which sets `record._options.block` so the PUT
+/// request carries the block option and the source record is parked
+/// in `after_put` until the server acknowledges completion) —
+/// `pvxs/ioc/pvalink_lset.cpp` `putValue` / `putValueAsync`.
+///
+/// The database selects the op from the write context: a write that
+/// originates inside a put-notify / blocking-put chain (the source
+/// record carries a completion wait-set) uses [`Async`]; a plain
+/// record-processing OUT write uses [`Plain`].
+///
+/// [`Async`]: LinkPutOp::Async
+/// [`Plain`]: LinkPutOp::Plain
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LinkPutOp {
+    /// Plain put — fire-and-forget from the lset's perspective. Maps to
+    /// pvxs `pvaPutValue` (`wait=false`) / C `dbPutLink`.
+    #[default]
+    Plain,
+    /// Completion-aware put — the originating record is part of a
+    /// put-notify / blocking-put chain. Maps to pvxs `pvaPutValueAsync`
+    /// (`wait=true`, `record._options.block`) / C `dbPutLinkAsync`.
+    Async,
+}
+
 /// Remote display / control / valueAlarm metadata snapshot for a
 /// link, as exposed by pvxs's pvalink lset metadata getters.
 ///
@@ -163,12 +195,14 @@ pub trait LinkSet: Send + Sync {
     /// this name.
     fn get_value(&self, name: &str) -> Option<EpicsValue>;
 
-    /// Write `value` to `name`. Returns Err with a human-readable
-    /// reason on failure (denied, type-mismatch, no-such-pv, etc.).
-    /// Default impl rejects all writes — read-only lsets keep the
-    /// default.
-    fn put_value(&self, name: &str, value: EpicsValue) -> Result<(), String> {
-        let _ = (name, value);
+    /// Write `value` to `name` with the delivery semantics named by
+    /// `op` ([`LinkPutOp::Plain`] for a fire-and-forget put,
+    /// [`LinkPutOp::Async`] for a put that is part of a put-notify /
+    /// blocking-put chain). Returns Err with a human-readable reason
+    /// on failure (denied, type-mismatch, no-such-pv, etc.). Default
+    /// impl rejects all writes — read-only lsets keep the default.
+    fn put_value(&self, name: &str, value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
+        let _ = (name, value, op);
         Err("link set is read-only".into())
     }
 

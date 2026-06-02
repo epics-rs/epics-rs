@@ -209,11 +209,16 @@ async fn ca_link_out_write_updates_remote_pv() {
         .await;
     assert!(connected, "CA link must connect before the OUT write");
 
-    use epics_base_rs::server::database::LinkSet;
+    use epics_base_rs::server::database::{LinkPutOp, LinkSet};
     // Bare ` CA`-modified OUT link form: `epics-base-rs` strips the
     // modifier and hands the resolver the bare PV name.
-    LinkSet::put_value(&resolver, "CALINK:OUT:DST", EpicsValue::Double(88.0))
-        .expect("CA-link OUT write must succeed");
+    LinkSet::put_value(
+        &resolver,
+        "CALINK:OUT:DST",
+        EpicsValue::Double(88.0),
+        LinkPutOp::Plain,
+    )
+    .expect("CA-link OUT write must succeed");
 
     // The resolver's monitor sees the server-side change — poll the
     // monitor-backed cache until the write propagates back.
@@ -269,9 +274,14 @@ async fn ca_link_out_write_accepts_scheme_prefix() {
         .await;
     assert!(connected, "scheme-prefixed CA OUT link must connect");
 
-    use epics_base_rs::server::database::LinkSet;
-    LinkSet::put_value(&resolver, "ca://CALINK:OUT:SCHEME", EpicsValue::Long(123))
-        .expect("scheme-prefixed CA-link OUT write must succeed");
+    use epics_base_rs::server::database::{LinkPutOp, LinkSet};
+    LinkSet::put_value(
+        &resolver,
+        "ca://CALINK:OUT:SCHEME",
+        EpicsValue::Long(123),
+        LinkPutOp::Plain,
+    )
+    .expect("scheme-prefixed CA-link OUT write must succeed");
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {

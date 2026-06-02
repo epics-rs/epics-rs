@@ -6,7 +6,7 @@ use crate::server::record::{AlarmSeverity, NotifyWaitSet, RecordInstance, ScanTy
 use crate::types::EpicsValue;
 
 use super::processing::join_put_notify;
-use super::{PvDatabase, SelmKind, SelmResult, select_link_indices_ex};
+use super::{LinkPutOp, PvDatabase, SelmKind, SelmResult, select_link_indices_ex};
 
 /// Alarm state from a link source, used for MS/NMS propagation.
 ///
@@ -664,10 +664,16 @@ impl PvDatabase {
     /// when no lset is registered for the scheme or the lset rejects
     /// the write (the caller folds that into a LINK alarm — it must
     /// never panic).
+    ///
+    /// `op` carries the delivery semantics the lset must honour:
+    /// [`LinkPutOp::Async`] when the write is part of a put-notify /
+    /// blocking-put chain (mirrors C `dbPutLinkAsync` / pvxs
+    /// `pvaPutValueAsync`), [`LinkPutOp::Plain`] otherwise.
     pub(crate) async fn write_external_pv(
         &self,
         name: &str,
         value: EpicsValue,
+        op: LinkPutOp,
     ) -> Result<(), String> {
         let (scheme, body) = if let Some(rest) = name.strip_prefix("pva://") {
             ("pva", rest)
@@ -685,7 +691,7 @@ impl PvDatabase {
             let mut last_err = String::new();
             for s in schemes {
                 if let Some(lset) = registry.get(&s) {
-                    match lset.put_value(name, value.clone()) {
+                    match lset.put_value(name, value.clone(), op) {
                         Ok(()) => {
                             // Production drain of any retry-queued OUT
                             // writes on this lset now that a write has
@@ -709,11 +715,26 @@ impl PvDatabase {
             .await
             .get(scheme)
             .ok_or_else(|| format!("no '{scheme}' link set registered for '{name}'"))?;
-        let result = lset.put_value(body, value);
+        let result = lset.put_value(body, value, op);
         if result.is_ok() {
             lset.flush_puts();
         }
         result
+    }
+
+    /// Map a record's put-completion wait-set to the external-link put
+    /// op. A write that originates inside a put-notify / blocking-put
+    /// chain (the source record carries a completion wait-set) is
+    /// delivered as [`LinkPutOp::Async`] (the pvxs `pvaPutValueAsync` /
+    /// C `dbPutLinkAsync` path); a plain record-processing OUT write is
+    /// [`LinkPutOp::Plain`]. Single owner of the notify→op mapping so
+    /// the external-OUT dispatch sites cannot diverge.
+    fn external_put_op(src_notify: Option<&Arc<NotifyWaitSet>>) -> LinkPutOp {
+        if src_notify.is_some() {
+            LinkPutOp::Async
+        } else {
+            LinkPutOp::Plain
+        }
     }
 
     /// Write a value through a parsed OUT link, dispatching DB links
@@ -750,7 +771,8 @@ impl PvDatabase {
                 let name = link
                     .external_pv_name()
                     .expect("Ca/Pva/PvaJson link carries a PV name");
-                if let Err(e) = self.write_external_pv(name, value).await {
+                let op = Self::external_put_op(src_notify);
+                if let Err(e) = self.write_external_pv(name, value, op).await {
                     eprintln!("OUT-link write to external PV '{name}' failed: {e}");
                 }
             }
@@ -1174,7 +1196,9 @@ impl PvDatabase {
                                 let name = parsed
                                     .external_pv_name()
                                     .expect("Ca/Pva/PvaJson link carries a PV name");
-                                if let Err(e) = self.write_external_pv(name, val.clone()).await {
+                                let op = Self::external_put_op(src_notify.as_ref());
+                                if let Err(e) = self.write_external_pv(name, val.clone(), op).await
+                                {
                                     eprintln!(
                                         "dfanout OUT-link write to external PV '{name}' failed: {e}"
                                     );

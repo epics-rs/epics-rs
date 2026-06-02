@@ -201,16 +201,16 @@ impl IntoServiceResponse for Status {
     }
 }
 
-// Result wrappers — Err short-circuits the dispatch into the
-// PVA error path.
-impl<T: IntoServiceResponse, E: std::fmt::Display> IntoServiceResponse for Result<T, E> {
-    fn into_service_response(self) -> ServiceResponse {
-        match self {
-            Ok(v) => v.into_service_response(),
-            Err(e) => Status::error(e.to_string()).into_service_response(),
-        }
-    }
-}
+// NOTE: there is deliberately no `IntoServiceResponse for Result<T, E>`.
+// A `ServiceResponse` is a *success* payload, so converting a method's
+// `Err` through it could only ever produce a success-shaped reply
+// (an NTRPCStatus with `ok=false`) — exactly the bug where a failed
+// RPC looked successful to the client. Instead, the `#[pva_service]`
+// macro routes a `Result`-returning method's `Err` to
+// `ServiceError::Method`, which the dispatch path turns into a wire
+// `Status::error` (an RPC operation error), matching pvxs
+// `op->error(...)` (`sharedpv.cpp:162-180`). An app that genuinely
+// wants a non-error status payload returns `Ok(Status::error(...))`.
 
 #[cfg(test)]
 mod tests {

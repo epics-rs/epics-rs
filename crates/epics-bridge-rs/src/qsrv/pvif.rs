@@ -61,32 +61,30 @@ impl NtType {
     }
 }
 
-/// Choose the NormativeType for a channel bound to `field`, the single
+/// Choose the NormativeType for a channel bound to a field, the single
 /// owner of NT selection for both the single-record path
 /// ([`super::channel::BridgeChannel`]) and the QSRV group scalar-member
 /// path ([`super::group::GroupChannel`]).
 ///
-/// `VAL` keeps the record-type mapping ([`NtType::from_record_type`]). A
-/// non-`VAL` field's NT is chosen from its *resolved value's* final
-/// DBR/DBF type and element count, mirroring pvxs, which builds every
-/// channel prototype from `dbChannelFinalFieldType(chan)`
+/// The NT is chosen from the field's *resolved value's* final DBR/DBF
+/// type and element count, mirroring pvxs, which builds every channel
+/// prototype from `dbChannelFinalFieldType(chan)`
 /// (singlesource.cpp:189-205; group members via `getTypeDefForChannel` /
 /// `IOCSource::getChannelValueType`, groupconfigprocessor.cpp:867-974):
 /// `DBF_ENUM`/`DBF_MENU`/`DBF_DEVICE` resolve to `DBR_ENUM`
 /// (db/dbAccess.c:88-90) and select `NTEnum`, an array field selects
-/// `NTScalarArray`, and everything else is `NTScalar`. Deriving NT from
-/// the configured field's resolved value — not from
-/// `Record::record_type()` — is what lets a `REC.SCAN` member become
-/// NTEnum and a `BI.DESC` member stay NTScalar string (the record type
-/// would otherwise mis-route both).
-pub(crate) fn nt_type_for_field(
-    record_type: &str,
-    field: &str,
-    value: Option<&EpicsValue>,
-) -> NtType {
-    if field.eq_ignore_ascii_case("VAL") {
-        return NtType::from_record_type(record_type);
-    }
+/// `NTScalarArray`, and everything else is `NTScalar`.
+///
+/// This applies uniformly to `VAL` and every other field — there is no
+/// record-type-name short-circuit for `VAL`. A `bi`/`bo`/`mbbi`/`mbbo`
+/// **and** `busy` `VAL` all resolve to an enum value and become `NTEnum`;
+/// an `aai`/`waveform`/`compress` `VAL` resolves to an array and becomes
+/// `NTScalarArray`; a `REC.SCAN` member becomes `NTEnum`; a `BI.DESC`
+/// member stays `NTScalar` string. Deriving NT from the resolved value —
+/// not from `Record::record_type()` — keeps the advertised NT in lockstep
+/// with pvxs `dbChannelFinalFieldType` for every record, including the
+/// `DBF_ENUM` records (e.g. `busy`) a record-type name list would omit.
+pub(crate) fn nt_type_for_field(value: Option<&EpicsValue>) -> NtType {
     match value {
         // DBF_ENUM/MENU/DEVICE → DBR_ENUM → NTEnum (scalar index +
         // choices). An enum *array* has no scalar-index NTEnum shape,
@@ -1338,6 +1336,38 @@ mod tests {
         assert_eq!(NtType::from_record_type("waveform"), NtType::ScalarArray);
         assert_eq!(NtType::from_record_type("calc"), NtType::Scalar);
         assert_eq!(NtType::from_record_type("mbbi"), NtType::Enum);
+    }
+
+    /// `nt_type_for_field` derives the NT purely from the resolved value,
+    /// with no record-type-name short-circuit for `VAL`. A `busy` VAL
+    /// resolves to an enum value and must select NTEnum (was NTScalar
+    /// under the old name-list short-circuit that omitted `busy`); arrays
+    /// select NTScalarArray; scalars and an unresolved value select
+    /// NTScalar — matching pvxs `dbChannelFinalFieldType` for every record.
+    #[test]
+    fn nt_type_for_field_derives_from_value() {
+        // DBF_ENUM value (bi/bo/mbbi/mbbo AND busy) → NTEnum.
+        assert_eq!(nt_type_for_field(Some(&EpicsValue::Enum(2))), NtType::Enum);
+        // Array value → NTScalarArray (aai/waveform/compress VAL etc.).
+        assert_eq!(
+            nt_type_for_field(Some(&EpicsValue::DoubleArray(vec![1.0, 2.0]))),
+            NtType::ScalarArray
+        );
+        assert_eq!(
+            nt_type_for_field(Some(&EpicsValue::LongArray(vec![1, 2]))),
+            NtType::ScalarArray
+        );
+        // Plain scalar → NTScalar.
+        assert_eq!(
+            nt_type_for_field(Some(&EpicsValue::Double(3.0))),
+            NtType::Scalar
+        );
+        assert_eq!(
+            nt_type_for_field(Some(&EpicsValue::Long(7))),
+            NtType::Scalar
+        );
+        // Unresolved value → NTScalar (uniform with the non-VAL path).
+        assert_eq!(nt_type_for_field(None), NtType::Scalar);
     }
 
     #[test]

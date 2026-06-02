@@ -935,8 +935,7 @@ impl GroupChannel {
                 // enum choices (e.g. `.SCAN`). Matches the single-record
                 // path and pvxs's per-channel `getChannelValueType`
                 // (groupconfigprocessor.cpp:960-974).
-                let rtyp = instance.record.record_type();
-                let nt_type = pvif::nt_type_for_field(rtyp, field_name, Some(&snapshot.value));
+                let nt_type = pvif::nt_type_for_field(Some(&snapshot.value));
                 Ok(PvField::Structure(pvif::snapshot_to_pv_structure(
                     &snapshot, nt_type,
                 )))
@@ -1014,10 +1013,9 @@ impl GroupChannel {
             .ok_or_else(|| BridgeError::RecordNotFound(record_name.to_string()))?;
 
         let instance = rec.read().await;
-        let rtyp = instance.record.record_type();
         let field_upper = field_name.to_ascii_uppercase();
         let resolved = instance.resolve_field(&field_upper);
-        let nt_type = pvif::nt_type_for_field(rtyp, &field_upper, resolved.as_ref());
+        let nt_type = pvif::nt_type_for_field(resolved.as_ref());
         let value_dbf = resolved
             .as_ref()
             .map(|v| v.db_field_type())

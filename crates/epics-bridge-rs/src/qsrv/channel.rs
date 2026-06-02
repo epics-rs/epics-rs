@@ -433,7 +433,6 @@ impl BridgeChannel {
             .ok_or_else(|| BridgeError::RecordNotFound(record_name.to_string()))?;
 
         let instance = rec.read().await;
-        let rtyp = instance.record.record_type();
         // Resolve the bound field's actual value once (record field →
         // common field → virtual field). This is the single source of
         // truth for both the served DBF type and (below) the NT shape,
@@ -474,7 +473,7 @@ impl BridgeChannel {
             {
                 NtType::LongString
             } else {
-                pvif::nt_type_for_field(rtyp, &field_upper, resolved.as_ref())
+                pvif::nt_type_for_field(resolved.as_ref())
             };
             (resolved, nt_type)
         };

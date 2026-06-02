@@ -804,7 +804,7 @@ impl PvaClient {
             crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
                 .await?
                 .0
-                .byte_order,
+                .byte_order(),
             crate::proto::ByteOrder::Big
         );
         let bytes = request.encode(big_endian);
@@ -1010,7 +1010,7 @@ impl PvaClient {
                     )
                     .await?
                     .0
-                    .byte_order,
+                    .byte_order(),
                     crate::proto::ByteOrder::Big
                 );
                 let bytes = req.encode(big_endian);
@@ -1056,7 +1056,7 @@ impl PvaClient {
                     )
                     .await?
                     .0
-                    .byte_order,
+                    .byte_order(),
                     crate::proto::ByteOrder::Big
                 );
                 let bytes = req.encode(big_endian);
@@ -1154,7 +1154,7 @@ impl PvaClient {
             crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
                 .await?
                 .0
-                .byte_order,
+                .byte_order(),
             crate::proto::ByteOrder::Big
         );
         let bytes = request.encode(big_endian);
@@ -1179,7 +1179,7 @@ impl PvaClient {
             crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
                 .await?
                 .0
-                .byte_order,
+                .byte_order(),
             crate::proto::ByteOrder::Big
         );
         let bytes = request.encode(big_endian);
@@ -1215,7 +1215,7 @@ impl PvaClient {
                     )
                     .await?
                     .0
-                    .byte_order,
+                    .byte_order(),
                     crate::proto::ByteOrder::Big
                 );
                 Some(req.encode(big_endian))
@@ -1247,7 +1247,7 @@ impl PvaClient {
             crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
                 .await?
                 .0
-                .byte_order,
+                .byte_order(),
             crate::proto::ByteOrder::Big
         );
         let bytes = request.encode(big_endian);
@@ -1273,7 +1273,7 @@ impl PvaClient {
             crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
                 .await?
                 .0
-                .byte_order;
+                .byte_order();
         let mut bytes = Vec::new();
         let desc = pv_request.descriptor();
         crate::pvdata::encode::encode_type_desc(&desc, order, &mut bytes);
@@ -1306,7 +1306,7 @@ impl PvaClient {
             crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
                 .await?
                 .0
-                .byte_order,
+                .byte_order(),
             crate::proto::ByteOrder::Big
         );
         let bytes = request.encode(big_endian);
@@ -1426,7 +1426,7 @@ impl PvaClient {
         // it would fail a live-but-slow monitor at `op_timeout` instead
         // of retrying — wrong for a long-lived subscription.
         let big_endian = matches!(
-            ch.ensure_active().await?.0.byte_order,
+            ch.ensure_active().await?.0.byte_order(),
             crate::proto::ByteOrder::Big
         );
         // Flow control comes from the SAME request the wire bytes are
@@ -1529,7 +1529,7 @@ impl PvaClient {
         let (raw_pv_req, flow) = match request {
             Some(req) => {
                 let big_endian = matches!(
-                    ch.ensure_active().await?.0.byte_order,
+                    ch.ensure_active().await?.0.byte_order(),
                     crate::proto::ByteOrder::Big
                 );
                 let flow = crate::client_native::ops_v2::MonitorFlow::from_record_options(
@@ -1759,7 +1759,7 @@ impl PvaClient {
             crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
                 .await?
                 .0
-                .byte_order;
+                .byte_order();
         let mut bytes = Vec::new();
         let desc = pv_request.descriptor();
         crate::pvdata::encode::encode_type_desc(&desc, order, &mut bytes);
@@ -2164,7 +2164,7 @@ impl PvaClient {
                     continue;
                 }
             };
-            let order = server.byte_order;
+            let order = server.byte_order();
             let codec = crate::codec::PvaCodec {
                 big_endian: matches!(order, crate::proto::ByteOrder::Big),
             };
@@ -2305,7 +2305,7 @@ impl PvaClient {
                 *channel.cached_get.lock() = Some(warm);
             } else {
                 // Tear down the abandoned (sid, ioid) — best effort.
-                let order = warm.server.upgrade().map(|srv| srv.byte_order);
+                let order = warm.server.upgrade().map(|srv| srv.byte_order());
                 if let (Some(srv), Some(order)) = (warm.server.upgrade(), order) {
                     let codec = crate::codec::PvaCodec {
                         big_endian: matches!(order, crate::proto::ByteOrder::Big),

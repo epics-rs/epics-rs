@@ -352,7 +352,22 @@ fn apply_monitor_event(
     })();
 
     let Some((changed, v)) = decoded else {
-        return MonitorEventOutcome::default();
+        // Decode failure (truncated / malformed / descriptor-inconsistent
+        // frame). The event still ARRIVED: C marks `havedata = true`
+        // unconditionally at the top of MonitorCacheEntry::monitorEvent
+        // (moncache.cpp:132-133), before its copy loop, so the
+        // first-event/`havedata` signal does not depend on a successful
+        // decode. Mirror that — report `was_first` when no prior event has
+        // been seen so `raw_cb` fires `first_event` and `await_first_event`
+        // does not time out and evict a connectable PV as not-found. There
+        // is no decoded value to merge, so `value` stays `None` and
+        // `state.latest` is left untouched; the raw frame itself is still
+        // cached and fanned out by the caller regardless of this decode.
+        return MonitorEventOutcome {
+            was_first: state.read().introspection.is_none(),
+            type_changed: false,
+            value: None,
+        };
     };
 
     let mut s = state.write();
@@ -1861,6 +1876,53 @@ mod tests {
             state.read().latest,
             Some(PvField::Scalar(ScalarValue::Double(3.0))),
             "snapshot must track the live value across many events"
+        );
+    }
+
+    /// BRPVAGW-4 regression: a monitor event whose body fails to decode
+    /// still counts as "first event arrived". C marks `havedata = true`
+    /// unconditionally at the top of `MonitorCacheEntry::monitorEvent`
+    /// (moncache.cpp:132-133), before any value copy, so the
+    /// first-event/`havedata` signal does not depend on a successful decode.
+    /// Pre-fix the decode-failure path returned `MonitorEventOutcome::
+    /// default()` (was_first=false), so a malformed FIRST frame never fired
+    /// `first_event` and `await_first_event` timed out and evicted a
+    /// connectable PV as not-found.
+    #[test]
+    fn brpvagw4_decode_failure_first_event_still_signals_arrival() {
+        let desc = FieldDesc::Scalar(ScalarType::Double);
+        let state = RwLock::new(EntryState::default());
+
+        // An empty body fails `BitSet::decode` (size byte short-reads) →
+        // the decode-failure path.
+        let outcome = apply_monitor_event(&state, &desc, &[], ByteOrder::Little);
+        assert!(
+            outcome.was_first,
+            "a decode failure on the FIRST event must still report was_first \
+             (C havedata=true) so first_event fires and the entry is not evicted"
+        );
+        assert!(
+            outcome.value.is_none(),
+            "no decoded value to report on failure"
+        );
+        assert!(!outcome.type_changed, "decode failure is not a type change");
+        assert!(
+            state.read().latest.is_none(),
+            "decode failure must not fabricate a snapshot value"
+        );
+
+        // The failure path does NOT set introspection, so the first
+        // DECODABLE event is still treated as the first and establishes the
+        // real snapshot.
+        let body = encode_body(&desc, &PvField::Scalar(ScalarValue::Double(7.0)), &[0]);
+        let o2 = apply_monitor_event(&state, &desc, &body, ByteOrder::Little);
+        assert!(
+            o2.was_first,
+            "the first successfully-decoded event after a failed one is still first"
+        );
+        assert_eq!(
+            state.read().latest,
+            Some(PvField::Scalar(ScalarValue::Double(7.0)))
         );
     }
 

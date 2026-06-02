@@ -408,6 +408,58 @@ impl PvaLink {
                 }
             });
             monitor_abort = Some(MonitorAbort(join.abort_handle()));
+        } else if matches!(config.direction, LinkDirection::Out) {
+            // pvxs pvalink runs a monitor on EVERY channel — INP *and*
+            // OUT — to maintain `lchan->connected`
+            // (`pvalink_channel.cpp:342-363`); the OUT-write gate
+            // `valid()` is `connected && root` (`pvalink_link.cpp:69`,
+            // applied at `pvalink_lset.cpp:609`). An OUT link must
+            // therefore track connection too, even though it never reads
+            // the cached value: without it `is_connected()` (the
+            // `latest.is_some()` fallback) is permanently false for OUT
+            // links, so the non-retry write gate below would drop every
+            // OUT write. This is the same re-subscribe-with-backoff loop
+            // as the INP monitor, stripped to connection-tracking only —
+            // no value cache, no scan triggers, no disconnect-time
+            // capture (those are INP-read concerns).
+            let pv_name = config.pv_name.clone();
+            let client_clone = client.clone();
+            let connected = Arc::new(AtomicBool::new(false));
+            let connected_for_task = connected.clone();
+            monitor_connected = Some(connected);
+            let join = tokio::spawn(async move {
+                let mut backoff = Duration::from_millis(250);
+                let max_backoff = Duration::from_secs(30);
+                loop {
+                    let connected_inner = connected_for_task.clone();
+                    // Liveness is proven by a delivered event (the
+                    // monitor's initial value on connect), not by
+                    // entering `pvmonitor`; the value itself is ignored.
+                    let on_event = move |_value: &PvField| {
+                        connected_inner.store(true, Ordering::Release);
+                    };
+                    let result = client_clone.pvmonitor(&pv_name, on_event).await;
+                    // Subscription ended — reflect the disconnect so the
+                    // OUT-write gate sees `is_connected() == false` until
+                    // re-subscribed.
+                    connected_for_task.store(false, Ordering::Release);
+                    match &result {
+                        Ok(()) => tracing::debug!(
+                            pv = %pv_name,
+                            "pvalink: OUT connection monitor ended, re-subscribing"
+                        ),
+                        Err(e) => tracing::warn!(
+                            pv = %pv_name,
+                            error = %e,
+                            backoff_ms = backoff.as_millis() as u64,
+                            "pvalink: OUT connection monitor failed, will retry"
+                        ),
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff * 2, max_backoff);
+                }
+            });
+            monitor_abort = Some(MonitorAbort(join.abort_handle()));
         }
 
         Ok(Self {
@@ -664,6 +716,20 @@ impl PvaLink {
     ) -> PvaLinkResult<()> {
         if matches!(self.config.direction, LinkDirection::Inp) {
             return Err(PvaLinkError::NotWritable);
+        }
+        // pvxs `pvaPutValueX` gates EVERY put — deferred or not — on
+        // `if(!self->retry && !self->valid()) return -1`
+        // (`pvalink_lset.cpp:609`), BEFORE staging into `put_scratch`.
+        // A non-retry write to a disconnected channel would fail
+        // identically on every replay, so it must not occupy the
+        // scratch (nor return Ok on the deferred path). `retry` links
+        // skip this gate and queue for replay instead — the disconnect
+        // is handled in `flush_scratch`, which restores the staged
+        // value and arms the production drain. This `retry` is the
+        // PER-CALL link's option (combine-PUT siblings carry their own),
+        // and `is_connected()` is the shared channel's connection truth.
+        if !retry && !self.is_connected() {
+            return Err(PvaLinkError::Disconnected(self.config.pv_name.clone()));
         }
         self.stage_put(
             field,
@@ -1322,6 +1388,14 @@ impl PvaLink {
     /// `PvaServer` address). Lets a server-backed test exercise the
     /// real `write` / `write_pv_field` wire paths without UDP
     /// discovery.
+    ///
+    /// The link is marked CONNECTED (`monitor_connected = Some(true)`):
+    /// a link built around a live, server-pinned client stands in for
+    /// one whose channel monitor has already delivered its first event,
+    /// so the OUT-write disconnect gate (`stage_and_flush`) lets non-retry
+    /// writes through to the real wire path. A test wanting the
+    /// disconnected case uses [`Self::for_test`] (no client) or
+    /// [`Self::for_test_with_monitor_flag`] with the flag left false.
     #[cfg(test)]
     pub(crate) fn for_test_with_client(config: PvaLinkConfig, client: PvaClient) -> Self {
         Self {
@@ -1329,7 +1403,7 @@ impl PvaLink {
             config,
             client,
             latest: Arc::new(Mutex::new(None)),
-            monitor_connected: None,
+            monitor_connected: Some(Arc::new(AtomicBool::new(true))),
             notify_rx: Mutex::new(None),
             out_scratch: Mutex::new(HashMap::new()),
             retry_pending: AtomicBool::new(false),
@@ -1338,11 +1412,14 @@ impl PvaLink {
         }
     }
 
-    /// Test-only constructor for an INP+monitor link whose
-    /// live-connection flag is externally controllable. Returns the
-    /// link plus the shared `AtomicBool` so a test can simulate the
+    /// Test-only constructor for a link whose live-connection flag is
+    /// externally controllable (INP+monitor or OUT). Returns the link
+    /// plus the shared `AtomicBool` so a test can simulate the
     /// re-subscribe loop's connect / event / disconnect transitions
-    /// (B-pvalink-restart) without standing up a PVA server.
+    /// (B-pvalink-restart) without standing up a PVA server. For an OUT
+    /// link, setting the flag `true` stands in for the channel monitor
+    /// having connected, so the `stage_and_flush` disconnect gate lets
+    /// non-retry writes stage (offline staging/coalescing tests).
     #[cfg(test)]
     pub(crate) fn for_test_with_monitor_flag(
         config: PvaLinkConfig,
@@ -2438,6 +2515,17 @@ mod tests {
         }
     }
 
+    /// A CONNECTED OUT link for offline staging/coalescing tests:
+    /// stands in for an OUT channel whose connection monitor has
+    /// fired, so the `stage_and_flush` disconnect gate
+    /// (`pvalink_lset.cpp:609`) lets non-retry writes stage without a
+    /// live server. The disconnected case uses [`PvaLink::for_test`].
+    fn connected_out(defer: bool, retry: bool) -> PvaLink {
+        let (link, flag) = PvaLink::for_test_with_monitor_flag(out_cfg(defer, retry), None);
+        flag.store(true, Ordering::Release);
+        link
+    }
+
     /// Read the single staged value (tests stage exactly one field).
     fn sole_staged(link: &PvaLink) -> Option<QueuedPut> {
         link.out_scratch
@@ -2449,7 +2537,10 @@ mod tests {
 
     #[tokio::test]
     async fn b4_defer_coalesces_to_most_recent() {
-        let link = PvaLink::for_test(out_cfg(true, false), None);
+        // Connected OUT link: the disconnect gate lets these non-retry
+        // deferred writes stage so the most-recent-wins coalescing is
+        // what's exercised, not the gate.
+        let link = connected_out(true, false);
         assert_eq!(link.staged_count(), 0);
         // defer=true: write stages, returns Ok without a server.
         link.write("42").await.expect("deferred write is Ok");
@@ -2477,14 +2568,14 @@ mod tests {
     /// `write_pv_field` is staged as `QueuedPut::Field` verbatim.
     #[tokio::test]
     async fn minor_deferred_string_put_keeps_string_form() {
-        let str_link = PvaLink::for_test(out_cfg(true, false), None);
+        let str_link = connected_out(true, false);
         str_link.write("42").await.unwrap();
         match sole_staged(&str_link) {
             Some(QueuedPut::Str(s)) => assert_eq!(s, "42"),
             other => panic!("string write must stage QueuedPut::Str, got {other:?}"),
         }
 
-        let field_link = PvaLink::for_test(out_cfg(true, false), None);
+        let field_link = connected_out(true, false);
         field_link
             .write_pv_field(&PvField::Scalar(ScalarValue::Double(1.0)))
             .await
@@ -2511,22 +2602,58 @@ mod tests {
 
     #[tokio::test]
     async fn b4_no_retry_surfaces_disconnect_error() {
-        // retry=false, no server → write must surface the error and
-        // stage nothing.
+        // retry=false, disconnected (no client) → the `stage_and_flush`
+        // gate (pvxs `pvalink_lset.cpp:609` `!retry && !valid()`) drops
+        // the write before staging: surface the error, stage nothing.
         let link = PvaLink::for_test(out_cfg(false, false), None);
         let r = link.write("7").await;
-        assert!(r.is_err(), "non-retry write must error on disconnect");
+        assert!(
+            matches!(r, Err(PvaLinkError::Disconnected(_))),
+            "non-retry write must surface a disconnect error, got {r:?}"
+        );
         assert_eq!(link.staged_count(), 0);
+        assert!(!link.retry_pending.load(Ordering::Acquire));
+    }
+
+    /// BRPVALINK-2 regression: a DEFERRED non-retry write to a
+    /// disconnected channel must error and stage NOTHING — pvxs gates
+    /// every put, deferred or not, on `!retry && !valid()` at the very
+    /// top of `pvaPutValueX`, BEFORE the `if(!defer) lchan->put()`
+    /// branch (`pvalink_lset.cpp:609,653`). Pre-fix this Rust path had
+    /// no such gate: a deferred write returned `Ok` and left a value in
+    /// the scratch even though the upstream was unreachable, so a value
+    /// that could never be delivered sat queued forever and the owning
+    /// record never saw the disconnect alarm. The non-deferred sibling
+    /// is covered by `b4_no_retry_surfaces_disconnect_error`.
+    #[tokio::test]
+    async fn defer_no_retry_to_disconnected_upstream_errors() {
+        // defer=true, retry=false, disconnected (no client).
+        let link = PvaLink::for_test(out_cfg(true, false), None);
+        assert!(!link.is_connected(), "no client ⟹ disconnected");
+        let r = link.write("9").await;
+        assert!(
+            matches!(r, Err(PvaLinkError::Disconnected(_))),
+            "deferred non-retry write to a disconnected channel must error \
+             (pre-fix it returned Ok and staged), got {r:?}"
+        );
+        assert_eq!(
+            link.staged_count(),
+            0,
+            "the undeliverable value must NOT occupy the scratch"
+        );
         assert!(!link.retry_pending.load(Ordering::Acquire));
     }
 
     #[tokio::test]
     async fn b4_flush_drops_value_when_no_retry() {
-        // defer link, retry=false; flush against no server. The staged
-        // value's Put fails on disconnect → with retry=false it is
-        // dropped (it would fail identically on every replay), leaving
-        // the scratch empty and an error for the record to alarm on.
-        let link = PvaLink::for_test(out_cfg(true, false), None);
+        // defer link, retry=false; staged while connected, then flushed
+        // against no server. The staged value's Put fails on disconnect
+        // → with retry=false it is dropped (it would fail identically on
+        // every replay), leaving the scratch empty and an error for the
+        // record to alarm on. Connected so the staging gate passes; the
+        // failure is the real PUT (no server behind the test client),
+        // i.e. this exercises the flush-time drop, not the stage gate.
+        let link = connected_out(true, false);
         link.write("1").await.unwrap();
         link.write("2").await.unwrap();
         // Coalesced to one staged value ("2").
@@ -3302,7 +3429,10 @@ mod tests {
             defer: true,
             ..PvaLinkConfig::defaults_for("BR11:PV", LinkDirection::Out)
         };
-        let link = PvaLink::for_test(cfg, None);
+        // Connected so the disconnect gate lets the deferred write
+        // stage (we're checking the defer path enqueues, not the gate).
+        let (link, flag) = PvaLink::for_test_with_monitor_flag(cfg, None);
+        flag.store(true, Ordering::Release);
         // Deferred write queues without hitting the network.
         tokio::runtime::Builder::new_current_thread()
             .build()

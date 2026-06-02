@@ -38,6 +38,44 @@ use super::pvlist::PvList;
 use super::stats::Stats;
 use super::upstream::{UpstreamManager, UpstreamManagerConfig};
 
+/// Whether the gateway caches upstream values or forwards each read.
+///
+/// Mirrors C ca-gateway's `cacheMode` (`gateResources.h:116-117`,
+/// default `true` — caching on; `-no_cache` clears it,
+/// `gateway.cc:238/1162`).
+///
+/// - [`CacheMode::Cached`] (default): every resolved PV holds a
+///   persistent upstream monitor; downstream GETs are served from the
+///   last cached monitor value (the shadow PV's stored snapshot). This is
+///   the original gateway behaviour.
+/// - [`CacheMode::NoCache`]: a resolved PV does NOT hold a persistent
+///   upstream monitor. Each downstream GET is forwarded as a fresh
+///   upstream get (via a [`ReadHook`](epics_base_rs::server::pv::ReadHook)
+///   on the shadow PV), and the upstream monitor is created lazily — only
+///   while at least one downstream client is actually monitoring the PV —
+///   then dropped when the last monitor leaves. Matches C ca-gateway
+///   `-no_cache`: "Every get request will be forwarded to the ioc and
+///   monitor will be created only if needed" (`gateway.cc:1454-1455`,
+///   `gatePvData::getCB` no-cache branch `gatePv.cc:1737-1753`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheMode {
+    /// Cache upstream values; serve GETs from the shadow snapshot;
+    /// persistent upstream monitor per resolved PV. The default.
+    #[default]
+    Cached,
+    /// Forward every GET to upstream; create the upstream monitor only
+    /// while a downstream client is monitoring the PV.
+    NoCache,
+}
+
+impl CacheMode {
+    /// Whether reads are forwarded fresh to upstream rather than served
+    /// from the shadow cache.
+    pub fn is_no_cache(self) -> bool {
+        matches!(self, CacheMode::NoCache)
+    }
+}
+
 /// Configuration for [`GatewayServer`].
 ///
 /// `Debug` is implemented manually (see below) rather than derived:
@@ -97,6 +135,12 @@ pub struct GatewayConfig {
     pub reconnect_inhibit: Duration,
     /// Read-only mode: rejects all puts.
     pub read_only: bool,
+    /// Cache mode (C `cacheMode` / `-no_cache`). [`CacheMode::Cached`]
+    /// (default) holds a persistent upstream monitor per PV and serves
+    /// GETs from the shadow cache; [`CacheMode::NoCache`] forwards each
+    /// GET to upstream and creates the upstream monitor only while a
+    /// downstream client is monitoring. See [`CacheMode`].
+    pub cache_mode: CacheMode,
     /// Upstream-monitor event mask (C `-mask`). Selects which `DBE_*`
     /// events the gateway's upstream subscriptions request. Defaults to
     /// [`DEFAULT_EVENT_MASK`] (`DBE_VALUE | DBE_ALARM`), matching
@@ -148,6 +192,7 @@ impl Default for GatewayConfig {
             // C++ GATE_RECONNECT_INHIBIT default (BeaconAnomaly::new).
             reconnect_inhibit: Duration::from_secs(60 * 5),
             read_only: false,
+            cache_mode: CacheMode::default(),
             event_mask: DEFAULT_EVENT_MASK,
             #[cfg(feature = "ca-gateway-tls")]
             tls: None,
@@ -183,6 +228,7 @@ impl std::fmt::Debug for GatewayConfig {
             .field("heartbeat_interval", &self.heartbeat_interval)
             .field("reconnect_inhibit", &self.reconnect_inhibit)
             .field("read_only", &self.read_only)
+            .field("cache_mode", &self.cache_mode)
             .field("event_mask", &self.event_mask);
         #[cfg(feature = "ca-gateway-tls")]
         {
@@ -400,6 +446,11 @@ impl GatewayServer {
             putlog_scope: config.putlog_scope,
             stats: stats.clone(),
             read_only: config.read_only,
+            // C `cacheMode` / `-no_cache`: NoCache forwards each GET to
+            // upstream and gates the upstream monitor on live downstream
+            // monitor interest; Cached holds a persistent monitor and
+            // serves GETs from the shadow snapshot.
+            cache_mode: config.cache_mode,
             // Single connect-timeout owner: the lazy-resolution
             // `wait_connected` gate uses the same configured budget as the
             // cache reaper instead of a local constant (parity with C
@@ -880,6 +931,12 @@ impl GatewayServer {
         let conn_handle = if let Some(mut rx) = conn_rx {
             let stats_for_conn = stats.clone();
             let cache_for_conn = self.cache.clone();
+            // No-cache: the connection-event owner is also the owner of
+            // the lazy upstream-monitor lifetime — it calls
+            // `ensure_monitor`/`release_monitor` on the first/last
+            // downstream monitor. Cached mode never touches these.
+            let upstream_for_conn = self.upstream.clone();
+            let cache_mode = self.config.cache_mode;
             Some(tokio::spawn(async move {
                 use super::downstream::ConnEventRecv;
                 use epics_ca_rs::server::ServerConnectionEvent;
@@ -901,6 +958,15 @@ impl GatewayServer {
                 // state. We mirror every Created here and drain the
                 // peer's entries on Disconnected as a safety net.
                 let mut peer_channels: HashMap<std::net::SocketAddr, Vec<(String, u32)>> =
+                    HashMap::new();
+                // No-cache: per-peer OPEN-MONITOR registry, parallel to
+                // `peer_channels` but keyed on `EVENT_ADD`/`EVENT_CANCEL`
+                // (sub_id) rather than CREATE/CLEAR (cid) — a plain caget
+                // opens a channel but no monitor. Drives the lazy upstream
+                // monitor and is drained on a hard `Disconnected` so a
+                // peer that vanishes without `EVENT_CANCEL` still releases
+                // its monitor interest. Stays empty in cached mode.
+                let mut peer_monitors: HashMap<std::net::SocketAddr, Vec<(String, u32)>> =
                     HashMap::new();
                 loop {
                     let event = match rx.recv().await {
@@ -937,6 +1003,24 @@ impl GatewayServer {
                                     }
                                 }
                             }
+                            // No-cache safety net: a hard close may skip
+                            // EVENT_CANCEL, so drain this peer's open
+                            // monitors and drop the upstream monitor for
+                            // any PV that hit zero monitor interest.
+                            if let Some(monitors) = peer_monitors.remove(&addr) {
+                                for (pv_name, msid) in monitors {
+                                    let became_empty =
+                                        match cache_for_conn.read().await.get(&pv_name) {
+                                            Some(entry) => {
+                                                entry.write().await.remove_monitor_interest(msid)
+                                            }
+                                            None => false,
+                                        };
+                                    if became_empty {
+                                        upstream_for_conn.release_monitor(&pv_name);
+                                    }
+                                }
+                            }
                         }
                         ServerConnectionEvent::ChannelCreated { peer, pv_name, cid } => {
                             let sid = synthetic_sid(peer, &pv_name, cid);
@@ -954,6 +1038,54 @@ impl GatewayServer {
                                 channels.retain(|(p, s)| !(p == &pv_name && *s == sid));
                                 if channels.is_empty() {
                                     peer_channels.remove(&peer);
+                                }
+                            }
+                        }
+                        // No-cache lazy upstream monitor: the FIRST
+                        // downstream monitor (`EVENT_ADD`) on a PV creates
+                        // the upstream subscription; the LAST monitor
+                        // (`EVENT_CANCEL` / teardown) drops it. Cached mode
+                        // ignores these — its monitor is always present.
+                        // Mirrors C ca-gateway no-cache `vc->needPosting()`
+                        // gating `pv->monitor()` (gatePv.cc:1737-1753).
+                        ServerConnectionEvent::SubscriptionOpened {
+                            peer,
+                            pv_name,
+                            sub_id,
+                        } => {
+                            if cache_mode.is_no_cache() {
+                                let msid = synthetic_sid(peer, &pv_name, sub_id);
+                                let became_first = match cache_for_conn.read().await.get(&pv_name) {
+                                    Some(entry) => entry.write().await.add_monitor_interest(msid),
+                                    None => false,
+                                };
+                                if became_first {
+                                    upstream_for_conn.ensure_monitor(&pv_name);
+                                }
+                                peer_monitors.entry(peer).or_default().push((pv_name, msid));
+                            }
+                        }
+                        ServerConnectionEvent::SubscriptionClosed {
+                            peer,
+                            pv_name,
+                            sub_id,
+                        } => {
+                            if cache_mode.is_no_cache() {
+                                let msid = synthetic_sid(peer, &pv_name, sub_id);
+                                let became_empty = match cache_for_conn.read().await.get(&pv_name) {
+                                    Some(entry) => {
+                                        entry.write().await.remove_monitor_interest(msid)
+                                    }
+                                    None => false,
+                                };
+                                if became_empty {
+                                    upstream_for_conn.release_monitor(&pv_name);
+                                }
+                                if let Some(monitors) = peer_monitors.get_mut(&peer) {
+                                    monitors.retain(|(p, s)| !(p == &pv_name && *s == msid));
+                                    if monitors.is_empty() {
+                                        peer_monitors.remove(&peer);
+                                    }
                                 }
                             }
                         }

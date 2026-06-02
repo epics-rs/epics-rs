@@ -111,6 +111,12 @@ struct Args {
     #[arg(long)]
     ca_read_only: bool,
 
+    /// CA gateway: disable caching (C `-no_cache`): forward every get
+    /// request to the IOC and create the upstream monitor only while a
+    /// downstream client is monitoring the PV. Default is caching on.
+    #[arg(long)]
+    ca_no_cache: bool,
+
     /// CA gateway: upstream monitor event mask (C `-mask`). DBE selector
     /// characters `v`=value, `a`=alarm, `l`=log/archive, `p`=property
     /// (case-insensitive). Unset — or no recognised selector — keeps the
@@ -245,6 +251,7 @@ struct CaSection {
     cip: Option<String>,
     cport: Option<u16>,
     read_only: Option<bool>,
+    no_cache: Option<bool>,
     stats_prefix: Option<String>,
     heartbeat_interval: Option<u64>,
     cleanup_interval: Option<u64>,
@@ -294,6 +301,7 @@ fn default_config_toml() -> &'static str {
 # cip = "10.0.0.1 10.0.0.2"              # -cip: EPICS_CA_ADDR_LIST (+AUTO=NO)
 # cport = 5066                           # -cport: EPICS_CA_SERVER_PORT
 # read_only = false
+# no_cache = false                       # -no_cache: forward gets, lazy monitor
 # stats_prefix = "gateway"               # bare namespace; ':' added at publish
 # heartbeat_interval = 1
 # cleanup_interval = 10
@@ -363,6 +371,15 @@ async fn run_ca_gateway(args: &Args) -> Result<(), String> {
             Some(Duration::from_secs(args.ca_heartbeat_interval))
         },
         read_only: args.ca_read_only,
+        // C `cacheMode` / `-no_cache`: NoCache forwards every get to the
+        // IOC and lazily creates the upstream monitor only while a
+        // downstream client is monitoring; default Cached keeps a
+        // persistent upstream monitor and serves gets from the cache.
+        cache_mode: if args.ca_no_cache {
+            epics_bridge_rs::ca_gateway::CacheMode::NoCache
+        } else {
+            epics_bridge_rs::ca_gateway::CacheMode::Cached
+        },
         // C `-mask` resolution (gateway.cc:736-766 / :1146): absent or
         // unrecognised spec keeps DBE_VALUE|DBE_ALARM, never the
         // DBE_LOG-bearing CaChannel subscribe() default.
@@ -484,6 +501,11 @@ fn merge_config(args: &mut Args, cfg: &ConfigFile) {
     if !args.ca_read_only {
         if let Some(true) = cfg.ca.read_only {
             args.ca_read_only = true;
+        }
+    }
+    if !args.ca_no_cache {
+        if let Some(true) = cfg.ca.no_cache {
+            args.ca_no_cache = true;
         }
     }
     if args.ca_stats_prefix.is_none() {

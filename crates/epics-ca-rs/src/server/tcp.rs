@@ -2385,7 +2385,39 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 }
             };
 
-            let snapshot = get_full_snapshot(&entry.target).await;
+            // GET path consults the target's optional read hook
+            // (`get_read_snapshot`): a no-cache CA-gateway shadow PV
+            // forwards this read to a fresh upstream fetch. An `Err` is
+            // the forwarded upstream get failing — surface ECA_GETFAIL
+            // to the client, the IOC get-callback error C ca-gateway
+            // would propagate. READ_NOTIFY carries the status in its
+            // reply frame; the deprecated READ uses the CA_PROTO_ERROR
+            // channel like its read-denial path above.
+            let snapshot = match get_read_snapshot(&entry.target).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!(error = %e, "ca server: read hook (no-cache get) failed");
+                    if is_notify {
+                        send_cmd_error(
+                            writer,
+                            CA_PROTO_READ_NOTIFY,
+                            requested_type,
+                            ECA_GETFAIL,
+                            ioid,
+                        )
+                        .await?;
+                    } else {
+                        let audit_pv = match &entry.target {
+                            ChannelTarget::SimplePv(pv) => pv.name.clone(),
+                            ChannelTarget::RecordField { record, field } => {
+                                format!("{}.{}", record.read().await.name, field)
+                            }
+                        };
+                        send_ca_error(writer, hdr, ECA_GETFAIL, entry.cid, &audit_pv).await?;
+                    }
+                    return Ok(());
+                }
+            };
             let Some(mut snapshot) = snapshot else {
                 if is_notify {
                     send_cmd_error(
@@ -4276,6 +4308,30 @@ async fn get_full_snapshot(
         ChannelTarget::SimplePv(pv) => Some(pv.snapshot().await),
         ChannelTarget::RecordField { record, field } => {
             record.read().await.snapshot_for_field(field)
+        }
+    }
+}
+
+/// Snapshot for a one-shot client GET (`CA_PROTO_READ` /
+/// `CA_PROTO_READ_NOTIFY`).
+///
+/// Distinct from [`get_full_snapshot`] (used for monitor initial events
+/// and access-rights re-posts) so only the *client GET* path consults a
+/// PV's optional [`ReadHook`](epics_base_rs::server::pv::ReadHook): the
+/// CA gateway's no-cache mode installs that hook to forward each
+/// downstream read to a fresh upstream fetch. For a PV without a read
+/// hook — every record-backed and cached PV — this is exactly
+/// `get_full_snapshot` wrapped in `Ok`. The `Err` propagates an upstream
+/// get failure so the GET handler can answer `ECA_GETFAIL`, matching C
+/// ca-gateway forwarding the read to the IOC under `-no_cache`
+/// (`gateVc.cc:1361-1369`).
+async fn get_read_snapshot(
+    target: &ChannelTarget,
+) -> Result<Option<epics_base_rs::server::snapshot::Snapshot>, epics_base_rs::error::CaError> {
+    match target {
+        ChannelTarget::SimplePv(pv) => pv.read_snapshot().await.map(Some),
+        ChannelTarget::RecordField { record, field } => {
+            Ok(record.read().await.snapshot_for_field(field))
         }
     }
 }

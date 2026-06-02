@@ -160,6 +160,33 @@ pub struct AccessDecision {
 /// re-evaluation.
 pub type AccessHook = Arc<dyn Fn(&str, &str) -> AccessDecision + Send + Sync>;
 
+/// per-PV read hook consulted by the CA server's one-shot GET path
+/// (`CA_PROTO_READ` / `CA_PROTO_READ_NOTIFY`) when set. A bare PV serves
+/// reads straight from its stored value cell; a proxy (the CA gateway in
+/// its no-cache mode) installs this hook so each downstream GET is
+/// satisfied by a *fresh* upstream fetch instead of the last cached
+/// value. Mirrors C ca-gateway `-no_cache`, where a connected channel
+/// with caching disabled forwards every read as a fresh
+/// `ca_array_get_callback()` to the IOC (`gateVc.cc:1361-1369`) rather
+/// than returning `vc->eventData()`.
+///
+/// The hook is async (it performs an upstream get) and fallible: on
+/// `Err` the server surfaces the failure to the client (`ECA_GETFAIL`)
+/// exactly as the IOC's own get-callback error would propagate. Only the
+/// GET path consults it ([`ProcessVariable::read_snapshot`]); monitor
+/// fan-out, the initial monitor event, and access-rights re-posts keep
+/// serving the stored snapshot, so a no-cache PV still backs a downstream
+/// monitor with its upstream subscription's events.
+///
+/// `None` (the default) leaves the read path byte-for-byte unchanged for
+/// every record-backed and cached PV — the hook is purely additive.
+pub type ReadHook = Arc<
+    dyn Fn() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<EpicsValue, CaError>> + Send>,
+        > + Send
+        + Sync,
+>;
+
 /// A monitor event sent to subscribers when a PV value changes.
 /// Carries a full Snapshot so GR/CTRL metadata (PREC, EGU, limits) is available.
 #[derive(Debug, Clone)]
@@ -316,6 +343,15 @@ pub struct ProcessVariable {
     /// `can_read` / `can_write`, symmetric to [`Self::write_hook`].
     /// Same sync `parking_lot::RwLock` slot rationale as `write_hook`.
     access_hook: parking_lot::RwLock<Option<AccessHook>>,
+    /// optional read hook consulted by the CA server's one-shot GET path
+    /// ([`Self::read_snapshot`]) to fetch a fresh value instead of the
+    /// stored cell. Used by the CA gateway's no-cache mode to forward
+    /// each downstream GET to upstream. `None` (the default) keeps the
+    /// read path serving the stored value, identical to before. Same
+    /// sync slot rationale as [`Self::write_hook`]: the GET path clones
+    /// the optional `Arc` without an `.await`, then awaits the hook
+    /// outside any lock. See [`ReadHook`].
+    read_hook: parking_lot::RwLock<Option<ReadHook>>,
 }
 
 impl ProcessVariable {
@@ -328,6 +364,7 @@ impl ProcessVariable {
             posted_meta: parking_lot::RwLock::new(None),
             write_hook: parking_lot::RwLock::new(None),
             access_hook: parking_lot::RwLock::new(None),
+            read_hook: parking_lot::RwLock::new(None),
         }
     }
 
@@ -376,6 +413,21 @@ impl ProcessVariable {
     /// non-async, like [`Self::write_hook`].
     pub fn access_hook(&self) -> Option<AccessHook> {
         self.access_hook.read().clone()
+    }
+
+    /// Install a read hook. Replaces any previously-installed hook.
+    /// Used by the CA gateway's no-cache mode so each downstream GET is
+    /// served by a fresh upstream fetch. See [`ReadHook`].
+    pub fn set_read_hook(&self, hook: ReadHook) {
+        *self.read_hook.write() = Some(hook);
+    }
+
+    /// Snapshot of the installed read hook (clone of the `Arc`), or
+    /// `None`. Cheap and non-async, like [`Self::write_hook`]: the read
+    /// lock is released before the cloned `Arc` returns, so the caller's
+    /// subsequent `await` on the hook holds no lock.
+    pub fn read_hook(&self) -> Option<ReadHook> {
+        self.read_hook.read().clone()
     }
 
     /// Install a write hook. Replaces any previously-installed hook.
@@ -434,6 +486,41 @@ impl ProcessVariable {
         };
         self.apply_metadata(&mut snap);
         snap
+    }
+
+    /// Build the snapshot served on a one-shot client GET
+    /// (`CA_PROTO_READ` / `CA_PROTO_READ_NOTIFY`).
+    ///
+    /// When a [`ReadHook`] is installed (the CA gateway's no-cache mode),
+    /// the value is fetched fresh through the hook and merged onto the
+    /// PV's current alarm / timestamp / shadow metadata; on hook error
+    /// the failure propagates so the server can answer `ECA_GETFAIL`,
+    /// matching C ca-gateway forwarding each read to the IOC under
+    /// `-no_cache` (`gateVc.cc:1361-1369`). Without a hook this is exactly
+    /// [`Self::snapshot`] wrapped in `Ok`, so the GET path is unchanged
+    /// for every record-backed and cached PV.
+    ///
+    /// Only the GET path calls this; monitor fan-out, the initial monitor
+    /// event, and access-rights re-posts keep using [`Self::snapshot`]
+    /// (the stored value), so a no-cache PV still backs a downstream
+    /// monitor with its upstream subscription's events rather than a
+    /// per-event upstream get.
+    pub async fn read_snapshot(&self) -> Result<Snapshot, CaError> {
+        match self.read_hook() {
+            Some(hook) => {
+                // Fetch fresh upstream, then carry the value on the PV's
+                // current alarm/time/metadata. The upstream get returns a
+                // bare value (no alarm/time), so the shadow's last-known
+                // alarm/time is the best available stamp — the freshness
+                // guarantee is on the value, which is the point of
+                // no-cache.
+                let value = hook().await?;
+                let mut snap = self.snapshot().await;
+                snap.value = value;
+                Ok(snap)
+            }
+            None => Ok(self.snapshot().await),
+        }
     }
 
     /// Set a new value and notify all subscribers.
@@ -1085,6 +1172,99 @@ mod metadata_tests {
         assert!(
             val_rx.try_recv().is_err(),
             "DBE_VALUE-only subscriber must not receive a property post"
+        );
+    }
+}
+
+#[cfg(test)]
+mod read_hook_tests {
+    use super::*;
+
+    fn pv() -> ProcessVariable {
+        ProcessVariable::new("g:pv".into(), EpicsValue::Double(1.0))
+    }
+
+    /// No hook installed (the default for every record-backed and cached
+    /// PV): `read_snapshot` is exactly `snapshot` wrapped in `Ok` — the
+    /// stored value, byte-for-byte unchanged.
+    #[tokio::test]
+    async fn read_snapshot_without_hook_equals_snapshot() {
+        let pv = pv();
+        let read = pv.read_snapshot().await.expect("no-hook read never errors");
+        let stored = pv.snapshot().await;
+        assert_eq!(read.value, stored.value);
+        assert_eq!(read.value, EpicsValue::Double(1.0));
+    }
+
+    /// With a hook installed (no-cache mode), the GET value comes fresh
+    /// from the hook, NOT from the stored shadow value — the stored value
+    /// stays a stale sentinel that the hook overrides.
+    #[tokio::test]
+    async fn read_snapshot_fires_hook_for_fresh_value() {
+        let pv = pv();
+        // Stored shadow value is a sentinel the hook must override.
+        pv.set(EpicsValue::Double(999.0)).await;
+        pv.set_read_hook(Arc::new(|| {
+            Box::pin(async { Ok(EpicsValue::Double(42.0)) })
+        }));
+        let read = pv.read_snapshot().await.expect("hook returns Ok");
+        assert_eq!(
+            read.value,
+            EpicsValue::Double(42.0),
+            "GET must serve the hook's fresh value, not the stored sentinel"
+        );
+    }
+
+    /// A hook failure propagates so the server can answer `ECA_GETFAIL`,
+    /// matching C ca-gateway forwarding each read to the IOC.
+    #[tokio::test]
+    async fn read_snapshot_propagates_hook_error() {
+        let pv = pv();
+        pv.set_read_hook(Arc::new(|| Box::pin(async { Err(CaError::Disconnected) })));
+        let err = pv.read_snapshot().await.expect_err("hook error propagates");
+        assert!(matches!(err, CaError::Disconnected));
+    }
+
+    /// The read hook is GET-path only: `snapshot` (monitor fan-out, the
+    /// initial monitor event, access-rights re-posts) keeps serving the
+    /// stored value even when a hook is installed.
+    #[tokio::test]
+    async fn snapshot_ignores_read_hook() {
+        let pv = pv();
+        pv.set(EpicsValue::Double(7.0)).await;
+        pv.set_read_hook(Arc::new(|| {
+            Box::pin(async { Ok(EpicsValue::Double(42.0)) })
+        }));
+        let snap = pv.snapshot().await;
+        assert_eq!(
+            snap.value,
+            EpicsValue::Double(7.0),
+            "snapshot must serve the stored value, never the read hook"
+        );
+    }
+
+    /// Fresh value rides the PV's current alarm/time/metadata: the hook
+    /// supplies only the value; the shadow's installed metadata stays.
+    #[tokio::test]
+    async fn read_snapshot_carries_shadow_metadata() {
+        let pv = pv();
+        pv.set_metadata(PvMetadata {
+            display: Some(DisplayInfo {
+                units: "mm".into(),
+                precision: 3,
+                ..Default::default()
+            }),
+            control: None,
+            enums: None,
+        });
+        pv.set_read_hook(Arc::new(|| Box::pin(async { Ok(EpicsValue::Double(5.0)) })));
+        let read = pv.read_snapshot().await.expect("hook returns Ok");
+        assert_eq!(read.value, EpicsValue::Double(5.0));
+        assert_eq!(
+            read.display
+                .expect("shadow metadata rides fresh value")
+                .units,
+            "mm"
         );
     }
 }

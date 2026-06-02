@@ -1840,10 +1840,10 @@ impl GroupMonitor {
                 _ => EventMark::Derive,
             };
         }
-        let targets: Vec<&str> = match &source.triggers {
+        let targets: Vec<&GroupMember> = match &source.triggers {
             TriggerDef::None => return EventMark::Skip,
             // Self-trigger inside a mixed group marks only its own field.
-            TriggerDef::SelfOnly => vec![source.field_name.as_str()],
+            TriggerDef::SelfOnly => vec![source],
             // `"*"` marks every member field WITH A CHANNEL. pvxs drops
             // channel-less Const/Structure targets from the `*` expansion
             // (`groupconfigprocessor.cpp:387-388`: `if(!…channel.empty())`)
@@ -1854,27 +1854,19 @@ impl GroupMonitor {
                 .members
                 .iter()
                 .filter(|m| !m.channel.is_empty())
-                .map(|m| m.field_name.as_str())
                 .collect(),
             // Named targets: pvxs resolves only references that name an
             // existing field WITH A CHANNEL (`groupconfigprocessor.cpp:
             // 405-409`: a target whose `channel.empty()` is ignored).
-            // Unknown refs were warned + dropped at parse time and
-            // are absent from `channeled` here too.
-            TriggerDef::Fields(refs) => {
-                let channeled: std::collections::HashSet<&str> = def
-                    .members
-                    .iter()
-                    .filter(|m| !m.channel.is_empty())
-                    .map(|m| m.field_name.as_str())
-                    .collect();
-                refs.iter()
-                    .map(String::as_str)
-                    .filter(|r| channeled.contains(r))
-                    .collect()
-            }
+            // Unknown refs were warned + dropped at parse time and are
+            // absent from `members` here too.
+            TriggerDef::Fields(refs) => def
+                .members
+                .iter()
+                .filter(|m| !m.channel.is_empty() && refs.iter().any(|r| r == &m.field_name))
+                .collect(),
         };
-        Self::mark_or_derive(targets)
+        Self::leaves_or_derive(targets, MemberEventKind::Value)
     }
 
     /// a *property* event marks only the source field's
@@ -1889,22 +1881,83 @@ impl GroupMonitor {
         if def.is_pure_self_trigger() {
             return EventMark::Derive;
         }
-        Self::mark_or_derive(vec![source.field_name.as_str()])
+        Self::leaves_or_derive(vec![source], MemberEventKind::Property)
     }
 
-    /// Turn a resolved target list into an [`EventMark`]. An empty list
-    /// means every target was dropped → no post. A target that cannot
-    /// be addressed by a structure path (a root-flattened `Meta` member
-    /// with an empty field name) falls back to [`EventMark::Derive`] —
-    /// a full mask — rather than under-marking and losing data.
-    fn mark_or_derive(targets: Vec<&str>) -> EventMark {
+    /// Expand each marked member into the wire leaves its update kind
+    /// actually assigns, mirroring pvxs `IOCSource::get`
+    /// (`iocsource.cpp:312-352`): a *value/alarm* event marks
+    /// `value` + `alarm` + `timeStamp`; a *property* event marks
+    /// `display` + `control` + `valueAlarm` (+ enum `value.choices`).
+    /// This is the leaf narrowing — previously a marked member flagged
+    /// its WHOLE subtree, so a DBE_PROPERTY event re-sent value/alarm/
+    /// timeStamp and a DBE_VALUE event re-sent the display/control limits.
+    ///
+    /// An empty target list → [`EventMark::Skip`]. A target whose field
+    /// path is empty (a root-flattened `Meta` member that cannot be
+    /// addressed by a structure path) → [`EventMark::Derive`] (full
+    /// mask) rather than under-marking. A target that contributes no leaf
+    /// for this kind (a `Const`/`Structure`/`Proc` member, or a
+    /// `Meta`/`Plain`/`Any` member on a property event) is dropped; if
+    /// every target drops, the post carries nothing → [`EventMark::Skip`].
+    fn leaves_or_derive(targets: Vec<&GroupMember>, kind: MemberEventKind) -> EventMark {
         if targets.is_empty() {
             return EventMark::Skip;
         }
-        if targets.iter().any(|n| n.is_empty()) {
+        if targets.iter().any(|m| m.field_name.is_empty()) {
             return EventMark::Derive;
         }
-        EventMark::Marked(targets.into_iter().map(str::to_string).collect())
+        let mut leaves = Vec::new();
+        for m in targets {
+            for suffix in Self::member_event_leaves(m.mapping, kind) {
+                leaves.push(if suffix.is_empty() {
+                    m.field_name.clone()
+                } else {
+                    format!("{}.{}", m.field_name, suffix)
+                });
+            }
+        }
+        if leaves.is_empty() {
+            return EventMark::Skip;
+        }
+        EventMark::Marked(leaves)
+    }
+
+    /// The wire leaves a group member contributes for one update kind,
+    /// as field-path suffixes relative to the member's field name
+    /// (`""` = the member node itself, for value-only mappings that carry
+    /// no metadata sub-structure). Ports pvxs `IOCSource::get`'s
+    /// per-`UpdateType` assignment (`iocsource.cpp:312-352`).
+    fn member_event_leaves(
+        mapping: FieldMapping,
+        kind: MemberEventKind,
+    ) -> &'static [&'static str] {
+        match (mapping, kind) {
+            // NTScalar value/alarm event: pvxs `Value|Alarm` for a
+            // triggered field assigns the scalar `value` plus `alarm` +
+            // `timeStamp` (getTimeAlarm). `value` is marked whole — for an
+            // enum this re-sends `choices` too, a harmless over-send vs the
+            // old whole-member mark.
+            (FieldMapping::Scalar, MemberEventKind::Value) => &["value", "alarm", "timeStamp"],
+            // NTScalar property event: getProperties fills `display` +
+            // `control` + `valueAlarm` limits, plus enum `value.choices`.
+            // getProperties is gated on `info.type==Scalar`, so only Scalar
+            // members carry property leaves.
+            (FieldMapping::Scalar, MemberEventKind::Property) => {
+                &["display", "control", "valueAlarm", "value.choices"]
+            }
+            // `+type:meta`: `alarm` + `timeStamp` only, and only on a
+            // value/alarm event — pvxs has no value leaf for Meta and skips
+            // getProperties for it.
+            (FieldMapping::Meta, MemberEventKind::Value) => &["alarm", "timeStamp"],
+            // Value-only mappings: the member node IS the value (pvxs
+            // `value = node`), marked whole; no metadata sub-tree exists,
+            // so there is nothing to over-mark.
+            (FieldMapping::Plain | FieldMapping::Any, MemberEventKind::Value) => &[""],
+            // Const/Structure/Proc carry no runtime event leaf; Meta/Plain
+            // /Any contribute nothing on a property event.
+            _ => &[],
+        }
     }
 }
 
@@ -2522,11 +2575,11 @@ mod tests {
         match GroupMonitor::value_event_mark(&def, src_idx(&def)) {
             EventMark::Marked(paths) => {
                 assert!(
-                    paths.contains(&"chan".to_string()),
+                    paths.iter().any(|p| p == "chan" || p.starts_with("chan.")),
                     "channeled member must be marked: {paths:?}"
                 );
                 assert!(
-                    !paths.contains(&"meta".to_string()),
+                    !paths.iter().any(|p| p == "meta" || p.starts_with("meta.")),
                     "channel-less structure member must NOT be marked by `*`: {paths:?}"
                 );
             }
@@ -2544,17 +2597,132 @@ mod tests {
         match GroupMonitor::value_event_mark(&def, src_idx(&def)) {
             EventMark::Marked(paths) => {
                 assert!(
-                    paths.contains(&"chan".to_string()),
+                    paths.iter().any(|p| p == "chan" || p.starts_with("chan.")),
                     "named channeled target must be marked: {paths:?}"
                 );
                 assert!(
-                    !paths.contains(&"meta".to_string()),
+                    !paths.iter().any(|p| p == "meta" || p.starts_with("meta.")),
                     "named channel-less target must NOT be marked: {paths:?}"
                 );
             }
             EventMark::Derive => panic!("expected Marked from named triggers, got Derive"),
             EventMark::Skip => panic!("expected Marked from named triggers, got Skip"),
         }
+    }
+
+    /// a marked member is narrowed to the leaves its
+    /// UpdateType actually assigns, not its whole subtree. A DBE_VALUE
+    /// event marks value/alarm/timeStamp; a DBE_PROPERTY event marks
+    /// display/control/valueAlarm — neither crosses into the other's
+    /// leaves, and a property event never marks triggered members. Mirrors
+    /// pvxs `IOCSource::get` (`iocsource.cpp:312-352`).
+    #[test]
+    fn event_marks_narrow_to_update_type_leaves() {
+        use crate::qsrv::group_config::parse_group_config;
+
+        // Mixed-trigger group (a `*` member) so the marks are explicit
+        // `Marked`, not the pure-self-trigger `Derive` diff path.
+        let json = r#"{ "GRP": {
+            "a": { "+channel": "R:a", "+trigger": "*" },
+            "b": { "+channel": "R:b" }
+        } }"#;
+        let def = parse_group_config(json).unwrap().pop().unwrap();
+        let src = def
+            .members
+            .iter()
+            .position(|m| m.field_name == "a")
+            .unwrap();
+
+        // Value event: value/alarm/timeStamp of every channeled member,
+        // never the property-metadata leaves.
+        let EventMark::Marked(v) = GroupMonitor::value_event_mark(&def, src) else {
+            panic!("expected Marked from a `*` value event");
+        };
+        for member in ["a", "b"] {
+            assert!(v.contains(&format!("{member}.value")), "value leaf: {v:?}");
+            assert!(v.contains(&format!("{member}.alarm")), "alarm leaf: {v:?}");
+            assert!(
+                v.contains(&format!("{member}.timeStamp")),
+                "timeStamp leaf: {v:?}"
+            );
+        }
+        assert!(
+            !v.iter().any(|p| p.ends_with(".display")
+                || p.ends_with(".control")
+                || p.ends_with(".valueAlarm")),
+            "value event must NOT mark property-metadata leaves: {v:?}"
+        );
+
+        // Property event: only the source member's display/control/
+        // valueAlarm (+ enum value.choices), never value/alarm/timeStamp,
+        // never the triggered member `b`.
+        let EventMark::Marked(p) = GroupMonitor::property_event_mark(&def, src) else {
+            panic!("expected Marked from a property event");
+        };
+        assert!(p.contains(&"a.display".to_string()), "display leaf: {p:?}");
+        assert!(p.contains(&"a.control".to_string()), "control leaf: {p:?}");
+        assert!(
+            p.contains(&"a.valueAlarm".to_string()),
+            "valueAlarm leaf: {p:?}"
+        );
+        assert!(
+            !p.iter()
+                .any(|leaf| leaf == "a.value" || leaf == "a.alarm" || leaf == "a.timeStamp"),
+            "property event must NOT mark value/alarm/timeStamp: {p:?}"
+        );
+        assert!(
+            !p.iter().any(|leaf| leaf.starts_with("b.")),
+            "property event must never mark triggered members: {p:?}"
+        );
+    }
+
+    /// a `+type:meta` member marks alarm/timeStamp (no
+    /// value) on a value event and contributes nothing on a property
+    /// event (pvxs getProperties is Scalar-only); a value-only `plain`
+    /// member marks the member node whole (no metadata sub-tree).
+    #[test]
+    fn meta_and_plain_member_leaves() {
+        use crate::qsrv::group_config::parse_group_config;
+
+        let json = r#"{ "GRP": {
+            "m": { "+channel": "R:m", "+type": "meta", "+trigger": "*" },
+            "p": { "+channel": "R:p", "+type": "plain" }
+        } }"#;
+        let def = parse_group_config(json).unwrap().pop().unwrap();
+        let src = def
+            .members
+            .iter()
+            .position(|m| m.field_name == "m")
+            .unwrap();
+
+        let EventMark::Marked(v) = GroupMonitor::value_event_mark(&def, src) else {
+            panic!("expected Marked");
+        };
+        // meta member: alarm + timeStamp, no value leaf.
+        assert!(v.contains(&"m.alarm".to_string()), "{v:?}");
+        assert!(v.contains(&"m.timeStamp".to_string()), "{v:?}");
+        assert!(
+            !v.contains(&"m.value".to_string()),
+            "meta member has no value leaf: {v:?}"
+        );
+        // plain member: the member node itself (value-only).
+        assert!(
+            v.contains(&"p".to_string()),
+            "plain member marks its node: {v:?}"
+        );
+        assert!(
+            !v.iter().any(|leaf| leaf.starts_with("p.")),
+            "plain member has no metadata sub-leaves: {v:?}"
+        );
+
+        // Property event on the meta source contributes nothing → Skip.
+        assert!(
+            matches!(
+                GroupMonitor::property_event_mark(&def, src),
+                EventMark::Skip
+            ),
+            "meta member carries no property-metadata leaves"
+        );
     }
 
     #[test]

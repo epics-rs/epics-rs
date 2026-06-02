@@ -58,7 +58,7 @@
 //!
 //! | PV | Type | Maps to |
 //! |----|------|---------|
-//! | `<prefix>fd` | Double | Current open file-descriptor count (C statFd) |
+//! | `<prefix>fd` | Double | Current open file-descriptor count (Rust-native; C serves `statFd` only under the non-default `USE_FDS` build) |
 //! | `<prefix>clientEventCount` | Long | Cumulative upstream events received (Rust-native, no C name) |
 //! | `<prefix>postEventCount` | Long | Cumulative monitor posts fanned downstream |
 //! | `<prefix>loopCount` | Long | Cumulative gateway run-loop iterations |
@@ -263,8 +263,12 @@ impl Stats {
             // separate from the upstream event counters.
             ("existTestRate", EpicsValue::Double(0.0)),
             // B5: RATE_STATS internals — tokio-model equivalents of
-            // the C++ ca-gateway gateServer counters. `fd` is a C
-            // gateStat PV (statFd) → DBR_DOUBLE like the other stats;
+            // the C++ ca-gateway gateServer counters. `fd` is Rust-native:
+            // C's `statFd` is compiled in only under the non-default
+            // `USE_FDS` build (gateServer.h:15 `//#define USE_FDS`,
+            // statFd at h:106 under `#ifdef USE_FDS`; CONFIG_SITE never
+            // defines it), so a default C build serves no fd PV. We serve
+            // it as DBR_DOUBLE for consistency with the gateStat values.
             // clientEventCount/postEventCount/loopCount have no C-name
             // counterpart (C exposes rates, not raw counts), so they
             // stay Long as a Rust-native API surface.
@@ -442,7 +446,8 @@ impl Stats {
         // platform we leave the PV at its last value rather than
         // posting a misleading 0.
         if let Some(fd) = fd_count {
-            // C `fd` (statFd) is a gateStat PV → DBR_DOUBLE.
+            // `fd` is Rust-native (C's statFd is non-default USE_FDS only);
+            // served as DBR_DOUBLE for consistency with the gateStat values.
             let _ = db
                 .put_pv_and_post(&n_fd, EpicsValue::Double(fd as f64))
                 .await;
@@ -469,9 +474,12 @@ impl Stats {
 
 /// B5: count the process's currently open file descriptors.
 ///
-/// The C++ ca-gateway publishes `fd` from `fdManager`'s registered
-/// descriptor table. The tokio port has no such table, so the count
-/// is derived from the kernel's per-process fd directory:
+/// The C++ ca-gateway publishes `statFd` from `fdManager`'s registered
+/// descriptor table only under the non-default `USE_FDS` build
+/// (gateServer.h:15 `//#define USE_FDS`); a default build serves no fd
+/// PV. This `fd` PV is therefore a Rust-native diagnostic. The tokio
+/// port has no `fdManager` table, so the count is derived from the
+/// kernel's per-process fd directory:
 ///
 /// - Linux: `/proc/self/fd`
 /// - macOS / *BSD: `/dev/fd`

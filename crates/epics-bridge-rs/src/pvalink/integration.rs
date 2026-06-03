@@ -1528,6 +1528,9 @@ fn is_array_value(value: &EpicsValue) -> bool {
         | EpicsValue::Short(_)
         | EpicsValue::Float(_)
         | EpicsValue::Enum(_)
+        // Transient NTEnum carrier is a scalar (single index + choices), not
+        // an array — routes through the scalar Display path like `Enum`.
+        | EpicsValue::EnumWithChoices { .. }
         | EpicsValue::Char(_)
         | EpicsValue::Long(_)
         | EpicsValue::Double(_)
@@ -1565,10 +1568,29 @@ fn pvfield_to_epics_value(field: &PvField) -> Option<EpicsValue> {
             // wrapper or the `enum_t` directly.
             if s.struct_id == "enum_t" {
                 if let Some(PvField::Scalar(sv)) = s.get_field("index") {
-                    return Some(match scalar_to_epics(sv) {
-                        EpicsValue::Enum(v) => EpicsValue::Enum(v),
-                        other => EpicsValue::Enum(other.to_f64().map(|f| f as u16).unwrap_or(0)),
-                    });
+                    let index = match scalar_to_epics(sv) {
+                        EpicsValue::Enum(v) => v,
+                        other => other.to_f64().map(|f| f as u16).unwrap_or(0),
+                    };
+                    // pvxs `pvaGetValue` reads the sibling `choices`
+                    // string[] alongside `index` (`pvalink_lset.cpp:344-356`)
+                    // so a later type-aware `put_field` can store the
+                    // label on a DBR_STRING target or the index on a
+                    // numeric one. The resolver boundary is dbrType-blind,
+                    // so carry both through `EnumWithChoices`; an
+                    // absent/empty `choices` makes the string-target path
+                    // fall back to the "%u" index form.
+                    let choices = match s.get_field("choices") {
+                        Some(PvField::ScalarArray(arr)) => arr
+                            .iter()
+                            .filter_map(|sv| match sv {
+                                ScalarValue::String(s) => Some(s.clone()),
+                                _ => None,
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    return Some(EpicsValue::EnumWithChoices { index, choices });
                 }
             }
             for (name, sub) in &s.fields {
@@ -1868,9 +1890,16 @@ mod tests {
         ));
         let mut nt = PvStructure::new("epics:nt/NTEnum:1.0");
         nt.fields.push(("value".into(), PvField::Structure(enum_t)));
+        // The carrier keeps BOTH the index and the choice labels so the
+        // consumer (`convert_to`) can copy the label on a DBR_STRING target
+        // (pvxs `pvalink_lset.cpp:330-360`, `case DBR_STRING`) while every
+        // numeric target still gets the index.
         assert_eq!(
             pvfield_to_epics_value(&PvField::Structure(nt)),
-            Some(EpicsValue::Enum(2))
+            Some(EpicsValue::EnumWithChoices {
+                index: 2,
+                choices: vec!["Off".into(), "On".into(), "Reset".into()],
+            })
         );
     }
 

@@ -143,6 +143,11 @@ fn snapshot_to_pv_field(snap: &Snapshot) -> PvField {
         EpicsValue::Short(v) => PvField::Scalar(ScalarValue::Short(*v)),
         EpicsValue::Char(v) => PvField::Scalar(ScalarValue::UByte(*v)),
         EpicsValue::Enum(v) => PvField::Scalar(ScalarValue::Int(*v as i32)),
+        // Transient NTEnum carrier never reaches a record snapshot (coerced in
+        // base at the link-write boundary); serve its index like a DBF_ENUM.
+        EpicsValue::EnumWithChoices { index, .. } => {
+            PvField::Scalar(ScalarValue::Int(*index as i32))
+        }
         EpicsValue::String(s) => PvField::Scalar(ScalarValue::String(s.clone())),
         EpicsValue::Int64(v) => PvField::Scalar(ScalarValue::Long(*v)),
         // C `DBF_UINT64` → PVA `ulong` (native unsigned 64-bit).
@@ -210,6 +215,7 @@ fn snapshot_to_field_desc(snap: &Snapshot) -> FieldDesc {
         EpicsValue::Short(_) => (FieldDesc::Scalar(ScalarType::Short), false),
         EpicsValue::Char(_) => (FieldDesc::Scalar(ScalarType::UByte), false),
         EpicsValue::Enum(_) => (FieldDesc::Scalar(ScalarType::Int), false),
+        EpicsValue::EnumWithChoices { .. } => (FieldDesc::Scalar(ScalarType::Int), false),
         EpicsValue::String(_) => (FieldDesc::Scalar(ScalarType::String), false),
         EpicsValue::Int64(_) => (FieldDesc::Scalar(ScalarType::Long), false),
         EpicsValue::UInt64(_) => (FieldDesc::Scalar(ScalarType::ULong), false),

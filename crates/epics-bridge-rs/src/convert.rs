@@ -28,6 +28,9 @@ pub fn epics_to_scalar(val: &EpicsValue) -> ScalarValue {
         EpicsValue::Short(v) => ScalarValue::Short(*v),
         EpicsValue::Float(v) => ScalarValue::Float(*v),
         EpicsValue::Enum(v) => ScalarValue::UShort(*v), // C++: pvUShort
+        // Transient NTEnum carrier never reaches qsrv serving (coerced in
+        // base at the link-write boundary); convert its index like a DBF_ENUM.
+        EpicsValue::EnumWithChoices { index, .. } => ScalarValue::UShort(*index),
         // C qsrv: DBF_CHAR → pvByte (signed). Bit-preserving cast keeps
         // the on-the-wire byte identical; only the typed interpretation
         // changes from unsigned to signed.

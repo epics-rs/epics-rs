@@ -133,7 +133,9 @@ fn value_scalar_type(value: &EpicsValue) -> ScalarType {
         EpicsValue::String(_) | EpicsValue::StringArray(_) => ScalarType::String,
         EpicsValue::Short(_) | EpicsValue::ShortArray(_) => ScalarType::Short,
         EpicsValue::Float(_) | EpicsValue::FloatArray(_) => ScalarType::Float,
-        EpicsValue::Enum(_) | EpicsValue::EnumArray(_) => ScalarType::UShort,
+        EpicsValue::Enum(_) | EpicsValue::EnumArray(_) | EpicsValue::EnumWithChoices { .. } => {
+            ScalarType::UShort
+        }
         // DBF_CHAR ↔ pvByte (signed), matching `convert::dbf_to_scalar_type`.
         EpicsValue::Char(_) | EpicsValue::CharArray(_) => ScalarType::Byte,
         EpicsValue::Long(_) | EpicsValue::LongArray(_) => ScalarType::Int,

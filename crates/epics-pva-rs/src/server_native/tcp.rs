@@ -417,6 +417,11 @@ fn epics_value_to_pv_field(v: &epics_base_rs::types::EpicsValue) -> Option<PvFie
         EpicsValue::Short(s) => PvField::Scalar(ScalarValue::Short(*s)),
         EpicsValue::Char(c) => PvField::Scalar(ScalarValue::UByte(*c)),
         EpicsValue::Enum(e) => PvField::Scalar(ScalarValue::Int(*e as i32)),
+        // Transient NTEnum carrier never reaches a filter result (coerced in
+        // base at the link-write boundary); serve its index like a DBF_ENUM.
+        EpicsValue::EnumWithChoices { index, .. } => {
+            PvField::Scalar(ScalarValue::Int(*index as i32))
+        }
         EpicsValue::String(s) => PvField::Scalar(ScalarValue::String(s.clone())),
         EpicsValue::Int64(l) => PvField::Scalar(ScalarValue::Long(*l)),
         EpicsValue::UInt64(u) => PvField::Scalar(ScalarValue::ULong(*u)),

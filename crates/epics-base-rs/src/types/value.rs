@@ -11,6 +11,22 @@ pub enum EpicsValue {
     Short(i16),
     Float(f32),
     Enum(u16),
+    /// An NTEnum value that still carries its `choices` labels, so a
+    /// later type-aware `put_field` can pick the label-vs-index form
+    /// the target dbrType requires (pvxs `pvalink_lset.cpp:344-356`:
+    /// a `DBR_STRING` target copies `choices[index]`, a numeric target
+    /// takes the index). This is a TRANSIENT carrier produced only on
+    /// the pvalink NTEnum link-resolver path (`pvfield_to_epics_value`);
+    /// the dbrType-blind [`ExternalPvResolver`](crate::server::database)
+    /// boundary cannot resolve the label itself, so the choices must
+    /// survive to the record's `put_field`. Everywhere else it behaves
+    /// exactly like [`Self::Enum`]: read the public `index` field for the
+    /// choice index. It is never stored in a record field nor serialized
+    /// to the wire (those paths normalize it to the index).
+    EnumWithChoices {
+        index: u16,
+        choices: Vec<PvString>,
+    },
     Char(u8),
     Long(i32),
     Double(f64),
@@ -46,6 +62,10 @@ impl fmt::Display for EpicsValue {
             Self::Short(v) => write!(f, "{v}"),
             Self::Float(v) => write!(f, "{v}"),
             Self::Enum(v) => write!(f, "{v}"),
+            // Transient NTEnum carrier: render the index, identical to
+            // `Enum`. The labels are only consumed by a string-target
+            // `put_field`, never by Display.
+            Self::EnumWithChoices { index, .. } => write!(f, "{index}"),
             Self::Char(v) => write!(f, "{v}"),
             Self::Long(v) => write!(f, "{v}"),
             Self::Double(v) => write!(f, "{v}"),
@@ -98,6 +118,18 @@ impl fmt::Display for EpicsValue {
 }
 
 impl EpicsValue {
+    /// The label for an enum `index` against its `choices`:
+    /// `choices[index]` when in range, else the decimal index — pvxs
+    /// `pvalink_lset.cpp:347-354` (`strncpy(choices[index])` with an
+    /// `epicsSnprintf("%u", index)` out-of-range fallback). Used at the
+    /// link-write boundary to render an NTEnum onto a string target.
+    pub fn enum_index_label(choices: &[PvString], index: u16) -> String {
+        choices
+            .get(index as usize)
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| index.to_string())
+    }
+
     /// Render for audit / log paths with array truncation. The full
     /// `Display` impl allocates `Vec<String>` of length N and joins —
     /// for a peer-controlled `LongArray` of millions of elements that
@@ -235,6 +267,7 @@ impl EpicsValue {
             Self::Short(v) => v.to_be_bytes().to_vec(),
             Self::Float(v) => v.to_be_bytes().to_vec(),
             Self::Enum(v) => v.to_be_bytes().to_vec(),
+            Self::EnumWithChoices { index, .. } => index.to_be_bytes().to_vec(),
             Self::Char(v) => vec![*v],
             Self::Long(v) => v.to_be_bytes().to_vec(),
             Self::Double(v) => v.to_be_bytes().to_vec(),
@@ -491,7 +524,7 @@ impl EpicsValue {
             Self::String(_) | Self::StringArray(_) => DbFieldType::String,
             Self::Short(_) | Self::ShortArray(_) => DbFieldType::Short,
             Self::Float(_) | Self::FloatArray(_) => DbFieldType::Float,
-            Self::Enum(_) | Self::EnumArray(_) => DbFieldType::Enum,
+            Self::Enum(_) | Self::EnumWithChoices { .. } | Self::EnumArray(_) => DbFieldType::Enum,
             Self::Char(_) | Self::CharArray(_) => DbFieldType::Char,
             Self::Long(_) | Self::LongArray(_) => DbFieldType::Long,
             Self::Double(_) | Self::DoubleArray(_) => DbFieldType::Double,
@@ -594,6 +627,24 @@ impl EpicsValue {
     /// array). Without this an array requested as a different DBR
     /// native type would collapse to a single zero scalar.
     pub fn convert_to(&self, target: DbFieldType) -> EpicsValue {
+        // pvalink NTEnum carrier (pvxs `pvaGetValue` scalar switch,
+        // `pvalink_lset.cpp:330-360`): a DBR_STRING target stores the
+        // label `choices[index]` (with the "%u" index fallback out of
+        // range); EVERY other target — char/short/long/int64, the
+        // unsigned widths, float/double, enum — takes the numeric index.
+        // Resolve the transient here, the single value-coercion owner
+        // (`set_val`'s default routes a `TypeMismatch` through this, and
+        // `put_field_internal` calls it directly), so `EnumWithChoices`
+        // never reaches storage or the wire. Must precede the
+        // `db_field_type()==target` short-circuit: the carrier's type is
+        // `Enum`, so an `Enum` target would otherwise clone it verbatim
+        // instead of collapsing to a bare index.
+        if let Self::EnumWithChoices { index, choices } = self {
+            return match target {
+                DbFieldType::String => Self::String(Self::enum_index_label(choices, *index).into()),
+                _ => Self::Enum(*index).convert_to(target),
+            };
+        }
         if self.db_field_type() == target {
             return self.clone();
         }
@@ -727,7 +778,7 @@ impl EpicsValue {
             Self::Float(_) => DbFieldType::Float,
             Self::Long(_) => DbFieldType::Long,
             Self::Short(_) => DbFieldType::Short,
-            Self::Enum(_) => DbFieldType::Enum,
+            Self::Enum(_) | Self::EnumWithChoices { .. } => DbFieldType::Enum,
             Self::Char(_) => DbFieldType::Char,
             Self::String(_) => DbFieldType::String,
             Self::Int64(_) | Self::Int64Array(_) => DbFieldType::Int64,
@@ -749,6 +800,11 @@ impl EpicsValue {
             Self::Long(v) => Some(*v as f64),
             Self::Short(v) => Some(*v as f64),
             Self::Enum(v) => Some(*v as f64),
+            // NTEnum carrier: numeric coercion takes the index (pvxs
+            // numeric branch), identical to `Enum`. Reached on the
+            // multi-input/DOL/SELN paths that pre-convert link values to
+            // f64 before applying them, bypassing `convert_to`.
+            Self::EnumWithChoices { index, .. } => Some(*index as f64),
             Self::Int64(v) => Some(*v as f64),
             Self::UInt64(v) => Some(*v as f64),
             // DBF_CHAR is epicsInt8 (signed) per epics-base c5012d9f73:
@@ -1120,5 +1176,91 @@ mod array_convert_tests {
     fn same_type_array_identity() {
         let v = EpicsValue::LongArray(vec![1, 2, 3]);
         assert_eq!(v.convert_to(DbFieldType::Long), v);
+    }
+}
+
+#[cfg(test)]
+mod enum_with_choices_tests {
+    use super::*;
+
+    fn carrier(index: u16) -> EpicsValue {
+        EpicsValue::EnumWithChoices {
+            index,
+            choices: vec!["Off".into(), "On".into(), "Reset".into()],
+        }
+    }
+
+    /// pvxs `pvalink_lset.cpp:330-360`, `case DBR_STRING`: a string target
+    /// stores the choice LABEL, not the index. Index 2 → "Reset".
+    #[test]
+    fn string_target_resolves_to_label() {
+        assert_eq!(
+            carrier(2).convert_to(DbFieldType::String),
+            EpicsValue::String("Reset".into())
+        );
+    }
+
+    /// Out-of-range index falls back to the decimal index ("%u" in pvxs),
+    /// not an empty string or a panic.
+    #[test]
+    fn string_target_out_of_range_falls_back_to_index() {
+        assert_eq!(
+            carrier(5).convert_to(DbFieldType::String),
+            EpicsValue::String("5".into())
+        );
+    }
+
+    /// Every NUMERIC target takes the bare index. One case per target type
+    /// so a regression in any single width is caught in isolation.
+    #[test]
+    fn numeric_targets_take_index() {
+        assert_eq!(
+            carrier(2).convert_to(DbFieldType::Long),
+            EpicsValue::Long(2)
+        );
+        assert_eq!(
+            carrier(2).convert_to(DbFieldType::Short),
+            EpicsValue::Short(2)
+        );
+        assert_eq!(
+            carrier(2).convert_to(DbFieldType::Char),
+            EpicsValue::Char(2)
+        );
+        assert_eq!(
+            carrier(2).convert_to(DbFieldType::Int64),
+            EpicsValue::Int64(2)
+        );
+        assert_eq!(
+            carrier(2).convert_to(DbFieldType::UInt64),
+            EpicsValue::UInt64(2)
+        );
+        assert_eq!(
+            carrier(2).convert_to(DbFieldType::Float),
+            EpicsValue::Float(2.0)
+        );
+        assert_eq!(
+            carrier(2).convert_to(DbFieldType::Double),
+            EpicsValue::Double(2.0)
+        );
+    }
+
+    /// An ENUM target collapses the carrier to a bare `Enum(index)` — it must
+    /// NOT short-circuit as an identity clone (both report `db_field_type ==
+    /// Enum`), which is why `convert_to` handles the carrier before the
+    /// `db_field_type()==target` check.
+    #[test]
+    fn enum_target_collapses_to_bare_index() {
+        assert_eq!(
+            carrier(2).convert_to(DbFieldType::Enum),
+            EpicsValue::Enum(2)
+        );
+    }
+
+    /// `enum_index_label` is the shared label/fallback helper.
+    #[test]
+    fn enum_index_label_in_and_out_of_range() {
+        let choices: Vec<PvString> = vec!["Off".into(), "On".into()];
+        assert_eq!(EpicsValue::enum_index_label(&choices, 1), "On");
+        assert_eq!(EpicsValue::enum_index_label(&choices, 9), "9");
     }
 }

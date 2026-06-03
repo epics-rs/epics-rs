@@ -1406,7 +1406,7 @@ fn dbf_type_name(val: &EpicsValue) -> &'static str {
         EpicsValue::String(_) => "DBF_STRING",
         EpicsValue::Short(_) => "DBF_SHORT",
         EpicsValue::Float(_) => "DBF_FLOAT",
-        EpicsValue::Enum(_) => "DBF_ENUM",
+        EpicsValue::Enum(_) | EpicsValue::EnumWithChoices { .. } => "DBF_ENUM",
         EpicsValue::Char(_) => "DBF_CHAR",
         EpicsValue::Long(_) => "DBF_LONG",
         EpicsValue::Double(_) => "DBF_DOUBLE",

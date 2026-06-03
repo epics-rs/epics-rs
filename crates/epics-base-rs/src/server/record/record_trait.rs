@@ -554,7 +554,30 @@ pub trait Record: Send + Sync + 'static {
     /// Used by the framework to write values from ReadDbLink actions
     /// into fields that are normally read-only (e.g., epid.CVAL).
     /// Default implementation delegates to put_field().
+    ///
+    /// On the `ReadDbLink` path this is also where a pvalink NTEnum
+    /// carrier ([`EpicsValue::EnumWithChoices`]) is resolved. The
+    /// dbrType-blind link resolver produces it for an NTEnum source;
+    /// pvxs `pvaGetValue` (`pvalink_lset.cpp:330-360`) picks
+    /// label-vs-index by the TARGET field's dbrType — only a DBR_STRING
+    /// target gets the `choices[index]` label, every other type takes
+    /// the numeric index. Route it through [`EpicsValue::convert_to`]
+    /// (the single value-coercion owner) against the target field's
+    /// `db_field_type`, so the transient carrier is consumed before any
+    /// record `put_field` / storage / wire path can see it. The
+    /// single-INP→VAL apply path reaches the same `convert_to` via
+    /// `set_val`'s `TypeMismatch` auto-coerce.
     fn put_field_internal(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        let value = match value {
+            EpicsValue::EnumWithChoices { .. } => {
+                let target_type = self
+                    .get_field(name)
+                    .map(|v| v.db_field_type())
+                    .unwrap_or(DbFieldType::Long);
+                value.convert_to(target_type)
+            }
+            other => other,
+        };
         self.put_field(name, value)
     }
 

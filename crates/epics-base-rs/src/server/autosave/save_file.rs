@@ -269,6 +269,10 @@ pub fn value_to_save_str(value: &EpicsValue) -> String {
         EpicsValue::Long(v) => v.to_string(),
         EpicsValue::Int64(v) => v.to_string(),
         EpicsValue::Enum(v) => v.to_string(),
+        // NTEnum carrier never reaches an autosave write (it is consumed
+        // at the link-write boundary), but serialize the index for
+        // exhaustiveness, identical to `Enum`.
+        EpicsValue::EnumWithChoices { index, .. } => index.to_string(),
         EpicsValue::Char(v) => v.to_string(),
         EpicsValue::DoubleArray(arr) => {
             let parts: Vec<_> = arr.iter().map(|v| format!("{:.14e}", v)).collect();
@@ -355,6 +359,10 @@ pub fn value_to_save_str_c(value: &EpicsValue) -> String {
         EpicsValue::Long(v) => v.to_string(),
         EpicsValue::Int64(v) => v.to_string(),
         EpicsValue::Enum(v) => v.to_string(),
+        // NTEnum carrier never reaches an autosave write (it is consumed
+        // at the link-write boundary), but serialize the index for
+        // exhaustiveness, identical to `Enum`.
+        EpicsValue::EnumWithChoices { index, .. } => index.to_string(),
         EpicsValue::Char(v) => v.to_string(),
         // Arrays: C `@array@ { "v" "v" }` form.
         EpicsValue::DoubleArray(arr) => c_array(arr.iter().map(|v| format!("{:.14e}", v))),
@@ -389,7 +397,9 @@ pub fn parse_save_value(s: &str, template: &EpicsValue) -> Option<EpicsValue> {
         EpicsValue::Int64(_) => s.parse::<i64>().ok().map(EpicsValue::Int64),
         EpicsValue::UInt64(_) => s.parse::<u64>().ok().map(EpicsValue::UInt64),
         EpicsValue::Short(_) => s.parse::<i16>().ok().map(EpicsValue::Short),
-        EpicsValue::Enum(_) => s.parse::<u16>().ok().map(EpicsValue::Enum),
+        EpicsValue::Enum(_) | EpicsValue::EnumWithChoices { .. } => {
+            s.parse::<u16>().ok().map(EpicsValue::Enum)
+        }
         EpicsValue::Char(_) => s.parse::<u8>().ok().map(EpicsValue::Char),
         EpicsValue::DoubleArray(_) => {
             parse_array_str(s, |v| v.parse::<f64>().ok()).map(EpicsValue::DoubleArray)

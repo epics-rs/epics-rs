@@ -147,6 +147,9 @@ pub fn format_value(
         EpicsValue::UInt64(n) => format_int_wide(n.to_string(), *n, fmt.int_style),
         EpicsValue::Char(n) => format_int_i64((*n as i8) as i64, fmt.int_style),
         EpicsValue::Enum(idx) => format_enum(*idx as i64, fmt, enum_strings),
+        // Transient NTEnum carrier never reaches CA serialization (coerced in
+        // base at the link-write boundary); format its index like a DBF_ENUM.
+        EpicsValue::EnumWithChoices { index, .. } => format_enum(*index as i64, fmt, enum_strings),
         EpicsValue::Float(x) => format_float(*x as f64, fmt),
         EpicsValue::Double(x) => format_float(*x, fmt),
         EpicsValue::ShortArray(arr) => render_array_int(

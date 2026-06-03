@@ -209,10 +209,17 @@ impl PrintfRecord {
                 i += 2;
                 continue;
             }
+            let start = i;
             let (d, next) = Self::parse_directive(bytes, i);
             i = next;
             if d.bad {
-                // Bad format directive — C copies the directive text.
+                // Bad format directive: C `printfRecord.c:306-307` echoes
+                // the literal accumulated directive text (`format`) on
+                // F_BADFMT, so FMT "x=%q" yields VAL "x=%q". The bytes
+                // `[start..i]` are exactly that directive (parse_directive
+                // advances past the bad conversion char). All ASCII, so
+                // the slice is on a char boundary.
+                result.push_str(&self.fmt[start..i]);
                 continue;
             }
 
@@ -716,6 +723,24 @@ mod tests {
         rec.vals[0] = EpicsValue::Long(65); // 'A'
         rec.process().unwrap();
         assert_eq!(rec.val, "A");
+    }
+
+    /// A bad conversion echoes the literal directive text (C
+    /// `printfRecord.c:306`, F_BADFMT), not an empty string.
+    #[test]
+    fn bad_format_echoes_directive_text() {
+        let mut rec = rec_with("x=%q");
+        rec.process().unwrap();
+        assert_eq!(rec.val, "x=%q");
+    }
+
+    /// A trailing bare `%` (no conversion char) is also a bad directive
+    /// and echoes verbatim.
+    #[test]
+    fn trailing_percent_echoes_verbatim() {
+        let mut rec = rec_with("v=%");
+        rec.process().unwrap();
+        assert_eq!(rec.val, "v=%");
     }
 
     /// L-2: `%#g` of zero keeps trailing zeros; plain `%g` is "0".

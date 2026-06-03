@@ -48,17 +48,79 @@ pub fn encode_payload(value: &DecodedValue, addr: &TopicAddress) -> String {
 pub fn encode_flat(value: &DecodedValue) -> String {
     match value {
         DecodedValue::Int32(v) => v.to_string(),
-        DecodedValue::Float64(v) => v.to_string(),
+        // C parity: FLAT scalar float publishes `std::to_string(epicsFloat64)`
+        // (drvMqtt.cpp:651), specified as sprintf "%f" — always 6 decimals.
+        DecodedValue::Float64(v) => format!("{v:.6}"),
         DecodedValue::UInt32(v) => v.to_string(),
         DecodedValue::String(v) => v.clone(),
         DecodedValue::Int32Array(v) => {
             let parts: Vec<String> = v.iter().map(|x| x.to_string()).collect();
             parts.join(",")
         }
+        // C parity: FLAT array float streams each element through a default
+        // `std::ostringstream` (drvMqtt.cpp:685, `oss << arrayData[i]`), i.e.
+        // printf "%g" at the stream's default 6-significant-digit precision.
         DecodedValue::Float64Array(v) => {
-            let parts: Vec<String> = v.iter().map(|x| x.to_string()).collect();
+            let parts: Vec<String> = v.iter().map(|x| format_ostream_double(*x)).collect();
             parts.join(",")
         }
+    }
+}
+
+/// Format a float as C++ default `std::ostream operator<<` does — printf
+/// `%g` at the stream's default 6-significant-digit precision
+/// (drvMqtt.cpp:685, `oss << arrayData[i]`).
+///
+/// `%g` chooses fixed or scientific by the post-rounding decimal exponent
+/// `e`: fixed when `-4 <= e < 6`, scientific otherwise, with trailing
+/// zeros stripped. We round to 6 significant digits via Rust scientific
+/// formatting (which yields the post-rounding exponent), then re-render in
+/// the selected style.
+fn format_ostream_double(v: f64) -> String {
+    const SIG: usize = 6;
+    if v == 0.0 {
+        // `oss << 0.0` => "0"; negative zero keeps its sign.
+        return if v.is_sign_negative() {
+            "-0".to_string()
+        } else {
+            "0".to_string()
+        };
+    }
+    if !v.is_finite() {
+        // libstdc++ streams non-finite as "nan"/"inf"/"-inf".
+        if v.is_nan() {
+            return "nan".to_string();
+        }
+        return if v < 0.0 {
+            "-inf".to_string()
+        } else {
+            "inf".to_string()
+        };
+    }
+    // Scientific render to SIG significant digits gives the rounded exponent.
+    let sci = format!("{:.*e}", SIG - 1, v);
+    let (mantissa, exp_str) = sci.split_once('e').expect("LowerExp always has 'e'");
+    let exp: i32 = exp_str.parse().expect("LowerExp exponent is an integer");
+    if (-4..SIG as i32).contains(&exp) {
+        // Fixed style: SIG-1-exp fractional digits, then strip trailing zeros.
+        let frac = (SIG as i32 - 1 - exp).max(0) as usize;
+        strip_trailing_zeros(&format!("{v:.frac$}"))
+    } else {
+        // Scientific style: strip the mantissa, render a C-style exponent
+        // (explicit sign, at least two digits) — e.g. "1.23457e+06".
+        let mantissa = strip_trailing_zeros(mantissa);
+        let sign = if exp < 0 { '-' } else { '+' };
+        format!("{mantissa}e{sign}{:02}", exp.abs())
+    }
+}
+
+/// Strip trailing zeros (and a now-bare decimal point) from a fixed-form
+/// decimal string, matching printf `%g`'s zero suppression.
+fn strip_trailing_zeros(s: &str) -> String {
+    if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        s.to_string()
     }
 }
 
@@ -489,7 +551,10 @@ mod tests {
     #[test]
     fn encode_flat_values() {
         assert_eq!(encode_flat(&DecodedValue::Int32(42)), "42");
-        assert_eq!(encode_flat(&DecodedValue::Float64(3.15)), "3.15");
+        // C `std::to_string(double)` = sprintf "%f" → fixed 6 decimals
+        // (drvMqtt.cpp:651), not the shortest round-trip "3.15".
+        assert_eq!(encode_flat(&DecodedValue::Float64(3.15)), "3.150000");
+        assert_eq!(encode_flat(&DecodedValue::Float64(22.5)), "22.500000");
         assert_eq!(encode_flat(&DecodedValue::UInt32(255)), "255");
         assert_eq!(encode_flat(&DecodedValue::String("hello".into())), "hello");
     }
@@ -500,10 +565,43 @@ mod tests {
             encode_flat(&DecodedValue::Int32Array(vec![1, 2, 3])),
             "1,2,3"
         );
+        // FLAT float arrays stream through default ostream = "%g"
+        // 6-significant-digit (drvMqtt.cpp:685); short values are unchanged.
         assert_eq!(
             encode_flat(&DecodedValue::Float64Array(vec![1.1, 2.2])),
             "1.1,2.2"
         );
+        // ...but more-than-6-significant-digit / large-magnitude values are
+        // rounded by "%g" where the old shortest-round-trip kept full form.
+        assert_eq!(
+            encode_flat(&DecodedValue::Float64Array(vec![
+                std::f64::consts::PI,
+                1234567.0
+            ])),
+            "3.14159,1.23457e+06"
+        );
+    }
+
+    #[test]
+    fn format_ostream_double_matches_g6() {
+        // Fixed-style branch (-4 <= exp < 6), trailing zeros stripped.
+        assert_eq!(format_ostream_double(22.5), "22.5");
+        assert_eq!(format_ostream_double(1.0), "1");
+        assert_eq!(format_ostream_double(100.0), "100");
+        assert_eq!(format_ostream_double(0.1), "0.1");
+        assert_eq!(format_ostream_double(std::f64::consts::PI), "3.14159");
+        assert_eq!(format_ostream_double(0.0001234567), "0.000123457");
+        assert_eq!(format_ostream_double(999999.0), "999999");
+        assert_eq!(format_ostream_double(-22.5), "-22.5");
+        // Scientific-style branch (exp >= 6 or exp < -4), C exponent form.
+        assert_eq!(format_ostream_double(1234567.0), "1.23457e+06");
+        assert_eq!(format_ostream_double(1000000.0), "1e+06");
+        assert_eq!(format_ostream_double(0.00001234567), "1.23457e-05");
+        // Post-rounding exponent carry (9999999 -> 1.00000e7).
+        assert_eq!(format_ostream_double(9999999.0), "1e+07");
+        // Zero and signed zero.
+        assert_eq!(format_ostream_double(0.0), "0");
+        assert_eq!(format_ostream_double(-0.0), "-0");
     }
 
     // --- JSON encode ---

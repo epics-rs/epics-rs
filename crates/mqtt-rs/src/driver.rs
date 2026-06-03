@@ -306,7 +306,8 @@ mod tests {
 
         let req = rx.try_recv().unwrap();
         assert_eq!(req.topic, "test/float_topic");
-        assert_eq!(req.payload, "3.15");
+        // C `std::to_string(double)` = "%f", fixed 6 decimals (drvMqtt.cpp:651).
+        assert_eq!(req.payload, "3.150000");
     }
 
     #[test]

@@ -2785,25 +2785,40 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 }
             };
 
-            let write_type = match DbFieldType::from_u16(hdr.data_type) {
-                Ok(t) => t,
-                Err(_) => {
-                    // C `write_notify_action` (camessage.c:1647-1651) and
-                    // `write_action` (camessage.c:753-766) both treat
-                    // unsupported data types as a protocol violation:
-                    // emit the appropriate error reply, then return
-                    // RSRV_ERROR which tears the connection down. The
-                    // C source classifies this as "client doesn't
-                    // recover" — a peer sending an unsupported DBR
-                    // either has a corrupted dispatcher or is probing
-                    // for protocol weaknesses; either way the right
-                    // response is to drop.
-                    if is_notify {
-                        // C `putNotifyErrorReply` (`camessage.c:
-                        // 1482-1501`) preserves `m_dataType` and
-                        // `m_count` from the request — `caHdrLargeArray`
-                        // count is the 32-bit decoded value re-emitted
-                        // in extended form when needed.
+            // The DBR-type gate and the write-access gate run in
+            // OPPOSITE orders for the two write opcodes, and the order is
+            // observable when BOTH fail: a bad type tears the connection
+            // down (RSRV_ERROR), denied access keeps it (RSRV_OK), and
+            // only the gate that runs FIRST reports its error.
+            //
+            // * `write_notify_action` (camessage.c:1647-1656): TYPE first
+            //   (ECA_BADTYPE → RSRV_ERROR/drop), THEN access
+            //   (ECA_NOWTACCESS → RSRV_OK/keep).
+            // * `write_action` (camessage.c:741-766): ACCESS first
+            //   (ECA_NOWTACCESS → RSRV_OK/keep). There is NO standalone
+            //   type pre-check — the type is validated only by
+            //   `caNetConvert` (camessage.c:753) AFTER access passes
+            //   (ECA_BADTYPE → RSRV_ERROR/drop).
+            //
+            // So a deprecated CA_PROTO_WRITE carrying an unsupported DBR
+            // type to a channel the peer cannot write must reply
+            // ECA_NOWTACCESS and KEEP the connection — not ECA_BADTYPE +
+            // drop. Pre-fix Rust ran the type gate first for both
+            // opcodes, inverting `write_action`. Each gate's witness type
+            // (`write_type`, `write_grant`) flows to the write below.
+            //
+            // A type-state WRITE gate: `lookup_access` is the only path
+            // to the cache; the witness ensures the matching ECA code
+            // reaches the wire.
+            let (write_type, write_grant) = if is_notify {
+                let write_type = match DbFieldType::from_u16(hdr.data_type) {
+                    Ok(t) => t,
+                    Err(_) => {
+                        // C `putNotifyErrorReply` (camessage.c:1482-1501)
+                        // preserves `m_dataType`/`m_count` from the
+                        // request, then returns RSRV_ERROR (drop) — a
+                        // peer sending an unsupported DBR has a corrupted
+                        // dispatcher or is probing, so C drops.
                         send_put_notify_response(
                             writer,
                             hdr.data_type,
@@ -2812,27 +2827,19 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             ioid,
                         )
                         .await?;
-                    } else {
-                        send_ca_error(writer, hdr, ECA_BADTYPE, entry_cid, "bad data type").await?;
+                        return Err(epics_base_rs::error::CaError::Protocol(format!(
+                            "WRITE_NOTIFY with unsupported DBR type {} (matches C write_notify_action RSRV_ERROR)",
+                            hdr.data_type
+                        )));
                     }
-                    return Err(epics_base_rs::error::CaError::Protocol(format!(
-                        "WRITE with unsupported DBR type {} (matches C write_action RSRV_ERROR)",
-                        hdr.data_type
-                    )));
-                }
-            };
-
-            // Type-state WRITE gate. `lookup_access` is
-            // the only path to the cache; the witness type ensures
-            // the matching ECA code reaches the wire.
-            let write_grant = match state.lookup_access(sid).require_write() {
-                Ok(g) => g,
-                Err(denied) => {
-                    if is_notify {
-                        // route through the refinement
-                        // helper so large-array put-callbacks
-                        // refused by ACF carry the extended-form
-                        // count instead of the u16 marker.
+                };
+                let write_grant = match state.lookup_access(sid).require_write() {
+                    Ok(g) => g,
+                    Err(denied) => {
+                        // route through the refinement helper so
+                        // large-array put-callbacks refused by ACF carry
+                        // the extended-form count instead of the u16
+                        // marker.
                         send_put_notify_response(
                             writer,
                             write_type as u16,
@@ -2841,21 +2848,41 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             ioid,
                         )
                         .await?;
-                    } else {
-                        // C `write_action` (`rsrv/camessage.c:741-750`)
-                        // emits `send_err(mp, ECA_NOWTACCESS, client,
-                        // RECORD_NAME(pciu->dbch))` even for the no-
-                        // notify WRITE. Without this branch the Rust
-                        // server dropped denied PROTO_WRITEs silently —
-                        // C libca's `cac::exception` path never fired,
-                        // so a `caput` from a read-only peer looked
-                        // like it had succeeded (no error callback)
-                        // even though the value never reached the DB.
-                        send_ca_error(writer, hdr, denied.eca_code(), entry_cid, &audit_pv).await?;
+                        state.audit("caput", &audit_pv, "", "denied").await;
+                        return Ok(());
                     }
-                    state.audit("caput", &audit_pv, "", "denied").await;
-                    return Ok(());
-                }
+                };
+                (write_type, write_grant)
+            } else {
+                // C `write_action` (camessage.c:741-750) emits
+                // `send_err(mp, ECA_NOWTACCESS, ...)` and returns RSRV_OK
+                // (keep) BEFORE any type handling. Without surfacing this
+                // the Rust server dropped denied PROTO_WRITEs silently —
+                // libca's `cac::exception` never fired, so a `caput` from
+                // a read-only peer looked like it had succeeded even
+                // though the value never reached the DB.
+                let write_grant = match state.lookup_access(sid).require_write() {
+                    Ok(g) => g,
+                    Err(denied) => {
+                        send_ca_error(writer, hdr, denied.eca_code(), entry_cid, &audit_pv).await?;
+                        state.audit("caput", &audit_pv, "", "denied").await;
+                        return Ok(());
+                    }
+                };
+                // Type validated only after access passes (C
+                // `caNetConvert`, camessage.c:753) — a bad type here is a
+                // protocol violation → RSRV_ERROR/drop.
+                let write_type = match DbFieldType::from_u16(hdr.data_type) {
+                    Ok(t) => t,
+                    Err(_) => {
+                        send_ca_error(writer, hdr, ECA_BADTYPE, entry_cid, "bad data type").await?;
+                        return Err(epics_base_rs::error::CaError::Protocol(format!(
+                            "WRITE with unsupported DBR type {} (matches C write_action RSRV_ERROR)",
+                            hdr.data_type
+                        )));
+                    }
+                };
+                (write_type, write_grant)
             };
 
             // the write-trap mask of the ACF rule that
@@ -5868,6 +5895,227 @@ mod non_graceful_disconnect_teardown_tests {
             .expect("handle_client completes")
             .expect("join ok");
         assert!(res.is_ok(), "graceful EOF must be Ok, got {res:?}");
+    }
+}
+
+#[cfg(test)]
+mod write_gate_order_tests {
+    //! The deprecated `CA_PROTO_WRITE` (cmd 4) and `CA_PROTO_WRITE_NOTIFY`
+    //! (cmd 19) run their DBR-type gate and their write-access gate in
+    //! OPPOSITE orders, and the order is observable when BOTH fail:
+    //!
+    //! * `write_notify_action` (rsrv/camessage.c:1647-1656): TYPE first
+    //!   (ECA_BADTYPE → RSRV_ERROR / connection DROPPED), THEN access.
+    //! * `write_action` (rsrv/camessage.c:741-766): ACCESS first
+    //!   (ECA_NOWTACCESS → RSRV_OK / connection KEPT), the type is
+    //!   validated only afterwards by `caNetConvert`.
+    //!
+    //! So a peer that sends a deprecated WRITE which is BOTH access-denied
+    //! AND carries an unsupported DBR type must receive ECA_NOWTACCESS and
+    //! keep its connection — NOT ECA_BADTYPE + drop. Pre-fix Rust ran the
+    //! type gate first for both opcodes, inverting `write_action`. These
+    //! two tests pin each opcode's ordering.
+    use super::non_graceful_disconnect_teardown_tests::{
+        create_chan_frame, read_create_chan_sid, version_frame,
+    };
+    use super::*;
+    use epics_base_rs::server::access_security::parse_acf;
+    use epics_base_rs::server::database::PvDatabase;
+    use epics_base_rs::types::EpicsValue;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// An unsupported DBR type code: far above `LAST_BUFFER_TYPE`, and
+    /// neither `DBR_PUT_ACKT` (35) nor `DBR_PUT_ACKS` (36) — so it falls
+    /// through to the regular `DbFieldType::from_u16` gate and fails it.
+    const BAD_DBR_TYPE: u16 = 9999;
+
+    /// Build a write frame (`cmmd` = `CA_PROTO_WRITE` or
+    /// `CA_PROTO_WRITE_NOTIFY`) addressed to `sid`, carrying `data_type`
+    /// and an 8-byte (one DBR_DOUBLE) payload. `count == 1`.
+    fn write_frame(cmmd: u16, sid: u32, ioid: u32, data_type: u16) -> Vec<u8> {
+        let mut h = CaHeader::new(cmmd);
+        h.data_type = data_type;
+        h.count = 1;
+        h.cid = sid;
+        h.available = ioid;
+        h.set_payload_size(8, 1);
+        let mut frame = h.to_bytes().to_vec();
+        frame.extend_from_slice(&0f64.to_be_bytes());
+        frame
+    }
+
+    /// Read frames from `client` until one whose command is `want_cmmd`
+    /// is seen; return it. Times out (panics) otherwise.
+    async fn read_frame_of_cmmd<R: tokio::io::AsyncRead + Unpin>(
+        client: &mut R,
+        want_cmmd: u16,
+        timeout: Duration,
+    ) -> CaHeader {
+        let mut acc: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 512];
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for cmmd {want_cmmd}"
+            );
+            let n = tokio::time::timeout(remaining, client.read(&mut buf))
+                .await
+                .expect("read within timeout")
+                .expect("read ok");
+            assert!(n > 0, "server closed before cmmd {want_cmmd}");
+            acc.extend_from_slice(&buf[..n]);
+            let mut offset = 0;
+            while offset + CaHeader::SIZE <= acc.len() {
+                let (hdr, hdr_size) =
+                    CaHeader::from_bytes_extended(&acc[offset..]).expect("response header parses");
+                let msg_len = hdr_size + hdr.actual_postsize();
+                if offset + msg_len > acc.len() {
+                    break;
+                }
+                if hdr.cmmd == want_cmmd {
+                    return hdr;
+                }
+                offset += msg_len;
+            }
+        }
+    }
+
+    /// Spawn `handle_client` over a duplex pair with a read-only ACF
+    /// (`RULE(0, READ)` — unconditional, write denied to every peer) and
+    /// a single double SimplePv `caput:ro`. Returns the client half, the
+    /// join handle, and the ACF-reload sender — the caller MUST keep the
+    /// sender alive for the test's duration: the read loop polls
+    /// `acf_reload_rx.recv()` biased-first, and a dropped sender resolves
+    /// to `Closed`, which makes `handle_client` exit `Ok(())` before it
+    /// ever reads a client frame.
+    async fn spawn_read_only_server(
+        peer_port: u16,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<CaResult<()>>,
+        broadcast::Sender<()>,
+    ) {
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("caput:ro", EpicsValue::Double(0.0))
+            .await
+            .expect("add pv");
+        let cfg = parse_acf("ASG(DEFAULT) { RULE(0, READ) }").expect("parse acf");
+        let acf = Arc::new(tokio::sync::RwLock::new(Some(cfg)));
+        let (acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let peer: SocketAddr = format!("127.0.0.1:{peer_port}").parse().unwrap();
+        let handle = tokio::spawn(async move {
+            handle_client(
+                server_io,
+                peer,
+                db,
+                acf,
+                acf_reload_rx,
+                5064,
+                None,
+                None,
+                None,
+                None,
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await
+        });
+        (client_io, handle, acf_reload_tx)
+    }
+
+    /// Drive version + create-chan and return the server-assigned sid.
+    async fn handshake(client: &mut tokio::io::DuplexStream) -> u32 {
+        client.write_all(&version_frame()).await.expect("version");
+        client
+            .write_all(&create_chan_frame(0xC1, "caput:ro"))
+            .await
+            .expect("create_chan");
+        client.flush().await.expect("flush create_chan");
+        read_create_chan_sid(client, Duration::from_secs(3)).await
+    }
+
+    /// Deprecated `CA_PROTO_WRITE`, access-denied AND bad type: C
+    /// `write_action` checks access FIRST → ECA_NOWTACCESS + RSRV_OK
+    /// (keep). The error rides a `CA_PROTO_ERROR` reply (`m_available` =
+    /// ECA status). Pre-fix the type-first path replied ECA_BADTYPE and
+    /// dropped the connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deprecated_write_denied_reports_nowtaccess_and_keeps_conn() {
+        let (mut client, handle, _acf_reload_tx) = spawn_read_only_server(55330).await;
+        let sid = handshake(&mut client).await;
+
+        client
+            .write_all(&write_frame(CA_PROTO_WRITE, sid, 0x42, BAD_DBR_TYPE))
+            .await
+            .expect("write");
+        client.flush().await.expect("flush write");
+
+        let err = read_frame_of_cmmd(&mut client, CA_PROTO_ERROR, Duration::from_secs(3)).await;
+        assert_eq!(
+            err.available, ECA_NOWTACCESS,
+            "deprecated WRITE must report access denial first (ECA_NOWTACCESS), \
+             not the type error (ECA_BADTYPE={ECA_BADTYPE}); got {}",
+            err.available
+        );
+
+        // RSRV_OK after ECA_NOWTACCESS — the connection must stay up.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !handle.is_finished(),
+            "deprecated WRITE access-denied must KEEP the connection (C write_action RSRV_OK)"
+        );
+
+        drop(client);
+        handle.abort();
+    }
+
+    /// `CA_PROTO_WRITE_NOTIFY`, same access-denied + bad type: C
+    /// `write_notify_action` checks the TYPE FIRST → ECA_BADTYPE +
+    /// RSRV_ERROR (drop). The error rides a `CA_PROTO_WRITE_NOTIFY` reply
+    /// (`m_cid` = ECA status). This pins the opposite ordering so a future
+    /// "unify the two opcodes" refactor cannot silently re-invert either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_notify_bad_type_reports_badtype_and_drops_conn() {
+        let (mut client, handle, _acf_reload_tx) = spawn_read_only_server(55331).await;
+        let sid = handshake(&mut client).await;
+
+        client
+            .write_all(&write_frame(CA_PROTO_WRITE_NOTIFY, sid, 0x43, BAD_DBR_TYPE))
+            .await
+            .expect("write_notify");
+        client.flush().await.expect("flush write_notify");
+
+        let reply =
+            read_frame_of_cmmd(&mut client, CA_PROTO_WRITE_NOTIFY, Duration::from_secs(3)).await;
+        // send_put_notify_response carries the ECA status in `m_cid`.
+        assert_eq!(
+            reply.cid, ECA_BADTYPE,
+            "WRITE_NOTIFY must report the type error first (ECA_BADTYPE), \
+             not access (ECA_NOWTACCESS={ECA_NOWTACCESS}); got {}",
+            reply.cid
+        );
+
+        // RSRV_ERROR after ECA_BADTYPE — the connection must drop.
+        let res = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handle_client completes after WRITE_NOTIFY bad type")
+            .expect("join ok");
+        assert!(
+            res.is_err(),
+            "WRITE_NOTIFY bad type must DROP the connection (C write_notify_action RSRV_ERROR), \
+             got {res:?}"
+        );
+
+        drop(client);
     }
 }
 

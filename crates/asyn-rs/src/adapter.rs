@@ -464,7 +464,7 @@ fn param_value_to_epics_value(pv: &crate::param::ParamValue) -> Option<EpicsValu
         ParamValue::Int32(v) => Some(EpicsValue::Long(*v)),
         ParamValue::Int64(v) => Some(EpicsValue::Double(*v as f64)),
         ParamValue::Float64(v) => Some(EpicsValue::Double(*v)),
-        ParamValue::Octet(s) => Some(EpicsValue::String(s.clone())),
+        ParamValue::Octet(s) => Some(EpicsValue::String(s.clone().into())),
         ParamValue::UInt32Digital(v) => Some(EpicsValue::Long(*v as i32)),
         ParamValue::Enum { index, .. } => Some(EpicsValue::Enum(*index as u16)),
         ParamValue::Int8Array(a) => {
@@ -586,7 +586,7 @@ impl AsynDeviceSupport {
             "asynFloat64" => result.float_val.map(EpicsValue::Double),
             "asynOctet" => result.data.as_ref().map(|d| {
                 let n = result.nbytes.min(d.len());
-                EpicsValue::String(String::from_utf8_lossy(&d[..n]).into_owned())
+                EpicsValue::String(String::from_utf8_lossy(&d[..n]).into_owned().into())
             }),
             "asynUInt32Digital" => result.uint_val.map(|v| EpicsValue::Long(v as i32)),
             "asynEnum" => result.enum_index.map(|v| EpicsValue::Enum(v as u16)),

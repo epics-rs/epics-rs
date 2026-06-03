@@ -223,6 +223,119 @@ async fn test_single_inp_mss_propagates_stat_and_amsg() {
     );
 }
 
+/// OUTPUT-side twin of the INP MS-class tests above: C `dbDbPutValue`
+/// (dbDbLink.c:382-383) folds the SOURCE record's alarm into a DB
+/// OUT-link DEST via `recGblInheritSevrMsg`. A source at MAJOR writing
+/// through `OUT = DST PP MS` must lift DST to MAJOR under `LINK_ALARM`
+/// (NOT the source's HIHI stat), with no amsg. Pre-fix the OUT-link
+/// write path only put the value and propagated PUTF — the dest never
+/// inherited the source severity, so an alarming upstream record silently
+/// drove a NO_ALARM downstream. (Per-mode semantics — MS/MSI/MSS/NMS —
+/// are exercised by the INP tests above; both sides share the
+/// `inherit_sevr_msg` helper, so these OUT tests pin the wiring: the OUT
+/// path captures the source's committed alarm and applies it to the DEST.)
+#[tokio::test]
+async fn test_out_link_ms_propagates_link_alarm_to_dest() {
+    use epics_base_rs::server::recgbl::alarm_status;
+
+    let db = PvDatabase::new();
+    // SRC: ao with VAL=99 over HIHI=50/HHSV=Major → computes MAJOR/HIHI
+    // through its own analog-limit alarm, then writes 99 to DST via a
+    // `PP MS` OUT link.
+    db.add_record("SRC", Box::new(AoRecord::new(99.0)))
+        .await
+        .unwrap();
+    db.add_record("DST", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("SRC").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("OUT", EpicsValue::String("DST PP MS".into()))
+            .unwrap();
+        inst.put_common_field("HIHI", EpicsValue::Double(50.0))
+            .unwrap();
+        inst.put_common_field("HHSV", EpicsValue::Short(AlarmSeverity::Major as i16))
+            .unwrap();
+        inst.common.udf = false;
+    }
+    if let Some(rec) = db.get_record("DST").await {
+        // Clear DST's own UDF so its post-write process raises no alarm
+        // of its own — the only severity it can end up at is the
+        // inherited one.
+        rec.write().await.common.udf = false;
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SRC", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let dst = db.get_record("DST").await.expect("DST exists");
+    let inst = dst.read().await;
+    // Guard: the OUT-link value actually landed.
+    let val = inst.record.val().and_then(|v| v.to_f64()).unwrap_or(0.0);
+    assert!(
+        (val - 99.0).abs() < 1e-9,
+        "OUT-link value must reach DST: got {val}"
+    );
+    assert_eq!(
+        inst.common.sevr,
+        AlarmSeverity::Major,
+        "MS OUT link must lift DST severity to source's Major"
+    );
+    assert_eq!(
+        inst.common.stat,
+        alarm_status::LINK_ALARM,
+        "C parity: MS OUT link MUST surface as LINK_ALARM, not the source's HIHI stat"
+    );
+    assert!(
+        inst.common.amsg.is_empty(),
+        "C parity: MS OUT link MUST NOT propagate amsg; got {:?}",
+        inst.common.amsg
+    );
+}
+
+/// NMS contrast for the OUT-link inheritance above: a bare `OUT = DST PP`
+/// carries the default NoMaximize switch, so a MAJOR source must NOT
+/// raise the dest's severity.
+#[tokio::test]
+async fn test_out_link_nms_does_not_propagate_alarm_to_dest() {
+    let db = PvDatabase::new();
+    db.add_record("SRC", Box::new(AoRecord::new(99.0)))
+        .await
+        .unwrap();
+    db.add_record("DST", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("SRC").await {
+        let mut inst = rec.write().await;
+        // No MS-class modifier → NoMaximize.
+        inst.put_common_field("OUT", EpicsValue::String("DST PP".into()))
+            .unwrap();
+        inst.put_common_field("HIHI", EpicsValue::Double(50.0))
+            .unwrap();
+        inst.put_common_field("HHSV", EpicsValue::Short(AlarmSeverity::Major as i16))
+            .unwrap();
+        inst.common.udf = false;
+    }
+    if let Some(rec) = db.get_record("DST").await {
+        rec.write().await.common.udf = false;
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SRC", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let dst = db.get_record("DST").await.expect("DST exists");
+    let inst = dst.read().await;
+    assert_eq!(
+        inst.common.sevr,
+        AlarmSeverity::NoAlarm,
+        "NMS OUT link MUST NOT propagate the source's Major severity"
+    );
+}
+
 /// B2 regression: a soft-channel record whose INP is an external
 /// `pva://` link must fold the lset's gated alarm severity into its
 /// own `LINK_ALARM`. Previously `read_link_with_alarm` returned

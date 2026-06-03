@@ -21,6 +21,67 @@ pub(crate) struct LinkAlarm {
     pub amsg: String,
 }
 
+/// Apply C `recGblInheritSevrMsg` (recGbl.c:263-281) for one MS-class
+/// link: fold the link source's alarm (`src`) into the destination
+/// record's PENDING alarm (`dest`) per the maximize-severity mode `ms`.
+///
+/// * **NMS** — no propagation.
+/// * **MS**  — raise dest severity to `src.sevr` under `LINK_ALARM`
+///   (NOT the source's stat); no message.
+/// * **MSI** — same as MS, but only when the source is at `INVALID`.
+/// * **MSS** — copy the source's stat + severity + amsg (the only mode
+///   that propagates the message).
+///
+/// Shared by the INPUT-link read path (`processing.rs`, where `dest` is
+/// the record reading its inputs) and the DB OUT-link write path
+/// ([`Database::write_db_link_value`], C `dbDbPutValue` →
+/// `recGblInheritSevrMsg`, dbDbLink.c:382-383, where `dest` is the
+/// OUT-link target). One implementation keeps the two sides from
+/// diverging — an earlier INPUT-side variant wrongly treated MS like
+/// MSS (propagating source stat + amsg through plain MS).
+pub(crate) fn inherit_sevr_msg(
+    dest: &mut crate::server::record::CommonFields,
+    ms: crate::server::record::MonitorSwitch,
+    src: &LinkAlarm,
+) {
+    use crate::server::recgbl::{alarm_status, rec_gbl_set_sevr, rec_gbl_set_sevr_msg};
+    use crate::server::record::{AlarmSeverity, MonitorSwitch};
+    match ms {
+        MonitorSwitch::Maximize => {
+            rec_gbl_set_sevr(dest, alarm_status::LINK_ALARM, src.sevr);
+        }
+        MonitorSwitch::MaximizeIfInvalid => {
+            if src.sevr == AlarmSeverity::Invalid {
+                rec_gbl_set_sevr(dest, alarm_status::LINK_ALARM, src.sevr);
+            }
+        }
+        MonitorSwitch::MaximizeStatus => {
+            rec_gbl_set_sevr_msg(dest, src.stat, src.sevr, src.amsg.clone());
+        }
+        MonitorSwitch::NoMaximize => {} // NMS: do not propagate
+    }
+}
+
+/// The source record's per-cycle state propagated to a DB OUT-link
+/// target, captured once from the source and threaded to every OUT-link
+/// write so all targets in one cycle see the same snapshot:
+///
+/// * `putf` / `notify` — the PUTF bit and put-notify wait-set that C
+///   `processTarget` carries to each target (dbDbLink.c:460-474).
+/// * `alarm` — the committed alarm that C `recGblInheritSevrMsg` folds
+///   into the dest per the link's MS-class switch (dbDbLink.c:382-383).
+///
+/// Bundled so the OUT-link write path threads one snapshot instead of
+/// three positional arguments. The FLNK process-trigger path keeps the
+/// lighter `PutNotifyCtx` (a forward link propagates no value and thus
+/// no alarm).
+#[derive(Clone, Copy)]
+pub(crate) struct OutLinkSrc<'a> {
+    pub putf: bool,
+    pub notify: Option<&'a Arc<NotifyWaitSet>>,
+    pub alarm: &'a LinkAlarm,
+}
+
 /// One `seq` link group — C `linkGrp { dly, dol, dov, lnk }`.
 #[derive(Clone, Debug)]
 pub(crate) struct SeqGroup {
@@ -570,8 +631,7 @@ impl PvDatabase {
         &self,
         link: &crate::server::record::DbLink,
         value: EpicsValue,
-        src_putf: bool,
-        src_notify: Option<&Arc<NotifyWaitSet>>,
+        src: OutLinkSrc<'_>,
         visited: &mut HashSet<String>,
         depth: usize,
     ) {
@@ -589,6 +649,26 @@ impl PvDatabase {
         // `dbDbPutValue` writes the OUT-link target under the same
         // lock set the chain already owns.
         let _ = self.put_pv_already_locked(&target_name, value).await;
+
+        // C `dbDbPutValue` (dbDbLink.c:382-383) folds the SOURCE
+        // record's alarm into the destination via `recGblInheritSevrMsg`,
+        // AFTER the `dbPut` and BEFORE `processTarget`. In this port the
+        // source's per-cycle alarm has already been committed by
+        // `rec_gbl_reset_alarms` before the OUT link dispatches, so
+        // `src_alarm` carries the source's *committed* stat/sevr/amsg —
+        // the same values C reads from the still-pending nsta/nsev/namsg
+        // at its (earlier) synchronous `writeValue` point. The inherited
+        // severity lands in the dest's PENDING nsev/nsta(/namsg for MSS);
+        // the dest commits it on its next `rec_gbl_reset_alarms` — its
+        // own process cycle, reached below for a `.PROC`/`PP` link, or a
+        // later independent scan otherwise. NMS (the common case) skips
+        // the dest lookup/lock entirely.
+        if link.monitor_switch != crate::server::record::MonitorSwitch::NoMaximize {
+            if let Some(target_rec) = self.get_record(&link.record).await {
+                let mut tg = target_rec.write().await;
+                inherit_sevr_msg(&mut tg.common, link.monitor_switch, src.alarm);
+            }
+        }
 
         // C `dbDbPutValue` (`dbDbLink.c:387-390`) processes the target
         // when the destination field is `.PROC` **or** the link carries
@@ -613,7 +693,7 @@ impl PvDatabase {
                     let on_chain = visited.contains(&link.record);
                     let scan = tg.common.scan;
                     if !pact {
-                        tg.common.putf = src_putf;
+                        tg.common.putf = src.putf;
                         // C `dbNotifyAdd` (dbDbLink.c:460) lives inside
                         // `processTarget`, which `dbDbPutValue` reaches
                         // for a `.PROC` write or a `PP` link to a passive
@@ -624,9 +704,9 @@ impl PvDatabase {
                         // join, or it would `enter` the wait-set without
                         // ever `leave`ing it and hang the completion.
                         if scan == ScanType::Passive {
-                            join_put_notify(&mut tg, src_notify);
+                            join_put_notify(&mut tg, src.notify);
                         }
-                    } else if src_putf && !on_chain {
+                    } else if src.putf && !on_chain {
                         tg.common.rpro = true;
                         tg.common.putf = false;
                     }
@@ -755,14 +835,13 @@ impl PvDatabase {
         &self,
         link: &crate::server::record::ParsedLink,
         value: EpicsValue,
-        src_putf: bool,
-        src_notify: Option<&Arc<NotifyWaitSet>>,
+        src: OutLinkSrc<'_>,
         visited: &mut HashSet<String>,
         depth: usize,
     ) {
         match link {
             crate::server::record::ParsedLink::Db(db) => {
-                self.write_db_link_value(db, value, src_putf, src_notify, visited, depth)
+                self.write_db_link_value(db, value, src, visited, depth)
                     .await;
             }
             crate::server::record::ParsedLink::Ca(_)
@@ -771,7 +850,7 @@ impl PvDatabase {
                 let name = link
                     .external_pv_name()
                     .expect("Ca/Pva/PvaJson link carries a PV name");
-                let op = Self::external_put_op(src_notify);
+                let op = Self::external_put_op(src.notify);
                 if let Err(e) = self.write_external_pv(name, value, op).await {
                     eprintln!("OUT-link write to external PV '{name}' failed: {e}");
                 }
@@ -848,10 +927,26 @@ impl PvDatabase {
         // Snapshot the source record's PUTF bit + put-notify wait-set so
         // every write_db_link_value call below propagates them to its
         // target — C `dbDbLink.c::processTarget` PUTF and `dbNotifyAdd`
-        // wait-set invariants (see write_db_link_value doc).
-        let (src_putf, src_notify) = {
+        // wait-set invariants (see write_db_link_value doc). The
+        // committed alarm travels the same way for `recGblInheritSevrMsg`
+        // MS-class propagation into each OUT-link target.
+        let (src_putf, src_notify, src_alarm) = {
             let guard = rec.read().await;
-            (guard.common.putf, guard.notify.clone())
+            (
+                guard.common.putf,
+                guard.notify.clone(),
+                LinkAlarm {
+                    stat: guard.common.stat,
+                    sevr: guard.common.sevr,
+                    amsg: guard.common.amsg.clone(),
+                },
+            )
+        };
+        // One snapshot threaded to every OUT-link write below.
+        let out_src = OutLinkSrc {
+            putf: src_putf,
+            notify: src_notify.as_ref(),
+            alarm: &src_alarm,
         };
 
         // Resolve the SELL link into SELN before SELN is read below.
@@ -1173,15 +1268,8 @@ impl PvDatabase {
                         let parsed = crate::server::record::parse_output_link_v2(link_str);
                         match parsed {
                             crate::server::record::ParsedLink::Db(ref db) => {
-                                self.write_db_link_value(
-                                    db,
-                                    val.clone(),
-                                    src_putf,
-                                    src_notify.as_ref(),
-                                    visited,
-                                    depth,
-                                )
-                                .await;
+                                self.write_db_link_value(db, val.clone(), out_src, visited, depth)
+                                    .await;
                             }
                             // External `ca://`/`pva://` OUTn — C
                             // `dbPutLink` routes a CA-link write through
@@ -1246,15 +1334,8 @@ impl PvDatabase {
                         // both through the link set's `putValue`
                         // (dbLink.c:434-448).
                         let lnk_parsed = crate::server::record::parse_output_link_v2(&grp.lnk);
-                        self.write_out_link_value(
-                            &lnk_parsed,
-                            value,
-                            src_putf,
-                            src_notify.as_ref(),
-                            visited,
-                            depth,
-                        )
-                        .await;
+                        self.write_out_link_value(&lnk_parsed, value, out_src, visited, depth)
+                            .await;
                     }
                 }
             }
@@ -1290,15 +1371,8 @@ impl PvDatabase {
                         // through the link set's `putValue`
                         // (dbLink.c:434-448).
                         let lnk_parsed = crate::server::record::parse_output_link_v2(&grp.lnk);
-                        self.write_out_link_value(
-                            &lnk_parsed,
-                            value,
-                            src_putf,
-                            src_notify.as_ref(),
-                            visited,
-                            depth,
-                        )
-                        .await;
+                        self.write_out_link_value(&lnk_parsed, value, out_src, visited, depth)
+                            .await;
                     }
                 }
             }

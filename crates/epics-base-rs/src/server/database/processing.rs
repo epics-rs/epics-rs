@@ -1235,36 +1235,10 @@ impl PvDatabase {
             // identically, propagating source stat + amsg through both
             // — that matches MSS but is wrong for MS (and MSI), which
             // C says should always surface as LINK_ALARM with no msg.
+            // The per-mode switch is shared with the DB OUT-link write
+            // path via `inherit_sevr_msg` so the two sides cannot drift.
             for (ms, alarm) in &link_alarms {
-                use crate::server::recgbl::{alarm_status, rec_gbl_set_sevr, rec_gbl_set_sevr_msg};
-                use crate::server::record::MonitorSwitch;
-                match ms {
-                    MonitorSwitch::Maximize => {
-                        rec_gbl_set_sevr(
-                            &mut instance.common,
-                            alarm_status::LINK_ALARM,
-                            alarm.sevr,
-                        );
-                    }
-                    MonitorSwitch::MaximizeIfInvalid => {
-                        if alarm.sevr == crate::server::record::AlarmSeverity::Invalid {
-                            rec_gbl_set_sevr(
-                                &mut instance.common,
-                                alarm_status::LINK_ALARM,
-                                alarm.sevr,
-                            );
-                        }
-                    }
-                    MonitorSwitch::MaximizeStatus => {
-                        rec_gbl_set_sevr_msg(
-                            &mut instance.common,
-                            alarm.stat,
-                            alarm.sevr,
-                            alarm.amsg.clone(),
-                        );
-                    }
-                    MonitorSwitch::NoMaximize => {} // NMS: do not propagate
-                }
+                super::links::inherit_sevr_msg(&mut instance.common, *ms, alarm);
             }
 
             // UDF update — C parity (aiRecord.c:285, calcRecord.c
@@ -1667,10 +1641,20 @@ impl PvDatabase {
         // `processTarget` / `dbNotifyAdd` invariants (see
         // `write_db_link_value` doc). Captured once here so every OUT /
         // multi-OUT / FLNK dispatch in this cycle propagates the same
-        // bit and joins the same wait-set.
-        let (src_putf, src_notify) = {
+        // bit and joins the same wait-set. The committed alarm is
+        // captured the same way for `recGblInheritSevrMsg` MS-class
+        // propagation into the OUT-link target.
+        let (src_putf, src_notify, src_alarm) = {
             let guard = rec.read().await;
-            (guard.common.putf, guard.notify.clone())
+            (
+                guard.common.putf,
+                guard.notify.clone(),
+                super::links::LinkAlarm {
+                    stat: guard.common.stat,
+                    sevr: guard.common.sevr,
+                    amsg: guard.common.amsg.clone(),
+                },
+            )
         };
 
         // 4. OUT link — DB *or* external `ca://`/`pva://`. C
@@ -1683,8 +1667,11 @@ impl PvDatabase {
             self.write_out_link_value(
                 link,
                 out_val.clone(),
-                src_putf,
-                src_notify.as_ref(),
+                super::links::OutLinkSrc {
+                    putf: src_putf,
+                    notify: src_notify.as_ref(),
+                    alarm: &src_alarm,
+                },
                 visited,
                 depth,
             )
@@ -1872,6 +1859,17 @@ impl PvDatabase {
                 }
             };
             if let Some(pairs) = multi_out {
+                // Source committed alarm for `recGblInheritSevrMsg`
+                // MS-class propagation into each OUT-link target —
+                // captured once, same lifecycle as `src.putf`.
+                let src_alarm = {
+                    let guard = rec.read().await;
+                    super::links::LinkAlarm {
+                        stat: guard.common.stat,
+                        sevr: guard.common.sevr,
+                        amsg: guard.common.amsg.clone(),
+                    }
+                };
                 for (link_str, val) in pairs {
                     // `multi_output_links` carries record OUT links
                     // (sseq `LNKn`, scalcout `OUTn` — all `DBF_OUTLINK`)
@@ -1888,8 +1886,18 @@ impl PvDatabase {
                     let parsed = crate::server::record::parse_output_link_v2(
                         link_str.as_str_lossy().as_ref(),
                     );
-                    self.write_out_link_value(&parsed, val, src.putf, src.notify, visited, depth)
-                        .await;
+                    self.write_out_link_value(
+                        &parsed,
+                        val,
+                        super::links::OutLinkSrc {
+                            putf: src.putf,
+                            notify: src.notify,
+                            alarm: &src_alarm,
+                        },
+                        visited,
+                        depth,
+                    )
+                    .await;
                 }
             }
         }
@@ -2070,8 +2078,10 @@ impl PvDatabase {
                 }
                 ProcessAction::WriteDbLink { link_field, value } => {
                     // 1. Get the link string (record fields → common fields)
-                    // and the source PUTF for processTarget propagation.
-                    let (link_str, src_putf, src_notify) = {
+                    // and the source PUTF for processTarget propagation,
+                    // plus the committed alarm for `recGblInheritSevrMsg`
+                    // MS-class propagation into the OUT-link target.
+                    let (link_str, src_putf, src_notify, src_alarm) = {
                         let instance = rec.read().await;
                         let link = instance
                             .resolve_field(link_field)
@@ -2083,7 +2093,16 @@ impl PvDatabase {
                                 }
                             })
                             .unwrap_or_default();
-                        (link, instance.common.putf, instance.notify.clone())
+                        (
+                            link,
+                            instance.common.putf,
+                            instance.notify.clone(),
+                            super::links::LinkAlarm {
+                                stat: instance.common.stat,
+                                sevr: instance.common.sevr,
+                                amsg: instance.common.amsg.clone(),
+                            },
+                        )
                     };
                     if link_str.is_empty() {
                         continue;
@@ -2101,8 +2120,11 @@ impl PvDatabase {
                     self.write_out_link_value(
                         &parsed,
                         value,
-                        src_putf,
-                        src_notify.as_ref(),
+                        super::links::OutLinkSrc {
+                            putf: src_putf,
+                            notify: src_notify.as_ref(),
+                            alarm: &src_alarm,
+                        },
                         visited,
                         depth,
                     )
@@ -2502,9 +2524,19 @@ impl PvDatabase {
         // landed on the record; it (and wait-set membership) must
         // propagate through the (now-completing) OUT / FLNK chain so an
         // async target reached here also defers WRITE_NOTIFY completion.
-        let (src_putf, src_notify) = {
+        // The committed alarm propagates the same way for
+        // `recGblInheritSevrMsg` MS-class inheritance.
+        let (src_putf, src_notify, src_alarm) = {
             let guard = rec.read().await;
-            (guard.common.putf, guard.notify.clone())
+            (
+                guard.common.putf,
+                guard.notify.clone(),
+                super::links::LinkAlarm {
+                    stat: guard.common.stat,
+                    sevr: guard.common.sevr,
+                    amsg: guard.common.amsg.clone(),
+                },
+            )
         };
 
         // OUT link — DB *or* external `ca://`/`pva://`. Same scheme
@@ -2514,8 +2546,11 @@ impl PvDatabase {
             self.write_out_link_value(
                 &link,
                 out_val,
-                src_putf,
-                src_notify.as_ref(),
+                super::links::OutLinkSrc {
+                    putf: src_putf,
+                    notify: src_notify.as_ref(),
+                    alarm: &src_alarm,
+                },
                 visited,
                 depth,
             )
@@ -2585,8 +2620,11 @@ impl PvDatabase {
                     self.write_out_link_value(
                         &parsed,
                         val,
-                        src_putf,
-                        src_notify.as_ref(),
+                        super::links::OutLinkSrc {
+                            putf: src_putf,
+                            notify: src_notify.as_ref(),
+                            alarm: &src_alarm,
+                        },
                         visited,
                         depth,
                     )

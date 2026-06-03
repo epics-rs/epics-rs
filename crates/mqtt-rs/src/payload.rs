@@ -208,16 +208,43 @@ fn decode_json(raw: &str, value_type: ValueType, field_path: &str) -> MqttResult
     }
 }
 
-/// Traverse a JSON value using a dot-separated field path.
+/// Recursively search for `target_key` anywhere in the JSON value,
+/// depth-first, first match wins.
+///
+/// C parity: `findJsonField` (drvMqtt.cpp:340-359) descends into every
+/// nested object and array element and returns the first value whose key
+/// equals `target_key`. The key is matched WHOLE — a configured field
+/// like `a.b` is one literal key (C parses jsonField as the entire
+/// arguments-remainder, drvMqtt.cpp:92), never a dot-separated path. At
+/// each object level the key is checked before recursing into its value,
+/// so traversal order mirrors C; serde_json's default `Map` is a sorted
+/// `BTreeMap`, matching nlohmann's default sorted `std::map` iteration.
 fn extract_json_field<'a>(
     json: &'a serde_json::Value,
-    path: &str,
+    target_key: &str,
 ) -> Option<&'a serde_json::Value> {
-    let mut current = json;
-    for key in path.split('.') {
-        current = current.get(key)?;
+    match json {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                if key == target_key {
+                    return Some(value);
+                }
+                if let Some(found) = extract_json_field(value, target_key) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(elems) => {
+            for elem in elems {
+                if let Some(found) = extract_json_field(elem, target_key) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
     }
-    Some(current)
 }
 
 /// Parse a comma-separated or space-separated list of integers.
@@ -334,16 +361,48 @@ mod tests {
 
     #[test]
     fn decode_json_nested() {
-        let addr = TopicAddress::parse("JSON:INT sensors/data reading.value").unwrap();
+        // C `findJsonField` recurses into nested objects (drvMqtt.cpp:347):
+        // a whole-key match found anywhere wins, so `value` resolves even
+        // though it sits under the `reading` parent object.
+        let addr = TopicAddress::parse("JSON:INT sensors/data value").unwrap();
         let val = decode_payload(r#"{"reading": {"value": 42}}"#, &addr).unwrap();
         assert_eq!(val, DecodedValue::Int32(42));
     }
 
     #[test]
     fn decode_json_deeply_nested() {
-        let addr = TopicAddress::parse("JSON:FLOAT device/data a.b.c").unwrap();
+        // Recursion descends arbitrarily deep (drvMqtt.cpp:347).
+        let addr = TopicAddress::parse("JSON:FLOAT device/data c").unwrap();
         let val = decode_payload(r#"{"a": {"b": {"c": 9.99}}}"#, &addr).unwrap();
         assert_eq!(val, DecodedValue::Float64(9.99));
+    }
+
+    #[test]
+    fn decode_json_whole_key_with_dot() {
+        // C parses jsonField as the whole arguments-remainder
+        // (drvMqtt.cpp:92), so a key that legally contains a dot is matched
+        // literally as one key, never split into a path.
+        let addr = TopicAddress::parse("JSON:INT dev/data a.b").unwrap();
+        let val = decode_payload(r#"{"a.b": 7}"#, &addr).unwrap();
+        assert_eq!(val, DecodedValue::Int32(7));
+    }
+
+    #[test]
+    fn decode_json_dotted_field_is_not_path_split() {
+        // Anti-regression for the old dot-split traversal: `reading.value`
+        // is one literal key (absent here), so C returns not-found rather
+        // than walking `reading` then `value`.
+        let addr = TopicAddress::parse("JSON:INT sensors/data reading.value").unwrap();
+        assert!(decode_payload(r#"{"reading": {"value": 42}}"#, &addr).is_err());
+    }
+
+    #[test]
+    fn decode_json_recurses_into_array_elements() {
+        // C recurses into array elements as well as objects
+        // (drvMqtt.cpp:352-356).
+        let addr = TopicAddress::parse("JSON:FLOAT dev/data temp").unwrap();
+        let val = decode_payload(r#"{"sensors": [{"id": 1}, {"temp": 2.5}]}"#, &addr).unwrap();
+        assert_eq!(val, DecodedValue::Float64(2.5));
     }
 
     #[test]
@@ -390,10 +449,11 @@ mod tests {
         assert_eq!(val, DecodedValue::Int32Array(vec![10, 20, 30]));
     }
 
-    /// BUG 5 regression — a nested JSON INTARRAY field decodes too.
+    /// BUG 5 regression — a nested JSON INTARRAY field decodes too, reached
+    /// by C's recursive whole-key search (drvMqtt.cpp:347).
     #[test]
     fn decode_json_int_array_nested() {
-        let addr = TopicAddress::parse("JSON:INTARRAY dev/data a.b").unwrap();
+        let addr = TopicAddress::parse("JSON:INTARRAY dev/data b").unwrap();
         let val = decode_payload(r#"{"a": {"b": [1, 2, 3, 4]}}"#, &addr).unwrap();
         assert_eq!(val, DecodedValue::Int32Array(vec![1, 2, 3, 4]));
     }

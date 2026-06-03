@@ -45,8 +45,12 @@ pub enum TsMode {
     /// Replace value with a 2-element `LongArray = [sec, nsec]`.
     Array,
     /// Replace value with the EPICS-format timestamp string
-    /// (`%Y-%m-%d %H:%M:%S.%06f`).
+    /// (`%Y-%m-%d %H:%M:%S.%06f`, C `tsStringEpics`).
     StringEpics,
+    /// Replace value with the ISO-8601 timestamp string in LOCAL time
+    /// (`%Y-%m-%dT%H:%M:%S.%06f%z`, C `tsStringIso`, ts.c:250) — a `T`
+    /// separator and a `%z` zone offset, distinct from `StringEpics`.
+    StringIso,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +120,24 @@ fn format_epics_string(t: std::time::SystemTime) -> String {
     dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
 }
 
+fn format_iso_string(t: std::time::SystemTime) -> String {
+    use chrono::{DateTime, Local, Utc};
+    let unix_secs = t
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let utc: DateTime<Utc> =
+        DateTime::from_timestamp(unix_secs.trunc() as i64, ((unix_secs.fract()) * 1e9) as u32)
+            .unwrap_or_else(Utc::now);
+    // C `tsStringIso` formats in LOCAL time (epicsTimeToStrftime ->
+    // epicsTime_localtime), so `%z` carries the real local-zone offset
+    // (ts.c:250). The `T` separator and `%z` suffix distinguish it from
+    // the space-separated, zoneless epics format (ts.c:247).
+    utc.with_timezone(&Local)
+        .format("%Y-%m-%dT%H:%M:%S%.6f%z")
+        .to_string()
+}
+
 impl SubscriptionFilter for TimestampFilter {
     fn name(&self) -> &'static str {
         "ts"
@@ -159,6 +181,10 @@ impl SubscriptionFilter for TimestampFilter {
             TsMode::StringEpics => {
                 event.event.snapshot.value =
                     EpicsValue::String(format_epics_string(event.event.snapshot.timestamp).into());
+            }
+            TsMode::StringIso => {
+                event.event.snapshot.value =
+                    EpicsValue::String(format_iso_string(event.event.snapshot.timestamp).into());
             }
         }
         Some(event)
@@ -323,5 +349,40 @@ mod tests {
             }
             other => panic!("expected String, got {other:?}"),
         }
+    }
+
+    /// C `tsStringIso` (ts.c:250) emits a distinct ISO-8601 string in
+    /// local time: a `T` date/time separator and a `%z` zone offset,
+    /// unlike the space-separated, zoneless epics format. Timezone-
+    /// independent assertions on structure + distinctness from epics.
+    #[test]
+    fn string_mode_formats_iso_distinct_from_epics() {
+        let secs_since_unix = 1_705_322_096_u64;
+        let ts = SystemTime::UNIX_EPOCH + Duration::new(secs_since_unix, 123_456_000);
+
+        let extract = |mode| match TimestampFilter::with_mode(mode)
+            .apply(make_event(ts))
+            .unwrap()
+            .event
+            .snapshot
+            .value
+        {
+            EpicsValue::String(s) => s.as_str_lossy().into_owned(),
+            other => panic!("expected String, got {other:?}"),
+        };
+        let iso = extract(TsMode::StringIso);
+        let epics = extract(TsMode::StringEpics);
+
+        assert!(iso.contains('T'), "ISO must use a T separator: {iso}");
+        assert!(iso.contains(".123456"), "ISO must keep microseconds: {iso}");
+        // chrono `%z` appends a 5-char signed offset (`+HHMM` / `-HHMM`).
+        let zone = &iso[iso.len() - 5..];
+        assert!(
+            (zone.starts_with('+') || zone.starts_with('-'))
+                && zone[1..].chars().all(|c| c.is_ascii_digit()),
+            "ISO must end with a %z zone offset: {iso}"
+        );
+        assert!(!epics.contains('T'), "epics format must not use T: {epics}");
+        assert_ne!(iso, epics, "iso and epics must be distinct strings");
     }
 }

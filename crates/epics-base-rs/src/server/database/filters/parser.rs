@@ -431,10 +431,10 @@ fn build_ts(cfg: &serde_json::Value) -> Option<Arc<dyn SubscriptionFilter>> {
     if let Some(s) = obj.get("str").and_then(|v| v.as_str()) {
         match s {
             "epics" => return Some(Arc::new(TimestampFilter::with_mode(TsMode::StringEpics))),
-            // `iso` is documented in C but its tsStringIso path is
-            // gated on MSVC and treated as identical to epics on
-            // non-Windows. Fall back to the EPICS format.
-            "iso" => return Some(Arc::new(TimestampFilter::with_mode(TsMode::StringEpics))),
+            // C `ts.c:62` maps {"iso",2}=tsStringIso to a distinct ISO-8601
+            // format ("%Y-%m-%dT%H:%M:%S.%06f%z", ts.c:250); only VS2012
+            // (_MSC_VER<=1700) rejects it. Emit the distinct ISO string.
+            "iso" => return Some(Arc::new(TimestampFilter::with_mode(TsMode::StringIso))),
             _ => {
                 tracing::warn!(value = %s, "unknown ts `str` value; ignoring");
                 return None;

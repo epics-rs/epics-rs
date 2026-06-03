@@ -486,18 +486,12 @@ impl PvDatabase {
             // completion; otherwise WRITE_NOTIFY would return ECA_NORMAL
             // before the device move actually finished.
             if field == "PROC" {
-                let is_nonzero = match &value {
-                    EpicsValue::Char(v) => *v != 0,
-                    EpicsValue::Short(v) => *v != 0,
-                    EpicsValue::Long(v) => *v != 0,
-                    EpicsValue::Int64(v) => *v != 0,
-                    EpicsValue::Double(v) => *v != 0.0,
-                    _ => true,
-                };
+                // C `dbPutField` (dbAccess.c:1265) matches the proc field by
+                // pointer with NO value check: any write to PROC — including
+                // 0 — processes the record (when !pact). The standard
+                // `caput REC.PROC 0` / `dbpf REC.PROC 0` force-process idiom
+                // must therefore not be skipped for a zero value.
                 drop(instance);
-                if !is_nonzero {
-                    return Ok(None);
-                }
                 // Continue to the put-notify setup + process below
                 // by jumping past the field-write step (the value
                 // itself isn't stored; PROC is a trigger).

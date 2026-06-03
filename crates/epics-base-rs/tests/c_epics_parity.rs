@@ -1391,6 +1391,35 @@ async fn database_proc_triggers_processing() {
     }
 }
 
+/// C EPICS: a PROC write of 0 also triggers processing. dbPutField
+/// (dbAccess.c:1265) matches the proc field by pointer with no value
+/// check, so `caput REC.PROC 0` force-processes the record exactly like
+/// `caput REC.PROC 1`.
+#[tokio::test]
+async fn database_proc_zero_still_triggers_processing() {
+    use epics_base_rs::server::database::PvDatabase;
+    use std::sync::Arc;
+
+    let db = Arc::new(PvDatabase::new());
+    db.add_record("proc_zero_rec", Box::new(AoRecord::new(5.0)))
+        .await
+        .unwrap();
+
+    // A fresh record starts UDF=true; PROC=0 must process and clear it.
+    let result = db
+        .put_record_field_from_ca("proc_zero_rec", "PROC", EpicsValue::Char(0))
+        .await;
+    assert!(result.is_ok());
+
+    if let Some(rec) = db.get_record("proc_zero_rec").await {
+        let inst = rec.read().await;
+        assert!(
+            !inst.common.udf,
+            "UDF should be cleared after PROC=0 (force-process, not a no-op)"
+        );
+    }
+}
+
 /// C EPICS: all record names returned from database
 #[tokio::test]
 async fn database_all_record_names() {

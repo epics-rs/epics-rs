@@ -433,27 +433,57 @@ fn asyn_to_ca_error(e: AsynError) -> CaError {
     CaError::Protocol(e.to_string())
 }
 
-/// Convert an asyn error to EPICS alarm status/severity pair.
-/// Matches C asyn's `asynStatusToEpicsAlarm()` conversion:
-/// - Success → no alarm (0, 0)
-/// - Timeout → READ alarm, MAJOR severity
-/// - Error/Overflow → READ alarm, MAJOR severity
-/// - Disconnected/Disabled → COMM alarm, INVALID severity
+/// Convert an asyn error to an EPICS (alarm status, alarm severity) pair
+/// for the device-support READ path.
+///
+/// Mirrors C `asynStatusToEpicsAlarm` (asynEpicsUtils.c:234-266) with the
+/// READ-path defaults the Int32/Float64/UInt32 device support pass:
+/// `defaultStat = READ_ALARM`, `defaultSevr = INVALID_ALARM`
+/// (devAsynInt32.c:844-846). Every non-success asyn status maps to
+/// INVALID severity; only the condition code differs:
+/// - Success      → (NO_ALARM, NO_ALARM)
+/// - Timeout      → (TIMEOUT_ALARM, INVALID)   = (10, 3)
+/// - Overflow     → (HW_LIMIT_ALARM, INVALID)  = (11, 3)
+/// - Disconnected → (COMM_ALARM, INVALID)      = (9, 3)
+/// - Disabled     → (DISABLE_ALARM, INVALID)   = (18, 3)
+/// - Error/other  → (READ_ALARM, INVALID)      = (1, 3)
+///
+/// Pre-fix this mapping was wrong: Timeout / Overflow / Error all yielded
+/// (7, 2) — condition 7 is STATE_ALARM, not READ_ALARM (which is 1), and
+/// MAJOR(2) instead of INVALID(3) — and Disabled was lumped with
+/// Disconnected as COMM_ALARM(9) instead of DISABLE_ALARM(18).
 fn asyn_error_to_alarm(e: &AsynError) -> (u16, u16) {
+    use crate::error::AsynStatus;
+    use epics_base_rs::server::recgbl::alarm_status;
+    use epics_base_rs::server::record::AlarmSeverity;
+    let invalid = AlarmSeverity::Invalid as u16;
     match e {
         AsynError::Status {
-            status: crate::error::AsynStatus::Timeout,
+            status: AsynStatus::Success,
             ..
-        } => (7, 2), // READ_ALARM=7, MAJOR_ALARM=2
+        } => (alarm_status::NO_ALARM, AlarmSeverity::NoAlarm as u16),
         AsynError::Status {
-            status: crate::error::AsynStatus::Disconnected,
+            status: AsynStatus::Timeout,
             ..
-        }
-        | AsynError::Status {
-            status: crate::error::AsynStatus::Disabled,
+        } => (alarm_status::TIMEOUT_ALARM, invalid),
+        AsynError::Status {
+            status: AsynStatus::Overflow,
             ..
-        } => (9, 3), // COMM_ALARM=9, INVALID_ALARM=3
-        _ => (7, 2), // Default: READ_ALARM, MAJOR
+        } => (alarm_status::HW_LIMIT_ALARM, invalid),
+        AsynError::Status {
+            status: AsynStatus::Disconnected,
+            ..
+        } => (alarm_status::COMM_ALARM, invalid),
+        AsynError::Status {
+            status: AsynStatus::Disabled,
+            ..
+        } => (alarm_status::DISABLE_ALARM, invalid),
+        AsynError::Status {
+            status: AsynStatus::Error,
+            ..
+        } => (alarm_status::READ_ALARM, invalid),
+        // Non-status asyn errors take C's asynError/default branch.
+        _ => (alarm_status::READ_ALARM, invalid),
     }
 }
 
@@ -1159,6 +1189,52 @@ pub fn register_asyn_device_support_for_builder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every asyn read error maps to the C `asynStatusToEpicsAlarm` pair
+    /// under the device-support READ-path defaults (READ_ALARM / INVALID).
+    /// Condition codes per epics-base alarm.h: READ=1, COMM=9, TIMEOUT=10,
+    /// HW_LIMIT=11, DISABLE=18; INVALID severity = 3.
+    #[test]
+    fn asyn_error_to_alarm_matches_c_status_to_epics_alarm() {
+        use crate::error::AsynStatus;
+        let mk = |s: AsynStatus| {
+            asyn_error_to_alarm(&AsynError::Status {
+                status: s,
+                message: String::new(),
+            })
+        };
+        assert_eq!(mk(AsynStatus::Success), (0, 0));
+        assert_eq!(
+            mk(AsynStatus::Timeout),
+            (10, 3),
+            "Timeout -> TIMEOUT_ALARM(10), INVALID(3)"
+        );
+        assert_eq!(
+            mk(AsynStatus::Overflow),
+            (11, 3),
+            "Overflow -> HW_LIMIT_ALARM(11), INVALID(3)"
+        );
+        assert_eq!(
+            mk(AsynStatus::Disconnected),
+            (9, 3),
+            "Disconnected -> COMM_ALARM(9), INVALID(3)"
+        );
+        assert_eq!(
+            mk(AsynStatus::Disabled),
+            (18, 3),
+            "Disabled -> DISABLE_ALARM(18), INVALID(3)"
+        );
+        assert_eq!(
+            mk(AsynStatus::Error),
+            (1, 3),
+            "Error -> READ_ALARM(1), INVALID(3)"
+        );
+        // Non-status asyn errors take C's asynError/default branch.
+        assert_eq!(
+            asyn_error_to_alarm(&AsynError::PortNotFound("p".into())),
+            (1, 3)
+        );
+    }
 
     /// Regression: the IocBuilder companion helper exists
     /// and accepts a pure-Rust builder. Pre-fix, `register_asyn_device_support`

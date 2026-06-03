@@ -1002,10 +1002,20 @@ impl DeviceSupport for AsynDeviceSupport {
             return None;
         }
 
+        // C parity: a UInt32Digital record registers its @asynMask as the
+        // interrupt mask (devAsynUInt32Digital.c:293/343); the driver fires
+        // the callback only when `pInterrupt->mask & interruptMask`
+        // (asynPortDriver.cpp:720) and delivers `pInterrupt->mask & value`
+        // (asynPortDriver.cpp:729). Other interfaces carry no changed-bit
+        // mask (uint32_changed_mask == 0), so a mask filter would gate every
+        // interrupt out — restrict the gate (and the value masking below) to
+        // UInt32Digital.
+        let is_uint32 = self.iface_type == "asynUInt32Digital";
+        let mask = self.mask;
         let filter = InterruptFilter {
             reason: Some(self.reason),
             addr: Some(self.addr),
-            uint32_mask: None,
+            uint32_mask: if is_uint32 { Some(mask) } else { None },
         };
 
         let (sub, mut intr_rx) = self.handle.interrupts().register_interrupt_user(filter);
@@ -1018,8 +1028,24 @@ impl DeviceSupport for AsynDeviceSupport {
         let fifo = self.interrupt_fifo.clone();
         tokio::spawn(async move {
             while let Some(iv) = intr_rx.recv().await {
+                // C parity (asynPortDriver.cpp:729 + devAsynUInt32Digital.c:464):
+                // deliver `mask & value` for UInt32Digital so the I/O-Intr value
+                // matches the polled read (RequestOp::UInt32DigitalRead { mask }).
+                // interruptCallbackInput stores the already-masked value in the
+                // ring buffer; mirror that here. Non-UInt32 values pass through.
+                // C parity (asynPortDriver.cpp:729 + devAsynUInt32Digital.c:464):
+                // deliver `mask & value` for UInt32Digital so the I/O-Intr value
+                // matches the polled read (RequestOp::UInt32DigitalRead { mask }).
+                // interruptCallbackInput stores the already-masked value in the
+                // ring buffer; mirror that here. Non-UInt32 values pass through.
+                let value = match iv.value {
+                    crate::param::ParamValue::UInt32Digital(v) if is_uint32 => {
+                        crate::param::ParamValue::UInt32Digital(v & mask)
+                    }
+                    other => other,
+                };
                 let entry = CachedInterrupt {
-                    value: iv.value,
+                    value,
                     timestamp: iv.timestamp,
                 };
                 // C parity (devAsynInt32.c:564-576):
@@ -1369,7 +1395,7 @@ mod tests {
     }
 
     use crate::error::AsynResult;
-    use crate::interrupt::InterruptManager;
+    use crate::interrupt::{InterruptManager, InterruptValue};
     use crate::param::ParamType;
     use crate::port::{PortDriver, PortDriverBase, PortFlags};
     use crate::port_actor::PortActor;
@@ -1482,6 +1508,154 @@ mod tests {
         ads.init(&mut rec).unwrap();
         let rx = ads.io_intr_receiver();
         assert!(rx.is_some());
+    }
+
+    /// Build a `ScanType::IoIntr` adapter on the `asynUInt32Digital`
+    /// interface with the given record `@asynMask`.
+    fn make_uint32_io_intr_adapter(mask: u32) -> AsynDeviceSupport {
+        let driver = TestPort::new();
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let actor = PortActor::new(Box::new(driver), rx);
+        std::thread::Builder::new()
+            .name("test-u32-actor".into())
+            .spawn(move || actor.run())
+            .unwrap();
+        let handle = PortHandle::new(tx, "test".into(), interrupts);
+        let link = AsynLink {
+            port_name: "test".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: "VAL".into(),
+        };
+        let mut ads =
+            AsynDeviceSupport::from_handle(handle, link, "asynUInt32Digital").with_mask(mask);
+        ads.set_record_info("TEST:U32", ScanType::IoIntr);
+        ads
+    }
+
+    /// Poll the interrupt FIFO until an entry arrives (bridge runs on a
+    /// spawned task), returning its value. Panics if none arrives.
+    async fn await_fifo_value(
+        fifo: &Arc<std::sync::Mutex<InterruptFifo>>,
+    ) -> crate::param::ParamValue {
+        for _ in 0..200 {
+            if let Some(entry) = fifo.lock().unwrap().pop() {
+                return entry.value;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("interrupt value never reached FIFO");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn io_intr_uint32_masks_delivered_value_to_record_mask() {
+        // C uint32Callback delivers `pInterrupt->mask & value`
+        // (asynPortDriver.cpp:729); the @asynMask=0x0F record must see
+        // a 0xFF param value masked to 0x0F, matching the polled read.
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut ads = make_uint32_io_intr_adapter(0x0F);
+        let mut rec = LonginRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let fifo = ads.interrupt_fifo.clone();
+        let _rx = ads.io_intr_receiver().expect("io intr receiver for IoIntr");
+
+        interrupts.notify(InterruptValue {
+            reason,
+            addr: 0,
+            value: crate::param::ParamValue::UInt32Digital(0xFF),
+            timestamp: SystemTime::now(),
+            uint32_changed_mask: 0x01,
+            ..Default::default()
+        });
+
+        match await_fifo_value(&fifo).await {
+            crate::param::ParamValue::UInt32Digital(bits) => assert_eq!(
+                bits, 0x0F,
+                "I/O-Intr value must be masked to the record @asynMask"
+            ),
+            other => panic!("expected UInt32Digital, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn io_intr_uint32_gates_out_non_overlapping_change() {
+        // C uint32Callback fires only when `pInterrupt->mask &
+        // interruptMask` (asynPortDriver.cpp:720): a change confined to
+        // bits outside the @asynMask=0x0F record (changed=0xF0) must be
+        // gated out, while an overlapping change still arrives.
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut ads = make_uint32_io_intr_adapter(0x0F);
+        let mut rec = LonginRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let fifo = ads.interrupt_fifo.clone();
+        let _rx = ads.io_intr_receiver().expect("io intr receiver for IoIntr");
+
+        interrupts.notify(InterruptValue {
+            reason,
+            addr: 0,
+            value: crate::param::ParamValue::UInt32Digital(0xFF),
+            timestamp: SystemTime::now(),
+            uint32_changed_mask: 0xF0,
+            ..Default::default()
+        });
+        // matches() rejects synchronously at notify(); a bounded wait
+        // then proves the value was dropped, not merely delayed.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            fifo.lock().unwrap().pop().is_none(),
+            "non-overlapping change must be gated out, not delivered"
+        );
+
+        // The bridge is still live: an overlapping change arrives, proving
+        // the gate (not a dead bridge) dropped the previous notify.
+        interrupts.notify(InterruptValue {
+            reason,
+            addr: 0,
+            value: crate::param::ParamValue::UInt32Digital(0xFF),
+            timestamp: SystemTime::now(),
+            uint32_changed_mask: 0x01,
+            ..Default::default()
+        });
+        assert!(matches!(
+            await_fifo_value(&fifo).await,
+            crate::param::ParamValue::UInt32Digital(0x0F)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn io_intr_non_uint32_not_gated_by_default_mask() {
+        // Guard: the default 0xFFFFFFFF mask must NOT gate a non-UInt32
+        // interrupt (uint32_changed_mask == 0). An asynInt32 I/O-Intr
+        // record must receive its interrupt unchanged.
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut ads = make_adapter(ScanType::IoIntr);
+        let mut rec = LonginRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let fifo = ads.interrupt_fifo.clone();
+        let _rx = ads.io_intr_receiver().expect("io intr receiver for IoIntr");
+
+        interrupts.notify(InterruptValue {
+            reason,
+            addr: 0,
+            value: crate::param::ParamValue::Int32(42),
+            timestamp: SystemTime::now(),
+            uint32_changed_mask: 0,
+            ..Default::default()
+        });
+        assert!(
+            matches!(
+                await_fifo_value(&fifo).await,
+                crate::param::ParamValue::Int32(42)
+            ),
+            "non-UInt32 interrupt must pass through ungated and unmasked"
+        );
     }
 
     #[test]

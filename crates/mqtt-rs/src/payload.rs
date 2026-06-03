@@ -165,10 +165,38 @@ fn encode_json(value: &DecodedValue, field_path: &str) -> String {
     result.to_string()
 }
 
+/// C `isBoolean` shortcut (drvMqtt.cpp:388): a payload of exactly "true"
+/// or "false" maps to 1 / 0 before any numeric parse, for INT
+/// (drvMqtt.cpp:278-281) and DIGITAL (drvMqtt.cpp:290-293) records only.
+/// `asynParamFloat64` has no such branch (drvMqtt.cpp:285-287), so floats
+/// never take this shortcut.
+fn boolean_payload_to_int(s: &str) -> Option<i64> {
+    match s {
+        "true" => Some(1),
+        "false" => Some(0),
+        _ => None,
+    }
+}
+
+/// JSON form of [`boolean_payload_to_int`]. C stringifies the JSON field
+/// before `isBoolean` — `dump()` for non-strings, the raw text for string
+/// fields (drvMqtt.cpp:262-265) — so a JSON boolean and a JSON string
+/// "true"/"false" both take the shortcut.
+fn json_boolean_to_int(value: &serde_json::Value) -> Option<i64> {
+    match value {
+        serde_json::Value::Bool(b) => Some(i64::from(*b)),
+        serde_json::Value::String(s) => boolean_payload_to_int(s),
+        _ => None,
+    }
+}
+
 fn decode_flat(raw: &str, value_type: ValueType) -> MqttResult<DecodedValue> {
     let trimmed = raw.trim();
     match value_type {
         ValueType::Int => {
+            if let Some(b) = boolean_payload_to_int(trimmed) {
+                return Ok(DecodedValue::Int32(b as i32));
+            }
             let v: i32 = trimmed
                 .parse()
                 .map_err(|e| MqttError::ValueConversion(format!("INT parse: {e}")))?;
@@ -181,6 +209,9 @@ fn decode_flat(raw: &str, value_type: ValueType) -> MqttResult<DecodedValue> {
             Ok(DecodedValue::Float64(v))
         }
         ValueType::Digital => {
+            if let Some(b) = boolean_payload_to_int(trimmed) {
+                return Ok(DecodedValue::UInt32(b as u32));
+            }
             let v: u32 = trimmed
                 .parse()
                 .map_err(|e| MqttError::ValueConversion(format!("DIGITAL parse: {e}")))?;
@@ -205,6 +236,9 @@ fn decode_json(raw: &str, value_type: ValueType, field_path: &str) -> MqttResult
 
     match value_type {
         ValueType::Int => {
+            if let Some(b) = json_boolean_to_int(value) {
+                return Ok(DecodedValue::Int32(b as i32));
+            }
             let v = value.as_i64().ok_or_else(|| {
                 MqttError::ValueConversion(format!(
                     "expected integer at '{field_path}', got {value}"
@@ -221,6 +255,9 @@ fn decode_json(raw: &str, value_type: ValueType, field_path: &str) -> MqttResult
             Ok(DecodedValue::Float64(v))
         }
         ValueType::Digital => {
+            if let Some(b) = json_boolean_to_int(value) {
+                return Ok(DecodedValue::UInt32(b as u32));
+            }
             let v = value.as_u64().ok_or_else(|| {
                 MqttError::ValueConversion(format!(
                     "expected unsigned at '{field_path}', got {value}"
@@ -497,6 +534,88 @@ mod tests {
     fn decode_json_invalid_json() {
         let addr = TopicAddress::parse("JSON:INT sensors/data value").unwrap();
         assert!(decode_payload("not json at all", &addr).is_err());
+    }
+
+    // --- Boolean shortcut (C isBoolean, drvMqtt.cpp:278-293) ---
+
+    #[test]
+    fn decode_flat_int_boolean() {
+        // C maps "true"/"false" to 1/0 before the integer parse for INT
+        // (drvMqtt.cpp:278-281).
+        let addr = TopicAddress::parse("FLAT:INT test/t").unwrap();
+        assert_eq!(
+            decode_payload("true", &addr).unwrap(),
+            DecodedValue::Int32(1)
+        );
+        assert_eq!(
+            decode_payload("false", &addr).unwrap(),
+            DecodedValue::Int32(0)
+        );
+    }
+
+    #[test]
+    fn decode_flat_digital_boolean() {
+        // Same shortcut for DIGITAL (drvMqtt.cpp:290-293).
+        let addr = TopicAddress::parse("FLAT:DIGITAL test/t").unwrap();
+        assert_eq!(
+            decode_payload("true", &addr).unwrap(),
+            DecodedValue::UInt32(1)
+        );
+        assert_eq!(
+            decode_payload("false", &addr).unwrap(),
+            DecodedValue::UInt32(0)
+        );
+    }
+
+    #[test]
+    fn decode_flat_float_rejects_boolean() {
+        // C has no isBoolean branch for asynParamFloat64 (drvMqtt.cpp:285-287):
+        // a boolean payload on a float topic is a parse error, not 1.0.
+        let addr = TopicAddress::parse("FLAT:FLOAT test/t").unwrap();
+        assert!(decode_payload("true", &addr).is_err());
+    }
+
+    #[test]
+    fn decode_json_int_boolean() {
+        // C dumps a JSON boolean field to "true"/"false" then runs the same
+        // isBoolean shortcut (drvMqtt.cpp:265,278).
+        let addr = TopicAddress::parse("JSON:INT dev/data flag").unwrap();
+        assert_eq!(
+            decode_payload(r#"{"flag": true}"#, &addr).unwrap(),
+            DecodedValue::Int32(1)
+        );
+        assert_eq!(
+            decode_payload(r#"{"flag": false}"#, &addr).unwrap(),
+            DecodedValue::Int32(0)
+        );
+    }
+
+    #[test]
+    fn decode_json_digital_boolean() {
+        let addr = TopicAddress::parse("JSON:DIGITAL dev/data flag").unwrap();
+        assert_eq!(
+            decode_payload(r#"{"flag": true}"#, &addr).unwrap(),
+            DecodedValue::UInt32(1)
+        );
+    }
+
+    #[test]
+    fn decode_json_int_string_boolean() {
+        // A JSON string field "true" is fetched via get<std::string>() and
+        // takes the same isBoolean shortcut in C (drvMqtt.cpp:263,278).
+        let addr = TopicAddress::parse("JSON:INT dev/data flag").unwrap();
+        assert_eq!(
+            decode_payload(r#"{"flag": "true"}"#, &addr).unwrap(),
+            DecodedValue::Int32(1)
+        );
+    }
+
+    #[test]
+    fn decode_json_float_rejects_boolean() {
+        // No isBoolean for float (drvMqtt.cpp:285-287); a JSON boolean on a
+        // float topic stays an error.
+        let addr = TopicAddress::parse("JSON:FLOAT dev/data flag").unwrap();
+        assert!(decode_payload(r#"{"flag": true}"#, &addr).is_err());
     }
 
     // --- BUG 5: inbound integer-array support ---

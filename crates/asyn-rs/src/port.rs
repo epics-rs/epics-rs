@@ -592,9 +592,13 @@ impl PortDriverBase {
         for reason in changed {
             let value = self.params.get_value(reason, addr)?.clone();
             let ts = self.params.get_timestamp(reason, addr)?.unwrap_or(now);
+            // C parity: read the accumulated callback mask and reset it
+            // (asynPortDriver.cpp:854-855 fires uint32Callback then sets
+            // uInt32CallbackMask = 0). The flush is the single owner of
+            // this consume, so accumulated bits never leak to the next.
             let uint32_mask = self
                 .params
-                .get_uint32_interrupt_mask(reason, addr)
+                .take_uint32_interrupt_mask(reason, addr)
                 .unwrap_or(0);
             // C parity: asynPortDriver.cpp:631-642 sets
             // `pInterrupt->pasynUser->auxStatus/alarmStatus/alarmSeverity`
@@ -627,9 +631,13 @@ impl PortDriverBase {
             let now = self.current_timestamp();
             let value = self.params.get_value(reason, addr)?.clone();
             let ts = self.params.get_timestamp(reason, addr)?.unwrap_or(now);
+            // C parity: read the accumulated callback mask and reset it
+            // (asynPortDriver.cpp:854-855 fires uint32Callback then sets
+            // uInt32CallbackMask = 0). The flush is the single owner of
+            // this consume, so accumulated bits never leak to the next.
             let uint32_mask = self
                 .params
-                .get_uint32_interrupt_mask(reason, addr)
+                .take_uint32_interrupt_mask(reason, addr)
                 .unwrap_or(0);
             // C parity: see `call_param_callbacks` above.
             let (aux_status, alarm_status, alarm_severity) = self
@@ -1262,6 +1270,36 @@ mod tests {
         let v2 = rx.try_recv().unwrap();
         assert_eq!(v2.reason, 1);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn uint32_callback_mask_does_not_leak_across_flushes() {
+        // C resets uInt32CallbackMask = 0 after each uint32Callback
+        // (asynPortDriver.cpp:855): a second flush must deliver only the
+        // bits changed since the first, never the accumulated history.
+        let mut drv = TestDriver::new();
+        let mut rx = drv.base_mut().interrupts.subscribe_async();
+
+        // flush 1: change bit 0 on BITS (param index 3).
+        drv.base_mut().params.set_uint32(3, 0, 0x01, 0x01).unwrap();
+        drv.base_mut().call_param_callbacks(0).unwrap();
+        let iv1 = rx.try_recv().unwrap();
+        assert_eq!(iv1.reason, 3);
+        assert_eq!(iv1.uint32_changed_mask, 0x01);
+
+        // flush 2: change bit 1 only — must deliver 0x02, not 0x03.
+        drv.base_mut().params.set_uint32(3, 0, 0x02, 0x02).unwrap();
+        drv.base_mut().call_param_callbacks(0).unwrap();
+        let iv2 = rx.try_recv().unwrap();
+        assert_eq!(
+            iv2.uint32_changed_mask, 0x02,
+            "second flush must not leak flush-1 bits via an un-reset mask"
+        );
+        assert_eq!(
+            drv.base().params.get_uint32_interrupt_mask(3, 0).unwrap(),
+            0,
+            "the flush must consume (reset) the callback mask"
+        );
     }
 
     #[test]

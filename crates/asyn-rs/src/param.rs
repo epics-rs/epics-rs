@@ -613,7 +613,12 @@ impl ParamList {
                 new_val
             };
             if !was_defined || starting != new_val {
-                entry.uint32_interrupt_mask = changed_bits;
+                // C parity: `uInt32CallbackMask |= (data.uival ^ newValue)`
+                // (paramVal.cpp:215) — accumulate the union of changed bits
+                // across every setUInt32 before one callParamCallbacks, not
+                // just the last set's bits. The flush owner resets the mask
+                // to 0 after firing (see take_uint32_interrupt_mask).
+                entry.uint32_interrupt_mask |= changed_bits;
                 entry.value = ParamValue::UInt32Digital(new_val);
                 entry.value_changed = true;
                 entry.defined = true;
@@ -627,9 +632,23 @@ impl ParamList {
         Ok(())
     }
 
-    /// Get the UInt32Digital interrupt mask (which bits changed on last set).
+    /// Get the UInt32Digital interrupt mask (accumulated changed bits).
     pub fn get_uint32_interrupt_mask(&self, index: usize, addr: i32) -> AsynResult<u32> {
         Ok(self.get_entry(index, addr)?.uint32_interrupt_mask)
+    }
+
+    /// Read the accumulated UInt32Digital callback mask AND reset it to 0.
+    ///
+    /// C parity: `uint32Callback` clears `uInt32CallbackMask = 0`
+    /// immediately after firing (`asynPortDriver.cpp:855`). The flush is
+    /// the single owner of this transition — it consumes the mask so the
+    /// next flush starts clean and accumulated bits do not leak forward.
+    /// A no-op returning 0 for non-UInt32 params, whose mask is always 0.
+    pub fn take_uint32_interrupt_mask(&mut self, index: usize, addr: i32) -> AsynResult<u32> {
+        let entry = self.get_entry_mut(index, addr)?;
+        let mask = entry.uint32_interrupt_mask;
+        entry.uint32_interrupt_mask = 0;
+        Ok(mask)
     }
 
     /// Configure which bits of a UInt32Digital parameter should fire
@@ -1912,6 +1931,37 @@ mod tests {
             pl.get_uint32_interrupt_mask(idx, 0).unwrap(),
             0xFFFF_FFFF,
             "a UInt32Digital status change must force the full callback mask"
+        );
+    }
+
+    #[test]
+    fn set_uint32_accumulates_callback_mask_across_sets() {
+        // C `uInt32CallbackMask |= (uival ^ newValue)` (paramVal.cpp:215):
+        // two setUInt32 calls before one callParamCallbacks must accumulate
+        // the union of changed bits, not keep only the last set's bits.
+        let mut pl = ParamList::new(1, false);
+        let idx = pl.create_param("U", ParamType::UInt32Digital).unwrap();
+        pl.set_uint32(idx, 0, 0x01, 0x01).unwrap(); // define + change bit 0
+        pl.set_uint32(idx, 0, 0x02, 0x02).unwrap(); // change bit 1
+        assert_eq!(
+            pl.get_uint32_interrupt_mask(idx, 0).unwrap(),
+            0x03,
+            "callback mask must accumulate the union of changed bits since the last flush"
+        );
+    }
+
+    #[test]
+    fn take_uint32_interrupt_mask_reads_and_resets() {
+        // C uint32Callback resets uInt32CallbackMask = 0 after firing
+        // (asynPortDriver.cpp:855).
+        let mut pl = ParamList::new(1, false);
+        let idx = pl.create_param("U", ParamType::UInt32Digital).unwrap();
+        pl.set_uint32(idx, 0, 0x05, 0x0F).unwrap();
+        assert_eq!(pl.take_uint32_interrupt_mask(idx, 0).unwrap(), 0x05);
+        assert_eq!(
+            pl.get_uint32_interrupt_mask(idx, 0).unwrap(),
+            0,
+            "callback mask must be reset to 0 after take"
         );
     }
 

@@ -1501,11 +1501,20 @@ impl PvDatabase {
             use crate::server::recgbl::EventMask;
             let mut event_mask = EventMask::NONE;
 
-            let (include_val, include_archive) = if instance.record.uses_monitor_deadband() {
-                instance.check_deadband_ext()
-            } else {
-                // Binary records (bi/bo/busy/mbbi/mbbo): always post monitors
-                (true, true)
+            let (include_val, include_archive) = match instance.record.monitor_value_changed() {
+                // lsi/lso post VALUE|LOG only when the string actually
+                // changed (C `lsiRecord.c`/`lsoRecord.c` monitor: `len !=
+                // olen || memcmp(oval, val, len)`); they have no MDEL/ADEL
+                // deadband to express that, so the gate is explicit.
+                Some(changed) => (changed, changed),
+                None => {
+                    if instance.record.uses_monitor_deadband() {
+                        instance.check_deadband_ext()
+                    } else {
+                        // Binary records (bi/bo/busy/mbbi/mbbo): always post monitors
+                        (true, true)
+                    }
+                }
             };
             if include_val {
                 event_mask |= EventMask::VALUE;
@@ -2276,11 +2285,20 @@ impl PvDatabase {
 
             use crate::server::recgbl::EventMask;
             let mut event_mask = EventMask::NONE;
-            let (include_val, include_archive) = if instance.record.uses_monitor_deadband() {
-                instance.check_deadband_ext()
-            } else {
-                // Binary records (bi/bo/busy/mbbi/mbbo): always post monitors
-                (true, true)
+            let (include_val, include_archive) = match instance.record.monitor_value_changed() {
+                // lsi/lso post VALUE|LOG only when the string actually
+                // changed (C `lsiRecord.c`/`lsoRecord.c` monitor: `len !=
+                // olen || memcmp(oval, val, len)`); they have no MDEL/ADEL
+                // deadband to express that, so the gate is explicit.
+                Some(changed) => (changed, changed),
+                None => {
+                    if instance.record.uses_monitor_deadband() {
+                        instance.check_deadband_ext()
+                    } else {
+                        // Binary records (bi/bo/busy/mbbi/mbbo): always post monitors
+                        (true, true)
+                    }
+                }
             };
             if include_val {
                 event_mask |= EventMask::VALUE;

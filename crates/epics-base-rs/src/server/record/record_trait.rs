@@ -410,6 +410,27 @@ pub trait Record: Send + Sync + 'static {
         true
     }
 
+    /// Per-record VALUE/LOG monitor gate for record types that post a
+    /// monitor *only when the value actually changed* — and have no
+    /// MDEL/ADEL deadband to express that.
+    ///
+    /// `Some(changed)` makes the framework post the VALUE and LOG
+    /// monitors iff `changed`; `None` (the default) leaves the decision
+    /// to the deadband / always-post path.
+    ///
+    /// C `lsiRecord.c`/`lsoRecord.c` `monitor()` raise `DBE_VALUE |
+    /// DBE_LOG` only when `len != olen || memcmp(oval, val, len)`. Those
+    /// records return [`Self::uses_monitor_deadband`]`== false`, which
+    /// otherwise routes them to the unconditional always-post path
+    /// (correct for binary records, wrong for lsi/lso). Because the
+    /// framework posts monitors *after* `process()` — by which point the
+    /// record has already committed `oval`/`olen` — the implementation
+    /// captures the comparison result during `process()` and returns the
+    /// captured flag here, not a live re-comparison.
+    fn monitor_value_changed(&self) -> Option<bool> {
+        None
+    }
+
     /// The value the MDEL/ADEL deadband is evaluated against.
     ///
     /// For most records C `monitor()` applies the value deadband to

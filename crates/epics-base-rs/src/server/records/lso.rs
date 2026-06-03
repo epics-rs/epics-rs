@@ -34,6 +34,11 @@ pub struct LsoRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
+    /// Per-cycle scratch: did VAL change on the most recent `process()`?
+    /// Captured BEFORE `process()` commits `oval`/`olen` so the
+    /// framework's post-process monitor gate can see it. C
+    /// `lsoRecord.c::monitor`: `len != olen || memcmp(oval, val, len)`.
+    value_changed: bool,
 }
 
 impl Default for LsoRecord {
@@ -53,6 +58,7 @@ impl Default for LsoRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
+            value_changed: false,
         }
     }
 }
@@ -169,12 +175,22 @@ impl Record for LsoRecord {
         false
     }
 
+    fn monitor_value_changed(&self) -> Option<bool> {
+        Some(self.value_changed)
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // C `lsoRecord.c::monitor` (lines 244-256): copy OVAL and bump
-        // OLEN only when the value actually changed. LEN is set when
+        // OLEN only when the value actually changed, and raise
+        // `DBE_VALUE | DBE_LOG` on that same condition. LEN is set when
         // VAL is written (C `special`, Rust `put_field`); `process()`
         // must not recompute it.
-        if self.len != self.olen || self.oval != self.val {
+        //
+        // Capture the change BEFORE committing oval/olen, because the
+        // framework's monitor gate reads `monitor_value_changed()`
+        // *after* this returns — by then oval == val and olen == len.
+        self.value_changed = self.len != self.olen || self.oval != self.val;
+        if self.value_changed {
             self.oval = self.val.clone();
             self.olen = self.len;
         }

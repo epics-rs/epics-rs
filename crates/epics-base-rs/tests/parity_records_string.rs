@@ -95,6 +95,46 @@ fn h9_lso_process_olen_tracks_last_posted_length() {
 }
 
 // ---------------------------------------------------------------
+// lsi/lso post VALUE/LOG monitors only when the string changed
+// (C lsiRecord.c/lsoRecord.c monitor: `len != olen ||
+// memcmp(oval, val, len)`), not on every process cycle.
+// ---------------------------------------------------------------
+
+#[test]
+fn h11_lsi_monitor_gate_only_on_change() {
+    let mut rec = LsiRecord::default();
+    rec.put_field("VAL", EpicsValue::CharArray(b"hello".to_vec()))
+        .unwrap();
+    // First process: "" -> "hello" is a change.
+    rec.process().unwrap();
+    assert_eq!(rec.monitor_value_changed(), Some(true));
+    // Re-process with no new value: no change → no VALUE/LOG monitor.
+    rec.process().unwrap();
+    assert_eq!(rec.monitor_value_changed(), Some(false));
+    // Write a different value: change again.
+    rec.put_field("VAL", EpicsValue::CharArray(b"world".to_vec()))
+        .unwrap();
+    rec.process().unwrap();
+    assert_eq!(rec.monitor_value_changed(), Some(true));
+    // Write the SAME value: process must report no change.
+    rec.put_field("VAL", EpicsValue::CharArray(b"world".to_vec()))
+        .unwrap();
+    rec.process().unwrap();
+    assert_eq!(rec.monitor_value_changed(), Some(false));
+}
+
+#[test]
+fn h11_lso_monitor_gate_only_on_change() {
+    let mut rec = LsoRecord::default();
+    rec.put_field("VAL", EpicsValue::CharArray(b"abc".to_vec()))
+        .unwrap();
+    rec.process().unwrap();
+    assert_eq!(rec.monitor_value_changed(), Some(true));
+    rec.process().unwrap();
+    assert_eq!(rec.monitor_value_changed(), Some(false));
+}
+
+// ---------------------------------------------------------------
 // stringin/stringout VAL truncates at MAX_STRING_SIZE (40).
 // ---------------------------------------------------------------
 

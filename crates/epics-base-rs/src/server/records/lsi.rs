@@ -31,6 +31,11 @@ pub struct LsiRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
+    /// Per-cycle scratch: did VAL change on the most recent `process()`?
+    /// Captured BEFORE `process()` commits `oval`/`olen` so the
+    /// framework's post-process monitor gate can see it. C
+    /// `lsiRecord.c::monitor`: `len != olen || memcmp(oval, val, len)`.
+    value_changed: bool,
 }
 
 impl Default for LsiRecord {
@@ -48,6 +53,7 @@ impl Default for LsiRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
+            value_changed: false,
         }
     }
 }
@@ -140,14 +146,24 @@ impl Record for LsiRecord {
         false
     }
 
+    fn monitor_value_changed(&self) -> Option<bool> {
+        Some(self.value_changed)
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // C `lsiRecord.c::monitor` (lines 202-224) copies OVAL and
         // bumps OLEN *only when the value actually changed* —
-        // `len != olen || memcmp(oval, val, len)`. `process()` itself
-        // does not recompute LEN; LEN is set when VAL is written
+        // `len != olen || memcmp(oval, val, len)` — and raises
+        // `DBE_VALUE | DBE_LOG` on that same condition. `process()`
+        // itself does not recompute LEN; LEN is set when VAL is written
         // (C `special`, Rust `put_field`). Recomputing it here would
         // make OLEN report the previous LEN after a no-op cycle.
-        if self.len != self.olen || self.oval != self.val {
+        //
+        // Capture the change BEFORE committing oval/olen, because the
+        // framework's monitor gate reads `monitor_value_changed()`
+        // *after* this returns — by then oval == val and olen == len.
+        self.value_changed = self.len != self.olen || self.oval != self.val;
+        if self.value_changed {
             self.oval = self.val.clone();
             self.olen = self.len;
         }

@@ -985,9 +985,30 @@ impl ParamList {
         alarm_severity: u16,
     ) -> AsynResult<()> {
         let entry = self.get_entry_mut(index, addr)?;
+        // C paramVal::setStatus / setAlarmStatus / setAlarmSeverity
+        // (paramVal.cpp:71-104) each call setValueChanged() when their
+        // field actually changes; the paramList wrappers
+        // (asynPortDriver.cpp:420-472) then run registerParameterChange ->
+        // setFlag, marking the param dirty. So a STATUS- or ALARM-only
+        // transition (no value change) is still delivered on the next
+        // callParamCallbacks. Each changed setter also forces the full
+        // UInt32Digital callback mask (0xFFFFFFFF) so every subscriber bit
+        // fires. Pre-fix Rust assigned the fields without marking
+        // value_changed, so a status/alarm-only transition was silently
+        // dropped by take_changed (the standard setParamStatus() +
+        // callParamCallbacks() alarm-push pattern never fired).
+        let changed = entry.status != status
+            || entry.alarm_status != alarm_status
+            || entry.alarm_severity != alarm_severity;
         entry.status = status;
         entry.alarm_status = alarm_status;
         entry.alarm_severity = alarm_severity;
+        if changed {
+            entry.value_changed = true;
+            if entry.param_type == ParamType::UInt32Digital {
+                entry.uint32_interrupt_mask = 0xFFFF_FFFF;
+            }
+        }
         Ok(())
     }
 
@@ -1842,5 +1863,71 @@ mod tests {
         pl.set_enum_index(idx, 0, 0).unwrap();
         assert!(pl.is_param_defined(idx, 0).unwrap());
         assert!(pl.take_changed_single(idx, 0).unwrap());
+    }
+
+    #[test]
+    fn set_param_status_only_change_marks_value_changed() {
+        // C paramVal::setStatus (paramVal.cpp:71-78) calls setValueChanged()
+        // on a status transition with no value change, so the standard
+        // setParamStatus() + callParamCallbacks() alarm-push delivers an
+        // I/O Intr. The param value itself is never touched here.
+        let mut pl = ParamList::new(1, false);
+        let idx = pl.create_param("S", ParamType::Int32).unwrap();
+        let _ = pl.take_changed(0).unwrap();
+        pl.set_param_status(idx, 0, AsynStatus::Timeout, 0, 0)
+            .unwrap();
+        let changed = pl.take_changed(0).unwrap();
+        assert!(
+            changed.contains(&idx),
+            "a status-only transition must mark the param value_changed"
+        );
+    }
+
+    #[test]
+    fn set_param_alarm_only_change_marks_value_changed() {
+        // C setAlarmStatus / setAlarmSeverity (paramVal.cpp:84-104) also
+        // call setValueChanged() on change — status can stay Success.
+        let mut pl = ParamList::new(1, false);
+        let idx = pl.create_param("S", ParamType::Float64).unwrap();
+        let _ = pl.take_changed(0).unwrap();
+        pl.set_param_status(idx, 0, AsynStatus::Success, 7, 2)
+            .unwrap();
+        assert!(
+            pl.take_changed_single(idx, 0).unwrap(),
+            "an alarm-status/severity-only transition must mark the param value_changed"
+        );
+    }
+
+    #[test]
+    fn set_param_status_change_forces_full_uint32_mask() {
+        // C setStatus on a UInt32Digital param forces uInt32CallbackMask =
+        // 0xFFFFFFFF (paramVal.cpp:76) so every subscriber bit fires.
+        let mut pl = ParamList::new(1, false);
+        let idx = pl.create_param("U", ParamType::UInt32Digital).unwrap();
+        let _ = pl.take_changed(0).unwrap();
+        pl.set_param_status(idx, 0, AsynStatus::Error, 0, 0)
+            .unwrap();
+        assert!(pl.take_changed_single(idx, 0).unwrap());
+        assert_eq!(
+            pl.get_uint32_interrupt_mask(idx, 0).unwrap(),
+            0xFFFF_FFFF,
+            "a UInt32Digital status change must force the full callback mask"
+        );
+    }
+
+    #[test]
+    fn set_param_status_no_change_does_not_mark_value_changed() {
+        // C gates on `status_ != status` etc., so re-asserting the
+        // existing status/alarm (the fresh-param default Success/0/0) is a
+        // no-op and must NOT mark the param dirty.
+        let mut pl = ParamList::new(1, false);
+        let idx = pl.create_param("S", ParamType::Int32).unwrap();
+        let _ = pl.take_changed(0).unwrap();
+        pl.set_param_status(idx, 0, AsynStatus::Success, 0, 0)
+            .unwrap();
+        assert!(
+            !pl.take_changed_single(idx, 0).unwrap(),
+            "re-asserting the same status/alarm must not mark the param value_changed"
+        );
     }
 }

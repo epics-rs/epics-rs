@@ -465,21 +465,39 @@ fn build_ts(cfg: &serde_json::Value) -> Option<Arc<dyn SubscriptionFilter>> {
 
 fn build_dbnd(cfg: &serde_json::Value) -> Option<Arc<dyn SubscriptionFilter>> {
     let obj = cfg.as_object()?;
-    if let Some(d) = obj.get("d").and_then(|v| v.as_f64()) {
-        return Some(Arc::new(DeadbandFilter::new(d, DeadbandMode::Absolute)));
+    // C `dbnd.c:35-44` schema: modeEnum {"abs"=>0,"rel"=>1}; opts =
+    // chfDouble("d") + chfEnum("m") + chfTagDouble("abs",mode=0) +
+    // chfTagDouble("rel",mode=1). There is NO "r" key. The `abs`/`rel`
+    // keys set the delta AND force the mode; `d` sets the delta with the
+    // mode taken from the `m` enum (default abs). Relative stores the C
+    // percent `cval` as the internal fraction (`cval/100`), matching the
+    // filter's `my->hyst = val * cval/100` (dbnd.c:88); the internal
+    // `DeadbandFilter` then bands by `fraction * |last|`.
+    if let Some(v) = obj.get("abs").and_then(|v| v.as_f64()) {
+        return Some(Arc::new(DeadbandFilter::new(v, DeadbandMode::Absolute)));
     }
-    if let Some(r) = obj.get("r").and_then(|v| v.as_f64()) {
-        // C `dbnd.c`: `my->hyst = val * my->cval/100.` — JSON `r` is
-        // interpreted as a percent (e.g. `{"r":50}` means 50%). The
-        // internal `DeadbandFilter` stores the relative threshold as
-        // a fraction (`threshold * |last|` per call), so divide by
-        // 100 at the wire boundary to match C semantics.
+    if let Some(v) = obj.get("rel").and_then(|v| v.as_f64()) {
         return Some(Arc::new(DeadbandFilter::new(
-            r / 100.0,
+            v / 100.0,
             DeadbandMode::Relative,
         )));
     }
-    None
+    let d = obj.get("d").and_then(|v| v.as_f64())?;
+    match obj.get("m").and_then(|m| m.as_str()) {
+        None => Some(Arc::new(DeadbandFilter::new(d, DeadbandMode::Absolute))),
+        Some(m) => match DeadbandFilter::parse_mode(m)? {
+            // C `chfEnum` rejects an `m` value outside modeEnum, failing
+            // the whole filter parse — `parse_mode` returns None there and
+            // the `?` above drops the filter.
+            DeadbandMode::Relative => Some(Arc::new(DeadbandFilter::new(
+                d / 100.0,
+                DeadbandMode::Relative,
+            ))),
+            DeadbandMode::Absolute => {
+                Some(Arc::new(DeadbandFilter::new(d, DeadbandMode::Absolute)))
+            }
+        },
+    }
 }
 
 fn build_arr(cfg: &serde_json::Value) -> Option<Arc<dyn SubscriptionFilter>> {
@@ -683,9 +701,32 @@ mod tests {
     }
 
     #[test]
-    fn parse_dbnd_relative_uses_r_key() {
-        let chain = parse_filter_chain(r#"{"dbnd":{"r":0.01}}"#);
-        assert_eq!(chain.len(), 1);
+    fn parse_dbnd_relative_rel_key_and_d_m() {
+        // C `dbnd.c` accepts `{"rel":X}` and `{"d":X,"m":"rel"}` for
+        // relative mode; both build a one-filter chain.
+        assert_eq!(parse_filter_chain(r#"{"dbnd":{"rel":50}}"#).len(), 1);
+        assert_eq!(
+            parse_filter_chain(r#"{"dbnd":{"d":50,"m":"rel"}}"#).len(),
+            1
+        );
+        // `{"abs":X}` and `{"d":X,"m":"abs"}` build absolute mode.
+        assert_eq!(parse_filter_chain(r#"{"dbnd":{"abs":0.5}}"#).len(), 1);
+        assert_eq!(
+            parse_filter_chain(r#"{"dbnd":{"d":0.5,"m":"abs"}}"#).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn parse_dbnd_rejects_fabricated_r_key_and_bad_mode() {
+        // The fabricated `r` key C never had now matches nothing — the
+        // filter is dropped (empty chain).
+        assert_eq!(parse_filter_chain(r#"{"dbnd":{"r":0.01}}"#).len(), 0);
+        // An `m` value outside modeEnum fails the parse like C chfEnum.
+        assert_eq!(
+            parse_filter_chain(r#"{"dbnd":{"d":1.0,"m":"nope"}}"#).len(),
+            0
+        );
     }
 
     #[test]

@@ -7,11 +7,10 @@
 //! `DBE_ALARM` / `DBE_PROPERTY` (a stale property silenced by a
 //! deadband would desync clients).
 //!
-//! pvxs CA filter wire syntax: `PV.{"dbnd":{"d":0.5}}` (abs) or
-//! `PV.{"dbnd":{"r":0.5}}` (relative to last value). The parser
-//! that lifts this off the channel name is not yet implemented;
-//! this commit ships the filter itself, ready to be plumbed in by
-//! the JSON parser commit.
+//! C `dbnd.c` filter wire syntax (`modeEnum {"abs","rel"}`, opts
+//! `d`/`m`/`abs`/`rel`): `PV.{"dbnd":{"d":0.5}}` or `{"abs":0.5}`
+//! (absolute); `PV.{"dbnd":{"rel":50}}` or `{"d":50,"m":"rel"}`
+//! (relative, percent of last value). There is no `r` key.
 
 use parking_lot::Mutex;
 
@@ -22,16 +21,16 @@ use crate::types::EpicsValue;
 /// Deadband mode — absolute or relative-to-last-value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeadbandMode {
-    /// `|new - last| > threshold` passes. The default for the
-    /// `d` JSON key. Comparison is strict — matches C
-    /// `recGblCheckDeadband` (`if (delta > deadband)`).
+    /// `|new - last| > threshold` passes. The mode for the `d` key
+    /// (default), the `abs` key, and `d` with `m:"abs"`. Comparison is
+    /// strict — matches C `recGblCheckDeadband` (`if (delta > deadband)`).
     Absolute,
-    /// `|new - last| > threshold * |last|` passes. The `r` JSON
-    /// key. `threshold` is the internal fraction (e.g. `0.01` for
-    /// 1%); the JSON wire form `r=50` (C-style percent) is divided
-    /// by 100 in the parser. When `last == 0.0` the band is `0` so
-    /// any non-zero delta passes — matching C `hyst = val * cval/100`
-    /// which is zero when `val == 0`.
+    /// `|new - last| > threshold * |last|` passes. The mode for the `rel`
+    /// key and `d` with `m:"rel"`. `threshold` is the internal fraction
+    /// (e.g. `0.01` for 1%); the JSON wire form is a C-style percent
+    /// (`cval`) divided by 100 in the parser. When `last == 0.0` the band
+    /// is `0` so any non-zero delta passes — matching C
+    /// `hyst = val * cval/100` which is zero when `val == 0`.
     Relative,
 }
 
@@ -59,6 +58,18 @@ impl DeadbandFilter {
     /// Convenience: absolute-deadband filter with the given threshold.
     pub fn absolute(threshold: f64) -> Self {
         Self::new(threshold, DeadbandMode::Absolute)
+    }
+
+    /// Parse the `m` mode-enum value of a `dbnd` filter — C `dbnd.c:35`
+    /// `modeEnum { {"abs",0}, {"rel",1} }`. Returns `None` for any other
+    /// string, matching C `chfEnum`'s rejection of an unknown enum value
+    /// (which fails the whole filter parse).
+    pub(crate) fn parse_mode(m: &str) -> Option<DeadbandMode> {
+        match m {
+            "abs" => Some(DeadbandMode::Absolute),
+            "rel" => Some(DeadbandMode::Relative),
+            _ => None,
+        }
     }
 
     /// Convenience: relative-deadband filter (fraction — 0.01 = 1%).
@@ -142,16 +153,6 @@ impl SubscriptionFilter for DeadbandFilter {
         } else {
             None
         }
-    }
-}
-
-/// Hint helper for the future JSON parser — distinguishes `d` vs `r`.
-#[allow(dead_code)] // wired in when the PV-name JSON parser lands
-pub(crate) fn parse_mode(key: &str) -> Option<DeadbandMode> {
-    match key {
-        "d" => Some(DeadbandMode::Absolute),
-        "r" => Some(DeadbandMode::Relative),
-        _ => None,
     }
 }
 
@@ -373,9 +374,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_mode_recognises_d_and_r() {
-        assert_eq!(parse_mode("d"), Some(DeadbandMode::Absolute));
-        assert_eq!(parse_mode("r"), Some(DeadbandMode::Relative));
-        assert_eq!(parse_mode("nope"), None);
+    fn parse_mode_recognises_abs_and_rel() {
+        // C `dbnd.c:35` modeEnum: {"abs",0},{"rel",1}.
+        assert_eq!(
+            DeadbandFilter::parse_mode("abs"),
+            Some(DeadbandMode::Absolute)
+        );
+        assert_eq!(
+            DeadbandFilter::parse_mode("rel"),
+            Some(DeadbandMode::Relative)
+        );
+        // `d` is a delta key, not a mode value; the fabricated `r` key is
+        // gone. Neither is a valid `m` enum value.
+        assert_eq!(DeadbandFilter::parse_mode("d"), None);
+        assert_eq!(DeadbandFilter::parse_mode("r"), None);
+        assert_eq!(DeadbandFilter::parse_mode("nope"), None);
     }
 }

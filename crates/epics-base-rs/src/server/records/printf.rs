@@ -30,6 +30,18 @@ pub struct PrintfRecord {
     /// `printfRecord.c:322` `prec->len = pval - prec->val` and posted at
     /// :400 (DBF_ULONG, like lsi/lso).
     pub len: u32,
+    /// IVLS: the "Invalid Link String" emitted in place of any format
+    /// directive whose input link did not resolve this cycle. C
+    /// `printfRecord.c:306-307` `flags & F_BADLNK ? prec->ivls : format`;
+    /// DBF_STRING `size(16)`, `initial("LNK")`.
+    pub ivls: String,
+    /// Per-cycle scratch: which of INP0..INP9 produced a value this
+    /// cycle (link configured AND fetch succeeded). Set by the
+    /// framework via [`Record::set_resolved_input_links`] before
+    /// `process()`. `apply_fmt` treats a consumed slot that is not
+    /// resolved as a bad link — the framework analogue of C
+    /// `RTN_SUCCESS(dbGetLink(...))` / `recGblInitConstantLink` failing.
+    resolved: [bool; 10],
 }
 
 impl Default for PrintfRecord {
@@ -41,6 +53,8 @@ impl Default for PrintfRecord {
             inp_links: Default::default(),
             vals: std::array::from_fn(|_| EpicsValue::Double(0.0)),
             len: 0,
+            ivls: "LNK".to_string(),
+            resolved: [false; 10],
         }
     }
 }
@@ -191,14 +205,17 @@ impl PrintfRecord {
         let mut i = 0;
         let mut inp_idx = 0usize;
 
-        // Fetch the next input value, advancing the cursor.
+        // Consume the next input link slot, advancing the cursor (C
+        // `linkn++`). Returns the value only when the slot is in range
+        // AND its INPn link actually resolved this cycle; otherwise the
+        // consumption is a failed link read (C `dbGetLink` /
+        // `recGblInitConstantLink` returning non-success → F_BADLNK).
         let take = |idx: &mut usize| -> Option<&EpicsValue> {
-            if *idx < 10 {
-                let v = &self.vals[*idx];
-                *idx += 1;
-                Some(v)
+            let cur = *idx;
+            *idx += 1;
+            if cur < 10 && self.resolved[cur] {
+                Some(&self.vals[cur])
             } else {
-                *idx += 1;
                 None
             }
         };
@@ -229,19 +246,32 @@ impl PrintfRecord {
                 continue;
             }
 
-            // Resolve `*` width / precision from the next input(s).
+            // Track a failed link read across the directive's consumed
+            // slots. C sets F_BADLNK on the first failure and emits IVLS
+            // for the whole directive (printfRecord.c:306-307).
+            let mut bad_link = false;
+
+            // Resolve `*` width / precision from the next input(s). A
+            // `*` consumes a link slot even when it fails to resolve.
             let width = if d.star_width {
-                take(&mut inp_idx)
-                    .map(|v| Self::val_as_f64(v) as i64)
-                    .unwrap_or(0)
+                match take(&mut inp_idx) {
+                    Some(v) => Self::val_as_f64(v) as i64,
+                    None => {
+                        bad_link = true;
+                        0
+                    }
+                }
             } else {
                 d.width.unwrap_or(0) as i64
             };
             let precision = if d.star_prec {
-                take(&mut inp_idx)
-                    .map(|v| Self::val_as_f64(v) as i64)
-                    .unwrap_or(0)
-                    .max(0) as usize
+                match take(&mut inp_idx) {
+                    Some(v) => (Self::val_as_f64(v) as i64).max(0) as usize,
+                    None => {
+                        bad_link = true;
+                        0
+                    }
+                }
             } else {
                 d.precision.unwrap_or(usize::MAX)
             };
@@ -251,7 +281,29 @@ impl PrintfRecord {
                 (width as usize, d.left_align)
             };
 
-            let arg = take(&mut inp_idx);
+            // C `goto bad_format` (printfRecord.c:167-168) jumps out
+            // BEFORE consuming the conversion's link when a `*` already
+            // failed, so a failed star does NOT consume the conversion's
+            // INP slot — the next directive inherits it. Only consume the
+            // conversion arg when no star failed; an arg that is exhausted
+            // or unresolved is itself a bad link.
+            let arg = if bad_link {
+                None
+            } else {
+                let a = take(&mut inp_idx);
+                if a.is_none() {
+                    bad_link = true;
+                }
+                a
+            };
+
+            if bad_link {
+                // F_BADLNK: emit the Invalid Link String once for the
+                // whole directive (printfRecord.c:307).
+                result.push_str(&self.ivls);
+                continue;
+            }
+
             let conv_prec = if precision == usize::MAX {
                 6
             } else {
@@ -475,6 +527,11 @@ static PRINTF_FIELDS: &[FieldDesc] = &[
         read_only: false,
     },
     FieldDesc {
+        name: "IVLS",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
         name: "INP0",
         dbf_type: DbFieldType::String,
         read_only: false,
@@ -611,6 +668,7 @@ impl Record for PrintfRecord {
             "LEN" => Some(EpicsValue::Long(self.len as i32)),
             "SIZV" => Some(EpicsValue::Short(self.sizv as i16)),
             "FMT" => Some(EpicsValue::String(self.fmt.clone().into())),
+            "IVLS" => Some(EpicsValue::String(self.ivls.clone().into())),
             _ => {
                 if let Some(idx) = Self::inp_index(name) {
                     return Some(EpicsValue::String(self.inp_links[idx].clone().into()));
@@ -637,6 +695,15 @@ impl Record for PrintfRecord {
                     self.fmt = s.as_str_lossy().into_owned();
                 } else {
                     return Err(CaError::TypeMismatch("FMT".into()));
+                }
+            }
+            "IVLS" => {
+                if let EpicsValue::String(s) = value {
+                    // C dbd `field(IVLS,DBF_STRING) size(16)`: a 16-byte
+                    // buffer holds at most 15 chars plus the NUL.
+                    self.ivls = s.as_str_lossy().chars().take(15).collect();
+                } else {
+                    return Err(CaError::TypeMismatch("IVLS".into()));
                 }
             }
             _ => {
@@ -672,6 +739,20 @@ impl Record for PrintfRecord {
             ("INP9", "J"),
         ]
     }
+
+    fn set_resolved_input_links(&mut self, resolved: &[&'static str]) {
+        // Record which INPn links produced a value this cycle so
+        // `apply_fmt` can emit IVLS for the directives whose link read
+        // failed (C `printfRecord.c` F_BADLNK). The framework passes the
+        // `link_field` names ("INP0".."INP9") that resolved; any slot not
+        // listed is a failed/unconfigured link this cycle.
+        self.resolved = [false; 10];
+        for &lf in resolved {
+            if let Some(idx) = Self::inp_index(lf) {
+                self.resolved[idx] = true;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -685,11 +766,22 @@ mod tests {
         }
     }
 
+    impl PrintfRecord {
+        /// Test helper: simulate INPn resolving to `value` this cycle.
+        /// The framework writes the value slot and marks it resolved in
+        /// lockstep (processing.rs); a test that only set `vals[idx]`
+        /// without this would (correctly) see the slot as a bad link.
+        fn set_input(&mut self, idx: usize, value: EpicsValue) {
+            self.vals[idx] = value;
+            self.resolved[idx] = true;
+        }
+    }
+
     /// `%s` prints the input link's STRING content, not a number.
     #[test]
     fn percent_s_formats_string_input() {
         let mut rec = rec_with("name=%s");
-        rec.vals[0] = EpicsValue::String("motor1".into());
+        rec.set_input(0, EpicsValue::String("motor1".into()));
         rec.process().unwrap();
         assert_eq!(rec.val, "name=motor1");
     }
@@ -698,7 +790,7 @@ mod tests {
     #[test]
     fn percent_s_with_width_padding() {
         let mut rec = rec_with("[%8s]");
-        rec.vals[0] = EpicsValue::String("ab".into());
+        rec.set_input(0, EpicsValue::String("ab".into()));
         rec.process().unwrap();
         assert_eq!(rec.val, "[      ab]");
     }
@@ -707,8 +799,8 @@ mod tests {
     #[test]
     fn star_width_consumes_an_input() {
         let mut rec = rec_with("%*d");
-        rec.vals[0] = EpicsValue::Long(6); // width
-        rec.vals[1] = EpicsValue::Long(42); // value
+        rec.set_input(0, EpicsValue::Long(6)); // width
+        rec.set_input(1, EpicsValue::Long(42)); // value
         rec.process().unwrap();
         assert_eq!(rec.val, "    42");
     }
@@ -717,7 +809,7 @@ mod tests {
     #[test]
     fn long_modifier_consumed() {
         let mut rec = rec_with("%ld");
-        rec.vals[0] = EpicsValue::Long(99);
+        rec.set_input(0, EpicsValue::Long(99));
         rec.process().unwrap();
         assert_eq!(rec.val, "99");
     }
@@ -726,7 +818,7 @@ mod tests {
     #[test]
     fn long_string_conversion() {
         let mut rec = rec_with("%ls");
-        rec.vals[0] = EpicsValue::String("hello".into());
+        rec.set_input(0, EpicsValue::String("hello".into()));
         rec.process().unwrap();
         assert_eq!(rec.val, "hello");
     }
@@ -735,7 +827,7 @@ mod tests {
     #[test]
     fn percent_c_formats_char() {
         let mut rec = rec_with("%c");
-        rec.vals[0] = EpicsValue::Long(65); // 'A'
+        rec.set_input(0, EpicsValue::Long(65)); // 'A'
         rec.process().unwrap();
         assert_eq!(rec.val, "A");
     }
@@ -763,7 +855,7 @@ mod tests {
     #[test]
     fn len_counts_formatted_bytes_plus_nul() {
         let mut rec = rec_with("name=%s");
-        rec.vals[0] = EpicsValue::String("motor1".into());
+        rec.set_input(0, EpicsValue::String("motor1".into()));
         rec.process().unwrap();
         assert_eq!(rec.val, "name=motor1");
         // 11 chars + 1 NUL.
@@ -786,12 +878,12 @@ mod tests {
     #[test]
     fn g_zero_alt_form() {
         let mut rec = rec_with("%g");
-        rec.vals[0] = EpicsValue::Double(0.0);
+        rec.set_input(0, EpicsValue::Double(0.0));
         rec.process().unwrap();
         assert_eq!(rec.val, "0");
 
         let mut rec = rec_with("%#.3g");
-        rec.vals[0] = EpicsValue::Double(0.0);
+        rec.set_input(0, EpicsValue::Double(0.0));
         rec.process().unwrap();
         assert_eq!(rec.val, "0.00");
     }
@@ -802,5 +894,77 @@ mod tests {
         let mut rec = rec_with("100%%");
         rec.process().unwrap();
         assert_eq!(rec.val, "100%");
+    }
+
+    /// A directive whose INPn link did not resolve this cycle emits IVLS
+    /// (default "LNK"), not a default zero. C `printfRecord.c:307`
+    /// F_BADLNK. Boundary: slot in range (idx < 10) but not resolved.
+    #[test]
+    fn unresolved_link_emits_ivls() {
+        let mut rec = rec_with("v=%d");
+        // No set_input → INP0 did not resolve.
+        rec.process().unwrap();
+        assert_eq!(rec.val, "v=LNK");
+    }
+
+    /// Only the unresolved directive emits IVLS; resolved neighbours
+    /// format normally. C consumes one INP slot per directive.
+    #[test]
+    fn mixed_resolved_and_unresolved() {
+        let mut rec = rec_with("%d/%d");
+        rec.set_input(0, EpicsValue::Long(7)); // INP0 resolves
+        // INP1 (slot 1) unconfigured.
+        rec.process().unwrap();
+        assert_eq!(rec.val, "7/LNK");
+    }
+
+    /// More directives than the 10 INP slots: the exhausted slot
+    /// (idx >= 10) is a bad link. C `linkn >= PRINTF_NLINKS`.
+    #[test]
+    fn exhausted_links_emit_ivls() {
+        let mut rec = rec_with("%d%d%d%d%d%d%d%d%d%d%d"); // 11 directives
+        for i in 0..10 {
+            rec.set_input(i, EpicsValue::Long(i as i32));
+        }
+        rec.process().unwrap();
+        // First ten format their slot; the 11th is exhausted → IVLS.
+        assert_eq!(rec.val, "0123456789LNK");
+    }
+
+    /// IVLS is configurable and is what gets emitted on a bad link.
+    #[test]
+    fn custom_ivls_is_emitted() {
+        let mut rec = rec_with("%d");
+        rec.put_field("IVLS", EpicsValue::String("BAD".into()))
+            .unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.val, "BAD");
+        assert_eq!(
+            rec.get_field("IVLS"),
+            Some(EpicsValue::String("BAD".into()))
+        );
+    }
+
+    /// IVLS clamps to the C `size(16)` buffer: 15 chars max.
+    #[test]
+    fn ivls_clamps_to_fifteen_chars() {
+        let mut rec = rec_with("");
+        rec.put_field("IVLS", EpicsValue::String("0123456789ABCDEFGHIJ".into()))
+            .unwrap();
+        assert_eq!(rec.ivls, "0123456789ABCDE");
+    }
+
+    /// A failed `*` width link short-circuits BEFORE the conversion arg
+    /// is consumed (C `goto bad_format`), so the conversion's INP slot is
+    /// inherited by the next directive. FMT "%*d|%d": star width (slot 0)
+    /// fails → "LNK"; the `d` of the FIRST directive does NOT consume a
+    /// slot, so the SECOND `%d` reads slot 1.
+    #[test]
+    fn failed_star_width_does_not_consume_conversion_slot() {
+        let mut rec = rec_with("%*d|%d");
+        // Slot 0 (the star width) unresolved; slot 1 resolves to 42.
+        rec.set_input(1, EpicsValue::Long(42));
+        rec.process().unwrap();
+        assert_eq!(rec.val, "LNK|42");
     }
 }

@@ -174,9 +174,11 @@ fn h6_printf_percent_s_uses_string_input() {
     let mut rec = PrintfRecord::default();
     rec.put_field("FMT", EpicsValue::String("device: %s".into()))
         .unwrap();
-    // The framework delivers the INP0 link value into field A.
+    // The framework delivers the INP0 link value into field A and marks
+    // the link resolved for this cycle.
     rec.put_field("A", EpicsValue::String("ADC1".into()))
         .unwrap();
+    rec.set_resolved_input_links(&["INP0"]);
     rec.process().unwrap();
     if let Some(EpicsValue::CharArray(bytes)) = rec.get_field("VAL") {
         assert_eq!(String::from_utf8(bytes).unwrap(), "device: ADC1");
@@ -199,6 +201,7 @@ fn h7_printf_star_width_and_modifiers() {
     rec.put_field("C", EpicsValue::String("tag".into()))
         .unwrap(); // %ls
     rec.put_field("D", EpicsValue::Long(33)).unwrap(); // %c -> '!'
+    rec.set_resolved_input_links(&["INP0", "INP1", "INP2", "INP3"]);
     rec.process().unwrap();
     if let Some(EpicsValue::CharArray(bytes)) = rec.get_field("VAL") {
         assert_eq!(String::from_utf8(bytes).unwrap(), "[    7] tag !");

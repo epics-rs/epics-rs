@@ -2545,6 +2545,45 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let actual_count = snapshot.value.count() as u32;
             let element_count = if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
                 1
+            } else if !is_notify && requested_count == 0 {
+                // The deprecated synchronous CA_PROTO_READ (cmd 3) does
+                // NOT treat m_count==0 as autosize. C `read_action`
+                // (rsrv/camessage.c:622-645) sizes the reply with
+                // `dbr_size_n(type, m_count)`, writes the header count as
+                // `m_count`, and calls `dbChannel_get(.., m_count, ..)`
+                // — all VERBATIM. Only `read_reply` (READ_NOTIFY /
+                // EVENT_ADD, camessage.c:507-509) interprets m_count==0 as
+                // "all available elements". So a deprecated READ with
+                // count==0 must ship count=0 and a value-less payload of
+                // `dbr_size_n(type, 0)` bytes == the type's metadata only
+                // (0 bytes for a plain DBR type; the STS/TIME/GR/CTRL
+                // header for a compound type, since `dbr_size_n(t,0)` ==
+                // `dbr_size[t] - dbr_value_size[t]`). Pre-fix Rust shared
+                // the autosize path for both opcodes and returned the full
+                // native array with count=actual_native_count, diverging
+                // from rsrv on both the wire count field and the payload
+                // length.
+                match epics_base_rs::types::native_type_for_dbr(requested_type) {
+                    Ok(native) => {
+                        let meta_size =
+                            epics_base_rs::types::dbr_buffer_size(requested_type, native, 0);
+                        if data.len() > meta_size {
+                            data.truncate(meta_size);
+                        }
+                        0
+                    }
+                    // Unreachable for a type that already encoded above
+                    // (<= LAST_BUFFER_TYPE). If it ever weren't, fall back
+                    // to the autosize sizing so the header count still
+                    // matches the payload rather than shipping count=0
+                    // with a value-bearing body.
+                    Err(_) => pad_dbr_to_requested_count(
+                        &mut data,
+                        actual_count,
+                        requested_count,
+                        requested_type,
+                    ),
+                }
             } else {
                 pad_dbr_to_requested_count(&mut data, actual_count, requested_count, requested_type)
             };
@@ -6116,6 +6155,211 @@ mod write_gate_order_tests {
         );
 
         drop(client);
+    }
+}
+
+#[cfg(test)]
+mod deprecated_read_autosize_tests {
+    //! The deprecated synchronous CA_PROTO_READ (cmd 3) does NOT
+    //! autosize a zero element count. C `read_action`
+    //! (rsrv/camessage.c:622-645) sizes the reply with
+    //! `dbr_size_n(type, m_count)`, writes the header count as `m_count`,
+    //! and calls `dbChannel_get(.., m_count, ..)` — all verbatim. Only
+    //! `read_reply` (READ_NOTIFY / EVENT_ADD, camessage.c:507-509) treats
+    //! `m_count == 0` as "all available elements". So a deprecated READ
+    //! with count==0 against a 3-element waveform must reply count=0 with
+    //! a value-less payload, while a READ_NOTIFY with count==0 autosizes
+    //! to the full 3-element array.
+    use super::non_graceful_disconnect_teardown_tests::{
+        create_chan_frame, read_create_chan_sid, version_frame,
+    };
+    use super::*;
+    use epics_base_rs::server::database::PvDatabase;
+    use epics_base_rs::types::{DBR_DOUBLE, EpicsValue};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Build a READ / READ_NOTIFY request for `sid` at `data_type` with
+    /// the given element `count` (0 means "autosize" only on the NOTIFY
+    /// opcode). No payload.
+    fn read_request(cmmd: u16, sid: u32, ioid: u32, data_type: u16, count: u32) -> Vec<u8> {
+        let mut h = CaHeader::new(cmmd);
+        h.data_type = data_type;
+        h.cid = sid;
+        h.available = ioid;
+        h.set_payload_size(0, count);
+        h.to_bytes_extended().to_vec()
+    }
+
+    /// Read frames until one whose command is `want_cmmd` arrives; return
+    /// its header. Panics on timeout / EOF.
+    async fn read_frame_of_cmmd<R: tokio::io::AsyncRead + Unpin>(
+        client: &mut R,
+        want_cmmd: u16,
+        timeout: Duration,
+    ) -> CaHeader {
+        let mut acc: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 512];
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for cmmd {want_cmmd}"
+            );
+            let n = tokio::time::timeout(remaining, client.read(&mut buf))
+                .await
+                .expect("read within timeout")
+                .expect("read ok");
+            assert!(n > 0, "server closed before cmmd {want_cmmd}");
+            acc.extend_from_slice(&buf[..n]);
+            let mut offset = 0;
+            while offset + CaHeader::SIZE <= acc.len() {
+                let (hdr, hdr_size) =
+                    CaHeader::from_bytes_extended(&acc[offset..]).expect("response header parses");
+                let msg_len = hdr_size + hdr.actual_postsize();
+                if offset + msg_len > acc.len() {
+                    break;
+                }
+                if hdr.cmmd == want_cmmd {
+                    return hdr;
+                }
+                offset += msg_len;
+            }
+        }
+    }
+
+    /// Spawn `handle_client` over a duplex pair with a permissive (no
+    /// ACF) server holding one waveform SimplePv `rd:arr` of `elems`.
+    /// Returns the client half, the join handle, and the ACF-reload
+    /// sender — the caller MUST keep the sender alive (a dropped sender
+    /// makes the biased-first `acf_reload_rx.recv()` resolve `Closed`,
+    /// exiting `handle_client` before it reads a client frame).
+    async fn spawn_array_server(
+        peer_port: u16,
+        elems: Vec<f64>,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<CaResult<()>>,
+        broadcast::Sender<()>,
+    ) {
+        let db = Arc::new(PvDatabase::new());
+        db.add_pv("rd:arr", EpicsValue::DoubleArray(elems))
+            .await
+            .expect("add array pv");
+        let acf = Arc::new(tokio::sync::RwLock::new(None));
+        let (acf_reload_tx, acf_reload_rx) = broadcast::channel::<()>(4);
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let peer: SocketAddr = format!("127.0.0.1:{peer_port}").parse().unwrap();
+        let handle = tokio::spawn(async move {
+            handle_client(
+                server_io,
+                peer,
+                db,
+                acf,
+                acf_reload_rx,
+                5064,
+                None,
+                None,
+                None,
+                None,
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+                #[cfg(feature = "cap-tokens")]
+                None,
+            )
+            .await
+        });
+        (client_io, handle, acf_reload_tx)
+    }
+
+    async fn handshake(client: &mut tokio::io::DuplexStream) -> u32 {
+        client.write_all(&version_frame()).await.expect("version");
+        client
+            .write_all(&create_chan_frame(0xD1, "rd:arr"))
+            .await
+            .expect("create_chan");
+        client.flush().await.expect("flush create_chan");
+        read_create_chan_sid(client, Duration::from_secs(3)).await
+    }
+
+    /// Deprecated CA_PROTO_READ (cmd 3), count==0 against a 3-element
+    /// DBR_DOUBLE waveform: C ships count=0 + a value-less (0-byte for a
+    /// plain DBR type) payload. Pre-fix Rust autosized to count=3 + 24
+    /// payload bytes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deprecated_read_count0_ships_verbatim_zero() {
+        let (mut client, handle, _acf_reload_tx) =
+            spawn_array_server(55340, vec![1.0, 2.0, 3.0]).await;
+        let sid = handshake(&mut client).await;
+
+        client
+            .write_all(&read_request(CA_PROTO_READ, sid, 0x11, DBR_DOUBLE, 0))
+            .await
+            .expect("read");
+        client.flush().await.expect("flush read");
+
+        let resp = read_frame_of_cmmd(&mut client, CA_PROTO_READ, Duration::from_secs(3)).await;
+        assert_eq!(
+            resp.actual_count(),
+            0,
+            "deprecated READ must echo m_count==0 verbatim (no autosize); got {}",
+            resp.actual_count()
+        );
+        assert_eq!(
+            resp.actual_postsize(),
+            0,
+            "deprecated READ count==0 of a plain DBR_DOUBLE ships a value-less \
+             (dbr_size_n(type,0)==0) payload; got {} bytes",
+            resp.actual_postsize()
+        );
+
+        drop(client);
+        handle.abort();
+    }
+
+    /// Contrast: CA_PROTO_READ_NOTIFY (cmd 15), count==0 against the same
+    /// waveform DOES autosize to the full 3-element array (C `read_reply`,
+    /// camessage.c:507-509). Pins that the fix did not touch the NOTIFY
+    /// autosize path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_notify_count0_autosizes_to_full_array() {
+        let (mut client, handle, _acf_reload_tx) =
+            spawn_array_server(55341, vec![1.0, 2.0, 3.0]).await;
+        let sid = handshake(&mut client).await;
+
+        client
+            .write_all(&read_request(
+                CA_PROTO_READ_NOTIFY,
+                sid,
+                0x12,
+                DBR_DOUBLE,
+                0,
+            ))
+            .await
+            .expect("read_notify");
+        client.flush().await.expect("flush read_notify");
+
+        let resp =
+            read_frame_of_cmmd(&mut client, CA_PROTO_READ_NOTIFY, Duration::from_secs(3)).await;
+        assert_eq!(
+            resp.actual_count(),
+            3,
+            "READ_NOTIFY count==0 must autosize to the full native array; got {}",
+            resp.actual_count()
+        );
+        assert_eq!(
+            resp.actual_postsize(),
+            24,
+            "READ_NOTIFY count==0 ships all 3 DBR_DOUBLE elements (3*8=24 bytes); got {}",
+            resp.actual_postsize()
+        );
+
+        drop(client);
+        handle.abort();
     }
 }
 

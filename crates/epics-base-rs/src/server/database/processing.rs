@@ -2941,12 +2941,28 @@ impl PvDatabase {
                     apply_timestamp(&mut instance.common, true);
                     instance.common.udf = false;
 
-                    // Set simulation alarm
+                    // Simulation alarm + alarm tail. C `aiRecord.c`
+                    // (and every soft-input record): `readValue()` raises
+                    // `recGblSetSevr(prec, SIMM_ALARM, prec->sims)` —
+                    // MAXIMIZE into the pending nsta/nsev, not a direct
+                    // commit — and then `process()` ALWAYS runs
+                    // `checkAlarms` + `recGblResetAlarms` even for a
+                    // simulated value, so the sim VAL still trips its own
+                    // limit/state alarms and the SIMM severity maximizes
+                    // against them. Set SIMM_ALARM first so it wins
+                    // severity ties (C order: readValue before checkAlarms).
                     let sev = crate::server::record::AlarmSeverity::from_u16(sims as u16);
-                    if sev != crate::server::record::AlarmSeverity::NoAlarm {
-                        instance.common.sevr = sev;
-                        instance.common.stat = crate::server::recgbl::alarm_status::SIMM_ALARM;
+                    crate::server::recgbl::rec_gbl_set_sevr(
+                        &mut instance.common,
+                        crate::server::recgbl::alarm_status::SIMM_ALARM,
+                        sev,
+                    );
+                    {
+                        let inst = &mut *instance;
+                        inst.record.check_alarms(&mut inst.common);
                     }
+                    instance.evaluate_alarms();
+                    let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
 
                     // Build snapshot and notify
                     let mut changed_fields = Vec::new();
@@ -2999,11 +3015,23 @@ impl PvDatabase {
                 apply_timestamp(&mut instance.common, true);
                 instance.common.udf = false;
 
+                // Simulation alarm + alarm tail (same C parity as the
+                // input branch above): maximize SIMM_ALARM into the
+                // pending state, then run the record's checkAlarms and
+                // recGblResetAlarms so the sim output value trips its own
+                // alarms and the SIMM severity maximizes against them.
                 let sev = crate::server::record::AlarmSeverity::from_u16(sims as u16);
-                if sev != crate::server::record::AlarmSeverity::NoAlarm {
-                    instance.common.sevr = sev;
-                    instance.common.stat = crate::server::recgbl::alarm_status::SIMM_ALARM;
+                crate::server::recgbl::rec_gbl_set_sevr(
+                    &mut instance.common,
+                    crate::server::recgbl::alarm_status::SIMM_ALARM,
+                    sev,
+                );
+                {
+                    let inst = &mut *instance;
+                    inst.record.check_alarms(&mut inst.common);
                 }
+                instance.evaluate_alarms();
+                let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
 
                 // Notify subscribers of simulation output
                 let mut changed_fields = Vec::new();

@@ -1374,6 +1374,56 @@ async fn test_sim_mode_input() {
     assert!(matches!(sevr, EpicsValue::Short(1)));
 }
 
+/// A simulated value runs the record's full alarm tail like a real one.
+/// C `aiRecord.c`: `readValue()` raises `recGblSetSevr(prec,
+/// SIMM_ALARM, prec->sims)` (MAXIMIZE) and `process()` still runs
+/// `checkAlarms` + `recGblResetAlarms` on the simulated VAL. So a sim
+/// VAL of 99 trips HIHI, and because HHSV (MAJOR) outranks SIMM (MINOR)
+/// the limit alarm must WIN — the pre-fix direct-commit clobbered it
+/// (and never even evaluated the limit), reporting only MINOR/SIMM.
+#[tokio::test]
+async fn test_sim_value_trips_own_limit_and_maximizes_over_simm() {
+    use epics_base_rs::server::recgbl::alarm_status;
+
+    let db = PvDatabase::new();
+    db.add_record("SIM_SW2", Box::new(AoRecord::new(1.0)))
+        .await
+        .unwrap();
+    db.add_record("SIM_VAL2", Box::new(AoRecord::new(99.0)))
+        .await
+        .unwrap();
+
+    let mut ai = AiRecord::new(0.0);
+    ai.siml = "SIM_SW2".to_string();
+    ai.siol = "SIM_VAL2".to_string();
+    ai.sims = 1; // SIMM severity = MINOR
+    db.add_record("SIM_AI2", Box::new(ai)).await.unwrap();
+    if let Some(rec) = db.get_record("SIM_AI2").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("HIHI", EpicsValue::Double(50.0))
+            .unwrap();
+        inst.put_common_field("HHSV", EpicsValue::Short(AlarmSeverity::Major as i16))
+            .unwrap();
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SIM_AI2", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // VAL=99 > HIHI=50 → HIHI MAJOR maximizes over the SIMM MINOR.
+    let sevr = db.get_pv("SIM_AI2.SEVR").await.unwrap();
+    assert!(
+        matches!(sevr, EpicsValue::Short(2)),
+        "sim limit MAJOR must win over SIMM MINOR: got {sevr:?}"
+    );
+    let stat = db.get_pv("SIM_AI2.STAT").await.unwrap();
+    assert!(
+        matches!(stat, EpicsValue::Short(s) if s as u16 == alarm_status::HIHI_ALARM),
+        "STAT must be HIHI_ALARM, not SIMM_ALARM: got {stat:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_sim_mode_toggle() {
     let db = PvDatabase::new();

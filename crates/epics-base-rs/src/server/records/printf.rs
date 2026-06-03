@@ -25,6 +25,11 @@ pub struct PrintfRecord {
     /// type. `%s` reads the string form, numeric conversions read the
     /// numeric form.
     pub vals: [EpicsValue; 10],
+    /// LEN: byte length of the formatted VAL string INCLUDING the
+    /// terminating NUL, recomputed each process cycle. C
+    /// `printfRecord.c:322` `prec->len = pval - prec->val` and posted at
+    /// :400 (DBF_ULONG, like lsi/lso).
+    pub len: u32,
 }
 
 impl Default for PrintfRecord {
@@ -35,6 +40,7 @@ impl Default for PrintfRecord {
             fmt: String::new(),
             inp_links: Default::default(),
             vals: std::array::from_fn(|_| EpicsValue::Double(0.0)),
+            len: 0,
         }
     }
 }
@@ -454,6 +460,11 @@ static PRINTF_FIELDS: &[FieldDesc] = &[
         read_only: true,
     },
     FieldDesc {
+        name: "LEN",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
         name: "SIZV",
         dbf_type: DbFieldType::Short,
         read_only: false,
@@ -584,6 +595,9 @@ impl Record for PrintfRecord {
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         self.val = self.apply_fmt();
+        // C `printfRecord.c:321-322`: `*pval++ = 0; prec->len = pval - prec->val`
+        // — LEN counts the formatted bytes plus the terminating NUL.
+        self.len = (self.val.len() + 1) as u32;
         Ok(ProcessOutcome::complete())
     }
 
@@ -594,6 +608,7 @@ impl Record for PrintfRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::CharArray(self.val.as_bytes().to_vec())),
+            "LEN" => Some(EpicsValue::Long(self.len as i32)),
             "SIZV" => Some(EpicsValue::Short(self.sizv as i16)),
             "FMT" => Some(EpicsValue::String(self.fmt.clone().into())),
             _ => {
@@ -741,6 +756,30 @@ mod tests {
         let mut rec = rec_with("v=%");
         rec.process().unwrap();
         assert_eq!(rec.val, "v=%");
+    }
+
+    /// LEN reports the formatted byte count INCLUDING the NUL terminator
+    /// (C `printfRecord.c:321-322`), and is exposed via get_field.
+    #[test]
+    fn len_counts_formatted_bytes_plus_nul() {
+        let mut rec = rec_with("name=%s");
+        rec.vals[0] = EpicsValue::String("motor1".into());
+        rec.process().unwrap();
+        assert_eq!(rec.val, "name=motor1");
+        // 11 chars + 1 NUL.
+        assert_eq!(rec.len, 12);
+        assert_eq!(rec.get_field("LEN"), Some(EpicsValue::Long(12)));
+    }
+
+    /// An empty format still has a NUL, so LEN == 1 (boundary: zero-length
+    /// VAL), not 0.
+    #[test]
+    fn len_of_empty_value_is_one() {
+        let mut rec = rec_with("");
+        rec.process().unwrap();
+        assert_eq!(rec.val, "");
+        assert_eq!(rec.len, 1);
+        assert_eq!(rec.get_field("LEN"), Some(EpicsValue::Long(1)));
     }
 
     /// L-2: `%#g` of zero keeps trailing zeros; plain `%g` is "0".

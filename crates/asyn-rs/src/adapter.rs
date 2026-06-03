@@ -1762,6 +1762,68 @@ mod tests {
         ads.init(&mut rec).unwrap();
     }
 
+    /// A driver that does NOT implement getBounds reports low=high=0
+    /// (C asynInt32Base.c:99), so convertAi skips the LINEAR ESLO/EOFF
+    /// computation (devAsynInt32.c:444). TestPort overrides no bounds,
+    /// exercising the PortDriver default; ESLO/EOFF must be left at the
+    /// record's pre-set values.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ai_linear_skip_when_driver_uses_default_bounds() {
+        let mut ads = make_adapter(ScanType::Passive); // TestPort: default bounds
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut rec = AiRecord::new(0.0);
+        rec.eguf = 10.0;
+        rec.egul = 0.0;
+        rec.linr = 2; // LINEAR
+        rec.eslo = 123.456;
+        rec.eoff = 42.0;
+        ads.init(&mut rec).unwrap();
+        assert!(
+            (rec.eslo - 123.456).abs() < 1e-9,
+            "ESLO must be untouched when the driver relies on the default (0,0) bounds: got {}",
+            rec.eslo
+        );
+        assert!(
+            (rec.eoff - 42.0).abs() < 1e-9,
+            "EOFF must be untouched when the driver relies on the default (0,0) bounds: got {}",
+            rec.eoff
+        );
+    }
+
+    /// Every getBounds default returns (0, 0), matching C
+    /// asynInt32Base.c:99 / asynInt64Base.c:99 (`*low = *high = 0`).
+    #[test]
+    fn get_bounds_defaults_match_c_low_high_zero() {
+        use crate::interfaces::int32::AsynInt32;
+        use crate::interfaces::int64::AsynInt64;
+
+        struct Bare32;
+        impl AsynInt32 for Bare32 {
+            fn read_int32(&mut self, _u: &AsynUser) -> AsynResult<i32> {
+                Ok(0)
+            }
+            fn write_int32(&mut self, _u: &mut AsynUser, _v: i32) -> AsynResult<()> {
+                Ok(())
+            }
+        }
+        struct Bare64;
+        impl AsynInt64 for Bare64 {
+            fn read_int64(&mut self, _u: &AsynUser) -> AsynResult<i64> {
+                Ok(0)
+            }
+            fn write_int64(&mut self, _u: &mut AsynUser, _v: i64) -> AsynResult<()> {
+                Ok(())
+            }
+        }
+
+        let u = AsynUser::new(0);
+        assert_eq!(Bare32.get_bounds(&u).unwrap(), (0, 0));
+        assert_eq!(Bare64.get_bounds(&u).unwrap(), (0, 0));
+        // PortDriver defaults — TestPort overrides neither.
+        assert_eq!(TestPort::new().get_bounds_int32(&u).unwrap(), (0, 0));
+        assert_eq!(TestPort::new().get_bounds_int64(&u).unwrap(), (0, 0));
+    }
+
     // --- asyn:FIFO ring buffer ---
 
     fn intr_entry(v: i32, t_ms: u64) -> CachedInterrupt {

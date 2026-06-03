@@ -785,12 +785,17 @@ pub trait PortDriver: Send + Sync + 'static {
         self.base_mut().call_param_callbacks(user.addr)
     }
 
+    /// C `asynInt32Base.c:99` default: report `low = high = 0` so a
+    /// driver that does not implement getBounds makes convertAi/convertAo
+    /// skip the LINEAR ESLO/EOFF computation (`devAsynInt32.c:444`).
     fn get_bounds_int32(&self, _user: &AsynUser) -> AsynResult<(i32, i32)> {
-        Ok((i32::MIN, i32::MAX))
+        Ok((0, 0))
     }
 
+    /// C `asynInt64Base.c:99` default: report `low = high = 0` (see
+    /// `get_bounds_int32`).
     fn get_bounds_int64(&self, _user: &AsynUser) -> AsynResult<(i64, i64)> {
-        Ok((i64::MIN, i64::MAX))
+        Ok((0, 0))
     }
 
     fn read_float64(&mut self, user: &AsynUser) -> AsynResult<f64> {
@@ -1589,8 +1594,10 @@ mod tests {
         }
         let drv = BoundsDriver { base };
         let (lo, hi) = drv.get_bounds_int64(&AsynUser::default()).unwrap();
-        assert_eq!(lo, i64::MIN);
-        assert_eq!(hi, i64::MAX);
+        // C asynInt64Base.c:99 default: *low = *high = 0 (so a driver
+        // that does not implement getBounds skips LINEAR ESLO/EOFF).
+        assert_eq!(lo, 0);
+        assert_eq!(hi, 0);
     }
 
     #[test]

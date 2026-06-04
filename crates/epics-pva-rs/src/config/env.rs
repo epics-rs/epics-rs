@@ -373,6 +373,38 @@ pub fn parse_endpoints_with_port(env: &str, default_port: u16) -> Vec<Endpoint> 
         .collect()
 }
 
+/// Collapse duplicate beacon endpoints, mirroring pvxs
+/// `removeDups<SockEndpoint>` (`config.cpp:349-371`): duplicates are keyed
+/// by `(addr, iface)` and combined into the FIRST occurrence carrying the
+/// LONGEST TTL, preserving first-appearance order. pvxs applies this to
+/// `beaconDestinations` in `Config::expand()` (`config.cpp:523`), AFTER
+/// auto-broadcast / multicast-group expansion, so `removeDups` sees the
+/// fully assembled list.
+///
+/// Without it, `EPICS_PVAS_BEACON_ADDR_LIST="224.0.2.3,1 224.0.2.3,8"`
+/// emitted two multicast beacons (TTL 1 and TTL 8) where pvxs emits one at
+/// TTL 8, and `@iface` duplicates double-beaconed a NIC. A `None` (OS
+/// default) TTL ranks below any explicit TTL via `Option` ordering, so a
+/// specified TTL always wins the combine.
+pub fn dedup_endpoints(endpoints: Vec<Endpoint>) -> Vec<Endpoint> {
+    let mut out: Vec<Endpoint> = Vec::with_capacity(endpoints.len());
+    for ep in endpoints {
+        if let Some(existing) = out
+            .iter_mut()
+            .find(|e| e.addr == ep.addr && e.iface == ep.iface)
+        {
+            // duplicate (addr, iface): keep the longest TTL on the
+            // first-seen entry — pvxs `if(ep.ttl > orig.ttl) orig.ttl = ep.ttl`.
+            if ep.ttl > existing.ttl {
+                existing.ttl = ep.ttl;
+            }
+        } else {
+            out.push(ep);
+        }
+    }
+    out
+}
+
 /// Default-port variant using `EPICS_PVA_BROADCAST_PORT` (5076 fallback).
 pub fn parse_addr_list(env: &str) -> Vec<SocketAddr> {
     parse_addr_list_with_port(env, broadcast_port())
@@ -1307,6 +1339,56 @@ mod tests {
         let addrs = parse_addr_list_with_port("224.0.2.3,5@eth0 10.0.0.1", 5076);
         assert_eq!(addrs.len(), 2);
         assert_eq!(addrs[0], "224.0.2.3:5076".parse().unwrap());
+    }
+
+    #[test]
+    fn dedup_beacon_endpoints_combines_longest_ttl() {
+        // pvxs `removeDups<SockEndpoint>` collapses same-(addr,iface)
+        // duplicates into the first occurrence carrying the longest TTL.
+        let eps = parse_endpoints_with_port("224.0.2.3,1 224.0.2.3,8", 5076);
+        assert_eq!(eps.len(), 2, "two raw tokens before dedup");
+        let deduped = dedup_endpoints(eps);
+        assert_eq!(deduped.len(), 1, "same (addr,iface) collapses to one");
+        assert_eq!(deduped[0].addr, "224.0.2.3:5076".parse().unwrap());
+        assert_eq!(deduped[0].ttl, Some(8), "longest TTL survives the combine");
+    }
+
+    #[test]
+    fn dedup_beacon_endpoints_explicit_ttl_beats_default() {
+        // `None` (OS default) TTL ranks below any explicit TTL via `Option`
+        // ordering — a specified TTL always wins regardless of token order.
+        let default_first =
+            dedup_endpoints(parse_endpoints_with_port("224.0.2.3 224.0.2.3,4", 5076));
+        assert_eq!(default_first.len(), 1);
+        assert_eq!(default_first[0].ttl, Some(4));
+        let explicit_first =
+            dedup_endpoints(parse_endpoints_with_port("224.0.2.3,4 224.0.2.3", 5076));
+        assert_eq!(explicit_first.len(), 1);
+        assert_eq!(explicit_first[0].ttl, Some(4));
+    }
+
+    #[test]
+    fn dedup_beacon_endpoints_keeps_distinct_iface() {
+        // Same multicast group on two different interfaces is two distinct
+        // destinations (pvxs keys dedup by `(addr, iface)`, not addr alone).
+        let eps = parse_endpoints_with_port("224.0.2.3,8@127.0.0.1 224.0.2.3,8@127.0.0.2", 5076);
+        let deduped = dedup_endpoints(eps);
+        assert_eq!(deduped.len(), 2, "distinct @iface stays separate");
+        assert_eq!(deduped[0].iface.as_deref(), Some("127.0.0.1"));
+        assert_eq!(deduped[1].iface.as_deref(), Some("127.0.0.2"));
+    }
+
+    #[test]
+    fn dedup_beacon_endpoints_preserves_first_seen_order() {
+        // Non-duplicate endpoints keep first-appearance order; the surviving
+        // duplicate stays in its first-seen slot, not the later one.
+        let eps = parse_endpoints_with_port("10.0.0.1 224.0.2.3,1 10.0.0.2 224.0.2.3,8", 5076);
+        let deduped = dedup_endpoints(eps);
+        assert_eq!(deduped.len(), 3, "one (224.0.2.3) duplicate collapsed");
+        assert_eq!(deduped[0].addr, "10.0.0.1:5076".parse().unwrap());
+        assert_eq!(deduped[1].addr, "224.0.2.3:5076".parse().unwrap());
+        assert_eq!(deduped[1].ttl, Some(8), "merged TTL on the first-seen slot");
+        assert_eq!(deduped[2].addr, "10.0.0.2:5076".parse().unwrap());
     }
 
     #[test]

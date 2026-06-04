@@ -273,6 +273,15 @@ pub async fn run_udp_responder_with_config(
             beacon_destinations.push(v6_mcast);
         }
     }
+    // Collapse duplicate beacon destinations by (addr, iface), keeping the
+    // longest TTL and first-appearance order — pvxs `removeDups<SockEndpoint>`
+    // applied to `beaconDestinations` in `Config::expand()` (config.cpp:523).
+    // Runs AFTER auto-broadcast / v6-group expansion (matching pvxs, which
+    // dedups after `expandAddrList`/`addGroups`) so synthesized destinations
+    // are deduped too. Single owner for all sources: env, programmatic
+    // `PvaServerConfig::beacon_destinations`, and the gateway CLI all flow
+    // their beacon lists into this responder.
+    beacon_destinations = crate::config::env::dedup_endpoints(beacon_destinations);
     // Send-only v6 socket used for beacon emission to v6 destinations.
     // The receive side (SEARCH on `[::]:udp_port`) is handled by the
     // companion `run_udp_responder_v6` task — keeping the beacon TX

@@ -4907,8 +4907,17 @@ fn handle_cancel_request(
             //      terminal `ExecFinished` is ignored by the
             //      `apply_exec_finish` ABA guard (it must not later flip a
             //      re-EXEC'd op or remove it on a stale `last_request`);
-            //   3. clear `last_request` — Cancel is not a teardown, the op
-            //      survives for re-EXEC;
+            //   3. preserve `last_request` — pvxs `CANCEL_REQUEST`
+            //      (`serverconn.cpp:262-289`) sets `state = Idle` but never
+            //      clears `ServerGPR::lastRequest`; the sticky destroy marker
+            //      survives, and `if(!op->lastRequest) op->lastRequest = ...`
+            //      keeps it true on the next EXEC (`serverget.cpp:470-471`) so
+            //      that EXEC's `doReply` cleans the op up after replying
+            //      (`serverget.cpp:111-114`). The fresh op-instance id from
+            //      step 2 already neutralizes the canceled task's late
+            //      completion, so the sticky marker only takes effect on a
+            //      genuine re-EXEC's reply — clearing it here would leak an op
+            //      pvxs would have released;
             //   4. drop the abort guard — aborting the spawned task both
             //      prevents its late reply AND drops the in-flight source
             //      future, which is the Rust structured-concurrency
@@ -4917,7 +4926,6 @@ fn handle_cancel_request(
             //      the source call, with no separate source-facing hook.
             op.exec_state = ExecState::Idle;
             op.monitor_op_id = next_op_id();
-            op.last_request = false;
             op.data_task_abort = None;
         }
     }
@@ -9946,6 +9954,8 @@ mod tests {
         op.data_task_abort = Some(abort);
         op.last_request = true; // a last-request EXEC that is now cancelled
         let old_op_id = op.monitor_op_id;
+        // Regression R0604-PVASRV-CANCEL-LASTREQUEST-1: the sticky destroy
+        // marker must SURVIVE this cancel (asserted below).
 
         let mut channels: HashMap<u32, ChannelState> = HashMap::new();
         let mut ops = HashMap::new();
@@ -9987,8 +9997,10 @@ mod tests {
             "cancel must mint a fresh op-instance id so the stale ExecFinished is ignored"
         );
         assert!(
-            !op.last_request,
-            "cancel clears last_request — the op survives for re-EXEC"
+            op.last_request,
+            "cancel must PRESERVE the sticky last_request marker (pvxs \
+             serverconn.cpp:262-289 never clears ServerGPR::lastRequest); \
+             the op survives Idle for re-EXEC and that EXEC's reply cleans it up"
         );
 
         // A subsequent EXEC is accepted now that the op is Idle.
@@ -10003,6 +10015,106 @@ mod tests {
         assert!(
             outcome.unwrap_err().is_cancelled(),
             "cancel must abort the in-flight non-monitor task"
+        );
+    }
+
+    /// Regression R0604-PVASRV-CANCEL-LASTREQUEST-1. pvxs `CANCEL_REQUEST`
+    /// (`serverconn.cpp:262-289`) sets an executing op `Idle` but never clears
+    /// `ServerGPR::lastRequest`. A client may therefore send a last-request
+    /// EXEC, cancel it before the source replies, then send a non-last EXEC:
+    /// the sticky marker keeps `lastRequest` true on that next EXEC
+    /// (`serverget.cpp:470-471`) so its `doReply` cleans the op up after
+    /// replying (`serverget.cpp:111-114`). The pre-fix Rust handler cleared
+    /// `last_request` on cancel, leaving the op live after the next reply —
+    /// leaking an op pvxs would have released. This drives the lifecycle
+    /// through the read-loop owner directly (no spawned tasks): cancel must
+    /// preserve the marker, the stale canceled task's late completion must be
+    /// ignored by the ABA guard, and the re-EXEC's completion must remove the
+    /// op because the sticky marker survived.
+    #[test]
+    fn cancel_preserves_last_request_so_next_exec_completion_destroys_op() {
+        let order = ByteOrder::Little;
+        let sid: u32 = 9;
+        let ioid: u32 = 123;
+
+        let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
+        let mut op = non_monitor_op_state(FieldDesc::Variant, OpKind::Get, BitSet::new());
+        op.exec_state = ExecState::Executing;
+        op.last_request = true; // a last-request EXEC, now about to be cancelled
+        let stale_op_id = op.monitor_op_id;
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut ops = HashMap::new();
+        ops.insert(ioid, op);
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(FieldDesc::Variant),
+                source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                ops,
+            },
+        );
+
+        // Cancel the in-flight last-request EXEC.
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        let frame = synth_frame(Command::CancelRequest, order, payload);
+        handle_cancel_request(&frame, &mut channels).expect("well-formed CancelRequest");
+
+        // The op survives Idle with the sticky marker preserved and a fresh
+        // op-instance id.
+        let live = &channels[&sid].ops[&ioid];
+        assert_eq!(
+            live.exec_state,
+            ExecState::Idle,
+            "cancel returns op to Idle"
+        );
+        assert!(live.last_request, "cancel must preserve the sticky marker");
+        assert_ne!(
+            live.monitor_op_id, stale_op_id,
+            "cancel mints a fresh op-instance id"
+        );
+
+        // The canceled task's late ExecFinished (carrying the stale op id) is
+        // ignored by the ABA guard: the op must NOT be removed here, despite
+        // last_request being true.
+        apply_exec_finish(
+            &mut channels,
+            ExecFinished {
+                sid,
+                ioid,
+                op_id: stale_op_id,
+            },
+        );
+        assert!(
+            channels[&sid].ops.contains_key(&ioid),
+            "stale completion (old op id) must not destroy the re-EXEC-able op"
+        );
+
+        // A subsequent EXEC is accepted; capture its op-instance id.
+        let exec_id = begin_exec(channels.get_mut(&sid).unwrap(), ioid)
+            .expect("a non-last EXEC is accepted after cancel");
+
+        // That EXEC's reply completes. Because the sticky last_request marker
+        // survived the cancel, the completion owner removes the op — matching
+        // pvxs cleanup-after-reply for a last-request op.
+        apply_exec_finish(
+            &mut channels,
+            ExecFinished {
+                sid,
+                ioid,
+                op_id: exec_id,
+            },
+        );
+        assert!(
+            !channels[&sid].ops.contains_key(&ioid),
+            "the re-EXEC's reply must destroy the op (sticky last_request), \
+             matching pvxs serverget.cpp:111-114"
         );
     }
 

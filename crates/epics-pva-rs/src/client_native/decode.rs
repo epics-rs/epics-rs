@@ -352,16 +352,24 @@ pub enum OpResponse {
 /// response so we can decode data payloads; for INIT responses
 /// themselves, pass `None`.
 ///
-/// This wrapper cannot resolve `0xFD`/`0xFE` type-cache markers that
-/// reference a slot defined by an *earlier* frame on the connection,
-/// because each call starts from an empty cache. Production op paths
-/// MUST therefore use [`decode_op_response_cached`] with the
-/// connection-scoped cache (`ServerConn::type_cache()`); pvxs decodes
-/// INIT descriptors and DATA values through one shared connection
-/// `rxRegistry` (`clientget.cpp:410-451`). This empty-cache form exists
-/// only for fuzz/test harnesses that intentionally start from a clean
-/// connection and for self-contained frames known to carry no nested
-/// cache references.
+/// This is the production op-decode entry. It is sound with an empty
+/// cache because the reader side ([`flatten_type_cache_markers`]) has
+/// already rewritten every `0xFD`/`0xFE` type-cache marker — both the
+/// INIT descriptor and any `any`/`variant` value markers — into a single
+/// self-contained frame in wire order before the frame ever reaches an op
+/// task (Regression R0604-PVACLI-DATA-TYPECACHE-SPLIT-OWNER-1). With the
+/// markers resolved into inline types, no shared connection-level registry
+/// is needed here, so op tasks carry no cross-frame decode state and cannot
+/// race over a shared cache. pvxs keeps one `rxRegistry` per connection
+/// (`clientget.cpp:410-451`); we move that single-owner resolution entirely
+/// to the reader so the per-op decode is pure.
+///
+/// [`decode_op_response_cached`] remains for the value-decode plumbing
+/// (which threads a `&mut TypeCache` down to `decode_pv_field_*_cached`)
+/// and for tests that intentionally pre-seed a cache to exercise the
+/// marker path directly.
+///
+/// [`flatten_type_cache_markers`]: crate::client_native::decode::flatten_type_cache_markers
 pub fn decode_op_response(
     frame: &Frame,
     introspection: Option<&FieldDesc>,
@@ -370,8 +378,13 @@ pub fn decode_op_response(
     decode_op_response_cached(frame, introspection, &mut empty)
 }
 
-/// Like [`decode_op_response`] but threads a per-connection
+/// Like [`decode_op_response`] but threads a
 /// [`TypeCache`](crate::pvdata::encode::TypeCache) for 0xFD/0xFE marker support.
+///
+/// Production op paths use [`decode_op_response`] (empty cache) because the
+/// reader has already flattened markers into self-contained frames; this
+/// form exists for the internal value-decode plumbing and for tests that
+/// pre-seed a cache to exercise the raw marker path.
 pub fn decode_op_response_cached(
     frame: &Frame,
     introspection: Option<&FieldDesc>,
@@ -541,9 +554,11 @@ pub fn decode_op_response_cached(
 
 // ─── Type-cache marker flattening (reader-task owned) ───────────────────
 
-/// Resolve any 0xFD/0xFE type-cache markers in an inbound op-response
-/// frame, rewriting the frame payload to carry self-contained inline
-/// descriptors.
+/// Resolve 0xFD/0xFE type-cache markers in an inbound op-response frame —
+/// both in the leading FieldDesc region (INIT introspection, PUT_GET
+/// putIF/getIF, GET_FIELD type, RPC data type) AND inside `any`
+/// (Variant / VariantArray) value payloads of DATA frames — rewriting the
+/// payload to carry self-contained inline descriptors.
 ///
 /// **Why this runs in the reader task.** Type-cache markers (`0xFD`
 /// define / `0xFE` reference) only resolve correctly if every define is
@@ -552,139 +567,319 @@ pub fn decode_op_response_cached(
 /// per-op tasks are scheduled by tokio in arbitrary order, so decoding a
 /// `0xFE` reference in a per-op task could race ahead of the `0xFD`
 /// define carried by an earlier (but not-yet-decoded) frame on a
-/// different op. Flattening here, against a reader-task-owned `cache`,
-/// makes the routed frames self-contained: per-op decoders never touch a
-/// shared cache and the race is structurally impossible.
+/// different op. Flattening here, against the reader-task-owned `cache`,
+/// makes the routed frames self-contained: per-op decoders decode with an
+/// empty cache and the race is structurally impossible. pvxs resolves both
+/// INIT descriptors and value-embedded `any` types through the one
+/// connection `rxRegistry` (`dataencode.cpp:542`, `clientget.cpp:410-451`);
+/// folding the value markers into the same reader-owned cache is the parity
+/// equivalent.
 ///
-/// `cache` is owned by the reader task and threaded across every frame on
-/// the connection. On any parse difficulty the frame payload is left
-/// untouched — the per-op decoder will then surface a precise error
-/// rather than this function masking it.
+/// `cache` holds the type-cache slots (pvxs `rxRegistry`); `introspection`
+/// maps an in-flight IOID to the FieldDesc captured from its INIT response,
+/// so a later DATA frame's `any`-bearing value can be walked. Both are
+/// owned by the reader task and threaded across every frame in wire order.
+/// The introspection entry is dropped on MONITOR FINISH here, and on any
+/// op's teardown via
+/// [`ServerConn::unregister_ioid`](crate::client_native::server_conn::ServerConn::unregister_ioid).
 ///
-/// Invariant: only the reader task calls this, and exactly once per
-/// inbound application frame, in wire order.
-pub fn flatten_type_cache_markers(frame: &mut Frame, cache: &mut crate::pvdata::encode::TypeCache) {
+/// ChannelArray (`Command::Array`) is intentionally NOT handled here: its
+/// DATA frame layout is sub-op dependent (getArray value vs getLength size
+/// vs empty) and cannot be determined from the frame alone, so its INIT and
+/// DATA legs resolve markers against an op-local cache in
+/// [`op_array_data`](crate::client_native::ops_v2). That op runs both legs
+/// on one task in wire order, so the op-local cache is correctly ordered;
+/// the narrow consequence is that an Array value may not resolve a slot a
+/// *different* op defined on the same connection.
+///
+/// On any parse difficulty the frame payload is left untouched — the per-op
+/// decoder will then surface a precise error rather than this masking it.
+///
+/// Invariant: only the reader task calls this, exactly once per inbound
+/// application frame, in wire order.
+pub fn flatten_type_cache_markers(
+    frame: &mut Frame,
+    cache: &mut crate::pvdata::encode::TypeCache,
+    introspection: &dashmap::DashMap<u32, FieldDesc>,
+) {
     let order = frame.header.flags.byte_order();
     let Some(cmd) = Command::from_code(frame.header.command) else {
         return;
     };
+    let Some(ioid) = peek_u32(&frame.payload, 0, order) else {
+        return;
+    };
 
-    // Descriptor count carried after `ioid + subcmd + status`:
-    //   0 — no descriptor (drop the frame through untouched)
-    //   1 — Get/Put/Monitor/Rpc/GetField introspection or Rpc data type
-    //   2 — PutGet INIT: putIF then getIF
-    let desc_count: u8 = match cmd {
+    match cmd {
         Command::GetField => {
-            // ioid(4) + status + [type-desc] — no subcmd byte, unlike the
-            // op responses below. Mirrors `decode_get_field_response`,
-            // which reads `ioid` (u32, 4 bytes) then `Status`.
+            // ioid(4) + status + [type-desc] — no subcmd byte. There is no
+            // DATA value follow-up to value-flatten, so no introspection
+            // capture is needed.
             rewrite_after_status(frame, order, cache, 4, 1);
-            return;
         }
         Command::Get | Command::Put | Command::Monitor => {
             let Some(subcmd) = peek_u8(&frame.payload, 4) else {
                 return;
             };
-            // INIT phase carries the introspection; FINISH (0x10) does
-            // not; DATA phase carries no descriptor (uses INIT's type).
-            if subcmd & 0x08 != 0 && subcmd & 0x10 == 0 {
-                1
-            } else {
+            // MONITOR FINISH (status-only, MONITOR-specific) drops the op.
+            // For GET/PUT the same 0x10 bit is the last-request marker on an
+            // otherwise normal DATA response, so it must NOT short-circuit.
+            if cmd == Command::Monitor && subcmd & 0x10 != 0 {
+                introspection.remove(&ioid);
                 return;
             }
+            if subcmd & 0x08 != 0 {
+                // INIT: flatten the single introspection descriptor and
+                // capture it for the matching DATA frame(s).
+                if let Some(descs) = rewrite_after_status(frame, order, cache, 5, 1) {
+                    if let Some(d) = descs.into_iter().next() {
+                        introspection.insert(ioid, d);
+                    }
+                }
+                return;
+            }
+            // DATA: flatten markers inside the value using captured intro.
+            flatten_op_data_value(frame, order, cache, cmd, ioid, introspection);
         }
         Command::Rpc => {
             let Some(subcmd) = peek_u8(&frame.payload, 4) else {
                 return;
             };
             if subcmd & 0x10 != 0 {
+                introspection.remove(&ioid);
                 return; // FINISH/DESTROY
             }
             if subcmd & 0x08 != 0 {
                 return; // RPC INIT carries no type descriptor
             }
-            1 // RPC data response: status + type + value
+            // RPC DATA: ioid+subcmd+status+type+full_value. The type is in
+            // the frame; flatten it, then walk the fully-present value.
+            flatten_rpc_data_value(frame, order, cache);
         }
         Command::PutGet => {
             let Some(subcmd) = peek_u8(&frame.payload, 4) else {
                 return;
             };
-            if subcmd & 0x08 != 0 && subcmd & 0x10 == 0 {
-                2 // PutGet INIT: putIF + getIF
-            } else {
+            if subcmd & 0x10 != 0 {
+                introspection.remove(&ioid);
                 return;
             }
+            if subcmd & 0x08 != 0 {
+                // INIT: putIF + getIF. Capture getIF — the DATA value type.
+                if let Some(descs) = rewrite_after_status(frame, order, cache, 5, 2) {
+                    if let Some(get_if) = descs.into_iter().nth(1) {
+                        introspection.insert(ioid, get_if);
+                    }
+                }
+                return;
+            }
+            // DATA: ioid+subcmd+status+getChanged+getValue → flatten value.
+            flatten_op_data_value(frame, order, cache, cmd, ioid, introspection);
         }
-        _ => return,
-    };
-
-    // ioid(4) + subcmd(1) + status, then `desc_count` descriptors.
-    rewrite_after_status(frame, order, cache, 5, desc_count);
+        _ => {}
+    }
 }
 
 /// Rewrite a frame whose layout is `prefix_len` fixed bytes, then a
 /// `Status`, then `desc_count` type descriptors, then an arbitrary tail.
 ///
-/// The fixed prefix, the `Status` bytes, and the tail are copied
-/// verbatim; each descriptor is flattened through [`crate::pvdata::encode
-/// ::rewrite_type_desc_inline`]. On a failure status the descriptors are
-/// absent — the function detects this via the `Status` parse and leaves
-/// the (descriptor-free) frame untouched.
+/// The fixed prefix, the `Status` bytes, and the tail are copied verbatim;
+/// each descriptor is decoded against `cache` (resolving 0xFD/0xFE markers)
+/// and re-emitted inline. Returns the decoded descriptors in wire order so
+/// the caller can capture an op's introspection. Returns `None` when the
+/// frame is short, the status is non-success (descriptors absent), or a
+/// descriptor fails to resolve — in which case the frame is left untouched.
 fn rewrite_after_status(
     frame: &mut Frame,
     order: ByteOrder,
     cache: &mut crate::pvdata::encode::TypeCache,
     prefix_len: usize,
     desc_count: u8,
-) {
+) -> Option<Vec<FieldDesc>> {
     if frame.payload.len() < prefix_len {
-        return;
+        return None;
     }
     let mut cur = Cursor::new(frame.payload.as_slice());
     cur.set_position(prefix_len as u64);
-    let status = match Status::decode(&mut cur, order) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
+    let status = Status::decode(&mut cur, order).ok()?;
     // A non-success status has no trailing descriptor (mirrors the
     // decoder fast-paths in `decode_op_response_cached`).
     if !status.is_success() {
-        return;
+        return None;
     }
     let descs_start = cur.position() as usize;
 
-    // Flatten each descriptor in order, capturing where the descriptor
-    // region ends so the value tail can be copied verbatim.
+    // Decode + re-emit each descriptor inline, capturing it so the caller
+    // can record the op's introspection.
     let mut inline = Vec::new();
+    let mut descs = Vec::with_capacity(desc_count as usize);
     for _ in 0..desc_count {
-        if crate::pvdata::encode::rewrite_type_desc_inline(&mut cur, order, cache, &mut inline)
-            .is_err()
-        {
-            // Markers unresolved or malformed — leave the frame as-is so
-            // the per-op decoder surfaces the precise error.
-            return;
-        }
+        let d = crate::pvdata::encode::decode_type_desc_cached(&mut cur, order, cache).ok()?;
+        crate::pvdata::encode::encode_type_desc(&d, order, &mut inline);
+        descs.push(d);
     }
     let descs_end = cur.position() as usize;
 
     // Fast path: if the descriptor region already had no markers the
     // flattened bytes are byte-identical; skip the realloc.
-    if inline.as_slice() == &frame.payload[descs_start..descs_end] {
+    if inline.as_slice() != &frame.payload[descs_start..descs_end] {
+        let mut rebuilt =
+            Vec::with_capacity(descs_start + inline.len() + (frame.payload.len() - descs_end));
+        rebuilt.extend_from_slice(&frame.payload[..descs_start]);
+        rebuilt.extend_from_slice(&inline);
+        rebuilt.extend_from_slice(&frame.payload[descs_end..]);
+        frame.header.payload_length = rebuilt.len() as u32;
+        frame.payload = rebuilt;
+    }
+    Some(descs)
+}
+
+/// Flatten 0xFD/0xFE markers embedded in `any` payloads of a
+/// GET/PUT/MONITOR/PUT_GET DATA value, in place. `cmd` selects the frame
+/// layout; the value type is the introspection captured from the op's INIT.
+/// On any difficulty the frame is left as-is for the per-op decoder.
+fn flatten_op_data_value(
+    frame: &mut Frame,
+    order: ByteOrder,
+    cache: &mut crate::pvdata::encode::TypeCache,
+    cmd: Command,
+    ioid: u32,
+    introspection: &dashmap::DashMap<u32, FieldDesc>,
+) {
+    // Clone the captured introspection and drop the DashMap read guard
+    // before the (potentially multi-MiB) value walk — never hold a shard
+    // lock across the walk.
+    let Some(intro) = introspection.get(&ioid).map(|r| r.value().clone()) else {
+        return;
+    };
+    // Cheap gate: a value with no Variant/VariantArray anywhere cannot
+    // carry an embedded marker — keep the zero-copy verbatim path.
+    if !crate::pvdata::encode::desc_contains_variant(&intro) {
         return;
     }
 
-    let mut rebuilt =
-        Vec::with_capacity(descs_start + inline.len() + (frame.payload.len() - descs_end));
-    rebuilt.extend_from_slice(&frame.payload[..descs_start]);
-    rebuilt.extend_from_slice(&inline);
-    rebuilt.extend_from_slice(&frame.payload[descs_end..]);
-    frame.header.payload_length = rebuilt.len() as u32;
-    frame.payload = rebuilt;
+    // Locate the value start and decode the changed BitSet. ioid(4) +
+    // subcmd(1) = 5, then a Status for GET/PUT/PUT_GET (MONITOR DATA carries
+    // none), then the changed BitSet. Any early return leaves the frame as-is.
+    let (value_start, changed) = {
+        let mut cur = Cursor::new(frame.payload.as_slice());
+        cur.set_position(5);
+        if matches!(cmd, Command::Get | Command::Put | Command::PutGet) {
+            match Status::decode(&mut cur, order) {
+                Ok(s) if s.is_success() => {}
+                // status-only error reply (no value) or undecodable status.
+                _ => return,
+            }
+        }
+        // A PUT data response without GetBack (subcmd & 0x40 == 0) is
+        // status-only — there is no value to flatten.
+        if cmd == Command::Put {
+            match peek_u8(&frame.payload, 4) {
+                Some(subcmd) if subcmd & 0x40 != 0 => {}
+                _ => return,
+            }
+        }
+        let changed = match BitSet::decode(&mut cur, order) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        (cur.position() as usize, changed)
+    };
+
+    match crate::pvdata::encode::flatten_value_markers(
+        &frame.payload,
+        value_start,
+        &intro,
+        &changed,
+        order,
+        cache,
+    ) {
+        Ok((value_end, Some(rewritten))) => {
+            // Tail (MONITOR overrun BitSet, else nothing) copied verbatim.
+            let mut rebuilt = Vec::with_capacity(
+                value_start + rewritten.len() + (frame.payload.len() - value_end),
+            );
+            rebuilt.extend_from_slice(&frame.payload[..value_start]);
+            rebuilt.extend_from_slice(&rewritten);
+            rebuilt.extend_from_slice(&frame.payload[value_end..]);
+            frame.header.payload_length = rebuilt.len() as u32;
+            frame.payload = rebuilt;
+        }
+        // No marker rewritten → value already self-contained, route verbatim.
+        Ok((_, None)) => {}
+        // Malformed → leave as-is; the per-op decoder surfaces the error.
+        Err(_) => {}
+    }
+}
+
+/// Flatten an RPC DATA frame: `ioid+subcmd+status+type+full_value`. The type
+/// descriptor is in the frame; flatten it (capturing the decoded FieldDesc),
+/// then walk the fully-present value against the same connection cache.
+fn flatten_rpc_data_value(
+    frame: &mut Frame,
+    order: ByteOrder,
+    cache: &mut crate::pvdata::encode::TypeCache,
+) {
+    // Flatten the in-frame type descriptor (after ioid+subcmd+status) first,
+    // registering its 0xFD defines into `cache` so a value-tail 0xFE can
+    // resolve them.
+    let Some(resp_desc) =
+        rewrite_after_status(frame, order, cache, 5, 1).and_then(|descs| descs.into_iter().next())
+    else {
+        return;
+    };
+    if !crate::pvdata::encode::desc_contains_variant(&resp_desc) {
+        return;
+    }
+    // Re-locate the value start in the (possibly rebuilt) frame: skip the
+    // status and the now-inline type descriptor.
+    let value_start = {
+        let mut cur = Cursor::new(frame.payload.as_slice());
+        cur.set_position(5);
+        if Status::decode(&mut cur, order).is_err() {
+            return;
+        }
+        if crate::pvdata::encode::decode_type_desc(&mut cur, order).is_err() {
+            return;
+        }
+        cur.position() as usize
+    };
+
+    match crate::pvdata::encode::flatten_value_markers_full(
+        &frame.payload,
+        value_start,
+        &resp_desc,
+        order,
+        cache,
+    ) {
+        Ok((value_end, Some(rewritten))) => {
+            let mut rebuilt = Vec::with_capacity(
+                value_start + rewritten.len() + (frame.payload.len() - value_end),
+            );
+            rebuilt.extend_from_slice(&frame.payload[..value_start]);
+            rebuilt.extend_from_slice(&rewritten);
+            rebuilt.extend_from_slice(&frame.payload[value_end..]);
+            frame.header.payload_length = rebuilt.len() as u32;
+            frame.payload = rebuilt;
+        }
+        Ok((_, None)) => {}
+        Err(_) => {}
+    }
 }
 
 /// Read a single byte at `off` from a payload slice, `None` if short.
 fn peek_u8(payload: &[u8], off: usize) -> Option<u8> {
     payload.get(off).copied()
+}
+
+/// Read a u32 at `off` from a payload slice in `order`, `None` if short.
+fn peek_u32(payload: &[u8], off: usize, order: ByteOrder) -> Option<u32> {
+    let b = payload.get(off..off.checked_add(4)?)?;
+    let arr = [b[0], b[1], b[2], b[3]];
+    Some(match order {
+        ByteOrder::Big => u32::from_be_bytes(arr),
+        ByteOrder::Little => u32::from_le_bytes(arr),
+    })
 }
 
 // ─── GET_FIELD response ──────────────────────────────────────────────────
@@ -931,8 +1126,9 @@ mod tests {
 
         // Reader task flattens both frames in strict WIRE order: A then B.
         let mut reader_cache = crate::pvdata::encode::TypeCache::new();
-        flatten_type_cache_markers(&mut frame_a, &mut reader_cache);
-        flatten_type_cache_markers(&mut frame_b, &mut reader_cache);
+        let reader_intro = dashmap::DashMap::new();
+        flatten_type_cache_markers(&mut frame_a, &mut reader_cache, &reader_intro);
+        flatten_type_cache_markers(&mut frame_b, &mut reader_cache, &reader_intro);
 
         // After flattening neither frame carries a marker — both are
         // self-contained inline descriptors.
@@ -969,17 +1165,20 @@ mod tests {
         }
     }
 
-    /// A data-phase value carrying an `any`/`variant` `0xFE <slot>`
-    /// back-reference must resolve against the connection-scoped
-    /// `TypeCache` that an earlier frame populated — exactly what pvxs does
-    /// by decoding every DATA value through the same connection
-    /// `rxRegistry` (`clientget.cpp:445-451`, `dataencode.cpp:542-557`).
-    /// `decode_op_response_cached` must thread that cache into the value
-    /// body, not just the top-level INIT descriptor; the empty-cache
-    /// `decode_op_response` wrapper cannot and reports a spurious slot miss
-    /// (the defect this closes).
+    /// Unit test of the low-level [`decode_op_response_cached`] value-body
+    /// marker plumbing: a data-phase `any`/`variant` value carrying a
+    /// `0xFE <slot>` back-reference resolves against the `TypeCache` passed
+    /// in, and an empty cache misses. This is the decode-side mirror of what
+    /// the reader's `flatten_value_markers` does in wire order.
+    ///
+    /// In *production* (Regression R0604-PVACLI-DATA-TYPECACHE-SPLIT-OWNER-1)
+    /// op tasks no longer thread any shared cache: the reader has already
+    /// flattened value markers into self-contained inline types before the
+    /// frame is routed, so the per-op decode runs with an empty cache. See
+    /// `reader_flatten_resolves_variant_value_marker_into_self_contained_frame`
+    /// for the end-to-end regression that exercises that path.
     #[test]
-    fn op_data_variant_value_resolves_via_connection_type_cache() {
+    fn decode_op_cached_resolves_variant_value_marker() {
         use crate::proto::WriteExt;
         use crate::pvdata::{PvField, ScalarType, ScalarValue};
 
@@ -1038,6 +1237,205 @@ mod tests {
             decode_op_response_cached(&build(), Some(&intro), &mut empty).is_err(),
             "0xFE slot-5 reference must miss without the connection cache that defined it"
         );
+    }
+
+    /// End-to-end regression for R0604-PVACLI-DATA-TYPECACHE-SPLIT-OWNER-1.
+    ///
+    /// The reader task flattens BOTH the INIT introspection descriptor AND
+    /// the `any`/`variant` `0xFE <slot>` markers inside a later DATA value
+    /// into one reader-owned cache, in wire order. After flattening, the
+    /// routed DATA frame is self-contained, so the per-op decoder resolves
+    /// the variant with an EMPTY cache and no shared connection state.
+    ///
+    /// Pre-fix the reader flattened only the descriptor region; the DATA
+    /// value's `0xFE <slot>` was copied verbatim and the per-op decode (empty
+    /// cache, after `ServerConn::type_cache` removal) reported a spurious
+    /// slot miss → connection close. With the value flatten disabled this
+    /// test fails on the empty-cache decode below.
+    #[test]
+    fn reader_flatten_resolves_variant_value_marker_into_self_contained_frame() {
+        use crate::proto::WriteExt;
+        use crate::pvdata::{PvField, ScalarType, ScalarValue};
+
+        let order = ByteOrder::Little;
+        let ioid = 9u32;
+        // GET introspection: a structure with one `any` (Variant) leaf.
+        let intro = FieldDesc::Structure {
+            struct_id: "x".into(),
+            fields: vec![("v".into(), FieldDesc::Variant)],
+        };
+
+        // Reader-owned state, threaded across frames in strict wire order.
+        let mut reader_cache = crate::pvdata::encode::TypeCache::new();
+        let reader_intro = dashmap::DashMap::new();
+        // Slot 5 was defined earlier on this connection (a prior 0xFD
+        // define); it lives in the reader cache — the single owner.
+        reader_cache.insert(5, FieldDesc::Scalar(ScalarType::Int));
+
+        // Frame 1: INIT (subcmd 0x08) carrying the introspection inline. The
+        // reader captures it for this IOID so a later DATA value can be
+        // walked.
+        let mut init = Vec::new();
+        init.put_u32(ioid, order);
+        init.put_u8(0x08);
+        Status::ok().write_into(order, &mut init);
+        crate::pvdata::encode::encode_type_desc(&intro, order, &mut init);
+        let mut init_frame = Frame {
+            header: PvaHeader::application(true, order, Command::Get.code(), init.len() as u32),
+            payload: init,
+        };
+        flatten_type_cache_markers(&mut init_frame, &mut reader_cache, &reader_intro);
+        assert!(
+            reader_intro.contains_key(&ioid),
+            "reader must capture INIT introspection per-IOID"
+        );
+
+        // Frame 2: DATA (subcmd 0x00). value = Variant whose body is
+        // `0xFE <slot=5> <Int 42 LE>` — a back-reference to slot 5.
+        let mut data = Vec::new();
+        data.put_u32(ioid, order);
+        data.put_u8(0x00);
+        Status::ok().write_into(order, &mut data);
+        let mut changed = BitSet::new();
+        changed.set(0); // whole structure present
+        data.extend_from_slice(&changed.encode(order));
+        data.extend_from_slice(&[0xFE, 0x05, 0x00, 0x2A, 0x00, 0x00, 0x00]);
+        let mut data_frame = Frame {
+            header: PvaHeader::application(true, order, Command::Get.code(), data.len() as u32),
+            payload: data,
+        };
+        let pre = data_frame.payload.clone();
+        flatten_type_cache_markers(&mut data_frame, &mut reader_cache, &reader_intro);
+        assert_ne!(
+            data_frame.payload, pre,
+            "reader must rewrite the variant value marker inline"
+        );
+        assert_eq!(
+            data_frame.header.payload_length as usize,
+            data_frame.payload.len(),
+            "rewritten frame length must match payload"
+        );
+
+        // The routed DATA frame is self-contained: the per-op decoder
+        // resolves the variant with an EMPTY cache (no shared state).
+        match decode_op_response(&data_frame, Some(&intro)).unwrap() {
+            OpResponse::Data(d) => match d.value {
+                PvField::Structure(s) => {
+                    assert_eq!(s.fields.len(), 1);
+                    match &s.fields[0].1 {
+                        PvField::Variant(vv) => {
+                            assert_eq!(vv.desc, Some(FieldDesc::Scalar(ScalarType::Int)));
+                            assert!(matches!(vv.value, PvField::Scalar(ScalarValue::Int(42))));
+                        }
+                        other => panic!("expected Variant leaf, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Structure value, got {other:?}"),
+            },
+            other => panic!("expected Data, got {other:?}"),
+        }
+    }
+
+    /// Two concurrent ops, wire-order value-marker resolution
+    /// (R0604-PVACLI-DATA-TYPECACHE-SPLIT-OWNER-1). One op's DATA value
+    /// *defines* a slot inline via `0xFD`; a later op's DATA value
+    /// *references* it via `0xFE`. Because the reader flattens in strict
+    /// wire order through one owned cache, the define is folded before the
+    /// reference, and BOTH routed frames are self-contained — the per-op
+    /// decoders (empty cache, arbitrary order) both succeed. This is the
+    /// value-marker analogue of the descriptor-region cross-op race fixed by
+    /// `type_cache_reference_decodes_before_define_after_flatten`.
+    #[test]
+    fn reader_flatten_value_markers_resolve_in_wire_order_across_ioids() {
+        use crate::proto::WriteExt;
+        use crate::pvdata::{PvField, ScalarType, ScalarValue};
+
+        let order = ByteOrder::Little;
+        let intro_a = FieldDesc::Structure {
+            struct_id: "a".into(),
+            fields: vec![("v".into(), FieldDesc::Variant)],
+        };
+        let intro_b = FieldDesc::Structure {
+            struct_id: "b".into(),
+            fields: vec![("u".into(), FieldDesc::Variant)],
+        };
+
+        let mut reader_cache = crate::pvdata::encode::TypeCache::new();
+        let reader_intro = dashmap::DashMap::new();
+
+        // Build a GET frame (server direction) with the given payload.
+        let mk = |payload: Vec<u8>| Frame {
+            header: PvaHeader::application(true, order, Command::Get.code(), payload.len() as u32),
+            payload,
+        };
+        let init_frame = |ioid: u32, desc: &FieldDesc| -> Frame {
+            let mut p = Vec::new();
+            p.put_u32(ioid, order);
+            p.put_u8(0x08);
+            Status::ok().write_into(order, &mut p);
+            crate::pvdata::encode::encode_type_desc(desc, order, &mut p);
+            mk(p)
+        };
+        // DATA frame `ioid` whose single Variant leaf carries `variant_body`.
+        let data_frame = |ioid: u32, variant_body: &[u8]| -> Frame {
+            let mut p = Vec::new();
+            p.put_u32(ioid, order);
+            p.put_u8(0x00);
+            Status::ok().write_into(order, &mut p);
+            let mut changed = BitSet::new();
+            changed.set(0);
+            p.extend_from_slice(&changed.encode(order));
+            p.extend_from_slice(variant_body);
+            mk(p)
+        };
+
+        // Inline Int descriptor bytes for the `0xFD` define body.
+        let mut int_desc = Vec::new();
+        crate::pvdata::encode::encode_type_desc(
+            &FieldDesc::Scalar(ScalarType::Int),
+            order,
+            &mut int_desc,
+        );
+
+        // ioid 10's value DEFINES slot 5 = Int inline, value 7.
+        let mut def_body = vec![0xFD, 0x05, 0x00];
+        def_body.extend_from_slice(&int_desc);
+        def_body.extend_from_slice(&7i32.to_le_bytes());
+        // ioid 9's value REFERENCES slot 5, value 42.
+        let ref_body = [0xFE, 0x05, 0x00, 0x2A, 0x00, 0x00, 0x00];
+
+        // WIRE ORDER: INIT 9, INIT 10, DATA 10 (define), DATA 9 (reference).
+        let mut f_init9 = init_frame(9, &intro_a);
+        let mut f_init10 = init_frame(10, &intro_b);
+        let mut f_data10 = data_frame(10, &def_body);
+        let mut f_data9 = data_frame(9, &ref_body);
+        flatten_type_cache_markers(&mut f_init9, &mut reader_cache, &reader_intro);
+        flatten_type_cache_markers(&mut f_init10, &mut reader_cache, &reader_intro);
+        flatten_type_cache_markers(&mut f_data10, &mut reader_cache, &reader_intro);
+        flatten_type_cache_markers(&mut f_data9, &mut reader_cache, &reader_intro);
+
+        // Per-op decode in REVERSE order (9 before 10) with empty caches:
+        // both routed frames are self-contained, so order does not matter.
+        let leaf_int = |frame: &Frame, intro: &FieldDesc| -> i32 {
+            match decode_op_response(frame, Some(intro)).unwrap() {
+                OpResponse::Data(d) => match d.value {
+                    PvField::Structure(s) => match &s.fields[0].1 {
+                        PvField::Variant(vv) => {
+                            assert_eq!(vv.desc, Some(FieldDesc::Scalar(ScalarType::Int)));
+                            match vv.value {
+                                PvField::Scalar(ScalarValue::Int(n)) => n,
+                                ref other => panic!("expected Int leaf, got {other:?}"),
+                            }
+                        }
+                        other => panic!("expected Variant leaf, got {other:?}"),
+                    },
+                    other => panic!("expected Structure value, got {other:?}"),
+                },
+                other => panic!("expected Data, got {other:?}"),
+            }
+        };
+        assert_eq!(leaf_int(&f_data9, &intro_a), 42, "reference op (ioid 9)");
+        assert_eq!(leaf_int(&f_data10, &intro_b), 7, "define op (ioid 10)");
     }
 
     /// a MONITOR DATA frame ends with an overrun bitset; the
@@ -1311,7 +1709,8 @@ mod tests {
         };
 
         let mut reader_cache = crate::pvdata::encode::TypeCache::new();
-        flatten_type_cache_markers(&mut frame, &mut reader_cache);
+        let reader_intro = dashmap::DashMap::new();
+        flatten_type_cache_markers(&mut frame, &mut reader_cache, &reader_intro);
         assert_eq!(
             frame.payload, payload,
             "marker-free frame must be unchanged"
@@ -1384,8 +1783,9 @@ mod tests {
 
         // Reader task flattens both frames in strict WIRE order: A then B.
         let mut reader_cache = crate::pvdata::encode::TypeCache::new();
-        flatten_type_cache_markers(&mut frame_a, &mut reader_cache);
-        flatten_type_cache_markers(&mut frame_b, &mut reader_cache);
+        let reader_intro = dashmap::DashMap::new();
+        flatten_type_cache_markers(&mut frame_a, &mut reader_cache, &reader_intro);
+        flatten_type_cache_markers(&mut frame_b, &mut reader_cache, &reader_intro);
 
         // After flattening neither frame carries a marker.
         assert_ne!(frame_a.payload[5], 0xFD);
@@ -1447,7 +1847,8 @@ mod tests {
         };
 
         let mut reader_cache = crate::pvdata::encode::TypeCache::new();
-        flatten_type_cache_markers(&mut frame, &mut reader_cache);
+        let reader_intro = dashmap::DashMap::new();
+        flatten_type_cache_markers(&mut frame, &mut reader_cache, &reader_intro);
         assert_eq!(
             frame.payload, payload,
             "marker-free GetField frame must be unchanged"
@@ -1475,7 +1876,8 @@ mod tests {
             payload: payload.clone(),
         };
         let mut reader_cache = crate::pvdata::encode::TypeCache::new();
-        flatten_type_cache_markers(&mut frame, &mut reader_cache);
+        let reader_intro = dashmap::DashMap::new();
+        flatten_type_cache_markers(&mut frame, &mut reader_cache, &reader_intro);
         assert_eq!(frame.payload, payload);
     }
 }

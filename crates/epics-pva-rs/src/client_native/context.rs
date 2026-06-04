@@ -2268,18 +2268,16 @@ impl PvaClient {
             }
             let frame_res = tokio::time::timeout(op_timeout, rx).await;
             let value = match frame_res {
-                // Decode through the same connection-scoped `TypeCache` the
-                // warm op's circuit owns, so a GET DATA value carrying an
-                // `any`/`variant` `0xFE <slot>` back-reference resolves
-                // against the slot a prior frame defined (pvxs reuses one
-                // `rxRegistry` for every value, `clientget.cpp:445-451`).
+                // Decode with no shared cache. The reader side
+                // (`flatten_type_cache_markers`) has already flattened every
+                // `0xFD`/`0xFE` type-cache marker — including any
+                // `any`/`variant` `0xFE <slot>` back-reference inside the GET
+                // DATA value — into a self-contained frame in wire order
+                // (Regression R0604-PVACLI-DATA-TYPECACHE-SPLIT-OWNER-1), so
+                // this frame embeds its own inline types.
                 // If the circuit is already gone the warm op cannot complete.
                 Ok(Ok(frame)) => match warm.server.upgrade() {
-                    Some(srv) => match super::decode::decode_op_response_cached(
-                        &frame,
-                        Some(&intro),
-                        &mut srv.type_cache().lock(),
-                    ) {
+                    Some(_) => match super::decode::decode_op_response(&frame, Some(&intro)) {
                         Ok(OpResponse::Data(d)) if d.status.is_success() => Ok(d.value),
                         Ok(OpResponse::Data(d)) => {
                             Err(PvaError::Protocol(format!("warm GET data: {:?}", d.status)))

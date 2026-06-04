@@ -151,8 +151,16 @@ pub struct ServerConn {
     /// server could satisfy a GET with a MONITOR-shaped frame
     /// because IOID alone is enough to find a registered sink.
     ioid_to_cmd: Arc<DashMap<u32, u8>>,
-    /// Per-connection FieldDesc cache for 0xFD/0xFE wire markers.
-    type_cache: Arc<Mutex<crate::pvdata::encode::TypeCache>>,
+    /// Per-IOID introspection captured by the reader task from each op's
+    /// INIT response (Get/Put/Monitor → the single descriptor; PUT_GET →
+    /// getIF). The reader consults it to value-flatten 0xFD/0xFE markers
+    /// embedded in an `any` DATA value (see
+    /// [`flatten_type_cache_markers`](crate::client_native::decode::flatten_type_cache_markers)).
+    /// Inserted on INIT, dropped on MONITOR FINISH and on
+    /// [`Self::unregister_ioid`]. The connection's single 0xFD/0xFE type-
+    /// cache lives reader-task-local (`reader_type_cache`) — there is no
+    /// shared decode-time cache, so per-op decoders never race over it.
+    op_introspection: Arc<DashMap<u32, crate::pvdata::FieldDesc>>,
     /// Per-channel (by server-assigned SID) byte counters + PV name, for
     /// pvxs `Context::report` per-channel `Report::Channel` parity
     /// (client.cpp:464-501). pvxs bumps `chan->statTx` on each op-body send
@@ -326,6 +334,8 @@ impl ServerConn {
             Arc::new(DashMap::new());
         let ioid_to_sid: Arc<DashMap<u32, u32>> = Arc::new(DashMap::new());
         let ioid_to_cmd: Arc<DashMap<u32, u8>> = Arc::new(DashMap::new());
+        let op_introspection: Arc<DashMap<u32, crate::pvdata::FieldDesc>> =
+            Arc::new(DashMap::new());
         let chan_stats: Arc<DashMap<u32, ChanStat>> = Arc::new(DashMap::new());
 
         // Writer task
@@ -369,6 +379,7 @@ impl ServerConn {
         let by_sid_close_reader = by_sid_close.clone();
         let ioid_to_sid_reader = ioid_to_sid.clone();
         let ioid_to_cmd_reader = ioid_to_cmd.clone();
+        let op_introspection_reader = op_introspection.clone();
         let chan_stats_reader = chan_stats.clone();
         let writer_tx_reader = writer_tx.clone();
         let out_order_reader = out_order.clone();
@@ -578,6 +589,7 @@ impl ServerConn {
                                 crate::client_native::decode::flatten_type_cache_markers(
                                     &mut dispatch_frame,
                                     &mut reader_type_cache,
+                                    &op_introspection_reader,
                                 );
                                 route_frame(dispatch_frame, &by_ioid_reader, &by_cid_reader, &by_sid_close_reader, &ioid_to_sid_reader, &ioid_to_cmd_reader, &chan_stats_reader, &writer_tx_reader, &cancel_reader);
                             }
@@ -601,6 +613,10 @@ impl ServerConn {
             by_sid_close_reader.clear();
             ioid_to_sid_reader.clear();
             ioid_to_cmd_reader.clear();
+            // Drop every captured op introspection — the conn is dying and
+            // no further DATA frames will reference it. Keeps the reader the
+            // single owner of this map's lifecycle on teardown.
+            op_introspection_reader.clear();
             // pvxs drops the per-channel counters with the connection
             // (Channel objects are torn down on disconnect); clear them so
             // a reconnect's fresh SIDs start from zero.
@@ -679,7 +695,7 @@ impl ServerConn {
             by_sid_close,
             ioid_to_sid,
             ioid_to_cmd,
-            type_cache: Arc::new(Mutex::new(crate::pvdata::encode::TypeCache::new())),
+            op_introspection,
             chan_stats,
         }))
     }
@@ -781,12 +797,6 @@ impl ServerConn {
     /// after a successful TLS handshake.
     pub fn is_tls(&self) -> bool {
         self.server_identity.is_some()
-    }
-
-    /// Get a clone of the per-connection FieldDesc cache (Arc shared).
-    /// Used by op decoders to resolve 0xFD/0xFE wire markers.
-    pub fn type_cache(&self) -> Arc<Mutex<crate::pvdata::encode::TypeCache>> {
-        self.type_cache.clone()
     }
 
     pub fn close(&self) {
@@ -911,6 +921,11 @@ impl ServerConn {
         self.by_ioid.remove(&ioid);
         self.ioid_to_sid.remove(&ioid);
         self.ioid_to_cmd.remove(&ioid);
+        // Drop the reader-captured introspection for this op. The reader is
+        // otherwise the only mutator (insert on INIT, remove on MONITOR
+        // FINISH); this covers GET/PUT/RPC and any op torn down before a
+        // FINISH so the map cannot leak across the op's lifetime.
+        self.op_introspection.remove(&ioid);
     }
 
     pub fn register_sid_close(

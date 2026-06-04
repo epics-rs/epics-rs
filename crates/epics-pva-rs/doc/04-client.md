@@ -119,9 +119,16 @@ connection. (This is a smell — see the kodex review memory; a slow
 monitor pile-up could grow unbounded. Bounded with a "lagged" event
 is the planned fix.)
 
-Type cache: each ServerConn carries its own `Arc<Mutex<TypeCache>>`,
-populated as `0xFD` markers arrive. `op_get` / `op_monitor` /
-`op_put` use it via `decode_op_response_cached`.
+Type cache: the connection **reader task** owns marker resolution. It
+flattens `0xFD`/`0xFE` markers — in both the type descriptor region and
+inside `any` DATA values — into self-contained inline frames, in strict
+wire order, against one reader-owned cache plus a per-IOID introspection
+map (`ServerConn::op_introspection`). `op_get` / `op_monitor` / `op_put`
+then decode the routed frames with `decode_op_response` and an empty
+cache — no shared op-side cache, no cross-op decode race. See
+`doc/07-introspection-cache.md` (Regression
+R0604-PVACLI-DATA-TYPECACHE-SPLIT-OWNER-1). ChannelArray keeps an
+op-local cache (its DATA layout is sub-op dependent).
 
 ## ops_v2
 

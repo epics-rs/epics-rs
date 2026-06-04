@@ -705,33 +705,6 @@ pub fn decode_type_desc_cached_with_policy(
     decode_type_desc_cached_at_depth(cur, order, cache, policy, 0)
 }
 
-/// Resolve a single type descriptor at the cursor against `cache`,
-/// appending its **inline** (marker-free) wire form to `out`.
-///
-/// This is the rewrite primitive used by the connection reader task to
-/// flatten 0xFD/0xFE type-cache markers out of inbound op-response frames
-/// before they are routed to per-op tasks. The reader task processes
-/// frames strictly in wire order, so a 0xFD define is always observed
-/// (and folded into `cache`) before any later 0xFE reference to the same
-/// slot. After rewriting, the routed frame carries a self-contained
-/// descriptor and per-op tasks can decode it with an empty cache — there
-/// is no cross-op decode-order dependency.
-///
-/// The cursor is advanced past exactly one type descriptor (including any
-/// nested markers). A `0xFD` define updates `cache`; a `0xFE` reference
-/// reads from it (and errors on a miss).
-pub fn rewrite_type_desc_inline(
-    cur: &mut Cursor<&[u8]>,
-    order: ByteOrder,
-    cache: &mut TypeCache,
-    out: &mut Vec<u8>,
-) -> Result<(), DecodeError> {
-    let desc =
-        decode_type_desc_cached_at_depth(cur, order, cache, BoundedStringPolicy::Interop, 0)?;
-    encode_type_desc(&desc, order, out);
-    Ok(())
-}
-
 fn decode_type_desc_cached_at_depth(
     cur: &mut Cursor<&[u8]>,
     order: ByteOrder,
@@ -1726,6 +1699,392 @@ pub fn decode_pv_field_with_bitset_cached(
             Ok(PvField::Structure(s))
         }
     }
+}
+
+// ── Value-region type-cache marker flattening (reader-task owned) ─────────
+//
+// Used by the connection reader to rewrite 0xFD/0xFE type-cache markers that
+// appear INSIDE `any` (Variant / VariantArray) value payloads — not only in
+// the leading FieldDesc region. pvxs resolves these the same way it resolves
+// INIT descriptors: through the one connection `rxRegistry`
+// (`dataencode.cpp:542` Any branch → `from_wire(buf, *descs, ctxt)`), so a
+// peer whose introspection registry assigns ids (e.g. pvAccessCPP) may send
+// `0xFD <slot> <desc>` in the value of one frame and `0xFE <slot>` in a
+// later frame. The reader walks the value in wire order against the single
+// connection cache, inlining every embedded descriptor so the routed frame
+// is self-contained and per-op decoders need no shared cache.
+//
+// The walk is byte-faithful and cheap: scalar arrays (e.g. a multi-MiB
+// NTNDArray image) are skipped by cursor arithmetic, never materialized;
+// only `any` descriptors are decoded + re-emitted. Verbatim regions are
+// copied lazily (copy-on-write), so a frame whose `any` descriptors are all
+// inline — every pvxs / epics-rs server emits them inline — produces no
+// output and is routed untouched. Regression
+// R0604-PVACLI-DATA-TYPECACHE-SPLIT-OWNER-1.
+
+/// True iff `desc` contains a `Variant` or `VariantArray` anywhere in its
+/// tree — i.e. a value of this type *could* carry an embedded 0xFD/0xFE
+/// type-cache marker. The reader gates the value walk on this so plain
+/// NTScalar / NTScalarArray frames keep the zero-copy verbatim path.
+pub(crate) fn desc_contains_variant(desc: &FieldDesc) -> bool {
+    match desc {
+        FieldDesc::Variant | FieldDesc::VariantArray => true,
+        FieldDesc::Scalar(_) | FieldDesc::ScalarArray(_) => false,
+        FieldDesc::Structure { fields, .. } | FieldDesc::StructureArray { fields, .. } => {
+            fields.iter().any(|(_, c)| desc_contains_variant(c))
+        }
+        FieldDesc::Union { variants, .. } | FieldDesc::UnionArray { variants, .. } => {
+            variants.iter().any(|(_, c)| desc_contains_variant(c))
+        }
+    }
+}
+
+/// Copy-on-write accumulator for value-region marker flattening. Holds the
+/// frame payload and the source position up to which bytes are already
+/// accounted for; emits nothing until the first rewrite, then copies the
+/// intervening verbatim gap before each replacement.
+struct ValueCow<'a> {
+    src: &'a [u8],
+    flushed: usize,
+    out: Vec<u8>,
+    dirty: bool,
+}
+
+impl<'a> ValueCow<'a> {
+    fn new(src: &'a [u8], start: usize) -> Self {
+        Self {
+            src,
+            flushed: start,
+            out: Vec::new(),
+            dirty: false,
+        }
+    }
+
+    /// Replace `src[start..end]` with `repl`, flushing the verbatim gap
+    /// `src[flushed..start]` first. `start >= flushed` always holds because
+    /// the walker advances the cursor monotonically.
+    fn replace(&mut self, start: usize, end: usize, repl: &[u8]) {
+        self.out.extend_from_slice(&self.src[self.flushed..start]);
+        self.out.extend_from_slice(repl);
+        self.flushed = end;
+        self.dirty = true;
+    }
+
+    /// Finish the value region at `end`: `Some(rewritten)` if any
+    /// replacement happened (trailing gap flushed), else `None` (the value
+    /// is byte-identical and the caller routes it verbatim).
+    fn finish(mut self, end: usize) -> Option<Vec<u8>> {
+        if !self.dirty {
+            return None;
+        }
+        self.out.extend_from_slice(&self.src[self.flushed..end]);
+        Some(self.out)
+    }
+}
+
+/// Flatten 0xFD/0xFE markers embedded in `any` payloads of a bitset-gated
+/// value of type `desc`, starting at `value_start` in `src`. `bitset` is the
+/// changed-field set (pvData §5.4 numbering, root = bit 0). Used for
+/// GET/PUT/MONITOR/PUT_GET DATA values.
+///
+/// Returns the cursor position at the end of the value and, when a marker
+/// was actually rewritten, the replacement bytes for `src[value_start..end]`.
+/// `Ok((end, None))` means the value carried no markers and spans
+/// `src[value_start..end]` verbatim.
+pub(crate) fn flatten_value_markers(
+    src: &[u8],
+    value_start: usize,
+    desc: &FieldDesc,
+    bitset: &crate::proto::BitSet,
+    order: ByteOrder,
+    cache: &mut TypeCache,
+) -> Result<(usize, Option<Vec<u8>>), DecodeError> {
+    let mut cur = Cursor::new(src);
+    cur.set_position(value_start as u64);
+    let mut cow = ValueCow::new(src, value_start);
+    walk_value_bitset(desc, bitset, 0, &mut cur, order, cache, &mut cow, 0)?;
+    let end = cur.position() as usize;
+    Ok((end, cow.finish(end)))
+}
+
+/// Like [`flatten_value_markers`] but for a fully-present value (no bitset).
+/// Used for RPC DATA, whose value carries every field.
+pub(crate) fn flatten_value_markers_full(
+    src: &[u8],
+    value_start: usize,
+    desc: &FieldDesc,
+    order: ByteOrder,
+    cache: &mut TypeCache,
+) -> Result<(usize, Option<Vec<u8>>), DecodeError> {
+    let mut cur = Cursor::new(src);
+    cur.set_position(value_start as u64);
+    let mut cow = ValueCow::new(src, value_start);
+    walk_value_present(desc, &mut cur, order, cache, &mut cow, 0)?;
+    let end = cur.position() as usize;
+    Ok((end, cow.finish(end)))
+}
+
+/// Advance the cursor over a bitset-gated value, mirroring
+/// [`decode_pv_field_with_bitset_cached`] exactly so the walker and the
+/// decoder agree on byte spans. Rewrites embedded `any` descriptors via
+/// [`walk_any`].
+#[allow(clippy::too_many_arguments)]
+fn walk_value_bitset(
+    desc: &FieldDesc,
+    bitset: &crate::proto::BitSet,
+    bit_offset: usize,
+    cur: &mut Cursor<&[u8]>,
+    order: ByteOrder,
+    cache: &mut TypeCache,
+    cow: &mut ValueCow,
+    depth: u32,
+) -> Result<(), DecodeError> {
+    if depth > MAX_FIELD_DEPTH {
+        return Err(decode_err!(
+            "value flatten nesting exceeds MAX_FIELD_DEPTH ({MAX_FIELD_DEPTH})"
+        ));
+    }
+    match desc {
+        FieldDesc::Scalar(_)
+        | FieldDesc::ScalarArray(_)
+        | FieldDesc::Variant
+        | FieldDesc::VariantArray
+        | FieldDesc::Union { .. }
+        | FieldDesc::UnionArray { .. }
+        | FieldDesc::StructureArray { .. } => {
+            if bitset.get(bit_offset) {
+                walk_value_present(desc, cur, order, cache, cow, depth)?;
+            }
+        }
+        FieldDesc::Structure { fields, .. } => {
+            // Own bit set → the whole subtree is on the wire (pvxs BitSet
+            // compression). Else present only if some descendant bit is set.
+            if bitset.get(bit_offset) {
+                walk_value_present(desc, cur, order, cache, cow, depth)?;
+                return Ok(());
+            }
+            let total = desc.total_bits();
+            let mut any_descendant = false;
+            for i in 0..total {
+                if bitset.get(bit_offset + i) {
+                    any_descendant = true;
+                    break;
+                }
+            }
+            if !any_descendant {
+                return Ok(());
+            }
+            let mut child_bit = bit_offset + 1;
+            for (_, child) in fields {
+                walk_value_bitset(child, bitset, child_bit, cur, order, cache, cow, depth + 1)?;
+                child_bit += child.total_bits();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Advance the cursor over a fully-present value, mirroring
+/// [`decode_pv_field_at_depth`] exactly. Rewrites embedded `any` descriptors
+/// via [`walk_any`]; everything else is advanced without materializing.
+fn walk_value_present(
+    desc: &FieldDesc,
+    cur: &mut Cursor<&[u8]>,
+    order: ByteOrder,
+    cache: &mut TypeCache,
+    cow: &mut ValueCow,
+    depth: u32,
+) -> Result<(), DecodeError> {
+    if depth > MAX_FIELD_DEPTH {
+        return Err(decode_err!(
+            "value flatten nesting exceeds MAX_FIELD_DEPTH ({MAX_FIELD_DEPTH})"
+        ));
+    }
+    match desc {
+        FieldDesc::Scalar(st) => advance_scalar(*st, cur, order)?,
+        FieldDesc::ScalarArray(st) => {
+            let n = decode_size(cur, order)?
+                .ok_or_else(|| decode_err!("scalar array length cannot be null"))?
+                as usize;
+            advance_scalar_array(*st, n, cur, order)?;
+        }
+        FieldDesc::Structure { fields, .. } => {
+            for (_, child) in fields {
+                walk_value_present(child, cur, order, cache, cow, depth + 1)?;
+            }
+        }
+        FieldDesc::StructureArray { struct_id, fields } => {
+            let n = decode_size(cur, order)?
+                .ok_or_else(|| decode_err!("structure array length cannot be null"))?
+                as usize;
+            let element = FieldDesc::Structure {
+                struct_id: struct_id.clone(),
+                fields: fields.clone(),
+            };
+            for _ in 0..n {
+                match cur.get_u8()? {
+                    0x00 => {}
+                    0x01 => walk_value_present(&element, cur, order, cache, cow, depth + 1)?,
+                    other => {
+                        return Err(decode_err!(
+                            "structure array element presence byte 0x{other:02X} (expected 0x00 or 0x01)"
+                        ));
+                    }
+                }
+            }
+        }
+        FieldDesc::Union { variants, .. } => {
+            if let Some(sel_u32) = decode_size(cur, order)? {
+                let (_, vdesc) = variants
+                    .get(sel_u32 as usize)
+                    .ok_or_else(|| decode_err!("union selector {sel_u32} out of range"))?
+                    .clone();
+                walk_value_present(&vdesc, cur, order, cache, cow, depth + 1)?;
+            }
+        }
+        FieldDesc::UnionArray { variants, .. } => {
+            let n = decode_size(cur, order)?
+                .ok_or_else(|| decode_err!("union array length cannot be null"))?
+                as usize;
+            for _ in 0..n {
+                match cur.get_u8()? {
+                    0x00 => {}
+                    0x01 => {
+                        if let Some(sel_u32) = decode_size(cur, order)? {
+                            let (_, vdesc) = variants
+                                .get(sel_u32 as usize)
+                                .ok_or_else(|| {
+                                    decode_err!("union array selector {sel_u32} out of range")
+                                })?
+                                .clone();
+                            walk_value_present(&vdesc, cur, order, cache, cow, depth + 1)?;
+                        }
+                    }
+                    other => {
+                        return Err(decode_err!(
+                            "union array element presence byte 0x{other:02X} (expected 0x00 or 0x01)"
+                        ));
+                    }
+                }
+            }
+        }
+        FieldDesc::Variant => walk_any(cur, order, cache, cow, depth)?,
+        FieldDesc::VariantArray => {
+            let n = decode_size(cur, order)?.ok_or_else(|| decode_err!("variant array length"))?
+                as usize;
+            for _ in 0..n {
+                match cur.get_u8()? {
+                    0x00 => {}
+                    0x01 => walk_any(cur, order, cache, cow, depth)?,
+                    other => {
+                        return Err(decode_err!(
+                            "variant array element presence byte 0x{other:02X} (expected 0x00 or 0x01)"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Flatten one `any` payload at the cursor. The payload begins with either
+/// `0xFF` (null — one byte, no descriptor, no value) or an embedded type
+/// descriptor (possibly a `0xFD` define / `0xFE` reference) followed by the
+/// carried value. The descriptor is decoded against `cache` and re-emitted
+/// inline, replacing the wire bytes only when they actually differ (a marker
+/// was present). The carried value is then walked (it may itself nest anys).
+fn walk_any(
+    cur: &mut Cursor<&[u8]>,
+    order: ByteOrder,
+    cache: &mut TypeCache,
+    cow: &mut ValueCow,
+    depth: u32,
+) -> Result<(), DecodeError> {
+    let desc_start = cur.position() as usize;
+    if cur.get_u8()? == 0xFF {
+        // Null `any` — one byte, no descriptor, no value (mirrors the
+        // `peek == 0xFF` arms of `decode_pv_field_at_depth`).
+        return Ok(());
+    }
+    // Rewind and decode the full embedded descriptor against the connection
+    // cache (registers a 0xFD define / resolves a 0xFE reference).
+    cur.set_position(desc_start as u64);
+    let inner = decode_type_desc_cached(cur, order, cache)?;
+    let desc_end = cur.position() as usize;
+    let mut inline = Vec::new();
+    encode_type_desc(&inner, order, &mut inline);
+    if inline.as_slice() != &cow.src[desc_start..desc_end] {
+        cow.replace(desc_start, desc_end, &inline);
+    }
+    // Walk the carried value (fully present); nested anys resolve too.
+    walk_value_present(&inner, cur, order, cache, cow, depth + 1)
+}
+
+/// Fixed wire width of a scalar type, or `None` for the variable-length
+/// `String`. Matches [`decode_scalar_value`].
+fn scalar_fixed_size(st: ScalarType) -> Option<usize> {
+    Some(match st {
+        ScalarType::Boolean | ScalarType::Byte | ScalarType::UByte => 1,
+        ScalarType::Short | ScalarType::UShort => 2,
+        ScalarType::Int | ScalarType::UInt | ScalarType::Float => 4,
+        ScalarType::Long | ScalarType::ULong | ScalarType::Double => 8,
+        ScalarType::String => return None,
+    })
+}
+
+/// Advance the cursor past one scalar value without materializing it.
+fn advance_scalar(
+    st: ScalarType,
+    cur: &mut Cursor<&[u8]>,
+    order: ByteOrder,
+) -> Result<(), DecodeError> {
+    match scalar_fixed_size(st) {
+        Some(sz) => advance_cursor(cur, sz),
+        None => {
+            decode_string_value(cur, order)?;
+            Ok(())
+        }
+    }
+}
+
+/// Advance the cursor past a scalar array of `n` elements. Fixed-width
+/// elements are skipped by cursor arithmetic (the multi-MiB NTNDArray image
+/// never materializes); String elements are read one at a time.
+fn advance_scalar_array(
+    st: ScalarType,
+    n: usize,
+    cur: &mut Cursor<&[u8]>,
+    order: ByteOrder,
+) -> Result<(), DecodeError> {
+    match scalar_fixed_size(st) {
+        Some(sz) => {
+            let nbytes = n
+                .checked_mul(sz)
+                .ok_or_else(|| decode_err!("scalar array size overflow"))?;
+            advance_cursor(cur, nbytes)
+        }
+        None => {
+            for _ in 0..n {
+                decode_string_value(cur, order)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Advance the cursor by `n` bytes, erroring (rather than panicking) if that
+/// would run past the end of the frame.
+fn advance_cursor(cur: &mut Cursor<&[u8]>, n: usize) -> Result<(), DecodeError> {
+    let pos = cur.position() as usize;
+    let end = pos
+        .checked_add(n)
+        .ok_or_else(|| decode_err!("cursor advance overflow"))?;
+    if end > cur.get_ref().len() {
+        return Err(decode_err!("value flatten ran past end of frame"));
+    }
+    cur.set_position(end as u64);
+    Ok(())
 }
 
 /// pvxs cc5d382 (2022-11) "monitor yield 'complete' updates":

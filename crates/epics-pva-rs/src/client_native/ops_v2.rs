@@ -37,7 +37,7 @@ use crate::pvdata::{
 
 use super::channel::Channel;
 use super::decode::{
-    Frame, GetFieldResponse, OpResponse, decode_get_field_response, decode_op_response_cached,
+    Frame, GetFieldResponse, OpResponse, decode_get_field_response, decode_op_response,
 };
 use super::server_conn::ServerConn;
 
@@ -52,35 +52,23 @@ use super::server_conn::ServerConn;
 /// here matters because a circuit left alive after a bad frame would carry a
 /// corrupted peer / type-cache state into later ops on the same connection.
 ///
-/// The decode is threaded through the connection-scoped `TypeCache`
-/// (`server.type_cache()`) so a data-phase `any` / `variant` value whose
-/// inner descriptor is a `0xFE <slot>` back-reference resolves against the
-/// slot a *prior* frame defined with `0xFD`. pvxs decodes both INIT
-/// descriptors and DATA values through the same connection `rxRegistry`
-/// (`clientget.cpp:410-451`, `clientmon.cpp:485-552`); decoding DATA with a
-/// fresh empty cache here would report a spurious slot miss the moment a
-/// peer starts using the descriptor cache.
+/// The frame is decoded with an EMPTY type cache: the connection reader
+/// task has already flattened every 0xFD/0xFE marker — in both the INIT
+/// descriptor region and inside `any` DATA values — against its single
+/// reader-owned cache, so a routed frame is self-contained
+/// ([`flatten_type_cache_markers`](super::decode::flatten_type_cache_markers)).
+/// pvxs decodes both through the one connection `rxRegistry`
+/// (`clientget.cpp:410-451`, `dataencode.cpp:542`); folding the value
+/// markers into the same reader-owned cache is the parity equivalent. Per-op
+/// tasks therefore never share decode-time cache state, which makes the
+/// cross-op decode-order race structurally impossible.
+/// Regression R0604-PVACLI-DATA-TYPECACHE-SPLIT-OWNER-1.
 fn decode_op_or_reset(
     server: &ServerConn,
     frame: &Frame,
     introspection: Option<&FieldDesc>,
 ) -> PvaResult<OpResponse> {
-    let cache = server.type_cache();
-    decode_op_response_cached(frame, introspection, &mut cache.lock())
-        .inspect_err(|_| server.close())
-}
-
-/// Like [`decode_op_or_reset`] but takes the connection `TypeCache` by
-/// reference, for INIT callers that already hold it locked-and-reused
-/// across the INIT/DATA legs of the same op. Same connection-fatal
-/// contract and same cache semantics.
-fn decode_op_cached_or_reset(
-    server: &ServerConn,
-    frame: &Frame,
-    introspection: Option<&FieldDesc>,
-    type_cache: &mut crate::pvdata::encode::TypeCache,
-) -> PvaResult<OpResponse> {
-    decode_op_response_cached(frame, introspection, type_cache).inspect_err(|_| server.close())
+    decode_op_response(frame, introspection).inspect_err(|_| server.close())
 }
 
 /// GET_FIELD analog: pvxs resets the circuit on a bad GET_FIELD descriptor
@@ -464,7 +452,6 @@ async fn op_get_inner(
     // TwoShot VecDeque so first frame → rx_init, second → rx_data.
     let (rx_init, rx_data) = server.register_ioid_twoshot(sid, ioid, Command::Get.code());
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
-    let cache = server.type_cache();
 
     // Pipeline: combine INIT + GET frames into a single buffer and
     // send as one channel message. The writer task writes both in one
@@ -480,7 +467,7 @@ async fn op_get_inner(
 
     // Receive INIT response
     let init_frame = await_oneshot_frame(rx_init, op_timeout).await?;
-    let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
+    let init = match decode_op_or_reset(&server, &init_frame, None)? {
         OpResponse::Init(i) => i,
         other => {
             // Wrong response kind for this op step == impossible op state.
@@ -756,12 +743,11 @@ pub async fn op_put_field(
     };
     let mut stream = server.register_ioid_stream(sid, ioid, Command::Put.code());
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
-    let cache = server.type_cache();
 
     let init_req = codec.build_put_init(sid, ioid, &pv_req);
     server.send_for_channel(sid, init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
-    let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
+    let init = match decode_op_or_reset(&server, &init_frame, None)? {
         OpResponse::Init(i) => i,
         other => {
             // Wrong response kind for this op step == impossible op state.
@@ -897,12 +883,11 @@ pub async fn op_put_fields(
 
     let mut stream = server.register_ioid_stream(sid, ioid, Command::Put.code());
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
-    let cache = server.type_cache();
 
     let init_req = codec.build_put_init(sid, ioid, pv_req);
     server.send_for_channel(sid, init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
-    let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
+    let init = match decode_op_or_reset(&server, &init_frame, None)? {
         OpResponse::Init(i) => i,
         other => {
             // Wrong response kind for this op step == impossible op state.
@@ -992,12 +977,11 @@ pub async fn op_put_field_with_request(
 
     let mut stream = server.register_ioid_stream(sid, ioid, Command::Put.code());
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
-    let cache = server.type_cache();
 
     let init_req = codec.build_put_init(sid, ioid, pv_req);
     server.send_for_channel(sid, init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
-    let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
+    let init = match decode_op_or_reset(&server, &init_frame, None)? {
         OpResponse::Init(i) => i,
         other => {
             // Wrong response kind for this op step == impossible op state.
@@ -1097,12 +1081,11 @@ pub async fn op_put_value_field_with_request(
 
     let mut stream = server.register_ioid_stream(sid, ioid, Command::Put.code());
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
-    let cache = server.type_cache();
 
     let init_req = codec.build_put_init(sid, ioid, pv_req);
     server.send_for_channel(sid, init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
-    let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
+    let init = match decode_op_or_reset(&server, &init_frame, None)? {
         OpResponse::Init(i) => i,
         other => {
             // Wrong response kind for this op step == impossible op state.
@@ -1304,12 +1287,11 @@ pub async fn op_put_value(
     let pv_req = build_pv_request_value_only(big_endian);
     let mut stream = server.register_ioid_stream(sid, ioid, Command::Put.code());
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
-    let cache = server.type_cache();
 
     let init_req = codec.build_put_init(sid, ioid, &pv_req);
     server.send_for_channel(sid, init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
-    let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
+    let init = match decode_op_or_reset(&server, &init_frame, None)? {
         OpResponse::Init(i) => i,
         other => {
             // Wrong response kind for this op step == impossible op state.
@@ -1397,12 +1379,11 @@ pub async fn op_put_value_raw(
 
     let mut stream = server.register_ioid_stream(sid, ioid, Command::Put.code());
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
-    let cache = server.type_cache();
 
     let init_req = codec.build_put_init(sid, ioid, pv_req);
     server.send_for_channel(sid, init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
-    let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
+    let init = match decode_op_or_reset(&server, &init_frame, None)? {
         OpResponse::Init(i) => i,
         other => {
             // Wrong response kind for this op step == impossible op state.
@@ -1512,13 +1493,12 @@ where
     };
     let mut stream = server.register_ioid_stream(sid, ioid, Command::Put.code());
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
-    let cache = server.type_cache();
 
     // INIT
     let init_req = codec.build_put_init(sid, ioid, &pv_req);
     server.send_for_channel(sid, init_req).await?;
     let init_frame = await_frame(&mut stream, op_timeout).await?;
-    let init = match decode_op_cached_or_reset(&server, &init_frame, None, &mut cache.lock())? {
+    let init = match decode_op_or_reset(&server, &init_frame, None)? {
         OpResponse::Init(i) => i,
         other => {
             // Wrong response kind for this op step == impossible op state.
@@ -2282,8 +2262,7 @@ where
         .await
         .map_err(|_| MonitorEnd::ConnectionLost)?;
     let init_frame = stream.recv().await.ok_or(MonitorEnd::ConnectionLost)?;
-    let cache = server.type_cache();
-    let init = match decode_op_response_cached(&init_frame, None, &mut cache.lock()) {
+    let init = match decode_op_response(&init_frame, None) {
         Ok(OpResponse::Init(i)) => i,
         Ok(other) => {
             server.unregister_ioid(ioid);
@@ -2763,8 +2742,7 @@ where
         .await
         .map_err(|_| MonitorEnd::ConnectionLost)?;
     let init_frame = stream.recv().await.ok_or(MonitorEnd::ConnectionLost)?;
-    let cache = server.type_cache();
-    let init = match decode_op_response_cached(&init_frame, None, &mut cache.lock()) {
+    let init = match decode_op_response(&init_frame, None) {
         Ok(OpResponse::Init(i)) => i,
         Ok(other) => {
             server.unregister_ioid(ioid);
@@ -2859,13 +2837,14 @@ where
                 }
             },
         };
-        // Decode DATA through the connection `TypeCache` (same cache the
-        // MONITOR INIT used above) so `0xFE <slot>` back-references inside
-        // `any`/`variant` values resolve, mirroring pvxs `clientmon.cpp:
-        // 485-552` which reuses one `rxRegistry` for the INIT type and
-        // every DATA value. The lock is scoped to the decode so the
-        // non-`Send` parking_lot guard is dropped before the awaits below.
-        let decoded = decode_op_response_cached(&frame, Some(&intro), &mut cache.lock());
+        // Decode DATA with no shared cache. The reader side
+        // (`flatten_type_cache_markers`) has already flattened every
+        // `0xFD`/`0xFE` type-cache marker — both the INIT descriptor and
+        // any `any`/`variant` value markers — into a single self-contained
+        // frame in wire order (Regression R0604-PVACLI-DATA-TYPECACHE-
+        // SPLIT-OWNER-1), so this DATA frame embeds its own inline types
+        // and needs no connection-level registry to resolve.
+        let decoded = decode_op_response(&frame, Some(&intro));
         match decoded {
             Ok(OpResponse::Data(d)) => {
                 // a non-empty overrun bitset means the server
@@ -3234,7 +3213,14 @@ async fn op_put_get_data(
     };
     let mut stream = server.register_ioid_stream(sid, ioid, Command::PutGet.code());
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
-    let cache = server.type_cache();
+    // Op-local type cache. PUT_GET and ChannelArray run their INIT and DATA
+    // legs on one task in wire order, so this cache resolves any within-op
+    // 0xFD/0xFE markers without a shared connection cache. PUT_GET's DATA
+    // value is additionally reader-flattened (its layout is unambiguous), so
+    // here it stays empty; ChannelArray's ambiguous DATA layout keeps it as
+    // the op's resolver — see `flatten_type_cache_markers`.
+    // Regression R0604-PVACLI-DATA-TYPECACHE-SPLIT-OWNER-1.
+    let mut cache = crate::pvdata::encode::TypeCache::new();
 
     // INIT — `sid + ioid + 0x08 + pvRequest`.
     let mut init = Vec::with_capacity(9 + pv_req.len());
@@ -3249,7 +3235,7 @@ async fn op_put_get_data(
     server.send_for_channel(sid, init_frame).await?;
 
     let init_resp = await_frame(&mut stream, op_timeout).await?;
-    let intro = match decode_put_get_init(&init_resp, &mut cache.lock()) {
+    let intro = match decode_put_get_init(&init_resp, &mut cache) {
         Ok(Ok(intro)) => intro,
         Ok(Err(status)) => {
             server.unregister_ioid(ioid);
@@ -3298,7 +3284,7 @@ async fn op_put_get_data(
     server.send_for_channel(sid, data_frame).await?;
 
     let resp_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = match decode_put_get_data(&resp_frame, &intro, &mut cache.lock()) {
+    let result = match decode_put_get_data(&resp_frame, &intro, &mut cache) {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(status)) => Err(PvaError::Protocol(format!("PUT_GET: {status:?}"))),
         Err(e) => {
@@ -3464,7 +3450,14 @@ async fn op_array_data(
     };
     let mut stream = server.register_ioid_stream(sid, ioid, Command::Array.code());
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
-    let cache = server.type_cache();
+    // Op-local type cache. PUT_GET and ChannelArray run their INIT and DATA
+    // legs on one task in wire order, so this cache resolves any within-op
+    // 0xFD/0xFE markers without a shared connection cache. PUT_GET's DATA
+    // value is additionally reader-flattened (its layout is unambiguous), so
+    // here it stays empty; ChannelArray's ambiguous DATA layout keeps it as
+    // the op's resolver — see `flatten_type_cache_markers`.
+    // Regression R0604-PVACLI-DATA-TYPECACHE-SPLIT-OWNER-1.
+    let mut cache = crate::pvdata::encode::TypeCache::new();
 
     // INIT — `sid + ioid + 0x08 + pvRequest`.
     let mut init = Vec::with_capacity(9 + pv_req.len());
@@ -3479,7 +3472,7 @@ async fn op_array_data(
     server.send_for_channel(sid, init_frame).await?;
 
     let init_resp = await_frame(&mut stream, op_timeout).await?;
-    let array_desc = match decode_array_init(&init_resp, &mut cache.lock()) {
+    let array_desc = match decode_array_init(&init_resp, &mut cache) {
         Ok(Ok(desc)) => desc,
         Ok(Err(status)) => {
             server.unregister_ioid(ioid);
@@ -3535,7 +3528,7 @@ async fn op_array_data(
     server.send_for_channel(sid, data_frame).await?;
 
     let resp_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = match decode_array_data(&resp_frame, &req, &array_desc, &mut cache.lock()) {
+    let result = match decode_array_data(&resp_frame, &req, &array_desc, &mut cache) {
         Ok(Ok(resp)) => Ok(resp),
         Ok(Err(status)) => Err(PvaError::Protocol(format!("ARRAY: {status:?}"))),
         Err(e) => {
@@ -3740,7 +3733,11 @@ pub async fn op_array_describe(
     };
     let mut stream = server.register_ioid_stream(sid, ioid, Command::Array.code());
     let mut ioid_guard = IoidGuard::new(server.clone(), ioid);
-    let cache = server.type_cache();
+    // Op-local type cache (ChannelArray): INIT and DATA run on one task in
+    // wire order. The reader does not flatten ARRAY DATA (its layout is
+    // sub-op dependent), so this op-local cache resolves its within-op
+    // markers. R0604-PVACLI-DATA-TYPECACHE-SPLIT-OWNER-1.
+    let mut cache = crate::pvdata::encode::TypeCache::new();
 
     let mut init = Vec::with_capacity(9 + pv_req.len());
     init.put_u32(sid, order);
@@ -3754,7 +3751,7 @@ pub async fn op_array_describe(
     server.send_for_channel(sid, init_frame).await?;
 
     let init_resp = await_frame(&mut stream, op_timeout).await?;
-    let array_desc = match decode_array_init(&init_resp, &mut cache.lock()) {
+    let array_desc = match decode_array_init(&init_resp, &mut cache) {
         Ok(Ok(desc)) => desc,
         Ok(Err(status)) => {
             server.unregister_ioid(ioid);

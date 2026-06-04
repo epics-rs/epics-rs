@@ -999,6 +999,22 @@ struct ExecFinished {
     sid: u32,
     ioid: u32,
     op_id: u64,
+    /// Whether the data-phase task emitted a SUCCESSFUL terminal reply
+    /// (`Status::ok`), as opposed to an error reply / panic / abort.
+    ///
+    /// For a GPR op (GET/PUT/RPC) the read-loop owner cleans up a
+    /// `last_request` op ONLY after success; an error reply returns the op to
+    /// `Idle` with the marker preserved for a later EXEC (pvxs
+    /// `ServerGPR::doReply`, `serverget.cpp:86-116`). For one-shot /
+    /// pvAccessCPP-modeled kinds (GET_FIELD, PUT_GET, PROCESS, ARRAY) the owner
+    /// ignores this flag and removes a `last_request` op on every terminal
+    /// reply (see [`apply_exec_finish`]); those tasks leave it `false`.
+    ///
+    /// Defaulting to `false` makes the safe disposition (return to Idle for a
+    /// GPR op, never an erroneous destroy) hold by construction for any task
+    /// exit that does not explicitly [`ExecFinishGuard::mark_success`] — error
+    /// returns, panics, and aborts all skip the marking.
+    success: bool,
 }
 
 /// RAII finalizer held as a single local at the top of a data-phase
@@ -1011,6 +1027,17 @@ struct ExecFinished {
 struct ExecFinishGuard {
     tx: mpsc::UnboundedSender<ExecFinished>,
     fin: ExecFinished,
+}
+
+impl ExecFinishGuard {
+    /// Record that this task emitted a successful terminal reply
+    /// (`Status::ok`). The `Drop` finalizer then tells the owner to clean up a
+    /// `last_request` GPR op; without this call (error reply, panic, abort) the
+    /// owner returns the op to `Idle` with the marker preserved, mirroring pvxs
+    /// `ServerGPR::doReply` (`serverget.cpp:86-116`).
+    fn mark_success(&mut self) {
+        self.fin.success = true;
+    }
 }
 
 impl Drop for ExecFinishGuard {
@@ -1026,24 +1053,47 @@ impl Drop for ExecFinishGuard {
 /// Gated on the op-instance id so a stale signal cannot affect a re-INIT'd op
 /// that reused the ioid.
 ///
-/// - `last_request` op: the reply has now been sent, so this is where pvxs
-///   `cleanup()`s the op after `doReply` (`serverget.cpp:111-114`). Remove it,
-///   freeing its IOID — kept reserved until exactly this point so a re-INIT
-///   racing a slow source could not reuse the IOID mid-reply.
-/// - otherwise: return the op to `Idle` and clear its (now-inert) abort guard
-///   so a later explicit re-EXEC is accepted (pvxs `serverget.cpp:114-115`).
+/// Disposition depends on the op kind, because pvxs models GPR and one-shot
+/// ops with different `doReply` lifecycles:
+///
+/// - GPR (`Get`/`Put`/`Rpc`, pvxs `ServerGPR::doReply`,
+///   `serverget.cpp:86-116`): a SUCCESSFUL reply on a `last_request` op cleans
+///   it up (`:112-114`); a SUCCESSFUL non-last reply, OR ANY error reply,
+///   returns the op to `Idle` (`:89-90`, `:114-115`) WITHOUT touching
+///   `last_request` — the sticky marker survives an error for a later EXEC.
+///   So removal requires `last_request && success`; otherwise return to Idle.
+/// - one-shot / pvAccessCPP-modeled (`GetField`/`PutGet`/`Process`/`Array`):
+///   `GET_FIELD` is a `ServerIntrospect` removed on EVERY terminal reply,
+///   success or error (`serverintrospect.cpp:47-49`; the Rust slow path always
+///   reserves it as `last_request`); `PUT_GET`/`PROCESS`/`ARRAY` follow the
+///   pvAccessCPP destroy-after-reply lifecycle. These keep the unconditional
+///   `last_request` rule and ignore `success`.
+///
+/// In every case the reply has already been sent, so this is where the IOID —
+/// kept reserved until exactly this point so a re-INIT racing a slow source
+/// could not reuse it mid-reply — is finally freed (on removal) and the
+/// (now-inert) abort guard is cleared (on return-to-Idle).
 fn apply_exec_finish(channels: &mut HashMap<u32, ChannelState>, fin: ExecFinished) {
     let Some(ch) = channels.get_mut(&fin.sid) else {
         return;
     };
-    let (matches, last_request) = match ch.ops.get(&fin.ioid) {
-        Some(op) => (op.monitor_op_id == fin.op_id, op.last_request),
+    let (matches, last_request, kind) = match ch.ops.get(&fin.ioid) {
+        Some(op) => (op.monitor_op_id == fin.op_id, op.last_request, op.kind),
         None => return,
     };
     if !matches {
         return;
     }
-    if last_request {
+    let remove = match kind {
+        // R0604-PVASRV-LASTREQUEST-ERROR-1: GPR cleanup is gated on a
+        // successful reply; an error reply keeps the op Idle with the sticky
+        // last_request marker for a later EXEC.
+        OpKind::Get | OpKind::Put | OpKind::Rpc => last_request && fin.success,
+        // GET_FIELD one-shot + pvAccessCPP PUT_GET/PROCESS/ARRAY: removed once
+        // the single reserved reply is out, regardless of status.
+        _ => last_request,
+    };
+    if remove {
         ch.ops.remove(&fin.ioid);
     } else if let Some(op) = ch.ops.get_mut(&fin.ioid) {
         op.exec_state = ExecState::Idle;
@@ -3644,7 +3694,12 @@ async fn handle_put_get(
             return Ok(());
         }
     };
-    let exec_fin = ExecFinished { sid, ioid, op_id };
+    let exec_fin = ExecFinished {
+        sid,
+        ioid,
+        op_id,
+        success: false,
+    };
     let exec_fin_tx_task = exec_fin_tx.clone();
     let join = tokio::spawn(async move {
         // return this op to `Idle` (via the read-loop owner) when the
@@ -3965,7 +4020,12 @@ async fn handle_process(
             return Ok(());
         }
     };
-    let exec_fin = ExecFinished { sid, ioid, op_id };
+    let exec_fin = ExecFinished {
+        sid,
+        ioid,
+        op_id,
+        success: false,
+    };
     let exec_fin_tx_task = exec_fin_tx.clone();
     let join = tokio::spawn(async move {
         // return this op to `Idle` (via the read-loop owner) when the
@@ -4313,7 +4373,12 @@ async fn handle_channel_array(
             return Ok(());
         }
     };
-    let exec_fin = ExecFinished { sid, ioid, op_id };
+    let exec_fin = ExecFinished {
+        sid,
+        ioid,
+        op_id,
+        success: false,
+    };
     let exec_fin_tx_task = exec_fin_tx.clone();
     let join = tokio::spawn(async move {
         let _exec_fin_guard = ExecFinishGuard {
@@ -5570,12 +5635,17 @@ async fn handle_op(
                     return Ok(());
                 }
             };
-            let exec_fin = ExecFinished { sid, ioid, op_id };
+            let exec_fin = ExecFinished {
+                sid,
+                ioid,
+                op_id,
+                success: false,
+            };
             let exec_fin_tx_task = exec_fin_tx.clone();
             let join = tokio::spawn(async move {
                 // returns this op to `Idle` (via the read-loop owner)
                 // when the task ends, so a later explicit re-EXEC is accepted.
-                let _exec_fin_guard = ExecFinishGuard {
+                let mut exec_fin_guard = ExecFinishGuard {
                     tx: exec_fin_tx_task,
                     fin: exec_fin,
                 };
@@ -5654,6 +5724,10 @@ async fn handle_op(
                 let mut buf = Vec::new();
                 h.write_into(&mut buf);
                 buf.extend_from_slice(&payload);
+                // Successful GET data reply: a last_request op is cleaned up by
+                // the completion owner (pvxs serverget.cpp:112-114). Every
+                // error path above returned before reaching here.
+                exec_fin_guard.mark_success();
                 let _ = tx_clone.send(buf).await;
             });
             finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
@@ -5696,10 +5770,15 @@ async fn handle_op(
                         return Ok(());
                     }
                 };
-                let exec_fin = ExecFinished { sid, ioid, op_id };
+                let exec_fin = ExecFinished {
+                    sid,
+                    ioid,
+                    op_id,
+                    success: false,
+                };
                 let exec_fin_tx_task = exec_fin_tx.clone();
                 let join = tokio::spawn(async move {
-                    let _exec_fin_guard = ExecFinishGuard {
+                    let mut exec_fin_guard = ExecFinishGuard {
                         tx: exec_fin_tx_task,
                         fin: exec_fin,
                     };
@@ -5778,6 +5857,10 @@ async fn handle_op(
                     let mut buf = Vec::new();
                     h.write_into(&mut buf);
                     buf.extend_from_slice(&payload);
+                    // Successful PUT/Get readback reply (subcmd & 0x40): a
+                    // last_request op is cleaned up by the completion owner;
+                    // every error path above returned before reaching here.
+                    exec_fin_guard.mark_success();
                     let _ = tx_clone.send(buf).await;
                 });
                 finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
@@ -5834,10 +5917,15 @@ async fn handle_op(
                     return Ok(());
                 }
             };
-            let exec_fin = ExecFinished { sid, ioid, op_id };
+            let exec_fin = ExecFinished {
+                sid,
+                ioid,
+                op_id,
+                success: false,
+            };
             let exec_fin_tx_task = exec_fin_tx.clone();
             let join = tokio::spawn(async move {
-                let _exec_fin_guard = ExecFinishGuard {
+                let mut exec_fin_guard = ExecFinishGuard {
                     tx: exec_fin_tx_task,
                     fin: exec_fin,
                 };
@@ -5878,7 +5966,13 @@ async fn handle_op(
                 let mut payload = Vec::new();
                 payload.put_u32(ioid, order);
                 payload.put_u8(subcmd);
-                match result {
+                // `replied_ok` mirrors the single status word written below:
+                // pvxs `ServerGPR::doReply` decides the op disposition from
+                // `sts.isSuccess()` (serverget.cpp:86-116). A successful
+                // last_request PUT/PUT_GET is cleaned up by the completion
+                // owner; an error reply keeps the op Idle with the sticky
+                // marker for a later EXEC.
+                let replied_ok = match result {
                     Ok(()) => {
                         if subcmd & 0x40 != 0 {
                             // PUT_GET readback: build readback
@@ -5907,25 +6001,37 @@ async fn handle_op(
                                     let bits = BitSet::all_set(intro_t.total_bits());
                                     bits.write_into(order, &mut payload);
                                     encode_pv_field(&v, &intro_t, order, &mut payload);
+                                    true
                                 }
                                 Ok(None) => {
                                     Status::ok().write_into(order, &mut payload);
                                     let empty = BitSet::with_capacity(intro_t.total_bits());
                                     empty.write_into(order, &mut payload);
+                                    true
                                 }
-                                Err(msg) => Status::error(msg).write_into(order, &mut payload),
+                                Err(msg) => {
+                                    Status::error(msg).write_into(order, &mut payload);
+                                    false
+                                }
                             }
                         } else {
                             Status::ok().write_into(order, &mut payload);
+                            true
                         }
                     }
-                    Err(msg) => Status::error(msg).write_into(order, &mut payload),
-                }
+                    Err(msg) => {
+                        Status::error(msg).write_into(order, &mut payload);
+                        false
+                    }
+                };
                 let h =
                     PvaHeader::application(true, order, Command::Put.code(), payload.len() as u32);
                 let mut buf = Vec::new();
                 h.write_into(&mut buf);
                 buf.extend_from_slice(&payload);
+                if replied_ok {
+                    exec_fin_guard.mark_success();
+                }
                 let _ = tx_clone.send(buf).await;
             });
             finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
@@ -7033,10 +7139,15 @@ async fn handle_op(
                     return Ok(());
                 }
             };
-            let exec_fin = ExecFinished { sid, ioid, op_id };
+            let exec_fin = ExecFinished {
+                sid,
+                ioid,
+                op_id,
+                success: false,
+            };
             let exec_fin_tx_task = exec_fin_tx.clone();
             let join = tokio::spawn(async move {
-                let _exec_fin_guard = ExecFinishGuard {
+                let mut exec_fin_guard = ExecFinishGuard {
                     tx: exec_fin_tx_task,
                     fin: exec_fin,
                 };
@@ -7067,21 +7178,31 @@ async fn handle_op(
                 payload.put_u32(ioid, order);
                 // pvxs `serverget.cpp:83` echoes the request subcmd.
                 payload.put_u8(subcmd);
-                match result {
+                // `replied_ok` mirrors the status word written below; pvxs
+                // `ServerGPR::doReply` cleans up a last_request RPC only after
+                // success and otherwise returns it to Idle (serverget.cpp:86-116).
+                let replied_ok = match result {
                     Ok((resp_desc, resp_value)) => {
                         Status::ok().write_into(order, &mut payload);
                         // Spawned task cannot hold &mut EncodeTypeCache; use inline
                         // encode_type_desc (no cache) for RPC responses.
                         encode_type_desc(&resp_desc, order, &mut payload);
                         encode_pv_field(&resp_value, &resp_desc, order, &mut payload);
+                        true
                     }
-                    Err(msg) => Status::error(msg).write_into(order, &mut payload),
-                }
+                    Err(msg) => {
+                        Status::error(msg).write_into(order, &mut payload);
+                        false
+                    }
+                };
                 let h =
                     PvaHeader::application(true, order, Command::Rpc.code(), payload.len() as u32);
                 let mut buf = Vec::new();
                 h.write_into(&mut buf);
                 buf.extend_from_slice(&payload);
+                if replied_ok {
+                    exec_fin_guard.mark_success();
+                }
                 let _ = tx_clone.send(buf).await;
             });
             finish_exec_data_task(ch, ioid, subcmd, join.abort_handle());
@@ -7228,7 +7349,12 @@ async fn handle_get_field(
     let chan_mut = channels.get_mut(&sid).expect("SID presence verified above");
     chan_mut.ops.insert(ioid, reserve);
 
-    let exec_fin = ExecFinished { sid, ioid, op_id };
+    let exec_fin = ExecFinished {
+        sid,
+        ioid,
+        op_id,
+        success: false,
+    };
     let exec_fin_tx_task = exec_fin_tx.clone();
     let join = tokio::spawn(async move {
         // terminal finalizer — releases the reserved IOID on EVERY exit
@@ -10089,6 +10215,7 @@ mod tests {
                 sid,
                 ioid,
                 op_id: stale_op_id,
+                success: false,
             },
         );
         assert!(
@@ -10100,15 +10227,17 @@ mod tests {
         let exec_id = begin_exec(channels.get_mut(&sid).unwrap(), ioid)
             .expect("a non-last EXEC is accepted after cancel");
 
-        // That EXEC's reply completes. Because the sticky last_request marker
-        // survived the cancel, the completion owner removes the op — matching
-        // pvxs cleanup-after-reply for a last-request op.
+        // That EXEC's reply completes SUCCESSFULLY. Because the sticky
+        // last_request marker survived the cancel, a successful GPR reply makes
+        // the completion owner remove the op — matching pvxs cleanup-after-reply
+        // for a last-request op (serverget.cpp:111-114).
         apply_exec_finish(
             &mut channels,
             ExecFinished {
                 sid,
                 ioid,
                 op_id: exec_id,
+                success: true,
             },
         );
         assert!(
@@ -15771,6 +15900,7 @@ mod bfr15_tests {
                 sid,
                 ioid,
                 op_id: op_id.wrapping_add(1),
+                success: true,
             },
         );
         assert_eq!(
@@ -15779,8 +15909,148 @@ mod bfr15_tests {
             "stale op-instance id must not return the op to Idle"
         );
 
-        // Matching signal: applies.
-        apply_exec_finish(&mut channels, ExecFinished { sid, ioid, op_id });
+        // Matching signal: applies. The op is not last_request, so it returns
+        // to Idle regardless of reply success.
+        apply_exec_finish(
+            &mut channels,
+            ExecFinished {
+                sid,
+                ioid,
+                op_id,
+                success: true,
+            },
+        );
         assert_eq!(op_exec_state(&channels, sid, ioid), ExecState::Idle);
+    }
+
+    /// Regression R0604-PVASRV-LASTREQUEST-ERROR-1. pvxs `ServerGPR::doReply`
+    /// (serverget.cpp:86-116) returns an executing GPR op to `Idle` on an ERROR
+    /// reply WITHOUT cleanup — `lastRequest` stays sticky for a later EXEC — and
+    /// cleans the op up only after a SUCCESSFUL last-request reply. The pre-fix
+    /// owner removed a `last_request` op on completion regardless of reply
+    /// status, freeing the IOID on a source error / descriptor mismatch /
+    /// rejected PUT that pvxs would have kept alive. The completion signal now
+    /// carries reply success; an error completion must preserve the Idle op and
+    /// a later success completion must remove it.
+    #[test]
+    fn last_request_gpr_error_completion_keeps_op_idle_then_success_removes() {
+        let (sid, ioid) = (3u32, 88u32);
+        let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
+        let mut op = non_monitor_op_state(FieldDesc::Variant, OpKind::Get, BitSet::new());
+        op.exec_state = ExecState::Executing;
+        op.last_request = true;
+        let op_id = op.monitor_op_id;
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut ops = HashMap::new();
+        ops.insert(ioid, op);
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(FieldDesc::Variant),
+                source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                ops,
+            },
+        );
+
+        // ERROR completion of the last-request GET: the op survives, returns to
+        // Idle, and keeps its sticky last_request marker for a later EXEC.
+        apply_exec_finish(
+            &mut channels,
+            ExecFinished {
+                sid,
+                ioid,
+                op_id,
+                success: false,
+            },
+        );
+        {
+            let op = &channels[&sid].ops[&ioid];
+            assert_eq!(
+                op.exec_state,
+                ExecState::Idle,
+                "an error reply returns the GPR op to Idle (serverget.cpp:89-90)"
+            );
+            assert!(
+                op.last_request,
+                "an error reply must NOT clear the sticky last_request marker"
+            );
+        }
+
+        // Re-EXEC drives it back to Executing.
+        let op_id2 = begin_exec(channels.get_mut(&sid).unwrap(), ioid)
+            .expect("re-EXEC accepted after an error reply");
+
+        // SUCCESS completion now cleans the last-request op up.
+        apply_exec_finish(
+            &mut channels,
+            ExecFinished {
+                sid,
+                ioid,
+                op_id: op_id2,
+                success: true,
+            },
+        );
+        assert!(
+            !channels[&sid].ops.contains_key(&ioid),
+            "a SUCCESSFUL last-request reply removes the op (serverget.cpp:111-114)"
+        );
+    }
+
+    /// GET_FIELD is a `ServerIntrospect` one-shot (serverintrospect.cpp:47-49):
+    /// it is removed on EVERY terminal reply — success OR error — unlike a GPR
+    /// op. The success-gating from R0604-PVASRV-LASTREQUEST-ERROR-1 must apply
+    /// ONLY to GPR kinds; a naive `last_request && success` for all kinds would
+    /// leak a failed introspection's reserved IOID. Lock the kind distinction:
+    /// an error completion of a GET_FIELD op still frees it.
+    #[test]
+    fn get_field_one_shot_removed_on_error_completion() {
+        let (sid, ioid) = (4u32, 90u32);
+        let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
+        let mut op = non_monitor_op_state(
+            FieldDesc::Variant,
+            OpKind::GetField,
+            BitSet::with_capacity(0),
+        );
+        op.exec_state = ExecState::Executing;
+        // The Rust slow path always reserves a GET_FIELD op as last_request.
+        op.last_request = true;
+        let op_id = op.monitor_op_id;
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut ops = HashMap::new();
+        ops.insert(ioid, op);
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(FieldDesc::Variant),
+                source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                ops,
+            },
+        );
+
+        // Error completion (success = false) of a one-shot GET_FIELD still
+        // removes it — the success gate does not reach this kind.
+        apply_exec_finish(
+            &mut channels,
+            ExecFinished {
+                sid,
+                ioid,
+                op_id,
+                success: false,
+            },
+        );
+        assert!(
+            !channels[&sid].ops.contains_key(&ioid),
+            "GET_FIELD one-shot is removed on every terminal reply, even an error"
+        );
     }
 }

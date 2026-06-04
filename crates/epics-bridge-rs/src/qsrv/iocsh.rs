@@ -131,7 +131,34 @@ pub(crate) fn apply_group_file(
     let expanded = if macros.is_empty() {
         raw
     } else {
-        expand_macros(&raw, &parse_macros(macros))
+        // pvxs expands each group-config line independently through
+        // `macDefExpand` and, when expansion fails (an undefined or recursive
+        // macro makes `macExpandString` return a negative length, so
+        // `macDefExpand` returns `NULL`), logs an error and skips that line —
+        // the failed line never reaches the JSON buffer
+        // (groupconfigprocessor.cpp:88-105). Expanding line-by-line, rather
+        // than the whole file at once, is what stops an undefined reference
+        // inside a quoted string (`"+channel": "$(MISSING)"`) or a group name
+        // from surviving as a literal `$(MISSING,undefined)` placeholder.
+        let parsed = parse_macros(macros);
+        let mut buffer = String::with_capacity(raw.len());
+        for (idx, line) in raw.lines().enumerate() {
+            match expand_macros(line, &parsed) {
+                Some(exp) => {
+                    buffer.push_str(&exp);
+                    buffer.push('\n');
+                }
+                None => {
+                    tracing::error!(
+                        file = %filename,
+                        line = idx + 1,
+                        "dbLoadGroup: macro expansion failed (undefined or \
+                         recursive macro); skipping line"
+                    );
+                }
+            }
+        }
+        buffer
     };
     provider
         .load_group_file_tracked(filename, macros, &expanded)
@@ -180,14 +207,29 @@ fn parse_macros(s: &str) -> std::collections::HashMap<String, String> {
 ///     the handle with the `{"","environ"}` pair —
 ///     `groupsourcehooks.cpp:154`, `lookup`+`FLAG_USE_ENVIRONMENT`).
 ///   - a resolved (macro or env) value is re-scanned for further
-///     references (chained expansion); a self-referential macro emits
-///     its value once without recursing (`refentry->visited`).
-///   - an undefined name with no default emits the `macLib` placeholder
-///     `$(name,undefined)` (`refer:errval`), which the JSON parser then
-///     rejects rather than silently producing wrong output.
-fn expand_macros(s: &str, macros: &std::collections::HashMap<String, String>) -> String {
+///     references (chained expansion); a self-referential macro is a
+///     recursive reference and fails the expansion (`refentry->visited`).
+///   - an undefined name with no default, or a recursive reference, is an
+///     expansion *error* (`refer` sets `entry->error`, errval
+///     `,undefined)`/`,recursive)`). `macExpandString` then returns a
+///     negative length and `macDefExpand` returns `NULL`
+///     (macCore.c:210,220,895-896,881-882), so this function returns `None`
+///     instead of a string. pvxs's group loader skips the whole line on
+///     `NULL`, so a placeholder can never register as a literal channel or
+///     group name (groupconfigprocessor.cpp:91-103).
+///
+/// Returns `None` exactly when C `macDefExpand()` would return `NULL` for the
+/// same input + macro set; `Some(expanded)` otherwise.
+fn expand_macros(s: &str, macros: &std::collections::HashMap<String, String>) -> Option<String> {
     let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
+    // `error` mirrors C `entry.error`: any undefined or recursive reference
+    // anywhere in the (possibly nested) expansion sets it. The reference name
+    // and an actually-used default value are translated through this same flag
+    // (C uses the outer `entry`, macCore.c:798,890-893), so their errors
+    // propagate; scoped-definition names/values are NOT (separate `subs`,
+    // macCore.c:821-826), handled inside `mac_parse_scoped`.
+    let mut error = false;
     // The user's source string is translated at level 0 (`discard = false`):
     // its own quote delimiters and escape backslashes are preserved
     // (`macExpandString` → `trans(handle, &entry, 0, ...)`, macCore.c:216).
@@ -200,9 +242,13 @@ fn expand_macros(s: &str, macros: &std::collections::HashMap<String, String>) ->
         &mut Vec::new(),
         &mut Vec::new(),
         false,
+        &mut error,
         &mut out,
     );
-    out
+    // macExpandString returns the destination text even on error, but
+    // macDefExpand discards it and returns NULL when the length is negative
+    // (macCore.c:220). Mirror that: a failed expansion yields no string.
+    if error { None } else { Some(out) }
 }
 
 /// Translate `chars` into `out`, expanding macro references.
@@ -219,6 +265,7 @@ fn mac_trans(
     scopes: &mut Vec<std::collections::HashMap<String, String>>,
     visiting: &mut Vec<String>,
     discard: bool,
+    error: &mut bool,
     out: &mut String,
 ) {
     let mut quote: Option<char> = None;
@@ -267,7 +314,7 @@ fn mac_trans(
         let mac_ref =
             c == '$' && i + 1 < chars.len() && (chars[i + 1] == '(' || chars[i + 1] == '{');
         if mac_ref && quote != Some('\'') {
-            if let Some(next) = mac_refer(chars, i, macros, scopes, visiting, out) {
+            if let Some(next) = mac_refer(chars, i, macros, scopes, visiting, error, out) {
                 i = next;
                 continue;
             }
@@ -287,6 +334,7 @@ fn mac_refer(
     macros: &std::collections::HashMap<String, String>,
     scopes: &mut Vec<std::collections::HashMap<String, String>>,
     visiting: &mut Vec<String>,
+    error: &mut bool,
     out: &mut String,
 ) -> Option<usize> {
     let close = if chars[start + 1] == '(' { ')' } else { '}' };
@@ -324,9 +372,12 @@ fn mac_refer(
 
     // the name itself may contain macro references — expand it. The name
     // is a substituted (level+1) value, so its quotes/escapes are discarded
-    // (C `trans(handle, entry, level+1, macEnd, ...)`, macCore.c:798).
+    // (C `trans(handle, entry, level+1, macEnd, ...)`, macCore.c:798). C
+    // translates the name through the *outer* `entry`, so an undefined or
+    // recursive reference inside the name fails the whole expansion — pass the
+    // shared `error`.
     let mut name = String::new();
-    mac_trans(name_chars, macros, scopes, visiting, true, &mut name);
+    mac_trans(name_chars, macros, scopes, visiting, true, error, &mut name);
 
     // Default value (`=...`) and scoped definitions (`,k=v`).
     let mut default: Option<&[char]> = None;
@@ -371,18 +422,27 @@ fn mac_refer(
     match resolved {
         Some(val) => {
             if visiting.contains(&name) {
-                // Recursive reference (C `refentry->visited`): emit the
-                // resolved value once WITHOUT re-expansion to break the
-                // cycle, rather than recursing forever.
-                out.push_str(&val);
+                // Recursive reference: C `refer` finds `refentry->visited`
+                // already set, sets `entry->error = TRUE`, and writes the
+                // `$(name,recursive)` placeholder (macCore.c:880-882,903-912).
+                // `macExpandString` then reports a negative length so
+                // `macDefExpand` returns `NULL`. Flag the error; the
+                // placeholder text is discarded by `expand_macros` on error,
+                // exactly as `macDefExpand` discards the destination buffer.
+                *error = true;
+                out.push_str("$(");
+                out.push_str(&name);
+                out.push_str(",recursive)");
             } else {
                 visiting.push(name.clone());
                 let val_chars: Vec<char> = val.chars().collect();
                 // A resolved macro value is a substituted (level+1) value:
                 // its quote delimiters and escape backslashes are stripped
                 // (C `trans(handle, entry, level+1, "", &rv, ...)` /
-                // pre-`expand` at level 1, macCore.c:667-673,875).
-                mac_trans(&val_chars, macros, scopes, visiting, true, out);
+                // pre-`expand` at level 1, macCore.c:667-673,875). Errors in
+                // the value (e.g. a chained reference to an undefined macro)
+                // propagate through the shared `entry` (macCore.c:870,875).
+                mac_trans(&val_chars, macros, scopes, visiting, true, error, out);
                 visiting.pop();
             }
         }
@@ -391,11 +451,20 @@ fn mac_refer(
                 // The default value is also substituted at level+1, so its
                 // quotes/escapes are discarded by the translation itself —
                 // C `trans(handle, entry, level+1, macEnd+1, &defval, ...)`
-                // (macCore.c:892). No separate outer-quote strip is needed.
-                mac_trans(def_chars, macros, scopes, visiting, true, out);
+                // (macCore.c:892). It is translated through the outer `entry`,
+                // so a default that itself resolves to an undefined/recursive
+                // reference still fails the expansion — pass the shared
+                // `error`. A present, resolvable default is NOT an error.
+                mac_trans(def_chars, macros, scopes, visiting, true, error, out);
             }
             None => {
-                // Undefined macro placeholder (C `refer` `errval`).
+                // Undefined reference with no default: C `refer` sets
+                // `entry->error = TRUE` and writes the `$(name,undefined)`
+                // placeholder (macCore.c:895-896,903-912), so
+                // `macExpandString` returns a negative length and
+                // `macDefExpand` returns `NULL`. Flag the error; the
+                // placeholder is discarded by `expand_macros` on error.
+                *error = true;
                 out.push_str("$(");
                 out.push_str(&name);
                 out.push_str(",undefined)");
@@ -416,6 +485,13 @@ fn mac_parse_scoped(
     visiting: &mut Vec<String>,
     out: &mut Vec<(String, String)>,
 ) {
+    // C translates scoped-definition names and values through a SEPARATE
+    // `MAC_ENTRY subs` whose `error` flag is initialized fresh and never
+    // merged back into the enclosing `entry` (macCore.c:821-826,841,849). So
+    // an undefined or recursive reference inside a scoped definition does NOT
+    // fail the surrounding expansion. Route these translations through a
+    // throwaway sink rather than the caller's `error` to match.
+    let mut scoped_err = false;
     let mut k = 0;
     while k < rest.len() {
         if rest[k] != ',' {
@@ -431,7 +507,15 @@ fn mac_parse_scoped(
         // Scoped macro names/values are substituted at level+1, so their
         // quotes/escapes are discarded (C `trans(handle, &subs, level+1,
         // ...)`, macCore.c:841,849).
-        mac_trans(name_part, macros, scopes, visiting, true, &mut sname);
+        mac_trans(
+            name_part,
+            macros,
+            scopes,
+            visiting,
+            true,
+            &mut scoped_err,
+            &mut sname,
+        );
         k += name_part.len();
         if let Some('=') = tail.first() {
             let valseg = &tail[1..];
@@ -440,7 +524,15 @@ fn mac_parse_scoped(
                 None => (valseg, &valseg[valseg.len()..]),
             };
             let mut sval = String::new();
-            mac_trans(val_part, macros, scopes, visiting, true, &mut sval);
+            mac_trans(
+                val_part,
+                macros,
+                scopes,
+                visiting,
+                true,
+                &mut scoped_err,
+                &mut sval,
+            );
             out.push((sname, sval));
             k += 1 + val_part.len();
         }
@@ -872,18 +964,37 @@ mod tests {
         m.insert("PVNAME".to_string(), "TEST:val".to_string());
         m.insert("UNIT".to_string(), "deg".to_string());
         // both `${...}` and `$(...)` forms resolve (macLib `macEnd`).
-        let s = expand_macros(r#"{"+id": "${PVNAME}_$(UNIT)", "+atomic": false}"#, &m);
+        let s = expand_macros(r#"{"+id": "${PVNAME}_$(UNIT)", "+atomic": false}"#, &m).unwrap();
         assert_eq!(s, r#"{"+id": "TEST:val_deg", "+atomic": false}"#);
     }
 
+    /// Regression R0604-BRQSRV-MACLIB-ERROR-STATE-1.
+    ///
+    /// An undefined macro with no default is an expansion *error*: C `refer`
+    /// sets `entry->error`, so `macExpandString` returns a negative length and
+    /// `macDefExpand` returns `NULL` (macCore.c:895-896,210,220). pvxs skips
+    /// the whole line on `NULL` (groupconfigprocessor.cpp:99-103); it never
+    /// feeds the `$(name,undefined)` placeholder to the JSON parser. So
+    /// `expand_macros` must return `None`, not a placeholder string.
     #[test]
-    fn macro_unbound_emits_maclib_placeholder() {
-        // macLib (`macCore.c` `refer`) replaces an undefined macro with
-        // the `$(name,undefined)` marker so the JSON parser then errors,
-        // rather than leaving the raw `${name}` token.
+    fn macro_undefined_signals_error() {
         let m = std::collections::HashMap::new();
-        let s = expand_macros("${THIS_MACRO_IS_NOT_SET_ANYWHERE}", &m);
-        assert_eq!(s, "$(THIS_MACRO_IS_NOT_SET_ANYWHERE,undefined)");
+        assert_eq!(expand_macros("${R0604_MACRO_NOT_SET_ANYWHERE}", &m), None);
+        // Undefined inside a quoted `+channel` string (the pvxs line shape):
+        // still an error, so the line is dropped rather than registering a
+        // `$(...,undefined)` channel.
+        assert_eq!(
+            expand_macros(
+                r#"  "value": { "+channel": "$(R0604_MISSING_CHANNEL)", "+type": "plain" },"#,
+                &m
+            ),
+            None
+        );
+        // Undefined inside a group-name key is likewise an error.
+        assert_eq!(
+            expand_macros(r#"  "$(R0604_MISSING_GROUP):grp": {"#, &m),
+            None
+        );
     }
 
     #[test]
@@ -891,10 +1002,12 @@ mod tests {
         // `$(NAME=default)` / `${NAME=default}` supply a fallback used
         // when the macro is otherwise undefined (macLib default arm).
         let m = std::collections::HashMap::new();
-        assert_eq!(expand_macros("${P=DEFAULT}", &m), "DEFAULT");
+        // A present, resolvable default is NOT an error (C uses the default
+        // arm and leaves `entry->error` clear, macCore.c:890-893).
+        assert_eq!(expand_macros("${P=DEFAULT}", &m).unwrap(), "DEFAULT");
         let mut m2 = std::collections::HashMap::new();
         m2.insert("P".to_string(), "SET".to_string());
-        assert_eq!(expand_macros("$(P=DEFAULT)", &m2), "SET");
+        assert_eq!(expand_macros("$(P=DEFAULT)", &m2).unwrap(), "SET");
     }
 
     #[test]
@@ -903,7 +1016,7 @@ mod tests {
         // (macLib `macDefExpandTest.c:193-218`).
         let mut m = std::collections::HashMap::new();
         m.insert("FOO".to_string(), "fromfoo".to_string());
-        assert_eq!(expand_macros("${BAR=${FOO}}", &m), "fromfoo");
+        assert_eq!(expand_macros("${BAR=${FOO}}", &m).unwrap(), "fromfoo");
     }
 
     #[test]
@@ -912,7 +1025,7 @@ mod tests {
         // duration of this reference's expansion.
         let mut m = std::collections::HashMap::new();
         m.insert("FOO".to_string(), "scopedval".to_string());
-        assert_eq!(expand_macros("${BAR,BAR=$(FOO)}", &m), "scopedval");
+        assert_eq!(expand_macros("${BAR,BAR=$(FOO)}", &m).unwrap(), "scopedval");
     }
 
     #[test]
@@ -921,7 +1034,7 @@ mod tests {
         let mut m = std::collections::HashMap::new();
         m.insert("A".to_string(), "$(B)".to_string());
         m.insert("B".to_string(), "deep".to_string());
-        assert_eq!(expand_macros("$(A)", &m), "deep");
+        assert_eq!(expand_macros("$(A)", &m).unwrap(), "deep");
     }
 
     /// Regression R0604-BRQSRV-MACLIB-DISCARD-LEVEL-1.
@@ -937,21 +1050,21 @@ mod tests {
         // Macro value with surrounding quotes → quotes removed on expansion.
         let mut m = std::collections::HashMap::new();
         m.insert("P".to_string(), "\"IOC:\"".to_string());
-        assert_eq!(expand_macros("$(P)grp", &m), "IOC:grp");
+        assert_eq!(expand_macros("$(P)grp", &m).unwrap(), "IOC:grp");
 
         // Macro value with an escape → backslash dropped, escaped byte kept.
         let mut m = std::collections::HashMap::new();
         m.insert("E".to_string(), "a\\,b".to_string());
-        assert_eq!(expand_macros("$(E)", &m), "a,b");
+        assert_eq!(expand_macros("$(E)", &m).unwrap(), "a,b");
 
         // Default value quotes are likewise discarded (substituted level+1),
         // including interior quotes a one-pair strip would have left behind.
         let m = std::collections::HashMap::new();
-        assert_eq!(expand_macros(r#"$(X="a"b)"#, &m), "ab");
+        assert_eq!(expand_macros(r#"$(X="a"b)"#, &m).unwrap(), "ab");
 
         // Scoped value quotes are discarded too.
         let m = std::collections::HashMap::new();
-        assert_eq!(expand_macros(r#"$(BAR,BAR="v")"#, &m), "v");
+        assert_eq!(expand_macros(r#"$(BAR,BAR="v")"#, &m).unwrap(), "v");
     }
 
     /// Regression R0604-BRQSRV-MACLIB-DISCARD-LEVEL-1 (level-0 preservation).
@@ -966,17 +1079,69 @@ mod tests {
         m.insert("V".to_string(), "x".to_string());
         // The literal JSON quotes around the value are the user's quotes and
         // must remain; only `$(V)` is substituted.
-        assert_eq!(expand_macros(r#"{"k": "$(V)"}"#, &m), r#"{"k": "x"}"#);
+        assert_eq!(
+            expand_macros(r#"{"k": "$(V)"}"#, &m).unwrap(),
+            r#"{"k": "x"}"#
+        );
     }
 
+    /// Regression R0604-BRQSRV-MACLIB-ERROR-STATE-1.
+    ///
+    /// `A=$(A)` must not recurse forever (macLib `visited`), and the recursion
+    /// is an *error*: C `refer` sets `entry->error` on the recursive reference,
+    /// so `macExpandString` returns a negative length and `macDefExpand`
+    /// returns `NULL` (macCore.c:880-882,210,220). pvxs then drops the line, so
+    /// the recursive macro never reaches the JSON parser as literal text —
+    /// `expand_macros` must return `None`, not the resolved value.
     #[test]
-    fn macro_self_reference_terminates() {
-        // `A=$(A)` must not recurse forever (macLib `visited`).
+    fn macro_self_reference_signals_error() {
         let mut m = std::collections::HashMap::new();
         m.insert("A".to_string(), "$(A)".to_string());
-        // emits the resolved value once; the inner self-ref is emitted
-        // raw (not re-expanded) so it cannot loop.
-        assert_eq!(expand_macros("$(A)", &m), "$(A)");
+        assert_eq!(expand_macros("$(A)", &m), None);
+    }
+
+    /// Regression R0604-BRQSRV-MACLIB-ERROR-STATE-1.
+    ///
+    /// An undefined/recursive reference inside a *scoped definition* uses C's
+    /// separate `MAC_ENTRY subs`, whose error flag is discarded
+    /// (macCore.c:821-826,841,849). It must NOT fail the enclosing expansion,
+    /// so a reference whose own name resolves still succeeds even when a
+    /// scoped-definition value it never uses is undefined.
+    #[test]
+    fn macro_scoped_definition_error_does_not_fail_outer() {
+        let mut m = std::collections::HashMap::new();
+        m.insert("P".to_string(), "val".to_string());
+        // P resolves; the scoped `K=$(UNDEF)` value is undefined but its error
+        // is confined to the scoped `subs` entry, so the whole expansion is
+        // still successful.
+        assert_eq!(expand_macros("$(P,K=$(UNDEF))", &m).unwrap(), "val");
+    }
+
+    /// Regression R0604-BRQSRV-MACLIB-ERROR-STATE-1.
+    ///
+    /// pvxs expands each group-config line through `macDefExpand` and skips a
+    /// line whose expansion returns `NULL` (groupconfigprocessor.cpp:88-105).
+    /// An undefined macro inside a quoted `+channel` value must therefore never
+    /// register as a literal `$(MISSING,undefined)` channel: the line is
+    /// dropped, leaving no such group.
+    #[test]
+    fn group_file_undefined_macro_line_dropped() {
+        let db = Arc::new(PvDatabase::new());
+        let provider = Arc::new(BridgeProvider::new(db));
+        // Single self-contained line whose only macro is undefined. With the
+        // line dropped the buffer is empty, so parsing fails and — crucially —
+        // no group named after the placeholder is ever created.
+        let json = r#"{ "G:grp": { "value": { "+channel": "$(R0604_MISSING_CHANNEL)", "+type": "plain" } } }"#;
+        let path = std::env::temp_dir().join("qsrv_iocsh_undef_macro_line.json");
+        std::fs::write(&path, json).unwrap();
+        // Non-empty macros enables expansion (pvxs `macros[0] != '\0'` gate).
+        let res = apply_group_file(&provider, path.to_str().unwrap(), "DUMMY=1");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            res.is_err(),
+            "an all-dropped file must not parse into a group, got {res:?}"
+        );
+        assert_eq!(provider.group_count(), 0);
     }
 
     #[test]

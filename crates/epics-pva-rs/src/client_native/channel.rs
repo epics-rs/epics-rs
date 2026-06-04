@@ -55,6 +55,19 @@ pub enum ChannelState {
     Closed,
 }
 
+/// A resolution candidate: a server address plus the GUID that resolved
+/// it, when known. Search hits carry `Some(guid)` from the resolving
+/// `SEARCH_RESPONSE`; direct-connect resolvers carry `None` (no search,
+/// hence no reply GUID — matching pvxs forced-server, which also has no
+/// channel GUID). `ChannelState::Active::expected_guid` is taken from this
+/// `guid`, NOT re-derived from the beacon tracker
+/// (R0604-PVACLI-SEARCH-GUID-DISCARD-1).
+#[derive(Debug, Clone, Copy)]
+struct Candidate {
+    addr: std::net::SocketAddr,
+    guid: Option<[u8; 12]>,
+}
+
 pub struct Channel {
     pub pv_name: String,
     pub cid: u32,
@@ -81,7 +94,7 @@ pub struct Channel {
     /// if `ensure_active` fails to connect or `CREATE_CHANNEL`s to the
     /// first server, it pops the next alternative before falling back to
     /// a fresh UDP search.
-    alternatives: parking_lot::Mutex<Vec<std::net::SocketAddr>>,
+    alternatives: parking_lot::Mutex<Vec<Candidate>>,
     /// Earliest instant at which `ensure_active` is allowed to attempt a
     /// fresh connect, or `None` when reconnect may proceed immediately.
     /// Set per pvxs failure class (see `reconnect_holdoff`): a
@@ -729,7 +742,7 @@ impl Channel {
         // most recent multi-window search; otherwise issue a fresh search.
         // The lock guard from parking_lot is !Send, so we drop it before
         // any await.
-        let cached: Option<Vec<std::net::SocketAddr>> = {
+        let cached: Option<Vec<Candidate>> = {
             let mut alts = self.alternatives.lock();
             if alts.is_empty() {
                 None
@@ -820,11 +833,17 @@ impl Channel {
                         // moment the outer timeout closed the responder.
                         let result = engine.find(&self.pv_name, reason).await.ok();
                         match result {
-                            Some(addr) => vec![addr],
+                            Some(hit) => vec![Candidate {
+                                addr: hit.server,
+                                guid: Some(hit.guid),
+                            }],
                             None => Vec::new(),
                         }
                     }
-                    Resolver::Direct(addr) => vec![*addr],
+                    Resolver::Direct(addr) => vec![Candidate {
+                        addr: *addr,
+                        guid: None,
+                    }],
                 }
             }
         };
@@ -836,12 +855,12 @@ impl Channel {
         // Try each candidate in order; stash the rest as alternatives.
         let mut last_err: Option<PvaError> = None;
         let mut last_failure: Option<FailureClass> = None;
-        for (idx, server_addr) in candidates.iter().enumerate() {
+        for (idx, cand) in candidates.iter().enumerate() {
             self.set_state(ChannelState::Connecting);
             match self
                 .pool
                 .get_or_connect(
-                    *server_addr,
+                    cand.addr,
                     &self.user,
                     &self.host,
                     self.op_timeout,
@@ -862,12 +881,21 @@ impl Channel {
                         self.set_state(ChannelState::Active {
                             server: server.clone(),
                             sid,
-                            // capture the GUID our search
-                            // engine recorded for this address. If a
-                            // future reconnect to the same address
-                            // observes a different beacon GUID, the
-                            // ensure_active path can detect it.
-                            expected_guid: self.resolver.last_guid_for(server.addr),
+                            // Capture the GUID the resolving
+                            // SEARCH_RESPONSE carried for this PV
+                            // (`cand.guid`), so the stored
+                            // `expected_guid` is the identity of the
+                            // server that actually claimed the name —
+                            // pvxs `procSearchReply` parity, where
+                            // `chan->guid` is set from the reply, not
+                            // from a beacon. For a `Direct` resolver
+                            // (no search) fall back to the beacon
+                            // tracker's last GUID for the address. If a
+                            // future reconnect observes a different
+                            // GUID, the ensure_active path detects it.
+                            expected_guid: cand
+                                .guid
+                                .or_else(|| self.resolver.last_guid_for(server.addr)),
                         });
                         // Successful Active — clear any pending reconnect
                         // holdoff; the next disconnect re-derives its pacing

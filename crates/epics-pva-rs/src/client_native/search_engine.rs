@@ -117,19 +117,20 @@ pub enum SearchReason {
 }
 
 pub enum SearchCommand {
-    /// Resolve `pv_name` → first server address. Reply via `responder`
+    /// Resolve `pv_name` → first [`SearchHit`]. Reply via `responder`
     /// once a SEARCH_RESPONSE comes in.
     Find {
         pv_name: String,
-        responder: oneshot::Sender<SocketAddr>,
+        responder: oneshot::Sender<SearchHit>,
         reason: SearchReason,
     },
     /// Resolve `pv_name` and collect *all* responses received within
     /// the next [`MULTI_SERVER_WINDOW`]. The reply contains every
-    /// server that claimed the PV; the caller can fan-out / fail over.
+    /// server [`SearchHit`] that claimed the PV; the caller can fan-out /
+    /// fail over.
     FindAll {
         pv_name: String,
-        responder: oneshot::Sender<Vec<SocketAddr>>,
+        responder: oneshot::Sender<Vec<SearchHit>>,
         reason: SearchReason,
     },
     /// Cancel an outstanding search (channel was dropped or closed).
@@ -204,6 +205,33 @@ pub enum Discovered {
         proto: String,
         peer_version: u8,
     },
+}
+
+/// A resolved `SEARCH_RESPONSE` hit: the full server identity decoded from
+/// the reply that claimed the PV, not just its address.
+///
+/// pvxs decodes `{guid, server, proto, peerVersion}` from every
+/// `SEARCH_RESPONSE` and, while the channel is still `Searching`, stores
+/// the reply GUID directly on the channel (`chan->guid = guid`,
+/// client.cpp:925-927) so later duplicate / server-replacement checks
+/// compare against the GUID that *actually resolved the channel*. Returning
+/// a bare `SocketAddr` from `find()` forced the channel to re-derive the
+/// GUID from the beacon tracker (`guid_for(addr)`), which can be absent
+/// (no beacon yet) or — since the tracker is keyed by `(server, proto)` —
+/// an arbitrary protocol's GUID. Carrying the hit makes the channel's
+/// `expected_guid` come from the search reply, as pvxs intends.
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    /// Advertised TCP server endpoint (loopback-rewritten to the UDP peer
+    /// when the payload advertised `0.0.0.0`).
+    pub server: SocketAddr,
+    /// Server GUID decoded from this `SEARCH_RESPONSE`.
+    pub guid: [u8; 12],
+    /// Advertised transport protocol of the reply (always `"tcp"` for a
+    /// found=true reply the engine acts on; see the `proto != "tcp"` gate).
+    pub proto: String,
+    /// PVA header version of the reply frame (pvxs `peerVersion`).
+    pub peer_version: u8,
 }
 
 /// Maximum age of a beacon before the server is treated as offline.
@@ -416,11 +444,12 @@ impl SearchEngine {
         Ok(Self { cmd_tx, beacons })
     }
 
-    /// Issue a search for `pv_name`. Future resolves to the server address
+    /// Issue a search for `pv_name`. Future resolves to the resolving
+    /// [`SearchHit`] (server identity decoded from the SEARCH_RESPONSE)
     /// once a response arrives. `reason` controls whether the first
     /// SEARCH packet fires immediately (`Initial`) or is bucket-spread
     /// (`Reconnect`).
-    pub async fn find(&self, pv_name: &str, reason: SearchReason) -> PvaResult<SocketAddr> {
+    pub async fn find(&self, pv_name: &str, reason: SearchReason) -> PvaResult<SearchHit> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SearchCommand::Find {
@@ -437,11 +466,7 @@ impl SearchEngine {
     /// Collect every SEARCH_RESPONSE for `pv_name` within
     /// [`MULTI_SERVER_WINDOW`]. Returns a ranked list — first is the
     /// fastest responder. Empty list means the search timed out.
-    pub async fn find_all(
-        &self,
-        pv_name: &str,
-        reason: SearchReason,
-    ) -> PvaResult<Vec<SocketAddr>> {
+    pub async fn find_all(&self, pv_name: &str, reason: SearchReason) -> PvaResult<Vec<SearchHit>> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SearchCommand::FindAll {
@@ -753,10 +778,10 @@ pub(crate) fn join_addr_list_multicast(sock: &AsyncUdpV4) {
 // ── Engine main loop ────────────────────────────────────────────────────
 
 enum Responder {
-    Single(oneshot::Sender<SocketAddr>),
+    Single(oneshot::Sender<SearchHit>),
     Multi {
-        responder: oneshot::Sender<Vec<SocketAddr>>,
-        accumulated: Vec<SocketAddr>,
+        responder: oneshot::Sender<Vec<SearchHit>>,
+        accumulated: Vec<SearchHit>,
         deadline: Instant,
     },
 }
@@ -2085,21 +2110,47 @@ fn handle_search_response(
         if is_tcp && server.port() == 0 {
             server.set_port(peer.port());
         }
+        // The full server identity decoded from this reply — pvxs stores
+        // exactly this on the channel while Searching (client.cpp:925-927).
+        let hit = SearchHit {
+            server,
+            guid: resp.guid,
+            proto: resp.protocol.clone(),
+            peer_version: frame.header.version,
+        };
         let Some(entry) = pending.get_mut(&cid) else {
             continue;
         };
         match &mut entry.responder {
             Responder::Single(_) => {
-                // Single responder: deliver and remove.
+                // Single responder: deliver the resolving hit and remove.
+                // pvxs likewise moves the channel to Connecting on the first
+                // reply (client.cpp:921-933); subsequent same-round replies
+                // are only diagnostic. The channel captures `expected_guid`
+                // from this hit, so a later reconnect that resolves to a
+                // different GUID is what surfaces server replacement.
                 let p = pending.remove(&cid).unwrap();
                 by_name.remove(&p.pv_name);
                 if let Responder::Single(tx) = p.responder {
-                    let _ = tx.send(server);
+                    let _ = tx.send(hit);
                 }
             }
             Responder::Multi { accumulated, .. } => {
-                if !accumulated.contains(&server) {
-                    accumulated.push(server);
+                // pvxs logs `Duplicate PV name %s from %s and %s` when two
+                // servers with *different* GUIDs both claim one PV
+                // (client.cpp:934-940). The multi-collector is the only
+                // place that holds more than one reply for a name, so the
+                // diagnostic lives here.
+                if let Some(other) = accumulated.iter().find(|h| h.guid != hit.guid) {
+                    tracing::error!(
+                        pv = %entry.pv_name,
+                        from = %other.server,
+                        and = %hit.server,
+                        "Duplicate PV name claimed by servers with different GUIDs"
+                    );
+                }
+                if !accumulated.iter().any(|h| h.server == hit.server) {
+                    accumulated.push(hit);
                 }
                 // Don't deliver yet — wait for the deadline tick to flush.
             }
@@ -2856,7 +2907,7 @@ mod tests {
 
         // (1) found=true SEARCH_RESPONSE with an ignored GUID must NOT
         // resolve the pending channel.
-        let (tx, _rx) = oneshot::channel::<SocketAddr>();
+        let (tx, _rx) = oneshot::channel::<SearchHit>();
         let mut pending: HashMap<u32, Pending> = HashMap::new();
         pending.insert(
             1,
@@ -2989,7 +3040,7 @@ mod tests {
         ] {
             let mut frame = base.clone();
             frame[2] |= seg; // flags byte
-            let (tx, _rx) = oneshot::channel::<SocketAddr>();
+            let (tx, _rx) = oneshot::channel::<SearchHit>();
             let mut pending: HashMap<u32, Pending> = HashMap::new();
             pending.insert(
                 1,
@@ -3026,7 +3077,7 @@ mod tests {
         }
 
         // Control: the same frame un-segmented DOES resolve.
-        let (tx, mut rx) = oneshot::channel::<SocketAddr>();
+        let (tx, mut rx) = oneshot::channel::<SearchHit>();
         let mut pending: HashMap<u32, Pending> = HashMap::new();
         pending.insert(
             1,
@@ -3061,6 +3112,246 @@ mod tests {
         assert!(
             rx.try_recv().is_ok(),
             "resolved channel must receive a server addr"
+        );
+    }
+
+    /// Regression R0604-PVACLI-SEARCH-GUID-DISCARD-1 (point 1): a found=true
+    /// `SEARCH_RESPONSE` resolves the single-responder channel with the GUID
+    /// decoded from *that reply*, even when no beacon has ever been observed
+    /// for the server. pvxs stores `chan->guid = guid` straight off the reply
+    /// (client.cpp:925-927); the Rust engine hands the resolving `SearchHit`
+    /// (carrying `resp.guid`) to `find()` so the channel's `expected_guid`
+    /// comes from the search reply, not a (possibly absent) beacon.
+    ///
+    /// FAIL-proof: structural. Before the fix `Responder::Single` carried a
+    /// bare `oneshot::Sender<SocketAddr>`, so the reply GUID never left the
+    /// engine and this assertion could not be written (no `.guid` on the
+    /// delivered value). Reverting the hit threading reverts the responder
+    /// type and breaks compilation.
+    #[test]
+    fn found_reply_delivers_search_hit_guid_without_beacon() {
+        use tokio::sync::oneshot;
+        const G: [u8; 12] = [0xABu8; 12];
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 60)), 5076);
+        let server = SocketAddr::new(peer.ip(), 5075);
+
+        let (tx, mut rx) = oneshot::channel::<SearchHit>();
+        let mut pending: HashMap<u32, Pending> = HashMap::new();
+        pending.insert(
+            1,
+            Pending {
+                pv_name: "dut".into(),
+                responder: Responder::Single(tx),
+                last_attempt: Instant::now(),
+                attempt: 1,
+                bucket: 0,
+            },
+        );
+        let mut by_name: HashMap<String, u32> = std::iter::once(("dut".to_string(), 1)).collect();
+        // Empty tracker: no beacon has ever been seen for this server.
+        let beacons = BeaconTracker::new();
+        assert!(
+            beacons.guid_for(server).is_none(),
+            "precondition: no beacon GUID for the server"
+        );
+        let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
+        let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+        let mut poke = false;
+        let frame = crate::server_native::udp::build_search_response_proto(
+            G,
+            0,
+            5075,
+            &[1],
+            ByteOrder::Little,
+            "tcp",
+        );
+        handle_search_response(
+            &frame,
+            &mut pending,
+            &mut by_name,
+            &beacons,
+            &ignore,
+            &mut subs,
+            &mut poke,
+            peer,
+            false, // UDP
+        );
+        let hit = rx
+            .try_recv()
+            .expect("found=true reply must resolve the single responder");
+        assert_eq!(
+            hit.guid, G,
+            "resolving SearchHit must carry the SEARCH_RESPONSE GUID, \
+             not a beacon-derived one"
+        );
+        assert_eq!(hit.proto, "tcp");
+        assert_eq!(hit.server, server);
+    }
+
+    /// Regression R0604-PVACLI-SEARCH-GUID-DISCARD-1 (point 3): a transient
+    /// `tls` beacon recorded for the *same server address* with a different
+    /// GUID must NOT influence the GUID a `tcp` `SEARCH_RESPONSE` resolves
+    /// with. The beacon tracker is keyed by `(server, proto)` and
+    /// `guid_for(addr)` collapses by address alone (the 4912f4bc hazard), so
+    /// before the fix the channel re-derived `expected_guid` from
+    /// `last_guid_for(addr)` and could pick up the tls beacon's GUID. The
+    /// resolving `SearchHit` now carries the reply's own GUID, and the channel
+    /// sets `expected_guid: cand.guid.or_else(|| last_guid_for(..))` — so with
+    /// a present hit GUID the beacon fallback is never consulted.
+    ///
+    /// FAIL-proof: structural, as above — the reply GUID flows through
+    /// `SearchHit`; reverting breaks the type. The `guid_for` precondition
+    /// documents the contrast: address-only lookup yields the *tls* GUID.
+    #[test]
+    fn found_tcp_reply_guid_unaffected_by_tls_beacon_same_addr() {
+        use tokio::sync::oneshot;
+        const G_TLS: [u8; 12] = [0x11u8; 12];
+        const G_TCP: [u8; 12] = [0x22u8; 12];
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 70)), 5076);
+        let server = SocketAddr::new(peer.ip(), 5075);
+
+        let beacons = BeaconTracker::new();
+        // A tls beacon for the same endpoint carries a different transient GUID.
+        beacons.observe(server, "tls", G_TLS, 2);
+        assert_eq!(
+            beacons.guid_for(server),
+            Some(G_TLS),
+            "precondition: address-only beacon lookup yields the tls GUID — \
+             the wrong source the fix must bypass"
+        );
+
+        let (tx, mut rx) = oneshot::channel::<SearchHit>();
+        let mut pending: HashMap<u32, Pending> = HashMap::new();
+        pending.insert(
+            1,
+            Pending {
+                pv_name: "dut".into(),
+                responder: Responder::Single(tx),
+                last_attempt: Instant::now(),
+                attempt: 1,
+                bucket: 0,
+            },
+        );
+        let mut by_name: HashMap<String, u32> = std::iter::once(("dut".to_string(), 1)).collect();
+        let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
+        let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+        let mut poke = false;
+        let frame = crate::server_native::udp::build_search_response_proto(
+            G_TCP,
+            0,
+            5075,
+            &[1],
+            ByteOrder::Little,
+            "tcp",
+        );
+        handle_search_response(
+            &frame,
+            &mut pending,
+            &mut by_name,
+            &beacons,
+            &ignore,
+            &mut subs,
+            &mut poke,
+            peer,
+            false,
+        );
+        let hit = rx.try_recv().expect("tcp reply must resolve the channel");
+        assert_eq!(
+            hit.guid, G_TCP,
+            "channel GUID must come from the tcp SEARCH_RESPONSE, \
+             not the tls beacon at the same address"
+        );
+        assert_ne!(hit.guid, G_TLS);
+    }
+
+    /// Regression R0604-PVACLI-SEARCH-GUID-DISCARD-1 (point 2): when two
+    /// servers with *different* GUIDs both claim one PV name, the multi-server
+    /// collector logs the pvxs duplicate-PV diagnostic (`procSearchReply`,
+    /// client.cpp:934-940) instead of silently dropping the second reply. The
+    /// first reply seeds `accumulated`; the second with a mismatched GUID must
+    /// emit an ERROR-level event.
+    ///
+    /// FAIL-proof: removing the
+    /// `accumulated.iter().find(|h| h.guid != hit.guid)` diagnostic block in
+    /// `handle_search_response` drops the ERROR event and fails this test.
+    #[test]
+    fn duplicate_pv_different_guid_logs_diagnostic() {
+        use std::sync::{Arc, Mutex};
+        use tokio::sync::oneshot;
+        use tracing::Level;
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+
+        struct LevelCapture(Arc<Mutex<Vec<Level>>>);
+        impl<S: tracing::Subscriber> Layer<S> for LevelCapture {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                self.0.lock().unwrap().push(*event.metadata().level());
+            }
+        }
+
+        const G_A: [u8; 12] = [0xA1u8; 12];
+        const G_B: [u8; 12] = [0xB2u8; 12];
+        let peer_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5076);
+        let peer_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 5076);
+
+        let levels = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(LevelCapture(levels.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            let (tx, _rx) = oneshot::channel::<Vec<SearchHit>>();
+            // First reply (GUID A from server A) already accumulated.
+            let seed = SearchHit {
+                server: SocketAddr::new(peer_a.ip(), 5075),
+                guid: G_A,
+                proto: "tcp".into(),
+                peer_version: 2,
+            };
+            let mut pending: HashMap<u32, Pending> = HashMap::new();
+            pending.insert(
+                1,
+                Pending {
+                    pv_name: "dut".into(),
+                    responder: Responder::Multi {
+                        responder: tx,
+                        accumulated: vec![seed],
+                        deadline: Instant::now(),
+                    },
+                    last_attempt: Instant::now(),
+                    attempt: 1,
+                    bucket: 0,
+                },
+            );
+            let mut by_name: HashMap<String, u32> =
+                std::iter::once(("dut".to_string(), 1)).collect();
+            let beacons = BeaconTracker::new();
+            let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
+            let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+            let mut poke = false;
+            // Second reply: same cid, different GUID B, from server B.
+            let frame = crate::server_native::udp::build_search_response_proto(
+                G_B,
+                0,
+                5075,
+                &[1],
+                ByteOrder::Little,
+                "tcp",
+            );
+            handle_search_response(
+                &frame,
+                &mut pending,
+                &mut by_name,
+                &beacons,
+                &ignore,
+                &mut subs,
+                &mut poke,
+                peer_b,
+                false,
+            );
+        });
+        let got = levels.lock().unwrap().clone();
+        assert!(
+            got.contains(&Level::ERROR),
+            "a second found reply with a different GUID must emit the pvxs \
+             duplicate-PV ERROR diagnostic; captured levels: {got:?}"
         );
     }
 
@@ -3247,8 +3538,8 @@ mod tests {
 
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 5076);
 
-        let make_pending = || -> (HashMap<u32, Pending>, HashMap<String, u32>, oneshot::Receiver<SocketAddr>) {
-            let (tx, rx) = oneshot::channel::<SocketAddr>();
+        let make_pending = || -> (HashMap<u32, Pending>, HashMap<String, u32>, oneshot::Receiver<SearchHit>) {
+            let (tx, rx) = oneshot::channel::<SearchHit>();
             let mut pending: HashMap<u32, Pending> = HashMap::new();
             pending.insert(
                 1,
@@ -4022,12 +4313,12 @@ mod tests {
         .expect("SEARCH must resolve over IPv6");
 
         assert_eq!(
-            resolved.port(),
+            resolved.server.port(),
             server_tcp_port,
             "resolved TCP port must match v6 server's listener"
         );
         assert!(
-            matches!(resolved.ip(), IpAddr::V6(_)),
+            matches!(resolved.server.ip(), IpAddr::V6(_)),
             "resolved server address must be IPv6; got {resolved:?}"
         );
         drop(server);
@@ -4346,12 +4637,12 @@ mod tests {
             .expect("find() must complete within 5 s; TCP NS search path may be broken")
             .expect("find() must succeed; handle_search_response may not route TCP responses");
         assert_eq!(
-            resolved.port(),
+            resolved.server.port(),
             ns_addr.port(),
             "resolved port must match what the NS advertised in SEARCH_RESPONSE"
         );
         assert_eq!(
-            resolved.ip(),
+            resolved.server.ip(),
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             "resolved IP must be 127.0.0.1 (rewrite_loopback from unspecified)"
         );

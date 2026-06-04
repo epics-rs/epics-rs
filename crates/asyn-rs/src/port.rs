@@ -778,8 +778,20 @@ pub trait PortDriver: Send + Sync + 'static {
     // The port actor checks check_ready_addr() before dispatching, matching
     // C asyn where asynManager checks connection before calling the driver.
 
+    // Default reads use the STRICT getter: an undefined parameter must
+    // surface as ParamUndefined, not success/0. C parity — the default
+    // asynPortDriver::read{Int32,Int64,Float64,Octet,UInt32Digital}
+    // (asynPortDriver.cpp) calls get{Integer,Integer64,Double,String,
+    // UIntDigital}Param, and every paramVal getter throws
+    // ParamValNotDefined → asynParamUndefined for an unset value
+    // (paramVal.cpp:152,181,235,264,292). devAsyn* then routes that status
+    // through asynStatusToEpicsAlarm(READ_ALARM, INVALID_ALARM) instead of
+    // updating RVAL/clearing UDF (e.g. devAsynUInt32Digital.c:898-901,
+    // devAsynInt32.c:844-847). The lax get_*_param accessors stay for
+    // internal callers that explicitly want default-zero behavior.
+
     fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
-        self.base().params.get_int32(user.reason, user.addr)
+        self.base().params.get_int32_strict(user.reason, user.addr)
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
@@ -790,7 +802,7 @@ pub trait PortDriver: Send + Sync + 'static {
     }
 
     fn read_int64(&mut self, user: &AsynUser) -> AsynResult<i64> {
-        self.base().params.get_int64(user.reason, user.addr)
+        self.base().params.get_int64_strict(user.reason, user.addr)
     }
 
     fn write_int64(&mut self, user: &mut AsynUser, value: i64) -> AsynResult<()> {
@@ -814,7 +826,9 @@ pub trait PortDriver: Send + Sync + 'static {
     }
 
     fn read_float64(&mut self, user: &AsynUser) -> AsynResult<f64> {
-        self.base().params.get_float64(user.reason, user.addr)
+        self.base()
+            .params
+            .get_float64_strict(user.reason, user.addr)
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
@@ -825,7 +839,10 @@ pub trait PortDriver: Send + Sync + 'static {
     }
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        let s = self.base().params.get_string(user.reason, user.addr)?;
+        let s = self
+            .base()
+            .params
+            .get_string_strict(user.reason, user.addr)?;
         let bytes = s.as_bytes();
         let n = bytes.len().min(buf.len());
         buf[..n].copy_from_slice(&bytes[..n]);
@@ -841,7 +858,10 @@ pub trait PortDriver: Send + Sync + 'static {
     }
 
     fn read_uint32_digital(&mut self, user: &AsynUser, mask: u32) -> AsynResult<u32> {
-        let val = self.base().params.get_uint32(user.reason, user.addr)?;
+        let val = self
+            .base()
+            .params
+            .get_uint32_strict(user.reason, user.addr)?;
         Ok(val & mask)
     }
 
@@ -2032,6 +2052,103 @@ mod tests {
             drv.get_interrupt_uint32_digital(&user, InterruptReason::OneToZero)
                 .unwrap(),
             0x0E
+        );
+    }
+
+    /// C parity: the default `read_int32` / `read_int64` / `read_float64` /
+    /// `read_octet` / `read_uint32_digital` must surface an *unset*
+    /// parameter as `ParamUndefined`, not success/0. The default
+    /// `asynPortDriver::read{Int32,Int64,Float64,Octet,UInt32Digital}` calls
+    /// `get{Integer,Integer64,Double,String,UIntDigital}Param`, every
+    /// `paramVal` getter throws `ParamValNotDefined` → `asynParamUndefined`
+    /// for an unset value (paramVal.cpp:152,181,235,264,292), and the
+    /// `devAsyn*` device support routes that status through
+    /// `asynStatusToEpicsAlarm(READ_ALARM, INVALID_ALARM)`. After a write
+    /// the same reads succeed with the stored value.
+    #[test]
+    fn default_scalar_reads_report_undefined_until_set() {
+        struct AllTypesDrv {
+            base: PortDriverBase,
+        }
+        impl PortDriver for AllTypesDrv {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+
+        let mut base = PortDriverBase::new("undef_read", 1, PortFlags::default());
+        let i32_idx = base.params.create_param("I32", ParamType::Int32).unwrap();
+        let i64_idx = base.params.create_param("I64", ParamType::Int64).unwrap();
+        let f64_idx = base.params.create_param("F64", ParamType::Float64).unwrap();
+        let oct_idx = base.params.create_param("OCT", ParamType::Octet).unwrap();
+        let u32_idx = base
+            .params
+            .create_param("BITS", ParamType::UInt32Digital)
+            .unwrap();
+        let mut drv = AllTypesDrv { base };
+
+        // Unset → every default scalar read is ParamUndefined, NOT Ok(0).
+        assert!(matches!(
+            drv.read_int32(&AsynUser::new(i32_idx).with_addr(0)),
+            Err(AsynError::ParamUndefined(_))
+        ));
+        assert!(matches!(
+            drv.read_int64(&AsynUser::new(i64_idx).with_addr(0)),
+            Err(AsynError::ParamUndefined(_))
+        ));
+        assert!(matches!(
+            drv.read_float64(&AsynUser::new(f64_idx).with_addr(0)),
+            Err(AsynError::ParamUndefined(_))
+        ));
+        let mut buf = [0u8; 16];
+        assert!(matches!(
+            drv.read_octet(&AsynUser::new(oct_idx).with_addr(0), &mut buf),
+            Err(AsynError::ParamUndefined(_))
+        ));
+        assert!(matches!(
+            drv.read_uint32_digital(&AsynUser::new(u32_idx).with_addr(0), 0xFFFF_FFFF),
+            Err(AsynError::ParamUndefined(_))
+        ));
+
+        // After a write the same reads succeed with the stored value.
+        drv.base_mut().params.set_int32(i32_idx, 0, 7).unwrap();
+        drv.base_mut().params.set_int64(i64_idx, 0, 9).unwrap();
+        drv.base_mut().params.set_float64(f64_idx, 0, 1.5).unwrap();
+        drv.base_mut()
+            .params
+            .set_string(oct_idx, 0, "hi".to_string())
+            .unwrap();
+        drv.base_mut()
+            .params
+            .set_uint32(u32_idx, 0, 0x05, 0xFFFF_FFFF, 0)
+            .unwrap();
+
+        assert_eq!(
+            drv.read_int32(&AsynUser::new(i32_idx).with_addr(0))
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            drv.read_int64(&AsynUser::new(i64_idx).with_addr(0))
+                .unwrap(),
+            9
+        );
+        assert_eq!(
+            drv.read_float64(&AsynUser::new(f64_idx).with_addr(0))
+                .unwrap(),
+            1.5
+        );
+        let n = drv
+            .read_octet(&AsynUser::new(oct_idx).with_addr(0), &mut buf)
+            .unwrap();
+        assert_eq!(&buf[..n], b"hi");
+        assert_eq!(
+            drv.read_uint32_digital(&AsynUser::new(u32_idx).with_addr(0), 0xFFFF_FFFF)
+                .unwrap(),
+            0x05
         );
     }
 }

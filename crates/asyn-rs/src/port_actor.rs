@@ -969,6 +969,11 @@ mod tests {
         let mut drv = TestDriver::new();
         drv.base.connected = false;
         drv.base.auto_connect = true;
+        // Seed VAL so the read probe returns a value: the default read now
+        // surfaces an unset param as ParamUndefined (C parity), so this
+        // lifecycle test must assert the auto-connect outcome (the request
+        // reaches the driver and is not rejected), not undefined-read state.
+        drv.base.params.set_int32(0, 0, 0).unwrap();
         let tx = spawn_actor(drv);
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let result = send_and_wait(&tx, RequestOp::Int32Read, user);
@@ -996,7 +1001,11 @@ mod tests {
 
     #[test]
     fn actor_connect_disconnect() {
-        let tx = spawn_actor(TestDriver::new());
+        let mut drv = TestDriver::new();
+        // Seed VAL so the post-reconnect read probe returns a value rather
+        // than ParamUndefined; this test asserts the reconnect lifecycle.
+        drv.base.params.set_int32(0, 0, 0).unwrap();
+        let tx = spawn_actor(drv);
 
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         send_and_wait(&tx, RequestOp::Disconnect, user).unwrap();
@@ -1044,7 +1053,12 @@ mod tests {
         // An UnblockProcess that waited out its queue deadline must still
         // execute — otherwise the port stays wedged for every non-owner
         // caller forever. Lifecycle ops bypass the deadline short-circuit.
-        let tx = spawn_actor(TestDriver::new());
+        let mut drv = TestDriver::new();
+        // Seed VAL so the post-unblock read probe returns a value rather than
+        // the C-parity ParamUndefined for an unset param; this test asserts
+        // the unblock lifecycle, not undefined-read state.
+        drv.base.params.set_int32(0, 0, 0).unwrap();
+        let tx = spawn_actor(drv);
 
         let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         user.block_token = Some(7);
@@ -1058,6 +1072,8 @@ mod tests {
             .expect("expired-deadline UnblockProcess must still run");
 
         // Port must be unblocked: a non-owner request now succeeds.
+        // (VAL was written above, so the read returns a defined value rather
+        // than the C-parity ParamUndefined for an unset param.)
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         send_and_wait(&tx, RequestOp::Int32Read, user)
             .expect("port should be unblocked after UnblockProcess");

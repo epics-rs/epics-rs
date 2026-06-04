@@ -167,15 +167,24 @@ pub fn dbe_mask_from_pv_request(request: &PvStructure) -> Option<u16> {
     // applies, so a present `DBE` that selects an empty value mask
     // (PROPERTY-only, or unrecognized text like `LOG`) falls back to
     // VALUE|ALARM rather than leaving the value subscription empty.
-    let upper = raw.to_ascii_uppercase();
+    // Case-SENSITIVE substring search on the original string, exactly like
+    // pvxs `mask.find("VALUE"/"ARCHIVE"/"ALARM")` (singlesource.cpp:122-125).
+    // pvxs does NOT case-fold the option, so a lowercase token such as
+    // `"alarm"` or `"value"` matches nothing, selects an empty value mask,
+    // and falls through to the `VALUE|ALARM` fallback below — whereas an
+    // uppercase substring (including a prefixed spelling like `"DBE_VALUE"`)
+    // selects its bit. Folding to uppercase first (as Rust previously did)
+    // made lowercase tokens select a narrower mask than pvxs, hiding value
+    // changes from clients that used lowercase option strings.
+    // Regression R0604-BRQSRV-DBE-STRING-CASE-1.
     let mut raw_mask = 0u16;
-    if upper.contains("VALUE") {
+    if raw.contains("VALUE") {
         raw_mask |= EventMask::VALUE.bits();
     }
-    if upper.contains("ARCHIVE") {
+    if raw.contains("ARCHIVE") {
         raw_mask |= EventMask::LOG.bits();
     }
-    if upper.contains("ALARM") {
+    if raw.contains("ALARM") {
         raw_mask |= EventMask::ALARM.bits();
     }
     Some(dbe_value_class_mask(raw_mask))
@@ -1102,6 +1111,39 @@ mod tests {
         let req = req_with_dbe(PvField::Scalar(ScalarValue::String("LOG".into())));
         let mask = dbe_mask_from_pv_request(&req).expect("must parse");
         assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
+    }
+
+    /// Regression R0604-BRQSRV-DBE-STRING-CASE-1: pvxs's string DBE parse is
+    /// case-SENSITIVE (`mask.find("VALUE"/"ARCHIVE"/"ALARM")`,
+    /// singlesource.cpp:122-125), so a lowercase token selects an empty value
+    /// mask and falls back to `VALUE|ALARM`. Before the fix Rust uppercased
+    /// the option first, so `"alarm"` subscribed alarm-only and `"archive"`
+    /// archive/log-only — narrower than pvxs and hiding value changes.
+    #[test]
+    fn dbe_string_lowercase_tokens_fall_back_to_value_alarm() {
+        use epics_base_rs::server::recgbl::EventMask;
+        let fallback = (EventMask::VALUE | EventMask::ALARM).bits();
+        for token in ["alarm", "value", "archive", "value | alarm", "dbe_value"] {
+            let req = req_with_dbe(PvField::Scalar(ScalarValue::String(token.into())));
+            let mask = dbe_mask_from_pv_request(&req).expect("present option must parse");
+            assert_eq!(
+                mask, fallback,
+                "lowercase DBE token {token:?} matches no uppercase substring, so pvxs falls back to VALUE|ALARM"
+            );
+        }
+    }
+
+    /// Regression R0604-BRQSRV-DBE-STRING-CASE-1: an uppercase substring inside
+    /// mixed-case text still selects its bit, because pvxs searches for the
+    /// exact uppercase substring rather than tokenizing. `"alarmALARM"`
+    /// therefore selects ALARM (the embedded uppercase `ALARM`), proving the
+    /// match is a case-sensitive substring search, not a case fold.
+    #[test]
+    fn dbe_string_uppercase_substring_in_mixed_case_still_selects() {
+        use epics_base_rs::server::recgbl::EventMask;
+        let req = req_with_dbe(PvField::Scalar(ScalarValue::String("alarmALARM".into())));
+        let mask = dbe_mask_from_pv_request(&req).expect("present option must parse");
+        assert_eq!(mask, EventMask::ALARM.bits());
     }
 
     /// numeric integer DBE within the value class passes through

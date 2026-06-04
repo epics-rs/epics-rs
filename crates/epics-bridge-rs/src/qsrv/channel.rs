@@ -150,11 +150,18 @@ pub fn dbe_mask_from_pv_request(request: &PvStructure) -> Option<u16> {
 }
 
 /// parse `record._options.atomic` from a group operation
-/// pvRequest. Returns `Some(true|false)` when the option is set,
-/// `None` when absent — the caller then falls back to the group's
-/// default atomicity. pvxs accepts either a boolean scalar
-/// (`record._options.atomic = true`) or a `"true"`/`"false"` string;
-/// both forms are supported here.
+/// pvRequest. Returns `Some(true|false)` when the option is set and
+/// convertible, `None` when absent or unconvertible — the caller then
+/// falls back to the group's default atomicity.
+///
+/// pvxs resolves group atomicity with `pvRequest["record._options.atomic"]
+/// .as(atomic)` on both PUT and GET (`groupsource.cpp:203,480`), i.e.
+/// `Value::as<bool>`. Route through the shared [`scalar_as_bool`] owner so
+/// the coercion is identical to `record._options.block`: a bool, any
+/// signed/unsigned integer or real scalar maps by nonzero truthiness, and
+/// a string is accepted only as the exact tokens `"true"` / `"false"`.
+/// Numeric `0` / `1` / `UInt(1)` / `Double(1.0)` therefore override the
+/// group default instead of being silently ignored.
 pub fn atomic_from_pv_request(request: &PvStructure) -> Option<bool> {
     let options = request
         .get_field("record")
@@ -168,14 +175,7 @@ pub fn atomic_from_pv_request(request: &PvStructure) -> Option<bool> {
         })?;
 
     match options.get_field("atomic")? {
-        PvField::Scalar(ScalarValue::Boolean(b)) => Some(*b),
-        PvField::Scalar(ScalarValue::String(s)) => {
-            match s.as_str_lossy().to_ascii_lowercase().as_str() {
-                "true" => Some(true),
-                "false" => Some(false),
-                _ => None,
-            }
-        }
+        PvField::Scalar(sv) => scalar_as_bool(sv),
         _ => None,
     }
 }
@@ -1143,6 +1143,40 @@ mod tests {
     fn atomic_option_absent_returns_none() {
         let req = PvStructure::new("request");
         assert!(atomic_from_pv_request(&req).is_none());
+    }
+
+    /// pvxs `Value::as<bool>` coerces numeric scalars by nonzero
+    /// truthiness, so a typed `record._options.atomic = 0` must override
+    /// an atomic-by-default group (returns `Some(false)`), and `1`
+    /// returns `Some(true)` — not the silent `None` that lets the group
+    /// default win. Covers signed int, unsigned int, and real.
+    #[test]
+    fn atomic_option_coerces_numeric_scalars() {
+        assert_eq!(
+            atomic_from_pv_request(&req_with_atomic(PvField::Scalar(ScalarValue::Int(0)))),
+            Some(false),
+            "signed int 0 ⇒ false (overrides atomic-default group)"
+        );
+        assert_eq!(
+            atomic_from_pv_request(&req_with_atomic(PvField::Scalar(ScalarValue::Int(1)))),
+            Some(true),
+            "signed int 1 ⇒ true"
+        );
+        assert_eq!(
+            atomic_from_pv_request(&req_with_atomic(PvField::Scalar(ScalarValue::UInt(1)))),
+            Some(true),
+            "unsigned int 1 ⇒ true"
+        );
+        assert_eq!(
+            atomic_from_pv_request(&req_with_atomic(PvField::Scalar(ScalarValue::Double(1.0)))),
+            Some(true),
+            "real 1.0 ⇒ true"
+        );
+        assert_eq!(
+            atomic_from_pv_request(&req_with_atomic(PvField::Scalar(ScalarValue::Double(0.0)))),
+            Some(false),
+            "real 0.0 ⇒ false"
+        );
     }
 
     // ---- channel-filter accept/reject parity with dbChannelCreate ----

@@ -428,6 +428,19 @@ fn expand_template(pattern: &Regex, input: &str, template: &str) -> String {
 }
 
 /// Parse a `.pvlist` file from string content.
+///
+/// Parsing is per-line recoverable, matching C `gateAs::readPvList`
+/// (gateAs.cc:530-632): a malformed line is logged and SKIPPED, and the
+/// valid rules before and after it still load. C diagnoses every error
+/// family — missing command (`:532`), missing/invalid ORDER operands
+/// (`:581,:593`), missing ALIAS target (`:602`), unknown command, and
+/// `gateAsEntry::init()`/regex failures — with `fprintf` and then `continue`
+/// or falls through to the next line; an `AS`/`PVL` reload keeps the gateway
+/// running on the newly parsed valid subset. An invalid ORDER line leaves the
+/// previous `order` value unchanged (C never assigns `eval_order` on the
+/// invalid branch). The only hard error is an I/O failure reading the file,
+/// which lives in [`parse_pvlist_file`]; this string parser therefore always
+/// returns `Ok`. Regression R0604-BRCAGW-PVLIST-LINE-ERROR-ABORT-1.
 pub fn parse_pvlist(content: &str) -> BridgeResult<PvList> {
     let mut list = PvList::new();
 
@@ -456,14 +469,32 @@ pub fn parse_pvlist(content: &str) -> BridgeResult<PvList> {
             .is_some_and(|cmd| cmd.eq_ignore_ascii_case("ORDER"))
         {
             // `head` now yields the operand tokens (after the pattern token and
-            // the ORDER command). Pass them on for comma/whitespace splitting.
-            list.order = parse_order_directive(head, lineno + 1)?;
+            // the ORDER command). A malformed ORDER line is skipped and leaves
+            // `list.order` unchanged (C falls through without reassigning
+            // `eval_order`, gateAs.cc:593-597).
+            match parse_order_directive(head, lineno + 1) {
+                Ok(order) => list.order = order,
+                Err(e) => tracing::warn!(
+                    line = lineno + 1,
+                    error = %e,
+                    "pvlist: skipping malformed EVALUATION ORDER line, keeping prior order \
+                     (C gateAs.cc:593-597 logs and continues)"
+                ),
+            }
             continue;
         }
 
-        // Pattern rule: pattern KEYWORD [args...]
-        let entry = parse_rule_line(line, lineno + 1)?;
-        list.entries.push(entry);
+        // Pattern rule: pattern KEYWORD [args...]. A malformed rule (missing
+        // keyword, bad regex, missing ALIAS target, unknown command) is
+        // skipped, not fatal — C drops just that rule and keeps the rest.
+        match parse_rule_line(line, lineno + 1) {
+            Ok(entry) => list.entries.push(entry),
+            Err(e) => tracing::warn!(
+                line = lineno + 1,
+                error = %e,
+                "pvlist: skipping malformed rule line (C gateAs.cc:532-628 logs and continues)"
+            ),
+        }
     }
 
     Ok(list)
@@ -960,9 +991,20 @@ mod tests {
             EvaluationOrder::AllowDeny
         );
 
-        // Genuinely invalid operands are still rejected.
-        assert!(parse_pvlist("EVALUATION ORDER ALLOW ALLOW").is_err());
-        assert!(parse_pvlist("EVALUATION ORDER ALLOW").is_err());
+        // Genuinely invalid operands are skipped (logged) and leave the order
+        // at its prior value — C logs "invalid"/"missing argument" and
+        // `continue`s WITHOUT reassigning `eval_order` (gateAs.cc:585,593-597).
+        // With no preceding ORDER line the default (AllowDeny) is retained.
+        assert_eq!(
+            parse_pvlist("EVALUATION ORDER ALLOW ALLOW").unwrap().order,
+            EvaluationOrder::AllowDeny,
+            "invalid ORDER operands leave default order unchanged"
+        );
+        assert_eq!(
+            parse_pvlist("EVALUATION ORDER ALLOW").unwrap().order,
+            EvaluationOrder::AllowDeny,
+            "missing ORDER operand leaves default order unchanged"
+        );
 
         // `ORDER` as the *first* token is NOT a directive — it is a pattern
         // named "ORDER" with keyword ALLOW (matches C: pattern, then cmd).
@@ -1129,7 +1171,13 @@ mod tests {
 
     #[test]
     fn parse_invalid_keyword() {
-        assert!(parse_pvlist("foo BAD").is_err());
+        // Unknown command: C logs "invalid command '%s'" and the loop iterates
+        // to the next line (gateAs.cc:627-629) — the malformed line is dropped,
+        // not a whole-file abort. parse_rule_line still reports the error; the
+        // file parser skips it. Regression R0604-BRCAGW-PVLIST-LINE-ERROR-ABORT-1.
+        assert!(parse_rule_line("foo BAD", 1).is_err());
+        let list = parse_pvlist("foo BAD").unwrap();
+        assert!(list.entries.is_empty(), "unknown command line skipped");
     }
 
     /// C ca-gateway (gateAs.cc:617-621) accepts PATTERN and PV as synonyms
@@ -1168,12 +1216,78 @@ mod tests {
 
     #[test]
     fn parse_invalid_regex() {
-        assert!(parse_pvlist("[invalid ALLOW").is_err());
+        // Bad pattern: C's gateAsEntry::init() fails, the entry is deleted and
+        // the loop continues (gateAs.cc:619-620). parse_rule_line reports the
+        // error; the file parser skips just that line.
+        // Regression R0604-BRCAGW-PVLIST-LINE-ERROR-ABORT-1.
+        assert!(parse_rule_line("[invalid ALLOW", 1).is_err());
+        let list = parse_pvlist("[invalid ALLOW").unwrap();
+        assert!(list.entries.is_empty(), "invalid-regex line skipped");
     }
 
     #[test]
     fn parse_alias_missing_target() {
-        assert!(parse_pvlist("foo ALIAS").is_err());
+        // Missing ALIAS real-name target: C logs "missing real name in ALIAS
+        // command" and `continue`s (gateAs.cc:602-605). parse_rule_line reports
+        // the error; the file parser skips just that line, not the whole file.
+        // Regression R0604-BRCAGW-PVLIST-LINE-ERROR-ABORT-1.
+        assert!(parse_rule_line("foo ALIAS", 1).is_err());
+        let list = parse_pvlist("foo ALIAS").unwrap();
+        assert!(list.entries.is_empty(), "ALIAS-missing-target line skipped");
+    }
+
+    /// Regression R0604-BRCAGW-PVLIST-LINE-ERROR-ABORT-1: a single malformed
+    /// `.pvlist` line must NOT abort the whole load/reload. C `gateAs::readPvList`
+    /// (gateAs.cc:530-632) logs and `continue`s on every malformed line family —
+    /// missing command (:532-535), missing/invalid ORDER operands (:585,:593-597,
+    /// `eval_order` left unchanged), missing ALIAS target (:602-605), unknown
+    /// command (:627-629), and `gateAsEntry::init()`/regex failures (:619-620) —
+    /// keeping the valid rules before and after it. This test sandwiches each
+    /// malformed family between valid ALLOW lines and asserts (a) all valid
+    /// siblings survive and (b) the invalid ORDER leaves the previous order value
+    /// unchanged.
+    #[test]
+    fn malformed_lines_are_skipped_valid_siblings_survive() {
+        let content = r#"
+            A0:.* ALLOW
+            LonelyPattern
+            A1:.* ALLOW
+            EVALUATION ORDER DENY, ALLOW
+            EVALUATION ORDER ALLOW ALLOW
+            A2:.* ALLOW
+            foo ALIAS
+            A3:.* ALLOW
+            bar BAZ
+            A4:.* ALLOW
+            [invalid ALLOW
+            A5:.* ALLOW
+        "#;
+        let list = parse_pvlist(content).unwrap();
+
+        // The six valid ALLOW lines (one before and one after each malformed
+        // family) all load; the five malformed lines contribute nothing.
+        assert_eq!(
+            list.entries.len(),
+            6,
+            "all valid ALLOW siblings survive; malformed lines skipped"
+        );
+        for i in 0..6 {
+            assert!(
+                list.match_name(&format!("A{i}:x")).is_some(),
+                "valid sibling A{i} survived",
+            );
+        }
+
+        // The valid `DENY, ALLOW` line set DenyAllow; the immediately-following
+        // invalid `ALLOW ALLOW` line is skipped and must NOT reset the order —
+        // C never reassigns `eval_order` on the invalid branch. A reset would
+        // leave the default AllowDeny, so DenyAllow proves the invalid line was
+        // a no-op for the order.
+        assert_eq!(
+            list.order,
+            EvaluationOrder::DenyAllow,
+            "invalid ORDER line leaves the previously-set order unchanged"
+        );
     }
 
     /// C ca-gateway (gateAs.cc:612) parses ASL with `sscanf("%d")`; when that
@@ -1220,9 +1334,18 @@ mod tests {
             other => panic!("expected Allow, got {other:?}"),
         }
 
-        // A missing ALIAS target is a genuine syntax error C also rejects —
-        // it must stay a hard parse error, not fall through to level 1.
-        assert!(parse_pvlist("foo ALIAS").is_err());
+        // A missing ALIAS target is a genuine per-line syntax error (C logs
+        // "missing real name in ALIAS command" and `continue`s,
+        // gateAs.cc:602-605) — it must NOT fall through to a level-1 ALIAS
+        // rule. parse_rule_line rejects it; the file parser skips the line,
+        // leaving no entry, distinct from the unparseable-ASL case above which
+        // keeps the rule at level 1.
+        assert!(parse_rule_line("foo ALIAS", 1).is_err());
+        let list = parse_pvlist("foo ALIAS").unwrap();
+        assert!(
+            list.entries.is_empty(),
+            "missing ALIAS target is skipped, not installed at level 1"
+        );
     }
 
     /// Regression R0604-BRCAGW-PVLIST-ASL-PREFIX-1: C reads the ASL token with
@@ -1535,12 +1658,19 @@ mod tests {
     /// silently mis-compiling (fix-direction option (b)).
     #[test]
     fn in_pattern_backreference_is_rejected() {
-        let err = parse_pvlist(r"\(.*\)\1 ALLOW").unwrap_err();
+        // parse_rule_line still produces the clear back-reference diagnostic...
+        let err = parse_rule_line(r"\(.*\)\1 ALLOW", 1).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("back-reference"),
             "expected a back-reference diagnostic, got: {msg}"
         );
+        // ...but at the file level the unrepresentable line is skipped, not a
+        // whole-file abort — C compiles BRE `\1` fine, so dropping just this
+        // line keeps the Rust port's reload behaviour C-compatible for the
+        // valid siblings. Regression R0604-BRCAGW-PVLIST-LINE-ERROR-ABORT-1.
+        let list = parse_pvlist(r"\(.*\)\1 ALLOW").unwrap();
+        assert!(list.entries.is_empty(), "back-reference line skipped");
     }
 
     #[test]

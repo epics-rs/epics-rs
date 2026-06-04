@@ -1,7 +1,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// EPICS epoch starts at 1990-01-01 00:00:00 UTC.
-const EPICS_EPOCH_OFFSET: u64 = 631_152_000;
+/// Equals pvxs/pvData `POSIX_TIME_AT_EPICS_EPOCH`; added when converting an
+/// EPICS-epoch timestamp to the POSIX-epoch `time_t` carried on the wire.
+pub const EPICS_EPOCH_OFFSET: u64 = 631_152_000;
 
 /// Lightweight EPICS timestamp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

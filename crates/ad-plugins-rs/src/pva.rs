@@ -125,7 +125,12 @@ fn ndarray_to_pv_field(array: &NDArray) -> PvField {
         })
         .collect();
 
-    let data_time_stamp = epics_ts_to_nt(&array.timestamp);
+    // C ADCore fills the two NTNDArray time fields from two distinct sources
+    // (ntndArrayConverter.cpp:477-501): `dataTimeStamp` from the floating-point
+    // `NDArray::timeStamp` (fromDataTimeStamp), `timeStamp` from the integer
+    // `NDArray::epicsTS` (fromTimeStamp). Both add POSIX_TIME_AT_EPICS_EPOCH.
+    let data_time_stamp = double_ts_to_nt(array.time_stamp);
+    let time_stamp = epics_ts_to_nt(&array.timestamp);
 
     let attribute: Vec<NdAttribute> = array
         .attributes
@@ -156,14 +161,14 @@ fn ndarray_to_pv_field(array: &NDArray) -> PvField {
         uncompressed_size,
         dimension,
         unique_id: array.unique_id,
-        data_time_stamp: data_time_stamp.clone(),
+        data_time_stamp,
         attribute,
         alarm: NdAlarm {
             severity: 0,
             status: 0,
             message: "NO_ALARM".into(),
         },
-        time_stamp: data_time_stamp,
+        time_stamp,
     };
     nt_nd_array_value(&nt)
 }
@@ -183,10 +188,29 @@ fn ndbuffer_to_buffer(buf: &NDDataBuffer) -> NdArrayBuffer {
     }
 }
 
+/// Convert an EPICS-epoch `epicsTS` into the NT `timeStamp` `time_t`, mirroring
+/// `NTNDArrayConverter::fromTimeStamp` (ntndArrayConverter.cpp:493-501):
+/// `TimeStamp(epicsTS.secPastEpoch + POSIX_TIME_AT_EPICS_EPOCH, epicsTS.nsec)`.
+/// The C `TimeStamp` ctor leaves `userTag` at 0.
 fn epics_ts_to_nt(ts: &ad_core_rs::timestamp::EpicsTimestamp) -> NdTimeStamp {
     NdTimeStamp {
-        seconds_past_epoch: ts.sec as i64,
+        seconds_past_epoch: ts.sec as i64 + ad_core_rs::timestamp::EPICS_EPOCH_OFFSET as i64,
         nanoseconds: ts.nsec as i32,
+        user_tag: 0,
+    }
+}
+
+/// Convert the floating-point `NDArray::timeStamp` (seconds since the EPICS
+/// epoch) into the NT `dataTimeStamp` `time_t`, mirroring
+/// `NTNDArrayConverter::fromDataTimeStamp` (ntndArrayConverter.cpp:477-490):
+/// floor to whole seconds, scale the fraction to nanoseconds, then add
+/// POSIX_TIME_AT_EPICS_EPOCH. The C `TimeStamp` ctor leaves `userTag` at 0.
+fn double_ts_to_nt(t: f64) -> NdTimeStamp {
+    let seconds = t.floor();
+    let nanoseconds = ((t - seconds) * 1e9) as i32;
+    NdTimeStamp {
+        seconds_past_epoch: seconds as i64 + ad_core_rs::timestamp::EPICS_EPOCH_OFFSET as i64,
+        nanoseconds,
         user_tag: 0,
     }
 }
@@ -355,6 +379,7 @@ mod tests {
         use epics_pva_rs::pvdata::PvStructure;
 
         let mut arr = NDArray::new(vec![NDDimension::new(2)], NDDataType::UInt8);
+        arr.time_stamp = 1234.0;
         arr.timestamp.sec = 1234;
         arr.timestamp.nsec = 567;
         arr.attributes.add(NDAttribute::new_static(
@@ -385,9 +410,12 @@ mod tests {
             (sec, nsec)
         };
 
-        // Top-level timestamps follow the image source.
-        assert_eq!(read_ts(s, "dataTimeStamp"), (1234, 567));
-        assert_eq!(read_ts(s, "timeStamp"), (1234, 567));
+        // Top-level timestamps follow the image source, with the EPICS->POSIX
+        // offset added (see R0604-ADPVA-TIMESTAMP-1): dataTimeStamp from the
+        // floating-point `time_stamp`, timeStamp from the integer `epicsTS`.
+        let offset = ad_core_rs::timestamp::EPICS_EPOCH_OFFSET as i64;
+        assert_eq!(read_ts(s, "dataTimeStamp"), (1234 + offset, 0));
+        assert_eq!(read_ts(s, "timeStamp"), (1234 + offset, 567));
 
         // Per-attribute timeStamp must stay default (0, 0), NOT the
         // fabricated image timestamp.
@@ -400,5 +428,54 @@ mod tests {
             (0, 0),
             "per-attribute timeStamp must stay default, not the image timestamp"
         );
+    }
+
+    /// Regression R0604-ADPVA-TIMESTAMP-1.
+    ///
+    /// C ADCore fills the two NTNDArray time fields from two distinct sources
+    /// (ntndArrayConverter.cpp:477-501): `dataTimeStamp` from the floating-point
+    /// `NDArray::timeStamp` (floor the seconds, scale the fraction to ns), and
+    /// `timeStamp` from the integer `NDArray::epicsTS`. Both add
+    /// POSIX_TIME_AT_EPICS_EPOCH to convert the EPICS epoch to POSIX. Pre-fix
+    /// Rust wrote the raw EPICS seconds (no offset) into both fields and sourced
+    /// both from `epicsTS`, ignoring the floating-point `timeStamp` entirely.
+    #[test]
+    fn nt_timestamps_use_distinct_sources_and_posix_offset() {
+        use epics_pva_rs::pvdata::PvStructure;
+
+        let mut arr = NDArray::new(vec![NDDimension::new(2)], NDDataType::UInt8);
+        // Distinct values so a single-source bug is observable: the
+        // floating-point timeStamp carries a sub-second fraction, the integer
+        // epicsTS carries different whole seconds and nanoseconds.
+        arr.time_stamp = 10.25;
+        arr.timestamp.sec = 1000;
+        arr.timestamp.nsec = 42;
+
+        let payload = ndarray_to_pv_field(&arr);
+        let PvField::Structure(s) = &payload else {
+            panic!("expected structure, got {payload:?}");
+        };
+
+        let read_ts = |st: &PvStructure, field: &str| -> (i64, i32) {
+            let Some(PvField::Structure(ts)) = st.get_field(field) else {
+                panic!("expected {field} time_t structure");
+            };
+            let sec = match ts.get_field("secondsPastEpoch") {
+                Some(PvField::Scalar(ScalarValue::Long(v))) => *v,
+                other => panic!("expected secondsPastEpoch Long, got {other:?}"),
+            };
+            let nsec = match ts.get_field("nanoseconds") {
+                Some(PvField::Scalar(ScalarValue::Int(v))) => *v,
+                other => panic!("expected nanoseconds Int, got {other:?}"),
+            };
+            (sec, nsec)
+        };
+
+        let offset = ad_core_rs::timestamp::EPICS_EPOCH_OFFSET as i64;
+
+        // dataTimeStamp: floor(10.25)=10s + offset, fraction 0.25 -> 250_000_000ns.
+        assert_eq!(read_ts(s, "dataTimeStamp"), (10 + offset, 250_000_000));
+        // timeStamp: epicsTS 1000s + offset, 42ns — distinct source from above.
+        assert_eq!(read_ts(s, "timeStamp"), (1000 + offset, 42));
     }
 }

@@ -222,6 +222,12 @@ fn validate(cfg: &GatewayConfigFile) -> Result<(), String> {
     // Unique client names — duplicates would silently shadow under
     // server→client resolution.
     for (i, a) in cfg.clients.iter().enumerate() {
+        // C gwmain.cpp:298-299 rejects an empty client name before the
+        // duplicate check, configure_client, or any provider use.
+        // Regression R0604-BRPVAGW-CONFIG-EMPTY-NAMES-1.
+        if a.name.is_empty() {
+            return Err("Client with empty name not allowed".to_string());
+        }
         if a.provider != "pva" {
             return Err(format!(
                 "client '{}': provider '{}' is not supported by pva-gateway-rs \
@@ -236,6 +242,11 @@ fn validate(cfg: &GatewayConfigFile) -> Result<(), String> {
         }
     }
     for (i, a) in cfg.servers.iter().enumerate() {
+        // C gwmain.cpp:314-315 rejects an empty server name before the
+        // duplicate check. Regression R0604-BRPVAGW-CONFIG-EMPTY-NAMES-1.
+        if a.name.is_empty() {
+            return Err("Server with empty name not allowed".to_string());
+        }
         for b in &cfg.servers[i + 1..] {
             if a.name == b.name {
                 return Err(format!("duplicate server name '{}'", a.name));
@@ -658,6 +669,36 @@ mod tests {
         )
         .expect("parse");
         assert_eq!(validate(&cfg).unwrap_err(), "duplicate client name 'c'");
+    }
+
+    #[test]
+    fn empty_client_name_rejected() {
+        // Regression R0604-BRPVAGW-CONFIG-EMPTY-NAMES-1: C gwmain.cpp:298-299
+        // rejects an empty client name before the duplicate check.
+        let cfg = parse_config(
+            r#"{"version":1,"clients":[{"name":"","provider":"pva"}],
+                "servers":[{"name":"s","clients":[""]}]}"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            validate(&cfg).unwrap_err(),
+            "Client with empty name not allowed"
+        );
+    }
+
+    #[test]
+    fn empty_server_name_rejected() {
+        // Regression R0604-BRPVAGW-CONFIG-EMPTY-NAMES-1: C gwmain.cpp:314-315
+        // rejects an empty server name before the duplicate check.
+        let cfg = parse_config(
+            r#"{"version":1,"clients":[{"name":"c","provider":"pva"}],
+                "servers":[{"name":"","clients":["c"]}]}"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            validate(&cfg).unwrap_err(),
+            "Server with empty name not allowed"
+        );
     }
 
     #[test]

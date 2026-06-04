@@ -882,6 +882,31 @@ fn rearm_after_send(
     }
 }
 
+/// Deduplicate name-server targets, preserving first-seen order.
+///
+/// pvxs parses `EPICS_PVA_NAME_SERVERS` through `split_addr_into`
+/// (config.cpp:148-183), which resolves hostnames, re-prints each as a
+/// canonical address, then `std::sort`s and `std::unique`s the list — so a
+/// duplicate token (`"host:5075 host:5075"`) collapses to ONE entry and
+/// `startNS` (client.cpp:651-667) opens exactly one persistent TCP
+/// connection per unique target. Our `name_servers()` returned the parsed
+/// vector unchanged, so a duplicate token spawned two `ns_task`s and
+/// double-forwarded every SEARCH. Dedup at the spawn gate — the single
+/// owner of the list→connections transition — restores one-connection-per-
+/// unique-target for both env-derived and programmatic
+/// `PvaClientBuilder::name_servers()` lists. Order is preserved rather than
+/// sorted: name servers are queried in parallel, so pvxs's canonical sort is
+/// not observable, and first-seen order keeps the config's intent.
+///
+/// Regression R0604-PVA-NAMESERVER-DEDUP-1.
+fn dedup_name_servers(name_servers: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let mut seen = std::collections::HashSet::with_capacity(name_servers.len());
+    name_servers
+        .into_iter()
+        .filter(|a| seen.insert(*a))
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_engine(
     mut cmd_rx: mpsc::Receiver<SearchCommand>,
@@ -953,6 +978,10 @@ async fn run_engine(
     // pvxs client.cpp:651-667 startNS(): one persistent TCP connection per
     // EPICS_PVA_NAME_SERVERS entry. Each ns_task handles connect/reconnect;
     // ns_senders receives SEARCH frame bytes to forward over the connection.
+    // Collapse duplicate name-server targets to one TCP connection each, matching
+    // pvxs `split_addr_into` sort+unique (config.cpp:179-183). See
+    // `dedup_name_servers`. Regression R0604-PVA-NAMESERVER-DEDUP-1.
+    let name_servers = dedup_name_servers(name_servers);
     let (ns_response_tx, mut ns_response_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(64);
     let mut ns_senders: Vec<NsHandle> = Vec::with_capacity(name_servers.len());
     for ns_addr in name_servers {
@@ -2436,6 +2465,36 @@ mod tests {
     use super::*;
     use crate::proto::{ByteOrder, ControlCommand, WriteExt, encode_string_into};
     use serial_test::serial;
+
+    // ---- name-server dedup (pvxs split_addr_into sort+unique) ----
+    //
+    // Regression R0604-PVA-NAMESERVER-DEDUP-1: a duplicate
+    // `EPICS_PVA_NAME_SERVERS` token must collapse to one connection target,
+    // matching pvxs `split_addr_into` (config.cpp:179-183). One case per
+    // boundary: an exact duplicate is dropped; distinct targets are kept in
+    // first-seen order (not sorted); an already-unique list is unchanged.
+    #[test]
+    fn dedup_name_servers_collapses_duplicates_preserving_order() {
+        let a: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:5076".parse().unwrap();
+        let c: SocketAddr = "10.0.0.1:5075".parse().unwrap();
+
+        // Exact duplicate token → one entry.
+        assert_eq!(dedup_name_servers(vec![a, a]), vec![a]);
+
+        // Distinct targets preserved in first-seen order (pvxs sorts, but the
+        // sort is unobservable since name servers are queried in parallel).
+        assert_eq!(dedup_name_servers(vec![c, a, b]), vec![c, a, b]);
+
+        // Interleaved duplicates: keep the first occurrence of each.
+        assert_eq!(dedup_name_servers(vec![a, b, a, c, b]), vec![a, b, c]);
+
+        // Already-unique list is returned unchanged.
+        assert_eq!(dedup_name_servers(vec![a, b, c]), vec![a, b, c]);
+
+        // Empty list stays empty.
+        assert_eq!(dedup_name_servers(Vec::new()), Vec::<SocketAddr>::new());
+    }
 
     // ---- maybe_poke rate-limit invariant (pvxs pokeHoldoff, A8-R2-1) ----
     //

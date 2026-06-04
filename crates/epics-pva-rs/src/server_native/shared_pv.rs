@@ -668,30 +668,32 @@ impl SharedPV {
         changed: &crate::proto::BitSet,
         delta: PvField,
     ) -> Result<(), String> {
-        // Phase 1: under the lock, dispatch on PUT policy. The merge
+        // Under the lock, dispatch on PUT policy. The merge
         // (`fill_unmarked_from_prior`, a pure function) is safe to call
         // while holding the parking_lot mutex.
         //
         // Reject/Readonly bail BEFORE merging so a non-writable PV's
         // stored value is never touched (pvxs `sharedpv.cpp:209-227`).
         //
-        // The MAILBOX store happens under THIS lock, atomically with the
-        // merge, so two concurrent disjoint delta PUTs cannot both read
-        // the same prior and clobber each other (the read-merge-write
-        // invariant). A CUSTOM handler runs OUTSIDE the lock (it may
-        // re-enter the PV), so its merge-then-handle is not atomic — the
-        // handler owns that semantics, exactly as it does for `put`.
-        enum Applied {
-            Posted {
-                value: PvField,
-                subscribers: Vec<MonitorOutbox>,
-            },
-            Handler {
-                handler: OnPutFn,
-                value: PvField,
-            },
-        }
-        let applied = {
+        // MAILBOX merge + store + deliver all happen under THIS lock.
+        // Storing under the lock gives the read-merge-write invariant
+        // (two concurrent disjoint delta PUTs cannot both read the same
+        // prior and clobber each other). Delivering under the SAME lock
+        // closes R0604-PVASRV-SHAREDPV-PUTDELTA-CLOSE-RACE-1: `close()`
+        // also takes `inner`, so a post and a close serialize exactly as
+        // pvxs serializes `post()`/`close()` on `impl->lock`
+        // (`sharedpv.cpp:394-407`) — there is no window in which a value
+        // is delivered to a subscriber that `close()` already cleared.
+        // (The prior design cloned `inner.subscribers` under the lock and
+        // posted to the clone after releasing it; a `close()` landing in
+        // that gap cleared the canonical set while the live clone still
+        // delivered.) `MonitorOutbox::post` only locks its own per-queue
+        // mutex (never `inner`), so holding `inner` across delivery cannot
+        // deadlock. This mirrors `try_post_checked`'s in-lock delivery.
+        // Only a CUSTOM handler is deferred OUTSIDE the lock (it may
+        // re-enter the PV — post/close — so holding `inner` across it
+        // would deadlock), exactly as `put` defers it.
+        let deferred = {
             let mut g = self.inner.lock();
             let inner = &mut *g;
             let policy = inner.put_policy.clone();
@@ -725,12 +727,15 @@ impl SharedPV {
                             "SharedPV::put_delta: merged value does not fit opened descriptor ({e})"
                         ));
                     }
-                    // store atomically with the read above.
+                    // Store + deliver atomically under this lock — the
+                    // close-race fix. pvxs servermon.cpp:283-286:
+                    // squash-to-tail for a normal post; retain drops
+                    // receivers that have closed.
                     *prior = merged.clone();
-                    Applied::Posted {
-                        value: merged,
-                        subscribers: inner.subscribers.clone(),
-                    }
+                    inner
+                        .subscribers
+                        .retain(|tx| tx.post(merged.clone(), false));
+                    return Ok(());
                 }
                 PutPolicy::Custom(handler) => {
                     let PvState::Open { value: prior, .. } = &mut inner.state else {
@@ -739,29 +744,14 @@ impl SharedPV {
                     let merged = crate::pvdata::encode::fill_unmarked_from_prior(
                         desc, changed, 0, delta, prior,
                     );
-                    Applied::Handler {
-                        handler,
-                        value: merged,
-                    }
+                    (handler, merged)
                 }
             }
         };
-        // Phase 2: outside the lock — post to subscribers (mailbox) or
-        // run the user handler (custom).
-        match applied {
-            Applied::Posted {
-                value,
-                mut subscribers,
-            } => {
-                // pvxs servermon.cpp:283-286: squash-to-tail for normal post.
-                subscribers.retain(|tx| tx.post(value.clone(), false));
-                // Reconcile the canonical subscriber set: drop receivers
-                // that closed between the phase-1 snapshot and now.
-                self.inner.lock().subscribers.retain(|tx| !tx.is_closed());
-                Ok(())
-            }
-            Applied::Handler { handler, value } => handler(self, value),
-        }
+        // A CUSTOM handler runs OUTSIDE the lock (it may re-enter the PV);
+        // it owns any re-post / close side-effects, exactly as for `put`.
+        let (handler, value) = deferred;
+        handler(self, value)
     }
 
     /// pvxs `SharedPV::buildMailbox` `onPut` timestamp-fill
@@ -2237,6 +2227,100 @@ mod tests {
             after.is_none(),
             "close() must terminate the subscriber inbox"
         );
+    }
+
+    /// Regression R0604-PVASRV-SHAREDPV-PUTDELTA-CLOSE-RACE-1.
+    /// Mailbox `put_delta` now stores the merged value AND delivers it to
+    /// subscribers under one `inner` lock — the same lock `close()` takes
+    /// (pvxs serializes `post()`/`close()` on `impl->lock`,
+    /// `sharedpv.cpp:394-407`). This pins the in-lock contract: a PUT
+    /// while open commits the value and the subscriber observes exactly
+    /// that committed value; once `close()` runs, the inbox terminates
+    /// and a later PUT is rejected with no surviving clone to deliver a
+    /// post-close value.
+    #[tokio::test]
+    async fn r0604_put_delta_store_and_delivery_serialize_with_close() {
+        use crate::proto::BitSet;
+        let pv = SharedPV::build_mailbox();
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
+            .unwrap();
+        let mut rx = pv.subscribe(8).expect("subscribe");
+        let _ = rx.recv().await.expect("initial value");
+
+        let desc = nt_scalar_int_desc();
+        let mut changed = BitSet::new();
+        changed.set(1);
+        // PUT while open: store and delivery happen under one lock, so
+        // `current()` and the delivered value are the same commit.
+        pv.put_delta(&desc, &changed, nt_scalar_int_value(7))
+            .expect("put while open");
+        assert_eq!(extract_int(&pv.current().unwrap()), 7, "store committed");
+        assert_eq!(
+            extract_int(&rx.recv().await.unwrap()),
+            7,
+            "subscriber observes the committed value"
+        );
+
+        // close() terminates the subscriber. Because delivery is under
+        // the same lock, no post can be ordered after this boundary.
+        pv.close();
+        assert!(rx.recv().await.is_none(), "close terminates the inbox");
+
+        // A PUT after close is rejected; there is no surviving subscriber
+        // clone (the pre-fix cross-lock clone) to receive a post-close
+        // value.
+        let err = pv
+            .put_delta(&desc, &changed, nt_scalar_int_value(9))
+            .unwrap_err();
+        assert!(err.contains("not open"), "put after close rejected: {err}");
+        assert!(pv.current().is_none(), "closed PV has no current value");
+    }
+
+    /// Regression R0604-PVASRV-SHAREDPV-PUTDELTA-CLOSE-RACE-1 (liveness).
+    /// In-lock delivery must not deadlock against `close()`. Both `put_delta`
+    /// (mailbox) and `close()` take the `inner` mutex, and delivery now runs
+    /// while `inner` is held; this is safe only because `MonitorOutbox::post`
+    /// locks solely its own per-queue mutex (never `inner`). Race real
+    /// threads: every PUT and every close must make progress (both joins
+    /// return) — a deadlock would hang this test.
+    #[test]
+    fn r0604_put_delta_close_race_makes_progress_without_deadlock() {
+        use crate::proto::BitSet;
+        use std::sync::{Arc, Barrier};
+        let desc = nt_scalar_int_desc();
+        let mut changed = BitSet::new();
+        changed.set(1);
+
+        for iter in 0..100 {
+            let pv = SharedPV::build_mailbox();
+            pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
+                .unwrap();
+            // Hold a live subscriber so delivery runs under the lock during
+            // the race (the path that would deadlock if post() took inner).
+            let _rx = pv.subscribe(8).expect("subscribe");
+            let barrier = Arc::new(Barrier::new(2));
+
+            let w_pv = pv.clone();
+            let w_desc = desc.clone();
+            let w_changed = changed.clone();
+            let w_barrier = Arc::clone(&barrier);
+            let writer = std::thread::spawn(move || {
+                w_barrier.wait();
+                // A PUT racing a close may be accepted or rejected; both are
+                // valid serializations. We only require it to return.
+                let _ = w_pv.put_delta(&w_desc, &w_changed, nt_scalar_int_value(iter));
+            });
+            let c_pv = pv.clone();
+            let c_barrier = Arc::clone(&barrier);
+            let closer = std::thread::spawn(move || {
+                c_barrier.wait();
+                c_pv.close();
+            });
+            writer.join().unwrap();
+            closer.join().unwrap();
+            // close() always wins eventually: the PV ends closed.
+            assert!(!pv.is_open(), "PV must be closed after the race");
+        }
     }
 
     #[tokio::test]

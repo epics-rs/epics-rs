@@ -975,22 +975,22 @@ pub async fn run_udp_responder_v6(
 /// Resolve a SEARCH_RESPONSE destination from the announced reply
 /// address/port and the UDP source, for the IPv6 responder.
 ///
-/// - Explicit (non-wildcard) reply address: trust the advertised
-///   address AND port (pvxs `udp_collector.cpp:377-380`). This is the
-///   capability the pre-fix v6 responder lacked — it always replied to
-///   the UDP source and ignored an explicit v6 reply endpoint.
-/// - Wildcard reply address: reply to the sender's actual socket tuple.
-///   pvxs additionally overrides the port with the advertised value
-///   (`:380 setPort`), which assumes the client advertises the port it
-///   listens on. The in-repo Rust v6 client advertises its v4
-///   search-socket port while listening on a distinct v6 socket
-///   (`client_native/search_engine.rs` `bind_ephemeral_udp_v6` binds an
-///   independent ephemeral port), so adopting the advertised port on the
-///   wildcard path would route the reply to a port nothing listens on.
-///   Replying to the real source tuple is the robust "reply to sender".
-///   Aligning the client's advertised v6 `response_port` (so the server
-///   can take pvxs's unconditional `setPort`) is a client-side change
-///   tracked as a cross-request.
+/// Mirrors pvxs `udp_collector.cpp:367-380`: the 16-byte reply address
+/// decodes into `replyDest`, then `replyDest.setPort(port)` runs
+/// unconditionally — on both the explicit-address branch and the
+/// wildcard `server.isAny()` branch. So:
+///
+/// - Explicit (non-wildcard) reply address: reply to the advertised
+///   address AND port.
+/// - Wildcard reply address: reply to the sender's source IP but with
+///   the advertised port (pvxs `:380 setPort`), not the UDP source port.
+///   This is correct because the Rust v6 SEARCH client now advertises
+///   the actual v6 receive-socket port (`client_native/search_engine.rs`
+///   `bind_ephemeral_udp_v6` binds an independent ephemeral port whose
+///   number is stamped into the v6 SEARCH frame's `response_port`), so a
+///   pvxs-compatible split-socket client that sends from one port and
+///   listens on the advertised port is answered on the port it listens
+///   on. Regression R0604-PVASRV-V6-WILDCARD-SEARCH-PORT-1.
 fn resolve_reply_dest(
     reply_addr: Option<IpAddr>,
     reply_port: u16,
@@ -998,7 +998,7 @@ fn resolve_reply_dest(
 ) -> SocketAddr {
     match reply_addr {
         Some(ip) => SocketAddr::new(ip, reply_port),
-        None => udp_src,
+        None => SocketAddr::new(udp_src.ip(), reply_port),
     }
 }
 
@@ -2667,19 +2667,20 @@ mod tests {
     /// `resolve_reply_dest` invariant boundaries: an explicit advertised
     /// address is honoured with its advertised port (pvxs
     /// `udp_collector.cpp:377-380`), including a port that differs from
-    /// the UDP source port; a wildcard (`None`) replies to the full UDP
-    /// source tuple (see the helper doc for the deliberate deviation
-    /// from pvxs's wildcard `setPort`).
+    /// the UDP source port; a wildcard (`None`) replies to the sender's
+    /// source IP but with the advertised port (pvxs's unconditional
+    /// `:380 setPort`). Regression R0604-PVASRV-V6-WILDCARD-SEARCH-PORT-1.
     #[test]
     fn resolve_reply_dest_boundaries() {
         use std::net::Ipv6Addr;
         let src: SocketAddr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5000);
 
-        // Wildcard reply addr → full UDP source tuple (source port kept).
+        // Wildcard reply addr → sender's source IP with the *advertised*
+        // port (9876), not the UDP source port (5000): pvxs `setPort`.
         assert_eq!(
             resolve_reply_dest(None, 9876, src),
-            src,
-            "wildcard replies to the sender's actual socket tuple"
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9876),
+            "wildcard replies to the sender IP on the advertised port"
         );
 
         // Explicit v6 reply addr → that addr, advertised port (differs

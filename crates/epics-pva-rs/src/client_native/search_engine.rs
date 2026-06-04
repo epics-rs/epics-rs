@@ -971,6 +971,19 @@ async fn run_engine(
         .first()
         .map(|a| a.port())
         .unwrap_or(0);
+    // The v6 SEARCH socket (`bind_ephemeral_udp_v6` → `[::]:0`) binds its
+    // own ephemeral port, distinct from the v4 search socket's shared
+    // port. A SEARCH frame must advertise the response port of the socket
+    // it is transmitted on (pvxs honours the advertised `response_port`
+    // via `udp_collector.cpp:380 setPort`), so v6 frames carry the v6
+    // socket's port while v4 frames keep `response_port`. With v6 disabled
+    // this equals `response_port`, so v6/v4 frames are byte-identical.
+    // Regression R0604-PVASRV-V6-WILDCARD-SEARCH-PORT-1.
+    let response_port_v6 = search_socket_v6
+        .as_ref()
+        .and_then(|s| s.local_addr().ok())
+        .map(|a| a.port())
+        .unwrap_or(response_port);
 
     let mut pending: HashMap<u32, Pending> = HashMap::new(); // by search_id
     let mut by_name: HashMap<String, u32> = HashMap::new(); // pv_name → search_id
@@ -1291,8 +1304,9 @@ async fn run_engine(
                     // gates on this exact value (client.cpp:889) so an
                     // unrelated found=false reply is not promoted to a fake
                     // beacon.
-                    let pkt = codec.build_discover_search(SEARCH_SEQ, response_port);
-                    broadcast(&search_socket, search_socket_v6.as_ref(), &pkt, &extra_targets, &client_interfaces, &mut search_send_errs).await;
+                    let pkt_v4 = codec.build_discover_search(SEARCH_SEQ, response_port);
+                    let pkt_v6 = codec.build_discover_search(SEARCH_SEQ, response_port_v6);
+                    broadcast(&search_socket, search_socket_v6.as_ref(), &pkt_v4, &pkt_v6, &extra_targets, &client_interfaces, &mut search_send_errs).await;
                 }
                 None => break,
             },
@@ -1448,6 +1462,7 @@ async fn run_engine(
                     &pending,
                     &codec,
                     response_port,
+                    response_port_v6,
                     &search_socket,
                     search_socket_v6.as_ref(),
                     &extra_targets,
@@ -1569,11 +1584,17 @@ async fn run_engine(
                 // broadcast each; reuse the packed names for name-server
                 // forwarding with the response port zeroed.
                 if !to_send.is_empty() {
-                    for frame in pack_search_frames(&codec, &to_send, response_port, false) {
+                    // Pack the same entries with each family's response
+                    // port. The port field is fixed-width, so the two sets
+                    // batch identically and pair 1:1 (see `broadcast`).
+                    let frames_v4 = pack_search_frames(&codec, &to_send, response_port, false);
+                    let frames_v6 = pack_search_frames(&codec, &to_send, response_port_v6, false);
+                    for (frame_v4, frame_v6) in frames_v4.iter().zip(&frames_v6) {
                         broadcast(
                             &search_socket,
                             search_socket_v6.as_ref(),
-                            &frame,
+                            frame_v4,
+                            frame_v6,
                             &extra_targets,
                             &client_interfaces,
                             &mut search_send_errs,
@@ -1744,7 +1765,15 @@ fn search_targets(
 async fn broadcast(
     socket: &AsyncUdpV4,
     socket_v6: Option<&Arc<UdpSocket>>,
-    packet: &[u8],
+    // The SEARCH frame to transmit, in two per-family variants: `packet_v4`
+    // advertises the v4 search socket's response port and goes to every v4
+    // destination; `packet_v6` advertises the v6 socket's port and goes to
+    // every v6 destination. The two differ only in the 2-byte
+    // `response_port` field (identical length → identical MTU batching),
+    // so a caller that packs both with the same entries gets 1:1 frames.
+    // Regression R0604-PVASRV-V6-WILDCARD-SEARCH-PORT-1.
+    packet_v4: &[u8],
+    packet_v6: &[u8],
     extra_targets: &[SocketAddr],
     client_interfaces: &[Ipv4Addr],
     send_errs: &mut HashSet<SocketAddr>,
@@ -1772,13 +1801,13 @@ async fn broadcast(
             SocketAddr::V4(v4) => {
                 let needs_fanout = v4.ip().is_broadcast() || v4.ip().is_multicast();
                 if needs_fanout {
-                    socket.fanout_to(packet, t).await.map(|_| ())
+                    socket.fanout_to(packet_v4, t).await.map(|_| ())
                 } else {
-                    socket.send_to(packet, t).await.map(|_| ())
+                    socket.send_to(packet_v4, t).await.map(|_| ())
                 }
             }
             SocketAddr::V6(_) => match socket_v6 {
-                Some(s6) => s6.send_to(packet, t).await.map(|_| ()),
+                Some(s6) => s6.send_to(packet_v6, t).await.map(|_| ()),
                 None => Err(std::io::Error::new(
                     std::io::ErrorKind::AddrNotAvailable,
                     "no IPv6 search socket; v6 entry routed despite v6 disabled",
@@ -1818,6 +1847,7 @@ async fn flush_initial_searches(
     pending: &HashMap<u32, Pending>,
     codec: &PvaCodec,
     response_port: u16,
+    response_port_v6: u16,
     search_socket: &AsyncUdpV4,
     search_socket_v6: Option<&Arc<UdpSocket>>,
     extra_targets: &[SocketAddr],
@@ -1840,11 +1870,16 @@ async fn flush_initial_searches(
     if entries.is_empty() {
         return;
     }
-    for frame in pack_search_frames(codec, &entries, response_port, false) {
+    // Pack the same entries with each family's response port; the fixed-
+    // width port field keeps the two sets batched identically (1:1).
+    let frames_v4 = pack_search_frames(codec, &entries, response_port, false);
+    let frames_v6 = pack_search_frames(codec, &entries, response_port_v6, false);
+    for (frame_v4, frame_v6) in frames_v4.iter().zip(&frames_v6) {
         broadcast(
             search_socket,
             search_socket_v6,
-            &frame,
+            frame_v4,
+            frame_v6,
             extra_targets,
             client_interfaces,
             send_errs,
@@ -4322,6 +4357,75 @@ mod tests {
             "resolved server address must be IPv6; got {resolved:?}"
         );
         drop(server);
+    }
+
+    /// Regression R0604-PVASRV-V6-WILDCARD-SEARCH-PORT-1 (client half):
+    /// the v6 SEARCH frame must advertise the v6 search socket's own port
+    /// — the port it actually receives SEARCH_RESPONSE on — not the v4
+    /// search socket's port. A pvxs-compatible server honours the
+    /// advertised `response_port` (`udp_collector.cpp:380 setPort`), so
+    /// advertising the wrong (v4) port routes the reply to a port nothing
+    /// listens on over IPv6.
+    ///
+    /// FAIL-proof: capture the discover SEARCH the engine emits to a v6
+    /// target. The datagram's source port is the engine's live v6 socket
+    /// port, and the advertised `response_port` inside the frame must
+    /// equal it. Before the fix the v6 frame carried the v4 socket port
+    /// (≠ source) and this assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(epics_env)]
+    async fn v6_search_advertises_v6_socket_port() {
+        use std::net::{Ipv6Addr, SocketAddrV6};
+
+        // No auto broadcast / no addr-list: the engine sends only to our
+        // explicit v6 sniffer target.
+        let _env = EnvVarGuard::set(&[
+            ("EPICS_PVA_AUTO_ADDR_LIST", "NO"),
+            ("EPICS_PVA_ADDR_LIST", ""),
+        ]);
+
+        // v6 sniffer the engine will broadcast its discover SEARCH to.
+        let sniffer = tokio::net::UdpSocket::bind("[::1]:0")
+            .await
+            .expect("bind v6 sniffer");
+        let sniffer_port = sniffer.local_addr().expect("sniffer addr").port();
+        let v6_target = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, sniffer_port, 0, 0));
+
+        let engine = SearchEngine::spawn(vec![v6_target], Vec::new())
+            .await
+            .expect("spawn engine");
+
+        // DiscoverPing fires one discover SEARCH immediately to every
+        // target (no initial-search coalescing window to wait out).
+        engine.ping_all().await;
+
+        let mut buf = vec![0u8; 1024];
+        let (n, src) = tokio::time::timeout(Duration::from_secs(5), sniffer.recv_from(&mut buf))
+            .await
+            .expect("v6 discover SEARCH did not arrive (is IPv6 loopback available?)")
+            .expect("recv_from");
+
+        // The datagram's source port IS the engine's live v6 search socket
+        // port — the port it will receive SEARCH_RESPONSE on.
+        let v6_socket_port = match src {
+            SocketAddr::V6(v6) => v6.port(),
+            other => panic!("v6 sniffer received non-v6 source {other}"),
+        };
+
+        // Decode the advertised `response_port`. `run_engine` builds
+        // little-endian frames: 8-byte PVA header + payload {seq(4) +
+        // flags(1) + reserved(3) + reply addr(16) + response_port(2) + …},
+        // so the port sits at frame offset 8+4+1+3+16 = 32.
+        assert!(n >= 34, "discover SEARCH too short to hold response_port");
+        let advertised = u16::from_le_bytes([buf[32], buf[33]]);
+
+        assert_eq!(
+            advertised, v6_socket_port,
+            "v6 SEARCH must advertise its own v6 socket port ({v6_socket_port}), \
+             not a different (v4) port ({advertised})"
+        );
+
+        drop(engine);
     }
 
     /// PR #205 IPv6 Stage 6: `bind_beacon_udp_v6` returns a usable

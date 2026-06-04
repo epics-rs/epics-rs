@@ -357,8 +357,13 @@ fn dbr_extended_str(req_type: u16, snap: &Snapshot) -> String {
         sevr_to_str(sevr)
     );
     match req_type {
-        // STS_* (7..=13): status + severity only.
-        7..=13 => sts,
+        // STS_* (7..=13), plus the two "not implemented" string special-DBRs
+        // GR_STRING (21) and CTRL_STRING (28): status + severity only. C
+        // `tool_lib.c:350-352` routes DBR_GR_STRING and DBR_CTRL_STRING
+        // through the DBR_STS_STRING arm (`PRN_DBR_STS`), so they carry no
+        // units, precision, or display/control limits — unlike the numeric
+        // GR/CTRL types below. Regression R0604-CAGET-SPECDBR-GR-CTRL-STRING-1.
+        7..=13 | 21 | 28 => sts,
         // TIME_* (14..=20): timestamp then status + severity.
         14..=20 => format!(
             "    Timestamp:        {}\n{sts}",
@@ -379,10 +384,16 @@ fn dbr_extended_str(req_type: u16, snap: &Snapshot) -> String {
             }
             out
         }
-        // GR_* (21..=27) / CTRL_* (28..=34) numeric: status/severity,
-        // units, [precision for float/double], 6 graphic limits, and
-        // (CTRL only) 2 control limits.
-        21..=34 => {
+        // GR numeric (22 SHORT/INT, 23 FLOAT, 25 CHAR, 26 LONG, 27 DOUBLE)
+        // and CTRL numeric (29 SHORT/INT, 30 FLOAT, 32 CHAR, 33 LONG,
+        // 34 DOUBLE): status/severity, units, [precision for float/double],
+        // 6 graphic limits, and (CTRL only) 2 control limits. The string
+        // (21/28) and enum (24/31) members of the GR/CTRL range are handled
+        // by the arms above, so this arm lists only the numeric members,
+        // mirroring the C `dbr2str` switch's per-type cases instead of a
+        // broad `21..=34` range that fabricated a limit block for the two
+        // string types. Regression R0604-CAGET-SPECDBR-GR-CTRL-STRING-1.
+        22 | 23 | 25 | 26 | 27 | 29 | 30 | 32 | 33 | 34 => {
             let is_ctrl = req_type >= 28;
             let is_float = matches!(req_type, 23 | 27 | 30 | 34); // GR/CTRL FLOAT/DOUBLE
             let is_int = matches!(req_type, 22 | 25 | 26 | 29 | 32 | 33); // SHORT/CHAR/LONG
@@ -869,8 +880,8 @@ mod tests {
     use clap::CommandFactory;
     use epics_base_rs::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, Snapshot};
     use epics_base_rs::types::{
-        DBR_CLASS_NAME, DBR_CTRL_DOUBLE, DBR_DOUBLE, DBR_STRING, DBR_STSACK_STRING,
-        DBR_TIME_DOUBLE, DBR_TIME_FLOAT,
+        DBR_CLASS_NAME, DBR_CTRL_DOUBLE, DBR_CTRL_STRING, DBR_DOUBLE, DBR_GR_STRING, DBR_STRING,
+        DBR_STSACK_STRING, DBR_TIME_DOUBLE, DBR_TIME_FLOAT,
     };
     use epics_ca_rs::EpicsValue;
     use epics_ca_rs::cli::ValueFormat;
@@ -999,6 +1010,52 @@ mod tests {
         assert!(es.contains("    Enums:            ( 2)"), "{es}");
         assert!(es.contains("[ 0] OFF"), "{es}");
         assert!(es.contains("[ 1] ON"), "{es}");
+    }
+
+    // Regression R0604-CAGET-SPECDBR-GR-CTRL-STRING-1: C `tool_lib.c:350-352`
+    // marks DBR_GR_STRING (21) and DBR_CTRL_STRING (28) "not implemented" and
+    // routes them through the DBR_STS_STRING arm (`PRN_DBR_STS`), so
+    // `caget -d DBR_GR_STRING` / `-d DBR_CTRL_STRING` print only Status +
+    // Severity — never Units, precision, or display/control limits. The
+    // earlier `21..=34` range fabricated a numeric GR/CTRL limit block for
+    // these two string types.
+    #[test]
+    fn gr_ctrl_string_extended_block_is_status_severity_only() {
+        // A snapshot carrying full display + control metadata: if the buggy
+        // numeric arm were still taken, Units/limits/precision would leak in.
+        let snap = ctrl_double_snap();
+        for req in [DBR_GR_STRING, DBR_CTRL_STRING] {
+            let ext = dbr_extended_str(req, &snap);
+            assert!(
+                ext.contains("    Status:           NO_ALARM"),
+                "req {req} must print Status: {ext}"
+            );
+            assert!(
+                ext.contains("    Severity:         NO_ALARM"),
+                "req {req} must print Severity: {ext}"
+            );
+            assert!(!ext.contains("Units"), "req {req} must omit Units: {ext}");
+            assert!(
+                !ext.contains("disp limit"),
+                "req {req} must omit display limits: {ext}"
+            );
+            assert!(
+                !ext.contains("alarm limit"),
+                "req {req} must omit alarm limits: {ext}"
+            );
+            assert!(
+                !ext.contains("warn limit"),
+                "req {req} must omit warn limits: {ext}"
+            );
+            assert!(
+                !ext.contains("ctrl limit"),
+                "req {req} must omit control limits: {ext}"
+            );
+            assert!(
+                !ext.contains("Precision"),
+                "req {req} must omit Precision: {ext}"
+            );
+        }
     }
 
     // C db_access dbr_text[]: code → mnemonic, out-of-range → invalid.

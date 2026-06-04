@@ -2230,6 +2230,13 @@ async fn process_connection_validation(
     // x509 identity from the verified cert chain wins — the
     // client's CONNECTION_VALIDATION claim is parsed only
     // for diagnostics and never replaces it.
+    //
+    // `advertised` records whether the *effective* method (mTLS x509, or the
+    // plain-TCP claim) is one this server advertised. It is the only gate on
+    // the OK-vs-Error reply below, and `*cred` is committed only on the
+    // advertised path — so a rejected re-auth never mutates the connection
+    // identity (Regression R0604-PVASRV-REAUTH-REJECT-CLEARS-CREDENTIAL-1).
+    let advertised;
     if x509_locked {
         // a decode fault here is still fatal —
         // log + propagate. Pre-fix swallowed; pvxs
@@ -2248,58 +2255,72 @@ async fn process_connection_validation(
                 "PVA client over mTLS sent anonymous CONNECTION_VALIDATION"
             ),
         }
+        // mTLS: the verified x509 chain is the identity and is always an
+        // advertised method (pvxs advertises `x509` for TLS transports); the
+        // client's CONNECTION_VALIDATION claim never replaces `cred`.
+        advertised = true;
     } else {
-        // a decode fault is now connection-fatal
-        // (matches pvxs `serverconn.cpp:211-216`
-        // bev.reset). An anonymous handshake (empty
-        // method) returns Ok(None) and keeps the
-        // existing anonymous credential. Only a fully
-        // decoded auth structure replaces `cred`.
-        if let Some(claimed) = parse_client_credentials(frame, decode_cache)? {
-            *cred = claimed;
+        // Parse the client's claim into a CANDIDATE without committing it.
+        // pvxs clones the current `cred` into a local `C` (serverconn.cpp:221)
+        // and commits `cred = C` only via an advertised method, so a rejected
+        // unadvertised re-auth leaves the previous identity in force. Mirror
+        // that: decode into `candidate`, decide whether the effective method is
+        // advertised, and write `*cred` ONLY on the advertised path. A decode
+        // fault is connection-fatal (pvxs serverconn.cpp:211-216 bev.reset). An
+        // anonymous handshake (empty/"anonymous" method) returns Ok(None) and
+        // keeps whatever credential is already in force — anonymous on a fresh
+        // connection, the committed identity on a re-auth.
+        let candidate = parse_client_credentials(frame, decode_cache)?;
+        // The method that would take effect: the claim's method when the client
+        // sent one, otherwise the credential already in force (so an anonymous
+        // re-handshake stays advertised against the live method, never resetting
+        // a committed `ca` identity).
+        let effective_method = candidate
+            .as_ref()
+            .map_or(cred.method.as_str(), |c| c.method.as_str());
+        advertised = ADVERTISED_AUTH_METHODS.contains(&effective_method);
+        if !advertised {
+            // Unadvertised method: `*cred` is left untouched. pvxs treats a
+            // rejected re-auth as a rejected credential *update*, not a logout
+            // (serverconn.cpp:221-241: `C` started as a copy of the old cred and
+            // no advertised method changed it), so the previous identity —
+            // alice/ca on a re-auth, anonymous on a fresh connection — stays the
+            // connection's effective credential. The Status::Error reply below
+            // tells the client its elevated claim was rejected.
+            debug!(
+                ?peer,
+                rejected_method = %effective_method,
+                kept_method = %cred.method,
+                kept_account = %cred.account,
+                "PVA client selects unadvertised auth method — replying \
+                 Status::Error, keeping the previous credential"
+            );
+        }
+        if advertised {
+            // Advertised method: commit the claim. A `None` candidate
+            // (anonymous handshake) keeps the current credential unchanged.
+            if let Some(claimed) = candidate {
+                *cred = claimed;
+            }
         }
     }
     debug!(?peer, method = %cred.method, account = %cred.account,
         authority = %cred.authority, roles = ?cred.roles,
         "PVA client credentials");
-    // pvxs `serverconn.cpp:238-241` parity: when the client
-    // picks an auth method we never advertised, reply
-    // CONNECTION_VALIDATED with Status::Error so the client
-    // knows its elevated identity claim was rejected. pvxs
-    // keeps the connection open and falls back to whatever
-    // identity is recorded (typically anonymous via the
-    // empty-method path inside parse_client_credentials);
-    // matches "No practical way to handle auth failure. So
-    // we accept all credentials, but may not grant rights."
-    // an mTLS connection is authenticated by its
-    // verified certificate chain — `cred.method` is
-    // `"x509"` regardless of the CONNECTION_VALIDATION
-    // claim, and that is always a valid method when TLS is
-    // in use (pvxs advertises `x509` for TLS transports).
-    // So the unadvertised-method rejection only applies to
-    // the plain-TCP `ca`/`anonymous` negotiation.
-    let advertised = x509_locked || ADVERTISED_AUTH_METHODS.iter().any(|m| *m == cred.method);
+    // pvxs `serverconn.cpp:238-241` parity: when the client picks an auth
+    // method we never advertised, reply CONNECTION_VALIDATED with
+    // Status::Error so the client knows its elevated identity claim was
+    // rejected. The connection stays open and the effective credential is
+    // whatever was already in force — never the rejected claim, and never a
+    // forced downgrade to anonymous (Regression
+    // R0604-PVASRV-REAUTH-REJECT-CLEARS-CREDENTIAL-1). Matches "No practical
+    // way to handle auth failure. So we accept all credentials, but may not
+    // grant rights." `advertised` was decided above from the effective method
+    // (mTLS x509 is always advertised) and `*cred` was committed only on the
+    // advertised path, so there is nothing to revert here.
     let validated_status = if advertised {
         Status::ok()
     } else {
-        debug!(
-            ?peer,
-            method = %cred.method,
-            "PVA client selects unadvertised auth method — replying Status::Error"
-        );
-        // the client picked an auth method the
-        // server never advertised. The handshake completes
-        // (pvxs keeps the connection open) but the claimed
-        // credential MUST NOT survive — the server is about
-        // to return Status::Error rejecting it. Leaving
-        // `cred` as the unadvertised claim would let the
-        // `auth_complete` hook and every later ACF-gated
-        // operation see an identity the server just
-        // rejected: a legacy rule without a METHOD(...)
-        // clause would still match the claimed account.
-        // Revert to anonymous so the rejected claim never
-        // becomes the connection identity.
-        *cred = ClientCredentials::anonymous();
         Status::error("Client selects unadvertised auth".to_string())
     };
     let mut payload = Vec::new();
@@ -2439,7 +2460,9 @@ fn parse_client_credentials(
     // Byte-exact "ca" (pvxs serverconn.cpp:221-231 keys on selected=="ca"):
     // a non-exact spelling like "CA" is not "ca", so this fallback does not
     // fire; it returns the claimed credential and the caller rejects it as
-    // an unadvertised method, reverting the identity to anonymous.
+    // an unadvertised method, leaving the previous connection identity in
+    // force (the claim is never committed; see process_connection_validation,
+    // Regression R0604-PVASRV-REAUTH-REJECT-CLEARS-CREDENTIAL-1).
     if creds.method == "ca" && creds.account.is_empty() {
         return Ok(None);
     }
@@ -16360,6 +16383,162 @@ mod tests {
                 ("ca".to_string(), "bob".to_string()),
             ],
             "auth_complete fires on every validation with the new identity"
+        );
+    }
+
+    /// Build a client CONNECTION_VALIDATION frame selecting an arbitrary
+    /// `method` and carrying a decodable auth structure with the given `user`.
+    /// Used to drive an *unadvertised* method (e.g. `"bogus"`) past
+    /// `parse_client_credentials` — which only short-circuits empty/"anonymous"
+    /// and `ca`-without-user — so the candidate reaches the advertised gate.
+    fn build_validation_frame_with_method(order: ByteOrder, method: &str, user: &str) -> Frame {
+        use crate::pvdata::{PvStructure, ScalarType, ScalarValue};
+        let auth_desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![("user".into(), FieldDesc::Scalar(ScalarType::String))],
+        };
+        let mut auth_struct = PvStructure::new("");
+        auth_struct.fields.push((
+            "user".into(),
+            PvField::Scalar(ScalarValue::String(user.into())),
+        ));
+        let auth_val = PvField::Structure(auth_struct);
+
+        let mut payload: Vec<u8> = Vec::new();
+        payload.put_u32(0x10000, order);
+        payload.put_u16(32_767, order);
+        payload.put_u16(0, order);
+        encode_string_into(method, order, &mut payload);
+        encode_type_desc(&auth_desc, order, &mut payload);
+        encode_pv_field(&auth_val, &auth_desc, order, &mut payload);
+        let header = PvaHeader::application(
+            false,
+            order,
+            Command::ConnectionValidation.code(),
+            payload.len() as u32,
+        );
+        Frame { header, payload }
+    }
+
+    /// Regression R0604-PVASRV-REAUTH-REJECT-CLEARS-CREDENTIAL-1.
+    ///
+    /// A post-handshake CONNECTION_VALIDATION selecting an *unadvertised*
+    /// method must reply Status::Error but leave the connection's effective
+    /// credential at the previously committed identity — pvxs clones `cred`
+    /// into a local `C`, commits `cred = C` only via an advertised method, and
+    /// only then rejects an unadvertised `selected` (serverconn.cpp:221-241),
+    /// so a rejected re-auth is a rejected credential *update*, not a logout.
+    /// Pre-fix Rust committed the claim and then forced `*cred` to anonymous,
+    /// stripping a live `alice/ca` connection's ACF identity.
+    #[tokio::test]
+    async fn process_connection_validation_unadvertised_reauth_keeps_previous_credential() {
+        use std::io::Cursor;
+        use std::sync::Mutex as StdMutex;
+
+        let order = ByteOrder::Little;
+        let observed: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(Vec::new()));
+        let observed_hook = observed.clone();
+        let config = PvaServerConfig {
+            auth_complete: Some(Arc::new(move |_peer, cred: &ClientCredentials| {
+                observed_hook
+                    .lock()
+                    .unwrap()
+                    .push((cred.method.clone(), cred.account.clone()));
+            })),
+            ..Default::default()
+        };
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let peer_entry = crate::server_native::peers::PeerEntry::new(false);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let mut cred = ClientCredentials::anonymous();
+        let mut decode_cache = TypeCache::new();
+
+        // Initial handshake: identity becomes alice/ca.
+        let f1 = build_ca_validation_frame(order, "alice");
+        process_connection_validation(
+            &f1,
+            &tx,
+            order,
+            false,
+            &mut cred,
+            peer,
+            &peer_entry,
+            &config,
+            &mut decode_cache,
+        )
+        .await
+        .expect("initial validation");
+        assert_eq!(cred.account, "alice", "initial handshake commits alice");
+        assert_eq!(cred.method, "ca", "initial handshake commits ca");
+        let _ = rx.try_recv().expect("first CONNECTION_VALIDATED emitted");
+
+        // Post-handshake re-auth with an UNADVERTISED method ("bogus") and a
+        // decodable auth value. parse_client_credentials returns Some(bogus/...)
+        // (only empty/"anonymous" and ca-without-user yield None), so the
+        // candidate reaches the advertised gate and is rejected there.
+        let f2 = build_validation_frame_with_method(order, "bogus", "mallory");
+        process_connection_validation(
+            &f2,
+            &tx,
+            order,
+            false,
+            &mut cred,
+            peer,
+            &peer_entry,
+            &config,
+            &mut decode_cache,
+        )
+        .await
+        .expect("re-auth validation completes (connection stays open)");
+
+        // The reply is a SECOND CONNECTION_VALIDATED carrying Status::Error.
+        let v2 = rx.try_recv().expect("second CONNECTION_VALIDATED emitted");
+        assert_eq!(
+            v2[3],
+            Command::ConnectionValidated.code(),
+            "rejected re-auth still re-issues CONNECTION_VALIDATED"
+        );
+        let status =
+            Status::decode(&mut Cursor::new(&v2[PvaHeader::SIZE..]), order).expect("decode status");
+        assert!(
+            !status.is_success(),
+            "unadvertised re-auth replies an error status, got {status:?}"
+        );
+        assert_eq!(
+            status.message(),
+            Some("Client selects unadvertised auth"),
+            "error status carries the unadvertised-auth message"
+        );
+
+        // The connection credential is UNCHANGED — still alice/ca, never the
+        // rejected "bogus/mallory" claim and never a forced downgrade to
+        // anonymous.
+        assert_eq!(
+            cred.account, "alice",
+            "rejected re-auth leaves the previous account in force"
+        );
+        assert_eq!(
+            cred.method, "ca",
+            "rejected re-auth leaves the previous method in force"
+        );
+
+        // The per-peer credential record (the ACF/report identity) is unchanged.
+        assert_eq!(
+            *peer_entry.credentials.lock(),
+            Some(("alice".to_string(), "ca".to_string())),
+            "peer credential record still alice/ca after rejected re-auth"
+        );
+
+        // The auth_complete hook — pvxs's `auth_complete`, the ACF integration
+        // point — fired on both frames; the second firing observed alice/ca, not
+        // anonymous, proving a following ACF-gated operation still sees alice/ca.
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![
+                ("ca".to_string(), "alice".to_string()),
+                ("ca".to_string(), "alice".to_string()),
+            ],
+            "hook re-fires with the previous identity on a rejected re-auth"
         );
     }
 }

@@ -3923,10 +3923,11 @@ pub async fn op_process_with_request(
     server.send_for_channel(sid, init_frame).await?;
 
     let init_resp = await_frame(&mut stream, op_timeout).await?;
-    let init_status = match decode_process_status(&init_resp) {
+    let init_status = match decode_process_status(&init_resp, true) {
         Ok(s) => s,
         Err(e) => {
-            // Decode fault / command mismatch on the INIT reply is fatal.
+            // Decode fault / command mismatch / wrong phase on the INIT
+            // reply is fatal.
             server.close();
             return Err(e);
         }
@@ -3951,7 +3952,7 @@ pub async fn op_process_with_request(
     server.send_for_channel(sid, data_frame).await?;
 
     let resp_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = match decode_process_status(&resp_frame) {
+    let result = match decode_process_status(&resp_frame, false) {
         Ok(s) if s.is_success() => Ok(()),
         Ok(s) => Err(PvaError::Protocol(format!("PROCESS failed: {s:?}"))),
         Err(e) => {
@@ -3999,9 +4000,11 @@ pub async fn op_process_with_request_value(
     server.send_for_channel(sid, init_frame).await?;
 
     let init_resp = await_frame(&mut stream, op_timeout).await?;
-    let init_status = match decode_process_status(&init_resp) {
+    let init_status = match decode_process_status(&init_resp, true) {
         Ok(s) => s,
         Err(e) => {
+            // Decode fault / command mismatch / wrong phase on the INIT
+            // reply is fatal.
             server.close();
             return Err(e);
         }
@@ -4026,7 +4029,7 @@ pub async fn op_process_with_request_value(
     server.send_for_channel(sid, data_frame).await?;
 
     let resp_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = match decode_process_status(&resp_frame) {
+    let result = match decode_process_status(&resp_frame, false) {
         Ok(s) if s.is_success() => Ok(()),
         Ok(s) => Err(PvaError::Protocol(format!("PROCESS failed: {s:?}"))),
         Err(e) => {
@@ -4042,15 +4045,31 @@ pub async fn op_process_with_request_value(
     result
 }
 
-/// Decode a `PROCESS` response: `ioid + subcmd + status`. Returns the
-/// decoded `Status`.
+/// Decode a `PROCESS` response: `ioid + subcmd + status`, enforcing the
+/// expected wire phase. Returns the decoded `Status` for the matching
+/// phase.
+///
+/// `expect_init` selects the phase. pvAccess `BaseRequestImpl::response()`
+/// routes purely on `qos & QOS_INIT` (clientContextImpl.cpp:315-342): an
+/// INIT-bit reply runs `initResponse()` (channelProcessConnect) and a
+/// non-INIT reply runs `normalResponse()` (processDone), and
+/// `ChannelProcessRequestImpl::process()` refuses to send the data request
+/// until a successful INIT set `m_initialized`. Both PROCESS phases carry
+/// an identical status-only body, so the subcmd is the *only* phase
+/// discriminator: dropping it let a peer pass off a normal response as the
+/// INIT-ack, or an INIT-ack as process completion. The INIT reply must
+/// therefore carry `QOS_INIT` and the process-done reply must not.
 ///
 /// An `Err` from this decoder is always connection-fatal — a command
-/// mismatch or a truncated body is a protocol violation that pvxs answers
-/// with `bev.reset()` (clientget.cpp:456-493). A non-success `Status`
-/// decodes to `Ok`: it is a per-operation result, NOT a fault, so the
-/// caller surfaces it without resetting the circuit.
-fn decode_process_status(frame: &super::decode::Frame) -> PvaResult<crate::proto::Status> {
+/// mismatch, a wrong-phase subcmd, or a truncated body is a protocol
+/// violation that pvxs answers with `bev.reset()` (clientget.cpp:456-493).
+/// A non-success `Status` *for the correct phase* decodes to `Ok`: it is a
+/// per-operation result, NOT a fault, so the caller surfaces it without
+/// resetting the circuit.
+fn decode_process_status(
+    frame: &super::decode::Frame,
+    expect_init: bool,
+) -> PvaResult<crate::proto::Status> {
     if frame.header.command != Command::Process.code() {
         return Err(PvaError::Protocol(format!(
             "expected PROCESS response, got command {}",
@@ -4062,7 +4081,14 @@ fn decode_process_status(frame: &super::decode::Frame) -> PvaResult<crate::proto
     let _ioid = cur
         .get_u32(order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
-    let _subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
+    let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
+    let is_init = subcmd & QosFlags::INIT != 0;
+    if is_init != expect_init {
+        return Err(PvaError::Protocol(format!(
+            "PROCESS response phase mismatch: expected {}, got subcmd {subcmd:#04x}",
+            if expect_init { "INIT" } else { "process-done" },
+        )));
+    }
     let status = crate::proto::Status::decode(&mut cur, order)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     Ok(status)
@@ -5616,10 +5642,15 @@ mod tests {
     }
 
     /// PROCESS response: `ioid + subcmd + status`.
-    fn process_frame(order: ByteOrder, status: crate::proto::Status, full: bool) -> Frame {
+    fn process_frame(
+        order: ByteOrder,
+        subcmd: u8,
+        status: crate::proto::Status,
+        full: bool,
+    ) -> Frame {
         let mut payload = Vec::new();
         payload.put_u32(7, order);
-        payload.put_u8(0x00);
+        payload.put_u8(subcmd);
         if full {
             status.write_into(order, &mut payload);
         }
@@ -5630,8 +5661,15 @@ mod tests {
 
     #[test]
     fn process_non_success_status_is_per_op_not_fatal() {
-        let frame = process_frame(ByteOrder::Little, crate::proto::Status::error("busy"), true);
-        match decode_process_status(&frame) {
+        // Process-done phase (subcmd 0x00) with a non-success status is a
+        // per-op result, not a connection fault.
+        let frame = process_frame(
+            ByteOrder::Little,
+            0x00,
+            crate::proto::Status::error("busy"),
+            true,
+        );
+        match decode_process_status(&frame, false) {
             Ok(s) => assert!(
                 !s.is_success(),
                 "non-success PROCESS status is data, not Err"
@@ -5642,21 +5680,72 @@ mod tests {
 
     #[test]
     fn process_truncated_is_fatal_err() {
-        let frame = process_frame(ByteOrder::Little, crate::proto::Status::ok(), false);
+        let frame = process_frame(ByteOrder::Little, 0x00, crate::proto::Status::ok(), false);
         assert!(
-            decode_process_status(&frame).is_err(),
+            decode_process_status(&frame, false).is_err(),
             "a truncated PROCESS body must be a connection-fatal Err"
         );
     }
 
     #[test]
     fn process_wrong_command_is_fatal_err() {
-        let mut frame = process_frame(ByteOrder::Little, crate::proto::Status::ok(), true);
+        let mut frame = process_frame(ByteOrder::Little, 0x00, crate::proto::Status::ok(), true);
         frame.header.command = Command::Get.code();
         assert!(
-            decode_process_status(&frame).is_err(),
+            decode_process_status(&frame, false).is_err(),
             "a command mismatch must be a connection-fatal Err"
         );
+    }
+
+    #[test]
+    fn process_init_phase_rejects_normal_subcmd() {
+        // Regression R0604-PVACLI-PROCESS-SUBCMD-1.
+        // A normal (subcmd 0x00) reply to the INIT request is a phase
+        // swap. pvAccess routes INIT vs done purely on QOS_INIT
+        // (clientContextImpl.cpp:315): a normal response where INIT was
+        // expected must be a connection-fatal Err, not a successful
+        // create.
+        let frame = process_frame(ByteOrder::Little, 0x00, crate::proto::Status::ok(), true);
+        assert!(
+            decode_process_status(&frame, true).is_err(),
+            "a normal-phase reply where INIT was expected must be fatal"
+        );
+    }
+
+    #[test]
+    fn process_done_phase_rejects_init_subcmd() {
+        // Regression R0604-PVACLI-PROCESS-SUBCMD-1.
+        // An INIT-bit (0x08) reply to the process request must not be
+        // reported as process completion.
+        let frame = process_frame(
+            ByteOrder::Little,
+            QosFlags::INIT,
+            crate::proto::Status::ok(),
+            true,
+        );
+        assert!(
+            decode_process_status(&frame, false).is_err(),
+            "an INIT-phase reply where process-done was expected must be fatal"
+        );
+    }
+
+    #[test]
+    fn process_init_phase_accepts_init_subcmd() {
+        // Regression R0604-PVACLI-PROCESS-SUBCMD-1: the matching INIT
+        // phase (subcmd 0x08) decodes to Ok(success).
+        let frame = process_frame(
+            ByteOrder::Little,
+            QosFlags::INIT,
+            crate::proto::Status::ok(),
+            true,
+        );
+        match decode_process_status(&frame, true) {
+            Ok(s) => assert!(
+                s.is_success(),
+                "matching INIT phase must be a success status"
+            ),
+            Err(e) => panic!("matching INIT phase must decode Ok, got Err({e:?})"),
+        }
     }
 
     #[test]

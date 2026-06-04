@@ -310,6 +310,42 @@ impl ParsedLink {
     }
 }
 
+/// The two link-value shapes the pvxs JLink root callbacks accept at parse
+/// depth 0: a JSON string (channel-name shorthand) or a JSON object/map
+/// (longhand options). Every other root token — null, bool, integer, real,
+/// array — installs no channel name in pvxs, so [`classify_pva_root_value`]
+/// returns `None` for them rather than coercing the raw token into a PV
+/// name. Regression R0604-BRPVALINK-ROOT-NONSTRING-PVA-1.
+enum PvaRootValue<'a> {
+    /// `{ ... }` longhand options map (handed to the sub-object parser).
+    Object(&'a str),
+    /// `"name"` / `'name'` string shorthand — exactly one matching quote
+    /// pair stripped, contents kept verbatim (no semantic-character trim).
+    StringName(&'a str),
+}
+
+/// Classify a root `pva`/`ca` link value by JSON shape. Accepts only a JSON
+/// object or a (single- or double-) quoted string; rejects bare
+/// `null`/`true`/`false`/number/array tokens the way the pvxs root JLink
+/// callbacks do — `pva_parse_string` assigns `channelName` only at depth 0
+/// while `pva_parse_null`/`bool`/`integer` ignore root-depth values
+/// (pvalink_jlif.cpp:74-100,143-154). Regression
+/// R0604-BRPVALINK-ROOT-NONSTRING-PVA-1.
+fn classify_pva_root_value(value: &str) -> Option<PvaRootValue<'_>> {
+    let v = value.trim();
+    if v.starts_with('{') {
+        return Some(PvaRootValue::Object(v));
+    }
+    for quote in ['"', '\''] {
+        if let Some(rest) = v.strip_prefix(quote) {
+            if let Some(inner) = rest.strip_suffix(quote) {
+                return Some(PvaRootValue::StringName(inner));
+            }
+        }
+    }
+    None
+}
+
 /// Try to recognize a JSON-style link option (epics-base PR #86).
 ///
 /// epics-base accepts inline JSON link options like `{ca: {pv: "foo"}}`,
@@ -370,38 +406,47 @@ fn try_parse_json_link(s: &str) -> Option<ParsedLink> {
             // through to legacy DB parsing (which would treat the raw JSON
             // text as a record name).
             let value = rest.trim_end_matches(',').trim();
-            let is_subobject = value.starts_with('{');
-            if key == "ca" {
-                // JSON CA links carry no plain-text MS modifier and ignore
-                // pvalink options; take only the PV name. Alarm policy
-                // defaults to NoMaximize.
-                let pv = if is_subobject {
-                    extract_pv_and_opts_from_subobject(value)?.0
-                } else {
-                    let name = value.trim_matches('"').trim_matches('\'').trim();
+            // Classify the root value by JSON shape — only a string
+            // (channel-name shorthand) or an object/map (longhand options)
+            // is a valid pvalink root; a bare `true`/`5`/`null`/`[..]` token
+            // installs no channel name in pvxs and must NOT be coerced into a
+            // literal PV name. `?` returns `None` here so a non-string root
+            // falls through to legacy parsing instead of dialing a remote PV.
+            // Regression R0604-BRPVALINK-ROOT-NONSTRING-PVA-1.
+            match classify_pva_root_value(value)? {
+                PvaRootValue::Object(obj) => {
+                    if key == "ca" {
+                        // JSON CA links carry no plain-text MS modifier and
+                        // ignore pvalink options; take only the PV name.
+                        // Alarm policy defaults to NoMaximize.
+                        Some(ParsedLink::Ca(CaLink::new(
+                            extract_pv_and_opts_from_subobject(obj)?.0,
+                        )))
+                    } else {
+                        // PVA longhand: keep the options as structured JLink
+                        // members.
+                        let (pv, options) = extract_pv_and_opts_from_subobject(obj)?;
+                        if options.is_empty() {
+                            Some(ParsedLink::Pva(pv))
+                        } else {
+                            Some(ParsedLink::PvaJson(PvaJsonLink { pv, options }))
+                        }
+                    }
+                }
+                PvaRootValue::StringName(name) => {
+                    // String shorthand: the contents are the verbatim channel
+                    // name. Do NOT split `?` — it is link data (pvxs treats a
+                    // string pvalink as the channel name in full).
+                    let name = name.trim();
                     if name.is_empty() {
                         return None;
                     }
-                    name.to_string()
-                };
-                Some(ParsedLink::Ca(CaLink::new(pv)))
-            } else if is_subobject {
-                // PVA longhand: keep the options as structured JLink members.
-                let (pv, options) = extract_pv_and_opts_from_subobject(value)?;
-                if options.is_empty() {
-                    Some(ParsedLink::Pva(pv))
-                } else {
-                    Some(ParsedLink::PvaJson(PvaJsonLink { pv, options }))
+                    if key == "ca" {
+                        Some(ParsedLink::Ca(CaLink::new(name.to_string())))
+                    } else {
+                        Some(ParsedLink::Pva(name.to_string()))
+                    }
                 }
-            } else {
-                // PVA string shorthand: the value is the verbatim channel
-                // name. Do NOT split `?` — it is link data (pvxs treats a
-                // string pvalink as the channel name in full).
-                let name = value.trim_matches('"').trim_matches('\'').trim();
-                if name.is_empty() {
-                    return None;
-                }
-                Some(ParsedLink::Pva(name.to_string()))
             }
         }
         "calc" => {
@@ -853,6 +898,61 @@ mod json_link_tests {
                 options: vec![("Q".to_string(), "4".to_string())],
             })
         );
+    }
+
+    /// Regression R0604-BRPVALINK-ROOT-NONSTRING-PVA-1.
+    ///
+    /// pvxs installs root JLink callbacks only for the JSON string (channel
+    /// shorthand) and map (longhand) cases; `pva_parse_null`/`bool`/`integer`
+    /// ignore root-depth values (pvalink_jlif.cpp:74-100,143-154). A bare
+    /// `true`/`5`/`null`/`[..]` root therefore installs no channel name and
+    /// must NOT become an external PVA/CA link to a literal token. The old
+    /// `value.starts_with('{')` heuristic accepted every non-`{` token as a
+    /// PV name after trimming quotes, dialing channels named `"true"`/`"5"`/
+    /// `"null"`/`"[1,2]"`.
+    #[test]
+    fn json_pva_link_root_nonstring_rejected() {
+        // Accepted roots: string shorthand and object longhand.
+        assert_eq!(
+            parse_link_v2(r#"{pva: "TARGET"}"#),
+            ParsedLink::Pva("TARGET".to_string())
+        );
+        assert_eq!(
+            parse_link_v2(r#"{pva: { pv: "TARGET" }}"#),
+            ParsedLink::Pva("TARGET".to_string())
+        );
+
+        // Rejected roots: a non-string, non-object value must never produce
+        // a PVA link (it falls through to legacy parsing instead).
+        for src in [
+            r#"{pva: true}"#,
+            r#"{pva: false}"#,
+            r#"{pva: 5}"#,
+            r#"{pva: null}"#,
+            r#"{pva: [1,2]}"#,
+        ] {
+            assert!(
+                !matches!(
+                    parse_link_v2(src),
+                    ParsedLink::Pva(_) | ParsedLink::PvaJson(_)
+                ),
+                "non-string pva root must not become a PVA link: {src}"
+            );
+        }
+
+        // Same defect family on the `ca` key: a bare token must not become a
+        // CA link to a literal `"true"`/`"5"` channel name.
+        for src in [
+            r#"{ca: true}"#,
+            r#"{ca: 5}"#,
+            r#"{ca: null}"#,
+            r#"{ca: [1,2]}"#,
+        ] {
+            assert!(
+                !matches!(parse_link_v2(src), ParsedLink::Ca(_)),
+                "non-string ca root must not become a CA link: {src}"
+            );
+        }
     }
 
     // epics-base PR #213 — hardware-link parsing.

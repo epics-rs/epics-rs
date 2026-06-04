@@ -45,10 +45,12 @@ pub fn default_broadcast_port() -> u16 {
 }
 
 pub fn default_server_port() -> u16 {
-    std::env::var("EPICS_PVA_SERVER_PORT")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(5075)
+    // Single owner applies pvxs-compatible port parsing (uint64 + low-16
+    // truncate, whitespace-tolerant) and the client zero->5075 rule
+    // (pvxs `config.cpp` Config::expand), so this legacy search path
+    // cannot drift from `env::server_port()` — mirrors how
+    // `default_broadcast_port` above already delegates.
+    crate::config::env::server_port()
 }
 
 fn auto_addr_list_enabled() -> bool {

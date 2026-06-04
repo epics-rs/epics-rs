@@ -268,7 +268,9 @@ async fn main() {
         .or_else(|| {
             std::env::var("EPICS_PVA_BROADCAST_PORT")
                 .ok()
-                .and_then(|s| s.parse().ok())
+                // pvxs-compatible port parse (uint64 + low-16 truncate,
+                // whitespace-tolerant) instead of a strict u16 parse.
+                .and_then(|s| epics_pva_rs::config::env::parse_port_env(&s))
         })
         .unwrap_or(5076);
 

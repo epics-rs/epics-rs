@@ -439,6 +439,33 @@ fn parse_bool(name: &str, raw: &str) -> Option<bool> {
     }
 }
 
+/// Parse a PVA port env value the way pvxs does. pvxs `_fromDefs` parses
+/// every `EPICS_PVA*_{SERVER,BROADCAST}_PORT` with `parseTo<uint64_t>`
+/// (`util.cpp:786-800` — `std::stoull` with leading/trailing whitespace
+/// tolerance) and then ASSIGNS the `uint64_t` into the `unsigned short`
+/// port field (`server.h:168/170`, `client.h:1030/1033`), truncating to
+/// the low 16 bits; a parse error logs and leaves the port at its
+/// prior/default value (`config.cpp:402-414, 556-570`).
+///
+/// So `EPICS_PVAS_SERVER_PORT=70000` becomes TCP port `4464`
+/// (`70000 & 0xFFFF`) under pvxs, and `" 5076 "` is accepted. A direct
+/// `parse::<u16>()` rejected both (out of range / surrounding whitespace)
+/// and fell back to the default, putting a Rust client/server on a
+/// different port than a C IOC in the same environment. This helper is
+/// the single owner of that rule; every scalar port getter routes
+/// through it, then applies its own zero-normalization on the result.
+/// Returns the truncated `u16`, or `None` when the value is not a
+/// base-10 integer (caller keeps its default).
+///
+/// pvxs `stoull(.., 0)` additionally accepts `0x`/`0`-prefixed
+/// hex/octal and wraps a leading `-`; those pathological config inputs
+/// are intentionally not reproduced (decimal only), so this is strictly
+/// narrower than pvxs on non-decimal text while matching it on every
+/// realistic decimal port value.
+pub fn parse_port_env(raw: &str) -> Option<u16> {
+    raw.trim().parse::<u64>().ok().map(|v| v as u16)
+}
+
 /// Effective **client** UDP search/broadcast port from
 /// `EPICS_PVA_BROADCAST_PORT` (default 5076).
 ///
@@ -457,7 +484,7 @@ fn parse_bool(name: &str, raw: &str) -> Option<bool> {
 pub fn broadcast_port() -> u16 {
     match std::env::var("EPICS_PVA_BROADCAST_PORT")
         .ok()
-        .and_then(|s| s.parse::<u16>().ok())
+        .and_then(|s| parse_port_env(&s))
     {
         Some(0) => {
             tracing::warn!("ignoring EPICS_PVA_BROADCAST_PORT=0; using default 5076");
@@ -477,7 +504,7 @@ pub fn server_broadcast_port_opt() -> Option<u16> {
     std::env::var("EPICS_PVAS_BROADCAST_PORT")
         .ok()
         .or_else(|| std::env::var("EPICS_PVA_BROADCAST_PORT").ok())
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| parse_port_env(&s))
 }
 
 /// `EPICS_PVAS_BROADCAST_PORT` falling back to `EPICS_PVA_BROADCAST_PORT`.
@@ -503,7 +530,7 @@ pub fn server_port() -> u16 {
     let parsed = std::env::var("EPICS_PVA_SERVER_PORT")
         .ok()
         .or_else(|| std::env::var("EPICS_PVAS_SERVER_PORT").ok())
-        .and_then(|s| s.parse::<u16>().ok())
+        .and_then(|s| parse_port_env(&s))
         .unwrap_or(5075);
     // pvxs Config::expand(): a zero effective client TCP port → 5075.
     if parsed == 0 { 5075 } else { parsed }
@@ -527,7 +554,7 @@ pub fn pvas_server_port_opt() -> Option<u16> {
     std::env::var("EPICS_PVAS_SERVER_PORT")
         .ok()
         .or_else(|| std::env::var("EPICS_PVA_SERVER_PORT").ok())
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| parse_port_env(&s))
 }
 
 /// `EPICS_PVA_AUTO_ADDR_LIST` — default YES. When truthy, the search
@@ -1234,6 +1261,61 @@ mod tests {
         );
         unsafe { std::env::remove_var("EPICS_PVAS_BROADCAST_PORT") };
         assert_eq!(broadcast_port(), 5076, "unset defaults to 5076");
+    }
+
+    #[test]
+    fn parse_port_env_matches_pvxs_uint64_truncation() {
+        // pvxs parseTo<uint64_t> then assigns to `unsigned short`:
+        // EPICS_PVAS_SERVER_PORT=70000 -> 70000 & 0xFFFF = 4464.
+        assert_eq!(parse_port_env("70000"), Some(4464));
+        // 65536 truncates to 0 (caller then applies its own zero rule).
+        assert_eq!(parse_port_env("65536"), Some(0));
+        // leading/trailing whitespace accepted (stoull skips it).
+        assert_eq!(parse_port_env(" 5076 "), Some(5076));
+        assert_eq!(parse_port_env("\t5075\n"), Some(5075));
+        // ordinary in-range values pass through unchanged.
+        assert_eq!(parse_port_env("5075"), Some(5075));
+        assert_eq!(parse_port_env("0"), Some(0));
+        // non-integer / extraneous trailing chars / internal space / empty
+        // -> None, so the caller keeps its default (pvxs logs + keeps default).
+        assert_eq!(parse_port_env("garbage"), None);
+        assert_eq!(parse_port_env("5076x"), None);
+        assert_eq!(parse_port_env("50 76"), None);
+        assert_eq!(parse_port_env(""), None);
+        // beyond u64 range -> None (pvxs throws out_of_range -> default kept).
+        assert_eq!(parse_port_env("999999999999999999999999999"), None);
+    }
+
+    #[test]
+    fn port_getters_truncate_out_of_range_like_pvxs() {
+        // The finding's named cases, exercised through the getters.
+        // SAFETY: nextest runs each test in its own process, so mutating
+        // the process environment here cannot race other tests.
+        // EPICS_PVAS_SERVER_PORT=70000 -> pvxs TCP port 4464, not the
+        // default 5075 a strict u16 parse fell back to.
+        unsafe { std::env::set_var("EPICS_PVAS_SERVER_PORT", "70000") };
+        assert_eq!(
+            pvas_server_port(),
+            4464,
+            "server bind port truncates 70000 -> 4464"
+        );
+        unsafe { std::env::remove_var("EPICS_PVAS_SERVER_PORT") };
+
+        // EPICS_PVA_BROADCAST_PORT=70000 -> 4464 (nonzero, no fallback).
+        unsafe { std::env::set_var("EPICS_PVA_BROADCAST_PORT", "70000") };
+        assert_eq!(
+            broadcast_port(),
+            4464,
+            "client broadcast port truncates 70000 -> 4464"
+        );
+        // A whitespace-wrapped valid port is accepted (was rejected before).
+        unsafe { std::env::set_var("EPICS_PVA_BROADCAST_PORT", " 5099 ") };
+        assert_eq!(
+            broadcast_port(),
+            5099,
+            "whitespace-wrapped port accepted -> 5099"
+        );
+        unsafe { std::env::remove_var("EPICS_PVA_BROADCAST_PORT") };
     }
 
     #[test]

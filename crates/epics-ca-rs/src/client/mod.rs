@@ -25,7 +25,7 @@ use crate::repeater;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::{
-    DBR_STRING, DBR_TIME_STRING, DbFieldType, EpicsValue, PvString, decode_dbr,
+    DBR_STRING, DBR_TIME_INT, DBR_TIME_STRING, DbFieldType, EpicsValue, PvString, decode_dbr,
 };
 
 pub use state::{ChannelState, ConnectionEvent};
@@ -77,23 +77,103 @@ pub fn float_as_string_readback_dbr(native: DbFieldType) -> Option<u16> {
     matches!(native, DbFieldType::Float | DbFieldType::Double).then_some(DBR_TIME_STRING)
 }
 
+/// ENUM readback DBR type for the `caget`/`camonitor` GET/monitor path.
+///
+/// C `caget.c:174-181` and `camonitor.c:155-162` start from
+/// `dbf_type_to_DBR_TIME(dbfType)` and then, for an ENUM field, ALWAYS
+/// replace the type — they never read an ENUM back as native
+/// `DBR_TIME_ENUM`: `enumAsNr` (`-n`) selects `DBR_TIME_INT` (the numeric
+/// index), otherwise `DBR_TIME_STRING` (the state label). Both branches
+/// stay in the TIME class, so the request type is identical across plain,
+/// terse, and wide output (the value-only modes simply ignore the carried
+/// timestamp/alarm). Returns `None` for non-ENUM fields so the caller keeps
+/// its native path.
+///
+/// Distinct from [`enum_string_readback_dbr`], which models only the
+/// label-vs-native decision shared with `caput` and deliberately returns
+/// `None` for the numeric case (caput keeps a native numeric readback
+/// there). This owner is the caget/camonitor chain, where `-n` maps to an
+/// integer DBR instead of falling through to native ENUM.
+pub fn enum_cli_readback_dbr(native: DbFieldType, enum_as_number: bool) -> Option<u16> {
+    matches!(native, DbFieldType::Enum).then(|| {
+        if enum_as_number {
+            DBR_TIME_INT
+        } else {
+            DBR_TIME_STRING
+        }
+    })
+}
+
+/// How a subscription requests an ENUM field's readback type.
+///
+/// Models the three mutually-exclusive ENUM readback modes as one sum type
+/// instead of an `enum_as_string: bool` that meant different things on
+/// different paths. The bool collapsed three intents into two values: the
+/// plain library/gateway subscribe and `camonitor -n` BOTH passed `false`,
+/// yet the former must keep the native ENUM index while the latter must
+/// request `DBR_TIME_INT`. Disambiguating them by a runtime flag was the
+/// dual-meaning defect (R0604-CACLI-ENUM-NUMERIC-READBACK-1); a sum type
+/// makes the three modes explicit at every call site and the illegal
+/// "native-vs-numeric on the same `false`" combination unrepresentable:
+///
+/// - `Native`  — keep the field's native TIME type. ENUM stays
+///   `DBR_TIME_ENUM` (numeric index + label set); the plain
+///   `subscribe_with_mask` and the CA gateway/pvalink rely on this (no
+///   silent behaviour change for existing library consumers).
+/// - `Label`   — `camonitor` default: an ENUM is requested as
+///   `DBR_TIME_STRING` so values arrive as state labels
+///   (C `camonitor.c:156-160`).
+/// - `Numeric` — `camonitor -n`: an ENUM is requested as `DBR_TIME_INT`
+///   so values arrive as the numeric index
+///   (C `camonitor.c:158` `if (enumAsNr) ppv->dbrType = DBR_TIME_INT`).
+///
+/// `Label`/`Numeric` only ever substitute ENUM fields; for a non-ENUM field
+/// all three modes fall through to the float/native chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnumReadback {
+    /// Native TIME type (ENUM stays `DBR_TIME_ENUM`): the library/gateway
+    /// subscribe default.
+    Native,
+    /// `camonitor` default — ENUM as `DBR_TIME_STRING` (state label).
+    Label,
+    /// `camonitor -n` — ENUM as `DBR_TIME_INT` (numeric index).
+    Numeric,
+}
+
+impl EnumReadback {
+    /// The ENUM substitution DBR type for this mode, or `None` when the
+    /// caller should keep its native path (mode `Native`, or any non-ENUM
+    /// field). `Label`/`Numeric` reuse [`enum_cli_readback_dbr`] — the same
+    /// owner the `caget`/`camonitor` GET path uses — so the monitor and GET
+    /// ENUM substitutions cannot drift.
+    fn enum_substitution(self, native: DbFieldType) -> Option<u16> {
+        match self {
+            EnumReadback::Native => None,
+            EnumReadback::Label => enum_cli_readback_dbr(native, false),
+            EnumReadback::Numeric => enum_cli_readback_dbr(native, true),
+        }
+    }
+}
+
 /// TIME-class readback DBR type for a *subscription*, applying the C CLI
 /// substitution chain in source order (`camonitor.c:155-166`): an ENUM
-/// field honours `-n` via [`enum_string_readback_dbr`]
-/// (`enum_as_string` → `DBR_TIME_STRING`); otherwise a FLOAT/DOUBLE under
-/// `-s` becomes `DBR_TIME_STRING` via [`float_as_string_readback_dbr`];
-/// otherwise the field's native TIME-class type. C tests the ENUM case
-/// first and the float case in the `else if`, so the ENUM substitution
-/// takes precedence — preserved here by `enum_string_readback_dbr(..).or_else(..)`.
+/// field is substituted per [`EnumReadback`] (`Label` → `DBR_TIME_STRING`,
+/// `Numeric` → `DBR_TIME_INT`, `Native` → keep native); otherwise a
+/// FLOAT/DOUBLE under `-s` becomes `DBR_TIME_STRING` via
+/// [`float_as_string_readback_dbr`]; otherwise the field's native TIME-class
+/// type. C tests the ENUM case first and the float case in the `else if`, so
+/// the ENUM substitution takes precedence — preserved here by
+/// `enum_substitution(..).or_else(..)`.
 ///
 /// Single owner of the subscribe-time derivation so the initial
 /// `Subscribe` and the `NativeTypeChanged` restore stay in agreement.
 pub fn subscription_readback_dbr(
     native: DbFieldType,
-    enum_as_string: bool,
+    enum_readback: EnumReadback,
     float_as_string: bool,
 ) -> u16 {
-    enum_string_readback_dbr(native, true, enum_as_string)
+    enum_readback
+        .enum_substitution(native)
         .or_else(|| {
             float_as_string
                 .then(|| float_as_string_readback_dbr(native))
@@ -400,13 +480,14 @@ enum CoordRequest {
         /// (C `camonitor.c:169`), so it works even though the subscribe is
         /// issued before the channel connects.
         req_count: Option<u32>,
-        /// When set, an ENUM field is subscribed in its `DBR_TIME_STRING`
-        /// form so monitor values arrive as state labels (the `camonitor`
-        /// default; C `camonitor.c:156-160`). The plain library subscribe
-        /// passes `false` to keep the native ENUM type. Applied by the
-        /// coordinator at connect-time type derivation, so it works even
-        /// though the subscribe is issued before the channel connects.
-        enum_as_string: bool,
+        /// Which ENUM readback type the subscription requests: `Native`
+        /// (keep `DBR_TIME_ENUM` — the plain library/gateway subscribe),
+        /// `Label` (the `camonitor` default, `DBR_TIME_STRING`), or
+        /// `Numeric` (`camonitor -n`, `DBR_TIME_INT`). See [`EnumReadback`].
+        /// Applied by the coordinator at connect-time type derivation, so it
+        /// works even though the subscribe is issued before the channel
+        /// connects.
+        enum_readback: EnumReadback,
         /// When set, a FLOAT/DOUBLE field is subscribed in its
         /// `DBR_TIME_STRING` form so the server renders the value to a
         /// string at record precision (`camonitor -s` / `floatAsString`;
@@ -2556,7 +2637,7 @@ impl CaChannel {
         deadband: f64,
         mask: u16,
     ) -> CaResult<MonitorHandle> {
-        self.subscribe_with_mask_readback_count(deadband, mask, false, false, None)
+        self.subscribe_with_mask_readback_count(deadband, mask, EnumReadback::Native, false, None)
             .await
     }
 
@@ -2590,10 +2671,20 @@ impl CaChannel {
         enum_as_string: bool,
         float_as_string: bool,
     ) -> CaResult<MonitorHandle> {
+        // The library convenience API only distinguishes label-vs-native for
+        // ENUM (it has no numeric mode — only `camonitor -n` does, via the
+        // [`EnumReadback`]-typed `subscribe_with_mask_readback_count`): set →
+        // `Label` (state labels), unset → `Native` (numeric index, the
+        // existing library/gateway default).
+        let enum_readback = if enum_as_string {
+            EnumReadback::Label
+        } else {
+            EnumReadback::Native
+        };
         self.subscribe_with_mask_readback_count(
             deadband,
             mask,
-            enum_as_string,
+            enum_readback,
             float_as_string,
             None,
         )
@@ -2613,7 +2704,7 @@ impl CaChannel {
         &self,
         deadband: f64,
         mask: u16,
-        enum_as_string: bool,
+        enum_readback: EnumReadback,
         float_as_string: bool,
         req_count: Option<u32>,
     ) -> CaResult<MonitorHandle> {
@@ -2631,7 +2722,7 @@ impl CaChannel {
             callback_tx,
             coalesce_slot: coalesce_slot.clone(),
             req_count,
-            enum_as_string,
+            enum_readback,
             float_as_string,
             reply: reply_tx,
         });
@@ -3119,7 +3210,7 @@ async fn run_coordinator(
                                 .push(reply);
                         }
                     }
-                    CoordRequest::Subscribe { cid, mask, deadband, callback_tx, coalesce_slot, req_count, enum_as_string, float_as_string, reply } => {
+                    CoordRequest::Subscribe { cid, mask, deadband, callback_tx, coalesce_slot, req_count, enum_readback, float_as_string, reply } => {
                         if let Some(ch) = channels.get(&cid) {
                             let server_addr = ch.server_addr.unwrap_or_else(|| {
                                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
@@ -3127,13 +3218,14 @@ async fn run_coordinator(
                             let priority = ch.priority;
                             let connected = ch.state == ChannelState::Connected;
                             // Single owner of the subscribe-time readback
-                            // derivation: ENUM honours -n (camonitor default
-                            // DBR_TIME_STRING), else FLOAT/DOUBLE under -s
-                            // becomes DBR_TIME_STRING, else native TIME type
+                            // derivation: ENUM substituted per enum_readback
+                            // (Label→DBR_TIME_STRING, Numeric→DBR_TIME_INT,
+                            // Native→keep), else FLOAT/DOUBLE under -s becomes
+                            // DBR_TIME_STRING, else native TIME type
                             // (C camonitor.c:155-166).
                             let data_type = ch
                                 .native_type
-                                .map(|t| subscription_readback_dbr(t, enum_as_string, float_as_string));
+                                .map(|t| subscription_readback_dbr(t, enum_readback, float_as_string));
                             // Single owner of the reqElems→wire-count rule: a
                             // `-#` cap is clamped to the native element count,
                             // no cap resolves to wire 0 (autosize) (C
@@ -3162,12 +3254,12 @@ async fn run_coordinator(
                                 // The public subscribe API auto-derives the
                                 // DBR type from the channel's native type, so
                                 // it must re-derive on NativeTypeChanged. The
-                                // `enum_as_string` / `float_as_string`
+                                // `enum_readback` / `float_as_string`
                                 // preferences are carried on the record so the
                                 // restore re-derivation applies the same
                                 // substitution chain.
                                 type_user_supplied: false,
-                                enum_as_string,
+                                enum_readback,
                                 float_as_string,
                                 mask,
                                 server_addr,
@@ -4494,39 +4586,90 @@ mod enum_readback_tests {
         }
     }
 
+    // Regression R0604-CACLI-ENUM-NUMERIC-READBACK-1: the caget/camonitor
+    // ENUM substitution always replaces native ENUM (C `caget.c:177-181` /
+    // `camonitor.c:156-162`): `-n` → DBR_TIME_INT, otherwise DBR_TIME_STRING.
+    // Both branches are TIME class regardless of output mode; non-ENUM is
+    // None so the caller keeps its native path.
+    #[test]
+    fn enum_cli_readback_substitutes_int_or_string() {
+        // `-n` (enum_as_number) → DBR_TIME_INT, never native DBR_TIME_ENUM.
+        assert_eq!(
+            enum_cli_readback_dbr(DbFieldType::Enum, true),
+            Some(DBR_TIME_INT)
+        );
+        // Default (labels) → DBR_TIME_STRING.
+        assert_eq!(
+            enum_cli_readback_dbr(DbFieldType::Enum, false),
+            Some(DBR_TIME_STRING)
+        );
+        // Non-ENUM fields are never substituted here (caller keeps native).
+        for t in [
+            DbFieldType::String,
+            DbFieldType::Short,
+            DbFieldType::Float,
+            DbFieldType::Double,
+            DbFieldType::Char,
+            DbFieldType::Long,
+        ] {
+            assert_eq!(enum_cli_readback_dbr(t, true), None, "{t:?} -n");
+            assert_eq!(enum_cli_readback_dbr(t, false), None, "{t:?} default");
+        }
+    }
+
     // The unified subscribe-time chain, by invariant boundary:
-    // ENUM-case-precedence × float-substitution × native fallback,
-    // mirroring C `if (ENUM) … else if (float …) … else native`.
+    // EnumReadback {Native, Label, Numeric} × float-substitution × native
+    // fallback, mirroring C `if (ENUM) … else if (float …) … else native`.
     #[test]
     fn subscription_readback_chain_precedence() {
-        // ENUM + enum_as_string wins even when float_as_string is also set.
+        // ENUM + Label (camonitor default) wins even when float_as_string is
+        // also set (C tests the ENUM case before the float `else if`).
         assert_eq!(
-            subscription_readback_dbr(DbFieldType::Enum, true, true),
+            subscription_readback_dbr(DbFieldType::Enum, EnumReadback::Label, true),
             DBR_TIME_STRING
         );
-        // ENUM with `-n` (enum_as_string=false) keeps native ENUM TIME type
-        // regardless of float_as_string (ENUM is not a float kind).
+        // ENUM + Numeric (`camonitor -n`) → DBR_TIME_INT (numeric index),
+        // regardless of float_as_string (ENUM is not a float kind). C
+        // `camonitor.c:158` `if (enumAsNr) ppv->dbrType = DBR_TIME_INT` — an
+        // ENUM is never left on the native DBR_TIME_ENUM type under `-n`.
+        // Regression R0604-CACLI-ENUM-NUMERIC-READBACK-1.
         assert_eq!(
-            subscription_readback_dbr(DbFieldType::Enum, false, true),
+            subscription_readback_dbr(DbFieldType::Enum, EnumReadback::Numeric, true),
+            DBR_TIME_INT
+        );
+        // ENUM + Native (the plain library/gateway subscribe) keeps the
+        // native ENUM TIME type — NOT substituted to INT/STRING — even when
+        // float_as_string is set. This is the library contract the bool
+        // `enum_as_string=false` conflated with `-n`: a sum type keeps
+        // Native distinct from Numeric. Regression
+        // R0604-CACLI-ENUM-NUMERIC-READBACK-1.
+        assert_eq!(
+            subscription_readback_dbr(DbFieldType::Enum, EnumReadback::Native, true),
             DbFieldType::Enum.time_dbr_type()
         );
-        // FLOAT/DOUBLE under `-s` → DBR_TIME_STRING.
+        // FLOAT/DOUBLE under `-s` → DBR_TIME_STRING (ENUM mode is Native, so
+        // it does not pre-empt the float substitution).
         assert_eq!(
-            subscription_readback_dbr(DbFieldType::Float, false, true),
+            subscription_readback_dbr(DbFieldType::Float, EnumReadback::Native, true),
             DBR_TIME_STRING
         );
         assert_eq!(
-            subscription_readback_dbr(DbFieldType::Double, false, true),
+            subscription_readback_dbr(DbFieldType::Double, EnumReadback::Native, true),
             DBR_TIME_STRING
         );
         // FLOAT without `-s` → native TIME type (no substitution).
         assert_eq!(
-            subscription_readback_dbr(DbFieldType::Double, false, false),
+            subscription_readback_dbr(DbFieldType::Double, EnumReadback::Native, false),
             DbFieldType::Double.time_dbr_type()
         );
-        // Non-float, non-enum native type is untouched by either flag.
+        // Non-float, non-enum native type is untouched by any ENUM mode —
+        // Label/Numeric only substitute ENUM fields.
         assert_eq!(
-            subscription_readback_dbr(DbFieldType::Long, true, true),
+            subscription_readback_dbr(DbFieldType::Long, EnumReadback::Label, true),
+            DbFieldType::Long.time_dbr_type()
+        );
+        assert_eq!(
+            subscription_readback_dbr(DbFieldType::Long, EnumReadback::Numeric, false),
             DbFieldType::Long.time_dbr_type()
         );
     }

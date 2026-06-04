@@ -7,7 +7,7 @@ use clap::Parser;
 use epics_ca_rs::cli::{
     FloatFormat, FloatStyle, IntStyle, PV_NAME_WIDTH, ValueFormat, format_value,
 };
-use epics_ca_rs::client::{CaChannel, CaClient, ConnectionEvent};
+use epics_ca_rs::client::{CaChannel, CaClient, ConnectionEvent, EnumReadback};
 
 const VERSION_INFO: &str = concat!(
     "\nEPICS Version epics-rs ",
@@ -345,14 +345,21 @@ async fn monitor_pv(
     });
 
     // honour `-m <msk>` via the caller-resolved DBE_* mask.
-    // C `camonitor.c:156-160` requests DBR_TIME_STRING for an ENUM field
-    // unless `-n`, so the monitor delivers state labels by default;
-    // C `camonitor.c:162-166` requests DBR_TIME_STRING for a FLOAT/DOUBLE
-    // field under `-s` so the server renders it to a string. The ENUM
-    // case takes precedence over the float case (C `if/else if`).
-    let enum_as_string = !fmt.enum_as_number;
+    // C `camonitor.c:155-162` ALWAYS substitutes an ENUM field's request
+    // type (it never reads native DBR_TIME_ENUM): `-n` (`enumAsNr`) →
+    // DBR_TIME_INT (the numeric index, `camonitor.c:158`), otherwise
+    // DBR_TIME_STRING (the state label, `camonitor.c:156-160`) — the default,
+    // so the monitor delivers labels. C `camonitor.c:162-166` requests
+    // DBR_TIME_STRING for a FLOAT/DOUBLE field under `-s` so the server
+    // renders it to a string. The ENUM case takes precedence over the float
+    // case (C `if/else if`). Regression R0604-CACLI-ENUM-NUMERIC-READBACK-1.
+    let enum_readback = if fmt.enum_as_number {
+        EnumReadback::Numeric
+    } else {
+        EnumReadback::Label
+    };
     let Ok(mut monitor) = channel
-        .subscribe_with_mask_readback_count(0.0, mask, enum_as_string, float_as_string, req_count)
+        .subscribe_with_mask_readback_count(0.0, mask, enum_readback, float_as_string, req_count)
         .await
     else {
         return;

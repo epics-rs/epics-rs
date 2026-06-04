@@ -277,12 +277,14 @@ pub(crate) struct SubscriptionRecord {
     /// reports `NativeTypeChanged` on reconnect); user-supplied values
     /// are preserved across reconnects. See `restore_for_channel`.
     pub type_user_supplied: bool,
-    /// `camonitor` ENUM-as-state-label preference. When `true`, an ENUM
-    /// field's auto-derived monitor type is the `DBR_TIME_STRING` form
-    /// (C `camonitor.c:156-160`). Carried here so the reconnect
-    /// re-derivation in `restore_for_channel` re-applies the same
-    /// ENUM→STRING substitution against the (possibly new) native type.
-    pub enum_as_string: bool,
+    /// ENUM readback mode for this subscription: `Native` (keep
+    /// `DBR_TIME_ENUM`), `Label` (the `camonitor` default `DBR_TIME_STRING`,
+    /// C `camonitor.c:156-160`), or `Numeric` (`camonitor -n`
+    /// `DBR_TIME_INT`, C `camonitor.c:158`). See
+    /// [`super::EnumReadback`]. Carried here so the reconnect re-derivation
+    /// in `restore_for_channel` re-applies the same ENUM substitution against
+    /// the (possibly new) native type.
+    pub enum_readback: super::EnumReadback,
     /// `camonitor -s` float-as-string preference. When `true`, a
     /// FLOAT/DOUBLE field's auto-derived monitor type is the
     /// `DBR_TIME_STRING` form so the server renders the value to a string
@@ -604,7 +606,7 @@ impl SubscriptionRegistry {
                 let derived = DbFieldType::from_u16(native_type)
                     .ok()
                     .map(|t| {
-                        super::subscription_readback_dbr(t, rec.enum_as_string, rec.float_as_string)
+                        super::subscription_readback_dbr(t, rec.enum_readback, rec.float_as_string)
                     })
                     .unwrap_or(native_type + 14);
                 let data_type = *rec.data_type.get_or_insert(derived);
@@ -738,7 +740,7 @@ mod tests {
             count: None,
             req_count: None,
             type_user_supplied,
-            enum_as_string: false,
+            enum_readback: crate::client::EnumReadback::Native,
             float_as_string: false,
             mask: 1,
             server_addr: addr(),
@@ -949,7 +951,7 @@ mod tests {
             count: Some(1),
             req_count: None,
             type_user_supplied: true,
-            enum_as_string: false,
+            enum_readback: crate::client::EnumReadback::Native,
             float_as_string: false,
             mask: 1,
             server_addr: addr(),

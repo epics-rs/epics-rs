@@ -5,7 +5,7 @@ use epics_base_rs::types::DBR_CLASS_NAME;
 use epics_ca_rs::cli::{
     FloatFormat, FloatStyle, IntStyle, PV_NAME_WIDTH, ValueFormat, format_value,
 };
-use epics_ca_rs::client::{CaClient, enum_string_readback_dbr, float_as_string_readback_dbr};
+use epics_ca_rs::client::{CaClient, enum_cli_readback_dbr, float_as_string_readback_dbr};
 use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
 use std::time::SystemTime;
 
@@ -629,13 +629,17 @@ async fn main() {
                 }
             } else {
                 // C `caget.c:177-187` readback substitution, in C's
-                // precedence: an ENUM field is read back in its STRING form
-                // (state label unless `-n` keeps the index), ELSE a `-s`
-                // request on a native FLOAT/DOUBLE field is read back as
-                // DBR_TIME_STRING so the SERVER converts it.
+                // precedence: an ENUM field is ALWAYS substituted —
+                // `-n` (`enumAsNr`) → DBR_TIME_INT (numeric index), otherwise
+                // DBR_TIME_STRING (state label) — it is never read back as
+                // native DBR_TIME_ENUM. ELSE a `-s` request on a native
+                // FLOAT/DOUBLE field is read back as DBR_TIME_STRING so the
+                // SERVER converts it. Both substitutions are TIME class; the
+                // value-only output modes below just take `snap.value`.
+                // Regression R0604-CACLI-ENUM-NUMERIC-READBACK-1.
                 let nt = ch.native_field_type().ok();
                 let sub_dbr = nt
-                    .and_then(|nt| enum_string_readback_dbr(nt, want_time, !enum_as_number))
+                    .and_then(|nt| enum_cli_readback_dbr(nt, enum_as_number))
                     .or_else(|| {
                         float_as_string
                             .then(|| nt.and_then(float_as_string_readback_dbr))

@@ -20,10 +20,11 @@ use epics_base_rs::server::records::bi::BiRecord;
 use epics_base_rs::server::records::stringin::StringinRecord;
 use epics_base_rs::server::records::waveform::WaveformRecord;
 use epics_base_rs::types::{
-    DBR_CHAR, DBR_CLASS_NAME, DBR_STRING, DBR_TIME_DOUBLE, DBR_TIME_FLOAT, DbFieldType,
+    DBR_CHAR, DBR_CLASS_NAME, DBR_STRING, DBR_TIME_DOUBLE, DBR_TIME_FLOAT, DBR_TIME_INT,
+    DbFieldType,
 };
 use epics_ca_rs::EpicsValue;
-use epics_ca_rs::client::CaClient;
+use epics_ca_rs::client::{CaClient, EnumReadback};
 use epics_ca_rs::server::CaServer;
 use serial_test::serial;
 
@@ -130,15 +131,19 @@ async fn enum_default_readback_is_state_label() {
     );
 }
 
-/// (caget -n): the `-n` (enum-as-number) path keeps the native
-/// type, so the value is the numeric ENUM index — the `caget -n`
-/// behaviour (C `enumAsNr` → `DBR_TIME_INT`). Proves the fix is opt-out.
+/// (native ENUM GET): a plain library GET (`ca_get` / the native
+/// `get_with_timeout`) returns the numeric ENUM index. This is the
+/// building-block primitive, NOT the `caget -n` request path: `caget -n`
+/// asks the server for `DBR_TIME_INT` (C `caget.c:180`
+/// `if (enumAsNr) dbrType = DBR_TIME_INT`), covered by
+/// `enum_numeric_readback_via_time_int` below and the
+/// `enum_cli_readback_dbr` unit tests.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn enum_native_readback_is_numeric_index() {
     let (_client, ch) = server_with_bi("A5R2:BI:NUM", 1, "Off", "On").await;
 
-    // The native GET is what `-n` / the plain library API uses.
+    // The native GET is the plain library API building block.
     let (dbf, value) = ch
         .get_with_timeout(Duration::from_secs(3))
         .await
@@ -148,6 +153,28 @@ async fn enum_native_readback_is_numeric_index() {
         value,
         EpicsValue::Enum(1),
         "native enum readback must be the numeric index"
+    );
+}
+
+/// (caget -n): the request type `caget -n` / `camonitor -n` now issues for
+/// an ENUM field — `DBR_TIME_INT` (C `caget.c:180` /  `camonitor.c:158`
+/// `if (enumAsNr) dbrType = DBR_TIME_INT`) — must round-trip the numeric
+/// index from the server, not fall through to native `DBR_TIME_ENUM`.
+/// `bi` VAL=1 → short `1`. Regression R0604-CACLI-ENUM-NUMERIC-READBACK-1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn enum_numeric_readback_via_time_int() {
+    let (_client, ch) = server_with_bi("A5R2:BI:TINT", 1, "Off", "On").await;
+
+    // What the `-n` caget/camonitor path requests for an enum.
+    let snap = ch
+        .get_with_dbr_type(DBR_TIME_INT, 0)
+        .await
+        .expect("DBR_TIME_INT get on enum");
+    assert_eq!(
+        snap.value,
+        EpicsValue::Short(1),
+        "-n enum readback (DBR_TIME_INT) must be the numeric index as a short"
     );
 }
 
@@ -197,6 +224,43 @@ async fn enum_monitor_native_delivers_index() {
         snap.value,
         EpicsValue::Enum(1),
         "plain library subscribe must keep the native numeric enum"
+    );
+}
+
+/// (camonitor -n): the `EnumReadback::Numeric` monitor mode — the type
+/// `camonitor -n` issues — must request `DBR_TIME_INT` and deliver the ENUM
+/// as a numeric INT (`EpicsValue::Short(1)`), NOT the native
+/// `DBR_TIME_ENUM` (`EpicsValue::Enum(1)`) nor the state label
+/// (`EpicsValue::String("On")`). C `camonitor.c:158` `if (enumAsNr)
+/// ppv->dbrType = DBR_TIME_INT`. This is the subscribe-path companion to
+/// the GET-path `enum_numeric_readback_via_time_int`, exercising the full
+/// `subscribe_with_mask_readback_count` → coordinator →
+/// `subscription_readback_dbr` chain. Regression
+/// R0604-CACLI-ENUM-NUMERIC-READBACK-1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn enum_monitor_numeric_delivers_index() {
+    let (_client, ch) = server_with_bi("A5R2:BI:MONI", 1, "Off", "On").await;
+
+    let mut mon = ch
+        .subscribe_with_mask_readback_count(
+            0.0,
+            epics_ca_rs::protocol::DBE_VALUE,
+            EnumReadback::Numeric,
+            false,
+            None,
+        )
+        .await
+        .expect("subscribe enum-as-number");
+    let snap = tokio::time::timeout(Duration::from_secs(3), mon.recv())
+        .await
+        .expect("monitor event within timeout")
+        .expect("monitor stream open")
+        .expect("monitor snapshot");
+    assert_eq!(
+        snap.value,
+        EpicsValue::Short(1),
+        "camonitor -n must deliver the numeric enum index as a short (DBR_TIME_INT)"
     );
 }
 

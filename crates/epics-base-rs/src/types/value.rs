@@ -123,11 +123,18 @@ impl EpicsValue {
     /// `pvalink_lset.cpp:347-354` (`strncpy(choices[index])` with an
     /// `epicsSnprintf("%u", index)` out-of-range fallback). Used at the
     /// link-write boundary to render an NTEnum onto a string target.
-    pub fn enum_index_label(choices: &[PvString], index: u16) -> String {
+    ///
+    /// Returns the choice as a `PvString` so the raw label bytes are copied
+    /// verbatim, matching C's `strncpy(choice.c_str(), …)`. Rendering an
+    /// in-range choice through `String`/`as_str_lossy` here would rewrite a
+    /// non-UTF-8 label with `U+FFFD` before it reached `EpicsValue::String`;
+    /// the byte-faithful return keeps decode→store→re-encode lossless. The
+    /// out-of-range decimal fallback is pure ASCII, so it is lossless too.
+    pub fn enum_index_label(choices: &[PvString], index: u16) -> PvString {
         choices
             .get(index as usize)
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| index.to_string())
+            .cloned()
+            .unwrap_or_else(|| PvString::from(index.to_string()))
     }
 
     /// Render for audit / log paths with array truncation. The full
@@ -641,7 +648,7 @@ impl EpicsValue {
         // instead of collapsing to a bare index.
         if let Self::EnumWithChoices { index, choices } = self {
             return match target {
-                DbFieldType::String => Self::String(Self::enum_index_label(choices, *index).into()),
+                DbFieldType::String => Self::String(Self::enum_index_label(choices, *index)),
                 _ => Self::Enum(*index).convert_to(target),
             };
         }
@@ -1262,5 +1269,31 @@ mod enum_with_choices_tests {
         let choices: Vec<PvString> = vec!["Off".into(), "On".into()];
         assert_eq!(EpicsValue::enum_index_label(&choices, 1), "On");
         assert_eq!(EpicsValue::enum_index_label(&choices, 9), "9");
+    }
+
+    /// An in-range NTEnum choice label with non-UTF-8 bytes must reach
+    /// `EpicsValue::String` verbatim — C copies the raw `std::string` choice
+    /// with `strncpy(choice.c_str(), …)` (`pvalink_lset.cpp:349`). A lossy
+    /// `String`/`as_str_lossy` round-trip would rewrite the `0xFF` byte as the
+    /// 3-byte `U+FFFD` replacement before storage. The out-of-range fallback
+    /// is ASCII and stays byte-identical.
+    #[test]
+    fn enum_choice_label_preserves_non_utf8_bytes() {
+        let choices = vec![PvString::from_bytes(vec![0xFFu8])];
+        // In-range: raw byte preserved, not the 3-byte U+FFFD replacement.
+        assert_eq!(
+            EpicsValue::enum_index_label(&choices, 0).as_bytes(),
+            &[0xFFu8]
+        );
+        let carrier = EpicsValue::EnumWithChoices {
+            index: 0,
+            choices: choices.clone(),
+        };
+        match carrier.convert_to(DbFieldType::String) {
+            EpicsValue::String(s) => assert_eq!(s.as_bytes(), &[0xFFu8]),
+            other => panic!("expected String, got {other:?}"),
+        }
+        // Out-of-range: ASCII decimal index.
+        assert_eq!(EpicsValue::enum_index_label(&choices, 9).as_bytes(), b"9");
     }
 }

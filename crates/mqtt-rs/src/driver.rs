@@ -183,9 +183,10 @@ impl PortDriver for MqttDriver {
         value: u32,
         mask: u32,
     ) -> AsynResult<()> {
+        // Device write interface: no forced interrupt mask (interrupt_mask = 0).
         self.base
             .params
-            .set_uint32(user.reason, user.addr, value, mask)?;
+            .set_uint32(user.reason, user.addr, value, mask, 0)?;
         let full_val = self
             .base
             .params

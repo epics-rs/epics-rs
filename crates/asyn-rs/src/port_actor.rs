@@ -595,8 +595,15 @@ impl PortActor {
                             addr,
                             value,
                             mask,
+                            interrupt_mask,
                         } => {
-                            let _ = base.set_uint32_param(*reason, *addr, *value, *mask);
+                            let _ = base.set_uint32_param(
+                                *reason,
+                                *addr,
+                                *value,
+                                *mask,
+                                *interrupt_mask,
+                            );
                         }
                     }
                 }

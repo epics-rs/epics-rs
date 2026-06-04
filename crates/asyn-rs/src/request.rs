@@ -40,6 +40,10 @@ pub enum ParamSetValue {
         addr: i32,
         value: u32,
         mask: u32,
+        /// Bits to force into the I/O Intr callback mask even when the
+        /// stored value is unchanged (C `setUIntDigitalParam(..,
+        /// interruptMask)`); `0` for a plain value set.
+        interrupt_mask: u32,
     },
 }
 

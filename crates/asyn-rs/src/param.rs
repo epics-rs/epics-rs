@@ -593,7 +593,14 @@ impl ParamList {
         }
     }
 
-    pub fn set_uint32(&mut self, index: usize, addr: i32, value: u32, mask: u32) -> AsynResult<()> {
+    pub fn set_uint32(
+        &mut self,
+        index: usize,
+        addr: i32,
+        value: u32,
+        mask: u32,
+        interrupt_mask: u32,
+    ) -> AsynResult<()> {
         let entry = self.get_entry_mut(index, addr)?;
         if let ParamValue::UInt32Digital(ref old) = entry.value {
             // C parity: paramVal::setUInt32 (paramVal.cpp:198-225).
@@ -622,6 +629,16 @@ impl ParamList {
                 entry.value = ParamValue::UInt32Digital(new_val);
                 entry.value_changed = true;
                 entry.defined = true;
+            }
+            // C parity: paramVal.cpp:220-224 — a non-zero `interruptMask`
+            // forces those bits into the callback mask and marks the value
+            // changed EVEN when the stored value is unchanged, so I/O Intr
+            // callbacks gated on those bits still fire. This is the
+            // `setUIntDigitalParam(.., interruptMask)` overload path; the
+            // first-write `defined` flip above already ran when needed.
+            if interrupt_mask != 0 {
+                entry.uint32_interrupt_mask |= interrupt_mask;
+                entry.value_changed = true;
             }
         } else {
             return Err(AsynError::TypeMismatch {
@@ -1345,9 +1362,9 @@ mod tests {
     fn test_get_set_uint32_mask() {
         let mut pl = ParamList::new(1, false);
         let idx = pl.create_param("BITS", ParamType::UInt32Digital).unwrap();
-        pl.set_uint32(idx, 0, 0xFF, 0x0F).unwrap();
+        pl.set_uint32(idx, 0, 0xFF, 0x0F, 0).unwrap();
         assert_eq!(pl.get_uint32(idx, 0).unwrap(), 0x0F);
-        pl.set_uint32(idx, 0, 0xFF, 0xF0).unwrap();
+        pl.set_uint32(idx, 0, 0xFF, 0xF0, 0).unwrap();
         assert_eq!(pl.get_uint32(idx, 0).unwrap(), 0xFF);
     }
 
@@ -1853,7 +1870,7 @@ mod tests {
         // to publish an initial zero state and expects the callback to fire.
         let mut pl = ParamList::new(1, false);
         let idx = pl.create_param("V", ParamType::UInt32Digital).unwrap();
-        pl.set_uint32(idx, 0, 0, 0xFFFF).unwrap();
+        pl.set_uint32(idx, 0, 0, 0xFFFF, 0).unwrap();
         assert!(pl.is_param_defined(idx, 0).unwrap());
         assert!(pl.take_changed_single(idx, 0).unwrap());
         assert_eq!(pl.get_uint32_strict(idx, 0).unwrap(), 0);
@@ -1935,14 +1952,46 @@ mod tests {
     }
 
     #[test]
+    fn set_uint32_force_interrupt_mask_on_unchanged_value_notifies() {
+        // C paramVal::setUInt32 (paramVal.cpp:220-224): a non-zero
+        // `interruptMask` ORs those bits into uInt32CallbackMask AND calls
+        // setValueChanged() UNCONDITIONALLY — even when the merged value is
+        // identical to the stored value. This is the setUIntDigitalParam
+        // interruptMask overload (asynPortDriver.cpp:1381): a driver forces
+        // an I/O Intr on specific bits without changing the value.
+        let mut pl = ParamList::new(1, false);
+        let idx = pl.create_param("U", ParamType::UInt32Digital).unwrap();
+        // Define the param at 0x05 and drain the resulting change + mask.
+        pl.set_uint32(idx, 0, 0x05, 0x0F, 0).unwrap();
+        let _ = pl.take_changed(0).unwrap();
+        let _ = pl.take_uint32_interrupt_mask(idx, 0).unwrap();
+        // Re-set the SAME value (no value-bit change) but force bit 0x02.
+        pl.set_uint32(idx, 0, 0x05, 0x0F, 0x02).unwrap();
+        assert_eq!(
+            pl.get_uint32(idx, 0).unwrap(),
+            0x05,
+            "a forced-interrupt-only set must not change the stored value"
+        );
+        assert!(
+            pl.take_changed(0).unwrap().contains(&idx),
+            "a forced interruptMask must mark value_changed even on an unchanged value"
+        );
+        assert_eq!(
+            pl.take_uint32_interrupt_mask(idx, 0).unwrap(),
+            0x02,
+            "the forced interruptMask bits must land in the callback mask"
+        );
+    }
+
+    #[test]
     fn set_uint32_accumulates_callback_mask_across_sets() {
         // C `uInt32CallbackMask |= (uival ^ newValue)` (paramVal.cpp:215):
         // two setUInt32 calls before one callParamCallbacks must accumulate
         // the union of changed bits, not keep only the last set's bits.
         let mut pl = ParamList::new(1, false);
         let idx = pl.create_param("U", ParamType::UInt32Digital).unwrap();
-        pl.set_uint32(idx, 0, 0x01, 0x01).unwrap(); // define + change bit 0
-        pl.set_uint32(idx, 0, 0x02, 0x02).unwrap(); // change bit 1
+        pl.set_uint32(idx, 0, 0x01, 0x01, 0).unwrap(); // define + change bit 0
+        pl.set_uint32(idx, 0, 0x02, 0x02, 0).unwrap(); // change bit 1
         assert_eq!(
             pl.get_uint32_interrupt_mask(idx, 0).unwrap(),
             0x03,
@@ -1956,7 +2005,7 @@ mod tests {
         // (asynPortDriver.cpp:855).
         let mut pl = ParamList::new(1, false);
         let idx = pl.create_param("U", ParamType::UInt32Digital).unwrap();
-        pl.set_uint32(idx, 0, 0x05, 0x0F).unwrap();
+        pl.set_uint32(idx, 0, 0x05, 0x0F, 0).unwrap();
         assert_eq!(pl.take_uint32_interrupt_mask(idx, 0).unwrap(), 0x05);
         assert_eq!(
             pl.get_uint32_interrupt_mask(idx, 0).unwrap(),

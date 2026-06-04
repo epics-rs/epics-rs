@@ -206,6 +206,9 @@ async fn handle_incoming_message(
                             addr: 0,
                             value: v,
                             mask: 0xFFFF_FFFF,
+                            // Inbound MQTT value: changed bits derive from the
+                            // value merge; no forced interrupt mask.
+                            interrupt_mask: 0,
                         });
                     }
                     DecodedValue::Int32Array(v) => {

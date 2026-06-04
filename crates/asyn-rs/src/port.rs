@@ -458,14 +458,21 @@ impl PortDriverBase {
         self.params.get_string_strict(index, addr)
     }
 
+    /// Set a UInt32Digital parameter. `interrupt_mask` mirrors C
+    /// `setUIntDigitalParam(.., interruptMask)` (asynPortDriver.cpp:1369,
+    /// 1381): bits to force into the I/O Intr callback mask even when the
+    /// stored value did not change. Pass `0` for a plain value set (the
+    /// 3-arg C overload, asynPortDriver.cpp:1347).
     pub fn set_uint32_param(
         &mut self,
         index: usize,
         addr: i32,
         value: u32,
         mask: u32,
+        interrupt_mask: u32,
     ) -> AsynResult<()> {
-        self.params.set_uint32(index, addr, value, mask)
+        self.params
+            .set_uint32(index, addr, value, mask, interrupt_mask)
     }
 
     pub fn get_uint32_param(&self, index: usize, addr: i32) -> AsynResult<u32> {
@@ -844,9 +851,11 @@ pub trait PortDriver: Send + Sync + 'static {
         value: u32,
         mask: u32,
     ) -> AsynResult<()> {
+        // The asynUInt32Digital write interface carries no forced interrupt
+        // mask — changed bits derive from value^old (interrupt_mask = 0).
         self.base_mut()
             .params
-            .set_uint32(user.reason, user.addr, value, mask)?;
+            .set_uint32(user.reason, user.addr, value, mask, 0)?;
         self.base_mut().call_param_callbacks(user.addr)
     }
 
@@ -1281,14 +1290,20 @@ mod tests {
         let mut rx = drv.base_mut().interrupts.subscribe_async();
 
         // flush 1: change bit 0 on BITS (param index 3).
-        drv.base_mut().params.set_uint32(3, 0, 0x01, 0x01).unwrap();
+        drv.base_mut()
+            .params
+            .set_uint32(3, 0, 0x01, 0x01, 0)
+            .unwrap();
         drv.base_mut().call_param_callbacks(0).unwrap();
         let iv1 = rx.try_recv().unwrap();
         assert_eq!(iv1.reason, 3);
         assert_eq!(iv1.uint32_changed_mask, 0x01);
 
         // flush 2: change bit 1 only — must deliver 0x02, not 0x03.
-        drv.base_mut().params.set_uint32(3, 0, 0x02, 0x02).unwrap();
+        drv.base_mut()
+            .params
+            .set_uint32(3, 0, 0x02, 0x02, 0)
+            .unwrap();
         drv.base_mut().call_param_callbacks(0).unwrap();
         let iv2 = rx.try_recv().unwrap();
         assert_eq!(

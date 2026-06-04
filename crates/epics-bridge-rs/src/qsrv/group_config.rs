@@ -190,15 +190,23 @@ pub enum TriggerDef {
 ///
 /// Two string-literal-aware transformations (quoted payloads such as a
 /// channel value `"a/*b*/c"` or `"+notakey"` are never rewritten):
-///   1. strip `/* block */` and `// line` comments;
+///   1. replace `/* block */` and `// line` comments with whitespace;
 ///   2. wrap bare `+ident` object keys in double quotes.
+///
+/// YAJL treats a comment as a single run of whitespace, so it SEPARATES
+/// the tokens on either side and an unterminated `/* ... */` is a parse
+/// error. The comment is therefore replaced with whitespace rather than
+/// deleted (deleting it with no separator would splice `1/*x*/2` into the
+/// single token `12`, turning input YAJL rejects into a different valid
+/// document), and an unterminated block comment returns an error instead
+/// of being silently stripped to EOF (`R0604-BRQSRV-GROUP-JSON-COMMENT-CONCAT-1`).
 ///
 /// Group names and member field names are always quoted in the upstream
 /// dialect, so only `+`-prefixed option keys are ever unquoted; this
 /// keeps the transform minimal rather than guessing at arbitrary bare
 /// keys. The existing typed validation runs unchanged on the parsed
 /// result, so parser leniency never hides an invalid group field.
-fn normalize_relaxed_group_json(src: &str) -> String {
+fn normalize_relaxed_group_json(src: &str) -> BridgeResult<String> {
     let chars: Vec<char> = src.chars().collect();
     let n = chars.len();
     let mut out = String::with_capacity(src.len());
@@ -225,13 +233,27 @@ fn normalize_relaxed_group_json(src: &str) -> String {
                     }
                 }
             }
-            // Block comment `/* ... */`.
+            // Block comment `/* ... */`. YAJL treats it as whitespace, so it
+            // SEPARATES the surrounding tokens; emit one space in its place
+            // and fail on a `/*` that never closes (matching YAJL, which
+            // reports a parse error rather than accepting the truncated text).
             '/' if i + 1 < n && chars[i + 1] == '*' => {
                 i += 2;
-                while i + 1 < n && !(chars[i] == '*' && chars[i + 1] == '/') {
+                let mut closed = false;
+                while i + 1 < n {
+                    if chars[i] == '*' && chars[i + 1] == '/' {
+                        i += 2;
+                        closed = true;
+                        break;
+                    }
                     i += 1;
                 }
-                i += 2; // consume the closing `*/` (or run off the end)
+                if !closed {
+                    return Err(BridgeError::GroupConfigError(
+                        "unterminated block comment '/* ... */' in QSRV group JSON".into(),
+                    ));
+                }
+                out.push(' ');
             }
             // Line comment `// ...`.
             '/' if i + 1 < n && chars[i + 1] == '/' => {
@@ -270,14 +292,14 @@ fn normalize_relaxed_group_json(src: &str) -> String {
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Parse group definitions from a JSON string.
 ///
 /// The JSON is a top-level object where each key is a group name.
 pub fn parse_group_config(json: &str) -> BridgeResult<Vec<GroupPvDef>> {
-    let normalized = normalize_relaxed_group_json(json);
+    let normalized = normalize_relaxed_group_json(json)?;
     let root: HashMap<String, RawGroupDef> = serde_json::from_str(&normalized)
         .map_err(|e| BridgeError::GroupConfigError(e.to_string()))?;
 
@@ -314,7 +336,7 @@ pub fn parse_group_config(json: &str) -> BridgeResult<Vec<GroupPvDef>> {
 /// The `record_name` is used as channel prefix: if `+channel` is a bare field
 /// name (no `:` separator), it becomes `"record_name.FIELD"`.
 pub fn parse_info_group(record_name: &str, json: &str) -> BridgeResult<Vec<GroupPvDef>> {
-    let normalized = normalize_relaxed_group_json(json);
+    let normalized = normalize_relaxed_group_json(json)?;
     let root: HashMap<String, RawGroupDef> = serde_json::from_str(&normalized)
         .map_err(|e| BridgeError::GroupConfigError(e.to_string()))?;
 
@@ -1009,6 +1031,47 @@ mod tests {
         }"#;
         let defs = parse_group_config(json).expect("strings with markers must parse");
         assert_eq!(defs[0].members[0].channel, "A/*not a comment*/B//x");
+    }
+
+    /// Regression R0604-BRQSRV-GROUP-JSON-COMMENT-CONCAT-1: YAJL treats a
+    /// comment as whitespace (`allow_comments`, configparse.cpp:231/249), so
+    /// it SEPARATES the tokens it stands between. A block comment wedged
+    /// between two numbers (`1/*x*/2`) leaves two number tokens where a comma
+    /// or `}` is required, which YAJL rejects. Deleting the comment with no
+    /// separator spliced them into the single token `12`, turning input YAJL
+    /// rejects into a different valid document.
+    #[test]
+    fn group_json_block_comment_separates_tokens() {
+        let json = r#"{ "g": { "f": {+channel:"VAL", +putorder:1/*typo*/2} } }"#;
+        assert!(
+            parse_info_group("rec", json).is_err(),
+            "block comment must separate 1 and 2, leaving invalid JSON (not splice into 12)"
+        );
+        // The same comment placed where a separator is legal still parses, and
+        // the number before it keeps its value (`1`, not `12`).
+        let json = r#"{ "g": { "f": {+channel:"VAL", +putorder:1/*typo*/, +type:"plain"} } }"#;
+        let groups = parse_info_group("rec", json).expect("comment before ',' is valid");
+        assert_eq!(
+            groups[0].members[0].put_order,
+            Some(1),
+            "putorder is 1, not 12"
+        );
+    }
+
+    /// Regression R0604-BRQSRV-GROUP-JSON-COMMENT-CONCAT-1: an unterminated
+    /// `/* ... */` is a YAJL parse error, not silently stripped to EOF. The
+    /// previous normalizer ran the strip past the end and accepted the
+    /// preceding text if it happened to be valid.
+    #[test]
+    fn group_json_unterminated_block_comment_is_rejected() {
+        let json = r#"{ "g": { "f": {+channel:"VAL"} } } /* never closed"#;
+        assert!(
+            parse_info_group("rec", json).is_err(),
+            "unterminated block comment must be rejected, matching YAJL"
+        );
+        // Also rejected mid-document, before any otherwise-valid close.
+        let json = r#"{ "g": { "f": {+channel:"VAL" /* unterminated } } }"#;
+        assert!(parse_info_group("rec", json).is_err());
     }
 
     /// The relaxed normalizer applies to the record `info(Q:group, ...)`

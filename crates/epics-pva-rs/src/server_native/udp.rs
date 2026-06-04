@@ -652,7 +652,7 @@ pub async fn run_udp_responder_with_config(
 /// |   5    |  3   | reserved         |
 /// |   8    | 16   | response_addr    |
 /// |  24    |  2   | response_port    |
-fn try_build_forward_frame(frame: &[u8], reply_dest: SocketAddrV4) -> Option<Vec<u8>> {
+fn try_build_forward_frame(frame: &[u8], reply_dest: SocketAddr) -> Option<Vec<u8>> {
     let req = parse_search_request(frame)?;
     if !req.unicast {
         return None;
@@ -665,11 +665,15 @@ fn try_build_forward_frame(frame: &[u8], reply_dest: SocketAddrV4) -> Option<Vec
     // Clear Unicast bit so peers don't re-forward (pvxs uses the flag
     // as a "single-server-targeted" marker).
     out[payload_off + 4] &= !0x80;
-    // Overwrite the 16-byte response_addr with the resolved IPv4
-    // (v4-mapped IPv6 form). This is what the recipient must use as
-    // the reply destination since the original UDP source is the
+    // Overwrite the 16-byte response_addr with the resolved reply
+    // destination (`to_wire(replyDest)`, pvxs `udp_collector.cpp:394`):
+    // a v4 address as the v4-mapped IPv6 form, a v6 address as its raw
+    // 16 bytes. The reply-address field is family-independent even though
+    // the ORIGIN_TAG forward transport is IPv4, so an explicit IPv6 reply
+    // endpoint must survive the forward. The recipient uses this field as
+    // the SEARCH_RESPONSE destination since the original UDP source is the
     // forwarder, not the requester.
-    let addr_bytes = ip_to_bytes(IpAddr::V4(*reply_dest.ip()));
+    let addr_bytes = ip_to_bytes(reply_dest.ip());
     out[payload_off + 8..payload_off + 24].copy_from_slice(&addr_bytes);
     // Overwrite the 2-byte response_port in the SEARCH's byte order.
     let port_bytes = match req.byte_order {
@@ -764,20 +768,21 @@ async fn process_search_datagram(
             // for the forward-frame rewriter.
             if let Some(req) = parse_search_request(frame) {
                 if req.unicast {
-                    // The loopback ORIGIN_TAG forward channel is IPv4-only,
-                    // so a forwarded reply destination must resolve to a v4
-                    // address: prefer the SEARCH-payload addr when it is v4,
-                    // else the UDP source's v4 (a v6 reply addr or v6 source
-                    // has no place on this channel — fall back to
-                    // UNSPECIFIED so OS routing/the recipient sorts it out).
-                    let reply_ip = match req.reply_addr {
-                        Some(IpAddr::V4(v4)) => v4,
-                        _ => match udp_src.ip() {
-                            IpAddr::V4(v4) => v4,
-                            IpAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
-                        },
+                    // Resolve the reply destination the forwarded SEARCH
+                    // carries, transport-independent at the payload level
+                    // (pvxs `udp_collector.cpp:367-380`). An explicit reply
+                    // address — v4 OR v6 — is preserved (`replyDest =
+                    // server`, :378); only the wildcard sentinel falls back
+                    // to the original UDP source (`replyDest = origSrc`,
+                    // :372). The ORIGIN_TAG forward transport is IPv4, but
+                    // the 16-byte reply-address field is family-independent,
+                    // so a requester that asks for SEARCH_RESPONSE at its
+                    // IPv6 endpoint keeps it rather than being downgraded to
+                    // the v4 sender or wildcard.
+                    let reply_dest = match req.reply_addr {
+                        Some(ip) => SocketAddr::new(ip, req.reply_port),
+                        None => SocketAddr::new(udp_src.ip(), req.reply_port),
                     };
-                    let reply_dest = SocketAddrV4::new(reply_ip, req.reply_port);
                     if let Some(forward) = try_build_forward_frame(frame, reply_dest) {
                         let prefix = PvaCodec::build_origin_tag_prefix(reply_iface_ip);
                         let mut out = Vec::with_capacity(prefix.len() + forward.len());
@@ -2546,7 +2551,7 @@ mod tests {
         let original = codec.build_search(7, 42, "MY:PV", [0, 0, 0, 0], 5076, true);
         // Forwarder resolves reply_dest = 192.168.1.5:54321 (the UDP
         // source IP + announced port).
-        let dest = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 5), 54321);
+        let dest = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 54321);
         let out = try_build_forward_frame(&original, dest).expect("unicast → Some");
 
         // Re-parse the forwarded frame: unicast must be cleared, reply
@@ -2562,6 +2567,38 @@ mod tests {
         // Non-unicast SEARCH: forward returns None (no rewrite).
         let bcast = codec.build_search(7, 42, "MY:PV", [10, 0, 0, 1], 5076, false);
         assert!(try_build_forward_frame(&bcast, dest).is_none());
+    }
+
+    /// Regression R0604-PVASRV-V4-FORWARD-V6-REPLYADDR-1: an explicit
+    /// IPv6 reply endpoint inside a forwarded SEARCH must be preserved as
+    /// its raw 16-byte address, not downgraded to the IPv4 sender or
+    /// wildcard. pvxs forwarding is transport-independent at the payload
+    /// level (`to_wire(replyDest)`, `udp_collector.cpp:394`), so a
+    /// requester asking for SEARCH_RESPONSE at `[2001:db8::1]:9876` keeps
+    /// that endpoint even though the ORIGIN_TAG forward channel is IPv4.
+    #[test]
+    fn try_build_forward_frame_preserves_ipv6_reply_endpoint() {
+        use std::net::Ipv6Addr;
+        let codec = PvaCodec { big_endian: false };
+        // Unicast SEARCH whose payload reply address is IPv6.
+        let mut original = codec.build_search(7, 42, "MY:PV", [0, 0, 0, 0], 5076, true);
+        let v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let off = PvaHeader::SIZE + 8;
+        original[off..off + 16].copy_from_slice(&ip_to_bytes(IpAddr::V6(v6)));
+
+        // Forwarder resolved the same v6 endpoint (caller keeps
+        // `req.reply_addr` verbatim) with the advertised port.
+        let dest = SocketAddr::new(IpAddr::V6(v6), 9876);
+        let out = try_build_forward_frame(&original, dest).expect("unicast → Some");
+
+        let req = parse_search_request(&out).expect("re-parse ok");
+        assert!(!req.unicast, "unicast flag must be cleared");
+        assert_eq!(
+            req.reply_addr,
+            Some(IpAddr::V6(v6)),
+            "forwarded SEARCH must keep the IPv6 reply address, not downgrade it"
+        );
+        assert_eq!(req.reply_port, 9876);
     }
 
     /// `parse_search_request` extracts the reply addr + port from the

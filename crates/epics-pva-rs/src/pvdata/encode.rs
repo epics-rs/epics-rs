@@ -586,21 +586,46 @@ pub type TypeCache = std::collections::HashMap<u16, FieldDesc>;
 /// recursion frames).
 const MAX_FIELD_DEPTH: u32 = 20;
 
+/// Policy for the EPICS base pvData / pvAccessCPP bounded-string descriptor
+/// tag (`0x83`). pvxs never emits this tag and faults on a bounded/fixed
+/// descriptor (`dataencode.cpp:120-123,186-206`); EPICS base pvAccessCPP
+/// serializes a `BoundedString` as `0x83` + `writeSize(maxLength)` and reads
+/// it back into a `BoundedString` whose value is a normal string with a
+/// maximum length (`FieldCreateFactory.cpp:201-206,1512-1523`). The two
+/// dialects disagree on the wire, so the inbound decode rule is made explicit
+/// rather than hard-coded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BoundedStringPolicy {
+    /// Broad pvAccessCPP interop (default): decode `0x83` + size as plain
+    /// `String` introspection, dropping the bound, so GET/MONITOR/PUT work
+    /// against a Base pvAccessCPP server. There is no `FieldDesc` variant that
+    /// carries a bound, so re-encoding the decoded field emits the plain
+    /// string tag (`0x60`) — a descriptor relayed toward a pvxs peer is
+    /// normalized by construction.
+    #[default]
+    Interop,
+    /// Strict pvxs conformance: reject `0x83` as an invalid type code (the
+    /// pre-interop behavior). pvxs peers never emit it, so this only matters
+    /// when asserting that a stream is pvxs-pure.
+    StrictPvxs,
+}
+
 /// Decode a top-level `FieldDesc` (`name` + type description).
 pub fn decode_field_desc(
     cur: &mut Cursor<&[u8]>,
     order: ByteOrder,
 ) -> Result<(String, FieldDesc), DecodeError> {
-    decode_field_desc_at_depth(cur, order, 0)
+    decode_field_desc_at_depth(cur, order, BoundedStringPolicy::Interop, 0)
 }
 
 fn decode_field_desc_at_depth(
     cur: &mut Cursor<&[u8]>,
     order: ByteOrder,
+    policy: BoundedStringPolicy,
     depth: u32,
 ) -> Result<(String, FieldDesc), DecodeError> {
     let name = decode_string(cur, order)?.unwrap_or_default();
-    let desc = decode_type_desc_at_depth(cur, order, depth)?;
+    let desc = decode_type_desc_at_depth(cur, order, policy, depth)?;
     Ok((name, desc))
 }
 
@@ -611,17 +636,18 @@ pub fn decode_field_desc_cached(
     order: ByteOrder,
     cache: &mut TypeCache,
 ) -> Result<(String, FieldDesc), DecodeError> {
-    decode_field_desc_cached_at_depth(cur, order, cache, 0)
+    decode_field_desc_cached_at_depth(cur, order, cache, BoundedStringPolicy::Interop, 0)
 }
 
 fn decode_field_desc_cached_at_depth(
     cur: &mut Cursor<&[u8]>,
     order: ByteOrder,
     cache: &mut TypeCache,
+    policy: BoundedStringPolicy,
     depth: u32,
 ) -> Result<(String, FieldDesc), DecodeError> {
     let name = decode_string(cur, order)?.unwrap_or_default();
-    let desc = decode_type_desc_cached_at_depth(cur, order, cache, depth)?;
+    let desc = decode_type_desc_cached_at_depth(cur, order, cache, policy, depth)?;
     Ok((name, desc))
 }
 
@@ -630,16 +656,17 @@ pub fn decode_type_desc(
     cur: &mut Cursor<&[u8]>,
     order: ByteOrder,
 ) -> Result<FieldDesc, DecodeError> {
-    decode_type_desc_at_depth(cur, order, 0)
+    decode_type_desc_at_depth(cur, order, BoundedStringPolicy::Interop, 0)
 }
 
 fn decode_type_desc_at_depth(
     cur: &mut Cursor<&[u8]>,
     order: ByteOrder,
+    policy: BoundedStringPolicy,
     depth: u32,
 ) -> Result<FieldDesc, DecodeError> {
     let mut empty = TypeCache::new();
-    decode_type_desc_cached_at_depth(cur, order, &mut empty, depth)
+    decode_type_desc_cached_at_depth(cur, order, &mut empty, policy, depth)
 }
 
 /// Decode a type descriptor honouring 0xFD (define) / 0xFE (lookup)
@@ -660,7 +687,22 @@ pub fn decode_type_desc_cached(
     order: ByteOrder,
     cache: &mut TypeCache,
 ) -> Result<FieldDesc, DecodeError> {
-    decode_type_desc_cached_at_depth(cur, order, cache, 0)
+    decode_type_desc_cached_at_depth(cur, order, cache, BoundedStringPolicy::Interop, 0)
+}
+
+/// Variant of [`decode_type_desc_cached`] that selects the
+/// [`BoundedStringPolicy`] explicitly. The default entry points decode an
+/// EPICS base pvAccessCPP `0x83` bounded-string descriptor as a plain
+/// `String` ([`BoundedStringPolicy::Interop`]); pass
+/// [`BoundedStringPolicy::StrictPvxs`] to reject it instead — the explicit
+/// pvxs-strict opt-in.
+pub fn decode_type_desc_cached_with_policy(
+    cur: &mut Cursor<&[u8]>,
+    order: ByteOrder,
+    cache: &mut TypeCache,
+    policy: BoundedStringPolicy,
+) -> Result<FieldDesc, DecodeError> {
+    decode_type_desc_cached_at_depth(cur, order, cache, policy, 0)
 }
 
 /// Resolve a single type descriptor at the cursor against `cache`,
@@ -684,7 +726,8 @@ pub fn rewrite_type_desc_inline(
     cache: &mut TypeCache,
     out: &mut Vec<u8>,
 ) -> Result<(), DecodeError> {
-    let desc = decode_type_desc_cached_at_depth(cur, order, cache, 0)?;
+    let desc =
+        decode_type_desc_cached_at_depth(cur, order, cache, BoundedStringPolicy::Interop, 0)?;
     encode_type_desc(&desc, order, out);
     Ok(())
 }
@@ -693,6 +736,7 @@ fn decode_type_desc_cached_at_depth(
     cur: &mut Cursor<&[u8]>,
     order: ByteOrder,
     cache: &mut TypeCache,
+    policy: BoundedStringPolicy,
     depth: u32,
 ) -> Result<FieldDesc, DecodeError> {
     if depth > MAX_FIELD_DEPTH {
@@ -705,7 +749,7 @@ fn decode_type_desc_cached_at_depth(
         0xFD => {
             // define new cache slot, then full inline descriptor.
             let key = cur.get_u16(order)?;
-            let desc = decode_type_desc_cached_at_depth(cur, order, cache, depth + 1)?;
+            let desc = decode_type_desc_cached_at_depth(cur, order, cache, policy, depth + 1)?;
             // pvxs uses `std::map::emplace` (dataencode.cpp:91-95), which is
             // a no-op when the slot is already bound: a duplicate `0xFD`
             // for an existing slot is consumed and validated (the inline
@@ -726,8 +770,10 @@ fn decode_type_desc_cached_at_depth(
                 .cloned()
                 .ok_or_else(|| decode_err!("typecache miss for slot {key}"))
         }
-        TAG_STRUCTURE => decode_structure_body_cached_at_depth(cur, order, false, cache, depth + 1),
-        TAG_UNION => decode_union_body_cached_at_depth(cur, order, false, cache, depth + 1),
+        TAG_STRUCTURE => {
+            decode_structure_body_cached_at_depth(cur, order, false, cache, policy, depth + 1)
+        }
+        TAG_UNION => decode_union_body_cached_at_depth(cur, order, false, cache, policy, depth + 1),
         TAG_STRUCTURE_ARRAY => {
             let inner = cur.get_u8()?;
             if inner != TAG_STRUCTURE {
@@ -735,7 +781,7 @@ fn decode_type_desc_cached_at_depth(
                     "structure-array element tag 0x{inner:02X} (expected 0x80)"
                 ));
             }
-            decode_structure_body_cached_at_depth(cur, order, true, cache, depth + 1)
+            decode_structure_body_cached_at_depth(cur, order, true, cache, policy, depth + 1)
         }
         TAG_UNION_ARRAY => {
             let inner = cur.get_u8()?;
@@ -744,20 +790,35 @@ fn decode_type_desc_cached_at_depth(
                     "union-array element tag 0x{inner:02X} (expected 0x81)"
                 ));
             }
-            decode_union_body_cached_at_depth(cur, order, true, cache, depth + 1)
+            decode_union_body_cached_at_depth(cur, order, true, cache, policy, depth + 1)
         }
         TAG_VARIANT => Ok(FieldDesc::Variant),
         TAG_VARIANT_ARRAY => Ok(FieldDesc::VariantArray),
-        // pvxs faults on a bounded/fixed descriptor (`dataencode.cpp:120-123`
-        // for the fixed-size bit, `:186-206` leaves bounded unhandled in the
-        // default switch). The 0x83 tag is never emitted by a pvxs peer, and
-        // there is no `FieldDesc` variant that produces it; reject it as an
-        // invalid type code (also catches the legacy Rust-only 0x83 tag that
-        // earlier builds emitted before the bounded-string descriptor was
-        // dropped) rather than fall through to the scalar lookup.
-        TAG_BOUNDED_STRING => Err(decode_err!(
-            "bounded string descriptor (0x{TAG_BOUNDED_STRING:02X}) is not a pvAccess type code"
-        )),
+        // EPICS base pvData/pvAccessCPP serializes a `BoundedString` as the
+        // `0x83` tag followed by `writeSize(maxLength)` and deserializes it
+        // back into a `BoundedString` whose value is a normal string with a
+        // maximum length (`FieldCreateFactory.cpp:201-206,1512-1523`). pvxs
+        // never emits `0x83` and faults on a bounded/fixed descriptor
+        // (`dataencode.cpp:120-123,186-206`). The two dialects disagree, so
+        // the rule is policy-driven (see `BoundedStringPolicy`).
+        // Regression R0604-PVDATA-BOUNDED-STRING-PVACCESSCPP-1.
+        TAG_BOUNDED_STRING => match policy {
+            // Interop: consume the size and surface the field as a plain
+            // `String`. The bound is dropped — pvData treats a bounded
+            // string's value as a normal string, and no `FieldDesc` variant
+            // carries a bound, so re-encoding emits the plain `0x60` string
+            // tag (normalized toward pvxs by construction).
+            BoundedStringPolicy::Interop => {
+                decode_size(cur, order)?
+                    .ok_or_else(|| decode_err!("bounded string size cannot be null"))?;
+                Ok(FieldDesc::Scalar(ScalarType::String))
+            }
+            // Strict pvxs: reject the tag (also rejects the legacy Rust-only
+            // `0x83` that pre-interop builds emitted).
+            BoundedStringPolicy::StrictPvxs => Err(decode_err!(
+                "bounded string descriptor (0x{TAG_BOUNDED_STRING:02X}) is not a pvxs type code"
+            )),
+        },
         b if b & 0x08 != 0 => {
             let scalar = ScalarType::from_array_type_code(b)
                 .ok_or_else(|| decode_err!("unknown scalar array tag 0x{b:02X}"))?;
@@ -776,6 +837,7 @@ fn decode_structure_body_cached_at_depth(
     order: ByteOrder,
     is_array: bool,
     cache: &mut TypeCache,
+    policy: BoundedStringPolicy,
     depth: u32,
 ) -> Result<FieldDesc, DecodeError> {
     let struct_id = decode_string(cur, order)?.unwrap_or_default();
@@ -783,7 +845,9 @@ fn decode_structure_body_cached_at_depth(
         .ok_or_else(|| decode_err!("structure field count cannot be null"))? as usize;
     let mut fields = Vec::with_capacity(safe_capacity(n, cur));
     for _ in 0..n {
-        fields.push(decode_field_desc_cached_at_depth(cur, order, cache, depth)?);
+        fields.push(decode_field_desc_cached_at_depth(
+            cur, order, cache, policy, depth,
+        )?);
     }
     Ok(if is_array {
         FieldDesc::StructureArray { struct_id, fields }
@@ -797,6 +861,7 @@ fn decode_union_body_cached_at_depth(
     order: ByteOrder,
     is_array: bool,
     cache: &mut TypeCache,
+    policy: BoundedStringPolicy,
     depth: u32,
 ) -> Result<FieldDesc, DecodeError> {
     let struct_id = decode_string(cur, order)?.unwrap_or_default();
@@ -804,7 +869,9 @@ fn decode_union_body_cached_at_depth(
         .ok_or_else(|| decode_err!("union variant count cannot be null"))? as usize;
     let mut variants = Vec::with_capacity(safe_capacity(n, cur));
     for _ in 0..n {
-        variants.push(decode_field_desc_cached_at_depth(cur, order, cache, depth)?);
+        variants.push(decode_field_desc_cached_at_depth(
+            cur, order, cache, policy, depth,
+        )?);
     }
     Ok(if is_array {
         FieldDesc::UnionArray {

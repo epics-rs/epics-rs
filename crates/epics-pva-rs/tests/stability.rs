@@ -2195,3 +2195,308 @@ async fn pva_rs_155_shared_pv_monitor_seeds_current_value_once() {
 
     handle.stop();
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// ChannelArray data-phase pre-source failures must reply with a CMD_ARRAY
+// error status, not drop silently.
+//
+// pvAccessCPP is the only ChannelArray server reference (pvxs has no ARRAY
+// handler): a data-phase frame whose IOID was never INIT'd draws
+// `badIOIDStatus` ("bad request id"), and a second sub-op while one is still
+// executing draws `otherRequestPendingStatus` ("other request pending")
+// (responseHandlers.cpp:2157,2164). The server used to `return Ok(())` for
+// both, so a conforming client blocked until timeout. These tests drive raw
+// frames and assert the error reply arrives instead of silence.
+// ─────────────────────────────────────────────────────────────────────
+
+use epics_pva_rs::server_native::ChannelContext;
+use epics_pva_rs::server_native::source::AccessChecked;
+
+/// An NTScalarArray source whose `channel_array_get` blocks on a semaphore
+/// until the test releases a permit. This keeps the first sub-op
+/// `Executing` so a second concurrent sub-op deterministically hits the
+/// "already executing" path rather than racing the handler's completion.
+#[derive(Clone)]
+struct GatedArraySource {
+    gate: Arc<tokio::sync::Semaphore>,
+}
+
+impl ChannelSource for GatedArraySource {
+    async fn list_pvs(&self) -> Vec<String> {
+        vec!["GATED:ARR".into()]
+    }
+    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
+        let n = n.to_string();
+        async move { n == "GATED:ARR" }
+    }
+    async fn get_introspection(&self, _: &str) -> Option<FieldDesc> {
+        Some(nt_double_array_desc())
+    }
+    async fn get_value(&self, _: &str) -> Option<PvField> {
+        Some(make_nt_double_array(&[1.0, 2.0, 3.0]))
+    }
+    async fn put_value(&self, _: &str, _: PvField) -> Result<(), OpError> {
+        Ok(())
+    }
+    async fn is_writable(&self, _: &str) -> bool {
+        true
+    }
+    async fn subscribe(&self, _: &str) -> Option<mpsc::Receiver<PvField>> {
+        None
+    }
+    async fn channel_array_init(&self, _: &str, _: ChannelContext) -> Result<FieldDesc, OpError> {
+        Ok(FieldDesc::ScalarArray(ScalarType::Double))
+    }
+    async fn channel_array_get(
+        &self,
+        _checked: AccessChecked,
+        _offset: u32,
+        _count: u32,
+        _stride: u32,
+        _ctx: ChannelContext,
+    ) -> Result<PvField, OpError> {
+        // Block until the test releases a permit; the op stays `Executing`.
+        let _permit = self.gate.acquire().await.expect("array gate closed");
+        Ok(PvField::ScalarArray(vec![
+            ScalarValue::Double(1.0),
+            ScalarValue::Double(2.0),
+            ScalarValue::Double(3.0),
+        ]))
+    }
+}
+
+/// Hand-speak the anonymous CONNECTION_VALIDATION reply, mirroring the
+/// `create_channel_*` tests above.
+fn send_anonymous_validation(
+    sock: &mut std::net::TcpStream,
+    order: epics_pva_rs::proto::ByteOrder,
+) {
+    use std::io::Write;
+
+    use epics_pva_rs::proto::{Command, PvaHeader, WriteExt, encode_string_into};
+
+    let mut payload: Vec<u8> = Vec::new();
+    payload.put_u32(0x10000, order);
+    payload.put_u16(32_767, order);
+    payload.put_u16(0, order);
+    encode_string_into("anonymous", order, &mut payload);
+    payload.put_u8(0xFF);
+    let h = PvaHeader::application(
+        false,
+        order,
+        Command::ConnectionValidation.code(),
+        payload.len() as u32,
+    );
+    let mut req = Vec::new();
+    h.write_into(&mut req);
+    req.extend_from_slice(&payload);
+    sock.write_all(&req).unwrap();
+}
+
+/// CREATE_CHANNEL one PV and return the resolved server-side `sid`.
+fn create_one_channel(
+    sock: &mut std::net::TcpStream,
+    reader: &mut FrameReader,
+    order: epics_pva_rs::proto::ByteOrder,
+    cid: u32,
+    name: &str,
+) -> u32 {
+    use std::io::Write;
+
+    use epics_pva_rs::codec::CMD_CREATE_CHANNEL;
+    use epics_pva_rs::proto::{PvaHeader, ReadExt, Status, WriteExt, encode_string_into};
+
+    let mut body = Vec::new();
+    body.put_u16(1, order);
+    body.put_u32(cid, order);
+    encode_string_into(name, order, &mut body);
+    let h = PvaHeader::application(false, order, CMD_CREATE_CHANNEL, body.len() as u32);
+    let mut frame = Vec::new();
+    h.write_into(&mut frame);
+    frame.extend_from_slice(&body);
+    sock.write_all(&frame).unwrap();
+
+    let resp = reader.read(sock);
+    let mut cur = resp.cursor();
+    let _cid = cur.get_u32(order).unwrap();
+    let sid = cur.get_u32(order).unwrap();
+    let status = Status::decode(&mut cur, order).unwrap();
+    assert!(
+        status.is_success(),
+        "CREATE_CHANNEL must succeed: {status:?}"
+    );
+    sid
+}
+
+/// Boundary — op absent. A getArray data-phase frame on an IOID that was
+/// never INIT'd must draw a CMD_ARRAY "bad request id" error reply, not a
+/// silent drop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn array_data_phase_unknown_ioid_replies_error_not_silent() {
+    use std::io::Write;
+
+    use epics_pva_rs::proto::{
+        ByteOrder, Command, PvaHeader, QosFlags, ReadExt, Status, WriteExt, encode_size_into,
+    };
+
+    let source = Arc::new(MemSource::new());
+    source.add_pv("ARR:UNKIOID", 1.0).await;
+    let (tcp, _udp, h) = spawn_server(source.clone()).await;
+    let server_addr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
+
+    let order = ByteOrder::Little;
+    let mut sock = read_handshake_prelude(server_addr);
+    send_anonymous_validation(&mut sock, order);
+    let mut reader = FrameReader::new();
+    let _validated = reader.read(&mut sock);
+
+    let sid = create_one_channel(&mut sock, &mut reader, order, 55, "ARR:UNKIOID");
+
+    // getArray data-phase frame for an IOID we never INIT'd.
+    let bad_ioid = 0xDEAD_BEEF_u32;
+    let mut body = Vec::new();
+    body.put_u32(sid, order);
+    body.put_u32(bad_ioid, order);
+    body.put_u8(QosFlags::GET);
+    encode_size_into(0, order, &mut body); // offset
+    encode_size_into(0, order, &mut body); // count (to end)
+    encode_size_into(1, order, &mut body); // stride
+    let fh = PvaHeader::application(false, order, Command::Array.code(), body.len() as u32);
+    let mut frame = Vec::new();
+    fh.write_into(&mut frame);
+    frame.extend_from_slice(&body);
+    sock.write_all(&frame).unwrap();
+
+    // Pre-fix: silent drop → the reader times out (panic). Post-fix: a
+    // CMD_ARRAY error frame arrives.
+    let resp = reader.read(&mut sock);
+    assert_eq!(
+        resp.header.command,
+        Command::Array.code(),
+        "reply must be a CMD_ARRAY frame"
+    );
+    let mut cur = resp.cursor();
+    let ioid = cur.get_u32(order).unwrap();
+    let _subcmd = cur.get_u8().unwrap();
+    let status = Status::decode(&mut cur, order).unwrap();
+    assert_eq!(
+        ioid, bad_ioid,
+        "ARRAY error reply must echo the offending IOID"
+    );
+    assert!(
+        !status.is_success(),
+        "unknown-IOID data phase must reply with an error, got {status:?}"
+    );
+    assert_eq!(
+        status.message(),
+        Some("bad request id"),
+        "must mirror pvAccessCPP badIOIDStatus"
+    );
+
+    h.abort();
+}
+
+/// Boundary — op executing. A second sub-op arriving while the first is
+/// still in flight must draw a CMD_ARRAY "other request pending" error
+/// reply, not a silent drop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn array_concurrent_subop_replies_error_not_silent() {
+    use std::io::Write;
+
+    use epics_pva_rs::proto::{
+        ByteOrder, Command, PvaHeader, QosFlags, ReadExt, Status, WriteExt, encode_size_into,
+    };
+
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let src = Arc::new(GatedArraySource { gate: gate.clone() });
+    let (tcp, udp) = alloc_port_pair();
+    let cfg = PvaServerConfig {
+        tcp_port: tcp,
+        udp_port: udp,
+        idle_timeout: Duration::from_secs(60),
+        ..Default::default()
+    };
+    let h = tokio::spawn(async move {
+        let _ = run_pva_server(src, cfg).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let server_addr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), tcp);
+
+    let order = ByteOrder::Little;
+    let mut sock = read_handshake_prelude(server_addr);
+    send_anonymous_validation(&mut sock, order);
+    let mut reader = FrameReader::new();
+    let _validated = reader.read(&mut sock);
+
+    let sid = create_one_channel(&mut sock, &mut reader, order, 66, "GATED:ARR");
+
+    // ARRAY INIT (ioid = 1) using the default value-only pvRequest.
+    let ioid = 1u32;
+    let pv_req = epics_pva_rs::pv_request::build_pv_request_value_only(false);
+    let mut ibody = Vec::new();
+    ibody.put_u32(sid, order);
+    ibody.put_u32(ioid, order);
+    ibody.put_u8(QosFlags::INIT);
+    ibody.extend_from_slice(&pv_req);
+    let ih = PvaHeader::application(false, order, Command::Array.code(), ibody.len() as u32);
+    let mut iframe = Vec::new();
+    ih.write_into(&mut iframe);
+    iframe.extend_from_slice(&ibody);
+    sock.write_all(&iframe).unwrap();
+
+    let iresp = reader.read(&mut sock);
+    assert_eq!(iresp.header.command, Command::Array.code());
+    {
+        let mut cur = iresp.cursor();
+        let _ioid = cur.get_u32(order).unwrap();
+        let _subcmd = cur.get_u8().unwrap();
+        let istatus = Status::decode(&mut cur, order).unwrap();
+        assert!(istatus.is_success(), "ARRAY INIT must succeed: {istatus:?}");
+    }
+
+    // Two getArray EXEC frames on ioid=1 in one burst. The first blocks in
+    // the gated handler (op stays Executing); the second must draw an error.
+    let mut burst = Vec::new();
+    for _ in 0..2 {
+        let mut b = Vec::new();
+        b.put_u32(sid, order);
+        b.put_u32(ioid, order);
+        b.put_u8(QosFlags::GET);
+        encode_size_into(0, order, &mut b);
+        encode_size_into(0, order, &mut b);
+        encode_size_into(1, order, &mut b);
+        let hh = PvaHeader::application(false, order, Command::Array.code(), b.len() as u32);
+        hh.write_into(&mut burst);
+        burst.extend_from_slice(&b);
+    }
+    sock.write_all(&burst).unwrap();
+
+    // Pre-fix: the second sub-op is silently dropped and the first is
+    // blocked → no reply → the reader times out (panic). Post-fix: an
+    // "other request pending" error frame arrives for the second.
+    let resp = reader.read(&mut sock);
+    assert_eq!(resp.header.command, Command::Array.code());
+    let mut cur = resp.cursor();
+    let r_ioid = cur.get_u32(order).unwrap();
+    let _subcmd = cur.get_u8().unwrap();
+    let status = Status::decode(&mut cur, order).unwrap();
+    assert_eq!(
+        r_ioid, ioid,
+        "concurrent-op error reply must echo the op IOID"
+    );
+    assert!(
+        !status.is_success(),
+        "second concurrent sub-op must reply with an error, got {status:?}"
+    );
+    assert_eq!(
+        status.message(),
+        Some("other request pending"),
+        "must mirror pvAccessCPP otherRequestPendingStatus"
+    );
+
+    // Release the blocked first sub-op so the server task winds down cleanly.
+    gate.add_permits(1);
+    h.abort();
+}

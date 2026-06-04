@@ -4216,7 +4216,20 @@ async fn handle_channel_array(
     // Data phase. Bind to the INIT-registered op (kind must match).
     let init_pv_request = match ch.ops.get(&ioid) {
         None => {
-            // DESTROY_REQUEST race — drop silently, as the other handlers do.
+            // No op registered for this IOID at the data phase. pvAccessCPP —
+            // the only ChannelArray server reference (pvxs has no ARRAY
+            // handler) — answers with a CMD_ARRAY error frame (badIOIDStatus,
+            // responseHandlers.cpp:2157), NOT a silent drop, so a client
+            // awaiting the sub-op callback does not block until timeout.
+            send_chan_op_error(
+                &chan_tx,
+                OpKind::Array,
+                ioid,
+                subcmd,
+                "bad request id",
+                order,
+            )
+            .await?;
             return Ok(());
         }
         Some(o) => {
@@ -4279,12 +4292,24 @@ async fn handle_channel_array(
     };
     let src = source.clone();
     let tx_clone = chan_tx.clone();
-    // Run this sub-op only when the op is `Idle`; ignore a second EXEC while
-    // one is in flight rather than aborting it (pvxs serverget.cpp:511-514).
+    // Run this sub-op only when the op is `Idle`. A second sub-op arriving
+    // while one is in flight is a protocol error: pvAccessCPP `startRequest`
+    // returns false and the server answers with a CMD_ARRAY error frame
+    // (otherRequestPendingStatus, responseHandlers.cpp:2164) rather than
+    // ignoring it. The in-flight op is left running, not aborted.
     let op_id = match begin_exec(ch, ioid) {
         Some(id) => id,
         None => {
-            debug!(ioid, "ARRAY sub-op ignored: op already executing");
+            debug!(ioid, "ARRAY sub-op rejected: op already executing");
+            send_chan_op_error(
+                &chan_tx,
+                OpKind::Array,
+                ioid,
+                subcmd,
+                "other request pending",
+                order,
+            )
+            .await?;
             return Ok(());
         }
     };

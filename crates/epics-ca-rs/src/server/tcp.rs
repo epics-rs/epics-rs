@@ -2525,12 +2525,6 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     )));
                 }
             };
-            // CA-268: DBR_CLASS_NAME wire payload is always one fixed
-            // 40-byte string. element_count must be 1 regardless of
-            // the underlying record's value count — for waveform
-            // records, snapshot.value.count() can be N, which would
-            // make C clients parse 40 * N bytes of body and fail.
-            //
             // C `read_reply` (`rsrv/camessage.c:507-571`) keeps
             // the request count in the header and zero-fills the
             // payload when fewer elements are returned than requested
@@ -2543,9 +2537,17 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // Rust than from rsrv.
             let mut data = data;
             let actual_count = snapshot.value.count() as u32;
-            let element_count = if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
-                1
-            } else if !is_notify && requested_count == 0 {
+            // ORDER MATTERS: the deprecated-READ count==0 branch MUST
+            // precede the DBR_CLASS_NAME normalization. C `read_action`
+            // (rsrv/camessage.c:622-645) sizes EVERY type — including
+            // DBR_CLASS_NAME — with `dbr_size_n(type, m_count)` and writes
+            // the header count as `m_count` VERBATIM, with no class-name
+            // special case. `dbr_size_n(DBR_CLASS_NAME, 0) = dbr_size[38]
+            // - dbr_value_size[38] = 40 - 40 = 0`, so a deprecated READ of
+            // DBR_CLASS_NAME at count==0 ships count=0 and a 0-byte
+            // payload. Only the READ_NOTIFY / EVENT_ADD path (`read_reply`)
+            // forces the fixed 40-byte class string at count 1 (CA-268).
+            let element_count = if !is_notify && requested_count == 0 {
                 // The deprecated synchronous CA_PROTO_READ (cmd 3) does
                 // NOT treat m_count==0 as autosize. C `read_action`
                 // (rsrv/camessage.c:622-645) sizes the reply with
@@ -2565,8 +2567,17 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 // length.
                 match epics_base_rs::types::native_type_for_dbr(requested_type) {
                     Ok(native) => {
-                        let meta_size =
-                            epics_base_rs::types::dbr_buffer_size(requested_type, native, 0);
+                        // `dbr_buffer_size(.., 0)` equals `dbr_size_n(t, 0)`
+                        // for every type EXCEPT DBR_CLASS_NAME, where it
+                        // reports the fixed 40-byte string (the count>=1
+                        // framing size) rather than `dbr_size_n(38,0)=0`.
+                        // Use 0 for CLASS_NAME to match C's value-less
+                        // count==0 payload.
+                        let meta_size = if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
+                            0
+                        } else {
+                            epics_base_rs::types::dbr_buffer_size(requested_type, native, 0)
+                        };
                         if data.len() > meta_size {
                             data.truncate(meta_size);
                         }
@@ -2584,6 +2595,16 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         requested_type,
                     ),
                 }
+            } else if requested_type == epics_base_rs::types::DBR_CLASS_NAME {
+                // CA-268: DBR_CLASS_NAME wire payload is always one fixed
+                // 40-byte string. element_count must be 1 regardless of
+                // the underlying record's value count — for waveform
+                // records, snapshot.value.count() can be N, which would
+                // make C clients parse 40 * N bytes of body and fail.
+                // This applies to the READ_NOTIFY / EVENT_ADD path and to
+                // ordinary deprecated reads with count!=0; the deprecated
+                // count==0 case is handled above (C ships count=0).
+                1
             } else {
                 pad_dbr_to_requested_count(&mut data, actual_count, requested_count, requested_type)
             };

@@ -1361,6 +1361,235 @@ async fn server_write_notify_bad_type_replies_error_and_disconnects() {
     );
 }
 
+/// Deprecated synchronous `CA_PROTO_READ` (cmd 3) sizes EVERY reply
+/// with `dbr_size_n(type, m_count)` and writes the header count as
+/// `m_count` VERBATIM — there is NO DBR_CLASS_NAME special case in C
+/// `read_action` (`rsrv/camessage.c:622-624`). For DBR_CLASS_NAME (38)
+/// with `m_count == 0`, `dbr_size_n(38, 0) = dbr_size[38] -
+/// dbr_value_size[38] = 40 - 40 = 0` (`access.cpp:906`/`:955`,
+/// `db_access.h:533`), so the reply ships `count = 0` and a 0-byte
+/// payload. Only the READ_NOTIFY / EVENT_ADD path (C `read_reply`,
+/// `camessage.c:507-575`) treats `m_count == 0` as autosize and forces
+/// the fixed 40-byte class string at `count = 1`.
+///
+/// Pre-fix Rust normalized DBR_CLASS_NAME to `count = 1` BEFORE the
+/// deprecated `count == 0` branch, so a deprecated READ of
+/// DBR_CLASS_NAME at count 0 wrongly shipped `count = 1` + 40 bytes,
+/// diverging from rsrv on both the wire count field and payload length.
+///
+/// Tests the invariant boundary, not one scenario:
+///   A. deprecated READ, CLASS_NAME, count 0  -> count 0, 0-byte body
+///   B. deprecated READ, CLASS_NAME, count 1  -> count 1, 40-byte body
+///   C. READ_NOTIFY,     CLASS_NAME, count 0  -> count 1, 40-byte body
+/// B and C pin that the reorder preserves ordinary class-name reads and
+/// the notify autosize path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn server_deprecated_read_class_name_count0_follows_c_m_count() {
+    use std::collections::HashMap as Map;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    // DBR_CLASS_NAME = 38 (epics_base_rs::types::DBR_CLASS_NAME); use the
+    // literal to match this file's wire-level convention (no types import).
+    const DBR_CLASS_NAME: u16 = 38;
+
+    let port = {
+        let probe =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
+        let p = probe.local_addr().unwrap().port();
+        drop(probe);
+        p
+    };
+
+    let server = CaServer::builder()
+        .port(port)
+        .pv("CLSNM:PV", EpicsValue::Double(0.0))
+        .build()
+        .await
+        .expect("build CA server");
+    let _rs_handle = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+
+    // VERSION handshake
+    let mut ver = CaHeader::new(CA_PROTO_VERSION);
+    ver.count = CA_MINOR_VERSION;
+    sock.write_all(&ver.to_bytes()).await.unwrap();
+    let mut hello = [0u8; 64];
+    tokio::time::timeout(Duration::from_secs(2), sock.read(&mut hello))
+        .await
+        .expect("VERSION reply timed out")
+        .expect("read VERSION");
+
+    // CLIENT_NAME + HOST_NAME (required before CREATE_CHAN)
+    for (cmd, name) in [
+        (CA_PROTO_CLIENT_NAME, "testuser\0"),
+        (CA_PROTO_HOST_NAME, "testhost\0"),
+    ] {
+        let mut h = CaHeader::new(cmd);
+        let mut body = name.as_bytes().to_vec();
+        while !body.len().is_multiple_of(8) {
+            body.push(0);
+        }
+        h.set_payload_size(body.len(), 0);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&h.to_bytes());
+        frame.extend_from_slice(&body);
+        sock.write_all(&frame).await.unwrap();
+    }
+
+    // CREATE_CHAN on CLSNM:PV with a distinctive client CID. The
+    // deprecated READ reply must echo this CID (`pciu->cid`), so capture
+    // it to assert on later.
+    const CLIENT_CID: u32 = 0xCAFE_BABE;
+    let mut create = CaHeader::new(CA_PROTO_CREATE_CHAN);
+    create.cid = CLIENT_CID;
+    let pv_name = b"CLSNM:PV\0";
+    let mut create_body = pv_name.to_vec();
+    while !create_body.len().is_multiple_of(8) {
+        create_body.push(0);
+    }
+    create.set_payload_size(create_body.len(), 0);
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&create.to_bytes());
+    frame.extend_from_slice(&create_body);
+    sock.write_all(&frame).await.unwrap();
+
+    // Scan server frames header-by-header to find the CREATE_CHAN reply
+    // (the SID lives in m_available). Frame order is not fixed (VERSION,
+    // ACCESS_RIGHTS may interleave), so walk rather than index.
+    let mut buf = [0u8; 256];
+    let mut got = 0;
+    let sid = loop {
+        let n = tokio::time::timeout(Duration::from_millis(500), sock.read(&mut buf[got..]))
+            .await
+            .expect("server drain timed out")
+            .expect("read");
+        if n == 0 {
+            panic!("EOF before CREATE_CHAN reply");
+        }
+        got += n;
+        let mut off = 0;
+        let mut found = None;
+        while off + 16 <= got {
+            if let Ok(h) = CaHeader::from_bytes(&buf[off..off + 16]) {
+                if h.cmmd == CA_PROTO_CREATE_CHAN {
+                    found = Some(h.available);
+                    break;
+                }
+                off += 16 + ((h.postsize as usize + 7) & !7);
+            } else {
+                off += 16;
+            }
+        }
+        if let Some(sid) = found {
+            break sid;
+        }
+    };
+
+    // Three reads, distinct ioids in m_available so replies can be keyed.
+    // ioid 0x0A: deprecated READ (cmd 3), CLASS_NAME, count 0
+    // ioid 0x0B: deprecated READ (cmd 3), CLASS_NAME, count 1
+    // ioid 0x0C: READ_NOTIFY (cmd 15), CLASS_NAME, count 0
+    for (cmd, count, ioid) in [
+        (CA_PROTO_READ, 0u16, 0x0A_u32),
+        (CA_PROTO_READ, 1u16, 0x0B_u32),
+        (CA_PROTO_READ_NOTIFY, 0u16, 0x0C_u32),
+    ] {
+        let mut r = CaHeader::new(cmd);
+        r.data_type = DBR_CLASS_NAME;
+        r.count = count;
+        r.cid = sid; // request addresses the channel by SID
+        r.available = ioid;
+        sock.write_all(&r.to_bytes()).await.unwrap();
+    }
+
+    // Drain replies and collect READ / READ_NOTIFY headers by ioid.
+    let mut acc: Vec<u8> = Vec::new();
+    let mut replies: Map<u32, CaHeader> = Map::new();
+    let mut rbuf = [0u8; 256];
+    let deadline = Duration::from_secs(3);
+    while replies.len() < 3 {
+        let n = tokio::time::timeout(deadline, sock.read(&mut rbuf))
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed out waiting for READ replies; got {:?}",
+                    replies.keys()
+                )
+            })
+            .expect("read replies");
+        if n == 0 {
+            panic!("EOF before all READ replies; got {:?}", replies.keys());
+        }
+        acc.extend_from_slice(&rbuf[..n]);
+        let mut off = 0;
+        while off + 16 <= acc.len() {
+            let Ok(h) = CaHeader::from_bytes(&acc[off..off + 16]) else {
+                off += 16;
+                continue;
+            };
+            if (h.cmmd == CA_PROTO_READ || h.cmmd == CA_PROTO_READ_NOTIFY)
+                && [0x0A, 0x0B, 0x0C].contains(&h.available)
+            {
+                replies.insert(h.available, h);
+            }
+            off += 16 + ((h.postsize as usize + 7) & !7);
+        }
+    }
+
+    // A. deprecated READ, CLASS_NAME, count 0 -> count 0, 0-byte payload,
+    //    m_cid echoes the client CID (`pciu->cid`).
+    let a = &replies[&0x0A];
+    assert_eq!(a.cmmd, CA_PROTO_READ, "A: deprecated READ reply opcode");
+    assert_eq!(
+        a.count, 0,
+        "A: deprecated CA_PROTO_READ DBR_CLASS_NAME count=0 must ship \
+         header count=0 (C read_action writes m_count verbatim), got {}",
+        a.count
+    );
+    assert_eq!(
+        a.postsize, 0,
+        "A: dbr_size_n(DBR_CLASS_NAME, 0) = 40 - 40 = 0, so the payload \
+         must be 0 bytes, got postsize={}",
+        a.postsize
+    );
+    assert_eq!(
+        a.cid, CLIENT_CID,
+        "A: deprecated READ m_cid carries pciu->cid (client CID), not the SID"
+    );
+
+    // B. deprecated READ, CLASS_NAME, count 1 -> count 1, 40-byte payload.
+    let b = &replies[&0x0B];
+    assert_eq!(b.cmmd, CA_PROTO_READ, "B: deprecated READ reply opcode");
+    assert_eq!(
+        b.count, 1,
+        "B: ordinary deprecated CLASS_NAME read (count!=0) stays count=1"
+    );
+    assert_eq!(
+        b.postsize, 40,
+        "B: CLASS_NAME at count=1 is the fixed 40-byte string"
+    );
+
+    // C. READ_NOTIFY, CLASS_NAME, count 0 -> count 1, 40-byte payload
+    //    (the notify autosize path is unaffected by the reorder).
+    let c = &replies[&0x0C];
+    assert_eq!(c.cmmd, CA_PROTO_READ_NOTIFY, "C: READ_NOTIFY reply opcode");
+    assert_eq!(
+        c.count, 1,
+        "C: READ_NOTIFY CLASS_NAME count=0 autosizes to count=1 (read_reply)"
+    );
+    assert_eq!(
+        c.postsize, 40,
+        "C: READ_NOTIFY CLASS_NAME ships the fixed 40-byte string"
+    );
+}
+
 /// The UDP batching loop must not re-parse a stale
 /// datagram. When `try_recv_from` drains a queued datagram that is
 /// rejected (short sub-header, ignore-list, or rate-limited), pre-fix

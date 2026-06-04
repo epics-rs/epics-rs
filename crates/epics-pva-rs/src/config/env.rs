@@ -421,21 +421,24 @@ pub fn parse_addr_list(env: &str) -> Vec<SocketAddr> {
 /// to `false` silently disabled discovery on a typo; returning `None`
 /// keeps the documented default enabled, matching pvxs.
 ///
-/// Accepted true values extend pvxs with the historically documented
-/// `Y`/`TRUE`; the symmetric false set is `NO`/`N`/`0`/`FALSE`. Every
-/// other value is invalid (`None` + a warning), never silently `false`.
+/// The accepted grammar is EXACT to pvxs for env parity: case-insensitive
+/// `YES`/`NO` (`epicsStrCaseCmp`) or the literal `1`/`0` (`val=="1"` /
+/// `val=="0"`), with NO surrounding-whitespace tolerance. `Y`, `TRUE`,
+/// `N`, `FALSE`, and any trimmed value such as `" NO "` are invalid
+/// (`None` + a warning), so the caller keeps its default — pvxs treats
+/// them the same. Regression R0604-PVA-BOOL-ENV-EXTENSIONS-1.
 fn parse_bool(name: &str, raw: &str) -> Option<bool> {
-    match raw.trim().to_ascii_uppercase().as_str() {
-        "YES" | "Y" | "1" | "TRUE" => Some(true),
-        "NO" | "N" | "0" | "FALSE" => Some(false),
-        _ => {
-            tracing::warn!(
-                var = name,
-                value = raw,
-                "invalid PVA boolean env value (expected YES/NO); keeping default"
-            );
-            None
-        }
+    if raw.eq_ignore_ascii_case("YES") || raw == "1" {
+        Some(true)
+    } else if raw.eq_ignore_ascii_case("NO") || raw == "0" {
+        Some(false)
+    } else {
+        tracing::warn!(
+            var = name,
+            value = raw,
+            "invalid PVA boolean env value (expected YES/NO); keeping default"
+        );
+        None
     }
 }
 
@@ -1199,23 +1202,59 @@ mod tests {
         assert!(!cfg_a.contains(UNSET));
     }
 
+    /// Regression R0604-PVA-BOOL-ENV-EXTENSIONS-1: the env bool grammar
+    /// must be EXACT to pvxs `parse_bool` (config.cpp:199-208). Tested by
+    /// the accept/reject boundary, not a narrative: case-insensitive
+    /// `YES`/`NO` and literal `1`/`0` accept; `Y`, `TRUE`, `N`, `FALSE`,
+    /// and any whitespace-padded value reject (→ `None` → default kept).
     #[test]
-    fn parse_bool_valid_true_false_invalid_none() {
+    fn parse_bool_exact_to_pvxs_yes_no_one_zero_only() {
         const N: &str = "EPICS_PVA_AUTO_ADDR_LIST";
-        // True set (pvxs YES/1 + documented Y/TRUE extensions).
+        // pvxs true set: case-insensitive YES, literal 1.
         assert_eq!(parse_bool(N, "YES"), Some(true));
         assert_eq!(parse_bool(N, "yes"), Some(true));
-        assert_eq!(parse_bool(N, "Y"), Some(true));
+        assert_eq!(parse_bool(N, "Yes"), Some(true));
         assert_eq!(parse_bool(N, "1"), Some(true));
-        assert_eq!(parse_bool(N, "True"), Some(true));
-        // False set (pvxs NO/0 + symmetric N/FALSE).
+        // pvxs false set: case-insensitive NO, literal 0.
         assert_eq!(parse_bool(N, "NO"), Some(false));
+        assert_eq!(parse_bool(N, "no"), Some(false));
         assert_eq!(parse_bool(N, "0"), Some(false));
-        assert_eq!(parse_bool(N, "false"), Some(false));
-        // Invalid → None so the caller preserves its default (pvxs leaves
-        // the destination unchanged on an unrecognized value).
+        // Non-pvxs extensions are now invalid → None (keep default).
+        assert_eq!(parse_bool(N, "Y"), None);
+        assert_eq!(parse_bool(N, "TRUE"), None);
+        assert_eq!(parse_bool(N, "true"), None);
+        assert_eq!(parse_bool(N, "N"), None);
+        assert_eq!(parse_bool(N, "FALSE"), None);
+        assert_eq!(parse_bool(N, "false"), None);
+        // No trimming: a padded YES/NO is invalid, exactly as pvxs's
+        // `epicsStrCaseCmp(" NO ", "NO") != 0`.
+        assert_eq!(parse_bool(N, " NO "), None);
+        assert_eq!(parse_bool(N, " YES"), None);
+        assert_eq!(parse_bool(N, "1 "), None);
+        // Other invalid values → None so the caller preserves its default.
         assert_eq!(parse_bool(N, "maybe"), None);
         assert_eq!(parse_bool(N, ""), None);
+    }
+
+    /// Regression R0604-PVA-BOOL-ENV-EXTENSIONS-1 (caller side): a
+    /// non-pvxs bool value on a default-enabled var must leave the default
+    /// ON, matching pvxs leaving `autoAddrList` untouched on an invalid
+    /// value — `N`, `FALSE`, and `" NO "` no longer disable discovery.
+    #[test]
+    fn auto_addr_list_non_pvxs_bool_preserves_default_enabled() {
+        // SAFETY: nextest runs each test in its own process, so mutating
+        // the process environment here cannot race other tests.
+        for invalid in ["N", "FALSE", " NO ", "false"] {
+            unsafe { std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", invalid) };
+            assert!(
+                auto_addr_list_enabled(),
+                "non-pvxs bool {invalid:?} must preserve default true (pvxs keeps auto-addr ON)"
+            );
+        }
+        // The exact pvxs false token still disables.
+        unsafe { std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO") };
+        assert!(!auto_addr_list_enabled(), "exact NO disables");
+        unsafe { std::env::remove_var("EPICS_PVA_AUTO_ADDR_LIST") };
     }
 
     #[test]

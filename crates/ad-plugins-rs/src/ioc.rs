@@ -583,22 +583,14 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
 
                 #[cfg(feature = "pva")]
                 let processor = {
+                    // The processor owns the validating `PvaPvHandle` (built
+                    // with the canonical NTNDArray descriptor); registering a
+                    // clone shares the same `latest`/`subscribers` state with
+                    // the qsrv adapter. Producer posts and server reads flow
+                    // through one validating owner — a frame that does not
+                    // match the descriptor never becomes the served value.
                     let proc = crate::pva::PvaProcessor::new(pva_pv_name.clone());
-                    let latest = proc.latest_handle();
-                    let subscribers = proc.subscribers_handle();
-                    // NTNDArray's `value` field is a `union` of ten scalar
-                    // array variants; only one is exercised per snapshot.
-                    // Hand the canonical descriptor through so introspection
-                    // advertises every variant rather than just the one the
-                    // current frame happens to use.
-                    epics_bridge_rs::qsrv::register_pva_pv_global(
-                        &pva_pv_name,
-                        epics_bridge_rs::qsrv::PvaPvHandle {
-                            latest,
-                            subscribers,
-                            descriptor: Some(epics_pva_rs::nt::nd_array::nt_nd_array_desc()),
-                        },
-                    );
+                    epics_bridge_rs::qsrv::register_pva_pv_global(&pva_pv_name, proc.handle());
                     proc
                 };
                 #[cfg(not(feature = "pva"))]

@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use tokio::sync::{RwLock, mpsc};
 
-use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure};
+use epics_pva_rs::pvdata::{
+    FieldDesc, PvField, PvStructure, ValueDescMismatch, value_matches_descriptor,
+};
 use epics_pva_rs::server_native::source::OpError;
 
 use super::provider::{
@@ -33,59 +35,89 @@ use super::provider::{
 /// When `None`, `get_introspection` falls back to value-derived recovery
 /// — sufficient for structure-rooted normative types where every field
 /// is exercised in the value.
+///
+/// The `latest` snapshot and `subscribers` list are private: the single
+/// way a value enters either is [`PvaPvHandle::post`], which validates
+/// against `descriptor` before storing or fanning out. This makes
+/// "the served value matches the advertised descriptor" hold by
+/// construction — the serving owner never needs a serve-time re-check —
+/// and reproduces pvxs `SharedPV::post`, which rejects a
+/// descriptor-mismatched value before it can become `current`.
 #[derive(Clone)]
 pub struct PvaPvHandle {
-    pub latest: Arc<parking_lot::Mutex<Option<PvField>>>,
-    pub subscribers: Arc<parking_lot::Mutex<Vec<mpsc::Sender<PvField>>>>,
-    /// Canonical introspection descriptor supplied by the producer.
-    /// Preferred over value-derived recovery when present.
-    pub descriptor: Option<FieldDesc>,
+    latest: Arc<parking_lot::Mutex<Option<PvField>>>,
+    subscribers: Arc<parking_lot::Mutex<Vec<mpsc::Sender<PvField>>>>,
+    descriptor: Option<FieldDesc>,
 }
 
 impl PvaPvHandle {
-    /// Gate a value about to be served on the wire against the
-    /// canonical descriptor.
+    /// Create an empty native PVA PV handle advertising `descriptor`.
     ///
-    /// pvxs `SharedPV::post` (`src/sharedpv.cpp:417-431`) refuses to
-    /// assign a value that was not built from the descriptor the PV was
-    /// opened with, so every GET/MONITOR value pvxs serves matches the
-    /// advertised wire shape. A native QSRV PVA PV declares its
-    /// canonical descriptor once at registration, but the producer owns
-    /// the `latest` mutex and can mutate it past the registration-time
-    /// root-kind gate (a wrong scalar leaf, a missing/extra field, an
-    /// invalid union selector). The serving owner (`QsrvPvStore`)
-    /// therefore re-checks every served value here — recursively via
-    /// [`epics_pva_rs::pvdata::value_matches_descriptor`], not just root
-    /// kind — and refuses to serve a mismatch rather than letting
-    /// `encode_pv_field`'s generic fallback coerce default/garbage bytes
-    /// onto the wire under the canonical descriptor.
-    ///
-    /// Returns `None` (serve nothing) on a mismatch. A descriptor-less
-    /// diagnostic PV has no canonical contract and passes through
-    /// unchanged.
-    fn validate_for_serve(&self, value: PvField) -> Option<PvField> {
-        match &self.descriptor {
-            Some(desc) => match epics_pva_rs::pvdata::value_matches_descriptor(&value, desc) {
-                Ok(()) => Some(value),
-                Err(e) => {
-                    tracing::warn!(
-                        "qsrv native PVA PV value does not match its canonical \
-                         descriptor ({e}); refusing to serve (pvxs SharedPV::post \
-                         sharedpv.cpp:417 rejects descriptor-mismatched values)"
-                    );
-                    None
-                }
-            },
-            None => Some(value),
+    /// `latest` starts empty; the only way a value enters it is through
+    /// [`PvaPvHandle::post`], which validates against `descriptor` first.
+    /// Pass `Some(..)` when the producer knows the canonical wire shape
+    /// (e.g. `nt_nd_array_desc()` for NTNDArray, or a custom top-level
+    /// `UnionArray`); pass `None` for a descriptor-less diagnostic PV that
+    /// accepts any posted value and uses value-derived introspection
+    /// (lossy for some types — see [`PvField::descriptor`]).
+    pub fn new(descriptor: Option<FieldDesc>) -> Self {
+        Self {
+            latest: Arc::new(parking_lot::Mutex::new(None)),
+            subscribers: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            descriptor,
         }
     }
 
-    /// Lock `latest` and return the current value only if it can be
-    /// served faithfully under the canonical descriptor. See
-    /// [`PvaPvHandle::validate_for_serve`].
-    fn current_served_value(&self) -> Option<PvField> {
-        let value = self.latest.lock().clone()?;
-        self.validate_for_serve(value)
+    /// Validate a producer value against the canonical descriptor, then —
+    /// only on success — store it as the current snapshot and fan it out
+    /// to monitor subscribers. The single owner of every write to
+    /// `latest` and every subscriber notification.
+    ///
+    /// pvxs `SharedPV::post` (`src/sharedpv.cpp:417-431`) checks that the
+    /// posted value was built from the descriptor the PV was opened with
+    /// and throws *before* `impl->current.assign(val)` on a mismatch, so a
+    /// later `fetch()` still returns the last accepted value and monitors
+    /// never see the bad frame. This mirrors that contract: on a
+    /// descriptor mismatch the previous `latest` is left untouched and no
+    /// subscriber receives a frame. A descriptor-less PV (`None`) has no
+    /// canonical contract and accepts every post.
+    ///
+    /// Regression R0604-BRQSRV-NATIVE-PVA-BAD-POST-CLEARS-VALUE-1.
+    pub fn post(&self, value: PvField) -> Result<(), ValueDescMismatch> {
+        if let Some(desc) = &self.descriptor {
+            value_matches_descriptor(&value, desc)?;
+        }
+        // Accepted. Store the snapshot before fanning out, matching pvxs
+        // post order (`current.assign` then notify) so a concurrent GET
+        // can never observe an older value than a monitor frame.
+        *self.latest.lock() = Some(value.clone());
+        let mut subs = self.subscribers.lock();
+        subs.retain(|tx| tx.try_send(value.clone()).is_ok());
+        Ok(())
+    }
+
+    /// The current accepted snapshot, or `None` before the first accepted
+    /// post — the analog of pvxs `SharedPV::fetch()`. Already
+    /// descriptor-valid by construction (every write goes through
+    /// [`PvaPvHandle::post`]), so no serve-time re-check is needed.
+    pub fn current_value(&self) -> Option<PvField> {
+        self.latest.lock().clone()
+    }
+
+    /// Append a monitor subscriber (reaping any already-dropped ones) and
+    /// return its receiver. Frames arrive only via [`PvaPvHandle::post`],
+    /// so every delivered value already matches the canonical descriptor.
+    fn add_subscriber(&self) -> mpsc::Receiver<PvField> {
+        let (tx, rx) = mpsc::channel::<PvField>(64);
+        let mut subs = self.subscribers.lock();
+        subs.retain(|s| !s.is_closed());
+        subs.push(tx);
+        rx
+    }
+
+    /// Canonical introspection descriptor supplied at registration.
+    fn descriptor(&self) -> Option<&FieldDesc> {
+        self.descriptor.as_ref()
     }
 }
 
@@ -100,94 +132,22 @@ static PVA_PV_REGISTRY: std::sync::LazyLock<
 
 /// Register a native PVA PV before the CA+PVA runner starts.
 ///
-/// Same root-kind invariant as [`QsrvPvStore::register_pva_pv`]: if the
-/// handle carries both a value and a descriptor, their root kinds must
-/// agree, otherwise this panics. Enforcing it here too (not just on the
-/// later runner-side `register_pva_pv` call) means the failure surfaces
-/// at the producer call site, where the wrong descriptor was assembled,
-/// rather than deep inside the CA+PVA runner.
+/// The handle's `latest` snapshot can only have been written through
+/// [`PvaPvHandle::post`], which validates the value against the
+/// descriptor before storing it, so a stored value always matches the
+/// advertised wire shape by construction — there is no separate
+/// registration-time root-kind check to perform.
 pub fn register_pva_pv_global(pv_name: &str, handle: PvaPvHandle) {
-    assert_handle_root_kind(pv_name, &handle);
     PVA_PV_REGISTRY
         .lock()
         .unwrap()
         .insert(pv_name.to_string(), handle);
 }
 
-/// Invariant gate shared by both registration paths
-/// (`register_pva_pv_global` and `QsrvPvStore::register_pva_pv`).
-fn assert_handle_root_kind(pv_name: &str, handle: &PvaPvHandle) {
-    if let Some(desc) = &handle.descriptor {
-        let guard = handle.latest.lock();
-        if let Some(value) = guard.as_ref() {
-            assert!(
-                root_kind_matches(value, desc),
-                "PvaPvHandle for {pv_name:?}: supplied descriptor root kind \
-                 does not match value root kind ({value_kind} vs {desc_kind}) — \
-                 introspection would disagree with served values",
-                value_kind = root_kind_name_value(value),
-                desc_kind = root_kind_name_desc(desc),
-            );
-        }
-    }
-}
-
 /// Take all registered native PVA PVs. Called by [`run_ca_pva_qsrv_ioc`]
 /// to wire them into `QsrvPvStore`.
 pub fn take_registered_pva_pvs() -> std::collections::HashMap<String, PvaPvHandle> {
     std::mem::take(&mut *PVA_PV_REGISTRY.lock().unwrap())
-}
-
-/// Root-level kind compatibility between a value and a descriptor.
-///
-/// This is the weakest invariant we can cheaply verify at registration
-/// time: deeper structural agreement (field names, scalar types,
-/// variants list) is the producer's responsibility. The root check
-/// catches the obvious misconfiguration — wiring a `Structure` value
-/// with a `UnionArray` descriptor — without forcing a full recursive
-/// walk on a potentially large `latest` snapshot under the mutex.
-fn root_kind_matches(value: &PvField, desc: &FieldDesc) -> bool {
-    matches!(
-        (value, desc),
-        (PvField::Scalar(_), FieldDesc::Scalar(_))
-            | (
-                PvField::ScalarArray(_) | PvField::ScalarArrayTyped(_),
-                FieldDesc::ScalarArray(_)
-            )
-            | (PvField::Structure(_), FieldDesc::Structure { .. })
-            | (PvField::StructureArray(_), FieldDesc::StructureArray { .. })
-            | (PvField::Union { .. }, FieldDesc::Union { .. })
-            | (PvField::UnionArray(_), FieldDesc::UnionArray { .. })
-            | (PvField::Variant(_) | PvField::Null, FieldDesc::Variant)
-            | (PvField::VariantArray(_), FieldDesc::VariantArray)
-    )
-}
-
-fn root_kind_name_value(v: &PvField) -> &'static str {
-    match v {
-        PvField::Scalar(_) => "Scalar",
-        PvField::ScalarArray(_) | PvField::ScalarArrayTyped(_) => "ScalarArray",
-        PvField::Structure(_) => "Structure",
-        PvField::StructureArray(_) => "StructureArray",
-        PvField::Union { .. } => "Union",
-        PvField::UnionArray(_) => "UnionArray",
-        PvField::Variant(_) => "Variant",
-        PvField::VariantArray(_) => "VariantArray",
-        PvField::Null => "Null",
-    }
-}
-
-fn root_kind_name_desc(d: &FieldDesc) -> &'static str {
-    match d {
-        FieldDesc::Scalar(_) => "Scalar",
-        FieldDesc::ScalarArray(_) => "ScalarArray",
-        FieldDesc::Structure { .. } => "Structure",
-        FieldDesc::StructureArray { .. } => "StructureArray",
-        FieldDesc::Union { .. } => "Union",
-        FieldDesc::UnionArray { .. } => "UnionArray",
-        FieldDesc::Variant => "Variant",
-        FieldDesc::VariantArray => "VariantArray",
-    }
 }
 
 /// Convert a native-PVA [`ChannelContext`] to a [`ClientCreds`] for
@@ -236,35 +196,11 @@ impl QsrvPvStore {
     /// Register a native PVA PV (e.g., NTNDArray from NDPluginPva).
     ///
     /// After registration, the PV is discoverable via `has_pv`, readable
-    /// via `get_value`, and subscribable via `subscribe`.
-    ///
-    /// Pass `descriptor = Some(...)` when the producer knows the
-    /// canonical wire shape (e.g. `nt_nd_array_desc()` for NTNDArray, or
-    /// a custom top-level `UnionArray`); pass `None` to use value-derived
-    /// recovery on each introspection query (lossy for some types — see
-    /// [`PvField::descriptor`]).
-    ///
-    /// **Panics** if `descriptor` is supplied and a value is already
-    /// present in `latest` whose root kind disagrees (e.g. supplying a
-    /// `FieldDesc::UnionArray` alongside a `PvField::Structure` value).
-    /// This catches misconfigured producers at startup rather than
-    /// shipping clients an introspection that disagrees with the values
-    /// they receive. Producers whose first value arrives after
-    /// registration (NDPluginPva: first NDArray hasn't been processed
-    /// yet) trivially pass this check.
-    pub async fn register_pva_pv(
-        &self,
-        pv_name: &str,
-        latest: Arc<parking_lot::Mutex<Option<PvField>>>,
-        subscribers: Arc<parking_lot::Mutex<Vec<mpsc::Sender<PvField>>>>,
-        descriptor: Option<FieldDesc>,
-    ) {
-        let handle = PvaPvHandle {
-            latest,
-            subscribers,
-            descriptor,
-        };
-        assert_handle_root_kind(pv_name, &handle);
+    /// via `get_value`, and subscribable via `subscribe`. The handle
+    /// carries its canonical descriptor (set at [`PvaPvHandle::new`]),
+    /// which gates every producer [`PvaPvHandle::post`] — so a registered
+    /// PV only ever serves descriptor-valid values, by construction.
+    pub async fn register_pva_pv(&self, pv_name: &str, handle: PvaPvHandle) {
         self.pva_pvs
             .write()
             .await
@@ -323,32 +259,11 @@ async fn open_monitor(
     }
     let name = checked.pv_name().to_string();
     if let Some(handle) = pva_pvs.read().await.get(&name).cloned() {
-        let (tx, rx) = mpsc::channel::<PvField>(64);
-        {
-            let mut subs = handle.subscribers.lock();
-            subs.retain(|s| !s.is_closed());
-            subs.push(tx);
-        }
-        // When a canonical descriptor was registered, interpose a relay
-        // that drops any producer-pushed value that does not match it,
-        // so the monitor stream never serves a descriptor-mismatched
-        // frame — the same invariant the GET path enforces, and what
-        // pvxs `SharedPV::post` guarantees before a value can post.
-        if handle.descriptor.is_some() {
-            let (wire_tx, wire_rx) = mpsc::channel::<PvField>(64);
-            tokio::spawn(async move {
-                let mut rx = rx;
-                while let Some(value) = rx.recv().await {
-                    if let Some(v) = handle.validate_for_serve(value)
-                        && wire_tx.send(v).await.is_err()
-                    {
-                        break;
-                    }
-                }
-            });
-            return Some(OpenedMonitor::Native(wire_rx));
-        }
-        return Some(OpenedMonitor::Native(rx));
+        // Frames arrive only through `PvaPvHandle::post`, which validates
+        // against the canonical descriptor before fanout (pvxs
+        // `SharedPV::post`), so the monitor stream can never carry a
+        // descriptor-mismatched frame — no serve-time relay needed.
+        return Some(OpenedMonitor::Native(handle.add_subscriber()));
     }
     let channel = provider
         .create_channel_with_creds(&name, ctx_to_creds(&ctx))
@@ -435,13 +350,12 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 return None;
             }
             let name = checked.pv_name().to_string();
-            // Native PVA-pushed PVs (NDPluginPva) carry no
-            // per-record ACF — they are always readable. Serve the
-            // latest value only if it matches the canonical descriptor
-            // (refuse a descriptor-mismatched producer update rather
-            // than coercing it onto the wire).
+            // Native PVA-pushed PVs (NDPluginPva) carry no per-record ACF
+            // — they are always readable. The snapshot is descriptor-valid
+            // by construction (every write went through
+            // `PvaPvHandle::post`), so serve it directly.
             if let Some(handle) = pva_pvs.read().await.get(&name).cloned()
-                && let Some(value) = handle.current_served_value()
+                && let Some(value) = handle.current_value()
             {
                 return Some(value);
             }
@@ -861,10 +775,10 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 // Prefer the canonical descriptor supplied at registration
                 // (wire-faithful for `UnionArray` and other types that
                 // `PvField::descriptor` cannot losslessly reconstruct).
-                if let Some(desc) = handle.descriptor.clone() {
+                if let Some(desc) = handle.descriptor().cloned() {
                     return Some(desc);
                 }
-                if let Some(value) = handle.latest.lock().clone() {
+                if let Some(value) = handle.current_value() {
                     return Some(value.descriptor());
                 }
             }
@@ -878,7 +792,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         let pva_pvs = self.pva_pvs.clone();
         async move {
             if let Some(handle) = pva_pvs.read().await.get(&name_owned).cloned()
-                && let Some(value) = handle.current_served_value()
+                && let Some(value) = handle.current_value()
             {
                 return Some(value);
             }
@@ -946,23 +860,12 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         let name_owned = name.to_string();
         let pva_pvs = self.pva_pvs.clone();
         async move {
-            // Native-registered PVA PVs publish into their own
-            // subscriber list maintained by the registering plugin
-            // (NDPluginPva); the QSRV side just appends a tx so the
-            // plugin's `post()` fans out into the PVA server.
-            // Reap any subscriber whose receiver was already dropped
-            // before pushing — without this, an idle camera that
-            // never calls `process_array` (the only existing reaper)
-            // accumulates one closed Sender per subscribe-and-disconnect
-            // cycle, growing the Vec without bound.
+            // Native-registered PVA PVs publish into their own subscriber
+            // list; `add_subscriber` appends a tx (reaping any already-
+            // dropped receivers) so the plugin's `post()` fans out into
+            // the PVA server.
             if let Some(handle) = pva_pvs.read().await.get(&name_owned).cloned() {
-                let (tx, rx) = mpsc::channel::<PvField>(64);
-                {
-                    let mut subs = handle.subscribers.lock();
-                    subs.retain(|s| !s.is_closed());
-                    subs.push(tx);
-                }
-                return Some(rx);
+                return Some(handle.add_subscriber());
             }
             let channel = self.channel(&name_owned).await?;
             let mut monitor = channel.create_monitor().await.ok()?;
@@ -1145,14 +1048,7 @@ pub async fn run_ca_pva_qsrv_ioc(
     let pva_pvs = take_registered_pva_pvs();
     for (pv_name, handle) in pva_pvs {
         tracing::info!(pv = %pv_name, "registering native PVA PV");
-        store
-            .register_pva_pv(
-                &pv_name,
-                handle.latest,
-                handle.subscribers,
-                handle.descriptor,
-            )
-            .await;
+        store.register_pva_pv(&pv_name, handle).await;
     }
 
     // ── External links (`calink` / `pvalink` features) ──
@@ -1382,13 +1278,11 @@ mod tests {
             "DB record hidden when disabled"
         );
 
-        let latest = Arc::new(parking_lot::Mutex::new(Some(PvField::Scalar(
-            epics_pva_rs::pvdata::ScalarValue::Int(7),
-        ))));
-        let subscribers = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        store
-            .register_pva_pv("NATIVE:PV", latest, subscribers, None)
-            .await;
+        let handle = PvaPvHandle::new(None);
+        handle
+            .post(PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Int(7)))
+            .expect("descriptor-less post accepted");
+        store.register_pva_pv("NATIVE:PV", handle).await;
         assert!(
             store.has_pv("NATIVE:PV").await,
             "native PVA PV stays served even when QSRV2 DB serving is off"
@@ -1441,11 +1335,11 @@ mod tests {
             value: PvField::Scalar(ScalarValue::Int(7)),
         })]);
 
-        let latest = Arc::new(parking_lot::Mutex::new(Some(value)));
-        let subscribers = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        store
-            .register_pva_pv("TEST:UARR", latest, subscribers, Some(canonical.clone()))
-            .await;
+        let handle = PvaPvHandle::new(Some(canonical.clone()));
+        handle
+            .post(value)
+            .expect("value matches canonical descriptor");
+        store.register_pva_pv("TEST:UARR", handle).await;
 
         let got = store.get_introspection("TEST:UARR").await.unwrap();
         assert_eq!(got, canonical, "supplied descriptor must round-trip");
@@ -1469,11 +1363,9 @@ mod tests {
             variant_name: "as_int".into(),
             value: PvField::Scalar(epics_pva_rs::pvdata::ScalarValue::Int(7)),
         })]);
-        let latest = Arc::new(parking_lot::Mutex::new(Some(value)));
-        let subscribers = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        store
-            .register_pva_pv("TEST:UARR_LOSSY", latest, subscribers, None)
-            .await;
+        let handle = PvaPvHandle::new(None);
+        handle.post(value).expect("descriptor-less post accepted");
+        store.register_pva_pv("TEST:UARR_LOSSY", handle).await;
 
         let got = store.get_introspection("TEST:UARR_LOSSY").await.unwrap();
         assert_eq!(
@@ -1486,69 +1378,17 @@ mod tests {
         );
     }
 
-    /// Symmetric invariant guard at the global-registry entry point.
-    /// `register_pva_pv_global` is the producer-side path (called from
-    /// IOC startup before the runner exists); it must enforce the same
-    /// root-kind invariant as the runner-side `register_pva_pv`,
-    /// otherwise misconfigured handles silently sit in the global map
-    /// and surface only when the runner drains it later.
-    #[test]
-    #[should_panic(expected = "root kind")]
-    fn register_pva_pv_global_panics_on_root_mismatch() {
-        use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType};
-
-        let value = PvField::Structure(PvStructure::new("x"));
-        let bogus_desc = FieldDesc::UnionArray {
-            struct_id: String::new(),
-            variants: vec![("as_int".into(), FieldDesc::Scalar(ScalarType::Int))],
-        };
-        register_pva_pv_global(
-            "TEST:BOGUS_GLOBAL",
-            PvaPvHandle {
-                latest: Arc::new(parking_lot::Mutex::new(Some(value))),
-                subscribers: Arc::new(parking_lot::Mutex::new(Vec::new())),
-                descriptor: Some(bogus_desc),
-            },
-        );
-    }
-
-    /// Invariant guard: registering a descriptor whose root kind
-    /// disagrees with the current value panics. Mirrors the
-    /// `PvaPvHandle` contract — introspection must not diverge from
-    /// the values served.
+    /// pvxs `SharedPV::post` (sharedpv.cpp:417-431) validates the posted
+    /// value against the descriptor the PV was opened with and throws
+    /// *before* `impl->current.assign(val)`, so a descriptor-mismatched
+    /// post leaves the last accepted value readable via `fetch()` and
+    /// never reaches monitors. `PvaPvHandle::post` is the single
+    /// validating write owner that reproduces this: a bad post returns
+    /// `Err`, leaves `latest` untouched, and fans out nothing — `latest`
+    /// can only ever hold a descriptor-valid value, by construction.
+    /// Regression R0604-BRQSRV-NATIVE-PVA-BAD-POST-CLEARS-VALUE-1.
     #[tokio::test]
-    #[should_panic(expected = "root kind")]
-    async fn register_pva_pv_panics_on_descriptor_value_root_mismatch() {
-        use epics_base_rs::server::database::PvDatabase;
-        use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType};
-
-        let db = Arc::new(PvDatabase::new());
-        let provider = Arc::new(BridgeProvider::new(db));
-        let store = QsrvPvStore::new(provider);
-
-        // Value is a Structure, descriptor is a UnionArray — root mismatch.
-        let value = PvField::Structure(PvStructure::new("x"));
-        let bogus_desc = FieldDesc::UnionArray {
-            struct_id: String::new(),
-            variants: vec![("as_int".into(), FieldDesc::Scalar(ScalarType::Int))],
-        };
-        let latest = Arc::new(parking_lot::Mutex::new(Some(value)));
-        let subscribers = Arc::new(parking_lot::Mutex::new(Vec::new()));
-
-        store
-            .register_pva_pv("TEST:BOGUS", latest, subscribers, Some(bogus_desc))
-            .await;
-    }
-
-    /// A native PVA PV that registered a canonical descriptor must only
-    /// serve values that encode faithfully under it. The registration
-    /// root-kind gate is too weak (a deeper leaf mismatch keeps the same
-    /// root kind) and runs only once, while the producer owns `latest`
-    /// and can mutate it later. The serving owner re-checks every served
-    /// value recursively and refuses a mismatch — matching pvxs
-    /// `SharedPV::post`, which never posts a descriptor-mismatched value.
-    #[tokio::test]
-    async fn native_pva_get_refuses_descriptor_mismatched_update() {
+    async fn native_pva_bad_post_keeps_prior_value_and_skips_monitor() {
         use epics_base_rs::server::database::PvDatabase;
         use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
         use epics_pva_rs::server_native::ChannelSource;
@@ -1562,46 +1402,96 @@ mod tests {
             struct_id: "epics:nt/NTScalar:1.0".into(),
             fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
         };
-        // Initial value matches the descriptor.
-        let mut good = PvStructure::new("epics:nt/NTScalar:1.0");
-        good.set("value", PvField::Scalar(ScalarValue::Double(1.5)));
-        let latest = Arc::new(parking_lot::Mutex::new(Some(PvField::Structure(good))));
-        let subscribers = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let handle = PvaPvHandle::new(Some(desc));
 
-        store
-            .register_pva_pv("TEST:NTS", latest.clone(), subscribers, Some(desc))
-            .await;
+        // Subscribe before any post so the monitor observes the same post
+        // sequence the GET path sees (the clone shares `latest`/
+        // `subscribers`, so registering a clone keeps both views in sync).
+        let mut rx = handle.add_subscriber();
 
-        // A matching value is served.
-        assert!(
-            store.get_value("TEST:NTS").await.is_some(),
-            "descriptor-matching value must be served"
+        // A descriptor-matching post becomes current and is delivered.
+        let good = {
+            let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
+            s.set("value", PvField::Scalar(ScalarValue::Double(1.5)));
+            PvField::Structure(s)
+        };
+        handle.post(good.clone()).expect("good post accepted");
+        store.register_pva_pv("TEST:NTS", handle.clone()).await;
+
+        assert_eq!(
+            store.get_value("TEST:NTS").await,
+            Some(good.clone()),
+            "accepted value is served"
+        );
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(good.clone()),
+            "monitor receives the good frame"
         );
 
-        // Producer mutates `latest` to a value with the right root kind
-        // and struct_id but a wrong scalar leaf (Int under a Double
-        // descriptor) — root-kind gate would pass, recursive check must
-        // reject.
-        {
-            let mut bad = PvStructure::new("epics:nt/NTScalar:1.0");
-            bad.set("value", PvField::Scalar(ScalarValue::Int(3)));
-            *latest.lock() = Some(PvField::Structure(bad));
-        }
-        assert!(
-            store.get_value("TEST:NTS").await.is_none(),
-            "descriptor-mismatched leaf must be refused, not coerced onto the wire"
-        );
+        // A descriptor-mismatched post (Int leaf under a Double
+        // descriptor: same root kind and struct_id, wrong scalar type) is
+        // rejected before it can touch `latest` or fan out.
+        let bad = {
+            let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
+            s.set("value", PvField::Scalar(ScalarValue::Int(3)));
+            PvField::Structure(s)
+        };
+        handle
+            .post(bad)
+            .expect_err("descriptor-mismatched post must be rejected");
 
-        // Mutating to a value missing the canonical struct_id is also
-        // refused.
-        {
-            let mut wrong_id = PvStructure::new("wrong:id");
-            wrong_id.set("value", PvField::Scalar(ScalarValue::Double(2.0)));
-            *latest.lock() = Some(PvField::Structure(wrong_id));
-        }
+        // GET still returns the last *accepted* value — not None, not the
+        // bad value (pvxs `fetch()` after a thrown post).
+        assert_eq!(
+            store.get_value("TEST:NTS").await,
+            Some(good),
+            "rejected post must leave the prior accepted value readable"
+        );
+        // The monitor saw no frame for the rejected post.
         assert!(
-            store.get_value("TEST:NTS").await.is_none(),
-            "struct_id mismatch must be refused"
+            rx.try_recv().is_err(),
+            "rejected post must not reach monitor subscribers"
+        );
+    }
+
+    /// A descriptor-mismatched *first* post (no previously accepted value)
+    /// leaves the PV with no current value — matching pvxs before
+    /// `open()` / the first accepted post, where `fetch()` has nothing to
+    /// return. The bad frame must not be coerced into a fabricated
+    /// snapshot.
+    /// Regression R0604-BRQSRV-NATIVE-PVA-BAD-POST-CLEARS-VALUE-1.
+    #[tokio::test]
+    async fn native_pva_bad_first_post_leaves_no_current_value() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
+        use epics_pva_rs::server_native::ChannelSource;
+
+        let db = Arc::new(PvDatabase::new());
+        let provider = Arc::new(BridgeProvider::new(db));
+        let store = QsrvPvStore::new(provider);
+
+        let desc = FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::Double))],
+        };
+        let handle = PvaPvHandle::new(Some(desc));
+
+        // First post is descriptor-mismatched (Int leaf) → rejected.
+        let bad = {
+            let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
+            s.set("value", PvField::Scalar(ScalarValue::Int(3)));
+            PvField::Structure(s)
+        };
+        handle
+            .post(bad)
+            .expect_err("descriptor-mismatched first post must be rejected");
+
+        store.register_pva_pv("TEST:NTS:EMPTY", handle).await;
+        assert_eq!(
+            store.get_value("TEST:NTS:EMPTY").await,
+            None,
+            "no accepted post yet: GET has no current value"
         );
     }
 
@@ -1773,14 +1663,11 @@ mod tests {
             variant_name: "as_int".into(),
             value: PvField::Scalar(ScalarValue::Int(7)),
         })]);
-        store
-            .register_pva_pv(
-                "TEST:WIRE:UARR",
-                Arc::new(parking_lot::Mutex::new(Some(value))),
-                Arc::new(parking_lot::Mutex::new(Vec::new())),
-                Some(canonical.clone()),
-            )
-            .await;
+        let handle = PvaPvHandle::new(Some(canonical.clone()));
+        handle
+            .post(value)
+            .expect("value matches canonical descriptor");
+        store.register_pva_pv("TEST:WIRE:UARR", handle).await;
 
         let server =
             PvaServer::start(store, PvaServerConfig::isolated()).expect("test server must start");

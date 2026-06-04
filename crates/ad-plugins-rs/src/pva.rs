@@ -11,41 +11,44 @@ use ad_core_rs::ndarray::{NDArray, NDDataBuffer};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
 
+use epics_bridge_rs::qsrv::PvaPvHandle;
 use epics_pva_rs::nt::nd_array::{
     NdAlarm, NdArrayBuffer, NdAttribute, NdCodec, NdDimension, NdTimeStamp, NtNdArray,
-    nt_nd_array_value,
+    nt_nd_array_desc, nt_nd_array_value,
 };
 use epics_pva_rs::pvdata::{PvField, ScalarValue, VariantValue};
 
-/// Latest snapshot + subscriber list, shared with the qsrv adapter via a
-/// global registry.
-pub type LatestHandle = Arc<Mutex<Option<PvField>>>;
-pub type SubscribersHandle = Arc<Mutex<Vec<mpsc::Sender<PvField>>>>;
-
-/// PVA plugin processor: captures the latest NDArray and converts to PvField.
+/// PVA plugin processor: captures the latest NDArray, converts it to an
+/// NTNDArray [`PvField`], and posts it through its shared [`PvaPvHandle`].
+///
+/// The handle is the single validating write owner (pvxs
+/// `SharedPV::post`): a frame that does not match the canonical NTNDArray
+/// descriptor is rejected and never replaces the last good snapshot or
+/// reaches monitor subscribers. The producer holds one clone of the
+/// handle and the qsrv adapter registers another; both share the same
+/// `latest`/`subscribers` state.
 pub struct PvaProcessor {
     pv_name: String,
-    latest: LatestHandle,
-    subscribers: SubscribersHandle,
+    handle: PvaPvHandle,
 }
 
 impl PvaProcessor {
     pub fn new(pv_name: String) -> Self {
+        // The producer always emits NTNDArray-shaped values; advertising
+        // `nt_nd_array_desc()` lets `post` gate any malformed frame before
+        // it can become the served snapshot.
         Self {
             pv_name,
-            latest: Arc::new(Mutex::new(None)),
-            subscribers: Arc::new(Mutex::new(Vec::new())),
+            handle: PvaPvHandle::new(Some(nt_nd_array_desc())),
         }
     }
 
-    pub fn latest_handle(&self) -> LatestHandle {
-        self.latest.clone()
-    }
-
-    pub fn subscribers_handle(&self) -> SubscribersHandle {
-        self.subscribers.clone()
+    /// A clone of the shared handle to register with the qsrv adapter.
+    /// Producer posts and server reads/monitors flow through the same
+    /// `latest`/`subscribers` state.
+    pub fn handle(&self) -> PvaPvHandle {
+        self.handle.clone()
     }
 }
 
@@ -58,11 +61,19 @@ impl Default for PvaProcessor {
 impl NDPluginProcess for PvaProcessor {
     fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
         let payload = ndarray_to_pv_field(array);
-        *self.latest.lock() = Some(payload.clone());
 
-        // Notify subscribers, remove dead ones.
-        let mut subs = self.subscribers.lock();
-        subs.retain(|tx| tx.try_send(payload.clone()).is_ok());
+        // Regression R0604-BRQSRV-NATIVE-PVA-BAD-POST-CLEARS-VALUE-1.
+        // `post` validates against the canonical NTNDArray descriptor and
+        // is the single owner of `latest`/`subscribers`: a malformed frame
+        // is rejected without replacing the last good snapshot or reaching
+        // monitor subscribers (pvxs `SharedPV::post`).
+        if let Err(err) = self.handle.post(payload) {
+            tracing::warn!(
+                pv = %self.pv_name,
+                error = %err,
+                "dropping NDArray frame that does not match the NTNDArray descriptor"
+            );
+        }
 
         // Pass through to downstream plugins.
         ProcessResult::arrays(vec![Arc::new(array.clone())])
@@ -299,6 +310,12 @@ mod tests {
         }
     }
 
+    /// Regression R0604-BRQSRV-NATIVE-PVA-BAD-POST-CLEARS-VALUE-1.
+    /// A real NDArray frame must match the canonical `nt_nd_array_desc()`
+    /// the producer advertises in its handle; otherwise `post` would reject
+    /// every frame and the served value would stay empty. Posting a real
+    /// frame and asserting `current_value().is_some()` verifies the
+    /// producer output and the advertised descriptor agree.
     #[test]
     fn processor_stores_latest() {
         let mut proc = PvaProcessor::new("TEST:Pva1:Image".into());
@@ -306,8 +323,7 @@ mod tests {
         let arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::Float64);
         proc.process_array(&arr, &pool);
 
-        let latest = proc.latest_handle().lock().clone();
-        assert!(latest.is_some());
+        assert!(proc.handle().current_value().is_some());
     }
 
     #[test]

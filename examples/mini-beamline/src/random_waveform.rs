@@ -29,13 +29,13 @@ pub mod ioc_support {
     use rand::{Rng, SeedableRng};
 
     use epics_base_rs::error::CaResult;
-    use epics_base_rs::runtime::sync::mpsc;
     use epics_base_rs::server::device_support::{
         DeviceReadOutcome, DeviceSupport, WriteCompletion,
     };
     use epics_base_rs::server::record::{Record, ScanType};
     use epics_base_rs::types::EpicsValue;
-    use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarValue};
+    use epics_bridge_rs::qsrv::PvaPvHandle;
+    use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
 
     /// Generate `len` deterministic-random doubles in `[0.0, 1.0)`
     /// from a 64-bit seed.
@@ -87,16 +87,14 @@ pub mod ioc_support {
         /// lifetime of the PV. Mirrors pvxs `SharedPV::post`'s requirement
         /// that subsequent posts match the type of `open()`.
         field_prefix: OnceLock<String>,
-        /// Captured on first publish, used to defend against accidental
-        /// shape drift on later publishes (count or scalar-type changes
-        /// would break already-connected monitors).
-        expected_desc: OnceLock<FieldDesc>,
-        /// Count of monitor events the bundle had to drop because a
-        /// subscriber's mpsc was full. Best-effort observability — not
-        /// a hard contract.
-        dropped_events: AtomicU64,
-        latest: Arc<Mutex<Option<PvField>>>,
-        subscribers: Arc<Mutex<Vec<mpsc::Sender<PvField>>>>,
+        /// The single validating write owner for this PV (pvxs
+        /// `SharedPV::post`). Created lazily on the first publish from the
+        /// payload's descriptor — the field names depend on the runtime
+        /// `field_prefix`, so the canonical shape is not known until then.
+        /// Every later publish posts through this same handle, which rejects
+        /// a payload whose shape drifted from the first and is the only path
+        /// that may write `latest`/`subscribers`.
+        handle: OnceLock<PvaPvHandle>,
     }
 
     impl RandomWaveformShared {
@@ -116,10 +114,7 @@ pub mod ioc_support {
                 processed_mask: AtomicU64::new(0),
                 expected_mask,
                 field_prefix: OnceLock::new(),
-                expected_desc: OnceLock::new(),
-                dropped_events: AtomicU64::new(0),
-                latest: Arc::new(Mutex::new(None)),
-                subscribers: Arc::new(Mutex::new(Vec::new())),
+                handle: OnceLock::new(),
             }
         }
 
@@ -164,8 +159,13 @@ pub mod ioc_support {
             self.field_prefix.get().map(String::as_str).unwrap_or("wf")
         }
 
-        fn dropped_events(&self) -> u64 {
-            self.dropped_events.load(Ordering::Relaxed)
+        /// The latest published snapshot, read through the validating
+        /// handle (`None` until the first publish creates it). Used by the
+        /// unit tests to observe publish state without reaching into the
+        /// handle's private fields.
+        #[cfg(test)]
+        fn current_value(&self) -> Option<PvField> {
+            self.handle.get().and_then(|h| h.current_value())
         }
 
         fn publish_bundle(&self) {
@@ -174,38 +174,21 @@ pub mod ioc_support {
                 build_bundle_payload(&datasets, self.len, self.field_prefix())
             };
 
-            // Type-stability guard: capture the descriptor on first publish,
-            // refuse to send mismatched shapes afterwards. pvxs
-            // `SharedPV::post` enforces the same invariant.
-            let desc = payload.descriptor();
-            match self.expected_desc.get() {
-                None => {
-                    let _ = self.expected_desc.set(desc);
-                }
-                Some(expected) if expected != &desc => {
-                    eprintln!(
-                        "RandomWaveformShared::publish_bundle: shape changed since first \
-                         publish — dropping payload to keep already-connected monitors valid"
-                    );
-                    return;
-                }
-                Some(_) => {}
-            }
-
-            *self.latest.lock() = Some(payload.clone());
-
-            let mut subscribers = self.subscribers.lock();
-            subscribers.retain(|tx| !tx.is_closed());
-            for tx in subscribers.iter() {
-                if tx.try_send(payload.clone()).is_err() {
-                    let prev = self.dropped_events.fetch_add(1, Ordering::Relaxed);
-                    if prev == 0 {
-                        eprintln!(
-                            "mini:wf:bundle: dropping monitor event — subscriber queue full \
-                             (further drops counted via dropped_events())"
-                        );
-                    }
-                }
+            // Route every publish through the single validating owner. The
+            // handle's descriptor is captured from the first payload (field
+            // names depend on the runtime `field_prefix`); `post` then
+            // rejects any later payload whose shape drifted from the first —
+            // pvxs `SharedPV::post`'s type-stability invariant — and never
+            // lets a mismatched value become the served snapshot or reach
+            // monitor subscribers.
+            let handle = self
+                .handle
+                .get_or_init(|| PvaPvHandle::new(Some(payload.descriptor())));
+            if let Err(err) = handle.post(payload) {
+                eprintln!(
+                    "mini:wf:bundle: dropping payload whose shape changed since the first \
+                     publish ({err}); keeping already-connected monitors valid"
+                );
             }
         }
 
@@ -345,27 +328,20 @@ pub mod ioc_support {
             ))
         }
 
-        /// Cumulative count of monitor events that were dropped because a
-        /// subscriber's mpsc queue was full. Useful for benchmark scripts
-        /// to assert no drops happened during a run.
-        pub fn dropped_events(&self) -> u64 {
-            self.shared.dropped_events()
-        }
-
         pub fn register_pva_bundle(&self, pv_name: &str, field_prefix: &str) {
             self.shared.set_field_prefix(field_prefix);
+            // The first publish creates the validating handle from the
+            // payload's descriptor; register a clone so the qsrv adapter
+            // shares the same `latest`/`subscribers` state and serves the
+            // canonical descriptor for introspection.
             self.shared.publish_bundle();
-            // publish_bundle stamped expected_desc on first call — pass it
-            // through so introspection serves the canonical wire shape
-            // rather than re-deriving from the value.
-            epics_bridge_rs::qsrv::register_pva_pv_global(
-                pv_name,
-                epics_bridge_rs::qsrv::PvaPvHandle {
-                    latest: self.shared.latest.clone(),
-                    subscribers: self.shared.subscribers.clone(),
-                    descriptor: self.shared.expected_desc.get().cloned(),
-                },
-            );
+            let handle = self
+                .shared
+                .handle
+                .get()
+                .expect("publish_bundle initializes the handle")
+                .clone();
+            epics_bridge_rs::qsrv::register_pva_pv_global(pv_name, handle);
         }
     }
 
@@ -392,12 +368,12 @@ pub mod ioc_support {
         fn mark_processed_publishes_when_all_bits_set() {
             let shared = RandomWaveformShared::new(4, 3);
             // No publish before any record processes.
-            assert!(shared.latest.lock().is_none());
+            assert!(shared.current_value().is_none());
             shared.mark_processed(0);
             shared.mark_processed(1);
-            assert!(shared.latest.lock().is_none());
+            assert!(shared.current_value().is_none());
             shared.mark_processed(2);
-            assert!(shared.latest.lock().is_some());
+            assert!(shared.current_value().is_some());
             // Mask should reset for the next cycle.
             assert_eq!(shared.processed_mask.load(Ordering::Relaxed), 0);
         }
@@ -407,9 +383,9 @@ pub mod ioc_support {
             let shared = RandomWaveformShared::new(2, 2);
             shared.mark_processed(0);
             shared.mark_processed(0); // duplicate — should not advance cycle
-            assert!(shared.latest.lock().is_none());
+            assert!(shared.current_value().is_none());
             shared.mark_processed(1);
-            assert!(shared.latest.lock().is_some());
+            assert!(shared.current_value().is_some());
         }
 
         #[test]
@@ -418,7 +394,7 @@ pub mod ioc_support {
             // must still be safe if invoked directly with expected_mask=0.
             let shared = RandomWaveformShared::new(1, 0);
             shared.mark_processed(0);
-            assert!(shared.latest.lock().is_none());
+            assert!(shared.current_value().is_none());
         }
 
         #[test]
@@ -443,21 +419,11 @@ pub mod ioc_support {
             let shared = RandomWaveformShared::new(2, 2);
             shared.set_field_prefix("wf");
             shared.publish_bundle();
-            let first = shared
-                .latest
-                .lock()
-                .as_ref()
-                .map(|v| v.descriptor())
-                .unwrap();
+            let first = shared.current_value().map(|v| v.descriptor()).unwrap();
             // Bump some data and republish — descriptor must match.
             shared.update_data(0);
             shared.publish_bundle();
-            let second = shared
-                .latest
-                .lock()
-                .as_ref()
-                .map(|v| v.descriptor())
-                .unwrap();
+            let second = shared.current_value().map(|v| v.descriptor()).unwrap();
             assert_eq!(first, second);
         }
 

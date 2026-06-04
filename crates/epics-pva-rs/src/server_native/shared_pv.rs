@@ -413,10 +413,11 @@ impl SharedPV {
     /// A writable "mailbox" PV: a client PUT stores the value and posts
     /// it to all subscribers. Mirrors pvxs `SharedPV::buildMailbox`
     /// (`sharedpv.cpp:106-132`) — it installs an `onPut` handler that
-    /// `post`s the value. (pvxs additionally stamps `timeStamp` with the
-    /// current time when the client left it unset; this builder leaves
-    /// the value untouched, so callers that want server-side timestamps
-    /// install a custom [`Self::on_put`].)
+    /// `post`s the value, additionally stamping `timeStamp` with the
+    /// server's current time when the client's PUT marked neither the
+    /// timeStamp field nor any of its children (`sharedpv.cpp:113-121`).
+    /// A client-supplied (marked) timeStamp is preserved. See
+    /// [`Self::fill_mailbox_timestamp`].
     pub fn build_mailbox() -> Self {
         let pv = Self::new();
         pv.inner.lock().put_policy = PutPolicy::Mailbox;
@@ -705,9 +706,17 @@ impl SharedPV {
                     else {
                         return Err("SharedPV not open".into());
                     };
-                    let merged = crate::pvdata::encode::fill_unmarked_from_prior(
+                    let mut merged = crate::pvdata::encode::fill_unmarked_from_prior(
                         desc, changed, 0, delta, prior,
                     );
+                    // Regression R0604-PVASRV-SHAREDPV-MAILBOX-TIMESTAMP-1.
+                    // pvxs `buildMailbox` installs an `onPut` that stamps an
+                    // unmarked `timeStamp` with the server's current time
+                    // before posting (`sharedpv.cpp:113-121`). Do that here,
+                    // in the mailbox owner, so the stored+posted value
+                    // carries a fresh timestamp when the client PUT left it
+                    // unset. A client-marked timeStamp is preserved.
+                    Self::fill_mailbox_timestamp(desc, changed, &mut merged);
                     // descriptor enforcement for the store path: the
                     // merged value must fit the opened descriptor, not a
                     // stale peer-cached `desc` (pvxs `sharedpv.cpp:417-431`).
@@ -752,6 +761,85 @@ impl SharedPV {
                 Ok(())
             }
             Applied::Handler { handler, value } => handler(self, value),
+        }
+    }
+
+    /// pvxs `SharedPV::buildMailbox` `onPut` timestamp-fill
+    /// (`sharedpv.cpp:113-121`): when the merged value carries a
+    /// top-level `timeStamp` structure that the client marked neither at
+    /// its own bit nor at any descendant, stamp `secondsPastEpoch` /
+    /// `nanoseconds` from the server's current POSIX time. A
+    /// client-supplied (marked) timeStamp is left untouched.
+    ///
+    /// `desc` / `changed` use the wire bit numbering (pvData §5.4); the
+    /// "marked" test covers `[ts_bit, ts_bit + total_bits)` — the field's
+    /// own bit plus every descendant — matching pvxs `isMarked(true,
+    /// true)`. Child leaves are rewritten in place, preserving their
+    /// declared integer type so the merged value still fits the opened
+    /// descriptor. Mailbox-only: a custom `on_put` handler owns its own
+    /// timestamp policy, exactly as pvxs installs this fill only in
+    /// `buildMailbox` (a full-value `post`/[`Self::put`] is not stamped).
+    fn fill_mailbox_timestamp(
+        desc: &FieldDesc,
+        changed: &crate::proto::BitSet,
+        value: &mut PvField,
+    ) {
+        use crate::pvdata::ScalarValue;
+        // Locate the top-level `timeStamp` field and its bit offset
+        // (root is bit 0; the first child is bit 1, then depth-first).
+        let FieldDesc::Structure { fields, .. } = desc else {
+            return;
+        };
+        let mut ts_bit = 1usize;
+        let mut ts_desc = None;
+        for (name, child) in fields {
+            if name == "timeStamp" {
+                ts_desc = Some(child);
+                break;
+            }
+            ts_bit += child.total_bits();
+        }
+        // Only a `timeStamp` *structure* is stampable (pvxs writes the two
+        // child leaves of `val["timeStamp"]`).
+        let Some(ts_desc @ FieldDesc::Structure { .. }) = ts_desc else {
+            return;
+        };
+        // Client marked the field or any descendant → keep its timestamp.
+        let total = ts_desc.total_bits();
+        if (0..total).any(|i| changed.get(ts_bit + i)) {
+            return;
+        }
+        // Stamp the two child leaves from the server's current POSIX time.
+        let PvField::Structure(root) = value else {
+            return;
+        };
+        let Some(PvField::Structure(ts)) = root.get_field_mut("timeStamp") else {
+            return;
+        };
+        let dur = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        // Overwrite preserving the declared integer width/signedness so
+        // the value still matches the opened descriptor.
+        fn stamp_int(slot: &mut ScalarValue, v: i64) {
+            match slot {
+                ScalarValue::Byte(x) => *x = v as i8,
+                ScalarValue::Short(x) => *x = v as i16,
+                ScalarValue::Int(x) => *x = v as i32,
+                ScalarValue::Long(x) => *x = v,
+                ScalarValue::UByte(x) => *x = v as u8,
+                ScalarValue::UShort(x) => *x = v as u16,
+                ScalarValue::UInt(x) => *x = v as u32,
+                ScalarValue::ULong(x) => *x = v as u64,
+                // Non-integer leaf: not a standard `time_t` field — leave.
+                _ => {}
+            }
+        }
+        if let Some(PvField::Scalar(s)) = ts.get_field_mut("secondsPastEpoch") {
+            stamp_int(s, dur.as_secs() as i64);
+        }
+        if let Some(PvField::Scalar(s)) = ts.get_field_mut("nanoseconds") {
+            stamp_int(s, dur.subsec_nanos() as i64);
         }
     }
 
@@ -1412,6 +1500,68 @@ mod tests {
         PvField::Structure(s)
     }
 
+    /// NTScalar<Int> with a `time_t` `timeStamp` member. Bit numbering:
+    /// root=0, value=1, timeStamp=2, secondsPastEpoch=3, nanoseconds=4,
+    /// userTag=5 (so the timeStamp subtree covers bits 2..=5).
+    fn nt_scalar_ts_desc() -> FieldDesc {
+        let time_t = FieldDesc::Structure {
+            struct_id: "time_t".into(),
+            fields: vec![
+                (
+                    "secondsPastEpoch".into(),
+                    FieldDesc::Scalar(ScalarType::Long),
+                ),
+                ("nanoseconds".into(), FieldDesc::Scalar(ScalarType::Int)),
+                ("userTag".into(), FieldDesc::Scalar(ScalarType::Int)),
+            ],
+        };
+        FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::Int)),
+                ("timeStamp".into(), time_t),
+            ],
+        }
+    }
+
+    fn nt_scalar_ts_value(v: i32, secs: i64, nanos: i32) -> PvField {
+        let mut ts = crate::pvdata::PvStructure::new("time_t");
+        ts.fields.push((
+            "secondsPastEpoch".into(),
+            PvField::Scalar(ScalarValue::Long(secs)),
+        ));
+        ts.fields.push((
+            "nanoseconds".into(),
+            PvField::Scalar(ScalarValue::Int(nanos)),
+        ));
+        ts.fields
+            .push(("userTag".into(), PvField::Scalar(ScalarValue::Int(0))));
+        let mut s = crate::pvdata::PvStructure::new("epics:nt/NTScalar:1.0");
+        s.fields
+            .push(("value".into(), PvField::Scalar(ScalarValue::Int(v))));
+        s.fields.push(("timeStamp".into(), PvField::Structure(ts)));
+        PvField::Structure(s)
+    }
+
+    /// Read back `(secondsPastEpoch, nanoseconds)` from an NTScalar value.
+    fn extract_timestamp(v: &PvField) -> (i64, i32) {
+        let PvField::Structure(root) = v else {
+            panic!("not a structure");
+        };
+        let Some(PvField::Structure(ts)) = root.get_field("timeStamp") else {
+            panic!("no timeStamp");
+        };
+        let secs = match ts.get_field("secondsPastEpoch") {
+            Some(PvField::Scalar(ScalarValue::Long(s))) => *s,
+            other => panic!("unexpected secondsPastEpoch: {other:?}"),
+        };
+        let nanos = match ts.get_field("nanoseconds") {
+            Some(PvField::Scalar(ScalarValue::Int(n))) => *n,
+            other => panic!("unexpected nanoseconds: {other:?}"),
+        };
+        (secs, nanos)
+    }
+
     #[test]
     fn shared_pv_open_then_current() {
         let pv = SharedPV::new();
@@ -1937,6 +2087,84 @@ mod tests {
             "subscriber inbox must keep receiving after repeated put_delta"
         );
         assert_eq!(extract_int(&v2.unwrap()), 22);
+    }
+
+    /// Regression R0604-PVASRV-SHAREDPV-MAILBOX-TIMESTAMP-1.
+    /// A mailbox PUT that marks only `value` (timeStamp left unset) must
+    /// get a fresh server timestamp, mirroring pvxs `buildMailbox`'s
+    /// `onPut` (`sharedpv.cpp:113-121`). The PV opened with a zero
+    /// timestamp; after the value-only PUT the stored timeStamp must hold
+    /// the current wall-clock time, not the stale zero.
+    #[tokio::test]
+    async fn r0604_mailbox_put_value_only_stamps_timestamp() {
+        use crate::proto::BitSet;
+        let pv = SharedPV::build_mailbox();
+        pv.open(nt_scalar_ts_desc(), nt_scalar_ts_value(0, 0, 0))
+            .unwrap();
+        let desc = nt_scalar_ts_desc();
+        // Mark only `value` (bit 1); timeStamp subtree (bits 2..=5) unset.
+        let mut changed = BitSet::new();
+        changed.set(1);
+        pv.put_delta(&desc, &changed, nt_scalar_ts_value(11, 0, 0))
+            .expect("mailbox put ok");
+        let (secs, _nanos) = extract_timestamp(&pv.current().expect("has value"));
+        // A real POSIX wall-clock stamp is far past this 2020 epoch; the
+        // pre-fix path would leave the opened zero in place.
+        assert!(
+            secs > 1_600_000_000,
+            "unmarked timeStamp must be stamped from current time, got {secs}"
+        );
+        assert_eq!(extract_int(&pv.current().unwrap()), 11, "value stored");
+    }
+
+    /// Regression R0604-PVASRV-SHAREDPV-MAILBOX-TIMESTAMP-1.
+    /// A client that marks `timeStamp.secondsPastEpoch` keeps its own
+    /// timestamp — pvxs only stamps when `!isMarked(true, true)`, so a
+    /// marked child suppresses the server fill.
+    #[tokio::test]
+    async fn r0604_mailbox_put_marked_timestamp_is_preserved() {
+        use crate::proto::BitSet;
+        let pv = SharedPV::build_mailbox();
+        pv.open(nt_scalar_ts_desc(), nt_scalar_ts_value(0, 0, 0))
+            .unwrap();
+        let desc = nt_scalar_ts_desc();
+        // Mark `value` (1) and `secondsPastEpoch` (3): client supplied a
+        // timestamp, so the server must not overwrite it.
+        let mut changed = BitSet::new();
+        changed.set(1);
+        changed.set(3);
+        pv.put_delta(&desc, &changed, nt_scalar_ts_value(11, 12_345, 0))
+            .expect("mailbox put ok");
+        let (secs, _nanos) = extract_timestamp(&pv.current().expect("has value"));
+        assert_eq!(
+            secs, 12_345,
+            "client-marked timeStamp must be preserved, not re-stamped"
+        );
+    }
+
+    /// Regression R0604-PVASRV-SHAREDPV-MAILBOX-TIMESTAMP-1.
+    /// A value type with no `timeStamp` field is unaffected: the PUT
+    /// stores the value and the server fabricates no timeStamp.
+    #[tokio::test]
+    async fn r0604_mailbox_put_no_timestamp_field_unchanged() {
+        use crate::proto::BitSet;
+        let pv = SharedPV::build_mailbox();
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
+            .unwrap();
+        let desc = nt_scalar_int_desc();
+        let mut changed = BitSet::new();
+        changed.set(1);
+        pv.put_delta(&desc, &changed, nt_scalar_int_value(11))
+            .expect("mailbox put ok");
+        let cur = pv.current().expect("has value");
+        assert_eq!(extract_int(&cur), 11, "value stored");
+        let PvField::Structure(s) = cur else {
+            panic!("not a structure");
+        };
+        assert!(
+            s.get_field("timeStamp").is_none(),
+            "no timeStamp must be fabricated for a type without one"
+        );
     }
 
     /// A plain (no-handler) `SharedPV` is NOT writable: both `put` and

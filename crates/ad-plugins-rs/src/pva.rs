@@ -136,7 +136,14 @@ fn ndarray_to_pv_field(array: &NDArray) -> PvField {
             tags: Vec::new(),
             descriptor: a.description.clone(),
             alarm: NdAlarm::default(),
-            time_stamp: data_time_stamp.clone(),
+            // C ADCore converters (ntndArrayConverter.cpp:544-590,
+            // ntndArrayConverterPvxs.cpp::fromAttributes) populate only
+            // name/descriptor/source/sourceType/value on each attribute;
+            // `NDAttribute` carries no timestamp, so the per-attribute
+            // `timeStamp` stays at the NTAttribute default. Do NOT copy the
+            // image/array timestamp here — that would fabricate per-attribute
+            // provenance C never emits.
+            time_stamp: NdTimeStamp::default(),
             source_type: ndattr_source_type(&a.source),
             source: ndattr_source_string(&a.source),
         })
@@ -331,5 +338,67 @@ mod tests {
             }
             other => panic!("expected null variant value, got {other:?}"),
         }
+    }
+
+    /// Regression R0604-ADPVA-ATTR-TIMESTAMP-1.
+    ///
+    /// C ADCore converters set only name/descriptor/source/sourceType/value
+    /// on each NTAttribute (ntndArrayConverterPvxs.cpp::fromAttributes);
+    /// `NDAttribute` carries no timestamp, so the per-attribute `timeStamp`
+    /// stays at the NTAttribute default while top-level `dataTimeStamp`/
+    /// `timeStamp` follow the image source. Pre-fix Rust copied the image
+    /// timestamp into every attribute's `timeStamp`, fabricating per-
+    /// attribute provenance C never emits.
+    #[test]
+    fn attribute_timestamp_stays_default_not_image_ts() {
+        use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+        use epics_pva_rs::pvdata::PvStructure;
+
+        let mut arr = NDArray::new(vec![NDDimension::new(2)], NDDataType::UInt8);
+        arr.timestamp.sec = 1234;
+        arr.timestamp.nsec = 567;
+        arr.attributes.add(NDAttribute::new_static(
+            "gain",
+            "detector gain",
+            NDAttrSource::Constant,
+            NDAttrValue::Int32(7),
+        ));
+
+        let payload = ndarray_to_pv_field(&arr);
+        let PvField::Structure(s) = &payload else {
+            panic!("expected structure, got {payload:?}");
+        };
+
+        // Read (secondsPastEpoch, nanoseconds) from a `time_t` member.
+        let read_ts = |st: &PvStructure, field: &str| -> (i64, i32) {
+            let Some(PvField::Structure(ts)) = st.get_field(field) else {
+                panic!("expected {field} time_t structure");
+            };
+            let sec = match ts.get_field("secondsPastEpoch") {
+                Some(PvField::Scalar(ScalarValue::Long(v))) => *v,
+                other => panic!("expected secondsPastEpoch Long, got {other:?}"),
+            };
+            let nsec = match ts.get_field("nanoseconds") {
+                Some(PvField::Scalar(ScalarValue::Int(v))) => *v,
+                other => panic!("expected nanoseconds Int, got {other:?}"),
+            };
+            (sec, nsec)
+        };
+
+        // Top-level timestamps follow the image source.
+        assert_eq!(read_ts(s, "dataTimeStamp"), (1234, 567));
+        assert_eq!(read_ts(s, "timeStamp"), (1234, 567));
+
+        // Per-attribute timeStamp must stay default (0, 0), NOT the
+        // fabricated image timestamp.
+        let Some(PvField::StructureArray(attrs)) = s.get_field("attribute") else {
+            panic!("expected attribute structure-array");
+        };
+        let attr0 = attrs[0].as_ref().expect("attribute present");
+        assert_eq!(
+            read_ts(attr0, "timeStamp"),
+            (0, 0),
+            "per-attribute timeStamp must stay default, not the image timestamp"
+        );
     }
 }

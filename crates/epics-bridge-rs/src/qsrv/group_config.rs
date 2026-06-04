@@ -795,7 +795,16 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
             // only by `resolve_self_trigger_default` (mixed groups) and for
             // channel-less Structure/Const members above.
             None | Some("") => TriggerDef::SelfOnly,
-            Some(s) => TriggerDef::Fields(s.split(',').map(|f| f.trim().to_string()).collect()),
+            // pvxs `defineTriggers` (groupconfigprocessor.cpp:299-309)
+            // splits a non-empty `+trigger` with `std::getline(.,',')` and
+            // inserts each substring VERBATIM — it does not trim whitespace.
+            // Trigger resolution (`:394-408`) then looks each name up exactly
+            // in `fieldMap`, so `"a, b"` keeps the target `" b"` and reports
+            // it as a nonexistent field rather than triggering `b`. Trimming
+            // here would make Rust trigger `b`, diverging from pvxs and
+            // changing the group's changed-bitset/monitor fanout.
+            // Regression R0604-QSRV-TRIGGER-WHITESPACE-1.
+            Some(s) => TriggerDef::Fields(s.split(',').map(|f| f.to_string()).collect()),
         }
     };
 
@@ -997,6 +1006,61 @@ mod tests {
         assert_eq!(f2.channel, "RVAL");
         match &f2.triggers {
             TriggerDef::Fields(t) => assert_eq!(t, &vec!["fld1".to_string(), "fld2".to_string()]),
+            other => panic!("expected named trigger fields, got {other:?}"),
+        }
+    }
+
+    /// Regression R0604-QSRV-TRIGGER-WHITESPACE-1: pvxs `defineTriggers`
+    /// (groupconfigprocessor.cpp:299-309) splits `+trigger` on commas with
+    /// `std::getline` and inserts each substring VERBATIM — no trim. So
+    /// `"a, b"` yields targets `a` and `" b"`, and exact `fieldMap`
+    /// resolution drops `" b"` as a nonexistent field rather than triggering
+    /// `b`. The earlier `.trim()` collapsed `" b"` to `b`, diverging from
+    /// pvxs and silently widening the group's trigger fanout.
+    #[test]
+    fn trigger_targets_preserve_whitespace_like_pvxs() {
+        // Spaces after the comma are part of the target name (verbatim),
+        // matching pvxs `getline`. `" b"` must NOT collapse to `b`.
+        let json = r#"{
+            "G": {
+                "a": {"+channel": "A.VAL"},
+                "b": {"+channel": "B.VAL"},
+                "c": {"+channel": "C.VAL", "+trigger": "a, b"}
+            }
+        }"#;
+        let defs = parse_group_config(json).expect("must parse");
+        let c = defs[0]
+            .members
+            .iter()
+            .find(|m| m.field_name == "c")
+            .expect("member c");
+        match &c.triggers {
+            TriggerDef::Fields(t) => assert_eq!(
+                t,
+                &vec!["a".to_string(), " b".to_string()],
+                "pvxs keeps the post-comma space; ' b' must not collapse to 'b'"
+            ),
+            other => panic!("expected named trigger fields, got {other:?}"),
+        }
+
+        // No spaces → exact field names, unaffected by the no-trim change.
+        let json_tight = r#"{
+            "G": {
+                "a": {"+channel": "A.VAL"},
+                "b": {"+channel": "B.VAL"},
+                "c": {"+channel": "C.VAL", "+trigger": "a,b"}
+            }
+        }"#;
+        let defs = parse_group_config(json_tight).expect("must parse");
+        let c = defs[0]
+            .members
+            .iter()
+            .find(|m| m.field_name == "c")
+            .expect("member c");
+        match &c.triggers {
+            TriggerDef::Fields(t) => {
+                assert_eq!(t, &vec!["a".to_string(), "b".to_string()])
+            }
             other => panic!("expected named trigger fields, got {other:?}"),
         }
     }

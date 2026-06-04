@@ -651,6 +651,19 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
     let struct_id = match &raw.id {
         None => None,
         Some(v) => match json_value_as_string(v) {
+            // pvxs merges `+id` into the group definition only when the
+            // coerced string is non-empty (groupconfigprocessor.cpp:187-188:
+            // `if (!groupConfig.structureId.empty()) groupDefinitionMap[...]
+            // .structureId = groupConfig.structureId`). So an empty `+id`
+            // never sets the group's structure ID, and on a later fragment
+            // never clears a previously set one. Collapse an empty string to
+            // `None` at this sole construction site so `GroupPvDef.struct_id`
+            // carries one meaning on every path (`Some` ⟹ a real non-empty
+            // ID); the last-wins merge in `merge_group_defs` then keeps the
+            // last NON-EMPTY id and leaves a prior id intact when a later
+            // fragment supplies an empty `+id`, matching pvxs.
+            // Regression R0604-BRQSRV-GROUP-EMPTY-ID-MERGE-1.
+            Some(s) if s.is_empty() => None,
             Some(s) => Some(s),
             None => {
                 return Err(BridgeError::GroupConfigError(format!(
@@ -1524,6 +1537,60 @@ mod tests {
         let groups = parse_group_config(json).expect("whole file must still parse");
         assert_eq!(groups.len(), 1, "only the valid sibling survives");
         assert_eq!(groups[0].name, "G:good", "the bad +id group is dropped");
+    }
+
+    /// Regression R0604-BRQSRV-GROUP-EMPTY-ID-MERGE-1. pvxs merges `+id`
+    /// into the group definition only when the coerced string is non-empty
+    /// (groupconfigprocessor.cpp:187-188), so a later fragment that supplies
+    /// an empty `+id` must NOT clear an earlier non-empty structure ID, while
+    /// a non-empty `+id` still wins last. The Rust port collapses an empty
+    /// `+id` to `None` at the sole construction site, giving
+    /// `GroupPvDef.struct_id` one meaning (`Some` ⟹ a real non-empty ID) so
+    /// the last-wins merge keeps the last NON-EMPTY id. Tested by invariant
+    /// boundary: lone-empty at construction, empty-second-must-not-clear (the
+    /// bug), and non-empty-second-wins.
+    #[test]
+    fn br_group_empty_id_merge_keeps_last_nonempty() {
+        use std::collections::HashMap;
+
+        // Boundary 1: a lone empty `+id` normalizes to `None` at the sole
+        // construction site (not `Some("")`) — the structural invariant.
+        let empty_only =
+            parse_group_config(r#"{ "G:e": { "+id": "", "a": { "+channel": "R.A" } } }"#).unwrap();
+        assert_eq!(
+            empty_only[0].struct_id, None,
+            "an empty +id must normalize to None, not Some(\"\")"
+        );
+
+        // Boundary 2 (the bug): non-empty first, empty `+id` second — the
+        // empty fragment must NOT clear the established structure ID.
+        let first = parse_group_config(
+            r#"{ "G:m": { "+id": "epics:nt/NTScalar:1.0", "a": { "+channel": "R.A" } } }"#,
+        )
+        .unwrap();
+        let empty_second =
+            parse_group_config(r#"{ "G:m": { "+id": "", "b": { "+channel": "R.B" } } }"#).unwrap();
+        let mut map: HashMap<String, GroupPvDef> =
+            first.iter().cloned().map(|d| (d.name.clone(), d)).collect();
+        merge_group_defs(&mut map, empty_second);
+        assert_eq!(
+            map["G:m"].struct_id.as_deref(),
+            Some("epics:nt/NTScalar:1.0"),
+            "an empty +id second fragment must not clear the prior non-empty ID"
+        );
+
+        // Boundary 3: a non-empty `+id` second fragment still wins last
+        // (last-non-empty-wins).
+        let nonempty_second = parse_group_config(
+            r#"{ "G:m": { "+id": "epics:nt/NTTable:1.0", "c": { "+channel": "R.C" } } }"#,
+        )
+        .unwrap();
+        merge_group_defs(&mut map, nonempty_second);
+        assert_eq!(
+            map["G:m"].struct_id.as_deref(),
+            Some("epics:nt/NTTable:1.0"),
+            "a later non-empty +id wins last"
+        );
     }
 
     /// A later `info(Q:group)` fragment that omits `+atomic` must not

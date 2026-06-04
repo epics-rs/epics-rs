@@ -1933,9 +1933,14 @@ impl GroupMonitor {
         match (mapping, kind) {
             // NTScalar value/alarm event: pvxs `Value|Alarm` for a
             // triggered field assigns the scalar `value` plus `alarm` +
-            // `timeStamp` (getTimeAlarm). `value` is marked whole — for an
-            // enum this re-sends `choices` too, a harmless over-send vs the
-            // old whole-member mark.
+            // `timeStamp` (getTimeAlarm). `value` is the *semantic* leaf;
+            // for an NTEnum member it is the structure `{index, choices}`,
+            // and a bare `value` mark would re-send the property-only
+            // `value.choices` (the PVA selection layer expands a marked
+            // structure path to its whole subtree). [`poll`] narrows each
+            // enum `value` leaf to `value.index` against the concrete
+            // composed value — see [`narrow_enum_value_leaves`] — matching
+            // pvxs (`iocsource.cpp:107-109,331-351`).
             (FieldMapping::Scalar, MemberEventKind::Value) => &["value", "alarm", "timeStamp"],
             // NTScalar property event: getProperties fills `display` +
             // `control` + `valueAlarm` limits, plus enum `value.choices`.
@@ -1956,6 +1961,58 @@ impl GroupMonitor {
             // /Any contribute nothing on a property event.
             _ => &[],
         }
+    }
+
+    /// Resolve value-shape-dependent leaves in a value/alarm event's
+    /// marked set against the concrete composed group value (the exact
+    /// value about to be encoded, so it cannot drift from the descriptor).
+    ///
+    /// [`member_event_leaves`] emits the *semantic* leaf `value` for an
+    /// NTScalar member. For an NTEnum member the `value` node is the
+    /// structure `{index, choices}`, and [`marked_changed_bitset`] expands
+    /// a marked structure path to its whole subtree — so a bare `<m>.value`
+    /// mark would re-send the property-only `value.choices` on every value
+    /// update. pvxs assigns only `value.index` on a value/alarm event
+    /// (`iocsource.cpp:107-109,331-351`) and fills `value.choices` solely
+    /// from `getProperties` on a property event (`iocsource.cpp:278-285`).
+    /// Rewrite each marked `<m>.value` whose composed member value is an
+    /// enum to `<m>.value.index`; plain-scalar `value` leaves and every
+    /// non-`value` leaf are left untouched. Property-event sets carry
+    /// `<m>.value.choices`, never a bare `<m>.value`, so they are
+    /// unaffected by this pass.
+    fn narrow_enum_value_leaves(paths: Vec<String>, value: &PvStructure) -> Vec<String> {
+        paths
+            .into_iter()
+            .map(|path| match path.strip_suffix(".value") {
+                Some(base) if Self::member_value_is_enum(value, base) => format!("{path}.index"),
+                _ => path,
+            })
+            .collect()
+    }
+
+    /// True iff the group member addressed by the dot-separated `base`
+    /// path carries an NTEnum `value` (its `value` child is itself a
+    /// structure with an `index` leaf) in the composed group value.
+    fn member_value_is_enum(root: &PvStructure, base: &str) -> bool {
+        let mut node = root;
+        let mut segs = base.split('.').peekable();
+        while let Some(seg) = segs.next() {
+            match node.get_field(seg) {
+                Some(PvField::Structure(s)) => {
+                    if segs.peek().is_none() {
+                        // `s` is the member NT structure; its `value` child
+                        // is an enum iff it is a structure with `index`.
+                        return matches!(
+                            s.get_field("value"),
+                            Some(PvField::Structure(v)) if v.get_field("index").is_some()
+                        );
+                    }
+                    node = s;
+                }
+                _ => return false,
+            }
+        }
+        false
     }
 }
 
@@ -2149,11 +2206,14 @@ impl super::provider::PvaMonitor for GroupMonitor {
             };
 
             let group_channel = self.group_channel.as_ref()?;
-            return group_channel
-                .read_group()
-                .await
-                .ok()
-                .map(|value| super::provider::MonitorPoll { value, marked });
+            let value = group_channel.read_group().await.ok()?;
+            // Resolve value-shape-dependent leaves against the concrete
+            // composed value: an NTEnum member's value/alarm event marks
+            // only `value.index`, never the property-only `value.choices`
+            // the whole-subtree `value` mark would otherwise re-send
+            // (pvxs `iocsource.cpp:107-109,331-351`).
+            let marked = marked.map(|paths| Self::narrow_enum_value_leaves(paths, &value));
+            return Some(super::provider::MonitorPoll { value, marked });
         }
     }
 
@@ -2722,6 +2782,93 @@ mod tests {
                 EventMark::Skip
             ),
             "meta member carries no property-metadata leaves"
+        );
+    }
+
+    /// Regression R0604-BRQSRV-ENUM-BITSET-1. A value/alarm event on an
+    /// NTEnum group member must narrow its `value` leaf to `value.index`,
+    /// not mark the whole `value` subtree. pvxs assigns only `value.index`
+    /// on a value event (`iocsource.cpp:107-109,331-351`) and fills
+    /// `value.choices` solely via getProperties (`iocsource.cpp:278-285`).
+    /// A bare `value` mark would, through `marked_changed_bitset`'s
+    /// whole-subtree expansion, re-send the property-only `choices` array
+    /// on every value update. Plain-scalar `value` leaves and non-value
+    /// leaves stay untouched, and a nested (dot-pathed) enum member is
+    /// handled too.
+    #[test]
+    fn enum_value_event_narrows_value_leaf_to_index() {
+        use epics_pva_rs::pvdata::ScalarValue;
+
+        fn nt_enum_member() -> PvField {
+            let mut value = PvStructure::new("enum_t");
+            value
+                .fields
+                .push(("index".into(), PvField::Scalar(ScalarValue::Int(1))));
+            value.fields.push((
+                "choices".into(),
+                PvField::ScalarArray(vec![
+                    ScalarValue::String("OFF".into()),
+                    ScalarValue::String("ON".into()),
+                ]),
+            ));
+            let mut m = PvStructure::new("epics:nt/NTEnum:1.0");
+            m.fields.push(("value".into(), PvField::Structure(value)));
+            m.fields.push((
+                "alarm".into(),
+                PvField::Structure(PvStructure::new("alarm_t")),
+            ));
+            PvField::Structure(m)
+        }
+
+        fn nt_scalar_member() -> PvField {
+            let mut m = PvStructure::new("epics:nt/NTScalar:1.0");
+            m.fields
+                .push(("value".into(), PvField::Scalar(ScalarValue::Double(3.5))));
+            m.fields.push((
+                "alarm".into(),
+                PvField::Structure(PvStructure::new("alarm_t")),
+            ));
+            PvField::Structure(m)
+        }
+
+        // composed group value: one NTEnum member, one plain NTScalar
+        // member, and a nested NTEnum member under an intermediate node.
+        let mut nested = PvStructure::new("");
+        nested.fields.push(("mode".into(), nt_enum_member()));
+
+        let mut root = PvStructure::new("");
+        root.fields.push(("state".into(), nt_enum_member()));
+        root.fields.push(("temp".into(), nt_scalar_member()));
+        root.fields.push(("grp".into(), PvField::Structure(nested)));
+
+        // member_value_is_enum: enum members resolve true (incl. nested),
+        // plain scalar resolves false, and an unknown path resolves false.
+        assert!(GroupMonitor::member_value_is_enum(&root, "state"));
+        assert!(GroupMonitor::member_value_is_enum(&root, "grp.mode"));
+        assert!(!GroupMonitor::member_value_is_enum(&root, "temp"));
+        assert!(!GroupMonitor::member_value_is_enum(&root, "missing"));
+
+        let marked = vec![
+            "state.value".to_string(),
+            "state.alarm".to_string(),
+            "temp.value".to_string(),
+            "grp.mode.value".to_string(),
+        ];
+        let narrowed = GroupMonitor::narrow_enum_value_leaves(marked, &root);
+        assert_eq!(
+            narrowed,
+            vec![
+                "state.value.index".to_string(),
+                "state.alarm".to_string(),
+                "temp.value".to_string(),
+                "grp.mode.value.index".to_string(),
+            ],
+            "enum value leaves narrow to value.index; plain value and non-value leaves unchanged"
+        );
+        // The over-marking path that re-sent choices must be gone.
+        assert!(
+            !narrowed.contains(&"state.value".to_string()),
+            "bare enum `value` leaf (expands to choices) must not survive: {narrowed:?}"
         );
     }
 

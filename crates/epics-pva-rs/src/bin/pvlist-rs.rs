@@ -303,14 +303,23 @@ impl DiscoveryPrinter {
     }
 
     /// Line to print for a `Timeout` (offline) event, or `None`.
-    fn on_timeout(&mut self, server: SocketAddr, guid: [u8; 12]) -> Option<String> {
+    fn on_timeout(&mut self, server: SocketAddr, guid: [u8; 12], proto: &str) -> Option<String> {
         if self.verbose {
-            Some(format!("OFFLINE  {server:24}  guid={}", fmt_guid(&guid)))
+            Some(format!(
+                "OFFLINE  {server:24}  guid={}  proto={proto}",
+                fmt_guid(&guid)
+            ))
+        } else if proto == "tcp" {
+            // pvxs erases the `(guid, proto)` entry on Timeout so a later
+            // re-Online reprints the address — but the erase is gated on
+            // `proto == "tcp"` (list.cpp:133-137), so a `tls` timeout must
+            // NOT retire the `tcp` identity. Carrying `proto` on the event
+            // is what makes that gate possible; without it, every timeout
+            // wrongly cleared the lone `tcp` key.
+            self.tcp_seen.remove(&(guid, proto.to_string()));
+            None
         } else {
-            // pvxs erases the (guid, "tcp") entry on Timeout so a later
-            // re-Online reprints the address (list.cpp:136). Our Timeout
-            // event carries no proto and non-verbose only tracks tcp.
-            self.tcp_seen.remove(&(guid, "tcp".to_string()));
+            // Non-verbose suppresses non-TCP endpoints (list.cpp:133).
             None
         }
     }
@@ -377,8 +386,13 @@ async fn discover_mode(args: &Args) {
                     println!("{line}");
                 }
             }
-            Discovered::Timeout { server, guid } => {
-                if let Some(line) = printer.on_timeout(server, guid) {
+            Discovered::Timeout {
+                server,
+                guid,
+                proto,
+                ..
+            } => {
+                if let Some(line) = printer.on_timeout(server, guid, &proto) {
                     println!("{line}");
                 }
             }
@@ -600,11 +614,44 @@ mod tests {
                 .is_none()
         );
         // Offline event prints nothing in non-verbose mode.
-        assert!(p.on_timeout(addr("10.0.0.5:5075"), guid).is_none());
+        assert!(p.on_timeout(addr("10.0.0.5:5075"), guid, "tcp").is_none());
         // After timeout cleared the entry, a re-Online reprints.
         assert!(
             p.on_online(addr("10.0.0.5:5075"), guid, addr("10.0.0.5:1"), "tcp")
                 .is_some()
+        );
+    }
+
+    /// Regression R0604-PVACLI-DISCOVERY-TIMEOUT-PROTO-1.
+    /// The non-verbose dedup erase is gated on `proto == "tcp"`
+    /// (list.cpp:133-137): a `tls` Timeout must NOT clear the printed
+    /// `tcp` identity. Before the fix `on_timeout` carried no proto and
+    /// cleared `(guid, "tcp")` for *every* timeout, so a `tls` server going
+    /// offline wrongly caused the `tcp` address to reprint on its next
+    /// beacon.
+    #[test]
+    fn nonverbose_tls_timeout_does_not_clear_tcp() {
+        let mut p = DiscoveryPrinter::new(false);
+        let guid = [7u8; 12];
+        // tcp endpoint printed once.
+        assert!(
+            p.on_online(addr("10.0.0.5:5075"), guid, addr("10.0.0.5:1"), "tcp")
+                .is_some()
+        );
+        // A tls timeout for the SAME guid must not retire the tcp entry.
+        assert!(p.on_timeout(addr("10.0.0.5:5076"), guid, "tls").is_none());
+        // tcp beacon again: still deduped (entry survived the tls timeout).
+        assert!(
+            p.on_online(addr("10.0.0.5:5075"), guid, addr("10.0.0.5:1"), "tcp")
+                .is_none(),
+            "a tls timeout must not cause the tcp address to reprint"
+        );
+        // Only a tcp timeout clears it → the next tcp beacon reprints.
+        assert!(p.on_timeout(addr("10.0.0.5:5075"), guid, "tcp").is_none());
+        assert!(
+            p.on_online(addr("10.0.0.5:5075"), guid, addr("10.0.0.5:1"), "tcp")
+                .is_some(),
+            "a tcp timeout clears the entry so the next tcp beacon reprints"
         );
     }
 
@@ -675,7 +722,10 @@ mod tests {
             .on_online(addr("10.0.0.5:5075"), [4u8; 12], addr("10.0.0.5:1"), "tcp")
             .unwrap();
         assert!(on.starts_with("ONLINE"));
-        let off = p.on_timeout(addr("10.0.0.5:5075"), [4u8; 12]).unwrap();
+        let off = p
+            .on_timeout(addr("10.0.0.5:5075"), [4u8; 12], "tcp")
+            .unwrap();
         assert!(off.starts_with("OFFLINE"));
+        assert!(off.contains("proto=tcp"), "verbose OFFLINE carries proto");
     }
 }

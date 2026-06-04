@@ -53,9 +53,14 @@ pub enum BeaconAction {
     /// First beacon for this `(server, proto)` — emit `Online`, poke.
     New,
     /// Known `(server, proto)` reported a different GUID or peerVersion —
-    /// emit `Timeout` for `old_guid` then `Online` for the new identity,
-    /// and poke (client.cpp:807-821).
-    Changed { old_guid: [u8; 12] },
+    /// emit `Timeout` for the old identity then `Online` for the new one,
+    /// and poke (client.cpp:807-821). pvxs builds that `Timeout` from the
+    /// *previous* GUID and peerVersion (`cur.guid` / `cur.peerVersion`,
+    /// client.cpp:814-819), so both are carried out for the emitter.
+    Changed {
+        old_guid: [u8; 12],
+        old_peer_version: u8,
+    },
     /// Same identity (same GUID and peerVersion) — no event, no poke.
     Update,
     /// New entry refused because the tracker is at its size cap.
@@ -127,9 +132,13 @@ impl BeaconTracker {
                 entry.last_seen = now;
                 if entry.guid != guid || entry.peer_version != peer_version {
                     let old_guid = entry.guid;
+                    let old_peer_version = entry.peer_version;
                     entry.guid = guid;
                     entry.peer_version = peer_version;
-                    BeaconAction::Changed { old_guid }
+                    BeaconAction::Changed {
+                        old_guid,
+                        old_peer_version,
+                    }
                 } else {
                     BeaconAction::Update
                 }
@@ -156,17 +165,22 @@ impl BeaconTracker {
     }
 
     /// Drop entries whose last beacon is older than `max_age`. Returns the
-    /// list of (server, guid) tuples that were pruned so the caller can
-    /// raise a `Discovered::Timeout` for each. Mirrors pvxs
-    /// `tickBeaconClean` (client.cpp:1254) which prunes after 2× the
-    /// beacon-clean interval (default 360s).
-    pub fn prune_stale(&self, max_age: Duration) -> Vec<(SocketAddr, [u8; 12])> {
+    /// `(server, proto, guid, peer_version)` of each pruned entry so the
+    /// caller can raise a `Discovered::Timeout` carrying the full beacon
+    /// identity. The `proto` is load-bearing: pvxs keys `beaconTrack` by
+    /// `(server, proto)` and emits one Timeout per pruned entry
+    /// (client.cpp:1295), so a server advertising both `tcp` and `tls` at
+    /// one endpoint expires as two distinguishable timeouts rather than one
+    /// collapsed `(server, guid)`. Mirrors pvxs `tickBeaconClean`
+    /// (client.cpp:1254) which prunes after 2× the beacon-clean interval
+    /// (default 360s).
+    pub fn prune_stale(&self, max_age: Duration) -> Vec<(SocketAddr, String, [u8; 12], u8)> {
         let now = Instant::now();
         let mut map = self.inner.write();
         let mut pruned = Vec::new();
-        map.retain(|(server, _proto), entry| {
+        map.retain(|(server, proto), entry| {
             if now.duration_since(entry.last_seen) > max_age {
-                pruned.push((*server, entry.guid));
+                pruned.push((*server, proto.clone(), entry.guid, entry.peer_version));
                 false
             } else {
                 true
@@ -227,7 +241,8 @@ mod tests {
         assert_eq!(
             t.observe(addr(), "tcp", [2u8; 12], V),
             BeaconAction::Changed {
-                old_guid: [1u8; 12]
+                old_guid: [1u8; 12],
+                old_peer_version: V,
             }
         );
         assert_eq!(t.guid_for(addr()), Some([2u8; 12]));
@@ -243,9 +258,11 @@ mod tests {
         assert_eq!(
             t.observe(addr(), "tcp", [1u8; 12], 3),
             BeaconAction::Changed {
-                old_guid: [1u8; 12]
+                old_guid: [1u8; 12],
+                old_peer_version: 2,
             },
-            "same GUID + new peerVersion must be a Change, not an Update"
+            "same GUID + new peerVersion must be a Change, not an Update; \
+             the old peerVersion (2) is carried out for the Timeout"
         );
     }
 
@@ -270,10 +287,64 @@ mod tests {
         // Negative-ish (zero) cutoff drops everything currently tracked.
         let pruned = t.prune_stale(Duration::from_secs(0));
         assert_eq!(pruned.len(), 1);
+        // Pruned tuple is (server, proto, guid, peer_version).
         assert_eq!(pruned[0].0, addr());
-        assert_eq!(pruned[0].1, [9u8; 12]);
+        assert_eq!(pruned[0].1, "tcp");
+        assert_eq!(pruned[0].2, [9u8; 12]);
+        assert_eq!(pruned[0].3, V);
         // Idempotent: a second call with no entries left returns empty.
         assert!(t.prune_stale(Duration::from_secs(0)).is_empty());
+    }
+
+    /// Regression R0604-PVACLI-DISCOVERY-TIMEOUT-PROTO-1.
+    /// One endpoint advertising both `tcp` and `tls` is two `(server, proto)`
+    /// identities; stale cleanup must surface both with their proto so the
+    /// caller can fire two *distinguishable* `Discovered::Timeout` events
+    /// (pvxs `tickBeaconClean` erases one entry per `(server, proto)`,
+    /// client.cpp:1295). A `(server, guid)`-only return collapsed them.
+    #[test]
+    fn prune_stale_distinguishes_protocols_on_one_endpoint() {
+        let t = BeaconTracker::new();
+        // Same endpoint + GUID, two protocols, two peerVersions.
+        assert_eq!(t.observe(addr(), "tcp", [7u8; 12], 2), BeaconAction::New);
+        assert_eq!(t.observe(addr(), "tls", [7u8; 12], 3), BeaconAction::New);
+        let mut pruned = t.prune_stale(Duration::from_secs(0));
+        assert_eq!(pruned.len(), 2, "tcp and tls must prune as two entries");
+        // Sort by proto for a deterministic assert.
+        pruned.sort_by(|a, b| a.1.cmp(&b.1));
+        let (tcp, tls) = (&pruned[0], &pruned[1]);
+        assert_eq!((tcp.0, tcp.1.as_str(), tcp.3), (addr(), "tcp", 2));
+        assert_eq!((tls.0, tls.1.as_str(), tls.3), (addr(), "tls", 3));
+        assert_ne!(
+            tcp.1, tls.1,
+            "the two timeouts must be distinguishable by proto"
+        );
+    }
+
+    /// Regression R0604-PVACLI-DISCOVERY-TIMEOUT-PROTO-1.
+    /// A `tls` GUID/peerVersion change is scoped to the `tls` identity: it
+    /// reports the *old* tls GUID+peerVersion for the Timeout and must NOT
+    /// retire the coexisting `tcp` identity (still `Update` on next beacon).
+    #[test]
+    fn proto_scoped_change_does_not_retire_sibling_proto() {
+        let t = BeaconTracker::new();
+        assert_eq!(t.observe(addr(), "tcp", [1u8; 12], 2), BeaconAction::New);
+        assert_eq!(t.observe(addr(), "tls", [1u8; 12], 2), BeaconAction::New);
+        // tls server restarts: new GUID + peerVersion on the tls identity.
+        assert_eq!(
+            t.observe(addr(), "tls", [2u8; 12], 3),
+            BeaconAction::Changed {
+                old_guid: [1u8; 12],
+                old_peer_version: 2,
+            },
+            "tls change carries the old tls GUID + peerVersion"
+        );
+        // The tcp identity is untouched — same GUID/version → Update.
+        assert_eq!(
+            t.observe(addr(), "tcp", [1u8; 12], 2),
+            BeaconAction::Update,
+            "a tls change must not retire or alter the tcp identity"
+        );
     }
 
     #[test]

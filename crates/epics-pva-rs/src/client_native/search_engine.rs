@@ -189,10 +189,21 @@ pub enum Discovered {
         proto: String,
     },
     /// A server we were tracking has stopped sending beacons for at
-    /// least `BEACON_TIMEOUT`. Mirrors pvxs `Discovered::Timeout`
-    /// (client.cpp:1272) — operators / dashboards use this to mark
-    /// servers as unreachable without waiting for a TCP error.
-    Timeout { server: SocketAddr, guid: [u8; 12] },
+    /// least `BEACON_TIMEOUT`, or a known `(server, proto)` reported a new
+    /// GUID/peerVersion (the old incarnation timed out). Mirrors pvxs
+    /// `Discovered::Timeout` (client.cpp:1272), which carries the full
+    /// beacon identity — including `proto` and `peer_version` — so a
+    /// consumer can retire the exact `(server, proto)` it tracked. Without
+    /// `proto`, a server advertising both `tcp` and `tls` at one endpoint
+    /// produces two indistinguishable timeouts and the consumer cannot tell
+    /// which protocol went away. `peer_version` is the PVA header version
+    /// of the *expired* incarnation (pvxs `cur.peerVersion`).
+    Timeout {
+        server: SocketAddr,
+        guid: [u8; 12],
+        proto: String,
+        peer_version: u8,
+    },
 }
 
 /// Maximum age of a beacon before the server is treated as offline.
@@ -1367,8 +1378,8 @@ async fn run_engine(
             }
 
             _ = beacon_clean_tick.tick() => {
-                for (server, guid) in beacons.prune_stale(BEACON_TIMEOUT) {
-                    let evt = Discovered::Timeout { server, guid };
+                for (server, proto, guid, peer_version) in beacons.prune_stale(BEACON_TIMEOUT) {
+                    let evt = Discovered::Timeout { server, guid, proto, peer_version };
                     publish_discovery(&mut subscribers, evt);
                 }
             }
@@ -1929,14 +1940,23 @@ fn emit_beacon_action(
             );
             true
         }
-        BeaconAction::Changed { old_guid } => {
+        BeaconAction::Changed {
+            old_guid,
+            old_peer_version,
+        } => {
             // pvxs emits a Timeout for the prior incarnation before the
-            // Online for the new one (client.cpp:814-844).
+            // Online for the new one (client.cpp:814-844). The Timeout
+            // carries the SAME proto as the new beacon (this is one
+            // `(server, proto)` identity changing GUID/version) and the
+            // *old* peerVersion (pvxs `cur.peerVersion`); `proto` is cloned
+            // because the Online below takes ownership of it.
             publish_discovery(
                 subscribers,
                 Discovered::Timeout {
                     server,
                     guid: old_guid,
+                    proto: proto.clone(),
+                    peer_version: old_peer_version,
                 },
             );
             publish_discovery(
@@ -3157,6 +3177,61 @@ mod tests {
             subs.is_empty(),
             "a closed receiver must unsubscribe the discovery operation"
         );
+    }
+
+    /// Regression R0604-PVACLI-DISCOVERY-TIMEOUT-PROTO-1.
+    /// A GUID/peerVersion change on the `tls` identity must emit
+    /// `Timeout{proto:"tls", ..}` carrying the OLD GUID + peerVersion, then
+    /// `Online{proto:"tls", ..}` for the new incarnation — mirroring pvxs
+    /// `onBeacon` (client.cpp:814-844). Before the fix the Timeout carried
+    /// no proto, so a consumer could not tell which protocol's incarnation
+    /// expired and a `tls` change was indistinguishable from a `tcp` one.
+    #[test]
+    fn changed_emits_proto_scoped_timeout_then_online() {
+        let server = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)), 5075);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 9)), 5076);
+        let (tx, mut rx) = mpsc::channel::<Discovered>(8);
+        let mut subs: Vec<mpsc::Sender<Discovered>> = vec![tx];
+
+        let poke = emit_beacon_action(
+            BeaconAction::Changed {
+                old_guid: [1u8; 12],
+                old_peer_version: 2,
+            },
+            server,
+            [2u8; 12], // new GUID
+            peer,
+            "tls".to_string(),
+            &mut subs,
+        );
+        assert!(poke, "a Change must poke pending searches");
+
+        // First event: Timeout for the OLD tls incarnation.
+        match rx.try_recv() {
+            Ok(Discovered::Timeout {
+                server: s,
+                guid,
+                proto,
+                peer_version,
+            }) => {
+                assert_eq!(s, server);
+                assert_eq!(guid, [1u8; 12], "Timeout carries the OLD guid");
+                assert_eq!(proto, "tls", "Timeout is scoped to the tls identity");
+                assert_eq!(peer_version, 2, "Timeout carries the OLD peerVersion");
+            }
+            other => panic!("expected Timeout{{proto:\"tls\"}} first, got {other:?}"),
+        }
+
+        // Second event: Online for the NEW tls incarnation, same proto.
+        match rx.try_recv() {
+            Ok(Discovered::Online { guid, proto, .. }) => {
+                assert_eq!(guid, [2u8; 12], "Online carries the NEW guid");
+                assert_eq!(proto, "tls");
+            }
+            other => panic!("expected Online{{proto:\"tls\"}} second, got {other:?}"),
+        }
+
+        assert!(rx.try_recv().is_err(), "exactly two events emitted");
     }
 
     /// PVA-RS-2026-05-28-114: a found=true SEARCH_RESPONSE is resolved

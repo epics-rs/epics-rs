@@ -31,6 +31,26 @@ pub enum FieldMapping {
     Const,
 }
 
+impl FieldMapping {
+    /// The lowercase mapping-type token pvxs prints for this mapping in
+    /// `Group::show` / `pvxgl`, mirroring `MappingInfo::name`
+    /// (`ioc/typeutils.cpp:65-77`). Used by the QSRV `pvxgl` diagnostic
+    /// instead of Rust's `{:?}` (which would emit the capitalized variant
+    /// names `Scalar`/`Plain`/… and break pvxs output compatibility).
+    /// Regression R0604-BRQSRV-PVXSL-PVXGL-DIAG-FORMAT-1.
+    pub fn pvxs_name(self) -> &'static str {
+        match self {
+            FieldMapping::Scalar => "scalar",
+            FieldMapping::Plain => "plain",
+            FieldMapping::Any => "any",
+            FieldMapping::Meta => "meta",
+            FieldMapping::Proc => "proc",
+            FieldMapping::Structure => "structure",
+            FieldMapping::Const => "const",
+        }
+    }
+}
+
 /// NormativeType classification derived from record type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NtType {

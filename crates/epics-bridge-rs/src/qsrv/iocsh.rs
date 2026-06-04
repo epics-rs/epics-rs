@@ -702,24 +702,43 @@ pub fn pvxsl_command(provider: Arc<BridgeProvider>) -> CommandDef {
             });
             names.sort();
             names.dedup();
-            // pvxs prints the SOURCE header only when the source has at
-            // least one name (`list.names && !list.names->empty()`).
-            if detail != 0 && !names.is_empty() {
-                ctx.println("------------------");
-                ctx.println("SOURCE: qsrv single records");
-                ctx.println("------------------");
-                ctx.println("RECORDS: ");
-            }
-            for n in names {
-                if detail != 0 {
-                    ctx.println(&format!("  {n}"));
-                } else {
-                    ctx.println(&n);
-                }
+            for line in pvxsl_lines(&names, detail) {
+                ctx.println(&line);
             }
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+/// Build the `pvxsl` output lines for a sorted, de-duplicated record-name
+/// list, mirroring pvxs `pvxsl` (`singlesourcehooks.cpp:33-65`). Split out
+/// of [`pvxsl_command`] so the exact pvxs-compatible text is unit-testable
+/// without capturing stdout.
+///
+/// pvxs prints the `SOURCE`/`RECORDS:` header only when the source has at
+/// least one name (`list.names && !list.names->empty()`), and the header
+/// line is `SOURCE: <record>@<ioid><dynamic>` (`:52`). The QSRV single
+/// source is registered as `qsrvSingle` at IOID 0 (`:159`) and its
+/// `onList()` reports a static record set (`List::dynamic` defaults false,
+/// `source.h:277`; `SingleSource::onList` returns `allRecords` unchanged,
+/// `singlesource.h:32`), so the ` [dynamic]` suffix is never appended.
+/// Regression R0604-BRQSRV-PVXSL-PVXGL-DIAG-FORMAT-1.
+fn pvxsl_lines(names: &[String], detail: i64) -> Vec<String> {
+    let mut out = Vec::new();
+    if detail != 0 && !names.is_empty() {
+        out.push("------------------".to_string());
+        out.push("SOURCE: qsrvSingle@0".to_string());
+        out.push("------------------".to_string());
+        out.push("RECORDS: ".to_string());
+    }
+    for n in names {
+        if detail != 0 {
+            out.push(format!("  {n}"));
+        } else {
+            out.push(n.clone());
+        }
+    }
+    out
 }
 
 /// `pvxgl [<level>] [<pattern>]` — list QSRV group PV names, optionally
@@ -754,52 +773,83 @@ pub fn pvxgl_command(provider: Arc<BridgeProvider>) -> CommandDef {
                 _ => "",
             };
             let groups = provider.groups();
-            let mut names: Vec<&String> = groups.keys().collect();
-            names.sort();
-            for name in names {
-                // empty pattern matches everything (pvxs `!pattern[0]`).
-                if !pattern.is_empty() && !glob_match(name, pattern) {
-                    continue;
-                }
-                ctx.println(name);
-                if level > 0 {
-                    let def = &groups[name];
-                    // pvxs `Group::show`: atomic flag + member count.
-                    ctx.println(&format!(
-                        "  Atomic Get/Put:{} Atomic Members:{}",
-                        if def.atomic { "yes" } else { "no" },
-                        def.members.len()
-                    ));
-                    if level > 1 {
-                        for m in &def.members {
-                            // "  grp.fld <mapping> id=foo chan=pv chan ..."
-                            let id = m
-                                .struct_id
-                                .as_ref()
-                                .map(|s| format!(" id={s}"))
-                                .unwrap_or_default();
-                            let chan = if m.channel.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" chan={}", m.channel)
-                            };
-                            let trig =
-                                if matches!(m.triggers, super::group_config::TriggerDef::None) {
-                                    ""
-                                } else {
-                                    " has triggers"
-                                };
-                            ctx.println(&format!(
-                                "  {}\t<{:?}>{id}{chan}{trig}",
-                                m.field_name, m.mapping
-                            ));
-                        }
-                    }
-                }
+            for line in pvxgl_lines(&groups, level, pattern) {
+                ctx.println(&line);
             }
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+/// Build the `pvxgl` output lines for a group-definition map, mirroring
+/// pvxs `pvxsgl` (`groupsourcehooks.cpp:50-83`) plus `Group::show`
+/// (`group.cpp:61-94`). Split out of [`pvxgl_command`] so the exact
+/// pvxs-compatible text is unit-testable without capturing stdout.
+///
+/// Groups are listed in sorted name order; an empty `pattern` matches
+/// every group (pvxs `!pattern[0]`). `level > 0` prints the atomic flag
+/// and member count; `level > 1` prints one line per member as
+/// `  <fieldName>\t<mappingName><id><chan><has triggers>` — the mapping
+/// token comes from [`FieldMapping::pvxs_name`] (lowercase, matching
+/// `MappingInfo::name`, `typeutils.cpp:65`), not Rust `Debug`. The
+/// ` has triggers` suffix and the `level > 2` per-trigger-target lines are
+/// both derived from the one resolved trigger set
+/// ([`GroupPvDef::resolved_trigger_targets`]) so they can never disagree,
+/// exactly as pvxs derives both from `field.triggers`.
+/// Regression R0604-BRQSRV-PVXSL-PVXGL-DIAG-FORMAT-1.
+fn pvxgl_lines(
+    groups: &std::collections::HashMap<String, super::group_config::GroupPvDef>,
+    level: i64,
+    pattern: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut names: Vec<&String> = groups.keys().collect();
+    names.sort();
+    for name in names {
+        if !pattern.is_empty() && !glob_match(name, pattern) {
+            continue;
+        }
+        out.push(name.clone());
+        if level > 0 {
+            let def = &groups[name];
+            out.push(format!(
+                "  Atomic Get/Put:{} Atomic Members:{}",
+                if def.atomic { "yes" } else { "no" },
+                def.members.len()
+            ));
+            if level > 1 {
+                for (idx, m) in def.members.iter().enumerate() {
+                    let id = m
+                        .struct_id
+                        .as_ref()
+                        .map(|s| format!(" id={s}"))
+                        .unwrap_or_default();
+                    let chan = if m.channel.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" chan={}", m.channel)
+                    };
+                    let targets = def.resolved_trigger_targets(idx);
+                    let trig = if targets.is_empty() {
+                        ""
+                    } else {
+                        " has triggers"
+                    };
+                    out.push(format!(
+                        "  {}\t<{}>{id}{chan}{trig}",
+                        m.field_name,
+                        m.mapping.pvxs_name()
+                    ));
+                    if level > 2 {
+                        for t in &targets {
+                            out.push(format!("    {t}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Port of EPICS Base `epicsStrGlobMatch` (`misc/epicsString.c`):
@@ -956,6 +1006,120 @@ mod tests {
         assert!(!glob_match("TEST:grp", "TEST:gr"));
         assert!(!glob_match("abc", "a?"));
         assert!(glob_match("", "*"));
+    }
+
+    /// Borrow a `Vec<String>` as `Vec<&str>` for exact-output assertions
+    /// against string-literal arrays.
+    fn as_strs(v: &[String]) -> Vec<&str> {
+        v.iter().map(String::as_str).collect()
+    }
+
+    fn groups_from_json(
+        json: &str,
+    ) -> std::collections::HashMap<String, super::super::group_config::GroupPvDef> {
+        super::super::group_config::parse_group_config(json)
+            .unwrap()
+            .into_iter()
+            .map(|d| (d.name.clone(), d))
+            .collect()
+    }
+
+    /// Regression R0604-BRQSRV-PVXSL-PVXGL-DIAG-FORMAT-1.
+    ///
+    /// `pvxsl 1` prints the pvxs source identity `SOURCE: qsrvSingle@0`
+    /// (singlesourcehooks.cpp:52 with the `qsrvSingle`/IOID-0 registration
+    /// at :159 and a static, non-dynamic `onList()`), inside the
+    /// `------`/`RECORDS:` frame — not the Rust-only
+    /// `SOURCE: qsrv single records`. `pvxsl 0` prints bare names. The
+    /// header is suppressed when the source serves no names
+    /// (`list.names && !list.names->empty()`).
+    #[test]
+    fn pvxsl_lines_match_pvxs_source_identity() {
+        let names = vec!["REC:a".to_string(), "REC:b".to_string()];
+        assert_eq!(as_strs(&pvxsl_lines(&names, 0)), ["REC:a", "REC:b"]);
+        assert_eq!(
+            as_strs(&pvxsl_lines(&names, 1)),
+            [
+                "------------------",
+                "SOURCE: qsrvSingle@0",
+                "------------------",
+                "RECORDS: ",
+                "  REC:a",
+                "  REC:b",
+            ]
+        );
+        // No names -> no SOURCE header at all.
+        assert!(pvxsl_lines(&[], 1).is_empty());
+    }
+
+    /// Regression R0604-BRQSRV-PVXSL-PVXGL-DIAG-FORMAT-1.
+    ///
+    /// `pvxgl 2` prints each member mapping through the lowercase
+    /// `MappingInfo::name()` spelling (`<scalar>`/`<plain>`/`<meta>`/
+    /// `<const>`/`<structure>`), mirroring pvxs `Group::show`
+    /// (group.cpp:73-80; typeutils.cpp:65) — never the capitalized Rust
+    /// `Debug` variant names. Channel-less `const`/`structure` members
+    /// carry no `chan=` and (being `TriggerDef::None`) no ` has triggers`.
+    #[test]
+    fn pvxgl_lines_mapping_names_lowercase_like_pvxs() {
+        let json = r#"{
+            "TEST:grp": {
+                "+id": "epics:nt/NTTable:1.0",
+                "+atomic": true,
+                "s": { "+channel": "REC:s.VAL", "+type": "scalar" },
+                "p": { "+channel": "REC:p.VAL", "+type": "plain" },
+                "m": { "+channel": "REC:m.VAL", "+type": "meta" },
+                "k": { "+const": 7, "+type": "const" },
+                "n": { "+type": "structure" }
+            }
+        }"#;
+        let groups = groups_from_json(json);
+        // Members are emitted in canonical (put_order, field_name) order;
+        // none carry +putorder, so the order is alphabetical by field name.
+        assert_eq!(
+            as_strs(&pvxgl_lines(&groups, 2, "")),
+            [
+                "TEST:grp",
+                "  Atomic Get/Put:yes Atomic Members:5",
+                "  k\t<const>",
+                "  m\t<meta> chan=REC:m.VAL has triggers",
+                "  n\t<structure>",
+                "  p\t<plain> chan=REC:p.VAL has triggers",
+                "  s\t<scalar> chan=REC:s.VAL has triggers",
+            ]
+        );
+    }
+
+    /// Regression R0604-BRQSRV-PVXSL-PVXGL-DIAG-FORMAT-1.
+    ///
+    /// `pvxgl 3` prints, under each member, one line per resolved
+    /// `+trigger` target field name, mirroring pvxs `Group::show`
+    /// level>2 (group.cpp:81-92). Targets are sorted to match pvxs's
+    /// `std::set<std::string>` ordering. A member with an explicit
+    /// `+trigger` in a group that has triggers keeps its targets; a
+    /// sibling without one is demoted to silence (`resolve_self_trigger_
+    /// default`) and shows neither ` has triggers` nor target lines.
+    #[test]
+    fn pvxgl_lines_level3_prints_trigger_targets() {
+        let json = r#"{
+            "TRIG:grp": {
+                "+atomic": true,
+                "a": { "+channel": "REC:a.VAL", "+type": "scalar", "+trigger": "a,b" },
+                "b": { "+channel": "REC:b.VAL", "+type": "scalar" }
+            }
+        }"#;
+        let groups = groups_from_json(json);
+        assert_eq!(
+            as_strs(&pvxgl_lines(&groups, 3, "")),
+            [
+                "TRIG:grp",
+                "  Atomic Get/Put:yes Atomic Members:2",
+                "  a\t<scalar> chan=REC:a.VAL has triggers",
+                "    a",
+                "    b",
+                "  b\t<scalar> chan=REC:b.VAL",
+            ]
+        );
     }
 
     #[test]

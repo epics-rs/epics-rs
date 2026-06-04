@@ -151,6 +151,52 @@ impl GroupPvDef {
             }
         }
     }
+
+    /// Resolved `+trigger` target field names for member `idx`, mirroring
+    /// the pvxs `field.triggers` set built by `initialiseTriggers`
+    /// (`groupconfigprocessor.cpp:536-560`): the group fields *with a
+    /// channel* whose mappings a change on this member posts. A
+    /// channel-less source posts nothing (pvxs's outer
+    /// `!fieldDefinition.channel.empty()` guard); `SelfOnly` resolves to
+    /// the member's own field, `All` (`"*"`) to every channeled member,
+    /// `Fields` to the named channeled members (unknown/channel-less refs
+    /// dropped, as pvxs `defineGroupTriggers` does at `:385-409`), and
+    /// `None` to the empty set.
+    ///
+    /// Returned sorted by field name to match pvxs's
+    /// `TriggerNames = std::set<std::string>` ordering
+    /// (`fielddefinition.h:24`), so the `pvxgl <level>3` detail output is
+    /// byte-identical to pvxs `Group::show`. Shares the channeled-target
+    /// rules with the monitor mark path
+    /// ([`super::group::GroupMonitor::value_event_mark`]).
+    /// Regression R0604-BRQSRV-PVXSL-PVXGL-DIAG-FORMAT-1.
+    pub fn resolved_trigger_targets(&self, idx: usize) -> Vec<&str> {
+        let Some(source) = self.members.get(idx) else {
+            return Vec::new();
+        };
+        // pvxs only builds a trigger set for channel-bearing source fields.
+        if source.channel.is_empty() {
+            return Vec::new();
+        }
+        let mut targets: Vec<&str> = match &source.triggers {
+            TriggerDef::None => return Vec::new(),
+            TriggerDef::SelfOnly => vec![source.field_name.as_str()],
+            TriggerDef::All => self
+                .members
+                .iter()
+                .filter(|m| !m.channel.is_empty())
+                .map(|m| m.field_name.as_str())
+                .collect(),
+            TriggerDef::Fields(refs) => self
+                .members
+                .iter()
+                .filter(|m| !m.channel.is_empty() && refs.iter().any(|r| r == &m.field_name))
+                .map(|m| m.field_name.as_str())
+                .collect(),
+        };
+        targets.sort_unstable();
+        targets
+    }
 }
 
 /// Defines which group fields are updated when a member's source record changes.

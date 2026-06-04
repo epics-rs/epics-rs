@@ -191,8 +191,14 @@ pub fn negotiated_queue_size(pv_request: &PvStructure) -> i32 {
 
 /// stamp `record._options.queueSize` (int) and
 /// `record._options.atomic` (boolean) onto a group GET / MONITOR
-/// value. Adds them at the root, replacing the previous values if
-/// `_options` already exists (e.g. composed by an earlier read).
+/// value. Merged under the existing `record` structure (replacing only
+/// the `_options` subtree if it already exists, e.g. composed by an
+/// earlier read), so any user-configured `record.*` member — a group
+/// field mapped under `record`, such as `record.status` — is preserved.
+/// pvxs adds the built-in `record._options` branch to the same member
+/// vector and `TypeDef::_append()` recursively merges matching compound
+/// children (ioc/groupconfigprocessor.cpp:499-519, src/type.cpp:374-389);
+/// a whole-`record` replacement would drop those user fields.
 ///
 /// `queue_size` is the negotiated monitor queue depth (see
 /// [`negotiated_queue_size`]) on the MONITOR path; the GET path passes
@@ -209,36 +215,30 @@ pub fn push_record_options(pv: &mut PvStructure, atomic: bool, queue_size: i32) 
         "atomic".into(),
         PvField::Scalar(ScalarValue::Boolean(atomic)),
     ));
-    let mut record = PvStructure::new("");
-    record
-        .fields
-        .push(("_options".into(), PvField::Structure(options)));
-    let record_field = PvField::Structure(record);
-    if let Some(pos) = pv.fields.iter().position(|(n, _)| n == "record") {
-        pv.fields[pos].1 = record_field;
-    } else {
-        pv.fields.push(("record".into(), record_field));
-    }
+    // Merge the built-in options under `record._options`, navigating into
+    // an existing `record` structure and replacing only the `_options`
+    // child — user `record.*` siblings are left intact.
+    set_nested_field(pv, "record._options", PvField::Structure(options));
 }
 
 /// Descriptor twin of [`push_record_options`]: the introspection shape
-/// of the built-in `record._options` subtree (`queueSize` int,
-/// `atomic` boolean). pvxs builds this branch into `group.valueTemplate`
-/// (ioc/groupconfigprocessor.cpp:499-523), so CREATE_CHANNEL / GET_FIELD
-/// negotiation advertises it and every GET/MONITOR value conforms.
-/// Keep the field names and scalar types here in lockstep with
-/// `push_record_options` so the descriptor never diverges from the value.
-fn record_options_field_desc() -> FieldDesc {
-    let options = FieldDesc::Structure {
+/// of the built-in `record._options` subtree *content* (`queueSize` int,
+/// `atomic` boolean). The caller merges it under `record._options` via
+/// `set_nested_field_desc`, so any user `record.*` member descriptor is
+/// preserved. pvxs builds this branch into
+/// `group.valueTemplate` via a recursive `TypeDef::_append()` merge
+/// (ioc/groupconfigprocessor.cpp:499-523, src/type.cpp:374-389), so
+/// CREATE_CHANNEL / GET_FIELD negotiation advertises it and every
+/// GET/MONITOR value conforms. Keep the field names and scalar types here
+/// in lockstep with `push_record_options` so the descriptor never
+/// diverges from the value.
+fn record_options_inner_field_desc() -> FieldDesc {
+    FieldDesc::Structure {
         struct_id: String::new(),
         fields: vec![
             ("queueSize".into(), FieldDesc::Scalar(ScalarType::Int)),
             ("atomic".into(), FieldDesc::Scalar(ScalarType::Boolean)),
         ],
-    };
-    FieldDesc::Structure {
-        struct_id: String::new(),
-        fields: vec![("_options".into(), options)],
     }
 }
 
@@ -1656,16 +1656,19 @@ impl super::provider::Channel for GroupChannel {
             set_member_field_desc(&mut fields, member, desc);
         }
 
-        // Advertise the built-in `record._options` branch the value
-        // side stamps via push_record_options, placed last to match the
-        // value's field order (the value adds `record` after members).
-        // pvxs carries it in group.valueTemplate so descriptor and
-        // payload agree (groupconfigprocessor.cpp:499-523).
-        if let Some(pos) = fields.iter().position(|(n, _)| n == "record") {
-            fields[pos].1 = record_options_field_desc();
-        } else {
-            fields.push(("record".into(), record_options_field_desc()));
-        }
+        // Advertise the built-in `record._options` branch the value side
+        // stamps via push_record_options. Merge it under `record` (adding
+        // `record` after members if absent, else descending into the
+        // user-built `record` and replacing only the `_options` child) so
+        // a user `record.*` member descriptor is preserved and descriptor
+        // and payload agree. pvxs carries it in group.valueTemplate via a
+        // recursive `TypeDef::_append()` merge, not a whole-`record`
+        // replacement (groupconfigprocessor.cpp:499-523, type.cpp:374-389).
+        set_nested_field_desc(
+            &mut fields,
+            "record._options",
+            record_options_inner_field_desc(),
+        );
 
         Ok(FieldDesc::Structure {
             struct_id: struct_id.into(),
@@ -3196,6 +3199,77 @@ mod tests {
                 "proc member without +putorder must process its record (atomic={atomic})"
             );
         }
+    }
+
+    /// Regression R0604-BRQSRV-RECORD-OPTIONS-MERGE-1. A group member
+    /// mapped under `record.*` (e.g. `record.status`) must survive
+    /// alongside the built-in `record._options` branch in both the
+    /// composed value (GET/MONITOR share `read_group`) and the
+    /// introspected descriptor (GET_FIELD). pvxs adds the built-in
+    /// `record._options` to the same member vector and `TypeDef::_append()`
+    /// recursively merges matching compound children
+    /// (groupconfigprocessor.cpp:499-519, type.cpp:374-389). The prior
+    /// Rust path replaced the whole `record` field with one containing
+    /// only `_options`, dropping the user member from value, descriptor,
+    /// and (via the descriptor) PUT.
+    #[tokio::test]
+    async fn group_record_member_survives_record_options_merge() {
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("RM:rec", Box::new(AiRecord::new(1.5)))
+            .await
+            .unwrap();
+        // A normal member plus one mapped under `record.status`.
+        let cfg = r#"{ "RM:GRP": {
+            "v": {"+type": "plain", "+channel": "RM:rec.VAL"},
+            "record.status": {"+type": "plain", "+channel": "RM:rec.VAL"}
+        } }"#;
+        let mut defs = super::super::group_config::parse_group_config(cfg).unwrap();
+        let def = defs.pop().unwrap();
+        let channel = GroupChannel::new(db.clone(), def);
+
+        // value path (GET / MONITOR share read_group): the user
+        // `record.status` member and the built-in `record._options`
+        // both survive under one `record` branch.
+        let value = channel.read_group().await.expect("group read_group");
+        let Some(PvField::Structure(record)) = value.get_field("record") else {
+            panic!("record branch must be a structure: {value:?}");
+        };
+        assert!(
+            record.get_field("status").is_some(),
+            "user record.status member must survive the options merge: {record:?}"
+        );
+        assert!(
+            matches!(record.get_field("_options"), Some(PvField::Structure(_))),
+            "built-in record._options must be present: {record:?}"
+        );
+
+        // descriptor path (GET_FIELD): the same invariant for the
+        // advertised type, so PUT clients can address record.status.
+        let desc = channel.get_field().await.expect("group get_field");
+        let FieldDesc::Structure { fields, .. } = &desc else {
+            panic!("group descriptor must be a structure");
+        };
+        let record_desc = &fields
+            .iter()
+            .find(|(n, _)| n == "record")
+            .expect("record descriptor present")
+            .1;
+        let FieldDesc::Structure {
+            fields: rfields, ..
+        } = record_desc
+        else {
+            panic!("record descriptor must be a structure");
+        };
+        assert!(
+            rfields.iter().any(|(n, _)| n == "status"),
+            "record.status descriptor must survive the options merge: {rfields:?}"
+        );
+        assert!(
+            rfields.iter().any(|(n, _)| n == "_options"),
+            "built-in record._options descriptor must be present: {rfields:?}"
+        );
     }
 
     /// A QSRV group scalar member must derive its NT shape and DBF type

@@ -457,8 +457,12 @@ pub fn event_provider_name() -> Option<String> {
 
 /// Format a `SystemTime` the way C `generalTimeReport` does
 /// (`epicsTimeToStrftime` with `"%Y-%m-%d %H:%M:%S.%06f"`).
+///
+/// `epicsTimeToStrftime` converts via `epicsTime_localtime` -> `localtime_r`
+/// (epicsTime.cpp:202 -> :318, osdTime.cpp:82), i.e. LOCAL wall-clock, not
+/// UTC — so this uses `chrono::Local` to match the C report output.
 fn format_time_sample(t: SystemTime) -> String {
-    let dt: chrono::DateTime<chrono::Utc> = t.into();
+    let dt: chrono::DateTime<chrono::Local> = t.into();
     dt.format("%Y-%m-%d %H:%M:%S.%6f").to_string()
 }
 

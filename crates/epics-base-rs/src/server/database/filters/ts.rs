@@ -109,15 +109,24 @@ fn ts_parts(t: std::time::SystemTime, epoch: TsEpoch) -> (i64, u32) {
 }
 
 fn format_epics_string(t: std::time::SystemTime) -> String {
-    use chrono::{DateTime, Utc};
+    use chrono::{DateTime, Local, Utc};
     let unix_secs = t
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
-    let dt: DateTime<Utc> =
+    let utc: DateTime<Utc> =
         DateTime::from_timestamp(unix_secs.trunc() as i64, ((unix_secs.fract()) * 1e9) as u32)
             .unwrap_or_else(Utc::now);
-    dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+    // C `tsStringEpics` formats through `epicsTimeToStrftime`, which
+    // converts via `epicsTime_localtime` -> `localtime_r` (ts.c:247,
+    // epicsTime.cpp:202 -> :318, osdTime.cpp:82): LOCAL wall-clock, same as
+    // `tsStringIso`. The two modes differ ONLY by the separator (space vs
+    // `T`) and the zoneless layout (no `%z`), never by timezone — so this
+    // mirrors `format_iso_string`'s `with_timezone(&Local)` rather than
+    // formatting UTC directly.
+    utc.with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M:%S%.6f")
+        .to_string()
 }
 
 fn format_iso_string(t: std::time::SystemTime) -> String {
@@ -331,23 +340,92 @@ mod tests {
     }
 
     /// `str=epics` returns a formatted `YYYY-MM-DD HH:MM:SS.ffffff` string.
+    /// Timezone-independent structural assertions: `format_epics_string`
+    /// now renders LOCAL wall-clock (C `epicsTimeToStrftime`), so the date
+    /// and time fields depend on the host zone — pin only the shape
+    /// (`\d{4}-\d\d-\d\d \d\d:\d\d:\d\d.123456`, zoneless, no `T`), not a
+    /// UTC-derived date.
     #[test]
     fn string_mode_formats_epics_style() {
-        // 2024-01-15 12:34:56.123456 UTC
+        // 2024-01-15 12:34:56.123456 UTC (local wall-clock varies by zone).
         let secs_since_unix = 1_705_322_096_u64;
         let ts = SystemTime::UNIX_EPOCH + Duration::new(secs_since_unix, 123_456_000);
         let f = TimestampFilter::with_mode(TsMode::StringEpics);
         let out = f.apply(make_event(ts)).unwrap();
         match out.event.snapshot.value {
             EpicsValue::String(s) => {
-                // Sanity: contains the date and the microsecond fraction.
                 let s = s.as_str_lossy();
+                assert!(s.ends_with(".123456"), "must keep microseconds: {s}");
                 assert!(
-                    s.starts_with("2024-01-15") && s.contains(".123456"),
-                    "unexpected format: {s}"
+                    !s.contains('T'),
+                    "epics format must not use a T separator: {s}"
                 );
+                let bytes = s.as_bytes();
+                // "YYYY-MM-DD HH:MM:SS.ffffff" — digits/separators at fixed
+                // offsets, regardless of the host timezone.
+                assert_eq!(s.len(), 26, "unexpected length: {s}");
+                for (i, c) in s.char_indices() {
+                    let ok = match i {
+                        4 | 7 => c == '-',
+                        10 => c == ' ',
+                        13 | 16 => c == ':',
+                        19 => c == '.',
+                        _ => c.is_ascii_digit(),
+                    };
+                    assert!(ok, "char {i} ({c:?}) breaks the epics layout: {s}");
+                }
+                let _ = bytes;
             }
             other => panic!("expected String, got {other:?}"),
+        }
+    }
+
+    /// C `tsStringEpics` and `tsStringIso` BOTH format through
+    /// `epicsTimeToStrftime` -> `epicsTime_localtime` -> `localtime_r`
+    /// (ts.c:247/250, epicsTime.cpp:202 -> :318, osdTime.cpp:82): LOCAL
+    /// wall-clock. The two layouts differ ONLY by separator (space vs `T`)
+    /// and the ISO `%z` zone suffix — never by timezone. Earlier the epics
+    /// path formatted UTC, diverging from C in any non-UTC host zone.
+    #[test]
+    fn string_epics_and_iso_share_local_wallclock() {
+        // Force a fixed non-UTC zone (UTC+9, no DST) so the divergence is
+        // deterministic regardless of the host zone. nextest runs each test
+        // in its own process, so this `set_var` is read fresh before the
+        // first `chrono::Local` conversion in this process. POSIX `XXX-9`
+        // needs no tzdata files.
+        unsafe { std::env::set_var("TZ", "XXX-9") }
+
+        // 2024-01-15 12:34:56.123456 UTC == 2024-01-15 21:34:56.123456 +0900
+        let ts = SystemTime::UNIX_EPOCH + Duration::new(1_705_322_096, 123_456_000);
+        let extract = |mode| match TimestampFilter::with_mode(mode)
+            .apply(make_event(ts))
+            .unwrap()
+            .event
+            .snapshot
+            .value
+        {
+            EpicsValue::String(s) => s.as_str_lossy().into_owned(),
+            other => panic!("expected String, got {other:?}"),
+        };
+        let epics = extract(TsMode::StringEpics);
+        let iso = extract(TsMode::StringIso);
+
+        // iso normalized to the epics layout: T -> space, drop 5-char %z.
+        let iso_norm = iso.replace('T', " ");
+        let iso_norm = &iso_norm[..iso_norm.len() - 5];
+        assert_eq!(
+            epics, iso_norm,
+            "epics and iso string modes must render the SAME local wall-clock"
+        );
+
+        // When the host honored TZ=UTC+9 (nextest process isolation), the
+        // local wall-clock is the UTC instant + 9h. This deterministically
+        // catches a UTC-formatting regression even on a UTC CI host.
+        if iso.ends_with("+0900") {
+            assert!(
+                epics.starts_with("2024-01-15 21:34:56.123456"),
+                "epics must show the +09:00 local wall-clock, got {epics}"
+            );
         }
     }
 

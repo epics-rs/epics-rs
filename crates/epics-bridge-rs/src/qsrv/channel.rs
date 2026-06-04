@@ -73,6 +73,32 @@ fn dbe_value_class_mask(raw: u16) -> u16 {
     }
 }
 
+/// Coerce a numeric or boolean PVA scalar DBE option to its
+/// `uint8_t`-equivalent value, mirroring pvxs's `fld.as<uint8_t>()`
+/// (singlesource.cpp:134). pvxs's `Value::as<uint8_t>()` routes real,
+/// signed, unsigned, and bool storage through one `copyOutScalar()` path
+/// that narrows to `uint8_t` (data.cpp:402-435), so every numeric scalar
+/// variant must map the same way — not only `Int`/`Long`. The narrowing
+/// `as u8` reproduces C's `(uint8_t)` truncation (DBE bits live in the low
+/// nibble, so the high bits pvxs discards are irrelevant). `String` is
+/// parsed separately by the substring path and so yields `None` here.
+fn dbe_scalar_as_u8(sv: &ScalarValue) -> Option<u8> {
+    Some(match sv {
+        ScalarValue::Boolean(b) => *b as u8,
+        ScalarValue::Byte(n) => *n as u8,
+        ScalarValue::Short(n) => *n as u8,
+        ScalarValue::Int(n) => *n as u8,
+        ScalarValue::Long(n) => *n as u8,
+        ScalarValue::UByte(n) => *n,
+        ScalarValue::UShort(n) => *n as u8,
+        ScalarValue::UInt(n) => *n as u8,
+        ScalarValue::ULong(n) => *n as u8,
+        ScalarValue::Float(n) => *n as u8,
+        ScalarValue::Double(n) => *n as u8,
+        ScalarValue::String(_) => return None,
+    })
+}
+
 /// parse `record._options.DBE` from a MONITOR INIT pvRequest into the
 /// value-subscription mask. Returns `None` only when the option is
 /// absent; a present option always resolves to a non-empty value-class
@@ -107,12 +133,18 @@ pub fn dbe_mask_from_pv_request(request: &PvStructure) -> Option<u16> {
     // leak into the value subscription.
     let raw = match dbe {
         PvField::Scalar(ScalarValue::String(s)) => s.as_str_lossy().into_owned(),
-        PvField::Scalar(ScalarValue::Int(n)) => {
-            return Some(dbe_value_class_mask((*n as u32 & 0xFFFF) as u16));
-        }
-        PvField::Scalar(ScalarValue::Long(n)) => {
-            return Some(dbe_value_class_mask((*n as u32 & 0xFFFF) as u16));
-        }
+        // pvxs reads a numeric/bool DBE option as `fld.as<uint8_t>()`
+        // (singlesource.cpp:134) whenever the field kind is Integer or Real;
+        // `Value::as<uint8_t>()` coerces real, signed, unsigned, and bool
+        // storage through one `copyOutScalar()` path (data.cpp:402-435).
+        // Mirror that for every numeric scalar variant — not just Int/Long —
+        // so a `UInt`/`UByte`/`Short`/`Double`/`Boolean` DBE selects the
+        // requested value class instead of falling through to the default
+        // VALUE|ALARM mask.
+        PvField::Scalar(sv) => match dbe_scalar_as_u8(sv) {
+            Some(n) => return Some(dbe_value_class_mask(n as u16)),
+            None => return None,
+        },
         _ => return None,
     };
 
@@ -1132,6 +1164,51 @@ mod tests {
     fn dbe_mask_absent_returns_none() {
         let req = PvStructure::new("request");
         assert!(dbe_mask_from_pv_request(&req).is_none());
+    }
+
+    /// Regression R0604-BRQSRV-DBE-COERCE-1. A numeric `record._options.DBE`
+    /// option must select the requested value class regardless of which PVA
+    /// numeric scalar type carries it. pvxs reads the field as
+    /// `fld.as<uint8_t>()` (singlesource.cpp:134), coercing every Integer/Real
+    /// (and bool) storage through one `copyOutScalar()` path
+    /// (data.cpp:402-435). Before the fix only `Int`/`Long` were handled and
+    /// every other numeric/bool scalar fell to `None`, so the monitor
+    /// silently used the default `VALUE|ALARM` (5) mask. Each value below
+    /// resolves to a class distinct from that default, proving the coercion
+    /// actually ran (pre-fix the function returns `None` and the
+    /// `unwrap`/panic below fires).
+    #[test]
+    fn dbe_numeric_coerces_every_scalar_variant() {
+        use epics_base_rs::server::recgbl::EventMask;
+        let cases = [
+            (PvField::Scalar(ScalarValue::UInt(2)), EventMask::LOG.bits()),
+            (
+                PvField::Scalar(ScalarValue::UByte(4)),
+                EventMask::ALARM.bits(),
+            ),
+            (
+                PvField::Scalar(ScalarValue::Short(2)),
+                EventMask::LOG.bits(),
+            ),
+            (
+                PvField::Scalar(ScalarValue::Double(2.0)),
+                EventMask::LOG.bits(),
+            ),
+            (
+                PvField::Scalar(ScalarValue::Boolean(true)),
+                EventMask::VALUE.bits(),
+            ),
+        ];
+        for (field, expected) in cases {
+            let label = format!("{field:?}");
+            let req = req_with_dbe(field);
+            let mask = dbe_mask_from_pv_request(&req)
+                .unwrap_or_else(|| panic!("DBE {label} must coerce to a value-class mask"));
+            assert_eq!(
+                mask, expected,
+                "DBE {label} resolved to the wrong value mask"
+            );
+        }
     }
 
     fn req_with_atomic(value: PvField) -> PvStructure {

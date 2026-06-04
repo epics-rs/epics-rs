@@ -966,6 +966,17 @@ struct ChannelState {
     /// can show per-channel byte counters (pvxs `chan->statTx/statRx`,
     /// server.cpp:260-268).
     stat: Arc<crate::server_native::peers::ChannelStat>,
+    /// Credential snapshot taken when this channel was CREATED, used for
+    /// the channel *lifecycle* callbacks (`notify_channel_open` /
+    /// `notify_channel_close`) and nothing else. pvxs builds the channel's
+    /// `ServerChannelControl` with `conn->cred` at CREATE_CHANNEL
+    /// (`serverchan.cpp:62`); a later re-auth that reassigns `ServerConn::cred`
+    /// does NOT rewrite the credential captured by an already-open channel
+    /// control. Per-operation handlers still use the connection's *current*
+    /// credential (pvxs builds each `ConnectOp`/`ExecOp` from `conn->cred`),
+    /// so only the open/close edges are pinned here (Regression
+    /// R0604-PVASRV-REAUTH-CHANNEL-LIFECYCLE-CRED-1).
+    open_cred: ClientCredentials,
     /// ioid → (introspection negotiated for this op, kind)
     ops: HashMap<u32, OpState>,
 }
@@ -982,6 +993,7 @@ impl std::fmt::Debug for ChannelState {
             .field("introspection", &self.introspection)
             .field("source", &"<bound owner>")
             .field("stat", &self.stat)
+            .field("open_cred", &self.open_cred)
             .field("ops", &self.ops)
             .finish()
     }
@@ -2546,6 +2558,13 @@ struct CreateChannelCompletion {
     cid: u32,
     sid: u32,
     name: String,
+    /// Credential in force when CREATE_CHANNEL was dispatched, captured
+    /// before the async resolver runs and carried back so the channel's
+    /// lifecycle callbacks use the credential the channel was opened under —
+    /// not whatever the connection re-authenticated to while the resolver
+    /// was still running (pvxs `serverchan.cpp:62`; Regression
+    /// R0604-PVASRV-REAUTH-CHANNEL-LIFECYCLE-CRED-1).
+    open_cred: ClientCredentials,
     /// `Some` → PV was found; carries the negotiated descriptor and the
     /// owner source bound into the channel. `None` → not found; emit an
     /// error response and insert no channel. Folding "found" and "owner"
@@ -2880,6 +2899,7 @@ async fn handle_connection_io(
                             introspection: resolved.intro,
                             source: resolved.owner,
                             stat: stat.clone(),
+                            open_cred: cc.open_cred,
                             ops: HashMap::new(),
                         });
                         // Register the channel (live + lifetime counts and
@@ -2893,7 +2913,12 @@ async fn handle_connection_io(
                         // GET/PUT/RPC/GET_FIELD-only client drives lazy open
                         // too. Paired with `close_channel`'s onClose.
                         if let Some(ch) = channels.get(&cc.sid) {
-                            let ctx = channel_lifecycle_ctx(peer, &cred);
+                            // Pinned to the channel's CREATE-time credential, not
+                            // the connection's current `cred` — a re-auth between
+                            // CREATE dispatch and this completion must not change
+                            // which identity the source sees the channel open under
+                            // (Regression R0604-PVASRV-REAUTH-CHANNEL-LIFECYCLE-CRED-1).
+                            let ctx = channel_lifecycle_ctx(peer, &ch.open_cred);
                             ch.source.notify_channel_open(&ch.name, &ctx);
                         }
                     } else {
@@ -2982,9 +3007,7 @@ async fn handle_connection_io(
                         let teardown = ChannelTeardownCtx {
                             tx: &tx,
                             order,
-                            peer,
-                            cred: &cred,
-                            peer_entry: &peer_entry,
+                            peer,                            peer_entry: &peer_entry,
                         };
                         invalidate_named_channels(&pv, &mut channels, &teardown).await;
                     }
@@ -3174,9 +3197,7 @@ async fn handle_connection_io(
                 let teardown = ChannelTeardownCtx {
                     tx: &tx,
                     order,
-                    peer,
-                    cred: &cred,
-                    peer_entry: &peer_entry,
+                    peer,                    peer_entry: &peer_entry,
                 };
                 handle_destroy_channel(&frame, &mut channels, &teardown).await?;
             }
@@ -3434,7 +3455,7 @@ async fn handle_connection_io(
     // letting the map's `Drop` free the ops silently) is what delivers
     // the close notification the implicit `Drop` cannot.
     for (_sid, ch) in channels.drain() {
-        close_channel(ch, peer, &cred);
+        close_channel(ch, peer);
     }
     conn_result
 }
@@ -4830,15 +4851,17 @@ async fn handle_create_channel(
         // pvxs builds `ServerChannelControl` with `conn->cred`
         // (`serverchan.cpp:62`). `pv_request` is `None` — CREATE_CHANNEL
         // carries no per-op pvRequest.
-        let conn_ctx = crate::server_native::source::ChannelContext {
-            peer,
-            account: cred.account.clone(),
-            method: cred.method.clone(),
-            host: cred.host.clone(),
-            authority: cred.authority.clone(),
-            roles: cred.roles.clone(),
-            pv_request: None,
-        };
+        //
+        // Snapshot the credential in force NOW, before the resolver runs:
+        // the channel is created under this identity and its lifecycle
+        // callbacks must use it even if the connection re-authenticates to a
+        // different identity while the resolver is still in flight. The
+        // snapshot rides back in each completion and is stored on the channel
+        // (Regression R0604-PVASRV-REAUTH-CHANNEL-LIFECYCLE-CRED-1). The
+        // resolver's `ChannelContext` is built from the same snapshot, so
+        // resolution and the open callback agree.
+        let open_cred = cred.clone();
+        let conn_ctx = channel_lifecycle_ctx(peer, &open_cred);
         tokio::spawn(async move {
             for (cid, sid, nm) in batch {
                 let resolved = if src.has_pv_checked(&nm, conn_ctx.clone()).await {
@@ -4863,6 +4886,7 @@ async fn handle_create_channel(
                         cid,
                         sid,
                         name: nm,
+                        open_cred: open_cred.clone(),
                         resolved,
                     })
                     .await;
@@ -4896,32 +4920,43 @@ fn channel_lifecycle_ctx(
 /// source, in pvxs `ServerChan::cleanup` order: drop the per-op state
 /// first — aborting any monitor subscriber tasks and releasing
 /// source-side subscriptions — then notify the source exactly once
-/// (`serverchan.cpp:43-60`, `:115-127`). `peer`/`cred` reconstruct the
-/// connection-scoped identity the channel was opened under.
-fn close_channel(ch: ChannelState, peer: SocketAddr, cred: &ClientCredentials) {
+/// (`serverchan.cpp:43-60`, `:115-127`). `peer` plus the channel's stored
+/// `open_cred` reconstruct the identity the channel was *created* under —
+/// pvxs delivers `onClose` with the channel-control credential
+/// (`serverchan.cpp:62`), so a re-auth between open and teardown must not
+/// change the close identity (Regression
+/// R0604-PVASRV-REAUTH-CHANNEL-LIFECYCLE-CRED-1).
+fn close_channel(ch: ChannelState, peer: SocketAddr) {
     let ChannelState {
-        name, source, ops, ..
+        name,
+        source,
+        open_cred,
+        ops,
+        ..
     } = ch;
     drop(ops);
-    let ctx = channel_lifecycle_ctx(peer, cred);
+    let ctx = channel_lifecycle_ctx(peer, &open_cred);
     source.notify_channel_close(&name, &ctx);
 }
 
 /// Connection-scoped context for a channel teardown that emits a
 /// DESTROY_CHANNEL frame: the writer handle, the outbound byte order, the
-/// peer's address + credentials (to reconstruct the channel's lifecycle
-/// identity for the source `onClose`), and the per-peer report registry.
-/// Bundling these five keeps the teardown helpers
-/// ([`finalize_channel_destroy`], [`handle_destroy_channel`],
-/// [`invalidate_named_channels`]) within the argument-count budget and lets
-/// the read loop build the context once per use (built per-use rather than
-/// once per connection because the connection's `cred` is reassigned during
-/// the validation handshake, so a borrow cannot outlive a single arm).
+/// peer's address, and the per-peer report registry. Bundling these four
+/// keeps the teardown helpers ([`finalize_channel_destroy`],
+/// [`handle_destroy_channel`], [`invalidate_named_channels`]) within the
+/// argument-count budget.
+///
+/// It deliberately carries NO credential: the source `onClose` lifecycle
+/// callback is delivered with the channel's own stored open-time credential
+/// (`ChannelState::open_cred`), pinned at CREATE_CHANNEL, not the
+/// connection's current identity — which a re-auth can reassign after the
+/// channel is open (Regression R0604-PVASRV-REAUTH-CHANNEL-LIFECYCLE-CRED-1).
+/// `close_channel` reconstructs the lifecycle [`ChannelContext`] from that
+/// stored snapshot and `ctx.peer`.
 struct ChannelTeardownCtx<'a> {
     tx: &'a SrvTx,
     order: ByteOrder,
     peer: SocketAddr,
-    cred: &'a ClientCredentials,
     peer_entry: &'a Arc<crate::server_native::peers::PeerEntry>,
 }
 
@@ -4993,7 +5028,10 @@ async fn finalize_channel_destroy(
     // Capture the channel's stat before `close_channel` consumes the
     // state, so the server-initiated path can charge the reply below.
     let stat = ch.stat.clone();
-    close_channel(ch, ctx.peer, ctx.cred);
+    // `close_channel` delivers `onClose` with the channel's stored
+    // open-time credential, not `ctx.cred` (the connection's current
+    // identity) — pinned per R0604-PVASRV-REAUTH-CHANNEL-LIFECYCLE-CRED-1.
+    close_channel(ch, ctx.peer);
 
     // Client-initiated DESTROY: pvxs `handle_DESTROY_CHANNEL()` erases the
     // channel from `chanBySID` BEFORE sending the reply, so drop the report
@@ -9170,6 +9208,7 @@ mod tests {
                     introspection: Some(intro),
                     source,
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                    open_cred: ClientCredentials::anonymous(),
                     ops: HashMap::new(),
                 },
             );
@@ -9590,6 +9629,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops: HashMap::new(),
             },
         );
@@ -9818,6 +9858,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops: HashMap::new(),
             },
         );
@@ -9949,6 +9990,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops: HashMap::new(),
             },
         );
@@ -10072,6 +10114,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops: HashMap::new(),
             },
         );
@@ -10172,6 +10215,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops: HashMap::new(),
             },
         );
@@ -10347,6 +10391,7 @@ mod tests {
                 introspection: None,
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops,
             },
         );
@@ -10619,6 +10664,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: src.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops,
             },
         );
@@ -10929,6 +10975,7 @@ mod tests {
                 introspection: Some(FieldDesc::Scalar(ScalarType::Int)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops,
             },
         );
@@ -10994,6 +11041,7 @@ mod tests {
                 introspection: Some(FieldDesc::Scalar(ScalarType::Int)),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops,
             },
         );
@@ -11093,6 +11141,7 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops,
             },
         );
@@ -11192,6 +11241,7 @@ mod tests {
                 introspection: Some(FieldDesc::Variant),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops,
             },
         );
@@ -11278,6 +11328,7 @@ mod tests {
                 introspection: Some(FieldDesc::Variant),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops,
             },
         );
@@ -11596,13 +11647,11 @@ mod tests {
         let frame = synth_frame(Command::DestroyChannel, order, payload);
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
         let peer_entry = crate::server_native::peers::PeerEntry::new(false);
         let teardown = ChannelTeardownCtx {
             tx: &tx,
             order,
             peer,
-            cred: &cred,
             peer_entry: &peer_entry,
         };
         handle_destroy_channel(&frame, &mut channels, &teardown)
@@ -11639,6 +11688,7 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops: HashMap::new(),
             },
         );
@@ -11650,13 +11700,11 @@ mod tests {
         let frame = synth_frame(Command::DestroyChannel, order, payload);
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
         let peer_entry = crate::server_native::peers::PeerEntry::new(false);
         let teardown = ChannelTeardownCtx {
             tx: &tx,
             order,
             peer,
-            cred: &cred,
             peer_entry: &peer_entry,
         };
         handle_destroy_channel(&frame, &mut channels, &teardown)
@@ -11698,6 +11746,7 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops: HashMap::new(),
             },
         );
@@ -11710,7 +11759,6 @@ mod tests {
         let frame = synth_frame(Command::DestroyChannel, inbound_order, payload);
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
         let peer_entry = crate::server_native::peers::PeerEntry::new(false);
         // Server configured little-endian (config_order) for its OWN
         // outbound frames; the inbound frame is big-endian.
@@ -11718,7 +11766,6 @@ mod tests {
             tx: &tx,
             order: config_order,
             peer,
-            cred: &cred,
             peer_entry: &peer_entry,
         };
         handle_destroy_channel(&frame, &mut channels, &teardown)
@@ -11847,6 +11894,7 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops: HashMap::new(),
             },
         );
@@ -11858,13 +11906,11 @@ mod tests {
         let frame = synth_frame(Command::DestroyChannel, order, payload);
 
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
         let peer_entry = crate::server_native::peers::PeerEntry::new(false);
         let teardown = ChannelTeardownCtx {
             tx: &tx,
             order,
             peer,
-            cred: &cred,
             peer_entry: &peer_entry,
         };
         handle_destroy_channel(&frame, &mut channels, &teardown)
@@ -11890,6 +11936,395 @@ mod tests {
             *closed.lock(),
             vec!["dut".to_string()],
             "a destroy on an already-removed SID must not re-fire onClose"
+        );
+    }
+
+    /// Build a `ca`-method credential for the given account, used by the
+    /// channel-lifecycle credential-pinning regressions below.
+    fn cred_ca(account: &str) -> ClientCredentials {
+        ClientCredentials {
+            method: "ca".into(),
+            account: account.into(),
+            host: "10.0.0.1".into(),
+            authority: String::new(),
+            roles: Vec::new(),
+        }
+    }
+
+    /// Records the `(method, account)` each edge observed: channel open
+    /// (`notify_channel_open`), channel close (`notify_channel_close`), and
+    /// the per-op GET ACF check (`get_value_checked`). Lets the
+    /// R0604-PVASRV-REAUTH-CHANNEL-LIFECYCLE-CRED-1 regressions assert which
+    /// identity each edge ran under.
+    struct CredRecordingSource {
+        opened: Arc<parking_lot::Mutex<Vec<(String, String)>>>,
+        closed: Arc<parking_lot::Mutex<Vec<(String, String)>>>,
+        op_reads: Arc<parking_lot::Mutex<Vec<(String, String)>>>,
+        intro: FieldDesc,
+        value: PvField,
+    }
+    impl crate::server_native::source::ChannelSource for CredRecordingSource {
+        async fn list_pvs(&self) -> Vec<String> {
+            vec!["dut".into()]
+        }
+        async fn has_pv(&self, name: &str) -> bool {
+            name == "dut"
+        }
+        async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+            Some(self.intro.clone())
+        }
+        async fn get_value(&self, _name: &str) -> Option<PvField> {
+            Some(self.value.clone())
+        }
+        async fn get_value_checked(
+            &self,
+            checked: crate::server_native::source::AccessChecked,
+            ctx: crate::server_native::source::ChannelContext,
+        ) -> Option<PvField> {
+            self.op_reads
+                .lock()
+                .push((ctx.method.clone(), ctx.account.clone()));
+            if !checked.allows_read() {
+                return None;
+            }
+            Some(self.value.clone())
+        }
+        async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), OpError> {
+            Ok(())
+        }
+        async fn is_writable(&self, _name: &str) -> bool {
+            false
+        }
+        async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+            None
+        }
+        fn notify_channel_open(
+            &self,
+            _name: &str,
+            ctx: &crate::server_native::source::ChannelContext,
+        ) {
+            self.opened
+                .lock()
+                .push((ctx.method.clone(), ctx.account.clone()));
+        }
+        fn notify_channel_close(
+            &self,
+            _name: &str,
+            ctx: &crate::server_native::source::ChannelContext,
+        ) {
+            self.closed
+                .lock()
+                .push((ctx.method.clone(), ctx.account.clone()));
+        }
+    }
+
+    fn empty_cred_log() -> Arc<parking_lot::Mutex<Vec<(String, String)>>> {
+        Arc::new(parking_lot::Mutex::new(Vec::new()))
+    }
+
+    /// Regression R0604-PVASRV-REAUTH-CHANNEL-LIFECYCLE-CRED-1 — open edge.
+    ///
+    /// pvxs builds the channel's `ServerChannelControl` with `conn->cred` at
+    /// CREATE_CHANNEL (serverchan.cpp:62) and runs the source attach under
+    /// that captured identity; a later `ServerConn::cred` reassignment does
+    /// not rewrite it. So a client that CREATEs under `alice/ca` and
+    /// re-authenticates to `bob/ca` before the async resolver completes must
+    /// still see `notify_channel_open` fire as Alice. `handle_create_channel`
+    /// snapshots the dispatch-time credential into
+    /// `CreateChannelCompletion::open_cred`, and the read loop fires the open
+    /// callback from the channel's stored `open_cred`, never the current `cred`.
+    #[tokio::test]
+    async fn reauth_channel_open_callback_pinned_to_create_credential() {
+        let order = ByteOrder::Little;
+        let opened = empty_cred_log();
+        let source: DynSource = Arc::new(CredRecordingSource {
+            opened: opened.clone(),
+            closed: empty_cred_log(),
+            op_reads: empty_cred_log(),
+            intro: FieldDesc::Variant,
+            value: PvField::Scalar(ScalarValue::Int(7)),
+        });
+
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let (cc_tx, mut cc_rx) = tokio::sync::mpsc::channel::<CreateChannelCompletion>(8);
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        let mut pending = 0usize;
+
+        // CREATE_CHANNEL for "dut", dispatched while the connection identity
+        // is alice/ca.
+        let cid: u32 = 42;
+        let mut payload = Vec::new();
+        payload.put_u16(1, order);
+        payload.put_u32(cid, order);
+        encode_string_into("dut", order, &mut payload);
+        let frame = synth_frame(Command::CreateChannel, order, payload);
+
+        let alice = cred_ca("alice");
+        handle_create_channel(
+            &source,
+            &frame,
+            &tx,
+            &channels,
+            order,
+            100,
+            peer,
+            &alice,
+            &cc_tx,
+            &mut pending,
+        )
+        .await
+        .expect("CREATE_CHANNEL dispatch ok");
+
+        let completion = cc_rx.recv().await.expect("resolver emits a completion");
+        assert_eq!(
+            (
+                completion.open_cred.method.as_str(),
+                completion.open_cred.account.as_str()
+            ),
+            ("ca", "alice"),
+            "the completion must carry the credential in force at CREATE dispatch (alice)"
+        );
+        let resolved = completion
+            .resolved
+            .expect("the recording source resolves \"dut\"");
+
+        // The connection re-authenticates to bob/ca BEFORE the read loop
+        // applies the completion; the open callback must still fire as alice.
+        let _bob = cred_ca("bob");
+        // Mirrors the read loop's completion arm (tcp.rs ~2895-2922): the
+        // channel stores the completion's open_cred and the open callback is
+        // built from `ch.open_cred`, never the (now bob) connection credential.
+        channels.insert(
+            completion.sid,
+            ChannelState {
+                name: completion.name.clone(),
+                cid: completion.cid,
+                sid: completion.sid,
+                introspection: resolved.intro,
+                source: resolved.owner,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: completion.open_cred,
+                ops: HashMap::new(),
+            },
+        );
+        let ch = channels.get(&completion.sid).unwrap();
+        let ctx = channel_lifecycle_ctx(peer, &ch.open_cred);
+        ch.source.notify_channel_open(&ch.name, &ctx);
+
+        assert_eq!(
+            *opened.lock(),
+            vec![("ca".to_string(), "alice".to_string())],
+            "notify_channel_open must run under the channel's CREATE-time identity (alice), \
+             not the re-authed connection identity (bob)"
+        );
+    }
+
+    /// Regression R0604-PVASRV-REAUTH-CHANNEL-LIFECYCLE-CRED-1 — client-DESTROY
+    /// close edge. A channel opened under `alice/ca` and destroyed by a client
+    /// DESTROY_CHANNEL after the connection re-authed to `bob/ca` must deliver
+    /// `notify_channel_close` under Alice — the close identity comes from the
+    /// channel's stored `open_cred`, not the connection's current credential.
+    #[tokio::test]
+    async fn reauth_client_destroy_close_pinned_to_create_credential() {
+        let order = ByteOrder::Little;
+        let sid: u32 = 7;
+        let cid: u32 = 9;
+        let closed = empty_cred_log();
+        let source: DynSource = Arc::new(CredRecordingSource {
+            opened: empty_cred_log(),
+            closed: closed.clone(),
+            op_reads: empty_cred_log(),
+            intro: FieldDesc::Variant,
+            value: PvField::Scalar(ScalarValue::Int(0)),
+        });
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid,
+                sid,
+                introspection: None,
+                source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                // Channel was created under alice/ca.
+                open_cred: cred_ca("alice"),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(cid, order);
+        let frame = synth_frame(Command::DestroyChannel, order, payload);
+
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let peer_entry = crate::server_native::peers::PeerEntry::new(false);
+        // The ChannelTeardownCtx carries NO credential post-fix; the close
+        // identity comes from the channel's open_cred even though the
+        // connection has since re-authed to bob.
+        let teardown = ChannelTeardownCtx {
+            tx: &tx,
+            order,
+            peer,
+            peer_entry: &peer_entry,
+        };
+        handle_destroy_channel(&frame, &mut channels, &teardown)
+            .await
+            .expect("destroy ok");
+
+        assert_eq!(
+            *closed.lock(),
+            vec![("ca".to_string(), "alice".to_string())],
+            "client DESTROY_CHANNEL close callback must use the CREATE-time identity (alice)"
+        );
+    }
+
+    /// Regression R0604-PVASRV-REAUTH-CHANNEL-LIFECYCLE-CRED-1 — server-teardown
+    /// close edge. The connection-teardown / operator `:drop`/`:flush` path
+    /// tears channels down through `finalize_channel_destroy` (server-initiated
+    /// DESTROY_CHANNEL). It must also deliver `notify_channel_close` under the
+    /// channel's CREATE-time identity, not whatever the connection last
+    /// re-authed to.
+    #[tokio::test]
+    async fn reauth_server_teardown_close_pinned_to_create_credential() {
+        let order = ByteOrder::Little;
+        let sid: u32 = 3;
+        let cid: u32 = 4;
+        let closed = empty_cred_log();
+        let source: DynSource = Arc::new(CredRecordingSource {
+            opened: empty_cred_log(),
+            closed: closed.clone(),
+            op_reads: empty_cred_log(),
+            intro: FieldDesc::Variant,
+            value: PvField::Scalar(ScalarValue::Int(0)),
+        });
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid,
+                sid,
+                introspection: None,
+                source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: cred_ca("alice"),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let peer_entry = crate::server_native::peers::PeerEntry::new(false);
+        let teardown = ChannelTeardownCtx {
+            tx: &tx,
+            order,
+            peer,
+            peer_entry: &peer_entry,
+        };
+
+        let torn = finalize_channel_destroy(
+            sid,
+            cid,
+            DestroyCause::ServerInitiated,
+            &mut channels,
+            &teardown,
+        )
+        .await;
+        assert!(torn, "the channel was present and torn down");
+        assert_eq!(
+            *closed.lock(),
+            vec![("ca".to_string(), "alice".to_string())],
+            "server-initiated teardown close callback must use the CREATE-time identity (alice)"
+        );
+    }
+
+    /// Regression R0604-PVASRV-REAUTH-CHANNEL-LIFECYCLE-CRED-1 — per-op edge
+    /// (the converse guard). Only the channel *lifecycle* edges are pinned to
+    /// the CREATE-time credential; per-operation handlers must keep using the
+    /// connection's *current* credential (pvxs builds each `ConnectOp`/`ExecOp`
+    /// from `conn->cred`). A GET on a channel opened under `alice/ca`, executed
+    /// after the connection re-authed to `bob/ca`, must run its ACF check as
+    /// Bob — proving the fix did not over-pin operations to `open_cred`.
+    #[tokio::test]
+    async fn reauth_get_op_uses_current_connection_credential() {
+        let order = ByteOrder::Little;
+        let sid: u32 = 11;
+        let ioid: u32 = 21;
+        let intro = FieldDesc::Scalar(ScalarType::Int);
+        let op_reads = empty_cred_log();
+        let source: DynSource = Arc::new(CredRecordingSource {
+            opened: empty_cred_log(),
+            closed: empty_cred_log(),
+            op_reads: op_reads.clone(),
+            intro: intro.clone(),
+            value: PvField::Scalar(ScalarValue::Int(7)),
+        });
+
+        let mut ops: HashMap<u32, OpState> = HashMap::new();
+        ops.insert(
+            ioid,
+            non_monitor_op_state(
+                intro.clone(),
+                OpKind::Get,
+                BitSet::all_set(intro.total_bits()),
+            ),
+        );
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                // Channel was created under alice/ca.
+                open_cred: cred_ca("alice"),
+                ops,
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = crate::server_native::runtime::PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        // Connection has since re-authenticated to bob/ca.
+        let bob = cred_ca("bob");
+
+        // GET EXEC (subcmd 0x40) under the current connection credential bob.
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x40);
+        let frame = synth_frame(Command::Get, order, payload);
+        handle_op(
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Get,
+            &config,
+            &mut encode_cache,
+            &mut TypeCache::new(),
+            peer,
+            &bob,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("GET EXEC ok");
+        let _ = rx.recv().await.expect("GET data reply emitted");
+
+        assert_eq!(
+            *op_reads.lock(),
+            vec![("ca".to_string(), "bob".to_string())],
+            "the per-op GET ACF check must use the connection's CURRENT credential (bob), \
+             not the channel's CREATE-time open_cred (alice)"
         );
     }
 
@@ -11921,6 +12356,7 @@ mod tests {
                     introspection: None,
                     source: source.clone(),
                     stat: stat.clone(),
+                    open_cred: ClientCredentials::anonymous(),
                     ops: HashMap::new(),
                 },
             );
@@ -11935,12 +12371,10 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
         let teardown = ChannelTeardownCtx {
             tx: &tx,
             order,
             peer,
-            cred: &cred,
             peer_entry: &peer_entry,
         };
 
@@ -11995,6 +12429,7 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: stat.clone(),
+                open_cred: ClientCredentials::anonymous(),
                 ops: HashMap::new(),
             },
         );
@@ -12002,12 +12437,10 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-        let cred = ClientCredentials::anonymous();
         let teardown = ChannelTeardownCtx {
             tx: &tx,
             order,
             peer,
-            cred: &cred,
             peer_entry: &peer_entry,
         };
 
@@ -12075,6 +12508,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops: HashMap::new(),
             },
         );
@@ -12205,6 +12639,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops: HashMap::new(),
             },
         );
@@ -12347,6 +12782,7 @@ mod tests {
                     introspection: Some(intro.clone()),
                     source: source.clone(),
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                    open_cred: ClientCredentials::anonymous(),
                     ops,
                 },
             );
@@ -12502,6 +12938,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops: HashMap::new(),
             },
         );
@@ -12602,6 +13039,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops: HashMap::new(),
             },
         );
@@ -12992,6 +13430,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops: HashMap::new(),
             },
         );
@@ -13120,6 +13559,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops: HashMap::new(),
             },
         );
@@ -13445,6 +13885,7 @@ mod tests {
                 introspection: Some(intro),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops,
             },
         );
@@ -13836,6 +14277,7 @@ mod tests {
                 introspection: Some(intro),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops,
             },
         );
@@ -13955,6 +14397,7 @@ mod tests {
                 introspection: Some(intro),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops: HashMap::new(),
             },
         );
@@ -14237,6 +14680,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops,
             },
         );
@@ -14423,6 +14867,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops,
             },
         );
@@ -14561,6 +15006,7 @@ mod tests {
                 introspection: Some(FieldDesc::Variant),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops,
             },
         );
@@ -14620,6 +15066,7 @@ mod tests {
                 introspection: Some(FieldDesc::Variant),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops: HashMap::new(),
             },
         );
@@ -14687,6 +15134,7 @@ mod tests {
                 introspection: Some(FieldDesc::Variant),
                 source: source.clone(),
                 stat: stat.clone(),
+                open_cred: ClientCredentials::anonymous(),
                 ops: HashMap::new(),
             },
         );
@@ -14793,6 +15241,7 @@ mod tests {
                     introspection: None,
                     source: source.clone(),
                     stat: stat.clone(),
+                    open_cred: ClientCredentials::anonymous(),
                     ops: HashMap::new(),
                 },
             );
@@ -14801,12 +15250,10 @@ mod tests {
 
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
             let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
-            let cred = ClientCredentials::anonymous();
             let teardown = ChannelTeardownCtx {
                 tx: &tx,
                 order,
                 peer,
-                cred: &cred,
                 peer_entry: &peer_entry,
             };
 
@@ -14870,6 +15317,7 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops: HashMap::new(),
             },
         );
@@ -14953,6 +15401,7 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops: HashMap::new(),
             },
         );
@@ -15058,6 +15507,7 @@ mod tests {
                 introspection: None,
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops: HashMap::new(),
             },
         );
@@ -15480,6 +15930,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: src.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops,
             },
         );
@@ -15685,6 +16136,7 @@ mod tests {
                 introspection: Some(intro.clone()),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops: HashMap::new(),
             },
         );
@@ -15858,6 +16310,7 @@ mod tests {
                 introspection: intro,
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops: HashMap::new(),
             },
         );
@@ -15985,6 +16438,7 @@ mod tests {
                     introspection: Some(three_field_intro()),
                     source: source.clone(),
                     stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                    open_cred: ClientCredentials::anonymous(),
                     ops: HashMap::new(),
                 },
             );
@@ -16700,6 +17154,7 @@ mod r14_tests {
                 introspection: Some(intro),
                 source: source.clone(),
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops,
             },
         );
@@ -16883,6 +17338,7 @@ mod bfr15_tests {
                 introspection: Some(intro),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops,
             },
         );
@@ -17319,6 +17775,7 @@ mod bfr15_tests {
                 introspection: Some(FieldDesc::Variant),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops,
             },
         );
@@ -17399,6 +17856,7 @@ mod bfr15_tests {
                 introspection: Some(FieldDesc::Variant),
                 source,
                 stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
                 ops,
             },
         );

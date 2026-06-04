@@ -2608,6 +2608,34 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             } else {
                 pad_dbr_to_requested_count(&mut data, actual_count, requested_count, requested_type)
             };
+            // Deprecated CA_PROTO_READ (cmd 3) contracts a scalar
+            // DBR_STRING payload to its NUL-terminated length before the
+            // 8-byte alignment. C `read_action` (rsrv/camessage.c:666-680)
+            // recomputes `payloadSize = epicsStrnLen(pStr, 40) + 1` for
+            // `DBR_STRING && m_count == 1` when a NUL is found within the
+            // 40-byte slot (otherwise it force-terminates byte 39 and keeps
+            // the full 40), then `cas_commit_msg` (caserverio.c:350-365)
+            // aligns the shortened size to 8 and rewrites m_postsize while
+            // leaving the header count at 1. So `"OK"` commits an 8-byte
+            // payload, not the fixed 40-byte slot. READ_NOTIFY / EVENT_ADD
+            // never run this branch — C `read_reply` keeps the full slot —
+            // so gate on `!is_notify`. `element_count == 1` is the scalar
+            // case; arrays / count!=1 keep their full per-element slots.
+            if !is_notify
+                && requested_type == epics_base_rs::types::DBR_STRING
+                && element_count == 1
+            {
+                // epicsStrnLen(pStr, 40): the first NUL index, capped at the
+                // 40-byte slot. Trim to value + its NUL only when a NUL
+                // exists within the slot; the encoder always NUL-bounds a
+                // scalar string at <= 39 chars (value.rs to_bytes), so the
+                // no-NUL else-branch C guards against cannot arise here and
+                // the full 40-byte slot is kept untouched if it ever did.
+                let slot = data.len().min(40);
+                if let Some(nul) = data[..slot].iter().position(|&b| b == 0) {
+                    data.truncate(nul + 1);
+                }
+            }
             let mut padded = data;
             padded.resize(align8(padded.len()), 0);
 

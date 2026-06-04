@@ -1590,6 +1590,204 @@ async fn server_deprecated_read_class_name_count0_follows_c_m_count() {
     );
 }
 
+/// Deprecated synchronous `CA_PROTO_READ` (cmd 3) contracts a scalar
+/// `DBR_STRING` payload to its NUL-terminated length. C `read_action`
+/// (`rsrv/camessage.c:666-680`) recomputes `payloadSize =
+/// epicsStrnLen(pStr, 40) + 1` for `DBR_STRING && m_count == 1`, then
+/// `cas_commit_msg` (`caserverio.c:350-365`) aligns to 8 and rewrites
+/// `m_postsize` (header count stays 1). So `"OK"` commits an 8-byte
+/// payload, not the fixed 40-byte slot. READ_NOTIFY / EVENT_ADD never
+/// run this branch (C `read_reply` keeps the full slot).
+///
+/// Boundary cases in one test:
+///   A. deprecated READ, "OK"           -> count 1, postsize 8  (align8(2+1))
+///   B. deprecated READ, 40-char value  -> count 1, postsize 40 (39 chars + NUL)
+///   C. READ_NOTIFY,     "OK"           -> count 1, postsize 40 (full slot)
+/// B pins that a near-full string is not over-trimmed; C pins that the
+/// notify path keeps the C `read_reply` 40-byte slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn server_deprecated_read_string_shortens_to_nul_length() {
+    use std::collections::HashMap as Map;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    // DBR_STRING = 0 (epics_base_rs::types::DBR_STRING).
+    const DBR_STRING: u16 = 0;
+
+    let port = {
+        let probe =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve free CA server port");
+        let p = probe.local_addr().unwrap().port();
+        drop(probe);
+        p
+    };
+
+    // STR:SHORT = "OK"; STR:LONG = 40 'A's (encoder clamps to 39 chars +
+    // a NUL at byte 39, so epicsStrnLen == 39 and the trimmed size is 40).
+    let server = CaServer::builder()
+        .port(port)
+        .pv("STR:SHORT", EpicsValue::String("OK".into()))
+        .pv("STR:LONG", EpicsValue::String("A".repeat(40).into()))
+        .build()
+        .await
+        .expect("build CA server");
+    let _rs_handle = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+
+    // VERSION handshake
+    let mut ver = CaHeader::new(CA_PROTO_VERSION);
+    ver.count = CA_MINOR_VERSION;
+    sock.write_all(&ver.to_bytes()).await.unwrap();
+    let mut hello = [0u8; 64];
+    tokio::time::timeout(Duration::from_secs(2), sock.read(&mut hello))
+        .await
+        .expect("VERSION reply timed out")
+        .expect("read VERSION");
+
+    // CLIENT_NAME + HOST_NAME
+    for (cmd, name) in [
+        (CA_PROTO_CLIENT_NAME, "testuser\0"),
+        (CA_PROTO_HOST_NAME, "testhost\0"),
+    ] {
+        let mut h = CaHeader::new(cmd);
+        let mut body = name.as_bytes().to_vec();
+        while !body.len().is_multiple_of(8) {
+            body.push(0);
+        }
+        h.set_payload_size(body.len(), 0);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&h.to_bytes());
+        frame.extend_from_slice(&body);
+        sock.write_all(&frame).await.unwrap();
+    }
+
+    // CREATE_CHAN on both PVs; capture (client_cid -> sid).
+    let mut want_create: Map<u32, &str> = Map::new();
+    want_create.insert(0x1111_0001, "STR:SHORT\0");
+    want_create.insert(0x1111_0002, "STR:LONG\0");
+    for (cid, pv) in [(0x1111_0001u32, "STR:SHORT\0"), (0x1111_0002, "STR:LONG\0")] {
+        let mut create = CaHeader::new(CA_PROTO_CREATE_CHAN);
+        create.cid = cid;
+        let mut body = pv.as_bytes().to_vec();
+        while !body.len().is_multiple_of(8) {
+            body.push(0);
+        }
+        create.set_payload_size(body.len(), 0);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&create.to_bytes());
+        frame.extend_from_slice(&body);
+        sock.write_all(&frame).await.unwrap();
+    }
+
+    // Drain CREATE_CHAN replies; map client cid -> sid (m_cid -> m_available).
+    let mut acc: Vec<u8> = Vec::new();
+    let mut sids: Map<u32, u32> = Map::new();
+    let mut buf = [0u8; 512];
+    while sids.len() < 2 {
+        let n = tokio::time::timeout(Duration::from_millis(800), sock.read(&mut buf))
+            .await
+            .expect("CREATE_CHAN drain timed out")
+            .expect("read");
+        if n == 0 {
+            panic!("EOF before both CREATE_CHAN replies; got {:?}", sids.keys());
+        }
+        acc.extend_from_slice(&buf[..n]);
+        let mut off = 0;
+        while off + 16 <= acc.len() {
+            let Ok(h) = CaHeader::from_bytes(&acc[off..off + 16]) else {
+                off += 16;
+                continue;
+            };
+            if h.cmmd == CA_PROTO_CREATE_CHAN && want_create.contains_key(&h.cid) {
+                sids.insert(h.cid, h.available);
+            }
+            off += 16 + ((h.postsize as usize + 7) & !7);
+        }
+    }
+    let sid_short = sids[&0x1111_0001];
+    let sid_long = sids[&0x1111_0002];
+
+    // ioid 0x21: deprecated READ (cmd 3) DBR_STRING count=1 on "OK"
+    // ioid 0x22: deprecated READ (cmd 3) DBR_STRING count=1 on 40-char
+    // ioid 0x23: READ_NOTIFY (cmd 15) DBR_STRING count=1 on "OK"
+    for (cmd, sid, ioid) in [
+        (CA_PROTO_READ, sid_short, 0x21_u32),
+        (CA_PROTO_READ, sid_long, 0x22_u32),
+        (CA_PROTO_READ_NOTIFY, sid_short, 0x23_u32),
+    ] {
+        let mut r = CaHeader::new(cmd);
+        r.data_type = DBR_STRING;
+        r.count = 1;
+        r.cid = sid;
+        r.available = ioid;
+        sock.write_all(&r.to_bytes()).await.unwrap();
+    }
+
+    // Collect the three READ / READ_NOTIFY replies by ioid.
+    let mut racc: Vec<u8> = Vec::new();
+    let mut replies: Map<u32, CaHeader> = Map::new();
+    let mut rbuf = [0u8; 512];
+    while replies.len() < 3 {
+        let n = tokio::time::timeout(Duration::from_secs(3), sock.read(&mut rbuf))
+            .await
+            .unwrap_or_else(|_| panic!("timed out; got {:?}", replies.keys()))
+            .expect("read replies");
+        if n == 0 {
+            panic!("EOF before all replies; got {:?}", replies.keys());
+        }
+        racc.extend_from_slice(&rbuf[..n]);
+        let mut off = 0;
+        while off + 16 <= racc.len() {
+            let Ok(h) = CaHeader::from_bytes(&racc[off..off + 16]) else {
+                off += 16;
+                continue;
+            };
+            if (h.cmmd == CA_PROTO_READ || h.cmmd == CA_PROTO_READ_NOTIFY)
+                && [0x21, 0x22, 0x23].contains(&h.available)
+            {
+                replies.insert(h.available, h);
+            }
+            off += 16 + ((h.postsize as usize + 7) & !7);
+        }
+    }
+
+    // A. "OK" -> count 1, postsize align8(2+1) = 8.
+    let a = &replies[&0x21];
+    assert_eq!(a.cmmd, CA_PROTO_READ, "A: deprecated READ reply opcode");
+    assert_eq!(a.count, 1, "A: scalar DBR_STRING is one element");
+    assert_eq!(
+        a.postsize, 8,
+        "A: \"OK\" contracts to epicsStrnLen+1=3 aligned to 8, got {}",
+        a.postsize
+    );
+
+    // B. 40-char value -> 39 chars + NUL = 40 bytes, align8(40) = 40.
+    let b = &replies[&0x22];
+    assert_eq!(b.cmmd, CA_PROTO_READ, "B: deprecated READ reply opcode");
+    assert_eq!(b.count, 1, "B: scalar DBR_STRING is one element");
+    assert_eq!(
+        b.postsize, 40,
+        "B: a near-full (39-char + NUL) string keeps the 40-byte slot, got {}",
+        b.postsize
+    );
+
+    // C. READ_NOTIFY "OK" -> full 40-byte slot (no read_action shortening).
+    let c = &replies[&0x23];
+    assert_eq!(c.cmmd, CA_PROTO_READ_NOTIFY, "C: READ_NOTIFY reply opcode");
+    assert_eq!(c.count, 1, "C: scalar DBR_STRING is one element");
+    assert_eq!(
+        c.postsize, 40,
+        "C: READ_NOTIFY keeps the full 40-byte DBR_STRING slot (C read_reply), got {}",
+        c.postsize
+    );
+}
+
 /// The UDP batching loop must not re-parse a stale
 /// datagram. When `try_recv_from` drains a queued datagram that is
 /// rejected (short sub-header, ignore-list, or rate-limited), pre-fix

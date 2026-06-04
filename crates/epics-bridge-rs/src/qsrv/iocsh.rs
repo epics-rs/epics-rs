@@ -161,7 +161,13 @@ fn parse_macros(s: &str) -> std::collections::HashMap<String, String> {
 /// (`groupconfigprocessor.cpp:88-101`). Implemented behaviors:
 ///
 ///   - `$(NAME)` and `${NAME}` are both references; `\<char>` blocks
-///     detection and copies both bytes verbatim (`trans:740-749`).
+///     detection. At level 0 (the user's source string) both bytes are
+///     copied verbatim; at a discard level (a substituted macro value) the
+///     escape backslash is dropped and only the escaped byte is kept
+///     (`trans:740-743`, `discard = level > 0`).
+///   - quote delimiters are kept at level 0 (the user's quotes) but removed
+///     from substituted macro values/names/defaults/scopes
+///     (`trans:716-726`).
 ///   - macros are NOT expanded inside single quotes (`trans:722-733`).
 ///   - a reference name is itself macro-expanded before lookup, so
 ///     `$($(WHICH))` resolves the inner reference first.
@@ -182,7 +188,20 @@ fn parse_macros(s: &str) -> std::collections::HashMap<String, String> {
 fn expand_macros(s: &str, macros: &std::collections::HashMap<String, String>) -> String {
     let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
-    mac_trans(&chars, macros, &mut Vec::new(), &mut Vec::new(), &mut out);
+    // The user's source string is translated at level 0 (`discard = false`):
+    // its own quote delimiters and escape backslashes are preserved
+    // (`macExpandString` → `trans(handle, &entry, 0, ...)`, macCore.c:216).
+    // Substituted macro values/names/defaults/scopes are translated at
+    // level+1 inside `mac_refer`, where `discard = true` strips them
+    // (matching C `expand`/`refer`, macCore.c:667-673,798,892).
+    mac_trans(
+        &chars,
+        macros,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        false,
+        &mut out,
+    );
     out
 }
 
@@ -199,6 +218,7 @@ fn mac_trans(
     macros: &std::collections::HashMap<String, String>,
     scopes: &mut Vec<std::collections::HashMap<String, String>>,
     visiting: &mut Vec<String>,
+    discard: bool,
     out: &mut String,
 ) {
     let mut quote: Option<char> = None;
@@ -206,18 +226,37 @@ fn mac_trans(
     while i < chars.len() {
         let c = chars[i];
 
-        // Track single/double quote state (C `trans` `quote` var).
+        // Track single/double quote state (C `trans` `quote` var). At a
+        // discard level (`level > 0` — i.e. these are NOT the user's quotes
+        // but a substituted macro value/name/default/scope) the quote
+        // DELIMITERS are dropped: C `continue`s past the opening and the
+        // closing quote without copying them (macCore.c:716-726). The
+        // characters between the quotes are still emitted.
         if let Some(q) = quote {
             if c == q {
                 quote = None;
+                if discard {
+                    i += 1;
+                    continue;
+                }
             }
         } else if c == '"' || c == '\'' {
             quote = Some(c);
+            if discard {
+                i += 1;
+                continue;
+            }
         }
 
-        // `\<char>`: emit both verbatim, skip macro detection.
+        // `\<char>`: copy the escaped character; the backslash itself is
+        // kept only at level 0 (the user's escape) and dropped at a discard
+        // level (C `if (v < valend && !discard) *v++ = '\\'`,
+        // macCore.c:740-743). Either way the macro detector does not see the
+        // escaped byte.
         if c == '\\' && i + 1 < chars.len() {
-            out.push('\\');
+            if !discard {
+                out.push('\\');
+            }
             out.push(chars[i + 1]);
             i += 2;
             continue;
@@ -283,9 +322,11 @@ fn mac_refer(
         None => (body, &body[body.len()..]),
     };
 
-    // the name itself may contain macro references — expand it.
+    // the name itself may contain macro references — expand it. The name
+    // is a substituted (level+1) value, so its quotes/escapes are discarded
+    // (C `trans(handle, entry, level+1, macEnd, ...)`, macCore.c:798).
     let mut name = String::new();
-    mac_trans(name_chars, macros, scopes, visiting, &mut name);
+    mac_trans(name_chars, macros, scopes, visiting, true, &mut name);
 
     // Default value (`=...`) and scoped definitions (`,k=v`).
     let mut default: Option<&[char]> = None;
@@ -337,16 +378,21 @@ fn mac_refer(
             } else {
                 visiting.push(name.clone());
                 let val_chars: Vec<char> = val.chars().collect();
-                mac_trans(&val_chars, macros, scopes, visiting, out);
+                // A resolved macro value is a substituted (level+1) value:
+                // its quote delimiters and escape backslashes are stripped
+                // (C `trans(handle, entry, level+1, "", &rv, ...)` /
+                // pre-`expand` at level 1, macCore.c:667-673,875).
+                mac_trans(&val_chars, macros, scopes, visiting, true, out);
                 visiting.pop();
             }
         }
         None => match default {
             Some(def_chars) => {
-                // Strip a single layer of surrounding quotes from the
-                // default (`$(NAME="value")` → value).
-                let def = mac_strip_outer_quotes(def_chars);
-                mac_trans(def, macros, scopes, visiting, out);
+                // The default value is also substituted at level+1, so its
+                // quotes/escapes are discarded by the translation itself —
+                // C `trans(handle, entry, level+1, macEnd+1, &defval, ...)`
+                // (macCore.c:892). No separate outer-quote strip is needed.
+                mac_trans(def_chars, macros, scopes, visiting, true, out);
             }
             None => {
                 // Undefined macro placeholder (C `refer` `errval`).
@@ -382,7 +428,10 @@ fn mac_parse_scoped(
             None => (seg, &seg[seg.len()..]),
         };
         let mut sname = String::new();
-        mac_trans(name_part, macros, scopes, visiting, &mut sname);
+        // Scoped macro names/values are substituted at level+1, so their
+        // quotes/escapes are discarded (C `trans(handle, &subs, level+1,
+        // ...)`, macCore.c:841,849).
+        mac_trans(name_part, macros, scopes, visiting, true, &mut sname);
         k += name_part.len();
         if let Some('=') = tail.first() {
             let valseg = &tail[1..];
@@ -391,7 +440,7 @@ fn mac_parse_scoped(
                 None => (valseg, &valseg[valseg.len()..]),
             };
             let mut sval = String::new();
-            mac_trans(val_part, macros, scopes, visiting, &mut sval);
+            mac_trans(val_part, macros, scopes, visiting, true, &mut sval);
             out.push((sname, sval));
             k += 1 + val_part.len();
         }
@@ -441,15 +490,6 @@ fn mac_top_level_comma(body: &[char]) -> Option<usize> {
         i += 1;
     }
     None
-}
-
-/// Strip one layer of matching surrounding double quotes from a slice.
-fn mac_strip_outer_quotes(s: &[char]) -> &[char] {
-    if s.len() >= 2 && s[0] == '"' && s[s.len() - 1] == '"' {
-        &s[1..s.len() - 1]
-    } else {
-        s
-    }
 }
 
 /// `processGroups` — finalize group config after `dbLoadGroup` calls
@@ -882,6 +922,51 @@ mod tests {
         m.insert("A".to_string(), "$(B)".to_string());
         m.insert("B".to_string(), "deep".to_string());
         assert_eq!(expand_macros("$(A)", &m), "deep");
+    }
+
+    /// Regression R0604-BRQSRV-MACLIB-DISCARD-LEVEL-1.
+    ///
+    /// C `macCore.c` expands a substituted macro value at `level > 0`, where
+    /// `discard` removes the value's quote delimiters and escape backslashes
+    /// (macCore.c:716-726,740-743). A site macro `P="IOC:"` therefore expands
+    /// to `IOC:`, not `"IOC:"`. The Rust expander used to copy quotes/escapes
+    /// from every level, corrupting JSON or PV names substituted from quoted
+    /// macro values.
+    #[test]
+    fn macro_value_quotes_and_escapes_discarded() {
+        // Macro value with surrounding quotes → quotes removed on expansion.
+        let mut m = std::collections::HashMap::new();
+        m.insert("P".to_string(), "\"IOC:\"".to_string());
+        assert_eq!(expand_macros("$(P)grp", &m), "IOC:grp");
+
+        // Macro value with an escape → backslash dropped, escaped byte kept.
+        let mut m = std::collections::HashMap::new();
+        m.insert("E".to_string(), "a\\,b".to_string());
+        assert_eq!(expand_macros("$(E)", &m), "a,b");
+
+        // Default value quotes are likewise discarded (substituted level+1),
+        // including interior quotes a one-pair strip would have left behind.
+        let m = std::collections::HashMap::new();
+        assert_eq!(expand_macros(r#"$(X="a"b)"#, &m), "ab");
+
+        // Scoped value quotes are discarded too.
+        let m = std::collections::HashMap::new();
+        assert_eq!(expand_macros(r#"$(BAR,BAR="v")"#, &m), "v");
+    }
+
+    /// Regression R0604-BRQSRV-MACLIB-DISCARD-LEVEL-1 (level-0 preservation).
+    ///
+    /// The user's own source string is translated at level 0 (`discard =
+    /// false`), so its quote delimiters and escape backslashes survive — only
+    /// substituted macro values are normalized (macExpandString runs
+    /// `trans(..., 0, ...)`, macCore.c:216).
+    #[test]
+    fn macro_user_quotes_preserved_at_level_zero() {
+        let mut m = std::collections::HashMap::new();
+        m.insert("V".to_string(), "x".to_string());
+        // The literal JSON quotes around the value are the user's quotes and
+        // must remain; only `$(V)` is substituted.
+        assert_eq!(expand_macros(r#"{"k": "$(V)"}"#, &m), r#"{"k": "x"}"#);
     }
 
     #[test]

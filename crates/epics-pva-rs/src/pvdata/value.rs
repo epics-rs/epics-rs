@@ -161,8 +161,15 @@ impl Value {
     /// the leaf's container bit. The target scalar type is taken from the
     /// leaf's current (typed) value. The path may traverse union/any
     /// members and compound-array elements (e.g. `value->floatValue`,
-    /// `array[0].field`); the addressed leaf must already be a scalar —
-    /// `set()` does not select a union variant or grow an array.
+    /// `array[0].field`).
+    ///
+    /// A `->member` segment **selects** the union arm via the mutable
+    /// traversal in [`Self::lookup_mut`] (pvxs `traverse(modify=true)`):
+    /// a null or differently-selected union is switched to `member` and
+    /// its default payload allocated, so the freshly-allocated scalar
+    /// carries the descriptor's type that this write then coerces into.
+    /// The addressed leaf must still resolve to a scalar — `set()` writes
+    /// scalars only and does not grow an array.
     pub fn set<T: IntoScalarValue>(&mut self, path: &str, v: T) -> Result<(), ValueError> {
         let bit = self.bit_for_value_path(path);
         let leaf = self
@@ -412,11 +419,33 @@ impl Value {
     }
 
     /// Mutable counterpart of [`Self::lookup`].
+    ///
+    /// Unlike the read-only [`Self::lookup`], this is a *mutable*
+    /// traversal — pvxs `traverse(name, modify=true, …)` (data.cpp:854-906).
+    /// A `->member` segment on a union **selects** that member: when the
+    /// union is null or set to a different arm, the member's default
+    /// payload is allocated and the selector/variant_name are updated
+    /// before descending into it (data.cpp:877-887). The same path may
+    /// switch an already-selected arm. Read-only [`Self::lookup`] stays
+    /// constrained to the currently-selected arm (data.cpp:888-894 errors
+    /// on a const select).
+    ///
+    /// The descriptor is threaded alongside the value tree so the
+    /// selected arm's type is known; selection inside an `any` region
+    /// (where the static descriptor is lost) is limited to an
+    /// already-selected matching member.
     pub fn lookup_mut(&mut self, path: &str) -> Option<&mut PvField> {
         let segs = parse_path(path).ok()?;
+        // Clone the Arc so the descriptor cursor is independent of the
+        // `&mut self.field` borrow taken below — both are needed at once
+        // to select a union arm by its descriptor.
+        let desc = Arc::clone(&self.desc);
         let mut cur = CurMut::Field(&mut self.field);
+        let mut dcur: Option<&FieldDesc> = Some(desc.as_ref());
         for seg in &segs {
-            cur = step_mut(cur, seg)?;
+            let (next_cur, next_desc) = step_mut(cur, dcur, seg)?;
+            cur = next_cur;
+            dcur = next_desc;
         }
         match cur {
             CurMut::Field(f) => Some(f),
@@ -681,20 +710,37 @@ enum CurMut<'a> {
     Variant(&'a mut VariantValue),
 }
 
-fn step_mut<'a>(cur: CurMut<'a>, seg: &PathSeg) -> Option<CurMut<'a>> {
+/// One mutable traversal step, threading the type descriptor alongside
+/// the value cursor so a union `->member` segment can **select** the
+/// member by descriptor (pvxs `traverse(modify=true)`, data.cpp:854-906).
+/// `dcur` is `None` once traversal enters an `any` region whose content
+/// descriptor is dynamic; union selection there is limited to an
+/// already-selected member.
+fn step_mut<'f, 'd>(
+    cur: CurMut<'f>,
+    dcur: Option<&'d FieldDesc>,
+    seg: &PathSeg,
+) -> Option<(CurMut<'f>, Option<&'d FieldDesc>)> {
     match (seg, cur) {
         (PathSeg::Field(n), CurMut::Field(PvField::Structure(s))) => {
-            Some(CurMut::Field(s.get_field_mut(n)?))
+            let child = s.get_field_mut(n)?;
+            Some((CurMut::Field(child), struct_child_desc(dcur, n)))
         }
-        (PathSeg::Field(n), CurMut::Struct(s)) => Some(CurMut::Field(s.get_field_mut(n)?)),
+        (PathSeg::Field(n), CurMut::Struct(s)) => {
+            let child = s.get_field_mut(n)?;
+            Some((CurMut::Field(child), struct_child_desc(dcur, n)))
+        }
         (PathSeg::Index(i), CurMut::Field(PvField::StructureArray(items))) => {
-            Some(CurMut::Struct(items.get_mut(*i)?.as_mut()?))
+            // The element's fields live in the StructureArray descriptor,
+            // which `struct_child_desc` reads the same as a Structure.
+            Some((CurMut::Struct(items.get_mut(*i)?.as_mut()?), dcur))
         }
         (PathSeg::Index(i), CurMut::Field(PvField::UnionArray(items))) => {
-            Some(CurMut::Union(items.get_mut(*i)?.as_mut()?))
+            // The element's variants live in the UnionArray descriptor.
+            Some((CurMut::Union(items.get_mut(*i)?.as_mut()?), dcur))
         }
         (PathSeg::Index(i), CurMut::Field(PvField::VariantArray(items))) => {
-            Some(CurMut::Variant(items.get_mut(*i)?.as_mut()?))
+            Some((CurMut::Variant(items.get_mut(*i)?.as_mut()?), None))
         }
         (
             PathSeg::Deref(m),
@@ -703,15 +749,95 @@ fn step_mut<'a>(cur: CurMut<'a>, seg: &PathSeg) -> Option<CurMut<'a>> {
                 variant_name,
                 value,
             }),
-        ) if deref_union(*selector, variant_name, m) => Some(CurMut::Field(value)),
+        ) => select_union_member(selector, variant_name, value, dcur, m),
         (PathSeg::Deref(_), CurMut::Field(PvField::Variant(v))) => {
-            Some(CurMut::Field(&mut v.value))
+            Some((CurMut::Field(&mut v.value), None))
         }
-        (PathSeg::Deref(m), CurMut::Union(it)) if deref_union(it.selector, &it.variant_name, m) => {
-            Some(CurMut::Field(&mut it.value))
-        }
-        (PathSeg::Deref(_), CurMut::Variant(v)) => Some(CurMut::Field(&mut v.value)),
+        (PathSeg::Deref(m), CurMut::Union(it)) => select_union_member(
+            &mut it.selector,
+            &mut it.variant_name,
+            &mut it.value,
+            dcur,
+            m,
+        ),
+        (PathSeg::Deref(_), CurMut::Variant(v)) => Some((CurMut::Field(&mut v.value), None)),
         _ => None,
+    }
+}
+
+/// Descend the descriptor cursor into a structure member named `name`.
+/// Reads both `Structure` and `StructureArray` (whose element fields are
+/// the array's `fields`). Returns `None` when the descriptor is absent or
+/// the member is missing.
+fn struct_child_desc<'d>(dcur: Option<&'d FieldDesc>, name: &str) -> Option<&'d FieldDesc> {
+    match dcur {
+        Some(FieldDesc::Structure { fields, .. })
+        | Some(FieldDesc::StructureArray { fields, .. }) => {
+            fields.iter().find(|(n, _)| n == name).map(|(_, d)| d)
+        }
+        _ => None,
+    }
+}
+
+/// The descriptor of a union variant named `name`, from a `Union` /
+/// `UnionArray` descriptor.
+fn union_variant_desc<'d>(dcur: Option<&'d FieldDesc>, name: &str) -> Option<&'d FieldDesc> {
+    match dcur {
+        Some(FieldDesc::Union { variants, .. }) | Some(FieldDesc::UnionArray { variants, .. }) => {
+            variants.iter().find(|(n, _)| n == name).map(|(_, d)| d)
+        }
+        _ => None,
+    }
+}
+
+/// Mutable union dereference / selection — pvxs `traverse(modify=true)`
+/// union branch (data.cpp:867-905). Shared by the plain-union field arm
+/// and the union-array-element arm.
+///
+/// - bare `->` (no member): dereference the current selection; a null
+///   union (no arm selected) has nothing to dereference → `None`
+///   (data.cpp:900-904).
+/// - `->member` with a descriptor: look the member up in the union
+///   descriptor; when it is not the currently-selected arm, allocate its
+///   default payload and update the selector (select/switch,
+///   data.cpp:877-887); then descend into it.
+/// - `->member` without a descriptor (inside an `any` region): may only
+///   dereference an already-selected matching member.
+fn select_union_member<'f, 'd>(
+    selector: &mut i32,
+    variant_name: &mut String,
+    value: &'f mut PvField,
+    dcur: Option<&'d FieldDesc>,
+    member: &Option<String>,
+) -> Option<(CurMut<'f>, Option<&'d FieldDesc>)> {
+    match member {
+        None => {
+            if *selector < 0 {
+                return None;
+            }
+            let mdesc = union_variant_desc(dcur, variant_name);
+            Some((CurMut::Field(value), mdesc))
+        }
+        Some(m) => match dcur {
+            Some(FieldDesc::Union { variants, .. })
+            | Some(FieldDesc::UnionArray { variants, .. }) => {
+                let idx = variants.iter().position(|(n, _)| n == m)?;
+                let mdesc = &variants[idx].1;
+                if *selector != idx as i32 {
+                    *value = default_for(mdesc);
+                    *selector = idx as i32;
+                    *variant_name = m.clone();
+                }
+                Some((CurMut::Field(value), Some(mdesc)))
+            }
+            _ => {
+                if *selector >= 0 && variant_name == m {
+                    Some((CurMut::Field(value), None))
+                } else {
+                    None
+                }
+            }
+        },
     }
 }
 
@@ -1171,6 +1297,96 @@ mod tests {
         // The union occupies one bit; marking its member marks `value`.
         assert!(v.is_marked("value"));
         assert!(v.is_marked("value->floatValue"));
+    }
+
+    #[test]
+    fn set_selects_null_union_member() {
+        // Regression R0604-PVA-VALUE-SET-UNION-SELECT-1.
+        // A freshly-created value has a null union (selector -1); pvxs
+        // mutable traversal (data.cpp:877-887) selects the named member
+        // when writing, so `set("value->floatValue", …)` must succeed and
+        // allocate the Float arm. Previously the value-only traversal
+        // returned NoField on a null union.
+        let desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![("value".into(), union_value_desc())],
+        };
+        let mut v = Value::create_from(desc);
+        v.set("value->floatValue", 2.5f32).unwrap();
+        assert_eq!(v.get_as::<f32>("value->floatValue").unwrap(), 2.5);
+        assert!(v.is_marked("value"));
+        // Bare `->` now dereferences the freshly-selected Float arm.
+        assert!(matches!(
+            v.lookup("value->"),
+            Some(PvField::Scalar(ScalarValue::Float(_)))
+        ));
+    }
+
+    #[test]
+    fn set_switches_selected_union_member() {
+        // Regression R0604-PVA-VALUE-SET-UNION-SELECT-1.
+        // Writing a *different* member switches the arm (pvxs reselects
+        // when fld.desc != the requested member, data.cpp:879-883).
+        let mut v = struct_of(
+            "value",
+            union_value_desc(),
+            PvField::Union {
+                selector: 0,
+                variant_name: "floatValue".into(),
+                value: Box::new(PvField::Scalar(ScalarValue::Float(1.0))),
+            },
+        );
+        v.set("value->intValue", 7i32).unwrap();
+        assert_eq!(v.get_as::<i32>("value->intValue").unwrap(), 7);
+        // The Float arm is no longer selected, so the const read can't
+        // reach it.
+        assert!(v.lookup("value->floatValue").is_none());
+        assert!(v.is_marked("value"));
+    }
+
+    #[test]
+    fn lookup_mut_selects_null_union_member_allocating_default() {
+        // Regression R0604-PVA-VALUE-SET-UNION-SELECT-1.
+        // The public mutable lookup selects too: on a null union it
+        // allocates the member's default payload (here Float(0.0)).
+        let mut v = struct_of(
+            "value",
+            union_value_desc(),
+            PvField::Union {
+                selector: -1,
+                variant_name: String::new(),
+                value: Box::new(PvField::Null),
+            },
+        );
+        let leaf = v.lookup_mut("value->floatValue").unwrap();
+        assert!(matches!(leaf, PvField::Scalar(ScalarValue::Float(f)) if *f == 0.0));
+    }
+
+    #[test]
+    fn set_switches_union_array_element_member() {
+        // Regression R0604-PVA-VALUE-SET-UNION-SELECT-1.
+        // Member selection also applies to an *existing* union-array
+        // element (allocating a new array element is the separately
+        // deferred half of this finding). Switch a present `d` element to
+        // the `i` arm and write it.
+        let mut v = struct_of(
+            "cells",
+            FieldDesc::UnionArray {
+                struct_id: String::new(),
+                variants: vec![
+                    ("d".into(), FieldDesc::Scalar(ScalarType::Double)),
+                    ("i".into(), FieldDesc::Scalar(ScalarType::Int)),
+                ],
+            },
+            PvField::UnionArray(vec![Some(UnionItem {
+                selector: 0,
+                variant_name: "d".into(),
+                value: PvField::Scalar(ScalarValue::Double(3.5)),
+            })]),
+        );
+        v.set("cells[0]->i", 9i32).unwrap();
+        assert_eq!(v.get_as::<i32>("cells[0]->i").unwrap(), 9);
+        assert!(v.lookup("cells[0]->d").is_none());
     }
 
     #[test]

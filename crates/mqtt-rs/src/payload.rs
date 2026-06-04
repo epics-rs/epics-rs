@@ -178,18 +178,6 @@ fn boolean_payload_to_int(s: &str) -> Option<i64> {
     }
 }
 
-/// JSON form of [`boolean_payload_to_int`]. C stringifies the JSON field
-/// before `isBoolean` — `dump()` for non-strings, the raw text for string
-/// fields (drvMqtt.cpp:262-265) — so a JSON boolean and a JSON string
-/// "true"/"false" both take the shortcut.
-fn json_boolean_to_int(value: &serde_json::Value) -> Option<i64> {
-    match value {
-        serde_json::Value::Bool(b) => Some(i64::from(*b)),
-        serde_json::Value::String(s) => boolean_payload_to_int(s),
-        _ => None,
-    }
-}
-
 fn decode_flat(raw: &str, value_type: ValueType) -> MqttResult<DecodedValue> {
     let trimmed = raw.trim();
     match value_type {
@@ -234,77 +222,37 @@ fn decode_json(raw: &str, value_type: ValueType, field_path: &str) -> MqttResult
     let value = extract_json_field(&json, field_path)
         .ok_or_else(|| MqttError::JsonFieldNotFound(field_path.to_string()))?;
 
-    match value_type {
-        ValueType::Int => {
-            if let Some(b) = json_boolean_to_int(value) {
-                return Ok(DecodedValue::Int32(b as i32));
-            }
-            let v = value.as_i64().ok_or_else(|| {
-                MqttError::ValueConversion(format!(
-                    "expected integer at '{field_path}', got {value}"
-                ))
-            })?;
-            Ok(DecodedValue::Int32(v as i32))
-        }
-        ValueType::Float => {
-            let v = value.as_f64().ok_or_else(|| {
-                MqttError::ValueConversion(format!(
-                    "expected number at '{field_path}', got {value}"
-                ))
-            })?;
-            Ok(DecodedValue::Float64(v))
-        }
-        ValueType::Digital => {
-            if let Some(b) = json_boolean_to_int(value) {
-                return Ok(DecodedValue::UInt32(b as u32));
-            }
-            let v = value.as_u64().ok_or_else(|| {
-                MqttError::ValueConversion(format!(
-                    "expected unsigned at '{field_path}', got {value}"
-                ))
-            })?;
-            Ok(DecodedValue::UInt32(v as u32))
-        }
-        ValueType::String => {
-            let v = match value {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            Ok(DecodedValue::String(v))
-        }
-        ValueType::IntArray => {
-            let arr = value.as_array().ok_or_else(|| {
-                MqttError::ValueConversion(format!("expected array at '{field_path}', got {value}"))
-            })?;
-            let v = arr
-                .iter()
-                .map(|e| {
-                    e.as_i64().map(|n| n as i32).ok_or_else(|| {
-                        MqttError::ValueConversion(format!(
-                            "expected integer array element at '{field_path}', got {e}"
-                        ))
-                    })
-                })
-                .collect::<MqttResult<Vec<i32>>>()?;
-            Ok(DecodedValue::Int32Array(v))
-        }
-        ValueType::FloatArray => {
-            let arr = value.as_array().ok_or_else(|| {
-                MqttError::ValueConversion(format!("expected array at '{field_path}', got {value}"))
-            })?;
-            let v = arr
-                .iter()
-                .map(|e| {
-                    e.as_f64().ok_or_else(|| {
-                        MqttError::ValueConversion(format!(
-                            "expected number array element at '{field_path}', got {e}"
-                        ))
-                    })
-                })
-                .collect::<MqttResult<Vec<f64>>>()?;
-            Ok(DecodedValue::Float64Array(v))
-        }
+    // C's onMessageCb (drvMqtt.cpp:256-265) collapses the matched JSON
+    // field to ONE string carrier and then runs the *same* type switch it
+    // uses for a non-JSON (flat) payload: a missing field or an explicit
+    // JSON `null` is "not found"; a JSON string yields its raw content
+    // (`fieldAddr->get<std::string>()`); every other type yields its
+    // compact serialization (`fieldAddr->dump()`). The numeric/array/bool
+    // conversion (isBoolean/isInteger/isFloat/checkAndParse*Array) is then
+    // identical to the flat path. Mirror that exactly — build the carrier,
+    // then delegate to [`decode_flat`] — so JSON and flat share one parser
+    // instead of decode_json re-deriving conversion with serde's
+    // `as_i64`/`as_f64`/`as_array`. That divergence rejected the string
+    // carrier a broker that encodes every value as text emits:
+    // `{"v":"42"}` (INT), `{"v":"3.14"}` (FLOAT), and `{"v":"[1,2,3]"}`
+    // (INTARRAY) all failed where C accepts them, and `dump()` likewise
+    // lets a lone JSON number satisfy an *array* topic (checkAndParseInt
+    // Array accepts a single value, drvMqtt.cpp:426-487).
+    if value.is_null() {
+        return Err(MqttError::JsonFieldNotFound(field_path.to_string()));
     }
+    let carrier = match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+
+    // Octet/String is C's one non-parsing arm: `setStringParam(val)` uses
+    // the carrier verbatim (no trim, no parse), so emit it directly rather
+    // than routing through decode_flat's whitespace-trimming string arm.
+    if value_type == ValueType::String {
+        return Ok(DecodedValue::String(carrier));
+    }
+    decode_flat(&carrier, value_type)
 }
 
 /// Recursively search for `target_key` anywhere in the JSON value,
@@ -647,12 +595,65 @@ mod tests {
         assert_eq!(val, DecodedValue::Float64Array(vec![1.5, 2.5]));
     }
 
-    /// BUG 5 — a non-array JSON value for an INTARRAY topic is a clean
-    /// conversion error, not a panic.
+    /// A scalar JSON number on an INTARRAY topic is NOT rejected: C dumps
+    /// it to "42" and `checkAndParseIntArray` accepts a lone value as a
+    /// one-element array — it breaks right after the first number with
+    /// `asynSuccess` (drvMqtt.cpp:465-487). The carrier delegation
+    /// reproduces that through `parse_int_array`. (The earlier
+    /// `as_array()` path rejected it, diverging from C.)
     #[test]
-    fn decode_json_int_array_type_mismatch() {
+    fn decode_json_scalar_number_is_single_element_int_array() {
         let addr = TopicAddress::parse("JSON:INTARRAY sensors/data readings").unwrap();
-        assert!(decode_payload(r#"{"readings": 42}"#, &addr).is_err());
+        let val = decode_payload(r#"{"readings": 42}"#, &addr).unwrap();
+        assert_eq!(val, DecodedValue::Int32Array(vec![42]));
+    }
+
+    /// R0604-MQTT-JSON-STRING-NUMERIC-1 regression. C builds a string
+    /// carrier from the matched JSON field — `get<std::string>()` for a
+    /// JSON string, `dump()` otherwise (drvMqtt.cpp:262-265) — then runs
+    /// the same flat numeric/array parsers. A broker that encodes every
+    /// value as a JSON string must therefore still drive INT/FLOAT/
+    /// DIGITAL/INTARRAY/FLOATARRAY records. The earlier per-type
+    /// `as_i64`/`as_f64`/`as_array` path rejected every one of these.
+    #[test]
+    fn decode_json_string_carried_numeric_and_array() {
+        let int = TopicAddress::parse("JSON:INT dev/d v").unwrap();
+        assert_eq!(
+            decode_payload(r#"{"v": "42"}"#, &int).unwrap(),
+            DecodedValue::Int32(42)
+        );
+
+        let float = TopicAddress::parse("JSON:FLOAT dev/d v").unwrap();
+        assert_eq!(
+            decode_payload(r#"{"v": "12.5"}"#, &float).unwrap(),
+            DecodedValue::Float64(12.5)
+        );
+
+        let digital = TopicAddress::parse("JSON:DIGITAL dev/d v").unwrap();
+        assert_eq!(
+            decode_payload(r#"{"v": "7"}"#, &digital).unwrap(),
+            DecodedValue::UInt32(7)
+        );
+
+        let int_arr = TopicAddress::parse("JSON:INTARRAY dev/d v").unwrap();
+        assert_eq!(
+            decode_payload(r#"{"v": "[1,2,3]"}"#, &int_arr).unwrap(),
+            DecodedValue::Int32Array(vec![1, 2, 3])
+        );
+
+        let float_arr = TopicAddress::parse("JSON:FLOATARRAY dev/d v").unwrap();
+        assert_eq!(
+            decode_payload(r#"{"v": "[1.5, 2.5]"}"#, &float_arr).unwrap(),
+            DecodedValue::Float64Array(vec![1.5, 2.5])
+        );
+    }
+
+    /// An explicit JSON `null` for a field is treated as "not found", as
+    /// C does (`!fieldAddr || fieldAddr->is_null()`, drvMqtt.cpp:260).
+    #[test]
+    fn decode_json_explicit_null_is_not_found() {
+        let addr = TopicAddress::parse("JSON:INT dev/d v").unwrap();
+        assert!(decode_payload(r#"{"v": null}"#, &addr).is_err());
     }
 
     /// BUG 5 — the FLAT INTARRAY decode path (already producing

@@ -175,40 +175,46 @@ impl ServerInfoSource {
         value
     }
 
-    /// Whether the request carries a `help` field (after NTURI `query`
-    /// unwrapping), mirroring pvxs `args["help"].valid()`
-    /// (serversource.cpp:46). Any present field named `help` triggers
-    /// the help reply regardless of its value/type.
-    fn has_help(request: &PvField) -> bool {
-        let root = match request {
-            PvField::Structure(s) => s,
-            _ => return false,
-        };
-        if let Some(PvField::Structure(query)) = root.get_field("query")
-            && query.get_field("help").is_some()
-        {
-            return true;
-        }
-        root.get_field("help").is_some()
-    }
-
-    /// Extract the `op` argument from an RPC request. Handles both the
-    /// NTURI shape (`query.op`) and a flat-struct request (`op` at the
-    /// top level) — pvxs `ServerSource::onRPC` unwraps `query` when
-    /// present, then reads `op`.
-    fn extract_op(request: &PvField) -> Option<String> {
+    /// Regression R0604-PVASRV-SERVER-RPC-QUERY-FALLBACK-1.
+    /// The single argument structure pvxs `ServerSource::onRPC` inspects.
+    /// pvxs does `args = raw; if(auto Q = args["query"]) args = Q;`
+    /// (serversource.cpp:41-44) and then reads *both* `help` and `op` from
+    /// that one selected value — so NTURI `query` unwrapping is terminal:
+    /// once a `query` field is present it is the only argument view and
+    /// there is no fall-back to root-level `help`/`op`.
+    ///
+    /// - `query` present and a structure → that structure is the args view.
+    /// - `query` present but not a structure → no args (pvxs's `args = Q`
+    ///   on a non-structure has neither `help` nor a readable `op`, so both
+    ///   lookups fail and the RPC errors). Returned as `None`.
+    /// - no `query` field → flat custom request; the root is the args view.
+    fn rpc_args(request: &PvField) -> Option<&PvStructure> {
         let root = match request {
             PvField::Structure(s) => s,
             _ => return None,
         };
-        // NTURI: arguments live under `query`.
-        if let Some(PvField::Structure(query)) = root.get_field("query") {
-            if let Some(op) = scalar_string(query.get_field("op")) {
-                return Some(op);
-            }
+        match root.get_field("query") {
+            Some(PvField::Structure(query)) => Some(query),
+            // `query` present but not a structure → terminal, no args.
+            Some(_) => None,
+            // No `query` → inspect the root for a flat request.
+            None => Some(root),
         }
-        // Flat-struct fallback: `op` directly at the top level.
-        scalar_string(root.get_field("op"))
+    }
+
+    /// Whether the selected RPC argument view carries a `help` field,
+    /// mirroring pvxs `args["help"].valid()` (serversource.cpp:46). Any
+    /// present field named `help` triggers the help reply regardless of
+    /// its value/type.
+    fn has_help(request: &PvField) -> bool {
+        Self::rpc_args(request).is_some_and(|args| args.get_field("help").is_some())
+    }
+
+    /// Extract the `op` argument from the selected RPC argument view —
+    /// the NTURI `query` structure when present, otherwise the flat root.
+    /// No fall-back across the `query` boundary (see [`Self::rpc_args`]).
+    fn extract_op(request: &PvField) -> Option<String> {
+        scalar_string(Self::rpc_args(request)?.get_field("op"))
     }
 }
 
@@ -578,6 +584,69 @@ mod tests {
             },
             other => panic!("unexpected wrapper: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn rpc_query_op_wins_over_root_help() {
+        // Regression R0604-PVASRV-SERVER-RPC-QUERY-FALLBACK-1.
+        // pvxs selects `args = query` then reads BOTH help and op from
+        // that single view (serversource.cpp:41-53) — a root-level `help`
+        // beside `query.op` is never consulted, so this returns the
+        // channel list, not the help text.
+        let src = source_with(vec!["x".into()]);
+        let mut query = PvStructure::new("");
+        query.fields.push((
+            "op".into(),
+            PvField::Scalar(ScalarValue::String("channels".into())),
+        ));
+        let mut root = PvStructure::new("epics:nt/NTURI:1.0");
+        root.fields.push((
+            "help".into(),
+            PvField::Scalar(ScalarValue::String("".into())),
+        ));
+        root.fields
+            .push(("query".into(), PvField::Structure(query)));
+        let (_, resp) = src
+            .rpc("server", FieldDesc::Variant, PvField::Structure(root))
+            .await
+            .expect("rpc ok");
+        // A help reply is an NTScalar<string>; the channel list is a
+        // string array. Asserting we got the array proves query.op won
+        // over the root-level help.
+        match resp {
+            PvField::Structure(s) => match s.get_field("value") {
+                Some(PvField::ScalarArrayTyped(TypedScalarArray::String(a))) => {
+                    assert_eq!(a.to_vec(), vec!["x".to_string()]);
+                }
+                other => panic!("query.op=channels must win over root help: {other:?}"),
+            },
+            other => panic!("unexpected wrapper: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_present_query_does_not_fall_back_to_root_op() {
+        // Regression R0604-PVASRV-SERVER-RPC-QUERY-FALLBACK-1.
+        // With a present (here empty) `query`, pvxs reads `op` ONLY from
+        // the query view; a root-level `op` is not a fallback. So this
+        // errors for a missing op rather than running root `op=channels`.
+        let src = source_with(vec!["x".into()]);
+        let query = PvStructure::new(""); // present but empty: no op
+        let mut root = PvStructure::new("epics:nt/NTURI:1.0");
+        root.fields.push((
+            "op".into(),
+            PvField::Scalar(ScalarValue::String("channels".into())),
+        ));
+        root.fields
+            .push(("query".into(), PvField::Structure(query)));
+        let err = src
+            .rpc("server", FieldDesc::Variant, PvField::Structure(root))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("op"),
+            "present query without op must error, not fall back to root op: {err}"
+        );
     }
 
     #[tokio::test]

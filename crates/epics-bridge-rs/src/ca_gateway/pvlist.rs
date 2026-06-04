@@ -725,8 +725,19 @@ fn build_pattern(pat: &str, lineno: usize) -> BridgeResult<Regex> {
         BridgeError::GroupConfigError(format!("line {lineno}: pvlist pattern '{pat}': {e}"))
     })?;
     // Anchor the pattern to match the full PV name (C++ ca-gateway behavior:
-    // re_match against the whole channel name, not a substring).
-    let anchored = format!("^{translated}$");
+    // gateAs.cc:386-405 admits a name only when `re_match(...) == len`, a
+    // whole-string match of whichever alternation branch matched). The
+    // translated source must be wrapped in a group before anchoring: in Rust
+    // `regex` (as in EREs) alternation `|` binds LOWER than the `^`/`$`
+    // anchors, so a translated `foo|bar` anchored bare as `^foo|bar$` parses
+    // as `(^foo)|(bar$)` and matches `foobar` (via `^foo`) and `xxbar` (via
+    // `bar$`) — names C `re_match` rejects because their full length never
+    // equals the matched branch length. A NON-capturing group `(?:…)` scopes
+    // the alternation under both anchors without consuming a capture index, so
+    // the `\1`..`\9` ALIAS backreference numbering in `expand_template` (which
+    // indexes captures positionally) is unchanged.
+    // Regression R0604-BRCAGW-PVLIST-BRE-ALT-ANCHOR-1.
+    let anchored = format!("^(?:{translated})$");
     Regex::new(&anchored).map_err(|e| {
         BridgeError::GroupConfigError(format!("line {lineno}: invalid regex '{pat}': {e}"))
     })
@@ -1651,6 +1662,50 @@ mod tests {
         let list = parse_pvlist(r"a|b ALLOW").unwrap();
         assert!(list.match_name("a|b").is_some(), "bare | is literal");
         assert!(list.match_name("a").is_none(), "bare | does not alternate");
+    }
+
+    /// Regression R0604-BRCAGW-PVLIST-BRE-ALT-ANCHOR-1. An UNGROUPED GNU/BRE
+    /// alternation `foo\|bar` is C-valid: C compiles it with
+    /// `re_compile_pattern` (gateAs.cc:236) and admits a name only when
+    /// `re_match(...) == len` (gateAs.cc:386-405) — a WHOLE-string match of
+    /// whichever branch matched, so `foo\|bar` matches exactly `foo` or `bar`
+    /// and never `foobar`/`xxbar`. The translated source `foo|bar` must be
+    /// scoped by a group before the `^…$` anchors; the previous bare
+    /// `^foo|bar$` parsed (by `|`'s low precedence) as `^foo` OR `bar$` and
+    /// over-matched `foobar` (prefix) and `xxbar` (suffix) — names C rejects.
+    #[test]
+    fn bre_ungrouped_alternation_is_whole_string_anchored() {
+        let list = parse_pvlist(r"foo\|bar ALLOW").unwrap();
+        assert!(
+            list.match_name("foo").is_some(),
+            "left branch matches the whole name"
+        );
+        assert!(
+            list.match_name("bar").is_some(),
+            "right branch matches the whole name"
+        );
+        assert!(
+            list.match_name("foobar").is_none(),
+            "must not match via the ^foo prefix (bare ^foo|bar$ precedence)"
+        );
+        assert!(
+            list.match_name("xxbar").is_none(),
+            "must not match via the bar$ suffix (bare ^foo|bar$ precedence)"
+        );
+
+        // The wrapper is NON-capturing, so positional ALIAS backreferences are
+        // unchanged: a top-level alternation of two capture groups still
+        // expands `\1`/`\2` to groups 1 and 2 (the absent branch expands to "").
+        let aliases = parse_pvlist(r"dev:\(.*\)\|sys:\(.*\) ALIAS out:\1\2").unwrap();
+        let m = aliases
+            .match_name("dev:hv")
+            .expect("left branch alias matches");
+        assert!(m.is_alias);
+        assert_eq!(m.resolved_name, "out:hv", "\\1 from group 1, \\2 absent");
+        let m = aliases
+            .match_name("sys:lv")
+            .expect("right branch alias matches");
+        assert_eq!(m.resolved_name, "out:lv", "\\2 from group 2, \\1 absent");
     }
 
     /// A GNU back-reference inside the *pattern* is unrepresentable in the Rust

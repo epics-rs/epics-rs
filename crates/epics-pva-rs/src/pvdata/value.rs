@@ -226,10 +226,16 @@ impl Value {
     /// pvxs `Value::assign()` delegates to `copyIn(&o, StoreType::Compound)`
     /// whose struct branch iterates `src.imarked()` only (data.cpp:731-769):
     /// an unmarked source field is not part of the update and leaves the
-    /// destination unchanged, and a marked source field with no matching
+    /// destination unchanged, and a marked source *leaf* with no matching
     /// destination field throws `NoField` (data.cpp:746-756) rather than
     /// being silently dropped. Driving the copy from every descriptor leaf
     /// instead copied stale unmarked values and hid schema mismatches.
+    ///
+    /// A marked structure *node* propagates only its changed-bit — pvxs
+    /// calls `dfld.mark()` for a marked sub-struct and copies NO subtree
+    /// payload (data.cpp:739-744). The node's leaves transfer only when
+    /// individually marked, so a bare `alarm` mark leaves the destination's
+    /// `alarm.*` leaves untouched.
     pub fn assign(&mut self, other: &Value) -> Result<(), ValueError> {
         for path in other.iter_marked() {
             // Marked source field absent in the destination: pvxs throws
@@ -281,16 +287,17 @@ impl Value {
                 | FieldDesc::VariantArray => {
                     let _ = self.write_field(&path, src_field.clone());
                 }
-                // A marked structure node represents its whole subtree
-                // (pvxs imarked, testdata.cpp:180-209). Copy the subtree
-                // payload so a bare structure-level mark transfers; any
-                // individually-marked descendant leaf is also visited and
-                // re-copied (with scalar coercion) later in this loop.
-                FieldDesc::Structure { .. } => {
-                    if matches!(src_field, PvField::Structure(_)) {
-                        let _ = self.write_field(&path, src_field.clone());
-                    }
-                }
+                // A marked structure node only propagates the changed-bit
+                // — pvxs `copyIn` calls `dfld.mark()` for a marked
+                // sub-struct and copies NO subtree payload (data.cpp:
+                // 739-744). The node's leaves transfer only when they are
+                // individually marked and visited as their own paths in
+                // this loop. Copying the source subtree here overwrote
+                // destination leaves that a bare structure-node mark must
+                // leave untouched, and installed unvalidated source
+                // children on a schema mismatch. The `self.mark(&path)`
+                // below records the changed-bit; the payload stays put.
+                FieldDesc::Structure { .. } => {}
             }
             // Every path here came from the source mark set, so the
             // destination field is now part of the update.
@@ -1042,8 +1049,12 @@ mod tests {
     }
 
     #[test]
-    fn assign_copies_marked_structure_subtree() {
-        // A bare structure-level mark transfers the whole subtree.
+    fn assign_marked_structure_node_marks_only_no_subtree_copy() {
+        // Regression R0604-PVA-VALUE-ASSIGN-STRUCT-MARK-1.
+        // pvxs copyIn's struct branch (data.cpp:739-744) calls dfld.mark()
+        // for a marked sub-struct and copies NO subtree payload. A bare
+        // `alarm` mark therefore propagates only the changed-bit; the
+        // destination's own alarm leaves stay untouched.
         let mut src = make_nt_int();
         src.set("alarm.severity", 3i32).unwrap();
         src.set("alarm.status", 1i32).unwrap();
@@ -1051,10 +1062,35 @@ mod tests {
         src.unmark("alarm.status").unwrap();
         src.mark("alarm").unwrap(); // only the structure node is marked
         let mut dst = make_nt_int();
+        dst.set("alarm.severity", 7i32).unwrap();
+        dst.set("alarm.status", 9i32).unwrap();
+        dst.assign(&src).unwrap();
+        // Destination leaves preserved — no subtree payload was copied.
+        assert_eq!(dst.get_as::<i32>("alarm.severity").unwrap(), 7);
+        assert_eq!(dst.get_as::<i32>("alarm.status").unwrap(), 9);
+        // The structure-node changed-bit still propagates.
+        assert!(dst.is_marked("alarm"));
+    }
+
+    #[test]
+    fn assign_parent_plus_leaf_mark_copies_only_marked_leaf() {
+        // Regression R0604-PVA-VALUE-ASSIGN-STRUCT-MARK-1.
+        // Marking the `alarm` node AND the `alarm.severity` leaf transfers
+        // only the individually-marked leaf; the unmarked sibling
+        // (`alarm.status`) keeps the destination's own value.
+        let mut src = make_nt_int();
+        src.set("alarm.severity", 3i32).unwrap();
+        src.set("alarm.status", 1i32).unwrap();
+        src.unmark("alarm.status").unwrap();
+        src.mark("alarm").unwrap(); // node + the still-marked severity leaf
+        let mut dst = make_nt_int();
+        dst.set("alarm.severity", 7i32).unwrap();
+        dst.set("alarm.status", 9i32).unwrap();
         dst.assign(&src).unwrap();
         assert_eq!(dst.get_as::<i32>("alarm.severity").unwrap(), 3);
-        assert_eq!(dst.get_as::<i32>("alarm.status").unwrap(), 1);
+        assert_eq!(dst.get_as::<i32>("alarm.status").unwrap(), 9);
         assert!(dst.is_marked("alarm"));
+        assert!(dst.is_marked("alarm.severity"));
     }
 
     #[test]

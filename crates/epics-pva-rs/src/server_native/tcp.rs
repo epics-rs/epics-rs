@@ -6845,19 +6845,45 @@ async fn handle_op(
                                 None => break,
                             }
                         };
+                        // Drain immediately-available extras, folding the
+                        // in-hand `value` into the SAME bounded queue so a
+                        // single owner counts EVERY unsent post against
+                        // `queue_limit` — including the front being prepared
+                        // for this reply. pvxs counts `queue.front()` against
+                        // queueSize (servermon.cpp:271-287) and pops it only in
+                        // `doReply()` when a frame is produced
+                        // (servermon.cpp:171-183); holding `value` OUTSIDE the
+                        // queue (as before) let `queue_limit + 1` distinct
+                        // posts go unsent under backpressure. The drain returns
+                        // the (possibly squashed) front as the next `value`.
+                        let (next_value, overflow) =
+                            drain_monitor_queue(&mut rx, value, &mut pending, queue_limit);
+                        value = next_value;
+                        if overflow {
+                            debug!(
+                                pv = %pv_name,
+                                queue_limit,
+                                "monitor queue full — squashed newest into tail"
+                            );
+                        }
                         // Subscription boundary: the upstream descriptor
                         // changed. The decoded values that follow are shaped
                         // for the NEW descriptor and would be mis-encoded
                         // against the `intro_clone` negotiated at this
-                        // monitor's INIT. Emit MONITOR FINISH BEFORE reading
-                        // `value` (it is a placeholder on a boundary) so the
-                        // client reopens with a fresh INIT — the decoded-path
+                        // monitor's INIT. Emit MONITOR FINISH so the client
+                        // reopens with a fresh INIT — the decoded-path
                         // counterpart of the raw fast path's `type_changed`
-                        // branch. This covers both acquisition paths: a
-                        // boundary popped from `pending` (drained ahead) and
-                        // one yielded live by `next_monitor_event`, including
-                        // one surfaced through a pause-hold/queue-overflow
-                        // coalesce (which preserves the boundary).
+                        // branch. This check runs AFTER the drain: at
+                        // `queueSize == 1` the front IS the tail, so the drain
+                        // can coalesce a boundary post directly into `value`,
+                        // and a coalesced boundary MUST be detected on the
+                        // finalized `value`, not the pre-drain one. It still
+                        // covers both acquisition paths — a boundary popped
+                        // from `pending` and one yielded live by
+                        // `next_monitor_event` (incl. one surfaced through a
+                        // pause-hold coalesce) — because `coalesce_monitor_update`
+                        // keeps a boundary sticky and it always reaches the
+                        // front before any value it shadowed.
                         if value.type_changed {
                             let finish = build_monitor_finish(ioid, order);
                             let _ = tx_clone.send(finish).await;
@@ -6888,18 +6914,6 @@ async fn handle_op(
                             }
                             mon_acl_version_at_subscribe_cell
                                 .store(live_v, std::sync::atomic::Ordering::Release);
-                        }
-                        // Drain immediately-available extras into the queue.
-                        // `value` is the entry being sent THIS iteration (the
-                        // popped head), so the not-yet-sent queue may still
-                        // hold up to `queue_limit` more distinct entries; only
-                        // a full queue squashes the newest into its tail.
-                        if drain_monitor_queue(&mut rx, &mut pending, queue_limit) {
-                            debug!(
-                                pv = %pv_name,
-                                queue_limit,
-                                "monitor queue full — squashed newest into tail"
-                            );
                         }
                         // outbound-queue depth is a SERVER
                         // diagnostic only — it is no longer used to fire
@@ -7708,25 +7722,41 @@ fn coalesce_monitor_update(
     }
 }
 
-/// Drain every immediately-available monitor update from `rx` into the
-/// bounded server-side queue `pending`, returning true if any overflow
-/// squash occurred.
+/// Fold the in-hand monitor update and every immediately-available update
+/// from `rx` into the bounded server-side queue, returning the
+/// (possibly squashed) front as the next event to consider plus a flag
+/// set when any overflow squash occurred.
 ///
 /// This is the server monitor queue, modelled after pvxs
 /// `servermon.cpp:271-287`: a post is appended as a DISTINCT queue entry
-/// while `pending.len() < limit`, and only once the queue is full is the
-/// newest update squashed into the queue tail (unioning marked-leaf sets
-/// via [`coalesce_monitor_update`]). The send loop pops exactly one entry
-/// per reply (`servermon.cpp:171-183`), so a burst below the negotiated
-/// depth is delivered as distinct DATA frames rather than collapsed into
-/// one. Coalescing is the OVERFLOW action, not the normal drain.
+/// while the queue holds fewer than `limit` entries, and only once the
+/// queue is full is the newest update squashed into the queue tail
+/// (unioning marked-leaf sets via [`coalesce_monitor_update`]). The send
+/// loop pops exactly one entry per reply (`servermon.cpp:171-183`), so a
+/// burst below the negotiated depth is delivered as distinct DATA frames
+/// rather than collapsed into one. Coalescing is the OVERFLOW action, not
+/// the normal drain.
 ///
-/// `limit` must be >= 1, so a full queue always has a tail to squash into.
+/// `in_hand` is the front of the conceptual queue — pvxs counts
+/// `queue.front()` (the post being prepared for the next reply) against
+/// `queueSize` and pops it only in `doReply()` when a frame is actually
+/// produced. So this helper is the SINGLE owner of the unsent count:
+/// `[in_hand] ++ pending` is bounded to `limit` total, never `limit + 1`.
+/// `in_hand` is pushed to the front, the queue is bounded, then the front
+/// is restored as the returned value — at `limit == 1` the front IS the
+/// tail, so an overflow squashes into `in_hand` itself.
+///
+/// `limit` must be >= 1, so the queue always has a tail to squash into.
 fn drain_monitor_queue(
     rx: &mut mpsc::Receiver<crate::server_native::MonitorUpdate>,
+    in_hand: crate::server_native::MonitorUpdate,
     pending: &mut std::collections::VecDeque<crate::server_native::MonitorUpdate>,
     limit: usize,
-) -> bool {
+) -> (crate::server_native::MonitorUpdate, bool) {
+    // Fold the in-hand front into the SAME queue so one uniform rule
+    // covers every unsent post: it extends the queue while there is room,
+    // else squashes into the tail.
+    pending.push_front(in_hand);
     let mut overflow = false;
     // `try_recv` Empty (no more buffered) or Disconnected (source ended)
     // both stop the drain; disconnect is observed by the outer loop's
@@ -7737,12 +7767,16 @@ fn drain_monitor_queue(
         } else {
             let tail = pending
                 .pop_back()
-                .expect("limit >= 1 so a full queue has a tail to squash into");
+                .expect("push_front above guarantees a non-empty queue to squash into");
             pending.push_back(coalesce_monitor_update(tail, next));
             overflow = true;
         }
     }
-    overflow
+    // Restore the (possibly squashed) front as the next in-hand event.
+    let front = pending
+        .pop_front()
+        .expect("push_front above guarantees a non-empty queue");
+    (front, overflow)
 }
 
 /// outcome of turning one [`crate::server_native::RawMonitorEvent`]
@@ -8380,12 +8414,23 @@ mod tests {
     }
 
     /// Boundary test for the server-side monitor queue
-    /// ([`drain_monitor_queue`], pvxs servermon.cpp:271-287): below the
-    /// limit every post stays a DISTINCT entry; at the limit the newest is
-    /// squashed into the tail. Tested by the `len < limit` vs `len == limit`
-    /// boundary, not by a narrative burst.
+    /// ([`drain_monitor_queue`], pvxs servermon.cpp:271-287). The drain is
+    /// the SINGLE owner of the unsent count: it folds the in-hand front
+    /// event into the same bounded queue, so `[in_hand] ++ pending` never
+    /// exceeds `limit`. Tested by invariant boundary — below limit, at
+    /// limit, the `limit == 1` squash-into-front, and a boundary post — not
+    /// by a narrative burst.
+    ///
+    /// Regression R0604-PVASRV-MONITOR-QUEUE-OFFBYONE-1: before the fix the
+    /// in-hand `value` was held OUTSIDE the queue and only `pending.len()`
+    /// was bounded, so under backpressure `queue_limit + 1` distinct posts
+    /// went unsent. This reproduces the real loop state the old isolated
+    /// helper test missed (one event already removed from the queue before
+    /// the drain): with `record[queueSize=2]`, in-hand `first` plus posts
+    /// `[second, third]` must leave exactly two unsent events `[first,
+    /// third]`, not three.
     #[tokio::test]
-    async fn pva_44_monitor_queue_keeps_distinct_below_limit_squashes_tail_at_limit() {
+    async fn pva_44_monitor_queue_counts_in_hand_event_against_limit() {
         use std::collections::VecDeque;
         let val = |tag: i32| PvField::Scalar(ScalarValue::Int(tag));
         let upd = |tag: i32| crate::server_native::MonitorUpdate {
@@ -8393,39 +8438,85 @@ mod tests {
             marked: None,
             type_changed: false,
         };
+        // The whole unsent set the loop will deliver, in send order: the
+        // returned front followed by the rest of the bounded queue.
+        let unsent =
+            |front: &crate::server_native::MonitorUpdate,
+             pending: &VecDeque<crate::server_native::MonitorUpdate>| {
+                let mut v = vec![front.value.clone()];
+                v.extend(pending.iter().map(|u| u.value.clone()));
+                v
+            };
 
-        // Three posts into a queue of limit 4 (the finding's exact case):
-        // all stay distinct, no squash.
+        // The finding's exact loop state: record[queueSize=2], pipeline
+        // credit at zero so nothing is sent, in-hand `first` already popped
+        // for this iteration, posts `second` and `third` buffered on the
+        // channel. The whole unsent set is bounded to 2 — [first, third],
+        // the newest squashed into the tail — NOT three distinct frames.
         let (tx, mut rx) = mpsc::channel::<crate::server_native::MonitorUpdate>(16);
-        for tag in 1..=3 {
+        for tag in [2, 3] {
             tx.send(upd(tag)).await.unwrap();
         }
         let mut pending: VecDeque<crate::server_native::MonitorUpdate> = VecDeque::new();
-        let overflow = drain_monitor_queue(&mut rx, &mut pending, 4);
-        assert!(!overflow, "3 posts below limit 4 must not squash");
-        assert_eq!(pending.len(), 3, "three distinct queue entries below limit");
-        let tags: Vec<_> = pending.iter().map(|u| u.value.clone()).collect();
+        let (front, overflow) = drain_monitor_queue(&mut rx, upd(1), &mut pending, 2);
+        assert!(
+            overflow,
+            "in-hand + 2 posts into limit 2 must squash the tail"
+        );
         assert_eq!(
-            tags,
-            vec![val(1), val(2), val(3)],
-            "distinct posts must be delivered in order, not coalesced"
+            unsent(&front, &pending),
+            vec![val(1), val(3)],
+            "queueSize=2 holds the in-hand front plus one queued tail, \
+             squashing the newest into it — never queue_limit + 1 distinct posts"
         );
 
-        // Filling past the limit squashes the NEWEST into the tail and
-        // leaves the head entries untouched.
+        // Below the limit: the in-hand front plus the queued posts all stay
+        // distinct (in-hand counts against the limit, but there is room).
         let (tx, mut rx) = mpsc::channel::<crate::server_native::MonitorUpdate>(16);
-        for tag in 1..=5 {
+        for tag in [2, 3] {
             tx.send(upd(tag)).await.unwrap();
         }
         let mut pending: VecDeque<crate::server_native::MonitorUpdate> = VecDeque::new();
-        let overflow = drain_monitor_queue(&mut rx, &mut pending, 2);
-        assert!(overflow, "5 posts into limit 2 must squash the tail");
-        assert_eq!(pending.len(), 2, "queue stays capped at the limit");
-        let tags: Vec<_> = pending.iter().map(|u| u.value.clone()).collect();
+        let (front, overflow) = drain_monitor_queue(&mut rx, upd(1), &mut pending, 4);
+        assert!(!overflow, "in-hand + 2 posts below limit 4 must not squash");
         assert_eq!(
-            tags,
-            vec![val(1), val(5)],
-            "head (1) is preserved distinct; the tail squashes to the newest (5)"
+            unsent(&front, &pending),
+            vec![val(1), val(2), val(3)],
+            "in-hand front and queued posts stay distinct below the limit"
+        );
+
+        // queueSize == 1: the front IS the tail, so every later post
+        // squashes into the in-hand event itself (latest value wins).
+        let (tx, mut rx) = mpsc::channel::<crate::server_native::MonitorUpdate>(16);
+        for tag in [2, 3] {
+            tx.send(upd(tag)).await.unwrap();
+        }
+        let mut pending: VecDeque<crate::server_native::MonitorUpdate> = VecDeque::new();
+        let (front, overflow) = drain_monitor_queue(&mut rx, upd(1), &mut pending, 1);
+        assert!(overflow, "limit 1 squashes every later post into the front");
+        assert!(
+            pending.is_empty(),
+            "limit 1 leaves no distinct queue entries"
+        );
+        assert_eq!(
+            unsent(&front, &pending),
+            vec![val(3)],
+            "limit 1 collapses in-hand + posts to the single newest value"
+        );
+
+        // A descriptor-change boundary among the posts is sticky through the
+        // squash: at limit 1 it coalesces into the front, which the loop
+        // then detects (MONITOR FINISH) rather than encoding a stale value.
+        let (tx, mut rx) = mpsc::channel::<crate::server_native::MonitorUpdate>(16);
+        tx.send(upd(2)).await.unwrap();
+        tx.send(crate::server_native::MonitorUpdate::type_change())
+            .await
+            .unwrap();
+        let mut pending: VecDeque<crate::server_native::MonitorUpdate> = VecDeque::new();
+        let (front, _overflow) = drain_monitor_queue(&mut rx, upd(1), &mut pending, 1);
+        assert!(
+            front.type_changed,
+            "a boundary post must survive the limit-1 squash into the front"
         );
     }
 

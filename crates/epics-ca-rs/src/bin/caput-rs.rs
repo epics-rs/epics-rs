@@ -320,15 +320,29 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // Re-read for echoing to stdout (matches C caput which always
-    // reads the PV back after the put, caput.c:583). Same readback type
-    // selection as the `Old :` read above, so an ENUM `New :` value also
-    // echoes as the state label. `echo_fallback` is shown if the post-put
-    // read fails — just what was written.
+    // Re-read for echoing to stdout (matches C caput which always reads the PV
+    // back after the put, caput.c:583). Same readback type selection as the
+    // `Old :` read above, so an ENUM `New :` value also echoes as the state
+    // label. C returns this readback's status as caput's exit status
+    // (caput.c:589): a read TIMEOUT or a total DISCONNECT must fail the command
+    // (see `postput_read_fatal`), so we exit non-zero before printing rather
+    // than hiding the failure behind the submitted value. Other readback errors
+    // (e.g. read-access denied, which C exits 0 on) fall back to echoing the
+    // submitted value and exit 0, matching C's exit code.
     let echo_fallback = parsed_value.echo_fallback();
     let (new_value, new_snap) = match read_display(ch.clone()).await {
         Ok(pair) => pair,
-        Err(_) => (echo_fallback.clone(), None),
+        Err(e) => match postput_read_fatal(&e) {
+            Some(FatalReadback::Timeout) => {
+                eprintln!("Read operation timed out: PV data was not read.");
+                std::process::exit(1);
+            }
+            Some(FatalReadback::Disconnect) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+            None => (echo_fallback.clone(), None),
+        },
     };
 
     let mut fmt = ValueFormat::default();
@@ -414,7 +428,8 @@ enum WriteValue {
 }
 
 impl WriteValue {
-    /// Value used to echo `New :` if the post-put read-back fails.
+    /// Value used to echo `New :` if the post-put read-back fails
+    /// non-fatally (see [`postput_read_fatal`]).
     fn echo_fallback(&self) -> epics_ca_rs::EpicsValue {
         match self {
             WriteValue::Typed(v) => v.clone(),
@@ -422,6 +437,41 @@ impl WriteValue {
             WriteValue::EnumString(s) => epics_ca_rs::EpicsValue::String(s.clone()),
             WriteValue::EnumStringArray(v) => epics_ca_rs::EpicsValue::StringArray(v.clone()),
         }
+    }
+}
+
+/// A post-put readback error that C `caput` propagates to a non-zero exit.
+#[derive(Debug, PartialEq, Eq)]
+enum FatalReadback {
+    /// `ca_pend_io` timed out — C `caget` prints the read-timeout message and
+    /// returns `ECA_TIMEOUT` (`caput.c:186-188`).
+    Timeout,
+    /// No channel connected for the readback — C `caget` returns `1` from its
+    /// `if (!nConn) return 1` guard (`caput.c:181`).
+    Disconnect,
+}
+
+/// Classify a post-put readback error by C `caput`'s exit-status contract.
+///
+/// C always issues `caget()` after the put and returns its result as the
+/// process exit status (`caput.c:583,589`). Inside `caget()` only two
+/// conditions make the status non-`ECA_NORMAL`: a `ca_pend_io` timeout
+/// (`caput.c:186-188`) and "no PV connected" (`caput.c:181`). A read whose
+/// `ca_array_get` fails *synchronously* — most notably read-access-denied,
+/// which libca rejects client-side with `ECA_NORDACCESS` before any I/O is
+/// outstanding — leaves `ca_pend_io` at `ECA_NORMAL`; `caget()` prints a
+/// `*** ...` marker for that PV but still returns success, so C exits `0`
+/// (`caput.c:200-206`). This classifier therefore marks ONLY `Timeout` and
+/// `Disconnected`/`Shutdown` as fatal; every other readback error is
+/// non-fatal (echo the submitted value, exit `0`), matching C's exit code.
+/// Returns `None` for the non-fatal case.
+///
+/// Regression R0604-CAPUT-POSTPUT-READBACK-STATUS-1.
+fn postput_read_fatal(err: &CaError) -> Option<FatalReadback> {
+    match err {
+        CaError::Timeout => Some(FatalReadback::Timeout),
+        CaError::Disconnected | CaError::Shutdown => Some(FatalReadback::Disconnect),
+        _ => None,
     }
 }
 
@@ -732,11 +782,62 @@ fn parse_array(
 
 #[cfg(test)]
 mod tests {
-    use super::{WriteValue, build_write_value, raw_from_escaped, raw_from_escaped_string};
-    use epics_ca_rs::{DbFieldType, EpicsValue};
+    use super::{
+        FatalReadback, WriteValue, build_write_value, postput_read_fatal, raw_from_escaped,
+        raw_from_escaped_string,
+    };
+    use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
 
     fn vals(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// Regression R0604-CAPUT-POSTPUT-READBACK-STATUS-1: the post-put readback
+    /// status must follow C `caput`'s exit-code contract — a read TIMEOUT and a
+    /// total DISCONNECT fail the command (C `caget` returns ECA_TIMEOUT /
+    /// `!nConn` returns 1, caput.c:181,186-188), while a synchronously-failed
+    /// read such as read-access-denied leaves `ca_pend_io` at ECA_NORMAL so
+    /// C exits 0 (caput.c:200-206). Boundary cases, one per classifier arm.
+    #[test]
+    fn postput_read_timeout_is_fatal() {
+        assert_eq!(
+            postput_read_fatal(&CaError::Timeout),
+            Some(FatalReadback::Timeout),
+            "read timeout must fail caput like C ca_pend_io ECA_TIMEOUT"
+        );
+    }
+
+    #[test]
+    fn postput_read_disconnect_is_fatal() {
+        // Both disconnect and shutdown map to C's `!nConn` no-connection guard.
+        assert_eq!(
+            postput_read_fatal(&CaError::Disconnected),
+            Some(FatalReadback::Disconnect),
+            "disconnected readback must fail caput like C caget !nConn"
+        );
+        assert_eq!(
+            postput_read_fatal(&CaError::Shutdown),
+            Some(FatalReadback::Disconnect),
+            "client shutdown during readback must fail caput"
+        );
+    }
+
+    #[test]
+    fn postput_read_other_errors_are_nonfatal() {
+        // Read-access-denied and other synchronous CA failures: C's caget still
+        // returns ECA_NORMAL (ca_pend_io never timed out) → caput exits 0. These
+        // must be non-fatal so we echo the submitted value and exit 0, NOT
+        // over-correct to non-zero (the finding's prescription was wrong here).
+        assert_eq!(
+            postput_read_fatal(&CaError::ServerError(0x178)), // ECA_NORDACCESS
+            None,
+            "read-access-denied exits 0 in C, must stay non-fatal"
+        );
+        assert_eq!(
+            postput_read_fatal(&CaError::Protocol("bad frame".into())),
+            None,
+            "other readback errors exit 0 in C, must stay non-fatal"
+        );
     }
 
     #[test]

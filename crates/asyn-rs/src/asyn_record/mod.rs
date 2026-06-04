@@ -117,6 +117,12 @@ fn menu_index_to_baud_rate(idx: i32) -> i32 {
 /// (`asynFMT_Binary` in EPICS `asynRecord.dbd`; ASCII = 0, Hybrid = 1.)
 const ASYN_FMT_BINARY: i32 = 2;
 
+/// `asynFMT` menu value for ASCII I/O format (`asynFMT_ASCII` in EPICS
+/// `asynRecord.dbd`). On the input side C selects the read destination by
+/// IFMT: ASCII reads land in the AINP string, Binary/Hybrid in the BINP
+/// byte buffer (`asynRecord.c:1503-1509`, monitor `:1012-1018`).
+const ASYN_FMT_ASCII: i32 = 0;
+
 fn translate_escape(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len());
     let mut chars = s.bytes().peekable();
@@ -1259,10 +1265,22 @@ impl AsynRecord {
                             self.eomr = result.eom_reason as i32;
                             if let Some(data) = result.data {
                                 self.nord = data.len() as i32;
-                                self.ainp = String::from_utf8_lossy(&data).to_string();
+                                // C asynRecord stores the device bytes into the
+                                // single IFMT-selected input field: ASCII -> AINP,
+                                // Binary/Hybrid -> the BINP byte buffer
+                                // (asynRecord.c:1503-1509); TINP is the escaped
+                                // textual view posted for every read mode, and the
+                                // monitor path posts only the selected field
+                                // (asynRecord.c:1012-1018,1627-1631). Writing both
+                                // AINP and BINP on every read makes clients watching
+                                // the unselected field see values Base never posts.
                                 self.tinp =
                                     crate::trace::format_io_data(&data, TraceIoMask::ESCAPE);
-                                self.binp = data;
+                                if self.ifmt == ASYN_FMT_ASCII {
+                                    self.ainp = String::from_utf8_lossy(&data).to_string();
+                                } else {
+                                    self.binp = data;
+                                }
                             }
                         }
                         Err(e) => {
@@ -2160,6 +2178,98 @@ mod tests {
         let entry = registry::get_port("test_asyn_rec");
         assert!(entry.is_some());
         assert_eq!(entry.unwrap().handle.port_name(), "test_asyn_rec");
+    }
+
+    /// Regression R0604-ASYN-IFMT-FIELDS-1.
+    ///
+    /// C asynRecord stores a device octet read into the single IFMT-selected
+    /// input field — ASCII into AINP, Binary/Hybrid into the BINP byte buffer
+    /// (`asynRecord.c:1503-1509`) — and the monitor path posts only that field
+    /// plus the always-escaped TINP (`asynRecord.c:1012-1018`). Pre-fix Rust
+    /// set AINP (lossy UTF-8), TINP, and BINP on every read regardless of
+    /// IFMT, so a client watching the unselected field saw values and changes
+    /// Base never publishes.
+    #[test]
+    fn octet_read_updates_only_ifmt_selected_field() {
+        use crate::interpose::EomReason;
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::user::AsynUser;
+        use tokio::sync::mpsc;
+
+        // A non-UTF8 leading byte makes the AINP lossy text observably
+        // different from the raw BINP bytes.
+        const PAYLOAD: &[u8] = &[0xFF, b'A', b'B'];
+
+        struct OctetDriver(PortDriverBase);
+        impl PortDriver for OctetDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn io_read_octet_eom(
+                &mut self,
+                _user: &AsynUser,
+                buf: &mut [u8],
+            ) -> crate::error::AsynResult<(usize, EomReason)> {
+                let n = PAYLOAD.len().min(buf.len());
+                buf[..n].copy_from_slice(&PAYLOAD[..n]);
+                Ok((n, EomReason::END))
+            }
+        }
+
+        let port_name = "test_ifmt_octet_read";
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(
+            Box::new(OctetDriver(PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags::default(),
+            ))),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), interrupts);
+        register_port(port_name, handle, Arc::new(TraceManager::new()));
+
+        // ASCII read: AINP gets the (lossy) text; BINP must stay untouched.
+        let mut ascii = AsynRecord::default();
+        ascii.port = port_name.to_string();
+        ascii.connect_device();
+        ascii.iface = 0; // asynOctet
+        ascii.tmod = TransferMode::Read as i32;
+        ascii.imax = 256;
+        ascii.ifmt = ASYN_FMT_ASCII;
+        ascii.binp = b"SENTINEL".to_vec();
+        ascii.process().unwrap();
+        assert_eq!(ascii.errs, "");
+        assert_eq!(ascii.nord, PAYLOAD.len() as i32);
+        assert_eq!(ascii.ainp, String::from_utf8_lossy(PAYLOAD));
+        assert_eq!(
+            ascii.binp,
+            b"SENTINEL".to_vec(),
+            "ASCII read must not touch BINP"
+        );
+        assert!(!ascii.tinp.is_empty(), "TINP is posted for every read mode");
+
+        // Binary read: BINP gets the raw bytes; AINP must stay untouched.
+        let mut binary = AsynRecord::default();
+        binary.port = port_name.to_string();
+        binary.connect_device();
+        binary.iface = 0;
+        binary.tmod = TransferMode::Read as i32;
+        binary.imax = 256;
+        binary.ifmt = ASYN_FMT_BINARY;
+        binary.ainp = "SENTINEL".to_string();
+        binary.process().unwrap();
+        assert_eq!(binary.errs, "");
+        assert_eq!(binary.nord, PAYLOAD.len() as i32);
+        assert_eq!(binary.binp, PAYLOAD.to_vec());
+        assert_eq!(binary.ainp, "SENTINEL", "Binary read must not touch AINP");
     }
 
     #[test]

@@ -126,6 +126,27 @@ pub enum ScalarValue {
     String(PvString),
 }
 
+/// Source-compatibility `Default` for the public [`ScalarValue`] API.
+///
+/// `ScalarValue` is re-exported from [`crate::pvdata`], so downstream crates
+/// can name it directly and rely on `Default` for optional scalar slots, test
+/// fixtures, or `T: Default` bounds. The historical default is `Int(0)`; it is
+/// kept purely for that compatibility — the NTNDArray attribute model that was
+/// the original reason for deriving it now carries its own manual `Default`
+/// (`VariantValue::null()`), so this impl no longer has an internal caller and
+/// exists only so the exported type's `Default` does not silently disappear.
+/// Regression R0604-PVDATA-SCALARVALUE-DEFAULT-API-1.
+///
+/// ```
+/// use epics_pva_rs::pvdata::ScalarValue;
+/// assert_eq!(ScalarValue::default(), ScalarValue::Int(0));
+/// ```
+impl Default for ScalarValue {
+    fn default() -> Self {
+        ScalarValue::Int(0)
+    }
+}
+
 /// Typed conversions into [`ScalarValue`], so the pvRequest builder's
 /// `record(key, value)` preserves the caller's scalar type — pvxs
 /// `CommonBuilder::record<T>` stores `Value::Helper::build(value, vtype)`

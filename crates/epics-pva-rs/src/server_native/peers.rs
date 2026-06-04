@@ -62,9 +62,28 @@ impl ChannelStat {
     }
 
     /// Attribute `n` received bytes to this channel (pvxs
-    /// `chan->statRx += rxlen`).
+    /// `chan->statRx += rxlen`). Low-level primitive; production op
+    /// handlers must use [`Self::add_op_rx`] so the 8-byte header is
+    /// never dropped from the count.
     pub(crate) fn add_rx(&self, n: usize) {
         self.rx.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    /// Attribute one inbound op [`Frame`] to this channel, charging the
+    /// full framed PVA byte count (`PvaHeader::SIZE + body`) — pvxs
+    /// `rxlen = 8u + evbuffer_get_length(segBuf)` accumulated into
+    /// `chan->statRx` (serverget.cpp:349/386, servermon.cpp:478/513,
+    /// serverintrospect.cpp:145/164). This is the single per-channel
+    /// op-RX owner: taking the received [`Frame`] rather than a raw
+    /// `usize` is the structural guard for
+    /// R0604-PVASRV-REPORT-CHANNEL-BYTE-ACCOUNTING-1 — every op handler
+    /// previously called `add_rx(frame.payload.len())` and under-counted
+    /// the header by 8 bytes per request, so no caller can pass the body
+    /// length alone here.
+    ///
+    /// [`Frame`]: crate::client_native::decode::Frame
+    pub(crate) fn add_op_rx(&self, frame: &crate::client_native::decode::Frame) {
+        self.add_rx(crate::proto::PvaHeader::SIZE + frame.payload.len());
     }
 }
 

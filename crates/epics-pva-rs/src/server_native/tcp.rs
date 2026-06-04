@@ -3633,7 +3633,7 @@ async fn handle_put_get(
     // Attribute the inbound PUT_GET frame to the channel and route every
     // reply through `chan_tx` (pvxs `chan->statRx`/`statTx`; see
     // `handle_op`).
-    ch.stat.add_rx(frame.payload.len());
+    ch.stat.add_op_rx(frame);
     let chan_tx = ChannelTx::new(tx.clone(), ch.stat.clone());
 
     // Dispatch to the CREATE_CHANNEL-bound owner, not the registry
@@ -4018,7 +4018,7 @@ async fn handle_process(
     // Attribute the inbound PROCESS frame to the channel and route every
     // reply through `chan_tx` (pvxs `chan->statRx`/`statTx`; see
     // `handle_op`).
-    ch.stat.add_rx(frame.payload.len());
+    ch.stat.add_op_rx(frame);
     let chan_tx = ChannelTx::new(tx.clone(), ch.stat.clone());
 
     // Dispatch to the CREATE_CHANNEL-bound owner, not the registry
@@ -4327,7 +4327,7 @@ async fn handle_channel_array(
             return Ok(());
         }
     };
-    ch.stat.add_rx(frame.payload.len());
+    ch.stat.add_op_rx(frame);
     let chan_tx = ChannelTx::new(tx.clone(), ch.stat.clone());
 
     // Dispatch to the CREATE_CHANNEL-bound owner, not the registry.
@@ -4902,6 +4902,29 @@ struct ChannelTeardownCtx<'a> {
     peer_entry: &'a Arc<crate::server_native::peers::PeerEntry>,
 }
 
+/// Why a channel is being torn down with a DESTROY_CHANNEL frame. pvxs
+/// attributes the 16-byte reply to the report differently for the two
+/// causes, so the single teardown owner must know which one it serves
+/// (Regression R0604-PVASRV-REPORT-CHANNEL-BYTE-ACCOUNTING-1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DestroyCause {
+    /// Server-initiated unsolicited destroy: PVA gateway operator
+    /// `:drop`/`:flush`, the read loop's invalidation arm. pvxs
+    /// `ServerChannelControl::close()` sends the reply and charges BOTH
+    /// the connection AND the channel `statTx += 16u`
+    /// (serverchan.cpp:151-152), then runs `cleanup()` — so the report
+    /// can show the live channel with the 16-byte reply attributed.
+    ServerInitiated,
+    /// Client-initiated `DESTROY_CHANNEL` (cmd 8): the peer asked us to
+    /// drop the channel. pvxs `ServerConn::handle_DESTROY_CHANNEL()`
+    /// erases the channel from `chanBySID` and cleans it up FIRST, then
+    /// sends the 16-byte reply charging only the connection `statTx`
+    /// with the explicit note "don't bother to increment for channel"
+    /// (serverchan.cpp:404-411). The per-channel report entry is gone
+    /// before the reply, so no report attributes the reply to a channel.
+    ClientInitiated,
+}
+
 /// Single owner of a channel teardown that notifies the peer with a
 /// DESTROY_CHANNEL frame. EVERY teardown path that emits DESTROY_CHANNEL —
 /// the client-initiated [`handle_destroy_channel`] and the server-initiated
@@ -4914,10 +4937,17 @@ struct ChannelTeardownCtx<'a> {
 ///    subscriptions),
 /// 2. runs [`close_channel`] (op teardown → bound source `onClose`, pvxs
 ///    `ServerChan::cleanup` serverchan.cpp:43-60),
-/// 3. emits the DESTROY_CHANNEL frame (`sid + cid`, charged to the
-///    channel's stat — pvxs serverchan.cpp:409 `statTx += 16u`), and
+/// 3. emits the DESTROY_CHANNEL frame (`sid + cid`), and
 /// 4. drops the `PeerEntry` report entry (`channel_closed`, pvxs removes
 ///    from `conn->chanBySID`).
+///
+/// Steps 3 and 4 differ by `cause` to match pvxs report accounting (see
+/// [`DestroyCause`]): the server-initiated path charges the reply to the
+/// channel's `statTx` then drops the report entry (pvxs `close()`); the
+/// client-initiated path drops the report entry FIRST and charges no
+/// channel `statTx` (pvxs `handle_DESTROY_CHANNEL()`). The
+/// connection-level `bytes_out` counter is charged by the writer task for
+/// the frame in BOTH cases, so only the per-channel attribution varies.
 ///
 /// Returns `true` when a channel was actually present and torn down,
 /// `false` for an unknown SID (no-op, no reply). `ctx.order` is the
@@ -4925,6 +4955,7 @@ struct ChannelTeardownCtx<'a> {
 async fn finalize_channel_destroy(
     sid: u32,
     cid: u32,
+    cause: DestroyCause,
     channels: &mut HashMap<u32, ChannelState>,
     ctx: &ChannelTeardownCtx<'_>,
 ) -> bool {
@@ -4936,11 +4967,19 @@ async fn finalize_channel_destroy(
     let Some(ch) = channels.remove(&sid) else {
         return false;
     };
-    // Charge the DESTROY_CHANNEL reply to the channel being torn down;
-    // capture its counter before `close_channel` consumes the state. pvxs
-    // charges no per-channel `statRx` for CREATE/DESTROY — only the reply.
+    // Capture the channel's stat before `close_channel` consumes the
+    // state, so the server-initiated path can charge the reply below.
     let stat = ch.stat.clone();
     close_channel(ch, ctx.peer, ctx.cred);
+
+    // Client-initiated DESTROY: pvxs `handle_DESTROY_CHANNEL()` erases the
+    // channel from `chanBySID` BEFORE sending the reply, so drop the report
+    // entry now. With no channel `statTx` charge below, a concurrent report
+    // never shows this channel carrying the destroy reply.
+    if cause == DestroyCause::ClientInitiated {
+        ctx.peer_entry.channel_closed(sid);
+    }
+
     let mut payload = Vec::new();
     payload.put_u32(sid, ctx.order);
     payload.put_u32(cid, ctx.order);
@@ -4953,13 +4992,23 @@ async fn finalize_channel_destroy(
     let mut buf = Vec::new();
     h.write_into(&mut buf);
     buf.extend_from_slice(&payload);
-    stat.add_tx(buf.len());
+    // Server-initiated close charges the reply to the channel's `statTx`
+    // (pvxs `ch->statTx += 16u`, serverchan.cpp:152); the client-initiated
+    // path charges only the connection counter (the writer task's
+    // `bytes_out`), matching pvxs serverchan.cpp:409-410.
+    if cause == DestroyCause::ServerInitiated {
+        stat.add_tx(buf.len());
+    }
     let _ = ctx.tx.send(buf).await;
-    // Drop the per-channel report entry + live count in one owner call
-    // (pvxs removes from conn->chanBySID). Folded into this finalizer so no
-    // teardown caller can forget it — a no-op for a SID never registered
-    // (`channel_closed` is gated on a successful map removal).
-    ctx.peer_entry.channel_closed(sid);
+
+    // Server-initiated close drops the report entry AFTER charging the
+    // reply (pvxs `cleanup()` runs after `ch->statTx += 16u`). Folded into
+    // this finalizer so no teardown caller can forget it — a no-op for a
+    // SID never registered (`channel_closed` is gated on a successful map
+    // removal). The client-initiated path already dropped it above.
+    if cause == DestroyCause::ServerInitiated {
+        ctx.peer_entry.channel_closed(sid);
+    }
     true
 }
 
@@ -4985,7 +5034,7 @@ async fn invalidate_named_channels(
         .collect();
     let mut torn_down = 0;
     for (sid, cid) in victims {
-        if finalize_channel_destroy(sid, cid, channels, ctx).await {
+        if finalize_channel_destroy(sid, cid, DestroyCause::ServerInitiated, channels, ctx).await {
             torn_down += 1;
         }
     }
@@ -5038,7 +5087,7 @@ async fn handle_destroy_channel(
             "DESTROY_CHANNEL CID mismatch"
         );
     }
-    finalize_channel_destroy(sid, cid, channels, ctx).await;
+    finalize_channel_destroy(sid, cid, DestroyCause::ClientInitiated, channels, ctx).await;
     Ok(())
 }
 
@@ -5362,12 +5411,14 @@ async fn handle_op(
         }
     };
 
-    // Attribute this inbound op frame's body to the channel's report
-    // counter (pvxs `chan->statRx += rxlen`, serverget.cpp:386 /
-    // servermon.cpp:513). All per-channel reply/data frames go out
-    // through `chan_tx`, the single owner of `statTx` accounting, so the
-    // outbound count cannot be skipped at any send site.
-    ch.stat.add_rx(frame.payload.len());
+    // Attribute this inbound op frame to the channel's report counter as
+    // its full framed length (`PvaHeader::SIZE + body`), matching pvxs
+    // `chan->statRx += rxlen` where `rxlen = 8u + body` (serverget.cpp:386
+    // / servermon.cpp:513). `add_op_rx` owns the `+ header`, so no site
+    // can regress to charging the body alone. All per-channel reply/data
+    // frames go out through `chan_tx`, the single owner of `statTx`
+    // accounting, so the outbound count cannot be skipped at any send site.
+    ch.stat.add_op_rx(frame);
     let chan_tx = ChannelTx::new(tx.clone(), ch.stat.clone());
 
     // Dispatch every operation to the source bound at CREATE_CHANNEL,
@@ -7489,7 +7540,7 @@ async fn handle_get_field(
     // `ch->statTx += enqueueTxBody(CMD_GET_FIELD)`); both the cached
     // fast-path reply and the spawned slow-path reply go through
     // `chan_tx`.
-    chan.stat.add_rx(frame.payload.len());
+    chan.stat.add_op_rx(frame);
     let chan_tx = ChannelTx::new(tx.clone(), chan.stat.clone());
     if let Some(intro) = chan.introspection.clone() {
         // Fast path: introspection already cached on the channel; reply
@@ -14579,11 +14630,13 @@ mod tests {
     }
 
     /// Per-channel report attribution wiring: a GET_FIELD request charges
-    /// the inbound body to the channel's `statRx` and the reply to its
-    /// `statTx` (pvxs serverintrospect.cpp:45/164). Drives the real
-    /// handler and reads back the SHARED `ChannelStat` Arc the report
-    /// would observe, so a future send site that bypasses `chan_tx` (or a
-    /// missing rx charge) regresses this test.
+    /// the FULL framed inbound length (`PvaHeader::SIZE + body`) to the
+    /// channel's `statRx` and the reply to its `statTx` (pvxs
+    /// serverintrospect.cpp:45/164, where `rxlen = 8u + body`). Drives the
+    /// real handler and reads back the SHARED `ChannelStat` Arc the report
+    /// would observe, so a future send site that bypasses `chan_tx` (or an
+    /// rx charge that drops the 8-byte header) regresses this test
+    /// (Regression R0604-PVASRV-REPORT-CHANNEL-BYTE-ACCOUNTING-1).
     #[tokio::test]
     async fn get_field_attributes_tx_rx_to_channel_stat() {
         use crate::pvdata::FieldDesc;
@@ -14643,14 +14696,125 @@ mod tests {
 
         assert_eq!(
             stat.rx.load(Ordering::Relaxed),
-            inbound_body as u64,
-            "GET_FIELD inbound body must be charged to the channel statRx"
+            (PvaHeader::SIZE + inbound_body) as u64,
+            "GET_FIELD framed length (header + body) must be charged to the channel statRx (pvxs rxlen = 8 + body)"
         );
         assert_eq!(
             stat.tx.load(Ordering::Relaxed),
             resp.len() as u64,
             "GET_FIELD reply must be charged to the channel statTx"
         );
+    }
+
+    /// Owner math for per-channel inbound op-RX accounting
+    /// (R0604-PVASRV-REPORT-CHANNEL-BYTE-ACCOUNTING-1): `add_op_rx` must
+    /// charge the FULL framed length `PvaHeader::SIZE + body`, matching
+    /// pvxs `rxlen = 8u + evbuffer_get_length(segBuf)`. Every op handler
+    /// (PUT_GET / PROCESS / ARRAY / GET / PUT / MONITOR / RPC / GET_FIELD)
+    /// funnels its inbound frame through this one method, so a body-only
+    /// charge (the pre-fix `add_rx(frame.payload.len())`) would 8-byte
+    /// under-count every op reported under a live channel. Driving the
+    /// single owner directly keeps the boundary anchored even as handlers
+    /// are added.
+    #[test]
+    fn add_op_rx_charges_framed_length_header_plus_body() {
+        use std::sync::atomic::Ordering;
+        let stat = crate::server_native::peers::ChannelStat::new("dut".into());
+        // 13-byte body → framed length must be header (8) + 13 = 21.
+        let frame = synth_frame(Command::Get, ByteOrder::Little, vec![0u8; 13]);
+        stat.add_op_rx(&frame);
+        assert_eq!(
+            stat.rx.load(Ordering::Relaxed),
+            (PvaHeader::SIZE + 13) as u64,
+            "per-channel op RX must be 8-byte header + body, not body alone"
+        );
+        // A second frame accumulates, proving `+=` semantics, not `=`.
+        let frame2 = synth_frame(Command::Monitor, ByteOrder::Little, vec![0u8; 5]);
+        stat.add_op_rx(&frame2);
+        assert_eq!(
+            stat.rx.load(Ordering::Relaxed),
+            (PvaHeader::SIZE + 13 + PvaHeader::SIZE + 5) as u64,
+            "successive op frames accumulate framed lengths"
+        );
+    }
+
+    /// Sub-defect B boundary: the 16-byte DESTROY_CHANNEL reply is charged
+    /// to the channel `statTx` for a server-initiated close (pvxs
+    /// `ServerChannelControl::close()`, serverchan.cpp:151-152) but NOT for
+    /// a client-initiated DESTROY_CHANNEL (pvxs
+    /// `ServerConn::handle_DESTROY_CHANNEL()`, serverchan.cpp:404-411 —
+    /// "don't bother to increment for channel"). Both drop the per-channel
+    /// report entry. One case per `DestroyCause` boundary; before the fix a
+    /// single finalizer charged the channel reply unconditionally, so the
+    /// client case over-counted (Regression
+    /// R0604-PVASRV-REPORT-CHANNEL-BYTE-ACCOUNTING-1).
+    #[tokio::test]
+    async fn destroy_channel_tx_attribution_splits_by_cause() {
+        use std::sync::atomic::Ordering;
+        let order = ByteOrder::Little;
+        for (cause, charges_channel_tx) in [
+            (DestroyCause::ServerInitiated, true),
+            (DestroyCause::ClientInitiated, false),
+        ] {
+            let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
+            let sid = 1u32;
+            let cid = 10u32;
+            let stat = crate::server_native::peers::ChannelStat::new("dut".into());
+            let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+            channels.insert(
+                sid,
+                ChannelState {
+                    name: "dut".into(),
+                    cid,
+                    sid,
+                    introspection: None,
+                    source: source.clone(),
+                    stat: stat.clone(),
+                    ops: HashMap::new(),
+                },
+            );
+            let peer_entry = crate::server_native::peers::PeerEntry::new(false);
+            peer_entry.channel_opened(sid, stat.clone());
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+            let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+            let cred = ClientCredentials::anonymous();
+            let teardown = ChannelTeardownCtx {
+                tx: &tx,
+                order,
+                peer,
+                cred: &cred,
+                peer_entry: &peer_entry,
+            };
+
+            let torn = finalize_channel_destroy(sid, cid, cause, &mut channels, &teardown).await;
+            assert!(torn, "{cause:?}: the live channel was torn down");
+
+            let frame = rx
+                .try_recv()
+                .unwrap_or_else(|_| panic!("{cause:?}: DESTROY_CHANNEL frame must be emitted"));
+            assert_eq!(frame.len(), PvaHeader::SIZE + 8, "{cause:?}: 16-byte reply");
+
+            let expected_channel_tx = if charges_channel_tx {
+                frame.len() as u64
+            } else {
+                0
+            };
+            assert_eq!(
+                stat.tx.load(Ordering::Relaxed),
+                expected_channel_tx,
+                "{cause:?}: per-channel statTx (server charges the reply, client does not — pvxs serverchan.cpp:152 vs :410)"
+            );
+            assert_eq!(
+                peer_entry.channels.load(Ordering::SeqCst),
+                0,
+                "{cause:?}: per-channel report entry + live count dropped"
+            );
+            assert!(
+                channels.is_empty(),
+                "{cause:?}: connection channel-table entry removed"
+            );
+        }
     }
 
     /// GET_FIELD slow path on a channel whose source returns no

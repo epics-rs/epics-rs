@@ -1935,23 +1935,23 @@ impl Pauser {
 
 /// classification of a frame arriving on the raw MONITOR
 /// stream. The control-frame policy lives here as one pure, testable
-/// decision so a malformed control frame cannot be silently skipped or
-/// reported as a clean end-of-stream — the two swallow bugs the raw
-/// loop previously had (`payload.len() < 5 => continue` and a FINISH
-/// `Status::decode` failure falling through to `Ok(())`).
+/// decision so a malformed or out-of-state control frame cannot be
+/// silently skipped or reported as a clean end-of-stream — the swallow
+/// bugs the raw loop previously had (`payload.len() < 5 => continue`, a
+/// FINISH `Status::decode` failure falling through to `Ok(())`, and a
+/// second INIT or any unexpected subcmd treated as a benign skip).
 #[derive(Debug)]
 enum RawMonitorFrameKind {
     /// subcmd `0x00` — a DATA frame; the caller forwards `payload[5..]`.
     Data,
-    /// A non-DATA, non-FINISH control frame (e.g. a pipeline ACK echo) —
-    /// the caller ignores it.
-    Skip,
     /// FINISH (`subcmd & 0x10`) carrying a success Status — clean end of
     /// stream.
     FinishOk,
     /// A fatal condition: a truncated frame (shorter than `ioid +
-    /// subcmd`), a FINISH whose required Status cannot be decoded, or a
-    /// FINISH carrying a non-success Status. The caller surfaces
+    /// subcmd`), a FINISH whose required Status cannot be decoded, a
+    /// FINISH carrying a non-success Status, a second INIT
+    /// (`subcmd & 0x08`) on a running subscription, or any other subcmd
+    /// a server never emits on a monitor stream. The caller surfaces
     /// `MonitorEnd::Fatal`.
     Fatal(PvaError),
 }
@@ -1973,6 +1973,18 @@ fn classify_raw_monitor_frame(payload: &[u8], order: ByteOrder) -> RawMonitorFra
     if subcmd == 0x00 {
         return RawMonitorFrameKind::Data;
     }
+    // pvxs reads `init = subcmd & 0x08` (clientmon.cpp:479) and gates on it
+    // BEFORE the FINISH/data branches: a monitor that is no longer Creating
+    // but receives an INIT subcmd is a state-machine violation — the buffer
+    // faults and the connection is reset (clientmon.cpp:589-605). The raw
+    // loop runs only post-START (the monitor is Running), so any INIT here
+    // is fatal, never a skippable control frame. Checked before 0x10 to
+    // mirror pvxs's init-first precedence.
+    if subcmd & 0x08 != 0 {
+        return RawMonitorFrameKind::Fatal(PvaError::Protocol(format!(
+            "MONITOR INIT (subcmd {subcmd:#04x}) on a running subscription"
+        )));
+    }
     if subcmd & 0x10 != 0 {
         // FINISH carries a required Status after the subcmd. A decode
         // failure must NOT degrade to a clean end-of-stream — that would
@@ -1988,8 +2000,16 @@ fn classify_raw_monitor_frame(payload: &[u8], order: ByteOrder) -> RawMonitorFra
             ))),
         };
     }
-    // Non-DATA, non-FINISH control frame (pipeline ACK echo etc.).
-    RawMonitorFrameKind::Skip
+    // A server emits only DATA (0x00), INIT (0x08), and FINISH (0x10) on a
+    // monitor stream (pvxs servermon.cpp:133-149); START/STOP/ACK subcmds
+    // are client->server only. Any other subcmd from the server is a
+    // protocol violation, not a benign control frame: this loop forwards
+    // bodies without decoding, so swallowing it would desync the stream and
+    // hide the violation from a forwarding gateway. pvxs decode-faults such
+    // a frame and resets the connection (clientmon.cpp:601-605).
+    RawMonitorFrameKind::Fatal(PvaError::Protocol(format!(
+        "MONITOR unexpected subcmd {subcmd:#04x} on a running subscription"
+    )))
 }
 
 /// Serialize a pvRequest VALUE to its on-wire `descriptor + value`
@@ -2359,9 +2379,6 @@ where
         match classify_raw_monitor_frame(&frame.payload, order) {
             // subcmd 0x00: DATA — fall through to body forwarding below.
             RawMonitorFrameKind::Data => {}
-            // Non-DATA, non-FINISH control frame (pipeline ACK echo); we
-            // drive ACKs ourselves, so ignore it.
-            RawMonitorFrameKind::Skip => continue,
             RawMonitorFrameKind::FinishOk => {
                 server.unregister_ioid(ioid);
                 // clear the handle's `active` tuple on FINISH so
@@ -5261,6 +5278,43 @@ mod tests {
             classify_raw_monitor_frame(&payload, ByteOrder::Little),
             RawMonitorFrameKind::Data
         ));
+    }
+
+    /// Regression R0604-PVACLI-RAW-MONITOR-SECOND-INIT-1. A second INIT
+    /// (`subcmd & 0x08`) on a running raw monitor is a state-machine
+    /// violation: pvxs faults the buffer and resets the connection
+    /// (clientmon.cpp:589-605). The classifier must surface it as
+    /// `Fatal`, never swallow it as a benign skipped control frame.
+    #[test]
+    fn raw_monitor_second_init_is_fatal_protocol() {
+        // subcmd 0x08 (INIT) with a trailing body (Status + descriptor
+        // shape) — irrelevant, since the frame is rejected on the subcmd.
+        let payload = [0u8, 0, 0, 0, 0x08, 0xff, 0x00];
+        match classify_raw_monitor_frame(&payload, ByteOrder::Little) {
+            RawMonitorFrameKind::Fatal(PvaError::Protocol(msg)) => {
+                assert!(msg.contains("INIT"), "msg: {msg}");
+            }
+            other => panic!("second INIT must be Fatal(Protocol), got {other:?}"),
+        }
+    }
+
+    /// Regression R0604-PVACLI-RAW-MONITOR-SECOND-INIT-1 (structural). A
+    /// server emits only DATA (0x00), INIT (0x08), and FINISH (0x10) on a
+    /// monitor stream (servermon.cpp:133-149); START/STOP/ACK are
+    /// client->server only. The classifier no longer treats an unexpected
+    /// subcmd as a benign skip — it is a protocol violation, matching
+    /// pvxs's decode-fault + reset on an out-of-state monitor frame.
+    #[test]
+    fn raw_monitor_unexpected_subcmd_is_fatal_protocol() {
+        // subcmd 0x04 (STOP) is a client->server control byte; a server
+        // never sends it on the monitor stream.
+        let payload = [0u8, 0, 0, 0, 0x04];
+        match classify_raw_monitor_frame(&payload, ByteOrder::Little) {
+            RawMonitorFrameKind::Fatal(PvaError::Protocol(msg)) => {
+                assert!(msg.contains("unexpected subcmd"), "msg: {msg}");
+            }
+            other => panic!("unexpected subcmd must be Fatal(Protocol), got {other:?}"),
+        }
     }
 
     #[test]

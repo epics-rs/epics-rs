@@ -1116,6 +1116,29 @@ pub(crate) async fn search_matched_cids(
     if !protocol_ok {
         return Vec::new();
     }
+    matched_cids_for_requester(source, req, requester).await
+}
+
+/// Name-match core: the CIDs in `req` whose names this server will answer
+/// for `requester`, WITHOUT the transport-protocol gate. This is the rule
+/// pvxs applies on an established TCP circuit — `handle_SEARCH` parses the
+/// protocol strings into `foundtcp` but never consults it before calling
+/// every source's `onSearch` (serverchan.cpp:184-244). The transport was
+/// already negotiated when the circuit opened, so a SEARCH payload's
+/// protocol list does not re-gate matches on that circuit.
+///
+/// The UDP responders need the protocol gate (a broadcast SEARCH must not
+/// pull a `found=1` from a server that does not speak the requested
+/// transport), so [`search_matched_cids`] wraps this with that gate. The
+/// TCP-circuit handler calls this directly. Splitting the gate out keeps
+/// the per-query `searchable_from` rule (endpoint-scoped advertisement,
+/// pvxs `Search::source()`) shared across all three responders while the
+/// protocol policy differs by transport.
+pub(crate) async fn matched_cids_for_requester(
+    source: &DynSource,
+    req: &SearchRequest,
+    requester: SocketAddr,
+) -> Vec<u32> {
     let mut matched = Vec::with_capacity(req.queries.len());
     for (cid, name) in &req.queries {
         // Endpoint-scoped advertisement: a source may claim a name only

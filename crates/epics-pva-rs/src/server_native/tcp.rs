@@ -5388,14 +5388,21 @@ async fn handle_tcp_search(
         ));
     };
 
-    // Default protocol on TCP is "tcp" (or "tls" when TLS is in use).
-    // Protocol-gated match set, shared with the v4/v6 UDP responders.
-    // See `udp::search_matched_cids`.
+    // Default protocol on TCP is "tcp" (or "tls" when TLS is in use); it
+    // names the transport advertised back in the SEARCH_RESPONSE.
     let protocol: &'static str = if config.tls.is_some() { "tls" } else { "tcp" };
-    // pvxs fills `Search::source` from the TCP peer for circuit search
-    // (serverchan.cpp:197-222), so a source can scope advertisement by
-    // the established peer endpoint.
-    let matched = super::udp::search_matched_cids(source, &req, protocol, peer).await;
+    // Match WITHOUT the UDP protocol gate. pvxs `handle_SEARCH` parses the
+    // SEARCH protocol strings into `foundtcp` but never consults it before
+    // calling every source's `onSearch` (serverchan.cpp:184-244): on an
+    // established circuit the transport was already negotiated at connect
+    // time, so a SEARCH payload's protocol list (e.g. `["tls"]` arriving on
+    // a plaintext TCP circuit) must NOT suppress matches. The byte-exact
+    // protocol gate stays on the v4/v6 UDP responders (a broadcast SEARCH
+    // must not pull `found=1` from a server that does not speak the
+    // requested transport). pvxs fills `Search::source` from the TCP peer
+    // (serverchan.cpp:197-222), so a source can still scope advertisement
+    // by the established peer endpoint via `searchable_from`.
+    let matched = super::udp::matched_cids_for_requester(source, &req, peer).await;
     // pvxs `serverchan.cpp:240-249`: emit the response only when
     // there's a match OR MustReply was set. Skip otherwise to
     // avoid leaking server presence on every probe.
@@ -10907,6 +10914,145 @@ mod tests {
     fn synth_frame(command: Command, order: ByteOrder, payload: Vec<u8>) -> Frame {
         let header = PvaHeader::application(false, order, command.code(), payload.len() as u32);
         Frame { header, payload }
+    }
+
+    /// Build the body of a SEARCH frame (everything after the 8-byte
+    /// header) with an arbitrary advertised protocol list. The codec's
+    /// `build_search_batch` hardcodes the protocol to `"tcp"`, so a
+    /// `["tls"]`-protocol SEARCH (the case that exercises the TCP-circuit
+    /// protocol gate) has to be hand-assembled here. Layout mirrors
+    /// `parse_search_request` (udp.rs): seq, flags, 3 reserved, 16-byte
+    /// reply addr, reply port, protocol-count + entries, query-count +
+    /// (cid, name) entries.
+    fn build_search_body(
+        order: ByteOrder,
+        seq: u32,
+        flags: u8,
+        protocols: &[&str],
+        queries: &[(u32, &str)],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.put_u32(seq, order);
+        body.put_u8(flags);
+        body.extend_from_slice(&[0u8; 3]); // reserved
+        body.extend_from_slice(&[0u8; 16]); // reply addr (unspecified)
+        body.put_u16(0, order); // reply port (unused by TCP circuit)
+        crate::proto::encode_size_into(protocols.len() as u32, order, &mut body);
+        for p in protocols {
+            crate::proto::encode_string_into(p, order, &mut body);
+        }
+        body.put_u16(queries.len() as u16, order);
+        for (cid, name) in queries {
+            body.put_u32(*cid, order);
+            crate::proto::encode_string_into(name, order, &mut body);
+        }
+        body
+    }
+
+    /// Regression R0604-PVASRV-TCP-SEARCH-PROTOCOL-GATE-1: a SEARCH
+    /// arriving on an established **plaintext TCP** circuit that advertises
+    /// only `["tls"]` must still match a hosted PV. pvxs `handle_SEARCH`
+    /// parses the protocol strings into `foundtcp` but never consults it
+    /// before calling every source's `onSearch` (serverchan.cpp:184-244):
+    /// the transport was already negotiated when the circuit opened, so the
+    /// payload's protocol list does not re-gate matches on that circuit.
+    /// (The byte-exact protocol gate is kept on the UDP responders — see
+    /// `udp::search_matched_cids_gates_on_protocol` — where a broadcast
+    /// SEARCH must not pull `found=1` from a server that does not speak the
+    /// requested transport.)
+    ///
+    /// Both sub-cases are asserted: without `MustReply` the response still
+    /// carries the found CID (because the match is real, not a forced
+    /// probe-reply), and with `MustReply` it likewise carries the CID.
+    #[tokio::test]
+    async fn tcp_search_does_not_gate_on_advertised_protocol() {
+        use crate::client_native::decode::{decode_search_response, try_parse_frame};
+        use crate::server_native::{SharedPV, SharedSource};
+
+        let order = ByteOrder::Little;
+        let shared = SharedSource::new();
+        shared.add("MY:PV", SharedPV::new());
+        let source: DynSource = Arc::new(shared);
+        // Plaintext TCP server: tls = None, so `protocol` == "tcp", while
+        // the SEARCH below advertises only "tls".
+        let config = PvaServerConfig::default();
+        assert!(
+            config.tls.is_none(),
+            "this regression targets the tcp circuit"
+        );
+        let peer: SocketAddr = "127.0.0.1:34567".parse().unwrap();
+
+        // --- (a) no MustReply: the real match alone must produce a reply. ---
+        let body = build_search_body(order, 7, 0x00, &["tls"], &[(42, "MY:PV")]);
+        let frame = synth_frame(Command::Search, order, body);
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        handle_tcp_search(&source, &frame, &tx, &config, peer)
+            .await
+            .expect("handle_tcp_search must succeed");
+        let raw = rx
+            .try_recv()
+            .expect("a matching tcp SEARCH must emit a SEARCH_RESPONSE even with no MustReply");
+        let (resp_frame, _) = try_parse_frame(&raw)
+            .expect("response must parse")
+            .expect("response must be a complete frame");
+        let resp = decode_search_response(&resp_frame).expect("decode SEARCH_RESPONSE");
+        assert!(
+            resp.found,
+            "found byte must be set: the tcp circuit matched MY:PV"
+        );
+        assert_eq!(resp.cids, vec![42], "the matched CID must be echoed back");
+        assert_eq!(resp.seq, 7, "the SEARCH seq must be echoed");
+
+        // --- (b) MustReply: the same match must still carry the CID. ---
+        let body = build_search_body(order, 9, 0x01, &["tls"], &[(43, "MY:PV")]);
+        let frame = synth_frame(Command::Search, order, body);
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        handle_tcp_search(&source, &frame, &tx, &config, peer)
+            .await
+            .expect("handle_tcp_search must succeed");
+        let raw = rx
+            .try_recv()
+            .expect("MustReply must emit a SEARCH_RESPONSE");
+        let (resp_frame, _) = try_parse_frame(&raw)
+            .expect("response must parse")
+            .expect("response must be a complete frame");
+        let resp = decode_search_response(&resp_frame).expect("decode SEARCH_RESPONSE");
+        assert!(resp.found, "MustReply match must set found");
+        assert_eq!(
+            resp.cids,
+            vec![43],
+            "MustReply must still carry the matched CID"
+        );
+        assert_eq!(resp.seq, 9);
+    }
+
+    /// Companion to the no-gate case above: a TCP-circuit SEARCH for a name
+    /// this server does NOT host, with no `MustReply`, emits nothing. This
+    /// pins that dropping the protocol gate did not turn the TCP handler
+    /// into a reply-to-everything path — a genuine name miss is still
+    /// silent (pvxs serverchan.cpp:240-249 only replies on a match or
+    /// MustReply).
+    #[tokio::test]
+    async fn tcp_search_unknown_name_without_mustreply_is_silent() {
+        use crate::server_native::{SharedPV, SharedSource};
+
+        let order = ByteOrder::Little;
+        let shared = SharedSource::new();
+        shared.add("MY:PV", SharedPV::new());
+        let source: DynSource = Arc::new(shared);
+        let config = PvaServerConfig::default();
+        let peer: SocketAddr = "127.0.0.1:34567".parse().unwrap();
+
+        let body = build_search_body(order, 11, 0x00, &["tls"], &[(50, "OTHER:PV")]);
+        let frame = synth_frame(Command::Search, order, body);
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+        handle_tcp_search(&source, &frame, &tx, &config, peer)
+            .await
+            .expect("handle_tcp_search must succeed");
+        assert!(
+            rx.try_recv().is_err(),
+            "an unmatched name with no MustReply must not emit a SEARCH_RESPONSE"
+        );
     }
 
     #[test]

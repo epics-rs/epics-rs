@@ -428,18 +428,30 @@ pub fn merge_group_defs(existing: &mut HashMap<String, GroupPvDef>, new_defs: Ve
 
 #[derive(Deserialize)]
 struct RawGroupDef {
-    #[serde(rename = "+id")]
-    id: Option<String>,
+    // pvxs assigns `+id` with `value.as<std::string>()`
+    // (groupprocessorcontext.cpp:33), which coerces a bool / integer /
+    // real / string JSON scalar to its string form (data.cpp:402-461).
+    // Capturing the raw `serde_json::Value` (not `Option<String>`) keeps a
+    // non-string `+id` from failing the whole-file `serde_json::from_str`;
+    // the `as<string>` coercion and its NoConvert/per-group-skip outcome
+    // run in `raw_to_group_def`, inside the per-group recovery boundary.
+    #[serde(rename = "+id", default)]
+    id: Option<serde_json::Value>,
     // pvxs tracks `+atomic` as a value plus a presence bit
     // (`groupconfig.h:24-31`: `atomic` defaults true, `atomicIsSet`
     // defaults false; groupprocessorcontext.cpp:27-30 sets the bit only
-    // when the JSON actually carries `+atomic`). `Option<bool>` is the
-    // faithful model: `None` == not specified by THIS fragment, so a
-    // later fragment that omits `+atomic` must not clobber an earlier
-    // explicit setting during merge. A plain `bool` with a `true`
-    // default erased that distinction.
+    // when the JSON actually carries `+atomic`) and assigns it with
+    // `value.as<bool>()`, coercing bool / integer / unsigned / real
+    // (nonzero ⇒ true) and the exact strings "true"/"false"
+    // (data.cpp:402-461). Capturing the raw `serde_json::Value` (not
+    // `Option<bool>`) keeps a numeric/real/string `+atomic` from failing
+    // the whole-file parse and preserves the presence bit: `None` == not
+    // specified by THIS fragment, so a later fragment that omits `+atomic`
+    // must not clobber an earlier explicit setting during merge. The
+    // `as<bool>` coercion and its NoConvert/per-group-skip outcome run in
+    // `raw_to_group_def`.
     #[serde(rename = "+atomic", default)]
-    atomic: Option<bool>,
+    atomic: Option<serde_json::Value>,
     #[serde(flatten)]
     fields: HashMap<String, serde_json::Value>,
 }
@@ -457,6 +469,55 @@ fn sort_members_canonical(members: &mut [GroupMember]) {
             .cmp(&b.put_order)
             .then_with(|| a.field_name.cmp(&b.field_name))
     });
+}
+
+/// Coerce a JSON `+atomic` value to a bool exactly as pvxs
+/// `Value::as<bool>` coerces the parsed group-config scalar
+/// (groupprocessorcontext.cpp:29 → data.cpp:402-461): a JSON bool maps
+/// directly; a JSON number is true when nonzero (integer and real alike,
+/// matching `copyOutScalar`'s `bool(src)` cast); a JSON string accepts
+/// only the exact tokens `"true"`/`"false"` (no trim, case-sensitive).
+/// Any other value (other string, array, object, null) is unconvertible
+/// — `None` mirrors pvxs's NoConvert, which the caller turns into a
+/// per-group skip. JSON-value sibling of [`crate::qsrv::channel`]'s
+/// `scalar_as_bool`, which applies the same `as<bool>` rule to a runtime
+/// pvRequest `ScalarValue`.
+fn json_value_as_bool(v: &serde_json::Value) -> Option<bool> {
+    match v {
+        serde_json::Value::Bool(b) => Some(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some(i != 0)
+            } else if let Some(u) = n.as_u64() {
+                Some(u != 0)
+            } else {
+                n.as_f64().map(|f| f != 0.0)
+            }
+        }
+        serde_json::Value::String(s) => match s.as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Coerce a JSON `+id` value to a string exactly as pvxs
+/// `Value::as<std::string>()` coerces the parsed scalar
+/// (groupprocessorcontext.cpp:33 → data.cpp:402-461): a JSON string maps
+/// directly; a JSON bool becomes `"true"`/`"false"` (the Bool→String
+/// store branch, data.cpp:436); a JSON number becomes its base-10 form
+/// (`copyOutScalar`'s `SB()<<src`, data.cpp:409). Any other value (array,
+/// object, null) is unconvertible — `None` mirrors pvxs's NoConvert,
+/// which the caller turns into a per-group skip.
+fn json_value_as_string(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Bool(b) => Some(if *b { "true" } else { "false" }.to_string()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
 }
 
 fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> {
@@ -537,14 +598,51 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
         }
     }
 
+    // pvxs assigns `+atomic` via `value.as<bool>()` and `+id` via
+    // `value.as<std::string>()` (groupprocessorcontext.cpp:29,33). A value
+    // that cannot coerce raises NoConvert, which pvxs catches per group —
+    // the bad group is dropped and its siblings survive
+    // (groupconfigprocessor.cpp:128-163). Run the coercion here, inside the
+    // per-group recovery boundary, so a numeric/real/string `+atomic` (or a
+    // non-string `+id`) no longer fails the whole-file `serde_json::from_str`.
+    // pvxs assigns `+atomic` via `value.as<bool>()` and `+id` via
+    // `value.as<std::string>()` (groupprocessorcontext.cpp:29,33). A value
+    // that cannot coerce raises NoConvert, which pvxs catches per group —
+    // the bad group is dropped and its siblings survive
+    // (groupconfigprocessor.cpp:128-163). Run the coercion here, inside the
+    // per-group recovery boundary, so a numeric/real/string `+atomic` (or a
+    // non-string `+id`) no longer fails the whole-file `serde_json::from_str`.
+    let (atomic, atomic_is_set) = match &raw.atomic {
+        // Unset: pvxs's runtime rule `atomic != False`
+        // (groupconfigprocessor.cpp:436) resolves atomic (`true`) but
+        // leaves the presence bit clear.
+        None => (true, false),
+        Some(v) => match json_value_as_bool(v) {
+            Some(b) => (b, true),
+            None => {
+                return Err(BridgeError::GroupConfigError(format!(
+                    "group '{name}': +atomic value {v} is not a bool, number, or \"true\"/\"false\""
+                )));
+            }
+        },
+    };
+    let struct_id = match &raw.id {
+        None => None,
+        Some(v) => match json_value_as_string(v) {
+            Some(s) => Some(s),
+            None => {
+                return Err(BridgeError::GroupConfigError(format!(
+                    "group '{name}': +id value {v} is not a string, number, or bool"
+                )));
+            }
+        },
+    };
+
     let mut def = GroupPvDef {
         name,
-        struct_id: raw.id,
-        // Resolve the TriState to pvxs's runtime rule `atomic != False`
-        // (groupconfigprocessor.cpp:436): unset (`None`) and explicit
-        // `true` both resolve atomic, only explicit `false` is non-atomic.
-        atomic: raw.atomic != Some(false),
-        atomic_is_set: raw.atomic.is_some(),
+        struct_id,
+        atomic,
+        atomic_is_set,
         members,
         atomic_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
     };
@@ -1205,6 +1303,100 @@ mod tests {
             !g.atomic_is_set,
             "presence bit must stay clear when +atomic omitted"
         );
+    }
+
+    /// Regression R0604-BRQSRV-GROUP-ATOMIC-CONFIG-1. pvxs assigns group
+    /// `+atomic` with `value.as<bool>()` (groupprocessorcontext.cpp:29),
+    /// so a numeric, real, or `"true"`/`"false"` scalar sets atomicity by
+    /// nonzero truthiness (data.cpp:402-461). A numeric `+atomic` must
+    /// parse, not fail the whole-file `serde_json::from_str`.
+    #[test]
+    fn config_atomic_numeric_and_string_coerce_like_as_bool() {
+        // integer 0 / 1, real 0.0, exact strings "true"/"false".
+        for (json, want, label) in [
+            (
+                r#"{ "G": { "+atomic": 0, "a": { "+channel": "R.A" } } }"#,
+                false,
+                "int 0",
+            ),
+            (
+                r#"{ "G": { "+atomic": 1, "a": { "+channel": "R.A" } } }"#,
+                true,
+                "int 1",
+            ),
+            (
+                r#"{ "G": { "+atomic": 2, "a": { "+channel": "R.A" } } }"#,
+                true,
+                "int 2 (nonzero)",
+            ),
+            (
+                r#"{ "G": { "+atomic": 0.0, "a": { "+channel": "R.A" } } }"#,
+                false,
+                "real 0.0",
+            ),
+            (
+                r#"{ "G": { "+atomic": "false", "a": { "+channel": "R.A" } } }"#,
+                false,
+                "\"false\"",
+            ),
+            (
+                r#"{ "G": { "+atomic": "true", "a": { "+channel": "R.A" } } }"#,
+                true,
+                "\"true\"",
+            ),
+        ] {
+            let groups = parse_group_config(json)
+                .unwrap_or_else(|e| panic!("{label}: numeric/string +atomic must parse: {e}"));
+            assert_eq!(groups.len(), 1, "{label}: group must be present");
+            assert_eq!(groups[0].atomic, want, "{label}: +atomic coercion");
+            assert!(groups[0].atomic_is_set, "{label}: presence bit set");
+        }
+    }
+
+    /// Regression R0604-BRQSRV-GROUP-ATOMIC-CONFIG-1. A `+atomic` value
+    /// that `as<bool>` cannot coerce (a non-`"true"`/`"false"` string,
+    /// array, object, null) raises NoConvert in pvxs, which is caught per
+    /// group — the bad group is dropped, its valid siblings survive
+    /// (groupconfigprocessor.cpp:128-163). It must NOT fail the whole file.
+    #[test]
+    fn config_bad_atomic_skips_only_that_group() {
+        let json = r#"{
+            "G:bad":  { "+atomic": "yes", "a": { "+channel": "R.A" } },
+            "G:good": { "b": { "+channel": "R.B" } }
+        }"#;
+        let groups = parse_group_config(json).expect("whole file must still parse");
+        assert_eq!(groups.len(), 1, "only the valid sibling survives");
+        assert_eq!(groups[0].name, "G:good", "the bad +atomic group is dropped");
+    }
+
+    /// Regression R0604-BRQSRV-GROUP-ATOMIC-CONFIG-1 (same defect family,
+    /// `+id`). pvxs assigns `+id` with `value.as<std::string>()`
+    /// (groupprocessorcontext.cpp:33), coercing a numeric `+id` to its
+    /// base-10 string. A numeric `+id` must parse, not fail the whole file.
+    #[test]
+    fn config_id_numeric_coerces_to_string() {
+        let groups = parse_group_config(r#"{ "G": { "+id": 5, "a": { "+channel": "R.A" } } }"#)
+            .expect("numeric +id must parse");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].struct_id.as_deref(),
+            Some("5"),
+            "numeric +id coerces to its base-10 string"
+        );
+    }
+
+    /// Regression R0604-BRQSRV-GROUP-ATOMIC-CONFIG-1 (same defect family,
+    /// `+id`). A `+id` that `as<std::string>` cannot coerce (array,
+    /// object, null) is a per-group NoConvert, not a whole-file failure.
+    #[test]
+    fn config_bad_id_skips_only_that_group() {
+        let json = r#"{
+            "G:bad":  { "+id": [1, 2], "a": { "+channel": "R.A" } },
+            "G:good": { "b": { "+channel": "R.B" } }
+        }"#;
+        let groups = parse_group_config(json).expect("whole file must still parse");
+        assert_eq!(groups.len(), 1, "only the valid sibling survives");
+        assert_eq!(groups[0].name, "G:good", "the bad +id group is dropped");
     }
 
     /// A later `info(Q:group)` fragment that omits `+atomic` must not

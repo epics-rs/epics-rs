@@ -358,10 +358,15 @@ pub fn spawn_ca_monitor(
 fn epics_value_to_nd_attr(value: &epics_ca_rs::EpicsValue) -> NDAttrValue {
     use epics_ca_rs::EpicsValue as E;
     match value {
-        E::String(s) => NDAttrValue::String(s.clone()),
+        E::String(s) => NDAttrValue::String(s.as_str_lossy().into_owned()),
         E::Short(v) => NDAttrValue::Int16(*v),
         E::Float(v) => NDAttrValue::Float32(*v),
         E::Enum(v) => NDAttrValue::UInt16(*v),
+        // `EnumWithChoices` is a transient NTEnum carrier that behaves
+        // exactly like `Enum` everywhere except a string-target put_field:
+        // read the index (epics-base-rs value.rs). An NDArray attribute is a
+        // numeric scalar with no string target, so it takes the index form.
+        E::EnumWithChoices { index, .. } => NDAttrValue::UInt16(*index),
         E::Char(v) => NDAttrValue::UInt8(*v),
         E::Long(v) => NDAttrValue::Int32(*v),
         E::Double(v) => NDAttrValue::Float64(*v),
@@ -391,9 +396,9 @@ fn epics_value_to_nd_attr(value: &epics_ca_rs::EpicsValue) -> NDAttrValue {
         E::UInt64Array(a) => a
             .first()
             .map_or(NDAttrValue::Undefined, |v| NDAttrValue::UInt64(*v)),
-        E::StringArray(a) => a
-            .first()
-            .map_or(NDAttrValue::Undefined, |v| NDAttrValue::String(v.clone())),
+        E::StringArray(a) => a.first().map_or(NDAttrValue::Undefined, |v| {
+            NDAttrValue::String(v.as_str_lossy().into_owned())
+        }),
     }
 }
 

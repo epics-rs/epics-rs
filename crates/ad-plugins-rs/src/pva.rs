@@ -234,7 +234,7 @@ fn attribute_value_to_variant(val: &ad_core_rs::attributes::NDAttrValue) -> Vari
         NDAttrValue::UInt64(v) => ScalarValue::ULong(*v),
         NDAttrValue::Float32(v) => ScalarValue::Float(*v),
         NDAttrValue::Float64(v) => ScalarValue::Double(*v),
-        NDAttrValue::String(v) => ScalarValue::String(v.clone()),
+        NDAttrValue::String(v) => ScalarValue::String(v.clone().into()),
         NDAttrValue::Undefined => return VariantValue::null(),
     };
     VariantValue::scalar(scalar)

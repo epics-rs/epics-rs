@@ -456,6 +456,12 @@ pub struct DrvAsynIPPort {
     io: IpIoState,
     /// Auto-disconnect when read times out (default: false).
     disconnect_on_read_timeout: bool,
+    /// Verbatim host-info spec, mirroring C `ttyController_t::IPDeviceName`
+    /// (`drvAsynIPPort.c`). `parseHostInfo` stores `epicsStrDup(hostInfo)`
+    /// on construction and on every `setOption("hostInfo", ...)` reparse;
+    /// `getOption("hostInfo")` returns it verbatim. Kept so the IP driver's
+    /// `get_option` can echo the live endpoint instead of the generic map.
+    host_info: String,
 }
 
 impl DrvAsynIPPort {
@@ -481,6 +487,8 @@ impl DrvAsynIPPort {
             config,
             io: IpIoState { inner: None },
             disconnect_on_read_timeout: false,
+            // C parseHostInfo: tty->IPDeviceName = epicsStrDup(hostInfo).
+            host_info: config_str.to_string(),
         })
     }
 
@@ -842,65 +850,99 @@ impl PortDriver for DrvAsynIPPort {
     }
 
     fn set_option(&mut self, key: &str, value: &str) -> AsynResult<()> {
-        match key {
-            "noDelay" => {
-                let enabled = value == "Y" || value == "y" || value == "1" || value == "yes";
-                self.config.no_delay = enabled;
-                if let Some(IpIoInner::Tcp(ref stream)) = self.io.inner {
-                    stream.set_nodelay(enabled)?;
-                }
+        // C `drvAsynIPPort.c::setOption`/`getOption` compare option keys
+        // with `epicsStrCaseCmp` (case-insensitive). Match that here: the
+        // asynRecord writes the IP keys lowercase (`hostinfo`, see
+        // asyn_record/mod.rs), and iocsh callers may use any case, so a
+        // case-sensitive `match` would silently route them to the generic
+        // option map and skip the real handler — leaving the live socket
+        // configured for the old endpoint. The keys form an if/else chain
+        // exactly like C's `epicsStrCaseCmp` cascade.
+        if key.eq_ignore_ascii_case("noDelay") {
+            let enabled = value == "Y" || value == "y" || value == "1" || value == "yes";
+            self.config.no_delay = enabled;
+            if let Some(IpIoInner::Tcp(ref stream)) = self.io.inner {
+                stream.set_nodelay(enabled)?;
             }
-            "disconnectOnReadTimeout" => {
-                self.disconnect_on_read_timeout =
-                    value == "Y" || value == "y" || value == "1" || value == "yes";
+        } else if key.eq_ignore_ascii_case("disconnectOnReadTimeout") {
+            self.disconnect_on_read_timeout =
+                value == "Y" || value == "y" || value == "1" || value == "yes";
+        } else if key.eq_ignore_ascii_case("hostInfo") {
+            // Mirror C drvAsynIPPort.c::parseHostInfo (lines 273-401):
+            //
+            //   if (fd != INVALID_SOCKET) {
+            //       flags |= FLAG_SHUTDOWN;
+            //       closeConnection(...);
+            //       epicsThreadSleep(CLOSE_SOCKET_DELAY);   // 0.02s
+            //   }
+            //   ... full reparse: protocol, FLAG_BROADCAST,
+            //       FLAG_SO_REUSEPORT, hostname, port, localPort
+            //   flags &= ~FLAG_SHUTDOWN;
+            //
+            // Earlier this branch updated only host/port/local_port,
+            // so a runtime switch like "udp tcp" or "udp& udp*"
+            // left the previous protocol/flags active and the next
+            // connect() bound the wrong socket type.
+            //
+            // We parse first (no observable state change on
+            // parse error) and only then drop the live socket and
+            // overwrite config.
+            let new_config = IpPortConfig::parse(value)?;
+            if self.io.inner.is_some() {
+                // Drop in-flight socket; matches C closeConnection.
+                self.io.inner = None;
+                // Owner-API: set_connected handles the edge-guarded
+                // fan-out, so a redundant call here is a no-op for
+                // listeners just like C's exceptionDisconnect.
+                self.base.set_connected(false);
+                // C's "if this delay is not present then the sockets
+                // are not always really closed cleanly" — same 20ms
+                // settle to ensure the kernel actually tears down
+                // the prior socket before we rebind on a fresh one
+                // (especially relevant for UDP+SO_REUSEPORT swaps).
+                std::thread::sleep(Duration::from_millis(20));
             }
-            "hostInfo" => {
-                // Mirror C drvAsynIPPort.c::parseHostInfo (lines 273-401):
-                //
-                //   if (fd != INVALID_SOCKET) {
-                //       flags |= FLAG_SHUTDOWN;
-                //       closeConnection(...);
-                //       epicsThreadSleep(CLOSE_SOCKET_DELAY);   // 0.02s
-                //   }
-                //   ... full reparse: protocol, FLAG_BROADCAST,
-                //       FLAG_SO_REUSEPORT, hostname, port, localPort
-                //   flags &= ~FLAG_SHUTDOWN;
-                //
-                // Earlier this branch updated only host/port/local_port,
-                // so a runtime switch like "udp tcp" or "udp& udp*"
-                // left the previous protocol/flags active and the next
-                // connect() bound the wrong socket type.
-                //
-                // We parse first (no observable state change on
-                // parse error) and only then drop the live socket and
-                // overwrite config.
-                let new_config = IpPortConfig::parse(value)?;
-                if self.io.inner.is_some() {
-                    // Drop in-flight socket; matches C closeConnection.
-                    self.io.inner = None;
-                    // Owner-API: set_connected handles the edge-guarded
-                    // fan-out, so a redundant call here is a no-op for
-                    // listeners just like C's exceptionDisconnect.
-                    self.base.set_connected(false);
-                    // C's "if this delay is not present then the sockets
-                    // are not always really closed cleanly" — same 20ms
-                    // settle to ensure the kernel actually tears down
-                    // the prior socket before we rebind on a fresh one
-                    // (especially relevant for UDP+SO_REUSEPORT swaps).
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                self.config.host = new_config.host;
-                self.config.port = new_config.port;
-                self.config.local_port = new_config.local_port;
-                self.config.protocol = new_config.protocol;
-                // connect_timeout / no_delay are first-set-only in C
-                // too — parseHostInfo doesn't touch them.
-            }
-            _ => {
-                self.base.options.insert(key.to_string(), value.to_string());
-            }
+            self.config.host = new_config.host;
+            self.config.port = new_config.port;
+            self.config.local_port = new_config.local_port;
+            self.config.protocol = new_config.protocol;
+            // connect_timeout / no_delay are first-set-only in C
+            // too — parseHostInfo doesn't touch them.
+            //
+            // C parseHostInfo replaces tty->IPDeviceName with
+            // epicsStrDup(hostInfo); store the verbatim spec so a later
+            // getOption("hostInfo") echoes the new endpoint, not the old.
+            self.host_info = value.to_string();
+        } else {
+            self.base.options.insert(key.to_string(), value.to_string());
         }
         Ok(())
+    }
+
+    /// Read an IP-driver option. Mirrors C `drvAsynIPPort.c::getOption`
+    /// (lines 888-913): `disconnectOnReadTimeout` -> `"Y"`/`"N"`,
+    /// `hostInfo` -> the live device spec, both matched case-insensitively
+    /// (`epicsStrCaseCmp`). Without this override the base default reads
+    /// the generic option map, which the real `set_option` handlers above
+    /// never populate, so the asynRecord could never read back the live
+    /// `HOSTINFO`/`DRTO`. Unknown keys fall through to the generic map.
+    fn get_option(&self, key: &str) -> AsynResult<String> {
+        if key.eq_ignore_ascii_case("disconnectOnReadTimeout") {
+            Ok(if self.disconnect_on_read_timeout {
+                "Y"
+            } else {
+                "N"
+            }
+            .to_string())
+        } else if key.eq_ignore_ascii_case("hostInfo") {
+            Ok(self.host_info.clone())
+        } else {
+            self.base
+                .options
+                .get(key)
+                .cloned()
+                .ok_or_else(|| AsynError::OptionNotFound(key.to_string()))
+        }
     }
 }
 
@@ -1264,6 +1306,38 @@ mod tests {
             drv.config.local_port, None,
             "local_port must reset on hostInfo reparse"
         );
+    }
+
+    /// Regression R0604-ASYN-HOSTINFO-OPTION-KEY-1.
+    ///
+    /// C `drvAsynIPPort` compares option keys with `epicsStrCaseCmp`
+    /// (drvAsynIPPort.c:899/937), so the asynRecord's lowercase
+    /// `hostinfo`/`disconnectOnReadTimeout` keys and any mixed-case iocsh
+    /// key reach the real driver handler. Pre-fix the Rust driver matched
+    /// keys case-sensitively, so the asynRecord's lowercase `hostinfo`
+    /// write fell into the generic option map: `config.host`/`port`/
+    /// `protocol` stayed at the old endpoint, and reads returned the map
+    /// value (or nothing) instead of the live spec.
+    #[test]
+    fn host_info_option_key_is_case_insensitive_for_get_and_set() {
+        let mut drv = DrvAsynIPPort::new("iptest", "127.0.0.1:5025 tcp").unwrap();
+
+        // asynRecord writes the lowercase key (asyn_record/mod.rs).
+        drv.set_option("hostinfo", "10.0.0.5:1234 udp").unwrap();
+        // The live driver config must reflect the reparse, not the map.
+        assert_eq!(drv.config.host, "10.0.0.5");
+        assert_eq!(drv.config.port, 1234);
+        assert_eq!(drv.config.protocol, IpProtocol::Udp);
+
+        // get must echo the live endpoint for either key case
+        // (C getOption returns tty->IPDeviceName verbatim).
+        assert_eq!(drv.get_option("hostinfo").unwrap(), "10.0.0.5:1234 udp");
+        assert_eq!(drv.get_option("hostInfo").unwrap(), "10.0.0.5:1234 udp");
+
+        // disconnectOnReadTimeout shares the same case-insensitive key
+        // contract for set and get (C getOption -> "Y"/"N").
+        drv.set_option("DISCONNECTONREADTIMEOUT", "Y").unwrap();
+        assert_eq!(drv.get_option("disconnectonreadtimeout").unwrap(), "Y");
     }
 
     // --- Protocol suffix parsing — C parity (drvAsynIPPort.c:355-391) ---

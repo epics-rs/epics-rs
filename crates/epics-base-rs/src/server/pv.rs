@@ -631,21 +631,27 @@ impl ProcessVariable {
             .await;
     }
 
-    /// Post a `DBE_PROPERTY` monitor event carrying the current value and
-    /// the installed shadow metadata, so downstream property-change
-    /// monitors re-read the units / precision / limits / enum labels.
+    /// Post a `DBE_PROPERTY` monitor event carrying the decoded upstream
+    /// CTRL event `snapshot` — its value plus the upstream status /
+    /// severity and timestamp — overlaid with the installed shadow
+    /// metadata, so downstream property-change monitors re-read the units /
+    /// precision / limits / enum labels with the *upstream* alarm state.
     ///
     /// Used by the CA / PVA gateway when an upstream `DBE_PROPERTY` event
     /// fires (metadata changed) after it has refreshed the shadow PV via
-    /// [`Self::set_metadata`]. Mirrors the C ca-gateway posting on its
-    /// control type following a `DBE_PROPERTY` callback
-    /// (`gatePv.cc:850-860`, `:920-934`). Property events are a distinct
-    /// class from value/alarm: only `DBE_PROPERTY` subscribers receive
-    /// them.
-    pub async fn post_property(&self) {
+    /// [`Self::set_metadata`]. The caller supplies the snapshot rather than
+    /// this method synthesising one: C ca-gateway decodes the upstream
+    /// `DBR_CTRL_*` callback and re-posts the value with `setStatSevr()`
+    /// status/severity preserved (`gatePv.cc:2413-2438`,
+    /// `runValueDataCB`), leaving the timestamp as the control DBR carries
+    /// none — it must NOT be replaced with a fresh `NO_ALARM` /
+    /// wall-clock-now snapshot just because metadata changed. Pass the
+    /// timestamp the upstream value carried (the control event has none of
+    /// its own); pass `status`/`severity` from the upstream CTRL payload.
+    /// Property events are a distinct class from value/alarm: only
+    /// `DBE_PROPERTY` subscribers receive them.
+    pub async fn post_property(&self, mut snapshot: Snapshot) {
         use crate::server::recgbl::EventMask;
-        let value = self.value.read().await.clone();
-        let mut snapshot = Snapshot::new(value, 0, 0, crate::runtime::time::now_wall());
         self.apply_metadata(&mut snapshot);
         self.deliver(EventMask::PROPERTY, snapshot).await;
     }
@@ -1158,7 +1164,13 @@ mod metadata_tests {
             .add_subscriber(2, DbFieldType::Double, DBE_VALUE)
             .await
             .expect("subscriber added");
-        pv.post_property().await;
+        pv.post_property(Snapshot::new(
+            EpicsValue::Double(1.0),
+            0,
+            0,
+            std::time::SystemTime::UNIX_EPOCH,
+        ))
+        .await;
         let ev = prop_rx
             .try_recv()
             .expect("DBE_PROPERTY subscriber receives property post");
@@ -1172,6 +1184,55 @@ mod metadata_tests {
         assert!(
             val_rx.try_recv().is_err(),
             "DBE_VALUE-only subscriber must not receive a property post"
+        );
+    }
+
+    /// Regression R0604-BASEPV-PROPERTY-POST-SNAPSHOT-1: a property post
+    /// must carry the upstream CTRL event's status/severity and timestamp,
+    /// not a fabricated `NO_ALARM` / wall-clock-now snapshot. C ca-gateway
+    /// preserves `setStatSevr()` on the property callback
+    /// (`gatePv.cc:2413-2438`); a downstream `DBE_PROPERTY` monitor must
+    /// see `severity=MAJOR` and the upstream timestamp, even though only
+    /// metadata changed.
+    #[tokio::test]
+    async fn post_property_preserves_upstream_alarm_and_timestamp() {
+        const DBE_PROPERTY: u16 = 8;
+        const MAJOR: u16 = 2; // epicsSevMajor
+        const HIGH: u16 = 3; // epicsAlarmHigh
+        let pv = pv();
+        pv.set_metadata(meta());
+        let mut prop_rx = pv
+            .add_subscriber(1, DbFieldType::Double, DBE_PROPERTY)
+            .await
+            .expect("subscriber added");
+        // The upstream CTRL event timestamp: a fixed point in the past, so
+        // it is unmistakably NOT a fresh wall clock minted by the post.
+        let upstream_ts =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        pv.post_property(Snapshot::new(
+            EpicsValue::Double(2.0),
+            HIGH,
+            MAJOR,
+            upstream_ts,
+        ))
+        .await;
+        let ev = prop_rx.try_recv().expect("property post delivered");
+        assert_eq!(
+            ev.snapshot.alarm.severity, MAJOR,
+            "property post must carry the upstream MAJOR severity, not NO_ALARM"
+        );
+        assert_eq!(ev.snapshot.alarm.status, HIGH, "upstream status preserved");
+        assert_eq!(
+            ev.snapshot.timestamp, upstream_ts,
+            "property post must keep the upstream timestamp, not a fresh wall clock"
+        );
+        // Shadow metadata is still overlaid onto the upstream snapshot.
+        assert_eq!(
+            ev.snapshot
+                .display
+                .expect("property post carries shadow metadata")
+                .units,
+            "degC"
         );
     }
 }

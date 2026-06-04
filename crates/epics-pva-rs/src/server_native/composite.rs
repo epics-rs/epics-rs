@@ -135,8 +135,30 @@ impl CompositeSource {
 
     /// Current registry beacon-change counter. Mirrors pvxs
     /// `Server::pvt->beaconChange` (server.cpp:90-115).
+    ///
+    /// pvxs keeps a SINGLE counter that both `addSource` / `removeSource`
+    /// AND the built-in `StaticSource` registry (`addPV` / `removePV`)
+    /// bump (`server.cpp:95,113,180,189`). To reproduce that single-counter
+    /// view across the Rust source tree, fold every inner source's own
+    /// [`ChannelSource::beacon_change`] into this composite's local
+    /// add/remove counter. Otherwise a built-in
+    /// [`SharedSource`](crate::server_native::SharedSource) `add` / `remove`
+    /// (the Rust analog of `addPV` / `removePV`) would leave the beacon
+    /// `change_count` unchanged because the composite's own add/remove
+    /// counter did not move.
+    ///
+    /// `wrapping_add` over inner counters (not `max`) for the same reason
+    /// the access-gate aggregator uses it (see [`Self::default`]): any
+    /// single inner bump shifts the sum, so the beacon task's
+    /// `live != stored` comparison reliably detects the change; a `max`
+    /// fold would miss a bump on an inner whose value stayed below the
+    /// peak.
     pub fn beacon_change(&self) -> u64 {
-        self.beacon_change.load(Ordering::Relaxed)
+        let mut sum = self.beacon_change.load(Ordering::Relaxed);
+        for entry in self.entries.read().iter() {
+            sum = sum.wrapping_add(entry.source.beacon_change());
+        }
+        sum
     }
 
     /// Look up a previously added source by (name, order).
@@ -203,11 +225,13 @@ impl ChannelSource for CompositeSource {
         &self.access_gate
     }
 
-    /// Surface the registry beacon-change counter so the UDP beacon task
-    /// advances its `change_count` on a source add/remove (pvxs
-    /// `beaconChange`, server.cpp:90-115).
+    /// Surface the aggregated registry beacon-change counter so the UDP
+    /// beacon task advances its `change_count` on a source add/remove AND
+    /// on a built-in `SharedSource` PV add/remove (pvxs `beaconChange`,
+    /// server.cpp:90-115). Delegates to the inherent
+    /// [`CompositeSource::beacon_change`], which folds inner sources.
     fn beacon_change(&self) -> u64 {
-        self.beacon_change.load(Ordering::Relaxed)
+        CompositeSource::beacon_change(self)
     }
 
     /// Monitor-reload READ
@@ -1527,6 +1551,53 @@ mod tests {
 
         // The trait-level accessor reports the same value.
         assert_eq!(<CompositeSource as ChannelSource>::beacon_change(&comp), v4);
+    }
+
+    /// R0604-PVASRV-BEACON-SHAREDPV-MUTATION-1: the composite must fold an
+    /// inner source's own `beacon_change()` into its returned counter, so
+    /// a built-in `SharedSource` PV add/remove advances the beacon even
+    /// when the composite's OWN add/remove counter is unchanged. pvxs
+    /// keeps a single `beaconChange` bumped by both
+    /// `addSource`/`removeSource` AND `addPV`/`removePV`
+    /// (server.cpp:95,113,180,189).
+    #[tokio::test]
+    async fn beacon_change_aggregates_inner_shared_source_mutations() {
+        use crate::server_native::{SharedPV, SharedSource};
+
+        let comp = CompositeSource::new();
+        let shared = Arc::new(SharedSource::new());
+        comp.add_source("__builtin", shared.clone() as DynSource, 0)
+            .unwrap();
+
+        // Snapshot AFTER registration: from here the composite's own
+        // add/remove counter does not move; only the inner SharedSource
+        // mutates. Pre-fix the composite returned only its own counter, so
+        // these inner mutations left the aggregate unchanged.
+        let base = comp.beacon_change();
+
+        // Inner add → composite aggregate advances.
+        shared.add("X", SharedPV::new());
+        let after_add = comp.beacon_change();
+        assert!(
+            after_add > base,
+            "inner SharedSource add must advance composite beacon_change: \
+             {base} -> {after_add}"
+        );
+
+        // Inner remove → composite aggregate advances again.
+        assert!(shared.remove("X").is_some());
+        let after_remove = comp.beacon_change();
+        assert!(
+            after_remove > after_add,
+            "inner SharedSource remove must advance composite beacon_change: \
+             {after_add} -> {after_remove}"
+        );
+
+        // The trait accessor reports the same aggregate.
+        assert_eq!(
+            <CompositeSource as ChannelSource>::beacon_change(&comp),
+            after_remove
+        );
     }
 
     #[tokio::test]

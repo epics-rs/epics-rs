@@ -25,7 +25,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 use parking_lot::Mutex;
@@ -1116,6 +1116,18 @@ pub struct SharedSource {
     /// enforce a real .acf policy against PVA clients. Set via
     /// [`SharedSource::set_access_gate`].
     access_gate: std::sync::OnceLock<epics_base_rs::server::access_security::AccessGate>,
+    /// Registry beacon-change counter, surfaced through
+    /// [`ChannelSource::beacon_change`](super::source::ChannelSource::beacon_change).
+    /// pvxs treats the built-in `StaticSource` PV registry as part of the
+    /// single server `beaconChange`: `Server::addPV` / `removePV` bump it
+    /// (`server.cpp:180,189`) just like `addSource` / `removeSource`. This
+    /// is the Rust equivalent of those `addPV` / `removePV` bumps —
+    /// incremented by [`Self::try_add`] on a real insert and by
+    /// [`Self::remove`] on a real erase — so the UDP beacon task advances
+    /// its `change_count` when a hosted PV is added or replaced even
+    /// within one beacon interval (when `list_pvs()` is unchanged
+    /// before/after, e.g. remove+re-add of the same name).
+    beacon_change: AtomicU64,
 }
 
 impl SharedSource {
@@ -1123,6 +1135,7 @@ impl SharedSource {
         Self {
             pvs: Mutex::new(HashMap::new()),
             access_gate: std::sync::OnceLock::new(),
+            beacon_change: AtomicU64::new(0),
         }
     }
 
@@ -1156,6 +1169,13 @@ impl SharedSource {
             Entry::Occupied(e) => Err(AddPvError(e.key().clone())),
             Entry::Vacant(slot) => {
                 slot.insert(pv);
+                // pvxs `Server::addPV` bumps `beaconChange` only after the
+                // built-in `StaticSource::add` succeeds (it throws on a
+                // duplicate, skipping the bump — server.cpp:177-180). This
+                // is the single insertion owner, so bumping here on the
+                // vacant arm gives the lenient `add()` wrapper the same
+                // "bump on success, not on duplicate" semantics for free.
+                self.beacon_change.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
         }
@@ -1182,7 +1202,19 @@ impl SharedSource {
     /// service registered via `add_rpc_service`; also useful for
     /// dynamic IOC topologies where PVs come and go at runtime.
     pub fn remove(&self, name: &str) -> Option<SharedPV> {
-        self.pvs.lock().remove(name)
+        let removed = self.pvs.lock().remove(name);
+        if removed.is_some() {
+            // pvxs `Server::removePV` bumps `beaconChange` so the next
+            // BEACON signals the registry change (server.cpp:184-189).
+            // Bump only on a real erase — consistent with
+            // [`CompositeSource::remove_source`], which treats a no-op
+            // remove (absent name) as not a topology change. A real erase
+            // combined with a re-add of the same name within one beacon
+            // interval still advances `change_count` (net `+2`) even
+            // though `list_pvs()` is unchanged.
+            self.beacon_change.fetch_add(1, Ordering::Relaxed);
+        }
+        removed
     }
 
     pub fn get(&self, name: &str) -> Option<SharedPV> {
@@ -1207,6 +1239,17 @@ impl super::source::ChannelSource for SharedSource {
                 OPEN_GATE.get_or_init(epics_base_rs::server::access_security::AccessGate::open)
             }
         }
+    }
+
+    /// Surface this source's PV-registry counter so the UDP beacon task
+    /// advances `change_count` on an `add` / `remove` of a hosted PV —
+    /// the Rust equivalent of pvxs `Server::addPV` / `removePV` bumping
+    /// the single server `beaconChange` (`server.cpp:180,189`). Without
+    /// this override the trait default returns `0`, and the beacon task
+    /// would fall back to the PV-name-set hash, which cannot see a
+    /// remove+re-add of the same name within one beacon interval.
+    fn beacon_change(&self) -> u64 {
+        self.beacon_change.load(Ordering::Relaxed)
     }
 
     fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
@@ -2340,5 +2383,68 @@ mod tests {
                 Some(&PvField::Scalar(ScalarValue::Int(123)))
             );
         }
+    }
+
+    /// R0604-PVASRV-BEACON-SHAREDPV-MUTATION-1: a built-in `SharedSource`
+    /// PV registry mutation must advance the beacon-change counter, the
+    /// Rust analog of pvxs `Server::addPV` / `removePV` bumping
+    /// `beaconChange` (server.cpp:180,189). The boundary case the PV-name
+    /// hash fallback cannot detect — remove + re-add of the SAME name
+    /// within one beacon interval, so `list_pvs()` is identical
+    /// before/after — must still advance the counter.
+    #[tokio::test]
+    async fn shared_source_beacon_change_advances_on_pv_registry_mutations() {
+        use super::super::source::ChannelSource;
+
+        let src = SharedSource::new();
+        let v0 = src.beacon_change();
+
+        // add → bump.
+        src.add("a", SharedPV::new());
+        let v1 = src.beacon_change();
+        assert!(v1 > v0, "add must bump beacon_change: {v0} -> {v1}");
+
+        // try_add of a DUPLICATE name → Err, must NOT bump (pvxs addPV
+        // throws before the bump, server.cpp:177-180).
+        assert!(src.try_add("a", SharedPV::new()).is_err());
+        assert_eq!(
+            src.beacon_change(),
+            v1,
+            "duplicate try_add must not advance beacon_change"
+        );
+
+        // remove of a present PV → bump.
+        assert!(src.remove("a").is_some());
+        let v2 = src.beacon_change();
+        assert!(v2 > v1, "remove must bump beacon_change: {v1} -> {v2}");
+
+        // no-op remove of an absent name → must NOT bump (consistent with
+        // CompositeSource::remove_source's no-op semantics).
+        assert!(src.remove("a").is_none());
+        assert_eq!(
+            src.beacon_change(),
+            v2,
+            "no-op remove must not advance beacon_change"
+        );
+
+        // The boundary case: re-add "b", capture the PV set, then
+        // remove+re-add "b" within one interval. list_pvs() is identical
+        // before and after, but the counter advances (net +2).
+        src.add("b", SharedPV::new());
+        let before: Vec<String> = src.list_pvs().await;
+        let v3 = src.beacon_change();
+        assert!(src.remove("b").is_some());
+        src.add("b", SharedPV::new());
+        let after: Vec<String> = src.list_pvs().await;
+        let v4 = src.beacon_change();
+        assert_eq!(
+            before, after,
+            "list_pvs must be identical across remove+re-add"
+        );
+        assert!(
+            v4 > v3,
+            "remove+re-add of the same name within one interval must still \
+             advance beacon_change even though list_pvs is unchanged: {v3} -> {v4}"
+        );
     }
 }

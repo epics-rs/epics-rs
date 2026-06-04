@@ -599,6 +599,32 @@ fn parse_order_directive<'a>(
     }
 }
 
+/// Parse a leading signed decimal integer prefix exactly like C
+/// `sscanf(token, "%d", &lev)`: an optional `+`/`-` sign followed by one or
+/// more decimal digits is consumed, and any trailing non-numeric bytes are
+/// ignored (`0junk` → `0`, `1foo` → `1`, `-1tail` → `-1`). Returns `None`
+/// when no digit follows the optional sign — the case where C `sscanf`
+/// returns 0 and the caller applies the `lev=1` fallback. Tokens reach here
+/// already split on whitespace, so there is no leading whitespace for
+/// `sscanf` to skip. Regression R0604-BRCAGW-PVLIST-ASL-PREFIX-1.
+fn sscanf_int_prefix(token: &str) -> Option<i32> {
+    let bytes = token.as_bytes();
+    let mut end = 0;
+    if matches!(bytes.first(), Some(b'+' | b'-')) {
+        end = 1;
+    }
+    let digits_start = end;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == digits_start {
+        return None; // no digits after optional sign → C sscanf returns != 1
+    }
+    // A prefix that overflows `i32` is degenerate input C leaves undefined; map
+    // it to the same no-conversion fallback rather than guessing C's wrap.
+    token[..end].parse::<i32>().ok()
+}
+
 /// Parse the optional trailing `[asg [asl]]` of an ALLOW/PATTERN/PV/ALIAS
 /// rule, mirroring C ca-gateway (gateAs.cc:609-613):
 ///
@@ -613,13 +639,17 @@ fn parse_order_directive<'a>(
 /// - The ASL token is read **only** when an ASG token precedes it (C reads
 ///   `asl` inside the `if(asg)` block); a bare `pattern ALLOW` carries no ASG
 ///   and no ASL.
-/// - An ASL token that is present but not an integer falls back to **level 1**
-///   (`sscanf(...)!=1 → lev=1`) instead of aborting. A single typo such as
-///   `PV.* ALLOW BeamGroup typo` keeps serving `PV.*` at ASL 1 in C; the
-///   previous `s.parse::<i32>()?` rejected the whole pvlist (or reload). The
-///   omitted-ASL and invalid-ASL cases both resolve to 1 — `Some(1)` here for
-///   the invalid case records the explicit fallback, `None` for the omitted
-///   case defaults to 1 via [`PvListMatch::effective_asl`].
+/// - The ASL token is read with C `sscanf("%d")` prefix semantics (see
+///   [`sscanf_int_prefix`]): a leading signed decimal prefix is consumed and
+///   trailing bytes are ignored, so `0junk` installs level 0, `1foo` level 1,
+///   and `-1tail` level -1. Only a token with **no** integer prefix falls back
+///   to **level 1** (`sscanf(...)!=1 → lev=1`) instead of aborting. A single
+///   typo such as `PV.* ALLOW BeamGroup typo` keeps serving `PV.*` at ASL 1 in
+///   C; an earlier whole-token `s.parse::<i32>()` both rejected the pvlist on a
+///   typo and mis-rejected a valid C prefix like `0junk`. The omitted-ASL and
+///   no-prefix cases both resolve to 1 — `Some(1)` here for the no-prefix case
+///   records the explicit fallback, `None` for the omitted case defaults to 1
+///   via [`PvListMatch::effective_asl`].
 ///
 /// Genuine syntax errors C also rejects (a missing ALIAS target) remain hard
 /// errors at their call site, not here.
@@ -629,12 +659,12 @@ fn parse_asg_asl<'a>(
 ) -> (Option<String>, Option<i32>) {
     let asg = tokens.next().map(String::from);
     let asl = asg.is_some().then(|| tokens.next()).flatten().map(|s| {
-        s.parse::<i32>().unwrap_or_else(|_| {
+        sscanf_int_prefix(s).unwrap_or_else(|| {
             tracing::warn!(
                 line = lineno,
                 token = %s,
-                "pvlist: invalid ASL token — falling back to level 1 \
-                 (C gateAs.cc:612 sscanf!=1 → lev=1)"
+                "pvlist: ASL token has no integer prefix — falling back to level 1 \
+                 (C gateAs.cc:611 sscanf!=1 → lev=1)"
             );
             1
         })
@@ -1193,6 +1223,40 @@ mod tests {
         // A missing ALIAS target is a genuine syntax error C also rejects —
         // it must stay a hard parse error, not fall through to level 1.
         assert!(parse_pvlist("foo ALIAS").is_err());
+    }
+
+    /// Regression R0604-BRCAGW-PVLIST-ASL-PREFIX-1: C reads the ASL token with
+    /// `sscanf(asl,"%d",&lev)` (gateAs.cc:611), which consumes a leading signed
+    /// decimal prefix and ignores trailing bytes. A whole-token
+    /// `s.parse::<i32>()` rejected `0junk`/`1foo`/`-1tail` and fell back to
+    /// level 1, silently raising `0junk` from ASL 0 to ASL 1 — a stricter
+    /// access level than C installs. Only a token with no integer prefix
+    /// (`typo`) takes the level-1 fallback.
+    #[test]
+    fn parse_asl_numeric_prefix_matches_c_sscanf() {
+        for (token, want) in [("0junk", 0), ("1foo", 1), ("-1tail", -1), ("2tail", 2)] {
+            let list = parse_pvlist(&format!("PV.* ALLOW grp {token}")).unwrap();
+            match &list.entries[0] {
+                PvListEntry::Allow { asl, .. } => assert_eq!(
+                    *asl,
+                    Some(want),
+                    "ASL token {token:?} must take its C sscanf %d prefix {want}"
+                ),
+                other => panic!("{token}: expected Allow, got {other:?}"),
+            }
+        }
+
+        // No integer prefix → C sscanf returns 0 → level-1 fallback. A bare
+        // sign with no digit (`+`) also has no prefix.
+        for token in ["typo", "+", "junk7"] {
+            let list = parse_pvlist(&format!("PV.* ALLOW grp {token}")).unwrap();
+            match &list.entries[0] {
+                PvListEntry::Allow { asl, .. } => {
+                    assert_eq!(*asl, Some(1), "no-prefix ASL token {token:?} → level 1")
+                }
+                other => panic!("{token}: expected Allow, got {other:?}"),
+            }
+        }
     }
 
     #[test]

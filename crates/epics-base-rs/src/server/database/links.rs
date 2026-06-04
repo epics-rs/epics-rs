@@ -648,7 +648,7 @@ impl PvDatabase {
         // dead-lock on the entry record's own non-reentrant gate. C
         // `dbDbPutValue` writes the OUT-link target under the same
         // lock set the chain already owns.
-        let _ = self.put_pv_already_locked(&target_name, value).await;
+        let put_result = self.put_pv_already_locked(&target_name, value).await;
 
         // C `dbDbPutValue` (dbDbLink.c:382-383) folds the SOURCE
         // record's alarm into the destination via `recGblInheritSevrMsg`,
@@ -668,6 +668,21 @@ impl PvDatabase {
                 let mut tg = target_rec.write().await;
                 inherit_sevr_msg(&mut tg.common, link.monitor_switch, src.alarm);
             }
+        }
+
+        // C `dbDbPutValue` (dbDbLink.c:384-385) returns the put status
+        // immediately after the alarm inheritance and BEFORE the
+        // `.PROC`/`PP` `processTarget` branch: only a successful write
+        // reaches target processing. A failed OUT-link write (value
+        // conversion error, missing field, record put rejection — e.g.
+        // an empty array written into a scalar field) must therefore NOT
+        // trigger the target's process cycle, which would otherwise run
+        // the target on its stale field value and diverge from C on side
+        // effects, FLNK, alarms, and put-notify completion ordering. The
+        // alarm inheritance above already ran (C folds it regardless of
+        // status), matching the C ordering exactly.
+        if put_result.is_err() {
+            return;
         }
 
         // C `dbDbPutValue` (`dbDbLink.c:387-390`) processes the target
@@ -1568,5 +1583,77 @@ impl PvDatabase {
         if count > 0 {
             eprintln!("iocInit: {count} CP link subscriptions");
         }
+    }
+}
+
+#[cfg(test)]
+mod out_link_put_fail_tests {
+    use super::{LinkAlarm, OutLinkSrc};
+    use crate::server::database::PvDatabase;
+    use crate::server::record::{AlarmSeverity, DbLink, LinkProcessPolicy, MonitorSwitch};
+    use crate::server::records::calc::CalcRecord;
+    use crate::types::EpicsValue;
+    use std::collections::HashSet;
+
+    /// Regression R0604-BASEDB-OUT-PUT-FAIL-PROCESS-1.
+    ///
+    /// C `dbDbPutValue` (dbDbLink.c:382-390) runs `dbPut`, folds the
+    /// source alarm via `recGblInheritSevrMsg`, then `if (status) return
+    /// status;` — only a *successful* write reaches the `.PROC`/`PP`
+    /// `processTarget` branch. A failed OUT-link write must therefore NOT
+    /// process the target. Here the write is an empty array into a scalar
+    /// field, which `put_pv_already_locked` rejects with `InvalidValue`
+    /// (the C dbPut nRequest=0 empty-array guard, field_io.rs).
+    ///
+    /// Observable: a passive `calc` target with `CALC = "7"` evaluates to
+    /// `VAL = 7` on process and stays at its `Default` `VAL = 0` when not
+    /// processed. The PP OUT link below carries a value the write
+    /// rejects, so the fixed code returns before `processTarget` and
+    /// `VAL` stays `0.0`; the pre-fix code processed the target
+    /// unconditionally and `VAL` would become `7.0`.
+    #[tokio::test]
+    async fn pp_out_link_failed_write_does_not_process_target() {
+        let db = PvDatabase::new();
+        db.add_record("TGT", Box::new(CalcRecord::new("7")))
+            .await
+            .unwrap();
+
+        // Precondition: CALC not yet evaluated, VAL at its Default 0.0.
+        assert!(
+            matches!(db.get_pv("TGT.VAL").await.unwrap(), EpicsValue::Double(v) if v == 0.0),
+            "calc VAL must start at its Default 0.0 before any process"
+        );
+
+        let link = DbLink {
+            record: "TGT".to_string(),
+            field: "VAL".to_string(),
+            policy: LinkProcessPolicy::ProcessPassive, // ` PP` token
+            monitor_switch: MonitorSwitch::NoMaximize,
+        };
+        let alarm = LinkAlarm {
+            stat: 0,
+            sevr: AlarmSeverity::NoAlarm,
+            amsg: String::new(),
+        };
+        let src = OutLinkSrc {
+            putf: false,
+            notify: None,
+            alarm: &alarm,
+        };
+        let mut visited = HashSet::new();
+
+        // Empty array into the scalar VAL field: put_pv_already_locked
+        // returns Err(InvalidValue) per the field_io.rs empty-array guard.
+        db.write_db_link_value(&link, EpicsValue::DoubleArray(vec![]), src, &mut visited, 0)
+            .await;
+
+        // Fixed: the failed write short-circuits before processTarget,
+        // so CALC was never evaluated and VAL is still its Default 0.0.
+        // Pre-fix: the target processed and VAL would be 7.0.
+        assert!(
+            matches!(db.get_pv("TGT.VAL").await.unwrap(), EpicsValue::Double(v) if v == 0.0),
+            "a failed OUT-link write must NOT process the PP target \
+             (VAL must stay 0.0, not become 7.0)"
+        );
     }
 }

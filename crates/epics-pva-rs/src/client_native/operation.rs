@@ -120,6 +120,25 @@ impl<T: Send + 'static> PvaOperation<T> {
                 "Operation result already consumed".into(),
             ));
         }
+        // Regression R0604-PVACLI-CANCEL-AFTER-COMPLETE-POISONS-WAIT-1.
+        // A produced result is terminal and wins over a later cancellation.
+        // pvxs treats a completed `Operation` as final: `cancel()` of it
+        // returns false and leaves the buffered reply intact. `cancel()`
+        // here sets the `cancelled` flag before it can observe that the task
+        // already terminated, so a cancel issued as idempotent cleanup after
+        // completion must not replace the already-buffered Ok/Err result
+        // with `Operation cancelled`. Read the buffered result *before*
+        // honouring the cancellation flag.
+        match self.result_rx.try_recv() {
+            Ok(r) => {
+                self.done = true;
+                return r;
+            }
+            // `Empty`: still running. `Closed`: the task ended without
+            // sending (aborted — possibly by `cancel()`). Either way, fall
+            // through to the cancellation check and the awaiting select.
+            Err(oneshot::error::TryRecvError::Empty | oneshot::error::TryRecvError::Closed) => {}
+        }
         if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
             return Err(PvaError::Protocol("Operation cancelled".into()));
         }
@@ -421,6 +440,47 @@ mod tests {
         }
         let v = op.wait(Some(Duration::from_secs(1))).await.unwrap();
         assert_eq!(v, 5);
+    }
+
+    /// Regression R0604-PVACLI-CANCEL-AFTER-COMPLETE-POISONS-WAIT-1.
+    /// `cancel()` used as idempotent cleanup after an operation has already
+    /// completed (but before its result is consumed) must report not-active
+    /// and must NOT poison the buffered `Ok` result for a later `wait()`.
+    #[tokio::test]
+    async fn cancel_after_complete_preserves_ok_result() {
+        let mut op = PvaOperation::spawn(async { Ok::<i32, _>(42) });
+        // Let the task fully terminate without consuming the result: once
+        // it is finished the result has been sent and is buffered.
+        while !op.is_done() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        // Completed → cancel reports not-active and is a no-op for the result.
+        assert!(
+            !op.cancel().await,
+            "cancel of a completed op must report not-active"
+        );
+        assert_eq!(
+            op.wait(Some(Duration::from_secs(1))).await.unwrap(),
+            42,
+            "cancel after completion must not replace the buffered Ok result"
+        );
+    }
+
+    /// Regression R0604-PVACLI-CANCEL-AFTER-COMPLETE-POISONS-WAIT-1.
+    /// The same precedence holds for an operation that completed with an
+    /// `Err`: the real error survives a post-completion `cancel()`.
+    #[tokio::test]
+    async fn cancel_after_complete_preserves_err_result() {
+        let mut op = PvaOperation::<i32>::spawn(async { Err(PvaError::Protocol("boom".into())) });
+        while !op.is_done() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(!op.cancel().await);
+        let r = op.wait(Some(Duration::from_secs(1))).await;
+        assert!(
+            matches!(r, Err(PvaError::Protocol(ref m)) if m.contains("boom")),
+            "cancel after completion must surface the real error, not `Operation cancelled`, got {r:?}"
+        );
     }
 
     /// After one successful result read the single-consumer policy

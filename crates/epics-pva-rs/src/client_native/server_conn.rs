@@ -1182,6 +1182,19 @@ fn route_frame(
             } else {
                 tracing::debug!(sid, "server destroyed unknown channel (already torn down?)");
             }
+            // CMD_DESTROY_CHANNEL is the single owner of per-SID client-side
+            // teardown: drop this SID's `ClientReport` counters too, matching
+            // pvxs `Channel::disconnect()` (called on disconnect OR
+            // CMD_DESTROY_CHANNEL) which does `current->chanBySID.erase(sid)`
+            // in the Active case (client.cpp:149,170). Without this the report
+            // still lists the destroyed channel until the next ChannelState
+            // transition, and a same-connection SID reuse keeps the stale
+            // name/counters because `register_channel` is `or_insert_with`.
+            // The other per-SID teardown owners already drop it (set_state via
+            // `unregister_channel`, connection drop via `chan_stats.clear()`);
+            // this closes the last bypass. Regression
+            // R0604-PVACLI-REPORT-DESTROY-CHANNEL-LEAK-1.
+            chan_stats.remove(&sid);
         }
         return;
     }
@@ -1720,6 +1733,75 @@ mod tests {
         );
         assert!(flag.load(AtoOrd::Relaxed));
         assert!(!by_sid_close.contains_key(&sid));
+    }
+
+    /// Regression R0604-PVACLI-REPORT-DESTROY-CHANNEL-LEAK-1: a
+    /// server-initiated `CMD_DESTROY_CHANNEL` must also drop the destroyed
+    /// SID's `ClientReport` (`chan_stats`) entry, matching pvxs
+    /// `Channel::disconnect()` doing `chanBySID.erase(sid)` (client.cpp:170).
+    /// Before the fix the branch removed the IOID maps and close signal but
+    /// left `chan_stats` populated, so a report taken before the next state
+    /// transition still listed the destroyed channel, and a same-connection
+    /// SID reuse kept the stale name/counters (`register_channel` is
+    /// `or_insert_with`).
+    #[test]
+    fn destroy_channel_removes_chan_stats_report_entry() {
+        let (by_ioid, by_cid, by_sid_close, ioid_to_sid, ioid_to_cmd, writer_tx, cancel) =
+            fresh_router();
+        let chan_stats: Arc<DashMap<u32, ChanStat>> = Arc::new(DashMap::new());
+        let sid = 9u32;
+        // A live channel with accumulated report counters.
+        chan_stats.insert(
+            sid,
+            ChanStat {
+                name: "OLD:PV".into(),
+                rx: AtomicU64::new(123),
+                tx: AtomicU64::new(456),
+            },
+        );
+        let flag = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        by_sid_close.insert(sid, (flag.clone(), notify.clone()));
+
+        let order = ByteOrder::Little;
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        let header = PvaHeader::application(
+            true,
+            order,
+            Command::DestroyChannel.code(),
+            payload.len() as u32,
+        );
+        route_frame(
+            Frame { header, payload },
+            &by_ioid,
+            &by_cid,
+            &by_sid_close,
+            &ioid_to_sid,
+            &ioid_to_cmd,
+            &chan_stats,
+            &writer_tx,
+            &cancel,
+        );
+
+        // pvxs erases chanBySID[sid]: the report no longer lists the channel.
+        assert!(
+            !chan_stats.contains_key(&sid),
+            "server DESTROY_CHANNEL must drop the channel's report entry"
+        );
+
+        // Same-connection SID reuse: `register_channel`'s `or_insert_with`
+        // now creates a fresh entry (new name, zeroed counters) instead of
+        // keeping the destroyed channel's stale name/counters.
+        chan_stats.entry(sid).or_insert_with(|| ChanStat {
+            name: "NEW:PV".into(),
+            rx: AtomicU64::new(0),
+            tx: AtomicU64::new(0),
+        });
+        let reused = chan_stats.get(&sid).unwrap();
+        assert_eq!(reused.name, "NEW:PV", "reused SID must take the new name");
+        assert_eq!(reused.rx.load(Ordering::Relaxed), 0, "reused SID rx zeroed");
+        assert_eq!(reused.tx.load(Ordering::Relaxed), 0, "reused SID tx zeroed");
     }
 
     /// `flag.store(true)` for the destroyed sid must run together with

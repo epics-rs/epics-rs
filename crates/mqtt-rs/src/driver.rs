@@ -183,6 +183,21 @@ impl PortDriver for MqttDriver {
         value: u32,
         mask: u32,
     ) -> AsynResult<()> {
+        // C parity: MqttDriver::digitalWrite (drvMqtt.cpp:608-622) refuses a
+        // partial-mask digital write until the current full value is known.
+        // It reads getUIntDigitalParam(idx, &cur, 0xFFFFFFFF); if that returns
+        // asynParamUndefined it throws "Masked write attempted on uninitialized
+        // value" and returns asynError, because publishing only the masked bits
+        // would overwrite the unknown bits with an assumed zero. A full-mask
+        // (0xFFFFFFFF) write supplies every bit, so it may proceed with no prior
+        // value. The lower asyn param library otherwise starts an undefined
+        // UInt32Digital from zero (set_uint32), which is exactly what this guard
+        // must prevent for a masked publish.
+        if mask != 0xFFFF_FFFF {
+            // Surfaces ParamUndefined as an error (C asynParamUndefined),
+            // gating the start-from-zero merge below.
+            self.base.params.get_uint32_strict(user.reason, user.addr)?;
+        }
         // Device write interface: no forced interrupt mask (interrupt_mask = 0).
         self.base
             .params
@@ -324,6 +339,54 @@ mod tests {
         let req = rx.try_recv().unwrap();
         assert_eq!(req.topic, "test/str_topic");
         assert_eq!(req.payload, "hello");
+    }
+
+    /// C parity: a partial-mask DIGITAL write before any current value is
+    /// known must be rejected (MqttDriver::digitalWrite throws on
+    /// asynParamUndefined, drvMqtt.cpp:613-614) and must not publish — the
+    /// unknown bits cannot be safely overwritten with an assumed zero.
+    #[test]
+    fn masked_digital_write_rejected_when_value_uninitialized() {
+        let (mut driver, mut rx) = make_driver(&["FLAT:DIGITAL test/bits"]);
+        let reason = driver.drv_user_create("FLAT:DIGITAL test/bits").unwrap();
+        let mut user = AsynUser::new(reason);
+
+        let r = driver.write_uint32_digital(&mut user, 0x0005, 0x000f);
+        assert!(
+            matches!(r, Err(AsynError::ParamUndefined(_))),
+            "masked write on uninitialized value must be rejected, got {r:?}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a rejected masked write must not publish"
+        );
+    }
+
+    /// Once the current value is known (here via a full-mask write, which C
+    /// allows with no prior value), a partial-mask write merges the masked
+    /// bits into it and publishes the composite — matching C's
+    /// auxVal |= (value & mask); auxVal &= (value | ~mask) (drvMqtt.cpp:620-621).
+    #[test]
+    fn masked_digital_write_merges_after_current_value_known() {
+        let (mut driver, mut rx) = make_driver(&["FLAT:DIGITAL test/bits"]);
+        let reason = driver.drv_user_create("FLAT:DIGITAL test/bits").unwrap();
+        let mut user = AsynUser::new(reason);
+
+        // Full mask supplies every bit → allowed with no prior value.
+        driver
+            .write_uint32_digital(&mut user, 0x00f0, 0xffff_ffff)
+            .unwrap();
+        let req = rx.try_recv().unwrap();
+        assert_eq!(req.topic, "test/bits");
+        assert_eq!(req.payload, "240"); // 0x00f0
+
+        // Partial mask now merges into the known 0x00f0:
+        // (0x00f0 & ~0x000f) | (0x0005 & 0x000f) = 0x00f5 = 245.
+        driver
+            .write_uint32_digital(&mut user, 0x0005, 0x000f)
+            .unwrap();
+        let req = rx.try_recv().unwrap();
+        assert_eq!(req.payload, "245");
     }
 
     #[test]

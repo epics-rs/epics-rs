@@ -6063,47 +6063,41 @@ async fn handle_op(
             let is_start = is_start_stop && (subcmd & 0x40 != 0);
             let is_stop = is_start_stop && (subcmd & 0x40 == 0);
             let is_destroy = subcmd & 0x10 != 0;
-            if let Some(op) = ch.ops.get(&ioid) {
-                if is_stop {
-                    op.monitor_paused
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                    // Executing->Idle. The op's single
-                    // start-control owner fires notify_monitor_start(false)
-                    // on the edge so a gateway can suspend its upstream.
-                    if let Some(ctl) = &op.monitor_start_ctl {
-                        ctl.set(false);
-                    }
-                } else if is_start {
-                    let prev = op
-                        .monitor_paused
-                        .swap(false, std::sync::atomic::Ordering::Relaxed);
-                    if prev {
-                        if let Some(n) = op.monitor_window_notify.as_ref() {
-                            n.notify_waiters();
-                        }
-                        // wake the subscriber loop so it flushes
-                        // the value squashed during the pause (works for
-                        // non-pipelined ops too, which have no window
-                        // notify). `notify_one` stores a permit when the
-                        // loop isn't waiting yet, so a resume that races
-                        // ahead of the loop's `notified()` is not lost.
-                        op.monitor_resume.notify_one();
-                        // Idle->Executing. `prev` gates this to a
-                        // genuine resume — a START on a monitor that was not
-                        // actually paused does not re-fire on_start(true).
-                        if let Some(ctl) = &op.monitor_start_ctl {
-                            ctl.set(true);
-                        }
-                    }
-                }
-            }
+            // Validate-before-side-effect: decode and validate the optional
+            // ACK count BEFORE any START/STOP or source callback.
+            // Regression R0604-PVASRV-MONITOR-ACK-VALIDATE-ORDER-1.
+            //
+            // pvxs `servermon.cpp:599-608` reads `from_wire(M, nack)` when
+            // `subcmd & 0x80` and, on a truncated frame (`!M.good()`), calls
+            // `bev.reset()` and returns BEFORE op lookup, ACK refill,
+            // `onHighMark`, `onStart`, or any state change. A malformed
+            // combined frame — `0xC4` (ACK|START) or `0x84` (ACK|STOP) with no
+            // ACK `u32` — must therefore NOT fire `notify_monitor_start` or
+            // mutate `monitor_paused`/the resume waiters before this decode.
+            // Hoisting the decode above the START/STOP block makes those side
+            // effects unreachable on a bad ACK. `cur` is consumed by nothing
+            // else in this arm, so this is the sole frame-payload read; a
+            // missing/truncated count propagates a Decode error that resets the
+            // connection. Never fabricate credits — the old `unwrap_or(4)`
+            // corrupted the flow-control window.
+            let ack_count: Option<u32> = if is_ack {
+                Some(cur.get_u32(inbound_order).map_err(|e| {
+                    PvaError::Decode(format!(
+                        "malformed MONITOR ACK (ioid {ioid}): missing u32 ack-count: {e}"
+                    ))
+                })?)
+            } else {
+                None
+            };
 
-            // ACK path: refill the pipeline window. pvxs
-            // servermon.cpp:111 reads the u32 ack-count; we add it
-            // to the AtomicU32 and pulse the notify so a paused
-            // subscriber wakes and resumes emission. ACKs can arrive
-            // before OR after the START — we always honour them.
-            if is_ack {
+            // ACK refill — applied BEFORE START/STOP to match pvxs order
+            // (servermon.cpp:643-689 applies ACK refill then START/STOP, so
+            // `onHighMark` precedes `onStart` for a well-formed combined
+            // frame). The ACK count was validated above; here we add it to the
+            // pipeline window and pulse the notify so a paused subscriber wakes
+            // and resumes emission. ACKs can arrive before OR after the START —
+            // we always honour them.
+            if let Some(ack_count) = ack_count {
                 // fire HIGH (resume) from the ACK path —
                 // pvxs `servermon.cpp:653-666` fires `onHighMark` when
                 // ACKs add enough credit. A gateway source that paused
@@ -6114,25 +6108,6 @@ async fn handle_op(
                 // token) is computed under the `op` borrow, then the
                 // callback runs after it is dropped so `source` can
                 // borrow `ch.name` freely.
-                // `(seq, op_id)` of the crossing, computed under the `op`
-                // borrow, fired after it is dropped so `source` can borrow
-                // `ch.name` freely.
-                // pvxs `servermon.cpp:599-608`: a data-phase ACK
-                // (`subcmd & 0x80`) carries a u32 ack-count; a
-                // missing/truncated one is `!M.good()` → `bev.reset()`
-                // (connection-fatal). The previous `unwrap_or(4)`
-                // fabricated 4 credits from a malformed ACK, silently
-                // corrupting the flow-control window. Read it first and
-                // propagate a Decode error so the connection loop resets
-                // — never fabricate credits. (A data frame on a
-                // non-existent IOID was already rejected with "operation
-                // not initialised" above, so by here the op exists; this
-                // read is the only remaining ACK-payload validation.)
-                let ack_count = cur.get_u32(inbound_order).map_err(|e| {
-                    PvaError::Decode(format!(
-                        "malformed MONITOR ACK (ioid {ioid}): missing u32 ack-count: {e}"
-                    ))
-                })?;
                 let mut fire_high: Option<(u64, u64)> = None;
                 if let Some(op) = ch.ops.get(&ioid) {
                     if let (Some(w), Some(n)) = (
@@ -6211,6 +6186,47 @@ async fn handle_op(
                             kind: crate::server_native::source::WatermarkKind::Resume,
                         },
                     );
+                }
+            }
+
+            // START / STOP — applied AFTER ACK refill (pvxs
+            // servermon.cpp:671-689 sets Executing/Idle and fires `onStart`
+            // after the ACK block). The ACK count for a combined frame was
+            // already validated at the top of this arm, so reaching here means
+            // the frame decoded cleanly and these side effects are safe.
+            // Regression R0604-PVASRV-MONITOR-ACK-VALIDATE-ORDER-1.
+            if let Some(op) = ch.ops.get(&ioid) {
+                if is_stop {
+                    op.monitor_paused
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    // Executing->Idle. The op's single
+                    // start-control owner fires notify_monitor_start(false)
+                    // on the edge so a gateway can suspend its upstream.
+                    if let Some(ctl) = &op.monitor_start_ctl {
+                        ctl.set(false);
+                    }
+                } else if is_start {
+                    let prev = op
+                        .monitor_paused
+                        .swap(false, std::sync::atomic::Ordering::Relaxed);
+                    if prev {
+                        if let Some(n) = op.monitor_window_notify.as_ref() {
+                            n.notify_waiters();
+                        }
+                        // wake the subscriber loop so it flushes
+                        // the value squashed during the pause (works for
+                        // non-pipelined ops too, which have no window
+                        // notify). `notify_one` stores a permit when the
+                        // loop isn't waiting yet, so a resume that races
+                        // ahead of the loop's `notified()` is not lost.
+                        op.monitor_resume.notify_one();
+                        // Idle->Executing. `prev` gates this to a
+                        // genuine resume — a START on a monitor that was not
+                        // actually paused does not re-fire on_start(true).
+                        if let Some(ctl) = &op.monitor_start_ctl {
+                            ctl.set(true);
+                        }
+                    }
                 }
             }
 
@@ -9935,6 +9951,357 @@ mod tests {
             window.load(Ordering::Relaxed),
             u32::MAX,
             "refill must saturate at u32::MAX, not wrap to a tiny value"
+        );
+    }
+
+    /// Recorder source for the MONITOR ACK validate-order regression
+    /// (R0604-PVASRV-MONITOR-ACK-VALIDATE-ORDER-1). Pushes every
+    /// `notify_monitor_start` and `notify_watermark` edge into one ordered
+    /// log so a test can assert (a) NO edge fires when a malformed combined
+    /// frame is rejected, and (b) ACK refill precedes START for a well-formed
+    /// combined frame.
+    struct AckOrderSource {
+        intro: FieldDesc,
+        value: PvField,
+        log: Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+    impl crate::server_native::source::ChannelSource for AckOrderSource {
+        async fn list_pvs(&self) -> Vec<String> {
+            vec!["dut".into()]
+        }
+        async fn has_pv(&self, n: &str) -> bool {
+            n == "dut"
+        }
+        async fn get_introspection(&self, _n: &str) -> Option<FieldDesc> {
+            Some(self.intro.clone())
+        }
+        async fn get_value(&self, _n: &str) -> Option<PvField> {
+            Some(self.value.clone())
+        }
+        async fn put_value(&self, _n: &str, _v: PvField) -> Result<(), OpError> {
+            Ok(())
+        }
+        async fn is_writable(&self, _n: &str) -> bool {
+            false
+        }
+        async fn subscribe(&self, _n: &str) -> Option<mpsc::Receiver<PvField>> {
+            let (_tx, rx) = mpsc::channel(1);
+            Some(rx)
+        }
+        fn notify_monitor_start(
+            &self,
+            _name: &str,
+            _ctx: &crate::server_native::source::ChannelContext,
+            start: bool,
+        ) {
+            self.log.lock().push(format!("start:{start}"));
+        }
+        fn notify_watermark(
+            &self,
+            _name: &str,
+            _ctx: &crate::server_native::source::ChannelContext,
+            ev: crate::server_native::source::WatermarkEvent,
+        ) {
+            self.log.lock().push(format!("watermark:{:?}", ev.kind));
+        }
+    }
+
+    /// Build a single started MONITOR op for the ACK validate-order tests.
+    /// `paused` is the caller-held `monitor_paused` handle (so it can assert
+    /// on it after the call); `executing` fires the initial Idle->Executing
+    /// edge on `monitor_start_ctl` (recording "start:true" — callers clear the
+    /// log after build when they need a clean slate); `wm`, when set, also
+    /// seeds the watermark sequence to the "below high" (drained) parity so an
+    /// ACK refill can cross HIGH.
+    fn ack_order_channels(
+        ids: (u32, u32),
+        paused: Arc<std::sync::atomic::AtomicBool>,
+        executing: bool,
+        window: Arc<std::sync::atomic::AtomicU32>,
+        wm: Option<(usize, usize)>,
+        src: &DynSource,
+        intro: &FieldDesc,
+    ) -> HashMap<u32, ChannelState> {
+        let (sid, ioid) = ids;
+        let mut op = non_monitor_op_state(
+            intro.clone(),
+            OpKind::Monitor,
+            BitSet::all_set(intro.total_bits()),
+        );
+        op.monitor_started = true;
+        op.monitor_window = Some(window);
+        op.monitor_window_notify = Some(Arc::new(tokio::sync::Notify::new()));
+        op.monitor_paused = paused;
+        op.monitor_resume = Arc::new(tokio::sync::Notify::new());
+        op.monitor_wm = wm;
+        // even parity = "below high" (a drained window awaiting refill), odd =
+        // "above" (full window). `cross_watermark` fires HIGH only from the
+        // below state, so a watermark test seeds 0; without a watermark the
+        // seed is irrelevant (matches the production full-window seed of 1).
+        op.monitor_wm_seq = Arc::new(std::sync::atomic::AtomicU64::new(if wm.is_some() {
+            0
+        } else {
+            1
+        }));
+        let (exec_tx, _exec_rx) = tokio::sync::watch::channel(false);
+        let ctl = Arc::new(MonitorStartControl::new(
+            src.clone(),
+            "dut".into(),
+            bfr12_anon_ctx(),
+            exec_tx,
+        ));
+        if executing {
+            ctl.set(true); // Idle->Executing edge (records "start:true")
+        }
+        op.monitor_start_ctl = Some(ctl);
+        let mut ops = HashMap::new();
+        ops.insert(ioid, op);
+        let mut channels = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                source: src.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                ops,
+            },
+        );
+        channels
+    }
+
+    /// Regression R0604-PVASRV-MONITOR-ACK-VALIDATE-ORDER-1.
+    ///
+    /// A truncated `0xC4` (ACK|START) frame with no ACK `u32` must be a
+    /// connection-fatal Decode error with NO START side effect: `monitor_paused`
+    /// stays paused and `notify_monitor_start` never fires. pvxs
+    /// (servermon.cpp:599-608) reads/validates the ACK count before any op
+    /// lookup or `onStart`. Pre-fix the START block ran first, clearing the
+    /// pause and firing `notify_monitor_start(true)` before the decode error.
+    #[tokio::test]
+    async fn monitor_combined_ack_start_truncated_no_side_effect() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (3u32, 88u32);
+        let intro = three_field_intro();
+        let log = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let src: DynSource = Arc::new(AckOrderSource {
+            intro: intro.clone(),
+            value: three_field_value(0, 0, 0),
+            log: log.clone(),
+        });
+        let window = Arc::new(AtomicU32::new(0));
+        // paused=true so a real START would resume (observable); ctl Idle
+        // (executing=false) so a real START would fire notify_monitor_start.
+        let paused = Arc::new(AtomicBool::new(true));
+        let mut channels = ack_order_channels(
+            (sid, ioid),
+            paused.clone(),
+            false,
+            window.clone(),
+            None,
+            &src,
+            &intro,
+        );
+        log.lock().clear();
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let config = crate::server_native::runtime::PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // subcmd 0xC4 = ACK(0x80)|START(0x04)|start(0x40), NO ack u32 payload.
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0xC4);
+        let frame = synth_frame(Command::Monitor, order, payload);
+        let err = handle_op(
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Monitor,
+            &config,
+            &mut encode_cache,
+            &mut TypeCache::new(),
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect_err("truncated ACK|START must be connection-fatal");
+        assert!(
+            matches!(err, PvaError::Decode(_)),
+            "expected a Decode (connection-reset) error, got {err:?}"
+        );
+        assert!(
+            paused.load(Ordering::Relaxed),
+            "a rejected ACK|START must NOT clear monitor_paused before the decode error"
+        );
+        assert!(
+            log.lock().is_empty(),
+            "a rejected ACK|START must fire no start/watermark callback, got {:?}",
+            log.lock()
+        );
+    }
+
+    /// Regression R0604-PVASRV-MONITOR-ACK-VALIDATE-ORDER-1.
+    ///
+    /// A truncated `0x84` (ACK|STOP) frame with no ACK `u32` must be a
+    /// connection-fatal Decode error with NO STOP side effect: `monitor_paused`
+    /// stays cleared and `notify_monitor_start(false)` never fires. Pre-fix the
+    /// STOP block stored `monitor_paused=true` and fired the stop edge before
+    /// the decode error.
+    #[tokio::test]
+    async fn monitor_combined_ack_stop_truncated_no_side_effect() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (3u32, 88u32);
+        let intro = three_field_intro();
+        let log = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let src: DynSource = Arc::new(AckOrderSource {
+            intro: intro.clone(),
+            value: three_field_value(0, 0, 0),
+            log: log.clone(),
+        });
+        let window = Arc::new(AtomicU32::new(0));
+        // paused=false and ctl Executing (executing=true) so a real STOP would
+        // pause and fire notify_monitor_start(false).
+        let paused = Arc::new(AtomicBool::new(false));
+        let mut channels = ack_order_channels(
+            (sid, ioid),
+            paused.clone(),
+            true,
+            window.clone(),
+            None,
+            &src,
+            &intro,
+        );
+        log.lock().clear(); // drop the build-time "start:true" edge
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let config = crate::server_native::runtime::PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // subcmd 0x84 = ACK(0x80)|STOP(0x04, no start bit), NO ack u32 payload.
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x84);
+        let frame = synth_frame(Command::Monitor, order, payload);
+        let err = handle_op(
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Monitor,
+            &config,
+            &mut encode_cache,
+            &mut TypeCache::new(),
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect_err("truncated ACK|STOP must be connection-fatal");
+        assert!(
+            matches!(err, PvaError::Decode(_)),
+            "expected a Decode (connection-reset) error, got {err:?}"
+        );
+        assert!(
+            !paused.load(Ordering::Relaxed),
+            "a rejected ACK|STOP must NOT set monitor_paused before the decode error"
+        );
+        assert!(
+            log.lock().is_empty(),
+            "a rejected ACK|STOP must fire no stop/watermark callback, got {:?}",
+            log.lock()
+        );
+    }
+
+    /// Regression R0604-PVASRV-MONITOR-ACK-VALIDATE-ORDER-1.
+    ///
+    /// A well-formed `0xC4` (ACK|START) refills the window AND resumes, and
+    /// pvxs (servermon.cpp:643-689) applies ACK refill THEN START, so the
+    /// `onHighMark` (Resume watermark) precedes `onStart`. Pre-fix the START
+    /// block ran first, reversing the order to [start, watermark].
+    #[tokio::test]
+    async fn monitor_combined_ack_start_wellformed_acks_before_start() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let order = ByteOrder::Little;
+        let (sid, ioid) = (3u32, 88u32);
+        let intro = three_field_intro();
+        let log = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let src: DynSource = Arc::new(AckOrderSource {
+            intro: intro.clone(),
+            value: three_field_value(0, 0, 0),
+            log: log.clone(),
+        });
+        // Drained window (0) with high=0 so any refill crosses HIGH; paused so
+        // START is a real resume; ctl Idle so the resume fires onStart(true).
+        let window = Arc::new(AtomicU32::new(0));
+        let paused = Arc::new(AtomicBool::new(true));
+        let mut channels = ack_order_channels(
+            (sid, ioid),
+            paused.clone(),
+            false,
+            window.clone(),
+            Some((0, 0)),
+            &src,
+            &intro,
+        );
+        log.lock().clear();
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let config = crate::server_native::runtime::PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // subcmd 0xC4 with a 3-credit ACK count.
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0xC4);
+        payload.put_u32(3, order);
+        let frame = synth_frame(Command::Monitor, order, payload);
+        handle_op(
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Monitor,
+            &config,
+            &mut encode_cache,
+            &mut TypeCache::new(),
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("well-formed ACK|START ok");
+        assert_eq!(
+            window.load(Ordering::Relaxed),
+            3,
+            "ACK must refill the window by the decoded count"
+        );
+        assert!(
+            !paused.load(Ordering::Relaxed),
+            "a well-formed START must resume the monitor"
+        );
+        assert_eq!(
+            *log.lock(),
+            vec!["watermark:Resume".to_string(), "start:true".to_string()],
+            "pvxs order: ACK refill (onHighMark) precedes START (onStart)"
         );
     }
 

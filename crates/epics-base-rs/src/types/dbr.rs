@@ -217,11 +217,17 @@ pub fn is_link_dbf_type(dbf_type: u8) -> bool {
 /// field outside the list).
 ///
 /// `record_type` is the record's `recordType` (`ai`, `bo`, `seq`, …); it
-/// is consulted only to resolve the one direction-ambiguous field,
-/// `SIOL`, which is `DBF_OUTLINK` on output records and `DBF_INLINK` on
-/// input records (compare `boRecord.dbd.pod:318` `SIOL,DBF_OUTLINK` vs
-/// `aiRecord`/`biRecord` `SIOL,DBF_INLINK`). Every other family has a
-/// fixed class across all record types.
+/// is consulted to resolve the two direction-ambiguous fields that share a
+/// spelling across record families:
+///   - `SIOL` is `DBF_OUTLINK` on output records and `DBF_INLINK` on input
+///     records (compare `boRecord.dbd.pod:318` `SIOL,DBF_OUTLINK` vs
+///     `aiRecord`/`biRecord` `SIOL,DBF_INLINK`).
+///   - `LNK0..LNKF` is `DBF_FWDLINK` on `fanoutRecord` (the multi-forward
+///     fan-out family) and `DBF_OUTLINK` on `seqRecord` / synApps
+///     `sseqRecord` (compare `fanoutRecord.dbd.pod` `field(LNK0,DBF_FWDLINK)`
+///     vs `seqRecord.dbd.pod` `field(LNK0,DBF_OUTLINK)`).
+///
+/// Every other family has a fixed class across all record types.
 ///
 /// Names and classes are taken verbatim from EPICS Base / synApps
 /// `*.dbd(.pod)`:
@@ -229,7 +235,8 @@ pub fn is_link_dbf_type(dbf_type: u8) -> bool {
 ///   - `INP`/`DOL`/`SIML`/`NVL`/`SVL`/`SUBL`/`SELL`→In, `OUT`→Out.
 ///   - `SIOL`→Out on output records, else In.
 ///   - `INPA..INPU`/`INP0..INP9`→In; `OUTA..OUTU`→Out.
-///   - `DOL0..DOL9`/`DOLA..DOLF`→In; `LNK0..LNK9`/`LNKA..LNKF`→Out.
+///   - `DOL0..DOL9`/`DOLA..DOLF`→In.
+///   - `LNK0..LNK9`/`LNKA..LNKF`→Fwd on `fanout`, else Out.
 pub fn dbf_link_class(record_type: &str, field: &str) -> Option<DbfLinkClass> {
     use DbfLinkClass::*;
     let f = field.trim().to_ascii_uppercase();
@@ -257,11 +264,23 @@ pub fn dbf_link_class(record_type: &str, field: &str) -> Option<DbfLinkClass> {
     // base record that defines the family, so a one-char-suffix rule is
     // both complete and on the safe (reject) side for custom records.
     let one_alnum = |rest: &str| rest.len() == 1 && rest.as_bytes()[0].is_ascii_alphanumeric();
+    // `LNK0..LNKF` is direction-ambiguous by record type the same way
+    // `SIOL` is: `fanoutRecord` declares the family as `DBF_FWDLINK`
+    // (multi-forward fan-out), every other family that uses the spelling
+    // (`seqRecord`, synApps `sseqRecord`) declares it `DBF_OUTLINK`.
+    // Resolve it once here so the prefix table below carries a single
+    // class per spelling rather than collapsing fanout's forward links to
+    // output links by prefix.
+    let lnk_class = if is_fanout_link_record(record_type) {
+        FwdLink
+    } else {
+        OutLink
+    };
     for (prefix, class) in [
         ("INP", InLink),
         ("DOL", InLink),
         ("OUT", OutLink),
-        ("LNK", OutLink),
+        ("LNK", lnk_class),
     ] {
         if let Some(rest) = f.strip_prefix(prefix) {
             if one_alnum(rest) {
@@ -281,6 +300,16 @@ fn is_output_record_type(record_type: &str) -> bool {
         record_type,
         "ao" | "bo" | "longout" | "int64out" | "mbbo" | "mbboDirect" | "stringout" | "lso" | "aao"
     )
+}
+
+/// `fanoutRecord` is the one Base family whose `LNK0..LNKF` fields are
+/// `DBF_FWDLINK` (forward links fired in numerical order). Every other
+/// family that uses the same `LNK*` spelling — `seqRecord`, synApps
+/// `sseqRecord` — declares them `DBF_OUTLINK`. Compare
+/// `fanoutRecord.dbd.pod` `field(LNK0,DBF_FWDLINK)` vs `seqRecord.dbd.pod`
+/// `field(LNK0,DBF_OUTLINK)`.
+fn is_fanout_link_record(record_type: &str) -> bool {
+    record_type == "fanout"
 }
 
 /// Calculate buffer size for a DBR type including metadata, matching C
@@ -531,6 +560,38 @@ mod dbf_link_class_tests {
         // SIML is always DBF_INLINK regardless of direction.
         assert_eq!(dbf_link_class("bo", "SIML"), Some(DbfLinkClass::InLink));
         assert_eq!(dbf_link_class("ai", "SIML"), Some(DbfLinkClass::InLink));
+    }
+
+    /// Regression R0604-BASEDB-LINK-CLASS-FANOUT-LNK-1: `LNK0..LNKF` shares
+    /// its spelling across two DBF classes — `fanoutRecord` declares the
+    /// family `DBF_FWDLINK`, while `seqRecord`/`sseqRecord` declare it
+    /// `DBF_OUTLINK`. The classifier must resolve by `record_type`, not
+    /// collapse every `LNK*` to OutLink by prefix.
+    #[test]
+    fn lnk_class_depends_on_record_type() {
+        // fanoutRecord.dbd.pod field(LNK0,DBF_FWDLINK) … field(LNKF,…).
+        assert_eq!(
+            dbf_link_class("fanout", "LNK0"),
+            Some(DbfLinkClass::FwdLink),
+            "fanout LNK0 is DBF_FWDLINK (16), not OUTLINK"
+        );
+        assert_eq!(
+            dbf_link_class("fanout", "LNKF"),
+            Some(DbfLinkClass::FwdLink),
+            "fanout LNKF is DBF_FWDLINK (16), not OUTLINK"
+        );
+        // seqRecord.dbd.pod field(LNK0,DBF_OUTLINK): the default direction
+        // for the shared spelling.
+        assert_eq!(dbf_link_class("seq", "LNK0"), Some(DbfLinkClass::OutLink));
+        assert_eq!(dbf_link_class("seq", "LNKF"), Some(DbfLinkClass::OutLink));
+        // synApps sseqRecord LNK1..LNK9 are also DBF_OUTLINK (LNK10 is the
+        // two-char spelling the one-alnum suffix rule deliberately rejects).
+        assert_eq!(dbf_link_class("sseq", "LNK1"), Some(DbfLinkClass::OutLink));
+        // fanout's dbCommon FLNK is still a forward link (unchanged).
+        assert_eq!(
+            dbf_link_class("fanout", "FLNK"),
+            Some(DbfLinkClass::FwdLink)
+        );
     }
 
     #[test]

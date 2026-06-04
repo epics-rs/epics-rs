@@ -45,23 +45,44 @@ struct Args {
     pv_names: Vec<String>,
 }
 
-/// `cainfo.c:167-173` `sscanf(optarg, "%u", &statLevel)` parity: parse a
-/// leading unsigned integer; an unparseable value is ignored (reset to 0)
-/// with the C warning, so both `-s 0` and a bad `-s` are normal per-PV
-/// mode rather than a diagnostics-only invocation.
+/// `cainfo.c:167-173` `sscanf(optarg, "%u", &statLevel)` parity.
+/// Regression R0604-CAINFO-STATLEVEL-SIGNED-1.
+///
+/// C `%u` skips leading whitespace, accepts an OPTIONAL sign (`+`/`-`),
+/// then reads a decimal-digit run, stopping at the first non-digit. With
+/// at least one digit the conversion succeeds and applies unsigned
+/// wrapping: a leading `-` negates modulo 2^32 (a local probe gives
+/// `sscanf("-1","%u") == 4294967295` and `sscanf("+3abc","%u") == 3`).
+/// With no digit after the optional sign the conversion fails and C resets
+/// `statLevel` to 0 with the warning. Any non-zero result selects
+/// `ca_client_status` mode, so the earlier digit-only parser wrongly
+/// dropped signed inputs like `-1`/`+3abc` into normal per-PV mode.
 fn parse_stat_level(s: &str) -> u32 {
-    let digits: String = s
-        .trim_start()
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    match digits.parse::<u32>() {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!("'{s}' is not a valid interest level - ignored. ('cainfo -h' for help.)");
-            0
+    let mut chars = s.trim_start().chars().peekable();
+    let neg = match chars.peek() {
+        Some('+') => {
+            chars.next();
+            false
         }
+        Some('-') => {
+            chars.next();
+            true
+        }
+        _ => false,
+    };
+    let digits: String = chars.take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        eprintln!("'{s}' is not a valid interest level - ignored. ('cainfo -h' for help.)");
+        return 0;
     }
+    // C `%u` accumulates the magnitude into a 64-bit `unsigned long`
+    // (strtoul, clamping to ULONG_MAX only past 2^64) and then assigns it
+    // to the 32-bit `unsigned int statLevel` by truncation mod 2^32 — a
+    // local probe gives `sscanf("99999999999","%u") == 1215752191`
+    // (== 99999999999 mod 2^32), NOT a saturated `u32::MAX`. Mirror with a
+    // u64 parse, `as u32` truncation, then the sign via wrapping negation.
+    let mag = (digits.parse::<u64>().unwrap_or(u64::MAX)) as u32;
+    if neg { mag.wrapping_neg() } else { mag }
 }
 
 #[tokio::main]
@@ -225,7 +246,42 @@ mod tests {
         // No leading digits → ignored (reset to 0).
         assert_eq!(parse_stat_level("abc"), 0);
         assert_eq!(parse_stat_level(""), 0);
-        // A negative is not a `%u` match → reset to 0.
-        assert_eq!(parse_stat_level("-1"), 0);
+    }
+
+    // Regression R0604-CAINFO-STATLEVEL-SIGNED-1: C `%u` accepts an
+    // optional sign before the digit run, with unsigned wrapping. The
+    // earlier digit-only parser returned 0 for these and wrongly chose
+    // normal per-PV mode where C selects ca_client_status mode.
+    #[test]
+    fn stat_level_accepts_signed_unsigned_prefix() {
+        // `sscanf("-1","%u")` -> 4294967295 (probe-confirmed).
+        assert_eq!(parse_stat_level("-1"), 4_294_967_295);
+        // `sscanf("+3abc","%u")` -> 3.
+        assert_eq!(parse_stat_level("+3abc"), 3);
+        // Leading whitespace is skipped before the sign.
+        assert_eq!(parse_stat_level("  -5"), 5u32.wrapping_neg());
+        assert_eq!(parse_stat_level("+7"), 7);
+        // A sign with no following digit is not a match → reset to 0.
+        assert_eq!(parse_stat_level("-"), 0);
+        assert_eq!(parse_stat_level("+"), 0);
+        // `-0` converts to 0 → normal per-PV mode (not diagnostics).
+        assert_eq!(parse_stat_level("-0"), 0);
+        // Overflow truncates mod 2^32 (NOT saturate): probe-confirmed
+        // `sscanf("99999999999","%u") == 1215752191`.
+        assert_eq!(parse_stat_level("99999999999"), 1_215_752_191);
+    }
+
+    // The decisive mode-selector property: any non-zero `parse_stat_level`
+    // selects ca_client_status mode (`stat_level != 0` in `main`), so a
+    // signed `-s -1` enters status mode and is exempt from the missing-PV
+    // error — matching C `cainfo.c:202` `if (!statLevel && nPvs < 1)`.
+    #[test]
+    fn signed_stat_level_selects_status_mode() {
+        assert_ne!(parse_stat_level("-1"), 0, "-s -1 must enter status mode");
+        assert_ne!(
+            parse_stat_level("+3abc"),
+            0,
+            "-s +3abc must enter status mode"
+        );
     }
 }

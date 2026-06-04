@@ -336,46 +336,12 @@ impl PvaLinkResolver {
             monitor: true,
             ..cfg
         };
-        let pv_name = cfg.pv_name.clone();
-        // B4 `local`: a `local`-flagged link must resolve a PV served
-        // by *this* IOC. pvxs requires a local channel; here that
-        // means the target must be hosted by this IOC under one of
-        // three forms:
-        //   * a `PvDatabase` record or one of its fields (channel-level,
-        //     like `dbChannelTest()` — see `is_local_in_db`),
-        //   * a simple PV registered via `add_pv` (e.g. a QSRV
-        //     single-record channel, an iocsh stats PV, a gateway
-        //     shadow PV),
-        //   * a QSRV group composite PV — which lives only in the
-        //     QSRV provider's group registry, not the `PvDatabase`.
-        // Gating on `get_record` alone wrongly rejected simple PVs;
-        // gating on the `PvDatabase` alone wrongly rejected group
-        // PVs. All three are IOC-local; only a genuinely remote PV is
-        // rejected. The DB lookups use the no-resolver path so the
-        // `local` check never triggers a remote search. Reject
-        // up-front so the operator gets a clear error instead of a
-        // silent remote resolution. Mirrors pvxs `pvaLinkConfig::local`.
-        if cfg.local {
-            // `mut` is only consumed by the QSRV fallthrough below;
-            // gate it so a `qsrv`-less build does not warn unused_mut.
-            #[cfg(feature = "qsrv")]
-            let mut is_local = self.is_local_in_db(&pv_name).await;
-            #[cfg(not(feature = "qsrv"))]
-            let is_local = self.is_local_in_db(&pv_name).await;
-            // QSRV group / single composite PVs: only checked when a
-            // QSRV provider is wired. `hosts_pv` covers both the group
-            // registry and the provider's single-channel name set.
-            #[cfg(feature = "qsrv")]
-            if !is_local {
-                let provider = self.qsrv.read().clone();
-                if let Some(provider) = provider {
-                    is_local = provider.hosts_pv(&pv_name).await;
-                }
-            }
-            if !is_local {
-                return Err(PvaLinkError::NotLocal(pv_name));
-            }
-        }
+        // B4 `local`: a `local`-flagged link must resolve a PV served by
+        // *this* IOC. Reject up-front so the operator gets a clear error
+        // instead of a silent remote resolution. The identical gate runs
+        // on the OUT open and lazy-write paths — see
+        // [`Self::check_local_admission`].
+        self.check_local_admission(&cfg).await?;
         // Register the per-link options under the caller-chosen key:
         // the full scheme-stripped link string for the convenience-URI
         // path (two links to the same PV with different options each keep
@@ -486,6 +452,57 @@ impl PvaLinkResolver {
                 .process_record_with_links(record, &mut visited, 0)
                 .await;
         }
+    }
+
+    /// Shared `local`-admission gate, applied before every pvalink
+    /// `registry.get_or_open` on both the INP and OUT paths.
+    ///
+    /// pvxs applies `pvaLinkConfig::local` inside `pvaOpenLink()`
+    /// (`ioc/pvalink_lset.cpp:69-74`), the single open function used for
+    /// every link direction: if `local` is set and `dbChannelTest()`
+    /// cannot find the channel in this IOC, the link set is cleared
+    /// (`plink->lset = NULL`) and the link never opens, reads, or writes a
+    /// channel. This helper is the single owner of that decision so a
+    /// `local=true` link can never open — or reuse a non-local sibling's
+    /// already-open — remote channel: every caller MUST invoke it before
+    /// `registry.get_or_open`. A non-`local` config passes unconditionally.
+    ///
+    /// "Local" means the target is hosted by this IOC under one of three
+    /// forms, all checked without a remote search:
+    ///   * a `PvDatabase` record or one of its fields (channel-level, like
+    ///     `dbChannelTest()` — see [`Self::is_local_in_db`]),
+    ///   * a simple PV registered via `add_pv` (a QSRV single-record
+    ///     channel, an iocsh stats PV, a gateway shadow PV),
+    ///   * a QSRV group composite PV, which lives only in the QSRV
+    ///     provider's group registry, not the `PvDatabase`.
+    ///
+    /// Gating on `get_record`/the `PvDatabase` alone wrongly rejected
+    /// simple and group PVs; only a genuinely remote PV is rejected.
+    async fn check_local_admission(&self, cfg: &PvaLinkConfig) -> PvaLinkResult<()> {
+        if !cfg.local {
+            return Ok(());
+        }
+        let pv_name = &cfg.pv_name;
+        // `mut` is only consumed by the QSRV fallthrough below; gate it so
+        // a `qsrv`-less build does not warn unused_mut.
+        #[cfg(feature = "qsrv")]
+        let mut is_local = self.is_local_in_db(pv_name).await;
+        #[cfg(not(feature = "qsrv"))]
+        let is_local = self.is_local_in_db(pv_name).await;
+        // QSRV group / single composite PVs: only checked when a QSRV
+        // provider is wired. `hosts_pv` covers both the group registry and
+        // the provider's single-channel name set.
+        #[cfg(feature = "qsrv")]
+        if !is_local {
+            let provider = self.qsrv.read().clone();
+            if let Some(provider) = provider {
+                is_local = provider.hosts_pv(pv_name).await;
+            }
+        }
+        if !is_local {
+            return Err(PvaLinkError::NotLocal(pv_name.clone()));
+        }
+        Ok(())
     }
 
     /// Whether `pv_name` names a channel hosted by the attached
@@ -626,6 +643,11 @@ impl PvaLinkResolver {
         cfg: PvaLinkConfig,
         options_key: String,
     ) -> PvaLinkResult<Arc<PvaLink>> {
+        // `local`-admission gate before any registration or open, so a
+        // rejected `local=true` OUT link leaves no stale option entry and
+        // never opens — or reuses a sibling's already-open — remote
+        // channel (pvxs `pvaOpenLink`, direction-agnostic).
+        self.check_local_admission(&cfg).await?;
         self.out_link_options
             .write()
             .insert(options_key, cfg.clone());
@@ -1193,6 +1215,14 @@ impl LinkSet for PvaLinkResolver {
         let array_path = is_array_value(&value);
         block_in_place_or_warn(|| {
             self.handle.block_on(async {
+                // `local`-admission gate on the lazy write path: a
+                // `local=true` OUT link must never open — or reuse a
+                // sibling's already-open — remote channel. Checked before
+                // `get_or_open` so even a cache hit is gated (pvxs
+                // `pvaOpenLink`, direction-agnostic).
+                self.check_local_admission(&cfg)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 // Resolve the SHARED channel owner for this PV (the
                 // registry no longer keys on the per-link OUT options),
                 // then stage THIS link's write with its own
@@ -3009,6 +3039,100 @@ mod tests {
             matches!(bad_record, Err(PvaLinkError::NotLocal(_))),
             "local link to a nonexistent record must be rejected, got {:?}",
             bad_record.err()
+        );
+    }
+
+    /// R0604-BRPVALINK-OUT-LOCAL-GATE-1: an OUT link with `local=true` to
+    /// a PV not served by this IOC must be rejected at open time, exactly
+    /// like the INP path. pvxs applies `pvaLinkConfig::local` inside
+    /// `pvaOpenLink()` for every direction (`ioc/pvalink_lset.cpp:69-74`);
+    /// before this fix the OUT open path stored the options and opened the
+    /// remote channel without ever evaluating `local`.
+    #[tokio::test]
+    async fn b4_local_out_link_rejects_non_local_pv() {
+        let db = Arc::new(PvDatabase::new());
+        let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        let r = resolver
+            .open_out_link("pva://NOT:A:LOCAL:RECORD?local=true")
+            .await;
+        assert!(
+            matches!(r, Err(PvaLinkError::NotLocal(_))),
+            "local OUT link to a non-local PV must be rejected, got {:?}",
+            r.err()
+        );
+    }
+
+    /// R0604-BRPVALINK-OUT-LOCAL-GATE-1: the structured pvxs-parity JSON
+    /// OUT path (`open_json_out_link`) honours `local=true` the same way.
+    #[tokio::test]
+    async fn b4_local_json_out_link_rejects_non_local_pv() {
+        let db = Arc::new(PvDatabase::new());
+        let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        let r = resolver
+            .open_json_out_link(
+                "NOT:A:LOCAL:RECORD",
+                &[("local".to_string(), "true".to_string())],
+            )
+            .await;
+        assert!(
+            matches!(r, Err(PvaLinkError::NotLocal(_))),
+            "local JSON OUT link to a non-local PV must be rejected, got {:?}",
+            r.err()
+        );
+    }
+
+    /// R0604-BRPVALINK-OUT-LOCAL-GATE-1: the lazy write path
+    /// (`LinkSet::put_value`, the hot path that opens an OUT link on first
+    /// write) must reject a `local=true` write to a remote PV before
+    /// opening/queuing, not send or stage a remote PUT. Asserts the error
+    /// is the `local` gate (`NotLocal` Display) rather than an incidental
+    /// disconnected-write failure, so removing the gate truly fails this.
+    ///
+    /// Multi-thread runtime: `put_value` drives the async open through
+    /// `block_in_place` + `block_on`, which a current-thread runtime
+    /// rejects (matching the typed-array OUT tests below).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn b4_local_out_put_value_rejects_non_local_pv() {
+        let db = Arc::new(PvDatabase::new());
+        let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        let r = LinkSet::put_value(
+            &resolver,
+            "pva://NOT:A:LOCAL:RECORD?local=true",
+            EpicsValue::Double(1.0),
+            LinkPutOp::Plain,
+        );
+        let err = r.expect_err("local=true OUT put to a non-local PV must fail");
+        assert!(
+            err.contains("has no matching local record"),
+            "put must be rejected by the local gate, not an unrelated write failure: {err}"
+        );
+    }
+
+    /// R0604-BRPVALINK-OUT-LOCAL-GATE-1 (sibling-cache): a non-local OUT
+    /// link to a remote PV opens first and seeds the shared channel owner;
+    /// a later `local=true` OUT link to the SAME PV must still be rejected
+    /// rather than reusing the already-open remote owner. The gate runs
+    /// before `get_or_open`, so a cache hit cannot bypass it.
+    #[tokio::test]
+    async fn b4_local_out_link_rejected_even_after_non_local_sibling_opened() {
+        let db = Arc::new(PvDatabase::new());
+        let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        // Non-local sibling opens fine and caches the shared owner.
+        let opened = resolver.open_out_link("pva://SHARED:REMOTE:PV").await;
+        assert!(
+            opened.is_ok(),
+            "non-local OUT link must open, got {:?}",
+            opened.err()
+        );
+        // A later local=true link to the same PV must NOT reuse it.
+        let gated = resolver
+            .open_out_link("pva://SHARED:REMOTE:PV?local=true")
+            .await;
+        assert!(
+            matches!(gated, Err(PvaLinkError::NotLocal(_))),
+            "local=true OUT link must be rejected even when a non-local \
+             sibling already opened the channel, got {:?}",
+            gated.err()
         );
     }
 

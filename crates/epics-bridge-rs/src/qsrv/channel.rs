@@ -181,39 +181,30 @@ pub fn atomic_from_pv_request(request: &PvStructure) -> Option<bool> {
 }
 
 /// Map a `record._options.process` scalar to a [`ProcessMode`],
-/// mirroring pvxs `setForceProcessingFlag` (ioc/iocsource.cpp:426-448):
-/// `Value::as<bool>` accepts a bool, any integer (nonzero ⇒ true), or a
-/// bool-parsable string; the literal `"passive"` (and any other
-/// unrecognized value) leaves the mode at the passive default.
+/// mirroring pvxs `setForceProcessingFlag` (ioc/iocsource.cpp:426-448).
+/// pvxs reads the option through `proc.as<bool>` and, on success, sets
+/// `forceProc = b ? True : False`; only when `as<bool>` raises
+/// `NoConvert` does it fall through to the `"passive"` string check, and
+/// any other unrecognized value is logged and left `Unset`.
+/// `True`/`False`/`Unset` map to Force/Inhibit/Passive here.
+///
+/// This is the *same* `as<bool>` coercion used for
+/// `record._options.atomic`/`block`, so it routes through the shared
+/// [`scalar_as_bool`] owner rather than re-deriving it: a bool, any
+/// signed/unsigned integer or real scalar maps by nonzero truthiness
+/// (`copyOutScalar` `bool(src)`, src/data.cpp:402-408), and a string is
+/// accepted only as the exact tokens `"true"`/`"false"` — no trim, case
+/// sensitive (src/data.cpp:459-461). Every NoConvert outcome — the
+/// literal `"passive"`, a whitespace-wrapped `" false "`, or any other
+/// value — collapses to the passive default, matching pvxs's
+/// `else if(proc.as(s))` / log-and-default tail. The earlier parser
+/// forced real scalars to passive and trimmed strings, both of which
+/// diverged from `as<bool>`.
 fn process_mode_from_scalar(sv: &ScalarValue) -> ProcessMode {
-    let force = |b: bool| {
-        if b {
-            ProcessMode::Force
-        } else {
-            ProcessMode::Inhibit
-        }
-    };
-    match sv {
-        ScalarValue::Boolean(b) => force(*b),
-        ScalarValue::Byte(n) => force(*n != 0),
-        ScalarValue::Short(n) => force(*n != 0),
-        ScalarValue::Int(n) => force(*n != 0),
-        ScalarValue::Long(n) => force(*n != 0),
-        ScalarValue::UByte(n) => force(*n != 0),
-        ScalarValue::UShort(n) => force(*n != 0),
-        ScalarValue::UInt(n) => force(*n != 0),
-        ScalarValue::ULong(n) => force(*n != 0),
-        ScalarValue::String(s) => match s.as_str_lossy().trim() {
-            "true" => ProcessMode::Force,
-            "false" => ProcessMode::Inhibit,
-            // "passive" and any other string fall back to passive,
-            // matching pvxs's `as<bool>` failure → "passive" check →
-            // ignore-and-default chain.
-            _ => ProcessMode::Passive,
-        },
-        // Float/Double are not a documented `process` encoding; pvxs's
-        // as<bool> is not relied upon here. Leave passive.
-        ScalarValue::Float(_) | ScalarValue::Double(_) => ProcessMode::Passive,
+    match scalar_as_bool(sv) {
+        Some(true) => ProcessMode::Force,
+        Some(false) => ProcessMode::Inhibit,
+        None => ProcessMode::Passive,
     }
 }
 
@@ -226,11 +217,11 @@ fn process_mode_from_scalar(sv: &ScalarValue) -> ProcessMode {
 /// keeps its default, matching pvxs `as<bool>(fallback)` returning the
 /// fallback for an absent or unconvertible field.
 ///
-/// This is intentionally distinct from [`process_mode_from_scalar`],
-/// which is a tri-state (Force/Inhibit/Passive) routed through pvxs's
-/// separate `setForceProcessingFlag` chain (real ⇒ passive, `"passive"`
-/// recognized) — mirroring the two different pvxs code paths rather than
-/// forcing one parser to serve both.
+/// [`process_mode_from_scalar`] shares this exact `as<bool>` coercion:
+/// pvxs `setForceProcessingFlag` (iocsource.cpp:436) calls the same
+/// `proc.as<bool>`, so the only difference is that it is a tri-state — a
+/// NoConvert outcome (this returning `None`) becomes the passive default
+/// there instead of the caller's bool fallback here.
 fn scalar_as_bool(sv: &ScalarValue) -> Option<bool> {
     match sv {
         ScalarValue::Boolean(b) => Some(*b),
@@ -904,6 +895,41 @@ mod tests {
             f(ScalarValue::String("passive".into())),
             ProcessMode::Passive
         );
+    }
+
+    /// pvxs reads `record._options.process` through the SAME `proc.as<bool>`
+    /// coercion as `atomic`/`block` (iocsource.cpp:436 → copyOutScalar /
+    /// string store). Real scalars therefore coerce by nonzero truthiness
+    /// (`bool(src)`, data.cpp:402-408), and the string store is exact:
+    /// `" true "`/`" false "` are NoConvert and stay passive (data.cpp:
+    /// 459-461). The earlier parser forced real scalars to passive and
+    /// `.trim()`-ed strings, so `Double(1.0)` was dropped to passive and a
+    /// whitespace-wrapped `" false "` wrongly inhibited processing.
+    #[test]
+    fn put_options_process_real_truthiness_and_no_trim() {
+        let f = |v| PutOptions::from_pv_request(&req_with_process(PvField::Scalar(v))).process;
+
+        // real scalars coerce by nonzero truthiness, not silently passive
+        assert_eq!(f(ScalarValue::Double(1.0)), ProcessMode::Force);
+        assert_eq!(f(ScalarValue::Double(0.0)), ProcessMode::Inhibit);
+        assert_eq!(f(ScalarValue::Float(2.5)), ProcessMode::Force);
+        assert_eq!(f(ScalarValue::Float(0.0)), ProcessMode::Inhibit);
+        // unsigned integer truthiness
+        assert_eq!(f(ScalarValue::UInt(1)), ProcessMode::Force);
+        // strings are matched exactly: surrounding whitespace is NoConvert,
+        // so the mode stays passive (pvxs never trims before the
+        // "true"/"false" store) instead of the trimmed parser's
+        // Force/Inhibit.
+        assert_eq!(
+            f(ScalarValue::String(" true ".into())),
+            ProcessMode::Passive
+        );
+        assert_eq!(
+            f(ScalarValue::String(" false ".into())),
+            ProcessMode::Passive
+        );
+        // case-sensitive, like pvxs's exact string store
+        assert_eq!(f(ScalarValue::String("TRUE".into())), ProcessMode::Passive);
     }
 
     fn req_with_block(value: PvField) -> PvStructure {

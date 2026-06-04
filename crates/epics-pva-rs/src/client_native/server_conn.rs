@@ -1298,6 +1298,12 @@ fn log_server_message(payload: &[u8], order: ByteOrder) {
         .ok()
         .flatten()
         .unwrap_or_default();
+    // pvxs `handle_MESSAGE` maps the level through `mtype2level`
+    // (pvaproto.h:704-712, clientconn.cpp:457): 0 -> Info, 1 -> Warn,
+    // 2 -> Err, and default (Fatal=3 and every unknown value) -> Crit.
+    // tracing has no Crit level, so Err, Fatal, and unknown types all map
+    // to its highest level, error! — an unknown type must escalate, not
+    // be downgraded to warn!.
     match mtype {
         x if x == MessageType::Info as u8 => {
             tracing::info!(ioid, msg, "server MESSAGE")
@@ -1305,11 +1311,8 @@ fn log_server_message(payload: &[u8], order: ByteOrder) {
         x if x == MessageType::Warning as u8 => {
             tracing::warn!(ioid, msg, "server MESSAGE")
         }
-        x if x == MessageType::Error as u8 || x == MessageType::Fatal as u8 => {
-            tracing::error!(ioid, msg, "server MESSAGE")
-        }
         other => {
-            tracing::warn!(ioid, mtype = other, msg, "server MESSAGE (unknown type)")
+            tracing::error!(ioid, mtype = other, msg, "server MESSAGE")
         }
     }
 }
@@ -1592,6 +1595,57 @@ mod tests {
         log_server_message(&[0x01], ByteOrder::Little);
         log_server_message(&[0u8; 4], ByteOrder::Little); // ioid only, no mtype
         log_server_message(&[0u8; 5], ByteOrder::Little); // ioid + mtype but no string
+    }
+
+    /// Regression R0604-PVASRV-MESSAGE-SEVERITY-MAP-1 (client half).
+    /// pvxs client `handle_MESSAGE` maps the level through the same
+    /// `mtype2level` as the server (clientconn.cpp:457, pvaproto.h:704-712):
+    /// 0=Info, 1=Warn, 2=Err, default (Fatal=3 and every unknown value)=Crit.
+    /// tracing has no Crit, so Err, Fatal, and unknown types all map to its
+    /// highest level, error!. An unknown type must escalate to error!, not
+    /// be downgraded to warn! as it was before.
+    #[test]
+    fn r0604_log_server_message_severity_matches_mtype2level() {
+        use std::sync::{Arc, Mutex};
+        use tracing::Level;
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+
+        struct LevelCapture(Arc<Mutex<Vec<Level>>>);
+        impl<S: tracing::Subscriber> Layer<S> for LevelCapture {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                self.0.lock().unwrap().push(*event.metadata().level());
+            }
+        }
+
+        let order = ByteOrder::Little;
+        let levels = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(LevelCapture(levels.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            for mtype in [
+                MessageType::Info as u8,
+                MessageType::Warning as u8,
+                MessageType::Error as u8,
+                MessageType::Fatal as u8,
+                99u8, // unknown
+            ] {
+                let payload = build_message_payload(order, 0xCAFEBABE, mtype, "m");
+                log_server_message(&payload, order);
+            }
+        });
+
+        let got = levels.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec![
+                Level::INFO,
+                Level::WARN,
+                Level::ERROR,
+                Level::ERROR,
+                Level::ERROR,
+            ],
+            "server-MESSAGE mtypes Info/Warn/Err/Fatal/unknown must map to INFO/WARN/ERROR/ERROR/ERROR"
+        );
     }
 
     /// Build a fresh set of router DashMaps + cancel token + writer_tx

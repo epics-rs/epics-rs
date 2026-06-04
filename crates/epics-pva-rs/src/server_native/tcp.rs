@@ -20,7 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::interval;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::client_native::decode::{Frame, PeerRole, try_parse_frame_role};
 use crate::error::{PvaError, PvaResult};
@@ -5041,11 +5041,17 @@ fn handle_message(
         return Ok(());
     };
     let pv = channel.name.as_str();
+    // pvxs `mtype2level` (pvaproto.h:704-712, serverconn.cpp:346-351):
+    // 0 -> Info, 1 -> Warn, 2 -> Err, and every other value (including the
+    // protocol's Fatal=3 and any unknown type) -> Crit. The tracing stack
+    // has no Crit level, so both Err and Crit map to its highest level,
+    // error!. A live-IOID MESSAGE of any type is surfaced at its pvxs
+    // severity; unknown/Fatal types escalate to error!, never hidden at
+    // debug. The unknown-IOID gate above stays debug-only.
     match mtype {
-        0 => debug!(?peer, ioid, pv, message = %msg, "client info"),
-        1 => warn!(?peer, ioid, pv, message = %msg, "client warning"),
-        2 | 3 => error!(?peer, ioid, pv, message = %msg, "client error"),
-        _ => debug!(?peer, ioid, pv, mtype, message = %msg, "client message (unknown type)"),
+        0 => info!(?peer, ioid, pv, message = %msg, "client message"),
+        1 => warn!(?peer, ioid, pv, message = %msg, "client message"),
+        _ => error!(?peer, ioid, pv, mtype, message = %msg, "client message"),
     }
     Ok(())
 }
@@ -10392,6 +10398,92 @@ mod tests {
         msg(7).expect("MESSAGE on live IOID accepted");
         // Unknown IOID: dropped, not an error, no severity escalation.
         msg(999).expect("MESSAGE on unknown IOID dropped, not an error");
+    }
+
+    /// Regression R0604-PVASRV-MESSAGE-SEVERITY-MAP-1.
+    /// pvxs maps inbound CMD_MESSAGE mtypes through `mtype2level`: 0=Info,
+    /// 1=Warn, 2=Err, default (Fatal=3 and every unknown value)=Crit
+    /// (pvaproto.h:704-712, serverconn.cpp:346-351). The tracing stack has
+    /// no Crit, so Err and Crit collapse to its highest level, error!.
+    /// A live-IOID mtype 0 must log at INFO (it was hidden at debug) and
+    /// Fatal/unknown types at ERROR (also hidden at debug before). The
+    /// unknown-IOID gate stays debug-only.
+    #[test]
+    fn r0604_message_severity_matches_mtype2level_for_live_ioid() {
+        use std::sync::{Arc, Mutex};
+        use tracing::Level;
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+
+        struct LevelCapture(Arc<Mutex<Vec<Level>>>);
+        impl<S: tracing::Subscriber> Layer<S> for LevelCapture {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                self.0.lock().unwrap().push(*event.metadata().level());
+            }
+        }
+
+        let order = ByteOrder::Little;
+        let peer = "127.0.0.1:5075".parse::<SocketAddr>().unwrap();
+
+        // Build a channel with a live op for ioid 7 (constructed OUTSIDE
+        // the capture scope so only handler events are recorded).
+        let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
+        let mut ops = HashMap::new();
+        ops.insert(
+            7u32,
+            non_monitor_op_state(
+                FieldDesc::Scalar(ScalarType::Int),
+                OpKind::Get,
+                BitSet::new(),
+            ),
+        );
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            1,
+            ChannelState {
+                name: "dut:pv".into(),
+                cid: 0,
+                sid: 1,
+                introspection: Some(FieldDesc::Scalar(ScalarType::Int)),
+                source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                ops,
+            },
+        );
+
+        let send = |ioid: u32, mtype: u8| {
+            let mut payload = Vec::new();
+            payload.put_u32(ioid, order);
+            payload.put_u8(mtype);
+            crate::proto::encode_string_into("m", order, &mut payload);
+            let frame = synth_frame(Command::Message, order, payload);
+            handle_message(&frame, &channels, &peer).expect("well-formed MESSAGE");
+        };
+
+        let levels = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(LevelCapture(levels.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            // Live IOID: 0->INFO, 1->WARN, 2->ERROR, 3->ERROR, 9->ERROR.
+            for mtype in [0u8, 1, 2, 3, 9] {
+                send(7, mtype);
+            }
+            // Unknown IOID stays DEBUG regardless of mtype.
+            send(999, 1);
+        });
+
+        let got = levels.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec![
+                Level::INFO,
+                Level::WARN,
+                Level::ERROR,
+                Level::ERROR,
+                Level::ERROR,
+                Level::DEBUG,
+            ],
+            "live-IOID mtypes 0/1/2/3/9 must map to INFO/WARN/ERROR/ERROR/ERROR; unknown IOID stays DEBUG"
+        );
     }
 
     #[tokio::test]

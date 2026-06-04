@@ -25,8 +25,8 @@ use tracing::{debug, error, info, warn};
 use crate::client_native::decode::{Frame, PeerRole, try_parse_frame_role};
 use crate::error::{PvaError, PvaResult};
 use crate::proto::{
-    BitSet, ByteOrder, Command, ControlCommand, HeaderFlags, PVA_VERSION, PvaHeader, QosFlags,
-    Status, WriteExt, encode_size_into, encode_string_into,
+    BitSet, ByteOrder, Command, ControlCommand, HeaderFlags, MessageType, PVA_VERSION, PvaHeader,
+    QosFlags, Status, WriteExt, encode_size_into, encode_string_into,
 };
 use crate::pvdata::encode::{
     EncodeTypeCache, TypeCache, decode_pv_field_cached, decode_pv_field_with_bitset_cached,
@@ -46,6 +46,32 @@ fn alloc_sid() -> u32 {
 // uses `sid = -1` (serverchan.cpp:273/338) and wires it as 0xFFFFFFFF;
 // `NEXT_SID` starts at 1, so this value can never be a live channel id.
 const CREATE_CHANNEL_NO_SID: u32 = u32::MAX;
+
+/// A pvxs `ServerConn::logRemote()` diagnostic emitted during MONITOR
+/// INIT option negotiation (`servermon.cpp:529,542,567,572`) when an
+/// option value is PRESENT but unusable. `level` is the PVA MESSAGE
+/// `messageType` byte the server sends to the client (`level2mtype`,
+/// `pvaproto.h:715`): pvxs `Level::Warn` → [`MessageType::Warning`] (1),
+/// `Level::Crit` → [`MessageType::Fatal`] (3). These are built ALONGSIDE
+/// the effective options WITHOUT changing any negotiated value — pvxs
+/// reports them while still applying its fallback (pipeline disabled,
+/// default queue depth, or clamped `ackAt`).
+#[derive(Debug, Clone)]
+struct MonitorOptionDiag {
+    level: MessageType,
+    message: String,
+}
+
+/// Render a monitor `_options` scalar value for a pvxs-shaped
+/// `logRemote` message. pvxs streams the option `Value` through
+/// `operator<<` (`SB()<<…<<pipeline`); the scalar text form is the
+/// faithful approximation. Non-scalar fields render as `<non-scalar>`.
+fn render_option_value(f: &PvField) -> String {
+    match f {
+        PvField::Scalar(sv) => sv.to_string(),
+        _ => "<non-scalar>".to_string(),
+    }
+}
 
 struct PipelineOptions {
     enabled: bool,
@@ -68,6 +94,12 @@ struct PipelineOptions {
     /// (`servermon.cpp:332-333`, see [`clamp_watermarks`]). Defaults to
     /// `1` when `ackAny` is absent; only meaningful when `enabled`.
     ack_at: u32,
+    /// pvxs `ServerConn::logRemote()` diagnostics for PRESENT-but-invalid
+    /// options (`servermon.cpp:529,542,567,572`). Carried alongside the
+    /// effective options so the MONITOR INIT owner can emit pvxs-shaped
+    /// `CMD_MESSAGE` frames; never alters a negotiated value. Empty for a
+    /// clean request. Regression R0604-PVASRV-MONITOR-OPTION-REMOTE-LOG-1.
+    diagnostics: Vec<MonitorOptionDiag>,
 }
 
 /// Outcome of parsing a MONITOR INIT pvRequest's `record._options`
@@ -93,28 +125,61 @@ enum MonitorPipelineRequest {
 /// `1`; an explicit `0` becomes `queueSize / 2`; the result clamps to
 /// `[1, queueSize]`. `queue_size` MUST be `>= 1` (the caller only
 /// invokes this for an enabled pipeline, where `queueSize >= 2`).
-fn ack_at_from(ack_any: Option<&PvField>, queue_size: u32) -> u32 {
+///
+/// Returns the effective `ackAt` plus an optional pvxs
+/// `Level::Crit` [`MonitorOptionDiag`]. pvxs emits a Crit `logRemote`
+/// for exactly two cases (`servermon.cpp:557-573`), and leaves `ackAt`
+/// at its default in both:
+/// * a NON-scalar `ackAny` — `as<int>` and `as<string>` both fail →
+///   "Unable to parse …" (`:570-573`);
+/// * a `"N%"` percentage string whose numeric part fails to parse →
+///   "Unable to parse% …" (`:561-568`).
+///
+/// A plain scalar string that simply fails integer parse (e.g.
+/// `"garbage"`) is SILENTLY ignored by pvxs — `as<string>` succeeds, the
+/// value has no `%` suffix, so neither branch fires and no diagnostic is
+/// emitted (`:560-569`). This faithfully differs from the review doc's
+/// imprecise `ackAny=garbage` Crit example. Regression
+/// R0604-PVASRV-MONITOR-OPTION-REMOTE-LOG-1.
+fn ack_at_from(ack_any: Option<&PvField>, queue_size: u32) -> (u32, Option<MonitorOptionDiag>) {
     use crate::pvdata::ScalarValue;
     // pvxs `MonitorOp::ackAt` struct default.
     let mut ack_at: u32 = 1;
-    if let Some(PvField::Scalar(sv)) = ack_any {
-        match sv {
+    let mut diag: Option<MonitorOptionDiag> = None;
+    match ack_any {
+        Some(PvField::Scalar(sv)) => match sv {
             ScalarValue::String(s) => {
                 let s = s.as_str_lossy();
                 if let Some(pct) = s.strip_suffix('%').filter(|p| !p.is_empty()) {
-                    if let Ok(percent) = pct.trim().parse::<f64>() {
-                        // pvxs `servermon.cpp:563` historically
-                        // computed `clamp(percent,0,100) * limit` with NO
-                        // `/ 100`, so any percent >= 1% saturated to the full
-                        // queue after the `[1, limit]` clamp below, defeating
-                        // the percentage control. Divide by 100 so `"50%"` of a
-                        // queue of 4 is 2 — honoring the documented percentage
-                        // semantics. pvxs adopts the same fix.
-                        ack_at = (percent.clamp(0.0, 100.0) / 100.0 * queue_size as f64) as u32;
+                    match pct.trim().parse::<f64>() {
+                        Ok(percent) => {
+                            // pvxs `servermon.cpp:563` historically
+                            // computed `clamp(percent,0,100) * limit` with NO
+                            // `/ 100`, so any percent >= 1% saturated to the full
+                            // queue after the `[1, limit]` clamp below, defeating
+                            // the percentage control. Divide by 100 so `"50%"` of a
+                            // queue of 4 is 2 — honoring the documented percentage
+                            // semantics. pvxs adopts the same fix.
+                            ack_at = (percent.clamp(0.0, 100.0) / 100.0 * queue_size as f64) as u32;
+                        }
+                        Err(e) => {
+                            // pvxs `servermon.cpp:566-568`: a `"N%"` string whose
+                            // numeric prefix fails `parseTo<double>` is a Crit
+                            // logRemote; `ackAt` stays at its default.
+                            diag = Some(MonitorOptionDiag {
+                                level: MessageType::Fatal,
+                                message: format!(
+                                    "Unable to parse% record._options.ackAny : {s} : {e}"
+                                ),
+                            });
+                        }
                     }
                 } else if let Ok(n) = s.trim().parse::<u32>() {
                     ack_at = n;
                 }
+                // else: a plain non-`%` string that fails integer parse —
+                // pvxs leaves `ackAt` default with NO logRemote
+                // (`servermon.cpp:560-569` only logs the `%` branch).
             }
             ScalarValue::Byte(i) => ack_at = u32::try_from(*i).unwrap_or(1),
             ScalarValue::UByte(i) => ack_at = u32::from(*i),
@@ -125,13 +190,25 @@ fn ack_at_from(ack_any: Option<&PvField>, queue_size: u32) -> u32 {
             ScalarValue::Long(l) => ack_at = u32::try_from(*l).unwrap_or(1),
             ScalarValue::ULong(l) => ack_at = u32::try_from(*l).unwrap_or(1),
             _ => {}
+        },
+        Some(other) => {
+            // pvxs `servermon.cpp:570-573`: a NON-scalar `ackAny` fails both
+            // `as<int>` and `as<string>` → Crit logRemote; `ackAt` default.
+            diag = Some(MonitorOptionDiag {
+                level: MessageType::Fatal,
+                message: format!(
+                    "Unable to parse record._options.ackAny : {}",
+                    render_option_value(other)
+                ),
+            });
         }
+        None => {}
     }
     // servermon.cpp:577-581.
     if ack_at == 0 {
         ack_at = queue_size / 2;
     }
-    ack_at.clamp(1, queue_size)
+    (ack_at.clamp(1, queue_size), diag)
 }
 
 /// pvxs `servermon.cpp:332-333` — the pipeline ACK threshold `ack_at`
@@ -683,6 +760,10 @@ fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
         PvField::Structure(s) => s,
         _ => return None,
     };
+    // pvxs `ServerConn::logRemote()` diagnostics for PRESENT-but-invalid
+    // options, accumulated alongside the effective options without
+    // altering any negotiated value.
+    let mut diagnostics: Vec<MonitorOptionDiag> = Vec::new();
     // pvxs `servermon.cpp:523-540` parses `pipeline` via
     // `Value::as(bool)` and `queueSize` via the analogous scalar
     // conversion. A pvxs client using the typed builder form
@@ -691,28 +772,65 @@ fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
     // Pre-fix Rust matched only the string form; the typed builder
     // produced a pvRequest Rust decoded as non-pipelined, dropping
     // flow control. Accept both shapes.
-    let enabled = opt_s
+    //
+    // The effective `enabled` mapping below is unchanged from before this
+    // finding (every input maps to the same true/false it did): the only
+    // addition is a pvxs `Level::Warn` diagnostic for a PRESENT pipeline
+    // value pvxs's `pipeline.as(bool)` cannot parse (an unrecognized
+    // string or a non-scalar). pvxs leaves pipeline disabled in that case
+    // (`servermon.cpp:528-530`), which the unrecognized→`false` mapping
+    // already does, so the diagnostic is purely additive.
+    let pipeline_field = opt_s
         .fields
         .iter()
-        .find_map(|(k, v)| {
-            (k == "pipeline").then_some(v).and_then(|v| match v {
-                PvField::Scalar(ScalarValue::Boolean(b)) => Some(*b),
-                PvField::Scalar(ScalarValue::String(s)) => Some(matches!(
-                    s.as_str_lossy().to_ascii_lowercase().as_str(),
-                    "true" | "1" | "yes"
-                )),
-                PvField::Scalar(ScalarValue::Byte(i)) => Some(*i != 0),
-                PvField::Scalar(ScalarValue::UByte(i)) => Some(*i != 0),
-                PvField::Scalar(ScalarValue::Short(i)) => Some(*i != 0),
-                PvField::Scalar(ScalarValue::UShort(i)) => Some(*i != 0),
-                PvField::Scalar(ScalarValue::Int(i)) => Some(*i != 0),
-                PvField::Scalar(ScalarValue::UInt(i)) => Some(*i != 0),
-                PvField::Scalar(ScalarValue::Long(i)) => Some(*i != 0),
-                PvField::Scalar(ScalarValue::ULong(i)) => Some(*i != 0),
-                _ => None,
-            })
-        })
-        .unwrap_or(false);
+        .find_map(|(k, v)| (k == "pipeline").then_some(v));
+    let enabled = match pipeline_field {
+        None => false,
+        Some(PvField::Scalar(ScalarValue::Boolean(b))) => *b,
+        Some(PvField::Scalar(ScalarValue::Byte(i))) => *i != 0,
+        Some(PvField::Scalar(ScalarValue::UByte(i))) => *i != 0,
+        Some(PvField::Scalar(ScalarValue::Short(i))) => *i != 0,
+        Some(PvField::Scalar(ScalarValue::UShort(i))) => *i != 0,
+        Some(PvField::Scalar(ScalarValue::Int(i))) => *i != 0,
+        Some(PvField::Scalar(ScalarValue::UInt(i))) => *i != 0,
+        Some(PvField::Scalar(ScalarValue::Long(i))) => *i != 0,
+        Some(PvField::Scalar(ScalarValue::ULong(i))) => *i != 0,
+        // Float/Double pipeline fell to the pre-fix `_ => None` →
+        // `false`; keep that exact effective value with no diagnostic
+        // (this is an effective-value choice, out of scope for the
+        // diagnostics finding — do not start warning here).
+        Some(PvField::Scalar(ScalarValue::Float(_)))
+        | Some(PvField::Scalar(ScalarValue::Double(_))) => false,
+        Some(PvField::Scalar(ScalarValue::String(s))) => {
+            match s.as_str_lossy().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => true,
+                "false" | "0" | "no" => false,
+                _ => {
+                    // PRESENT but unrecognized string: pvxs `as(bool)`
+                    // fails → Warn logRemote, pipeline left disabled.
+                    diagnostics.push(MonitorOptionDiag {
+                        level: MessageType::Warning,
+                        message: format!(
+                            "Unable to parse record._options.pipeline : {}",
+                            s.as_str_lossy()
+                        ),
+                    });
+                    false
+                }
+            }
+        }
+        Some(other) => {
+            // PRESENT non-scalar: pvxs `as(bool)` fails → Warn, disabled.
+            diagnostics.push(MonitorOptionDiag {
+                level: MessageType::Warning,
+                message: format!(
+                    "Unable to parse record._options.pipeline : {}",
+                    render_option_value(other)
+                ),
+            });
+            false
+        }
+    };
     // pvxs `servermon.cpp:533-540` distinguishes a PRESENT-but-invalid
     // `queueSize` from an ABSENT one: `if(auto queueSize = ...)` gates
     // on presence, then `queueSize.as(qSize) && qSize>=2` gates on
@@ -752,25 +870,41 @@ fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
     let opts = if enabled {
         match queue_size {
             // Valid: use the requested window (pvxs `op->limit = qSize`).
-            Some(n) if n >= 2 => PipelineOptions {
-                enabled: true,
-                queue_size: n,
-                requested_queue_size,
-                ack_at: ack_at_from(ack_any, n),
-            },
+            Some(n) if n >= 2 => {
+                let (ack_at, ack_diag) = ack_at_from(ack_any, n);
+                diagnostics.extend(ack_diag);
+                PipelineOptions {
+                    enabled: true,
+                    queue_size: n,
+                    requested_queue_size,
+                    ack_at,
+                    diagnostics,
+                }
+            }
             // PRESENT but invalid (`<2` or unparseable): pvxs
             // `servermon.cpp:537-540` rejects the INIT — the pipeline
             // sub-protocol requires agreement on `queueSize`. Do NOT
-            // downgrade to a non-pipeline monitor.
+            // downgrade to a non-pipeline monitor. pvxs answers this with
+            // `ctrl->error(...)` (a per-op error), NOT a logRemote, and
+            // returns BEFORE the `ackAny` block — so no diagnostics are
+            // owed. `diagnostics` is provably empty here (a rejected
+            // pipeline required a recognized `pipeline=true`, which emits
+            // no Warn, and `ackAny` is never reached), so dropping it
+            // matches pvxs.
             _ if queue_size_present => return Some(MonitorPipelineRequest::Reject),
             // ABSENT: pvxs keeps the default `limit` (4) and leaves
             // pipeline enabled.
-            _ => PipelineOptions {
-                enabled: true,
-                queue_size: 4,
-                requested_queue_size,
-                ack_at: ack_at_from(ack_any, 4),
-            },
+            _ => {
+                let (ack_at, ack_diag) = ack_at_from(ack_any, 4);
+                diagnostics.extend(ack_diag);
+                PipelineOptions {
+                    enabled: true,
+                    queue_size: 4,
+                    requested_queue_size,
+                    ack_at,
+                    diagnostics,
+                }
+            }
         }
     } else {
         // Non-pipeline: a valid `queueSize` sets the queue depth
@@ -783,11 +917,27 @@ fn monitor_pipeline_options(req: &PvField) -> Option<MonitorPipelineRequest> {
             Some(n) if n >= 2 => n,
             _ => 4,
         };
+        // pvxs `servermon.cpp:541-543`: a PRESENT-but-invalid `queueSize`
+        // on a NON-pipeline monitor keeps the default depth and emits a
+        // Warn logRemote ("Unable to use …"). (Under pipeline the same
+        // case is the Reject above, not a Warn.) `requested_queue_size`
+        // is `Some` only for a valid `>= 2` value, so
+        // present + `None` == present-invalid.
+        if queue_size_present && requested_queue_size.is_none() {
+            let rendered = queue_size_field
+                .map(render_option_value)
+                .unwrap_or_default();
+            diagnostics.push(MonitorOptionDiag {
+                level: MessageType::Warning,
+                message: format!("Unable to use record._options.queueSize : {rendered}"),
+            });
+        }
         PipelineOptions {
             enabled: false,
             queue_size,
             requested_queue_size,
             ack_at: 1,
+            diagnostics,
         }
     };
     Some(MonitorPipelineRequest::Options(opts))
@@ -5379,6 +5529,22 @@ async fn handle_op(
             .await?;
             return Ok(());
         }
+        // pvxs `servermon.cpp:529/542/567/572` — emit `ServerConn::logRemote()`
+        // diagnostics for PRESENT-but-invalid monitor options as IOID-tagged
+        // CMD_MESSAGE frames before continuing the INIT. MONITOR-only (GET/PUT/
+        // RPC never negotiate these options), and after the Reject early-return
+        // so a rejected pipeline INIT carries only its op-error (matching pvxs
+        // `ctrl->error()`, which emits no logRemote). Borrowed before the move
+        // below consumes `pipeline_req`. Regression
+        // R0604-PVASRV-MONITOR-OPTION-REMOTE-LOG-1.
+        if kind == OpKind::Monitor
+            && let Some(MonitorPipelineRequest::Options(o)) = &pipeline_req
+        {
+            for diag in &o.diagnostics {
+                let frame = build_message_frame(ioid, diag.level, &diag.message, order);
+                let _ = chan_tx.send(frame).await;
+            }
+        }
         let pipeline_opt = match pipeline_req {
             Some(MonitorPipelineRequest::Options(o)) => Some(o),
             _ => None,
@@ -7501,6 +7667,26 @@ fn build_op_error_frame(
     buf
 }
 
+/// Encode a single `CMD_MESSAGE` frame (`ioid`, `messageType`,
+/// `message`). pvxs `ServerConn::logRemote()` (`serverconn.cpp:146-160`)
+/// sends operation diagnostics this way. The payload layout mirrors the
+/// client decoder [`crate::client_native::server_conn`] (and is
+/// `ioid:u32 + mtype:u8 + message:string`); the client logs `Warning`
+/// (1) at `warn!` and `Fatal` (3) at `error!`. Used by the MONITOR INIT
+/// owner to surface [`MonitorOptionDiag`] negotiation diagnostics.
+/// Regression R0604-PVASRV-MONITOR-OPTION-REMOTE-LOG-1.
+fn build_message_frame(ioid: u32, level: MessageType, msg: &str, order: ByteOrder) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.put_u32(ioid, order);
+    payload.put_u8(level as u8);
+    encode_string_into(msg, order, &mut payload);
+    let h = PvaHeader::application(true, order, Command::Message.code(), payload.len() as u32);
+    let mut buf = Vec::new();
+    h.write_into(&mut buf);
+    buf.extend_from_slice(&payload);
+    buf
+}
+
 #[allow(unused_imports)]
 use crate::proto::ReadExt;
 const _: u8 = PVA_VERSION;
@@ -9112,6 +9298,293 @@ mod tests {
             parsed_opts(&req).ack_at,
             8,
             "0.5% of 16 = 0.08 → truncates to 0 → limit/2 fallback = 8"
+        );
+    }
+
+    // ---- R0604-PVASRV-MONITOR-OPTION-REMOTE-LOG-1 ----
+    // pvxs `ServerConn::logRemote()` diagnostics for PRESENT-but-invalid
+    // monitor `_options` (`servermon.cpp:529/542/567/572`). Asserted by
+    // the option/validity boundary (the diagnostics vec carried on the
+    // parsed options), not by scenario. Each assertion also confirms the
+    // EFFECTIVE option value is unchanged — the diagnostics are additive.
+
+    #[test]
+    fn monitor_diag_pipeline_unparseable_string_warns() {
+        // pvxs `servermon.cpp:528-530`: a PRESENT pipeline value that
+        // `as(bool)` cannot parse is a Warn logRemote; pipeline stays
+        // disabled (the effective value is unchanged).
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::String("garbage".into())),
+            PvField::Scalar(ScalarValue::Int(16)),
+        );
+        let opts = parsed_opts(&req);
+        assert!(!opts.enabled, "unparseable pipeline stays disabled");
+        assert_eq!(opts.diagnostics.len(), 1, "one pipeline Warn");
+        assert_eq!(opts.diagnostics[0].level, MessageType::Warning);
+        assert!(
+            opts.diagnostics[0].message.contains("pipeline"),
+            "message names the pipeline option: {}",
+            opts.diagnostics[0].message
+        );
+    }
+
+    #[test]
+    fn monitor_diag_recognized_false_tokens_do_not_warn() {
+        // Recognized false-ish tokens are intentional disables, NOT parse
+        // errors — no diagnostic (only genuinely unrecognized values warn).
+        for tok in ["false", "0", "no", "FALSE", "No"] {
+            let req = make_pipeline_request(
+                PvField::Scalar(ScalarValue::String(tok.into())),
+                PvField::Scalar(ScalarValue::Int(16)),
+            );
+            let opts = parsed_opts(&req);
+            assert!(!opts.enabled, "{tok} → disabled");
+            assert!(
+                opts.diagnostics.is_empty(),
+                "{tok} is a recognized false token, no Warn"
+            );
+        }
+    }
+
+    #[test]
+    fn monitor_diag_non_pipeline_invalid_queue_size_warns() {
+        // pvxs `servermon.cpp:541-543`: a non-pipeline monitor with a
+        // PRESENT-but-invalid queueSize keeps the default depth and emits
+        // a Warn logRemote ("Unable to use …").
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(false)),
+            PvField::Scalar(ScalarValue::Int(1)),
+        );
+        let opts = parsed_opts(&req);
+        assert!(!opts.enabled);
+        assert_eq!(opts.queue_size, 4, "invalid queueSize → default 4");
+        assert_eq!(opts.diagnostics.len(), 1, "one queueSize Warn");
+        assert_eq!(opts.diagnostics[0].level, MessageType::Warning);
+        assert!(
+            opts.diagnostics[0].message.contains("queueSize"),
+            "message names the queueSize option: {}",
+            opts.diagnostics[0].message
+        );
+    }
+
+    #[test]
+    fn monitor_diag_valid_non_pipeline_queue_size_no_warn() {
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(false)),
+            PvField::Scalar(ScalarValue::Int(16)),
+        );
+        assert!(
+            parsed_opts(&req).diagnostics.is_empty(),
+            "valid queueSize → no Warn"
+        );
+    }
+
+    #[test]
+    fn monitor_diag_pipeline_and_queue_size_both_warn() {
+        // An unparseable pipeline AND an invalid non-pipeline queueSize are
+        // both present: pvxs emits BOTH logRemote Warns.
+        let req = make_pipeline_request(
+            PvField::Scalar(ScalarValue::String("garbage".into())),
+            PvField::Scalar(ScalarValue::Int(1)),
+        );
+        let opts = parsed_opts(&req);
+        assert!(!opts.enabled);
+        assert_eq!(opts.diagnostics.len(), 2, "pipeline Warn + queueSize Warn");
+        assert!(
+            opts.diagnostics
+                .iter()
+                .all(|d| d.level == MessageType::Warning)
+        );
+        assert!(
+            opts.diagnostics
+                .iter()
+                .any(|d| d.message.contains("pipeline"))
+        );
+        assert!(
+            opts.diagnostics
+                .iter()
+                .any(|d| d.message.contains("queueSize"))
+        );
+    }
+
+    #[test]
+    fn monitor_diag_ackany_non_scalar_under_pipeline_is_crit() {
+        // pvxs `servermon.cpp:570-573`: a NON-scalar ackAny fails both
+        // `as<int>` and `as<string>` → Crit logRemote. ackAt stays default.
+        let non_scalar = PvField::Structure(PvStructure {
+            struct_id: String::new(),
+            fields: vec![],
+        });
+        let req = make_pipeline_request_ack(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(16)),
+            non_scalar,
+        );
+        let opts = parsed_opts(&req);
+        assert!(opts.enabled);
+        assert_eq!(opts.ack_at, 1, "non-scalar ackAny leaves ackAt default");
+        assert_eq!(opts.diagnostics.len(), 1, "one ackAny Crit");
+        assert_eq!(opts.diagnostics[0].level, MessageType::Fatal);
+        assert!(
+            opts.diagnostics[0].message.contains("ackAny"),
+            "message names the ackAny option: {}",
+            opts.diagnostics[0].message
+        );
+    }
+
+    #[test]
+    fn monitor_diag_ackany_bad_percent_under_pipeline_is_crit() {
+        // pvxs `servermon.cpp:561-568`: a `"N%"` string whose numeric
+        // prefix fails to parse → Crit "Unable to parse% …". ackAt default.
+        let req = make_pipeline_request_ack(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(16)),
+            PvField::Scalar(ScalarValue::String("abc%".into())),
+        );
+        let opts = parsed_opts(&req);
+        assert_eq!(opts.ack_at, 1, "bad-percent ackAny leaves ackAt default");
+        assert_eq!(opts.diagnostics.len(), 1, "one ackAny Crit");
+        assert_eq!(opts.diagnostics[0].level, MessageType::Fatal);
+        assert!(
+            opts.diagnostics[0].message.contains("Unable to parse%"),
+            "percentage-form Crit message: {}",
+            opts.diagnostics[0].message
+        );
+    }
+
+    #[test]
+    fn monitor_diag_ackany_plain_garbage_emits_no_diagnostic() {
+        // Faithful pvxs: a plain non-`%` string that fails integer parse
+        // is SILENTLY ignored (`as<string>` succeeds, no `%`), so NO
+        // logRemote — unlike the review doc's imprecise `ackAny=garbage`
+        // Crit example. ackAt stays at the default.
+        let req = make_pipeline_request_ack(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(16)),
+            PvField::Scalar(ScalarValue::String("garbage".into())),
+        );
+        let opts = parsed_opts(&req);
+        assert_eq!(opts.ack_at, 1);
+        assert!(
+            opts.diagnostics.is_empty(),
+            "plain unparseable ackAny string → no diagnostic (pvxs silent)"
+        );
+    }
+
+    #[test]
+    fn monitor_diag_clean_pipeline_request_has_no_diagnostics() {
+        let req = make_pipeline_request_ack(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(16)),
+            PvField::Scalar(ScalarValue::Int(4)),
+        );
+        assert!(
+            parsed_opts(&req).diagnostics.is_empty(),
+            "clean request → no diagnostics"
+        );
+    }
+
+    /// Emission half of R0604-PVASRV-MONITOR-OPTION-REMOTE-LOG-1: a
+    /// MONITOR INIT carrying a PRESENT-but-invalid option must put a
+    /// pvxs-shaped CMD_MESSAGE (IOID-tagged) on the wire BEFORE the INIT
+    /// reply. Here an unparseable `pipeline` string yields one Warn frame.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn monitor_init_emits_remote_log_for_invalid_option() {
+        use crate::server_native::SharedSource;
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::shared_pv::SharedPV;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 814;
+
+        let intro = three_field_intro();
+        let pv = SharedPV::new();
+        pv.open(intro.clone(), three_field_value(0, 0, 0)).unwrap();
+
+        let shared = SharedSource::new();
+        shared.add("dut", pv);
+        let source: DynSource = Arc::new(shared);
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                source: source.clone(),
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // MONITOR INIT (subcmd 0x08, no pipeline bit) with an unparseable
+        // `pipeline` value → pipeline disabled, one Warn logRemote.
+        let req_val = make_pipeline_request(
+            PvField::Scalar(ScalarValue::String("garbage".into())),
+            PvField::Scalar(ScalarValue::Int(16)),
+        );
+        let req_desc = req_val.descriptor();
+        let mut init_payload = Vec::new();
+        init_payload.put_u32(sid, order);
+        init_payload.put_u32(ioid, order);
+        init_payload.put_u8(0x08);
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init_payload);
+        crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
+        let init_frame = synth_frame(Command::Monitor, order, init_payload);
+        handle_op(
+            &init_frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Monitor,
+            &config,
+            &mut encode_cache,
+            &mut TypeCache::new(),
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("MONITOR INIT ok");
+
+        // The FIRST frame on the wire is the diagnostic CMD_MESSAGE,
+        // emitted before the INIT reply (pvxs `logRemote` precedes the
+        // subscribe/reply).
+        let frame = rx.recv().await.expect("a diagnostic CMD_MESSAGE frame");
+        assert_eq!(
+            frame[3],
+            Command::Message.code(),
+            "first frame must be CMD_MESSAGE, not the INIT reply"
+        );
+        // Payload after the 8-byte header: ioid:u32 + mtype:u8 + string.
+        let got_ioid = u32::from_le_bytes([frame[8], frame[9], frame[10], frame[11]]);
+        assert_eq!(got_ioid, ioid, "diagnostic is tagged with the op IOID");
+        assert_eq!(
+            frame[12],
+            MessageType::Warning as u8,
+            "unparseable pipeline → Warn (mtype 1)"
+        );
+        let needle = b"pipeline";
+        assert!(
+            frame.windows(needle.len()).any(|w| w == needle),
+            "message names the pipeline option"
+        );
+        // The INIT reply follows the diagnostic.
+        let reply = rx.recv().await.expect("INIT reply");
+        assert_eq!(
+            reply[3],
+            Command::Monitor.code(),
+            "the INIT reply is a MONITOR frame after the diagnostic"
         );
     }
 

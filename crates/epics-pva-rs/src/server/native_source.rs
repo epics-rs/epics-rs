@@ -1982,6 +1982,75 @@ ASG(LOCKED) {
         );
     }
 
+    /// Regression R0604-PVASRV-UINT32-SIGNED-PUT-NARROW-1: a native PVA
+    /// scalar `uint` PUT into a signed `DBF_LONG` field must truncate
+    /// (C/pvxs `static_cast`: `uint32 0xffffffff -> int32 -1`,
+    /// `testdata.cpp:596`), not saturate. The `uint` carrier is `Int64`;
+    /// pre-fix `convert_to(DBF_LONG)` round-tripped through f64 and clamped
+    /// `4294967295.0` to `i32::MAX` (2147483647) instead of yielding -1.
+    #[tokio::test]
+    async fn r0604_uint_scalar_put_truncates_into_signed_longout() {
+        use epics_base_rs::server::records::longout::LongoutRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("UI:LO", Box::new(LongoutRecord::new(0)))
+            .await
+            .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+
+        source
+            .put_value_ctx(
+                "UI:LO",
+                PvField::Scalar(ScalarValue::UInt(0xffff_ffff)),
+                make_ctx("h", "anyone", "anonymous"),
+            )
+            .await
+            .expect("uint PUT must succeed");
+
+        let snap = snapshot_for(&db, "UI:LO").await.unwrap();
+        assert_eq!(
+            snap.value,
+            EpicsValue::Long(-1),
+            "uint 0xffffffff into DBF_LONG must truncate to -1, got {:?}",
+            snap.value,
+        );
+    }
+
+    /// Regression R0604-PVASRV-UINT32-SIGNED-PUT-NARROW-1: a native PVA
+    /// `uint[]` PUT into a signed `waveform(FTVL=LONG)` must truncate each
+    /// element (pvxs `convertCast` `Dest(S[i])`, `sharedarray.cpp:160-166`).
+    /// `{1, 2, 0xffffffff}` lands as `{1, 2, -1}`; pre-fix the last element
+    /// saturated to `i32::MAX` through the f64 round-trip.
+    #[tokio::test]
+    async fn r0604_uint_array_put_truncates_into_signed_long_waveform() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(
+            "UI:WFL",
+            Box::new(WaveformRecord::new(3, DbFieldType::Long)),
+        )
+        .await
+        .unwrap();
+        let source = PvDatabaseSource::new(db.clone());
+
+        let values: Vec<u32> = vec![1, 2, 0xffff_ffff];
+        let put = PvField::ScalarArray(values.iter().map(|v| ScalarValue::UInt(*v)).collect());
+        source
+            .put_value_ctx("UI:WFL", put, make_ctx("h", "anyone", "anonymous"))
+            .await
+            .expect("uint[] PUT must succeed");
+
+        let snap = snapshot_for(&db, "UI:WFL").await.unwrap();
+        assert_eq!(
+            snap.value,
+            EpicsValue::LongArray(vec![1, 2, -1]),
+            "uint[] {{1,2,0xffffffff}} into FTVL=LONG must truncate to {{1,2,-1}}, got {:?}",
+            snap.value,
+        );
+    }
+
     /// PVA-04 regression: a wire-decoded *empty* typed scalar array must
     /// PUT successfully and clear the waveform. Pre-fix the typed array
     /// was erased to `Vec<ScalarValue>` and its element type recovered

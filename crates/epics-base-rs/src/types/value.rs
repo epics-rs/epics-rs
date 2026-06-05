@@ -626,6 +626,44 @@ impl EpicsValue {
         }
     }
 
+    /// The value as `i64` when this is an integer-family scalar
+    /// (`Short`/`Enum`/`Long`/`Int64`/`UInt64`), else `None`.
+    ///
+    /// `UInt64` reinterprets its bit pattern (`v as i64`). Narrowing an
+    /// integer target off this view then keeps the low N bits — matching
+    /// C/pvxs `static_cast` truncation (`uint32 0xffffffff -> int32 -1`,
+    /// `convertCast` in `pvxs/src/sharedarray.cpp:160-166`), NOT the
+    /// float round-trip's saturation. `Char` is intentionally excluded:
+    /// it is 8-bit (no narrowing target can overflow) and `to_f64`
+    /// reinterprets it as signed `epicsInt8`, a contract this view must
+    /// not silently change.
+    fn as_int_i64(&self) -> Option<i64> {
+        Some(match self {
+            Self::Short(v) => *v as i64,
+            Self::Enum(v) => *v as i64,
+            Self::Long(v) => *v as i64,
+            Self::Int64(v) => *v,
+            Self::UInt64(v) => *v as i64,
+            _ => return None,
+        })
+    }
+
+    /// Per-element `i64` view of an integer-family array
+    /// (`ShortArray`/`EnumArray`/`LongArray`/`Int64Array`/`UInt64Array`),
+    /// else `None`. Same truncation contract as [`Self::as_int_i64`].
+    /// `CharArray` is excluded — it carries its own signed-`epicsInt8`
+    /// conversion arm in `convert_to`.
+    fn as_int_i64_array(&self) -> Option<Vec<i64>> {
+        Some(match self {
+            Self::ShortArray(a) => a.iter().map(|&v| v as i64).collect(),
+            Self::EnumArray(a) => a.iter().map(|&v| v as i64).collect(),
+            Self::LongArray(a) => a.iter().map(|&v| v as i64).collect(),
+            Self::Int64Array(a) => a.clone(),
+            Self::UInt64Array(a) => a.iter().map(|&v| v as i64).collect(),
+            _ => return None,
+        })
+    }
+
     /// Convert to a different native type.
     ///
     /// Scalars convert element-wise via `to_f64`. Array variants
@@ -663,27 +701,43 @@ impl EpicsValue {
         // text. StringArray falls through to the scalar path (its
         // cross-type semantics are not numeric).
         if let Some(nums) = self.as_f64_array() {
+            // Integer-family arrays also expose a lossless `i64` element
+            // view; route integer targets through it so narrowing truncates
+            // (C/pvxs `static_cast`: `uint32 0xffffffff -> int32 -1`)
+            // instead of saturating through f64 (which would clamp to
+            // `i32::MAX`). Float/Double/String targets keep the
+            // value-preserving f64 view — correct for unsigned widening
+            // such as `UInt64Array -> Double`.
+            let ints = self.as_int_i64_array();
             return match target {
-                DbFieldType::Short => {
-                    EpicsValue::ShortArray(nums.iter().map(|&v| v as i16).collect())
-                }
+                DbFieldType::Short => EpicsValue::ShortArray(match &ints {
+                    Some(v) => v.iter().map(|&x| x as i16).collect(),
+                    None => nums.iter().map(|&v| v as i16).collect(),
+                }),
                 DbFieldType::Float => {
                     EpicsValue::FloatArray(nums.iter().map(|&v| v as f32).collect())
                 }
-                DbFieldType::Enum => {
-                    EpicsValue::EnumArray(nums.iter().map(|&v| v as u16).collect())
-                }
-                DbFieldType::Long => {
-                    EpicsValue::LongArray(nums.iter().map(|&v| v as i32).collect())
-                }
+                DbFieldType::Enum => EpicsValue::EnumArray(match &ints {
+                    Some(v) => v.iter().map(|&x| x as u16).collect(),
+                    None => nums.iter().map(|&v| v as u16).collect(),
+                }),
+                DbFieldType::Long => EpicsValue::LongArray(match &ints {
+                    Some(v) => v.iter().map(|&x| x as i32).collect(),
+                    None => nums.iter().map(|&v| v as i32).collect(),
+                }),
                 DbFieldType::Double => EpicsValue::DoubleArray(nums),
-                DbFieldType::Int64 => {
-                    EpicsValue::Int64Array(nums.iter().map(|&v| v as i64).collect())
-                }
-                DbFieldType::UInt64 => {
-                    EpicsValue::UInt64Array(nums.iter().map(|&v| v as u64).collect())
-                }
-                DbFieldType::Char => EpicsValue::CharArray(nums.iter().map(|&v| v as u8).collect()),
+                DbFieldType::Int64 => EpicsValue::Int64Array(match &ints {
+                    Some(v) => v.clone(),
+                    None => nums.iter().map(|&v| v as i64).collect(),
+                }),
+                DbFieldType::UInt64 => EpicsValue::UInt64Array(match &ints {
+                    Some(v) => v.iter().map(|&x| x as u64).collect(),
+                    None => nums.iter().map(|&v| v as u64).collect(),
+                }),
+                DbFieldType::Char => EpicsValue::CharArray(match &ints {
+                    Some(v) => v.iter().map(|&x| x as u8).collect(),
+                    None => nums.iter().map(|&v| v as u8).collect(),
+                }),
                 DbFieldType::String => {
                     EpicsValue::StringArray(nums.iter().map(|v| v.to_string().into()).collect())
                 }
@@ -737,20 +791,37 @@ impl EpicsValue {
                 _ => {}
             }
         }
+        // Integer-source narrowing uses the `i64` view (C/pvxs `static_cast`
+        // truncation: low N bits) so `uint 0xffffffff -> DBF_LONG` yields
+        // `-1`, not the f64 round-trip's saturated `i32::MAX`. Float/double
+        // sources have no integer view, so they keep the f64 path; that path
+        // also serves the String/Float/Double targets for every source.
         match target {
             DbFieldType::String => EpicsValue::String(format!("{self}").into()),
-            DbFieldType::Short => EpicsValue::Short(self.to_f64().unwrap_or(0.0) as i16),
+            DbFieldType::Short => EpicsValue::Short(match self.as_int_i64() {
+                Some(i) => i as i16,
+                None => self.to_f64().unwrap_or(0.0) as i16,
+            }),
             DbFieldType::Float => EpicsValue::Float(self.to_f64().unwrap_or(0.0) as f32),
-            DbFieldType::Enum => EpicsValue::Enum(self.to_f64().unwrap_or(0.0) as u16),
+            DbFieldType::Enum => EpicsValue::Enum(match self.as_int_i64() {
+                Some(i) => i as u16,
+                None => self.to_f64().unwrap_or(0.0) as u16,
+            }),
             DbFieldType::Char => {
                 // String → CharArray (for waveform FTVL=CHAR)
                 if let EpicsValue::String(s) = self {
                     EpicsValue::CharArray(s.as_bytes().to_vec())
                 } else {
-                    EpicsValue::Char(self.to_f64().unwrap_or(0.0) as u8)
+                    EpicsValue::Char(match self.as_int_i64() {
+                        Some(i) => i as u8,
+                        None => self.to_f64().unwrap_or(0.0) as u8,
+                    })
                 }
             }
-            DbFieldType::Long => EpicsValue::Long(self.to_f64().unwrap_or(0.0) as i32),
+            DbFieldType::Long => EpicsValue::Long(match self.as_int_i64() {
+                Some(i) => i as i32,
+                None => self.to_f64().unwrap_or(0.0) as i32,
+            }),
             DbFieldType::Double => EpicsValue::Double(self.to_f64().unwrap_or(0.0)),
             DbFieldType::Int64 => {
                 // Avoid f64 round-trip when value is already Int64.
@@ -1183,6 +1254,74 @@ mod array_convert_tests {
     fn same_type_array_identity() {
         let v = EpicsValue::LongArray(vec![1, 2, 3]);
         assert_eq!(v.convert_to(DbFieldType::Long), v);
+    }
+
+    /// Regression R0604-PVASRV-UINT32-SIGNED-PUT-NARROW-1.
+    ///
+    /// An integer array narrowed to a signed target truncates per element
+    /// (pvxs `convertCast`'s `Dest(S[i])`, `sharedarray.cpp:160-166`), it
+    /// must not saturate through f64. The native PVA `uint[]` carrier is
+    /// `Int64Array`, so a `uint[] {1,2,0xffffffff}` PUT into a
+    /// `waveform(FTVL=LONG)` lands as `{1,2,-1}`, not `{1,2,i32::MAX}`.
+    #[test]
+    fn int64_array_narrows_to_signed_long_by_truncation() {
+        let v = EpicsValue::Int64Array(vec![1, 2, 0xffff_ffff]);
+        assert_eq!(
+            v.convert_to(DbFieldType::Long),
+            EpicsValue::LongArray(vec![1, 2, -1])
+        );
+        // i16 target truncates the same way (pvxs uint32->int16 == -1).
+        assert_eq!(
+            v.convert_to(DbFieldType::Short),
+            EpicsValue::ShortArray(vec![1, 2, -1])
+        );
+        // Float/Double targets keep the value-preserving (unsigned) view.
+        assert_eq!(
+            EpicsValue::UInt64Array(vec![u64::MAX]).convert_to(DbFieldType::Double),
+            EpicsValue::DoubleArray(vec![u64::MAX as f64])
+        );
+    }
+}
+
+/// Regression R0604-PVASRV-UINT32-SIGNED-PUT-NARROW-1: integer-source
+/// scalar narrowing must use C/pvxs `static_cast` truncation, never the
+/// f64 round-trip's saturation. Values pinned against pvxs
+/// `test/testdata.cpp:596-599`.
+#[cfg(test)]
+mod int_narrow_scalar_tests {
+    use super::*;
+
+    #[test]
+    fn uint_carrier_narrows_to_signed_by_truncation() {
+        // uint32 0xffffffff (carried as Int64) -> int32 / int16 == -1.
+        assert_eq!(
+            EpicsValue::Int64(0xffff_ffff).convert_to(DbFieldType::Long),
+            EpicsValue::Long(-1)
+        );
+        assert_eq!(
+            EpicsValue::Int64(0xffff_ffff).convert_to(DbFieldType::Short),
+            EpicsValue::Short(-1)
+        );
+        // uint32 0x80000000 -> int32 == i32::MIN (testdata.cpp:599).
+        assert_eq!(
+            EpicsValue::Int64(0x8000_0000).convert_to(DbFieldType::Long),
+            EpicsValue::Long(i32::MIN)
+        );
+        // uint16 0xffff -> int32 widens losslessly (testdata.cpp:598).
+        assert_eq!(
+            EpicsValue::Enum(0xffff).convert_to(DbFieldType::Long),
+            EpicsValue::Long(0xffff)
+        );
+        // DBF_INT64 target stays lossless: the full epicsUInt32 range.
+        assert_eq!(
+            EpicsValue::Int64(0xffff_ffff).convert_to(DbFieldType::Int64),
+            EpicsValue::Int64(0xffff_ffff)
+        );
+        // Float source keeps the f64 path unchanged (out of this family).
+        assert_eq!(
+            EpicsValue::Double(99.9).convert_to(DbFieldType::Long),
+            EpicsValue::Long(99)
+        );
     }
 }
 

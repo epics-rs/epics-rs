@@ -75,8 +75,9 @@ pub mod ca_gateway;
 #[cfg(feature = "pvalink")]
 pub mod pvalink;
 
-#[cfg(feature = "calink")]
-pub mod calink;
+// CA links (`calink`) moved to `epics_ca_rs::calink` (always-on, no
+// feature). The qsrv runner installs it via `epics_ca_rs::calink::
+// install_calink_resolver`; see `crates/epics-ca-rs/src/calink`.
 
 #[cfg(feature = "pva-gateway")]
 pub mod pva_gateway;

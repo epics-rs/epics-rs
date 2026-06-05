@@ -1,6 +1,6 @@
 //! iocsh commands for `calink` — `caxr`, `dbcaxr`.
 //!
-//! The CA-link counterpart of [`crate::pvalink::iocsh`]. Mirrors C
+//! The CA-link counterpart of the bridge `pvalink::iocsh`. Mirrors C
 //! `dbCa.c` debug surface: pre-warm a CA link so the synchronous
 //! record-link resolver reads cached monitor values without a blocking
 //! GET (`caxr`), and dump CA-link state for a record (`dbcaxr`).

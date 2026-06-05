@@ -1112,18 +1112,18 @@ pub async fn run_ca_pva_qsrv_ioc(
         store.provider().clone(),
     ));
 
-    #[cfg(feature = "calink")]
+    // CA links: the resolver lives in `epics-ca-rs` (always-on, no
+    // feature). `qsrv` pulls in `epics-ca-rs`, so it is always present.
+    match epics_ca_rs::calink::install_calink_resolver(&db, tokio::runtime::Handle::current()).await
     {
-        match crate::calink::install_calink_resolver(&db, tokio::runtime::Handle::current()).await {
-            Ok(resolver) => {
-                shell_commands.extend(crate::calink::register_calink_commands(resolver));
-                tracing::info!("calink: `ca` link set installed");
-            }
-            Err(e) => {
-                // A CA-client init failure must not abort the IOC: a
-                // database with no CA links is still fully serviceable.
-                tracing::warn!("calink: CA link set NOT installed: {e}");
-            }
+        Ok(resolver) => {
+            shell_commands.extend(epics_ca_rs::calink::register_calink_commands(resolver));
+            tracing::info!("calink: `ca` link set installed");
+        }
+        Err(e) => {
+            // A CA-client init failure must not abort the IOC: a
+            // database with no CA links is still fully serviceable.
+            tracing::warn!("calink: CA link set NOT installed: {e}");
         }
     }
     #[cfg(feature = "pvalink")]

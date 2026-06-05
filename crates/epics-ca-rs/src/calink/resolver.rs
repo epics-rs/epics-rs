@@ -1,5 +1,5 @@
 //! [`CaLinkResolver`] — a [`LinkSet`] backend that resolves CA record
-//! links through a live [`epics_ca_rs::client::CaClient`].
+//! links through a live [`crate::client::CaClient`].
 //!
 //! Each distinct CA-link PV name gets one [`CaLink`]: a CA channel, a
 //! subscription, and a monitor task that keeps an [`arc_swap::ArcSwap`]
@@ -12,13 +12,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::DbFieldType;
+use crate::client::{CaChannel, CaClient};
+use crate::protocol::{DBE_ALARM, DBE_VALUE};
 use arc_swap::ArcSwap;
 use epics_base_rs::server::database::{LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, PvDatabase};
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_base_rs::types::EpicsValue;
-use epics_ca_rs::DbFieldType;
-use epics_ca_rs::client::{CaChannel, CaClient};
-use epics_ca_rs::protocol::{DBE_ALARM, DBE_VALUE};
 use parking_lot::RwLock;
 
 /// CA record-link monitor event mask — `DBE_VALUE | DBE_ALARM`, matching
@@ -443,7 +443,7 @@ impl CaLinkResolver {
 /// monitor event overwrites the cached value/severity/timestamp that
 /// `dbCaGetLink` later serves.
 async fn run_monitor(
-    mut monitor: epics_ca_rs::client::MonitorHandle,
+    mut monitor: crate::client::MonitorHandle,
     cache: Arc<ArcSwap<Option<CachedSnapshot>>>,
     connected: Arc<AtomicBool>,
     channel: Arc<CaChannel>,
@@ -519,9 +519,7 @@ async fn run_monitor(
 /// later disconnect — the metadata is best-effort and the read path
 /// gates on `connected` regardless.
 async fn run_connection_watcher(
-    mut conn_rx: epics_base_rs::runtime::sync::broadcast::Receiver<
-        epics_ca_rs::client::ConnectionEvent,
-    >,
+    mut conn_rx: epics_base_rs::runtime::sync::broadcast::Receiver<crate::client::ConnectionEvent>,
     connected: Arc<AtomicBool>,
     channel: Arc<CaChannel>,
     handle: tokio::runtime::Handle,
@@ -558,8 +556,8 @@ async fn run_connection_watcher(
 /// Factored out of [`run_connection_watcher`] so the flag logic — the
 /// disconnect-tracking regression — is unit-testable without a live CA
 /// channel.
-fn note_conn_event(evt: &epics_ca_rs::client::ConnectionEvent, flag: &AtomicBool) -> bool {
-    use epics_ca_rs::client::ConnectionEvent;
+fn note_conn_event(evt: &crate::client::ConnectionEvent, flag: &AtomicBool) -> bool {
+    use crate::client::ConnectionEvent;
     match evt {
         ConnectionEvent::Connected => {
             flag.store(true, Ordering::Release);
@@ -765,7 +763,7 @@ fn strip_ca_scheme(name: &str) -> &str {
 
 /// Run `f`, parking the tokio worker thread for the duration when on a
 /// multi-threaded runtime so an inner `block_on` does not deadlock the
-/// runtime. Mirrors the helper in [`crate::pvalink`]'s integration
+/// runtime. Mirrors the helper in the bridge `pvalink`'s integration
 /// module — the lset trait is synchronous but is invoked from inside
 /// `PvDatabase::resolve_external_pv`'s async context.
 fn block_in_place_or_warn<F, R>(f: F) -> R
@@ -809,7 +807,7 @@ pub async fn install_calink_resolver(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_ca_rs::client::ConnectionEvent;
+    use crate::client::ConnectionEvent;
 
     #[test]
     fn strip_ca_scheme_handles_both_forms() {
@@ -825,7 +823,7 @@ mod tests {
     /// to the default `subscribe()` mask, which adds `DBE_LOG`.
     #[test]
     fn calink_monitor_mask_is_dbca_value_alarm_without_log() {
-        use epics_ca_rs::protocol::{DBE_ALARM, DBE_LOG, DBE_VALUE};
+        use crate::protocol::{DBE_ALARM, DBE_LOG, DBE_VALUE};
         assert_eq!(
             CALINK_EVENT_MASK,
             DBE_VALUE | DBE_ALARM,

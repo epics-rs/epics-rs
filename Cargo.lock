@@ -1036,6 +1036,7 @@ dependencies = [
 name = "epics-ca-rs"
 version = "0.18.6"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "base64",
  "chrono",

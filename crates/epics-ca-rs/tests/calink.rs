@@ -4,7 +4,6 @@
 //! hosts a PV, a [`CaLinkResolver`] is registered on a [`PvDatabase`] as the
 //! `ca` link set, and a soft-channel record whose INP is a CA link fetches the
 //! remote PV's value through the monitor-backed cache — the C `dbCa.c` model.
-#![cfg(feature = "calink")]
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -14,7 +13,7 @@ use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::record::LinkType;
 use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::types::EpicsValue;
-use epics_bridge_rs::calink::{CaLinkResolver, install_calink_resolver};
+use epics_ca_rs::calink::{CaLinkResolver, install_calink_resolver};
 use epics_ca_rs::client::{CaClient, CaClientConfig};
 use epics_ca_rs::server::CaServer;
 use serial_test::serial;

@@ -15,6 +15,11 @@
 //! separated from the core IOC infrastructure in `epics-base-rs`.
 
 pub mod audit;
+/// CA links for record INP/OUT fields — resolves ` CA`-modified /
+/// `ca://` record link fields to a live CA client (monitor-backed
+/// cache). Mirrors C `dbCa.c` / `dbCaLink`. Always compiled: having
+/// `epics-ca-rs` is enough to resolve CA links, no feature opt-in.
+pub mod calink;
 pub mod cap_token;
 pub(crate) mod channel;
 pub mod chaos;

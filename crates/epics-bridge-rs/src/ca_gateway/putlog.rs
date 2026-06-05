@@ -3,40 +3,45 @@
 //! Records client put operations to a log file. Corresponds to
 //! C++ ca-gateway's `-putlog` option.
 //!
-//! Each put generates one line in the log. The `old=` field carries the
-//! gateway's last cached upstream value before the put (C ca-gateway logs
-//! `vc->eventData()` here; `old=?` when no monitor value has been cached
-//! yet).
-//!
-//! ## Logging scope ([`PutLogScope`])
+//! ## Logging scope ([`PutLogScope`]) and line shape ([`PutLogLine`])
 //!
 //! The *scope* — which writes produce a line — is selected by the write
-//! hook, not by this module; the two modes also use distinct line formats:
+//! hook, not by this module; each scope emits its own line shape, and the
+//! two shapes are NOT the same line with an optional field:
 //!
 //! - [`PutLogScope::TrapWrite`] (default, C contract): record only granted
 //!   writes whose matched WRITE rule carries `TRAPWRITE`. C ca-gateway
 //!   gates all put-log emission on `asclient->clientPvt()->trapMask`
 //!   (`gateVc.cc:236`) and only reaches `gateVcChan::write` for writes
 //!   access security already granted, so denied and non-trapped writes are
-//!   never logged. The line omits an outcome token, matching C's
-//!   `"%s %s@%s %s %s old=%s\n"` (`gateResources.cc:486`):
+//!   never logged. The default C build (`#ifndef WITH_CAPUTLOG`) writes
+//!   ONLY `"%s %s@%s %s\n"` — timestamp, user@host, PV — with NO value and
+//!   NO old (`gateVc.cc:240`):
 //!
 //!   ```text
-//!   Apr 09 14:35:21 user@host TEMP:setpoint 25.0 old=24.8
+//!   Apr 09 14:35:21 user@host TEMP:setpoint
 //!   ```
 //!
-//! - [`PutLogScope::AllWrites`] (opt-in, broader audit): record *every*
-//!   client write attempt with its outcome (`OK` / `FAILED` / `DENIED`),
-//!   including access-denied and upstream-failed writes — a fail-loud
-//!   superset that is not the C contract:
+//!   The value/old data-rich format (`gateResources.cc:486`,
+//!   `"%s %s@%s %s %s old=%s\n"`) is reachable only in the optional
+//!   caPutLog-enabled build (the `#else /* WITH_CAPUTLOG */` branch;
+//!   `putLog()` is declared under `#ifdef WITH_CAPUTLOG`,
+//!   `gateResources.h:128`), which the checked-in `configure/RELEASE`
+//!   leaves disabled — so it is NOT part of the default `--putlog` line.
+//!
+//! - [`PutLogScope::AllWrites`] (opt-in `--putlog-all`, broader audit):
+//!   record *every* client write attempt with the put value, the cached
+//!   `old=` value, and its outcome (`OK` / `FAILED` / `DENIED`), including
+//!   access-denied and upstream-failed writes — a fail-loud superset that
+//!   is not the C contract:
 //!
 //!   ```text
 //!   Apr 09 14:35:22 guest@1.2.3.4 PRESSURE:cmd 100.0 old=? DENIED
 //!   ```
 //!
-//! The line format is selected by the `outcome` argument to [`PutLog::log`]:
-//! `None` writes the C-compatible TrapWrite line, `Some(_)` writes the
-//! outcome-tagged AllWrites line.
+//! The line shape is the [`PutLogLine`] variant passed to [`PutLog::log`]:
+//! [`PutLogLine::TrapWrite`] writes the C default valueless line,
+//! [`PutLogLine::AllWrites`] writes the value/old/outcome audit line.
 
 /// Which client writes the put log records. Selected by the write hook
 /// from gateway configuration; see the module docs for the per-mode line
@@ -44,8 +49,9 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PutLogScope {
     /// C ca-gateway contract (default): only granted writes to PVs whose
-    /// matched WRITE rule carries `TRAPWRITE` are logged, without an
-    /// outcome token (`gateVc.cc:236`, `gateResources.cc:486`).
+    /// matched WRITE rule carries `TRAPWRITE` are logged, as the default
+    /// build's valueless `timestamp user@host pv` line — no value, no old,
+    /// no outcome token (`gateVc.cc:236`, `gateVc.cc:240`).
     #[default]
     TrapWrite,
     /// Broader fail-loud audit (opt-in): every client write attempt is
@@ -90,6 +96,31 @@ impl PutOutcome {
     }
 }
 
+/// One putlog line's content — selects the file line shape.
+///
+/// The two shapes are not the same line with an optional field: the
+/// default C build (`#ifndef WITH_CAPUTLOG`, `gateVc.cc:240`) logs ONLY
+/// `timestamp user@host pv`, while the value/`old=` data-rich format
+/// belongs to the optional caPutLog-enabled build (`gateResources.cc:486`,
+/// declared under `#ifdef WITH_CAPUTLOG` at `gateResources.h:128`).
+/// Modeling them as separate variants keeps the value/old payload off the
+/// C-default line by construction — the illegal "default line with value"
+/// state is unrepresentable.
+#[derive(Debug, Clone, Copy)]
+pub enum PutLogLine<'a> {
+    /// C default trapped-write file line: `"{ts} {user}@{host} {pv}"` —
+    /// no value, no old, no outcome token (`gateVc.cc:240`).
+    TrapWrite,
+    /// Rust-only fail-loud audit line (`--putlog-all`): the put `value`,
+    /// the gateway's cached `old=` value, and an `OK`/`FAILED`/`DENIED`
+    /// outcome token. Not the C default contract.
+    AllWrites {
+        value: &'a str,
+        old: &'a str,
+        outcome: PutOutcome,
+    },
+}
+
 /// Put-event logger.
 ///
 /// Writes to a file with line-buffered async I/O. Multiple concurrent
@@ -130,25 +161,22 @@ impl PutLog {
 
     /// Log a put event.
     ///
-    /// `old` is the gateway's last cached upstream value before this put,
-    /// rendered into the `old=` field — the C ca-gateway logs
-    /// `vc->eventData()` (the virtual connection's cached monitor value)
-    /// in the same position (gateResources.cc:486-492). Callers pass
-    /// `"?"` when no monitor value has been cached, matching C's
-    /// `old_value == NULL` → `acOldVal = "?"` (gateResources.cc:476-480).
+    /// `line` selects the file line shape ([`PutLogLine`]):
+    /// [`PutLogLine::TrapWrite`] writes the C default valueless line
+    /// `"{ts} {u}@{h} {pv}"` (`gateVc.cc:240`); [`PutLogLine::AllWrites`]
+    /// writes the opt-in audit line `"{ts} {u}@{h} {pv} {val} old={old} {outcome}"`.
     ///
-    /// `outcome` selects the line format ([`PutLogScope`]): `None` writes
-    /// the C-compatible TrapWrite line `"{ts} {u}@{h} {pv} {val} old={old}"`
-    /// (`gateResources.cc:486`); `Some(o)` appends the AllWrites outcome
-    /// token (` OK`/` FAILED`/` DENIED`).
+    /// For the audit line, `old` is the gateway's last cached upstream
+    /// value before this put — the C caPutLog build logs `vc->eventData()`
+    /// in that position (`gateResources.cc:486-492`); callers pass `"?"`
+    /// when no monitor value has been cached, matching C's
+    /// `old_value == NULL` → `acOldVal = "?"` (`gateResources.cc:476-480`).
     pub async fn log(
         &self,
         user: &str,
         host: &str,
         pv: &str,
-        value: &str,
-        old: &str,
-        outcome: Option<PutOutcome>,
+        line: PutLogLine<'_>,
     ) -> BridgeResult<()> {
         // Match C ca-gateway's `timeStamp()` (gateResources.cc:73-84):
         // `localtime()` + `strftime("%b %d %H:%M:%S")` → e.g.
@@ -156,9 +184,16 @@ impl PutLog {
         // HH:MM:SS, NO year, NO subseconds. Use `Local` (not `Utc`) to
         // mirror `localtime()`.
         let timestamp = Local::now().format("%b %d %H:%M:%S").to_string();
-        let line = match outcome {
-            // AllWrites: outcome-tagged audit line.
-            Some(o) => format!(
+        let line = match line {
+            // C default build (`#ifndef WITH_CAPUTLOG`, gateVc.cc:240):
+            // timestamp, user@host, PV — no value, no old, no token.
+            PutLogLine::TrapWrite => format!("{timestamp} {user}@{host} {pv}\n"),
+            // Opt-in fail-loud audit line: value, cached old=, outcome.
+            PutLogLine::AllWrites {
+                value,
+                old,
+                outcome,
+            } => format!(
                 "{} {}@{} {} {} old={} {}\n",
                 timestamp,
                 user,
@@ -166,13 +201,7 @@ impl PutLog {
                 pv,
                 value,
                 old,
-                o.as_str()
-            ),
-            // TrapWrite: C-compatible line, no outcome token
-            // (gateResources.cc:486 `"%s %s@%s %s %s old=%s\n"`).
-            None => format!(
-                "{} {}@{} {} {} old={}\n",
-                timestamp, user, host, pv, value, old
+                outcome.as_str()
             ),
         };
 
@@ -247,14 +276,16 @@ mod tests {
         let _ = std::fs::remove_file(&temp);
 
         let log = PutLog::new(temp.clone());
-        // AllWrites lines carry the outcome token.
+        // AllWrites lines carry value, old=, and the outcome token.
         log.log(
             "alice",
             "host1",
             "TEMP",
-            "25.0",
-            "24.8",
-            Some(PutOutcome::Ok),
+            PutLogLine::AllWrites {
+                value: "25.0",
+                old: "24.8",
+                outcome: PutOutcome::Ok,
+            },
         )
         .await
         .unwrap();
@@ -262,9 +293,11 @@ mod tests {
             "bob",
             "host2",
             "PRESS",
-            "100",
-            "?",
-            Some(PutOutcome::Denied),
+            PutLogLine::AllWrites {
+                value: "100",
+                old: "?",
+                outcome: PutOutcome::Denied,
+            },
         )
         .await
         .unwrap();
@@ -272,14 +305,16 @@ mod tests {
             "eve",
             "host3",
             "VAC",
-            "1e-6",
-            "2e-6",
-            Some(PutOutcome::Failed),
+            PutLogLine::AllWrites {
+                value: "1e-6",
+                old: "2e-6",
+                outcome: PutOutcome::Failed,
+            },
         )
         .await
         .unwrap();
-        // TrapWrite line (None): C-compatible, no outcome token.
-        log.log("max", "host4", "FLOW", "3.3", "3.2", None)
+        // TrapWrite line: C default valueless line.
+        log.log("max", "host4", "FLOW", PutLogLine::TrapWrite)
             .await
             .unwrap();
 
@@ -290,11 +325,50 @@ mod tests {
         assert!(lines[0].contains("alice@host1 TEMP 25.0 old=24.8 OK"));
         assert!(lines[1].contains("bob@host2 PRESS 100 old=? DENIED"));
         assert!(lines[2].contains("eve@host3 VAC 1e-6 old=2e-6 FAILED"));
-        // The C-compatible line ends at `old=...` with no trailing token.
-        assert!(lines[3].ends_with("max@host4 FLOW 3.3 old=3.2"));
+        // The C default TrapWrite line ends at the PV name — no value,
+        // no old=, no outcome token.
+        assert!(lines[3].ends_with("max@host4 FLOW"));
         assert!(
-            !lines[3].contains("OK") && !lines[3].contains("DENIED"),
-            "TrapWrite line must not carry an outcome token"
+            !lines[3].contains("old=") && !lines[3].contains("OK"),
+            "TrapWrite line must carry no value/old and no outcome token"
+        );
+
+        let _ = std::fs::remove_file(&temp);
+    }
+
+    /// Regression R0604-BRCAGW-PUTLOG-BODY-WITHOUT-CAPUTLOG-1.
+    ///
+    /// The default `--putlog` ([`PutLogScope::TrapWrite`]) file line must
+    /// be exactly the C default build's `"%s %s@%s %s\n"` —
+    /// `timestamp user@host pv` — with NO value and NO `old=` field. Those
+    /// fields belong to the optional caPutLog-enabled build
+    /// (`#else /* WITH_CAPUTLOG */`, `gateResources.cc:486`), which the
+    /// checked-in `configure/RELEASE` leaves disabled, so they are not part
+    /// of the default putlog line.
+    #[tokio::test]
+    async fn trapwrite_line_is_c_default_no_value_or_old() {
+        let temp =
+            std::env::temp_dir().join(format!("ca_gateway_putlog_trap_{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&temp);
+
+        let log = PutLog::new(temp.clone());
+        log.log("op", "ws3", "TEMP:setpoint", PutLogLine::TrapWrite)
+            .await
+            .unwrap();
+
+        let content = std::fs::read_to_string(&temp).unwrap();
+        let line = content.lines().next().expect("one log line");
+        // The body after the three timestamp tokens is exactly
+        // "user@host pv" — split off the timestamp and compare.
+        let toks: Vec<&str> = line.split(' ').collect();
+        assert_eq!(
+            &toks[3..],
+            &["op@ws3", "TEMP:setpoint"],
+            "C default line body is `user@host pv` only, got {line:?}"
+        );
+        assert!(
+            !line.contains("old="),
+            "default putlog line must not carry an `old=` field, got {line:?}"
         );
 
         let _ = std::fs::remove_file(&temp);
@@ -311,7 +385,7 @@ mod tests {
         let _ = std::fs::remove_file(&temp);
 
         let log = PutLog::new(temp.clone());
-        log.log("alice", "host1", "TEMP", "25.0", "24.8", None)
+        log.log("alice", "host1", "TEMP", PutLogLine::TrapWrite)
             .await
             .unwrap();
 

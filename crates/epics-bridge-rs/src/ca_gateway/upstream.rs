@@ -56,7 +56,7 @@ use crate::error::{BridgeError, BridgeResult};
 
 use super::access::AccessConfig;
 use super::cache::{PvCache, PvState};
-use super::putlog::{PutLog, PutLogScope, PutOutcome};
+use super::putlog::{PutLog, PutLogLine, PutLogScope, PutOutcome};
 use super::pvlist::PvList;
 use super::server::CacheMode;
 use super::stats::Stats;
@@ -1218,22 +1218,34 @@ fn build_write_hook(
         let acl = acl.clone();
         let env = env.clone();
         Box::pin(async move {
+            // value/old are logged ONLY on the opt-in `AllWrites`
+            // (`--putlog-all`) audit line; the default C `TrapWrite` line
+            // is `timestamp user@host pv` with no value and no old
+            // (gateVc.cc:240). Compute them only for that scope so the
+            // default path neither formats the value nor does the async
+            // cache read for an `old=` field it will never write.
+            let audit_data = env.putlog.is_some() && env.putlog_scope == PutLogScope::AllWrites;
+
             // Bound the audit-log value so a client putting a 1M
             // element waveform doesn't allocate a 25MB String per
             // put and write a multi-megabyte putlog line. 256 chars
             // is enough for scalars, NTScalar, and a leading slice
             // of array values; full fidelity would belong in a
             // separate binary trace if ever needed.
-            let value_str = format_value_for_audit(&new_value, 256);
+            let value_str = if audit_data {
+                format_value_for_audit(&new_value, 256)
+            } else {
+                String::new()
+            };
 
             // Prior cached value for the audit `old=` field. C ca-gateway
             // logs `vc->eventData()` — the virtual connection's cached
             // monitor value — as the put's `old` value
             // (gateResources.cc:486-492). Read once up-front, keyed by
             // `served_name` (the cache key, upstream.rs:313/481), so every
-            // log path (denial branches + forward outcome) records the
-            // same pre-put value, and only when a putlog is configured.
-            let old_str = if env.putlog.is_some() {
+            // `AllWrites` log path (denial branches + forward outcome)
+            // records the same pre-put value.
+            let old_str = if audit_data {
                 cached_old_for_audit(&env, &served_name).await
             } else {
                 String::new()
@@ -1359,11 +1371,22 @@ enum WriteAudit {
     Forwarded { trap: bool, ok: bool },
 }
 
+/// What a put event logs, as decided by scope + audit outcome — the shape
+/// of the line without its value/old payload (which [`emit_putlog`]
+/// supplies for the audit variant).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PutLogDecision {
+    /// C default trapped-write line: `timestamp user@host pv` only.
+    TrapWrite,
+    /// Opt-in fail-loud audit line with this outcome token.
+    AllWrites(PutOutcome),
+}
+
 /// The single owner of the "what does the put log record" contract.
-/// Returns `None` to suppress the line, `Some(token)` to emit it — where
-/// `token = None` is the C-compatible token-less [`PutLogScope::TrapWrite`]
-/// line (`gateResources.cc:486`) and `Some(o)` is the
-/// [`PutLogScope::AllWrites`] outcome-tagged line.
+/// Returns `None` to suppress the line, or the [`PutLogDecision`] line
+/// shape: [`PutLogDecision::TrapWrite`] is the C-default valueless line
+/// (`gateVc.cc:240`); [`PutLogDecision::AllWrites`] is the outcome-tagged
+/// audit line.
 ///
 /// C ca-gateway gates *all* put-log emission on the matched rule's
 /// `trapMask` and only reaches the write path for access-granted puts
@@ -1371,19 +1394,25 @@ enum WriteAudit {
 /// write logs nothing, and a trapped grant logs regardless of the upstream
 /// result (C logs the attempt before writing). `AllWrites` is the broader
 /// fail-loud superset: every event logs, tagged with its outcome.
-fn putlog_outcome(scope: PutLogScope, audit: WriteAudit) -> Option<Option<PutOutcome>> {
+fn putlog_outcome(scope: PutLogScope, audit: WriteAudit) -> Option<PutLogDecision> {
     match (scope, audit) {
         // Broader audit: log every event with its outcome token.
-        (PutLogScope::AllWrites, WriteAudit::Denied) => Some(Some(PutOutcome::Denied)),
-        (PutLogScope::AllWrites, WriteAudit::Forwarded { ok, .. }) => Some(Some(if ok {
-            PutOutcome::Ok
-        } else {
-            PutOutcome::Failed
-        })),
+        (PutLogScope::AllWrites, WriteAudit::Denied) => {
+            Some(PutLogDecision::AllWrites(PutOutcome::Denied))
+        }
+        (PutLogScope::AllWrites, WriteAudit::Forwarded { ok, .. }) => {
+            Some(PutLogDecision::AllWrites(if ok {
+                PutOutcome::Ok
+            } else {
+                PutOutcome::Failed
+            }))
+        }
         // C contract: denials and non-trapped writes are never logged; a
-        // trapped grant logs as a token-less C line.
+        // trapped grant logs as the valueless C default line.
         (PutLogScope::TrapWrite, WriteAudit::Denied) => None,
-        (PutLogScope::TrapWrite, WriteAudit::Forwarded { trap: true, .. }) => Some(None),
+        (PutLogScope::TrapWrite, WriteAudit::Forwarded { trap: true, .. }) => {
+            Some(PutLogDecision::TrapWrite)
+        }
         (PutLogScope::TrapWrite, WriteAudit::Forwarded { trap: false, .. }) => None,
     }
 }
@@ -1401,11 +1430,22 @@ async fn emit_putlog(
     old: &str,
     audit: WriteAudit,
 ) {
-    let Some(outcome) = putlog_outcome(env.putlog_scope, audit) else {
+    let Some(decision) = putlog_outcome(env.putlog_scope, audit) else {
         return;
     };
+    let line = match decision {
+        // C default line: value/old are deliberately dropped here, not
+        // just omitted from the format — they are never logged by the
+        // default `--putlog` build (gateVc.cc:240).
+        PutLogDecision::TrapWrite => PutLogLine::TrapWrite,
+        PutLogDecision::AllWrites(outcome) => PutLogLine::AllWrites {
+            value,
+            old,
+            outcome,
+        },
+    };
     if let Some(pl) = &env.putlog
-        && let Err(e) = pl.log(&ctx.user, &ctx.host, pv, value, old, outcome).await
+        && let Err(e) = pl.log(&ctx.user, &ctx.host, pv, line).await
     {
         tracing::warn!(
             target: "ca_gateway::putlog",
@@ -1541,8 +1581,8 @@ mod tests {
                     ok: true
                 }
             ),
-            Some(None),
-            "TRAPWRITE grant must log a C-style (token-less) line"
+            Some(PutLogDecision::TrapWrite),
+            "TRAPWRITE grant must log a C-style (valueless, token-less) line"
         );
         assert_eq!(
             putlog_outcome(
@@ -1552,7 +1592,7 @@ mod tests {
                     ok: false
                 }
             ),
-            Some(None),
+            Some(PutLogDecision::TrapWrite),
             "TRAPWRITE grant logs the attempt even if the upstream write failed"
         );
 
@@ -1584,7 +1624,7 @@ mod tests {
         use PutLogScope::AllWrites;
         assert_eq!(
             putlog_outcome(AllWrites, WriteAudit::Denied),
-            Some(Some(PutOutcome::Denied))
+            Some(PutLogDecision::AllWrites(PutOutcome::Denied))
         );
         assert_eq!(
             putlog_outcome(
@@ -1594,7 +1634,7 @@ mod tests {
                     ok: true
                 }
             ),
-            Some(Some(PutOutcome::Ok)),
+            Some(PutLogDecision::AllWrites(PutOutcome::Ok)),
             "AllWrites logs a non-trapped success as OK"
         );
         assert_eq!(
@@ -1605,7 +1645,7 @@ mod tests {
                     ok: false
                 }
             ),
-            Some(Some(PutOutcome::Failed)),
+            Some(PutLogDecision::AllWrites(PutOutcome::Failed)),
             "AllWrites logs an upstream failure as FAILED"
         );
     }

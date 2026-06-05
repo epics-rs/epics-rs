@@ -3846,10 +3846,32 @@ mod tests {
             "resolver-level link_alarm_severity must use the caller's MS mode"
         );
 
-        // Ungated snapshot (pvxs pvaGetAlarmMsg / dbGetAlarm): even the
-        // NMS caller — whose gated contribution is None above — must see
-        // the remote MAJOR severity, LINK_ALARM(14) status, and message.
-        // The `sevr` mode does not gate this path.
+        // Ungated snapshot (pvxs pvaGetAlarmMsg / dbGetAlarm). Regression
+        // R0604-BRPVALINK-ALARM-SNAPSHOT-LATCH-1: the snapshot is LATCHED
+        // at the value read, not read live from the cached value. BEFORE
+        // any value read it is the pvxs initial INVALID_ALARM(3) /
+        // LINK_ALARM(14) / blank (`pvxs/ioc/pvalink.h:250`) — exactly like
+        // `dbGetAlarm` before the first `dbGetLink`
+        // (`pvxs/test/testpvalink.cpp:370-428`). The earlier
+        // `alarm_severity` calls read the cached value live and do NOT
+        // latch, so the snapshot is still INVALID here.
+        let pre = LinkSet::remote_alarm(&resolver, nms_name)
+            .expect("connected link reports the initial INVALID snapshot");
+        assert_eq!(pre.severity, 3, "pre-read snapshot is INVALID_ALARM");
+        assert_eq!(pre.status, 14, "LINK_ALARM status");
+        assert_eq!(pre.message, "", "initial snapshot carries no message");
+
+        // A value read (the LinkSet `get_value` path = pvxs `dbGetLink` /
+        // `pvaGetValue`) latches the snapshot.
+        assert!(
+            LinkSet::get_value(&resolver, nms_name).is_some(),
+            "the cached value read must succeed and latch the snapshot"
+        );
+
+        // AFTER the value read: even the NMS caller — whose gated
+        // contribution is None above — sees the remote MAJOR severity,
+        // LINK_ALARM(14) status, and message. The `sevr` mode does not
+        // gate this path.
         let snap = LinkSet::remote_alarm(&resolver, nms_name)
             .expect("NMS caller still gets the ungated remote alarm snapshot");
         assert_eq!(snap.severity, 2, "ungated snapshot reports remote MAJOR");

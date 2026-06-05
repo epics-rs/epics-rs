@@ -311,14 +311,30 @@ fn spawn_db_monitor_updates(
 ) -> mpsc::Receiver<epics_pva_rs::server_native::MonitorUpdate> {
     let (tx, rx) = mpsc::channel::<epics_pva_rs::server_native::MonitorUpdate>(64);
     tokio::spawn(async move {
-        while let Some(poll) = monitor.poll().await {
-            let update = epics_pva_rs::server_native::MonitorUpdate {
-                value: PvField::Structure(poll.value),
-                marked: poll.marked,
-                type_changed: false,
-            };
-            if tx.send(update).await.is_err() {
-                break;
+        loop {
+            // Park on poll() but stay responsive to downstream teardown.
+            // An all-const / quiet monitor now *parks* in poll() (it no
+            // longer self-signals finish), so a client cancel that drops
+            // the downstream receiver must be observed via `tx.closed()`
+            // rather than only on the next `tx.send()`. Without this select
+            // a parked poll() would keep the monitor — and its member
+            // DbSubscriptions — alive forever after the op tore down.
+            // `poll() == None` still means a genuine source-close / read
+            // error and breaks. Regression
+            // R0604-BRQSRV-GROUP-CONST-MONITOR-FINISH-1.
+            tokio::select! {
+                _ = tx.closed() => break,
+                poll = monitor.poll() => {
+                    let Some(poll) = poll else { break };
+                    let update = epics_pva_rs::server_native::MonitorUpdate {
+                        value: PvField::Structure(poll.value),
+                        marked: poll.marked,
+                        type_changed: false,
+                    };
+                    if tx.send(update).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
         monitor.stop().await;
@@ -626,9 +642,24 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 OpenedMonitor::Db(mut monitor) => {
                     let (tx, rx) = mpsc::channel::<PvField>(64);
                     tokio::spawn(async move {
-                        while let Some(poll) = monitor.poll().await {
-                            if tx.send(PvField::Structure(poll.value)).await.is_err() {
-                                break;
+                        loop {
+                            // See `spawn_db_monitor_updates`: park on poll()
+                            // but tear down on downstream drop so a quiet /
+                            // all-const monitor does not leak after cancel.
+                            // Regression
+                            // R0604-BRQSRV-GROUP-CONST-MONITOR-FINISH-1.
+                            tokio::select! {
+                                _ = tx.closed() => break,
+                                poll = monitor.poll() => {
+                                    let Some(poll) = poll else { break };
+                                    if tx
+                                        .send(PvField::Structure(poll.value))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
                             }
                         }
                         monitor.stop().await;
@@ -874,9 +905,19 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
             tokio::spawn(async move {
                 // Legacy ctx-less path: plain values, marked set dropped
                 // (the marked-aware cooked entry is `subscribe_checked_opts_marked`).
-                while let Some(poll) = monitor.poll().await {
-                    if tx.send(PvField::Structure(poll.value)).await.is_err() {
-                        break;
+                loop {
+                    // See `spawn_db_monitor_updates`: park on poll() but tear
+                    // down on downstream drop so a quiet / all-const monitor
+                    // does not leak after cancel. Regression
+                    // R0604-BRQSRV-GROUP-CONST-MONITOR-FINISH-1.
+                    tokio::select! {
+                        _ = tx.closed() => break,
+                        poll = monitor.poll() => {
+                            let Some(poll) = poll else { break };
+                            if tx.send(PvField::Structure(poll.value)).await.is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
                 monitor.stop().await;

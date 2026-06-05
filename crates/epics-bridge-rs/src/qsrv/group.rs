@@ -1738,6 +1738,20 @@ pub struct GroupMonitor {
     group_channel: Option<GroupChannel>,
     /// Fan-in receiver for member events
     event_rx: Option<tokio::sync::mpsc::Receiver<MemberEvent>>,
+    /// Keepalive fan-in *sender*, retained for the monitor's whole
+    /// lifetime so the event channel stays open even when no member task
+    /// holds a sender (an all-const / channel-less group) or every member
+    /// has gone quiet. Without it, [`start`]'s local `tx` would drop as
+    /// soon as the member loop finishes, [`poll`]'s `rx.recv()` would
+    /// return `None` immediately, and the forward task would read that as
+    /// source-close and emit a MONITOR FINISH — whereas pvxs keeps an
+    /// all-const subscription open until the client cancels
+    /// (`groupsource.cpp:240-300`). This sender is never used to post; it
+    /// only pins the channel open so `poll()` *parks* on a quiet stream.
+    /// `None` from `poll()` therefore means teardown (`stop()` cleared
+    /// `event_rx`) or a read error — never "no member events left to
+    /// forward". Regression R0604-BRQSRV-GROUP-CONST-MONITOR-FINISH-1.
+    event_tx: Option<tokio::sync::mpsc::Sender<MemberEvent>>,
     /// Handles for spawned per-member tasks. Wrapped in AbortOnDrop
     /// so a quiet PV (no events between subscribe-then-drop cycles)
     /// doesn't leak member-subscription tasks. Each task drives a
@@ -1786,6 +1800,7 @@ impl GroupMonitor {
             running: false,
             group_channel: None,
             event_rx: None,
+            event_tx: None,
             _tasks: Vec::new(),
             activation_handles: Vec::new(),
             access: super::provider::AccessContext::allow_all(),
@@ -2161,6 +2176,15 @@ impl super::provider::PvaMonitor for GroupMonitor {
             .with_monitor_queue_size(self.monitor_queue_size)
             .with_monitor_stamp();
 
+        // Retain the original fan-in sender for the monitor's lifetime so
+        // the event channel never closes just because there are no member
+        // tasks (all-const / channel-less group) or they have all gone
+        // quiet. poll() then *parks* instead of returning None, so the
+        // forward task never reads source-close and never emits a premature
+        // MONITOR FINISH — pvxs keeps an all-const subscription open until
+        // the client cancels (groupsource.cpp:240-300). Regression
+        // R0604-BRQSRV-GROUP-CONST-MONITOR-FINISH-1.
+        self.event_tx = Some(tx);
         self.group_channel = Some(group_channel);
         self.event_rx = Some(rx);
         self.running = true;
@@ -2174,8 +2198,16 @@ impl super::provider::PvaMonitor for GroupMonitor {
         // carries only fresh member deltas — never an initial snapshot.
         //
         // A channel-less (all-const) group has no member subscriptions, so
-        // this never wakes and the client sees exactly one DATA frame (the
-        // wire initial). A channel-backed group forwards each member event
+        // `rx.recv()` never wakes — but the retained `event_tx` keepalive
+        // keeps the channel open, so this *parks* rather than returning
+        // `None`. The client sees exactly one DATA frame (the wire initial)
+        // and the subscription stays open until the client cancels, matching
+        // pvxs `groupsource.cpp:240-300` (an all-const subscription is left
+        // open after the initial post). `None` here therefore means teardown
+        // (`stop()` cleared `event_rx`) or a read error — never "no member
+        // events left to forward" (Regression
+        // R0604-BRQSRV-GROUP-CONST-MONITOR-FINISH-1). A channel-backed group
+        // forwards each member event
         // as it arrives, with NO gate on other members posting first: pvxs
         // primes every field from sampled values at start via
         // db_post_single_event (groupsource.cpp:289-297), so a quiet member
@@ -2221,8 +2253,14 @@ impl super::provider::PvaMonitor for GroupMonitor {
     }
 
     async fn stop(&mut self) {
-        // Drop the receiver first to signal tasks to stop
+        // Drop the receiver and the keepalive sender so the fan-in channel
+        // fully closes; any still-live member task then observes the send
+        // error and exits even before its AbortOnDrop guard fires. Clearing
+        // the keepalive here is what lets a future poll() report teardown —
+        // while running, the keepalive keeps poll() parking on a quiet
+        // stream (Regression R0604-BRQSRV-GROUP-CONST-MONITOR-FINISH-1).
         self.event_rx = None;
+        self.event_tx = None;
 
         // Abort spawned tasks. Drop fires the AbortOnDrop guard.
         self._tasks.clear();
@@ -3466,10 +3504,17 @@ mod tests {
     /// NOT forward a manufactured initial snapshot through the monitor
     /// stream — the native PVA server already sends the initial frame via
     /// get_value_checked() at MONITOR INIT, so a forwarded snapshot would
-    /// be a duplicate DATA frame for a value that never changes. After
-    /// start(), poll() must yield nothing (it returns None as soon as the
-    /// empty event channel closes), so the client sees exactly one DATA
-    /// frame and no source-side update follows.
+    /// be a duplicate DATA frame for a value that never changes.
+    ///
+    /// poll() must yield NO snapshot — but it must do so by *parking*, not
+    /// by resolving to `None`. The earlier "returns None as soon as the
+    /// empty event channel closes" shape made the native server read
+    /// source-close and send a premature MONITOR FINISH; pvxs keeps an
+    /// all-const subscription open until the client cancels
+    /// (`groupsource.cpp:240-300`). The keepalive sender in
+    /// [`GroupMonitor::start`] now pins the channel open so poll() parks:
+    /// the client sees exactly one DATA frame and the stream stays open
+    /// (Regression R0604-BRQSRV-GROUP-CONST-MONITOR-FINISH-1).
     #[tokio::test]
     async fn bridge114_all_const_group_monitor_emits_no_stream_snapshot() {
         use crate::qsrv::provider::PvaMonitor;
@@ -3486,13 +3531,14 @@ mod tests {
         let mut mon = GroupMonitor::new(db.clone(), def);
         mon.start().await.expect("all-const group monitor starts");
 
-        // poll() must NOT manufacture an initial snapshot. With no member
-        // subscriptions the event channel is already closed, so poll()
-        // resolves to None promptly (no manufactured DATA frame, no hang).
+        // poll() must NOT manufacture an initial snapshot, and must NOT
+        // resolve to None (which the native server turns into a premature
+        // FINISH). With the keepalive sender holding the empty event channel
+        // open it parks indefinitely, so a bounded poll() must TIME OUT.
         let polled = tokio::time::timeout(Duration::from_millis(200), mon.poll()).await;
         assert!(
-            matches!(polled, Ok(None)),
-            "all-const group monitor must forward no stream snapshot, got {polled:?}"
+            polled.is_err(),
+            "all-const group monitor must park (no snapshot, no FINISH), got {polled:?}"
         );
     }
 

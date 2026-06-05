@@ -57,6 +57,20 @@ const GROUP_JSON_NAMED_TRIGGER: &str = r#"{
     }
 }"#;
 
+// An *all-const* (channel-less) group: every member is `+type:const`, so
+// no member has a backing DB channel and `GroupMonitor::start()` spawns
+// zero member tasks. pvxs `groupsource.cpp:240-300` posts the single
+// initial value and then leaves the subscription OPEN until the client
+// cancels ("maybe post initial here in pathological case with no +channel
+// (eg. all const)"). Regression R0604-BRQSRV-GROUP-CONST-MONITOR-FINISH-1.
+const GROUP_JSON_ALLCONST: &str = r#"{
+    "TEST:allconst": {
+        "+id": "epics:nt/NTScalar:1.0",
+        "value": { "+type": "const", "+const": 42 },
+        "label": { "+type": "const", "+const": "static" }
+    }
+}"#;
+
 fn empty_request() -> PvStructure {
     PvStructure::new("epics:nt/NTRequest:1.0")
 }
@@ -263,6 +277,129 @@ async fn group_monitor_subscribes_archive_log_events() {
     );
 
     mon.stop().await;
+}
+
+/// An all-const (channel-less) group monitor must treat "no member event
+/// sources" as *quiet but open*, not as a closed stream. pvxs keeps such a
+/// subscription open after the initial post (`groupsource.cpp:240-300`),
+/// whereas the pre-fix Rust `GroupMonitor::poll()` returned `None` the
+/// instant its member-event channel closed — and the native PVA server
+/// turns that `None` into a premature MONITOR FINISH (`subcmd 0x10`).
+///
+/// After the keepalive-sender fix, `poll()` parks indefinitely (no member
+/// ever posts), so a bounded `poll()` must TIME OUT rather than resolve to
+/// `None`.
+///
+/// FAIL-proof: removing `self.event_tx = Some(tx)` in `GroupMonitor::start`
+/// makes the fan-in channel close as soon as `start()` returns, so `poll()`
+/// resolves to `None` immediately and `timeout(...)` is `Ok(None)` — the
+/// `is_err()` assertion fails.
+///
+/// Regression R0604-BRQSRV-GROUP-CONST-MONITOR-FINISH-1.
+#[tokio::test]
+async fn allconst_group_monitor_poll_parks_instead_of_finishing() {
+    use epics_bridge_rs::qsrv::group::GroupMonitor;
+    use epics_bridge_rs::qsrv::provider::PvaMonitor;
+    use std::time::Duration;
+
+    // No DB records needed — every member is `+const`.
+    let db = Arc::new(PvDatabase::new());
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider
+        .load_group_config(GROUP_JSON_ALLCONST)
+        .expect("all-const group must load");
+    let def = provider
+        .groups()
+        .get("TEST:allconst")
+        .cloned()
+        .expect("all-const group registered");
+
+    let mut mon = GroupMonitor::new(db.clone(), def);
+    mon.start().await.expect("start");
+
+    // poll() must PARK (the wire layer already sent the one initial frame);
+    // there is no member event source, so it must NOT resolve to None.
+    let polled = tokio::time::timeout(Duration::from_millis(500), mon.poll()).await;
+    assert!(
+        polled.is_err(),
+        "all-const group poll() must park (quiet but open), not resolve to {polled:?} — \
+         a resolved None becomes a premature MONITOR FINISH"
+    );
+
+    mon.stop().await;
+}
+
+/// End-to-end through the native-PVA `ChannelSource` adapter: an all-const
+/// group's MONITOR stream must stay OPEN and quiet after the initial frame
+/// (no FINISH), and must tear down promptly when the client cancels (the
+/// downstream receiver is dropped).
+///
+/// Pre-fix, `subscribe` opened the group monitor, `poll()` returned `None`
+/// at once, and the forward task dropped its sender — closing the receiver
+/// (the wire-level FINISH). After the keepalive fix the stream stays open;
+/// after the forward-task `tokio::select!` on `tx.closed()` it still tears
+/// down on cancel instead of leaking the parked monitor (and its
+/// `Arc<PvDatabase>` clones) forever.
+///
+/// FAIL-proof (open half): reverting the keepalive closes the receiver, so
+/// the first `recv()` resolves to `None` within 500 ms and the `is_err()`
+/// assertion fails. FAIL-proof (teardown half): reverting the forward-task
+/// `tokio::select!` leaves `poll()` parked forever for an all-const group,
+/// so the monitor — and its `Arc<PvDatabase>` clones — never drop after the
+/// receiver is dropped, and the strong count never returns to baseline.
+///
+/// Regression R0604-BRQSRV-GROUP-CONST-MONITOR-FINISH-1.
+#[tokio::test]
+async fn allconst_group_subscribe_stays_open_then_tears_down_on_cancel() {
+    use epics_bridge_rs::qsrv::QsrvPvStore;
+    use epics_pva_rs::server_native::ChannelSource;
+    use std::time::Duration;
+
+    let db = Arc::new(PvDatabase::new());
+    let provider = Arc::new(BridgeProvider::new(db.clone()));
+    provider
+        .load_group_config(GROUP_JSON_ALLCONST)
+        .expect("all-const group must load");
+    let store = QsrvPvStore::new(provider);
+
+    // Baseline strong count after the provider/store exist but before the
+    // monitor opens. The forward task's `GroupMonitor`/`GroupChannel` add
+    // `Arc<PvDatabase>` clones on top of this; teardown must release them.
+    let baseline = Arc::strong_count(&db);
+
+    let mut rx = ChannelSource::subscribe(&store, "TEST:allconst")
+        .await
+        .expect("subscribe opens the all-const group monitor");
+
+    // Open half: the stream stays quiet (the wire layer owns the single
+    // initial frame) and OPEN — no FINISH/close. A pre-fix close would make
+    // recv() resolve to None within the window.
+    let recv = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
+    assert!(
+        recv.is_err(),
+        "all-const group monitor stream must stay open and quiet (parked), got {recv:?}"
+    );
+
+    // Teardown half: dropping the downstream receiver (client cancel) must
+    // tear the forward task + monitor down, releasing the `Arc<PvDatabase>`
+    // clones the GroupMonitor/GroupChannel hold, so the strong count returns
+    // to baseline. A parked poll() with no `tx.closed()` select would leak
+    // it forever.
+    drop(rx);
+    let mut returned = false;
+    for _ in 0..400 {
+        if Arc::strong_count(&db) == baseline {
+            returned = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        returned,
+        "dropping the receiver must tear down the parked all-const monitor; \
+         db strong-count {} did not return to baseline {baseline}",
+        Arc::strong_count(&db)
+    );
 }
 
 /// a group GET / MONITOR value carries

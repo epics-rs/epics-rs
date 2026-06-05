@@ -24,20 +24,29 @@
 //!   PV's AS group and level, `gateServer.cc:736-953`. SIGUSR2 shortcut,
 //!   `gateServer.cc:2403-2407`.
 //! - **R3** = `report3()` — the access-security report,
-//!   `gateServer.cc:955-979` (`as->report(fp)`).
+//!   `gateServer.cc:955-979` (`as->report(fp)` → `gateAs::report`,
+//!   `gateAs.cc:760-828`): the `.pvlist` Allowed/Denied/Denied-from-host
+//!   tables, the evaluation order, the rules-installed flags, then the
+//!   parsed UAG/HAG/ASG/RULE access-security dump
+//!   (`asDumpFP(fp, NULL, NULL, TRUE)`).
 //!
-//! R3 limitation: C's `as->report(fp)` dumps the parsed UAG/HAG/ASG/RULE
-//! structures. `epics-base-rs`'s `AccessSecurityConfig` exposes no
-//! enumeration of those structures, and adding one is outside this
-//! change's crate lease, so R3 reports the gateway's effective access
-//! *mode* and the verbatim `.access` file contents — the same
-//! configuration an operator reads, sourced from the path the gateway
-//! already holds for reloads.
+//! R3 renders from the gateway's *active* parsed structures — the live
+//! [`super::pvlist::PvList`] and the parsed
+//! [`epics_base_rs::server::access_security::AccessSecurityConfig`]
+//! (dumped via its `dump_report()`, shared with the `asdbdump` iocsh
+//! command) — never the raw `.access` file text, which could be stale
+//! relative to the live rules after a hot reload (the defect
+//! `R0604-BRCAGW-R3-RAW-ACCESS-REPORT-1` closes). The one piece C's
+//! verbose `asDumpFP(..., TRUE)` adds that R3 omits is the live
+//! AS-member/client listing: this gateway models no `asgMemberList`
+//! (see the `aspmem` iocsh command note), so the dump covers the parsed
+//! configuration structures only.
 
 use std::io::Write;
 use std::path::Path;
 
 use super::cache::PvState;
+use super::pvlist::{EvaluationOrder, PvList, PvListEntry};
 
 /// Stats counters captured at report time (read from the live
 /// [`super::stats::Stats`] atomics by the command handler).
@@ -158,22 +167,139 @@ pub fn render_r2(stats: &StatsSnapshot, pvs: &[PvReportEntry]) -> String {
     out
 }
 
-/// Render the **R3** access-security report: the effective mode plus the
-/// verbatim `.access` configuration (see the module-level R3 note on why
-/// this is the file contents rather than a parsed-structure dump).
-pub fn render_r3(mode_summary: &str, acf_path: Option<&str>, acf_content: Option<&str>) -> String {
+/// Render the **R3** access-security report from the gateway's *active*
+/// parsed structures, mirroring C `gateAs::report()`
+/// (`gateAs.cc:760-828`): the `.pvlist` Allowed/Denied/Denied-from-host
+/// tables, the evaluation order, the rules-installed flags, then the
+/// parsed UAG/HAG/ASG/RULE access-security dump.
+///
+/// - `pvlist` is the live parsed rule list (ALLOW/DENY/ALIAS entries plus
+///   the evaluation order).
+/// - `as_dump` is [`super::access::AccessConfig::dump_report`] output:
+///   `Some` when an `.access` file was loaded, `None` for the file-less
+///   read-only / allow-all default (no parsed structures to dump).
+///   `as_dump.is_some()` also distinguishes C's `rules_installed` from
+///   `use_default_rules` (`gateAs.cc:816-817`).
+///
+/// Patterns are shown as the compiled match regex actually enforced
+/// (`^(?:…)$`, GNU-BRE-translated — see [`super::pvlist`]), i.e. the
+/// active admission test rather than the raw `.pvlist` source line. The
+/// raw `.access` file text the old R3 emitted is deliberately dropped: it
+/// could be stale relative to the live rules after a hot reload.
+pub fn render_r3(
+    mode_summary: &str,
+    acf_path: Option<&str>,
+    pvlist: &PvList,
+    as_dump: Option<&str>,
+) -> String {
     let mut out = String::from("==== ca-gateway-rs R3 (access security report) ====\n");
     out.push_str(&format!("mode: {mode_summary}\n"));
     out.push_str(&format!("acf source: {}\n", acf_path.unwrap_or("(none)")));
-    out.push_str("--- acf file contents ---\n");
-    match acf_content {
-        Some(content) => {
-            out.push_str(content);
-            if !content.ends_with('\n') {
+
+    // ---- Allowed PV report (.pvlist ALLOW + ALIAS rules) ----
+    // C "Allowed PV Report" (gateAs.cc:767-777): pattern, ASG, ASL, alias.
+    out.push_str("--- allowed PV report ---\n");
+    out.push_str(&format!(
+        "  {:<30} {:<16} {:>3} {}\n",
+        "pattern", "asg", "asl", "alias"
+    ));
+    for entry in &pvlist.entries {
+        match entry {
+            PvListEntry::Allow { pattern, asg, asl } => {
+                out.push_str(&format!(
+                    "  {:<30} {:<16} {:>3}\n",
+                    pattern.as_str(),
+                    asg_label(asg),
+                    asl.unwrap_or(1),
+                ));
+            }
+            PvListEntry::Alias {
+                pattern,
+                target_template,
+                asg,
+                asl,
+            } => {
+                out.push_str(&format!(
+                    "  {:<30} {:<16} {:>3} {}\n",
+                    pattern.as_str(),
+                    asg_label(asg),
+                    asl.unwrap_or(1),
+                    target_template,
+                ));
+            }
+            PvListEntry::Deny { .. } => {}
+        }
+    }
+
+    // ---- Denied PV report ----
+    // C "Denied PV Report" (gateAs.cc:779-809): global denies, then
+    // per-host denies grouped by host.
+    out.push_str("--- denied PV report ---\n");
+    let global: Vec<&str> = pvlist
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            PvListEntry::Deny {
+                pattern,
+                from_hosts,
+            } if from_hosts.is_empty() => Some(pattern.as_str()),
+            _ => None,
+        })
+        .collect();
+    if !global.is_empty() {
+        out.push_str("  denied from ALL hosts:\n");
+        for p in global {
+            out.push_str(&format!("    {p}\n"));
+        }
+    }
+    // Per-host denies, grouped by host in a stable (sorted) order.
+    let mut by_host: std::collections::BTreeMap<&str, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for entry in &pvlist.entries {
+        if let PvListEntry::Deny {
+            pattern,
+            from_hosts,
+        } = entry
+        {
+            for h in from_hosts {
+                by_host
+                    .entry(h.as_str())
+                    .or_default()
+                    .push(pattern.as_str());
+            }
+        }
+    }
+    for (host, patterns) in &by_host {
+        out.push_str(&format!("  denied from host {host}:\n"));
+        for p in patterns {
+            out.push_str(&format!("    {p}\n"));
+        }
+    }
+
+    // ---- Evaluation order + rules-installed flags (gateAs.cc:811-817) ----
+    out.push_str(match pvlist.order {
+        EvaluationOrder::DenyAllow => "evaluation order: deny, allow\n",
+        EvaluationOrder::AllowDeny => "evaluation order: allow, deny\n",
+    });
+    if as_dump.is_some() {
+        out.push_str("access security rules are installed.\n");
+    } else {
+        out.push_str("using default access rules.\n");
+    }
+
+    // ---- Parsed access-security dump (UAG/HAG/ASG/RULE) ----
+    // C `asDumpFP(fp, NULL, NULL, TRUE)` (gateAs.cc:821-822). The verbose
+    // member/client listing is not reproduced (no live AS-member registry).
+    out.push_str("--- access security dump ---\n");
+    match as_dump {
+        Some(dump) if !dump.is_empty() => {
+            out.push_str(dump);
+            if !dump.ends_with('\n') {
                 out.push('\n');
             }
         }
-        None => out.push_str("(no .access file configured)\n"),
+        Some(_) => out.push_str("(no UAG/HAG/ASG defined)\n"),
+        None => out.push_str("(no .access file loaded — default rules in effect)\n"),
     }
     out
 }
@@ -266,25 +392,104 @@ mod tests {
         assert!(out.contains("GW:ALIAS asg=RWGROUP level=0"));
     }
 
+    fn sample_pvlist() -> PvList {
+        use regex::Regex;
+        PvList {
+            order: EvaluationOrder::DenyAllow,
+            entries: vec![
+                PvListEntry::Allow {
+                    pattern: Regex::new("^(?:BEAM:.*)$").unwrap(),
+                    asg: Some("RWGROUP".to_string()),
+                    asl: Some(1),
+                },
+                PvListEntry::Alias {
+                    pattern: Regex::new("^(?:GW:(.*))$").unwrap(),
+                    target_template: "UPSTREAM:$1".to_string(),
+                    asg: None,
+                    asl: None,
+                },
+                // Global (FROM-less) deny.
+                PvListEntry::Deny {
+                    pattern: Regex::new("^(?:SECRET:.*)$").unwrap(),
+                    from_hosts: vec![],
+                },
+                // Host-targeted deny (from_hosts hold resolved addresses).
+                PvListEntry::Deny {
+                    pattern: Regex::new("^(?:LOCAL:.*)$").unwrap(),
+                    from_hosts: vec!["10.0.0.5".to_string()],
+                },
+            ],
+        }
+    }
+
     #[test]
-    fn r3_emits_mode_and_acf_contents() {
+    fn r3_renders_active_pvlist_and_as_dump() {
+        let as_dump = "UAG(ops)\n\talice\nASG(DEFAULT)\n\tRULE(1,WRITE)\n\t\tUAG(ops)\n";
         let out = render_r3(
-            "rules from file",
+            "rules parsed from .access file",
             Some("/etc/gw/access.acf"),
-            Some("ASG(DEFAULT) {\n  RULE(1, READ)\n}"),
+            &sample_pvlist(),
+            Some(as_dump),
         );
         assert!(out.contains("R3 (access security report)"));
-        assert!(out.contains("mode: rules from file"));
+        assert!(out.contains("mode: rules parsed from .access file"));
         assert!(out.contains("acf source: /etc/gw/access.acf"));
-        assert!(out.contains("RULE(1, READ)"));
-        // trailing newline normalised even when the ACF lacked one
+
+        // Allowed report: ALLOW with its ASG/ASL, and the ALIAS target.
+        assert!(out.contains("--- allowed PV report ---"));
+        assert!(out.contains("^(?:BEAM:.*)$"));
+        assert!(out.contains("RWGROUP"));
+        // ALIAS renders its target; an omitted ASG defaults to DEFAULT,
+        // an omitted ASL defaults to 1.
+        assert!(out.contains("^(?:GW:(.*))$"));
+        assert!(out.contains("UPSTREAM:$1"));
+
+        // Denied report: global deny under ALL hosts, host deny grouped.
+        assert!(out.contains("--- denied PV report ---"));
+        assert!(out.contains("denied from ALL hosts:"));
+        assert!(out.contains("^(?:SECRET:.*)$"));
+        assert!(out.contains("denied from host 10.0.0.5:"));
+        assert!(out.contains("^(?:LOCAL:.*)$"));
+
+        // Evaluation order reflects the parsed PvList order.
+        assert!(out.contains("evaluation order: deny, allow"));
+        // as_dump present => rules installed.
+        assert!(out.contains("access security rules are installed."));
+
+        // Parsed AS dump appears verbatim, not the raw .access file text.
+        assert!(out.contains("--- access security dump ---"));
+        assert!(out.contains("UAG(ops)"));
+        assert!(out.contains("RULE(1,WRITE)"));
         assert!(out.ends_with('\n'));
     }
 
     #[test]
-    fn r3_without_acf_file_notes_absence() {
-        let out = render_r3("read-only default", None, None);
+    fn r3_without_acf_uses_default_rules_note() {
+        // No .access file => no parsed dump => "using default access rules"
+        // and the default-rules note instead of a UAG/HAG/ASG dump.
+        let out = render_r3(
+            "read-only default (ASG(DEFAULT){RULE(1,READ)}, no .access file)",
+            None,
+            &PvList::new(),
+            None,
+        );
         assert!(out.contains("acf source: (none)"));
-        assert!(out.contains("(no .access file configured)"));
+        assert!(out.contains("using default access rules."));
+        assert!(out.contains("(no .access file loaded — default rules in effect)"));
+        // The old behaviour (raw .access file dump) must be gone.
+        assert!(!out.contains("acf file contents"));
+    }
+
+    #[test]
+    fn r3_loaded_acf_with_empty_structures_notes_absence() {
+        // .access file loaded (as_dump Some) but it defined no UAG/HAG/ASG.
+        let out = render_r3(
+            "rules parsed from .access file",
+            Some("/etc/gw/empty.acf"),
+            &PvList::new(),
+            Some(""),
+        );
+        assert!(out.contains("access security rules are installed."));
+        assert!(out.contains("(no UAG/HAG/ASG defined)"));
     }
 }

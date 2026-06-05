@@ -184,19 +184,19 @@ impl CommandHandler {
                 self.emit_report("R2", section, format!("{} PVs", pvs.len()))
             }
             GatewayCommand::ReportAccess => {
-                // R3 = C report3(): the access-security report
-                // (gateServer.cc:955-979).
+                // R3 = C report3()/gateAs::report(): the .pvlist
+                // allowed/denied tables + evaluation order + rules-installed
+                // flags + the parsed UAG/HAG/ASG/RULE dump
+                // (gateServer.cc:955-979, gateAs.cc:760-828). Rendered from
+                // the live parsed structures, not the raw .access file text.
                 let access = self.access.load_full();
                 let mode = access.mode_summary();
-                let (acf_path, acf_content) = match &self.access_path {
-                    Some(p) => (
-                        Some(p.display().to_string()),
-                        std::fs::read_to_string(p).ok(),
-                    ),
-                    None => (None, None),
-                };
-                let section = report::render_r3(mode, acf_path.as_deref(), acf_content.as_deref());
-                let rules = self.pvlist.load_full().entries.len();
+                let as_dump = access.dump_report();
+                let acf_path = self.access_path.as_ref().map(|p| p.display().to_string());
+                let pvlist = self.pvlist.load_full();
+                let section =
+                    report::render_r3(mode, acf_path.as_deref(), &pvlist, as_dump.as_deref());
+                let rules = pvlist.entries.len();
                 self.emit_report("R3", section, format!("{rules} pvlist rules"))
             }
             GatewayCommand::ReloadPvList => match self.reload_pvlist_and_prune().await? {
@@ -528,10 +528,13 @@ mod tests {
                 .set_state(PvState::Dead);
         }
         let pvlist = Arc::new(ArcSwap::from_pointee(PvList::new()));
-        // R3's verbatim-content path reads the ACF straight from
-        // `access_path`, independent of the parsed config, so the parsed
-        // mode here is irrelevant to what the report carries.
-        let access = Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all()));
+        // R3 renders the *parsed* access-security structures (the
+        // UAG/HAG/ASG/RULE dump), not the raw ACF file text — so load the
+        // ACF as parsed rules here. Regression
+        // R0604-BRCAGW-R3-RAW-ACCESS-REPORT-1.
+        let access = Arc::new(ArcSwap::from_pointee(
+            AccessConfig::from_file(&acf_path).unwrap(),
+        ));
         let handler = CommandHandler::new(cache, pvlist, access, None, Some(acf_path.clone()))
             .with_stats(Arc::new(Stats::new("gw".to_string())))
             .with_report_path(Some(report_path.clone()));
@@ -561,9 +564,17 @@ mod tests {
         assert!(body.contains("R2 (process variable report)"));
         assert!(body.contains("total PVs=2 connecting=0 dead=1 disconnect=0 inactive=0 active=1"));
         assert!(body.contains("VAC:PRESSURE asg=DEFAULT level=1"));
-        // R3 section: access report carrying the verbatim ACF content.
+        // R3 section: access report carrying the PARSED AS dump
+        // (UAG/HAG/ASG/RULE), not the raw ACF file text. The parsed dump
+        // emits `RULE(1,READ)` (no space) under `ASG(DEFAULT)`, distinct
+        // from the file's `RULE(1, READ)`.
         assert!(body.contains("R3 (access security report)"));
-        assert!(body.contains("RULE(1, READ)"));
+        assert!(body.contains("access security rules are installed."));
+        assert!(body.contains("--- access security dump ---"));
+        assert!(body.contains("ASG(DEFAULT)"));
+        assert!(body.contains("RULE(1,READ)"));
+        // The old raw-file echo must be gone.
+        assert!(!body.contains("RULE(1, READ)"));
         // All three sections appended to one file (append, not truncate).
         let r1_pos = body.find("R1 (PV report)").unwrap();
         let r2_pos = body.find("R2 (process variable report)").unwrap();

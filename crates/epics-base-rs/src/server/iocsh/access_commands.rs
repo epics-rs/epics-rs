@@ -14,7 +14,7 @@
 use std::sync::Mutex;
 
 use super::registry::*;
-use crate::server::access_security::{AccessLevel, AccessSecurityConfig, RuleAccess, parse_acf};
+use crate::server::access_security::{AccessLevel, AccessSecurityConfig, parse_acf};
 
 /// Process-global access-security shell state. Mirrors the
 /// `asDbLib.c` file-scope globals (`acf`, `substitutions`).
@@ -167,67 +167,27 @@ fn cmd_asdbdump() -> CommandDef {
         vec![],
         "asdbdump — Dump the processed ACF file (as read).",
         |_args: &[ArgValue], ctx: &CommandContext| {
+            // Delegate to the single dump-format owner in
+            // `access_security.rs` (shared with the CA gateway R3 report),
+            // printing each rendered line through the shell.
             with_config(ctx, |cfg| {
-                let mut uags: Vec<_> = cfg.uag.keys().collect();
-                uags.sort();
-                for name in uags {
-                    ctx.println(&format!("UAG({name})"));
-                    for m in &cfg.uag[name] {
-                        ctx.println(&format!("\t{m}"));
-                    }
-                }
-                let mut hags: Vec<_> = cfg.hag.keys().collect();
-                hags.sort();
-                for name in hags {
-                    ctx.println(&format!("HAG({name})"));
-                    for h in &cfg.hag[name] {
-                        ctx.println(&format!("\t{h}"));
-                    }
-                }
-                let mut asgs: Vec<_> = cfg.asg.keys().collect();
-                asgs.sort();
-                for name in asgs {
-                    ctx.println(&format!("ASG({name})"));
-                    print_asg(ctx, cfg, name);
+                for line in cfg.dump_report().lines() {
+                    ctx.println(line);
                 }
             })
         },
     )
 }
 
-/// Print the INP links and RULEs of one ASG (shared by `asdbdump`
-/// and `asprules`).
+/// Print the INP links and RULEs of one ASG (used by `asprules`).
+/// Delegates to [`AccessSecurityConfig::fmt_asg`] — the single owner of
+/// the rule-dump format shared with `asdbdump` and the CA gateway R3
+/// report — then prints each rendered line through the shell.
 fn print_asg(ctx: &CommandContext, cfg: &AccessSecurityConfig, name: &str) {
-    let Some(asg) = cfg.asg.get(name) else {
-        return;
-    };
-    for inp in &asg.inp {
-        let letter = (b'A' + inp.index) as char;
-        ctx.println(&format!("\tINP{letter}(\"{}\")", inp.link));
-    }
-    for rule in &asg.rules {
-        let access = match rule.access {
-            RuleAccess::None => "NONE",
-            RuleAccess::Read => "READ",
-            RuleAccess::Write => "WRITE",
-        };
-        let disabled = if rule.ignore { " [DISABLED]" } else { "" };
-        ctx.println(&format!("\tRULE({},{access}){disabled}", rule.level));
-        for u in &rule.uag {
-            ctx.println(&format!("\t\tUAG({u})"));
-        }
-        for h in &rule.hag {
-            ctx.println(&format!("\t\tHAG({h})"));
-        }
-        for m in &rule.method {
-            ctx.println(&format!("\t\tMETHOD(\"{m}\")"));
-        }
-        for a in &rule.authority {
-            ctx.println(&format!("\t\tAUTHORITY(\"{a}\")"));
-        }
-        if let Some(calc) = &rule.calc {
-            ctx.println(&format!("\t\tCALC(\"{calc}\")"));
-        }
+    let mut buf = String::new();
+    cfg.fmt_asg(name, &mut buf);
+    for line in buf.lines() {
+        ctx.println(line);
     }
 }
 

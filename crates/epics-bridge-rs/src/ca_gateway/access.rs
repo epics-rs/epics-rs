@@ -183,15 +183,29 @@ impl AccessConfig {
     }
 
     /// One-line description of the effective access mode, for the R3
-    /// access-security report. The full parsed UAG/HAG/ASG/RULE dump C's
-    /// `as->report` emits is not reachable from here (base-rs does not
-    /// expose the parsed structures), so R3 pairs this summary with the
-    /// verbatim `.access` file contents.
+    /// access-security report header.
     pub fn mode_summary(&self) -> &'static str {
         match self.mode {
             Mode::ReadOnly => "read-only default (ASG(DEFAULT){RULE(1,READ)}, no .access file)",
             Mode::AllowAll => "allow-all (no .access file)",
             Mode::Rules(_) => "rules parsed from .access file",
+        }
+    }
+
+    /// Parsed UAG/HAG/ASG/RULE dump in C `asDumpFP` shape, for the R3
+    /// access-security report. `Some` only when an `.access` file was
+    /// loaded (`Mode::Rules`); the file-less `ReadOnly`/`AllowAll`
+    /// defaults have no parsed structures to dump and return `None`.
+    ///
+    /// Delegates to the single dump-format owner
+    /// [`AccessSecurityConfig::dump_report`] in `epics-base-rs`, shared
+    /// with the `asdbdump` iocsh command. The verbose member/client
+    /// listing of C's `asDumpFP(..., verbose=TRUE)` is not included (no
+    /// live AS-member registry — see that method's note).
+    pub fn dump_report(&self) -> Option<String> {
+        match &self.mode {
+            Mode::Rules(cfg) => Some(cfg.dump_report()),
+            Mode::ReadOnly | Mode::AllowAll => None,
         }
     }
 }

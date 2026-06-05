@@ -542,6 +542,85 @@ pub struct AccessSecurityConfig {
 }
 
 impl AccessSecurityConfig {
+    /// Render the parsed ACF (UAG/HAG/ASG with their `INP*` links and
+    /// RULEs) in C `asDumpFP` shape, as a `String`.
+    ///
+    /// This is the single owner of the dump format: the `asdbdump` iocsh
+    /// command and the CA gateway's R3 access-security report both render
+    /// through here, so the two cannot drift. UAG, HAG, and ASG names are
+    /// emitted in sorted order so the dump is stable across `HashMap`
+    /// iteration order.
+    ///
+    /// The verbose member/client listing of C's
+    /// `asDumpFP(fp, NULL, NULL, verbose=TRUE)` is intentionally *not*
+    /// included: this crate models no live AS-member/client registry (see
+    /// the `aspmem` iocsh command, which derives membership by scanning
+    /// records rather than from an `asgMemberList`). The dump therefore
+    /// covers the parsed configuration structures only.
+    pub fn dump_report(&self) -> String {
+        let mut out = String::new();
+        let mut uags: Vec<_> = self.uag.keys().collect();
+        uags.sort();
+        for name in uags {
+            out.push_str(&format!("UAG({name})\n"));
+            for m in &self.uag[name] {
+                out.push_str(&format!("\t{m}\n"));
+            }
+        }
+        let mut hags: Vec<_> = self.hag.keys().collect();
+        hags.sort();
+        for name in hags {
+            out.push_str(&format!("HAG({name})\n"));
+            for h in &self.hag[name] {
+                out.push_str(&format!("\t{h}\n"));
+            }
+        }
+        let mut asgs: Vec<_> = self.asg.keys().collect();
+        asgs.sort();
+        for name in asgs {
+            out.push_str(&format!("ASG({name})\n"));
+            self.fmt_asg(name, &mut out);
+        }
+        out
+    }
+
+    /// Append one ASG's `INP*` links and RULEs to `out`, in C `asDumpFP`
+    /// shape. Shared by [`Self::dump_report`] and the `asprules` iocsh
+    /// command's per-ASG renderer so the rule format has one owner.
+    pub fn fmt_asg(&self, name: &str, out: &mut String) {
+        let Some(asg) = self.asg.get(name) else {
+            return;
+        };
+        for inp in &asg.inp {
+            let letter = (b'A' + inp.index) as char;
+            out.push_str(&format!("\tINP{letter}(\"{}\")\n", inp.link));
+        }
+        for rule in &asg.rules {
+            let access = match rule.access {
+                RuleAccess::None => "NONE",
+                RuleAccess::Read => "READ",
+                RuleAccess::Write => "WRITE",
+            };
+            let disabled = if rule.ignore { " [DISABLED]" } else { "" };
+            out.push_str(&format!("\tRULE({},{access}){disabled}\n", rule.level));
+            for u in &rule.uag {
+                out.push_str(&format!("\t\tUAG({u})\n"));
+            }
+            for h in &rule.hag {
+                out.push_str(&format!("\t\tHAG({h})\n"));
+            }
+            for m in &rule.method {
+                out.push_str(&format!("\t\tMETHOD(\"{m}\")\n"));
+            }
+            for a in &rule.authority {
+                out.push_str(&format!("\t\tAUTHORITY(\"{a}\")\n"));
+            }
+            if let Some(calc) = &rule.calc {
+                out.push_str(&format!("\t\tCALC(\"{calc}\")\n"));
+            }
+        }
+    }
+
     /// Check access for a given ASG, hostname, and username.
     ///
     /// Convenience that omits the ASL gate (treats every rule as

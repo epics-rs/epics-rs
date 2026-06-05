@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
@@ -35,7 +35,7 @@ use crate::pvdata::encode::{
 use crate::pvdata::{FieldDesc, PvField};
 
 use super::runtime::PvaServerConfig;
-use super::source::{DynSource, OpError};
+use super::source::{ChannelInvalidator, DynSource, OpError};
 
 static NEXT_SID: AtomicU32 = AtomicU32::new(1);
 fn alloc_sid() -> u32 {
@@ -1834,15 +1834,12 @@ pub async fn run_tcp_server_with_peers(
 ) -> PvaResult<()> {
     let listener = TcpListener::bind(bind_addr).await.map_err(PvaError::Io)?;
     // Standalone single-listener path (not driven by `PvaServer`): create
-    // and wire the channel-invalidation broadcast here so a source served
-    // this way — e.g. a PVA gateway — still force-disconnects downstream
-    // channels on an operator `:drop`/`:flush`. `PvaServer`'s multi-listener
-    // path creates it once in `run_pva_server` and shares the one sender
-    // across every TCP/UDP listener; here there is a single listener, so a
-    // local sender is sufficient. The initial receiver is dropped; the
-    // sender stays alive for the accept loop's lifetime.
-    let (channel_invalidator, _inv_rx0) =
-        broadcast::channel::<String>(crate::server_native::runtime::CHANNEL_INVALIDATION_CAPACITY);
+    // and wire the channel invalidator here so a source served this way —
+    // e.g. a PVA gateway — still force-disconnects downstream channels on an
+    // operator `:drop`/`:flush`. `PvaServer`'s multi-listener path creates it
+    // once in `run_pva_server` and shares the one handle across every TCP/UDP
+    // listener; here there is a single listener, so a local handle suffices.
+    let channel_invalidator = ChannelInvalidator::new();
     source.set_channel_invalidator(channel_invalidator.clone());
     run_tcp_server_on_listener(source, listener, config, peers, channel_invalidator).await
 }
@@ -1859,11 +1856,11 @@ pub async fn run_tcp_server_on_listener(
     listener: TcpListener,
     config: PvaServerConfig,
     peers: Arc<crate::server_native::peers::PeerRegistry>,
-    // Server-wide channel-invalidation broadcast. Each accepted connection
-    // subscribes a receiver; a source publishes the PV name of any channel
-    // that must be force-disconnected out of band (PVA gateway operator
-    // `:drop`/`:flush`). See [`ChannelSource::set_channel_invalidator`].
-    channel_invalidator: broadcast::Sender<String>,
+    // Server-wide channel invalidator. Each accepted connection holds a
+    // receiver; a source publishes the PV name(s) of any channel that must
+    // be force-disconnected out of band (PVA gateway operator `:drop`/`:flush`).
+    // See [`ChannelSource::set_channel_invalidator`].
+    channel_invalidator: ChannelInvalidator,
 ) -> PvaResult<()> {
     let bind_addr = listener.local_addr().map_err(PvaError::Io)?;
     debug!(?bind_addr, "TCP listener up");
@@ -2595,12 +2592,12 @@ struct ConnInit {
     /// and overrides the CONNECTION_VALIDATION claim — mirrors pvxs
     /// `SSLContext::fill_credentials`.
     x509_identity: Option<crate::auth::X509Credentials>,
-    /// Server-wide channel-invalidation broadcast (see
+    /// Server-wide channel invalidator (see
     /// [`ChannelSource::set_channel_invalidator`]). Subscribed once below; a
     /// published PV name force-disconnects every channel this connection
     /// currently serves under that name with a server-initiated
     /// DESTROY_CHANNEL.
-    channel_invalidator: broadcast::Sender<String>,
+    channel_invalidator: ChannelInvalidator,
 }
 
 async fn handle_connection_io(
@@ -2752,18 +2749,20 @@ async fn handle_connection_io(
     // Step 3+: drive the read loop.
     let mut rx_buf: Vec<u8> = Vec::with_capacity(8192);
     let mut channels: HashMap<u32, ChannelState> = HashMap::new();
-    // Receiver on the server-wide channel-invalidation broadcast. A source
-    // publishes the PV name of a channel that must be force-disconnected
-    // out of band (PVA gateway operator `:drop`/`:flush`); the read-loop
-    // arm below force-disconnects every channel in `channels` serving that
-    // name with a server-initiated DESTROY_CHANNEL. Subscribing here (post-
-    // accept, pre-handshake) is sufficient: no channel exists until after
+    // Receiver on the server-wide channel invalidator. A source publishes a
+    // batch of PV names that must be force-disconnected out of band (PVA
+    // gateway operator `:drop`/`:flush`); the read-loop arm below
+    // force-disconnects every channel in `channels` serving any of those
+    // names with a server-initiated DESTROY_CHANNEL. The queue is unbounded
+    // and per-connection, so a large `:flush` can never drop a name on this
+    // connection (R0604-BRPVAGW-FLUSH-1). Subscribing here (post-accept,
+    // pre-handshake) is sufficient: no channel exists until after
     // CONNECTION_VALIDATION, so any invalidation during the handshake names
     // a PV this connection cannot yet be serving and is harmlessly missed.
     let mut inv_rx = channel_invalidator.subscribe();
     // Disables the invalidation select! arm once every sender has dropped
-    // (server shutdown). Without the guard a closed `broadcast::Receiver`
-    // resolves `recv()` immediately and forever, busy-looping the select.
+    // (server shutdown). Without the guard a closed mpsc `recv()` resolves
+    // `None` immediately and forever, busy-looping the select.
     let mut inv_closed = false;
     let mut handshake_complete = false;
     // Client identity carried for the rest of the connection lifetime.
@@ -2988,45 +2987,35 @@ async fn handle_connection_io(
                 continue;
             }
             inv_res = inv_rx.recv(), if !inv_closed => {
-                // A source invalidated a channel out of band (PVA gateway
-                // operator `<prefix>:drop` / `:flush`). Force-disconnect
-                // every channel this connection currently serves under the
-                // published PV name with a server-initiated DESTROY_CHANNEL
-                // — the downstream effect of pva2pva dropping a
+                // A source invalidated one or more channels out of band (PVA
+                // gateway operator `<prefix>:drop` / `:flush`). Force-disconnect
+                // every channel this connection currently serves under each
+                // published PV name with a server-initiated DESTROY_CHANNEL —
+                // the downstream effect of pva2pva dropping a
                 // `ChannelCacheEntry`: `channel->destroy()` →
                 // `channelStateChange(DESTROYED)` fanout to every interested
-                // `GWChannel` (chancache.cpp:76-99, server.cpp:133-135).
+                // `GWChannel` (chancache.cpp:34-99, server.cpp:130-135).
                 match inv_res {
-                    Ok(pv) => {
-                        // Tear down every channel this connection serves
-                        // under the published name through the single
-                        // teardown owner. A channel hosts every op under one
-                        // name, so destroying it ends that name's GET/PUT/
-                        // MONITOR alike — matching pva2pva's per-channel,
-                        // not per-pvRequest, destroy granularity.
+                    Some(batch) => {
+                        // One removal command publishes its whole removed set
+                        // as a single unbounded-queue batch, so nothing is ever
+                        // dropped, regardless of how many entries a `:flush`
+                        // cleared (R0604-BRPVAGW-FLUSH-1). Tear down each name
+                        // through the single teardown owner: a channel hosts
+                        // every op under one name, so destroying it ends that
+                        // name's GET/PUT/MONITOR alike — matching pva2pva's
+                        // per-channel, not per-pvRequest, destroy granularity.
                         let teardown = ChannelTeardownCtx {
                             tx: &tx,
                             order,
-                            peer,                            peer_entry: &peer_entry,
+                            peer,
+                            peer_entry: &peer_entry,
                         };
-                        invalidate_named_channels(&pv, &mut channels, &teardown).await;
+                        for pv in batch.iter() {
+                            invalidate_named_channels(pv, &mut channels, &teardown).await;
+                        }
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        // The invalidation stream overflowed this
-                        // connection's buffer (a very large `:flush` while
-                        // this task was busy in its read loop). Some names
-                        // were dropped before this task could act; the
-                        // operator can re-issue. Log loudly — silently
-                        // missing a force-disconnect would leave a channel
-                        // bound to a dropped cache entry, the exact defect
-                        // this path closes.
-                        warn!(
-                            ?peer,
-                            dropped = n,
-                            "channel-invalidation receiver lagged; some force-disconnects missed, re-issue :drop/:flush"
-                        );
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
+                    None => {
                         // Every sender dropped (server shutting down). Stop
                         // polling this arm so it cannot busy-loop; this
                         // connection keeps serving until its own teardown.

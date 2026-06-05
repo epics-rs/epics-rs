@@ -259,6 +259,72 @@ impl From<OpError> for String {
     }
 }
 
+/// Server-wide channel-invalidation fan-out. An operator-driven cache
+/// removal (PVA gateway `<prefix>:drop` / `:flush`) publishes the set of
+/// removed PV names through [`Self::publish`]; every per-connection task
+/// owns a receiver from [`Self::subscribe`] and force-disconnects the
+/// downstream channels it serves under those names with a server-initiated
+/// `DESTROY_CHANNEL`. That is the downstream effect of pva2pva dropping a
+/// `ChannelCacheEntry`: `channel->destroy()` → `channelStateChange(DESTROYED)`
+/// fanout to every interested `GWChannel`
+/// (`p2pApp/chancache.cpp:34-99`, `server.cpp:130-135`).
+///
+/// **Lossless by construction.** pva2pva's fanout iterates a live
+/// listener vector under lock — there is no queue between removal and
+/// `DESTROYED`, so no force-disconnect is ever dropped. This type matches
+/// that property two ways, replacing the earlier bounded
+/// `tokio::broadcast<String>` whose 1024-deep ring could silently drop
+/// names on a large `:flush` (R0604-BRPVAGW-FLUSH-1):
+///
+/// 1. **Per-connection unbounded queues.** Each connection holds its own
+///    [`mpsc::UnboundedReceiver`] — there is no shared ring buffer to
+///    overflow, so a slow connection can never make another connection
+///    (or itself) miss an invalidation.
+/// 2. **One command, one batch.** A removal publishes the whole removed
+///    set as a single [`Arc<[String]>`], so a `:flush` of the full
+///    50,000-entry cache is one message per connection, not one per name.
+///
+/// Memory is bounded by connection lifetime: a wedged connection that
+/// never drains is itself torn down by the op timeout / TCP keepalive,
+/// dropping its receiver; dead senders are pruned on the next
+/// [`Self::publish`] / [`Self::subscribe`]. Cheap to clone (one `Arc`).
+#[derive(Clone, Default)]
+pub struct ChannelInvalidator {
+    subscribers: Arc<std::sync::Mutex<Vec<mpsc::UnboundedSender<Arc<[String]>>>>>,
+}
+
+impl ChannelInvalidator {
+    /// A fresh invalidator with no subscribers. The server creates one per
+    /// [`crate::server_native::PvaServer`] and hands a clone to the source
+    /// (which `publish`es) and to every per-connection task (which
+    /// `subscribe`s).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a per-connection receiver. Closed subscribers (their
+    /// receiver dropped) are pruned here so a high connection-churn
+    /// workload cannot grow the registry between publishes.
+    pub fn subscribe(&self) -> mpsc::UnboundedReceiver<Arc<[String]>> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut subs = self.subscribers.lock().unwrap_or_else(|e| e.into_inner());
+        subs.retain(|s| !s.is_closed());
+        subs.push(tx);
+        rx
+    }
+
+    /// Publish one removal batch to every live connection. Unbounded
+    /// queues never drop, so no force-disconnect is lost; senders whose
+    /// receiver has gone are pruned in passing. An empty batch is a no-op.
+    pub fn publish(&self, names: Arc<[String]>) {
+        if names.is_empty() {
+            return;
+        }
+        let mut subs = self.subscribers.lock().unwrap_or_else(|e| e.into_inner());
+        subs.retain(|s| s.send(names.clone()).is_ok());
+    }
+}
+
 pub trait ChannelSource: Send + Sync + 'static {
     /// Per-source access policy. Returns the [`AccessGate`] used by
     /// the wire layer to mint [`AccessChecked`] tokens for the typed
@@ -1135,23 +1201,24 @@ pub trait ChannelSource: Send + Sync + 'static {
         let _ = (name, ctx);
     }
 
-    /// Register the server's channel-invalidation broadcast sender with
-    /// this source. The server creates one sender per
-    /// [`crate::server_native::PvaServer`] and hands it here before
-    /// accepting connections. A source that can invalidate a channel
-    /// out-of-band keeps the sender and publishes the PV name of every
-    /// channel that must be force-disconnected; each per-connection task
-    /// subscribes to a receiver and, for a name it currently serves, tears
-    /// that channel down with a server-initiated `DESTROY_CHANNEL`. That is
-    /// the downstream effect of pva2pva dropping a `ChannelCacheEntry` —
+    /// Register the server's [`ChannelInvalidator`] with this source. The
+    /// server creates one per [`crate::server_native::PvaServer`] and hands
+    /// it here before accepting connections. A source that can invalidate a
+    /// channel out-of-band keeps the handle and `publish`es the PV name of
+    /// every channel that must be force-disconnected; each per-connection
+    /// task holds a receiver and, for a name it currently serves, tears that
+    /// channel down with a server-initiated `DESTROY_CHANNEL`. That is the
+    /// downstream effect of pva2pva dropping a `ChannelCacheEntry` —
     /// `channel->destroy()` → `channelStateChange(DESTROYED)` fanout to
-    /// every interested downstream `GWChannel` (`p2pApp/server.cpp:133-135`,
-    /// `chancache.cpp:30-35,76-99`). The PVA gateway uses this so an
-    /// operator `<prefix>:drop` / `:flush` actually disconnects the live
-    /// downstream channels instead of leaving them bound to a silently
-    /// re-created upstream entry. Default impl ignores it (a source that
-    /// never invalidates channels out of band).
-    fn set_channel_invalidator(&self, invalidator: tokio::sync::broadcast::Sender<String>) {
+    /// every interested downstream `GWChannel` (`p2pApp/server.cpp:130-135`,
+    /// `chancache.cpp:34-99`). The PVA gateway uses this so an operator
+    /// `<prefix>:drop` / `:flush` actually disconnects the live downstream
+    /// channels instead of leaving them bound to a silently re-created
+    /// upstream entry. The invalidation is lossless by construction (see
+    /// [`ChannelInvalidator`]) — a large `:flush` cannot drop names.
+    /// Default impl ignores it (a source that never invalidates channels
+    /// out of band).
+    fn set_channel_invalidator(&self, invalidator: ChannelInvalidator) {
         let _ = invalidator;
     }
 
@@ -1636,7 +1703,7 @@ pub trait ChannelSourceObj: Send + Sync {
     fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool);
     fn notify_channel_open(&self, name: &str, ctx: &ChannelContext);
     fn notify_channel_close(&self, name: &str, ctx: &ChannelContext);
-    fn set_channel_invalidator(&self, invalidator: tokio::sync::broadcast::Sender<String>);
+    fn set_channel_invalidator(&self, invalidator: ChannelInvalidator);
     fn monitor_watermarks<'a>(
         &'a self,
         name: &'a str,
@@ -1993,7 +2060,7 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     fn notify_channel_close(&self, name: &str, ctx: &ChannelContext) {
         <Self as ChannelSource>::notify_channel_close(self, name, ctx);
     }
-    fn set_channel_invalidator(&self, invalidator: tokio::sync::broadcast::Sender<String>) {
+    fn set_channel_invalidator(&self, invalidator: ChannelInvalidator) {
         <Self as ChannelSource>::set_channel_invalidator(self, invalidator);
     }
     fn monitor_watermarks<'a>(
@@ -2002,5 +2069,100 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(usize, usize)>> + Send + 'a>>
     {
         Box::pin(<Self as ChannelSource>::monitor_watermarks(self, name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn batch(names: &[&str]) -> Arc<[String]> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Regression R0604-BRPVAGW-FLUSH-1.
+    ///
+    /// The channel invalidator must be lossless under backlog: a connection
+    /// that has not yet drained must still see every published name, no matter
+    /// how many a `:flush` produced. The pre-fix bounded `broadcast::<String>`
+    /// (capacity 1024, one message per name) silently dropped names past the
+    /// ring on a large flush; this unbounded per-connection queue cannot. Far
+    /// exceed the old 1024 cap before draining, then assert nothing was lost.
+    #[tokio::test]
+    async fn invalidator_never_drops_under_backlog() {
+        let inv = ChannelInvalidator::new();
+        let mut rx = inv.subscribe();
+
+        // 5000 single-name removals published with the receiver never polled —
+        // 3976 past the old 1024-deep broadcast ring.
+        const N: usize = 5000;
+        for i in 0..N {
+            inv.publish(batch(&[&format!("PV:{i}")]));
+        }
+
+        // Every one arrives, in order; none were dropped.
+        for i in 0..N {
+            let got = rx.try_recv().expect("no invalidation may be dropped");
+            assert_eq!(got.to_vec(), vec![format!("PV:{i}")]);
+        }
+        assert!(rx.try_recv().is_err(), "exactly N batches, no more");
+    }
+
+    /// One removal command publishes its whole removed set as a single batch,
+    /// regardless of how many entries it cleared — the per-name → snapshot
+    /// shape change that lets a full-cache `:flush` ride in one message.
+    #[tokio::test]
+    async fn invalidator_delivers_one_batch_per_command() {
+        let inv = ChannelInvalidator::new();
+        let mut rx = inv.subscribe();
+
+        inv.publish(batch(&["A", "B", "C"]));
+        assert_eq!(
+            rx.try_recv().expect("batch delivered").to_vec(),
+            vec!["A".to_string(), "B".to_string(), "C".to_string()]
+        );
+        assert!(rx.try_recv().is_err(), "one command = one batch");
+    }
+
+    /// Fan-out reaches every live subscriber, and an empty batch is a no-op
+    /// (a `:flush` of an empty cache publishes nothing).
+    #[tokio::test]
+    async fn invalidator_fans_out_and_skips_empty() {
+        let inv = ChannelInvalidator::new();
+        let mut a = inv.subscribe();
+        let mut b = inv.subscribe();
+
+        inv.publish(batch(&[])); // empty: no-op
+        inv.publish(batch(&["X"]));
+
+        assert_eq!(
+            a.try_recv().expect("a sees X").to_vec(),
+            vec!["X".to_string()]
+        );
+        assert_eq!(
+            b.try_recv().expect("b sees X").to_vec(),
+            vec!["X".to_string()]
+        );
+        assert!(a.try_recv().is_err(), "empty batch was not delivered");
+        assert!(b.try_recv().is_err(), "empty batch was not delivered");
+    }
+
+    /// A subscriber whose receiver was dropped is pruned on the next publish,
+    /// so a high connection-churn workload does not grow the registry. The
+    /// surviving subscriber keeps receiving.
+    #[tokio::test]
+    async fn invalidator_prunes_dropped_subscribers() {
+        let inv = ChannelInvalidator::new();
+        let dead = inv.subscribe();
+        let mut live = inv.subscribe();
+        drop(dead);
+
+        // Publish prunes the dead sender (its send fails) but still reaches the
+        // live one.
+        inv.publish(batch(&["Y"]));
+        assert_eq!(
+            live.try_recv().expect("live sees Y").to_vec(),
+            vec!["Y".to_string()]
+        );
     }
 }

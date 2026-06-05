@@ -36,7 +36,7 @@ use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::client_native::ops_v2::Pauser;
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
 use epics_pva_rs::server_native::MonitorUpdate;
-use epics_pva_rs::server_native::source::WatermarkKind;
+use epics_pva_rs::server_native::source::{ChannelInvalidator, WatermarkKind};
 
 use super::error::{GwError, GwResult};
 
@@ -742,18 +742,19 @@ pub struct ChannelCache {
     /// `cleanerDust`, same path). Distinguishes "cache shrank because
     /// idle entries aged out" from "downstream dropped its interest".
     cleaner_removed: AtomicU64,
-    /// Server-wide channel-invalidation sender, wired once by the bound
+    /// Server-wide channel invalidator, wired once by the bound
     /// `GatewayChannelSource` from the native server (see
     /// `ChannelSource::set_channel_invalidator`). An operator
     /// `<prefix>:drop` / `:flush` removes cache entries through [`Self::flush`]
     /// / [`Self::drop_entry`] — the single removal owner — which then
-    /// publishes each removed PV name here so every connection task
-    /// force-disconnects the matching downstream channel. This is the
-    /// downstream effect of pva2pva dropping a `ChannelCacheEntry`
+    /// publishes the removed PV names here (one batch per command) so every
+    /// connection task force-disconnects the matching downstream channel. This
+    /// is the downstream effect of pva2pva dropping a `ChannelCacheEntry`
     /// (`channel->destroy()` → `channelStateChange(DESTROYED)` fanout,
-    /// chancache.cpp:76-99). `None` until wired (standalone caches in
-    /// tests, or before the server attaches).
-    invalidator: OnceLock<broadcast::Sender<String>>,
+    /// chancache.cpp:34-99). Delivery is lossless by construction, so even a
+    /// full-cache `:flush` cannot drop a name (R0604-BRPVAGW-FLUSH-1). Unset
+    /// until wired (standalone caches in tests, or before the server attaches).
+    invalidator: OnceLock<ChannelInvalidator>,
 }
 
 /// One cached channel's status row for the control report.
@@ -1447,33 +1448,34 @@ impl ChannelCache {
         }
     }
 
-    /// Wire the server-wide channel-invalidation sender (see the
+    /// Wire the server-wide channel invalidator (see the
     /// [`Self::invalidator`] field). Called by the bound
-    /// `GatewayChannelSource` when the native server hands it the sender.
+    /// `GatewayChannelSource` when the native server hands it the handle.
     /// Idempotent — a second set is ignored (`OnceLock`), so
     /// re-registration of the shared cache on `<prefix>:reload` is
     /// harmless.
-    pub fn set_invalidator(&self, invalidator: broadcast::Sender<String>) {
+    pub fn set_invalidator(&self, invalidator: ChannelInvalidator) {
         let _ = self.invalidator.set(invalidator);
     }
 
-    /// Publish each PV name removed by an operator-driven [`Self::flush`] /
-    /// [`Self::drop_entry`] onto the server-wide invalidation stream, so
+    /// Publish the PV names removed by an operator-driven [`Self::flush`] /
+    /// [`Self::drop_entry`] onto the server-wide invalidator as ONE batch, so
     /// every per-connection task force-disconnects the matching downstream
-    /// channel (the downstream effect of dropping the cache entry, pva2pva
-    /// `channel->destroy()` fanout). A send error means there are no live
-    /// connections to notify — harmless. No-op when the cache is not wired
-    /// to a server (standalone caches in tests). Only operator-driven
-    /// removal publishes: the idle cleanup tick evicts entries that have no
-    /// downstream interest, so disconnecting on eviction would needlessly
-    /// kill idle-but-open channels and defeat the cache.
+    /// channels (the downstream effect of dropping the cache entry, pva2pva
+    /// `channel->destroy()` fanout). One command = one batch regardless of how
+    /// many entries it removed, and the per-connection queues are unbounded,
+    /// so no name is ever dropped even on a full-cache `:flush`
+    /// (R0604-BRPVAGW-FLUSH-1). No-op when the cache is not wired to a server
+    /// (standalone caches in tests) or when the batch is empty. Only
+    /// operator-driven removal publishes: the idle cleanup tick evicts entries
+    /// that have no downstream interest, so disconnecting on eviction would
+    /// needlessly kill idle-but-open channels and defeat the cache.
     fn publish_invalidation(&self, names: impl IntoIterator<Item = String>) {
-        let Some(tx) = self.invalidator.get() else {
+        let Some(inv) = self.invalidator.get() else {
             return;
         };
-        for name in names {
-            let _ = tx.send(name);
-        }
+        let batch: Arc<[String]> = names.into_iter().collect();
+        inv.publish(batch);
     }
 
     /// B6: operator-driven cache flush. Drops every cached channel (and
@@ -2275,23 +2277,27 @@ mod tests {
         );
     }
 
+    /// Regression R0604-BRPVAGW-FLUSH-1.
+    ///
     /// As the single removal owner, `drop_entry` publishes the
-    /// removed PV name on the wired channel-invalidation stream so the
+    /// removed PV name on the wired channel invalidator so the
     /// native server force-disconnects the downstream channel (the
-    /// downstream effect of dropping the cache entry). A drop that removes
-    /// nothing publishes nothing.
+    /// downstream effect of dropping the cache entry). A drop publishes one
+    /// batch carrying the removed name; a drop that removes nothing publishes
+    /// nothing.
     #[tokio::test]
     async fn drop_entry_publishes_removed_name_on_invalidator() {
         let client = Arc::new(PvaClient::builder().build());
         let cache = ChannelCache::new(client, Duration::from_secs(60));
-        let (tx, mut rx) = broadcast::channel::<String>(16);
-        cache.set_invalidator(tx.clone());
+        let inv = ChannelInvalidator::new();
+        let mut rx = inv.subscribe();
+        cache.set_invalidator(inv.clone());
         cache.insert_test_entry("WM:PV").await;
 
         assert!(cache.drop_entry("WM:PV").await, "entry was present");
         assert_eq!(
-            rx.try_recv().expect("name published on drop"),
-            "WM:PV".to_string()
+            rx.try_recv().expect("name published on drop").to_vec(),
+            vec!["WM:PV".to_string()]
         );
 
         // A drop that matches no entry removes nothing and publishes nothing.
@@ -2302,27 +2308,34 @@ mod tests {
         );
     }
 
-    /// `flush` publishes every distinct removed name so all
-    /// downstream channels bound to dropped entries are force-disconnected,
-    /// not merely starved of events.
+    /// Regression R0604-BRPVAGW-FLUSH-1.
+    ///
+    /// `flush` publishes every distinct removed name so all downstream
+    /// channels bound to dropped entries are force-disconnected, not merely
+    /// starved of events — and it does so as ONE batch, not one message per
+    /// name. The per-name fan-out (the pre-fix shape) could overflow a bounded
+    /// broadcast on a large `:flush`; a single batch over an unbounded
+    /// per-connection queue cannot.
     #[tokio::test]
-    async fn flush_publishes_each_removed_name() {
+    async fn flush_publishes_all_removed_names_in_one_batch() {
         let client = Arc::new(PvaClient::builder().build());
         let cache = ChannelCache::new(client, Duration::from_secs(60));
-        let (tx, mut rx) = broadcast::channel::<String>(16);
-        cache.set_invalidator(tx.clone());
+        let inv = ChannelInvalidator::new();
+        let mut rx = inv.subscribe();
+        cache.set_invalidator(inv.clone());
         cache.insert_test_entry("A:PV").await;
         cache.insert_test_entry("B:PV").await;
 
         assert_eq!(cache.flush().await, 2, "both channels removed");
-        // HashMap iteration order is unspecified, so sort before comparing.
-        let mut got = vec![
-            rx.try_recv().expect("first name published on flush"),
-            rx.try_recv().expect("second name published on flush"),
-        ];
+        // One flush = one batch carrying both names. HashMap iteration order
+        // is unspecified, so sort the batch before comparing.
+        let mut got = rx.try_recv().expect("flush published one batch").to_vec();
         got.sort();
         assert_eq!(got, vec!["A:PV".to_string(), "B:PV".to_string()]);
-        assert!(rx.try_recv().is_err(), "exactly two names, no more");
+        assert!(
+            rx.try_recv().is_err(),
+            "a flush publishes exactly one batch, not one message per name"
+        );
     }
 
     /// Regression R0604-BRPVAGW-MONITOR-VARIANT-CACHESIZE-1.

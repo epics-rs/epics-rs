@@ -20,7 +20,9 @@ use tokio::sync::mpsc;
 
 use crate::pvdata::{FieldDesc, PvField};
 
-use super::source::{AccessChecked, ChannelSource, DynSource, OpError, RawMonitorEvent};
+use super::source::{
+    AccessChecked, ChannelInvalidator, ChannelSource, DynSource, OpError, RawMonitorEvent,
+};
 
 /// One entry in the registry.
 #[derive(Clone)]
@@ -1011,15 +1013,15 @@ impl ChannelSource for CompositeSource {
         }
     }
 
-    fn set_channel_invalidator(&self, invalidator: tokio::sync::broadcast::Sender<String>) {
+    fn set_channel_invalidator(&self, invalidator: ChannelInvalidator) {
         // The server's bound source is a CompositeSource (and the PVA
         // gateway nests another composite under it), so the trait-default
-        // no-op would strand the sender at the wrapper and never reach the
-        // leaf source(s) that publish invalidations. Fan the SAME sender
+        // no-op would strand the handle at the wrapper and never reach the
+        // leaf source(s) that publish invalidations. Fan the SAME handle
         // out to every child — including nested composites, which forward
         // again — so multi-tenant gateways (N `GatewayChannelSource`s under
         // one composite, `multi_gateway.rs`) all publish onto the one
-        // server-wide stream the per-connection tasks subscribe to.
+        // server-wide invalidator the per-connection tasks subscribe to.
         for src in self.snapshot() {
             src.set_channel_invalidator(invalidator.clone());
         }

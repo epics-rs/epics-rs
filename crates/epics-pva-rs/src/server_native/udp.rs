@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use epics_base_rs::net::{
-    AsyncUdpV4, ORIGIN_TAG_MCAST_GROUP, bind_loopback_mcast, enable_so_rxq_ovfl_for_socket,
-    recv_from_with_drop_count_socket,
+    AsyncUdpV4, IfaceMap, ORIGIN_TAG_MCAST_GROUP, bind_loopback_mcast,
+    enable_so_rxq_ovfl_for_socket, recv_from_with_drop_count_socket,
 };
 use std::net::SocketAddrV4;
 use tracing::{debug, warn};
@@ -118,7 +118,7 @@ fn bind_udp(
     // all-NIC default. A constrained bind also gets each listed NIC's
     // broadcast-RX socket from `bind_on_interfaces`, so subnet-directed
     // SEARCH to a listed interface still reaches us.
-    let sock = if interfaces.is_empty() {
+    let mut sock = if interfaces.is_empty() {
         AsyncUdpV4::bind(port, true)
     } else {
         AsyncUdpV4::bind_on_interfaces(interfaces, port, true)
@@ -136,38 +136,113 @@ fn bind_udp(
     // directly because that is the client search-target list; for the
     // server, the raw client var is the wrong source — it ignores the
     // PVAS-specific list and programmatic destinations.)
-    join_beacon_multicast_groups(&sock, beacon_dests);
+    //
+    // `addGroups` pushes the join targets onto the *listener* interface set
+    // regardless of `EPICS_PVAS_INTF_ADDR_LIST`, so a modifier-less
+    // multicast destination is joined on every external NIC — even NICs
+    // outside the configured interface list — and `&mut sock` lets
+    // `ensure_iface_socket` add those listener sockets to the bundle.
+    let external_nics: Vec<Ipv4Addr> = IfaceMap::new()
+        .up_non_loopback()
+        .into_iter()
+        .map(|i| i.ip)
+        .collect();
+    join_beacon_multicast_groups(&mut sock, beacon_dests, port, &external_nics);
     Ok(sock)
 }
 
-/// Select the IPv4 multicast groups the responder must join from the
-/// server's effective beacon destinations (pvxs `addGroups`,
-/// `config.cpp:310-335`). Non-multicast and IPv6 destinations are dropped —
-/// the v4 socket cannot join a v6 group, and broadcast/unicast destinations
-/// need no membership. Pure so the destination-source decision (the PVA-33
-/// fix: beacon destinations, not the raw client `EPICS_PVA_ADDR_LIST`) is
-/// testable without real NIC multicast.
-fn multicast_v4_groups(beacon_dests: &[Endpoint]) -> Vec<Ipv4Addr> {
-    beacon_dests
-        .iter()
-        .filter_map(|dest| match dest.addr {
-            SocketAddr::V4(v4) if v4.ip().is_multicast() => Some(*v4.ip()),
-            _ => None,
-        })
-        .collect()
+/// Resolve the `(group, interface)` multicast join targets from the
+/// server's effective beacon destinations, mirroring pvxs `addGroups`
+/// (`config.cpp:310-335`).
+///
+/// Non-multicast and IPv6 destinations are dropped — the v4 socket cannot
+/// join a v6 group, and broadcast/unicast destinations need no membership.
+/// For each v4 multicast destination:
+///
+/// * an explicit `@iface` modifier (`Endpoint::iface`) resolves to that one
+///   interface — the group is joined on that NIC alone (pvxs pushes the
+///   endpoint as-is, `config.cpp:320-322`); an unresolvable interface spec
+///   is skipped (logged), the same outcome it would have for beacon egress.
+/// * a modifier-less destination expands over every external NIC
+///   (`external_nics`, pvxs `ifmap.all_external()`, `config.cpp:324-333`),
+///   yielding one join target per NIC.
+///
+/// `(group, iface)` pairs are deduplicated, first-appearance order
+/// preserved (pvxs `removeDups`). Pure given `external_nics` — the only
+/// non-pure step is `resolve_iface_v4` for *named* interfaces, which
+/// IP-literal `@iface` forms bypass — so the plan is testable without real
+/// NIC multicast.
+fn multicast_join_plan(
+    beacon_dests: &[Endpoint],
+    external_nics: &[Ipv4Addr],
+) -> Vec<(Ipv4Addr, Ipv4Addr)> {
+    let mut plan: Vec<(Ipv4Addr, Ipv4Addr)> = Vec::new();
+    let mut push_unique = |group: Ipv4Addr, iface: Ipv4Addr| {
+        let entry = (group, iface);
+        if !plan.contains(&entry) {
+            plan.push(entry);
+        }
+    };
+    for dest in beacon_dests {
+        let group = match dest.addr {
+            SocketAddr::V4(v4) if v4.ip().is_multicast() => *v4.ip(),
+            _ => continue,
+        };
+        match dest.iface.as_deref() {
+            Some(spec) => match crate::config::env::resolve_iface_v4(spec) {
+                Ok(ip) => push_unique(group, ip),
+                Err(e) => debug!(
+                    "multicast beacon destination {group}@{spec}: \
+                     interface resolve failed: {e}; skipping join"
+                ),
+            },
+            None => {
+                for &ip in external_nics {
+                    push_unique(group, ip);
+                }
+            }
+        }
+    }
+    plan
 }
 
 /// Join every IPv4 multicast group in the server's effective beacon
-/// destinations on the responder socket, so SEARCH packets sent to those
-/// groups reach us (pvxs `addGroups` / `server.cpp:411-423`). Idempotent
-/// across restarts; a single failed join is logged but does not disable the
-/// rest.
-fn join_beacon_multicast_groups(sock: &AsyncUdpV4, beacon_dests: &[Endpoint]) {
-    for ip in multicast_v4_groups(beacon_dests) {
-        if let Err(e) = sock.join_multicast_v4(ip) {
-            debug!("join_multicast_v4 for beacon destination {ip} failed: {e}");
-        } else {
-            debug!("joined beacon multicast group {ip}");
+/// destinations on the responder bundle, so SEARCH packets sent to those
+/// groups reach us (pvxs `addGroups` / `server.cpp:411-423`).
+///
+/// Each plan entry is joined on its own interface via
+/// [`AsyncUdpV4::join_multicast_v4_on`], not fanned out across every NIC:
+/// an explicit `@iface` multicast destination must be received on that NIC
+/// alone (pvxs joins the one chosen interface). When the target interface
+/// lies outside `EPICS_PVAS_INTF_ADDR_LIST` (so the bundle has no socket on
+/// it yet), [`AsyncUdpV4::ensure_iface_socket`] first binds and appends a
+/// listener socket — pvxs adds that listener interface regardless of the
+/// configured set. Idempotent across restarts; a single failed bind/join is
+/// logged but does not disable the rest.
+fn join_beacon_multicast_groups(
+    sock: &mut AsyncUdpV4,
+    beacon_dests: &[Endpoint],
+    port: u16,
+    external_nics: &[Ipv4Addr],
+) {
+    for (group, iface_ip) in multicast_join_plan(beacon_dests, external_nics) {
+        match sock.ensure_iface_socket(iface_ip, port, true) {
+            Ok(true) => debug!(
+                "added multicast listener interface {iface_ip} \
+                 (outside configured set) for group {group}"
+            ),
+            Ok(false) => {}
+            Err(e) => {
+                debug!(
+                    "cannot bind multicast listener interface {iface_ip} \
+                     for group {group}: {e}; skipping join"
+                );
+                continue;
+            }
+        }
+        match sock.join_multicast_v4_on(group, iface_ip) {
+            Ok(()) => debug!("joined beacon multicast group {group} on interface {iface_ip}"),
+            Err(e) => debug!("join_multicast_v4_on {group}@{iface_ip} failed: {e}"),
         }
     }
 }
@@ -3164,10 +3239,12 @@ mod tests {
     /// The server's multicast SEARCH-listener joins are derived from its
     /// effective beacon destinations (pvxs `addGroups`): only IPv4
     /// multicast destinations become group joins. Broadcast, unicast, and
-    /// IPv6 destinations are dropped.
+    /// IPv6 destinations are dropped. A modifier-less destination is joined
+    /// on the (single) external NIC supplied here.
     #[test]
-    fn multicast_v4_groups_selects_only_v4_multicast_beacon_destinations() {
+    fn multicast_join_plan_selects_only_v4_multicast_beacon_destinations() {
         use std::net::{Ipv6Addr, SocketAddrV6};
+        let nics = [Ipv4Addr::new(10, 0, 0, 1)];
         let dests: Vec<Endpoint> = vec![
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 1, 1, 1)), 5076).into(), // mcast
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 255)), 5076).into(), // broadcast
@@ -3181,10 +3258,10 @@ mod tests {
             .into(), // v6 mcast — not joinable on the v4 socket
         ];
         assert_eq!(
-            multicast_v4_groups(&dests),
-            vec![Ipv4Addr::new(224, 1, 1, 1)]
+            multicast_join_plan(&dests, &nics),
+            vec![(Ipv4Addr::new(224, 1, 1, 1), Ipv4Addr::new(10, 0, 0, 1))]
         );
-        assert!(multicast_v4_groups(&[]).is_empty());
+        assert!(multicast_join_plan(&[], &nics).is_empty());
     }
 
     /// PVA-33 regression: a server configured with
@@ -3208,9 +3285,10 @@ mod tests {
         unsafe {
             std::env::remove_var("EPICS_PVAS_BEACON_ADDR_LIST");
         }
+        let nics = [Ipv4Addr::new(10, 0, 0, 1)];
         assert_eq!(
-            multicast_v4_groups(&dests),
-            vec![Ipv4Addr::new(224, 0, 7, 7)],
+            multicast_join_plan(&dests, &nics),
+            vec![(Ipv4Addr::new(224, 0, 7, 7), Ipv4Addr::new(10, 0, 0, 1))],
             "PVAS_BEACON_ADDR_LIST multicast group must be joined even with PVA_ADDR_LIST unset"
         );
     }
@@ -3222,9 +3300,68 @@ mod tests {
     fn programmatic_beacon_destinations_join_multicast() {
         let dests: Vec<Endpoint> =
             vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 1, 2, 3)), 5076).into()];
+        let nics = [Ipv4Addr::new(10, 0, 0, 1)];
         assert_eq!(
-            multicast_v4_groups(&dests),
-            vec![Ipv4Addr::new(239, 1, 2, 3)]
+            multicast_join_plan(&dests, &nics),
+            vec![(Ipv4Addr::new(239, 1, 2, 3), Ipv4Addr::new(10, 0, 0, 1))]
+        );
+    }
+
+    /// Regression R0604-PVASRV-MCAST-JOIN-IFACE-1: the join plan must honour
+    /// the `@iface` modifier exactly like pvxs `addGroups`
+    /// (`config.cpp:310-335`):
+    ///
+    /// * an explicit `@iface` multicast destination is joined on *that one*
+    ///   interface only — NOT fanned out across every NIC (the pre-fix
+    ///   `multicast_v4_groups` dropped the `@iface` and `join_multicast_v4`
+    ///   joined every NIC), and NOT expanded over the external-NIC set.
+    /// * a modifier-less multicast destination expands over *every* external
+    ///   NIC — one join target per NIC — even NICs outside
+    ///   `EPICS_PVAS_INTF_ADDR_LIST` (the `external_nics` argument is the
+    ///   full external set, not the bound interface set).
+    ///
+    /// `(group, iface)` pairs are deduplicated, first-appearance order kept.
+    /// IP-literal `@iface` forms are used so `resolve_iface_v4` is a pure
+    /// passthrough and the assertion is deterministic.
+    #[test]
+    fn multicast_join_plan_respects_iface_modifier_and_expands_modifierless() {
+        let external = [Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 1, 1)];
+
+        // Explicit @iface (IP form): joined on that NIC alone, even though
+        // it is NOT in `external` — pvxs pushes the endpoint as-is.
+        let explicit = Endpoint {
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 2, 9)), 5076),
+            ttl: None,
+            iface: Some("192.168.5.5".to_string()),
+        };
+        assert_eq!(
+            multicast_join_plan(std::slice::from_ref(&explicit), &external),
+            vec![(Ipv4Addr::new(224, 0, 2, 9), Ipv4Addr::new(192, 168, 5, 5))],
+            "explicit @iface joins exactly that interface, not every NIC"
+        );
+
+        // Modifier-less: expands over every external NIC.
+        let wildcard: Endpoint =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 3, 3)), 5076).into();
+        assert_eq!(
+            multicast_join_plan(std::slice::from_ref(&wildcard), &external),
+            vec![
+                (Ipv4Addr::new(224, 0, 3, 3), Ipv4Addr::new(10, 0, 0, 1)),
+                (Ipv4Addr::new(224, 0, 3, 3), Ipv4Addr::new(10, 0, 1, 1)),
+            ],
+            "modifier-less multicast joins every external NIC"
+        );
+
+        // Both together, plus a duplicate wildcard entry: dedup keeps each
+        // (group, iface) pair once, in first-appearance order.
+        let plan = multicast_join_plan(&[explicit.clone(), wildcard.clone(), wildcard], &external);
+        assert_eq!(
+            plan,
+            vec![
+                (Ipv4Addr::new(224, 0, 2, 9), Ipv4Addr::new(192, 168, 5, 5)),
+                (Ipv4Addr::new(224, 0, 3, 3), Ipv4Addr::new(10, 0, 0, 1)),
+                (Ipv4Addr::new(224, 0, 3, 3), Ipv4Addr::new(10, 0, 1, 1)),
+            ],
         );
     }
 }

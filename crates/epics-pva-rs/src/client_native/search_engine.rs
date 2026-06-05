@@ -755,10 +755,60 @@ fn bind_beacon_udp_v6() -> Option<Arc<UdpSocket>> {
     Some(tokio_sock)
 }
 
-/// Walk `EPICS_PVA_ADDR_LIST` and join every IPv4 multicast group on
-/// every up, non-loopback NIC of `sock`. Errors are logged but not
-/// propagated — a single failed join shouldn't disable the rest of
-/// the discovery path.
+/// Project `EPICS_PVA_ADDR_LIST` endpoints to their multicast join
+/// targets. Each entry is `(group, iface)`:
+///
+/// * `iface = Some(ip)` — the endpoint carried an explicit `@iface`
+///   modifier, so the group is joined on *that interface alone* (pvxs
+///   joins the one chosen interface; `udp_collector.cpp:186-196`).
+/// * `iface = None` — a modifier-less group, joined on every external NIC.
+///
+/// Non-multicast and IPv6 entries are dropped (the v4 socket cannot join a
+/// v6 group, and a unicast/broadcast search target needs no membership).
+/// An unresolvable `@iface` spec is skipped (logged). Pure given IP-literal
+/// `@iface` forms (`resolve_iface_v4` passthrough), so the projection is
+/// testable without real NIC multicast.
+fn addr_list_multicast_targets(
+    endpoints: &[crate::config::Endpoint],
+) -> Vec<(Ipv4Addr, Option<Ipv4Addr>)> {
+    let mut out = Vec::new();
+    for ep in endpoints {
+        let SocketAddr::V4(v4) = ep.addr else {
+            continue;
+        };
+        let group = *v4.ip();
+        if !group.is_multicast() {
+            continue;
+        }
+        let iface = match ep.iface.as_deref() {
+            None => None,
+            Some(spec) => match crate::config::env::resolve_iface_v4(spec) {
+                Ok(ip) => Some(ip),
+                Err(e) => {
+                    debug!(
+                        "EPICS_PVA_ADDR_LIST {group}@{spec}: \
+                         interface resolve failed: {e}; skipping join"
+                    );
+                    continue;
+                }
+            },
+        };
+        out.push((group, iface));
+    }
+    out
+}
+
+/// Walk `EPICS_PVA_ADDR_LIST` and join its IPv4 multicast groups on `sock`.
+/// Errors are logged but not propagated — a single failed join shouldn't
+/// disable the rest of the discovery path.
+///
+/// A group with an explicit `@iface` modifier is joined on that interface
+/// alone via [`AsyncUdpV4::join_multicast_v4_on`]; a modifier-less group is
+/// joined on every external NIC. Regression
+/// R0604-PVASRV-MCAST-JOIN-IFACE-1: the previous code dropped the `@iface`
+/// and called the all-NIC [`AsyncUdpV4::join_multicast_v4`] for every
+/// group — the same `@iface`-dropping defect as the server beacon-join
+/// path, fixed here in the same change.
 pub(crate) fn join_addr_list_multicast(sock: &AsyncUdpV4) {
     let Ok(env) = std::env::var("EPICS_PVA_ADDR_LIST") else {
         return;
@@ -770,16 +820,19 @@ pub(crate) fn join_addr_list_multicast(sock: &AsyncUdpV4) {
     // `$(VAR)` macros, and resolves DNS / bracketed-v6 the same way the
     // active-SEARCH path does. We keep only the V4 multicast groups.
     let bport = crate::config::env::broadcast_port();
-    for ep in crate::config::env::parse_endpoints_with_port(&env, bport) {
-        let SocketAddr::V4(v4) = ep.addr else {
-            continue;
-        };
-        let ip = *v4.ip();
-        if ip.is_multicast() {
-            if let Err(e) = sock.join_multicast_v4(ip) {
-                debug!("join_multicast_v4 for {ip} failed: {e}");
-            } else {
-                debug!("joined multicast group {ip}");
+    let endpoints = crate::config::env::parse_endpoints_with_port(&env, bport);
+    for (group, iface) in addr_list_multicast_targets(&endpoints) {
+        match iface {
+            Some(iface_ip) => match sock.join_multicast_v4_on(group, iface_ip) {
+                Ok(()) => debug!("joined multicast group {group} on interface {iface_ip}"),
+                Err(e) => debug!("join_multicast_v4_on {group}@{iface_ip} failed: {e}"),
+            },
+            None => {
+                if let Err(e) = sock.join_multicast_v4(group) {
+                    debug!("join_multicast_v4 for {group} failed: {e}");
+                } else {
+                    debug!("joined multicast group {group}");
+                }
             }
         }
     }
@@ -2634,6 +2687,47 @@ mod tests {
     use super::*;
     use crate::proto::{ByteOrder, ControlCommand, WriteExt, encode_string_into};
     use serial_test::serial;
+
+    /// Regression R0604-PVASRV-MCAST-JOIN-IFACE-1 (client half, same
+    /// `@iface`-dropping defect family as the server beacon-join path): the
+    /// `EPICS_PVA_ADDR_LIST` multicast projection must keep the `@iface`
+    /// modifier so an explicit-interface group is joined on that interface
+    /// alone (`Some(ip)`), while a modifier-less group stays an all-NIC join
+    /// (`None`). The pre-fix code projected every group to the all-NIC
+    /// `join_multicast_v4`, dropping the interface entirely. IP-literal
+    /// `@iface` forms make `resolve_iface_v4` a pure passthrough.
+    #[test]
+    fn addr_list_multicast_targets_preserves_iface_modifier() {
+        let modifierless: crate::config::Endpoint =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 4, 4)), 5076).into();
+        let explicit = crate::config::Endpoint {
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 5, 5)), 5076),
+            ttl: None,
+            iface: Some("192.168.7.7".to_string()),
+        };
+        // Unicast and v6 entries are dropped.
+        let unicast: crate::config::Endpoint =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)), 5076).into();
+        let v6: crate::config::Endpoint = SocketAddr::V6(std::net::SocketAddrV6::new(
+            Ipv6Addr::new(0xff0e, 0, 0, 0, 0, 0, 0, 0x400),
+            5076,
+            0,
+            0,
+        ))
+        .into();
+
+        assert_eq!(
+            addr_list_multicast_targets(&[modifierless, explicit, unicast, v6]),
+            vec![
+                (Ipv4Addr::new(224, 0, 4, 4), None),
+                (
+                    Ipv4Addr::new(224, 0, 5, 5),
+                    Some(Ipv4Addr::new(192, 168, 7, 7))
+                ),
+            ],
+            "modifier-less group → all-NIC (None); @iface group → that interface (Some)"
+        );
+    }
 
     // ---- name-server dedup (pvxs split_addr_into sort+unique) ----
     //

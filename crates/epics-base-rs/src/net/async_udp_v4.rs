@@ -1092,6 +1092,76 @@ impl AsyncUdpV4 {
         }
         Ok(())
     }
+
+    /// Join `group` on **only** the bundle socket bound to `iface_ip`,
+    /// not on every NIC like [`Self::join_multicast_v4`].
+    ///
+    /// This is the per-interface multicast join pvxs performs when a
+    /// multicast endpoint carries an explicit `@iface` modifier
+    /// (`udp_collector.cpp:186-196`, `mcast_join` on the one chosen
+    /// interface) — the group is received on that NIC alone. Returns
+    /// [`io::ErrorKind::NotFound`] when no (non-`rx_only_bcast`) bundle
+    /// socket is bound to `iface_ip`; the caller decides whether to first
+    /// [`Self::ensure_iface_socket`] (server — pvxs adds listener
+    /// interfaces outside the configured set) or to skip (client).
+    pub fn join_multicast_v4_on(&self, group: Ipv4Addr, iface_ip: Ipv4Addr) -> io::Result<()> {
+        let nic = self
+            .sockets
+            .iter()
+            .find(|n| n.iface_ip == iface_ip && !n.rx_only_bcast)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("AsyncUdpV4: no socket bound to {iface_ip} to join {group}"),
+                )
+            })?;
+        nic.sock.join_multicast_v4(group, iface_ip)
+    }
+
+    /// Ensure the bundle has a (non-`rx_only_bcast`) socket bound to
+    /// `iface_ip` on `port`, binding and appending one if absent.
+    ///
+    /// This lets the server join a multicast group whose `@iface` lies
+    /// *outside* `EPICS_PVAS_INTF_ADDR_LIST`: pvxs `addGroups`
+    /// (`config.cpp:310-335`) pushes each beacon-destination join target
+    /// onto the listener interface set regardless of the configured
+    /// interface constraint, and `UDPCollector::addListener` opens a
+    /// collector socket on that interface. The newly-bound socket is
+    /// appended to `self.sockets`, so it participates in every subsequent
+    /// `recv*` call (the receive loop iterates the whole bundle).
+    ///
+    /// Returns `Ok(true)` when a socket was added, `Ok(false)` when one
+    /// was already present.
+    pub fn ensure_iface_socket(
+        &mut self,
+        iface_ip: Ipv4Addr,
+        port: u16,
+        broadcast: bool,
+    ) -> io::Result<bool> {
+        if self
+            .sockets
+            .iter()
+            .any(|n| n.iface_ip == iface_ip && !n.rx_only_bcast)
+        {
+            return Ok(false);
+        }
+        let map = IfaceMap::new();
+        // `select_ifaces` always yields one entry for a single-element
+        // list (synthesizing a unicast-only `IfaceInfo` when the OS did
+        // not enumerate the address), so `next()` is always `Some`.
+        let info = select_ifaces(&map, Some(&[iface_ip]))
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    format!("AsyncUdpV4: cannot resolve interface {iface_ip}"),
+                )
+            })?;
+        let nic = bind_one(&info, port, broadcast)?;
+        self.sockets.push(nic);
+        Ok(true)
+    }
 }
 
 /// Build a [`socket2::SockRef`] borrowing `sock`'s file descriptor /
@@ -1349,6 +1419,66 @@ mod tests {
         assert!(
             addrs.iter().all(|a| a.ip().is_loopback()),
             "loopback-only search socket produced a non-loopback bind addr"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_multicast_v4_on_absent_iface_is_not_found() {
+        // `join_multicast_v4_on` joins one interface only; when no bundle
+        // socket is bound to that interface it must surface NotFound so the
+        // caller (server) can `ensure_iface_socket` first.
+        let sock = AsyncUdpV4::bind_on_interfaces(&[Ipv4Addr::LOCALHOST], 0, true)
+            .expect("loopback-only bind");
+        let group = Ipv4Addr::new(224, 0, 9, 9);
+        let absent = Ipv4Addr::new(203, 0, 113, 77);
+        let err = sock
+            .join_multicast_v4_on(group, absent)
+            .expect_err("absent interface must error");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn ensure_iface_socket_adds_then_is_idempotent() {
+        // A bundle constrained to loopback (as under
+        // `EPICS_PVAS_INTF_ADDR_LIST=127.0.0.1`) has no external NIC
+        // socket. `ensure_iface_socket` must add one on demand (the pvxs
+        // `addGroups` "listener interface outside the configured set"
+        // behaviour) and be a no-op when the interface is already present.
+        let mut sock = AsyncUdpV4::bind_on_interfaces(&[Ipv4Addr::LOCALHOST], 0, true)
+            .expect("loopback-only bind");
+        assert!(
+            !sock
+                .ensure_iface_socket(Ipv4Addr::LOCALHOST, 0, true)
+                .expect("loopback already present"),
+            "loopback socket already in the bundle must not be re-added"
+        );
+
+        let before = sock.ifaces().len();
+        // Add a real external NIC (bindable, but outside the loopback
+        // bundle). Environments with no external NIC cannot exercise the
+        // add branch — skip rather than fail.
+        let Some(nic) = IfaceMap::new()
+            .up_non_loopback()
+            .into_iter()
+            .find(|i| !i.ip.is_loopback())
+        else {
+            return;
+        };
+        assert!(
+            sock.ensure_iface_socket(nic.ip, 0, true)
+                .expect("bind external NIC"),
+            "an external NIC outside the bundle must be added"
+        );
+        assert_eq!(
+            sock.ifaces().len(),
+            before + 1,
+            "exactly one listener socket appended"
+        );
+        assert!(
+            !sock
+                .ensure_iface_socket(nic.ip, 0, true)
+                .expect("now present"),
+            "second call for the same interface is a no-op"
         );
     }
 

@@ -24,10 +24,13 @@
 //! multicast interface. `,ttl#` sets `IP_MULTICAST_TTL` on forwarded
 //! multicast packets.
 
+use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
+use std::sync::Arc;
 
 use clap::Parser;
+use epics_base_rs::net::IfaceMap;
 use epics_pva_rs::server_native::udp::ForwardableDatagram;
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::net::UdpSocket;
@@ -252,6 +255,39 @@ fn multicast_opts_for(tgt: &ForwardTarget) -> Option<(u32, Ipv4Addr)> {
     ))
 }
 
+/// SEARCH `Unicast` flag classification for a forward destination,
+/// mirroring pvxs `mshim.cpp:140-146`: the flag is SET for a true
+/// unicast target and CLEARED for any multicast or broadcast target.
+///
+/// pvxs clears the flag when `dest.addr.isMCast() || ifmap.is_broadcast(dest.addr)`.
+/// `IfaceMap::is_broadcast` (`evhelper.cpp:866`) recognizes a host
+/// interface's *subnet* broadcast (e.g. `192.168.1.255`), not only the
+/// limited broadcast `255.255.255.255` that `Ipv4Addr::is_broadcast()`
+/// matches. `host_broadcasts` is the set of those subnet broadcasts,
+/// snapshotted once at startup from the local interface map (pvxs holds
+/// `IfaceMap::instance()` for the `App` lifetime, `mshim.cpp:79,87`).
+/// Without that set a SEARCH forwarded to a subnet broadcast is
+/// mislabeled unicast, and the limited-broadcast case is kept because
+/// `255.255.255.255` is a broadcast target too.
+fn dest_is_unicast(dest: SocketAddr, host_broadcasts: &HashSet<Ipv4Addr>) -> bool {
+    match dest.ip() {
+        IpAddr::V4(v4) => {
+            !v4.is_multicast() && !v4.is_broadcast() && !host_broadcasts.contains(&v4)
+        }
+        IpAddr::V6(v6) => !v6.is_multicast(),
+    }
+}
+
+/// Snapshot the host's interface subnet-broadcast addresses once at
+/// startup (pvxs `IfaceMap::instance()`). Used by [`dest_is_unicast`].
+fn host_broadcast_addrs() -> HashSet<Ipv4Addr> {
+    IfaceMap::new()
+        .all()
+        .into_iter()
+        .filter_map(|i| i.broadcast)
+        .collect()
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -368,6 +404,11 @@ async fn main() {
     };
     let send_sock = std::sync::Arc::new(send_sock);
 
+    // Snapshot the host's interface subnet-broadcast addresses once so a
+    // SEARCH forwarded to e.g. `192.168.1.255` is classified broadcast,
+    // not unicast — pvxs `IfaceMap::is_broadcast` parity (mshim.cpp:141).
+    let host_broadcasts = Arc::new(host_broadcast_addrs());
+
     eprintln!(
         "mshim-rs: listening on {} endpoint(s), forwarding to {} target(s)",
         listen.len(),
@@ -410,6 +451,7 @@ async fn main() {
         };
         let targets = forward_targets.clone();
         let send_sock = send_sock.clone();
+        let host_broadcasts = host_broadcasts.clone();
         let h = tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             loop {
@@ -438,11 +480,11 @@ async fn main() {
                             }
                             // SEARCH `Unicast` flag: set for a unicast
                             // destination, cleared for multicast/broadcast
-                            // (pvxs mshim.cpp:140-146). BEACON ignores it.
-                            let dest_unicast = match tgt.addr.ip() {
-                                IpAddr::V4(v4) => !v4.is_multicast() && !v4.is_broadcast(),
-                                IpAddr::V6(v6) => !v6.is_multicast(),
-                            };
+                            // (pvxs mshim.cpp:140-146). A subnet broadcast
+                            // (e.g. 192.168.1.255) is recognized via the
+                            // host interface map, not just 255.255.255.255.
+                            // BEACON ignores the flag.
+                            let dest_unicast = dest_is_unicast(tgt.addr, &host_broadcasts);
                             // Apply per-destination multicast options
                             // before the send — for EVERY multicast
                             // target, override or not (see
@@ -689,6 +731,91 @@ mod tests {
             multicast_opts_for(&bare),
             Some((1, Ipv4Addr::UNSPECIFIED)),
             "bare target resets to defaults, not the prior target's 32/{iface}"
+        );
+    }
+
+    /// Regression R0604-MSHIM-BROADCAST-UNICAST-FLAG-1.
+    ///
+    /// pvxs `mshim` clears the SEARCH `Unicast` flag for any destination
+    /// `IfaceMap::is_broadcast` recognizes — a host interface's *subnet*
+    /// broadcast (e.g. 192.168.1.255), not only the limited broadcast
+    /// 255.255.255.255 (mshim.cpp:141, evhelper.cpp:866). The classifier
+    /// must therefore consult the host broadcast set, not merely
+    /// `Ipv4Addr::is_broadcast()`.
+    #[test]
+    fn dest_is_unicast_clears_for_subnet_broadcast() {
+        let subnet_bcast = Ipv4Addr::new(192, 168, 1, 255);
+        let host: HashSet<Ipv4Addr> = std::iter::once(subnet_bcast).collect();
+
+        // Subnet broadcast known to the host map → NOT unicast (the regression).
+        assert!(
+            !dest_is_unicast(SocketAddr::new(IpAddr::V4(subnet_bcast), 5076), &host),
+            "subnet broadcast must clear Unicast"
+        );
+        // Limited broadcast 255.255.255.255 → NOT unicast (existing case, kept).
+        assert!(!dest_is_unicast(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), 5076),
+            &host
+        ));
+        // Multicast → NOT unicast (existing case).
+        assert!(!dest_is_unicast(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 1, 1, 1)), 5076),
+            &host
+        ));
+        // Ordinary unicast not in the host broadcast set → unicast.
+        assert!(dest_is_unicast(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), 5076),
+            &host
+        ));
+        // The SAME subnet-broadcast address with an EMPTY host map (the
+        // pre-fix `Ipv4Addr::is_broadcast()` behavior) is mislabeled
+        // unicast — proves the host set, not a magic constant, drives it.
+        assert!(dest_is_unicast(
+            SocketAddr::new(IpAddr::V4(subnet_bcast), 5076),
+            &HashSet::new()
+        ));
+    }
+
+    /// Regression R0604-MSHIM-BROADCAST-UNICAST-FLAG-1 (end-to-end wire).
+    ///
+    /// A real SEARCH datagram forwarded to a `-F <subnet-broadcast>`
+    /// target must be rebuilt with the wire `Unicast` flag (0x80)
+    /// cleared, matching pvxs for `ifmap.is_broadcast(dest)`. The flags
+    /// byte is the first payload byte after the 8-byte UDP header and
+    /// the 4-byte sequence id (offset 12).
+    #[test]
+    fn rebuilt_search_to_subnet_broadcast_clears_unicast_flag() {
+        use epics_pva_rs::codec::PvaCodec;
+
+        const FLAGS_OFFSET: usize = 12;
+        const UNICAST_FLAG: u8 = 0x80;
+
+        let codec = PvaCodec::new();
+        // A client SEARCH that announced itself unicast (flag set).
+        let frame = codec.build_search(1, 7, "MY:PV", [10, 1, 2, 3], 5076, /*unicast=*/ true);
+        let msgs = ForwardableDatagram::decode_all(&frame);
+        assert_eq!(msgs.len(), 1, "one SEARCH message decoded");
+
+        let subnet_bcast = Ipv4Addr::new(192, 168, 1, 255);
+        let host: HashSet<Ipv4Addr> = std::iter::once(subnet_bcast).collect();
+        let source: SocketAddr = "10.1.2.3:1111".parse().unwrap();
+
+        // Forwarded to the subnet broadcast → Unicast cleared.
+        let bcast_dest = SocketAddr::new(IpAddr::V4(subnet_bcast), 5076);
+        let bcast_frame = msgs[0].rebuild_for(dest_is_unicast(bcast_dest, &host), source);
+        assert_eq!(
+            bcast_frame[FLAGS_OFFSET] & UNICAST_FLAG,
+            0,
+            "Unicast must be cleared for a SEARCH forwarded to a subnet broadcast"
+        );
+
+        // Contrast: an ordinary unicast dest keeps the flag set.
+        let uni_dest = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), 5076);
+        let uni_frame = msgs[0].rebuild_for(dest_is_unicast(uni_dest, &host), source);
+        assert_eq!(
+            uni_frame[FLAGS_OFFSET] & UNICAST_FLAG,
+            UNICAST_FLAG,
+            "Unicast must be set for a SEARCH forwarded to an ordinary unicast dest"
         );
     }
 }

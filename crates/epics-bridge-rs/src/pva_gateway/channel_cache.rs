@@ -23,7 +23,7 @@
 //! entry. See `UpstreamEntry::is_retained` for the full rationale and
 //! the (Low) cost of the narrowing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -594,26 +594,79 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Cache key: one upstream monitor exists per `(PV name, serialized
-/// downstream pvRequest)`. pva2pva keys its monitor cache by the
-/// serialized request (`p2pApp/moncache.cpp:34-37`,
-/// `channel.cpp:157-193`), so two downstream monitors that ask for
-/// different field sets / `record._options` / `_filter` chains each get
-/// their own upstream monitor opened with their own request rather than
-/// all sharing one gateway-default stream. An empty `pv_request` is the
-/// no-request default fanout (the ctx-less `subscribe`/`subscribe_raw`
+/// One cached upstream channel — pva2pva `ChannelCacheEntry`
+/// (`p2pApp/chancache.h:103-125`). Groups the per-pvRequest upstream
+/// monitors opened for a single PV name. The top-level cache
+/// ([`ChannelCache::entries`]) is keyed by channel name; `cacheSize`, the
+/// admission cap, and the cleaner counters all operate on this level
+/// (channels), exactly as pva2pva reports `entries.size()` channels and
+/// `cleanerDust` channels (`server.cpp:182-198`). Each channel holds its
+/// own nested map of monitor variants keyed by serialized downstream
+/// pvRequest (pva2pva `mon_entries`, `chancache.h:123-125`): two
+/// downstream monitors that ask for different field sets / `record._options`
+/// / `_filter` chains each get their own upstream monitor opened with their
+/// own request rather than all sharing one gateway-default stream
+/// (`moncache.cpp:34-37`, `channel.cpp:157-193`). An empty pvRequest key
+/// is the no-request default fanout (the ctx-less `subscribe`/`subscribe_raw`
 /// paths, which carry no downstream request).
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct MonitorCacheKey {
-    pv_name: String,
-    pv_request: Vec<u8>,
+///
+/// Splitting the two levels keeps `cacheSize` a *channel* count: one PV
+/// asked for under three pvRequests is ONE cached channel with three
+/// unique subscriptions, not three cache entries — so it consumes one slot
+/// of the admission cap and increments `cleanerRemoved` by one when it ages
+/// out, matching pva2pva.
+struct ChannelEntry {
+    /// Upstream monitor variants for this channel, keyed by serialized
+    /// downstream pvRequest bytes (see [`pv_request_key`]). pva2pva
+    /// `ChannelCacheEntry::mon_entries`.
+    monitors: HashMap<Vec<u8>, Arc<UpstreamEntry>>,
 }
 
-/// Serialize a downstream pvRequest VALUE into the canonical key bytes
-/// for [`MonitorCacheKey`]. Fixed little-endian so the key is stable
-/// regardless of the downstream connection's byte order — it is a
-/// dedup key, never sent on the wire (the forward path re-encodes per
-/// upstream connection). `None` (no pvRequest captured) maps to the
+impl ChannelEntry {
+    fn new() -> Self {
+        Self {
+            monitors: HashMap::new(),
+        }
+    }
+
+    /// Live downstream subscribers summed across this channel's monitor
+    /// variants (decoded + raw fan-outs of each variant).
+    fn subscriber_count(&self) -> usize {
+        self.monitors.values().map(|e| e.subscriber_count()).sum()
+    }
+
+    /// `true` once any variant's upstream has delivered ≥1 event (its
+    /// snapshot is populated) — pva2pva per-channel `haveData`.
+    fn connected(&self) -> bool {
+        self.monitors
+            .values()
+            .any(|e| e.state.read().latest.is_some())
+    }
+
+    /// `true` while any variant still holds its `drop_poke` recency grace.
+    fn drop_poke(&self) -> bool {
+        self.monitors.values().any(|e| *e.drop_poke.lock())
+    }
+}
+
+/// Remove the monitor variant `req_key` from `pv_name`'s channel, dropping
+/// the channel entry itself when it has no remaining variants. The single
+/// shape used by every variant-removal site (the lookup cleanup guard) so
+/// an emptied channel never lingers as a zero-variant ghost in `cacheSize`.
+fn remove_variant(map: &mut HashMap<String, ChannelEntry>, pv_name: &str, req_key: &[u8]) {
+    if let Some(channel) = map.get_mut(pv_name) {
+        channel.monitors.remove(req_key);
+        if channel.monitors.is_empty() {
+            map.remove(pv_name);
+        }
+    }
+}
+
+/// Serialize a downstream pvRequest VALUE into the canonical key bytes for
+/// a [`ChannelEntry`]'s nested monitor-variant map. Fixed little-endian so
+/// the key is stable regardless of the downstream connection's byte order —
+/// it is a dedup key, never sent on the wire (the forward path re-encodes
+/// per upstream connection). `None` (no pvRequest captured) maps to the
 /// empty default-fanout key.
 fn pv_request_key(pv_request: Option<&PvField>) -> Vec<u8> {
     match pv_request {
@@ -664,16 +717,22 @@ fn resubscribe_backoff(
 /// `Arc<ChannelCache>`; cheap to clone (only the Arc is bumped).
 pub struct ChannelCache {
     client: Arc<PvaClient>,
-    /// Map of `(PV name, serialized downstream pvRequest)` → entry. See
-    /// [`MonitorCacheKey`]: one upstream monitor per distinct request,
-    /// pva2pva `moncache.cpp` parity.
-    entries: Arc<Mutex<HashMap<MonitorCacheKey, Arc<UpstreamEntry>>>>,
+    /// Top-level cache, keyed by channel (PV) name — pva2pva
+    /// `ChannelCache::entries` (`p2pApp/chancache.cpp:165-209`). Each
+    /// [`ChannelEntry`] nests the per-pvRequest upstream monitors for that
+    /// name, so `cacheSize`, the admission cap, and the cleaner counters
+    /// all operate on channels, not monitor variants.
+    entries: Arc<Mutex<HashMap<String, ChannelEntry>>>,
     /// Cleanup-tick handle. Aborted on `ChannelCache` drop.
     cleanup_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Hard cap on `entries.len()` — defends against probe-storm DoS
-    /// where a client searches N random names and forces N upstream
-    /// monitor tasks. New inserts past this limit return
-    /// `GwError::CacheFull` so the downstream sees a clean error.
+    /// Hard cap on the number of cached *channels* (`entries.len()`) —
+    /// defends against probe-storm DoS where a client searches N random
+    /// names and forces N upstream channels. A new channel past this limit
+    /// returns `GwError::CacheFull`; adding another pvRequest *variant* to
+    /// an already-cached channel does NOT consume a slot, matching pva2pva
+    /// where the cap is on `ChannelCacheEntry` count, not `mon_entries`
+    /// (a per-name variant accumulation is bounded instead by each idle
+    /// variant aging out of its channel's nested map via the cleaner).
     max_entries: usize,
     /// Lifetime count of cleanup-tick sweeps (pva2pva `cleanerRuns`,
     /// `p2pApp/chancache.cpp:230-262`). Surfaced in the control status
@@ -701,11 +760,17 @@ pub struct ChannelCache {
 #[derive(Debug, Clone)]
 pub struct EntryStatus {
     pub pv_name: String,
-    /// Upstream has delivered ≥1 event (snapshot populated).
+    /// Upstream has delivered ≥1 event (snapshot populated) on any of this
+    /// channel's monitor variants.
     pub connected: bool,
-    /// Live downstream subscribers across both fan-outs (decoded + raw).
+    /// Live downstream subscribers across both fan-outs (decoded + raw),
+    /// summed over this channel's monitor variants.
     pub subscribers: usize,
-    /// Idle-eviction grace bit (lowered by the cleanup tick).
+    /// Distinct downstream pvRequest variants (upstream monitors) open for
+    /// this channel — pva2pva's per-channel "`<n>` unique subscription(s)"
+    /// (`server.cpp:218,228`).
+    pub subscriptions: usize,
+    /// Idle-eviction grace bit (set while any variant is still poked).
     pub drop_poke: bool,
 }
 
@@ -780,17 +845,12 @@ impl ChannelCache {
     /// genuinely need to resolve.
     pub async fn peek(&self, pv_name: &str) -> Option<Arc<UpstreamEntry>> {
         let map = self.entries.lock().await;
-        // Existence probe by PV name: any cached entry for the name
-        // (under any pvRequest) answers "writable". `is_writable` only
-        // needs presence, not a specific request variant.
-        let existing = map
-            .iter()
-            .find(|(k, _)| k.pv_name == pv_name)
-            .map(|(_, e)| e.clone());
-        if let Some(ref e) = existing {
-            e.poke();
-        }
-        existing
+        // Existence probe by PV name: any cached monitor variant for the
+        // channel answers "writable". `is_writable` only needs presence,
+        // not a specific request variant.
+        let existing = map.get(pv_name)?.monitors.values().next()?.clone();
+        existing.poke();
+        Some(existing)
     }
 
     /// Name-only lookup — the default-fanout entry (empty pvRequest).
@@ -842,39 +902,52 @@ impl ChannelCache {
         pv_request: Option<&PvField>,
         connect_timeout: Duration,
     ) -> GwResult<Arc<UpstreamEntry>> {
-        let key = MonitorCacheKey {
-            pv_name: pv_name.to_string(),
-            pv_request: pv_request_key(pv_request),
-        };
+        let req_key = pv_request_key(pv_request);
         let (entry, was_fresh) = {
             let mut map = self.entries.lock().await;
-            if let Some(existing) = map.get(&key) {
+            // Existing variant for this (channel, request)? `.cloned()` ends
+            // the immutable borrow so the else-branch can mutate `map`.
+            let existing = map
+                .get(pv_name)
+                .and_then(|ch| ch.monitors.get(&req_key))
+                .cloned();
+            if let Some(existing) = existing {
                 existing.poke();
-                (existing.clone(), false)
+                (existing, false)
             } else {
-                if map.len() >= self.max_entries {
-                    // spurious-reject mitigation: pre-sweep the
-                    // entries the periodic `cleanup_tick` would also evict —
-                    // no remaining `drop_poke` grace AND no live downstream
-                    // subscriber. Shares the `is_retained` keep-predicate
-                    // with `cleanup_tick`. (The old `Arc::strong_count > 1`
-                    // test missed subscribers — they hold a
-                    // `broadcast::Receiver`, not an `Arc<UpstreamEntry>` — so
-                    // it swept live entries and killed their upstream
-                    // monitor. The sweep does not consume the poke grace.)
-                    map.retain(|_, e| e.is_retained());
+                // The admission cap counts CHANNELS (pva2pva
+                // `ChannelCacheEntry` count), so only a brand-new channel
+                // may be refused; adding another pvRequest variant to an
+                // already-cached channel never trips it.
+                let is_new_channel = !map.contains_key(pv_name);
+                if is_new_channel && map.len() >= self.max_entries {
+                    // spurious-reject mitigation: pre-sweep the channels the
+                    // periodic `cleanup_tick` would also evict — every
+                    // variant idle (no remaining `drop_poke` grace AND no
+                    // live downstream subscriber). Shares the `is_retained`
+                    // keep-predicate with `cleanup_tick`. (Subscribers hold a
+                    // `broadcast::Receiver`, not an `Arc<UpstreamEntry>`, so
+                    // a strong-count test would wrongly sweep live entries.)
+                    // The sweep does not consume the poke grace.
+                    map.retain(|_, ch| {
+                        ch.monitors.retain(|_, e| e.is_retained());
+                        !ch.monitors.is_empty()
+                    });
                 }
-                if map.len() >= self.max_entries {
+                if is_new_channel && map.len() >= self.max_entries {
                     tracing::warn!(
                         pv = %pv_name,
                         len = map.len(),
                         cap = self.max_entries,
-                        "pva-gateway: channel cache full, refusing new entry"
+                        "pva-gateway: channel cache full, refusing new channel"
                     );
                     return Err(GwError::CacheFull(self.max_entries));
                 }
                 let fresh = self.spawn_upstream_monitor(pv_name, pv_request.cloned());
-                map.insert(key.clone(), fresh.clone());
+                map.entry(pv_name.to_string())
+                    .or_insert_with(ChannelEntry::new)
+                    .monitors
+                    .insert(req_key.clone(), fresh.clone());
                 (fresh, true)
             }
         };
@@ -883,7 +956,8 @@ impl ChannelCache {
         // cancellation). Disarmed on success.
         struct CleanupGuard<'a> {
             cache: &'a ChannelCache,
-            key: &'a MonitorCacheKey,
+            pv_name: &'a str,
+            req_key: &'a [u8],
             armed: bool,
         }
         impl<'a> CleanupGuard<'a> {
@@ -896,13 +970,14 @@ impl ChannelCache {
                 if !self.armed {
                     return;
                 }
-                // Remove the fresh-but-unconnected entry so a
+                // Remove the fresh-but-unconnected variant so a
                 // cancellation race (caller's outer timeout / abort
                 // dropping the future before await_first_event returns)
-                // does not pin an upstream-monitor task. A later lookup
-                // re-probes from scratch.
+                // does not pin an upstream-monitor task. Pruning an emptied
+                // channel is the `remove_variant` owner's job. A later
+                // lookup re-probes from scratch.
                 if let Ok(mut map) = self.cache.entries.try_lock() {
-                    map.remove(self.key);
+                    remove_variant(&mut map, self.pv_name, self.req_key);
                     return;
                 }
                 // Lock contended — spawn a tiny task that takes the
@@ -911,16 +986,19 @@ impl ChannelCache {
                 // cleanup_tick treats drop_poke=true (initial state)
                 // as "recently used, keep".
                 let entries = self.cache.entries.clone();
-                let key = self.key.clone();
+                let pv_name = self.pv_name.to_string();
+                let req_key = self.req_key.to_vec();
                 tokio::spawn(async move {
-                    entries.lock().await.remove(&key);
+                    let mut map = entries.lock().await;
+                    remove_variant(&mut map, &pv_name, &req_key);
                 });
             }
         }
 
         let mut guard = CleanupGuard {
             cache: self,
-            key: &key,
+            pv_name,
+            req_key: &req_key,
             armed: was_fresh,
         };
         match self.await_first_event(entry, connect_timeout).await {
@@ -1268,41 +1346,50 @@ impl ChannelCache {
     async fn cleanup_tick(&self) {
         let mut map = self.entries.lock().await;
         let before = map.len();
-        map.retain(|_, entry| {
-            // Same keep-predicate as the cache-full emergency sweep.
-            let retained = entry.is_retained();
-            if retained {
-                // Consume one tick of `drop_poke` grace (pva2pva resets
-                // `dropPoke` on keep, `chancache.cpp:126`), so a
-                // poked-but-idle entry is evicted on the next tick once it
-                // has no subscribers. Harmless on a subscriber-retained
-                // entry whose poke may already be false.
-                *entry.drop_poke.lock() = false;
-            }
-            retained
+        map.retain(|_, channel| {
+            // Evict idle monitor variants within the channel, then drop the
+            // channel itself once it holds no variant. cacheSize / the
+            // cleaner counter are channel-level, so an evicted variant of a
+            // still-busy channel does not count as a removed channel.
+            channel.monitors.retain(|_, entry| {
+                // Same keep-predicate as the cache-full emergency sweep.
+                let retained = entry.is_retained();
+                if retained {
+                    // Consume one tick of `drop_poke` grace (pva2pva resets
+                    // `dropPoke` on keep, `chancache.cpp:126`), so a
+                    // poked-but-idle variant is evicted on the next tick once
+                    // it has no subscribers. Harmless on a subscriber-
+                    // retained variant whose poke may already be false.
+                    *entry.drop_poke.lock() = false;
+                }
+                retained
+            });
+            !channel.monitors.is_empty()
         });
         // pva2pva bumps `cleanerRuns` every sweep and `cleanerDust` by the
-        // number of evicted entries (`chancache.cpp:230-262`); both surface
-        // in the operator status report. Relaxed is sufficient — these are
-        // monotonic diagnostic counters with no ordering dependency.
+        // number of evicted CHANNELS (`chancache.cpp:230-262`,
+        // `server.cpp:182-198`); both surface in the operator status report.
+        // Relaxed is sufficient — these are monotonic diagnostic counters
+        // with no ordering dependency.
         self.cleaner_runs.fetch_add(1, Ordering::Relaxed);
         self.cleaner_removed
             .fetch_add((before - map.len()) as u64, Ordering::Relaxed);
     }
 
     /// Snapshot of cached PV names — used by `ChannelSource::list_pvs`.
-    /// A PV may have several cache entries (one per distinct pvRequest);
-    /// `list_pvs` wants each name once, so the names are de-duplicated.
+    /// The top-level cache is keyed by channel name (one entry per PV
+    /// regardless of how many pvRequest variants it holds), so the keys are
+    /// already unique; just sort for a stable listing.
     pub async fn names(&self) -> Vec<String> {
         let map = self.entries.lock().await;
-        let mut names: Vec<String> = map.keys().map(|k| k.pv_name.clone()).collect();
+        let mut names: Vec<String> = map.keys().cloned().collect();
         drop(map);
         names.sort_unstable();
-        names.dedup();
         names
     }
 
-    /// Diagnostic: total entries in the cache.
+    /// Diagnostic: total cached channels (one per PV name, irrespective of
+    /// how many pvRequest variants each holds) — pva2pva `entries.size()`.
     pub async fn entry_count(&self) -> usize {
         self.entries.lock().await.len()
     }
@@ -1337,14 +1424,17 @@ impl ChannelCache {
         let map = self.entries.lock().await;
         let total = map.len();
         let mut entries: Vec<EntryStatus> = Vec::with_capacity(total.min(limit));
-        for entry in map.values().take(limit) {
+        for (pv_name, channel) in map.iter().take(limit) {
             entries.push(EntryStatus {
-                pv_name: entry.pv_name.clone(),
-                // "connected" == the upstream has delivered at least one
-                // event (the snapshot is populated) — pva2pva `haveData`.
-                connected: entry.state.read().latest.is_some(),
-                subscribers: entry.tx.receiver_count() + entry.tx_raw.receiver_count(),
-                drop_poke: *entry.drop_poke.lock(),
+                pv_name: pv_name.clone(),
+                // Channel-level aggregates over the monitor variants — pva2pva
+                // emits one row per channel with its `<n>` unique
+                // subscriptions (`server.cpp:218,228`), not one row per
+                // variant.
+                connected: channel.connected(),
+                subscribers: channel.subscriber_count(),
+                subscriptions: channel.monitors.len(),
+                drop_poke: channel.drop_poke(),
             });
         }
         CacheStatus {
@@ -1386,8 +1476,9 @@ impl ChannelCache {
         }
     }
 
-    /// B6: operator-driven cache flush. Drops every cached
-    /// `UpstreamEntry`, then returns the number of entries removed.
+    /// B6: operator-driven cache flush. Drops every cached channel (and
+    /// with it every nested `UpstreamEntry`), then returns the number of
+    /// channels removed.
     ///
     /// Each removed entry's `AbortOnDrop` aborts its upstream monitor
     /// task once the last `Arc<UpstreamEntry>` is released; any live
@@ -1407,15 +1498,9 @@ impl ChannelCache {
         let (removed, names) = {
             let mut map = self.entries.lock().await;
             let removed = map.len();
-            // An entry exists per distinct pvRequest, but the downstream
-            // channel is keyed by name only — dedup to one invalidation
-            // per name.
-            let names: Vec<String> = map
-                .keys()
-                .map(|k| k.pv_name.clone())
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
+            // The cache is keyed by channel name, so the keys are already
+            // one invalidation per downstream channel.
+            let names: Vec<String> = map.keys().cloned().collect();
             map.clear();
             (removed, names)
         };
@@ -1424,21 +1509,16 @@ impl ChannelCache {
         removed
     }
 
-    /// B6: drop every cache entry for an exact PV name. A PV may have
-    /// several entries (one per distinct downstream pvRequest); an
-    /// operator-driven drop targets the name, so all of them go.
-    /// Returns `true` if at least one entry was present and removed.
+    /// B6: drop the cached channel for an exact PV name, taking all its
+    /// pvRequest monitor variants with it (an operator-driven drop targets
+    /// the channel, so every variant under it goes). Returns `true` if the
+    /// channel was present and removed.
     ///
     /// On a removal, also publishes the name on the
     /// channel-invalidation stream so the matching downstream channel is
     /// force-disconnected (same rationale as [`Self::flush`]).
     pub async fn drop_entry(&self, pv_name: &str) -> bool {
-        let removed = {
-            let mut map = self.entries.lock().await;
-            let before = map.len();
-            map.retain(|k, _| k.pv_name != pv_name);
-            map.len() != before
-        };
+        let removed = self.entries.lock().await.remove(pv_name).is_some();
         if removed {
             self.publish_invalidation(std::iter::once(pv_name.to_string()));
         }
@@ -1452,6 +1532,16 @@ impl ChannelCache {
     /// exercised without a live upstream IOC.
     #[cfg(test)]
     pub(crate) async fn insert_test_entry(&self, pv_name: &str) {
+        // Default-fanout variant (empty pvRequest key).
+        self.insert_test_variant(pv_name, Vec::new()).await;
+    }
+
+    /// Test-only: insert a synthetic, parked monitor variant for `pv_name`
+    /// under the serialized-pvRequest key `req_key`, creating the channel
+    /// entry if absent. Lets accounting tests build a single channel with
+    /// several pvRequest variants without a live upstream IOC.
+    #[cfg(test)]
+    pub(crate) async fn insert_test_variant(&self, pv_name: &str, req_key: Vec<u8>) {
         let (tx, rx0) = broadcast::channel::<MonitorUpdate>(4);
         drop(rx0);
         let (tx_raw, rx0_raw) = broadcast::channel::<crate::pva_gateway::source::RawEvent>(4);
@@ -1468,13 +1558,13 @@ impl ChannelCache {
             drop_poke: parking_lot::Mutex::new(false),
             pause: PauseControl::new(),
         });
-        self.entries.lock().await.insert(
-            MonitorCacheKey {
-                pv_name: pv_name.to_string(),
-                pv_request: Vec::new(),
-            },
-            entry,
-        );
+        self.entries
+            .lock()
+            .await
+            .entry(pv_name.to_string())
+            .or_insert_with(ChannelEntry::new)
+            .monitors
+            .insert(req_key, entry);
     }
 }
 
@@ -2224,8 +2314,8 @@ mod tests {
         cache.insert_test_entry("A:PV").await;
         cache.insert_test_entry("B:PV").await;
 
-        assert_eq!(cache.flush().await, 2, "both entries removed");
-        // HashSet iteration order is unspecified, so sort before comparing.
+        assert_eq!(cache.flush().await, 2, "both channels removed");
+        // HashMap iteration order is unspecified, so sort before comparing.
         let mut got = vec![
             rx.try_recv().expect("first name published on flush"),
             rx.try_recv().expect("second name published on flush"),
@@ -2233,6 +2323,63 @@ mod tests {
         got.sort();
         assert_eq!(got, vec!["A:PV".to_string(), "B:PV".to_string()]);
         assert!(rx.try_recv().is_err(), "exactly two names, no more");
+    }
+
+    /// Regression R0604-BRPVAGW-MONITOR-VARIANT-CACHESIZE-1.
+    ///
+    /// One PV asked for under several distinct pvRequests is ONE cached
+    /// channel with several unique subscriptions — pva2pva keys the top-level
+    /// `ChannelCache::entries` by channel name and nests the per-pvRequest
+    /// monitors in `ChannelCacheEntry::mon_entries` (`chancache.h:108-125`).
+    /// `cacheSize` (`entry_count`), the admission cap, and `cleanerRemoved`
+    /// must therefore count CHANNELS, not monitor variants; the report row
+    /// surfaces the variant count separately as pva2pva's `<n>` unique
+    /// subscription(s) (`server.cpp:218,228`).
+    ///
+    /// Pre-fix the flat `(pv_name, pv_request)` map made all three of these
+    /// count variants, so this same PV reported `cacheSize=3`, ate three
+    /// admission slots, and bumped `cleanerRemoved` by three. By boundary:
+    /// one channel / three variants → entry_count==1, status row
+    /// subscriptions==3, drop removes the whole channel.
+    #[tokio::test]
+    async fn monitor_variants_count_as_one_channel() {
+        let client = Arc::new(PvaClient::builder().build());
+        let cache = ChannelCache::new(client, Duration::from_secs(60));
+        // Same PV name, three distinct serialized-pvRequest keys.
+        cache.insert_test_variant("VAR:PV", Vec::new()).await;
+        cache.insert_test_variant("VAR:PV", vec![1, 2, 3]).await;
+        cache.insert_test_variant("VAR:PV", vec![4, 5, 6]).await;
+        // …and an unrelated second channel.
+        cache.insert_test_entry("OTHER:PV").await;
+
+        // cacheSize counts channels: 2, not 4 monitor variants.
+        assert_eq!(
+            cache.entry_count().await,
+            2,
+            "cacheSize must count channels, not pvRequest variants"
+        );
+
+        // The status row for the multi-variant channel reports its three
+        // unique subscriptions, while the cache lists two channel rows.
+        let status = cache.entry_status(64).await;
+        assert_eq!(status.total, 2, "report total counts channels");
+        let var = status
+            .entries
+            .iter()
+            .find(|e| e.pv_name == "VAR:PV")
+            .expect("VAR:PV channel row present");
+        assert_eq!(
+            var.subscriptions, 3,
+            "channel row reports its unique-subscription (variant) count"
+        );
+
+        // Dropping the channel takes all three variants with it.
+        assert!(cache.drop_entry("VAR:PV").await, "channel was present");
+        assert_eq!(
+            cache.entry_count().await,
+            1,
+            "dropping a channel removes all its variants"
+        );
     }
 
     /// A cache with no invalidator wired (standalone, outside a server)

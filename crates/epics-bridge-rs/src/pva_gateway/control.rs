@@ -236,8 +236,8 @@ impl ControlSource {
                 ));
                 for e in &cache.entries {
                     out.push_str(&format!(
-                        "    {} connected={} subscribers={} dropPoke={}\n",
-                        e.pv_name, e.connected, e.subscribers, e.drop_poke
+                        "    {} connected={} subscribers={} subscriptions={} dropPoke={}\n",
+                        e.pv_name, e.connected, e.subscribers, e.subscriptions, e.drop_poke
                     ));
                 }
                 if cache.truncated > 0 {

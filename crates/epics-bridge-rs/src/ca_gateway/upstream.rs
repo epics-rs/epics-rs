@@ -46,6 +46,7 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use epics_base_rs::error::CaError;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::pv::{WriteContext, WriteHook};
+use epics_base_rs::server::snapshot::DbrClass;
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 use epics_ca_rs::client::{CaChannel, CaClient, EventWatcher, MonitorHandle};
 use epics_ca_rs::server::AccessRightsNotifier;
@@ -629,19 +630,27 @@ impl UpstreamManager {
         // In no-cache mode (C `-no_cache`), serve each downstream GET
         // from a FRESH upstream fetch instead of the shadow snapshot:
         // install a read hook that forwards to the shared upstream
-        // channel's `get()`. It captures the same `Arc<CaChannel>` the
-        // write hook reuses, so a GET costs one upstream get with no
-        // fresh CREATE_CHAN. The hook lands ATOMICALLY with registration
-        // (`add_pv_with_hooks_full`), closing the same CREATE_CHAN+READ
-        // race the write/access hooks close. Cached mode installs no read
-        // hook — GETs serve the monitor-fed shadow value as before.
-        // Mirrors `gateVc.cc:1361-1369` forwarding the read to the IOC.
+        // channel with a metadata-bearing `get_with_metadata(DbrClass::Time)`.
+        // C `-no_cache` reads issue `ca_array_get_callback(eventType(), ...)`
+        // with `eventType()` a `DBR_TIME_*` class, and `getTimeCB` decodes
+        // the event's status/severity/timestamp into `setEventData`
+        // (`gatePv.cc:976`, `:1789-1794`); requesting the `DBR_TIME_*`
+        // variant here makes the fresh value travel WITH its upstream
+        // alarm/timestamp, so the server read path never grafts a fresh
+        // value onto a stale/default shadow snapshot. It captures the same
+        // `Arc<CaChannel>` the write hook reuses, so a GET costs one
+        // upstream get with no fresh CREATE_CHAN. The hook lands ATOMICALLY
+        // with registration (`add_pv_with_hooks_full`), closing the same
+        // CREATE_CHAN+READ race the write/access hooks close. Cached mode
+        // installs no read hook — GETs serve the monitor-fed shadow value
+        // as before. Mirrors `gateVc.cc:1361-1369` forwarding the read to
+        // the IOC.
         let read_hook: Option<epics_base_rs::server::pv::ReadHook> =
             if self.cache_mode.is_no_cache() {
                 let ch = channel.clone();
                 Some(Arc::new(move || {
                     let ch = ch.clone();
-                    Box::pin(async move { ch.get().await.map(|(_dbf, v)| v) })
+                    Box::pin(async move { ch.get_with_metadata(DbrClass::Time).await })
                 }))
             } else {
                 None

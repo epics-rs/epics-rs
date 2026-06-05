@@ -170,6 +170,19 @@ pub type AccessHook = Arc<dyn Fn(&str, &str) -> AccessDecision + Send + Sync>;
 /// `ca_array_get_callback()` to the IOC (`gateVc.cc:1361-1369`) rather
 /// than returning `vc->eventData()`.
 ///
+/// The hook returns a full [`Snapshot`], not a bare value: C `-no_cache`
+/// reads issue `ca_array_get_callback(eventType(), ...)` with `eventType()`
+/// a `DBR_TIME_*` class, and `getTimeCB` decodes the event's status,
+/// severity, and timestamp into `setEventData` before the GET completes
+/// (`gatePv.cc:976`, `:1789-1794`). The hook therefore owns producing the
+/// fresh value *together with* its upstream alarm/timestamp so the read
+/// path never synthesizes metadata by grafting a fresh value onto an
+/// unrelated cached snapshot. Property metadata (display/control/enum) is
+/// not carried by a `DBR_TIME_*` event in either C or here; the consumer
+/// overlays the shadow's last-known property metadata for those fields
+/// (a separate upstream path feeds them, as C splits value/time from the
+/// property monitor).
+///
 /// The hook is async (it performs an upstream get) and fallible: on
 /// `Err` the server surfaces the failure to the client (`ECA_GETFAIL`)
 /// exactly as the IOC's own get-callback error would propagate. Only the
@@ -181,9 +194,9 @@ pub type AccessHook = Arc<dyn Fn(&str, &str) -> AccessDecision + Send + Sync>;
 /// `None` (the default) leaves the read path byte-for-byte unchanged for
 /// every record-backed and cached PV — the hook is purely additive.
 pub type ReadHook = Arc<
-    dyn Fn() -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<EpicsValue, CaError>> + Send>,
-        > + Send
+    dyn Fn()
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Snapshot, CaError>> + Send>>
+        + Send
         + Sync,
 >;
 
@@ -543,13 +556,15 @@ impl ProcessVariable {
     /// (`CA_PROTO_READ` / `CA_PROTO_READ_NOTIFY`).
     ///
     /// When a [`ReadHook`] is installed (the CA gateway's no-cache mode),
-    /// the value is fetched fresh through the hook and merged onto the
-    /// PV's current alarm / timestamp / shadow metadata; on hook error
-    /// the failure propagates so the server can answer `ECA_GETFAIL`,
+    /// the snapshot is fetched fresh through the hook — value *and* its
+    /// upstream alarm status/severity and IOC timestamp together — and the
+    /// shadow's last-known property metadata (display/control/enum) is
+    /// overlaid for the fields a `DBR_TIME_*` event does not carry; on hook
+    /// error the failure propagates so the server can answer `ECA_GETFAIL`,
     /// matching C ca-gateway forwarding each read to the IOC under
-    /// `-no_cache` (`gateVc.cc:1361-1369`). Without a hook this is exactly
-    /// [`Self::snapshot`] wrapped in `Ok`, so the GET path is unchanged
-    /// for every record-backed and cached PV.
+    /// `-no_cache` (`gateVc.cc:1361-1369`, `gatePv.cc:976`/`:1789-1794`).
+    /// Without a hook this is exactly [`Self::snapshot`] wrapped in `Ok`,
+    /// so the GET path is unchanged for every record-backed and cached PV.
     ///
     /// Only the GET path calls this; monitor fan-out, the initial monitor
     /// event, and access-rights re-posts keep using [`Self::snapshot`]
@@ -559,15 +574,20 @@ impl ProcessVariable {
     pub async fn read_snapshot(&self) -> Result<Snapshot, CaError> {
         match self.read_hook() {
             Some(hook) => {
-                // Fetch fresh upstream, then carry the value on the PV's
-                // current alarm/time/metadata. The upstream get returns a
-                // bare value (no alarm/time), so the shadow's last-known
-                // alarm/time is the best available stamp — the freshness
-                // guarantee is on the value, which is the point of
-                // no-cache.
-                let value = hook().await?;
-                let mut snap = self.snapshot().await;
-                snap.value = value;
+                // The hook issues a metadata-bearing upstream GET
+                // (`DbrClass::Time`), so the returned snapshot already
+                // carries the fresh value WITH its upstream alarm
+                // status/severity and IOC timestamp — mirroring C
+                // `getTimeCB` decoding the `DBR_TIME_*` event before
+                // `setEventData`. A `DBR_TIME_*` event does not carry
+                // display/control/enum metadata, so overlay the shadow's
+                // last-known property metadata for those absent fields only
+                // (a separate upstream path feeds it, exactly as C splits
+                // the value/time path from the property monitor). Never
+                // graft the fresh value onto the stored snapshot's
+                // alarm/time, which may be stale or the bare-PV default.
+                let mut snap = hook().await?;
+                self.apply_metadata(&mut snap);
                 Ok(snap)
             }
             None => Ok(self.snapshot().await),
@@ -1376,7 +1396,14 @@ mod read_hook_tests {
         // Stored shadow value is a sentinel the hook must override.
         pv.set(EpicsValue::Double(999.0)).await;
         pv.set_read_hook(Arc::new(|| {
-            Box::pin(async { Ok(EpicsValue::Double(42.0)) })
+            Box::pin(async {
+                Ok(Snapshot::new(
+                    EpicsValue::Double(42.0),
+                    0,
+                    0,
+                    std::time::UNIX_EPOCH,
+                ))
+            })
         }));
         let read = pv.read_snapshot().await.expect("hook returns Ok");
         assert_eq!(
@@ -1404,7 +1431,14 @@ mod read_hook_tests {
         let pv = pv();
         pv.set(EpicsValue::Double(7.0)).await;
         pv.set_read_hook(Arc::new(|| {
-            Box::pin(async { Ok(EpicsValue::Double(42.0)) })
+            Box::pin(async {
+                Ok(Snapshot::new(
+                    EpicsValue::Double(42.0),
+                    0,
+                    0,
+                    std::time::UNIX_EPOCH,
+                ))
+            })
         }));
         let snap = pv.snapshot().await;
         assert_eq!(
@@ -1414,8 +1448,9 @@ mod read_hook_tests {
         );
     }
 
-    /// Fresh value rides the PV's current alarm/time/metadata: the hook
-    /// supplies only the value; the shadow's installed metadata stays.
+    /// Fresh value + upstream alarm/time ride from the hook; the shadow's
+    /// installed *property* metadata (display/control/enum) — which a
+    /// `DBR_TIME_*` event does not carry — is overlaid for those fields.
     #[tokio::test]
     async fn read_snapshot_carries_shadow_metadata() {
         let pv = pv();
@@ -1428,14 +1463,65 @@ mod read_hook_tests {
             control: None,
             enums: None,
         });
-        pv.set_read_hook(Arc::new(|| Box::pin(async { Ok(EpicsValue::Double(5.0)) })));
+        // The hook returns a Time-class snapshot (value + alarm + time,
+        // no display/control/enum), exactly as `get_with_metadata(Time)`.
+        pv.set_read_hook(Arc::new(|| {
+            Box::pin(async {
+                Ok(Snapshot::new(
+                    EpicsValue::Double(5.0),
+                    0,
+                    0,
+                    std::time::UNIX_EPOCH,
+                ))
+            })
+        }));
         let read = pv.read_snapshot().await.expect("hook returns Ok");
         assert_eq!(read.value, EpicsValue::Double(5.0));
         assert_eq!(
             read.display
-                .expect("shadow metadata rides fresh value")
+                .expect("shadow property metadata rides fresh value")
                 .units,
             "mm"
+        );
+    }
+
+    /// Regression R0604-BRCAGW-NOCACHE-1.
+    ///
+    /// A no-cache GET must report the FRESH upstream alarm and timestamp
+    /// that travel with the value (C `getTimeCB` decodes the `DBR_TIME_*`
+    /// event's status/severity/time before `setEventData`,
+    /// `gatePv.cc:1789-1794`), NOT the shadow's last monitor-posted (or
+    /// bare-PV default) alarm/time. Before the fix the read hook returned
+    /// a bare value and `read_snapshot` grafted it onto the stored
+    /// snapshot, so the GET reported the new value with a stale or default
+    /// status/severity/timestamp.
+    #[tokio::test]
+    async fn read_snapshot_carries_upstream_alarm_not_shadow() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let pv = pv();
+        // The shadow's stored snapshot carries one alarm/time (a prior
+        // monitor post). Make it concrete and DIFFERENT from the upstream
+        // GET so a graft-onto-shadow regression is observable.
+        let shadow_time = UNIX_EPOCH + Duration::from_secs(1_000);
+        pv.set_snapshot(Snapshot::new(EpicsValue::Double(1.0), 7, 1, shadow_time))
+            .await;
+        // The fresh upstream GET reports a different value, alarm, and time.
+        let upstream_time = UNIX_EPOCH + Duration::from_secs(2_000);
+        pv.set_read_hook(Arc::new(move || {
+            Box::pin(
+                async move { Ok(Snapshot::new(EpicsValue::Double(5.0), 17, 2, upstream_time)) },
+            )
+        }));
+        let read = pv.read_snapshot().await.expect("hook returns Ok");
+        assert_eq!(read.value, EpicsValue::Double(5.0), "fresh upstream value");
+        assert_eq!(
+            read.alarm.status, 17,
+            "upstream alarm status, not shadow's 7"
+        );
+        assert_eq!(read.alarm.severity, 2, "upstream severity, not shadow's 1");
+        assert_eq!(
+            read.timestamp, upstream_time,
+            "upstream timestamp, not shadow's"
         );
     }
 }

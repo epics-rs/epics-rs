@@ -957,6 +957,7 @@ impl GatewayServer {
             let cache_mode = self.config.cache_mode;
             Some(tokio::spawn(async move {
                 use super::downstream::ConnEventRecv;
+                use epics_ca_rs::protocol::DBE_PROPERTY;
                 use epics_ca_rs::server::ServerConnectionEvent;
                 use std::collections::HashMap;
                 use std::collections::hash_map::DefaultHasher;
@@ -1027,15 +1028,25 @@ impl GatewayServer {
                             // any PV that hit zero monitor interest.
                             if let Some(monitors) = peer_monitors.remove(&addr) {
                                 for (pv_name, msid) in monitors {
-                                    let became_empty =
+                                    // Withdraw both interests by sid — the
+                                    // property removal is a no-op for a
+                                    // value-only subscription (see
+                                    // SubscriptionClosed).
+                                    let (became_empty, prop_became_empty) =
                                         match cache_for_conn.read().await.get(&pv_name) {
                                             Some(entry) => {
-                                                entry.write().await.remove_monitor_interest(msid)
+                                                let mut e = entry.write().await;
+                                                let v = e.remove_monitor_interest(msid);
+                                                let p = e.remove_property_interest(msid);
+                                                (v, p)
                                             }
-                                            None => false,
+                                            None => (false, false),
                                         };
                                     if became_empty {
                                         upstream_for_conn.release_monitor(&pv_name);
+                                    }
+                                    if prop_became_empty {
+                                        upstream_for_conn.release_prop_monitor(&pv_name);
                                     }
                                 }
                             }
@@ -1070,15 +1081,41 @@ impl GatewayServer {
                             peer,
                             pv_name,
                             sub_id,
+                            mask,
                         } => {
                             if cache_mode.is_no_cache() {
                                 let msid = synthetic_sid(peer, &pv_name, sub_id);
-                                let became_first = match cache_for_conn.read().await.get(&pv_name) {
-                                    Some(entry) => entry.write().await.add_monitor_interest(msid),
-                                    None => false,
-                                };
+                                // A DBE_PROPERTY subscription also satisfies
+                                // C `needPosting()`, so it enables BOTH the
+                                // value and the property monitor — add value
+                                // interest unconditionally, property interest
+                                // only when the property bit is set.
+                                let (became_first, prop_became_first) =
+                                    match cache_for_conn.read().await.get(&pv_name) {
+                                        Some(entry) => {
+                                            let mut e = entry.write().await;
+                                            let v = e.add_monitor_interest(msid);
+                                            // Mirrors C `getCB` [NO_CACHE]
+                                            // `propMonitor()` gate on
+                                            // `client_mask == DBE_PROPERTY`,
+                                            // set from the EVENT_ADD mask's
+                                            // DBE_PROPERTY bit
+                                            // (gateVc.cc:1222-1223,
+                                            // gatePv.cc:1749-1752).
+                                            let p = if mask & DBE_PROPERTY != 0 {
+                                                e.add_property_interest(msid)
+                                            } else {
+                                                false
+                                            };
+                                            (v, p)
+                                        }
+                                        None => (false, false),
+                                    };
                                 if became_first {
                                     upstream_for_conn.ensure_monitor(&pv_name);
+                                }
+                                if prop_became_first {
+                                    upstream_for_conn.ensure_prop_monitor(&pv_name);
                                 }
                                 peer_monitors.entry(peer).or_default().push((pv_name, msid));
                             }
@@ -1090,14 +1127,25 @@ impl GatewayServer {
                         } => {
                             if cache_mode.is_no_cache() {
                                 let msid = synthetic_sid(peer, &pv_name, sub_id);
-                                let became_empty = match cache_for_conn.read().await.get(&pv_name) {
-                                    Some(entry) => {
-                                        entry.write().await.remove_monitor_interest(msid)
-                                    }
-                                    None => false,
-                                };
+                                // Close carries no mask, so withdraw both
+                                // interests by sid — `remove_property_interest`
+                                // is a no-op for a value-only subscription
+                                // whose sid was never added to `prop_interest`.
+                                let (became_empty, prop_became_empty) =
+                                    match cache_for_conn.read().await.get(&pv_name) {
+                                        Some(entry) => {
+                                            let mut e = entry.write().await;
+                                            let v = e.remove_monitor_interest(msid);
+                                            let p = e.remove_property_interest(msid);
+                                            (v, p)
+                                        }
+                                        None => (false, false),
+                                    };
                                 if became_empty {
                                     upstream_for_conn.release_monitor(&pv_name);
+                                }
+                                if prop_became_empty {
+                                    upstream_for_conn.release_prop_monitor(&pv_name);
                                 }
                                 if let Some(monitors) = peer_monitors.get_mut(&peer) {
                                     monitors.retain(|(p, s)| !(p == &pv_name && *s == msid));

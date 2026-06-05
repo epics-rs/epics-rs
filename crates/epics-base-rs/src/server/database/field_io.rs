@@ -232,6 +232,54 @@ impl PvDatabase {
         Err(CaError::ChannelNotFound(name.to_string()))
     }
 
+    /// Install upstream `DBR_CTRL_*` metadata (display / control limits,
+    /// enum labels) on a shadow simple PV WITHOUT posting an event.
+    ///
+    /// The CA gateway calls this once on upstream connect, after its initial
+    /// `DBR_CTRL_*` get, so a later downstream `DBR_CTRL_*` / `DBR_GR_*` read
+    /// returns the real limits instead of zeroed ones. No `DBE_PROPERTY`
+    /// monitor event fires — nothing has *changed* yet, this only seeds the
+    /// attribute cache. Mirrors C `gatePvData::getCB` → `runDataCB` →
+    /// `vc->setPvData(dd)` (`gatePv.cc:1693-1695`), which seeds the property
+    /// cache from the initial control get in both cache modes before any
+    /// monitor is enabled.
+    ///
+    /// Returns `ChannelNotFound` for record-backed PVs — those own their own
+    /// metadata via record processing and are not gateway shadow PVs.
+    pub async fn set_pv_metadata(&self, name: &str, snapshot: &Snapshot) -> CaResult<()> {
+        if let Some(pv) = self.inner.simple_pvs.read().await.get(name).cloned() {
+            pv.set_metadata(metadata_from_snapshot(snapshot));
+            return Ok(());
+        }
+        Err(CaError::ChannelNotFound(name.to_string()))
+    }
+
+    /// Refresh a shadow simple PV's upstream metadata AND post a
+    /// `DBE_PROPERTY` monitor event carrying `snapshot` to downstream
+    /// property subscribers.
+    ///
+    /// `snapshot` is the decoded upstream `DBR_CTRL_*` property event: it
+    /// carries the control value and the upstream `status` / `severity`,
+    /// and (because control DBR structs carry no timestamp) an undefined
+    /// timestamp the caller must NOT replace with a fresh wall-clock. The
+    /// gateway's property monitor calls this on every upstream
+    /// `DBE_PROPERTY` event, mirroring C `gatePvData::propEventCB` →
+    /// `runDataCB` + `setPvData` + `runValueDataCB` +
+    /// `vcPostEvent(propertyEventMask())` (`gatePv.cc:1571-1607`): the
+    /// attribute cache is refreshed and a property event is posted with the
+    /// upstream alarm state preserved (`setStatSevr`) and the undefined
+    /// control-DBR timestamp left as-is (`gatePv.cc:1594-1595`).
+    ///
+    /// Returns `ChannelNotFound` for record-backed PVs.
+    pub async fn post_pv_property(&self, name: &str, snapshot: Snapshot) -> CaResult<()> {
+        if let Some(pv) = self.inner.simple_pvs.read().await.get(name).cloned() {
+            pv.set_metadata(metadata_from_snapshot(&snapshot));
+            pv.post_property(snapshot).await;
+            return Ok(());
+        }
+        Err(CaError::ChannelNotFound(name.to_string()))
+    }
+
     /// Like `put_pv_and_post` but with explicit origin tag.
     pub async fn put_pv_and_post_with_origin(
         &self,
@@ -930,6 +978,21 @@ impl PvDatabase {
     }
 }
 
+/// Project a decoded `DBR_CTRL_*` / `DBR_GR_*` snapshot's metadata fields
+/// (display / control limits, enum labels) into the shadow-PV
+/// [`PvMetadata`](crate::server::pv::PvMetadata) the CA gateway installs.
+/// A non-metadata (TIME/STS) snapshot carries `None` in all three, which
+/// clears the shadow metadata — but the gateway only ever feeds this a
+/// control-class snapshot, matching C `setPvData` replacing the attribute
+/// gdd wholesale from the control get/event.
+fn metadata_from_snapshot(snapshot: &Snapshot) -> crate::server::pv::PvMetadata {
+    crate::server::pv::PvMetadata {
+        display: snapshot.display.clone(),
+        control: snapshot.control.clone(),
+        enums: snapshot.enums.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::PvDatabase;
@@ -998,6 +1061,153 @@ mod tests {
             .unwrap();
         let v = db.get_pv("ALT.VAL").await.unwrap();
         assert!(matches!(v, EpicsValue::Double(x) if x == 13.0));
+    }
+
+    /// Regression R0604-BRCAGW-PROP-1.
+    ///
+    /// `set_pv_metadata` installs the upstream `DBR_CTRL_*` metadata on a
+    /// shadow simple PV WITHOUT posting any event (the CA gateway's
+    /// connect-time seed). A later GET-class read must then see the
+    /// installed limits/units, and a `DBE_PROPERTY` subscriber must NOT
+    /// have received anything (nothing *changed* yet). An unknown / record
+    /// name is rejected with `ChannelNotFound`.
+    #[tokio::test]
+    async fn set_pv_metadata_installs_without_posting() {
+        use crate::error::CaError;
+        use crate::server::snapshot::{DisplayInfo, Snapshot};
+        use crate::types::DbFieldType;
+        use std::time::SystemTime;
+
+        let db = PvDatabase::new();
+        db.add_pv("gw:meta", EpicsValue::Double(0.0)).await.unwrap();
+
+        // A DBE_PROPERTY subscriber attached BEFORE the seed — it must stay
+        // empty, because seeding metadata is not a property *change*.
+        const DBE_PROPERTY: u16 = 8;
+        let pv = db.find_pv("gw:meta").await.expect("PV exists");
+        let mut prop_rx = pv
+            .add_subscriber(1, DbFieldType::Double, DBE_PROPERTY)
+            .await
+            .expect("subscriber added");
+
+        // Build a CTRL-class snapshot carrying display metadata.
+        let mut ctrl = Snapshot::new(EpicsValue::Double(0.0), 0, 0, SystemTime::UNIX_EPOCH);
+        ctrl.display = Some(DisplayInfo {
+            units: "mm".into(),
+            precision: 3,
+            upper_disp_limit: 10.0,
+            lower_disp_limit: -10.0,
+            ..Default::default()
+        });
+
+        db.set_pv_metadata("gw:meta", &ctrl)
+            .await
+            .expect("simple PV set_pv_metadata must succeed");
+
+        // The metadata landed on the shadow PV.
+        let installed = pv.metadata();
+        assert_eq!(
+            installed.display.expect("display metadata installed").units,
+            "mm"
+        );
+
+        // No event was posted (seed != change).
+        assert!(
+            prop_rx.try_recv().is_err(),
+            "set_pv_metadata must not post a DBE_PROPERTY event"
+        );
+
+        // Unknown / non-simple PV is rejected.
+        assert!(matches!(
+            db.set_pv_metadata("no:such:pv", &ctrl).await,
+            Err(CaError::ChannelNotFound(_))
+        ));
+    }
+
+    /// Regression R0604-BRCAGW-PROP-1.
+    ///
+    /// `post_pv_property` refreshes the shadow metadata AND posts a
+    /// `DBE_PROPERTY` event carrying the supplied snapshot's metadata,
+    /// upstream status/severity, and (undefined control-DBR) timestamp — to
+    /// `DBE_PROPERTY` subscribers only. This is the DB-routing layer the
+    /// gateway's property monitor drives on every upstream `DBE_PROPERTY`
+    /// event. An unknown / record name is rejected with `ChannelNotFound`.
+    #[tokio::test]
+    async fn post_pv_property_refreshes_and_posts_property_event() {
+        use crate::error::CaError;
+        use crate::server::snapshot::{DisplayInfo, Snapshot};
+        use crate::types::DbFieldType;
+        use std::time::{Duration, SystemTime};
+
+        const DBE_PROPERTY: u16 = 8;
+        const DBE_VALUE: u16 = 1;
+        const MAJOR: u16 = 2;
+        const HIGH: u16 = 3;
+
+        let db = PvDatabase::new();
+        db.add_pv("gw:prop", EpicsValue::Double(0.0)).await.unwrap();
+        let pv = db.find_pv("gw:prop").await.expect("PV exists");
+
+        let mut prop_rx = pv
+            .add_subscriber(1, DbFieldType::Double, DBE_PROPERTY)
+            .await
+            .expect("property subscriber added");
+        let mut val_rx = pv
+            .add_subscriber(2, DbFieldType::Double, DBE_VALUE)
+            .await
+            .expect("value subscriber added");
+
+        // Upstream CTRL event: metadata + MAJOR/HIGH alarm + a fixed past
+        // timestamp that is unmistakably not a fresh wall clock.
+        let upstream_ts = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let mut ctrl = Snapshot::new(EpicsValue::Double(5.0), HIGH, MAJOR, upstream_ts);
+        ctrl.display = Some(DisplayInfo {
+            units: "V".into(),
+            precision: 1,
+            ..Default::default()
+        });
+
+        db.post_pv_property("gw:prop", ctrl)
+            .await
+            .expect("simple PV post_pv_property must succeed");
+
+        // The metadata was refreshed on the shadow PV.
+        assert_eq!(
+            pv.metadata().display.expect("metadata refreshed").units,
+            "V"
+        );
+
+        // The DBE_PROPERTY subscriber received the metadata-bearing event,
+        // with the upstream alarm and timestamp preserved.
+        let ev = prop_rx
+            .try_recv()
+            .expect("DBE_PROPERTY subscriber receives the property event");
+        assert_eq!(
+            ev.snapshot.display.expect("event carries metadata").units,
+            "V"
+        );
+        assert_eq!(
+            ev.snapshot.alarm.severity, MAJOR,
+            "upstream severity preserved"
+        );
+        assert_eq!(ev.snapshot.alarm.status, HIGH, "upstream status preserved");
+        assert_eq!(
+            ev.snapshot.timestamp, upstream_ts,
+            "control-DBR timestamp preserved, not a fresh wall clock"
+        );
+
+        // The DBE_VALUE-only subscriber must NOT receive a property event.
+        assert!(
+            val_rx.try_recv().is_err(),
+            "DBE_VALUE-only subscriber must not receive a property post"
+        );
+
+        // Unknown / non-simple PV is rejected.
+        let again = Snapshot::new(EpicsValue::Double(0.0), 0, 0, SystemTime::UNIX_EPOCH);
+        assert!(matches!(
+            db.post_pv_property("no:such:pv", again).await,
+            Err(CaError::ChannelNotFound(_))
+        ));
     }
 
     /// Regression: `put_record_field_from_ca` (the CA

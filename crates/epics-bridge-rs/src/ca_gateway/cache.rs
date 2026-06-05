@@ -87,6 +87,17 @@ pub struct GwPvEntry {
     /// `vc->needPosting()` gating `pv->monitor()` under `-no_cache`
     /// (`gatePv.cc:1737-1753`).
     pub monitor_interest: Vec<u32>,
+    /// Synthetic IDs of downstream clients with an open `DBE_PROPERTY`
+    /// monitor on this PV — a subset of [`Self::monitor_interest`] (a
+    /// downstream monitor may select value-only, property-only, or both).
+    /// Drives the no-cache lazy upstream *property* monitor independently
+    /// of the value monitor: the upstream property subscription exists
+    /// only while this is non-empty. Empty (and unused) in
+    /// [`CacheMode::Cached`](super::server::CacheMode::Cached), where the
+    /// property monitor is always present. Mirrors C ca-gateway gating
+    /// `pv->propMonitor()` on `vc->needPosting() && client_mask ==
+    /// DBE_PROPERTY` under `-no_cache` (`gatePv.cc:1749-1752`).
+    pub prop_interest: Vec<u32>,
     /// When the current state was entered. Used by cleanup to evict
     /// PVs that have been Inactive/Dead/Disconnect for too long.
     pub state_since: Instant,
@@ -110,6 +121,7 @@ impl GwPvEntry {
             cached: None,
             subscribers: Vec::new(),
             monitor_interest: Vec::new(),
+            prop_interest: Vec::new(),
             state_since: Instant::now(),
             event_count: 0,
             total_alive: Duration::ZERO,
@@ -186,6 +198,38 @@ impl GwPvEntry {
     /// How many downstream monitors are currently open on this PV.
     pub fn monitor_interest_count(&self) -> usize {
         self.monitor_interest.len()
+    }
+
+    /// Record a downstream `DBE_PROPERTY` monitor (`EVENT_ADD` with the
+    /// property select bit) opening on this PV. Returns `true` when this is
+    /// the *first* property monitor — the no-cache owner uses that edge to
+    /// create the upstream property monitor. No-op (returns `false`) if
+    /// `sid` is already counted, so a duplicate/replayed event cannot
+    /// double-create the upstream property subscription.
+    pub fn add_property_interest(&mut self, sid: u32) -> bool {
+        if self.prop_interest.contains(&sid) {
+            return false;
+        }
+        let was_empty = self.prop_interest.is_empty();
+        self.prop_interest.push(sid);
+        was_empty
+    }
+
+    /// Record a downstream `DBE_PROPERTY` monitor closing on this PV.
+    /// Returns `true` when this was the *last* property monitor — the
+    /// no-cache owner uses that edge to drop the upstream property monitor.
+    /// No-op (returns `false`) if `sid` was not counted (e.g. a value-only
+    /// monitor closing), so an unconditional call on every subscription
+    /// close is safe.
+    pub fn remove_property_interest(&mut self, sid: u32) -> bool {
+        let before = self.prop_interest.len();
+        self.prop_interest.retain(|s| *s != sid);
+        before != self.prop_interest.len() && self.prop_interest.is_empty()
+    }
+
+    /// How many downstream `DBE_PROPERTY` monitors are open on this PV.
+    pub fn property_interest_count(&self) -> usize {
+        self.prop_interest.len()
     }
 
     /// Update cached snapshot from a new upstream event.
@@ -508,6 +552,130 @@ mod tests {
             !e.remove_monitor_interest(2),
             "removing from an empty set is a no-op"
         );
+    }
+
+    /// Regression R0604-BRCAGW-PROP-1.
+    ///
+    /// `add_property_interest` returns `true` only on the empty→first edge;
+    /// `remove_property_interest` returns `true` only on the last→empty
+    /// edge. These two booleans are what the no-cache owner uses to create
+    /// and drop the upstream DBE_PROPERTY monitor exactly once. Boundary
+    /// values are enumerated, not narrated.
+    #[test]
+    fn property_interest_edge_transitions() {
+        let mut e = GwPvEntry::new_connecting("TEMP");
+        assert_eq!(e.property_interest_count(), 0);
+
+        // empty → first: became-first edge fires (create the prop monitor)
+        assert!(
+            e.add_property_interest(1),
+            "first DBE_PROPERTY monitor is the create edge"
+        );
+        assert_eq!(e.property_interest_count(), 1);
+
+        // first → second: no edge
+        assert!(
+            !e.add_property_interest(2),
+            "second property monitor must not re-fire the create edge"
+        );
+        assert_eq!(e.property_interest_count(), 2);
+
+        // duplicate add: no-op, no edge
+        assert!(
+            !e.add_property_interest(2),
+            "duplicate sid cannot double-create the upstream property monitor"
+        );
+        assert_eq!(e.property_interest_count(), 2);
+
+        // second → first: not the last, no drop edge
+        assert!(
+            !e.remove_property_interest(1),
+            "removing one of two property monitors must not fire the drop edge"
+        );
+        assert_eq!(e.property_interest_count(), 1);
+
+        // remove uncounted sid: no-op, no edge
+        assert!(
+            !e.remove_property_interest(999),
+            "removing an uncounted sid is a no-op"
+        );
+        assert_eq!(e.property_interest_count(), 1);
+
+        // first → empty: last→empty edge fires (drop the prop monitor)
+        assert!(
+            e.remove_property_interest(2),
+            "removing the last property monitor is the drop edge"
+        );
+        assert_eq!(e.property_interest_count(), 0);
+
+        // remove from empty: no-op, no edge
+        assert!(
+            !e.remove_property_interest(2),
+            "removing from an empty set is a no-op"
+        );
+    }
+
+    /// Regression R0604-BRCAGW-PROP-1.
+    ///
+    /// Value interest and property interest are independent refcounts: a
+    /// value-only subscription (no DBE_PROPERTY bit) never adds to
+    /// `prop_interest`, so `remove_property_interest` on its sid at close is
+    /// a no-op edge — this is what lets `SubscriptionClosed`/`Disconnected`
+    /// withdraw property interest unconditionally without spuriously
+    /// dropping the upstream property monitor. Conversely a property
+    /// subscription adds to BOTH (a DBE_PROPERTY EVENT_ADD also satisfies C
+    /// `needPosting()`, gatePv.cc:1737/1749).
+    #[test]
+    fn value_and_property_interest_are_independent() {
+        let mut e = GwPvEntry::new_connecting("TEMP");
+
+        // A value-only subscription: value interest only.
+        assert!(e.add_monitor_interest(10));
+        assert_eq!(e.monitor_interest_count(), 1);
+        assert_eq!(
+            e.property_interest_count(),
+            0,
+            "a value-only subscription must not touch property interest"
+        );
+
+        // Withdrawing property interest for that value-only sid is a no-op
+        // edge — never fires the prop-monitor drop.
+        assert!(
+            !e.remove_property_interest(10),
+            "withdrawing property interest for a value-only sid must not fire the drop edge"
+        );
+
+        // A property subscription adds to both interests. Its value
+        // interest is the second value sid (10 already present), so it is
+        // NOT the value-monitor create edge; its property interest IS the
+        // prop-monitor create edge (first property sid).
+        assert!(
+            !e.add_monitor_interest(20),
+            "second value interest must not re-fire the value-monitor create edge"
+        );
+        assert!(
+            e.add_property_interest(20),
+            "first property subscription is the prop-monitor create edge"
+        );
+        assert_eq!(e.monitor_interest_count(), 2);
+        assert_eq!(e.property_interest_count(), 1);
+
+        // Closing the value-only sid drops neither to empty.
+        assert!(!e.remove_monitor_interest(10));
+        assert_eq!(e.monitor_interest_count(), 1);
+
+        // Closing the property sid: value interest hits empty (drop value
+        // monitor) AND property interest hits empty (drop prop monitor).
+        assert!(
+            e.remove_monitor_interest(20),
+            "removing the last value interest is the value-monitor drop edge"
+        );
+        assert!(
+            e.remove_property_interest(20),
+            "removing the last property interest is the prop-monitor drop edge"
+        );
+        assert_eq!(e.monitor_interest_count(), 0);
+        assert_eq!(e.property_interest_count(), 0);
     }
 
     #[test]

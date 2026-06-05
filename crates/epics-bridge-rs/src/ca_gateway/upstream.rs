@@ -49,6 +49,7 @@ use epics_base_rs::server::pv::{WriteContext, WriteHook};
 use epics_base_rs::server::snapshot::DbrClass;
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 use epics_ca_rs::client::{CaChannel, CaClient, EventWatcher, MonitorHandle};
+use epics_ca_rs::protocol::DBE_PROPERTY;
 use epics_ca_rs::server::AccessRightsNotifier;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
@@ -149,6 +150,18 @@ struct UpstreamSubscription {
     /// served via the shadow PV's read hook (fresh upstream fetch), no
     /// persistent subscription needed.
     task: Option<JoinHandle<()>>,
+    /// The property-monitor-forwarding task — the distinct upstream
+    /// `DBE_PROPERTY` subscription that refreshes the shadow PV's
+    /// display/control/enum metadata and fans `DBE_PROPERTY` events out
+    /// downstream. `Some` whenever it is live: always in
+    /// [`CacheMode::Cached`] (spawned eagerly alongside [`Self::task`]),
+    /// and in [`CacheMode::NoCache`] only while ≥1 downstream client holds
+    /// a `DBE_PROPERTY` monitor (created by
+    /// [`UpstreamManager::ensure_prop_monitor`], torn down by
+    /// [`UpstreamManager::release_prop_monitor`]). `None` otherwise.
+    /// Mirrors C ca-gateway's separate `pv->propMonitor()`
+    /// (`gatePv.cc:1705`, `:1749-1752`).
+    prop_task: Option<JoinHandle<()>>,
     /// Live `.pvlist` ASG/ASL for this shadow PV, shared by-`Arc` with
     /// the read and write hook closures so a `AS`/`PVL` reload can swap
     /// the group/level in place. Replaces the previous by-value
@@ -672,6 +685,50 @@ impl UpstreamManager {
             )));
         }
 
+        // Seed the shadow PV's DBR_CTRL_* metadata from an initial control
+        // get so a downstream DBR_CTRL_*/DBR_GR_* read returns the real
+        // units / precision / limits / enum-labels instead of zeroed ones —
+        // even before any property *change* occurs. Best-effort and bounded
+        // (500 ms): a slow or denied metadata read must not fail the
+        // subscription, since the value path is already wired above and a
+        // later property event will refresh it. Mirrors C `gatePvData::getCB`
+        // decoding the initial control get through `runDataCB` →
+        // `vc->setPvData(dd)` in BOTH cache modes (gatePv.cc:1689-1696),
+        // before any monitor is enabled; the DBE_PROPERTY monitor handled
+        // below keeps it refreshed on later upstream metadata changes.
+        match tokio::time::timeout(
+            Duration::from_millis(500),
+            channel.get_with_metadata(DbrClass::Ctrl),
+        )
+        .await
+        {
+            Ok(Ok(meta_snap)) => {
+                if let Err(e) = self
+                    .shadow_db
+                    .set_pv_metadata(served_name, &meta_snap)
+                    .await
+                {
+                    tracing::debug!(
+                        pv = upstream_name,
+                        served = served_name,
+                        error = %e,
+                        "ca-gateway-rs: initial CTRL metadata seed skipped"
+                    );
+                }
+            }
+            Ok(Err(e)) => tracing::info!(
+                pv = upstream_name,
+                error = %e,
+                "ca-gateway-rs: initial CTRL metadata get failed; shadow \
+                 metadata stays empty until an upstream property event"
+            ),
+            Err(_) => tracing::info!(
+                pv = upstream_name,
+                "ca-gateway-rs: initial CTRL metadata get timed out; shadow \
+                 metadata stays empty until an upstream property event"
+            ),
+        }
+
         // Subscribe the persistent upstream monitor — CACHED mode only.
         //
         // Cached: subscribe now. Autosize (wire count=0) + the configured
@@ -745,6 +802,19 @@ impl UpstreamManager {
         let task = initial_monitor
             .map(|monitor| self.spawn_forward_task(served_name, channel.clone(), Some(monitor)));
 
+        // Property monitor: CACHED spawns it eagerly alongside the value
+        // monitor (C `getCB` [CACHE] enables `propMonitor()` unconditionally,
+        // gatePv.cc:1705). NO-CACHE leaves it `None` here —
+        // `ensure_prop_monitor` creates it lazily on the first downstream
+        // DBE_PROPERTY monitor, matching C `getCB` [NO_CACHE] gating
+        // `propMonitor()` on `needPosting() && client_mask == DBE_PROPERTY`
+        // (gatePv.cc:1749-1752).
+        let prop_task = if self.cache_mode.is_no_cache() {
+            None
+        } else {
+            Some(self.spawn_prop_forward_task(served_name, channel.clone()))
+        };
+
         // subscription dedup keys on `served_name` so a
         // repeat search for the same alias is a no-op (fast path above)
         // and a `.pvlist` reload prunes by the served name it admits.
@@ -753,6 +823,7 @@ impl UpstreamManager {
             UpstreamSubscription {
                 channel,
                 task,
+                prop_task,
                 acl,
                 _access_rights_watcher: access_rights_watcher,
             },
@@ -943,6 +1014,125 @@ impl UpstreamManager {
         })
     }
 
+    /// Spawn the upstream property-monitor-forwarding task for
+    /// `served_name` — the distinct `DBE_PROPERTY` subscription that keeps
+    /// the shadow PV's display/control/enum metadata in step with upstream
+    /// and fans property events out to downstream DBE_PROPERTY monitors.
+    ///
+    /// The subscription requests the `DBE_PROPERTY` mask (autosize count=0)
+    /// and acts purely as a *trigger*: its delivered payload is the value
+    /// type and carries no metadata, so each event drives a fresh
+    /// `get_with_metadata(DbrClass::Ctrl)` to read the new
+    /// limits/precision/enum-labels. DBE_PROPERTY events are rare (metadata
+    /// seldom changes), so the extra control get per event is cheap. The
+    /// decoded CTRL snapshot carries the upstream status/severity and an
+    /// undefined (control-DBR) timestamp; `post_pv_property` refreshes the
+    /// shadow metadata and posts that snapshot to downstream property
+    /// subscribers WITHOUT inventing a wall-clock time. Mirrors C
+    /// `gatePvData::propEventCB` (gatePv.cc:1534-1607): the very first event
+    /// is ignored — it is the subscription's initial-state confirmation, not
+    /// a change (C `propGetPending()` / `markPropNoGetPending`,
+    /// gatePv.cc:1564-1568), and the initial metadata already came from the
+    /// connect-time control get in `ensure_subscribed`. Every later event
+    /// (including a reconnect's initial event, which may carry metadata that
+    /// changed during the outage) refreshes `setPvData` and posts
+    /// `propertyEventMask()`.
+    ///
+    /// Re-subscribes with exponential backoff on upstream disconnect, exits
+    /// cleanly on `CaError::Shutdown` or cache eviction, and changes no
+    /// external truth (aborting only drops the in-memory monitor stream and
+    /// leaves the last-installed metadata in place), so
+    /// `release_prop_monitor` may abort the returned handle with no
+    /// finalizer — symmetric to `spawn_forward_task`. Unlike the value task
+    /// it surfaces no disconnect alarm: the value task already owns the
+    /// downstream disconnect signal; this task only re-arms its metadata
+    /// stream.
+    fn spawn_prop_forward_task(
+        &self,
+        served_name: &str,
+        channel: Arc<CaChannel>,
+    ) -> JoinHandle<()> {
+        let cache_clone = self.cache.clone();
+        let db_clone = self.shadow_db.clone();
+        let name = served_name.to_string();
+        tokio::spawn(async move {
+            let mut backoff = Duration::from_millis(250);
+            let max_backoff = Duration::from_secs(30);
+            // The very first event of the FIRST subscription is the
+            // initial-state confirmation; the connect-time control get
+            // already seeded metadata, so skip it (C ignore-first-propEvent,
+            // gatePv.cc:1564-1568). Tracked across reconnects so a
+            // reconnect's initial event DOES refresh — it may carry metadata
+            // that changed while upstream was gone.
+            let mut first_event_seen = false;
+            loop {
+                let mut monitor = match channel
+                    .subscribe_with_mask_autosize(0.0, DBE_PROPERTY)
+                    .await
+                {
+                    Ok(m) => m,
+                    // Coordinator gone — retrying would spin forever; exit.
+                    Err(CaError::Shutdown) => {
+                        tracing::debug!(
+                            pv = %name,
+                            "ca-gateway-rs: CA coordinator gone, \
+                             stopping upstream property monitor task"
+                        );
+                        return;
+                    }
+                    Err(_) => {
+                        if cache_clone.read().await.get(&name).is_none() {
+                            return;
+                        }
+                        tokio::time::sleep(backoff).await;
+                        backoff = std::cmp::min(backoff * 2, max_backoff);
+                        continue;
+                    }
+                };
+                while let Some(result) = monitor.recv().await {
+                    // The trigger payload is discarded; a decode error is a
+                    // missed trigger, not fatal.
+                    if result.is_err() {
+                        continue;
+                    }
+                    if !first_event_seen {
+                        first_event_seen = true;
+                        continue;
+                    }
+                    // A property change fired: re-read the full control
+                    // metadata (units/precision/limits/enum-labels + upstream
+                    // status/severity) and refresh + fan out downstream.
+                    match channel.get_with_metadata(DbrClass::Ctrl).await {
+                        Ok(meta_snap) => {
+                            if let Err(e) = db_clone.post_pv_property(&name, meta_snap).await {
+                                tracing::debug!(
+                                    pv = %name,
+                                    error = %e,
+                                    "ca-gateway-rs: shadow post_pv_property failed"
+                                );
+                            }
+                        }
+                        Err(e) => tracing::debug!(
+                            pv = %name,
+                            error = %e,
+                            "ca-gateway-rs: property-event CTRL get failed; \
+                             shadow metadata not refreshed this event"
+                        ),
+                    }
+                    backoff = Duration::from_millis(250);
+                }
+                // Subscription closed (upstream disconnect). Back off, then
+                // the top of the loop re-subscribes. Bail if the cache entry
+                // was evicted (nobody cares anymore).
+                tokio::time::sleep(backoff).await;
+                backoff = std::cmp::min(backoff * 2, max_backoff);
+                if cache_clone.read().await.get(&name).is_none() {
+                    return;
+                }
+            }
+        })
+    }
+
     /// No-cache: ensure the upstream monitor for `served_name` is live.
     ///
     /// Called by the connection-event owner when the FIRST downstream
@@ -1004,6 +1194,61 @@ impl UpstreamManager {
         }
     }
 
+    /// No-cache: ensure the upstream property monitor for `served_name` is
+    /// live.
+    ///
+    /// Called by the connection-event owner when the FIRST downstream
+    /// client opens a `DBE_PROPERTY` monitor (`EVENT_ADD` with
+    /// `mask & DBE_PROPERTY`) on this PV. Spawns the property-forwarding
+    /// task iff none currently runs. Idempotent. No-op in
+    /// [`CacheMode::Cached`] — there the property monitor is created
+    /// eagerly at `ensure_subscribed`, so it is always present. Mirrors C
+    /// no-cache `getCB`/`propEventCB` enabling `propMonitor()` only on
+    /// `needPosting() && client_mask == DBE_PROPERTY` (gatePv.cc:1749-1752).
+    pub fn ensure_prop_monitor(&self, served_name: &str) {
+        if !self.cache_mode.is_no_cache() {
+            return;
+        }
+        let channel = {
+            let subs = self.subs.lock();
+            match subs.get(served_name) {
+                Some(sub) if sub.prop_task.is_none() => sub.channel.clone(),
+                // No subscription (evicted) or a prop task already runs.
+                _ => return,
+            }
+        };
+        let handle = self.spawn_prop_forward_task(served_name, channel);
+        let mut subs = self.subs.lock();
+        match subs.get_mut(served_name) {
+            // Re-check: another caller may have raced a prop task in, or the
+            // subscription may have been evicted, while we spawned.
+            Some(sub) if sub.prop_task.is_none() => sub.prop_task = Some(handle),
+            _ => handle.abort(),
+        }
+    }
+
+    /// No-cache: drop the upstream property monitor for `served_name`.
+    ///
+    /// Called by the connection-event owner when the LAST downstream
+    /// `DBE_PROPERTY` monitor on this PV closes. Aborts the
+    /// property-forwarding task; the shadow PV's last-installed metadata
+    /// stays in place. Idempotent: a no-op if no prop task is running. No-op
+    /// in [`CacheMode::Cached`] — the persistent property monitor must
+    /// outlive any single downstream subscriber.
+    pub fn release_prop_monitor(&self, served_name: &str) {
+        if !self.cache_mode.is_no_cache() {
+            return;
+        }
+        let task = self
+            .subs
+            .lock()
+            .get_mut(served_name)
+            .and_then(|sub| sub.prop_task.take());
+        if let Some(task) = task {
+            task.abort();
+        }
+    }
+
     /// Remove an upstream subscription and abort its task. Also
     /// drops the corresponding shadow PV from the database so its
     /// (now-stale) `WriteHook` — which captures the soon-to-be-aborted
@@ -1017,10 +1262,13 @@ impl UpstreamManager {
     /// pass the served name they read from the cache / subs map.
     pub async fn unsubscribe(&self, served_name: &str) {
         let removed = self.subs.lock().remove(served_name);
-        if let Some(sub) = removed
-            && let Some(task) = sub.task
-        {
-            task.abort();
+        if let Some(sub) = removed {
+            if let Some(task) = sub.task {
+                task.abort();
+            }
+            if let Some(prop_task) = sub.prop_task {
+                prop_task.abort();
+            }
         }
         // Best-effort: if the PV is gone already (concurrent reload
         // path) `remove_simple_pv` returns None; we don't care.

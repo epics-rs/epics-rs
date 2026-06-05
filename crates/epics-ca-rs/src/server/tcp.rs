@@ -166,10 +166,18 @@ pub enum ServerConnectionEvent {
     /// `CA_PROTO_EVENT_ADD` accepted; a new subscription is live.
     /// Drives `ServerStats::subscriptions_opened_total` (PR #592's
     /// `caServerSubscriptionCount`).
+    ///
+    /// `mask` is the validated `DBE_*` event-select mask the client
+    /// requested (`1..=255`). The CA gateway consults `mask & DBE_PROPERTY`
+    /// to decide, in no-cache mode, whether to spawn the upstream property
+    /// monitor for this PV — mirroring C ca-gateway gating `propMonitor()`
+    /// on `needPosting() && client_mask == DBE_PROPERTY`
+    /// (`gatePv.cc:1749-1752`).
     SubscriptionOpened {
         peer: SocketAddr,
         pv_name: String,
         sub_id: u32,
+        mask: u16,
     },
     /// `CA_PROTO_EVENT_CANCEL` or channel teardown closed a
     /// subscription. Drives `ServerStats::subscriptions_closed_total`.
@@ -3716,6 +3724,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 peer,
                                 pv_name: sub_pv_name.clone(),
                                 sub_id,
+                                mask,
                             });
                         }
                     }
@@ -4026,6 +4035,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 peer,
                                 pv_name: sub_pv_name.clone(),
                                 sub_id,
+                                mask,
                             });
                         }
                     }

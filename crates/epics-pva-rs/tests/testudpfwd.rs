@@ -137,6 +137,117 @@ fn mshim_forwards_search_and_drops_unrecognized() {
     }
 }
 
+/// Regression R0604-MSHIM-CHAINED-UDP-FORWARD-1.
+///
+/// A single received datagram that chains two SEARCHes (`A || B`) must be
+/// forwarded as ONLY the first rebuilt message — pvxs
+/// `UDPCollector::process_one` decodes one PVA header per datagram and
+/// ignores the tail (udp_collector.cpp:329-352). Pre-fix `mshim-rs`
+/// decoded every chained message and sent each as its own datagram,
+/// amplifying one received datagram into two forwarded ones.
+///
+/// `parse_search_request` is crate-private, so messages are told apart by
+/// their SEARCH sequence number, which `build_search` writes (and the
+/// forward rebuilder preserves) as the first 4 payload bytes after the
+/// 8-byte PVA header. The assertion is "the tail SEARCH(B)'s seq is never
+/// forwarded", which holds no matter how many times the probe is resent.
+#[test]
+#[serial]
+fn mshim_forwards_only_first_chained_message() {
+    let bin = match option_env!("CARGO_BIN_EXE_mshim-rs") {
+        Some(p) => p,
+        None => {
+            eprintln!("CARGO_BIN_EXE_mshim-rs not set — skipping");
+            return;
+        }
+    };
+
+    const PVA_HEADER_SIZE: usize = 8;
+    const SEQ_A: u32 = 0x0000_0011;
+    const SEQ_B: u32 = 0x0000_0022;
+
+    let (listen_port, forward_port) = alloc_two_ports();
+
+    let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, forward_port)).expect("bind receiver");
+    receiver
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+
+    let child = Command::new(bin)
+        .arg("-L")
+        .arg(format!("127.0.0.1:{listen_port}"))
+        .arg("-F")
+        .arg(format!("127.0.0.1:{forward_port}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn mshim-rs");
+    let _guard = ChildGuard(Some(child));
+
+    std::thread::sleep(Duration::from_millis(500));
+
+    let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind sender");
+    let listen_addr: SocketAddr = format!("127.0.0.1:{listen_port}").parse().unwrap();
+
+    // SEARCH(A) || SEARCH(B) packed into one datagram. Distinct seqs so a
+    // forwarded frame can be attributed to A or B by its payload prefix.
+    let codec = PvaCodec::new();
+    let search_a = codec.build_search(SEQ_A, 101, "chainA", [127, 0, 0, 1], 5566, true);
+    let search_b = codec.build_search(SEQ_B, 102, "chainB", [127, 0, 0, 1], 5566, true);
+    let mut chained = search_a.clone();
+    chained.extend_from_slice(&search_b);
+
+    // Resend until the first message (A) is observed forwarded, asserting
+    // on every arrival that B's seq was NOT forwarded. With the fix only
+    // A is ever forwarded; pre-fix a B-seq datagram arrives and trips the
+    // assertion. The deadline tolerates the bind/scheduling window.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut saw_a = false;
+    while Instant::now() < deadline && !saw_a {
+        sender.send_to(&chained, listen_addr).expect("send chained");
+        let mut buf = [0u8; 256];
+        while let Ok((n, _)) = receiver.recv_from(&mut buf) {
+            if n >= PVA_HEADER_SIZE + 4 {
+                let seq = u32::from_le_bytes(
+                    buf[PVA_HEADER_SIZE..PVA_HEADER_SIZE + 4]
+                        .try_into()
+                        .unwrap(),
+                );
+                assert_ne!(
+                    seq, SEQ_B,
+                    "chained tail SEARCH(B) must NOT be forwarded as its own datagram"
+                );
+                if seq == SEQ_A {
+                    saw_a = true;
+                }
+            }
+        }
+    }
+    assert!(saw_a, "the first chained SEARCH(A) must be forwarded");
+
+    // Final drain: after A is seen, give a B datagram a chance to surface
+    // (pre-fix it trails A) and assert it never does.
+    let drain_until = Instant::now() + Duration::from_millis(600);
+    let mut buf = [0u8; 256];
+    while Instant::now() < drain_until {
+        match receiver.recv_from(&mut buf) {
+            Ok((n, _)) if n >= PVA_HEADER_SIZE + 4 => {
+                let seq = u32::from_le_bytes(
+                    buf[PVA_HEADER_SIZE..PVA_HEADER_SIZE + 4]
+                        .try_into()
+                        .unwrap(),
+                );
+                assert_ne!(
+                    seq, SEQ_B,
+                    "chained tail SEARCH(B) must NOT be forwarded as its own datagram"
+                );
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+}
+
 #[test]
 #[serial]
 fn mshim_rejects_invalid_listen_endpoint() {

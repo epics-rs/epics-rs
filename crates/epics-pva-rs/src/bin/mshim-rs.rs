@@ -458,19 +458,21 @@ async fn main() {
                 match sock.recv_from(&mut buf).await {
                     Ok((n, peer)) => {
                         // pvxs `mshim` does NOT relay the raw datagram: it
-                        // decodes each SEARCH/BEACON, drops anything else,
+                        // decodes the SEARCH/BEACON, drops anything else,
                         // and rebuilds a fresh wire body per destination —
                         // toggling the SEARCH `Unicast` flag and resolving
                         // an `isAny` reply/server address to the original
-                        // source (mshim.cpp:95-200). A datagram may chain
-                        // several messages; forward each rebuilt message
-                        // as its own datagram.
-                        let messages = ForwardableDatagram::decode_all(&buf[..n]);
-                        if messages.is_empty() {
+                        // source (mshim.cpp:95-200). pvxs decodes only the
+                        // FIRST PVA header per datagram and ignores any
+                        // trailing bytes (`UDPCollector::process_one`,
+                        // udp_collector.cpp:329-352), so forward exactly
+                        // one rebuilt message — never amplify a chained
+                        // datagram into several forwarded packets.
+                        let Some(message) = ForwardableDatagram::decode_first(&buf[..n]) else {
                             // Unrecognized / malformed: drop, never relay
                             // raw bytes (pvxs forwards only decoded msgs).
                             continue;
-                        }
+                        };
                         for tgt in &targets {
                             // Avoid an obvious feedback loop: don't
                             // forward back to the source endpoint of
@@ -510,13 +512,11 @@ async fn main() {
                                     );
                                 }
                             }
-                            for msg in &messages {
-                                let frame = msg.rebuild_for(dest_unicast, peer);
-                                if let Err(e) = send_sock.send_to(&frame, tgt.addr).await
-                                    && e.kind() != ErrorKind::WouldBlock
-                                {
-                                    eprintln!("mshim-rs: forward to {}: {e}", tgt.addr);
-                                }
+                            let frame = message.rebuild_for(dest_unicast, peer);
+                            if let Err(e) = send_sock.send_to(&frame, tgt.addr).await
+                                && e.kind() != ErrorKind::WouldBlock
+                            {
+                                eprintln!("mshim-rs: forward to {}: {e}", tgt.addr);
                             }
                         }
                     }

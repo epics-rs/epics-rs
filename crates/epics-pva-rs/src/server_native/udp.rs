@@ -1598,13 +1598,36 @@ enum ForwardKind {
 }
 
 impl ForwardableDatagram {
-    /// Decode every chained SEARCH/BEACON message in one UDP datagram,
-    /// in wire order. A datagram normally carries exactly one message;
-    /// PVA permits several back-to-back, so this drains them all (pvxs
-    /// `UDPManager` dispatches each message in a datagram separately).
-    /// Stops at the first undecodable / non-SEARCH-or-BEACON message:
-    /// the returned vec holds the recognized prefix. An empty vec means
-    /// "drop the datagram" (the shim forwards nothing it cannot decode).
+    /// Decode only the FIRST SEARCH/BEACON message in a UDP datagram and
+    /// ignore any trailing bytes — the pvxs `UDPCollector::process_one`
+    /// contract (`udp_collector.cpp:329-352`: read one PVA header, switch
+    /// once on the command, dispatch the listener once, then break; for a
+    /// BEACON the remaining bytes are an explicitly-ignored serverStatus
+    /// blob, `:480`). Returns `None` when the first message is not a
+    /// recognized SEARCH/BEACON, so the shim drops the whole datagram.
+    ///
+    /// This is the default `mshim-rs` forward boundary: pvxs `mshim`
+    /// forwards only the first decoded message, never a chained tail.
+    /// [`decode_all`](Self::decode_all) is a Rust-only extension that
+    /// additionally drains chained messages; it is not the pvxs-faithful
+    /// default.
+    pub fn decode_first(datagram: &[u8]) -> Option<Self> {
+        if let Some(req) = parse_search_request(datagram) {
+            Some(Self(ForwardKind::Search(req)))
+        } else {
+            parse_beacon(datagram).map(|b| Self(ForwardKind::Beacon(b)))
+        }
+    }
+
+    /// Decode every chained SEARCH/BEACON message in one UDP datagram, in
+    /// wire order. A datagram normally carries exactly one message, and
+    /// pvxs dispatches only that first message (see
+    /// [`decode_first`](Self::decode_first)); this multi-message drain is
+    /// a Rust-only extension, NOT pvxs-faithful — `mshim-rs` must not use
+    /// it for default forwarding or it amplifies one received datagram
+    /// into several forwarded ones. Stops at the first undecodable /
+    /// non-SEARCH-or-BEACON message: the returned vec holds the
+    /// recognized prefix. An empty vec means "drop the datagram".
     pub fn decode_all(datagram: &[u8]) -> Vec<Self> {
         let mut out = Vec::new();
         let mut pos = 0usize;
@@ -3075,6 +3098,66 @@ mod tests {
         assert!(
             ForwardableDatagram::decode_all(&cc).is_empty(),
             "only SEARCH/BEACON are forwardable"
+        );
+    }
+
+    /// Regression R0604-MSHIM-CHAINED-UDP-FORWARD-1.
+    ///
+    /// pvxs `UDPCollector::process_one` decodes only the FIRST PVA header
+    /// in a datagram and ignores trailing bytes (udp_collector.cpp:329-352),
+    /// so `mshim` forwards exactly one message. A crafted
+    /// `SEARCH(A) || SEARCH(B)` must yield only A under `decode_first` (the
+    /// default mshim boundary), while `decode_all` (the Rust-only
+    /// extension) still drains both — the contrast that proves the fix.
+    #[test]
+    fn mshim_decode_first_ignores_chained_search() {
+        let codec = PvaCodec { big_endian: false };
+        let a = codec.build_search(1, 7, "PV:A", [10, 0, 0, 1], 5076, true);
+        let b = codec.build_search(2, 8, "PV:B", [10, 0, 0, 2], 5076, true);
+        let mut chained = a.clone();
+        chained.extend_from_slice(&b);
+
+        // decode_first: exactly the first message (SEARCH A), tail ignored.
+        let first = ForwardableDatagram::decode_first(&chained).expect("first SEARCH decodes");
+        assert!(first.is_search());
+        let source: SocketAddr = "192.168.9.9:1111".parse().unwrap();
+        let out = parse_search_request(&first.rebuild_for(false, source)).expect("rebuilt parses");
+        assert_eq!(
+            out.queries,
+            vec![(7, "PV:A".to_string())],
+            "only the first SEARCH is forwarded, not the chained PV:B"
+        );
+
+        // decode_all (Rust-only extension) still drains both.
+        assert_eq!(
+            ForwardableDatagram::decode_all(&chained).len(),
+            2,
+            "decode_all drains every chained message"
+        );
+    }
+
+    /// Regression R0604-MSHIM-CHAINED-UDP-FORWARD-1 (`SEARCH || BEACON`).
+    ///
+    /// A `SEARCH` followed by a `BEACON` in one datagram is forwarded as
+    /// the single first message (the SEARCH); the trailing BEACON is
+    /// ignored, matching pvxs `process_one`.
+    #[test]
+    fn mshim_decode_first_search_then_beacon_takes_search() {
+        let codec = PvaCodec { big_endian: false };
+        let search = codec.build_search(1, 7, "PV:A", [10, 0, 0, 1], 5076, true);
+        let beacon = build_beacon([0xCDu8; 12], 5075, ByteOrder::Little, 3, 9, "tcp");
+        let mut chained = search.clone();
+        chained.extend_from_slice(&beacon);
+
+        let first = ForwardableDatagram::decode_first(&chained).expect("first message decodes");
+        assert!(
+            first.is_search(),
+            "the first message (SEARCH) is taken; the trailing BEACON is ignored"
+        );
+        assert_eq!(
+            ForwardableDatagram::decode_all(&chained).len(),
+            2,
+            "decode_all still sees both the SEARCH and the trailing BEACON"
         );
     }
 

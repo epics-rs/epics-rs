@@ -180,15 +180,27 @@ pub struct DbLink {
 pub struct CaLink {
     pub pv: String,
     pub monitor_switch: MonitorSwitch,
+    /// Link-processing policy carried by this link's parsed modifier,
+    /// exactly as [`DbLink::policy`] does. A `CA`/`ca://` link can carry
+    /// `CP`/`CPP` (`"OTHER:PV CP CA"`, `"ca://OTHER:PV CPP"`); the dbCa
+    /// equivalent (`calink`) must subscribe a monitor and process the
+    /// link-holder on every remote change (C `dbCa.c:993-994`
+    /// `CA_DBPROCESS`). Pre-fix this was dropped at parse time, so a
+    /// cross-IOC `CP`/`CPP` link silently never processed its holder
+    /// (Regression R0604-CALINK-CP-NO-PROCESS-1). `cp_passive_only()`
+    /// reads it identically to the local DB path.
+    pub policy: LinkProcessPolicy,
 }
 
 impl CaLink {
-    /// CA link with the default (`NoMaximize`) alarm policy — the
-    /// shape used by callers that have only a bare PV name.
+    /// CA link with the default (`NoMaximize`) alarm policy and no
+    /// CP/CPP processing — the shape used by callers that have only a
+    /// bare PV name (JSON `{ca:…}` links carry no plaintext modifier).
     pub fn new(pv: impl Into<String>) -> Self {
         Self {
             pv: pv.into(),
             monitor_switch: MonitorSwitch::NoMaximize,
+            policy: LinkProcessPolicy::NoProcess,
         }
     }
 }
@@ -685,10 +697,14 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
     // parsed `MS`/`NMS`/`MSI`/`MSS` switch rides in the `CaLink` so the
     // alarm gate is applied at the record-processing boundary.
     if let Some(rest) = s.strip_prefix("ca://") {
-        let (pv, _policy, ms, _force_ca) = strip_link_modifiers(rest);
+        let (pv, policy, ms, _force_ca) = strip_link_modifiers(rest);
         return ParsedLink::Ca(CaLink {
             pv: pv.to_string(),
             monitor_switch: ms,
+            // Carry the parsed CP/CPP policy so `ca://OTHER:PV CPP`
+            // drives holder processing (R0604-CALINK-CP-NO-PROCESS-1);
+            // pre-fix it was discarded into a bare latest-value link.
+            policy,
         });
     }
     if let Some(rest) = s.strip_prefix("pva://") {
@@ -711,10 +727,14 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
         // a bare ` CA`-forced link carries the same
         // maximize-severity policy as any other link — store the parsed
         // `ms` so e.g. `REC.VAL CA MS` keeps its `MS` gate instead of
-        // discarding it.
+        // discarding it. It also carries the CP/CPP process policy
+        // (`REC.VAL CP CA`): store it so the calink resolver processes
+        // the holder on a remote change instead of dropping the CP
+        // intent (R0604-CALINK-CP-NO-PROCESS-1).
         return ParsedLink::Ca(CaLink {
             pv: link_part.to_string(),
             monitor_switch: ms,
+            policy,
         });
     }
 
@@ -1092,12 +1112,22 @@ mod json_link_tests {
             ParsedLink::Ca(CaLink {
                 pv: "REC.VAL".to_string(),
                 monitor_switch: MonitorSwitch::Maximize,
+                policy: LinkProcessPolicy::NoProcess,
             })
         );
-        // `PP CA` carries no MS-class modifier → NoMaximize.
+        // `PP CA` now CARRIES the `PP` process policy (pre-fix the
+        // force-CA branch discarded it, reducing this to a bare
+        // `CaLink::new`); no MS-class modifier → NoMaximize. `PP` is not
+        // CP/CPP, so `cp_passive_only() == None` and this link is never
+        // registered as an external CP holder
+        // (Regression R0604-CALINK-CP-NO-PROCESS-1).
         assert_eq!(
             parse_link_v2("REC.VAL PP CA"),
-            ParsedLink::Ca(CaLink::new("REC.VAL"))
+            ParsedLink::Ca(CaLink {
+                pv: "REC.VAL".to_string(),
+                monitor_switch: MonitorSwitch::NoMaximize,
+                policy: LinkProcessPolicy::ProcessPassive,
+            })
         );
         // `CA NMS` carries the explicit NoMaximize switch.
         assert_eq!(
@@ -1105,6 +1135,7 @@ mod json_link_tests {
             ParsedLink::Ca(CaLink {
                 pv: "REC.VAL".to_string(),
                 monitor_switch: MonitorSwitch::NoMaximize,
+                policy: LinkProcessPolicy::NoProcess,
             })
         );
         assert_eq!(link_field_type("REC.VAL CA NMS"), LinkType::Ca);
@@ -1119,6 +1150,7 @@ mod json_link_tests {
             ParsedLink::Ca(CaLink {
                 pv: "SR:DCCT".to_string(),
                 monitor_switch: MonitorSwitch::Maximize,
+                policy: LinkProcessPolicy::NoProcess,
             })
         );
         assert_eq!(
@@ -1126,6 +1158,7 @@ mod json_link_tests {
             ParsedLink::Ca(CaLink {
                 pv: "SR:DCCT".to_string(),
                 monitor_switch: MonitorSwitch::MaximizeIfInvalid,
+                policy: LinkProcessPolicy::NoProcess,
             })
         );
         assert_eq!(
@@ -1133,6 +1166,7 @@ mod json_link_tests {
             ParsedLink::Ca(CaLink {
                 pv: "SR:DCCT".to_string(),
                 monitor_switch: MonitorSwitch::MaximizeStatus,
+                policy: LinkProcessPolicy::NoProcess,
             })
         );
         // Bare `ca://PV` → default NoMaximize, PV name intact.

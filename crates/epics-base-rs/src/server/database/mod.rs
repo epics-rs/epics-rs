@@ -223,6 +223,16 @@ struct PvDatabaseInner {
     /// the source changes. Each edge carries the CP-vs-CPP distinction (see
     /// [`CpTarget`]).
     cp_links: RwLock<HashMap<String, Vec<CpTarget>>>,
+    /// External (CA/PVA) CP/CPP link index: maps the *external PV name*
+    /// (the cross-IOC source, e.g. `OTHER:PV` from `INP="OTHER:PV CP CA"`)
+    /// → holder edges to process when that remote PV changes. The local
+    /// [`Self::cp_links`] index is keyed by a local source RECORD that
+    /// processes here; a cross-IOC source never processes locally, so its
+    /// only trigger is the calink/pvalink CA monitor callback, which calls
+    /// [`PvDatabase::dispatch_external_cp_targets`]. Parity with C
+    /// `dbCa.c:993-994` `eventCallback` adding `CA_DBPROCESS`
+    /// (Regression R0604-CALINK-CP-NO-PROCESS-1).
+    external_cp_links: RwLock<HashMap<String, Vec<CpTarget>>>,
     /// Alias map: alternate-name → real-record-name. Mirrors epics-base
     /// PR #336 (alias name validation + parsing). `find_entry` and
     /// related lookups consult this map after the canonical record
@@ -411,6 +421,7 @@ impl PvDatabase {
                 load_order: RwLock::new(HashMap::new()),
                 load_order_counter: std::sync::atomic::AtomicU64::new(0),
                 cp_links: RwLock::new(HashMap::new()),
+                external_cp_links: RwLock::new(HashMap::new()),
                 aliases: RwLock::new(HashMap::new()),
                 registration_mutex: tokio::sync::Mutex::new(()),
                 after_ioc_running: std::sync::Mutex::new(Vec::new()),

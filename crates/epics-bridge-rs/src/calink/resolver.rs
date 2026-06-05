@@ -262,6 +262,14 @@ pub struct CaLinkResolver {
     handle: tokio::runtime::Handle,
     /// Open links keyed by bare PV name (`ca://` scheme stripped).
     links: Arc<RwLock<HashMap<String, Arc<CaLink>>>>,
+    /// Database handle the monitor callback uses to process external
+    /// CP/CPP holder records on each remote change
+    /// ([`PvDatabase::dispatch_external_cp_targets`]). `None` until
+    /// [`Self::attach_database`] is called at IOC assembly. Late-bound
+    /// behind a lock so the cheaply-`Clone`d resolver can have the DB
+    /// attached after construction — the same shape as `pvalink`'s
+    /// `PvaLinkResolver::db` (Regression R0604-CALINK-CP-NO-PROCESS-1).
+    db: Arc<RwLock<Option<PvDatabase>>>,
 }
 
 impl CaLinkResolver {
@@ -274,6 +282,7 @@ impl CaLinkResolver {
             client: Arc::new(client),
             handle,
             links: Arc::new(RwLock::new(HashMap::new())),
+            db: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -285,7 +294,20 @@ impl CaLinkResolver {
             client,
             handle,
             links: Arc::new(RwLock::new(HashMap::new())),
+            db: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Attach the database handle the monitor callback uses to process
+    /// external CP/CPP holder records on each remote change
+    /// ([`PvDatabase::dispatch_external_cp_targets`]). Called by
+    /// [`install_calink_resolver`] at IOC assembly — before iocInit's
+    /// `setup_cp_links` warms any external CP link — so the handle is
+    /// always present by the time the first monitor event fires. The
+    /// cross-IOC twin of `pvalink`'s `PvaLinkResolver::attach_database`
+    /// (Regression R0604-CALINK-CP-NO-PROCESS-1).
+    pub fn attach_database(&self, db: PvDatabase) {
+        *self.db.write() = Some(db);
     }
 
     /// Open / cache the CA link for `pv_name` (a bare PV name, no
@@ -348,6 +370,7 @@ impl CaLinkResolver {
             connected.clone(),
             channel.clone(),
             pv_name.to_string(),
+            self.db.clone(),
         ));
         let link = Arc::new(CaLink {
             cache,
@@ -425,6 +448,7 @@ async fn run_monitor(
     connected: Arc<AtomicBool>,
     channel: Arc<CaChannel>,
     pv_name: String,
+    db: Arc<RwLock<Option<PvDatabase>>>,
 ) {
     while let Some(event) = monitor.recv().await {
         match event {
@@ -448,6 +472,22 @@ async fn run_monitor(
                     snapshot,
                     native_count,
                 })));
+                // C `dbCa.c eventCallback` refreshes the cached value, then
+                // adds `CA_DBPROCESS` for every CP link (and Passive CPP
+                // link) on this PV (`dbCa.c:925,993-994`); the worker thread
+                // later runs `db_process(prec)` (`dbCa.c:1295`). Drive the
+                // Rust twin: process every local holder of an external
+                // CP/CPP link to this PV. The cache is stored ABOVE first,
+                // so the holder's INP read sees the fresh value — matching
+                // the C ordering (cache update precedes the process request)
+                // (Regression R0604-CALINK-CP-NO-PROCESS-1). No-op when no
+                // holder is registered or the DB is not attached. The read
+                // guard is dropped before the await so the lock is never
+                // held across the process call.
+                let db_handle = db.read().clone();
+                if let Some(db_handle) = db_handle {
+                    db_handle.dispatch_external_cp_targets(&pv_name).await;
+                }
             }
             // A monitor error event (e.g. a transient server-side
             // problem) leaves the last cached value in place — the
@@ -756,6 +796,12 @@ pub async fn install_calink_resolver(
     handle: tokio::runtime::Handle,
 ) -> Result<CaLinkResolver, CaLinkError> {
     let resolver = CaLinkResolver::new(handle).await?;
+    // Attach the DB before registering the lset, so the monitor callback
+    // can drive `dispatch_external_cp_targets` from the first event on
+    // (Regression R0604-CALINK-CP-NO-PROCESS-1). This runs before iocInit's
+    // `setup_cp_links` warms any external CP link, so the handle is always
+    // present when the first warmed-link event arrives.
+    resolver.attach_database(db.clone());
     db.register_link_set("ca", Arc::new(resolver.clone())).await;
     Ok(resolver)
 }

@@ -2745,43 +2745,81 @@ impl PvDatabase {
     ) {
         let cp_targets = self.get_cp_targets(name).await;
         for target in cp_targets {
-            if visited.contains(&target.record) {
-                continue;
+            self.process_one_cp_target(&target, visited, depth).await;
+        }
+    }
+
+    /// Process a single CP/CPP target edge, applying the CPP passive gate
+    /// and the PACT/RPRO pre-check. This is the single owner of the
+    /// scan-time CP-dispatch decision, shared by the local-source path
+    /// ([`Self::dispatch_cp_targets`]) and the cross-IOC path
+    /// ([`Self::dispatch_external_cp_targets`]) so both honour the same
+    /// `dbCa.c` semantics.
+    async fn process_one_cp_target(
+        &self,
+        target: &super::CpTarget,
+        visited: &mut std::collections::HashSet<String>,
+        depth: usize,
+    ) {
+        if visited.contains(&target.record) {
+            return;
+        }
+        let target_rec = {
+            let records = self.inner.records.read().await;
+            records.get(&target.record).cloned()
+        };
+        let mut skip = false;
+        if let Some(ref t) = target_rec {
+            let mut tg = t.write().await;
+            if target.passive_only && tg.common.scan != crate::server::record::ScanType::Passive {
+                // CPP gate (`dbCa.c:854,994,1072`): a CPP link adds
+                // `CA_DBPROCESS` only when the link-holder's SCAN is
+                // Passive. A non-Passive target is reached by its own
+                // periodic/event scan, so skip it here — no process,
+                // no RPRO. A CP link (`passive_only == false`) never
+                // takes this branch and always processes.
+                skip = true;
+            } else if tg.processing.load(std::sync::atomic::Ordering::Acquire) {
+                tg.common.rpro = true;
+                skip = true;
             }
-            let target_rec = {
-                let records = self.inner.records.read().await;
-                records.get(&target.record).cloned()
-            };
-            let mut skip = false;
-            if let Some(ref t) = target_rec {
-                let mut tg = t.write().await;
-                if target.passive_only && tg.common.scan != crate::server::record::ScanType::Passive
-                {
-                    // CPP gate (`dbCa.c:854,994,1072`): a CPP link adds
-                    // `CA_DBPROCESS` only when the link-holder's SCAN is
-                    // Passive. A non-Passive target is reached by its own
-                    // periodic/event scan, so skip it here — no process,
-                    // no RPRO. A CP link (`passive_only == false`) never
-                    // takes this branch and always processes.
-                    skip = true;
-                } else if tg.processing.load(std::sync::atomic::Ordering::Acquire) {
-                    tg.common.rpro = true;
-                    skip = true;
-                }
-                // else (not processing): fall through and process below.
-                // epics-base PR #3fb10b6: PUTF must remain false on
-                // CP-driven targets — only the record directly receiving
-                // the dbPut reports PUTF=1 to dbNotify/onChange observers,
-                // so we deliberately do NOT set PUTF here.
-            }
-            if skip {
-                continue;
-            }
-            // recursive CP-target fan-out within one chain —
-            // gate already held by the foreign entry record.
-            let _ = self
-                .process_record_with_links_recursive(&target.record, visited, depth + 1)
-                .await;
+            // else (not processing): fall through and process below.
+            // epics-base PR #3fb10b6: PUTF must remain false on
+            // CP-driven targets — only the record directly receiving
+            // the dbPut reports PUTF=1 to dbNotify/onChange observers,
+            // so we deliberately do NOT set PUTF here.
+        }
+        if skip {
+            return;
+        }
+        // recursive CP-target fan-out within one chain —
+        // gate already held by the foreign entry record.
+        let _ = self
+            .process_record_with_links_recursive(&target.record, visited, depth + 1)
+            .await;
+    }
+
+    /// Process every holder of an EXTERNAL CP/CPP link to `external_pv` —
+    /// the cross-IOC twin of [`Self::dispatch_cp_targets`]. Called by the
+    /// calink/pvalink CA monitor callback on every remote change, this is
+    /// the Rust equivalent of C `dbCa.c eventCallback` adding
+    /// `CA_DBPROCESS` for a CP (or Passive CPP) link (`dbCa.c:993-994`)
+    /// and the worker thread running `db_process(prec)` (`dbCa.c:1295`).
+    /// A cross-IOC source never processes locally, so this callback is the
+    /// only trigger; without it a `CP`/`CPP` link's holder never processes
+    /// on a remote change (Regression R0604-CALINK-CP-NO-PROCESS-1).
+    ///
+    /// A fresh `visited` set and `depth = 0` start a new process chain —
+    /// the monitor event is an independent external trigger, like a scan,
+    /// not a continuation of an in-flight local chain.
+    pub async fn dispatch_external_cp_targets(&self, external_pv: &str) {
+        let targets = self.get_external_cp_targets(external_pv).await;
+        if targets.is_empty() {
+            return;
+        }
+        let mut visited = std::collections::HashSet::new();
+        for target in targets {
+            self.process_one_cp_target(&target, &mut visited, 0).await;
         }
     }
 

@@ -178,6 +178,123 @@ async fn record_with_ca_inp_link_reads_remote_value() {
     );
 }
 
+/// Regression R0604-CALINK-CP-NO-PROCESS-1 — a Passive `ai` holder
+/// whose INP is a `CP` CA link MUST process (and read the new value into
+/// VAL) on every remote change, driven solely by the calink monitor
+/// callback — never by an explicit `process_record` call.
+///
+/// This is the exact C `dbCa.c` path: `eventCallback` refreshes the
+/// cached value and adds `CA_DBPROCESS` for a CP link (`dbCa.c:925,993`),
+/// and the worker thread runs `db_process(prec)` (`dbCa.c:1295`).
+///
+/// The holder is Passive on purpose: a Passive record never self-scans,
+/// so its CA link never opens lazily and the monitor that drives the
+/// dispatch is never created — the chicken-and-egg the iocInit warm in
+/// `setup_cp_links` closes. Pre-fix, `setup_cp_links` matched only
+/// `ParsedLink::Db`, so the holder was never registered, never warmed,
+/// and `run_monitor` had no dispatch hook: VAL stayed at its initial 0.0
+/// forever. Two observations prove the fix:
+///   1. the warm's first monitor event drives VAL to the source's 5.0;
+///   2. an independent remote write to 42.0 drives VAL to 42.0.
+#[tokio::test(flavor = "multi_thread")]
+#[serial(epics_env)]
+async fn ca_cp_holder_processes_on_remote_change() {
+    let port = free_port();
+    let server = CaServer::builder()
+        .port(port)
+        .pv("CALINK:CP:SRC", EpicsValue::Double(5.0))
+        .build()
+        .await
+        .expect("CA server");
+    let _server = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    pin_env(port);
+    let db = PvDatabase::new();
+
+    // Passive ai holder with a bare ` CP CA` INP link to the remote PV.
+    // ai's default SCAN is Passive — assert it so the "never self-scans,
+    // so the link is never opened lazily" precondition is explicit.
+    db.add_record("CALINK:CP:HOLDER", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    {
+        let rec = db.get_record("CALINK:CP:HOLDER").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.put_common_field("INP", EpicsValue::String("CALINK:CP:SRC CP CA".into()))
+            .unwrap();
+        inst.common.udf = false;
+        assert_eq!(
+            inst.common.scan,
+            epics_base_rs::server::record::ScanType::Passive,
+            "holder must be Passive so its link only opens via the iocInit warm"
+        );
+    }
+
+    // Production wiring: installs the `ca` lset AND attaches the db so
+    // the monitor callback can dispatch CP holders (the
+    // R0604-CALINK-CP-NO-PROCESS-1 fix). Uses its own client, which picks
+    // up the pinned env set above.
+    let _resolver = install_calink_resolver(&db, tokio::runtime::Handle::current())
+        .await
+        .expect("calink resolver installs");
+
+    // iocInit step: registers the external CP edge AND warms (opens) the
+    // monitor for the Passive holder's source PV.
+    db.setup_cp_links().await;
+
+    // (1) The warm's first monitor event must drive the holder to process
+    // and read the remote value (5.0) into VAL — with NO explicit
+    // process_record call anywhere in this test.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let v = {
+            let rec = db.get_record("CALINK:CP:HOLDER").await.unwrap();
+            let inst = rec.read().await;
+            inst.record.val().and_then(|v| v.to_f64())
+        };
+        if v == Some(5.0) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "CP holder VAL must reach the warmed source value 5.0 \
+             (got {v:?}) — the iocInit warm + monitor dispatch did not fire"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // (2) An independent CA client changes the source to 42.0. The
+    // steady-state monitor event must drive the holder to reprocess to
+    // 42.0 — again with no explicit process_record call.
+    let writer = pinned_client(port).await;
+    let wch = writer.create_channel("CALINK:CP:SRC");
+    wch.wait_connected(Duration::from_secs(5))
+        .await
+        .expect("writer channel connects");
+    wch.put(&EpicsValue::Double(42.0))
+        .await
+        .expect("remote write to source");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let v = {
+            let rec = db.get_record("CALINK:CP:HOLDER").await.unwrap();
+            let inst = rec.read().await;
+            inst.record.val().and_then(|v| v.to_f64())
+        };
+        if v == Some(42.0) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "CP holder VAL must follow the remote change to 42.0 \
+             (got {v:?}) — the steady-state monitor dispatch did not fire"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// Gap 2 OUT write — a CA-type OUT link writes the remote PV.
 /// `CaLinkResolver::put_value` (the `LinkSet` OUT-write path) must
 /// push a value through the CA channel into the upstream CA server's

@@ -1478,47 +1478,142 @@ impl PvDatabase {
             .unwrap_or_default()
     }
 
-    /// Scan all records for CP input links and register them.
+    /// Register an EXTERNAL CP/CPP link: when the remote PV `external_pv`
+    /// (a cross-IOC CA/PVA source, e.g. `OTHER:PV` from
+    /// `INP="OTHER:PV CP CA"`) changes, process `target_record`.
+    ///
+    /// Twin of [`Self::register_cp_link`] for cross-IOC sources. The key is
+    /// the **scheme-stripped external PV name** — it is not a local record,
+    /// so it is NOT alias-resolved. It MUST equal the name the calink/pvalink
+    /// monitor dispatches under: that monitor is opened through the lset,
+    /// which strips the `ca://` / `pva://` scheme first, so its `pv_name`
+    /// (passed to [`Self::dispatch_external_cp_targets`]) is the bare PV.
+    /// Stripping the same schemes here — the set [`Self::resolve_external_pv`]
+    /// already knows — guarantees the registry key and the dispatch key can
+    /// never diverge. The `target_record` (the local holder) IS alias-resolved
+    /// so the dispatch processes the canonical record. CP dominates CPP on a
+    /// merged edge, identical to the local path
+    /// (Regression R0604-CALINK-CP-NO-PROCESS-1).
+    pub async fn register_external_cp_link(
+        &self,
+        external_pv: &str,
+        target_record: &str,
+        passive_only: bool,
+    ) {
+        let key = external_pv
+            .strip_prefix("ca://")
+            .or_else(|| external_pv.strip_prefix("pva://"))
+            .unwrap_or(external_pv);
+        let target = self
+            .resolve_alias(target_record)
+            .await
+            .unwrap_or_else(|| target_record.to_string());
+        let mut cp = self.inner.external_cp_links.write().await;
+        let targets = cp.entry(key.to_string()).or_default();
+        if let Some(existing) = targets.iter_mut().find(|t| t.record == target) {
+            existing.passive_only = existing.passive_only && passive_only;
+        } else {
+            targets.push(super::CpTarget {
+                record: target,
+                passive_only,
+            });
+        }
+    }
+
+    /// Get holder edges to process when the remote PV `external_pv` changes
+    /// (external CA/PVA CP/CPP links).
+    pub async fn get_external_cp_targets(&self, external_pv: &str) -> Vec<super::CpTarget> {
+        self.inner
+            .external_cp_links
+            .read()
+            .await
+            .get(external_pv)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Every external PV name that has at least one CP/CPP holder edge.
+    /// The calink/pvalink integration warms (opens a monitor for) each of
+    /// these at iocInit so the remote source has a live subscription whose
+    /// callback can drive [`Self::dispatch_external_cp_targets`] — a Passive
+    /// CP holder is otherwise never read and its monitor never opens.
+    pub async fn external_cp_pv_names(&self) -> Vec<String> {
+        self.inner
+            .external_cp_links
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Classify one link string for CP/CPP setup, pushing onto the right
+    /// accumulator. A local `Db` CP/CPP link drives the local-source path
+    /// ([`Self::dispatch_cp_targets`]); an external `Ca` CP/CPP link drives
+    /// the cross-IOC path ([`Self::dispatch_external_cp_targets`]).
+    ///
+    /// The `Ca` arm is the structural fix for Regression
+    /// R0604-CALINK-CP-NO-PROCESS-1: pre-fix `setup_cp_links` matched only
+    /// `ParsedLink::Db`, so a `ca://OTHER CP` / `OTHER CP CA` holder was
+    /// silently dropped and never processed on a remote change — unlike C
+    /// `dbCa.c`, where `eventCallback` adds `CA_DBPROCESS` for every CP link
+    /// (`dbCa.c:993-994`). A link with no CP/CPP policy (`cp_passive_only()
+    /// == None`), and every other `ParsedLink` variant, is ignored here.
+    fn classify_cp_link(
+        link_str: &str,
+        target_name: &str,
+        db_links: &mut Vec<(String, String, bool)>,
+        ext_links: &mut Vec<(String, String, bool)>,
+    ) {
+        if link_str.is_empty() {
+            return;
+        }
+        match crate::server::record::parse_link_v2(link_str) {
+            crate::server::record::ParsedLink::Db(db) => {
+                if let Some(passive_only) = db.policy.cp_passive_only() {
+                    db_links.push((db.record, target_name.to_string(), passive_only));
+                }
+            }
+            crate::server::record::ParsedLink::Ca(ca) => {
+                if let Some(passive_only) = ca.policy.cp_passive_only() {
+                    ext_links.push((ca.pv, target_name.to_string(), passive_only));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Scan all records for CP/CPP input links and register them. Local
+    /// `Db` links land in the local CP registry; external `Ca` links land
+    /// in the external CP registry, whose holders are processed by the
+    /// calink monitor callback (Regression R0604-CALINK-CP-NO-PROCESS-1).
     pub async fn setup_cp_links(&self) {
         let names = self.all_record_names().await;
-        let mut links_to_register: Vec<(String, String, bool)> = Vec::new();
+        let mut db_links: Vec<(String, String, bool)> = Vec::new();
+        let mut ext_links: Vec<(String, String, bool)> = Vec::new();
 
         for target_name in &names {
             if let Some(rec_arc) = self.get_record(target_name).await {
                 let instance = rec_arc.read().await;
-                // Check common INP link
-                let inp_str = &instance.common.inp;
-                if !inp_str.is_empty() {
-                    let parsed = crate::server::record::parse_link_v2(inp_str);
-                    if let crate::server::record::ParsedLink::Db(ref db) = parsed {
-                        if let Some(passive_only) = db.policy.cp_passive_only() {
-                            links_to_register.push((
-                                db.record.clone(),
-                                target_name.clone(),
-                                passive_only,
-                            ));
-                        }
-                    }
-                }
-                // Check multi-input links (INPA..INPL for calc/calcout/sel/sub)
+                // Common INP link.
+                Self::classify_cp_link(
+                    &instance.common.inp,
+                    target_name,
+                    &mut db_links,
+                    &mut ext_links,
+                );
+                // Multi-input links (INPA..INPL for calc/calcout/sel/sub).
                 for (lf, _vf) in instance.record.multi_input_links() {
                     if let Some(EpicsValue::String(link_str)) = instance.record.get_field(lf) {
-                        if !link_str.is_empty() {
-                            let parsed =
-                                crate::server::record::parse_link_v2(&link_str.as_str_lossy());
-                            if let crate::server::record::ParsedLink::Db(ref db) = parsed {
-                                if let Some(passive_only) = db.policy.cp_passive_only() {
-                                    links_to_register.push((
-                                        db.record.clone(),
-                                        target_name.clone(),
-                                        passive_only,
-                                    ));
-                                }
-                            }
-                        }
+                        Self::classify_cp_link(
+                            &link_str.as_str_lossy(),
+                            target_name,
+                            &mut db_links,
+                            &mut ext_links,
+                        );
                     }
                 }
-                // Check additional input link fields that may use CP:
+                // Additional input link fields that may use CP:
                 // DOL (ao/bo/longout/mbbo), DOL0-DOLF (seq — 16
                 // groups), DOL1-DOLA (sseq — legacy 10 groups),
                 // NVL (sel), SELL (sseq), SDIS (common), SGNL (histogram)
@@ -1530,58 +1625,60 @@ impl PvDatabase {
                     if let Some(EpicsValue::String(link_str)) =
                         instance.record.get_field(field_name)
                     {
-                        if !link_str.is_empty() {
-                            let parsed =
-                                crate::server::record::parse_link_v2(&link_str.as_str_lossy());
-                            if let crate::server::record::ParsedLink::Db(ref db) = parsed {
-                                if let Some(passive_only) = db.policy.cp_passive_only() {
-                                    links_to_register.push((
-                                        db.record.clone(),
-                                        target_name.clone(),
-                                        passive_only,
-                                    ));
-                                }
-                            }
-                        }
+                        Self::classify_cp_link(
+                            &link_str.as_str_lossy(),
+                            target_name,
+                            &mut db_links,
+                            &mut ext_links,
+                        );
                     }
                 }
-                // Check TSEL in common fields
-                let tsel_str = &instance.common.tsel;
-                if !tsel_str.is_empty() {
-                    let parsed = crate::server::record::parse_link_v2(tsel_str);
-                    if let crate::server::record::ParsedLink::Db(ref db) = parsed {
-                        if let Some(passive_only) = db.policy.cp_passive_only() {
-                            links_to_register.push((
-                                db.record.clone(),
-                                target_name.clone(),
-                                passive_only,
-                            ));
-                        }
-                    }
-                }
-                // Check SDIS in common fields
-                let sdis_str = &instance.common.sdis;
-                if !sdis_str.is_empty() {
-                    let parsed = crate::server::record::parse_link_v2(sdis_str);
-                    if let crate::server::record::ParsedLink::Db(ref db) = parsed {
-                        if let Some(passive_only) = db.policy.cp_passive_only() {
-                            links_to_register.push((
-                                db.record.clone(),
-                                target_name.clone(),
-                                passive_only,
-                            ));
-                        }
-                    }
-                }
+                // TSEL in common fields.
+                Self::classify_cp_link(
+                    &instance.common.tsel,
+                    target_name,
+                    &mut db_links,
+                    &mut ext_links,
+                );
+                // SDIS in common fields.
+                Self::classify_cp_link(
+                    &instance.common.sdis,
+                    target_name,
+                    &mut db_links,
+                    &mut ext_links,
+                );
             }
         }
 
-        let count = links_to_register.len();
-        for (source, target, passive_only) in links_to_register {
+        let db_count = db_links.len();
+        for (source, target, passive_only) in db_links {
             self.register_cp_link(&source, &target, passive_only).await;
         }
-        if count > 0 {
-            eprintln!("iocInit: {count} CP link subscriptions");
+        let ext_count = ext_links.len();
+        for (external_pv, target, passive_only) in ext_links {
+            self.register_external_cp_link(&external_pv, &target, passive_only)
+                .await;
+        }
+        if db_count > 0 {
+            eprintln!("iocInit: {db_count} CP link subscriptions");
+        }
+        // Warm external CP/CPP links. A Passive holder of an external CP
+        // link is never scanned, so its link never opens lazily and the
+        // calink monitor that drives `dispatch_external_cp_targets` is never
+        // created (chicken-and-egg). Open each external CP PV now so its
+        // monitor is live at iocInit — the C `dbCa.c` "add the link at init"
+        // analogue (`dbCaAddLink`). `resolve_external_pv` routes through the
+        // registered lset's lazy-open path (the same path a record read
+        // uses); a no-op when no matching lset is installed (calink off).
+        if ext_count > 0 {
+            let ext_pvs = self.external_cp_pv_names().await;
+            for pv in &ext_pvs {
+                let _ = self.resolve_external_pv(pv).await;
+            }
+            eprintln!(
+                "iocInit: {ext_count} external CP link subscriptions ({} PVs warmed)",
+                ext_pvs.len()
+            );
         }
     }
 }

@@ -35,8 +35,9 @@ consulted in the source tree.
 
 | Variable | Default | Where |
 |----------|---------|-------|
-| `RUST_LOG` | unset | standard `tracing-subscriber` filter; binaries respect it via `tracing_subscriber::EnvFilter` |
-| `PVXS_LOG` | unset | pvxs-style log spec; mapped to RUST_LOG at startup by `crate::log::init_filter` |
+| `PVXS_LOG` | unset | highest-precedence log filter spec, read directly by `crate::log::init_filter` for pvxs `logger_config_env` parity; applied verbatim as a `tracing_subscriber::EnvFilter` |
+| `EPICS_PVA_LOG` | unset | retained Rust-only alias for the filter spec; used only when `PVXS_LOG` is unset |
+| `RUST_LOG` | unset | standard `tracing-subscriber` filter; used only when neither `PVXS_LOG` nor `EPICS_PVA_LOG` is set |
 
 ## Operational
 

@@ -33,7 +33,7 @@ Levels:
 RUST_LOG=info                         # default for daemons
 RUST_LOG=epics_pva_rs=debug,info      # debug pva-rs, info elsewhere
 RUST_LOG=epics_pva_rs::client_native::ops_v2=trace
-PVXS_LOG=*=DEBUG                      # mapped to RUST_LOG by crate::log::init_filter
+PVXS_LOG=epics_pva_rs=debug           # read directly by crate::log::init_filter (pvxs PVXS_LOG parity); takes precedence over EPICS_PVA_LOG and RUST_LOG
 ```
 
 ### Reload

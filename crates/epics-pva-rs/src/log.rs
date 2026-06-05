@@ -12,8 +12,8 @@
 //! use epics_pva_rs::log;
 //! use tracing_subscriber::{fmt, prelude::*};
 //!
-//! // Once at startup. Reads RUST_LOG / EPICS_PVA_LOG, falls back to
-//! // "info" when neither is set.
+//! // Once at startup. Reads PVXS_LOG / EPICS_PVA_LOG / RUST_LOG (in that
+//! // precedence), falls back to "info" when none is set.
 //! let (filter, handle) = log::init_filter();
 //! tracing_subscriber::registry()
 //!     .with(filter)
@@ -46,9 +46,38 @@ pub type FilterReloadHandle = reload::Handle<EnvFilter, tracing_subscriber::Regi
 /// [`set_log_filter`] / [`set_log_level`] calls go through this.
 static GLOBAL_HANDLE: OnceLock<FilterReloadHandle> = OnceLock::new();
 
-/// Build an `EnvFilter` reload-layer pair seeded from the standard
-/// EPICS log env vars. Honours `EPICS_PVA_LOG` first (matches
-/// pvxs `PVXS_LOG`), then `RUST_LOG`, then defaults to `"info"`.
+/// The base log-filter spec taken from the environment, in
+/// pvxs-compatibility precedence:
+///
+/// 1. `PVXS_LOG` — the variable pvxs `logger_config_env()` reads
+///    (`log.cpp:388-394`); each pvxs tool consults it before option
+///    parsing and `-d` is documented as shorthand for
+///    `PVXS_LOG="pvxs.*=DEBUG"`. Honouring it first is what makes
+///    `PVXS_LOG=… pvget-rs PV` behave like `PVXS_LOG=… pvxget PV`.
+/// 2. `EPICS_PVA_LOG` — retained Rust-only alias, second in precedence.
+/// 3. `RUST_LOG` — the Rust-native fallback.
+///
+/// An empty value is treated as unset and skipped (pvxs `if(!*env)`), so an
+/// exported-but-empty `PVXS_LOG` does not shadow a real `EPICS_PVA_LOG`.
+/// Returns `None` when no source is set (callers default to `"info"`).
+///
+/// Single owner for the env-source precedence: both [`init_filter`] and
+/// [`set_log_level`] read through here, so they cannot diverge on which
+/// variable wins.
+pub(crate) fn log_env_base() -> Option<String> {
+    for key in ["PVXS_LOG", "EPICS_PVA_LOG", "RUST_LOG"] {
+        if let Ok(spec) = std::env::var(key) {
+            if !spec.is_empty() {
+                return Some(spec);
+            }
+        }
+    }
+    None
+}
+
+/// Build an `EnvFilter` reload-layer pair seeded from the standard log env
+/// vars via [`log_env_base`] (`PVXS_LOG`, then `EPICS_PVA_LOG`, then
+/// `RUST_LOG`), defaulting to `"info"` when none is set.
 ///
 /// Returns the wrapped layer (install into your subscriber) and a
 /// handle for runtime reconfiguration.
@@ -56,9 +85,7 @@ pub fn init_filter() -> (
     reload::Layer<EnvFilter, tracing_subscriber::Registry>,
     FilterReloadHandle,
 ) {
-    let initial_spec = std::env::var("EPICS_PVA_LOG")
-        .or_else(|_| std::env::var("RUST_LOG"))
-        .unwrap_or_else(|_| "info".to_string());
+    let initial_spec = log_env_base().unwrap_or_else(|| "info".to_string());
     let filter = EnvFilter::try_new(&initial_spec).unwrap_or_else(|_| EnvFilter::new("info"));
     reload::Layer::new(filter)
 }
@@ -81,11 +108,11 @@ pub fn set_global_handle(handle: FilterReloadHandle) {
 /// `monitor.cpp:48-70`, `put.cpp:41-64`, `list.cpp:66-99`,
 /// `info.cpp:47-66`, `call.cpp:47-64`).
 ///
-/// The filter is seeded by [`init_filter`] (`EPICS_PVA_LOG`, then
-/// `RUST_LOG`, then `"info"`), so `EPICS_PVA_LOG=... pvget-rs PV` works
-/// for these tools the way `PVXS_LOG=... pvxget PV` does for pvxs. Log
-/// records go to **stderr**, never stdout, so they cannot corrupt the
-/// value output a script parses.
+/// The filter is seeded by [`init_filter`] (`PVXS_LOG`, then
+/// `EPICS_PVA_LOG`, then `RUST_LOG`, then `"info"`), so
+/// `PVXS_LOG=... pvget-rs PV` works for these tools the way
+/// `PVXS_LOG=... pvxget PV` does for pvxs. Log records go to **stderr**,
+/// never stdout, so they cannot corrupt the value output a script parses.
 ///
 /// `debug` (the `-d` flag) raises the `epics_pva_rs` library namespace
 /// to `DEBUG` on top of the env base — the analogue of pvxs's
@@ -130,12 +157,11 @@ pub fn set_log_filter(spec: &str) -> Result<(), LogFilterError> {
 
 /// Set a single target's level. Mirrors pvxs `logger_level_set(name,
 /// Level)`. Internally builds an `EnvFilter` of the form
-/// `"<base>,<target>=<level>"` where `<base>` is the current
-/// `RUST_LOG` (or `"info"` fallback).
+/// `"<base>,<target>=<level>"` where `<base>` is the same env-derived
+/// spec [`init_filter`] seeds from ([`log_env_base`]: `PVXS_LOG`, then
+/// `EPICS_PVA_LOG`, then `RUST_LOG`), or `"info"` when none is set.
 pub fn set_log_level(target: &str, level: LevelFilter) -> Result<(), LogFilterError> {
-    let base = std::env::var("EPICS_PVA_LOG")
-        .or_else(|_| std::env::var("RUST_LOG"))
-        .unwrap_or_else(|_| "info".to_string());
+    let base = log_env_base().unwrap_or_else(|| "info".to_string());
     let level_str = match level {
         LevelFilter::OFF => "off",
         LevelFilter::ERROR => "error",
@@ -161,4 +187,53 @@ pub enum LogFilterError {
     Parse(String),
     #[error("reload failed: {0}")]
     Reload(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression R0604-PVACLI-PVXS-LOG-ENV-1: the log env base must read
+    /// `PVXS_LOG` for pvxs `logger_config_env()` parity, with the documented
+    /// precedence `PVXS_LOG` > `EPICS_PVA_LOG` > `RUST_LOG`, an empty value
+    /// treated as unset (pvxs `if(!*env)`), and `None` when nothing is set.
+    /// One case per boundary. Serialised on `epics_env` because the three
+    /// variables are process-global and shared with other env-driven tests.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn log_env_base_pvxs_precedence_and_empty_skip() {
+        // SAFETY: std::env::{set,remove}_var are unsafe in edition 2024;
+        // the `epics_env` serial guard makes the mutation race-free.
+        unsafe {
+            for k in ["PVXS_LOG", "EPICS_PVA_LOG", "RUST_LOG"] {
+                std::env::remove_var(k);
+            }
+        }
+
+        // Nothing set → None (caller defaults to "info").
+        assert_eq!(log_env_base(), None);
+
+        // RUST_LOG alone is the fallback.
+        unsafe { std::env::set_var("RUST_LOG", "rust_log_spec") };
+        assert_eq!(log_env_base().as_deref(), Some("rust_log_spec"));
+
+        // EPICS_PVA_LOG wins over RUST_LOG.
+        unsafe { std::env::set_var("EPICS_PVA_LOG", "epics_pva_spec") };
+        assert_eq!(log_env_base().as_deref(), Some("epics_pva_spec"));
+
+        // PVXS_LOG wins over both (pvxs compatibility variable).
+        unsafe { std::env::set_var("PVXS_LOG", "epics_pva_rs=debug") };
+        assert_eq!(log_env_base().as_deref(), Some("epics_pva_rs=debug"));
+
+        // An empty PVXS_LOG is treated as unset, so EPICS_PVA_LOG wins —
+        // an exported-but-empty PVXS_LOG must not shadow a real setting.
+        unsafe { std::env::set_var("PVXS_LOG", "") };
+        assert_eq!(log_env_base().as_deref(), Some("epics_pva_spec"));
+
+        unsafe {
+            for k in ["PVXS_LOG", "EPICS_PVA_LOG", "RUST_LOG"] {
+                std::env::remove_var(k);
+            }
+        }
+    }
 }

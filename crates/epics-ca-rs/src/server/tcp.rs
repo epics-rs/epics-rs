@@ -265,10 +265,11 @@ struct ChannelEntry {
     /// Raw channel-filter JSON suffix the client appended after the
     /// record (epics-base 3.15.7). `None` for ordinary channels;
     /// `Some` when the client requested `REC.{"dbnd":{"d":0.5}}`
-    /// etc. Parsed via
-    /// `server::database::filters::parse_filter_chain` on
-    /// `CA_PROTO_EVENT_ADD` so the filter chain attaches to the
-    /// fresh subscriber.
+    /// etc. Validated by `try_parse_filter_chain` at
+    /// `CA_PROTO_CREATE_CHAN` (a bad suffix is rejected with
+    /// `CREATE_CH_FAIL` and no `ChannelEntry` is stored), then re-parsed
+    /// per delivery via `ChannelEntry::filter_chain` so each subscriber
+    /// and the READ path get a fresh stateful chain.
     filter_suffix: Option<String>,
     /// per-channel WRITE_NOTIFY busy gate. C
     /// `write_notify_action` (`rsrv/camessage.c:1660-1707`) stores
@@ -295,14 +296,20 @@ struct ChannelEntry {
 
 impl ChannelEntry {
     /// parse a FRESH channel-filter chain from this channel's
-    /// stored `.{...}` suffix. Returns an empty (identity) chain when
-    /// the channel carried no suffix or the suffix was malformed
-    /// (`parse_filter_chain` is permissive and warns — finding's
-    /// "empty chain with warning" case is preserved). A fresh chain
-    /// per call is REQUIRED: stateful filters (`dbnd` last-value,
-    /// `dec` counter, `sync` state) must not share state across the
-    /// READ path and each monitor subscriber, nor across two
-    /// subscribers on one channel.
+    /// stored `.{...}` suffix. A fresh chain per call is REQUIRED:
+    /// stateful filters (`dbnd` last-value, `dec` counter, `sync` state)
+    /// must not share state across the READ path and each monitor
+    /// subscriber, nor across two subscribers on one channel.
+    ///
+    /// Uses the STRICT `try_parse_filter_chain`. The suffix stored on a
+    /// `ChannelEntry` was already validated by the same strict parser at
+    /// `CA_PROTO_CREATE_CHAN` (a `ChannelEntry` exists only if its suffix
+    /// parsed — a bad suffix is rejected with `CREATE_CH_FAIL` and no
+    /// entry is inserted). Parsing is deterministic, so this re-parse
+    /// always succeeds; the empty fallback is unreachable, kept only so a
+    /// delivery path never panics. This holds the invariant by
+    /// construction — delivery never silently downgrades to an unfiltered
+    /// stream the way the permissive parser would.
     ///
     /// This is the single owner of filter parsing for every delivery
     /// path — READ / READ_NOTIFY, the monitor initial snapshot, and
@@ -310,7 +317,8 @@ impl ChannelEntry {
     /// only on the record-field `EVENT_ADD` path (the prior gap).
     fn filter_chain(&self) -> epics_base_rs::server::database::filters::FilterChain {
         match self.filter_suffix.as_deref() {
-            Some(json) => epics_base_rs::server::database::filters::parse_filter_chain(json),
+            Some(json) => epics_base_rs::server::database::filters::try_parse_filter_chain(json)
+                .unwrap_or_default(),
             None => epics_base_rs::server::database::filters::FilterChain::new(),
         }
     }
@@ -2152,21 +2160,51 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     }
                 };
 
-                // advertise the filter-FINAL element count
-                // (C `dbChannelFinalElements`). A count-reshaping filter
-                // (`arr` slice) shrinks how many elements the channel can
-                // ever deliver; the client must learn that count so its
-                // READ / monitor request count — and buffer allocation —
-                // match the filtered payload. Without this the client
-                // requests the native count and the server zero-pads the
-                // slice back up to it. An empty / value-gating-only
-                // chain folds to the identity, so unfiltered channels keep
-                // their native count unchanged.
+                // Parse the channel-filter suffix STRICTLY at channel
+                // creation — EPICS `dbChannelCreate()` parity. C runs
+                // `chf_parse()` while building the channel; a malformed /
+                // non-object suffix, an unknown filter name, or a filter
+                // whose own `parse_end()` rejects its config sets `status`,
+                // and at `finish:` `dbChannelCreate()` does
+                // `dbChannelDelete(chan); chan = NULL` and returns NULL —
+                // i.e. CREATE_CH_FAIL on the CA wire (dbChannel.c:176-179,
+                // 266-279, 512-526). The earlier CA path used the
+                // permissive `parse_filter_chain`, which fails OPEN to an
+                // unfiltered channel on a bad suffix, so a typo in a filter
+                // used to throttle / slice / synchronize exposure read the
+                // raw stream where C refuses the channel.
+                //
+                // On success the validated chain also yields the
+                // filter-FINAL element count (C `dbChannelFinalElements`):
+                // a count-reshaping filter (`arr` slice) shrinks how many
+                // elements the channel can ever deliver, and the client
+                // must learn that count so its READ / monitor request count
+                // — and buffer allocation — match the filtered payload. An
+                // empty / value-gating-only chain folds to the identity, so
+                // unfiltered channels keep their native count unchanged.
                 let element_count = match &filter_suffix {
                     Some(json) => {
-                        epics_base_rs::server::database::filters::parse_filter_chain(json)
-                            .final_element_count(element_count as usize)
-                            as u32
+                        match epics_base_rs::server::database::filters::try_parse_filter_chain(json)
+                        {
+                            Ok(chain) => chain.final_element_count(element_count as usize) as u32,
+                            Err(e) => {
+                                tracing::debug!(
+                                    pv = %pv_name,
+                                    error = %e,
+                                    "rejecting CREATE_CHAN: invalid channel-filter suffix",
+                                );
+                                let mut fail = CaHeader::new(CA_PROTO_CREATE_CH_FAIL);
+                                fail.cid = client_cid;
+                                let mut w = writer.lock().await;
+                                w.write_all(&fail.to_bytes()).await?;
+                                // flush deferred to handle_client outer loop (batched)
+                                drop(w);
+                                state
+                                    .audit("create_chan", &pv_name, "", "filter_parse_fail")
+                                    .await;
+                                return Ok(());
+                            }
+                        }
                     }
                     None => element_count,
                 };

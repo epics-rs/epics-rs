@@ -309,12 +309,17 @@ async fn ca_fr_8_arr_on_scalar_channel_is_noop() {
     }
 }
 
-/// A malformed filter suffix preserves the permissive
-/// "empty chain with warning" behaviour — the read returns the full
-/// unfiltered value rather than failing the subscription.
+/// Regression R0604-CASRV-FILTER-FAILOPEN-1.
+/// A malformed / unknown / bad-config filter suffix must REJECT the
+/// channel at `CA_PROTO_CREATE_CHAN` (CREATE_CH_FAIL), matching EPICS
+/// `dbChannelCreate()` → `chf_parse()` failure deleting the channel and
+/// returning NULL. The earlier CA path failed OPEN: a bad suffix
+/// downgraded to an unfiltered channel, so `caget("...{bad}")` read the
+/// raw waveform. Each malformed case must now fail to connect rather
+/// than return the unfiltered value.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn ca_fr_8_malformed_suffix_preserves_unfiltered_read() {
+async fn ca_fr_8_malformed_suffix_rejects_channel_create() {
     let port = free_port();
     let server = CaServer::builder()
         .port(port)
@@ -336,23 +341,31 @@ async fn ca_fr_8_malformed_suffix_preserves_unfiltered_read() {
         .await
         .expect("seed VAL");
 
-    // `{bad}` is not valid JSON → parse_filter_chain returns an empty
-    // chain (with a tracing warn) and the read proceeds unfiltered.
-    let (_t, val) =
-        tokio::time::timeout(Duration::from_secs(5), client.caget(r#"CAFR8:WF:R4.{bad}"#))
-            .await
-            .expect("caget with malformed suffix did not complete")
-            .expect("caget with malformed suffix should still succeed (permissive empty chain)");
-    assert_eq!(
-        first_double(&val),
-        0.0,
-        "malformed suffix must leave the value unfiltered (first element of the full ramp)"
-    );
-    assert_eq!(
-        len_double(&val),
-        10,
-        "malformed suffix must return the full 10-element waveform, not a slice"
-    );
+    // Sanity: the bare record (no suffix) still connects and reads.
+    let (_t, ok) = tokio::time::timeout(Duration::from_secs(5), client.caget("CAFR8:WF:R4"))
+        .await
+        .expect("bare caget did not complete")
+        .expect("bare record must still connect");
+    assert_eq!(len_double(&ok), 10, "bare record reads the full waveform");
+
+    // Each of these is rejected by `try_parse_filter_chain` at
+    // channel creation: invalid JSON, an unknown filter name, and a
+    // known filter whose config is rejected by its own parser. The
+    // server replies CREATE_CH_FAIL and the channel never connects, so
+    // `wait_connected` must error rather than the channel opening and
+    // failing open to the raw stream.
+    for bad in [
+        r#"CAFR8:WF:R4.{bad}"#,          // not valid JSON
+        r#"CAFR8:WF:R4.{"no_such":{}}"#, // unknown filter name
+        r#"CAFR8:WF:R4.{"dec":{}}"#,     // dec requires `n` — config rejected
+    ] {
+        let ch = client.create_channel(bad);
+        assert!(
+            ch.wait_connected(Duration::from_secs(1)).await.is_err(),
+            "{bad} must be rejected at CREATE_CHAN (CREATE_CH_FAIL) — the \
+             channel must not connect (fail-open)"
+        );
+    }
 }
 
 /// A filter suffix whose JSON contains a `.` (e.g.

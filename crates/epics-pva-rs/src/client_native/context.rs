@@ -2319,25 +2319,36 @@ impl PvaClient {
         results
     }
 
-    /// Same as [`Self::pvget_many`] but returns full introspection +
-    /// server address for each PV, and applies an optional custom
-    /// pvRequest (`None` = the default all-fields GET) to every PV.
+    /// Streaming multi-PV `pvget`: every GET is *started* before any is
+    /// awaited (one tokio task per PV), the client's UDP search is hurried
+    /// so siblings discover in parallel, and then each PV's result is
+    /// handed to `on_result(idx, result)` the instant *its* task
+    /// completes — in completion order, not after the whole batch joins.
+    /// `idx` is the PV's position in `pv_names` so the caller can recover
+    /// the name. A slow or missing PV no longer blocks its siblings from
+    /// starting *or* from being reported, and the batch is bounded by one
+    /// timeout instead of N.
     ///
-    /// Every GET is *started* before any is awaited: one tokio task per
-    /// PV issues the operation concurrently, then the client's UDP
-    /// search is hurried so siblings discover in parallel, and the whole
-    /// set is awaited under the per-op timeout. A slow or missing PV no
-    /// longer blocks its siblings from starting, and the batch is bounded
-    /// by one timeout instead of N. Mirrors pvxs `tools/get.cpp:102-133`,
-    /// which `exec()`s every operation, calls `ctxt.hurryUp()`, and waits
-    /// once on the shared completion event. Results are in input order;
-    /// a failed PV maps to `Err`.
-    pub async fn pvget_many_full(
+    /// This is the per-operation `.result()` callback shape of pvxs
+    /// `pvxget` (`tools/get.cpp:102-133`): the tool `exec()`s every op,
+    /// installs a result callback that prints the PV the moment its op
+    /// finishes, calls `ctxt.hurryUp()`, and waits once on the shared
+    /// completion event. A fast PV is therefore visible before a slow or
+    /// missing sibling's timeout expires.
+    ///
+    /// [`Self::pvget_many_full`] is the ordered-collection wrapper over
+    /// this for library callers that need an input-order `Vec`; CLIs that
+    /// surface partial progress must call this directly so a completed PV
+    /// is printed immediately instead of buffered behind a slow sibling.
+    /// Regression R0604-PVACLI-MULTIPV-OUTPUT-BATCHED-1.
+    pub async fn pvget_many_full_streaming<F>(
         &self,
         pv_names: &[&str],
         request: Option<&crate::pv_request::PvRequestExpr>,
-    ) -> Vec<PvaResult<PvGetResult>> {
-        let n = pv_names.len();
+        mut on_result: F,
+    ) where
+        F: FnMut(usize, PvaResult<PvGetResult>),
+    {
         let mut set = tokio::task::JoinSet::new();
         for (idx, name) in pv_names.iter().enumerate() {
             let client = self.clone();
@@ -2355,28 +2366,54 @@ impl PvaClient {
         // search immediately instead of waiting for the periodic tick
         // (pvxs `ctxt.hurryUp()` after the exec loop).
         self.hurry_up().await;
-        let mut results: Vec<PvaResult<PvGetResult>> =
-            (0..n).map(|_| Err(PvaError::Timeout)).collect();
         while let Some(join_result) = set.join_next().await {
             if let Ok((idx, pva_result)) = join_result {
-                results[idx] = pva_result;
+                on_result(idx, pva_result);
             }
         }
+    }
+
+    /// Same as [`Self::pvget_many`] but returns full introspection +
+    /// server address for each PV, and applies an optional custom
+    /// pvRequest (`None` = the default all-fields GET) to every PV.
+    /// Results are in input order; a failed PV maps to `Err`.
+    ///
+    /// Ordered-collection wrapper over
+    /// [`Self::pvget_many_full_streaming`] for library callers that want
+    /// the whole batch as one `Vec`. CLIs that print partial progress must
+    /// call the streaming method directly so a fast PV is reported as soon
+    /// as it completes rather than buffered behind the slowest sibling.
+    pub async fn pvget_many_full(
+        &self,
+        pv_names: &[&str],
+        request: Option<&crate::pv_request::PvRequestExpr>,
+    ) -> Vec<PvaResult<PvGetResult>> {
+        let mut results: Vec<PvaResult<PvGetResult>> = (0..pv_names.len())
+            .map(|_| Err(PvaError::Timeout))
+            .collect();
+        self.pvget_many_full_streaming(pv_names, request, |idx, r| {
+            results[idx] = r;
+        })
+        .await;
         results
     }
 
-    /// Concurrent multi-PV `pvinfo`. Starts a GET_FIELD describe op for
-    /// every PV at once, hurries discovery, then awaits the whole set
-    /// under the per-op timeout — the same start-all-then-wait structure
-    /// as [`Self::pvget_many_full`], mirroring pvxs `tools/info.cpp:81-112`
-    /// (`exec()` every op, `hurryUp()`, one shared wait). A slow or
-    /// missing PV does not block its siblings, and the batch is bounded by
-    /// one timeout. Results are in input order; a failed PV maps to `Err`.
-    pub async fn pvinfo_many_full_with_credentials(
-        &self,
-        pv_names: &[&str],
-    ) -> Vec<PvaResult<PvInfoResult>> {
-        let n = pv_names.len();
+    /// Streaming multi-PV `pvinfo`: starts a GET_FIELD describe op for
+    /// every PV at once, hurries discovery, then hands each PV's result to
+    /// `on_result(idx, result)` the instant its task completes — the same
+    /// start-all, report-at-completion structure as
+    /// [`Self::pvget_many_full_streaming`], mirroring pvxs
+    /// `tools/info.cpp:81-112` (`exec()` every op, install a per-op
+    /// `.result()` callback, `hurryUp()`, one shared wait). A slow or
+    /// missing PV does not block its siblings from being reported, and the
+    /// batch is bounded by one timeout. `idx` is the PV's position in
+    /// `pv_names`. [`Self::pvinfo_many_full_with_credentials`] is the
+    /// ordered-collection wrapper over this.
+    /// Regression R0604-PVACLI-MULTIPV-OUTPUT-BATCHED-1.
+    pub async fn pvinfo_many_full_streaming<F>(&self, pv_names: &[&str], mut on_result: F)
+    where
+        F: FnMut(usize, PvaResult<PvInfoResult>),
+    {
         let mut set = tokio::task::JoinSet::new();
         for (idx, name) in pv_names.iter().enumerate() {
             let client = self.clone();
@@ -2384,13 +2421,28 @@ impl PvaClient {
             set.spawn(async move { (idx, client.pvinfo_full_with_credentials(&name).await) });
         }
         self.hurry_up().await;
-        let mut results: Vec<PvaResult<PvInfoResult>> =
-            (0..n).map(|_| Err(PvaError::Timeout)).collect();
         while let Some(join_result) = set.join_next().await {
             if let Ok((idx, r)) = join_result {
-                results[idx] = r;
+                on_result(idx, r);
             }
         }
+    }
+
+    /// Concurrent multi-PV `pvinfo`, input-order collection. Ordered
+    /// wrapper over [`Self::pvinfo_many_full_streaming`]; a failed PV maps
+    /// to `Err`. CLIs that print partial progress must call the streaming
+    /// method directly.
+    pub async fn pvinfo_many_full_with_credentials(
+        &self,
+        pv_names: &[&str],
+    ) -> Vec<PvaResult<PvInfoResult>> {
+        let mut results: Vec<PvaResult<PvInfoResult>> = (0..pv_names.len())
+            .map(|_| Err(PvaError::Timeout))
+            .collect();
+        self.pvinfo_many_full_streaming(pv_names, |idx, r| {
+            results[idx] = r;
+        })
+        .await;
         results
     }
 }

@@ -116,55 +116,62 @@ async fn main() {
         .timeout(epics_pva_rs::cli::wait_timeout_duration(args.timeout))
         .build();
 
-    // Start a describe op for every PV before awaiting any, then await the
-    // whole set under one command-level timeout (pvxs `tools/info.cpp:81-112`
-    // exec()s all ops, hurryUp()s, and waits once). The serial await-per-PV
-    // loop this replaces spent one timeout per PV and let a slow first PV
-    // block later ones from even starting.
+    // Start a describe op for every PV before awaiting any, then print
+    // each PV's result the instant its task completes — completion order,
+    // not input order — so a fast PV is visible before a slow or missing
+    // sibling's timeout expires. pvxs `pvxinfo` (tools/info.cpp:81-112)
+    // exec()s all ops, installs a per-op `.result()` callback that prints
+    // the PV when its op finishes, hurryUp()s, and waits once. The serial
+    // await-per-PV loop this replaces spent one timeout per PV; the prior
+    // collect-then-zip loop buffered every completed PV behind the slowest
+    // sibling (Regression R0604-PVACLI-MULTIPV-OUTPUT-BATCHED-1). Each
+    // output block leads with the PV name, so completion-order output
+    // stays self-identifying.
     let names: Vec<&str> = args.pv_names.iter().map(String::as_str).collect();
-    let results = client.pvinfo_many_full_with_credentials(&names).await;
-
     let mut failed = false;
-    for (pv_name, result) in args.pv_names.iter().zip(results) {
-        match result {
-            Ok((desc, server_addr, cred)) => {
-                // Under `--show-credentials`, print the server's peer
-                // identity line first. pvxs
-                // `operator<<(PeerCredentials)` formats as
-                // `TLS method:authority/account@peer`; the `TLS`
-                // prefix and `authority` segment are omitted when not
-                // applicable. (pvxs reserves `-v` for effective config,
-                // so this Rust diagnostic gets its own flag.)
-                if args.show_credentials {
-                    match &cred {
-                        Some(c) => {
-                            let authority = if c.authority.is_empty() {
-                                String::new()
-                            } else {
-                                format!(":{}", c.authority)
-                            };
-                            println!("# TLS x509{authority}/{}@{server_addr}", c.account);
-                        }
-                        None => {
-                            // Plain `pva://` TCP — no peer certificate,
-                            // so no X.509 identity to report.
-                            println!("# anonymous/anonymous@{server_addr}");
+    client
+        .pvinfo_many_full_streaming(&names, |idx, result| {
+            let pv_name = &args.pv_names[idx];
+            match result {
+                Ok((desc, server_addr, cred)) => {
+                    // Under `--show-credentials`, print the server's peer
+                    // identity line first. pvxs
+                    // `operator<<(PeerCredentials)` formats as
+                    // `TLS method:authority/account@peer`; the `TLS`
+                    // prefix and `authority` segment are omitted when not
+                    // applicable. (pvxs reserves `-v` for effective config,
+                    // so this Rust diagnostic gets its own flag.)
+                    if args.show_credentials {
+                        match &cred {
+                            Some(c) => {
+                                let authority = if c.authority.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(":{}", c.authority)
+                                };
+                                println!("# TLS x509{authority}/{}@{server_addr}", c.account);
+                            }
+                            None => {
+                                // Plain `pva://` TCP — no peer certificate,
+                                // so no X.509 identity to report.
+                                println!("# anonymous/anonymous@{server_addr}");
+                            }
                         }
                     }
+                    // pvxs `pvinfo` prints "<pv> from <peer>" then the type tree
+                    // with values hidden (info.cpp:90-94). This replaces the
+                    // Rust-specific `<pv>` / `Server:` / `Type:` label block; the
+                    // `--show-credentials` `#` line above is a Rust-only
+                    // diagnostic kept ahead of the pvxs-format block.
+                    print!("{}", format::format_info_value(pv_name, server_addr, &desc));
                 }
-                // pvxs `pvinfo` prints "<pv> from <peer>" then the type tree
-                // with values hidden (info.cpp:90-94). This replaces the
-                // Rust-specific `<pv>` / `Server:` / `Type:` label block; the
-                // `--show-credentials` `#` line above is a Rust-only
-                // diagnostic kept ahead of the pvxs-format block.
-                print!("{}", format::format_info_value(pv_name, server_addr, &desc));
+                Err(e) => {
+                    eprintln!("{pv_name}: {e}");
+                    failed = true;
+                }
             }
-            Err(e) => {
-                eprintln!("{pv_name}: {e}");
-                failed = true;
-            }
-        }
-    }
+        })
+        .await;
     if failed {
         std::process::exit(1);
     }

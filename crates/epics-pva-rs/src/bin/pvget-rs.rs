@@ -129,57 +129,66 @@ async fn main() {
         .build();
     let mode = args.mode.as_str();
 
-    // Start a GET for every PV before awaiting any, then await the whole
-    // set under one command-level timeout. A slow or missing PV must not
-    // prevent its siblings from even starting (pvxs `tools/get.cpp:102-133`
-    // exec()s all ops, hurryUp()s, and waits once). The serial await-per-PV
-    // loop this replaces spent one timeout per PV and hid later successes
-    // behind an earlier slow one.
+    // Start a GET for every PV before awaiting any, then print each PV's
+    // result the instant its task completes — completion order, not input
+    // order — so a fast PV is visible before a slow or missing sibling's
+    // timeout expires. pvxs `pvxget` (tools/get.cpp:102-133) exec()s all
+    // ops, installs a per-op `.result()` callback that prints the PV when
+    // its op finishes, hurryUp()s, and waits once. The serial await-per-PV
+    // loop this replaces spent one timeout per PV; the prior
+    // collect-then-zip loop buffered every completed PV behind the slowest
+    // sibling (Regression R0604-PVACLI-MULTIPV-OUTPUT-BATCHED-1). Each
+    // output block leads with the PV name, so completion-order output
+    // stays self-identifying — exactly as pvxs prints `argv[n]` first.
     let names: Vec<&str> = args.pv_names.iter().map(String::as_str).collect();
-    let results = client.pvget_many_full(&names, request.as_ref()).await;
-
     let mut failed = false;
-    for (pv_name, result) in args.pv_names.iter().zip(results) {
-        match result {
-            Ok(result) => {
-                // `-q` is a deprecated no-op (see Args::quiet); successful
-                // values are always printed, matching pvAccessCPP pvget.
-                let output = if let Some(vfmt) = format::parse_value_format(args.format.as_deref())
-                {
-                    // pvxs `-F` path (get.cpp:112-117): print the PV-name
-                    // line, then the `Value::format()` output wrapped in one
-                    // `Indented` level (base_depth=1). A GET marks every
-                    // field it returns, so Delta shows them all (marked=None).
-                    let fmt = format::ValueFmt {
-                        format: vfmt,
-                        array_limit: args.array_limit,
-                        show_value: true,
-                    };
-                    format!(
-                        "{pv_name}\n{}",
-                        format::format_value(
-                            &result.introspection,
-                            Some(&result.value),
-                            &fmt,
-                            None,
-                            1,
+    client
+        .pvget_many_full_streaming(&names, request.as_ref(), |idx, result| {
+            let pv_name = &args.pv_names[idx];
+            match result {
+                Ok(result) => {
+                    // `-q` is a deprecated no-op (see Args::quiet); successful
+                    // values are always printed, matching pvAccessCPP pvget.
+                    let output = if let Some(vfmt) =
+                        format::parse_value_format(args.format.as_deref())
+                    {
+                        // pvxs `-F` path (get.cpp:112-117): print the PV-name
+                        // line, then the `Value::format()` output wrapped in one
+                        // `Indented` level (base_depth=1). A GET marks every
+                        // field it returns, so Delta shows them all (marked=None).
+                        let fmt = format::ValueFmt {
+                            format: vfmt,
+                            array_limit: args.array_limit,
+                            show_value: true,
+                        };
+                        format!(
+                            "{pv_name}\n{}",
+                            format::format_value(
+                                &result.introspection,
+                                Some(&result.value),
+                                &fmt,
+                                None,
+                                1,
+                            )
                         )
-                    )
-                } else {
-                    match mode {
-                        "json" => format::format_json(pv_name, &result.value),
-                        "raw" => format::format_raw(pv_name, &result.introspection, &result.value),
-                        _ => format::format_nt(pv_name, &result.introspection, &result.value),
-                    }
-                };
-                print!("{output}");
+                    } else {
+                        match mode {
+                            "json" => format::format_json(pv_name, &result.value),
+                            "raw" => {
+                                format::format_raw(pv_name, &result.introspection, &result.value)
+                            }
+                            _ => format::format_nt(pv_name, &result.introspection, &result.value),
+                        }
+                    };
+                    print!("{output}");
+                }
+                Err(e) => {
+                    eprintln!("{pv_name}: {e}");
+                    failed = true;
+                }
             }
-            Err(e) => {
-                eprintln!("{pv_name}: {e}");
-                failed = true;
-            }
-        }
-    }
+        })
+        .await;
     if failed {
         std::process::exit(1);
     }

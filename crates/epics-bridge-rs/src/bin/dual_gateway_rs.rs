@@ -628,11 +628,16 @@ fn main() -> ExitCode {
     // read them at construction. Only when the CA side is enabled; the PVA
     // side uses the EPICS_PVA_* namespace and is unaffected.
     if !args.no_ca {
+        // C reads the *current* EPICS_CAS_AUTO_BEACON_ADDR_LIST via getenv
+        // inside the -cip branch (gateway.cc:367-372) and rewrites a present
+        // non-NO value to YES; mirror that read here and pass it in.
+        let beacon_auto = std::env::var("EPICS_CAS_AUTO_BEACON_ADDR_LIST").ok();
         let routing = epics_bridge_rs::ca_gateway::routing_env_pairs(
             args.ca_sip.as_deref(),
             args.ca_signore.as_deref(),
             args.ca_cip.as_deref(),
             args.ca_cport,
+            beacon_auto.as_deref(),
         );
         // SAFETY: still single-threaded — the multi-thread runtime is built
         // on the next statement, after this loop returns.

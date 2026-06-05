@@ -312,11 +312,16 @@ fn main() -> ExitCode {
     // (EPICS_CA_*) read them at construction. Distinct namespaces => the
     // two sides cannot collide. Done here, while the process is still
     // single-threaded, to satisfy `set_var`'s safety contract.
+    // C reads the *current* EPICS_CAS_AUTO_BEACON_ADDR_LIST via getenv inside
+    // the -cip branch (gateway.cc:367-372) and rewrites a present non-NO value
+    // to YES; mirror that read here and pass it into the pure mapping.
+    let beacon_auto = std::env::var("EPICS_CAS_AUTO_BEACON_ADDR_LIST").ok();
     let routing = epics_bridge_rs::ca_gateway::routing_env_pairs(
         args.sip.as_deref(),
         args.signore.as_deref(),
         args.cip.as_deref(),
         args.cport,
+        beacon_auto.as_deref(),
     );
     // SAFETY: no runtime threads exist yet — the multi-thread tokio runtime
     // is built below, after this loop returns.

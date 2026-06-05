@@ -1021,6 +1021,53 @@ fn qsrv2_enabled() -> bool {
     decision.enabled
 }
 
+/// Async link-set installer for
+/// [`epics_base_rs::server::ioc_app::IocApplication::register_link_set_installer`].
+///
+/// Installs the `"pva"` link set (pvalink) on `db` and returns the
+/// `pvxr` / `dbpvxr` / `pvalink_enable` / `pvalink_disable` iocsh
+/// commands. Registered at IOC construction, it is fired by
+/// `IocApplication::run` at the `AfterCaLinkInit` hook — BEFORE
+/// `setup_cp_links` and, crucially, before the iocInit external-link
+/// wait (`wait_for_external_links`). So PVA links participate in the
+/// iocInit "wait for links to connect before PINI" step, matching the
+/// `"ca"` link set installed at the same hook. Installing pvalink in
+/// the Phase-3 protocol runner (where it lived previously) ran after
+/// that wait, so PVA links were silently excluded from it.
+///
+/// QSRV2-gated (pvxs `iochooks.cpp:461-496`: `pvalink_enable()` runs
+/// only when `enable2()` is true) and feature-gated on `pvalink`. When
+/// QSRV2 is disabled or the feature is off this is an empty no-op
+/// installer — a database with no PVA links stays fully serviceable,
+/// and the shared PVA client is created lazily per link, so there is
+/// no init failure to abort the IOC on. The QSRV2 decision is taken
+/// via the non-printing `resolve_qsrv2_enable`; the single
+/// authoritative startup diagnostic is still emitted once by the
+/// runner's own `qsrv2_enabled` call.
+pub async fn pvalink_link_set_install(
+    db: Arc<epics_base_rs::server::database::PvDatabase>,
+) -> Vec<epics_base_rs::server::iocsh::registry::CommandDef> {
+    let qsrv2_on = resolve_qsrv2_enable(
+        std::env::var("EPICS_IOC_IGNORE_SERVERS").ok().as_deref(),
+        std::env::var("PVXS_QSRV_ENABLE").ok().as_deref(),
+    )
+    .enabled;
+    if !qsrv2_on {
+        return Vec::new();
+    }
+    #[cfg(feature = "pvalink")]
+    {
+        let resolver =
+            crate::pvalink::install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
+        crate::pvalink::register_pvalink_commands(resolver)
+    }
+    #[cfg(not(feature = "pvalink"))]
+    {
+        let _ = db;
+        Vec::new()
+    }
+}
+
 /// Runs a combined CA + PVA IOC with QSRV bridge.
 ///
 /// Designed as a protocol runner for [`IocApplication::run`]. Starts a CA
@@ -1092,20 +1139,20 @@ pub async fn run_ca_pva_qsrv_ioc(
         store.register_pva_pv(&pv_name, handle).await;
     }
 
-    // ── External links (`pvalink`) ──
-    // The `"pva"` link set is installed here so a loaded database with
-    // `pva://somepv` links resolves through the monitor-backed cache,
-    // registering the `pvxr` / `dbpvxr` / `pvalink_enable` /
-    // `pvalink_disable` iocsh commands.
-    //
-    // The `"ca"` link set (`calink`) is NOT installed here. It is
-    // registered at the base `AfterCaLinkInit` hook via
-    // `IocApplication::register_link_set_installer(calink_link_set_install)`
-    // — BEFORE `setup_cp_links` warms Passive CP holders. Installing it
-    // in this Phase-3 runner is too late: the warm's `resolve_external_pv`
-    // would no-op, so a Passive CP/CPP holder of a `ca://` link would
-    // never open its monitor. `config.shell_commands` already carries the
-    // `caxr` / `dbcaxr` commands the installer returned at that hook.
+    // ── External links (`calink` + `pvalink`) ──
+    // Neither external link set is installed in this Phase-3 runner. Both
+    // register at the base `AfterCaLinkInit` hook via
+    // `IocApplication::register_link_set_installer(...)`:
+    //   * `"ca"`  — `calink_link_set_install`
+    //   * `"pva"` — `pvalink_link_set_install`
+    // The hook fires BEFORE `setup_cp_links` (which warms Passive `ca://`
+    // CP holders) AND before the iocInit external-link wait
+    // (`wait_for_external_links`, which holds PINI until links connect).
+    // Installing either set here in Phase 3 is too late: a Passive `ca://`
+    // CP holder's `resolve_external_pv` warm would no-op, and PVA links
+    // would be silently excluded from the iocInit link-wait.
+    // `config.shell_commands` already carries the `caxr` / `dbcaxr` /
+    // `pvxr` / `dbpvxr` commands those installers returned at the hook.
     let mut shell_commands = config.shell_commands;
 
     // Register the QSRV runtime (interactive-shell) commands —
@@ -1119,23 +1166,6 @@ pub async fn run_ca_pva_qsrv_ioc(
     shell_commands.extend(super::iocsh::register_qsrv_runtime_commands(
         store.provider().clone(),
     ));
-
-    #[cfg(feature = "pvalink")]
-    if qsrv2_on {
-        // pvxs calls `pvalink_enable()` only when `enable2()` is true
-        // (iochooks.cpp:461-496); a QSRV2-disabled IOC leaves pvalink
-        // inactive and registers no pvalink iocsh commands.
-        //
-        // `install_pvalink_resolver` is infallible — the PVA client is
-        // created lazily per link — so there is no init failure to
-        // abort the IOC on. A database with no PVA links is still
-        // fully serviceable. This is the PVA-side counterpart of the
-        // `"ca"` link set installed above.
-        let resolver =
-            crate::pvalink::install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
-        shell_commands.extend(crate::pvalink::register_pvalink_commands(resolver));
-        tracing::info!("pvalink: `pva` link set installed");
-    }
 
     // ── CA server (background) ──
     let ca_server = epics_ca_rs::server::CaServer::from_parts(

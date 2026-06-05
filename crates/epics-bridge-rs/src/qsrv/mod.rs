@@ -45,6 +45,7 @@ pub use provider::{
 };
 #[cfg(feature = "qsrv")]
 pub use pva_adapter::{
-    PvaPvHandle, QsrvPvStore, register_pva_pv_global, run_ca_pva_qsrv_ioc, take_registered_pva_pvs,
+    PvaPvHandle, QsrvPvStore, pvalink_link_set_install, register_pva_pv_global,
+    run_ca_pva_qsrv_ioc, take_registered_pva_pvs,
 };
 pub use pvif::{FieldMapping, NtType};

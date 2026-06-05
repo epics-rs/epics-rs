@@ -5,7 +5,9 @@ use epics_base_rs::types::DBR_CLASS_NAME;
 use epics_ca_rs::cli::{
     FloatFormat, FloatStyle, IntStyle, PV_NAME_WIDTH, ValueFormat, format_value,
 };
-use epics_ca_rs::client::{CaClient, enum_cli_readback_dbr, float_as_string_readback_dbr};
+use epics_ca_rs::client::{
+    CaClient, ReqCount, enum_cli_readback_dbr, float_as_string_readback_dbr,
+};
 use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
 use std::time::SystemTime;
 
@@ -509,6 +511,32 @@ fn specified_dbr_report(
     out
 }
 
+/// Resolve the CA READ_NOTIFY element count for `caget`'s two request
+/// modes, mirroring C `caget.c:197-218`:
+///
+/// - **Callback** (`-c`, `ca_array_get_callback`, `caget.c:200`): the
+///   user's `-#` count is clamped to the native count
+///   (`reqElems > nElems ? nElems : reqElems`), but no positive `-#` (no
+///   `-#`, or `-# 0`) is sent as the CA autosize request (count 0), so a
+///   dynamic waveform returns only its current `NORD` elements →
+///   [`ReqCount::Autosize`].
+/// - **Synchronous** (no `-c`, `ca_array_get`, `caget.c:208`): the same
+///   clamp applies, but a 0 (no `-#`/`-# 0`) means the full native count
+///   (`reqElems && reqElems < nElems ? reqElems : nElems`) →
+///   [`ReqCount::Fixed`] (which resolves `0` to `native`).
+///
+/// `max_elements` is the user's `-#` argument (`None` = not given);
+/// `native` is the connected channel's element count (libca
+/// `ca_element_count`).
+fn caget_req_count(callback: bool, max_elements: Option<usize>, native: u32) -> ReqCount {
+    let count = max_elements.map_or(0, |n| (n as u32).min(native));
+    if callback {
+        ReqCount::Autosize(count)
+    } else {
+        ReqCount::Fixed(count)
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Parse via ArgMatches (not the plain derive) so the command-line
@@ -587,6 +615,10 @@ async fn main() {
     // reqElems`); `None` (no `-#`) requests the full count. Captured as a
     // Copy so each spawned task owns it without moving `args`.
     let max_elements = args.max_elements;
+    // C `caget.c:197-218` resolves that count differently per request mode:
+    // callback (`-c`) preserves a count-0 autosize request, the synchronous
+    // path rewrites 0 → native. Captured as a Copy for the same reason.
+    let callback = args.callback;
     let mut handles = Vec::new();
     for (name, ch) in &channels {
         let name = name.clone();
@@ -597,14 +629,14 @@ async fn main() {
             if connect.is_err() {
                 return (name, Err("not connected".to_string()));
             }
-            // Bound the CA payload at the request boundary: clamp `-# N` to
-            // the connected channel's native element count (C `caget.c:200`).
-            // `0` requests the full count, which the count-aware GET paths
-            // translate to the native element count.
-            let req_count: u32 = match max_elements {
-                Some(n) => (n as u32).min(ch.element_count().unwrap_or(0)),
-                None => 0,
-            };
+            // Bound the CA payload at the request boundary and pick the
+            // request-mode count contract (C `caget.c:197-218`): the
+            // callback path (`-c`) sends a count-0 autosize request so a
+            // dynamic waveform returns its current NORD, while the
+            // synchronous path requests the full native count.
+            // Regression R0604-CAGET-CALLBACK-AUTOSIZE-1.
+            let native = ch.element_count().unwrap_or(0);
+            let req_count = caget_req_count(callback, max_elements, native);
             // C `caget.c:172-187`: the request DBR type depends on the
             // output format. `specifiedDbr` carries the `-d` type verbatim
             // (`pvs[n].dbrType = dbrType`) and keeps the full snapshot for
@@ -878,8 +910,8 @@ fn parse_dbr_type(s: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, OutputMode, dbr_extended_str, dbr_text, parse_dbr_type, resolve_output_mode,
-        scan_leading_i64, specified_dbr_report,
+        Args, OutputMode, ReqCount, caget_req_count, dbr_extended_str, dbr_text, parse_dbr_type,
+        resolve_output_mode, scan_leading_i64, specified_dbr_report,
     };
     use clap::CommandFactory;
     use epics_base_rs::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, Snapshot};
@@ -894,6 +926,43 @@ mod tests {
     fn mode_of(argv: &[&str]) -> OutputMode {
         let m = Args::command().get_matches_from(argv);
         resolve_output_mode(&m)
+    }
+
+    /// Regression R0604-CAGET-CALLBACK-AUTOSIZE-1: `caget -c` (callback,
+    /// `ca_array_get_callback`) must send the CA autosize request (count 0)
+    /// when no positive `-#` is given, so a dynamic waveform returns its
+    /// current `NORD`; the synchronous path (no `-c`, `ca_array_get`)
+    /// instead requests the full native element count. A positive `-# N`
+    /// clamps to the native count in both modes (C `caget.c:197-218`).
+    ///
+    /// One assertion per (mode × `-#` boundary); the asserted value is the
+    /// resolved on-the-wire READ_NOTIFY count (`ReqCount::resolve`):
+    /// callback → 0 / 0 / N, synchronous → native / native / N. Before the
+    /// fix the callback flag was a no-op, so both modes resolved 0 → native
+    /// and the autosize request was lost.
+    #[test]
+    fn caget_req_count_callback_preserves_autosize() {
+        let native = 5u32;
+        let wire =
+            |callback, max: Option<usize>| caget_req_count(callback, max, native).resolve(native);
+
+        // Synchronous (no -c): a count-0 request becomes the native count.
+        assert_eq!(wire(false, None), native, "sync, no -#");
+        assert_eq!(wire(false, Some(0)), native, "sync, -# 0");
+        assert_eq!(wire(false, Some(3)), 3, "sync, -# 3");
+        assert_eq!(wire(false, Some(9)), native, "sync, -# > native clamps");
+
+        // Callback (-c): no positive -# preserves the count-0 autosize wire
+        // request; a positive -# clamps to native exactly like the sync path.
+        assert_eq!(wire(true, None), 0, "callback, no -# => autosize 0");
+        assert_eq!(wire(true, Some(0)), 0, "callback, -# 0 => autosize 0");
+        assert_eq!(wire(true, Some(3)), 3, "callback, -# 3");
+        assert_eq!(wire(true, Some(9)), native, "callback, -# > native clamps");
+
+        // The request-mode variant itself: no-positive-`-#` callback is the
+        // only case that constructs an Autosize request.
+        assert_eq!(caget_req_count(true, None, native), ReqCount::Autosize(0));
+        assert_eq!(caget_req_count(false, None, native), ReqCount::Fixed(0));
     }
 
     // C `complainIfNotPlainAndSet` (caget.c:369): -t/-a/-d are mutually

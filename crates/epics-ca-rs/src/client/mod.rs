@@ -1543,6 +1543,58 @@ impl CaChannel {
     }
 }
 
+/// How a CA GET resolves its on-the-wire READ_NOTIFY element count.
+///
+/// `caget` issues its request in one of two modes, and C resolves the
+/// user's `-#` element count differently in each (`caget.c:197-218`):
+///
+/// - [`ReqCount::Fixed`] mirrors the synchronous `ca_array_get` branch
+///   (`caget.c:208`): `reqElems && reqElems < nElems ? reqElems : nElems`.
+///   A `0` (no `-#`, or `-# 0`) means "the channel's current native
+///   element count", so the request always carries a concrete count.
+/// - [`ReqCount::Autosize`] mirrors the `ca_array_get_callback` branch
+///   (`caget.c:200-205`): `reqElems > nElems ? nElems : reqElems`. A `0`
+///   (no positive `-#`) is sent **verbatim** as the CA autosize request,
+///   so the IOC reports each response with the record's *current* element
+///   count — a dynamic waveform with `NORD < NELM` returns only `NORD`
+///   elements instead of the full `NELM`.
+///
+/// `From<u32>` maps a bare count to [`ReqCount::Fixed`], so existing
+/// callers that pass `0` keep the "0 = native count" contract unchanged;
+/// only the callback tool front-end constructs [`ReqCount::Autosize`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReqCount {
+    /// Request exactly this many elements; `0` is resolved to the native
+    /// element count (synchronous `ca_array_get`, `caget.c:208`).
+    Fixed(u32),
+    /// Send this count verbatim, including `0` (CA autosize); callback
+    /// `ca_array_get_callback`, `caget.c:200`.
+    Autosize(u32),
+}
+
+impl From<u32> for ReqCount {
+    /// A bare element count is a [`ReqCount::Fixed`] request — preserving
+    /// the long-standing "0 = full native count" convention for every
+    /// caller that has not opted into autosize.
+    fn from(count: u32) -> Self {
+        ReqCount::Fixed(count)
+    }
+}
+
+impl ReqCount {
+    /// The concrete element count to put on the wire, given the channel's
+    /// `native` element count. `Fixed(0)` resolves to `native`; every
+    /// other value (including `Autosize(0)`) is passed through. The GET
+    /// paths still apply libca's `ECA_BADCOUNT` guard, so a resolved count
+    /// greater than `native` is rejected rather than silently clamped.
+    pub fn resolve(self, native: u32) -> u32 {
+        match self {
+            ReqCount::Fixed(0) => native,
+            ReqCount::Fixed(n) | ReqCount::Autosize(n) => n,
+        }
+    }
+}
+
 impl CaChannel {
     pub async fn wait_connected(&self, timeout: Duration) -> CaResult<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -2162,33 +2214,36 @@ impl CaChannel {
         self.get_with_timeout_count(timeout, 0).await
     }
 
-    /// Plain (no-metadata) GET requesting at most `count` array elements;
-    /// `count == 0` requests the full native count. The count-aware sibling
-    /// of [`Self::get_with_timeout`], mirroring the metadata/exact-type GET
-    /// paths ([`Self::get_with_metadata_count`], [`Self::get_with_dbr_type`])
-    /// so `caget -# N` bounds the CA payload at the request boundary instead
-    /// of transferring the whole array and truncating in rendering
-    /// (C `caget.c:200-215` applies `reqElems` to the wire request count).
+    /// Plain (no-metadata) GET requesting `count` array elements. `count`
+    /// accepts a bare `u32` ([`ReqCount::Fixed`], where `0` resolves to the
+    /// full native count) or [`ReqCount::Autosize`] (callback mode, where
+    /// `0` is sent verbatim as the CA autosize request). The count-aware
+    /// sibling of [`Self::get_with_timeout`], mirroring the
+    /// metadata/exact-type GET paths ([`Self::get_with_metadata_count`],
+    /// [`Self::get_with_dbr_type`]) so `caget -# N` bounds the CA payload at
+    /// the request boundary instead of transferring the whole array and
+    /// truncating in rendering (C `caget.c:200-215` applies `reqElems` to
+    /// the wire request count).
     ///
-    /// A `count` greater than the channel element count is rejected as
-    /// `ECA_BADCOUNT`, matching libca `nciu::read`; the tool front-end
+    /// A resolved count greater than the channel element count is rejected
+    /// as `ECA_BADCOUNT`, matching libca `nciu::read`; the tool front-end
     /// clamps to the native count first (C `caget.c:200`
     /// `reqElems > nElems ? nElems : reqElems`), so this guards only
     /// programmatic misuse.
     pub async fn get_with_timeout_count(
         &self,
         timeout: Duration,
-        count: u32,
+        count: impl Into<ReqCount>,
     ) -> CaResult<(DbFieldType, EpicsValue)> {
         let snap = self.snapshot()?;
-        if count > 0 && count > snap.element_count {
+        let request_count = count.into().resolve(snap.element_count);
+        if request_count > snap.element_count {
             return Err(CaError::Protocol(format!(
                 "get count {} exceeds channel element count {} \
                  (matches libca nciu::read ECA_BADCOUNT)",
-                count, snap.element_count
+                request_count, snap.element_count
             )));
         }
-        let request_count = if count > 0 { count } else { snap.element_count };
 
         let ioid = self.in_flight.alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -2246,7 +2301,11 @@ impl CaChannel {
     /// re-derives the value type from the channel's native type
     /// (`caget.c:175`, `format != specifiedDbr`). For `caget -d`'s
     /// *exact* type request, use [`Self::get_with_dbr_type`] instead.
-    pub async fn get_with_metadata_count(&self, class: DbrClass, count: u32) -> CaResult<Snapshot> {
+    pub async fn get_with_metadata_count(
+        &self,
+        class: DbrClass,
+        count: impl Into<ReqCount>,
+    ) -> CaResult<Snapshot> {
         let snap = self.snapshot()?;
 
         let native = DbFieldType::from_u16(snap.native_type as u16)?;
@@ -2265,7 +2324,7 @@ impl CaChannel {
             DbrClass::Plain => native.to_dbr_type() as u16,
         };
 
-        self.get_dbr_request(snap, request_type, count).await
+        self.get_dbr_request(snap, request_type, count.into()).await
     }
 
     /// Get a PV value requesting an **exact** DBR type code (`0..=38`),
@@ -2283,9 +2342,13 @@ impl CaChannel {
     /// The caller is responsible for validating the type code (the tool
     /// front-ends mirror C's `caget.c:430` range check); an unsupported
     /// code surfaces as the server's `ECA_BADTYPE`.
-    pub async fn get_with_dbr_type(&self, dbr_type: u16, count: u32) -> CaResult<Snapshot> {
+    pub async fn get_with_dbr_type(
+        &self,
+        dbr_type: u16,
+        count: impl Into<ReqCount>,
+    ) -> CaResult<Snapshot> {
         let snap = self.snapshot()?;
-        self.get_dbr_request(snap, dbr_type, count).await
+        self.get_dbr_request(snap, dbr_type, count.into()).await
     }
 
     /// Shared one-shot READ_NOTIFY body for the metadata/exact-type GET
@@ -2295,23 +2358,25 @@ impl CaChannel {
         &self,
         snap: ChannelSnapshotPublic,
         request_type: u16,
-        count: u32,
+        count: ReqCount,
     ) -> CaResult<Snapshot> {
-        // C `libca/nciu.cpp::read()` rejects `countIn >
-        // this->count` with ECA_BADCOUNT before queueing the read.
-        // Pre-fix Rust silently clamped with `.min(snap.element_count)`,
-        // so a caller bug requesting 100 elements from a 10-element PV
-        // got a 10-element response from Rust where libca would have
-        // returned ECA_BADCOUNT without sending anything. Validate
-        // up front; `count == 0` keeps the autosize semantic.
-        if count > 0 && count > snap.element_count {
+        // Resolve the request mode (`Fixed(0)` → native count; `Autosize`
+        // passes its count through, including the `0` autosize request).
+        let request_count = count.resolve(snap.element_count);
+        // C `libca/nciu.cpp::read()` rejects `countIn > this->count` with
+        // ECA_BADCOUNT before queueing the read. Pre-fix Rust silently
+        // clamped with `.min(snap.element_count)`, so a caller bug
+        // requesting 100 elements from a 10-element PV got a 10-element
+        // response from Rust where libca would have returned ECA_BADCOUNT
+        // without sending anything. Validate the resolved count up front;
+        // `0` (native or autosize) is always in range.
+        if request_count > snap.element_count {
             return Err(CaError::Protocol(format!(
                 "get count {} exceeds channel element count {} \
                  (matches libca nciu::read ECA_BADCOUNT)",
-                count, snap.element_count
+                request_count, snap.element_count
             )));
         }
-        let request_count = if count > 0 { count } else { snap.element_count };
 
         let ioid = self.in_flight.alloc_ioid();
         let (reply_tx, reply_rx) = oneshot::channel();

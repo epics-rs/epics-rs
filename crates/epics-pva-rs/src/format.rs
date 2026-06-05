@@ -970,22 +970,22 @@ fn scalar_to_inline(v: &ScalarValue) -> String {
 /// `maybeQuote`-escaped for inline display. Keeping the two separate
 /// prevents a table cell from being `maybeQuote`-escaped and then
 /// `csv_escape`-escaped a second time.
+///
+/// Mirrors Base `PVScalarArray::getAs<std::string>()`, the conversion
+/// `printTable` applies to every column (pvData printer.cpp:252): each
+/// element passes through `castUnsafe<std::string, FROM>`
+/// (typeCast.h:101-110), i.e. `std::ostringstream << value` at the C++
+/// default stream precision. For `double`/`float` that default is six
+/// significant digits (`defaultfloat`), so numeric cells use
+/// `format_g(_, 6)` — the same renderer the inline NT path uses — NOT
+/// Rust's shortest-round-trip `{f}`, which would print extra digits Base
+/// never emits and would over-widen the column. Bool maps to
+/// `true`/`false` (`print_convolute<boolean>`) and integers print in
+/// decimal.
 fn scalar_cell_text(v: &ScalarValue) -> String {
     match v {
-        ScalarValue::Double(f) => {
-            if f.fract() == 0.0 && f.abs() < 1e15 {
-                format!("{}", *f as i64)
-            } else {
-                format!("{f}")
-            }
-        }
-        ScalarValue::Float(f) => {
-            if f.fract() == 0.0 && f.abs() < 1e7 {
-                format!("{}", *f as i32)
-            } else {
-                format!("{f}")
-            }
-        }
+        ScalarValue::Double(f) => format_g(*f, 6),
+        ScalarValue::Float(f) => format_g(*f as f64, 6),
         ScalarValue::String(s) => s.as_str_lossy().into_owned(),
         ScalarValue::Boolean(b) => (if *b { "true" } else { "false" }).to_string(),
         other => format!("{other}"),
@@ -2242,15 +2242,39 @@ mod tests {
         assert_eq!(format_value_inline(&dbls), "[1.5,2.25]");
     }
 
-    /// Decoupling guard: table cells use `scalar_cell_text` (Base
-    /// `getAs<std::string>`, full precision), NOT the six-significant-digit
-    /// raw/NT display path — so the same double renders differently in a
-    /// table cell vs an inline scalar.
+    /// Regression R0604-PVACLI-NTTABLE-DOUBLE-PRECISION-1: an NTTable
+    /// double column renders through Base `getAs<std::string>` — each cell
+    /// passes `castUnsafe<std::string, double>` → `std::ostringstream <<
+    /// value` at the C++ default precision of six significant digits
+    /// (printer.cpp:252, typeCast.h:101-110) — NOT Rust's shortest-round-
+    /// trip full precision. So `1.23456789` prints as `"1.23457"`, matching
+    /// `pvget`'s table output character-for-character. The earlier
+    /// "keeps full precision" guard asserted the divergent behaviour.
     #[test]
-    fn nt_table_double_cell_keeps_full_precision() {
+    fn nt_table_double_cell_uses_six_sig_digits() {
         let (desc, value) = nt_table(&["d"], &[("d", vec![ScalarValue::Double(1.23456789)])]);
         let out = format_nt("PV", &desc, &value);
-        assert_eq!(out, "PV \n         d\n1.23456789\n");
+        assert_eq!(out, "PV \n      d\n1.23457\n");
+    }
+
+    /// Companion to [`nt_table_double_cell_uses_six_sig_digits`]: the
+    /// six-significant-digit cell, not the discarded full-precision text,
+    /// drives the column width. With a one-char label `"v"` and a
+    /// `1.23456789` cell, the column is 7 wide (`"1.23457"`), so the header
+    /// right-justifies `"v"` with six leading spaces — full precision (ten
+    /// chars) would have produced nine. A short second row (`2.5`) confirms
+    /// every data row aligns to the same shortened width.
+    #[test]
+    fn nt_table_double_column_width_tracks_six_sig_digits() {
+        let (desc, value) = nt_table(
+            &["v"],
+            &[(
+                "v",
+                vec![ScalarValue::Double(1.23456789), ScalarValue::Double(2.5)],
+            )],
+        );
+        let out = format_nt("PV", &desc, &value);
+        assert_eq!(out, "PV \n      v\n1.23457\n    2.5\n");
     }
 
     /// Build an NTScalarArray top structure carrying the given scalar-array

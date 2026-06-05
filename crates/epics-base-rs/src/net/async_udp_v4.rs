@@ -265,12 +265,17 @@ impl AsyncUdpV4 {
     /// Like [`Self::bind_ephemeral_same_port`] but binds **only** the
     /// interfaces whose unicast IPv4 address appears in `interfaces` —
     /// the same-port-per-NIC bundle is restricted to exactly the
-    /// configured set rather than every discovered NIC. This is the
-    /// client-side `EPICS_PVA_INTF_ADDR_LIST` constraint on the active-
-    /// search socket (pvxs `config.cpp:624-648` threads `interfaces`
-    /// into the search-socket bind), so a loopback-only list binds a
-    /// single loopback socket and a client never emits SEARCH out an
-    /// interface the operator excluded.
+    /// configured set rather than every discovered NIC, so a
+    /// loopback-only list binds a single loopback socket.
+    ///
+    /// NOTE: the PVA client active-search socket does NOT bind through
+    /// this to apply `EPICS_PVA_INTF_ADDR_LIST`. pvxs binds the search
+    /// socket to wildcard (`client.cpp:578-590`) and applies the
+    /// interface list only to auto-broadcast expansion and fanout egress;
+    /// reducing the bundle here forced an explicit non-loopback
+    /// `EPICS_PVA_ADDR_LIST` target onto a loopback-only socket. This is a
+    /// general primitive for callers that genuinely need a bundle bound to
+    /// a fixed interface set.
     pub fn bind_ephemeral_same_port_on_interfaces(
         interfaces: &[Ipv4Addr],
         broadcast: bool,

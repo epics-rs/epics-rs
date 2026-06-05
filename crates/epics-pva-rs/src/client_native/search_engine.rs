@@ -307,12 +307,18 @@ impl SearchEngine {
         let beacons = BeaconTracker::new();
         let (cmd_tx, cmd_rx) = mpsc::channel::<SearchCommand>(256);
 
-        // `EPICS_PVA_INTF_ADDR_LIST` (v4 entries) constrains both the
-        // active-search socket bind and the auto-broadcast address
-        // expansion to the listed interfaces. Empty = all-NIC default
-        // (pvxs threads `client::Config::interfaces` into both, see
-        // `config.cpp:624-648`). v6 entries are not part of the v4
-        // search-socket bundle; the v6 search socket binds wildcard.
+        // `EPICS_PVA_INTF_ADDR_LIST` (v4 entries) constrains the
+        // auto-broadcast address expansion (in `search_targets`) and the
+        // limited-broadcast / multicast fanout egress (in `broadcast`) to
+        // the listed interfaces. It does NOT reduce the active-search
+        // socket bundle: pvxs binds the search socket to wildcard
+        // (`client.cpp:578-590`) and applies `client::Config::interfaces`
+        // only to `expandAddrList` / `addGroups` (`config.cpp:624-648`)
+        // and beacon receive, sending every explicit `EPICS_PVA_ADDR_LIST`
+        // unicast target through the wildcard socket via the OS route.
+        // Constraining the bundle forced an explicit non-loopback target
+        // onto a loopback-only socket under `INTF_ADDR_LIST=127.0.0.1`.
+        // Regression R0604-PVA-CLIENT-INTF-EXPLICIT-ADDR-1.
         let client_interfaces: Vec<Ipv4Addr> = crate::config::env::list_intf_addresses()
             .into_iter()
             .filter_map(|ip| match ip {
@@ -321,7 +327,7 @@ impl SearchEngine {
             })
             .collect();
 
-        let search_socket = bind_ephemeral_udp(&client_interfaces)?;
+        let search_socket = bind_ephemeral_udp()?;
         // PR #205 IPv6 Stage 4: optional v6 send/recv socket. Used
         // alongside the v4 socket — graceful degradation when the
         // host has no usable IPv6 stack.
@@ -572,21 +578,25 @@ impl SearchEngine {
 
 // ── UDP socket helpers ──────────────────────────────────────────────────
 
-fn bind_ephemeral_udp(interfaces: &[Ipv4Addr]) -> PvaResult<AsyncUdpV4> {
+fn bind_ephemeral_udp() -> PvaResult<AsyncUdpV4> {
     // SEARCH packets embed a `response_port` that IOCs reply unicast
     // to. With per-NIC sockets we want every NIC's reply port to be
     // identical so the IOC's response lands on the right
     // logical socket regardless of which NIC delivered it back.
     //
-    // `EPICS_PVA_INTF_ADDR_LIST` (v4 entries) constrains the active-
-    // search socket to the listed interfaces (pvxs `config.cpp:624-648`
-    // threads `interfaces` into the search-socket bind); empty list =
-    // the historical all-NIC default.
-    if interfaces.is_empty() {
-        AsyncUdpV4::bind_ephemeral_same_port(true).map_err(PvaError::Io)
-    } else {
-        AsyncUdpV4::bind_ephemeral_same_port_on_interfaces(interfaces, true).map_err(PvaError::Io)
-    }
+    // The bundle is ALWAYS all-NIC, matching pvxs which binds the
+    // active-search socket to wildcard (`client.cpp:578-590`).
+    // `EPICS_PVA_INTF_ADDR_LIST` does NOT reduce this bundle: pvxs
+    // applies the interface list only to auto-broadcast expansion
+    // (`config.cpp:624-648`) and beacon receive, and sends every explicit
+    // `EPICS_PVA_ADDR_LIST` unicast target through the wildcard socket via
+    // the OS route. Reducing the bundle to the interface list forced an
+    // explicit non-loopback target onto a loopback-only socket under
+    // `INTF_ADDR_LIST=127.0.0.1`; the interface constraint now lives only
+    // in `search_targets` (auto-broadcast generation) and `broadcast`'s
+    // limited-broadcast / multicast fanout egress. Regression
+    // R0604-PVA-CLIENT-INTF-EXPLICIT-ADDR-1.
+    AsyncUdpV4::bind_ephemeral_same_port(true).map_err(PvaError::Io)
 }
 
 /// PR #205 IPv6 Stage 4: bind a v6-only ephemeral UDP socket used to
@@ -1762,6 +1772,44 @@ fn search_targets(
     targets
 }
 
+/// Fan a limited-broadcast / multicast SEARCH out of exactly the
+/// `EPICS_PVA_INTF_ADDR_LIST` interfaces. Loopback is skipped — it cannot
+/// carry broadcast, and `list_broadcast_addresses_on` yields no broadcast
+/// target for a loopback-only list, so this is never reached for one.
+/// Best-effort: succeeds if any listed interface accepted the send, else
+/// returns the last error. With the all-NIC search bundle this reproduces
+/// the egress of the pre-fix interface-constrained bundle's `fanout_to`,
+/// while leaving explicit unicast to route across the full bundle via
+/// `pick_nic` (Regression R0604-PVA-CLIENT-INTF-EXPLICIT-ADDR-1).
+async fn fanout_on_interfaces(
+    socket: &AsyncUdpV4,
+    packet: &[u8],
+    dest: SocketAddr,
+    client_interfaces: &[Ipv4Addr],
+) -> std::io::Result<()> {
+    let mut ok = 0usize;
+    let mut last_err: Option<std::io::Error> = None;
+    for ip in client_interfaces {
+        if ip.is_loopback() {
+            continue;
+        }
+        match socket.send_via(packet, dest, *ip).await {
+            Ok(_) => ok += 1,
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if ok > 0 {
+        Ok(())
+    } else {
+        Err(last_err.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                "no listed EPICS_PVA_INTF_ADDR_LIST interface available for broadcast fanout",
+            )
+        }))
+    }
+}
+
 async fn broadcast(
     socket: &AsyncUdpV4,
     socket_v6: Option<&Arc<UdpSocket>>,
@@ -1801,7 +1849,22 @@ async fn broadcast(
             SocketAddr::V4(v4) => {
                 let needs_fanout = v4.ip().is_broadcast() || v4.ip().is_multicast();
                 if needs_fanout {
-                    socket.fanout_to(packet_v4, t).await.map(|_| ())
+                    // Limited-broadcast (255.255.255.255) / multicast egress
+                    // is constrained to EPICS_PVA_INTF_ADDR_LIST when set, so
+                    // the all-NIC search bundle does not leak auto-broadcast
+                    // out an interface the operator excluded. Empty list =
+                    // every up-non-loopback NIC (the all-NIC default). This
+                    // reproduces the pre-fix interface-constrained bundle's
+                    // broadcast egress exactly while the bundle itself stays
+                    // all-NIC so explicit unicast routes via `pick_nic` below.
+                    // Per-subnet directed broadcasts and explicit unicast take
+                    // the `send_to` path. Regression
+                    // R0604-PVA-CLIENT-INTF-EXPLICIT-ADDR-1.
+                    if client_interfaces.is_empty() {
+                        socket.fanout_to(packet_v4, t).await.map(|_| ())
+                    } else {
+                        fanout_on_interfaces(socket, packet_v4, t, client_interfaces).await
+                    }
                 } else {
                     socket.send_to(packet_v4, t).await.map(|_| ())
                 }
@@ -4888,6 +4951,43 @@ mod tests {
         assert!(
             targets.is_empty(),
             "AUTO_ADDR_LIST=NO + empty list must emit no broadcast; got {targets:?}"
+        );
+    }
+
+    /// Regression R0604-PVA-CLIENT-INTF-EXPLICIT-ADDR-1.
+    ///
+    /// `EPICS_PVA_INTF_ADDR_LIST` must NOT reduce the active-search socket
+    /// bundle. pvxs binds the search socket to wildcard
+    /// (`client.cpp:578-590`) and applies the interface list only to
+    /// auto-broadcast generation + beacon receive; explicit unicast
+    /// `EPICS_PVA_ADDR_LIST` targets route via the OS from the full bundle.
+    /// Before the fix, a loopback-only interface list bound a loopback-only
+    /// bundle, so `pick_nic` forced an explicit non-loopback target onto the
+    /// loopback socket (last-resort) where it could never reach the IOC.
+    #[tokio::test]
+    async fn search_socket_bundle_not_reduced_by_intf_addr_list() {
+        // The defect can only manifest where the host actually has a
+        // non-loopback IPv4 NIC; on a loopback-only host the bundle is
+        // loopback-only on either code path, so the boundary is absent.
+        let host_has_non_loopback = if_addrs::get_if_addrs()
+            .map(|v| {
+                v.iter()
+                    .any(|i| matches!(i.addr, if_addrs::IfAddr::V4(_)) && !i.is_loopback())
+            })
+            .unwrap_or(false);
+        if !host_has_non_loopback {
+            return;
+        }
+        // The interface list is irrelevant to the bundle now — bind the
+        // search socket the way `spawn_inner` does and require a
+        // non-loopback bind addr to be present.
+        let sock = bind_ephemeral_udp().expect("search socket bind");
+        let addrs = sock.local_addrs();
+        assert!(
+            addrs.iter().any(|a| !a.ip().is_loopback()),
+            "active-search socket bundle was reduced to loopback only; an \
+             explicit non-loopback EPICS_PVA_ADDR_LIST target would be forced \
+             onto the loopback socket and never reach the IOC. Bound: {addrs:?}"
         );
     }
 

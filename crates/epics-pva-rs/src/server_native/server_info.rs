@@ -124,6 +124,14 @@ impl ServerInfoSource {
         PvField::Structure(s)
     }
 
+    /// The exact `help` reply payload pvxs `ServerSource::onRPC` sends:
+    /// `ret["value"] = "Help, I really should write some help"`
+    /// (serversource.cpp:47). A client or test comparing the built-in
+    /// `server` help output against pvxs must see this byte-for-byte, so
+    /// the Rust server emits the same literal rather than its own
+    /// descriptive text.
+    const HELP_TEXT: &'static str = "Help, I really should write some help";
+
     /// FieldDesc + value for a `help` reply — a full `NTScalar` string,
     /// the same NT type pvxs `ServerSource` replies with for a request
     /// that carries a `help` field (`nt::NTScalar{TypeCode::String}`,
@@ -131,18 +139,15 @@ impl ServerInfoSource {
     /// builder so the advertised `epics:nt/NTScalar:1.0` ID carries the
     /// mandatory `alarm` and `timeStamp` members (pvxs `NTScalar::build()`,
     /// nt.cpp:44-53) — a strict NT client selecting the layout by ID then
-    /// finds every member it expects.
+    /// finds every member it expects. The `value` is the pvxs literal
+    /// (serversource.cpp:47) so the exact-output matches.
     fn help_response() -> (FieldDesc, PvField) {
         let desc = NTScalar::new(ScalarType::String).build();
         let mut value = NTScalar::new(ScalarType::String).create();
         if let PvField::Structure(s) = &mut value {
             s.set(
                 "value",
-                PvField::Scalar(ScalarValue::String(
-                    "server PV: RPC op=channels lists hosted PVs, op=info reports \
-                     implLang/version"
-                        .into(),
-                )),
+                PvField::Scalar(ScalarValue::String(Self::HELP_TEXT.into())),
             );
         }
         (desc, value)
@@ -522,8 +527,17 @@ mod tests {
                     s.get_field("timeStamp").is_some(),
                     "help value must carry timeStamp"
                 );
+                // Regression R0604-PVASRV-SERVER-RPC-HELP-TEXT-1: the
+                // `value` payload must be the exact pvxs literal
+                // (serversource.cpp:47), not Rust-specific descriptive text.
                 match s.get_field("value") {
-                    Some(PvField::Scalar(ScalarValue::String(_))) => {}
+                    Some(PvField::Scalar(ScalarValue::String(text))) => {
+                        assert_eq!(
+                            text.as_str_lossy().as_ref(),
+                            "Help, I really should write some help",
+                            "help value must match pvxs literal byte-for-byte"
+                        );
+                    }
                     other => panic!("unexpected help value: {other:?}"),
                 }
             }

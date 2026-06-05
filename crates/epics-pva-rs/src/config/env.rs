@@ -320,6 +320,16 @@ pub fn resolve_iface_v4(spec: &str) -> Result<Ipv4Addr, String> {
 /// `SocketAddr`, appending `default_port` when no port is present. Shared
 /// by [`Endpoint::parse`] and [`parse_addr_list_with_port`].
 ///
+/// An explicit `:0` port (or a host that resolves to port 0) is normalized
+/// to `default_port`, mirroring pvxs `split_addr_into`
+/// (`config.cpp:167-168`: `if(ep.addr.port()==0) ep.addr.setPort(defaultPort)`).
+/// pvxs applies this uniformly to every env address list — name servers
+/// (`tcp_port`), `EPICS_PVA_ADDR_LIST` / beacon destinations (`udp_port`) —
+/// because port 0 is never a usable SEARCH/connect destination. When the
+/// caller passes `default_port == 0` (e.g. a server bind list that allows an
+/// ephemeral port), `setPort(0)` is a no-op, also matching pvxs. Regression
+/// R0604-PVACLI-NAMESERVER-EXPLICIT-ZERO-1.
+///
 /// P-6 (BUG_ARCHAEOLOGY libca a8e8d22c3): the previous parser only
 /// accepted literal IPs, silently dropping every DNS hostname. C libca had
 /// a 32-byte buffer truncation bug; we had a stricter "drop the whole
@@ -336,27 +346,36 @@ fn resolve_token_addr(s: &str, default_port: u16) -> Option<SocketAddr> {
     if s.is_empty() {
         return None;
     }
-    if let Ok(sa) = s.parse::<SocketAddr>() {
-        return Some(sa);
-    }
-    if let Ok(ip) = s.parse::<IpAddr>() {
-        return Some(SocketAddr::new(ip, default_port));
-    }
-    let with_port = if s.contains(':') {
-        s.to_string()
+    let mut addr = if let Ok(sa) = s.parse::<SocketAddr>() {
+        sa
+    } else if let Ok(ip) = s.parse::<IpAddr>() {
+        SocketAddr::new(ip, default_port)
     } else {
-        format!("{s}:{default_port}")
-    };
-    match with_port.to_socket_addrs() {
-        Ok(iter) => pick_v4_preferred(iter).or_else(|| {
-            tracing::debug!(token = %s, "EPICS_PVA addr-list: empty resolution");
-            None
-        }),
-        Err(e) => {
-            tracing::debug!(token = %s, error = %e, "EPICS_PVA addr-list: resolve failed");
-            None
+        let with_port = if s.contains(':') {
+            s.to_string()
+        } else {
+            format!("{s}:{default_port}")
+        };
+        match with_port.to_socket_addrs() {
+            Ok(iter) => pick_v4_preferred(iter).or_else(|| {
+                tracing::debug!(token = %s, "EPICS_PVA addr-list: empty resolution");
+                None
+            })?,
+            Err(e) => {
+                tracing::debug!(token = %s, error = %e, "EPICS_PVA addr-list: resolve failed");
+                return None;
+            }
         }
+    };
+    // pvxs `split_addr_into` (config.cpp:167-168) normalizes an explicit
+    // `:0` (or a host resolving to port 0) up to the list's default port;
+    // `set_port(0)` when `default_port == 0` is a no-op. Without this, an
+    // `EPICS_PVA_NAME_SERVERS=host:0` token reached the search engine as a
+    // port-0 TCP destination instead of `host:5075`.
+    if addr.port() == 0 {
+        addr.set_port(default_port);
     }
+    Some(addr)
 }
 
 /// Endpoint-preserving variant of [`parse_addr_list_with_port`]: splits on
@@ -527,8 +546,9 @@ pub fn server_broadcast_port() -> u16 {
 /// client destination, so `EPICS_PVA_SERVER_PORT=0` must not rewrite every
 /// bare name-server token to `host:0`. The server bind port keeps zero —
 /// see [`pvas_server_port`]. An explicit `host:0` in a name-server list is
-/// preserved verbatim by [`parse_addr_list_with_port`]; only the *default*
-/// port is expanded here.
+/// likewise normalized to this effective port by [`resolve_token_addr`]
+/// (pvxs `split_addr_into` `config.cpp:167-168`), so both the bare token and
+/// `host:0` resolve to `5075`.
 pub fn server_port() -> u16 {
     let parsed = std::env::var("EPICS_PVA_SERVER_PORT")
         .ok()
@@ -1907,6 +1927,78 @@ mod tests {
         assert!(
             name_servers().is_empty(),
             "no name-server list → no addresses"
+        );
+
+        unsafe {
+            match prev_pva {
+                Some(v) => std::env::set_var("EPICS_PVA_SERVER_PORT", v),
+                None => std::env::remove_var("EPICS_PVA_SERVER_PORT"),
+            }
+            match prev_pvas {
+                Some(v) => std::env::set_var("EPICS_PVAS_SERVER_PORT", v),
+                None => std::env::remove_var("EPICS_PVAS_SERVER_PORT"),
+            }
+            match prev_ns {
+                Some(v) => std::env::set_var("EPICS_PVA_NAME_SERVERS", v),
+                None => std::env::remove_var("EPICS_PVA_NAME_SERVERS"),
+            }
+        }
+    }
+
+    /// Regression R0604-PVACLI-NAMESERVER-EXPLICIT-ZERO-1. An explicit
+    /// `host:0` in `EPICS_PVA_NAME_SERVERS` must normalize to the effective
+    /// client TCP port (5075), not survive as a literal port-0 TCP
+    /// destination — pvxs `split_addr_into` (`config.cpp:167-168`) sets the
+    /// list default on any `port==0` token. This holds both with default env
+    /// and under `EPICS_PVA_SERVER_PORT=0` (which expands to 5075). A
+    /// non-zero explicit port is still preserved verbatim.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn name_servers_explicit_zero_port_normalizes_to_effective_tcp_port() {
+        let prev_pva = std::env::var("EPICS_PVA_SERVER_PORT").ok();
+        let prev_pvas = std::env::var("EPICS_PVAS_SERVER_PORT").ok();
+        let prev_ns = std::env::var("EPICS_PVA_NAME_SERVERS").ok();
+
+        // Default env (no server-port override): `:0` → 5075.
+        unsafe {
+            std::env::remove_var("EPICS_PVA_SERVER_PORT");
+            std::env::remove_var("EPICS_PVAS_SERVER_PORT");
+            std::env::set_var("EPICS_PVA_NAME_SERVERS", "127.0.0.1:0");
+        }
+        assert_eq!(
+            name_servers()
+                .iter()
+                .map(SocketAddr::port)
+                .collect::<Vec<_>>(),
+            vec![5075],
+            "explicit `:0` must normalize to the effective TCP port, not 0"
+        );
+
+        // EPICS_PVA_SERVER_PORT=0 expands to 5075 (server_port zero rule),
+        // and `:0` resolves through it to 5075.
+        unsafe {
+            std::env::set_var("EPICS_PVA_SERVER_PORT", "0");
+        }
+        assert_eq!(
+            name_servers()
+                .iter()
+                .map(SocketAddr::port)
+                .collect::<Vec<_>>(),
+            vec![5075],
+            "explicit `:0` under EPICS_PVA_SERVER_PORT=0 must still resolve to 5075"
+        );
+
+        // A non-zero explicit port survives unchanged.
+        unsafe {
+            std::env::set_var("EPICS_PVA_NAME_SERVERS", "127.0.0.1:9876");
+        }
+        assert_eq!(
+            name_servers()
+                .iter()
+                .map(SocketAddr::port)
+                .collect::<Vec<_>>(),
+            vec![9876],
+            "a non-zero explicit name-server port is preserved verbatim"
         );
 
         unsafe {

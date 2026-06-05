@@ -79,6 +79,11 @@ pub struct MbboRecord {
     /// raised in `check_alarms()` since `convert()` has no access to
     /// `CommonFields`.
     soft_alarm: bool,
+    // Regression R0604-BASEREC-BINARY-MONITOR-1: VAL change gate. C
+    // mbboRecord.c:400-403 monitor() raises DBE_VALUE|DBE_LOG for VAL only
+    // when `mlst != val`. Captured during process() because the framework
+    // reads monitor_value_changed() after process() has committed mlst.
+    value_changed: bool,
 }
 
 impl Default for MbboRecord {
@@ -154,6 +159,7 @@ impl Default for MbboRecord {
             siol: String::new(),
             sims: 0,
             soft_alarm: false,
+            value_changed: false,
         }
     }
 }
@@ -627,6 +633,14 @@ impl Record for MbboRecord {
         false
     }
 
+    /// Regression R0604-BASEREC-BINARY-MONITOR-1: VAL posts DBE_VALUE|DBE_LOG
+    /// only when it changed (C mbboRecord.c:400-403 `mlst != val`), not every
+    /// process cycle. The comparison is captured in process(); see
+    /// `value_changed`.
+    fn monitor_value_changed(&self) -> Option<bool> {
+        Some(self.value_changed)
+    }
+
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
             if self.mask == 0 && self.nobt > 0 && self.nobt <= 32 {
@@ -655,6 +669,13 @@ impl Record for MbboRecord {
         self.convert();
         self.oraw = self.rval;
         self.orbv = self.rbv;
+        // Regression R0604-BASEREC-BINARY-MONITOR-1: capture the VAL-change
+        // gate now (C mbboRecord.c:400-403 `mlst != val`); the framework reads
+        // monitor_value_changed() after process().
+        self.value_changed = self.mlst != self.val;
+        if self.value_changed {
+            self.mlst = self.val;
+        }
         Ok(ProcessOutcome::complete())
     }
 

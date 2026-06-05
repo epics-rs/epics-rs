@@ -149,11 +149,11 @@ async fn main() {
 
     // pvxs `pvxcall -w 0` is an immediate completion poll (epicsEvent
     // `tryWait`, `epicsEvent.h:101-107`), not a 5 s wait. Route `-w`
-    // through `rpc_timeout_duration` so a non-positive value maps to an
+    // through `wait_timeout_duration` so a non-positive value maps to an
     // immediate (zero) operation timeout rather than the generic
     // `timeout_duration` 5 s clamp (tools/call.cpp:44-65,125-154).
     let client = PvaClient::builder()
-        .timeout(epics_pva_rs::cli::rpc_timeout_duration(args.timeout))
+        .timeout(epics_pva_rs::cli::wait_timeout_duration(args.timeout))
         .build();
 
     match client.pvrpc(&pv_name, &desc, &value).await {
@@ -297,7 +297,7 @@ mod tests {
     fn w_zero_is_immediate_timeout() {
         let args = Args::parse_from(["pvcall-rs", "-w", "0", "svc"]);
         assert_eq!(
-            epics_pva_rs::cli::rpc_timeout_duration(args.timeout),
+            epics_pva_rs::cli::wait_timeout_duration(args.timeout),
             std::time::Duration::ZERO
         );
     }
@@ -307,7 +307,7 @@ mod tests {
     fn w_positive_is_finite_timeout() {
         let args = Args::parse_from(["pvcall-rs", "-w", "2.5", "svc"]);
         assert_eq!(
-            epics_pva_rs::cli::rpc_timeout_duration(args.timeout),
+            epics_pva_rs::cli::wait_timeout_duration(args.timeout),
             std::time::Duration::from_secs_f64(2.5)
         );
     }

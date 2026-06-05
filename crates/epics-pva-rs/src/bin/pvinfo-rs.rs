@@ -107,11 +107,13 @@ async fn main() {
 
     // Build the client with the parsed `-w` as the operation timeout,
     // applied once at construction so every describe op uses the same
-    // owner. Before this, `-w` was parsed but dropped and every info ran
-    // against the 5 s default. pvAccessCPP pvinfo waits using the parsed
-    // `-w` (pvinfo.cpp:130-138,194-198).
+    // owner. pvxs `pvxinfo` waits for completion with `done.wait(timeout)`
+    // (tools/info.cpp:66,112), and `epicsEvent::wait(0)` is `tryWait()` —
+    // an immediate poll (epicsEvent.h:101-107). Route `-w` through
+    // `wait_timeout_duration` so `-w 0` maps to an immediate (zero) timeout
+    // rather than the generic `timeout_duration` 5 s clamp.
     let client = PvaClient::builder()
-        .timeout(epics_pva_rs::cli::timeout_duration(args.timeout))
+        .timeout(epics_pva_rs::cli::wait_timeout_duration(args.timeout))
         .build();
 
     // Start a describe op for every PV before awaiting any, then await the
@@ -171,6 +173,29 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `pvinfo-rs -w 0` is an immediate completion poll: pvxs `pvxinfo`
+    /// waits with `done.wait(timeout)` and `epicsEvent::wait(0)` is
+    /// `tryWait()` (tools/info.cpp:112, epicsEvent.h:101-107), so a
+    /// non-positive `-w` maps to `Duration::ZERO`, NOT the prior 5 s clamp.
+    #[test]
+    fn w_zero_is_immediate_timeout() {
+        let args = Args::parse_from(["pvinfo-rs", "-w", "0", "PV"]);
+        assert_eq!(
+            epics_pva_rs::cli::wait_timeout_duration(args.timeout),
+            std::time::Duration::ZERO
+        );
+    }
+
+    /// A finite, strictly-positive `-w` is preserved as a bounded timeout.
+    #[test]
+    fn w_positive_is_finite_timeout() {
+        let args = Args::parse_from(["pvinfo-rs", "-w", "2.5", "PV"]);
+        assert_eq!(
+            epics_pva_rs::cli::wait_timeout_duration(args.timeout),
+            std::time::Duration::from_secs_f64(2.5)
+        );
+    }
 
     /// `-v` is effective-config output (pvxs `pvxinfo -v`), and must
     /// NOT pull in the credential diagnostic — that lives behind

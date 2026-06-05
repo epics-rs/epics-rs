@@ -92,23 +92,26 @@ impl TimeoutPolicy {
     }
 }
 
-/// `pvxcall`'s `-w` rule — distinct from both [`timeout_duration`] (the
+/// The `done.wait(timeout)` `-w` rule shared by every pvxs tool that
+/// waits on an `epicsEvent` for operation completion (`pvxget`, `pvxput`,
+/// `pvxinfo`, `pvxcall`) — distinct from both [`timeout_duration`] (the
 /// 5 s clamp) and [`TimeoutPolicy::wait_or_forever`] (no-timeout-on-zero).
 ///
-/// pvxs `pvxcall` parses `-w` into a `double timeout` and, after issuing
-/// the RPC, waits with `done.wait(timeout)`
-/// (`tools/call.cpp:44-65,125-154`). EPICS `epicsEvent::wait(double)`
+/// Those tools parse `-w` into a `double timeout` and, after issuing the
+/// operation, wait with `done.wait(timeout)` (`tools/get.cpp:72,132`,
+/// `tools/put.cpp:64,153`, `tools/info.cpp:66,112`,
+/// `tools/call.cpp:44-65,125-154`). EPICS `epicsEvent::wait(double)`
 /// treats a timeout of zero or less as `tryWait()` — a non-blocking poll
 /// that returns immediately (`libcom/src/osi/epicsEvent.h:101-107,
-/// 192-201`). So `pvxcall -w 0` is an immediate completion poll, neither
-/// a 5 s wait (the prior `timeout_duration` behavior) nor pvxlist's
-/// no-deadline wait.
+/// 192-201`). So `-w 0` on any of them is an immediate completion poll,
+/// neither a 5 s wait (the prior `timeout_duration` behavior) nor
+/// pvxlist's no-deadline wait.
 ///
 /// Maps a finite, strictly-positive `-w` to that bounded duration and
 /// any non-positive / non-finite value to `Duration::ZERO`, which the
-/// client RPC path (`tokio::time::timeout`) treats as an immediate
+/// client operation path (`tokio::time::timeout`) treats as an immediate
 /// timeout — the `tryWait()` analogue.
-pub fn rpc_timeout_duration(secs: f64) -> Duration {
+pub fn wait_timeout_duration(secs: f64) -> Duration {
     if secs.is_finite() && secs > 0.0 {
         Duration::from_secs_f64(secs)
     } else {
@@ -277,22 +280,23 @@ mod tests {
         assert_eq!(p.op_timeout(), Duration::from_secs(3));
     }
 
-    /// `pvxcall -w 0` is an immediate completion poll (epicsEvent
+    /// `-w 0` on any `done.wait(timeout)` tool (`pvxget`/`pvxput`/
+    /// `pvxinfo`/`pvxcall`) is an immediate completion poll (epicsEvent
     /// `tryWait`, `epicsEvent.h:101-107`): the mapping yields
     /// `Duration::ZERO`, which the client treats as an immediate timeout
     /// — NOT the 5 s clamp and NOT pvxlist's no-deadline wait.
     #[test]
-    fn rpc_timeout_duration_maps_nonpositive_to_immediate() {
+    fn wait_timeout_duration_maps_nonpositive_to_immediate() {
         for secs in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            assert_eq!(rpc_timeout_duration(secs), Duration::ZERO, "secs={secs}");
+            assert_eq!(wait_timeout_duration(secs), Duration::ZERO, "secs={secs}");
         }
     }
 
-    /// A finite, strictly-positive `-w` is preserved as a bounded RPC
-    /// timeout.
+    /// A finite, strictly-positive `-w` is preserved as a bounded
+    /// completion timeout.
     #[test]
-    fn rpc_timeout_duration_preserves_positive_finite() {
-        assert_eq!(rpc_timeout_duration(2.5), Duration::from_secs_f64(2.5));
+    fn wait_timeout_duration_preserves_positive_finite() {
+        assert_eq!(wait_timeout_duration(2.5), Duration::from_secs_f64(2.5));
     }
 
     /// The shared `-v` verbose path emits the pvxs `Effective config`

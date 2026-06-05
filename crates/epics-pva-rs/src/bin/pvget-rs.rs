@@ -119,11 +119,13 @@ async fn main() {
 
     // Build the client with the parsed `-w` as the operation timeout,
     // applied once at construction so every op path uses the same owner.
-    // Before this, `-w` was parsed but dropped and every GET ran against
-    // the 5 s default. pvAccessCPP pvget waits for completion using the
-    // parsed `-w` (pvget.cpp:317-326,422-431).
+    // pvxs `pvxget` waits for completion with `done.wait(timeout)`
+    // (tools/get.cpp:72,132), and `epicsEvent::wait(0)` is `tryWait()` —
+    // an immediate poll (epicsEvent.h:101-107). Route `-w` through
+    // `wait_timeout_duration` so `-w 0` maps to an immediate (zero)
+    // timeout rather than the generic `timeout_duration` 5 s clamp.
     let client = PvaClient::builder()
-        .timeout(epics_pva_rs::cli::timeout_duration(args.timeout))
+        .timeout(epics_pva_rs::cli::wait_timeout_duration(args.timeout))
         .build();
     let mode = args.mode.as_str();
 
@@ -186,6 +188,29 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `pvget-rs -w 0` is an immediate completion poll: pvxs `pvxget`
+    /// waits with `done.wait(timeout)` and `epicsEvent::wait(0)` is
+    /// `tryWait()` (tools/get.cpp:132, epicsEvent.h:101-107), so a
+    /// non-positive `-w` maps to `Duration::ZERO`, NOT the prior 5 s clamp.
+    #[test]
+    fn w_zero_is_immediate_timeout() {
+        let args = Args::parse_from(["pvget-rs", "-w", "0", "PV"]);
+        assert_eq!(
+            epics_pva_rs::cli::wait_timeout_duration(args.timeout),
+            std::time::Duration::ZERO
+        );
+    }
+
+    /// A finite, strictly-positive `-w` is preserved as a bounded timeout.
+    #[test]
+    fn w_positive_is_finite_timeout() {
+        let args = Args::parse_from(["pvget-rs", "-w", "2.5", "PV"]);
+        assert_eq!(
+            epics_pva_rs::cli::wait_timeout_duration(args.timeout),
+            std::time::Duration::from_secs_f64(2.5)
+        );
+    }
 
     /// `-q` is accepted for legacy compatibility but is a deprecated
     /// no-op: it must not gate successful output (pvAccessCPP

@@ -134,12 +134,14 @@ async fn main() {
 
     // Build the client with the parsed `-w` as the operation timeout,
     // applied once at construction so the optional readback GET, the PUT
-    // wait, and the post-PUT GET all use the same owner. Before this, `-w`
-    // was parsed but dropped and every op ran against the 5 s default.
-    // pvAccessCPP pvput applies the parsed `-w` to all three operations
-    // (pvput.cpp:311-320,403-428).
+    // wait, and the post-PUT GET all use the same owner. pvxs `pvxput`
+    // waits for completion with `done.wait(timeout)` (tools/put.cpp:64,153),
+    // and `epicsEvent::wait(0)` is `tryWait()` — an immediate poll
+    // (epicsEvent.h:101-107). Route `-w` through `wait_timeout_duration`
+    // so `-w 0` maps to an immediate (zero) timeout rather than the generic
+    // `timeout_duration` 5 s clamp.
     let client = PvaClient::builder()
-        .timeout(epics_pva_rs::cli::timeout_duration(args.timeout))
+        .timeout(epics_pva_rs::cli::wait_timeout_duration(args.timeout))
         .build();
 
     // Parse the optional pvRequest once (shared by both put forms).
@@ -264,6 +266,29 @@ fn format_old_new_line(label: &str, s: &PvStructure) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `pvput-rs -w 0` is an immediate completion poll: pvxs `pvxput`
+    /// waits with `done.wait(timeout)` and `epicsEvent::wait(0)` is
+    /// `tryWait()` (tools/put.cpp:153, epicsEvent.h:101-107), so a
+    /// non-positive `-w` maps to `Duration::ZERO`, NOT the prior 5 s clamp.
+    #[test]
+    fn w_zero_is_immediate_timeout() {
+        let args = Args::parse_from(["pvput-rs", "-w", "0", "PV", "42"]);
+        assert_eq!(
+            epics_pva_rs::cli::wait_timeout_duration(args.timeout),
+            std::time::Duration::ZERO
+        );
+    }
+
+    /// A finite, strictly-positive `-w` is preserved as a bounded timeout.
+    #[test]
+    fn w_positive_is_finite_timeout() {
+        let args = Args::parse_from(["pvput-rs", "-w", "2.5", "PV", "42"]);
+        assert_eq!(
+            epics_pva_rs::cli::wait_timeout_duration(args.timeout),
+            std::time::Duration::from_secs_f64(2.5)
+        );
+    }
 
     // pvput token classification (field=value vs bare, unknown-field
     // warn, mix rejection) is no longer guessed at the CLI — it is

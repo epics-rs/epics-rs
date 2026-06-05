@@ -128,3 +128,4 @@ required-features = ["dual-gateway-bin"]
 
 [dev-dependencies]
 serial_test = "3"
+tempfile = "3"

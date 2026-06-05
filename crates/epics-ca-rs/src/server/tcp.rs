@@ -3841,18 +3841,24 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         let task = epics_base_rs::runtime::task::spawn(async move {
                             let mut rx = rx;
                             loop {
-                                // Drain any coalesced overflow value before
-                                // blocking on the channel — the producer
-                                // parks the latest value here when the mpsc
-                                // is full so we always converge on current.
-                                let coalesced_opt =
-                                    record_for_task.read().await.pop_coalesced(sub_id);
-                                let next = if let Some(ev) = coalesced_opt {
-                                    Some(ev)
-                                } else {
-                                    rx.recv().await
+                                // Block on the queue front, then fold the
+                                // producer's coalesce overflow slot. When the
+                                // mpsc filled while we were busy the newest
+                                // value is parked in the slot;
+                                // `coalesce_consume` delivers it AND drains
+                                // the now-stale queue tail, so delivery never
+                                // steps from the newest value back to an older
+                                // queued one. A set slot implies the queue was
+                                // full, so the front `recv()` returns
+                                // immediately — no added latency, no
+                                // newest-then-old replay of the stale backlog.
+                                let Some(queued) = rx.recv().await else {
+                                    break;
                                 };
-                                let Some(mut event) = next else { break };
+                                let coalesced = record_for_task.read().await.pop_coalesced(sub_id);
+                                let mut event = epics_base_rs::server::pv::coalesce_consume(
+                                    &mut rx, queued, coalesced,
+                                );
                                 if flow_control.is_paused() {
                                     let Some(coalesced) = flow_control
                                         .coalesce_while_paused(&mut rx, event, || async {

@@ -212,9 +212,11 @@ pub struct Subscriber {
     pub tx: mpsc::Sender<MonitorEvent>,
     /// Last-value coalescing slot. When the bounded mpsc above is full,
     /// the producer stores the newest event here, overwriting any prior
-    /// pending overflow value. The consumer drains this after each normal
-    /// recv() to deliver the most recent state — matching libca rsrv
-    /// "drop oldest, keep newest" semantics.
+    /// pending overflow value. After each normal recv() the consumer pops
+    /// this slot through [`coalesce_consume`]: a set slot is newer than the
+    /// whole queue, so it is delivered and the now-stale queue tail is
+    /// drained — matching libca rsrv "drop oldest, keep newest" semantics
+    /// while never delivering the newest value and then an older queued one.
     pub coalesced: Arc<StdMutex<Option<MonitorEvent>>>,
     /// Server-side channel filter chain (epics-base 3.15.7).
     /// Defaults to empty — every event passes unchanged. Populated
@@ -264,6 +266,55 @@ impl Subscriber {
             *slot = Some(event);
         }
     }
+}
+
+/// Fold the producer's coalesce overflow slot into the next monitor
+/// delivery, preserving arrival order.
+///
+/// A subscriber's pending events live in two places: the bounded
+/// per-subscriber `rx` and the side `coalesced` slot. The producer fills
+/// `rx` first via `try_send` and parks an event in the slot ONLY after
+/// `rx` is full ([`Subscriber::coalesce_overflow`]), so a set slot value
+/// is strictly newer than every event still queued in `rx`. Delivery
+/// must stay monotonic in arrival order: pvxs keeps overflow and delivery
+/// in one queue and never sends the newest value and then an older queued
+/// one — `Subscription::post()` squashes overflow into `queue.back()`
+/// while `doReply()` sends `queue.front()` (`sharedpv.cpp:417-439`,
+/// `servermon.cpp:172-285`).
+///
+/// Given the freshly recv'd `queued` head and the popped `coalesced` slot,
+/// this returns the single event to deliver next:
+/// * slot empty → deliver `queued` (the in-order front, unchanged);
+/// * slot set → deliver the slot's newest value and DRAIN the now-stale
+///   `rx` backlog, because every queued entry (including `queued`) predates
+///   it. Each discarded entry is counted as a dropped monitor event — the
+///   "drop all stale, keep newest" coalescing policy. This is what keeps
+///   the consumer from returning the coalesced newest and then replaying
+///   older queued values.
+///
+/// This is the single owner of the rx-vs-slot ordering rule; every
+/// in-process and server-side monitor consumer that drains the slot
+/// (`PvSubscription`, `DbSubscription`, and the CA server monitor tasks)
+/// routes through it, so none can re-introduce newest-then-old. The
+/// caller pops the slot itself — the slot lives behind a different lock
+/// owner per source (`ProcessVariable` vs `RecordInstance`) — and hands
+/// the result here together with the `rx` it owns.
+pub fn coalesce_consume(
+    rx: &mut mpsc::Receiver<MonitorEvent>,
+    queued: MonitorEvent,
+    coalesced: Option<MonitorEvent>,
+) -> MonitorEvent {
+    let Some(newest) = coalesced else {
+        return queued;
+    };
+    // `queued` and everything still queued in `rx` predate `newest`;
+    // discard them so delivery converges to the newest value without
+    // ever stepping backward to an older queued snapshot.
+    record_dropped_monitor();
+    while rx.try_recv().is_ok() {
+        record_dropped_monitor();
+    }
+    newest
 }
 
 /// Shadow `DBR_GR_*` / `DBR_CTRL_*` / enum metadata for a
@@ -778,8 +829,10 @@ impl ProcessVariable {
     }
 
     /// Take any pending coalesced overflow value for the given subscriber.
-    /// Called by the per-subscription forwarder task after each delivery
-    /// so a slow consumer always converges on the latest known value.
+    /// Called by the per-subscription forwarder task after each `rx.recv()`
+    /// and folded in via [`coalesce_consume`], which drains the now-stale
+    /// queue tail so a slow consumer converges on the latest known value
+    /// without ever delivering it before older queued values.
     pub async fn pop_coalesced(&self, sid: u32) -> Option<MonitorEvent> {
         let subs = self.subscribers.lock().await;
         let sub = subs.iter().find(|s| s.sid == sid)?;
@@ -842,14 +895,17 @@ impl PvSubscription {
         Some(Self { rx, pv, sid })
     }
 
-    /// Await the next value change as a full `Snapshot`. Drains any
-    /// coalesced overflow the producer stashed when the bounded mpsc filled
-    /// mid-burst, so a briefly-slow consumer converges on the freshest
-    /// value rather than the stale queue tail — the same `pop_coalesced`
-    /// discipline `DbSubscription::next_event` applies.
+    /// Await the next value change as a full `Snapshot`. When the producer
+    /// parked a newer value in the coalesce slot because the bounded mpsc
+    /// filled mid-burst, [`coalesce_consume`] returns that newest value and
+    /// drains the now-stale queue tail, so a briefly-slow consumer converges
+    /// on the freshest value and never observes it stepping back to an older
+    /// queued snapshot — the same `coalesce_consume` discipline
+    /// `DbSubscription::next_event` applies.
     pub async fn recv_snapshot(&mut self) -> Option<Snapshot> {
         let queued = self.rx.recv().await?;
-        let event = self.pv.pop_coalesced(self.sid).await.unwrap_or(queued);
+        let coalesced = self.pv.pop_coalesced(self.sid).await;
+        let event = coalesce_consume(&mut self.rx, queued, coalesced);
         Some(event.snapshot)
     }
 }
@@ -1047,6 +1103,60 @@ mod mask_gate_tests {
         assert!(
             rx.try_recv().is_ok(),
             "DBE_LOG subscriber must receive an alarm post"
+        );
+    }
+
+    /// Regression R0604-PVASRV-SOURCE-COALESCED-STALE-TAIL-1.
+    ///
+    /// A simple-PV monitor whose bounded queue overflows mid-burst must
+    /// never deliver the coalesced newest value and then step back to an
+    /// older queued one. The producer fills the cap-64 queue with values
+    /// `1..=64` and parks the newest (`80`) in the coalesce slot; the
+    /// consumer must converge on `80` and never observe a value smaller
+    /// than one it already delivered.
+    ///
+    /// Before the fix `recv_snapshot()` returned the coalesced `80` and
+    /// then replayed the stale queue tail `1..=64`, so the delivered
+    /// sequence ran `80, 1, 2, ...` — value time going backwards, which
+    /// neither pvxs `SharedPV` nor the server monitor queue allow
+    /// (`sharedpv.cpp:417-439`, `servermon.cpp:172-285`).
+    #[tokio::test]
+    async fn r0604_pv_overflow_never_delivers_newest_then_old() {
+        use std::time::Duration;
+        let pv = Arc::new(ProcessVariable::new(
+            "coalesce:pv".into(),
+            EpicsValue::Double(0.0),
+        ));
+        let mut sub = PvSubscription::subscribe(pv.clone())
+            .await
+            .expect("subscribe");
+        // Fill the bounded queue (default cap 64) then overflow: with no
+        // consumer draining, values 1..=64 queue and the newest (80) lands
+        // in the coalesce slot.
+        for i in 1..=80u32 {
+            pv.set(EpicsValue::Double(i as f64)).await;
+        }
+        // Drain every immediately-available delivery; the recv past the
+        // last event has nothing queued and times out, ending collection.
+        let mut seq = Vec::new();
+        while let Ok(Some(snap)) =
+            tokio::time::timeout(Duration::from_millis(200), sub.recv_snapshot()).await
+        {
+            seq.push(snap.value.to_f64().expect("double value"));
+        }
+        assert!(!seq.is_empty(), "consumer must observe at least one value");
+        for w in seq.windows(2) {
+            assert!(
+                w[0] <= w[1],
+                "monitor delivery stepped backward {} -> {} (sequence {seq:?})",
+                w[0],
+                w[1],
+            );
+        }
+        assert_eq!(
+            *seq.last().unwrap(),
+            80.0,
+            "consumer must converge on the newest produced value (sequence {seq:?})"
         );
     }
 }

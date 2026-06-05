@@ -358,20 +358,23 @@ impl DbSubscription {
         }
     }
 
-    /// Drain the latest pending coalesced event (set when the per-
-    /// subscriber mpsc filled mid-burst) AFTER each successful
-    /// `rx.recv()`. Returns the coalesced event when present so the
-    /// caller observes the freshest value of a burst rather than
-    /// stopping at the (now-stale) tail of the bounded queue.
+    /// Fold the latest pending coalesced event (set when the per-
+    /// subscriber mpsc filled mid-burst) into delivery AFTER each
+    /// successful `rx.recv()`. When the coalesce slot holds a newer value,
+    /// [`crate::server::pv::coalesce_consume`] returns it AND drains the
+    /// now-stale queue tail, so the caller observes the freshest value of a
+    /// burst and never steps back to an older queued snapshot afterward —
+    /// the same ordering rule `PvSubscription::recv_snapshot` applies.
     async fn next_event(&mut self) -> Option<MonitorEvent> {
         loop {
             let queued = self.rx.recv().await?;
-            // Take any newer event the producer stashed in the
-            // coalesce slot while the mpsc was full. Without this,
-            // an in-process consumer that briefly fell behind would
-            // never see the freshest value of a burst.
+            // Take any newer event the producer stashed in the coalesce
+            // slot while the mpsc was full and discard the stale backlog.
+            // Without this, an in-process consumer that briefly fell behind
+            // would deliver the freshest value and then replay older queued
+            // values (newest-then-old).
             let coalesced = self.record.read().await.pop_coalesced(self.sid);
-            let event = coalesced.unwrap_or(queued);
+            let event = crate::server::pv::coalesce_consume(&mut self.rx, queued, coalesced);
             if self.ignore_origin != 0 && event.origin == self.ignore_origin {
                 continue;
             }

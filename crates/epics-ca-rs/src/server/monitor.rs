@@ -6,7 +6,7 @@ use tokio::sync::Notify;
 use epics_base_rs::runtime::sync::{Mutex, mpsc};
 
 use crate::protocol::*;
-use epics_base_rs::server::pv::{MonitorEvent, ProcessVariable};
+use epics_base_rs::server::pv::{MonitorEvent, ProcessVariable, coalesce_consume};
 use epics_base_rs::types::encode_dbr;
 
 #[derive(Default)]
@@ -155,15 +155,17 @@ where
 {
     epics_base_rs::runtime::task::spawn(async move {
         loop {
-            // Prefer any coalesced overflow value before blocking on the
-            // mpsc — when the queue filled up while we were busy, the
-            // newest value is parked there waiting for delivery.
-            let next = if let Some(ev) = pv.pop_coalesced(sub_id).await {
-                Some(ev)
-            } else {
-                rx.recv().await
-            };
-            let Some(mut event) = next else { break };
+            // Block on the queue front, then fold the producer's coalesce
+            // overflow slot. When the queue filled while we were busy the
+            // newest value is parked in the slot; `coalesce_consume`
+            // delivers it AND drains the now-stale queue tail, so delivery
+            // never steps from the newest value back to an older queued one.
+            // A set slot implies the queue was full, so the front `recv()`
+            // returns immediately — no added latency over checking the slot
+            // first, and no newest-then-old replay of the stale backlog.
+            let Some(queued) = rx.recv().await else { break };
+            let coalesced = pv.pop_coalesced(sub_id).await;
+            let mut event = coalesce_consume(&mut rx, queued, coalesced);
             if flow_control.is_paused() {
                 let Some(coalesced) = flow_control
                     .coalesce_while_paused(&mut rx, event, || pv.pop_coalesced(sub_id))

@@ -1058,4 +1058,63 @@ mod tests {
             .expect("a DBE_VALUE monitor must fire for a direct VAL put to a non-pp record");
         assert_eq!(got, Some(5.0));
     }
+
+    /// Regression R0604-PVASRV-SOURCE-COALESCED-STALE-TAIL-1 (record-backed
+    /// consumer half).
+    ///
+    /// `DbSubscription::next_event` shares the `coalesce_consume` ordering
+    /// rule with `PvSubscription`: a record-field monitor whose bounded
+    /// queue overflows mid-burst must converge on the newest value and
+    /// never step back to an older queued one. Each non-pp `VAL` put posts
+    /// exactly one DBE_VALUE monitor with the put value and does NOT
+    /// reprocess (see `ca_put_to_non_pp_val_posts_monitor`), so 80 distinct
+    /// puts produce a strictly increasing 1..=80 stream; with no consumer
+    /// draining, 1..=64 fill the queue and the newest (80) lands in the
+    /// coalesce slot.
+    ///
+    /// Before the fix `next_event` returned the coalesced `80` and then
+    /// replayed the stale tail `1..=64` (`80, 1, 2, ...`) — value time
+    /// going backwards.
+    #[tokio::test]
+    async fn r0604_db_overflow_never_delivers_newest_then_old() {
+        use crate::server::database::db_access::DbSubscription;
+        use crate::server::records::calc::CalcRecord;
+
+        let db = PvDatabase::new();
+        db.add_record("CALC1", Box::new(CalcRecord::new("0")))
+            .await
+            .unwrap();
+        let mut sub = DbSubscription::subscribe(&db, "CALC1.VAL")
+            .await
+            .expect("subscribe to CALC1.VAL");
+
+        for i in 1..=80u32 {
+            db.put_record_field_from_ca("CALC1", "VAL", EpicsValue::Double(i as f64))
+                .await
+                .expect("CA put to CALC1.VAL must succeed");
+        }
+
+        // Drain every immediately-available delivery; the recv past the
+        // last event has nothing queued and times out, ending collection.
+        let mut seq = Vec::new();
+        while let Ok(Some(v)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), sub.recv_f64()).await
+        {
+            seq.push(v);
+        }
+        assert!(!seq.is_empty(), "consumer must observe at least one value");
+        for w in seq.windows(2) {
+            assert!(
+                w[0] <= w[1],
+                "record monitor delivery stepped backward {} -> {} (sequence {seq:?})",
+                w[0],
+                w[1],
+            );
+        }
+        assert_eq!(
+            *seq.last().unwrap(),
+            80.0,
+            "record consumer must converge on the newest produced value (sequence {seq:?})"
+        );
+    }
 }

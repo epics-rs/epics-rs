@@ -1092,12 +1092,20 @@ pub async fn run_ca_pva_qsrv_ioc(
         store.register_pva_pv(&pv_name, handle).await;
     }
 
-    // ── External links (`calink` / `pvalink` features) ──
-    // Install the `"ca"` and `"pva"` link sets so a loaded database
-    // with `INP="somepv CA"` / `ca://somepv` or `pva://somepv` links
-    // resolves through the monitor-backed caches, and register the
-    // matching `caxr` / `dbcaxr` and `pvxr` / `dbpvxr` /
-    // `pvalink_enable` / `pvalink_disable` iocsh commands.
+    // ── External links (`pvalink`) ──
+    // The `"pva"` link set is installed here so a loaded database with
+    // `pva://somepv` links resolves through the monitor-backed cache,
+    // registering the `pvxr` / `dbpvxr` / `pvalink_enable` /
+    // `pvalink_disable` iocsh commands.
+    //
+    // The `"ca"` link set (`calink`) is NOT installed here. It is
+    // registered at the base `AfterCaLinkInit` hook via
+    // `IocApplication::register_link_set_installer(calink_link_set_install)`
+    // — BEFORE `setup_cp_links` warms Passive CP holders. Installing it
+    // in this Phase-3 runner is too late: the warm's `resolve_external_pv`
+    // would no-op, so a Passive CP/CPP holder of a `ca://` link would
+    // never open its monitor. `config.shell_commands` already carries the
+    // `caxr` / `dbcaxr` commands the installer returned at that hook.
     let mut shell_commands = config.shell_commands;
 
     // Register the QSRV runtime (interactive-shell) commands —
@@ -1112,20 +1120,6 @@ pub async fn run_ca_pva_qsrv_ioc(
         store.provider().clone(),
     ));
 
-    // CA links: the resolver lives in `epics-ca-rs` (always-on, no
-    // feature). `qsrv` pulls in `epics-ca-rs`, so it is always present.
-    match epics_ca_rs::calink::install_calink_resolver(&db, tokio::runtime::Handle::current()).await
-    {
-        Ok(resolver) => {
-            shell_commands.extend(epics_ca_rs::calink::register_calink_commands(resolver));
-            tracing::info!("calink: `ca` link set installed");
-        }
-        Err(e) => {
-            // A CA-client init failure must not abort the IOC: a
-            // database with no CA links is still fully serviceable.
-            tracing::warn!("calink: CA link set NOT installed: {e}");
-        }
-    }
     #[cfg(feature = "pvalink")]
     if qsrv2_on {
         // pvxs calls `pvalink_enable()` only when `enable2()` is true

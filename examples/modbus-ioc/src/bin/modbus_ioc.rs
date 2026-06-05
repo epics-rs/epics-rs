@@ -57,6 +57,11 @@ async fn main() -> CaResult<()> {
     app = modbus_rs::ioc::register_modbus_commands(app, handle, trace);
 
     app.startup_script(&script)
+        // CA links resolve with zero further setup: the `ca` link set
+        // installs at the base `AfterCaLinkInit` hook, before
+        // `setup_cp_links` warms Passive CP holders
+        // (R0604-CALINK-NOT-DEFAULT-WIRED-1).
+        .register_link_set_installer(epics_ca_rs::calink::calink_link_set_install)
         .run(epics_bridge_rs::qsrv::run_ca_pva_qsrv_ioc)
         .await
 }

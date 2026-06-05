@@ -304,6 +304,28 @@ pub struct DeviceSupportContext<'a> {
 pub type DynamicDeviceSupportFactory =
     Box<dyn Fn(&DeviceSupportContext) -> Option<Box<dyn DeviceSupport>> + Send + Sync>;
 
+/// An async external link-set installer, registered on an
+/// [`IocApplication`] via [`IocApplication::register_link_set_installer`]
+/// and invoked by [`IocApplication::run`] at the C `initHookAfterCaLinkInit`
+/// point — BEFORE [`PvDatabase::setup_cp_links`] warms Passive CP holders.
+///
+/// The installer receives the live database, registers its external
+/// [`crate::server::database::LinkSet`] (e.g. the `ca` set from
+/// `epics-ca-rs`'s `calink`, the `pva` set from the bridge's `pvalink`),
+/// and returns any iocsh commands to expose in the interactive shell.
+/// Registering the link set here — not inside the Phase-3 protocol runner
+/// — is what makes a Passive holder of an external CP/CPP link warm at
+/// iocInit: `setup_cp_links`'s `resolve_external_pv` open path is a no-op
+/// unless the matching link set is already installed.
+pub type LinkSetInstaller = Box<
+    dyn FnOnce(
+            Arc<PvDatabase>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Vec<CommandDef>> + Send + 'static>,
+        > + Send
+        + 'static,
+>;
+
 /// Configuration passed to the protocol runner after IOC initialization.
 ///
 /// Contains all the pieces needed to start a protocol-specific server
@@ -352,6 +374,11 @@ pub struct IocApplication {
     inline_records: Vec<(String, Box<dyn Record>)>,
     /// Callbacks invoked after iocInit completes (e.g., start pollers).
     after_init_hooks: Vec<Box<dyn FnOnce() + Send>>,
+    /// Async external link-set installers (CA links via `epics-ca-rs`'s
+    /// `calink`, PVA links via the bridge's `pvalink`). Fired at the
+    /// `AfterCaLinkInit` hook in [`Self::run`] — before `setup_cp_links`
+    /// — so a Passive holder of an external CP link warms at iocInit.
+    link_set_installers: Vec<LinkSetInstaller>,
 }
 
 impl IocApplication {
@@ -383,6 +410,7 @@ impl IocApplication {
             startup_script: None,
             inline_records: Vec::new(),
             after_init_hooks: Vec::new(),
+            link_set_installers: Vec::new(),
         }
     }
 
@@ -461,6 +489,32 @@ impl IocApplication {
     /// not need to remember to drain them.
     pub fn register_after_init(mut self, hook: impl FnOnce() + Send + 'static) -> Self {
         self.after_init_hooks.push(Box::new(hook));
+        self
+    }
+
+    /// Register an async external link-set installer.
+    ///
+    /// The installer is invoked by [`Self::run`] at the C
+    /// `initHookAfterCaLinkInit` point — BEFORE
+    /// [`PvDatabase::setup_cp_links`] warms Passive CP holders. It
+    /// registers its external [`crate::server::database::LinkSet`] on the
+    /// live database and returns any iocsh commands to add to the
+    /// interactive shell (merged into the protocol runner's command set).
+    ///
+    /// This is the seam that makes external record links resolve by
+    /// construction: registering the link set inside the Phase-3 protocol
+    /// runner is too late, because `setup_cp_links`'s `resolve_external_pv`
+    /// warm has already run and found no matching link set, so a Passive
+    /// holder of an external CP/CPP link never opens its monitor. A
+    /// CA-serving IOC wires `epics_ca_rs::calink::calink_link_set_install`
+    /// here so CA links resolve with no further setup.
+    pub fn register_link_set_installer<F, Fut>(mut self, installer: F) -> Self
+    where
+        F: FnOnce(Arc<PvDatabase>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Vec<CommandDef>> + Send + 'static,
+    {
+        self.link_set_installers
+            .push(Box::new(move |db| Box::pin(installer(db))));
         self
     }
 
@@ -560,10 +614,11 @@ impl IocApplication {
             autosave_config,
             autosave_startup,
             mut startup_commands,
-            shell_commands,
+            mut shell_commands,
             startup_script,
             inline_records,
             after_init_hooks,
+            link_set_installers,
         } = self;
 
         // Register record type factories with global registry so dbLoadRecords
@@ -757,6 +812,21 @@ impl IocApplication {
         announce!(InitHookState::AtBeginning);
         announce!(InitHookState::AfterCallbackInit);
         announce!(InitHookState::AfterCaLinkInit);
+
+        // External link-set installers fire at `AfterCaLinkInit` — the C
+        // `initHookAfterCaLinkInit` point — so every external link set is
+        // registered on the database BEFORE `setup_cp_links` (Phase 2b,
+        // below) warms Passive CP/CPP holders. A link set registered later
+        // (e.g. inside the Phase-3 protocol runner) is too late: the warm's
+        // `resolve_external_pv` open path no-ops when no matching link set
+        // is installed, so a Passive holder of an external CP link never
+        // opens its monitor and never processes on a remote change. Each
+        // installer also yields its iocsh commands (`caxr`/`dbcaxr`, …),
+        // merged into the shell command set the protocol runner registers.
+        for installer in link_set_installers {
+            shell_commands.extend(installer(db.clone()).await);
+        }
+
         announce!(InitHookState::AfterInitDrvSup);
         announce!(InitHookState::AfterInitRecSup);
 

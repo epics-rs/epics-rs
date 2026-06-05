@@ -234,9 +234,7 @@ async fn ca_cp_holder_processes_on_remote_change() {
     // the monitor callback can dispatch CP holders (the
     // R0604-CALINK-CP-NO-PROCESS-1 fix). Uses its own client, which picks
     // up the pinned env set above.
-    let _resolver = install_calink_resolver(&db, tokio::runtime::Handle::current())
-        .await
-        .expect("calink resolver installs");
+    let _resolver = install_calink_resolver(&db, tokio::runtime::Handle::current()).await;
 
     // iocInit step: registers the external CP edge AND warms (opens) the
     // monitor for the Passive holder's source PV.
@@ -500,9 +498,7 @@ async fn install_registers_ca_scheme() {
     pin_env(free_port());
 
     let db = PvDatabase::new();
-    let _resolver = install_calink_resolver(&db, tokio::runtime::Handle::current())
-        .await
-        .expect("install resolver");
+    let _resolver = install_calink_resolver(&db, tokio::runtime::Handle::current()).await;
     let schemes = db.registered_link_schemes().await;
     assert!(
         schemes.contains(&"ca".to_string()),
@@ -518,4 +514,99 @@ fn ca_modifier_link_classifies_as_ca() {
         epics_base_rs::server::record::link_field_type("REMOTE:PV.VAL CA"),
         LinkType::Ca,
     );
+}
+
+/// Regression R0604-CALINK-NOT-DEFAULT-WIRED-1 — the calink `ca` link set
+/// must install at the base `AfterCaLinkInit` seam (BEFORE `setup_cp_links`)
+/// when an IOC is built with
+/// [`IocApplication::register_link_set_installer`], so a Passive CP holder
+/// warms through the PRODUCTION `IocApplication::run` path — not only when a
+/// test hand-replicates the ordering with a manual `install_calink_resolver`
+/// + `setup_cp_links` (the [`ca_cp_holder_processes_on_remote_change`] path).
+///
+/// Pre-fix, calink was installed inside the Phase-3 protocol runner — AFTER
+/// `setup_cp_links` had already warmed Passive CP holders — so the holder's
+/// `resolve_external_pv` open no-op'd (no `ca` link set was registered yet)
+/// and VAL stayed at its initial 0.0; the pure-CA `run_ca_ioc` runner never
+/// installed calink at all. This test fails on either of those.
+///
+/// The holder record and its bare ` CP CA` INP link are loaded via
+/// `dbLoadRecords` from an st.cmd — the real iocInit path, where INP is set
+/// before `setup_cp_links` runs. A custom protocol runner (in place of
+/// `run_ca_ioc`) observes the warmed VAL and returns `Ok(())`, so `run`
+/// completes instead of serving forever.
+#[tokio::test(flavor = "multi_thread")]
+#[serial(epics_env)]
+async fn calink_warms_cp_holder_via_iocapplication_run_seam() {
+    use epics_base_rs::server::ioc_app::IocApplication;
+
+    let port = free_port();
+    let server = CaServer::builder()
+        .port(port)
+        .pv("CALINK:SEAM:SRC", EpicsValue::Double(5.0))
+        .build()
+        .await
+        .expect("CA server");
+    let _server = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    pin_env(port);
+
+    // The Passive `ai` holder's INP is a bare ` CP CA` link to the remote
+    // PV; PINI=NO so it never self-processes — only the iocInit CP warm can
+    // open its monitor and drive the first process.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db_path = dir.path().join("seam.db");
+    std::fs::write(
+        &db_path,
+        "record(ai, \"CALINK:SEAM:HOLDER\") {\n\
+         \tfield(INP, \"CALINK:SEAM:SRC CP CA\")\n\
+         \tfield(PINI, \"NO\")\n\
+         \tfield(SCAN, \"Passive\")\n\
+         }\n",
+    )
+    .expect("write seam.db");
+    let stcmd_path = dir.path().join("st.cmd");
+    std::fs::write(
+        &stcmd_path,
+        format!("dbLoadRecords(\"{}\")\n", db_path.display()),
+    )
+    .expect("write st.cmd");
+
+    // The seam under test: register the calink installer at construction.
+    // It fires at `AfterCaLinkInit`, before `setup_cp_links` — zero further
+    // wiring, no feature opt-in.
+    let result = IocApplication::new()
+        .startup_script(stcmd_path.to_str().unwrap())
+        .register_link_set_installer(epics_ca_rs::calink::calink_link_set_install)
+        .run(|config| async move {
+            // By here iocInit has already run `setup_cp_links` and the
+            // external-link wait. Poll the holder until the warm's monitor
+            // event drives VAL to the source's 5.0 — with NO explicit
+            // process call anywhere in this test.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let v = {
+                    let rec = config
+                        .db
+                        .get_record("CALINK:SEAM:HOLDER")
+                        .await
+                        .expect("holder loaded via dbLoadRecords");
+                    let inst = rec.read().await;
+                    inst.record.val().and_then(|v| v.to_f64())
+                };
+                if v == Some(5.0) {
+                    return Ok(());
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "CP holder VAL must reach the warmed source value 5.0 via \
+                     the IocApplication::run seam (got {v:?}) — the installer \
+                     fired after setup_cp_links, or not at all"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+    result.expect("IOC run returns Ok once the CP holder warmed");
 }

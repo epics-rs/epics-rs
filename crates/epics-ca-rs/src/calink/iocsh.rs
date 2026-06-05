@@ -132,15 +132,13 @@ pub fn register_calink_commands(resolver: CaLinkResolver) -> Vec<CommandDef> {
 mod tests {
     use super::*;
 
-    async fn dummy_resolver() -> CaLinkResolver {
+    fn dummy_resolver() -> CaLinkResolver {
         CaLinkResolver::new(tokio::runtime::Handle::current())
-            .await
-            .expect("CA client init")
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn register_calink_commands_returns_two() {
-        let r = dummy_resolver().await;
+        let r = dummy_resolver();
         let cmds = register_calink_commands(r);
         assert_eq!(cmds.len(), 2);
         let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();

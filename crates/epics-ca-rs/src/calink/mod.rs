@@ -28,16 +28,50 @@
 //!
 //! ## Usage
 //!
-//! ```ignore
-//! use epics_ca_rs::calink::install_calink_resolver;
+//! A CA-serving IOC built on [`epics_base_rs::server::ioc_app::IocApplication`]
+//! wires the link set once, at construction, via the base
+//! `register_link_set_installer` seam. The installer fires at the
+//! iocInit `AfterCaLinkInit` hook — BEFORE `setup_cp_links` warms Passive
+//! CP holders — so CA links (including a Passive CP/CPP holder's source)
+//! resolve with no further setup:
 //!
-//! let resolver = install_calink_resolver(&db, tokio::runtime::Handle::current()).await?;
-//! // Records whose INP is `ca://OTHER:IOC:TEMP` (or `OTHER:IOC:TEMP CA`)
-//! // now resolve through the monitor-backed cache.
+//! ```ignore
+//! use epics_ca_rs::calink::calink_link_set_install;
+//!
+//! IocApplication::new()
+//!     .startup_script("st.cmd")
+//!     .register_link_set_installer(calink_link_set_install)
+//!     .run(epics_ca_rs::server::run_ca_ioc)
+//!     .await
 //! ```
+//!
+//! The lower-level [`install_calink_resolver`] is also available for
+//! callers that drive their own database assembly (it must run before
+//! `setup_cp_links`). The shared CA client is created lazily on the
+//! first CA link open, so an IOC with no CA links never spins one up.
 
 mod iocsh;
 mod resolver;
 
+use std::sync::Arc;
+
+use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::iocsh::registry::CommandDef;
+
 pub use iocsh::{ca_caxr_command, db_dbcaxr_command, register_calink_commands};
 pub use resolver::{CaLink, CaLinkError, CaLinkResolver, install_calink_resolver};
+
+/// Async link-set installer for
+/// [`epics_base_rs::server::ioc_app::IocApplication::register_link_set_installer`].
+///
+/// Installs the `"ca"` link set on `db` and returns the `caxr` /
+/// `dbcaxr` iocsh commands. Registered at IOC construction, it is fired
+/// by `IocApplication::run` at the `AfterCaLinkInit` hook — before
+/// `setup_cp_links` warms Passive CP holders — so this is all a
+/// CA-serving IOC needs to make CA links resolve: no feature opt-in, no
+/// manual [`CaLinkResolver::open`] calls. The shared CA client is
+/// created lazily on the first link open.
+pub async fn calink_link_set_install(db: Arc<PvDatabase>) -> Vec<CommandDef> {
+    let resolver = install_calink_resolver(&db, tokio::runtime::Handle::current()).await;
+    register_calink_commands(resolver)
+}

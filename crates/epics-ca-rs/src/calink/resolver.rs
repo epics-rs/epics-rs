@@ -258,7 +258,12 @@ impl CaLink {
 /// clone — every field is `Arc`-backed.
 #[derive(Clone)]
 pub struct CaLinkResolver {
-    client: Arc<CaClient>,
+    /// Shared CA client, created lazily on the first link [`Self::open`].
+    /// An IOC with no CA links never spins one up — the same lazy-client
+    /// shape as `pvalink`'s per-link `PvaClient` (the C `dbCa` client is
+    /// likewise only created once a link is added). Seeded eagerly by
+    /// [`Self::with_client`] when a caller wants to share/pin a client.
+    client: Arc<tokio::sync::OnceCell<Arc<CaClient>>>,
     handle: tokio::runtime::Handle,
     /// Open links keyed by bare PV name (`ca://` scheme stripped).
     links: Arc<RwLock<HashMap<String, Arc<CaLink>>>>,
@@ -273,29 +278,47 @@ pub struct CaLinkResolver {
 }
 
 impl CaLinkResolver {
-    /// Build a resolver with a freshly created shared [`CaClient`].
-    pub async fn new(handle: tokio::runtime::Handle) -> Result<Self, CaLinkError> {
-        let client = CaClient::new()
-            .await
-            .map_err(|e| CaLinkError::ClientInit(e.to_string()))?;
-        Ok(Self {
-            client: Arc::new(client),
-            handle,
-            links: Arc::new(RwLock::new(HashMap::new())),
-            db: Arc::new(RwLock::new(None)),
-        })
-    }
-
-    /// Build a resolver around an already-constructed [`CaClient`].
-    /// Lets a caller share one client across the CA gateway and the
-    /// CA links, or pin the client to a specific server in tests.
-    pub fn with_client(client: Arc<CaClient>, handle: tokio::runtime::Handle) -> Self {
+    /// Build a resolver whose shared [`CaClient`] is created lazily on
+    /// the first link [`Self::open`]. Infallible — an IOC with no CA
+    /// links never constructs a client, and any client-init failure
+    /// surfaces at the first `open` (mirroring `pvalink`'s lazy client),
+    /// so installation cannot fail and never aborts the IOC.
+    pub fn new(handle: tokio::runtime::Handle) -> Self {
         Self {
-            client,
+            client: Arc::new(tokio::sync::OnceCell::new()),
             handle,
             links: Arc::new(RwLock::new(HashMap::new())),
             db: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Build a resolver around an already-constructed [`CaClient`].
+    /// Lets a caller share one client across the CA gateway and the
+    /// CA links, or pin the client to a specific server in tests. The
+    /// client is seeded eagerly, so the lazy-init path in [`Self::open`]
+    /// is bypassed.
+    pub fn with_client(client: Arc<CaClient>, handle: tokio::runtime::Handle) -> Self {
+        Self {
+            client: Arc::new(tokio::sync::OnceCell::new_with(Some(client))),
+            handle,
+            links: Arc::new(RwLock::new(HashMap::new())),
+            db: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Get the shared [`CaClient`], creating it on first call. The
+    /// `OnceCell` guarantees exactly one client even under concurrent
+    /// first opens. A client-init failure is returned (not cached), so a
+    /// later open retries — matching C `dbCa`'s deferred channel setup.
+    async fn client(&self) -> Result<&Arc<CaClient>, CaLinkError> {
+        self.client
+            .get_or_try_init(|| async {
+                CaClient::new()
+                    .await
+                    .map(Arc::new)
+                    .map_err(|e| CaLinkError::ClientInit(e.to_string()))
+            })
+            .await
     }
 
     /// Attach the database handle the monitor callback uses to process
@@ -322,7 +345,7 @@ impl CaLinkResolver {
         if let Some(existing) = self.links.read().get(pv_name).cloned() {
             return Ok(existing);
         }
-        let channel = Arc::new(self.client.create_channel(pv_name));
+        let channel = Arc::new(self.client().await?.create_channel(pv_name));
         // subscribe the connection-event stream BEFORE the
         // `subscribe()` round-trip that drives the circuit connect, so the
         // watcher cannot miss the `Connected` event — that event is what
@@ -789,11 +812,17 @@ where
 ///
 /// Returns the resolver so the caller can pre-open links
 /// ([`CaLinkResolver::open`]) at IOC init and query stats.
+///
+/// Infallible: the shared CA client is created lazily on the first link
+/// open ([`CaLinkResolver::new`]), so installation never spins one up
+/// and never fails — a database with no CA links is fully serviceable
+/// and an IOC must not be aborted by CA-client init. This is the
+/// CA-side twin of the bridge's infallible `install_pvalink_resolver`.
 pub async fn install_calink_resolver(
     db: &PvDatabase,
     handle: tokio::runtime::Handle,
-) -> Result<CaLinkResolver, CaLinkError> {
-    let resolver = CaLinkResolver::new(handle).await?;
+) -> CaLinkResolver {
+    let resolver = CaLinkResolver::new(handle);
     // Attach the DB before registering the lset, so the monitor callback
     // can drive `dispatch_external_cp_targets` from the first event on
     // (Regression R0604-CALINK-CP-NO-PROCESS-1). This runs before iocInit's
@@ -801,7 +830,7 @@ pub async fn install_calink_resolver(
     // present when the first warmed-link event arrives.
     resolver.attach_database(db.clone());
     db.register_link_set("ca", Arc::new(resolver.clone())).await;
-    Ok(resolver)
+    resolver
 }
 
 #[cfg(test)]

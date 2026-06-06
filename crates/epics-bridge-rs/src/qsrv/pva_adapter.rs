@@ -7,7 +7,7 @@
 //! no spvirit_* types appear in this module.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tokio::sync::{RwLock, mpsc};
 
@@ -1005,13 +1005,39 @@ fn resolve_qsrv2_enable(ignore_servers: Option<&str>, qsrv_enable: Option<&str>)
     }
 }
 
-/// Read `EPICS_IOC_IGNORE_SERVERS` / `PVXS_QSRV_ENABLE`, apply the pvxs
-/// `enable2()` rule, print the same synchronous startup diagnostics, and
-/// return whether QSRV2 database/group serving is enabled.
+/// Process-global QSRV2 enable decision, computed exactly once from the
+/// environment. Pinning it here is the structural single-source-of-truth:
+/// the two consumers that run at different iocInit points — the pvalink
+/// install seam (`pvalink_link_set_install`, fired at `AfterCaLinkInit`)
+/// and the Phase-3 protocol runner (`run_ca_pva_qsrv_ioc`) — read this one
+/// cell, so they cannot disagree on whether QSRV2 is on. Mirrors pvxs,
+/// where `enable2()` is evaluated once in `pvxsBaseRegistrar` and the
+/// single result gates `single_enable()` / `group_enable()` /
+/// `pvalink_enable()` together (iochooks.cpp:465-496).
+static QSRV2_DECISION: OnceLock<Qsrv2Decision> = OnceLock::new();
+
+/// The single owner of the QSRV2 enable decision. Reads
+/// `EPICS_IOC_IGNORE_SERVERS` / `PVXS_QSRV_ENABLE` and applies the pvxs
+/// `enable2()` rule on the FIRST call only; every later caller reuses the
+/// cached [`Qsrv2Decision`]. Pure and silent — the startup diagnostics are
+/// emitted once by [`qsrv2_enabled`] (the runner's authoritative print),
+/// so callers that only need the boolean (the install seam) take no
+/// diagnostic side effect.
+fn qsrv2_decision() -> &'static Qsrv2Decision {
+    QSRV2_DECISION.get_or_init(|| {
+        let ignore = std::env::var("EPICS_IOC_IGNORE_SERVERS").ok();
+        let enable = std::env::var("PVXS_QSRV_ENABLE").ok();
+        resolve_qsrv2_enable(ignore.as_deref(), enable.as_deref())
+    })
+}
+
+/// Apply the cached QSRV2 decision, print the same synchronous startup
+/// diagnostics pvxs emits (iochooks.cpp:421-446), and return whether QSRV2
+/// database/group serving is enabled. Called once, by the protocol runner,
+/// so the `INFO:` / `ERROR:` line prints exactly once at the pvxs-equivalent
+/// point.
 fn qsrv2_enabled() -> bool {
-    let ignore = std::env::var("EPICS_IOC_IGNORE_SERVERS").ok();
-    let enable = std::env::var("PVXS_QSRV_ENABLE").ok();
-    let decision = resolve_qsrv2_enable(ignore.as_deref(), enable.as_deref());
+    let decision = qsrv2_decision();
     if let Some(e) = &decision.error {
         eprintln!("{e}");
     }
@@ -1040,19 +1066,14 @@ fn qsrv2_enabled() -> bool {
 /// QSRV2 is disabled or the feature is off this is an empty no-op
 /// installer — a database with no PVA links stays fully serviceable,
 /// and the shared PVA client is created lazily per link, so there is
-/// no init failure to abort the IOC on. The QSRV2 decision is taken
-/// via the non-printing `resolve_qsrv2_enable`; the single
-/// authoritative startup diagnostic is still emitted once by the
-/// runner's own `qsrv2_enabled` call.
+/// no init failure to abort the IOC on. The gate reads the shared
+/// [`qsrv2_decision`] (silent), so this seam and the runner's
+/// `qsrv2_enabled` print always agree on the same one decision; the
+/// authoritative startup diagnostic is emitted once by the runner.
 pub async fn pvalink_link_set_install(
     db: Arc<epics_base_rs::server::database::PvDatabase>,
 ) -> Vec<epics_base_rs::server::iocsh::registry::CommandDef> {
-    let qsrv2_on = resolve_qsrv2_enable(
-        std::env::var("EPICS_IOC_IGNORE_SERVERS").ok().as_deref(),
-        std::env::var("PVXS_QSRV_ENABLE").ok().as_deref(),
-    )
-    .enabled;
-    if !qsrv2_on {
+    if !qsrv2_decision().enabled {
         return Vec::new();
     }
     #[cfg(feature = "pvalink")]

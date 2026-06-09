@@ -1361,6 +1361,50 @@ impl PvaClient {
         .await
     }
 
+    /// Typed multi-field PUT: assign each `(path, PutLeaf)` into the PUT
+    /// prototype and send one combined delta. Unlike [`Self::pvput_fields`],
+    /// a [`crate::client_native::ops_v2::PutLeaf::Typed`] value is placed
+    /// into the selected descriptor leaf as pvData with no `Display`/parse
+    /// round trip — so a typed scalar array travels as its original payload
+    /// rather than a bracketed string that the field parser would split on
+    /// commas. [`crate::client_native::ops_v2::PutLeaf::Str`] leaves still
+    /// lower through the CLI parser.
+    ///
+    /// Used by pvalink OUT links that coalesce sibling fields into one
+    /// shared PUT carrying typed staged values — pvxs `linkBuildPut`
+    /// (`pvalink_channel.cpp:127-159`) parity for the combined path.
+    pub async fn pvput_fields_typed(
+        &self,
+        pv_name: &str,
+        assignments: &[(String, crate::client_native::ops_v2::PutLeaf)],
+        request: Option<&crate::pv_request::PvRequestExpr>,
+    ) -> PvaResult<()> {
+        let ch = self.channel(pv_name).await?;
+        let req_bytes = match request {
+            Some(req) => {
+                let big_endian = matches!(
+                    crate::client_native::ops_v2::ensure_active_with_op_timeout(
+                        &ch,
+                        self.inner.timeout
+                    )
+                    .await?
+                    .0
+                    .byte_order(),
+                    crate::proto::ByteOrder::Big
+                );
+                Some(req.encode(big_endian))
+            }
+            None => None,
+        };
+        crate::client_native::ops_v2::op_put_fields_typed(
+            &ch,
+            assignments,
+            req_bytes.as_deref(),
+            self.inner.timeout,
+        )
+        .await
+    }
+
     /// PUT a pre-built [`PvField`] with a custom pvRequest. Like
     /// `pvput_pv_field` but INIT carries the caller's record options
     /// (`process`, `block`). DATA still targets `"value"`.

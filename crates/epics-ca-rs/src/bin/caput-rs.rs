@@ -122,22 +122,29 @@ struct Args {
     long_mode: bool,
 
     /// Force interpretation of values as numbers (overrides ENUM
-    /// auto-string-resolution).
-    #[arg(short = 'n', long = "num-enum")]
+    /// auto-string-resolution). C `caput.c:298-305` makes `-n` and `-s`
+    /// a mutually-exclusive pair where the LAST one given wins (each case
+    /// sets its flag and clears the other), with no conflict error —
+    /// `overrides_with` reproduces that last-wins semantics.
+    #[arg(short = 'n', long = "num-enum", overrides_with = "force_string")]
     force_numeric: bool,
 
     /// Force interpretation of values as strings (overrides numeric
-    /// parse for ENUM).
-    #[arg(short = 's', long = "string-enum", conflicts_with = "force_numeric")]
+    /// parse for ENUM). Paired with `-n` (last one wins, caput.c:302-305).
+    #[arg(short = 's', long = "string-enum", overrides_with = "force_numeric")]
     force_string: bool,
 
     /// Put long string as an array of chars (long-string convention).
-    #[arg(short = 'S', long = "long-string")]
+    /// C `caput.c:306-319` makes `-S` and `-a` a mutually-exclusive pair
+    /// where the LAST one given wins (each clears the other) — modelled
+    /// with `overrides_with` so the two flags can never both be set.
+    #[arg(short = 'S', long = "long-string", overrides_with = "array_mode")]
     long_string: bool,
 
     /// Put as array. The remaining positionals are
-    /// `<count> <v0> <v1> ...`.
-    #[arg(short = 'a', long = "array")]
+    /// `<count> <v0> <v1> ...`. Paired with `-S` (last one wins,
+    /// caput.c:316-319).
+    #[arg(short = 'a', long = "array", overrides_with = "long_string")]
     array_mode: bool,
 
     /// Alternate output field separator.
@@ -199,6 +206,26 @@ async fn main() {
             eprintln!("error: {e}");
             std::process::exit(1);
         }
+    };
+    // C caput.c:455-465: for an ENUM field, read the menu (DBR_GR_ENUM)
+    // BEFORE building the write, so each value can be matched against the
+    // state names (caput.c:487-494). A menu-read timeout aborts the put
+    // exactly as C does (caput.c:461-465). The menu is empty for non-ENUM
+    // fields, which makes `build_write_value` skip the ENUM path entirely.
+    let enum_menu: Vec<String> = if native_type == epics_ca_rs::DbFieldType::Enum {
+        match ch.get_with_metadata(DbrClass::Gr).await {
+            Ok(snap) => snap.enums.map(|e| e.strings).unwrap_or_default(),
+            Err(CaError::Timeout) => {
+                eprintln!("Read operation timed out: ENUM data was not read.");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        Vec::new()
     };
     // C caput.c:147-152: the readback (the `Old :`/`New :` display) is
     // requested in the STRING form for an ENUM field unless `-n`, so the
@@ -262,6 +289,7 @@ async fn main() {
         args.force_string,
         args.long_string,
         args.array_mode,
+        &enum_menu,
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -271,13 +299,6 @@ async fn main() {
     };
 
     let result = match &parsed_value {
-        WriteValue::Typed(v) => {
-            if args.callback {
-                ch.put_with_timeout(v, timeout).await
-            } else {
-                ch.put_nowait(v).await
-            }
-        }
         WriteValue::Wire { dbr_type, value } => {
             // C-tool wire model: send the explicit DBR type (DBR_STRING /
             // DBR_CHAR) and let the server convert. The CLI `-w` timeout
@@ -397,17 +418,13 @@ async fn main() {
     }
 }
 
-/// What `caput-rs` will write — either a value typed against the
-/// channel's native DBR type, or a string to be sent as `DBR_STRING`
-/// for server-side resolution (the ENUM-by-name path).
+/// What `caput-rs` will write. Like C `caput`, every value travels as an
+/// explicit DBR wire type that the server converts to the native field
+/// type — there is no native-binary-typed put path. Non-ENUM values go as
+/// `DBR_STRING` / `DBR_CHAR`; ENUM values go as `DBR_STRING` (by name) or
+/// `DBR_DOUBLE` (numeric fallback), per `caput.c:486-552`.
 #[derive(Debug)]
 enum WriteValue {
-    /// A native-typed write sent as the channel's native DBR type via
-    /// `CaChannel::put*`. Used only for ENUM numeric-index values, which
-    /// C `caput` writes as the numeric type (`caput.c:474-481`,
-    /// `enumAsNr`); every other CLI value is converted by the server from
-    /// an explicit-wire-type [`WriteValue::Wire`].
-    Typed(epics_ca_rs::EpicsValue),
     /// An explicit-wire-type write: the tool picks the DBR wire type and
     /// the server converts to the native field type. C `caput` sends a
     /// non-ENUM value as `DBR_STRING` (`caput.c:540-552`) and an `-S`
@@ -432,7 +449,6 @@ impl WriteValue {
     /// non-fatally (see [`postput_read_fatal`]).
     fn echo_fallback(&self) -> epics_ca_rs::EpicsValue {
         match self {
-            WriteValue::Typed(v) => v.clone(),
             WriteValue::Wire { value, .. } => value.clone(),
             WriteValue::EnumString(s) => epics_ca_rs::EpicsValue::String(s.clone()),
             WriteValue::EnumStringArray(v) => epics_ca_rs::EpicsValue::StringArray(v.clone()),
@@ -598,6 +614,13 @@ fn raw_from_escaped_string(s: &str) -> epics_ca_rs::PvString {
 /// original argv). In `-a` mode the leading count token is skipped
 /// without parsing (C `caput.c:413-418`); a per-element parse failure
 /// returns `Err` with the full message for the caller to print.
+///
+/// For an ENUM field `enum_menu` is the record's state-name list
+/// (`DBR_GR_ENUM`, read up front by the caller as C does at
+/// `caput.c:459`). C classifies each value against that menu — a name
+/// that matches a state goes as `DBR_STRING`, otherwise it falls back to
+/// a number sent as `DBR_DOUBLE` (`caput.c:486-508`). The menu is empty
+/// for non-ENUM fields.
 fn build_write_value(
     values: &[String],
     native_type: epics_ca_rs::DbFieldType,
@@ -605,6 +628,7 @@ fn build_write_value(
     force_string: bool,
     long_string: bool,
     array_mode: bool,
+    enum_menu: &[String],
 ) -> Result<WriteValue, String> {
     if array_mode {
         // C `caput -a` (caput.c:413-418): after the PV name it skips the
@@ -618,25 +642,12 @@ fn build_write_value(
         // zero-count put is decided by the server/libca, not by CLI
         // argument parsing.
         let tokens = &values[1..];
-        // ENUM waveform special-casing, parallel to the scalar path:
-        // unless `-n` forces numeric, route to a DBR_STRING array for
-        // server-side menu resolution when `-s` is set or any element is
-        // not a plain integer index (the same documented divergence as
-        // the scalar path). C escapes each enum-name element (caput.c:487).
-        let enum_by_name = native_type == epics_ca_rs::DbFieldType::Enum
-            && !force_numeric
-            && (force_string || tokens.iter().any(|t| parse_plain_integer(t).is_none()));
-        if enum_by_name {
-            let escaped = tokens.iter().map(|t| raw_from_escaped_string(t)).collect();
-            return Ok(WriteValue::EnumStringArray(escaped));
-        }
-        // ENUM numeric-index waveform stays native — the server takes the
-        // index directly. This is the documented ENUM divergence, not the
-        // non-ENUM string-conversion path below.
+        // ENUM waveform: classify each element against the menu exactly as
+        // the scalar path does (C `caput.c:467-509` runs the same per-value
+        // loop for any count). Build one consistent wire type for the whole
+        // array — see `build_enum_array`.
         if native_type == epics_ca_rs::DbFieldType::Enum {
-            return parse_array(native_type, tokens)
-                .map(WriteValue::Typed)
-                .map_err(|e| format!("error: {e}"));
+            return build_enum_array(tokens, force_numeric, force_string, enum_menu);
         }
         // Non-ENUM array: C sends every element as a DBR_STRING after
         // epicsStrnRawFromEscaped (caput.c:540-552), regardless of the
@@ -653,21 +664,20 @@ fn build_write_value(
     let joined = values.join(" ");
 
     // (1) ENUM field type is handled FIRST (caput.c:455), BEFORE `-S` —
-    // charArrAsStr never applies to an ENUM PV. We don't fetch the menu;
-    // we let the server classify:
-    // * `-n` (force_numeric): interpret as a number.
-    // * `-s` (force_string): always DBR_STRING; server resolves the menu.
-    // * default: a plain integer index goes numeric; anything else is
-    //   sent as DBR_STRING for server-side menu resolution (escaped, as
-    //   C runs epicsStrnRawFromEscaped on the menu name, caput.c:487).
+    // charArrAsStr never applies to an ENUM PV. C reads the menu and
+    // classifies the value against it (`classify_enum_token`): a state
+    // name goes as DBR_STRING, a number as DBR_DOUBLE. Sending a numeric-
+    // looking *label* (e.g. "1" where state 1 is named "1") as a native
+    // index would silently mean the wrong state — the menu match prevents
+    // that (caput.c:486-508).
     if native_type == epics_ca_rs::DbFieldType::Enum {
-        let is_plain_integer = parse_plain_integer(&joined).is_some();
-        if !force_numeric && (force_string || !is_plain_integer) {
-            return Ok(WriteValue::EnumString(raw_from_escaped_string(&joined)));
-        }
-        return epics_ca_rs::EpicsValue::parse(native_type, &joined)
-            .map(WriteValue::Typed)
-            .map_err(|e| format!("error: {e}"));
+        return match classify_enum_token(&joined, force_numeric, force_string, enum_menu)? {
+            EnumToken::Name(s) => Ok(WriteValue::EnumString(s)),
+            EnumToken::Number(n) => Ok(WriteValue::Wire {
+                dbr_type: epics_ca_rs::DbFieldType::Double as u16,
+                value: epics_ca_rs::EpicsValue::Double(n),
+            }),
+        };
     }
 
     // (2) `-S` (charArrAsStr) on a NON-ENUM PV → NUL-terminated DBR_CHAR
@@ -697,99 +707,175 @@ fn build_write_value(
     })
 }
 
-/// Parse a plain integer index — decimal, optionally signed, no radix
-/// prefix and no surrounding garbage. C `caput` treats anything that
-/// is not a clean number as an ENUM menu string. Returns `Some` only
-/// for a strict integer literal.
-fn parse_plain_integer(s: &str) -> Option<i64> {
-    s.trim().parse::<i64>().ok()
+/// One ENUM value's classification, mirroring C `caput.c`'s per-value
+/// `dbrType` decision: a menu state name is written as `DBR_STRING`
+/// ([`EnumToken::Name`]); anything else is written as a `DBR_DOUBLE`
+/// number ([`EnumToken::Number`]).
+enum EnumToken {
+    Name(epics_ca_rs::PvString),
+    Number(f64),
 }
 
-fn parse_array(
-    native_type: epics_ca_rs::DbFieldType,
-    tokens: &[String],
-) -> Result<epics_ca_rs::EpicsValue, String> {
-    use epics_ca_rs::DbFieldType as DT;
-    use epics_ca_rs::EpicsValue;
-    match native_type {
-        DT::Short => {
-            let mut arr = Vec::with_capacity(tokens.len());
-            for t in tokens {
-                arr.push(
-                    EpicsValue::parse(DT::Short, t)
-                        .and_then(|v| match v {
-                            EpicsValue::Short(n) => Ok(n),
-                            _ => Err(epics_ca_rs::CaError::InvalidValue("not short".into())),
-                        })
-                        .map_err(|e| e.to_string())?,
-                );
-            }
-            Ok(EpicsValue::ShortArray(arr))
-        }
-        DT::Float => {
-            let mut arr = Vec::with_capacity(tokens.len());
-            for t in tokens {
-                arr.push(t.parse::<f32>().map_err(|e| e.to_string())?);
-            }
-            Ok(EpicsValue::FloatArray(arr))
-        }
-        DT::Double => {
-            let mut arr = Vec::with_capacity(tokens.len());
-            for t in tokens {
-                arr.push(t.parse::<f64>().map_err(|e| e.to_string())?);
-            }
-            Ok(EpicsValue::DoubleArray(arr))
-        }
-        DT::Long => {
-            let mut arr = Vec::with_capacity(tokens.len());
-            for t in tokens {
-                arr.push(t.parse::<i32>().map_err(|e| e.to_string())?);
-            }
-            Ok(EpicsValue::LongArray(arr))
-        }
-        DT::Enum => {
-            let mut arr = Vec::with_capacity(tokens.len());
-            for t in tokens {
-                arr.push(t.parse::<u16>().map_err(|e| e.to_string())?);
-            }
-            Ok(EpicsValue::EnumArray(arr))
-        }
-        DT::Int64 => {
-            let mut arr = Vec::with_capacity(tokens.len());
-            for t in tokens {
-                arr.push(t.parse::<i64>().map_err(|e| e.to_string())?);
-            }
-            Ok(EpicsValue::Int64Array(arr))
-        }
-        DT::UInt64 => {
-            let mut arr = Vec::with_capacity(tokens.len());
-            for t in tokens {
-                arr.push(t.parse::<u64>().map_err(|e| e.to_string())?);
-            }
-            Ok(EpicsValue::UInt64Array(arr))
-        }
-        DT::Char => Ok(EpicsValue::CharArray(
-            tokens
-                .iter()
-                .map(|t| t.parse::<u8>().unwrap_or(0))
-                .collect(),
-        )),
-        DT::String => Ok(EpicsValue::StringArray(
-            tokens.iter().map(|t| t.clone().into()).collect(),
-        )),
+/// Classify one value written to an ENUM field, mirroring C
+/// `caput.c:467-509`.
+///
+/// * `-n` (`force_numeric`): parse the token as a number and send it as
+///   `DBR_DOUBLE` (caput.c:469-482); a non-number is an error.
+/// * default / `-s`: escape-decode the token and compare it byte-for-byte
+///   against the menu state names (`strcmp`, caput.c:487-494). A match is
+///   sent as `DBR_STRING`. A non-match falls back to a number sent as
+///   `DBR_DOUBLE` (caput.c:496-508) — UNLESS `-s` (`force_string`) forbids
+///   the numeric fallback, in which case the value is rejected.
+///
+/// This is the structural fix for the numeric-label defect: a token like
+/// "1" is matched against the menu FIRST, so when state 1 is literally
+/// named "1" it is written by name (DBR_STRING) and resolves to the right
+/// state, instead of being sent as a native index that could mean a
+/// different state.
+fn classify_enum_token(
+    token: &str,
+    force_numeric: bool,
+    force_string: bool,
+    menu: &[String],
+) -> Result<EnumToken, String> {
+    if force_numeric {
+        return parse_enum_double(token)
+            .map(EnumToken::Number)
+            .ok_or_else(|| format!("Enum index value '{token}' is not a number."));
     }
+    // C escapes the value into a fixed EpicsStr buffer before comparing
+    // it to the menu names (caput.c:487-488).
+    let escaped = raw_from_escaped_string(token);
+    if menu
+        .iter()
+        .any(|name| name.as_bytes() == escaped.as_bytes())
+    {
+        return Ok(EnumToken::Name(escaped));
+    }
+    // Not a menu name: `-s` rejects it outright (caput.c:499); otherwise
+    // try the escaped text as a number (caput.c:498-507).
+    if force_string {
+        return Err(format!("Enum string value '{escaped}' invalid."));
+    }
+    parse_enum_double(&String::from_utf8_lossy(escaped.as_bytes()))
+        .map(EnumToken::Number)
+        .ok_or_else(|| format!("Enum string value '{escaped}' invalid."))
+}
+
+/// Parse an ENUM value as a number, mirroring C `epicsStrtod`
+/// (caput.c:470,498). Returns `None` when the token is not a number.
+/// Stricter than `strtod` in rejecting trailing garbage (e.g. "1.5x"),
+/// which is irrelevant for the clean indices ENUM values carry.
+fn parse_enum_double(s: &str) -> Option<f64> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    t.parse::<f64>().ok()
+}
+
+/// Build an ENUM waveform write, applying [`classify_enum_token`] to each
+/// element (C `caput.c:467-509` loops over `count` values).
+///
+/// C shares a single `dbrType` across the array — the LAST element's
+/// classification wins (caput.c:489/507) — which silently zeroes any
+/// name element when the final element is numeric (`dbuf` is never set
+/// for a name). We pick ONE wire type for the whole array instead: all
+/// numbers → `DBR_DOUBLE[]`; otherwise → `DBR_STRING[]` so every name
+/// still resolves (a numeric element falls to the server's index parse),
+/// rather than corrupting name elements to 0.
+fn build_enum_array(
+    tokens: &[String],
+    force_numeric: bool,
+    force_string: bool,
+    menu: &[String],
+) -> Result<WriteValue, String> {
+    let classified: Vec<EnumToken> = tokens
+        .iter()
+        .map(|t| classify_enum_token(t, force_numeric, force_string, menu))
+        .collect::<Result<_, _>>()?;
+
+    let mut numbers = Vec::with_capacity(classified.len());
+    let mut all_number = true;
+    for c in &classified {
+        match c {
+            EnumToken::Number(n) => numbers.push(*n),
+            EnumToken::Name(_) => all_number = false,
+        }
+    }
+    if all_number {
+        return Ok(WriteValue::Wire {
+            dbr_type: epics_ca_rs::DbFieldType::Double as u16,
+            value: epics_ca_rs::EpicsValue::DoubleArray(numbers),
+        });
+    }
+    // At least one menu name → DBR_STRING array. A `Number` element keeps
+    // its escaped token text; the server resolves it by index parse.
+    let names = tokens
+        .iter()
+        .zip(&classified)
+        .map(|(t, c)| match c {
+            EnumToken::Name(s) => s.clone(),
+            EnumToken::Number(_) => raw_from_escaped_string(t),
+        })
+        .collect();
+    Ok(WriteValue::EnumStringArray(names))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        FatalReadback, WriteValue, build_write_value, postput_read_fatal, raw_from_escaped,
+        Args, FatalReadback, WriteValue, build_write_value, postput_read_fatal, raw_from_escaped,
         raw_from_escaped_string,
     };
+    use clap::Parser;
     use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
 
     fn vals(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// C `caput.c:298-319` parses `-n`/`-s` and `-S`/`-a` as two
+    /// mutually-exclusive last-wins pairs via a getopt switch (each case
+    /// sets its flag and clears the paired one), with NO conflict error.
+    /// `overrides_with` must reproduce that for every order boundary.
+    #[test]
+    fn enum_and_array_flags_are_last_wins_pairs() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["caput-rs"];
+            argv.extend_from_slice(extra);
+            argv.extend_from_slice(&["PV", "1"]);
+            Args::try_parse_from(argv).expect("flags must parse without a conflict error")
+        };
+
+        // -n / -s: last one wins, neither errors.
+        let a = parse(&["-n", "-s"]);
+        assert!(
+            a.force_string && !a.force_numeric,
+            "-n -s → string (last wins)"
+        );
+        let a = parse(&["-s", "-n"]);
+        assert!(
+            a.force_numeric && !a.force_string,
+            "-s -n → numeric (last wins)"
+        );
+        let a = parse(&["-n"]);
+        assert!(a.force_numeric && !a.force_string, "-n alone → numeric");
+        let a = parse(&["-s"]);
+        assert!(a.force_string && !a.force_numeric, "-s alone → string");
+
+        // -S / -a: last one wins, never both set.
+        let a = parse(&["-a", "-S"]);
+        assert!(
+            a.long_string && !a.array_mode,
+            "-a -S → long string (last wins)"
+        );
+        let a = parse(&["-S", "-a"]);
+        assert!(a.array_mode && !a.long_string, "-S -a → array (last wins)");
+        let a = parse(&["-a"]);
+        assert!(a.array_mode && !a.long_string, "-a alone → array");
+        let a = parse(&["-S"]);
+        assert!(a.long_string && !a.array_mode, "-S alone → long string");
     }
 
     /// Regression R0604-CAPUT-POSTPUT-READBACK-STATUS-1: the post-put readback
@@ -874,6 +960,7 @@ mod tests {
             false,
             true,
             false,
+            &[],
         );
         match r {
             Ok(WriteValue::Wire {
@@ -898,7 +985,7 @@ mod tests {
             DbFieldType::Long,
             DbFieldType::String,
         ] {
-            let r = build_write_value(&vals(&["not a number"]), nt, false, false, true, false);
+            let r = build_write_value(&vals(&["not a number"]), nt, false, false, true, false, &[]);
             assert!(
                 matches!(
                     r,
@@ -915,9 +1002,11 @@ mod tests {
     #[test]
     fn enum_field_type_wins_over_long_string() {
         // C checks the ENUM field type FIRST (`caput.c:455`), so `-S`
-        // (charArrAsStr) never applies to an ENUM PV: a non-integer token
-        // routes to DBR_STRING for server-side menu resolution, NOT a
-        // DBR_CHAR array. Pre-fix the top-level `-S` block hijacked this.
+        // (charArrAsStr) never applies to an ENUM PV: a value that matches
+        // a menu state name routes to DBR_STRING (server resolves the
+        // name), NOT a DBR_CHAR array. Pre-fix the top-level `-S` block
+        // hijacked this.
+        let menu = vals(&["Stop", "Run", "not a number"]);
         let r = build_write_value(
             &vals(&["not a number"]),
             DbFieldType::Enum,
@@ -925,18 +1014,205 @@ mod tests {
             false,
             true,
             false,
+            &menu,
         );
         match r {
             Ok(WriteValue::EnumString(s)) => assert_eq!(s, "not a number"),
             other => panic!("-S on an ENUM PV must yield EnumString, got {other:?}"),
         }
-        // A plain integer index on an ENUM PV still goes numeric even with
-        // `-S` set — ENUM precedence, then the default index path.
-        let idx = build_write_value(&vals(&["2"]), DbFieldType::Enum, false, false, true, false);
-        assert!(
-            matches!(idx, Ok(WriteValue::Typed(_))),
-            "integer index on ENUM PV stays numeric, got {idx:?}"
+        // An integer index that is NOT a menu state name falls back to a
+        // number sent as DBR_DOUBLE (caput.c:507) even with `-S` set —
+        // ENUM precedence, then the numeric fallback path.
+        let idx = build_write_value(
+            &vals(&["5"]),
+            DbFieldType::Enum,
+            false,
+            false,
+            true,
+            false,
+            &menu,
         );
+        match idx {
+            Ok(WriteValue::Wire {
+                dbr_type,
+                value: EpicsValue::Double(n),
+            }) => {
+                assert_eq!(dbr_type, DbFieldType::Double as u16);
+                assert_eq!(n, 5.0);
+            }
+            other => panic!("out-of-menu index on ENUM PV → DBR_DOUBLE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enum_numeric_label_matches_menu_name_before_index() {
+        // Regression: a record whose state 1 is literally named "1" must
+        // be written by NAME (DBR_STRING) so the server resolves it to that
+        // state — C matches the menu before the numeric fallback
+        // (caput.c:487-494). Sending "1" as a native index instead could
+        // mean a different state.
+        let menu = vals(&["0", "1", "2"]);
+        match build_write_value(
+            &vals(&["1"]),
+            DbFieldType::Enum,
+            false,
+            false,
+            false,
+            false,
+            &menu,
+        ) {
+            Ok(WriteValue::EnumString(s)) => assert_eq!(s, "1"),
+            other => panic!("numeric-looking menu label must go by name, got {other:?}"),
+        }
+        // A value with no matching state name falls back to a number
+        // (DBR_DOUBLE), not a native index (caput.c:496-507).
+        match build_write_value(
+            &vals(&["7"]),
+            DbFieldType::Enum,
+            false,
+            false,
+            false,
+            false,
+            &menu,
+        ) {
+            Ok(WriteValue::Wire {
+                dbr_type,
+                value: EpicsValue::Double(n),
+            }) => {
+                assert_eq!(dbr_type, DbFieldType::Double as u16);
+                assert_eq!(n, 7.0);
+            }
+            other => panic!("out-of-menu value → DBR_DOUBLE fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enum_force_string_rejects_non_menu_value() {
+        // `-s` (enumAsString) forbids the numeric fallback: a value that
+        // matches no state name is an error, not a coerced index
+        // (caput.c:499-503).
+        let menu = vals(&["Off", "On"]);
+        let err = build_write_value(
+            &vals(&["3"]),
+            DbFieldType::Enum,
+            false,
+            true,
+            false,
+            false,
+            &menu,
+        );
+        assert!(
+            matches!(&err, Err(m) if m.contains("invalid")),
+            "-s on a non-menu value must error, got {err:?}"
+        );
+        // A name that DOES match is accepted as DBR_STRING.
+        match build_write_value(
+            &vals(&["On"]),
+            DbFieldType::Enum,
+            false,
+            true,
+            false,
+            false,
+            &menu,
+        ) {
+            Ok(WriteValue::EnumString(s)) => assert_eq!(s, "On"),
+            other => panic!("-s with a matching name → EnumString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enum_force_numeric_sends_dbr_double_ignoring_menu() {
+        // `-n` (enumAsNr) interprets every value as a number sent as
+        // DBR_DOUBLE, never matching the menu (caput.c:467-482) — even a
+        // value that IS a state name.
+        let menu = vals(&["1", "2"]);
+        match build_write_value(
+            &vals(&["1"]),
+            DbFieldType::Enum,
+            true,
+            false,
+            false,
+            false,
+            &menu,
+        ) {
+            Ok(WriteValue::Wire {
+                dbr_type,
+                value: EpicsValue::Double(n),
+            }) => {
+                assert_eq!(dbr_type, DbFieldType::Double as u16);
+                assert_eq!(n, 1.0);
+            }
+            other => panic!("-n must send DBR_DOUBLE, got {other:?}"),
+        }
+        // `-n` on a non-number is an error.
+        let err = build_write_value(
+            &vals(&["Open"]),
+            DbFieldType::Enum,
+            true,
+            false,
+            false,
+            false,
+            &menu,
+        );
+        assert!(
+            matches!(&err, Err(m) if m.contains("is not a number")),
+            "-n on a non-number must error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn enum_array_homogeneous_and_mixed_wire_types() {
+        // ENUM waveform: all-name → DBR_STRING[]; all-number → DBR_DOUBLE[].
+        let menu = vals(&["Stop", "Run"]);
+        // `-a PV 2 Stop Run`: both are state names → DBR_STRING[].
+        match build_write_value(
+            &vals(&["2", "Stop", "Run"]),
+            DbFieldType::Enum,
+            false,
+            false,
+            false,
+            true,
+            &menu,
+        ) {
+            Ok(WriteValue::EnumStringArray(a)) => {
+                assert_eq!(a, vec!["Stop", "Run"]);
+            }
+            other => panic!("name array → DBR_STRING[], got {other:?}"),
+        }
+        // `-a PV 2 0 1`: neither matches a name → DBR_DOUBLE[] (caput.c:507).
+        match build_write_value(
+            &vals(&["2", "0", "1"]),
+            DbFieldType::Enum,
+            false,
+            false,
+            false,
+            true,
+            &menu,
+        ) {
+            Ok(WriteValue::Wire {
+                dbr_type,
+                value: EpicsValue::DoubleArray(a),
+            }) => {
+                assert_eq!(dbr_type, DbFieldType::Double as u16);
+                assert_eq!(a, vec![0.0, 1.0]);
+            }
+            other => panic!("numeric array → DBR_DOUBLE[], got {other:?}"),
+        }
+        // Mixed `-a PV 2 Stop 1`: at least one name → DBR_STRING[] for the
+        // whole array (we avoid C's last-element-wins corruption that would
+        // zero the name element).
+        match build_write_value(
+            &vals(&["2", "Stop", "1"]),
+            DbFieldType::Enum,
+            false,
+            false,
+            false,
+            true,
+            &menu,
+        ) {
+            Ok(WriteValue::EnumStringArray(a)) => assert_eq!(a, vec!["Stop", "1"]),
+            other => panic!("mixed array → DBR_STRING[], got {other:?}"),
+        }
     }
 
     #[test]
@@ -951,6 +1227,7 @@ mod tests {
             false,
             true,
             false,
+            &[],
         );
         match r {
             Ok(WriteValue::Wire {
@@ -977,6 +1254,7 @@ mod tests {
             false,
             false,
             false,
+            &[],
         );
         match r {
             Ok(WriteValue::Wire {
@@ -1004,6 +1282,7 @@ mod tests {
             false,
             false,
             false,
+            &[],
         ) {
             Ok(WriteValue::Wire {
                 dbr_type,
@@ -1023,6 +1302,7 @@ mod tests {
             false,
             false,
             true,
+            &[],
         ) {
             Ok(WriteValue::Wire {
                 dbr_type,
@@ -1052,6 +1332,7 @@ mod tests {
             false,
             false,
             true,
+            &[],
         ) {
             Ok(WriteValue::Wire {
                 value: EpicsValue::StringArray(a),
@@ -1067,6 +1348,7 @@ mod tests {
             false,
             false,
             true,
+            &[],
         ) {
             Ok(WriteValue::Wire {
                 value: EpicsValue::StringArray(a),
@@ -1076,7 +1358,15 @@ mod tests {
         }
         // `-a PV 0`: zero trailing values reaches the write path as an
         // empty array (count == 0), decided by the server — not a CLI error.
-        match build_write_value(&vals(&["0"]), DbFieldType::Long, false, false, false, true) {
+        match build_write_value(
+            &vals(&["0"]),
+            DbFieldType::Long,
+            false,
+            false,
+            false,
+            true,
+            &[],
+        ) {
             Ok(WriteValue::Wire {
                 value: EpicsValue::StringArray(a),
                 ..
@@ -1093,7 +1383,15 @@ mod tests {
         // performs the conversion and any rejection). This is distinct
         // from `-S`, which sends a DBR_CHAR byte array.
         for tok in ["65", "hello"] {
-            match build_write_value(&vals(&[tok]), DbFieldType::Char, false, false, false, false) {
+            match build_write_value(
+                &vals(&[tok]),
+                DbFieldType::Char,
+                false,
+                false,
+                false,
+                false,
+                &[],
+            ) {
                 Ok(WriteValue::Wire {
                     dbr_type,
                     value: EpicsValue::String(s),
@@ -1121,6 +1419,7 @@ mod tests {
             false,
             false,
             false,
+            &[],
         ) {
             Ok(WriteValue::Wire {
                 value: EpicsValue::String(s),
@@ -1140,6 +1439,7 @@ mod tests {
             false,
             false,
             true,
+            &[],
         ) {
             Ok(WriteValue::Wire {
                 value: EpicsValue::StringArray(a),
@@ -1150,7 +1450,10 @@ mod tests {
             }
             other => panic!("expected truncated DBR_STRING[] Wire, got {other:?}"),
         }
-        // ENUM-by-name scalar (`-s`) -> EnumString capped to 39.
+        // ENUM-by-name scalar (`-s`) -> EnumString capped to 39. The value
+        // is escape-decoded and truncated to 39 bytes BEFORE the menu
+        // compare, so the matching state name is the 39-byte form.
+        let menu_label = "a".repeat(39);
         match build_write_value(
             &vals(&[long.as_str()]),
             DbFieldType::Enum,
@@ -1158,6 +1461,7 @@ mod tests {
             true,
             false,
             false,
+            std::slice::from_ref(&menu_label),
         ) {
             Ok(WriteValue::EnumString(s)) => {
                 assert_eq!(s.len(), 39, "enum-by-name value truncated to 39 bytes")
@@ -1173,6 +1477,7 @@ mod tests {
             false,
             true,
             false,
+            &[],
         ) {
             Ok(WriteValue::Wire {
                 dbr_type,
@@ -1236,6 +1541,7 @@ mod tests {
             false,
             false,
             false,
+            &[],
         ) {
             Ok(WriteValue::Wire {
                 dbr_type,

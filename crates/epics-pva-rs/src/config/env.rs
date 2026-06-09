@@ -1163,6 +1163,228 @@ pub fn list_broadcast_addresses_on(interfaces: &[Ipv4Addr], port: u16) -> Vec<So
     out
 }
 
+/// pvxs idle-timeout scale (`config.cpp:149` `tmoScale = 4.0/3.0`): a
+/// configured `EPICS_PVA_CONN_TMO` of 30 s yields a 40 s effective
+/// inactivity timeout, so the server's reap window does not race a Java
+/// client's 30 s echo cadence. The raw env parser [`conn_timeout_secs`]
+/// keeps the *configured* seconds; [`Config`] is the effective-timeout
+/// owner that applies this scale (`parse_timeout`, `config.cpp:211-227`).
+const TMO_SCALE: f64 = 4.0 / 3.0;
+
+/// Clamp an effective (already `4/3`-scaled) TCP idle timeout to the pvxs
+/// bounds, mirroring `enforceTimeout` (`config.cpp:373-391`). A
+/// non-finite, non-positive, or `>= time_t::max` value resets to the 40 s
+/// default; anything under the 2 s floor is raised to 2 s, so a
+/// misconfigured timeout can never fall below the echo cadence.
+fn enforce_timeout(tmo: &mut f64) {
+    if !tmo.is_finite() || *tmo <= 0.0 || *tmo >= i64::MAX as f64 {
+        *tmo = 40.0;
+    } else if *tmo < 2.0 {
+        *tmo = 2.0;
+    }
+}
+
+/// Wrap interface IPs as modifier-less [`Endpoint`]s (port 0 — a bind
+/// interface carries no destination port). Bridges the `Vec<IpAddr>`
+/// interface parsers to [`Config`]'s endpoint-typed `interfaces` field.
+fn intf_endpoints(ips: Vec<IpAddr>) -> Vec<Endpoint> {
+    ips.into_iter()
+        .map(|ip| Endpoint::from(SocketAddr::new(ip, 0)))
+        .collect()
+}
+
+/// Give every port-less destination the list's default port, mirroring
+/// pvxs `split_addr_into` (`config.cpp:167-168`:
+/// `if(ep.addr.port()==0) ep.addr.setPort(defaultPort)`). Applied inside
+/// [`Config::expand`] so `addr` and `addr:udp_port` do not survive dedup
+/// as two distinct effective targets.
+fn set_default_port(eps: &mut [Endpoint], port: u16) {
+    for e in eps.iter_mut() {
+        if e.addr.port() == 0 {
+            e.addr.set_port(port);
+        }
+    }
+}
+
+/// Drop duplicate `(ip, port)` ignore entries, preserving first-seen
+/// order (pvxs `removeDups(ignoreAddrs)`, `config.cpp:525`).
+fn dedup_ignore_addrs(addrs: &mut Vec<(IpAddr, u16)>) {
+    let mut seen = std::collections::HashSet::new();
+    addrs.retain(|x| seen.insert(*x));
+}
+
+/// The effective PVA configuration value — a client+server union of
+/// `pvxs::client::Config` and `pvxs::server::Config` (`config.cpp`),
+/// seeded from the environment via [`Config::from_client_env`] /
+/// [`Config::from_server_env`] and finalised by [`Config::expand`].
+///
+/// `expand()` is the single owner that turns the *as-configured* value
+/// into the *as-used* value: it normalises the protocol ports, fills the
+/// wildcard interface, fans the auto-address / auto-beacon broadcasts
+/// into the destination lists, gives each destination its effective
+/// port, collapses duplicates, and clamps the idle timeout — mirroring
+/// pvxs `Config::expand()` (`config.cpp:485-529` server, `:624-651`
+/// client). The post-`expand()` value is what an effective-config
+/// readback (`pvinfo -D`, `operator<<`) should render.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Config {
+    /// `EPICS_PVA_BROADCAST_PORT` — UDP SEARCH / beacon port (pvxs
+    /// `udp_port`); the default port for UDP address-list and beacon
+    /// destinations.
+    pub udp_port: u16,
+    /// `EPICS_PVA_SERVER_PORT` — TCP server / name-server port (pvxs
+    /// `tcp_port`).
+    pub tcp_port: u16,
+    /// `EPICS_PVA_AUTO_ADDR_LIST` — when set, `expand()` appends each
+    /// interface's directed broadcast to [`Self::address_list`] and then
+    /// clears the flag (pvxs `autoAddrList`, `config.cpp:640-643`).
+    pub auto_addr_list: bool,
+    /// `EPICS_PVAS_AUTO_BEACON_ADDR_LIST` — server analogue of
+    /// `auto_addr_list` for [`Self::beacon_destinations`] (pvxs
+    /// `auto_beacon`, `config.cpp:512-519`).
+    pub auto_beacon: bool,
+    /// `EPICS_PVA[S]_INTF_ADDR_LIST` — interface bind / broadcast-source
+    /// list. Empty means the wildcard, which `expand()` fills with
+    /// `0.0.0.0` (`config.cpp:492-494, 637-638`).
+    pub interfaces: Vec<Endpoint>,
+    /// `EPICS_PVA_ADDR_LIST` — UDP SEARCH targets. pva2pva treats these,
+    /// together with [`Self::udp_port`], as UDP SEARCH destinations,
+    /// never TCP name servers.
+    pub address_list: Vec<Endpoint>,
+    /// `EPICS_PVA_NAME_SERVERS` — persistent TCP SEARCH peers (distinct
+    /// from [`Self::address_list`]).
+    pub name_servers: Vec<SocketAddr>,
+    /// `EPICS_PVAS_BEACON_ADDR_LIST` — explicit beacon destinations.
+    pub beacon_destinations: Vec<Endpoint>,
+    /// `EPICS_PVAS_IGNORE_ADDR_LIST` — peers to drop (`port == 0` matches
+    /// any port from that IP).
+    pub ignore_addrs: Vec<(IpAddr, u16)>,
+    /// Effective (`4/3`-scaled) TCP idle timeout, seconds. `expand()`
+    /// clamps it to the pvxs bounds via [`enforce_timeout`].
+    pub tcp_timeout: f64,
+}
+
+impl Config {
+    /// Seed a client-role config from the `EPICS_PVA_*` environment.
+    /// Mirrors `client::Config::fromEnv` (`config.cpp:552-599`): each
+    /// field comes from the matching env accessor, the address list is
+    /// parsed against the UDP port, and the timeout is scaled. Call
+    /// [`Self::expand`] before use.
+    pub fn from_client_env() -> Self {
+        let udp_port = broadcast_port();
+        let address_list = std::env::var("EPICS_PVA_ADDR_LIST")
+            .ok()
+            .map(|s| parse_endpoints_with_port(&s, udp_port))
+            .unwrap_or_default();
+        Self {
+            udp_port,
+            tcp_port: server_port(),
+            auto_addr_list: auto_addr_list_enabled(),
+            auto_beacon: false,
+            interfaces: intf_endpoints(list_intf_addresses()),
+            address_list,
+            name_servers: name_servers(),
+            beacon_destinations: Vec::new(),
+            ignore_addrs: Vec::new(),
+            tcp_timeout: conn_timeout_secs() * TMO_SCALE,
+        }
+    }
+
+    /// Seed a server-role config from the `EPICS_PVAS_*` environment
+    /// (falling back to `EPICS_PVA_*`). Mirrors `server::Config::fromEnv`
+    /// (`config.cpp:397-445`). Call [`Self::expand`] before use.
+    pub fn from_server_env() -> Self {
+        Self {
+            udp_port: server_broadcast_port(),
+            tcp_port: pvas_server_port(),
+            auto_addr_list: false,
+            auto_beacon: auto_beacon_addr_list_enabled(),
+            interfaces: intf_endpoints(server_intf_addr_list()),
+            address_list: Vec::new(),
+            name_servers: Vec::new(),
+            beacon_destinations: server_beacon_endpoints_opt().unwrap_or_default(),
+            ignore_addrs: server_ignore_addr_list(),
+            tcp_timeout: conn_timeout_secs() * TMO_SCALE,
+        }
+    }
+
+    /// Finalise the configuration in place — see the type docs. Idempotent:
+    /// the `auto_*` flags are cleared once consumed, so a second call is a
+    /// no-op fan-out (pvxs sets `autoAddrList = false` / `auto_beacon =
+    /// false` for the same reason, `config.cpp:643, 518`).
+    pub fn expand(&mut self) {
+        // A zero effective port is never a usable destination, so promote
+        // it to the protocol default (config.cpp:563-566, 575-578,
+        // 628-632). The server bind port keeps its own zero-means-ephemeral
+        // semantics elsewhere; this is the *effective destination* port.
+        if self.udp_port == 0 {
+            self.udp_port = 5076;
+        }
+        if self.tcp_port == 0 {
+            self.tcp_port = 5075;
+        }
+
+        // An empty interface list implies the wildcard — "no addresses
+        // isn't interesting" (config.cpp:492-494, 637-638).
+        if self.interfaces.is_empty() {
+            self.interfaces.push(Endpoint::from(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                0,
+            )));
+        }
+
+        let v4_ifaces = self.interface_v4_addrs();
+
+        // Auto address-list expansion (client, config.cpp:640-643): append
+        // each interface's directed broadcast to the SEARCH targets, then
+        // clear the flag so a re-`expand()` does not duplicate them.
+        if self.auto_addr_list {
+            for sa in list_broadcast_addresses_on(&v4_ifaces, self.udp_port) {
+                self.address_list.push(Endpoint::from(sa));
+            }
+            self.auto_addr_list = false;
+        }
+
+        // Auto beacon expansion (server, config.cpp:512-519): the same
+        // broadcast fan-out into the beacon destinations.
+        if self.auto_beacon {
+            for sa in list_broadcast_addresses_on(&v4_ifaces, self.udp_port) {
+                self.beacon_destinations.push(Endpoint::from(sa));
+            }
+            self.auto_beacon = false;
+        }
+
+        // Give every port-less destination its effective UDP port before
+        // dedup, so `addr` and `addr:udp_port` collapse together.
+        set_default_port(&mut self.address_list, self.udp_port);
+        set_default_port(&mut self.beacon_destinations, self.udp_port);
+
+        // Collapse duplicates — longest TTL wins, first-seen order
+        // (config.cpp:521-525, 647 `removeDups`).
+        self.interfaces = dedup_endpoints(std::mem::take(&mut self.interfaces));
+        self.address_list = dedup_endpoints(std::mem::take(&mut self.address_list));
+        self.beacon_destinations = dedup_endpoints(std::mem::take(&mut self.beacon_destinations));
+        dedup_ignore_addrs(&mut self.ignore_addrs);
+
+        // Clamp the idle timeout to the pvxs bounds (config.cpp:527, 650).
+        enforce_timeout(&mut self.tcp_timeout);
+    }
+
+    /// The IPv4 addresses of [`Self::interfaces`], used as the interface
+    /// constraint for broadcast auto-expansion. The wildcard `0.0.0.0`
+    /// entry maps to itself, so [`list_broadcast_addresses_on`] expands it
+    /// to every NIC.
+    fn interface_v4_addrs(&self) -> Vec<Ipv4Addr> {
+        self.interfaces
+            .iter()
+            .filter_map(|e| match e.addr.ip() {
+                IpAddr::V4(v4) => Some(v4),
+                IpAddr::V6(_) => None,
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2154,6 +2376,198 @@ mod tests {
             match prev_ns {
                 Some(v) => std::env::set_var("EPICS_PVA_NAME_SERVERS", v),
                 None => std::env::remove_var("EPICS_PVA_NAME_SERVERS"),
+            }
+        }
+    }
+
+    // ---- Config::expand() ----
+
+    /// Build a bare client config (no env reads) for `expand()` unit tests.
+    fn bare_config() -> Config {
+        Config {
+            udp_port: 5076,
+            tcp_port: 5075,
+            auto_addr_list: false,
+            auto_beacon: false,
+            interfaces: Vec::new(),
+            address_list: Vec::new(),
+            name_servers: Vec::new(),
+            beacon_destinations: Vec::new(),
+            ignore_addrs: Vec::new(),
+            tcp_timeout: 40.0,
+        }
+    }
+
+    /// `expand()` promotes a zero UDP/TCP port to the protocol defaults —
+    /// pvxs `config.cpp:563-566, 575-578, 628-632` (a zero effective port is
+    /// never a usable destination).
+    #[test]
+    fn config_expand_promotes_zero_ports() {
+        let mut c = bare_config();
+        c.udp_port = 0;
+        c.tcp_port = 0;
+        c.expand();
+        assert_eq!(c.udp_port, 5076);
+        assert_eq!(c.tcp_port, 5075);
+    }
+
+    /// An empty interface list expands to the wildcard `0.0.0.0` — pvxs
+    /// "no addresses isn't interesting" (`config.cpp:492-494, 637-638`).
+    #[test]
+    fn config_expand_fills_wildcard_interface() {
+        let mut c = bare_config();
+        c.expand();
+        assert!(
+            c.interfaces
+                .iter()
+                .any(|e| e.addr.ip() == IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            "empty interface list must expand to the wildcard: {:?}",
+            c.interfaces
+        );
+    }
+
+    /// `auto_addr_list` appends the limited broadcast to the SEARCH targets
+    /// and then clears the flag — pvxs `autoAddrList` consumption
+    /// (`config.cpp:640-643`). The flag is idempotent: a second `expand()`
+    /// adds nothing.
+    #[test]
+    fn config_expand_consumes_auto_addr_list() {
+        let mut c = bare_config();
+        c.auto_addr_list = true;
+        c.expand();
+        assert!(
+            !c.auto_addr_list,
+            "auto_addr_list must be cleared after expand"
+        );
+        let bcast = SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), 5076);
+        assert!(
+            c.address_list.iter().any(|e| e.addr == bcast),
+            "auto expansion must add the limited broadcast: {:?}",
+            c.address_list
+        );
+        let n = c.address_list.len();
+        c.expand();
+        assert_eq!(
+            n,
+            c.address_list.len(),
+            "re-expand must not duplicate targets"
+        );
+    }
+
+    /// Duplicate destinations collapse to one, keeping the longest TTL and
+    /// first-seen order — pvxs `removeDups` (`config.cpp:349-371, 647`).
+    #[test]
+    fn config_expand_dedups_endpoints_longest_ttl() {
+        let mut c = bare_config();
+        let mcast = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(224, 0, 2, 3)), 5076);
+        c.address_list = vec![
+            Endpoint {
+                addr: mcast,
+                ttl: Some(1),
+                iface: None,
+            },
+            Endpoint {
+                addr: mcast,
+                ttl: Some(8),
+                iface: None,
+            },
+        ];
+        c.expand();
+        assert_eq!(
+            c.address_list.len(),
+            1,
+            "duplicate (addr,iface) must collapse"
+        );
+        assert_eq!(c.address_list[0].ttl, Some(8), "longest TTL must win");
+    }
+
+    /// A port-less destination takes the effective UDP port before dedup —
+    /// pvxs `split_addr_into` (`config.cpp:167-168`).
+    #[test]
+    fn config_expand_sets_default_port_on_targets() {
+        let mut c = bare_config();
+        c.udp_port = 5099;
+        c.address_list = vec![Endpoint::from(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+            0,
+        ))];
+        c.expand();
+        assert_eq!(c.address_list[0].addr.port(), 5099);
+    }
+
+    /// The idle timeout is clamped to the pvxs `enforceTimeout` bounds
+    /// (`config.cpp:373-391`): non-positive → 40 s default, below the 2 s
+    /// floor → 2 s, a sane value is preserved.
+    #[test]
+    fn config_expand_enforces_timeout_bounds() {
+        let mut zero = bare_config();
+        zero.tcp_timeout = 0.0;
+        zero.expand();
+        assert_eq!(zero.tcp_timeout, 40.0);
+
+        let mut tiny = bare_config();
+        tiny.tcp_timeout = 1.0;
+        tiny.expand();
+        assert_eq!(tiny.tcp_timeout, 2.0);
+
+        let mut sane = bare_config();
+        sane.tcp_timeout = 40.0;
+        sane.expand();
+        assert_eq!(sane.tcp_timeout, 40.0);
+
+        let mut nan = bare_config();
+        nan.tcp_timeout = f64::NAN;
+        nan.expand();
+        assert_eq!(nan.tcp_timeout, 40.0);
+    }
+
+    /// `from_client_env` reads `EPICS_PVA_*`, scaling `CONN_TMO` by 4/3 and
+    /// parsing the address list against the UDP port (pvxs
+    /// `client::Config::fromEnv`, `config.cpp:552-599`).
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn config_from_client_env_reads_pva_vars() {
+        let keys = [
+            "EPICS_PVA_BROADCAST_PORT",
+            "EPICS_PVA_SERVER_PORT",
+            "EPICS_PVA_ADDR_LIST",
+            "EPICS_PVA_AUTO_ADDR_LIST",
+            "EPICS_PVA_CONN_TMO",
+            "EPICS_PVA_INTF_ADDR_LIST",
+            "EPICS_PVA_NAME_SERVERS",
+        ];
+        let saved: Vec<_> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+        // SAFETY: std::env mutation is unsafe in edition 2024; the
+        // `epics_env` serial guard makes the whole block race-free.
+        unsafe {
+            std::env::set_var("EPICS_PVA_BROADCAST_PORT", "5099");
+            std::env::set_var("EPICS_PVA_SERVER_PORT", "5098");
+            std::env::set_var("EPICS_PVA_ADDR_LIST", "10.0.0.5");
+            std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
+            std::env::set_var("EPICS_PVA_CONN_TMO", "30");
+            std::env::remove_var("EPICS_PVA_INTF_ADDR_LIST");
+            std::env::remove_var("EPICS_PVA_NAME_SERVERS");
+        }
+        let c = Config::from_client_env();
+        assert_eq!(c.udp_port, 5099);
+        assert_eq!(c.tcp_port, 5098);
+        assert!(!c.auto_addr_list);
+        // CONN_TMO 30 s scaled by 4/3 → 40 s effective.
+        assert!((c.tcp_timeout - 40.0).abs() < 1e-9);
+        assert!(
+            c.address_list
+                .iter()
+                .any(|e| e.addr == SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)), 5099)),
+            "addr list must parse against the UDP port: {:?}",
+            c.address_list
+        );
+        // SAFETY: restore, same serial guard.
+        unsafe {
+            for (k, v) in keys.iter().zip(saved) {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
             }
         }
     }

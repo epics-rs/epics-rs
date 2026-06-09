@@ -294,15 +294,99 @@ impl Value {
                         })?;
                     let _ = self.write_field(&path, PvField::ScalarArray(converted));
                 }
-                // "Any" (Variant) holds an arbitrary value: pvxs `copyIn`
-                // for an Any destination stores the source Value verbatim
-                // with no descriptor reselection (data.cpp:668-681).
-                // StructureArray elements are enforced against the
-                // destination element descriptor only when they differ
-                // (data.cpp:623-643); for the same-schema squash that
-                // drives this path the descriptors are identical, so a
-                // verbatim store reproduces pvxs.
-                FieldDesc::StructureArray { .. } | FieldDesc::Variant | FieldDesc::VariantArray => {
+                // pvxs `copyIn` for a `Struct[]` destination enforces the
+                // destination element schema (data.cpp:617-642): any
+                // element whose descriptor differs from the destination
+                // member descriptor is rebuilt in the destination schema
+                // and copied field-by-field (`allocMember()` +
+                // `Value::assign`, data.cpp:635-636), and only when *every*
+                // element already matches does the whole array store
+                // verbatim (the `!convert` fast path, data.cpp:642).
+                FieldDesc::StructureArray {
+                    struct_id: dst_struct_id,
+                    fields: dst_fields,
+                } => {
+                    let PvField::StructureArray(src_items) = src_field else {
+                        // A non-`Struct[]` payload cannot satisfy a
+                        // `Struct[]` destination; pvxs throws NoConvert
+                        // rather than silently dropping it (data.cpp:660).
+                        return Err(ValueError::NoConvert {
+                            path: path.clone(),
+                            target: "struct[]".into(),
+                        });
+                    };
+                    let Some(FieldDesc::StructureArray {
+                        struct_id: src_struct_id,
+                        fields: src_fields,
+                    }) = other.desc_at(&path)
+                    else {
+                        return Err(ValueError::NoConvert {
+                            path: path.clone(),
+                            target: "struct[]".into(),
+                        });
+                    };
+                    if src_fields == dst_fields {
+                        // Identical element schema → verbatim clone, the
+                        // pvxs `!convert` fast path (data.cpp:642). Do not
+                        // pay the per-element rebuild when squashing a
+                        // same-schema source.
+                        let _ = self.write_field(&path, src_field.clone());
+                    } else {
+                        // Cross-schema: convert every present element into
+                        // the destination element schema field-by-field,
+                        // mirroring pvxs `scratch[i] = allocMember();
+                        // scratch[i].assign(tsrc[i])` (data.cpp:635-636).
+                        let src_elem_desc = FieldDesc::Structure {
+                            struct_id: src_struct_id.clone(),
+                            fields: src_fields.clone(),
+                        };
+                        let dst_elem_desc = FieldDesc::Structure {
+                            struct_id: dst_struct_id.clone(),
+                            fields: dst_fields.clone(),
+                        };
+                        let mut out = Vec::with_capacity(src_items.len());
+                        for item in src_items {
+                            match item {
+                                // A present `Struct[]` element is fully
+                                // populated (no per-element wire bitset),
+                                // so mark every source field and let
+                                // `assign` project them onto the
+                                // destination schema — the same struct-to-
+                                // struct copyIn pvxs runs over the source's
+                                // marked fields (data.cpp:735-757), which
+                                // already coerces scalars, reselects union
+                                // arms, and faults `NoField` on a source
+                                // field absent from the destination.
+                                Some(src_struct) => {
+                                    let mut src_elem = Value::from_parts(
+                                        src_elem_desc.clone(),
+                                        PvField::Structure(src_struct.clone()),
+                                        BitSet::new(),
+                                    );
+                                    src_elem.mark_all();
+                                    let mut dst_elem = Value::create_from(dst_elem_desc.clone());
+                                    dst_elem.assign(&src_elem)?;
+                                    let (_, field, _) = dst_elem.into_parts();
+                                    let PvField::Structure(s) = field else {
+                                        unreachable!("Structure desc yields a Structure field");
+                                    };
+                                    out.push(Some(s));
+                                }
+                                // A null element stays null: pvxs converts
+                                // only `if(tsrc[i])` (data.cpp:634).
+                                None => out.push(None),
+                            }
+                        }
+                        let _ = self.write_field(&path, PvField::StructureArray(out));
+                    }
+                }
+                // "Any" (Variant) and its array form hold arbitrary
+                // self-describing values: pvxs `copyIn` stores the source
+                // verbatim with no descriptor reselection (Any at
+                // data.cpp:669-681; `AnyA` skips the member-type
+                // enforcement — the convert block runs only when
+                // `desc->code != TypeCode::AnyA`, data.cpp:623).
+                FieldDesc::Variant | FieldDesc::VariantArray => {
                     let _ = self.write_field(&path, src_field.clone());
                 }
                 // A union destination reselects its arm by *descriptor*,
@@ -1900,6 +1984,67 @@ mod tests {
                     row.get_field("a"),
                     Some(&PvField::Scalar(ScalarValue::Int(5)))
                 );
+            }
+            other => panic!("expected StructureArray, got {other:?}"),
+        }
+        assert!(dst.is_marked("rows"));
+    }
+
+    #[test]
+    fn assign_structure_array_cross_schema_copies_field_by_field() {
+        // Source element schema differs from the destination's (`a` is a
+        // Long here, an Int in the destination), so pvxs takes the
+        // `convert` path: each present element is rebuilt in the
+        // destination schema and copied field-by-field with coercion
+        // (data.cpp:623-642). A verbatim clone would store `a` as a Long
+        // under an Int descriptor; this asserts the per-element rebuild
+        // instead, and that a null element survives.
+        let mut elem = PvStructure::new("");
+        elem.fields
+            .push(("a".into(), PvField::Scalar(ScalarValue::Long(5))));
+        elem.fields
+            .push(("b".into(), PvField::Scalar(ScalarValue::Double(2.5))));
+        let src = one_field_value(
+            "rows",
+            FieldDesc::StructureArray {
+                struct_id: String::new(),
+                fields: vec![
+                    ("a".into(), FieldDesc::Scalar(ScalarType::Long)),
+                    ("b".into(), FieldDesc::Scalar(ScalarType::Double)),
+                ],
+            },
+            PvField::StructureArray(vec![Some(elem), None]),
+        );
+        let dst_desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![(
+                "rows".into(),
+                FieldDesc::StructureArray {
+                    struct_id: String::new(),
+                    fields: vec![
+                        ("a".into(), FieldDesc::Scalar(ScalarType::Int)),
+                        ("b".into(), FieldDesc::Scalar(ScalarType::Double)),
+                    ],
+                },
+            )],
+        };
+        let mut dst = Value::create_from(dst_desc);
+        dst.assign(&src).unwrap();
+        match dst.lookup_field("rows").unwrap() {
+            PvField::StructureArray(rows) => {
+                assert_eq!(rows.len(), 2);
+                let row = rows[0].as_ref().expect("present element");
+                // `a` is now an Int (destination schema), not the source's
+                // Long — proof the element was rebuilt, not cloned verbatim.
+                assert_eq!(
+                    row.get_field("a"),
+                    Some(&PvField::Scalar(ScalarValue::Int(5)))
+                );
+                assert_eq!(
+                    row.get_field("b"),
+                    Some(&PvField::Scalar(ScalarValue::Double(2.5)))
+                );
+                assert!(rows[1].is_none(), "null element must stay null");
             }
             other => panic!("expected StructureArray, got {other:?}"),
         }

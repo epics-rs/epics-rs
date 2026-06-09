@@ -2034,13 +2034,10 @@ impl Record for AsynRecord {
                 self.write_option("disconnectOnReadTimeout", val);
             }
 
-            // --- GPIB commands (no GPIB hardware, log as stub) ---
-            "UCMD" | "ACMD" => {
-                // GPIB not supported in Rust ports
-                if self.gpibiv == 0 && (self.ucmd != 0 || self.acmd != 0) {
-                    self.errs = "GPIB not supported on this port".to_string();
-                }
-            }
+            // GPIB UCMD/ACMD are `pp(TRUE)` with no `special()` in C
+            // (asynRecord.dbd:454-467); the command dispatch lives in the
+            // process path (asynCallbackProcess, asynRecord.c:819-826), not
+            // here. See `process()`.
 
             // --- AQR (Abort Queue Request) ---
             "AQR" => {
@@ -2090,6 +2087,35 @@ impl Record for AsynRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
+        // C asynCallbackProcess (asynRecord.c:819-827) dispatches by
+        // priority: a pending UCMD universal GPIB command first, else a
+        // pending ACMD addressed GPIB command, else octet/register I/O
+        // (performIO). The two GPIB commands take priority over performIO
+        // — they run even when TMOD is NoIO — and each resets its menu
+        // field back to None so the operator's request is consumed
+        // exactly once.
+        //
+        // gpibUniversalCmd / gpibAddressedCmd (asynRecord.c:1647-1651,
+        // 1693-1697) begin with `if (!pasynRec->gpibiv)`: with no asynGpib
+        // interface they report "No asynGpib interface", raise a
+        // COMM_ALARM/MAJOR_ALARM, and return without touching the bus.
+        // epics-rs ports carry no asynGpib interface (GPIBIV is always 0,
+        // set in connect_device), so that no-interface branch is the only
+        // reachable path here. The COMM_ALARM/MAJOR_ALARM severity is a
+        // recGblSetSevr on the record's alarm fields, which this record
+        // type does not model (its octet I/O errors likewise report only
+        // via ERRS).
+        if self.ucmd != 0 {
+            self.errs = "No asynGpib interface".to_string();
+            self.ucmd = 0;
+            return Ok(ProcessOutcome::complete());
+        }
+        if self.acmd != 0 {
+            self.errs = "No asynGpib interface".to_string();
+            self.acmd = 0;
+            return Ok(ProcessOutcome::complete());
+        }
+
         let tmod = TransferMode::from_u16(self.tmod as u16);
         if tmod == TransferMode::NoIo {
             return Ok(ProcessOutcome::complete());
@@ -2231,6 +2257,50 @@ mod tests {
         rec.tmod = TransferMode::Read as i32;
         rec.process().unwrap();
         assert_eq!(rec.errs, "not connected");
+    }
+
+    #[test]
+    fn process_ucmd_with_no_gpib_interface_errors_and_resets() {
+        // C asynCallbackProcess (asynRecord.c:819-822): a pending UCMD is
+        // dispatched to gpibUniversalCmd then reset to None. With no
+        // asynGpib interface (the only epics-rs case) gpibUniversalCmd
+        // reports "No asynGpib interface" (asynRecord.c:1648). The command
+        // takes priority over performIO, so even with TMOD=Read on an
+        // unconnected record the I/O path ("not connected") is never
+        // reached.
+        let mut rec = AsynRecord::default();
+        rec.tmod = TransferMode::Read as i32;
+        rec.ucmd = 1; // Device Clear (DCL)
+        rec.process().unwrap();
+        assert_eq!(rec.errs, "No asynGpib interface");
+        assert_eq!(rec.ucmd, 0, "UCMD must reset to None after dispatch");
+    }
+
+    #[test]
+    fn process_acmd_with_no_gpib_interface_errors_and_resets() {
+        // C asynCallbackProcess (asynRecord.c:823-826): a pending ACMD is
+        // dispatched to gpibAddressedCmd then reset to None. With no
+        // asynGpib interface gpibAddressedCmd reports "No asynGpib
+        // interface" (asynRecord.c:1694).
+        let mut rec = AsynRecord::default();
+        rec.tmod = TransferMode::Read as i32;
+        rec.acmd = 1; // Group Execute Trigger (GET)
+        rec.process().unwrap();
+        assert_eq!(rec.errs, "No asynGpib interface");
+        assert_eq!(rec.acmd, 0, "ACMD must reset to None after dispatch");
+    }
+
+    #[test]
+    fn process_ucmd_takes_priority_over_acmd() {
+        // C dispatches UCMD first (`if`), ACMD only in the `else if`. With
+        // both pending only UCMD is consumed this cycle; ACMD is left for
+        // the next process.
+        let mut rec = AsynRecord::default();
+        rec.ucmd = 1;
+        rec.acmd = 1;
+        rec.process().unwrap();
+        assert_eq!(rec.ucmd, 0, "UCMD consumed first");
+        assert_eq!(rec.acmd, 1, "ACMD left pending while UCMD was set");
     }
 
     #[test]

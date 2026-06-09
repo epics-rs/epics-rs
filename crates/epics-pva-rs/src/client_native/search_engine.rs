@@ -256,6 +256,89 @@ pub const BEACON_CLEAN_INTERVAL: Duration = Duration::from_secs(180);
 /// first one for a given pv name (used by [`SearchCommand::FindAll`]).
 pub const MULTI_SERVER_WINDOW: Duration = Duration::from_millis(200);
 
+/// Per-client UDP SEARCH configuration — the address-list / port knobs a
+/// caller can override per `PvaClient` instead of inheriting the process
+/// environment. Mirrors the UDP-discovery fields of `pvxs::client::Config`
+/// (`addressList` client.h:1011-1017, `autoAddrList` client.h:1035-1036,
+/// `udp_port` client.h:1029-1030, `tcp_port` client.h:1031-1033; env mapping
+/// in `config.cpp`).
+///
+/// A client's `addressList` is "addresses to which search requests will be
+/// sent" (client.h:1011) — UDP SEARCH **targets**, datagrams sent to each
+/// address on the broadcast port — NOT TCP name servers (those are a separate
+/// `Config::nameServers`, client.h:1024-1027 → [`PvaClientBuilder::name_servers`]).
+/// An entry keeps its multicast modifiers ([`crate::config::Endpoint`]) so a
+/// `224.0.2.3@iface` target joins the right group.
+#[derive(Debug, Clone)]
+pub struct ClientSearchConfig {
+    /// `EPICS_PVA_ADDR_LIST` — explicit UDP SEARCH destinations. Sent on
+    /// [`Self::broadcast_port`]; multicast entries are also joined for
+    /// beacon receive.
+    pub addr_list: Vec<crate::config::Endpoint>,
+    /// `EPICS_PVA_AUTO_ADDR_LIST` — when true, per-NIC directed broadcasts
+    /// are added to the SEARCH targets (pvxs `autoAddrList`).
+    pub auto_addr_list: bool,
+    /// `EPICS_PVA_BROADCAST_PORT` — UDP SEARCH / beacon port (pvxs
+    /// `udp_port`). The port SEARCH datagrams are sent to and beacons are
+    /// received on.
+    pub broadcast_port: u16,
+    /// `EPICS_PVA_SERVER_PORT` — the server TCP port (pvxs `tcp_port`),
+    /// the default connect port for an advertised server endpoint. Carried
+    /// on the per-client config so a gateway can pin it per upstream.
+    pub server_port: u16,
+}
+
+impl ClientSearchConfig {
+    /// Seed from the `EPICS_PVA_*` environment — the default a
+    /// [`PvaClientBuilder`] starts from. The address list is parsed against
+    /// the broadcast port (pvxs `split_addr_into(..., udp_port)`).
+    pub fn from_env() -> Self {
+        let broadcast_port = crate::config::env::broadcast_port();
+        let addr_list = std::env::var("EPICS_PVA_ADDR_LIST")
+            .ok()
+            .map(|s| crate::config::env::parse_endpoints_with_port(&s, broadcast_port))
+            .unwrap_or_default();
+        Self {
+            addr_list,
+            auto_addr_list: crate::config::env::auto_addr_list_enabled(),
+            broadcast_port,
+            server_port: crate::config::env::server_port(),
+        }
+    }
+}
+
+impl Default for ClientSearchConfig {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+/// The two UDP-target knobs threaded through the SEARCH emission path so
+/// `broadcast()` builds its destination list from the per-client config
+/// instead of re-reading the process environment each tick.
+#[derive(Debug, Clone, Copy)]
+struct UdpSearchParams {
+    broadcast_port: u16,
+    auto_addr_list: bool,
+}
+
+/// The full input set `broadcast()` needs to compute one tick's SEARCH
+/// destinations: the per-client UDP knobs plus the explicit address-list
+/// targets and the interface constraint. Bundled into one borrow so the
+/// destination policy travels as a unit and the emission helpers stay
+/// within the argument budget.
+#[derive(Clone, Copy)]
+struct SearchDestinations<'a> {
+    udp: UdpSearchParams,
+    /// Explicit `addr_list` UDP SEARCH targets (already merged with any
+    /// programmatic extras) — every datagram is sent to each of these.
+    extra_targets: &'a [SocketAddr],
+    /// `EPICS_PVA_INTF_ADDR_LIST` (v4): constrains the auto-broadcast
+    /// expansion and the limited-broadcast / multicast fanout egress.
+    /// Empty = all-NIC default.
+    client_interfaces: &'a [Ipv4Addr],
+}
+
 /// Public handle to the engine. Cheap to clone (it's just a sender).
 #[derive(Clone)]
 pub struct SearchEngine {
@@ -275,11 +358,37 @@ impl SearchEngine {
         name_servers: Vec<SocketAddr>,
     ) -> PvaResult<Self> {
         Self::spawn_inner(
+            ClientSearchConfig::from_env(),
             extra_targets,
             name_servers,
             String::new(),
             String::new(),
             NS_HANDSHAKE_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Spawn with an explicit per-client UDP SEARCH config (address list /
+    /// auto-addr / broadcast & server ports) instead of the process
+    /// environment, plus the client's CA credentials for TCP name servers.
+    /// The config's `addr_list` is sent on its `broadcast_port` as UDP
+    /// SEARCH targets (pva2pva client-config semantics; see
+    /// [`ClientSearchConfig`]).
+    pub async fn spawn_with_config(
+        config: ClientSearchConfig,
+        extra_targets: Vec<SocketAddr>,
+        name_servers: Vec<SocketAddr>,
+        ns_user: String,
+        ns_host: String,
+        ns_handshake_timeout: Duration,
+    ) -> PvaResult<Self> {
+        Self::spawn_inner(
+            config,
+            extra_targets,
+            name_servers,
+            ns_user,
+            ns_host,
+            ns_handshake_timeout,
         )
         .await
     }
@@ -298,6 +407,7 @@ impl SearchEngine {
         ns_handshake_timeout: Duration,
     ) -> PvaResult<Self> {
         Self::spawn_inner(
+            ClientSearchConfig::from_env(),
             extra_targets,
             name_servers,
             ns_user,
@@ -308,6 +418,7 @@ impl SearchEngine {
     }
 
     async fn spawn_inner(
+        config: ClientSearchConfig,
         mut extra_targets: Vec<SocketAddr>,
         name_servers: Vec<SocketAddr>,
         ns_user: String,
@@ -342,69 +453,46 @@ impl SearchEngine {
         // alongside the v4 socket — graceful degradation when the
         // host has no usable IPv6 stack.
         let search_socket_v6 = bind_ephemeral_udp_v6();
-        let beacon_socket = bind_beacon_udp(); // Optional — may be None.
+        // Beacon receive uses the per-client UDP port and joins the
+        // per-client address-list multicast groups (pvxs `udp_port`).
+        let beacon_socket = bind_beacon_udp(config.broadcast_port, &config.addr_list); // Optional.
         // PR #205 IPv6 Stage 6: optional v6 beacon listener bound to
         // `[::]:5076` joined to `ff0e::400`. Receives v6 multicast
         // beacons emitted by the server's Stage 5 path. None when the
         // host has no v6.
-        let beacon_socket_v6 = bind_beacon_udp_v6();
+        let beacon_socket_v6 = bind_beacon_udp_v6(config.broadcast_port);
 
         // pvxs 8db40be (2025-10): warn loudly when a Context is built
         // with no search destinations and AUTO_ADDR_LIST disabled.
-        // The user otherwise sees nothing but timeouts.
-        let auto_on = crate::config::env::auto_addr_list_enabled();
-        let env_addrs = std::env::var("EPICS_PVA_ADDR_LIST").ok();
-        // PVA-466: expand $(VAR) before checking emptiness so an
-        // unset macro collapses to "" and the no-destinations
-        // warning fires correctly.
-        let env_has_dest = env_addrs
-            .as_deref()
-            .map(|s| crate::config::env::expand_dollar_vars(s))
-            // Whitespace-only token test (pvxs `split_addr_into`): the comma
-            // and `@` are endpoint modifiers, so a token contributes a
-            // destination only when its address part (before any `,`/`@`) is
-            // non-empty — matching `Endpoint::parse`, which drops a token
-            // with an empty address. A bare-comma string is still "no dest".
-            .map(|s| {
-                s.split_whitespace()
-                    .any(|t| !t.split([',', '@']).next().unwrap_or("").is_empty())
-            })
-            .unwrap_or(false);
-        if extra_targets.is_empty() && !env_has_dest && !auto_on {
+        // The user otherwise sees nothing but timeouts. The destination
+        // set is now the per-client config (`config.addr_list`), not the
+        // ambient environment, so a caller-supplied list is honoured.
+        let auto_on = config.auto_addr_list;
+        let cfg_has_dest = !config.addr_list.is_empty();
+        if extra_targets.is_empty() && !cfg_has_dest && !auto_on {
             tracing::warn!(
                 target: "epics_pva_rs::client",
                 "PVA client context created with no search destinations \
-                 (EPICS_PVA_ADDR_LIST empty, EPICS_PVA_AUTO_ADDR_LIST=NO, \
-                 no programmatic addr_list). All searches will time out."
+                 (addr_list empty, auto_addr_list disabled, no programmatic \
+                 addr_list). All searches will time out."
             );
         }
 
-        // Resolve EPICS_PVA_ADDR_LIST once at startup and merge into
-        // `extra_targets`. Uses the shared parser (`parse_addr_list_with_port`)
-        // so `IP`, `IP:port`, `hostname`, and `hostname:port` all work —
-        // previously the search engine only handled literal IPs and
-        // silently dropped DNS hostnames, mirroring the pre-fix libca
-        // bug captured in `parse_addr_list_with_port`'s P-6 comment.
-        // DNS is blocking; offload to the blocking pool so a slow
-        // resolver doesn't stall the engine spawn on the runtime's
-        // worker thread for the full DNS timeout.
-        if let Some(s) = env_addrs.as_deref() {
-            let s = s.to_string();
-            let bport = crate::config::env::broadcast_port();
-            let resolved = tokio::task::spawn_blocking(move || {
-                crate::config::env::parse_addr_list_with_port(&s, bport)
-            })
-            .await
-            .unwrap_or_default();
-            // PR #205 IPv6 Stage 4: v6 entries are now routable
-            // when `search_socket_v6` was bound successfully. If the
-            // host has no v6 stack (v6 bind failed) we still need to
-            // drop v6 entries to avoid the InvalidInput retry storm
-            // on the v4 socket, but emit a one-shot warning rather
-            // than silently skipping.
+        // Merge the per-client address-list UDP SEARCH targets into
+        // `extra_targets`. The list was parsed once (DNS-resolved,
+        // `$(VAR)`-expanded) at config-build time via the shared
+        // `parse_endpoints_with_port`, so `IP`, `IP:port`, `hostname`, and
+        // `hostname:port` all work. pva2pva treats these as UDP SEARCH
+        // destinations on `config.broadcast_port`, never TCP name servers.
+        {
+            // PR #205 IPv6 Stage 4: v6 entries are routable only when
+            // `search_socket_v6` bound. On a host with no v6 stack, drop
+            // them (avoiding the InvalidInput retry storm on the v4 socket)
+            // with a one-shot warning rather than silently.
             let v6_available = search_socket_v6.is_some();
             let mut dropped_v6: Vec<SocketAddr> = Vec::new();
-            for sa in resolved {
+            for ep in &config.addr_list {
+                let sa = ep.addr;
                 if matches!(sa, SocketAddr::V6(_)) && !v6_available {
                     dropped_v6.push(sa);
                     continue;
@@ -416,22 +504,19 @@ impl SearchEngine {
             if !dropped_v6.is_empty() {
                 warn!(
                     dropped = ?dropped_v6,
-                    "EPICS_PVA_ADDR_LIST contained IPv6 entries but no usable v6 \
+                    "client addr_list contained IPv6 entries but no usable v6 \
                      socket could be bound on this host. Dropping these entries; \
                      the rest of the search remains IPv4-only."
                 );
             }
-            // When v6 is available and AUTO_ADDR_LIST is YES, add
-            // the default v6 multicast group (ff0e::400:5076). Mirrors
-            // the v4 path that adds `224.0.2.3` only on explicit
-            // opt-in via ADDR_LIST — but for v6 we have no equivalent
-            // limited broadcast, so the multicast group is the only
-            // way to reach v6-only servers without enumerating each.
+            // When v6 is available and auto-addr-list is on, add the
+            // default v6 multicast group (`ff0e::400:<udp_port>`) — there
+            // is no v6 limited broadcast, so the group is the only way to
+            // reach v6-only servers without enumerating each.
             if v6_available && auto_on {
-                let bport = crate::config::env::broadcast_port();
                 let mcast = SocketAddr::V6(std::net::SocketAddrV6::new(
                     DEFAULT_V6_MULTICAST_GROUP,
-                    bport,
+                    config.broadcast_port,
                     0,
                     0,
                 ));
@@ -441,6 +526,10 @@ impl SearchEngine {
             }
         }
 
+        let udp = UdpSearchParams {
+            broadcast_port: config.broadcast_port,
+            auto_addr_list: config.auto_addr_list,
+        };
         let beacons_clone = beacons.clone();
         tokio::spawn(run_engine(
             cmd_rx,
@@ -455,6 +544,7 @@ impl SearchEngine {
             ns_host,
             ns_handshake_timeout,
             client_interfaces,
+            udp,
         ));
 
         Ok(Self { cmd_tx, beacons })
@@ -671,8 +761,7 @@ async fn recv_from_v6_opt(
     }
 }
 
-fn bind_beacon_udp() -> Option<AsyncUdpV4> {
-    let port = crate::config::env::broadcast_port();
+fn bind_beacon_udp(port: u16, addr_list: &[crate::config::Endpoint]) -> Option<AsyncUdpV4> {
     // Skip the loopback NIC: any local pva-rs *server* has its UDP
     // responder bound on 127.0.0.1:5076 with SO_REUSEPORT, and a
     // co-bound client beacon socket on the same (addr, port) would
@@ -691,10 +780,10 @@ fn bind_beacon_udp() -> Option<AsyncUdpV4> {
     };
     // pvxs udp_collector.cpp:140 binds wildcard so we also receive
     // multicast packets — but only for groups we've explicitly joined.
-    // Join any multicast groups present in EPICS_PVA_ADDR_LIST (and the
-    // standard PVA `224.0.2.3` group is left to user opt-in to avoid
+    // Join any multicast groups present in the per-client address list
+    // (the standard PVA `224.0.2.3` group is left to user opt-in to avoid
     // surprising multicast traffic from a default config).
-    join_addr_list_multicast(&sock);
+    join_addr_list_multicast(&sock, addr_list);
     Some(sock)
 }
 
@@ -703,10 +792,8 @@ fn bind_beacon_udp() -> Option<AsyncUdpV4> {
 /// default v6 PVA multicast group `ff0e::400`. Returns `None` when the
 /// host lacks v6 or the bind fails — fast-reconnect via v6 beacons is
 /// best-effort, the v4 beacon socket keeps doing its job.
-fn bind_beacon_udp_v6() -> Option<Arc<UdpSocket>> {
+fn bind_beacon_udp_v6(port: u16) -> Option<Arc<UdpSocket>> {
     use socket2::{Domain, Protocol, Socket, Type};
-
-    let port = crate::config::env::broadcast_port();
 
     let sock = match Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)) {
         Ok(s) => s,
@@ -821,19 +908,14 @@ fn addr_list_multicast_targets(
 /// and called the all-NIC [`AsyncUdpV4::join_multicast_v4`] for every
 /// group — the same `@iface`-dropping defect as the server beacon-join
 /// path, fixed here in the same change.
-pub(crate) fn join_addr_list_multicast(sock: &AsyncUdpV4) {
-    let Ok(env) = std::env::var("EPICS_PVA_ADDR_LIST") else {
-        return;
-    };
-    // Route through the single address-list parser
-    // (`parse_endpoints_with_port`) instead of a private comma-split +
-    // `:`-split: it splits on WHITESPACE only (pvxs `split_addr_into` —
-    // the comma is endpoint syntax, not a list separator), expands
-    // `$(VAR)` macros, and resolves DNS / bracketed-v6 the same way the
-    // active-SEARCH path does. We keep only the V4 multicast groups.
-    let bport = crate::config::env::broadcast_port();
-    let endpoints = crate::config::env::parse_endpoints_with_port(&env, bport);
-    for (group, iface) in addr_list_multicast_targets(&endpoints) {
+pub(crate) fn join_addr_list_multicast(sock: &AsyncUdpV4, endpoints: &[crate::config::Endpoint]) {
+    // The endpoints were resolved once at config-build time through the
+    // single address-list parser (`parse_endpoints_with_port`): split on
+    // WHITESPACE only (pvxs `split_addr_into` — the comma is endpoint
+    // syntax, not a list separator), `$(VAR)` macros expanded, DNS /
+    // bracketed-v6 resolved the same way the active-SEARCH path does. We
+    // keep only the V4 multicast groups here.
+    for (group, iface) in addr_list_multicast_targets(endpoints) {
         match iface {
             Some(iface_ip) => match sock.join_multicast_v4_on(group, iface_ip) {
                 Ok(()) => debug!("joined multicast group {group} on interface {iface_ip}"),
@@ -1035,6 +1117,10 @@ async fn run_engine(
     // broadcast-target expansion is restricted to these interfaces'
     // subnets. Empty = all-NIC default.
     client_interfaces: Vec<Ipv4Addr>,
+    // Per-client UDP SEARCH parameters (broadcast port + auto-addr-list),
+    // resolved once from `ClientSearchConfig` at spawn — replaces the
+    // ambient `EPICS_PVA_*` reads in the broadcast path.
+    udp: UdpSearchParams,
 ) {
     static NEXT_SEARCH_ID: AtomicU32 = AtomicU32::new(1);
 
@@ -1386,7 +1472,8 @@ async fn run_engine(
                     // beacon.
                     let pkt_v4 = codec.build_discover_search(SEARCH_SEQ, response_port);
                     let pkt_v6 = codec.build_discover_search(SEARCH_SEQ, response_port_v6);
-                    broadcast(&search_socket, search_socket_v6.as_ref(), &pkt_v4, &pkt_v6, &extra_targets, &client_interfaces, &mut search_send_errs).await;
+                    let dests = SearchDestinations { udp, extra_targets: &extra_targets, client_interfaces: &client_interfaces };
+                    broadcast(&search_socket, search_socket_v6.as_ref(), &pkt_v4, &pkt_v6, dests, &mut search_send_errs).await;
                 }
                 None => break,
             },
@@ -1537,6 +1624,11 @@ async fn run_engine(
                 // The initial-search coalescing window elapsed: send the
                 // burst as one batched SEARCH (broadcast + name-server
                 // forward), then disarm until the next initial Find.
+                let dests = SearchDestinations {
+                    udp,
+                    extra_targets: &extra_targets,
+                    client_interfaces: &client_interfaces,
+                };
                 flush_initial_searches(
                     &mut initial_pending,
                     &pending,
@@ -1545,8 +1637,7 @@ async fn run_engine(
                     response_port_v6,
                     &search_socket,
                     search_socket_v6.as_ref(),
-                    &extra_targets,
-                    &client_interfaces,
+                    dests,
                     &mut search_send_errs,
                     &ns_senders,
                 )
@@ -1669,14 +1760,18 @@ async fn run_engine(
                     // batch identically and pair 1:1 (see `broadcast`).
                     let frames_v4 = pack_search_frames(&codec, &to_send, response_port, false);
                     let frames_v6 = pack_search_frames(&codec, &to_send, response_port_v6, false);
+                    let dests = SearchDestinations {
+                        udp,
+                        extra_targets: &extra_targets,
+                        client_interfaces: &client_interfaces,
+                    };
                     for (frame_v4, frame_v6) in frames_v4.iter().zip(&frames_v6) {
                         broadcast(
                             &search_socket,
                             search_socket_v6.as_ref(),
                             frame_v4,
                             frame_v6,
-                            &extra_targets,
-                            &client_interfaces,
+                            dests,
                             &mut search_send_errs,
                         )
                         .await;
@@ -1892,15 +1987,14 @@ async fn broadcast(
     // Regression R0604-PVASRV-V6-WILDCARD-SEARCH-PORT-1.
     packet_v4: &[u8],
     packet_v6: &[u8],
-    extra_targets: &[SocketAddr],
-    client_interfaces: &[Ipv4Addr],
+    dests: SearchDestinations<'_>,
     send_errs: &mut HashSet<SocketAddr>,
 ) {
-    let bport = crate::config::env::broadcast_port();
+    let client_interfaces = dests.client_interfaces;
     let targets = search_targets(
-        bport,
-        crate::config::env::auto_addr_list_enabled(),
-        extra_targets,
+        dests.udp.broadcast_port,
+        dests.udp.auto_addr_list,
+        dests.extra_targets,
         client_interfaces,
     );
 
@@ -1983,8 +2077,7 @@ async fn flush_initial_searches(
     response_port_v6: u16,
     search_socket: &AsyncUdpV4,
     search_socket_v6: Option<&Arc<UdpSocket>>,
-    extra_targets: &[SocketAddr],
-    client_interfaces: &[Ipv4Addr],
+    dests: SearchDestinations<'_>,
     send_errs: &mut HashSet<SocketAddr>,
     ns_senders: &[NsHandle],
 ) {
@@ -2013,8 +2106,7 @@ async fn flush_initial_searches(
             search_socket_v6,
             frame_v4,
             frame_v6,
-            extra_targets,
-            client_interfaces,
+            dests,
             send_errs,
         )
         .await;
@@ -4747,7 +4839,7 @@ mod tests {
         // Use a unique broadcast port for this test so we don't fight
         // a parallel test or a local pva-rs IOC for the well-known
         // 5076 socket. Picks via OS-coordinated probe, drops, then
-        // env-sets so `bind_beacon_udp_v6` reads the same port.
+        // passes the port directly to `bind_beacon_udp_v6`.
         let pick_port = || {
             let s = std::net::UdpSocket::bind("[::1]:0").expect("v6 probe bind");
             let p = s.local_addr().unwrap().port();
@@ -4755,11 +4847,9 @@ mod tests {
             p
         };
         let port = pick_port();
-        let port_str = port.to_string();
-        let _env = EnvVarGuard::set(&[("EPICS_PVA_BROADCAST_PORT", &port_str)]);
 
-        let sock =
-            bind_beacon_udp_v6().expect("v6 beacon socket must bind on a host with IPv6 enabled");
+        let sock = bind_beacon_udp_v6(port)
+            .expect("v6 beacon socket must bind on a host with IPv6 enabled");
         let local = sock.local_addr().expect("local_addr");
         assert!(
             matches!(local.ip(), IpAddr::V6(_)),
@@ -5314,6 +5404,82 @@ mod tests {
         assert!(
             with_explicit.contains(&lo),
             "explicit addr-list loopback entry must still target loopback: {with_explicit:?}"
+        );
+    }
+
+    /// `ClientSearchConfig::from_env` seeds every UDP-discovery field from
+    /// the `EPICS_PVA_*` environment — the default a `PvaClientBuilder`
+    /// starts from (pvxs `Config::fromEnv`, `config.cpp`). The address list
+    /// is parsed against the configured broadcast port, not 5076.
+    #[test]
+    #[serial(epics_env)]
+    fn client_search_config_from_env_reads_pva_vars() {
+        let _env = EnvVarGuard::set(&[
+            ("EPICS_PVA_BROADCAST_PORT", "5099"),
+            ("EPICS_PVA_SERVER_PORT", "5098"),
+            ("EPICS_PVA_AUTO_ADDR_LIST", "NO"),
+            ("EPICS_PVA_ADDR_LIST", "10.0.0.7 192.168.1.9:5080"),
+        ]);
+        let cfg = ClientSearchConfig::from_env();
+        assert_eq!(cfg.broadcast_port, 5099, "broadcast_port from env");
+        assert_eq!(cfg.server_port, 5098, "server_port from env");
+        assert!(!cfg.auto_addr_list, "AUTO_ADDR_LIST=NO disables auto");
+        // The port-less entry inherits the broadcast port; the explicit
+        // `:5080` entry keeps its own (pvxs `split_addr_into(.., udp_port)`).
+        assert!(
+            cfg.addr_list
+                .iter()
+                .any(|e| e.addr == "10.0.0.7:5099".parse().unwrap()),
+            "port-less addr-list entry must inherit broadcast_port 5099: {:?}",
+            cfg.addr_list
+        );
+        assert!(
+            cfg.addr_list
+                .iter()
+                .any(|e| e.addr == "192.168.1.9:5080".parse().unwrap()),
+            "explicit-port addr-list entry must keep its port: {:?}",
+            cfg.addr_list
+        );
+    }
+
+    /// A per-client `addr_list` carrying a multicast group must drive the
+    /// beacon-socket multicast join, with any `@iface` modifier honoured —
+    /// the join no longer reads `EPICS_PVA_ADDR_LIST` from the environment
+    /// (pvxs joins per-listener groups, `udp_collector.cpp:186-196`).
+    #[test]
+    fn client_search_config_multicast_endpoint_drives_join() {
+        let endpoints = vec![
+            crate::config::Endpoint {
+                addr: "224.0.2.3:5076".parse().unwrap(),
+                ttl: None,
+                iface: None,
+            },
+            crate::config::Endpoint {
+                addr: "239.1.2.3:5076".parse().unwrap(),
+                ttl: None,
+                iface: Some("127.0.0.1".to_string()),
+            },
+            // A plain unicast entry contributes no multicast membership.
+            crate::config::Endpoint {
+                addr: "10.0.0.7:5076".parse().unwrap(),
+                ttl: None,
+                iface: None,
+            },
+        ];
+        let targets = addr_list_multicast_targets(&endpoints);
+        assert!(
+            targets.contains(&(Ipv4Addr::new(224, 0, 2, 3), None)),
+            "modifier-less multicast group must join on every NIC: {targets:?}"
+        );
+        assert!(
+            targets.contains(&(Ipv4Addr::new(239, 1, 2, 3), Some(Ipv4Addr::LOCALHOST))),
+            "@iface multicast group must join on that interface alone: {targets:?}"
+        );
+        assert!(
+            !targets
+                .iter()
+                .any(|(g, _)| *g == Ipv4Addr::new(10, 0, 0, 7)),
+            "unicast addr-list entry must not appear as a multicast target: {targets:?}"
         );
     }
 

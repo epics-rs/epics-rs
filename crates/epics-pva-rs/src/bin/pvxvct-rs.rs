@@ -18,7 +18,7 @@
 //! ```
 
 use std::io::Cursor;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket as StdUdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -167,24 +167,6 @@ fn default_bind_port(port_arg: Option<u16>) -> u16 {
     port_arg.unwrap_or(5076)
 }
 
-/// Resolve a host token to an IPv4 address. A literal IPv4 string is
-/// parsed directly; otherwise the name is resolved and the first IPv4
-/// result is used. pvxs `parsePeer` uses `hostToIPAddr`, which likewise
-/// resolves names to an `in_addr`.
-fn resolve_ipv4(host: &str) -> Result<Ipv4Addr, String> {
-    if let Ok(v4) = host.parse::<Ipv4Addr>() {
-        return Ok(v4);
-    }
-    (host, 0u16)
-        .to_socket_addrs()
-        .map_err(|e| format!("cannot resolve {host:?}: {e}"))?
-        .find_map(|sa| match sa.ip() {
-            IpAddr::V4(v4) => Some(v4),
-            IpAddr::V6(_) => None,
-        })
-        .ok_or_else(|| format!("no IPv4 address for {host:?}"))
-}
-
 /// Parse a `-H` value (`host[/bits | /dotted.mask]`) into a
 /// [`PeerFilter`]. Mirrors pvxs `parsePeer` (`tools/pvxvct.cpp:36-78`):
 /// no mask → exact host match (`INADDR_BROADCAST`); `/N` → high-N-bits
@@ -195,7 +177,7 @@ fn parse_peer(spec: &str) -> Result<PeerFilter, String> {
         Some((h, m)) => (h, Some(m)),
         None => (spec, None),
     };
-    let addr = resolve_ipv4(host)?;
+    let addr = epics_pva_rs::cli::resolve_host_ipv4(host)?;
     let mask: u32 = match mask_spec {
         // pvxs default: INADDR_BROADCAST (all ones) → exact match.
         None => 0xffff_ffff,
@@ -230,8 +212,13 @@ fn parse_peer(spec: &str) -> Result<PeerFilter, String> {
 /// Parse a `-B` value into a [`BindEndpoint`]. Grammar mirrors pvxs
 /// `SockEndpoint` (`tools/pvxvct.cpp:152-153`): `addr[,ttl][@iface][:port]`.
 /// The `ttl` is accepted for grammar compatibility but does not affect a
-/// pure listener, so it is validated and discarded. `iface` must be an
-/// IPv4 address (interface-name lookup is not supported here).
+/// pure listener, so it is validated and discarded. The endpoint body and
+/// the multicast `@iface` are resolved through the shared PVA-tool
+/// resolvers: the body via DNS (IPv4-preferred), and `@iface` accepting
+/// **either** an interface IPv4 address **or** an OS interface name
+/// (`en0`, `lo0`) — the dual form pvxs `IfaceMap` accepts
+/// (`evhelper.cpp:556-575`), so `-B 224.0.1.1@en0` works as it does under
+/// pvxs instead of being misresolved as a DNS host.
 fn parse_bind(spec: &str, default_port: u16) -> Result<BindEndpoint, String> {
     let mut rest = spec;
     let mut port = default_port;
@@ -245,7 +232,7 @@ fn parse_bind(spec: &str, default_port: u16) -> Result<BindEndpoint, String> {
     }
     let mut iface = Ipv4Addr::UNSPECIFIED;
     if let Some((head, tail)) = rest.rsplit_once('@') {
-        iface = resolve_ipv4(tail)?;
+        iface = epics_pva_rs::cli::resolve_iface_ipv4(tail)?;
         rest = head;
     }
     if let Some((head, tail)) = rest.rsplit_once(',') {
@@ -254,7 +241,7 @@ fn parse_bind(spec: &str, default_port: u16) -> Result<BindEndpoint, String> {
             .map_err(|_| format!("invalid ttl {tail:?} in -B {spec:?}"))?;
         rest = head;
     }
-    let addr = resolve_ipv4(rest)?;
+    let addr = epics_pva_rs::cli::resolve_host_ipv4(rest)?;
     Ok(BindEndpoint { addr, port, iface })
 }
 
@@ -626,6 +613,25 @@ mod tests {
     #[test]
     fn parse_bind_rejects_bad_ttl() {
         assert!(parse_bind("224.0.1.1,abc", 5076).is_err());
+    }
+
+    /// The multicast `@iface` suffix accepts an OS interface *name*, not
+    /// just an interface IPv4 address — the dual form pvxs `IfaceMap`
+    /// accepts (`evhelper.cpp:556-575`). The loopback interface is `lo`
+    /// on Linux and `lo0` on macOS/BSD; binding `224.0.1.1@<loopback>`
+    /// must resolve the name to that interface's loopback IPv4 address.
+    #[cfg(unix)]
+    #[test]
+    fn parse_bind_iface_accepts_interface_name() {
+        let ep = parse_bind("224.0.1.1@lo0", 5076).or_else(|_| parse_bind("224.0.1.1@lo", 5076));
+        if let Ok(ep) = ep {
+            assert_eq!(ep.addr, Ipv4Addr::new(224, 0, 1, 1));
+            assert!(
+                ep.iface.is_loopback(),
+                "interface name should resolve to the loopback IPv4, got {}",
+                ep.iface
+            );
+        }
     }
 
     /// The bind default is the literal 5076 (pvxs `pvxvct` hard-codes it,

@@ -215,6 +215,100 @@ pub fn effective_config_string() -> String {
     s
 }
 
+/// Resolve a PVA tool endpoint **body** (the address part of `mshim
+/// -L/-F` and `pvxvct -B`) to a single IPv4 address. A literal IPv4
+/// string is used directly; any other token is resolved through the
+/// system resolver and the first IPv4 result is taken.
+///
+/// pvxs routes these endpoints through `SockEndpoint` →
+/// `SockAddr::setAddress` (`util.cpp:523-538`), which accepts DNS
+/// hostnames and prefers IPv4 "for maximum compatibility". Both tools
+/// are IPv4-only (mshim is an IPv4 multicast shim whose `parseEP`
+/// rejects any non-AF_INET resolved endpoint, `mshim.cpp:66-68`; pvxvct
+/// binds AF_INET), so a name with no IPv4 address is an error rather
+/// than an IPv6 fallback. This is the single owner both tools share, so
+/// they cannot diverge on hostname handling the way they did when one
+/// resolved names and the other required a literal `IpAddr`.
+pub fn resolve_host_ipv4(host: &str) -> Result<std::net::Ipv4Addr, String> {
+    use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+    if let Ok(v4) = host.parse::<Ipv4Addr>() {
+        return Ok(v4);
+    }
+    (host, 0u16)
+        .to_socket_addrs()
+        .map_err(|e| format!("cannot resolve {host:?}: {e}"))?
+        .find_map(|sa| match sa.ip() {
+            IpAddr::V4(v4) => Some(v4),
+            IpAddr::V6(_) => None,
+        })
+        .ok_or_else(|| format!("no IPv4 address for {host:?}"))
+}
+
+/// Resolve an endpoint `@iface` suffix to the interface's IPv4 address.
+/// Accepts either a literal IPv4 address (returned verbatim) or an OS
+/// interface name (`eth0`, `en0`, `lo0`), looked up via `getifaddrs`.
+///
+/// pvxs normalizes the multicast `@iface` of a `SockEndpoint` through
+/// `IfaceMap`, which accepts both an interface name and an interface
+/// IPv4 address (`evhelper.cpp:556-575`). Resolving the suffix only as a
+/// DNS host — as the cable tester previously did — made
+/// `pvxvct -B 224.0.1.1@en0` fail unless `en0` happened to exist in DNS.
+/// This is the single owner both tools share for `@iface` resolution.
+pub fn resolve_iface_ipv4(spec: &str) -> Result<std::net::Ipv4Addr, String> {
+    if let Ok(v4) = spec.parse::<std::net::Ipv4Addr>() {
+        return Ok(v4);
+    }
+    #[cfg(unix)]
+    {
+        iface_name_to_ipv4(spec)
+    }
+    #[cfg(not(unix))]
+    {
+        Err(format!(
+            "interface-name override {spec:?} requires a Unix host; \
+             pass the interface's IPv4 address instead"
+        ))
+    }
+}
+
+/// Look up an interface's first IPv4 address by name via `getifaddrs`.
+#[cfg(unix)]
+fn iface_name_to_ipv4(name: &str) -> Result<std::net::Ipv4Addr, String> {
+    use std::ffi::CStr;
+    use std::net::Ipv4Addr;
+
+    // SAFETY: getifaddrs allocates a linked list we free via
+    // freeifaddrs; every pointer is null-checked before deref.
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifap) != 0 {
+            return Err(format!(
+                "getifaddrs failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut cur = ifap;
+        let mut found: Option<Ipv4Addr> = None;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            if !ifa.ifa_name.is_null() && !ifa.ifa_addr.is_null() {
+                let ifa_name = CStr::from_ptr(ifa.ifa_name).to_string_lossy();
+                let sa = &*ifa.ifa_addr;
+                if ifa_name == name && sa.sa_family as i32 == libc::AF_INET {
+                    let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                    // s_addr is in network byte order.
+                    let addr = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+                    found = Some(addr);
+                    break;
+                }
+            }
+            cur = ifa.ifa_next;
+        }
+        libc::freeifaddrs(ifap);
+        found.ok_or_else(|| format!("interface {name:?} has no IPv4 address"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,5 +443,39 @@ mod tests {
             v.lines().count() >= 3,
             "version output must carry dependency context, got: {v:?}"
         );
+    }
+
+    /// `resolve_host_ipv4` accepts a literal IPv4 verbatim and resolves a
+    /// hostname to IPv4, preferring IPv4 over any IPv6 the resolver also
+    /// returns (`localhost` is typically dual-stack). pvxs `setAddress`
+    /// makes the same IPv4-preferring choice (`util.cpp:529-538`).
+    #[test]
+    fn resolve_host_ipv4_literal_and_hostname() {
+        assert_eq!(
+            resolve_host_ipv4("192.168.1.5").unwrap(),
+            std::net::Ipv4Addr::new(192, 168, 1, 5)
+        );
+        let lo = resolve_host_ipv4("localhost").expect("localhost resolves");
+        assert!(lo.is_loopback(), "expected IPv4 loopback, got {lo}");
+    }
+
+    /// `resolve_iface_ipv4` accepts a literal interface IPv4 address
+    /// verbatim and, on Unix, resolves an interface *name* to its IPv4
+    /// address — the dual form pvxs `IfaceMap` accepts
+    /// (`evhelper.cpp:556-575`). The loopback interface is `lo` on Linux
+    /// and `lo0` on macOS/BSD; try both.
+    #[test]
+    fn resolve_iface_ipv4_literal_and_name() {
+        assert_eq!(
+            resolve_iface_ipv4("10.0.0.2").unwrap(),
+            std::net::Ipv4Addr::new(10, 0, 0, 2)
+        );
+        #[cfg(unix)]
+        {
+            let lo = resolve_iface_ipv4("lo").or_else(|_| resolve_iface_ipv4("lo0"));
+            if let Ok(v4) = lo {
+                assert!(v4.is_loopback(), "loopback iface IPv4 expected, got {v4}");
+            }
+        }
     }
 }

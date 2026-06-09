@@ -27,6 +27,12 @@ pub struct MotorRecord {
     pub timing: TimingFields,
     pub pco: PcoFields,
     pub internal: InternalFields,
+    /// Database-link / menu fields imported from the public C motorRecord.dbd
+    /// surface (OUT/RDBL/DOL/OMSL/RLNK/STOO/DINP/RINP/POST).
+    pub links: LinkFields,
+    /// Alarm-limit fields imported from the public C motorRecord.dbd surface
+    /// (HIHI/HIGH/LOW/LOLO/HHSV/LLSV).
+    pub alarm: AlarmFields,
     /// Pending event for next process() call
     pending_event: Option<MotorEvent>,
     /// Track which field was last written (for process)
@@ -58,6 +64,8 @@ impl Default for MotorRecord {
             timing: TimingFields::default(),
             pco: PcoFields::default(),
             internal: InternalFields::default(),
+            links: LinkFields::default(),
+            alarm: AlarmFields::default(),
             pending_event: None,
             last_write: None,
             suppress_flnk: false,
@@ -329,5 +337,79 @@ mod tests {
             rec.should_fire_forward_link(),
             "FLNK must fire on the DMOV false→true completion transition"
         );
+    }
+
+    // Public C motorRecord.dbd field surface: every link/menu/alarm/last-value
+    // field a CA or PVA client can address must be discoverable through
+    // field_list() and round-trip through get/put (writable) or read (NOMOD).
+    // Behavioral link routing (DOL closed-loop drive, RDBL readback pull, RLNK
+    // forward firing) is deliberately outside this field-presence import.
+    #[test]
+    fn dbd_link_menu_alarm_fields_are_field_open() {
+        use epics_base_rs::types::DbFieldType;
+
+        let mut rec = MotorRecord::new();
+
+        // Writable DBF_INLINK/OUTLINK, DBF_MENU and DBF_DOUBLE alarm fields:
+        // present, writable, and surviving a put/get round-trip.
+        let writable: &[(&str, DbFieldType, EpicsValue)] = &[
+            (
+                "RDBL",
+                DbFieldType::String,
+                EpicsValue::String("$(P)$(R).RBV CP".into()),
+            ),
+            (
+                "DOL",
+                DbFieldType::String,
+                EpicsValue::String("$(P)setpoint CP".into()),
+            ),
+            (
+                "RLNK",
+                DbFieldType::String,
+                EpicsValue::String("$(P)done.PROC PP".into()),
+            ),
+            (
+                "OUT",
+                DbFieldType::String,
+                EpicsValue::String("@asyn(PORT,0)".into()),
+            ),
+            ("OMSL", DbFieldType::Short, EpicsValue::Short(1)),
+            ("HIHI", DbFieldType::Double, EpicsValue::Double(95.0)),
+        ];
+        for (name, dbf, val) in writable {
+            let desc = rec
+                .field_list()
+                .iter()
+                .find(|f| f.name == *name)
+                .unwrap_or_else(|| panic!("{name} missing from motor field_list()"));
+            assert_eq!(desc.dbf_type, *dbf, "{name} dbf_type");
+            assert!(!desc.read_only, "{name} must be writable");
+            rec.put_field(name, val.clone())
+                .unwrap_or_else(|e| panic!("put {name}: {e:?}"));
+            assert_eq!(rec.get_field(name), Some(val.clone()), "{name} round-trip");
+        }
+
+        // OMSL/HHSV are menu indices and must clamp to their menu range.
+        rec.put_field("OMSL", EpicsValue::Short(7)).unwrap();
+        assert_eq!(rec.get_field("OMSL"), Some(EpicsValue::Short(1)));
+
+        // Read-only last-value / monitor-map fields (SPC_NOMOD): present,
+        // readable, and flagged read-only so the record layer rejects writes.
+        let read_only: &[(&str, DbFieldType)] = &[
+            ("ALST", DbFieldType::Double),
+            ("MLST", DbFieldType::Double),
+            ("MMAP", DbFieldType::Long),
+            ("NMAP", DbFieldType::Long),
+        ];
+        for (name, dbf) in read_only {
+            let desc = rec
+                .field_list()
+                .iter()
+                .find(|f| f.name == *name)
+                .unwrap_or_else(|| panic!("{name} missing from motor field_list()"));
+            assert_eq!(desc.dbf_type, *dbf, "{name} dbf_type");
+            assert!(desc.read_only, "{name} must be read-only (SPC_NOMOD)");
+            assert!(rec.get_field(name).is_some(), "{name} must be readable");
+        }
     }
 }

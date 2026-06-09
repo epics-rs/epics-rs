@@ -326,11 +326,29 @@ pub(crate) struct SelmResult {
     pub alarm: Option<(u16, crate::server::record::AlarmSeverity)>,
 }
 
+/// Convert a link value to `epicsUInt16` with C `dbGetLink(.., DBR_USHORT,
+/// ..)` cast semantics. The dbConvert GET macro stores `*pdst =
+/// (epicsUInt16) *psrc` (`dbConvert.c:63-70`) — a C cast that truncates
+/// toward zero then wraps modulo 2^16, NOT a clamp. So `-1` becomes
+/// `65535` and `65536` becomes `0`. Used for fanout/dfanout/seq
+/// `SELL`→`SELN` so a constant, DB, CA, or PVA link source all convert
+/// by the one rule C applies through `dbFastGetConvertRoutine`.
+pub(crate) fn dbr_ushort_cast(value: &EpicsValue) -> u16 {
+    (value.to_f64().unwrap_or(0.0) as i64) as u16
+}
+
 /// Select which link indices are active based on SELM/SELN, applying
 /// the record-type-specific `OFFS`/`SHFT` bias.
 ///
 /// SELM: 0 = All, 1 = Specified, 2 = Mask. `count` is the number of
 /// link slots (16 for fanout/dfanout/seq).
+///
+/// `seln` is the raw 16-bit bit pattern stored in the signed `SELN`
+/// field; C declares `SELN` as `epicsUInt16`, so every comparison below
+/// reinterprets it as unsigned (`seln as u16`) to match C's unsigned
+/// selection arithmetic. A `SELL=-1` link read therefore selects
+/// `65535` (out of range → INVALID for Specified, all-bits for Mask),
+/// not `-1`.
 ///
 /// C references:
 /// * fanout — `fanoutRecord.c:106-141`
@@ -344,6 +362,9 @@ pub(crate) fn select_link_indices_ex(
     shft: i16,
     count: usize,
 ) -> SelmResult {
+    // C `SELN` is `epicsUInt16`; reinterpret the stored bit pattern as
+    // unsigned for every range/zero/mask test below.
+    let seln_u = seln as u16;
     use crate::server::recgbl::alarm_status::SOFT_ALARM;
     use crate::server::record::AlarmSeverity;
 
@@ -362,8 +383,11 @@ pub(crate) fn select_link_indices_ex(
         // Specified.
         1 => match kind {
             SelmKind::FanoutSeq => {
-                // C: `i = seln + offs;` 0-based; `i<0 || i>=NLINKS` → INVALID.
-                let i = seln as i32 + offs as i32;
+                // C: `i = seln + offs;` with `seln` unsigned (epicsUInt16),
+                // 0-based; `i<0 || i>=NLINKS` → INVALID. So `SELN=65535`
+                // (from `SELL=-1`) yields `i>=NLINKS` → INVALID, never
+                // drives link 0.
+                let i = seln_u as i32 + offs as i32;
                 if i < 0 || i >= count as i32 {
                     invalid()
                 } else {
@@ -371,14 +395,19 @@ pub(crate) fn select_link_indices_ex(
                 }
             }
             SelmKind::Dfanout => {
-                // C: `seln > OUT_ARG_MAX` → INVALID; `seln == 0` → no output;
+                // C `dfanoutRecord.c:315-320`: `if (prec->seln > OUT_ARG_MAX)`
+                // with `seln` unsigned → INVALID; `seln == 0` → no output;
                 // otherwise drive `seln - 1`. OFFS is not a dfanout field.
-                if seln as i32 > count as i32 {
+                // `SELL=-1` → `SELN=65535` > count → INVALID (the signed
+                // read used to see `-1`, take the `<= 0` branch, and drive
+                // nothing with no alarm).
+                let seln_i = seln_u as i32;
+                if seln_i > count as i32 {
                     invalid()
-                } else if seln <= 0 {
+                } else if seln_i == 0 {
                     ok(Vec::new())
                 } else {
-                    ok(vec![(seln - 1) as usize])
+                    ok(vec![(seln_i - 1) as usize])
                 }
             }
         },
@@ -390,7 +419,7 @@ pub(crate) fn select_link_indices_ex(
                     if !(-15..=15).contains(&shft) {
                         return invalid();
                     }
-                    let raw = (seln as u16) as u32;
+                    let raw = seln_u as u32;
                     if shft >= 0 {
                         raw >> shft
                     } else {
@@ -398,7 +427,7 @@ pub(crate) fn select_link_indices_ex(
                     }
                 }
                 // dfanout Mask has no SHFT.
-                SelmKind::Dfanout => (seln as u16) as u32,
+                SelmKind::Dfanout => seln_u as u32,
             };
             ok((0..count).filter(|i| mask & (1 << i) != 0).collect())
         }
@@ -1344,6 +1373,36 @@ mod tests {
         // dfanout Mask has no SHFT — SHFT arg ignored.
         let r = select_link_indices_ex(SelmKind::Dfanout, 2, 5, 0, 7, 16);
         assert_eq!(r.indices, vec![0, 2]);
+    }
+
+    #[test]
+    fn seln_is_unsigned_dbr_ushort_cast() {
+        use crate::server::record::AlarmSeverity;
+        // `dbr_ushort_cast` reproduces C's `(epicsUInt16)` cast
+        // (dbConvert.c:63-70): truncate toward zero, wrap mod 2^16, NOT a
+        // clamp. SELL=-1 → 65535, SELL=65536 → 0.
+        assert_eq!(dbr_ushort_cast(&EpicsValue::Double(-1.0)), 65535);
+        assert_eq!(dbr_ushort_cast(&EpicsValue::Double(65536.0)), 0);
+        assert_eq!(dbr_ushort_cast(&EpicsValue::Double(3.7)), 3);
+        assert_eq!(dbr_ushort_cast(&EpicsValue::Long(-1)), 65535);
+
+        // SELL=-1 stores the i16 bit pattern of 65535 into SELN.
+        let seln_neg1 = 65535u16 as i16; // -1
+        // fanout/seq Specified: C `i = (epicsUInt16)seln + offs` =
+        // 65535 → out of range → INVALID. The old signed read clamped to
+        // 0 and drove link 0.
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, seln_neg1, 0, 0, 16);
+        assert!(r.indices.is_empty());
+        assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
+        // fanout/seq Mask: 65535 → all 16 low bits set → every link. The
+        // old clamp produced an empty mask.
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, seln_neg1, 0, 0, 16);
+        assert_eq!(r.indices, (0..16).collect::<Vec<_>>());
+        // dfanout Specified: 65535 > count → INVALID. The old signed read
+        // saw -1 ≤ 0 → drove nothing with no alarm.
+        let r = select_link_indices_ex(SelmKind::Dfanout, 1, seln_neg1, 0, 0, 16);
+        assert!(r.indices.is_empty());
+        assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
     }
 
     /// Lset that flips to "connected" after a configurable delay.

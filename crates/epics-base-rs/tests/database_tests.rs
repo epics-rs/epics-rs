@@ -4041,6 +4041,81 @@ async fn test_seq_bare_lnk_does_not_process_passive_target() {
     );
 }
 
+// R0604 regression — a record's `WriteDbLink` OUT write must land BEFORE
+// the producing record's FLNK fires. C record support performs
+// `dbPutLink()` for OUT links before `recGblFwdLink()`
+// (transformRecord.c:608-619, scalerRecord.c:457-480), so a downstream
+// FLNK target that reads the written PV observes the new value. Pre-fix
+// the framework ran the FLNK tail first, leaving the target stale.
+struct WriteThenFlnkProducer;
+impl Record for WriteThenFlnkProducer {
+    fn record_type(&self) -> &'static str {
+        "write_flnk_producer"
+    }
+    fn process(&mut self) -> epics_base_rs::error::CaResult<ProcessOutcome> {
+        Ok(ProcessOutcome::complete_with(vec![
+            ProcessAction::WriteDbLink {
+                link_field: "OUT",
+                value: EpicsValue::Double(42.0),
+            },
+        ]))
+    }
+    fn get_field(&self, name: &str) -> Option<EpicsValue> {
+        match name {
+            "OUT" => Some(EpicsValue::String("WF_TARGET".into())),
+            _ => None,
+        }
+    }
+    fn put_field(&mut self, _name: &str, _value: EpicsValue) -> epics_base_rs::error::CaResult<()> {
+        Ok(())
+    }
+    fn field_list(&self) -> &'static [FieldDesc] {
+        &[]
+    }
+}
+
+#[tokio::test]
+async fn test_write_db_link_runs_before_flnk_target_reads_fresh() {
+    let db = PvDatabase::new();
+    // Target the producer writes 42.0 into.
+    db.add_record("WF_TARGET", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    // FLNK observer reads WF_TARGET via its INP during its own process.
+    db.add_record("WF_OBSERVER", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("WF_OBSERVER").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("INP", EpicsValue::String("WF_TARGET".into()))
+            .unwrap();
+    }
+    // Producer: WriteDbLink → WF_TARGET, FLNK → WF_OBSERVER.
+    db.add_record("WF_PRODUCER", Box::new(WriteThenFlnkProducer))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("WF_PRODUCER").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("FLNK", EpicsValue::String("WF_OBSERVER".into()))
+            .unwrap();
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("WF_PRODUCER", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // The OUT write ran before FLNK, so the observer read the fresh 42.0.
+    let observed = db.get_pv("WF_OBSERVER").await.unwrap();
+    match observed {
+        EpicsValue::Double(v) => assert!(
+            (v - 42.0).abs() < 1e-10,
+            "FLNK observer must read the post-WriteDbLink value 42.0, got {v}"
+        ),
+        other => panic!("expected Double(42.0), got {other:?}"),
+    }
+}
+
 // BUG 1 regression — sseq `LNKn` is `DBF_OUTLINK` driven via `dbPutLink`
 // → `dbDbPutValue` (`dbDbLink.c:388`). A bare sseq LNKn is NPP and must
 // not process its target; an explicit-PP LNKn must.
@@ -6325,4 +6400,67 @@ async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
         "MSI inherits an INVALID remote alarm"
     );
     assert_eq!(stat, alarm_status::LINK_ALARM, "MSI surfaces as LINK_ALARM");
+}
+
+// R0602-BASEREC-4 — lsi/lso `menuPost` MPST/APST "Always" mode.
+//
+// After fix 9587929c an unchanged lsi/lso process cycle posts NO
+// VALUE/LOG monitor (C `lsiRecord.c`/`lsoRecord.c` monitor gate on
+// `len != olen || memcmp(oval, val, len)`). The MPST/APST menu fields
+// restore C's override: an unchanged cycle still posts DBE_VALUE when
+// MPST == menuPost_Always and DBE_LOG when APST == menuPost_Always
+// (lsiRecord.c:217-220). This test drives an unchanged cycle through
+// the link-processing path and asserts the VALUE event fires only when
+// MPST is Always.
+#[tokio::test]
+async fn test_lsi_mpst_always_posts_value_on_unchanged_cycle() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::server::records::lsi::LsiRecord;
+    use epics_base_rs::types::DbFieldType;
+
+    async fn unchanged_cycle_posts_value(mpst_always: bool) -> bool {
+        let db = PvDatabase::new();
+        db.add_record("LSI_MPST", Box::new(LsiRecord::new("hello")))
+            .await
+            .unwrap();
+        if mpst_always {
+            // MPST = menuPost_Always (1).
+            let rec = db.get_record("LSI_MPST").await.unwrap();
+            let mut inst = rec.write().await;
+            inst.record.put_field("MPST", EpicsValue::Short(1)).unwrap();
+        }
+
+        // Cycle 1 commits oval/olen for the seeded "hello", so cycle 2 is
+        // genuinely unchanged (value_changed == false).
+        let mut visited = HashSet::new();
+        db.process_record_with_links("LSI_MPST", &mut visited, 0)
+            .await
+            .unwrap();
+
+        // Subscribe to VAL AFTER cycle 1.
+        let mut val_rx = {
+            let rec = db.get_record("LSI_MPST").await.unwrap();
+            let mut inst = rec.write().await;
+            inst.add_subscriber("VAL", 71, DbFieldType::Char, EventMask::VALUE.bits())
+        }
+        .expect("VAL subscription must be accepted");
+
+        // Cycle 2: no new value. Without MPST this posts nothing; with
+        // MPST == Always it must still post a DBE_VALUE event.
+        let mut visited = HashSet::new();
+        db.process_record_with_links("LSI_MPST", &mut visited, 0)
+            .await
+            .unwrap();
+
+        val_rx.try_recv().is_ok()
+    }
+
+    assert!(
+        unchanged_cycle_posts_value(true).await,
+        "MPST == Always must post a VALUE monitor on an unchanged lsi cycle"
+    );
+    assert!(
+        !unchanged_cycle_posts_value(false).await,
+        "MPST == OnChange (default) must NOT post a VALUE monitor on an unchanged lsi cycle"
+    );
 }

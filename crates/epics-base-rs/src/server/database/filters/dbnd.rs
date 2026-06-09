@@ -11,6 +11,28 @@
 //! `d`/`m`/`abs`/`rel`): `PV.{"dbnd":{"d":0.5}}` or `{"abs":0.5}`
 //! (absolute); `PV.{"dbnd":{"rel":50}}` or `{"d":50,"m":"rel"}`
 //! (relative, percent of last value). There is no `r` key.
+//!
+//! ## Deviation from C: the deadband is a magnitude (signed-off)
+//!
+//! C compares `delta = |last - new|` against a *signed* deadband
+//! (`recGblCheckDeadband`, recGbl.c:345-370 — `if (delta > deadband)`,
+//! with no `abs()` on `deadband`). In relative mode C refreshes
+//! `hyst = val * cval/100` after each delivered event (dbnd.c:87), so a
+//! positive percentage on a *negative* PV value drives `hyst` negative:
+//! every finite `delta` then satisfies `delta > hyst`, the deadband is
+//! effectively disabled, and the subscriber is flooded with events.
+//!
+//! This port intentionally treats the deadband as a magnitude —
+//! `threshold` is stored as `|threshold|` and the relative band is
+//! `|threshold| * |last|` — so a negative-valued channel is suppressed
+//! exactly like a positive-valued one. The cost is a deliberate parity
+//! deviation: under epics-rs a `{"rel":N}` filter on a negative-baseline
+//! PV emits *fewer* events than C (which emits all of them), and a
+//! negative configured `d` is normalised to its magnitude instead of
+//! inverting the comparison the way C's signed double would. Absolute
+//! mode is unaffected for the usual non-negative threshold. `DeadbandFilter`
+//! is the sole owner of this rule; it is not shared with record MDEL/ADEL
+//! processing (`record_instance::ln`).
 
 use parking_lot::Mutex;
 
@@ -49,6 +71,9 @@ pub struct DeadbandFilter {
 impl DeadbandFilter {
     pub fn new(threshold: f64, mode: DeadbandMode) -> Self {
         Self {
+            // Magnitude deadband — intentional, signed-off deviation from
+            // C's signed `recGblCheckDeadband` comparison. See the module
+            // doc "Deviation from C" for the rationale.
             threshold: threshold.abs(),
             mode,
             last_sent: Mutex::new(f64::NAN),
@@ -120,7 +145,10 @@ impl SubscriptionFilter for DeadbandFilter {
                 // is the initial NaN seed (no successful send yet),
                 // fall back to raw `threshold` — C's first call sees
                 // `hyst = cval` from `parse_ok` until the first
-                // refresh.
+                // refresh. The `|prev|` (vs C's signed `prev`) is the
+                // intentional magnitude deviation documented at module
+                // scope: it keeps the band non-negative for a negative
+                // baseline instead of disabling the deadband as C does.
                 if prev.is_finite() {
                     self.threshold * prev.abs()
                 } else {

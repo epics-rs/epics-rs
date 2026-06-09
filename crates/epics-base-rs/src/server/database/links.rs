@@ -6,7 +6,7 @@ use crate::server::record::{AlarmSeverity, NotifyWaitSet, RecordInstance, ScanTy
 use crate::types::EpicsValue;
 
 use super::processing::join_put_notify;
-use super::{LinkPutOp, PvDatabase, SelmKind, SelmResult, select_link_indices_ex};
+use super::{LinkPutOp, PvDatabase, SelmKind, SelmResult, dbr_ushort_cast, select_link_indices_ex};
 
 /// Record-specific input link fields that may carry a CP/CPP modifier:
 /// DOL (ao/bo/longout/mbbo), DOL0-DOLF (seq — 16 groups), DOL1-DOLA
@@ -1080,11 +1080,18 @@ impl PvDatabase {
                     // updated SELN.
                     let parsed = crate::server::record::parse_link_v2(&sell);
                     if let Some(val) = self.read_link_value_no_process(&parsed).await {
-                        // DBR_USHORT — clamp to the unsigned 16-bit
-                        // range the C `epicsUInt16 seln` field holds,
-                        // then store into the record's SELN field.
-                        let seln = val.to_f64().unwrap_or(0.0);
-                        let seln = seln.clamp(0.0, 65535.0) as u16 as i16;
+                        // C reads SELL with `dbGetLink(&prec->sell,
+                        // DBR_USHORT, &prec->seln, 0, 0)`; the dbConvert GET
+                        // macro stores `*pdst = (epicsUInt16) *psrc`
+                        // (`dbConvert.c:63-70`) — a C cast (truncate-then-
+                        // wrap mod 2^16), NOT a clamp. `SELL=-1` therefore
+                        // yields `SELN=65535` (Specified → out-of-range
+                        // INVALID, Mask → all-bits), where the old clamp
+                        // produced `0` (drove link 0 / empty mask). The
+                        // unsigned bit pattern is stored into the signed
+                        // i16 SELN field; `select_link_indices_ex` reads it
+                        // back as `u16`.
+                        let seln = dbr_ushort_cast(&val) as i16;
                         let mut instance = rec.write().await;
                         let _ = instance.record.put_field("SELN", EpicsValue::Short(seln));
                     }

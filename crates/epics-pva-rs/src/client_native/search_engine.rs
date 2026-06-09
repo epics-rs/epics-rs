@@ -1435,7 +1435,7 @@ async fn run_engine(
                     let mut pos = 0usize;
                     while pos < n {
                         let consumed = handle_beacon(
-                            &beacon_buf[pos..n], &beacons, &mut pending,
+                            &beacon_buf[pos..n], &beacons,
                             &mut subscribers, &mut poke,
                             from,
                         );
@@ -1462,7 +1462,7 @@ async fn run_engine(
                     let mut pos = 0usize;
                     while pos < n {
                         let consumed = handle_beacon(
-                            &beacon_buf_v6[pos..n], &beacons, &mut pending,
+                            &beacon_buf_v6[pos..n], &beacons,
                             &mut subscribers, &mut poke,
                             from,
                         );
@@ -2226,11 +2226,18 @@ fn handle_search_response(
                 subscribers,
             );
             if should_poke {
+                // pvxs `poke()` (client.cpp:736-759) only records `lastPoke`,
+                // arms `nPoked`, and reschedules the search timer — it never
+                // iterates channels or resets `nSearch`. The fast revolution's
+                // poked ticks then keep each search's accumulated backoff
+                // (`tickSearch(..., poked=true)` skips the `nSearch++`
+                // increment, client.cpp:1141-1143, and requeues into the same
+                // bucket). So this handler only signals the poke; the run
+                // loop's single `maybe_poke()` + `rearm_after_send()` owner
+                // decides cadence and retry. Resetting per-search backoff here
+                // converted every pending search into a fresh first-retry,
+                // amplifying UDP search load on a mass beacon/discovery event.
                 *poke_request = true;
-                for p in pending.values_mut() {
-                    p.last_attempt = Instant::now() - Duration::from_secs(60);
-                    p.attempt = 0;
-                }
             }
         }
         return consumed;
@@ -2312,11 +2319,9 @@ fn handle_search_response(
 
 /// Returns bytes consumed from `bytes` so the caller can advance to
 /// the next chained beacon in the same datagram.
-#[allow(clippy::too_many_arguments)]
 fn handle_beacon(
     bytes: &[u8],
     beacons: &Arc<BeaconTracker>,
-    pending: &mut HashMap<u32, Pending>,
     subscribers: &mut Vec<mpsc::Sender<Discovered>>,
     poke_request: &mut bool,
     peer: SocketAddr,
@@ -2416,16 +2421,18 @@ fn handle_beacon(
     // (200 ms × 30) for one revolution.
     let should_poke = emit_beacon_action(action, server, guid_arr, peer, proto, subscribers);
     if should_poke {
+        // pvxs `onBeacon()` routes a New/Changed identity through `poke()`
+        // (client.cpp:773-847 → 736-759), which only records `lastPoke`,
+        // arms `nPoked`, and reschedules the search timer. It does NOT
+        // touch any channel's `nSearch`. The fast revolution then retransmits
+        // every parked search while preserving its accumulated backoff: the
+        // poked tick skips the `nSearch++` increment and requeues into the
+        // same bucket (client.cpp:1141-1143). So this handler only signals
+        // the poke; the run loop's single `maybe_poke()` + `rearm_after_send()`
+        // owner decides cadence and retry. Resetting per-search backoff here
+        // turned every pending search into a fresh first-retry, amplifying
+        // UDP search broadcast on a mass beacon event.
         *poke_request = true;
-        for p in pending.values_mut() {
-            p.last_attempt = Instant::now() - Duration::from_secs(60);
-            // NOTE: more aggressive than pvxs's `poked` semantic
-            // (which preserves nSearch and skips the increment for
-            // one tick). See the BeaconObserved arm in `run_engine`
-            // for the full rationale. Acceptable trade for single-
-            // channel recovery.
-            p.attempt = 0;
-        }
     }
     consumed
 }
@@ -3193,7 +3200,7 @@ mod tests {
         let (txb, mut rxb) = mpsc::channel::<Discovered>(8);
         let mut subs3: Vec<mpsc::Sender<Discovered>> = vec![txb];
         let mut poke3 = false;
-        handle_beacon(&frame, &beacons, &mut pending, &mut subs3, &mut poke3, peer);
+        handle_beacon(&frame, &beacons, &mut subs3, &mut poke3, peer);
         assert_eq!(
             beacons.guid_for(server),
             Some(IG),
@@ -3580,12 +3587,10 @@ mod tests {
             let mut frame = base.clone();
             frame[2] |= seg;
             let beacons = BeaconTracker::new();
-            let mut pending: HashMap<u32, Pending> = HashMap::new();
             let (tx, mut rx) = mpsc::channel::<Discovered>(8);
             let mut subs: Vec<mpsc::Sender<Discovered>> = vec![tx];
             let mut poke = false;
-            let consumed =
-                handle_beacon(&frame, &beacons, &mut pending, &mut subs, &mut poke, peer);
+            let consumed = handle_beacon(&frame, &beacons, &mut subs, &mut poke, peer);
             assert!(
                 consumed > 0,
                 "segmented beacon frame must still be advanced"
@@ -3602,11 +3607,10 @@ mod tests {
 
         // Control: the un-segmented beacon tracks + emits Online.
         let beacons = BeaconTracker::new();
-        let mut pending: HashMap<u32, Pending> = HashMap::new();
         let (tx, mut rx) = mpsc::channel::<Discovered>(8);
         let mut subs: Vec<mpsc::Sender<Discovered>> = vec![tx];
         let mut poke = false;
-        handle_beacon(&base, &beacons, &mut pending, &mut subs, &mut poke, peer);
+        handle_beacon(&base, &beacons, &mut subs, &mut poke, peer);
         assert_eq!(
             beacons.guid_for(server),
             Some(G),
@@ -3855,11 +3859,10 @@ mod tests {
         // Returns (Discovered::Online fired, server entered the tracker).
         let run = |frame: &[u8]| -> (bool, bool) {
             let beacons = BeaconTracker::new();
-            let mut pending: HashMap<u32, Pending> = HashMap::new();
             let (tx, mut rx) = mpsc::channel::<Discovered>(8);
             let mut subs: Vec<mpsc::Sender<Discovered>> = vec![tx];
             let mut poke = false;
-            handle_beacon(frame, &beacons, &mut pending, &mut subs, &mut poke, peer);
+            handle_beacon(frame, &beacons, &mut subs, &mut poke, peer);
             let server = SocketAddr::new(peer.ip(), 5075);
             (rx.try_recv().is_ok(), beacons.guid_for(server).is_some())
         };
@@ -4054,6 +4057,74 @@ mod tests {
             rearm_after_send(false, current, 0, no_imbalance),
             ((current + 1) % N_SEARCH_BUCKETS, 1),
             "first normal retry escalates one bucket forward"
+        );
+    }
+
+    /// pvxs `poke()` (client.cpp:736-759) and the discovery-pong path
+    /// (client.cpp:889-899) only arm the fast search revolution — they
+    /// never iterate channels or reset `nSearch`. The revolution's poked
+    /// ticks then preserve each search's accumulated backoff
+    /// (`tickSearch(..., poked=true)` skips the `nSearch++` increment,
+    /// client.cpp:1141-1143). A real discovery pong must therefore leave a
+    /// pending search's `attempt`/`bucket` untouched and only signal the
+    /// poke. Before, the UDP discovery-pong handler reset every pending
+    /// search to `attempt = 0` / `last_attempt = now-60s`, converting an
+    /// escalated backoff into a fresh 1-bucket retry on each beacon — a
+    /// search-broadcast amplifier on a mass IOC restart.
+    #[test]
+    fn discovery_pong_preserves_pending_search_backoff() {
+        use tokio::sync::oneshot;
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 5076);
+        let (tx, _rx) = oneshot::channel::<SearchHit>();
+        let mut pending: HashMap<u32, Pending> = HashMap::new();
+        pending.insert(
+            1,
+            Pending {
+                pv_name: "dut".into(),
+                responder: Responder::Single(tx),
+                last_attempt: Instant::now(),
+                attempt: 3,
+                bucket: 2,
+            },
+        );
+        let mut by_name: HashMap<String, u32> = std::iter::once(("dut".to_string(), 1)).collect();
+        let beacons = BeaconTracker::new();
+        // An active discover() subscriber — required for the discovery-pong
+        // branch to fire at all (pvxs `!discoverers.empty()`,
+        // client.cpp:889). Keep `_rxd` alive so the channel stays open.
+        let (txd, _rxd) = mpsc::channel::<Discovered>(8);
+        let mut subs: Vec<mpsc::Sender<Discovered>> = vec![txd];
+        let mut poke = false;
+        // found=false (empty cids), seq == SEARCH_SEQ, fresh GUID → a New
+        // beacon identity → should_poke.
+        let pong = crate::server_native::udp::build_search_response_proto(
+            [0x99u8; 12],
+            SEARCH_SEQ,
+            5075,
+            &[],
+            ByteOrder::Little,
+            "tcp",
+        );
+        handle_search_response(
+            &pong,
+            &mut pending,
+            &mut by_name,
+            &beacons,
+            &std::collections::HashSet::new(),
+            &mut subs,
+            &mut poke,
+            peer,
+            false,
+        );
+        assert!(poke, "a New discovery-pong identity must signal a poke");
+        let p = pending.get(&1).expect("pending search must survive a poke");
+        assert_eq!(
+            p.attempt, 3,
+            "discovery pong must NOT reset the pending search's accumulated backoff"
+        );
+        assert_eq!(
+            p.bucket, 2,
+            "discovery pong must NOT move the pending search to a fresh bucket"
         );
     }
 

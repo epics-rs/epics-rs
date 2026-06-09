@@ -149,34 +149,40 @@ async fn main() {
             // `std::cout` for the value, `std::cerr` for Connected /
             // Disconnected / Finished, the last only when verbose).
             let on_event = |event: MonitorEvent| match event {
-                MonitorEvent::Data { intro, value } => {
+                MonitorEvent::Data {
+                    intro,
+                    value,
+                    marked,
+                } => {
                     // `-q` is a deprecated no-op (see Args::quiet); monitor
                     // updates are always printed, matching pvAccessCPP.
-                    let output =
-                        if let Some(vfmt) = format::parse_value_format(format_mode.as_deref()) {
-                            // pvxs `-F` path (monitor.cpp:142-146): the PV-name
-                            // line, then `Value::format()` wrapped in one
-                            // `Indented` level. The decoded monitor value is the
-                            // full reconstructed snapshot, so Delta shows every
-                            // present leaf (marked=None) rather than only the
-                            // server-marked changed subset — see the crate-level
-                            // note on the monitor changed-set.
-                            let fmt = format::ValueFmt {
-                                format: vfmt,
-                                array_limit,
-                                show_value: true,
-                            };
-                            format!(
-                                "{pv_name}\n{}",
-                                format::format_value(&intro, Some(&value), &fmt, None, 1)
-                            )
-                        } else {
-                            match mode.as_str() {
-                                "json" => format::format_json(&pv_name, &value),
-                                "raw" => format::format_raw(&pv_name, &intro, &value),
-                                _ => format::format_nt(&pv_name, &intro, &value),
-                            }
+                    let output = if let Some(vfmt) =
+                        format::parse_value_format(format_mode.as_deref())
+                    {
+                        // pvxs `-F` path (monitor.cpp:142-146): the PV-name
+                        // line, then `Value::format()` wrapped in one
+                        // `Indented` level. `value` is the full reconstructed
+                        // snapshot; `marked` carries this update's
+                        // server-marked changed leaves so Delta prints only
+                        // them (`Value::imarked()`, datafmt.cpp:112-120). It is
+                        // `None` on the first update (full snapshot) so the
+                        // first Delta shows every leaf, like pvxs.
+                        let fmt = format::ValueFmt {
+                            format: vfmt,
+                            array_limit,
+                            show_value: true,
                         };
+                        format!(
+                            "{pv_name}\n{}",
+                            format::format_value(&intro, Some(&value), &fmt, marked.as_ref(), 1)
+                        )
+                    } else {
+                        match mode.as_str() {
+                            "json" => format::format_json(&pv_name, &value),
+                            "raw" => format::format_raw(&pv_name, &intro, &value),
+                            _ => format::format_nt(&pv_name, &intro, &value),
+                        }
+                    };
                     print!("{output}");
                 }
                 MonitorEvent::Connected { peer } => {

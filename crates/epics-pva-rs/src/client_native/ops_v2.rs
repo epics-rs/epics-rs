@@ -678,12 +678,13 @@ pub async fn op_put_tokens(
     raw_pv_req: Option<&[u8]>,
     op_timeout: Duration,
 ) -> PvaResult<()> {
-    op_put_inner_build(channel, raw_pv_req, op_timeout, |intro| {
-        Ok((
-            build_put_value_from_tokens(intro, tokens)?,
-            value_only_bit_set(intro),
-        ))
-    })
+    op_put_inner_build(
+        channel,
+        raw_pv_req,
+        op_timeout,
+        value_target_is_enum,
+        |intro, previous| build_put_value_mode(intro, tokens, previous),
+    )
     .await
 }
 
@@ -707,9 +708,13 @@ pub async fn op_put_args(
     // returns every writable field for classification, matching
     // pvAccessCPP's empty default request (pvutils.cpp:31).
     let pv_req = raw_pv_req.unwrap_or_else(|| sentinel_all_fields());
-    op_put_inner_build(channel, Some(pv_req), op_timeout, |intro| {
-        build_put_from_args(intro, tokens)
-    })
+    op_put_inner_build(
+        channel,
+        Some(pv_req),
+        op_timeout,
+        value_target_is_enum,
+        |intro, previous| build_put_from_args(intro, tokens, previous),
+    )
     .await
 }
 
@@ -1495,12 +1500,21 @@ async fn op_put_inner(
     raw_pv_req: Option<&[u8]>,
     op_timeout: Duration,
 ) -> PvaResult<()> {
-    op_put_inner_build(channel, raw_pv_req, op_timeout, |intro| {
-        Ok((
-            build_put_value(intro, value_str)?,
-            value_only_bit_set(intro),
-        ))
-    })
+    op_put_inner_build(
+        channel,
+        raw_pv_req,
+        op_timeout,
+        // No get-first snapshot: the programmatic single-value put has no
+        // choice menu to match an enum label against, so it stays one round
+        // trip and the value lowers as-is.
+        |_intro| false,
+        |intro, _previous| {
+            Ok((
+                build_put_value(intro, value_str)?,
+                value_only_bit_set(intro),
+            ))
+        },
+    )
     .await
 }
 
@@ -1512,14 +1526,26 @@ async fn op_put_inner(
 /// length to drop) get the prototype before they commit. `build_value`
 /// runs synchronously between the INIT reply and the DATA send — no
 /// await crosses it.
-async fn op_put_inner_build<FB>(
+///
+/// When `wants_previous(&intro)` is true, a get-first snapshot is fetched
+/// between INIT and the build and handed to `build_value` as
+/// `Some(&previous)`. pvput always issues the PUT with get=true
+/// (pvput.cpp:409) so it can resolve an enum write by choice label
+/// (pvput.cpp:186-188); here the snapshot is fetched only for the
+/// prototypes that need it, so an ordinary scalar PUT keeps its single
+/// round trip and a write-only PV is not gated on a GET. A failed snapshot
+/// is best-effort (`None`): the builder still runs and falls back to the
+/// no-snapshot path.
+async fn op_put_inner_build<FB, WP>(
     channel: &Arc<Channel>,
     raw_pv_req: Option<&[u8]>,
     op_timeout: Duration,
+    wants_previous: WP,
     build_value: FB,
 ) -> PvaResult<()>
 where
-    FB: FnOnce(&FieldDesc) -> PvaResult<(PvField, BitSet)>,
+    FB: FnOnce(&FieldDesc, Option<&PvField>) -> PvaResult<(PvField, BitSet)>,
+    WP: FnOnce(&FieldDesc) -> bool,
 {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
     let order = server.byte_order();
@@ -1560,11 +1586,22 @@ where
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
 
+    // Get-first snapshot for builders that resolve against the current
+    // value (e.g. an enum write matched by choice label). Fetched only when
+    // the prototype calls for it, and best-effort — a failure leaves the
+    // builder to fall back to its no-snapshot path. pvput.cpp:409 (get=true)
+    // / pvput.cpp:186-188.
+    let previous = if wants_previous(&intro) {
+        op_get(channel, &[], op_timeout).await.ok().map(|(_, v)| v)
+    } else {
+        None
+    };
+
     // Build the value AND its changed-bitset against the prototype. The
     // builder owns the changed-bit decision because only it knows which
     // fields it actually wrote: a bare `.value` write marks the value
     // bit, a deferred field=value delta marks each assigned path's bit.
-    let (value, changed) = build_value(&intro)?;
+    let (value, changed) = build_value(&intro, previous.as_ref())?;
 
     // DATA
     let mut payload = Vec::new();
@@ -1619,8 +1656,21 @@ pub enum MonitorEvent {
     /// the server endpoint so callers can report `Connected to <peer>`
     /// like pvxs (`tools/monitor.cpp:152`).
     Connected { peer: std::net::SocketAddr },
-    /// Server pushed a value update.
-    Data { intro: FieldDesc, value: PvField },
+    /// Server pushed a value update. `value` is the full prior-merged
+    /// snapshot; `marked` carries the leaf paths the server flagged
+    /// changed in *this* update — the decoded changed `BitSet` resolved
+    /// to dotted leaf paths (the shape `format::format_value`'s `marked`
+    /// argument expects). It is `None` on the first update of a connect
+    /// cycle (a complete snapshot, no prior to delta against) so a delta
+    /// renderer shows every leaf, then `Some(set)` on later updates so it
+    /// prints only the changed leaves. pvxs renders a monitor delta from
+    /// the update's own marked set (`Value::imarked()`, datafmt.cpp:112-120;
+    /// the first monitor post is a full value).
+    Data {
+        intro: FieldDesc,
+        value: PvField,
+        marked: Option<std::collections::HashSet<String>>,
+    },
     /// Channel left Active (TCP closed, op error, channel closed).
     Disconnected,
     /// Server signalled end-of-stream via subcmd=0x10 (no further
@@ -2564,6 +2614,13 @@ async fn op_monitor_inner<F>(
 where
     F: FnMut(&FieldDesc, &PvField) + Send,
 {
+    // Adapt the public `FnMut(&FieldDesc, &PvField)` callback to the inner
+    // loop's marked-set-carrying signature; these whole-PV / raw monitor
+    // APIs deliver the merged value and do not surface the changed set.
+    let mut adapter =
+        |intro: &FieldDesc,
+         value: &PvField,
+         _marked: Option<&std::collections::HashSet<String>>| { callback(intro, value) };
     loop {
         let (server, sid) = match channel.ensure_active().await {
             Ok(p) => p,
@@ -2585,7 +2642,7 @@ where
             &fields_owned,
             raw_pv_req.as_deref(),
             flow,
-            &mut callback,
+            &mut adapter,
             None,
         )
         .await
@@ -2656,13 +2713,22 @@ where
                     continue;
                 }
             };
+            // Adapt the public `FnMut(&FieldDesc, &PvField)` callback to the
+            // inner loop's marked-set-carrying signature; the handle API
+            // delivers the merged value and does not surface the changed set.
+            let mut adapter =
+                |intro: &FieldDesc,
+                 value: &PvField,
+                 _marked: Option<&std::collections::HashSet<String>>| {
+                    callback(intro, value)
+                };
             match run_monitor_loop(
                 server.clone(),
                 sid,
                 &fields_owned,
                 None,
                 flow,
-                &mut callback,
+                &mut adapter,
                 Some(state_for_task.clone()),
             )
             .await
@@ -2731,12 +2797,16 @@ where
         if !mask.mask_connected {
             callback(MonitorEvent::Connected { peer: server.addr });
         }
-        let mut data_callback = |intro: &FieldDesc, value: &PvField| {
-            callback(MonitorEvent::Data {
-                intro: intro.clone(),
-                value: value.clone(),
-            });
-        };
+        let mut data_callback =
+            |intro: &FieldDesc,
+             value: &PvField,
+             marked: Option<&std::collections::HashSet<String>>| {
+                callback(MonitorEvent::Data {
+                    intro: intro.clone(),
+                    value: value.clone(),
+                    marked: marked.cloned(),
+                });
+            };
         let result = run_monitor_loop(
             server.clone(),
             sid,
@@ -2788,6 +2858,58 @@ enum MonitorEnd {
     Fatal(PvaError),
 }
 
+/// Resolve a decoded monitor changed `BitSet` to the set of dotted leaf
+/// paths it marks — the shape `format::format_value`'s `marked` argument
+/// expects (a `Structure` is a container; every other field is a leaf, so
+/// a leaf path is `value` / `alarm.severity` / `timeStamp.userTag`).
+///
+/// `bit_offset` uses the same depth-first numbering as
+/// `decode_pv_field_with_bitset` / `fill_unmarked_from_prior` (pvData spec
+/// §5.4): a structure occupies its own bit and its children follow. A
+/// structure whose own bit is set means the whole subtree was sent fresh
+/// (pvData BitSet compression), so every descendant leaf is marked — the
+/// same propagation `prune_to_marked` applies. pvxs builds a monitor delta
+/// from exactly these marked leaves (`Value::imarked()`, datafmt.cpp:112-120).
+fn changed_bitset_to_marked_paths(
+    desc: &FieldDesc,
+    bitset: &BitSet,
+) -> std::collections::HashSet<String> {
+    fn walk(
+        desc: &FieldDesc,
+        bit_offset: usize,
+        prefix: &str,
+        ancestor_marked: bool,
+        bitset: &BitSet,
+        out: &mut std::collections::HashSet<String>,
+    ) {
+        match desc {
+            FieldDesc::Structure { fields, .. } => {
+                let here_marked = ancestor_marked || bitset.get(bit_offset);
+                let mut child_bit = bit_offset + 1;
+                for (name, child) in fields {
+                    let cpath = if prefix.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{prefix}.{name}")
+                    };
+                    walk(child, child_bit, &cpath, here_marked, bitset, out);
+                    child_bit += child.total_bits();
+                }
+            }
+            // Leaf (scalar/array/union/any/struct-array): marked iff its own
+            // bit or any enclosing structure bit is set.
+            _ => {
+                if (ancestor_marked || bitset.get(bit_offset)) && !prefix.is_empty() {
+                    out.insert(prefix.to_string());
+                }
+            }
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    walk(desc, 0, "", false, bitset, &mut out);
+    out
+}
+
 async fn run_monitor_loop<F>(
     server: Arc<super::server_conn::ServerConn>,
     sid: u32,
@@ -2798,7 +2920,7 @@ async fn run_monitor_loop<F>(
     state: Option<Arc<SubscriptionState>>,
 ) -> Result<(), MonitorEnd>
 where
-    F: FnMut(&FieldDesc, &PvField) + Send,
+    F: FnMut(&FieldDesc, &PvField, Option<&std::collections::HashSet<String>>) + Send,
 {
     let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
@@ -2964,6 +3086,21 @@ where
                 // coalesced updates because we fell behind. Capture it
                 // before `d.value` is moved below.
                 let srv_squash = !d.overrun.is_empty();
+                // pvxs renders a monitor delta from the update's own changed
+                // set (`Value::imarked()`, datafmt.cpp:112-120). The first
+                // post of a connect cycle is a complete snapshot with no
+                // prior to delta against, so surface marked=None (every leaf
+                // shown); later posts carry only the server-marked changed
+                // leaves. A non-structure top has no addressable leaves —
+                // the value itself is the datum, always shown — so leave it
+                // None too (the delta formatter hides a struct-less top when
+                // a marked subset is supplied). Resolve before `d.value`
+                // moves; `d.changed` is still borrowable afterwards.
+                let marked = if prior.is_some() && matches!(intro, FieldDesc::Structure { .. }) {
+                    Some(changed_bitset_to_marked_paths(&intro, &d.changed))
+                } else {
+                    None
+                };
                 let value = if let Some(prev) = prior.as_ref() {
                     crate::pvdata::encode::fill_unmarked_from_prior(
                         &intro, &d.changed, 0, d.value, prev,
@@ -2972,7 +3109,7 @@ where
                     d.value
                 };
                 prior = Some(value.clone());
-                callback(&intro, &value);
+                callback(&intro, &value, marked.as_ref());
                 events_since_ack += 1;
                 if let Some(s) = &state {
                     let mut st = s.stats.lock();
@@ -4447,6 +4584,101 @@ fn value_only_bit_set(intro: &FieldDesc) -> BitSet {
     changed
 }
 
+/// True when the prototype's writable `.value` is an `enum_t` structure
+/// (NTEnum) — the case pvput handles by writing `value.index` rather than
+/// the whole `.value` (pvput.cpp:180). The `index` member is required so a
+/// degenerate `enum_t`-named structure without it is not mistaken for one.
+fn value_target_is_enum(intro: &FieldDesc) -> bool {
+    matches!(
+        value_target_desc(intro),
+        FieldDesc::Structure { struct_id, fields }
+            if struct_id == "enum_t" && fields.iter().any(|(n, _)| n == "index")
+    )
+}
+
+/// The `value.choices` labels from a previously-fetched value snapshot, used
+/// to resolve an enum write by label. `None` when the snapshot is absent or
+/// does not carry a `value.choices` string array.
+fn enum_choices_from_previous(previous: &PvField) -> Option<Vec<String>> {
+    match value_at_path(previous, &["value", "choices"])? {
+        PvField::ScalarArray(items) => Some(
+            items
+                .iter()
+                .map(|sv| sv.to_string())
+                .collect::<Vec<String>>(),
+        ),
+        _ => None,
+    }
+}
+
+/// Resolve a bare enum token to its `index`, matching the current choice
+/// labels first and falling back to an integer index — pvput.cpp:190-202:
+/// a token equal to a choice writes that choice's position, otherwise it is
+/// parsed as the integer index directly. `choices` is `None` when no
+/// get-first snapshot is available (the integer fallback still applies).
+fn resolve_enum_index(token: &str, choices: Option<&[String]>) -> PvaResult<i32> {
+    if let Some(choices) = choices {
+        if let Some(i) = choices.iter().position(|c| c == token) {
+            return Ok(i as i32);
+        }
+    }
+    token.trim().parse::<i32>().map_err(|_| {
+        PvaError::InvalidValue(format!(
+            "enum value '{token}' is neither a choice label nor an integer index"
+        ))
+    })
+}
+
+/// Build the `(value, changed-bits)` delta for a bare write to an `enum_t`
+/// `.value`: set `value.index` to the resolved index and mark ONLY that bit
+/// (pvput.cpp:180-204, `args.tosend.set(idxfld->getFieldOffset())`). Leaving
+/// `value.choices` unmarked means the server keeps the menu it already
+/// holds — marking the whole `.value` would clobber `choices` with an empty
+/// array.
+fn build_enum_value_delta(intro: &FieldDesc, index: i32) -> PvaResult<(PvField, BitSet)> {
+    let mut value = crate::pvdata::encode::default_value_for(intro);
+    assign_at_path(
+        &mut value,
+        &["value", "index"],
+        PvField::Scalar(ScalarValue::Int(index)),
+    );
+    let bit = intro.bit_for_path("value.index").ok_or_else(|| {
+        PvaError::InvalidValue("enum prototype has no value.index field".to_string())
+    })?;
+    let mut changed = BitSet::new();
+    changed.set(bit);
+    Ok((value, changed))
+}
+
+/// Plain-value (bare token) PUT mode against the `.value` member, the single
+/// owner of pvput.cpp:155-207. An `enum_t` `.value` resolves the lone token
+/// to `value.index` (by choice label, then integer) using the optional
+/// get-first snapshot `previous`, marking only `value.index`; every other
+/// shape lowers through [`build_put_value_from_tokens`] and marks the
+/// `.value` bit. Shared by the deferred CLI classifier
+/// ([`build_put_from_args`]) and the legacy positional token form
+/// ([`op_put_tokens`]).
+fn build_put_value_mode(
+    intro: &FieldDesc,
+    tokens: &[String],
+    previous: Option<&PvField>,
+) -> PvaResult<(PvField, BitSet)> {
+    if value_target_is_enum(intro) {
+        if tokens.len() != 1 {
+            return Err(PvaError::InvalidValue(
+                "Can't assign multiple values to enum".to_string(),
+            ));
+        }
+        let choices = previous.and_then(enum_choices_from_previous);
+        let index = resolve_enum_index(&tokens[0], choices.as_deref())?;
+        return build_enum_value_delta(intro, index);
+    }
+    Ok((
+        build_put_value_from_tokens(intro, tokens)?,
+        value_only_bit_set(intro),
+    ))
+}
+
 /// One leaf of a multi-field PUT assignment. The leaf kind is explicit
 /// so the single delta owner ([`build_field_delta`]) places each value
 /// the right way: a [`PutLeaf::Str`] is parsed against the target
@@ -4510,6 +4742,279 @@ fn build_field_delta(
     Ok((value, changed))
 }
 
+/// The descriptor at a dotted field path inside `desc`, or `None` when a
+/// segment is missing or a non-structure is traversed. The descriptor
+/// twin of [`value_at_path`], used to lower a JSON field value against the
+/// right target shape.
+fn field_desc_at_path<'a>(desc: &'a FieldDesc, parts: &[&str]) -> Option<&'a FieldDesc> {
+    match parts.split_first() {
+        None => Some(desc),
+        Some((head, tail)) => {
+            if let FieldDesc::Structure { fields, .. } = desc {
+                let child = fields.iter().find(|(n, _)| n == head).map(|(_, d)| d)?;
+                field_desc_at_path(child, tail)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Coerce one JSON scalar to a [`ScalarValue`] of the target type, the
+/// pvData `PVScalar::putFrom` coercion the JSON parser applies per token
+/// (parseinto.cpp:60-66, `valueAssign` → `castUnsafe`): a JSON number
+/// lands in any numeric type (float→int truncates, like a C++ static
+/// cast), a JSON bool maps to 0/1 for numerics, and a JSON string is
+/// parsed for a numeric/bool target or taken verbatim for a string.
+fn json_scalar_to_value(st: ScalarType, j: &serde_json::Value) -> PvaResult<ScalarValue> {
+    use ScalarType as T;
+    use serde_json::Value as J;
+    // Any JSON scalar as a wide integer (i128 holds every i64/u64 exactly;
+    // a float source truncates toward zero, matching `static_cast`).
+    let as_int = || -> Option<i128> {
+        match j {
+            J::Number(n) => n
+                .as_i64()
+                .map(|v| v as i128)
+                .or_else(|| n.as_u64().map(|v| v as i128))
+                .or_else(|| n.as_f64().map(|f| f as i128)),
+            J::Bool(b) => Some(*b as i128),
+            J::String(s) => s.trim().parse::<i128>().ok(),
+            _ => None,
+        }
+    };
+    let as_float = || -> Option<f64> {
+        match j {
+            J::Number(n) => n.as_f64(),
+            J::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+            J::String(s) => s.trim().parse::<f64>().ok(),
+            _ => None,
+        }
+    };
+    let int_err = || PvaError::InvalidValue(format!("cannot assign JSON {j} to an integer field"));
+    let float_err =
+        || PvaError::InvalidValue(format!("cannot assign JSON {j} to a floating field"));
+    Ok(match st {
+        T::Boolean => match j {
+            J::Bool(b) => ScalarValue::Boolean(*b),
+            J::Number(n) => ScalarValue::Boolean(n.as_f64().map(|f| f != 0.0).unwrap_or(false)),
+            J::String(s) => ScalarValue::parse(st, s).map_err(PvaError::InvalidValue)?,
+            _ => {
+                return Err(PvaError::InvalidValue(format!(
+                    "cannot assign JSON {j} to a bool field"
+                )));
+            }
+        },
+        T::Byte => ScalarValue::Byte(as_int().ok_or_else(int_err)? as i8),
+        T::Short => ScalarValue::Short(as_int().ok_or_else(int_err)? as i16),
+        T::Int => ScalarValue::Int(as_int().ok_or_else(int_err)? as i32),
+        T::Long => ScalarValue::Long(as_int().ok_or_else(int_err)? as i64),
+        T::UByte => ScalarValue::UByte(as_int().ok_or_else(int_err)? as u8),
+        T::UShort => ScalarValue::UShort(as_int().ok_or_else(int_err)? as u16),
+        T::UInt => ScalarValue::UInt(as_int().ok_or_else(int_err)? as u32),
+        T::ULong => ScalarValue::ULong(as_int().ok_or_else(int_err)? as u64),
+        T::Float => ScalarValue::Float(as_float().ok_or_else(float_err)? as f32),
+        T::Double => ScalarValue::Double(as_float().ok_or_else(float_err)?),
+        T::String => match j {
+            J::String(s) => ScalarValue::String(s.clone().into()),
+            J::Number(n) => ScalarValue::String(n.to_string().into()),
+            J::Bool(b) => ScalarValue::String(b.to_string().into()),
+            _ => {
+                return Err(PvaError::InvalidValue(format!(
+                    "cannot assign JSON {j} to a string field"
+                )));
+            }
+        },
+    })
+}
+
+/// Infer an `any` (variant) value from a JSON scalar — narrowest type that
+/// holds it, mirroring pvData's variant-union assignment which wraps the
+/// JSON token's native scalar type (parseinto.cpp:99-104).
+fn json_to_variant(j: &serde_json::Value) -> PvaResult<(FieldDesc, PvField)> {
+    use serde_json::Value as J;
+    let (st, sv) = match j {
+        J::Bool(b) => (ScalarType::Boolean, ScalarValue::Boolean(*b)),
+        J::Number(n) if n.is_i64() => (ScalarType::Long, ScalarValue::Long(n.as_i64().unwrap())),
+        J::Number(n) if n.is_u64() => (ScalarType::ULong, ScalarValue::ULong(n.as_u64().unwrap())),
+        J::Number(n) => (
+            ScalarType::Double,
+            ScalarValue::Double(n.as_f64().unwrap_or(0.0)),
+        ),
+        J::String(s) => (ScalarType::String, ScalarValue::String(s.clone().into())),
+        _ => {
+            return Err(PvaError::InvalidValue(
+                "cannot infer an 'any' value from a JSON array, object, or null".to_string(),
+            ));
+        }
+    };
+    Ok((FieldDesc::Scalar(st), PvField::Scalar(sv)))
+}
+
+/// Lower a parsed JSON value into a [`PvField`] matching `desc`, marking
+/// each assigned leaf in `changed` at its depth-first bit offset
+/// (`base_bit` is `desc`'s own offset). This is the descriptor-driven
+/// counterpart of pvData `parseJSON(strm, dest, assigned)`
+/// (parseinto.cpp): a structure assigns only its named JSON keys and marks
+/// each assigned leaf (not the container — so unmentioned siblings keep
+/// their server value); a scalar / scalar-array / array element marks its
+/// own bit. An unknown JSON key is an error, like pvData's
+/// `getSubFieldT` (parseinto.cpp:212). Union targets are rejected (pvData's
+/// member auto-select is ambiguous from a bare CLI token).
+fn parse_json_into_field(
+    desc: &FieldDesc,
+    j: &serde_json::Value,
+    base_bit: usize,
+    changed: &mut BitSet,
+) -> PvaResult<PvField> {
+    match desc {
+        FieldDesc::Scalar(st) => {
+            let v = json_scalar_to_value(*st, j)?;
+            changed.set(base_bit);
+            Ok(PvField::Scalar(v))
+        }
+        FieldDesc::ScalarArray(st) => {
+            let arr = j.as_array().ok_or_else(|| {
+                PvaError::InvalidValue(format!(
+                    "expected a JSON array for a scalar-array field, got {j}"
+                ))
+            })?;
+            let mut items = Vec::with_capacity(arr.len());
+            for e in arr {
+                items.push(json_scalar_to_value(*st, e)?);
+            }
+            changed.set(base_bit);
+            Ok(PvField::ScalarArray(items))
+        }
+        FieldDesc::Structure { struct_id, fields } => {
+            let obj = j.as_object().ok_or_else(|| {
+                PvaError::InvalidValue(format!(
+                    "expected a JSON object for a structure field, got {j}"
+                ))
+            })?;
+            // pvData `getSubFieldT` throws on an unknown key (parseinto.cpp:212).
+            for k in obj.keys() {
+                if !fields.iter().any(|(n, _)| n == k) {
+                    return Err(PvaError::InvalidValue(format!(
+                        "JSON field '{k}' not present in target structure"
+                    )));
+                }
+            }
+            let mut s = PvStructure::new(struct_id);
+            let mut child_bit = base_bit + 1;
+            for (name, child) in fields {
+                let cv = match obj.get(name) {
+                    Some(jv) => parse_json_into_field(child, jv, child_bit, changed)?,
+                    None => crate::pvdata::encode::default_value_for(child),
+                };
+                s.fields.push((name.clone(), cv));
+                child_bit += child.total_bits();
+            }
+            // The container's own bit stays clear — only assigned leaves are
+            // marked, so unmentioned siblings keep their server-side value.
+            Ok(PvField::Structure(s))
+        }
+        FieldDesc::StructureArray { struct_id, fields } => {
+            let arr = j.as_array().ok_or_else(|| {
+                PvaError::InvalidValue(format!(
+                    "expected a JSON array for a structure-array field, got {j}"
+                ))
+            })?;
+            let elem_desc = FieldDesc::Structure {
+                struct_id: struct_id.clone(),
+                fields: fields.clone(),
+            };
+            let mut items = Vec::with_capacity(arr.len());
+            for e in arr {
+                // Element-internal bits are not part of the top BitSet — pvData
+                // pushes structureArray-element frames with a null `assigned`
+                // and marks only the array field's own offset
+                // (parseinto.cpp:191,267). A scratch set absorbs them.
+                let mut scratch = BitSet::new();
+                match parse_json_into_field(&elem_desc, e, 0, &mut scratch)? {
+                    PvField::Structure(st) => items.push(Some(st)),
+                    other => {
+                        return Err(PvaError::InvalidValue(format!(
+                            "internal: structure-array element built as {other:?}"
+                        )));
+                    }
+                }
+            }
+            changed.set(base_bit);
+            Ok(PvField::StructureArray(items))
+        }
+        FieldDesc::Variant => {
+            let (vdesc, vval) = json_to_variant(j)?;
+            changed.set(base_bit);
+            Ok(PvField::Variant(Box::new(VariantValue {
+                desc: Some(vdesc),
+                value: vval,
+            })))
+        }
+        FieldDesc::VariantArray => {
+            let arr = j.as_array().ok_or_else(|| {
+                PvaError::InvalidValue(format!("expected a JSON array for an any[] field, got {j}"))
+            })?;
+            let mut items = Vec::with_capacity(arr.len());
+            for e in arr {
+                let (vd, vv) = json_to_variant(e)?;
+                items.push(Some(VariantValue {
+                    desc: Some(vd),
+                    value: vv,
+                }));
+            }
+            changed.set(base_bit);
+            Ok(PvField::VariantArray(items))
+        }
+        FieldDesc::Union { .. } | FieldDesc::UnionArray { .. } => Err(PvaError::InvalidValue(
+            "JSON assignment to a union field is not supported".to_string(),
+        )),
+    }
+}
+
+/// Field=value mode lowering (pvput.cpp:209-244): a pair whose value starts
+/// with `[` or `{` is JSON (an array lowers into a scalar/struct array, an
+/// object into a (sub)structure — pvData `parseJSON`/`jarray`), marking the
+/// assigned leaves; every other pair is a scalar text assignment marking
+/// the field's own bit. Single owner of the CLI field-mode delta, kept
+/// distinct from the programmatic [`build_field_delta`] (pvxs
+/// `PutBuilder::set`) so the pvput-only JSON lowering does not leak into
+/// the typed-setter path.
+fn build_put_field_pairs(
+    intro: &FieldDesc,
+    pairs: &[(String, String)],
+) -> PvaResult<(PvField, BitSet)> {
+    let mut value = crate::pvdata::encode::default_value_for(intro);
+    let mut changed = BitSet::new();
+    for (fname, raw) in pairs {
+        let parts: Vec<&str> = fname.split('.').filter(|s| !s.is_empty()).collect();
+        let bit = intro.bit_for_path(fname).ok_or_else(|| {
+            PvaError::InvalidValue(format!("field path '{fname}' not present in introspection"))
+        })?;
+        let trimmed = raw.trim_start();
+        if trimmed.starts_with('[') || trimmed.starts_with('{') {
+            let field_desc = field_desc_at_path(intro, &parts).ok_or_else(|| {
+                PvaError::InvalidValue(format!("field path '{fname}' not present in introspection"))
+            })?;
+            let json: serde_json::Value = serde_json::from_str(raw.trim()).map_err(|e| {
+                PvaError::InvalidValue(format!("{fname} : invalid JSON value: {e}"))
+            })?;
+            // `parse_json_into_field` marks the assigned leaves (or the
+            // array/leaf bit) — do not also blanket-mark the field bit.
+            let fv = parse_json_into_field(field_desc, &json, bit, &mut changed)?;
+            assign_at_path(&mut value, &parts, fv);
+        } else {
+            let one = build_put_value_for_path(intro, &parts, raw)?;
+            let leaf_val = value_at_path(&one, &parts).ok_or_else(|| {
+                PvaError::InvalidValue(format!("could not build field '{fname}'"))
+            })?;
+            assign_at_path(&mut value, &parts, leaf_val);
+            changed.set(bit);
+        }
+    }
+    Ok((value, changed))
+}
+
 /// Classify the raw CLI PUT tokens against the server prototype and
 /// build the `(value, changed-bits)` delta — deferring every
 /// field-vs-bare decision until the prototype is known, exactly like
@@ -4528,10 +5033,16 @@ fn build_field_delta(
 /// - bare values and field pairs both present → "Can't mix" (pvput.cpp:139-140);
 /// - everything ignored → "No valid value(s)" (pvput.cpp:141-143).
 ///
-/// Bare values lower through [`build_put_value_from_tokens`] (legacy
-/// positional array length-drop + lone `[...]` shortcut); field pairs
-/// lower through [`build_field_delta`].
-fn build_put_from_args(intro: &FieldDesc, tokens: &[String]) -> PvaResult<(PvField, BitSet)> {
+/// A lone `[...]` is the `value=[...]` shorthand and a lone `{...}` is JSON
+/// top mode (the whole object parsed into the root structure with
+/// leaf-level marking); every other bare value lowers through
+/// [`build_put_value_from_tokens`] (legacy positional array length-drop)
+/// and field pairs lower through [`build_put_field_pairs`] (JSON-aware).
+fn build_put_from_args(
+    intro: &FieldDesc,
+    tokens: &[String],
+    previous: Option<&PvField>,
+) -> PvaResult<(PvField, BitSet)> {
     // pvput.cpp:124-130: an unresolved `f=v` is a bare string value only
     // when the writable `.value` target is a `string` scalar.
     let value_is_string = matches!(
@@ -4540,7 +5051,7 @@ fn build_put_from_args(intro: &FieldDesc, tokens: &[String]) -> PvaResult<(PvFie
     );
 
     let mut bare: Vec<String> = Vec::new();
-    let mut pairs: Vec<(String, PutLeaf)> = Vec::new();
+    let mut pairs: Vec<(String, String)> = Vec::new();
     for tok in tokens {
         match tok.split_once('=') {
             // No `=`: a plain bare value (pvput.cpp:112-114).
@@ -4548,7 +5059,7 @@ fn build_put_from_args(intro: &FieldDesc, tokens: &[String]) -> PvaResult<(PvFie
             // `f=v` with `f` present in the prototype: a field assignment
             // (pvput.cpp:116-121).
             Some((fname, val)) if !fname.is_empty() && intro.bit_for_path(fname).is_some() => {
-                pairs.push((fname.to_string(), PutLeaf::Str(val.to_string())));
+                pairs.push((fname.to_string(), val.to_string()));
             }
             // `f=v` with `f` absent (or an empty field name): either a
             // bare string value containing `=`, or warn-and-ignore.
@@ -4573,13 +5084,41 @@ fn build_put_from_args(intro: &FieldDesc, tokens: &[String]) -> PvaResult<(PvFie
         ));
     }
 
+    // pvput.cpp:144-148: a lone `[...]` is shorthand for `value=[...]`, so it
+    // lowers through the same JSON-array field path. Only when the prototype
+    // exposes a `.value` member — a bare-leaf prototype keeps the legacy
+    // positional handling in `build_put_value_from_tokens`, where pvput's
+    // root is always a structure.
+    if bare.len() == 1
+        && bare[0].trim_start().starts_with('[')
+        && intro.bit_for_path("value").is_some()
+    {
+        pairs.push(("value".to_string(), bare.remove(0)));
+    }
+
+    // pvput.cpp:150-153: a lone `{...}` is JSON top mode — parse the whole
+    // object into the root structure, marking each assigned leaf
+    // (`parseJSON(strm, root, &args.tosend)`). pvput's root is always a
+    // structure, so this only applies to a structure prototype.
+    if bare.len() == 1
+        && bare[0].trim_start().starts_with('{')
+        && matches!(intro, FieldDesc::Structure { .. })
+    {
+        let json: serde_json::Value = serde_json::from_str(bare[0].trim())
+            .map_err(|e| PvaError::InvalidValue(format!("invalid JSON value: {e}")))?;
+        let mut changed = BitSet::new();
+        let value = parse_json_into_field(intro, &json, 0, &mut changed)?;
+        return Ok((value, changed));
+    }
+
     if pairs.is_empty() {
-        // Plain value mode → `.value` (pvput.cpp:155-207).
-        let value = build_put_value_from_tokens(intro, &bare)?;
-        Ok((value, value_only_bit_set(intro)))
+        // Plain value mode → `.value` (pvput.cpp:155-207), enum-aware: an
+        // `enum_t` `.value` resolves the token to `value.index` against the
+        // get-first `previous` snapshot.
+        build_put_value_mode(intro, &bare, previous)
     } else {
-        // Field=value mode (pvput.cpp:209-235).
-        build_field_delta(intro, &pairs)
+        // Field=value mode (pvput.cpp:209-244), JSON-aware.
+        build_put_field_pairs(intro, &pairs)
     }
 }
 
@@ -4851,6 +5390,155 @@ mod tests {
         assert_ne!(frame, value_only_frame);
     }
 
+    /// Monitor `-F delta` must mark only the leaves the server flagged
+    /// changed in *this* update. `changed_bitset_to_marked_paths` resolves
+    /// the decoded changed `BitSet` to the dotted leaf paths
+    /// `format::format_value`'s `marked` argument consumes, with pvData
+    /// BitSet-compression propagation (a set structure bit marks its whole
+    /// subtree) — pvxs `Value::imarked()` (datafmt.cpp:112-120).
+    mod monitor_delta_marks {
+        use super::*;
+
+        // NTScalar-shaped prototype: value + alarm{severity,status,message}
+        // + timeStamp{secondsPastEpoch,nanoseconds,userTag}. Depth-first
+        // bits: 0 root, 1 value, 2 alarm, 3 severity, 4 status, 5 message,
+        // 6 timeStamp, 7 secondsPastEpoch, 8 nanoseconds, 9 userTag.
+        fn nt_scalar() -> FieldDesc {
+            let sub = |fields: Vec<(&str, FieldDesc)>, id: &str| FieldDesc::Structure {
+                struct_id: id.to_string(),
+                fields: fields
+                    .into_iter()
+                    .map(|(n, d)| (n.to_string(), d))
+                    .collect(),
+            };
+            sub(
+                vec![
+                    ("value", FieldDesc::Scalar(ScalarType::Double)),
+                    (
+                        "alarm",
+                        sub(
+                            vec![
+                                ("severity", FieldDesc::Scalar(ScalarType::Int)),
+                                ("status", FieldDesc::Scalar(ScalarType::Int)),
+                                ("message", FieldDesc::Scalar(ScalarType::String)),
+                            ],
+                            "alarm_t",
+                        ),
+                    ),
+                    (
+                        "timeStamp",
+                        sub(
+                            vec![
+                                ("secondsPastEpoch", FieldDesc::Scalar(ScalarType::Long)),
+                                ("nanoseconds", FieldDesc::Scalar(ScalarType::Int)),
+                                ("userTag", FieldDesc::Scalar(ScalarType::Int)),
+                            ],
+                            "time_t",
+                        ),
+                    ),
+                ],
+                "epics:nt/NTScalar:1.0",
+            )
+        }
+
+        fn marks(bits: &[usize]) -> std::collections::HashSet<String> {
+            let mut bs = BitSet::new();
+            for &b in bits {
+                bs.set(b);
+            }
+            changed_bitset_to_marked_paths(&nt_scalar(), &bs)
+        }
+
+        fn set_of(paths: &[&str]) -> std::collections::HashSet<String> {
+            paths.iter().map(|s| s.to_string()).collect()
+        }
+
+        /// A value-only update (bit 1) marks exactly `value` — not the
+        /// untouched alarm/timeStamp leaves. This is the reprint bug the
+        /// fix closes.
+        #[test]
+        fn value_only_marks_only_value() {
+            assert_eq!(marks(&[1]), set_of(&["value"]));
+        }
+
+        /// A single nested leaf (bit 3 = alarm.severity) marks only that
+        /// leaf.
+        #[test]
+        fn single_nested_leaf() {
+            assert_eq!(marks(&[3]), set_of(&["alarm.severity"]));
+        }
+
+        /// A set structure bit (bit 2 = the `alarm` sub-struct) marks every
+        /// descendant leaf (BitSet compression), not the struct itself.
+        #[test]
+        fn struct_bit_marks_whole_subtree() {
+            assert_eq!(
+                marks(&[2]),
+                set_of(&["alarm.severity", "alarm.status", "alarm.message"])
+            );
+        }
+
+        /// The root bit (bit 0) marks every leaf — the first-snapshot /
+        /// full-value case (here surfaced explicitly; the live loop sends
+        /// `marked=None` on the first update instead).
+        #[test]
+        fn root_bit_marks_all_leaves() {
+            assert_eq!(
+                marks(&[0]),
+                set_of(&[
+                    "value",
+                    "alarm.severity",
+                    "alarm.status",
+                    "alarm.message",
+                    "timeStamp.secondsPastEpoch",
+                    "timeStamp.nanoseconds",
+                    "timeStamp.userTag",
+                ])
+            );
+        }
+
+        /// A multi-leaf update (value + timeStamp.userTag) marks exactly
+        /// those two and nothing else.
+        #[test]
+        fn disjoint_leaves() {
+            assert_eq!(marks(&[1, 9]), set_of(&["value", "timeStamp.userTag"]));
+        }
+
+        /// An empty changed set marks nothing.
+        #[test]
+        fn empty_marks_nothing() {
+            assert!(marks(&[]).is_empty());
+        }
+
+        /// The resolved paths match `format::format_value`'s `marked`
+        /// contract: feeding the set into the Delta formatter prints only
+        /// the marked leaves and omits the unmarked ones.
+        #[test]
+        fn marked_paths_drive_delta_formatter() {
+            let desc = nt_scalar();
+            // Full value so every leaf is present to (potentially) print.
+            let value = crate::pvdata::encode::default_value_for(&desc);
+            let mut bs = BitSet::new();
+            bs.set(1); // value only
+            let marked = changed_bitset_to_marked_paths(&desc, &bs);
+            let fmt = crate::format::ValueFmt {
+                format: crate::format::ValueFormat::Delta,
+                array_limit: 0,
+                show_value: true,
+            };
+            let out = crate::format::format_value(&desc, Some(&value), &fmt, Some(&marked), 0);
+            assert!(out.contains("value"), "value leaf must print: {out:?}");
+            assert!(
+                !out.contains("severity"),
+                "unmarked alarm.severity must not print: {out:?}"
+            );
+            assert!(
+                !out.contains("secondsPastEpoch"),
+                "unmarked timeStamp leaf must not print: {out:?}"
+            );
+        }
+    }
+
     /// Legacy pvAccessCPP positional bare-token PUT classification
     /// (`pvput.cpp:144-178`): the array-vs-scalar decision is made
     /// against the prototype, so these exercise `build_put_value_from_tokens`
@@ -4987,7 +5675,7 @@ mod tests {
         #[test]
         fn bare_token_targets_value() {
             let intro = nt(ScalarType::Double);
-            let (value, changed) = build_put_from_args(&intro, &t(&["42"])).unwrap();
+            let (value, changed) = build_put_from_args(&intro, &t(&["42"]), None).unwrap();
             assert_eq!(scalar_at(&value, &["value"]), &ScalarValue::Double(42.0));
             assert!(changed.get(intro.bit_for_path("value").unwrap()));
             assert!(!changed.get(intro.bit_for_path("alarm.severity").unwrap()));
@@ -5000,7 +5688,7 @@ mod tests {
         #[test]
         fn equals_token_on_string_value_is_bare_string() {
             let intro = nt(ScalarType::String);
-            let (value, changed) = build_put_from_args(&intro, &t(&["a=b"])).unwrap();
+            let (value, changed) = build_put_from_args(&intro, &t(&["a=b"]), None).unwrap();
             assert_eq!(
                 scalar_at(&value, &["value"]),
                 &ScalarValue::String("a=b".into())
@@ -5013,7 +5701,8 @@ mod tests {
         #[test]
         fn existing_field_is_assignment() {
             let intro = nt(ScalarType::Double);
-            let (value, changed) = build_put_from_args(&intro, &t(&["alarm.severity=2"])).unwrap();
+            let (value, changed) =
+                build_put_from_args(&intro, &t(&["alarm.severity=2"]), None).unwrap();
             assert_eq!(
                 scalar_at(&value, &["alarm", "severity"]),
                 &ScalarValue::Int(2)
@@ -5028,7 +5717,7 @@ mod tests {
         #[test]
         fn unknown_field_on_nonstring_value_is_ignored() {
             let intro = nt(ScalarType::Double);
-            let err = build_put_from_args(&intro, &t(&["nope=1"])).unwrap_err();
+            let err = build_put_from_args(&intro, &t(&["nope=1"]), None).unwrap_err();
             assert!(
                 matches!(err, PvaError::InvalidValue(ref m) if m.contains("No valid value")),
                 "got: {err:?}"
@@ -5041,7 +5730,8 @@ mod tests {
         #[test]
         fn mix_bare_and_field_pair_is_rejected() {
             let intro = nt(ScalarType::Double);
-            let err = build_put_from_args(&intro, &t(&["42", "alarm.severity=2"])).unwrap_err();
+            let err =
+                build_put_from_args(&intro, &t(&["42", "alarm.severity=2"]), None).unwrap_err();
             assert!(
                 matches!(err, PvaError::InvalidValue(ref m) if m.contains("Can't mix")),
                 "got: {err:?}"
@@ -5053,7 +5743,8 @@ mod tests {
         fn multiple_field_pairs_each_marked() {
             let intro = nt(ScalarType::Double);
             let (value, changed) =
-                build_put_from_args(&intro, &t(&["alarm.severity=2", "alarm.status=1"])).unwrap();
+                build_put_from_args(&intro, &t(&["alarm.severity=2", "alarm.status=1"]), None)
+                    .unwrap();
             assert_eq!(
                 scalar_at(&value, &["alarm", "severity"]),
                 &ScalarValue::Int(2)
@@ -5065,6 +5756,349 @@ mod tests {
             assert!(changed.get(intro.bit_for_path("alarm.severity").unwrap()));
             assert!(changed.get(intro.bit_for_path("alarm.status").unwrap()));
             assert!(!changed.get(intro.bit_for_path("value").unwrap()));
+        }
+    }
+
+    /// JSON value parsing for the CLI PUT classifier (`build_put_from_args`):
+    /// a lone `{...}` is JSON top mode, a lone `[...]` is the `value=[...]`
+    /// shorthand, and a `field={...}`/`field=[...]` pair lowers JSON into
+    /// that field — each marking only the assigned leaves
+    /// (pvAccessCPP `pvput.cpp:144-244`, pvData `parseJSON`/`jarray`).
+    mod put_json_values {
+        use super::*;
+        use crate::pvdata::ScalarType;
+
+        /// `{ value: <T>, alarm: { severity: int, status: int } }`.
+        fn nt(value_type: ScalarType) -> FieldDesc {
+            FieldDesc::Structure {
+                struct_id: "epics:nt/NTScalar:1.0".to_string(),
+                fields: vec![
+                    ("value".to_string(), FieldDesc::Scalar(value_type)),
+                    (
+                        "alarm".to_string(),
+                        FieldDesc::Structure {
+                            struct_id: "alarm_t".to_string(),
+                            fields: vec![
+                                ("severity".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+                                ("status".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+                            ],
+                        },
+                    ),
+                ],
+            }
+        }
+        /// `{ value: <T>[], alarm: { severity: int, status: int } }`.
+        fn nt_array(elem: ScalarType) -> FieldDesc {
+            FieldDesc::Structure {
+                struct_id: "epics:nt/NTScalarArray:1.0".to_string(),
+                fields: vec![
+                    ("value".to_string(), FieldDesc::ScalarArray(elem)),
+                    (
+                        "alarm".to_string(),
+                        FieldDesc::Structure {
+                            struct_id: "alarm_t".to_string(),
+                            fields: vec![
+                                ("severity".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+                                ("status".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+                            ],
+                        },
+                    ),
+                ],
+            }
+        }
+        fn t(args: &[&str]) -> Vec<String> {
+            args.iter().map(|s| s.to_string()).collect()
+        }
+        fn scalar_at<'a>(v: &'a PvField, path: &[&str]) -> &'a ScalarValue {
+            let mut cur = v;
+            for seg in path {
+                match cur {
+                    PvField::Structure(s) => {
+                        cur = &s.fields.iter().find(|(n, _)| n == seg).unwrap().1;
+                    }
+                    other => panic!("expected structure at {seg}, got {other:?}"),
+                }
+            }
+            match cur {
+                PvField::Scalar(sv) => sv,
+                other => panic!("expected scalar at {path:?}, got {other:?}"),
+            }
+        }
+        fn array_at<'a>(v: &'a PvField, name: &str) -> &'a [ScalarValue] {
+            match v {
+                PvField::Structure(s) => {
+                    match &s.fields.iter().find(|(n, _)| n == name).unwrap().1 {
+                        PvField::ScalarArray(items) => items,
+                        other => panic!("expected ScalarArray at {name}, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Structure, got {other:?}"),
+            }
+        }
+
+        /// JSON top mode (`pvput.cpp:150-153`): a lone `{...}` parses into the
+        /// root, assigning each named leaf and marking ONLY those leaves — an
+        /// unmentioned sibling (`alarm.status`) stays unmarked so the server
+        /// keeps its current value.
+        #[test]
+        fn json_top_mode_marks_only_named_leaves() {
+            let intro = nt(ScalarType::Double);
+            let (value, changed) = build_put_from_args(
+                &intro,
+                &t(&[r#"{"value":42,"alarm":{"severity":2}}"#]),
+                None,
+            )
+            .unwrap();
+            assert_eq!(scalar_at(&value, &["value"]), &ScalarValue::Double(42.0));
+            assert_eq!(
+                scalar_at(&value, &["alarm", "severity"]),
+                &ScalarValue::Int(2)
+            );
+            assert!(changed.get(intro.bit_for_path("value").unwrap()));
+            assert!(changed.get(intro.bit_for_path("alarm.severity").unwrap()));
+            // The unmentioned sibling is NOT marked.
+            assert!(!changed.get(intro.bit_for_path("alarm.status").unwrap()));
+            // The container bit is not blanket-marked either.
+            assert!(!changed.get(intro.bit_for_path("alarm").unwrap()));
+        }
+
+        /// Field-mode JSON object (`pvput.cpp:231-233`): `alarm={...}` lowers
+        /// the object into the `alarm` sub-structure, marking each assigned
+        /// leaf — `value` and `alarm.status` stay unmarked.
+        #[test]
+        fn json_field_object_marks_assigned_leaves() {
+            let intro = nt(ScalarType::Double);
+            let (value, changed) =
+                build_put_from_args(&intro, &t(&[r#"alarm={"severity":3}"#]), None).unwrap();
+            assert_eq!(
+                scalar_at(&value, &["alarm", "severity"]),
+                &ScalarValue::Int(3)
+            );
+            assert!(changed.get(intro.bit_for_path("alarm.severity").unwrap()));
+            assert!(!changed.get(intro.bit_for_path("alarm.status").unwrap()));
+            assert!(!changed.get(intro.bit_for_path("value").unwrap()));
+        }
+
+        /// Field-mode JSON array (`pvput.cpp:219-229`, jarray → scalarArray):
+        /// `value=[...]` writes the typed array and marks the value bit.
+        #[test]
+        fn json_field_array_writes_scalar_array() {
+            let intro = nt_array(ScalarType::Double);
+            let (value, changed) =
+                build_put_from_args(&intro, &t(&["value=[1.0,2.0,3.0]"]), None).unwrap();
+            let got: Vec<f64> = array_at(&value, "value")
+                .iter()
+                .map(|sv| match sv {
+                    ScalarValue::Double(d) => *d,
+                    other => panic!("expected Double, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(got, vec![1.0, 2.0, 3.0]);
+            assert!(changed.get(intro.bit_for_path("value").unwrap()));
+        }
+
+        /// A lone `[...]` is the `value=[...]` shorthand (`pvput.cpp:144-148`)
+        /// — routed through the JSON-array field path, not the legacy
+        /// length-then-element list.
+        #[test]
+        fn lone_bracket_is_value_shorthand() {
+            let intro = nt_array(ScalarType::Int);
+            let (value, changed) = build_put_from_args(&intro, &t(&["[10,20,30]"]), None).unwrap();
+            let got: Vec<i32> = array_at(&value, "value")
+                .iter()
+                .map(|sv| match sv {
+                    ScalarValue::Int(i) => *i,
+                    other => panic!("expected Int, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(got, vec![10, 20, 30]);
+            assert!(changed.get(intro.bit_for_path("value").unwrap()));
+        }
+
+        /// An unknown JSON key is a hard error, like pvData `getSubFieldT`
+        /// (`parseinto.cpp:212`) — silently dropping it would lose a value
+        /// the user asked to write.
+        #[test]
+        fn json_unknown_key_is_error() {
+            let intro = nt(ScalarType::Double);
+            let err = build_put_from_args(&intro, &t(&[r#"{"nope":1}"#]), None).unwrap_err();
+            assert!(
+                matches!(err, PvaError::InvalidValue(ref m) if m.contains("not present")),
+                "got: {err:?}"
+            );
+        }
+
+        /// JSON string coercion into a numeric leaf matches pvData
+        /// `putFrom` (`parseinto.cpp:60-66`): `"7"` lands in an int field.
+        #[test]
+        fn json_string_coerces_into_numeric_field() {
+            let intro = nt(ScalarType::Double);
+            let (value, changed) =
+                build_put_from_args(&intro, &t(&[r#"alarm={"severity":"7"}"#]), None).unwrap();
+            assert_eq!(
+                scalar_at(&value, &["alarm", "severity"]),
+                &ScalarValue::Int(7)
+            );
+            assert!(changed.get(intro.bit_for_path("alarm.severity").unwrap()));
+        }
+    }
+
+    /// NTEnum bare-token PUT (`build_put_from_args` plain value mode):
+    /// a bare token writes `value.index` — matched against the current
+    /// `value.choices` by label first, then parsed as an integer index —
+    /// and marks ONLY `value.index`, so the server keeps its choice menu
+    /// (pvAccessCPP `pvput.cpp:180-204`).
+    mod put_enum_value {
+        use super::*;
+        use crate::pvdata::ScalarType;
+
+        /// `{ value: enum_t{ index: int, choices: string[] }, alarm: {...} }`.
+        fn nt_enum() -> FieldDesc {
+            FieldDesc::Structure {
+                struct_id: "epics:nt/NTEnum:1.0".to_string(),
+                fields: vec![
+                    (
+                        "value".to_string(),
+                        FieldDesc::Structure {
+                            struct_id: "enum_t".to_string(),
+                            fields: vec![
+                                ("index".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+                                (
+                                    "choices".to_string(),
+                                    FieldDesc::ScalarArray(ScalarType::String),
+                                ),
+                            ],
+                        },
+                    ),
+                    (
+                        "alarm".to_string(),
+                        FieldDesc::Structure {
+                            struct_id: "alarm_t".to_string(),
+                            fields: vec![(
+                                "severity".to_string(),
+                                FieldDesc::Scalar(ScalarType::Int),
+                            )],
+                        },
+                    ),
+                ],
+            }
+        }
+        /// A get-first snapshot whose `value.choices` are the given labels.
+        fn previous_with_choices(choices: &[&str]) -> PvField {
+            let mut enum_v = PvStructure::new("enum_t");
+            enum_v
+                .fields
+                .push(("index".to_string(), PvField::Scalar(ScalarValue::Int(0))));
+            enum_v.fields.push((
+                "choices".to_string(),
+                PvField::ScalarArray(
+                    choices
+                        .iter()
+                        .map(|c| ScalarValue::String((*c).into()))
+                        .collect(),
+                ),
+            ));
+            let mut root = PvStructure::new("epics:nt/NTEnum:1.0");
+            root.fields
+                .push(("value".to_string(), PvField::Structure(enum_v)));
+            PvField::Structure(root)
+        }
+        fn t(args: &[&str]) -> Vec<String> {
+            args.iter().map(|s| s.to_string()).collect()
+        }
+        fn index_of(v: &PvField) -> i32 {
+            match v {
+                PvField::Structure(s) => {
+                    let value = &s.fields.iter().find(|(n, _)| n == "value").unwrap().1;
+                    match value {
+                        PvField::Structure(e) => {
+                            match &e.fields.iter().find(|(n, _)| n == "index").unwrap().1 {
+                                PvField::Scalar(ScalarValue::Int(i)) => *i,
+                                other => panic!("expected Int index, got {other:?}"),
+                            }
+                        }
+                        other => panic!("expected enum_t value, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Structure, got {other:?}"),
+            }
+        }
+
+        /// A token equal to a choice label writes that choice's position
+        /// (pvput.cpp:190-197) and marks ONLY `value.index` — `value` and
+        /// `value.choices` stay unmarked so the menu is preserved.
+        #[test]
+        fn label_resolves_to_index_marking_only_value_index() {
+            let intro = nt_enum();
+            let previous = previous_with_choices(&["OFF", "ON", "AUTO"]);
+            let (value, changed) =
+                build_put_from_args(&intro, &t(&["AUTO"]), Some(&previous)).unwrap();
+            assert_eq!(index_of(&value), 2);
+            assert!(changed.get(intro.bit_for_path("value.index").unwrap()));
+            // The container and the choices array must NOT be marked — else
+            // the server would overwrite its menu with an empty array.
+            assert!(!changed.get(intro.bit_for_path("value").unwrap()));
+            assert!(!changed.get(intro.bit_for_path("value.choices").unwrap()));
+        }
+
+        /// A token that is not a choice label is parsed as the integer index
+        /// (pvput.cpp:199-202), still marking only `value.index`.
+        #[test]
+        fn integer_token_falls_back_to_index() {
+            let intro = nt_enum();
+            let previous = previous_with_choices(&["OFF", "ON", "AUTO"]);
+            let (value, changed) =
+                build_put_from_args(&intro, &t(&["1"]), Some(&previous)).unwrap();
+            assert_eq!(index_of(&value), 1);
+            assert!(changed.get(intro.bit_for_path("value.index").unwrap()));
+            assert!(!changed.get(intro.bit_for_path("value.choices").unwrap()));
+        }
+
+        /// A choice label that happens to be numeric still wins over the
+        /// integer fallback (pvput matches the label first): choice `"1"`
+        /// at position 0 resolves to index 0, not index 1.
+        #[test]
+        fn numeric_label_wins_over_integer_parse() {
+            let intro = nt_enum();
+            let previous = previous_with_choices(&["1", "2"]);
+            let (value, _changed) =
+                build_put_from_args(&intro, &t(&["1"]), Some(&previous)).unwrap();
+            assert_eq!(index_of(&value), 0);
+        }
+
+        /// Without a get-first snapshot a label cannot be resolved, so a
+        /// non-integer token is a clear error rather than a silent index 0.
+        #[test]
+        fn label_without_snapshot_is_error() {
+            let intro = nt_enum();
+            let err = build_put_from_args(&intro, &t(&["AUTO"]), None).unwrap_err();
+            assert!(
+                matches!(err, PvaError::InvalidValue(ref m) if m.contains("neither a choice label")),
+                "got: {err:?}"
+            );
+        }
+
+        /// An integer token still works with no snapshot (the fallback path
+        /// needs no choices).
+        #[test]
+        fn integer_token_without_snapshot_ok() {
+            let intro = nt_enum();
+            let (value, changed) = build_put_from_args(&intro, &t(&["2"]), None).unwrap();
+            assert_eq!(index_of(&value), 2);
+            assert!(changed.get(intro.bit_for_path("value.index").unwrap()));
+        }
+
+        /// More than one bare token is rejected for an enum
+        /// (pvput.cpp:181-183).
+        #[test]
+        fn multiple_tokens_rejected() {
+            let intro = nt_enum();
+            let previous = previous_with_choices(&["OFF", "ON"]);
+            let err = build_put_from_args(&intro, &t(&["ON", "OFF"]), Some(&previous)).unwrap_err();
+            assert!(
+                matches!(err, PvaError::InvalidValue(ref m) if m.contains("multiple values to enum")),
+                "got: {err:?}"
+            );
         }
     }
 

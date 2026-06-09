@@ -3261,6 +3261,7 @@ async fn handle_connection_io(
                     &tx,
                     &mut channels,
                     order,
+                    &out_order,
                     OpKind::Get,
                     &config,
                     &mut encode_type_cache,
@@ -3279,6 +3280,7 @@ async fn handle_connection_io(
                     &tx,
                     &mut channels,
                     order,
+                    &out_order,
                     OpKind::Put,
                     &config,
                     &mut encode_type_cache,
@@ -3297,6 +3299,7 @@ async fn handle_connection_io(
                     &tx,
                     &mut channels,
                     order,
+                    &out_order,
                     OpKind::Monitor,
                     &config,
                     &mut encode_type_cache,
@@ -3315,6 +3318,7 @@ async fn handle_connection_io(
                     &tx,
                     &mut channels,
                     order,
+                    &out_order,
                     OpKind::Rpc,
                     &config,
                     &mut encode_type_cache,
@@ -5523,6 +5527,14 @@ async fn handle_op(
     tx: &SrvTx,
     channels: &mut HashMap<u32, ChannelState>,
     order: ByteOrder,
+    // The connection's LIVE outbound byte-order cell (the read loop is its
+    // single owner; it re-stores on every mid-stream SET_BYTE_ORDER). The
+    // synchronous reply paths use the `order` snapshot, but a spawned MONITOR
+    // task outlives this call and must follow a later renegotiation, so it
+    // clones this cell and reads it at every frame build (pvxs `conn.cpp:
+    // 169-188` re-latches `sendBE`; `servermon.cpp:159,174` reads
+    // `conn->sendBE` at monitor send time).
+    out_order: &Arc<std::sync::atomic::AtomicBool>,
     kind: OpKind,
     config: &PvaServerConfig,
     encode_cache: &mut EncodeTypeCache,
@@ -6792,6 +6804,16 @@ async fn handle_op(
                 // captured by the task and the sender reaches the op's
                 // `MonitorStartControl` below.
                 let (monitor_exec_tx, monitor_exec_rx) = tokio::sync::watch::channel(false);
+                // Outbound byte order for this long-lived monitor task is read
+                // LIVE from the connection's shared `out_order` cell, not
+                // captured by value at spawn. pvxs `conn.cpp:169-188` re-latches
+                // `sendBE` on every mid-stream SET_BYTE_ORDER and
+                // `servermon.cpp:159,174` reads `conn->sendBE` at monitor send
+                // time, so an already-open monitor follows the renegotiated
+                // order. Capturing `order` here would freeze each subscription
+                // at its INIT-time order and diverge from the connection's
+                // synchronous replies and heartbeat after a renegotiation.
+                let out_order_mon = out_order.clone();
                 let join = tokio::spawn(async move {
                     // terminal finalizer — see `MonitorFinishGuard`.
                     // A single local at the top of the body so no exit (source
@@ -6800,6 +6822,18 @@ async fn handle_op(
                     let _fin_guard = MonitorFinishGuard {
                         tx: mon_fin_tx_task,
                         fin: mon_fin,
+                    };
+                    // Single live read of the connection's current outbound
+                    // byte order, consulted at every frame build below — the
+                    // monitor stream follows a mid-stream SET_BYTE_ORDER instead
+                    // of staying latched to its INIT-time order (pvxs
+                    // `servermon.cpp:159,174` reads `conn->sendBE` at send time).
+                    let order_now = || {
+                        if out_order_mon.load(std::sync::atomic::Ordering::Relaxed) {
+                            ByteOrder::Big
+                        } else {
+                            ByteOrder::Little
+                        }
                     };
                     // access gate check moved inside the spawn
                     // so the read loop is not blocked while the ACF
@@ -6884,7 +6918,7 @@ async fn handle_op(
                                 .await
                                 .is_none()
                             {
-                                let finish = build_monitor_finish(ioid, order);
+                                let finish = build_monitor_finish(ioid, order_now());
                                 let _ = tx_clone.send(finish).await;
                                 return;
                             }
@@ -6903,7 +6937,7 @@ async fn handle_op(
                                 &intro_clone,
                                 &initial,
                                 &mask_clone,
-                                order,
+                                order_now(),
                             );
                             if tx_clone.send(payload).await.is_err() {
                                 return;
@@ -6945,7 +6979,7 @@ async fn handle_op(
                             // reopen against the new descriptor, and
                             // tear down this monitor task.
                             if ev.type_changed {
-                                let finish = build_monitor_finish(ioid, order);
+                                let finish = build_monitor_finish(ioid, order_now());
                                 let _ = tx_clone.send(finish).await;
                                 return;
                             }
@@ -6968,7 +7002,7 @@ async fn handle_op(
                                     .await
                                     .is_none()
                                 {
-                                    let finish = build_monitor_finish(ioid, order);
+                                    let finish = build_monitor_finish(ioid, order_now());
                                     let _ = tx_clone.send(finish).await;
                                     return;
                                 }
@@ -7003,7 +7037,12 @@ async fn handle_op(
                             // `raw_monitor_frame` owns that single policy so
                             // the same-endian forward and the cross-endian
                             // re-encode cannot diverge on malformed input.
-                            let payload = match raw_monitor_frame(ioid, &intro_clone, &ev, order) {
+                            let payload = match raw_monitor_frame(
+                                ioid,
+                                &intro_clone,
+                                &ev,
+                                order_now(),
+                            ) {
                                 RawMonitorFrame::Forward(p) => p,
                                 RawMonitorFrame::Terminate { frame, reason } => {
                                     debug!(
@@ -7019,7 +7058,7 @@ async fn handle_op(
                                 return;
                             }
                         }
-                        let finish = build_monitor_finish(ioid, order);
+                        let finish = build_monitor_finish(ioid, order_now());
                         let _ = tx_clone.send(finish).await;
                         return;
                     }
@@ -7123,7 +7162,7 @@ async fn handle_op(
                                 .await
                                 .is_none()
                             {
-                                let finish = build_monitor_finish(ioid, order);
+                                let finish = build_monitor_finish(ioid, order_now());
                                 let _ = tx_clone.send(finish).await;
                                 return;
                             }
@@ -7167,7 +7206,7 @@ async fn handle_op(
                                         ioid,
                                         "server-side filter transform does not \
                                      fit the monitor descriptor",
-                                        order,
+                                        order_now(),
                                     );
                                     let _ = tx_clone.send(err).await;
                                     return;
@@ -7193,7 +7232,7 @@ async fn handle_op(
                                 &intro_clone,
                                 &initial,
                                 &mask_clone,
-                                order,
+                                order_now(),
                             );
                             if emits_partial {
                                 prev_value = Some(initial);
@@ -7306,7 +7345,7 @@ async fn handle_op(
                         // keeps a boundary sticky and it always reaches the
                         // front before any value it shadowed.
                         if value.type_changed {
-                            let finish = build_monitor_finish(ioid, order);
+                            let finish = build_monitor_finish(ioid, order_now());
                             let _ = tx_clone.send(finish).await;
                             return;
                         }
@@ -7329,7 +7368,7 @@ async fn handle_op(
                                 .await
                                 .is_none()
                             {
-                                let finish = build_monitor_finish(ioid, order);
+                                let finish = build_monitor_finish(ioid, order_now());
                                 let _ = tx_clone.send(finish).await;
                                 return;
                             }
@@ -7427,7 +7466,7 @@ async fn handle_op(
                                     ioid,
                                     "server-side filter transform does not \
                                      fit the monitor descriptor",
-                                    order,
+                                    order_now(),
                                 );
                                 let _ = tx_clone.send(err).await;
                                 return;
@@ -7466,7 +7505,7 @@ async fn handle_op(
                                 &value,
                                 paths,
                                 &mask_clone,
-                                order,
+                                order_now(),
                             )
                         } else if let Some(prev) = prev_value.as_ref() {
                             build_monitor_payload_partial(
@@ -7475,10 +7514,16 @@ async fn handle_op(
                                 &value,
                                 prev,
                                 &mask_clone,
-                                order,
+                                order_now(),
                             )
                         } else {
-                            build_monitor_payload(ioid, &intro_clone, &value, &mask_clone, order)
+                            build_monitor_payload(
+                                ioid,
+                                &intro_clone,
+                                &value,
+                                &mask_clone,
+                                order_now(),
+                            )
                         };
                         if emits_partial {
                             prev_value = Some(value.clone());
@@ -7491,7 +7536,7 @@ async fn handle_op(
                     // pvxs servermon.cpp:148-178 sends a final frame with
                     // subcmd=0x10 to signal end-of-stream so the client can
                     // tear down cleanly.
-                    let finish = build_monitor_finish(ioid, order);
+                    let finish = build_monitor_finish(ioid, order_now());
                     let _ = tx_clone.send(finish).await;
                 });
                 // install the single-owner Executing<->Idle edge
@@ -8401,6 +8446,16 @@ fn now_nanos() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+/// A fixed-order outbound cell for `handle_op` calls in tests that do not
+/// renegotiate the connection byte order mid-stream. Production threads the
+/// read loop's live cell; these tests latch it once to the handler's `order`
+/// so a spawned MONITOR task reads the same order it was given. Defined at
+/// module level so every `#[cfg(test)]` sub-module reaches it via `super::*`.
+#[cfg(test)]
+fn fixed_out_order(order: ByteOrder) -> Arc<std::sync::atomic::AtomicBool> {
+    Arc::new(std::sync::atomic::AtomicBool::new(order.is_big()))
 }
 
 #[cfg(test)]
@@ -9400,6 +9455,7 @@ mod tests {
                 &tx,
                 &mut channels,
                 order,
+                &fixed_out_order(order),
                 kind,
                 &config,
                 &mut encode_cache,
@@ -9493,6 +9549,7 @@ mod tests {
                 &tx,
                 &mut channels,
                 order,
+                &fixed_out_order(order),
                 kind,
                 &config,
                 &mut encode_cache,
@@ -9584,6 +9641,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Get,
             &config,
             &mut encode_cache,
@@ -9999,6 +10057,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Monitor,
             &config,
             &mut encode_cache,
@@ -10232,6 +10291,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Monitor,
             &config,
             &mut encode_cache,
@@ -10257,6 +10317,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Monitor,
             &config,
             &mut encode_cache,
@@ -10361,6 +10422,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Monitor,
             &config,
             &mut encode_cache,
@@ -10385,6 +10447,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Monitor,
             &config,
             &mut encode_cache,
@@ -10487,6 +10550,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Monitor,
             &config,
             &mut encode_cache,
@@ -10584,6 +10648,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Monitor,
             &config,
             &mut encode_cache,
@@ -10624,6 +10689,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Monitor,
             &config,
             &mut encode_cache,
@@ -10646,6 +10712,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Monitor,
             &config,
             &mut encode_cache,
@@ -10668,6 +10735,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Monitor,
             &config,
             &mut encode_cache,
@@ -10770,6 +10838,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Monitor,
             &config,
             &mut encode_cache,
@@ -10822,6 +10891,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Monitor,
             &config,
             &mut encode_cache,
@@ -10874,6 +10944,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Monitor,
             &config,
             &mut encode_cache,
@@ -11063,6 +11134,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Monitor,
             &config,
             &mut encode_cache,
@@ -11140,6 +11212,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Monitor,
             &config,
             &mut encode_cache,
@@ -11217,6 +11290,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Monitor,
             &config,
             &mut encode_cache,
@@ -12388,6 +12462,7 @@ mod tests {
             &tx,
             &mut channels,
             config_order,
+            &fixed_out_order(config_order),
             OpKind::Monitor,
             &config,
             &mut encode_cache,
@@ -12881,6 +12956,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Get,
             &config,
             &mut encode_cache,
@@ -13112,6 +13188,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Put,
             &config,
             &mut encode_cache,
@@ -13148,6 +13225,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Put,
             &config,
             &mut encode_cache,
@@ -13241,6 +13319,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Put,
             &config,
             &mut encode_cache,
@@ -13275,6 +13354,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Put,
             &config,
             &mut encode_cache,
@@ -13381,6 +13461,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Get,
             &config,
             &mut encode_cache,
@@ -13441,6 +13522,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Get,
             &config,
             &mut encode_cache,
@@ -13562,6 +13644,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Get,
             &config,
             &mut encode_cache,
@@ -13584,6 +13667,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Get,
             &config,
             &mut encode_cache,
@@ -13623,6 +13707,7 @@ mod tests {
             &tx,
             &mut empty_channels,
             order,
+            &fixed_out_order(order),
             OpKind::Get,
             &config,
             &mut encode_cache,
@@ -14033,6 +14118,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Put,
             &config,
             &mut encode_cache,
@@ -14074,6 +14160,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Put,
             &config,
             &mut encode_cache,
@@ -16839,6 +16926,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Monitor,
             &config,
             &mut encode_cache,
@@ -16867,6 +16955,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Monitor,
             &config,
             &mut encode_cache,
@@ -17048,6 +17137,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Get,
             &config,
             &mut encode_cache,
@@ -17072,6 +17162,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Get,
             &config,
             &mut encode_cache,
@@ -17159,6 +17250,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Get,
             &config,
             &mut encode_cache,
@@ -17239,6 +17331,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Put,
             &config,
             &mut encode_cache,
@@ -17264,6 +17357,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Put,
             &config,
             &mut encode_cache,
@@ -17319,6 +17413,7 @@ mod tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Get,
             &config,
             &mut encode_cache,
@@ -17853,6 +17948,7 @@ mod r14_tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Get,
             &config,
             &mut encode_cache,
@@ -18113,6 +18209,7 @@ mod bfr15_tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Get,
             &config,
             &mut encode_cache,
@@ -18134,6 +18231,7 @@ mod bfr15_tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Get,
             &config,
             &mut encode_cache,
@@ -18195,6 +18293,7 @@ mod bfr15_tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Put,
             &config,
             &mut encode_cache,
@@ -18215,6 +18314,7 @@ mod bfr15_tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Put,
             &config,
             &mut encode_cache,
@@ -18273,6 +18373,7 @@ mod bfr15_tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Get,
             &config,
             &mut encode_cache,
@@ -18330,6 +18431,7 @@ mod bfr15_tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Get,
             &config,
             &mut encode_cache,
@@ -18356,6 +18458,7 @@ mod bfr15_tests {
             &tx,
             &mut channels,
             order,
+            &fixed_out_order(order),
             OpKind::Get,
             &config,
             &mut encode_cache,

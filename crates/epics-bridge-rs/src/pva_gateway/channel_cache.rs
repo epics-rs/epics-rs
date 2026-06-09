@@ -24,6 +24,7 @@
 //! the (Low) cost of the narrowing.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -620,12 +621,24 @@ struct ChannelEntry {
     /// downstream pvRequest bytes (see [`pv_request_key`]). pva2pva
     /// `ChannelCacheEntry::mon_entries`.
     monitors: HashMap<Vec<u8>, Arc<UpstreamEntry>>,
+    /// Connection-only admission recency for a `has_pv`/`pvconnect` channel
+    /// that connected upstream without opening a monitor. The bool is the
+    /// recency grace, lowered one cleaner tick at a time exactly like
+    /// [`UpstreamEntry::drop_poke`] (`Some(true)` → consume grace,
+    /// `Some(false)` → evict), so a connectionless-probe channel is counted
+    /// in `cacheSize`, charged against the admission cap, and reachable by
+    /// `:drop`/`:flush` until it ages out. pva2pva caches the connected
+    /// channel from `channelFind` so it lives in `entries` and the cleaner
+    /// (`chancache.cpp:166-199`); the actual upstream channel is released by
+    /// the client's own idle reaper. `None` for a pure monitor channel.
+    connection: Option<bool>,
 }
 
 impl ChannelEntry {
     fn new() -> Self {
         Self {
             monitors: HashMap::new(),
+            connection: None,
         }
     }
 
@@ -636,11 +649,14 @@ impl ChannelEntry {
     }
 
     /// `true` once any variant's upstream has delivered ≥1 event (its
-    /// snapshot is populated) — pva2pva per-channel `haveData`.
+    /// snapshot is populated) — pva2pva per-channel `haveData` — or the
+    /// channel was admitted by a successful connection-only probe.
     fn connected(&self) -> bool {
-        self.monitors
-            .values()
-            .any(|e| e.state.read().latest.is_some())
+        self.connection.is_some()
+            || self
+                .monitors
+                .values()
+                .any(|e| e.state.read().latest.is_some())
     }
 
     /// `true` while any variant still holds its `drop_poke` recency grace.
@@ -932,7 +948,7 @@ impl ChannelCache {
                     // The sweep does not consume the poke grace.
                     map.retain(|_, ch| {
                         ch.monitors.retain(|_, e| e.is_retained());
-                        !ch.monitors.is_empty()
+                        !ch.monitors.is_empty() || ch.connection.is_some()
                     });
                 }
                 if is_new_channel && map.len() >= self.max_entries {
@@ -1014,6 +1030,61 @@ impl ChannelCache {
                 Err(e)
             }
         }
+    }
+
+    /// Admit a channel by upstream CONNECTION only (no monitor), routing
+    /// `has_pv` / `pvconnect` admission through the bounded gateway-owned
+    /// cache. Connects through this cache's own client — the same pool the
+    /// monitors and the follow-up GET/PUT/RPC reuse — then records a
+    /// connection admission so the channel is counted in `cacheSize`,
+    /// charged against the admission cap, surfaced in the operator status
+    /// report, and reachable by `:drop`/`:flush`, instead of being a
+    /// connectionless probe that left an untracked `client.inner.channels`
+    /// entry. pva2pva answers `channelFind` from `ChannelCache::lookup`,
+    /// which caches the connected channel (`chancache.cpp:166-199`) rather
+    /// than bypassing the cache; the actual channel lifetime is still owned
+    /// by the client's idle reaper. Returns the resolved upstream address.
+    pub async fn admit_connection(
+        &self,
+        pv_name: &str,
+        connect_timeout: Duration,
+    ) -> GwResult<SocketAddr> {
+        // Channel admission cap (mirrors `lookup_with_request`): only a
+        // brand-new channel may be refused; pre-sweep idle channels the
+        // cleaner would also evict before refusing.
+        {
+            let mut map = self.entries.lock().await;
+            let is_new = !map.contains_key(pv_name);
+            if is_new && map.len() >= self.max_entries {
+                map.retain(|_, ch| {
+                    ch.monitors.retain(|_, e| e.is_retained());
+                    !ch.monitors.is_empty() || ch.connection.is_some()
+                });
+            }
+            if !map.contains_key(pv_name) && map.len() >= self.max_entries {
+                tracing::warn!(
+                    pv = %pv_name,
+                    len = map.len(),
+                    cap = self.max_entries,
+                    "pva-gateway: channel cache full, refusing connection admission"
+                );
+                return Err(GwError::CacheFull(self.max_entries));
+            }
+        }
+        // Connect through the owned client (one-shot, bounded by the
+        // caller's connect timeout exactly as the prior direct `pvconnect`
+        // was). On failure nothing is recorded — the next probe re-resolves.
+        let addr = tokio::time::timeout(connect_timeout, self.client.pvconnect(pv_name))
+            .await
+            .map_err(|_| GwError::UpstreamTimeout(pv_name.to_string()))??;
+        // Record / refresh the connection admission (poked recent).
+        self.entries
+            .lock()
+            .await
+            .entry(pv_name.to_string())
+            .or_insert_with(ChannelEntry::new)
+            .connection = Some(true);
+        Ok(addr)
     }
 
     /// Spawn an upstream monitor task and return a populated
@@ -1365,7 +1436,22 @@ impl ChannelCache {
                 }
                 retained
             });
-            !channel.monitors.is_empty()
+            // Age out a connection-only admission the same one-tick way:
+            // `Some(true)` consumes its grace, `Some(false)` evicts the
+            // marker. A channel with live monitors is retained regardless;
+            // a connection-only channel survives exactly one idle tick.
+            let connection_retained = match channel.connection {
+                Some(true) => {
+                    channel.connection = Some(false);
+                    true
+                }
+                Some(false) => {
+                    channel.connection = None;
+                    false
+                }
+                None => false,
+            };
+            !channel.monitors.is_empty() || connection_retained
         });
         // pva2pva bumps `cleanerRuns` every sweep and `cleanerDust` by the
         // number of evicted CHANNELS (`chancache.cpp:230-262`,
@@ -1572,6 +1658,25 @@ impl ChannelCache {
             .or_insert_with(ChannelEntry::new)
             .monitors
             .insert(req_key, entry);
+    }
+
+    /// Test-only: insert a synthetic connection-only admission (no monitor
+    /// variant) for `pv_name`, as `admit_connection` would after a
+    /// successful connect — lets accounting tests exercise cacheSize /
+    /// cleanup grace / drop without a live upstream IOC.
+    #[cfg(test)]
+    pub(crate) async fn insert_test_connection(&self, pv_name: &str) {
+        let mut map = self.entries.lock().await;
+        map.entry(pv_name.to_string())
+            .or_insert_with(ChannelEntry::new)
+            .connection = Some(true);
+    }
+
+    /// Test-only: run one cleanup sweep (the periodic cleaner's body) so a
+    /// test can drive idle eviction deterministically.
+    #[cfg(test)]
+    pub(crate) async fn cleanup_tick_for_test(&self) {
+        self.cleanup_tick().await;
     }
 
     /// Test-only: clone the decoded-fanout broadcast sender of `pv_name`'s
@@ -2416,6 +2521,65 @@ mod tests {
             1,
             "dropping a channel removes all its variants"
         );
+    }
+
+    /// A connection-only admission (`has_pv`/`pvconnect` routed through the
+    /// cache) is counted in `cacheSize`, survives exactly one idle cleanup
+    /// tick of grace before ageing out, and is reachable by `drop`/`flush`
+    /// — the accounting half that keeps a connectionless probe's channel
+    /// visible to the operator surface instead of an untracked client entry.
+    #[tokio::test]
+    async fn connection_admission_counts_ages_out_and_drops() {
+        let client = Arc::new(PvaClient::builder().build());
+        let cache = ChannelCache::new(client, Duration::from_secs(60));
+
+        cache.insert_test_connection("CONN:PV").await;
+        assert_eq!(
+            cache.entry_count().await,
+            1,
+            "connection-only admission counts in cacheSize"
+        );
+        // It is reported as a connected channel with zero subscriptions.
+        let status = cache.entry_status(64).await;
+        let row = status
+            .entries
+            .iter()
+            .find(|e| e.pv_name == "CONN:PV")
+            .expect("connection admission has a status row");
+        assert!(row.connected, "a connected probe reports connected");
+        assert_eq!(
+            row.subscriptions, 0,
+            "connection-only channel has no monitors"
+        );
+
+        // One grace tick keeps it; the next idle tick ages it out.
+        cache.cleanup_tick_for_test().await;
+        assert_eq!(
+            cache.entry_count().await,
+            1,
+            "connection admission survives one grace tick"
+        );
+        cache.cleanup_tick_for_test().await;
+        assert_eq!(
+            cache.entry_count().await,
+            0,
+            "idle connection admission ages out on the next tick"
+        );
+
+        // Reachable by drop_entry and flush.
+        cache.insert_test_connection("CONN:PV").await;
+        assert!(
+            cache.drop_entry("CONN:PV").await,
+            "connection admission is droppable by name"
+        );
+        cache.insert_test_connection("A:PV").await;
+        cache.insert_test_connection("B:PV").await;
+        assert_eq!(
+            cache.flush().await,
+            2,
+            "flush removes connection-only admissions"
+        );
+        assert_eq!(cache.entry_count().await, 0);
     }
 
     /// A cache with no invalidator wired (standalone, outside a server)

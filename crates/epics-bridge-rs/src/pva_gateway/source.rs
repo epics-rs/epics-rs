@@ -1155,13 +1155,20 @@ impl ChannelSource for GatewayChannelSource {
         // creates a monitor. Gating admission on the monitor cache made a
         // connectable PV that is slow to (or never does) produce a monitor
         // event look "not found", and poisoned the negative cache on a slow
-        // first frame. `pvconnect` connects the channel without a monitor
-        // (pvxs `Context::connect`); the client's pool reuses the
-        // connection for the GET/PUT/RPC/PROCESS that follow.
-        matches!(
-            tokio::time::timeout(self.connect_timeout, self.cache.client().pvconnect(name)).await,
-            Ok(Ok(_))
-        )
+        // first frame. The connect runs without a monitor (pvxs
+        // `Context::connect`); the client's pool reuses the connection for
+        // the GET/PUT/RPC/PROCESS that follow.
+        //
+        // Route the admission through the gateway-owned cache rather than
+        // calling the client directly, so the connected channel is counted
+        // in `cacheSize`, charged against the admission cap, and reachable
+        // by `:drop`/`:flush` — pva2pva caches the channel from
+        // `channelFind` (`chancache.cpp:166-199`) instead of leaving an
+        // untracked connection.
+        self.cache
+            .admit_connection(name, self.connect_timeout)
+            .await
+            .is_ok()
     }
 
     async fn get_introspection(&self, name: &str) -> Option<FieldDesc> {
@@ -1186,15 +1193,17 @@ impl ChannelSource for GatewayChannelSource {
     /// peers fall back to the shared client (`upstream_client_for` returns
     /// `self.cache.client()`). The credential-free `has_pv` is kept for the
     /// connectionless UDP SEARCH path, which carries no identity.
+    ///
+    /// Admission routes through THAT peer's per-credential cache
+    /// (`upstream_cache_for`, backed by `upstream_client_for`), so the
+    /// connection-only channel counts in that cache's `cacheSize` and is
+    /// reachable by the all-layers `:drop`/`:flush` — the same accounting
+    /// `has_pv` gets on the shared cache.
     async fn has_pv_checked(&self, name: &str, ctx: ChannelContext) -> bool {
-        matches!(
-            tokio::time::timeout(
-                self.connect_timeout,
-                self.upstream_client_for(&ctx).pvconnect(name)
-            )
-            .await,
-            Ok(Ok(_))
-        )
+        self.upstream_cache_for(&ctx)
+            .admit_connection(name, self.connect_timeout)
+            .await
+            .is_ok()
     }
 
     /// descriptor discovery for a credentialed downstream peer

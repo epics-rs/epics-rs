@@ -2007,6 +2007,46 @@ pub fn encode_pv_request_value(req: &PvField, order: ByteOrder) -> Vec<u8> {
     out
 }
 
+/// Extract the `record._options` scalar entries from a decoded pvRequest
+/// VALUE into the `(name, ScalarValue)` pairs
+/// [`MonitorFlow::from_record_options`] consumes. Mirrors the server's
+/// pvRequest navigation (`server_native::tcp::monitor_pipeline_options`):
+/// root → `record` → `_options` → scalar leaves. A request with no
+/// `record._options` structure (a plain monitor) yields an empty list,
+/// which `from_record_options` reads as pipeline-disabled — so a forwarded
+/// gateway request that never asked for a pipeline opens a plain upstream
+/// monitor, matching pvxs.
+fn record_options_from_request(req: &PvField) -> Vec<(String, crate::pvdata::ScalarValue)> {
+    let root = match req {
+        PvField::Structure(s) => s,
+        _ => return Vec::new(),
+    };
+    let record = match root
+        .fields
+        .iter()
+        .find_map(|(k, v)| (k == "record").then_some(v))
+    {
+        Some(PvField::Structure(s)) => s,
+        _ => return Vec::new(),
+    };
+    let options = match record
+        .fields
+        .iter()
+        .find_map(|(k, v)| (k == "_options").then_some(v))
+    {
+        Some(PvField::Structure(s)) => s,
+        _ => return Vec::new(),
+    };
+    options
+        .fields
+        .iter()
+        .filter_map(|(k, v)| match v {
+            PvField::Scalar(sv) => Some((k.clone(), sv.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Raw-frame monitor entry: like [`op_monitor`] but the
 /// callback receives the **raw MONITOR DATA body bytes** (the
 /// `changed | value | overrun` triplet from the wire) instead of a
@@ -2047,7 +2087,7 @@ where
             sid,
             &fields_owned,
             None,
-            pipeline_size,
+            MonitorFlow::window(pipeline_size),
             &mut callback,
             None,
         )
@@ -2126,12 +2166,28 @@ fn spawn_raw_frames_handle<F>(
 where
     F: FnMut(&FieldDesc, bytes::Bytes, ByteOrder) + Send + 'static,
 {
+    // Flow control shares one origin with the wire request: a forwarded
+    // pvRequest's own `record._options.{pipeline,queueSize,ackAny}` drive
+    // the INIT pipeline bit / `nack` trailer and ACK cadence (pvxs
+    // MonitorBuilder::exec, clientmon.cpp:761-808), exactly as the typed
+    // `op_monitor_raw` path. A gateway forwarding a downstream request that
+    // omits `pipeline=true` therefore opens a plain upstream monitor and
+    // sends no ACKs — matching pvxs, whose servers enable pipeline only
+    // from the pvRequest (servermon.cpp:523-552). With no forwarded request
+    // the client's configured window stands (the auto-built request injects
+    // the matching options).
+    let flow = match &pv_request {
+        Some(req) => {
+            MonitorFlow::from_record_options(&record_options_from_request(req), pipeline_size)
+        }
+        None => MonitorFlow::window(pipeline_size),
+    };
     let state = Arc::new(SubscriptionState {
         active: parking_lot::Mutex::new(None),
         paused: std::sync::atomic::AtomicBool::new(false),
         stop: std::sync::atomic::AtomicBool::new(false),
         stats: parking_lot::Mutex::new(SubscriptionStat {
-            limit_queue: pipeline_size,
+            limit_queue: flow.queue_size,
             ..Default::default()
         }),
         cancel: tokio::sync::Notify::new(),
@@ -2166,7 +2222,7 @@ where
                 sid,
                 &fields_owned,
                 pv_request.as_ref(),
-                pipeline_size,
+                flow,
                 &mut callback,
                 Some(state_for_task.clone()),
             )
@@ -2200,7 +2256,7 @@ async fn run_raw_monitor_loop<F>(
     sid: u32,
     fields: &[String],
     pv_request: Option<&PvField>,
-    pipeline_size: u32,
+    flow: MonitorFlow,
     callback: &mut F,
     state: Option<Arc<SubscriptionState>>,
 ) -> Result<(), MonitorEnd>
@@ -2211,52 +2267,47 @@ where
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
-    // when `pipeline_size > 0`, inject
-    // `record._options.pipeline = "true"` + `queueSize` into the
-    // pvRequest and set the MONITOR INIT pipeline bit + initial
-    // nack trailer. Server-side credit window is keyed on the
-    // pvRequest options (pvxs servermon.cpp:523-552); pre-fix Rust
-    // sent the pipeline size on START as a trailer the server never
-    // read.
+    // Flow control and the wire request share one origin. A caller-
+    // supplied pvRequest is encoded verbatim, and `flow` was derived from
+    // that SAME request's `record._options` (see `spawn_raw_frames_handle`
+    // / `record_options_from_request`), so the INIT pipeline bit + `nack`
+    // trailer and the ACK cadence below cannot disagree with the wire
+    // `queueSize`/`pipeline` the server negotiates. Servers enable pipeline
+    // only from the pvRequest (pvxs servermon.cpp:523-552), not the INIT
+    // subcmd bit, so a forwarded request without `pipeline=true` opens a
+    // plain upstream monitor here too. With no caller request the
+    // auto-built pvRequest injects the pipeline options iff `flow.pipeline`
+    // (the client's configured window).
     let refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
-    let pv_req: std::borrow::Cow<'_, [u8]> = if let Some(req) = pv_request {
-        // A caller-supplied pvRequest (e.g. the PVA gateway forwarding a
-        // downstream's MONITOR INIT request so the upstream applies the
-        // same field projection / `_filter` chain) is encoded verbatim
-        // in THIS connection's byte order. Re-encoding per reconnect is
-        // why it is carried as a decoded value, not pre-serialized bytes
-        // (a reconnect may land on a peer of the opposite endianness).
-        // The pipeline INIT bit / nack below stays driven by
-        // `pipeline_size` — the gateway's own upstream credit window for
-        // its `Pauser`-based backpressure — independent of the
-        // downstream's options that the forwarded request also carries.
-        std::borrow::Cow::Owned(encode_pv_request_value(req, order))
-    } else if pipeline_size > 0 {
-        // Empty field list → empty `field {}` sub-structure, which
-        // `request_to_mask` reads as "select the whole structure"
-        // (pv_request.rs `request_field.is_empty()`). Forcing a
-        // `field(value)` here narrowed the default monitor to the
-        // `value` leaf and broke any PV whose top-level descriptor is
-        // not a structure with a `value` member (e.g. a bare-scalar
-        // `SharedPV`): the server rejects `field(value)` with
-        // `RequestMaskError::EmptyMask`.
-        std::borrow::Cow::Owned(crate::pv_request::build_pv_request_pipeline(
-            &refs,
-            pipeline_size,
-            big_endian,
-        ))
-    } else if fields.is_empty() {
-        std::borrow::Cow::Borrowed(sentinel_all_fields())
-    } else {
-        std::borrow::Cow::Owned(build_pv_request_fields(&refs, big_endian))
+    let pv_req: std::borrow::Cow<'_, [u8]> = match pv_request {
+        Some(req) => {
+            // Re-encoded per reconnect (carried as a decoded value, not
+            // pre-serialized bytes) so a reconnect onto an opposite-endian
+            // peer stays correct. pva2pva forwards the serialized
+            // downstream pvRequest verbatim (p2pApp/channel.cpp:157-193).
+            std::borrow::Cow::Owned(encode_pv_request_value(req, order))
+        }
+        None if flow.pipeline => {
+            // Empty field list → empty `field {}` sub-structure, which
+            // `request_to_mask` reads as "select the whole structure"
+            // (pv_request.rs `request_field.is_empty()`). Forcing a
+            // `field(value)` here narrowed the default monitor to the
+            // `value` leaf and broke any PV whose top-level descriptor is
+            // not a structure with a `value` member (e.g. a bare-scalar
+            // `SharedPV`): the server rejects `field(value)` with
+            // `RequestMaskError::EmptyMask`.
+            std::borrow::Cow::Owned(crate::pv_request::build_pv_request_pipeline(
+                &refs,
+                flow.queue_size,
+                big_endian,
+            ))
+        }
+        None if fields.is_empty() => std::borrow::Cow::Borrowed(sentinel_all_fields()),
+        None => std::borrow::Cow::Owned(build_pv_request_fields(&refs, big_endian)),
     };
     let mut stream = server.register_ioid_stream(sid, ioid, Command::Monitor.code());
-    let init_req = codec.build_monitor_init(
-        sid,
-        ioid,
-        &pv_req,
-        (pipeline_size > 0).then_some(pipeline_size),
-    );
+    let init_req =
+        codec.build_monitor_init(sid, ioid, &pv_req, flow.pipeline.then_some(flow.queue_size));
     server
         .send_for_channel(sid, init_req)
         .await
@@ -2411,7 +2462,7 @@ where
                 st.max_events_per_ack = events_since_ack;
             }
         }
-        if pipeline_size > 0 && events_since_ack >= ack_threshold(pipeline_size) {
+        if flow.pipeline && events_since_ack >= flow.ack_at {
             let ack = codec.build_monitor_ack(sid, ioid, events_since_ack);
             if server.send_for_channel(sid, ack).await.is_err() {
                 server.unregister_ioid(ioid);
@@ -5512,6 +5563,82 @@ mod tests {
         assert!(f.pipeline);
         assert_eq!(f.queue_size, 4);
         assert_eq!(f.ack_at, ack_threshold(4));
+    }
+
+    /// Build a decoded pvRequest VALUE carrying `record._options.<pairs>`,
+    /// the shape the gateway forwards into the raw-frame monitor path.
+    fn pv_request_with_options(pairs: &[(&str, PvField)]) -> PvField {
+        use crate::pvdata::PvStructure;
+        let options_value = PvField::Structure(PvStructure {
+            struct_id: String::new(),
+            fields: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+        });
+        let record_value = PvField::Structure(PvStructure {
+            struct_id: String::new(),
+            fields: vec![("_options".to_string(), options_value)],
+        });
+        PvField::Structure(PvStructure {
+            struct_id: String::new(),
+            fields: vec![("record".to_string(), record_value)],
+        })
+    }
+
+    /// The raw-frame monitor path must derive its `MonitorFlow` from the
+    /// forwarded request's own `record._options` — including TYPED values a
+    /// pvxs builder client sends (`Boolean`/`UInt`), not just the parsed
+    /// string form — so the wire pipeline/queueSize and the ACK cadence
+    /// share one origin. `ackAny=75%` of 16 → ackAt 12 (pvxs parity).
+    #[test]
+    fn record_options_from_request_extracts_typed_pipeline_options() {
+        let req = pv_request_with_options(&[
+            ("pipeline", PvField::Scalar(ScalarValue::Boolean(true))),
+            ("queueSize", PvField::Scalar(ScalarValue::UInt(16))),
+            ("ackAny", PvField::Scalar(ScalarValue::String("75%".into()))),
+        ]);
+        let extracted = record_options_from_request(&req);
+        assert_eq!(
+            extracted.len(),
+            3,
+            "all three scalar options must be extracted"
+        );
+        let flow = MonitorFlow::from_record_options(&extracted, 4);
+        assert!(flow.pipeline);
+        assert_eq!(flow.queue_size, 16);
+        assert_eq!(flow.ack_at, 12);
+    }
+
+    /// A forwarded plain monitor request (no `record._options`) must
+    /// extract nothing and derive a plain (non-pipeline) flow — pvxs
+    /// servers enable pipeline only from the pvRequest, so the client must
+    /// not send a `nack` trailer / ACKs the server would ignore.
+    #[test]
+    fn record_options_from_request_plain_request_yields_no_pipeline() {
+        let req = PvField::Structure(crate::pvdata::PvStructure {
+            struct_id: String::new(),
+            fields: vec![],
+        });
+        assert!(record_options_from_request(&req).is_empty());
+        let flow = MonitorFlow::from_record_options(&record_options_from_request(&req), 4);
+        assert!(!flow.pipeline);
+        assert_eq!(flow.queue_size, 0);
+        assert_eq!(flow.ack_at, 0);
+    }
+
+    /// A forwarded request naming `queueSize` but NOT `pipeline` must stay
+    /// plain (pvxs `clientmon.cpp` defaults `pipeline` false): the gateway
+    /// forwarding such a request opens a plain upstream monitor, not a
+    /// pipelined one driven by the client's builder default.
+    #[test]
+    fn record_options_queue_size_without_pipeline_stays_plain() {
+        let req = pv_request_with_options(&[("queueSize", PvField::Scalar(ScalarValue::UInt(16)))]);
+        let extracted = record_options_from_request(&req);
+        assert_eq!(extracted.len(), 1);
+        let flow = MonitorFlow::from_record_options(&extracted, 4);
+        assert!(!flow.pipeline);
+        assert_eq!(flow.queue_size, 0);
     }
 
     fn idle_sub_state() -> Arc<SubscriptionState> {

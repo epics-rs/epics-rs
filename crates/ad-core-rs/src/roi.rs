@@ -226,6 +226,7 @@ mod tests {
             level: 0,
             shuffle: 0,
             compressor: 0,
+            original_data_type: crate::ndarray::NDDataType::UInt8,
         });
         assert!(crop_roi(&arr, &layout, 0, 0, 4, 4).is_err());
     }

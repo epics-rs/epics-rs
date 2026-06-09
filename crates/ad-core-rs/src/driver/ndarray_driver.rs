@@ -1033,6 +1033,7 @@ mod tests {
             level: 0,
             shuffle: 0,
             compressor: 0,
+            original_data_type: crate::ndarray::NDDataType::UInt8,
         });
         arr.attributes.add(NDAttribute {
             name: "bayerPattern".into(),

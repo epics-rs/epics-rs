@@ -324,11 +324,6 @@ impl NDFileWriter for NetcdfWriter {
         let attrs: Vec<AttrData> = array
             .attributes
             .iter()
-            // A compressed frame carries the codec module's internal
-            // type-recovery attribute; C ADCore stores the uncompressed type
-            // in `NDArray::dataType`, not an attribute, so it has no netCDF
-            // counterpart.
-            .filter(|a| !crate::codec::is_internal_attr(&a.name))
             .map(|a| AttrData {
                 name: a.name.clone(),
                 description: a.description.clone(),

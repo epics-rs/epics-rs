@@ -2798,6 +2798,7 @@ mod tests {
             level: 0,
             shuffle: 0,
             compressor: 0,
+            original_data_type: NDDataType::UInt8,
         });
         send_array(handle.array_sender(), Arc::new(compressed));
 

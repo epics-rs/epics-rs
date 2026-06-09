@@ -1460,15 +1460,6 @@ impl Hdf5Writer {
             return;
         }
         for attr in array.attributes.iter() {
-            // A compressed frame carries the codec module's internal
-            // type-recovery attribute; C ADCore stores no such attribute
-            // (NDPluginCodec keeps the type in `NDArray::dataType`), so it
-            // must not become an NDAttributes/ dataset. Skipping it here also
-            // keeps it out of the per-frame value push, which iterates these
-            // datasets by name.
-            if crate::codec::is_internal_attr(&attr.name) {
-                continue;
-            }
             let dt = attr.value.data_type();
             self.attr_datasets
                 .push(AttributeDataset::new(attr.name.clone(), dt));

@@ -1,3 +1,5 @@
+use crate::ndarray::NDDataType;
+
 /// Codec names for compressed NDArray data (matching C++ `NDCodecName`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecName {
@@ -42,7 +44,18 @@ pub fn blosc_comp_name(compressor: i32) -> Option<&'static str> {
         .and_then(|i| BLOSC_COMP_NAMES.get(i).copied())
 }
 
-/// Codec information attached to an NDArray (matching C++ Codec_t).
+/// Codec information attached to a compressed NDArray.
+///
+/// `name`/`level`/`shuffle`/`compressor` mirror C++ `Codec_t` and
+/// `compressed_size` mirrors `NDArray::compressedSize`. `original_data_type`
+/// folds in C++ `NDArray::dataType`, which "holds the data type of the
+/// *uncompressed* data ... used for decompression" (NDPluginCodec.cpp:35-36).
+/// The Rust port's typed [`NDDataBuffer`](crate::ndarray::NDDataBuffer)
+/// collapses to raw bytes (`U8`) once compressed and so can no longer carry the
+/// element type; because a `Codec` exists exactly when an array is compressed,
+/// this field is the single source of truth for the original element type on
+/// every compressed array (set by the codec plugin on compress, read on
+/// decompress).
 #[derive(Debug, Clone)]
 pub struct Codec {
     pub name: CodecName,
@@ -50,6 +63,9 @@ pub struct Codec {
     pub level: i32,
     pub shuffle: i32,
     pub compressor: i32,
+    /// Element type of the uncompressed data (C++ `NDArray::dataType`),
+    /// retained so decompression can rebuild the correctly-typed buffer.
+    pub original_data_type: NDDataType,
 }
 
 #[cfg(test)]
@@ -64,10 +80,12 @@ mod tests {
             level: 0,
             shuffle: 0,
             compressor: 0,
+            original_data_type: NDDataType::UInt16,
         };
         let c2 = c.clone();
         assert_eq!(c2.name, CodecName::LZ4);
         assert_eq!(c2.compressed_size, 1024);
+        assert_eq!(c2.original_data_type, NDDataType::UInt16);
     }
 
     #[test]

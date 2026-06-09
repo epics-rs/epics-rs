@@ -1,7 +1,6 @@
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use ad_core_rs::codec::{Codec, CodecName};
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
@@ -15,46 +14,22 @@ use rust_hdf5::format::messages::filter::{
     FILTER_BLOSC, Filter, FilterPipeline, apply_filters, reverse_filters,
 };
 
-/// Attribute name used to store the original NDDataType ordinal before compression.
-const ATTR_ORIGINAL_DATA_TYPE: &str = "CODEC_ORIGINAL_DATA_TYPE";
-
 /// The original (uncompressed) element type of an NDArray.
 ///
 /// For an uncompressed array this is the buffer's own type. For a compressed
-/// array the buffer holds raw bytes (`UInt8`), so the original type is recovered
-/// from the [`ATTR_ORIGINAL_DATA_TYPE`] attribute the compressor stored
-/// (defaulting to `UInt8` if absent). This is the single owner of that codec
-/// convention, shared by the decompress round-trip and the NTNDArray converter:
-/// the converter needs it to publish `uncompressedSize` and `codec.parameters`
-/// (C `NDDataTypeToScalar[src->dataType]`, ntndArrayConverter.cpp:413-419) since
-/// a compressed array's value union no longer carries the element type.
+/// array the typed buffer has collapsed to raw bytes (`UInt8`), so the original
+/// type is read from [`Codec::original_data_type`], which the codec plugin set
+/// on compress — mirroring C ADCore keeping it in `NDArray::dataType`
+/// (NDPluginCodec.cpp:35-36). Shared by the decompress round-trip and the
+/// NTNDArray converter, which needs it to publish `uncompressedSize` and
+/// `codec.parameters` (C `NDDataTypeToScalar[src->dataType]`,
+/// ntndArrayConverter.cpp:413-419) since a compressed array's value union no
+/// longer carries the element type.
 pub fn original_data_type(array: &NDArray) -> NDDataType {
-    if array.codec.is_none() {
-        return array.data.data_type();
+    match &array.codec {
+        Some(c) => c.original_data_type,
+        None => array.data.data_type(),
     }
-    array
-        .attributes
-        .get(ATTR_ORIGINAL_DATA_TYPE)
-        .and_then(|a| a.value.as_i64())
-        .and_then(|ord| NDDataType::from_ordinal(ord as u8))
-        .unwrap_or(NDDataType::UInt8)
-}
-
-/// True when `name` is a codec-internal carrier attribute — metadata this
-/// module attaches to a compressed NDArray purely to recover the original
-/// element type on the decompress round-trip, because a compressed buffer is
-/// raw bytes that no longer carry it (see [`compress_lz4`] et al.).
-///
-/// Such carriers must never be published as user-visible NDArray attributes.
-/// C ADCore has no counterpart: it keeps the uncompressed element type in the
-/// native `NDArray::dataType` field (NDPluginCodec.cpp:35,70), so a compressed
-/// frame's attribute list — and therefore the NTNDArray `attribute[]`, the
-/// HDF5/NeXus/netCDF attribute records, and any other all-attributes output —
-/// holds only genuine driver/user attributes. Every output boundary that
-/// serializes the whole attribute list filters through this predicate so the
-/// carrier stays internal to the compress/decompress path that owns it.
-pub fn is_internal_attr(name: &str) -> bool {
-    name == ATTR_ORIGINAL_DATA_TYPE
 }
 
 /// Reconstruct an `NDDataBuffer` from raw bytes and a target data type.
@@ -194,15 +169,10 @@ pub fn compress_lz4(src: &NDArray) -> NDArray {
         level: 0,
         shuffle: 0,
         compressor: 0,
+        // The original element type travels in the codec (C `NDArray::dataType`,
+        // NDPluginCodec.cpp:35-36), so decompression can rebuild the buffer.
+        original_data_type,
     });
-
-    // Store original data type so decompression can reconstruct the buffer.
-    arr.attributes.add(NDAttribute::new_static(
-        ATTR_ORIGINAL_DATA_TYPE,
-        "Original NDDataType ordinal before codec compression",
-        NDAttrSource::Driver,
-        NDAttrValue::UInt8(original_data_type as u8),
-    ));
 
     tracing::debug!(
         original_size,
@@ -223,14 +193,9 @@ pub fn decompress_lz4(src: &NDArray) -> Option<NDArray> {
         return None;
     }
     let compressed = src.data.as_u8_slice();
-    // C++ uses LZ4_decompress_fast with known uncompressed size
-    // We need the original size from the codec's compressed_size or data type info
-    let original_type = src
-        .attributes
-        .get(ATTR_ORIGINAL_DATA_TYPE)
-        .and_then(|a| a.value.as_i64())
-        .and_then(|ord| NDDataType::from_ordinal(ord as u8))
-        .unwrap_or(NDDataType::UInt8);
+    // C++ uses LZ4_decompress_fast with a known uncompressed size; the original
+    // element type travels in the codec (C `NDArray::dataType`).
+    let original_type = original_data_type(src);
     let num_elements: usize = src.dims.iter().map(|d| d.size).product();
     let uncompressed_size = num_elements * original_type.element_size();
     let decompressed = decompress(compressed, uncompressed_size).ok()?;
@@ -240,7 +205,6 @@ pub fn decompress_lz4(src: &NDArray) -> Option<NDArray> {
     let mut arr = src.clone();
     arr.data = buffer;
     arr.codec = None;
-    arr.attributes.remove(ATTR_ORIGINAL_DATA_TYPE);
 
     Some(arr)
 }
@@ -286,13 +250,8 @@ pub fn compress_zlib(src: &NDArray) -> NDArray {
         level: ZLIB_DEFAULT_LEVEL as i32,
         shuffle: 0,
         compressor: 0,
+        original_data_type,
     });
-    arr.attributes.add(NDAttribute::new_static(
-        ATTR_ORIGINAL_DATA_TYPE,
-        "Original NDDataType ordinal before codec compression",
-        NDAttrSource::Driver,
-        NDAttrValue::UInt8(original_data_type as u8),
-    ));
 
     tracing::debug!(
         original_size,
@@ -313,12 +272,7 @@ pub fn decompress_zlib(src: &NDArray) -> Option<NDArray> {
     }
     let compressed = src.data.as_u8_slice();
 
-    let original_type = src
-        .attributes
-        .get(ATTR_ORIGINAL_DATA_TYPE)
-        .and_then(|a| a.value.as_i64())
-        .and_then(|ord| NDDataType::from_ordinal(ord as u8))
-        .unwrap_or(NDDataType::UInt8);
+    let original_type = original_data_type(src);
     let num_elements: usize = src.dims.iter().map(|d| d.size).product();
     let uncompressed_size = num_elements * original_type.element_size();
 
@@ -331,7 +285,6 @@ pub fn decompress_zlib(src: &NDArray) -> Option<NDArray> {
     let mut arr = src.clone();
     arr.data = buffer;
     arr.codec = None;
-    arr.attributes.remove(ATTR_ORIGINAL_DATA_TYPE);
     Some(arr)
 }
 
@@ -399,13 +352,8 @@ pub fn compress_lz4hdf5(src: &NDArray) -> NDArray {
         level: 0,
         shuffle: 0,
         compressor: 0,
+        original_data_type: data_type,
     });
-    arr.attributes.add(NDAttribute::new_static(
-        ATTR_ORIGINAL_DATA_TYPE,
-        "Original NDDataType ordinal before codec compression",
-        NDAttrSource::Driver,
-        NDAttrValue::UInt8(data_type as u8),
-    ));
 
     tracing::debug!(
         original_size,
@@ -433,12 +381,7 @@ pub fn decompress_lz4hdf5(src: &NDArray) -> Option<NDArray> {
         return None;
     }
 
-    let original_type = src
-        .attributes
-        .get(ATTR_ORIGINAL_DATA_TYPE)
-        .and_then(|a| a.value.as_i64())
-        .and_then(|ord| NDDataType::from_ordinal(ord as u8))
-        .unwrap_or(NDDataType::UInt8);
+    let original_type = original_data_type(src);
 
     let mut out: Vec<u8> = Vec::with_capacity(total_bytes);
     let mut pos = 12usize;
@@ -473,7 +416,6 @@ pub fn decompress_lz4hdf5(src: &NDArray) -> Option<NDArray> {
     let mut arr = src.clone();
     arr.data = buffer;
     arr.codec = None;
-    arr.attributes.remove(ATTR_ORIGINAL_DATA_TYPE);
     Some(arr)
 }
 
@@ -655,13 +597,8 @@ pub fn compress_bslz4(src: &NDArray) -> NDArray {
         level: 0,
         shuffle: 0,
         compressor: 0,
+        original_data_type: data_type,
     });
-    arr.attributes.add(NDAttribute::new_static(
-        ATTR_ORIGINAL_DATA_TYPE,
-        "Original NDDataType ordinal before codec compression",
-        NDAttrSource::Driver,
-        NDAttrValue::UInt8(data_type as u8),
-    ));
 
     tracing::debug!(
         original_size = raw.len(),
@@ -686,12 +623,7 @@ pub fn decompress_bslz4(src: &NDArray) -> Option<NDArray> {
     let total_bytes = u64::from_be_bytes(buf[0..8].try_into().ok()?) as usize;
     let block_size = u32::from_be_bytes(buf[8..12].try_into().ok()?) as usize;
 
-    let original_type = src
-        .attributes
-        .get(ATTR_ORIGINAL_DATA_TYPE)
-        .and_then(|a| a.value.as_i64())
-        .and_then(|ord| NDDataType::from_ordinal(ord as u8))
-        .unwrap_or(NDDataType::UInt8);
+    let original_type = original_data_type(src);
     let elem_size = original_type.element_size();
     if elem_size == 0 || block_size == 0 || total_bytes % elem_size != 0 {
         return None;
@@ -724,7 +656,6 @@ pub fn decompress_bslz4(src: &NDArray) -> Option<NDArray> {
     let mut arr = src.clone();
     arr.data = buffer;
     arr.codec = None;
-    arr.attributes.remove(ATTR_ORIGINAL_DATA_TYPE);
     Some(arr)
 }
 
@@ -785,6 +716,10 @@ pub fn compress_jpeg(src: &NDArray, quality: u8) -> Option<NDArray> {
         level: 0,
         shuffle: 0,
         compressor: 0,
+        // JPEG input is constrained to UInt8 above; record the source type so
+        // the codec carries the original element type uniformly (C
+        // `NDArray::dataType`, NDPluginCodec.cpp:35-36).
+        original_data_type: src.data.data_type(),
     });
 
     tracing::debug!(
@@ -889,13 +824,8 @@ pub fn compress_blosc(src: &NDArray, config: &BloscConfig) -> NDArray {
     };
 
     let compressed_size = compressed.len();
+    let original_data_type = src.data.data_type();
     let mut arr = src.clone();
-    arr.attributes.add(NDAttribute::new_static(
-        ATTR_ORIGINAL_DATA_TYPE,
-        "Original NDDataType ordinal before codec compression",
-        NDAttrSource::Driver,
-        NDAttrValue::UInt8(src.data.data_type() as u8),
-    ));
     arr.data = NDDataBuffer::U8(compressed);
     arr.codec = Some(Codec {
         name: CodecName::Blosc,
@@ -903,6 +833,7 @@ pub fn compress_blosc(src: &NDArray, config: &BloscConfig) -> NDArray {
         level: 0,
         shuffle: 0,
         compressor: 0,
+        original_data_type,
     });
     arr
 }
@@ -926,19 +857,13 @@ pub fn decompress_blosc(src: &NDArray) -> Option<NDArray> {
 
     let decompressed = reverse_filters(&pipeline, compressed).ok()?;
 
-    let original_type = src
-        .attributes
-        .get(ATTR_ORIGINAL_DATA_TYPE)
-        .and_then(|a| a.value.as_i64())
-        .and_then(|ord| NDDataType::from_ordinal(ord as u8))
-        .unwrap_or(NDDataType::UInt8);
+    let original_type = original_data_type(src);
 
     let buffer = buffer_from_bytes(&decompressed, original_type)?;
 
     let mut arr = src.clone();
     arr.data = buffer;
     arr.codec = None;
-    arr.attributes.remove(ATTR_ORIGINAL_DATA_TYPE);
     Some(arr)
 }
 
@@ -1230,23 +1155,13 @@ mod tests {
         arr
     }
 
+    /// Every compressor must record the original element type STRUCTURALLY in
+    /// `codec.original_data_type` (C `NDArray::dataType`, NDPluginCodec.cpp:35-36)
+    /// and must attach NO carrier attribute, so the attribute list a compressed
+    /// frame carries holds only genuine driver/user attributes at every output
+    /// boundary by construction.
     #[test]
-    fn internal_carrier_attr_is_recognized() {
-        // The carrier the compressors attach is internal and must be
-        // recognizable by the single owning predicate; genuine driver/user
-        // attribute names are not.
-        assert!(is_internal_attr(ATTR_ORIGINAL_DATA_TYPE));
-        assert!(is_internal_attr("CODEC_ORIGINAL_DATA_TYPE"));
-        assert!(!is_internal_attr("ColorMode"));
-        assert!(!is_internal_attr("ArrayCounter"));
-        assert!(!is_internal_attr(""));
-    }
-
-    /// A compressed array must carry the internal type-recovery attribute (so
-    /// the round-trip works), and that attribute must be flagged internal (so
-    /// every all-attributes output boundary drops it).
-    #[test]
-    fn compressors_attach_an_internal_carrier() {
+    fn compressors_record_type_in_codec_not_an_attribute() {
         let mut arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::UInt16);
         if let NDDataBuffer::U16(ref mut v) = arr.data {
             for (i, x) in v.iter_mut().enumerate() {
@@ -1258,13 +1173,20 @@ mod tests {
             compress_zlib(&arr),
             compress_lz4hdf5(&arr),
             compress_bslz4(&arr),
+            compress_blosc(&arr, &BloscConfig::default()),
         ] {
-            let carrier = compressed
-                .attributes
-                .iter()
-                .find(|a| is_internal_attr(&a.name))
-                .expect("compressed array must carry the internal type-recovery attribute");
-            assert_eq!(carrier.name, ATTR_ORIGINAL_DATA_TYPE);
+            assert_eq!(
+                compressed.codec.as_ref().unwrap().original_data_type,
+                NDDataType::UInt16,
+                "the original element type must travel in the codec"
+            );
+            assert!(
+                compressed
+                    .attributes
+                    .get("CODEC_ORIGINAL_DATA_TYPE")
+                    .is_none(),
+                "no codec carrier attribute may be attached to a compressed frame"
+            );
         }
     }
 
@@ -1301,21 +1223,23 @@ mod tests {
 
         let compressed = compress_lz4(&arr);
         assert_eq!(compressed.codec.as_ref().unwrap().name, CodecName::LZ4);
-        // The original data type attribute should be set
-        let dt_attr = compressed.attributes.get(ATTR_ORIGINAL_DATA_TYPE).unwrap();
-        assert_eq!(dt_attr.value, NDAttrValue::UInt8(NDDataType::UInt16 as u8));
+        // The original data type is recorded structurally in the codec.
+        assert_eq!(
+            compressed.codec.as_ref().unwrap().original_data_type,
+            NDDataType::UInt16
+        );
+        // No carrier attribute leaks onto the array.
+        assert!(
+            compressed
+                .attributes
+                .get("CODEC_ORIGINAL_DATA_TYPE")
+                .is_none()
+        );
 
         let decompressed = decompress_lz4(&compressed).unwrap();
         assert!(decompressed.codec.is_none());
         assert_eq!(decompressed.data.data_type(), NDDataType::UInt16);
         assert_eq!(decompressed.data.as_u8_slice(), original_bytes.as_slice());
-        // Attribute should be cleaned up
-        assert!(
-            decompressed
-                .attributes
-                .get(ATTR_ORIGINAL_DATA_TYPE)
-                .is_none()
-        );
     }
 
     #[test]
@@ -1434,15 +1358,13 @@ mod tests {
         let original = arr.data.as_u8_slice().to_vec();
 
         let compressed = compress_bslz4(&arr);
+        assert_eq!(
+            compressed.codec.as_ref().unwrap().original_data_type,
+            NDDataType::UInt16
+        );
         let decompressed = decompress_bslz4(&compressed).unwrap();
         assert_eq!(decompressed.data.data_type(), NDDataType::UInt16);
         assert_eq!(decompressed.data.as_u8_slice(), original.as_slice());
-        assert!(
-            decompressed
-                .attributes
-                .get(ATTR_ORIGINAL_DATA_TYPE)
-                .is_none()
-        );
     }
 
     #[test]
@@ -1641,18 +1563,14 @@ mod tests {
         let original = arr.data.as_u8_slice().to_vec();
 
         let compressed = compress_zlib(&arr);
-        let dt_attr = compressed.attributes.get(ATTR_ORIGINAL_DATA_TYPE).unwrap();
-        assert_eq!(dt_attr.value, NDAttrValue::UInt8(NDDataType::UInt16 as u8));
+        assert_eq!(
+            compressed.codec.as_ref().unwrap().original_data_type,
+            NDDataType::UInt16
+        );
 
         let decompressed = decompress_zlib(&compressed).unwrap();
         assert_eq!(decompressed.data.data_type(), NDDataType::UInt16);
         assert_eq!(decompressed.data.as_u8_slice(), original.as_slice());
-        assert!(
-            decompressed
-                .attributes
-                .get(ATTR_ORIGINAL_DATA_TYPE)
-                .is_none()
-        );
     }
 
     #[test]
@@ -1755,18 +1673,14 @@ mod tests {
         let original = arr.data.as_u8_slice().to_vec();
 
         let compressed = compress_lz4hdf5(&arr);
-        let dt_attr = compressed.attributes.get(ATTR_ORIGINAL_DATA_TYPE).unwrap();
-        assert_eq!(dt_attr.value, NDAttrValue::UInt8(NDDataType::UInt16 as u8));
+        assert_eq!(
+            compressed.codec.as_ref().unwrap().original_data_type,
+            NDDataType::UInt16
+        );
 
         let decompressed = decompress_lz4hdf5(&compressed).unwrap();
         assert_eq!(decompressed.data.data_type(), NDDataType::UInt16);
         assert_eq!(decompressed.data.as_u8_slice(), original.as_slice());
-        assert!(
-            decompressed
-                .attributes
-                .get(ATTR_ORIGINAL_DATA_TYPE)
-                .is_none()
-        );
     }
 
     #[test]

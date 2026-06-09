@@ -348,10 +348,30 @@ impl PvRequestBuilder {
         self
     }
 
-    /// Replace the builder state by parsing a pvRequest string in
-    /// pvxs syntax (`field(a,b)record[pipeline=true]`). Mirrors
-    /// pvxs `RequestBuilder::pvRequest(str)`.
+    /// Replace the builder state by parsing a pvRequest string in the
+    /// **strict pvxs grammar**, exactly as pvxs `RequestBuilder::pvRequest(str)`
+    /// does: pvxs always runs `PVRParser` via `CommonBase::_parse`
+    /// (clientreq.cpp:137-283), which accepts only `field(name,...)`,
+    /// `record[name=value,...]`, and the bare-name shorthand. The lenient
+    /// pvDataCPP `createRequest` extensions — brace member groups
+    /// (`field(v{a,b})`), per-field option brackets
+    /// (`field(v[deadband=abs:1.0])`), and quoted / `:`-bearing option values —
+    /// are rejected here, so a string this method accepts is also accepted by
+    /// pvxs. For the extended pvData filter grammar use
+    /// [`pv_request_lenient`](Self::pv_request_lenient).
     pub fn pv_request(mut self, expr: &str) -> Result<Self, PvRequestParseError> {
+        self.expr = PvRequestExpr::parse_pvxs_compat(expr)?;
+        Ok(self)
+    }
+
+    /// Replace the builder state by parsing a pvRequest string in the lenient
+    /// pvDataCPP `createRequest` extension grammar (brace member groups,
+    /// per-field option brackets, quoted / `:`-bearing option values). This is
+    /// a deliberate superset of pvxs `RequestBuilder::pvRequest(str)` and does
+    /// **not** claim pvxs request-builder parity — use
+    /// [`pv_request`](Self::pv_request) where strict pvxs acceptance is
+    /// required (e.g. anything advertised as pvxs command-line compatible).
+    pub fn pv_request_lenient(mut self, expr: &str) -> Result<Self, PvRequestParseError> {
         self.expr = PvRequestExpr::parse(expr)?;
         Ok(self)
     }
@@ -1721,12 +1741,38 @@ mod tests {
     }
 
     #[test]
-    fn builder_pv_request_accepts_brace_dialect() {
+    fn builder_pv_request_lenient_accepts_brace_dialect() {
         let built = PvRequestBuilder::new()
-            .pv_request("field(value{LMT_l,LTM_h})")
+            .pv_request_lenient("field(value{LMT_l,LTM_h})")
             .expect("parse ok")
             .build();
         assert_eq!(built.fields, ["value.LMT_l", "value.LTM_h"]);
+    }
+
+    #[test]
+    fn builder_pv_request_is_strict_pvxs_grammar() {
+        // pvxs RequestBuilder::pvRequest() always runs PVRParser, which has no
+        // brace member-group syntax, so the strict builder path must reject it.
+        assert!(
+            PvRequestBuilder::new()
+                .pv_request("field(value{LMT_l,LTM_h})")
+                .is_err(),
+            "strict pv_request() must reject the pvDataCPP brace extension"
+        );
+        // Per-field option brackets are likewise a pvDataCPP extension pvxs
+        // rejects during request construction.
+        assert!(
+            PvRequestBuilder::new()
+                .pv_request("field(value[deadband=abs:1.0])")
+                .is_err(),
+            "strict pv_request() must reject per-field option brackets"
+        );
+        // The plain pvxs forms still parse on the strict path.
+        let ok = PvRequestBuilder::new()
+            .pv_request("field(value,alarm.severity)record[pipeline=true]")
+            .expect("strict pvxs form parses")
+            .build();
+        assert_eq!(ok.fields, ["value", "alarm.severity"]);
     }
 
     // ── typed builder vs parsed-text wire descriptor (pvxs

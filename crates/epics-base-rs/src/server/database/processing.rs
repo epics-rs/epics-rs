@@ -52,6 +52,20 @@ fn ca_tsel_time_record(pv: &str) -> Option<&str> {
         .then_some(&pv[..idx])
 }
 
+/// Convert an lset `(seconds_past_epoch, nanos, userTag)` timestamp
+/// triple into the record-side `(SystemTime, userTag)` pair, clamping
+/// seconds/nanos to the valid `Duration` range. Shared by the TSEL
+/// `.TIME` Ca arm and the non-local Db arm — both read a `ca://` `.TIME`
+/// source through `external_link_time` and adopt the result identically.
+fn ext_time_pair((secs, ns, utag): (i64, i32, u64)) -> (std::time::SystemTime, u64) {
+    let secs = secs.max(0) as u64;
+    let ns = (ns.max(0) as u32).min(999_999_999);
+    (
+        std::time::UNIX_EPOCH + std::time::Duration::new(secs, ns),
+        utag,
+    )
+}
+
 /// The source record's put-propagation context for the forward-link tail.
 /// C `processTarget` (dbDbLink.c:460-474) carries `psrc->putf` and
 /// `psrc->ppn` to each target as a unit — the PUTF bit and the put-notify
@@ -528,12 +542,30 @@ impl PvDatabase {
                 // Read the pair as one consistent snapshot per source.
                 let src_time = match &tsel_link {
                     crate::server::record::ParsedLink::Db(link) => {
-                        match self.get_record(&link.record).await {
-                            Some(src) => {
-                                let g = src.read().await;
-                                Some((g.common.time, g.common.utag))
+                        // C `dbInitLink` locality (`dbLink.c:115-130`):
+                        // `TSEL_modified` sets the `TSELisTIME` flag and
+                        // strips `.TIME` BEFORE the DB-vs-CA decision
+                        // (dbLink.c:115-118), so a TSEL `.TIME` link whose
+                        // record is not local still becomes a CA link and
+                        // reads its remote `.TIME` via the CA lset
+                        // `getTimeStampTag`. Local arm reads the source
+                        // record's `(time, utag)`; the non-local arm routes
+                        // `ca://REC` through `external_link_time` (CA
+                        // carries no userTag, so utag is 0) — uniform with
+                        // the `Ca` arm below and the `read_db_link_value`
+                        // read-locality fallback.
+                        if self.has_name_no_resolve(&link.record).await {
+                            match self.get_record(&link.record).await {
+                                Some(src) => {
+                                    let g = src.read().await;
+                                    Some((g.common.time, g.common.utag))
+                                }
+                                None => None,
                             }
-                            None => None,
+                        } else {
+                            self.external_link_time(&format!("ca://{}", link.record))
+                                .await
+                                .map(ext_time_pair)
                         }
                     }
                     crate::server::record::ParsedLink::Ca(ca) => {
@@ -548,13 +580,7 @@ impl PvDatabase {
                             Some(rec_name) => self
                                 .external_link_time(&format!("ca://{rec_name}"))
                                 .await
-                                .map(|(secs, ns, utag)| {
-                                    let secs = secs.max(0) as u64;
-                                    let ns = (ns.max(0) as u32).min(999_999_999);
-                                    let t =
-                                        std::time::UNIX_EPOCH + std::time::Duration::new(secs, ns);
-                                    (t, utag)
-                                }),
+                                .map(ext_time_pair),
                             None => None,
                         }
                     }

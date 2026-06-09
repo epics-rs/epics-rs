@@ -4579,6 +4579,74 @@ async fn test_tsel_ca_time_link_copies_source_time() {
 }
 
 #[tokio::test]
+async fn test_tsel_nonlocal_db_time_link_copies_remote_time() {
+    // A bare TSEL `.TIME` link (no `ca://`, no CP/CPP/CA modifier) whose
+    // target record is NOT local. C `dbInitLink` (dbLink.c:115-130) sets
+    // `TSELisTIME` and strips `.TIME` BEFORE the DB-vs-CA decision, then
+    // `dbDbInitLink` fails for the non-local target so the link becomes a
+    // CA link — `dbGetTimeStampTag` reads the remote `.TIME`. The pre-fix
+    // Db arm did a local `get_record`, found nothing, and never adopted
+    // the timestamp; the record kept its local processing time.
+    use epics_base_rs::server::database::LinkSet;
+    struct TimeCaLset {
+        secs: i64,
+        nsec: i32,
+    }
+    impl LinkSet for TimeCaLset {
+        fn is_connected(&self, _: &str) -> bool {
+            true
+        }
+        fn get_value(&self, _: &str) -> Option<EpicsValue> {
+            Some(EpicsValue::Double(1.0))
+        }
+        fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
+            // The bare Db record name (`.TIME` already split into the link
+            // field by the parser) reaches the CA lset via the non-local
+            // fallback `external_link_time("ca://TSE_SRC")`.
+            assert_eq!(
+                name, "TSE_SRC",
+                "non-local TSEL .TIME must address the bare record"
+            );
+            Some((self.secs, self.nsec, 0))
+        }
+    }
+
+    let db = PvDatabase::new();
+    db.register_link_set(
+        "ca",
+        Arc::new(TimeCaLset {
+            secs: 1_700_000_123,
+            nsec: 789,
+        }),
+    )
+    .await;
+    // TSE_SRC is never added locally -> the bare Db TSEL .TIME is non-local.
+    db.add_record("TS_NLDST", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    {
+        let rec = db.get_record("TS_NLDST").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.common.tsel = "TSE_SRC.TIME".to_string();
+        inst.parsed_tsel = parse_link_v2(&inst.common.tsel);
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("TS_NLDST", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let rec = db.get_record("TS_NLDST").await.unwrap();
+    let inst = rec.read().await;
+    let expected = std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_123, 789);
+    assert_eq!(
+        inst.common.time, expected,
+        "non-local Db TSEL .TIME link must adopt the remote .TIME via the CA path"
+    );
+    assert_eq!(inst.common.tse, -2, "adopting link time marks TSE=-2");
+}
+
+#[tokio::test]
 async fn test_new_common_fields_get_put() {
     let db = PvDatabase::new();
     db.add_record("REC", Box::new(AoRecord::new(0.0)))

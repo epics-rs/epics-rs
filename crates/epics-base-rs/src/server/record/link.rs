@@ -103,6 +103,37 @@ pub enum ParsedLink {
     Calc(CalcLink),
 }
 
+/// A single JLink option value, preserving the JSON value KIND parsed
+/// from a `{pva:{...}}` longhand option.
+///
+/// pvxs's pvalink JLink callback table dispatches strictly by JSON type:
+/// `pva_parse_null`/`pva_parse_bool`/`pva_parse_integer`/`pva_parse_string`
+/// are wired to distinct slots and the real/double slot is `NULL`
+/// (pvxs `ioc/pvalink_jlif.cpp:286-300`), so JSON reals are unsupported.
+/// Critically, a JSON boolean (`pipeline:true`) and a JSON string
+/// (`pipeline:"yes"`) reach DIFFERENT callbacks and are NOT
+/// interchangeable: a string value on a boolean-only key falls through
+/// `pva_parse_string`'s unknown-key branch and is ignored
+/// (`pvalink_jlif.cpp:189-191`), and a string `proc:"true"` is likewise
+/// ignored because only `CP`/`CPP`/`PP`/`NPP`/empty are recognized
+/// strings (`:156-170`). Collapsing every option to its text form erases
+/// that distinction, so this enum carries the kind through to the pvalink
+/// consumer, which reproduces pvxs's per-type dispatch exactly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JlinkValue {
+    /// JSON `null` — `pva_parse_null` (`proc`→Default, `sevr`→NMS,
+    /// `local`→false; pvalink_jlif.cpp:69-88).
+    Null,
+    /// JSON boolean — `pva_parse_bool` (pvalink_jlif.cpp:90-122).
+    Bool(bool),
+    /// JSON integer — `pva_parse_integer` (`Q`, `monorder`;
+    /// pvalink_jlif.cpp:124-141).
+    Int(i64),
+    /// JSON string — `pva_parse_string` (`pv`, `field`, and the `proc`/
+    /// `sevr` enum strings; pvalink_jlif.cpp:143-197).
+    Str(String),
+}
+
 /// A PVA (`pvalink`) external link parsed from the structured JSON
 /// longhand `{pva:{pv:"name", field:"f", proc:"CP", …}}`.
 ///
@@ -121,10 +152,11 @@ pub struct PvaJsonLink {
     pub pv: String,
     /// Non-`pv` JLink options in source order with original key case
     /// (`field`, `proc`, `sevr`, `Q`, `pipeline`, `time`, `retry`,
-    /// `local`, `atomic`, `monorder`, …). Empty when the map carried
-    /// only `pv` — in that case [`parse_link_v2`] yields a plain
-    /// [`ParsedLink::Pva`] rather than this variant.
-    pub options: Vec<(String, String)>,
+    /// `local`, `atomic`, `monorder`, …) and original JSON value KIND
+    /// ([`JlinkValue`]). Empty when the map carried only `pv` — in that
+    /// case [`parse_link_v2`] yields a plain [`ParsedLink::Pva`] rather
+    /// than this variant.
+    pub options: Vec<(String, JlinkValue)>,
 }
 
 /// Configuration for a `lnkCalc` link.
@@ -520,11 +552,17 @@ fn try_parse_json_link(s: &str) -> Option<ParsedLink> {
 /// from JLink map members (pvalink_jlif.cpp:69-196), matching pvxs,
 /// which has no URI-query parser in its JLink callback table
 /// (pvalink_jlif.cpp:286-300). Key case is preserved so a case-sensitive
-/// key like `Q` survives.
-fn extract_pv_and_opts_from_subobject(body: &str) -> Option<(String, Vec<(String, String)>)> {
+/// key like `Q` survives, AND the JSON value KIND is preserved as a
+/// [`JlinkValue`]: a quoted token is a string, a bare `true`/`false`/
+/// `null` is the JSON keyword, a bare integer is an integer. pvxs
+/// dispatches its pvalink callbacks strictly by this kind
+/// (pvalink_jlif.cpp:286-300), so flattening a bare `pipeline:true` and
+/// a quoted `pipeline:"yes"` to the same text would let Rust honor an
+/// option pvxs ignores.
+fn extract_pv_and_opts_from_subobject(body: &str) -> Option<(String, Vec<(String, JlinkValue)>)> {
     let body = body.trim_start_matches('{').trim_end_matches('}').trim();
     let mut pv: Option<String> = None;
-    let mut opts: Vec<(String, String)> = Vec::new();
+    let mut opts: Vec<(String, JlinkValue)> = Vec::new();
     for entry in body.split(',') {
         let entry = entry.trim();
         if entry.is_empty() {
@@ -537,24 +575,56 @@ fn extract_pv_and_opts_from_subobject(body: &str) -> Option<(String, Vec<(String
         // colon in the entry string).
         let (k, v) = entry.split_once(':')?;
         let k_raw = k.trim().trim_matches('"').trim_matches('\'');
-        let v_raw = v
-            .trim()
-            .trim_matches(',')
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'');
-        if v_raw.is_empty() {
+        // Trim only the trailing entry comma + whitespace. DO NOT strip
+        // the value's quotes here — quote presence is what distinguishes
+        // a JSON string from a bare bool/integer/null, the distinction
+        // pvxs dispatches on (pvalink_jlif.cpp:286-300).
+        let v_trimmed = v.trim().trim_matches(',').trim();
+        if v_trimmed.is_empty() {
             continue;
         }
         if k_raw.eq_ignore_ascii_case("pv") {
-            pv = Some(v_raw.to_string());
-        } else {
-            // Preserve original key case for PvaLinkConfig::parse
-            // (which is case-sensitive for keys like `Q`).
-            opts.push((k_raw.to_string(), v_raw.to_string()));
+            // `pv` is always the channel-name string; strip its quotes.
+            let name = v_trimmed.trim_matches('"').trim_matches('\'');
+            if !name.is_empty() {
+                pv = Some(name.to_string());
+            }
+        } else if let Some(val) = classify_jlink_value(v_trimmed) {
+            // Preserve original key case (case-sensitive for keys like
+            // `Q`) AND the JSON value KIND.
+            opts.push((k_raw.to_string(), val));
         }
     }
     Some((pv?, opts))
+}
+
+/// Classify a raw JLink option value token into its JSON value KIND,
+/// preserving the bool/integer/string distinction pvxs dispatches on
+/// (pvxs `ioc/pvalink_jlif.cpp:286-300`). A quoted token (single or
+/// double quote, the EPICS-relaxed JSON dialect) is a string; the bare
+/// literals `true`/`false`/`null` are the JSON keywords (yajl is
+/// case-sensitive, so only lowercase); a bare integer is an integer.
+/// Anything else bare — a float (which pvxs's `NULL` real callback slot
+/// rejects) or an unquoted word — is kept as a string so the consumer's
+/// per-option validation decides, matching the previous lenient
+/// tokenizer that treated every bare value as text.
+fn classify_jlink_value(raw: &str) -> Option<JlinkValue> {
+    let t = raw.trim();
+    if t.len() >= 2
+        && ((t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')))
+    {
+        return Some(JlinkValue::Str(t[1..t.len() - 1].to_string()));
+    }
+    match t {
+        "" => None,
+        "true" => Some(JlinkValue::Bool(true)),
+        "false" => Some(JlinkValue::Bool(false)),
+        "null" => Some(JlinkValue::Null),
+        _ => match t.parse::<i64>() {
+            Ok(n) => Some(JlinkValue::Int(n)),
+            Err(_) => Some(JlinkValue::Str(t.to_string())),
+        },
+    }
 }
 
 /// Recognize a hardware (`@dev …` / `#Cn Sn`) link. Mirrors epics-base
@@ -915,8 +985,38 @@ mod json_link_tests {
             parse_link_v2(r#"{pva: { pv: "FOO:bar", Q: "4" }}"#),
             ParsedLink::PvaJson(PvaJsonLink {
                 pv: "FOO:bar".to_string(),
-                options: vec![("Q".to_string(), "4".to_string())],
+                // `Q: "4"` is QUOTED, so its kind is a JSON string, not an
+                // integer — the kind survives parsing (pvxs would later
+                // ignore a string `Q`, which only accepts an integer).
+                options: vec![("Q".to_string(), JlinkValue::Str("4".to_string()))],
             })
+        );
+    }
+
+    /// The longhand parser preserves each option's JSON value KIND, the
+    /// distinction pvxs dispatches its pvalink callbacks on
+    /// (pvalink_jlif.cpp:286-300): a bare `true`/`false` is a boolean, a
+    /// bare integer is an integer, a quoted token is a string. A boolean
+    /// and a string spelling of the "same" value are NOT collapsed.
+    #[test]
+    fn json_pva_link_longhand_preserves_value_kind() {
+        let link = parse_link_v2(
+            r#"{pva: {pv: "X:AI", pipeline: true, retry: false, proc: "CP", Q: 4, sevr: true}}"#,
+        );
+        let j = match link {
+            ParsedLink::PvaJson(j) => j,
+            other => panic!("expected PvaJson, got {other:?}"),
+        };
+        assert_eq!(
+            j.options,
+            vec![
+                ("pipeline".to_string(), JlinkValue::Bool(true)),
+                ("retry".to_string(), JlinkValue::Bool(false)),
+                ("proc".to_string(), JlinkValue::Str("CP".to_string())),
+                ("Q".to_string(), JlinkValue::Int(4)),
+                // `sevr: true` is a BOOLEAN, not the string "true".
+                ("sevr".to_string(), JlinkValue::Bool(true)),
+            ]
         );
     }
 
@@ -1210,10 +1310,14 @@ mod json_link_tests {
         assert_eq!(
             j.options,
             vec![
-                ("field".to_string(), "display.precision".to_string()),
-                ("proc".to_string(), "CPP".to_string()),
-                ("sevr".to_string(), "MS".to_string()),
-                ("Q".to_string(), "8".to_string()),
+                (
+                    "field".to_string(),
+                    JlinkValue::Str("display.precision".to_string())
+                ),
+                ("proc".to_string(), JlinkValue::Str("CPP".to_string())),
+                ("sevr".to_string(), JlinkValue::Str("MS".to_string())),
+                // `Q: 8` is a BARE integer — its kind is preserved as Int.
+                ("Q".to_string(), JlinkValue::Int(8)),
             ]
         );
     }

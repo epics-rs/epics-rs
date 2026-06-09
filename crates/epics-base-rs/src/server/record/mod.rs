@@ -11,8 +11,8 @@ pub use crate::server::recgbl::EventMask;
 pub use alarm::{AlarmSeverity, AnalogAlarmConfig};
 pub use common_fields::CommonFields;
 pub use link::{
-    CaLink, CalcLink, DbLink, HwLink, HwLinkKind, LinkAddress, LinkProcessPolicy, LinkType,
-    MonitorSwitch, ParsedLink, PvaJsonLink, link_field_type, parse_link, parse_link_v2,
+    CaLink, CalcLink, DbLink, HwLink, HwLinkKind, JlinkValue, LinkAddress, LinkProcessPolicy,
+    LinkType, MonitorSwitch, ParsedLink, PvaJsonLink, link_field_type, parse_link, parse_link_v2,
     parse_output_link_v2,
 };
 pub use record_instance::{NotifyWaitSet, RecordInstance};

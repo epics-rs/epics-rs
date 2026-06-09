@@ -20,6 +20,7 @@
 use std::sync::Arc;
 
 use epics_base_rs::server::database::{ExternalPvResolver, LinkPutOp, LinkSet, PvDatabase};
+use epics_base_rs::server::record::JlinkValue;
 use epics_base_rs::types::EpicsValue;
 use epics_pva_rs::pvdata::{PvField, ScalarValue};
 
@@ -309,7 +310,7 @@ impl PvaLinkResolver {
     pub async fn open_json_link_for_record(
         &self,
         pv: &str,
-        options: &[(String, String)],
+        options: &[(String, JlinkValue)],
         record: &str,
     ) -> PvaLinkResult<Arc<PvaLink>> {
         let cfg = PvaLinkConfig::from_jlink_options(pv, options, LinkDirection::Inp)?;
@@ -638,7 +639,7 @@ impl PvaLinkResolver {
     pub async fn open_json_out_link(
         &self,
         pv: &str,
-        options: &[(String, String)],
+        options: &[(String, JlinkValue)],
         record: Option<&str>,
     ) -> PvaLinkResult<Arc<PvaLink>> {
         let cfg = PvaLinkConfig::from_jlink_options(pv, options, LinkDirection::Out)?;
@@ -3122,7 +3123,9 @@ mod tests {
         let r = resolver
             .open_json_out_link(
                 "NOT:A:LOCAL:RECORD",
-                &[("local".to_string(), "true".to_string())],
+                // JSON boolean `local:true` — pvxs accepts `local` only as
+                // a boolean (pva_parse_bool), so the kind matters here.
+                &[("local".to_string(), JlinkValue::Bool(true))],
                 None,
             )
             .await;
@@ -3299,11 +3302,11 @@ mod tests {
     /// URI query parser exists in the JLink callback table).
     #[tokio::test]
     async fn br_r10_db_json_pvalink_options_preserved() {
-        use epics_base_rs::server::record::{ParsedLink, PvaJsonLink, parse_link_v2};
+        use epics_base_rs::server::record::{JlinkValue, ParsedLink, PvaJsonLink, parse_link_v2};
 
         // Part 1: the JSON longhand parses to a structured PvaJson link —
         // options as JLink members, in source order with original key
-        // case, never a query string.
+        // case and JSON value KIND, never a query string.
         let json =
             r#"{pva: {pv: "TARGET:AI", field: "display.precision", proc: "CPP", sevr: "MS"}}"#;
         let j = match parse_link_v2(json) {
@@ -3315,9 +3318,12 @@ mod tests {
             PvaJsonLink {
                 pv: "TARGET:AI".to_string(),
                 options: vec![
-                    ("field".to_string(), "display.precision".to_string()),
-                    ("proc".to_string(), "CPP".to_string()),
-                    ("sevr".to_string(), "MS".to_string()),
+                    (
+                        "field".to_string(),
+                        JlinkValue::Str("display.precision".to_string())
+                    ),
+                    ("proc".to_string(), JlinkValue::Str("CPP".to_string())),
+                    ("sevr".to_string(), JlinkValue::Str("MS".to_string())),
                 ],
             },
             "pvalink options preserved as structured JLink members"

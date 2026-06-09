@@ -330,6 +330,8 @@ fn spawn_db_monitor_updates(
                         value: PvField::Structure(poll.value),
                         marked: poll.marked,
                         type_changed: false,
+                        // direct DB poll loop — no lag/loss accounting here, so no overrun
+                        overrun: Vec::new(),
                     };
                     if tx.send(update).await.is_err() {
                         break;

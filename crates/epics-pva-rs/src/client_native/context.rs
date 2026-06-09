@@ -941,9 +941,31 @@ impl PvaClient {
     ///
     /// Mirrors pvxs `Context::close` (client.cpp:422). Idempotent.
     pub fn close(&self) {
-        // Drop channels first so their Arc<ServerConn> drops; this
-        // gives the pool a chance to skip "still-in-use" connections.
-        self.inner.channels.write().clear();
+        // pvxs `ContextImpl::close` (client.cpp:693-718) is the single
+        // owner of terminal teardown: it moves out the channel and
+        // connection maps and runs `Connection::cleanup()` on each
+        // connection, which resets the socket and disconnects every channel
+        // — existing operations are orphaned, not left running on a hidden
+        // circuit. Clearing the maps alone is not enough: a live monitor
+        // handle holds an `Arc<Channel>` and its subscription state holds
+        // `(Arc<ServerConn>, sid, ioid)`, so dropping the maps leaves the
+        // monitor receiving data and the TCP circuit alive until that handle
+        // is separately dropped or the peer disconnects.
+        //
+        // Collect the cached channels under the lock, release it, then
+        // `close()` each so the `set_state(Closed)` transition (which
+        // touches the connection router) never runs while the channel-map
+        // lock is held.
+        let channels: Vec<Arc<Channel>> = {
+            let mut map = self.inner.channels.write();
+            map.drain().map(|(_, ch)| ch).collect()
+        };
+        for ch in channels {
+            ch.close();
+        }
+        // `pool.clear()` closes every pooled connection (waking active
+        // monitor streams via the router drain) before dropping the map and
+        // setting the shutdown gate.
         self.inner.pool.clear();
     }
 

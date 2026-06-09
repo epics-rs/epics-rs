@@ -449,17 +449,29 @@ impl ConnectionPool {
         self.inner.lock().remove(&addr);
     }
 
-    /// Drop every cached connection. The underlying `ServerConn`s live
-    /// only as long as some `Arc` to them is held, so callers should
-    /// already have dropped any operation handles that hold a clone.
-    /// Used by `PvaClient::close` for explicit shutdown. Also flips
-    /// the shutdown flag so any subsequent `get_or_connect` /
-    /// name-server reconnect path returns an error instead of dialing
-    /// out (pvxs 4d12da87205e).
+    /// Terminal teardown: close and drop every cached connection. Used by
+    /// `PvaClient::close` for explicit shutdown. Also flips the shutdown
+    /// flag so any subsequent `get_or_connect` / name-server reconnect path
+    /// returns an error instead of dialing out (pvxs 4d12da87205e).
+    ///
+    /// Each connection is `close()`d, not merely dropped: a live operation
+    /// handle — e.g. a monitor's subscription state, which holds
+    /// `(Arc<ServerConn>, sid, ioid)` — keeps its own `Arc`, so dropping
+    /// the map's `Arc` alone would leave the reader/writer tasks running
+    /// and the monitor receiving data until idle timeout or peer
+    /// disconnect. `close()` cancels the connection token, which drains the
+    /// router (drops every per-ioid sender) so active monitor streams wake
+    /// with `None`. Mirrors pvxs `Connection::cleanup()` resetting the
+    /// socket on context close (clientconn.cpp:176-204).
     pub fn clear(&self) {
         self.shutdown
             .store(true, std::sync::atomic::Ordering::Release);
-        self.inner.lock().clear();
+        // Drain under the lock, then close after releasing it so a
+        // connection teardown can never re-enter the pool while held.
+        let conns: Vec<Arc<ServerConn>> = self.inner.lock().drain().map(|(_, c)| c).collect();
+        for conn in conns {
+            conn.close();
+        }
     }
 
     /// `true` after `clear()` (i.e. after `PvaClient::close`) has run.

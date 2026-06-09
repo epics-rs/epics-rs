@@ -1256,19 +1256,170 @@ fn escape_char_array_for_dbgf(buf: &[u8]) -> String {
     out
 }
 
+/// Split an IOC macro definition string into `(name, value)` pairs the
+/// way libCom `macParseDefns` does (`macUtil.c:74-196`): commas separate
+/// pairs and `=` separates a name from its value, but a separator inside
+/// single/double quotes or escaped with a backslash is a literal, and
+/// unquoted whitespace around names and values is trimmed. A name with
+/// no `=` (e.g. `,FOO,`) is a deletion and yields `None`.
+///
+/// Quotes and escapes are stripped from both the name and the value. C
+/// strips them from names in `macParseDefns` and from values later in
+/// `macExpandString`; this port substitutes the value directly with no
+/// second `macExpandString` pass, so both are stripped here to reach the
+/// same observable substitution.
+fn macro_defn_pairs(s: &str) -> Vec<(String, Option<String>)> {
+    #[derive(PartialEq, Clone, Copy)]
+    enum St {
+        PreName,
+        InName,
+        PreValue,
+        InValue,
+    }
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    let mut state = St::PreName;
+    let mut name = String::new();
+    let mut value = String::new();
+    // Unquoted whitespace seen mid-token: buffered so trailing whitespace
+    // before a delimiter is dropped while interior whitespace is kept.
+    let mut pending_ws = String::new();
+    let mut quote: Option<char> = None;
+
+    // Append a literal char to the token for the current state, entering
+    // the token from a "pre" state if needed and flushing buffered ws.
+    macro_rules! push_lit {
+        ($c:expr) => {{
+            match state {
+                St::PreName => state = St::InName,
+                St::PreValue => state = St::InValue,
+                _ => {}
+            }
+            let target = if matches!(state, St::InName) {
+                &mut name
+            } else {
+                &mut value
+            };
+            target.push_str(&pending_ws);
+            pending_ws.clear();
+            target.push($c);
+        }};
+    }
+
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+
+        // Escape: `\X` makes `X` a literal (and not a delimiter); the
+        // backslash itself is dropped. Quotes do not suppress escapes.
+        if c == '\\' && i + 1 < chars.len() {
+            push_lit!(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+
+        // Inside a quote: every char is literal until the matching quote.
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            } else {
+                push_lit!(c);
+            }
+            i += 1;
+            continue;
+        }
+        if c == '\'' || c == '"' {
+            quote = Some(c);
+            // An opening quote also begins the token (e.g. `=""`).
+            match state {
+                St::PreName => state = St::InName,
+                St::PreValue => state = St::InValue,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+
+        match state {
+            St::PreName => {
+                if c == '=' {
+                    state = St::PreValue;
+                } else if !(c.is_ascii_whitespace() || c == ',') {
+                    state = St::InName;
+                    name.push(c);
+                }
+                // leading whitespace and bare commas: skip
+            }
+            St::InName => {
+                if c == '=' {
+                    pending_ws.clear();
+                    state = St::PreValue;
+                } else if c == ',' {
+                    // name with no '=' → deletion
+                    pending_ws.clear();
+                    out.push((std::mem::take(&mut name), None));
+                    state = St::PreName;
+                } else if c.is_ascii_whitespace() {
+                    pending_ws.push(c);
+                } else {
+                    name.push_str(&pending_ws);
+                    pending_ws.clear();
+                    name.push(c);
+                }
+            }
+            St::PreValue => {
+                if c == ',' {
+                    out.push((std::mem::take(&mut name), Some(String::new())));
+                    state = St::PreName;
+                } else if !c.is_ascii_whitespace() {
+                    state = St::InValue;
+                    value.push(c);
+                }
+                // leading value whitespace: skip
+            }
+            St::InValue => {
+                if c == ',' {
+                    pending_ws.clear();
+                    out.push((std::mem::take(&mut name), Some(std::mem::take(&mut value))));
+                    state = St::PreName;
+                } else if c.is_ascii_whitespace() {
+                    pending_ws.push(c);
+                } else {
+                    value.push_str(&pending_ws);
+                    pending_ws.clear();
+                    value.push(c);
+                }
+            }
+        }
+        i += 1;
+    }
+
+    // Flush the token open at end of string.
+    match state {
+        St::PreName => {}
+        St::InName => out.push((std::mem::take(&mut name), None)),
+        St::PreValue => out.push((std::mem::take(&mut name), Some(String::new()))),
+        St::InValue => out.push((std::mem::take(&mut name), Some(std::mem::take(&mut value)))),
+    }
+    out
+}
+
 /// Parse a macro string like "P=IOC:,R=TEMP" into a HashMap.
 /// Macro values may reference environment variables via `$(ENVVAR)`.
+///
+/// Splitting honors quotes/escapes and trims whitespace via
+/// [`macro_defn_pairs`] so `DESC="a,b",P=IOC:` keeps `a,b` as one value
+/// instead of tearing it on the embedded comma (libCom `macParseDefns`
+/// parity). Deletion entries (a name with no `=`) have nothing to remove
+/// from a fresh map and are skipped.
 pub(super) fn parse_macro_string(s: &str) -> HashMap<String, String> {
     let mut macros = HashMap::new();
-    if s.is_empty() {
-        return macros;
-    }
-    for pair in s.split(',') {
-        if let Some((k, v)) = pair.split_once('=') {
-            macros.insert(
-                k.trim().to_string(),
-                super::registry::substitute_env_vars(v.trim()),
-            );
+    for (k, v) in macro_defn_pairs(s) {
+        if let Some(v) = v {
+            if k.is_empty() {
+                continue;
+            }
+            macros.insert(k, super::registry::substitute_env_vars(&v));
         }
     }
     macros
@@ -1798,5 +1949,36 @@ record(mbbo, "DUP:CM") {{
 
         let empty = parse_macro_string("");
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn parse_macro_string_honors_quotes_escapes_whitespace() {
+        // Quoted comma stays inside the value (macParseDefns parity):
+        // raw split would tear this into `DESC="a` + a stray `b"`.
+        let m = parse_macro_string(r#"DESC="a,b",P=IOC:"#);
+        assert_eq!(m.get("DESC").unwrap(), "a,b");
+        assert_eq!(m.get("P").unwrap(), "IOC:");
+
+        // Escaped comma is a literal; the backslash is dropped.
+        let m = parse_macro_string(r#"DESC=a\,b,P=IOC:"#);
+        assert_eq!(m.get("DESC").unwrap(), "a,b");
+        assert_eq!(m.get("P").unwrap(), "IOC:");
+
+        // Whitespace around names and values is trimmed; quoted names
+        // and quoted/escaped names round-trip.
+        let m = parse_macro_string(r#" P = IOC: , "R" = TEMP "#);
+        assert_eq!(m.get("P").unwrap(), "IOC:");
+        assert_eq!(m.get("R").unwrap(), "TEMP");
+
+        // Quoted whitespace inside a value is preserved.
+        let m = parse_macro_string(r#"MSG="a b c""#);
+        assert_eq!(m.get("MSG").unwrap(), "a b c");
+
+        // A name with no '=' is a deletion: nothing to remove from a
+        // fresh map, and the surrounding assignments still parse.
+        let m = parse_macro_string("A=1,DROP,B=2");
+        assert_eq!(m.get("A").unwrap(), "1");
+        assert_eq!(m.get("B").unwrap(), "2");
+        assert!(!m.contains_key("DROP"));
     }
 }

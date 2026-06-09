@@ -163,11 +163,6 @@ fn ndarray_to_pv_field(array: &NDArray) -> PvField {
     let attribute: Vec<NdAttribute> = array
         .attributes
         .iter()
-        // A compressed frame carries the codec module's internal
-        // type-recovery attribute (CODEC_ORIGINAL_DATA_TYPE); C ADCore keeps
-        // the uncompressed type in `NDArray::dataType`, not an attribute, so
-        // it has no NTNDArray counterpart — keep it out of `attribute[]`.
-        .filter(|a| !crate::codec::is_internal_attr(&a.name))
         .map(|a| NdAttribute {
             name: a.name.clone(),
             value: attribute_value_to_variant(&a.value),
@@ -422,13 +417,12 @@ mod tests {
         );
     }
 
-    /// Regression: the codec module's internal type-recovery carrier
-    /// (`CODEC_ORIGINAL_DATA_TYPE`) must NOT leak into the NTNDArray
-    /// `attribute[]` list. C ADCore keeps the uncompressed element type in the
-    /// native `NDArray::dataType` field (NDPluginCodec.cpp:35,70), never as an
-    /// NDAttribute, so a compressed frame's `attribute[]` holds only genuine
-    /// driver/user attributes. Pre-fix the converter mapped every attribute,
-    /// publishing the Rust-only carrier the compressor attaches.
+    /// Regression: a compressed frame's NTNDArray `attribute[]` must hold only
+    /// genuine driver/user attributes. C ADCore keeps the uncompressed element
+    /// type in the native `NDArray::dataType` field (NDPluginCodec.cpp:35,70),
+    /// never as an NDAttribute; the Rust port records it in
+    /// `Codec::original_data_type`, so the compressor attaches NO carrier
+    /// attribute and the converter maps every attribute through unfiltered.
     #[test]
     fn compressed_frame_attribute_list_omits_codec_carrier() {
         use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
@@ -439,7 +433,7 @@ mod tests {
                 *v = (i * 1000) as u16;
             }
         }
-        // A genuine driver attribute that MUST survive the filter.
+        // A genuine driver attribute that MUST be published.
         arr.attributes.add(NDAttribute::new_static(
             "ColorMode",
             "Color Mode",
@@ -447,14 +441,20 @@ mod tests {
             NDAttrValue::Int32(0),
         ));
 
-        // compress_lz4 attaches the internal CODEC_ORIGINAL_DATA_TYPE carrier.
+        // The compressor records the original type structurally in the codec
+        // and attaches no carrier attribute.
         let compressed = crate::codec::compress_lz4(&arr);
+        assert_eq!(
+            compressed.codec.as_ref().unwrap().original_data_type,
+            NDDataType::UInt16,
+            "precondition: the original element type is recorded in the codec"
+        );
         assert!(
             compressed
                 .attributes
                 .get("CODEC_ORIGINAL_DATA_TYPE")
-                .is_some(),
-            "precondition: the compressor stores the internal carrier on the array"
+                .is_none(),
+            "precondition: no carrier attribute is attached to the array"
         );
 
         let payload = ndarray_to_pv_field(&compressed);

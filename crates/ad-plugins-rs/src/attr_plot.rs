@@ -197,13 +197,6 @@ impl AttrPlotProcessor {
 
         let mut names: Vec<String> = Vec::new();
         for attr in array.attributes.iter() {
-            // The codec module's internal type-recovery carrier on a
-            // compressed frame is numeric, so it would otherwise surface as a
-            // selectable plot attribute; it is not a real driver/user
-            // attribute (C ADCore stores the type in `NDArray::dataType`).
-            if crate::codec::is_internal_attr(&attr.name) {
-                continue;
-            }
             if attr.value.as_f64().is_some() {
                 names.push(attr.name.clone());
             }

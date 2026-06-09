@@ -281,6 +281,10 @@ pub struct DisplayFields {
     pub mdel: f64,
     pub alst: f64,
     pub mlst: f64,
+    /// High operating range (C `motorRecord.dbd` HOPR, DBF_DOUBLE).
+    pub hopr: f64,
+    /// Low operating range (C `motorRecord.dbd` LOPR, DBF_DOUBLE).
+    pub lopr: f64,
 }
 
 impl Default for DisplayFields {
@@ -292,8 +296,41 @@ impl Default for DisplayFields {
             mdel: 0.0,
             alst: 0.0,
             mlst: 0.0,
+            hopr: 0.0,
+            lopr: 0.0,
         }
     }
+}
+
+/// Database-link and menu fields imported from the public C `motorRecord.dbd`
+/// surface (motorRecord.dbd:233-265, 739-760). The link strings hold the
+/// `DBF_INLINK` / `DBF_OUTLINK` specification clients open by C name; `post` is
+/// the `DBF_STRING` post-move command. `omsl` is the `menuOmsl` selector
+/// (0 = supervisory, 1 = closed_loop).
+#[derive(Debug, Clone, Default)]
+pub struct LinkFields {
+    pub out: String,
+    pub rdbl: String,
+    pub dol: String,
+    pub rlnk: String,
+    pub stoo: String,
+    pub dinp: String,
+    pub rinp: String,
+    pub post: String,
+    pub omsl: i16,
+}
+
+/// Alarm-limit fields imported from the public C `motorRecord.dbd` surface
+/// (motorRecord.dbd:396-441). `hhsv` / `llsv` are `menuAlarmSevr` selectors
+/// (0 = NO_ALARM, 1 = MINOR, 2 = MAJOR, 3 = INVALID).
+#[derive(Debug, Clone, Default)]
+pub struct AlarmFields {
+    pub hihi: f64,
+    pub high: f64,
+    pub low: f64,
+    pub lolo: f64,
+    pub hhsv: i16,
+    pub llsv: i16,
 }
 
 /// Timing fields.
@@ -331,6 +368,13 @@ pub struct InternalFields {
     pub lval: f64,
     pub ldvl: f64,
     pub lrvl: i64,
+    /// Last RLV value posted (C `motorRecord.dbd` LRLV, DBF_DOUBLE, SPC_NOMOD).
+    pub lrlv: f64,
+    /// Monitored-field bitmap (C `motorRecord.dbd` MMAP, DBF_ULONG, SPC_NOMOD).
+    pub mmap: i64,
+    /// Non-monitored-field bitmap (C `motorRecord.dbd` NMAP, DBF_ULONG,
+    /// SPC_NOMOD).
+    pub nmap: i64,
     pub lspg: SpmgMode,
     pub sync: bool,
     /// Backlash final move pending after MainMove completes

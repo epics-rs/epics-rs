@@ -18,6 +18,28 @@ use rust_hdf5::format::messages::filter::{
 /// Attribute name used to store the original NDDataType ordinal before compression.
 const ATTR_ORIGINAL_DATA_TYPE: &str = "CODEC_ORIGINAL_DATA_TYPE";
 
+/// The original (uncompressed) element type of an NDArray.
+///
+/// For an uncompressed array this is the buffer's own type. For a compressed
+/// array the buffer holds raw bytes (`UInt8`), so the original type is recovered
+/// from the [`ATTR_ORIGINAL_DATA_TYPE`] attribute the compressor stored
+/// (defaulting to `UInt8` if absent). This is the single owner of that codec
+/// convention, shared by the decompress round-trip and the NTNDArray converter:
+/// the converter needs it to publish `uncompressedSize` and `codec.parameters`
+/// (C `NDDataTypeToScalar[src->dataType]`, ntndArrayConverter.cpp:413-419) since
+/// a compressed array's value union no longer carries the element type.
+pub fn original_data_type(array: &NDArray) -> NDDataType {
+    if array.codec.is_none() {
+        return array.data.data_type();
+    }
+    array
+        .attributes
+        .get(ATTR_ORIGINAL_DATA_TYPE)
+        .and_then(|a| a.value.as_i64())
+        .and_then(|ord| NDDataType::from_ordinal(ord as u8))
+        .unwrap_or(NDDataType::UInt8)
+}
+
 /// Reconstruct an `NDDataBuffer` from raw bytes and a target data type.
 ///
 /// The byte slice is reinterpreted as the target type using native endianness.

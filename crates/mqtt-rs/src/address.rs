@@ -22,11 +22,23 @@ pub enum ValueType {
 
 /// Parsed topic address from a drvInfo string.
 ///
-/// Format: `"FORMAT:TYPE topic/name [json.field.path]"`
+/// Format: `"FORMAT:TYPE topic/name [json field]"`
+///
+/// Grammar follows C `MqttDriver::parseDeviceAddress` (drvMqtt.cpp:64-96):
+/// - **FLAT**: everything after `FORMAT:TYPE ` is the topic (spaces allowed),
+///   `topicName = arguments`.
+/// - **JSON**: the topic is the text before the FIRST whitespace and the JSON
+///   field is the entire remaining suffix (`arguments.substr(spacePos + 1)`),
+///   so a JSON object key may itself contain spaces. A topic containing
+///   spaces is not expressible in the C grammar; this port adds an explicit
+///   quoted-topic extension `FORMAT:TYPE "topic with spaces" field` for that
+///   case only, leaving the reference grammar for unquoted drvInfo intact.
 ///
 /// Examples:
 /// - `"FLAT:INT test/temperature"`
-/// - `"JSON:FLOAT sensors/data humidity.relative"`
+/// - `"JSON:FLOAT sensors/data humidity"`
+/// - `"JSON:STRING device/topic key with spaces"` (field is `key with spaces`)
+/// - `"JSON:FLOAT \"zigbee2mqtt/living room plug\" power"` (quoted topic)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopicAddress {
     pub format: PayloadFormat,
@@ -41,11 +53,10 @@ pub struct TopicAddress {
 impl TopicAddress {
     /// Parse a drvInfo string into a `TopicAddress`.
     ///
-    /// Parsing strategy (supports topics with spaces, e.g. Korean device names):
-    /// - First whitespace-delimited token: `FORMAT:TYPE`
-    /// - **FLAT**: everything after `FORMAT:TYPE ` is the topic
-    /// - **JSON**: last whitespace-delimited token is the json field,
-    ///   everything between FORMAT:TYPE and the last token is the topic
+    /// See the type docs for the grammar. The unquoted JSON form mirrors C
+    /// `parseDeviceAddress` (drvMqtt.cpp:74-92) exactly: first whitespace
+    /// separates the topic from the whole JSON field suffix. The quoted JSON
+    /// form is a port-only extension for topics that contain spaces.
     pub fn parse(drv_info: &str) -> MqttResult<Self> {
         // Split off FORMAT:TYPE (first token)
         let (format_type_str, rest) =
@@ -70,18 +81,40 @@ impl TopicAddress {
                 (rest.to_string(), None)
             }
             PayloadFormat::Json => {
-                // Last token is the json field, everything before is the topic.
-                // JSON field is a dot-separated path (no spaces).
-                let (topic, field) = rest.rsplit_once(char::is_whitespace).ok_or_else(|| {
-                    MqttError::InvalidAddress("JSON format requires 'topic field'".into())
-                })?;
-                let topic = topic.trim_end().to_string();
-                if topic.is_empty() {
-                    return Err(MqttError::InvalidAddress(
-                        "empty topic before JSON field".into(),
-                    ));
+                if let Some(after_open) = rest.strip_prefix('"') {
+                    // Quoted-topic extension: the topic is the text between the
+                    // quotes (spaces allowed), the field is the remainder.
+                    let close = after_open.find('"').ok_or_else(|| {
+                        MqttError::InvalidAddress("unterminated quoted JSON topic".into())
+                    })?;
+                    let topic = after_open[..close].to_string();
+                    if topic.is_empty() {
+                        return Err(MqttError::InvalidAddress("empty quoted JSON topic".into()));
+                    }
+                    let field = after_open[close + 1..].trim();
+                    if field.is_empty() {
+                        return Err(MqttError::InvalidAddress(
+                            "JSON format requires a field after the quoted topic".into(),
+                        ));
+                    }
+                    (topic, Some(field.to_string()))
+                } else {
+                    // C grammar (drvMqtt.cpp:75,86,92): topic is the text before
+                    // the first whitespace; the JSON field is the entire rest of
+                    // the suffix and may itself contain spaces.
+                    let (topic, field) = rest.split_once(char::is_whitespace).ok_or_else(|| {
+                        MqttError::InvalidAddress("JSON format requires 'topic field'".into())
+                    })?;
+                    if topic.is_empty() {
+                        return Err(MqttError::InvalidAddress(
+                            "empty topic before JSON field".into(),
+                        ));
+                    }
+                    if field.is_empty() {
+                        return Err(MqttError::InvalidAddress("empty JSON field".into()));
+                    }
+                    (topic.to_string(), Some(field.to_string()))
                 }
-                (topic, Some(field.to_string()))
             }
         };
 
@@ -123,6 +156,11 @@ impl TopicAddress {
             ValueType::FloatArray => "FLOATARRAY",
         };
         match &self.json_field {
+            // A topic containing spaces is only round-trippable through the
+            // quoted-topic extension; an unquoted topic re-parses C-faithfully.
+            Some(field) if self.topic.contains(char::is_whitespace) => {
+                format!("{fmt}:{typ} \"{}\" {field}", self.topic)
+            }
             Some(field) => format!("{fmt}:{typ} {} {field}", self.topic),
             None => format!("{fmt}:{typ} {}", self.topic),
         }
@@ -225,7 +263,19 @@ mod tests {
     #[test]
     fn parse_json_nested_field() {
         let addr = TopicAddress::parse("JSON:INT sensors/data reading.value").unwrap();
+        assert_eq!(addr.topic, "sensors/data");
         assert_eq!(addr.json_field.as_deref(), Some("reading.value"));
+    }
+
+    // C parity: the JSON field is the entire suffix after the first space, so a
+    // key containing spaces is one literal key matched against the payload
+    // (drvMqtt.cpp:92). The topic is the first token only.
+    #[test]
+    fn parse_json_field_with_spaces() {
+        let addr = TopicAddress::parse("JSON:STRING device/topic key with spaces").unwrap();
+        assert_eq!(addr.format, PayloadFormat::Json);
+        assert_eq!(addr.topic, "device/topic");
+        assert_eq!(addr.json_field.as_deref(), Some("key with spaces"));
     }
 
     #[test]
@@ -283,6 +333,10 @@ mod tests {
     }
 
     // --- Topics with spaces (e.g. Z2M Korean device names) ---
+    //
+    // FLAT topics may contain spaces directly (C `topicName = arguments`).
+    // JSON topics with spaces require the quoted-topic extension, because the
+    // unquoted C grammar reserves whitespace for the topic/field boundary.
 
     #[test]
     fn parse_flat_topic_with_spaces() {
@@ -294,20 +348,35 @@ mod tests {
     }
 
     #[test]
-    fn parse_json_topic_with_spaces() {
-        let addr = TopicAddress::parse("JSON:FLOAT zigbee2mqtt/living room plug power").unwrap();
+    fn parse_json_quoted_topic_with_spaces() {
+        let addr =
+            TopicAddress::parse("JSON:FLOAT \"zigbee2mqtt/living room plug\" power").unwrap();
         assert_eq!(addr.format, PayloadFormat::Json);
         assert_eq!(addr.topic, "zigbee2mqtt/living room plug");
         assert_eq!(addr.json_field.as_deref(), Some("power"));
     }
 
     #[test]
-    fn parse_json_topic_with_spaces_nested_field() {
+    fn parse_json_quoted_topic_nested_field() {
         let addr =
-            TopicAddress::parse("JSON:FLOAT zigbee2mqtt/desk light update.installed_version")
+            TopicAddress::parse("JSON:FLOAT \"zigbee2mqtt/desk light\" update.installed_version")
                 .unwrap();
         assert_eq!(addr.topic, "zigbee2mqtt/desk light");
         assert_eq!(addr.json_field.as_deref(), Some("update.installed_version"));
+    }
+
+    // The unquoted JSON form must NOT absorb topic spaces — that is the C
+    // behavior this port restores: first token is the topic, the rest is field.
+    #[test]
+    fn parse_json_unquoted_splits_at_first_space() {
+        let addr = TopicAddress::parse("JSON:FLOAT zigbee2mqtt/living room plug power").unwrap();
+        assert_eq!(addr.topic, "zigbee2mqtt/living");
+        assert_eq!(addr.json_field.as_deref(), Some("room plug power"));
+    }
+
+    #[test]
+    fn reject_json_unterminated_quoted_topic() {
+        assert!(TopicAddress::parse("JSON:FLOAT \"zigbee2mqtt/living room power").is_err());
     }
 
     #[test]
@@ -322,7 +391,15 @@ mod tests {
         let addr = TopicAddress::parse(original).unwrap();
         assert_eq!(addr.to_drv_info(), original);
 
-        let original = "JSON:INT zigbee2mqtt/bedroom plug device_temperature";
+        // A spaced JSON topic round-trips through the quoted-topic extension.
+        let original = "JSON:INT \"zigbee2mqtt/bedroom plug\" device_temperature";
+        let addr = TopicAddress::parse(original).unwrap();
+        assert_eq!(addr.topic, "zigbee2mqtt/bedroom plug");
+        assert_eq!(addr.json_field.as_deref(), Some("device_temperature"));
+        assert_eq!(addr.to_drv_info(), original);
+
+        // A JSON field containing spaces round-trips unquoted (C grammar).
+        let original = "JSON:STRING device/topic key with spaces";
         let addr = TopicAddress::parse(original).unwrap();
         assert_eq!(addr.to_drv_info(), original);
     }

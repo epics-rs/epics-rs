@@ -82,7 +82,12 @@ fn parse_attributes_xml(
             "EPICS_PV" => {
                 // G10: a CA-monitor task feeds the cell; backend is pluggable.
                 let src = EpicsPvAttributeSource::new(source_str);
-                NDAttribute::new_with_source(name, description, NDAttrSource::EpicsPV, src)
+                NDAttribute::new_with_source(
+                    name,
+                    description,
+                    NDAttrSource::EpicsPV(source_str.to_string()),
+                    src,
+                )
             }
             "PARAM" => {
                 // C++ paramAttribute: optional `addr` (default 0).
@@ -105,12 +110,17 @@ fn parse_attributes_xml(
                 // `param` is the string passed to the function.
                 let func_param = xml_attr(tag, "param").unwrap_or("");
                 let src = FunctionAttributeSource::new(registry.clone(), source_str, func_param);
-                NDAttribute::new_with_source(name, description, NDAttrSource::Function, src)
+                NDAttribute::new_with_source(
+                    name,
+                    description,
+                    NDAttrSource::Function(source_str.to_string()),
+                    src,
+                )
             }
             "CONST" => NDAttribute::new_static(
                 name,
                 description,
-                NDAttrSource::Constant,
+                NDAttrSource::Constant(source_str.to_string()),
                 NDAttrValue::String(source_str.to_string()),
             ),
             other => {
@@ -1120,10 +1130,12 @@ mod tests {
         assert!(matches!(gain.source, NDAttrSource::Param { .. }));
         let comment = drv.attributes().get("Comment").unwrap();
         assert_eq!(comment.value, NDAttrValue::String("hello".into()));
-        assert!(matches!(
-            drv.attributes().get("Temp").unwrap().source,
-            NDAttrSource::EpicsPV
-        ));
+        // C publishes the original XML `source` string verbatim, not a label.
+        assert_eq!(comment.source.source_string(), "hello");
+        assert_eq!(gain.source.source_string(), "GAIN");
+        let temp = drv.attributes().get("Temp").unwrap();
+        assert!(matches!(temp.source, NDAttrSource::EpicsPV(_)));
+        assert_eq!(temp.source.source_string(), "$(P)Temp");
         assert_eq!(
             drv.port_base
                 .get_int32_param(drv.params.attributes_status, 0)

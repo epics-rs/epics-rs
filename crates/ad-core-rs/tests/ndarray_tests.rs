@@ -465,7 +465,7 @@ fn attribute_list_clear() {
         list.add(NDAttribute {
             name: format!("attr_{i}"),
             description: "".into(),
-            source: NDAttrSource::Constant,
+            source: NDAttrSource::Constant(String::new()),
             value: NDAttrValue::Int32(i),
             source_impl: None,
         });
@@ -481,14 +481,14 @@ fn attribute_list_iter() {
     list.add(NDAttribute {
         name: "A".into(),
         description: "".into(),
-        source: NDAttrSource::Constant,
+        source: NDAttrSource::Constant(String::new()),
         value: NDAttrValue::Int32(1),
         source_impl: None,
     });
     list.add(NDAttribute {
         name: "B".into(),
         description: "".into(),
-        source: NDAttrSource::Constant,
+        source: NDAttrSource::Constant(String::new()),
         value: NDAttrValue::String("hello".into()),
         source_impl: None,
     });
@@ -544,11 +544,11 @@ fn attribute_source_types() {
     let const_attr = NDAttribute {
         name: "const_val".into(),
         description: "".into(),
-        source: NDAttrSource::Constant,
+        source: NDAttrSource::Constant(String::new()),
         value: NDAttrValue::UInt8(255),
         source_impl: None,
     };
-    assert_eq!(const_attr.source, NDAttrSource::Constant);
+    assert_eq!(const_attr.source, NDAttrSource::Constant(String::new()));
 }
 
 // ---------------------------------------------------------------------------

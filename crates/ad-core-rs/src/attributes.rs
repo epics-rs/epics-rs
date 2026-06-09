@@ -1,4 +1,11 @@
 /// Source of an NDAttribute value.
+///
+/// C `NDAttribute` keeps the source *string* (`source_`, the constructor
+/// `pSource`) independent of the source *type* (`sourceType_`); the EPICS_PV,
+/// Param, Function, and Const variants each carry their own configured `source`
+/// property (a PV name, asyn drvInfo, function name, or constant string), so the
+/// variant holds that string rather than re-synthesizing it from the type.
+/// See [`NDAttrSource::source_string`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum NDAttrSource {
     Driver,
@@ -6,10 +13,33 @@ pub enum NDAttrSource {
         port_name: String,
         param_name: String,
     },
-    EpicsPV,
-    Function,
-    Constant,
+    /// EPICS PV name (C++ `PVAttribute` `pSource`).
+    EpicsPV(String),
+    /// Registered function name (C++ `functAttribute` `pSource`).
+    Function(String),
+    /// Constant string from the XML `source` property (C++ `NDAttrSourceConst`).
+    Constant(String),
     Undefined,
+}
+
+impl NDAttrSource {
+    /// The original `source` string for this attribute, stored verbatim from
+    /// construction — *not* derived from the source type.
+    ///
+    /// C `NDAttribute` publishes `source_` verbatim from both the NTNDArray and
+    /// netCDF writers (`NDAttribute.cpp:68`, `ntndArrayConverter.cpp:564`).
+    /// Driver-created attributes carry the literal `"Driver"`
+    /// (`NDAttributeList.cpp:73`); a Param attribute's source is its asyn
+    /// drvInfo (the `param_name`); EPICS_PV / Function / Const attributes carry
+    /// their configured XML `source` string.
+    pub fn source_string(&self) -> &str {
+        match self {
+            Self::Driver => "Driver",
+            Self::Param { param_name, .. } => param_name,
+            Self::EpicsPV(s) | Self::Function(s) | Self::Constant(s) => s,
+            Self::Undefined => "",
+        }
+    }
 }
 
 /// Data type tags for NDAttribute values.
@@ -598,14 +628,14 @@ mod tests {
         list.add(NDAttribute {
             name: "A".into(),
             description: "".into(),
-            source: NDAttrSource::Constant,
+            source: NDAttrSource::Constant(String::new()),
             value: NDAttrValue::Int32(1),
             source_impl: None,
         });
         list.add(NDAttribute {
             name: "B".into(),
             description: "".into(),
-            source: NDAttrSource::Constant,
+            source: NDAttrSource::Constant(String::new()),
             value: NDAttrValue::String("hello".into()),
             source_impl: None,
         });
@@ -720,8 +750,12 @@ mod tests {
         let src = std::sync::Arc::new(CountingSource {
             counter: std::sync::atomic::AtomicI32::new(0),
         });
-        let mut attr =
-            NDAttribute::new_with_source("live", "live source", NDAttrSource::Function, src);
+        let mut attr = NDAttribute::new_with_source(
+            "live",
+            "live source",
+            NDAttrSource::Function(String::new()),
+            src,
+        );
         // Constructed value is the first evaluation.
         assert_eq!(attr.value, NDAttrValue::Int32(1));
         attr.update();
@@ -733,8 +767,12 @@ mod tests {
     #[test]
     fn test_static_attribute_update_is_noop() {
         // G10: static (Constant / Driver) attributes are not re-evaluated.
-        let mut attr =
-            NDAttribute::new_static("static", "", NDAttrSource::Constant, NDAttrValue::Int32(42));
+        let mut attr = NDAttribute::new_static(
+            "static",
+            "",
+            NDAttrSource::Constant(String::new()),
+            NDAttrValue::Int32(42),
+        );
         attr.update();
         assert_eq!(attr.value, NDAttrValue::Int32(42));
     }
@@ -769,7 +807,8 @@ mod tests {
             NDAttrValue::Int32(p.parse::<i32>().unwrap_or(0) * 2)
         });
         let src = FunctionAttributeSource::new(registry.clone(), "double", "21");
-        let mut attr = NDAttribute::new_with_source("Doubled", "", NDAttrSource::Function, src);
+        let mut attr =
+            NDAttribute::new_with_source("Doubled", "", NDAttrSource::Function(String::new()), src);
         assert_eq!(attr.value, NDAttrValue::Int32(42));
         attr.update();
         assert_eq!(attr.value, NDAttrValue::Int32(42));
@@ -796,7 +835,7 @@ mod tests {
         list.add(NDAttribute::new_with_source(
             "live",
             "",
-            NDAttrSource::Function,
+            NDAttrSource::Function(String::new()),
             std::sync::Arc::new(CountingSource {
                 counter: std::sync::atomic::AtomicI32::new(0),
             }),
@@ -804,7 +843,7 @@ mod tests {
         list.add(NDAttribute::new_static(
             "frozen",
             "",
-            NDAttrSource::Constant,
+            NDAttrSource::Constant(String::new()),
             NDAttrValue::Int32(7),
         ));
         list.update_values();

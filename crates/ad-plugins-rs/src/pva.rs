@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer};
+use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType};
 use ad_core_rs::ndarray_pool::NDArrayPool;
 use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
 use parking_lot::Mutex;
@@ -102,26 +102,43 @@ impl NDPluginProcess for PvaProcessor {
 // ---------------------------------------------------------------------------
 
 fn ndarray_to_pv_field(array: &NDArray) -> PvField {
-    let value = ndbuffer_to_buffer(&array.data);
-    let element_size = array.data.data_type().element_size() as i64;
-    let num_elements = array.data.len() as i64;
-    let uncompressed_size = num_elements * element_size;
+    // C ADCore's NTNDArray converter (ntndArrayConverter.cpp:396-453) applies a
+    // uniform rule to compressed and uncompressed arrays: `uncompressedSize` is
+    // always the ORIGINAL byte count (NDArrayInfo::totalBytes = nElements *
+    // element size of the original type), and `codec.parameters` always records
+    // the original scalar type (NDDataTypeToScalar[dataType]) so a consumer can
+    // recover it once the value union can no longer carry it. Only the value
+    // union arm, `compressedSize`, and `codec.name` differ by branch: a
+    // compressed array publishes its raw byte stream under `ubyteValue` with the
+    // codec's own `compressedSize`; an uncompressed array uses its type-specific
+    // arm, has an empty `codec.name`, and `compressedSize == dataSize`
+    // (NDArray.h:136).
+    let original_type = crate::codec::original_data_type(array);
+    let num_elements: i64 = if array.dims.is_empty() {
+        0
+    } else {
+        array.dims.iter().map(|d| d.size as i64).product()
+    };
+    let uncompressed_size = num_elements * original_type.element_size() as i64;
+    let codec_parameters = Some(VariantValue::scalar(ScalarValue::Int(
+        nd_data_type_to_scalar(original_type),
+    )));
 
-    let (compressed_size, codec) = match &array.codec {
+    let (value, compressed_size, codec_name) = match &array.codec {
         Some(c) => (
+            NdArrayBuffer::UByte(array.data.as_u8_slice().to_vec()),
             c.compressed_size as i64,
-            NdCodec {
-                name: codec_name_to_string(c.name),
-                parameters: None,
-            },
+            codec_name_to_string(c.name),
         ),
         None => (
+            ndbuffer_to_buffer(&array.data),
             uncompressed_size,
-            NdCodec {
-                name: String::new(),
-                parameters: None,
-            },
+            String::new(),
         ),
+    };
+    let codec = NdCodec {
+        name: codec_name,
+        parameters: codec_parameters,
     };
 
     let dimension: Vec<NdDimension> = array
@@ -161,7 +178,9 @@ fn ndarray_to_pv_field(array: &NDArray) -> PvField {
             // provenance C never emits.
             time_stamp: NdTimeStamp::default(),
             source_type: ndattr_source_type(&a.source),
-            source: ndattr_source_string(&a.source),
+            // C publishes `NDAttribute::getSource()` verbatim
+            // (ntndArrayConverter.cpp:564); never synthesize it from the type.
+            source: a.source.source_string().to_string(),
         })
         .collect();
 
@@ -230,30 +249,38 @@ fn codec_name_to_string(name: ad_core_rs::codec::CodecName) -> String {
     name.as_str().to_string()
 }
 
+/// pvData `ScalarType` int for an NDArray element type — the value C writes into
+/// `codec.parameters` so a consumer can recover the original element type after
+/// decompression (C `NDDataTypeToScalar`, ntndArrayConverter.cpp:25-36). The
+/// pvData ScalarType enum order is pvBoolean=0, pvByte=1, pvShort=2, pvInt=3,
+/// pvLong=4, pvUByte=5, pvUShort=6, pvUInt=7, pvULong=8, pvFloat=9, pvDouble=10.
+fn nd_data_type_to_scalar(dt: NDDataType) -> i32 {
+    match dt {
+        NDDataType::Int8 => 1,     // pvByte
+        NDDataType::UInt8 => 5,    // pvUByte
+        NDDataType::Int16 => 2,    // pvShort
+        NDDataType::UInt16 => 6,   // pvUShort
+        NDDataType::Int32 => 3,    // pvInt
+        NDDataType::UInt32 => 7,   // pvUInt
+        NDDataType::Int64 => 4,    // pvLong
+        NDDataType::UInt64 => 8,   // pvULong
+        NDDataType::Float32 => 9,  // pvFloat
+        NDDataType::Float64 => 10, // pvDouble
+    }
+}
+
+/// `sourceType` field for the NTNDArray attribute — the raw `NDAttrSource_t`
+/// enum int that C writes verbatim (`ntndArrayConverter.cpp:566-567`,
+/// enum order `NDAttribute.h:62-68`).
 fn ndattr_source_type(src: &ad_core_rs::attributes::NDAttrSource) -> i32 {
     use ad_core_rs::attributes::NDAttrSource;
     match src {
         NDAttrSource::Driver => 0,
         NDAttrSource::Param { .. } => 1,
-        NDAttrSource::EpicsPV => 2,
-        NDAttrSource::Function => 3,
-        NDAttrSource::Constant => 4,
-        NDAttrSource::Undefined => -1,
-    }
-}
-
-fn ndattr_source_string(src: &ad_core_rs::attributes::NDAttrSource) -> String {
-    use ad_core_rs::attributes::NDAttrSource;
-    match src {
-        NDAttrSource::Driver => "driver".into(),
-        NDAttrSource::Param {
-            port_name,
-            param_name,
-        } => format!("{port_name}.{param_name}"),
-        NDAttrSource::EpicsPV => "epics".into(),
-        NDAttrSource::Function => "function".into(),
-        NDAttrSource::Constant => "constant".into(),
-        NDAttrSource::Undefined => String::new(),
+        NDAttrSource::EpicsPV(_) => 2,
+        NDAttrSource::Function(_) => 3,
+        NDAttrSource::Constant(_) => 4,
+        NDAttrSource::Undefined => 5,
     }
 }
 
@@ -310,6 +337,86 @@ mod tests {
         }
     }
 
+    /// Regression for the compressed NTNDArray wire contract.
+    ///
+    /// C ADCore's NTNDArray converter publishes a compressed array as a distinct
+    /// wire shape (ntndArrayConverter.cpp:407-453): the compressed byte stream
+    /// goes out under `value.ubyteValue` with `compressedSize` bytes,
+    /// `uncompressedSize` stays the ORIGINAL uncompressed byte count, and
+    /// `codec.parameters` holds the original scalar type
+    /// (`NDDataTypeToScalar[dataType]`, pvUShort=6 for UInt16) because the value
+    /// union selector is now ubyte. Pre-fix Rust chose the union arm before
+    /// checking the codec, so a compressed UInt16 array stayed `ushortValue`
+    /// with a length/type taken from the compressed byte buffer and a null
+    /// `codec.parameters`.
+    #[test]
+    fn compressed_array_emits_ubyte_value_and_codec_parameters() {
+        let mut arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::UInt16);
+        if let NDDataBuffer::U16(ref mut buf) = arr.data {
+            for (i, v) in buf.iter_mut().enumerate() {
+                *v = (i * 1000) as u16;
+            }
+        }
+        let uncompressed_bytes = (arr.data.len() * 2) as i64; // 8 elems * 2 bytes
+
+        let compressed = crate::codec::compress_lz4(&arr);
+        let comp_size = compressed.codec.as_ref().unwrap().compressed_size as i64;
+        assert!(
+            matches!(compressed.data, NDDataBuffer::U8(_)),
+            "compressed buffer must hold raw bytes"
+        );
+
+        let payload = ndarray_to_pv_field(&compressed);
+        let PvField::Structure(s) = &payload else {
+            panic!("expected structure, got {payload:?}");
+        };
+
+        // value must be the ubyteValue union arm with exactly compressed_size bytes.
+        let Some(PvField::Union {
+            variant_name,
+            value,
+            ..
+        }) = s.get_field("value")
+        else {
+            panic!("expected value union");
+        };
+        assert_eq!(variant_name, "ubyteValue");
+        match value.as_ref() {
+            PvField::ScalarArray(items) => {
+                assert_eq!(items.len() as i64, comp_size);
+                assert!(matches!(items.first(), Some(ScalarValue::UByte(_))));
+            }
+            other => panic!("expected ubyte scalar array, got {other:?}"),
+        }
+
+        assert_eq!(
+            s.get_field("compressedSize"),
+            Some(&PvField::Scalar(ScalarValue::Long(comp_size)))
+        );
+        // uncompressedSize is the ORIGINAL byte count, not the compressed length.
+        assert_eq!(
+            s.get_field("uncompressedSize"),
+            Some(&PvField::Scalar(ScalarValue::Long(uncompressed_bytes)))
+        );
+
+        let Some(PvField::Structure(codec)) = s.get_field("codec") else {
+            panic!("expected codec structure");
+        };
+        assert_eq!(
+            codec.get_field("name"),
+            Some(&PvField::Scalar(ScalarValue::String("lz4".into())))
+        );
+        // codec.parameters carries the original scalar type: pvUShort = 6.
+        let Some(PvField::Variant(params)) = codec.get_field("parameters") else {
+            panic!("expected codec.parameters variant");
+        };
+        assert_eq!(params.value, PvField::Scalar(ScalarValue::Int(6)));
+        assert!(
+            params.desc.is_some(),
+            "codec.parameters must carry a descriptor (non-null variant)"
+        );
+    }
+
     /// Regression R0604-BRQSRV-NATIVE-PVA-BAD-POST-CLEARS-VALUE-1.
     /// A real NDArray frame must match the canonical `nt_nd_array_desc()`
     /// the producer advertises in its handle; otherwise `post` would reject
@@ -339,7 +446,7 @@ mod tests {
         arr.attributes.add(NDAttribute::new_static(
             "gain",
             "detector gain",
-            NDAttrSource::Constant,
+            NDAttrSource::Constant(String::new()),
             NDAttrValue::Int32(7),
         ));
         arr.attributes.add(NDAttribute::new_static(
@@ -401,7 +508,7 @@ mod tests {
         arr.attributes.add(NDAttribute::new_static(
             "gain",
             "detector gain",
-            NDAttrSource::Constant,
+            NDAttrSource::Constant(String::new()),
             NDAttrValue::Int32(7),
         ));
 
@@ -444,6 +551,96 @@ mod tests {
             (0, 0),
             "per-attribute timeStamp must stay default, not the image timestamp"
         );
+    }
+
+    /// Regression for the NTNDArray attribute `source` / `sourceType` contract.
+    ///
+    /// C `NDAttribute` stores the constructor `pSource` verbatim and the
+    /// converter publishes it with `pvAttr->getSubField<PVString>("source")
+    /// ->put(attr->getSource())` (ntndArrayConverter.cpp:564), while
+    /// `sourceType` is the raw `NDAttrSource_t` enum int (NDAttribute.h:62-68:
+    /// Driver=0, Param=1, EPICSPV=2, Funct=3, Const=4, Undefined=5).
+    /// Driver-created attributes carry the literal `"Driver"`
+    /// (NDAttributeList.cpp:73); XML attributes carry their configured `source`
+    /// property (PV name, asyn drvInfo, function name, or constant string). The
+    /// `source` string must never be synthesized from the type.
+    #[test]
+    fn attribute_source_string_and_type_match_c() {
+        use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+
+        let mut arr = NDArray::new(vec![NDDimension::new(2)], NDDataType::UInt8);
+        arr.attributes.add(NDAttribute::new_static(
+            "FromDriver",
+            "driver attr",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(0),
+        ));
+        arr.attributes.add(NDAttribute::new_static(
+            "Counter",
+            "param attr",
+            NDAttrSource::Param {
+                port_name: "SIM1".into(),
+                param_name: "ARRAY_COUNTER".into(),
+            },
+            NDAttrValue::Int32(0),
+        ));
+        arr.attributes.add(NDAttribute::new_static(
+            "Temp",
+            "epics pv attr",
+            NDAttrSource::EpicsPV("13SIM1:cam1:Temperature".into()),
+            NDAttrValue::Float64(0.0),
+        ));
+        arr.attributes.add(NDAttribute::new_static(
+            "Computed",
+            "function attr",
+            NDAttrSource::Function("my_func".into()),
+            NDAttrValue::Int32(0),
+        ));
+        arr.attributes.add(NDAttribute::new_static(
+            "Label",
+            "const attr",
+            NDAttrSource::Constant("a constant".into()),
+            NDAttrValue::String("a constant".into()),
+        ));
+
+        let payload = ndarray_to_pv_field(&arr);
+        let PvField::Structure(s) = &payload else {
+            panic!("expected structure, got {payload:?}");
+        };
+        let Some(PvField::StructureArray(attrs)) = s.get_field("attribute") else {
+            panic!("expected attribute structure-array");
+        };
+        assert_eq!(attrs.len(), 5);
+
+        let src_str = |i: usize| -> String {
+            let a = attrs[i].as_ref().expect("attribute present");
+            match a.get_field("source") {
+                Some(PvField::Scalar(ScalarValue::String(v))) => v.as_str_lossy().into_owned(),
+                other => panic!("expected source string, got {other:?}"),
+            }
+        };
+        let src_type = |i: usize| -> i32 {
+            let a = attrs[i].as_ref().expect("attribute present");
+            match a.get_field("sourceType") {
+                Some(PvField::Scalar(ScalarValue::Int(v))) => *v,
+                other => panic!("expected sourceType int, got {other:?}"),
+            }
+        };
+
+        // Driver: literal "Driver", enum 0 — NOT a lowercase "driver" label.
+        assert_eq!(src_str(0), "Driver");
+        assert_eq!(src_type(0), 0);
+        // Param: the asyn drvInfo verbatim, NOT "{port}.{param}".
+        assert_eq!(src_str(1), "ARRAY_COUNTER");
+        assert_eq!(src_type(1), 1);
+        // EPICS_PV / Function / Const: the configured source string verbatim,
+        // NOT the fixed labels "epics" / "function" / "constant".
+        assert_eq!(src_str(2), "13SIM1:cam1:Temperature");
+        assert_eq!(src_type(2), 2);
+        assert_eq!(src_str(3), "my_func");
+        assert_eq!(src_type(3), 3);
+        assert_eq!(src_str(4), "a constant");
+        assert_eq!(src_type(4), 4);
     }
 
     /// Regression R0604-ADPVA-TIMESTAMP-1.

@@ -492,6 +492,138 @@ pub(crate) static FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         read_only: false,
     },
+    // Public C motorRecord.dbd link / menu surface (motorRecord.dbd:233-265,
+    // 739-760). DBF_INLINK/DBF_OUTLINK fields appear over CA as DBF_STRING (the
+    // link specification); DBF_MENU OMSL appears as the menuOmsl index.
+    FieldDesc {
+        name: "OUT",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "RDBL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DOL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "RLNK",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "STOO",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DINP",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "RINP",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "POST",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "OMSL",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    // Public C motorRecord.dbd alarm-limit / operator-range surface
+    // (motorRecord.dbd:370-441). HHSV/LLSV are menuAlarmSevr indices.
+    FieldDesc {
+        name: "HIHI",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "HIGH",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LOW",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LOLO",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "HHSV",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LLSV",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "HOPR",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LOPR",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    // Public C motorRecord.dbd last-value / monitor-map surface
+    // (motorRecord.dbd:560-595, 675-682, 829-836). All SPC_NOMOD → read-only.
+    FieldDesc {
+        name: "LVAL",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LDVL",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LRVL",
+        dbf_type: DbFieldType::Int64,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "LRLV",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "ALST",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "MLST",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "MMAP",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "NMAP",
+        dbf_type: DbFieldType::Long,
+        read_only: true,
+    },
 ];
 
 pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValue> {
@@ -606,6 +738,35 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "DLY" => Some(EpicsValue::Double(rec.timing.dly)),
         "NTM" => Some(EpicsValue::Short(if rec.timing.ntm { 1 } else { 0 })),
         "NTMF" => Some(EpicsValue::Double(rec.timing.ntmf)),
+        // Public C motorRecord.dbd link / menu / string surface.
+        "OUT" => Some(EpicsValue::String(rec.links.out.clone().into())),
+        "RDBL" => Some(EpicsValue::String(rec.links.rdbl.clone().into())),
+        "DOL" => Some(EpicsValue::String(rec.links.dol.clone().into())),
+        "RLNK" => Some(EpicsValue::String(rec.links.rlnk.clone().into())),
+        "STOO" => Some(EpicsValue::String(rec.links.stoo.clone().into())),
+        "DINP" => Some(EpicsValue::String(rec.links.dinp.clone().into())),
+        "RINP" => Some(EpicsValue::String(rec.links.rinp.clone().into())),
+        "POST" => Some(EpicsValue::String(rec.links.post.clone().into())),
+        "OMSL" => Some(EpicsValue::Short(rec.links.omsl)),
+        // Alarm-limit / operator-range surface.
+        "HIHI" => Some(EpicsValue::Double(rec.alarm.hihi)),
+        "HIGH" => Some(EpicsValue::Double(rec.alarm.high)),
+        "LOW" => Some(EpicsValue::Double(rec.alarm.low)),
+        "LOLO" => Some(EpicsValue::Double(rec.alarm.lolo)),
+        "HHSV" => Some(EpicsValue::Short(rec.alarm.hhsv)),
+        "LLSV" => Some(EpicsValue::Short(rec.alarm.llsv)),
+        "HOPR" => Some(EpicsValue::Double(rec.disp.hopr)),
+        "LOPR" => Some(EpicsValue::Double(rec.disp.lopr)),
+        // Last-value / monitor-map surface (SPC_NOMOD, read-only). LRVL mirrors
+        // RVAL's 64-bit exposure; MMAP/NMAP appear as DBF_LONG over CA.
+        "LVAL" => Some(EpicsValue::Double(rec.internal.lval)),
+        "LDVL" => Some(EpicsValue::Double(rec.internal.ldvl)),
+        "LRVL" => Some(EpicsValue::Int64(rec.internal.lrvl)),
+        "LRLV" => Some(EpicsValue::Double(rec.internal.lrlv)),
+        "ALST" => Some(EpicsValue::Double(rec.disp.alst)),
+        "MLST" => Some(EpicsValue::Double(rec.disp.mlst)),
+        "MMAP" => Some(EpicsValue::Long(rec.internal.mmap as i32)),
+        "NMAP" => Some(EpicsValue::Long(rec.internal.nmap as i32)),
         _ => None,
     }
 }
@@ -1531,7 +1692,97 @@ pub(crate) fn motor_put_field(
             }
             _ => Err(CaError::TypeMismatch(name.into())),
         },
+        // Public C motorRecord.dbd link / string surface. The link string is
+        // stored verbatim (the DBF_INLINK/DBF_OUTLINK specification); behavioral
+        // link processing (closed-loop DOL drive, RDBL readback, RLNK firing) is
+        // not wired here.
+        "OUT" => put_link_string(value, &mut rec.links.out, name),
+        "RDBL" => put_link_string(value, &mut rec.links.rdbl, name),
+        "DOL" => put_link_string(value, &mut rec.links.dol, name),
+        "RLNK" => put_link_string(value, &mut rec.links.rlnk, name),
+        "STOO" => put_link_string(value, &mut rec.links.stoo, name),
+        "DINP" => put_link_string(value, &mut rec.links.dinp, name),
+        "RINP" => put_link_string(value, &mut rec.links.rinp, name),
+        "POST" => put_link_string(value, &mut rec.links.post, name),
+        // menuOmsl: 0 = supervisory, 1 = closed_loop.
+        "OMSL" => match value {
+            EpicsValue::Short(v) => {
+                rec.links.omsl = v.clamp(0, 1);
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        // Alarm-limit / operator-range surface.
+        "HIHI" => match value {
+            EpicsValue::Double(v) => {
+                rec.alarm.hihi = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "HIGH" => match value {
+            EpicsValue::Double(v) => {
+                rec.alarm.high = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "LOW" => match value {
+            EpicsValue::Double(v) => {
+                rec.alarm.low = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "LOLO" => match value {
+            EpicsValue::Double(v) => {
+                rec.alarm.lolo = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        // menuAlarmSevr: 0 = NO_ALARM, 1 = MINOR, 2 = MAJOR, 3 = INVALID.
+        "HHSV" => match value {
+            EpicsValue::Short(v) => {
+                rec.alarm.hhsv = v.clamp(0, 3);
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "LLSV" => match value {
+            EpicsValue::Short(v) => {
+                rec.alarm.llsv = v.clamp(0, 3);
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "HOPR" => match value {
+            EpicsValue::Double(v) => {
+                rec.disp.hopr = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "LOPR" => match value {
+            EpicsValue::Double(v) => {
+                rec.disp.lopr = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
         _ => Err(CaError::FieldNotFound(name.into())),
+    }
+}
+
+/// Store a DBF_INLINK/DBF_OUTLINK specification string verbatim, mirroring how
+/// C `dbPutString` records the link before `recGblInitConstantLink`/resolution.
+fn put_link_string(value: EpicsValue, slot: &mut String, name: &str) -> CaResult<()> {
+    match value {
+        EpicsValue::String(v) => {
+            *slot = v.as_str_lossy().into_owned();
+            Ok(())
+        }
+        _ => Err(CaError::TypeMismatch(name.into())),
     }
 }
 

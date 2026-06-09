@@ -108,6 +108,26 @@ fn mark_raw_body_local_overrun(
     Some(bytes::Bytes::from(out))
 }
 
+/// Lost-leaf paths to record in a cooked [`MonitorUpdate::overrun`] after a
+/// fanout broadcast lag — the decoded-path counterpart of
+/// [`mark_raw_body_local_overrun`]. The cooked gateway fanout re-encodes the
+/// whole value (changed = full selection mask) on every event, so a dropped
+/// intermediate may have moved any leaf; the surviving snapshot's changed
+/// leaves are therefore the value's own leaves. Returning the top-level
+/// field names lets the server's `overrun_bitset` expand them to every leaf
+/// (via `marked_changed_bitset`) and intersect down to the subscriber's
+/// request selection. Mirrors pva2pva unioning the surviving element's
+/// changed leaves into the overrun bitset on downstream overflow —
+/// `overrun |= changed & lastelem->changed`
+/// (epics-base/modules/pva2pva/p2pApp/moncache.cpp:160-168). A non-structure
+/// value (no gateway PV produces one) reports no overrun.
+fn value_overrun_paths(value: &PvField) -> Vec<String> {
+    match value {
+        PvField::Structure(s) => s.fields.iter().map(|(k, _)| k.clone()).collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// one downstream→upstream pause/resume command queued to
 /// the gateway's single watermark applier (spawned in
 /// [`GatewayChannelSource::new`]).
@@ -1005,14 +1025,30 @@ impl GatewayChannelSource {
             // updates-only: the connect-time `initial` snapshot is
             // returned as the SubscriptionSeed seed and emitted by the
             // server, NOT replayed into this stream (double-seed fix).
+            //
+            // Set when this subscriber's broadcast receiver lagged (events
+            // dropped under its own backpressure); the next delivered update
+            // carries the lost leaves in its `overrun` set, parallel to the
+            // raw forwarder's `pending_overrun` / `mark_raw_body_local_overrun`.
+            let mut pending_overrun = false;
             loop {
                 match bcast_rx.recv().await {
-                    Ok(update) => {
+                    Ok(mut update) => {
                         // A `type_changed` boundary is the last event
                         // the decoded stream carries: forward it so the server
                         // emits MONITOR FINISH, then end the forwarder —
                         // mirroring the raw forwarder's `type_changed` return.
                         let is_boundary = update.type_changed;
+                        // After a lag, this surviving snapshot is the coalesced
+                        // element pva2pva would deliver marked overrun
+                        // (moncache.cpp:160-168). Record the lost leaves in the
+                        // cooked `overrun` set so the server encodes them into
+                        // the trailing overrun bitset of the next DATA frame. A
+                        // type-change marker carries no value and is untouched.
+                        if pending_overrun && !is_boundary {
+                            update.overrun = value_overrun_paths(&update.value);
+                            pending_overrun = false;
+                        }
                         if mpsc_tx.send(update).await.is_err() {
                             return;
                         }
@@ -1020,17 +1056,19 @@ impl GatewayChannelSource {
                             return;
                         }
                     }
-                    // Drops under this receiver's backpressure. The raw path
-                    // (default-on, EPICS_PVA_GW_RAW_FRAMES) now marks the
-                    // coalesced body's overrun bitset on lag; the typed
-                    // PvField fan-out cannot — the downstream native server
-                    // encodes a typed monitor with an empty overrun bitset
-                    // (epics-pva-rs server_native/tcp.rs `BitSet::new(); //
-                    // no overruns`) and the `MonitorUpdate` item carries no
-                    // bitset to thread one through. Faithful overrun on the
-                    // typed path needs an epics-pva-rs API that accepts an
-                    // overrun bitset alongside the typed value (cross-crate).
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    // Drops under this receiver's backpressure. pva2pva enters
+                    // overflow and ORs the overrun bitset (moncache.cpp:156-174)
+                    // rather than silently swallowing the loss; the raw
+                    // forwarder mirrors this via `pending_overrun`. The cooked
+                    // path now does the same through `MonitorUpdate.overrun`
+                    // (the decoded-path counterpart of the trailing overrun
+                    // bitset), so a slow downstream client behind
+                    // EPICS_PVA_GW_RAW_FRAMES=NO is no longer served a
+                    // deceptively clean stream that hides the dropped events.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        pending_overrun = true;
+                        continue;
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 }
             }
@@ -3036,6 +3074,79 @@ ASG(DEFAULT) {
         assert!(
             mark_raw_body_local_overrun(&body, &desc, ByteOrder::Little).is_none(),
             "undecodable body falls back to None"
+        );
+    }
+
+    #[test]
+    fn value_overrun_paths_lists_struct_top_fields() {
+        let mut s = epics_pva_rs::pvdata::PvStructure::new("epics:nt/NTScalar:1.0");
+        s.fields.push((
+            "value".to_string(),
+            PvField::Scalar(ScalarValue::Double(1.0)),
+        ));
+        s.fields
+            .push(("alarm".to_string(), PvField::Scalar(ScalarValue::Int(0))));
+        let paths = value_overrun_paths(&PvField::Structure(s));
+        assert_eq!(paths, vec!["value".to_string(), "alarm".to_string()]);
+
+        // A non-structure value reports no overrun (no gateway PV produces one).
+        assert!(value_overrun_paths(&PvField::Scalar(ScalarValue::Double(1.0))).is_empty());
+    }
+
+    /// Cooked/typed fanout parity with the raw path: when a subscriber's
+    /// broadcast receiver lags (its single-slot mpsc backpressure stalls the
+    /// forwarder while the upstream keeps producing), the next delivered
+    /// `MonitorUpdate` must carry the lost leaves in its `overrun` set — so a
+    /// slow downstream behind `EPICS_PVA_GW_RAW_FRAMES=NO` is not served a
+    /// deceptively clean stream (pva2pva moncache.cpp:160-168).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cooked_fanout_marks_overrun_on_subscriber_lag() {
+        let mut src = make_source();
+        // Single-slot subscriber queue: the forwarder buffers one update then
+        // blocks on the second send, so it cannot drain the broadcast and a
+        // burst overflows the entry's broadcast buffer deterministically.
+        src.subscriber_queue = 1;
+        src.cache.insert_test_entry("OV:PV").await;
+        let tx = src.cache.test_broadcast_sender("OV:PV").await;
+
+        let (_seed, mut rx) = src
+            .subscribe_inner(src.cache.clone(), "OV:PV", None)
+            .await
+            .expect("subscribe to parked test entry");
+
+        // Burst far past the broadcast buffer capacity BEFORE draining, so the
+        // stalled forwarder lags and drops intermediate updates.
+        let mk = |v: f64| {
+            let mut s = epics_pva_rs::pvdata::PvStructure::new("epics:nt/NTScalar:1.0");
+            s.fields
+                .push(("value".to_string(), PvField::Scalar(ScalarValue::Double(v))));
+            epics_pva_rs::server_native::MonitorUpdate::from(PvField::Structure(s))
+        };
+        for i in 0..64 {
+            let _ = tx.send(mk(i as f64));
+        }
+
+        // At least one delivered update must carry a non-empty overrun set
+        // naming the lost leaf, proving the lag is no longer silent.
+        let mut saw_overrun = false;
+        for _ in 0..8 {
+            match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+                Ok(Some(u)) if !u.overrun.is_empty() => {
+                    assert!(
+                        u.overrun.iter().any(|p| p == "value"),
+                        "overrun must name the value leaf, got {:?}",
+                        u.overrun
+                    );
+                    saw_overrun = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(
+            saw_overrun,
+            "a post-lag cooked update must carry overrun leaves"
         );
     }
 }

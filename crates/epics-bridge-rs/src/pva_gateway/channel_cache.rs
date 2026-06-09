@@ -1560,6 +1560,11 @@ impl ChannelCache {
             drop_poke: parking_lot::Mutex::new(false),
             pause: PauseControl::new(),
         });
+        // Pre-mark the parked variant connected: store a `first_event`
+        // permit so a `lookup_with_request` resolves it immediately
+        // (`await_first_event` consumes the permit) without a live upstream
+        // IOC ever firing the signal.
+        entry.first_event.notify_one();
         self.entries
             .lock()
             .await
@@ -1567,6 +1572,24 @@ impl ChannelCache {
             .or_insert_with(ChannelEntry::new)
             .monitors
             .insert(req_key, entry);
+    }
+
+    /// Test-only: clone the decoded-fanout broadcast sender of `pv_name`'s
+    /// default (empty-pvRequest) monitor variant, so a test can push
+    /// `MonitorUpdate`s into the fanout and drive subscriber backpressure /
+    /// lag without a live upstream IOC.
+    #[cfg(test)]
+    pub(crate) async fn test_broadcast_sender(
+        &self,
+        pv_name: &str,
+    ) -> broadcast::Sender<MonitorUpdate> {
+        self.entries
+            .lock()
+            .await
+            .get(pv_name)
+            .and_then(|ch| ch.monitors.get(&Vec::new()))
+            .map(|e| e.tx.clone())
+            .expect("default test monitor variant must exist")
     }
 }
 

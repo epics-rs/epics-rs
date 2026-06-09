@@ -217,6 +217,14 @@ bitflags! {
 pub enum TraceFile {
     Stderr,
     Stdout,
+    /// EPICS errlog sink. C asyn maps the trace file pointer `NULL`
+    /// (`fd == 0`, the `<errlog>` token in asynRecord.c:456) to
+    /// `errlogPrintf`, which routes through the central error logger and
+    /// is async-signal safe. This port has no errlog ring buffer, so the
+    /// faithful console behaviour is stderr (errlog's default sink); the
+    /// distinct variant preserves the `<errlog>` routing decision so a
+    /// later errlog wiring need only change this arm.
+    Errlog,
     File(Arc<Mutex<std::fs::File>>),
 }
 
@@ -224,7 +232,7 @@ impl TraceFile {
     /// Write a complete line atomically (single write_all call under lock).
     pub fn write_line(&self, line: &str) {
         match self {
-            TraceFile::Stderr => {
+            TraceFile::Stderr | TraceFile::Errlog => {
                 let _ = std::io::stderr().write_all(line.as_bytes());
             }
             TraceFile::Stdout => {

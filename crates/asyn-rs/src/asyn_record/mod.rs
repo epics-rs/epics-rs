@@ -179,6 +179,26 @@ fn translate_escape(s: &str) -> Vec<u8> {
     out
 }
 
+/// Resolve an asynRecord `TFIL` string to its trace sink, C-faithful per
+/// `asynRecord.c:453-468`: empty and `<stdout>` -> stdout, `<stderr>` ->
+/// stderr, `<errlog>` -> the errlog sink. Any other value is a file path
+/// opened with append semantics (`fopen(.., "a+")`) so an existing trace
+/// log is preserved rather than truncated. The bracketed tokens are the
+/// only special names — a bare `"stdout"`/`"stderr"` is a literal filename,
+/// exactly as in C.
+fn open_trace_file(tfil: &str) -> std::io::Result<TraceFile> {
+    match tfil {
+        "" | "<stdout>" => Ok(TraceFile::Stdout),
+        "<stderr>" => Ok(TraceFile::Stderr),
+        "<errlog>" => Ok(TraceFile::Errlog),
+        path => std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+            .map(|f| TraceFile::File(Arc::new(std::sync::Mutex::new(f)))),
+    }
+}
+
 // ===== AsynRecord =====
 
 /// Full asynRecord with all 67 fields.
@@ -941,21 +961,29 @@ impl AsynRecord {
     }
 
     /// Apply trace file to TraceManager.
-    fn apply_trace_file(&self) {
-        if let Some(ref entry) = self.port_entry {
-            let file = match self.tfil.as_str() {
-                "" | "stderr" => TraceFile::Stderr,
-                "stdout" => TraceFile::Stdout,
-                path => match std::fs::File::create(path) {
-                    Ok(f) => TraceFile::File(Arc::new(std::sync::Mutex::new(f))),
-                    Err(_) => {
-                        eprintln!("asynRecord: cannot open trace file '{path}', using stderr");
-                        TraceFile::Stderr
-                    }
-                },
-            };
-            entry.trace.set_trace_file(Some(&self.port), file);
-        }
+    ///
+    /// C parity: `special`/`asynRecordTFIL` (asynRecord.c:453-480) maps the
+    /// `TFIL` string to a trace sink with the bracketed-token convention —
+    /// empty and `<stdout>` -> stdout, `<stderr>` -> stderr, `<errlog>` ->
+    /// the errlog sink, any other value a file path opened with
+    /// `fopen(.., "a+")` so existing trace logs are appended, not
+    /// truncated. On open failure C reports the error and leaves the
+    /// current trace file unchanged (does not fall back to another sink).
+    /// (The IOC-shell `asynSetTraceFile` uses a different convention —
+    /// bare names, empty -> stderr, `fopen "w"` — handled in `iocsh.rs`.)
+    fn apply_trace_file(&mut self) {
+        let Some(entry) = self.port_entry.clone() else {
+            return;
+        };
+        let tfil = self.tfil.clone();
+        let file = match open_trace_file(&tfil) {
+            Ok(file) => file,
+            Err(e) => {
+                self.errs = format!("Error opening trace file: {tfil}: {e}");
+                return;
+            }
+        };
+        entry.trace.set_trace_file(Some(&self.port), file);
     }
 
     /// Read current trace state from TraceManager into record fields.
@@ -2312,5 +2340,62 @@ mod tests {
         assert_eq!(translate_escape("\\0"), vec![0x00]);
         // A terminator built from two octal escapes (e.g. CR LF).
         assert_eq!(translate_escape("\\015\\012"), vec![0x0D, 0x0A]);
+    }
+
+    #[test]
+    fn test_tfil_special_targets() {
+        // C asynRecord.c:453-461 bracketed-token convention. Empty maps to
+        // stdout (NOT stderr), and only the bracketed names are special.
+        assert!(matches!(open_trace_file("").unwrap(), TraceFile::Stdout));
+        assert!(matches!(
+            open_trace_file("<stdout>").unwrap(),
+            TraceFile::Stdout
+        ));
+        assert!(matches!(
+            open_trace_file("<stderr>").unwrap(),
+            TraceFile::Stderr
+        ));
+        assert!(matches!(
+            open_trace_file("<errlog>").unwrap(),
+            TraceFile::Errlog
+        ));
+    }
+
+    #[test]
+    fn test_tfil_bare_names_are_file_paths() {
+        // C treats a bare "stdout"/"stderr" as a literal filename (only the
+        // bracketed tokens are special). Open them in a temp dir so the
+        // resolved sink is a File, not a console.
+        let dir = std::env::temp_dir().join(format!("asynrec_tfil_bare_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["stdout", "stderr"] {
+            let path = dir.join(name);
+            let p = path.to_str().unwrap();
+            assert!(
+                matches!(open_trace_file(p).unwrap(), TraceFile::File(_)),
+                "bare {name} must resolve to a file path, not a console sink"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tfil_path_appends_not_truncates() {
+        // C opens trace files with fopen(.., "a+"); a second open must keep
+        // earlier content rather than truncating it (File::create did).
+        let path = std::env::temp_dir().join(format!("asynrec_tfil_append_{}", std::process::id()));
+        let p = path.to_str().unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        open_trace_file(p).unwrap().write_line("first\n");
+        // Re-open (as a record re-applying TFIL would) and append more.
+        open_trace_file(p).unwrap().write_line("second\n");
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            contents, "first\nsecond\n",
+            "re-opening a trace file must append, not truncate"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

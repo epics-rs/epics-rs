@@ -679,6 +679,21 @@ impl PvDatabase {
         } else {
             format!("{}.{}", link.record, link.field)
         };
+        // C `dbInitLink` locality (`dbLink.c:118-130`): a target record
+        // not present in this IOC is a CA link, so its write is routed
+        // through the external put path (`dbCaPutLink`), not a local
+        // `dbPut`. The alarm-inheritance / PUTF / `processTarget`
+        // machinery below is the local-DB `dbDbPutValue` body
+        // (dbDbLink.c:372-393), which `dbCaPutLink` performs none of —
+        // so a non-local target returns right after the remote write.
+        // OUTPUT-side twin of the `read_db_link_value` locality fallback.
+        if !self.has_name_no_resolve(&link.record).await {
+            let op = Self::external_put_op(src.notify);
+            if let Err(e) = self.write_external_pv(&target_name, value, op).await {
+                eprintln!("OUT-link write to external PV '{target_name}' failed: {e}");
+            }
+            return;
+        }
         // an OUT-link write-back is an internal step of the
         // processing chain that already holds the entry record's
         // advisory write gate (`dbScanLock` analogue). It must use the
@@ -1809,6 +1824,133 @@ mod out_link_put_fail_tests {
             matches!(db.get_pv("TGT.VAL").await.unwrap(), EpicsValue::Double(v) if v == 0.0),
             "a failed OUT-link write must NOT process the PP target \
              (VAL must stay 0.0, not become 7.0)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod nonlocal_db_link_write_tests {
+    use super::OutLinkSrc;
+    use crate::server::database::{LinkPutOp, LinkSet, PvDatabase};
+    use crate::server::record::{AlarmSeverity, DbLink, LinkProcessPolicy, MonitorSwitch};
+    use crate::server::records::calc::CalcRecord;
+    use crate::types::EpicsValue;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
+    /// A link set that records every `put_value` it receives so a test
+    /// can assert a non-local OUT-link write reached the external (CA)
+    /// put path instead of being dropped by a local `dbPut`.
+    struct RecordingLset {
+        puts: Arc<Mutex<Vec<(String, EpicsValue)>>>,
+    }
+    impl LinkSet for RecordingLset {
+        fn is_connected(&self, _: &str) -> bool {
+            true
+        }
+        fn get_value(&self, _: &str) -> Option<EpicsValue> {
+            None
+        }
+        fn put_value(&self, name: &str, value: EpicsValue, _op: LinkPutOp) -> Result<(), String> {
+            self.puts.lock().unwrap().push((name.to_string(), value));
+            Ok(())
+        }
+    }
+
+    fn out_src(alarm: &super::LinkAlarm) -> OutLinkSrc<'_> {
+        OutLinkSrc {
+            putf: false,
+            notify: None,
+            alarm,
+        }
+    }
+
+    fn no_alarm() -> super::LinkAlarm {
+        super::LinkAlarm {
+            stat: 0,
+            sevr: AlarmSeverity::NoAlarm,
+            amsg: String::new(),
+        }
+    }
+
+    /// A plain OUT link whose target record is NOT local must write
+    /// through the external put path — C `dbPutLink` routes a non-local
+    /// (CA) link's write to `dbCaPutLink`, never a local `dbPut`. The
+    /// pre-fix code called `put_pv_already_locked` on a name that does
+    /// not exist locally; the write was silently dropped. The recording
+    /// lset must now capture the value.
+    #[tokio::test]
+    async fn nonlocal_db_out_link_writes_through_external_put() {
+        let db = PvDatabase::new();
+        let puts = Arc::new(Mutex::new(Vec::new()));
+        db.register_link_set("ca", Arc::new(RecordingLset { puts: puts.clone() }))
+            .await;
+
+        // "OTHER:PV" is never added as a local record -> non-local.
+        let link = DbLink {
+            record: "OTHER:PV".to_string(),
+            field: "VAL".to_string(),
+            policy: LinkProcessPolicy::NoProcess,
+            monitor_switch: MonitorSwitch::NoMaximize,
+        };
+        let alarm = no_alarm();
+        let mut visited = HashSet::new();
+        db.write_db_link_value(
+            &link,
+            EpicsValue::Double(42.0),
+            out_src(&alarm),
+            &mut visited,
+            0,
+        )
+        .await;
+
+        let captured = puts.lock().unwrap();
+        assert_eq!(
+            captured.len(),
+            1,
+            "non-local OUT-link write must reach the external put path exactly once"
+        );
+        assert_eq!(captured[0].0, "OTHER:PV");
+        assert!(matches!(captured[0].1, EpicsValue::Double(v) if v == 42.0));
+    }
+
+    /// A local OUT-link write must NOT divert to the external put path —
+    /// the locality dispatch only reroutes non-local targets. The local
+    /// record receives the value; the lset records nothing.
+    #[tokio::test]
+    async fn local_db_out_link_writes_local_not_external() {
+        let db = PvDatabase::new();
+        let puts = Arc::new(Mutex::new(Vec::new()));
+        db.register_link_set("ca", Arc::new(RecordingLset { puts: puts.clone() }))
+            .await;
+        db.add_record("TGT", Box::new(CalcRecord::new("0")))
+            .await
+            .unwrap();
+
+        let link = DbLink {
+            record: "TGT".to_string(),
+            field: "VAL".to_string(),
+            policy: LinkProcessPolicy::NoProcess,
+            monitor_switch: MonitorSwitch::NoMaximize,
+        };
+        let alarm = no_alarm();
+        let mut visited = HashSet::new();
+        db.write_db_link_value(
+            &link,
+            EpicsValue::Double(7.0),
+            out_src(&alarm),
+            &mut visited,
+            0,
+        )
+        .await;
+
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "a local OUT-link write must not reach the external put path"
+        );
+        assert!(
+            matches!(db.get_pv("TGT.VAL").await.unwrap(), EpicsValue::Double(v) if v == 7.0),
+            "the local target must hold the written value"
         );
     }
 }

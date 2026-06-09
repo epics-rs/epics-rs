@@ -447,6 +447,18 @@ impl PvaLink {
             let connected = Arc::new(AtomicBool::new(false));
             let connected_for_task = connected.clone();
             monitor_connected = Some(connected);
+            // pvxs keeps one `pvaLinkChannel` per `(channelName,
+            // pvRequest)` and calls `chan.monitor(this, pvRequest)` for
+            // BOTH INP and OUT channels, with `pvRequest` coming from
+            // `pvaLink::makeRequest()` (`pvalink_link.cpp:47-65`,
+            // installed at `pvalink_channel.cpp` channel open). That
+            // request always carries `record._options.atomic=true`,
+            // `pipeline=<cfg>`, and `queueSize=<Q/4>`. The OUT
+            // connection-tracking monitor must therefore open with the
+            // same request as the INP monitor — not a plain
+            // option-less subscription — so the server sees the pvalink
+            // atomic/pipeline/queue negotiation on the OUT liveness path.
+            let request = monitor_request(&config);
             let join = tokio::spawn(async move {
                 let mut backoff = Duration::from_millis(250);
                 let max_backoff = Duration::from_secs(30);
@@ -458,7 +470,14 @@ impl PvaLink {
                     let on_event = move |_value: &PvField| {
                         connected_inner.store(true, Ordering::Release);
                     };
-                    let result = client_clone.pvmonitor(&pv_name, on_event).await;
+                    let result = match &request {
+                        Some(req) => {
+                            client_clone
+                                .pvmonitor_with_request(&pv_name, req, on_event)
+                                .await
+                        }
+                        None => client_clone.pvmonitor(&pv_name, on_event).await,
+                    };
                     // Subscription ended — reflect the disconnect so the
                     // OUT-write gate sees `is_connected() == false` until
                     // re-subscribed.
@@ -1662,10 +1681,12 @@ fn put_field_path(field: &str) -> String {
     }
 }
 
-/// build the pvRequest for an INP+monitor link.
+/// build the pvRequest for a pvalink monitor channel (INP value monitor
+/// or OUT connection-tracking monitor — pvxs uses the same
+/// `makeRequest()` output for both).
 ///
 /// pvxs `pvaLink::makeRequest` (`pvalink_link.cpp:47-65`) ALWAYS
-/// emits three fields on every INP monitor request:
+/// emits three fields on every pvalink monitor request:
 ///
 ///   - `record._options.pipeline`  — boolean, honors `cfg.pipeline`
 ///   - `record._options.atomic`    — hard-coded `true` (forces the
@@ -2596,6 +2617,41 @@ mod tests {
         );
         // pvxs `makeRequest` always sends queueSize alongside pipeline.
         assert!(req.record_options.iter().any(|(k, _)| k == "queueSize"));
+    }
+
+    /// An OUT link's connection-tracking monitor must open with the same
+    /// pvalink pvRequest as an INP monitor — pvxs uses one
+    /// `makeRequest()` output for both directions
+    /// (`pvalink_link.cpp:47-65`, `pvalink_channel.cpp` channel open).
+    /// Regression for the OUT path opening a plain option-less
+    /// `pvmonitor` so the server saw no atomic/pipeline/queue
+    /// negotiation on the liveness monitor that gates OUT writes.
+    #[test]
+    fn out_connection_monitor_request_matches_pvxs_make_request() {
+        let cfg = PvaLinkConfig {
+            pipeline: true,
+            queue_size: 16,
+            ..PvaLinkConfig::defaults_for("X", LinkDirection::Out)
+        };
+        let req = monitor_request(&cfg).expect("OUT monitor must carry a pvRequest");
+        assert!(
+            req.record_options
+                .iter()
+                .any(|(k, v)| k == "atomic" && *v == ScalarValue::Boolean(true)),
+            "OUT monitor request must force atomic=true"
+        );
+        assert!(
+            req.record_options
+                .iter()
+                .any(|(k, v)| k == "pipeline" && *v == ScalarValue::Boolean(true)),
+            "OUT monitor request must carry pipeline=true"
+        );
+        assert!(
+            req.record_options
+                .iter()
+                .any(|(k, v)| k == "queueSize" && *v == ScalarValue::UInt(16)),
+            "OUT monitor request must carry queueSize=16"
+        );
     }
 
     // ---- B4: defer / retry Put queue ----

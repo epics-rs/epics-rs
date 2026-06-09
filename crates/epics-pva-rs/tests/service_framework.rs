@@ -15,6 +15,14 @@ struct Counter {
     value: AtomicI64,
 }
 
+/// A project-local result alias. A proc-macro cannot resolve this back
+/// to `Result`, so the `#[pva_service]` macro must route it to the
+/// operation-error path via the type system (`IntoServiceOutcome`), not
+/// by syntactically matching the literal token `Result`. Pre-fix, an
+/// `RpcResult`-returning method failed to compile (the success branch
+/// required `RpcResult<T>: IntoServiceResponse`).
+type RpcResult<T> = Result<T, String>;
+
 #[pva_service]
 impl Counter {
     /// Add `delta` to the counter; returns the new value.
@@ -46,6 +54,19 @@ impl Counter {
     /// from a method `Err`, which is an operation error.
     async fn app_status(&self) -> Result<Status, String> {
         Ok(Status::error("app-level not-ok"))
+    }
+
+    /// Returns through a `Result` type alias on the success path — pins
+    /// that the macro compiles aliased-`Result` returns.
+    async fn alias_add(&self, delta: i64) -> RpcResult<i64> {
+        Ok(self.value.fetch_add(delta, Ordering::Relaxed) + delta)
+    }
+
+    /// Returns `Err` through a `Result` type alias — pins that an
+    /// aliased `Result`'s `Err` is routed to the RPC operation-error
+    /// path exactly like a literal `Result`.
+    async fn alias_boom(&self) -> RpcResult<i64> {
+        Err("aliased failure".into())
     }
 }
 
@@ -98,12 +119,14 @@ async fn pva_service_dispatch_round_trip() {
     let source = SharedSource::new();
     let registered = epics_pva_rs::service::add_rpc_service(&source, "counter", Counter::default())
         .expect("first registration must succeed");
-    assert_eq!(registered.len(), 5);
+    assert_eq!(registered.len(), 7);
     assert!(registered.contains(&"counter:add".to_string()));
     assert!(registered.contains(&"counter:reset".to_string()));
     assert!(registered.contains(&"counter:square".to_string()));
     assert!(registered.contains(&"counter:boom".to_string()));
     assert!(registered.contains(&"counter:app_status".to_string()));
+    assert!(registered.contains(&"counter:alias_add".to_string()));
+    assert!(registered.contains(&"counter:alias_boom".to_string()));
 
     let server = PvaServer::isolated(Arc::new(source)).expect("isolated test server must start");
     let client = server.client_config();
@@ -225,6 +248,39 @@ async fn pva_service_method_err_surfaces_as_rpc_error() {
         }
         other => panic!("unexpected app_status response: {other:?}"),
     }
+
+    // counter:alias_add returns Ok through a `RpcResult` alias — a
+    // successful RPC carrying the value.
+    let (desc, value) = nturi_request(&[("delta", ScalarValue::Long(4))]);
+    let (_, resp) = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.pvrpc("counter:alias_add", &desc, &value),
+    )
+    .await
+    .expect("rpc timeout")
+    .expect("an aliased-Result Ok is a successful RPC");
+    match resp {
+        PvField::Structure(s) => assert!(matches!(
+            s.get_field("value"),
+            Some(PvField::Scalar(ScalarValue::Long(4)))
+        )),
+        other => panic!("unexpected alias_add response: {other:?}"),
+    }
+
+    // counter:alias_boom returns Err through the same alias — it must
+    // surface as an RPC operation error, identical to a literal Result.
+    let (desc, value) = nturi_request(&[]);
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.pvrpc("counter:alias_boom", &desc, &value),
+    )
+    .await
+    .expect("rpc timeout")
+    .expect_err("an aliased-Result Err must surface as an RPC operation error");
+    assert!(
+        err.to_string().contains("aliased failure"),
+        "the RPC error must carry the method's message, got: {err}"
+    );
 }
 
 /// Direct-struct RPC request shape: arguments live at the top
@@ -305,7 +361,7 @@ async fn add_rpc_service_rejects_colliding_registration() {
     let source = SharedSource::new();
     let first = epics_pva_rs::service::add_rpc_service(&source, "counter", Counter::default())
         .expect("first registration must succeed");
-    assert_eq!(first.len(), 5);
+    assert_eq!(first.len(), 7);
 
     // A second service under the same prefix collides on the very
     // first method (`counter:add`). pvxs `StaticSource::add()` rejects
@@ -315,7 +371,7 @@ async fn add_rpc_service_rejects_colliding_registration() {
         .expect_err("colliding registration must be rejected");
     assert!(err.0.contains("counter:add"), "unexpected error: {err}");
 
-    // All five original PVs are still present and exactly five exist:
+    // All original PVs are still present and the count is unchanged:
     // the rejected call rolled itself back, adding nothing.
     for name in [
         "counter:add",
@@ -323,12 +379,14 @@ async fn add_rpc_service_rejects_colliding_registration() {
         "counter:square",
         "counter:boom",
         "counter:app_status",
+        "counter:alias_add",
+        "counter:alias_boom",
     ] {
         assert!(source.has_pv(name).await, "{name} must remain registered");
     }
     assert_eq!(
         source.list_pvs().await.len(),
-        5,
+        7,
         "no extra PVs from the rejected call"
     );
 }

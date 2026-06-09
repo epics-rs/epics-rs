@@ -319,30 +319,44 @@ impl ChannelSource for CompositeSource {
         }
     }
 
-    /// Route to the first source that *hosts* the name and ask THAT
-    /// source whether it is UDP-search-advertised. A name hosted by a
-    /// non-searchable source (the built-in `ServerInfoSource`) must
-    /// stay unanswered on broadcast SEARCH even though `has_pv` is
-    /// true — so we cannot just OR `searchable` across sources.
+    /// A name is SEARCH-advertised iff *any* source claims it — the OR
+    /// of `searchable` across every source that hosts the name.
+    ///
+    /// SEARCH aggregation is separate from CREATE/GET/PUT/RPC ownership.
+    /// pvxs runs `Source::onSearch` on every registered source and lets
+    /// each independently mark its claim in the shared `Search` object
+    /// (`server.cpp:694-712`, `serverchan.cpp:212-221`); a name is
+    /// answered when at least one source claims it. The built-in
+    /// `ServerSource::onSearch` is empty (`serversource.cpp:25-28`), so
+    /// the diagnostic `server` PV claims nothing and never *suppresses*
+    /// another source — it simply does not contribute a claim of its own.
+    ///
+    /// Routing SEARCH to the first hosting source instead would let the
+    /// front-ordered, non-searchable `ServerInfoSource` veto a later
+    /// user PV that happens to be named `server`, which pvxs advertises.
+    /// CREATE/GET/PUT/RPC keep the first-owner rule (lowest order wins,
+    /// so `__server` owns the literal `server` channel); only SEARCH ORs.
     fn searchable(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
         let sources = self.snapshot();
         let name = name.to_string();
         async move {
             for src in sources {
-                if src.has_pv(&name).await {
-                    return src.searchable(&name).await;
+                if src.has_pv(&name).await && src.searchable(&name).await {
+                    return true;
                 }
             }
             false
         }
     }
 
-    /// Endpoint-scoped counterpart of [`Self::searchable`]: route to the
-    /// owning source and let IT decide using both the name and the
-    /// requester endpoint. Same "first source that hosts the name wins"
-    /// rule — a name hosted by a non-searchable source must stay
-    /// unanswered even though `has_pv` is true, so we cannot OR
-    /// `searchable_from` across sources.
+    /// Endpoint-scoped counterpart of [`Self::searchable`]: the OR of
+    /// `searchable_from` across every source that hosts the name, so a
+    /// source can claim a PV only for some requesters (pvxs
+    /// `Search::source()`, filled from the UDP reply dest /
+    /// `server.cpp:674-704` or the TCP peer / `serverchan.cpp:197-222`).
+    /// Same "any source may claim" rule as [`Self::searchable`] — a
+    /// non-searchable hosting source must not veto a later source's
+    /// claim, matching pvxs's per-source independent `onSearch`.
     fn searchable_from(
         &self,
         name: &str,
@@ -352,8 +366,8 @@ impl ChannelSource for CompositeSource {
         let name = name.to_string();
         async move {
             for src in sources {
-                if src.has_pv(&name).await {
-                    return src.searchable_from(&name, requester).await;
+                if src.has_pv(&name).await && src.searchable_from(&name, requester).await {
+                    return true;
                 }
             }
             false
@@ -1848,6 +1862,124 @@ mod tests {
                         Some((_, PvField::Scalar(ScalarValue::Int(2)))))
             ),
             "a new channel must bind the replacement source B (value=2)"
+        );
+    }
+
+    /// A front-ordered, non-searchable source that *hosts* a name must
+    /// not veto a later source's SEARCH claim for that same name. pvxs
+    /// runs `onSearch` on every source and ORs the claims
+    /// (`server.cpp:694-712`); its built-in `ServerSource::onSearch` is
+    /// empty (`serversource.cpp:25-28`), so the diagnostic `server` PV
+    /// never suppresses a user PV named `server`. Mirrors the built-in
+    /// `__server` (order -1, non-searchable) sitting in front of a
+    /// default-order user `server` PV.
+    #[tokio::test]
+    async fn search_ors_claims_across_sources_non_searchable_host_does_not_veto() {
+        /// Hosts `name` but is never search-advertised — the
+        /// `ServerInfoSource`/pvxs `ServerSource` shape.
+        struct NonSearchableSrc {
+            name: &'static str,
+        }
+        impl ChannelSource for NonSearchableSrc {
+            fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+                async { Vec::new() }
+            }
+            fn has_pv(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
+                let m = name == self.name;
+                async move { m }
+            }
+            fn searchable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+                async { false }
+            }
+            fn get_introspection(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
+                async { None }
+            }
+            fn get_value(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<PvField>> + Send {
+                async { None }
+            }
+            fn put_value(
+                &self,
+                _: &str,
+                _: PvField,
+            ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+                async { Err("n/a".into()) }
+            }
+            fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+                async { false }
+            }
+            fn subscribe(
+                &self,
+                _: &str,
+            ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send
+            {
+                async { None }
+            }
+        }
+
+        let requester: std::net::SocketAddr = "10.0.0.5:5076".parse().unwrap();
+
+        // Bare built-in `server`: only the non-searchable host exists, so
+        // SEARCH stays unanswered (pvxs serves `server` by direct connect
+        // only).
+        let bare = CompositeSource::new();
+        bare.add_source(
+            "__server",
+            Arc::new(NonSearchableSrc { name: "server" }),
+            -1,
+        )
+        .unwrap();
+        assert!(
+            !bare.searchable("server").await,
+            "a bare built-in `server` must not be UDP-search-advertised"
+        );
+        assert!(
+            !bare.searchable_from("server", requester).await,
+            "a bare built-in `server` must not be TCP-circuit search-advertised"
+        );
+
+        // Front non-searchable `__server` + default-order user `server`
+        // PV: the user PV's claim survives the front host's non-claim.
+        let comp = CompositeSource::new();
+        comp.add_source(
+            "__server",
+            Arc::new(NonSearchableSrc { name: "server" }),
+            -1,
+        )
+        .unwrap();
+        comp.add_source(
+            "user",
+            Arc::new(PvSrc {
+                name: "server",
+                value: 7,
+            }),
+            0,
+        )
+        .unwrap();
+        assert!(
+            comp.searchable("server").await,
+            "a user PV named `server` must be UDP-search-advertised even \
+             behind the front non-searchable `__server` source"
+        );
+        assert!(
+            comp.searchable_from("server", requester).await,
+            "a user PV named `server` must be TCP-circuit search-advertised \
+             even behind the front non-searchable `__server` source"
+        );
+
+        // CREATE/GET ownership still goes to the front source (lowest
+        // order wins): the non-searchable `__server` keeps owning the
+        // literal `server` channel, so a GET returns no value (pvxs
+        // `server` has no GET surface), not the user PV's value=7.
+        assert!(
+            comp.get_value("server").await.is_none(),
+            "first-owner CREATE/GET rule must keep `server` owned by the \
+             front `__server` source; SEARCH OR must not change ownership"
         );
     }
 }

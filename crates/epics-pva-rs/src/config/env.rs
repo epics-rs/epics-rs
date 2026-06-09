@@ -109,10 +109,15 @@ pub fn seed_env_overrides(map: &HashMap<String, String>, replace_existing: bool)
 /// several named client/server configs (pva2pva-style) without
 /// cross-contamination.
 ///
-/// Resolution precedence matches pvxs (explicit definitions win over the
-/// ambient environment): [`PvaConfigDefs::get`] returns the scoped
-/// definition when present, else falls back to the process environment.
-/// Compose `get` with the pure parsers in this module
+/// Scoped definitions and the ambient environment are two SEPARATE
+/// sources, mirroring pvxs's `PickOne{useenv}` (config.cpp:228-249):
+/// [`PvaConfigDefs::get`] reads only this config's definitions
+/// (pvxs `useenv=false`), while the ambient process environment is read
+/// through this module's `*_from_env` helpers / `std::env::var`
+/// (pvxs `useenv=true`). They are deliberately NOT a fallback chain — a
+/// missing scoped key must not silently inherit an unrelated process
+/// variable, which is the cross-config contamination this primitive
+/// exists to prevent. Compose `get` with the pure parsers in this module
 /// ([`parse_addr_list_with_port`], integer/`parse_bool` parsing) to derive
 /// typed config values without reading global state for a scoped key.
 #[derive(Debug, Clone, Default)]
@@ -128,14 +133,21 @@ impl PvaConfigDefs {
         Self { defs: map.clone() }
     }
 
-    /// Resolve a variable name. A scoped definition takes precedence; when
-    /// this config does not define `name`, fall back to the process
-    /// environment (pvxs: explicit defs override the ambient env).
+    /// Resolve `name` against this config's scoped definitions ONLY.
+    ///
+    /// pvxs `applyDefs(defs)` runs `_fromDefs(..., useenv=false)`, whose
+    /// `PickOne` searches only the supplied `defs` map and NEVER calls
+    /// `getenv()` (config.cpp:228-249, :468-470, :607-609); an absent key
+    /// leaves the config field at its current/default value. So a key this
+    /// config does not define returns `None` — it does **not** fall back to
+    /// the ambient environment. The earlier fallback re-introduced exactly
+    /// the cross-config contamination scoped defs prevent: two configs
+    /// could each inherit unrelated process variables (e.g.
+    /// `EPICS_PVA_NAME_SERVERS`) through their missing keys. For the pvxs
+    /// `fromEnv` source (`useenv=true`), read the process environment
+    /// explicitly via this module's `*_from_env` helpers.
     pub fn get(&self, name: &str) -> Option<String> {
-        match self.defs.get(name) {
-            Some(v) => Some(v.clone()),
-            None => std::env::var(name).ok(),
-        }
+        self.defs.get(name).cloned()
     }
 
     /// True when `name` is defined by this config (independent of the
@@ -887,21 +899,58 @@ pub fn server_addr_list() -> Vec<SocketAddr> {
         .unwrap_or_default()
 }
 
+/// Resolve a `EPICS_PVA*_INTF_ADDR_LIST` value to a deduplicated list of
+/// bind `IpAddr`s.
+///
+/// pvxs parses interface lists through the SAME `split_addr_into` /
+/// `SockEndpoint` path as every other address list (config.cpp:151-169,
+/// 418-419, 592-593), so a DNS hostname is resolved before it constrains
+/// the bind/search interfaces: `SockEndpoint` calls `SockAddr::setAddress`
+/// (util.cpp:523-540), which falls back to a synchronous DNS lookup,
+/// IPv4-preferred. The earlier `parse::<IpAddr>()`-only split dropped any
+/// hostname token, silently turning a constrained interface list into the
+/// empty all-NIC default (client search/broadcast) or wildcard bind
+/// (server listener) — a broader exposure than pvxs.
+///
+/// Routes each whitespace-separated token (pvxs `split_addr_into` splits on
+/// whitespace; the comma is endpoint syntax, never a list separator)
+/// through the shared [`resolve_token_addr`] resolver — literal IP /
+/// `ip:port` / hostname / `host:port`, IPv4-preferred DNS — and keeps the
+/// resolved `IpAddr`; the port is irrelevant for a bind interface, so the
+/// default port is `0`. Unresolvable tokens are dropped with a `warn` so an
+/// operator sees a mistyped interface. Duplicates are collapsed after
+/// resolution, preserving first-appearance order (pvxs normalizes then
+/// `removeDups`). One owner for both the client and server interface lists
+/// so the family cannot drift back to dropping hostnames at one site.
+fn resolve_intf_addr_list(value: &str) -> Vec<IpAddr> {
+    // PVA-466: expand $(VAR) / ${VAR} refs before tokenising.
+    let value = expand_dollar_vars(value);
+    let mut out: Vec<IpAddr> = Vec::new();
+    for token in value.split_whitespace() {
+        match resolve_token_addr(token, 0) {
+            Some(sa) => {
+                let ip = sa.ip();
+                if !out.contains(&ip) {
+                    out.push(ip);
+                }
+            }
+            None => tracing::warn!(
+                token = %token,
+                "EPICS_PVA*_INTF_ADDR_LIST: unresolvable interface, skipping"
+            ),
+        }
+    }
+    out
+}
+
 /// Parse `EPICS_PVA_INTF_ADDR_LIST` — client-side interface bind list.
-/// Empty = bind to 0.0.0.0 (default behaviour). `$(VAR)` / `${VAR}`
-/// refs are expanded against the process env (PVA-466 parity).
+/// Empty = bind to 0.0.0.0 (default behaviour). DNS hostnames resolve
+/// (IPv4-preferred) and `$(VAR)` / `${VAR}` refs expand; see
+/// [`resolve_intf_addr_list`].
 pub fn list_intf_addresses() -> Vec<IpAddr> {
     std::env::var("EPICS_PVA_INTF_ADDR_LIST")
         .ok()
-        .map(|s| {
-            let s = expand_dollar_vars(&s);
-            // pvxs splits address lists on WHITESPACE only (`split_addr_into`,
-            // config.cpp:151-169); the comma is endpoint syntax, never a list
-            // separator. Interface lists carry no multicast modifiers.
-            s.split_whitespace()
-                .filter_map(|t| t.trim().parse::<IpAddr>().ok())
-                .collect()
-        })
+        .map(|s| resolve_intf_addr_list(&s))
         .unwrap_or_default()
 }
 
@@ -919,30 +968,11 @@ pub fn server_intf_addr_list_opt() -> Option<Vec<IpAddr>> {
 
 pub fn server_intf_addr_list() -> Vec<IpAddr> {
     if let Ok(s) = std::env::var("EPICS_PVAS_INTF_ADDR_LIST") {
-        // PVA-466: expand $(VAR) refs before tokenising.
-        let s = expand_dollar_vars(&s);
-        // Whitespace-only split (pvxs `split_addr_into`, config.cpp:151-169):
-        // the comma is endpoint syntax, not a list separator.
-        return s
-            .split_whitespace()
-            .filter_map(|t| {
-                let t = t.trim();
-                if t.is_empty() {
-                    return None;
-                }
-                match t.parse::<IpAddr>() {
-                    Ok(addr) => Some(addr),
-                    Err(e) => {
-                        tracing::warn!(
-                            token = %t,
-                            error = %e,
-                            "EPICS_PVAS_INTF_ADDR_LIST: invalid IP address, skipping"
-                        );
-                        None
-                    }
-                }
-            })
-            .collect();
+        // Same hostname-resolving path as the client list — see
+        // [`resolve_intf_addr_list`]. A DNS NIC name (`ioc-public-nic`)
+        // must resolve to its IPv4 address, not be dropped, so the server
+        // binds the named interface instead of falling back to wildcard.
+        return resolve_intf_addr_list(&s);
     }
     list_intf_addresses()
 }
@@ -1216,10 +1246,71 @@ mod tests {
             "apply_defs must not seed the process environment"
         );
 
-        // A key absent from the config falls back to the (here unset)
-        // process environment → None.
-        assert!(cfg_a.get(UNSET).is_none(), "unset key resolves to None");
+        // A key this config does not define resolves to None — pvxs
+        // `useenv=false` reads only the defs map, never the env.
+        assert!(cfg_a.get(UNSET).is_none(), "undefined key resolves to None");
         assert!(!cfg_a.contains(UNSET));
+    }
+
+    /// pvxs `applyDefs(defs)` -> `_fromDefs(useenv=false)`: `PickOne`
+    /// searches only the defs map and never calls `getenv()`
+    /// (config.cpp:228-249, :468-470). A key present in the process
+    /// environment but absent from the scoped defs must NOT leak into the
+    /// scoped config — that ambient fallback was the contamination this
+    /// primitive exists to prevent.
+    #[test]
+    fn pva_config_defs_get_does_not_fall_back_to_ambient_env() {
+        const KEY: &str = "EPICS_PVA_NAME_SERVERS";
+        unsafe {
+            std::env::set_var(KEY, "10.9.9.9:5075");
+        }
+        // Scoped defs deliberately omit KEY.
+        let scoped = PvaConfigDefs::apply_defs(&HashMap::new());
+        let scoped_got = scoped.get(KEY);
+        // The ambient-env source (pvxs `useenv=true`) still holds the value
+        // — the two sources are distinct, not chained.
+        let env_seen = std::env::var(KEY).ok();
+        unsafe {
+            std::env::remove_var(KEY);
+        }
+        assert!(
+            scoped_got.is_none(),
+            "scoped get() must not fall back to ambient env (pvxs useenv=false)"
+        );
+        assert_eq!(
+            env_seen.as_deref(),
+            Some("10.9.9.9:5075"),
+            "the ambient process-env source still resolves the value independently"
+        );
+    }
+
+    /// A key absent from one config's defs must not bleed in from another
+    /// config's map nor from the process environment.
+    #[test]
+    fn pva_config_defs_absent_key_does_not_bleed_between_maps_or_env() {
+        const KEY: &str = "EPICS_PVA_ADDR_LIST";
+        unsafe {
+            std::env::set_var(KEY, "172.16.0.1");
+        }
+        let mut a = HashMap::new();
+        a.insert(KEY.to_string(), "10.0.0.1".to_string());
+        let cfg_a = PvaConfigDefs::apply_defs(&a);
+        // Map B omits KEY.
+        let cfg_b = PvaConfigDefs::apply_defs(&HashMap::new());
+        let a_got = cfg_a.get(KEY);
+        let b_got = cfg_b.get(KEY);
+        unsafe {
+            std::env::remove_var(KEY);
+        }
+        assert_eq!(
+            a_got.as_deref(),
+            Some("10.0.0.1"),
+            "map A keeps its own scoped definition"
+        );
+        assert!(
+            b_got.is_none(),
+            "map B must not inherit KEY from map A or from the process env"
+        );
     }
 
     /// Regression R0604-PVA-BOOL-ENV-EXTENSIONS-1: the env bool grammar
@@ -1617,6 +1708,56 @@ mod tests {
             std::env::remove_var("EPICS_PVAS_INTF_ADDR_LIST");
             std::env::remove_var("EPICS_PVAS_IGNORE_ADDR_LIST");
         }
+    }
+
+    /// A DNS hostname in `EPICS_PVA_INTF_ADDR_LIST` /
+    /// `EPICS_PVAS_INTF_ADDR_LIST` must resolve to its (IPv4-preferred)
+    /// address, matching pvxs `SockAddr::setAddress` (util.cpp:523-540),
+    /// not be dropped to an empty list. Pre-fix the parser required a
+    /// literal IP, so `localhost` produced `[]` — the all-NIC / wildcard
+    /// default — broadening the bind/search surface beyond pvxs.
+    #[test]
+    fn intf_addr_list_resolves_hostname_to_loopback() {
+        unsafe {
+            std::env::set_var("EPICS_PVA_INTF_ADDR_LIST", "localhost");
+            std::env::set_var("EPICS_PVAS_INTF_ADDR_LIST", "localhost");
+        }
+        let client = list_intf_addresses();
+        let server = server_intf_addr_list();
+        unsafe {
+            std::env::remove_var("EPICS_PVA_INTF_ADDR_LIST");
+            std::env::remove_var("EPICS_PVAS_INTF_ADDR_LIST");
+        }
+        assert_eq!(
+            client,
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            "EPICS_PVA_INTF_ADDR_LIST=localhost must resolve to 127.0.0.1, not drop to []"
+        );
+        assert_eq!(
+            server,
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            "EPICS_PVAS_INTF_ADDR_LIST=localhost must resolve to 127.0.0.1, not drop to []"
+        );
+    }
+
+    /// Interface lists deduplicate after resolution, preserving
+    /// first-appearance order (pvxs normalizes then `removeDups`). A
+    /// hostname that resolves to an IP already listed collapses into the
+    /// existing entry.
+    #[test]
+    fn intf_addr_list_dedups_after_resolution() {
+        unsafe {
+            std::env::set_var("EPICS_PVA_INTF_ADDR_LIST", "127.0.0.1 localhost 127.0.0.1");
+        }
+        let client = list_intf_addresses();
+        unsafe {
+            std::env::remove_var("EPICS_PVA_INTF_ADDR_LIST");
+        }
+        assert_eq!(
+            client,
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            "literal 127.0.0.1 and resolved localhost must collapse to a single entry"
+        );
     }
 
     /// PVA-40: numeric ignore-list tokens keep pvxs port semantics — a

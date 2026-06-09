@@ -13,12 +13,11 @@
 //! reference-leak diagnostic (`pvxs/ioc/iochooks.cpp:479-484`), not a
 //! pvalink command.
 
-use epics_base_rs::server::database::LinkSet;
 use epics_base_rs::server::iocsh::registry::{
     ArgDesc, ArgType, ArgValue, CommandContext, CommandDef, CommandOutcome,
 };
 
-use super::config::{ProcMode, SevrMode};
+use super::config::{LinkDirection, ProcMode, SevrMode};
 use super::integration::PvaLinkResolver;
 use super::registry::ChannelDiag;
 
@@ -116,22 +115,79 @@ fn sevr_label(s: SevrMode) -> &'static str {
     }
 }
 
-/// Print one channel row + (at `level >= 5`) its config detail, mirroring
-/// pvxs `dbpvxr`'s per-channel block (`pvxs/ioc/pvalink.cpp:243-306`).
-fn print_channel_row(ctx: &CommandContext, d: &ChannelDiag, level: i64) {
+/// Port of EPICS Base `epicsStrGlobMatch` (`misc/epicsString.c`), the
+/// matcher pvxs's `dbpvxr` applies to each attached link's record name
+/// (`epicsStrGlobMatch(pval->plink->precord->name, precordname)`,
+/// `pvxs/ioc/pvalink.cpp:224,233`): `*` matches any run of characters,
+/// `?` matches exactly one, every other character is literal.
+fn glob_match(s: &str, pattern: &str) -> bool {
+    let text: Vec<char> = s.chars().collect();
+    let pat: Vec<char> = pattern.chars().collect();
+    let mut i = 0usize;
+    let mut p = 0usize;
+    let mut mp: Option<usize> = None;
+    let mut cp = 0usize;
+
+    while i < text.len() && p < pat.len() && pat[p] != '*' {
+        if pat[p] != text[i] && pat[p] != '?' {
+            return false;
+        }
+        p += 1;
+        i += 1;
+    }
+    while i < text.len() {
+        if p < pat.len() && pat[p] == '*' {
+            p += 1;
+            if p >= pat.len() {
+                return true;
+            }
+            mp = Some(p);
+            cp = i + 1;
+        } else if p < pat.len() && (pat[p] == text[i] || pat[p] == '?') {
+            p += 1;
+            i += 1;
+        } else if let Some(m) = mp {
+            p = m;
+            i = cp;
+            cp += 1;
+        } else {
+            return false;
+        }
+    }
+    while p < pat.len() && pat[p] == '*' {
+        p += 1;
+    }
+    p >= pat.len()
+}
+
+/// Print one channel row + (at `level >= 5`) its per-link config detail,
+/// mirroring pvxs `dbpvxr`'s per-channel block
+/// (`pvxs/ioc/pvalink.cpp:243-306`). When `glob` is set, only attached
+/// records whose name matches it are printed (pvxs `pvalink.cpp:269`).
+fn print_channel_row(ctx: &CommandContext, d: &ChannelDiag, level: i64, glob: Option<&str>) {
     // pvxs right-justifies the channel name in a 28-wide column.
     ctx.println(&format!(
-        "{:>28} conn={}",
+        "{:>28} conn={} dir={} Q={} pipe={}",
         d.pv_name,
-        if d.connected { 'T' } else { 'F' }
+        if d.connected { 'T' } else { 'F' },
+        match d.direction {
+            LinkDirection::Inp => "INP",
+            LinkDirection::Out => "OUT",
+        },
+        d.queue_size,
+        if d.pipeline { 'T' } else { 'F' },
     ));
     if level >= 5 {
-        // pvxs prints num_disconnect / num_type_change / Put here too;
-        // the Rust link does not instrument those transitions, so the
-        // detail line carries only the per-link config it does track.
-        ctx.println(&format!(
-            "{:30}{} {} Q={} pipe={} defer={} time={} retry={} morder={} field={:?}",
-            "",
+        // pvxs prints one `precord->name.fldname` row per attached
+        // `pvaLink`, glob-filtered by record name. The Rust registry
+        // folds field/sevr-only variants onto one channel, so it cannot
+        // recover each link's record-field name or per-link proc/sevr;
+        // it prints one row per owning record carrying the channel's
+        // folded config. (pvxs num_disconnect / num_type_change / Put
+        // are not instrumented by the Rust link and are omitted rather
+        // than fabricated.)
+        let detail = format!(
+            "{} {} Q={} pipe={} defer={} time={} retry={} morder={} field={:?}",
             proc_label(d.proc),
             sevr_label(d.sevr),
             d.queue_size,
@@ -141,31 +197,44 @@ fn print_channel_row(ctx: &CommandContext, d: &ChannelDiag, level: i64) {
             if d.retry { 'T' } else { 'F' },
             d.monorder,
             d.field,
-        ));
+        );
+        let mut printed_any = false;
+        for rec in &d.records {
+            if glob.map(|g| glob_match(rec, g)).unwrap_or(true) {
+                ctx.println(&format!("{:30}{rec} {detail}", ""));
+                printed_any = true;
+            }
+        }
+        if !printed_any {
+            // Channel with no owning record (e.g. a `pvxr`-opened link):
+            // still surface the folded config.
+            ctx.println(&format!("{:30}{detail}", ""));
+        }
     }
 }
 
-/// `dbpvar [<recordName>] [<level>]` — print pvalink diagnostics.
+/// `dbpvar [<recordNameGlob>] [<level>]` — print pvalink diagnostics.
 ///
 /// The Rust counterpart of pvxs `dbpvxr`, which the upstream IOC
 /// registers under the shell name `dbpvar`
-/// (`pvxs/ioc/pvalink.cpp:184-331`). An empty or `"*"` record selects
-/// all channels; a named record selects that record's link fields.
+/// (`pvxs/ioc/pvalink.cpp:184-316`). The command is channel-centric:
+/// it snapshots the cached channel map and, for both the all-records
+/// and the record-filtered call, filters channels by glob-matching the
+/// names of the records whose links attached to each channel
+/// (`epicsStrGlobMatch`, `pvalink.cpp:224,233,269`). The first argument
+/// is therefore a record-name GLOB (`REC:*`, `IOC:AI?`), not an exact
+/// record name; empty / missing / `"*"` selects every channel.
+///
 /// Level semantics follow pvxs (`pvalink.cpp:240-311`):
 ///
 /// - `level <= 0` — summary only (connected/total channel counts).
-/// - `level == 1` — additionally list disconnected channels.
-/// - `level >= 2` — list every channel.
-/// - `level >= 5` — additionally dump each channel's link config.
+/// - `level == 1` — additionally list disconnected matching channels.
+/// - `level >= 2` — list every matching channel.
+/// - `level >= 5` — additionally dump per-link rows, glob-filtered by
+///   record name.
 ///
 /// `dbpvxr` is registered as an alias of the same handler for
 /// compatibility with existing Rust startup scripts.
-///
-/// The record-named path walks the database's link fields (record →
-/// link) because the Rust registry, unlike pvxs's `pvaLinkChannel`,
-/// keeps no channel → record back-index; it therefore reports per-field
-/// connection / value / alarm / time rather than filtering the channel
-/// list by record glob.
 pub fn dbpvar_command(resolver: PvaLinkResolver) -> CommandDef {
     dbpvar_like("dbpvar", resolver)
 }
@@ -180,7 +249,7 @@ fn dbpvar_like(name: &'static str, resolver: PvaLinkResolver) -> CommandDef {
         name,
         vec![
             ArgDesc {
-                name: "record",
+                name: "recordNameGlob",
                 arg_type: ArgType::String,
                 optional: true,
             },
@@ -190,14 +259,15 @@ fn dbpvar_like(name: &'static str, resolver: PvaLinkResolver) -> CommandDef {
                 optional: true,
             },
         ],
-        // pvxs usage is "record name", "level".
+        // pvxs usage is "record name" (a glob), "level".
         match name {
-            "dbpvxr" => "dbpvxr [<recordName>] [<level>]",
-            _ => "dbpvar [<recordName>] [<level>]",
+            "dbpvxr" => "dbpvxr [<recordNameGlob>] [<level>]",
+            _ => "dbpvar [<recordNameGlob>] [<level>]",
         },
         move |args: &[ArgValue], ctx: &CommandContext| {
-            // empty / missing / "*" => all records (pvxs pvalink.cpp:193).
-            let target = match args.first() {
+            // First arg is a record-name GLOB; empty / missing / "*" =>
+            // every channel (pvxs `pvalink.cpp:193`).
+            let glob = match args.first() {
                 Some(ArgValue::String(s)) if !s.is_empty() && s != "*" => Some(s.clone()),
                 _ => None,
             };
@@ -206,136 +276,58 @@ fn dbpvar_like(name: &'static str, resolver: PvaLinkResolver) -> CommandDef {
                 _ => 0,
             };
 
-            match &target {
+            match &glob {
                 None => ctx.println("PVA links in all records\n"),
-                Some(rec) => ctx.println(&format!("PVA links in record named '{rec}'\n")),
+                Some(g) => ctx.println(&format!("PVA links in records matching '{g}'\n")),
             }
 
-            if let Some(rec) = target {
-                // Record-named path: record → link-field walk (the Rust
-                // registry has no channel → record back-index).
-                dump_record_link_fields(&resolver, ctx, &rec);
-            } else {
-                // All-records path: channel-centric listing with pvxs
-                // level semantics.
-                let diags = resolver.channel_diagnostics();
-                let nchans = diags.len();
-                let nconn = diags.iter().filter(|d| d.connected).count();
-                if level >= 1 {
-                    for d in &diags {
-                        // level 1 shows only disconnected channels;
-                        // level >= 2 shows every channel.
-                        if level >= 2 || !d.connected {
-                            print_channel_row(ctx, d, level);
-                        }
-                    }
+            // Channel-centric listing for BOTH all-records and
+            // record-filtered calls, mirroring pvxs `dbpvxr`: snapshot
+            // the channel map, filter each channel by glob-matching the
+            // names of the records whose links attached to it, then apply
+            // the level gates (`pvalink.cpp:208-311`).
+            let diags = resolver.channel_diagnostics();
+            let mut nchans = 0usize;
+            let mut nconn = 0usize;
+            let mut nlinks = 0usize;
+            for d in &diags {
+                let nmatched = match &glob {
+                    Some(g) => d.records.iter().filter(|r| glob_match(r, g)).count(),
+                    None => d.records.len(),
+                };
+                // A glob-filtered call skips channels no matching record
+                // uses (pvxs `pvalink.cpp:229-231`).
+                if glob.is_some() && nmatched == 0 {
+                    continue;
                 }
-                ctx.println(&format!(
-                    "  {nconn}/{nchans} channels connected ({} cached link(s), {} total reads, enabled={})",
-                    resolver.link_count(),
-                    resolver.read_count(),
-                    resolver.is_enabled()
-                ));
+                nchans += 1;
+                if d.connected {
+                    nconn += 1;
+                }
+                nlinks += nmatched;
+                if level <= 0 {
+                    continue;
+                }
+                // level 1 lists only disconnected channels; level >= 2
+                // lists every matching channel (pvxs `pvalink.cpp:243`).
+                if level >= 2 || !d.connected {
+                    print_channel_row(ctx, d, level, glob.as_deref());
+                }
             }
+            ctx.println(&format!(
+                "  {nconn}/{nchans} channels connected used by {nlinks} link(s)"
+            ));
+            // Rust-specific resolver counters, clearly separated from the
+            // pvxs-shaped summary above.
+            ctx.println(&format!(
+                "  ({} cached link(s), {} total reads, enabled={})",
+                resolver.link_count(),
+                resolver.read_count(),
+                resolver.is_enabled()
+            ));
             Ok(CommandOutcome::Continue)
         },
     )
-}
-
-/// Walk every link-shaped String field on `rec` and dump connection /
-/// value / alarm / time state for each `pva://` / `ca://` link via the
-/// registered [`LinkSet`]. The record-named branch of `dbpvar`.
-fn dump_record_link_fields(resolver: &PvaLinkResolver, ctx: &CommandContext, rec: &str) {
-    let db = ctx.db().clone();
-    let handle = ctx.runtime_handle().clone();
-    let rec_clone = rec.to_string();
-    let links = std::thread::spawn(move || {
-        handle.block_on(async move { db.record_link_fields(&rec_clone).await })
-    })
-    .join()
-    .unwrap_or_default();
-    if links.is_empty() {
-        ctx.println(&format!(
-            "  '{rec}': no link fields found (or record missing)"
-        ));
-        return;
-    }
-    ctx.println(&format!("  '{rec}': {} link field(s)", links.len()));
-    for (field, raw, parsed) in links {
-        match parsed {
-            epics_base_rs::server::record::ParsedLink::Pva(name) => {
-                let connected = <PvaLinkResolver as LinkSet>::is_connected(resolver, &name);
-                let value = <PvaLinkResolver as LinkSet>::get_value(resolver, &name);
-                let alarm = <PvaLinkResolver as LinkSet>::alarm_message(resolver, &name);
-                let ts = <PvaLinkResolver as LinkSet>::time_stamp(resolver, &name);
-                ctx.println(&format!(
-                    "    {field}={raw:?}  pva://{name}  connected={connected}"
-                ));
-                if let Some(v) = value {
-                    ctx.println(&format!("        value={v}"));
-                }
-                if let Some(a) = alarm {
-                    ctx.println(&format!("        alarm={a:?}"));
-                }
-                if let Some((s, n, _)) = ts {
-                    ctx.println(&format!("        timeStamp={s}.{n:09}"));
-                }
-            }
-            epics_base_rs::server::record::ParsedLink::PvaJson(j) => {
-                // pvxs-parity JSON longhand `{pva:{pv,…}}`: dump the same
-                // connection / value / alarm / time state as the string
-                // form, looked up by the bare channel name (the name
-                // epics-base-rs hands the lset), and surface the parsed
-                // JLink options so `dbpvar` shows the per-link config.
-                let name = &j.pv;
-                let connected = <PvaLinkResolver as LinkSet>::is_connected(resolver, name);
-                let value = <PvaLinkResolver as LinkSet>::get_value(resolver, name);
-                let alarm = <PvaLinkResolver as LinkSet>::alarm_message(resolver, name);
-                let ts = <PvaLinkResolver as LinkSet>::time_stamp(resolver, name);
-                ctx.println(&format!(
-                    "    {field}={raw:?}  pva://{name}  opts={:?}  connected={connected}",
-                    j.options
-                ));
-                if let Some(v) = value {
-                    ctx.println(&format!("        value={v}"));
-                }
-                if let Some(a) = alarm {
-                    ctx.println(&format!("        alarm={a:?}"));
-                }
-                if let Some((s, n, _)) = ts {
-                    ctx.println(&format!("        timeStamp={s}.{n:09}"));
-                }
-            }
-            epics_base_rs::server::record::ParsedLink::Ca(ca) => {
-                let name = &ca.pv;
-                ctx.println(&format!(
-                    "    {field}={raw:?}  ca://{name}  (CA link — see camonitor)"
-                ));
-            }
-            epics_base_rs::server::record::ParsedLink::Db(db) => {
-                ctx.println(&format!(
-                    "    {field}={raw:?}  db link → {}.{}",
-                    db.record, db.field
-                ));
-            }
-            epics_base_rs::server::record::ParsedLink::Constant(c) => {
-                ctx.println(&format!("    {field}={raw:?}  constant {c:?}"));
-            }
-            epics_base_rs::server::record::ParsedLink::None => {}
-            epics_base_rs::server::record::ParsedLink::Hw(hw) => {
-                ctx.println(&format!(
-                    "    {field}={raw:?}  hw link {:?} args={:?}",
-                    hw.kind, hw.args
-                ));
-            }
-            epics_base_rs::server::record::ParsedLink::Calc(calc) => {
-                ctx.println(&format!(
-                    "    {field}={raw:?}  calc link expr={:?} args={:?}",
-                    calc.expr, calc.args
-                ));
-            }
-        }
-    }
 }
 
 /// `pvaLinkNWorkers [<n>]` — pvxs registers `pvaLinkNWorkers` as an IOC
@@ -452,6 +444,22 @@ mod tests {
             assert!(matches!(cmd.args[1].arg_type, ArgType::Int));
             assert!(cmd.args[1].optional);
         }
+    }
+
+    /// `dbpvar`'s record-name filter is an `epicsStrGlobMatch` glob, not
+    /// an exact match: `*` spans any run, `?` one char, the rest literal
+    /// (pvxs `pvalink.cpp:224,233,269`).
+    #[test]
+    fn dbpvar_glob_match_semantics() {
+        assert!(glob_match("TST:AI1", "TST:*"));
+        assert!(glob_match("TST:AI1", "*AI1"));
+        assert!(glob_match("TST:AI1", "TST:AI?"));
+        assert!(glob_match("TST:AI1", "*"));
+        assert!(glob_match("TST:AI1", "TST:AI1"));
+        // Non-matches: a literal `TST:*` is NOT how a glob is matched.
+        assert!(!glob_match("OTH:AI1", "TST:*"));
+        assert!(!glob_match("TST:AI11", "TST:AI?"));
+        assert!(!glob_match("TST:AI1", "TST:AI1X"));
     }
 
     #[tokio::test]

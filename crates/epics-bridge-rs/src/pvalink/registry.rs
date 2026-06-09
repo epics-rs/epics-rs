@@ -3,7 +3,7 @@
 //! Used by record handlers so multiple records pointing at the same PV
 //! share a single underlying client connection.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -64,6 +64,14 @@ pub struct ChannelDiag {
     pub time: bool,
     pub retry: bool,
     pub monorder: i32,
+    /// Sorted set of record names whose links attached to this channel.
+    /// pvxs's `pvaLinkChannel` keeps a `links` list of `pvaLink*`, each
+    /// with `plink->precord->name`; the registry folds field/sevr-only
+    /// variants onto one channel entry, so this is the de-duplicated set
+    /// of owning records. Backs `dbpvar`'s record-name glob filter
+    /// (`pvxs/ioc/pvalink.cpp:213-243`). Empty for channels opened
+    /// manually (e.g. `pvxr`) with no owning record.
+    pub records: Vec<String>,
 }
 
 /// Cached PvaLink. Returns the same `Arc<PvaLink>` for repeated
@@ -81,11 +89,44 @@ pub struct PvaLinkRegistry {
     /// This map carries an `Arc<Notify>` per in-flight open; the
     /// second caller awaits and then reads the cached entry.
     pending: RwLock<HashMap<RegistryKey, Arc<Notify>>>,
+    /// Channel → owning record-name back-index. Mirrors pvxs's
+    /// `pvaLinkChannel::links` (a list of `pvaLink*` each with
+    /// `plink->precord->name`): the set of records whose links attached
+    /// to each cached channel. Populated at open time via
+    /// [`Self::attach_record`]; backs the `dbpvar` record-name glob
+    /// filter (`pvxs/ioc/pvalink.cpp:213-243`).
+    channel_records: RwLock<HashMap<RegistryKey, BTreeSet<String>>>,
+}
+
+/// Build the [`RegistryKey`] for a config — the shared
+/// `(channelName, pvRequest)` identity pvxs caches by.
+fn key_of(config: &PvaLinkConfig) -> RegistryKey {
+    (
+        config.pv_name.clone(),
+        config.pipeline,
+        config.queue_size,
+        config.direction,
+    )
 }
 
 impl PvaLinkRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record that `record`'s link attached to the channel identified by
+    /// `config`. The channel may not be open yet (or may be shared by
+    /// several records); the back-index keys by the same
+    /// `(channelName, pvRequest)` identity the registry caches by, so a
+    /// fold of field/sevr-only variants still accumulates every owning
+    /// record. Mirrors pvxs appending a `pvaLink` to
+    /// `pvaLinkChannel::links` (`pvalink_channel.cpp` link attach).
+    pub fn attach_record(&self, config: &PvaLinkConfig, record: &str) {
+        self.channel_records
+            .write()
+            .entry(key_of(config))
+            .or_default()
+            .insert(record.to_string());
     }
 
     /// Exact lookup for the full config's [`RegistryKey`]. Returns
@@ -253,6 +294,7 @@ impl PvaLinkRegistry {
     pub fn close_all(&self) {
         self.map.write().clear();
         self.pending.write().clear();
+        self.channel_records.write().clear();
     }
 
     /// Test-only: insert a pre-built [`PvaLink`] under its config's
@@ -338,11 +380,13 @@ impl PvaLinkRegistry {
                 LinkDirection::Out => 1,
             }
         }
+        let records = self.channel_records.read();
         let mut rows: Vec<ChannelDiag> = self
             .map
             .read()
             .iter()
-            .map(|((pv, pipeline, qsize, dir), link)| {
+            .map(|(key, link)| {
+                let (pv, pipeline, qsize, dir) = key;
                 let c = link.config();
                 ChannelDiag {
                     pv_name: pv.clone(),
@@ -357,6 +401,10 @@ impl PvaLinkRegistry {
                     time: c.time,
                     retry: c.retry,
                     monorder: c.monorder,
+                    records: records
+                        .get(key)
+                        .map(|s| s.iter().cloned().collect())
+                        .unwrap_or_default(),
                 }
             })
             .collect();
@@ -479,6 +527,50 @@ mod tests {
 
         // `for_test` links are not connected (no live monitor).
         assert!(diags.iter().all(|d| !d.connected));
+    }
+
+    /// The channel → record back-index that backs `dbpvar`'s record-name
+    /// glob filter: `attach_record` accumulates every owning record on a
+    /// channel (folding field/sevr-only variants onto one entry), and
+    /// `channel_diagnostics` surfaces the de-duplicated, sorted set.
+    /// pvxs equivalent: `pvaLinkChannel::links` filtered by
+    /// `epicsStrGlobMatch(precord->name, ...)` (`pvalink.cpp:213-243`).
+    #[tokio::test]
+    async fn channel_diagnostics_carries_attached_record_names() {
+        let reg = PvaLinkRegistry::new();
+
+        let inp = PvaLinkConfig::defaults_for("SRC:PV", LinkDirection::Inp);
+        // A field-only variant folds onto the same channel key.
+        let inp_field = PvaLinkConfig {
+            field: "alarm.severity".to_string(),
+            ..PvaLinkConfig::defaults_for("SRC:PV", LinkDirection::Inp)
+        };
+        reg.insert_for_test(&inp, Arc::new(PvaLink::for_test(inp.clone(), None)));
+        reg.insert_for_test(
+            &inp_field,
+            Arc::new(PvaLink::for_test(inp_field.clone(), None)),
+        );
+
+        // Two records share the folded channel; one of them registers
+        // twice (idempotent set insert).
+        reg.attach_record(&inp, "REC:A");
+        reg.attach_record(&inp_field, "REC:B");
+        reg.attach_record(&inp, "REC:A");
+
+        let diags = reg.channel_diagnostics();
+        let row = diags
+            .iter()
+            .find(|d| d.pv_name == "SRC:PV" && d.direction == LinkDirection::Inp)
+            .expect("INP channel present");
+        assert_eq!(
+            row.records,
+            vec!["REC:A".to_string(), "REC:B".to_string()],
+            "both owning records surface, de-duplicated and sorted"
+        );
+
+        // close_all clears the back-index too.
+        reg.close_all();
+        assert!(reg.channel_diagnostics().is_empty());
     }
 
     /// Two OUT links to the same remote PV that differ only in their

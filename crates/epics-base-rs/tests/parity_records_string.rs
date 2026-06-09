@@ -59,20 +59,22 @@ fn c2_histogram_counter_wraps_no_panic() {
 #[test]
 fn h8_lsi_sizv_clamps_to_c_range() {
     let mut rec = LsiRecord::default();
-    rec.put_field("SIZV", EpicsValue::Short(1)).unwrap();
-    assert_eq!(rec.get_field("SIZV"), Some(EpicsValue::Short(16)));
-    rec.put_field("SIZV", EpicsValue::Short(i16::MAX)).unwrap();
-    assert_eq!(rec.get_field("SIZV"), Some(EpicsValue::Short(0x7fff)));
+    // SIZV is DBF_USHORT (lsiRecord.dbd.pod:75); clamp range stays [16, 0x7fff].
+    rec.put_field("SIZV", EpicsValue::UShort(1)).unwrap();
+    assert_eq!(rec.get_field("SIZV"), Some(EpicsValue::UShort(16)));
+    rec.put_field("SIZV", EpicsValue::UShort(0x7fff)).unwrap();
+    assert_eq!(rec.get_field("SIZV"), Some(EpicsValue::UShort(0x7fff)));
 }
 
 #[test]
 fn m8_lsi_lso_len_initialises_zero() {
+    // LEN/OLEN are DBF_ULONG (lsiRecord.dbd.pod:82/86, lsoRecord.dbd.pod:135/139).
     let lsi = LsiRecord::default();
-    assert_eq!(lsi.get_field("LEN"), Some(EpicsValue::Long(0)));
-    assert_eq!(lsi.get_field("OLEN"), Some(EpicsValue::Long(0)));
+    assert_eq!(lsi.get_field("LEN"), Some(EpicsValue::ULong(0)));
+    assert_eq!(lsi.get_field("OLEN"), Some(EpicsValue::ULong(0)));
     let lso = LsoRecord::default();
-    assert_eq!(lso.get_field("LEN"), Some(EpicsValue::Long(0)));
-    assert_eq!(lso.get_field("OLEN"), Some(EpicsValue::Long(0)));
+    assert_eq!(lso.get_field("LEN"), Some(EpicsValue::ULong(0)));
+    assert_eq!(lso.get_field("OLEN"), Some(EpicsValue::ULong(0)));
 }
 
 // ---------------------------------------------------------------

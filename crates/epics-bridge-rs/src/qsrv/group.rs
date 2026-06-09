@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::database::db_access::{DbSubscription, SubscriptionActivation};
-use epics_base_rs::types::DbFieldType;
+use epics_base_rs::types::{DbFieldType, dbf_link_class};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, VariantValue};
 
 use super::group_config::{GroupMember, GroupPvDef, TriggerDef};
@@ -1063,6 +1063,42 @@ impl GroupChannel {
             .unwrap_or(DbFieldType::Double)
     }
 
+    /// True iff this member's backing field is a dbStatic link class
+    /// (`DBF_INLINK..=DBF_FWDLINK`).
+    ///
+    /// pvxs rejects a group PUT that binds any link-class field during the
+    /// all-field preparation pass (`ioc/groupsource.cpp:603-606`,
+    /// `dbChannelFinalFieldType` in `DBF_INLINK..=DBF_FWDLINK`), before any
+    /// marked/putable filtering. The Rust port has no dbStatic field table
+    /// and link fields surface as `DbFieldType::String`, so classification
+    /// routes through the record's `recordType` plus the field name into the
+    /// canonical `dbf_link_class` classifier (`epics-base-rs`
+    /// `types/dbr.rs`) — the single owner of the "is this field a link"
+    /// rule — instead of a member-name heuristic that re-opens the bypass
+    /// for any record spelling a link field outside the list.
+    ///
+    /// A member with no backing channel (`+type:structure` / `+const`) has
+    /// no dbChannel to classify, matching pvxs skipping fields whose
+    /// `field.value` is null.
+    async fn member_targets_link_field(&self, member: &GroupMember) -> bool {
+        if member.channel.is_empty() {
+            return false;
+        }
+        let (record_name, field_name) =
+            epics_base_rs::server::database::parse_pv_name(&member.channel);
+        // Resolve the backing record's type so the two direction-ambiguous
+        // families (`SIOL`, `LNK*`) classify per record type. An
+        // unresolvable backing record cannot occur for a group pvxs would
+        // have loaded (the dbChannel creation would have failed); fall back
+        // to record-type-blind name classification, which still catches the
+        // unambiguous link families.
+        let record_type: &'static str = match self.db.get_record(record_name).await {
+            Some(rec) => rec.read().await.record.record_type(),
+            None => "",
+        };
+        dbf_link_class(record_type, field_name).is_some()
+    }
+
     /// Convert an incoming PvField to an EpicsValue typed against the
     /// member's actual DBF field. This avoids context-free fallback
     /// conversions (e.g. ScalarValue::Long → EpicsValue::Double).
@@ -1284,24 +1320,25 @@ impl GroupChannel {
             }
         };
 
-        // pvxs's `groupsource.cpp:548` rejects group PUT
-        // preparation for `DBF_INLINK..DBF_FWDLINK` fields —
-        // writing into a record's link field via group PUT is
-        // semantically meaningless (the link is metadata, not
-        // value state) and was a wire compatibility gap. EPICS
-        // link fields have well-known names (FLNK, DOL, INP,
-        // INP*, OUT, OUT*, SDIS). Reject any member whose target
-        // field is in that set before any write fires — but only for
-        // members this PUT actually acts on, so an unmarked
-        // link-targeting member cannot reject a partial PUT.
-        for m in &ordered {
-            if !member_is_active(m) {
-                continue;
-            }
-            if member_targets_link_field(&m.channel) {
+        // pvxs's group PUT preparation pass (groupsource.cpp:596-609)
+        // iterates EVERY backing field — before any marked/putable
+        // filtering — and throws "Links not supported for put" for any
+        // field whose `dbChannelFinalFieldType` is link class
+        // (`DBF_INLINK..=DBF_FWDLINK`, groupsource.cpp:603-606). The
+        // rejection is independent of whether the client marked that
+        // member: a sparse PUT marking only a scalar still fails if the
+        // group also binds a link field. Run the check over all members
+        // with a backing channel (not `member_is_active`-gated), and
+        // classify by the actual DBF link class via the canonical
+        // `dbf_link_class` classifier rather than a member-name
+        // heuristic — a name list re-opens the bypass for any record
+        // that spells a link field outside the list and false-rejects
+        // non-link fields whose names collide with the heuristic.
+        for m in &self.def.members {
+            if self.member_targets_link_field(m).await {
                 return Err(BridgeError::PutRejected(format!(
                     "group {} PUT: member '{}' targets link field '{}' \
-                     (pvxs groupsource.cpp:548 rejects link-class field writes)",
+                     (pvxs groupsource.cpp:603-606 rejects link-class field writes)",
                     self.def.name, m.field_name, m.channel
                 )));
             }
@@ -2332,103 +2369,6 @@ impl super::provider::PvaMonitor for AnyMonitor {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// pvxs `groupsource.cpp:596-606` refuses group PUT preparation for any
-/// field whose `dbChannelFinalFieldType` is in `DBF_INLINK..DBF_FWDLINK`
-/// — a DBF-class rule, not a name rule.
-///
-/// The durable fix classifies by DBF type. `epics-base-rs` does not yet
-/// expose a link-field DBF class (`DbFieldType` has no
-/// `INLINK`/`OUTLINK`/`FWDLINK` variants; link fields surface as
-/// `String`), so this is a NAME-based stopgap. It is intentionally a
-/// superset and is INCOMPLETE: a custom record type with a link field
-/// outside these families is not caught, and the real close requires
-/// `epics-base-rs` to expose the field's DBF class (tracked as a
-/// cross-crate follow-up). Until then we enumerate the standard EPICS
-/// Base link-field name families so the common record types reject
-/// link writes the same way pvxs does.
-///
-/// Covered families (all `DBF_INLINK`/`DBF_OUTLINK`/`DBF_FWDLINK` in
-/// EPICS Base `*.dbd.pod`):
-///   - `FLNK` (forward), `SDIS` (disable), `DOL`, `INP`, `OUT`
-///   - simulation links `SIOL` / `SIML` and `selRecord` `NVL`,
-///     `histogramRecord` `SVL`
-///   - indexed/lettered families: `INP*` / `OUT*` (calc/aSub),
-///     `DOL*` (`seqRecord` `DOL0..DOL9`/`DOLA`/`DOLF`), and
-///     `LNK*` (`seqRecord` `LNK0..LNK9`/`LNKF`) where `*` is a single
-///     alphanumeric character.
-fn member_targets_link_field(channel: &str) -> bool {
-    let (_, field) = epics_base_rs::server::database::parse_pv_name(channel);
-    let f = field.to_ascii_uppercase();
-    if matches!(
-        f.as_str(),
-        "FLNK" | "DOL" | "SDIS" | "INP" | "OUT" | "NVL" | "SVL" | "SIOL" | "SIML"
-    ) {
-        return true;
-    }
-    // Indexed/lettered link families: a known link prefix followed by
-    // exactly one alphanumeric suffix character. This is a superset
-    // (record-type specifics may treat a given `INPx` as non-link) but
-    // rejecting it through group PUT is the safe direction — pvxs's rule
-    // is "never write a link through a group".
-    for prefix in ["INP", "OUT", "DOL", "LNK"] {
-        if let Some(rest) = f.strip_prefix(prefix)
-            && rest.len() == 1
-            && rest.chars().next().unwrap().is_ascii_alphanumeric()
-        {
-            return true;
-        }
-    }
-    false
-}
-
-#[cfg(test)]
-mod link_field_tests {
-    use super::member_targets_link_field;
-
-    #[test]
-    fn link_class_field_names_rejected() {
-        for f in ["FLNK", "DOL", "SDIS", "INP", "OUT", "INPA", "OUTL", "INPZ"] {
-            assert!(
-                member_targets_link_field(&format!("REC.{f}")),
-                "expected {f} to be classified as a link field"
-            );
-        }
-    }
-
-    #[test]
-    fn standard_record_link_families_rejected() {
-        // The families the original name subset missed, each defined as
-        // a link field in EPICS Base `*.dbd.pod`:
-        //   seqRecord DOL0 (INLINK) / LNK0 (OUTLINK) / DOLA / DOLF / LNKF
-        //   selRecord NVL (INLINK); histogramRecord SVL (INLINK)
-        //   boRecord SIOL (OUTLINK) / SIML (INLINK)
-        for f in [
-            "DOL0", "LNK0", "DOLA", "DOLF", "LNKF", "NVL", "SVL", "SIOL", "SIML",
-        ] {
-            assert!(
-                member_targets_link_field(&format!("REC.{f}")),
-                "expected {f} to be classified as a link field"
-            );
-        }
-    }
-
-    #[test]
-    fn value_class_field_names_allowed() {
-        for f in ["VAL", "DESC", "EGU", "PREC", "SCAN", "HIHI", "LOLO", "RVAL"] {
-            assert!(
-                !member_targets_link_field(&format!("REC.{f}")),
-                "expected {f} to be classified as a value field, not a link"
-            );
-        }
-    }
-
-    #[test]
-    fn bare_record_default_is_val_not_link() {
-        // parse_pv_name returns ("REC", "VAL") for "REC".
-        assert!(!member_targets_link_field("REC"));
-    }
-}
-
 fn meta_desc() -> FieldDesc {
     FieldDesc::Structure {
         struct_id: "meta_t".into(),
@@ -3308,6 +3248,64 @@ mod tests {
             rfields.iter().any(|(n, _)| n == "_options"),
             "built-in record._options descriptor must be present: {rfields:?}"
         );
+    }
+
+    /// pvxs prepares a group PUT by iterating every backing field and
+    /// throwing "Links not supported for put" for any link-class field
+    /// (`dbChannelFinalFieldType` in `DBF_INLINK..=DBF_FWDLINK`,
+    /// groupsource.cpp:603-606) BEFORE any marked/putable filtering. A
+    /// sparse PUT marking only a scalar member must therefore still be
+    /// rejected when the same group binds a link field. The prior Rust path
+    /// gated the link check on `member_is_active`, so an unmarked link
+    /// member never rejected a partial PUT; it also classified by a
+    /// member-name heuristic rather than the actual DBF link class.
+    #[tokio::test]
+    async fn group_put_rejects_link_member_even_when_unmarked() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_pva_rs::pvdata::ScalarValue;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("LNK:rec", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+
+        // A scalar value member plus a forward-link member. `FLNK` is a
+        // dbCommon link field, so it resolves to a link class for every
+        // record type via the canonical `dbf_link_class` classifier.
+        let cfg = r#"{ "LNK:GRP": {
+            "v":   {"+type": "plain", "+channel": "LNK:rec.VAL", "+putorder": 0},
+            "fwd": {"+type": "plain", "+channel": "LNK:rec.FLNK", "+putorder": 1}
+        } }"#;
+        let mut defs = super::super::group_config::parse_group_config(cfg).unwrap();
+        let def = defs.pop().unwrap();
+        let channel = GroupChannel::new(db.clone(), def);
+
+        // Partial PUT marking ONLY the scalar value member; the link member
+        // is left unmarked.
+        let mut value = PvStructure::new("structure");
+        value.set("v", PvField::Scalar(ScalarValue::Double(2.0)));
+        let res = channel.put(&value).await;
+        assert!(
+            matches!(res, Err(BridgeError::PutRejected(_))),
+            "a partial group PUT marking only the scalar must be rejected \
+             when the group binds a link field (pvxs groupsource.cpp:603-606): {res:?}"
+        );
+
+        // Control: a group with only the scalar member accepts the same
+        // partial PUT, proving the rejection is the link member, not the
+        // partial shape.
+        let cfg_ok = r#"{ "OK:GRP": {
+            "v": {"+type": "plain", "+channel": "LNK:rec.VAL", "+putorder": 0}
+        } }"#;
+        let mut defs_ok = super::super::group_config::parse_group_config(cfg_ok).unwrap();
+        let def_ok = defs_ok.pop().unwrap();
+        let channel_ok = GroupChannel::new(db.clone(), def_ok);
+        let mut value_ok = PvStructure::new("structure");
+        value_ok.set("v", PvField::Scalar(ScalarValue::Double(3.0)));
+        channel_ok
+            .put(&value_ok)
+            .await
+            .expect("a scalar-only group PUT must succeed");
     }
 
     /// A QSRV group scalar member must derive its NT shape and DBF type

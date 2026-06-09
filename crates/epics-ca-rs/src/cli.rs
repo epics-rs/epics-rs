@@ -7,26 +7,49 @@ use epics_base_rs::types::EpicsValue;
 /// `EPICS_CLI_TIMEOUT` env var is set.
 pub const DEFAULT_CLI_TIMEOUT_SECS: f64 = 1.0;
 
+/// Deadline meaning "wait indefinitely", used for a CLI `-w 0` /
+/// `EPICS_CLI_TIMEOUT=0`. C `caget`/`caput`/`camonitor` pass `caTimeout`
+/// straight to `ca_pend_io` / `ca_pend_event`, where a value of `0.0`
+/// waits forever — `ca_pend_io(0)` calls `pendIO(DBL_MAX)` and
+/// `ca_pend_event(0)` loops `pendEvent(60.0)` without end (EPICS base
+/// `access.cpp:495-499,468-474`). A far-future finite `Duration`
+/// (≈10 years) reproduces that "0 == forever" without an `Option`,
+/// keeping the `Duration`-typed client API (`wait_connected`,
+/// `get_with_timeout`, `put_with_timeout`) unchanged; it is effectively
+/// unbounded for any CLI session and stays well inside tokio's timer
+/// range, so arming a `timeout` / `sleep` with it does not overflow.
+pub const INDEFINITE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10 * 365 * 24 * 60 * 60);
+
 /// Read `EPICS_CLI_TIMEOUT` from the environment, falling back to
-/// [`DEFAULT_CLI_TIMEOUT_SECS`] when unset, unparsable, or
-/// non-finite/non-positive. Mirrors C `tool_lib.c:use_ca_timeout_env`
-/// (commit 1d056c6) — the env var is consulted only when the caller
-/// did not pass `-w`/`--wait` on the command line.
+/// [`DEFAULT_CLI_TIMEOUT_SECS`] when unset, unparsable, or non-finite.
+/// Mirrors C `tool_lib.c:use_ca_timeout_env` (commit 1d056c6): it sets
+/// the timeout to any value `epicsScanDouble` accepts and only falls
+/// back to the default on a parse failure — the env var is consulted
+/// only when the caller did not pass `-w`/`--wait`. A value of `0` is a
+/// valid timeout meaning "wait forever" (see [`INDEFINITE_TIMEOUT`]), so
+/// it is passed through here and resolved by [`timeout_duration`];
+/// negatives and non-finite values stay clamped to the default.
 pub fn env_default_timeout() -> f64 {
     std::env::var("EPICS_CLI_TIMEOUT")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v > 0.0)
+        .filter(|v| v.is_finite() && *v >= 0.0)
         .unwrap_or(DEFAULT_CLI_TIMEOUT_SECS)
 }
 
 /// Convert a user-supplied timeout (CLI `-w` or env var) into a
-/// `std::time::Duration`. `Duration::from_secs_f64` panics on NaN /
-/// infinity / negative values; clap accepts those literally so this
-/// guard clamps to [`DEFAULT_CLI_TIMEOUT_SECS`] on the bad inputs.
-/// Mirrors the spirit of epics-base 1655d68e (defensive against
-/// pathological floats in CA timeout computation).
+/// `std::time::Duration`.
+///
+/// A value of `0` means "wait indefinitely", matching C `ca_pend_io(0)`
+/// / `ca_pend_event(0)` (see [`INDEFINITE_TIMEOUT`]) — NOT the 1 s
+/// default. `Duration::from_secs_f64` panics on NaN / infinity /
+/// negative values; clap accepts those literally so this guard clamps
+/// them to [`DEFAULT_CLI_TIMEOUT_SECS`] (defensive, epics-base 1655d68e).
 pub fn timeout_duration(secs: f64) -> std::time::Duration {
+    if secs == 0.0 {
+        return INDEFINITE_TIMEOUT;
+    }
     let s = if secs.is_finite() && secs > 0.0 {
         secs
     } else {
@@ -698,8 +721,6 @@ mod tests {
         assert_eq!(d.as_secs_f64(), DEFAULT_CLI_TIMEOUT_SECS);
         let d = timeout_duration(-1.0);
         assert_eq!(d.as_secs_f64(), DEFAULT_CLI_TIMEOUT_SECS);
-        let d = timeout_duration(0.0);
-        assert_eq!(d.as_secs_f64(), DEFAULT_CLI_TIMEOUT_SECS);
     }
 
     /// Sane positive values pass through unchanged.
@@ -707,6 +728,28 @@ mod tests {
     fn timeout_duration_preserves_positive_finite() {
         let d = timeout_duration(2.5);
         assert!((d.as_secs_f64() - 2.5).abs() < 1e-9);
+    }
+
+    /// C `caget`/`caput`/`camonitor` pass `-w 0` straight to
+    /// `ca_pend_io(0)` / `ca_pend_event(0)`, which wait forever. `-w 0`
+    /// must therefore resolve to the far-future [`INDEFINITE_TIMEOUT`],
+    /// NOT the 1 s default — the bug was clamping it to the default.
+    #[test]
+    fn timeout_zero_means_indefinite() {
+        assert_eq!(timeout_duration(0.0), INDEFINITE_TIMEOUT);
+        assert_eq!(timeout_duration(-0.0), INDEFINITE_TIMEOUT);
+        // Effectively unbounded: far longer than any CLI session.
+        assert!(INDEFINITE_TIMEOUT.as_secs() > 365 * 24 * 60 * 60);
+    }
+
+    /// `INDEFINITE_TIMEOUT` must be safe to arm a tokio timer with — a
+    /// duration that overflowed `Instant` would panic when `timeout` /
+    /// `sleep` computes its deadline. Proven by setting up a `timeout`
+    /// with it (the inner future is already ready, so it returns at once).
+    #[tokio::test]
+    async fn indefinite_timeout_arms_tokio_timer_without_panic() {
+        let r = tokio::time::timeout(INDEFINITE_TIMEOUT, async { 7 }).await;
+        assert_eq!(r.unwrap(), 7);
     }
 
     /// Env-var path must reject the same pathological set so a
@@ -725,6 +768,20 @@ mod tests {
         assert_eq!(env_default_timeout(), DEFAULT_CLI_TIMEOUT_SECS);
         unsafe { std::env::set_var("EPICS_CLI_TIMEOUT", "2.5") };
         assert!((env_default_timeout() - 2.5).abs() < 1e-9);
+        unsafe { std::env::remove_var("EPICS_CLI_TIMEOUT") };
+    }
+
+    /// C `use_ca_timeout_env` (tool_lib.c:646) sets `caTimeout` to any
+    /// value `epicsScanDouble` accepts — including `0`, which then means
+    /// "wait forever". `EPICS_CLI_TIMEOUT=0` must pass through as `0.0`
+    /// and resolve to [`INDEFINITE_TIMEOUT`], not the 1 s default.
+    #[serial_test::serial]
+    #[test]
+    fn env_zero_resolves_to_indefinite() {
+        // SAFETY: serial_test::serial guarantees no concurrent env access.
+        unsafe { std::env::set_var("EPICS_CLI_TIMEOUT", "0") };
+        assert_eq!(env_default_timeout(), 0.0);
+        assert_eq!(timeout_duration(env_default_timeout()), INDEFINITE_TIMEOUT);
         unsafe { std::env::remove_var("EPICS_CLI_TIMEOUT") };
     }
 

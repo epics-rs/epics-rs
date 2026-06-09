@@ -2585,6 +2585,17 @@ impl<'a> ConnectBuilder<'a> {
             }
             None => self.client.channel(&self.pv_name).await?,
         };
+        // pvxs samples the channel state in one worker dispatch right after
+        // `Channel::build()` and BEFORE the channel processes its
+        // CREATE_CHANNEL response (client.cpp:274-282): a freshly built
+        // channel is not yet Active, so the first connector fires the
+        // synthetic initial `onDisconnect`; an already-active shared channel
+        // fires only `onConnect`. Take that snapshot synchronously here,
+        // before the resolution driver below can run `ensure_active()` and
+        // flip the channel Active. Re-sampling inside the watcher task races
+        // the driver: on a fast/direct server the driver connects first and
+        // the first connector would skip the initial `on_disconnect`.
+        let initial_active = ch.is_active();
         let on_connect = self.on_connect;
         let on_disconnect = self.on_disconnect;
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -2627,8 +2638,12 @@ impl<'a> ConnectBuilder<'a> {
             // `onDisconnect` once (client.cpp:274-282). A fresh channel
             // is Idle, so a searchable connect fires `on_disconnect`
             // first — the previous passive watcher fired nothing for the
-            // initial not-connected state.
-            let mut was_active = ch.is_active();
+            // initial not-connected state. Use the snapshot captured in
+            // `exec()` before the resolution driver started, not a fresh
+            // `ch.is_active()` here: re-sampling inside this spawned task
+            // races the driver, which on a fast server can set the channel
+            // Active first and skip the initial `on_disconnect`.
+            let mut was_active = initial_active;
             if was_active {
                 if let Some(cb) = &on_connect {
                     cb();

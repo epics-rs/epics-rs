@@ -114,17 +114,23 @@ static LSO_FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "SIZV",
-        dbf_type: DbFieldType::Short,
+        // C declares SIZV as DBF_USHORT (lsoRecord.dbd.pod:128): the VAL buffer
+        // size is an unsigned 16-bit count (clamped to [16, 0x7fff] at init).
+        dbf_type: DbFieldType::UShort,
         read_only: false,
     },
     FieldDesc {
         name: "LEN",
-        dbf_type: DbFieldType::Long,
+        // C declares LEN as DBF_ULONG (lsoRecord.dbd.pod:135): the current
+        // string byte length is an unsigned 32-bit count.
+        dbf_type: DbFieldType::ULong,
         read_only: true,
     },
     FieldDesc {
         name: "OLEN",
-        dbf_type: DbFieldType::Long,
+        // C declares OLEN as DBF_ULONG (lsoRecord.dbd.pod:139): the previously
+        // posted byte length is an unsigned 32-bit count.
+        dbf_type: DbFieldType::ULong,
         read_only: true,
     },
     FieldDesc {
@@ -240,9 +246,9 @@ impl Record for LsoRecord {
         match name {
             "VAL" => Some(EpicsValue::CharArray(self.clamped().into_bytes())),
             "OVAL" => Some(EpicsValue::CharArray(self.oval.clone().into_bytes())),
-            "SIZV" => Some(EpicsValue::Short(self.sizv as i16)),
-            "LEN" => Some(EpicsValue::Long(self.len as i32)),
-            "OLEN" => Some(EpicsValue::Long(self.olen as i32)),
+            "SIZV" => Some(EpicsValue::UShort(self.sizv)),
+            "LEN" => Some(EpicsValue::ULong(self.len)),
+            "OLEN" => Some(EpicsValue::ULong(self.olen)),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
             "IVOV" => Some(EpicsValue::CharArray(self.ivov.clone().into_bytes())),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
@@ -278,12 +284,15 @@ impl Record for LsoRecord {
                 self.len = (self.val.len() + 1) as u32;
             }
             "SIZV" => {
-                if let EpicsValue::Short(v) = value {
-                    // C `lsoRecord.c:51-58`: SIZV clamps to [16, 0x7fff].
-                    self.sizv = (v as i32).clamp(16, 0x7fff) as u16;
-                } else {
-                    return Err(CaError::TypeMismatch("SIZV".into()));
-                }
+                // SIZV is DBF_USHORT (lsoRecord.dbd.pod:128): a client put
+                // arrives as UShort, internal callers may still pass Short.
+                let raw = match value {
+                    EpicsValue::UShort(v) => v as i32,
+                    EpicsValue::Short(v) => v as i32,
+                    _ => return Err(CaError::TypeMismatch("SIZV".into())),
+                };
+                // C `lsoRecord.c:51-58`: SIZV clamps to [16, 0x7fff].
+                self.sizv = raw.clamp(16, 0x7fff) as u16;
             }
             "IVOA" => {
                 if let EpicsValue::Short(v) = value {

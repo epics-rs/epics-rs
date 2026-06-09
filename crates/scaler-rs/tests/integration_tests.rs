@@ -85,7 +85,8 @@ record(scaler, "TEST:SC2") {
         .unwrap();
 
     let pr1 = server.get("TEST:SC2.PR1").await.unwrap();
-    assert_eq!(pr1, EpicsValue::Long(2_000_000), "PR1 = TP * FREQ");
+    // PR1 is DBF_ULONG (scalerRecord.dbd:945) -> native EpicsValue::ULong.
+    assert_eq!(pr1, EpicsValue::ULong(2_000_000), "PR1 = TP * FREQ");
 }
 
 // ============================================================
@@ -207,7 +208,8 @@ record(scaler, "TEST:SC5") {
     assert_eq!(nm2, EpicsValue::String("detector".into()));
 
     let s1 = server.get("TEST:SC5.S1").await.unwrap();
-    assert_eq!(s1, EpicsValue::Long(0));
+    // S1 is DBF_ULONG (scalerRecord.dbd:1334) -> native EpicsValue::ULong.
+    assert_eq!(s1, EpicsValue::ULong(0));
 }
 
 // ============================================================
@@ -307,7 +309,8 @@ async fn test_count_start_posts_pr1_tp_freq_monitor_events() {
         let rec = db.get_record("TEST:SCMON").await.unwrap();
         let mut inst = rec.write().await;
         let pr1 = inst
-            .add_subscriber("PR1", 1, DbFieldType::Long, EventMask::VALUE.bits())
+            // PR1 is DBF_ULONG (scalerRecord.dbd:945); subscribe with the native type.
+            .add_subscriber("PR1", 1, DbFieldType::ULong, EventMask::VALUE.bits())
             .expect("PR1 subscription accepted");
         let tp = inst
             .add_subscriber("TP", 2, DbFieldType::Double, EventMask::VALUE.bits())
@@ -354,7 +357,8 @@ async fn test_count_start_posts_pr1_tp_freq_monitor_events() {
     let expected_pr1 = QuantizingDriver::quantize(12_500_000); // NINT(1.0*1.25e7)
     assert_eq!(
         pr1_evt.snapshot.value,
-        EpicsValue::Long(expected_pr1 as i32),
+        // PR1 is DBF_ULONG (scalerRecord.dbd:945) -> native EpicsValue::ULong.
+        EpicsValue::ULong(expected_pr1),
         "posted PR1 must be the driver-programmed (quantized) preset"
     );
     assert_eq!(

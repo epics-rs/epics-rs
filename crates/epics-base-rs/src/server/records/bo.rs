@@ -6,11 +6,14 @@ use crate::types::{DbFieldType, EpicsValue};
 /// VAL is converted to RVAL using MASK before writing to hardware.
 pub struct BoRecord {
     pub val: u16,
-    pub rval: i32,
-    pub oraw: i32, // old raw value for monitor
-    pub rbv: i32,  // readback value
-    pub orbv: i32, // old readback value
-    pub mask: i32, // hardware mask from device support
+    // RVAL/ORAW/RBV/ORBV/MASK are DBF_ULONG (boRecord.dbd.pod:252/256/299/
+    // 303/261): unsigned 32-bit raw/readback/mask words. C stores epicsUInt32,
+    // so high-bit masks (e.g. 0x80000000) must round-trip without sign loss.
+    pub rval: u32,
+    pub oraw: u32, // old raw value for monitor
+    pub rbv: u32,  // readback value
+    pub orbv: u32, // old readback value
+    pub mask: u32, // hardware mask from device support
     // Strings
     pub znam: String,
     pub onam: String,
@@ -93,7 +96,7 @@ impl BoRecord {
                 self.rval = self.mask;
             }
         } else {
-            self.rval = self.val as i32;
+            self.rval = self.val as u32;
         }
     }
 }
@@ -140,27 +143,27 @@ static FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "RVAL",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
         name: "ORAW",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: true,
     },
     FieldDesc {
         name: "RBV",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: true,
     },
     FieldDesc {
         name: "ORBV",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: true,
     },
     FieldDesc {
         name: "MASK",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
@@ -190,12 +193,12 @@ static FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "LALM",
-        dbf_type: DbFieldType::Enum,
+        dbf_type: DbFieldType::UShort,
         read_only: true,
     },
     FieldDesc {
         name: "MLST",
-        dbf_type: DbFieldType::Enum,
+        dbf_type: DbFieldType::UShort,
         read_only: true,
     },
     FieldDesc {
@@ -220,7 +223,7 @@ static FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "IVOV",
-        dbf_type: DbFieldType::Enum,
+        dbf_type: DbFieldType::UShort,
         read_only: false,
     },
     FieldDesc {
@@ -252,14 +255,16 @@ impl Record for BoRecord {
 
     // C recBo.c IVOA=set_to_IVOV: val = ivov; rval = ivov.
     fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
-        // RVAL is Long; IVOV is Enum on this record. Coerce to Long.
-        let rval = match &ivov {
-            EpicsValue::Enum(e) => EpicsValue::Long(*e as i32),
-            EpicsValue::Short(s) => EpicsValue::Long(*s as i32),
-            other => other.clone(),
+        // IVOV is DBF_USHORT (boRecord.dbd.pod:372); VAL is the binary enum
+        // and RVAL is DBF_ULONG. Route the unsigned IVOV value into both.
+        let v: u16 = match &ivov {
+            EpicsValue::UShort(e) => *e,
+            EpicsValue::Enum(e) => *e,
+            EpicsValue::Short(s) => *s as u16,
+            other => return Err(CaError::TypeMismatch(format!("bo IVOV: {other:?}"))),
         };
-        self.put_field("RVAL", rval)?;
-        self.put_field("VAL", ivov)
+        self.put_field("RVAL", EpicsValue::ULong(u32::from(v)))?;
+        self.put_field("VAL", EpicsValue::Enum(v))
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
@@ -356,23 +361,23 @@ impl Record for BoRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Enum(self.val)),
-            "RVAL" => Some(EpicsValue::Long(self.rval)),
-            "ORAW" => Some(EpicsValue::Long(self.oraw)),
-            "RBV" => Some(EpicsValue::Long(self.rbv)),
-            "ORBV" => Some(EpicsValue::Long(self.orbv)),
-            "MASK" => Some(EpicsValue::Long(self.mask)),
+            "RVAL" => Some(EpicsValue::ULong(self.rval)),
+            "ORAW" => Some(EpicsValue::ULong(self.oraw)),
+            "RBV" => Some(EpicsValue::ULong(self.rbv)),
+            "ORBV" => Some(EpicsValue::ULong(self.orbv)),
+            "MASK" => Some(EpicsValue::ULong(self.mask)),
             "ZNAM" => Some(EpicsValue::String(self.znam.clone().into())),
             "ONAM" => Some(EpicsValue::String(self.onam.clone().into())),
             "ZSV" => Some(EpicsValue::Short(self.zsv)),
             "OSV" => Some(EpicsValue::Short(self.osv)),
             "COSV" => Some(EpicsValue::Short(self.cosv)),
-            "LALM" => Some(EpicsValue::Enum(self.lalm)),
-            "MLST" => Some(EpicsValue::Enum(self.mlst)),
+            "LALM" => Some(EpicsValue::UShort(self.lalm)),
+            "MLST" => Some(EpicsValue::UShort(self.mlst)),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
             "DOL" => Some(EpicsValue::String(self.dol.clone().into())),
             "HIGH" => Some(EpicsValue::Double(self.high)),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
-            "IVOV" => Some(EpicsValue::Enum(self.ivov)),
+            "IVOV" => Some(EpicsValue::UShort(self.ivov)),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
@@ -412,16 +417,26 @@ impl Record for BoRecord {
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
+            // RVAL/MASK are DBF_ULONG: a client put arrives as ULong, internal
+            // / device-support callers may still pass Long (same bit pattern).
             "RVAL" => match value {
-                EpicsValue::Long(v) => {
+                EpicsValue::ULong(v) => {
                     self.rval = v;
+                    Ok(())
+                }
+                EpicsValue::Long(v) => {
+                    self.rval = v as u32;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "MASK" => match value {
-                EpicsValue::Long(v) => {
+                EpicsValue::ULong(v) => {
                     self.mask = v;
+                    Ok(())
+                }
+                EpicsValue::Long(v) => {
+                    self.mask = v as u32;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -461,7 +476,13 @@ impl Record for BoRecord {
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
+            // LALM/MLST are DBF_USHORT: accept a client UShort put, tolerate an
+            // internal Enum (same u16 value).
             "LALM" => match value {
+                EpicsValue::UShort(v) => {
+                    self.lalm = v;
+                    Ok(())
+                }
                 EpicsValue::Enum(v) => {
                     self.lalm = v;
                     Ok(())
@@ -469,6 +490,10 @@ impl Record for BoRecord {
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "MLST" => match value {
+                EpicsValue::UShort(v) => {
+                    self.mlst = v;
+                    Ok(())
+                }
                 EpicsValue::Enum(v) => {
                     self.mlst = v;
                     Ok(())
@@ -503,7 +528,12 @@ impl Record for BoRecord {
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
+            // IVOV is DBF_USHORT: accept a client UShort put, tolerate Enum.
             "IVOV" => match value {
+                EpicsValue::UShort(v) => {
+                    self.ivov = v;
+                    Ok(())
+                }
                 EpicsValue::Enum(v) => {
                     self.ivov = v;
                     Ok(())

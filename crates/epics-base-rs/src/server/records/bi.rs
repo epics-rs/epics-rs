@@ -6,9 +6,12 @@ use crate::types::{DbFieldType, EpicsValue};
 /// RVAL from device support is converted to VAL (0 or 1).
 pub struct BiRecord {
     pub val: u16,
-    pub rval: i32,
-    pub oraw: i32, // old raw value for monitor
-    pub mask: i32, // hardware mask from device support
+    // RVAL/ORAW/MASK are DBF_ULONG (biRecord.dbd.pod:199/203/208): unsigned
+    // 32-bit raw/mask words. C stores epicsUInt32, so high-bit masks must
+    // round-trip without sign loss.
+    pub rval: u32,
+    pub oraw: u32, // old raw value for monitor
+    pub mask: u32, // hardware mask from device support
     // Strings
     pub znam: String,
     pub onam: String,
@@ -74,17 +77,17 @@ static FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "RVAL",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
         name: "ORAW",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: true,
     },
     FieldDesc {
         name: "MASK",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
@@ -114,12 +117,12 @@ static FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "LALM",
-        dbf_type: DbFieldType::Enum,
+        dbf_type: DbFieldType::UShort,
         read_only: true,
     },
     FieldDesc {
         name: "MLST",
-        dbf_type: DbFieldType::Enum,
+        dbf_type: DbFieldType::UShort,
         read_only: true,
     },
     FieldDesc {
@@ -238,7 +241,8 @@ impl Record for BiRecord {
         let rval = value.to_f64().map(|f| f as i32).ok_or_else(|| {
             CaError::TypeMismatch("bi Raw Soft Channel: INP value not numeric".into())
         })?;
-        self.rval = rval;
+        // RVAL is DBF_ULONG; preserve the bit pattern of the i32 conversion.
+        self.rval = rval as u32;
         if self.mask != 0 {
             self.rval &= self.mask;
         }
@@ -248,16 +252,16 @@ impl Record for BiRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Enum(self.val)),
-            "RVAL" => Some(EpicsValue::Long(self.rval)),
-            "ORAW" => Some(EpicsValue::Long(self.oraw)),
-            "MASK" => Some(EpicsValue::Long(self.mask)),
+            "RVAL" => Some(EpicsValue::ULong(self.rval)),
+            "ORAW" => Some(EpicsValue::ULong(self.oraw)),
+            "MASK" => Some(EpicsValue::ULong(self.mask)),
             "ZNAM" => Some(EpicsValue::String(self.znam.clone().into())),
             "ONAM" => Some(EpicsValue::String(self.onam.clone().into())),
             "ZSV" => Some(EpicsValue::Short(self.zsv)),
             "OSV" => Some(EpicsValue::Short(self.osv)),
             "COSV" => Some(EpicsValue::Short(self.cosv)),
-            "LALM" => Some(EpicsValue::Enum(self.lalm)),
-            "MLST" => Some(EpicsValue::Enum(self.mlst)),
+            "LALM" => Some(EpicsValue::UShort(self.lalm)),
+            "MLST" => Some(EpicsValue::UShort(self.mlst)),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
@@ -300,16 +304,26 @@ impl Record for BiRecord {
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
+            // RVAL/MASK are DBF_ULONG: a client put arrives as ULong, internal
+            // / device-support callers may still pass Long (same bit pattern).
             "RVAL" => match value {
-                EpicsValue::Long(v) => {
+                EpicsValue::ULong(v) => {
                     self.rval = v;
+                    Ok(())
+                }
+                EpicsValue::Long(v) => {
+                    self.rval = v as u32;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "MASK" => match value {
-                EpicsValue::Long(v) => {
+                EpicsValue::ULong(v) => {
                     self.mask = v;
+                    Ok(())
+                }
+                EpicsValue::Long(v) => {
+                    self.mask = v as u32;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -349,7 +363,13 @@ impl Record for BiRecord {
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
+            // LALM/MLST are DBF_USHORT: accept a client UShort put, tolerate an
+            // internal Enum (same u16 value).
             "LALM" => match value {
+                EpicsValue::UShort(v) => {
+                    self.lalm = v;
+                    Ok(())
+                }
                 EpicsValue::Enum(v) => {
                     self.lalm = v;
                     Ok(())
@@ -357,6 +377,10 @@ impl Record for BiRecord {
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "MLST" => match value {
+                EpicsValue::UShort(v) => {
+                    self.mlst = v;
+                    Ok(())
+                }
                 EpicsValue::Enum(v) => {
                     self.mlst = v;
                     Ok(())

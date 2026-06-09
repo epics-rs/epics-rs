@@ -104,22 +104,37 @@ fn test_read_only_scalar_fields() {
 #[test]
 fn test_get_put_indexed_s() {
     let rec = ScalerRecord::default();
-    // S fields are read-only
-    assert_eq!(rec.get_field("S1"), Some(EpicsValue::Long(0)));
-    assert_eq!(rec.get_field("S64"), Some(EpicsValue::Long(0)));
+    // S fields are read-only and DBF_ULONG (scalerRecord.dbd:1334-1649).
+    assert_eq!(rec.get_field("S1"), Some(EpicsValue::ULong(0)));
+    assert_eq!(rec.get_field("S64"), Some(EpicsValue::ULong(0)));
 
     let mut rec = rec;
-    assert!(rec.put_field("S1", EpicsValue::Long(100)).is_err());
+    assert!(rec.put_field("S1", EpicsValue::ULong(100)).is_err());
 }
 
 #[test]
 fn test_get_put_indexed_pr() {
     let mut rec = ScalerRecord::default();
+    // PR1..PR64 are DBF_ULONG (scalerRecord.dbd:945-1323); the legacy signed
+    // Long put is tolerated, the read-back is the native ULong.
     rec.put_field("PR1", EpicsValue::Long(1000000)).unwrap();
-    assert_eq!(rec.get_field("PR1"), Some(EpicsValue::Long(1000000)));
+    assert_eq!(rec.get_field("PR1"), Some(EpicsValue::ULong(1000000)));
 
-    rec.put_field("PR64", EpicsValue::Long(500)).unwrap();
-    assert_eq!(rec.get_field("PR64"), Some(EpicsValue::Long(500)));
+    rec.put_field("PR64", EpicsValue::ULong(500)).unwrap();
+    assert_eq!(rec.get_field("PR64"), Some(EpicsValue::ULong(500)));
+}
+
+// DBF_ULONG high-bit round-trip: a PR/S count >= 2^31 must survive without
+// sign loss. PR1..PR64 and S1..S64 are DBF_ULONG (scalerRecord.dbd:945-1649).
+#[test]
+fn test_scaler_pr_s_high_bit_round_trip() {
+    let mut rec = ScalerRecord::default();
+    rec.put_field("PR1", EpicsValue::ULong(0x8000_0000))
+        .unwrap();
+    assert_eq!(rec.get_field("PR1"), Some(EpicsValue::ULong(0x8000_0000)));
+    // S1 is read-only over put_field; device support fills it directly.
+    rec.s[0] = 0xDEAD_BEEF;
+    assert_eq!(rec.get_field("S1"), Some(EpicsValue::ULong(0xDEAD_BEEF)));
 }
 
 #[test]

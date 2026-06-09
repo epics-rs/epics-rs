@@ -748,8 +748,10 @@ impl DeviceSupport for AsynDeviceSupport {
         // `plsi->sizv` to initCommon as the per-record buffer size;
         // the read path (line 1117-1124) then writes up to sizv-1
         // bytes and stuffs `\0` at the boundary. For stringin /
-        // stringout (no SIZV) we keep the 256-byte default.
-        if let Some(EpicsValue::Short(sizv)) = record.get_field("SIZV") {
+        // stringout (no SIZV) we keep the 256-byte default. SIZV is
+        // DBF_USHORT (lsiRecord/lsoRecord/printfRecord.dbd.pod), so the
+        // field reads back as an unsigned 16-bit value.
+        if let Some(EpicsValue::UShort(sizv)) = record.get_field("SIZV") {
             if sizv > 0 {
                 self.octet_max_size = sizv as usize;
             }

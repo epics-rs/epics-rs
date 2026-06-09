@@ -9,10 +9,14 @@ use crate::types::{DbFieldType, EpicsValue};
 // On process: RVAL is shifted right by SHFT and stored in VAL and bit fields.
 pub struct MbbiDirectRecord {
     pub val: u32,
-    pub rval: i32,
-    pub oraw: i32,
-    pub mask: i32,
-    pub shft: i16,
+    // RVAL/ORAW/MASK are DBF_ULONG (mbbiDirectRecord.dbd.pod:112,116,121) —
+    // u32 so high-bit raw/mask values round-trip without sign loss.
+    pub rval: u32,
+    pub oraw: u32,
+    pub mask: u32,
+    // SHFT is DBF_USHORT (mbbiDirectRecord.dbd.pod:131). VAL/NOBT/MLST are
+    // DBF_LONG/DBF_SHORT (signed) on the Direct variant, unlike mbbi.
+    pub shft: u16,
     pub nobt: i16,
     pub mlst: u32,
     pub bits: [u8; 32], // B0-B1F
@@ -127,22 +131,22 @@ static MBBI_DIRECT_HEAD_FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "RVAL",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
         name: "ORAW",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: true,
     },
     FieldDesc {
         name: "MASK",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
         name: "SHFT",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::UShort,
         read_only: false,
     },
     FieldDesc {
@@ -214,7 +218,7 @@ impl Record for MbbiDirectRecord {
             // C `mbbiDirectRecord.c::init_record` — MASK from NOBT,
             // NOBT may span 1..32 (NUM_BITS 32).
             if self.mask == 0 && self.nobt > 0 && self.nobt <= 32 {
-                self.mask = ((1i64 << self.nobt) - 1) as i32;
+                self.mask = ((1i64 << self.nobt) - 1) as u32;
             }
             self.mlst = self.val;
             self.oraw = self.rval;
@@ -233,9 +237,9 @@ impl Record for MbbiDirectRecord {
                 // Same defect family as mbbi/mbbo: a CA-written SHFT
                 // >= 32 panics a bare `>>` in debug builds. `checked_shr`
                 // mapped to 0 matches the C UB-but-no-crash result.
-                raw = (raw as u32).checked_shr(self.shft as u32).unwrap_or(0) as i32;
+                raw = raw.checked_shr(self.shft as u32).unwrap_or(0);
             }
-            self.val = raw as u32;
+            self.val = raw;
             self.val_to_bits();
         }
         self.skip_convert = false;
@@ -253,10 +257,10 @@ impl Record for MbbiDirectRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Long(self.val as i32)),
-            "RVAL" => Some(EpicsValue::Long(self.rval)),
-            "ORAW" => Some(EpicsValue::Long(self.oraw)),
-            "MASK" => Some(EpicsValue::Long(self.mask)),
-            "SHFT" => Some(EpicsValue::Short(self.shft)),
+            "RVAL" => Some(EpicsValue::ULong(self.rval)),
+            "ORAW" => Some(EpicsValue::ULong(self.oraw)),
+            "MASK" => Some(EpicsValue::ULong(self.mask)),
+            "SHFT" => Some(EpicsValue::UShort(self.shft)),
             "NOBT" => Some(EpicsValue::Short(self.nobt)),
             "MLST" => Some(EpicsValue::Long(self.mlst as i32)),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
@@ -281,26 +285,30 @@ impl Record for MbbiDirectRecord {
                 }
                 self.val_to_bits();
             }
+            // RVAL/MASK are DBF_ULONG: accept the native ULong and tolerate
+            // the legacy signed Long (device support / autosave).
             "RVAL" => {
-                if let EpicsValue::Long(v) = value {
-                    self.rval = v;
-                } else {
-                    return Err(CaError::TypeMismatch("RVAL".into()));
-                }
+                self.rval = match value {
+                    EpicsValue::ULong(v) => v,
+                    EpicsValue::Long(v) => v as u32,
+                    _ => return Err(CaError::TypeMismatch("RVAL".into())),
+                };
             }
             "MASK" => {
-                if let EpicsValue::Long(v) = value {
-                    self.mask = v;
-                } else {
-                    return Err(CaError::TypeMismatch("MASK".into()));
-                }
+                self.mask = match value {
+                    EpicsValue::ULong(v) => v,
+                    EpicsValue::Long(v) => v as u32,
+                    _ => return Err(CaError::TypeMismatch("MASK".into())),
+                };
             }
+            // SHFT is DBF_USHORT: accept UShort, tolerate Enum/Short.
             "SHFT" => {
-                if let EpicsValue::Short(v) = value {
-                    self.shft = v;
-                } else {
-                    return Err(CaError::TypeMismatch("SHFT".into()));
-                }
+                self.shft = match value {
+                    EpicsValue::UShort(v) => v,
+                    EpicsValue::Enum(v) => v,
+                    EpicsValue::Short(v) => v as u16,
+                    _ => return Err(CaError::TypeMismatch("SHFT".into())),
+                };
             }
             "NOBT" => {
                 if let EpicsValue::Short(v) = value {

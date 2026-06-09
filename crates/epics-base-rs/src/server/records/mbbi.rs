@@ -5,12 +5,16 @@ use crate::types::{DbFieldType, EpicsValue};
 /// Multi-bit binary input record — manual Record impl for raw↔index conversion.
 pub struct MbbiRecord {
     pub val: u16,
-    pub rval: i32,
-    pub oraw: i32,
-    pub mask: i32,
-    pub shft: i16,
+    // RVAL/ORAW/MASK are DBF_ULONG (mbbiRecord.dbd.pod:604,608,613) — u32
+    // storage so high-bit (>= 2^31) raw/mask values round-trip without
+    // sign loss; served as EpicsValue::ULong.
+    pub rval: u32,
+    pub oraw: u32,
+    pub mask: u32,
+    // SHFT/NOBT/MLST/LALM are DBF_USHORT (mbbiRecord.dbd.pod:633,133,618,623).
+    pub shft: u16,
     pub sdef: bool,
-    pub nobt: i16,
+    pub nobt: u16,
     pub mlst: u16,
     pub lalm: u16,
     pub zrsv: i16,
@@ -36,22 +40,23 @@ pub struct MbbiRecord {
     pub aftc: f64,
     /// Alarm filter accumulator. 0 = initial sample.
     pub afvl: f64,
-    pub zrvl: i32,
-    pub onvl: i32,
-    pub twvl: i32,
-    pub thvl: i32,
-    pub frvl: i32,
-    pub fvvl: i32,
-    pub sxvl: i32,
-    pub svvl: i32,
-    pub eivl: i32,
-    pub nivl: i32,
-    pub tevl: i32,
-    pub elvl: i32,
-    pub tvvl: i32,
-    pub ttvl: i32,
-    pub ftvl: i32,
-    pub ffvl: i32,
+    // State raw values ZRVL..FFVL are DBF_ULONG (mbbiRecord.dbd.pod:144-264).
+    pub zrvl: u32,
+    pub onvl: u32,
+    pub twvl: u32,
+    pub thvl: u32,
+    pub frvl: u32,
+    pub fvvl: u32,
+    pub sxvl: u32,
+    pub svvl: u32,
+    pub eivl: u32,
+    pub nivl: u32,
+    pub tevl: u32,
+    pub elvl: u32,
+    pub tvvl: u32,
+    pub ttvl: u32,
+    pub ftvl: u32,
+    pub ffvl: u32,
     pub zrst: String,
     pub onst: String,
     pub twst: String,
@@ -162,7 +167,7 @@ impl MbbiRecord {
         }
     }
 
-    fn raw_values(&self) -> [i32; 16] {
+    fn raw_values(&self) -> [u32; 16] {
         [
             self.zrvl, self.onvl, self.twvl, self.thvl, self.frvl, self.fvvl, self.sxvl, self.svvl,
             self.eivl, self.nivl, self.tevl, self.elvl, self.tvvl, self.ttvl, self.ftvl, self.ffvl,
@@ -185,7 +190,7 @@ impl MbbiRecord {
         }
     }
 
-    fn raw_to_val(&self, raw: i32) -> u16 {
+    fn raw_to_val(&self, raw: u32) -> u16 {
         if !self.sdef {
             return raw as u16;
         }
@@ -215,22 +220,22 @@ static MBBI_FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "RVAL",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
         name: "ORAW",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: true,
     },
     FieldDesc {
         name: "MASK",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
         name: "SHFT",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::UShort,
         read_only: false,
     },
     // Simulation-mode fields. `mbbiRecord.c:125-126` declares SIML/SIOL
@@ -260,17 +265,17 @@ static MBBI_FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "MLST",
-        dbf_type: DbFieldType::Enum,
+        dbf_type: DbFieldType::UShort,
         read_only: true,
     },
     FieldDesc {
         name: "LALM",
-        dbf_type: DbFieldType::Enum,
+        dbf_type: DbFieldType::UShort,
         read_only: true,
     },
     FieldDesc {
         name: "NOBT",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::UShort,
         read_only: false,
     },
     FieldDesc {
@@ -375,82 +380,82 @@ static MBBI_FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "ZRVL",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
         name: "ONVL",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
         name: "TWVL",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
         name: "THVL",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
         name: "FRVL",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
         name: "FVVL",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
         name: "SXVL",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
         name: "SVVL",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
         name: "EIVL",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
         name: "NIVL",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
         name: "TEVL",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
         name: "ELVL",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
         name: "TVVL",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
         name: "TTVL",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
         name: "FTVL",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
         name: "FFVL",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
@@ -573,11 +578,41 @@ macro_rules! mbb_get_field {
 macro_rules! mbb_put_field {
     // `String`-variant fields store a Rust `String`; the extracted payload
     // is a `PvString`, so convert with `.as_str_lossy().into_owned()`.
-    (@put $self:expr, $field:ident, String, $v:expr) => {
-        $self.$field = $v.as_str_lossy().into_owned();
+    (@put $self:expr, $field:ident, String, $value:expr, $name:expr) => {
+        if let EpicsValue::String(v) = $value {
+            $self.$field = v.as_str_lossy().into_owned();
+        } else {
+            return Err(CaError::TypeMismatch($name.into()));
+        }
     };
-    (@put $self:expr, $field:ident, $variant:ident, $v:expr) => {
-        $self.$field = $v;
+    // DBF_ULONG fields (RVAL/ORAW/MASK/ZRVL..FFVL): accept the native
+    // unsigned carrier and tolerate the legacy signed `Long` that device
+    // support / autosave presented before these were retyped to their true
+    // unsigned dbd type (mbbiRecord.dbd.pod). The reinterpret preserves the
+    // bit pattern, so a high-bit value round-trips.
+    (@put $self:expr, $field:ident, ULong, $value:expr, $name:expr) => {
+        $self.$field = match $value {
+            EpicsValue::ULong(v) => v,
+            EpicsValue::Long(v) => v as u32,
+            _ => return Err(CaError::TypeMismatch($name.into())),
+        };
+    };
+    // DBF_USHORT fields (NOBT/SHFT/MLST/LALM): accept the native unsigned
+    // carrier and tolerate the legacy `Enum`/`Short` carriers.
+    (@put $self:expr, $field:ident, UShort, $value:expr, $name:expr) => {
+        $self.$field = match $value {
+            EpicsValue::UShort(v) => v,
+            EpicsValue::Enum(v) => v,
+            EpicsValue::Short(v) => v as u16,
+            _ => return Err(CaError::TypeMismatch($name.into())),
+        };
+    };
+    (@put $self:expr, $field:ident, $variant:ident, $value:expr, $name:expr) => {
+        if let EpicsValue::$variant(v) = $value {
+            $self.$field = v;
+        } else {
+            return Err(CaError::TypeMismatch($name.into()));
+        }
     };
     ($self:expr, $name:expr, $value:expr, $( $str:literal => $field:ident : $variant:ident ),* $(,)?) => {
         match $name {
@@ -589,13 +624,7 @@ macro_rules! mbb_put_field {
                     _ => return Err(CaError::TypeMismatch("VAL".into())),
                 }
             }
-            $( $str => {
-                if let EpicsValue::$variant(v) = $value {
-                    mbb_put_field!(@put $self, $field, $variant, v);
-                } else {
-                    return Err(CaError::TypeMismatch($str.into()));
-                }
-            } )*
+            $( $str => { mbb_put_field!(@put $self, $field, $variant, $value, $str); } )*
             _ => return Err(CaError::FieldNotFound($name.to_string())),
         }
     };
@@ -624,7 +653,7 @@ impl Record for MbbiRecord {
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
             if self.mask == 0 && self.nobt > 0 && self.nobt <= 32 {
-                self.mask = ((1i64 << self.nobt) - 1) as i32;
+                self.mask = ((1i64 << self.nobt) - 1) as u32;
             }
             self.compute_sdef();
             self.mlst = self.val;
@@ -643,7 +672,7 @@ impl Record for MbbiRecord {
                 // makes that shift UB in C (no crash). Rust `>>`
                 // panics in debug builds; `checked_shr` mapped to 0
                 // matches the defined fully-shifted-out result.
-                rval = (rval as u32).checked_shr(self.shft as u32).unwrap_or(0) as i32;
+                rval = rval.checked_shr(self.shft as u32).unwrap_or(0);
             }
             self.val = self.raw_to_val(rval);
         }
@@ -661,9 +690,9 @@ impl Record for MbbiRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         mbb_get_field!(self, name,
-            "RVAL" => rval: Long, "ORAW" => oraw: Long, "MASK" => mask: Long,
-            "SHFT" => shft: Short, "MLST" => mlst: Enum, "LALM" => lalm: Enum,
-            "NOBT" => nobt: Short,
+            "RVAL" => rval: ULong, "ORAW" => oraw: ULong, "MASK" => mask: ULong,
+            "SHFT" => shft: UShort, "MLST" => mlst: UShort, "LALM" => lalm: UShort,
+            "NOBT" => nobt: UShort,
             "SIMM" => simm: Short, "SIML" => siml: String, "SIOL" => siol: String,
             "SIMS" => sims: Short,
             "ZRSV" => zrsv: Short, "ONSV" => onsv: Short, "TWSV" => twsv: Short, "THSV" => thsv: Short,
@@ -672,10 +701,10 @@ impl Record for MbbiRecord {
             "TVSV" => tvsv: Short, "TTSV" => ttsv: Short, "FTSV" => ftsv: Short, "FFSV" => ffsv: Short,
             "UNSV" => unsv: Short, "COSV" => cosv: Short,
             "AFTC" => aftc: Double, "AFVL" => afvl: Double,
-            "ZRVL" => zrvl: Long, "ONVL" => onvl: Long, "TWVL" => twvl: Long, "THVL" => thvl: Long,
-            "FRVL" => frvl: Long, "FVVL" => fvvl: Long, "SXVL" => sxvl: Long, "SVVL" => svvl: Long,
-            "EIVL" => eivl: Long, "NIVL" => nivl: Long, "TEVL" => tevl: Long, "ELVL" => elvl: Long,
-            "TVVL" => tvvl: Long, "TTVL" => ttvl: Long, "FTVL" => ftvl: Long, "FFVL" => ffvl: Long,
+            "ZRVL" => zrvl: ULong, "ONVL" => onvl: ULong, "TWVL" => twvl: ULong, "THVL" => thvl: ULong,
+            "FRVL" => frvl: ULong, "FVVL" => fvvl: ULong, "SXVL" => sxvl: ULong, "SVVL" => svvl: ULong,
+            "EIVL" => eivl: ULong, "NIVL" => nivl: ULong, "TEVL" => tevl: ULong, "ELVL" => elvl: ULong,
+            "TVVL" => tvvl: ULong, "TTVL" => ttvl: ULong, "FTVL" => ftvl: ULong, "FFVL" => ffvl: ULong,
             "ZRST" => zrst: String, "ONST" => onst: String, "TWST" => twst: String, "THST" => thst: String,
             "FRST" => frst: String, "FVST" => fvst: String, "SXST" => sxst: String, "SVST" => svst: String,
             "EIST" => eist: String, "NIST" => nist: String, "TEST" => test: String, "ELST" => elst: String,
@@ -685,9 +714,9 @@ impl Record for MbbiRecord {
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         mbb_put_field!(self, name, value,
-            "RVAL" => rval: Long, "ORAW" => oraw: Long, "MASK" => mask: Long,
-            "SHFT" => shft: Short, "MLST" => mlst: Enum, "LALM" => lalm: Enum,
-            "NOBT" => nobt: Short,
+            "RVAL" => rval: ULong, "ORAW" => oraw: ULong, "MASK" => mask: ULong,
+            "SHFT" => shft: UShort, "MLST" => mlst: UShort, "LALM" => lalm: UShort,
+            "NOBT" => nobt: UShort,
             "SIMM" => simm: Short, "SIML" => siml: String, "SIOL" => siol: String,
             "SIMS" => sims: Short,
             "ZRSV" => zrsv: Short, "ONSV" => onsv: Short, "TWSV" => twsv: Short, "THSV" => thsv: Short,
@@ -696,10 +725,10 @@ impl Record for MbbiRecord {
             "TVSV" => tvsv: Short, "TTSV" => ttsv: Short, "FTSV" => ftsv: Short, "FFSV" => ffsv: Short,
             "UNSV" => unsv: Short, "COSV" => cosv: Short,
             "AFTC" => aftc: Double, "AFVL" => afvl: Double,
-            "ZRVL" => zrvl: Long, "ONVL" => onvl: Long, "TWVL" => twvl: Long, "THVL" => thvl: Long,
-            "FRVL" => frvl: Long, "FVVL" => fvvl: Long, "SXVL" => sxvl: Long, "SVVL" => svvl: Long,
-            "EIVL" => eivl: Long, "NIVL" => nivl: Long, "TEVL" => tevl: Long, "ELVL" => elvl: Long,
-            "TVVL" => tvvl: Long, "TTVL" => ttvl: Long, "FTVL" => ftvl: Long, "FFVL" => ffvl: Long,
+            "ZRVL" => zrvl: ULong, "ONVL" => onvl: ULong, "TWVL" => twvl: ULong, "THVL" => thvl: ULong,
+            "FRVL" => frvl: ULong, "FVVL" => fvvl: ULong, "SXVL" => sxvl: ULong, "SVVL" => svvl: ULong,
+            "EIVL" => eivl: ULong, "NIVL" => nivl: ULong, "TEVL" => tevl: ULong, "ELVL" => elvl: ULong,
+            "TVVL" => tvvl: ULong, "TTVL" => ttvl: ULong, "FTVL" => ftvl: ULong, "FFVL" => ffvl: ULong,
             "ZRST" => zrst: String, "ONST" => onst: String, "TWST" => twst: String, "THST" => thst: String,
             "FRST" => frst: String, "FVST" => fvst: String, "SXST" => sxst: String, "SVST" => svst: String,
             "EIST" => eist: String, "NIST" => nist: String, "TEST" => test: String, "ELST" => elst: String,
@@ -776,9 +805,15 @@ impl Record for MbbiRecord {
 
     /// Override set_val: convert raw value from hardware → enum index.
     fn set_val(&mut self, value: EpicsValue) -> CaResult<()> {
-        let raw = match value {
-            EpicsValue::Long(v) => v,
-            EpicsValue::Short(v) => v as i32,
+        // RVAL is DBF_ULONG (mbbiRecord.dbd.pod:604): a raw value from
+        // hardware is an unsigned 32-bit word. Accept the native ULong and
+        // the legacy signed carriers; the signed→unsigned reinterpret
+        // preserves the bit pattern (a sign-extended Short fills the upper
+        // bits, matching the prior i32 path).
+        let raw: u32 = match value {
+            EpicsValue::ULong(v) => v,
+            EpicsValue::Long(v) => v as u32,
+            EpicsValue::Short(v) => v as u32,
             EpicsValue::Enum(v) => {
                 // Already an index — store directly
                 self.val = v;
@@ -807,7 +842,7 @@ impl Record for MbbiRecord {
         let shifted = if self.shft > 0 {
             // See `process` — `checked_shr` so a CA-written SHFT >= 32
             // yields 0 instead of panicking in debug builds.
-            (raw as u32).checked_shr(self.shft as u32).unwrap_or(0) as i32
+            raw.checked_shr(self.shft as u32).unwrap_or(0)
         } else {
             raw
         };

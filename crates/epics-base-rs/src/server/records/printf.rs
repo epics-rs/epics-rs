@@ -520,7 +520,10 @@ static PRINTF_FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "SIZV",
-        dbf_type: DbFieldType::Short,
+        // C declares SIZV as DBF_USHORT (printfRecord.dbd.pod:202): the VAL
+        // buffer size is an unsigned 16-bit count (clamped to [16, 0x7fff]
+        // at init because dbAddr::field_size is signed, printfRecord.c:341).
+        dbf_type: DbFieldType::UShort,
         read_only: false,
     },
     FieldDesc {
@@ -668,7 +671,7 @@ impl Record for PrintfRecord {
         match name {
             "VAL" => Some(EpicsValue::CharArray(self.val.as_bytes().to_vec())),
             "LEN" => Some(EpicsValue::ULong(self.len)),
-            "SIZV" => Some(EpicsValue::Short(self.sizv as i16)),
+            "SIZV" => Some(EpicsValue::UShort(self.sizv)),
             "FMT" => Some(EpicsValue::String(self.fmt.clone().into())),
             "IVLS" => Some(EpicsValue::String(self.ivls.clone().into())),
             _ => {
@@ -686,10 +689,16 @@ impl Record for PrintfRecord {
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
         match name {
             "SIZV" => {
-                if let EpicsValue::Short(v) = value {
-                    // C `init_record`: SIZV clamps to [16, 0x7fff].
-                    let v = (v as i32).clamp(16, 0x7fff);
-                    self.sizv = v as u16;
+                // SIZV is DBF_USHORT (printfRecord.dbd.pod:202): a client put
+                // arrives as UShort, internal callers may still pass Short.
+                let raw = match value {
+                    EpicsValue::UShort(v) => Some(v as i32),
+                    EpicsValue::Short(v) => Some(v as i32),
+                    _ => None,
+                };
+                if let Some(raw) = raw {
+                    // C printfRecord.c:337-342 clamps SIZV to [16, 0x7fff].
+                    self.sizv = raw.clamp(16, 0x7fff) as u16;
                 }
             }
             "FMT" => {

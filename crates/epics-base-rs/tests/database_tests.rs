@@ -1407,9 +1407,10 @@ async fn test_bo_ivoa_set_to_ivov_writes_rval() {
         .unwrap();
 
     // After IVOA=2, RVAL must equal IVOV (=1) — pre-fix it stayed at 0.
+    // RVAL is DBF_ULONG (boRecord.dbd.pod:252).
     let rval = db.get_pv("BO_SRC.RVAL").await.unwrap();
     assert!(
-        matches!(rval, EpicsValue::Long(1)),
+        matches!(rval, EpicsValue::ULong(1)),
         "BO_SRC.RVAL must equal IVOV(1): got {rval:?}"
     );
 }
@@ -2130,9 +2131,10 @@ async fn test_bi_raw_soft_channel_inp_applies_mask() {
     if let Some(rec) = db.get_record("BI_RAW").await {
         let inst = rec.read().await;
         let rval = inst.record.get_field("RVAL");
+        // RVAL is DBF_ULONG (biRecord.dbd.pod:199).
         assert_eq!(
             rval,
-            Some(EpicsValue::Long(0x0F)),
+            Some(EpicsValue::ULong(0x0F)),
             "MASK must clamp RVAL to low nibble"
         );
         let val = inst.record.get_field("VAL");
@@ -5847,14 +5849,15 @@ async fn test_ca_put_mbbo_val_recomputes_rval() {
         Some(EpicsValue::Enum(3)),
         "VAL holds the CA-written value"
     );
+    // RVAL/ORAW are DBF_ULONG (mbboRecord.dbd.pod:620,624).
     assert_eq!(
         inst.record.get_field("RVAL"),
-        Some(EpicsValue::Long(48)),
+        Some(EpicsValue::ULong(48)),
         "RVAL must be recomputed from the new VAL (3 << 4), not left stale at 0"
     );
     assert_eq!(
         inst.record.get_field("ORAW"),
-        Some(EpicsValue::Long(48)),
+        Some(EpicsValue::ULong(48)),
         "ORAW must roll forward to the freshly converted RVAL"
     );
 }
@@ -5879,14 +5882,15 @@ async fn test_ca_put_mbbo_direct_val_recomputes_rval() {
 
     let rec = db.get_record("MBBOD_CA").await.unwrap();
     let inst = rec.read().await;
+    // RVAL/ORAW are DBF_ULONG (mbboDirectRecord.dbd.pod:167,172).
     assert_eq!(
         inst.record.get_field("RVAL"),
-        Some(EpicsValue::Long(80)),
+        Some(EpicsValue::ULong(80)),
         "RVAL must be recomputed from the new VAL (5 << 4), not left stale at 0"
     );
     assert_eq!(
         inst.record.get_field("ORAW"),
-        Some(EpicsValue::Long(80)),
+        Some(EpicsValue::ULong(80)),
         "ORAW must roll forward to the freshly converted RVAL"
     );
 }

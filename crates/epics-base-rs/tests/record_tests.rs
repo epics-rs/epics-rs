@@ -126,7 +126,40 @@ fn test_bi_raw_soft_channel_mask_zero_passthrough() {
     rec.mask = 0;
     rec.apply_raw_input(EpicsValue::Long(0xDEAD_BEEFu32 as i32))
         .unwrap();
-    assert_eq!(rec.rval, 0xDEAD_BEEFu32 as i32);
+    // RVAL is DBF_ULONG (biRecord.dbd.pod:199); same bit pattern, unsigned.
+    assert_eq!(rec.rval, 0xDEAD_BEEF_u32);
+}
+
+// DBF_ULONG high-bit round-trip: a MASK/RVAL value >= 2^31 must survive
+// without sign loss — the regression an i32 storage would introduce. C
+// declares bo.MASK/RVAL as DBF_ULONG (boRecord.dbd.pod:261/252).
+#[test]
+fn test_bo_mask_rval_high_bit_round_trip() {
+    use epics_base_rs::server::records::bo::BoRecord;
+    let mut rec = BoRecord::new(0);
+    rec.put_field("MASK", EpicsValue::ULong(0x8000_0000))
+        .unwrap();
+    assert_eq!(rec.get_field("MASK"), Some(EpicsValue::ULong(0x8000_0000)));
+    rec.put_field("RVAL", EpicsValue::ULong(0xDEAD_BEEF))
+        .unwrap();
+    assert_eq!(rec.get_field("RVAL"), Some(EpicsValue::ULong(0xDEAD_BEEF)));
+}
+
+// DBF_ULONG high-bit round-trip for the mbbo state-value table: a ZRVL
+// >= 2^31 must survive read-back and flow into RVAL through convert()
+// without sign loss. C declares mbbo.ZRVL..FFVL and RVAL as DBF_ULONG
+// (mbboRecord.dbd.pod:222/620).
+#[test]
+fn test_mbbo_zrvl_high_bit_round_trip() {
+    use epics_base_rs::server::records::mbbo::MbboRecord;
+    let mut rec = MbboRecord::new(0);
+    rec.put_field("ZRVL", EpicsValue::ULong(0x8000_0000))
+        .unwrap();
+    assert_eq!(rec.get_field("ZRVL"), Some(EpicsValue::ULong(0x8000_0000)));
+    // With a defined state table and VAL=0, convert() copies ZRVL into
+    // RVAL; the high bit must not be lost to sign.
+    rec.init_record(0).unwrap();
+    assert_eq!(rec.get_field("RVAL"), Some(EpicsValue::ULong(0x8000_0000)));
 }
 
 // A masked-to-zero raw read must yield VAL=0 even when the source
@@ -1514,7 +1547,8 @@ fn test_mbbi_lalm_updates_when_cosv_set() {
         .record
         .get_field("LALM")
         .and_then(|v| match v {
-            EpicsValue::Enum(s) => Some(s),
+            // LALM is DBF_USHORT (mbbiRecord.dbd.pod:623).
+            EpicsValue::UShort(s) => Some(s),
             _ => None,
         })
         .expect("LALM readable");
@@ -1534,7 +1568,8 @@ fn test_mbbi_lalm_updates_when_cosv_set() {
         .record
         .get_field("LALM")
         .and_then(|v| match v {
-            EpicsValue::Enum(s) => Some(s),
+            // LALM is DBF_USHORT (mbbiRecord.dbd.pod:623).
+            EpicsValue::UShort(s) => Some(s),
             _ => None,
         })
         .expect("LALM readable");
@@ -1576,8 +1611,9 @@ fn test_bi_lalm_updates_when_cosv_set() {
     let lalm = inst
         .record
         .get_field("LALM")
+        // LALM is DBF_USHORT (biRecord.dbd.pod:213).
         .and_then(|v| match v {
-            EpicsValue::Enum(s) => Some(s),
+            EpicsValue::UShort(s) => Some(s),
             _ => None,
         })
         .expect("LALM readable");

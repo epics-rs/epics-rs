@@ -111,17 +111,23 @@ static LSI_FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "SIZV",
-        dbf_type: DbFieldType::Short,
+        // C declares SIZV as DBF_USHORT (lsiRecord.dbd.pod:75): the VAL buffer
+        // size is an unsigned 16-bit count (clamped to [16, 0x7fff] at init).
+        dbf_type: DbFieldType::UShort,
         read_only: false,
     },
     FieldDesc {
         name: "LEN",
-        dbf_type: DbFieldType::Long,
+        // C declares LEN as DBF_ULONG (lsiRecord.dbd.pod:82): the current
+        // string byte length is an unsigned 32-bit count.
+        dbf_type: DbFieldType::ULong,
         read_only: true,
     },
     FieldDesc {
         name: "OLEN",
-        dbf_type: DbFieldType::Long,
+        // C declares OLEN as DBF_ULONG (lsiRecord.dbd.pod:86): the previously
+        // posted byte length is an unsigned 32-bit count.
+        dbf_type: DbFieldType::ULong,
         read_only: true,
     },
     FieldDesc {
@@ -213,9 +219,9 @@ impl Record for LsiRecord {
         match name {
             "VAL" => Some(EpicsValue::CharArray(self.clamped().into_bytes())),
             "OVAL" => Some(EpicsValue::CharArray(self.oval.clone().into_bytes())),
-            "SIZV" => Some(EpicsValue::Short(self.sizv as i16)),
-            "LEN" => Some(EpicsValue::Long(self.len as i32)),
-            "OLEN" => Some(EpicsValue::Long(self.olen as i32)),
+            "SIZV" => Some(EpicsValue::UShort(self.sizv)),
+            "LEN" => Some(EpicsValue::ULong(self.len)),
+            "OLEN" => Some(EpicsValue::ULong(self.olen)),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
@@ -250,12 +256,15 @@ impl Record for LsiRecord {
                 self.len = (self.val.len() + 1) as u32;
             }
             "SIZV" => {
-                if let EpicsValue::Short(v) = value {
-                    // C `lsiRecord.c:46-55`: SIZV clamps to [16, 0x7fff].
-                    self.sizv = (v as i32).clamp(16, 0x7fff) as u16;
-                } else {
-                    return Err(CaError::TypeMismatch("SIZV".into()));
-                }
+                // SIZV is DBF_USHORT (lsiRecord.dbd.pod:75): a client put
+                // arrives as UShort, internal callers may still pass Short.
+                let raw = match value {
+                    EpicsValue::UShort(v) => v as i32,
+                    EpicsValue::Short(v) => v as i32,
+                    _ => return Err(CaError::TypeMismatch("SIZV".into())),
+                };
+                // C `lsiRecord.c:46-55`: SIZV clamps to [16, 0x7fff].
+                self.sizv = raw.clamp(16, 0x7fff) as u16;
             }
             "SIMM" => {
                 if let EpicsValue::Short(v) = value {

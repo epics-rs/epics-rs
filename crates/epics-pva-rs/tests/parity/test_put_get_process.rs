@@ -245,6 +245,55 @@ async fn put_get_with_request_value_round_trips() {
     let _ = tokio::time::timeout(Duration::from_secs(2), server.wait()).await;
 }
 
+/// Plain GET carrying a caller-supplied pvRequest (the PVA-gateway GET
+/// forward path). The explicit `field(value)` pvRequest is encoded at GET
+/// INIT; a malformed encoding would fail the server's `request_to_mask`
+/// rather than return the value, so a successful readback proves the
+/// pvRequest reached the server's GET. A prior PUT sets the stored value
+/// to a non-default 42 so the readback is unambiguous.
+#[tokio::test]
+async fn get_with_request_value_round_trips() {
+    let (port, udp) = alloc_port();
+    let cfg = PvaServerConfig {
+        tcp_port: port,
+        udp_port: udp,
+        ..Default::default()
+    };
+    let src = DoublingSource::new();
+    let server = PvaServer::start(Arc::new(src.clone()), cfg).expect("test server must start");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = client_to(port);
+
+    // PUT 21 → source stores 42 (doubled), so the GET readback is unambiguous.
+    tokio::time::timeout(Duration::from_secs(3), client.pvput("dut", "21"))
+        .await
+        .expect("pvput timed out")
+        .expect("pvput failed");
+
+    let req = epics_pva_rs::pv_request::PvRequestBuilder::new()
+        .field("value")
+        .build()
+        .to_pv_field();
+
+    let (_intro, readback) = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.pvget_pv_field_with_request_value("dut", &req),
+    )
+    .await
+    .expect("pvget_pv_field_with_request_value timed out")
+    .expect("pvget_pv_field_with_request_value failed");
+
+    assert_eq!(
+        int_value(&readback),
+        42,
+        "GET-with-request readback should be the stored (doubled) value"
+    );
+
+    server.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(2), server.wait()).await;
+}
+
 /// PUT_GET then a plain GET observe the same post-put value — the
 /// PUT_GET op leaves the channel in a consistent state.
 #[tokio::test]

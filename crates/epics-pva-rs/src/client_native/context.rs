@@ -683,6 +683,38 @@ impl PvaClient {
         Ok(v)
     }
 
+    /// GET carrying the caller's decoded pvRequest (e.g. a PVA gateway's
+    /// preserved `ChannelContext.pv_request`) rather than the default
+    /// value-only request, returning `(introspection, value)`. The
+    /// GET-side counterpart of [`Self::pvput_pv_field_with_request_value`]:
+    /// the pvRequest — carrying field selection and provider create-time
+    /// options such as `record._options.atomic` — is serialized in the
+    /// connection's negotiated byte order and sent at GET INIT.
+    ///
+    /// pva2pva forwards the exact downstream pvRequest into
+    /// `createChannelGet(..., pvRequest)` (`p2pApp/channel.cpp:109-114`), so
+    /// upstream providers that interpret GET pvRequest options (e.g. pvxs
+    /// QSRV group GET reading `record._options.atomic` from
+    /// `getOperation->pvRequest()`, `groupsource.cpp:479-481`) see the
+    /// downstream request; the default [`Self::pvget`] would drop it.
+    pub async fn pvget_pv_field_with_request_value(
+        &self,
+        pv_name: &str,
+        pv_request: &crate::pvdata::PvField,
+    ) -> PvaResult<(FieldDesc, PvField)> {
+        let ch = self.channel(pv_name).await?;
+        let order =
+            crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
+                .await?
+                .0
+                .byte_order();
+        let mut bytes = Vec::new();
+        let desc = pv_request.descriptor();
+        crate::pvdata::encode::encode_type_desc(&desc, order, &mut bytes);
+        crate::pvdata::encode::encode_pv_field(pv_request, &desc, order, &mut bytes);
+        crate::client_native::ops_v2::op_get_raw(&ch, &bytes, self.inner.timeout).await
+    }
+
     /// I-3: explicit "connect, then return" — wait for the named
     /// channel to reach `Active` state without issuing a GET/PUT/
     /// MONITOR. Mirrors pvxs `Context::connect(pvname)`. Useful

@@ -678,12 +678,13 @@ pub async fn op_put_tokens(
     raw_pv_req: Option<&[u8]>,
     op_timeout: Duration,
 ) -> PvaResult<()> {
-    op_put_inner_build(channel, raw_pv_req, op_timeout, |intro| {
-        Ok((
-            build_put_value_from_tokens(intro, tokens)?,
-            value_only_bit_set(intro),
-        ))
-    })
+    op_put_inner_build(
+        channel,
+        raw_pv_req,
+        op_timeout,
+        value_target_is_enum,
+        |intro, previous| build_put_value_mode(intro, tokens, previous),
+    )
     .await
 }
 
@@ -707,9 +708,13 @@ pub async fn op_put_args(
     // returns every writable field for classification, matching
     // pvAccessCPP's empty default request (pvutils.cpp:31).
     let pv_req = raw_pv_req.unwrap_or_else(|| sentinel_all_fields());
-    op_put_inner_build(channel, Some(pv_req), op_timeout, |intro| {
-        build_put_from_args(intro, tokens)
-    })
+    op_put_inner_build(
+        channel,
+        Some(pv_req),
+        op_timeout,
+        value_target_is_enum,
+        |intro, previous| build_put_from_args(intro, tokens, previous),
+    )
     .await
 }
 
@@ -1495,12 +1500,21 @@ async fn op_put_inner(
     raw_pv_req: Option<&[u8]>,
     op_timeout: Duration,
 ) -> PvaResult<()> {
-    op_put_inner_build(channel, raw_pv_req, op_timeout, |intro| {
-        Ok((
-            build_put_value(intro, value_str)?,
-            value_only_bit_set(intro),
-        ))
-    })
+    op_put_inner_build(
+        channel,
+        raw_pv_req,
+        op_timeout,
+        // No get-first snapshot: the programmatic single-value put has no
+        // choice menu to match an enum label against, so it stays one round
+        // trip and the value lowers as-is.
+        |_intro| false,
+        |intro, _previous| {
+            Ok((
+                build_put_value(intro, value_str)?,
+                value_only_bit_set(intro),
+            ))
+        },
+    )
     .await
 }
 
@@ -1512,14 +1526,26 @@ async fn op_put_inner(
 /// length to drop) get the prototype before they commit. `build_value`
 /// runs synchronously between the INIT reply and the DATA send — no
 /// await crosses it.
-async fn op_put_inner_build<FB>(
+///
+/// When `wants_previous(&intro)` is true, a get-first snapshot is fetched
+/// between INIT and the build and handed to `build_value` as
+/// `Some(&previous)`. pvput always issues the PUT with get=true
+/// (pvput.cpp:409) so it can resolve an enum write by choice label
+/// (pvput.cpp:186-188); here the snapshot is fetched only for the
+/// prototypes that need it, so an ordinary scalar PUT keeps its single
+/// round trip and a write-only PV is not gated on a GET. A failed snapshot
+/// is best-effort (`None`): the builder still runs and falls back to the
+/// no-snapshot path.
+async fn op_put_inner_build<FB, WP>(
     channel: &Arc<Channel>,
     raw_pv_req: Option<&[u8]>,
     op_timeout: Duration,
+    wants_previous: WP,
     build_value: FB,
 ) -> PvaResult<()>
 where
-    FB: FnOnce(&FieldDesc) -> PvaResult<(PvField, BitSet)>,
+    FB: FnOnce(&FieldDesc, Option<&PvField>) -> PvaResult<(PvField, BitSet)>,
+    WP: FnOnce(&FieldDesc) -> bool,
 {
     let (server, sid) = ensure_active_with_op_timeout(channel, op_timeout).await?;
     let order = server.byte_order();
@@ -1560,11 +1586,22 @@ where
     ioid_guard.arm_destroy(sid);
     let intro = init.introspection;
 
+    // Get-first snapshot for builders that resolve against the current
+    // value (e.g. an enum write matched by choice label). Fetched only when
+    // the prototype calls for it, and best-effort — a failure leaves the
+    // builder to fall back to its no-snapshot path. pvput.cpp:409 (get=true)
+    // / pvput.cpp:186-188.
+    let previous = if wants_previous(&intro) {
+        op_get(channel, &[], op_timeout).await.ok().map(|(_, v)| v)
+    } else {
+        None
+    };
+
     // Build the value AND its changed-bitset against the prototype. The
     // builder owns the changed-bit decision because only it knows which
     // fields it actually wrote: a bare `.value` write marks the value
     // bit, a deferred field=value delta marks each assigned path's bit.
-    let (value, changed) = build_value(&intro)?;
+    let (value, changed) = build_value(&intro, previous.as_ref())?;
 
     // DATA
     let mut payload = Vec::new();
@@ -4547,6 +4584,101 @@ fn value_only_bit_set(intro: &FieldDesc) -> BitSet {
     changed
 }
 
+/// True when the prototype's writable `.value` is an `enum_t` structure
+/// (NTEnum) — the case pvput handles by writing `value.index` rather than
+/// the whole `.value` (pvput.cpp:180). The `index` member is required so a
+/// degenerate `enum_t`-named structure without it is not mistaken for one.
+fn value_target_is_enum(intro: &FieldDesc) -> bool {
+    matches!(
+        value_target_desc(intro),
+        FieldDesc::Structure { struct_id, fields }
+            if struct_id == "enum_t" && fields.iter().any(|(n, _)| n == "index")
+    )
+}
+
+/// The `value.choices` labels from a previously-fetched value snapshot, used
+/// to resolve an enum write by label. `None` when the snapshot is absent or
+/// does not carry a `value.choices` string array.
+fn enum_choices_from_previous(previous: &PvField) -> Option<Vec<String>> {
+    match value_at_path(previous, &["value", "choices"])? {
+        PvField::ScalarArray(items) => Some(
+            items
+                .iter()
+                .map(|sv| sv.to_string())
+                .collect::<Vec<String>>(),
+        ),
+        _ => None,
+    }
+}
+
+/// Resolve a bare enum token to its `index`, matching the current choice
+/// labels first and falling back to an integer index — pvput.cpp:190-202:
+/// a token equal to a choice writes that choice's position, otherwise it is
+/// parsed as the integer index directly. `choices` is `None` when no
+/// get-first snapshot is available (the integer fallback still applies).
+fn resolve_enum_index(token: &str, choices: Option<&[String]>) -> PvaResult<i32> {
+    if let Some(choices) = choices {
+        if let Some(i) = choices.iter().position(|c| c == token) {
+            return Ok(i as i32);
+        }
+    }
+    token.trim().parse::<i32>().map_err(|_| {
+        PvaError::InvalidValue(format!(
+            "enum value '{token}' is neither a choice label nor an integer index"
+        ))
+    })
+}
+
+/// Build the `(value, changed-bits)` delta for a bare write to an `enum_t`
+/// `.value`: set `value.index` to the resolved index and mark ONLY that bit
+/// (pvput.cpp:180-204, `args.tosend.set(idxfld->getFieldOffset())`). Leaving
+/// `value.choices` unmarked means the server keeps the menu it already
+/// holds — marking the whole `.value` would clobber `choices` with an empty
+/// array.
+fn build_enum_value_delta(intro: &FieldDesc, index: i32) -> PvaResult<(PvField, BitSet)> {
+    let mut value = crate::pvdata::encode::default_value_for(intro);
+    assign_at_path(
+        &mut value,
+        &["value", "index"],
+        PvField::Scalar(ScalarValue::Int(index)),
+    );
+    let bit = intro.bit_for_path("value.index").ok_or_else(|| {
+        PvaError::InvalidValue("enum prototype has no value.index field".to_string())
+    })?;
+    let mut changed = BitSet::new();
+    changed.set(bit);
+    Ok((value, changed))
+}
+
+/// Plain-value (bare token) PUT mode against the `.value` member, the single
+/// owner of pvput.cpp:155-207. An `enum_t` `.value` resolves the lone token
+/// to `value.index` (by choice label, then integer) using the optional
+/// get-first snapshot `previous`, marking only `value.index`; every other
+/// shape lowers through [`build_put_value_from_tokens`] and marks the
+/// `.value` bit. Shared by the deferred CLI classifier
+/// ([`build_put_from_args`]) and the legacy positional token form
+/// ([`op_put_tokens`]).
+fn build_put_value_mode(
+    intro: &FieldDesc,
+    tokens: &[String],
+    previous: Option<&PvField>,
+) -> PvaResult<(PvField, BitSet)> {
+    if value_target_is_enum(intro) {
+        if tokens.len() != 1 {
+            return Err(PvaError::InvalidValue(
+                "Can't assign multiple values to enum".to_string(),
+            ));
+        }
+        let choices = previous.and_then(enum_choices_from_previous);
+        let index = resolve_enum_index(&tokens[0], choices.as_deref())?;
+        return build_enum_value_delta(intro, index);
+    }
+    Ok((
+        build_put_value_from_tokens(intro, tokens)?,
+        value_only_bit_set(intro),
+    ))
+}
+
 /// One leaf of a multi-field PUT assignment. The leaf kind is explicit
 /// so the single delta owner ([`build_field_delta`]) places each value
 /// the right way: a [`PutLeaf::Str`] is parsed against the target
@@ -4906,7 +5038,11 @@ fn build_put_field_pairs(
 /// leaf-level marking); every other bare value lowers through
 /// [`build_put_value_from_tokens`] (legacy positional array length-drop)
 /// and field pairs lower through [`build_put_field_pairs`] (JSON-aware).
-fn build_put_from_args(intro: &FieldDesc, tokens: &[String]) -> PvaResult<(PvField, BitSet)> {
+fn build_put_from_args(
+    intro: &FieldDesc,
+    tokens: &[String],
+    previous: Option<&PvField>,
+) -> PvaResult<(PvField, BitSet)> {
     // pvput.cpp:124-130: an unresolved `f=v` is a bare string value only
     // when the writable `.value` target is a `string` scalar.
     let value_is_string = matches!(
@@ -4976,9 +5112,10 @@ fn build_put_from_args(intro: &FieldDesc, tokens: &[String]) -> PvaResult<(PvFie
     }
 
     if pairs.is_empty() {
-        // Plain value mode → `.value` (pvput.cpp:155-207).
-        let value = build_put_value_from_tokens(intro, &bare)?;
-        Ok((value, value_only_bit_set(intro)))
+        // Plain value mode → `.value` (pvput.cpp:155-207), enum-aware: an
+        // `enum_t` `.value` resolves the token to `value.index` against the
+        // get-first `previous` snapshot.
+        build_put_value_mode(intro, &bare, previous)
     } else {
         // Field=value mode (pvput.cpp:209-244), JSON-aware.
         build_put_field_pairs(intro, &pairs)
@@ -5538,7 +5675,7 @@ mod tests {
         #[test]
         fn bare_token_targets_value() {
             let intro = nt(ScalarType::Double);
-            let (value, changed) = build_put_from_args(&intro, &t(&["42"])).unwrap();
+            let (value, changed) = build_put_from_args(&intro, &t(&["42"]), None).unwrap();
             assert_eq!(scalar_at(&value, &["value"]), &ScalarValue::Double(42.0));
             assert!(changed.get(intro.bit_for_path("value").unwrap()));
             assert!(!changed.get(intro.bit_for_path("alarm.severity").unwrap()));
@@ -5551,7 +5688,7 @@ mod tests {
         #[test]
         fn equals_token_on_string_value_is_bare_string() {
             let intro = nt(ScalarType::String);
-            let (value, changed) = build_put_from_args(&intro, &t(&["a=b"])).unwrap();
+            let (value, changed) = build_put_from_args(&intro, &t(&["a=b"]), None).unwrap();
             assert_eq!(
                 scalar_at(&value, &["value"]),
                 &ScalarValue::String("a=b".into())
@@ -5564,7 +5701,8 @@ mod tests {
         #[test]
         fn existing_field_is_assignment() {
             let intro = nt(ScalarType::Double);
-            let (value, changed) = build_put_from_args(&intro, &t(&["alarm.severity=2"])).unwrap();
+            let (value, changed) =
+                build_put_from_args(&intro, &t(&["alarm.severity=2"]), None).unwrap();
             assert_eq!(
                 scalar_at(&value, &["alarm", "severity"]),
                 &ScalarValue::Int(2)
@@ -5579,7 +5717,7 @@ mod tests {
         #[test]
         fn unknown_field_on_nonstring_value_is_ignored() {
             let intro = nt(ScalarType::Double);
-            let err = build_put_from_args(&intro, &t(&["nope=1"])).unwrap_err();
+            let err = build_put_from_args(&intro, &t(&["nope=1"]), None).unwrap_err();
             assert!(
                 matches!(err, PvaError::InvalidValue(ref m) if m.contains("No valid value")),
                 "got: {err:?}"
@@ -5592,7 +5730,8 @@ mod tests {
         #[test]
         fn mix_bare_and_field_pair_is_rejected() {
             let intro = nt(ScalarType::Double);
-            let err = build_put_from_args(&intro, &t(&["42", "alarm.severity=2"])).unwrap_err();
+            let err =
+                build_put_from_args(&intro, &t(&["42", "alarm.severity=2"]), None).unwrap_err();
             assert!(
                 matches!(err, PvaError::InvalidValue(ref m) if m.contains("Can't mix")),
                 "got: {err:?}"
@@ -5604,7 +5743,8 @@ mod tests {
         fn multiple_field_pairs_each_marked() {
             let intro = nt(ScalarType::Double);
             let (value, changed) =
-                build_put_from_args(&intro, &t(&["alarm.severity=2", "alarm.status=1"])).unwrap();
+                build_put_from_args(&intro, &t(&["alarm.severity=2", "alarm.status=1"]), None)
+                    .unwrap();
             assert_eq!(
                 scalar_at(&value, &["alarm", "severity"]),
                 &ScalarValue::Int(2)
@@ -5703,9 +5843,12 @@ mod tests {
         #[test]
         fn json_top_mode_marks_only_named_leaves() {
             let intro = nt(ScalarType::Double);
-            let (value, changed) =
-                build_put_from_args(&intro, &t(&[r#"{"value":42,"alarm":{"severity":2}}"#]))
-                    .unwrap();
+            let (value, changed) = build_put_from_args(
+                &intro,
+                &t(&[r#"{"value":42,"alarm":{"severity":2}}"#]),
+                None,
+            )
+            .unwrap();
             assert_eq!(scalar_at(&value, &["value"]), &ScalarValue::Double(42.0));
             assert_eq!(
                 scalar_at(&value, &["alarm", "severity"]),
@@ -5726,7 +5869,7 @@ mod tests {
         fn json_field_object_marks_assigned_leaves() {
             let intro = nt(ScalarType::Double);
             let (value, changed) =
-                build_put_from_args(&intro, &t(&[r#"alarm={"severity":3}"#])).unwrap();
+                build_put_from_args(&intro, &t(&[r#"alarm={"severity":3}"#]), None).unwrap();
             assert_eq!(
                 scalar_at(&value, &["alarm", "severity"]),
                 &ScalarValue::Int(3)
@@ -5742,7 +5885,7 @@ mod tests {
         fn json_field_array_writes_scalar_array() {
             let intro = nt_array(ScalarType::Double);
             let (value, changed) =
-                build_put_from_args(&intro, &t(&["value=[1.0,2.0,3.0]"])).unwrap();
+                build_put_from_args(&intro, &t(&["value=[1.0,2.0,3.0]"]), None).unwrap();
             let got: Vec<f64> = array_at(&value, "value")
                 .iter()
                 .map(|sv| match sv {
@@ -5760,7 +5903,7 @@ mod tests {
         #[test]
         fn lone_bracket_is_value_shorthand() {
             let intro = nt_array(ScalarType::Int);
-            let (value, changed) = build_put_from_args(&intro, &t(&["[10,20,30]"])).unwrap();
+            let (value, changed) = build_put_from_args(&intro, &t(&["[10,20,30]"]), None).unwrap();
             let got: Vec<i32> = array_at(&value, "value")
                 .iter()
                 .map(|sv| match sv {
@@ -5778,7 +5921,7 @@ mod tests {
         #[test]
         fn json_unknown_key_is_error() {
             let intro = nt(ScalarType::Double);
-            let err = build_put_from_args(&intro, &t(&[r#"{"nope":1}"#])).unwrap_err();
+            let err = build_put_from_args(&intro, &t(&[r#"{"nope":1}"#]), None).unwrap_err();
             assert!(
                 matches!(err, PvaError::InvalidValue(ref m) if m.contains("not present")),
                 "got: {err:?}"
@@ -5791,12 +5934,171 @@ mod tests {
         fn json_string_coerces_into_numeric_field() {
             let intro = nt(ScalarType::Double);
             let (value, changed) =
-                build_put_from_args(&intro, &t(&[r#"alarm={"severity":"7"}"#])).unwrap();
+                build_put_from_args(&intro, &t(&[r#"alarm={"severity":"7"}"#]), None).unwrap();
             assert_eq!(
                 scalar_at(&value, &["alarm", "severity"]),
                 &ScalarValue::Int(7)
             );
             assert!(changed.get(intro.bit_for_path("alarm.severity").unwrap()));
+        }
+    }
+
+    /// NTEnum bare-token PUT (`build_put_from_args` plain value mode):
+    /// a bare token writes `value.index` — matched against the current
+    /// `value.choices` by label first, then parsed as an integer index —
+    /// and marks ONLY `value.index`, so the server keeps its choice menu
+    /// (pvAccessCPP `pvput.cpp:180-204`).
+    mod put_enum_value {
+        use super::*;
+        use crate::pvdata::ScalarType;
+
+        /// `{ value: enum_t{ index: int, choices: string[] }, alarm: {...} }`.
+        fn nt_enum() -> FieldDesc {
+            FieldDesc::Structure {
+                struct_id: "epics:nt/NTEnum:1.0".to_string(),
+                fields: vec![
+                    (
+                        "value".to_string(),
+                        FieldDesc::Structure {
+                            struct_id: "enum_t".to_string(),
+                            fields: vec![
+                                ("index".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+                                (
+                                    "choices".to_string(),
+                                    FieldDesc::ScalarArray(ScalarType::String),
+                                ),
+                            ],
+                        },
+                    ),
+                    (
+                        "alarm".to_string(),
+                        FieldDesc::Structure {
+                            struct_id: "alarm_t".to_string(),
+                            fields: vec![(
+                                "severity".to_string(),
+                                FieldDesc::Scalar(ScalarType::Int),
+                            )],
+                        },
+                    ),
+                ],
+            }
+        }
+        /// A get-first snapshot whose `value.choices` are the given labels.
+        fn previous_with_choices(choices: &[&str]) -> PvField {
+            let mut enum_v = PvStructure::new("enum_t");
+            enum_v
+                .fields
+                .push(("index".to_string(), PvField::Scalar(ScalarValue::Int(0))));
+            enum_v.fields.push((
+                "choices".to_string(),
+                PvField::ScalarArray(
+                    choices
+                        .iter()
+                        .map(|c| ScalarValue::String((*c).into()))
+                        .collect(),
+                ),
+            ));
+            let mut root = PvStructure::new("epics:nt/NTEnum:1.0");
+            root.fields
+                .push(("value".to_string(), PvField::Structure(enum_v)));
+            PvField::Structure(root)
+        }
+        fn t(args: &[&str]) -> Vec<String> {
+            args.iter().map(|s| s.to_string()).collect()
+        }
+        fn index_of(v: &PvField) -> i32 {
+            match v {
+                PvField::Structure(s) => {
+                    let value = &s.fields.iter().find(|(n, _)| n == "value").unwrap().1;
+                    match value {
+                        PvField::Structure(e) => {
+                            match &e.fields.iter().find(|(n, _)| n == "index").unwrap().1 {
+                                PvField::Scalar(ScalarValue::Int(i)) => *i,
+                                other => panic!("expected Int index, got {other:?}"),
+                            }
+                        }
+                        other => panic!("expected enum_t value, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Structure, got {other:?}"),
+            }
+        }
+
+        /// A token equal to a choice label writes that choice's position
+        /// (pvput.cpp:190-197) and marks ONLY `value.index` — `value` and
+        /// `value.choices` stay unmarked so the menu is preserved.
+        #[test]
+        fn label_resolves_to_index_marking_only_value_index() {
+            let intro = nt_enum();
+            let previous = previous_with_choices(&["OFF", "ON", "AUTO"]);
+            let (value, changed) =
+                build_put_from_args(&intro, &t(&["AUTO"]), Some(&previous)).unwrap();
+            assert_eq!(index_of(&value), 2);
+            assert!(changed.get(intro.bit_for_path("value.index").unwrap()));
+            // The container and the choices array must NOT be marked — else
+            // the server would overwrite its menu with an empty array.
+            assert!(!changed.get(intro.bit_for_path("value").unwrap()));
+            assert!(!changed.get(intro.bit_for_path("value.choices").unwrap()));
+        }
+
+        /// A token that is not a choice label is parsed as the integer index
+        /// (pvput.cpp:199-202), still marking only `value.index`.
+        #[test]
+        fn integer_token_falls_back_to_index() {
+            let intro = nt_enum();
+            let previous = previous_with_choices(&["OFF", "ON", "AUTO"]);
+            let (value, changed) =
+                build_put_from_args(&intro, &t(&["1"]), Some(&previous)).unwrap();
+            assert_eq!(index_of(&value), 1);
+            assert!(changed.get(intro.bit_for_path("value.index").unwrap()));
+            assert!(!changed.get(intro.bit_for_path("value.choices").unwrap()));
+        }
+
+        /// A choice label that happens to be numeric still wins over the
+        /// integer fallback (pvput matches the label first): choice `"1"`
+        /// at position 0 resolves to index 0, not index 1.
+        #[test]
+        fn numeric_label_wins_over_integer_parse() {
+            let intro = nt_enum();
+            let previous = previous_with_choices(&["1", "2"]);
+            let (value, _changed) =
+                build_put_from_args(&intro, &t(&["1"]), Some(&previous)).unwrap();
+            assert_eq!(index_of(&value), 0);
+        }
+
+        /// Without a get-first snapshot a label cannot be resolved, so a
+        /// non-integer token is a clear error rather than a silent index 0.
+        #[test]
+        fn label_without_snapshot_is_error() {
+            let intro = nt_enum();
+            let err = build_put_from_args(&intro, &t(&["AUTO"]), None).unwrap_err();
+            assert!(
+                matches!(err, PvaError::InvalidValue(ref m) if m.contains("neither a choice label")),
+                "got: {err:?}"
+            );
+        }
+
+        /// An integer token still works with no snapshot (the fallback path
+        /// needs no choices).
+        #[test]
+        fn integer_token_without_snapshot_ok() {
+            let intro = nt_enum();
+            let (value, changed) = build_put_from_args(&intro, &t(&["2"]), None).unwrap();
+            assert_eq!(index_of(&value), 2);
+            assert!(changed.get(intro.bit_for_path("value.index").unwrap()));
+        }
+
+        /// More than one bare token is rejected for an enum
+        /// (pvput.cpp:181-183).
+        #[test]
+        fn multiple_tokens_rejected() {
+            let intro = nt_enum();
+            let previous = previous_with_choices(&["OFF", "ON"]);
+            let err = build_put_from_args(&intro, &t(&["ON", "OFF"]), Some(&previous)).unwrap_err();
+            assert!(
+                matches!(err, PvaError::InvalidValue(ref m) if m.contains("multiple values to enum")),
+                "got: {err:?}"
+            );
         }
     }
 

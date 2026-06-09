@@ -5849,14 +5849,15 @@ async fn test_ca_put_mbbo_val_recomputes_rval() {
         Some(EpicsValue::Enum(3)),
         "VAL holds the CA-written value"
     );
+    // RVAL/ORAW are DBF_ULONG (mbboRecord.dbd.pod:620,624).
     assert_eq!(
         inst.record.get_field("RVAL"),
-        Some(EpicsValue::Long(48)),
+        Some(EpicsValue::ULong(48)),
         "RVAL must be recomputed from the new VAL (3 << 4), not left stale at 0"
     );
     assert_eq!(
         inst.record.get_field("ORAW"),
-        Some(EpicsValue::Long(48)),
+        Some(EpicsValue::ULong(48)),
         "ORAW must roll forward to the freshly converted RVAL"
     );
 }

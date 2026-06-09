@@ -145,6 +145,23 @@ fn test_bo_mask_rval_high_bit_round_trip() {
     assert_eq!(rec.get_field("RVAL"), Some(EpicsValue::ULong(0xDEAD_BEEF)));
 }
 
+// DBF_ULONG high-bit round-trip for the mbbo state-value table: a ZRVL
+// >= 2^31 must survive read-back and flow into RVAL through convert()
+// without sign loss. C declares mbbo.ZRVL..FFVL and RVAL as DBF_ULONG
+// (mbboRecord.dbd.pod:222/620).
+#[test]
+fn test_mbbo_zrvl_high_bit_round_trip() {
+    use epics_base_rs::server::records::mbbo::MbboRecord;
+    let mut rec = MbboRecord::new(0);
+    rec.put_field("ZRVL", EpicsValue::ULong(0x8000_0000))
+        .unwrap();
+    assert_eq!(rec.get_field("ZRVL"), Some(EpicsValue::ULong(0x8000_0000)));
+    // With a defined state table and VAL=0, convert() copies ZRVL into
+    // RVAL; the high bit must not be lost to sign.
+    rec.init_record(0).unwrap();
+    assert_eq!(rec.get_field("RVAL"), Some(EpicsValue::ULong(0x8000_0000)));
+}
+
 // A masked-to-zero raw read must yield VAL=0 even when the source
 // had bits outside the mask set.
 #[test]
@@ -1530,7 +1547,8 @@ fn test_mbbi_lalm_updates_when_cosv_set() {
         .record
         .get_field("LALM")
         .and_then(|v| match v {
-            EpicsValue::Enum(s) => Some(s),
+            // LALM is DBF_USHORT (mbbiRecord.dbd.pod:623).
+            EpicsValue::UShort(s) => Some(s),
             _ => None,
         })
         .expect("LALM readable");
@@ -1550,7 +1568,8 @@ fn test_mbbi_lalm_updates_when_cosv_set() {
         .record
         .get_field("LALM")
         .and_then(|v| match v {
-            EpicsValue::Enum(s) => Some(s),
+            // LALM is DBF_USHORT (mbbiRecord.dbd.pod:623).
+            EpicsValue::UShort(s) => Some(s),
             _ => None,
         })
         .expect("LALM readable");

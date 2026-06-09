@@ -1176,13 +1176,15 @@ fn mbbo_state_strings_and_values() {
     rec.put_field("TWST", EpicsValue::String("High".into()))
         .unwrap();
 
-    // C defaults all *VL to 0. Set them explicitly.
+    // C defaults all *VL to 0. Set them explicitly. ZRVL..FFVL are
+    // DBF_ULONG (mbboRecord.dbd.pod:222-342); the legacy signed Long put is
+    // still tolerated, but the read-back is the native ULong.
     rec.put_field("ZRVL", EpicsValue::Long(0)).unwrap();
     rec.put_field("ONVL", EpicsValue::Long(1)).unwrap();
     rec.put_field("TWVL", EpicsValue::Long(2)).unwrap();
-    assert_eq!(rec.get_field("ZRVL"), Some(EpicsValue::Long(0)));
-    assert_eq!(rec.get_field("ONVL"), Some(EpicsValue::Long(1)));
-    assert_eq!(rec.get_field("TWVL"), Some(EpicsValue::Long(2)));
+    assert_eq!(rec.get_field("ZRVL"), Some(EpicsValue::ULong(0)));
+    assert_eq!(rec.get_field("ONVL"), Some(EpicsValue::ULong(1)));
+    assert_eq!(rec.get_field("TWVL"), Some(EpicsValue::ULong(2)));
 
     rec.put_field("VAL", EpicsValue::Enum(1)).unwrap();
     assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Enum(1)));
@@ -1220,9 +1222,11 @@ fn mbbi_all_16_states() {
             15 => "FFVL",
             _ => unreachable!(),
         };
+        // ZRVL..FFVL are DBF_ULONG (mbbiRecord.dbd.pod:144-264); served as
+        // the native ULong even though the put used the tolerated Long.
         assert_eq!(
             rec.get_field(field),
-            Some(EpicsValue::Long(i as i32)),
+            Some(EpicsValue::ULong(u32::from(i))),
             "State {i} value mismatch"
         );
     }

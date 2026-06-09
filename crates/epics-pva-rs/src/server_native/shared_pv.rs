@@ -32,7 +32,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use crate::pvdata::{FieldDesc, PvField};
-use crate::server_native::source::OpError;
+use crate::server_native::source::{ChannelInvalidator, OpError};
 
 /// User-provided put handler. Mirrors pvxs `SharedPV::onPut`
 /// (sharedpv.cpp:329). Handler receives the new value; returning Err
@@ -365,6 +365,14 @@ struct Inner {
     /// monitor start/stop hook (pvxs `onStart`). See
     /// [`OnStartFn`].
     on_start: Option<OnStartFn>,
+    /// Server channel-invalidators bound by the [`SharedSource`](s) this PV
+    /// is registered with, paired with the name it is registered under.
+    /// [`SharedPV::close`] publishes each name through its invalidator so the
+    /// per-connection read loop force-disconnects every attached server
+    /// channel for this PV — the second half of pvxs `SharedPV::close()`
+    /// (`sharedpv.cpp:411-414` closes every attached channel, not just the
+    /// value/type). Empty for a standalone (never-registered) PV.
+    invalidators: Vec<(ChannelInvalidator, String)>,
 }
 
 impl Default for Inner {
@@ -384,6 +392,7 @@ impl Default for Inner {
             on_high_mark: None,
             on_low_mark: None,
             on_start: None,
+            invalidators: Vec::new(),
         }
     }
 }
@@ -483,17 +492,46 @@ impl SharedPV {
         matches!(self.inner.lock().state, PvState::Open { .. })
     }
 
-    /// Close the PV: clear its descriptor and value and drop all
-    /// subscribers. After close, `current()` / `introspection()` (and
-    /// thus GET / GET_FIELD) return `None` until `open()` is called
-    /// again — pvxs `sharedpv.cpp:404-405` clears `impl->current`, which
-    /// is exactly what makes `fetch()` throw `"open() first"` afterwards
-    /// (`:443-469`). Channel-lifecycle teardown of attached clients
-    /// (pvxs `:411-414`) is a separate lifecycle concern.
+    /// Bind a [`SharedSource`]'s server channel-invalidator and the name
+    /// this PV is registered under, so a later [`Self::close`] can
+    /// force-disconnect every attached server channel. Called by
+    /// [`SharedSource`] at registration time (and when the server installs
+    /// the invalidator). Multiple bindings accumulate: one PV registered
+    /// under several names / sources closes them all.
+    pub(crate) fn bind_invalidator(&self, invalidator: ChannelInvalidator, name: String) {
+        self.inner.lock().invalidators.push((invalidator, name));
+    }
+
+    /// Close the PV: clear its descriptor and value, drop all subscribers,
+    /// AND force-disconnect every attached server channel. After close,
+    /// `current()` / `introspection()` (and thus GET / GET_FIELD) return
+    /// `None` until `open()` is called again — pvxs `sharedpv.cpp:404-405`
+    /// clears `impl->current`, which is what makes `fetch()` throw
+    /// `"open() first"` afterwards (`:443-469`).
+    ///
+    /// pvxs `sharedpv.cpp:407-414` ALSO moves out the attached-channel set
+    /// and calls `chan->close()` on each, sending a server-initiated
+    /// `DESTROY_CHANNEL`. We mirror that by publishing the registered name(s)
+    /// through the bound [`ChannelInvalidator`]: every per-connection read
+    /// loop tears down the channels it serves under that name through the
+    /// single teardown owner (`finalize_channel_destroy` →
+    /// `notify_channel_close` once + report close + `DESTROY_CHANNEL`). This
+    /// closes the close/reopen-with-new-descriptor hazard where a live
+    /// pre-close channel kept negotiating ops against the stale descriptor it
+    /// captured at CREATE_CHANNEL while the source served the reopened value.
     pub fn close(&self) {
-        let mut g = self.inner.lock();
-        g.state = PvState::Closed;
-        g.subscribers.clear();
+        // Snapshot the bindings under the lock, then publish after releasing
+        // it — `publish` only enqueues to per-connection mpsc queues, but
+        // keeping it off the PV lock avoids re-entrancy hazards.
+        let invalidations: Vec<(ChannelInvalidator, String)> = {
+            let mut g = self.inner.lock();
+            g.state = PvState::Closed;
+            g.subscribers.clear();
+            g.invalidators.clone()
+        };
+        for (invalidator, name) in invalidations {
+            invalidator.publish(std::sync::Arc::from(vec![name]));
+        }
     }
 
     /// Type descriptor (None while closed).
@@ -1128,6 +1166,14 @@ pub struct SharedSource {
     /// within one beacon interval (when `list_pvs()` is unchanged
     /// before/after, e.g. remove+re-add of the same name).
     beacon_change: AtomicU64,
+    /// Server channel-invalidator, installed by the runtime via
+    /// [`ChannelSource::set_channel_invalidator`](super::source::ChannelSource::set_channel_invalidator)
+    /// before connections are accepted. `None` until then (e.g. before the
+    /// server runs, or in tests that never start one). Bound into every
+    /// registered [`SharedPV`] so [`SharedPV::close`] can force-disconnect
+    /// the PV's attached server channels (pvxs `SharedPV::close()` channel
+    /// teardown, `sharedpv.cpp:411-414`).
+    invalidator: Mutex<Option<super::source::ChannelInvalidator>>,
 }
 
 impl SharedSource {
@@ -1136,6 +1182,7 @@ impl SharedSource {
             pvs: Mutex::new(HashMap::new()),
             access_gate: std::sync::OnceLock::new(),
             beacon_change: AtomicU64::new(0),
+            invalidator: Mutex::new(None),
         }
     }
 
@@ -1165,9 +1212,20 @@ impl SharedSource {
     /// swap underneath in-flight operations holding the old `SharedPV`.
     pub fn try_add(&self, name: impl Into<String>, pv: SharedPV) -> Result<(), AddPvError> {
         use std::collections::hash_map::Entry;
-        match self.pvs.lock().entry(name.into()) {
+        // Single lock-acquisition order across this and
+        // `set_channel_invalidator`: `pvs` first, then `invalidator`. The PV
+        // inner mutex (`bind_invalidator`) is a leaf, so no cycle exists.
+        let mut pvs = self.pvs.lock();
+        match pvs.entry(name.into()) {
             Entry::Occupied(e) => Err(AddPvError(e.key().clone())),
             Entry::Vacant(slot) => {
+                // If the server is already running, bind its invalidator now
+                // so `SharedPV::close()` force-disconnects this PV's channels.
+                // A PV added before the server starts is bound later, when the
+                // runtime calls `set_channel_invalidator`.
+                if let Some(invalidator) = self.invalidator.lock().clone() {
+                    pv.bind_invalidator(invalidator, slot.key().clone());
+                }
                 slot.insert(pv);
                 // pvxs `Server::addPV` bumps `beaconChange` only after the
                 // built-in `StaticSource::add` succeeds (it throws on a
@@ -1250,6 +1308,22 @@ impl super::source::ChannelSource for SharedSource {
     /// remove+re-add of the same name within one beacon interval.
     fn beacon_change(&self) -> u64 {
         self.beacon_change.load(Ordering::Relaxed)
+    }
+
+    /// Store the server's channel-invalidator and bind it into every
+    /// already-registered [`SharedPV`], so `SharedPV::close()` can
+    /// force-disconnect that PV's attached server channels (the channel
+    /// half of pvxs `SharedPV::close()`, `sharedpv.cpp:411-414`). PVs added
+    /// after this call are bound by [`Self::try_add`]. Same lock order as
+    /// `try_add` — `pvs` first, then `invalidator` — so the two cannot
+    /// deadlock, and holding `pvs` across the install makes the
+    /// store-and-bind atomic against a concurrent `add`.
+    fn set_channel_invalidator(&self, invalidator: super::source::ChannelInvalidator) {
+        let pvs = self.pvs.lock();
+        *self.invalidator.lock() = Some(invalidator.clone());
+        for (name, pv) in pvs.iter() {
+            pv.bind_invalidator(invalidator.clone(), name.clone());
+        }
     }
 
     fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
@@ -1743,6 +1817,65 @@ mod tests {
         pv.close();
         assert!(!pv.is_open());
         assert_eq!(pv.try_post(nt_scalar_int_value(1)), 0);
+    }
+
+    /// `SharedPV::close()` must publish the PV's registered name(s) through
+    /// the bound server invalidator so each per-connection read loop
+    /// force-disconnects the channels it serves under that name — the
+    /// channel half of pvxs `SharedPV::close()` (`sharedpv.cpp:411-414`).
+    /// Covers BOTH binding paths: a PV registered before the server
+    /// installs the invalidator (`set_channel_invalidator` injection) and a
+    /// PV registered after (`try_add` injection).
+    #[test]
+    fn close_publishes_registered_name_through_invalidator() {
+        use crate::server_native::source::{ChannelInvalidator, ChannelSource};
+
+        // Path 1: PV registered BEFORE the invalidator is installed.
+        let src = SharedSource::new();
+        let pv_before = SharedPV::build_mailbox();
+        pv_before
+            .open(nt_scalar_int_desc(), nt_scalar_int_value(0))
+            .unwrap();
+        src.add("before", pv_before.clone());
+
+        let invalidator = ChannelInvalidator::new();
+        let mut rx = invalidator.subscribe();
+        src.set_channel_invalidator(invalidator);
+
+        // Path 2: PV registered AFTER the invalidator is installed.
+        let pv_after = SharedPV::build_mailbox();
+        pv_after
+            .open(nt_scalar_int_desc(), nt_scalar_int_value(0))
+            .unwrap();
+        src.add("after", pv_after.clone());
+
+        pv_before.close();
+        let batch = rx.try_recv().expect("close() must publish a batch");
+        assert_eq!(
+            batch.as_ref(),
+            ["before".to_string()],
+            "close() publishes the pre-install-registered name"
+        );
+
+        pv_after.close();
+        let batch = rx.try_recv().expect("close() must publish a batch");
+        assert_eq!(
+            batch.as_ref(),
+            ["after".to_string()],
+            "close() publishes the post-install-registered name"
+        );
+    }
+
+    /// A standalone `SharedPV` never registered with a source has no bound
+    /// invalidator: `close()` must still clear value/subscribers and must
+    /// not panic — there is simply no channel teardown to publish.
+    #[test]
+    fn close_without_invalidator_is_silent() {
+        let pv = SharedPV::new();
+        pv.open(nt_scalar_int_desc(), nt_scalar_int_value(0))
+            .unwrap();
+        pv.close();
+        assert!(!pv.is_open());
     }
 
     /// Regression: pvxs runs `onFirstConnect`/`onLastDisconnect` off the

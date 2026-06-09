@@ -1560,31 +1560,63 @@ impl PvDatabase {
             .collect()
     }
 
-    /// Classify one link string for CP/CPP setup, pushing onto the right
-    /// accumulator. A local `Db` CP/CPP link drives the local-source path
-    /// ([`Self::dispatch_cp_targets`]); an external `Ca` CP/CPP link drives
-    /// the cross-IOC path ([`Self::dispatch_external_cp_targets`]).
+    /// Classify one parsed CP/CPP link, deciding the local-vs-external
+    /// routing — this method is the single owner of that decision, so the
+    /// CP trigger registry and the holder's value-read parse cache stay
+    /// consistent.
     ///
-    /// The `Ca` arm is the structural fix for Regression
-    /// R0604-CALINK-CP-NO-PROCESS-1: pre-fix `setup_cp_links` matched only
-    /// `ParsedLink::Db`, so a `ca://OTHER CP` / `OTHER CP CA` holder was
-    /// silently dropped and never processed on a remote change — unlike C
-    /// `dbCa.c`, where `eventCallback` adds `CA_DBPROCESS` for every CP link
-    /// (`dbCa.c:993-994`). A link with no CP/CPP policy (`cp_passive_only()
-    /// == None`), and every other `ParsedLink` variant, is ignored here.
-    fn classify_cp_link(
-        link_str: &str,
+    /// A link with no CP/CPP policy (`cp_passive_only() == None`), and
+    /// every non-`Db`/`Ca` variant, is ignored.
+    ///
+    /// `Ca`: an external `ca://OTHER CP` / `OTHER CP CA` holder always
+    /// drives the cross-IOC path — C `dbCa.c` `eventCallback` adds
+    /// `CA_DBPROCESS` for every CP link (`dbCa.c:993-994`).
+    ///
+    /// `Db`: C `dbInitLink` (`dbLink.c:118-130`) makes any link carrying a
+    /// `CP`/`CPP`/`CA` option a CA link, and `dbDbInitLink` keeps it local
+    /// only when the named record exists in this IOC. So a CP/CPP `Db`
+    /// link whose target is NOT a local record (e.g. `INP="other:pv CP"`,
+    /// no explicit `CA`) must be served externally — both the calink
+    /// trigger monitor (`ext_links`) AND the holder's value read. The read
+    /// half is the `convert_to_ca` entry: it carries the field name and an
+    /// equivalent [`CaLink`] so the caller rewrites the holder's cached
+    /// parse from `Db` to `Ca`, routing the read through the external
+    /// resolver. A local target keeps the local fast-path (`db_links`).
+    async fn classify_cp_link(
+        &self,
+        field: &str,
+        parsed: crate::server::record::ParsedLink,
         target_name: &str,
         db_links: &mut Vec<(String, String, bool)>,
         ext_links: &mut Vec<(String, String, bool)>,
+        convert_to_ca: &mut Vec<(String, crate::server::record::CaLink)>,
     ) {
-        if link_str.is_empty() {
-            return;
-        }
-        match crate::server::record::parse_link_v2(link_str) {
+        match parsed {
             crate::server::record::ParsedLink::Db(db) => {
-                if let Some(passive_only) = db.policy.cp_passive_only() {
+                let Some(passive_only) = db.policy.cp_passive_only() else {
+                    return;
+                };
+                if self.has_name_no_resolve(&db.record).await {
                     db_links.push((db.record, target_name.to_string(), passive_only));
+                } else {
+                    // Reconstruct the CA channel name verbatim: `record`
+                    // for a default-`VAL` link, `record.FIELD` otherwise —
+                    // the same string the `CA`-modifier path would store
+                    // in `CaLink::pv`.
+                    let pv = if db.field == "VAL" {
+                        db.record.clone()
+                    } else {
+                        format!("{}.{}", db.record, db.field)
+                    };
+                    ext_links.push((pv.clone(), target_name.to_string(), passive_only));
+                    convert_to_ca.push((
+                        field.to_string(),
+                        crate::server::record::CaLink {
+                            pv,
+                            monitor_switch: db.monitor_switch,
+                            policy: db.policy,
+                        },
+                    ));
                 }
             }
             crate::server::record::ParsedLink::Ca(ca) => {
@@ -1609,14 +1641,44 @@ impl PvDatabase {
             // Enumerate this record's link-bearing fields through the
             // single shared owner (`record_link_fields`) so the CA CP/CPP
             // setup here and the pvalink install scan can never diverge on
-            // which fields count as links — the structural cause of a
-            // device-support `INP`/`OUT` pvalink CP/CPP holder never being
-            // opened. `classify_cp_link` keeps only the CP/CPP-policy links
-            // and routes local `Db` vs external `Ca`; non-CP links (and
-            // `OUT`, which carries no CP/CPP) fall through its
-            // `cp_passive_only() == None` gate.
-            for (_field, raw, _parsed) in self.record_link_fields(target_name).await {
-                Self::classify_cp_link(&raw, target_name, &mut db_links, &mut ext_links);
+            // which fields count as links. `classify_cp_link` keeps only
+            // the CP/CPP-policy links, routes local `Db` vs external `Ca`,
+            // and — for a CP/CPP `Db` link to a non-local target — emits a
+            // `convert_to_ca` entry so the holder's value read is rewired
+            // to the external resolver (C `dbLink.c:118-130`).
+            let mut convert_to_ca: Vec<(String, crate::server::record::CaLink)> = Vec::new();
+            for (field, _raw, parsed) in self.record_link_fields(target_name).await {
+                self.classify_cp_link(
+                    &field,
+                    parsed,
+                    target_name,
+                    &mut db_links,
+                    &mut ext_links,
+                    &mut convert_to_ca,
+                )
+                .await;
+            }
+            // Apply the `Db`→`Ca` parse-cache rewrite for non-local CP/CPP
+            // links so the holder reads its value through the external
+            // resolver — consistent with the external CP trigger registered
+            // above (both halves use the same locality decision made in
+            // `classify_cp_link`). Only the common-field caches are
+            // rewritten; INPA.. / DOL.. links are re-parsed from their raw
+            // strings each process cycle and so are not covered here.
+            if !convert_to_ca.is_empty() {
+                if let Some(rec_arc) = self.get_record(target_name).await {
+                    let mut inst = rec_arc.write().await;
+                    for (field, calink) in convert_to_ca {
+                        let link = crate::server::record::ParsedLink::Ca(calink);
+                        match field.as_str() {
+                            "INP" => inst.parsed_inp = link,
+                            "OUT" => inst.parsed_out = link,
+                            "TSEL" => inst.parsed_tsel = link,
+                            "SDIS" => inst.parsed_sdis = link,
+                            _ => {}
+                        }
+                    }
+                }
             }
         }
 
@@ -1721,6 +1783,101 @@ mod out_link_put_fail_tests {
             matches!(db.get_pv("TGT.VAL").await.unwrap(), EpicsValue::Double(v) if v == 0.0),
             "a failed OUT-link write must NOT process the PP target \
              (VAL must stay 0.0, not become 7.0)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cp_link_locality_tests {
+    use crate::server::database::PvDatabase;
+    use crate::server::record::ParsedLink;
+    use crate::server::records::ai::AiRecord;
+
+    /// A CP/CPP link with no explicit `CA` modifier whose target is NOT a
+    /// local record must be served as an external (CA) link — both the
+    /// trigger and the value read. C `dbInitLink` (`dbLink.c:118-130`)
+    /// makes any `CP`/`CPP` link a CA link, and `dbDbInitLink` keeps it
+    /// local only when the named record exists in this IOC.
+    ///
+    /// Here `INP="OTHER:PV CP"` parses to `ParsedLink::Db` (bare name, no
+    /// `CA`), but `OTHER:PV` is not local. After `setup_cp_links` the
+    /// holder's `parsed_inp` must be rewritten to `ParsedLink::Ca` (so the
+    /// read routes through `resolve_external_pv`) and `OTHER:PV` must be
+    /// registered as an external CP trigger.
+    #[tokio::test]
+    async fn cp_link_to_nonlocal_target_forced_external() {
+        let db = PvDatabase::new();
+        db.add_record("HOLDER", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        {
+            let rec = db.get_record("HOLDER").await.unwrap();
+            rec.write().await.common.inp = "OTHER:PV CP".to_string();
+        }
+
+        db.setup_cp_links().await;
+
+        let inp = db
+            .get_record("HOLDER")
+            .await
+            .unwrap()
+            .read()
+            .await
+            .parsed_inp
+            .clone();
+        match inp {
+            ParsedLink::Ca(ca) => assert_eq!(
+                ca.pv, "OTHER:PV",
+                "non-local CP link must carry the verbatim PV name"
+            ),
+            other => panic!("non-local CP link must be forced to Ca, got {other:?}"),
+        }
+        assert!(
+            db.external_cp_pv_names()
+                .await
+                .contains(&"OTHER:PV".to_string()),
+            "non-local CP link must be registered as an external CP trigger"
+        );
+    }
+
+    /// A CP link whose target IS a local record keeps the local fast-path:
+    /// `setup_cp_links` must NOT rewrite its `parsed_inp` to `Ca` and must
+    /// NOT register it as an external CP link.
+    #[tokio::test]
+    async fn cp_link_to_local_target_stays_db() {
+        let db = PvDatabase::new();
+        db.add_record("SRC", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        db.add_record("HOLDER", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        {
+            let rec = db.get_record("HOLDER").await.unwrap();
+            let mut inst = rec.write().await;
+            inst.common.inp = "SRC CP".to_string();
+            // Seed the parse cache as load would, so the assertion proves
+            // setup_cp_links leaves a local CP link untouched.
+            inst.parsed_inp = crate::server::record::parse_link_v2("SRC CP");
+        }
+
+        db.setup_cp_links().await;
+
+        let inp = db
+            .get_record("HOLDER")
+            .await
+            .unwrap()
+            .read()
+            .await
+            .parsed_inp
+            .clone();
+        assert!(
+            matches!(inp, ParsedLink::Db(_)),
+            "local CP link must stay a Db link, got {inp:?}"
+        );
+        assert!(
+            !db.external_cp_pv_names().await.contains(&"SRC".to_string()),
+            "a local CP target must not be registered as an external CP link"
         );
     }
 }

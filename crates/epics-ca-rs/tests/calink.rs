@@ -364,6 +364,62 @@ async fn ca_link_out_write_updates_remote_pv() {
     );
 }
 
+/// Gap 2 OUT write, completion-aware arm — a `LinkPutOp::Async` put
+/// (the put-notify / blocking-put chain case, C `dbCaPutLinkCallback`
+/// → `ca_array_put_callback`) issues a CA WRITE_NOTIFY and waits for
+/// the server's put-completion reply, then the value lands on the
+/// upstream PV. Contrast with `ca_link_out_write_updates_remote_pv`,
+/// which exercises the `LinkPutOp::Plain` fire-and-forget
+/// `CA_PROTO_WRITE` arm (C `dbCaPutLink` → `ca_array_put`); the two
+/// arms must route to the two distinct CA write opcodes.
+#[tokio::test(flavor = "multi_thread")]
+#[serial(epics_env)]
+async fn ca_link_out_write_async_waits_for_completion() {
+    let port = free_port();
+    let server = CaServer::builder()
+        .port(port)
+        .pv("CALINK:OUT:ASYNC", EpicsValue::Double(1.0))
+        .build()
+        .await
+        .expect("CA server");
+    let _server = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let client = Arc::new(pinned_client(port).await);
+    let resolver = CaLinkResolver::with_client(client, tokio::runtime::Handle::current());
+
+    let connected = resolver
+        .wait_for_link_connected("CALINK:OUT:ASYNC", Duration::from_secs(5))
+        .await;
+    assert!(connected, "CA link must connect before the async OUT write");
+
+    use epics_base_rs::server::database::{LinkPutOp, LinkSet};
+    // Completion-aware put: this call returns only after the server's
+    // WRITE_NOTIFY completion reply, so the written value is already
+    // committed on the upstream PV by the time `put_value` returns.
+    LinkSet::put_value(
+        &resolver,
+        "CALINK:OUT:ASYNC",
+        EpicsValue::Double(42.0),
+        LinkPutOp::Async,
+    )
+    .expect("completion-aware CA-link OUT write must succeed");
+
+    // An independent CA client GET reads the committed value back —
+    // the WRITE_NOTIFY reached the server and completed.
+    let verify_client = pinned_client(port).await;
+    let ch = verify_client.create_channel("CALINK:OUT:ASYNC");
+    ch.wait_connected(Duration::from_secs(5))
+        .await
+        .expect("verify channel connects");
+    let (_dbf, read_back) = ch.get().await.expect("verify GET");
+    assert_eq!(
+        read_back.to_f64(),
+        Some(42.0),
+        "upstream CA server PV must reflect the completion-aware OUT write"
+    );
+}
+
 /// Gap 2 OUT write — the `ca://` scheme-prefixed form of an OUT link
 /// is accepted by `put_value` (the resolver strips the prefix), same
 /// as the INP-side `ca_link_resolves_with_scheme_prefix` test.

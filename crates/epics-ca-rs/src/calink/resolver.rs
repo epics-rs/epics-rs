@@ -715,16 +715,24 @@ impl LinkSet for CaLinkResolver {
         self.link_for(name)?.value()
     }
 
-    fn put_value(&self, name: &str, value: EpicsValue, _op: LinkPutOp) -> Result<(), String> {
-        // `_op` is accepted for the trait but does not alter CA
-        // delivery: `CaChannel::put` always issues a CA WRITE_NOTIFY and
-        // awaits the server's put-completion reply, so a CA OUT-link
-        // write is already completion-aware — the C `dbCaPutLinkCallback`
-        // path that `LinkPutOp::Async` names. A `LinkPutOp::Plain` write
-        // is delivered with the same completion wait (stricter than C's
-        // fire-and-forget `dbCaPutLink`/`ca_array_put`), which never
-        // weakens correctness, so both ops route through the one
-        // write-notify path.
+    fn put_value(&self, name: &str, value: EpicsValue, op: LinkPutOp) -> Result<(), String> {
+        // Honour the C dbCore split between a plain link put and a
+        // put-notify-aware put. `dbCaPutLink` (no callback) sets
+        // `putType = CA_PUT`, and the CA task later issues a
+        // fire-and-forget `ca_array_put` — the source record's
+        // processing does NOT block on the remote put completing
+        // (dbCa.c:627-633 `dbCaPutLink`, dbCa.c:1201-1206 the
+        // `CA_PUT` dispatch). Only `dbCaPutLinkCallback`
+        // (`putType = CA_PUT_CALLBACK`) issues `ca_array_put_callback`
+        // and parks the originating record until completion. The
+        // database maps a plain record-processing OUT write to
+        // `LinkPutOp::Plain` and a put-notify / blocking-put chain
+        // write to `LinkPutOp::Async`, so the resolver must preserve
+        // the split: routing `Plain` through the fire-and-forget
+        // `CA_PROTO_WRITE` (`put_nowait`) keeps a slow or hung remote
+        // CA server from stalling normal record processing for the
+        // `EPICS_CA_PUT_TIMEOUT` window, while `Async` keeps the
+        // WRITE_NOTIFY completion wait the put-notify chain needs.
         let name = strip_ca_scheme(name);
         let link = self
             .link_for(name)
@@ -732,7 +740,12 @@ impl LinkSet for CaLinkResolver {
         let channel = link.channel.clone();
         block_in_place_or_warn(move || {
             self.handle
-                .block_on(async { channel.put(&value).await })
+                .block_on(async move {
+                    match op {
+                        LinkPutOp::Plain => channel.put_nowait(&value).await,
+                        LinkPutOp::Async => channel.put(&value).await,
+                    }
+                })
                 .map_err(|e| e.to_string())
         })
     }

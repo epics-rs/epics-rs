@@ -175,6 +175,13 @@ pub fn version_information() -> &'static str {
 /// output formatter) per binary. The values are read through the
 /// resolved [`crate::config`] getters so the output reflects
 /// environment + defaults exactly as the client will use them.
+///
+/// Known gap: `EPICS_PVA_ADDR_LIST` is shown as the configured value,
+/// not pvxs's post-`Config::expand()` search list (auto-address
+/// expansion, hostname→endpoint resolution, dedup, and the
+/// `AUTO_ADDR_LIST=NO` it leaves after expanding). That expansion needs
+/// a client `Config` value/`expand()` in the config module; until that
+/// exists this readback reflects the configured, not the expanded, list.
 pub fn print_effective_config() {
     print!("{}", effective_config_string());
 }
@@ -198,6 +205,9 @@ pub fn effective_config_string() -> String {
         .join(" ");
     let mut s = String::new();
     let _ = writeln!(s, "Effective config");
+    // pvxs prints the effective Config as a sorted `updateDefs()` map
+    // (config.cpp:613-658), so the keys come out alphabetically and use
+    // their canonical `EPICS_PVA_*` names.
     let _ = writeln!(s, "  EPICS_PVA_ADDR_LIST={addr_list}");
     let _ = writeln!(
         s,
@@ -208,10 +218,16 @@ pub fn effective_config_string() -> String {
             "NO"
         }
     );
-    let _ = writeln!(s, "  EPICS_PVA_SERVER_PORT={}", config::server_port());
     let _ = writeln!(s, "  EPICS_PVA_BROADCAST_PORT={}", config::broadcast_port());
+    // pvxs keeps the connection timeout as a double and prints it in the
+    // effective config (`config.cpp:211-227 parse_timeout`); the CLI
+    // readback previously omitted `EPICS_PVA_CONN_TMO` entirely.
+    let _ = writeln!(s, "  EPICS_PVA_CONN_TMO={}", config::conn_timeout_secs());
+    // pvxs names this key `EPICS_PVA_INTF_ADDR_LIST`, not the non-pvxs
+    // `interfaces=` the readback used before.
+    let _ = writeln!(s, "  EPICS_PVA_INTF_ADDR_LIST={interfaces}");
     let _ = writeln!(s, "  EPICS_PVA_NAME_SERVERS={name_servers}");
-    let _ = writeln!(s, "  interfaces={interfaces}");
+    let _ = writeln!(s, "  EPICS_PVA_SERVER_PORT={}", config::server_port());
     s
 }
 
@@ -405,13 +421,22 @@ mod tests {
         for key in [
             "EPICS_PVA_ADDR_LIST=",
             "EPICS_PVA_AUTO_ADDR_LIST=",
-            "EPICS_PVA_SERVER_PORT=",
             "EPICS_PVA_BROADCAST_PORT=",
+            // pvxs prints the connection timeout (config.cpp:211-227); the
+            // readback must include it, not omit it as before.
+            "EPICS_PVA_CONN_TMO=",
+            // pvxs key name, NOT the non-pvxs `interfaces=` used before.
+            "EPICS_PVA_INTF_ADDR_LIST=",
             "EPICS_PVA_NAME_SERVERS=",
-            "interfaces=",
+            "EPICS_PVA_SERVER_PORT=",
         ] {
             assert!(s.contains(key), "missing {key:?} in:\n{s}");
         }
+        // The non-pvxs `interfaces=` key must be gone.
+        assert!(
+            !s.contains("  interfaces="),
+            "non-pvxs `interfaces=` key must be replaced: {s}"
+        );
     }
 
     /// The shared `-V` text reports more than `<binary> <crate-version>`:

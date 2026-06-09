@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use epics_base_rs::net::AsyncUdpV4;
@@ -64,6 +64,16 @@ pub const DEFAULT_BROADCAST_PORT: u16 = 5076;
 /// initial burst) is packed into as few datagrams as fit under this
 /// limit rather than one datagram per channel name.
 const MAX_SEARCH_PAYLOAD: usize = 1400;
+
+/// pvxs gates each TCP name-server SEARCH write on the connection's live
+/// output-buffer byte length: `if(evbuffer_get_length(tx) > 64*1024)` it
+/// skips that name server for the tick and relies on the normal retry
+/// cadence (`client.cpp:1118-1128`). The backpressure signal is queued
+/// bytes, not a frame count — 64 near-MTU frames already exceed this — so
+/// the engine tracks bytes queued-but-not-yet-written per name server and
+/// skips an over-budget one rather than treating a full fixed-count channel
+/// as the limit.
+const NS_TX_MAX_QUEUED_BYTES: usize = 64 * 1024;
 
 /// pvxs `initialSearchDelay` (`client.cpp:43`): the first SEARCH for a
 /// freshly created channel is deferred by this window so a burst of
@@ -1106,9 +1116,11 @@ async fn run_engine(
         // buffered up to 64 stale SEARCH frames while the NS was offline or still
         // handshaking and replayed them as a burst on reconnect.
         let ready = Arc::new(AtomicBool::new(false));
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
         ns_senders.push(NsHandle {
             tx: search_tx,
             ready: Arc::clone(&ready),
+            queued_bytes: Arc::clone(&queued_bytes),
         });
         let resp_tx = ns_response_tx.clone();
         tokio::spawn(ns_task(
@@ -1116,9 +1128,12 @@ async fn run_engine(
             search_rx,
             resp_tx,
             ready,
-            ns_user.clone(),
-            ns_host.clone(),
-            ns_handshake_timeout,
+            queued_bytes,
+            NsConnParams {
+                user: ns_user.clone(),
+                host: ns_host.clone(),
+                handshake_timeout: ns_handshake_timeout,
+            },
         ));
     }
 
@@ -2475,6 +2490,14 @@ fn rewrite_loopback(addr: SocketAddr, peer: SocketAddr) -> SocketAddr {
 struct NsHandle {
     tx: mpsc::Sender<Vec<u8>>,
     ready: Arc<AtomicBool>,
+    /// Bytes queued to this name server's writer but not yet written to the
+    /// socket. The engine skips an NS for a tick when this exceeds
+    /// [`NS_TX_MAX_QUEUED_BYTES`], mirroring pvxs's
+    /// `evbuffer_get_length(tx) > 64*1024` gate (client.cpp:1118-1128).
+    /// `ns_forward_frames` adds on a successful enqueue; [`ns_run_once`]
+    /// subtracts once each frame is actually written, and zeroes it after
+    /// draining the disconnected-side backlog.
+    queued_bytes: Arc<AtomicUsize>,
 }
 
 /// Forward the current tick's SEARCH for `sid`/`pv_name` to every name-server
@@ -2533,20 +2556,52 @@ fn pack_search_frames(
 /// connection. pvxs reuses the same packed `searchMsg` for name-server
 /// forwarding after zeroing the UDP response port (`client.cpp:1217-1234`);
 /// these frames are already built with `port=0` + the unicast bit. A
-/// not-ready NS is skipped this tick (no replayed backlog). The bounded
-/// channel's `Full` error drops the frame rather than growing an
-/// unbounded backlog (pvxs `client.cpp:1227-1235`).
+/// not-ready NS is skipped this tick (no replayed backlog).
+///
+/// Backpressure is byte-aware, mirroring pvxs's
+/// `evbuffer_get_length(tx) > 64*1024` skip (client.cpp:1118-1128): before
+/// enqueuing this tick's frames, an NS whose queued-but-unwritten backlog
+/// already exceeds [`NS_TX_MAX_QUEUED_BYTES`] is skipped for the tick and
+/// retried later by the bucket cadence. A frame-count gate would let 64
+/// near-MTU frames (~89 KiB) queue past pvxs's 64 KiB threshold, or pass a
+/// single oversized frame. The bounded channel remains a hard backstop:
+/// `Full`/closed drops the frame (and does not bump the byte counter)
+/// rather than growing an unbounded backlog.
 fn ns_forward_frames(handles: &[NsHandle], frames: &[Vec<u8>]) {
     if frames.is_empty() || handles.iter().all(|h| !h.ready.load(Ordering::SeqCst)) {
         return;
     }
     for ns in handles {
-        if ns.ready.load(Ordering::SeqCst) {
-            for frame in frames {
-                let _ = ns.tx.try_send(frame.clone());
+        if !ns.ready.load(Ordering::SeqCst) {
+            continue;
+        }
+        // pvxs skips a name server for the whole tick when its output buffer
+        // already holds > 64 KiB; the queued byte backlog (not a frame count)
+        // is the signal. ns_run_once subtracts from this once each frame is
+        // written, so it tracks the real socket-side backlog.
+        if ns.queued_bytes.load(Ordering::SeqCst) > NS_TX_MAX_QUEUED_BYTES {
+            continue;
+        }
+        for frame in frames {
+            let len = frame.len();
+            match ns.tx.try_send(frame.clone()) {
+                Ok(()) => {
+                    ns.queued_bytes.fetch_add(len, Ordering::SeqCst);
+                }
+                // Channel full or closed: drop without counting it; the
+                // search is retried on a later ready tick.
+                Err(_) => break,
             }
         }
     }
+}
+
+/// Client identity and handshake deadline for one name-server connection,
+/// grouped so the long-lived connect/handshake task signatures stay readable.
+struct NsConnParams {
+    user: String,
+    host: String,
+    handshake_timeout: Duration,
 }
 
 /// Long-running task for one EPICS_PVA_NAME_SERVERS entry.
@@ -2557,9 +2612,8 @@ async fn ns_task(
     mut search_rx: mpsc::Receiver<Vec<u8>>,
     response_tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
     ready: Arc<AtomicBool>,
-    user: String,
-    host: String,
-    handshake_timeout: Duration,
+    queued_bytes: Arc<AtomicUsize>,
+    params: NsConnParams,
 ) {
     // pvxs client.cpp:68: tcpNSCheckInterval = 10s.
     const RECONNECT_INTERVAL: Duration = Duration::from_secs(10);
@@ -2569,9 +2623,8 @@ async fn ns_task(
             &mut search_rx,
             &response_tx,
             &ready,
-            &user,
-            &host,
-            handshake_timeout,
+            &queued_bytes,
+            &params,
         )
         .await;
         // Connection is gone: clear readiness immediately so the engine skips
@@ -2595,10 +2648,15 @@ async fn ns_run_once(
     search_rx: &mut mpsc::Receiver<Vec<u8>>,
     response_tx: &mpsc::Sender<(Vec<u8>, SocketAddr)>,
     ready: &AtomicBool,
-    user: &str,
-    host: &str,
-    handshake_timeout: Duration,
+    queued_bytes: &AtomicUsize,
+    params: &NsConnParams,
 ) -> std::io::Result<()> {
+    let NsConnParams {
+        user,
+        host,
+        handshake_timeout,
+    } = params;
+    let handshake_timeout = *handshake_timeout;
     let stream = TcpStream::connect(ns_addr).await?;
     let (mut reader, mut writer) = tokio::io::split(stream);
 
@@ -2640,6 +2698,10 @@ async fn ns_run_once(
     // draining do we publish readiness, so the engine never races a frame into
     // the about-to-be-drained window.
     while search_rx.try_recv().is_ok() {}
+    // The drained frames were counted in `queued_bytes`; zero the accounting
+    // so the new connection starts with an empty output backlog (the byte
+    // gate must not stay tripped by frames that were discarded, not written).
+    queued_bytes.store(0, Ordering::SeqCst);
     ready.store(true, Ordering::SeqCst);
 
     // ── Main loop: forward SEARCH frames out; route SEARCH_RESPONSE back ────
@@ -2647,7 +2709,13 @@ async fn ns_run_once(
         tokio::select! {
             pkt = search_rx.recv() => {
                 match pkt {
-                    Some(bytes) => writer.write_all(&bytes).await?,
+                    Some(bytes) => {
+                        let len = bytes.len();
+                        writer.write_all(&bytes).await?;
+                        // Frame is now on the socket: release its share of the
+                        // queued-byte backlog so the engine's tick gate frees up.
+                        queued_bytes.fetch_sub(len, Ordering::SeqCst);
+                    }
                     // Engine dropped the sender — shut down cleanly.
                     None => return Ok(()),
                 }
@@ -5257,6 +5325,7 @@ mod tests {
         let handles = vec![NsHandle {
             tx,
             ready: Arc::clone(&ready),
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
         }];
 
         // NS offline/handshaking: ticks far exceeding the channel capacity must
@@ -5291,10 +5360,12 @@ mod tests {
             NsHandle {
                 tx: tx_a,
                 ready: Arc::new(AtomicBool::new(true)),
+                queued_bytes: Arc::new(AtomicUsize::new(0)),
             },
             NsHandle {
                 tx: tx_b,
                 ready: Arc::new(AtomicBool::new(false)),
+                queued_bytes: Arc::new(AtomicUsize::new(0)),
             },
         ];
         ns_forward_one(&handles, &codec, 7, "PV:X");
@@ -5302,6 +5373,45 @@ mod tests {
         assert!(
             rx_b.try_recv().is_err(),
             "not-ready NS is skipped this tick"
+        );
+    }
+
+    /// pvxs skips a name server for a tick once its TCP output buffer exceeds
+    /// 64 KiB (`evbuffer_get_length(tx) > 64*1024`, client.cpp:1118-1128). The
+    /// engine's gate must be byte-aware, not a frame count: an empty channel
+    /// (zero frames queued) with an over-threshold byte backlog is still
+    /// skipped, and a delivered frame adds its own byte length to the backlog.
+    #[test]
+    fn ns_forward_gate_is_byte_based_not_frame_count() {
+        let codec = PvaCodec { big_endian: false };
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let ready = Arc::new(AtomicBool::new(true));
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let handles = vec![NsHandle {
+            tx,
+            ready: Arc::clone(&ready),
+            queued_bytes: Arc::clone(&queued_bytes),
+        }];
+
+        // Channel is empty (0 frames), but the byte backlog already exceeds the
+        // 64 KiB gate: pvxs skips the NS for the tick on queued bytes alone, so
+        // a frame-count gate (which would see an empty channel) is wrong here.
+        queued_bytes.store(NS_TX_MAX_QUEUED_BYTES + 1, Ordering::SeqCst);
+        ns_forward_one(&handles, &codec, 1, "PV:GATE");
+        assert!(
+            rx.try_recv().is_err(),
+            "over-budget queued bytes must skip the tick even with an empty channel"
+        );
+
+        // Drained back under the threshold: the next tick is delivered and the
+        // frame's own length is tracked in the backlog (bytes, not a count).
+        queued_bytes.store(0, Ordering::SeqCst);
+        ns_forward_one(&handles, &codec, 2, "PV:GATE");
+        let frame = rx.try_recv().expect("under-budget tick is delivered");
+        assert_eq!(
+            queued_bytes.load(Ordering::SeqCst),
+            frame.len(),
+            "the delivered frame's byte length is added to the queued-byte backlog"
         );
     }
 

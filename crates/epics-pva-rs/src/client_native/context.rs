@@ -272,6 +272,7 @@ impl PvaClientBuilder {
                 pool,
                 channels: RwLock::new(HashMap::new()),
                 search: OnceLock::new(),
+                cache_cleaner: std::sync::Once::new(),
                 name_servers: self.name_servers,
                 priority: self.priority,
                 tcp_timeout: self.tcp_timeout,
@@ -299,6 +300,12 @@ struct ClientInner {
     channels: RwLock<HashMap<String, Arc<Channel>>>,
     /// Lazy: only spawn the search engine when we actually need to resolve.
     search: OnceLock<SearchEngine>,
+    /// Spawns the periodic [`cache_clean_loop`] exactly once, on the first
+    /// channel cached. Deferred to the first cache insert (rather than
+    /// `build()`) so the sync builder never requires a Tokio runtime, mirroring
+    /// the lazy `search` engine spawn above; there is nothing to clean until a
+    /// channel exists.
+    cache_cleaner: std::sync::Once,
     /// TCP name servers (EPICS_PVA_NAME_SERVERS). Passed into SearchEngine
     /// as persistent search peers; also reported by ClientReport::name_servers.
     name_servers: Vec<SocketAddr>,
@@ -329,6 +336,13 @@ struct ClientInner {
 /// Lazily initialized on first use.
 static SHARED_SEARCH_ENGINE: tokio::sync::OnceCell<SearchEngine> =
     tokio::sync::OnceCell::const_new();
+
+/// Interval between automatic channel-cache sweeps. pvxs enables a
+/// per-`ContextImpl` `cacheCleaner` timer at `channelCacheCleanInterval{10,0}`
+/// (client.cpp:57, 666) that runs `cacheClean("", Context::Clean)` over the
+/// whole channel map so a long-lived client probing many PV names does not
+/// retain every idle channel until the context is closed.
+const CHANNEL_CACHE_CLEAN_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Apply a [`CacheAction`] to the channel map, returning the channels that were
 /// removed so the caller can close `Disconnect`ed ones after releasing the map
@@ -384,6 +398,55 @@ pub enum CacheAction {
     /// disconnect transition — the analog of pvxs `trash->disconnect(trash)`
     /// (client.cpp:1367-1369).
     Disconnect,
+}
+
+/// Background channel-cache GC. Mirrors the pvxs `cacheCleaner` timer callback
+/// `cacheClean("", Context::Clean)` (client.cpp:666, 1339-1382): every `period`
+/// it removes cached channels whose only owner is the cache itself
+/// (`Arc::strong_count == 1`, the analog of pvxs `use_count <= 1`), leaving
+/// in-use channels connected and reusable.
+///
+/// Lifetime: the task holds a `Weak<ClientInner>`, so it never keeps the
+/// context alive. It exits when the last [`PvaClient`] clone is dropped
+/// (`upgrade()` fails) or after [`PvaClient::close`] sets the `ConnectionPool`
+/// shutdown gate. Unlike pvxs, which removes the timer synchronously in
+/// `ContextImpl::close` (client.cpp:693-725), the Rust task exits on its next
+/// tick — the same idle-until-observed divergence already documented for the
+/// search-engine timer in [`PvaClient::close`]; it does no work in the interim
+/// (the shutdown gate short-circuits the sweep and `close()` already drained
+/// the map).
+///
+/// It never spawns the search engine: pvxs `cacheClean` touches only the
+/// channel map, so a direct-server client that never resolves a name keeps no
+/// engine. A `Clean`-removed channel has `strong_count == 1`, which means no
+/// in-flight op holds it and therefore no pending search references it (pending
+/// searches are held only by an awaiting caller's `oneshot` receiver), so
+/// dropping it here cannot orphan engine state.
+async fn cache_clean_loop(inner: std::sync::Weak<ClientInner>, period: Duration) {
+    let mut tick = tokio::time::interval(period);
+    // pvxs arms the timer with `event_add(cacheCleaner, &channelCacheCleanInterval)`
+    // (client.cpp:666), i.e. the first sweep fires after one interval, not at
+    // startup. Consume the immediate first tick so the first real sweep is one
+    // `period` away.
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        let Some(inner) = inner.upgrade() else {
+            return; // last PvaClient clone dropped — nothing left to clean
+        };
+        if inner.pool.is_shutdown() {
+            return; // close()d — terminal teardown already drained the cache
+        }
+        // Clean removes only channels whose sole reference is the map's own
+        // Arc; the returned channels are dropped here. Clean never closes
+        // in-use channels (client.cpp:1350-1357), so there is nothing to
+        // close after releasing the lock.
+        let _removed = {
+            let mut chans = inner.channels.write();
+            apply_cache_action(&mut chans, "", CacheAction::Clean)
+        };
+    }
 }
 
 #[derive(Clone)]
@@ -570,6 +633,18 @@ impl PvaClient {
         if forced.is_some() {
             return Ok(ch);
         }
+
+        // First channel about to enter the cache: arm the periodic cache
+        // cleaner (pvxs starts `cacheCleaner` at context construction,
+        // client.cpp:666). Deferred to here so the cleaner holds a
+        // `Weak<ClientInner>` and is spawned inside the Tokio runtime that
+        // every channel op already runs in; `Once` guarantees a single task.
+        self.inner.cache_cleaner.call_once(|| {
+            tokio::spawn(cache_clean_loop(
+                Arc::downgrade(&self.inner),
+                CHANNEL_CACHE_CLEAN_INTERVAL,
+            ));
+        });
 
         let mut map = self.inner.channels.write();
         if let Some(existing) = map.get(pv_name).cloned() {
@@ -2887,6 +2962,88 @@ mod tests {
         let removed = apply_cache_action(&mut chans, "", CacheAction::Drop);
         assert!(chans.is_empty(), "empty name sweeps every cached channel");
         assert_eq!(removed.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn periodic_cache_cleaner_sweeps_only_unreferenced_channels() {
+        // Drive the same loop the client arms on its first cached channel.
+        // `tokio`'s "full" feature excludes "test-util", so paused time is
+        // unavailable here; a short real interval plus bounded polling keeps the
+        // test deterministic without depending on one sleep landing on a tick.
+        let client = PvaClient::builder().build();
+        let period = Duration::from_millis(25);
+        tokio::spawn(cache_clean_loop(Arc::downgrade(&client.inner), period));
+
+        // (a) a cached channel with no external Arc is swept within a few ticks.
+        client
+            .inner
+            .channels
+            .write()
+            .insert("unused".into(), cache_test_channel("unused"));
+        let mut swept = false;
+        for _ in 0..200 {
+            if !client.inner.channels.read().contains_key("unused") {
+                swept = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            swept,
+            "cleaner removes a cached channel with no live external reference"
+        );
+
+        // (b) a channel with an extra live Arc survives repeated sweeps.
+        let held = cache_test_channel("held");
+        client
+            .inner
+            .channels
+            .write()
+            .insert("held".into(), Arc::clone(&held));
+        tokio::time::sleep(period * 5).await;
+        assert!(
+            client.inner.channels.read().contains_key("held"),
+            "cleaner preserves a channel that still has a live external reference"
+        );
+
+        // (c) once that extra reference drops, a later sweep removes it.
+        drop(held);
+        let mut swept = false;
+        for _ in 0..200 {
+            if !client.inner.channels.read().contains_key("held") {
+                swept = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            swept,
+            "cleaner removes the channel on a sweep after its last external ref drops"
+        );
+    }
+
+    #[tokio::test]
+    async fn periodic_cache_cleaner_exits_when_client_dropped() {
+        let client = PvaClient::builder().build();
+        let weak = Arc::downgrade(&client.inner);
+        let handle = tokio::spawn(cache_clean_loop(weak.clone(), Duration::from_millis(25)));
+
+        // Dropping the only PvaClient clone releases the last strong ref; the
+        // cleaner's next `Weak::upgrade` fails and the task returns.
+        drop(client);
+        assert_eq!(weak.strong_count(), 0, "no strong ClientInner ref remains");
+        let mut finished = false;
+        for _ in 0..200 {
+            if handle.is_finished() {
+                finished = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            finished,
+            "cleaner task exits once the last PvaClient clone is dropped"
+        );
     }
 
     // Regression: a client built with both `share_udp(true)` and a

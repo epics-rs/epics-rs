@@ -1268,6 +1268,37 @@ impl LinkSet for PvaLinkResolver {
         })
     }
 
+    fn scan_forward(&self, name: &str) -> Result<(), String> {
+        if !self.is_enabled() {
+            return Err("pvalink disabled".into());
+        }
+        let full = strip_scheme(name).ok_or_else(|| {
+            format!("pvalink rejects ca:// scheme: {name} (use the CA-link path instead)")
+        })?;
+        let bare = link_pv_name(full);
+        // lazily register per-link options from the query string; a
+        // forward link shares the same monitor-backed channel a value
+        // INP link would open (pvxs's `pvaLinkChannel` always monitors —
+        // `pvalink_channel.cpp`), which is what `is_connected` checks.
+        if full != bare {
+            lazy_register_inp_opts(&self.link_options, full);
+        }
+        let cfg = self.inp_cfg_for(full);
+        block_in_place_or_warn(|| {
+            self.handle.block_on(async {
+                // Open / reuse the shared channel so the forward link
+                // tracks connection the way pvxs's shared channel does,
+                // then fire `pvaScanForward` (process-only, no value).
+                let link = self
+                    .registry
+                    .get_or_open(cfg)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                link.scan_forward().await.map_err(|e| e.to_string())
+            })
+        })
+    }
+
     fn flush_puts(&self) {
         if !self.is_enabled() {
             return;

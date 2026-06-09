@@ -968,6 +968,35 @@ impl PvaLink {
         }
     }
 
+    /// Fire this link's forward link (FLNK): trigger the remote target to
+    /// process, transferring no value. Mirrors pvxs `pvaScanForward`
+    /// (`pvxs/ioc/pvalink_lset.cpp:672-688`).
+    ///
+    /// A forward link is never deferred ("FWD_LINK is never deferred, and
+    /// always results in a Put") and stages no value. pvxs realises it as
+    /// `lchan->put(true)` — a PUT that forces `record._options.process`
+    /// `= "true"` (`pvalink_channel.cpp:255-262`) with an empty value
+    /// bitset, reusing the channel's put machinery only because pvxs's
+    /// FWD link shares the value-link's put queue. Here the forward link
+    /// has nothing to stage and no queue to share, so it issues the
+    /// semantically identical PVA `PROCESS` (cmd 16) — "trigger record
+    /// processing without transferring a value", the wire `dbProcess`
+    /// that a DB FLNK's `scanOnce` also reaches.
+    ///
+    /// Applies pvxs's non-retry validity gate (`pvalink_lset.cpp:677`): a
+    /// forward link is never a retry write, so a disconnected channel
+    /// yields `Disconnected` and the caller raises LINK/INVALID — no
+    /// trigger is sent (and no blocking connect is attempted).
+    pub async fn scan_forward(&self) -> PvaLinkResult<()> {
+        if !self.is_connected() {
+            return Err(PvaLinkError::Disconnected(self.config.pv_name.clone()));
+        }
+        self.client
+            .pvprocess(&self.config.pv_name)
+            .await
+            .map_err(PvaLinkError::Pva)
+    }
+
     /// True when the link currently has a live upstream connection.
     /// Mirrors pvxs `pvaIsConnected` (pvalink_lset.cpp:186).
     ///
@@ -2659,6 +2688,24 @@ mod tests {
                 .any(|(k, v)| k == "queueSize" && *v == ScalarValue::UInt(16)),
             "OUT monitor request must carry queueSize=16"
         );
+    }
+
+    /// A forward link on a DISCONNECTED channel must NOT issue a process:
+    /// pvxs `pvaScanForward`'s `!retry && !valid()` gate
+    /// (`pvalink_lset.cpp:677`) returns immediately — no blocking connect,
+    /// no wire trigger — so the owning record can alarm LINK/INVALID. The
+    /// monitor flag is left false, standing in for a channel whose monitor
+    /// has not connected.
+    #[tokio::test]
+    async fn scan_forward_on_disconnected_link_is_gated() {
+        let (link, _flag) = PvaLink::for_test_with_monitor_flag(inp_cfg(SevrMode::Ms), None);
+        assert!(!link.is_connected());
+        match link.scan_forward().await {
+            Err(PvaLinkError::Disconnected(_)) => {}
+            other => {
+                panic!("disconnected forward must be gated to Disconnected, got {other:?}")
+            }
+        }
     }
 
     // ---- B4: defer / retry Put queue ----

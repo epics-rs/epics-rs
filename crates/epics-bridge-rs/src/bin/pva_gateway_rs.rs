@@ -37,21 +37,24 @@
 //! (`gwmain.cpp:133-188`), instead of collapsing to one client/server
 //! pair.
 //!
-//! Two faithful-but-bounded mappings, because epics-pva-rs's PVA stack
-//! is the only provider available here:
-//! - a client's `provider` must be `"pva"`; a `"ca"` upstream would need
-//!   a CA client (a different binary), so it is rejected with a clear
-//!   error rather than silently ignored.
-//! - a client's `addrlist` × `serverport` maps to the gateway client's
-//!   TCP name-server list ([`PvaClientBuilder::name_servers`]) — the
-//!   gateway-appropriate "pin these upstream endpoints" mechanism. The
-//!   client-side UDP broadcast knobs (`bcastport` / `autoaddrlist`) have
-//!   no per-client builder surface and are not applied to clients (they
-//!   ARE applied to servers, whose beacon emission maps to
-//!   `udp_port` / `auto_beacon`).
+//! One faithful-but-bounded mapping, because epics-pva-rs's PVA stack is
+//! the only provider available here: a client's `provider` must be
+//! `"pva"`; a `"ca"` upstream would need a CA client (a different binary),
+//! so it is rejected with a clear error rather than silently ignored.
+//!
+//! The client section's `addrlist` / `autoaddrlist` / `serverport` /
+//! `bcastport` configure the upstream pvAccess client's UDP SEARCH exactly
+//! as `pva2pva` maps them onto `EPICS_PVA_*` (`gwmain.cpp:141-144`
+//! `configure_client`): `addrlist` is the SEARCH destination list (sent on
+//! the broadcast port, NOT TCP name servers), `autoaddrlist` toggles
+//! per-NIC directed-broadcast expansion, `serverport` is the default
+//! connect port, and `bcastport` is the UDP SEARCH / beacon port. The
+//! server section's `interface` is likewise an address *list*
+//! (`EPICS_PVAS_INTF_ADDR_LIST`, `gwmain.cpp:164`), binding every listed
+//! NIC.
 
 use std::fs;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -198,8 +201,77 @@ fn default_interface() -> String {
     "0.0.0.0".to_string()
 }
 
+/// Strip `//` line and `/* */` block comments from JSON text, leaving the
+/// contents of string literals untouched.
+///
+/// pva2pva parses its config through `pvd::parseJSON` (gwmain.cpp:107),
+/// which enables yajl comment tolerance
+/// (`pvData/src/json/parseinto.cpp:271`
+/// `yajl_config(handle, yajl_allow_comments, 1)`); plain `serde_json`
+/// rejects comments. To keep comment-annotated `loopback.conf`-style files
+/// working, strip comments before parsing. Stripped bytes become spaces and
+/// newlines are preserved, so a `serde_json` parse error still reports the
+/// correct line/column in the original source.
+fn strip_json_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut chars = src.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                // Line comment: drop to end of line, preserving the newline.
+                chars.next();
+                out.push_str("  ");
+                for n in chars.by_ref() {
+                    if n == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                    out.push(if n == '\r' { '\r' } else { ' ' });
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                // Block comment: drop to the closing `*/`, preserving newlines.
+                chars.next();
+                out.push_str("  ");
+                let mut prev = '\0';
+                for n in chars.by_ref() {
+                    out.push(match n {
+                        '\n' => '\n',
+                        '\r' => '\r',
+                        _ => ' ',
+                    });
+                    if prev == '*' && n == '/' {
+                        break;
+                    }
+                    prev = n;
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn parse_config(text: &str) -> Result<GatewayConfigFile, String> {
-    serde_json::from_str(text).map_err(|e| format!("config file is not valid JSON: {e}"))
+    let stripped = strip_json_comments(text);
+    serde_json::from_str(&stripped).map_err(|e| format!("config file is not valid JSON: {e}"))
 }
 
 /// Validate a parsed config without touching the network. Mirrors the
@@ -270,22 +342,39 @@ fn validate(cfg: &GatewayConfigFile) -> Result<(), String> {
     Ok(())
 }
 
-/// Parse an EPICS-style whitespace-separated address list into socket
-/// addresses, combining bare IPs with `default_port`. Empty / blank
-/// input yields an empty list (the caller then keeps environment
-/// defaults rather than pinning an empty set).
-fn parse_addr_list(list: &str, default_port: u16) -> Result<Vec<SocketAddr>, String> {
+/// Parse a server `interface` field — an EPICS-style whitespace-separated
+/// address list (`EPICS_PVAS_INTF_ADDR_LIST`, gwmain.cpp:164). Each token is
+/// a bare IP literal; the list binds the PVA server's TCP/UDP responders to
+/// those interfaces. Empty / blank input yields an empty list (the caller
+/// defaults that to the all-NIC wildcard bind). Hostname resolution is not
+/// applied here — the env-driven path
+/// (`epics_pva_rs::config::server_intf_addr_list`) owns DNS resolution; this
+/// matches the prior single-`interface` parser's numeric-literal fidelity.
+fn parse_interface_list(list: &str) -> Result<Vec<IpAddr>, String> {
     let mut out = Vec::new();
     for tok in list.split_whitespace() {
-        if let Ok(sa) = tok.parse::<SocketAddr>() {
-            out.push(sa);
-        } else if let Ok(ip) = tok.parse::<IpAddr>() {
-            out.push(SocketAddr::new(ip, default_port));
-        } else {
-            return Err(format!("invalid address-list entry '{tok}'"));
+        match tok.parse::<IpAddr>() {
+            Ok(ip) => out.push(ip),
+            Err(_) => return Err(format!("invalid interface '{tok}'")),
         }
     }
     Ok(out)
+}
+
+/// Resolve a parsed interface list into the `(bind_ip, interfaces)` pair the
+/// [`PvaServerConfig`] runtime consumes. A wildcard entry (or no entry)
+/// collapses to the all-NIC bind — empty `interfaces` so the runtime's
+/// all-NIC TCP/UDP default applies (runtime.rs `tcp_bind_addresses` /
+/// `bind_on_interfaces`), carrying the wildcard's family as `bind_ip`. An
+/// explicit, wildcard-free list binds exactly those NICs.
+fn resolve_server_bind(intf_ips: Vec<IpAddr>) -> (IpAddr, Vec<IpAddr>) {
+    if let Some(wildcard) = intf_ips.iter().find(|ip| ip.is_unspecified()) {
+        (*wildcard, Vec::new())
+    } else if let Some(first) = intf_ips.first().copied() {
+        (first, intf_ips)
+    } else {
+        (IpAddr::V4(Ipv4Addr::UNSPECIFIED), Vec::new())
+    }
 }
 
 /// Build (but do not run) the multi-tenant gateway described by `cfg`.
@@ -309,34 +398,32 @@ fn build_gateway(
         .max_subscribers(max_subscribers);
 
     for c in &cfg.clients {
-        // addrlist × serverport → TCP name servers (the gateway pins its
-        // upstream endpoints; gwmain.cpp:133-150 configure_client).
-        let name_servers = parse_addr_list(&c.addrlist, c.serverport)
-            .map_err(|e| format!("client '{}' addrlist: {e}", c.name))?;
-        let mut cb = PvaClient::builder();
-        if !name_servers.is_empty() {
-            cb = cb.name_servers(name_servers);
-        }
-        // The client-side UDP broadcast-search knobs (`autoaddrlist` /
-        // `bcastport`) have no per-client builder surface — this gateway
-        // pins upstreams via TCP name servers instead. Surface that
-        // explicitly so an operator who set them is not silently ignored.
-        if c.autoaddrlist {
-            eprintln!(
-                "pva-gateway-rs: client '{}': autoaddrlist=true and bcastport={} are not applied \
-                 (no per-client UDP broadcast-search surface); pin upstreams via addrlist × serverport",
-                c.name, c.bcastport
-            );
-        }
+        // gwmain.cpp:141-144 configure_client maps the client section onto
+        // the pvAccess client's UDP-SEARCH env: addrlist → EPICS_PVA_ADDR_LIST
+        // (SEARCH destinations sent on the broadcast port, NOT TCP name
+        // servers — search_engine.rs ClientSearchConfig), autoaddrlist →
+        // EPICS_PVA_AUTO_ADDR_LIST, serverport → EPICS_PVA_SERVER_PORT,
+        // bcastport → EPICS_PVA_BROADCAST_PORT. An addrlist entry without an
+        // explicit port takes the broadcast port (ClientSearchConfig::from_env).
+        let addr_list = epics_pva_rs::config::parse_endpoints_with_port(&c.addrlist, c.bcastport);
+        let cb = PvaClient::builder()
+            .addr_list(addr_list)
+            .auto_addr_list(c.autoaddrlist)
+            .broadcast_port(c.bcastport)
+            .server_port(c.serverport);
         builder = builder.add_upstream(c.name.clone(), Arc::new(cb.build()));
     }
 
     for s in &cfg.servers {
-        let bind_ip: IpAddr = s
-            .interface
-            .trim()
-            .parse()
-            .map_err(|_| format!("server '{}': invalid interface '{}'", s.name, s.interface))?;
+        // gwmain.cpp:164 configure_server maps the server `interface` onto
+        // EPICS_PVAS_INTF_ADDR_LIST — an address *list*, binding the PVA
+        // server's TCP/UDP responders to every listed NIC, not a single
+        // interface. The server_native runtime already binds a Vec of
+        // interfaces (runtime.rs tcp_bind_addresses / udp_interfaces); parse
+        // the list and feed it through.
+        let intf_ips =
+            parse_interface_list(&s.interface).map_err(|e| format!("server '{}': {e}", s.name))?;
+        let (bind_ip, interfaces) = resolve_server_bind(intf_ips);
         // server addrlist × bcastport → beacon destinations
         // (EPICS_PVAS_BEACON_ADDR_LIST; gwmain.cpp:160-166 configure_server).
         // Use the endpoint-preserving parser so a multicast beacon target's
@@ -348,11 +435,7 @@ fn build_gateway(
             tcp_port: s.serverport,
             udp_port: s.bcastport,
             bind_ip,
-            interfaces: if bind_ip.is_unspecified() {
-                Vec::new()
-            } else {
-                vec![bind_ip]
-            },
+            interfaces,
             beacon_destinations: beacon,
             auto_beacon: s.autoaddrlist,
             ..PvaServerConfig::default()
@@ -780,12 +863,111 @@ mod tests {
     }
 
     #[test]
-    fn addr_list_parsing_combines_bare_ip_with_default_port() {
-        let got = parse_addr_list("127.0.0.1 10.0.0.2:9999", 5085).expect("parse");
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0], "127.0.0.1:5085".parse().unwrap());
-        assert_eq!(got[1], "10.0.0.2:9999".parse().unwrap());
-        assert!(parse_addr_list("", 5085).unwrap().is_empty());
-        assert!(parse_addr_list("not-an-ip", 5085).is_err());
+    fn client_addrlist_maps_to_udp_search_on_bcastport() {
+        // gwmain.cpp:141-144 configure_client: a client `addrlist` is
+        // EPICS_PVA_ADDR_LIST — UDP SEARCH destinations sent on the broadcast
+        // port — NOT TCP name servers. A bare-IP entry takes the broadcast
+        // port (bcastport), not the server port (serverport).
+        let cfg = parse_config(LOOPBACK).expect("parse");
+        let c = &cfg.clients[0];
+        assert_eq!(c.addrlist, "127.0.0.1");
+        assert_eq!(c.bcastport, 5086);
+        assert_eq!(c.serverport, 5085);
+        let eps = epics_pva_rs::config::parse_endpoints_with_port(&c.addrlist, c.bcastport);
+        assert_eq!(eps.len(), 1);
+        assert_eq!(
+            eps[0].addr.to_string(),
+            "127.0.0.1:5086",
+            "bare addrlist entry takes the broadcast port, not the server port"
+        );
+    }
+
+    #[test]
+    fn server_interface_parses_multiple_addresses() {
+        // gwmain.cpp:164 configure_server: a server `interface` is
+        // EPICS_PVAS_INTF_ADDR_LIST — an address LIST, binding every listed
+        // NIC, not a single interface.
+        let ifaces = parse_interface_list("127.0.0.1 192.0.2.5").expect("parse");
+        assert_eq!(
+            ifaces,
+            vec![
+                "127.0.0.1".parse::<IpAddr>().unwrap(),
+                "192.0.2.5".parse::<IpAddr>().unwrap(),
+            ]
+        );
+        assert!(parse_interface_list("").unwrap().is_empty());
+        assert!(parse_interface_list("   ").unwrap().is_empty());
+        assert!(parse_interface_list("not-an-ip").is_err());
+    }
+
+    #[test]
+    fn server_bind_resolution_collapses_wildcard_and_keeps_explicit_list() {
+        // An explicit, wildcard-free list binds exactly those NICs.
+        let two = vec![
+            "127.0.0.1".parse::<IpAddr>().unwrap(),
+            "192.0.2.5".parse::<IpAddr>().unwrap(),
+        ];
+        let (bind_ip, interfaces) = resolve_server_bind(two.clone());
+        assert_eq!(bind_ip, two[0]);
+        assert_eq!(interfaces, two);
+
+        // A wildcard entry collapses to the all-NIC bind: empty interface
+        // set (so the runtime binds every NIC) carrying the wildcard family.
+        // Passing [0.0.0.0] through as a literal interface would instead hit
+        // bind_on_interfaces([0.0.0.0]) rather than the all-NIC default.
+        let (bind_ip, interfaces) = resolve_server_bind(vec!["0.0.0.0".parse::<IpAddr>().unwrap()]);
+        assert!(bind_ip.is_unspecified());
+        assert!(interfaces.is_empty());
+
+        // No interface given → all-NIC wildcard bind.
+        let (bind_ip, interfaces) = resolve_server_bind(Vec::new());
+        assert_eq!(bind_ip, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert!(interfaces.is_empty());
+    }
+
+    #[test]
+    fn json_config_tolerates_line_and_block_comments() {
+        // pva2pva parses with yajl comment tolerance (gwmain.cpp:107 →
+        // pvData parseinto.cpp:271 yajl_allow_comments); a comment-annotated
+        // config must parse.
+        let with_comments = r#"{
+            // top-level line comment
+            "version":1,
+            "readOnly":false, /* inline block */
+            "clients":[
+                {"name":"c","provider":"pva"} // trailing line comment
+            ],
+            /* multi-line
+               block comment */
+            "servers":[{"name":"s","clients":["c"]}]
+        }"#;
+        let cfg = parse_config(with_comments).expect("comments must be tolerated");
+        assert_eq!(cfg.version, 1);
+        assert_eq!(cfg.clients.len(), 1);
+        assert_eq!(cfg.servers.len(), 1);
+        validate(&cfg).expect("validate");
+    }
+
+    #[test]
+    fn comment_markers_inside_strings_are_preserved() {
+        // `//` and `/*` inside a JSON string are data, not comment starts.
+        let cfg = parse_config(
+            r#"{"version":1,
+                "clients":[{"name":"a//b","provider":"pva","addrlist":"1.2.3.4"}],
+                "servers":[{"name":"s/*x*/","clients":["a//b"]}]}"#,
+        )
+        .expect("parse");
+        assert_eq!(cfg.clients[0].name, "a//b");
+        assert_eq!(cfg.clients[0].addrlist, "1.2.3.4");
+        assert_eq!(cfg.servers[0].name, "s/*x*/");
+        validate(&cfg).expect("validate");
+    }
+
+    #[test]
+    fn strip_comments_preserves_newlines_for_error_positions() {
+        // Stripped bytes become spaces, newlines are kept, so a `serde_json`
+        // error still points at the right source line.
+        let stripped = strip_json_comments("// a\n// bb\n\"x\"");
+        assert_eq!(stripped, "    \n     \n\"x\"");
     }
 }

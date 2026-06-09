@@ -101,11 +101,15 @@ pub struct GatewayConfig {
     /// Optional path to a command file processed on SIGUSR1 (Unix only).
     /// Each non-comment line is a [`super::command::GatewayCommand`].
     pub command_path: Option<PathBuf>,
-    /// Optional path to the R1/R2/R3 report file (C `-report`, default
-    /// `gateway.report`). When set, the `R1`/`R2`/`R3` commands and the
-    /// SIGUSR2 shortcut append C-compatible report sections here instead
-    /// of only logging a status line (`gateServer.cc:689-979`). `None`
-    /// keeps the log-only behaviour.
+    /// Path to the R1/R2/R3 report file. Defaults to `gateway.report`,
+    /// matching C ca-gateway: its report file is initialised to
+    /// `GATE_REPORT_FILE` in the resource constructor (`gateResources.h:24`,
+    /// `gateResources.cc:334` `report_file=strDup(GATE_REPORT_FILE)`) and is
+    /// overridden only when `-report <file>` is given (`gateway.cc:1159`
+    /// `if(report_file) gr->setReportFile(report_file)`). When set, the
+    /// `R1`/`R2`/`R3` commands and the SIGUSR2 shortcut append C-compatible
+    /// report sections here (`gateServer.cc:689-979`); `None` — the
+    /// Rust-only `--no-report` — keeps the log-only behaviour.
     pub report_path: Option<PathBuf>,
     /// Optional path to a file containing literal upstream PV names to
     /// pre-subscribe (one per line). When set, the gateway pre-fetches
@@ -171,6 +175,28 @@ pub struct GatewayConfig {
     pub upstream_tls_server_name: Option<String>,
 }
 
+/// Default report-file name. Mirrors C ca-gateway's `GATE_REPORT_FILE`
+/// (`gateResources.h:24`), the value its resource constructor installs
+/// (`gateResources.cc:334`).
+const GATE_REPORT_FILE: &str = "gateway.report";
+
+impl GatewayConfig {
+    /// Resolve the report-file path from the CLI layer over the built-in
+    /// default. C ca-gateway defaults the report file to `gateway.report`
+    /// and overrides it only when `-report <file>` is supplied
+    /// (`gateway.cc:1159`); a report is therefore emitted by default. This
+    /// keeps [`Self::default`]'s `report_path` authoritative for the default
+    /// and applies the override only when the operator gave one. `disabled`
+    /// is the Rust-only `--no-report` extension (C has no off switch).
+    pub fn resolve_report_path(explicit: Option<PathBuf>, disabled: bool) -> Option<PathBuf> {
+        if disabled {
+            None
+        } else {
+            explicit.or_else(|| Self::default().report_path)
+        }
+    }
+}
+
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
@@ -180,7 +206,7 @@ impl Default for GatewayConfig {
             putlog_path: None,
             putlog_scope: PutLogScope::default(),
             command_path: None,
-            report_path: None,
+            report_path: Some(PathBuf::from(GATE_REPORT_FILE)),
             preload_path: None,
             server_port: 0,
             timeouts: CacheTimeouts::default(),
@@ -1351,6 +1377,37 @@ mod tests {
         assert_eq!(parse_event_mask(""), 0);
         assert_eq!(parse_event_mask("xyz"), 0);
         assert_eq!(parse_event_mask("vx?a"), DBE_VALUE | DBE_ALARM);
+    }
+
+    #[test]
+    fn report_path_defaults_to_gateway_report() {
+        // C ca-gateway emits a report to gateway.report by default
+        // (gateResources.cc:334 report_file=strDup(GATE_REPORT_FILE)).
+        assert_eq!(
+            GatewayConfig::default().report_path,
+            Some(PathBuf::from("gateway.report"))
+        );
+    }
+
+    #[test]
+    fn resolve_report_path_layers_cli_over_default() {
+        // No flag → the built-in default report file.
+        assert_eq!(
+            GatewayConfig::resolve_report_path(None, false),
+            Some(PathBuf::from("gateway.report"))
+        );
+        // --report <file> overrides the default (gateway.cc:1159).
+        assert_eq!(
+            GatewayConfig::resolve_report_path(Some(PathBuf::from("/tmp/x.report")), false),
+            Some(PathBuf::from("/tmp/x.report"))
+        );
+        // --no-report disables the report entirely (Rust-only off switch),
+        // even if a path was also supplied.
+        assert_eq!(GatewayConfig::resolve_report_path(None, true), None);
+        assert_eq!(
+            GatewayConfig::resolve_report_path(Some(PathBuf::from("/tmp/x.report")), true),
+            None
+        );
     }
 
     #[test]

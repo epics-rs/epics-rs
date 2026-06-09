@@ -77,10 +77,17 @@ struct Args {
     #[arg(long)]
     ca_command: Option<PathBuf>,
 
-    /// CA gateway: R1/R2/R3 report file (C `-report`). When set, report
-    /// commands and the SIGUSR2 shortcut append C-compatible sections here.
+    /// CA gateway: R1/R2/R3 report file (C `-report`). Overrides the default
+    /// `gateway.report`. Report commands and the SIGUSR2 shortcut append
+    /// C-compatible sections here.
     #[arg(long)]
     ca_report: Option<PathBuf>,
+
+    /// CA gateway: disable the report file entirely (Rust-only). C ca-gateway
+    /// always has a report file (defaults to `gateway.report`); pass
+    /// `--ca-no-report` to opt out so no report is written.
+    #[arg(long, conflicts_with = "ca_report")]
+    ca_no_report: bool,
 
     /// CA server port (downstream side). 0 = use default 5064.
     #[arg(long, default_value_t = 0)]
@@ -245,6 +252,7 @@ struct CaSection {
     preload: Option<PathBuf>,
     command: Option<PathBuf>,
     report: Option<PathBuf>,
+    no_report: Option<bool>,
     port: Option<u16>,
     sip: Option<String>,
     signore: Option<String>,
@@ -294,7 +302,8 @@ fn default_config_toml() -> &'static str {
 # putlog_all = false                    # true = broader fail-loud audit (non-C)
 # preload = "/etc/gw/preload.txt"
 # command = "/etc/gw/command.cmd"      # SIGUSR1-triggered (Unix)
-# report = "/var/log/gateway.report"   # R1/R2/R3 + SIGUSR2 report file
+# report = "/var/log/gateway.report"   # override default report file (gateway.report)
+# no_report = false                     # true = disable the report file entirely
 # port = 5064
 # sip = "192.168.1.10"                   # -sip: EPICS_CAS_INTF_ADDR_LIST
 # signore = "192.168.9.0"                # -signore: EPICS_CAS_IGNORE_ADDR_LIST
@@ -349,7 +358,7 @@ async fn run_ca_gateway(args: &Args) -> Result<(), String> {
             PutLogScope::TrapWrite
         },
         command_path: args.ca_command.clone(),
-        report_path: args.ca_report.clone(),
+        report_path: GatewayConfig::resolve_report_path(args.ca_report.clone(), args.ca_no_report),
         preload_path: args.ca_preload.clone(),
         server_port: args.ca_port,
         timeouts: epics_bridge_rs::ca_gateway::CacheTimeouts {
@@ -480,6 +489,11 @@ fn merge_config(args: &mut Args, cfg: &ConfigFile) {
     }
     if args.ca_report.is_none() {
         args.ca_report = cfg.ca.report.clone();
+    }
+    if !args.ca_no_report {
+        if let Some(true) = cfg.ca.no_report {
+            args.ca_no_report = true;
+        }
     }
     if args.ca_port == 0 {
         if let Some(p) = cfg.ca.port {

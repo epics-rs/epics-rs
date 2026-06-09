@@ -1505,8 +1505,15 @@ impl PvDatabase {
                 // lsi/lso post VALUE|LOG only when the string actually
                 // changed (C `lsiRecord.c`/`lsoRecord.c` monitor: `len !=
                 // olen || memcmp(oval, val, len)`); they have no MDEL/ADEL
-                // deadband to express that, so the gate is explicit.
-                Some(changed) => (changed, changed),
+                // deadband to express that, so the gate is explicit. The
+                // MPST/APST `menuPost` "Always" override OR-adds DBE_VALUE /
+                // DBE_LOG even on an unchanged cycle (C monitor: `if (mpst ==
+                // menuPost_Always) events |= DBE_VALUE; if (apst ==
+                // menuPost_Always) events |= DBE_LOG;`).
+                Some(changed) => {
+                    let (val_always, archive_always) = instance.record.monitor_always_post();
+                    (changed || val_always, changed || archive_always)
+                }
                 None => {
                     if instance.record.uses_monitor_deadband() {
                         instance.check_deadband_ext()
@@ -2358,8 +2365,15 @@ impl PvDatabase {
                 // lsi/lso post VALUE|LOG only when the string actually
                 // changed (C `lsiRecord.c`/`lsoRecord.c` monitor: `len !=
                 // olen || memcmp(oval, val, len)`); they have no MDEL/ADEL
-                // deadband to express that, so the gate is explicit.
-                Some(changed) => (changed, changed),
+                // deadband to express that, so the gate is explicit. The
+                // MPST/APST `menuPost` "Always" override OR-adds DBE_VALUE /
+                // DBE_LOG even on an unchanged cycle (C monitor: `if (mpst ==
+                // menuPost_Always) events |= DBE_VALUE; if (apst ==
+                // menuPost_Always) events |= DBE_LOG;`).
+                Some(changed) => {
+                    let (val_always, archive_always) = instance.record.monitor_always_post();
+                    (changed || val_always, changed || archive_always)
+                }
                 None => {
                     if instance.record.uses_monitor_deadband() {
                         instance.check_deadband_ext()

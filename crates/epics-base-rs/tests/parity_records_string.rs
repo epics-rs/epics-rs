@@ -135,6 +135,50 @@ fn h11_lso_monitor_gate_only_on_change() {
 }
 
 // ---------------------------------------------------------------
+// lsi/lso MPST/APST `menuPost` fields: default On-Change (0) leaves
+// the change gate alone; Always (1) OR-adds DBE_VALUE (MPST) /
+// DBE_LOG (APST) even on an unchanged cycle. C lsiRecord.c /
+// lsoRecord.c monitor: `if (mpst == menuPost_Always) events |=
+// DBE_VALUE; if (apst == menuPost_Always) events |= DBE_LOG;`.
+// menuPost_OnChange = 0, menuPost_Always = 1.
+// ---------------------------------------------------------------
+
+#[test]
+fn h11_lsi_mpst_apst_always_post_override() {
+    let mut rec = LsiRecord::default();
+    // Default both menu fields On-Change (0): no Always override.
+    assert_eq!(rec.get_field("MPST"), Some(EpicsValue::Short(0)));
+    assert_eq!(rec.get_field("APST"), Some(EpicsValue::Short(0)));
+    assert_eq!(rec.monitor_always_post(), (false, false));
+
+    // MPST = Always (1): DBE_VALUE forced, DBE_LOG still gated.
+    rec.put_field("MPST", EpicsValue::Short(1)).unwrap();
+    assert_eq!(rec.get_field("MPST"), Some(EpicsValue::Short(1)));
+    assert_eq!(rec.monitor_always_post(), (true, false));
+
+    // APST = Always (1): DBE_LOG forced too.
+    rec.put_field("APST", EpicsValue::Short(1)).unwrap();
+    assert_eq!(rec.monitor_always_post(), (true, true));
+
+    // Any non-Always value (e.g. back to 0) is On-Change.
+    rec.put_field("MPST", EpicsValue::Short(0)).unwrap();
+    assert_eq!(rec.monitor_always_post(), (false, true));
+}
+
+#[test]
+fn h11_lso_mpst_apst_always_post_override() {
+    let mut rec = LsoRecord::default();
+    assert_eq!(rec.get_field("MPST"), Some(EpicsValue::Short(0)));
+    assert_eq!(rec.get_field("APST"), Some(EpicsValue::Short(0)));
+    assert_eq!(rec.monitor_always_post(), (false, false));
+
+    rec.put_field("MPST", EpicsValue::Short(1)).unwrap();
+    rec.put_field("APST", EpicsValue::Short(1)).unwrap();
+    assert_eq!(rec.monitor_always_post(), (true, true));
+    assert_eq!(rec.get_field("APST"), Some(EpicsValue::Short(1)));
+}
+
+// ---------------------------------------------------------------
 // stringin/stringout VAL truncates at MAX_STRING_SIZE (40).
 // ---------------------------------------------------------------
 

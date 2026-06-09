@@ -431,6 +431,29 @@ pub trait Record: Send + Sync + 'static {
         None
     }
 
+    /// `menuPost` "Always" override for the VALUE / LOG monitor masks.
+    ///
+    /// Returns `(post_value_always, post_archive_always)`. The framework
+    /// ORs these into the change-gated mask from
+    /// [`Self::monitor_value_changed`], so an *unchanged* process cycle
+    /// still posts `DBE_VALUE` (resp. `DBE_LOG`) when the record's MPST
+    /// (resp. APST) menu field is set to `Always`.
+    ///
+    /// C `lsiRecord.c`/`lsoRecord.c` `monitor()` compute the VAL post
+    /// mask from three independent inputs:
+    ///
+    /// * the change test `len != olen || memcmp(oval, val, len)` →
+    ///   `DBE_VALUE | DBE_LOG`,
+    /// * `if (mpst == menuPost_Always) events |= DBE_VALUE;`,
+    /// * `if (apst == menuPost_Always) events |= DBE_LOG;`.
+    ///
+    /// [`Self::monitor_value_changed`] carries the first input; this hook
+    /// carries the other two. Records without a `menuPost` field keep the
+    /// default `(false, false)`, which leaves the change gate unchanged.
+    fn monitor_always_post(&self) -> (bool, bool) {
+        (false, false)
+    }
+
     /// The value the MDEL/ADEL deadband is evaluated against.
     ///
     /// For most records C `monitor()` applies the value deadband to

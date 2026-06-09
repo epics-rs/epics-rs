@@ -6401,3 +6401,66 @@ async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
     );
     assert_eq!(stat, alarm_status::LINK_ALARM, "MSI surfaces as LINK_ALARM");
 }
+
+// R0602-BASEREC-4 — lsi/lso `menuPost` MPST/APST "Always" mode.
+//
+// After fix 9587929c an unchanged lsi/lso process cycle posts NO
+// VALUE/LOG monitor (C `lsiRecord.c`/`lsoRecord.c` monitor gate on
+// `len != olen || memcmp(oval, val, len)`). The MPST/APST menu fields
+// restore C's override: an unchanged cycle still posts DBE_VALUE when
+// MPST == menuPost_Always and DBE_LOG when APST == menuPost_Always
+// (lsiRecord.c:217-220). This test drives an unchanged cycle through
+// the link-processing path and asserts the VALUE event fires only when
+// MPST is Always.
+#[tokio::test]
+async fn test_lsi_mpst_always_posts_value_on_unchanged_cycle() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::server::records::lsi::LsiRecord;
+    use epics_base_rs::types::DbFieldType;
+
+    async fn unchanged_cycle_posts_value(mpst_always: bool) -> bool {
+        let db = PvDatabase::new();
+        db.add_record("LSI_MPST", Box::new(LsiRecord::new("hello")))
+            .await
+            .unwrap();
+        if mpst_always {
+            // MPST = menuPost_Always (1).
+            let rec = db.get_record("LSI_MPST").await.unwrap();
+            let mut inst = rec.write().await;
+            inst.record.put_field("MPST", EpicsValue::Short(1)).unwrap();
+        }
+
+        // Cycle 1 commits oval/olen for the seeded "hello", so cycle 2 is
+        // genuinely unchanged (value_changed == false).
+        let mut visited = HashSet::new();
+        db.process_record_with_links("LSI_MPST", &mut visited, 0)
+            .await
+            .unwrap();
+
+        // Subscribe to VAL AFTER cycle 1.
+        let mut val_rx = {
+            let rec = db.get_record("LSI_MPST").await.unwrap();
+            let mut inst = rec.write().await;
+            inst.add_subscriber("VAL", 71, DbFieldType::Char, EventMask::VALUE.bits())
+        }
+        .expect("VAL subscription must be accepted");
+
+        // Cycle 2: no new value. Without MPST this posts nothing; with
+        // MPST == Always it must still post a DBE_VALUE event.
+        let mut visited = HashSet::new();
+        db.process_record_with_links("LSI_MPST", &mut visited, 0)
+            .await
+            .unwrap();
+
+        val_rx.try_recv().is_ok()
+    }
+
+    assert!(
+        unchanged_cycle_posts_value(true).await,
+        "MPST == Always must post a VALUE monitor on an unchanged lsi cycle"
+    );
+    assert!(
+        !unchanged_cycle_posts_value(false).await,
+        "MPST == OnChange (default) must NOT post a VALUE monitor on an unchanged lsi cycle"
+    );
+}

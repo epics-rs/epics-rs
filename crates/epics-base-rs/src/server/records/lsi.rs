@@ -5,6 +5,12 @@ use crate::types::{DbFieldType, EpicsValue};
 /// EPICS `MAX_STRING_SIZE` — DBR_STRING buffers are 40 bytes.
 const MAX_STRING_SIZE: usize = 40;
 
+/// `menuPost_Always` — index 1 of the `menuPost` menu
+/// (`menuPost.dbd.pod`: `choice(menuPost_OnChange, ...)` = 0,
+/// `choice(menuPost_Always, ...)` = 1). MPST/APST default to
+/// `menuPost_OnChange` (0).
+const MENU_POST_ALWAYS: i16 = 1;
+
 /// Truncate `s` to at most `max` bytes, snapping back to a UTF-8
 /// char boundary so the result is always valid UTF-8.
 fn truncate_utf8(s: &str, max: usize) -> String {
@@ -31,6 +37,15 @@ pub struct LsiRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
+    /// `menuPost` Post Value Monitors: `menuPost_OnChange` (0, default)
+    /// posts DBE_VALUE only on a real change; `menuPost_Always` (1) posts
+    /// DBE_VALUE every write (C `lsiRecord.dbd.pod` MPST, monitor:
+    /// `if (mpst == menuPost_Always) events |= DBE_VALUE;`).
+    pub mpst: i16,
+    /// `menuPost` Post Archive Monitors: same as [`Self::mpst`] for the
+    /// DBE_LOG (archive) mask (C `lsiRecord.dbd.pod` APST, monitor:
+    /// `if (apst == menuPost_Always) events |= DBE_LOG;`).
+    pub apst: i16,
     /// Per-cycle scratch: did VAL change on the most recent `process()`?
     /// Captured BEFORE `process()` commits `oval`/`olen` so the
     /// framework's post-process monitor gate can see it. C
@@ -53,6 +68,8 @@ impl Default for LsiRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
+            mpst: 0,
+            apst: 0,
             value_changed: false,
         }
     }
@@ -127,6 +144,18 @@ static LSI_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    // `menuPost` menu fields (DBF_MENU). Exposed as Short, matching the
+    // record's other menu field (SIMM); C `lsiRecord.dbd.pod:107/113`.
+    FieldDesc {
+        name: "MPST",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "APST",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
 ];
 
 impl Record for LsiRecord {
@@ -148,6 +177,12 @@ impl Record for LsiRecord {
 
     fn monitor_value_changed(&self) -> Option<bool> {
         Some(self.value_changed)
+    }
+
+    fn monitor_always_post(&self) -> (bool, bool) {
+        // C `lsiRecord.c` monitor: `if (mpst == menuPost_Always) events |=
+        // DBE_VALUE; if (apst == menuPost_Always) events |= DBE_LOG;`.
+        (self.mpst == MENU_POST_ALWAYS, self.apst == MENU_POST_ALWAYS)
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
@@ -185,6 +220,8 @@ impl Record for LsiRecord {
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
+            "MPST" => Some(EpicsValue::Short(self.mpst)),
+            "APST" => Some(EpicsValue::Short(self.apst)),
             _ => None,
         }
     }
@@ -246,6 +283,20 @@ impl Record for LsiRecord {
                     self.sims = v;
                 } else {
                     return Err(CaError::TypeMismatch("SIMS".into()));
+                }
+            }
+            "MPST" => {
+                if let EpicsValue::Short(v) = value {
+                    self.mpst = v;
+                } else {
+                    return Err(CaError::TypeMismatch("MPST".into()));
+                }
+            }
+            "APST" => {
+                if let EpicsValue::Short(v) = value {
+                    self.apst = v;
+                } else {
+                    return Err(CaError::TypeMismatch("APST".into()));
                 }
             }
             _ => return Err(CaError::FieldNotFound(name.to_string())),

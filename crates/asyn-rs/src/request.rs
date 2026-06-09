@@ -60,6 +60,23 @@ pub enum RequestOp {
         data: Vec<u8>,
         buf_size: usize,
     },
+    /// Binary octet write: writes `data` raw with the driver's output EOS
+    /// temporarily suppressed. C parity: asynRecord binary output
+    /// (`asynRecord.c:1528-1541`) saves the current output EOS, sets it to
+    /// NULL for the write, and restores it. The actor performs the
+    /// save/clear/restore atomically under its serial ownership so the EOS
+    /// is restored on every exit path.
+    OctetWriteBinary {
+        data: Vec<u8>,
+    },
+    /// Binary octet read: reads with the driver's input EOS temporarily
+    /// suppressed. C parity: asynRecord binary input
+    /// (`asynRecord.c:1564-1577`) saves the current input EOS, sets it to
+    /// NULL for the read, and restores it. The actor brackets the read so
+    /// the EOS is restored on every exit path.
+    OctetReadBinary {
+        buf_size: usize,
+    },
     Int32Write {
         value: i32,
     },

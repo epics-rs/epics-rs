@@ -25,6 +25,16 @@ pub enum PortCommand {
         data: Vec<u8>,
         buf_size: usize,
     },
+    /// Binary octet write with the driver's output EOS suppressed
+    /// (asynRecord binary output, asynRecord.c:1528-1541).
+    OctetWriteBinary {
+        data: Vec<u8>,
+    },
+    /// Binary octet read with the driver's input EOS suppressed
+    /// (asynRecord binary input, asynRecord.c:1564-1577).
+    OctetReadBinary {
+        buf_size: usize,
+    },
     UInt32DigitalRead {
         mask: u32,
     },

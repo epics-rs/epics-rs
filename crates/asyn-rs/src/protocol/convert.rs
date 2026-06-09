@@ -29,6 +29,10 @@ impl From<&RequestOp> for PortCommand {
                 data: data.clone(),
                 buf_size: *buf_size,
             },
+            RequestOp::OctetWriteBinary { data } => Self::OctetWriteBinary { data: data.clone() },
+            RequestOp::OctetReadBinary { buf_size } => Self::OctetReadBinary {
+                buf_size: *buf_size,
+            },
             RequestOp::UInt32DigitalRead { mask } => Self::UInt32DigitalRead { mask: *mask },
             RequestOp::UInt32DigitalWrite { value, mask } => Self::UInt32DigitalWrite {
                 value: *value,
@@ -113,6 +117,10 @@ impl From<&PortCommand> for RequestOp {
             PortCommand::OctetWrite { data } => Self::OctetWrite { data: data.clone() },
             PortCommand::OctetWriteRead { data, buf_size } => Self::OctetWriteRead {
                 data: data.clone(),
+                buf_size: *buf_size,
+            },
+            PortCommand::OctetWriteBinary { data } => Self::OctetWriteBinary { data: data.clone() },
+            PortCommand::OctetReadBinary { buf_size } => Self::OctetReadBinary {
                 buf_size: *buf_size,
             },
             PortCommand::UInt32DigitalRead { mask } => Self::UInt32DigitalRead { mask: *mask },

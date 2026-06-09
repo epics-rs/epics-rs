@@ -1248,10 +1248,16 @@ impl AsynRecord {
                 InterfaceType::Octet => {
                     let data = self.octet_output_buffer();
                     let n = data.len();
-                    match entry.handle.submit_blocking(
-                        crate::request::RequestOp::OctetWrite { data },
-                        self.io_user(),
-                    ) {
+                    // C asynRecord.c:1528-1541: Binary output suppresses the
+                    // driver's output EOS for the raw write; ASCII/Hybrid keep
+                    // EOS active. The OctetWriteBinary op brackets the EOS
+                    // save/clear/restore inside the actor.
+                    let op = if self.ofmt == ASYN_FMT_BINARY {
+                        crate::request::RequestOp::OctetWriteBinary { data }
+                    } else {
+                        crate::request::RequestOp::OctetWrite { data }
+                    };
+                    match entry.handle.submit_blocking(op, self.io_user()) {
                         Ok(_) => {
                             self.nawt = n as i32;
                         }
@@ -1312,10 +1318,17 @@ impl AsynRecord {
                     } else {
                         imax
                     };
-                    match entry.handle.submit_blocking(
-                        crate::request::RequestOp::OctetRead { buf_size },
-                        self.io_user(),
-                    ) {
+                    // C asynRecord.c:1564-1577: Binary input suppresses the
+                    // driver's input EOS so a configured IEOS cannot stop the
+                    // read early or strip payload bytes; ASCII/Hybrid keep EOS
+                    // active. The OctetReadBinary op brackets the EOS
+                    // save/clear/restore inside the actor.
+                    let read_op = if self.ifmt == ASYN_FMT_BINARY {
+                        crate::request::RequestOp::OctetReadBinary { buf_size }
+                    } else {
+                        crate::request::RequestOp::OctetRead { buf_size }
+                    };
+                    match entry.handle.submit_blocking(read_op, self.io_user()) {
                         Ok(result) => {
                             // C asynRecord.c stores the driver's returned
                             // EOM reason into EOMR after every octet read.

@@ -92,8 +92,8 @@ async fn server_with_bi(
 ) -> (CaClient, epics_ca_rs::client::CaChannel) {
     let port = free_port();
     let mut rec = BiRecord::new(val);
-    rec.znam = znam.to_string();
-    rec.onam = onam.to_string();
+    rec.znam = znam.into();
+    rec.onam = onam.into();
     let server = CaServer::builder()
         .port(port)
         .record(pv, rec)

@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::record::{FieldDesc, ProcessAction, ProcessOutcome, Record};
-use epics_base_rs::types::{DbFieldType, EpicsValue};
+use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 
 /// Maximum number of scaler channels.
 pub const MAX_SCALER_CHANNELS: usize = 64;
@@ -95,7 +95,7 @@ pub struct ScalerRecord {
     pub t: f64,
     pub vers: f32,
     pub prec: i16,
-    pub egu: String,
+    pub egu: PvString,
     pub out: String,
     pub cout: String,
     pub coutp: String,
@@ -105,7 +105,7 @@ pub struct ScalerRecord {
     pub g: [i16; MAX_SCALER_CHANNELS],
     pub pr: [u32; MAX_SCALER_CHANNELS],
     pub s: [u32; MAX_SCALER_CHANNELS],
-    pub nm: [String; MAX_SCALER_CHANNELS],
+    pub nm: [PvString; MAX_SCALER_CHANNELS],
 
     // --- Delay tracking ---
     delay_start: Option<Instant>,
@@ -179,7 +179,7 @@ impl Default for ScalerRecord {
             t: 0.0,
             vers: VERSION,
             prec: 0,
-            egu: String::new(),
+            egu: PvString::new(),
             out: String::new(),
             cout: String::new(),
             coutp: String::new(),
@@ -197,7 +197,7 @@ impl Default for ScalerRecord {
             },
             pr: [0; MAX_SCALER_CHANNELS],
             s: [0; MAX_SCALER_CHANNELS],
-            nm: std::array::from_fn(|_| String::new()),
+            nm: std::array::from_fn(|_| PvString::new()),
             delay_start: None,
             autocount_delay: 0.0,
             done_flag: false,
@@ -885,14 +885,14 @@ impl Record for ScalerRecord {
             "T" => return Some(EpicsValue::Double(self.t)),
             "VERS" => return Some(EpicsValue::Float(self.vers)),
             "PREC" => return Some(EpicsValue::Short(self.prec)),
-            "EGU" => return Some(EpicsValue::String(self.egu.clone().into())),
+            "EGU" => return Some(EpicsValue::String(self.egu.clone())),
             "OUT" => return Some(EpicsValue::String(self.out.clone().into())),
             "COUT" => return Some(EpicsValue::String(self.cout.clone().into())),
             "COUTP" => return Some(EpicsValue::String(self.coutp.clone().into())),
             _ => {}
         }
         if let Some(i) = parse_indexed_field(name, "NM") {
-            return Some(EpicsValue::String(self.nm[i].clone().into()));
+            return Some(EpicsValue::String(self.nm[i].clone()));
         }
         if let Some(i) = parse_indexed_field(name, "PR") {
             // PR1..PR64 are DBF_ULONG (scalerRecord.dbd:945-1323).
@@ -992,7 +992,7 @@ impl Record for ScalerRecord {
             },
             "EGU" => match value {
                 EpicsValue::String(v) => {
-                    self.egu = v.as_str_lossy().into_owned();
+                    self.egu = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -1023,7 +1023,7 @@ impl Record for ScalerRecord {
                 if let Some(i) = parse_indexed_field(name, "NM") {
                     match value {
                         EpicsValue::String(v) => {
-                            self.nm[i] = v.as_str_lossy().into_owned();
+                            self.nm[i] = v;
                             Ok(())
                         }
                         _ => Err(CaError::TypeMismatch(name.into())),

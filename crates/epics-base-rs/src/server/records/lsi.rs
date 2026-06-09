@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// EPICS `MAX_STRING_SIZE` — DBR_STRING buffers are 40 bytes.
 const MAX_STRING_SIZE: usize = 40;
@@ -11,25 +11,23 @@ const MAX_STRING_SIZE: usize = 40;
 /// `menuPost_OnChange` (0).
 const MENU_POST_ALWAYS: i16 = 1;
 
-/// Truncate `s` to at most `max` bytes, snapping back to a UTF-8
-/// char boundary so the result is always valid UTF-8.
-fn truncate_utf8(s: &str, max: usize) -> String {
+/// Truncate `s` to at most `max` bytes. C `lsiRecord.c` keeps the long
+/// string in a fixed `char[]` and copies it byte for byte
+/// (`memcpy`/`strncpy`) with no UTF-8 awareness, so the cut is on a raw
+/// byte boundary and a non-UTF-8 value keeps its bytes verbatim.
+fn truncate_bytes(s: PvString, max: usize) -> PvString {
     if s.len() <= max {
-        return s.to_string();
+        return s;
     }
-    let trunc = (0..=max)
-        .rev()
-        .find(|&i| s.is_char_boundary(i))
-        .unwrap_or(0);
-    s[..trunc].to_string()
+    PvString::from_bytes(s.as_bytes()[..max].to_vec())
 }
 
 // Long string input record (EPICS 7).
 // Native CA type is DBR_CHAR array; SIZV (default 256) sets the max byte count.
 // LEN reports the current string length (number of bytes including NUL terminator).
 pub struct LsiRecord {
-    pub val: String,
-    pub oval: String,
+    pub val: PvString,
+    pub oval: PvString,
     pub sizv: u16,
     pub len: u32,
     pub olen: u32,
@@ -56,8 +54,8 @@ pub struct LsiRecord {
 impl Default for LsiRecord {
     fn default() -> Self {
         Self {
-            val: String::new(),
-            oval: String::new(),
+            val: PvString::new(),
+            oval: PvString::new(),
             sizv: 256,
             // C `lsiRecord.c:58-60`: `prec->len = 0; prec->olen = 0;`
             // after the buffer is allocated. LEN only becomes
@@ -77,7 +75,7 @@ impl Default for LsiRecord {
 
 impl LsiRecord {
     pub fn new(val: &str) -> Self {
-        let v = val.to_string();
+        let v = PvString::from(val);
         // LEN is `strlen+1` for a non-empty value; an empty initial
         // value leaves LEN=0 (C: no value present yet).
         let len = if v.is_empty() {
@@ -92,9 +90,9 @@ impl LsiRecord {
         }
     }
 
-    fn clamped(&self) -> String {
+    fn clamped(&self) -> PvString {
         let max = (self.sizv as usize).saturating_sub(1);
-        truncate_utf8(&self.val, max)
+        truncate_bytes(self.val.clone(), max)
     }
 }
 
@@ -255,16 +253,16 @@ impl Record for LsiRecord {
                 // cap. A DBR_CHAR long-string put (CharArray) is only
                 // bounded by SIZV.
                 let mut s = match value {
-                    EpicsValue::String(s) => truncate_utf8(&s.as_str_lossy(), MAX_STRING_SIZE - 1),
+                    EpicsValue::String(s) => truncate_bytes(s, MAX_STRING_SIZE - 1),
                     EpicsValue::CharArray(bytes) => {
                         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                        String::from_utf8_lossy(&bytes[..end]).into_owned()
+                        PvString::from_bytes(bytes[..end].to_vec())
                     }
                     _ => return Err(CaError::TypeMismatch("VAL".into())),
                 };
                 let max = (self.sizv as usize).saturating_sub(1);
                 if s.len() > max {
-                    s = truncate_utf8(&s, max);
+                    s = truncate_bytes(s, max);
                 }
                 self.val = s;
                 self.len = (self.val.len() + 1) as u32;

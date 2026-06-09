@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, MENU_YES_NO, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 // int64out: 64-bit integer output.
 // CA limitation: served as DBR_DOUBLE over Channel Access (precision loss for |val|>2^53).
@@ -15,7 +15,7 @@ use crate::types::{DbFieldType, EpicsValue};
 // with `int64outRecord.c::convert` (see [`Record::process`] below).
 pub struct Int64outRecord {
     pub val: i64,
-    pub egu: String,
+    pub egu: PvString,
     pub hopr: f64,
     pub lopr: f64,
     pub drvh: f64,
@@ -40,7 +40,7 @@ impl Default for Int64outRecord {
     fn default() -> Self {
         Self {
             val: 0,
-            egu: String::new(),
+            egu: PvString::new(),
             hopr: 0.0,
             lopr: 0.0,
             drvh: 0.0,
@@ -221,7 +221,7 @@ impl Record for Int64outRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Int64(self.val)),
-            "EGU" => Some(EpicsValue::String(self.egu.clone().into())),
+            "EGU" => Some(EpicsValue::String(self.egu.clone())),
             "HOPR" => Some(EpicsValue::Double(self.hopr)),
             "LOPR" => Some(EpicsValue::Double(self.lopr)),
             "DRVH" => Some(EpicsValue::Double(self.drvh)),
@@ -256,7 +256,7 @@ impl Record for Int64outRecord {
             }
             "EGU" => {
                 if let EpicsValue::String(v) = value {
-                    self.egu = v.as_str_lossy().into_owned();
+                    self.egu = v;
                 } else {
                     return Err(CaError::TypeMismatch("EGU".into()));
                 }

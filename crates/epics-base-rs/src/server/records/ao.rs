@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Choice labels for the output-increment-format menu, in index order.
 /// C `menu(aoOIF)` (`aoRecord.dbd.pod`): 0=Full, 1=Incremental. Selects
@@ -13,7 +13,7 @@ const AO_OIF_CHOICES: &[&str] = &["Full", "Incremental"];
 pub struct AoRecord {
     // Display
     pub val: f64,
-    pub egu: String,
+    pub egu: PvString,
     pub hopr: f64,
     pub lopr: f64,
     pub prec: i16,
@@ -66,7 +66,7 @@ impl Default for AoRecord {
     fn default() -> Self {
         Self {
             val: 0.0,
-            egu: String::new(),
+            egu: PvString::new(),
             hopr: 0.0,
             lopr: 0.0,
             prec: 0,
@@ -466,7 +466,7 @@ impl Record for AoRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
-            "EGU" => Some(EpicsValue::String(self.egu.clone().into())),
+            "EGU" => Some(EpicsValue::String(self.egu.clone())),
             "HOPR" => Some(EpicsValue::Double(self.hopr)),
             "LOPR" => Some(EpicsValue::Double(self.lopr)),
             "PREC" => Some(EpicsValue::Short(self.prec)),
@@ -521,7 +521,7 @@ impl Record for AoRecord {
             },
             "EGU" => match value {
                 EpicsValue::String(v) => {
-                    self.egu = v.as_str_lossy().into_owned();
+                    self.egu = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

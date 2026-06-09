@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 // printf record (EPICS 7).
 // Evaluates FMT as a printf format string with up to 10 inputs (INP0-INP9, values A-J).
@@ -18,7 +18,7 @@ use crate::types::{DbFieldType, EpicsValue};
 pub struct PrintfRecord {
     pub val: String,
     pub sizv: u16,
-    pub fmt: String,
+    pub fmt: PvString,
     /// INP0-INP9: input link strings.
     pub inp_links: [String; 10],
     /// A-J: current values from the input links, kept in their native
@@ -49,7 +49,7 @@ impl Default for PrintfRecord {
         Self {
             val: String::new(),
             sizv: 256,
-            fmt: String::new(),
+            fmt: PvString::new(),
             inp_links: Default::default(),
             vals: std::array::from_fn(|_| EpicsValue::Double(0.0)),
             len: 0,
@@ -240,9 +240,11 @@ impl PrintfRecord {
                 // the literal accumulated directive text (`format`) on
                 // F_BADFMT, so FMT "x=%q" yields VAL "x=%q". The bytes
                 // `[start..i]` are exactly that directive (parse_directive
-                // advances past the bad conversion char). All ASCII, so
-                // the slice is on a char boundary.
-                result.push_str(&self.fmt[start..i]);
+                // advances past the bad conversion char). Echo them byte
+                // for byte, as the literal-run path above does.
+                for &b in &bytes[start..i] {
+                    result.push(b as char);
+                }
                 continue;
             }
 
@@ -672,7 +674,7 @@ impl Record for PrintfRecord {
             "VAL" => Some(EpicsValue::CharArray(self.val.as_bytes().to_vec())),
             "LEN" => Some(EpicsValue::ULong(self.len)),
             "SIZV" => Some(EpicsValue::UShort(self.sizv)),
-            "FMT" => Some(EpicsValue::String(self.fmt.clone().into())),
+            "FMT" => Some(EpicsValue::String(self.fmt.clone())),
             "IVLS" => Some(EpicsValue::String(self.ivls.clone().into())),
             _ => {
                 if let Some(idx) = Self::inp_index(name) {
@@ -703,7 +705,7 @@ impl Record for PrintfRecord {
             }
             "FMT" => {
                 if let EpicsValue::String(s) = value {
-                    self.fmt = s.as_str_lossy().into_owned();
+                    self.fmt = s;
                 } else {
                     return Err(CaError::TypeMismatch("FMT".into()));
                 }
@@ -772,7 +774,7 @@ mod tests {
 
     fn rec_with(fmt: &str) -> PrintfRecord {
         PrintfRecord {
-            fmt: fmt.to_string(),
+            fmt: PvString::from(fmt),
             ..Default::default()
         }
     }

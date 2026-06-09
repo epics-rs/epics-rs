@@ -1,23 +1,21 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, MENU_YES_NO, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// EPICS `MAX_STRING_SIZE` — `val`/`oval`/`ivov` are fixed 40-byte
 /// buffers in C `stringoutRecord.c`.
 const MAX_STRING_SIZE: usize = 40;
 
-/// Truncate `s` to at most 39 bytes (40 incl. NUL), snapping back to
-/// a UTF-8 char boundary. Mirrors C `strncpy(dst, src, 40)`.
-fn truncate_string(s: &str) -> String {
+/// Truncate `s` to at most 39 payload bytes (40 incl. the implicit
+/// NUL). Mirrors C `strncpy(dst, src, 40)`, which copies bytes with no
+/// UTF-8 awareness, so the cut is on a raw byte boundary and a non-UTF-8
+/// VAL keeps its bytes verbatim.
+fn truncate_string(s: PvString) -> PvString {
     let max = MAX_STRING_SIZE - 1;
     if s.len() <= max {
-        return s.to_string();
+        return s;
     }
-    let trunc = (0..=max)
-        .rev()
-        .find(|&i| s.is_char_boundary(i))
-        .unwrap_or(0);
-    s[..trunc].to_string()
+    PvString::from_bytes(s.as_bytes()[..max].to_vec())
 }
 
 /// Stringout record — a 40-byte (`MAX_STRING_SIZE`) string output.
@@ -30,10 +28,10 @@ fn truncate_string(s: &str) -> String {
 /// does `strncpy(prec->val, prec->ivov, 40)`, which the default
 /// `apply_invalid_output_value` (`set_val`) reproduces exactly.
 pub struct StringoutRecord {
-    pub val: String,
-    pub oval: String,
+    pub val: PvString,
+    pub oval: PvString,
     pub ivoa: i16,
-    pub ivov: String,
+    pub ivov: PvString,
     pub omsl: i16,
     pub dol: String,
     pub simm: i16,
@@ -45,10 +43,10 @@ pub struct StringoutRecord {
 impl Default for StringoutRecord {
     fn default() -> Self {
         Self {
-            val: String::new(),
-            oval: String::new(),
+            val: PvString::new(),
+            oval: PvString::new(),
             ivoa: 0,
-            ivov: String::new(),
+            ivov: PvString::new(),
             omsl: 0,
             dol: String::new(),
             simm: 0,
@@ -62,7 +60,7 @@ impl Default for StringoutRecord {
 impl StringoutRecord {
     pub fn new(val: &str) -> Self {
         Self {
-            val: truncate_string(val),
+            val: truncate_string(PvString::from(val)),
             ..Default::default()
         }
     }
@@ -149,10 +147,10 @@ impl Record for StringoutRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL" => Some(EpicsValue::String(self.val.clone().into())),
-            "OVAL" => Some(EpicsValue::String(self.oval.clone().into())),
+            "VAL" => Some(EpicsValue::String(self.val.clone())),
+            "OVAL" => Some(EpicsValue::String(self.oval.clone())),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
-            "IVOV" => Some(EpicsValue::String(self.ivov.clone().into())),
+            "IVOV" => Some(EpicsValue::String(self.ivov.clone())),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
             "DOL" => Some(EpicsValue::String(self.dol.clone().into())),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
@@ -168,14 +166,14 @@ impl Record for StringoutRecord {
             // C truncates VAL/OVAL/IVOV copies at MAX_STRING_SIZE (40).
             "VAL" => match value {
                 EpicsValue::String(s) => {
-                    self.val = truncate_string(&s.as_str_lossy());
+                    self.val = truncate_string(s);
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("VAL".into())),
             },
             "OVAL" => match value {
                 EpicsValue::String(s) => {
-                    self.oval = truncate_string(&s.as_str_lossy());
+                    self.oval = truncate_string(s);
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("OVAL".into())),
@@ -189,7 +187,7 @@ impl Record for StringoutRecord {
             },
             "IVOV" => match value {
                 EpicsValue::String(s) => {
-                    self.ivov = truncate_string(&s.as_str_lossy());
+                    self.ivov = truncate_string(s);
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("IVOV".into())),

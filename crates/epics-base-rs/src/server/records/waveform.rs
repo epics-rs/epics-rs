@@ -47,7 +47,7 @@ pub struct WaveformRecord {
     pub apst: i16,  // Archive Post Mode: 0=Always, 1=OnChange
     pub hash: u32,  // Hash of array for OnChange detection
     pub busy: bool, // Record is busy (async operation pending)
-    pub egu: String,
+    pub egu: PvString,
     pub hopr: f64,
     pub lopr: f64,
     pub prec: i16,
@@ -85,7 +85,7 @@ impl Default for WaveformRecord {
             apst: 0,
             hash: 0,
             busy: false,
-            egu: String::new(),
+            egu: PvString::new(),
             hopr: 0.0,
             lopr: 0.0,
             prec: 0,
@@ -376,7 +376,7 @@ impl Record for WaveformRecord {
             // record type that doesn't declare the field).
             "INDX" if matches!(self.kind, ArrayKind::SubArray) => Some(EpicsValue::Long(self.indx)),
             "MALM" if matches!(self.kind, ArrayKind::SubArray) => Some(EpicsValue::Long(self.malm)),
-            "EGU" => Some(EpicsValue::String(self.egu.clone().into())),
+            "EGU" => Some(EpicsValue::String(self.egu.clone())),
             "HOPR" => Some(EpicsValue::Double(self.hopr)),
             "LOPR" => Some(EpicsValue::Double(self.lopr)),
             "PREC" => Some(EpicsValue::Short(self.prec)),
@@ -519,7 +519,7 @@ impl Record for WaveformRecord {
             }
             "EGU" => {
                 if let EpicsValue::String(s) = value {
-                    self.egu = s.as_str_lossy().into_owned();
+                    self.egu = s;
                     Ok(())
                 } else {
                     Err(CaError::TypeMismatch("EGU".into()))

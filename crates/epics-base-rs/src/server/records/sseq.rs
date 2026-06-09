@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Choice labels for the SELM step-selection menu, in index order.
 /// C `menu(sseqSELM)` (synApps sseqRecord.dbd): 0=All, 1=Specified, 2=Mask.
@@ -20,12 +20,12 @@ const NUM_STEPS: usize = 10;
 /// A single step in the string sequence.
 #[derive(Clone, Default)]
 struct SseqStep {
-    dly: f64,        // Delay before executing this step
-    dol: String,     // Input link (DOLn)
-    dov: f64,        // Numeric value (DOn)
-    lnk: String,     // Output link (LNKn)
-    str_val: String, // String value (STRn)
-    wait: i16,       // Wait mode: 0=NoWait, 1=Wait, 2..=After1..After9
+    dly: f64,          // Delay before executing this step
+    dol: String,       // Input link (DOLn)
+    dov: f64,          // Numeric value (DOn)
+    lnk: String,       // Output link (LNKn)
+    str_val: PvString, // String value (STRn)
+    wait: i16,         // Wait mode: 0=NoWait, 1=Wait, 2..=After1..After9
 }
 
 /// Sseq record — string sequence record.
@@ -517,7 +517,7 @@ impl Record for SseqRecord {
                         "DOL" => Some(EpicsValue::String(step.dol.clone().into())),
                         "DO" => Some(EpicsValue::Double(step.dov)),
                         "LNK" => Some(EpicsValue::String(step.lnk.clone().into())),
-                        "STR" => Some(EpicsValue::String(step.str_val.clone().into())),
+                        "STR" => Some(EpicsValue::String(step.str_val.clone())),
                         "WAIT" => Some(EpicsValue::Short(step.wait)),
                         _ => None,
                     };
@@ -625,7 +625,7 @@ impl Record for SseqRecord {
                         },
                         "STR" => match value {
                             EpicsValue::String(s) => {
-                                step.str_val = s.as_str_lossy().into_owned();
+                                step.str_val = s;
                                 Ok(())
                             }
                             _ => Err(CaError::TypeMismatch(name.into())),

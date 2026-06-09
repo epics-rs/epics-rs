@@ -7,7 +7,7 @@ use epics_base_rs::server::record::{
     AlarmSeverity, CommonFields, FieldDesc, LinkType, MENU_OMSL, ProcessAction, ProcessContext,
     ProcessOutcome, Record, link_field_type,
 };
-use epics_base_rs::types::{DbFieldType, EpicsValue};
+use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 
 /// Record-specific `DBF_MENU` choice tables, in `.dbd` value order (the
 /// index↔string mapping is wire-visible to clients). Source: the C
@@ -127,7 +127,7 @@ pub struct EpidRecord {
     /// Display precision (PREC)
     pub prec: i16,
     /// Engineering units (EGU)
-    pub egu: String,
+    pub egu: PvString,
     /// High operating range (HOPR)
     pub hopr: f64,
     /// Low operating range (LOPR)
@@ -297,7 +297,7 @@ impl Default for EpidRecord {
             fbop: 0,
             odel: 0.0,
             prec: 0,
-            egu: String::new(),
+            egu: PvString::new(),
             hopr: 0.0,
             lopr: 0.0,
             drvh: 0.0,
@@ -939,7 +939,7 @@ impl Record for EpidRecord {
             "FBOP" => Some(EpicsValue::Short(self.fbop)),
             "ODEL" => Some(EpicsValue::Double(self.odel)),
             "PREC" => Some(EpicsValue::Short(self.prec)),
-            "EGU" => Some(EpicsValue::String(self.egu.clone().into())),
+            "EGU" => Some(EpicsValue::String(self.egu.clone())),
             "HOPR" => Some(EpicsValue::Double(self.hopr)),
             "LOPR" => Some(EpicsValue::Double(self.lopr)),
             "DRVH" => Some(EpicsValue::Double(self.drvh)),
@@ -1092,7 +1092,7 @@ impl Record for EpidRecord {
             },
             "EGU" => match value {
                 EpicsValue::String(v) => {
-                    self.egu = v.as_str_lossy().into_owned();
+                    self.egu = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

@@ -1,23 +1,21 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, MENU_YES_NO, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// EPICS `MAX_STRING_SIZE` — `val`/`oval`/`sval` are fixed 40-byte
 /// buffers in C `stringinRecord.c`; every copy truncates at 40.
 const MAX_STRING_SIZE: usize = 40;
 
-/// Truncate `s` to at most `max` bytes, snapping back to a UTF-8
-/// char boundary. C `strncpy(dst, src, 40)` truncates at 39 + NUL.
-fn truncate_string(s: &str) -> String {
+/// Truncate `s` to at most `MAX_STRING_SIZE - 1` bytes. C
+/// `strncpy(dst, src, sizeof(prec->val))` copies 39 payload bytes + an
+/// implicit NUL byte for byte with no UTF-8 awareness, so the cut is on
+/// a raw byte boundary and a non-UTF-8 VAL keeps its bytes verbatim.
+fn truncate_string(s: PvString) -> PvString {
     let max = MAX_STRING_SIZE - 1;
     if s.len() <= max {
-        return s.to_string();
+        return s;
     }
-    let trunc = (0..=max)
-        .rev()
-        .find(|&i| s.is_char_boundary(i))
-        .unwrap_or(0);
-    s[..trunc].to_string()
+    PvString::from_bytes(s.as_bytes()[..max].to_vec())
 }
 
 /// Stringin record — a 40-byte (`MAX_STRING_SIZE`) string input.
@@ -27,8 +25,8 @@ fn truncate_string(s: &str) -> String {
 /// 40. The Rust port uses `String`, so every VAL/OVAL write must be
 /// truncated to 39 chars + implicit NUL to match.
 pub struct StringinRecord {
-    pub val: String,
-    pub oval: String,
+    pub val: PvString,
+    pub oval: PvString,
     pub simm: i16,
     pub siml: String,
     pub siol: String,
@@ -38,8 +36,8 @@ pub struct StringinRecord {
 impl Default for StringinRecord {
     fn default() -> Self {
         Self {
-            val: String::new(),
-            oval: String::new(),
+            val: PvString::new(),
+            oval: PvString::new(),
             simm: 0,
             siml: String::new(),
             siol: String::new(),
@@ -51,7 +49,7 @@ impl Default for StringinRecord {
 impl StringinRecord {
     pub fn new(val: &str) -> Self {
         Self {
-            val: truncate_string(val),
+            val: truncate_string(PvString::from(val)),
             ..Default::default()
         }
     }
@@ -117,8 +115,8 @@ impl Record for StringinRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL" => Some(EpicsValue::String(self.val.clone().into())),
-            "OVAL" => Some(EpicsValue::String(self.oval.clone().into())),
+            "VAL" => Some(EpicsValue::String(self.val.clone())),
+            "OVAL" => Some(EpicsValue::String(self.oval.clone())),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
@@ -132,14 +130,14 @@ impl Record for StringinRecord {
             "VAL" => match value {
                 // C truncates every VAL copy at MAX_STRING_SIZE (40).
                 EpicsValue::String(s) => {
-                    self.val = truncate_string(&s.as_str_lossy());
+                    self.val = truncate_string(s);
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("VAL".into())),
             },
             "OVAL" => match value {
                 EpicsValue::String(s) => {
-                    self.oval = truncate_string(&s.as_str_lossy());
+                    self.oval = truncate_string(s);
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("OVAL".into())),
@@ -197,5 +195,25 @@ mod tests {
         let s = "y".repeat(39);
         let rec = StringinRecord::new(&s);
         assert_eq!(rec.val.len(), 39);
+    }
+
+    /// A non-UTF-8 VAL (`0xff 0x00 0x80`) put through the field path is
+    /// stored and served back byte for byte, never U+FFFD-mangled. The C
+    /// `stringinRecord` VAL is a fixed `char[40]`, so a non-UTF-8 value
+    /// round-trips unchanged (the byte-based truncate keeps the raw bytes).
+    #[test]
+    fn val_preserves_non_utf8_bytes() {
+        let mut rec = StringinRecord::default();
+        let raw = vec![0xffu8, 0x00, 0x80];
+        rec.put_field("VAL", EpicsValue::String(PvString::from_bytes(raw.clone())))
+            .expect("VAL put");
+        match rec.get_field("VAL") {
+            Some(EpicsValue::String(s)) => assert_eq!(
+                s.as_bytes(),
+                raw.as_slice(),
+                "VAL must round-trip the raw bytes, not lossily decode them"
+            ),
+            other => panic!("expected EpicsValue::String, got {other:?}"),
+        }
     }
 }

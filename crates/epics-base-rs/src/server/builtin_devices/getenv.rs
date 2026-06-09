@@ -172,7 +172,7 @@ mod tests {
         // record type that wouldn't carry INP in its derived field
         // list.
         let _ = inp;
-        r.val = String::new();
+        r.val = crate::types::PvString::new();
         r
     }
 

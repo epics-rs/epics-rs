@@ -480,7 +480,7 @@ async fn ca_link_exposes_remote_metadata() {
     // ai record with real display/control metadata so the upstream CTRL
     // get returns non-default limits/precision/units.
     let mut src = AiRecord::new(50.0);
-    src.egu = "degC".to_string();
+    src.egu = "degC".into();
     src.hopr = 100.0;
     src.lopr = -50.0;
     src.prec = 3;

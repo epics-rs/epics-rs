@@ -1,5 +1,7 @@
 use epics_macros_rs::EpicsRecord;
 
+use crate::types::PvString;
+
 // int64in: 64-bit integer input.
 // CA limitation: served as DBR_DOUBLE over Channel Access (f64, precision loss for |val|>2^53).
 // Native i64 storage is lossless; precision is only lost at the CA wire boundary.
@@ -12,8 +14,8 @@ use epics_macros_rs::EpicsRecord;
 pub struct Int64inRecord {
     #[field(type = "Int64")]
     pub val: i64,
-    #[field(type = "String")]
-    pub egu: String,
+    #[field(type = "PvStr")]
+    pub egu: PvString,
     #[field(type = "Double")]
     pub hopr: f64,
     #[field(type = "Double")]
@@ -51,7 +53,7 @@ impl Default for Int64inRecord {
     fn default() -> Self {
         Self {
             val: 0,
-            egu: String::new(),
+            egu: PvString::new(),
             hopr: 0.0,
             lopr: 0.0,
             hyst: 0.0,

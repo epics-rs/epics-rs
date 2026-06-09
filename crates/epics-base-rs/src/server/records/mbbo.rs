@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Multi-bit binary output record — manual Record impl for raw↔index conversion.
 pub struct MbboRecord {
@@ -59,22 +59,22 @@ pub struct MbboRecord {
     pub ttvl: u32,
     pub ftvl: u32,
     pub ffvl: u32,
-    pub zrst: String,
-    pub onst: String,
-    pub twst: String,
-    pub thst: String,
-    pub frst: String,
-    pub fvst: String,
-    pub sxst: String,
-    pub svst: String,
-    pub eist: String,
-    pub nist: String,
-    pub test: String,
-    pub elst: String,
-    pub tvst: String,
-    pub ttst: String,
-    pub ftst: String,
-    pub ffst: String,
+    pub zrst: PvString,
+    pub onst: PvString,
+    pub twst: PvString,
+    pub thst: PvString,
+    pub frst: PvString,
+    pub fvst: PvString,
+    pub sxst: PvString,
+    pub svst: PvString,
+    pub eist: PvString,
+    pub nist: PvString,
+    pub test: PvString,
+    pub elst: PvString,
+    pub tvst: PvString,
+    pub ttst: PvString,
+    pub ftst: PvString,
+    pub ffst: PvString,
     pub simm: i16,
     pub siml: String,
     pub siol: String,
@@ -144,22 +144,22 @@ impl Default for MbboRecord {
             ttvl: 0,
             ftvl: 0,
             ffvl: 0,
-            zrst: String::new(),
-            onst: String::new(),
-            twst: String::new(),
-            thst: String::new(),
-            frst: String::new(),
-            fvst: String::new(),
-            sxst: String::new(),
-            svst: String::new(),
-            eist: String::new(),
-            nist: String::new(),
-            test: String::new(),
-            elst: String::new(),
-            tvst: String::new(),
-            ttst: String::new(),
-            ftst: String::new(),
-            ffst: String::new(),
+            zrst: PvString::new(),
+            onst: PvString::new(),
+            twst: PvString::new(),
+            thst: PvString::new(),
+            frst: PvString::new(),
+            fvst: PvString::new(),
+            sxst: PvString::new(),
+            svst: PvString::new(),
+            eist: PvString::new(),
+            nist: PvString::new(),
+            test: PvString::new(),
+            elst: PvString::new(),
+            tvst: PvString::new(),
+            ttst: PvString::new(),
+            ftst: PvString::new(),
+            ffst: PvString::new(),
             simm: 0,
             siml: String::new(),
             siol: String::new(),
@@ -187,7 +187,7 @@ impl MbboRecord {
 
     fn compute_sdef(&mut self) {
         let rvs = self.raw_values();
-        let sts: [&String; 16] = [
+        let sts: [&PvString; 16] = [
             &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst, &self.sxst,
             &self.svst, &self.eist, &self.nist, &self.test, &self.elst, &self.tvst, &self.ttst,
             &self.ftst, &self.ffst,
@@ -566,10 +566,18 @@ static MBBO_FIELDS: &[FieldDesc] = &[
 
 /// Helper macro: maps EPICS field name strings to struct fields.
 macro_rules! mbb_get_field {
-    // `String`-variant fields store a Rust `String`; `EpicsValue::String`
-    // now wraps `PvString`, so convert with `.into()` (lossy text record).
+    // `String`-tagged fields (the DOL/OUT/SIML/SIOL link grammar) store a
+    // Rust `String`; `EpicsValue::String` wraps `PvString`, so convert
+    // with `.into()`.
     (@get $self:expr, $field:ident, String) => {
         Some(EpicsValue::String($self.$field.clone().into()))
+    };
+    // `PvStr`-tagged fields are genuine DBF_STRING state-name data
+    // (`field(ZRST..FFST,DBF_STRING) size(26)` in `mbboRecord.dbd`),
+    // stored byte-for-byte in a `PvString`, so the bytes pass through
+    // verbatim — a non-UTF-8 state string round-trips unchanged.
+    (@get $self:expr, $field:ident, PvStr) => {
+        Some(EpicsValue::String($self.$field.clone()))
     };
     (@get $self:expr, $field:ident, $variant:ident) => {
         Some(EpicsValue::$variant($self.$field.clone()))
@@ -584,11 +592,22 @@ macro_rules! mbb_get_field {
 }
 
 macro_rules! mbb_put_field {
-    // `String`-variant fields store a Rust `String`; the extracted payload
-    // is a `PvString`, so convert with `.as_str_lossy().into_owned()`.
+    // `String`-tagged fields (the DOL/OUT/SIML/SIOL link grammar) store a
+    // Rust `String`; the extracted payload is a `PvString`, so convert
+    // with `.as_str_lossy().into_owned()`.
     (@put $self:expr, $field:ident, String, $value:expr, $name:expr) => {
         if let EpicsValue::String(v) = $value {
             $self.$field = v.as_str_lossy().into_owned();
+        } else {
+            return Err(CaError::TypeMismatch($name.into()));
+        }
+    };
+    // `PvStr`-tagged fields are genuine DBF_STRING state-name data stored
+    // in a `PvString`; move the wire bytes in verbatim so a non-UTF-8
+    // state string is preserved.
+    (@put $self:expr, $field:ident, PvStr, $value:expr, $name:expr) => {
+        if let EpicsValue::String(v) = $value {
+            $self.$field = v;
         } else {
             return Err(CaError::TypeMismatch($name.into()));
         }
@@ -730,10 +749,10 @@ impl Record for MbboRecord {
             "FRVL" => frvl: ULong, "FVVL" => fvvl: ULong, "SXVL" => sxvl: ULong, "SVVL" => svvl: ULong,
             "EIVL" => eivl: ULong, "NIVL" => nivl: ULong, "TEVL" => tevl: ULong, "ELVL" => elvl: ULong,
             "TVVL" => tvvl: ULong, "TTVL" => ttvl: ULong, "FTVL" => ftvl: ULong, "FFVL" => ffvl: ULong,
-            "ZRST" => zrst: String, "ONST" => onst: String, "TWST" => twst: String, "THST" => thst: String,
-            "FRST" => frst: String, "FVST" => fvst: String, "SXST" => sxst: String, "SVST" => svst: String,
-            "EIST" => eist: String, "NIST" => nist: String, "TEST" => test: String, "ELST" => elst: String,
-            "TVST" => tvst: String, "TTST" => ttst: String, "FTST" => ftst: String, "FFST" => ffst: String,
+            "ZRST" => zrst: PvStr, "ONST" => onst: PvStr, "TWST" => twst: PvStr, "THST" => thst: PvStr,
+            "FRST" => frst: PvStr, "FVST" => fvst: PvStr, "SXST" => sxst: PvStr, "SVST" => svst: PvStr,
+            "EIST" => eist: PvStr, "NIST" => nist: PvStr, "TEST" => test: PvStr, "ELST" => elst: PvStr,
+            "TVST" => tvst: PvStr, "TTST" => ttst: PvStr, "FTST" => ftst: PvStr, "FFST" => ffst: PvStr,
         )
     }
 
@@ -755,10 +774,10 @@ impl Record for MbboRecord {
             "FRVL" => frvl: ULong, "FVVL" => fvvl: ULong, "SXVL" => sxvl: ULong, "SVVL" => svvl: ULong,
             "EIVL" => eivl: ULong, "NIVL" => nivl: ULong, "TEVL" => tevl: ULong, "ELVL" => elvl: ULong,
             "TVVL" => tvvl: ULong, "TTVL" => ttvl: ULong, "FTVL" => ftvl: ULong, "FFVL" => ffvl: ULong,
-            "ZRST" => zrst: String, "ONST" => onst: String, "TWST" => twst: String, "THST" => thst: String,
-            "FRST" => frst: String, "FVST" => fvst: String, "SXST" => sxst: String, "SVST" => svst: String,
-            "EIST" => eist: String, "NIST" => nist: String, "TEST" => test: String, "ELST" => elst: String,
-            "TVST" => tvst: String, "TTST" => ttst: String, "FTST" => ftst: String, "FFST" => ffst: String,
+            "ZRST" => zrst: PvStr, "ONST" => onst: PvStr, "TWST" => twst: PvStr, "THST" => thst: PvStr,
+            "FRST" => frst: PvStr, "FVST" => fvst: PvStr, "SXST" => sxst: PvStr, "SVST" => svst: PvStr,
+            "EIST" => eist: PvStr, "NIST" => nist: PvStr, "TEST" => test: PvStr, "ELST" => elst: PvStr,
+            "TVST" => tvst: PvStr, "TTST" => ttst: PvStr, "FTST" => ftst: PvStr, "FFST" => ffst: PvStr,
         );
         Ok(())
     }

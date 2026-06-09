@@ -1,3 +1,5 @@
+use epics_base_rs::types::PvString;
+
 use crate::flags::*;
 
 /// Position-related fields.
@@ -275,7 +277,7 @@ pub struct PidFields {
 /// Display fields.
 #[derive(Debug, Clone)]
 pub struct DisplayFields {
-    pub egu: String,
+    pub egu: PvString,
     pub prec: i16,
     pub adel: f64,
     pub mdel: f64,
@@ -290,7 +292,7 @@ pub struct DisplayFields {
 impl Default for DisplayFields {
     fn default() -> Self {
         Self {
-            egu: String::new(),
+            egu: PvString::new(),
             prec: 0,
             adel: 0.0,
             mdel: 0.0,

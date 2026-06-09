@@ -67,7 +67,7 @@ fn test_format_0_contains_slashes() {
     rec.tst = 0;
     rec.process().unwrap();
     assert!(
-        rec.val.contains('/'),
+        rec.val.as_str_lossy().contains('/'),
         "Format 0 should contain '/', got: {}",
         rec.val
     );
@@ -80,7 +80,7 @@ fn test_format_4_time_only() {
     rec.tst = 4;
     rec.process().unwrap();
     assert!(
-        rec.val.contains(':'),
+        rec.val.as_str_lossy().contains(':'),
         "Format 4 should contain ':', got: {}",
         rec.val
     );
@@ -98,7 +98,10 @@ fn test_format_5_hour_minute() {
     let mut rec = TimestampRecord::default();
     rec.tst = 5;
     rec.process().unwrap();
-    assert!(rec.val.contains(':'), "Format 5 should contain ':'");
+    assert!(
+        rec.val.as_str_lossy().contains(':'),
+        "Format 5 should contain ':'"
+    );
     assert!(
         rec.val.len() <= 6,
         "Format 5 should be 5 chars, got: {}",
@@ -113,7 +116,7 @@ fn test_format_8_vms() {
     rec.tst = 8;
     rec.process().unwrap();
     assert!(
-        rec.val.contains('-'),
+        rec.val.as_str_lossy().contains('-'),
         "VMS format should contain '-', got: {}",
         rec.val
     );
@@ -126,7 +129,7 @@ fn test_format_9_with_milliseconds() {
     rec.tst = 9;
     rec.process().unwrap();
     assert!(
-        rec.val.contains('.'),
+        rec.val.as_str_lossy().contains('.'),
         "Format 9 should contain '.', got: {}",
         rec.val
     );
@@ -139,7 +142,7 @@ fn test_format_10_with_milliseconds() {
     rec.tst = 10;
     rec.process().unwrap();
     assert!(
-        rec.val.contains('.'),
+        rec.val.as_str_lossy().contains('.'),
         "Format 10 should contain '.', got: {}",
         rec.val
     );
@@ -198,8 +201,8 @@ fn test_out_of_range_tst_uses_format_0() {
 
     // Format 0 contains two '/' separators in the date part.
     assert_eq!(
-        rec_oob.val.matches('/').count(),
-        rec0.val.matches('/').count(),
+        rec_oob.val.as_str_lossy().matches('/').count(),
+        rec0.val.as_str_lossy().matches('/').count(),
         "out-of-range TST must render like format 0"
     );
 }
@@ -282,7 +285,7 @@ fn test_tse_device_time_truncates_fraction_format_9() {
     rec.set_process_context(&ctx_with_tse(EPICS_TIME_EVENT_DEVICE_TIME));
     rec.process().unwrap();
     assert!(
-        rec.val.ends_with(".000"),
+        rec.val.as_str_lossy().ends_with(".000"),
         "device-time TSE must zero the fraction; format 9 should end \
          '.000', got: {}",
         rec.val
@@ -297,7 +300,7 @@ fn test_tse_device_time_truncates_fraction_format_10() {
     rec.set_process_context(&ctx_with_tse(EPICS_TIME_EVENT_DEVICE_TIME));
     rec.process().unwrap();
     assert!(
-        rec.val.ends_with(".000"),
+        rec.val.as_str_lossy().ends_with(".000"),
         "device-time TSE must zero the fraction; format 10 should end \
          '.000', got: {}",
         rec.val
@@ -318,7 +321,7 @@ fn test_tse_current_time_keeps_format_9() {
     rec.set_process_context(&ctx_with_tse(0)); // epicsTimeEventCurrentTime
     rec.process().unwrap();
     assert!(
-        rec.val.contains('.'),
+        rec.val.as_str_lossy().contains('.'),
         "non-device TSE must still emit the .%03f fraction field, got: {}",
         rec.val
     );
@@ -335,7 +338,17 @@ fn test_tse_device_time_format_0_well_formed() {
     rec.set_process_context(&ctx_with_tse(EPICS_TIME_EVENT_DEVICE_TIME));
     rec.process().unwrap();
     // YY/MM/DD HH:MM:SS — two slashes, two colons, no fraction.
-    assert_eq!(rec.val.matches('/').count(), 2, "got: {}", rec.val);
-    assert_eq!(rec.val.matches(':').count(), 2, "got: {}", rec.val);
-    assert!(!rec.val.contains('.'), "got: {}", rec.val);
+    assert_eq!(
+        rec.val.as_str_lossy().matches('/').count(),
+        2,
+        "got: {}",
+        rec.val
+    );
+    assert_eq!(
+        rec.val.as_str_lossy().matches(':').count(),
+        2,
+        "got: {}",
+        rec.val
+    );
+    assert!(!rec.val.as_str_lossy().contains('.'), "got: {}", rec.val);
 }

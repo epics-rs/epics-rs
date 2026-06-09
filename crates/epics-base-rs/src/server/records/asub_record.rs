@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Number of aSub channels. C `aSubRecord.c`: `NUM_ARGS == 21`
 /// (inputs `A..U`, outputs `VALA..VALU`).
@@ -32,8 +32,8 @@ const SUFFIX: [char; NUM_ARGS] = [
 /// invoked by the framework (`RecordInstance::subroutine`).
 pub struct ASubRecord {
     pub val: f64,
-    pub snam: String,
-    pub inam: String,
+    pub snam: PvString,
+    pub inam: PvString,
     /// Input links `INPA..INPU`.
     pub inp: [String; NUM_ARGS],
     /// Input values `A..U` — native typed via `fta`.
@@ -60,8 +60,8 @@ impl Default for ASubRecord {
     fn default() -> Self {
         Self {
             val: 0.0,
-            snam: String::new(),
-            inam: String::new(),
+            snam: PvString::new(),
+            inam: PvString::new(),
             inp: std::array::from_fn(|_| String::new()),
             a: std::array::from_fn(|_| EpicsValue::Double(0.0)),
             vala: std::array::from_fn(|_| EpicsValue::DoubleArray(Vec::new())),
@@ -218,8 +218,8 @@ impl Record for ASubRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => return Some(EpicsValue::Double(self.val)),
-            "SNAM" => return Some(EpicsValue::String(self.snam.clone().into())),
-            "INAM" => return Some(EpicsValue::String(self.inam.clone().into())),
+            "SNAM" => return Some(EpicsValue::String(self.snam.clone())),
+            "INAM" => return Some(EpicsValue::String(self.inam.clone())),
             _ => {}
         }
         let (prefix, idx) = parse_channel(name)?;
@@ -249,7 +249,7 @@ impl Record for ASubRecord {
             "SNAM" => {
                 return match value {
                     EpicsValue::String(s) => {
-                        self.snam = s.as_str_lossy().into_owned();
+                        self.snam = s;
                         Ok(())
                     }
                     _ => Err(CaError::TypeMismatch(name.into())),
@@ -258,7 +258,7 @@ impl Record for ASubRecord {
             "INAM" => {
                 return match value {
                     EpicsValue::String(s) => {
-                        self.inam = s.as_str_lossy().into_owned();
+                        self.inam = s;
                         Ok(())
                     }
                     _ => Err(CaError::TypeMismatch(name.into())),

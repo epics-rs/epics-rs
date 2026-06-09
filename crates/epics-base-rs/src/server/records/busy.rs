@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, ProcessAction, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 // --- Busy-specific types (inlined from busy-rs/types.rs) ---
 
@@ -101,8 +101,8 @@ pub struct BusyRecord {
     pub val: u16,
     pub oval: u16,
     // Enum labels
-    pub znam: String,
-    pub onam: String,
+    pub znam: PvString,
+    pub onam: PvString,
     // Timing
     pub high: f64,
     // Alarms
@@ -143,8 +143,8 @@ impl Default for BusyRecord {
         Self {
             val: 0,
             oval: 0,
-            znam: "Done".to_string(),
-            onam: "Busy".to_string(),
+            znam: PvString::from("Done"),
+            onam: PvString::from("Busy"),
             high: 0.0,
             zsv: AlarmSevr::None,
             osv: AlarmSevr::None,
@@ -409,8 +409,8 @@ impl Record for BusyRecord {
         match name {
             "VAL" => Some(EpicsValue::Enum(self.val)),
             "OVAL" => Some(EpicsValue::Enum(self.oval)),
-            "ZNAM" => Some(EpicsValue::String(self.znam.clone().into())),
-            "ONAM" => Some(EpicsValue::String(self.onam.clone().into())),
+            "ZNAM" => Some(EpicsValue::String(self.znam.clone())),
+            "ONAM" => Some(EpicsValue::String(self.onam.clone())),
             "HIGH" => Some(EpicsValue::Double(self.high)),
             "ZSV" => Some(EpicsValue::Short(self.zsv.into())),
             "OSV" => Some(EpicsValue::Short(self.osv.into())),
@@ -439,13 +439,14 @@ impl Record for BusyRecord {
                     EpicsValue::Long(v) => v as u16,
                     EpicsValue::Double(v) => v as u16,
                     EpicsValue::String(ref s) => {
-                        let s = s.as_str_lossy();
-                        if s.eq_ignore_ascii_case(&self.znam) {
+                        // Match ZNAM/ONAM case-insensitively on raw bytes so a
+                        // non-UTF-8 state name still resolves to its index.
+                        if s.as_bytes().eq_ignore_ascii_case(self.znam.as_bytes()) {
                             0
-                        } else if s.eq_ignore_ascii_case(&self.onam) {
+                        } else if s.as_bytes().eq_ignore_ascii_case(self.onam.as_bytes()) {
                             1
                         } else {
-                            s.parse::<u16>().unwrap_or(0)
+                            s.as_str_lossy().parse::<u16>().unwrap_or(0)
                         }
                     }
                     _ => return Err(CaError::TypeMismatch(name.to_string())),
@@ -454,7 +455,7 @@ impl Record for BusyRecord {
             }
             "ZNAM" => {
                 if let EpicsValue::String(s) = value {
-                    self.znam = s.as_str_lossy().into_owned();
+                    self.znam = s;
                     Ok(())
                 } else {
                     Err(CaError::TypeMismatch(name.to_string()))
@@ -462,7 +463,7 @@ impl Record for BusyRecord {
             }
             "ONAM" => {
                 if let EpicsValue::String(s) = value {
-                    self.onam = s.as_str_lossy().into_owned();
+                    self.onam = s;
                     Ok(())
                 } else {
                     Err(CaError::TypeMismatch(name.to_string()))
@@ -698,8 +699,8 @@ mod tests {
         assert_eq!(rec.val, 1);
 
         // Custom ZNAM/ONAM
-        rec.znam = "Off".to_string();
-        rec.onam = "On".to_string();
+        rec.znam = "Off".into();
+        rec.onam = "On".into();
         rec.put_field("VAL", EpicsValue::String("Off".into()))
             .unwrap();
         assert_eq!(rec.val, 0);

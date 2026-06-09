@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Number of subroutine input arguments. C `subRecord.c`:
 /// `#define INP_ARG_MAX 21` — fields `A..U` / `INPA..INPU`.
@@ -49,7 +49,7 @@ const INP_VAL_PAIRS: [(&str, &str); INP_ARG_MAX] = [
 /// (`RecordInstance::subroutine`).
 pub struct SubRecord {
     pub val: f64,
-    pub snam: String,
+    pub snam: PvString,
     /// Input links `INPA..INPU`.
     pub inp: [String; INP_ARG_MAX],
     /// Input values `A..U`.
@@ -60,7 +60,7 @@ impl Default for SubRecord {
     fn default() -> Self {
         Self {
             val: 0.0,
-            snam: String::new(),
+            snam: PvString::new(),
             inp: std::array::from_fn(|_| String::new()),
             a: [0.0; INP_ARG_MAX],
         }
@@ -155,7 +155,7 @@ impl Record for SubRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => return Some(EpicsValue::Double(self.val)),
-            "SNAM" => return Some(EpicsValue::String(self.snam.clone().into())),
+            "SNAM" => return Some(EpicsValue::String(self.snam.clone())),
             _ => {}
         }
         if let Some(idx) = INP_NAMES.iter().position(|&n| n == name) {
@@ -181,7 +181,7 @@ impl Record for SubRecord {
             "SNAM" => {
                 return match value {
                     EpicsValue::String(s) => {
-                        self.snam = s.as_str_lossy().into_owned();
+                        self.snam = s;
                         Ok(())
                     }
                     _ => Err(CaError::TypeMismatch("SNAM".into())),

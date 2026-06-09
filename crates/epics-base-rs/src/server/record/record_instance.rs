@@ -1030,7 +1030,7 @@ impl RecordInstance {
             "UTAG" => Some(EpicsValue::UInt64(self.common.utag)),
             "ASG" => Some(EpicsValue::String(self.common.asg.clone().into())),
             "ASL" => Some(EpicsValue::Char(self.common.asl)),
-            "DESC" => Some(EpicsValue::String(self.common.desc.clone().into())),
+            "DESC" => Some(EpicsValue::String(self.common.desc.clone())),
             "PHAS" => Some(EpicsValue::Short(self.common.phas)),
             "EVNT" => Some(EpicsValue::String(self.common.evnt.clone().into())),
             "PRIO" => Some(EpicsValue::Short(self.common.prio)),
@@ -1335,7 +1335,9 @@ impl RecordInstance {
             }
             "DESC" => {
                 if let EpicsValue::String(s) = value {
-                    self.common.desc = s.as_str_lossy().into_owned();
+                    // DBF_STRING data field — store the bytes verbatim so a
+                    // non-UTF-8 DESC round-trips unchanged.
+                    self.common.desc = s;
                 }
             }
             "PHAS" => {
@@ -2735,7 +2737,7 @@ mod metadata_cache_tests {
         }
         fn process(&mut self) -> CaResult<crate::server::record::ProcessOutcome> {
             // Simulate dynamic metadata change inside processing
-            self.egu = "kV".to_string();
+            self.egu = "kV".into();
             self.took_change = true;
             Ok(crate::server::record::ProcessOutcome::complete())
         }

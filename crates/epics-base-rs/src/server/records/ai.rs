@@ -1,13 +1,13 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Analog input record with conversion support.
 /// LINR: 0=NO_CONVERSION, 1=SLOPE, 2=LINEAR
 pub struct AiRecord {
     // Display
     pub val: f64,
-    pub egu: String,
+    pub egu: PvString,
     pub hopr: f64,
     pub lopr: f64,
     pub prec: i16,
@@ -55,7 +55,7 @@ impl Default for AiRecord {
     fn default() -> Self {
         Self {
             val: 0.0,
-            egu: String::new(),
+            egu: PvString::new(),
             hopr: 0.0,
             lopr: 0.0,
             prec: 0,
@@ -322,7 +322,7 @@ impl Record for AiRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
-            "EGU" => Some(EpicsValue::String(self.egu.clone().into())),
+            "EGU" => Some(EpicsValue::String(self.egu.clone())),
             "HOPR" => Some(EpicsValue::Double(self.hopr)),
             "LOPR" => Some(EpicsValue::Double(self.lopr)),
             "PREC" => Some(EpicsValue::Short(self.prec)),
@@ -368,7 +368,7 @@ impl Record for AiRecord {
             },
             "EGU" => match value {
                 EpicsValue::String(v) => {
-                    self.egu = v.as_str_lossy().into_owned();
+                    self.egu = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

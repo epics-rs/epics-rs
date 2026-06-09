@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 use crate::calc::StringInputs;
 use crate::calc::engine::value::StackValue;
@@ -14,7 +14,7 @@ use crate::calc::{CompiledExpr, scalc_compile, scalc_eval};
 /// Output decision controlled by OOPT.
 pub struct ScalcoutRecord {
     pub val: f64,
-    pub sval: String,
+    pub sval: PvString,
     pub calc: String,
     compiled_calc: Option<CompiledExpr>,
     pub oopt: i16, // 0=Every, 1=OnChange, 2=WhenZero, 3=WhenNonzero, 4=TransZero, 5=TransNonzero
@@ -22,7 +22,7 @@ pub struct ScalcoutRecord {
     pub ocal: String,
     compiled_ocal: Option<CompiledExpr>,
     pub oval: f64,
-    pub osv: String,
+    pub osv: PvString,
     pub ivoa: i16, // 0=Continue, 1=Don't drive, 2=Set to IVOV
     pub ivov: f64,
     pub out: String, // output link
@@ -33,10 +33,10 @@ pub struct ScalcoutRecord {
     // Numeric input values A-L (mapped to vars A-P, but only 12 used)
     pub num_vals: [f64; 12],
     // String input values AA-LL
-    pub str_vals: [String; 12],
+    pub str_vals: [PvString; 12],
     // Previous value for transition detection
     prev_val: f64,
-    prev_sval: String,
+    prev_sval: PvString,
     /// CALC_ALARM flag — set when the CALC or OCAL `sCalcPerform`
     /// evaluation fails. synApps `sCalcoutRecord` raises `CALC_ALARM`
     /// on a broken expression; the framework's `evaluate_alarms`
@@ -54,7 +54,7 @@ impl Default for ScalcoutRecord {
     fn default() -> Self {
         Self {
             val: 0.0,
-            sval: String::new(),
+            sval: PvString::new(),
             calc: String::new(),
             compiled_calc: None,
             oopt: 0,
@@ -62,7 +62,7 @@ impl Default for ScalcoutRecord {
             ocal: String::new(),
             compiled_ocal: None,
             oval: 0.0,
-            osv: String::new(),
+            osv: PvString::new(),
             ivoa: 0,
             ivov: 0.0,
             out: String::new(),
@@ -72,7 +72,7 @@ impl Default for ScalcoutRecord {
             num_vals: [0.0; 12],
             str_vals: Default::default(),
             prev_val: 0.0,
-            prev_sval: String::new(),
+            prev_sval: PvString::new(),
             calc_alarm: false,
             cached_should_output: false,
         }
@@ -88,7 +88,10 @@ impl ScalcoutRecord {
         let mut inputs = StringInputs::new();
         for i in 0..12 {
             inputs.num_vars[i] = self.num_vals[i];
-            inputs.str_vars[i] = self.str_vals[i].clone();
+            // The string-calc engine evaluates UTF-8 text (substr/concat/
+            // compare), so a byte-faithful `PvString` input is presented to
+            // it lossily; the stored value round-trips verbatim regardless.
+            inputs.str_vars[i] = self.str_vals[i].as_str_lossy().into_owned();
         }
         inputs
     }
@@ -97,10 +100,10 @@ impl ScalcoutRecord {
         match result {
             StackValue::Double(v) => {
                 self.val = *v;
-                self.sval = format!("{}", v);
+                self.sval = PvString::from(format!("{}", v));
             }
             StackValue::Str(s) => {
-                self.sval = s.clone();
+                self.sval = PvString::from(s.clone());
                 self.val = s.parse::<f64>().unwrap_or(0.0);
             }
         }
@@ -499,10 +502,10 @@ impl Record for ScalcoutRecord {
                             Ok(result) => match &result {
                                 StackValue::Double(v) => {
                                     self.oval = *v;
-                                    self.osv = format!("{}", v);
+                                    self.osv = PvString::from(format!("{}", v));
                                 }
                                 StackValue::Str(s) => {
-                                    self.osv = s.clone();
+                                    self.osv = PvString::from(s.clone());
                                     self.oval = s.parse::<f64>().unwrap_or(0.0);
                                 }
                             },
@@ -527,13 +530,13 @@ impl Record for ScalcoutRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
-            "SVAL" => Some(EpicsValue::String(self.sval.clone().into())),
+            "SVAL" => Some(EpicsValue::String(self.sval.clone())),
             "CALC" => Some(EpicsValue::String(self.calc.clone().into())),
             "OOPT" => Some(EpicsValue::Short(self.oopt)),
             "DOPT" => Some(EpicsValue::Short(self.dopt)),
             "OCAL" => Some(EpicsValue::String(self.ocal.clone().into())),
             "OVAL" => Some(EpicsValue::Double(self.oval)),
-            "OSV" => Some(EpicsValue::String(self.osv.clone().into())),
+            "OSV" => Some(EpicsValue::String(self.osv.clone())),
             "IVOA" => Some(EpicsValue::Short(self.ivoa)),
             "IVOV" => Some(EpicsValue::Double(self.ivov)),
             "OUT" => Some(EpicsValue::String(self.out.clone().into())),
@@ -545,7 +548,7 @@ impl Record for ScalcoutRecord {
                     return Some(EpicsValue::Double(self.num_vals[idx]));
                 }
                 if let Some(idx) = Self::str_var_index(name) {
-                    return Some(EpicsValue::String(self.str_vals[idx].clone().into()));
+                    return Some(EpicsValue::String(self.str_vals[idx].clone()));
                 }
                 if let Some(idx) = Self::inp_index(name) {
                     return Some(EpicsValue::String(self.inp_links[idx].clone().into()));
@@ -565,7 +568,7 @@ impl Record for ScalcoutRecord {
             }
             "SVAL" => match value {
                 EpicsValue::String(s) => {
-                    self.sval = s.as_str_lossy().into_owned();
+                    self.sval = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SVAL".into())),
@@ -608,7 +611,7 @@ impl Record for ScalcoutRecord {
             }
             "OSV" => match value {
                 EpicsValue::String(s) => {
-                    self.osv = s.as_str_lossy().into_owned();
+                    self.osv = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("OSV".into())),
@@ -655,7 +658,7 @@ impl Record for ScalcoutRecord {
                 if let Some(idx) = Self::str_var_index(name) {
                     match value {
                         EpicsValue::String(s) => {
-                            self.str_vals[idx] = s.as_str_lossy().into_owned();
+                            self.str_vals[idx] = s;
                             return Ok(());
                         }
                         _ => return Err(CaError::TypeMismatch(name.into())),

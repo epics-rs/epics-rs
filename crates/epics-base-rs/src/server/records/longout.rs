@@ -9,11 +9,11 @@
 
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, MENU_YES_NO, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 pub struct LongoutRecord {
     pub val: i32,
-    pub egu: String,
+    pub egu: PvString,
     pub hopr: i32,
     pub lopr: i32,
     pub drvh: i32,
@@ -84,7 +84,7 @@ impl Default for LongoutRecord {
     fn default() -> Self {
         Self {
             val: 0,
-            egu: String::new(),
+            egu: PvString::new(),
             hopr: 0,
             lopr: 0,
             drvh: 0, // C defaults both to 0 (equal = no clamping)
@@ -361,7 +361,7 @@ impl Record for LongoutRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Long(self.val)),
-            "EGU" => Some(EpicsValue::String(self.egu.clone().into())),
+            "EGU" => Some(EpicsValue::String(self.egu.clone())),
             "HOPR" => Some(EpicsValue::Long(self.hopr)),
             "LOPR" => Some(EpicsValue::Long(self.lopr)),
             "DRVH" => Some(EpicsValue::Long(self.drvh)),
@@ -405,7 +405,7 @@ impl Record for LongoutRecord {
             }
             "EGU" => {
                 if let EpicsValue::String(v) = value {
-                    self.egu = v.as_str_lossy().into_owned();
+                    self.egu = v;
                 }
             }
             "HOPR" => {

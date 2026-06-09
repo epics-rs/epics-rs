@@ -722,7 +722,7 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "ICOF" => Some(EpicsValue::Double(rec.pid.icof)),
         "DCOF" => Some(EpicsValue::Double(rec.pid.dcof)),
         // Display
-        "EGU" => Some(EpicsValue::String(rec.disp.egu.clone().into())),
+        "EGU" => Some(EpicsValue::String(rec.disp.egu.clone())),
         "PREC" => Some(EpicsValue::Short(rec.disp.prec)),
         "ADEL" => Some(EpicsValue::Double(rec.disp.adel)),
         "MDEL" => Some(EpicsValue::Double(rec.disp.mdel)),
@@ -1593,7 +1593,7 @@ pub(crate) fn motor_put_field(
         // Display
         "EGU" => match value {
             EpicsValue::String(v) => {
-                rec.disp.egu = v.as_str_lossy().into_owned();
+                rec.disp.egu = v;
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),

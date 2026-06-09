@@ -11,7 +11,7 @@ use std::sync::LazyLock;
 
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::record::{FieldDesc, ProcessAction, ProcessOutcome, Record};
-use epics_base_rs::types::{DbFieldType, EpicsValue};
+use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -395,8 +395,8 @@ pub struct TableRecord {
     pub lvio: i16,
 
     // --- Display ---
-    pub legu: String,
-    pub aegu: String,
+    pub legu: PvString,
+    pub aegu: PvString,
     pub prec: i16,
     pub mmap: u32,
     pub geom: Geometry,
@@ -588,7 +588,7 @@ impl Default for TableRecord {
             sset: 0,
             suse: 0,
             lvio: 0,
-            legu: String::new(),
+            legu: PvString::new(),
             aegu: "degrees".into(),
             prec: 0,
             mmap: 0,
@@ -3423,8 +3423,8 @@ impl Record for TableRecord {
             "SSET" => Some(EpicsValue::Short(self.sset)),
             "SUSE" => Some(EpicsValue::Short(self.suse)),
             "LVIO" => Some(EpicsValue::Short(self.lvio)),
-            "LEGU" => Some(EpicsValue::String(self.legu.clone().into())),
-            "AEGU" => Some(EpicsValue::String(self.aegu.clone().into())),
+            "LEGU" => Some(EpicsValue::String(self.legu.clone())),
+            "AEGU" => Some(EpicsValue::String(self.aegu.clone())),
             "PREC" => Some(EpicsValue::Short(self.prec)),
             "MMAP" => Some(EpicsValue::Long(self.mmap as i32)),
             "GEOM" => Some(EpicsValue::Enum(self.geom as u16)),
@@ -3462,6 +3462,21 @@ impl Record for TableRecord {
                 match value {
                     EpicsValue::String(v) => {
                         $field = v.as_str_lossy().into_owned();
+                        Ok(())
+                    }
+                    _ => Err(CaError::TypeMismatch(name.into())),
+                }
+            };
+        }
+        // Byte-faithful put for genuine DBF_STRING display fields
+        // (`tableRecord.dbd` LEGU/AEGU, `PvString`): store the wire bytes
+        // verbatim so a non-UTF-8 EGU round-trips unchanged. (The `*L`/`*I`
+        // motor fields above are DBF_OUTLINK/INLINK grammar — `put_string!`.)
+        macro_rules! put_pvstring {
+            ($field:expr) => {
+                match value {
+                    EpicsValue::String(v) => {
+                        $field = v;
                         Ok(())
                     }
                     _ => Err(CaError::TypeMismatch(name.into())),
@@ -3590,8 +3605,8 @@ impl Record for TableRecord {
             "SET" => put_enum!(self.set, SetMode::from_u16),
             "SSET" => put_short!(self.sset),
             "SUSE" => put_short!(self.suse),
-            "LEGU" => put_string!(self.legu),
-            "AEGU" => put_string!(self.aegu),
+            "LEGU" => put_pvstring!(self.legu),
+            "AEGU" => put_pvstring!(self.aegu),
             "PREC" => put_short!(self.prec),
             "GEOM" => put_enum!(self.geom, Geometry::from_u16),
             "AUNIT" => put_enum!(self.aunit, AngleUnit::from_u16),

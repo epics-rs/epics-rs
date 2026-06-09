@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, MENU_SIMM, ProcessAction, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Binary output record matching C boRecord behavior.
 /// VAL is converted to RVAL using MASK before writing to hardware.
@@ -15,8 +15,8 @@ pub struct BoRecord {
     pub orbv: u32, // old readback value
     pub mask: u32, // hardware mask from device support
     // Strings
-    pub znam: String,
-    pub onam: String,
+    pub znam: PvString,
+    pub onam: PvString,
     // Alarm
     pub zsv: i16,
     pub osv: i16,
@@ -57,8 +57,8 @@ impl Default for BoRecord {
             rbv: 0,
             orbv: 0,
             mask: 0,
-            znam: String::new(),
-            onam: String::new(),
+            znam: PvString::new(),
+            onam: PvString::new(),
             zsv: 0,
             osv: 0,
             cosv: 0,
@@ -366,8 +366,8 @@ impl Record for BoRecord {
             "RBV" => Some(EpicsValue::ULong(self.rbv)),
             "ORBV" => Some(EpicsValue::ULong(self.orbv)),
             "MASK" => Some(EpicsValue::ULong(self.mask)),
-            "ZNAM" => Some(EpicsValue::String(self.znam.clone().into())),
-            "ONAM" => Some(EpicsValue::String(self.onam.clone().into())),
+            "ZNAM" => Some(EpicsValue::String(self.znam.clone())),
+            "ONAM" => Some(EpicsValue::String(self.onam.clone())),
             "ZSV" => Some(EpicsValue::Short(self.zsv)),
             "OSV" => Some(EpicsValue::Short(self.osv)),
             "COSV" => Some(EpicsValue::Short(self.cosv)),
@@ -443,14 +443,14 @@ impl Record for BoRecord {
             },
             "ZNAM" => match value {
                 EpicsValue::String(v) => {
-                    self.znam = v.as_str_lossy().into_owned();
+                    self.znam = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
             "ONAM" => match value {
                 EpicsValue::String(v) => {
-                    self.onam = v.as_str_lossy().into_owned();
+                    self.onam = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

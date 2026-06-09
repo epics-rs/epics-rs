@@ -1,12 +1,14 @@
 use epics_macros_rs::EpicsRecord;
 
+use crate::types::PvString;
+
 #[derive(EpicsRecord)]
 #[record(type = "longin")]
 pub struct LonginRecord {
     #[field(type = "Long")]
     pub val: i32,
-    #[field(type = "String")]
-    pub egu: String,
+    #[field(type = "PvStr")]
+    pub egu: PvString,
     #[field(type = "Long")]
     pub hopr: i32,
     #[field(type = "Long")]
@@ -62,7 +64,7 @@ impl Default for LonginRecord {
     fn default() -> Self {
         Self {
             val: 0,
-            egu: String::new(),
+            egu: PvString::new(),
             hopr: 0,
             lopr: 0,
             hihi: 0,

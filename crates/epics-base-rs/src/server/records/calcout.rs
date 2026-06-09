@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, ProcessAction, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Calcout record — calc with output.
 pub struct CalcoutRecord {
@@ -80,7 +80,7 @@ pub struct CalcoutRecord {
     pub lt: f64,
     pub lu: f64,
     // Display/engineering
-    pub egu: String,
+    pub egu: PvString,
     pub prec: i16,
     pub hopr: f64,
     pub lopr: f64,
@@ -187,7 +187,7 @@ impl Default for CalcoutRecord {
             ls: 0.0,
             lt: 0.0,
             lu: 0.0,
-            egu: String::new(),
+            egu: PvString::new(),
             prec: 0,
             hopr: 0.0,
             lopr: 0.0,
@@ -801,7 +801,7 @@ impl Record for CalcoutRecord {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
             "CALC" => Some(EpicsValue::String(self.calc.clone().into())),
-            "EGU" => Some(EpicsValue::String(self.egu.clone().into())),
+            "EGU" => Some(EpicsValue::String(self.egu.clone())),
             "PREC" => Some(EpicsValue::Short(self.prec)),
             "HOPR" => Some(EpicsValue::Double(self.hopr)),
             "LOPR" => Some(EpicsValue::Double(self.lopr)),
@@ -906,7 +906,7 @@ impl Record for CalcoutRecord {
             },
             "EGU" => match value {
                 EpicsValue::String(s) => {
-                    self.egu = s.as_str_lossy().into_owned();
+                    self.egu = s;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

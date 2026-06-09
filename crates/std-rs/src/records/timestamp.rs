@@ -2,7 +2,7 @@ use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::record::{
     EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc, ProcessContext, ProcessOutcome, Record,
 };
-use epics_base_rs::types::{DbFieldType, EpicsValue};
+use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 
 use chrono::{Local, TimeZone};
 
@@ -59,9 +59,9 @@ const TIMESTAMP_FORMATS: &[&str] = &[
 /// Ported from EPICS std module `timestampRecord.c`.
 pub struct TimestampRecord {
     /// Current formatted timestamp string (VAL).
-    pub val: String,
+    pub val: PvString,
     /// Previous value for change detection (OVAL).
-    pub oval: String,
+    pub oval: PvString,
     /// Seconds past EPICS epoch (RVAL). DBF_ULONG in C; the Rust value
     /// model has no unsigned-32 scalar, so this follows the project
     /// convention of mapping DBF_ULONG to `i32`/`EpicsValue::Long`.
@@ -82,8 +82,8 @@ pub struct TimestampRecord {
 impl Default for TimestampRecord {
     fn default() -> Self {
         Self {
-            val: String::new(),
-            oval: String::new(),
+            val: PvString::new(),
+            oval: PvString::new(),
             rval: 0,
             tst: 0,
             tse: 0,
@@ -115,7 +115,7 @@ static FIELDS: &[FieldDesc] = &[
 ];
 
 impl TimestampRecord {
-    fn format_timestamp(&self) -> (String, i32) {
+    fn format_timestamp(&self) -> (PvString, i32) {
         // C `timestampRecord.c:90-93`: `tse == epicsTimeEventDeviceTime`
         // takes the raw OS clock via `epicsTimeFromTime_t(&time, time(0))`
         // — whole seconds only, the nanosecond field is zero. Any other
@@ -144,7 +144,7 @@ impl TimestampRecord {
         // count is exactly zero (an uninitialised/unset time stamp), not
         // for any non-positive value.
         if sec_past_epoch == 0 {
-            return ("-NULL-".to_string(), sec_past_epoch);
+            return (PvString::from("-NULL-"), sec_past_epoch);
         }
 
         // C `timestampRecord.c:100-138`: any TST outside the valid menu
@@ -177,25 +177,25 @@ impl TimestampRecord {
         // C `timestampRecord.c:140` `epicsTimeToStrftime(val, sizeof(val), ...)`
         // bounds the result to the `char val[40]` buffer; `strftime` keeps
         // one byte for the NUL terminator, so at most 39 visible chars.
-        (truncate_to(formatted, VAL_VISIBLE_MAX), sec_past_epoch)
+        (
+            truncate_to(PvString::from(formatted), VAL_VISIBLE_MAX),
+            sec_past_epoch,
+        )
     }
 }
 
-/// Truncate `s` to at most `max` bytes, respecting UTF-8 char boundaries.
+/// Truncate `s` to at most `max` bytes.
 ///
 /// C stores VAL/OVAL in a fixed `char[40]` buffer whose last byte is the
-/// NUL terminator, so at most 39 visible bytes survive. Timestamp format
-/// strings only ever emit ASCII, so this is a plain byte truncation in
-/// practice.
-fn truncate_to(mut s: String, max: usize) -> String {
+/// NUL terminator, so at most 39 visible bytes survive. C `strftime`
+/// truncates the buffer byte for byte, so this cut is on a raw byte
+/// boundary and a non-UTF-8 VAL written by a client round-trips verbatim.
+fn truncate_to(s: PvString, max: usize) -> PvString {
     if s.len() > max {
-        let mut cut = max;
-        while cut > 0 && !s.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        s.truncate(cut);
+        PvString::from_bytes(s.as_bytes()[..max].to_vec())
+    } else {
+        s
     }
-    s
 }
 
 impl Record for TimestampRecord {
@@ -212,8 +212,8 @@ impl Record for TimestampRecord {
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
-            "VAL" => Some(EpicsValue::String(self.val.clone().into())),
-            "OVAL" => Some(EpicsValue::String(self.oval.clone().into())),
+            "VAL" => Some(EpicsValue::String(self.val.clone())),
+            "OVAL" => Some(EpicsValue::String(self.oval.clone())),
             "RVAL" => Some(EpicsValue::Long(self.rval)),
             "TST" => Some(EpicsValue::Short(self.tst)),
             _ => None,
@@ -226,7 +226,7 @@ impl Record for TimestampRecord {
                 EpicsValue::String(v) => {
                     // VAL is a `char[40]` field in C; the last byte is the
                     // NUL terminator, so 39 visible bytes at most.
-                    self.val = truncate_to(v.as_str_lossy().into_owned(), VAL_VISIBLE_MAX);
+                    self.val = truncate_to(v, VAL_VISIBLE_MAX);
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

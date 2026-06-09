@@ -1,6 +1,6 @@
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// EPICS `MAX_STRING_SIZE` — DBR_STRING buffers are 40 bytes.
 const MAX_STRING_SIZE: usize = 40;
@@ -11,29 +11,27 @@ const MAX_STRING_SIZE: usize = 40;
 /// `menuPost_OnChange` (0).
 const MENU_POST_ALWAYS: i16 = 1;
 
-/// Truncate `s` to at most `max` bytes, snapping back to a UTF-8
-/// char boundary so the result is always valid UTF-8.
-fn truncate_utf8(s: &str, max: usize) -> String {
+/// Truncate `s` to at most `max` bytes. C `lsoRecord.c` keeps the long
+/// string in a fixed `char[]` and copies it byte for byte
+/// (`memcpy`/`strncpy`) with no UTF-8 awareness, so the cut is on a raw
+/// byte boundary and a non-UTF-8 value keeps its bytes verbatim.
+fn truncate_bytes(s: PvString, max: usize) -> PvString {
     if s.len() <= max {
-        return s.to_string();
+        return s;
     }
-    let trunc = (0..=max)
-        .rev()
-        .find(|&i| s.is_char_boundary(i))
-        .unwrap_or(0);
-    s[..trunc].to_string()
+    PvString::from_bytes(s.as_bytes()[..max].to_vec())
 }
 
 // Long string output record (EPICS 7).
 // Native CA type is DBR_CHAR array; SIZV (default 256) sets the max byte count.
 pub struct LsoRecord {
-    pub val: String,
-    pub oval: String,
+    pub val: PvString,
+    pub oval: PvString,
     pub sizv: u16,
     pub len: u32,
     pub olen: u32,
     pub ivoa: i16,
-    pub ivov: String,
+    pub ivov: PvString,
     pub omsl: i16,
     pub dol: String,
     pub simm: i16,
@@ -59,14 +57,14 @@ pub struct LsoRecord {
 impl Default for LsoRecord {
     fn default() -> Self {
         Self {
-            val: String::new(),
-            oval: String::new(),
+            val: PvString::new(),
+            oval: PvString::new(),
             sizv: 256,
             // C `lsoRecord.c:62-64`: `prec->len = 0; prec->olen = 0;`.
             len: 0,
             olen: 0,
             ivoa: 0,
-            ivov: String::new(),
+            ivov: PvString::new(),
             omsl: 0,
             dol: String::new(),
             simm: 0,
@@ -82,7 +80,7 @@ impl Default for LsoRecord {
 
 impl LsoRecord {
     pub fn new(val: &str) -> Self {
-        let v = val.to_string();
+        let v = PvString::from(val);
         let len = if v.is_empty() {
             0
         } else {
@@ -95,9 +93,9 @@ impl LsoRecord {
         }
     }
 
-    fn clamped(&self) -> String {
+    fn clamped(&self) -> PvString {
         let max = (self.sizv as usize).saturating_sub(1);
-        truncate_utf8(&self.val, max)
+        truncate_bytes(self.val.clone(), max)
     }
 }
 
@@ -283,16 +281,16 @@ impl Record for LsoRecord {
                 // DBR_STRING-typed put caps at MAX_STRING_SIZE (40);
                 // DBR_CHAR long-string put is bounded only by SIZV.
                 let mut s = match value {
-                    EpicsValue::String(s) => truncate_utf8(&s.as_str_lossy(), MAX_STRING_SIZE - 1),
+                    EpicsValue::String(s) => truncate_bytes(s, MAX_STRING_SIZE - 1),
                     EpicsValue::CharArray(bytes) => {
                         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                        String::from_utf8_lossy(&bytes[..end]).into_owned()
+                        PvString::from_bytes(bytes[..end].to_vec())
                     }
                     _ => return Err(CaError::TypeMismatch("VAL".into())),
                 };
                 let max = (self.sizv as usize).saturating_sub(1);
                 if s.len() > max {
-                    s = truncate_utf8(&s, max);
+                    s = truncate_bytes(s, max);
                 }
                 self.val = s;
                 self.len = (self.val.len() + 1) as u32;
@@ -316,10 +314,10 @@ impl Record for LsoRecord {
                 }
             }
             "IVOV" => match value {
-                EpicsValue::String(s) => self.ivov = s.as_str_lossy().into_owned(),
+                EpicsValue::String(s) => self.ivov = s,
                 EpicsValue::CharArray(bytes) => {
                     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                    self.ivov = String::from_utf8_lossy(&bytes[..end]).into_owned();
+                    self.ivov = PvString::from_bytes(bytes[..end].to_vec());
                 }
                 _ => return Err(CaError::TypeMismatch("IVOV".into())),
             },

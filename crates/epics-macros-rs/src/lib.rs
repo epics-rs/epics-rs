@@ -457,7 +457,15 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<(String, bool, Option<sy
 }
 
 fn dbf_type_ident(type_str: &str) -> proc_macro2::Ident {
-    proc_macro2::Ident::new(type_str, proc_macro2::Span::call_site())
+    // `PvStr` is a byte-faithful DBF_STRING storage field backed by a
+    // `PvString`; it advertises the same DBF_STRING wire type as a
+    // `String` field but preserves non-UTF-8 bytes on the value path.
+    let variant = if type_str == "PvStr" {
+        "String"
+    } else {
+        type_str
+    };
+    proc_macro2::Ident::new(variant, proc_macro2::Span::call_site())
 }
 
 fn value_to_epics(
@@ -475,6 +483,9 @@ fn value_to_epics(
         "Enum" => quote! { #krate::types::EpicsValue::Enum(#field_expr) },
         "UShort" => quote! { #krate::types::EpicsValue::UShort(#field_expr) },
         "String" => quote! { #krate::types::EpicsValue::String(#field_expr.clone().into()) },
+        // Byte-faithful DBF_STRING storage (`PvString`): serve the bytes
+        // verbatim with no lossy text conversion.
+        "PvStr" => quote! { #krate::types::EpicsValue::String(#field_expr.clone()) },
         _ => quote! { compile_error!("unknown field type") },
     }
 }
@@ -526,13 +537,18 @@ fn value_from_epics(
         "Int64" => "Int64",
         "Char" => "Char",
         "String" => "String",
+        // `PvStr` fields carry the DBF_STRING payload (`EpicsValue::String`)
+        // but store it byte-for-byte in a `PvString`.
+        "PvStr" => "String",
         _ => return quote! { compile_error!("unknown field type"); },
     };
 
     let variant_ident = proc_macro2::Ident::new(variant, proc_macro2::Span::call_site());
 
-    // String fields are declared as `String` in Rust but the
-    // `EpicsValue::String` variant now wraps `PvString`; convert on assign.
+    // `String` fields are declared as Rust `String` but the
+    // `EpicsValue::String` variant wraps `PvString`, so convert on assign.
+    // `PvStr` fields already store a `PvString`, so the wire bytes move in
+    // verbatim — a non-UTF-8 value is preserved.
     let assign = if dbf_type == "String" {
         quote! { self.#field_ident = v.as_str_lossy().into_owned(); }
     } else {

@@ -2,6 +2,7 @@ use std::time::SystemTime;
 
 use super::alarm::{AlarmSeverity, AnalogAlarmConfig};
 use super::scan::ScanType;
+use crate::types::PvString;
 
 /// Common fields shared by all records.
 #[derive(Clone, Debug)]
@@ -59,8 +60,11 @@ pub struct CommonFields {
     /// `RULE(N>0, WRITE)` was always considered "applicable" and
     /// the per-record ASL gate was silently inert.
     pub asl: u8,
-    // Description (moved from individual records)
-    pub desc: String,
+    /// Description — C `dbCommon` `field(DESC,DBF_STRING) size(41)`. A
+    /// genuine DBF_STRING data field served verbatim to clients, so it is
+    /// a byte-preserving [`PvString`] (a non-UTF-8 DESC put must round-trip
+    /// unchanged, matching EPICS fixed-size char-array string semantics).
+    pub desc: PvString,
     // Phase/priority/event
     pub phas: i16,
     /// Event name for `SCAN="Event"` records. C `dbCommon.dbd.pod`:
@@ -134,7 +138,7 @@ impl Default for CommonFields {
             analog_alarm: None,
             asg: "DEFAULT".to_string(),
             asl: 0,
-            desc: String::new(),
+            desc: PvString::new(),
             phas: 0,
             evnt: String::new(),
             prio: 0,

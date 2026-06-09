@@ -5,7 +5,7 @@ use epics_base_rs::server::records::ai::AiRecord;
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::server::records::bi::BiRecord;
 use epics_base_rs::server::records::stringin::StringinRecord;
-use epics_base_rs::types::{DbFieldType, EpicsValue};
+use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 
 #[test]
 fn test_ai_record_type() {
@@ -1149,7 +1149,7 @@ fn test_udf_alarm_persists() {
 #[test]
 fn test_snapshot_ai_with_display_metadata() {
     let mut rec = AiRecord::new(42.0);
-    rec.egu = "degC".to_string();
+    rec.egu = "degC".into();
     rec.prec = 3;
     rec.hopr = 100.0;
     rec.lopr = -50.0;
@@ -1185,7 +1185,7 @@ fn test_snapshot_ai_with_display_metadata() {
 #[test]
 fn test_snapshot_ao_with_drvh_drvl() {
     let mut rec = AoRecord::new(10.0);
-    rec.egu = "V".to_string();
+    rec.egu = "V".into();
     rec.hopr = 100.0;
     rec.lopr = 0.0;
     rec.drvh = 50.0;
@@ -1203,8 +1203,8 @@ fn test_snapshot_ao_with_drvh_drvl() {
 #[test]
 fn test_snapshot_bi_enum_strings() {
     let mut rec = BiRecord::new(0);
-    rec.znam = "Off".to_string();
-    rec.onam = "On".to_string();
+    rec.znam = "Off".into();
+    rec.onam = "On".into();
     let inst = RecordInstance::new("BI:TEST".into(), rec);
 
     let snap = inst.snapshot_for_field("VAL").unwrap();
@@ -1220,10 +1220,10 @@ fn test_snapshot_bi_enum_strings() {
 fn test_snapshot_mbbi_16_strings() {
     use epics_base_rs::server::records::mbbi::MbbiRecord;
     let mut rec = MbbiRecord::default();
-    rec.zrst = "Zero".to_string();
-    rec.onst = "One".to_string();
-    rec.twst = "Two".to_string();
-    rec.ffst = "Fifteen".to_string();
+    rec.zrst = "Zero".into();
+    rec.onst = "One".into();
+    rec.twst = "Two".into();
+    rec.ffst = "Fifteen".into();
     let inst = RecordInstance::new("MBBI:TEST".into(), rec);
 
     let snap = inst.snapshot_for_field("VAL").unwrap();
@@ -1383,7 +1383,7 @@ fn test_snapshot_scalcout_oopt_includes_never() {
 fn test_snapshot_longin_display() {
     use epics_base_rs::server::records::longin::LonginRecord;
     let mut rec = LonginRecord::new(999);
-    rec.egu = "counts".to_string();
+    rec.egu = "counts".into();
     rec.hopr = 10000;
     rec.lopr = 0;
     let inst = RecordInstance::new("LONGIN:TEST".into(), rec);
@@ -1764,4 +1764,28 @@ fn test_bi_lalm_updates_when_cosv_set() {
         lalm, 1,
         "bi LALM must advance to new val even when COSV fires"
     );
+}
+
+/// A non-UTF-8 DESC (`0xff 0x00 0x80`) put through the common-field path
+/// is stored and served back byte for byte, never U+FFFD-mangled. C
+/// `dbCommon` `field(DESC,DBF_STRING) size(41)` is a fixed `char[]`, so a
+/// non-UTF-8 description round-trips unchanged.
+#[test]
+fn desc_preserves_non_utf8_bytes() {
+    let rec = AiRecord::new(0.0);
+    let mut inst = RecordInstance::new("DESC:NONUTF8".into(), rec);
+    let raw = vec![0xffu8, 0x00, 0x80];
+    inst.put_common_field(
+        "DESC",
+        EpicsValue::String(PvString::from_bytes(raw.clone())),
+    )
+    .expect("DESC put");
+    match inst.get_common_field("DESC") {
+        Some(EpicsValue::String(s)) => assert_eq!(
+            s.as_bytes(),
+            raw.as_slice(),
+            "DESC must round-trip the raw bytes, not lossily decode them"
+        ),
+        other => panic!("expected EpicsValue::String, got {other:?}"),
+    }
 }

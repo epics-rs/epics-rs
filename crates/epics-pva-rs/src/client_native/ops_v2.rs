@@ -856,9 +856,49 @@ fn assign_at_path(root: &mut PvField, parts: &[&str], leaf: PvField) {
 ///
 /// one prototype-based PUT, not one round-trip per field and
 /// not a single string concatenated into `.value`.
+///
+/// Text leaves only — each value is parsed against its target
+/// descriptor. Use [`op_put_fields_typed`] to assign already-typed
+/// pvData payloads (e.g. typed arrays staged by pvalink OUT links).
 pub async fn op_put_fields(
     channel: &Arc<Channel>,
     assignments: &[(String, String)],
+    pv_req_override: Option<&[u8]>,
+    op_timeout: Duration,
+) -> PvaResult<()> {
+    let typed: Vec<(String, PutLeaf)> = assignments
+        .iter()
+        .map(|(p, v)| (p.clone(), PutLeaf::Str(v.clone())))
+        .collect();
+    op_put_fields_inner(channel, &typed, pv_req_override, op_timeout).await
+}
+
+/// PUT multiple field assignments as a single delta, with each leaf
+/// either a parsed text value or an already-typed pvData payload (see
+/// [`PutLeaf`]). The typed counterpart of [`op_put_fields`]: a typed
+/// leaf is placed into the selected descriptor without serializing
+/// through `Display`/`ScalarValue::parse`, so a scalar array keeps its
+/// element type and byte content. pvxs `linkBuildPut` combined
+/// sibling-field PUT parity (`pvalink_channel.cpp:127-159`).
+pub async fn op_put_fields_typed(
+    channel: &Arc<Channel>,
+    assignments: &[(String, PutLeaf)],
+    pv_req_override: Option<&[u8]>,
+    op_timeout: Duration,
+) -> PvaResult<()> {
+    op_put_fields_inner(channel, assignments, pv_req_override, op_timeout).await
+}
+
+/// Shared machinery for the multi-field PUT: INIT (with the caller's
+/// `pv_req_override` or a request derived from the assigned paths),
+/// build the delta from the prototype via the single owner
+/// [`build_field_delta`], send, await completion. Both [`op_put_fields`]
+/// and [`op_put_fields_typed`] funnel through here so the INIT/await/
+/// destroy machinery has one owner and cannot drift between the text and
+/// typed paths.
+async fn op_put_fields_inner(
+    channel: &Arc<Channel>,
+    assignments: &[(String, PutLeaf)],
     pv_req_override: Option<&[u8]>,
     op_timeout: Duration,
 ) -> PvaResult<()> {
@@ -4407,29 +4447,64 @@ fn value_only_bit_set(intro: &FieldDesc) -> BitSet {
     changed
 }
 
+/// One leaf of a multi-field PUT assignment. The leaf kind is explicit
+/// so the single delta owner ([`build_field_delta`]) places each value
+/// the right way: a [`PutLeaf::Str`] is parsed against the target
+/// descriptor by the CLI parser, while a [`PutLeaf::Typed`] is assigned
+/// as pvData with no `Display`/parse round trip — so a typed scalar
+/// array travels as its original payload instead of a bracketed string.
+///
+/// pvxs `linkBuildPut` stages each OUT link's DBR payload typed and
+/// moves it into the selected field directly (`pvalink_channel.cpp:127`);
+/// [`PutLeaf::Typed`] is the client-side primitive for that combined
+/// sibling-field PUT path.
+pub enum PutLeaf {
+    /// CLI/text leaf, parsed against the target descriptor by
+    /// [`build_put_value_for_path`].
+    Str(String),
+    /// Already-typed pvData leaf, assigned directly into the selected
+    /// descriptor leaf.
+    Typed(PvField),
+}
+
 /// Build a `(value, changed-bits)` delta from explicit dotted-path
 /// assignments against the prototype: start from the prototype default,
 /// overwrite each assigned leaf, and mark exactly the assigned bits.
-/// Single owner of "assignments → wire delta", shared by the typed
-/// multi-field PUT ([`op_put_fields`]) and the deferred CLI token
-/// classifier ([`build_put_from_args`]).
+/// Single owner of "assignments → wire delta", shared by the text
+/// multi-field PUT ([`op_put_fields`]), the typed multi-field PUT
+/// ([`op_put_fields_typed`]), and the deferred CLI token classifier
+/// ([`build_put_from_args`]). The [`PutLeaf`] kind decides whether a leaf
+/// is parsed from text or assigned as already-typed pvData.
 fn build_field_delta(
     intro: &FieldDesc,
-    assignments: &[(String, String)],
+    assignments: &[(String, PutLeaf)],
 ) -> PvaResult<(PvField, BitSet)> {
     let mut value = crate::pvdata::encode::default_value_for(intro);
     let mut changed = BitSet::new();
-    for (path, value_str) in assignments {
+    for (path, leaf) in assignments {
         let parts: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
         let bit = intro.bit_for_path(path).ok_or_else(|| {
             PvaError::InvalidValue(format!("field path '{path}' not present in introspection"))
         })?;
-        // Reuse the single-path builder (parse + tree shape), then lift
-        // just this path's leaf into the shared accumulator.
-        let one = build_put_value_for_path(intro, &parts, value_str)?;
-        let leaf = value_at_path(&one, &parts)
-            .ok_or_else(|| PvaError::InvalidValue(format!("could not build field '{path}'")))?;
-        assign_at_path(&mut value, &parts, leaf);
+        match leaf {
+            // Text leaf: reuse the single-path builder (parse + tree
+            // shape), then lift just this path's leaf into the shared
+            // accumulator.
+            PutLeaf::Str(value_str) => {
+                let one = build_put_value_for_path(intro, &parts, value_str)?;
+                let leaf_val = value_at_path(&one, &parts).ok_or_else(|| {
+                    PvaError::InvalidValue(format!("could not build field '{path}'"))
+                })?;
+                assign_at_path(&mut value, &parts, leaf_val);
+            }
+            // Typed leaf: assign the original pvData payload directly,
+            // bypassing `Display`/`ScalarValue::parse` so a typed array
+            // keeps its element type and byte content (pvxs `linkBuildPut`
+            // `value = tosend`, pvalink_channel.cpp:147-159).
+            PutLeaf::Typed(pv) => {
+                assign_at_path(&mut value, &parts, pv.clone());
+            }
+        }
         changed.set(bit);
     }
     Ok((value, changed))
@@ -4465,7 +4540,7 @@ fn build_put_from_args(intro: &FieldDesc, tokens: &[String]) -> PvaResult<(PvFie
     );
 
     let mut bare: Vec<String> = Vec::new();
-    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut pairs: Vec<(String, PutLeaf)> = Vec::new();
     for tok in tokens {
         match tok.split_once('=') {
             // No `=`: a plain bare value (pvput.cpp:112-114).
@@ -4473,7 +4548,7 @@ fn build_put_from_args(intro: &FieldDesc, tokens: &[String]) -> PvaResult<(PvFie
             // `f=v` with `f` present in the prototype: a field assignment
             // (pvput.cpp:116-121).
             Some((fname, val)) if !fname.is_empty() && intro.bit_for_path(fname).is_some() => {
-                pairs.push((fname.to_string(), val.to_string()));
+                pairs.push((fname.to_string(), PutLeaf::Str(val.to_string())));
             }
             // `f=v` with `f` absent (or an empty field name): either a
             // bare string value containing `=`, or warn-and-ignore.
@@ -4990,6 +5065,111 @@ mod tests {
             assert!(changed.get(intro.bit_for_path("alarm.severity").unwrap()));
             assert!(changed.get(intro.bit_for_path("alarm.status").unwrap()));
             assert!(!changed.get(intro.bit_for_path("value").unwrap()));
+        }
+    }
+
+    /// Typed multi-field PUT delta (`build_field_delta` with `PutLeaf`):
+    /// a typed pvData leaf is assigned as-is, a text leaf is parsed —
+    /// the combined sibling-field PUT path used by pvalink OUT links.
+    mod field_delta_typed {
+        use super::*;
+        use crate::pvdata::ScalarType;
+
+        /// `{ value: Double[], gain: Int }` — an array field plus a
+        /// scalar sibling, so a combined PUT can carry one typed array
+        /// and one parsed scalar.
+        fn proto() -> FieldDesc {
+            FieldDesc::Structure {
+                struct_id: "test:array_plus_scalar".to_string(),
+                fields: vec![
+                    (
+                        "value".to_string(),
+                        FieldDesc::ScalarArray(ScalarType::Double),
+                    ),
+                    ("gain".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+                ],
+            }
+        }
+
+        fn array_at<'a>(v: &'a PvField, name: &str) -> &'a [ScalarValue] {
+            match v {
+                PvField::Structure(s) => {
+                    match &s.fields.iter().find(|(n, _)| n == name).unwrap().1 {
+                        PvField::ScalarArray(items) => items,
+                        other => panic!("expected ScalarArray at {name}, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Structure, got {other:?}"),
+            }
+        }
+        fn scalar_at<'a>(v: &'a PvField, name: &str) -> &'a ScalarValue {
+            match v {
+                PvField::Structure(s) => {
+                    match &s.fields.iter().find(|(n, _)| n == name).unwrap().1 {
+                        PvField::Scalar(sv) => sv,
+                        other => panic!("expected Scalar at {name}, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Structure, got {other:?}"),
+            }
+        }
+
+        /// A typed array leaf is assigned verbatim — its element type and
+        /// values survive intact — while a sibling text leaf is parsed.
+        /// This is exactly what stringifying the array (the pre-fix
+        /// `queued_to_string` path) would destroy: `Display` renders the
+        /// array as `[1, 2, 3]`, which the field parser then splits on
+        /// commas into `"[1"`, `"2"`, `"3]"` and fails/corrupts.
+        #[test]
+        fn typed_array_leaf_assigned_verbatim_with_str_sibling() {
+            let intro = proto();
+            let arr = PvField::ScalarArray(vec![
+                ScalarValue::Double(1.0),
+                ScalarValue::Double(2.0),
+                ScalarValue::Double(3.0),
+            ]);
+            let assignments = vec![
+                ("value".to_string(), PutLeaf::Typed(arr)),
+                ("gain".to_string(), PutLeaf::Str("7".to_string())),
+            ];
+            let (value, changed) = build_field_delta(&intro, &assignments).unwrap();
+
+            assert_eq!(
+                array_at(&value, "value"),
+                &[
+                    ScalarValue::Double(1.0),
+                    ScalarValue::Double(2.0),
+                    ScalarValue::Double(3.0),
+                ],
+                "typed array leaf must reach the delta unchanged, not stringified",
+            );
+            assert_eq!(scalar_at(&value, "gain"), &ScalarValue::Int(7));
+            assert!(changed.get(intro.bit_for_path("value").unwrap()));
+            assert!(changed.get(intro.bit_for_path("gain").unwrap()));
+
+            // The typed delta must encode/decode against the prototype —
+            // proves the assigned array is wire-valid, not merely typed.
+            for order in [ByteOrder::Little, ByteOrder::Big] {
+                let mut buf = Vec::new();
+                encode_pv_field_with_bitset(&value, &intro, &changed, 0, order, &mut buf);
+                assert!(!buf.is_empty(), "typed delta encoded empty ({order:?})");
+            }
+        }
+
+        /// A typed leaf for a path absent from the prototype is rejected,
+        /// same as the text path (no silent drop).
+        #[test]
+        fn typed_leaf_unknown_path_rejected() {
+            let intro = proto();
+            let assignments = vec![(
+                "nope".to_string(),
+                PutLeaf::Typed(PvField::Scalar(ScalarValue::Int(1))),
+            )];
+            let err = build_field_delta(&intro, &assignments).unwrap_err();
+            assert!(
+                matches!(err, PvaError::InvalidValue(ref m) if m.contains("not present in introspection")),
+                "got: {err:?}"
+            );
         }
     }
 

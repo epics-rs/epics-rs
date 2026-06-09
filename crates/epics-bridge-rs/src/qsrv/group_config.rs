@@ -893,25 +893,40 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
     })
 }
 
+/// `+const` JSON value that is itself a JSON object: pvxs's
+/// `parserCallbackStartBlock` increments the parser depth past 3 and throws
+/// "Group field def. can't contain Object (too deep)"
+/// (groupconfigprocessor.cpp:733-739).
+const CONST_OBJECT_TOO_DEEP: &str = "group +const cannot contain a nested object: pvxs rejects object nesting below a \
+     field definition (groupconfigprocessor.cpp:733-739)";
+
 /// Convert a JSON value to a PvField for a Const mapping.
 ///
-/// pvxs's group JSON parser can only assign a SCALAR or `null` to a
-/// `+const`. It registers no array callbacks — "arrays are not used"
-/// (groupconfigprocessor.cpp:772-790) — and rejects object nesting below
-/// a field-definition object with "Group field def. can't contain Object
-/// (too deep)" (:733-739). The const template then builds a `TypeDef`
-/// directly from the parsed scalar/null `Value` (:596-604).
+/// pvxs's group JSON parser drives a yajl SAX walk. It assigns the parsed
+/// scalar/null to `groupField.info.cval` when `key == "+const"`
+/// (groupprocessorcontext.cpp:80-86), then clears `key` so a later scalar
+/// in the same value falls through to the unknown-field-option warning.
+/// Crucially it registers NO array callbacks (`start_array`/`end_array` are
+/// `nullptr`, groupconfigprocessor.cpp:778-789), so array brackets never
+/// change the parser depth: every array element is processed at the
+/// field-definition depth in document order, and the FIRST scalar/null wins
+/// while the rest are ignored. An object anywhere starts a block, pushing
+/// depth past 3 and throwing "too deep" (:733-739), which rejects the whole
+/// group even if a scalar was already assigned. The const template then
+/// builds a `TypeDef` directly from the assigned scalar/null `Value`
+/// (:596-604).
 ///
 /// The earlier Rust port accepted the full recursive pvData space
-/// (scalar/structure/variant arrays and nested objects). Those forms
-/// produced const descriptors and payloads that pvxs rejects at IOC
-/// startup, so a group authored against Rust was not portable upstream.
-/// Restrict const values to the node kinds pvxs's parser can actually
-/// assign; an array or nested object is a hard error so the group is
-/// skipped (per-group recovery), matching pvxs's startup rejection.
+/// (scalar/structure/variant arrays and nested objects); the previous fix
+/// then over-corrected and rejected EVERY array, dropping groups pvxs loads.
+/// Mirror pvxs's callback semantics instead:
 ///
 /// * Scalars (`bool`/number/string) map to [`PvField::Scalar`].
 /// * `null` maps to [`PvField::Null`] (pvxs accepts an empty/unset const).
+/// * An array yields its first scalar/null element ([`const_from_array`]),
+///   nested arrays being transparent like pvxs; an object anywhere in it is
+///   a hard error so the group is skipped (per-group recovery).
+/// * A nested object value is a hard error for the same reason.
 fn json_to_pv_field(v: &serde_json::Value) -> Result<epics_pva_rs::pvdata::PvField, String> {
     use epics_pva_rs::pvdata::{PvField, ScalarValue};
     match v {
@@ -935,17 +950,51 @@ fn json_to_pv_field(v: &serde_json::Value) -> Result<epics_pva_rs::pvdata::PvFie
         }
         serde_json::Value::String(s) => Ok(PvField::Scalar(ScalarValue::String(s.clone().into()))),
         serde_json::Value::Null => Ok(PvField::Null),
-        serde_json::Value::Array(_) => Err(
-            "group +const cannot be an array: pvxs registers no array callbacks \
-             (groupconfigprocessor.cpp:772-790)"
-                .to_string(),
-        ),
-        serde_json::Value::Object(_) => Err(
-            "group +const cannot be a nested object: pvxs rejects object nesting below a \
-             field definition (groupconfigprocessor.cpp:733-739)"
-                .to_string(),
-        ),
+        serde_json::Value::Array(items) => const_from_array(items),
+        serde_json::Value::Object(_) => Err(CONST_OBJECT_TOO_DEEP.to_string()),
     }
+}
+
+/// Resolve a `+const` JSON array the way pvxs's yajl parser does.
+///
+/// Because pvxs registers no array callbacks (groupconfigprocessor.cpp:
+/// 778-789), array brackets are invisible to the parser: elements are
+/// processed at the field-definition depth in document order, so the FIRST
+/// scalar/null is assigned to `cval` and every later element is ignored
+/// (groupprocessorcontext.cpp:80-86). Nested arrays are transparent the same
+/// way, so `[[1,2],[3,4]]` yields the first flattened scalar `1`. An object
+/// anywhere starts a block that pushes the depth past 3 and throws "too
+/// deep" (:733-739), which rejects the group regardless of whether a scalar
+/// was already assigned — so a single document-order scan both captures the
+/// first scalar/null and fails on the first object it meets. An array with
+/// no scalar/null element (e.g. `[]`) leaves `cval` at pvxs's empty default,
+/// which the const template builds as a null const (:596-604).
+fn const_from_array(items: &[serde_json::Value]) -> Result<epics_pva_rs::pvdata::PvField, String> {
+    use epics_pva_rs::pvdata::PvField;
+
+    fn walk(items: &[serde_json::Value], first: &mut Option<PvField>) -> Result<(), String> {
+        for item in items {
+            match item {
+                // An object pushes the parser depth too deep — reject the
+                // group even if an earlier element already set the const.
+                serde_json::Value::Object(_) => return Err(CONST_OBJECT_TOO_DEEP.to_string()),
+                // Arrays are transparent: descend without consuming depth.
+                serde_json::Value::Array(inner) => walk(inner, first)?,
+                // Scalar/null: the first one wins; the rest are ignored.
+                scalar => {
+                    let value = json_to_pv_field(scalar)?;
+                    if first.is_none() {
+                        *first = Some(value);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    let mut first = None;
+    walk(items, &mut first)?;
+    Ok(first.unwrap_or(PvField::Null))
 }
 
 #[cfg(test)]
@@ -2261,22 +2310,97 @@ mod tests {
         }
     }
 
-    /// BR-81: pvxs's group JSON parser can only assign a scalar or `null`
-    /// to a `+const` — it has no array callbacks
-    /// (groupconfigprocessor.cpp:772-790) and rejects nested objects
-    /// (:733-739). A const whose value is an array (scalar, nested,
-    /// object-element, or null-element) or a nested object is rejected; the
-    /// group is skipped via per-group recovery, matching pvxs's startup
-    /// rejection. The cited values were previously accepted as Rust-only
-    /// `ScalarArray` / `VariantArray` / `StructureArray` / `Structure`
-    /// const forms that pvxs cannot represent.
+    /// pvxs's group JSON parser registers no array callbacks
+    /// (groupconfigprocessor.cpp:778-789), so array brackets are invisible to
+    /// the parser depth and a `+const` array is assigned its FIRST
+    /// scalar/null element (groupprocessorcontext.cpp:80-86); later elements
+    /// are ignored. Nested arrays are transparent, so the first flattened
+    /// scalar wins. An array with no scalar/null leaves the const at pvxs's
+    /// empty default (a null const). The previous Rust fix rejected every
+    /// array, dropping groups pvxs loads.
     #[test]
-    fn br_81_const_array_and_nested_object_rejected() {
+    fn const_array_takes_first_scalar_like_pvxs() {
+        use epics_pva_rs::pvdata::{PvField, ScalarValue};
+
+        fn const_of(body: &str) -> Option<PvField> {
+            let json = format!(r#"{{ "GRP:c": {{ {body} }} }}"#);
+            let groups = parse_group_config(&json).expect("file parses; group loads");
+            assert_eq!(groups.len(), 1, "group must load for `{body}`");
+            groups[0].members[0].const_value.clone()
+        }
+
+        // Integer array -> first element (pvxs Int64 -> Rust Long).
+        assert!(
+            matches!(
+                const_of(r#""list": { "+type": "const", "+const": [1, 2, 3] }"#),
+                Some(PvField::Scalar(ScalarValue::Long(1)))
+            ),
+            "[1,2,3] const must be Long(1)"
+        );
+        // Boolean array -> first element.
+        assert!(
+            matches!(
+                const_of(r#""flags": { "+type": "const", "+const": [true, false] }"#),
+                Some(PvField::Scalar(ScalarValue::Boolean(true)))
+            ),
+            "[true,false] const must be Boolean(true)"
+        );
+        // String array -> first element.
+        match const_of(r#""names": { "+type": "const", "+const": ["a", "b"] }"#) {
+            Some(PvField::Scalar(ScalarValue::String(ref v))) => {
+                assert_eq!(v.to_string(), "a", "[\"a\",\"b\"] const must be \"a\"");
+            }
+            other => panic!("[\"a\",\"b\"] const must be String(\"a\"), got {other:?}"),
+        }
+        // null-first array -> Null const.
+        assert!(
+            matches!(
+                const_of(r#""maybe": { "+type": "const", "+const": [null, 3] }"#),
+                Some(PvField::Null)
+            ),
+            "[null,3] const must be Null"
+        );
+        // Scalar-then-null array -> first scalar still wins.
+        assert!(
+            matches!(
+                const_of(r#""mixed": { "+type": "const", "+const": [1, null, 3] }"#),
+                Some(PvField::Scalar(ScalarValue::Long(1)))
+            ),
+            "[1,null,3] const must be Long(1)"
+        );
+        // Nested arrays are transparent: first flattened scalar wins.
+        assert!(
+            matches!(
+                const_of(r#""matrix": { "+type": "const", "+const": [[1, 2], [3, 4]] }"#),
+                Some(PvField::Scalar(ScalarValue::Long(1)))
+            ),
+            "[[1,2],[3,4]] const must be Long(1)"
+        );
+        // No scalar/null anywhere -> pvxs's empty default -> null const.
+        assert!(
+            matches!(
+                const_of(r#""empty": { "+type": "const", "+const": [] }"#),
+                Some(PvField::Null)
+            ),
+            "[] const must be Null"
+        );
+    }
+
+    /// A `+const` object — directly, or anywhere inside an array — starts a
+    /// block that pushes pvxs's parser depth past 3 and throws "too deep"
+    /// (groupconfigprocessor.cpp:733-739), so the group is skipped via
+    /// per-group recovery. The object rejects even when an earlier array
+    /// element already supplied a scalar.
+    #[test]
+    fn const_object_anywhere_rejects_group() {
         for body in [
-            r#""list": { "+type": "const", "+const": [1, 2, 3] }"#,
-            r#""matrix": { "+type": "const", "+const": [[1, 2], [3, 4]] }"#,
+            // Object elements in an array.
             r#""rows": { "+type": "const", "+const": [{"a": 1}, {"a": 2}] }"#,
-            r#""mixed": { "+type": "const", "+const": [1, null, 3] }"#,
+            // Scalar first, object later: pvxs still throws on the object.
+            r#""tail": { "+type": "const", "+const": [1, {"a": 2}] }"#,
+            // An object nested through a transparent array.
+            r#""deep": { "+type": "const", "+const": [[{"a": 1}]] }"#,
+            // A directly-nested object value.
             r#""cfg": { "+type": "const", "+const": {"limits": {"low": 0}} }"#,
         ] {
             let json = format!(r#"{{ "GRP:c": {{ {body} }} }}"#);
@@ -2284,7 +2408,7 @@ mod tests {
                 parse_group_config(&json).expect("file still parses; the invalid group is skipped");
             assert!(
                 groups.is_empty(),
-                "array / nested-object const must be rejected (group skipped) for `{body}`, got {groups:?}"
+                "object const must be rejected (group skipped) for `{body}`, got {groups:?}"
             );
         }
     }

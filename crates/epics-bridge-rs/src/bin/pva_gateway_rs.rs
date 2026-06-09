@@ -54,7 +54,7 @@
 //! NIC.
 
 use std::fs;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -273,6 +273,41 @@ fn validate(cfg: &GatewayConfigFile) -> Result<(), String> {
     Ok(())
 }
 
+/// Parse a server `interface` field — an EPICS-style whitespace-separated
+/// address list (`EPICS_PVAS_INTF_ADDR_LIST`, gwmain.cpp:164). Each token is
+/// a bare IP literal; the list binds the PVA server's TCP/UDP responders to
+/// those interfaces. Empty / blank input yields an empty list (the caller
+/// defaults that to the all-NIC wildcard bind). Hostname resolution is not
+/// applied here — the env-driven path
+/// (`epics_pva_rs::config::server_intf_addr_list`) owns DNS resolution; this
+/// matches the prior single-`interface` parser's numeric-literal fidelity.
+fn parse_interface_list(list: &str) -> Result<Vec<IpAddr>, String> {
+    let mut out = Vec::new();
+    for tok in list.split_whitespace() {
+        match tok.parse::<IpAddr>() {
+            Ok(ip) => out.push(ip),
+            Err(_) => return Err(format!("invalid interface '{tok}'")),
+        }
+    }
+    Ok(out)
+}
+
+/// Resolve a parsed interface list into the `(bind_ip, interfaces)` pair the
+/// [`PvaServerConfig`] runtime consumes. A wildcard entry (or no entry)
+/// collapses to the all-NIC bind — empty `interfaces` so the runtime's
+/// all-NIC TCP/UDP default applies (runtime.rs `tcp_bind_addresses` /
+/// `bind_on_interfaces`), carrying the wildcard's family as `bind_ip`. An
+/// explicit, wildcard-free list binds exactly those NICs.
+fn resolve_server_bind(intf_ips: Vec<IpAddr>) -> (IpAddr, Vec<IpAddr>) {
+    if let Some(wildcard) = intf_ips.iter().find(|ip| ip.is_unspecified()) {
+        (*wildcard, Vec::new())
+    } else if let Some(first) = intf_ips.first().copied() {
+        (first, intf_ips)
+    } else {
+        (IpAddr::V4(Ipv4Addr::UNSPECIFIED), Vec::new())
+    }
+}
+
 /// Build (but do not run) the multi-tenant gateway described by `cfg`.
 /// Assumes `cfg` already passed [`validate`].
 ///
@@ -311,11 +346,15 @@ fn build_gateway(
     }
 
     for s in &cfg.servers {
-        let bind_ip: IpAddr = s
-            .interface
-            .trim()
-            .parse()
-            .map_err(|_| format!("server '{}': invalid interface '{}'", s.name, s.interface))?;
+        // gwmain.cpp:164 configure_server maps the server `interface` onto
+        // EPICS_PVAS_INTF_ADDR_LIST — an address *list*, binding the PVA
+        // server's TCP/UDP responders to every listed NIC, not a single
+        // interface. The server_native runtime already binds a Vec of
+        // interfaces (runtime.rs tcp_bind_addresses / udp_interfaces); parse
+        // the list and feed it through.
+        let intf_ips =
+            parse_interface_list(&s.interface).map_err(|e| format!("server '{}': {e}", s.name))?;
+        let (bind_ip, interfaces) = resolve_server_bind(intf_ips);
         // server addrlist × bcastport → beacon destinations
         // (EPICS_PVAS_BEACON_ADDR_LIST; gwmain.cpp:160-166 configure_server).
         // Use the endpoint-preserving parser so a multicast beacon target's
@@ -327,11 +366,7 @@ fn build_gateway(
             tcp_port: s.serverport,
             udp_port: s.bcastport,
             bind_ip,
-            interfaces: if bind_ip.is_unspecified() {
-                Vec::new()
-            } else {
-                vec![bind_ip]
-            },
+            interfaces,
             beacon_destinations: beacon,
             auto_beacon: s.autoaddrlist,
             ..PvaServerConfig::default()
@@ -776,5 +811,48 @@ mod tests {
             "127.0.0.1:5086",
             "bare addrlist entry takes the broadcast port, not the server port"
         );
+    }
+
+    #[test]
+    fn server_interface_parses_multiple_addresses() {
+        // gwmain.cpp:164 configure_server: a server `interface` is
+        // EPICS_PVAS_INTF_ADDR_LIST — an address LIST, binding every listed
+        // NIC, not a single interface.
+        let ifaces = parse_interface_list("127.0.0.1 192.0.2.5").expect("parse");
+        assert_eq!(
+            ifaces,
+            vec![
+                "127.0.0.1".parse::<IpAddr>().unwrap(),
+                "192.0.2.5".parse::<IpAddr>().unwrap(),
+            ]
+        );
+        assert!(parse_interface_list("").unwrap().is_empty());
+        assert!(parse_interface_list("   ").unwrap().is_empty());
+        assert!(parse_interface_list("not-an-ip").is_err());
+    }
+
+    #[test]
+    fn server_bind_resolution_collapses_wildcard_and_keeps_explicit_list() {
+        // An explicit, wildcard-free list binds exactly those NICs.
+        let two = vec![
+            "127.0.0.1".parse::<IpAddr>().unwrap(),
+            "192.0.2.5".parse::<IpAddr>().unwrap(),
+        ];
+        let (bind_ip, interfaces) = resolve_server_bind(two.clone());
+        assert_eq!(bind_ip, two[0]);
+        assert_eq!(interfaces, two);
+
+        // A wildcard entry collapses to the all-NIC bind: empty interface
+        // set (so the runtime binds every NIC) carrying the wildcard family.
+        // Passing [0.0.0.0] through as a literal interface would instead hit
+        // bind_on_interfaces([0.0.0.0]) rather than the all-NIC default.
+        let (bind_ip, interfaces) = resolve_server_bind(vec!["0.0.0.0".parse::<IpAddr>().unwrap()]);
+        assert!(bind_ip.is_unspecified());
+        assert!(interfaces.is_empty());
+
+        // No interface given → all-NIC wildcard bind.
+        let (bind_ip, interfaces) = resolve_server_bind(Vec::new());
+        assert_eq!(bind_ip, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert!(interfaces.is_empty());
     }
 }

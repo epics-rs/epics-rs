@@ -1151,18 +1151,22 @@ async fn process_v6_search_datagram(
 }
 
 /// The CIDs in `req` whose names this server will answer, gated by the
-/// advertised transport protocol — the single match rule shared by the
-/// v4 UDP, v6 UDP, and TCP-circuit SEARCH responders.
+/// advertised transport protocol — the match rule shared by the v4 UDP
+/// and v6 UDP SEARCH responders (the TCP-circuit responder calls the
+/// ungated [`matched_cids_for_requester`] directly, mirroring pvxs
+/// `serverchan.cpp` which does not re-gate on an established circuit).
 ///
-/// pvxs `udp_collector.cpp:424-443` only collects a SEARCH's PV names
-/// when the request advertised the server's protocol ("tcp"; "tls" under
-/// TLS); a request asking for a protocol the server does not speak
-/// matches nothing — this is what stops a TLS-only client from getting
-/// `found=1` off a tcp-only server. An empty protocol list is tolerated
-/// as a wildcard (legacy peers that omitted the field). `searchable`
-/// (not `has_pv`) keeps non-advertised built-in sources (e.g. the
-/// `server` PV) out of broadcast SEARCH answers; a direct TCP connect
-/// still resolves them.
+/// pvxs `udp_collector.cpp:411-441` starts `protoTCP=false`, sets it true
+/// only when a parsed protocol string equals "tcp", and queues a SEARCH's
+/// PV names exclusively `if(protoTCP && …)`. A request advertising a
+/// protocol the server does not speak — including an *empty* protocol list
+/// (`nproto==0`, which never sets `protoTCP`) — therefore matches nothing.
+/// This is what stops a TLS-only client from getting `found=1` off a
+/// tcp-only server, and what makes a zero-protocol UDP SEARCH produce no
+/// claims (only a `MustReply` header then forces a `found=0` reply, pvxs
+/// `server.cpp:715-716`). `searchable` (not `has_pv`) keeps non-advertised
+/// built-in sources (e.g. the `server` PV) out of broadcast SEARCH
+/// answers; a direct TCP connect still resolves them.
 ///
 /// Returns an empty vec on protocol mismatch, so each responder's
 /// `found`/`MustReply` decision is identical regardless of family.
@@ -1177,17 +1181,17 @@ pub(crate) async fn search_matched_cids(
     protocol: &str,
     requester: SocketAddr,
 ) -> Vec<u32> {
-    // Byte-exact protocol gate (pvxs udp_collector.cpp:408-421 compares
-    // the raw wire string to "tcp"). An empty list is a legacy SEARCH
-    // that omitted the field → wildcard; a non-empty list with no entry
-    // equal to our protocol does not match, including a present-but-
-    // undecodable (e.g. invalid-UTF-8) protocol, which must NOT collapse
-    // to wildcard.
-    let protocol_ok = req.protocols.is_empty()
-        || req
-            .protocols
-            .iter()
-            .any(|p| p.as_slice() == protocol.as_bytes());
+    // Byte-exact protocol gate (pvxs udp_collector.cpp:414-418 compares
+    // the raw wire string to "tcp"). pvxs `protoTCP` starts false and is
+    // only raised by a matching entry, so an *empty* list (`nproto==0`)
+    // matches nothing — it is NOT a wildcard. A non-empty list with no
+    // entry equal to our protocol likewise does not match, including a
+    // present-but-undecodable (e.g. invalid-UTF-8) protocol, which must
+    // not collapse to a wildcard.
+    let protocol_ok = req
+        .protocols
+        .iter()
+        .any(|p| p.as_slice() == protocol.as_bytes());
     if !protocol_ok {
         return Vec::new();
     }
@@ -1343,14 +1347,14 @@ pub(crate) struct SearchRequest {
     /// (`if(nreply==0 && !msg.mustReply) return;`).
     pub(crate) must_reply: bool,
     /// the transport protocols the client requested in this
-    /// SEARCH, stored as RAW BYTES. pvxs `udp_collector.cpp:408-421`
+    /// SEARCH, stored as RAW BYTES. pvxs `udp_collector.cpp:411-421`
     /// reads each as a `std::string` without UTF-8 validation and only
-    /// equality-checks it against "tcp"; `:424-443` queues matches only
+    /// equality-checks it against "tcp"; `:424-441` queues matches only
     /// when "tcp" appeared. Keeping bytes (not `String`) mirrors that: an
-    /// invalid-UTF-8 protocol is a non-"tcp" entry, never dropped into an
-    /// empty list (which `search_matched_cids` would treat as a
-    /// wildcard). Empty = legacy SEARCH that omitted the field (tolerate
-    /// as "tcp by default").
+    /// invalid-UTF-8 protocol is a non-"tcp" entry. An empty list
+    /// (`nproto==0`) never raises pvxs `protoTCP`, so on the UDP
+    /// responders [`search_matched_cids`] matches nothing for it — it is
+    /// not a wildcard.
     pub(crate) protocols: Vec<Vec<u8>>,
     /// Total bytes consumed from the input slice (header + payload),
     /// used by the multi-message drain loop to advance to the next
@@ -2543,7 +2547,9 @@ mod tests {
             reply_port: 0,
             unicast: false,
             must_reply: false,
-            protocols: vec![],
+            // A matching protocol so the gate passes; this test exercises
+            // endpoint scoping (`searchable_from`), not the protocol gate.
+            protocols: vec![b"tcp".to_vec()],
             consumed: 0,
         };
         let allowed: SocketAddr = "10.0.0.5:5076".parse().unwrap();
@@ -2641,10 +2647,17 @@ mod tests {
                 .await
                 .is_empty()
         );
-        // Empty/legacy protocol list → wildcard, still matched.
-        assert_eq!(
-            search_matched_cids(&source, &req(vec![]), "tcp", requester).await,
-            vec![7]
+        // Empty protocol list (`nproto==0`) → never raises pvxs
+        // `protoTCP`, so no names are queued and nothing matches. The
+        // caller still answers a `MustReply` probe with `found=0`, but
+        // the match set itself is empty. Regression for the bug where an
+        // empty list was treated as a "tcp" wildcard, letting malformed
+        // zero-protocol UDP SEARCHes pull a `found=1` off the server.
+        assert!(
+            search_matched_cids(&source, &req(vec![]), "tcp", requester)
+                .await
+                .is_empty(),
+            "empty protocol list must not be treated as a wildcard match"
         );
         // A protocol entry that is not valid UTF-8 must compare as raw
         // bytes (≠ "tcp") and therefore NOT match — pvxs preserves the

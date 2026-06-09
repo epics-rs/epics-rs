@@ -201,8 +201,77 @@ fn default_interface() -> String {
     "0.0.0.0".to_string()
 }
 
+/// Strip `//` line and `/* */` block comments from JSON text, leaving the
+/// contents of string literals untouched.
+///
+/// pva2pva parses its config through `pvd::parseJSON` (gwmain.cpp:107),
+/// which enables yajl comment tolerance
+/// (`pvData/src/json/parseinto.cpp:271`
+/// `yajl_config(handle, yajl_allow_comments, 1)`); plain `serde_json`
+/// rejects comments. To keep comment-annotated `loopback.conf`-style files
+/// working, strip comments before parsing. Stripped bytes become spaces and
+/// newlines are preserved, so a `serde_json` parse error still reports the
+/// correct line/column in the original source.
+fn strip_json_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut chars = src.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                // Line comment: drop to end of line, preserving the newline.
+                chars.next();
+                out.push_str("  ");
+                for n in chars.by_ref() {
+                    if n == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                    out.push(if n == '\r' { '\r' } else { ' ' });
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                // Block comment: drop to the closing `*/`, preserving newlines.
+                chars.next();
+                out.push_str("  ");
+                let mut prev = '\0';
+                for n in chars.by_ref() {
+                    out.push(match n {
+                        '\n' => '\n',
+                        '\r' => '\r',
+                        _ => ' ',
+                    });
+                    if prev == '*' && n == '/' {
+                        break;
+                    }
+                    prev = n;
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn parse_config(text: &str) -> Result<GatewayConfigFile, String> {
-    serde_json::from_str(text).map_err(|e| format!("config file is not valid JSON: {e}"))
+    let stripped = strip_json_comments(text);
+    serde_json::from_str(&stripped).map_err(|e| format!("config file is not valid JSON: {e}"))
 }
 
 /// Validate a parsed config without touching the network. Mirrors the
@@ -854,5 +923,51 @@ mod tests {
         let (bind_ip, interfaces) = resolve_server_bind(Vec::new());
         assert_eq!(bind_ip, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert!(interfaces.is_empty());
+    }
+
+    #[test]
+    fn json_config_tolerates_line_and_block_comments() {
+        // pva2pva parses with yajl comment tolerance (gwmain.cpp:107 →
+        // pvData parseinto.cpp:271 yajl_allow_comments); a comment-annotated
+        // config must parse.
+        let with_comments = r#"{
+            // top-level line comment
+            "version":1,
+            "readOnly":false, /* inline block */
+            "clients":[
+                {"name":"c","provider":"pva"} // trailing line comment
+            ],
+            /* multi-line
+               block comment */
+            "servers":[{"name":"s","clients":["c"]}]
+        }"#;
+        let cfg = parse_config(with_comments).expect("comments must be tolerated");
+        assert_eq!(cfg.version, 1);
+        assert_eq!(cfg.clients.len(), 1);
+        assert_eq!(cfg.servers.len(), 1);
+        validate(&cfg).expect("validate");
+    }
+
+    #[test]
+    fn comment_markers_inside_strings_are_preserved() {
+        // `//` and `/*` inside a JSON string are data, not comment starts.
+        let cfg = parse_config(
+            r#"{"version":1,
+                "clients":[{"name":"a//b","provider":"pva","addrlist":"1.2.3.4"}],
+                "servers":[{"name":"s/*x*/","clients":["a//b"]}]}"#,
+        )
+        .expect("parse");
+        assert_eq!(cfg.clients[0].name, "a//b");
+        assert_eq!(cfg.clients[0].addrlist, "1.2.3.4");
+        assert_eq!(cfg.servers[0].name, "s/*x*/");
+        validate(&cfg).expect("validate");
+    }
+
+    #[test]
+    fn strip_comments_preserves_newlines_for_error_positions() {
+        // Stripped bytes become spaces, newlines are kept, so a `serde_json`
+        // error still points at the right source line.
+        let stripped = strip_json_comments("// a\n// bb\n\"x\"");
+        assert_eq!(stripped, "    \n     \n\"x\"");
     }
 }

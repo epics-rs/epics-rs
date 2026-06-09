@@ -53,11 +53,17 @@ struct Args {
     #[arg(long)]
     command: Option<PathBuf>,
 
-    /// Path to the R1/R2/R3 report file (C `-report`). When set, the
-    /// R1/R2/R3 commands and the SIGUSR2 shortcut append C-compatible
-    /// report sections here; otherwise the report is logged only.
+    /// Path to the R1/R2/R3 report file (C `-report`). Overrides the
+    /// default `gateway.report`. The R1/R2/R3 commands and the SIGUSR2
+    /// shortcut append C-compatible report sections here.
     #[arg(long)]
     report: Option<PathBuf>,
+
+    /// Disable the report file entirely (Rust-only). C ca-gateway always
+    /// has a report file (defaults to `gateway.report`, `gateResources.cc:334`);
+    /// pass `--no-report` to opt out so no report is written.
+    #[arg(long, conflicts_with = "report")]
+    no_report: bool,
 
     /// CA server port (downstream side). 0 = use default 5064.
     #[arg(long, default_value_t = 0)]
@@ -367,7 +373,7 @@ async fn async_main(args: Args) -> ExitCode {
             PutLogScope::TrapWrite
         },
         command_path: args.command.clone(),
-        report_path: args.report.clone(),
+        report_path: GatewayConfig::resolve_report_path(args.report.clone(), args.no_report),
         preload_path: args.preload.clone(),
         server_port: args.port,
         timeouts: epics_bridge_rs::ca_gateway::CacheTimeouts {

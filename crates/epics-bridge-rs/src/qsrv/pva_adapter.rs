@@ -732,12 +732,12 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         let pva_pvs = self.pva_pvs.clone();
         async move {
             let opened = open_monitor(provider, pva_pvs, checked.clone(), ctx.clone()).await?;
-            // Seed AFTER the subscription is armed (open_monitor started it),
-            // matching the default `subscribe_seeded` ordering so no event
-            // between seed and stream is lost or doubled.
-            let initial = self.get_value_checked(checked, ctx).await;
             match opened {
                 OpenedMonitor::Native(rx) => {
+                    // Native-registered PVA PVs (NDPluginPva etc.) serve the
+                    // GET seed and monitor frames from one cached snapshot, so
+                    // their `record._options` already match — keep the GET seed.
+                    let initial = self.get_value_checked(checked, ctx).await;
                     Some(epics_pva_rs::server_native::source::SubscriptionSeed {
                         initial,
                         updates: epics_pva_rs::server_native::plain_monitor_updates(rx),
@@ -745,6 +745,26 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                     })
                 }
                 OpenedMonitor::Db(monitor) => {
+                    // Seed a group monitor from the monitor-stamped value path
+                    // (`AnyMonitor::seed`), not the GET path, so the initial
+                    // DATA frame's `record._options` (atomic = true, negotiated
+                    // queueSize) match the update stream that `poll()` drains
+                    // from the same `group_channel`. pvxs delivers the first
+                    // group post through the monitor-stamped `currentValue`
+                    // (ioc/groupsource.cpp:401-405), whereas the GET path stamps
+                    // the operation atomicity and queueSize = 0 (:480-485); the
+                    // old GET seed made the first frame disagree with every
+                    // later one. A single-record monitor returns `None` from
+                    // `seed()` (its GET seed and frames already carry identical
+                    // options) and falls back to the GET seed. Read the seed
+                    // BEFORE the monitor moves into its forward task; the
+                    // subscription is already armed (open_monitor started it),
+                    // so any event between seed and stream is buffered in the
+                    // monitor's fan-in channel rather than lost or doubled.
+                    let initial = match monitor.seed().await {
+                        Some(v) => Some(v),
+                        None => self.get_value_checked(checked, ctx).await,
+                    };
                     // Capture the enable/disable handles before the monitor
                     // moves into its forward task; `Arc` so the gate closure
                     // (invoked once per START/STOP edge) reuses them.

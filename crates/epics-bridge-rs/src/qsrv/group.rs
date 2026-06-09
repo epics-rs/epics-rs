@@ -1870,6 +1870,30 @@ impl GroupMonitor {
         self.activation_handles.clone()
     }
 
+    /// Monitor-stamped seed snapshot for the MONITOR INIT DATA frame.
+    ///
+    /// pvxs delivers the first monitor post through the same
+    /// `currentValue` that carries every subsequent update: `onSubscribe`
+    /// stamps `record._options.atomic = true` and
+    /// `record._options.queueSize = stats.limitQueue` on that value once
+    /// (`groupsource.cpp:401-405`), then primes and posts it. The QSRV GET
+    /// seed path (`Channel::get` → GET-stamped `read_group_atomic`) instead
+    /// stamps the *operation* atomicity and `queueSize = 0`
+    /// (`groupsource.cpp:480-485`), so seeding a group monitor from GET made
+    /// the initial frame's `record._options` disagree with the update
+    /// stream. Read through the monitor's own `group_channel` — built in
+    /// [`PvaMonitor::start`] with `with_monitor_stamp`/
+    /// `with_monitor_queue_size`, the identical value path
+    /// [`poll`](Self::poll) drains — so the seed and the deltas share one
+    /// stamping by construction. Returns the full (unfiltered) group value,
+    /// matching the update stream and pvxs's fully-marked first event; the
+    /// wire layer applies the client's pvRequest field mask uniformly to
+    /// both. `None` before `start()` (no `group_channel`) or on a read
+    /// error.
+    pub async fn seed(&self) -> Option<PvStructure> {
+        self.group_channel.as_ref()?.read_group().await.ok()
+    }
+
     /// resolve the marked-leaf field paths for a *value*
     /// event from `source_idx`, mirroring pvxs `groupsource.cpp:283`
     /// iterating `field.triggers` and marking each target.
@@ -2328,6 +2352,22 @@ impl AnyMonitor {
         match self {
             Self::Group(m) => Self::Group(Box::new(m.with_queue_size(queue_size))),
             single => single,
+        }
+    }
+
+    /// Monitor-stamped seed snapshot for the MONITOR INIT DATA frame, or
+    /// `None` to fall back to the GET seed. Only a group monitor returns a
+    /// value: its initial frame must share the monitor `record._options`
+    /// stamping (`atomic = true`, negotiated `queueSize`) with its update
+    /// stream — see [`GroupMonitor::seed`] and pvxs `groupsource.cpp:401-405`
+    /// vs the GET path `:480-485`. A single-record monitor has no group-style
+    /// `record._options` branch, so its GET seed and monitor frames already
+    /// carry identical options; it returns `None` and the adapter keeps the
+    /// GET seed. Valid after [`PvaMonitor::start`].
+    pub async fn seed(&self) -> Option<PvField> {
+        match self {
+            Self::Single(_) => None,
+            Self::Group(m) => m.seed().await.map(PvField::Structure),
         }
     }
 
@@ -3538,6 +3578,96 @@ mod tests {
             polled.is_err(),
             "all-const group monitor must park (no snapshot, no FINISH), got {polled:?}"
         );
+    }
+
+    /// Regression: a group MONITOR's initial seed frame must carry the
+    /// same `record._options` stamping (atomic = true, negotiated
+    /// queueSize) as every subsequent update. pvxs delivers the first
+    /// group post through the monitor-stamped `currentValue`
+    /// (`groupsource.cpp:401-405`), not the GET path. The seed used to be
+    /// read from the GET path (`Channel::get` → GET-stamped `read_group`),
+    /// which stamps the *operation* atomicity and `queueSize = 0`
+    /// (`groupsource.cpp:480-485`), so the first frame disagreed with the
+    /// stream the client then received. `AnyMonitor::seed` reads through the
+    /// monitor's own `group_channel`, so the seed and the deltas share one
+    /// stamping by construction.
+    #[tokio::test]
+    async fn group_monitor_seed_carries_monitor_options_not_get_options() {
+        use crate::qsrv::provider::PvaMonitor;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_pva_rs::pvdata::ScalarValue;
+
+        fn read_options(pv: &PvStructure) -> (bool, i32) {
+            let Some(PvField::Structure(record)) = pv.get_field("record") else {
+                panic!("record branch must be a structure: {pv:?}");
+            };
+            let Some(PvField::Structure(options)) = record.get_field("_options") else {
+                panic!("record._options must be a structure: {record:?}");
+            };
+            let atomic = match options.get_field("atomic") {
+                Some(PvField::Scalar(ScalarValue::Boolean(b))) => *b,
+                other => panic!("record._options.atomic must be boolean: {other:?}"),
+            };
+            let queue = match options.get_field("queueSize") {
+                Some(PvField::Scalar(ScalarValue::Int(n))) => *n,
+                other => panic!("record._options.queueSize must be int: {other:?}"),
+            };
+            (atomic, queue)
+        }
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("SEED:rec", Box::new(AiRecord::new(2.5)))
+            .await
+            .unwrap();
+        // An explicitly non-atomic group with one backing member, so the
+        // GET path would stamp atomic = false / queueSize = 0 — the values
+        // the monitor seed must NOT inherit.
+        let cfg = r#"{
+            "SEED:GRP": {
+                "+atomic": false,
+                "v": {"+type": "plain", "+channel": "SEED:rec.VAL"}
+            }
+        }"#;
+        let mut defs = super::super::group_config::parse_group_config(cfg).unwrap();
+        let def = defs.pop().unwrap();
+        assert!(!def.atomic, "fixture group must be non-atomic");
+
+        // MONITOR seed: built with a negotiated queue depth of 32 and the
+        // monitor stamp, so the initial frame must report atomic = true and
+        // queueSize = 32 — matching the update stream poll() drains from the
+        // same group_channel.
+        let mut mon = AnyMonitor::Group(Box::new(GroupMonitor::new(db.clone(), def.clone())))
+            .with_queue_size(32);
+        mon.start().await.expect("group monitor starts");
+        let seed = mon
+            .seed()
+            .await
+            .expect("group monitor must expose a stamped seed");
+        let PvField::Structure(seed) = seed else {
+            panic!("group seed must be a structure: {seed:?}");
+        };
+        let (seed_atomic, seed_queue) = read_options(&seed);
+        assert!(
+            seed_atomic,
+            "group monitor seed must stamp atomic = true (monitor path)"
+        );
+        assert_eq!(
+            seed_queue, 32,
+            "group monitor seed must stamp the negotiated queueSize, got {seed_queue}"
+        );
+
+        // GET path (Channel::get / read_group, no monitor stamp): the same
+        // group reports the operation atomicity (false here) and
+        // queueSize = 0, confirming the two paths legitimately differ and the
+        // seed no longer borrows the GET stamping.
+        let get_channel = GroupChannel::new(db.clone(), def);
+        let get_value = get_channel.read_group().await.expect("group GET read");
+        let (get_atomic, get_queue) = read_options(&get_value);
+        assert!(
+            !get_atomic,
+            "non-atomic group GET must stamp atomic = false"
+        );
+        assert_eq!(get_queue, 0, "group GET must stamp queueSize = 0");
     }
 
     /// A PvStructure carrying `a` and `b` plain double values for the

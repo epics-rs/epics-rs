@@ -2,6 +2,10 @@ use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
 
+/// Choice labels for the SELM link-selection menu, in index order.
+/// C `menu(dfanoutSELM)`: 0=All, 1=Specified, 2=Mask.
+const DFANOUT_SELM_CHOICES: &[&str] = &["All", "Specified", "Mask"];
+
 /// Data fanout record — distributes VAL to up to 16 output links
 /// (OUTA..OUTP) selected by SELM/SELN. Manual `Record` impl so the
 /// analog limit alarms, MDEL/ADEL deadband and UDF check from C
@@ -171,7 +175,9 @@ static DFANOUT_FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "SELM",
-        dbf_type: DbFieldType::Short,
+        // SELM is DBF_MENU menu(dfanoutSELM) (dfanoutRecord.dbd.pod) — served
+        // as DBR_ENUM with the menu's choice labels, see DFANOUT_SELM_CHOICES.
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
@@ -365,6 +371,13 @@ impl Record for DfanoutRecord {
         DFANOUT_FIELDS
     }
 
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "SELM" => Some(DFANOUT_SELM_CHOICES),
+            _ => None,
+        }
+    }
+
     fn uses_monitor_deadband(&self) -> bool {
         true
     }
@@ -451,7 +464,9 @@ impl Record for DfanoutRecord {
         }
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
-            "SELM" => Some(EpicsValue::Short(self.selm)),
+            // SELM is DBF_MENU (dfanoutRecord.dbd.pod): served as DBR_ENUM,
+            // labels from menu_field_choices.
+            "SELM" => Some(EpicsValue::Enum(self.selm as u16)),
             "SELN" => Some(EpicsValue::UShort(self.seln)),
             "DOL" => Some(EpicsValue::String(self.dol.clone().into())),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
@@ -524,10 +539,23 @@ impl Record for DfanoutRecord {
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
             },
-            "SELM" | "OMSL" | "IVOA" | "HHSV" | "HSV" | "LSV" | "LLSV" => match value {
+            // SELM is DBF_MENU (dfanoutRecord.dbd.pod): a client put arrives
+            // converted to Enum; internal callers may still pass a Short
+            // index. Store the menu index either way.
+            "SELM" => match value {
+                EpicsValue::Enum(v) => {
+                    self.selm = v as i16;
+                    Ok(())
+                }
+                EpicsValue::Short(v) => {
+                    self.selm = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("SELM".into())),
+            },
+            "OMSL" | "IVOA" | "HHSV" | "HSV" | "LSV" | "LLSV" => match value {
                 EpicsValue::Short(v) => {
                     match name {
-                        "SELM" => self.selm = v,
                         "OMSL" => self.omsl = v,
                         "IVOA" => self.ivoa = v,
                         "HHSV" => self.hhsv = v,

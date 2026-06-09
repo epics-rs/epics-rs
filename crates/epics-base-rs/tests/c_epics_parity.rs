@@ -749,8 +749,10 @@ fn dfanout_field_access() {
     rec.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
     assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Double(5.0)));
 
+    // SELM is DBF_MENU (dfanoutRecord.dbd.pod): served as DBR_ENUM. A Short
+    // put is tolerated; the read-back is the native Enum index.
     rec.put_field("SELM", EpicsValue::Short(0)).unwrap();
-    assert_eq!(rec.get_field("SELM"), Some(EpicsValue::Short(0)));
+    assert_eq!(rec.get_field("SELM"), Some(EpicsValue::Enum(0)));
 
     // SELN is DBF_USHORT: a Short put is accepted (internal link reads
     // pass Short) but the field reads back as the native unsigned type.

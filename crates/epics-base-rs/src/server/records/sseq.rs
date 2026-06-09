@@ -2,6 +2,10 @@ use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
 
+/// Choice labels for the SELM step-selection menu, in index order.
+/// C `menu(sseqSELM)` (synApps sseqRecord.dbd): 0=All, 1=Specified, 2=Mask.
+const SSEQ_SELM_CHOICES: &[&str] = &["All", "Specified", "Mask"];
+
 const NUM_STEPS: usize = 10;
 
 /// A single step in the string sequence.
@@ -93,7 +97,9 @@ static SSEQ_FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "SELM",
-        dbf_type: DbFieldType::Short,
+        // SELM is DBF_MENU menu(sseqSELM) (sseqRecord.dbd:34) — served as
+        // DBR_ENUM with the menu's choice labels, see SSEQ_SELM_CHOICES.
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
@@ -486,7 +492,9 @@ impl Record for SseqRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Long(self.val)),
-            "SELM" => Some(EpicsValue::Short(self.selm)),
+            // SELM is DBF_MENU (sseqRecord.dbd:34): served as DBR_ENUM,
+            // labels from menu_field_choices.
+            "SELM" => Some(EpicsValue::Enum(self.selm as u16)),
             "SELN" => Some(EpicsValue::UShort(self.seln)),
             "SELL" => Some(EpicsValue::String(self.sell.clone().into())),
             "PREC" => Some(EpicsValue::Short(self.prec)),
@@ -522,7 +530,14 @@ impl Record for SseqRecord {
                 };
                 Ok(())
             }
+            // SELM is DBF_MENU (sseqRecord.dbd:34): a client put arrives
+            // converted to Enum; internal callers may still pass a Short
+            // index. Store the menu index either way.
             "SELM" => match value {
+                EpicsValue::Enum(v) => {
+                    self.selm = v as i16;
+                    Ok(())
+                }
                 EpicsValue::Short(v) => {
                     self.selm = v;
                     Ok(())
@@ -624,6 +639,13 @@ impl Record for SseqRecord {
     fn field_list(&self) -> &'static [FieldDesc] {
         SSEQ_FIELDS
     }
+
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "SELM" => Some(SSEQ_SELM_CHOICES),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -649,8 +671,10 @@ mod tests {
     #[test]
     fn test_sseq_put_get_selm() {
         let mut rec = SseqRecord::new();
+        // SELM is DBF_MENU (sseqRecord.dbd:34): served as DBR_ENUM. A Short
+        // put is tolerated; the read-back is the native Enum index.
         rec.put_field("SELM", EpicsValue::Short(2)).unwrap();
-        assert_eq!(rec.get_field("SELM"), Some(EpicsValue::Short(2)));
+        assert_eq!(rec.get_field("SELM"), Some(EpicsValue::Enum(2)));
     }
 
     #[test]

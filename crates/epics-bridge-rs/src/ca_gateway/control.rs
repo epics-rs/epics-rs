@@ -15,20 +15,26 @@
 //! the main loop then executes the corresponding command and resets the
 //! PV value to zero (`gateServer.cc:336-379`).
 //!
-//! This module mirrors that: each flag PV carries a [`WriteHook`] that,
-//! on a positive write, enqueues a [`ControlEvent`] to the single command
-//! owner. The owner ([`spawn_control_owner`]) dispatches it through the
-//! same [`CommandHandler`] the SIGUSR1 path uses — one command owner for
-//! every trigger source — and resets the flag PV back to zero.
+//! This module mirrors that flag model exactly: each flag PV carries a
+//! [`WriteHook`] that, on a positive write, RAISES a shared boolean flag in
+//! [`ControlFlags`] (it does not enqueue a discrete command) and wakes the
+//! single control owner. The owner ([`spawn_control_owner`]) drains the
+//! raised flags once per pass in C's fixed main-loop order — `commandFlag`,
+//! `report1Flag`, `report2Flag`, `report3Flag`, `newAsFlag`, `quitFlag`,
+//! `quitServerFlag` (`gateServer.cc:336-379`) — dispatching each through the
+//! same [`CommandHandler`] the SIGUSR1 path uses and resetting each consumed
+//! flag PV back to zero. Multiple positive writes to one flag before a pass
+//! therefore collapse to a single action, and a burst of different flags
+//! runs in main-loop order, not client write order.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use epics_base_rs::error::CaError;
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::pv::{WriteContext, WriteHook};
 use epics_base_rs::types::EpicsValue;
 use tokio::sync::Notify;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use super::command::{CommandHandler, GatewayCommand};
 
@@ -52,12 +58,77 @@ pub enum ControlTrigger {
     QuitServer,
 }
 
-/// One control request: the action plus the flag PV that raised it (so
-/// the owner can reset that PV to zero after handling, matching C).
-#[derive(Debug, Clone)]
-pub struct ControlEvent {
-    pub trigger: ControlTrigger,
-    pub pv: String,
+/// Shared control-flag state, owned by the single control task.
+///
+/// C ca-gateway does not enqueue a discrete command per write: a `caput` of
+/// a positive value to a control PV raises a boolean server flag
+/// (`gateStat::write` → `processStat`, `gateStat.cc:253-265` /
+/// `gateServer.cc:1838-1875`). The gateway main loop later consumes those
+/// booleans once per pass in a FIXED order — `commandFlag`, `report1Flag`,
+/// `report2Flag`, `report3Flag`, `newAsFlag`, `quitFlag`, `quitServerFlag`
+/// (`gateServer.cc:336-379`) — resetting each PV after its action. This
+/// type is the Rust analogue: one [`AtomicBool`] per flag plus a [`Notify`]
+/// to wake the owner. Because a write only sets a bool, repeated writes
+/// before a pass collapse to one action, and the owner's fixed drain order
+/// — not client write order — sequences a burst of different flags.
+pub struct ControlFlags {
+    /// Stats prefix with separator already applied; control PV names are
+    /// `<prefix><suffix>` (the owner derives reset targets from this).
+    prefix: String,
+    command: AtomicBool,
+    report1: AtomicBool,
+    report2: AtomicBool,
+    report3: AtomicBool,
+    new_as: AtomicBool,
+    quit: AtomicBool,
+    quit_server: AtomicBool,
+    /// Wakes the owner when any flag is raised. A `notify_one` permit is
+    /// retained if the owner is not currently waiting, so no raise that
+    /// lands mid-drain is lost — the owner re-drains on the next pass.
+    wake: Notify,
+}
+
+impl ControlFlags {
+    fn new(prefix: String) -> Self {
+        Self {
+            prefix,
+            command: AtomicBool::new(false),
+            report1: AtomicBool::new(false),
+            report2: AtomicBool::new(false),
+            report3: AtomicBool::new(false),
+            new_as: AtomicBool::new(false),
+            quit: AtomicBool::new(false),
+            quit_server: AtomicBool::new(false),
+            wake: Notify::new(),
+        }
+    }
+
+    /// Select the flag cell for a trigger.
+    fn cell(&self, trigger: ControlTrigger) -> &AtomicBool {
+        match trigger {
+            ControlTrigger::CommandFile => &self.command,
+            ControlTrigger::Report1 => &self.report1,
+            ControlTrigger::Report2 => &self.report2,
+            ControlTrigger::Report3 => &self.report3,
+            ControlTrigger::NewAs => &self.new_as,
+            ControlTrigger::Quit => &self.quit,
+            ControlTrigger::QuitServer => &self.quit_server,
+        }
+    }
+
+    /// Raise the flag for `trigger` and wake the owner. Called from the
+    /// control PV write hook on a positive write. Idempotent within a pass:
+    /// a second raise before the owner consumes the flag collapses to one
+    /// action (C `setStat`/main-loop semantics).
+    fn raise(&self, trigger: ControlTrigger) {
+        self.cell(trigger).store(true, Ordering::Relaxed);
+        self.wake.notify_one();
+    }
+
+    /// The full PV name for a control flag suffix under this prefix.
+    fn pv_name(&self, suffix: &str) -> String {
+        format!("{}{suffix}", self.prefix)
+    }
 }
 
 /// Flag PV suffix → trigger mapping. The suffixes match C's stat PV base
@@ -91,21 +162,16 @@ fn is_positive(v: &EpicsValue) -> bool {
 }
 
 /// Build the [`WriteHook`] for one control flag PV: on a positive write,
-/// enqueue the trigger to the command owner. Reads/zero-writes are inert.
-fn control_write_hook(
-    trigger: ControlTrigger,
-    pv: String,
-    tx: UnboundedSender<ControlEvent>,
-) -> WriteHook {
+/// RAISE the trigger's shared flag and wake the owner. Reads/zero-writes
+/// (including the owner's own reset to 0) are inert, so a reset never
+/// re-raises.
+fn control_write_hook(trigger: ControlTrigger, flags: Arc<ControlFlags>) -> WriteHook {
     Arc::new(move |value: EpicsValue, _ctx: WriteContext| {
         let trigger = trigger;
-        let pv = pv.clone();
-        let tx = tx.clone();
+        let flags = flags.clone();
         Box::pin(async move {
             if is_positive(&value) {
-                // Best-effort: if the owner task is gone the gateway is
-                // already shutting down, so a dropped trigger is benign.
-                let _ = tx.send(ControlEvent { trigger, pv });
+                flags.raise(trigger);
             }
             Ok::<(), CaError>(())
         })
@@ -113,23 +179,21 @@ fn control_write_hook(
 }
 
 /// Publish the C-compatible control flag PVs under `prefix`, each wired to
-/// send its trigger on a positive write. No-op when `prefix` is empty
-/// (stats disabled). Returns the receiver the owner task drains.
+/// raise its shared flag on a positive write. No-op when `prefix` is empty
+/// (stats disabled). Returns the shared [`ControlFlags`] the owner task
+/// drains (and the hooks raise into).
 ///
 /// Registered with a permissive (default) access decision, matching the
 /// other Rust stat PVs; site ACLs can still gate them through the
 /// `.pvlist`/ACF that governs every served name.
-pub async fn publish_control_pvs(
-    db: &PvDatabase,
-    prefix: &str,
-) -> Option<UnboundedReceiver<ControlEvent>> {
+pub async fn publish_control_pvs(db: &PvDatabase, prefix: &str) -> Option<Arc<ControlFlags>> {
     if prefix.is_empty() {
         return None;
     }
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let flags = Arc::new(ControlFlags::new(prefix.to_string()));
     for (suffix, trigger) in CONTROL_FLAGS {
         let pv = format!("{prefix}{suffix}");
-        let hook = control_write_hook(*trigger, pv.clone(), tx.clone());
+        let hook = control_write_hook(*trigger, flags.clone());
         // C ca-gateway creates the control flag PVs (statCommandFlag /
         // statReport1..3Flag / statNewAsFlag / statQuitFlag /
         // statQuitServerFlag) as plain `gateStat` (gateServer.cc:1768),
@@ -149,76 +213,108 @@ pub async fn publish_control_pvs(
             );
         }
     }
-    Some(rx)
+    Some(flags)
 }
 
-/// Spawn the single command owner that drains control-PV triggers and
+/// Spawn the single control owner that drains the raised flags and
 /// dispatches each through `handler` — the same `CommandHandler` the
-/// SIGUSR1 path uses. After handling, the raising flag PV is reset to
-/// zero (C resets the value after consuming the flag,
-/// `gateServer.cc:336-379`). `Quit`/`QuitServer` fire `shutdown` so the
-/// run loop tears down gracefully, then the owner exits.
+/// SIGUSR1 path uses.
+///
+/// On each wake the owner drains the flags ONCE in C's fixed main-loop
+/// order — `commandFlag`, `report1Flag`, `report2Flag`, `report3Flag`,
+/// `newAsFlag`, then `quitFlag`/`quitServerFlag` (`gateServer.cc:336-379`).
+/// Each `swap(false)` consumes-and-collapses the flag (duplicate writes
+/// that arrived before this pass become one action), and after each action
+/// the flag PV is reset to zero. `quit`/`quitServer` are checked LAST, so a
+/// quit raised in the same pass as a report/reload never pre-empts those
+/// earlier flags; once consumed it fires `shutdown` and the owner exits.
 pub fn spawn_control_owner(
-    mut rx: UnboundedReceiver<ControlEvent>,
+    flags: Arc<ControlFlags>,
     handler: CommandHandler,
     db: Arc<PvDatabase>,
     command_path: Option<std::path::PathBuf>,
     shutdown: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(ev) = rx.recv().await {
-            match ev.trigger {
-                ControlTrigger::CommandFile => {
-                    if let Some(path) = &command_path {
-                        match handler.process_file(path).await {
-                            Ok(out) if !out.is_empty() => {
-                                tracing::info!(output = %out.trim_end(), "ca-gateway-rs: commandFlag output");
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                tracing::warn!(error = %e, "ca-gateway-rs: commandFlag file error");
-                            }
-                        }
-                    } else {
-                        tracing::warn!(
-                            "ca-gateway-rs: commandFlag written but no command file configured"
-                        );
-                    }
-                }
-                ControlTrigger::Report1 => {
-                    dispatch_logged(&handler, GatewayCommand::ReportFull).await
-                }
-                ControlTrigger::Report2 => {
-                    dispatch_logged(&handler, GatewayCommand::ReportSummary).await
-                }
-                ControlTrigger::Report3 => {
-                    dispatch_logged(&handler, GatewayCommand::ReportAccess).await
-                }
-                ControlTrigger::NewAs => {
-                    dispatch_logged(&handler, GatewayCommand::ReloadAccess).await
-                }
-                ControlTrigger::Quit | ControlTrigger::QuitServer => {
-                    tracing::info!(
-                        trigger = ?ev.trigger,
-                        "ca-gateway-rs: shutdown requested via control PV"
-                    );
-                    // Reset the flag, then signal shutdown and stop the
-                    // owner — the run loop performs the actual teardown.
-                    // Double(0.0) matches the DBR_DOUBLE native type the
-                    // flag was registered with (gateStat parity).
-                    let _ = db.put_pv_and_post(&ev.pv, EpicsValue::Double(0.0)).await;
-                    shutdown.notify_one();
-                    return;
-                }
+        loop {
+            flags.wake.notified().await;
+
+            // commandFlag → run the command file (which itself collapses to
+            // C's four R1/R2/AS/R3 flags in fixed order, see command.rs).
+            if flags.command.swap(false, Ordering::Relaxed) {
+                run_command_file(&handler, &command_path).await;
+                reset_flag_pv(&db, &flags.pv_name("commandFlag")).await;
             }
-            // Reset the flag PV to zero after handling so a later write
-            // re-triggers (C resets value to 0 in the main loop).
-            // Double(0.0) matches the DBR_DOUBLE registration (gateStat).
-            if let Err(e) = db.put_pv_and_post(&ev.pv, EpicsValue::Double(0.0)).await {
-                tracing::debug!(pv = %ev.pv, error = %e, "ca-gateway-rs: control flag reset failed");
+            if flags.report1.swap(false, Ordering::Relaxed) {
+                dispatch_logged(&handler, GatewayCommand::ReportFull).await;
+                reset_flag_pv(&db, &flags.pv_name("report1Flag")).await;
+            }
+            if flags.report2.swap(false, Ordering::Relaxed) {
+                dispatch_logged(&handler, GatewayCommand::ReportSummary).await;
+                reset_flag_pv(&db, &flags.pv_name("report2Flag")).await;
+            }
+            if flags.report3.swap(false, Ordering::Relaxed) {
+                dispatch_logged(&handler, GatewayCommand::ReportAccess).await;
+                reset_flag_pv(&db, &flags.pv_name("report3Flag")).await;
+            }
+            if flags.new_as.swap(false, Ordering::Relaxed) {
+                dispatch_logged(&handler, GatewayCommand::ReloadAccess).await;
+                reset_flag_pv(&db, &flags.pv_name("newAsFlag")).await;
+            }
+
+            // quit / quitServer come last in the C loop. Consume both flags
+            // and reset their PVs before signaling shutdown, so they never
+            // skip the report/reload flags handled above in the same pass.
+            let quit = flags.quit.swap(false, Ordering::Relaxed);
+            let quit_server = flags.quit_server.swap(false, Ordering::Relaxed);
+            if quit {
+                reset_flag_pv(&db, &flags.pv_name("quitFlag")).await;
+            }
+            if quit_server {
+                reset_flag_pv(&db, &flags.pv_name("quitServerFlag")).await;
+            }
+            if quit || quit_server {
+                tracing::info!(
+                    quit,
+                    quit_server,
+                    "ca-gateway-rs: shutdown requested via control PV"
+                );
+                // The run loop performs the actual teardown.
+                shutdown.notify_one();
+                return;
             }
         }
     })
+}
+
+/// Run the configured command file (the `commandFlag` action), logging its
+/// output. A missing command-file path is a warned no-op, matching the
+/// previous behaviour.
+async fn run_command_file(handler: &CommandHandler, command_path: &Option<std::path::PathBuf>) {
+    match command_path {
+        Some(path) => match handler.process_file(path).await {
+            Ok(out) if !out.is_empty() => {
+                tracing::info!(output = %out.trim_end(), "ca-gateway-rs: commandFlag output");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "ca-gateway-rs: commandFlag file error");
+            }
+        },
+        None => {
+            tracing::warn!("ca-gateway-rs: commandFlag written but no command file configured");
+        }
+    }
+}
+
+/// Reset a consumed control flag PV to zero. `Double(0.0)` matches the
+/// DBR_DOUBLE native type the flag was registered with (gateStat parity);
+/// the write hook treats a zero write as inert, so the reset never
+/// re-raises the flag.
+async fn reset_flag_pv(db: &Arc<PvDatabase>, pv: &str) {
+    if let Err(e) = db.put_pv_and_post(pv, EpicsValue::Double(0.0)).await {
+        tracing::debug!(pv = %pv, error = %e, "ca-gateway-rs: control flag reset failed");
+    }
 }
 
 async fn dispatch_logged(handler: &CommandHandler, cmd: GatewayCommand) {
@@ -237,6 +333,7 @@ mod tests {
     use crate::ca_gateway::access::AccessConfig;
     use crate::ca_gateway::cache::PvCache;
     use crate::ca_gateway::pvlist::PvList;
+    use crate::ca_gateway::stats::Stats;
     use arc_swap::ArcSwap;
     use epics_base_rs::server::pv::ProcessVariable;
     use tokio::sync::RwLock;
@@ -283,12 +380,12 @@ mod tests {
     }
 
     /// publishing registers every control flag PV under the prefix, and a
-    /// positive write to one enqueues exactly that flag's trigger naming
-    /// the PV to reset. A zero write enqueues nothing.
+    /// positive write RAISES exactly that flag in the shared `ControlFlags`
+    /// (the hook→flag path). A zero write raises nothing.
     #[tokio::test]
-    async fn control_pv_positive_write_enqueues_trigger() {
+    async fn control_pv_positive_write_raises_flag() {
         let db = PvDatabase::new();
-        let mut rx = publish_control_pvs(&db, "gw:")
+        let flags = publish_control_pvs(&db, "gw:")
             .await
             .expect("non-empty prefix publishes control PVs");
 
@@ -301,36 +398,38 @@ mod tests {
             );
         }
 
-        // A positive write to newAsFlag enqueues NewAs naming that PV.
         let pv = db.find_pv("gw:newAsFlag").await.unwrap();
-        fire(&pv, EpicsValue::Long(1)).await.unwrap();
-
-        let ev = rx.try_recv().expect("positive write enqueues a trigger");
-        assert_eq!(ev.trigger, ControlTrigger::NewAs);
-        assert_eq!(ev.pv, "gw:newAsFlag");
-
-        // A zero write to the same PV enqueues nothing (so the owner's
-        // reset-to-zero never re-triggers).
-        fire(&pv, EpicsValue::Long(0)).await.unwrap();
+        // A zero write is inert (so the owner's reset never re-raises).
+        fire(&pv, EpicsValue::Double(0.0)).await.unwrap();
         assert!(
-            rx.try_recv().is_err(),
-            "a zero/reset write must not enqueue a trigger"
+            !flags.new_as.load(Ordering::Relaxed),
+            "a zero/reset write must not raise the flag"
+        );
+        // A positive write raises exactly the newAs flag.
+        fire(&pv, EpicsValue::Long(1)).await.unwrap();
+        assert!(
+            flags.new_as.load(Ordering::Relaxed),
+            "positive write raises newAs"
+        );
+        assert!(
+            !flags.report2.load(Ordering::Relaxed),
+            "a write to newAsFlag must not raise an unrelated flag"
         );
     }
 
-    /// the owner dispatches a Report trigger through the shared
-    /// CommandHandler and resets the raising flag PV back to zero.
+    /// the owner dispatches a Report flag through the shared CommandHandler
+    /// and resets the raising flag PV back to zero (DBR_DOUBLE 0.0).
     #[tokio::test]
     async fn owner_dispatches_and_resets_flag() {
         let db = Arc::new(PvDatabase::new());
-        let rx = publish_control_pvs(&db, "gw:").await.unwrap();
+        let flags = publish_control_pvs(&db, "gw:").await.unwrap();
 
         let cache = Arc::new(RwLock::new(PvCache::new()));
         let pvlist = Arc::new(ArcSwap::from_pointee(PvList::new()));
         let access = Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all()));
         let handler = CommandHandler::new(cache, pvlist, access, None, None);
         let shutdown = Arc::new(Notify::new());
-        let owner = spawn_control_owner(rx, handler, db.clone(), None, shutdown);
+        let owner = spawn_control_owner(flags.clone(), handler, db.clone(), None, shutdown);
 
         // Drive report2Flag positive via its write hook.
         let pv = db.find_pv("gw:report2Flag").await.unwrap();
@@ -353,18 +452,18 @@ mod tests {
         owner.abort();
     }
 
-    /// a quit trigger fires the shutdown Notify and stops the owner.
+    /// a quit flag fires the shutdown Notify and stops the owner.
     #[tokio::test]
     async fn quit_trigger_signals_shutdown() {
         let db = Arc::new(PvDatabase::new());
-        let rx = publish_control_pvs(&db, "gw:").await.unwrap();
+        let flags = publish_control_pvs(&db, "gw:").await.unwrap();
 
         let cache = Arc::new(RwLock::new(PvCache::new()));
         let pvlist = Arc::new(ArcSwap::from_pointee(PvList::new()));
         let access = Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all()));
         let handler = CommandHandler::new(cache, pvlist, access, None, None);
         let shutdown = Arc::new(Notify::new());
-        let owner = spawn_control_owner(rx, handler, db.clone(), None, shutdown.clone());
+        let owner = spawn_control_owner(flags.clone(), handler, db.clone(), None, shutdown.clone());
 
         let pv = db.find_pv("gw:quitFlag").await.unwrap();
         fire(&pv, EpicsValue::Long(1)).await.unwrap();
@@ -373,9 +472,162 @@ mod tests {
         let notified = tokio::time::timeout(std::time::Duration::from_secs(2), shutdown.notified())
             .await
             .is_ok();
-        assert!(notified, "quit trigger must fire the shutdown Notify");
+        assert!(notified, "quit flag must fire the shutdown Notify");
 
         // The owner task exits after a quit.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), owner).await;
+    }
+
+    /// Build a report-file-backed CommandHandler so dispatched reports are
+    /// observable (each R1/R2/R3 appends a section, R2 = SIGUSR2 shortcut).
+    fn report_handler(report_path: std::path::PathBuf) -> CommandHandler {
+        let cache = Arc::new(RwLock::new(PvCache::new()));
+        let pvlist = Arc::new(ArcSwap::from_pointee(PvList::new()));
+        let access = Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all()));
+        CommandHandler::new(cache, pvlist, access, None, None)
+            .with_stats(Arc::new(Stats::new("gw".to_string())))
+            .with_report_path(Some(report_path))
+    }
+
+    /// Poll the report file until `needle` appears (bounded), then return
+    /// the full body.
+    async fn wait_for_report(path: &std::path::Path, needle: &str) -> String {
+        for _ in 0..200 {
+            if let Ok(body) = std::fs::read_to_string(path) {
+                if body.contains(needle) {
+                    return body;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+
+    /// Multiple positive writes to one flag before the owner's pass collapse
+    /// to ONE action — C sets a boolean and consumes it once per main-loop
+    /// pass (gateServer.cc:347-351). Three report2Flag raises must produce a
+    /// single R2 report section, not three.
+    #[tokio::test]
+    async fn control_owner_collapses_duplicate_writes() {
+        let pid = std::process::id();
+        let report_path = std::env::temp_dir().join(format!("ca_gw_ctl_collapse_{pid}.report"));
+        let _ = std::fs::remove_file(&report_path);
+
+        let db = Arc::new(PvDatabase::new());
+        let flags = publish_control_pvs(&db, "gw:").await.unwrap();
+        // Raise report2 three times BEFORE the owner runs: the notify
+        // permits coalesce and the flag stays a single bool, so the owner
+        // drains it exactly once.
+        flags.raise(ControlTrigger::Report2);
+        flags.raise(ControlTrigger::Report2);
+        flags.raise(ControlTrigger::Report2);
+
+        let shutdown = Arc::new(Notify::new());
+        let owner = spawn_control_owner(
+            flags.clone(),
+            report_handler(report_path.clone()),
+            db.clone(),
+            None,
+            shutdown,
+        );
+
+        let body = wait_for_report(&report_path, "R2 (process variable report)").await;
+        // Settle: any erroneous second pass would have to wake again, but no
+        // further raise happened (the reset write is inert), so the count is
+        // stable. A short extra wait guards against an in-flight second pass.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let body = std::fs::read_to_string(&report_path).unwrap_or(body);
+        let count = body.matches("R2 (process variable report)").count();
+        assert_eq!(
+            count, 1,
+            "three report2Flag writes must collapse to one report: {count} sections"
+        );
+
+        owner.abort();
+        let _ = std::fs::remove_file(&report_path);
+    }
+
+    /// A burst of different flags runs in C's FIXED main-loop order, not
+    /// client write order: report1/2/3 raised in reverse order still append
+    /// R1, then R2, then R3 (gateServer.cc:342-356).
+    #[tokio::test]
+    async fn control_owner_runs_flags_in_fixed_c_order() {
+        let pid = std::process::id();
+        let report_path = std::env::temp_dir().join(format!("ca_gw_ctl_order_{pid}.report"));
+        let _ = std::fs::remove_file(&report_path);
+
+        let db = Arc::new(PvDatabase::new());
+        let flags = publish_control_pvs(&db, "gw:").await.unwrap();
+        // Raise in reverse C order to prove ordering is by the owner, not by
+        // write order.
+        flags.raise(ControlTrigger::Report3);
+        flags.raise(ControlTrigger::Report2);
+        flags.raise(ControlTrigger::Report1);
+
+        let shutdown = Arc::new(Notify::new());
+        let owner = spawn_control_owner(
+            flags.clone(),
+            report_handler(report_path.clone()),
+            db.clone(),
+            None,
+            shutdown,
+        );
+
+        // R3 is dispatched last; once it is present all three are.
+        let body = wait_for_report(&report_path, "R3 (access security report)").await;
+        let r1 = body.find("R1 (PV report)").expect("R1 present");
+        let r2 = body
+            .find("R2 (process variable report)")
+            .expect("R2 present");
+        let r3 = body
+            .find("R3 (access security report)")
+            .expect("R3 present");
+        assert!(
+            r1 < r2 && r2 < r3,
+            "fixed C order R1<R2<R3 — got R1={r1} R2={r2} R3={r3}"
+        );
+
+        owner.abort();
+        let _ = std::fs::remove_file(&report_path);
+    }
+
+    /// A quit raised in the same pass as a report does NOT skip the earlier
+    /// flag: C checks quitFlag/quitServerFlag last in the loop
+    /// (gateServer.cc:363-378), so the report still runs before shutdown.
+    #[tokio::test]
+    async fn control_owner_quit_does_not_skip_earlier_flags() {
+        let pid = std::process::id();
+        let report_path = std::env::temp_dir().join(format!("ca_gw_ctl_quit_{pid}.report"));
+        let _ = std::fs::remove_file(&report_path);
+
+        let db = Arc::new(PvDatabase::new());
+        let flags = publish_control_pvs(&db, "gw:").await.unwrap();
+        // Quit raised together with (even "before", by C order) report2.
+        flags.raise(ControlTrigger::Quit);
+        flags.raise(ControlTrigger::Report2);
+
+        let shutdown = Arc::new(Notify::new());
+        let owner = spawn_control_owner(
+            flags.clone(),
+            report_handler(report_path.clone()),
+            db.clone(),
+            None,
+            shutdown.clone(),
+        );
+
+        // The report ran despite the quit in the same pass.
+        let body = wait_for_report(&report_path, "R2 (process variable report)").await;
+        assert!(
+            body.contains("R2 (process variable report)"),
+            "report2 must run before quit in the same pass"
+        );
+        // And the quit still fired shutdown after the earlier flag.
+        let notified = tokio::time::timeout(std::time::Duration::from_secs(2), shutdown.notified())
+            .await
+            .is_ok();
+        assert!(notified, "quit must still fire shutdown after the report");
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), owner).await;
+        let _ = std::fs::remove_file(&report_path);
     }
 }

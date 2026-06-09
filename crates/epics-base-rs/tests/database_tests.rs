@@ -5882,14 +5882,15 @@ async fn test_ca_put_mbbo_direct_val_recomputes_rval() {
 
     let rec = db.get_record("MBBOD_CA").await.unwrap();
     let inst = rec.read().await;
+    // RVAL/ORAW are DBF_ULONG (mbboDirectRecord.dbd.pod:167,172).
     assert_eq!(
         inst.record.get_field("RVAL"),
-        Some(EpicsValue::Long(80)),
+        Some(EpicsValue::ULong(80)),
         "RVAL must be recomputed from the new VAL (5 << 4), not left stale at 0"
     );
     assert_eq!(
         inst.record.get_field("ORAW"),
-        Some(EpicsValue::Long(80)),
+        Some(EpicsValue::ULong(80)),
         "ORAW must roll forward to the freshly converted RVAL"
     );
 }

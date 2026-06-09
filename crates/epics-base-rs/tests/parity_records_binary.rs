@@ -59,7 +59,8 @@ fn mbbi_direct_nobt_above_16_sets_mask() {
     let mut rec = MbbiDirectRecord::default();
     rec.nobt = 24;
     rec.init_record(0).unwrap();
-    assert_eq!(rec.mask, (1i32 << 24) - 1);
+    // MASK is DBF_ULONG (mbbiDirectRecord.dbd.pod:121).
+    assert_eq!(rec.mask, (1u32 << 24) - 1);
 }
 
 // --- mbboDirect process must not force RBV = RVAL ---

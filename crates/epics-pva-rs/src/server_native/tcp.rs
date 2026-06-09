@@ -1290,6 +1290,40 @@ fn op_owner_sid(channels: &HashMap<u32, ChannelState>, ioid: u32) -> Option<u32>
         .find_map(|(sid, c)| c.ops.contains_key(&ioid).then_some(*sid))
 }
 
+/// Resolve which channel should service a data-phase (non-INIT) operation
+/// frame for `ioid`. pvxs looks the operation up in the connection-wide
+/// `opByIOID` map and acts on `op->chan`, IGNORING the SID carried in the
+/// frame for GET/PUT/RPC EXEC (`serverget.cpp:421-423`/`461-465`). A
+/// MONITOR frame additionally requires the supplied SID to equal the
+/// owning channel's SID and resets the circuit on a mismatch
+/// (`servermon.cpp:610-635`).
+///
+/// - `Ok(Some(owner))` — the IOID is live; service the frame on `owner`'s
+///   channel regardless of the SID in the frame.
+/// - `Ok(None)` — the IOID is not live anywhere on the connection; the
+///   caller falls back to its existing not-found path (the DESTROY race,
+///   `serverget.cpp:423-428` / `servermon.cpp:611-617`).
+/// - `Err` — connection-fatal: a MONITOR frame named a SID that does not
+///   own the IOID.
+///
+/// Keying the data phase on the op owner (not the frame SID) closes the
+/// gap where a data frame whose IOID is live on another channel was
+/// silently dropped because the frame SID's channel did not hold the op.
+fn data_phase_owner_sid(
+    channels: &HashMap<u32, ChannelState>,
+    ioid: u32,
+    frame_sid: u32,
+    require_sid_match: bool,
+) -> Result<Option<u32>, PvaError> {
+    match op_owner_sid(channels, ioid) {
+        Some(owner) if require_sid_match && owner != frame_sid => Err(PvaError::Decode(format!(
+            "MONITOR data-phase SID {frame_sid} does not own IOID {ioid} \
+             (owner channel {owner}); pvxs servermon.cpp:610-635 protocol error"
+        ))),
+        other => Ok(other),
+    }
+}
+
 /// await a user-supplied source handler so that a panic inside it
 /// becomes a recoverable `Err` instead of unwinding the spawned exec task.
 ///
@@ -3647,6 +3681,16 @@ async fn handle_put_get(
     // evaluated before the per-channel borrow below.
     let dup_ioid = subcmd & QosFlags::INIT != 0 && ioid_live_on_conn(channels, ioid);
 
+    // Data-phase frames resolve their channel via the connection-wide op
+    // owner, not the frame SID (see `data_phase_owner_sid` / `handle_op`).
+    // PUT_GET is a single request-response op (GPR-like), so the frame SID
+    // is not re-validated; INIT keeps the frame's channel.
+    let sid = if subcmd & QosFlags::INIT != 0 {
+        sid
+    } else {
+        data_phase_owner_sid(channels, ioid, sid, false)?.unwrap_or(sid)
+    };
+
     let ch = match channels.get_mut(&sid) {
         Some(c) => c,
         None => {
@@ -4032,6 +4076,16 @@ async fn handle_process(
     // evaluated before the per-channel borrow below.
     let dup_ioid = subcmd & QosFlags::INIT != 0 && ioid_live_on_conn(channels, ioid);
 
+    // Data-phase frames resolve their channel via the connection-wide op
+    // owner, not the frame SID (see `data_phase_owner_sid` / `handle_op`).
+    // PROCESS is a single request-response op (GPR-like), so the frame SID
+    // is not re-validated; INIT keeps the frame's channel.
+    let sid = if subcmd & QosFlags::INIT != 0 {
+        sid
+    } else {
+        data_phase_owner_sid(channels, ioid, sid, false)?.unwrap_or(sid)
+    };
+
     let ch = match channels.get_mut(&sid) {
         Some(c) => c,
         None => {
@@ -4344,6 +4398,16 @@ async fn handle_channel_array(
     let subcmd = cur.get_u8().map_err(|e| PvaError::Decode(e.to_string()))?;
 
     let dup_ioid = subcmd & QosFlags::INIT != 0 && ioid_live_on_conn(channels, ioid);
+
+    // Data-phase frames resolve their channel via the connection-wide op
+    // owner, not the frame SID (see `data_phase_owner_sid` / `handle_op`).
+    // ChannelArray is a single request-response op (GPR-like), so the frame
+    // SID is not re-validated; INIT keeps the frame's channel.
+    let sid = if subcmd & QosFlags::INIT != 0 {
+        sid
+    } else {
+        data_phase_owner_sid(channels, ioid, sid, false)?.unwrap_or(sid)
+    };
 
     let ch = match channels.get_mut(&sid) {
         Some(c) => c,
@@ -5452,6 +5516,20 @@ async fn handle_op(
     // Connection-wide IOID uniqueness, evaluated before the per-channel
     // borrow below (pvxs `ServerConn::opByIOID`, serverget.cpp:378-384).
     let dup_ioid = subcmd & 0x08 != 0 && ioid_live_on_conn(channels, ioid);
+
+    // pvxs services a data-phase (non-INIT) frame via the connection-wide
+    // `opByIOID` map and acts on `op->chan`, IGNORING the frame SID for
+    // GET/PUT/RPC (serverget.cpp:421-423); MONITOR additionally resets the
+    // circuit when the frame SID does not own the IOID (servermon.cpp:
+    // 610-635). Resolve the owner before the per-channel borrow so a data
+    // frame whose IOID is live on another channel is serviced on its real
+    // channel instead of being silently dropped. INIT keeps binding to the
+    // frame's own channel.
+    let sid = if subcmd & 0x08 != 0 {
+        sid
+    } else {
+        data_phase_owner_sid(channels, ioid, sid, kind == OpKind::Monitor)?.unwrap_or(sid)
+    };
 
     let ch = match channels.get_mut(&sid) {
         Some(c) => c,
@@ -11127,6 +11205,75 @@ mod tests {
         msg(7).expect("MESSAGE on live IOID accepted");
         // Unknown IOID: dropped, not an error, no severity escalation.
         msg(999).expect("MESSAGE on unknown IOID dropped, not an error");
+    }
+
+    /// Regression R0604-PVASRV-DATAPHASE-IOID-1.
+    /// A data-phase (non-INIT) operation frame must resolve its channel
+    /// through the connection-wide op owner, not the SID carried in the
+    /// frame. pvxs GET/PUT/RPC EXEC looks the op up in `opByIOID` and acts
+    /// on `op->chan`, ignoring the frame SID (serverget.cpp:421-423);
+    /// MONITOR additionally resets the circuit when the frame SID does not
+    /// own the IOID (servermon.cpp:610-635).
+    #[test]
+    fn data_phase_owner_sid_resolves_connection_wide() {
+        let mk_channel = |sid: u32, ioid: u32| -> ChannelState {
+            let source: DynSource = Arc::new(crate::server_native::SharedSource::new());
+            let mut ops = HashMap::new();
+            ops.insert(
+                ioid,
+                non_monitor_op_state(
+                    FieldDesc::Scalar(ScalarType::Int),
+                    OpKind::Get,
+                    BitSet::new(),
+                ),
+            );
+            ChannelState {
+                name: format!("dut:pv{sid}"),
+                cid: 0,
+                sid,
+                introspection: Some(FieldDesc::Scalar(ScalarType::Int)),
+                source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
+                ops,
+            }
+        };
+        // Channel 1 owns IOID 7; channel 2 owns IOID 9.
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(1, mk_channel(1, 7));
+        channels.insert(2, mk_channel(2, 9));
+
+        // GPR-like (require_sid_match=false): a frame naming the WRONG SID
+        // for a live IOID still resolves to the owning channel — the frame
+        // SID is ignored, matching pvxs serverget.cpp:421-423.
+        assert_eq!(
+            data_phase_owner_sid(&channels, 7, 2, false).unwrap(),
+            Some(1),
+            "GPR data frame must dispatch on the IOID owner, not the frame SID"
+        );
+        // Correct SID also resolves to the owner.
+        assert_eq!(
+            data_phase_owner_sid(&channels, 7, 1, false).unwrap(),
+            Some(1)
+        );
+        // MONITOR (require_sid_match=true): a frame SID that does not own
+        // the IOID is connection-fatal (pvxs servermon.cpp:631-635).
+        assert!(
+            data_phase_owner_sid(&channels, 7, 2, true).is_err(),
+            "MONITOR data frame with a mismatched SID must be connection-fatal"
+        );
+        // MONITOR with the matching SID resolves normally.
+        assert_eq!(
+            data_phase_owner_sid(&channels, 7, 1, true).unwrap(),
+            Some(1)
+        );
+        // Unknown IOID → fall through to the caller's not-found path (the
+        // DESTROY race), for both GPR and MONITOR.
+        assert_eq!(
+            data_phase_owner_sid(&channels, 999, 1, false).unwrap(),
+            None
+        );
+        assert_eq!(data_phase_owner_sid(&channels, 999, 1, true).unwrap(), None);
     }
 
     /// Regression R0604-PVASRV-MESSAGE-SEVERITY-MAP-1.

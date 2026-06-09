@@ -988,8 +988,9 @@ impl PvaClient {
     /// own receiver). Drop the receiver to unsubscribe.
     pub async fn discover(
         &self,
-    ) -> PvaResult<tokio::sync::mpsc::Receiver<crate::client_native::search_engine::Discovered>>
-    {
+    ) -> PvaResult<
+        tokio::sync::mpsc::UnboundedReceiver<crate::client_native::search_engine::Discovered>,
+    > {
         self.search_engine().await?.discover().await
     }
 

@@ -153,7 +153,7 @@ pub enum SearchCommand {
     /// `Discovered` for every beacon that observation logic regards as a
     /// new server (first-seen GUID) or a re-observed-after-restart GUID.
     Subscribe {
-        responder: oneshot::Sender<mpsc::Receiver<Discovered>>,
+        responder: oneshot::Sender<mpsc::UnboundedReceiver<Discovered>>,
     },
     /// Force the engine into fast-tick mode for one revolution and
     /// bring every pending search's retry deadline forward. Mirrors
@@ -569,13 +569,15 @@ impl SearchEngine {
     /// [`BeaconTracker`] regards as new or restarted. Mirrors pvxs's
     /// `client::Context::discover()` callback API.
     ///
-    /// The receiver is bounded; if the consumer falls behind, individual
-    /// events are dropped silently, but the **subscription survives** — a
-    /// momentarily-full queue does not unsubscribe a live consumer (pvxs
-    /// keeps each discovery operation until the caller cancels it,
-    /// clientdiscover.cpp:103-112). The subscription ends only when the
-    /// receiver is dropped.
-    pub async fn discover(&self) -> PvaResult<mpsc::Receiver<Discovered>> {
+    /// The receiver is unbounded, so delivery is lossless: every
+    /// `Online`/`Timeout` transition reaches a live consumer even under a
+    /// discovery burst, mirroring pvxs's inline-callback delivery
+    /// (`ContextImpl::serverEvent`), which has no bounded queue and never
+    /// drops an event. A slow consumer's backlog grows rather than losing
+    /// events. pvxs keeps each discovery operation until the caller cancels
+    /// it (clientdiscover.cpp:103-112); here the subscription ends only when
+    /// the receiver is dropped.
+    pub async fn discover(&self) -> PvaResult<mpsc::UnboundedReceiver<Discovered>> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SearchCommand::Subscribe { responder: tx })
@@ -1060,7 +1062,7 @@ async fn run_engine(
 
     let mut pending: HashMap<u32, Pending> = HashMap::new(); // by search_id
     let mut by_name: HashMap<String, u32> = HashMap::new(); // pv_name → search_id
-    let mut subscribers: Vec<mpsc::Sender<Discovered>> = Vec::new();
+    let mut subscribers: Vec<mpsc::UnboundedSender<Discovered>> = Vec::new();
     // Search bucket ring (pvxs client.cpp searchBuckets[30]). Each
     // bucket holds the search_ids whose retry slot is "this bucket"
     // on the rotating cursor. Tick advances the cursor and processes
@@ -1323,7 +1325,7 @@ async fn run_engine(
                     }
                 }
                 Some(SearchCommand::Subscribe { responder }) => {
-                    let (tx, rx) = mpsc::channel::<Discovered>(64);
+                    let (tx, rx) = mpsc::unbounded_channel::<Discovered>();
                     subscribers.push(tx);
                     let _ = responder.send(rx);
                 }
@@ -2084,24 +2086,23 @@ fn flush_expired_pending(
 /// Deliver a discovery event to every live subscriber.
 ///
 /// Single owner of the subscriber-eviction policy. pvxs runs each
-/// discovery callback inline on the client loop and removes a discovery
-/// operation only when the caller cancels it
-/// (clientdiscover.cpp:83-112) — it never reinterprets a slow consumer
-/// as cancellation. So we drop the event for a subscriber whose bounded
-/// queue is momentarily full (lossy delivery, as `discover()` documents)
-/// but KEEP the subscriber; a subscriber is removed only when its
-/// receiver has been dropped (`Closed`). Treating `Full` as removal —
-/// what a plain `try_send(..).is_ok()` retain does — silently unsubscribes
-/// a live-but-slow consumer after a beacon storm, which pvxs never does.
-fn publish_discovery(subscribers: &mut Vec<mpsc::Sender<Discovered>>, evt: Discovered) {
-    subscribers.retain(|tx| match tx.try_send(evt.clone()) {
-        Ok(()) => true,
-        // Live consumer that fell behind: keep it; the event is lost, not
-        // the subscription.
-        Err(mpsc::error::TrySendError::Full(_)) => true,
-        // Receiver dropped: the discovery operation is gone.
-        Err(mpsc::error::TrySendError::Closed(_)) => false,
-    });
+/// discovery callback inline on the client loop and never drops an event:
+/// `ContextImpl::serverEvent` (client.cpp) calls every live discoverer's
+/// callback synchronously, and a discovery operation is removed only when
+/// the caller cancels it (clientdiscover.cpp:83-112) — a slow consumer is
+/// never reinterpreted as cancellation or as a reason to skip an event.
+///
+/// Each subscriber owns an unbounded queue, so this delivery is lossless
+/// by construction: there is no "queue full" state to drop on, a slow
+/// consumer's backlog grows rather than losing Online/Timeout transitions,
+/// and `send` fails only once the receiver has been dropped — which is
+/// exactly the caller cancelling, so that subscriber is removed. This is
+/// the structural analog of the inline pvxs callback: no bounded queue,
+/// no overflow branch, removal only on cancellation.
+fn publish_discovery(subscribers: &mut Vec<mpsc::UnboundedSender<Discovered>>, evt: Discovered) {
+    // `send` on an unbounded channel never blocks and never drops; it errors
+    // only when the receiver is gone (the discovery operation was cancelled).
+    subscribers.retain(|tx| tx.send(evt.clone()).is_ok());
 }
 
 /// Emit the `Discovered` events implied by a beacon classification and
@@ -2116,7 +2117,7 @@ fn emit_beacon_action(
     guid: [u8; 12],
     peer: SocketAddr,
     proto: String,
-    subscribers: &mut Vec<mpsc::Sender<Discovered>>,
+    subscribers: &mut Vec<mpsc::UnboundedSender<Discovered>>,
 ) -> bool {
     match action {
         BeaconAction::New => {
@@ -2176,7 +2177,7 @@ fn handle_search_response(
     by_name: &mut HashMap<String, u32>,
     beacons: &Arc<BeaconTracker>,
     ignore_guids: &std::collections::HashSet<[u8; 12]>,
-    subscribers: &mut Vec<mpsc::Sender<Discovered>>,
+    subscribers: &mut Vec<mpsc::UnboundedSender<Discovered>>,
     poke_request: &mut bool,
     peer: SocketAddr,
     is_tcp: bool,
@@ -2337,7 +2338,7 @@ fn handle_search_response(
 fn handle_beacon(
     bytes: &[u8],
     beacons: &Arc<BeaconTracker>,
-    subscribers: &mut Vec<mpsc::Sender<Discovered>>,
+    subscribers: &mut Vec<mpsc::UnboundedSender<Discovered>>,
     poke_request: &mut bool,
     peer: SocketAddr,
 ) -> usize {
@@ -3033,7 +3034,7 @@ mod tests {
         let mut pending: HashMap<u32, Pending> = HashMap::new();
         let mut by_name: HashMap<String, u32> = HashMap::new();
         let ignore_guids: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
-        let mut subscribers: Vec<mpsc::Sender<Discovered>> = Vec::new(); // no discover() active
+        let mut subscribers: Vec<mpsc::UnboundedSender<Discovered>> = Vec::new(); // no discover() active
         let mut poke = false;
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 5076);
 
@@ -3073,8 +3074,8 @@ mod tests {
         let mut pending: HashMap<u32, Pending> = HashMap::new();
         let mut by_name: HashMap<String, u32> = HashMap::new();
         let ignore_guids: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
-        let (tx, mut rx) = mpsc::channel::<Discovered>(8);
-        let mut subscribers: Vec<mpsc::Sender<Discovered>> = vec![tx]; // discover() active
+        let (tx, mut rx) = mpsc::unbounded_channel::<Discovered>();
+        let mut subscribers: Vec<mpsc::UnboundedSender<Discovered>> = vec![tx]; // discover() active
         let mut poke = false;
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 5076);
 
@@ -3129,8 +3130,8 @@ mod tests {
         let mut pending: HashMap<u32, Pending> = HashMap::new();
         let mut by_name: HashMap<String, u32> = HashMap::new();
         let ignore_guids: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
-        let (tx, mut rx) = mpsc::channel::<Discovered>(8);
-        let mut subscribers: Vec<mpsc::Sender<Discovered>> = vec![tx]; // discover() active
+        let (tx, mut rx) = mpsc::unbounded_channel::<Discovered>();
+        let mut subscribers: Vec<mpsc::UnboundedSender<Discovered>> = vec![tx]; // discover() active
         let mut poke = false;
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 5076);
 
@@ -3188,7 +3189,7 @@ mod tests {
         );
         let mut by_name: HashMap<String, u32> = std::iter::once(("dut".to_string(), 1)).collect();
         let beacons = BeaconTracker::new();
-        let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+        let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = Vec::new();
         let mut poke = false;
         let found_true = crate::server_native::udp::build_search_response_proto(
             IG,
@@ -3216,8 +3217,8 @@ mod tests {
 
         // (2) found=false discovery pong with an ignored GUID, even with an
         // active discover() subscriber, must NOT announce.
-        let (txd, mut rxd) = mpsc::channel::<Discovered>(8);
-        let mut subs2: Vec<mpsc::Sender<Discovered>> = vec![txd];
+        let (txd, mut rxd) = mpsc::unbounded_channel::<Discovered>();
+        let mut subs2: Vec<mpsc::UnboundedSender<Discovered>> = vec![txd];
         let mut poke2 = false;
         let pong = crate::server_native::udp::build_search_response_proto(
             IG,
@@ -3265,8 +3266,8 @@ mod tests {
         header.write_into(&mut frame);
         frame.extend_from_slice(&payload);
 
-        let (txb, mut rxb) = mpsc::channel::<Discovered>(8);
-        let mut subs3: Vec<mpsc::Sender<Discovered>> = vec![txb];
+        let (txb, mut rxb) = mpsc::unbounded_channel::<Discovered>();
+        let mut subs3: Vec<mpsc::UnboundedSender<Discovered>> = vec![txb];
         let mut poke3 = false;
         handle_beacon(&frame, &beacons, &mut subs3, &mut poke3, peer);
         assert_eq!(
@@ -3323,7 +3324,7 @@ mod tests {
                 std::iter::once(("dut".to_string(), 1)).collect();
             let beacons = BeaconTracker::new();
             let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
-            let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+            let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = Vec::new();
             let mut poke = false;
             let consumed = handle_search_response(
                 &frame,
@@ -3359,7 +3360,7 @@ mod tests {
         let mut by_name: HashMap<String, u32> = std::iter::once(("dut".to_string(), 1)).collect();
         let beacons = BeaconTracker::new();
         let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
-        let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+        let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = Vec::new();
         let mut poke = false;
         handle_search_response(
             &base,
@@ -3422,7 +3423,7 @@ mod tests {
             "precondition: no beacon GUID for the server"
         );
         let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
-        let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+        let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = Vec::new();
         let mut poke = false;
         let frame = crate::server_native::udp::build_search_response_proto(
             G,
@@ -3501,7 +3502,7 @@ mod tests {
         );
         let mut by_name: HashMap<String, u32> = std::iter::once(("dut".to_string(), 1)).collect();
         let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
-        let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+        let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = Vec::new();
         let mut poke = false;
         let frame = crate::server_native::udp::build_search_response_proto(
             G_TCP,
@@ -3591,7 +3592,7 @@ mod tests {
                 std::iter::once(("dut".to_string(), 1)).collect();
             let beacons = BeaconTracker::new();
             let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
-            let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+            let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = Vec::new();
             let mut poke = false;
             // Second reply: same cid, different GUID B, from server B.
             let frame = crate::server_native::udp::build_search_response_proto(
@@ -3655,8 +3656,8 @@ mod tests {
             let mut frame = base.clone();
             frame[2] |= seg;
             let beacons = BeaconTracker::new();
-            let (tx, mut rx) = mpsc::channel::<Discovered>(8);
-            let mut subs: Vec<mpsc::Sender<Discovered>> = vec![tx];
+            let (tx, mut rx) = mpsc::unbounded_channel::<Discovered>();
+            let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = vec![tx];
             let mut poke = false;
             let consumed = handle_beacon(&frame, &beacons, &mut subs, &mut poke, peer);
             assert!(
@@ -3675,8 +3676,8 @@ mod tests {
 
         // Control: the un-segmented beacon tracks + emits Online.
         let beacons = BeaconTracker::new();
-        let (tx, mut rx) = mpsc::channel::<Discovered>(8);
-        let mut subs: Vec<mpsc::Sender<Discovered>> = vec![tx];
+        let (tx, mut rx) = mpsc::unbounded_channel::<Discovered>();
+        let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = vec![tx];
         let mut poke = false;
         handle_beacon(&base, &beacons, &mut subs, &mut poke, peer);
         assert_eq!(
@@ -3690,13 +3691,17 @@ mod tests {
         );
     }
 
-    /// A live discovery subscriber whose bounded queue is full must NOT be
-    /// evicted: pvxs keeps the operation until the caller cancels it
-    /// (clientdiscover.cpp:103-112) and never treats a slow consumer as
-    /// cancellation. The subscriber is removed only when its receiver is
-    /// dropped (`Closed`). Regression for treating `Full` as removal.
+    /// Discovery delivery is lossless. pvxs `ContextImpl::serverEvent`
+    /// (client.cpp) calls every live discoverer's callback inline and never
+    /// drops an event; a discovery operation is removed only when the caller
+    /// cancels it (clientdiscover.cpp:103-112), never because a consumer is
+    /// slow. The unbounded per-subscriber queue gives the same guarantee: a
+    /// burst far larger than any former bounded capacity is delivered in
+    /// full and in publish order without draining, and the subscriber is
+    /// removed only when its receiver is dropped (`Closed`). Regression for
+    /// the prior bounded queue that silently dropped events on `Full`.
     #[test]
-    fn full_queue_keeps_live_subscriber_closed_removes_it() {
+    fn unbounded_discovery_delivers_every_event_then_closed_removes_subscriber() {
         let sa = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5075);
         let mk = |n: u8| Discovered::Online {
             server: sa,
@@ -3704,30 +3709,37 @@ mod tests {
             peer: sa,
             proto: "tcp".into(),
         };
-        let (tx, mut rx) = mpsc::channel::<Discovered>(2);
-        let mut subs: Vec<mpsc::Sender<Discovered>> = vec![tx];
+        let (tx, mut rx) = mpsc::unbounded_channel::<Discovered>();
+        let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = vec![tx];
 
-        // Fill the 2-slot queue.
-        publish_discovery(&mut subs, mk(1));
-        publish_discovery(&mut subs, mk(2));
-        assert_eq!(subs.len(), 1, "subscriber present after filling the queue");
+        // Publish a burst far larger than the former 64-slot bounded
+        // capacity WITHOUT draining. The old bounded queue dropped every
+        // event past the cap; the unbounded queue keeps them all and the
+        // subscriber stays live throughout.
+        const BURST: u8 = 200;
+        for n in 1..=BURST {
+            publish_discovery(&mut subs, mk(n));
+            assert_eq!(subs.len(), 1, "live subscriber retained across the burst");
+        }
 
-        // Queue full → event is dropped but the subscriber is RETAINED.
-        publish_discovery(&mut subs, mk(3));
-        assert_eq!(
-            subs.len(),
-            1,
-            "a full queue must not unsubscribe a live consumer"
+        // Every event is delivered, in publish order, none lost.
+        for n in 1..=BURST {
+            match rx.try_recv() {
+                Ok(Discovered::Online { guid, .. }) => {
+                    assert_eq!(guid, [n; 12], "events delivered in order, none dropped");
+                }
+                other => panic!("expected Online #{n}, got {other:?}"),
+            }
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly the published events were delivered"
         );
 
-        // Drain one slot, then a later event is delivered to the same sub.
-        assert!(rx.try_recv().is_ok());
-        publish_discovery(&mut subs, mk(4));
-        assert_eq!(subs.len(), 1, "subscriber still live after draining");
-
         // Dropping the receiver closes the channel → subscriber removed.
+        // Caller cancellation is the only removal trigger.
         drop(rx);
-        publish_discovery(&mut subs, mk(5));
+        publish_discovery(&mut subs, mk(1));
         assert!(
             subs.is_empty(),
             "a closed receiver must unsubscribe the discovery operation"
@@ -3745,8 +3757,8 @@ mod tests {
     fn changed_emits_proto_scoped_timeout_then_online() {
         let server = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)), 5075);
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 9)), 5076);
-        let (tx, mut rx) = mpsc::channel::<Discovered>(8);
-        let mut subs: Vec<mpsc::Sender<Discovered>> = vec![tx];
+        let (tx, mut rx) = mpsc::unbounded_channel::<Discovered>();
+        let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = vec![tx];
 
         let poke = emit_beacon_action(
             BeaconAction::Changed {
@@ -3838,7 +3850,7 @@ mod tests {
             let (mut pending, mut by_name, _rx) = make_pending();
             let beacons = BeaconTracker::new();
             let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
-            let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+            let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = Vec::new();
             let mut poke = false;
             handle_search_response(
                 &found_true(proto),
@@ -3861,7 +3873,7 @@ mod tests {
         let (mut pending, mut by_name, mut rx) = make_pending();
         let beacons = BeaconTracker::new();
         let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
-        let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+        let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = Vec::new();
         let mut poke = false;
         handle_search_response(
             &found_true("tcp"),
@@ -3927,8 +3939,8 @@ mod tests {
         // Returns (Discovered::Online fired, server entered the tracker).
         let run = |frame: &[u8]| -> (bool, bool) {
             let beacons = BeaconTracker::new();
-            let (tx, mut rx) = mpsc::channel::<Discovered>(8);
-            let mut subs: Vec<mpsc::Sender<Discovered>> = vec![tx];
+            let (tx, mut rx) = mpsc::unbounded_channel::<Discovered>();
+            let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = vec![tx];
             let mut poke = false;
             handle_beacon(frame, &beacons, &mut subs, &mut poke, peer);
             let server = SocketAddr::new(peer.ip(), 5075);
@@ -4160,8 +4172,8 @@ mod tests {
         // An active discover() subscriber — required for the discovery-pong
         // branch to fire at all (pvxs `!discoverers.empty()`,
         // client.cpp:889). Keep `_rxd` alive so the channel stays open.
-        let (txd, _rxd) = mpsc::channel::<Discovered>(8);
-        let mut subs: Vec<mpsc::Sender<Discovered>> = vec![txd];
+        let (txd, _rxd) = mpsc::unbounded_channel::<Discovered>();
+        let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = vec![txd];
         let mut poke = false;
         // found=false (empty cids), seq == SEARCH_SEQ, fresh GUID → a New
         // beacon identity → should_poke.

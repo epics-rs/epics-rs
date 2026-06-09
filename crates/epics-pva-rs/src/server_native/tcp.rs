@@ -2954,6 +2954,36 @@ async fn handle_connection_io(
                             let ctx = channel_lifecycle_ctx(peer, &ch.open_cred);
                             ch.source.notify_channel_open(&ch.name, &ctx);
                         }
+                        // The attach hook above can lazily open a SharedPV that
+                        // was still closed when the resolver snapshotted its
+                        // descriptor (`resolved.intro == None`), e.g.
+                        // `on_first_connect(|p| p.open(...))` (pvxs
+                        // `sharedpv.cpp:299-313` runs `onFirstConnect` on the
+                        // empty->non-empty channel edge). pvxs serves later
+                        // operations from the owner's post-open descriptor; bind
+                        // the owner, drive its open hook, THEN obtain and cache
+                        // the descriptor from that SAME owner — so a GET / PUT /
+                        // MONITOR INIT reads a real prototype instead of replying
+                        // "must provide prototype" against a PV the hook just
+                        // opened. Only fires when the snapshot was absent; an
+                        // already-resolved descriptor (the common case) is left
+                        // untouched, so this adds no source round-trip for a PV
+                        // that was open at resolve time.
+                        let refresh = channels.get(&cc.sid).and_then(|ch| {
+                            ch.introspection.is_none().then(|| {
+                                (
+                                    ch.source.clone(),
+                                    ch.name.clone(),
+                                    channel_lifecycle_ctx(peer, &ch.open_cred),
+                                )
+                            })
+                        });
+                        if let Some((owner, name, ctx)) = refresh
+                            && let Some(intro) = owner.get_introspection_checked(&name, ctx).await
+                            && let Some(ch) = channels.get_mut(&cc.sid)
+                        {
+                            ch.introspection = Some(intro);
+                        }
                     } else {
                         // CREATE_CHANNEL failure sid must be the
                         // no-channel sentinel 0xFFFFFFFF (pvxs

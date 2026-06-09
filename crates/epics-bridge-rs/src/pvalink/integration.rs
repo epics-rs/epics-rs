@@ -351,6 +351,13 @@ impl PvaLinkResolver {
         // (`pvxs/ioc/pvalink.h:65`). The registry key shares the channel
         // by (pv_name, pipeline, queue_size) per `pvxs/ioc/pvalink.h:116`.
         self.link_options.write().insert(options_key, cfg.clone());
+        // Record the owning record on this channel's back-index (every
+        // INP link, not just CP/CPP scan targets) so `dbpvar` can filter
+        // channels by record-name glob, matching pvxs's
+        // `pvaLinkChannel::links` (`pvalink.cpp:213-243`).
+        if let Some(rec) = &record {
+            self.registry.attach_record(&cfg, rec);
+        }
         // B3: register the scan-on-update target before opening so the
         // forwarder spawned below already sees it. Keyed by the monitor
         // variant identity, NOT bare PV name, so a `Q=1` record's scan
@@ -610,11 +617,15 @@ impl PvaLinkResolver {
     ///
     /// Mirrors [`Self::open_link`] for the OUT direction. pvxs equivalent:
     /// `pvaLinkConfig` carried on the `jlink` (pvalink_jlif.cpp).
-    pub async fn open_out_link(&self, link_string: &str) -> PvaLinkResult<Arc<PvaLink>> {
+    pub async fn open_out_link(
+        &self,
+        link_string: &str,
+        record: Option<&str>,
+    ) -> PvaLinkResult<Arc<PvaLink>> {
         let cfg = PvaLinkConfig::parse(link_string, LinkDirection::Out)?;
         // key by full link string (same rationale as open_link_inner).
         let options_key = strip_scheme(link_string).unwrap_or(link_string).to_string();
-        self.open_out_cfg(cfg, options_key).await
+        self.open_out_cfg(cfg, options_key, record).await
     }
 
     /// OUT counterpart of [`Self::open_json_link_for_record`]: open an
@@ -628,9 +639,10 @@ impl PvaLinkResolver {
         &self,
         pv: &str,
         options: &[(String, String)],
+        record: Option<&str>,
     ) -> PvaLinkResult<Arc<PvaLink>> {
         let cfg = PvaLinkConfig::from_jlink_options(pv, options, LinkDirection::Out)?;
-        self.open_out_cfg(cfg, pv.to_string()).await
+        self.open_out_cfg(cfg, pv.to_string(), record).await
     }
 
     /// Register an OUT link's options under `options_key` and open/cache
@@ -642,6 +654,7 @@ impl PvaLinkResolver {
         &self,
         cfg: PvaLinkConfig,
         options_key: String,
+        record: Option<&str>,
     ) -> PvaLinkResult<Arc<PvaLink>> {
         // `local`-admission gate before any registration or open, so a
         // rejected `local=true` OUT link leaves no stale option entry and
@@ -651,6 +664,11 @@ impl PvaLinkResolver {
         self.out_link_options
             .write()
             .insert(options_key, cfg.clone());
+        // Back-index the owning record for `dbpvar`'s record-name glob
+        // filter (pvxs `pvaLinkChannel::links`).
+        if let Some(rec) = record {
+            self.registry.attach_record(&cfg, rec);
+        }
         self.registry.get_or_open(cfg).await
     }
 
@@ -861,7 +879,7 @@ pub async fn install_pvalink_resolver(
                     }
                     let link_str = format!("pva://{s}");
                     if field_name == "OUT" {
-                        let _ = resolver.open_out_link(&link_str).await;
+                        let _ = resolver.open_out_link(&link_str, Some(&record_name)).await;
                     } else {
                         let _ = resolver.open_link_for_record(&link_str, &record_name).await;
                     }
@@ -874,7 +892,9 @@ pub async fn install_pvalink_resolver(
                 // plain `Pva`), so there is no bare-PV early-out here.
                 ParsedLink::PvaJson(j) => {
                     if field_name == "OUT" {
-                        let _ = resolver.open_json_out_link(&j.pv, &j.options).await;
+                        let _ = resolver
+                            .open_json_out_link(&j.pv, &j.options, Some(&record_name))
+                            .await;
                     } else {
                         let _ = resolver
                             .open_json_link_for_record(&j.pv, &j.options, &record_name)
@@ -3053,7 +3073,7 @@ mod tests {
         let db = Arc::new(PvDatabase::new());
         let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
         let r = resolver
-            .open_out_link("pva://NOT:A:LOCAL:RECORD?local=true")
+            .open_out_link("pva://NOT:A:LOCAL:RECORD?local=true", None)
             .await;
         assert!(
             matches!(r, Err(PvaLinkError::NotLocal(_))),
@@ -3072,6 +3092,7 @@ mod tests {
             .open_json_out_link(
                 "NOT:A:LOCAL:RECORD",
                 &[("local".to_string(), "true".to_string())],
+                None,
             )
             .await;
         assert!(
@@ -3118,7 +3139,7 @@ mod tests {
         let db = Arc::new(PvDatabase::new());
         let resolver = install_pvalink_resolver(&db, tokio::runtime::Handle::current()).await;
         // Non-local sibling opens fine and caches the shared owner.
-        let opened = resolver.open_out_link("pva://SHARED:REMOTE:PV").await;
+        let opened = resolver.open_out_link("pva://SHARED:REMOTE:PV", None).await;
         assert!(
             opened.is_ok(),
             "non-local OUT link must open, got {:?}",
@@ -3126,7 +3147,7 @@ mod tests {
         );
         // A later local=true link to the same PV must NOT reuse it.
         let gated = resolver
-            .open_out_link("pva://SHARED:REMOTE:PV?local=true")
+            .open_out_link("pva://SHARED:REMOTE:PV?local=true", None)
             .await;
         assert!(
             matches!(gated, Err(PvaLinkError::NotLocal(_))),

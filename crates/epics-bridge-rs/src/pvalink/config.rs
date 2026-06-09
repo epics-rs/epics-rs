@@ -115,18 +115,20 @@ impl ProcMode {
     }
 
     /// INP scan-on-update derivation: `(scan_on_update, scan_on_passive)`.
-    /// `Pp` / `Cp` / `Cpp` all scan on monitor updates; `Pp` and `Cpp`
-    /// gate on the owning record being Passive, `Cp` always fires.
-    /// Mirrors the pvxs scan-list builder
-    /// (`pva2pva/pdbApp/pvalink_channel.cpp:393-397`): it skips only
-    /// `NPP`/`Default` (`pp != PP && pp != CPP && pp != CP → continue`)
-    /// and sets `scan_check_passive = pp != CP`, i.e. passive-only for
-    /// every scanning mode except `CP`.
+    /// Only `Cp` and `Cpp` are monitor scan modes; `Cp` always fires and
+    /// `Cpp` gates on the owning record being Passive. `Pp` is *not* a
+    /// scan mode for an INP link.
+    /// Mirrors pvxs/ioc `pvaLink::scanOnUpdate()`
+    /// (`pvalink_link.cpp:122-134`): it returns `scanOnUpdateYes` only for
+    /// `CP`, `scanOnUpdatePassive` only for `CPP`, and `scanOnUpdateNo`
+    /// for every other mode (including `PP`/`NPP`/`Default`), so a `PP`
+    /// INP link never registers in the monitor-event scan lists and only
+    /// drives the OUT-side `record._options.process` request.
     pub fn inp_scan(self) -> (bool, bool) {
         match self {
             ProcMode::Cp => (true, false),
-            ProcMode::Pp | ProcMode::Cpp => (true, true),
-            ProcMode::Default | ProcMode::Npp => (false, false),
+            ProcMode::Cpp => (true, true),
+            ProcMode::Pp | ProcMode::Default | ProcMode::Npp => (false, false),
         }
     }
 }
@@ -714,15 +716,16 @@ mod tests {
         assert_eq!(cpp.proc.put_process_request(), "true");
     }
 
-    /// `PP` (`proc=PP`, `proc=true`, and the legacy bare `PP` suffix)
-    /// must register a passive-only INP scan target — pvxs scans
-    /// `PP`/`CP`/`CPP` INP links and gates `PP`/`CPP` on Passive
-    /// (`pva2pva/pdbApp/pvalink_channel.cpp:393-397`). Pre-fix `PP`
-    /// returned `(false, false)` from `inp_scan` and stayed PUT-only.
+    /// `PP` (`proc=PP`, `proc=true`, and the legacy bare `PP` suffix) is
+    /// NOT an INP monitor scan mode under the pvxs/ioc pvalink dialect:
+    /// `pvaLink::scanOnUpdate()` (`pvalink_link.cpp:122-134`) returns
+    /// `scanOnUpdateNo` for everything except `CP`/`CPP`, so a `PP` INP
+    /// link never registers a scan target and only carries the OUT-side
+    /// `record._options.process` request.
     #[test]
-    fn pp_inp_registers_passive_only_scan() {
-        // canonical NT scan flags
-        assert_eq!(ProcMode::Pp.inp_scan(), (true, true));
+    fn pp_inp_does_not_register_scan() {
+        // PP is not a scan mode for INP links.
+        assert_eq!(ProcMode::Pp.inp_scan(), (false, false));
         // still requests remote processing on PUT
         assert_eq!(ProcMode::Pp.put_process_request(), "true");
 
@@ -730,10 +733,16 @@ mod tests {
             let c = PvaLinkConfig::parse(s, LinkDirection::Inp).unwrap();
             assert_eq!(c.proc, ProcMode::Pp, "{s}");
             assert!(
-                c.scan_on_update && c.scan_on_passive && c.monitor,
-                "{s}: PP must be a passive-only scan target"
+                !c.scan_on_update && !c.scan_on_passive,
+                "{s}: PP must not register an INP scan target"
             );
         }
+
+        // CP/CPP remain the only INP scan modes.
+        let cp = PvaLinkConfig::parse("pva://X?proc=CP", LinkDirection::Inp).unwrap();
+        assert!(cp.scan_on_update && !cp.scan_on_passive && cp.monitor);
+        let cpp = PvaLinkConfig::parse("pva://X?proc=CPP", LinkDirection::Inp).unwrap();
+        assert!(cpp.scan_on_update && cpp.scan_on_passive && cpp.monitor);
 
         // NPP / Default never scan.
         let npp = PvaLinkConfig::parse("pva://X?proc=NPP", LinkDirection::Inp).unwrap();

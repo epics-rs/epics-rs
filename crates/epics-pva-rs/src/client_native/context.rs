@@ -33,7 +33,7 @@ use super::ops_v2::{
     op_monitor_raw_frames_handle, op_monitor_raw_frames_handle_with_request, op_process,
     op_process_with_request, op_process_with_request_value, op_put, op_put_get, op_rpc,
 };
-use super::search_engine::SearchEngine;
+use super::search_engine::{ClientSearchConfig, SearchEngine};
 
 /// The empty pvRequest pvxs sends by default for a parameterless RPC
 /// (`pvRequest()` — an empty top-level structure). Used as the RPC
@@ -130,6 +130,18 @@ pub struct PvaClientBuilder {
     /// pvxs, which keeps no client-side RX message-size limit. `Some(n)`
     /// drops any connection whose server announces a payload over `n`.
     max_message_size: Option<usize>,
+    /// Per-client UDP SEARCH config (address list / auto-addr-list /
+    /// broadcast & server ports). Defaults to the `EPICS_PVA_*`
+    /// environment (pvxs `Config::fromEnv`); a caller can override any
+    /// field via [`PvaClientBuilder::addr_list`] et al. pva2pva treats
+    /// these as UDP SEARCH targets on the broadcast port, distinct from
+    /// the TCP [`Self::name_servers`].
+    search_config: ClientSearchConfig,
+    /// True once any UDP-search knob was overridden programmatically.
+    /// Forces a per-client engine even under `share_udp(true)`, since
+    /// the process-wide engine reads the environment and cannot carry a
+    /// caller's per-client address list.
+    search_config_overridden: bool,
 }
 
 impl PvaClientBuilder {
@@ -149,6 +161,8 @@ impl PvaClientBuilder {
             share_udp: false,
             asserted_identity: None,
             max_message_size: None,
+            search_config: ClientSearchConfig::from_env(),
+            search_config_overridden: false,
         }
     }
 
@@ -197,6 +211,53 @@ impl PvaClientBuilder {
     /// `new()` time.
     pub fn name_servers(mut self, servers: Vec<SocketAddr>) -> Self {
         self.name_servers = servers;
+        self
+    }
+
+    /// Per-client UDP SEARCH destinations — pvxs `Config::addressList`
+    /// ("addresses to which search requests will be sent", client.h:1011-1017).
+    /// A client's address list is the set of targets that SEARCH datagrams are
+    /// sent to on the broadcast port, NOT TCP name servers (those are a
+    /// separate `Config::nameServers`, client.h:1024-1027 → [`Self::name_servers`]).
+    /// Each [`crate::config::Endpoint`] keeps any `@iface` multicast modifier
+    /// so a `224.0.2.3@eth0` group is joined on the right interface. Replaces
+    /// the list parsed from `EPICS_PVA_ADDR_LIST` at `new()` and pins this
+    /// client to its own search engine even under [`Self::share_udp`].
+    pub fn addr_list(mut self, addr_list: Vec<crate::config::Endpoint>) -> Self {
+        self.search_config.addr_list = addr_list;
+        self.search_config_overridden = true;
+        self
+    }
+
+    /// Toggle auto-address-list expansion — pvxs `Config::autoAddrList`
+    /// (client.h:1035-1036, "extend the addressList with local interface
+    /// broadcast addresses"). When true (the default from
+    /// `EPICS_PVA_AUTO_ADDR_LIST`), per-NIC directed broadcasts are added to
+    /// the SEARCH targets. Pins this client to its own search engine even
+    /// under [`Self::share_udp`].
+    pub fn auto_addr_list(mut self, enabled: bool) -> Self {
+        self.search_config.auto_addr_list = enabled;
+        self.search_config_overridden = true;
+        self
+    }
+
+    /// UDP SEARCH / beacon port — pvxs `Config::udp_port` (client.h:1029-1030,
+    /// `EPICS_PVA_BROADCAST_PORT`, default 5076). The port SEARCH datagrams are
+    /// sent to and beacons received on. Pins this client to its own search
+    /// engine even under [`Self::share_udp`].
+    pub fn broadcast_port(mut self, port: u16) -> Self {
+        self.search_config.broadcast_port = port;
+        self.search_config_overridden = true;
+        self
+    }
+
+    /// Default server TCP port — pvxs `Config::tcp_port` (client.h:1031-1033,
+    /// `EPICS_PVA_SERVER_PORT`, default 5075). The connect port for an
+    /// advertised server endpoint that omits a port. Pins this client to its
+    /// own search engine even under [`Self::share_udp`].
+    pub fn server_port(mut self, port: u16) -> Self {
+        self.search_config.server_port = port;
+        self.search_config_overridden = true;
         self
     }
 
@@ -279,6 +340,8 @@ impl PvaClientBuilder {
                 share_udp: self.share_udp,
                 asserted_identity: self.asserted_identity,
                 max_message_size: self.max_message_size,
+                search_config: self.search_config,
+                search_config_overridden: self.search_config_overridden,
             }),
         }
     }
@@ -330,6 +393,13 @@ struct ClientInner {
     /// Stored so `with_asserted_identity` can carry it onto the derived
     /// client's fresh pool. Set on the pool at `build()` time.
     max_message_size: Option<usize>,
+    /// Per-client UDP SEARCH config. Passed to
+    /// [`SearchEngine::spawn_with_config`] when a per-client engine is
+    /// spawned (pvxs `Config` UDP-discovery fields).
+    search_config: ClientSearchConfig,
+    /// True when a UDP-search knob was overridden programmatically, so the
+    /// shared engine (which reads the environment) must not be used.
+    search_config_overridden: bool,
 }
 
 /// Process-wide singleton SearchEngine for `share_udp(true)` clients.
@@ -537,14 +607,18 @@ impl PvaClient {
     async fn search_engine(&self) -> PvaResult<&SearchEngine> {
         // The process-wide shared engine is a single `OnceCell` and cannot
         // carry per-client name_servers (different clients may have
-        // different lists). pvxs keeps `nameServers` per-Context regardless
-        // of `overrideShareUDP` — shareUDP only shares the UDP socket. To
-        // match that and avoid silently dropping configured TCP name
-        // servers, a client that has name servers configured always uses
-        // its own per-client engine (which carries the name-server list),
-        // even when `share_udp(true)` was requested. share_udp still saves
-        // the UDP socket for clients that have no name servers.
-        if self.inner.share_udp && self.inner.name_servers.is_empty() {
+        // different lists) NOR a per-client UDP-search config (address list /
+        // ports / auto-addr-list). pvxs keeps `nameServers` per-Context
+        // regardless of `overrideShareUDP` — shareUDP only shares the UDP
+        // socket. To match that and avoid silently dropping configured TCP
+        // name servers or a programmatic addr_list, a client that has name
+        // servers OR an overridden search config always uses its own
+        // per-client engine, even when `share_udp(true)` was requested.
+        // share_udp still saves the UDP socket for clients that have neither.
+        if self.inner.share_udp
+            && self.inner.name_servers.is_empty()
+            && !self.inner.search_config_overridden
+        {
             let engine = SHARED_SEARCH_ENGINE
                 .get_or_try_init(|| async { SearchEngine::spawn(Vec::new(), Vec::new()).await })
                 .await?;
@@ -553,9 +627,12 @@ impl PvaClient {
         if self.inner.search.get().is_none() {
             // Per-client engine carries the CA credentials so TCP name-server
             // handshakes authenticate as this client's user/host (pvxs has no
-            // name-server auth exception, clientconn.cpp:215-263). The shared
-            // engine above never has name servers, so it needs no credentials.
-            let engine = SearchEngine::spawn_with_auth(
+            // name-server auth exception, clientconn.cpp:215-263) and the
+            // per-client UDP-search config so a caller's `addr_list` / ports
+            // drive the SEARCH path instead of the process environment. The
+            // shared engine above never has either, so it needs neither.
+            let engine = SearchEngine::spawn_with_config(
+                self.inner.search_config.clone(),
                 Vec::new(),
                 self.inner.name_servers.clone(),
                 self.inner.user.clone(),

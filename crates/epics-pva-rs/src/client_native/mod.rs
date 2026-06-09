@@ -25,6 +25,7 @@ pub mod ops_v2;
 pub mod search;
 pub mod search_engine;
 pub mod server_conn;
+pub mod udp;
 
 pub use context::{AssertedIdentity, CacheAction, PvGetResult, PvaClient, PvaClientBuilder};
 pub use operation::PvaOperation;

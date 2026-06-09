@@ -105,27 +105,40 @@ fn menu_index_to_baud_rate(idx: i32) -> i32 {
     }
 }
 
+/// `asynFMT` menu value for ASCII I/O format (`asynFMT_ASCII` in EPICS
+/// `asynRecord.dbd`). On output C escape-translates AOUT; on input the
+/// read destination is the AINP string (`asynRecord.c:1486`,`:1503-1509`).
+const ASYN_FMT_ASCII: i32 = 0;
+
+/// `asynFMT` menu value for Hybrid I/O format (`asynFMT_Hybrid`). On
+/// output C escape-translates the binary BOUT buffer read as a C string;
+/// on input the read destination is the BINP byte buffer
+/// (`asynRecord.c:1491-1495`,`:1507-1510`).
+const ASYN_FMT_HYBRID: i32 = 1;
+
+/// `asynFMT` menu value for binary I/O format (`asynFMT_Binary`). Selects
+/// the raw BOUT / BINP byte buffers over the ASCII AOUT / AINP strings and
+/// suppresses escape translation (`asynRecord.c:1496-1502`).
+const ASYN_FMT_BINARY: i32 = 2;
+
 /// Decode a C-style backslash-escaped string into the raw bytes the
 /// driver layer expects. Mirrors EPICS base's `dbTranslateEscape`
 /// (`libCom/misc/dbTranslateEscape.c`) — supports the standard
 /// escape sequences `\r \n \t \\ \" \0` plus octal `\NNN`. Used by
-/// asynRecord OEOS/IEOS writes (C asynRecord.c:374-393) so a
-/// configured `\r\n` terminator in the DB field reaches the driver
-/// as the two raw bytes `0x0D 0x0A`, not the four-byte literal.
-/// `asynFMT` menu value for binary I/O format — selects the raw BOUT /
-/// BINP byte buffers over the ASCII AOUT / AINP string buffers.
-/// (`asynFMT_Binary` in EPICS `asynRecord.dbd`; ASCII = 0, Hybrid = 1.)
-const ASYN_FMT_BINARY: i32 = 2;
-
-/// `asynFMT` menu value for ASCII I/O format (`asynFMT_ASCII` in EPICS
-/// `asynRecord.dbd`). On the input side C selects the read destination by
-/// IFMT: ASCII reads land in the AINP string, Binary/Hybrid in the BINP
-/// byte buffer (`asynRecord.c:1503-1509`, monitor `:1012-1018`).
-const ASYN_FMT_ASCII: i32 = 0;
-
+/// asynRecord OEOS/IEOS writes (C asynRecord.c:374-393) and ASCII octet
+/// output (`:1489`) so a configured `\r\n` reaches the driver as the two
+/// raw bytes `0x0D 0x0A`, not the four-byte literal.
 fn translate_escape(s: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(s.len());
-    let mut chars = s.bytes().peekable();
+    translate_escape_bytes(s.as_bytes())
+}
+
+/// Byte-oriented core of [`translate_escape`]. C `dbTranslateEscape`
+/// operates on a NUL-terminated C string regardless of encoding; the
+/// Hybrid octet output path (`asynRecord.c:1494`) feeds it the raw binary
+/// BOUT buffer, so the translator must accept arbitrary bytes.
+fn translate_escape_bytes(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut chars = input.iter().copied().peekable();
     while let Some(c) = chars.next() {
         if c != b'\\' {
             out.push(c);
@@ -1185,6 +1198,37 @@ impl AsynRecord {
             .with_timeout(timeout)
     }
 
+    /// Build the octet output payload by `OFMT`, mirroring
+    /// `asynRecord.c:1486-1502`:
+    ///   - ASCII  -> `dbTranslateEscape(AOUT)`: the AOUT string with escape
+    ///     sequences (`\r\n` -> CRLF) translated.
+    ///   - Hybrid -> `dbTranslateEscape(BOUT read as a C string)`: the binary
+    ///     output buffer, escape-translated (stops at the first NUL).
+    ///   - Binary -> raw BOUT, `NOWT` bytes clamped to `OMAX`, no translation.
+    ///
+    /// ASCII/Hybrid emit the full translated buffer; only Binary is
+    /// length-bounded by `NOWT`/`OMAX`. Previously the record sent raw AOUT
+    /// for both ASCII and Hybrid (ASCII shipped literal backslashes, Hybrid
+    /// ignored BOUT) and clamped every mode by `NOWT`.
+    fn octet_output_buffer(&self) -> Vec<u8> {
+        match self.ofmt {
+            ASYN_FMT_BINARY => {
+                let omax = self.omax.max(0) as usize;
+                let nowt = (self.nowt.max(0) as usize).min(omax);
+                self.bout[..nowt.min(self.bout.len())].to_vec()
+            }
+            ASYN_FMT_HYBRID => {
+                let end = self
+                    .bout
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(self.bout.len());
+                translate_escape_bytes(&self.bout[..end])
+            }
+            _ => translate_escape(&self.aout),
+        }
+    }
+
     /// Perform I/O based on TMOD and IFACE.
     fn perform_io(&mut self) -> CaResult<()> {
         let entry = match &self.port_entry {
@@ -1202,23 +1246,8 @@ impl AsynRecord {
         if matches!(tmod, TransferMode::Write | TransferMode::WriteRead) {
             match iface {
                 InterfaceType::Octet => {
-                    // C asynRecord.c selects the output buffer by OFMT:
-                    // Binary (asynFMT_Binary) writes the raw BOUT byte
-                    // array, ASCII / Hybrid write the AOUT string. NOWT
-                    // bytes are written (NOWT defaults to OMAX), not the
-                    // whole buffer. Rust `io_write_octet` is all-or-error,
-                    // so a successful write transferred exactly the slice.
-                    let full: &[u8] = if self.ofmt == ASYN_FMT_BINARY {
-                        &self.bout
-                    } else {
-                        self.aout.as_bytes()
-                    };
-                    let n = if self.nowt > 0 {
-                        (self.nowt as usize).min(full.len())
-                    } else {
-                        full.len()
-                    };
-                    let data = full[..n].to_vec();
+                    let data = self.octet_output_buffer();
+                    let n = data.len();
                     match entry.handle.submit_blocking(
                         crate::request::RequestOp::OctetWrite { data },
                         self.io_user(),
@@ -2340,6 +2369,48 @@ mod tests {
         assert_eq!(translate_escape("\\0"), vec![0x00]);
         // A terminator built from two octal escapes (e.g. CR LF).
         assert_eq!(translate_escape("\\015\\012"), vec![0x0D, 0x0A]);
+    }
+
+    #[test]
+    fn test_octet_output_buffer_by_ofmt() {
+        let mut rec = AsynRecord::default();
+
+        // ASCII: AOUT is escape-translated, full buffer (no NOWT clamp).
+        rec.ofmt = ASYN_FMT_ASCII;
+        rec.aout = "hi\\r\\n".to_string();
+        rec.nowt = 2; // would have truncated under the old all-mode clamp
+        assert_eq!(
+            rec.octet_output_buffer(),
+            vec![b'h', b'i', 0x0D, 0x0A],
+            "ASCII must escape-translate AOUT and ignore NOWT"
+        );
+
+        // Hybrid: BOUT (as a C string) is escape-translated.
+        rec.ofmt = ASYN_FMT_HYBRID;
+        rec.bout = b"x\\t".to_vec();
+        assert_eq!(
+            rec.octet_output_buffer(),
+            vec![b'x', 0x09],
+            "Hybrid must escape-translate the BOUT buffer"
+        );
+        // Hybrid stops at an interior NUL (C-string semantics).
+        rec.bout = b"ab\0cd".to_vec();
+        assert_eq!(rec.octet_output_buffer(), vec![b'a', b'b']);
+
+        // Binary: raw BOUT, no translation, NOWT bytes clamped to OMAX.
+        rec.ofmt = ASYN_FMT_BINARY;
+        rec.bout = vec![b'\\', b'r', 0x00, 0x01, 0x02];
+        rec.omax = 80;
+        rec.nowt = 4;
+        assert_eq!(
+            rec.octet_output_buffer(),
+            vec![b'\\', b'r', 0x00, 0x01],
+            "Binary writes raw BOUT untranslated, NOWT bytes"
+        );
+        // NOWT clamps to OMAX.
+        rec.omax = 3;
+        rec.nowt = 10;
+        assert_eq!(rec.octet_output_buffer(), vec![b'\\', b'r', 0x00]);
     }
 
     #[test]

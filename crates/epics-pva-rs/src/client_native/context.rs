@@ -2543,9 +2543,12 @@ pub struct ConnectBuilder<'a> {
     /// Per-call forced server pinning. Mirrors pvxs
     /// `ConnectBuilder::server(s)` (client.h:952).
     server: Option<SocketAddr>,
-    /// pvxs `syncCancel(bool)` (client.h:950). Selects the teardown the
-    /// returned [`ConnectHandle`] performs on `Drop` — see
-    /// [`ConnectHandle`] for the exact async-Rust mapping.
+    /// Selects how the returned [`ConnectHandle`] stops its watcher on
+    /// `Drop`: `true` aborts (prompt), `false` detaches (graceful). Modeled
+    /// on pvxs `syncCancel(bool)` (client.h:950), but unlike pvxs this flag
+    /// does NOT make `Drop` block — async Rust cannot block in `Drop`. The
+    /// synchronous teardown boundary is [`ConnectHandle::wait`]; see the
+    /// [`ConnectHandle`] docs.
     sync_cancel: bool,
 }
 
@@ -2577,8 +2580,13 @@ impl<'a> ConnectBuilder<'a> {
         self
     }
 
-    /// Mirrors pvxs `ConnectBuilder::syncCancel(b)`. See the field
-    /// docstring for the current semantics.
+    /// Select the `Drop` teardown promptness of the returned
+    /// [`ConnectHandle`]: `true` (the default) aborts the watcher, `false`
+    /// detaches it. Modeled on pvxs `ConnectBuilder::syncCancel(b)`
+    /// (client.h:950), but — unlike pvxs's blocking destructor — neither
+    /// value makes `Drop` synchronous; async Rust cannot block in `Drop`.
+    /// Use [`ConnectHandle::wait`] for a synchronous teardown boundary. See
+    /// the [`ConnectHandle`] docs.
     pub fn sync_cancel(mut self, sync: bool) -> Self {
         self.sync_cancel = sync;
         self
@@ -2731,23 +2739,33 @@ impl<'a> ConnectBuilder<'a> {
 /// Handle returned by [`ConnectBuilder::exec`]. Drop to stop the
 /// watcher task; the channel itself is unaffected.
 ///
-/// pvxs `~Connect()` runs `loop.tryInvoke(syncCancel, ...)`
-/// (client.cpp:255-267): with `syncCancel(true)` (the pvxs default) the
-/// destructor blocks until the worker has removed the connector and any
-/// in-progress callback boundary has completed; with `syncCancel(false)`
-/// it signals and returns. Async Rust cannot block in `Drop` (no `.await`),
-/// so the modes map as follows:
+/// **The synchronous teardown boundary is [`ConnectHandle::wait`], never
+/// `Drop`.** pvxs `~Connect()` runs `loop.tryInvoke(syncCancel, ...)`
+/// (client.cpp:255-267) and, with the default `syncCancel(true)`, *blocks
+/// the destructor* until the worker has removed the connector and any
+/// in-progress callback has completed — so pvxs callback code may borrow
+/// caller-owned state. Async Rust cannot block in `Drop` (no `.await`), so
+/// that blocking destructor has no `Drop` analog here: `wait()` is the
+/// explicit, awaitable equivalent of pvxs `syncCancel(true)` and the only
+/// teardown after which no further callback can fire. (Rust callbacks are
+/// `'static`, so they cannot borrow a caller stack frame the way a pvxs
+/// lambda can — the lifetime hazard pvxs's blocking destructor guards
+/// against is already prevented here by the bound.)
 ///
-/// - `sync_cancel(false)` (async): `Drop` cancels and **detaches** the
-///   watcher. The task observes the cancel token at its next `select!` and
-///   exits cleanly on its own — "signal and return", matching pvxs's
-///   non-blocking mode.
-/// - `sync_cancel(true)` (sync): `Drop` cancels and **aborts** the watcher
-///   for a prompt stop, the closest non-blocking approximation of "no
-///   further callbacks after teardown" (our callbacks are synchronous
+/// `Drop` is therefore **always asynchronous cancellation** — it never
+/// blocks for an in-progress callback. The [`ConnectBuilder::sync_cancel`]
+/// flag only selects how promptly the detached watcher stops, not whether
+/// `Drop` waits:
+///
+/// - `sync_cancel(false)`: `Drop` cancels and **detaches** the watcher. The
+///   task observes the cancel token at its next `select!` and winds down
+///   cleanly on its own.
+/// - `sync_cancel(true)` (the builder default): `Drop` cancels and
+///   **aborts** the watcher for a prompt stop. Callbacks are synchronous
 ///   `Fn()` invoked between `await` points, so an abort cannot tear one
-///   apart mid-call). For a guaranteed await-for-completion boundary, call
-///   [`ConnectHandle::wait`] instead of relying on `Drop`.
+///   apart mid-call, but `Drop` still returns before a concurrently-running
+///   callback finishes. For a guaranteed await-for-completion boundary, call
+///   [`ConnectHandle::wait`].
 pub struct ConnectHandle {
     cancel: tokio_util::sync::CancellationToken,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -3104,6 +3122,81 @@ mod tests {
         assert!(
             !did_complete.load(Ordering::SeqCst),
             "sync sync_cancel(true) Drop must abort the task before its pending work completes"
+        );
+    }
+
+    /// pvxs `syncCancel(true)` blocks the destructor until any in-progress
+    /// callback completes; async Rust cannot block in `Drop`, so only
+    /// `wait()` provides that boundary. This proves the contract directly:
+    /// with the watcher parked mid-work, dropping a default
+    /// (`sync_cancel(true)`) handle returns WITHOUT the parked work having
+    /// finished, while `wait()` awaits full task termination.
+    #[tokio::test]
+    async fn connect_handle_only_wait_bounds_callback_completion() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio_util::sync::CancellationToken;
+
+        // Drop path (default sync_cancel = true). The task parks at a gate
+        // (standing in for an in-progress callback) and only sets `finished`
+        // after the gate opens. `Drop` aborts at the await point and returns
+        // immediately, so `finished` must still be false right after it —
+        // `Drop` is not a synchronous completion boundary.
+        let cancel = CancellationToken::new();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let handle = ConnectHandle {
+            cancel: cancel.clone(),
+            task: Some(tokio::spawn({
+                let g = gate.clone();
+                let s = started.clone();
+                let f = finished.clone();
+                async move {
+                    s.store(true, Ordering::SeqCst);
+                    g.notified().await;
+                    f.store(true, Ordering::SeqCst);
+                }
+            })),
+            sync_cancel: true,
+        };
+        for _ in 0..100 {
+            if started.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(
+            started.load(Ordering::SeqCst),
+            "task must have reached the gate"
+        );
+        drop(handle);
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "default sync_cancel(true) Drop must NOT block until the parked work completes"
+        );
+
+        // wait() path. The task completes its work once cancelled; after
+        // `wait()` returns, that work has run — wait() is the boundary.
+        let cancel2 = CancellationToken::new();
+        let done = Arc::new(AtomicBool::new(false));
+        let handle2 = ConnectHandle {
+            cancel: cancel2.clone(),
+            task: Some(tokio::spawn({
+                let c = cancel2.clone();
+                let d = done.clone();
+                async move {
+                    c.cancelled().await;
+                    d.store(true, Ordering::SeqCst);
+                }
+            })),
+            sync_cancel: false,
+        };
+        tokio::time::timeout(Duration::from_secs(2), handle2.wait())
+            .await
+            .expect("wait() must terminate synchronously, not hang");
+        assert!(
+            done.load(Ordering::SeqCst),
+            "wait() must await full task termination — the synchronous boundary"
         );
     }
 

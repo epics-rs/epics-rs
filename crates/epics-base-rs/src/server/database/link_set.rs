@@ -206,6 +206,31 @@ pub trait LinkSet: Send + Sync {
         Err("link set is read-only".into())
     }
 
+    /// Fire `name`'s forward link (FLNK): trigger the remote target to
+    /// process, transferring no value.
+    ///
+    /// The lset counterpart of C `dbScanFwdLink` → `lset->scanForward`
+    /// (`dbLink.c:475`), realised by the pvalink lset as `pvaScanForward`
+    /// (`pvxs/ioc/pvalink_lset.cpp:672-688`). A forward link is never
+    /// deferred ("FWD_LINK is never deferred, and always results in a
+    /// Put") and carries no staged value: it forces the remote record to
+    /// process when the source record fires its FLNK.
+    ///
+    /// The lset applies the same non-retry validity gate pvxs does
+    /// (`pvalink_lset.cpp:677`): on a non-retry link that is not currently
+    /// connected it performs NO trigger and returns `Err`, so the caller
+    /// raises LINK/INVALID on the owning record — pvxs calls
+    /// `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM, "Disconn")` there.
+    ///
+    /// Default impl: `Ok(())` no-op. A read-only or DB-local lset
+    /// forwards nothing through this hook — a DB FLNK target is processed
+    /// directly by the database's `scanOnce` path (the DB lset's
+    /// `scanForward`), not through an external link set.
+    fn scan_forward(&self, name: &str) -> Result<(), String> {
+        let _ = name;
+        Ok(())
+    }
+
     /// Flush any OUT-link writes the lset has queued but not yet sent —
     /// the production drain trigger for an async OUT channel owner.
     ///

@@ -14,6 +14,8 @@
 
 use std::collections::HashMap;
 
+use epics_base_rs::server::record::JlinkValue;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LinkDirection {
     /// Record reads from the remote PV (INP-style).
@@ -254,12 +256,13 @@ impl PvaLinkConfig {
             return Err(PvaLinkParseError::EmptyPv);
         }
 
-        // `opts` is an already-structured option map (split from the
-        // `?key=value` query here, or handed in verbatim as JLink
-        // members via [`Self::from_jlink_options`]). The query string is
-        // never reconstructed — both entry points apply the same
-        // structured map through the single [`Self::apply_options`]
-        // owner.
+        // `opts` is the convenience-URI option map split from the
+        // `?key=value` query above. This is the Rust-extension path:
+        // string values, lenient `yes`/`no` booleans. It is applied
+        // through [`Self::apply_options`]. The structured-JSON JLink path
+        // ([`Self::from_jlink_options`]) does NOT come through here — it
+        // dispatches by JSON value KIND to stay pvxs-faithful, so a
+        // string on a boolean key is ignored rather than coerced.
         let mut cfg = Self::apply_options(pv_name, &opts, direction);
 
         // Apply legacy bare modifiers
@@ -318,33 +321,132 @@ impl PvaLinkConfig {
     ///
     /// pvxs parses pvalink options only as JLink map keys / typed values
     /// (`pvalink_jlif.cpp:69-196`) — there is no `?key=value` URI query
-    /// parser in the JLink callback table (`:286-300`). The structured
-    /// `(key, value)` pairs carry the same option vocabulary the query
-    /// parser produces, so they feed the identical
-    /// [`Self::apply_options`] owner directly. This is the pvxs-parity
-    /// path (BRIDGE-RS-2026-05-28-107); [`Self::parse`] remains the Rust
-    /// convenience-URI path.
+    /// parser in the JLink callback table (`:286-300`). pvxs dispatches
+    /// each option STRICTLY by its JSON value KIND through distinct
+    /// callbacks (`pva_parse_{null,bool,integer,string}`, wired at
+    /// `:286-300`). This path reproduces that dispatch via
+    /// [`Self::apply_jlink_option`]; it does NOT share the
+    /// convenience-URI [`Self::apply_options`], which collapses every
+    /// value to text and accepts lenient `yes`/`no` booleans. Keeping the
+    /// two paths separate is the structural reason a JSON string on a
+    /// boolean key (`pipeline:"yes"`) is IGNORED here, exactly as pvxs
+    /// ignores it (`pva_parse_string` unknown-key branch, `:189-191`),
+    /// instead of being honored as a Rust extension. [`Self::parse`]
+    /// remains the Rust convenience-URI path.
     pub fn from_jlink_options(
         pv_name: &str,
-        options: &[(String, String)],
+        options: &[(String, JlinkValue)],
         direction: LinkDirection,
     ) -> Result<Self, PvaLinkParseError> {
         let pv_name = pv_name.trim();
         if pv_name.is_empty() {
             return Err(PvaLinkParseError::EmptyPv);
         }
-        let opts: HashMap<String, String> = options.iter().cloned().collect();
-        Ok(Self::apply_options(pv_name, &opts, direction))
+        let mut cfg = PvaLinkConfig {
+            pv_name: pv_name.to_string(),
+            direction,
+            ..PvaLinkConfig::defaults_for(pv_name, direction)
+        };
+        for (key, val) in options {
+            Self::apply_jlink_option(&mut cfg, pv_name, key, val);
+        }
+        // `proc` CP/CPP imply an open monitor + INP scan-on-update.
+        // Derive the scan flags from the FINAL `proc` value (pvxs builds
+        // its scan list at open() time from the parsed config,
+        // `pvalink_channel.cpp:393-397`, not per-option), so a `proc:"CP"`
+        // forces the monitor on regardless of option order.
+        let (sou, sop) = cfg.proc.inp_scan();
+        if sou {
+            cfg.monitor = true;
+            cfg.scan_on_update = true;
+            cfg.scan_on_passive = sop;
+        }
+        Ok(cfg)
     }
 
-    /// The single owner of "structured option map → [`PvaLinkConfig`]".
+    /// Apply ONE JLink option, dispatching by its JSON value KIND exactly
+    /// as pvxs's pvalink callback table does (pvxs `ioc/pvalink_jlif.cpp`):
+    /// `pva_parse_bool` (`:90-122`) for booleans, `pva_parse_integer`
+    /// (`:124-141`) for integers, `pva_parse_string` (`:143-197`) for
+    /// strings, `pva_parse_null` (`:69-88`) for null.
     ///
-    /// Both [`Self::parse`] (after splitting the `?key=value` query) and
-    /// [`Self::from_jlink_options`] (with verbatim JLink members) apply
-    /// every option through here, so the query and structured-JSON paths
-    /// can never diverge in how an option maps to a config field. Legacy
-    /// bare modifiers (`PP`/`MS`/…) are NOT handled here — they exist
-    /// only on the convenience-URI path and are applied by `parse`.
+    /// A value whose kind does not match the key's accepting callback —
+    /// a string `pipeline:"yes"` (boolean-only key), or a string
+    /// `proc:"true"` that is not one of `CP`/`CPP`/`PP`/`NPP` — falls
+    /// through that callback's unknown branch and is IGNORED, never
+    /// coerced. The boolean shorthands `proc:true`/`proc:false`
+    /// (→`PP`/`NPP`) and `sevr:true`/`sevr:false` (→`MS`/`NMS`) come from
+    /// `pva_parse_bool` (`:96-99`), so they are accepted only as JSON
+    /// booleans, not as the strings `"true"`/`"false"`. Options that are
+    /// not pvxs JLink keys at all (`monitor`, `notify`, `scan_on_update`,
+    /// `queueSize`) are likewise ignored — those exist only on the
+    /// convenience-URI [`Self::apply_options`] path.
+    fn apply_jlink_option(cfg: &mut PvaLinkConfig, pv_name: &str, key: &str, val: &JlinkValue) {
+        match val {
+            JlinkValue::Bool(b) => match key {
+                "proc" => cfg.proc = if *b { ProcMode::Pp } else { ProcMode::Npp },
+                "sevr" => cfg.sevr = if *b { SevrMode::Ms } else { SevrMode::Nms },
+                "defer" => cfg.defer = *b,
+                "pipeline" => cfg.pipeline = *b,
+                "time" => cfg.time = *b,
+                "retry" => cfg.retry = *b,
+                "local" => cfg.local = *b,
+                "always" => cfg.always = *b,
+                "atomic" => cfg.atomic = *b,
+                _ => warn_ignored_jlink(pv_name, key, val),
+            },
+            JlinkValue::Int(n) => match key {
+                // pvxs clamps `Q < 1` to 1 (pvalink_jlif.cpp:129-130).
+                "Q" => cfg.queue_size = if *n < 1 { 1 } else { *n as usize },
+                // pvxs clamps monorder to [-1024, 1024] (`:131-132`).
+                "monorder" => cfg.monorder = (*n).clamp(-1024, 1024) as i32,
+                _ => warn_ignored_jlink(pv_name, key, val),
+            },
+            JlinkValue::Str(s) => match key {
+                "field" => cfg.field = s.clone(),
+                // CASE-SENSITIVE enum strings (pva_parse_string
+                // :156-170): only CP/CPP/PP/NPP and the empty string
+                // (→Default) are recognized; anything else (incl. a
+                // lowercase typo, or the literal "true") is ignored.
+                "proc" => match s.as_str() {
+                    "" => cfg.proc = ProcMode::Default,
+                    "CP" => cfg.proc = ProcMode::Cp,
+                    "CPP" => cfg.proc = ProcMode::Cpp,
+                    "PP" => cfg.proc = ProcMode::Pp,
+                    "NPP" => cfg.proc = ProcMode::Npp,
+                    _ => warn_ignored_jlink(pv_name, key, val),
+                },
+                // pva_parse_string :172-187: NMS/MS/MSI, MSS aliased to MS.
+                "sevr" => match s.as_str() {
+                    "NMS" => cfg.sevr = SevrMode::Nms,
+                    "MS" => cfg.sevr = SevrMode::Ms,
+                    "MSI" => cfg.sevr = SevrMode::Msi,
+                    "MSS" => cfg.sevr = SevrMode::Ms,
+                    _ => warn_ignored_jlink(pv_name, key, val),
+                },
+                _ => warn_ignored_jlink(pv_name, key, val),
+            },
+            JlinkValue::Null => match key {
+                // pva_parse_null :74-83.
+                "proc" => cfg.proc = ProcMode::Default,
+                "sevr" => cfg.sevr = SevrMode::Nms,
+                "local" => cfg.local = false,
+                _ => warn_ignored_jlink(pv_name, key, val),
+            },
+        }
+    }
+
+    /// The single owner of "convenience-URI option map →
+    /// [`PvaLinkConfig`]".
+    ///
+    /// Used ONLY by [`Self::parse`] (after splitting the `?key=value`
+    /// query). This is the Rust-extension path: every value is a string
+    /// and booleans accept lenient `yes`/`no`. The pvxs-parity
+    /// structured-JSON path is [`Self::from_jlink_options`] /
+    /// [`Self::apply_jlink_option`], which dispatches by JSON value KIND
+    /// and does NOT come through here. Legacy bare modifiers (`PP`/`MS`/…)
+    /// are NOT handled here — they exist only on the convenience-URI path
+    /// and are applied by `parse`.
     fn apply_options(
         pv_name: &str,
         opts: &HashMap<String, String>,
@@ -533,6 +635,19 @@ fn apply_or_warn<T>(
 /// each parse callback `log_warn_printf`s an unknown/unparseable key or
 /// value and returns `jlif_continue`, so one bad option never discards
 /// the rest of the link.
+/// Warn that a JLink option was ignored, rendering its JSON value KIND
+/// in the log so a kind mismatch (`pipeline:"yes"` vs `pipeline:true`)
+/// is visible. Delegates to [`warn_ignored_option`].
+fn warn_ignored_jlink(pv: &str, key: &str, val: &JlinkValue) {
+    let rendered = match val {
+        JlinkValue::Null => "null".to_string(),
+        JlinkValue::Bool(b) => b.to_string(),
+        JlinkValue::Int(n) => n.to_string(),
+        JlinkValue::Str(s) => format!("\"{s}\""),
+    };
+    warn_ignored_option(pv, key, &rendered);
+}
+
 fn warn_ignored_option(pv: &str, key: &str, value: &str) {
     tracing::warn!(
         target: "pvalink",
@@ -591,6 +706,97 @@ mod tests {
         assert_eq!(c.proc, ProcMode::Default);
         // `time` defaults to false to match pvxs.
         assert!(!c.time);
+    }
+
+    // ---- JLink (structured `{pva:{...}}`) option kind dispatch ----
+    //
+    // pvxs routes each pvalink option strictly by its JSON value KIND
+    // (pvalink_jlif.cpp:286-300): a boolean key reached with a string,
+    // or a string key reached with a non-enum string, is IGNORED. These
+    // assert `from_jlink_options` reproduces that, NOT the lenient
+    // convenience-URI behavior (which accepts `yes`/`no` and `"true"`).
+
+    fn jlink(pv: &str, opts: Vec<(&str, JlinkValue)>) -> PvaLinkConfig {
+        let owned: Vec<(String, JlinkValue)> =
+            opts.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        PvaLinkConfig::from_jlink_options(pv, &owned, LinkDirection::Inp).unwrap()
+    }
+
+    #[test]
+    fn jlink_bool_pipeline_is_honored() {
+        let c = jlink("X", vec![("pipeline", JlinkValue::Bool(true))]);
+        assert!(
+            c.pipeline,
+            "JSON boolean pipeline:true must enable pipeline"
+        );
+    }
+
+    #[test]
+    fn jlink_string_on_bool_key_is_ignored() {
+        // `pipeline:"yes"` is a JSON string on a boolean-only key. pvxs's
+        // pva_parse_string ignores it (pvalink_jlif.cpp:189-191); the
+        // convenience-URI path would have accepted "yes" as true.
+        let c = jlink("X", vec![("pipeline", JlinkValue::Str("yes".to_string()))]);
+        assert!(
+            !c.pipeline,
+            "JSON string pipeline:\"yes\" must be ignored, not coerced to true"
+        );
+    }
+
+    #[test]
+    fn jlink_bool_proc_true_is_pp() {
+        let c = jlink("X", vec![("proc", JlinkValue::Bool(true))]);
+        assert_eq!(c.proc, ProcMode::Pp, "proc:true → PP (pva_parse_bool)");
+    }
+
+    #[test]
+    fn jlink_string_proc_true_is_ignored() {
+        // pva_parse_string accepts only CP/CPP/PP/NPP/empty for `proc`;
+        // "true" is unknown and ignored (pvalink_jlif.cpp:156-170). The
+        // convenience-URI applier mapped the string "true" → PP.
+        let c = jlink("X", vec![("proc", JlinkValue::Str("true".to_string()))]);
+        assert_eq!(
+            c.proc,
+            ProcMode::Default,
+            "proc:\"true\" (string) must be ignored, not mapped to PP"
+        );
+    }
+
+    #[test]
+    fn jlink_string_proc_cp_sets_scan() {
+        let c = jlink("X", vec![("proc", JlinkValue::Str("CP".to_string()))]);
+        assert_eq!(c.proc, ProcMode::Cp);
+        assert!(c.scan_on_update, "CP → scan_on_update");
+        assert!(c.monitor, "CP → open monitor");
+    }
+
+    #[test]
+    fn jlink_int_q_sets_queue_but_string_q_ignored() {
+        let c = jlink("X", vec![("Q", JlinkValue::Int(8))]);
+        assert_eq!(c.queue_size, 8, "Q:8 (integer) sets the queue size");
+
+        let default_q = PvaLinkConfig::defaults_for("X", LinkDirection::Inp).queue_size;
+        let c = jlink("X", vec![("Q", JlinkValue::Str("8".to_string()))]);
+        assert_eq!(
+            c.queue_size, default_q,
+            "Q:\"8\" (string) is ignored — pvxs Q accepts only an integer"
+        );
+    }
+
+    #[test]
+    fn jlink_bool_sevr_true_is_ms() {
+        let c = jlink("X", vec![("sevr", JlinkValue::Bool(true))]);
+        assert_eq!(c.sevr, SevrMode::Ms, "sevr:true → MS (pva_parse_bool)");
+    }
+
+    #[test]
+    fn jlink_null_proc_resets_to_default() {
+        let c = jlink("X", vec![("proc", JlinkValue::Null)]);
+        assert_eq!(
+            c.proc,
+            ProcMode::Default,
+            "proc:null → Default (pva_parse_null)"
+        );
     }
 
     /// `?time=true` enables remote-timestamp adoption.

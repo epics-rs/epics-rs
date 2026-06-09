@@ -790,7 +790,7 @@ impl PvDatabase {
         // produces local processing time. Mirrors pvxs
         // `pvalink_lset.cpp:427`.
         let inp_link_remote_time: Option<(i64, i32, u64)> = match inp_parsed.external_pv_name() {
-            Some(name) => self.external_link_time(name).await,
+            Some(name) => self.external_link_time(&name).await,
             None => None,
         };
 
@@ -1996,6 +1996,14 @@ impl PvDatabase {
             }
         }
 
+        // 5b. FLNK whose target is external (`pva://`/`ca://`): C
+        // `dbScanFwdLink` dispatches it through the link set's
+        // `scanForward` (pvalink `pvaScanForward`), a process-only trigger
+        // of the remote target. The `flnk_name` above only ever names a
+        // local DB target, so a non-DB FLNK is forwarded here through the
+        // single owner.
+        self.dispatch_external_forward_link(rec).await;
+
         // 6. CP link targets -- process records that have CP input links from this record
         self.dispatch_cp_targets(name, visited, depth).await;
 
@@ -2034,6 +2042,59 @@ impl PvDatabase {
                         .await;
                 });
             }
+        }
+    }
+
+    /// Fire a non-DB (external `pva://`/`ca://`) forward link (FLNK).
+    ///
+    /// C `recGblFwdLink` → `dbScanFwdLink` (`dbLink.c:475-480`) dispatches
+    /// every FLNK uniformly through `plink->lset->scanForward`: a DB lset
+    /// runs `scanOnce(target)` — handled directly by the local FLNK §5
+    /// path — while the pvalink/calink lset runs `pvaScanForward`, a
+    /// process-only trigger of the remote target. The DB-only `flnk_name`
+    /// filter at the three `should_fire_forward_link` sites dropped every
+    /// external FLNK; this is the single owner that forwards them, so the
+    /// dispatch is not open-coded per site (each FLNK tail calls only
+    /// this).
+    ///
+    /// On a non-retry, disconnected link the lset returns `Err`; pvxs
+    /// raises `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM, "Disconn")` on
+    /// the owning record (`pvxs/ioc/pvalink_lset.cpp:677-679`). This raises
+    /// the same *pending* LINK/INVALID alarm via [`rec_gbl_set_sevr_msg`],
+    /// promoted by the next `recGblResetAlarms` — exactly as the C late-set
+    /// inside `recGblFwdLink` (after the record's own alarm/monitor stage)
+    /// is.
+    async fn dispatch_external_forward_link(&self, rec: &Arc<RwLock<RecordInstance>>) {
+        let target = {
+            let instance = rec.read().await;
+            if !instance.record.should_fire_forward_link() {
+                return;
+            }
+            match &instance.parsed_flnk {
+                crate::server::record::ParsedLink::Pva(_)
+                | crate::server::record::ParsedLink::PvaJson(_)
+                | crate::server::record::ParsedLink::Ca(_) => instance
+                    .parsed_flnk
+                    .external_pv_name()
+                    .map(|s| s.to_string()),
+                // A DB FLNK is processed by the local §5 scanOnce path;
+                // every other kind (Constant/Hw/Calc/None) carries no
+                // forward action.
+                _ => None,
+            }
+        };
+        let Some(target) = target else {
+            return;
+        };
+        if let Err(e) = self.scan_forward_external_pv(&target).await {
+            let _ = e;
+            let mut instance = rec.write().await;
+            crate::server::recgbl::rec_gbl_set_sevr_msg(
+                &mut instance.common,
+                crate::server::recgbl::alarm_status::LINK_ALARM,
+                crate::server::record::AlarmSeverity::Invalid,
+                "Disconn",
+            );
         }
     }
 
@@ -2731,6 +2792,12 @@ impl PvDatabase {
             }
         }
 
+        // FLNK whose target is external (`pva://`/`ca://`): forwarded
+        // through the same single owner as the synchronous tail (C
+        // `dbScanFwdLink` → lset `scanForward`). `flnk_name` above only
+        // names a local DB target.
+        self.dispatch_external_forward_link(&rec).await;
+
         // CP link targets
         self.dispatch_cp_targets(name, visited, depth).await;
 
@@ -2925,7 +2992,7 @@ impl PvDatabase {
                     .external_pv_name()
                     .expect("Ca/Pva/PvaJson link carries a PV name");
                 if let Err(e) = self
-                    .write_external_pv(name, value, crate::server::database::LinkPutOp::Plain)
+                    .write_external_pv(&name, value, crate::server::database::LinkPutOp::Plain)
                     .await
                 {
                     eprintln!("SIOL simulation write to external PV '{name}' failed: {e}");

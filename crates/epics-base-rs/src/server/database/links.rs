@@ -236,7 +236,14 @@ impl PvDatabase {
             crate::server::record::ParsedLink::None => None,
             crate::server::record::ParsedLink::Ca(ca) => self.resolve_external_pv(&ca.pv).await,
             crate::server::record::ParsedLink::Pva(name) => self.resolve_external_pv(name).await,
-            crate::server::record::ParsedLink::PvaJson(j) => self.resolve_external_pv(&j.pv).await,
+            // Resolve through the per-link identity key (not bare `j.pv`)
+            // so two same-PV structured links keep distinct configs —
+            // matches the boundary key the write/scan/alarm paths use via
+            // `external_pv_name` (pvxs per-link `pvaLinkConfig`,
+            // ioc/pvalink.h:65).
+            crate::server::record::ParsedLink::PvaJson(j) => {
+                self.resolve_external_pv(&j.link_identity_key()).await
+            }
             crate::server::record::ParsedLink::Constant(_) => link.constant_value(),
             crate::server::record::ParsedLink::Db(db) => {
                 // PP: process source record if Passive before reading.
@@ -283,7 +290,10 @@ impl PvDatabase {
             crate::server::record::ParsedLink::None => None,
             crate::server::record::ParsedLink::Ca(ca) => self.resolve_external_pv(&ca.pv).await,
             crate::server::record::ParsedLink::Pva(name) => self.resolve_external_pv(name).await,
-            crate::server::record::ParsedLink::PvaJson(j) => self.resolve_external_pv(&j.pv).await,
+            // Per-link identity key, as in `read_link_value` above.
+            crate::server::record::ParsedLink::PvaJson(j) => {
+                self.resolve_external_pv(&j.link_identity_key()).await
+            }
             crate::server::record::ParsedLink::Constant(_) => link.constant_value(),
             crate::server::record::ParsedLink::Db(db) => self.read_db_link_value(db).await,
             // Hardware links carry no generic readable value.
@@ -428,8 +438,8 @@ impl PvDatabase {
                 let name = link
                     .external_pv_name()
                     .expect("Ca/Pva/PvaJson link carries a PV name");
-                let value = self.resolve_external_pv(name).await;
-                let alarm = self.external_link_alarm(name).await;
+                let value = self.resolve_external_pv(&name).await;
+                let alarm = self.external_link_alarm(&name).await;
                 (value, alarm)
             }
             _ => (None, None),
@@ -672,7 +682,7 @@ impl PvDatabase {
                 let name = link
                     .external_pv_name()
                     .expect("Ca/Pva/PvaJson link carries a PV name");
-                self.resolve_external_pv(name).await
+                self.resolve_external_pv(&name).await
             }
             // lnkCalc evaluates regardless of `is_soft` — the input
             // PVs may themselves be local DB targets (which need the
@@ -905,6 +915,52 @@ impl PvDatabase {
         result
     }
 
+    /// Fire a forward link (FLNK) whose target is an external
+    /// (`pva://` / `ca://`) PV — the FWD-link counterpart of
+    /// [`Self::write_external_pv`]. Resolves the scheme (or tries every
+    /// registered lset for a bare name, first to accept wins, exactly as
+    /// the OUT-write path does) and delegates to [`LinkSet::scan_forward`].
+    ///
+    /// Mirrors C `dbScanFwdLink` → `plink->lset->scanForward`
+    /// (`dbLink.c:475-480`): the database hands the forward link to the
+    /// link set, which (for pvalink) runs `pvaScanForward`. Returns the
+    /// lset's `Err` unchanged so the caller can raise LINK/INVALID on the
+    /// owning record (pvxs `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM)`).
+    pub(crate) async fn scan_forward_external_pv(&self, name: &str) -> Result<(), String> {
+        let (scheme, body) = if let Some(rest) = name.strip_prefix("pva://") {
+            ("pva", rest)
+        } else if let Some(rest) = name.strip_prefix("ca://") {
+            ("ca", rest)
+        } else {
+            // Bare name — try every registered lset in turn, first
+            // accepting the forward wins (mirrors `write_external_pv`'s
+            // bare-name path so FWD and OUT route a bare target alike).
+            let registry = self.inner.link_sets.read().await;
+            let schemes = registry.schemes();
+            if schemes.is_empty() {
+                return Err(format!("no link set registered for forward link '{name}'"));
+            }
+            let mut last_err = String::new();
+            for s in schemes {
+                if let Some(lset) = registry.get(&s) {
+                    match lset.scan_forward(name) {
+                        Ok(()) => return Ok(()),
+                        Err(e) => last_err = e,
+                    }
+                }
+            }
+            return Err(last_err);
+        };
+        let lset = self
+            .inner
+            .link_sets
+            .read()
+            .await
+            .get(scheme)
+            .ok_or_else(|| format!("no '{scheme}' link set registered for '{name}'"))?;
+        lset.scan_forward(body)
+    }
+
     /// Map a record's put-completion wait-set to the external-link put
     /// op. A write that originates inside a put-notify / blocking-put
     /// chain (the source record carries a completion wait-set) is
@@ -954,7 +1010,7 @@ impl PvDatabase {
                     .external_pv_name()
                     .expect("Ca/Pva/PvaJson link carries a PV name");
                 let op = Self::external_put_op(src.notify);
-                if let Err(e) = self.write_external_pv(name, value, op).await {
+                if let Err(e) = self.write_external_pv(&name, value, op).await {
                     eprintln!("OUT-link write to external PV '{name}' failed: {e}");
                 }
             }
@@ -1395,7 +1451,7 @@ impl PvDatabase {
                                     .external_pv_name()
                                     .expect("Ca/Pva/PvaJson link carries a PV name");
                                 let op = Self::external_put_op(src_notify.as_ref());
-                                if let Err(e) = self.write_external_pv(name, val.clone(), op).await
+                                if let Err(e) = self.write_external_pv(&name, val.clone(), op).await
                                 {
                                     eprintln!(
                                         "dfanout OUT-link write to external PV '{name}' failed: {e}"
@@ -1993,6 +2049,145 @@ mod nonlocal_db_link_write_tests {
             matches!(db.get_pv("TGT.VAL").await.unwrap(), EpicsValue::Double(v) if v == 7.0),
             "the local target must hold the written value"
         );
+    }
+
+    /// A link set that records every `scan_forward` it receives so a test
+    /// can assert a non-DB FLNK reached the external forward path
+    /// (C `dbScanFwdLink` → `lset->scanForward`) instead of being dropped
+    /// by the DB-only `flnk_name` filter. `connected=false` models a
+    /// disconnected link (pvxs `pvaScanForward`'s `!valid()` gate).
+    struct ForwardingLset {
+        forwards: Arc<Mutex<Vec<String>>>,
+        connected: bool,
+    }
+    impl LinkSet for ForwardingLset {
+        fn is_connected(&self, _: &str) -> bool {
+            self.connected
+        }
+        fn get_value(&self, _: &str) -> Option<EpicsValue> {
+            None
+        }
+        fn scan_forward(&self, name: &str) -> Result<(), String> {
+            self.forwards.lock().unwrap().push(name.to_string());
+            if self.connected {
+                Ok(())
+            } else {
+                Err("Disconn".into())
+            }
+        }
+    }
+
+    /// `scan_forward_external_pv` must resolve the scheme and delegate to
+    /// the registered lset's `scan_forward` — the FWD-link twin of
+    /// `write_external_pv` for OUT writes (C `dbScanFwdLink` →
+    /// `lset->scanForward`).
+    #[tokio::test]
+    async fn external_forward_link_dispatches_through_scan_forward() {
+        let db = PvDatabase::new();
+        let forwards = Arc::new(Mutex::new(Vec::new()));
+        db.register_link_set(
+            "pva",
+            Arc::new(ForwardingLset {
+                forwards: forwards.clone(),
+                connected: true,
+            }),
+        )
+        .await;
+
+        db.scan_forward_external_pv("pva://OTHER:PROC")
+            .await
+            .expect("a connected forward must succeed");
+
+        let captured = forwards.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0], "OTHER:PROC");
+    }
+
+    /// End-to-end: a record whose FLNK targets an external `pva://` PV
+    /// must fire the link set's `scan_forward` when it processes — the
+    /// non-DB FLNK dispatch the DB-only `flnk_name` filter previously
+    /// dropped. C `recGblFwdLink` runs `dbScanFwdLink` for every FLNK
+    /// regardless of link kind.
+    #[tokio::test]
+    async fn record_processing_fires_external_forward_link() {
+        let db = PvDatabase::new();
+        let forwards = Arc::new(Mutex::new(Vec::new()));
+        db.register_link_set(
+            "pva",
+            Arc::new(ForwardingLset {
+                forwards: forwards.clone(),
+                connected: true,
+            }),
+        )
+        .await;
+        db.add_record("SRC", Box::new(CalcRecord::new("0")))
+            .await
+            .unwrap();
+        if let Some(rec) = db.get_record("SRC").await {
+            let mut inst = rec.write().await;
+            inst.put_common_field("FLNK", EpicsValue::String("pva://TARGET".into()))
+                .unwrap();
+        }
+
+        let mut visited = HashSet::new();
+        db.process_record_with_links("SRC", &mut visited, 0)
+            .await
+            .unwrap();
+
+        let captured = forwards.lock().unwrap();
+        assert_eq!(
+            captured.len(),
+            1,
+            "an external pva:// FLNK must fire scan_forward exactly once"
+        );
+        assert_eq!(captured[0], "TARGET");
+    }
+
+    /// A disconnected non-retry external FLNK is NOT dropped silently: the
+    /// lset returns Err and the owning record takes a *pending*
+    /// LINK/INVALID alarm — pvxs `pvaScanForward`'s
+    /// `recGblSetSevrMsg(LINK_ALARM, INVALID_ALARM, "Disconn")`, which
+    /// writes `nsta`/`nsev`/`namsg` (promoted by the next
+    /// `recGblResetAlarms`, matching the C late-set inside `recGblFwdLink`).
+    #[tokio::test]
+    async fn disconnected_external_forward_link_raises_pending_link_invalid() {
+        let db = PvDatabase::new();
+        let forwards = Arc::new(Mutex::new(Vec::new()));
+        db.register_link_set(
+            "pva",
+            Arc::new(ForwardingLset {
+                forwards: forwards.clone(),
+                connected: false,
+            }),
+        )
+        .await;
+        db.add_record("SRC", Box::new(CalcRecord::new("0")))
+            .await
+            .unwrap();
+        if let Some(rec) = db.get_record("SRC").await {
+            let mut inst = rec.write().await;
+            inst.put_common_field("FLNK", EpicsValue::String("pva://TARGET".into()))
+                .unwrap();
+        }
+
+        let mut visited = HashSet::new();
+        db.process_record_with_links("SRC", &mut visited, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            forwards.lock().unwrap().len(),
+            1,
+            "scan_forward is still attempted on a disconnected link"
+        );
+        let rec = db.get_record("SRC").await.unwrap();
+        let inst = rec.read().await;
+        assert_eq!(inst.common.nsev, AlarmSeverity::Invalid);
+        assert_eq!(
+            inst.common.nsta,
+            crate::server::recgbl::alarm_status::LINK_ALARM
+        );
+        assert_eq!(inst.common.namsg, "Disconn");
     }
 }
 

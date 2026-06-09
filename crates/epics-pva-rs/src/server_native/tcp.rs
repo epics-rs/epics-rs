@@ -6937,6 +6937,9 @@ async fn handle_op(
                                 &intro_clone,
                                 &initial,
                                 &mask_clone,
+                                // a connect-time seed reports no lost
+                                // intermediate — empty overrun bitset.
+                                &[],
                                 order_now(),
                             );
                             if tx_clone.send(payload).await.is_err() {
@@ -7232,6 +7235,9 @@ async fn handle_op(
                                 &intro_clone,
                                 &initial,
                                 &mask_clone,
+                                // a connect-time seed reports no lost
+                                // intermediate — empty overrun bitset.
+                                &[],
                                 order_now(),
                             );
                             if emits_partial {
@@ -7430,8 +7436,13 @@ async fn handle_op(
                         // built from the PvField snapshot; the explicit
                         // marked-leaf set (when the source carries one) drives
                         // the changed-bitset below. `take()` leaves the moved
-                        // MonitorUpdate inert before we shadow `value`.
+                        // MonitorUpdate inert before we shadow `value`. The
+                        // overrun set — lost-intermediate leaves accumulated by
+                        // the server's queue-overflow squash (or a fanout
+                        // gateway's lag) — travels with it and is encoded as
+                        // the trailing overrun bitset of the cooked DATA body.
                         let marked = value.marked.take();
+                        let overrun = std::mem::take(&mut value.overrun);
                         let value = value.value;
                         // Server-side channel filters: skip when the
                         // chain drops this event. Empty chain (the
@@ -7505,6 +7516,7 @@ async fn handle_op(
                                 &value,
                                 paths,
                                 &mask_clone,
+                                &overrun,
                                 order_now(),
                             )
                         } else if let Some(prev) = prev_value.as_ref() {
@@ -7514,6 +7526,7 @@ async fn handle_op(
                                 &value,
                                 prev,
                                 &mask_clone,
+                                &overrun,
                                 order_now(),
                             )
                         } else {
@@ -7522,6 +7535,7 @@ async fn handle_op(
                                 &intro_clone,
                                 &value,
                                 &mask_clone,
+                                &overrun,
                                 order_now(),
                             )
                         };
@@ -8023,6 +8037,31 @@ async fn next_monitor_event<T>(
     }
 }
 
+/// Build the trailing **overrun bitset** of a cooked MONITOR DATA body
+/// from the lost-leaf paths a [`crate::server_native::MonitorUpdate`]
+/// accumulated (server queue-overflow squash or gateway fanout lag).
+/// Empty paths yield an empty bitset — identical to the prior
+/// `BitSet::new()` so a no-loss event is byte-for-byte unchanged.
+///
+/// The paths are turned into leaf bits via
+/// [`crate::pvdata::encode::marked_changed_bitset`] (the same expansion
+/// the changed set uses), intersected with the request selection `mask`
+/// so a field-subset subscriber never sees an overrun bit outside its
+/// selection, then canonicalized exactly like the changed bitset.
+fn overrun_bitset(intro: &FieldDesc, overrun_paths: &[String], mask: &BitSet) -> BitSet {
+    if overrun_paths.is_empty() {
+        return BitSet::new();
+    }
+    let target = crate::pvdata::encode::marked_changed_bitset(intro, overrun_paths);
+    let mut selected = BitSet::new();
+    for bit in target.iter() {
+        if mask.get(bit) {
+            selected.set(bit);
+        }
+    }
+    crate::pvdata::encode::canonical_changed_bitset(intro, &selected)
+}
+
 /// Build a complete MONITOR data frame (header + payload) for a single value
 /// emission. Pulled out so the back-pressure squashing loop can call it.
 fn build_monitor_payload(
@@ -8030,6 +8069,7 @@ fn build_monitor_payload(
     intro: &FieldDesc,
     value: &PvField,
     mask: &BitSet,
+    overrun_paths: &[String],
     order: ByteOrder,
 ) -> Vec<u8> {
     let mut payload = Vec::new();
@@ -8049,7 +8089,7 @@ fn build_monitor_payload(
         order,
         &mut payload,
     );
-    let overrun = BitSet::new(); // no overruns
+    let overrun = overrun_bitset(intro, overrun_paths, mask);
     overrun.write_into(order, &mut payload);
     let h = PvaHeader::application(true, order, Command::Monitor.code(), payload.len() as u32);
     let mut buf = Vec::with_capacity(8 + payload.len());
@@ -8080,6 +8120,7 @@ fn build_monitor_payload_partial(
     value: &PvField,
     prev: &PvField,
     mask: &BitSet,
+    overrun_paths: &[String],
     order: ByteOrder,
 ) -> Vec<u8> {
     // Leaves that actually changed since the last emitted snapshot.
@@ -8109,7 +8150,7 @@ fn build_monitor_payload_partial(
         order,
         &mut payload,
     );
-    let overrun = BitSet::new(); // no overruns
+    let overrun = overrun_bitset(intro, overrun_paths, mask);
     overrun.write_into(order, &mut payload);
     let h = PvaHeader::application(true, order, Command::Monitor.code(), payload.len() as u32);
     let mut buf = Vec::with_capacity(8 + payload.len());
@@ -8133,6 +8174,7 @@ fn build_monitor_payload_marked(
     value: &PvField,
     marked_paths: &[String],
     mask: &BitSet,
+    overrun_paths: &[String],
     order: ByteOrder,
 ) -> Vec<u8> {
     // Selection = every leaf under each marked target path.
@@ -8160,7 +8202,7 @@ fn build_monitor_payload_marked(
         order,
         &mut payload,
     );
-    let overrun = BitSet::new(); // no overruns
+    let overrun = overrun_bitset(intro, overrun_paths, mask);
     overrun.write_into(order, &mut payload);
     let h = PvaHeader::application(true, order, Command::Monitor.code(), payload.len() as u32);
     let mut buf = Vec::with_capacity(8 + payload.len());
@@ -8176,6 +8218,15 @@ fn build_monitor_payload_marked(
 /// side means "no explicit set — derive by diff", which over-marks
 /// safely, so the union of `None` with anything stays `None`.
 ///
+/// The squash also records OVERRUN: the dropped intermediate's distinct
+/// values are lost, so every leaf changed in BOTH the dropped older and
+/// the surviving newer update is added to the result's overrun set, and
+/// the two updates' own overrun sets union forward — pva2pva
+/// `moncache.cpp:160-168`. The cooked payload builders encode that set
+/// as the trailing overrun bitset so a lagging downstream learns it
+/// missed transitions (the decoded-path counterpart of the raw
+/// forwarder's bridge-local overrun marking).
+///
 /// A `type_changed` boundary must SURVIVE the squash: once the upstream
 /// descriptor changed, no value (squashed-old or post-boundary-new) may
 /// be delivered under the negotiated descriptor, so if either side is a
@@ -8189,6 +8240,30 @@ fn coalesce_monitor_update(
 ) -> crate::server_native::MonitorUpdate {
     if older.type_changed || newer.type_changed {
         return crate::server_native::MonitorUpdate::type_change();
+    }
+    // pva2pva moncache.cpp:160-168 squash-into-overflow accounting:
+    //   overrun |= older.overrun | newer.overrun   (carry both forward)
+    //   overrun |= older.changed & newer.changed    (lost intermediate)
+    //   changed |= older.changed | newer.changed    (accumulate, below)
+    // A leaf is overrun when a distinct value for it was overwritten:
+    // it is marked changed in BOTH the dropped `older` update and the
+    // surviving `newer` one, so the downstream missed a transition.
+    // Computed from the explicit marked sets BEFORE they are moved into
+    // the union below; when either side lacks an explicit set the
+    // intersection contributes nothing (the leaves cannot be named), but
+    // any overrun the producers already recorded still carries forward.
+    let mut overrun = older.overrun;
+    for p in newer.overrun {
+        if !overrun.contains(&p) {
+            overrun.push(p);
+        }
+    }
+    if let (Some(a), Some(b)) = (older.marked.as_ref(), newer.marked.as_ref()) {
+        for p in a {
+            if b.contains(p) && !overrun.contains(p) {
+                overrun.push(p.clone());
+            }
+        }
     }
     let marked = match (older.marked, newer.marked) {
         (Some(mut a), Some(b)) => {
@@ -8205,6 +8280,7 @@ fn coalesce_monitor_update(
         value: newer.value,
         marked,
         type_changed: false,
+        overrun,
     }
 }
 
@@ -8880,6 +8956,7 @@ mod tests {
             value: val(tag),
             marked: marked.map(|v| v.into_iter().map(str::to_string).collect()),
             type_changed: false,
+            overrun: Vec::new(),
         };
 
         // Some + Some → union of paths, deduped; newer value wins.
@@ -8909,6 +8986,88 @@ mod tests {
         );
     }
 
+    /// Boundary test for the overrun accumulation a squash performs —
+    /// pva2pva `moncache.cpp:160-168`:
+    ///   overrun |= older.overrun | newer.overrun   (carry forward)
+    ///   overrun |= older.changed & newer.changed    (lost intermediate)
+    /// A leaf is overrun iff a distinct value for it was overwritten by
+    /// the coalesce, i.e. it is marked changed in BOTH the dropped older
+    /// update and the surviving newer one. Tested per invariant boundary
+    /// (intersection non-empty / disjoint / None side / explicit carry /
+    /// dedup), not by a narrative burst.
+    #[test]
+    fn coalesce_monitor_update_accumulates_overrun() {
+        let val = |tag: i32| PvField::Scalar(ScalarValue::Int(tag));
+        let s = |v: &[&str]| v.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        let mk = |tag: i32, marked: Option<&[&str]>, overrun: &[&str]| {
+            crate::server_native::MonitorUpdate {
+                value: val(tag),
+                marked: marked.map(s),
+                type_changed: false,
+                overrun: s(overrun),
+            }
+        };
+        let sorted = |mut v: Vec<String>| {
+            v.sort();
+            v
+        };
+
+        // Intersection non-empty: `b` changed in both → overrun {b}; the
+        // value and the changed-union still resolve as before.
+        let m =
+            coalesce_monitor_update(mk(1, Some(&["a", "b"]), &[]), mk(2, Some(&["b", "c"]), &[]));
+        assert_eq!(m.value, val(2), "newer value wins");
+        assert_eq!(
+            sorted(m.overrun),
+            s(&["b"]),
+            "only the leaf marked in BOTH updates is overrun"
+        );
+
+        // Disjoint marked: no leaf was overwritten → no overrun.
+        let m = coalesce_monitor_update(mk(1, Some(&["a"]), &[]), mk(2, Some(&["b"]), &[]));
+        assert!(
+            m.overrun.is_empty(),
+            "disjoint changed sets lose no intermediate — empty overrun"
+        );
+
+        // Explicit overrun from either side carries forward (union),
+        // even when no fresh intersection arises.
+        let m = coalesce_monitor_update(mk(1, Some(&["a"]), &["x"]), mk(2, Some(&["b"]), &["y"]));
+        assert_eq!(
+            sorted(m.overrun),
+            s(&["x", "y"]),
+            "producer-recorded overrun on both sides must survive the squash"
+        );
+
+        // A None marked side contributes no intersection term, but an
+        // explicit overrun it already carried still propagates.
+        let m = coalesce_monitor_update(mk(1, None, &["x"]), mk(2, Some(&["b"]), &[]));
+        assert_eq!(
+            m.overrun,
+            s(&["x"]),
+            "None side names no leaves, but its recorded overrun carries"
+        );
+        assert!(m.marked.is_none(), "None side still collapses marked");
+
+        // Dedup: a leaf that is both already-overrun and freshly
+        // intersected appears once.
+        let m = coalesce_monitor_update(mk(1, Some(&["b"]), &["b"]), mk(2, Some(&["b"]), &[]));
+        assert_eq!(
+            m.overrun,
+            s(&["b"]),
+            "overrun must not duplicate a leaf present via both carry and intersection"
+        );
+
+        // A type-change boundary discards value/marked/overrun — the
+        // squash must surface the boundary, not a stale overrun.
+        let m = coalesce_monitor_update(
+            mk(1, Some(&["b"]), &["b"]),
+            crate::server_native::MonitorUpdate::type_change(),
+        );
+        assert!(m.type_changed, "boundary survives the squash");
+        assert!(m.overrun.is_empty(), "boundary carries no overrun");
+    }
+
     /// Boundary test for the server-side monitor queue
     /// ([`drain_monitor_queue`], pvxs servermon.cpp:271-287). The drain is
     /// the SINGLE owner of the unsent count: it folds the in-hand front
@@ -8933,6 +9092,7 @@ mod tests {
             value: val(tag),
             marked: None,
             type_changed: false,
+            overrun: Vec::new(),
         };
         // The whole unsent set the loop will deliver, in send order: the
         // returned front followed by the rest of the bounded queue.
@@ -12031,7 +12191,8 @@ mod tests {
             .push(("value".into(), PvField::Scalar(ScalarValue::Double(42.5))));
 
         let mask = BitSet::all_set(intro.total_bits());
-        let bytes = build_monitor_payload(ioid, &intro, &PvField::Structure(value), &mask, order);
+        let bytes =
+            build_monitor_payload(ioid, &intro, &PvField::Structure(value), &mask, &[], order);
         let (frame, used) = try_parse_frame(&bytes).unwrap().expect("complete frame");
         assert_eq!(used, bytes.len());
 
@@ -12050,6 +12211,73 @@ mod tests {
             }
             other => panic!("expected monitor data, got {other:?}"),
         }
+    }
+
+    /// The cooked payload builders encode a NON-empty overrun bitset
+    /// when the `MonitorUpdate` accumulated lost-intermediate leaves
+    /// (server queue-overflow squash or gateway fanout lag), instead of
+    /// the old always-empty `BitSet::new()`. The decoded MONITOR DATA's
+    /// trailing overrun bitset (`clientmon.cpp:550` `from_wire(M,
+    /// overrun)`, decoded here into `OpDataResponse::overrun`) must mark
+    /// exactly the overrun leaf and nothing else; an empty overrun set
+    /// still encodes an empty bitset (byte-compatible with before).
+    #[test]
+    fn cooked_payload_encodes_overrun_bitset() {
+        let order = ByteOrder::Little;
+        let ioid = 0x77;
+        // { a: Double, b: Double } → root bit 0, a bit 1, b bit 2.
+        let intro = FieldDesc::Structure {
+            struct_id: "structure".into(),
+            fields: vec![
+                ("a".into(), FieldDesc::Scalar(ScalarType::Double)),
+                ("b".into(), FieldDesc::Scalar(ScalarType::Double)),
+            ],
+        };
+        let mut s = PvStructure::new("structure");
+        s.fields
+            .push(("a".into(), PvField::Scalar(ScalarValue::Double(1.0))));
+        s.fields
+            .push(("b".into(), PvField::Scalar(ScalarValue::Double(2.0))));
+        let value = PvField::Structure(s);
+        let mask = BitSet::all_set(intro.total_bits());
+
+        // `a` changed; `b` is the overrun (a distinct intermediate `b`
+        // was lost in the squash). The marked builder is the typed
+        // gateway / +trigger path the finding targets.
+        let marked = vec!["a".to_string()];
+        let overrun = vec!["b".to_string()];
+        let bytes =
+            build_monitor_payload_marked(ioid, &intro, &value, &marked, &mask, &overrun, order);
+        let (frame, used) = try_parse_frame(&bytes).unwrap().expect("complete frame");
+        assert_eq!(used, bytes.len());
+        let data = match decode_op_response(&frame, Some(&intro)).unwrap() {
+            OpResponse::Data(d) => d,
+            other => panic!("expected monitor data, got {other:?}"),
+        };
+        assert!(
+            data.overrun.get(2),
+            "the overrun leaf `b` (bit 2) must be set in the wire overrun bitset"
+        );
+        assert!(
+            !data.overrun.get(1),
+            "`a` only changed (not overrun) — must NOT be in the overrun bitset"
+        );
+        assert!(
+            !data.overrun.get(0),
+            "the root structure bit must not be set for a single-leaf overrun"
+        );
+
+        // Empty overrun → empty bitset, identical to the prior behavior.
+        let bytes = build_monitor_payload_marked(ioid, &intro, &value, &marked, &mask, &[], order);
+        let (frame, _) = try_parse_frame(&bytes).unwrap().expect("complete frame");
+        let data = match decode_op_response(&frame, Some(&intro)).unwrap() {
+            OpResponse::Data(d) => d,
+            other => panic!("expected monitor data, got {other:?}"),
+        };
+        assert!(
+            data.overrun.iter().next().is_none(),
+            "no accumulated loss must encode an empty overrun bitset"
+        );
     }
 
     /// Residual regression: `build_monitor_payload_partial`
@@ -12094,7 +12322,7 @@ mod tests {
 
         // Partial builder: changed-bitset must mark only `a` (bit 1),
         // not `b` (bit 2).
-        let partial = build_monitor_payload_partial(ioid, &intro, &curr, &prev, &mask, order);
+        let partial = build_monitor_payload_partial(ioid, &intro, &curr, &prev, &mask, &[], order);
         let (frame, _) = try_parse_frame(&partial).unwrap().expect("complete frame");
         let data = match decode_op_response(&frame, Some(&intro)).unwrap() {
             OpResponse::Data(d) => d,
@@ -12117,7 +12345,7 @@ mod tests {
         // still conveys every member while the partial builder narrows to
         // the changed leaf. The contrast the residual gap describes holds:
         // root/whole-struct {0} vs leaf-level {1}.
-        let full = build_monitor_payload(ioid, &intro, &curr, &mask, order);
+        let full = build_monitor_payload(ioid, &intro, &curr, &mask, &[], order);
         let (full_frame, _) = try_parse_frame(&full).unwrap().expect("complete frame");
         let full_data = match decode_op_response(&full_frame, Some(&intro)).unwrap() {
             OpResponse::Data(d) => d,

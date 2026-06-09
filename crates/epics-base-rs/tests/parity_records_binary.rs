@@ -214,7 +214,7 @@ fn sel_specified_out_of_range_raises_soft_alarm() {
 fn sel_specified_negative_seln_treated_out_of_range() {
     let mut rec = SelRecord::default();
     rec.selm = 0;
-    rec.seln = -1; // negative i16 — C SELN is unsigned, so out of range
+    rec.seln = 0xFFFF; // a client -1 casts to DBF_USHORT 65535 → out of range
     rec.process().unwrap();
     let mut common = CommonFields::default();
     rec.check_alarms(&mut common);

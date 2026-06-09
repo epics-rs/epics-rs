@@ -117,6 +117,8 @@ impl SubscriptionFilter for ArrayFilter {
             EpicsValue::LongArray(v) => EpicsValue::LongArray(slice_with(v, cfg)),
             EpicsValue::Int64Array(v) => EpicsValue::Int64Array(slice_with(v, cfg)),
             EpicsValue::UInt64Array(v) => EpicsValue::UInt64Array(slice_with(v, cfg)),
+            EpicsValue::UShortArray(v) => EpicsValue::UShortArray(slice_with(v, cfg)),
+            EpicsValue::ULongArray(v) => EpicsValue::ULongArray(slice_with(v, cfg)),
             EpicsValue::FloatArray(v) => EpicsValue::FloatArray(slice_with(v, cfg)),
             EpicsValue::DoubleArray(v) => EpicsValue::DoubleArray(slice_with(v, cfg)),
             EpicsValue::EnumArray(v) => EpicsValue::EnumArray(slice_with(v, cfg)),

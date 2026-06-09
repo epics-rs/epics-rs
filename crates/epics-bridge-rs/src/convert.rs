@@ -18,6 +18,10 @@ pub fn dbf_to_scalar_type(dbf: DbFieldType) -> ScalarType {
         DbFieldType::Int64 => ScalarType::Long,
         // C `DBF_UINT64` → PVA `ulong` (native unsigned 64-bit).
         DbFieldType::UInt64 => ScalarType::ULong,
+        // C `DBF_USHORT` → PVA `ushort` / `DBF_ULONG` → PVA `uint`
+        // (pvxs `ioc/typeutils.cpp:38-44`).
+        DbFieldType::UShort => ScalarType::UShort,
+        DbFieldType::ULong => ScalarType::UInt,
     }
 }
 
@@ -39,6 +43,10 @@ pub fn epics_to_scalar(val: &EpicsValue) -> ScalarValue {
         EpicsValue::Double(v) => ScalarValue::Double(*v),
         EpicsValue::Int64(v) => ScalarValue::Long(*v),
         EpicsValue::UInt64(v) => ScalarValue::ULong(*v),
+        // C `DBF_USHORT` → PVA `ushort` / `DBF_ULONG` → PVA `uint`
+        // (pvxs `ioc/typeutils.cpp:38-44`).
+        EpicsValue::UShort(v) => ScalarValue::UShort(*v),
+        EpicsValue::ULong(v) => ScalarValue::UInt(*v),
         // Arrays: take first element or default
         EpicsValue::ShortArray(a) => ScalarValue::Short(a.first().copied().unwrap_or(0)),
         EpicsValue::FloatArray(a) => ScalarValue::Float(a.first().copied().unwrap_or(0.0)),
@@ -49,6 +57,8 @@ pub fn epics_to_scalar(val: &EpicsValue) -> ScalarValue {
         EpicsValue::StringArray(a) => ScalarValue::String(a.first().cloned().unwrap_or_default()),
         EpicsValue::Int64Array(a) => ScalarValue::Long(a.first().copied().unwrap_or(0)),
         EpicsValue::UInt64Array(a) => ScalarValue::ULong(a.first().copied().unwrap_or(0)),
+        EpicsValue::UShortArray(a) => ScalarValue::UShort(a.first().copied().unwrap_or(0)),
+        EpicsValue::ULongArray(a) => ScalarValue::UInt(a.first().copied().unwrap_or(0)),
     }
 }
 
@@ -142,6 +152,10 @@ pub fn scalar_to_epics_typed(
         DbFieldType::Short => EpicsValue::Short(scalar_to_i64(val)? as i16),
         DbFieldType::Char => EpicsValue::Char(scalar_to_i64(val)? as u8),
         DbFieldType::Enum => EpicsValue::Enum(scalar_to_i64(val)? as u16),
+        // DBF_USHORT/DBF_ULONG narrow off the integer view (C static_cast
+        // truncation, low 16/32 bits), mirroring the Short/Enum targets.
+        DbFieldType::UShort => EpicsValue::UShort(scalar_to_i64(val)? as u16),
+        DbFieldType::ULong => EpicsValue::ULong(scalar_to_i64(val)? as u32),
         DbFieldType::String => match val {
             ScalarValue::String(s) => EpicsValue::String(s.clone()),
             other => EpicsValue::String(other.to_string().into()),
@@ -304,6 +318,15 @@ pub fn epics_to_pv_field(val: &EpicsValue) -> PvField {
         }
         EpicsValue::UInt64Array(a) => {
             PvField::ScalarArray(a.iter().map(|v| ScalarValue::ULong(*v)).collect())
+        }
+        // DBF_USHORT[]/DBF_ULONG[] serve as PVA ushort[]/uint[]. These MUST be
+        // explicit: the `other =>` scalar fallback below would collapse the
+        // array to its first element (pvxs `ioc/typeutils.cpp:38-44`).
+        EpicsValue::UShortArray(a) => {
+            PvField::ScalarArray(a.iter().map(|v| ScalarValue::UShort(*v)).collect())
+        }
+        EpicsValue::ULongArray(a) => {
+            PvField::ScalarArray(a.iter().map(|v| ScalarValue::UInt(*v)).collect())
         }
         other => PvField::Scalar(epics_to_scalar(other)),
     }

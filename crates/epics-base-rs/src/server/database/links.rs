@@ -1037,6 +1037,20 @@ impl PvDatabase {
             .unwrap_or(0.0) as i16
     }
 
+    /// Read a record numeric field as `u16`, defaulting to 0.
+    ///
+    /// Used for `DBF_USHORT` fields such as `SELN`: the native unsigned
+    /// carrier returns its value directly, while any other DBR type is
+    /// truncated through the `i64` integer view (C `dbPut` cast), so a
+    /// value ≥ 32768 round-trips instead of saturating at `i16::MAX`.
+    fn field_u16(instance: &RecordInstance, field: &str) -> u16 {
+        match instance.record.get_field(field) {
+            Some(EpicsValue::UShort(v)) => v,
+            Some(other) => other.as_int_i64().unwrap_or(0) as u16,
+            None => 0,
+        }
+    }
+
     /// Apply a SELM-resolved out-of-range alarm to the record.
     ///
     /// C raises this alarm inside `process()` (before `recGblResetAlarms`)
@@ -1143,13 +1157,12 @@ impl PvDatabase {
                         // wrap mod 2^16), NOT a clamp. `SELL=-1` therefore
                         // yields `SELN=65535` (Specified → out-of-range
                         // INVALID, Mask → all-bits), where the old clamp
-                        // produced `0` (drove link 0 / empty mask). The
-                        // unsigned bit pattern is stored into the signed
-                        // i16 SELN field; `select_link_indices_ex` reads it
-                        // back as `u16`.
-                        let seln = dbr_ushort_cast(&val) as i16;
+                        // produced `0` (drove link 0 / empty mask). SELN is
+                        // a `DBF_USHORT` (u16) field; `select_link_indices_ex`
+                        // consumes it as `u16`.
+                        let seln = dbr_ushort_cast(&val);
                         let mut instance = rec.write().await;
-                        let _ = instance.record.put_field("SELN", EpicsValue::Short(seln));
+                        let _ = instance.record.put_field("SELN", EpicsValue::UShort(seln));
                     }
                 }
             }
@@ -1160,7 +1173,7 @@ impl PvDatabase {
             match instance.record.record_type() {
                 "fanout" => {
                     let selm = Self::field_i16(&instance, "SELM");
-                    let seln = Self::field_i16(&instance, "SELN");
+                    let seln = Self::field_u16(&instance, "SELN");
                     let offs = Self::field_i16(&instance, "OFFS");
                     let shft = Self::field_i16(&instance, "SHFT");
                     // C parity (fanoutRecord.c:39): 16 forward links
@@ -1185,7 +1198,7 @@ impl PvDatabase {
                 }
                 "dfanout" => {
                     let selm = Self::field_i16(&instance, "SELM");
-                    let seln = Self::field_i16(&instance, "SELN");
+                    let seln = Self::field_u16(&instance, "SELN");
                     // IVOA / IVOV — invalid output handling, mirrors
                     // epics-base PR #688. When the record's SEVR is
                     // INVALID, IVOA selects: 0 = continue (use VAL as
@@ -1228,7 +1241,7 @@ impl PvDatabase {
                 }
                 "seq" => {
                     let selm = Self::field_i16(&instance, "SELM");
-                    let seln = Self::field_i16(&instance, "SELN");
+                    let seln = Self::field_u16(&instance, "SELN");
                     let offs = Self::field_i16(&instance, "OFFS");
                     let shft = Self::field_i16(&instance, "SHFT");
                     // C parity (seqRecord.c:86): 16 link groups 0..F,
@@ -1277,7 +1290,7 @@ impl PvDatabase {
                 }
                 "sseq" => {
                     let selm = Self::field_i16(&instance, "SELM");
-                    let seln = Self::field_i16(&instance, "SELN");
+                    let seln = Self::field_u16(&instance, "SELN");
                     // sseq keeps the legacy 10-group 1-based layout —
                     // DOL1..DOLA / LNK1..LNKA with DO/STR value storage.
                     // synApps `sseqRecord.dbd` has NO `OFFS`/`SHFT`

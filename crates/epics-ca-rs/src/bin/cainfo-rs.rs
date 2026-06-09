@@ -210,6 +210,8 @@ fn dbf_name(t: DbFieldType) -> &'static str {
         DbFieldType::Double => "DBF_DOUBLE",
         DbFieldType::Int64 => "DBF_INT64",
         DbFieldType::UInt64 => "DBF_UINT64",
+        DbFieldType::UShort => "DBF_USHORT",
+        DbFieldType::ULong => "DBF_ULONG",
     }
 }
 
@@ -226,6 +228,8 @@ fn dbr_name(t: DbFieldType) -> &'static str {
         DbFieldType::Double => "DBR_DOUBLE",
         DbFieldType::Int64 => "DBR_DOUBLE", // Int64 has no CA wire type; appears as Double
         DbFieldType::UInt64 => "DBR_DOUBLE", // UInt64 has no CA wire type; appears as Double
+        DbFieldType::UShort => "DBR_LONG",  // DBF_USHORT promotes to DBR_LONG (db_convert.h)
+        DbFieldType::ULong => "DBR_DOUBLE", // DBF_ULONG promotes to DBR_DOUBLE like UInt64
     }
 }
 

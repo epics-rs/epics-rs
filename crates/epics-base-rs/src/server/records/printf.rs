@@ -513,7 +513,9 @@ static PRINTF_FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "LEN",
-        dbf_type: DbFieldType::Long,
+        // C declares LEN as DBF_ULONG (printfRecord.dbd.pod:209): the formatted
+        // byte count including the terminating NUL is an unsigned 32-bit count.
+        dbf_type: DbFieldType::ULong,
         read_only: true,
     },
     FieldDesc {
@@ -665,7 +667,7 @@ impl Record for PrintfRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::CharArray(self.val.as_bytes().to_vec())),
-            "LEN" => Some(EpicsValue::Long(self.len as i32)),
+            "LEN" => Some(EpicsValue::ULong(self.len)),
             "SIZV" => Some(EpicsValue::Short(self.sizv as i16)),
             "FMT" => Some(EpicsValue::String(self.fmt.clone().into())),
             "IVLS" => Some(EpicsValue::String(self.ivls.clone().into())),
@@ -860,7 +862,7 @@ mod tests {
         assert_eq!(rec.val, "name=motor1");
         // 11 chars + 1 NUL.
         assert_eq!(rec.len, 12);
-        assert_eq!(rec.get_field("LEN"), Some(EpicsValue::Long(12)));
+        assert_eq!(rec.get_field("LEN"), Some(EpicsValue::ULong(12)));
     }
 
     /// An empty format still has a NUL, so LEN == 1 (boundary: zero-length
@@ -871,7 +873,7 @@ mod tests {
         rec.process().unwrap();
         assert_eq!(rec.val, "");
         assert_eq!(rec.len, 1);
-        assert_eq!(rec.get_field("LEN"), Some(EpicsValue::Long(1)));
+        assert_eq!(rec.get_field("LEN"), Some(EpicsValue::ULong(1)));
     }
 
     /// L-2: `%#g` of zero keeps trailing zeros; plain `%g` is "0".

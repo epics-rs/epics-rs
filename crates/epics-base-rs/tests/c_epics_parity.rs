@@ -752,8 +752,10 @@ fn dfanout_field_access() {
     rec.put_field("SELM", EpicsValue::Short(0)).unwrap();
     assert_eq!(rec.get_field("SELM"), Some(EpicsValue::Short(0)));
 
+    // SELN is DBF_USHORT: a Short put is accepted (internal link reads
+    // pass Short) but the field reads back as the native unsigned type.
     rec.put_field("SELN", EpicsValue::Short(3)).unwrap();
-    assert_eq!(rec.get_field("SELN"), Some(EpicsValue::Short(3)));
+    assert_eq!(rec.get_field("SELN"), Some(EpicsValue::UShort(3)));
 }
 
 /// C EPICS: dfanout output link fields

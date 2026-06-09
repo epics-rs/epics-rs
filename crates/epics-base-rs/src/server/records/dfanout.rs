@@ -9,7 +9,10 @@ use crate::types::{DbFieldType, EpicsValue};
 pub struct DfanoutRecord {
     pub val: f64,
     pub selm: i16,
-    pub seln: i16,
+    /// Link selection. C declares SELN as `DBF_USHORT`
+    /// (dfanoutRecord.dbd.pod:188): unsigned 0..65535, used as a bit
+    /// mask in `SELM=Mask`.
+    pub seln: u16,
     pub outa: String,
     pub outb: String,
     pub outc: String,
@@ -173,7 +176,7 @@ static DFANOUT_FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "SELN",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::UShort,
         read_only: false,
     },
     FieldDesc {
@@ -449,7 +452,7 @@ impl Record for DfanoutRecord {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
             "SELM" => Some(EpicsValue::Short(self.selm)),
-            "SELN" => Some(EpicsValue::Short(self.seln)),
+            "SELN" => Some(EpicsValue::UShort(self.seln)),
             "DOL" => Some(EpicsValue::String(self.dol.clone().into())),
             "OMSL" => Some(EpicsValue::Short(self.omsl)),
             "SELL" => Some(EpicsValue::String(self.sell.clone().into())),
@@ -506,11 +509,25 @@ impl Record for DfanoutRecord {
                 }
                 Ok(())
             }
-            "SELM" | "SELN" | "OMSL" | "IVOA" | "HHSV" | "HSV" | "LSV" | "LLSV" => match value {
+            // SELN is `DBF_USHORT` (dfanoutRecord.dbd.pod:188): client
+            // puts arrive converted to UShort; internal SELL link reads
+            // still pass a Short. Cast both into the unsigned field
+            // (C `dbPut` truncation).
+            "SELN" => match value {
+                EpicsValue::UShort(v) => {
+                    self.seln = v;
+                    Ok(())
+                }
+                EpicsValue::Short(v) => {
+                    self.seln = v as u16;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "SELM" | "OMSL" | "IVOA" | "HHSV" | "HSV" | "LSV" | "LLSV" => match value {
                 EpicsValue::Short(v) => {
                     match name {
                         "SELM" => self.selm = v,
-                        "SELN" => self.seln = v,
                         "OMSL" => self.omsl = v,
                         "IVOA" => self.ivoa = v,
                         "HHSV" => self.hhsv = v,

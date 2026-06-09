@@ -426,6 +426,7 @@ fn value_to_epics(
         "Int64" => quote! { #krate::types::EpicsValue::Int64(#field_expr) },
         "Char" => quote! { #krate::types::EpicsValue::Char(#field_expr) },
         "Enum" => quote! { #krate::types::EpicsValue::Enum(#field_expr) },
+        "UShort" => quote! { #krate::types::EpicsValue::UShort(#field_expr) },
         "String" => quote! { #krate::types::EpicsValue::String(#field_expr.clone().into()) },
         _ => quote! { compile_error!("unknown field type") },
     }
@@ -441,6 +442,24 @@ fn value_from_epics(
         return quote! {
             match value {
                 #krate::types::EpicsValue::Enum(v) => { self.#field_ident = v; }
+                #krate::types::EpicsValue::Long(v) => { self.#field_ident = v as u16; }
+                #krate::types::EpicsValue::Short(v) => { self.#field_ident = v as u16; }
+                _ => {
+                    return Err(#krate::error::CaError::TypeMismatch(
+                        stringify!(#field_ident).to_uppercase().to_string()
+                    ));
+                }
+            }
+        };
+    }
+
+    // DBF_USHORT fields accept UShort plus Short/Long: C `dbPut`
+    // converts any source DBR into the native unsigned 16-bit field,
+    // and internal link reads (e.g. SELL/NVL -> SELN) still pass Short.
+    if dbf_type == "UShort" {
+        return quote! {
+            match value {
+                #krate::types::EpicsValue::UShort(v) => { self.#field_ident = v; }
                 #krate::types::EpicsValue::Long(v) => { self.#field_ident = v as u16; }
                 #krate::types::EpicsValue::Short(v) => { self.#field_ident = v as u16; }
                 _ => {

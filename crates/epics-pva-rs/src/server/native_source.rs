@@ -152,6 +152,10 @@ fn snapshot_to_pv_field(snap: &Snapshot) -> PvField {
         EpicsValue::Int64(v) => PvField::Scalar(ScalarValue::Long(*v)),
         // C `DBF_UINT64` → PVA `ulong` (native unsigned 64-bit).
         EpicsValue::UInt64(v) => PvField::Scalar(ScalarValue::ULong(*v)),
+        // C `DBF_USHORT` → PVA `ushort` / `DBF_ULONG` → PVA `uint`
+        // (pvxs `ioc/typeutils.cpp:38-44`: DBR_USHORT→UInt16, DBR_ULONG→UInt32).
+        EpicsValue::UShort(v) => PvField::Scalar(ScalarValue::UShort(*v)),
+        EpicsValue::ULong(v) => PvField::Scalar(ScalarValue::UInt(*v)),
         EpicsValue::DoubleArray(v) => {
             PvField::ScalarArray(v.iter().map(|x| ScalarValue::Double(*x)).collect())
         }
@@ -178,6 +182,12 @@ fn snapshot_to_pv_field(snap: &Snapshot) -> PvField {
         }
         EpicsValue::UInt64Array(v) => {
             PvField::ScalarArray(v.iter().map(|x| ScalarValue::ULong(*x)).collect())
+        }
+        EpicsValue::UShortArray(v) => {
+            PvField::ScalarArray(v.iter().map(|x| ScalarValue::UShort(*x)).collect())
+        }
+        EpicsValue::ULongArray(v) => {
+            PvField::ScalarArray(v.iter().map(|x| ScalarValue::UInt(*x)).collect())
         }
     };
 
@@ -219,6 +229,10 @@ fn snapshot_to_field_desc(snap: &Snapshot) -> FieldDesc {
         EpicsValue::String(_) => (FieldDesc::Scalar(ScalarType::String), false),
         EpicsValue::Int64(_) => (FieldDesc::Scalar(ScalarType::Long), false),
         EpicsValue::UInt64(_) => (FieldDesc::Scalar(ScalarType::ULong), false),
+        // C `DBF_USHORT` → PVA `ushort` / `DBF_ULONG` → PVA `uint`
+        // (pvxs `ioc/typeutils.cpp:38-44`).
+        EpicsValue::UShort(_) => (FieldDesc::Scalar(ScalarType::UShort), false),
+        EpicsValue::ULong(_) => (FieldDesc::Scalar(ScalarType::UInt), false),
         EpicsValue::DoubleArray(_) => (FieldDesc::ScalarArray(ScalarType::Double), true),
         EpicsValue::FloatArray(_) => (FieldDesc::ScalarArray(ScalarType::Float), true),
         EpicsValue::LongArray(_) => (FieldDesc::ScalarArray(ScalarType::Int), true),
@@ -228,6 +242,8 @@ fn snapshot_to_field_desc(snap: &Snapshot) -> FieldDesc {
         EpicsValue::StringArray(_) => (FieldDesc::ScalarArray(ScalarType::String), true),
         EpicsValue::Int64Array(_) => (FieldDesc::ScalarArray(ScalarType::Long), true),
         EpicsValue::UInt64Array(_) => (FieldDesc::ScalarArray(ScalarType::ULong), true),
+        EpicsValue::UShortArray(_) => (FieldDesc::ScalarArray(ScalarType::UShort), true),
+        EpicsValue::ULongArray(_) => (FieldDesc::ScalarArray(ScalarType::UInt), true),
     };
     let struct_id = if is_array {
         "epics:nt/NTScalarArray:1.0"

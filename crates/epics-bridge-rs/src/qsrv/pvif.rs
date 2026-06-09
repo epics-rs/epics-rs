@@ -119,7 +119,9 @@ pub(crate) fn nt_type_for_field(value: Option<&EpicsValue>) -> NtType {
             | EpicsValue::CharArray(_)
             | EpicsValue::StringArray(_)
             | EpicsValue::Int64Array(_)
-            | EpicsValue::UInt64Array(_),
+            | EpicsValue::UInt64Array(_)
+            | EpicsValue::UShortArray(_)
+            | EpicsValue::ULongArray(_),
         ) => NtType::ScalarArray,
         _ => NtType::Scalar,
     }
@@ -163,6 +165,10 @@ fn value_scalar_type(value: &EpicsValue) -> ScalarType {
         EpicsValue::Int64(_) | EpicsValue::Int64Array(_) => ScalarType::Long,
         // C `DBF_UINT64` → PVA `ulong`.
         EpicsValue::UInt64(_) | EpicsValue::UInt64Array(_) => ScalarType::ULong,
+        // C `DBF_USHORT` → PVA `ushort` / `DBF_ULONG` → PVA `uint`
+        // (pvxs `ioc/typeutils.cpp:38-44`).
+        EpicsValue::UShort(_) | EpicsValue::UShortArray(_) => ScalarType::UShort,
+        EpicsValue::ULong(_) | EpicsValue::ULongArray(_) => ScalarType::UInt,
     }
 }
 
@@ -729,6 +735,12 @@ fn is_empty_array(value: &EpicsValue) -> bool {
     ) || matches!(
         value,
         EpicsValue::CharArray(a) if a.is_empty()
+    ) || matches!(
+        value,
+        EpicsValue::UShortArray(a) if a.is_empty()
+    ) || matches!(
+        value,
+        EpicsValue::ULongArray(a) if a.is_empty()
     ) || matches!(
         value,
         EpicsValue::StringArray(a) if a.is_empty()

@@ -86,6 +86,22 @@ pub enum DbFieldType {
     /// type, so over CA these PVs appear as Double (type 6); over PVA they
     /// are served natively as `ulong`. Mirrors `Int64`'s CA handling.
     UInt64 = 8,
+    /// Internal-only type for unsigned 16-bit EPICS fields (C `DBF_USHORT`,
+    /// dbStatic `dbfType`). The CA wire protocol has no unsigned types, so
+    /// the IOC promotes `DBF_USHORT` to the next signed type that holds its
+    /// full `0..=65535` range — `DBR_LONG` (the C `dbDBRnewToDBRold` table,
+    /// `db_convert.h`: `5, /*DBR_USHORT to DBR_LONG*/`). Over PVA pvxs
+    /// serves it natively as `ushort` (`ioc/typeutils.cpp:38-40`:
+    /// `DBR_USHORT -> TypeCode::UInt16`). The discriminant is an internal
+    /// marker (not a CA wire code); see [`Self::ca_wire_type`].
+    UShort = 9,
+    /// Internal-only type for unsigned 32-bit EPICS fields (C `DBF_ULONG`,
+    /// dbStatic `dbfType`). `0..=4294967295` does not fit in `i32`, so the
+    /// IOC promotes `DBF_ULONG` to `DBR_DOUBLE` over CA exactly like
+    /// `UInt64`/`Int64` (`db_convert.h`: `6, /*DBR_ULONG to DBR_DOUBLE*/`).
+    /// Over PVA pvxs serves it natively as `uint` (`ioc/typeutils.cpp:43-44`:
+    /// `DBR_ULONG -> TypeCode::UInt32`).
+    ULong = 10,
 }
 
 impl DbFieldType {
@@ -102,22 +118,32 @@ impl DbFieldType {
         }
     }
 
-    /// Size in bytes for a single element of this type
+    /// Size in bytes for a single element of this type's native carrier.
+    ///
+    /// This is the carrier width (`UShort` = 2, `ULong` = 4), not the
+    /// CA-wire-promoted width: the CA value path always promotes via
+    /// [`crate::types::EpicsValue::dbr_type`] first and sizes buffers off
+    /// the promoted type (`UShort`→`Long`=4, `ULong`→`Double`=8), so this
+    /// width is never used to size a CA value array for the unsigned types.
     pub fn element_size(&self) -> usize {
         match self {
             Self::String => 40, // MAX_STRING_SIZE
-            Self::Short | Self::Enum => 2,
-            Self::Float | Self::Long => 4,
+            Self::Short | Self::Enum | Self::UShort => 2,
+            Self::Float | Self::Long | Self::ULong => 4,
             Self::Char => 1,
             Self::Double | Self::Int64 | Self::UInt64 => 8,
         }
     }
 
-    /// Return the wire type code as a `u16`. Int64/UInt64 have no CA wire
-    /// type and are reported as `DBR_DOUBLE` (6) for over-the-wire purposes.
+    /// Return the wire type code as a `u16`. The internal-only types have
+    /// no CA wire code, so they report the signed CA type the IOC promotes
+    /// them to (C `dbDBRnewToDBRold`, `db_convert.h`): `Int64`/`UInt64`/
+    /// `ULong` → `DBR_DOUBLE` (6), `UShort` → `DBR_LONG` (5, the smallest
+    /// signed CA type that holds the full `0..=65535` range).
     fn ca_wire_type(&self) -> u16 {
         match self {
-            Self::Int64 | Self::UInt64 => Self::Double as u16,
+            Self::Int64 | Self::UInt64 | Self::ULong => Self::Double as u16,
+            Self::UShort => Self::Long as u16,
             other => *other as u16,
         }
     }

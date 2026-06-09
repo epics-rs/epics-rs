@@ -1735,10 +1735,24 @@ impl ChannelSource for GatewayChannelSource {
         // pva2pva `channel.cpp:109-115` forwards createChannelGet rather than
         // replaying the monitor cache; the snapshot path returned stale cache
         // state and never ran the upstream GET-side handler.
-        self.upstream_client_for(&ctx)
-            .pvget(checked.pv_name())
-            .await
-            .ok()
+        //
+        // Carry the downstream's preserved pvRequest upstream when one was
+        // sent, so a `field(...)` projection or `record._options` set on the
+        // downstream GET reaches the upstream IOC verbatim — exactly what
+        // `GWChannel::createChannelGet` does, forwarding the requester's
+        // pvRequest to the upstream `createChannelGet`
+        // (epics-base/modules/pva2pva/p2pApp/channel.cpp:110-114). Falls back
+        // to the default request when the downstream sent none, matching the
+        // PUT_GET readback path above.
+        let client = self.upstream_client_for(&ctx);
+        match ctx.pv_request.as_ref() {
+            Some(req) => client
+                .pvget_pv_field_with_request_value(checked.pv_name(), req)
+                .await
+                .map(|(_desc, value)| value)
+                .ok(),
+            None => client.pvget(checked.pv_name()).await.ok(),
+        }
     }
 
     /// route MONITOR through per-credential upstream cache.

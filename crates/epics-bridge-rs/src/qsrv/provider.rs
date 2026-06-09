@@ -732,8 +732,12 @@ impl BridgeProvider {
     /// modelled per-group yet).
     pub async fn is_writable(&self, name: &str) -> bool {
         // Group channel: writability per-member is complex; for now
-        // assume true if the group is registered.
-        if self.groups.read().contains_key(name) {
+        // assume true if the group is *served* (registered and not
+        // shadowed by a backing record). A shadowed name falls through to
+        // the record path below so its `.DISP` governs writability — pvxs
+        // serves such a name only as the record (defineGroups,
+        // ioc/groupconfigprocessor.cpp:170-181), never the group.
+        if self.is_servable_group(name).await {
             return true;
         }
         let (record, _field) = epics_base_rs::server::database::parse_pv_name(name);
@@ -1021,10 +1025,15 @@ impl BridgeProvider {
     /// consecutive snapshots. Returns `false` for non-groups and for
     /// groups carrying any explicit `+trigger` member (see
     /// [`GroupPvDef::is_pure_self_trigger`]).
-    pub fn group_is_pure_self_trigger(&self, name: &str) -> bool {
-        self.groups
-            .read()
-            .get(name)
+    ///
+    /// Routed through the shadow gate ([`Self::servable_group`]): a group
+    /// name shadowed by a backing record is served as the record, whose
+    /// monitor is a single-record full-snapshot stream, not a
+    /// partial-trigger group stream — so this returns `false` for a
+    /// shadowed name to match the served channel.
+    pub async fn group_is_pure_self_trigger(&self, name: &str) -> bool {
+        self.servable_group(name)
+            .await
             .map(|g| g.is_pure_self_trigger())
             .unwrap_or(false)
     }
@@ -1070,6 +1079,23 @@ impl BridgeProvider {
             return None;
         }
         Some(def)
+    }
+
+    /// Lean bool form of [`Self::servable_group`]: `name` is served as a
+    /// group iff it is registered AND not shadowed by a backing record.
+    ///
+    /// The single shadow-aware predicate every group-specific helper
+    /// consults so the "a name is a record XOR a group" invariant pvxs
+    /// enforces in `defineGroups` (ioc/groupconfigprocessor.cpp:170-181,
+    /// live `groupMap` ioc/groupsource.cpp:75-89) holds on every path, not
+    /// only the find/list/create serve path. Avoids cloning the
+    /// `GroupPvDef` when only the existence answer is needed (e.g. the
+    /// `is_writable` / `PROCESS` admission checks).
+    pub(crate) async fn is_servable_group(&self, name: &str) -> bool {
+        // Read the registry into a bool before any await so the
+        // (non-Send) `parking_lot` guard is not held across `record_exists`.
+        let registered = self.groups.read().contains_key(name);
+        registered && !self.record_exists(name).await
     }
 
     /// Drop every registered group definition. Mirrors pvxs
@@ -1404,6 +1430,74 @@ mod tests {
         assert!(
             list.iter().any(|n| n == "GRP:ONLY"),
             "the non-colliding group must still be listed"
+        );
+    }
+
+    /// The shadow invariant must hold on the per-group *predicate* paths,
+    /// not only find/list/create. A group whose name collides with a
+    /// record is served only as the record (pvxs `defineGroups`,
+    /// groupconfigprocessor.cpp:170-181), so `is_writable`,
+    /// `group_is_pure_self_trigger`, and the shared `is_servable_group`
+    /// gate must all resolve a shadowed name to the record. Before the fix
+    /// these read the raw registry and leaked group-derived behavior.
+    #[tokio::test]
+    async fn shadowed_group_predicates_resolve_to_record() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("SH:rec", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        // DISP=1 so the served record is NOT writable; a leaked group
+        // predicate would still advertise writable=true.
+        {
+            let rec = db.get_record("SH:rec").await.unwrap();
+            rec.write().await.common.disp = true;
+        }
+
+        let provider = BridgeProvider::new(db);
+        // "SH:rec" shadows the record; "SH:grp" has no backing record.
+        // Both are pure self-trigger groups (no explicit `+trigger`).
+        provider
+            .load_group_config(
+                r#"{
+                    "SH:rec": { "value": { "+channel": "SH:rec.VAL", "+type": "plain" } },
+                    "SH:grp": { "value": { "+channel": "OTHER.VAL",  "+type": "plain" } }
+                }"#,
+            )
+            .unwrap();
+
+        // The single shadow gate.
+        assert!(
+            !provider.is_servable_group("SH:rec").await,
+            "shadowed name is not a servable group"
+        );
+        assert!(
+            provider.is_servable_group("SH:grp").await,
+            "non-colliding group is servable"
+        );
+
+        // is_writable: the shadowed name falls to the record path, whose
+        // DISP=1 makes it not writable (raw-registry leak returned true).
+        assert!(
+            !provider.is_writable("SH:rec").await,
+            "shadowed name must respect record DISP, not the group blanket-true"
+        );
+        assert!(
+            provider.is_writable("SH:grp").await,
+            "a real servable group is writable"
+        );
+
+        // group_is_pure_self_trigger: false for the shadowed name (served
+        // as a record full-snapshot monitor), true for the real group.
+        assert!(
+            !provider.group_is_pure_self_trigger("SH:rec").await,
+            "shadowed name is a record monitor, not a partial group stream"
+        );
+        assert!(
+            provider.group_is_pure_self_trigger("SH:grp").await,
+            "the real pure-self-trigger group emits partial"
         );
     }
 

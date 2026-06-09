@@ -329,6 +329,24 @@ static SWAIT_FIELDS_SCALAR: &[FieldDesc] = &[
     },
 ];
 
+/// Choice labels for the `swait` output-execute-option menu, in index
+/// order. C `menu(swaitOOPT)` (`swaitRecord.dbd`): the six `longoutOOPT`
+/// choices plus a trailing "Never" (index 6) that suppresses output.
+const SWAIT_OOPT_CHOICES: &[&str] = &[
+    "Every Time",
+    "On Change",
+    "When Zero",
+    "When Non-zero",
+    "Transition To Zero",
+    "Transition To Non-zero",
+    "Never",
+];
+
+/// Choice labels for the `swait` output-data-option menu, in index order.
+/// C `menu(swaitDOPT)` (`swaitRecord.dbd`): 0="Use VAL" (the calculated
+/// result), 1="Use DOL" (the value fetched through the `DOL` link).
+const SWAIT_DOPT_CHOICES: &[&str] = &["Use VAL", "Use DOL"];
+
 impl Record for SwaitRecord {
     fn record_type(&self) -> &'static str {
         "swait"
@@ -336,6 +354,17 @@ impl Record for SwaitRecord {
 
     fn field_list(&self) -> &'static [FieldDesc] {
         SWAIT_FIELDS_SCALAR
+    }
+
+    /// Record-specific `DBF_MENU` fields, served as `DBR_ENUM` with the
+    /// menu's choice labels in `.dbd` index order (`swaitRecord.dbd`):
+    /// `OOPT` is `menu(swaitOOPT)`, `DOPT` is `menu(swaitDOPT)`.
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "OOPT" => Some(SWAIT_OOPT_CHOICES),
+            "DOPT" => Some(SWAIT_DOPT_CHOICES),
+            _ => None,
+        }
     }
 
     fn uses_monitor_deadband(&self) -> bool {

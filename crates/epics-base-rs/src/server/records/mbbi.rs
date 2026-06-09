@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
+use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
 
 /// Multi-bit binary input record — manual Record impl for raw↔index conversion.
@@ -636,6 +636,17 @@ impl Record for MbbiRecord {
     }
     fn field_list(&self) -> &'static [FieldDesc] {
         MBBI_FIELDS
+    }
+
+    /// `SIMM` is `DBF_MENU menu(menuSimm)` (`mbbiRecord.dbd.pod`): the
+    /// multibit records carry the three-choice NO/YES/RAW simulation menu.
+    /// Served as `DBR_ENUM` with these labels. The state severities and
+    /// `SIMS`/`OLDSIMM` are shared menus resolved centrally.
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "SIMM" => Some(MENU_SIMM),
+            _ => None,
+        }
     }
 
     /// Regression R0604-BASEREC-BINARY-MONITOR-1: VAL posts DBE_VALUE|DBE_LOG

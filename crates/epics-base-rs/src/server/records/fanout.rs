@@ -1,5 +1,10 @@
 use epics_macros_rs::EpicsRecord;
 
+/// Choice labels for the `fanout` select-mechanism menu, in index order.
+/// C `menu(fanoutSELM)` (`fanoutRecord.dbd.pod:30-33`): 0=All,
+/// 1=Specified, 2=Mask.
+const FANOUT_SELM_CHOICES: &[&str] = &["All", "Specified", "Mask"];
+
 /// `fanout` record — forward-link fan-out.
 ///
 /// C parity (`fanoutRecord.c:39` `#define NLINKS 16`,
@@ -13,7 +18,10 @@ use epics_macros_rs::EpicsRecord;
 pub struct FanoutRecord {
     #[field(type = "Enum")]
     pub val: u16,
-    #[field(type = "Short")]
+    // SELM is DBF_MENU menu(fanoutSELM) (fanoutRecord.dbd.pod:111): served
+    // as DBR_ENUM with the menu's choice labels (FANOUT_SELM_CHOICES). The
+    // index is stored as a short; the framework promotes it to Enum.
+    #[field(type = "Short", menu_choices = FANOUT_SELM_CHOICES)]
     pub selm: i16,
     // SELN is `DBF_USHORT` (fanoutRecord.dbd.pod:117): unsigned 0..65535.
     #[field(type = "UShort")]

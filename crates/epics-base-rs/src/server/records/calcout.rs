@@ -655,6 +655,21 @@ static CALCOUT_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// Choice labels for the output-execute-option menu, in index order.
+/// C `menu(calcoutOOPT)` (`calcoutRecord.dbd.pod:33-39`).
+const CALCOUT_OOPT_CHOICES: &[&str] = &[
+    "Every Time",
+    "On Change",
+    "When Zero",
+    "When Non-zero",
+    "Transition To Zero",
+    "Transition To Non-zero",
+];
+
+/// Choice labels for the output-data-option menu, in index order.
+/// C `menu(calcoutDOPT)` (`calcoutRecord.dbd.pod:41-43`).
+const CALCOUT_DOPT_CHOICES: &[&str] = &["Use CALC", "Use OCAL"];
+
 impl Record for CalcoutRecord {
     fn record_type(&self) -> &'static str {
         "calcout"
@@ -1187,6 +1202,14 @@ impl Record for CalcoutRecord {
 
     fn field_list(&self) -> &'static [FieldDesc] {
         CALCOUT_FIELDS
+    }
+
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "OOPT" => Some(CALCOUT_OOPT_CHOICES),
+            "DOPT" => Some(CALCOUT_DOPT_CHOICES),
+            _ => None,
+        }
     }
 
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {

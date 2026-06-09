@@ -1,6 +1,7 @@
 mod alarm;
 mod common_fields;
 mod link;
+mod menu_choices;
 mod process_passive;
 mod record_instance;
 mod record_trait;
@@ -14,6 +15,10 @@ pub use link::{
     CaLink, CalcLink, DbLink, HwLink, HwLinkKind, JlinkValue, LinkAddress, LinkProcessPolicy,
     LinkType, MonitorSwitch, PVAJSON_IDENTITY_SEP, ParsedLink, PvaJsonLink, link_field_type,
     parse_link, parse_link_v2, parse_output_link_v2, pvajson_identity_key,
+};
+pub use menu_choices::{
+    MENU_ALARM_SEVR, MENU_CONVERT, MENU_FTYPE, MENU_IVOA, MENU_OMSL, MENU_POST, MENU_PRIORITY,
+    MENU_SCAN, MENU_SIMM, MENU_YES_NO, shared_menu_choices,
 };
 pub use record_instance::{NotifyWaitSet, RecordInstance};
 pub use record_trait::{

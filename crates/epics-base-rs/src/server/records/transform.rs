@@ -448,6 +448,16 @@ static TRANSFORM_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// Choice labels for the calculation-option menu, in index order.
+/// C `menu(transformCOPT)` (synApps `transformRecord.dbd`): 0=Conditional
+/// (only recompute outputs whose inputs changed), 1=Always.
+const TRANSFORM_COPT_CHOICES: &[&str] = &["Conditional", "Always"];
+
+/// Choice labels for the invalid-link-action menu, in index order.
+/// C `menu(transformIVLA)` (synApps `transformRecord.dbd`): 0="Ignore
+/// error", 1="Do Nothing".
+const TRANSFORM_IVLA_CHOICES: &[&str] = &["Ignore error", "Do Nothing"];
+
 impl Record for TransformRecord {
     fn record_type(&self) -> &'static str {
         "transform"
@@ -660,6 +670,17 @@ impl Record for TransformRecord {
 
     fn field_list(&self) -> &'static [FieldDesc] {
         TRANSFORM_FIELDS
+    }
+
+    /// Record-specific `DBF_MENU` fields, served as `DBR_ENUM` with the
+    /// menu's choice labels in `.dbd` index order (`transformRecord.dbd`):
+    /// `COPT` is `menu(transformCOPT)`, `IVLA` is `menu(transformIVLA)`.
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "COPT" => Some(TRANSFORM_COPT_CHOICES),
+            "IVLA" => Some(TRANSFORM_IVLA_CHOICES),
+            _ => None,
+        }
     }
 }
 

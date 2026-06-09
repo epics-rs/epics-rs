@@ -423,6 +423,67 @@ impl RecordInstance {
         }
     }
 
+    /// Choice table for a field served as `DBR_ENUM` from a `DBF_MENU`:
+    /// the record's own record-specific menu
+    /// ([`Record::menu_field_choices`](super::record_trait::Record::menu_field_choices)),
+    /// else a shared menu keyed by field name
+    /// ([`shared_menu_choices`](super::menu_choices::shared_menu_choices)).
+    fn menu_choices_for(&self, field: &str) -> Option<&'static [&'static str]> {
+        self.record
+            .menu_field_choices(field)
+            .or_else(|| super::menu_choices::shared_menu_choices(field))
+    }
+
+    /// Promote a `DBF_MENU` field's value to its `DBR_ENUM` client form: a
+    /// menu index stored as a short becomes [`EpicsValue::Enum`], so the
+    /// wire type a client sees is `DBR_ENUM` (CA) / `NTEnum` (PVA),
+    /// matching C dbStaticLib serving `DBF_MENU` as `DBR_ENUM`. The
+    /// menu index is held internally as `DbFieldType::Short`, so only that
+    /// representation is promoted; a same-named field that is not a menu
+    /// index here (e.g. `scalcout.OSV`, a string) is returned unchanged.
+    /// Idempotent for a value already delivered as `Enum` (`.SCAN`/`SSCN`,
+    /// the record-specific `SELM`).
+    fn promote_menu_value(&self, field: &str, value: EpicsValue) -> EpicsValue {
+        if self.menu_choices_for(field).is_some() {
+            if let EpicsValue::Short(idx) = value {
+                return EpicsValue::Enum(idx as u16);
+            }
+        }
+        value
+    }
+
+    /// The client-facing value of `field`: the resolved value with a
+    /// `DBF_MENU` field promoted to its `DBR_ENUM` form (see
+    /// [`Self::promote_menu_value`]), so a wire type derived directly from
+    /// the value matches the GET/MONITOR data. Used by the CA create-
+    /// channel path, which reads the native type from the value rather
+    /// than from [`Self::snapshot_for_field`].
+    pub fn client_field_value(&self, field: &str) -> Option<EpicsValue> {
+        let value = self.resolve_field(field)?;
+        Some(self.promote_menu_value(field, value))
+    }
+
+    /// Attach the `DBF_MENU` → `DBR_ENUM` representation to a built
+    /// snapshot: promote the value to [`EpicsValue::Enum`] and attach the
+    /// menu's `menu()` choice labels so the CA/PVA enum encoders present
+    /// them. The single owner of "menu field -> (enum value, choice
+    /// table)" for both the GET ([`Self::snapshot_for_field`]) and MONITOR
+    /// ([`Self::make_monitor_snapshot`]) snapshot builders, so the wire
+    /// form is identical on every delivery path. A same-named non-menu
+    /// field (whose value is not a menu index) keeps its plain value and
+    /// gets no choice table.
+    fn attach_menu_enum(&self, field: &str, snap: &mut super::super::snapshot::Snapshot) {
+        let Some(choices) = self.menu_choices_for(field) else {
+            return;
+        };
+        snap.value = self.promote_menu_value(field, snap.value.clone());
+        if matches!(snap.value, EpicsValue::Enum(_)) {
+            snap.enums = Some(super::super::snapshot::EnumInfo {
+                strings: choices.iter().map(|s| (*s).to_string()).collect(),
+            });
+        }
+    }
+
     /// Build a Snapshot with full metadata for the given field.
     pub fn snapshot_for_field(&self, field: &str) -> Option<super::super::snapshot::Snapshot> {
         let value = self.resolve_field(field)?;
@@ -454,17 +515,14 @@ impl RecordInstance {
         // and not part of the per-record cache.
         self.populate_common_enum_info(field, &mut snap);
 
-        // Record-specific DBF_MENU field (e.g. sel.SELM): attach the field's
-        // own menu() choice table so the CA/PVA enum encoders present the
-        // labels, matching C dbStaticLib serving a DBF_MENU field as
-        // DBR_ENUM. This overrides any record VAL enum table copied from the
-        // metadata cache above, because a menu field carries its own menu's
-        // choices, not the record's VAL state strings.
-        if let Some(choices) = self.record.menu_field_choices(field) {
-            snap.enums = Some(super::super::snapshot::EnumInfo {
-                strings: choices.iter().map(|s| (*s).to_string()).collect(),
-            });
-        }
+        // DBF_MENU field (a shared menu such as `OMSL`/`HHSV`/`SIMM`/... or
+        // a record-specific menu such as `sel.SELM`): carry the menu index
+        // as DBR_ENUM and attach its `menu()` choice labels. See
+        // `attach_menu_enum`. This overrides any record VAL enum table
+        // copied from the metadata cache above, because a menu field
+        // carries its own menu's choices, not the record's VAL state
+        // strings.
+        self.attach_menu_enum(field, &mut snap);
 
         // apply `info(Q:time:tag, "nsec:lsb:N")` — pvxs
         // typeutils.cpp:79 splits the low N bits of the timestamp's
@@ -2070,7 +2128,11 @@ impl RecordInstance {
     /// Build a Snapshot for a given value, populated with the record's display metadata.
     /// Uses the metadata cache so the populate cost is paid at most once
     /// per metadata-stable interval (cf. `cached_metadata`).
-    fn make_monitor_snapshot(&self, value: EpicsValue) -> super::super::snapshot::Snapshot {
+    fn make_monitor_snapshot(
+        &self,
+        field: &str,
+        value: EpicsValue,
+    ) -> super::super::snapshot::Snapshot {
         let mut snap = super::super::snapshot::Snapshot::new(
             value,
             self.common.stat,
@@ -2087,6 +2149,10 @@ impl RecordInstance {
         snap.display = meta.display;
         snap.control = meta.control;
         snap.enums = meta.enums;
+        // A monitored DBF_MENU field carries the same DBR_ENUM value and
+        // choice labels as the GET path, so a `camonitor`/`pvmonitor`
+        // update shows the menu label, not a bare index.
+        self.attach_menu_enum(field, &mut snap);
         snap
     }
 
@@ -2100,7 +2166,7 @@ impl RecordInstance {
         for (field, value) in &snapshot.changed_fields {
             if let Some(subs) = self.subscribers.get(field) {
                 // Build a full snapshot once per field (with display metadata)
-                let mon_snap = self.make_monitor_snapshot(value.clone());
+                let mon_snap = self.make_monitor_snapshot(field, value.clone());
                 for sub in subs {
                     // Paused subscriber (`db_event_disable`): suppress at
                     // the source — no delivery, no coalesce.
@@ -2157,7 +2223,7 @@ impl RecordInstance {
         use crate::server::database::filters::FilteredMonitorEvent;
         if let Some(subs) = self.subscribers.get(field) {
             if let Some(value) = self.resolve_field(field) {
-                let mon_snap = self.make_monitor_snapshot(value);
+                let mon_snap = self.make_monitor_snapshot(field, value);
                 for sub in subs {
                     // Paused subscriber (`db_event_disable`): suppress at
                     // the source — no delivery, no coalesce.
@@ -2491,7 +2557,7 @@ mod metadata_cache_tests {
             "GET path must serve the record's utag as timeStamp.userTag"
         );
 
-        let mon = inst.make_monitor_snapshot(EpicsValue::Double(1.0));
+        let mon = inst.make_monitor_snapshot("VAL", EpicsValue::Double(1.0));
         assert_eq!(
             mon.user_tag, want,
             "MONITOR path must carry the record's utag too"
@@ -2641,12 +2707,12 @@ mod metadata_cache_tests {
         assert!(inst.metadata_cache.lock().unwrap().is_none());
 
         // make_monitor_snapshot should also populate the cache
-        let snap = inst.make_monitor_snapshot(EpicsValue::Double(42.0));
+        let snap = inst.make_monitor_snapshot("VAL", EpicsValue::Double(42.0));
         assert!(snap.display.is_some());
         assert!(inst.metadata_cache.lock().unwrap().is_some());
 
         // Subsequent call hits cache
-        let snap2 = inst.make_monitor_snapshot(EpicsValue::Double(43.0));
+        let snap2 = inst.make_monitor_snapshot("VAL", EpicsValue::Double(43.0));
         let d1 = snap.display.unwrap();
         let d2 = snap2.display.unwrap();
         assert_eq!(d1.units, d2.units);

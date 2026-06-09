@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
+use crate::server::record::{FieldDesc, MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
 
 /// EPICS `MAX_STRING_SIZE` — `val`/`oval`/`sval` are fixed 40-byte
@@ -97,6 +97,16 @@ impl Record for StringinRecord {
 
     fn field_list(&self) -> &'static [FieldDesc] {
         STRINGIN_FIELDS
+    }
+
+    /// `SIMM` is `DBF_MENU menu(menuYesNo)` (`stringinRecord.dbd.pod`): the
+    /// two-choice NO/YES simulation menu. Served as `DBR_ENUM` with these
+    /// labels. `SIMS`/`OLDSIMM` are shared menus resolved centrally.
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "SIMM" => Some(MENU_YES_NO),
+            _ => None,
+        }
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {

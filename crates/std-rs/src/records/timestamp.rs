@@ -6,6 +6,24 @@ use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 use chrono::{Local, TimeZone};
 
+/// Choice labels for the timestamp string-format menu, in index order.
+/// C `menu(timestampTST)` (std `timestampRecord.dbd`): `TST` selects which
+/// of these `strftime`-style formats `VAL` is rendered with. The
+/// index↔string mapping is wire-visible to clients.
+const TIMESTAMP_TST_CHOICES: &[&str] = &[
+    "YY/MM/DD HH:MM:SS",
+    "MM/DD/YY HH:MM:SS",
+    "Mon DD HH:MM:SS YY",
+    "Mon DD HH:MM:SS",
+    "HH:MM:SS",
+    "HH:MM",
+    "DD/MM/YY HH:MM:SS",
+    "DD Mon HH:MM:SS YY",
+    "DD-Mon-YYYY HH:MM:SS",
+    "Mon DD, YYYY HH:MM:SS.ns",
+    "MM/DD/YY HH:MM:SS.ns",
+];
+
 /// EPICS epoch: 1990-01-01 00:00:00 UTC
 const EPICS_EPOCH_OFFSET: i64 = 631152000;
 
@@ -242,6 +260,15 @@ impl Record for TimestampRecord {
         FIELDS
     }
 
+    /// `TST` is `DBF_MENU menu(timestampTST)` (std `timestampRecord.dbd`);
+    /// served as `DBR_ENUM` with the format-string choice labels.
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "TST" => Some(TIMESTAMP_TST_CHOICES),
+            _ => None,
+        }
+    }
+
     /// C `timestampRecord.c:90` reads `ptimestamp->tse`. The framework
     /// owns `dbCommon.tse`; this hook captures it so `process()` can
     /// take the device-time branch.
@@ -251,5 +278,34 @@ impl Record for TimestampRecord {
 
     fn clears_udf(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod menu_choice_tests {
+    use super::{TIMESTAMP_TST_CHOICES, TimestampRecord};
+    use epics_base_rs::server::record::{Record, RecordInstance};
+    use epics_base_rs::types::EpicsValue;
+
+    // TST is menu(timestampTST) served as Short; the base snapshot path
+    // promotes it to DBR_ENUM and attaches the wire-visible format labels.
+    #[test]
+    fn timestamp_tst_snapshot_is_enum_with_labels() {
+        let mut rec = TimestampRecord::default();
+        rec.put_field("TST", EpicsValue::Short(4)).unwrap(); // HH:MM:SS
+        let inst = RecordInstance::new("TS:TST".into(), rec);
+
+        let snap = inst.snapshot_for_field("TST").unwrap();
+        assert_eq!(snap.value, EpicsValue::Enum(4));
+        let strings = &snap.enums.as_ref().unwrap().strings;
+        assert_eq!(strings.len(), 11);
+        assert_eq!(strings[4], "HH:MM:SS");
+    }
+
+    #[test]
+    fn timestamp_menu_field_choices_match_dbd() {
+        let rec = TimestampRecord::default();
+        assert_eq!(rec.menu_field_choices("TST"), Some(TIMESTAMP_TST_CHOICES));
+        assert_eq!(rec.menu_field_choices("VAL"), None);
     }
 }

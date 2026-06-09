@@ -2126,8 +2126,12 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     }
                     PvEntry::Record(rec) => {
                         let instance = rec.read().await;
-                        // Use resolve_field for 3-level priority
-                        let value = instance.resolve_field(&field);
+                        // `client_field_value` = resolve_field (3-level
+                        // priority) with a DBF_MENU field promoted to its
+                        // DBR_ENUM form, so the channel's announced native
+                        // type matches the GET/MONITOR data
+                        // (`value.dbr_type()` below).
+                        let value = instance.client_field_value(&field);
                         match value {
                             Some(v) => {
                                 // `$` long-string — C dbChannel.c:483-507

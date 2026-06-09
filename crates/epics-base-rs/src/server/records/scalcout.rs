@@ -401,6 +401,29 @@ static SCALCOUT_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// Choice labels for the `scalcout` output-execute-option menu, in index
+/// order. C `menu(scalcoutOOPT)` (`sCalcoutRecord.dbd`): like `calcoutOOPT`
+/// but with a trailing "Never" choice (index 6) that suppresses output
+/// entirely.
+const SCALCOUT_OOPT_CHOICES: &[&str] = &[
+    "Every Time",
+    "On Change",
+    "When Zero",
+    "When Non-zero",
+    "Transition To Zero",
+    "Transition To Non-zero",
+    "Never",
+];
+
+/// Choice labels for the `scalcout` output-data-option menu, in index
+/// order. C `menu(scalcoutDOPT)` (`sCalcoutRecord.dbd`): 0="Use CALC"
+/// (result of `CALC`), 1="Use OCAL" (result of the `OCAL` expression).
+const SCALCOUT_DOPT_CHOICES: &[&str] = &["Use CALC", "Use OCAL"];
+
+/// Choice labels for the `scalcout` wait-for-completion menu, in index
+/// order. C `menu(scalcoutWAIT)` (`sCalcoutRecord.dbd`): 0=NoWait, 1=Wait.
+const SCALCOUT_WAIT_CHOICES: &[&str] = &["NoWait", "Wait"];
+
 impl Record for ScalcoutRecord {
     fn record_type(&self) -> &'static str {
         "scalcout"
@@ -686,6 +709,19 @@ impl Record for ScalcoutRecord {
 
     fn field_list(&self) -> &'static [FieldDesc] {
         SCALCOUT_FIELDS
+    }
+
+    /// Record-specific `DBF_MENU` fields, served as `DBR_ENUM` with the
+    /// menu's choice labels in `.dbd` index order (`sCalcoutRecord.dbd`):
+    /// `OOPT` is `menu(scalcoutOOPT)`, `DOPT` is `menu(scalcoutDOPT)`, `WAIT`
+    /// is `menu(scalcoutWAIT)`. `IVOA` is a shared menu resolved centrally.
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "OOPT" => Some(SCALCOUT_OOPT_CHOICES),
+            "DOPT" => Some(SCALCOUT_DOPT_CHOICES),
+            "WAIT" => Some(SCALCOUT_WAIT_CHOICES),
+            _ => None,
+        }
     }
 }
 

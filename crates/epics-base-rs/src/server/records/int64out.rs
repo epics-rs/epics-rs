@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
+use crate::server::record::{FieldDesc, MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
 
 // int64out: 64-bit integer output.
@@ -204,6 +204,18 @@ impl Record for Int64outRecord {
 
     fn field_list(&self) -> &'static [FieldDesc] {
         INT64OUT_FIELDS
+    }
+
+    /// `SIMM` is `DBF_MENU menu(menuYesNo)` (`int64outRecord.dbd.pod`): the
+    /// integer records carry the two-choice NO/YES simulation menu, not the
+    /// three-choice `menuSimm` used by the analog/binary/multibit records.
+    /// Served as `DBR_ENUM` with these labels. `SIMS`/`OLDSIMM`/`OMSL`/
+    /// `IVOA` are shared menus resolved centrally.
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "SIMM" => Some(MENU_YES_NO),
+            _ => None,
+        }
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

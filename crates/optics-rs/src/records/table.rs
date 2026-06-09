@@ -3049,6 +3049,15 @@ static ALL_FIELDS: LazyLock<Vec<FieldDesc>> = LazyLock::new(|| {
 // Record trait implementation
 // ===========================================================================
 
+/// Record-specific `DBF_MENU` choice tables, in `.dbd` value order (the
+/// index↔string mapping is wire-visible to clients). Source: the C
+/// `tableRecord.dbd` menu definitions (optics module). `SET`/`GEOM`/`AUNIT`
+/// are already served as `DBR_ENUM`; these tables supply the labels the
+/// base record registry attaches to the snapshot.
+const TABLE_SET_CHOICES: &[&str] = &["Use", "Set"];
+const TABLE_GEOM_CHOICES: &[&str] = &["SRI", "GEOCARS", "NEWPORT", "PNC"];
+const TABLE_AUNIT_CHOICES: &[&str] = &["degrees", "ur"];
+
 impl Record for TableRecord {
     fn record_type(&self) -> &'static str {
         "table"
@@ -3762,6 +3771,18 @@ impl Record for TableRecord {
     fn field_list(&self) -> &'static [FieldDesc] {
         let fields: &Vec<FieldDesc> = &ALL_FIELDS;
         unsafe { std::slice::from_raw_parts(fields.as_ptr(), fields.len()) }
+    }
+
+    /// `SET`/`GEOM`/`AUNIT` are `DBF_MENU` (`tableSET`/`tableGEOM`/
+    /// `tableAUNIT`, C `tableRecord.dbd`); served as `DBR_ENUM` with the
+    /// menu's choice labels in `.dbd` index order.
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "SET" => Some(TABLE_SET_CHOICES),
+            "GEOM" => Some(TABLE_GEOM_CHOICES),
+            "AUNIT" => Some(TABLE_AUNIT_CHOICES),
+            _ => None,
+        }
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
@@ -5568,5 +5589,40 @@ mod tests {
             0.000000000000000e+00,
         ];
         assert_golden("SRI offset ax0=5", &mut t, &user, &c_motor, &c_rt);
+    }
+}
+
+#[cfg(test)]
+mod menu_choice_tests {
+    use super::{Geometry, TableRecord};
+    use epics_base_rs::server::record::{Record, RecordInstance};
+    use epics_base_rs::types::EpicsValue;
+
+    // GEOM is already served as DBR_ENUM; the menu_field_choices override
+    // supplies the wire-visible labels that the base snapshot path attaches
+    // (without it the enum had no choice strings).
+    #[test]
+    fn table_geom_snapshot_carries_labels() {
+        let mut rec = TableRecord::new();
+        rec.geom = Geometry::Newport; // index 2
+        let inst = RecordInstance::new("TBL:GEOM".into(), rec);
+
+        let snap = inst.snapshot_for_field("GEOM").unwrap();
+        assert_eq!(snap.value, EpicsValue::Enum(2));
+        assert_eq!(
+            snap.enums.as_ref().unwrap().strings,
+            vec!["SRI", "GEOCARS", "NEWPORT", "PNC"]
+        );
+    }
+
+    #[test]
+    fn table_menu_field_choices_match_dbd() {
+        let rec = TableRecord::new();
+        assert_eq!(rec.menu_field_choices("SET"), Some(&["Use", "Set"][..]));
+        assert_eq!(
+            rec.menu_field_choices("AUNIT"),
+            Some(&["degrees", "ur"][..])
+        );
+        assert_eq!(rec.menu_field_choices("VAL"), None);
     }
 }

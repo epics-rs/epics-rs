@@ -1,5 +1,10 @@
 use epics_macros_rs::EpicsRecord;
 
+/// Choice labels for the `seq` select-mechanism menu, in index order.
+/// C `menu(seqSELM)` (`seqRecord.dbd.pod:23-26`): 0=All, 1=Specified,
+/// 2=Mask.
+const SEQ_SELM_CHOICES: &[&str] = &["All", "Specified", "Mask"];
+
 /// `seq` record — sequenced multi-output writer.
 ///
 /// C parity (`seqRecord.c:86` `#define NUM_LINKS 16`,
@@ -13,7 +18,10 @@ use epics_macros_rs::EpicsRecord;
 pub struct SeqRecord {
     #[field(type = "Enum")]
     pub val: u16,
-    #[field(type = "Short")]
+    // SELM is DBF_MENU menu(seqSELM) (seqRecord.dbd.pod:265): served as
+    // DBR_ENUM with the menu's choice labels (SEQ_SELM_CHOICES). The index
+    // is stored as a short; the framework promotes it to Enum.
+    #[field(type = "Short", menu_choices = SEQ_SELM_CHOICES)]
     pub selm: i16,
     // SELN is `DBF_USHORT` (seqRecord.dbd.pod:271): unsigned 0..65535.
     #[field(type = "UShort")]

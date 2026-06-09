@@ -1256,6 +1256,129 @@ fn test_snapshot_sel_selm_menu_choices() {
     );
 }
 
+// SIMM is DBF_MENU, but its menu differs by record family: menu(menuSimm)
+// (NO/YES/RAW) on the analog/binary/multibit records, menu(menuYesNo)
+// (NO/YES) on the integer/string/long records. The snapshot boundary must
+// serve each record its OWN choice table — the field name alone is not
+// enough. These two cases pin both halves of that split.
+#[test]
+fn test_snapshot_ai_simm_is_menusimm_three_choices() {
+    let mut rec = AiRecord::new(1.0);
+    rec.simm = 2; // RAW — only present in menuSimm
+    let inst = RecordInstance::new("AI:SIMM".into(), rec);
+
+    let snap = inst.snapshot_for_field("SIMM").unwrap();
+    assert_eq!(snap.value, EpicsValue::Enum(2));
+    assert_eq!(
+        snap.enums.as_ref().unwrap().strings,
+        vec!["NO", "YES", "RAW"]
+    );
+}
+
+#[test]
+fn test_snapshot_longout_simm_is_menuyesno_two_choices() {
+    use epics_base_rs::server::records::longout::LongoutRecord;
+    let mut rec = LongoutRecord::new(0);
+    rec.simm = 1; // YES
+    let inst = RecordInstance::new("LO:SIMM".into(), rec);
+
+    let snap = inst.snapshot_for_field("SIMM").unwrap();
+    assert_eq!(snap.value, EpicsValue::Enum(1));
+    assert_eq!(snap.enums.as_ref().unwrap().strings, vec!["NO", "YES"]);
+}
+
+// The promotion lives at the snapshot boundary ONLY: get_field keeps
+// returning Short so record-internal callers (processing, alarm logic that
+// match EpicsValue::Short on SIMM/OMSL/IVOA) are unchanged.
+#[test]
+fn test_ai_simm_get_field_stays_short() {
+    let mut rec = AiRecord::new(1.0);
+    rec.simm = 2;
+    assert_eq!(rec.get_field("SIMM"), Some(EpicsValue::Short(2)));
+}
+
+// MPST/APST on lsi are menu(menuPost): On Change (0), Always (1). The value
+// order is wire-visible; the array records' POST menus reverse it, which is
+// why MPST/APST are resolved per record rather than globally.
+#[test]
+fn test_snapshot_lsi_mpst_menupost_order() {
+    use epics_base_rs::server::records::lsi::LsiRecord;
+    let mut rec = LsiRecord::new("x");
+    rec.mpst = 1; // Always
+    let inst = RecordInstance::new("LSI:MPST".into(), rec);
+
+    let snap = inst.snapshot_for_field("MPST").unwrap();
+    assert_eq!(snap.value, EpicsValue::Enum(1));
+    assert_eq!(
+        snap.enums.as_ref().unwrap().strings,
+        vec!["On Change", "Always"]
+    );
+}
+
+// A field whose name collides with a shared menu but is served centrally:
+// SIMS is menu(menuAlarmSevr) on every record, resolved by the global
+// registry without a per-record override.
+#[test]
+fn test_snapshot_ai_sims_alarm_severity_choices() {
+    let mut rec = AiRecord::new(1.0);
+    rec.sims = 3; // INVALID
+    let inst = RecordInstance::new("AI:SIMS".into(), rec);
+
+    let snap = inst.snapshot_for_field("SIMS").unwrap();
+    assert_eq!(snap.value, EpicsValue::Enum(3));
+    assert_eq!(
+        snap.enums.as_ref().unwrap().strings,
+        vec!["NO_ALARM", "MINOR", "MAJOR", "INVALID"]
+    );
+}
+
+// Record-specific output-policy menus carry their own labels in .dbd order.
+#[test]
+fn test_snapshot_ao_oif_menu_choices() {
+    let mut rec = AoRecord::new(0.0);
+    rec.oif = 1; // Incremental
+    let inst = RecordInstance::new("AO:OIF".into(), rec);
+
+    let snap = inst.snapshot_for_field("OIF").unwrap();
+    assert_eq!(snap.value, EpicsValue::Enum(1));
+    assert_eq!(
+        snap.enums.as_ref().unwrap().strings,
+        vec!["Full", "Incremental"]
+    );
+}
+
+#[test]
+fn test_snapshot_histogram_cmd_menu_choices() {
+    use epics_base_rs::server::records::histogram::HistogramRecord;
+    let mut rec = HistogramRecord::default();
+    rec.cmd = 2; // Start
+    let inst = RecordInstance::new("HIST:CMD".into(), rec);
+
+    let snap = inst.snapshot_for_field("CMD").unwrap();
+    assert_eq!(snap.value, EpicsValue::Enum(2));
+    assert_eq!(
+        snap.enums.as_ref().unwrap().strings,
+        vec!["Read", "Clear", "Start", "Stop"]
+    );
+}
+
+// scalcoutOOPT extends the six longoutOOPT choices with a trailing "Never"
+// (index 6) — the wire-visible label set must include it.
+#[test]
+fn test_snapshot_scalcout_oopt_includes_never() {
+    use epics_base_rs::server::records::scalcout::ScalcoutRecord;
+    let mut rec = ScalcoutRecord::default();
+    rec.oopt = 6; // Never
+    let inst = RecordInstance::new("SCALC:OOPT".into(), rec);
+
+    let snap = inst.snapshot_for_field("OOPT").unwrap();
+    assert_eq!(snap.value, EpicsValue::Enum(6));
+    let strings = &snap.enums.as_ref().unwrap().strings;
+    assert_eq!(strings.len(), 7);
+    assert_eq!(strings[0], "Every Time");
+    assert_eq!(strings[6], "Never");
+}
+
 #[test]
 fn test_snapshot_longin_display() {
     use epics_base_rs::server::records::longin::LonginRecord;

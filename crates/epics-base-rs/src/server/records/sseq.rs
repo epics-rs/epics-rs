@@ -6,6 +6,15 @@ use crate::types::{DbFieldType, EpicsValue};
 /// C `menu(sseqSELM)` (synApps sseqRecord.dbd): 0=All, 1=Specified, 2=Mask.
 const SSEQ_SELM_CHOICES: &[&str] = &["All", "Specified", "Mask"];
 
+/// Choice labels for the per-step wait-mode menu, in index order.
+/// C `menu(sseqWAIT)` (synApps sseqRecord.dbd): 0=NoWait, 1=Wait, then
+/// "After1".."AfterA" (wait for step 1..10 to finish before this one).
+/// Shared by every `WAIT1`..`WAITA` field.
+const SSEQ_WAIT_CHOICES: &[&str] = &[
+    "NoWait", "Wait", "After1", "After2", "After3", "After4", "After5", "After6", "After7",
+    "After8", "After9", "AfterA",
+];
+
 const NUM_STEPS: usize = 10;
 
 /// A single step in the string sequence.
@@ -643,6 +652,10 @@ impl Record for SseqRecord {
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
         match field {
             "SELM" => Some(SSEQ_SELM_CHOICES),
+            // The per-step `WAIT1`..`WAITA` fields are `menu(sseqWAIT)`.
+            _ if matches!(Self::step_index_from_suffix(field), Some((_, "WAIT"))) => {
+                Some(SSEQ_WAIT_CHOICES)
+            }
             _ => None,
         }
     }

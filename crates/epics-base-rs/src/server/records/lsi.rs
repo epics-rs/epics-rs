@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
+use crate::server::record::{FieldDesc, MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
 
 /// EPICS `MAX_STRING_SIZE` — DBR_STRING buffers are 40 bytes.
@@ -171,6 +171,20 @@ impl Record for LsiRecord {
 
     fn field_list(&self) -> &'static [FieldDesc] {
         LSI_FIELDS
+    }
+
+    /// `DBF_MENU` fields, served as `DBR_ENUM` (`lsiRecord.dbd.pod`): `SIMM`
+    /// is `menu(menuYesNo)` (two-choice NO/YES). `MPST`/`APST` are
+    /// `menu(menuPost)` (On Change, Always) — unlike the array records
+    /// (`aai`/`aao`/`waveform`) whose POST menus reverse that order, so they
+    /// are resolved here rather than globally. `SIMS`/`OLDSIMM` are shared
+    /// menus resolved centrally.
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "SIMM" => Some(MENU_YES_NO),
+            "MPST" | "APST" => Some(MENU_POST),
+            _ => None,
+        }
     }
 
     fn long_string_fields(&self) -> &'static [&'static str] {

@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
+use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
 
 use super::mbbi_direct::BIT_NAMES;
@@ -233,6 +233,17 @@ impl Record for MbboDirectRecord {
 
     fn field_list(&self) -> &'static [FieldDesc] {
         mbbo_direct_fields()
+    }
+
+    /// `SIMM` is `DBF_MENU menu(menuSimm)` (`mbboDirectRecord.dbd.pod`): the
+    /// three-choice NO/YES/RAW simulation menu. Served as `DBR_ENUM` with
+    /// these labels. `SIMS`/`OLDSIMM`/`OMSL`/`IVOA` are shared menus
+    /// resolved centrally.
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "SIMM" => Some(MENU_SIMM),
+            _ => None,
+        }
     }
 
     // C recMbboDirect.c IVOA=set_to_IVOV: val = ivov; rval = ivov.

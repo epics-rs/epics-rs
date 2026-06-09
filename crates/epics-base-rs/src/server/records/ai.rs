@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
+use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
 
 /// Analog input record with conversion support.
@@ -571,6 +571,18 @@ impl Record for AiRecord {
 
     fn field_list(&self) -> &'static [FieldDesc] {
         FIELDS
+    }
+
+    /// `SIMM` is `DBF_MENU menu(menuSimm)` (`aiRecord.dbd.pod`): the analog
+    /// records carry the three-choice NO/YES/RAW simulation menu, not the
+    /// two-choice `menuYesNo` used by the integer/string records. Served as
+    /// `DBR_ENUM` with these labels. `SIMS`/`OLDSIMM` are shared menus
+    /// resolved centrally.
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "SIMM" => Some(MENU_SIMM),
+            _ => None,
+        }
     }
 
     /// C `aiRecord.c::convert` raises `SOFT_ALARM/MAJOR_ALARM` when the

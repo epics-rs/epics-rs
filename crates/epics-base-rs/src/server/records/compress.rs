@@ -404,6 +404,21 @@ static COMPRESS_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// Choice labels for the compression algorithm menu, in index order.
+/// C `menu(compressALG)` (`compressRecord.dbd.pod:49-55`).
+const COMPRESS_ALG_CHOICES: &[&str] = &[
+    "N to 1 Low Value",
+    "N to 1 High Value",
+    "N to 1 Average",
+    "Average",
+    "Circular Buffer",
+    "N to 1 Median",
+];
+
+/// Choice labels for the buffering algorithm menu, in index order.
+/// C `menu(bufferingALG)` (`compressRecord.dbd.pod:57-59`).
+const COMPRESS_BALG_CHOICES: &[&str] = &["FIFO Buffer", "LIFO Buffer"];
+
 impl Record for CompressRecord {
     fn record_type(&self) -> &'static str {
         "compress"
@@ -600,6 +615,14 @@ impl Record for CompressRecord {
 
     fn field_list(&self) -> &'static [FieldDesc] {
         COMPRESS_FIELDS
+    }
+
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "ALG" => Some(COMPRESS_ALG_CHOICES),
+            "BALG" => Some(COMPRESS_BALG_CHOICES),
+            _ => None,
+        }
     }
 
     fn primary_field(&self) -> &'static str {

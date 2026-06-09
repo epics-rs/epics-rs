@@ -8,6 +8,13 @@ use epics_base_rs::types::{DbFieldType, EpicsValue};
 /// Maximum number of scaler channels.
 pub const MAX_SCALER_CHANNELS: usize = 64;
 
+/// Record-specific `DBF_MENU` choice tables, in `.dbd` value order (the
+/// index↔string mapping is wire-visible to clients). Source: the C
+/// `scalerRecord.dbd` menu definitions (scaler module). `CNT`/`PCNT` share
+/// `menu(scalerCNT)`; `CONT` is `menu(scalerCONT)`.
+const SCALER_CNT_CHOICES: &[&str] = &["Done", "Count"];
+const SCALER_CONT_CHOICES: &[&str] = &["OneShot", "AutoCount"];
+
 const VERSION: f32 = 3.19;
 
 // Scaler hardware state
@@ -1087,6 +1094,17 @@ impl Record for ScalerRecord {
         unsafe { std::slice::from_raw_parts(fields.as_ptr(), fields.len()) }
     }
 
+    /// `CNT`/`PCNT` are `DBF_MENU menu(scalerCNT)`; `CONT` is
+    /// `menu(scalerCONT)` (C `scalerRecord.dbd`). Served as `DBR_ENUM` with
+    /// the menu's choice labels in `.dbd` index order.
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "CNT" | "PCNT" => Some(SCALER_CNT_CHOICES),
+            "CONT" => Some(SCALER_CONT_CHOICES),
+            _ => None,
+        }
+    }
+
     fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
         Some(self)
     }
@@ -1111,5 +1129,36 @@ impl Record for ScalerRecord {
             self.tp = self.pr[0] as f64 / self.freq;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod menu_choice_tests {
+    use super::ScalerRecord;
+    use epics_base_rs::server::record::{Record, RecordInstance};
+    use epics_base_rs::types::EpicsValue;
+
+    // CONT is menu(scalerCONT) served as Short; the base snapshot path
+    // promotes it to DBR_ENUM and attaches the wire-visible labels.
+    #[test]
+    fn scaler_cont_snapshot_is_enum_with_labels() {
+        let mut rec = ScalerRecord::default();
+        rec.put_field("CONT", EpicsValue::Short(1)).unwrap();
+        let inst = RecordInstance::new("SC:CONT".into(), rec);
+
+        let snap = inst.snapshot_for_field("CONT").unwrap();
+        assert_eq!(snap.value, EpicsValue::Enum(1));
+        assert_eq!(
+            snap.enums.as_ref().unwrap().strings,
+            vec!["OneShot", "AutoCount"]
+        );
+    }
+
+    #[test]
+    fn scaler_menu_field_choices_match_dbd() {
+        let rec = ScalerRecord::default();
+        assert_eq!(rec.menu_field_choices("CNT"), Some(&["Done", "Count"][..]));
+        assert_eq!(rec.menu_field_choices("PCNT"), Some(&["Done", "Count"][..]));
+        assert_eq!(rec.menu_field_choices("VAL"), None);
     }
 }

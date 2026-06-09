@@ -6,6 +6,17 @@ use epics_base_rs::server::record::{
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
+/// Record-specific `DBF_MENU` choice tables, in `.dbd` value order (the
+/// index↔string mapping is wire-visible to clients). Source: the C
+/// `throttleRecord.dbd` menu definitions (std module). `OV`/`SIV` share
+/// `menu(throttleOV)`.
+const THROTTLE_WAIT_CHOICES: &[&str] = &["False", "True"];
+const THROTTLE_DRVLC_CHOICES: &[&str] = &["Off", "On"];
+const THROTTLE_DRVLS_CHOICES: &[&str] = &["Normal", "Low Limit", "High Limit"];
+const THROTTLE_STS_CHOICES: &[&str] = &["Unknown", "Error", "Success"];
+const THROTTLE_OV_CHOICES: &[&str] = &["Ext PV NC", "Ext PV OK", "Local PV", "Constant"];
+const THROTTLE_SYNC_CHOICES: &[&str] = &["Idle", "Process"];
+
 /// Throttle record — rate-limits value changes to prevent device damage.
 ///
 /// Ported from EPICS std module `throttleRecord.c`.
@@ -721,6 +732,23 @@ impl Record for ThrottleRecord {
         FIELDS
     }
 
+    /// Record-specific `DBF_MENU` fields, served as `DBR_ENUM` with the
+    /// menu's choice labels in `.dbd` index order (C `throttleRecord.dbd`):
+    /// `WAIT`=`throttleWAIT`, `DRVLC`=`throttleDRVLC`,
+    /// `DRVLS`=`throttleDRVLS`, `STS`=`throttleSTS`,
+    /// `OV`/`SIV`=`throttleOV`, `SYNC`=`throttleSYNC`.
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "WAIT" => Some(THROTTLE_WAIT_CHOICES),
+            "DRVLC" => Some(THROTTLE_DRVLC_CHOICES),
+            "DRVLS" => Some(THROTTLE_DRVLS_CHOICES),
+            "STS" => Some(THROTTLE_STS_CHOICES),
+            "OV" | "SIV" => Some(THROTTLE_OV_CHOICES),
+            "SYNC" => Some(THROTTLE_SYNC_CHOICES),
+            _ => None,
+        }
+    }
+
     /// C `throttleRecord.c:308` keeps `recGblFwdLink(prec)` commented
     /// out in `process()` — the forward link is fired ONLY from
     /// `valuePut`'s non-CONSTANT branch (`throttleRecord.c:580`), i.e.
@@ -754,5 +782,37 @@ impl Record for ThrottleRecord {
             self.out_written = false;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod menu_choice_tests {
+    use super::ThrottleRecord;
+    use epics_base_rs::server::record::Record;
+
+    // Choice tables must match throttleRecord.dbd menu value order — the
+    // index↔string mapping is wire-visible to clients.
+    #[test]
+    fn throttle_menu_field_choices_match_dbd() {
+        let rec = ThrottleRecord::default();
+        assert_eq!(rec.menu_field_choices("WAIT"), Some(&["False", "True"][..]));
+        assert_eq!(rec.menu_field_choices("DRVLC"), Some(&["Off", "On"][..]));
+        assert_eq!(
+            rec.menu_field_choices("DRVLS"),
+            Some(&["Normal", "Low Limit", "High Limit"][..])
+        );
+        assert_eq!(
+            rec.menu_field_choices("STS"),
+            Some(&["Unknown", "Error", "Success"][..])
+        );
+        // OV and SIV share menu(throttleOV).
+        let ov = &["Ext PV NC", "Ext PV OK", "Local PV", "Constant"][..];
+        assert_eq!(rec.menu_field_choices("OV"), Some(ov));
+        assert_eq!(rec.menu_field_choices("SIV"), Some(ov));
+        assert_eq!(
+            rec.menu_field_choices("SYNC"),
+            Some(&["Idle", "Process"][..])
+        );
+        assert_eq!(rec.menu_field_choices("VAL"), None);
     }
 }

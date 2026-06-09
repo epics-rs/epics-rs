@@ -4,10 +4,22 @@ use std::time::Instant;
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::recgbl::{self, alarm_status};
 use epics_base_rs::server::record::{
-    AlarmSeverity, CommonFields, FieldDesc, LinkType, ProcessAction, ProcessContext,
+    AlarmSeverity, CommonFields, FieldDesc, LinkType, MENU_OMSL, ProcessAction, ProcessContext,
     ProcessOutcome, Record, link_field_type,
 };
 use epics_base_rs::types::{DbFieldType, EpicsValue};
+
+/// Record-specific `DBF_MENU` choice tables, in `.dbd` value order (the
+/// index↔string mapping is wire-visible to clients). Source: the C
+/// `epidRecord.dbd` menu definitions (std module). `FMOD` is
+/// `menu(epidFeedbackMode)`; `FBON`/`FBOP` are `menu(epidFeedbackState)`.
+/// The alarm severities are shared menus resolved by the base registry.
+/// `SMSL` ("Setpoint Mode Select", `epidRecord.dbd:17`) is `menu(menuOmsl)`,
+/// but its field *name* is record-specific — the base registry keys the
+/// shared `menuOmsl` table by the standard name `OMSL` — so it is mapped
+/// per record to [`MENU_OMSL`].
+const EPID_FMOD_CHOICES: &[&str] = &["PID", "Max/Min"];
+const EPID_FBSTATE_CHOICES: &[&str] = &["Off", "On"];
 
 /// Feedback mode for the epid record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1201,6 +1213,18 @@ impl Record for EpidRecord {
         FIELDS
     }
 
+    /// `FMOD` is `DBF_MENU menu(epidFeedbackMode)`; `FBON`/`FBOP` are
+    /// `menu(epidFeedbackState)` (C `epidRecord.dbd`). Served as `DBR_ENUM`
+    /// with the menu's choice labels in `.dbd` index order.
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "SMSL" => Some(MENU_OMSL),
+            "FMOD" => Some(EPID_FMOD_CHOICES),
+            "FBON" | "FBOP" => Some(EPID_FBSTATE_CHOICES),
+            _ => None,
+        }
+    }
+
     fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
         Some(self)
     }
@@ -1391,5 +1415,50 @@ impl Record for EpidRecord {
         // C `epidRecord.c:201` `return(0)` on a UDF-gated cycle is
         // reached before `recGblFwdLink` — no forward link this cycle.
         !self.compute_skipped
+    }
+}
+
+#[cfg(test)]
+mod menu_choice_tests {
+    use super::EpidRecord;
+    use epics_base_rs::server::record::{Record, RecordInstance};
+    use epics_base_rs::types::EpicsValue;
+
+    // FMOD is menu(epidFeedbackMode); FBON/FBOP are menu(epidFeedbackState);
+    // SMSL is menu(menuOmsl). Choice tables must match epidRecord.dbd value
+    // order (wire-visible).
+    #[test]
+    fn epid_menu_field_choices_match_dbd() {
+        let rec = EpidRecord::default();
+        assert_eq!(
+            rec.menu_field_choices("FMOD"),
+            Some(&["PID", "Max/Min"][..])
+        );
+        let fbstate = &["Off", "On"][..];
+        assert_eq!(rec.menu_field_choices("FBON"), Some(fbstate));
+        assert_eq!(rec.menu_field_choices("FBOP"), Some(fbstate));
+        // SMSL is menu(menuOmsl); the field name is record-specific so the
+        // base registry does not resolve it — the per-record mapping must.
+        assert_eq!(
+            rec.menu_field_choices("SMSL"),
+            Some(&["supervisory", "closed_loop"][..])
+        );
+        assert_eq!(rec.menu_field_choices("VAL"), None);
+    }
+
+    // End-to-end: SMSL is served as Short; the base snapshot path promotes
+    // it to DBR_ENUM and attaches the menuOmsl labels.
+    #[test]
+    fn epid_smsl_snapshot_is_enum_with_labels() {
+        let mut rec = EpidRecord::default();
+        rec.put_field("SMSL", EpicsValue::Short(1)).unwrap(); // closed_loop
+        let inst = RecordInstance::new("PID:SMSL".into(), rec);
+
+        let snap = inst.snapshot_for_field("SMSL").unwrap();
+        assert_eq!(snap.value, EpicsValue::Enum(1));
+        assert_eq!(
+            snap.enums.as_ref().unwrap().strings,
+            vec!["supervisory", "closed_loop"]
+        );
     }
 }

@@ -188,6 +188,12 @@ static HISTOGRAM_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// Choice labels for the histogram command menu, in index order.
+/// C `menu(histogramCMD)` (`histogramRecord.dbd.pod`): 0=Read, 1=Clear,
+/// 2=Start, 3=Stop. Writing `CMD` triggers the corresponding action on the
+/// collection buffer.
+const HISTOGRAM_CMD_CHOICES: &[&str] = &["Read", "Clear", "Start", "Stop"];
+
 impl Record for HistogramRecord {
     fn record_type(&self) -> &'static str {
         "histogram"
@@ -298,6 +304,15 @@ impl Record for HistogramRecord {
 
     fn field_list(&self) -> &'static [FieldDesc] {
         HISTOGRAM_FIELDS
+    }
+
+    /// `CMD` is `DBF_MENU menu(histogramCMD)` (`histogramRecord.dbd.pod`);
+    /// served as `DBR_ENUM` with the Read/Clear/Start/Stop choice labels.
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "CMD" => Some(HISTOGRAM_CMD_CHOICES),
+            _ => None,
+        }
     }
 
     fn primary_field(&self) -> &'static str {

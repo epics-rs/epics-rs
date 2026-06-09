@@ -4,8 +4,26 @@ mod state_machine;
 mod status_update;
 
 use epics_base_rs::error::CaResult;
-use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record, RecordProcessResult};
+use epics_base_rs::server::record::{
+    FieldDesc, MENU_ALARM_SEVR, MENU_YES_NO, ProcessOutcome, Record, RecordProcessResult,
+};
 use epics_base_rs::types::EpicsValue;
+
+// Record-specific `DBF_MENU` choice tables, in `.dbd` value order (the
+// index↔string mapping is wire-visible to clients). Source: the C
+// `motorRecord.dbd` menu definitions (motor module). The shared menus
+// (`HHSV`/`HSV`/`LSV`/`LLSV`/`HLSV` = `menuAlarmSevr`, `OMSL` = `menuOmsl`)
+// are resolved by the base record registry and not restated here.
+const MOTOR_DIR_CHOICES: &[&str] = &["Pos", "Neg"];
+const MOTOR_FOFF_CHOICES: &[&str] = &["Variable", "Frozen"];
+const MOTOR_SET_CHOICES: &[&str] = &["Use", "Set"];
+const MOTOR_UEIP_CHOICES: &[&str] = &["No", "Yes"];
+const MOTOR_RSTM_CHOICES: &[&str] = &["Never", "Always", "NearZero", "Conditional"];
+const MOTOR_ACCU_CHOICES: &[&str] = &["Use ACCL", "Use ACCS"];
+const MOTOR_RMOD_CHOICES: &[&str] = &["Default", "Arithmetic", "Geometric", "In-Position"];
+const MOTOR_SPMG_CHOICES: &[&str] = &["Stop", "Pause", "Move", "Go"];
+const MOTOR_TORQ_CHOICES: &[&str] = &["Disable", "Enable"];
+const MOTOR_STUP_CHOICES: &[&str] = &["OFF", "ON", "BUSY"];
 
 use crate::coordinate;
 use crate::device_state::*;
@@ -247,6 +265,33 @@ impl Record for MotorRecord {
         field_access::FIELDS
     }
 
+    /// Record-specific `DBF_MENU` fields, served as `DBR_ENUM` with the
+    /// menu's choice labels in `.dbd` index order (C `motorRecord.dbd`).
+    /// `NTM` is `menu(menuYesNo)` (the shared base table); `UEIP`/`URIP`
+    /// share `menu(motorUEIP)`. `HLSV` ("HW Limit Violation Svr",
+    /// `motorRecord.dbd:452`) is `menu(menuAlarmSevr)` but its field *name*
+    /// is motor-specific, so the base registry — which keys the shared
+    /// severity menu by the standard names `HHSV`/`HSV`/`LSV`/`LLSV` — does
+    /// not resolve it; it is mapped here. The standard alarm severities and
+    /// `OMSL` are shared menus resolved by the base registry.
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "DIR" => Some(MOTOR_DIR_CHOICES),
+            "FOFF" => Some(MOTOR_FOFF_CHOICES),
+            "SET" => Some(MOTOR_SET_CHOICES),
+            "UEIP" | "URIP" => Some(MOTOR_UEIP_CHOICES),
+            "RSTM" => Some(MOTOR_RSTM_CHOICES),
+            "ACCU" => Some(MOTOR_ACCU_CHOICES),
+            "RMOD" => Some(MOTOR_RMOD_CHOICES),
+            "SPMG" => Some(MOTOR_SPMG_CHOICES),
+            "CNEN" => Some(MOTOR_TORQ_CHOICES),
+            "STUP" => Some(MOTOR_STUP_CHOICES),
+            "HLSV" => Some(MENU_ALARM_SEVR),
+            "NTM" => Some(MENU_YES_NO),
+            _ => None,
+        }
+    }
+
     /// C `init_record`: on pass 1, once all `field()` values have been
     /// applied, establish the limit invariant from the loaded DHLM/DLLM
     /// (C `set_dial_highlimit`/`set_dial_lowlimit`). See
@@ -411,5 +456,50 @@ mod tests {
             assert!(desc.read_only, "{name} must be read-only (SPC_NOMOD)");
             assert!(rec.get_field(name).is_some(), "{name} must be readable");
         }
+    }
+}
+
+#[cfg(test)]
+mod menu_choice_tests {
+    use super::MotorRecord;
+    use epics_base_rs::server::record::Record;
+
+    // The record-specific motor menus must hand the base snapshot path the
+    // exact .dbd choice tables, in value order (wire-visible to clients).
+    #[test]
+    fn motor_menu_field_choices_match_dbd() {
+        let rec = MotorRecord::new();
+        assert_eq!(rec.menu_field_choices("DIR"), Some(&["Pos", "Neg"][..]));
+        assert_eq!(
+            rec.menu_field_choices("FOFF"),
+            Some(&["Variable", "Frozen"][..])
+        );
+        assert_eq!(
+            rec.menu_field_choices("SPMG"),
+            Some(&["Stop", "Pause", "Move", "Go"][..])
+        );
+        assert_eq!(
+            rec.menu_field_choices("RMOD"),
+            Some(&["Default", "Arithmetic", "Geometric", "In-Position"][..])
+        );
+        assert_eq!(
+            rec.menu_field_choices("STUP"),
+            Some(&["OFF", "ON", "BUSY"][..])
+        );
+        // NTM is menu(menuYesNo) — the shared base table.
+        assert_eq!(rec.menu_field_choices("NTM"), Some(&["NO", "YES"][..]));
+        // HLSV is menu(menuAlarmSevr); its record-specific field name is not
+        // in the base registry's standard-severity key set, so it is mapped
+        // per record.
+        assert_eq!(
+            rec.menu_field_choices("HLSV"),
+            Some(&["NO_ALARM", "MINOR", "MAJOR", "INVALID"][..])
+        );
+        // UEIP/URIP share menu(motorUEIP).
+        assert_eq!(
+            rec.menu_field_choices("UEIP"),
+            rec.menu_field_choices("URIP")
+        );
+        assert_eq!(rec.menu_field_choices("VAL"), None);
     }
 }

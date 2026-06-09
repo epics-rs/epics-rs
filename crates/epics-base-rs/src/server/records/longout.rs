@@ -8,7 +8,7 @@
 //! `should_output_fn` knob this file can switch back to the derive form.
 
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
+use crate::server::record::{FieldDesc, MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
 
 pub struct LongoutRecord {
@@ -310,6 +310,18 @@ static LONGOUT_FIELDS: &[FieldDesc] = &[
     },
 ];
 
+/// Choice labels for the output-execute-option menu, in index order.
+/// C `menu(longoutOOPT)` (`longoutRecord.dbd.pod:23-29`). A distinct menu
+/// from `calcoutOOPT`, with the same six choices and no trailing "Never".
+const LONGOUT_OOPT_CHOICES: &[&str] = &[
+    "Every Time",
+    "On Change",
+    "When Zero",
+    "When Non-zero",
+    "Transition To Zero",
+    "Transition To Non-zero",
+];
+
 impl Record for LongoutRecord {
     fn record_type(&self) -> &'static str {
         "longout"
@@ -329,6 +341,21 @@ impl Record for LongoutRecord {
 
     fn field_list(&self) -> &'static [FieldDesc] {
         LONGOUT_FIELDS
+    }
+
+    /// `DBF_MENU` fields, served as `DBR_ENUM` with the menu's choice labels
+    /// in `.dbd` index order (`longoutRecord.dbd.pod`). `OOPT` is
+    /// `menu(longoutOOPT)` (lines 23-29,454-458); `OOCH` and `SIMM` are
+    /// `menu(menuYesNo)` (two-choice NO/YES — the integer record's `SIMM`
+    /// menu, unlike the analog/binary `menuSimm`), reusing the shared yes/no
+    /// table. `OOPT`/`OOCH` were added in EPICS 7.0.8. `SIMS`/`OLDSIMM`/
+    /// `OMSL`/`IVOA` are shared menus resolved centrally.
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "OOPT" => Some(LONGOUT_OOPT_CHOICES),
+            "OOCH" | "SIMM" => Some(MENU_YES_NO),
+            _ => None,
+        }
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

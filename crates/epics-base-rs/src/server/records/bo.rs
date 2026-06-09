@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessAction, ProcessOutcome, Record};
+use crate::server::record::{FieldDesc, MENU_SIMM, ProcessAction, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
 
 /// Binary output record matching C boRecord behavior.
@@ -574,6 +574,17 @@ impl Record for BoRecord {
 
     fn field_list(&self) -> &'static [FieldDesc] {
         FIELDS
+    }
+
+    /// `SIMM` is `DBF_MENU menu(menuSimm)` (`boRecord.dbd.pod`): the binary
+    /// records carry the three-choice NO/YES/RAW simulation menu. Served as
+    /// `DBR_ENUM` with these labels. `SIMS`/`OLDSIMM`/`OMSL`/`IVOA` are
+    /// shared menus resolved centrally.
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "SIMM" => Some(MENU_SIMM),
+            _ => None,
+        }
     }
 
     /// Regression R0604-BASEREC-BINARY-MONITOR-1: VAL posts DBE_VALUE|DBE_LOG

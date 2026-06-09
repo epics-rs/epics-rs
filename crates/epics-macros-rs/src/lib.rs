@@ -184,6 +184,11 @@ pub fn epics_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - `#[record(type = "ai", crate_path = "my_crate")]` — override crate path
 /// - `#[field(type = "Double")]` — sets the DBR type for a field
 /// - `#[field(type = "Double", read_only)]` — marks a field as read-only
+/// - `#[field(type = "Short", menu_choices = SELM_CHOICES)]` — a
+///   `DBF_MENU` field served as `DBR_ENUM`; `SELM_CHOICES` resolves to a
+///   `&'static [&'static str]` choice table and is emitted through
+///   `Record::menu_field_choices` (the framework promotes the stored menu
+///   index to `EpicsValue::Enum` and attaches these labels).
 ///
 /// Field names are converted from snake_case to UPPER_CASE for EPICS field names.
 #[proc_macro_derive(EpicsRecord, attributes(record, field))]
@@ -205,6 +210,11 @@ struct FieldInfo {
     epics_name: String,
     dbf_type: String,
     read_only: bool,
+    /// Choice-table expression for a `DBF_MENU` field served as
+    /// `DBR_ENUM` (`#[field(menu_choices = SOME_CONST)]`), or `None` for a
+    /// non-menu field. `SOME_CONST` must resolve to a
+    /// `&'static [&'static str]` in the record's module.
+    menu_choices: Option<syn::Expr>,
 }
 
 fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
@@ -240,13 +250,14 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
     let mut field_infos = Vec::new();
     for f in &fields.named {
         let ident = f.ident.as_ref().unwrap().clone();
-        let (dbf_type, read_only) = parse_field_attrs(f)?;
+        let (dbf_type, read_only, menu_choices) = parse_field_attrs(f)?;
         let epics_name = ident.to_string().to_uppercase();
         field_infos.push(FieldInfo {
             ident,
             epics_name,
             dbf_type,
             read_only,
+            menu_choices,
         });
     }
 
@@ -305,6 +316,32 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         })
         .collect();
 
+    // Generate menu_field_choices for any `#[field(menu_choices = ...)]`
+    // fields, so a DBF_MENU field served as DBR_ENUM carries its menu()
+    // choice labels (see `Record::menu_field_choices`). Omitted entirely
+    // when no field declares a menu, so the trait default applies.
+    let menu_arms: Vec<_> = field_infos
+        .iter()
+        .filter_map(|fi| {
+            fi.menu_choices.as_ref().map(|expr| {
+                let epics_name = &fi.epics_name;
+                quote! { #epics_name => Some(#expr), }
+            })
+        })
+        .collect();
+    let menu_method = if menu_arms.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+                match field {
+                    #(#menu_arms)*
+                    _ => None,
+                }
+            }
+        }
+    };
+
     let expanded = quote! {
         impl #krate::server::record::Record for #name {
             fn record_type(&self) -> &'static str {
@@ -336,6 +373,8 @@ fn impl_epics_record(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
                 self.on_put(name);
                 Ok(())
             }
+
+            #menu_method
         }
     };
 
@@ -379,9 +418,10 @@ fn parse_record_attrs(input: &DeriveInput) -> syn::Result<RecordAttrs> {
     })
 }
 
-fn parse_field_attrs(field: &syn::Field) -> syn::Result<(String, bool)> {
+fn parse_field_attrs(field: &syn::Field) -> syn::Result<(String, bool, Option<syn::Expr>)> {
     let mut dbf_type = None;
     let mut read_only = false;
+    let mut menu_choices = None;
 
     for attr in &field.attrs {
         if attr.path().is_ident("field") {
@@ -396,8 +436,15 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<(String, bool)> {
                 } else if meta.path.is_ident("read_only") {
                     read_only = true;
                     Ok(())
+                } else if meta.path.is_ident("menu_choices") {
+                    // `menu_choices = SOME_CONST`: a path/expression that
+                    // resolves to a `&'static [&'static str]` choice table
+                    // for a DBF_MENU field served as DBR_ENUM.
+                    let value = meta.value()?;
+                    menu_choices = Some(value.parse::<syn::Expr>()?);
+                    Ok(())
                 } else {
-                    Err(meta.error("expected `type` or `read_only`"))
+                    Err(meta.error("expected `type`, `read_only`, or `menu_choices`"))
                 }
             })?;
         }
@@ -406,7 +453,7 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<(String, bool)> {
     let dbf_type = dbf_type
         .ok_or_else(|| syn::Error::new_spanned(field, "missing #[field(type = \"...\")]"))?;
 
-    Ok((dbf_type, read_only))
+    Ok((dbf_type, read_only, menu_choices))
 }
 
 fn dbf_type_ident(type_str: &str) -> proc_macro2::Ident {

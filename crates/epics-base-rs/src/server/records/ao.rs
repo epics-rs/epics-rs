@@ -1,6 +1,12 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
+use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
+
+/// Choice labels for the output-increment-format menu, in index order.
+/// C `menu(aoOIF)` (`aoRecord.dbd.pod`): 0=Full, 1=Incremental. Selects
+/// whether `OVAL`/`OUT` writes the full value or the delta from the
+/// previous output.
+const AO_OIF_CHOICES: &[&str] = &["Full", "Incremental"];
 
 /// Analog output record with conversion and output policy support.
 /// LINR: 0=NO_CONVERSION, 1=SLOPE, 2=LINEAR
@@ -753,6 +759,18 @@ impl Record for AoRecord {
 
     fn field_list(&self) -> &'static [FieldDesc] {
         FIELDS
+    }
+
+    /// `SIMM` is `DBF_MENU menu(menuSimm)` and `OIF` is `menu(aoOIF)`
+    /// (`aoRecord.dbd.pod`); both served as `DBR_ENUM` with the menu's
+    /// choice labels in `.dbd` index order. `SIMS`/`OLDSIMM`/`OMSL`/`IVOA`/
+    /// `LINR` are shared menus resolved centrally.
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "SIMM" => Some(MENU_SIMM),
+            "OIF" => Some(AO_OIF_CHOICES),
+            _ => None,
+        }
     }
 
     /// C `aoRecord.c::convert` raises `SOFT_ALARM/MAJOR_ALARM` when the

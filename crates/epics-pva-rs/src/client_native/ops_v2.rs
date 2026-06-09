@@ -2261,7 +2261,18 @@ where
         .send_for_channel(sid, init_req)
         .await
         .map_err(|_| MonitorEnd::ConnectionLost)?;
-    let init_frame = stream.recv().await.ok_or(MonitorEnd::ConnectionLost)?;
+    // Cancel-aware INIT receive (see `recv_monitor_init`). `active` is not
+    // yet published, so a teardown here only unregisters the local IOID
+    // and ends ChannelClosed — no DESTROY, matching pvxs `_cancel()` in
+    // the Creating phase (clientmon.cpp:810-824).
+    let init_frame = match recv_monitor_init(&state, &mut stream).await {
+        MonitorInit::Reply(f) => f,
+        MonitorInit::Cancelled => {
+            server.unregister_ioid(ioid);
+            return Err(MonitorEnd::ChannelClosed);
+        }
+        MonitorInit::Lost => return Err(MonitorEnd::ConnectionLost),
+    };
     let init = match decode_op_response(&init_frame, None) {
         Ok(OpResponse::Init(i)) => i,
         Ok(other) => {
@@ -2741,7 +2752,18 @@ where
         .send_for_channel(sid, init_req)
         .await
         .map_err(|_| MonitorEnd::ConnectionLost)?;
-    let init_frame = stream.recv().await.ok_or(MonitorEnd::ConnectionLost)?;
+    // Cancel-aware INIT receive (see `recv_monitor_init`). `active` is not
+    // yet published, so a teardown here only unregisters the local IOID
+    // and ends ChannelClosed — no DESTROY, matching pvxs `_cancel()` in
+    // the Creating phase (clientmon.cpp:810-824).
+    let init_frame = match recv_monitor_init(&state, &mut stream).await {
+        MonitorInit::Reply(f) => f,
+        MonitorInit::Cancelled => {
+            server.unregister_ioid(ioid);
+            return Err(MonitorEnd::ChannelClosed);
+        }
+        MonitorInit::Lost => return Err(MonitorEnd::ConnectionLost),
+    };
     let init = match decode_op_response(&init_frame, None) {
         Ok(OpResponse::Init(i)) => i,
         Ok(other) => {
@@ -4102,6 +4124,56 @@ async fn await_frame(
         .map_err(|_| PvaError::Timeout)?
         .ok_or_else(|| PvaError::Protocol("connection closed".into()))?;
     Ok(frame)
+}
+
+/// Outcome of [`recv_monitor_init`].
+enum MonitorInit {
+    /// The server's MONITOR INIT reply arrived.
+    Reply(super::decode::Frame),
+    /// A stop()/teardown fired (or `stop` was already set) before the
+    /// reply: the caller must unregister the IOID and end ChannelClosed.
+    Cancelled,
+    /// The frame stream closed before any reply: connection lost.
+    Lost,
+}
+
+/// Race a monitor's INIT reply against the subscription's cancel signal.
+///
+/// This is the await that sits after `register_ioid_stream` but before
+/// `active` is published. A stop()/teardown issued in that window must
+/// complete the caller's cancel promptly instead of parking forever on a
+/// silent or withholding server — the same hazard the data loops guard.
+/// pvxs `_cancel()` completes synchronously even in the Creating phase and
+/// sends no DESTROY for a not-yet-acknowledged op (clientmon.cpp:810-824),
+/// so the caller's [`MonitorInit::Cancelled`] handling unregisters only the
+/// local IOID. With no handle (`state` is `None`) the op cannot be
+/// cancelled, so it simply awaits the reply. Shared by `run_monitor_loop`
+/// and `run_raw_monitor_loop` so both honour the same rule.
+async fn recv_monitor_init(
+    state: &Option<Arc<SubscriptionState>>,
+    stream: &mut mpsc::UnboundedReceiver<super::decode::Frame>,
+) -> MonitorInit {
+    match state {
+        Some(s) => {
+            // A teardown that raced just ahead of this await already set
+            // `stop`; honour it before parking on the stream.
+            if s.stop.load(Ordering::Relaxed) {
+                return MonitorInit::Cancelled;
+            }
+            tokio::select! {
+                biased;
+                _ = s.cancel.notified() => MonitorInit::Cancelled,
+                f = stream.recv() => match f {
+                    Some(f) => MonitorInit::Reply(f),
+                    None => MonitorInit::Lost,
+                },
+            }
+        }
+        None => match stream.recv().await {
+            Some(f) => MonitorInit::Reply(f),
+            None => MonitorInit::Lost,
+        },
+    }
 }
 
 /// Single-shot variant of [`await_frame`] for the new TwoShot ioid
@@ -5500,6 +5572,103 @@ mod tests {
         state.teardown();
         assert!(state.stop.load(std::sync::atomic::Ordering::Relaxed));
         assert!(state.active.lock().is_none());
+    }
+
+    fn dummy_monitor_frame() -> Frame {
+        let payload = vec![0u8; 4];
+        let header = PvaHeader::application(
+            true,
+            ByteOrder::Little,
+            Command::Monitor.code(),
+            payload.len() as u32,
+        );
+        Frame { header, payload }
+    }
+
+    /// The MONITOR INIT receive is the await between `register_ioid_stream`
+    /// and publishing `active`. A `stop_sync()`/teardown issued while the
+    /// server withholds the INIT reply must complete the cancel promptly
+    /// (return `Cancelled`) rather than hang the spawned monitor task
+    /// forever — the regression this fix closes.
+    #[tokio::test]
+    async fn recv_monitor_init_cancels_on_teardown_during_wait() {
+        let state = idle_sub_state();
+        let task_state = Some(state.clone());
+        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
+        let task = tokio::spawn(async move { recv_monitor_init(&task_state, &mut rx).await });
+        // Let the task reach its `select!` (silent-but-open server).
+        tokio::task::yield_now().await;
+        state.teardown();
+        let out = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("INIT recv must wake on teardown, not hang on a silent server")
+            .expect("task panicked");
+        assert!(
+            matches!(out, MonitorInit::Cancelled),
+            "a teardown during the INIT wait must yield Cancelled"
+        );
+        // Keep the sender alive until here so the stream modelled an open
+        // (silent) server, not a closed one.
+        drop(tx);
+    }
+
+    /// A teardown that races just ahead of the INIT receive sets `stop`
+    /// before the loop reaches the await; the pre-check must short-circuit
+    /// to `Cancelled` WITHOUT consuming a reply that may already be queued.
+    #[tokio::test]
+    async fn recv_monitor_init_cancels_when_stop_preset() {
+        let state = idle_sub_state();
+        state.stop.store(true, Ordering::Relaxed);
+        let opt = Some(state.clone());
+        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
+        tx.send(dummy_monitor_frame()).unwrap(); // a reply is even available
+        match recv_monitor_init(&opt, &mut rx).await {
+            MonitorInit::Cancelled => {}
+            _ => panic!("a preset stop must short-circuit to Cancelled"),
+        }
+        assert!(
+            rx.try_recv().is_ok(),
+            "preset stop must not consume the queued INIT reply"
+        );
+    }
+
+    /// The happy path: a queued INIT reply is delivered as `Reply`.
+    #[tokio::test]
+    async fn recv_monitor_init_returns_reply_when_frame_arrives() {
+        let state = Some(idle_sub_state());
+        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
+        tx.send(dummy_monitor_frame()).unwrap();
+        match recv_monitor_init(&state, &mut rx).await {
+            MonitorInit::Reply(_) => {}
+            _ => panic!("a queued INIT reply must yield Reply"),
+        }
+    }
+
+    /// A frame stream closed before any reply is `Lost` (connection lost),
+    /// distinct from a cancel — the caller maps it to ConnectionLost and
+    /// lets the reconnect loop retry.
+    #[tokio::test]
+    async fn recv_monitor_init_lost_when_stream_closed() {
+        let state = Some(idle_sub_state());
+        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
+        drop(tx); // server connection gone, no reply will arrive
+        match recv_monitor_init(&state, &mut rx).await {
+            MonitorInit::Lost => {}
+            _ => panic!("a closed stream before the reply must yield Lost"),
+        }
+    }
+
+    /// The no-handle path (plain `op_monitor`, `state == None`) cannot be
+    /// cancelled, so it still simply awaits and delivers the reply.
+    #[tokio::test]
+    async fn recv_monitor_init_no_handle_awaits_reply() {
+        let state: Option<Arc<SubscriptionState>> = None;
+        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
+        tx.send(dummy_monitor_frame()).unwrap();
+        match recv_monitor_init(&state, &mut rx).await {
+            MonitorInit::Reply(_) => {}
+            _ => panic!("the no-handle path must still deliver the reply"),
+        }
     }
 
     // ── op-response decode-fault → circuit close regressions ─────────────

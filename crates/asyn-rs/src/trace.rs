@@ -742,6 +742,23 @@ impl TraceManager {
             .map(|c| c.trace_io_mask)
             .unwrap_or(TraceIoMask::ASCII)
     }
+
+    /// C parity: `getTraceInfoMask` (asynManager.c) — the per-port trace
+    /// info mask, falling back to the global default. Read by
+    /// `monitorStatus` (asynRecord.c:1079) to refresh `TINM`/`TINB0..3`.
+    pub fn get_trace_info_mask(&self, port: Option<&str>) -> TraceInfoMask {
+        if let Some(name) = port {
+            if let Ok(configs) = self.port_configs.lock() {
+                if let Some(cfg) = configs.get(name) {
+                    return cfg.trace_info_mask;
+                }
+            }
+        }
+        self.global_config
+            .lock()
+            .map(|c| c.trace_info_mask)
+            .unwrap_or(TraceInfoMask::TIME | TraceInfoMask::PORT)
+    }
 }
 
 impl Default for TraceManager {

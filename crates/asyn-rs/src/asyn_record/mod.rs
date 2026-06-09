@@ -1035,13 +1035,20 @@ impl AsynRecord {
     }
 
     /// Read current trace state from TraceManager into record fields.
+    ///
+    /// C `monitorStatus` (asynRecord.c:1066-1084) refreshes the trace
+    /// mask, the trace I/O mask, AND the trace info mask (`TINM`/`TINB0..3`)
+    /// from the trace manager. Previously the info mask was never imported,
+    /// so a record connecting after a non-default `asynSetTraceInfoMask`
+    /// showed `TINM`/`TINB*` as zero.
     fn read_trace_state(&mut self) {
-        let (trace_mask, io_mask) = match self.port_entry {
+        let (trace_mask, io_mask, info_mask) = match self.port_entry {
             Some(ref entry) => {
                 let port = &self.port;
                 (
                     entry.trace.get_trace_mask(Some(port)).bits(),
                     entry.trace.get_trace_io_mask(Some(port)).bits(),
+                    entry.trace.get_trace_info_mask(Some(port)).bits(),
                 )
             }
             None => return,
@@ -1052,6 +1059,9 @@ impl AsynRecord {
 
         self.tiom = io_mask as i32;
         self.update_io_bits_from_mask();
+
+        self.tinm = info_mask as i32;
+        self.update_info_bits_from_mask();
     }
 
     /// Read serial/IP options from the driver into record fields.
@@ -2349,6 +2359,61 @@ mod tests {
         rec0.addr = -1; // unaddressed -> port-wide
         rec0.connect_device();
         assert!(rec0.trace_addr_target().is_none());
+    }
+
+    /// Regression R0604-ASYN-TRACE-INFO-SYNC-1 (connect-time import).
+    ///
+    /// C monitorStatus (asynRecord.c:1079-1084) imports the trace info mask
+    /// into TINM/TINB0..3 on connect; previously Rust read only the trace
+    /// mask and I/O mask, so a record connecting after a non-default
+    /// asynSetTraceInfoMask showed TINM/TINB* as zero.
+    #[test]
+    fn read_trace_state_imports_info_mask_on_connect() {
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use tokio::sync::mpsc;
+
+        struct D(PortDriverBase);
+        impl PortDriver for D {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+
+        let port_name = "test_trace_info_sync";
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(
+            Box::new(D(PortDriverBase::new(port_name, 1, PortFlags::default()))),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), interrupts);
+        let trace = Arc::new(TraceManager::new());
+        // Non-default info mask set on the manager BEFORE the record connects.
+        trace.set_trace_info_mask(
+            Some(port_name),
+            TraceInfoMask::SOURCE | TraceInfoMask::THREAD,
+        );
+        register_port(port_name, handle, trace);
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.connect_device();
+        assert_eq!(rec.cnct, 1);
+
+        assert_eq!(
+            rec.tinm as u32,
+            (TraceInfoMask::SOURCE | TraceInfoMask::THREAD).bits()
+        );
+        assert_eq!(rec.tinb0, 0); // TIME
+        assert_eq!(rec.tinb1, 0); // PORT
+        assert_eq!(rec.tinb2, 1); // SOURCE
+        assert_eq!(rec.tinb3, 1); // THREAD
     }
 
     /// Regression R0604-ASYN-IFMT-FIELDS-1.

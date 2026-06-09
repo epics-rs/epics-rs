@@ -94,22 +94,36 @@ fn load_records(prefix: &str, dev: &str, port: &str, records: &[RecordDef], ctx:
     }
 }
 
-/// Register a topic and return the drvInfo string.
-fn add_topic(port: &str, drv_info: &str) -> String {
-    add_topic_opts(port, drv_info, false)
+/// Register a Z2M JSON topic and return its canonical drvInfo (param name).
+///
+/// Z2M friendly names may contain spaces, so the topic is wrapped in the
+/// quoted-topic syntax (see [`TopicAddress::parse`]); the JSON field is the
+/// literal device member key. The returned string is the canonical
+/// `to_drv_info()` form so it matches the param name the driver registers
+/// (`MqttDriver::new` creates each param under `addr.to_drv_info()`).
+fn add_json(port: &str, type_tag: &str, topic: &str, field: &str) -> String {
+    add_topic_opts(port, &format!("JSON:{type_tag} \"{topic}\" {field}"), false)
 }
 
-/// Register a topic with ON/OFF normalization enabled.
-fn add_topic_normalized(port: &str, drv_info: &str) -> String {
-    add_topic_opts(port, drv_info, true)
+/// Like [`add_json`], with ON/OFF normalization enabled (for `/set` controls).
+fn add_json_normalized(port: &str, type_tag: &str, topic: &str, field: &str) -> String {
+    add_topic_opts(port, &format!("JSON:{type_tag} \"{topic}\" {field}"), true)
 }
 
+/// Parse `drv_info`, register the pending topic, and return the canonical
+/// drvInfo. Returning `to_drv_info()` (not the raw input) guarantees the
+/// record link text matches the driver's param name even when the input used
+/// the quoted-topic extension.
 fn add_topic_opts(port: &str, drv_info: &str, normalize: bool) -> String {
-    if let Ok(mut addr) = TopicAddress::parse(drv_info) {
-        addr.normalize_on_off = normalize;
-        register_pending_topic(port, addr);
+    match TopicAddress::parse(drv_info) {
+        Ok(mut addr) => {
+            addr.normalize_on_off = normalize;
+            let canonical = addr.to_drv_info();
+            register_pending_topic(port, addr);
+            canonical
+        }
+        Err(_) => drv_info.to_string(),
     }
-    drv_info.to_string()
 }
 
 // ============ Helper: common 4-arg extraction ============
@@ -177,7 +191,7 @@ pub fn cmd_z2m_plug() -> CommandDef {
                     suffix: "Power",
                     dtyp: "asynFloat64",
                     link_field: "INP",
-                    drv_info: add_topic(&port, &format!("JSON:FLOAT {topic} power")),
+                    drv_info: add_json(&port, "FLOAT", &topic, "power"),
                     egu: "W",
                     prec: Some(1),
                     scan_io_intr: true,
@@ -187,7 +201,7 @@ pub fn cmd_z2m_plug() -> CommandDef {
                     suffix: "Energy",
                     dtyp: "asynFloat64",
                     link_field: "INP",
-                    drv_info: add_topic(&port, &format!("JSON:FLOAT {topic} energy")),
+                    drv_info: add_json(&port, "FLOAT", &topic, "energy"),
                     egu: "kWh",
                     prec: Some(2),
                     scan_io_intr: true,
@@ -197,7 +211,7 @@ pub fn cmd_z2m_plug() -> CommandDef {
                     suffix: "DevTemp",
                     dtyp: "asynInt32",
                     link_field: "INP",
-                    drv_info: add_topic(&port, &format!("JSON:INT {topic} device_temperature")),
+                    drv_info: add_json(&port, "INT", &topic, "device_temperature"),
                     egu: "degC",
                     prec: None,
                     scan_io_intr: true,
@@ -207,7 +221,7 @@ pub fn cmd_z2m_plug() -> CommandDef {
                     suffix: "State",
                     dtyp: "asynOctetRead",
                     link_field: "INP",
-                    drv_info: add_topic(&port, &format!("JSON:STRING {topic} state")),
+                    drv_info: add_json(&port, "STRING", &topic, "state"),
                     egu: "",
                     prec: None,
                     scan_io_intr: true,
@@ -217,9 +231,11 @@ pub fn cmd_z2m_plug() -> CommandDef {
                     suffix: "SetState",
                     dtyp: "asynOctetWrite",
                     link_field: "OUT",
-                    drv_info: add_topic_normalized(
+                    drv_info: add_json_normalized(
                         &port,
-                        &format!("JSON:STRING {topic}/set state"),
+                        "STRING",
+                        &format!("{topic}/set"),
+                        "state",
                     ),
                     egu: "",
                     prec: None,
@@ -248,7 +264,7 @@ pub fn cmd_z2m_temp_sensor() -> CommandDef {
                     suffix: "Temp",
                     dtyp: "asynFloat64",
                     link_field: "INP",
-                    drv_info: add_topic(&port, &format!("JSON:FLOAT {topic} temperature")),
+                    drv_info: add_json(&port, "FLOAT", &topic, "temperature"),
                     egu: "degC",
                     prec: Some(1),
                     scan_io_intr: true,
@@ -258,7 +274,7 @@ pub fn cmd_z2m_temp_sensor() -> CommandDef {
                     suffix: "Hum",
                     dtyp: "asynFloat64",
                     link_field: "INP",
-                    drv_info: add_topic(&port, &format!("JSON:FLOAT {topic} humidity")),
+                    drv_info: add_json(&port, "FLOAT", &topic, "humidity"),
                     egu: "%",
                     prec: Some(1),
                     scan_io_intr: true,
@@ -268,7 +284,7 @@ pub fn cmd_z2m_temp_sensor() -> CommandDef {
                     suffix: "Batt",
                     dtyp: "asynInt32",
                     link_field: "INP",
-                    drv_info: add_topic(&port, &format!("JSON:INT {topic} battery")),
+                    drv_info: add_json(&port, "INT", &topic, "battery"),
                     egu: "%",
                     prec: None,
                     scan_io_intr: true,
@@ -296,7 +312,7 @@ pub fn cmd_z2m_light() -> CommandDef {
                     suffix: "Brightness",
                     dtyp: "asynInt32",
                     link_field: "INP",
-                    drv_info: add_topic(&port, &format!("JSON:INT {topic} brightness")),
+                    drv_info: add_json(&port, "INT", &topic, "brightness"),
                     egu: "",
                     prec: None,
                     scan_io_intr: true,
@@ -306,7 +322,7 @@ pub fn cmd_z2m_light() -> CommandDef {
                     suffix: "ColorTemp",
                     dtyp: "asynInt32",
                     link_field: "INP",
-                    drv_info: add_topic(&port, &format!("JSON:INT {topic} color_temp")),
+                    drv_info: add_json(&port, "INT", &topic, "color_temp"),
                     egu: "mired",
                     prec: None,
                     scan_io_intr: true,
@@ -316,7 +332,7 @@ pub fn cmd_z2m_light() -> CommandDef {
                     suffix: "State",
                     dtyp: "asynOctetRead",
                     link_field: "INP",
-                    drv_info: add_topic(&port, &format!("JSON:STRING {topic} state")),
+                    drv_info: add_json(&port, "STRING", &topic, "state"),
                     egu: "",
                     prec: None,
                     scan_io_intr: true,
@@ -326,9 +342,11 @@ pub fn cmd_z2m_light() -> CommandDef {
                     suffix: "SetState",
                     dtyp: "asynOctetWrite",
                     link_field: "OUT",
-                    drv_info: add_topic_normalized(
+                    drv_info: add_json_normalized(
                         &port,
-                        &format!("JSON:STRING {topic}/set state"),
+                        "STRING",
+                        &format!("{topic}/set"),
+                        "state",
                     ),
                     egu: "",
                     prec: None,
@@ -339,7 +357,7 @@ pub fn cmd_z2m_light() -> CommandDef {
                     suffix: "SetBright",
                     dtyp: "asynInt32",
                     link_field: "OUT",
-                    drv_info: add_topic(&port, &format!("JSON:INT {topic}/set brightness")),
+                    drv_info: add_json(&port, "INT", &format!("{topic}/set"), "brightness"),
                     egu: "",
                     prec: None,
                     scan_io_intr: false,
@@ -367,7 +385,7 @@ pub fn cmd_z2m_switch() -> CommandDef {
                     suffix: "State",
                     dtyp: "asynOctetRead",
                     link_field: "INP",
-                    drv_info: add_topic(&port, &format!("JSON:STRING {topic} state")),
+                    drv_info: add_json(&port, "STRING", &topic, "state"),
                     egu: "",
                     prec: None,
                     scan_io_intr: true,
@@ -377,9 +395,11 @@ pub fn cmd_z2m_switch() -> CommandDef {
                     suffix: "SetState",
                     dtyp: "asynOctetWrite",
                     link_field: "OUT",
-                    drv_info: add_topic_normalized(
+                    drv_info: add_json_normalized(
                         &port,
-                        &format!("JSON:STRING {topic}/set state"),
+                        "STRING",
+                        &format!("{topic}/set"),
+                        "state",
                     ),
                     egu: "",
                     prec: None,
@@ -408,7 +428,7 @@ pub fn cmd_z2m_motion() -> CommandDef {
                     suffix: "Occ",
                     dtyp: "asynOctetRead",
                     link_field: "INP",
-                    drv_info: add_topic(&port, &format!("JSON:STRING {topic} occupancy")),
+                    drv_info: add_json(&port, "STRING", &topic, "occupancy"),
                     egu: "",
                     prec: None,
                     scan_io_intr: true,
@@ -418,7 +438,7 @@ pub fn cmd_z2m_motion() -> CommandDef {
                     suffix: "Batt",
                     dtyp: "asynInt32",
                     link_field: "INP",
-                    drv_info: add_topic(&port, &format!("JSON:INT {topic} battery")),
+                    drv_info: add_json(&port, "INT", &topic, "battery"),
                     egu: "%",
                     prec: None,
                     scan_io_intr: true,
@@ -446,7 +466,7 @@ pub fn cmd_z2m_remote2() -> CommandDef {
                     suffix: "Act",
                     dtyp: "asynOctetRead",
                     link_field: "INP",
-                    drv_info: add_topic(&port, &format!("JSON:STRING {topic} action")),
+                    drv_info: add_json(&port, "STRING", &topic, "action"),
                     egu: "",
                     prec: None,
                     scan_io_intr: true,
@@ -456,7 +476,7 @@ pub fn cmd_z2m_remote2() -> CommandDef {
                     suffix: "Batt",
                     dtyp: "asynInt32",
                     link_field: "INP",
-                    drv_info: add_topic(&port, &format!("JSON:INT {topic} battery")),
+                    drv_info: add_json(&port, "INT", &topic, "battery"),
                     egu: "%",
                     prec: None,
                     scan_io_intr: true,

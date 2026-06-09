@@ -122,22 +122,29 @@ struct Args {
     long_mode: bool,
 
     /// Force interpretation of values as numbers (overrides ENUM
-    /// auto-string-resolution).
-    #[arg(short = 'n', long = "num-enum")]
+    /// auto-string-resolution). C `caput.c:298-305` makes `-n` and `-s`
+    /// a mutually-exclusive pair where the LAST one given wins (each case
+    /// sets its flag and clears the other), with no conflict error —
+    /// `overrides_with` reproduces that last-wins semantics.
+    #[arg(short = 'n', long = "num-enum", overrides_with = "force_string")]
     force_numeric: bool,
 
     /// Force interpretation of values as strings (overrides numeric
-    /// parse for ENUM).
-    #[arg(short = 's', long = "string-enum", conflicts_with = "force_numeric")]
+    /// parse for ENUM). Paired with `-n` (last one wins, caput.c:302-305).
+    #[arg(short = 's', long = "string-enum", overrides_with = "force_numeric")]
     force_string: bool,
 
     /// Put long string as an array of chars (long-string convention).
-    #[arg(short = 'S', long = "long-string")]
+    /// C `caput.c:306-319` makes `-S` and `-a` a mutually-exclusive pair
+    /// where the LAST one given wins (each clears the other) — modelled
+    /// with `overrides_with` so the two flags can never both be set.
+    #[arg(short = 'S', long = "long-string", overrides_with = "array_mode")]
     long_string: bool,
 
     /// Put as array. The remaining positionals are
-    /// `<count> <v0> <v1> ...`.
-    #[arg(short = 'a', long = "array")]
+    /// `<count> <v0> <v1> ...`. Paired with `-S` (last one wins,
+    /// caput.c:316-319).
+    #[arg(short = 'a', long = "array", overrides_with = "long_string")]
     array_mode: bool,
 
     /// Alternate output field separator.
@@ -818,13 +825,57 @@ fn build_enum_array(
 #[cfg(test)]
 mod tests {
     use super::{
-        FatalReadback, WriteValue, build_write_value, postput_read_fatal, raw_from_escaped,
+        Args, FatalReadback, WriteValue, build_write_value, postput_read_fatal, raw_from_escaped,
         raw_from_escaped_string,
     };
+    use clap::Parser;
     use epics_ca_rs::{CaError, DbFieldType, EpicsValue};
 
     fn vals(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// C `caput.c:298-319` parses `-n`/`-s` and `-S`/`-a` as two
+    /// mutually-exclusive last-wins pairs via a getopt switch (each case
+    /// sets its flag and clears the paired one), with NO conflict error.
+    /// `overrides_with` must reproduce that for every order boundary.
+    #[test]
+    fn enum_and_array_flags_are_last_wins_pairs() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["caput-rs"];
+            argv.extend_from_slice(extra);
+            argv.extend_from_slice(&["PV", "1"]);
+            Args::try_parse_from(argv).expect("flags must parse without a conflict error")
+        };
+
+        // -n / -s: last one wins, neither errors.
+        let a = parse(&["-n", "-s"]);
+        assert!(
+            a.force_string && !a.force_numeric,
+            "-n -s → string (last wins)"
+        );
+        let a = parse(&["-s", "-n"]);
+        assert!(
+            a.force_numeric && !a.force_string,
+            "-s -n → numeric (last wins)"
+        );
+        let a = parse(&["-n"]);
+        assert!(a.force_numeric && !a.force_string, "-n alone → numeric");
+        let a = parse(&["-s"]);
+        assert!(a.force_string && !a.force_numeric, "-s alone → string");
+
+        // -S / -a: last one wins, never both set.
+        let a = parse(&["-a", "-S"]);
+        assert!(
+            a.long_string && !a.array_mode,
+            "-a -S → long string (last wins)"
+        );
+        let a = parse(&["-S", "-a"]);
+        assert!(a.array_mode && !a.long_string, "-S -a → array (last wins)");
+        let a = parse(&["-a"]);
+        assert!(a.array_mode && !a.long_string, "-a alone → array");
+        let a = parse(&["-S"]);
+        assert!(a.long_string && !a.array_mode, "-S alone → long string");
     }
 
     /// Regression R0604-CAPUT-POSTPUT-READBACK-STATUS-1: the post-put readback

@@ -109,10 +109,15 @@ pub fn seed_env_overrides(map: &HashMap<String, String>, replace_existing: bool)
 /// several named client/server configs (pva2pva-style) without
 /// cross-contamination.
 ///
-/// Resolution precedence matches pvxs (explicit definitions win over the
-/// ambient environment): [`PvaConfigDefs::get`] returns the scoped
-/// definition when present, else falls back to the process environment.
-/// Compose `get` with the pure parsers in this module
+/// Scoped definitions and the ambient environment are two SEPARATE
+/// sources, mirroring pvxs's `PickOne{useenv}` (config.cpp:228-249):
+/// [`PvaConfigDefs::get`] reads only this config's definitions
+/// (pvxs `useenv=false`), while the ambient process environment is read
+/// through this module's `*_from_env` helpers / `std::env::var`
+/// (pvxs `useenv=true`). They are deliberately NOT a fallback chain — a
+/// missing scoped key must not silently inherit an unrelated process
+/// variable, which is the cross-config contamination this primitive
+/// exists to prevent. Compose `get` with the pure parsers in this module
 /// ([`parse_addr_list_with_port`], integer/`parse_bool` parsing) to derive
 /// typed config values without reading global state for a scoped key.
 #[derive(Debug, Clone, Default)]
@@ -128,14 +133,21 @@ impl PvaConfigDefs {
         Self { defs: map.clone() }
     }
 
-    /// Resolve a variable name. A scoped definition takes precedence; when
-    /// this config does not define `name`, fall back to the process
-    /// environment (pvxs: explicit defs override the ambient env).
+    /// Resolve `name` against this config's scoped definitions ONLY.
+    ///
+    /// pvxs `applyDefs(defs)` runs `_fromDefs(..., useenv=false)`, whose
+    /// `PickOne` searches only the supplied `defs` map and NEVER calls
+    /// `getenv()` (config.cpp:228-249, :468-470, :607-609); an absent key
+    /// leaves the config field at its current/default value. So a key this
+    /// config does not define returns `None` — it does **not** fall back to
+    /// the ambient environment. The earlier fallback re-introduced exactly
+    /// the cross-config contamination scoped defs prevent: two configs
+    /// could each inherit unrelated process variables (e.g.
+    /// `EPICS_PVA_NAME_SERVERS`) through their missing keys. For the pvxs
+    /// `fromEnv` source (`useenv=true`), read the process environment
+    /// explicitly via this module's `*_from_env` helpers.
     pub fn get(&self, name: &str) -> Option<String> {
-        match self.defs.get(name) {
-            Some(v) => Some(v.clone()),
-            None => std::env::var(name).ok(),
-        }
+        self.defs.get(name).cloned()
     }
 
     /// True when `name` is defined by this config (independent of the
@@ -1234,10 +1246,71 @@ mod tests {
             "apply_defs must not seed the process environment"
         );
 
-        // A key absent from the config falls back to the (here unset)
-        // process environment → None.
-        assert!(cfg_a.get(UNSET).is_none(), "unset key resolves to None");
+        // A key this config does not define resolves to None — pvxs
+        // `useenv=false` reads only the defs map, never the env.
+        assert!(cfg_a.get(UNSET).is_none(), "undefined key resolves to None");
         assert!(!cfg_a.contains(UNSET));
+    }
+
+    /// pvxs `applyDefs(defs)` -> `_fromDefs(useenv=false)`: `PickOne`
+    /// searches only the defs map and never calls `getenv()`
+    /// (config.cpp:228-249, :468-470). A key present in the process
+    /// environment but absent from the scoped defs must NOT leak into the
+    /// scoped config — that ambient fallback was the contamination this
+    /// primitive exists to prevent.
+    #[test]
+    fn pva_config_defs_get_does_not_fall_back_to_ambient_env() {
+        const KEY: &str = "EPICS_PVA_NAME_SERVERS";
+        unsafe {
+            std::env::set_var(KEY, "10.9.9.9:5075");
+        }
+        // Scoped defs deliberately omit KEY.
+        let scoped = PvaConfigDefs::apply_defs(&HashMap::new());
+        let scoped_got = scoped.get(KEY);
+        // The ambient-env source (pvxs `useenv=true`) still holds the value
+        // — the two sources are distinct, not chained.
+        let env_seen = std::env::var(KEY).ok();
+        unsafe {
+            std::env::remove_var(KEY);
+        }
+        assert!(
+            scoped_got.is_none(),
+            "scoped get() must not fall back to ambient env (pvxs useenv=false)"
+        );
+        assert_eq!(
+            env_seen.as_deref(),
+            Some("10.9.9.9:5075"),
+            "the ambient process-env source still resolves the value independently"
+        );
+    }
+
+    /// A key absent from one config's defs must not bleed in from another
+    /// config's map nor from the process environment.
+    #[test]
+    fn pva_config_defs_absent_key_does_not_bleed_between_maps_or_env() {
+        const KEY: &str = "EPICS_PVA_ADDR_LIST";
+        unsafe {
+            std::env::set_var(KEY, "172.16.0.1");
+        }
+        let mut a = HashMap::new();
+        a.insert(KEY.to_string(), "10.0.0.1".to_string());
+        let cfg_a = PvaConfigDefs::apply_defs(&a);
+        // Map B omits KEY.
+        let cfg_b = PvaConfigDefs::apply_defs(&HashMap::new());
+        let a_got = cfg_a.get(KEY);
+        let b_got = cfg_b.get(KEY);
+        unsafe {
+            std::env::remove_var(KEY);
+        }
+        assert_eq!(
+            a_got.as_deref(),
+            Some("10.0.0.1"),
+            "map A keeps its own scoped definition"
+        );
+        assert!(
+            b_got.is_none(),
+            "map B must not inherit KEY from map A or from the process env"
+        );
     }
 
     /// Regression R0604-PVA-BOOL-ENV-EXTENSIONS-1: the env bool grammar

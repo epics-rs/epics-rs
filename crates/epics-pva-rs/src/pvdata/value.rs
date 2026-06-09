@@ -243,6 +243,15 @@ impl Value {
     /// payload (data.cpp:739-744). The node's leaves transfer only when
     /// individually marked, so a bare `alarm` mark leaves the destination's
     /// `alarm.*` leaves untouched.
+    ///
+    /// A marked union (or union-array element) is reselected by *descriptor*
+    /// rather than copied verbatim: pvxs matches the source's selected
+    /// member descriptor against the destination union variants and assigns
+    /// into that arm (data.cpp:683-703), throwing `NoConvert` when none
+    /// matches. Preserving the source selector index/name instead made the
+    /// descriptor-driven encoder write the payload under the wrong arm when
+    /// the destination variant order differed. An "any" (Variant) field is
+    /// stored verbatim, matching pvxs's Any branch (data.cpp:668-681).
     pub fn assign(&mut self, other: &Value) -> Result<(), ValueError> {
         for path in other.iter_marked() {
             // Marked source field absent in the destination: pvxs throws
@@ -285,14 +294,74 @@ impl Value {
                         })?;
                     let _ = self.write_field(&path, PvField::ScalarArray(converted));
                 }
-                // Compound / "any" leaves: same-shape copy of the source
-                // store.
-                FieldDesc::StructureArray { .. }
-                | FieldDesc::Union { .. }
-                | FieldDesc::UnionArray { .. }
-                | FieldDesc::Variant
-                | FieldDesc::VariantArray => {
+                // "Any" (Variant) holds an arbitrary value: pvxs `copyIn`
+                // for an Any destination stores the source Value verbatim
+                // with no descriptor reselection (data.cpp:668-681).
+                // StructureArray elements are enforced against the
+                // destination element descriptor only when they differ
+                // (data.cpp:623-643); for the same-schema squash that
+                // drives this path the descriptors are identical, so a
+                // verbatim store reproduces pvxs.
+                FieldDesc::StructureArray { .. } | FieldDesc::Variant | FieldDesc::VariantArray => {
                     let _ = self.write_field(&path, src_field.clone());
+                }
+                // A union destination reselects its arm by *descriptor*,
+                // not by the source selector index or member name: pvxs
+                // `copyIn` matches the source's selected member descriptor
+                // against the destination variants and assigns into that
+                // arm, throwing `NoConvert` when none matches
+                // (data.cpp:683-703). Copying the source union verbatim
+                // kept the source selector even when the destination
+                // variant order differed, so the descriptor-driven encoder
+                // wrote the payload under the wrong destination arm.
+                FieldDesc::Union {
+                    variants: dst_variants,
+                    ..
+                } => {
+                    let Some(FieldDesc::Union {
+                        variants: src_variants,
+                        ..
+                    }) = other.desc_at(&path)
+                    else {
+                        return Err(ValueError::NoConvert {
+                            path: path.clone(),
+                            target: "union".into(),
+                        });
+                    };
+                    let converted = reselect_union(src_field, src_variants, dst_variants, &path)?;
+                    let _ = self.write_field(&path, converted);
+                }
+                // UnionArray reselects each present element's arm the same
+                // way; an unselected (`selector < 0`) present element
+                // canonicalizes to absent, matching the UnionA encoder.
+                FieldDesc::UnionArray {
+                    variants: dst_variants,
+                    ..
+                } => {
+                    let Some(FieldDesc::UnionArray {
+                        variants: src_variants,
+                        ..
+                    }) = other.desc_at(&path)
+                    else {
+                        return Err(ValueError::NoConvert {
+                            path: path.clone(),
+                            target: "union[]".into(),
+                        });
+                    };
+                    let PvField::UnionArray(src_items) = src_field else {
+                        return Err(ValueError::NoConvert {
+                            path: path.clone(),
+                            target: "union[]".into(),
+                        });
+                    };
+                    let mut out = Vec::with_capacity(src_items.len());
+                    for item in src_items {
+                        out.push(match item {
+                            Some(it) => reselect_union_item(it, src_variants, dst_variants, &path)?,
+                            None => None,
+                        });
+                    }
+                    let _ = self.write_field(&path, PvField::UnionArray(out));
                 }
                 // A marked structure node only propagates the changed-bit
                 // — pvxs `copyIn` calls `dfld.mark()` for a marked
@@ -553,6 +622,96 @@ fn default_for(desc: &FieldDesc) -> PvField {
         }
         FieldDesc::UnionArray { .. } => PvField::UnionArray(Vec::new()),
     }
+}
+
+/// Match the source union's selected arm against the destination
+/// variants by descriptor, returning the destination `(selector,
+/// variant_name, payload)`. pvxs `copyIn` selects the destination union
+/// member whose descriptor equals the source's selected member descriptor
+/// (`data.cpp:692` `_equal(src.desc, &desc->members[idx])`), not by index
+/// or name. Because the descriptors are equal, the source payload already
+/// conforms to the destination arm, so cloning it reproduces pvxs's
+/// `temp.assign(src)` for equal descriptors. Returns `None` when no
+/// destination variant matches.
+fn match_union_arm(
+    sel: usize,
+    value: &PvField,
+    src_variants: &[(String, FieldDesc)],
+    dst_variants: &[(String, FieldDesc)],
+) -> Option<(i32, String, PvField)> {
+    let src_arm_desc = &src_variants.get(sel)?.1;
+    dst_variants
+        .iter()
+        .enumerate()
+        .find(|(_, (_, ddesc))| ddesc == src_arm_desc)
+        .map(|(i, (dname, _))| (i as i32, dname.clone(), value.clone()))
+}
+
+/// Reselect a `PvField::Union` into the destination union's arm by
+/// descriptor (see [`match_union_arm`]). A null/unselected source union
+/// clears the destination to a null union: pvxs throws `NoConvert` for an
+/// unselected source, but the same-schema squash that drives [`Value::assign`]
+/// can mark a null union, so clearing it keeps the copy from failing
+/// wholesale. A selected source with no matching destination variant is
+/// `NoConvert`.
+fn reselect_union(
+    src: &PvField,
+    src_variants: &[(String, FieldDesc)],
+    dst_variants: &[(String, FieldDesc)],
+    path: &str,
+) -> Result<PvField, ValueError> {
+    let no_convert = || ValueError::NoConvert {
+        path: path.into(),
+        target: "union".into(),
+    };
+    match src {
+        PvField::Union {
+            selector, value, ..
+        } if *selector >= 0 => {
+            let (selector, variant_name, value) =
+                match_union_arm(*selector as usize, value, src_variants, dst_variants)
+                    .ok_or_else(no_convert)?;
+            Ok(PvField::Union {
+                selector,
+                variant_name,
+                value: Box::new(value),
+            })
+        }
+        PvField::Union { .. } => Ok(PvField::Union {
+            selector: -1,
+            variant_name: String::new(),
+            value: Box::new(PvField::Null),
+        }),
+        _ => Err(no_convert()),
+    }
+}
+
+/// Reselect one present [`UnionItem`] into the destination union-array's
+/// arm by descriptor. A present element whose selector is `< 0` selects no
+/// variant and canonicalizes to absent (`None`), matching the UnionA
+/// encoder; a selected element with no matching destination variant is
+/// `NoConvert`.
+fn reselect_union_item(
+    it: &UnionItem,
+    src_variants: &[(String, FieldDesc)],
+    dst_variants: &[(String, FieldDesc)],
+    path: &str,
+) -> Result<Option<UnionItem>, ValueError> {
+    if it.selector < 0 {
+        return Ok(None);
+    }
+    let (selector, variant_name, value) =
+        match_union_arm(it.selector as usize, &it.value, src_variants, dst_variants).ok_or_else(
+            || ValueError::NoConvert {
+                path: path.into(),
+                target: "union[]".into(),
+            },
+        )?;
+    Ok(Some(UnionItem {
+        selector,
+        variant_name,
+        value,
+    }))
 }
 
 fn default_scalar(t: ScalarType) -> ScalarValue {
@@ -1567,6 +1726,133 @@ mod tests {
             other => panic!("expected Union, got {other:?}"),
         }
         assert!(dst.is_marked("u"));
+    }
+
+    #[test]
+    fn assign_union_reselects_destination_arm_by_descriptor() {
+        // Source union has a single `s` (String) variant selected at
+        // index 0; destination is `{i: Int, s: String}` where `s` is at
+        // index 1. pvxs reselects by descriptor, so the destination must
+        // end up selecting arm 1 (`s`), not the source's literal selector
+        // 0 (which on the destination is the `i` Int arm).
+        let src = one_field_value(
+            "u",
+            FieldDesc::Union {
+                struct_id: String::new(),
+                variants: vec![("s".into(), FieldDesc::Scalar(ScalarType::String))],
+            },
+            PvField::Union {
+                selector: 0,
+                variant_name: "s".into(),
+                value: Box::new(PvField::Scalar(ScalarValue::String("hi".into()))),
+            },
+        );
+        let dst_desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![(
+                "u".into(),
+                FieldDesc::Union {
+                    struct_id: String::new(),
+                    variants: vec![
+                        ("i".into(), FieldDesc::Scalar(ScalarType::Int)),
+                        ("s".into(), FieldDesc::Scalar(ScalarType::String)),
+                    ],
+                },
+            )],
+        };
+        let mut dst = Value::create_from(dst_desc);
+        dst.assign(&src).unwrap();
+        match dst.lookup_field("u").unwrap() {
+            PvField::Union {
+                selector,
+                variant_name,
+                value,
+            } => {
+                assert_eq!(*selector, 1, "must reselect the `s` arm, not keep src 0");
+                assert_eq!(variant_name, "s");
+                assert_eq!(**value, PvField::Scalar(ScalarValue::String("hi".into())));
+            }
+            other => panic!("expected Union, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assign_union_no_matching_variant_errors() {
+        // Source selects a String arm the destination union does not
+        // offer — pvxs throws NoConvert.
+        let src = one_field_value(
+            "u",
+            FieldDesc::Union {
+                struct_id: String::new(),
+                variants: vec![("s".into(), FieldDesc::Scalar(ScalarType::String))],
+            },
+            PvField::Union {
+                selector: 0,
+                variant_name: "s".into(),
+                value: Box::new(PvField::Scalar(ScalarValue::String("x".into()))),
+            },
+        );
+        let dst_desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![(
+                "u".into(),
+                FieldDesc::Union {
+                    struct_id: String::new(),
+                    variants: vec![("i".into(), FieldDesc::Scalar(ScalarType::Int))],
+                },
+            )],
+        };
+        let mut dst = Value::create_from(dst_desc);
+        let err = dst.assign(&src).unwrap_err();
+        assert!(matches!(err, ValueError::NoConvert { .. }));
+    }
+
+    #[test]
+    fn assign_union_array_reselects_each_element() {
+        // Source union-array element selects `s` at index 0 in a
+        // single-variant `{s}`; destination is `{i, s}` so the element
+        // must reselect to dest index 1.
+        let src = one_field_value(
+            "ua",
+            FieldDesc::UnionArray {
+                struct_id: String::new(),
+                variants: vec![("s".into(), FieldDesc::Scalar(ScalarType::String))],
+            },
+            PvField::UnionArray(vec![
+                Some(UnionItem {
+                    selector: 0,
+                    variant_name: "s".into(),
+                    value: PvField::Scalar(ScalarValue::String("a".into())),
+                }),
+                None,
+            ]),
+        );
+        let dst_desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![(
+                "ua".into(),
+                FieldDesc::UnionArray {
+                    struct_id: String::new(),
+                    variants: vec![
+                        ("i".into(), FieldDesc::Scalar(ScalarType::Int)),
+                        ("s".into(), FieldDesc::Scalar(ScalarType::String)),
+                    ],
+                },
+            )],
+        };
+        let mut dst = Value::create_from(dst_desc);
+        dst.assign(&src).unwrap();
+        match dst.lookup_field("ua").unwrap() {
+            PvField::UnionArray(items) => {
+                assert_eq!(items.len(), 2);
+                let it = items[0].as_ref().expect("present element");
+                assert_eq!(it.selector, 1);
+                assert_eq!(it.variant_name, "s");
+                assert_eq!(it.value, PvField::Scalar(ScalarValue::String("a".into())));
+                assert!(items[1].is_none());
+            }
+            other => panic!("expected UnionArray, got {other:?}"),
+        }
     }
 
     #[test]

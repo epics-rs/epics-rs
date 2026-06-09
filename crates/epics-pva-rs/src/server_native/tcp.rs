@@ -12035,8 +12035,14 @@ mod tests {
             "member `b` (bit 2) unchanged — must NOT be marked (narrowing)"
         );
 
-        // Full builder: marks both members — confirms the old
-        // behaviour the residual gap describes.
+        // Full builder: a wildcard (all-set) request mask canonicalizes to
+        // the root structure bit alone. pvxs `to_wire_valid` compresses a
+        // fully-valid masked structure to its parent bit
+        // (`bit += desc.size()`), and the decoder expands that set root bit
+        // back to the whole structure (both members) — so the full builder
+        // still conveys every member while the partial builder narrows to
+        // the changed leaf. The contrast the residual gap describes holds:
+        // root/whole-struct {0} vs leaf-level {1}.
         let full = build_monitor_payload(ioid, &intro, &curr, &mask, order);
         let (full_frame, _) = try_parse_frame(&full).unwrap().expect("complete frame");
         let full_data = match decode_op_response(&full_frame, Some(&intro)).unwrap() {
@@ -12044,9 +12050,29 @@ mod tests {
             other => panic!("expected monitor data, got {other:?}"),
         };
         assert!(
-            full_data.changed.get(1) && full_data.changed.get(2),
-            "full-mask builder marks every member — the pre-fix wire shape"
+            full_data.changed.get(0),
+            "full-mask builder emits the root structure bit (whole-struct \
+             compression) — pvxs to_wire_valid byte-exact"
         );
+        assert!(
+            !full_data.changed.get(1) && !full_data.changed.get(2),
+            "descendant leaf bits are not emitted under the set root bit"
+        );
+        match &full_data.value {
+            PvField::Structure(s) => {
+                // The whole structure is conveyed despite the compressed
+                // bitset: both members decode from the set root bit.
+                assert_eq!(
+                    s.get_field("a"),
+                    Some(&PvField::Scalar(ScalarValue::Double(9.0)))
+                );
+                assert_eq!(
+                    s.get_field("b"),
+                    Some(&PvField::Scalar(ScalarValue::Double(2.0)))
+                );
+            }
+            other => panic!("expected structure, got {other:?}"),
+        }
     }
 
     /// pvxs `servermon.cpp:493` parity: when the client sets the

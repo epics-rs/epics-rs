@@ -205,12 +205,49 @@ impl IntoServiceResponse for Status {
 // A `ServiceResponse` is a *success* payload, so converting a method's
 // `Err` through it could only ever produce a success-shaped reply
 // (an NTRPCStatus with `ok=false`) — exactly the bug where a failed
-// RPC looked successful to the client. Instead, the `#[pva_service]`
-// macro routes a `Result`-returning method's `Err` to
-// `ServiceError::Method`, which the dispatch path turns into a wire
-// `Status::error` (an RPC operation error), matching pvxs
-// `op->error(...)` (`sharedpv.cpp:162-180`). An app that genuinely
-// wants a non-error status payload returns `Ok(Status::error(...))`.
+// RPC looked successful to the client. The `Result` arm lives on the
+// separate [`IntoServiceOutcome`] trait below, which routes `Err` to an
+// RPC operation error instead of a success payload.
+
+/// Terminal conversion the `#[pva_service]` macro inserts on every
+/// method's return value: it produces the dispatch outcome
+/// (`Ok(success)` or `Err(operation-error)`) for both a plain
+/// `T: IntoServiceResponse` and a `Result<T, E>`.
+///
+/// Routing `Result` through the type system here — rather than the
+/// macro syntactically testing whether the return type spells `Result`
+/// — is what makes a method whose return is a *type alias*
+/// (`type RpcResult<T> = Result<T, String>`, `anyhow::Result<T>`, …)
+/// behave identically to a literal `Result`: a proc-macro cannot
+/// resolve an alias, but the compiler resolves it before selecting the
+/// impl. A plain success value hits the blanket impl; a `Result` hits
+/// the `Result` impl, whose `Err` becomes [`ServiceError::Method`] (a
+/// wire `Status::error` / RPC operation error, matching pvxs
+/// `op->error(...)`, `sharedpv.cpp:162-180`). An app that wants an
+/// explicit non-error status payload returns `Ok(Status::error(...))`.
+pub trait IntoServiceOutcome {
+    fn into_service_outcome(self) -> Result<ServiceResponse, ServiceError>;
+}
+
+// Plain success value. `Result<T, E>` never reaches this impl: it does
+// not implement `IntoServiceResponse` (see the NOTE above), so the two
+// impls do not overlap.
+impl<T: IntoServiceResponse> IntoServiceOutcome for T {
+    fn into_service_outcome(self) -> Result<ServiceResponse, ServiceError> {
+        Ok(self.into_service_response())
+    }
+}
+
+// `Result`-returning method: `Ok(T)` is the success response, `Err(E)`
+// is an RPC operation error rather than a success-shaped payload.
+impl<T: IntoServiceResponse, E: std::fmt::Display> IntoServiceOutcome for Result<T, E> {
+    fn into_service_outcome(self) -> Result<ServiceResponse, ServiceError> {
+        match self {
+            Ok(v) => Ok(v.into_service_response()),
+            Err(e) => Err(ServiceError::Method(e.to_string())),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

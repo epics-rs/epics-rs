@@ -780,24 +780,6 @@ pub fn derive_nt_scalar(input: TokenStream) -> TokenStream {
     expanded.into()
 }
 
-/// True when a method's return type is a `Result<…>` (matched by the
-/// path's last segment, so `Result`, `std::result::Result`,
-/// `anyhow::Result`, … all qualify). A `Result`-returning service
-/// method routes its `Err` to the RPC operation-error path; any other
-/// return type is encoded directly as a success response.
-fn method_returns_result(output: &syn::ReturnType) -> bool {
-    let syn::ReturnType::Type(_, ty) = output else {
-        return false;
-    };
-    let syn::Type::Path(tp) = &**ty else {
-        return false;
-    };
-    tp.path
-        .segments
-        .last()
-        .is_some_and(|seg| seg.ident == "Result")
-}
-
 /// `#[pva_service]` — turn an `impl Block` for a service struct
 /// into a [`PvaService`] (in `epics_pva_rs::service`). Every async
 /// method becomes a wire-callable RPC; positional parameters are
@@ -813,6 +795,13 @@ fn method_returns_result(output: &syn::ReturnType) -> bool {
 ///   non-error status payload returns `Ok(Status::error(...))`.
 /// - a method returning a plain `T: IntoServiceResponse` is always a
 ///   success response.
+///
+/// The `Result` vs non-`Result` decision is made by the type system via
+/// `IntoServiceOutcome`, not by inspecting how the return type is
+/// spelled, so a return type that is a *type alias* for `Result`
+/// (`type RpcResult<T> = Result<T, String>`, `anyhow::Result<T>`, …)
+/// routes its `Err` to the operation-error path just like a literal
+/// `Result`.
 ///
 /// Restrictions:
 /// - methods must be `&self` async
@@ -867,32 +856,21 @@ pub fn pva_service(_attr: TokenStream, item: TokenStream) -> TokenStream {
             arg_tys.push((*pat_ty.ty).clone());
         }
 
-        // A `Result`-returning method routes `Err` to the RPC
+        // The return value's dispatch outcome is decided by the type
+        // system, not by syntactically testing whether the return type
+        // spells `Result`: `IntoServiceOutcome` has a blanket impl for
+        // `T: IntoServiceResponse` (always a success response) and a
+        // `Result<T, E>` impl that routes `Err` to the RPC
         // operation-error path (`ServiceError::Method` → wire
-        // `Status::error`, pvxs `op->error`); `Ok(T)` is encoded as the
-        // success response. A non-`Result` return is always a success
-        // response. The branch lives here, not in an `IntoServiceResponse
-        // for Result` impl, so an `Err` can never be silently encoded as
-        // a success NTRPCStatus payload.
-        let return_handling = if method_returns_result(&m.sig.output) {
-            quote! {
-                match __out {
-                    ::core::result::Result::Ok(__v) => ::core::result::Result::Ok(
-                        #krate::service::types::IntoServiceResponse::into_service_response(__v),
-                    ),
-                    ::core::result::Result::Err(__e) => ::core::result::Result::Err(
-                        #krate::service::ServiceError::Method(
-                            ::std::string::ToString::to_string(&__e),
-                        ),
-                    ),
-                }
-            }
-        } else {
-            quote! {
-                ::core::result::Result::Ok(
-                    #krate::service::types::IntoServiceResponse::into_service_response(__out),
-                )
-            }
+        // `Status::error`, pvxs `op->error`). A proc-macro cannot resolve
+        // a return type that is a *type alias* for `Result` (e.g.
+        // `RpcResult<T>` / `anyhow::Result<T>`), but the compiler resolves
+        // it before selecting the impl, so an aliased `Result` behaves
+        // identically to a literal one. The `Result` arm never lives in an
+        // `IntoServiceResponse for Result` impl, so an `Err` can never be
+        // silently encoded as a success NTRPCStatus payload.
+        let return_handling = quote! {
+            #krate::service::types::IntoServiceOutcome::into_service_outcome(__out)
         };
 
         let dispatch_arm = quote! {

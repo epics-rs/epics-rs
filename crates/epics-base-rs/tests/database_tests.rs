@@ -1407,9 +1407,10 @@ async fn test_bo_ivoa_set_to_ivov_writes_rval() {
         .unwrap();
 
     // After IVOA=2, RVAL must equal IVOV (=1) — pre-fix it stayed at 0.
+    // RVAL is DBF_ULONG (boRecord.dbd.pod:252).
     let rval = db.get_pv("BO_SRC.RVAL").await.unwrap();
     assert!(
-        matches!(rval, EpicsValue::Long(1)),
+        matches!(rval, EpicsValue::ULong(1)),
         "BO_SRC.RVAL must equal IVOV(1): got {rval:?}"
     );
 }
@@ -2130,9 +2131,10 @@ async fn test_bi_raw_soft_channel_inp_applies_mask() {
     if let Some(rec) = db.get_record("BI_RAW").await {
         let inst = rec.read().await;
         let rval = inst.record.get_field("RVAL");
+        // RVAL is DBF_ULONG (biRecord.dbd.pod:199).
         assert_eq!(
             rval,
-            Some(EpicsValue::Long(0x0F)),
+            Some(EpicsValue::ULong(0x0F)),
             "MASK must clamp RVAL to low nibble"
         );
         let val = inst.record.get_field("VAL");

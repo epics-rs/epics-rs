@@ -37,21 +37,24 @@
 //! (`gwmain.cpp:133-188`), instead of collapsing to one client/server
 //! pair.
 //!
-//! Two faithful-but-bounded mappings, because epics-pva-rs's PVA stack
-//! is the only provider available here:
-//! - a client's `provider` must be `"pva"`; a `"ca"` upstream would need
-//!   a CA client (a different binary), so it is rejected with a clear
-//!   error rather than silently ignored.
-//! - a client's `addrlist` × `serverport` maps to the gateway client's
-//!   TCP name-server list ([`PvaClientBuilder::name_servers`]) — the
-//!   gateway-appropriate "pin these upstream endpoints" mechanism. The
-//!   client-side UDP broadcast knobs (`bcastport` / `autoaddrlist`) have
-//!   no per-client builder surface and are not applied to clients (they
-//!   ARE applied to servers, whose beacon emission maps to
-//!   `udp_port` / `auto_beacon`).
+//! One faithful-but-bounded mapping, because epics-pva-rs's PVA stack is
+//! the only provider available here: a client's `provider` must be
+//! `"pva"`; a `"ca"` upstream would need a CA client (a different binary),
+//! so it is rejected with a clear error rather than silently ignored.
+//!
+//! The client section's `addrlist` / `autoaddrlist` / `serverport` /
+//! `bcastport` configure the upstream pvAccess client's UDP SEARCH exactly
+//! as `pva2pva` maps them onto `EPICS_PVA_*` (`gwmain.cpp:141-144`
+//! `configure_client`): `addrlist` is the SEARCH destination list (sent on
+//! the broadcast port, NOT TCP name servers), `autoaddrlist` toggles
+//! per-NIC directed-broadcast expansion, `serverport` is the default
+//! connect port, and `bcastport` is the UDP SEARCH / beacon port. The
+//! server section's `interface` is likewise an address *list*
+//! (`EPICS_PVAS_INTF_ADDR_LIST`, `gwmain.cpp:164`), binding every listed
+//! NIC.
 
 use std::fs;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -270,24 +273,6 @@ fn validate(cfg: &GatewayConfigFile) -> Result<(), String> {
     Ok(())
 }
 
-/// Parse an EPICS-style whitespace-separated address list into socket
-/// addresses, combining bare IPs with `default_port`. Empty / blank
-/// input yields an empty list (the caller then keeps environment
-/// defaults rather than pinning an empty set).
-fn parse_addr_list(list: &str, default_port: u16) -> Result<Vec<SocketAddr>, String> {
-    let mut out = Vec::new();
-    for tok in list.split_whitespace() {
-        if let Ok(sa) = tok.parse::<SocketAddr>() {
-            out.push(sa);
-        } else if let Ok(ip) = tok.parse::<IpAddr>() {
-            out.push(SocketAddr::new(ip, default_port));
-        } else {
-            return Err(format!("invalid address-list entry '{tok}'"));
-        }
-    }
-    Ok(out)
-}
-
 /// Build (but do not run) the multi-tenant gateway described by `cfg`.
 /// Assumes `cfg` already passed [`validate`].
 ///
@@ -309,25 +294,19 @@ fn build_gateway(
         .max_subscribers(max_subscribers);
 
     for c in &cfg.clients {
-        // addrlist × serverport → TCP name servers (the gateway pins its
-        // upstream endpoints; gwmain.cpp:133-150 configure_client).
-        let name_servers = parse_addr_list(&c.addrlist, c.serverport)
-            .map_err(|e| format!("client '{}' addrlist: {e}", c.name))?;
-        let mut cb = PvaClient::builder();
-        if !name_servers.is_empty() {
-            cb = cb.name_servers(name_servers);
-        }
-        // The client-side UDP broadcast-search knobs (`autoaddrlist` /
-        // `bcastport`) have no per-client builder surface — this gateway
-        // pins upstreams via TCP name servers instead. Surface that
-        // explicitly so an operator who set them is not silently ignored.
-        if c.autoaddrlist {
-            eprintln!(
-                "pva-gateway-rs: client '{}': autoaddrlist=true and bcastport={} are not applied \
-                 (no per-client UDP broadcast-search surface); pin upstreams via addrlist × serverport",
-                c.name, c.bcastport
-            );
-        }
+        // gwmain.cpp:141-144 configure_client maps the client section onto
+        // the pvAccess client's UDP-SEARCH env: addrlist → EPICS_PVA_ADDR_LIST
+        // (SEARCH destinations sent on the broadcast port, NOT TCP name
+        // servers — search_engine.rs ClientSearchConfig), autoaddrlist →
+        // EPICS_PVA_AUTO_ADDR_LIST, serverport → EPICS_PVA_SERVER_PORT,
+        // bcastport → EPICS_PVA_BROADCAST_PORT. An addrlist entry without an
+        // explicit port takes the broadcast port (ClientSearchConfig::from_env).
+        let addr_list = epics_pva_rs::config::parse_endpoints_with_port(&c.addrlist, c.bcastport);
+        let cb = PvaClient::builder()
+            .addr_list(addr_list)
+            .auto_addr_list(c.autoaddrlist)
+            .broadcast_port(c.bcastport)
+            .server_port(c.serverport);
         builder = builder.add_upstream(c.name.clone(), Arc::new(cb.build()));
     }
 
@@ -780,12 +759,22 @@ mod tests {
     }
 
     #[test]
-    fn addr_list_parsing_combines_bare_ip_with_default_port() {
-        let got = parse_addr_list("127.0.0.1 10.0.0.2:9999", 5085).expect("parse");
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0], "127.0.0.1:5085".parse().unwrap());
-        assert_eq!(got[1], "10.0.0.2:9999".parse().unwrap());
-        assert!(parse_addr_list("", 5085).unwrap().is_empty());
-        assert!(parse_addr_list("not-an-ip", 5085).is_err());
+    fn client_addrlist_maps_to_udp_search_on_bcastport() {
+        // gwmain.cpp:141-144 configure_client: a client `addrlist` is
+        // EPICS_PVA_ADDR_LIST — UDP SEARCH destinations sent on the broadcast
+        // port — NOT TCP name servers. A bare-IP entry takes the broadcast
+        // port (bcastport), not the server port (serverport).
+        let cfg = parse_config(LOOPBACK).expect("parse");
+        let c = &cfg.clients[0];
+        assert_eq!(c.addrlist, "127.0.0.1");
+        assert_eq!(c.bcastport, 5086);
+        assert_eq!(c.serverport, 5085);
+        let eps = epics_pva_rs::config::parse_endpoints_with_port(&c.addrlist, c.bcastport);
+        assert_eq!(eps.len(), 1);
+        assert_eq!(
+            eps[0].addr.to_string(),
+            "127.0.0.1:5086",
+            "bare addrlist entry takes the broadcast port, not the server port"
+        );
     }
 }

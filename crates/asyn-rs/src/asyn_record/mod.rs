@@ -2040,9 +2040,24 @@ impl Record for AsynRecord {
             // here. See `process()`.
 
             // --- AQR (Abort Queue Request) ---
-            "AQR" => {
-                // Not yet implemented — would need CancelToken tracking per-record
-            }
+            //
+            // C special() for AQR (asynRecord.c:393-408) calls
+            // pasynManager->cancelRequest; only when a request was
+            // actually dequeued does it report "I/O request canceled",
+            // raise STATE_ALARM/MAJOR_ALARM and force a completion
+            // callback. In every case it then sets state = stateIdle.
+            //
+            // This record's I/O is synchronous (perform_io ->
+            // submit_blocking), so the record stays locked for the whole
+            // transfer: an AQR write cannot arrive while one of this
+            // record's requests is queued or in flight. C's
+            // `wasQueued == true` branch is therefore unreachable here,
+            // and the reachable `wasQueued == false` case is exactly this
+            // idle no-op (no error, no alarm, no callback). Cancelling a
+            // live transfer would require async (PACT) record processing
+            // that returns immediately and holds the actor CancelToken;
+            // that completion framework lives in epics-base-rs.
+            "AQR" => {}
 
             // --- EOS (end-of-string) delimiters ---
             //

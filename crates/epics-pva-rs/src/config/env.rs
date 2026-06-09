@@ -887,21 +887,58 @@ pub fn server_addr_list() -> Vec<SocketAddr> {
         .unwrap_or_default()
 }
 
+/// Resolve a `EPICS_PVA*_INTF_ADDR_LIST` value to a deduplicated list of
+/// bind `IpAddr`s.
+///
+/// pvxs parses interface lists through the SAME `split_addr_into` /
+/// `SockEndpoint` path as every other address list (config.cpp:151-169,
+/// 418-419, 592-593), so a DNS hostname is resolved before it constrains
+/// the bind/search interfaces: `SockEndpoint` calls `SockAddr::setAddress`
+/// (util.cpp:523-540), which falls back to a synchronous DNS lookup,
+/// IPv4-preferred. The earlier `parse::<IpAddr>()`-only split dropped any
+/// hostname token, silently turning a constrained interface list into the
+/// empty all-NIC default (client search/broadcast) or wildcard bind
+/// (server listener) — a broader exposure than pvxs.
+///
+/// Routes each whitespace-separated token (pvxs `split_addr_into` splits on
+/// whitespace; the comma is endpoint syntax, never a list separator)
+/// through the shared [`resolve_token_addr`] resolver — literal IP /
+/// `ip:port` / hostname / `host:port`, IPv4-preferred DNS — and keeps the
+/// resolved `IpAddr`; the port is irrelevant for a bind interface, so the
+/// default port is `0`. Unresolvable tokens are dropped with a `warn` so an
+/// operator sees a mistyped interface. Duplicates are collapsed after
+/// resolution, preserving first-appearance order (pvxs normalizes then
+/// `removeDups`). One owner for both the client and server interface lists
+/// so the family cannot drift back to dropping hostnames at one site.
+fn resolve_intf_addr_list(value: &str) -> Vec<IpAddr> {
+    // PVA-466: expand $(VAR) / ${VAR} refs before tokenising.
+    let value = expand_dollar_vars(value);
+    let mut out: Vec<IpAddr> = Vec::new();
+    for token in value.split_whitespace() {
+        match resolve_token_addr(token, 0) {
+            Some(sa) => {
+                let ip = sa.ip();
+                if !out.contains(&ip) {
+                    out.push(ip);
+                }
+            }
+            None => tracing::warn!(
+                token = %token,
+                "EPICS_PVA*_INTF_ADDR_LIST: unresolvable interface, skipping"
+            ),
+        }
+    }
+    out
+}
+
 /// Parse `EPICS_PVA_INTF_ADDR_LIST` — client-side interface bind list.
-/// Empty = bind to 0.0.0.0 (default behaviour). `$(VAR)` / `${VAR}`
-/// refs are expanded against the process env (PVA-466 parity).
+/// Empty = bind to 0.0.0.0 (default behaviour). DNS hostnames resolve
+/// (IPv4-preferred) and `$(VAR)` / `${VAR}` refs expand; see
+/// [`resolve_intf_addr_list`].
 pub fn list_intf_addresses() -> Vec<IpAddr> {
     std::env::var("EPICS_PVA_INTF_ADDR_LIST")
         .ok()
-        .map(|s| {
-            let s = expand_dollar_vars(&s);
-            // pvxs splits address lists on WHITESPACE only (`split_addr_into`,
-            // config.cpp:151-169); the comma is endpoint syntax, never a list
-            // separator. Interface lists carry no multicast modifiers.
-            s.split_whitespace()
-                .filter_map(|t| t.trim().parse::<IpAddr>().ok())
-                .collect()
-        })
+        .map(|s| resolve_intf_addr_list(&s))
         .unwrap_or_default()
 }
 
@@ -919,30 +956,11 @@ pub fn server_intf_addr_list_opt() -> Option<Vec<IpAddr>> {
 
 pub fn server_intf_addr_list() -> Vec<IpAddr> {
     if let Ok(s) = std::env::var("EPICS_PVAS_INTF_ADDR_LIST") {
-        // PVA-466: expand $(VAR) refs before tokenising.
-        let s = expand_dollar_vars(&s);
-        // Whitespace-only split (pvxs `split_addr_into`, config.cpp:151-169):
-        // the comma is endpoint syntax, not a list separator.
-        return s
-            .split_whitespace()
-            .filter_map(|t| {
-                let t = t.trim();
-                if t.is_empty() {
-                    return None;
-                }
-                match t.parse::<IpAddr>() {
-                    Ok(addr) => Some(addr),
-                    Err(e) => {
-                        tracing::warn!(
-                            token = %t,
-                            error = %e,
-                            "EPICS_PVAS_INTF_ADDR_LIST: invalid IP address, skipping"
-                        );
-                        None
-                    }
-                }
-            })
-            .collect();
+        // Same hostname-resolving path as the client list — see
+        // [`resolve_intf_addr_list`]. A DNS NIC name (`ioc-public-nic`)
+        // must resolve to its IPv4 address, not be dropped, so the server
+        // binds the named interface instead of falling back to wildcard.
+        return resolve_intf_addr_list(&s);
     }
     list_intf_addresses()
 }
@@ -1617,6 +1635,56 @@ mod tests {
             std::env::remove_var("EPICS_PVAS_INTF_ADDR_LIST");
             std::env::remove_var("EPICS_PVAS_IGNORE_ADDR_LIST");
         }
+    }
+
+    /// A DNS hostname in `EPICS_PVA_INTF_ADDR_LIST` /
+    /// `EPICS_PVAS_INTF_ADDR_LIST` must resolve to its (IPv4-preferred)
+    /// address, matching pvxs `SockAddr::setAddress` (util.cpp:523-540),
+    /// not be dropped to an empty list. Pre-fix the parser required a
+    /// literal IP, so `localhost` produced `[]` — the all-NIC / wildcard
+    /// default — broadening the bind/search surface beyond pvxs.
+    #[test]
+    fn intf_addr_list_resolves_hostname_to_loopback() {
+        unsafe {
+            std::env::set_var("EPICS_PVA_INTF_ADDR_LIST", "localhost");
+            std::env::set_var("EPICS_PVAS_INTF_ADDR_LIST", "localhost");
+        }
+        let client = list_intf_addresses();
+        let server = server_intf_addr_list();
+        unsafe {
+            std::env::remove_var("EPICS_PVA_INTF_ADDR_LIST");
+            std::env::remove_var("EPICS_PVAS_INTF_ADDR_LIST");
+        }
+        assert_eq!(
+            client,
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            "EPICS_PVA_INTF_ADDR_LIST=localhost must resolve to 127.0.0.1, not drop to []"
+        );
+        assert_eq!(
+            server,
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            "EPICS_PVAS_INTF_ADDR_LIST=localhost must resolve to 127.0.0.1, not drop to []"
+        );
+    }
+
+    /// Interface lists deduplicate after resolution, preserving
+    /// first-appearance order (pvxs normalizes then `removeDups`). A
+    /// hostname that resolves to an IP already listed collapses into the
+    /// existing entry.
+    #[test]
+    fn intf_addr_list_dedups_after_resolution() {
+        unsafe {
+            std::env::set_var("EPICS_PVA_INTF_ADDR_LIST", "127.0.0.1 localhost 127.0.0.1");
+        }
+        let client = list_intf_addresses();
+        unsafe {
+            std::env::remove_var("EPICS_PVA_INTF_ADDR_LIST");
+        }
+        assert_eq!(
+            client,
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            "literal 127.0.0.1 and resolved localhost must collapse to a single entry"
+        );
     }
 
     /// PVA-40: numeric ignore-list tokens keep pvxs port semantics — a

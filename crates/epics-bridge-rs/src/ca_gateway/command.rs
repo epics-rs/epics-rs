@@ -400,31 +400,67 @@ impl CommandHandler {
         Ok(Some((count, pruned)))
     }
 
-    /// Process all commands from a command file.
+    /// Process a `gateway.command` file with C `gateServer::gateCommands`
+    /// semantics (gateServer.cc:434-496).
     ///
-    /// C ca-gateway strips an inline `#` comment from each line, then
-    /// `strtok`s it on whitespace and dispatches EVERY recognized command
-    /// token (gateServer.cc:458-470, :475-493) — so a single line may
-    /// carry several commands (`R1 AS`) and may end in a trailing comment
-    /// (`R1 # reload`). Parsing each whole line as one exact command (the
-    /// old behavior) silently dropped those C-compatible shapes, making a
-    /// `kill -USR1` appear to succeed while the intended command never
-    /// ran. Tokenize like C: split on whitespace and dispatch each
-    /// recognized token; unrecognized tokens are ignored, as in C.
+    /// C does NOT dispatch each token as it reads. It strips an inline `#`
+    /// comment from every line, `strtok`s on whitespace, and sets four
+    /// booleans (`r1Flag`/`r2Flag`/`r3Flag`/`asFlag`) — recognizing exactly
+    /// the four tokens `R1`, `R2`, `R3`, `AS` via case-sensitive `strcmp`
+    /// (gateServer.cc:462-465). Any other token prints `Invalid command`
+    /// (gateServer.cc:467). After the whole file is read, it runs at most
+    /// ONE of each in a fixed order — `R1`, `R2`, `AS`, `R3`
+    /// (gateServer.cc:476-493), with `R3` deliberately after `AS` so the
+    /// access report reflects the just-reloaded rules.
+    ///
+    /// Three C-parity properties this gives a C-compatible command file:
+    /// duplicate flags collapse to one action (`R2 R2` runs one summary);
+    /// a burst of different flags is ordered by C's fixed sequence, not by
+    /// token order in the file (`R3 AS` reloads access first, then reports);
+    /// and the broader Rust programmatic vocabulary
+    /// ([`GatewayCommand::parse_token`]: `PVL`, `VERSION`, long aliases,
+    /// lowercase) is NOT honored here — those are reported as invalid, so
+    /// the command-file path matches C exactly while the control-PV /
+    /// programmatic APIs keep the extensions.
     pub async fn process_file(&self, path: &PathBuf) -> BridgeResult<String> {
         let content = std::fs::read_to_string(path)?;
-        let mut combined = String::new();
+
+        // Pass 1: collapse the file into C's four flags and report invalid
+        // tokens. Case-sensitive exact match, mirroring C `strcmp`.
+        let (mut r1, mut r2, mut r3, mut reload_as) = (false, false, false, false);
         for raw in content.lines() {
-            // Strip an inline comment, then dispatch each token.
             let line = match raw.find('#') {
                 Some(i) => &raw[..i],
                 None => raw,
             };
             for tok in line.split_whitespace() {
-                if let Some(cmd) = GatewayCommand::parse_token(tok) {
-                    combined.push_str(&self.dispatch(cmd).await?);
+                match tok {
+                    "R1" => r1 = true,
+                    "R2" => r2 = true,
+                    "R3" => r3 = true,
+                    "AS" => reload_as = true,
+                    other => tracing::warn!(
+                        command = %other,
+                        "ca-gateway-rs: invalid command in command file (C gateCommands \
+                         accepts only R1/R2/R3/AS)"
+                    ),
                 }
             }
+        }
+
+        // Pass 2: run at most one of each in C's fixed order R1, R2, AS, R3.
+        let mut combined = String::new();
+        if r1 {
+            combined.push_str(&self.dispatch(GatewayCommand::ReportFull).await?);
+        }
+        if r2 {
+            combined.push_str(&self.dispatch(GatewayCommand::ReportSummary).await?);
+        }
+        if reload_as {
+            combined.push_str(&self.dispatch(GatewayCommand::ReloadAccess).await?);
+        }
+        if r3 {
+            combined.push_str(&self.dispatch(GatewayCommand::ReportAccess).await?);
         }
         Ok(combined)
     }
@@ -676,17 +712,18 @@ mod tests {
         let _ = std::fs::remove_file(&pvl_path);
     }
 
-    /// C-compatible command files put several commands on one line and
-    /// allow trailing `#` comments (gateServer.cc:458-470). process_file
-    /// must tokenize and dispatch every recognized token, not parse each
-    /// whole line as one exact command. Pre-fix `V R1 # note` was a no-op.
+    /// C `gateCommands` collapses multi-token/comment lines into the four
+    /// flags and runs each once (gateServer.cc:458-493). A command file may
+    /// put several tokens on one line and end in a trailing `#` comment, but
+    /// duplicate flags collapse to ONE action and non-C tokens (`V`, `PVL`,
+    /// long aliases, lowercase) are invalid — NOT dispatched.
     #[tokio::test]
-    async fn process_file_tokenizes_multi_command_and_comment_lines() {
+    async fn process_file_collapses_duplicates_and_rejects_non_c_tokens() {
         let pid = std::process::id();
         let cmd_path = std::env::temp_dir().join(format!("ca_gw_a10_cmd_{pid}.command"));
-        // Line 1: two commands on one line + trailing inline comment.
+        // Line 1: a non-C token (V) + R2 + trailing inline comment.
         // Line 2: a bare comment line (ignored).
-        // Line 3: a command with a leading-token comment stripped.
+        // Line 3: a duplicate R2 with an inline comment stripped.
         std::fs::write(&cmd_path, "V R2 # reload now\n# just a comment\nR2 #x\n").unwrap();
 
         let cache = Arc::new(RwLock::new(PvCache::new()));
@@ -696,16 +733,61 @@ mod tests {
 
         let out = handler.process_file(&cmd_path).await.unwrap();
 
-        // `V` produced a version line; both `R2` tokens produced an R2
-        // section (no report file → the rendered section is returned).
+        // `V` is not a C command-file token → no version line (C prints
+        // "Invalid command V" and runs nothing for it).
         assert!(
-            out.contains("ca-gateway-rs 0") || out.contains("ca-gateway-rs v"),
-            "V token dispatched a version line: {out:?}"
+            !out.contains("ca-gateway-rs 0") && !out.contains("ca-gateway-rs v"),
+            "V must be an invalid command-file token, not a version dispatch: {out:?}"
         );
+        // The two R2 tokens collapse to exactly ONE R2 section (C runs
+        // report2 once regardless of how many R2 flags were set).
         let summaries = out.matches("R2 (process variable report)").count();
         assert_eq!(
-            summaries, 2,
-            "both R2 tokens (line 1 and line 3) must dispatch: {out:?}"
+            summaries, 1,
+            "duplicate R2 tokens must collapse to one summary: {out:?}"
+        );
+
+        let _ = std::fs::remove_file(&cmd_path);
+    }
+
+    /// C `gateCommands` runs the flags in a FIXED order — `R1`, `R2`, `AS`,
+    /// `R3` — independent of token order in the file, with `R3` after `AS`
+    /// so the access report reflects the just-reloaded rules
+    /// (gateServer.cc:476-493). A file written `R3 AS R1` must still emit
+    /// R1, then R2-absent, then the AS reload, then R3.
+    #[tokio::test]
+    async fn process_file_runs_flags_in_fixed_c_order() {
+        let pid = std::process::id();
+        let cmd_path = std::env::temp_dir().join(format!("ca_gw_a10_order_{pid}.command"));
+        // Tokens deliberately out of C order on the line.
+        std::fs::write(&cmd_path, "R3 AS R1\n").unwrap();
+
+        let cache = Arc::new(RwLock::new(PvCache::new()));
+        let pvlist = Arc::new(ArcSwap::from_pointee(PvList::new()));
+        let access = Arc::new(ArcSwap::from_pointee(AccessConfig::allow_all()));
+        // No access/pvlist path → AS emits its "No access path configured"
+        // marker; that marker must appear BETWEEN R1 and R3.
+        let handler = CommandHandler::new(cache, pvlist, access, None, None);
+
+        let out = handler.process_file(&cmd_path).await.unwrap();
+
+        let r1_pos = out
+            .find("R1 (PV report)")
+            .expect("R1 section must be present");
+        let as_pos = out
+            .find("No access path configured")
+            .expect("AS reload marker must be present");
+        let r3_pos = out
+            .find("R3 (access security report)")
+            .expect("R3 section must be present");
+        assert!(
+            r1_pos < as_pos && as_pos < r3_pos,
+            "fixed C order is R1, (R2), AS, R3 — got positions R1={r1_pos} AS={as_pos} R3={r3_pos}: {out:?}"
+        );
+        // R2 was not requested, so no summary section.
+        assert!(
+            !out.contains("R2 (process variable report)"),
+            "R2 was not in the file and must not run: {out:?}"
         );
 
         let _ = std::fs::remove_file(&cmd_path);

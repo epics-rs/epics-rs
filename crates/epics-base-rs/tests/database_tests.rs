@@ -1610,6 +1610,113 @@ async fn test_sim_mode_output() {
     }
 }
 
+/// A SIMM-mode **input** record whose SIOL points at a NON-LOCAL record
+/// must read the simulated value through the external CA path, not a
+/// local lookup. C `readValue` reads SIOL via `dbGetLink`, and
+/// `dbInitLink` (dbLink.c:118-130) made the non-local SIOL a CA link, so
+/// the read is `dbCaGetLink`. The pre-fix port special-cased only a
+/// local `ParsedLink::Db` SIOL, so a non-local SIOL read nothing yet
+/// still returned `Simulated` — the record froze with no value. This is
+/// the INPUT twin of the OUT-link locality fallback.
+#[tokio::test]
+async fn test_sim_mode_input_nonlocal_db_siol() {
+    use epics_base_rs::server::database::LinkSet;
+    struct ValueCaLset(f64);
+    impl LinkSet for ValueCaLset {
+        fn is_connected(&self, _: &str) -> bool {
+            true
+        }
+        fn get_value(&self, name: &str) -> Option<EpicsValue> {
+            // The bare non-local SIOL record name reaches the CA lset
+            // via the read-locality fallback `resolve_external_pv`.
+            (name == "REMOTE:SIM").then_some(EpicsValue::Double(self.0))
+        }
+    }
+
+    let db = PvDatabase::new();
+    db.register_link_set("ca", Arc::new(ValueCaLset(73.0)))
+        .await;
+    db.add_record("SIM_SW", Box::new(AoRecord::new(1.0)))
+        .await
+        .unwrap();
+
+    let mut ai = AiRecord::new(0.0);
+    ai.siml = "SIM_SW".to_string();
+    // REMOTE:SIM is never added locally → dbInitLink makes it a CA link.
+    ai.siol = "REMOTE:SIM".to_string();
+    ai.sims = 1;
+    db.add_record("SIM_AI_NL", Box::new(ai)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SIM_AI_NL", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let val = db.get_pv("SIM_AI_NL").await.unwrap();
+    assert!(
+        matches!(val, EpicsValue::Double(v) if (v - 73.0).abs() < 1e-10),
+        "non-local Db SIOL must read the remote sim value into VAL: got {val:?}"
+    );
+}
+
+/// A SIMM-mode **output** record whose SIOL points at a NON-LOCAL
+/// record must write the simulated value through the external CA put
+/// path (C `writeValue` → `dbPutLink` → `dbCaPutLink`), not a local
+/// `dbPut`. OUTPUT twin of `test_sim_mode_input_nonlocal_db_siol`; the
+/// pre-fix port special-cased only a local `ParsedLink::Db` SIOL, so a
+/// non-local SIOL write went nowhere.
+#[tokio::test]
+async fn test_sim_mode_output_nonlocal_db_siol() {
+    use std::sync::Mutex;
+
+    use epics_base_rs::server::database::LinkPutOp;
+
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let db = PvDatabase::new();
+    db.register_link_set(
+        "ca",
+        Arc::new(CapturingLset {
+            writes: writes.clone(),
+        }),
+    )
+    .await;
+    db.add_record("SIM_SW", Box::new(AoRecord::new(1.0)))
+        .await
+        .unwrap();
+
+    let mut ao = AoRecord::new(55.0);
+    ao.siml = "SIM_SW".to_string();
+    // REMOTE:OUT is never added locally → dbInitLink makes it a CA link.
+    ao.siol = "REMOTE:OUT".to_string();
+    db.add_record("TEST_AO_NL", Box::new(ao)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("TEST_AO_NL", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let captured = writes.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "the non-local SIOL must drive exactly one external put_value"
+    );
+    assert_eq!(
+        captured[0].0, "REMOTE:OUT",
+        "put_value must receive the bare SIOL record name"
+    );
+    assert_eq!(
+        captured[0].1.to_f64(),
+        Some(55.0),
+        "put_value must receive the simulated output value"
+    );
+    assert_eq!(
+        captured[0].2,
+        LinkPutOp::Plain,
+        "a SIMM-mode simulation write is a Plain put"
+    );
+}
+
 #[tokio::test]
 async fn test_sdis_disable_skips_process() {
     let db = PvDatabase::new();

@@ -2849,6 +2849,57 @@ impl PvDatabase {
         }
     }
 
+    /// Write a simulation value to an output record's SIOL link,
+    /// dispatching by link type and locality exactly as C `dbPutLink`
+    /// (reached from `writeValue` for a SIMM-mode output record):
+    ///
+    /// - a **local DB** target uses the already-locked write — writing
+    ///   VAL is an internal step of this record's processing chain,
+    ///   which already holds the entry record's advisory write gate, so
+    ///   a SIOL pointing back at a chain record must not re-acquire the
+    ///   non-reentrant gate (same reasoning as `write_db_link_value`);
+    /// - a **non-local DB** target (`dbInitLink` made it a CA link) and
+    ///   an explicit **`Ca`/`Pva`** link route through the lset put path;
+    /// - constant / hardware / none SIOL targets are not writable — no-op
+    ///   (C `dbPutLink` -> `S_db_noLSET`).
+    async fn write_sim_siol_value(
+        &self,
+        siol: &crate::server::record::ParsedLink,
+        value: EpicsValue,
+    ) {
+        match siol {
+            crate::server::record::ParsedLink::Db(link) => {
+                let pv_name = if link.field == "VAL" {
+                    link.record.clone()
+                } else {
+                    format!("{}.{}", link.record, link.field)
+                };
+                if self.has_name_no_resolve(&link.record).await {
+                    let _ = self.put_pv_already_locked(&pv_name, value).await;
+                } else if let Err(e) = self
+                    .write_external_pv(&pv_name, value, crate::server::database::LinkPutOp::Plain)
+                    .await
+                {
+                    eprintln!("SIOL simulation write to external PV '{pv_name}' failed: {e}");
+                }
+            }
+            crate::server::record::ParsedLink::Ca(_)
+            | crate::server::record::ParsedLink::Pva(_)
+            | crate::server::record::ParsedLink::PvaJson(_) => {
+                let name = siol
+                    .external_pv_name()
+                    .expect("Ca/Pva/PvaJson link carries a PV name");
+                if let Err(e) = self
+                    .write_external_pv(name, value, crate::server::database::LinkPutOp::Plain)
+                    .await
+                {
+                    eprintln!("SIOL simulation write to external PV '{name}' failed: {e}");
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Check simulation mode for a record. Returns
     /// `SimOutcome::Simulated` when simulation handled the value (the
     /// caller must still run the forward-link tail), or
@@ -2965,17 +3016,23 @@ impl PvDatabase {
         let raw_mode = simm == 2;
         let raw_field = if raw_mode { "RVAL" } else { "VAL" };
 
-        // SIMM=YES(1) / SIMM=RAW(2): handle simulation
-        if let crate::server::record::ParsedLink::Db(ref link) = siol_link {
-            let pv_name = if link.field == "VAL" {
-                link.record.clone()
-            } else {
-                format!("{}.{}", link.record, link.field)
-            };
-
+        // SIMM=YES(1) / SIMM=RAW(2): read/write the SIOL link. C
+        // `readValue`/`writeValue` for a SIMM-mode record go through
+        // `dbGetLink`/`dbPutLink`, which dispatch by link type — a local
+        // DB target, a CA target (a bare non-local name or an explicit
+        // `CA`/`ca://` link), or a constant. The pre-fix port special-
+        // cased a local `ParsedLink::Db` SIOL only, so a non-local or
+        // external SIOL neither read nor wrote yet still returned
+        // `Simulated` — the record froze with no value and no alarm.
+        // Dispatch uniformly through the same link read/write owners as
+        // every other link; the alarm/timestamp/notify tail below now
+        // runs for every SIOL link type.
+        {
             if is_input {
-                // Input record: read from SIOL -> set VAL/RVAL.
-                if let Ok(siol_val) = self.get_pv(&pv_name).await {
+                // Input record: read from SIOL -> set VAL/RVAL. Uniform
+                // across Db (with locality fallback) / Ca / Pva / constant
+                // via `read_link_value_no_process` (C `dbGetLink`).
+                if let Some(siol_val) = self.read_link_value_no_process(&siol_link).await {
                     let mut instance = rec.write().await;
                     let target_supports_raw =
                         raw_mode && instance.record.get_field("RVAL").is_some();
@@ -3103,14 +3160,17 @@ impl PvDatabase {
                     }
                 };
                 if let Some(val) = out_val {
-                    // writing VAL to the SIOL target is an
+                    // Write VAL to the SIOL target, dispatching by link
+                    // type/locality (C `dbPutLink`). A local DB target
+                    // uses the `_already_locked` write — writing VAL is an
                     // internal step of this record's processing chain,
                     // which already holds the entry record's advisory
-                    // write gate. Use the `_already_locked` write so a
-                    // SIOL that points back at a chain record cannot
-                    // dead-lock on a non-reentrant gate (same reasoning
-                    // as the OUT-link write in `write_db_link_value`).
-                    let _ = self.put_pv_already_locked(&pv_name, val).await;
+                    // write gate, so a SIOL that points back at a chain
+                    // record cannot dead-lock on a non-reentrant gate
+                    // (same reasoning as the OUT-link write in
+                    // `write_db_link_value`). A non-local or external
+                    // SIOL routes through the lset put path.
+                    self.write_sim_siol_value(&siol_link, val).await;
                 }
 
                 let mut instance = rec.write().await;

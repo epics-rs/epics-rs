@@ -343,9 +343,8 @@ pub(crate) fn dbr_ushort_cast(value: &EpicsValue) -> u16 {
 /// SELM: 0 = All, 1 = Specified, 2 = Mask. `count` is the number of
 /// link slots (16 for fanout/dfanout/seq).
 ///
-/// `seln` is the raw 16-bit bit pattern stored in the signed `SELN`
-/// field; C declares `SELN` as `epicsUInt16`, so every comparison below
-/// reinterprets it as unsigned (`seln as u16`) to match C's unsigned
+/// `seln` is the native `DBF_USHORT` value: C declares `SELN` as
+/// `epicsUInt16`, so every comparison below is unsigned, matching C's
 /// selection arithmetic. A `SELL=-1` link read therefore selects
 /// `65535` (out of range → INVALID for Specified, all-bits for Mask),
 /// not `-1`.
@@ -357,14 +356,11 @@ pub(crate) fn dbr_ushort_cast(value: &EpicsValue) -> u16 {
 pub(crate) fn select_link_indices_ex(
     kind: SelmKind,
     selm: i16,
-    seln: i16,
+    seln: u16,
     offs: i16,
     shft: i16,
     count: usize,
 ) -> SelmResult {
-    // C `SELN` is `epicsUInt16`; reinterpret the stored bit pattern as
-    // unsigned for every range/zero/mask test below.
-    let seln_u = seln as u16;
     use crate::server::recgbl::alarm_status::SOFT_ALARM;
     use crate::server::record::AlarmSeverity;
 
@@ -387,7 +383,7 @@ pub(crate) fn select_link_indices_ex(
                 // 0-based; `i<0 || i>=NLINKS` → INVALID. So `SELN=65535`
                 // (from `SELL=-1`) yields `i>=NLINKS` → INVALID, never
                 // drives link 0.
-                let i = seln_u as i32 + offs as i32;
+                let i = seln as i32 + offs as i32;
                 if i < 0 || i >= count as i32 {
                     invalid()
                 } else {
@@ -401,7 +397,7 @@ pub(crate) fn select_link_indices_ex(
                 // `SELL=-1` → `SELN=65535` > count → INVALID (the signed
                 // read used to see `-1`, take the `<= 0` branch, and drive
                 // nothing with no alarm).
-                let seln_i = seln_u as i32;
+                let seln_i = seln as i32;
                 if seln_i > count as i32 {
                     invalid()
                 } else if seln_i == 0 {
@@ -419,7 +415,7 @@ pub(crate) fn select_link_indices_ex(
                     if !(-15..=15).contains(&shft) {
                         return invalid();
                     }
-                    let raw = seln_u as u32;
+                    let raw = seln as u32;
                     if shft >= 0 {
                         raw >> shft
                     } else {
@@ -427,7 +423,7 @@ pub(crate) fn select_link_indices_ex(
                     }
                 }
                 // dfanout Mask has no SHFT.
-                SelmKind::Dfanout => seln_u as u32,
+                SelmKind::Dfanout => seln as u32,
             };
             ok((0..count).filter(|i| mask & (1 << i) != 0).collect())
         }
@@ -1386,21 +1382,21 @@ mod tests {
         assert_eq!(dbr_ushort_cast(&EpicsValue::Double(3.7)), 3);
         assert_eq!(dbr_ushort_cast(&EpicsValue::Long(-1)), 65535);
 
-        // SELL=-1 stores the i16 bit pattern of 65535 into SELN.
-        let seln_neg1 = 65535u16 as i16; // -1
+        // SELL=-1 casts to the unsigned `DBF_USHORT` value 65535.
+        let seln_max = 65535u16;
         // fanout/seq Specified: C `i = (epicsUInt16)seln + offs` =
         // 65535 → out of range → INVALID. The old signed read clamped to
         // 0 and drove link 0.
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, seln_neg1, 0, 0, 16);
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 1, seln_max, 0, 0, 16);
         assert!(r.indices.is_empty());
         assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
         // fanout/seq Mask: 65535 → all 16 low bits set → every link. The
         // old clamp produced an empty mask.
-        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, seln_neg1, 0, 0, 16);
+        let r = select_link_indices_ex(SelmKind::FanoutSeq, 2, seln_max, 0, 0, 16);
         assert_eq!(r.indices, (0..16).collect::<Vec<_>>());
         // dfanout Specified: 65535 > count → INVALID. The old signed read
         // saw -1 ≤ 0 → drove nothing with no alarm.
-        let r = select_link_indices_ex(SelmKind::Dfanout, 1, seln_neg1, 0, 0, 16);
+        let r = select_link_indices_ex(SelmKind::Dfanout, 1, seln_max, 0, 0, 16);
         assert!(r.indices.is_empty());
         assert_eq!(r.alarm, Some((15, AlarmSeverity::Invalid)));
     }

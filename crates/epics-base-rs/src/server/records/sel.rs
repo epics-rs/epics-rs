@@ -9,10 +9,10 @@ const SEL_MAX: usize = 12;
 pub struct SelRecord {
     pub val: f64,
     pub selm: i16, // 0=Specified, 1=High, 2=Low, 3=Median
-    /// Selection number. C `selRecord.h` declares SELN as `DBF_USHORT`
-    /// so it is always ≥ 0; the Rust field is `i16` but is treated as
-    /// an unsigned 0..65535 index — `do_sel` rejects values ≥ SEL_MAX.
-    pub seln: i16,
+    /// Selection number. C declares SELN as `DBF_USHORT`
+    /// (selRecord.dbd.pod:295): an unsigned 0..65535 index — `do_sel`
+    /// rejects values ≥ SEL_MAX.
+    pub seln: u16,
     pub nvl: String, // NVL link (for SELN)
     // Input links
     pub inpa: String,
@@ -125,7 +125,7 @@ static SEL_FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "SELN",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::UShort,
         read_only: false,
     },
     FieldDesc {
@@ -320,9 +320,9 @@ impl Record for SelRecord {
             0 => {
                 // Specified: index by SELN. C `do_sel` raises
                 // SOFT_ALARM/INVALID and returns (VAL unchanged) when
-                // SELN >= SEL_MAX. SELN is unsigned in C; treat a
-                // negative i16 as a huge unsigned value → out of range.
-                let idx = self.seln as u16 as usize;
+                // SELN >= SEL_MAX. SELN is `DBF_USHORT` (u16), so an
+                // out-of-range client value lands as a large index.
+                let idx = self.seln as usize;
                 if idx >= SEL_MAX {
                     self.soft_alarm = true;
                 } else {
@@ -342,7 +342,7 @@ impl Record for SelRecord {
                 for (i, &v) in vals.iter().enumerate() {
                     if !v.is_nan() && val < v {
                         val = v;
-                        self.seln = i as i16;
+                        self.seln = i as u16;
                     }
                 }
                 self.val = val;
@@ -357,7 +357,7 @@ impl Record for SelRecord {
                 for (i, &v) in vals.iter().enumerate() {
                     if !v.is_nan() && val > v {
                         val = v;
-                        self.seln = i as i16;
+                        self.seln = i as u16;
                     }
                 }
                 self.val = val;
@@ -373,7 +373,7 @@ impl Record for SelRecord {
                     }
                 }
                 let count = order.len();
-                self.seln = count as i16;
+                self.seln = count as u16;
                 order.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 self.val = if count == 0 {
                     f64::NAN
@@ -479,7 +479,7 @@ impl Record for SelRecord {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
             "SELM" => Some(EpicsValue::Short(self.selm)),
-            "SELN" => Some(EpicsValue::Short(self.seln)),
+            "SELN" => Some(EpicsValue::UShort(self.seln)),
             "NVL" => Some(EpicsValue::String(self.nvl.clone().into())),
             "INPA" => Some(EpicsValue::String(self.inpa.clone().into())),
             "INPB" => Some(EpicsValue::String(self.inpb.clone().into())),
@@ -536,8 +536,16 @@ impl Record for SelRecord {
                 _ => Err(CaError::TypeMismatch("SELM".into())),
             },
             "SELN" => match value {
-                EpicsValue::Short(v) => {
+                // DBF_USHORT (selRecord.dbd.pod:295): client puts arrive
+                // converted to UShort; internal SELL/NVL link reads still
+                // pass a Short. Cast both into the unsigned field (C
+                // DBF_USHORT truncation).
+                EpicsValue::UShort(v) => {
                     self.seln = v;
+                    Ok(())
+                }
+                EpicsValue::Short(v) => {
+                    self.seln = v as u16;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SELN".into())),

@@ -15,8 +15,9 @@ pub struct SeqRecord {
     pub val: u16,
     #[field(type = "Short")]
     pub selm: i16,
-    #[field(type = "Short")]
-    pub seln: i16,
+    // SELN is `DBF_USHORT` (seqRecord.dbd.pod:271): unsigned 0..65535.
+    #[field(type = "UShort")]
+    pub seln: u16,
     #[field(type = "String")]
     pub sell: String,
     #[field(type = "Short")]

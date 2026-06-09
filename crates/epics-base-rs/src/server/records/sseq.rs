@@ -98,7 +98,7 @@ static SSEQ_FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "SELN",
-        dbf_type: DbFieldType::Short,
+        dbf_type: DbFieldType::UShort,
         read_only: false,
     },
     FieldDesc {
@@ -487,7 +487,7 @@ impl Record for SseqRecord {
         match name {
             "VAL" => Some(EpicsValue::Long(self.val)),
             "SELM" => Some(EpicsValue::Short(self.selm)),
-            "SELN" => Some(EpicsValue::Short(self.seln as i16)),
+            "SELN" => Some(EpicsValue::UShort(self.seln)),
             "SELL" => Some(EpicsValue::String(self.sell.clone().into())),
             "PREC" => Some(EpicsValue::Short(self.prec)),
             "ABORT" => Some(EpicsValue::Short(self.abort)),
@@ -529,7 +529,13 @@ impl Record for SseqRecord {
                 }
                 _ => Err(CaError::TypeMismatch("SELM".into())),
             },
+            // SELN is `DBF_USHORT` (sseqRecord.dbd:40): client puts arrive
+            // converted to UShort; internal SELL link reads pass a Short.
             "SELN" => match value {
+                EpicsValue::UShort(v) => {
+                    self.seln = v;
+                    Ok(())
+                }
                 EpicsValue::Short(v) => {
                     self.seln = v as u16;
                     Ok(())

@@ -760,7 +760,7 @@ impl EpicsValue {
     /// it is 8-bit (no narrowing target can overflow) and `to_f64`
     /// reinterprets it as signed `epicsInt8`, a contract this view must
     /// not silently change.
-    fn as_int_i64(&self) -> Option<i64> {
+    pub(crate) fn as_int_i64(&self) -> Option<i64> {
         Some(match self {
             Self::Short(v) => *v as i64,
             Self::Enum(v) => *v as i64,

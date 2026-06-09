@@ -4262,8 +4262,8 @@ async fn test_sel_nvl_link() {
         .unwrap();
     let seln = db.get_pv("SEL_REC.SELN").await.unwrap();
     match seln {
-        EpicsValue::Short(v) => assert_eq!(v, 2),
-        other => panic!("expected Short(2), got {:?}", other),
+        EpicsValue::UShort(v) => assert_eq!(v, 2),
+        other => panic!("expected UShort(2), got {:?}", other),
     }
     let val = db.get_pv("SEL_REC").await.unwrap();
     match val {
@@ -6069,7 +6069,7 @@ async fn test_fanout_resolves_sell_link_into_seln() {
     let seln = fan_rec.read().await.record.get_field("SELN").unwrap();
     assert_eq!(
         seln,
-        EpicsValue::Short(2),
+        EpicsValue::UShort(2),
         "SELN must be updated from the SELL link"
     );
 }

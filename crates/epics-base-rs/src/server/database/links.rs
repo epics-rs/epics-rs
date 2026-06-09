@@ -195,12 +195,25 @@ impl PvDatabase {
     /// opens the CA link and returns `None` until the monitor connects,
     /// then serves the cached value — exactly C `dbCaGetLink`.
     async fn read_db_link_value(&self, db: &crate::server::record::DbLink) -> Option<EpicsValue> {
-        let pv_name = if db.field == "VAL" {
-            db.record.clone()
+        self.read_target_value(&db.record, &db.field).await
+    }
+
+    /// Read a `(record, field)` link target's value, dispatching by C
+    /// `dbInitLink` locality (`dbLink.c:118-130`): a target present in
+    /// this IOC reads from the local database (`get_pv`); a non-local
+    /// target is a CA link, resolved through the external path
+    /// (`dbCaGetLink`). The single owner of that locality decision for
+    /// the value-read path — shared by [`Self::read_db_link_value`] (the
+    /// record's own `Db` link) and the lnkCalc input loop
+    /// ([`Self::evaluate_calc_link`]), whose `A..L` inputs are each their
+    /// own `dbInitLink` link and so become CA links when non-local.
+    async fn read_target_value(&self, record: &str, field: &str) -> Option<EpicsValue> {
+        let pv_name = if field == "VAL" {
+            record.to_string()
         } else {
-            format!("{}.{}", db.record, db.field)
+            format!("{record}.{field}")
         };
-        if self.has_name_no_resolve(&db.record).await {
+        if self.has_name_no_resolve(record).await {
             self.get_pv(&pv_name).await.ok()
         } else {
             self.resolve_external_pv(&pv_name).await
@@ -297,7 +310,15 @@ impl PvDatabase {
         }
         let mut vars = [0.0f64; CALC_NARGS];
         for (i, arg) in calc.args.iter().enumerate() {
-            let v = self.get_pv(arg).await.ok()?;
+            // Each lnkCalc input is its own `dbInitLink` link, so a
+            // non-local input record is a CA link — read it through the
+            // locality owner, not a local-only `get_pv`. `arg` is a bare
+            // record name or `record.FIELD`; split on the last `.`.
+            let (record, field) = match arg.rsplit_once('.') {
+                Some((r, f)) => (r, f),
+                None => (arg.as_str(), "VAL"),
+            };
+            let v = self.read_target_value(record, field).await?;
             vars[i] = v.to_f64()?;
         }
         let compiled = crate::calc::compile(&calc.expr).ok()?;
@@ -323,9 +344,22 @@ impl PvDatabase {
                 let src = calc.args.get(idx)?;
                 // Strip `.FIELD` suffix to land on the record name.
                 let record_name = src.rsplit_once('.').map(|(r, _)| r).unwrap_or(src);
-                let rec = self.get_record(record_name).await?;
-                let inst = rec.read().await;
-                Some(inst.common.time)
+                if self.has_name_no_resolve(record_name).await {
+                    let rec = self.get_record(record_name).await?;
+                    let inst = rec.read().await;
+                    Some(inst.common.time)
+                } else {
+                    // Non-local time source → CA link; pull the remote
+                    // `.TIME` through the external resolver (C
+                    // `dbGetTimeStamp` on a CA link), same as the
+                    // non-local TSEL `.TIME` adoption.
+                    let (secs, ns, _utag) = self
+                        .external_link_time(&format!("ca://{record_name}"))
+                        .await?;
+                    let secs = secs.max(0) as u64;
+                    let ns = (ns.max(0) as u32).min(999_999_999);
+                    Some(std::time::UNIX_EPOCH + std::time::Duration::new(secs, ns))
+                }
             }
             None => None,
         };

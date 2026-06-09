@@ -5670,6 +5670,77 @@ async fn test_lnk_calc_parses_evaluates_and_passes_timestamp() {
     assert_eq!(t, Some(known), "time pulled from pv_a (letter 'A')");
 }
 
+/// A `lnkCalc` `{calc:...}` link whose input record is NON-LOCAL must
+/// read that input through the external CA path, and its timestamp
+/// passthrough must adopt the remote `.TIME` — each `A..L` input is its
+/// own `dbInitLink` link, so a non-local input is a CA link. The pre-fix
+/// loop read every input with a local-only `get_pv` (and the time source
+/// with a local-only `get_record`), so a single non-local input made the
+/// whole evaluation return `None` and the time fell back to the
+/// consumer's own. Sibling of the non-local Db read / OUT-write / TSEL
+/// `.TIME` fixes — same `dbInitLink` locality cause, the lnkCalc inputs.
+#[tokio::test]
+async fn test_lnk_calc_nonlocal_input_resolves_externally() {
+    use epics_base_rs::server::database::LinkSet;
+    use epics_base_rs::server::record::CalcLink;
+    use epics_base_rs::server::records::ai::AiRecord;
+
+    struct CalcCaLset {
+        secs: i64,
+        nsec: i32,
+    }
+    impl LinkSet for CalcCaLset {
+        fn is_connected(&self, _: &str) -> bool {
+            true
+        }
+        fn get_value(&self, name: &str) -> Option<EpicsValue> {
+            (name == "REMOTE:A").then_some(EpicsValue::Double(10.0))
+        }
+        fn time_stamp(&self, name: &str) -> Option<(i64, i32, u64)> {
+            (name == "REMOTE:A").then_some((self.secs, self.nsec, 0))
+        }
+    }
+
+    let db = PvDatabase::new();
+    db.register_link_set(
+        "ca",
+        Arc::new(CalcCaLset {
+            secs: 1_700_000_456,
+            nsec: 321,
+        }),
+    )
+    .await;
+    // pv_b is local; REMOTE:A is never added → non-local CA input.
+    db.add_record("pv_b", Box::new(AiRecord::new(5.0)))
+        .await
+        .unwrap();
+
+    let calc = CalcLink {
+        expr: "A+B*2".into(),
+        args: vec!["REMOTE:A".into(), "pv_b".into()],
+        time_source: Some('A'),
+    };
+
+    let (value, time) = db
+        .evaluate_calc_link_with_time(&calc)
+        .await
+        .expect("calc with a non-local input must still evaluate");
+    match value {
+        // 10 (remote A) + 5 (local B) * 2 = 20.
+        EpicsValue::Double(v) => assert!(
+            (v - 20.0).abs() < 1e-9,
+            "non-local calc input must resolve via CA: expected 20, got {v}"
+        ),
+        other => panic!("expected Double, got {other:?}"),
+    }
+    let expected = std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_456, 321);
+    assert_eq!(
+        time,
+        Some(expected),
+        "time source 'A' is non-local → adopt the remote .TIME via the CA path"
+    );
+}
+
 /// Regression: a CA put to `mbbo.VAL` must recompute RVAL/ORAW.
 ///
 /// C `mbboRecord.c::process` (line 217) calls `convert(prec)`

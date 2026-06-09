@@ -312,6 +312,15 @@ impl TraceManager {
         }
     }
 
+    /// Return the installed exception sink, if any. C asyn delivers
+    /// `setTrace*` reconfiguration to listeners through
+    /// `exceptionCallbackAdd` (asynManager.c); asynRecord retrieves the
+    /// sink here to register the trace-status refresh callback that C
+    /// installs in `connectDevice` (asynRecord.c:1269).
+    pub fn exception_manager(&self) -> Option<Arc<ExceptionManager>> {
+        self.exception_sink.lock().ok().and_then(|g| g.clone())
+    }
+
     /// Fire a trace exception to the registered sink, if any.
     /// `port = None` corresponds to a global change.
     fn announce(&self, port: Option<&str>, exception: AsynException) {

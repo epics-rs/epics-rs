@@ -5,11 +5,13 @@ pub use registry::{
 };
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
+use crate::exception::{AsynException, ExceptionCallbackId, ExceptionManager};
 use crate::port_handle::PortHandle;
 use crate::trace::{TraceFile, TraceInfoMask, TraceIoMask, TraceManager, TraceMask};
 
@@ -317,6 +319,18 @@ pub struct AsynRecord {
     // --- Runtime state (not EPICS fields) ---
     port_entry: Option<PortEntry>,
     resolved_reason: usize,
+
+    // Set by the trace exception callback (C `exceptCallback`,
+    // asynRecord.c:903-917) when an external `setTrace{Mask,IOMask,
+    // InfoMask}` fires; consumed by `process()`, which re-imports the
+    // live masks through `read_trace_state`. The async callback cannot
+    // mutate the record (it is owned by the record framework) or post
+    // monitors, so the refresh is deferred to the next process cycle.
+    trace_status_dirty: Arc<AtomicBool>,
+    // Owner handle for the registered trace exception callback so it can
+    // be removed on disconnect / drop (C `exceptionCallbackRemove`,
+    // asynRecord.c:523,1154,1313).
+    trace_except_cb: Option<(Arc<ExceptionManager>, ExceptionCallbackId)>,
 }
 
 impl Default for AsynRecord {
@@ -400,6 +414,8 @@ impl Default for AsynRecord {
             aqr: 0,
             port_entry: None,
             resolved_reason: 0,
+            trace_status_dirty: Arc::new(AtomicBool::new(false)),
+            trace_except_cb: None,
         }
     }
 }
@@ -1064,6 +1080,56 @@ impl AsynRecord {
         self.update_info_bits_from_mask();
     }
 
+    /// Subscribe to the port's trace exceptions so a later external
+    /// `asynSetTrace{Mask,IOMask,InfoMask}` is reflected in the record's
+    /// readback fields.
+    ///
+    /// C registers `exceptCallback` with `exceptionCallbackAdd` in
+    /// `connectDevice` (asynRecord.c:1269); the callback re-runs
+    /// `monitorStatus` (asynRecord.c:903-917,1066-1084), which re-imports
+    /// the trace masks and posts the changed fields. In epics-rs the
+    /// record is owned by the record framework and the async callback
+    /// can neither mutate it nor post monitors, so the callback only
+    /// raises a dirty flag; `process()` performs the re-import through the
+    /// single `read_trace_state` owner. The immediate, process-free
+    /// re-post that C does under `dbScanLock` requires the record
+    /// monitor/locking framework and is not done here.
+    fn register_trace_exception_callback(&mut self) {
+        self.clear_trace_exception_callback();
+        let Some(ref entry) = self.port_entry else {
+            return;
+        };
+        let Some(mgr) = entry.trace.exception_manager() else {
+            return;
+        };
+        let port = self.port.clone();
+        let dirty = Arc::clone(&self.trace_status_dirty);
+        let id = mgr.add_callback(move |ev| {
+            // Only the trace masks `read_trace_state` imports matter here;
+            // the announce for a port-level `setTrace*` carries the port
+            // name (TraceManager::announce uses addr -1).
+            if ev.port_name == port
+                && matches!(
+                    ev.exception,
+                    AsynException::TraceMask
+                        | AsynException::TraceIoMask
+                        | AsynException::TraceInfoMask
+                )
+            {
+                dirty.store(true, Ordering::Release);
+            }
+        });
+        self.trace_except_cb = Some((mgr, id));
+    }
+
+    /// Remove the trace exception subscription (C `exceptionCallbackRemove`,
+    /// asynRecord.c:523,1154,1313). Idempotent.
+    fn clear_trace_exception_callback(&mut self) {
+        if let Some((mgr, id)) = self.trace_except_cb.take() {
+            mgr.remove_callback(id);
+        }
+    }
+
     /// Read serial/IP options from the driver into record fields.
     fn read_options_from_driver(&mut self, handle: &PortHandle) {
         // Baud rate
@@ -1164,6 +1230,7 @@ impl AsynRecord {
             self.pcnct = 0;
             self.cnct = 0;
             self.port_entry = None;
+            self.clear_trace_exception_callback();
             return;
         }
 
@@ -1196,6 +1263,10 @@ impl AsynRecord {
                 // Read trace state from manager
                 self.port_entry = Some(entry.clone());
                 self.read_trace_state();
+                // C `connectDevice` adds `exceptCallback` here
+                // (asynRecord.c:1269) so later external trace changes
+                // refresh the readback fields.
+                self.register_trace_exception_callback();
 
                 // Read serial/IP options from driver
                 self.read_options_from_driver(&entry.handle);
@@ -1224,6 +1295,7 @@ impl AsynRecord {
                 self.pcnct = 0;
                 self.cnct = 0;
                 self.port_entry = None;
+                self.clear_trace_exception_callback();
             }
         }
     }
@@ -1910,6 +1982,7 @@ impl Record for AsynRecord {
                 } else {
                     self.pcnct = 0;
                     self.port_entry = None;
+                    self.clear_trace_exception_callback();
                 }
             }
             "PCNCT" => {
@@ -1918,6 +1991,7 @@ impl Record for AsynRecord {
                 } else {
                     self.cnct = 0;
                     self.port_entry = None;
+                    self.clear_trace_exception_callback();
                 }
             }
 
@@ -2102,6 +2176,17 @@ impl Record for AsynRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
+        // Re-import the trace masks if an external `setTrace*` fired since
+        // the last cycle. C refreshes these readback fields from its
+        // `exceptCallback` immediately (asynRecord.c:903-917); epics-rs
+        // cannot mutate the record from the async callback, so the
+        // subscription (`register_trace_exception_callback`) only flags
+        // the change and the re-import happens here through the single
+        // `read_trace_state` owner.
+        if self.trace_status_dirty.swap(false, Ordering::AcqRel) {
+            self.read_trace_state();
+        }
+
         // C asynCallbackProcess (asynRecord.c:819-827) dispatches by
         // priority: a pending UCMD universal GPIB command first, else a
         // pending ACMD addressed GPIB command, else octet/register I/O
@@ -2143,6 +2228,16 @@ impl Record for AsynRecord {
 
     fn clears_udf(&self) -> bool {
         true
+    }
+}
+
+impl Drop for AsynRecord {
+    fn drop(&mut self) {
+        // C removes `exceptCallback` when the record disconnects
+        // (asynRecord.c:523,1154,1313); mirror that on teardown so a
+        // dropped record leaves no dangling subscription in the
+        // ExceptionManager callback list.
+        self.clear_trace_exception_callback();
     }
 }
 
@@ -2498,6 +2593,70 @@ mod tests {
         assert_eq!(rec.tinb0, 0); // TIME
         assert_eq!(rec.tinb1, 0); // PORT
         assert_eq!(rec.tinb2, 1); // SOURCE
+        assert_eq!(rec.tinb3, 1); // THREAD
+    }
+
+    /// A trace info mask changed externally AFTER the record connected must
+    /// reach the record's TINM/TINB* fields. C delivers this through
+    /// `exceptCallback` -> `monitorStatus` (asynRecord.c:903-917); epics-rs
+    /// flags the change in a trace exception callback and re-imports it on
+    /// the next `process()` via `read_trace_state`.
+    #[test]
+    fn external_trace_info_mask_reflected_after_process() {
+        use crate::exception::ExceptionManager;
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use tokio::sync::mpsc;
+
+        struct D(PortDriverBase);
+        impl PortDriver for D {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+
+        let port_name = "test_trace_info_live";
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(
+            Box::new(D(PortDriverBase::new(port_name, 1, PortFlags::default()))),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), interrupts);
+        let trace = Arc::new(TraceManager::new());
+        // Wire the exception sink as a real IOC would (PortManager installs
+        // it); without it the record's subscription is a no-op.
+        trace.set_exception_sink(Arc::new(ExceptionManager::new()));
+        trace.set_trace_info_mask(Some(port_name), TraceInfoMask::TIME);
+        register_port(port_name, handle, trace.clone());
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.tmod = TransferMode::NoIo as i32; // process() does no I/O
+        rec.connect_device();
+        assert_eq!(rec.cnct, 1);
+        assert_eq!(rec.tinm as u32, TraceInfoMask::TIME.bits());
+        assert_eq!(rec.tinb0, 1); // TIME
+        assert_eq!(rec.tinb1, 0); // PORT
+
+        // External reconfiguration after connect.
+        trace.set_trace_info_mask(Some(port_name), TraceInfoMask::PORT | TraceInfoMask::THREAD);
+        // Stale until the record runs again (no async record-side post).
+        assert_eq!(rec.tinm as u32, TraceInfoMask::TIME.bits());
+
+        rec.process().unwrap();
+
+        assert_eq!(
+            rec.tinm as u32,
+            (TraceInfoMask::PORT | TraceInfoMask::THREAD).bits()
+        );
+        assert_eq!(rec.tinb0, 0); // TIME cleared
+        assert_eq!(rec.tinb1, 1); // PORT
         assert_eq!(rec.tinb3, 1); // THREAD
     }
 

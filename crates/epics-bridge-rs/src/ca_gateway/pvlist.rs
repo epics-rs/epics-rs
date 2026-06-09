@@ -170,7 +170,12 @@ impl PvList {
     /// service). Mirrors C ca-gateway's `aToIPAddr` pass at pvlist load
     /// time (`gateAs.cc:488–509`):
     ///
-    /// - Tokens that are already IP-address literals are kept verbatim.
+    /// - Tokens that are already **IPv4**-address literals are kept verbatim.
+    ///   IPv6 literals are dropped, mirroring C `aToIPAddr` (which parses only
+    ///   IPv4 forms and rejects a `:`-leading literal): C never creates a
+    ///   host-scoped deny for any IPv6 address. A dropped IPv6 literal is
+    ///   treated like an unresolvable host (collapses to a global deny when it
+    ///   is the rule's only token).
     /// - Hostnames are resolved via `tokio::net::lookup_host` and reduced to a
     ///   **single IPv4 address — the first one returned**. C ca-gateway resolves
     ///   each DENY FROM token through `aToIPAddr` → `hostToIPAddr`, which sets
@@ -202,9 +207,32 @@ impl PvList {
                 }
                 let tokens = std::mem::take(from_hosts);
                 for token in tokens {
-                    // Already an IP literal? Preserve verbatim.
-                    if token.parse::<std::net::IpAddr>().is_ok() {
+                    // Already an IPv4 literal? Preserve verbatim. C
+                    // `aToIPAddr` (libcom aToIPAddr.c:97-173) parses only
+                    // dotted/raw IPv4 forms; its host-name fallback uses
+                    // `sscanf("%511[^:]")`, which matches zero characters for
+                    // a `:`-leading IPv6 literal, so `aToIPAddr("::1")` fails
+                    // outright. The `from_hosts` invariant after this pass is
+                    // "IPv4 dotted strings only".
+                    if token.parse::<std::net::Ipv4Addr>().is_ok() {
                         from_hosts.push(token);
+                        continue;
+                    }
+                    // An IPv6 literal is NOT a usable host-scoped deny in C:
+                    // `aToIPAddr` rejects it (above) and the `hostToIPAddr`
+                    // fallback is AF_INET-only (osdSock.c:250-267), so C never
+                    // builds a scoped deny for any IPv6 address. Treat it
+                    // exactly like C's `aToIPAddr` failure — drop the token; if
+                    // it is the rule's only host the rule collapses to a global
+                    // deny (gateAs.cc:540-556).
+                    if token.parse::<std::net::IpAddr>().is_ok() {
+                        tracing::warn!(
+                            host = %token,
+                            "pvlist DENY FROM: IPv6 literal is not a host-scoped \
+                             deny in C (aToIPAddr is IPv4-only) — host dropped; if \
+                             it is the rule's only host the rule collapses to a \
+                             global deny (matches C gateAs.cc:540-556)"
+                        );
                         continue;
                     }
                     // Hostname — resolve to a single IPv4 address. Append `:0`
@@ -255,10 +283,12 @@ impl PvList {
     /// This matches C ca-gateway semantics: `DENY FROM host` is a
     /// hard host-blacklist that applies regardless of `EVALUATION
     /// ORDER`. After [`Self::resolve_hosts`] has been called, every
-    /// entry in `from_hosts` is an IP-address string, so comparison
-    /// is exact (case-insensitive for IPv6 hex digits; IPv4 is all
-    /// numeric). Callers must pass the TCP peer IP in bracket-less
-    /// form (`192.0.2.1`, `::1`).
+    /// entry in `from_hosts` is an **IPv4** dotted-decimal string (C
+    /// `aToIPAddr` is IPv4-only, see [`Self::resolve_hosts`]), so the
+    /// comparison is exact. An IPv6 peer therefore never matches a
+    /// host-scoped rule — matching C, which converts the requester to an
+    /// IPv4 dotted string before `findEntry`. Callers pass the TCP peer IP
+    /// in bracket-less form (`192.0.2.1`).
     pub fn is_host_denied(&self, name: &str, host: &str) -> bool {
         for entry in &self.entries {
             if let PvListEntry::Deny {
@@ -1862,6 +1892,73 @@ mod tests {
         assert!(
             list.match_name("PV:x").is_none(),
             "all-unresolvable DENY FROM must collapse to a global deny (fail-closed)"
+        );
+    }
+
+    /// An IPv6 literal in `DENY FROM` is dropped — C `aToIPAddr` is
+    /// IPv4-only and never creates a host-scoped deny for an IPv6 address,
+    /// so the token is treated like an unresolvable host and the rule (with
+    /// no surviving host token) collapses to a global deny (fail-closed,
+    /// matches C `gateAs.cc:540-556`). Rust must NOT keep `::1` as a scoped
+    /// IPv6-only deny C cannot express.
+    #[tokio::test]
+    async fn resolve_hosts_ipv6_literal_dropped() {
+        let mut list = parse_pvlist(
+            r#"
+            PV.* ALLOW
+            PV.* DENY FROM ::1
+            "#,
+        )
+        .unwrap();
+        list.resolve_hosts().await;
+        let PvListEntry::Deny { from_hosts, .. } = &list.entries[1] else {
+            panic!("expected Deny");
+        };
+        assert!(
+            from_hosts.is_empty(),
+            "IPv6 literal must be dropped (C aToIPAddr is IPv4-only); got {from_hosts:?}"
+        );
+        // The IPv6 loopback peer is not host-scoped denied (C cannot scope it).
+        assert!(!list.is_host_denied("PV:x", "::1"));
+        // Having no surviving host token, the rule is now a global deny — under
+        // the default ALLOW,DENY order `match_name` rejects the pattern.
+        assert!(
+            list.match_name("PV:x").is_none(),
+            "DENY FROM ::1 must collapse to a global deny once the IPv6 token is dropped"
+        );
+    }
+
+    /// A mixed `DENY FROM 192.0.2.1 ::1` keeps the IPv4 token host-scoped
+    /// while dropping the IPv6 token — the IPv4 deny still fires for its
+    /// peer, and no Rust-only scoped IPv6 deny is created. Because a host
+    /// token survives, the rule stays host-targeted (NOT a global deny).
+    #[tokio::test]
+    async fn resolve_hosts_mixed_ipv4_ipv6_keeps_only_ipv4() {
+        let mut list = parse_pvlist(
+            r#"
+            PV.* ALLOW
+            PV.* DENY FROM 192.0.2.1 ::1
+            "#,
+        )
+        .unwrap();
+        list.resolve_hosts().await;
+        let PvListEntry::Deny { from_hosts, .. } = &list.entries[1] else {
+            panic!("expected Deny");
+        };
+        assert_eq!(
+            from_hosts,
+            &["192.0.2.1"],
+            "only the IPv4 token survives; the IPv6 token is dropped"
+        );
+        // IPv4 token still scopes the deny to its peer.
+        assert!(list.is_host_denied("PV:x", "192.0.2.1"));
+        // IPv6 peer is not denied (no Rust-only scoped IPv6 deny).
+        assert!(!list.is_host_denied("PV:x", "::1"));
+        // A surviving host token keeps the rule host-targeted, so a different
+        // host that is NOT 192.0.2.1 still reaches the ALLOW.
+        assert!(
+            list.match_name("PV:x").is_some(),
+            "a surviving IPv4 host token keeps the deny host-scoped, not global"
         );
     }
 }

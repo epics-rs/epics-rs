@@ -50,20 +50,27 @@
 //! | `<prefix>clientPostRate` | Double | postEventCount rate — monitor posts fanned downstream/sec |
 //! | `<prefix>existTestRate` | Double | pvExistTest (search) resolutions/sec — separate from eventRate |
 //! | `<prefix>loopRate` | Double | loopCount rate — maintenance-tick iterations/sec |
-//! | `<prefix>cpuFract` | Double | 0.0 placeholder — no tokio CPU-fraction source |
-//! | `<prefix>load` | Double | 0.0 placeholder — no tokio system-load source |
-//! | `<prefix>serverEventRate` | Double | 0.0 placeholder — no CAS server-event counter |
-//! | `<prefix>serverPostRate` | Double | 0.0 placeholder — no CAS server-post counter |
+//! | `<prefix>cpuFract` | Double | Process CPU fraction over the interval (Linux `/proc/self/stat`; left at last value where procfs is absent) |
+//! | `<prefix>load` | Double | 1-minute system load average (Linux `/proc/loadavg`; left at last value where procfs is absent) |
+//! | `<prefix>serverEventRate` | Double | 0.0 placeholder — CAS subscription-event counter lives downstream (epics-ca-rs server) |
+//! | `<prefix>serverPostRate` | Double | 0.0 placeholder — CAS subscription-post counter lives downstream (epics-ca-rs server) |
 //!
 //! C ca-gateway compiles `RATE_STATS` and `CAS_DIAGNOSTICS` on by
 //! default (`configure/CONFIG_SITE:60,69`), so its `initStats`
 //! (`gateServer.cc:1976-2028`) always registers all eight rate/diag
 //! names above. `clientEventRate`/`clientPostRate`/`existTestRate`/
-//! `loopRate` map onto live tokio-side counters; `cpuFract`/`load`/
-//! `serverEventRate`/`serverPostRate` have no source in the tokio model
-//! and are served as a constant `0.0` so a C-compat dashboard
-//! camonitoring the full default set resolves every name rather than
-//! getting does-not-exist.
+//! `loopRate` map onto live tokio-side counters. `cpuFract`/`load`
+//! map onto the same kernel sources the C gateway reads — process
+//! CPU jiffies from `/proc/<pid>/stat` (C `linuxCpuTimeDiff`,
+//! `gateServer.cc:2335`) and the 1-minute load average (C
+//! `getloadavg`, `gateServer.cc:2231`) — and fall back to leaving the
+//! PV at its last value on a platform without procfs (mirroring the
+//! `fd` PV). `serverEventRate`/`serverPostRate` derive from the CAS
+//! server's `subscriptionEventsProcessed`/`Posted` counters
+//! (`gateServer.cc:2147-2148`), which in the Rust split live in the
+//! downstream `epics-ca-rs` server rather than this bridge crate, so
+//! they are served as a constant `0.0` (resolved, not does-not-exist)
+//! pending a counter exported across that crate boundary.
 //!
 //! RATE_STATS internals (B5) — tokio-model equivalents of the C++
 //! ca-gateway `gateServer` RATE_STATS counters from `gateServer.cc`.
@@ -165,6 +172,12 @@ pub struct Stats {
     /// Last loop_count at refresh time, for loopRate delta
     /// (C `statLoopRate`, gateServer.cc:2204-2205).
     last_loop_count: AtomicU64,
+    /// Total process CPU jiffies (utime + stime from `/proc/self/stat`)
+    /// at the last refresh, for the cpuFract delta (C `linuxCpuTimeDiff`
+    /// keeps `prevutime`/`prevstime` statics, gateServer.cc:2337-2338).
+    /// Seeded with the process's current jiffies at construction so the
+    /// first refresh reports CPU used since startup, not since boot.
+    last_cpu_jiffies: AtomicU64,
 }
 
 impl Stats {
@@ -184,6 +197,11 @@ impl Stats {
             last_exist_count: AtomicU64::new(0),
             last_post_event_count: AtomicU64::new(0),
             last_loop_count: AtomicU64::new(0),
+            // Seed with the current process CPU jiffies so the first
+            // cpuFract delta is "since gateway start", mirroring the C
+            // timer's first-tick capture of cpuPrevCount
+            // (gateServer.cc:2161). 0 on a platform without procfs.
+            last_cpu_jiffies: AtomicU64::new(proc_self_cpu_jiffies().unwrap_or(0)),
         }
     }
 
@@ -291,11 +309,14 @@ impl Stats {
             // default C build's initStats (gateServer.cc:1976-2028)
             // registers all eight rate/diag names; omitting these six
             // made a C-compat dashboard camonitoring them get
-            // does-not-exist. clientPostRate/loopRate map onto the
-            // post_event_count/loop_count counters in refresh; cpuFract/
-            // load/serverEventRate/serverPostRate have no tokio-model
-            // source and stay a constant 0.0 (served, not absent). All
-            // are DBR_DOUBLE to match gateStat STAT_DOUBLE.
+            // does-not-exist. These are pre-registered at 0.0 and
+            // overwritten by refresh: clientPostRate/loopRate map onto the
+            // post_event_count/loop_count counters, cpuFract/load onto the
+            // procfs CPU/load sources (left at last value where procfs is
+            // absent). serverEventRate/serverPostRate derive from CAS
+            // subscription counters that live in the downstream
+            // epics-ca-rs server, so they stay a constant 0.0 (served, not
+            // absent). All are DBR_DOUBLE to match gateStat STAT_DOUBLE.
             ("clientPostRate", EpicsValue::Double(0.0)),
             ("loopRate", EpicsValue::Double(0.0)),
             ("cpuFract", EpicsValue::Double(0.0)),
@@ -408,6 +429,38 @@ impl Stats {
         // from one counter.
         let client_event_count = total_events;
 
+        // cpuFract (C `statCPUFract`, gateServer.cc:2207-2224): the
+        // process CPU time consumed since the last refresh, expressed as
+        // a fraction of the available CPU-seconds in that interval
+        // (`delTime * NO_OF_CPUS`). The C default build accumulates
+        // `clock()` from its single main loop; the tokio port has no such
+        // loop, so it mirrors C's `USE_LINUX_PROC_FOR_CPU` path
+        // (`linuxCpuTimeDiff`, gateServer.cc:2335-2393): read the same
+        // utime+stime jiffies from `/proc/self/stat` and scale by
+        // `SEC_PER_JIFFIE`. `NO_OF_CPUS` is `sysconf(_SC_NPROCESSORS_ONLN)`
+        // (gateServer.cc:63), i.e. `available_parallelism`. Where procfs
+        // is absent the source is unavailable (`None`); the PV is then
+        // left at its last value rather than posting a bogus 0.0, exactly
+        // as the `fd` PV does.
+        let cpu_fract = proc_self_cpu_jiffies().map(|cur| {
+            let prev = self.last_cpu_jiffies.swap(cur, Ordering::Relaxed);
+            let cpu_secs = cur.saturating_sub(prev) as f64 * SEC_PER_JIFFIE;
+            let n_cpus = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1) as f64;
+            if elapsed > 0.0 {
+                cpu_secs / (elapsed * n_cpus)
+            } else {
+                0.0
+            }
+        });
+        // load (C `statLoad`, gateServer.cc:2226-2233): the 1-minute
+        // system load average. C calls `getloadavg(load, N_LOAD)` with
+        // `N_LOAD == 1` (gateServer.cc:85) and reports `load[0]`, which is
+        // the first field of `/proc/loadavg`. Same leave-at-last fallback
+        // where procfs is absent.
+        let load_avg = load_average_1min();
+
         // Fan all stats PV writes out concurrently. Each
         // `put_pv_and_post` is independent (no shared lock between them
         // beyond the per-PV `RwLock`), so a single `tokio::join!` cuts
@@ -505,14 +558,15 @@ impl Stats {
             ),
             db.put_pv_and_post(&n_loop_count, EpicsValue::Long(loop_count as i32)),
             // C RATE_STATS / CAS_DIAGNOSTICS rate PVs. clientPostRate and
-            // loopRate carry the live rates computed above; cpuFract/load/
-            // serverEventRate/serverPostRate have no tokio-model source
-            // and are posted as a constant 0.0 (served, not absent) for
-            // C-name resolution parity.
+            // loopRate carry the live rates computed above. cpuFract/load
+            // are posted separately below (their procfs source can be
+            // absent → leave-at-last, like fd). serverEventRate/
+            // serverPostRate derive from CAS subscription counters that
+            // live in the downstream epics-ca-rs server, so they are
+            // posted as a constant 0.0 (served, not absent) for C-name
+            // resolution parity.
             db.put_pv_and_post(&n_client_post_rate, EpicsValue::Double(client_post_rate)),
             db.put_pv_and_post(&n_loop_rate, EpicsValue::Double(loop_rate)),
-            db.put_pv_and_post(&n_cpu_fract, EpicsValue::Double(0.0)),
-            db.put_pv_and_post(&n_load, EpicsValue::Double(0.0)),
             db.put_pv_and_post(&n_server_event_rate, EpicsValue::Double(0.0)),
             db.put_pv_and_post(&n_server_post_rate, EpicsValue::Double(0.0)),
         );
@@ -527,6 +581,19 @@ impl Stats {
             let _ = db
                 .put_pv_and_post(&n_fd, EpicsValue::Double(fd as f64))
                 .await;
+        }
+
+        // `cpuFract` / `load` are posted separately for the same reason as
+        // `fd`: their procfs source is absent on non-Linux platforms, so a
+        // `None` means leave the PV at its last value rather than posting a
+        // misleading 0.0.
+        if let Some(cf) = cpu_fract {
+            let _ = db
+                .put_pv_and_post(&n_cpu_fract, EpicsValue::Double(cf))
+                .await;
+        }
+        if let Some(la) = load_avg {
+            let _ = db.put_pv_and_post(&n_load, EpicsValue::Double(la)).await;
         }
     }
 
@@ -546,6 +613,51 @@ impl Stats {
     pub fn prefix(&self) -> &str {
         &self.prefix
     }
+}
+
+/// Seconds per scheduler jiffy used to scale `/proc/<pid>/stat`
+/// utime+stime jiffies into CPU seconds.
+///
+/// C ca-gateway hardcodes `SEC_PER_JIFFIE .01` (gateServer.cc:2334),
+/// i.e. USER_HZ = 100, when computing the cpuFract from its procfs CPU
+/// path. The constant is matched here for parity with that source.
+const SEC_PER_JIFFIE: f64 = 0.01;
+
+/// Total CPU jiffies (utime + stime) this process has consumed,
+/// read from Linux `/proc/self/stat`.
+///
+/// Mirrors the kernel fields C ca-gateway reads in `linuxCpuTimeDiff`
+/// (gateServer.cc:2335-2393): it scans `/proc/<pid>/stat` for `utime`
+/// (field 14) and `stime` (field 15) and sums them. The 2nd field
+/// (`comm`) is wrapped in parentheses and may itself contain spaces and
+/// `)`, so the remaining fields are taken after the LAST `)` rather than
+/// by naive whitespace split. After that `)` the whitespace-separated
+/// fields are, 0-based: state(0), ppid(1), pgrp(2), session(3),
+/// tty_nr(4), tpgid(5), flags(6), minflt(7), cminflt(8), majflt(9),
+/// cmajflt(10), utime(11), stime(12), ...
+///
+/// Returns `None` on a platform without procfs or on any parse failure,
+/// so the caller can leave the cpuFract PV at its last value rather than
+/// posting a bogus reading (matching the `fd` PV's platform handling).
+fn proc_self_cpu_jiffies() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let after_comm = stat.rsplit_once(')')?.1;
+    let mut fields = after_comm.split_whitespace();
+    let utime: u64 = fields.nth(11)?.parse().ok()?;
+    let stime: u64 = fields.next()?.parse().ok()?;
+    Some(utime + stime)
+}
+
+/// The 1-minute system load average from Linux `/proc/loadavg`.
+///
+/// C ca-gateway reports `getloadavg(load, N_LOAD)` with `N_LOAD == 1`
+/// (gateServer.cc:85,2231-2232), i.e. `load[0]` — the 1-minute average,
+/// which is the first whitespace-separated field of `/proc/loadavg`.
+/// Returns `None` on a platform without procfs or on a parse failure,
+/// with the same leave-at-last semantics as [`proc_self_cpu_jiffies`].
+fn load_average_1min() -> Option<f64> {
+    let loadavg = std::fs::read_to_string("/proc/loadavg").ok()?;
+    loadavg.split_whitespace().next()?.parse().ok()
 }
 
 /// B5: count the process's currently open file descriptors.
@@ -838,18 +950,63 @@ mod tests {
             EpicsValue::Double(r) => assert!(r > 0.0, "loopRate should be > 0, got {r}"),
             other => panic!("loopRate must be DBR_DOUBLE, got {other:?}"),
         }
-        // cpuFract / load / serverEventRate / serverPostRate have no
-        // tokio-model source and are posted as a constant 0.0.
-        for name in [
-            "g:cpuFract",
-            "g:load",
-            "g:serverEventRate",
-            "g:serverPostRate",
-        ] {
+        // serverEventRate / serverPostRate still have no in-crate source
+        // (the CAS subscription counters live in the downstream
+        // epics-ca-rs server) and are posted as a constant 0.0.
+        for name in ["g:serverEventRate", "g:serverPostRate"] {
             assert_eq!(
                 db.get_pv(name).await.unwrap(),
                 EpicsValue::Double(0.0),
-                "{name} is a 0.0 placeholder (no tokio source)"
+                "{name} is a 0.0 placeholder (CAS counter lives in epics-ca-rs)"
+            );
+        }
+        // cpuFract / load carry live procfs-derived values on Linux and
+        // are left at their initial 0.0 where procfs is absent — either
+        // way DBR_DOUBLE and never negative (the -1.0 error sentinel was
+        // replaced by leave-at-last, like the fd PV).
+        for name in ["g:cpuFract", "g:load"] {
+            match db.get_pv(name).await.unwrap() {
+                EpicsValue::Double(v) => {
+                    assert!(v >= 0.0, "{name} must be >= 0.0, got {v}")
+                }
+                other => panic!("{name} must be DBR_DOUBLE, got {other:?}"),
+            }
+        }
+    }
+
+    /// `proc_self_cpu_jiffies` reports a monotonically non-decreasing
+    /// total of process CPU jiffies on a procfs platform. Two reads
+    /// bracketing a busy loop must not go backwards. On a platform
+    /// without procfs the source is `None` and there is nothing to
+    /// assert (matching the cpuFract leave-at-last fallback).
+    #[test]
+    fn proc_self_cpu_jiffies_is_monotonic_on_procfs() {
+        let first = match proc_self_cpu_jiffies() {
+            Some(j) => j,
+            None => return, // no procfs on this platform
+        };
+        // Burn a little CPU so a second read can advance.
+        let mut acc: u64 = 0;
+        for i in 0..5_000_000u64 {
+            acc = acc.wrapping_add(i ^ acc);
+        }
+        std::hint::black_box(acc);
+        let second = proc_self_cpu_jiffies().expect("procfs available on second read");
+        assert!(
+            second >= first,
+            "process CPU jiffies went backwards: first={first} second={second}"
+        );
+    }
+
+    /// `load_average_1min` returns a non-negative load on a procfs
+    /// platform (the 1-minute field of `/proc/loadavg`), or `None` where
+    /// procfs is absent.
+    #[test]
+    fn load_average_1min_is_non_negative_on_procfs() {
+        if let Some(load) = load_average_1min() {
+            assert!(
+                load >= 0.0,
+                "1-minute load average must be >= 0.0, got {load}"
             );
         }
     }

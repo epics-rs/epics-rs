@@ -317,13 +317,12 @@ pub struct GatewayServer {
     /// Fired by a `quitFlag`/`quitServerFlag` control-PV write so the run
     /// loop tears down gracefully — the CA-triggered analogue of SIGINT.
     shutdown: Arc<tokio::sync::Notify>,
-    /// Receiver for control-PV triggers, drained once by the command
-    /// owner spawned in [`Self::run`]. `None` when the stats prefix is
-    /// empty (control PVs disabled). Wrapped for interior take from the
-    /// owned-`self` run loop.
-    control_rx: std::sync::Mutex<
-        Option<tokio::sync::mpsc::UnboundedReceiver<super::control::ControlEvent>>,
-    >,
+    /// Shared control-PV flags, drained by the single control owner spawned
+    /// in [`Self::run`]. The flag PV write hooks raise into this same
+    /// `Arc`; the owner consumes the flags once per pass in C's fixed
+    /// main-loop order. `None` when the stats prefix is empty (control PVs
+    /// disabled).
+    control_flags: Option<Arc<super::control::ControlFlags>>,
 }
 
 impl GatewayServer {
@@ -519,8 +518,8 @@ impl GatewayServer {
         // operators can trigger command-file execution, reports, reload,
         // and shutdown via `caput` — the cross-platform alternative to
         // SIGUSR1 (gateServer.cc:1877-2102). The receiver is drained by a
-        // single command owner in `run()`; `None` when stats are disabled.
-        let control_rx = super::control::publish_control_pvs(&shadow_db, &stats_prefix).await;
+        // single control owner in `run()`; `None` when stats are disabled.
+        let control_flags = super::control::publish_control_pvs(&shadow_db, &stats_prefix).await;
 
         let server = Self {
             config,
@@ -534,7 +533,7 @@ impl GatewayServer {
             putlog,
             beacon_anomaly,
             shutdown: Arc::new(tokio::sync::Notify::new()),
-            control_rx: std::sync::Mutex::new(control_rx),
+            control_flags,
         };
 
         // Pre-register stats PVs in shadow database so downstream can read them
@@ -895,8 +894,7 @@ impl GatewayServer {
         // every trigger source (mirrors C routing all flags through the
         // gateServer main loop). `quit*` fires `self.shutdown`.
         let control_handle = {
-            let taken = self.control_rx.lock().unwrap().take();
-            taken.map(|rx| {
+            self.control_flags.clone().map(|flags| {
                 let handler = CommandHandler::new(
                     self.cache.clone(),
                     self.pvlist.clone(),
@@ -909,7 +907,7 @@ impl GatewayServer {
                 .with_stats(stats.clone())
                 .with_report_path(self.config.report_path.clone());
                 super::control::spawn_control_owner(
-                    rx,
+                    flags,
                     handler,
                     self.shadow_db.clone(),
                     self.config.command_path.clone(),

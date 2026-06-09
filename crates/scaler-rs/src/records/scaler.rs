@@ -534,17 +534,20 @@ static ALL_FIELDS: LazyLock<Vec<FieldDesc>> = LazyLock::new(|| {
     ];
     for i in 1..=MAX_SCALER_CHANNELS {
         let s: &'static str = Box::leak(format!("S{}", i).into_boxed_str());
+        // S1..S64 are DBF_ULONG (scalerRecord.dbd:1334-1649) — 32-bit
+        // unsigned hardware counts; storage is already u32.
         fields.push(FieldDesc {
             name: s,
-            dbf_type: DbFieldType::Long,
+            dbf_type: DbFieldType::ULong,
             read_only: true,
         });
     }
     for i in 1..=MAX_SCALER_CHANNELS {
         let pr: &'static str = Box::leak(format!("PR{}", i).into_boxed_str());
+        // PR1..PR64 are DBF_ULONG (scalerRecord.dbd:945-1323).
         fields.push(FieldDesc {
             name: pr,
-            dbf_type: DbFieldType::Long,
+            dbf_type: DbFieldType::ULong,
             read_only: false,
         });
     }
@@ -885,10 +888,12 @@ impl Record for ScalerRecord {
             return Some(EpicsValue::String(self.nm[i].clone().into()));
         }
         if let Some(i) = parse_indexed_field(name, "PR") {
-            return Some(EpicsValue::Long(self.pr[i] as i32));
+            // PR1..PR64 are DBF_ULONG (scalerRecord.dbd:945-1323).
+            return Some(EpicsValue::ULong(self.pr[i]));
         }
         if let Some(i) = parse_indexed_field(name, "S") {
-            return Some(EpicsValue::Long(self.s[i] as i32));
+            // S1..S64 are DBF_ULONG (scalerRecord.dbd:1334-1649).
+            return Some(EpicsValue::ULong(self.s[i]));
         }
         if let Some(i) = parse_indexed_field(name, "G") {
             return Some(EpicsValue::Short(self.g[i]));
@@ -1017,7 +1022,14 @@ impl Record for ScalerRecord {
                         _ => Err(CaError::TypeMismatch(name.into())),
                     }
                 } else if let Some(i) = parse_indexed_field(name, "PR") {
+                    // PR1..PR64 are DBF_ULONG (scalerRecord.dbd:945-1323):
+                    // accept the native ULong and tolerate the legacy signed
+                    // Long carrier (the reinterpret preserves the bit pattern).
                     match value {
+                        EpicsValue::ULong(v) => {
+                            self.pr[i] = v;
+                            Ok(())
+                        }
                         EpicsValue::Long(v) => {
                             self.pr[i] = v as u32;
                             Ok(())
@@ -1050,9 +1062,15 @@ impl Record for ScalerRecord {
     }
 
     fn put_field_internal(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
-        // Allow framework to write S1-S64 (read-only) from device support read
+        // Allow framework to write S1-S64 (read-only) from device support read.
+        // S1..S64 are DBF_ULONG (scalerRecord.dbd:1334-1649): accept the
+        // native ULong and tolerate the legacy signed Long carrier.
         if let Some(i) = parse_indexed_field(name, "S") {
             match value {
+                EpicsValue::ULong(v) => {
+                    self.s[i] = v;
+                    Ok(())
+                }
                 EpicsValue::Long(v) => {
                     self.s[i] = v as u32;
                     Ok(())

@@ -757,6 +757,13 @@ impl NDFileWriter for NexusWriter {
                 .and_then(|a| a.write_numeric(&dtype_ordinal));
             // Write NDArray attributes on the first frame.
             for attr in array.attributes.iter() {
+                // Skip the codec module's internal type-recovery carrier on a
+                // compressed frame: C ADCore keeps the uncompressed type in
+                // `NDArray::dataType`, not an attribute, so it has no NeXus
+                // counterpart.
+                if crate::codec::is_internal_attr(&attr.name) {
+                    continue;
+                }
                 let val_str = attr.value.as_string();
                 let _ = ds
                     .new_attr::<rust_hdf5::types::VarLenUnicode>()

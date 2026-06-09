@@ -40,6 +40,23 @@ pub fn original_data_type(array: &NDArray) -> NDDataType {
         .unwrap_or(NDDataType::UInt8)
 }
 
+/// True when `name` is a codec-internal carrier attribute — metadata this
+/// module attaches to a compressed NDArray purely to recover the original
+/// element type on the decompress round-trip, because a compressed buffer is
+/// raw bytes that no longer carry it (see [`compress_lz4`] et al.).
+///
+/// Such carriers must never be published as user-visible NDArray attributes.
+/// C ADCore has no counterpart: it keeps the uncompressed element type in the
+/// native `NDArray::dataType` field (NDPluginCodec.cpp:35,70), so a compressed
+/// frame's attribute list — and therefore the NTNDArray `attribute[]`, the
+/// HDF5/NeXus/netCDF attribute records, and any other all-attributes output —
+/// holds only genuine driver/user attributes. Every output boundary that
+/// serializes the whole attribute list filters through this predicate so the
+/// carrier stays internal to the compress/decompress path that owns it.
+pub fn is_internal_attr(name: &str) -> bool {
+    name == ATTR_ORIGINAL_DATA_TYPE
+}
+
 /// Reconstruct an `NDDataBuffer` from raw bytes and a target data type.
 ///
 /// The byte slice is reinterpreted as the target type using native endianness.
@@ -1211,6 +1228,44 @@ mod tests {
             }
         }
         arr
+    }
+
+    #[test]
+    fn internal_carrier_attr_is_recognized() {
+        // The carrier the compressors attach is internal and must be
+        // recognizable by the single owning predicate; genuine driver/user
+        // attribute names are not.
+        assert!(is_internal_attr(ATTR_ORIGINAL_DATA_TYPE));
+        assert!(is_internal_attr("CODEC_ORIGINAL_DATA_TYPE"));
+        assert!(!is_internal_attr("ColorMode"));
+        assert!(!is_internal_attr("ArrayCounter"));
+        assert!(!is_internal_attr(""));
+    }
+
+    /// A compressed array must carry the internal type-recovery attribute (so
+    /// the round-trip works), and that attribute must be flagged internal (so
+    /// every all-attributes output boundary drops it).
+    #[test]
+    fn compressors_attach_an_internal_carrier() {
+        let mut arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::UInt16);
+        if let NDDataBuffer::U16(ref mut v) = arr.data {
+            for (i, x) in v.iter_mut().enumerate() {
+                *x = (i * 7) as u16;
+            }
+        }
+        for compressed in [
+            compress_lz4(&arr),
+            compress_zlib(&arr),
+            compress_lz4hdf5(&arr),
+            compress_bslz4(&arr),
+        ] {
+            let carrier = compressed
+                .attributes
+                .iter()
+                .find(|a| is_internal_attr(&a.name))
+                .expect("compressed array must carry the internal type-recovery attribute");
+            assert_eq!(carrier.name, ATTR_ORIGINAL_DATA_TYPE);
+        }
     }
 
     // ---- LZ4 tests ----

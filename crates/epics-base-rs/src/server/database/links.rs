@@ -175,6 +175,38 @@ pub(crate) fn multi_output_dispatch_owned(record_type: &str) -> bool {
 }
 
 impl PvDatabase {
+    /// Read a `Db`-variant link's value honoring C `dbInitLink`'s
+    /// locality rule (`dbLink.c:118-130`): a PV link whose target record
+    /// exists in this IOC reads from the local database; a non-local
+    /// target is a CA link — `dbDbInitLink` fails to resolve it locally
+    /// and falls through to `dbCaAddLinkCallbackOpt`, so its value comes
+    /// from the external resolver. Pre-fix every `Db` arm read only the
+    /// local DB (`get_pv`) and returned `None` for a non-local target, so
+    /// a plain `INP="other:pv"` (no modifier) and a re-parsed multi-input
+    /// (`INPA`..`INPL`) / `DOL` link never read the remote value.
+    ///
+    /// This is the single owner of that rule for the value-read path, so
+    /// it holds uniformly — for every link field and regardless of an
+    /// explicit `CP`/`CPP`/`CA` modifier — not only the
+    /// `INP`/`OUT`/`TSEL`/`SDIS` parse caches the iocInit CP scan
+    /// rewrites (the per-cycle re-parsed links have no cache to rewrite,
+    /// so an init-time conversion can never reach them). The external
+    /// read routes through the lset's lazy-open path: the first read
+    /// opens the CA link and returns `None` until the monitor connects,
+    /// then serves the cached value — exactly C `dbCaGetLink`.
+    async fn read_db_link_value(&self, db: &crate::server::record::DbLink) -> Option<EpicsValue> {
+        let pv_name = if db.field == "VAL" {
+            db.record.clone()
+        } else {
+            format!("{}.{}", db.record, db.field)
+        };
+        if self.has_name_no_resolve(&db.record).await {
+            self.get_pv(&pv_name).await.ok()
+        } else {
+            self.resolve_external_pv(&pv_name).await
+        }
+    }
+
     /// Read a value from a parsed link (DB, Constant, or external Ca/Pva).
     ///
     /// `visited` / `depth` are the caller's processing-chain state so a
@@ -199,12 +231,7 @@ impl PvDatabase {
                 // cycle terminates at the existing cycle guard instead
                 // of recursing with a fresh set.
                 self.process_passive_db_source(db, visited, depth).await;
-                let pv_name = if db.field == "VAL" {
-                    db.record.clone()
-                } else {
-                    format!("{}.{}", db.record, db.field)
-                };
-                self.get_pv(&pv_name).await.ok()
+                self.read_db_link_value(db).await
             }
             // Hardware links are dispatched by device support directly
             // — there's no canonical "value" available from a generic
@@ -245,14 +272,7 @@ impl PvDatabase {
             crate::server::record::ParsedLink::Pva(name) => self.resolve_external_pv(name).await,
             crate::server::record::ParsedLink::PvaJson(j) => self.resolve_external_pv(&j.pv).await,
             crate::server::record::ParsedLink::Constant(_) => link.constant_value(),
-            crate::server::record::ParsedLink::Db(db) => {
-                let pv_name = if db.field == "VAL" {
-                    db.record.clone()
-                } else {
-                    format!("{}.{}", db.record, db.field)
-                };
-                self.get_pv(&pv_name).await.ok()
-            }
+            crate::server::record::ParsedLink::Db(db) => self.read_db_link_value(db).await,
             // Hardware links carry no generic readable value.
             crate::server::record::ParsedLink::Hw(_) => None,
             crate::server::record::ParsedLink::Calc(calc) => self.evaluate_calc_link(calc).await,
@@ -324,6 +344,17 @@ impl PvDatabase {
                 } else {
                     format!("{}.{}", db.record, db.field)
                 };
+                // C `dbInitLink` locality (`dbLink.c:118-130`): a target
+                // record present in this IOC is a DB link read from the
+                // local database; a non-local target is a CA link, so its
+                // value and raw remote alarm come from the external
+                // resolver — identical to the `Ca`/`Pva` arm below.
+                if !self.has_name_no_resolve(&db.record).await {
+                    return (
+                        self.resolve_external_pv(&pv_name).await,
+                        self.external_link_alarm(&pv_name).await,
+                    );
+                }
                 let value = self.get_pv(&pv_name).await.ok();
                 // Read source record's alarm state — alias-aware
                 // (epics-base PR #336) so a link target spelled with
@@ -597,12 +628,7 @@ impl PvDatabase {
             crate::server::record::ParsedLink::Db(db) if is_soft => {
                 // PP: process source record if Passive before reading
                 self.process_passive_db_source(db, visited, depth).await;
-                let pv_name = if db.field == "VAL" {
-                    db.record.clone()
-                } else {
-                    format!("{}.{}", db.record, db.field)
-                };
-                self.get_pv(&pv_name).await.ok()
+                self.read_db_link_value(db).await
             }
             crate::server::record::ParsedLink::Ca(_)
             | crate::server::record::ParsedLink::Pva(_)
@@ -1878,6 +1904,104 @@ mod cp_link_locality_tests {
         assert!(
             !db.external_cp_pv_names().await.contains(&"SRC".to_string()),
             "a local CP target must not be registered as an external CP link"
+        );
+    }
+}
+
+#[cfg(test)]
+mod nonlocal_db_link_read_tests {
+    use crate::server::database::PvDatabase;
+    use crate::server::record::{ParsedLink, parse_link_v2};
+    use crate::types::EpicsValue;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    /// C `dbInitLink` (`dbLink.c:118-130`) makes a PV link whose target is
+    /// not a local record a CA link — even with NO `CP`/`CPP`/`CA`
+    /// modifier (`dbDbInitLink` fails to resolve it locally and falls
+    /// through to `dbCaAddLinkCallbackOpt`). So a plain `INP="OTHER:PV"`
+    /// to a non-local target must read the remote value, not return
+    /// `None`. Pre-fix the `Db` read arm read only the local DB (`get_pv`)
+    /// and dropped the non-local target.
+    #[tokio::test]
+    async fn plain_nonlocal_db_link_reads_via_external_resolver() {
+        let db = PvDatabase::new();
+        // Stand-in for the calink/pvalink lset: resolve OTHER:PV remotely.
+        db.set_external_resolver(Arc::new(|name: &str| {
+            if name == "OTHER:PV" {
+                Some(EpicsValue::Double(42.0))
+            } else {
+                None
+            }
+        }))
+        .await;
+
+        let link = parse_link_v2("OTHER:PV");
+        assert!(
+            matches!(link, ParsedLink::Db(_)),
+            "a bare non-scheme name parses to a Db link, got {link:?}"
+        );
+
+        let mut visited = HashSet::new();
+        let v = db.read_link_value(&link, &mut visited, 0).await;
+        assert_eq!(
+            v,
+            Some(EpicsValue::Double(42.0)),
+            "a plain non-local Db link must resolve through the external resolver (C dbCaAddLink fallback)"
+        );
+    }
+
+    /// A multi-input-style link re-parsed from its raw string each cycle
+    /// (calc `INPA`..`INPL`, `DOL`) routes its value read through
+    /// `read_link_with_alarm`; the same locality rule must hold there, so
+    /// a non-local target reads the remote value and surfaces no
+    /// local-record alarm.
+    #[tokio::test]
+    async fn nonlocal_db_link_value_and_alarm_via_external() {
+        let db = PvDatabase::new();
+        db.set_external_resolver(Arc::new(|name: &str| {
+            if name == "OTHER:PV" {
+                Some(EpicsValue::Double(5.0))
+            } else {
+                None
+            }
+        }))
+        .await;
+
+        let link = parse_link_v2("OTHER:PV");
+        let (value, alarm) = db.read_link_with_alarm(&link).await;
+        assert_eq!(
+            value,
+            Some(EpicsValue::Double(5.0)),
+            "non-local Db link value must come from the external resolver"
+        );
+        // No lset is registered (only the legacy resolver), so the bare
+        // external alarm path reports None — never a fabricated local
+        // record alarm for a record that does not exist in this IOC.
+        assert!(
+            alarm.is_none(),
+            "non-local Db link must not fabricate a local-record alarm, got {alarm:?}"
+        );
+    }
+
+    /// Owner path: a Db link whose target IS a local record still reads
+    /// the local database and never consults the external resolver.
+    #[tokio::test]
+    async fn local_db_link_reads_local_not_external() {
+        let db = PvDatabase::new();
+        db.add_pv("SRC", EpicsValue::Double(7.0)).await.unwrap();
+        // A resolver returning a DIFFERENT value proves the local read
+        // wins and the external path is not taken for a local target.
+        db.set_external_resolver(Arc::new(|_name: &str| Some(EpicsValue::Double(-1.0))))
+            .await;
+
+        let link = parse_link_v2("SRC");
+        let mut visited = HashSet::new();
+        let v = db.read_link_value(&link, &mut visited, 0).await;
+        assert_eq!(
+            v,
+            Some(EpicsValue::Double(7.0)),
+            "a local Db link must read the local DB, not the external resolver"
         );
     }
 }

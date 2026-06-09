@@ -52,25 +52,80 @@ struct Args {
     debug: bool,
 }
 
-/// Print host network troubleshooting info and return, mirroring pvxs
-/// `target_information` (`src/describe.cpp:27`) as invoked by `-D`
-/// (`tools/info.cpp:62-64`). pvxs additionally dumps C++ toolchain/ABI
-/// details that have no Rust analogue; the operationally meaningful
-/// part for "why can't I reach my IOC" is the local interfaces,
-/// broadcast targets, and effective client config, which is what we
-/// reproduce here.
+/// Build the host-troubleshooting report `-D` prints, the Rust analogue
+/// of pvxs `target_information` (`src/describe.cpp:27-133`) invoked by
+/// `tools/info.cpp:62-64`. Returned as a string so the section layout is
+/// unit-testable without capturing process stdout.
+///
+/// pvxs's report is Host/Target → Toolchain → Versions → Runtime →
+/// Effective Client config → Effective Server config. The C++
+/// toolchain/ABI block (`describe.cpp:36-75`: `__cplusplus`, libstdc++
+/// ABI, compiler build) has no Rust counterpart and is omitted; every
+/// other section has a Rust-side equivalent and is reproduced:
+///   - Host: the single-binary arch/OS (no host≠target cross split as in
+///     the C build system, so the `EPICS_HOST_ARCH`/`T_A` pair collapses),
+///   - Versions: the shared `version_information` stack (pvxs/EPICS
+///     Base/protocol — `describe.cpp:77-83`),
+///   - Runtime: CPU count (`epicsThreadGetCPUs`), the bound interface
+///     addresses (`osiLocalAddr`), and the per-NIC broadcast targets
+///     (`osiSockDiscoverBroadcastAddresses` — `describe.cpp:85-113`),
+///   - the effective client AND server config blocks
+///     (`describe.cpp:115-129`); the server block is the `EPICS_PVAS_*`
+///     set an operator needs to debug why a server does or does not
+///     advertise, and it never appears in the client-only `-v` output.
+fn target_information_string() -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+
+    // Host arch/OS — pvxs `Host:`/`Target:` (describe.cpp:29-34). One
+    // Rust binary has no host≠target split, so it is a single line.
+    let _ = writeln!(
+        s,
+        "Host: {}-{}",
+        std::env::consts::ARCH,
+        std::env::consts::OS
+    );
+
+    // Versions — pvxs prints pvxs/EPICS Base/libevent (describe.cpp:77-83);
+    // the Rust analogue is the same `-V` stack (lib/EPICS Base/protocol).
+    let _ = writeln!(s, "Versions");
+    for line in cli::version_information().lines() {
+        let _ = writeln!(s, "  {line}");
+    }
+
+    // Runtime — pvxs prints epicsThreadGetCPUs()/osiLocalAddr()/
+    // osiSockDiscoverBroadcastAddresses() (describe.cpp:85-113). The Rust
+    // analogues: available parallelism, the bound interface addresses, and
+    // the per-NIC broadcast targets. (pvxs's `uname()` line has no
+    // allocation-free std analogue without libc FFI; the Host line already
+    // carries arch/OS.)
+    let _ = writeln!(s, "Runtime");
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    let _ = writeln!(s, "  available_parallelism() -> {cpus}");
+    let _ = writeln!(s, "  local interfaces:");
+    for addr in config::list_intf_addresses() {
+        let _ = writeln!(s, "    {addr}");
+    }
+    let bport = config::broadcast_port();
+    let _ = writeln!(s, "  broadcast addresses (port {bport}):");
+    for addr in config::list_broadcast_addresses(bport) {
+        let _ = writeln!(s, "    {addr}");
+    }
+
+    // Effective client + server config — pvxs prints BOTH under -D
+    // (describe.cpp:115-129). The client block is the same one `-v` shows;
+    // the server (`EPICS_PVAS_*`) block is `-D`-only.
+    let _ = write!(s, "{}", cli::effective_config_string());
+    let _ = write!(s, "{}", cli::effective_server_config_string());
+    s
+}
+
+/// Print the `-D` host-troubleshooting report and return (`tools/info.cpp:
+/// 62-64`: `target_information(std::cout); return 0;`).
 fn target_information() {
-    let interfaces = config::list_intf_addresses();
-    println!("Network targets");
-    println!("  interfaces:");
-    for addr in &interfaces {
-        println!("    {addr}");
-    }
-    println!("  broadcast addresses (port {}):", config::broadcast_port());
-    for addr in config::list_broadcast_addresses(config::broadcast_port()) {
-        println!("    {addr}");
-    }
-    cli::print_effective_config();
+    print!("{}", target_information_string());
 }
 
 #[tokio::main]
@@ -247,5 +302,75 @@ mod tests {
     fn debug_flag_parses() {
         assert!(Args::parse_from(["pvinfo-rs", "-d", "PV"]).debug);
         assert!(!Args::parse_from(["pvinfo-rs", "PV"]).debug);
+    }
+
+    /// `-D` is the Rust analogue of pvxs `target_information`
+    /// (`src/describe.cpp:27-133`): it must carry every section that has a
+    /// Rust equivalent — Host, the version stack, Runtime readback, and
+    /// BOTH the effective client and the effective server config blocks.
+    /// The server (`EPICS_PVAS_*`) block is the piece the narrow pre-fix
+    /// network print dropped, and it is what an operator uses to debug why
+    /// a server does or does not advertise.
+    #[test]
+    fn target_information_includes_all_sections() {
+        let s = target_information_string();
+        for needle in [
+            "Host: ",
+            "Versions",
+            // version stack (pvxs/EPICS Base/protocol analogue)
+            "epics-pva-rs ",
+            "EPICS Base ",
+            "PVA protocol version ",
+            "Runtime",
+            "available_parallelism() ->",
+            "local interfaces:",
+            "broadcast addresses (port ",
+            // both config sections present
+            "Effective config",
+            "Effective server config",
+            // a representative key from each config block
+            "EPICS_PVA_BROADCAST_PORT=",
+            "EPICS_PVAS_SERVER_PORT=",
+        ] {
+            assert!(s.contains(needle), "missing {needle:?} in:\n{s}");
+        }
+    }
+
+    /// `-D` shows the effective *server* config from `EPICS_PVAS_*`, while
+    /// the client-only `-v` block does not — the parity contract the
+    /// pre-fix print broke by omitting the server section. Serialised on
+    /// `epics_env` because the variables are process-global.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn target_information_reflects_pvas_env_but_v_stays_client_only() {
+        // SAFETY: std::env mutation is unsafe in edition 2024; the
+        // `epics_env` serial guard makes it race-free.
+        unsafe {
+            std::env::set_var("EPICS_PVAS_SERVER_PORT", "5099");
+            std::env::set_var("EPICS_PVAS_INTF_ADDR_LIST", "10.1.2.3");
+        }
+
+        let d = target_information_string();
+        assert!(
+            d.contains("EPICS_PVAS_SERVER_PORT=5099"),
+            "-D must reflect EPICS_PVAS_SERVER_PORT: {d}"
+        );
+        assert!(
+            d.contains("EPICS_PVAS_INTF_ADDR_LIST=10.1.2.3"),
+            "-D must reflect EPICS_PVAS_INTF_ADDR_LIST: {d}"
+        );
+
+        // The shared `-v` client block must stay client-only — no server
+        // keys leak into it.
+        let v = cli::effective_config_string();
+        assert!(
+            !v.contains("EPICS_PVAS_"),
+            "the `-v` client block must not carry server keys: {v}"
+        );
+
+        unsafe {
+            std::env::remove_var("EPICS_PVAS_SERVER_PORT");
+            std::env::remove_var("EPICS_PVAS_INTF_ADDR_LIST");
+        }
     }
 }

@@ -231,6 +231,85 @@ pub fn effective_config_string() -> String {
     s
 }
 
+/// Render the effective **server** (`EPICS_PVAS_*`) configuration block —
+/// the server-side companion to [`effective_config_string`], used by the
+/// `pvinfo -D` host-troubleshooting report.
+///
+/// pvxs `target_information` prints both an "Effective Client config" and
+/// an "Effective Server config" section under `pvxinfo -D`
+/// (`src/describe.cpp:115-129`); the latter is `server::Config::fromEnv()`
+/// after `expand()`, whose `operator<<` emits ONLY the `EPICS_PVAS_*`
+/// variants of the def map, sorted (`src/config.cpp:474-545`). The
+/// client-only `-v` block never shows these, so an operator debugging why
+/// a *server* does or does not advertise on a network needs this distinct
+/// block — which is why `-D` carries it and plain `-v` does not.
+///
+/// Keys and order mirror pvxs's sorted server def map. `EPICS_PVA_CONN_TMO`
+/// is intentionally absent: pvxs sets it in `updateDefs` but its server
+/// `operator<<` filters to the `EPICS_PVAS_` prefix, so it never appears in
+/// the server section. Values come from the same resolved
+/// [`crate::config`] server getters the PVA server itself reads — the
+/// server-precedence `EPICS_PVAS_*`-first variants (`pvas_server_port`,
+/// `server_broadcast_port`, `server_intf_addr_list`,
+/// `server_beacon_addr_list`, `server_ignore_addr_list`,
+/// `auto_beacon_addr_list_enabled`), not the client `server_port` whose
+/// `EPICS_PVA_SERVER_PORT`-first precedence is the opposite
+/// (`config.cpp:402-432` vs `568-578`).
+///
+/// Known gap (shared with the client block): the address lists are shown
+/// as configured, not pvxs's post-`expand()` auto-beacon fan-out; that
+/// expansion needs a server `Config`/`expand()` value in the config
+/// module, which this CLI-scoped readback does not own.
+pub fn effective_server_config_string() -> String {
+    use crate::config;
+    use std::fmt::Write;
+    let beacon = config::server_beacon_addr_list()
+        .iter()
+        .map(|a| a.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let interfaces = config::server_intf_addr_list()
+        .iter()
+        .map(|a| a.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    // pvxs joins ignore entries as `host:port` (`join_addr`); port 0 is
+    // the wildcard "any port from this IP" match.
+    let ignore = config::env::server_ignore_addr_list()
+        .iter()
+        .map(|(ip, port)| format!("{ip}:{port}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut s = String::new();
+    let _ = writeln!(s, "Effective server config");
+    let _ = writeln!(
+        s,
+        "  EPICS_PVAS_AUTO_BEACON_ADDR_LIST={}",
+        if config::auto_beacon_addr_list_enabled() {
+            "YES"
+        } else {
+            "NO"
+        }
+    );
+    let _ = writeln!(s, "  EPICS_PVAS_BEACON_ADDR_LIST={beacon}");
+    let _ = writeln!(
+        s,
+        "  EPICS_PVAS_BROADCAST_PORT={}",
+        config::server_broadcast_port()
+    );
+    let _ = writeln!(s, "  EPICS_PVAS_IGNORE_ADDR_LIST={ignore}");
+    let _ = writeln!(s, "  EPICS_PVAS_INTF_ADDR_LIST={interfaces}");
+    // Server bind port uses pvxs server precedence (`EPICS_PVAS_SERVER_PORT`
+    // first), distinct from the client block's `EPICS_PVA_SERVER_PORT`-first
+    // `server_port`.
+    let _ = writeln!(
+        s,
+        "  EPICS_PVAS_SERVER_PORT={}",
+        config::env::pvas_server_port()
+    );
+    s
+}
+
 /// Resolve a PVA tool endpoint **body** (the address part of `mshim
 /// -L/-F` and `pvxvct -B`) to a single IPv4 address. A literal IPv4
 /// string is used directly; any other token is resolved through the
@@ -436,6 +515,38 @@ mod tests {
         assert!(
             !s.contains("  interfaces="),
             "non-pvxs `interfaces=` key must be replaced: {s}"
+        );
+    }
+
+    /// The `pvinfo -D` server block emits the pvxs `EPICS_PVAS_*` key set
+    /// (`src/config.cpp:474-545`), and the client `-v` block stays
+    /// client-only: it must carry no `EPICS_PVAS_` key. `EPICS_PVA_CONN_TMO`
+    /// is deliberately absent from the server block — pvxs's server
+    /// `operator<<` filters to the `EPICS_PVAS_` prefix.
+    #[test]
+    fn effective_server_config_emits_pvas_keys_and_v_stays_client_only() {
+        let s = effective_server_config_string();
+        assert!(s.starts_with("Effective server config\n"), "got: {s:?}");
+        for key in [
+            "EPICS_PVAS_AUTO_BEACON_ADDR_LIST=",
+            "EPICS_PVAS_BEACON_ADDR_LIST=",
+            "EPICS_PVAS_BROADCAST_PORT=",
+            "EPICS_PVAS_IGNORE_ADDR_LIST=",
+            "EPICS_PVAS_INTF_ADDR_LIST=",
+            "EPICS_PVAS_SERVER_PORT=",
+        ] {
+            assert!(s.contains(key), "missing {key:?} in:\n{s}");
+        }
+        // pvxs filters CONN_TMO out of the server section (no PVAS prefix).
+        assert!(
+            !s.contains("EPICS_PVA_CONN_TMO"),
+            "CONN_TMO must not appear in the server block: {s}"
+        );
+        // The client `-v` block is client-only: no EPICS_PVAS_ key.
+        let client = effective_config_string();
+        assert!(
+            !client.contains("EPICS_PVAS_"),
+            "the `-v` client block must not carry server keys: {client}"
         );
     }
 

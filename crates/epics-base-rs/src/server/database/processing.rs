@@ -1013,12 +1013,15 @@ impl PvDatabase {
                 .record
                 .set_resolved_input_links(&resolved_link_fields);
 
-            // Apply sel NVL -> SELN
+            // Apply sel NVL -> SELN. SELN is DBF_USHORT (selRecord.dbd.pod:295),
+            // an unsigned 0..65535 index. Carry the native unsigned value so a
+            // link value in 32768..65535 is not lost to f64->i16 saturation
+            // before it reaches the field's put.
             if let Some(nvl_val) = sel_nvl_value {
                 if let Some(f) = nvl_val.to_f64() {
                     let _ = instance
                         .record
-                        .put_field("SELN", EpicsValue::Short(f as i16));
+                        .put_field("SELN", EpicsValue::UShort(f as u16));
                 }
             }
 

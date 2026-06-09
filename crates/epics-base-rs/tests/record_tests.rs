@@ -1236,6 +1236,26 @@ fn test_snapshot_mbbi_16_strings() {
     assert_eq!(enums.strings[3], "");
 }
 
+// A record-specific DBF_MENU field (sel.SELM, menu(selSELM)
+// selRecord.dbd.pod:21-26) is served as DBR_ENUM: the field snapshot
+// carries the menu index as Enum and the menu's choice labels, so
+// caget/pvget present "Low Signal" instead of a bare 2.
+#[test]
+fn test_snapshot_sel_selm_menu_choices() {
+    use epics_base_rs::server::records::sel::SelRecord;
+    let mut rec = SelRecord::default();
+    rec.selm = 2; // Low Signal
+    let inst = RecordInstance::new("SEL:TEST".into(), rec);
+
+    let snap = inst.snapshot_for_field("SELM").unwrap();
+    assert_eq!(snap.value, EpicsValue::Enum(2));
+    let enums = snap.enums.as_ref().unwrap();
+    assert_eq!(
+        enums.strings,
+        vec!["Specified", "High Signal", "Low Signal", "Median Signal"]
+    );
+}
+
 #[test]
 fn test_snapshot_longin_display() {
     use epics_base_rs::server::records::longin::LonginRecord;

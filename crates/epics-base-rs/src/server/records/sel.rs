@@ -5,6 +5,11 @@ use crate::types::{DbFieldType, EpicsValue};
 /// Number of input signals A..L (C `selRecord.c::SEL_MAX`).
 const SEL_MAX: usize = 12;
 
+/// Choice labels for the SELM select-mechanism menu, in index order.
+/// C `menu(selSELM)` (selRecord.dbd.pod:21-26): 0=Specified, 1=High Signal,
+/// 2=Low Signal, 3=Median Signal.
+const SELM_CHOICES: &[&str] = &["Specified", "High Signal", "Low Signal", "Median Signal"];
+
 /// Sel (select) record — selects one of A-L based on SELM algorithm.
 pub struct SelRecord {
     pub val: f64,
@@ -120,7 +125,9 @@ static SEL_FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "SELM",
-        dbf_type: DbFieldType::Short,
+        // SELM is DBF_MENU menu(selSELM) (selRecord.dbd.pod:290) — served as
+        // DBR_ENUM with the menu's choice labels, see SELM_CHOICES.
+        dbf_type: DbFieldType::Enum,
         read_only: false,
     },
     FieldDesc {
@@ -478,7 +485,9 @@ impl Record for SelRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),
-            "SELM" => Some(EpicsValue::Short(self.selm)),
+            // SELM is DBF_MENU (selRecord.dbd.pod:290): served as DBR_ENUM,
+            // the choice labels come from menu_field_choices.
+            "SELM" => Some(EpicsValue::Enum(self.selm as u16)),
             "SELN" => Some(EpicsValue::UShort(self.seln)),
             "NVL" => Some(EpicsValue::String(self.nvl.clone().into())),
             "INPA" => Some(EpicsValue::String(self.inpa.clone().into())),
@@ -528,7 +537,14 @@ impl Record for SelRecord {
                 }
                 _ => Err(CaError::TypeMismatch("VAL".into())),
             },
+            // SELM is DBF_MENU (selRecord.dbd.pod:290): a client put arrives
+            // converted to Enum; internal callers may still pass a Short
+            // index. Store the menu index either way.
             "SELM" => match value {
+                EpicsValue::Enum(v) => {
+                    self.selm = v as i16;
+                    Ok(())
+                }
                 EpicsValue::Short(v) => {
                     self.selm = v;
                     Ok(())
@@ -635,6 +651,13 @@ impl Record for SelRecord {
 
     fn field_list(&self) -> &'static [FieldDesc] {
         SEL_FIELDS
+    }
+
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "SELM" => Some(SELM_CHOICES),
+            _ => None,
+        }
     }
 
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {

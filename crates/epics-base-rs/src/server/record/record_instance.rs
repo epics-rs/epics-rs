@@ -454,6 +454,18 @@ impl RecordInstance {
         // and not part of the per-record cache.
         self.populate_common_enum_info(field, &mut snap);
 
+        // Record-specific DBF_MENU field (e.g. sel.SELM): attach the field's
+        // own menu() choice table so the CA/PVA enum encoders present the
+        // labels, matching C dbStaticLib serving a DBF_MENU field as
+        // DBR_ENUM. This overrides any record VAL enum table copied from the
+        // metadata cache above, because a menu field carries its own menu's
+        // choices, not the record's VAL state strings.
+        if let Some(choices) = self.record.menu_field_choices(field) {
+            snap.enums = Some(super::super::snapshot::EnumInfo {
+                strings: choices.iter().map(|s| (*s).to_string()).collect(),
+            });
+        }
+
         // apply `info(Q:time:tag, "nsec:lsb:N")` — pvxs
         // typeutils.cpp:79 splits the low N bits of the timestamp's
         // nanoseconds into `timeStamp.userTag` and clears those bits

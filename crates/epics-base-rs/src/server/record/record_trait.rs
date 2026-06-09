@@ -239,6 +239,29 @@ pub trait Record: Send + Sync + 'static {
     /// Return the list of field descriptors.
     fn field_list(&self) -> &'static [FieldDesc];
 
+    /// Choice strings for a record-specific `DBF_MENU` field served as
+    /// `DBR_ENUM`, keyed by field name (uppercase, as declared).
+    ///
+    /// EPICS dbStaticLib serves a `DBF_MENU` field as `DBR_ENUM`: the value
+    /// is the menu index and the field carries its `menu()` choice strings,
+    /// so `caget`/`pvget` present the labels rather than a bare number
+    /// (`dbStaticLib.c` `dbGetMenuChoices`; `dbAccess.c` `get_enum_str`).
+    /// A record returns the label table (in index order) for each field it
+    /// serves as [`DbFieldType::Enum`] from a `menu()`; the framework
+    /// attaches it to the field snapshot's `EnumInfo` so the CA/PVA enum
+    /// encoders present the labels — the same mechanism `bi`/`bo`/`mbbi`/
+    /// `mbbo` already use for their `VAL` state strings, but per field
+    /// rather than per record (a record can carry several distinct menus).
+    ///
+    /// This is the single owner of "menu field -> choice table": a record
+    /// declares its menu fields here once, and `get_field` returns the menu
+    /// index as [`EpicsValue::Enum`]. Default: no record-specific menu
+    /// fields. The dbCommon menu fields (`SCAN`, etc.) are handled
+    /// separately by the framework, not here.
+    fn menu_field_choices(&self, _field: &str) -> Option<&'static [&'static str]> {
+        None
+    }
+
     /// Field names this record serves as a *long string*: a `DBF_CHAR`
     /// array field that semantically holds a NUL-terminated string.
     ///

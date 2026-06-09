@@ -3486,32 +3486,42 @@ async fn handle_connection_io(
 /// Decode the VALUE body of an INIT pvRequest, after its descriptor
 /// has already been read from `cur`.
 ///
-/// Distinguishes an ABSENT value body (the cursor is exhausted after
-/// the descriptor) from a PRESENT but malformed one. pvxs
-/// `from_wire_type_value` requires type+value and resets the connection
-/// on `!M.good()` (`serverget.cpp:368-371`, `servermon.cpp:489`). We
-/// tolerate the absent body for future-compat / legacy clients, but a
-/// present-but-undecodable
-/// body is an INIT protocol error — the previous `decode_pv_field(..).ok()`
-/// collapsed both into `None`, so a malformed pvRequest silently
-/// dropped its `_filter` / pipeline / `process`|`block` options and the
-/// op was registered with an OK INIT.
+/// pvxs `from_wire_type_value` (`dataencode.cpp:747-752`): once the
+/// descriptor yields a non-null `Value`, it ALWAYS runs `from_wire_full`
+/// to read the value body; a wire fault there leaves the buffer bad and
+/// the caller `bev.reset()`s the connection (`serverget.cpp:371-375`,
+/// `servermon.cpp:489-501`). A descriptor whose sub-structures are all
+/// empty — the default `field(...)` selector — needs zero value bytes and
+/// `from_wire_full` stays good, so an exhausted buffer is legal only when
+/// the descriptor requires no bytes. There is no "absent value body"
+/// concept: a present non-null descriptor that ends before its required
+/// value bytes is the same `!M.good()` fault as a truncated one.
 ///
-/// Returns `Ok(None)` for an absent body, `Ok(Some(value))` for a
-/// present-and-decoded one, and `Err(message)` for a present-but-
-/// malformed one (the caller turns that into an INIT error).
+/// So decode unconditionally (no cursor short-circuit): a descriptor with
+/// scalar/array leaves whose values were truncated or omitted faults here
+/// instead of silently dropping the create-time `record._options`
+/// (`pipeline` / `_filter` / `process` / `block` / `atomic`) and
+/// registering an OK op. The previous cursor-exhausted short-circuit to
+/// `Ok(None)` swallowed exactly that descriptor-only case.
+///
+/// The `Option` contract the create-time-option consumers rely on is
+/// preserved: a content-less value body (zero bytes consumed because the
+/// frame is exhausted) stays `None`; a value that actually carried bytes
+/// becomes `Some`. `exhausted && Ok` implies `from_wire_full` consumed
+/// nothing (only all-empty structures decode from an empty buffer), so the
+/// `None` here is byte-identical to the prior contract on every path that
+/// previously succeeded — only the malformed descriptor-only path flips
+/// from `Ok(None)` to a connection-fatal `Err`.
 fn decode_init_pv_request_value(
     cur: &mut std::io::Cursor<&[u8]>,
     req_desc: &FieldDesc,
     order: ByteOrder,
     decode_cache: &mut TypeCache,
 ) -> Result<Option<PvField>, String> {
-    if cur.position() as usize >= cur.get_ref().len() {
-        return Ok(None);
-    }
-    decode_pv_field_cached(req_desc, cur, order, decode_cache)
-        .map(Some)
-        .map_err(|e| format!("invalid pvRequest value: {e}"))
+    let exhausted = cur.position() as usize >= cur.get_ref().len();
+    let value = decode_pv_field_cached(req_desc, cur, order, decode_cache)
+        .map_err(|e| format!("invalid pvRequest value: {e}"))?;
+    Ok(if exhausted { None } else { Some(value) })
 }
 
 /// Decode an RPC EXEC argument body (`type + full value`), keeping the
@@ -4170,7 +4180,9 @@ async fn handle_process(
         // `if(!M.good()) bev.reset()` (serverget.cpp:371-375): a malformed
         // descriptor or value is connection-fatal (the read loop closes
         // the circuit, no op reply), uniform with the generic INIT path.
-        // An ABSENT value body is still tolerated for Rust↔Rust interop.
+        // A non-null descriptor that needs value bytes but ends before them
+        // is the same fault (see `decode_init_pv_request_value`); only the
+        // all-empty-structs default selector legitimately has a 0-byte body.
         let req_desc = match decode_type_desc_cached(&mut cur, inbound_order, decode_cache) {
             Ok(d) => d,
             Err(e) => {
@@ -4451,9 +4463,11 @@ async fn handle_channel_array(
             return Ok(());
         }
         // Decode the pvRequest selecting the array field, through the same
-        // structured boundary as GET/PUT/PROCESS INIT. A present-but-
-        // malformed descriptor or value is a connection-fatal peer wire
-        // fault (pvxs `from_wire_type_value`); an absent body is tolerated.
+        // structured boundary as GET/PUT/PROCESS INIT. A malformed
+        // descriptor, or a non-null descriptor that needs value bytes but
+        // ends before them, is a connection-fatal peer wire fault (pvxs
+        // `from_wire_type_value`); only the all-empty-structs default
+        // selector legitimately has a 0-byte value body.
         let req_desc = match decode_type_desc_cached(&mut cur, inbound_order, decode_cache) {
             Ok(d) => d,
             Err(e) => {
@@ -5644,10 +5658,13 @@ async fn handle_op(
                 return Err(PvaError::Decode(format!("INIT pvRequest descriptor: {e}")));
             }
         };
-        // VALUE body: an ABSENT body is tolerated (the Rust client's RPC
-        // INIT sends only the descriptor — interop), but a PRESENT but
-        // malformed one is the same `!M.good()` bev.reset() wire fault as
-        // the descriptor above, so it is likewise connection-fatal.
+        // VALUE body: read per pvxs `from_wire_full`. The Rust client's
+        // default selectors (and RPC INIT) send a descriptor whose
+        // sub-structures are all empty (`pv_request::build`), so the value
+        // body is legitimately 0 bytes and decodes fine — no "absent body"
+        // exception is needed. A non-null descriptor that needs value bytes
+        // but ends before them is the same `!M.good()` bev.reset() wire
+        // fault as the descriptor above, so it is likewise connection-fatal.
         let req_value =
             match decode_init_pv_request_value(&mut cur, &req_desc, inbound_order, decode_cache) {
                 Ok(v) => v,
@@ -9192,11 +9209,53 @@ mod tests {
     mod decode_init_pv_request_value_owner {
         use super::*;
 
-        /// No value body (cursor at end after the descriptor): tolerated
-        /// as "no options".
+        /// A descriptor that requires value bytes (scalar Int) but whose
+        /// frame ends before them is the `from_wire_full` -> `!M.good()`
+        /// wire fault pvxs `bev.reset()`s on (`dataencode.cpp:747-752`):
+        /// connection-fatal, not a silently-tolerated `None`.
         #[test]
-        fn absent_body_is_none() {
+        fn absent_body_for_scalar_descriptor_is_err() {
             let desc = FieldDesc::Scalar(ScalarType::Int);
+            let buf: &[u8] = &[];
+            let mut cur = std::io::Cursor::new(buf);
+            assert!(
+                decode_init_pv_request_value(
+                    &mut cur,
+                    &desc,
+                    ByteOrder::Little,
+                    &mut TypeCache::new()
+                )
+                .is_err(),
+                "a non-null descriptor needing value bytes with none present \
+                 must fault, not collapse to None",
+            );
+        }
+
+        /// The default `field(...)` selector: a descriptor whose
+        /// sub-structures are all empty consumes zero value bytes and
+        /// `from_wire_full` stays good. With the buffer exhausted this
+        /// carries no create-time options, so it stays `None` — the
+        /// content-less contract the option consumers rely on.
+        #[test]
+        fn absent_body_for_empty_struct_descriptor_is_none() {
+            // `structure { structure field { structure value {} } }` —
+            // the shape `pv_request::build(&["value"])` emits.
+            let desc = FieldDesc::Structure {
+                struct_id: String::new(),
+                fields: vec![(
+                    "field".to_string(),
+                    FieldDesc::Structure {
+                        struct_id: String::new(),
+                        fields: vec![(
+                            "value".to_string(),
+                            FieldDesc::Structure {
+                                struct_id: String::new(),
+                                fields: vec![],
+                            },
+                        )],
+                    },
+                )],
+            };
             let buf: &[u8] = &[];
             let mut cur = std::io::Cursor::new(buf);
             assert!(matches!(
@@ -9339,6 +9398,183 @@ mod tests {
         assert!(
             run(OpKind::Monitor, 801).await.is_err(),
             "a MONITOR INIT with a truncated pvRequest value must be connection-fatal"
+        );
+    }
+
+    /// Regression: a GET/MONITOR INIT carrying a non-null descriptor that
+    /// needs value bytes (scalar Int) but ENDS before them — a
+    /// descriptor-only frame — is the same `from_wire_type_value` ->
+    /// `!M.good()` wire fault pvxs `bev.reset()`s on (`dataencode.cpp:751`,
+    /// `serverget.cpp:371-375`, `servermon.cpp:489-501`). Connection-fatal,
+    /// no op reply, no IOID registration. The prior cursor-exhausted
+    /// short-circuit to `Ok(None)` accepted the frame and could register
+    /// the op while silently dropping the create-time options.
+    #[tokio::test]
+    async fn init_descriptor_only_pvrequest_value_is_connection_fatal() {
+        use crate::server_native::SharedSource;
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::shared_pv::SharedPV;
+
+        async fn run(kind: OpKind, ioid: u32) -> (bool, bool) {
+            let order = ByteOrder::Little;
+            let sid: u32 = 1;
+            let intro = three_field_intro();
+            let pv = SharedPV::new();
+            pv.open(intro.clone(), three_field_value(0, 0, 0)).unwrap();
+            let shared = SharedSource::new();
+            shared.add("dut", pv);
+            let source: DynSource = Arc::new(shared);
+
+            let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+            channels.insert(
+                sid,
+                ChannelState {
+                    name: "dut".into(),
+                    cid: 0,
+                    sid,
+                    introspection: Some(intro),
+                    source,
+                    stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                    open_cred: ClientCredentials::anonymous(),
+                    ops: HashMap::new(),
+                },
+            );
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+            let config = PvaServerConfig::default();
+            let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+            let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+            let cred = ClientCredentials::anonymous();
+
+            // INIT: valid Int descriptor, then NOTHING — the value body
+            // the descriptor requires is absent (descriptor-only frame).
+            let req_desc = FieldDesc::Scalar(crate::pvdata::ScalarType::Int);
+            let mut payload = Vec::new();
+            payload.put_u32(sid, order);
+            payload.put_u32(ioid, order);
+            payload.put_u8(0x08); // INIT
+            crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut payload);
+            let cmd = match kind {
+                OpKind::Monitor => Command::Monitor,
+                _ => Command::Get,
+            };
+            let frame = synth_frame(cmd, order, payload);
+            let result = handle_op(
+                &frame,
+                &tx,
+                &mut channels,
+                order,
+                kind,
+                &config,
+                &mut encode_cache,
+                &mut TypeCache::new(),
+                peer,
+                &cred,
+                &discard_mon_fin(),
+                &discard_exec_fin(),
+            )
+            .await;
+            let fatal = result.is_err();
+            let registered = channels.get(&sid).unwrap().ops.contains_key(&ioid);
+            let replied = rx.try_recv().is_ok();
+            (fatal, registered || replied)
+        }
+
+        let (fatal, leaked) = run(OpKind::Get, 810).await;
+        assert!(fatal, "a descriptor-only GET INIT must be connection-fatal");
+        assert!(
+            !leaked,
+            "a descriptor-only GET INIT must register no IOID and emit no op reply"
+        );
+        let (fatal, leaked) = run(OpKind::Monitor, 811).await;
+        assert!(
+            fatal,
+            "a descriptor-only MONITOR INIT must be connection-fatal"
+        );
+        assert!(
+            !leaked,
+            "a descriptor-only MONITOR INIT must register no IOID and emit no op reply"
+        );
+    }
+
+    /// Control: the default content-less selector (an empty `structure {}`
+    /// pvRequest = select all fields) consumes zero value bytes and
+    /// `from_wire_full` stays good, so a descriptor-only frame whose
+    /// descriptor needs NO bytes is NOT fatal — it registers the op and
+    /// replies, exactly as before. Guards the `decode_init_pv_request_value`
+    /// fix against over-firing on the common default GET/MONITOR INIT.
+    #[tokio::test]
+    async fn init_empty_selector_descriptor_only_registers_op() {
+        use crate::server_native::SharedSource;
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::shared_pv::SharedPV;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 820;
+        let intro = three_field_intro();
+        let pv = SharedPV::new();
+        pv.open(intro.clone(), three_field_value(0, 0, 0)).unwrap();
+        let shared = SharedSource::new();
+        shared.add("dut", pv);
+        let source: DynSource = Arc::new(shared);
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro),
+                source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
+                ops: HashMap::new(),
+            },
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // INIT: empty `structure {}` descriptor, no value body.
+        let req_desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![],
+        };
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x08); // INIT
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut payload);
+        let frame = synth_frame(Command::Get, order, payload);
+        let result = handle_op(
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            OpKind::Get,
+            &config,
+            &mut encode_cache,
+            &mut TypeCache::new(),
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "an empty-selector descriptor-only GET INIT must not be fatal"
+        );
+        assert!(
+            channels.get(&sid).unwrap().ops.contains_key(&ioid),
+            "an empty-selector GET INIT must register the IOID"
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "an empty-selector GET INIT must emit an op reply"
         );
     }
 
@@ -14816,6 +15052,105 @@ mod tests {
             Some(true),
             "a valid PROCESS INIT must reply Status::ok()"
         );
+    }
+
+    /// Regression: a PROCESS INIT carrying a non-null descriptor that needs
+    /// value bytes (scalar Int) but ENDS before them — a descriptor-only
+    /// frame — is the `from_wire_type_value` -> `!M.good()` wire fault
+    /// (`dataencode.cpp:747-752`, `serverget.cpp:371-375`): connection-fatal,
+    /// not registered, no reply. The prior cursor-exhausted short-circuit to
+    /// `Ok(None)` accepted it and registered the op with `Status::ok()`.
+    #[tokio::test]
+    async fn process_init_descriptor_only_value_rejected_and_unregistered() {
+        let order = ByteOrder::Little;
+        // Scalar Int descriptor, no value bytes.
+        let desc = FieldDesc::Scalar(crate::pvdata::ScalarType::Int);
+        let mut req = Vec::new();
+        crate::pvdata::encode::encode_type_desc(&desc, order, &mut req);
+
+        let (fatal, registered, reply) = run_process_init(1, 703, &req, order).await;
+        assert!(
+            fatal,
+            "a descriptor-only PROCESS INIT (value bytes absent) must be connection-fatal"
+        );
+        assert!(
+            !registered,
+            "a descriptor-only PROCESS INIT must not register the IOID"
+        );
+        assert!(reply.is_none(), "the bev.reset() path emits no op reply");
+    }
+
+    /// build a ChannelArray INIT frame `sid + ioid + 0x08 +
+    /// pv_request_bytes`.
+    #[cfg(test)]
+    fn array_init_frame(sid: u32, ioid: u32, pv_request: &[u8], order: ByteOrder) -> Frame {
+        let mut payload = Vec::new();
+        payload.put_u32(sid, order);
+        payload.put_u32(ioid, order);
+        payload.put_u8(0x08); // INIT
+        payload.extend_from_slice(pv_request);
+        synth_frame(Command::Array, order, payload)
+    }
+
+    /// drive `handle_channel_array` for an INIT frame and return
+    /// `(connection_fatal, ops contains ioid, an op reply was emitted)`.
+    #[cfg(test)]
+    async fn run_array_init(
+        sid: u32,
+        ioid: u32,
+        pv_request: &[u8],
+        order: ByteOrder,
+    ) -> (bool, bool, bool) {
+        let source: DynSource = std::sync::Arc::new(AuthorityGatedSource::new());
+        let mut channels = process_channels_no_op(sid, source.clone());
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5076".parse().unwrap();
+        let frame = array_init_frame(sid, ioid, pv_request, order);
+
+        let result = handle_channel_array(
+            &frame,
+            &tx,
+            &mut channels,
+            order,
+            &config,
+            &mut encode_cache,
+            &mut TypeCache::new(),
+            peer,
+            &x509_cred("MyCA"),
+            &discard_exec_fin(),
+        )
+        .await;
+        let fatal = result.is_err();
+        let registered = channels.get(&sid).unwrap().ops.contains_key(&ioid);
+        let replied = rx.try_recv().is_ok();
+        (fatal, registered, replied)
+    }
+
+    /// Regression: a ChannelArray INIT carrying a non-null descriptor that
+    /// needs value bytes (scalar Int) but ENDS before them is the
+    /// `from_wire_type_value` wire fault — connection-fatal, not registered,
+    /// no reply. The decode runs before `channel_array_init`, so the fault
+    /// fires at the wire boundary exactly as pvxs `bev.reset()` does.
+    #[tokio::test]
+    async fn array_init_descriptor_only_value_rejected_and_unregistered() {
+        let order = ByteOrder::Little;
+        // Scalar Int descriptor, no value bytes.
+        let desc = FieldDesc::Scalar(crate::pvdata::ScalarType::Int);
+        let mut req = Vec::new();
+        crate::pvdata::encode::encode_type_desc(&desc, order, &mut req);
+
+        let (fatal, registered, replied) = run_array_init(1, 704, &req, order).await;
+        assert!(
+            fatal,
+            "a descriptor-only ARRAY INIT (value bytes absent) must be connection-fatal"
+        );
+        assert!(
+            !registered,
+            "a descriptor-only ARRAY INIT must not register the IOID"
+        );
+        assert!(!replied, "the bev.reset() path emits no op reply");
     }
 
     /// Regression: the dedicated `handle_put_get` data phase must

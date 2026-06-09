@@ -6,6 +6,7 @@ use tokio::sync::Notify;
 use epics_base_rs::runtime::sync::{Mutex, mpsc};
 
 use super::LongStringMode;
+use super::ca_server::ServerStats;
 use crate::protocol::*;
 use epics_base_rs::server::pv::{MonitorEvent, ProcessVariable, coalesce_consume};
 use epics_base_rs::types::encode_dbr;
@@ -152,6 +153,7 @@ pub(crate) fn spawn_monitor_sender<W>(
     mut rx: mpsc::Receiver<MonitorEvent>,
     denied: Arc<AtomicBool>,
     long_string_mode: LongStringMode,
+    stats: Option<Arc<ServerStats>>,
 ) -> tokio::task::JoinHandle<()>
 where
     W: AsyncWrite + Unpin + Send + 'static,
@@ -178,6 +180,15 @@ where
                 };
                 event = coalesced;
             }
+            // One subscription update committed for delivery this cycle
+            // (post-coalesce). PCAS `subscriptionEventsPosted` parity —
+            // see `ServerStats::subscription_events_posted`. Counted
+            // before the read-access gate so a suppressed delivery shows
+            // as posted-but-not-processed, exactly as the gateway's
+            // `serverPostRate` > `serverEventRate` divergence expects.
+            if let Some(ref s) = stats {
+                s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
+            }
             // C `casAccessRightsCB` (`rsrv/camessage.c:1080-1095`)
             // suppresses event deliveries with `db_event_disable`
             // while read access is denied (without tearing the
@@ -199,6 +210,13 @@ where
             .is_err()
             {
                 break;
+            }
+            // Successfully written to the client — PCAS
+            // `subscriptionEventsProcessed` parity (gateway
+            // `serverEventRate`).
+            if let Some(ref s) = stats {
+                s.subscription_events_processed
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
     })
@@ -409,6 +427,136 @@ mod tests {
         );
         // Payload is 8-byte aligned (C client TCP parser requirement).
         assert_eq!(payload_size % 8, 0, "payload not 8-byte aligned");
+    }
+
+    /// Server-wide subscription-event counters (PCAS
+    /// `subscriptionEventsPosted` / `subscriptionEventsProcessed`,
+    /// feeding the CA gateway's `serverPostRate` / `serverEventRate`).
+    /// The monitor task is the single owner that advances them, so the
+    /// invariant boundaries are tested here against the real delivery
+    /// loop rather than through a full TCP round-trip.
+    mod subscription_event_counters {
+        use super::*;
+        use crate::server::ca_server::ServerStats;
+        use epics_base_rs::server::pv::ProcessVariable;
+        use epics_base_rs::types::{DBR_DOUBLE, DbFieldType, EpicsValue};
+        use std::time::Duration;
+
+        const DBE_VALUE: u16 = 1;
+
+        fn recording_writer() -> Arc<Mutex<BufWriter<RecordingWriter>>> {
+            Arc::new(Mutex::new(BufWriter::with_capacity(
+                0,
+                RecordingWriter::default(),
+            )))
+        }
+
+        /// Poll `counter` until it reaches `want`, driving the
+        /// single-threaded test runtime so the spawned monitor task can
+        /// run. Fails the test if it does not arrive within the timeout.
+        async fn wait_for(counter: &std::sync::atomic::AtomicU64, want: u64) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while counter.load(Ordering::Relaxed) < want {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "counter reached {} but wanted {want}",
+                    counter.load(Ordering::Relaxed)
+                )
+            });
+        }
+
+        /// Successful delivery advances posted AND processed in lockstep:
+        /// every dequeued event is posted, then — with read access
+        /// granted and the writer always succeeding — processed. Each
+        /// post is drained before the next so coalescing never collapses
+        /// two updates into one cycle, giving a deterministic count.
+        #[tokio::test]
+        async fn successful_delivery_advances_posted_and_processed() {
+            let pv = Arc::new(ProcessVariable::new("c:pv".into(), EpicsValue::Double(0.0)));
+            let rx = pv
+                .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
+                .await
+                .expect("subscriber added");
+            let stats = Arc::new(ServerStats::default());
+            let task = spawn_monitor_sender(
+                pv.clone(),
+                1,
+                DBR_DOUBLE,
+                0,
+                recording_writer(),
+                Arc::new(FlowControlGate::default()),
+                rx,
+                Arc::new(AtomicBool::new(false)),
+                LongStringMode::Plain,
+                Some(stats.clone()),
+            );
+
+            for (i, v) in [1.0_f64, 2.0, 3.0].into_iter().enumerate() {
+                pv.set(EpicsValue::Double(v)).await;
+                wait_for(&stats.subscription_events_processed, i as u64 + 1).await;
+            }
+
+            task.abort();
+            assert_eq!(
+                stats.subscription_events_processed.load(Ordering::Relaxed),
+                3,
+                "three drained value updates → three processed events"
+            );
+            assert_eq!(
+                stats.subscription_events_posted.load(Ordering::Relaxed),
+                3,
+                "posted matches processed when no event is suppressed or fails"
+            );
+        }
+
+        /// Read access denied: the producer keeps running and the task
+        /// keeps dequeuing events (so they are POSTED), but each is
+        /// dropped before the wire — so PROCESSED never advances. This
+        /// is the `serverPostRate` > `serverEventRate` divergence the
+        /// gateway surfaces; both counters reading equal would hide it.
+        #[tokio::test]
+        async fn denied_delivery_counts_posted_not_processed() {
+            let pv = Arc::new(ProcessVariable::new("c:pv".into(), EpicsValue::Double(0.0)));
+            let rx = pv
+                .add_subscriber(1, DbFieldType::Double, DBE_VALUE)
+                .await
+                .expect("subscriber added");
+            let stats = Arc::new(ServerStats::default());
+            let task = spawn_monitor_sender(
+                pv.clone(),
+                1,
+                DBR_DOUBLE,
+                0,
+                recording_writer(),
+                Arc::new(FlowControlGate::default()),
+                rx,
+                Arc::new(AtomicBool::new(true)), // read access denied
+                LongStringMode::Plain,
+                Some(stats.clone()),
+            );
+
+            pv.set(EpicsValue::Double(1.0)).await;
+            wait_for(&stats.subscription_events_posted, 1).await;
+            // Give the task ample opportunity to (wrongly) process it.
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+
+            task.abort();
+            assert!(
+                stats.subscription_events_posted.load(Ordering::Relaxed) >= 1,
+                "a denied event is still posted to the subscription"
+            );
+            assert_eq!(
+                stats.subscription_events_processed.load(Ordering::Relaxed),
+                0,
+                "a denied event is suppressed before the wire — never processed"
+            );
+        }
     }
 
     /// FlowControlGate (EVENTS_OFF/EVENTS_ON) pause/resume boundaries.

@@ -440,6 +440,13 @@ struct ClientState {
     /// only the channel-scoped tasks on CLEAR_CHANNEL without
     /// disturbing other channels' in-flight WRITE_NOTIFYs.
     write_notify_tasks: Vec<(u32, tokio::task::AbortHandle)>,
+    /// Server-wide stats handle, cloned into each monitor task so the
+    /// `subscription_events_posted` / `subscription_events_processed`
+    /// counters (PCAS `caServer` parity, feeding the gateway's
+    /// `serverPostRate` / `serverEventRate`) advance from the delivery
+    /// layer. `None` in unit tests that drive the TCP path without a
+    /// full `ServerStats` wired up.
+    stats: Option<Arc<super::ca_server::ServerStats>>,
 }
 
 impl ClientState {
@@ -475,6 +482,7 @@ impl ClientState {
             #[cfg(feature = "cap-tokens")]
             tls_channel_binding: None,
             write_notify_tasks: Vec::new(),
+            stats: None,
         }
     }
 
@@ -1234,6 +1242,7 @@ where
     // headroom for follow-on monitor events queued in the same tick.
     let writer = Arc::new(Mutex::new(BufWriter::with_capacity(64 * 1024, writer)));
     let mut state = ClientState::new(acf, tcp_port, db.clone());
+    state.stats = stats.clone();
     #[cfg(feature = "cap-tokens")]
     {
         state.cap_token_verifier = cap_token_verifier;
@@ -3717,6 +3726,19 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                         &snap,
                                     )
                                     .await?;
+                                    // Initial subscription value — C posts
+                                    // it via `db_post_single_event` at
+                                    // monitor creation (`camessage.c:1853`),
+                                    // so it counts as one posted and one
+                                    // processed subscription event (PCAS
+                                    // parity). Future updates flow through
+                                    // the monitor task below.
+                                    if let Some(ref s) = state.stats {
+                                        s.subscription_events_posted
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        s.subscription_events_processed
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
                                 }
                                 None => {}
                             }
@@ -3732,6 +3754,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             rx,
                             denied.clone(),
                             long_string_mode,
+                            state.stats.clone(),
                         );
 
                         state.subscriptions.insert(
@@ -3906,6 +3929,17 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 &snap,
                             )
                             .await?;
+                            // Initial subscription value posted and
+                            // processed (C `db_post_single_event` at
+                            // monitor creation, `camessage.c:1853`); PCAS
+                            // parity. Later updates flow through the
+                            // monitor task below.
+                            if let Some(ref s) = state.stats {
+                                s.subscription_events_posted
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                s.subscription_events_processed
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                         }
 
                         let writer_clone = writer.clone();
@@ -3913,6 +3947,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         let record_for_task = record.clone();
                         let denied = Arc::new(AtomicBool::new(access_denied));
                         let denied_for_task = denied.clone();
+                        let stats_for_task = state.stats.clone();
                         let task = epics_base_rs::runtime::task::spawn(async move {
                             let mut rx = rx;
                             loop {
@@ -3944,6 +3979,17 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                         break;
                                     };
                                     event = coalesced;
+                                }
+                                // One subscription update committed for
+                                // delivery this cycle (post-coalesce).
+                                // PCAS `subscriptionEventsPosted` parity —
+                                // counted before the read-access gate so a
+                                // suppressed delivery reads as
+                                // posted-but-not-processed, the same
+                                // `serverPostRate` > `serverEventRate`
+                                // divergence the gateway expects.
+                                if let Some(ref s) = stats_for_task {
+                                    s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
                                 }
                                 // C `casAccessRightsCB`
                                 // (`rsrv/camessage.c:1080-1095`)
@@ -4041,6 +4087,13 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                     break;
                                 }
                                 let _ = w.flush().await;
+                                // Frame written to the client — PCAS
+                                // `subscriptionEventsProcessed` parity
+                                // (gateway `serverEventRate`).
+                                if let Some(ref s) = stats_for_task {
+                                    s.subscription_events_processed
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         });
 
@@ -4824,6 +4877,15 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                     // native record field → scalar DBR_STRING).
                     super::apply_long_string_mode(&mut snap, sub_long_string_mode);
                     send_monitor_snapshot(writer, sub_id_val, data_type, data_count, &snap).await?;
+                    // Access-restore post — C `db_event_enable` then
+                    // `db_post_single_event` (`camessage.c:1086-1088`):
+                    // one posted and one processed subscription event,
+                    // same PCAS accounting as the initial value.
+                    if let Some(ref s) = state.stats {
+                        s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
+                        s.subscription_events_processed
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }

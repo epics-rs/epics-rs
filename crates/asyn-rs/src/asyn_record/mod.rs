@@ -105,27 +105,40 @@ fn menu_index_to_baud_rate(idx: i32) -> i32 {
     }
 }
 
+/// `asynFMT` menu value for ASCII I/O format (`asynFMT_ASCII` in EPICS
+/// `asynRecord.dbd`). On output C escape-translates AOUT; on input the
+/// read destination is the AINP string (`asynRecord.c:1486`,`:1503-1509`).
+const ASYN_FMT_ASCII: i32 = 0;
+
+/// `asynFMT` menu value for Hybrid I/O format (`asynFMT_Hybrid`). On
+/// output C escape-translates the binary BOUT buffer read as a C string;
+/// on input the read destination is the BINP byte buffer
+/// (`asynRecord.c:1491-1495`,`:1507-1510`).
+const ASYN_FMT_HYBRID: i32 = 1;
+
+/// `asynFMT` menu value for binary I/O format (`asynFMT_Binary`). Selects
+/// the raw BOUT / BINP byte buffers over the ASCII AOUT / AINP strings and
+/// suppresses escape translation (`asynRecord.c:1496-1502`).
+const ASYN_FMT_BINARY: i32 = 2;
+
 /// Decode a C-style backslash-escaped string into the raw bytes the
 /// driver layer expects. Mirrors EPICS base's `dbTranslateEscape`
 /// (`libCom/misc/dbTranslateEscape.c`) — supports the standard
 /// escape sequences `\r \n \t \\ \" \0` plus octal `\NNN`. Used by
-/// asynRecord OEOS/IEOS writes (C asynRecord.c:374-393) so a
-/// configured `\r\n` terminator in the DB field reaches the driver
-/// as the two raw bytes `0x0D 0x0A`, not the four-byte literal.
-/// `asynFMT` menu value for binary I/O format — selects the raw BOUT /
-/// BINP byte buffers over the ASCII AOUT / AINP string buffers.
-/// (`asynFMT_Binary` in EPICS `asynRecord.dbd`; ASCII = 0, Hybrid = 1.)
-const ASYN_FMT_BINARY: i32 = 2;
-
-/// `asynFMT` menu value for ASCII I/O format (`asynFMT_ASCII` in EPICS
-/// `asynRecord.dbd`). On the input side C selects the read destination by
-/// IFMT: ASCII reads land in the AINP string, Binary/Hybrid in the BINP
-/// byte buffer (`asynRecord.c:1503-1509`, monitor `:1012-1018`).
-const ASYN_FMT_ASCII: i32 = 0;
-
+/// asynRecord OEOS/IEOS writes (C asynRecord.c:374-393) and ASCII octet
+/// output (`:1489`) so a configured `\r\n` reaches the driver as the two
+/// raw bytes `0x0D 0x0A`, not the four-byte literal.
 fn translate_escape(s: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(s.len());
-    let mut chars = s.bytes().peekable();
+    translate_escape_bytes(s.as_bytes())
+}
+
+/// Byte-oriented core of [`translate_escape`]. C `dbTranslateEscape`
+/// operates on a NUL-terminated C string regardless of encoding; the
+/// Hybrid octet output path (`asynRecord.c:1494`) feeds it the raw binary
+/// BOUT buffer, so the translator must accept arbitrary bytes.
+fn translate_escape_bytes(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut chars = input.iter().copied().peekable();
     while let Some(c) = chars.next() {
         if c != b'\\' {
             out.push(c);
@@ -177,6 +190,26 @@ fn translate_escape(s: &str) -> Vec<u8> {
         out.push(decoded);
     }
     out
+}
+
+/// Resolve an asynRecord `TFIL` string to its trace sink, C-faithful per
+/// `asynRecord.c:453-468`: empty and `<stdout>` -> stdout, `<stderr>` ->
+/// stderr, `<errlog>` -> the errlog sink. Any other value is a file path
+/// opened with append semantics (`fopen(.., "a+")`) so an existing trace
+/// log is preserved rather than truncated. The bracketed tokens are the
+/// only special names — a bare `"stdout"`/`"stderr"` is a literal filename,
+/// exactly as in C.
+fn open_trace_file(tfil: &str) -> std::io::Result<TraceFile> {
+    match tfil {
+        "" | "<stdout>" => Ok(TraceFile::Stdout),
+        "<stderr>" => Ok(TraceFile::Stderr),
+        "<errlog>" => Ok(TraceFile::Errlog),
+        path => std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+            .map(|f| TraceFile::File(Arc::new(std::sync::Mutex::new(f)))),
+    }
 }
 
 // ===== AsynRecord =====
@@ -907,11 +940,31 @@ impl AsynRecord {
         self.tinm = mask as i32;
     }
 
+    /// Resolve the trace target for this record's trace-control writes.
+    ///
+    /// C `findTracePvt` (asynManager.c:541-549) routes a trace mutation to
+    /// the device `dpCommon` when the connected `pasynUser` names a device
+    /// — a multi-device port addressed by `ADDR >= 0` — otherwise to the
+    /// port-wide `dpc`. `Some(addr)` selects the device override;
+    /// `None` the port default. Every `apply_trace_*` path routes through
+    /// this single resolver so a record adjusting one address cannot mutate
+    /// the whole port (or vice versa), and future trace controls inherit
+    /// the rule by construction.
+    fn trace_addr_target(&self) -> Option<i32> {
+        match self.port_entry {
+            Some(ref entry) if self.addr >= 0 && entry.handle.is_multi_device() => Some(self.addr),
+            _ => None,
+        }
+    }
+
     /// Apply current trace mask fields to the TraceManager.
     fn apply_trace_mask(&self) {
         if let Some(ref entry) = self.port_entry {
             let mask = TraceMask::from_bits_truncate(self.tmsk as u32);
-            entry.trace.set_trace_mask(Some(&self.port), mask);
+            match self.trace_addr_target() {
+                Some(addr) => entry.trace.set_device_trace_mask(&self.port, addr, mask),
+                None => entry.trace.set_trace_mask(Some(&self.port), mask),
+            }
         }
     }
 
@@ -919,7 +972,10 @@ impl AsynRecord {
     fn apply_trace_io_mask(&self) {
         if let Some(ref entry) = self.port_entry {
             let mask = TraceIoMask::from_bits_truncate(self.tiom as u32);
-            entry.trace.set_trace_io_mask(Some(&self.port), mask);
+            match self.trace_addr_target() {
+                Some(addr) => entry.trace.set_device_trace_io_mask(&self.port, addr, mask),
+                None => entry.trace.set_trace_io_mask(Some(&self.port), mask),
+            }
         }
     }
 
@@ -927,45 +983,72 @@ impl AsynRecord {
     fn apply_trace_info_mask(&self) {
         if let Some(ref entry) = self.port_entry {
             let mask = TraceInfoMask::from_bits_truncate(self.tinm as u32);
-            entry.trace.set_trace_info_mask(Some(&self.port), mask);
+            match self.trace_addr_target() {
+                Some(addr) => entry
+                    .trace
+                    .set_device_trace_info_mask(&self.port, addr, mask),
+                None => entry.trace.set_trace_info_mask(Some(&self.port), mask),
+            }
         }
     }
 
     /// Apply truncate size to TraceManager.
     fn apply_trace_truncate_size(&self) {
         if let Some(ref entry) = self.port_entry {
-            entry
-                .trace
-                .set_io_truncate_size(Some(&self.port), self.tsiz as usize);
+            let size = self.tsiz as usize;
+            match self.trace_addr_target() {
+                Some(addr) => entry
+                    .trace
+                    .set_device_io_truncate_size(&self.port, addr, size),
+                None => entry.trace.set_io_truncate_size(Some(&self.port), size),
+            }
         }
     }
 
     /// Apply trace file to TraceManager.
-    fn apply_trace_file(&self) {
-        if let Some(ref entry) = self.port_entry {
-            let file = match self.tfil.as_str() {
-                "" | "stderr" => TraceFile::Stderr,
-                "stdout" => TraceFile::Stdout,
-                path => match std::fs::File::create(path) {
-                    Ok(f) => TraceFile::File(Arc::new(std::sync::Mutex::new(f))),
-                    Err(_) => {
-                        eprintln!("asynRecord: cannot open trace file '{path}', using stderr");
-                        TraceFile::Stderr
-                    }
-                },
-            };
-            entry.trace.set_trace_file(Some(&self.port), file);
+    ///
+    /// C parity: `special`/`asynRecordTFIL` (asynRecord.c:453-480) maps the
+    /// `TFIL` string to a trace sink with the bracketed-token convention —
+    /// empty and `<stdout>` -> stdout, `<stderr>` -> stderr, `<errlog>` ->
+    /// the errlog sink, any other value a file path opened with
+    /// `fopen(.., "a+")` so existing trace logs are appended, not
+    /// truncated. On open failure C reports the error and leaves the
+    /// current trace file unchanged (does not fall back to another sink).
+    /// (The IOC-shell `asynSetTraceFile` uses a different convention —
+    /// bare names, empty -> stderr, `fopen "w"` — handled in `iocsh.rs`.)
+    fn apply_trace_file(&mut self) {
+        let Some(entry) = self.port_entry.clone() else {
+            return;
+        };
+        let tfil = self.tfil.clone();
+        let file = match open_trace_file(&tfil) {
+            Ok(file) => file,
+            Err(e) => {
+                self.errs = format!("Error opening trace file: {tfil}: {e}");
+                return;
+            }
+        };
+        match self.trace_addr_target() {
+            Some(addr) => entry.trace.set_device_trace_file(&self.port, addr, file),
+            None => entry.trace.set_trace_file(Some(&self.port), file),
         }
     }
 
     /// Read current trace state from TraceManager into record fields.
+    ///
+    /// C `monitorStatus` (asynRecord.c:1066-1084) refreshes the trace
+    /// mask, the trace I/O mask, AND the trace info mask (`TINM`/`TINB0..3`)
+    /// from the trace manager. Previously the info mask was never imported,
+    /// so a record connecting after a non-default `asynSetTraceInfoMask`
+    /// showed `TINM`/`TINB*` as zero.
     fn read_trace_state(&mut self) {
-        let (trace_mask, io_mask) = match self.port_entry {
+        let (trace_mask, io_mask, info_mask) = match self.port_entry {
             Some(ref entry) => {
                 let port = &self.port;
                 (
                     entry.trace.get_trace_mask(Some(port)).bits(),
                     entry.trace.get_trace_io_mask(Some(port)).bits(),
+                    entry.trace.get_trace_info_mask(Some(port)).bits(),
                 )
             }
             None => return,
@@ -976,6 +1059,9 @@ impl AsynRecord {
 
         self.tiom = io_mask as i32;
         self.update_io_bits_from_mask();
+
+        self.tinm = info_mask as i32;
+        self.update_info_bits_from_mask();
     }
 
     /// Read serial/IP options from the driver into record fields.
@@ -1157,6 +1243,37 @@ impl AsynRecord {
             .with_timeout(timeout)
     }
 
+    /// Build the octet output payload by `OFMT`, mirroring
+    /// `asynRecord.c:1486-1502`:
+    ///   - ASCII  -> `dbTranslateEscape(AOUT)`: the AOUT string with escape
+    ///     sequences (`\r\n` -> CRLF) translated.
+    ///   - Hybrid -> `dbTranslateEscape(BOUT read as a C string)`: the binary
+    ///     output buffer, escape-translated (stops at the first NUL).
+    ///   - Binary -> raw BOUT, `NOWT` bytes clamped to `OMAX`, no translation.
+    ///
+    /// ASCII/Hybrid emit the full translated buffer; only Binary is
+    /// length-bounded by `NOWT`/`OMAX`. Previously the record sent raw AOUT
+    /// for both ASCII and Hybrid (ASCII shipped literal backslashes, Hybrid
+    /// ignored BOUT) and clamped every mode by `NOWT`.
+    fn octet_output_buffer(&self) -> Vec<u8> {
+        match self.ofmt {
+            ASYN_FMT_BINARY => {
+                let omax = self.omax.max(0) as usize;
+                let nowt = (self.nowt.max(0) as usize).min(omax);
+                self.bout[..nowt.min(self.bout.len())].to_vec()
+            }
+            ASYN_FMT_HYBRID => {
+                let end = self
+                    .bout
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(self.bout.len());
+                translate_escape_bytes(&self.bout[..end])
+            }
+            _ => translate_escape(&self.aout),
+        }
+    }
+
     /// Perform I/O based on TMOD and IFACE.
     fn perform_io(&mut self) -> CaResult<()> {
         let entry = match &self.port_entry {
@@ -1174,27 +1291,18 @@ impl AsynRecord {
         if matches!(tmod, TransferMode::Write | TransferMode::WriteRead) {
             match iface {
                 InterfaceType::Octet => {
-                    // C asynRecord.c selects the output buffer by OFMT:
-                    // Binary (asynFMT_Binary) writes the raw BOUT byte
-                    // array, ASCII / Hybrid write the AOUT string. NOWT
-                    // bytes are written (NOWT defaults to OMAX), not the
-                    // whole buffer. Rust `io_write_octet` is all-or-error,
-                    // so a successful write transferred exactly the slice.
-                    let full: &[u8] = if self.ofmt == ASYN_FMT_BINARY {
-                        &self.bout
+                    let data = self.octet_output_buffer();
+                    let n = data.len();
+                    // C asynRecord.c:1528-1541: Binary output suppresses the
+                    // driver's output EOS for the raw write; ASCII/Hybrid keep
+                    // EOS active. The OctetWriteBinary op brackets the EOS
+                    // save/clear/restore inside the actor.
+                    let op = if self.ofmt == ASYN_FMT_BINARY {
+                        crate::request::RequestOp::OctetWriteBinary { data }
                     } else {
-                        self.aout.as_bytes()
+                        crate::request::RequestOp::OctetWrite { data }
                     };
-                    let n = if self.nowt > 0 {
-                        (self.nowt as usize).min(full.len())
-                    } else {
-                        full.len()
-                    };
-                    let data = full[..n].to_vec();
-                    match entry.handle.submit_blocking(
-                        crate::request::RequestOp::OctetWrite { data },
-                        self.io_user(),
-                    ) {
+                    match entry.handle.submit_blocking(op, self.io_user()) {
                         Ok(_) => {
                             self.nawt = n as i32;
                         }
@@ -1255,10 +1363,17 @@ impl AsynRecord {
                     } else {
                         imax
                     };
-                    match entry.handle.submit_blocking(
-                        crate::request::RequestOp::OctetRead { buf_size },
-                        self.io_user(),
-                    ) {
+                    // C asynRecord.c:1564-1577: Binary input suppresses the
+                    // driver's input EOS so a configured IEOS cannot stop the
+                    // read early or strip payload bytes; ASCII/Hybrid keep EOS
+                    // active. The OctetReadBinary op brackets the EOS
+                    // save/clear/restore inside the actor.
+                    let read_op = if self.ifmt == ASYN_FMT_BINARY {
+                        crate::request::RequestOp::OctetReadBinary { buf_size }
+                    } else {
+                        crate::request::RequestOp::OctetRead { buf_size }
+                    };
+                    match entry.handle.submit_blocking(read_op, self.io_user()) {
                         Ok(result) => {
                             // C asynRecord.c stores the driver's returned
                             // EOM reason into EOMR after every octet read.
@@ -1919,18 +2034,30 @@ impl Record for AsynRecord {
                 self.write_option("disconnectOnReadTimeout", val);
             }
 
-            // --- GPIB commands (no GPIB hardware, log as stub) ---
-            "UCMD" | "ACMD" => {
-                // GPIB not supported in Rust ports
-                if self.gpibiv == 0 && (self.ucmd != 0 || self.acmd != 0) {
-                    self.errs = "GPIB not supported on this port".to_string();
-                }
-            }
+            // GPIB UCMD/ACMD are `pp(TRUE)` with no `special()` in C
+            // (asynRecord.dbd:454-467); the command dispatch lives in the
+            // process path (asynCallbackProcess, asynRecord.c:819-826), not
+            // here. See `process()`.
 
             // --- AQR (Abort Queue Request) ---
-            "AQR" => {
-                // Not yet implemented — would need CancelToken tracking per-record
-            }
+            //
+            // C special() for AQR (asynRecord.c:393-408) calls
+            // pasynManager->cancelRequest; only when a request was
+            // actually dequeued does it report "I/O request canceled",
+            // raise STATE_ALARM/MAJOR_ALARM and force a completion
+            // callback. In every case it then sets state = stateIdle.
+            //
+            // This record's I/O is synchronous (perform_io ->
+            // submit_blocking), so the record stays locked for the whole
+            // transfer: an AQR write cannot arrive while one of this
+            // record's requests is queued or in flight. C's
+            // `wasQueued == true` branch is therefore unreachable here,
+            // and the reachable `wasQueued == false` case is exactly this
+            // idle no-op (no error, no alarm, no callback). Cancelling a
+            // live transfer would require async (PACT) record processing
+            // that returns immediately and holds the actor CancelToken;
+            // that completion framework lives in epics-base-rs.
+            "AQR" => {}
 
             // --- EOS (end-of-string) delimiters ---
             //
@@ -1975,6 +2102,35 @@ impl Record for AsynRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
+        // C asynCallbackProcess (asynRecord.c:819-827) dispatches by
+        // priority: a pending UCMD universal GPIB command first, else a
+        // pending ACMD addressed GPIB command, else octet/register I/O
+        // (performIO). The two GPIB commands take priority over performIO
+        // — they run even when TMOD is NoIO — and each resets its menu
+        // field back to None so the operator's request is consumed
+        // exactly once.
+        //
+        // gpibUniversalCmd / gpibAddressedCmd (asynRecord.c:1647-1651,
+        // 1693-1697) begin with `if (!pasynRec->gpibiv)`: with no asynGpib
+        // interface they report "No asynGpib interface", raise a
+        // COMM_ALARM/MAJOR_ALARM, and return without touching the bus.
+        // epics-rs ports carry no asynGpib interface (GPIBIV is always 0,
+        // set in connect_device), so that no-interface branch is the only
+        // reachable path here. The COMM_ALARM/MAJOR_ALARM severity is a
+        // recGblSetSevr on the record's alarm fields, which this record
+        // type does not model (its octet I/O errors likewise report only
+        // via ERRS).
+        if self.ucmd != 0 {
+            self.errs = "No asynGpib interface".to_string();
+            self.ucmd = 0;
+            return Ok(ProcessOutcome::complete());
+        }
+        if self.acmd != 0 {
+            self.errs = "No asynGpib interface".to_string();
+            self.acmd = 0;
+            return Ok(ProcessOutcome::complete());
+        }
+
         let tmod = TransferMode::from_u16(self.tmod as u16);
         if tmod == TransferMode::NoIo {
             return Ok(ProcessOutcome::complete());
@@ -2119,6 +2275,50 @@ mod tests {
     }
 
     #[test]
+    fn process_ucmd_with_no_gpib_interface_errors_and_resets() {
+        // C asynCallbackProcess (asynRecord.c:819-822): a pending UCMD is
+        // dispatched to gpibUniversalCmd then reset to None. With no
+        // asynGpib interface (the only epics-rs case) gpibUniversalCmd
+        // reports "No asynGpib interface" (asynRecord.c:1648). The command
+        // takes priority over performIO, so even with TMOD=Read on an
+        // unconnected record the I/O path ("not connected") is never
+        // reached.
+        let mut rec = AsynRecord::default();
+        rec.tmod = TransferMode::Read as i32;
+        rec.ucmd = 1; // Device Clear (DCL)
+        rec.process().unwrap();
+        assert_eq!(rec.errs, "No asynGpib interface");
+        assert_eq!(rec.ucmd, 0, "UCMD must reset to None after dispatch");
+    }
+
+    #[test]
+    fn process_acmd_with_no_gpib_interface_errors_and_resets() {
+        // C asynCallbackProcess (asynRecord.c:823-826): a pending ACMD is
+        // dispatched to gpibAddressedCmd then reset to None. With no
+        // asynGpib interface gpibAddressedCmd reports "No asynGpib
+        // interface" (asynRecord.c:1694).
+        let mut rec = AsynRecord::default();
+        rec.tmod = TransferMode::Read as i32;
+        rec.acmd = 1; // Group Execute Trigger (GET)
+        rec.process().unwrap();
+        assert_eq!(rec.errs, "No asynGpib interface");
+        assert_eq!(rec.acmd, 0, "ACMD must reset to None after dispatch");
+    }
+
+    #[test]
+    fn process_ucmd_takes_priority_over_acmd() {
+        // C dispatches UCMD first (`if`), ACMD only in the `else if`. With
+        // both pending only UCMD is consumed this cycle; ACMD is left for
+        // the next process.
+        let mut rec = AsynRecord::default();
+        rec.ucmd = 1;
+        rec.acmd = 1;
+        rec.process().unwrap();
+        assert_eq!(rec.ucmd, 0, "UCMD consumed first");
+        assert_eq!(rec.acmd, 1, "ACMD left pending while UCMD was set");
+    }
+
+    #[test]
     fn test_special_trace_mask() {
         let mut rec = AsynRecord::default();
         rec.tmsk = (TraceMask::ERROR | TraceMask::WARNING | TraceMask::FLOW).bits() as i32;
@@ -2178,6 +2378,127 @@ mod tests {
         let entry = registry::get_port("test_asyn_rec");
         assert!(entry.is_some());
         assert_eq!(entry.unwrap().handle.port_name(), "test_asyn_rec");
+    }
+
+    /// Regression R0604-ASYN-TRACE-ADDR-1.
+    ///
+    /// On a multi-device port a record with ADDR >= 0 must route trace
+    /// controls to the (PORT,ADDR) device trace state, not the port-wide
+    /// state (C findTracePvt, asynManager.c:541-549). A record adjusting
+    /// device 3 must not change device 4 or the port default.
+    #[test]
+    fn trace_controls_route_to_device_on_multi_device_port() {
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use tokio::sync::mpsc;
+
+        struct MdDriver(PortDriverBase);
+        impl PortDriver for MdDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+
+        let port_name = "test_trace_addr_md";
+        let flags = PortFlags {
+            multi_device: true,
+            ..PortFlags::default()
+        };
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(
+            Box::new(MdDriver(PortDriverBase::new(port_name, 4, flags))),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let mut handle = PortHandle::new(tx, port_name.into(), interrupts);
+        handle.set_capabilities(true, 4);
+        let trace = Arc::new(TraceManager::new());
+        register_port(port_name, handle, trace.clone());
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.addr = 3;
+        rec.connect_device();
+        assert_eq!(rec.cnct, 1);
+        assert!(rec.trace_addr_target() == Some(3));
+
+        // Apply a device-3 trace mask through the record's TMSK path.
+        rec.tmsk = (TraceMask::ERROR | TraceMask::FLOW).bits() as i32;
+        rec.apply_trace_mask();
+        rec.tsiz = 17;
+        rec.apply_trace_truncate_size();
+
+        // Device 3 sees FLOW; device 4 and the port default do not.
+        assert!(trace.is_enabled_device(port_name, 3, TraceMask::FLOW));
+        assert!(!trace.is_enabled_device(port_name, 4, TraceMask::FLOW));
+        assert!(!trace.is_enabled(port_name, TraceMask::FLOW));
+
+        // A single-device (addr 0) record on the same port targets the port.
+        let mut rec0 = AsynRecord::default();
+        rec0.port = port_name.to_string();
+        rec0.addr = -1; // unaddressed -> port-wide
+        rec0.connect_device();
+        assert!(rec0.trace_addr_target().is_none());
+    }
+
+    /// Regression R0604-ASYN-TRACE-INFO-SYNC-1 (connect-time import).
+    ///
+    /// C monitorStatus (asynRecord.c:1079-1084) imports the trace info mask
+    /// into TINM/TINB0..3 on connect; previously Rust read only the trace
+    /// mask and I/O mask, so a record connecting after a non-default
+    /// asynSetTraceInfoMask showed TINM/TINB* as zero.
+    #[test]
+    fn read_trace_state_imports_info_mask_on_connect() {
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use tokio::sync::mpsc;
+
+        struct D(PortDriverBase);
+        impl PortDriver for D {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+
+        let port_name = "test_trace_info_sync";
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(
+            Box::new(D(PortDriverBase::new(port_name, 1, PortFlags::default()))),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), interrupts);
+        let trace = Arc::new(TraceManager::new());
+        // Non-default info mask set on the manager BEFORE the record connects.
+        trace.set_trace_info_mask(
+            Some(port_name),
+            TraceInfoMask::SOURCE | TraceInfoMask::THREAD,
+        );
+        register_port(port_name, handle, trace);
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.connect_device();
+        assert_eq!(rec.cnct, 1);
+
+        assert_eq!(
+            rec.tinm as u32,
+            (TraceInfoMask::SOURCE | TraceInfoMask::THREAD).bits()
+        );
+        assert_eq!(rec.tinb0, 0); // TIME
+        assert_eq!(rec.tinb1, 0); // PORT
+        assert_eq!(rec.tinb2, 1); // SOURCE
+        assert_eq!(rec.tinb3, 1); // THREAD
     }
 
     /// Regression R0604-ASYN-IFMT-FIELDS-1.
@@ -2312,5 +2633,104 @@ mod tests {
         assert_eq!(translate_escape("\\0"), vec![0x00]);
         // A terminator built from two octal escapes (e.g. CR LF).
         assert_eq!(translate_escape("\\015\\012"), vec![0x0D, 0x0A]);
+    }
+
+    #[test]
+    fn test_octet_output_buffer_by_ofmt() {
+        let mut rec = AsynRecord::default();
+
+        // ASCII: AOUT is escape-translated, full buffer (no NOWT clamp).
+        rec.ofmt = ASYN_FMT_ASCII;
+        rec.aout = "hi\\r\\n".to_string();
+        rec.nowt = 2; // would have truncated under the old all-mode clamp
+        assert_eq!(
+            rec.octet_output_buffer(),
+            vec![b'h', b'i', 0x0D, 0x0A],
+            "ASCII must escape-translate AOUT and ignore NOWT"
+        );
+
+        // Hybrid: BOUT (as a C string) is escape-translated.
+        rec.ofmt = ASYN_FMT_HYBRID;
+        rec.bout = b"x\\t".to_vec();
+        assert_eq!(
+            rec.octet_output_buffer(),
+            vec![b'x', 0x09],
+            "Hybrid must escape-translate the BOUT buffer"
+        );
+        // Hybrid stops at an interior NUL (C-string semantics).
+        rec.bout = b"ab\0cd".to_vec();
+        assert_eq!(rec.octet_output_buffer(), vec![b'a', b'b']);
+
+        // Binary: raw BOUT, no translation, NOWT bytes clamped to OMAX.
+        rec.ofmt = ASYN_FMT_BINARY;
+        rec.bout = vec![b'\\', b'r', 0x00, 0x01, 0x02];
+        rec.omax = 80;
+        rec.nowt = 4;
+        assert_eq!(
+            rec.octet_output_buffer(),
+            vec![b'\\', b'r', 0x00, 0x01],
+            "Binary writes raw BOUT untranslated, NOWT bytes"
+        );
+        // NOWT clamps to OMAX.
+        rec.omax = 3;
+        rec.nowt = 10;
+        assert_eq!(rec.octet_output_buffer(), vec![b'\\', b'r', 0x00]);
+    }
+
+    #[test]
+    fn test_tfil_special_targets() {
+        // C asynRecord.c:453-461 bracketed-token convention. Empty maps to
+        // stdout (NOT stderr), and only the bracketed names are special.
+        assert!(matches!(open_trace_file("").unwrap(), TraceFile::Stdout));
+        assert!(matches!(
+            open_trace_file("<stdout>").unwrap(),
+            TraceFile::Stdout
+        ));
+        assert!(matches!(
+            open_trace_file("<stderr>").unwrap(),
+            TraceFile::Stderr
+        ));
+        assert!(matches!(
+            open_trace_file("<errlog>").unwrap(),
+            TraceFile::Errlog
+        ));
+    }
+
+    #[test]
+    fn test_tfil_bare_names_are_file_paths() {
+        // C treats a bare "stdout"/"stderr" as a literal filename (only the
+        // bracketed tokens are special). Open them in a temp dir so the
+        // resolved sink is a File, not a console.
+        let dir = std::env::temp_dir().join(format!("asynrec_tfil_bare_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["stdout", "stderr"] {
+            let path = dir.join(name);
+            let p = path.to_str().unwrap();
+            assert!(
+                matches!(open_trace_file(p).unwrap(), TraceFile::File(_)),
+                "bare {name} must resolve to a file path, not a console sink"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tfil_path_appends_not_truncates() {
+        // C opens trace files with fopen(.., "a+"); a second open must keep
+        // earlier content rather than truncating it (File::create did).
+        let path = std::env::temp_dir().join(format!("asynrec_tfil_append_{}", std::process::id()));
+        let p = path.to_str().unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        open_trace_file(p).unwrap().write_line("first\n");
+        // Re-open (as a record re-applying TFIL would) and append more.
+        open_trace_file(p).unwrap().write_line("second\n");
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            contents, "first\nsecond\n",
+            "re-opening a trace file must append, not truncate"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

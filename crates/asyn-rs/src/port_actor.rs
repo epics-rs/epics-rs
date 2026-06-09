@@ -267,6 +267,7 @@ impl PortActor {
                 | RequestOp::Int64Read
                 | RequestOp::Float64Read
                 | RequestOp::OctetRead { .. }
+                | RequestOp::OctetReadBinary { .. }
                 | RequestOp::OctetWriteRead { .. }
                 | RequestOp::UInt32DigitalRead { .. }
                 | RequestOp::EnumRead
@@ -286,6 +287,34 @@ impl PortActor {
             RequestOp::OctetRead { buf_size } => {
                 let mut buf = vec![0u8; *buf_size];
                 let (n, eom) = self.driver.io_read_octet_eom(user, &mut buf)?;
+                buf.truncate(n);
+                Ok(RequestResult::octet_read_eom(buf, n, eom.bits()))
+            }
+            RequestOp::OctetWriteBinary { data } => {
+                // C parity: asynRecord binary output (asynRecord.c:1528-1541).
+                // Save the driver's output EOS, clear it for the raw write,
+                // and restore it on every exit path so a configured OEOS does
+                // not append terminator bytes to a binary payload. The actor
+                // owns the bracket atomically under its serial dispatch.
+                let saved = self.driver.get_output_eos();
+                self.driver.set_output_eos(&[])?;
+                let res = self.driver.io_write_octet(user, data);
+                let _ = self.driver.set_output_eos(&saved);
+                res?;
+                Ok(RequestResult::write_ok())
+            }
+            RequestOp::OctetReadBinary { buf_size } => {
+                // C parity: asynRecord binary input (asynRecord.c:1564-1577).
+                // Save the driver's input EOS, clear it for the read, and
+                // restore it on every exit path so a configured IEOS does not
+                // stop the read early or strip bytes belonging to the binary
+                // payload.
+                let saved = self.driver.get_input_eos();
+                self.driver.set_input_eos(&[])?;
+                let mut buf = vec![0u8; *buf_size];
+                let res = self.driver.io_read_octet_eom(user, &mut buf);
+                let _ = self.driver.set_input_eos(&saved);
+                let (n, eom) = res?;
                 buf.truncate(n);
                 Ok(RequestResult::octet_read_eom(buf, n, eom.bits()))
             }
@@ -770,6 +799,104 @@ mod tests {
         let user = AsynUser::new(2).with_timeout(Duration::from_secs(1));
         let result = send_and_wait(&tx, RequestOp::OctetRead { buf_size: 256 }, user).unwrap();
         assert_eq!(&result.data.unwrap()[..5], b"hello");
+    }
+
+    /// C parity: asynRecord binary I/O (asynRecord.c:1528-1577) saves the
+    /// driver EOS, clears it for the raw transfer, and restores it. The
+    /// OctetWriteBinary/OctetReadBinary ops must observe an empty EOS during
+    /// the binary transfer and leave the configured EOS intact afterward.
+    #[test]
+    fn actor_octet_binary_io_suppresses_and_restores_eos() {
+        struct EosObserver {
+            base: PortDriverBase,
+            write_eos: Arc<parking_lot::Mutex<Vec<u8>>>,
+            read_eos: Arc<parking_lot::Mutex<Vec<u8>>>,
+        }
+        impl PortDriver for EosObserver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn io_write_octet(&mut self, _user: &mut AsynUser, _data: &[u8]) -> AsynResult<()> {
+                *self.write_eos.lock() = self.base().output_eos.clone();
+                Ok(())
+            }
+            fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+                *self.read_eos.lock() = self.base().input_eos.clone();
+                let resp = [0x01u8, 0x02];
+                let n = resp.len().min(buf.len());
+                buf[..n].copy_from_slice(&resp[..n]);
+                Ok(n)
+            }
+        }
+
+        let write_eos = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let read_eos = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let tx = spawn_actor(EosObserver {
+            base: PortDriverBase::new("eos_test", 1, PortFlags::default()),
+            write_eos: write_eos.clone(),
+            read_eos: read_eos.clone(),
+        });
+        let mk = || AsynUser::new(0).with_timeout(Duration::from_secs(1));
+
+        send_and_wait(
+            &tx,
+            RequestOp::SetOutputEos {
+                eos: b"\r\n".to_vec(),
+            },
+            mk(),
+        )
+        .unwrap();
+        send_and_wait(
+            &tx,
+            RequestOp::SetInputEos {
+                eos: b"\n".to_vec(),
+            },
+            mk(),
+        )
+        .unwrap();
+
+        // Binary transfers observe a suppressed EOS.
+        send_and_wait(
+            &tx,
+            RequestOp::OctetWriteBinary {
+                data: vec![0x00, 0x01],
+            },
+            mk(),
+        )
+        .unwrap();
+        assert!(
+            write_eos.lock().is_empty(),
+            "binary write must see the output EOS suppressed"
+        );
+        send_and_wait(&tx, RequestOp::OctetReadBinary { buf_size: 16 }, mk()).unwrap();
+        assert!(
+            read_eos.lock().is_empty(),
+            "binary read must see the input EOS suppressed"
+        );
+
+        // A subsequent non-binary transfer sees the restored EOS.
+        send_and_wait(
+            &tx,
+            RequestOp::OctetWrite {
+                data: b"x".to_vec(),
+            },
+            mk(),
+        )
+        .unwrap();
+        assert_eq!(
+            &*write_eos.lock(),
+            b"\r\n",
+            "output EOS must be restored after a binary write"
+        );
+        send_and_wait(&tx, RequestOp::OctetRead { buf_size: 16 }, mk()).unwrap();
+        assert_eq!(
+            &*read_eos.lock(),
+            b"\n",
+            "input EOS must be restored after a binary read"
+        );
     }
 
     /// C parity: asynOctetSyncIO::writeRead (asynOctetSyncIO.c:250)

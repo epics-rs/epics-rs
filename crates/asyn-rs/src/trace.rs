@@ -217,6 +217,14 @@ bitflags! {
 pub enum TraceFile {
     Stderr,
     Stdout,
+    /// EPICS errlog sink. C asyn maps the trace file pointer `NULL`
+    /// (`fd == 0`, the `<errlog>` token in asynRecord.c:456) to
+    /// `errlogPrintf`, which routes through the central error logger and
+    /// is async-signal safe. This port has no errlog ring buffer, so the
+    /// faithful console behaviour is stderr (errlog's default sink); the
+    /// distinct variant preserves the `<errlog>` routing decision so a
+    /// later errlog wiring need only change this arm.
+    Errlog,
     File(Arc<Mutex<std::fs::File>>),
 }
 
@@ -224,7 +232,7 @@ impl TraceFile {
     /// Write a complete line atomically (single write_all call under lock).
     pub fn write_line(&self, line: &str) {
         match self {
-            TraceFile::Stderr => {
+            TraceFile::Stderr | TraceFile::Errlog => {
                 let _ = std::io::stderr().write_all(line.as_bytes());
             }
             TraceFile::Stdout => {
@@ -684,6 +692,29 @@ impl TraceManager {
         }
     }
 
+    /// Per-device variant of [`Self::set_io_truncate_size`].
+    ///
+    /// C parity: `setTraceIOTruncateSize` (asynManager.c:2929-2957) writes
+    /// the truncate size into the device `dpCommon` resolved by
+    /// `findTracePvt` when the asynUser carries a device, and announces
+    /// `asynExceptionTraceIOTruncateSize` per device.
+    pub fn set_device_io_truncate_size(&self, port: &str, addr: i32, size: usize) {
+        if let Ok(mut configs) = self.device_configs.lock() {
+            configs
+                .entry((port.to_string(), addr))
+                .or_insert_with(TraceConfig::default)
+                .io_truncate_size = size;
+        }
+        let sink = self.exception_sink.lock().ok().and_then(|g| g.clone());
+        if let Some(sink) = sink {
+            sink.announce(&ExceptionEvent {
+                port_name: port.to_string(),
+                exception: AsynException::TraceIoTruncateSize,
+                addr,
+            });
+        }
+    }
+
     pub fn get_trace_mask(&self, port: Option<&str>) -> TraceMask {
         if let Some(name) = port {
             if let Ok(configs) = self.port_configs.lock() {
@@ -710,6 +741,23 @@ impl TraceManager {
             .lock()
             .map(|c| c.trace_io_mask)
             .unwrap_or(TraceIoMask::ASCII)
+    }
+
+    /// C parity: `getTraceInfoMask` (asynManager.c) — the per-port trace
+    /// info mask, falling back to the global default. Read by
+    /// `monitorStatus` (asynRecord.c:1079) to refresh `TINM`/`TINB0..3`.
+    pub fn get_trace_info_mask(&self, port: Option<&str>) -> TraceInfoMask {
+        if let Some(name) = port {
+            if let Ok(configs) = self.port_configs.lock() {
+                if let Some(cfg) = configs.get(name) {
+                    return cfg.trace_info_mask;
+                }
+            }
+        }
+        self.global_config
+            .lock()
+            .map(|c| c.trace_info_mask)
+            .unwrap_or(TraceInfoMask::TIME | TraceInfoMask::PORT)
     }
 }
 

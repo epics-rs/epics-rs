@@ -70,6 +70,11 @@ pub fn casr_command(stats: Arc<ServerStats>) -> CommandDef {
                 ctx.println(&format!(
                     "    subscriptions: {subs_active} active; bytes in={bytes_in}, out={bytes_out}"
                 ));
+                let ev_posted = stats.subscription_events_posted.load(Relaxed);
+                let ev_processed = stats.subscription_events_processed.load(Relaxed);
+                ctx.println(&format!(
+                    "    subscription events: {ev_posted} posted, {ev_processed} processed total"
+                ));
             }
             Ok(CommandOutcome::Continue)
         },

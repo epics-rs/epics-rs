@@ -190,6 +190,7 @@ pub enum ServerConnectionEvent {
     },
 }
 
+use super::LongStringMode;
 use crate::protocol::*;
 use crate::server::monitor::{FlowControlGate, spawn_monitor_sender};
 use epics_base_rs::error::CaResult;
@@ -292,14 +293,15 @@ struct ChannelEntry {
     /// the task finishes (`Arc` so the spawned task can clear it
     /// without re-borrowing `state.channels`).
     put_notify_busy: Arc<AtomicBool>,
-    /// client appended `$` to the field name, requesting the
-    /// full string as a `DBR_CHAR` array (C `dbChannel.c:483-507`
-    /// long-string convention). When true, every GET/monitor
-    /// delivery converts `EpicsValue::String` → `EpicsValue::CharArray`
-    /// with a NUL terminator before DBR encoding, and the channel's
-    /// native type and element count are overridden to `DBR_CHAR` /
-    /// `MAX_STRING_SIZE` (= 40) at channel-create time.
-    long_string: bool,
+    /// long-string boundary conversion this channel applies on every
+    /// GET/monitor delivery (and the matching native-type override set
+    /// at channel-create time). `DollarChar` = client appended `$` to a
+    /// `DBF_STRING` field (C `dbChannel.c:483-507`): delivered as a
+    /// `DBR_CHAR[40]` array. `NativeString` = plain access to a
+    /// long-string *record* field (lsi/lso VAL & OVAL, printf VAL),
+    /// which C `cvt_dbaddr` presents as a scalar `DBF_STRING`. `Plain`
+    /// for every other channel.
+    long_string_mode: LongStringMode,
 }
 
 impl ChannelEntry {
@@ -351,11 +353,10 @@ struct SubscriptionEntry {
     /// access can resume the same camonitor).
     denied: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
-    /// mirrors `ChannelEntry::long_string`; stored here so the
+    /// mirrors `ChannelEntry::long_string_mode`; stored here so the
     /// access-restore path and `reeval_access_rights` can apply the
-    /// same `EpicsValue::String` → `EpicsValue::CharArray` conversion
-    /// without re-borrowing the channel entry.
-    long_string: bool,
+    /// same boundary conversion without re-borrowing the channel entry.
+    long_string_mode: LongStringMode,
 }
 
 struct ClientState {
@@ -439,6 +440,13 @@ struct ClientState {
     /// only the channel-scoped tasks on CLEAR_CHANNEL without
     /// disturbing other channels' in-flight WRITE_NOTIFYs.
     write_notify_tasks: Vec<(u32, tokio::task::AbortHandle)>,
+    /// Server-wide stats handle, cloned into each monitor task so the
+    /// `subscription_events_posted` / `subscription_events_processed`
+    /// counters (PCAS `caServer` parity, feeding the gateway's
+    /// `serverPostRate` / `serverEventRate`) advance from the delivery
+    /// layer. `None` in unit tests that drive the TCP path without a
+    /// full `ServerStats` wired up.
+    stats: Option<Arc<super::ca_server::ServerStats>>,
 }
 
 impl ClientState {
@@ -474,6 +482,7 @@ impl ClientState {
             #[cfg(feature = "cap-tokens")]
             tls_channel_binding: None,
             write_notify_tasks: Vec::new(),
+            stats: None,
         }
     }
 
@@ -1233,6 +1242,7 @@ where
     // headroom for follow-on monitor events queued in the same tick.
     let writer = Arc::new(Mutex::new(BufWriter::with_capacity(64 * 1024, writer)));
     let mut state = ClientState::new(acf, tcp_port, db.clone());
+    state.stats = stats.clone();
     #[cfg(feature = "cap-tokens")]
     {
         state.cap_token_verifier = cap_token_verifier;
@@ -2078,7 +2088,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             if let Some(entry) = db.find_entry_from(record_path, Some(peer)).await {
                 let sid = state.alloc_sid();
 
-                let (dbr_type, element_count, target) = match entry {
+                let (dbr_type, element_count, target, long_string_mode) = match entry {
                     PvEntry::Simple(pv) => {
                         let value = pv.get().await;
                         // `$` long-string — C dbChannel.c:486-503 requires the
@@ -2087,7 +2097,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         // string C overrides the channel to DBF_CHAR with
                         // `no_elements = field_size` (= 40). This must match the
                         // RecordField arm below, because the channel stores
-                        // `long_string` and every delivery path runs
+                        // its `LongStringMode` and every delivery path runs
                         // `apply_long_string` to convert the value to CHAR[40];
                         // advertising the native DBR_STRING/1 here would
                         // mis-size the client buffer against the delivered data.
@@ -2098,12 +2108,21 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             w.write_all(&fail.to_bytes()).await?;
                             return Ok(());
                         }
-                        let (dbr_type_val, element_count) = if long_string {
-                            (DbFieldType::Char, 40u32)
+                        let (dbr_type_val, element_count, mode) = if long_string {
+                            (DbFieldType::Char, 40u32, LongStringMode::DollarChar)
                         } else {
-                            (value.dbr_type(), value.count() as u32)
+                            (
+                                value.dbr_type(),
+                                value.count() as u32,
+                                LongStringMode::Plain,
+                            )
                         };
-                        (dbr_type_val, element_count, ChannelTarget::SimplePv(pv))
+                        (
+                            dbr_type_val,
+                            element_count,
+                            ChannelTarget::SimplePv(pv),
+                            mode,
+                        )
                     }
                     PvEntry::Record(rec) => {
                         let instance = rec.read().await;
@@ -2126,8 +2145,24 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 // C sets `paddr->field_type = DBF_CHAR`,
                                 // `paddr->dbr_field_type = DBR_CHAR`, and
                                 // `paddr->no_elements = paddr->field_size` (= 40).
-                                let (dbr_type_val, element_count) = if long_string {
-                                    (DbFieldType::Char, 40u32)
+                                let (dbr_type_val, element_count, mode) = if long_string {
+                                    (DbFieldType::Char, 40u32, LongStringMode::DollarChar)
+                                } else if instance
+                                    .record
+                                    .long_string_fields()
+                                    .contains(&field.as_str())
+                                {
+                                    // Long-string *record* field (lsi/lso VAL &
+                                    // OVAL, printf VAL). C `cvt_dbaddr` presents
+                                    // it as a scalar `DBF_STRING` with
+                                    // `no_elements = 1` (lsiRecord.c:141-143,
+                                    // lsoRecord.c:183-185, printfRecord.c:411-413);
+                                    // the full long value is reachable only via
+                                    // the `$` modifier (handled above). The record
+                                    // stores the value as a CHAR-array carrier, so
+                                    // every delivery path decodes it to a scalar
+                                    // string with `apply_native_long_string`.
+                                    (DbFieldType::String, 1u32, LongStringMode::NativeString)
                                 } else if field == "VAL"
                                     && instance.record.record_type() == "waveform"
                                 {
@@ -2142,9 +2177,9 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                             _ => None,
                                         })
                                         .unwrap_or(v.count() as u32);
-                                    (v.dbr_type(), nelm)
+                                    (v.dbr_type(), nelm, LongStringMode::Plain)
                                 } else {
-                                    (v.dbr_type(), v.count() as u32)
+                                    (v.dbr_type(), v.count() as u32, LongStringMode::Plain)
                                 };
                                 (
                                     dbr_type_val,
@@ -2153,6 +2188,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                         record: rec.clone(),
                                         field: field.clone(),
                                     },
+                                    mode,
                                 )
                             }
                             None => {
@@ -2232,7 +2268,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         pv_name: pv_name.clone(),
                         filter_suffix: filter_suffix.clone(),
                         put_notify_busy: Arc::new(AtomicBool::new(false)),
-                        long_string,
+                        long_string_mode,
                     },
                 );
                 state.channel_access.insert(sid, access_level);
@@ -2499,9 +2535,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // no_elements=40; the clamp must see the 40-element array so
             // `caget -# N PV.DESC$` trims to N chars (not the pre-convert
             // count of 1 that EpicsValue::String::count() returns).
-            if entry.long_string {
-                super::apply_long_string(&mut snapshot);
-            }
+            // `NativeString` is the inverse — a long-string record field
+            // (printf/lsi/lso) decoded from its CHAR carrier to a scalar
+            // string so plain access ships one DBR_STRING (C cvt_dbaddr).
+            super::apply_long_string_mode(&mut snapshot, entry.long_string_mode);
             // Respect client's requested element count (e.g. caget -# 10)
             if requested_count > 0 && requested_count < snapshot.value.count() {
                 snapshot.value.truncate(requested_count as usize);
@@ -3501,7 +3538,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // `state.subscriptions` so the entry borrow has to be
             // released before then).
             let sub_pv_name = entry.pv_name.clone();
-            let long_string = entry.long_string;
+            let long_string_mode = entry.long_string_mode;
 
             // EVENT_ADD must also consult the
             // channel's access_rights. A NoAccess peer mounting a
@@ -3663,10 +3700,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             match init_chain.apply_to_event_value(snap.value.clone()) {
                                 Some(v) => {
                                     snap.value = v;
-                                    // convert for `$` long-string channels.
-                                    if long_string {
-                                        super::apply_long_string(&mut snap);
-                                    }
+                                    // long-string boundary conversion
+                                    // (`$` → CHAR[40], or native record field
+                                    // → scalar DBR_STRING); no-op otherwise.
+                                    super::apply_long_string_mode(&mut snap, long_string_mode);
                                     // the initial event honours
                                     // the EVENT_ADD request count for
                                     // BOTH directions —
@@ -3689,6 +3726,19 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                         &snap,
                                     )
                                     .await?;
+                                    // Initial subscription value — C posts
+                                    // it via `db_post_single_event` at
+                                    // monitor creation (`camessage.c:1853`),
+                                    // so it counts as one posted and one
+                                    // processed subscription event (PCAS
+                                    // parity). Future updates flow through
+                                    // the monitor task below.
+                                    if let Some(ref s) = state.stats {
+                                        s.subscription_events_posted
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        s.subscription_events_processed
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
                                 }
                                 None => {}
                             }
@@ -3703,7 +3753,8 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             state.flow_control.clone(),
                             rx,
                             denied.clone(),
-                            long_string,
+                            long_string_mode,
+                            state.stats.clone(),
                         );
 
                         state.subscriptions.insert(
@@ -3716,7 +3767,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 data_count: requested_count,
                                 denied,
                                 task,
-                                long_string,
+                                long_string_mode,
                             },
                         );
                         if let Some(tx) = conn_events {
@@ -3804,10 +3855,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 match init_chain.apply_to_event_value(snap.value.clone()) {
                                     Some(v) => {
                                         snap.value = v;
-                                        // convert for `$` long-string channels.
-                                        if long_string {
-                                            super::apply_long_string(&mut snap);
-                                        }
+                                        // long-string boundary conversion
+                                        // (`$` → CHAR[40], or native record
+                                        // field → scalar DBR_STRING).
+                                        super::apply_long_string_mode(&mut snap, long_string_mode);
                                         Some(snap)
                                     }
                                     None => None,
@@ -3878,6 +3929,17 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 &snap,
                             )
                             .await?;
+                            // Initial subscription value posted and
+                            // processed (C `db_post_single_event` at
+                            // monitor creation, `camessage.c:1853`); PCAS
+                            // parity. Later updates flow through the
+                            // monitor task below.
+                            if let Some(ref s) = state.stats {
+                                s.subscription_events_posted
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                s.subscription_events_processed
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                         }
 
                         let writer_clone = writer.clone();
@@ -3885,6 +3947,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         let record_for_task = record.clone();
                         let denied = Arc::new(AtomicBool::new(access_denied));
                         let denied_for_task = denied.clone();
+                        let stats_for_task = state.stats.clone();
                         let task = epics_base_rs::runtime::task::spawn(async move {
                             let mut rx = rx;
                             loop {
@@ -3917,6 +3980,17 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                     };
                                     event = coalesced;
                                 }
+                                // One subscription update committed for
+                                // delivery this cycle (post-coalesce).
+                                // PCAS `subscriptionEventsPosted` parity —
+                                // counted before the read-access gate so a
+                                // suppressed delivery reads as
+                                // posted-but-not-processed, the same
+                                // `serverPostRate` > `serverEventRate`
+                                // divergence the gateway expects.
+                                if let Some(ref s) = stats_for_task {
+                                    s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
+                                }
                                 // C `casAccessRightsCB`
                                 // (`rsrv/camessage.c:1080-1095`)
                                 // suppresses delivery via
@@ -3945,11 +4019,13 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                             .to_string(),
                                     );
                                 }
-                                // convert String → CharArray+NUL for
-                                // `$` long-string channels before encoding.
-                                if long_string {
-                                    super::apply_long_string(&mut event.snapshot);
-                                }
+                                // long-string boundary conversion before
+                                // encoding: `$` → CHAR[40]+NUL, or a native
+                                // record field → scalar DBR_STRING.
+                                super::apply_long_string_mode(
+                                    &mut event.snapshot,
+                                    long_string_mode,
+                                );
                                 let mut payload_bytes =
                                     match encode_dbr(requested_type, &event.snapshot) {
                                         Ok(bytes) => bytes,
@@ -4011,6 +4087,13 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                     break;
                                 }
                                 let _ = w.flush().await;
+                                // Frame written to the client — PCAS
+                                // `subscriptionEventsProcessed` parity
+                                // (gateway `serverEventRate`).
+                                if let Some(ref s) = stats_for_task {
+                                    s.subscription_events_processed
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         });
 
@@ -4027,7 +4110,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                                 data_count: requested_count,
                                 denied,
                                 task,
-                                long_string,
+                                long_string_mode,
                             },
                         );
                         if let Some(tx) = conn_events {
@@ -4756,7 +4839,7 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
             // at the live `snapshot.value.count()`, only truncating
             // and never padding.
             for sub_id in &affected {
-                let (target, data_type, data_count, sub_id_val, sub_long_string) = {
+                let (target, data_type, data_count, sub_id_val, sub_long_string_mode) = {
                     let Some(sub) = state.subscriptions.get(sub_id) else {
                         continue;
                     };
@@ -4766,7 +4849,7 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                         sub.data_type,
                         sub.data_count,
                         sub.sub_id,
-                        sub.long_string,
+                        sub.long_string_mode,
                     )
                 };
                 if let Some(mut snap) = get_full_snapshot(&target).await {
@@ -4790,11 +4873,19 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
                             None => continue,
                         }
                     }
-                    // convert for `$` long-string channels.
-                    if sub_long_string {
-                        super::apply_long_string(&mut snap);
-                    }
+                    // long-string boundary conversion (`$` → CHAR[40], or
+                    // native record field → scalar DBR_STRING).
+                    super::apply_long_string_mode(&mut snap, sub_long_string_mode);
                     send_monitor_snapshot(writer, sub_id_val, data_type, data_count, &snap).await?;
+                    // Access-restore post — C `db_event_enable` then
+                    // `db_post_single_event` (`camessage.c:1086-1088`):
+                    // one posted and one processed subscription event,
+                    // same PCAS accounting as the initial value.
+                    if let Some(ref s) = state.stats {
+                        s.subscription_events_posted.fetch_add(1, Ordering::Relaxed);
+                        s.subscription_events_processed
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }

@@ -359,6 +359,21 @@ pub struct ServerStats {
     /// teardowns. Subtract from opened for the live subscription
     /// count.
     pub subscriptions_closed_total: std::sync::atomic::AtomicU64,
+    /// Cumulative monitor events posted to client subscriptions since
+    /// startup — counted once per subscription update the server
+    /// dequeues for delivery (the initial value post plus every later
+    /// monitor event). The PCAS `caServer::subscriptionEventsPosted()`
+    /// counter; the CA gateway derives `serverPostRate` from its delta
+    /// (ca-gateway `gateServer.cc:2147-2148`). RSRV has no equivalent —
+    /// this is a portable-CA-server (gateway) concept.
+    pub subscription_events_posted: std::sync::atomic::AtomicU64,
+    /// Cumulative monitor events processed (successfully written to a
+    /// client) since startup. Trails `subscription_events_posted` when a
+    /// dequeued event is suppressed before the wire (read access denied)
+    /// or the client write fails mid-delivery. The PCAS
+    /// `caServer::subscriptionEventsProcessed()` counter; the CA gateway
+    /// derives `serverEventRate` from its delta (same C site).
+    pub subscription_events_processed: std::sync::atomic::AtomicU64,
 }
 
 impl ServerStats {

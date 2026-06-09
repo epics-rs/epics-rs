@@ -790,7 +790,7 @@ impl PvDatabase {
         // produces local processing time. Mirrors pvxs
         // `pvalink_lset.cpp:427`.
         let inp_link_remote_time: Option<(i64, i32, u64)> = match inp_parsed.external_pv_name() {
-            Some(name) => self.external_link_time(name).await,
+            Some(name) => self.external_link_time(&name).await,
             None => None,
         };
 
@@ -2992,7 +2992,7 @@ impl PvDatabase {
                     .external_pv_name()
                     .expect("Ca/Pva/PvaJson link carries a PV name");
                 if let Err(e) = self
-                    .write_external_pv(name, value, crate::server::database::LinkPutOp::Plain)
+                    .write_external_pv(&name, value, crate::server::database::LinkPutOp::Plain)
                     .await
                 {
                     eprintln!("SIOL simulation write to external PV '{name}' failed: {e}");

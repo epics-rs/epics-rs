@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::types::EpicsValue;
 
 /// Link processing policy for input/output links.
@@ -157,6 +159,71 @@ pub struct PvaJsonLink {
     /// case [`parse_link_v2`] yields a plain [`ParsedLink::Pva`] rather
     /// than this variant.
     pub options: Vec<(String, JlinkValue)>,
+}
+
+impl PvaJsonLink {
+    /// Stable per-link identity key for the base→bridge link-set
+    /// boundary — `pv` plus a canonical encoding of this link's options.
+    ///
+    /// Two structured `{pva:{pv:"SRC",…}}` links to the SAME PV that
+    /// differ only by options (`field`, `Q`, `pipeline`, …) are distinct
+    /// links and must keep distinct `pvaLinkConfig`s (pvxs
+    /// `ioc/pvalink.h:65` — config is per-`pvaLink`; the shared channel
+    /// is keyed separately by `(channelName, pvRequest)`,
+    /// `ioc/pvalink.h:116`). The pvalink resolver caches each link's
+    /// config under the string it is handed at resolve time; handing it
+    /// the bare `pv` collapses every same-PV link onto one cache slot
+    /// (last-writer-wins). This key restores per-link identity while the
+    /// resolver still shares channels by bare PV + `(pipeline, Q)`.
+    ///
+    /// Delegates to [`pvajson_identity_key`] so the bridge can compute
+    /// the identical key from the same `(pv, options)` at registration.
+    pub fn link_identity_key(&self) -> String {
+        pvajson_identity_key(&self.pv, &self.options)
+    }
+}
+
+/// Separator byte between the bare `pv` and the encoded options in a
+/// [`pvajson_identity_key`]. ASCII Unit Separator (`\u{1f}`) — a control
+/// byte that cannot occur in a PV name or a `?key=value` user URI, so the
+/// bridge can recover the bare PV by splitting on it and never confuses an
+/// identity key for a convenience-URI query. Shared so base (the key
+/// producer) and the bridge resolver (the key consumer) cannot drift.
+pub const PVAJSON_IDENTITY_SEP: char = '\u{1f}';
+
+/// Build the stable link-identity key for a structured pvalink from its
+/// `pv` and parsed JLink options — see [`PvaJsonLink::link_identity_key`].
+///
+/// The encoding is INTERNAL to the base↔bridge link-set boundary and is
+/// deliberately NOT pvxs link syntax and NOT a `?key=value` user URI:
+/// the bare `pv` is the prefix up to the first [`PVAJSON_IDENTITY_SEP`],
+/// followed by the options encoded `key=kind:value` and joined by the same
+/// separator. Sorting makes the key canonical regardless of option
+/// order. A separator the resolver never lenient-parses as a query is
+/// what keeps this distinct from the convenience-URI path (so a
+/// structured option is never re-read through the URI applier).
+pub fn pvajson_identity_key(pv: &str, options: &[(String, JlinkValue)]) -> String {
+    if options.is_empty() {
+        return pv.to_string();
+    }
+    let mut pairs: Vec<String> = options
+        .iter()
+        .map(|(k, v)| match v {
+            JlinkValue::Null => format!("{k}=n"),
+            JlinkValue::Bool(b) => format!("{k}=b:{b}"),
+            JlinkValue::Int(n) => format!("{k}=i:{n}"),
+            JlinkValue::Str(s) => format!("{k}=s:{s}"),
+        })
+        .collect();
+    pairs.sort();
+    let mut key =
+        String::with_capacity(pv.len() + 1 + pairs.iter().map(|p| p.len() + 1).sum::<usize>());
+    key.push_str(pv);
+    for p in &pairs {
+        key.push(PVAJSON_IDENTITY_SEP);
+        key.push_str(p);
+    }
+    key
 }
 
 /// Configuration for a `lnkCalc` link.
@@ -325,16 +392,24 @@ impl ParsedLink {
         )
     }
 
-    /// PV name of an external (`Ca`/`Pva`/`PvaJson`) link, else `None`.
-    /// Lets a caller read the remote channel name uniformly without
-    /// matching the variants' differing payload shapes (`Ca` carries a
-    /// [`CaLink`], `Pva` a bare channel-name `String`, `PvaJson` a
-    /// [`PvaJsonLink`] with its `pv` member).
-    pub fn external_pv_name(&self) -> Option<&str> {
+    /// Boundary identity string for an external (`Ca`/`Pva`/`PvaJson`)
+    /// link, else `None` — the key the database hands the link-set when
+    /// resolving / writing / forwarding this link.
+    ///
+    /// For `Ca` and `Pva` this is the channel-name / link string verbatim
+    /// (borrowed). For `PvaJson` it is the per-link identity key
+    /// ([`PvaJsonLink::link_identity_key`], owned), NOT the bare `pv`:
+    /// two structured links to the same PV that differ by options must
+    /// resolve to their own per-link config, so the boundary key must
+    /// carry that identity (the resolver still shares the channel by bare
+    /// PV — pvxs `ioc/pvalink.h:65,116`). Callers feed the result to the
+    /// link-set, which is the only consumer; nothing relies on this
+    /// returning the bare PV name.
+    pub fn external_pv_name(&self) -> Option<Cow<'_, str>> {
         match self {
-            ParsedLink::Ca(ca) => Some(&ca.pv),
-            ParsedLink::Pva(name) => Some(name),
-            ParsedLink::PvaJson(j) => Some(&j.pv),
+            ParsedLink::Ca(ca) => Some(Cow::Borrowed(ca.pv.as_str())),
+            ParsedLink::Pva(name) => Some(Cow::Borrowed(name.as_str())),
+            ParsedLink::PvaJson(j) => Some(Cow::Owned(j.link_identity_key())),
             _ => None,
         }
     }
@@ -1344,13 +1419,47 @@ mod json_link_tests {
         );
     }
 
-    /// `external_pv_name` reads the channel name from a PvaJson link.
+    /// `external_pv_name` returns a PvaJson link's per-link identity key
+    /// (pv + canonical options), not the bare PV — so two same-PV links
+    /// that differ by options resolve to distinct configs.
     #[test]
     fn pva_json_external_pv_name() {
         let link = parse_link_v2(r#"{pva: {pv: "TARGET:AI", proc: "CP"}}"#);
-        assert_eq!(link.external_pv_name(), Some("TARGET:AI"));
+        let key = link.external_pv_name().expect("PvaJson carries a key");
+        assert_eq!(key.as_ref(), "TARGET:AI\u{1f}proc=s:CP");
         assert_eq!(link.link_type(), LinkType::Ca);
         assert!(link.is_writable_out_link());
+    }
+
+    /// Two structured links to the SAME PV differing only by options get
+    /// DISTINCT identity keys (the per-link cache key); the bare PV is
+    /// the prefix up to the first separator so the resolver can still
+    /// recover the shared channel identity.
+    #[test]
+    fn pva_json_identity_key_separates_same_pv_links() {
+        let a = match parse_link_v2(r#"{pva: {pv: "SRC", field: "value", Q: 64}}"#) {
+            ParsedLink::PvaJson(j) => j,
+            other => panic!("expected PvaJson, got {other:?}"),
+        };
+        let b = match parse_link_v2(r#"{pva: {pv: "SRC", field: "alarm.severity", Q: 1}}"#) {
+            ParsedLink::PvaJson(j) => j,
+            other => panic!("expected PvaJson, got {other:?}"),
+        };
+        assert_ne!(
+            a.link_identity_key(),
+            b.link_identity_key(),
+            "same-PV links with different options must not collide"
+        );
+        // Both keys start with the bare PV up to the first separator.
+        assert_eq!(a.link_identity_key().split('\u{1f}').next(), Some("SRC"));
+        assert_eq!(b.link_identity_key().split('\u{1f}').next(), Some("SRC"));
+        // Option order is canonicalized: the same options in a different
+        // source order yield the same key.
+        let c = match parse_link_v2(r#"{pva: {pv: "SRC", Q: 64, field: "value"}}"#) {
+            ParsedLink::PvaJson(j) => j,
+            other => panic!("expected PvaJson, got {other:?}"),
+        };
+        assert_eq!(a.link_identity_key(), c.link_identity_key());
     }
 
     /// Bare pvalink JSON with no extra options is unchanged.

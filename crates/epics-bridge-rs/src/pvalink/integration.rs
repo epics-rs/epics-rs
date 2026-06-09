@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use epics_base_rs::server::database::{ExternalPvResolver, LinkPutOp, LinkSet, PvDatabase};
-use epics_base_rs::server::record::JlinkValue;
+use epics_base_rs::server::record::{JlinkValue, PVAJSON_IDENTITY_SEP, pvajson_identity_key};
 use epics_base_rs::types::EpicsValue;
 use epics_pva_rs::pvdata::{PvField, ScalarValue};
 
@@ -302,11 +302,16 @@ impl PvaLinkResolver {
     /// the structured pvxs-parity JSON longhand `{pva:{pv,…}}`
     /// (`epics_base_rs` `PvaJsonLink`). The options arrive as JLink
     /// members, not a `?key=value` query (BRIDGE-RS-2026-05-28-107), and
-    /// the per-link config is keyed by the BARE PV name — epics-base-rs
-    /// resolves a `PvaJson` INP link through `resolve_external_pv(&j.pv)`
+    /// the per-link config is keyed by the per-link IDENTITY KEY
+    /// (`pvajson_identity_key`) — epics-base-rs resolves a `PvaJson` link
+    /// through `external_pv_name()` → `link_identity_key()`
     /// (`server/database/links.rs`), so the steady-state lset hot path
-    /// looks the config up by bare PV. `record` is bound as a CP/CPP
-    /// scan-on-update target exactly as the convenience-URI path does.
+    /// looks the config up by that same key. Keying by the bare PV would
+    /// collapse two same-PV structured links onto one cache slot
+    /// (last-writer-wins), losing each link's `field`/`Q`/`pipeline`
+    /// (pvxs per-link `pvaLinkConfig`, ioc/pvalink.h:65). `record` is
+    /// bound as a CP/CPP scan-on-update target exactly as the
+    /// convenience-URI path does.
     pub async fn open_json_link_for_record(
         &self,
         pv: &str,
@@ -314,7 +319,8 @@ impl PvaLinkResolver {
         record: &str,
     ) -> PvaLinkResult<Arc<PvaLink>> {
         let cfg = PvaLinkConfig::from_jlink_options(pv, options, LinkDirection::Inp)?;
-        self.open_inp_cfg(cfg, pv.to_string(), Some(record.to_string()))
+        let options_key = pvajson_identity_key(pv, options);
+        self.open_inp_cfg(cfg, options_key, Some(record.to_string()))
             .await
     }
 
@@ -323,7 +329,8 @@ impl PvaLinkResolver {
     /// its monitor-notification forwarder. The single owner shared by
     /// the convenience-URI path ([`Self::open_link_inner`], keyed by the
     /// full link string) and the pvxs-parity JSON path
-    /// ([`Self::open_json_link_for_record`], keyed by the bare PV name).
+    /// ([`Self::open_json_link_for_record`], keyed by the per-link
+    /// identity key).
     async fn open_inp_cfg(
         &self,
         cfg: PvaLinkConfig,
@@ -346,8 +353,11 @@ impl PvaLinkResolver {
         // Register the per-link options under the caller-chosen key:
         // the full scheme-stripped link string for the convenience-URI
         // path (two links to the same PV with different options each keep
-        // their own entry), or the bare PV name for the pvxs-parity JSON
-        // path (the name epics-base-rs hands the lset at resolve time).
+        // their own entry), or the per-link identity key
+        // (`pvajson_identity_key`) for the pvxs-parity JSON path (the same
+        // key epics-base-rs hands the lset at resolve time via
+        // `external_pv_name()` → `link_identity_key()`). Both forms keep
+        // two same-PV links with differing options on distinct entries.
         // pvxs equivalent: each `pvaLink` carries its own `pvaLinkConfig`
         // (`pvxs/ioc/pvalink.h:65`). The registry key shares the channel
         // by (pv_name, pipeline, queue_size) per `pvxs/ioc/pvalink.h:116`.
@@ -633,9 +643,11 @@ impl PvaLinkResolver {
     /// OUT link from the structured pvxs-parity JSON longhand
     /// (`epics_base_rs` `PvaJsonLink`), reading options as JLink members
     /// rather than a `?key=value` query (BRIDGE-RS-2026-05-28-107). Keyed
-    /// by the bare PV name — epics-base-rs writes a `PvaJson` OUT link
-    /// through `external_pv_name()` → `j.pv` (`server/database/links.rs`),
-    /// so `put_value` looks the config up by bare PV.
+    /// by the per-link IDENTITY KEY (`pvajson_identity_key`) — epics-base-rs
+    /// writes a `PvaJson` OUT link through `external_pv_name()` →
+    /// `link_identity_key()` (`server/database/links.rs`), so `put_value`
+    /// looks the config up by that same key (two same-PV structured OUT
+    /// links keep distinct `field`/`proc`/`defer` configs).
     pub async fn open_json_out_link(
         &self,
         pv: &str,
@@ -643,14 +655,15 @@ impl PvaLinkResolver {
         record: Option<&str>,
     ) -> PvaLinkResult<Arc<PvaLink>> {
         let cfg = PvaLinkConfig::from_jlink_options(pv, options, LinkDirection::Out)?;
-        self.open_out_cfg(cfg, pv.to_string(), record).await
+        let options_key = pvajson_identity_key(pv, options);
+        self.open_out_cfg(cfg, options_key, record).await
     }
 
     /// Register an OUT link's options under `options_key` and open/cache
     /// the link. Shared by the convenience-URI path
     /// ([`Self::open_out_link`], keyed by the full link string) and the
     /// pvxs-parity JSON path ([`Self::open_json_out_link`], keyed by the
-    /// bare PV name).
+    /// per-link identity key).
     async fn open_out_cfg(
         &self,
         cfg: PvaLinkConfig,
@@ -1515,8 +1528,11 @@ fn strip_query(s: &str) -> &str {
 }
 
 /// Extract the bare upstream PV identity from a pvalink link body,
-/// dropping BOTH representations of per-link options:
-///   * the `?key=value&…` query part (JSON form), and
+/// dropping ALL THREE representations of per-link options:
+///   * the structured-JSON identity key `PV<SEP>k=kind:v<SEP>…` minted by
+///     `epics_base_rs::server::record::pvajson_identity_key` (the byte is
+///     [`PVAJSON_IDENTITY_SEP`]), and
+///   * the `?key=value&…` query part (convenience-URI form), and
 ///   * the legacy whitespace-separated trailing modifiers
 ///     (`PP`/`NPP`/`CP`/`CPP`/`MS`/`MSI`/`MSS`/`NMS` — the DBD suffix
 ///     form a record writes as `pva://TARGET MS`).
@@ -1527,11 +1543,15 @@ fn strip_query(s: &str) -> &str {
 /// remote name. A PV name never contains whitespace, so the first token
 /// after query-stripping is always the PV; `PvaLinkConfig::parse` (via
 /// `strip_legacy_mods`) remains the single owner that interprets the
-/// trailing modifiers into the per-link config. This collapses the two
-/// option representations to one PV identity uniformly, so the existing
-/// `full != bare` lazy-registration path fires for suffix links too.
+/// trailing modifiers into the per-link config. The identity-key
+/// separator is a control byte that cannot occur in a PV name or a URI,
+/// so splitting on it is unambiguous. This collapses all option
+/// representations to one PV identity uniformly, so the channel is shared
+/// by bare PV + `(pipeline, Q)` regardless of how the options were
+/// expressed.
 fn link_pv_name(s: &str) -> &str {
-    let no_query = strip_query(s);
+    let bare = s.split(PVAJSON_IDENTITY_SEP).next().unwrap_or(s);
+    let no_query = strip_query(bare);
     no_query.split_whitespace().next().unwrap_or(no_query)
 }
 
@@ -1544,10 +1564,20 @@ fn link_pv_name(s: &str) -> &str {
 /// keyed by `full` (not bare PV name) so two links to the
 /// same PV with different options each get their own entry.
 /// pvxs parity: pvalink_jlif.cpp:24-196.
+///
+/// A structured-JSON identity key (`PV<SEP>k=kind:v…`) is NEVER
+/// lazy-registered here: it is always pre-registered at link-open time
+/// (`open_json_link_for_record`) under that exact key, and lenient
+/// URI-parsing `pva://PV<SEP>…` would mis-read its `key=kind:value`
+/// payload as a `?query`. Lazy registration handles only the
+/// convenience-URI (`?query`) and legacy whitespace-suffix forms.
 fn lazy_register_inp_opts(
     link_options: &parking_lot::RwLock<std::collections::HashMap<String, PvaLinkConfig>>,
     full: &str,
 ) {
+    if full.contains(PVAJSON_IDENTITY_SEP) {
+        return;
+    }
     if link_options.read().contains_key(full) {
         return;
     }
@@ -1564,11 +1594,14 @@ fn lazy_register_inp_opts(
 
 /// Lazily register OUT link options from a query-string-bearing name
 /// into `out_link_options`. Mirrors `lazy_register_inp_opts` for the
-/// OUT direction.
+/// OUT direction, including the structured-JSON identity-key guard.
 fn lazy_register_out_opts(
     out_link_options: &parking_lot::RwLock<std::collections::HashMap<String, PvaLinkConfig>>,
     full: &str,
 ) {
+    if full.contains(PVAJSON_IDENTITY_SEP) {
+        return;
+    }
     if out_link_options.read().contains_key(full) {
         return;
     }
@@ -3302,7 +3335,9 @@ mod tests {
     /// URI query parser exists in the JLink callback table).
     #[tokio::test]
     async fn br_r10_db_json_pvalink_options_preserved() {
-        use epics_base_rs::server::record::{JlinkValue, ParsedLink, PvaJsonLink, parse_link_v2};
+        use epics_base_rs::server::record::{
+            JlinkValue, ParsedLink, PvaJsonLink, parse_link_v2, pvajson_identity_key,
+        };
 
         // Part 1: the JSON longhand parses to a structured PvaJson link —
         // options as JLink members, in source order with original key
@@ -3346,11 +3381,14 @@ mod tests {
             .open_json_link_for_record(&j.pv, &j.options, "MY:RECORD")
             .await;
 
-        // options are registered under the BARE PV name — the name
-        // epics-base-rs hands the lset for a PvaJson link
-        // (`resolve_external_pv(&j.pv)`), so the steady-state hot path
-        // resolves the config by bare PV.
-        let cfg = resolver.inp_cfg_for("TARGET:AI");
+        // options are registered under the per-link IDENTITY KEY — the
+        // string epics-base-rs hands the lset for a PvaJson link
+        // (`external_pv_name()` → `link_identity_key()` →
+        // `resolve_external_pv(&key)`), so the steady-state hot path
+        // resolves the config by that same key. Computing it from the
+        // same `(pv, options)` proves base and bridge agree.
+        let key = pvajson_identity_key(&j.pv, &j.options);
+        let cfg = resolver.inp_cfg_for(&key);
         assert_eq!(
             cfg.field, "display.precision",
             "field option must be registered (was 'value' before fix)"
@@ -3361,6 +3399,10 @@ mod tests {
             cfg.scan_on_passive,
             "CPP scan_on_passive must be registered"
         );
+
+        // The bare PV is recovered from the identity key for channel
+        // sharing — `link_pv_name` strips the separator + encoded options.
+        assert_eq!(link_pv_name(&key), "TARGET:AI");
 
         // Scan target must be registered under the bare PV name.
         let targets = resolver.scan_targets.read();
@@ -3528,6 +3570,182 @@ mod tests {
             !rec_b.passive_only,
             "RECORD:B must be CP (not passive_only)"
         );
+    }
+
+    /// The STRUCTURED-JSON counterpart of
+    /// [`Self::br_r27_pvalink_cache_separates_per_link_options`]: two
+    /// `{pva:{pv:"TARGET:PV", …}}` links to the SAME PV that differ only
+    /// by their JLink options must keep independent per-link configs and
+    /// scan fan-outs.
+    ///
+    /// Before the fix the JSON path keyed `link_options` by the bare PV
+    /// (`j.pv`), so the second link's config overwrote the first
+    /// (last-writer-wins) and `resolve_external_pv(&j.pv)` returned the
+    /// same config for both records. The structural fix mints a per-link
+    /// identity key (`pvajson_identity_key`) on BOTH sides of the lset
+    /// boundary — base via `external_pv_name()` → `link_identity_key()`,
+    /// bridge at registration — so the two links never collide, while the
+    /// monitor channel is still shared by bare PV + `(pipeline, Q)`.
+    ///
+    /// Upstream parity:
+    ///   pvxs/ioc/pvalink.h:65    — `pvaLinkConfig` is per-link
+    ///   pvxs/ioc/pvalink.h:116   — channel key = (channelName, pvRequest)
+    #[tokio::test]
+    async fn br_json_links_same_pv_distinct_options_do_not_collide() {
+        use epics_base_rs::server::record::pvajson_identity_key;
+
+        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+
+        // Link A: read "alarm.severity", CPP (scan on passive).
+        let opts_a: Vec<(String, JlinkValue)> = vec![
+            (
+                "field".to_string(),
+                JlinkValue::Str("alarm.severity".to_string()),
+            ),
+            ("proc".to_string(), JlinkValue::Str("CPP".to_string())),
+        ];
+        // Link B: read "value", CP (always scan).
+        let opts_b: Vec<(String, JlinkValue)> = vec![
+            ("field".to_string(), JlinkValue::Str("value".to_string())),
+            ("proc".to_string(), JlinkValue::Str("CP".to_string())),
+        ];
+        let _ = resolver
+            .open_json_link_for_record("TARGET:PV", &opts_a, "RECORD:A")
+            .await;
+        let _ = resolver
+            .open_json_link_for_record("TARGET:PV", &opts_b, "RECORD:B")
+            .await;
+
+        // Each link resolves its own config by its identity key — the same
+        // key base hands the lset at resolve time.
+        let key_a = pvajson_identity_key("TARGET:PV", &opts_a);
+        let key_b = pvajson_identity_key("TARGET:PV", &opts_b);
+        assert_ne!(key_a, key_b, "distinct options must mint distinct keys");
+        let cfg_a = resolver.inp_cfg_for(&key_a);
+        let cfg_b = resolver.inp_cfg_for(&key_b);
+        assert_eq!(
+            cfg_a.field, "alarm.severity",
+            "link A field must not be overwritten by link B (was the bug)"
+        );
+        assert_eq!(cfg_b.field, "value", "link B field must retain its own");
+        assert!(
+            cfg_a.scan_on_passive,
+            "link A CPP must set scan_on_passive; link B's CP must not clobber it"
+        );
+        assert!(
+            !cfg_b.scan_on_passive,
+            "link B CP must not be passive-only; link A must not propagate"
+        );
+
+        // The shared channel identity is still the bare PV for both.
+        assert_eq!(link_pv_name(&key_a), "TARGET:PV");
+        assert_eq!(link_pv_name(&key_b), "TARGET:PV");
+
+        // Scan fan-out for the shared (bare PV, default Q) monitor holds
+        // both records, each with its own proc mode.
+        let targets = resolver.scan_targets.read();
+        let fanout = targets
+            .get(&mk("TARGET:PV"))
+            .expect("scan targets registered for TARGET:PV");
+        let rec_a = fanout
+            .records
+            .iter()
+            .find(|t| t.record == "RECORD:A")
+            .expect("RECORD:A must be in scan targets");
+        let rec_b = fanout
+            .records
+            .iter()
+            .find(|t| t.record == "RECORD:B")
+            .expect("RECORD:B must be in scan targets");
+        assert!(rec_a.passive_only, "RECORD:A must be CPP (passive_only)");
+        assert!(
+            !rec_b.passive_only,
+            "RECORD:B must be CP (not passive_only)"
+        );
+    }
+
+    /// Structured-JSON links to the same PV that differ by `Q` are
+    /// distinct monitor variants (distinct pvxs subscriptions,
+    /// `pvxs/ioc/pvalink.h:115-120`), exactly as the convenience-URI form
+    /// in [`Self::br128_distinct_q_variants_do_not_collapse`]. Their CP
+    /// scan fan-outs must land in SEPARATE [`MonitorKey`] buckets even
+    /// though both arrive through the JSON identity-key boundary.
+    #[tokio::test]
+    async fn br_json_distinct_q_variants_do_not_collapse() {
+        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+
+        let opts_q1: Vec<(String, JlinkValue)> = vec![
+            ("proc".to_string(), JlinkValue::Str("CP".to_string())),
+            ("Q".to_string(), JlinkValue::Int(1)),
+        ];
+        let opts_q64: Vec<(String, JlinkValue)> = vec![
+            ("proc".to_string(), JlinkValue::Str("CP".to_string())),
+            ("Q".to_string(), JlinkValue::Int(64)),
+        ];
+        let _ = resolver
+            .open_json_link_for_record("VAR:PV", &opts_q1, "REC:Q1")
+            .await;
+        let _ = resolver
+            .open_json_link_for_record("VAR:PV", &opts_q64, "REC:Q64")
+            .await;
+
+        let targets = resolver.scan_targets.read();
+        let key_q1 = MonitorKey {
+            pv_name: "VAR:PV".to_string(),
+            pipeline: false,
+            queue_size: 1,
+        };
+        let key_q64 = MonitorKey {
+            pv_name: "VAR:PV".to_string(),
+            pipeline: false,
+            queue_size: 64,
+        };
+        let fan_q1 = targets
+            .get(&key_q1)
+            .expect("Q=1 variant must have its own scan fan-out");
+        let fan_q64 = targets
+            .get(&key_q64)
+            .expect("Q=64 variant must have its own scan fan-out");
+        assert_eq!(fan_q1.records.len(), 1, "Q=1 fan-out holds only its record");
+        assert_eq!(fan_q1.records[0].record, "REC:Q1");
+        assert_eq!(
+            fan_q64.records.len(),
+            1,
+            "Q=64 fan-out must not inherit the Q=1 record"
+        );
+        assert_eq!(fan_q64.records[0].record, "REC:Q64");
+    }
+
+    /// A structured-JSON OUT link's options are registered under the
+    /// per-link identity key (matching `external_pv_name()` →
+    /// `link_identity_key()` for a `PvaJson` OUT link in
+    /// `epics_base_rs::server::database::links`), so two same-PV OUT links
+    /// with different `field`/`proc` keep distinct configs on the
+    /// `put_value` resolver hot path.
+    #[tokio::test]
+    async fn br_json_out_links_same_pv_distinct_options_do_not_collide() {
+        use epics_base_rs::server::record::pvajson_identity_key;
+
+        let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
+
+        let opts_a: Vec<(String, JlinkValue)> =
+            vec![("field".to_string(), JlinkValue::Str("a.b".to_string()))];
+        let opts_b: Vec<(String, JlinkValue)> =
+            vec![("field".to_string(), JlinkValue::Str("c.d".to_string()))];
+        let _ = resolver
+            .open_json_out_link("OUT:PV", &opts_a, Some("WRITER:A"))
+            .await;
+        let _ = resolver
+            .open_json_out_link("OUT:PV", &opts_b, Some("WRITER:B"))
+            .await;
+
+        let key_a = pvajson_identity_key("OUT:PV", &opts_a);
+        let key_b = pvajson_identity_key("OUT:PV", &opts_b);
+        let cfg_a = resolver.out_cfg_for(&key_a);
+        let cfg_b = resolver.out_cfg_for(&key_b);
+        assert_eq!(cfg_a.field, "a.b", "OUT link A field must not be clobbered");
+        assert_eq!(cfg_b.field, "c.d", "OUT link B field must retain its own");
+        assert_eq!(link_pv_name(&key_a), "OUT:PV");
     }
 
     /// BRIDGE-RS-2026-05-28-128: two records linking the SAME upstream

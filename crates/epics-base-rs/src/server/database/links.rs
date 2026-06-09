@@ -236,7 +236,14 @@ impl PvDatabase {
             crate::server::record::ParsedLink::None => None,
             crate::server::record::ParsedLink::Ca(ca) => self.resolve_external_pv(&ca.pv).await,
             crate::server::record::ParsedLink::Pva(name) => self.resolve_external_pv(name).await,
-            crate::server::record::ParsedLink::PvaJson(j) => self.resolve_external_pv(&j.pv).await,
+            // Resolve through the per-link identity key (not bare `j.pv`)
+            // so two same-PV structured links keep distinct configs —
+            // matches the boundary key the write/scan/alarm paths use via
+            // `external_pv_name` (pvxs per-link `pvaLinkConfig`,
+            // ioc/pvalink.h:65).
+            crate::server::record::ParsedLink::PvaJson(j) => {
+                self.resolve_external_pv(&j.link_identity_key()).await
+            }
             crate::server::record::ParsedLink::Constant(_) => link.constant_value(),
             crate::server::record::ParsedLink::Db(db) => {
                 // PP: process source record if Passive before reading.
@@ -283,7 +290,10 @@ impl PvDatabase {
             crate::server::record::ParsedLink::None => None,
             crate::server::record::ParsedLink::Ca(ca) => self.resolve_external_pv(&ca.pv).await,
             crate::server::record::ParsedLink::Pva(name) => self.resolve_external_pv(name).await,
-            crate::server::record::ParsedLink::PvaJson(j) => self.resolve_external_pv(&j.pv).await,
+            // Per-link identity key, as in `read_link_value` above.
+            crate::server::record::ParsedLink::PvaJson(j) => {
+                self.resolve_external_pv(&j.link_identity_key()).await
+            }
             crate::server::record::ParsedLink::Constant(_) => link.constant_value(),
             crate::server::record::ParsedLink::Db(db) => self.read_db_link_value(db).await,
             // Hardware links carry no generic readable value.
@@ -428,8 +438,8 @@ impl PvDatabase {
                 let name = link
                     .external_pv_name()
                     .expect("Ca/Pva/PvaJson link carries a PV name");
-                let value = self.resolve_external_pv(name).await;
-                let alarm = self.external_link_alarm(name).await;
+                let value = self.resolve_external_pv(&name).await;
+                let alarm = self.external_link_alarm(&name).await;
                 (value, alarm)
             }
             _ => (None, None),
@@ -672,7 +682,7 @@ impl PvDatabase {
                 let name = link
                     .external_pv_name()
                     .expect("Ca/Pva/PvaJson link carries a PV name");
-                self.resolve_external_pv(name).await
+                self.resolve_external_pv(&name).await
             }
             // lnkCalc evaluates regardless of `is_soft` — the input
             // PVs may themselves be local DB targets (which need the
@@ -1000,7 +1010,7 @@ impl PvDatabase {
                     .external_pv_name()
                     .expect("Ca/Pva/PvaJson link carries a PV name");
                 let op = Self::external_put_op(src.notify);
-                if let Err(e) = self.write_external_pv(name, value, op).await {
+                if let Err(e) = self.write_external_pv(&name, value, op).await {
                     eprintln!("OUT-link write to external PV '{name}' failed: {e}");
                 }
             }
@@ -1441,7 +1451,7 @@ impl PvDatabase {
                                     .external_pv_name()
                                     .expect("Ca/Pva/PvaJson link carries a PV name");
                                 let op = Self::external_put_op(src_notify.as_ref());
-                                if let Err(e) = self.write_external_pv(name, val.clone(), op).await
+                                if let Err(e) = self.write_external_pv(&name, val.clone(), op).await
                                 {
                                     eprintln!(
                                         "dfanout OUT-link write to external PV '{name}' failed: {e}"

@@ -4274,6 +4274,31 @@ async fn test_sel_nvl_link() {
     }
 }
 
+// SELN is DBF_USHORT (selRecord.dbd.pod:295): an NVL link value in the
+// upper unsigned half (32768..65535) must reach SELN intact. The former
+// f64->i16 carrier saturated such a value to 32767, losing the high half.
+#[tokio::test]
+async fn test_sel_nvl_link_high_index_unsigned() {
+    use epics_base_rs::server::records::sel::SelRecord;
+    let db = PvDatabase::new();
+    db.add_record("NVL_SRC_HI", Box::new(AoRecord::new(40000.0)))
+        .await
+        .unwrap();
+    let mut sel = SelRecord::default();
+    sel.selm = 0;
+    sel.nvl = "NVL_SRC_HI".to_string();
+    db.add_record("SEL_REC_HI", Box::new(sel)).await.unwrap();
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SEL_REC_HI", &mut visited, 0)
+        .await
+        .unwrap();
+    let seln = db.get_pv("SEL_REC_HI.SELN").await.unwrap();
+    match seln {
+        EpicsValue::UShort(v) => assert_eq!(v, 40000, "high SELN must survive the NVL link"),
+        other => panic!("expected UShort(40000), got {:?}", other),
+    }
+}
+
 #[tokio::test]
 async fn test_dol_cp_link_registration() {
     let db = PvDatabase::new();

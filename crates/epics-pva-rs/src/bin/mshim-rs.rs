@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use epics_base_rs::net::IfaceMap;
+use epics_pva_rs::cli;
 use epics_pva_rs::server_native::udp::ForwardableDatagram;
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::net::UdpSocket;
@@ -111,17 +112,17 @@ fn parse_endpoint(s: &str, default_port: u16) -> Result<Endpoint, String> {
     } else {
         (head, default_port)
     };
-    let ip: IpAddr = ip_str
-        .parse()
-        .map_err(|e| format!("ip {ip_str:?} invalid: {e}"))?;
-    // pvxs `mshim` is an IPv4 multicast shim: `parseEP()` rejects any
-    // non-AF_INET address (mshim.cpp:56-68) and a zero port number
-    // (mshim.cpp:70-72). Reject both here so a misconfigured IPv6 /
-    // `:0` endpoint fails at parse time instead of surviving startup
-    // and then failing on every socket bind / datagram send.
-    if !ip.is_ipv4() {
-        return Err(format!("only IPv4 addresses are supported, not {ip_str:?}"));
-    }
+    // pvxs `mshim` routes each `-L`/`-F` endpoint through
+    // `SockEndpoint(optarg, udp_port)`, whose body is parsed by
+    // `SockAddr::setAddress` (mshim.cpp:60), so a DNS hostname like
+    // `localhost` is resolved (IPv4-preferred) rather than rejected as a
+    // non-literal-IP. `parseEP` then requires the resolved endpoint to be
+    // AF_INET (mshim.cpp:66-68) — a non-IPv4 endpoint is an error — and
+    // the port to be non-zero (mshim.cpp:70-72). The shared IPv4-only
+    // resolver enforces AF_INET (a name with no IPv4 address fails); the
+    // zero-port check stays here so a misconfigured `:0` fails at parse
+    // time instead of surviving startup and then failing on every send.
+    let ip = IpAddr::V4(cli::resolve_host_ipv4(ip_str)?);
     if port == 0 {
         return Err("non-zero port number required".into());
     }
@@ -131,65 +132,6 @@ fn parse_endpoint(s: &str, default_port: u16) -> Result<Endpoint, String> {
         ttl,
         iface,
     })
-}
-
-/// Resolve an `@iface` spec to the interface's IPv4 address. Accepts
-/// either an interface name (`eth0`) or a literal IPv4 address (which
-/// is returned verbatim). Used to scope multicast joins and select
-/// the outbound multicast interface.
-fn resolve_iface_v4(spec: &str) -> Result<Ipv4Addr, String> {
-    // A literal IPv4 address is accepted directly — pvxs allows this.
-    if let Ok(v4) = spec.parse::<Ipv4Addr>() {
-        return Ok(v4);
-    }
-    #[cfg(unix)]
-    {
-        iface_name_to_v4(spec)
-    }
-    #[cfg(not(unix))]
-    {
-        Err(format!(
-            "interface-name override {spec:?} requires a Unix host; \
-             pass the interface's IPv4 address instead"
-        ))
-    }
-}
-
-/// Look up an interface's first IPv4 address by name via `getifaddrs`.
-#[cfg(unix)]
-fn iface_name_to_v4(name: &str) -> Result<Ipv4Addr, String> {
-    use std::ffi::CStr;
-
-    // SAFETY: getifaddrs allocates a linked list we free via
-    // freeifaddrs; every pointer is null-checked before deref.
-    unsafe {
-        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
-        if libc::getifaddrs(&mut ifap) != 0 {
-            return Err(format!(
-                "getifaddrs failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let mut cur = ifap;
-        let mut found: Option<Ipv4Addr> = None;
-        while !cur.is_null() {
-            let ifa = &*cur;
-            if !ifa.ifa_name.is_null() && !ifa.ifa_addr.is_null() {
-                let ifa_name = CStr::from_ptr(ifa.ifa_name).to_string_lossy();
-                let sa = &*ifa.ifa_addr;
-                if ifa_name == name && sa.sa_family as i32 == libc::AF_INET {
-                    let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
-                    // s_addr is in network byte order.
-                    let addr = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-                    found = Some(addr);
-                    break;
-                }
-            }
-            cur = ifa.ifa_next;
-        }
-        libc::freeifaddrs(ifap);
-        found.ok_or_else(|| format!("interface {name:?} has no IPv4 address"))
-    }
 }
 
 fn bind_listen(ep: &Endpoint) -> std::io::Result<UdpSocket> {
@@ -215,7 +157,7 @@ fn bind_listen(ep: &Endpoint) -> std::io::Result<UdpSocket> {
         // `@iface`: scope the group join to the named interface, by
         // its IPv4 address. Without it the kernel picks the default.
         let join_iface = match &ep.iface {
-            Some(spec) => resolve_iface_v4(spec)
+            Some(spec) => cli::resolve_iface_ipv4(spec)
                 .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))?,
             None => Ipv4Addr::UNSPECIFIED,
         };
@@ -349,7 +291,7 @@ async fn main() {
         .iter()
         .map(|e| {
             let iface_v4 = match &e.iface {
-                Some(spec) => Some(resolve_iface_v4(spec)?),
+                Some(spec) => Some(cli::resolve_iface_ipv4(spec)?),
                 None => None,
             };
             Ok(ForwardTarget {
@@ -611,7 +553,26 @@ mod tests {
 
     #[test]
     fn parse_endpoint_rejects_bad_ip() {
-        assert!(parse_endpoint("not-an-ip", 5076).is_err());
+        // A name that cannot resolve is an error (the `.invalid` TLD is
+        // reserved by RFC 6761 to never resolve, so this is
+        // deterministic regardless of the host's DNS).
+        assert!(parse_endpoint("no.such.host.invalid", 5076).is_err());
+    }
+
+    /// pvxs `mshim` resolves the endpoint body through
+    /// `SockEndpoint`/`SockAddr::setAddress` (mshim.cpp:60), so a DNS
+    /// hostname like `localhost` is accepted (resolved IPv4-preferred),
+    /// not rejected. `localhost:15076` must parse to an IPv4 loopback
+    /// address with the explicit port.
+    #[test]
+    fn parse_endpoint_resolves_hostname() {
+        let ep = parse_endpoint("localhost:15076", 5076).expect("localhost resolves");
+        assert!(
+            matches!(ep.ip, IpAddr::V4(v4) if v4.is_loopback()),
+            "expected IPv4 loopback, got {:?}",
+            ep.ip
+        );
+        assert_eq!(ep.port, 15076);
     }
 
     #[test]
@@ -649,26 +610,6 @@ mod tests {
     #[test]
     fn parse_endpoint_rejects_empty_iface() {
         assert!(parse_endpoint("224.1.1.1@", 5076).is_err());
-    }
-
-    #[test]
-    fn resolve_iface_accepts_literal_ipv4() {
-        let v4 = resolve_iface_v4("192.168.1.5").unwrap();
-        assert_eq!(v4, Ipv4Addr::new(192, 168, 1, 5));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn resolve_iface_loopback_name() {
-        // The loopback interface is named `lo` on Linux and `lo0` on
-        // macOS/BSD; one of them must resolve to 127.0.0.1.
-        let lo = resolve_iface_v4("lo").or_else(|_| resolve_iface_v4("lo0"));
-        if let Ok(v4) = lo {
-            assert!(
-                v4.is_loopback(),
-                "loopback iface should map to a loopback addr"
-            );
-        }
     }
 
     fn fwd(ip: &str, ttl: Option<u32>, iface: Option<Ipv4Addr>) -> ForwardTarget {

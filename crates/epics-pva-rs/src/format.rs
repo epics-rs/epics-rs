@@ -185,8 +185,13 @@ fn write_raw_field(out: &mut String, name: &str, desc: &FieldDesc, value: &PvFie
                 struct_id
             };
             if struct_id == "time_t" {
-                let ts_str = format_timestamp(s);
-                let _ = writeln!(out, "{indent}{id} {name} {ts_str}");
+                // EPICS Base raw formatter: `id ' ' name ' '` then
+                // `printTimeTx` then `'\n'` (printer.cpp:368,372-374,379).
+                // The block carries the `setw(24)` padding and the
+                // trailing space(s) Base streams, so the line ends with
+                // them as Base's does.
+                let ts_block = format_time_tx(Some(s));
+                let _ = writeln!(out, "{indent}{id} {name} {ts_block}");
             } else if struct_id == "enum_t" {
                 let summary = format_enum_summary(s);
                 let _ = writeln!(out, "{indent}{id} {name} {summary}");
@@ -324,18 +329,14 @@ fn nt_payload(s: &PvStructure) -> String {
         .get_field("value")
         .map(nt_scalar_value_str)
         .unwrap_or_default();
-    let ts = s
-        .get_field("timeStamp")
-        .and_then(|f| match f {
-            PvField::Structure(ts) => Some(format_timestamp(ts)),
-            _ => None,
-        })
-        .unwrap_or_else(|| "<undefined>".to_string());
-    // EPICS Base NTScalar order is `<timeStamp> <value> <alarm>`
-    // (pvData printer.cpp:428-434: printTimeT, value, printAlarmT). The
-    // alarm summary is empty unless severity is nonzero.
+    // EPICS Base NTScalar order is `printTimeT, value, printAlarmT`
+    // (pvData printer.cpp:428-434). The time block already carries the
+    // post-timestamp space(s) and an optional `userTag` token, so the
+    // value follows it directly. The alarm summary is empty unless
+    // severity is nonzero.
+    let ts_block = top_time_tx(s);
     let alarm = top_alarm_summary(s);
-    format!("{ts}  {val} {alarm}\n")
+    format!("{ts_block}{val} {alarm}\n")
 }
 
 /// Default NT output for a scalar-array `value` (NTScalarArray, or any
@@ -352,19 +353,13 @@ fn nt_payload(s: &PvStructure) -> String {
 /// six-significant-digit float precision (`std::setprecision(6)`,
 /// printer.cpp:440) and the per-type element separator.
 fn format_nt_scalar_array(pv_name: &str, s: &PvStructure) -> String {
-    let ts = s
-        .get_field("timeStamp")
-        .and_then(|f| match f {
-            PvField::Structure(ts) => Some(format_timestamp(ts)),
-            _ => None,
-        })
-        .unwrap_or_else(|| "<undefined>".to_string());
+    let ts_block = top_time_tx(s);
     let alarm = top_alarm_summary(s);
     let val = s
         .get_field("value")
         .map(format_value_inline)
         .unwrap_or_default();
-    format!("{pv_name} {ts}  {alarm}{val}\n")
+    format!("{pv_name} {ts_block}{alarm}{val}\n")
 }
 
 /// Render an NTScalar `value` field for `-M nt` output.
@@ -442,13 +437,7 @@ fn rewrite_e(s: &str, trim_mantissa: bool) -> String {
 }
 
 fn format_nt_enum(pv_name: &str, s: &PvStructure) -> String {
-    let ts = s
-        .get_field("timeStamp")
-        .and_then(|f| match f {
-            PvField::Structure(ts) => Some(format_timestamp(ts)),
-            _ => None,
-        })
-        .unwrap_or_else(|| "<undefined>".to_string());
+    let ts_block = top_time_tx(s);
     let (idx, choice) = match s.get_field("value") {
         Some(PvField::Structure(es)) => {
             let i = es
@@ -463,8 +452,10 @@ fn format_nt_enum(pv_name: &str, s: &PvStructure) -> String {
     };
     // EPICS Base NTEnum order is `<timeStamp> <alarm> (index) choice`
     // (pvData printer.cpp:162-176: printTimeT, printAlarmT, then the enum).
+    // The time block carries the post-timestamp space(s); the index
+    // follows the alarm directly.
     let alarm = top_alarm_summary(s);
-    format!("{pv_name} {ts} {alarm}({idx}) {choice}\n")
+    format!("{pv_name} {ts_block}{alarm}({idx}) {choice}\n")
 }
 
 /// Render an NTTable the way EPICS Base `printTable` does
@@ -532,7 +523,9 @@ fn format_nt_table(pv_name: &str, s: &PvStructure) -> Option<String> {
     // printTimeTx/printAlarmTx-derived helpers as the NTScalar path; the
     // upstream `setw(24)` timestamp padding is approximated identically.
     if let Some(PvField::Structure(ts)) = s.get_field("timeStamp") {
-        let _ = write!(out, "{} ", format_timestamp(ts));
+        // The block carries the `setw(24)` pad + post-timestamp space and
+        // any `userTag`; no extra separator needed.
+        let _ = write!(out, "{}", format_time_tx(Some(ts)));
     }
     if matches!(s.get_field("alarm"), Some(PvField::Structure(_))) {
         let _ = write!(out, "{} ", top_alarm_summary(s));
@@ -816,43 +809,101 @@ fn enum_choice_text(v: &ScalarValue) -> String {
     }
 }
 
-/// Format an EPICS timestamp from a `time_t` structure. Returns
-/// `YYYY-MM-DD HH:MM:SS.mmm` in local time, or `<undefined>` for epoch=0.
-fn format_timestamp(s: &PvStructure) -> String {
+/// The CLI sentinel for a timestamp with no valid time (missing or zero
+/// `secondsPastEpoch`). EPICS Base never emits this — it would format the
+/// 1990 EPICS epoch — but the Rust CLI prints it instead of a fake date.
+const UNDEFINED_TS: &str = "<undefined>";
+
+/// The timestamp text EPICS Base would format from a `time_t` structure
+/// (`YYYY-MM-DD HH:MM:SS.mmm`, local time), or `None` when the CLI renders
+/// the time as undefined ([`UNDEFINED_TS`]): missing/zero
+/// `secondsPastEpoch`, or a value `chrono` cannot represent.
+fn timestamp_text(s: &PvStructure) -> Option<String> {
     let sec = match s.get_field("secondsPastEpoch") {
         Some(PvField::Scalar(ScalarValue::Long(v))) => *v,
         Some(PvField::Scalar(ScalarValue::Int(v))) => *v as i64,
-        _ => return "<undefined>".to_string(),
+        _ => return None,
     };
     if sec == 0 {
-        return "<undefined>".to_string();
+        return None;
     }
     let nsec = match s.get_field("nanoseconds") {
         Some(PvField::Scalar(ScalarValue::Int(v))) => *v as u32,
         Some(PvField::Scalar(ScalarValue::UInt(v))) => *v,
         _ => 0,
     };
-    // EPICS Base `printTimeTx` (pvData printer.cpp:135-139) appends the
-    // `userTag` after the timestamp text when the field is present and
-    // nonzero (e.g. a QSRV pulse-id / event tag). The CLI dropped it.
-    let user_tag = match s.get_field("userTag") {
+    let dt = chrono::DateTime::from_timestamp(sec, nsec)?;
+    Some(
+        dt.with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S.%3f")
+            .to_string(),
+    )
+}
+
+/// The `userTag` of a `time_t` structure, or `0` when absent. Base reads
+/// this as `int64` (printer.cpp:123,136).
+fn timestamp_user_tag(s: &PvStructure) -> i64 {
+    match s.get_field("userTag") {
         Some(PvField::Scalar(ScalarValue::Int(v))) => *v as i64,
         Some(PvField::Scalar(ScalarValue::Long(v))) => *v,
         Some(PvField::Scalar(ScalarValue::UInt(v))) => *v as i64,
         _ => 0,
+    }
+}
+
+/// Render the EPICS Base `printTimeTx` token block for a `timeStamp`
+/// substructure (pvData printer.cpp:116-140), the single owner of the
+/// `time_t` textual output contract shared by the raw `time_t` line and
+/// the NTScalar / NTScalarArray / NTEnum / NTTable formatters.
+///
+/// Base streams `std::setw(24) << std::left << timeText << ' '`, then —
+/// when `userTag` is present and nonzero — `tag << ' '`. So the block is
+/// the timestamp text left-justified to width 24 then a space, followed
+/// by the optional `tag` and its own trailing space. The returned string
+/// ends in that trailing space (two spaces before the value for the
+/// common 23-char timestamp, since `setw(24)` adds exactly one pad
+/// space), matching what Base streams before the value/alarm.
+///
+/// Two contract points the previous per-caller string handling dropped:
+///  - the `userTag` is a separate token *after* the time text, so it is
+///    emitted even when the time is undefined — Base reads `userTag`
+///    after formatting the time and appends a nonzero tag regardless,
+///    whereas the old code returned early on an undefined timestamp and
+///    silently dropped the tag;
+///  - the tag carries its own trailing space (Base `tag << ' '`), instead
+///    of one space before and two after as the embedded-in-string form
+///    produced.
+///
+/// `ts == None` (no `timeStamp` field at all) renders the undefined
+/// block. The Rust [`UNDEFINED_TS`] sentinel is not padded to the
+/// 24-column — Base never produces it, so there is no Base column to
+/// align it to; its established two-space spacing is preserved.
+fn format_time_tx(ts: Option<&PvStructure>) -> String {
+    use std::fmt::Write;
+    let (text, tag) = match ts {
+        Some(ts) => (timestamp_text(ts), timestamp_user_tag(ts)),
+        None => (None, 0),
     };
-    let dt = chrono::DateTime::from_timestamp(sec, nsec);
-    match dt {
-        Some(dt) => {
-            let local = dt.with_timezone(&chrono::Local);
-            let ts = local.format("%Y-%m-%d %H:%M:%S.%3f");
-            if user_tag != 0 {
-                format!("{ts} {user_tag}")
-            } else {
-                format!("{ts}")
-            }
-        }
-        None => "<undefined>".to_string(),
+    let mut out = match text {
+        // Real timestamp: `setw(24) << left << timeText << ' '`
+        // (printer.cpp:134).
+        Some(t) => format!("{t:<24} "),
+        // Undefined sentinel: keep two-space spacing (see doc above).
+        None => format!("{UNDEFINED_TS}  "),
+    };
+    if tag != 0 {
+        // Base `tag << ' '` (printer.cpp:138) — tag then its own space.
+        let _ = write!(out, "{tag} ");
+    }
+    out
+}
+
+/// The `printTimeTx` block for the `timeStamp` substructure of an NT
+/// top-level structure (or the undefined block when there is none).
+fn top_time_tx(top: &PvStructure) -> String {
+    match top.get_field("timeStamp") {
+        Some(PvField::Structure(ts)) => format_time_tx(Some(ts)),
+        _ => format_time_tx(None),
     }
 }
 
@@ -1847,9 +1898,12 @@ mod tests {
 
     #[test]
     fn nt_scalar_timestamp_renders_nonzero_user_tag() {
-        // EPICS Base `printTimeTx` (pvData printer.cpp:135-139) appends the
-        // userTag after the timestamp when it is nonzero; pvxs/QSRV forces
-        // e.g. UTAG 142 (testqsingle.cpp:280-283).
+        // EPICS Base `printTimeTx` (pvData printer.cpp:134-139) writes
+        // `setw(24) << left << timeText << ' '` then `tag << ' '`, so for a
+        // 23-char timestamp there are TWO spaces before the tag (one pad,
+        // one explicit) and ONE space after it; pvxs/QSRV forces e.g.
+        // UTAG 142 (testqsingle.cpp:280-283). The earlier embedded-in-
+        // string form produced one space before and two after.
         let (desc, val) = nt_scalar_double(1.0, 1_700_000_000, 0);
         let PvField::Structure(mut s) = val else {
             panic!("nt scalar must be a structure");
@@ -1859,8 +1913,8 @@ mod tests {
         }
         let out = format_nt("MY:PV", &desc, &PvField::Structure(s));
         assert!(
-            out.contains(" 142 "),
-            "nonzero userTag must appear after the timestamp, got: {out:?}"
+            out.contains("  142 "),
+            "userTag must follow two spaces and precede one, got: {out:?}"
         );
     }
 
@@ -1875,6 +1929,53 @@ mod tests {
             !out.contains(" 0 "),
             "zero userTag must not be rendered, got: {out:?}"
         );
+    }
+
+    /// Exact `printTimeTx` block contract (pvData printer.cpp:116-140),
+    /// asserted against the helper directly so the spacing is checked
+    /// without a timezone-dependent date. One case per boundary:
+    /// nonzero tag, zero tag, undefined timestamp + nonzero tag, and a
+    /// missing `timeStamp`.
+    #[test]
+    fn time_tx_block_spacing_and_user_tag_boundaries() {
+        let ts0 = |sec: i64, tag: i32| {
+            let mut t = PvStructure::new("time_t");
+            t.set("secondsPastEpoch", PvField::Scalar(ScalarValue::Long(sec)));
+            t.set("nanoseconds", PvField::Scalar(ScalarValue::Int(0)));
+            t.set("userTag", PvField::Scalar(ScalarValue::Int(tag)));
+            t
+        };
+
+        // Undefined (sec == 0) + nonzero tag: the tag is STILL emitted
+        // (Base reads userTag after the time text). Fully deterministic.
+        assert_eq!(format_time_tx(Some(&ts0(0, 142))), "<undefined>  142 ");
+        // Undefined + zero tag: sentinel, two spaces, no tag.
+        assert_eq!(format_time_tx(Some(&ts0(0, 0))), "<undefined>  ");
+        // No `timeStamp` substructure at all → undefined block.
+        assert_eq!(format_time_tx(None), "<undefined>  ");
+
+        // Valid timestamp: the date text is local-timezone dependent, so
+        // assert the column/tag SHAPE and exact lengths (always 23-char
+        // text for a 4-digit year). setw(24) pads to 24; the explicit
+        // space makes two before the tag; the tag carries one space.
+        let with_tag = format_time_tx(Some(&ts0(1_700_000_000, 142)));
+        assert!(
+            !with_tag.starts_with(' '),
+            "time text must lead: {with_tag:?}"
+        );
+        assert!(
+            with_tag.ends_with("  142 "),
+            "tag token shape: {with_tag:?}"
+        );
+        assert_eq!(
+            with_tag.len(),
+            23 + 2 + 3 + 1,
+            "23-char ts + 2sp + 142 + sp"
+        );
+
+        let no_tag = format_time_tx(Some(&ts0(1_700_000_000, 0)));
+        assert!(no_tag.ends_with("  "), "two trailing spaces: {no_tag:?}");
+        assert_eq!(no_tag.len(), 23 + 2, "23-char ts + 2sp");
     }
 
     fn alarm_struct(severity: i32, status: i32, message: &str) -> PvField {

@@ -175,6 +175,13 @@ pub fn version_information() -> &'static str {
 /// output formatter) per binary. The values are read through the
 /// resolved [`crate::config`] getters so the output reflects
 /// environment + defaults exactly as the client will use them.
+///
+/// Known gap: `EPICS_PVA_ADDR_LIST` is shown as the configured value,
+/// not pvxs's post-`Config::expand()` search list (auto-address
+/// expansion, hostname→endpoint resolution, dedup, and the
+/// `AUTO_ADDR_LIST=NO` it leaves after expanding). That expansion needs
+/// a client `Config` value/`expand()` in the config module; until that
+/// exists this readback reflects the configured, not the expanded, list.
 pub fn print_effective_config() {
     print!("{}", effective_config_string());
 }
@@ -198,6 +205,9 @@ pub fn effective_config_string() -> String {
         .join(" ");
     let mut s = String::new();
     let _ = writeln!(s, "Effective config");
+    // pvxs prints the effective Config as a sorted `updateDefs()` map
+    // (config.cpp:613-658), so the keys come out alphabetically and use
+    // their canonical `EPICS_PVA_*` names.
     let _ = writeln!(s, "  EPICS_PVA_ADDR_LIST={addr_list}");
     let _ = writeln!(
         s,
@@ -208,11 +218,190 @@ pub fn effective_config_string() -> String {
             "NO"
         }
     );
-    let _ = writeln!(s, "  EPICS_PVA_SERVER_PORT={}", config::server_port());
     let _ = writeln!(s, "  EPICS_PVA_BROADCAST_PORT={}", config::broadcast_port());
+    // pvxs keeps the connection timeout as a double and prints it in the
+    // effective config (`config.cpp:211-227 parse_timeout`); the CLI
+    // readback previously omitted `EPICS_PVA_CONN_TMO` entirely.
+    let _ = writeln!(s, "  EPICS_PVA_CONN_TMO={}", config::conn_timeout_secs());
+    // pvxs names this key `EPICS_PVA_INTF_ADDR_LIST`, not the non-pvxs
+    // `interfaces=` the readback used before.
+    let _ = writeln!(s, "  EPICS_PVA_INTF_ADDR_LIST={interfaces}");
     let _ = writeln!(s, "  EPICS_PVA_NAME_SERVERS={name_servers}");
-    let _ = writeln!(s, "  interfaces={interfaces}");
+    let _ = writeln!(s, "  EPICS_PVA_SERVER_PORT={}", config::server_port());
     s
+}
+
+/// Render the effective **server** (`EPICS_PVAS_*`) configuration block —
+/// the server-side companion to [`effective_config_string`], used by the
+/// `pvinfo -D` host-troubleshooting report.
+///
+/// pvxs `target_information` prints both an "Effective Client config" and
+/// an "Effective Server config" section under `pvxinfo -D`
+/// (`src/describe.cpp:115-129`); the latter is `server::Config::fromEnv()`
+/// after `expand()`, whose `operator<<` emits ONLY the `EPICS_PVAS_*`
+/// variants of the def map, sorted (`src/config.cpp:474-545`). The
+/// client-only `-v` block never shows these, so an operator debugging why
+/// a *server* does or does not advertise on a network needs this distinct
+/// block — which is why `-D` carries it and plain `-v` does not.
+///
+/// Keys and order mirror pvxs's sorted server def map. `EPICS_PVA_CONN_TMO`
+/// is intentionally absent: pvxs sets it in `updateDefs` but its server
+/// `operator<<` filters to the `EPICS_PVAS_` prefix, so it never appears in
+/// the server section. Values come from the same resolved
+/// [`crate::config`] server getters the PVA server itself reads — the
+/// server-precedence `EPICS_PVAS_*`-first variants (`pvas_server_port`,
+/// `server_broadcast_port`, `server_intf_addr_list`,
+/// `server_beacon_addr_list`, `server_ignore_addr_list`,
+/// `auto_beacon_addr_list_enabled`), not the client `server_port` whose
+/// `EPICS_PVA_SERVER_PORT`-first precedence is the opposite
+/// (`config.cpp:402-432` vs `568-578`).
+///
+/// Known gap (shared with the client block): the address lists are shown
+/// as configured, not pvxs's post-`expand()` auto-beacon fan-out; that
+/// expansion needs a server `Config`/`expand()` value in the config
+/// module, which this CLI-scoped readback does not own.
+pub fn effective_server_config_string() -> String {
+    use crate::config;
+    use std::fmt::Write;
+    let beacon = config::server_beacon_addr_list()
+        .iter()
+        .map(|a| a.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let interfaces = config::server_intf_addr_list()
+        .iter()
+        .map(|a| a.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    // pvxs joins ignore entries as `host:port` (`join_addr`); port 0 is
+    // the wildcard "any port from this IP" match.
+    let ignore = config::env::server_ignore_addr_list()
+        .iter()
+        .map(|(ip, port)| format!("{ip}:{port}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut s = String::new();
+    let _ = writeln!(s, "Effective server config");
+    let _ = writeln!(
+        s,
+        "  EPICS_PVAS_AUTO_BEACON_ADDR_LIST={}",
+        if config::auto_beacon_addr_list_enabled() {
+            "YES"
+        } else {
+            "NO"
+        }
+    );
+    let _ = writeln!(s, "  EPICS_PVAS_BEACON_ADDR_LIST={beacon}");
+    let _ = writeln!(
+        s,
+        "  EPICS_PVAS_BROADCAST_PORT={}",
+        config::server_broadcast_port()
+    );
+    let _ = writeln!(s, "  EPICS_PVAS_IGNORE_ADDR_LIST={ignore}");
+    let _ = writeln!(s, "  EPICS_PVAS_INTF_ADDR_LIST={interfaces}");
+    // Server bind port uses pvxs server precedence (`EPICS_PVAS_SERVER_PORT`
+    // first), distinct from the client block's `EPICS_PVA_SERVER_PORT`-first
+    // `server_port`.
+    let _ = writeln!(
+        s,
+        "  EPICS_PVAS_SERVER_PORT={}",
+        config::env::pvas_server_port()
+    );
+    s
+}
+
+/// Resolve a PVA tool endpoint **body** (the address part of `mshim
+/// -L/-F` and `pvxvct -B`) to a single IPv4 address. A literal IPv4
+/// string is used directly; any other token is resolved through the
+/// system resolver and the first IPv4 result is taken.
+///
+/// pvxs routes these endpoints through `SockEndpoint` →
+/// `SockAddr::setAddress` (`util.cpp:523-538`), which accepts DNS
+/// hostnames and prefers IPv4 "for maximum compatibility". Both tools
+/// are IPv4-only (mshim is an IPv4 multicast shim whose `parseEP`
+/// rejects any non-AF_INET resolved endpoint, `mshim.cpp:66-68`; pvxvct
+/// binds AF_INET), so a name with no IPv4 address is an error rather
+/// than an IPv6 fallback. This is the single owner both tools share, so
+/// they cannot diverge on hostname handling the way they did when one
+/// resolved names and the other required a literal `IpAddr`.
+pub fn resolve_host_ipv4(host: &str) -> Result<std::net::Ipv4Addr, String> {
+    use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+    if let Ok(v4) = host.parse::<Ipv4Addr>() {
+        return Ok(v4);
+    }
+    (host, 0u16)
+        .to_socket_addrs()
+        .map_err(|e| format!("cannot resolve {host:?}: {e}"))?
+        .find_map(|sa| match sa.ip() {
+            IpAddr::V4(v4) => Some(v4),
+            IpAddr::V6(_) => None,
+        })
+        .ok_or_else(|| format!("no IPv4 address for {host:?}"))
+}
+
+/// Resolve an endpoint `@iface` suffix to the interface's IPv4 address.
+/// Accepts either a literal IPv4 address (returned verbatim) or an OS
+/// interface name (`eth0`, `en0`, `lo0`), looked up via `getifaddrs`.
+///
+/// pvxs normalizes the multicast `@iface` of a `SockEndpoint` through
+/// `IfaceMap`, which accepts both an interface name and an interface
+/// IPv4 address (`evhelper.cpp:556-575`). Resolving the suffix only as a
+/// DNS host — as the cable tester previously did — made
+/// `pvxvct -B 224.0.1.1@en0` fail unless `en0` happened to exist in DNS.
+/// This is the single owner both tools share for `@iface` resolution.
+pub fn resolve_iface_ipv4(spec: &str) -> Result<std::net::Ipv4Addr, String> {
+    if let Ok(v4) = spec.parse::<std::net::Ipv4Addr>() {
+        return Ok(v4);
+    }
+    #[cfg(unix)]
+    {
+        iface_name_to_ipv4(spec)
+    }
+    #[cfg(not(unix))]
+    {
+        Err(format!(
+            "interface-name override {spec:?} requires a Unix host; \
+             pass the interface's IPv4 address instead"
+        ))
+    }
+}
+
+/// Look up an interface's first IPv4 address by name via `getifaddrs`.
+#[cfg(unix)]
+fn iface_name_to_ipv4(name: &str) -> Result<std::net::Ipv4Addr, String> {
+    use std::ffi::CStr;
+    use std::net::Ipv4Addr;
+
+    // SAFETY: getifaddrs allocates a linked list we free via
+    // freeifaddrs; every pointer is null-checked before deref.
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifap) != 0 {
+            return Err(format!(
+                "getifaddrs failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut cur = ifap;
+        let mut found: Option<Ipv4Addr> = None;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            if !ifa.ifa_name.is_null() && !ifa.ifa_addr.is_null() {
+                let ifa_name = CStr::from_ptr(ifa.ifa_name).to_string_lossy();
+                let sa = &*ifa.ifa_addr;
+                if ifa_name == name && sa.sa_family as i32 == libc::AF_INET {
+                    let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                    // s_addr is in network byte order.
+                    let addr = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+                    found = Some(addr);
+                    break;
+                }
+            }
+            cur = ifa.ifa_next;
+        }
+        libc::freeifaddrs(ifap);
+        found.ok_or_else(|| format!("interface {name:?} has no IPv4 address"))
+    }
 }
 
 #[cfg(test)]
@@ -311,13 +500,54 @@ mod tests {
         for key in [
             "EPICS_PVA_ADDR_LIST=",
             "EPICS_PVA_AUTO_ADDR_LIST=",
-            "EPICS_PVA_SERVER_PORT=",
             "EPICS_PVA_BROADCAST_PORT=",
+            // pvxs prints the connection timeout (config.cpp:211-227); the
+            // readback must include it, not omit it as before.
+            "EPICS_PVA_CONN_TMO=",
+            // pvxs key name, NOT the non-pvxs `interfaces=` used before.
+            "EPICS_PVA_INTF_ADDR_LIST=",
             "EPICS_PVA_NAME_SERVERS=",
-            "interfaces=",
+            "EPICS_PVA_SERVER_PORT=",
         ] {
             assert!(s.contains(key), "missing {key:?} in:\n{s}");
         }
+        // The non-pvxs `interfaces=` key must be gone.
+        assert!(
+            !s.contains("  interfaces="),
+            "non-pvxs `interfaces=` key must be replaced: {s}"
+        );
+    }
+
+    /// The `pvinfo -D` server block emits the pvxs `EPICS_PVAS_*` key set
+    /// (`src/config.cpp:474-545`), and the client `-v` block stays
+    /// client-only: it must carry no `EPICS_PVAS_` key. `EPICS_PVA_CONN_TMO`
+    /// is deliberately absent from the server block — pvxs's server
+    /// `operator<<` filters to the `EPICS_PVAS_` prefix.
+    #[test]
+    fn effective_server_config_emits_pvas_keys_and_v_stays_client_only() {
+        let s = effective_server_config_string();
+        assert!(s.starts_with("Effective server config\n"), "got: {s:?}");
+        for key in [
+            "EPICS_PVAS_AUTO_BEACON_ADDR_LIST=",
+            "EPICS_PVAS_BEACON_ADDR_LIST=",
+            "EPICS_PVAS_BROADCAST_PORT=",
+            "EPICS_PVAS_IGNORE_ADDR_LIST=",
+            "EPICS_PVAS_INTF_ADDR_LIST=",
+            "EPICS_PVAS_SERVER_PORT=",
+        ] {
+            assert!(s.contains(key), "missing {key:?} in:\n{s}");
+        }
+        // pvxs filters CONN_TMO out of the server section (no PVAS prefix).
+        assert!(
+            !s.contains("EPICS_PVA_CONN_TMO"),
+            "CONN_TMO must not appear in the server block: {s}"
+        );
+        // The client `-v` block is client-only: no EPICS_PVAS_ key.
+        let client = effective_config_string();
+        assert!(
+            !client.contains("EPICS_PVAS_"),
+            "the `-v` client block must not carry server keys: {client}"
+        );
     }
 
     /// The shared `-V` text reports more than `<binary> <crate-version>`:
@@ -349,5 +579,39 @@ mod tests {
             v.lines().count() >= 3,
             "version output must carry dependency context, got: {v:?}"
         );
+    }
+
+    /// `resolve_host_ipv4` accepts a literal IPv4 verbatim and resolves a
+    /// hostname to IPv4, preferring IPv4 over any IPv6 the resolver also
+    /// returns (`localhost` is typically dual-stack). pvxs `setAddress`
+    /// makes the same IPv4-preferring choice (`util.cpp:529-538`).
+    #[test]
+    fn resolve_host_ipv4_literal_and_hostname() {
+        assert_eq!(
+            resolve_host_ipv4("192.168.1.5").unwrap(),
+            std::net::Ipv4Addr::new(192, 168, 1, 5)
+        );
+        let lo = resolve_host_ipv4("localhost").expect("localhost resolves");
+        assert!(lo.is_loopback(), "expected IPv4 loopback, got {lo}");
+    }
+
+    /// `resolve_iface_ipv4` accepts a literal interface IPv4 address
+    /// verbatim and, on Unix, resolves an interface *name* to its IPv4
+    /// address — the dual form pvxs `IfaceMap` accepts
+    /// (`evhelper.cpp:556-575`). The loopback interface is `lo` on Linux
+    /// and `lo0` on macOS/BSD; try both.
+    #[test]
+    fn resolve_iface_ipv4_literal_and_name() {
+        assert_eq!(
+            resolve_iface_ipv4("10.0.0.2").unwrap(),
+            std::net::Ipv4Addr::new(10, 0, 0, 2)
+        );
+        #[cfg(unix)]
+        {
+            let lo = resolve_iface_ipv4("lo").or_else(|_| resolve_iface_ipv4("lo0"));
+            if let Ok(v4) = lo {
+                assert!(v4.is_loopback(), "loopback iface IPv4 expected, got {v4}");
+            }
+        }
     }
 }

@@ -100,14 +100,29 @@ fn fmt_guid(guid: &[u8; 12]) -> String {
 /// Resolve `host` to a single [`SocketAddr`] at `port`, mirroring the
 /// synchronous DNS fallback in pvxs `SockAddr::setAddress`
 /// (`src/util.cpp:523-549`): when the token is not a literal IP it is
-/// resolved through the system resolver. The first returned address is
-/// used (pvxs likewise takes the first `getaddrinfo` result).
+/// resolved through the system resolver. When the resolver returns a
+/// mix of IPv4 and IPv6, pvxs **prefers IPv4** "for maximum
+/// compatibility" — it keeps the first IPv4 result and only falls back
+/// to an IPv6 result when no IPv4 was returned (`util.cpp:529-538`).
+/// Taking the bare first `getaddrinfo` result (which the OS may order
+/// IPv6-first) would make `pvlist-rs localhost` pick `::1` where
+/// `pvxlist localhost` picks `127.0.0.1`, so an IPv4-only server is
+/// found by pvxs but missed by Rust.
 fn resolve_host_port(host: &str, port: u16) -> Result<SocketAddr, String> {
-    (host, port)
+    let mut v6_fallback: Option<SocketAddr> = None;
+    for sa in (host, port)
         .to_socket_addrs()
         .map_err(|e| format!("cannot resolve {host:?}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("no address found for {host:?}"))
+    {
+        if sa.is_ipv4() {
+            // First IPv4 wins immediately (pvxs `break` on AF_INET).
+            return Ok(sa);
+        }
+        // Remember the first IPv6 result as the fallback for a host that
+        // resolves to IPv6 only.
+        v6_fallback.get_or_insert(sa);
+    }
+    v6_fallback.ok_or_else(|| format!("no address found for {host:?}"))
 }
 
 /// Parse `host[:port]`, defaulting to the PVA server TCP port (5075, or
@@ -134,9 +149,17 @@ fn parse_server_addr(s: &str, default_port: u16) -> Result<SocketAddr, String> {
         return Ok(SocketAddr::new(ip, default_port));
     }
     // `host:port` — explicit port on an IPv4 literal or a hostname.
-    if let Some((host, port_str)) = s.rsplit_once(':')
-        && let Ok(port) = port_str.parse::<u16>()
-    {
+    if let Some((host, port_str)) = s.rsplit_once(':') {
+        // pvxs `setAddress` parses the port with `parseTo<uint64_t>` and
+        // then stores it into the 16-bit socket port, truncating the low
+        // 16 bits (`util.cpp:540-546`). Match that: a numeric but
+        // out-of-`u16`-range port truncates rather than failing the
+        // `u16` parse and being misread as part of a hostname (which
+        // would make `host:70000` resolve the literal `"host:70000"`).
+        let port = match port_str.parse::<u64>() {
+            Ok(p) => p as u16,
+            Err(_) => return Err(format!("invalid port {port_str:?} in {s:?}")),
+        };
         return match host.parse::<std::net::IpAddr>() {
             Ok(ip) => Ok(SocketAddr::new(ip, port)),
             // Not a literal IP → resolve the hostname (pvxs setAddress).
@@ -695,15 +718,40 @@ mod tests {
     /// finding 66: a hostname must resolve (pvxs setAddress DNS
     /// fallback), not be rejected. `localhost` resolves offline via
     /// the hosts file, with and without an explicit port.
+    ///
+    /// `localhost` typically resolves to *both* `127.0.0.1` and `::1`;
+    /// pvxs `setAddress` prefers the IPv4 result (`util.cpp:529-538`), so
+    /// the resolved address must be IPv4, not whichever the OS returns
+    /// first (which is often `::1`).
     #[test]
     fn parse_addr_resolves_hostname() {
         let bare = parse_server_addr("localhost", 5075).expect("localhost resolves");
         assert!(bare.ip().is_loopback(), "got {bare}");
+        assert!(bare.is_ipv4(), "expected IPv4 preference, got {bare}");
         assert_eq!(bare.port(), 5075);
 
         let with_port = parse_server_addr("localhost:5099", 5075).expect("localhost:port resolves");
         assert!(with_port.ip().is_loopback(), "got {with_port}");
+        assert!(
+            with_port.is_ipv4(),
+            "expected IPv4 preference, got {with_port}"
+        );
         assert_eq!(with_port.port(), 5099);
+    }
+
+    /// An explicit port wider than 16 bits is parsed as `uint64_t` then
+    /// truncated to the 16-bit socket port, matching pvxs
+    /// `temp.setPort(parseTo<uint64_t>(port))` where `setPort` takes an
+    /// `unsigned short` (`util.cpp:544-545`). `70000 & 0xFFFF == 4464`.
+    /// A non-numeric port is a diagnostic, not silently swallowed as part
+    /// of a hostname.
+    #[test]
+    fn parse_addr_port_truncates_like_pvxs() {
+        assert_eq!(
+            parse_server_addr("1.2.3.4:70000", 5075).unwrap(),
+            addr("1.2.3.4:4464")
+        );
+        assert!(parse_server_addr("1.2.3.4:notaport", 5075).is_err());
     }
 
     /// An invalid bracketed address yields a diagnostic, not a panic

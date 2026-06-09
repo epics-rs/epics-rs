@@ -18,7 +18,7 @@
 //! ```
 
 use std::io::Cursor;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket as StdUdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -81,8 +81,12 @@ struct Args {
     #[arg(short = 'v')]
     verbose: bool,
 
-    /// UDP port to bind. Defaults to EPICS_PVA_BROADCAST_PORT or 5076.
-    /// Used as the default for `-B` endpoints that omit `:port`.
+    /// UDP port to bind (Rust-only explicit override). pvxs `pvxvct`
+    /// has no `-p` and hard-codes 5076; this defaults to that same
+    /// literal when unset and is only used as the default for the
+    /// implicit wildcard bind and `-B` endpoints that omit `:port`.
+    /// `EPICS_PVA_BROADCAST_PORT` is deliberately not consulted here, so
+    /// an unrelated PVA env setting cannot move the cable tester off 5076.
     #[arg(short = 'p', long = "port")]
     port: Option<u16>,
 }
@@ -147,22 +151,20 @@ fn pv_filter_allows(pvnames: &[String], names: &[String]) -> bool {
     names.iter().any(|n| pvnames.iter().any(|p| p == n))
 }
 
-/// Resolve a host token to an IPv4 address. A literal IPv4 string is
-/// parsed directly; otherwise the name is resolved and the first IPv4
-/// result is used. pvxs `parsePeer` uses `hostToIPAddr`, which likewise
-/// resolves names to an `in_addr`.
-fn resolve_ipv4(host: &str) -> Result<Ipv4Addr, String> {
-    if let Ok(v4) = host.parse::<Ipv4Addr>() {
-        return Ok(v4);
-    }
-    (host, 0u16)
-        .to_socket_addrs()
-        .map_err(|e| format!("cannot resolve {host:?}: {e}"))?
-        .find_map(|sa| match sa.ip() {
-            IpAddr::V4(v4) => Some(v4),
-            IpAddr::V6(_) => None,
-        })
-        .ok_or_else(|| format!("no IPv4 address for {host:?}"))
+/// The default UDP port for binds: used for the implicit no-`-B`
+/// wildcard listener and for any `-B` endpoint that omits `:port`.
+///
+/// pvxs `pvxvct` hard-codes the well-known PVA UDP port 5076 for both:
+/// `-B optarg` builds `SockEndpoint(optarg, 5076)` and the implicit bind
+/// is `SockAddr::any(AF_INET, 5076)` (`tools/pvxvct.cpp:155,172`). It has
+/// no `-p` option and never reads `EPICS_PVA_BROADCAST_PORT`. Consulting
+/// that variable would let an unrelated PVA env setting silently move the
+/// cable tester off 5076, so a diagnostic command copied between the C
+/// and Rust tools could miss the same SEARCH/BEACON traffic. The default
+/// is therefore the literal 5076; the Rust-only `-p` (`port_arg`) is the
+/// only override, and it is always explicit, never env-driven.
+fn default_bind_port(port_arg: Option<u16>) -> u16 {
+    port_arg.unwrap_or(5076)
 }
 
 /// Parse a `-H` value (`host[/bits | /dotted.mask]`) into a
@@ -175,7 +177,7 @@ fn parse_peer(spec: &str) -> Result<PeerFilter, String> {
         Some((h, m)) => (h, Some(m)),
         None => (spec, None),
     };
-    let addr = resolve_ipv4(host)?;
+    let addr = epics_pva_rs::cli::resolve_host_ipv4(host)?;
     let mask: u32 = match mask_spec {
         // pvxs default: INADDR_BROADCAST (all ones) → exact match.
         None => 0xffff_ffff,
@@ -210,8 +212,13 @@ fn parse_peer(spec: &str) -> Result<PeerFilter, String> {
 /// Parse a `-B` value into a [`BindEndpoint`]. Grammar mirrors pvxs
 /// `SockEndpoint` (`tools/pvxvct.cpp:152-153`): `addr[,ttl][@iface][:port]`.
 /// The `ttl` is accepted for grammar compatibility but does not affect a
-/// pure listener, so it is validated and discarded. `iface` must be an
-/// IPv4 address (interface-name lookup is not supported here).
+/// pure listener, so it is validated and discarded. The endpoint body and
+/// the multicast `@iface` are resolved through the shared PVA-tool
+/// resolvers: the body via DNS (IPv4-preferred), and `@iface` accepting
+/// **either** an interface IPv4 address **or** an OS interface name
+/// (`en0`, `lo0`) — the dual form pvxs `IfaceMap` accepts
+/// (`evhelper.cpp:556-575`), so `-B 224.0.1.1@en0` works as it does under
+/// pvxs instead of being misresolved as a DNS host.
 fn parse_bind(spec: &str, default_port: u16) -> Result<BindEndpoint, String> {
     let mut rest = spec;
     let mut port = default_port;
@@ -225,7 +232,7 @@ fn parse_bind(spec: &str, default_port: u16) -> Result<BindEndpoint, String> {
     }
     let mut iface = Ipv4Addr::UNSPECIFIED;
     if let Some((head, tail)) = rest.rsplit_once('@') {
-        iface = resolve_ipv4(tail)?;
+        iface = epics_pva_rs::cli::resolve_iface_ipv4(tail)?;
         rest = head;
     }
     if let Some((head, tail)) = rest.rsplit_once(',') {
@@ -234,7 +241,7 @@ fn parse_bind(spec: &str, default_port: u16) -> Result<BindEndpoint, String> {
             .map_err(|_| format!("invalid ttl {tail:?} in -B {spec:?}"))?;
         rest = head;
     }
-    let addr = resolve_ipv4(rest)?;
+    let addr = epics_pva_rs::cli::resolve_host_ipv4(rest)?;
     Ok(BindEndpoint { addr, port, iface })
 }
 
@@ -406,14 +413,7 @@ async fn main() {
         return;
     }
 
-    let default_port = args.port.unwrap_or_else(|| {
-        std::env::var("EPICS_PVA_BROADCAST_PORT")
-            .ok()
-            // pvxs-compatible port parse (uint64 + low-16 truncate,
-            // whitespace-tolerant) instead of a strict u16 parse.
-            .and_then(|s| epics_pva_rs::config::env::parse_port_env(&s))
-            .unwrap_or(5076)
-    });
+    let default_port = default_bind_port(args.port);
 
     let peers = match args
         .hosts
@@ -613,5 +613,65 @@ mod tests {
     #[test]
     fn parse_bind_rejects_bad_ttl() {
         assert!(parse_bind("224.0.1.1,abc", 5076).is_err());
+    }
+
+    /// The multicast `@iface` suffix accepts an OS interface *name*, not
+    /// just an interface IPv4 address — the dual form pvxs `IfaceMap`
+    /// accepts (`evhelper.cpp:556-575`). The loopback interface is `lo`
+    /// on Linux and `lo0` on macOS/BSD; binding `224.0.1.1@<loopback>`
+    /// must resolve the name to that interface's loopback IPv4 address.
+    #[cfg(unix)]
+    #[test]
+    fn parse_bind_iface_accepts_interface_name() {
+        let ep = parse_bind("224.0.1.1@lo0", 5076).or_else(|_| parse_bind("224.0.1.1@lo", 5076));
+        if let Ok(ep) = ep {
+            assert_eq!(ep.addr, Ipv4Addr::new(224, 0, 1, 1));
+            assert!(
+                ep.iface.is_loopback(),
+                "interface name should resolve to the loopback IPv4, got {}",
+                ep.iface
+            );
+        }
+    }
+
+    /// The bind default is the literal 5076 (pvxs `pvxvct` hard-codes it,
+    /// `tools/pvxvct.cpp:155,172`), and `EPICS_PVA_BROADCAST_PORT` must
+    /// NOT change it — pvxvct has no env-driven default. `-p` (the
+    /// `Some(..)` arm) is the only override. Serialised on `epics_env`
+    /// because the variable is process-global.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn default_bind_port_ignores_broadcast_port_env() {
+        // SAFETY: std::env mutation is unsafe in edition 2024; the
+        // `epics_env` serial guard makes it race-free.
+        unsafe { std::env::remove_var("EPICS_PVA_BROADCAST_PORT") };
+        // Unset env, no `-p` → 5076.
+        assert_eq!(default_bind_port(None), 5076);
+
+        // EPICS_PVA_BROADCAST_PORT=0 must still yield 5076 (pvxs listens
+        // on 5076 regardless; the old code bound port 0).
+        unsafe { std::env::set_var("EPICS_PVA_BROADCAST_PORT", "0") };
+        assert_eq!(default_bind_port(None), 5076);
+
+        // EPICS_PVA_BROADCAST_PORT=5099 must NOT move the default off
+        // 5076 — this is the regression the fix closes.
+        unsafe { std::env::set_var("EPICS_PVA_BROADCAST_PORT", "5099") };
+        assert_eq!(default_bind_port(None), 5076);
+
+        // `-p 5099` is the only thing that overrides, and it does so even
+        // with the env set.
+        assert_eq!(default_bind_port(Some(5099)), 5099);
+
+        unsafe { std::env::remove_var("EPICS_PVA_BROADCAST_PORT") };
+    }
+
+    /// With the env-free default, `-B 0.0.0.0` (no `:port`) binds 5076
+    /// while `-B 0.0.0.0:5099` still honours its explicit per-endpoint
+    /// port — the two pvxs-parity boundaries the finding calls out.
+    #[test]
+    fn parse_bind_uses_env_free_default_but_honours_explicit_port() {
+        let dflt = default_bind_port(None);
+        assert_eq!(parse_bind("0.0.0.0", dflt).unwrap().port, 5076);
+        assert_eq!(parse_bind("0.0.0.0:5099", dflt).unwrap().port, 5099);
     }
 }

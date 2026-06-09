@@ -1210,7 +1210,13 @@ pub async fn run_ca_pva_qsrv_ioc(
     // `group_enable()` / `singlesourcehooks.cpp`). `dbLoadGroup` is the
     // base startup command (pvxs only permits it before iocInit), so it
     // is intentionally absent from this runtime set.
-    shell_commands.extend(super::iocsh::register_qsrv_runtime_commands(
+    //
+    // Gated on the SAME `qsrv2_on` decision that gates serving and group
+    // loading above: pvxs registers `single_enable()` / `group_enable()`
+    // commands only inside `if(enableQ)` (iochooks.cpp:492-496), so a
+    // QSRV2-disabled IOC must expose none of this QSRV control surface.
+    shell_commands.extend(super::iocsh::register_qsrv_runtime_commands_if_enabled(
+        qsrv2_on,
         store.provider().clone(),
     ));
 

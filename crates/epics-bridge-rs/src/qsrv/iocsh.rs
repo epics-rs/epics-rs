@@ -948,6 +948,33 @@ pub fn register_qsrv_runtime_commands(provider: Arc<BridgeProvider>) -> Vec<Comm
     ]
 }
 
+/// QSRV2-gated runtime-command installer. pvxs registers the QSRV command
+/// surface — `pvxsl` (`single_enable()`, singlesourcehooks.cpp:162-166),
+/// `pvxgl` / `dbLoadGroup` (`group_enable()`, groupsourcehooks.cpp:233-245)
+/// — only inside `if(enableQ)` in `pvxsBaseRegistrar()`
+/// (iochooks.cpp:492-496), where `enableQ` is the one `enable2()` decision
+/// that also gates `addSource()`. When QSRV2 is disabled (`PVXS_QSRV_ENABLE=NO`
+/// or `EPICS_IOC_IGNORE_SERVERS=qsrv2`), none of those commands exist.
+///
+/// This is the single owner of that gate for the runtime (post-iocInit)
+/// command set: when `enabled` is false it returns an empty set, so a
+/// disabled IOC exposes no `processGroups` / `qsrvStats` / `pvxsl` / `pvxgl`
+/// / `resetGroups` control surface (`pvxsl` reads the database directly and
+/// `resetGroups` mutates the group registry — both must be absent when the
+/// QSRV2 sources are not served). It is bound to the same `qsrv2_on` decision
+/// that gates serving and group loading, so the whole QSRV surface follows
+/// one decision rather than each call site re-deciding.
+pub fn register_qsrv_runtime_commands_if_enabled(
+    enabled: bool,
+    provider: Arc<BridgeProvider>,
+) -> Vec<CommandDef> {
+    if enabled {
+        register_qsrv_runtime_commands(provider)
+    } else {
+        Vec::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -992,6 +1019,32 @@ mod tests {
         assert!(names.contains(&"pvxsl"));
         assert!(names.contains(&"pvxgl"));
         assert!(names.contains(&"resetGroups"));
+    }
+
+    /// pvxs gates `single_enable()` / `group_enable()` command registration
+    /// behind `enable2()` (iochooks.cpp:492-496). A QSRV2-enabled IOC
+    /// installs the full runtime set; a disabled IOC
+    /// (`PVXS_QSRV_ENABLE=NO` / `EPICS_IOC_IGNORE_SERVERS=qsrv2`) installs
+    /// none of it — no `processGroups`/`qsrvStats`/`pvxsl`/`pvxgl`/
+    /// `resetGroups` control surface.
+    #[test]
+    fn qsrv_runtime_commands_gated_on_qsrv2_enable() {
+        let db = Arc::new(PvDatabase::new());
+        let provider = Arc::new(BridgeProvider::new(db));
+
+        let enabled = register_qsrv_runtime_commands_if_enabled(true, provider.clone());
+        assert_eq!(enabled.len(), 5);
+        let names: Vec<&str> = enabled.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"processGroups"));
+        assert!(names.contains(&"qsrvStats"));
+        assert!(names.contains(&"pvxsl"));
+        assert!(names.contains(&"pvxgl"));
+        assert!(names.contains(&"resetGroups"));
+        // `dbLoadGroup` is a base startup command, never in the runtime set.
+        assert!(!names.contains(&"dbLoadGroup"));
+
+        let disabled = register_qsrv_runtime_commands_if_enabled(false, provider);
+        assert!(disabled.is_empty());
     }
 
     #[test]

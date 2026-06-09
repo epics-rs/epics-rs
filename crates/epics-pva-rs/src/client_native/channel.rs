@@ -527,6 +527,26 @@ fn reconnect_holdoff(class: Option<FailureClass>, is_direct: bool) -> Option<std
     }
 }
 
+/// Whether an exhausted candidate batch should re-enter the search ring
+/// instead of surfacing the error to the waiting operation.
+///
+/// pvxs treats a `CREATE_CHANNEL` refusal on a *searched* channel as a state
+/// transition back to `Searching`: it re-pushes the channel into
+/// `searchBuckets[currentBucket]` and the operation stays pending until a
+/// server accepts or the caller's own deadline ends it
+/// (clientconn.cpp:368-378). That applies only when the channel is searched
+/// (not direct) and every candidate failed at the CREATE stage — a
+/// Connecting-stage TCP failure instead keeps the fixed reconnect holdoff
+/// (clientconn.cpp:379-385) so an unreachable address is not hot-retried with
+/// no pacing.
+fn refusal_reenters_search(
+    last_failure: Option<FailureClass>,
+    saw_connect_failure: bool,
+    is_direct: bool,
+) -> bool {
+    !is_direct && !saw_connect_failure && last_failure == Some(FailureClass::CreateRefusal)
+}
+
 impl Channel {
     pub fn new(
         pv_name: String,
@@ -750,189 +770,223 @@ impl Channel {
             }
         }
 
-        // Pull a candidate server. Prefer cached alternatives from the
-        // most recent multi-window search; otherwise issue a fresh search.
-        // The lock guard from parking_lot is !Send, so we drop it before
-        // any await.
-        let cached: Option<Vec<Candidate>> = {
-            let mut alts = self.alternatives.lock();
-            if alts.is_empty() {
-                None
-            } else {
-                Some(std::mem::take(&mut *alts))
-            }
-        };
-        let candidates = match cached {
-            Some(list) => list,
-            None => {
-                self.set_state(ChannelState::Searching);
-                // Pick `Reconnect` once we've ever been Active so the
-                // search lands in the current bucket and waits for the
-                // next 1 Hz tick (pvxs `Channel::disconnect` parity);
-                // otherwise this is a fresh resolve and `Initial`
-                // earns the immediate broadcast for fast first-attempt
-                // latency.
-                let reason = if self
-                    .has_been_active
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    super::search_engine::SearchReason::Reconnect
+        let is_direct = matches!(self.resolver, Resolver::Direct(_));
+        // A searched CREATE_CHANNEL refusal is a channel-state transition (back
+        // to Searching), not a terminal operation error: pvxs re-pushes the
+        // channel into searchBuckets[currentBucket] and the waiting operation
+        // stays pending until a server accepts or the caller's own deadline
+        // ends it (clientconn.cpp:368-378). Mirror that by re-entering the
+        // search ring and retrying here; the op-level timeout in
+        // ops_v2::ensure_active_with_op_timeout (and SubscriptionHandle drop
+        // for monitors) owns the user-visible deadline.
+        let mut researched_after_refusal = false;
+        loop {
+            // Pull a candidate server. Prefer cached alternatives from the
+            // most recent multi-window search; otherwise issue a fresh search.
+            // The lock guard from parking_lot is !Send, so we drop it before
+            // any await.
+            let cached: Option<Vec<Candidate>> = {
+                let mut alts = self.alternatives.lock();
+                if alts.is_empty() {
+                    None
                 } else {
-                    super::search_engine::SearchReason::Initial
-                };
-                // Use single-server `find()` (delivers on first
-                // SEARCH_RESPONSE).
-                //
-                // - Initial: the engine broadcasts immediately on
-                //   receipt, so a healthy server replies in
-                //   microseconds, AND places the SEARCH at
-                //   `current_bucket+1` so a slow server is retried on
-                //   the pvxs-style `nSearch+1` escalation. No outer
-                //   timeout: a fresh resolve stays pending
-                //   until a server answers; the operation-level timeout
-                //   surfaces "no server" for one-shot ops (a wrong PV
-                //   name fails when the caller's op timeout elapses,
-                //   not at a hard-coded 200 ms ceiling).
-                //
-                // - Reconnect: NO outer timeout. The engine places
-                //   the SEARCH in the current bucket and the next
-                //   periodic tick (≤1 s) broadcasts it; if the
-                //   server doesn't reply, the engine retries on a
-                //   pvxs-style `nSearch+1`-bucket escalation
-                //   (1 s, 2 s, 3 s, ... up to 30 s) and a beacon
-                //   arrival from the recovered server kicks the
-                //   pending entries into fast-tick mode for
-                //   sub-second recovery. Mirrors pvxs's design,
-                //   where Channel::disconnect just leaves the
-                //   channel in `searchBuckets` — there is no
-                //   caller-facing find() with a timeout. Adding
-                //   one was a foot-gun: the previous `MULTI_SERVER_WINDOW`
-                //   ceiling cancelled the SEARCH before its bucket
-                //   could fire (dropped it as a zombie), and
-                //   recovery only happened when a beacon arrived
-                //   and a fresh retry cycle happened to align with
-                //   it. Without the timeout, the find() future
-                //   stays pending indefinitely; the monitor loop
-                //   awaits it (no CPU cost), and dropping the
-                //   `SubscriptionHandle` cancels everything via
-                //   normal future-drop semantics.
-                //
-                // Initial-symptom note (preserved): `pvget-rs PV`
-                // against a local IOC used to take ~1 s vs legacy
-                // `pvget`'s ~10 ms; root cause was `find_all`'s
-                // 1 Hz tick coupling to delivery, fixed by switching
-                // to single-server `find()`.
-                match &self.resolver {
-                    Resolver::Search(engine) => {
-                        // no inner timeout for either reason.
-                        // Both `find()` calls stay pending until a
-                        // SEARCH_RESPONSE arrives; the engine drives
-                        // recovery via the bucket scheduler (Initial
-                        // fires immediately + retries from
-                        // `current_bucket+1`, Reconnect rides the next
-                        // tick). The user-visible deadline is owned by
-                        // the operation-level timeout
-                        // (`ops_v2::ensure_active_with_op_timeout`) for
-                        // one-shot ops, and by `SubscriptionHandle` drop
-                        // for monitor loops — matching pvxs, where a
-                        // newly opened channel lives in the search ring
-                        // until the server answers or the caller drops
-                        // the operation. The previous 200 ms
-                        // `MULTI_SERVER_WINDOW` ceiling on `Initial`
-                        // collapsed a slow-but-live search into "no
-                        // servers found" and let the bucket loop reap the
-                        // still-wanted pending entry as a zombie the
-                        // moment the outer timeout closed the responder.
-                        let result = engine.find(&self.pv_name, reason).await.ok();
-                        match result {
-                            Some(hit) => vec![Candidate {
-                                addr: hit.server,
-                                guid: Some(hit.guid),
-                            }],
-                            None => Vec::new(),
+                    Some(std::mem::take(&mut *alts))
+                }
+            };
+            let candidates = match cached {
+                Some(list) => list,
+                None => {
+                    self.set_state(ChannelState::Searching);
+                    // Pick `Reconnect` once we've ever been Active so the
+                    // search lands in the current bucket and waits for the
+                    // next 1 Hz tick (pvxs `Channel::disconnect` parity);
+                    // otherwise this is a fresh resolve and `Initial`
+                    // earns the immediate broadcast for fast first-attempt
+                    // latency.
+                    let reason = if self
+                        .has_been_active
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        || researched_after_refusal
+                    {
+                        // Force the bucket-paced Reconnect search once we have
+                        // re-searched after a refusal, even on a channel that was
+                        // never Active: pvxs re-pushes the refused channel into the
+                        // current search bucket (clientconn.cpp:373-377), so the
+                        // re-search rides the ≤1 s tick instead of an immediate
+                        // Initial broadcast. Otherwise a server that answers SEARCH
+                        // instantly and then refuses CREATE would spin this loop
+                        // with no pacing.
+                        super::search_engine::SearchReason::Reconnect
+                    } else {
+                        super::search_engine::SearchReason::Initial
+                    };
+                    // Use single-server `find()` (delivers on first
+                    // SEARCH_RESPONSE).
+                    //
+                    // - Initial: the engine broadcasts immediately on
+                    //   receipt, so a healthy server replies in
+                    //   microseconds, AND places the SEARCH at
+                    //   `current_bucket+1` so a slow server is retried on
+                    //   the pvxs-style `nSearch+1` escalation. No outer
+                    //   timeout: a fresh resolve stays pending
+                    //   until a server answers; the operation-level timeout
+                    //   surfaces "no server" for one-shot ops (a wrong PV
+                    //   name fails when the caller's op timeout elapses,
+                    //   not at a hard-coded 200 ms ceiling).
+                    //
+                    // - Reconnect: NO outer timeout. The engine places
+                    //   the SEARCH in the current bucket and the next
+                    //   periodic tick (≤1 s) broadcasts it; if the
+                    //   server doesn't reply, the engine retries on a
+                    //   pvxs-style `nSearch+1`-bucket escalation
+                    //   (1 s, 2 s, 3 s, ... up to 30 s) and a beacon
+                    //   arrival from the recovered server kicks the
+                    //   pending entries into fast-tick mode for
+                    //   sub-second recovery. Mirrors pvxs's design,
+                    //   where Channel::disconnect just leaves the
+                    //   channel in `searchBuckets` — there is no
+                    //   caller-facing find() with a timeout. Adding
+                    //   one was a foot-gun: the previous `MULTI_SERVER_WINDOW`
+                    //   ceiling cancelled the SEARCH before its bucket
+                    //   could fire (dropped it as a zombie), and
+                    //   recovery only happened when a beacon arrived
+                    //   and a fresh retry cycle happened to align with
+                    //   it. Without the timeout, the find() future
+                    //   stays pending indefinitely; the monitor loop
+                    //   awaits it (no CPU cost), and dropping the
+                    //   `SubscriptionHandle` cancels everything via
+                    //   normal future-drop semantics.
+                    //
+                    // Initial-symptom note (preserved): `pvget-rs PV`
+                    // against a local IOC used to take ~1 s vs legacy
+                    // `pvget`'s ~10 ms; root cause was `find_all`'s
+                    // 1 Hz tick coupling to delivery, fixed by switching
+                    // to single-server `find()`.
+                    match &self.resolver {
+                        Resolver::Search(engine) => {
+                            // no inner timeout for either reason.
+                            // Both `find()` calls stay pending until a
+                            // SEARCH_RESPONSE arrives; the engine drives
+                            // recovery via the bucket scheduler (Initial
+                            // fires immediately + retries from
+                            // `current_bucket+1`, Reconnect rides the next
+                            // tick). The user-visible deadline is owned by
+                            // the operation-level timeout
+                            // (`ops_v2::ensure_active_with_op_timeout`) for
+                            // one-shot ops, and by `SubscriptionHandle` drop
+                            // for monitor loops — matching pvxs, where a
+                            // newly opened channel lives in the search ring
+                            // until the server answers or the caller drops
+                            // the operation. The previous 200 ms
+                            // `MULTI_SERVER_WINDOW` ceiling on `Initial`
+                            // collapsed a slow-but-live search into "no
+                            // servers found" and let the bucket loop reap the
+                            // still-wanted pending entry as a zombie the
+                            // moment the outer timeout closed the responder.
+                            let result = engine.find(&self.pv_name, reason).await.ok();
+                            match result {
+                                Some(hit) => vec![Candidate {
+                                    addr: hit.server,
+                                    guid: Some(hit.guid),
+                                }],
+                                None => Vec::new(),
+                            }
                         }
+                        Resolver::Direct(addr) => vec![Candidate {
+                            addr: *addr,
+                            guid: None,
+                        }],
                     }
-                    Resolver::Direct(addr) => vec![Candidate {
-                        addr: *addr,
-                        guid: None,
-                    }],
                 }
+            };
+
+            if candidates.is_empty() {
+                return Err(PvaError::Protocol("no servers found for PV".into()));
             }
-        };
 
-        if candidates.is_empty() {
-            return Err(PvaError::Protocol("no servers found for PV".into()));
-        }
-
-        // Try each candidate in order; stash the rest as alternatives.
-        let mut last_err: Option<PvaError> = None;
-        let mut last_failure: Option<FailureClass> = None;
-        for (idx, cand) in candidates.iter().enumerate() {
-            self.set_state(ChannelState::Connecting);
-            match self
-                .pool
-                .get_or_connect(
-                    cand.addr,
-                    &self.user,
-                    &self.host,
-                    self.op_timeout,
-                    self.tcp_timeout,
-                )
-                .await
-            {
-                Err(e) => {
-                    last_err = Some(e);
-                    last_failure = Some(FailureClass::Connect);
-                    continue;
-                }
-                Ok(server) => match self.do_create_channel(&server).await {
-                    Ok(sid) => {
-                        // Stash remaining candidates as alternatives.
-                        let leftovers: Vec<_> = candidates.iter().skip(idx + 1).copied().collect();
-                        *self.alternatives.lock() = leftovers;
-                        self.set_state(ChannelState::Active {
-                            server: server.clone(),
-                            sid,
-                            // Capture the GUID the resolving
-                            // SEARCH_RESPONSE carried for this PV
-                            // (`cand.guid`), so the stored
-                            // `expected_guid` is the identity of the
-                            // server that actually claimed the name —
-                            // pvxs `procSearchReply` parity, where
-                            // `chan->guid` is set from the reply, not
-                            // from a beacon. For a `Direct` resolver
-                            // (no search) fall back to the beacon
-                            // tracker's last GUID for the address. If a
-                            // future reconnect observes a different
-                            // GUID, the ensure_active path detects it.
-                            expected_guid: cand
-                                .guid
-                                .or_else(|| self.resolver.last_guid_for(server.addr)),
-                        });
-                        // Successful Active — clear any pending reconnect
-                        // holdoff; the next disconnect re-derives its pacing
-                        // from its own failure class.
-                        *self.holdoff_until.lock() = None;
-                        return Ok((server, sid));
-                    }
+            // Try each candidate in order; stash the rest as alternatives.
+            let mut last_err: Option<PvaError> = None;
+            let mut last_failure: Option<FailureClass> = None;
+            let mut saw_connect_failure = false;
+            for (idx, cand) in candidates.iter().enumerate() {
+                self.set_state(ChannelState::Connecting);
+                match self
+                    .pool
+                    .get_or_connect(
+                        cand.addr,
+                        &self.user,
+                        &self.host,
+                        self.op_timeout,
+                        self.tcp_timeout,
+                    )
+                    .await
+                {
                     Err(e) => {
                         last_err = Some(e);
-                        last_failure = Some(FailureClass::CreateRefusal);
+                        last_failure = Some(FailureClass::Connect);
+                        saw_connect_failure = true;
                         continue;
                     }
-                },
+                    Ok(server) => match self.do_create_channel(&server).await {
+                        Ok(sid) => {
+                            // Stash remaining candidates as alternatives.
+                            let leftovers: Vec<_> =
+                                candidates.iter().skip(idx + 1).copied().collect();
+                            *self.alternatives.lock() = leftovers;
+                            self.set_state(ChannelState::Active {
+                                server: server.clone(),
+                                sid,
+                                // Capture the GUID the resolving
+                                // SEARCH_RESPONSE carried for this PV
+                                // (`cand.guid`), so the stored
+                                // `expected_guid` is the identity of the
+                                // server that actually claimed the name —
+                                // pvxs `procSearchReply` parity, where
+                                // `chan->guid` is set from the reply, not
+                                // from a beacon. For a `Direct` resolver
+                                // (no search) fall back to the beacon
+                                // tracker's last GUID for the address. If a
+                                // future reconnect observes a different
+                                // GUID, the ensure_active path detects it.
+                                expected_guid: cand
+                                    .guid
+                                    .or_else(|| self.resolver.last_guid_for(server.addr)),
+                            });
+                            // Successful Active — clear any pending reconnect
+                            // holdoff; the next disconnect re-derives its pacing
+                            // from its own failure class.
+                            *self.holdoff_until.lock() = None;
+                            return Ok((server, sid));
+                        }
+                        Err(e) => {
+                            last_err = Some(e);
+                            last_failure = Some(FailureClass::CreateRefusal);
+                            continue;
+                        }
+                    },
+                }
             }
+            // Every candidate failed. A searched CREATE_CHANNEL refusal is a
+            // channel-state transition back to Searching, not a terminal op error:
+            // re-enter the search ring and keep the waiting operation pending
+            // (pvxs clientconn.cpp:368-378). The next pass clears nothing extra —
+            // `alternatives` is already drained — and issues a Reconnect search
+            // that rides the ≤1 s bucket tick.
+            if refusal_reenters_search(last_failure, saw_connect_failure, is_direct) {
+                researched_after_refusal = true;
+                continue;
+            }
+            // Otherwise pace the next attempt by the pvxs failure class (see
+            // `reconnect_holdoff`) and surface the error: a Connecting-stage TCP
+            // failure earns the fixed 10-bucket holdoff, and a direct-server
+            // refusal earns the fixed holdoff in lieu of pvxs "wait for reconnect"
+            // (clientconn.cpp:379-385) — a deliberate deviation, since a direct
+            // channel has no search ring to re-enter and a tight retry against the
+            // same refusing server must be avoided.
+            *self.holdoff_until.lock() =
+                reconnect_holdoff(last_failure, is_direct).map(|d| std::time::Instant::now() + d);
+            return Err(last_err.unwrap_or_else(|| PvaError::Protocol("connect failed".into())));
         }
-        // Every candidate failed. Pace the next attempt by the pvxs failure
-        // class (see `reconnect_holdoff`) instead of a Rust-only exponential
-        // ladder: a Connecting-stage TCP failure earns the fixed 10-bucket
-        // holdoff, a searched `CREATE_CHANNEL` refusal earns none (the search
-        // ring's ≤1 s tick paces the re-search), and a direct-server refusal
-        // earns the fixed holdoff in lieu of pvxs "wait for reconnect".
-        let is_direct = matches!(self.resolver, Resolver::Direct(_));
-        *self.holdoff_until.lock() =
-            reconnect_holdoff(last_failure, is_direct).map(|d| std::time::Instant::now() + d);
-        Err(last_err.unwrap_or_else(|| PvaError::Protocol("connect failed".into())))
     }
 
     fn set_state(&self, new_state: ChannelState) {
@@ -1090,6 +1144,38 @@ mod tests {
         );
         // No classified failure → conservative connect-stage holdoff.
         assert_eq!(reconnect_holdoff(None, false), Some(RECONNECT_HOLDOFF));
+    }
+
+    #[test]
+    fn refusal_reenters_search_only_for_pure_searched_create_refusal() {
+        // Searched channel, every candidate refused CREATE → re-enter the
+        // search ring (pvxs sets state=Searching, re-pushes into the bucket).
+        assert!(refusal_reenters_search(
+            Some(FailureClass::CreateRefusal),
+            false,
+            false
+        ));
+        // Direct channel refusal → no search ring; surface with holdoff.
+        assert!(!refusal_reenters_search(
+            Some(FailureClass::CreateRefusal),
+            false,
+            true
+        ));
+        // A Connecting-stage TCP failure anywhere in the batch → keep the
+        // 10-bucket reconnect holdoff, do NOT hot-retry an unreachable addr.
+        assert!(!refusal_reenters_search(
+            Some(FailureClass::CreateRefusal),
+            true,
+            false
+        ));
+        assert!(!refusal_reenters_search(
+            Some(FailureClass::Connect),
+            true,
+            false
+        ));
+        // No classified failure (empty candidate set already returned) →
+        // not a refusal, do not loop.
+        assert!(!refusal_reenters_search(None, false, false));
     }
 
     /// `close()` must route through `set_state` so the SID-close

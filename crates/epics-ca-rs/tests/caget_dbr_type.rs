@@ -17,6 +17,8 @@
 use std::time::Duration;
 
 use epics_base_rs::server::records::bi::BiRecord;
+use epics_base_rs::server::records::lsi::LsiRecord;
+use epics_base_rs::server::records::printf::PrintfRecord;
 use epics_base_rs::server::records::stringin::StringinRecord;
 use epics_base_rs::server::records::waveform::WaveformRecord;
 use epics_base_rs::types::{
@@ -409,5 +411,109 @@ async fn long_string_count_clamp_trims_char_array() {
     assert_eq!(
         bytes, b"hel",
         "trimmed content must be first 3 chars of string"
+    );
+}
+
+/// A long-string *record* field accessed plainly (no `$`) must advertise
+/// the native type C `cvt_dbaddr` gives it: a scalar `DBF_STRING`,
+/// `no_elements = 1` — NOT the `DBF_CHAR` array of its internal carrier.
+/// printfRecord.c:411-413 sets `field_type = dbr_field_type = DBF_STRING`
+/// and `no_elements = 1` for printf VAL; the Rust record stores the value
+/// as a CHAR array, so the CA boundary decodes it to a scalar string.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn printf_val_native_type_is_scalar_dbr_string() {
+    let port = free_port();
+    let mut rec = PrintfRecord::default();
+    rec.val = "log: 42".to_string();
+    let server = CaServer::builder()
+        .port(port)
+        .record("R3C2:PF:VAL", rec)
+        .build()
+        .await
+        .expect("build CA server");
+    let _h = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    point_client_at(port);
+    let client = CaClient::new().await.expect("client");
+    let ch = client.create_channel("R3C2:PF:VAL");
+    ch.wait_connected(Duration::from_secs(3))
+        .await
+        .expect("connect to printf VAL channel");
+
+    assert_eq!(
+        ch.native_field_type().expect("native field type"),
+        DbFieldType::String,
+        "printf VAL must advertise native DBF_STRING (C cvt_dbaddr), not DBF_CHAR"
+    );
+    assert_eq!(
+        ch.element_count().expect("native element count"),
+        1,
+        "printf VAL native count must be 1 (a single DBR_STRING)"
+    );
+
+    // Plain access delivers the value as a scalar string, not a byte array.
+    let snap = ch
+        .get_with_dbr_type(DBR_STRING, 0)
+        .await
+        .expect("DBR_STRING get on printf VAL");
+    assert_eq!(
+        snap.value,
+        EpicsValue::String("log: 42".into()),
+        "printf VAL plain read must return the formatted string"
+    );
+}
+
+/// lsi/lso VAL & OVAL share the same long-string carrier and the same C
+/// `cvt_dbaddr` scalar-DBF_STRING presentation (lsiRecord.c:141-143).
+/// The CA boundary keys on the record's `long_string_fields()`, so the
+/// whole family — not just printf — reports native DBF_STRING/1. An
+/// over-40-char value clips to the 40-byte DBR_STRING slot exactly as C
+/// does (the full value is reachable only via the `$` modifier).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn lsi_val_native_type_is_scalar_dbr_string_and_clips() {
+    let port = free_port();
+    // 45 chars: longer than MAX_STRING_SIZE (40) so the DBR_STRING slot clips.
+    let long = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHI";
+    let server = CaServer::builder()
+        .port(port)
+        .record("R3C2:LSI:VAL", LsiRecord::new(long))
+        .build()
+        .await
+        .expect("build CA server");
+    let _h = tokio::spawn(async move { server.run().await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    point_client_at(port);
+    let client = CaClient::new().await.expect("client");
+    let ch = client.create_channel("R3C2:LSI:VAL");
+    ch.wait_connected(Duration::from_secs(3))
+        .await
+        .expect("connect to lsi VAL channel");
+
+    assert_eq!(
+        ch.native_field_type().expect("native field type"),
+        DbFieldType::String,
+        "lsi VAL must advertise native DBF_STRING (C cvt_dbaddr), not DBF_CHAR"
+    );
+    assert_eq!(
+        ch.element_count().expect("native element count"),
+        1,
+        "lsi VAL native count must be 1"
+    );
+
+    let snap = ch
+        .get_with_dbr_type(DBR_STRING, 0)
+        .await
+        .expect("DBR_STRING get on lsi VAL");
+    let s = match snap.value {
+        EpicsValue::String(ref s) => s.as_str_lossy().into_owned(),
+        ref other => panic!("expected scalar String, got {other:?}"),
+    };
+    assert!(
+        long.starts_with(&s) && s.len() <= 39,
+        "lsi VAL plain read must clip to the <=39-char DBR_STRING slot; got {s:?}"
     );
 }

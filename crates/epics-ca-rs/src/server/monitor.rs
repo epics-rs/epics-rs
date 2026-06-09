@@ -5,6 +5,7 @@ use tokio::sync::Notify;
 
 use epics_base_rs::runtime::sync::{Mutex, mpsc};
 
+use super::LongStringMode;
 use crate::protocol::*;
 use epics_base_rs::server::pv::{MonitorEvent, ProcessVariable, coalesce_consume};
 use epics_base_rs::types::encode_dbr;
@@ -135,11 +136,13 @@ impl FlowControlGate {
 /// count)` — matches C `read_reply` which keeps the request count
 /// and pads (or uses `snapshot.value.count()` when the request was
 /// autosize=0).
-// `long_string` propagated from `ChannelEntry`; monitor events
-// for `$`-suffix channels are converted from `EpicsValue::String` to
-// `EpicsValue::CharArray` inside `send_event` (C dbChannel.c:483-507).
+// `long_string_mode` propagated from `ChannelEntry`; monitor events are
+// converted inside `send_event` per the channel's mode — `$`-suffix
+// channels `EpicsValue::String` → `EpicsValue::CharArray[40]` (C
+// dbChannel.c:483-507), long-string record fields `EpicsValue::CharArray`
+// → scalar `EpicsValue::String` (C cvt_dbaddr).
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_monitor_sender<W>(
+pub(crate) fn spawn_monitor_sender<W>(
     pv: Arc<ProcessVariable>,
     sub_id: u32,
     data_type: u16,
@@ -148,7 +151,7 @@ pub fn spawn_monitor_sender<W>(
     flow_control: Arc<FlowControlGate>,
     mut rx: mpsc::Receiver<MonitorEvent>,
     denied: Arc<AtomicBool>,
-    long_string: bool,
+    long_string_mode: LongStringMode,
 ) -> tokio::task::JoinHandle<()>
 where
     W: AsyncWrite + Unpin + Send + 'static,
@@ -184,9 +187,16 @@ where
             if denied.load(Ordering::Acquire) {
                 continue;
             }
-            if send_event(data_type, data_count, sub_id, &event, &writer, long_string)
-                .await
-                .is_err()
+            if send_event(
+                data_type,
+                data_count,
+                sub_id,
+                &event,
+                &writer,
+                long_string_mode,
+            )
+            .await
+            .is_err()
             {
                 break;
             }
@@ -200,20 +210,22 @@ async fn send_event<W: AsyncWrite + Unpin + Send + 'static>(
     sub_id: u32,
     event: &MonitorEvent,
     writer: &Arc<Mutex<BufWriter<W>>>,
-    long_string: bool,
+    long_string_mode: LongStringMode,
 ) -> std::io::Result<()> {
-    // for `$` long-string channels convert String → CharArray+NUL
-    // before encoding. Clone only when needed (most channels are not `$`).
+    // Apply the channel's long-string boundary conversion before
+    // encoding (`$` → CHAR[40]+NUL, or a long-string record field →
+    // scalar DBR_STRING). Clone only when a conversion actually runs
+    // (most channels are `Plain`).
     let ls_snap;
-    let snapshot = if long_string {
+    let snapshot = if long_string_mode == LongStringMode::Plain {
+        &event.snapshot
+    } else {
         ls_snap = {
             let mut s = event.snapshot.clone();
-            super::apply_long_string(&mut s);
+            super::apply_long_string_mode(&mut s, long_string_mode);
             s
         };
         &ls_snap
-    } else {
-        &event.snapshot
     };
     let mut payload = encode_dbr(data_type, snapshot)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "encode"))?;
@@ -356,7 +368,7 @@ mod tests {
 
         // data_count = 0 means autosize (use snapshot's actual count);
         // matches every producer caller.
-        send_event(DBR_LONG, 0, 7, &event, &writer, false)
+        send_event(DBR_LONG, 0, 7, &event, &writer, LongStringMode::Plain)
             .await
             .expect("send_event must succeed");
 

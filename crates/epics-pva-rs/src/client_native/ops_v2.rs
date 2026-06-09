@@ -2007,6 +2007,46 @@ pub fn encode_pv_request_value(req: &PvField, order: ByteOrder) -> Vec<u8> {
     out
 }
 
+/// Extract the `record._options` scalar entries from a decoded pvRequest
+/// VALUE into the `(name, ScalarValue)` pairs
+/// [`MonitorFlow::from_record_options`] consumes. Mirrors the server's
+/// pvRequest navigation (`server_native::tcp::monitor_pipeline_options`):
+/// root → `record` → `_options` → scalar leaves. A request with no
+/// `record._options` structure (a plain monitor) yields an empty list,
+/// which `from_record_options` reads as pipeline-disabled — so a forwarded
+/// gateway request that never asked for a pipeline opens a plain upstream
+/// monitor, matching pvxs.
+fn record_options_from_request(req: &PvField) -> Vec<(String, crate::pvdata::ScalarValue)> {
+    let root = match req {
+        PvField::Structure(s) => s,
+        _ => return Vec::new(),
+    };
+    let record = match root
+        .fields
+        .iter()
+        .find_map(|(k, v)| (k == "record").then_some(v))
+    {
+        Some(PvField::Structure(s)) => s,
+        _ => return Vec::new(),
+    };
+    let options = match record
+        .fields
+        .iter()
+        .find_map(|(k, v)| (k == "_options").then_some(v))
+    {
+        Some(PvField::Structure(s)) => s,
+        _ => return Vec::new(),
+    };
+    options
+        .fields
+        .iter()
+        .filter_map(|(k, v)| match v {
+            PvField::Scalar(sv) => Some((k.clone(), sv.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Raw-frame monitor entry: like [`op_monitor`] but the
 /// callback receives the **raw MONITOR DATA body bytes** (the
 /// `changed | value | overrun` triplet from the wire) instead of a
@@ -2047,7 +2087,7 @@ where
             sid,
             &fields_owned,
             None,
-            pipeline_size,
+            MonitorFlow::window(pipeline_size),
             &mut callback,
             None,
         )
@@ -2126,12 +2166,28 @@ fn spawn_raw_frames_handle<F>(
 where
     F: FnMut(&FieldDesc, bytes::Bytes, ByteOrder) + Send + 'static,
 {
+    // Flow control shares one origin with the wire request: a forwarded
+    // pvRequest's own `record._options.{pipeline,queueSize,ackAny}` drive
+    // the INIT pipeline bit / `nack` trailer and ACK cadence (pvxs
+    // MonitorBuilder::exec, clientmon.cpp:761-808), exactly as the typed
+    // `op_monitor_raw` path. A gateway forwarding a downstream request that
+    // omits `pipeline=true` therefore opens a plain upstream monitor and
+    // sends no ACKs — matching pvxs, whose servers enable pipeline only
+    // from the pvRequest (servermon.cpp:523-552). With no forwarded request
+    // the client's configured window stands (the auto-built request injects
+    // the matching options).
+    let flow = match &pv_request {
+        Some(req) => {
+            MonitorFlow::from_record_options(&record_options_from_request(req), pipeline_size)
+        }
+        None => MonitorFlow::window(pipeline_size),
+    };
     let state = Arc::new(SubscriptionState {
         active: parking_lot::Mutex::new(None),
         paused: std::sync::atomic::AtomicBool::new(false),
         stop: std::sync::atomic::AtomicBool::new(false),
         stats: parking_lot::Mutex::new(SubscriptionStat {
-            limit_queue: pipeline_size,
+            limit_queue: flow.queue_size,
             ..Default::default()
         }),
         cancel: tokio::sync::Notify::new(),
@@ -2166,7 +2222,7 @@ where
                 sid,
                 &fields_owned,
                 pv_request.as_ref(),
-                pipeline_size,
+                flow,
                 &mut callback,
                 Some(state_for_task.clone()),
             )
@@ -2200,7 +2256,7 @@ async fn run_raw_monitor_loop<F>(
     sid: u32,
     fields: &[String],
     pv_request: Option<&PvField>,
-    pipeline_size: u32,
+    flow: MonitorFlow,
     callback: &mut F,
     state: Option<Arc<SubscriptionState>>,
 ) -> Result<(), MonitorEnd>
@@ -2211,57 +2267,63 @@ where
     let big_endian = matches!(order, ByteOrder::Big);
     let codec = PvaCodec { big_endian };
     let ioid = alloc_ioid();
-    // when `pipeline_size > 0`, inject
-    // `record._options.pipeline = "true"` + `queueSize` into the
-    // pvRequest and set the MONITOR INIT pipeline bit + initial
-    // nack trailer. Server-side credit window is keyed on the
-    // pvRequest options (pvxs servermon.cpp:523-552); pre-fix Rust
-    // sent the pipeline size on START as a trailer the server never
-    // read.
+    // Flow control and the wire request share one origin. A caller-
+    // supplied pvRequest is encoded verbatim, and `flow` was derived from
+    // that SAME request's `record._options` (see `spawn_raw_frames_handle`
+    // / `record_options_from_request`), so the INIT pipeline bit + `nack`
+    // trailer and the ACK cadence below cannot disagree with the wire
+    // `queueSize`/`pipeline` the server negotiates. Servers enable pipeline
+    // only from the pvRequest (pvxs servermon.cpp:523-552), not the INIT
+    // subcmd bit, so a forwarded request without `pipeline=true` opens a
+    // plain upstream monitor here too. With no caller request the
+    // auto-built pvRequest injects the pipeline options iff `flow.pipeline`
+    // (the client's configured window).
     let refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
-    let pv_req: std::borrow::Cow<'_, [u8]> = if let Some(req) = pv_request {
-        // A caller-supplied pvRequest (e.g. the PVA gateway forwarding a
-        // downstream's MONITOR INIT request so the upstream applies the
-        // same field projection / `_filter` chain) is encoded verbatim
-        // in THIS connection's byte order. Re-encoding per reconnect is
-        // why it is carried as a decoded value, not pre-serialized bytes
-        // (a reconnect may land on a peer of the opposite endianness).
-        // The pipeline INIT bit / nack below stays driven by
-        // `pipeline_size` — the gateway's own upstream credit window for
-        // its `Pauser`-based backpressure — independent of the
-        // downstream's options that the forwarded request also carries.
-        std::borrow::Cow::Owned(encode_pv_request_value(req, order))
-    } else if pipeline_size > 0 {
-        // Empty field list → empty `field {}` sub-structure, which
-        // `request_to_mask` reads as "select the whole structure"
-        // (pv_request.rs `request_field.is_empty()`). Forcing a
-        // `field(value)` here narrowed the default monitor to the
-        // `value` leaf and broke any PV whose top-level descriptor is
-        // not a structure with a `value` member (e.g. a bare-scalar
-        // `SharedPV`): the server rejects `field(value)` with
-        // `RequestMaskError::EmptyMask`.
-        std::borrow::Cow::Owned(crate::pv_request::build_pv_request_pipeline(
-            &refs,
-            pipeline_size,
-            big_endian,
-        ))
-    } else if fields.is_empty() {
-        std::borrow::Cow::Borrowed(sentinel_all_fields())
-    } else {
-        std::borrow::Cow::Owned(build_pv_request_fields(&refs, big_endian))
+    let pv_req: std::borrow::Cow<'_, [u8]> = match pv_request {
+        Some(req) => {
+            // Re-encoded per reconnect (carried as a decoded value, not
+            // pre-serialized bytes) so a reconnect onto an opposite-endian
+            // peer stays correct. pva2pva forwards the serialized
+            // downstream pvRequest verbatim (p2pApp/channel.cpp:157-193).
+            std::borrow::Cow::Owned(encode_pv_request_value(req, order))
+        }
+        None if flow.pipeline => {
+            // Empty field list → empty `field {}` sub-structure, which
+            // `request_to_mask` reads as "select the whole structure"
+            // (pv_request.rs `request_field.is_empty()`). Forcing a
+            // `field(value)` here narrowed the default monitor to the
+            // `value` leaf and broke any PV whose top-level descriptor is
+            // not a structure with a `value` member (e.g. a bare-scalar
+            // `SharedPV`): the server rejects `field(value)` with
+            // `RequestMaskError::EmptyMask`.
+            std::borrow::Cow::Owned(crate::pv_request::build_pv_request_pipeline(
+                &refs,
+                flow.queue_size,
+                big_endian,
+            ))
+        }
+        None if fields.is_empty() => std::borrow::Cow::Borrowed(sentinel_all_fields()),
+        None => std::borrow::Cow::Owned(build_pv_request_fields(&refs, big_endian)),
     };
     let mut stream = server.register_ioid_stream(sid, ioid, Command::Monitor.code());
-    let init_req = codec.build_monitor_init(
-        sid,
-        ioid,
-        &pv_req,
-        (pipeline_size > 0).then_some(pipeline_size),
-    );
+    let init_req =
+        codec.build_monitor_init(sid, ioid, &pv_req, flow.pipeline.then_some(flow.queue_size));
     server
         .send_for_channel(sid, init_req)
         .await
         .map_err(|_| MonitorEnd::ConnectionLost)?;
-    let init_frame = stream.recv().await.ok_or(MonitorEnd::ConnectionLost)?;
+    // Cancel-aware INIT receive (see `recv_monitor_init`). `active` is not
+    // yet published, so a teardown here only unregisters the local IOID
+    // and ends ChannelClosed — no DESTROY, matching pvxs `_cancel()` in
+    // the Creating phase (clientmon.cpp:810-824).
+    let init_frame = match recv_monitor_init(&state, &mut stream).await {
+        MonitorInit::Reply(f) => f,
+        MonitorInit::Cancelled => {
+            server.unregister_ioid(ioid);
+            return Err(MonitorEnd::ChannelClosed);
+        }
+        MonitorInit::Lost => return Err(MonitorEnd::ConnectionLost),
+    };
     let init = match decode_op_response(&init_frame, None) {
         Ok(OpResponse::Init(i)) => i,
         Ok(other) => {
@@ -2400,7 +2462,7 @@ where
                 st.max_events_per_ack = events_since_ack;
             }
         }
-        if pipeline_size > 0 && events_since_ack >= ack_threshold(pipeline_size) {
+        if flow.pipeline && events_since_ack >= flow.ack_at {
             let ack = codec.build_monitor_ack(sid, ioid, events_since_ack);
             if server.send_for_channel(sid, ack).await.is_err() {
                 server.unregister_ioid(ioid);
@@ -2741,7 +2803,18 @@ where
         .send_for_channel(sid, init_req)
         .await
         .map_err(|_| MonitorEnd::ConnectionLost)?;
-    let init_frame = stream.recv().await.ok_or(MonitorEnd::ConnectionLost)?;
+    // Cancel-aware INIT receive (see `recv_monitor_init`). `active` is not
+    // yet published, so a teardown here only unregisters the local IOID
+    // and ends ChannelClosed — no DESTROY, matching pvxs `_cancel()` in
+    // the Creating phase (clientmon.cpp:810-824).
+    let init_frame = match recv_monitor_init(&state, &mut stream).await {
+        MonitorInit::Reply(f) => f,
+        MonitorInit::Cancelled => {
+            server.unregister_ioid(ioid);
+            return Err(MonitorEnd::ChannelClosed);
+        }
+        MonitorInit::Lost => return Err(MonitorEnd::ConnectionLost),
+    };
     let init = match decode_op_response(&init_frame, None) {
         Ok(OpResponse::Init(i)) => i,
         Ok(other) => {
@@ -3235,8 +3308,14 @@ async fn op_put_get_data(
     server.send_for_channel(sid, init_frame).await?;
 
     let init_resp = await_frame(&mut stream, op_timeout).await?;
-    let intro = match decode_put_get_init(&init_resp, &mut cache) {
-        Ok(Ok(intro)) => intro,
+    // pvAccessCPP keeps two client containers after INIT (`m_putData` from
+    // putIF, `m_getData` from getIF, clientContextImpl.cpp:1036-1040): the
+    // put leg is built/serialized against putIF, the get-side readback is
+    // decoded against getIF, and `getPut` reads put-side data back through
+    // putIF (:1156-1170). Using one descriptor for both breaks against a
+    // server whose put and get structures differ.
+    let (put_if, get_if) = match decode_put_get_init(&init_resp, &mut cache) {
+        Ok(Ok(descs)) => descs,
         Ok(Err(status)) => {
             server.unregister_ioid(ioid);
             return Err(PvaError::Protocol(format!(
@@ -3252,30 +3331,30 @@ async fn op_put_get_data(
     ioid_guard.arm_destroy(sid);
 
     // Data — `sid + ioid + subcmd [+ put bitset + put value]`. putGet
-    // (`Some`) carries a payload built against the negotiated
-    // introspection; getGet/getPut (`None`) send none.
+    // (`Some`) carries a payload built against the PUT descriptor;
+    // getGet/getPut (`None`) send none.
     let mut data = Vec::new();
     data.put_u32(sid, order);
     data.put_u32(ioid, order);
     data.put_u8(data_subcmd);
-    // putGet carries a put payload (string-parsed or typed); getGet/getPut
-    // (`None`) send none.
+    // putGet carries a put payload (string-parsed or typed) built against
+    // the PUT descriptor; getGet/getPut (`None`) send none.
     let put_value = match put {
         PutGetPut::None => None,
-        PutGetPut::Str(value_str) => Some(build_put_value(&intro, value_str)?),
-        PutGetPut::Typed(value) => Some(coerce_typed_put_value(&intro, value)?),
+        PutGetPut::Str(value_str) => Some(build_put_value(&put_if, value_str)?),
+        PutGetPut::Typed(value) => Some(coerce_typed_put_value(&put_if, value)?),
     };
     if let Some(value) = put_value {
         let mut changed = BitSet::new();
-        if let Some(bit) = intro.bit_for_path("value") {
+        if let Some(bit) = put_if.bit_for_path("value") {
             changed.set(bit);
         } else {
             changed.set(0);
         }
         changed.write_into(order, &mut data);
         // pvxs `from_wire_valid` decodes a BitSet delta — only the fields
-        // whose bit is set. Encode consistently.
-        encode_pv_field_with_bitset(&value, &intro, &changed, 0, order, &mut data);
+        // whose bit is set. Encode consistently against the PUT descriptor.
+        encode_pv_field_with_bitset(&value, &put_if, &changed, 0, order, &mut data);
     }
     let data_h = PvaHeader::application(false, order, Command::PutGet.code(), data.len() as u32);
     let mut data_frame = Vec::with_capacity(8 + data.len());
@@ -3284,13 +3363,19 @@ async fn op_put_get_data(
     server.send_for_channel(sid, data_frame).await?;
 
     let resp_frame = await_frame(&mut stream, op_timeout).await?;
-    let result = match decode_put_get_data(&resp_frame, &intro, &mut cache) {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(status)) => Err(PvaError::Protocol(format!("PUT_GET: {status:?}"))),
-        Err(e) => {
-            // Command mismatch or truncated data body is fatal.
-            server.close();
-            Err(e)
+    // getPut (`QOS_GET_PUT`) reads the PUT-side data, so decode and return
+    // the PUT descriptor; putGet and getGet read GET-side data → getIF.
+    let is_get_put = data_subcmd & QosFlags::GET_PUT != 0;
+    let result = {
+        let resp_desc = if is_get_put { &put_if } else { &get_if };
+        match decode_put_get_data(&resp_frame, resp_desc, &mut cache) {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(status)) => Err(PvaError::Protocol(format!("PUT_GET: {status:?}"))),
+            Err(e) => {
+                // Command mismatch or truncated data body is fatal.
+                server.close();
+                Err(e)
+            }
         }
     };
 
@@ -3298,12 +3383,20 @@ async fn op_put_get_data(
     let destroy = codec.build_destroy_request(sid, ioid);
     let _ = server.send_for_channel(sid, destroy).await;
     server.unregister_ioid(ioid);
-    result.map(|v| (intro, v))
+    let resp_desc = if is_get_put { put_if } else { get_if };
+    result.map(|v| (resp_desc, v))
 }
 
 /// Decode a `PUT_GET` INIT response: `ioid + subcmd + status + putIF +
-/// getIF`. On success returns the get-leg introspection (used to encode
-/// the put value and decode the readback).
+/// getIF`. On success returns BOTH leg descriptors as `(put_if, get_if)`.
+///
+/// pvAccessCPP keeps the two as separate client containers (`m_putData` /
+/// `m_getData`, clientContextImpl.cpp:1036-1040): the put leg is built and
+/// serialized against `putIF`, the get-side readback is deserialized
+/// against `getIF`, and a `getPut` reads the put-side data back through
+/// `putIF`. Returning only `getIF` (and using it for the put leg too) is
+/// the descriptor-selection bug this fixes — it breaks against a server
+/// whose put and get structures differ.
 ///
 /// The two-level result separates connection-fatal faults from per-op
 /// failures: an outer `Err` (command/subcommand mismatch, truncated body)
@@ -3313,7 +3406,7 @@ async fn op_put_get_data(
 fn decode_put_get_init(
     frame: &super::decode::Frame,
     type_cache: &mut crate::pvdata::encode::TypeCache,
-) -> PvaResult<Result<FieldDesc, crate::proto::Status>> {
+) -> PvaResult<Result<(FieldDesc, FieldDesc), crate::proto::Status>> {
     if frame.header.command != Command::PutGet.code() {
         return Err(PvaError::Protocol(format!(
             "expected PUT_GET INIT, got command {}",
@@ -3336,14 +3429,15 @@ fn decode_put_get_init(
     if !status.is_success() {
         return Ok(Err(status));
     }
-    // putIF then getIF. The put structure is decoded (advancing the
-    // cursor + populating the type cache) but the get structure is
-    // what the data legs use.
-    let _put_if = crate::pvdata::encode::decode_type_desc_cached(&mut cur, order, type_cache)
+    // putIF then getIF. Both are decoded (advancing the cursor +
+    // populating the type cache) and BOTH are returned: the put leg uses
+    // putIF, the get-side readback uses getIF, and getPut reads put-side
+    // data back through putIF (pvAccessCPP m_putData / m_getData).
+    let put_if = crate::pvdata::encode::decode_type_desc_cached(&mut cur, order, type_cache)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
     let get_if = crate::pvdata::encode::decode_type_desc_cached(&mut cur, order, type_cache)
         .map_err(|e| PvaError::Decode(e.to_string()))?;
-    Ok(Ok(get_if))
+    Ok(Ok((put_if, get_if)))
 }
 
 /// Decode a `PUT_GET` data response: `ioid + subcmd + status + get
@@ -4102,6 +4196,56 @@ async fn await_frame(
         .map_err(|_| PvaError::Timeout)?
         .ok_or_else(|| PvaError::Protocol("connection closed".into()))?;
     Ok(frame)
+}
+
+/// Outcome of [`recv_monitor_init`].
+enum MonitorInit {
+    /// The server's MONITOR INIT reply arrived.
+    Reply(super::decode::Frame),
+    /// A stop()/teardown fired (or `stop` was already set) before the
+    /// reply: the caller must unregister the IOID and end ChannelClosed.
+    Cancelled,
+    /// The frame stream closed before any reply: connection lost.
+    Lost,
+}
+
+/// Race a monitor's INIT reply against the subscription's cancel signal.
+///
+/// This is the await that sits after `register_ioid_stream` but before
+/// `active` is published. A stop()/teardown issued in that window must
+/// complete the caller's cancel promptly instead of parking forever on a
+/// silent or withholding server — the same hazard the data loops guard.
+/// pvxs `_cancel()` completes synchronously even in the Creating phase and
+/// sends no DESTROY for a not-yet-acknowledged op (clientmon.cpp:810-824),
+/// so the caller's [`MonitorInit::Cancelled`] handling unregisters only the
+/// local IOID. With no handle (`state` is `None`) the op cannot be
+/// cancelled, so it simply awaits the reply. Shared by `run_monitor_loop`
+/// and `run_raw_monitor_loop` so both honour the same rule.
+async fn recv_monitor_init(
+    state: &Option<Arc<SubscriptionState>>,
+    stream: &mut mpsc::UnboundedReceiver<super::decode::Frame>,
+) -> MonitorInit {
+    match state {
+        Some(s) => {
+            // A teardown that raced just ahead of this await already set
+            // `stop`; honour it before parking on the stream.
+            if s.stop.load(Ordering::Relaxed) {
+                return MonitorInit::Cancelled;
+            }
+            tokio::select! {
+                biased;
+                _ = s.cancel.notified() => MonitorInit::Cancelled,
+                f = stream.recv() => match f {
+                    Some(f) => MonitorInit::Reply(f),
+                    None => MonitorInit::Lost,
+                },
+            }
+        }
+        None => match stream.recv().await {
+            Some(f) => MonitorInit::Reply(f),
+            None => MonitorInit::Lost,
+        },
+    }
 }
 
 /// Single-shot variant of [`await_frame`] for the new TwoShot ioid
@@ -5442,6 +5586,82 @@ mod tests {
         assert_eq!(f.ack_at, ack_threshold(4));
     }
 
+    /// Build a decoded pvRequest VALUE carrying `record._options.<pairs>`,
+    /// the shape the gateway forwards into the raw-frame monitor path.
+    fn pv_request_with_options(pairs: &[(&str, PvField)]) -> PvField {
+        use crate::pvdata::PvStructure;
+        let options_value = PvField::Structure(PvStructure {
+            struct_id: String::new(),
+            fields: pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+        });
+        let record_value = PvField::Structure(PvStructure {
+            struct_id: String::new(),
+            fields: vec![("_options".to_string(), options_value)],
+        });
+        PvField::Structure(PvStructure {
+            struct_id: String::new(),
+            fields: vec![("record".to_string(), record_value)],
+        })
+    }
+
+    /// The raw-frame monitor path must derive its `MonitorFlow` from the
+    /// forwarded request's own `record._options` — including TYPED values a
+    /// pvxs builder client sends (`Boolean`/`UInt`), not just the parsed
+    /// string form — so the wire pipeline/queueSize and the ACK cadence
+    /// share one origin. `ackAny=75%` of 16 → ackAt 12 (pvxs parity).
+    #[test]
+    fn record_options_from_request_extracts_typed_pipeline_options() {
+        let req = pv_request_with_options(&[
+            ("pipeline", PvField::Scalar(ScalarValue::Boolean(true))),
+            ("queueSize", PvField::Scalar(ScalarValue::UInt(16))),
+            ("ackAny", PvField::Scalar(ScalarValue::String("75%".into()))),
+        ]);
+        let extracted = record_options_from_request(&req);
+        assert_eq!(
+            extracted.len(),
+            3,
+            "all three scalar options must be extracted"
+        );
+        let flow = MonitorFlow::from_record_options(&extracted, 4);
+        assert!(flow.pipeline);
+        assert_eq!(flow.queue_size, 16);
+        assert_eq!(flow.ack_at, 12);
+    }
+
+    /// A forwarded plain monitor request (no `record._options`) must
+    /// extract nothing and derive a plain (non-pipeline) flow — pvxs
+    /// servers enable pipeline only from the pvRequest, so the client must
+    /// not send a `nack` trailer / ACKs the server would ignore.
+    #[test]
+    fn record_options_from_request_plain_request_yields_no_pipeline() {
+        let req = PvField::Structure(crate::pvdata::PvStructure {
+            struct_id: String::new(),
+            fields: vec![],
+        });
+        assert!(record_options_from_request(&req).is_empty());
+        let flow = MonitorFlow::from_record_options(&record_options_from_request(&req), 4);
+        assert!(!flow.pipeline);
+        assert_eq!(flow.queue_size, 0);
+        assert_eq!(flow.ack_at, 0);
+    }
+
+    /// A forwarded request naming `queueSize` but NOT `pipeline` must stay
+    /// plain (pvxs `clientmon.cpp` defaults `pipeline` false): the gateway
+    /// forwarding such a request opens a plain upstream monitor, not a
+    /// pipelined one driven by the client's builder default.
+    #[test]
+    fn record_options_queue_size_without_pipeline_stays_plain() {
+        let req = pv_request_with_options(&[("queueSize", PvField::Scalar(ScalarValue::UInt(16)))]);
+        let extracted = record_options_from_request(&req);
+        assert_eq!(extracted.len(), 1);
+        let flow = MonitorFlow::from_record_options(&extracted, 4);
+        assert!(!flow.pipeline);
+        assert_eq!(flow.queue_size, 0);
+    }
+
     fn idle_sub_state() -> Arc<SubscriptionState> {
         Arc::new(SubscriptionState {
             active: parking_lot::Mutex::new(None),
@@ -5502,6 +5722,103 @@ mod tests {
         assert!(state.active.lock().is_none());
     }
 
+    fn dummy_monitor_frame() -> Frame {
+        let payload = vec![0u8; 4];
+        let header = PvaHeader::application(
+            true,
+            ByteOrder::Little,
+            Command::Monitor.code(),
+            payload.len() as u32,
+        );
+        Frame { header, payload }
+    }
+
+    /// The MONITOR INIT receive is the await between `register_ioid_stream`
+    /// and publishing `active`. A `stop_sync()`/teardown issued while the
+    /// server withholds the INIT reply must complete the cancel promptly
+    /// (return `Cancelled`) rather than hang the spawned monitor task
+    /// forever — the regression this fix closes.
+    #[tokio::test]
+    async fn recv_monitor_init_cancels_on_teardown_during_wait() {
+        let state = idle_sub_state();
+        let task_state = Some(state.clone());
+        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
+        let task = tokio::spawn(async move { recv_monitor_init(&task_state, &mut rx).await });
+        // Let the task reach its `select!` (silent-but-open server).
+        tokio::task::yield_now().await;
+        state.teardown();
+        let out = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("INIT recv must wake on teardown, not hang on a silent server")
+            .expect("task panicked");
+        assert!(
+            matches!(out, MonitorInit::Cancelled),
+            "a teardown during the INIT wait must yield Cancelled"
+        );
+        // Keep the sender alive until here so the stream modelled an open
+        // (silent) server, not a closed one.
+        drop(tx);
+    }
+
+    /// A teardown that races just ahead of the INIT receive sets `stop`
+    /// before the loop reaches the await; the pre-check must short-circuit
+    /// to `Cancelled` WITHOUT consuming a reply that may already be queued.
+    #[tokio::test]
+    async fn recv_monitor_init_cancels_when_stop_preset() {
+        let state = idle_sub_state();
+        state.stop.store(true, Ordering::Relaxed);
+        let opt = Some(state.clone());
+        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
+        tx.send(dummy_monitor_frame()).unwrap(); // a reply is even available
+        match recv_monitor_init(&opt, &mut rx).await {
+            MonitorInit::Cancelled => {}
+            _ => panic!("a preset stop must short-circuit to Cancelled"),
+        }
+        assert!(
+            rx.try_recv().is_ok(),
+            "preset stop must not consume the queued INIT reply"
+        );
+    }
+
+    /// The happy path: a queued INIT reply is delivered as `Reply`.
+    #[tokio::test]
+    async fn recv_monitor_init_returns_reply_when_frame_arrives() {
+        let state = Some(idle_sub_state());
+        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
+        tx.send(dummy_monitor_frame()).unwrap();
+        match recv_monitor_init(&state, &mut rx).await {
+            MonitorInit::Reply(_) => {}
+            _ => panic!("a queued INIT reply must yield Reply"),
+        }
+    }
+
+    /// A frame stream closed before any reply is `Lost` (connection lost),
+    /// distinct from a cancel — the caller maps it to ConnectionLost and
+    /// lets the reconnect loop retry.
+    #[tokio::test]
+    async fn recv_monitor_init_lost_when_stream_closed() {
+        let state = Some(idle_sub_state());
+        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
+        drop(tx); // server connection gone, no reply will arrive
+        match recv_monitor_init(&state, &mut rx).await {
+            MonitorInit::Lost => {}
+            _ => panic!("a closed stream before the reply must yield Lost"),
+        }
+    }
+
+    /// The no-handle path (plain `op_monitor`, `state == None`) cannot be
+    /// cancelled, so it still simply awaits and delivers the reply.
+    #[tokio::test]
+    async fn recv_monitor_init_no_handle_awaits_reply() {
+        let state: Option<Arc<SubscriptionState>> = None;
+        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
+        tx.send(dummy_monitor_frame()).unwrap();
+        match recv_monitor_init(&state, &mut rx).await {
+            MonitorInit::Reply(_) => {}
+            _ => panic!("the no-handle path must still deliver the reply"),
+        }
+    }
+
     // ── op-response decode-fault → circuit close regressions ─────────────
     //
     // pvxs resets the circuit (`bev.reset()`, clientget.cpp:456-493) on a
@@ -5555,13 +5872,75 @@ mod tests {
     }
 
     #[test]
-    fn put_get_init_success_decodes_get_introspection() {
+    fn put_get_init_success_decodes_both_introspections() {
         let frame = put_get_init_frame(ByteOrder::Little, crate::proto::Status::ok(), true);
         let mut cache = crate::pvdata::encode::TypeCache::new();
         match decode_put_get_init(&frame, &mut cache) {
-            Ok(Ok(intro)) => assert!(matches!(intro, FieldDesc::Structure { .. })),
-            other => panic!("successful INIT must yield Ok(Ok(getIF)), got {other:?}"),
+            Ok(Ok((put_if, get_if))) => {
+                assert!(matches!(put_if, FieldDesc::Structure { .. }));
+                assert!(matches!(get_if, FieldDesc::Structure { .. }));
+            }
+            other => panic!("successful INIT must yield Ok(Ok((putIF, getIF))), got {other:?}"),
         }
+    }
+
+    fn scalar_string_struct() -> FieldDesc {
+        FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![("value".into(), FieldDesc::Scalar(ScalarType::String))],
+        }
+    }
+
+    /// PUT_GET INIT with DISTINCT putIF (String value) and getIF (Int
+    /// value): the decoder must return BOTH descriptors, not silently
+    /// discard putIF. pvAccessCPP keeps `m_putData` (putIF) separate from
+    /// `m_getData` (getIF); building the put leg or decoding a `getPut`
+    /// against getIF would corrupt the wire layout when the structures
+    /// differ (clientContextImpl.cpp:1036-1040).
+    #[test]
+    fn put_get_init_returns_distinct_put_and_get_descriptors() {
+        let put = scalar_string_struct();
+        let get = scalar_int_struct();
+        let mut payload = Vec::new();
+        payload.put_u32(7, ByteOrder::Little);
+        payload.put_u8(QosFlags::INIT);
+        crate::proto::Status::ok().write_into(ByteOrder::Little, &mut payload);
+        encode_type_desc(&put, ByteOrder::Little, &mut payload); // putIF
+        encode_type_desc(&get, ByteOrder::Little, &mut payload); // getIF
+        let header = PvaHeader::application(
+            true,
+            ByteOrder::Little,
+            Command::PutGet.code(),
+            payload.len() as u32,
+        );
+        let frame = Frame { header, payload };
+        let mut cache = crate::pvdata::encode::TypeCache::new();
+        let (put_if, get_if) = match decode_put_get_init(&frame, &mut cache) {
+            Ok(Ok(descs)) => descs,
+            other => panic!("distinct INIT must decode to (putIF, getIF), got {other:?}"),
+        };
+        // putIF's value leaf is String; getIF's value leaf is Int — the two
+        // must be carried separately.
+        let put_value_ty = match &put_if {
+            FieldDesc::Structure { fields, .. } => {
+                fields.iter().find(|(n, _)| n == "value").map(|(_, d)| d)
+            }
+            _ => None,
+        };
+        let get_value_ty = match &get_if {
+            FieldDesc::Structure { fields, .. } => {
+                fields.iter().find(|(n, _)| n == "value").map(|(_, d)| d)
+            }
+            _ => None,
+        };
+        assert!(
+            matches!(put_value_ty, Some(FieldDesc::Scalar(ScalarType::String))),
+            "putIF value leaf must be String, got {put_value_ty:?}"
+        );
+        assert!(
+            matches!(get_value_ty, Some(FieldDesc::Scalar(ScalarType::Int))),
+            "getIF value leaf must be Int, got {get_value_ty:?}"
+        );
     }
 
     #[test]

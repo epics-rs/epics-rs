@@ -348,10 +348,30 @@ impl PvRequestBuilder {
         self
     }
 
-    /// Replace the builder state by parsing a pvRequest string in
-    /// pvxs syntax (`field(a,b)record[pipeline=true]`). Mirrors
-    /// pvxs `RequestBuilder::pvRequest(str)`.
+    /// Replace the builder state by parsing a pvRequest string in the
+    /// **strict pvxs grammar**, exactly as pvxs `RequestBuilder::pvRequest(str)`
+    /// does: pvxs always runs `PVRParser` via `CommonBase::_parse`
+    /// (clientreq.cpp:137-283), which accepts only `field(name,...)`,
+    /// `record[name=value,...]`, and the bare-name shorthand. The lenient
+    /// pvDataCPP `createRequest` extensions — brace member groups
+    /// (`field(v{a,b})`), per-field option brackets
+    /// (`field(v[deadband=abs:1.0])`), and quoted / `:`-bearing option values —
+    /// are rejected here, so a string this method accepts is also accepted by
+    /// pvxs. For the extended pvData filter grammar use
+    /// [`pv_request_lenient`](Self::pv_request_lenient).
     pub fn pv_request(mut self, expr: &str) -> Result<Self, PvRequestParseError> {
+        self.expr = PvRequestExpr::parse_pvxs_compat(expr)?;
+        Ok(self)
+    }
+
+    /// Replace the builder state by parsing a pvRequest string in the lenient
+    /// pvDataCPP `createRequest` extension grammar (brace member groups,
+    /// per-field option brackets, quoted / `:`-bearing option values). This is
+    /// a deliberate superset of pvxs `RequestBuilder::pvRequest(str)` and does
+    /// **not** claim pvxs request-builder parity — use
+    /// [`pv_request`](Self::pv_request) where strict pvxs acceptance is
+    /// required (e.g. anything advertised as pvxs command-line compatible).
+    pub fn pv_request_lenient(mut self, expr: &str) -> Result<Self, PvRequestParseError> {
         self.expr = PvRequestExpr::parse(expr)?;
         Ok(self)
     }
@@ -863,7 +883,19 @@ impl<'a> Parser<'a> {
 
     fn skip_whitespace(&mut self) {
         while let Some(c) = self.peek_char() {
-            if c.is_whitespace() {
+            // pvxs `PVRParser::lex` (clientreq.cpp:146-147) skips only the
+            // literal ASCII space before lexing; a tab/newline/CR is an
+            // invalid character that the lexer then rejects (`start==input`
+            // throw at clientreq.cpp:174). Strict mode must reject those
+            // too, so it only consumes `' '`. The lenient pvDataCPP
+            // `createRequest` superset stays permissive and skips all
+            // whitespace.
+            let skippable = if self.strict {
+                c == ' '
+            } else {
+                c.is_whitespace()
+            };
+            if skippable {
                 self.advance(c.len_utf8());
             } else {
                 break;
@@ -1290,6 +1322,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_options(&mut self, out: &mut PvRequestExpr) -> Result<(), PvRequestParseError> {
+        if self.strict {
+            return self.parse_options_strict(out);
+        }
         loop {
             let tok = self.lex()?;
             match tok {
@@ -1310,6 +1345,58 @@ impl<'a> Parser<'a> {
                     let val = self.lex_value()?;
                     out.record_options
                         .push((key, ScalarValue::String(val.into())));
+                }
+                other => {
+                    return Err(PvRequestParseError::UnexpectedChar {
+                        pos: self.pos,
+                        chr: format!("{other:?}"),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Parse a `record[...]` option list under the strict pvxs grammar
+    /// (`/Users/stevek/codes/epics-modules/pvxs/src/clientreq.cpp:245-283`,
+    /// plus the caller's `lextok==rb` acceptance check at
+    /// clientreq.cpp:211-212).
+    ///
+    /// pvxs accepts a list of zero-or-more `key=value` pairs separated by
+    /// single commas, with at most one trailing comma. Unlike the lenient
+    /// `field(...)` list (pvxs `parse_fields`, clientreq.cpp:230-243, which
+    /// tolerates stray commas anywhere), the option loop only consumes a
+    /// comma right after a completed pair and re-enters expecting either a
+    /// key or `]`. The single `after_pair` state makes the legal positions
+    /// hold by construction: `record[]` and `record[foo=bar,]` are
+    /// accepted, while a leading comma (`record[,]`), a doubled comma
+    /// (`record[foo=bar,,]`), and a missing separator (`record[a=b c=d]`)
+    /// all reach the error arm exactly as pvxs's `else { break; }` leaves a
+    /// non-`rb` token for the caller to reject.
+    fn parse_options_strict(&mut self, out: &mut PvRequestExpr) -> Result<(), PvRequestParseError> {
+        // `true` once a `key=value` pair has just been read, so a single
+        // separating comma is legal; `false` at the start and right after a
+        // separating comma, where only a key or `]` may appear.
+        let mut after_pair = false;
+        loop {
+            let tok = self.lex()?;
+            match tok {
+                Token::RBracket => return Ok(()),
+                Token::Comma if after_pair => {
+                    after_pair = false;
+                }
+                Token::Name(key) if !after_pair => {
+                    self.expect(Token::Equal)?;
+                    // Strict values are pvxs `name` tokens (lex_value routes
+                    // to lex_value_strict here); the parsed-text path is
+                    // always string-typed (pvxs PVRParser stores
+                    // `string pipeline = "true"`, testpvreq.cpp:232-256).
+                    let val = self.lex_value()?;
+                    out.record_options
+                        .push((key, ScalarValue::String(val.into())));
+                    after_pair = true;
+                }
+                Token::Eof => {
+                    return Err(PvRequestParseError::Unterminated { pos: self.pos });
                 }
                 other => {
                     return Err(PvRequestParseError::UnexpectedChar {
@@ -1721,12 +1808,38 @@ mod tests {
     }
 
     #[test]
-    fn builder_pv_request_accepts_brace_dialect() {
+    fn builder_pv_request_lenient_accepts_brace_dialect() {
         let built = PvRequestBuilder::new()
-            .pv_request("field(value{LMT_l,LTM_h})")
+            .pv_request_lenient("field(value{LMT_l,LTM_h})")
             .expect("parse ok")
             .build();
         assert_eq!(built.fields, ["value.LMT_l", "value.LTM_h"]);
+    }
+
+    #[test]
+    fn builder_pv_request_is_strict_pvxs_grammar() {
+        // pvxs RequestBuilder::pvRequest() always runs PVRParser, which has no
+        // brace member-group syntax, so the strict builder path must reject it.
+        assert!(
+            PvRequestBuilder::new()
+                .pv_request("field(value{LMT_l,LTM_h})")
+                .is_err(),
+            "strict pv_request() must reject the pvDataCPP brace extension"
+        );
+        // Per-field option brackets are likewise a pvDataCPP extension pvxs
+        // rejects during request construction.
+        assert!(
+            PvRequestBuilder::new()
+                .pv_request("field(value[deadband=abs:1.0])")
+                .is_err(),
+            "strict pv_request() must reject per-field option brackets"
+        );
+        // The plain pvxs forms still parse on the strict path.
+        let ok = PvRequestBuilder::new()
+            .pv_request("field(value,alarm.severity)record[pipeline=true]")
+            .expect("strict pvxs form parses")
+            .build();
+        assert_eq!(ok.fields, ["value", "alarm.severity"]);
     }
 
     // ── typed builder vs parsed-text wire descriptor (pvxs
@@ -2205,5 +2318,69 @@ mod tests {
             "pvxs value is a name token; ':' ends it and the trailing run is a parse error"
         );
         assert!(PvRequestExpr::parse("record[deadband=abs:1.0]").is_ok());
+    }
+
+    /// pvxs `PVRParser::lex` (clientreq.cpp:146-147) skips only the literal
+    /// ASCII space; a tab or newline is an invalid character that throws
+    /// (clientreq.cpp:174). Strict mode must reject non-space whitespace;
+    /// lenient mode (pvDataCPP) still skips all whitespace.
+    #[test]
+    fn pvxs_compat_rejects_non_space_whitespace() {
+        assert!(
+            PvRequestExpr::parse_pvxs_compat("field\t(value)").is_err(),
+            "pvxs skips only ' ', so a tab is an invalid character"
+        );
+        assert!(
+            PvRequestExpr::parse_pvxs_compat("field(value)\nrecord[block=true]").is_err(),
+            "a newline between entities is an invalid character in pvxs"
+        );
+        // Literal spaces are still skipped in strict mode, matching pvxs.
+        assert!(PvRequestExpr::parse_pvxs_compat("field( value )").is_ok());
+        // Lenient mode unchanged: all whitespace is skipped.
+        assert!(PvRequestExpr::parse("field\t(value)").is_ok());
+        assert!(PvRequestExpr::parse("field(value)\nrecord[block=true]").is_ok());
+    }
+
+    /// pvxs `parse_options` (clientreq.cpp:245-283) accepts an empty option
+    /// list and a single trailing comma after a completed `K=V` pair.
+    #[test]
+    fn pvxs_compat_accepts_empty_and_trailing_comma_options() {
+        let empty = PvRequestExpr::parse_pvxs_compat("record[]")
+            .expect("pvxs accepts an empty option list");
+        assert!(empty.record_options.is_empty());
+
+        let trailing = PvRequestExpr::parse_pvxs_compat("record[foo=bar,]")
+            .expect("pvxs accepts a single trailing comma after a K=V pair");
+        assert_eq!(trailing.record_options, [rec_s("foo", "bar")]);
+    }
+
+    /// pvxs `parse_options` consumes a comma only right after a completed
+    /// `K=V` pair, so a leading comma, a doubled comma, and a missing
+    /// separator all leave a non-`rb` token the caller rejects
+    /// (clientreq.cpp:211-212, 270-279). Strict mode must reject them;
+    /// lenient mode (which mirrors the stray-comma-tolerant pvDataCPP
+    /// behaviour) still accepts them.
+    #[test]
+    fn pvxs_compat_rejects_invalid_record_option_commas() {
+        assert!(
+            PvRequestExpr::parse_pvxs_compat("record[,]").is_err(),
+            "leading comma: no completed K=V pair precedes it"
+        );
+        assert!(
+            PvRequestExpr::parse_pvxs_compat("record[,foo=bar]").is_err(),
+            "leading comma before the first pair"
+        );
+        assert!(
+            PvRequestExpr::parse_pvxs_compat("record[foo=bar,,]").is_err(),
+            "doubled comma: the second comma follows a separating comma, not a pair"
+        );
+        assert!(
+            PvRequestExpr::parse_pvxs_compat("record[a=b c=d]").is_err(),
+            "missing separator: pvxs requires a comma between K=V pairs"
+        );
+        // Lenient mode unchanged: stray commas and missing separators pass.
+        assert!(PvRequestExpr::parse("record[,]").is_ok());
+        assert!(PvRequestExpr::parse("record[,foo=bar]").is_ok());
+        assert!(PvRequestExpr::parse("record[foo=bar,,]").is_ok());
     }
 }

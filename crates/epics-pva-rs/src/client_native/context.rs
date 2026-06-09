@@ -272,6 +272,7 @@ impl PvaClientBuilder {
                 pool,
                 channels: RwLock::new(HashMap::new()),
                 search: OnceLock::new(),
+                cache_cleaner: std::sync::Once::new(),
                 name_servers: self.name_servers,
                 priority: self.priority,
                 tcp_timeout: self.tcp_timeout,
@@ -299,6 +300,12 @@ struct ClientInner {
     channels: RwLock<HashMap<String, Arc<Channel>>>,
     /// Lazy: only spawn the search engine when we actually need to resolve.
     search: OnceLock<SearchEngine>,
+    /// Spawns the periodic [`cache_clean_loop`] exactly once, on the first
+    /// channel cached. Deferred to the first cache insert (rather than
+    /// `build()`) so the sync builder never requires a Tokio runtime, mirroring
+    /// the lazy `search` engine spawn above; there is nothing to clean until a
+    /// channel exists.
+    cache_cleaner: std::sync::Once,
     /// TCP name servers (EPICS_PVA_NAME_SERVERS). Passed into SearchEngine
     /// as persistent search peers; also reported by ClientReport::name_servers.
     name_servers: Vec<SocketAddr>,
@@ -329,6 +336,13 @@ struct ClientInner {
 /// Lazily initialized on first use.
 static SHARED_SEARCH_ENGINE: tokio::sync::OnceCell<SearchEngine> =
     tokio::sync::OnceCell::const_new();
+
+/// Interval between automatic channel-cache sweeps. pvxs enables a
+/// per-`ContextImpl` `cacheCleaner` timer at `channelCacheCleanInterval{10,0}`
+/// (client.cpp:57, 666) that runs `cacheClean("", Context::Clean)` over the
+/// whole channel map so a long-lived client probing many PV names does not
+/// retain every idle channel until the context is closed.
+const CHANNEL_CACHE_CLEAN_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Apply a [`CacheAction`] to the channel map, returning the channels that were
 /// removed so the caller can close `Disconnect`ed ones after releasing the map
@@ -384,6 +398,55 @@ pub enum CacheAction {
     /// disconnect transition — the analog of pvxs `trash->disconnect(trash)`
     /// (client.cpp:1367-1369).
     Disconnect,
+}
+
+/// Background channel-cache GC. Mirrors the pvxs `cacheCleaner` timer callback
+/// `cacheClean("", Context::Clean)` (client.cpp:666, 1339-1382): every `period`
+/// it removes cached channels whose only owner is the cache itself
+/// (`Arc::strong_count == 1`, the analog of pvxs `use_count <= 1`), leaving
+/// in-use channels connected and reusable.
+///
+/// Lifetime: the task holds a `Weak<ClientInner>`, so it never keeps the
+/// context alive. It exits when the last [`PvaClient`] clone is dropped
+/// (`upgrade()` fails) or after [`PvaClient::close`] sets the `ConnectionPool`
+/// shutdown gate. Unlike pvxs, which removes the timer synchronously in
+/// `ContextImpl::close` (client.cpp:693-725), the Rust task exits on its next
+/// tick — the same idle-until-observed divergence already documented for the
+/// search-engine timer in [`PvaClient::close`]; it does no work in the interim
+/// (the shutdown gate short-circuits the sweep and `close()` already drained
+/// the map).
+///
+/// It never spawns the search engine: pvxs `cacheClean` touches only the
+/// channel map, so a direct-server client that never resolves a name keeps no
+/// engine. A `Clean`-removed channel has `strong_count == 1`, which means no
+/// in-flight op holds it and therefore no pending search references it (pending
+/// searches are held only by an awaiting caller's `oneshot` receiver), so
+/// dropping it here cannot orphan engine state.
+async fn cache_clean_loop(inner: std::sync::Weak<ClientInner>, period: Duration) {
+    let mut tick = tokio::time::interval(period);
+    // pvxs arms the timer with `event_add(cacheCleaner, &channelCacheCleanInterval)`
+    // (client.cpp:666), i.e. the first sweep fires after one interval, not at
+    // startup. Consume the immediate first tick so the first real sweep is one
+    // `period` away.
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        let Some(inner) = inner.upgrade() else {
+            return; // last PvaClient clone dropped — nothing left to clean
+        };
+        if inner.pool.is_shutdown() {
+            return; // close()d — terminal teardown already drained the cache
+        }
+        // Clean removes only channels whose sole reference is the map's own
+        // Arc; the returned channels are dropped here. Clean never closes
+        // in-use channels (client.cpp:1350-1357), so there is nothing to
+        // close after releasing the lock.
+        let _removed = {
+            let mut chans = inner.channels.write();
+            apply_cache_action(&mut chans, "", CacheAction::Clean)
+        };
+    }
 }
 
 #[derive(Clone)]
@@ -570,6 +633,18 @@ impl PvaClient {
         if forced.is_some() {
             return Ok(ch);
         }
+
+        // First channel about to enter the cache: arm the periodic cache
+        // cleaner (pvxs starts `cacheCleaner` at context construction,
+        // client.cpp:666). Deferred to here so the cleaner holds a
+        // `Weak<ClientInner>` and is spawned inside the Tokio runtime that
+        // every channel op already runs in; `Once` guarantees a single task.
+        self.inner.cache_cleaner.call_once(|| {
+            tokio::spawn(cache_clean_loop(
+                Arc::downgrade(&self.inner),
+                CHANNEL_CACHE_CLEAN_INTERVAL,
+            ));
+        });
 
         let mut map = self.inner.channels.write();
         if let Some(existing) = map.get(pv_name).cloned() {
@@ -913,8 +988,9 @@ impl PvaClient {
     /// own receiver). Drop the receiver to unsubscribe.
     pub async fn discover(
         &self,
-    ) -> PvaResult<tokio::sync::mpsc::Receiver<crate::client_native::search_engine::Discovered>>
-    {
+    ) -> PvaResult<
+        tokio::sync::mpsc::UnboundedReceiver<crate::client_native::search_engine::Discovered>,
+    > {
         self.search_engine().await?.discover().await
     }
 
@@ -941,9 +1017,31 @@ impl PvaClient {
     ///
     /// Mirrors pvxs `Context::close` (client.cpp:422). Idempotent.
     pub fn close(&self) {
-        // Drop channels first so their Arc<ServerConn> drops; this
-        // gives the pool a chance to skip "still-in-use" connections.
-        self.inner.channels.write().clear();
+        // pvxs `ContextImpl::close` (client.cpp:693-718) is the single
+        // owner of terminal teardown: it moves out the channel and
+        // connection maps and runs `Connection::cleanup()` on each
+        // connection, which resets the socket and disconnects every channel
+        // — existing operations are orphaned, not left running on a hidden
+        // circuit. Clearing the maps alone is not enough: a live monitor
+        // handle holds an `Arc<Channel>` and its subscription state holds
+        // `(Arc<ServerConn>, sid, ioid)`, so dropping the maps leaves the
+        // monitor receiving data and the TCP circuit alive until that handle
+        // is separately dropped or the peer disconnects.
+        //
+        // Collect the cached channels under the lock, release it, then
+        // `close()` each so the `set_state(Closed)` transition (which
+        // touches the connection router) never runs while the channel-map
+        // lock is held.
+        let channels: Vec<Arc<Channel>> = {
+            let mut map = self.inner.channels.write();
+            map.drain().map(|(_, ch)| ch).collect()
+        };
+        for ch in channels {
+            ch.close();
+        }
+        // `pool.clear()` closes every pooled connection (waking active
+        // monitor streams via the router drain) before dropping the map and
+        // setting the shutdown gate.
         self.inner.pool.clear();
     }
 
@@ -2521,9 +2619,12 @@ pub struct ConnectBuilder<'a> {
     /// Per-call forced server pinning. Mirrors pvxs
     /// `ConnectBuilder::server(s)` (client.h:952).
     server: Option<SocketAddr>,
-    /// pvxs `syncCancel(bool)` (client.h:950). Selects the teardown the
-    /// returned [`ConnectHandle`] performs on `Drop` — see
-    /// [`ConnectHandle`] for the exact async-Rust mapping.
+    /// Selects how the returned [`ConnectHandle`] stops its watcher on
+    /// `Drop`: `true` aborts (prompt), `false` detaches (graceful). Modeled
+    /// on pvxs `syncCancel(bool)` (client.h:950), but unlike pvxs this flag
+    /// does NOT make `Drop` block — async Rust cannot block in `Drop`. The
+    /// synchronous teardown boundary is [`ConnectHandle::wait`]; see the
+    /// [`ConnectHandle`] docs.
     sync_cancel: bool,
 }
 
@@ -2555,8 +2656,13 @@ impl<'a> ConnectBuilder<'a> {
         self
     }
 
-    /// Mirrors pvxs `ConnectBuilder::syncCancel(b)`. See the field
-    /// docstring for the current semantics.
+    /// Select the `Drop` teardown promptness of the returned
+    /// [`ConnectHandle`]: `true` (the default) aborts the watcher, `false`
+    /// detaches it. Modeled on pvxs `ConnectBuilder::syncCancel(b)`
+    /// (client.h:950), but — unlike pvxs's blocking destructor — neither
+    /// value makes `Drop` synchronous; async Rust cannot block in `Drop`.
+    /// Use [`ConnectHandle::wait`] for a synchronous teardown boundary. See
+    /// the [`ConnectHandle`] docs.
     pub fn sync_cancel(mut self, sync: bool) -> Self {
         self.sync_cancel = sync;
         self
@@ -2585,6 +2691,17 @@ impl<'a> ConnectBuilder<'a> {
             }
             None => self.client.channel(&self.pv_name).await?,
         };
+        // pvxs samples the channel state in one worker dispatch right after
+        // `Channel::build()` and BEFORE the channel processes its
+        // CREATE_CHANNEL response (client.cpp:274-282): a freshly built
+        // channel is not yet Active, so the first connector fires the
+        // synthetic initial `onDisconnect`; an already-active shared channel
+        // fires only `onConnect`. Take that snapshot synchronously here,
+        // before the resolution driver below can run `ensure_active()` and
+        // flip the channel Active. Re-sampling inside the watcher task races
+        // the driver: on a fast/direct server the driver connects first and
+        // the first connector would skip the initial `on_disconnect`.
+        let initial_active = ch.is_active();
         let on_connect = self.on_connect;
         let on_disconnect = self.on_disconnect;
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -2627,8 +2744,12 @@ impl<'a> ConnectBuilder<'a> {
             // `onDisconnect` once (client.cpp:274-282). A fresh channel
             // is Idle, so a searchable connect fires `on_disconnect`
             // first — the previous passive watcher fired nothing for the
-            // initial not-connected state.
-            let mut was_active = ch.is_active();
+            // initial not-connected state. Use the snapshot captured in
+            // `exec()` before the resolution driver started, not a fresh
+            // `ch.is_active()` here: re-sampling inside this spawned task
+            // races the driver, which on a fast server can set the channel
+            // Active first and skip the initial `on_disconnect`.
+            let mut was_active = initial_active;
             if was_active {
                 if let Some(cb) = &on_connect {
                     cb();
@@ -2694,23 +2815,33 @@ impl<'a> ConnectBuilder<'a> {
 /// Handle returned by [`ConnectBuilder::exec`]. Drop to stop the
 /// watcher task; the channel itself is unaffected.
 ///
-/// pvxs `~Connect()` runs `loop.tryInvoke(syncCancel, ...)`
-/// (client.cpp:255-267): with `syncCancel(true)` (the pvxs default) the
-/// destructor blocks until the worker has removed the connector and any
-/// in-progress callback boundary has completed; with `syncCancel(false)`
-/// it signals and returns. Async Rust cannot block in `Drop` (no `.await`),
-/// so the modes map as follows:
+/// **The synchronous teardown boundary is [`ConnectHandle::wait`], never
+/// `Drop`.** pvxs `~Connect()` runs `loop.tryInvoke(syncCancel, ...)`
+/// (client.cpp:255-267) and, with the default `syncCancel(true)`, *blocks
+/// the destructor* until the worker has removed the connector and any
+/// in-progress callback has completed — so pvxs callback code may borrow
+/// caller-owned state. Async Rust cannot block in `Drop` (no `.await`), so
+/// that blocking destructor has no `Drop` analog here: `wait()` is the
+/// explicit, awaitable equivalent of pvxs `syncCancel(true)` and the only
+/// teardown after which no further callback can fire. (Rust callbacks are
+/// `'static`, so they cannot borrow a caller stack frame the way a pvxs
+/// lambda can — the lifetime hazard pvxs's blocking destructor guards
+/// against is already prevented here by the bound.)
 ///
-/// - `sync_cancel(false)` (async): `Drop` cancels and **detaches** the
-///   watcher. The task observes the cancel token at its next `select!` and
-///   exits cleanly on its own — "signal and return", matching pvxs's
-///   non-blocking mode.
-/// - `sync_cancel(true)` (sync): `Drop` cancels and **aborts** the watcher
-///   for a prompt stop, the closest non-blocking approximation of "no
-///   further callbacks after teardown" (our callbacks are synchronous
+/// `Drop` is therefore **always asynchronous cancellation** — it never
+/// blocks for an in-progress callback. The [`ConnectBuilder::sync_cancel`]
+/// flag only selects how promptly the detached watcher stops, not whether
+/// `Drop` waits:
+///
+/// - `sync_cancel(false)`: `Drop` cancels and **detaches** the watcher. The
+///   task observes the cancel token at its next `select!` and winds down
+///   cleanly on its own.
+/// - `sync_cancel(true)` (the builder default): `Drop` cancels and
+///   **aborts** the watcher for a prompt stop. Callbacks are synchronous
 ///   `Fn()` invoked between `await` points, so an abort cannot tear one
-///   apart mid-call). For a guaranteed await-for-completion boundary, call
-///   [`ConnectHandle::wait`] instead of relying on `Drop`.
+///   apart mid-call, but `Drop` still returns before a concurrently-running
+///   callback finishes. For a guaranteed await-for-completion boundary, call
+///   [`ConnectHandle::wait`].
 pub struct ConnectHandle {
     cancel: tokio_util::sync::CancellationToken,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -2832,6 +2963,88 @@ mod tests {
         let removed = apply_cache_action(&mut chans, "", CacheAction::Drop);
         assert!(chans.is_empty(), "empty name sweeps every cached channel");
         assert_eq!(removed.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn periodic_cache_cleaner_sweeps_only_unreferenced_channels() {
+        // Drive the same loop the client arms on its first cached channel.
+        // `tokio`'s "full" feature excludes "test-util", so paused time is
+        // unavailable here; a short real interval plus bounded polling keeps the
+        // test deterministic without depending on one sleep landing on a tick.
+        let client = PvaClient::builder().build();
+        let period = Duration::from_millis(25);
+        tokio::spawn(cache_clean_loop(Arc::downgrade(&client.inner), period));
+
+        // (a) a cached channel with no external Arc is swept within a few ticks.
+        client
+            .inner
+            .channels
+            .write()
+            .insert("unused".into(), cache_test_channel("unused"));
+        let mut swept = false;
+        for _ in 0..200 {
+            if !client.inner.channels.read().contains_key("unused") {
+                swept = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            swept,
+            "cleaner removes a cached channel with no live external reference"
+        );
+
+        // (b) a channel with an extra live Arc survives repeated sweeps.
+        let held = cache_test_channel("held");
+        client
+            .inner
+            .channels
+            .write()
+            .insert("held".into(), Arc::clone(&held));
+        tokio::time::sleep(period * 5).await;
+        assert!(
+            client.inner.channels.read().contains_key("held"),
+            "cleaner preserves a channel that still has a live external reference"
+        );
+
+        // (c) once that extra reference drops, a later sweep removes it.
+        drop(held);
+        let mut swept = false;
+        for _ in 0..200 {
+            if !client.inner.channels.read().contains_key("held") {
+                swept = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            swept,
+            "cleaner removes the channel on a sweep after its last external ref drops"
+        );
+    }
+
+    #[tokio::test]
+    async fn periodic_cache_cleaner_exits_when_client_dropped() {
+        let client = PvaClient::builder().build();
+        let weak = Arc::downgrade(&client.inner);
+        let handle = tokio::spawn(cache_clean_loop(weak.clone(), Duration::from_millis(25)));
+
+        // Dropping the only PvaClient clone releases the last strong ref; the
+        // cleaner's next `Weak::upgrade` fails and the task returns.
+        drop(client);
+        assert_eq!(weak.strong_count(), 0, "no strong ClientInner ref remains");
+        let mut finished = false;
+        for _ in 0..200 {
+            if handle.is_finished() {
+                finished = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            finished,
+            "cleaner task exits once the last PvaClient clone is dropped"
+        );
     }
 
     // Regression: a client built with both `share_udp(true)` and a
@@ -3067,6 +3280,81 @@ mod tests {
         assert!(
             !did_complete.load(Ordering::SeqCst),
             "sync sync_cancel(true) Drop must abort the task before its pending work completes"
+        );
+    }
+
+    /// pvxs `syncCancel(true)` blocks the destructor until any in-progress
+    /// callback completes; async Rust cannot block in `Drop`, so only
+    /// `wait()` provides that boundary. This proves the contract directly:
+    /// with the watcher parked mid-work, dropping a default
+    /// (`sync_cancel(true)`) handle returns WITHOUT the parked work having
+    /// finished, while `wait()` awaits full task termination.
+    #[tokio::test]
+    async fn connect_handle_only_wait_bounds_callback_completion() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio_util::sync::CancellationToken;
+
+        // Drop path (default sync_cancel = true). The task parks at a gate
+        // (standing in for an in-progress callback) and only sets `finished`
+        // after the gate opens. `Drop` aborts at the await point and returns
+        // immediately, so `finished` must still be false right after it —
+        // `Drop` is not a synchronous completion boundary.
+        let cancel = CancellationToken::new();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let handle = ConnectHandle {
+            cancel: cancel.clone(),
+            task: Some(tokio::spawn({
+                let g = gate.clone();
+                let s = started.clone();
+                let f = finished.clone();
+                async move {
+                    s.store(true, Ordering::SeqCst);
+                    g.notified().await;
+                    f.store(true, Ordering::SeqCst);
+                }
+            })),
+            sync_cancel: true,
+        };
+        for _ in 0..100 {
+            if started.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(
+            started.load(Ordering::SeqCst),
+            "task must have reached the gate"
+        );
+        drop(handle);
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "default sync_cancel(true) Drop must NOT block until the parked work completes"
+        );
+
+        // wait() path. The task completes its work once cancelled; after
+        // `wait()` returns, that work has run — wait() is the boundary.
+        let cancel2 = CancellationToken::new();
+        let done = Arc::new(AtomicBool::new(false));
+        let handle2 = ConnectHandle {
+            cancel: cancel2.clone(),
+            task: Some(tokio::spawn({
+                let c = cancel2.clone();
+                let d = done.clone();
+                async move {
+                    c.cancelled().await;
+                    d.store(true, Ordering::SeqCst);
+                }
+            })),
+            sync_cancel: false,
+        };
+        tokio::time::timeout(Duration::from_secs(2), handle2.wait())
+            .await
+            .expect("wait() must terminate synchronously, not hang");
+        assert!(
+            done.load(Ordering::SeqCst),
+            "wait() must await full task termination — the synchronous boundary"
         );
     }
 

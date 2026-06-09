@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use epics_base_rs::net::AsyncUdpV4;
@@ -64,6 +64,16 @@ pub const DEFAULT_BROADCAST_PORT: u16 = 5076;
 /// initial burst) is packed into as few datagrams as fit under this
 /// limit rather than one datagram per channel name.
 const MAX_SEARCH_PAYLOAD: usize = 1400;
+
+/// pvxs gates each TCP name-server SEARCH write on the connection's live
+/// output-buffer byte length: `if(evbuffer_get_length(tx) > 64*1024)` it
+/// skips that name server for the tick and relies on the normal retry
+/// cadence (`client.cpp:1118-1128`). The backpressure signal is queued
+/// bytes, not a frame count — 64 near-MTU frames already exceed this — so
+/// the engine tracks bytes queued-but-not-yet-written per name server and
+/// skips an over-budget one rather than treating a full fixed-count channel
+/// as the limit.
+const NS_TX_MAX_QUEUED_BYTES: usize = 64 * 1024;
 
 /// pvxs `initialSearchDelay` (`client.cpp:43`): the first SEARCH for a
 /// freshly created channel is deferred by this window so a burst of
@@ -143,7 +153,7 @@ pub enum SearchCommand {
     /// `Discovered` for every beacon that observation logic regards as a
     /// new server (first-seen GUID) or a re-observed-after-restart GUID.
     Subscribe {
-        responder: oneshot::Sender<mpsc::Receiver<Discovered>>,
+        responder: oneshot::Sender<mpsc::UnboundedReceiver<Discovered>>,
     },
     /// Force the engine into fast-tick mode for one revolution and
     /// bring every pending search's retry deadline forward. Mirrors
@@ -559,13 +569,15 @@ impl SearchEngine {
     /// [`BeaconTracker`] regards as new or restarted. Mirrors pvxs's
     /// `client::Context::discover()` callback API.
     ///
-    /// The receiver is bounded; if the consumer falls behind, individual
-    /// events are dropped silently, but the **subscription survives** — a
-    /// momentarily-full queue does not unsubscribe a live consumer (pvxs
-    /// keeps each discovery operation until the caller cancels it,
-    /// clientdiscover.cpp:103-112). The subscription ends only when the
-    /// receiver is dropped.
-    pub async fn discover(&self) -> PvaResult<mpsc::Receiver<Discovered>> {
+    /// The receiver is unbounded, so delivery is lossless: every
+    /// `Online`/`Timeout` transition reaches a live consumer even under a
+    /// discovery burst, mirroring pvxs's inline-callback delivery
+    /// (`ContextImpl::serverEvent`), which has no bounded queue and never
+    /// drops an event. A slow consumer's backlog grows rather than losing
+    /// events. pvxs keeps each discovery operation until the caller cancels
+    /// it (clientdiscover.cpp:103-112); here the subscription ends only when
+    /// the receiver is dropped.
+    pub async fn discover(&self) -> PvaResult<mpsc::UnboundedReceiver<Discovered>> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SearchCommand::Subscribe { responder: tx })
@@ -1050,7 +1062,7 @@ async fn run_engine(
 
     let mut pending: HashMap<u32, Pending> = HashMap::new(); // by search_id
     let mut by_name: HashMap<String, u32> = HashMap::new(); // pv_name → search_id
-    let mut subscribers: Vec<mpsc::Sender<Discovered>> = Vec::new();
+    let mut subscribers: Vec<mpsc::UnboundedSender<Discovered>> = Vec::new();
     // Search bucket ring (pvxs client.cpp searchBuckets[30]). Each
     // bucket holds the search_ids whose retry slot is "this bucket"
     // on the rotating cursor. Tick advances the cursor and processes
@@ -1106,9 +1118,11 @@ async fn run_engine(
         // buffered up to 64 stale SEARCH frames while the NS was offline or still
         // handshaking and replayed them as a burst on reconnect.
         let ready = Arc::new(AtomicBool::new(false));
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
         ns_senders.push(NsHandle {
             tx: search_tx,
             ready: Arc::clone(&ready),
+            queued_bytes: Arc::clone(&queued_bytes),
         });
         let resp_tx = ns_response_tx.clone();
         tokio::spawn(ns_task(
@@ -1116,9 +1130,12 @@ async fn run_engine(
             search_rx,
             resp_tx,
             ready,
-            ns_user.clone(),
-            ns_host.clone(),
-            ns_handshake_timeout,
+            queued_bytes,
+            NsConnParams {
+                user: ns_user.clone(),
+                host: ns_host.clone(),
+                handshake_timeout: ns_handshake_timeout,
+            },
         ));
     }
 
@@ -1308,7 +1325,7 @@ async fn run_engine(
                     }
                 }
                 Some(SearchCommand::Subscribe { responder }) => {
-                    let (tx, rx) = mpsc::channel::<Discovered>(64);
+                    let (tx, rx) = mpsc::unbounded_channel::<Discovered>();
                     subscribers.push(tx);
                     let _ = responder.send(rx);
                 }
@@ -1435,7 +1452,7 @@ async fn run_engine(
                     let mut pos = 0usize;
                     while pos < n {
                         let consumed = handle_beacon(
-                            &beacon_buf[pos..n], &beacons, &mut pending,
+                            &beacon_buf[pos..n], &beacons,
                             &mut subscribers, &mut poke,
                             from,
                         );
@@ -1462,7 +1479,7 @@ async fn run_engine(
                     let mut pos = 0usize;
                     while pos < n {
                         let consumed = handle_beacon(
-                            &beacon_buf_v6[pos..n], &beacons, &mut pending,
+                            &beacon_buf_v6[pos..n], &beacons,
                             &mut subscribers, &mut poke,
                             from,
                         );
@@ -2069,24 +2086,23 @@ fn flush_expired_pending(
 /// Deliver a discovery event to every live subscriber.
 ///
 /// Single owner of the subscriber-eviction policy. pvxs runs each
-/// discovery callback inline on the client loop and removes a discovery
-/// operation only when the caller cancels it
-/// (clientdiscover.cpp:83-112) — it never reinterprets a slow consumer
-/// as cancellation. So we drop the event for a subscriber whose bounded
-/// queue is momentarily full (lossy delivery, as `discover()` documents)
-/// but KEEP the subscriber; a subscriber is removed only when its
-/// receiver has been dropped (`Closed`). Treating `Full` as removal —
-/// what a plain `try_send(..).is_ok()` retain does — silently unsubscribes
-/// a live-but-slow consumer after a beacon storm, which pvxs never does.
-fn publish_discovery(subscribers: &mut Vec<mpsc::Sender<Discovered>>, evt: Discovered) {
-    subscribers.retain(|tx| match tx.try_send(evt.clone()) {
-        Ok(()) => true,
-        // Live consumer that fell behind: keep it; the event is lost, not
-        // the subscription.
-        Err(mpsc::error::TrySendError::Full(_)) => true,
-        // Receiver dropped: the discovery operation is gone.
-        Err(mpsc::error::TrySendError::Closed(_)) => false,
-    });
+/// discovery callback inline on the client loop and never drops an event:
+/// `ContextImpl::serverEvent` (client.cpp) calls every live discoverer's
+/// callback synchronously, and a discovery operation is removed only when
+/// the caller cancels it (clientdiscover.cpp:83-112) — a slow consumer is
+/// never reinterpreted as cancellation or as a reason to skip an event.
+///
+/// Each subscriber owns an unbounded queue, so this delivery is lossless
+/// by construction: there is no "queue full" state to drop on, a slow
+/// consumer's backlog grows rather than losing Online/Timeout transitions,
+/// and `send` fails only once the receiver has been dropped — which is
+/// exactly the caller cancelling, so that subscriber is removed. This is
+/// the structural analog of the inline pvxs callback: no bounded queue,
+/// no overflow branch, removal only on cancellation.
+fn publish_discovery(subscribers: &mut Vec<mpsc::UnboundedSender<Discovered>>, evt: Discovered) {
+    // `send` on an unbounded channel never blocks and never drops; it errors
+    // only when the receiver is gone (the discovery operation was cancelled).
+    subscribers.retain(|tx| tx.send(evt.clone()).is_ok());
 }
 
 /// Emit the `Discovered` events implied by a beacon classification and
@@ -2101,7 +2117,7 @@ fn emit_beacon_action(
     guid: [u8; 12],
     peer: SocketAddr,
     proto: String,
-    subscribers: &mut Vec<mpsc::Sender<Discovered>>,
+    subscribers: &mut Vec<mpsc::UnboundedSender<Discovered>>,
 ) -> bool {
     match action {
         BeaconAction::New => {
@@ -2161,7 +2177,7 @@ fn handle_search_response(
     by_name: &mut HashMap<String, u32>,
     beacons: &Arc<BeaconTracker>,
     ignore_guids: &std::collections::HashSet<[u8; 12]>,
-    subscribers: &mut Vec<mpsc::Sender<Discovered>>,
+    subscribers: &mut Vec<mpsc::UnboundedSender<Discovered>>,
     poke_request: &mut bool,
     peer: SocketAddr,
     is_tcp: bool,
@@ -2226,11 +2242,18 @@ fn handle_search_response(
                 subscribers,
             );
             if should_poke {
+                // pvxs `poke()` (client.cpp:736-759) only records `lastPoke`,
+                // arms `nPoked`, and reschedules the search timer — it never
+                // iterates channels or resets `nSearch`. The fast revolution's
+                // poked ticks then keep each search's accumulated backoff
+                // (`tickSearch(..., poked=true)` skips the `nSearch++`
+                // increment, client.cpp:1141-1143, and requeues into the same
+                // bucket). So this handler only signals the poke; the run
+                // loop's single `maybe_poke()` + `rearm_after_send()` owner
+                // decides cadence and retry. Resetting per-search backoff here
+                // converted every pending search into a fresh first-retry,
+                // amplifying UDP search load on a mass beacon/discovery event.
                 *poke_request = true;
-                for p in pending.values_mut() {
-                    p.last_attempt = Instant::now() - Duration::from_secs(60);
-                    p.attempt = 0;
-                }
             }
         }
         return consumed;
@@ -2312,12 +2335,10 @@ fn handle_search_response(
 
 /// Returns bytes consumed from `bytes` so the caller can advance to
 /// the next chained beacon in the same datagram.
-#[allow(clippy::too_many_arguments)]
 fn handle_beacon(
     bytes: &[u8],
     beacons: &Arc<BeaconTracker>,
-    pending: &mut HashMap<u32, Pending>,
-    subscribers: &mut Vec<mpsc::Sender<Discovered>>,
+    subscribers: &mut Vec<mpsc::UnboundedSender<Discovered>>,
     poke_request: &mut bool,
     peer: SocketAddr,
 ) -> usize {
@@ -2416,16 +2437,18 @@ fn handle_beacon(
     // (200 ms × 30) for one revolution.
     let should_poke = emit_beacon_action(action, server, guid_arr, peer, proto, subscribers);
     if should_poke {
+        // pvxs `onBeacon()` routes a New/Changed identity through `poke()`
+        // (client.cpp:773-847 → 736-759), which only records `lastPoke`,
+        // arms `nPoked`, and reschedules the search timer. It does NOT
+        // touch any channel's `nSearch`. The fast revolution then retransmits
+        // every parked search while preserving its accumulated backoff: the
+        // poked tick skips the `nSearch++` increment and requeues into the
+        // same bucket (client.cpp:1141-1143). So this handler only signals
+        // the poke; the run loop's single `maybe_poke()` + `rearm_after_send()`
+        // owner decides cadence and retry. Resetting per-search backoff here
+        // turned every pending search into a fresh first-retry, amplifying
+        // UDP search broadcast on a mass beacon event.
         *poke_request = true;
-        for p in pending.values_mut() {
-            p.last_attempt = Instant::now() - Duration::from_secs(60);
-            // NOTE: more aggressive than pvxs's `poked` semantic
-            // (which preserves nSearch and skips the increment for
-            // one tick). See the BeaconObserved arm in `run_engine`
-            // for the full rationale. Acceptable trade for single-
-            // channel recovery.
-            p.attempt = 0;
-        }
     }
     consumed
 }
@@ -2468,6 +2491,14 @@ fn rewrite_loopback(addr: SocketAddr, peer: SocketAddr) -> SocketAddr {
 struct NsHandle {
     tx: mpsc::Sender<Vec<u8>>,
     ready: Arc<AtomicBool>,
+    /// Bytes queued to this name server's writer but not yet written to the
+    /// socket. The engine skips an NS for a tick when this exceeds
+    /// [`NS_TX_MAX_QUEUED_BYTES`], mirroring pvxs's
+    /// `evbuffer_get_length(tx) > 64*1024` gate (client.cpp:1118-1128).
+    /// `ns_forward_frames` adds on a successful enqueue; [`ns_run_once`]
+    /// subtracts once each frame is actually written, and zeroes it after
+    /// draining the disconnected-side backlog.
+    queued_bytes: Arc<AtomicUsize>,
 }
 
 /// Forward the current tick's SEARCH for `sid`/`pv_name` to every name-server
@@ -2526,20 +2557,52 @@ fn pack_search_frames(
 /// connection. pvxs reuses the same packed `searchMsg` for name-server
 /// forwarding after zeroing the UDP response port (`client.cpp:1217-1234`);
 /// these frames are already built with `port=0` + the unicast bit. A
-/// not-ready NS is skipped this tick (no replayed backlog). The bounded
-/// channel's `Full` error drops the frame rather than growing an
-/// unbounded backlog (pvxs `client.cpp:1227-1235`).
+/// not-ready NS is skipped this tick (no replayed backlog).
+///
+/// Backpressure is byte-aware, mirroring pvxs's
+/// `evbuffer_get_length(tx) > 64*1024` skip (client.cpp:1118-1128): before
+/// enqueuing this tick's frames, an NS whose queued-but-unwritten backlog
+/// already exceeds [`NS_TX_MAX_QUEUED_BYTES`] is skipped for the tick and
+/// retried later by the bucket cadence. A frame-count gate would let 64
+/// near-MTU frames (~89 KiB) queue past pvxs's 64 KiB threshold, or pass a
+/// single oversized frame. The bounded channel remains a hard backstop:
+/// `Full`/closed drops the frame (and does not bump the byte counter)
+/// rather than growing an unbounded backlog.
 fn ns_forward_frames(handles: &[NsHandle], frames: &[Vec<u8>]) {
     if frames.is_empty() || handles.iter().all(|h| !h.ready.load(Ordering::SeqCst)) {
         return;
     }
     for ns in handles {
-        if ns.ready.load(Ordering::SeqCst) {
-            for frame in frames {
-                let _ = ns.tx.try_send(frame.clone());
+        if !ns.ready.load(Ordering::SeqCst) {
+            continue;
+        }
+        // pvxs skips a name server for the whole tick when its output buffer
+        // already holds > 64 KiB; the queued byte backlog (not a frame count)
+        // is the signal. ns_run_once subtracts from this once each frame is
+        // written, so it tracks the real socket-side backlog.
+        if ns.queued_bytes.load(Ordering::SeqCst) > NS_TX_MAX_QUEUED_BYTES {
+            continue;
+        }
+        for frame in frames {
+            let len = frame.len();
+            match ns.tx.try_send(frame.clone()) {
+                Ok(()) => {
+                    ns.queued_bytes.fetch_add(len, Ordering::SeqCst);
+                }
+                // Channel full or closed: drop without counting it; the
+                // search is retried on a later ready tick.
+                Err(_) => break,
             }
         }
     }
+}
+
+/// Client identity and handshake deadline for one name-server connection,
+/// grouped so the long-lived connect/handshake task signatures stay readable.
+struct NsConnParams {
+    user: String,
+    host: String,
+    handshake_timeout: Duration,
 }
 
 /// Long-running task for one EPICS_PVA_NAME_SERVERS entry.
@@ -2550,9 +2613,8 @@ async fn ns_task(
     mut search_rx: mpsc::Receiver<Vec<u8>>,
     response_tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
     ready: Arc<AtomicBool>,
-    user: String,
-    host: String,
-    handshake_timeout: Duration,
+    queued_bytes: Arc<AtomicUsize>,
+    params: NsConnParams,
 ) {
     // pvxs client.cpp:68: tcpNSCheckInterval = 10s.
     const RECONNECT_INTERVAL: Duration = Duration::from_secs(10);
@@ -2562,9 +2624,8 @@ async fn ns_task(
             &mut search_rx,
             &response_tx,
             &ready,
-            &user,
-            &host,
-            handshake_timeout,
+            &queued_bytes,
+            &params,
         )
         .await;
         // Connection is gone: clear readiness immediately so the engine skips
@@ -2588,10 +2649,15 @@ async fn ns_run_once(
     search_rx: &mut mpsc::Receiver<Vec<u8>>,
     response_tx: &mpsc::Sender<(Vec<u8>, SocketAddr)>,
     ready: &AtomicBool,
-    user: &str,
-    host: &str,
-    handshake_timeout: Duration,
+    queued_bytes: &AtomicUsize,
+    params: &NsConnParams,
 ) -> std::io::Result<()> {
+    let NsConnParams {
+        user,
+        host,
+        handshake_timeout,
+    } = params;
+    let handshake_timeout = *handshake_timeout;
     let stream = TcpStream::connect(ns_addr).await?;
     let (mut reader, mut writer) = tokio::io::split(stream);
 
@@ -2633,6 +2699,10 @@ async fn ns_run_once(
     // draining do we publish readiness, so the engine never races a frame into
     // the about-to-be-drained window.
     while search_rx.try_recv().is_ok() {}
+    // The drained frames were counted in `queued_bytes`; zero the accounting
+    // so the new connection starts with an empty output backlog (the byte
+    // gate must not stay tripped by frames that were discarded, not written).
+    queued_bytes.store(0, Ordering::SeqCst);
     ready.store(true, Ordering::SeqCst);
 
     // ── Main loop: forward SEARCH frames out; route SEARCH_RESPONSE back ────
@@ -2640,7 +2710,13 @@ async fn ns_run_once(
         tokio::select! {
             pkt = search_rx.recv() => {
                 match pkt {
-                    Some(bytes) => writer.write_all(&bytes).await?,
+                    Some(bytes) => {
+                        let len = bytes.len();
+                        writer.write_all(&bytes).await?;
+                        // Frame is now on the socket: release its share of the
+                        // queued-byte backlog so the engine's tick gate frees up.
+                        queued_bytes.fetch_sub(len, Ordering::SeqCst);
+                    }
                     // Engine dropped the sender — shut down cleanly.
                     None => return Ok(()),
                 }
@@ -2958,7 +3034,7 @@ mod tests {
         let mut pending: HashMap<u32, Pending> = HashMap::new();
         let mut by_name: HashMap<String, u32> = HashMap::new();
         let ignore_guids: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
-        let mut subscribers: Vec<mpsc::Sender<Discovered>> = Vec::new(); // no discover() active
+        let mut subscribers: Vec<mpsc::UnboundedSender<Discovered>> = Vec::new(); // no discover() active
         let mut poke = false;
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 5076);
 
@@ -2998,8 +3074,8 @@ mod tests {
         let mut pending: HashMap<u32, Pending> = HashMap::new();
         let mut by_name: HashMap<String, u32> = HashMap::new();
         let ignore_guids: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
-        let (tx, mut rx) = mpsc::channel::<Discovered>(8);
-        let mut subscribers: Vec<mpsc::Sender<Discovered>> = vec![tx]; // discover() active
+        let (tx, mut rx) = mpsc::unbounded_channel::<Discovered>();
+        let mut subscribers: Vec<mpsc::UnboundedSender<Discovered>> = vec![tx]; // discover() active
         let mut poke = false;
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 5076);
 
@@ -3054,8 +3130,8 @@ mod tests {
         let mut pending: HashMap<u32, Pending> = HashMap::new();
         let mut by_name: HashMap<String, u32> = HashMap::new();
         let ignore_guids: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
-        let (tx, mut rx) = mpsc::channel::<Discovered>(8);
-        let mut subscribers: Vec<mpsc::Sender<Discovered>> = vec![tx]; // discover() active
+        let (tx, mut rx) = mpsc::unbounded_channel::<Discovered>();
+        let mut subscribers: Vec<mpsc::UnboundedSender<Discovered>> = vec![tx]; // discover() active
         let mut poke = false;
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 5076);
 
@@ -3113,7 +3189,7 @@ mod tests {
         );
         let mut by_name: HashMap<String, u32> = std::iter::once(("dut".to_string(), 1)).collect();
         let beacons = BeaconTracker::new();
-        let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+        let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = Vec::new();
         let mut poke = false;
         let found_true = crate::server_native::udp::build_search_response_proto(
             IG,
@@ -3141,8 +3217,8 @@ mod tests {
 
         // (2) found=false discovery pong with an ignored GUID, even with an
         // active discover() subscriber, must NOT announce.
-        let (txd, mut rxd) = mpsc::channel::<Discovered>(8);
-        let mut subs2: Vec<mpsc::Sender<Discovered>> = vec![txd];
+        let (txd, mut rxd) = mpsc::unbounded_channel::<Discovered>();
+        let mut subs2: Vec<mpsc::UnboundedSender<Discovered>> = vec![txd];
         let mut poke2 = false;
         let pong = crate::server_native::udp::build_search_response_proto(
             IG,
@@ -3190,10 +3266,10 @@ mod tests {
         header.write_into(&mut frame);
         frame.extend_from_slice(&payload);
 
-        let (txb, mut rxb) = mpsc::channel::<Discovered>(8);
-        let mut subs3: Vec<mpsc::Sender<Discovered>> = vec![txb];
+        let (txb, mut rxb) = mpsc::unbounded_channel::<Discovered>();
+        let mut subs3: Vec<mpsc::UnboundedSender<Discovered>> = vec![txb];
         let mut poke3 = false;
-        handle_beacon(&frame, &beacons, &mut pending, &mut subs3, &mut poke3, peer);
+        handle_beacon(&frame, &beacons, &mut subs3, &mut poke3, peer);
         assert_eq!(
             beacons.guid_for(server),
             Some(IG),
@@ -3248,7 +3324,7 @@ mod tests {
                 std::iter::once(("dut".to_string(), 1)).collect();
             let beacons = BeaconTracker::new();
             let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
-            let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+            let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = Vec::new();
             let mut poke = false;
             let consumed = handle_search_response(
                 &frame,
@@ -3284,7 +3360,7 @@ mod tests {
         let mut by_name: HashMap<String, u32> = std::iter::once(("dut".to_string(), 1)).collect();
         let beacons = BeaconTracker::new();
         let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
-        let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+        let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = Vec::new();
         let mut poke = false;
         handle_search_response(
             &base,
@@ -3347,7 +3423,7 @@ mod tests {
             "precondition: no beacon GUID for the server"
         );
         let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
-        let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+        let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = Vec::new();
         let mut poke = false;
         let frame = crate::server_native::udp::build_search_response_proto(
             G,
@@ -3426,7 +3502,7 @@ mod tests {
         );
         let mut by_name: HashMap<String, u32> = std::iter::once(("dut".to_string(), 1)).collect();
         let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
-        let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+        let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = Vec::new();
         let mut poke = false;
         let frame = crate::server_native::udp::build_search_response_proto(
             G_TCP,
@@ -3516,7 +3592,7 @@ mod tests {
                 std::iter::once(("dut".to_string(), 1)).collect();
             let beacons = BeaconTracker::new();
             let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
-            let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+            let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = Vec::new();
             let mut poke = false;
             // Second reply: same cid, different GUID B, from server B.
             let frame = crate::server_native::udp::build_search_response_proto(
@@ -3580,12 +3656,10 @@ mod tests {
             let mut frame = base.clone();
             frame[2] |= seg;
             let beacons = BeaconTracker::new();
-            let mut pending: HashMap<u32, Pending> = HashMap::new();
-            let (tx, mut rx) = mpsc::channel::<Discovered>(8);
-            let mut subs: Vec<mpsc::Sender<Discovered>> = vec![tx];
+            let (tx, mut rx) = mpsc::unbounded_channel::<Discovered>();
+            let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = vec![tx];
             let mut poke = false;
-            let consumed =
-                handle_beacon(&frame, &beacons, &mut pending, &mut subs, &mut poke, peer);
+            let consumed = handle_beacon(&frame, &beacons, &mut subs, &mut poke, peer);
             assert!(
                 consumed > 0,
                 "segmented beacon frame must still be advanced"
@@ -3602,11 +3676,10 @@ mod tests {
 
         // Control: the un-segmented beacon tracks + emits Online.
         let beacons = BeaconTracker::new();
-        let mut pending: HashMap<u32, Pending> = HashMap::new();
-        let (tx, mut rx) = mpsc::channel::<Discovered>(8);
-        let mut subs: Vec<mpsc::Sender<Discovered>> = vec![tx];
+        let (tx, mut rx) = mpsc::unbounded_channel::<Discovered>();
+        let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = vec![tx];
         let mut poke = false;
-        handle_beacon(&base, &beacons, &mut pending, &mut subs, &mut poke, peer);
+        handle_beacon(&base, &beacons, &mut subs, &mut poke, peer);
         assert_eq!(
             beacons.guid_for(server),
             Some(G),
@@ -3618,13 +3691,17 @@ mod tests {
         );
     }
 
-    /// A live discovery subscriber whose bounded queue is full must NOT be
-    /// evicted: pvxs keeps the operation until the caller cancels it
-    /// (clientdiscover.cpp:103-112) and never treats a slow consumer as
-    /// cancellation. The subscriber is removed only when its receiver is
-    /// dropped (`Closed`). Regression for treating `Full` as removal.
+    /// Discovery delivery is lossless. pvxs `ContextImpl::serverEvent`
+    /// (client.cpp) calls every live discoverer's callback inline and never
+    /// drops an event; a discovery operation is removed only when the caller
+    /// cancels it (clientdiscover.cpp:103-112), never because a consumer is
+    /// slow. The unbounded per-subscriber queue gives the same guarantee: a
+    /// burst far larger than any former bounded capacity is delivered in
+    /// full and in publish order without draining, and the subscriber is
+    /// removed only when its receiver is dropped (`Closed`). Regression for
+    /// the prior bounded queue that silently dropped events on `Full`.
     #[test]
-    fn full_queue_keeps_live_subscriber_closed_removes_it() {
+    fn unbounded_discovery_delivers_every_event_then_closed_removes_subscriber() {
         let sa = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5075);
         let mk = |n: u8| Discovered::Online {
             server: sa,
@@ -3632,30 +3709,37 @@ mod tests {
             peer: sa,
             proto: "tcp".into(),
         };
-        let (tx, mut rx) = mpsc::channel::<Discovered>(2);
-        let mut subs: Vec<mpsc::Sender<Discovered>> = vec![tx];
+        let (tx, mut rx) = mpsc::unbounded_channel::<Discovered>();
+        let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = vec![tx];
 
-        // Fill the 2-slot queue.
-        publish_discovery(&mut subs, mk(1));
-        publish_discovery(&mut subs, mk(2));
-        assert_eq!(subs.len(), 1, "subscriber present after filling the queue");
+        // Publish a burst far larger than the former 64-slot bounded
+        // capacity WITHOUT draining. The old bounded queue dropped every
+        // event past the cap; the unbounded queue keeps them all and the
+        // subscriber stays live throughout.
+        const BURST: u8 = 200;
+        for n in 1..=BURST {
+            publish_discovery(&mut subs, mk(n));
+            assert_eq!(subs.len(), 1, "live subscriber retained across the burst");
+        }
 
-        // Queue full → event is dropped but the subscriber is RETAINED.
-        publish_discovery(&mut subs, mk(3));
-        assert_eq!(
-            subs.len(),
-            1,
-            "a full queue must not unsubscribe a live consumer"
+        // Every event is delivered, in publish order, none lost.
+        for n in 1..=BURST {
+            match rx.try_recv() {
+                Ok(Discovered::Online { guid, .. }) => {
+                    assert_eq!(guid, [n; 12], "events delivered in order, none dropped");
+                }
+                other => panic!("expected Online #{n}, got {other:?}"),
+            }
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly the published events were delivered"
         );
 
-        // Drain one slot, then a later event is delivered to the same sub.
-        assert!(rx.try_recv().is_ok());
-        publish_discovery(&mut subs, mk(4));
-        assert_eq!(subs.len(), 1, "subscriber still live after draining");
-
         // Dropping the receiver closes the channel → subscriber removed.
+        // Caller cancellation is the only removal trigger.
         drop(rx);
-        publish_discovery(&mut subs, mk(5));
+        publish_discovery(&mut subs, mk(1));
         assert!(
             subs.is_empty(),
             "a closed receiver must unsubscribe the discovery operation"
@@ -3673,8 +3757,8 @@ mod tests {
     fn changed_emits_proto_scoped_timeout_then_online() {
         let server = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)), 5075);
         let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 9)), 5076);
-        let (tx, mut rx) = mpsc::channel::<Discovered>(8);
-        let mut subs: Vec<mpsc::Sender<Discovered>> = vec![tx];
+        let (tx, mut rx) = mpsc::unbounded_channel::<Discovered>();
+        let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = vec![tx];
 
         let poke = emit_beacon_action(
             BeaconAction::Changed {
@@ -3766,7 +3850,7 @@ mod tests {
             let (mut pending, mut by_name, _rx) = make_pending();
             let beacons = BeaconTracker::new();
             let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
-            let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+            let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = Vec::new();
             let mut poke = false;
             handle_search_response(
                 &found_true(proto),
@@ -3789,7 +3873,7 @@ mod tests {
         let (mut pending, mut by_name, mut rx) = make_pending();
         let beacons = BeaconTracker::new();
         let ignore: std::collections::HashSet<[u8; 12]> = std::collections::HashSet::new();
-        let mut subs: Vec<mpsc::Sender<Discovered>> = Vec::new();
+        let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = Vec::new();
         let mut poke = false;
         handle_search_response(
             &found_true("tcp"),
@@ -3855,11 +3939,10 @@ mod tests {
         // Returns (Discovered::Online fired, server entered the tracker).
         let run = |frame: &[u8]| -> (bool, bool) {
             let beacons = BeaconTracker::new();
-            let mut pending: HashMap<u32, Pending> = HashMap::new();
-            let (tx, mut rx) = mpsc::channel::<Discovered>(8);
-            let mut subs: Vec<mpsc::Sender<Discovered>> = vec![tx];
+            let (tx, mut rx) = mpsc::unbounded_channel::<Discovered>();
+            let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = vec![tx];
             let mut poke = false;
-            handle_beacon(frame, &beacons, &mut pending, &mut subs, &mut poke, peer);
+            handle_beacon(frame, &beacons, &mut subs, &mut poke, peer);
             let server = SocketAddr::new(peer.ip(), 5075);
             (rx.try_recv().is_ok(), beacons.guid_for(server).is_some())
         };
@@ -4054,6 +4137,74 @@ mod tests {
             rearm_after_send(false, current, 0, no_imbalance),
             ((current + 1) % N_SEARCH_BUCKETS, 1),
             "first normal retry escalates one bucket forward"
+        );
+    }
+
+    /// pvxs `poke()` (client.cpp:736-759) and the discovery-pong path
+    /// (client.cpp:889-899) only arm the fast search revolution — they
+    /// never iterate channels or reset `nSearch`. The revolution's poked
+    /// ticks then preserve each search's accumulated backoff
+    /// (`tickSearch(..., poked=true)` skips the `nSearch++` increment,
+    /// client.cpp:1141-1143). A real discovery pong must therefore leave a
+    /// pending search's `attempt`/`bucket` untouched and only signal the
+    /// poke. Before, the UDP discovery-pong handler reset every pending
+    /// search to `attempt = 0` / `last_attempt = now-60s`, converting an
+    /// escalated backoff into a fresh 1-bucket retry on each beacon — a
+    /// search-broadcast amplifier on a mass IOC restart.
+    #[test]
+    fn discovery_pong_preserves_pending_search_backoff() {
+        use tokio::sync::oneshot;
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 5076);
+        let (tx, _rx) = oneshot::channel::<SearchHit>();
+        let mut pending: HashMap<u32, Pending> = HashMap::new();
+        pending.insert(
+            1,
+            Pending {
+                pv_name: "dut".into(),
+                responder: Responder::Single(tx),
+                last_attempt: Instant::now(),
+                attempt: 3,
+                bucket: 2,
+            },
+        );
+        let mut by_name: HashMap<String, u32> = std::iter::once(("dut".to_string(), 1)).collect();
+        let beacons = BeaconTracker::new();
+        // An active discover() subscriber — required for the discovery-pong
+        // branch to fire at all (pvxs `!discoverers.empty()`,
+        // client.cpp:889). Keep `_rxd` alive so the channel stays open.
+        let (txd, _rxd) = mpsc::unbounded_channel::<Discovered>();
+        let mut subs: Vec<mpsc::UnboundedSender<Discovered>> = vec![txd];
+        let mut poke = false;
+        // found=false (empty cids), seq == SEARCH_SEQ, fresh GUID → a New
+        // beacon identity → should_poke.
+        let pong = crate::server_native::udp::build_search_response_proto(
+            [0x99u8; 12],
+            SEARCH_SEQ,
+            5075,
+            &[],
+            ByteOrder::Little,
+            "tcp",
+        );
+        handle_search_response(
+            &pong,
+            &mut pending,
+            &mut by_name,
+            &beacons,
+            &std::collections::HashSet::new(),
+            &mut subs,
+            &mut poke,
+            peer,
+            false,
+        );
+        assert!(poke, "a New discovery-pong identity must signal a poke");
+        let p = pending.get(&1).expect("pending search must survive a poke");
+        assert_eq!(
+            p.attempt, 3,
+            "discovery pong must NOT reset the pending search's accumulated backoff"
+        );
+        assert_eq!(
+            p.bucket, 2,
+            "discovery pong must NOT move the pending search to a fresh bucket"
         );
     }
 
@@ -5186,6 +5337,7 @@ mod tests {
         let handles = vec![NsHandle {
             tx,
             ready: Arc::clone(&ready),
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
         }];
 
         // NS offline/handshaking: ticks far exceeding the channel capacity must
@@ -5220,10 +5372,12 @@ mod tests {
             NsHandle {
                 tx: tx_a,
                 ready: Arc::new(AtomicBool::new(true)),
+                queued_bytes: Arc::new(AtomicUsize::new(0)),
             },
             NsHandle {
                 tx: tx_b,
                 ready: Arc::new(AtomicBool::new(false)),
+                queued_bytes: Arc::new(AtomicUsize::new(0)),
             },
         ];
         ns_forward_one(&handles, &codec, 7, "PV:X");
@@ -5231,6 +5385,45 @@ mod tests {
         assert!(
             rx_b.try_recv().is_err(),
             "not-ready NS is skipped this tick"
+        );
+    }
+
+    /// pvxs skips a name server for a tick once its TCP output buffer exceeds
+    /// 64 KiB (`evbuffer_get_length(tx) > 64*1024`, client.cpp:1118-1128). The
+    /// engine's gate must be byte-aware, not a frame count: an empty channel
+    /// (zero frames queued) with an over-threshold byte backlog is still
+    /// skipped, and a delivered frame adds its own byte length to the backlog.
+    #[test]
+    fn ns_forward_gate_is_byte_based_not_frame_count() {
+        let codec = PvaCodec { big_endian: false };
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let ready = Arc::new(AtomicBool::new(true));
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let handles = vec![NsHandle {
+            tx,
+            ready: Arc::clone(&ready),
+            queued_bytes: Arc::clone(&queued_bytes),
+        }];
+
+        // Channel is empty (0 frames), but the byte backlog already exceeds the
+        // 64 KiB gate: pvxs skips the NS for the tick on queued bytes alone, so
+        // a frame-count gate (which would see an empty channel) is wrong here.
+        queued_bytes.store(NS_TX_MAX_QUEUED_BYTES + 1, Ordering::SeqCst);
+        ns_forward_one(&handles, &codec, 1, "PV:GATE");
+        assert!(
+            rx.try_recv().is_err(),
+            "over-budget queued bytes must skip the tick even with an empty channel"
+        );
+
+        // Drained back under the threshold: the next tick is delivered and the
+        // frame's own length is tracked in the backlog (bytes, not a count).
+        queued_bytes.store(0, Ordering::SeqCst);
+        ns_forward_one(&handles, &codec, 2, "PV:GATE");
+        let frame = rx.try_recv().expect("under-budget tick is delivered");
+        assert_eq!(
+            queued_bytes.load(Ordering::SeqCst),
+            frame.len(),
+            "the delivered frame's byte length is added to the queued-byte backlog"
         );
     }
 

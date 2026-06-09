@@ -696,6 +696,11 @@ fn map_dbf_type(t: DbFieldType) -> LinkDbfType {
         DbFieldType::Double => LinkDbfType::Double,
         DbFieldType::Int64 => LinkDbfType::Int64,
         DbFieldType::UInt64 => LinkDbfType::UInt64,
+        // DBF_USHORT/DBF_ULONG are internal like Int64/UInt64 and never
+        // appear over CA (they present as DBR_LONG / DBR_DOUBLE); mapped
+        // for completeness.
+        DbFieldType::UShort => LinkDbfType::UShort,
+        DbFieldType::ULong => LinkDbfType::ULong,
     }
 }
 

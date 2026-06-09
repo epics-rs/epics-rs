@@ -106,6 +106,13 @@ fn native_placeholder(native_type: DbFieldType, element_count: u32) -> EpicsValu
         DbFieldType::Int64 => EpicsValue::Int64Array(vec![0; n]),
         DbFieldType::UInt64 if scalar => EpicsValue::UInt64(0),
         DbFieldType::UInt64 => EpicsValue::UInt64Array(vec![0; n]),
+        // Like Int64/UInt64, DBF_USHORT/DBF_ULONG never travel natively over
+        // CA (they promote to DBR_LONG / DBR_DOUBLE), so these branches are
+        // unreachable for a CA upstream; mapped for completeness.
+        DbFieldType::UShort if scalar => EpicsValue::UShort(0),
+        DbFieldType::UShort => EpicsValue::UShortArray(vec![0; n]),
+        DbFieldType::ULong if scalar => EpicsValue::ULong(0),
+        DbFieldType::ULong => EpicsValue::ULongArray(vec![0; n]),
     }
 }
 

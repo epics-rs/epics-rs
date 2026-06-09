@@ -168,6 +168,10 @@ pub fn format_value(
         EpicsValue::Long(n) => format_int_i64(*n as i64, fmt.int_style),
         EpicsValue::Int64(n) => format_int_wide(n.to_string(), *n as u64, fmt.int_style),
         EpicsValue::UInt64(n) => format_int_wide(n.to_string(), *n, fmt.int_style),
+        // u16/u32 widen losslessly into i64 (non-negative, in range), so the
+        // plain integer formatter is correct — no wide-unsigned path needed.
+        EpicsValue::UShort(n) => format_int_i64(*n as i64, fmt.int_style),
+        EpicsValue::ULong(n) => format_int_i64(*n as i64, fmt.int_style),
         EpicsValue::Char(n) => format_int_i64((*n as i8) as i64, fmt.int_style),
         EpicsValue::Enum(idx) => format_enum(*idx as i64, fmt, enum_strings),
         // Transient NTEnum carrier never reaches CA serialization (coerced in
@@ -200,6 +204,20 @@ pub fn format_value(
         EpicsValue::UInt64Array(arr) => render_array_iter(
             arr.iter()
                 .map(|&n| format_int_wide(n.to_string(), n, fmt.int_style)),
+            arr.len(),
+            fmt,
+            sep,
+            req_elems_present,
+        ),
+        EpicsValue::UShortArray(arr) => render_array_int(
+            arr.iter().map(|&n| n as i64),
+            arr.len(),
+            fmt,
+            sep,
+            req_elems_present,
+        ),
+        EpicsValue::ULongArray(arr) => render_array_int(
+            arr.iter().map(|&n| n as i64),
             arr.len(),
             fmt,
             sep,

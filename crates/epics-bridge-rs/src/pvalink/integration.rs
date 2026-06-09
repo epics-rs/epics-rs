@@ -1638,6 +1638,8 @@ fn is_array_value(value: &EpicsValue) -> bool {
         | EpicsValue::CharArray(_)
         | EpicsValue::Int64Array(_)
         | EpicsValue::UInt64Array(_)
+        | EpicsValue::UShortArray(_)
+        | EpicsValue::ULongArray(_)
         | EpicsValue::StringArray(_) => true,
         EpicsValue::String(_)
         | EpicsValue::Short(_)
@@ -1650,7 +1652,9 @@ fn is_array_value(value: &EpicsValue) -> bool {
         | EpicsValue::Long(_)
         | EpicsValue::Double(_)
         | EpicsValue::Int64(_)
-        | EpicsValue::UInt64(_) => false,
+        | EpicsValue::UInt64(_)
+        | EpicsValue::UShort(_)
+        | EpicsValue::ULong(_) => false,
     }
 }
 

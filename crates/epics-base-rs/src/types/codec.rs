@@ -277,8 +277,13 @@ pub(crate) fn sts_pad(native: DbFieldType) -> &'static [u8] {
         // (epicsInt32, **4 bytes** — `db_access.h:45 typedef epicsInt32
         // dbr_long_t`) between severity and value. Layout is
         // status(2)+severity(2)+RISC_pad(4)+value(8) → value at offset 8.
-        // Int64/UInt64 are served over CA as DBR_DOUBLE so they share the pad.
-        DbFieldType::Double | DbFieldType::Int64 | DbFieldType::UInt64 => &[0, 0, 0, 0],
+        // Int64/UInt64 are served over CA as DBR_DOUBLE so they share the pad;
+        // DBF_ULONG promotes to DBR_DOUBLE (db_convert.h dbDBRnewToDBRold) too.
+        // DBF_USHORT promotes to DBR_LONG, which has no STS pad, so it stays
+        // in the `_` arm with Short/Long/Float.
+        DbFieldType::Double | DbFieldType::Int64 | DbFieldType::UInt64 | DbFieldType::ULong => {
+            &[0, 0, 0, 0]
+        }
         _ => &[],
     }
 }
@@ -289,8 +294,11 @@ pub(crate) fn time_pad(native: DbFieldType) -> &'static [u8] {
         // 12 bytes header → short/enum need 2-pad, char needs 2+1=3 pad
         DbFieldType::Short | DbFieldType::Enum => &[0, 0],
         DbFieldType::Char => &[0, 0, 0],
-        // double: 12 → pad 4 to reach 16-byte boundary for 8-byte double
-        DbFieldType::Double => &[0, 0, 0, 0],
+        // double: 12 → pad 4 to reach 16-byte boundary for 8-byte double.
+        // DBF_ULONG promotes to DBR_DOUBLE (db_convert.h dbDBRnewToDBRold) so
+        // it shares the 4-byte pad; DBF_USHORT promotes to DBR_LONG (4-byte-
+        // aligned at offset 12, no pad) and stays in the `_` arm with Long.
+        DbFieldType::Double | DbFieldType::ULong => &[0, 0, 0, 0],
         _ => &[],
     }
 }
@@ -314,14 +322,16 @@ fn gr_ctrl_meta_size(native: DbFieldType, ctrl: bool) -> usize {
         // precision(2) + RISC_pad(2) + units[8] + n limits (f32).
         DbFieldType::Float => head + 4 + MAX_UNITS_SIZE + n_limits * 4,
         // precision(2) + RISC_pad(2) + units[8] + n limits (f64). Int64/
-        // UInt64 have no CA GR/CTRL type and reuse the Double layout.
-        DbFieldType::Double | DbFieldType::Int64 | DbFieldType::UInt64 => {
+        // UInt64/ULong have no CA GR/CTRL type and reuse the Double layout
+        // (DBF_ULONG promotes to DBR_DOUBLE, db_convert.h dbDBRnewToDBRold).
+        DbFieldType::Double | DbFieldType::Int64 | DbFieldType::UInt64 | DbFieldType::ULong => {
             head + 4 + MAX_UNITS_SIZE + n_limits * 8
         }
         // units[8] + n limits (i16).
         DbFieldType::Short => head + MAX_UNITS_SIZE + n_limits * 2,
-        // units[8] + n limits (i32).
-        DbFieldType::Long => head + MAX_UNITS_SIZE + n_limits * 4,
+        // units[8] + n limits (i32). DBF_USHORT promotes to DBR_LONG, so it
+        // reuses the Long GR/CTRL layout.
+        DbFieldType::Long | DbFieldType::UShort => head + MAX_UNITS_SIZE + n_limits * 4,
         // units[8] + n limits (u8) + RISC_pad(1).
         DbFieldType::Char => head + MAX_UNITS_SIZE + n_limits + 1,
     }
@@ -438,7 +448,9 @@ fn serialize_gr_ctrl(
             let n_limits = if ctrl { 8 } else { 6 };
             buf.extend_from_slice(&vec![0u8; n_limits * 2]);
         }
-        DbFieldType::Long => {
+        // DBF_USHORT promotes to DBR_LONG (db_convert.h dbDBRnewToDBRold), so
+        // it serializes with the Long GR/CTRL layout.
+        DbFieldType::Long | DbFieldType::UShort => {
             // units[8] + 6 or 8 limits (i32)
             buf.extend_from_slice(&[0u8; MAX_UNITS_SIZE]);
             let n_limits = if ctrl { 8 } else { 6 };
@@ -451,10 +463,11 @@ fn serialize_gr_ctrl(
             buf.extend_from_slice(&vec![0u8; n_limits]);
             buf.push(0); // RISC_pad
         }
-        // Int64/UInt64 have no CA GR/CTRL type — this arm is unreachable in
-        // normal CA paths. Use same layout as Double
-        // (precision(2)+pad(2)+units(8)+n*f64 limits).
-        DbFieldType::Int64 | DbFieldType::UInt64 => {
+        // Int64/UInt64/ULong have no CA GR/CTRL type — this arm is unreachable
+        // in normal CA paths. Use same layout as Double
+        // (precision(2)+pad(2)+units(8)+n*f64 limits); DBF_ULONG promotes to
+        // DBR_DOUBLE (db_convert.h dbDBRnewToDBRold).
+        DbFieldType::Int64 | DbFieldType::UInt64 | DbFieldType::ULong => {
             buf.extend_from_slice(&[0u8; 4]); // precision + pad
             buf.extend_from_slice(&[0u8; MAX_UNITS_SIZE]);
             let n_limits = if ctrl { 8 } else { 6 };
@@ -559,15 +572,17 @@ fn encode_gr(
         DbFieldType::Short => {
             encode_units_limits_i16(&mut buf, snapshot, 6);
         }
-        DbFieldType::Long => {
+        // DBF_USHORT promotes to DBR_LONG; use the Long GR layout.
+        DbFieldType::Long | DbFieldType::UShort => {
             encode_units_limits_i32(&mut buf, snapshot, 6);
         }
         DbFieldType::Char => {
             encode_units_limits_u8(&mut buf, snapshot, 6);
             buf.push(0); // RISC_pad
         }
-        // Int64/UInt64 have no CA GR type; use Double layout.
-        DbFieldType::Int64 | DbFieldType::UInt64 => {
+        // Int64/UInt64/ULong have no CA GR type; use Double layout (DBF_ULONG
+        // promotes to DBR_DOUBLE).
+        DbFieldType::Int64 | DbFieldType::UInt64 | DbFieldType::ULong => {
             encode_prec_units_limits_f64(&mut buf, snapshot, 6);
         }
     }
@@ -604,15 +619,17 @@ fn encode_ctrl(
         DbFieldType::Short => {
             encode_units_limits_i16(&mut buf, snapshot, 8);
         }
-        DbFieldType::Long => {
+        // DBF_USHORT promotes to DBR_LONG; use the Long CTRL layout.
+        DbFieldType::Long | DbFieldType::UShort => {
             encode_units_limits_i32(&mut buf, snapshot, 8);
         }
         DbFieldType::Char => {
             encode_units_limits_u8(&mut buf, snapshot, 8);
             buf.push(0); // RISC_pad
         }
-        // Int64/UInt64 have no CA CTRL type; use Double layout.
-        DbFieldType::Int64 | DbFieldType::UInt64 => {
+        // Int64/UInt64/ULong have no CA CTRL type; use Double layout (DBF_ULONG
+        // promotes to DBR_DOUBLE).
+        DbFieldType::Int64 | DbFieldType::UInt64 | DbFieldType::ULong => {
             encode_prec_units_limits_f64(&mut buf, snapshot, 8);
         }
     }
@@ -1074,7 +1091,8 @@ fn decode_gr_ctrl(
                 });
             }
         }
-        DbFieldType::Long => {
+        // DBF_USHORT promotes to DBR_LONG; decode with the Long GR/CTRL layout.
+        DbFieldType::Long | DbFieldType::UShort => {
             let units = read_string(data, off, MAX_UNITS_SIZE);
             off += MAX_UNITS_SIZE;
             let n_limits = if ctrl { 8 } else { 6 };
@@ -1136,8 +1154,9 @@ fn decode_gr_ctrl(
                 });
             }
         }
-        // Int64/UInt64 have no CA GR/CTRL type; decode as Double layout.
-        DbFieldType::Int64 | DbFieldType::UInt64 => {
+        // Int64/UInt64/ULong have no CA GR/CTRL type; decode as Double layout
+        // (DBF_ULONG promotes to DBR_DOUBLE).
+        DbFieldType::Int64 | DbFieldType::UInt64 | DbFieldType::ULong => {
             let precision = read_i16(data, off)?;
             off += 4; // precision(2) + pad(2)
             let units = read_string(data, off, MAX_UNITS_SIZE);

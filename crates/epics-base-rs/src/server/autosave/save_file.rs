@@ -307,6 +307,16 @@ pub fn value_to_save_str(value: &EpicsValue) -> String {
             let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
             format!("[{}]", parts.join(","))
         }
+        EpicsValue::UShort(v) => v.to_string(),
+        EpicsValue::ULong(v) => v.to_string(),
+        EpicsValue::UShortArray(arr) => {
+            let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
+            format!("[{}]", parts.join(","))
+        }
+        EpicsValue::ULongArray(arr) => {
+            let parts: Vec<_> = arr.iter().map(|v| v.to_string()).collect();
+            format!("[{}]", parts.join(","))
+        }
         EpicsValue::StringArray(arr) => {
             let parts: Vec<_> = arr
                 .iter()
@@ -374,6 +384,10 @@ pub fn value_to_save_str_c(value: &EpicsValue) -> String {
         EpicsValue::Int64Array(arr) => c_array(arr.iter()),
         EpicsValue::UInt64(v) => v.to_string(),
         EpicsValue::UInt64Array(arr) => c_array(arr.iter()),
+        EpicsValue::UShort(v) => v.to_string(),
+        EpicsValue::ULong(v) => v.to_string(),
+        EpicsValue::UShortArray(arr) => c_array(arr.iter()),
+        EpicsValue::ULongArray(arr) => c_array(arr.iter()),
         EpicsValue::StringArray(arr) => c_array(arr.iter().cloned()),
     }
 }
@@ -424,6 +438,14 @@ pub fn parse_save_value(s: &str, template: &EpicsValue) -> Option<EpicsValue> {
         }
         EpicsValue::UInt64Array(_) => {
             parse_array_str(s, |v| v.parse::<u64>().ok()).map(EpicsValue::UInt64Array)
+        }
+        EpicsValue::UShort(_) => s.parse::<u16>().ok().map(EpicsValue::UShort),
+        EpicsValue::ULong(_) => s.parse::<u32>().ok().map(EpicsValue::ULong),
+        EpicsValue::UShortArray(_) => {
+            parse_array_str(s, |v| v.parse::<u16>().ok()).map(EpicsValue::UShortArray)
+        }
+        EpicsValue::ULongArray(_) => {
+            parse_array_str(s, |v| v.parse::<u32>().ok()).map(EpicsValue::ULongArray)
         }
         EpicsValue::StringArray(_) => {
             let inner = s.trim_start_matches('[').trim_end_matches(']');

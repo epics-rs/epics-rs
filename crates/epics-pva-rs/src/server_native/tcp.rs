@@ -502,6 +502,10 @@ fn epics_value_to_pv_field(v: &epics_base_rs::types::EpicsValue) -> Option<PvFie
         EpicsValue::String(s) => PvField::Scalar(ScalarValue::String(s.clone())),
         EpicsValue::Int64(l) => PvField::Scalar(ScalarValue::Long(*l)),
         EpicsValue::UInt64(u) => PvField::Scalar(ScalarValue::ULong(*u)),
+        // C `DBF_USHORT` → PVA `ushort` / `DBF_ULONG` → PVA `uint`
+        // (pvxs `ioc/typeutils.cpp:38-44`).
+        EpicsValue::UShort(u) => PvField::Scalar(ScalarValue::UShort(*u)),
+        EpicsValue::ULong(u) => PvField::Scalar(ScalarValue::UInt(*u)),
         EpicsValue::DoubleArray(a) => {
             PvField::ScalarArray(a.iter().map(|x| ScalarValue::Double(*x)).collect())
         }
@@ -528,6 +532,12 @@ fn epics_value_to_pv_field(v: &epics_base_rs::types::EpicsValue) -> Option<PvFie
         }
         EpicsValue::UInt64Array(a) => {
             PvField::ScalarArray(a.iter().map(|x| ScalarValue::ULong(*x)).collect())
+        }
+        EpicsValue::UShortArray(a) => {
+            PvField::ScalarArray(a.iter().map(|x| ScalarValue::UShort(*x)).collect())
+        }
+        EpicsValue::ULongArray(a) => {
+            PvField::ScalarArray(a.iter().map(|x| ScalarValue::UInt(*x)).collect())
         }
     })
 }

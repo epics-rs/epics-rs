@@ -1563,6 +1563,8 @@ fn dbf_type_name(val: &EpicsValue) -> &'static str {
         EpicsValue::Double(_) => "DBF_DOUBLE",
         EpicsValue::Int64(_) | EpicsValue::Int64Array(_) => "DBF_INT64",
         EpicsValue::UInt64(_) | EpicsValue::UInt64Array(_) => "DBF_UINT64",
+        EpicsValue::UShort(_) | EpicsValue::UShortArray(_) => "DBF_USHORT",
+        EpicsValue::ULong(_) | EpicsValue::ULongArray(_) => "DBF_ULONG",
         EpicsValue::ShortArray(_) => "DBF_SHORT",
         EpicsValue::FloatArray(_) => "DBF_FLOAT",
         EpicsValue::EnumArray(_) => "DBF_ENUM",

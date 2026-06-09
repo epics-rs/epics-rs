@@ -285,6 +285,8 @@ fn dbf_text(t: DbFieldType) -> &'static str {
         DbFieldType::Double => "DBF_DOUBLE",
         DbFieldType::Int64 => "DBF_INT64",
         DbFieldType::UInt64 => "DBF_UINT64",
+        DbFieldType::UShort => "DBF_USHORT",
+        DbFieldType::ULong => "DBF_ULONG",
     }
 }
 

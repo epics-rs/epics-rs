@@ -4041,6 +4041,81 @@ async fn test_seq_bare_lnk_does_not_process_passive_target() {
     );
 }
 
+// R0604 regression — a record's `WriteDbLink` OUT write must land BEFORE
+// the producing record's FLNK fires. C record support performs
+// `dbPutLink()` for OUT links before `recGblFwdLink()`
+// (transformRecord.c:608-619, scalerRecord.c:457-480), so a downstream
+// FLNK target that reads the written PV observes the new value. Pre-fix
+// the framework ran the FLNK tail first, leaving the target stale.
+struct WriteThenFlnkProducer;
+impl Record for WriteThenFlnkProducer {
+    fn record_type(&self) -> &'static str {
+        "write_flnk_producer"
+    }
+    fn process(&mut self) -> epics_base_rs::error::CaResult<ProcessOutcome> {
+        Ok(ProcessOutcome::complete_with(vec![
+            ProcessAction::WriteDbLink {
+                link_field: "OUT",
+                value: EpicsValue::Double(42.0),
+            },
+        ]))
+    }
+    fn get_field(&self, name: &str) -> Option<EpicsValue> {
+        match name {
+            "OUT" => Some(EpicsValue::String("WF_TARGET".into())),
+            _ => None,
+        }
+    }
+    fn put_field(&mut self, _name: &str, _value: EpicsValue) -> epics_base_rs::error::CaResult<()> {
+        Ok(())
+    }
+    fn field_list(&self) -> &'static [FieldDesc] {
+        &[]
+    }
+}
+
+#[tokio::test]
+async fn test_write_db_link_runs_before_flnk_target_reads_fresh() {
+    let db = PvDatabase::new();
+    // Target the producer writes 42.0 into.
+    db.add_record("WF_TARGET", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    // FLNK observer reads WF_TARGET via its INP during its own process.
+    db.add_record("WF_OBSERVER", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("WF_OBSERVER").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("INP", EpicsValue::String("WF_TARGET".into()))
+            .unwrap();
+    }
+    // Producer: WriteDbLink → WF_TARGET, FLNK → WF_OBSERVER.
+    db.add_record("WF_PRODUCER", Box::new(WriteThenFlnkProducer))
+        .await
+        .unwrap();
+    if let Some(rec) = db.get_record("WF_PRODUCER").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("FLNK", EpicsValue::String("WF_OBSERVER".into()))
+            .unwrap();
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("WF_PRODUCER", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // The OUT write ran before FLNK, so the observer read the fresh 42.0.
+    let observed = db.get_pv("WF_OBSERVER").await.unwrap();
+    match observed {
+        EpicsValue::Double(v) => assert!(
+            (v - 42.0).abs() < 1e-10,
+            "FLNK observer must read the post-WriteDbLink value 42.0, got {v}"
+        ),
+        other => panic!("expected Double(42.0), got {other:?}"),
+    }
+}
+
 // BUG 1 regression — sseq `LNKn` is `DBF_OUTLINK` driven via `dbPutLink`
 // → `dbDbPutValue` (`dbDbLink.c:388`). A bare sseq LNKn is NPP and must
 // not process its target; an explicit-PP LNKn must.

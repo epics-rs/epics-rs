@@ -1710,6 +1710,25 @@ impl PvDatabase {
             }
         }
 
+        // 7b. C record support performs a record's OUT/link writes BEFORE
+        // its forward link: `transformRecord` calls `dbPutLink()`
+        // (transformRecord.c:608-619) before `monitor()` +
+        // `recGblFwdLink()`, `scalerRecord` writes COUT/COUTP
+        // (scalerRecord.c:457-480) before its FLNK block, `throttleRecord`
+        // writes the selected OUT link (throttleRecord.c:562-580) before
+        // `recGblFwdLink()`, and `tableRecord` drives speed/drive links
+        // (tableRecord.c:573-597) before its final FLNK. The
+        // `ProcessAction::WriteDbLink` contract is documented as "before
+        // FLNK", so split the requested actions: link writes run now;
+        // delayed/reprocess and device-command actions (whose timing must
+        // stay after the FLNK tail) run afterward. A downstream FLNK
+        // target therefore reads the freshly written value, matching C.
+        let (link_writes, deferred_actions): (Vec<_>, Vec<_>) = process_actions
+            .into_iter()
+            .partition(|a| matches!(a, crate::server::record::ProcessAction::WriteDbLink { .. }));
+        self.execute_process_actions(name, &rec, link_writes, visited, depth)
+            .await;
+
         // 4.5 - 7. Multi-output / event / generic-multi-out / FLNK /
         // CP / RPRO tail. Shared with the simulation-mode path so a
         // simulated record runs the exact same `recGblFwdLink`
@@ -1727,9 +1746,11 @@ impl PvDatabase {
         )
         .await;
 
-        // 8. Execute ProcessActions from the record's process() outcome.
-        // This handles WriteDbLink, ReadDbLink, and ReprocessAfter actions.
-        self.execute_process_actions(name, &rec, process_actions, visited, depth)
+        // 8. Execute the deferred ProcessActions after the FLNK tail:
+        // `ReprocessAfter` schedules a later reprocess (the current
+        // cycle's FLNK must proceed first) and `DeviceCommand` posts its
+        // own monitors after this cycle's snapshot.
+        self.execute_process_actions(name, &rec, deferred_actions, visited, depth)
             .await;
 
         // 9. C `recGbl.c::recGblFwdLink:302` clears `putf = FALSE` at the

@@ -640,15 +640,26 @@ pub struct BridgeProvider {
     /// their *next* check (matches C++ QSRV — ACF reload takes effect
     /// without recreating channels).
     access_cell: Arc<parking_lot::RwLock<Arc<dyn AccessControl>>>,
-    /// Source registry for file-loaded group definitions:
-    /// `(filename, raw-macros)` → the group names that load placed into
-    /// `groups`. pvxs keeps a `groupConfigFiles` list so
-    /// `dbLoadGroup("-file.json")` can remove a previously added file
-    /// and `dbLoadGroup("-*")` can clear them all
-    /// (ioc/groupsourcehooks.cpp:133-183). The Rust port parses eagerly
-    /// into `groups` (the daemon serves without `processGroups`), so the
-    /// source identity is retained here to make the same add / replace /
-    /// remove contract expressible without a deferred-parse rearchitecture.
+    /// "Base" group fragments that survive every `dbLoadGroup` file
+    /// add/remove/clear: `info(Q:group)` record tags ([`Self::load_info_group`])
+    /// and direct config loads ([`Self::load_group_config`]). pvxs rebuilds
+    /// these first in `processGroups` (`loadConfigFromDb`,
+    /// ioc/groupsourcehooks.cpp:198) before any file fragments, so they are
+    /// kept separately from the removable file list and re-merged on every
+    /// rebuild. Stored as the parsed fragments (not the merged result) so a
+    /// rebuild can replay them through the field-keyed `merge_group_defs`.
+    base_group_defs: parking_lot::RwLock<Vec<GroupPvDef>>,
+    /// Source registry for file-loaded group definitions. pvxs keeps a
+    /// `groupConfigFiles` list so `dbLoadGroup("-file.json")` removes one
+    /// file's contribution and `dbLoadGroup("-*")` clears them all
+    /// (ioc/groupsourcehooks.cpp:133-183), then `processGroups` rebuilds the
+    /// live group map from the remaining files plus the DB-info fragments
+    /// (groupsourcehooks.cpp:200-207). Each entry stores its source identity
+    /// `(filename, raw-macros)` AND the parsed `GroupPvDef` fragments so the
+    /// live [`Self::groups`] map can be rebuilt field-by-field from the
+    /// surviving sources — removal is NOT a whole-group-name delete, which
+    /// would drop fields contributed to the same group name by other files
+    /// or `info(Q:group)` tags.
     group_files: parking_lot::RwLock<Vec<GroupFileEntry>>,
     /// QSRV2 serving gate. pvxs adds the single-record and group sources
     /// to the PVA server only when `enable2()` returns true
@@ -662,13 +673,16 @@ pub struct BridgeProvider {
     enabled: bool,
 }
 
-/// One `dbLoadGroup(filename, macros)` registration: its source
-/// identity plus the group names that load placed into the live
-/// registry, so the same file can later be removed.
+/// One `dbLoadGroup(filename, macros)` registration: its source identity
+/// plus the parsed `GroupPvDef` fragments that load contributed. Keeping
+/// the fragments (rather than only the group names) lets the live registry
+/// be rebuilt field-by-field from the surviving sources when this file is
+/// removed, so a file that contributed only some fields of a shared group
+/// name does not delete the whole group.
 struct GroupFileEntry {
     filename: String,
     macros: String,
-    names: Vec<String>,
+    defs: Vec<GroupPvDef>,
 }
 
 /// Proxy that re-reads the live access-control policy on every check.
@@ -720,6 +734,7 @@ impl BridgeProvider {
             ops_get: std::sync::atomic::AtomicU64::new(0),
             ops_put: std::sync::atomic::AtomicU64::new(0),
             ops_subscribe: std::sync::atomic::AtomicU64::new(0),
+            base_group_defs: parking_lot::RwLock::new(Vec::new()),
             group_files: parking_lot::RwLock::new(Vec::new()),
             enabled,
         }
@@ -732,8 +747,12 @@ impl BridgeProvider {
     /// modelled per-group yet).
     pub async fn is_writable(&self, name: &str) -> bool {
         // Group channel: writability per-member is complex; for now
-        // assume true if the group is registered.
-        if self.groups.read().contains_key(name) {
+        // assume true if the group is *served* (registered and not
+        // shadowed by a backing record). A shadowed name falls through to
+        // the record path below so its `.DISP` governs writability — pvxs
+        // serves such a name only as the record (defineGroups,
+        // ioc/groupconfigprocessor.cpp:170-181), never the group.
+        if self.is_servable_group(name).await {
             return true;
         }
         let (record, _field) = epics_base_rs::server::database::parse_pv_name(name);
@@ -840,19 +859,15 @@ impl BridgeProvider {
     /// against a shared `Arc<BridgeProvider>`.
     pub fn load_group_config(&self, json: &str) -> BridgeResult<()> {
         let defs = super::group_config::parse_group_config(json)?;
-        let mut g = self.groups.write();
-        // Accumulate field-by-field, not replace. pvxs loads every DB
-        // `info(Q:group)` entry and every queued `dbLoadGroup` file into
-        // one `GroupConfigProcessor` (groupsourcehooks.cpp:192-207) whose
-        // `fieldConfigMap` (groupprocessorcontext.cpp:25-42) collects
-        // distinct fields for the same group name across all sources. A
-        // bare `insert` here dropped a same-named group loaded earlier
-        // (whether from another file or a record `info(Q:group)` tag),
-        // turning a valid modular config into an order-dependent partial
-        // group. `merge_group_defs` is the same field-keyed path
-        // `load_info_group` already uses, so cross-source duplicate field
-        // names collapse first-wins (groupconfigprocessor.cpp:221-225).
-        super::group_config::merge_group_defs(&mut g, defs);
+        // A direct config load is a "base" source — it survives every
+        // dbLoadGroup file add/remove/clear, like pvxs DB-info groups
+        // (`loadConfigFromDb` runs before `loadConfigFiles` in
+        // `processGroups`, groupsourcehooks.cpp:198-201). Record the parsed
+        // fragments and rebuild the live map field-by-field from all
+        // sources via `merge_group_defs`, which collapses cross-source
+        // duplicate field names first-wins (groupconfigprocessor.cpp:221-225).
+        self.base_group_defs.write().extend(defs);
+        self.rebuild_groups();
         Ok(())
     }
 
@@ -878,25 +893,24 @@ impl BridgeProvider {
         json: &str,
     ) -> BridgeResult<()> {
         let defs = super::group_config::parse_group_config(json)?;
-        // Drop a prior load of the same source identity (pvxs erases
-        // the matching entry before appending the new one).
-        self.remove_group_file(filename, macros);
-        let names: Vec<String> = defs.iter().map(|d| d.name.clone()).collect();
         {
-            let mut g = self.groups.write();
-            // Accumulate across files rather than replace — a second file
-            // contributing distinct fields to the same group name must add
-            // them, not drop the first file's group (finding 40 /
-            // groupsourcehooks.cpp:192-207, fieldConfigMap accumulation).
-            // Same field-keyed merge as `load_group_config` /
-            // `load_info_group`.
-            super::group_config::merge_group_defs(&mut g, defs);
+            let mut files = self.group_files.write();
+            // Drop a prior load of the same source identity (pvxs erases
+            // the matching entry before appending the new one,
+            // groupsourcehooks.cpp:174-183), then register this file's
+            // parsed fragments.
+            files.retain(|e| !(e.filename == filename && e.macros == macros));
+            files.push(GroupFileEntry {
+                filename: filename.to_string(),
+                macros: macros.to_string(),
+                defs,
+            });
         }
-        self.group_files.write().push(GroupFileEntry {
-            filename: filename.to_string(),
-            macros: macros.to_string(),
-            names,
-        });
+        // Rebuild the live map from all surviving sources, accumulating
+        // field-by-field — a second file contributing distinct fields to
+        // the same group name adds them rather than replacing the first
+        // file's group (groupsourcehooks.cpp:192-207, fieldConfigMap).
+        self.rebuild_groups();
         Ok(())
     }
 
@@ -906,22 +920,20 @@ impl BridgeProvider {
     /// which compares the raw filename and raw macros string. Returns the
     /// number of group definitions removed.
     pub fn remove_group_file(&self, filename: &str, macros: &str) -> usize {
-        let mut files = self.group_files.write();
-        let mut groups = self.groups.write();
-        let mut removed = 0;
-        files.retain(|e| {
-            if e.filename == filename && e.macros == macros {
-                for n in &e.names {
-                    if groups.remove(n).is_some() {
-                        removed += 1;
-                    }
-                }
-                false
-            } else {
-                true
-            }
-        });
-        removed
+        let before = self.groups.read().len();
+        {
+            let mut files = self.group_files.write();
+            files.retain(|e| !(e.filename == filename && e.macros == macros));
+        }
+        // Rebuild from the surviving sources rather than deleting the
+        // removed file's group names: a group name shared with another file
+        // or an `info(Q:group)` tag keeps the fields those sources
+        // contributed (pvxs re-runs `processGroups` over the remaining file
+        // list, groupsourcehooks.cpp:200-207). The reported count is the
+        // number of group names that fully disappeared.
+        self.rebuild_groups();
+        let after = self.groups.read().len();
+        before.saturating_sub(after)
     }
 
     /// Remove every file-loaded group. Mirrors pvxs `dbLoadGroup("-*")`
@@ -930,24 +942,48 @@ impl BridgeProvider {
     /// intact; use [`Self::reset_groups`] to clear everything. Returns
     /// the number of group definitions removed.
     pub fn clear_group_files(&self) -> usize {
-        let mut files = self.group_files.write();
-        let mut groups = self.groups.write();
-        let mut removed = 0;
-        for e in files.drain(..) {
-            for n in &e.names {
-                if groups.remove(n).is_some() {
-                    removed += 1;
-                }
+        let before = self.groups.read().len();
+        self.group_files.write().clear();
+        // `info(Q:group)` and direct-config base fragments are not
+        // file-sourced and survive the rebuild; use `reset_groups` to clear
+        // everything. The reported count is the number of group names that
+        // fully disappeared once the file fragments are removed.
+        self.rebuild_groups();
+        let after = self.groups.read().len();
+        before.saturating_sub(after)
+    }
+
+    /// Single owner of the live group map. Rebuilds [`Self::groups`] from
+    /// the current sources via the field-keyed `merge_group_defs`: the base
+    /// fragments (DB-info / direct-config) first — matching pvxs
+    /// `loadConfigFromDb` before `loadConfigFiles` in `processGroups`
+    /// (groupsourcehooks.cpp:198-207) — then each tracked `dbLoadGroup`
+    /// file's fragments in load order. Because the map is a pure derivation
+    /// of the sources, an add/remove/clear re-merges the survivors, so a
+    /// file that contributed only some fields of a shared group name never
+    /// deletes the fields other sources contributed.
+    fn rebuild_groups(&self) {
+        let mut merged: HashMap<String, GroupPvDef> = HashMap::new();
+        {
+            let base = self.base_group_defs.read();
+            super::group_config::merge_group_defs(&mut merged, base.clone());
+        }
+        {
+            let files = self.group_files.read();
+            for entry in files.iter() {
+                super::group_config::merge_group_defs(&mut merged, entry.defs.clone());
             }
         }
-        removed
+        *self.groups.write() = merged;
     }
 
     /// Load group definitions from a record's info(Q:group, ...) tag.
     pub fn load_info_group(&self, record_name: &str, json: &str) -> BridgeResult<()> {
         let defs = super::group_config::parse_info_group(record_name, json)?;
-        let mut g = self.groups.write();
-        super::group_config::merge_group_defs(&mut g, defs);
+        // `info(Q:group)` tags are base sources (pvxs `loadConfigFromDb`);
+        // record the fragments and rebuild from all sources.
+        self.base_group_defs.write().extend(defs);
+        self.rebuild_groups();
         Ok(())
     }
 
@@ -1021,10 +1057,15 @@ impl BridgeProvider {
     /// consecutive snapshots. Returns `false` for non-groups and for
     /// groups carrying any explicit `+trigger` member (see
     /// [`GroupPvDef::is_pure_self_trigger`]).
-    pub fn group_is_pure_self_trigger(&self, name: &str) -> bool {
-        self.groups
-            .read()
-            .get(name)
+    ///
+    /// Routed through the shadow gate ([`Self::servable_group`]): a group
+    /// name shadowed by a backing record is served as the record, whose
+    /// monitor is a single-record full-snapshot stream, not a
+    /// partial-trigger group stream — so this returns `false` for a
+    /// shadowed name to match the served channel.
+    pub async fn group_is_pure_self_trigger(&self, name: &str) -> bool {
+        self.servable_group(name)
+            .await
             .map(|g| g.is_pure_self_trigger())
             .unwrap_or(false)
     }
@@ -1072,17 +1113,35 @@ impl BridgeProvider {
         Some(def)
     }
 
+    /// Lean bool form of [`Self::servable_group`]: `name` is served as a
+    /// group iff it is registered AND not shadowed by a backing record.
+    ///
+    /// The single shadow-aware predicate every group-specific helper
+    /// consults so the "a name is a record XOR a group" invariant pvxs
+    /// enforces in `defineGroups` (ioc/groupconfigprocessor.cpp:170-181,
+    /// live `groupMap` ioc/groupsource.cpp:75-89) holds on every path, not
+    /// only the find/list/create serve path. Avoids cloning the
+    /// `GroupPvDef` when only the existence answer is needed (e.g. the
+    /// `is_writable` / `PROCESS` admission checks).
+    pub(crate) async fn is_servable_group(&self, name: &str) -> bool {
+        // Read the registry into a bool before any await so the
+        // (non-Send) `parking_lot` guard is not held across `record_exists`.
+        let registered = self.groups.read().contains_key(name);
+        registered && !self.record_exists(name).await
+    }
+
     /// Drop every registered group definition. Mirrors pvxs
     /// `resetGroups` (groupsourcehooks.cpp:222) — used between
     /// `iocInit` cycles in tests so the second run starts clean. The
     /// underlying records are unaffected.
     pub fn reset_groups(&self) -> usize {
-        let mut g = self.groups.write();
-        let n = g.len();
-        g.clear();
-        // Drop the file-source registry too, so a later
-        // remove/clear or re-load starts from a clean slate.
+        let n = self.groups.read().len();
+        // Drop every source — base (info / config) fragments and the
+        // file-source registry — so a later remove/clear or re-load starts
+        // from a clean slate, then clear the derived live map.
+        self.base_group_defs.write().clear();
         self.group_files.write().clear();
+        self.groups.write().clear();
         n
     }
 
@@ -1407,6 +1466,74 @@ mod tests {
         );
     }
 
+    /// The shadow invariant must hold on the per-group *predicate* paths,
+    /// not only find/list/create. A group whose name collides with a
+    /// record is served only as the record (pvxs `defineGroups`,
+    /// groupconfigprocessor.cpp:170-181), so `is_writable`,
+    /// `group_is_pure_self_trigger`, and the shared `is_servable_group`
+    /// gate must all resolve a shadowed name to the record. Before the fix
+    /// these read the raw registry and leaked group-derived behavior.
+    #[tokio::test]
+    async fn shadowed_group_predicates_resolve_to_record() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::ai::AiRecord;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("SH:rec", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        // DISP=1 so the served record is NOT writable; a leaked group
+        // predicate would still advertise writable=true.
+        {
+            let rec = db.get_record("SH:rec").await.unwrap();
+            rec.write().await.common.disp = true;
+        }
+
+        let provider = BridgeProvider::new(db);
+        // "SH:rec" shadows the record; "SH:grp" has no backing record.
+        // Both are pure self-trigger groups (no explicit `+trigger`).
+        provider
+            .load_group_config(
+                r#"{
+                    "SH:rec": { "value": { "+channel": "SH:rec.VAL", "+type": "plain" } },
+                    "SH:grp": { "value": { "+channel": "OTHER.VAL",  "+type": "plain" } }
+                }"#,
+            )
+            .unwrap();
+
+        // The single shadow gate.
+        assert!(
+            !provider.is_servable_group("SH:rec").await,
+            "shadowed name is not a servable group"
+        );
+        assert!(
+            provider.is_servable_group("SH:grp").await,
+            "non-colliding group is servable"
+        );
+
+        // is_writable: the shadowed name falls to the record path, whose
+        // DISP=1 makes it not writable (raw-registry leak returned true).
+        assert!(
+            !provider.is_writable("SH:rec").await,
+            "shadowed name must respect record DISP, not the group blanket-true"
+        );
+        assert!(
+            provider.is_writable("SH:grp").await,
+            "a real servable group is writable"
+        );
+
+        // group_is_pure_self_trigger: false for the shadowed name (served
+        // as a record full-snapshot monitor), true for the real group.
+        assert!(
+            !provider.group_is_pure_self_trigger("SH:rec").await,
+            "shadowed name is a record monitor, not a partial group stream"
+        );
+        assert!(
+            provider.group_is_pure_self_trigger("SH:grp").await,
+            "the real pure-self-trigger group emits partial"
+        );
+    }
+
     /// `dbLoadGroup` source identity: a tracked file load can later be
     /// removed by its `(filename, macros)` identity, re-loading the same
     /// identity replaces rather than duplicates, and `-*` clears all
@@ -1475,6 +1602,99 @@ mod tests {
         assert!(
             names.contains(&"b"),
             "file B field must be added: {names:?}"
+        );
+    }
+
+    /// Removing one `dbLoadGroup` file must NOT delete the whole group name
+    /// when another file (or an `info(Q:group)` tag) contributed fields to
+    /// the same group. pvxs erases only the removed file entry and re-runs
+    /// `processGroups` over the remaining sources
+    /// (groupsourcehooks.cpp:174-207), so the surviving fields persist. The
+    /// prior Rust path tracked only group *names* per file and removed the
+    /// whole group on `-file`, losing the other sources' fields.
+    #[tokio::test]
+    async fn group_file_remove_keeps_other_sources_fields_for_shared_group() {
+        use epics_base_rs::server::database::PvDatabase;
+
+        let provider = BridgeProvider::new(Arc::new(PvDatabase::new()));
+        let file_a = r#"{ "GRP": { "a": { "+channel": "RA.VAL", "+type": "plain" } } }"#;
+        let file_b = r#"{ "GRP": { "b": { "+channel": "RB.VAL", "+type": "plain" } } }"#;
+
+        provider
+            .load_group_file_tracked("a.json", "", file_a)
+            .unwrap();
+        provider
+            .load_group_file_tracked("b.json", "", file_b)
+            .unwrap();
+
+        // Removing a.json keeps GRP alive with b.json's surviving field;
+        // no group name fully disappeared, so the reported count is 0.
+        assert_eq!(provider.remove_group_file("a.json", ""), 0);
+        let def = provider
+            .groups()
+            .get("GRP")
+            .cloned()
+            .expect("GRP must survive removal of a.json");
+        let names: Vec<&str> = def.members.iter().map(|m| m.field_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["b"],
+            "only file A's field is removed: {names:?}"
+        );
+
+        // Re-loading the SAME identity as b.json (replace) leaves GRP with
+        // exactly b's field — no duplicate, no loss of the survivor.
+        provider
+            .load_group_file_tracked("b.json", "", file_b)
+            .unwrap();
+        let def = provider.groups().get("GRP").cloned().expect("GRP exists");
+        assert_eq!(def.members.len(), 1, "re-load must not duplicate b");
+    }
+
+    /// `dbLoadGroup("-*")` clears file fragments but must preserve an
+    /// `info(Q:group)` (base) fragment for the same group name — pvxs's
+    /// `processGroups` rebuilds the DB-info groups after clearing files
+    /// (groupsourcehooks.cpp:140-143 + 198-207). The base/file source split
+    /// makes the file clear leave the info-contributed field intact.
+    #[tokio::test]
+    async fn group_file_clear_preserves_info_group_fragment() {
+        use epics_base_rs::server::database::PvDatabase;
+
+        let provider = BridgeProvider::new(Arc::new(PvDatabase::new()));
+        // info(Q:group) on record REC contributes GRP.i (record-relative
+        // channel is prefixed with "REC.").
+        provider
+            .load_info_group(
+                "REC",
+                r#"{ "GRP": { "i": { "+channel": "VAL", "+type": "plain" } } }"#,
+            )
+            .unwrap();
+        // a file contributes GRP.f.
+        provider
+            .load_group_file_tracked(
+                "f.json",
+                "",
+                r#"{ "GRP": { "f": { "+channel": "RF.VAL", "+type": "plain" } } }"#,
+            )
+            .unwrap();
+        assert_eq!(
+            provider.groups().get("GRP").unwrap().members.len(),
+            2,
+            "both info and file fields present before clear"
+        );
+
+        // -* clears the file fragment; the info(Q:group) fragment survives.
+        provider.clear_group_files();
+        let def = provider
+            .groups()
+            .get("GRP")
+            .cloned()
+            .expect("GRP must survive `-*` via its info(Q:group) fragment");
+        let names: Vec<&str> = def.members.iter().map(|m| m.field_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["i"],
+            "only the file field is cleared: {names:?}"
         );
     }
 

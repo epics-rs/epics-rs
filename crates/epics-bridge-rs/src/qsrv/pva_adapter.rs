@@ -611,7 +611,12 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                     "PROCESS not supported for native PVA PV '{name}' (no processing chain)"
                 )));
             }
-            if provider.groups().contains_key(&name) {
+            // Only a *served* group (registered and not shadowed by a
+            // backing record) rejects PROCESS as a group PV. A shadowed
+            // name is served as the record, so it must process through the
+            // record chain below — pvxs serves such a name only as the
+            // record (defineGroups, groupconfigprocessor.cpp:170-181).
+            if provider.is_servable_group(&name).await {
                 return Err(OpError::failed(format!(
                     "PROCESS not supported for group PV '{name}' (no record-level chain)"
                 )));
@@ -727,12 +732,12 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
         let pva_pvs = self.pva_pvs.clone();
         async move {
             let opened = open_monitor(provider, pva_pvs, checked.clone(), ctx.clone()).await?;
-            // Seed AFTER the subscription is armed (open_monitor started it),
-            // matching the default `subscribe_seeded` ordering so no event
-            // between seed and stream is lost or doubled.
-            let initial = self.get_value_checked(checked, ctx).await;
             match opened {
                 OpenedMonitor::Native(rx) => {
+                    // Native-registered PVA PVs (NDPluginPva etc.) serve the
+                    // GET seed and monitor frames from one cached snapshot, so
+                    // their `record._options` already match — keep the GET seed.
+                    let initial = self.get_value_checked(checked, ctx).await;
                     Some(epics_pva_rs::server_native::source::SubscriptionSeed {
                         initial,
                         updates: epics_pva_rs::server_native::plain_monitor_updates(rx),
@@ -740,6 +745,26 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                     })
                 }
                 OpenedMonitor::Db(monitor) => {
+                    // Seed a group monitor from the monitor-stamped value path
+                    // (`AnyMonitor::seed`), not the GET path, so the initial
+                    // DATA frame's `record._options` (atomic = true, negotiated
+                    // queueSize) match the update stream that `poll()` drains
+                    // from the same `group_channel`. pvxs delivers the first
+                    // group post through the monitor-stamped `currentValue`
+                    // (ioc/groupsource.cpp:401-405), whereas the GET path stamps
+                    // the operation atomicity and queueSize = 0 (:480-485); the
+                    // old GET seed made the first frame disagree with every
+                    // later one. A single-record monitor returns `None` from
+                    // `seed()` (its GET seed and frames already carry identical
+                    // options) and falls back to the GET seed. Read the seed
+                    // BEFORE the monitor moves into its forward task; the
+                    // subscription is already armed (open_monitor started it),
+                    // so any event between seed and stream is buffered in the
+                    // monitor's fan-in channel rather than lost or doubled.
+                    let initial = match monitor.seed().await {
+                        Some(v) => Some(v),
+                        None => self.get_value_checked(checked, ctx).await,
+                    };
                     // Capture the enable/disable handles before the monitor
                     // moves into its forward task; `Arc` so the gate closure
                     // (invoked once per START/STOP edge) reuses them.
@@ -934,8 +959,9 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
     /// (self-trigger); single-record / native-PVA PVs and groups with
     /// explicit `+trigger` members keep the full request mask.
     fn monitor_emits_partial(&self, name: &str) -> impl std::future::Future<Output = bool> + Send {
-        let partial = self.provider.group_is_pure_self_trigger(name);
-        async move { partial }
+        let provider = self.provider.clone();
+        let name = name.to_string();
+        async move { provider.group_is_pure_self_trigger(&name).await }
     }
 }
 
@@ -2118,6 +2144,52 @@ mod tests {
         assert!(
             err.message.contains("UNKNOWN:PV"),
             "error must name the PV; got: {err}"
+        );
+    }
+
+    /// PROCESS on a name that is BOTH a record and a (shadowed) group must
+    /// process the record, not reject as a group PV. pvxs serves a
+    /// record-shadowed group name only as the record (`defineGroups`,
+    /// groupconfigprocessor.cpp:170-181). The prior PROCESS gate read the
+    /// raw group registry, so a shadowed name was rejected with
+    /// "PROCESS not supported for group PV" even though the record is
+    /// processable.
+    #[tokio::test]
+    async fn process_shadowed_group_processes_the_record() {
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::records::ai::AiRecord;
+        use epics_pva_rs::server_native::ChannelSource;
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record("SP:rec", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        let provider = Arc::new(BridgeProvider::new(db));
+        // "SP:rec" shadows the record; "SP:grp" has no backing record.
+        provider
+            .load_group_config(
+                r#"{
+                    "SP:rec": { "value": { "+channel": "SP:rec.VAL", "+type": "plain" } },
+                    "SP:grp": { "value": { "+channel": "OTHER.VAL",  "+type": "plain" } }
+                }"#,
+            )
+            .expect("load group");
+        let store = QsrvPvStore::new(provider);
+
+        // The shadowed name processes through the record chain.
+        store
+            .process("SP:rec")
+            .await
+            .expect("PROCESS on a record-shadowed group name must process the record");
+
+        // The non-colliding group is still rejected as a group PV.
+        let err = store
+            .process("SP:grp")
+            .await
+            .expect_err("PROCESS on a real group PV must error");
+        assert!(
+            err.message.contains("group PV"),
+            "error must classify SP:grp as a group PV; got: {err}"
         );
     }
 

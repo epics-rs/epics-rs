@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 
 use epics_pva_rs::client::PvaClient;
 use epics_pva_rs::client_native::CacheAction;
+use epics_pva_rs::client_native::ops_v2::PutLeaf;
 use epics_pva_rs::pv_request::PvRequestExpr;
 use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarValue};
 
@@ -847,13 +848,26 @@ impl PvaLink {
             self.put_single(field, &sp.value, &req).await
         } else {
             // One combined PUT assigning every staged field into the
-            // same prototype (pvxs `linkBuildPut`).
-            let assignments: Vec<(String, String)> = staged
+            // same prototype (pvxs `linkBuildPut`,
+            // pvalink_channel.cpp:127-159). Each leaf travels as typed
+            // pvData: a staged `PvField` is assigned into the descriptor
+            // leaf verbatim — matching pvxs `value = tosend` for an array
+            // leaf — instead of being stringified into a bracketed list the
+            // field parser would re-split on commas, which corrupts a typed
+            // scalar array. String writes still lower through the CLI parser
+            // so the text is coerced against the native scalar type.
+            let assignments: Vec<(String, PutLeaf)> = staged
                 .iter()
-                .map(|(field, sp)| (put_field_path(field), queued_to_string(&sp.value)))
+                .map(|(field, sp)| {
+                    let leaf = match &sp.value {
+                        QueuedPut::Field(f) => PutLeaf::Typed(f.clone()),
+                        QueuedPut::Str(s) => PutLeaf::Str(s.clone()),
+                    };
+                    (put_field_path(field), leaf)
+                })
                 .collect();
             self.client
-                .pvput_fields(&self.config.pv_name, &assignments, Some(&req))
+                .pvput_fields_typed(&self.config.pv_name, &assignments, Some(&req))
                 .await
         };
 
@@ -1664,14 +1678,7 @@ fn combine_proc(modes: impl Iterator<Item = ProcMode>) -> ProcMode {
 /// combined `pvput_fields` path is the documented scalar-field
 /// coalescing case (`pvalink.rst:111-113`), while a lone typed array
 /// stays on the single-field typed path (see [`PvaLink::flush_scratch`]).
-fn queued_to_string(value: &QueuedPut) -> String {
-    match value {
-        QueuedPut::Str(s) => s.clone(),
-        QueuedPut::Field(f) => f.to_string(),
-    }
-}
-
-/// The dotted field path for a staged write's `pvput_fields`
+/// The dotted field path for a staged write's `pvput_fields_typed`
 /// assignment: a root write (`""`) targets `value`.
 fn put_field_path(field: &str) -> String {
     if field.is_empty() {

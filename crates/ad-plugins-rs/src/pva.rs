@@ -161,7 +161,9 @@ fn ndarray_to_pv_field(array: &NDArray) -> PvField {
             // provenance C never emits.
             time_stamp: NdTimeStamp::default(),
             source_type: ndattr_source_type(&a.source),
-            source: ndattr_source_string(&a.source),
+            // C publishes `NDAttribute::getSource()` verbatim
+            // (ntndArrayConverter.cpp:564); never synthesize it from the type.
+            source: a.source.source_string().to_string(),
         })
         .collect();
 
@@ -230,30 +232,18 @@ fn codec_name_to_string(name: ad_core_rs::codec::CodecName) -> String {
     name.as_str().to_string()
 }
 
+/// `sourceType` field for the NTNDArray attribute — the raw `NDAttrSource_t`
+/// enum int that C writes verbatim (`ntndArrayConverter.cpp:566-567`,
+/// enum order `NDAttribute.h:62-68`).
 fn ndattr_source_type(src: &ad_core_rs::attributes::NDAttrSource) -> i32 {
     use ad_core_rs::attributes::NDAttrSource;
     match src {
         NDAttrSource::Driver => 0,
         NDAttrSource::Param { .. } => 1,
-        NDAttrSource::EpicsPV => 2,
-        NDAttrSource::Function => 3,
-        NDAttrSource::Constant => 4,
-        NDAttrSource::Undefined => -1,
-    }
-}
-
-fn ndattr_source_string(src: &ad_core_rs::attributes::NDAttrSource) -> String {
-    use ad_core_rs::attributes::NDAttrSource;
-    match src {
-        NDAttrSource::Driver => "driver".into(),
-        NDAttrSource::Param {
-            port_name,
-            param_name,
-        } => format!("{port_name}.{param_name}"),
-        NDAttrSource::EpicsPV => "epics".into(),
-        NDAttrSource::Function => "function".into(),
-        NDAttrSource::Constant => "constant".into(),
-        NDAttrSource::Undefined => String::new(),
+        NDAttrSource::EpicsPV(_) => 2,
+        NDAttrSource::Function(_) => 3,
+        NDAttrSource::Constant(_) => 4,
+        NDAttrSource::Undefined => 5,
     }
 }
 
@@ -339,7 +329,7 @@ mod tests {
         arr.attributes.add(NDAttribute::new_static(
             "gain",
             "detector gain",
-            NDAttrSource::Constant,
+            NDAttrSource::Constant(String::new()),
             NDAttrValue::Int32(7),
         ));
         arr.attributes.add(NDAttribute::new_static(
@@ -401,7 +391,7 @@ mod tests {
         arr.attributes.add(NDAttribute::new_static(
             "gain",
             "detector gain",
-            NDAttrSource::Constant,
+            NDAttrSource::Constant(String::new()),
             NDAttrValue::Int32(7),
         ));
 
@@ -444,6 +434,96 @@ mod tests {
             (0, 0),
             "per-attribute timeStamp must stay default, not the image timestamp"
         );
+    }
+
+    /// Regression for the NTNDArray attribute `source` / `sourceType` contract.
+    ///
+    /// C `NDAttribute` stores the constructor `pSource` verbatim and the
+    /// converter publishes it with `pvAttr->getSubField<PVString>("source")
+    /// ->put(attr->getSource())` (ntndArrayConverter.cpp:564), while
+    /// `sourceType` is the raw `NDAttrSource_t` enum int (NDAttribute.h:62-68:
+    /// Driver=0, Param=1, EPICSPV=2, Funct=3, Const=4, Undefined=5).
+    /// Driver-created attributes carry the literal `"Driver"`
+    /// (NDAttributeList.cpp:73); XML attributes carry their configured `source`
+    /// property (PV name, asyn drvInfo, function name, or constant string). The
+    /// `source` string must never be synthesized from the type.
+    #[test]
+    fn attribute_source_string_and_type_match_c() {
+        use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+
+        let mut arr = NDArray::new(vec![NDDimension::new(2)], NDDataType::UInt8);
+        arr.attributes.add(NDAttribute::new_static(
+            "FromDriver",
+            "driver attr",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(0),
+        ));
+        arr.attributes.add(NDAttribute::new_static(
+            "Counter",
+            "param attr",
+            NDAttrSource::Param {
+                port_name: "SIM1".into(),
+                param_name: "ARRAY_COUNTER".into(),
+            },
+            NDAttrValue::Int32(0),
+        ));
+        arr.attributes.add(NDAttribute::new_static(
+            "Temp",
+            "epics pv attr",
+            NDAttrSource::EpicsPV("13SIM1:cam1:Temperature".into()),
+            NDAttrValue::Float64(0.0),
+        ));
+        arr.attributes.add(NDAttribute::new_static(
+            "Computed",
+            "function attr",
+            NDAttrSource::Function("my_func".into()),
+            NDAttrValue::Int32(0),
+        ));
+        arr.attributes.add(NDAttribute::new_static(
+            "Label",
+            "const attr",
+            NDAttrSource::Constant("a constant".into()),
+            NDAttrValue::String("a constant".into()),
+        ));
+
+        let payload = ndarray_to_pv_field(&arr);
+        let PvField::Structure(s) = &payload else {
+            panic!("expected structure, got {payload:?}");
+        };
+        let Some(PvField::StructureArray(attrs)) = s.get_field("attribute") else {
+            panic!("expected attribute structure-array");
+        };
+        assert_eq!(attrs.len(), 5);
+
+        let src_str = |i: usize| -> String {
+            let a = attrs[i].as_ref().expect("attribute present");
+            match a.get_field("source") {
+                Some(PvField::Scalar(ScalarValue::String(v))) => v.as_str_lossy().into_owned(),
+                other => panic!("expected source string, got {other:?}"),
+            }
+        };
+        let src_type = |i: usize| -> i32 {
+            let a = attrs[i].as_ref().expect("attribute present");
+            match a.get_field("sourceType") {
+                Some(PvField::Scalar(ScalarValue::Int(v))) => *v,
+                other => panic!("expected sourceType int, got {other:?}"),
+            }
+        };
+
+        // Driver: literal "Driver", enum 0 — NOT a lowercase "driver" label.
+        assert_eq!(src_str(0), "Driver");
+        assert_eq!(src_type(0), 0);
+        // Param: the asyn drvInfo verbatim, NOT "{port}.{param}".
+        assert_eq!(src_str(1), "ARRAY_COUNTER");
+        assert_eq!(src_type(1), 1);
+        // EPICS_PV / Function / Const: the configured source string verbatim,
+        // NOT the fixed labels "epics" / "function" / "constant".
+        assert_eq!(src_str(2), "13SIM1:cam1:Temperature");
+        assert_eq!(src_type(2), 2);
+        assert_eq!(src_str(3), "my_func");
+        assert_eq!(src_type(3), 3);
+        assert_eq!(src_str(4), "a constant");
+        assert_eq!(src_type(4), 4);
     }
 
     /// Regression R0604-ADPVA-TIMESTAMP-1.

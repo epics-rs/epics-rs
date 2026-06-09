@@ -49,27 +49,16 @@ struct FrameData {
     epics_ts_nsec: i32,
 }
 
-/// Map an `NDAttrSource` to the C++ `getSourceInfo()` source-type string.
+/// Map an `NDAttrSource` to the C++ `sourceTypeString_` label
+/// (NDAttribute.cpp:48-67), written by `getSourceInfo()`.
 fn attr_source_type_string(src: &NDAttrSource) -> &'static str {
     match src {
         NDAttrSource::Driver => "NDAttrSourceDriver",
-        NDAttrSource::EpicsPV => "NDAttrSourceEPICSPV",
+        NDAttrSource::EpicsPV(_) => "NDAttrSourceEPICSPV",
         NDAttrSource::Param { .. } => "NDAttrSourceParam",
-        NDAttrSource::Function => "NDAttrSourceFunct",
-        NDAttrSource::Constant => "NDAttrSourceConst",
+        NDAttrSource::Function(_) => "NDAttrSourceFunct",
+        NDAttrSource::Constant(_) => "NDAttrSourceConst",
         NDAttrSource::Undefined => "Undefined",
-    }
-}
-
-/// Map an `NDAttrSource` to the C++ `getSource()` source string.
-fn attr_source_string(src: &NDAttrSource) -> String {
-    match src {
-        NDAttrSource::Driver => "Driver".to_string(),
-        NDAttrSource::EpicsPV => "EPICS_PV".to_string(),
-        NDAttrSource::Param { param_name, .. } => param_name.clone(),
-        NDAttrSource::Function => "Function".to_string(),
-        NDAttrSource::Constant => "Const".to_string(),
-        NDAttrSource::Undefined => String::new(),
     }
 }
 
@@ -338,7 +327,9 @@ impl NDFileWriter for NetcdfWriter {
             .map(|a| AttrData {
                 name: a.name.clone(),
                 description: a.description.clone(),
-                source: attr_source_string(&a.source),
+                // C `NDFileNetCDF` writes `NDAttribute::getSource()` verbatim
+                // (NDFileNetCDF.cpp getAttributesFromFile); never synthesize it.
+                source: a.source.source_string().to_string(),
                 source_type: attr_source_type_string(&a.source).to_string(),
                 data_type_string: attr_data_type_string(&a.value).to_string(),
                 value: a.value.clone(),

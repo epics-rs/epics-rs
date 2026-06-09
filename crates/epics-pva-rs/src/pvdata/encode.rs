@@ -1330,13 +1330,14 @@ pub fn canonical_changed_bitset(
                 let whole = all_descendants_set(selection, bit_offset, desc)
                     || (bit_offset != 0 && selection.get(bit_offset));
                 if whole {
-                    // Descendant bits are redundant under a set structure
-                    // bit but harmless; set them for an unambiguous
-                    // "all present" mask.
-                    let total = desc.total_bits();
-                    for i in 0..total {
-                        out.set(bit_offset + i);
-                    }
+                    // pvxs `to_wire_valid` (dataencode.cpp:425-432) sets the
+                    // structure's own bit and then advances
+                    // `bit += desc[bit].size()`, skipping every descendant:
+                    // the parent bit alone conveys the whole subtree. Emit
+                    // parent-only so the wire bitset is byte-exact with pvxs;
+                    // the encoder/decoder treat a set structure bit as its
+                    // full subtree regardless of descendant bits.
+                    out.set(bit_offset);
                 } else {
                     // Partial → leave the structure bit clear; recurse.
                     let mut child_bit = bit_offset + 1;
@@ -3605,16 +3606,30 @@ mod tests {
         let mask = request_to_mask(&desc, &req).unwrap();
         assert_eq!(mask.iter().collect::<Vec<_>>(), vec![0, 2, 4]);
 
-        // Canonicalization preserves the named `alarm` structure bit as
-        // its whole subtree — {2,3,4} — NOT a narrowed {4}.
+        // Canonicalization keeps the named `alarm` structure bit as the
+        // sole representative of its whole subtree — {2}, NOT a narrowed
+        // {4} and NOT {2,3,4}. pvxs `to_wire_valid` sets only the parent
+        // (structure) bit and skips its descendants (`bit += desc.size()`);
+        // the set parent bit alone conveys the whole subtree on the wire.
         let changed = canonical_changed_bitset(&desc, &mask);
         assert!(changed.get(2), "named alarm structure bit preserved");
-        assert!(changed.get(3), "alarm.severity included (whole subtree)");
-        assert!(changed.get(4), "alarm.status included");
+        assert!(
+            !changed.get(3),
+            "alarm.severity descendant bit not emitted (parent bit conveys it)"
+        );
+        assert!(
+            !changed.get(4),
+            "alarm.status descendant bit not emitted (parent bit conveys it)"
+        );
         assert!(!changed.get(1), "value not requested → omitted");
         assert!(
             !changed.get(0),
             "root wildcard must not widen to whole tree"
+        );
+        assert_eq!(
+            changed.iter().collect::<Vec<_>>(),
+            vec![2],
+            "parent (structure) bit only — pvxs to_wire_valid byte-exact"
         );
 
         // GET-response round-trip: the source value's alarm is fully
@@ -3658,9 +3673,11 @@ mod tests {
     /// Mirror of pvxs `testpvreq.cpp:58-71`: `field(timeStamp,alarm.status)`
     /// against an NTScalar descriptor yields request mask
     /// {0,2,4,6,7,8,9}. The wire changed-bitset must keep the matched
-    /// `alarm` structure bit (2) — pvxs `to_wire_valid` sends the whole
-    /// `alarm` subtree — so the canonical form is {2,3,4,5,6,7,8,9}
-    /// (whole alarm + whole timeStamp), not a leaf-narrowed {4,6,7,8,9}.
+    /// `alarm` structure bit (2) so the whole `alarm` subtree is sent —
+    /// but pvxs `to_wire_valid` sets only the structure's own bit and
+    /// skips its descendants (`bit += desc.size()`), so the canonical
+    /// form is {2,6} (alarm + timeStamp parent bits), not the redundant
+    /// {2,3,4,5,6,7,8,9} and not a leaf-narrowed {4,6,7,8,9}.
     #[test]
     fn ntscalar_alarm_status_request_keeps_whole_alarm_structure() {
         use crate::pv_request::request_to_mask;
@@ -3739,8 +3756,10 @@ mod tests {
         let changed = canonical_changed_bitset(&value_desc, &mask);
         assert_eq!(
             changed.iter().collect::<Vec<_>>(),
-            vec![2, 3, 4, 5, 6, 7, 8, 9],
-            "whole alarm (2,3,4,5) + whole timeStamp (6,7,8,9); value omitted"
+            vec![2, 6],
+            "parent (structure) bits only — alarm (2) + timeStamp (6); pvxs \
+             to_wire_valid sets the structure bit and skips its descendants \
+             (`bit += desc.size()`), and value (1) is not requested"
         );
     }
 

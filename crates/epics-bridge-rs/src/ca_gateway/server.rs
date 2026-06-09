@@ -539,6 +539,15 @@ impl GatewayServer {
             upstream.install_access_notifier(notifier);
         }
 
+        // Snapshot the downstream CaServer's cumulative subscription-event
+        // counters so the stats refresh can derive serverEventRate /
+        // serverPostRate from their per-interval delta (gateServer.cc:
+        // 2147-2148). Captured BEFORE `downstream.run()` consumes the inner
+        // CaServer; the `Arc` keeps the shared counters alive afterwards.
+        if let Some(server_stats) = downstream.server_stats().await {
+            stats.install_server_stats(server_stats);
+        }
+
         // Publish C-compatible control flag PVs (commandFlag, report*Flag,
         // newAsFlag, quitFlag, quitServerFlag) under the stats prefix so
         // operators can trigger command-file execution, reports, reload,

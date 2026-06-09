@@ -24,7 +24,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
-use epics_ca_rs::server::{AccessRightsNotifier, CaServer, ServerConnectionEvent};
+use epics_ca_rs::server::{AccessRightsNotifier, CaServer, ServerConnectionEvent, ServerStats};
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 
@@ -419,6 +419,19 @@ impl DownstreamServer {
     pub async fn access_rights_notifier(&self) -> Option<AccessRightsNotifier> {
         let guard = self.server.lock().await;
         guard.as_ref().map(|s| s.access_rights_notifier())
+    }
+
+    /// Snapshot the inner CaServer's cumulative [`ServerStats`] so the
+    /// gateway's stats refresh can derive `serverEventRate`/`serverPostRate`
+    /// from the per-interval delta of its subscription-event counters
+    /// (ca-gateway samples `subscriptionEventsProcessed`/`Posted` at
+    /// gateServer.cc:2147-2148). Like [`Self::beacon_anomaly_handle`] this
+    /// must be called BEFORE [`Self::run`] consumes the inner CaServer; the
+    /// returned `Arc` keeps the counters alive afterwards. Returns None once
+    /// `run` has consumed the server.
+    pub async fn server_stats(&self) -> Option<Arc<ServerStats>> {
+        let guard = self.server.lock().await;
+        guard.as_ref().map(|s| s.stats())
     }
 
     /// Run the CA server (blocks until shutdown).

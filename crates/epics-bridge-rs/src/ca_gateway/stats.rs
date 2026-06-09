@@ -52,8 +52,8 @@
 //! | `<prefix>loopRate` | Double | loopCount rate — maintenance-tick iterations/sec |
 //! | `<prefix>cpuFract` | Double | Process CPU fraction over the interval (Linux `/proc/self/stat`; left at last value where procfs is absent) |
 //! | `<prefix>load` | Double | 1-minute system load average (Linux `/proc/loadavg`; left at last value where procfs is absent) |
-//! | `<prefix>serverEventRate` | Double | 0.0 placeholder — CAS subscription-event counter lives downstream (epics-ca-rs server) |
-//! | `<prefix>serverPostRate` | Double | 0.0 placeholder — CAS subscription-post counter lives downstream (epics-ca-rs server) |
+//! | `<prefix>serverEventRate` | Double | Downstream CA-server `subscription_events_processed` rate (0.0 until a `CaServer` stats handle is installed) |
+//! | `<prefix>serverPostRate` | Double | Downstream CA-server `subscription_events_posted` rate (0.0 until a `CaServer` stats handle is installed) |
 //!
 //! C ca-gateway compiles `RATE_STATS` and `CAS_DIAGNOSTICS` on by
 //! default (`configure/CONFIG_SITE:60,69`), so its `initStats`
@@ -68,9 +68,12 @@
 //! `fd` PV). `serverEventRate`/`serverPostRate` derive from the CAS
 //! server's `subscriptionEventsProcessed`/`Posted` counters
 //! (`gateServer.cc:2147-2148`), which in the Rust split live in the
-//! downstream `epics-ca-rs` server rather than this bridge crate, so
-//! they are served as a constant `0.0` (resolved, not does-not-exist)
-//! pending a counter exported across that crate boundary.
+//! downstream `epics-ca-rs` `CaServer`. The gateway snapshots that
+//! server's [`ServerStats`] `Arc` before `run` consumes the server and
+//! installs it via [`Stats::install_server_stats`]; `refresh` then posts
+//! the per-interval delta of each counter. Until a handle is installed
+//! (e.g. a stats-only unit test) both are served as a constant `0.0`
+//! (resolved, not does-not-exist).
 //!
 //! RATE_STATS internals (B5) — tokio-model equivalents of the C++
 //! ca-gateway `gateServer` RATE_STATS counters from `gateServer.cc`.
@@ -88,10 +91,12 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::types::EpicsValue;
+use epics_ca_rs::server::ServerStats;
 use tokio::sync::{Mutex, RwLock};
 
 use super::cache::PvCache;
@@ -178,6 +183,21 @@ pub struct Stats {
     /// Seeded with the process's current jiffies at construction so the
     /// first refresh reports CPU used since startup, not since boot.
     last_cpu_jiffies: AtomicU64,
+    /// Last `subscription_events_processed` value at refresh time, for
+    /// the serverEventRate delta (C `statServerEventRate`, sampled from
+    /// `subscriptionEventsProcessed`, gateServer.cc:2147,2238-2240).
+    last_server_events_processed: AtomicU64,
+    /// Last `subscription_events_posted` value at refresh time, for the
+    /// serverPostRate delta (C `statServerEventRequestRate`, sampled from
+    /// `subscriptionEventsPosted`, gateServer.cc:2148,2243-2245).
+    last_server_events_posted: AtomicU64,
+    /// Cumulative subscription-event counters of the gateway's downstream
+    /// CA server (epics-ca-rs `ServerStats`). Installed once via
+    /// [`Self::install_server_stats`] after the `CaServer` is built;
+    /// `serverEventRate`/`serverPostRate` stay 0.0 until then (e.g. a
+    /// stats-only unit test with no downstream server). The `Arc` keeps
+    /// the counters alive after `CaServer::run` consumes the server.
+    server_stats: OnceLock<Arc<ServerStats>>,
 }
 
 impl Stats {
@@ -202,7 +222,22 @@ impl Stats {
             // timer's first-tick capture of cpuPrevCount
             // (gateServer.cc:2161). 0 on a platform without procfs.
             last_cpu_jiffies: AtomicU64::new(proc_self_cpu_jiffies().unwrap_or(0)),
+            last_server_events_processed: AtomicU64::new(0),
+            last_server_events_posted: AtomicU64::new(0),
+            server_stats: OnceLock::new(),
         }
+    }
+
+    /// Install the gateway's downstream CA-server cumulative
+    /// subscription-event counters so [`Self::refresh`] can derive
+    /// `serverEventRate`/`serverPostRate` from their per-interval delta.
+    ///
+    /// Called once after the downstream `CaServer` is built and before
+    /// `CaServer::run` consumes it (the `Arc` keeps the counters alive
+    /// afterwards). Idempotent: a second call is ignored. Until set, both
+    /// server-rate PVs are posted as a constant 0.0.
+    pub fn install_server_stats(&self, server_stats: Arc<ServerStats>) {
+        let _ = self.server_stats.set(server_stats);
     }
 
     /// Record an upstream event. Only the upstream CA monitor callback
@@ -313,10 +348,11 @@ impl Stats {
             // overwritten by refresh: clientPostRate/loopRate map onto the
             // post_event_count/loop_count counters, cpuFract/load onto the
             // procfs CPU/load sources (left at last value where procfs is
-            // absent). serverEventRate/serverPostRate derive from CAS
-            // subscription counters that live in the downstream
-            // epics-ca-rs server, so they stay a constant 0.0 (served, not
-            // absent). All are DBR_DOUBLE to match gateStat STAT_DOUBLE.
+            // absent). serverEventRate/serverPostRate map onto the
+            // downstream epics-ca-rs CaServer subscription-event counters
+            // once a stats handle is installed, and stay 0.0 until then
+            // (served, not absent). All are DBR_DOUBLE to match gateStat
+            // STAT_DOUBLE.
             ("clientPostRate", EpicsValue::Double(0.0)),
             ("loopRate", EpicsValue::Double(0.0)),
             ("cpuFract", EpicsValue::Double(0.0)),
@@ -461,6 +497,40 @@ impl Stats {
         // where procfs is absent.
         let load_avg = load_average_1min();
 
+        // serverEventRate (C `statServerEventRate`, gateServer.cc:2238-2240)
+        // and serverPostRate (C `statServerEventRequestRate`, :2243-2245)
+        // are the delta-over-elapsed rates of the downstream CA server's
+        // cumulative subscription-event counters, sampled exactly like the
+        // client rates above (gateServer.cc:2147-2148): serverEventRate
+        // from `subscriptionEventsProcessed` (events written to clients),
+        // serverPostRate from `subscriptionEventsPosted` (events dequeued
+        // for delivery — `posted >= processed`, so serverPostRate trails
+        // upward when read access denies or a client write fails). The
+        // counters live in the downstream epics-ca-rs `CaServer`, installed
+        // via `install_server_stats`; until present (e.g. a stats-only unit
+        // test) both rates are 0.0.
+        let (server_event_rate, server_post_rate) = match self.server_stats.get() {
+            Some(ss) => {
+                let processed = ss.subscription_events_processed.load(Ordering::Relaxed);
+                let posted = ss.subscription_events_posted.load(Ordering::Relaxed);
+                let last_processed = self
+                    .last_server_events_processed
+                    .swap(processed, Ordering::Relaxed);
+                let last_posted = self
+                    .last_server_events_posted
+                    .swap(posted, Ordering::Relaxed);
+                if elapsed > 0.0 {
+                    (
+                        processed.saturating_sub(last_processed) as f64 / elapsed,
+                        posted.saturating_sub(last_posted) as f64 / elapsed,
+                    )
+                } else {
+                    (0.0, 0.0)
+                }
+            }
+            None => (0.0, 0.0),
+        };
+
         // Fan all stats PV writes out concurrently. Each
         // `put_pv_and_post` is independent (no shared lock between them
         // beyond the per-PV `RwLock`), so a single `tokio::join!` cuts
@@ -561,14 +631,13 @@ impl Stats {
             // loopRate carry the live rates computed above. cpuFract/load
             // are posted separately below (their procfs source can be
             // absent → leave-at-last, like fd). serverEventRate/
-            // serverPostRate derive from CAS subscription counters that
-            // live in the downstream epics-ca-rs server, so they are
-            // posted as a constant 0.0 (served, not absent) for C-name
-            // resolution parity.
+            // serverPostRate carry the downstream CA-server subscription-
+            // event rates when a `CaServer` stats handle is installed, and
+            // 0.0 otherwise (served, not absent) for C-name resolution.
             db.put_pv_and_post(&n_client_post_rate, EpicsValue::Double(client_post_rate)),
             db.put_pv_and_post(&n_loop_rate, EpicsValue::Double(loop_rate)),
-            db.put_pv_and_post(&n_server_event_rate, EpicsValue::Double(0.0)),
-            db.put_pv_and_post(&n_server_post_rate, EpicsValue::Double(0.0)),
+            db.put_pv_and_post(&n_server_event_rate, EpicsValue::Double(server_event_rate)),
+            db.put_pv_and_post(&n_server_post_rate, EpicsValue::Double(server_post_rate)),
         );
 
         // `fd` is posted separately because it is only available when
@@ -950,14 +1019,15 @@ mod tests {
             EpicsValue::Double(r) => assert!(r > 0.0, "loopRate should be > 0, got {r}"),
             other => panic!("loopRate must be DBR_DOUBLE, got {other:?}"),
         }
-        // serverEventRate / serverPostRate still have no in-crate source
-        // (the CAS subscription counters live in the downstream
-        // epics-ca-rs server) and are posted as a constant 0.0.
+        // serverEventRate / serverPostRate stay 0.0 here because this
+        // stats-only test installs no downstream CaServer stats handle
+        // (the `None` branch in refresh). The installed-handle path is
+        // covered by `refresh_server_rates_track_installed_ca_server_counters`.
         for name in ["g:serverEventRate", "g:serverPostRate"] {
             assert_eq!(
                 db.get_pv(name).await.unwrap(),
                 EpicsValue::Double(0.0),
-                "{name} is a 0.0 placeholder (CAS counter lives in epics-ca-rs)"
+                "{name} is 0.0 when no downstream CaServer stats handle is installed"
             );
         }
         // cpuFract / load carry live procfs-derived values on Linux and
@@ -972,6 +1042,68 @@ mod tests {
                 other => panic!("{name} must be DBR_DOUBLE, got {other:?}"),
             }
         }
+    }
+
+    /// With a downstream `CaServer` stats handle installed, serverEventRate
+    /// tracks the `subscription_events_processed` delta and serverPostRate
+    /// the `subscription_events_posted` delta (C samples the same two
+    /// counters at gateServer.cc:2147-2148). A first refresh with non-zero
+    /// counters posts a strictly-positive rate; a second refresh with no
+    /// new events decays both back to 0.0.
+    #[tokio::test]
+    async fn refresh_server_rates_track_installed_ca_server_counters() {
+        let stats = Stats::new("g:".into());
+        let db = PvDatabase::new();
+        stats.publish_initial(&db).await;
+
+        // Mirror the downstream CaServer's monitor-delivery owner advancing
+        // its cumulative counters: posted >= processed (some dequeued events
+        // suppressed before the wire), so serverPostRate >= serverEventRate.
+        let server_stats = Arc::new(ServerStats::default());
+        server_stats
+            .subscription_events_processed
+            .store(40, Ordering::Relaxed);
+        server_stats
+            .subscription_events_posted
+            .store(50, Ordering::Relaxed);
+        stats.install_server_stats(server_stats.clone());
+
+        let cache = RwLock::new(PvCache::new());
+        stats.refresh(&cache, &db, 0, 0).await;
+
+        // First refresh: previous baseline 0, deltas 40 / 50 over a tiny
+        // but positive elapsed → strictly > 0. DBR_DOUBLE per STAT_DOUBLE.
+        let first_event = match db.get_pv("g:serverEventRate").await.unwrap() {
+            EpicsValue::Double(r) => {
+                assert!(r > 0.0, "serverEventRate should be > 0, got {r}");
+                r
+            }
+            other => panic!("serverEventRate must be DBR_DOUBLE, got {other:?}"),
+        };
+        match db.get_pv("g:serverPostRate").await.unwrap() {
+            EpicsValue::Double(r) => {
+                assert!(r > 0.0, "serverPostRate should be > 0, got {r}");
+                // posted (50) >= processed (40) over the same interval.
+                assert!(
+                    r >= first_event,
+                    "serverPostRate ({r}) should be >= serverEventRate ({first_event})"
+                );
+            }
+            other => panic!("serverPostRate must be DBR_DOUBLE, got {other:?}"),
+        }
+
+        // Second refresh with no new events → delta 0 → both rates 0.0.
+        stats.refresh(&cache, &db, 0, 0).await;
+        assert_eq!(
+            db.get_pv("g:serverEventRate").await.unwrap(),
+            EpicsValue::Double(0.0),
+            "no new processed events → serverEventRate decays to 0"
+        );
+        assert_eq!(
+            db.get_pv("g:serverPostRate").await.unwrap(),
+            EpicsValue::Double(0.0),
+            "no new posted events → serverPostRate decays to 0"
+        );
     }
 
     /// `proc_self_cpu_jiffies` reports a monotonically non-decreasing

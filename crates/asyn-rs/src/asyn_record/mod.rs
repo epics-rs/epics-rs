@@ -940,11 +940,31 @@ impl AsynRecord {
         self.tinm = mask as i32;
     }
 
+    /// Resolve the trace target for this record's trace-control writes.
+    ///
+    /// C `findTracePvt` (asynManager.c:541-549) routes a trace mutation to
+    /// the device `dpCommon` when the connected `pasynUser` names a device
+    /// — a multi-device port addressed by `ADDR >= 0` — otherwise to the
+    /// port-wide `dpc`. `Some(addr)` selects the device override;
+    /// `None` the port default. Every `apply_trace_*` path routes through
+    /// this single resolver so a record adjusting one address cannot mutate
+    /// the whole port (or vice versa), and future trace controls inherit
+    /// the rule by construction.
+    fn trace_addr_target(&self) -> Option<i32> {
+        match self.port_entry {
+            Some(ref entry) if self.addr >= 0 && entry.handle.is_multi_device() => Some(self.addr),
+            _ => None,
+        }
+    }
+
     /// Apply current trace mask fields to the TraceManager.
     fn apply_trace_mask(&self) {
         if let Some(ref entry) = self.port_entry {
             let mask = TraceMask::from_bits_truncate(self.tmsk as u32);
-            entry.trace.set_trace_mask(Some(&self.port), mask);
+            match self.trace_addr_target() {
+                Some(addr) => entry.trace.set_device_trace_mask(&self.port, addr, mask),
+                None => entry.trace.set_trace_mask(Some(&self.port), mask),
+            }
         }
     }
 
@@ -952,7 +972,10 @@ impl AsynRecord {
     fn apply_trace_io_mask(&self) {
         if let Some(ref entry) = self.port_entry {
             let mask = TraceIoMask::from_bits_truncate(self.tiom as u32);
-            entry.trace.set_trace_io_mask(Some(&self.port), mask);
+            match self.trace_addr_target() {
+                Some(addr) => entry.trace.set_device_trace_io_mask(&self.port, addr, mask),
+                None => entry.trace.set_trace_io_mask(Some(&self.port), mask),
+            }
         }
     }
 
@@ -960,16 +983,25 @@ impl AsynRecord {
     fn apply_trace_info_mask(&self) {
         if let Some(ref entry) = self.port_entry {
             let mask = TraceInfoMask::from_bits_truncate(self.tinm as u32);
-            entry.trace.set_trace_info_mask(Some(&self.port), mask);
+            match self.trace_addr_target() {
+                Some(addr) => entry
+                    .trace
+                    .set_device_trace_info_mask(&self.port, addr, mask),
+                None => entry.trace.set_trace_info_mask(Some(&self.port), mask),
+            }
         }
     }
 
     /// Apply truncate size to TraceManager.
     fn apply_trace_truncate_size(&self) {
         if let Some(ref entry) = self.port_entry {
-            entry
-                .trace
-                .set_io_truncate_size(Some(&self.port), self.tsiz as usize);
+            let size = self.tsiz as usize;
+            match self.trace_addr_target() {
+                Some(addr) => entry
+                    .trace
+                    .set_device_io_truncate_size(&self.port, addr, size),
+                None => entry.trace.set_io_truncate_size(Some(&self.port), size),
+            }
         }
     }
 
@@ -996,7 +1028,10 @@ impl AsynRecord {
                 return;
             }
         };
-        entry.trace.set_trace_file(Some(&self.port), file);
+        match self.trace_addr_target() {
+            Some(addr) => entry.trace.set_device_trace_file(&self.port, addr, file),
+            None => entry.trace.set_trace_file(Some(&self.port), file),
+        }
     }
 
     /// Read current trace state from TraceManager into record fields.
@@ -2248,6 +2283,72 @@ mod tests {
         let entry = registry::get_port("test_asyn_rec");
         assert!(entry.is_some());
         assert_eq!(entry.unwrap().handle.port_name(), "test_asyn_rec");
+    }
+
+    /// Regression R0604-ASYN-TRACE-ADDR-1.
+    ///
+    /// On a multi-device port a record with ADDR >= 0 must route trace
+    /// controls to the (PORT,ADDR) device trace state, not the port-wide
+    /// state (C findTracePvt, asynManager.c:541-549). A record adjusting
+    /// device 3 must not change device 4 or the port default.
+    #[test]
+    fn trace_controls_route_to_device_on_multi_device_port() {
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use tokio::sync::mpsc;
+
+        struct MdDriver(PortDriverBase);
+        impl PortDriver for MdDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+
+        let port_name = "test_trace_addr_md";
+        let flags = PortFlags {
+            multi_device: true,
+            ..PortFlags::default()
+        };
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(
+            Box::new(MdDriver(PortDriverBase::new(port_name, 4, flags))),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let mut handle = PortHandle::new(tx, port_name.into(), interrupts);
+        handle.set_capabilities(true, 4);
+        let trace = Arc::new(TraceManager::new());
+        register_port(port_name, handle, trace.clone());
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.addr = 3;
+        rec.connect_device();
+        assert_eq!(rec.cnct, 1);
+        assert!(rec.trace_addr_target() == Some(3));
+
+        // Apply a device-3 trace mask through the record's TMSK path.
+        rec.tmsk = (TraceMask::ERROR | TraceMask::FLOW).bits() as i32;
+        rec.apply_trace_mask();
+        rec.tsiz = 17;
+        rec.apply_trace_truncate_size();
+
+        // Device 3 sees FLOW; device 4 and the port default do not.
+        assert!(trace.is_enabled_device(port_name, 3, TraceMask::FLOW));
+        assert!(!trace.is_enabled_device(port_name, 4, TraceMask::FLOW));
+        assert!(!trace.is_enabled(port_name, TraceMask::FLOW));
+
+        // A single-device (addr 0) record on the same port targets the port.
+        let mut rec0 = AsynRecord::default();
+        rec0.port = port_name.to_string();
+        rec0.addr = -1; // unaddressed -> port-wide
+        rec0.connect_device();
+        assert!(rec0.trace_addr_target().is_none());
     }
 
     /// Regression R0604-ASYN-IFMT-FIELDS-1.

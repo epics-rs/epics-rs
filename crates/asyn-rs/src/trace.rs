@@ -692,6 +692,29 @@ impl TraceManager {
         }
     }
 
+    /// Per-device variant of [`Self::set_io_truncate_size`].
+    ///
+    /// C parity: `setTraceIOTruncateSize` (asynManager.c:2929-2957) writes
+    /// the truncate size into the device `dpCommon` resolved by
+    /// `findTracePvt` when the asynUser carries a device, and announces
+    /// `asynExceptionTraceIOTruncateSize` per device.
+    pub fn set_device_io_truncate_size(&self, port: &str, addr: i32, size: usize) {
+        if let Ok(mut configs) = self.device_configs.lock() {
+            configs
+                .entry((port.to_string(), addr))
+                .or_insert_with(TraceConfig::default)
+                .io_truncate_size = size;
+        }
+        let sink = self.exception_sink.lock().ok().and_then(|g| g.clone());
+        if let Some(sink) = sink {
+            sink.announce(&ExceptionEvent {
+                port_name: port.to_string(),
+                exception: AsynException::TraceIoTruncateSize,
+                addr,
+            });
+        }
+    }
+
     pub fn get_trace_mask(&self, port: Option<&str>) -> TraceMask {
         if let Some(name) = port {
             if let Ok(configs) = self.port_configs.lock() {

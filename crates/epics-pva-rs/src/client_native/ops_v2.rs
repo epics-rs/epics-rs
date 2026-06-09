@@ -4610,6 +4610,279 @@ fn build_field_delta(
     Ok((value, changed))
 }
 
+/// The descriptor at a dotted field path inside `desc`, or `None` when a
+/// segment is missing or a non-structure is traversed. The descriptor
+/// twin of [`value_at_path`], used to lower a JSON field value against the
+/// right target shape.
+fn field_desc_at_path<'a>(desc: &'a FieldDesc, parts: &[&str]) -> Option<&'a FieldDesc> {
+    match parts.split_first() {
+        None => Some(desc),
+        Some((head, tail)) => {
+            if let FieldDesc::Structure { fields, .. } = desc {
+                let child = fields.iter().find(|(n, _)| n == head).map(|(_, d)| d)?;
+                field_desc_at_path(child, tail)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Coerce one JSON scalar to a [`ScalarValue`] of the target type, the
+/// pvData `PVScalar::putFrom` coercion the JSON parser applies per token
+/// (parseinto.cpp:60-66, `valueAssign` → `castUnsafe`): a JSON number
+/// lands in any numeric type (float→int truncates, like a C++ static
+/// cast), a JSON bool maps to 0/1 for numerics, and a JSON string is
+/// parsed for a numeric/bool target or taken verbatim for a string.
+fn json_scalar_to_value(st: ScalarType, j: &serde_json::Value) -> PvaResult<ScalarValue> {
+    use ScalarType as T;
+    use serde_json::Value as J;
+    // Any JSON scalar as a wide integer (i128 holds every i64/u64 exactly;
+    // a float source truncates toward zero, matching `static_cast`).
+    let as_int = || -> Option<i128> {
+        match j {
+            J::Number(n) => n
+                .as_i64()
+                .map(|v| v as i128)
+                .or_else(|| n.as_u64().map(|v| v as i128))
+                .or_else(|| n.as_f64().map(|f| f as i128)),
+            J::Bool(b) => Some(*b as i128),
+            J::String(s) => s.trim().parse::<i128>().ok(),
+            _ => None,
+        }
+    };
+    let as_float = || -> Option<f64> {
+        match j {
+            J::Number(n) => n.as_f64(),
+            J::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+            J::String(s) => s.trim().parse::<f64>().ok(),
+            _ => None,
+        }
+    };
+    let int_err = || PvaError::InvalidValue(format!("cannot assign JSON {j} to an integer field"));
+    let float_err =
+        || PvaError::InvalidValue(format!("cannot assign JSON {j} to a floating field"));
+    Ok(match st {
+        T::Boolean => match j {
+            J::Bool(b) => ScalarValue::Boolean(*b),
+            J::Number(n) => ScalarValue::Boolean(n.as_f64().map(|f| f != 0.0).unwrap_or(false)),
+            J::String(s) => ScalarValue::parse(st, s).map_err(PvaError::InvalidValue)?,
+            _ => {
+                return Err(PvaError::InvalidValue(format!(
+                    "cannot assign JSON {j} to a bool field"
+                )));
+            }
+        },
+        T::Byte => ScalarValue::Byte(as_int().ok_or_else(int_err)? as i8),
+        T::Short => ScalarValue::Short(as_int().ok_or_else(int_err)? as i16),
+        T::Int => ScalarValue::Int(as_int().ok_or_else(int_err)? as i32),
+        T::Long => ScalarValue::Long(as_int().ok_or_else(int_err)? as i64),
+        T::UByte => ScalarValue::UByte(as_int().ok_or_else(int_err)? as u8),
+        T::UShort => ScalarValue::UShort(as_int().ok_or_else(int_err)? as u16),
+        T::UInt => ScalarValue::UInt(as_int().ok_or_else(int_err)? as u32),
+        T::ULong => ScalarValue::ULong(as_int().ok_or_else(int_err)? as u64),
+        T::Float => ScalarValue::Float(as_float().ok_or_else(float_err)? as f32),
+        T::Double => ScalarValue::Double(as_float().ok_or_else(float_err)?),
+        T::String => match j {
+            J::String(s) => ScalarValue::String(s.clone().into()),
+            J::Number(n) => ScalarValue::String(n.to_string().into()),
+            J::Bool(b) => ScalarValue::String(b.to_string().into()),
+            _ => {
+                return Err(PvaError::InvalidValue(format!(
+                    "cannot assign JSON {j} to a string field"
+                )));
+            }
+        },
+    })
+}
+
+/// Infer an `any` (variant) value from a JSON scalar — narrowest type that
+/// holds it, mirroring pvData's variant-union assignment which wraps the
+/// JSON token's native scalar type (parseinto.cpp:99-104).
+fn json_to_variant(j: &serde_json::Value) -> PvaResult<(FieldDesc, PvField)> {
+    use serde_json::Value as J;
+    let (st, sv) = match j {
+        J::Bool(b) => (ScalarType::Boolean, ScalarValue::Boolean(*b)),
+        J::Number(n) if n.is_i64() => (ScalarType::Long, ScalarValue::Long(n.as_i64().unwrap())),
+        J::Number(n) if n.is_u64() => (ScalarType::ULong, ScalarValue::ULong(n.as_u64().unwrap())),
+        J::Number(n) => (
+            ScalarType::Double,
+            ScalarValue::Double(n.as_f64().unwrap_or(0.0)),
+        ),
+        J::String(s) => (ScalarType::String, ScalarValue::String(s.clone().into())),
+        _ => {
+            return Err(PvaError::InvalidValue(
+                "cannot infer an 'any' value from a JSON array, object, or null".to_string(),
+            ));
+        }
+    };
+    Ok((FieldDesc::Scalar(st), PvField::Scalar(sv)))
+}
+
+/// Lower a parsed JSON value into a [`PvField`] matching `desc`, marking
+/// each assigned leaf in `changed` at its depth-first bit offset
+/// (`base_bit` is `desc`'s own offset). This is the descriptor-driven
+/// counterpart of pvData `parseJSON(strm, dest, assigned)`
+/// (parseinto.cpp): a structure assigns only its named JSON keys and marks
+/// each assigned leaf (not the container — so unmentioned siblings keep
+/// their server value); a scalar / scalar-array / array element marks its
+/// own bit. An unknown JSON key is an error, like pvData's
+/// `getSubFieldT` (parseinto.cpp:212). Union targets are rejected (pvData's
+/// member auto-select is ambiguous from a bare CLI token).
+fn parse_json_into_field(
+    desc: &FieldDesc,
+    j: &serde_json::Value,
+    base_bit: usize,
+    changed: &mut BitSet,
+) -> PvaResult<PvField> {
+    match desc {
+        FieldDesc::Scalar(st) => {
+            let v = json_scalar_to_value(*st, j)?;
+            changed.set(base_bit);
+            Ok(PvField::Scalar(v))
+        }
+        FieldDesc::ScalarArray(st) => {
+            let arr = j.as_array().ok_or_else(|| {
+                PvaError::InvalidValue(format!(
+                    "expected a JSON array for a scalar-array field, got {j}"
+                ))
+            })?;
+            let mut items = Vec::with_capacity(arr.len());
+            for e in arr {
+                items.push(json_scalar_to_value(*st, e)?);
+            }
+            changed.set(base_bit);
+            Ok(PvField::ScalarArray(items))
+        }
+        FieldDesc::Structure { struct_id, fields } => {
+            let obj = j.as_object().ok_or_else(|| {
+                PvaError::InvalidValue(format!(
+                    "expected a JSON object for a structure field, got {j}"
+                ))
+            })?;
+            // pvData `getSubFieldT` throws on an unknown key (parseinto.cpp:212).
+            for k in obj.keys() {
+                if !fields.iter().any(|(n, _)| n == k) {
+                    return Err(PvaError::InvalidValue(format!(
+                        "JSON field '{k}' not present in target structure"
+                    )));
+                }
+            }
+            let mut s = PvStructure::new(struct_id);
+            let mut child_bit = base_bit + 1;
+            for (name, child) in fields {
+                let cv = match obj.get(name) {
+                    Some(jv) => parse_json_into_field(child, jv, child_bit, changed)?,
+                    None => crate::pvdata::encode::default_value_for(child),
+                };
+                s.fields.push((name.clone(), cv));
+                child_bit += child.total_bits();
+            }
+            // The container's own bit stays clear — only assigned leaves are
+            // marked, so unmentioned siblings keep their server-side value.
+            Ok(PvField::Structure(s))
+        }
+        FieldDesc::StructureArray { struct_id, fields } => {
+            let arr = j.as_array().ok_or_else(|| {
+                PvaError::InvalidValue(format!(
+                    "expected a JSON array for a structure-array field, got {j}"
+                ))
+            })?;
+            let elem_desc = FieldDesc::Structure {
+                struct_id: struct_id.clone(),
+                fields: fields.clone(),
+            };
+            let mut items = Vec::with_capacity(arr.len());
+            for e in arr {
+                // Element-internal bits are not part of the top BitSet — pvData
+                // pushes structureArray-element frames with a null `assigned`
+                // and marks only the array field's own offset
+                // (parseinto.cpp:191,267). A scratch set absorbs them.
+                let mut scratch = BitSet::new();
+                match parse_json_into_field(&elem_desc, e, 0, &mut scratch)? {
+                    PvField::Structure(st) => items.push(Some(st)),
+                    other => {
+                        return Err(PvaError::InvalidValue(format!(
+                            "internal: structure-array element built as {other:?}"
+                        )));
+                    }
+                }
+            }
+            changed.set(base_bit);
+            Ok(PvField::StructureArray(items))
+        }
+        FieldDesc::Variant => {
+            let (vdesc, vval) = json_to_variant(j)?;
+            changed.set(base_bit);
+            Ok(PvField::Variant(Box::new(VariantValue {
+                desc: Some(vdesc),
+                value: vval,
+            })))
+        }
+        FieldDesc::VariantArray => {
+            let arr = j.as_array().ok_or_else(|| {
+                PvaError::InvalidValue(format!("expected a JSON array for an any[] field, got {j}"))
+            })?;
+            let mut items = Vec::with_capacity(arr.len());
+            for e in arr {
+                let (vd, vv) = json_to_variant(e)?;
+                items.push(Some(VariantValue {
+                    desc: Some(vd),
+                    value: vv,
+                }));
+            }
+            changed.set(base_bit);
+            Ok(PvField::VariantArray(items))
+        }
+        FieldDesc::Union { .. } | FieldDesc::UnionArray { .. } => Err(PvaError::InvalidValue(
+            "JSON assignment to a union field is not supported".to_string(),
+        )),
+    }
+}
+
+/// Field=value mode lowering (pvput.cpp:209-244): a pair whose value starts
+/// with `[` or `{` is JSON (an array lowers into a scalar/struct array, an
+/// object into a (sub)structure — pvData `parseJSON`/`jarray`), marking the
+/// assigned leaves; every other pair is a scalar text assignment marking
+/// the field's own bit. Single owner of the CLI field-mode delta, kept
+/// distinct from the programmatic [`build_field_delta`] (pvxs
+/// `PutBuilder::set`) so the pvput-only JSON lowering does not leak into
+/// the typed-setter path.
+fn build_put_field_pairs(
+    intro: &FieldDesc,
+    pairs: &[(String, String)],
+) -> PvaResult<(PvField, BitSet)> {
+    let mut value = crate::pvdata::encode::default_value_for(intro);
+    let mut changed = BitSet::new();
+    for (fname, raw) in pairs {
+        let parts: Vec<&str> = fname.split('.').filter(|s| !s.is_empty()).collect();
+        let bit = intro.bit_for_path(fname).ok_or_else(|| {
+            PvaError::InvalidValue(format!("field path '{fname}' not present in introspection"))
+        })?;
+        let trimmed = raw.trim_start();
+        if trimmed.starts_with('[') || trimmed.starts_with('{') {
+            let field_desc = field_desc_at_path(intro, &parts).ok_or_else(|| {
+                PvaError::InvalidValue(format!("field path '{fname}' not present in introspection"))
+            })?;
+            let json: serde_json::Value = serde_json::from_str(raw.trim()).map_err(|e| {
+                PvaError::InvalidValue(format!("{fname} : invalid JSON value: {e}"))
+            })?;
+            // `parse_json_into_field` marks the assigned leaves (or the
+            // array/leaf bit) — do not also blanket-mark the field bit.
+            let fv = parse_json_into_field(field_desc, &json, bit, &mut changed)?;
+            assign_at_path(&mut value, &parts, fv);
+        } else {
+            let one = build_put_value_for_path(intro, &parts, raw)?;
+            let leaf_val = value_at_path(&one, &parts).ok_or_else(|| {
+                PvaError::InvalidValue(format!("could not build field '{fname}'"))
+            })?;
+            assign_at_path(&mut value, &parts, leaf_val);
+            changed.set(bit);
+        }
+    }
+    Ok((value, changed))
+}
+
 /// Classify the raw CLI PUT tokens against the server prototype and
 /// build the `(value, changed-bits)` delta — deferring every
 /// field-vs-bare decision until the prototype is known, exactly like
@@ -4628,9 +4901,11 @@ fn build_field_delta(
 /// - bare values and field pairs both present → "Can't mix" (pvput.cpp:139-140);
 /// - everything ignored → "No valid value(s)" (pvput.cpp:141-143).
 ///
-/// Bare values lower through [`build_put_value_from_tokens`] (legacy
-/// positional array length-drop + lone `[...]` shortcut); field pairs
-/// lower through [`build_field_delta`].
+/// A lone `[...]` is the `value=[...]` shorthand and a lone `{...}` is JSON
+/// top mode (the whole object parsed into the root structure with
+/// leaf-level marking); every other bare value lowers through
+/// [`build_put_value_from_tokens`] (legacy positional array length-drop)
+/// and field pairs lower through [`build_put_field_pairs`] (JSON-aware).
 fn build_put_from_args(intro: &FieldDesc, tokens: &[String]) -> PvaResult<(PvField, BitSet)> {
     // pvput.cpp:124-130: an unresolved `f=v` is a bare string value only
     // when the writable `.value` target is a `string` scalar.
@@ -4640,7 +4915,7 @@ fn build_put_from_args(intro: &FieldDesc, tokens: &[String]) -> PvaResult<(PvFie
     );
 
     let mut bare: Vec<String> = Vec::new();
-    let mut pairs: Vec<(String, PutLeaf)> = Vec::new();
+    let mut pairs: Vec<(String, String)> = Vec::new();
     for tok in tokens {
         match tok.split_once('=') {
             // No `=`: a plain bare value (pvput.cpp:112-114).
@@ -4648,7 +4923,7 @@ fn build_put_from_args(intro: &FieldDesc, tokens: &[String]) -> PvaResult<(PvFie
             // `f=v` with `f` present in the prototype: a field assignment
             // (pvput.cpp:116-121).
             Some((fname, val)) if !fname.is_empty() && intro.bit_for_path(fname).is_some() => {
-                pairs.push((fname.to_string(), PutLeaf::Str(val.to_string())));
+                pairs.push((fname.to_string(), val.to_string()));
             }
             // `f=v` with `f` absent (or an empty field name): either a
             // bare string value containing `=`, or warn-and-ignore.
@@ -4673,13 +4948,40 @@ fn build_put_from_args(intro: &FieldDesc, tokens: &[String]) -> PvaResult<(PvFie
         ));
     }
 
+    // pvput.cpp:144-148: a lone `[...]` is shorthand for `value=[...]`, so it
+    // lowers through the same JSON-array field path. Only when the prototype
+    // exposes a `.value` member — a bare-leaf prototype keeps the legacy
+    // positional handling in `build_put_value_from_tokens`, where pvput's
+    // root is always a structure.
+    if bare.len() == 1
+        && bare[0].trim_start().starts_with('[')
+        && intro.bit_for_path("value").is_some()
+    {
+        pairs.push(("value".to_string(), bare.remove(0)));
+    }
+
+    // pvput.cpp:150-153: a lone `{...}` is JSON top mode — parse the whole
+    // object into the root structure, marking each assigned leaf
+    // (`parseJSON(strm, root, &args.tosend)`). pvput's root is always a
+    // structure, so this only applies to a structure prototype.
+    if bare.len() == 1
+        && bare[0].trim_start().starts_with('{')
+        && matches!(intro, FieldDesc::Structure { .. })
+    {
+        let json: serde_json::Value = serde_json::from_str(bare[0].trim())
+            .map_err(|e| PvaError::InvalidValue(format!("invalid JSON value: {e}")))?;
+        let mut changed = BitSet::new();
+        let value = parse_json_into_field(intro, &json, 0, &mut changed)?;
+        return Ok((value, changed));
+    }
+
     if pairs.is_empty() {
         // Plain value mode → `.value` (pvput.cpp:155-207).
         let value = build_put_value_from_tokens(intro, &bare)?;
         Ok((value, value_only_bit_set(intro)))
     } else {
-        // Field=value mode (pvput.cpp:209-235).
-        build_field_delta(intro, &pairs)
+        // Field=value mode (pvput.cpp:209-244), JSON-aware.
+        build_put_field_pairs(intro, &pairs)
     }
 }
 
@@ -5314,6 +5616,187 @@ mod tests {
             assert!(changed.get(intro.bit_for_path("alarm.severity").unwrap()));
             assert!(changed.get(intro.bit_for_path("alarm.status").unwrap()));
             assert!(!changed.get(intro.bit_for_path("value").unwrap()));
+        }
+    }
+
+    /// JSON value parsing for the CLI PUT classifier (`build_put_from_args`):
+    /// a lone `{...}` is JSON top mode, a lone `[...]` is the `value=[...]`
+    /// shorthand, and a `field={...}`/`field=[...]` pair lowers JSON into
+    /// that field — each marking only the assigned leaves
+    /// (pvAccessCPP `pvput.cpp:144-244`, pvData `parseJSON`/`jarray`).
+    mod put_json_values {
+        use super::*;
+        use crate::pvdata::ScalarType;
+
+        /// `{ value: <T>, alarm: { severity: int, status: int } }`.
+        fn nt(value_type: ScalarType) -> FieldDesc {
+            FieldDesc::Structure {
+                struct_id: "epics:nt/NTScalar:1.0".to_string(),
+                fields: vec![
+                    ("value".to_string(), FieldDesc::Scalar(value_type)),
+                    (
+                        "alarm".to_string(),
+                        FieldDesc::Structure {
+                            struct_id: "alarm_t".to_string(),
+                            fields: vec![
+                                ("severity".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+                                ("status".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+                            ],
+                        },
+                    ),
+                ],
+            }
+        }
+        /// `{ value: <T>[], alarm: { severity: int, status: int } }`.
+        fn nt_array(elem: ScalarType) -> FieldDesc {
+            FieldDesc::Structure {
+                struct_id: "epics:nt/NTScalarArray:1.0".to_string(),
+                fields: vec![
+                    ("value".to_string(), FieldDesc::ScalarArray(elem)),
+                    (
+                        "alarm".to_string(),
+                        FieldDesc::Structure {
+                            struct_id: "alarm_t".to_string(),
+                            fields: vec![
+                                ("severity".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+                                ("status".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+                            ],
+                        },
+                    ),
+                ],
+            }
+        }
+        fn t(args: &[&str]) -> Vec<String> {
+            args.iter().map(|s| s.to_string()).collect()
+        }
+        fn scalar_at<'a>(v: &'a PvField, path: &[&str]) -> &'a ScalarValue {
+            let mut cur = v;
+            for seg in path {
+                match cur {
+                    PvField::Structure(s) => {
+                        cur = &s.fields.iter().find(|(n, _)| n == seg).unwrap().1;
+                    }
+                    other => panic!("expected structure at {seg}, got {other:?}"),
+                }
+            }
+            match cur {
+                PvField::Scalar(sv) => sv,
+                other => panic!("expected scalar at {path:?}, got {other:?}"),
+            }
+        }
+        fn array_at<'a>(v: &'a PvField, name: &str) -> &'a [ScalarValue] {
+            match v {
+                PvField::Structure(s) => {
+                    match &s.fields.iter().find(|(n, _)| n == name).unwrap().1 {
+                        PvField::ScalarArray(items) => items,
+                        other => panic!("expected ScalarArray at {name}, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Structure, got {other:?}"),
+            }
+        }
+
+        /// JSON top mode (`pvput.cpp:150-153`): a lone `{...}` parses into the
+        /// root, assigning each named leaf and marking ONLY those leaves — an
+        /// unmentioned sibling (`alarm.status`) stays unmarked so the server
+        /// keeps its current value.
+        #[test]
+        fn json_top_mode_marks_only_named_leaves() {
+            let intro = nt(ScalarType::Double);
+            let (value, changed) =
+                build_put_from_args(&intro, &t(&[r#"{"value":42,"alarm":{"severity":2}}"#]))
+                    .unwrap();
+            assert_eq!(scalar_at(&value, &["value"]), &ScalarValue::Double(42.0));
+            assert_eq!(
+                scalar_at(&value, &["alarm", "severity"]),
+                &ScalarValue::Int(2)
+            );
+            assert!(changed.get(intro.bit_for_path("value").unwrap()));
+            assert!(changed.get(intro.bit_for_path("alarm.severity").unwrap()));
+            // The unmentioned sibling is NOT marked.
+            assert!(!changed.get(intro.bit_for_path("alarm.status").unwrap()));
+            // The container bit is not blanket-marked either.
+            assert!(!changed.get(intro.bit_for_path("alarm").unwrap()));
+        }
+
+        /// Field-mode JSON object (`pvput.cpp:231-233`): `alarm={...}` lowers
+        /// the object into the `alarm` sub-structure, marking each assigned
+        /// leaf — `value` and `alarm.status` stay unmarked.
+        #[test]
+        fn json_field_object_marks_assigned_leaves() {
+            let intro = nt(ScalarType::Double);
+            let (value, changed) =
+                build_put_from_args(&intro, &t(&[r#"alarm={"severity":3}"#])).unwrap();
+            assert_eq!(
+                scalar_at(&value, &["alarm", "severity"]),
+                &ScalarValue::Int(3)
+            );
+            assert!(changed.get(intro.bit_for_path("alarm.severity").unwrap()));
+            assert!(!changed.get(intro.bit_for_path("alarm.status").unwrap()));
+            assert!(!changed.get(intro.bit_for_path("value").unwrap()));
+        }
+
+        /// Field-mode JSON array (`pvput.cpp:219-229`, jarray → scalarArray):
+        /// `value=[...]` writes the typed array and marks the value bit.
+        #[test]
+        fn json_field_array_writes_scalar_array() {
+            let intro = nt_array(ScalarType::Double);
+            let (value, changed) =
+                build_put_from_args(&intro, &t(&["value=[1.0,2.0,3.0]"])).unwrap();
+            let got: Vec<f64> = array_at(&value, "value")
+                .iter()
+                .map(|sv| match sv {
+                    ScalarValue::Double(d) => *d,
+                    other => panic!("expected Double, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(got, vec![1.0, 2.0, 3.0]);
+            assert!(changed.get(intro.bit_for_path("value").unwrap()));
+        }
+
+        /// A lone `[...]` is the `value=[...]` shorthand (`pvput.cpp:144-148`)
+        /// — routed through the JSON-array field path, not the legacy
+        /// length-then-element list.
+        #[test]
+        fn lone_bracket_is_value_shorthand() {
+            let intro = nt_array(ScalarType::Int);
+            let (value, changed) = build_put_from_args(&intro, &t(&["[10,20,30]"])).unwrap();
+            let got: Vec<i32> = array_at(&value, "value")
+                .iter()
+                .map(|sv| match sv {
+                    ScalarValue::Int(i) => *i,
+                    other => panic!("expected Int, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(got, vec![10, 20, 30]);
+            assert!(changed.get(intro.bit_for_path("value").unwrap()));
+        }
+
+        /// An unknown JSON key is a hard error, like pvData `getSubFieldT`
+        /// (`parseinto.cpp:212`) — silently dropping it would lose a value
+        /// the user asked to write.
+        #[test]
+        fn json_unknown_key_is_error() {
+            let intro = nt(ScalarType::Double);
+            let err = build_put_from_args(&intro, &t(&[r#"{"nope":1}"#])).unwrap_err();
+            assert!(
+                matches!(err, PvaError::InvalidValue(ref m) if m.contains("not present")),
+                "got: {err:?}"
+            );
+        }
+
+        /// JSON string coercion into a numeric leaf matches pvData
+        /// `putFrom` (`parseinto.cpp:60-66`): `"7"` lands in an int field.
+        #[test]
+        fn json_string_coerces_into_numeric_field() {
+            let intro = nt(ScalarType::Double);
+            let (value, changed) =
+                build_put_from_args(&intro, &t(&[r#"alarm={"severity":"7"}"#])).unwrap();
+            assert_eq!(
+                scalar_at(&value, &["alarm", "severity"]),
+                &ScalarValue::Int(7)
+            );
+            assert!(changed.get(intro.bit_for_path("alarm.severity").unwrap()));
         }
     }
 

@@ -1297,6 +1297,25 @@ pub struct MonitorUpdate {
     /// gateway's fanout sets this; sources that own their descriptor
     /// leave it `false`.
     pub type_changed: bool,
+    /// Dot-separated field paths whose intermediate transitions were
+    /// LOST before this event — the decoded-path counterpart of the
+    /// trailing **overrun bitset** in a raw `changed | value | overrun`
+    /// body. Empty (the default) means no loss: the cooked payload
+    /// builders then encode an empty overrun bitset exactly as before.
+    ///
+    /// The server's own queue overflow is one producer: when the
+    /// monitor queue coalesces (squashes) a dropped intermediate into
+    /// the surviving value, every leaf that
+    /// changed in BOTH the dropped and the surviving update is recorded
+    /// here, and the two updates' overrun sets union — pva2pva
+    /// `moncache.cpp:160-168`
+    /// (`overrun |= upstream_overrun | (changed & lastelem.changed)`).
+    /// A fanout gateway is the other producer: it sets this when its
+    /// downstream broadcast receiver lags so the next cooked DATA frame
+    /// carries the lost leaves, matching the raw forwarder's
+    /// bridge-local overrun marking. Sources with no loss to report
+    /// leave it empty.
+    pub overrun: Vec<String>,
 }
 
 impl MonitorUpdate {
@@ -1308,18 +1327,21 @@ impl MonitorUpdate {
             value: PvField::Null,
             marked: None,
             type_changed: true,
+            overrun: Vec::new(),
         }
     }
 }
 
 impl From<PvField> for MonitorUpdate {
     /// A plain value with no explicit marked set — the server derives
-    /// the changed-bitset (full mask or value-diff) as before.
+    /// the changed-bitset (full mask or value-diff) as before. No
+    /// overrun: a freshly produced value reports no lost intermediate.
     fn from(value: PvField) -> Self {
         Self {
             value,
             marked: None,
             type_changed: false,
+            overrun: Vec::new(),
         }
     }
 }

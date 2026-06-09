@@ -52,14 +52,13 @@ async fn pvalink_link_is_in_iocinit_external_link_wait_via_run_seam() {
     }
 
     // A Passive `calc` holder whose INPA is a CP pvalink in the canonical
-    // pvxs JSON longhand. `calc` is used (not `ai`) because its INPA–INPU
-    // are generic String link fields that `record_link_fields` surfaces;
-    // an `ai` record's INP is consumed by device support and never appears
-    // as a generic String field, so the install scan would not see it.
-    // `proc: 'CP'` keeps it a `PvaJson` link, which the install scan always
-    // pre-opens (no bare-PV early-out) — so its monitor identity is in the
-    // registry before the iocInit wait runs. PINI=NO / SCAN=Passive so the
-    // record never self-processes.
+    // pvxs JSON longhand. The install scan walks `record_link_fields`,
+    // which surfaces every link-bearing field — the record-specific
+    // INPA–INPU used here as well as a device-support `ai`'s/`ao`'s
+    // `common.inp`/`common.out`. `proc: 'CP'` keeps it a `PvaJson` link,
+    // which the install scan always pre-opens (no bare-PV early-out) — so
+    // its monitor identity is in the registry before the iocInit wait
+    // runs. PINI=NO / SCAN=Passive so the record never self-processes.
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("seam.db");
     std::fs::write(

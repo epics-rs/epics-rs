@@ -8,6 +8,19 @@ use crate::types::EpicsValue;
 use super::processing::join_put_notify;
 use super::{LinkPutOp, PvDatabase, SelmKind, SelmResult, select_link_indices_ex};
 
+/// Record-specific input link fields that may carry a CP/CPP modifier:
+/// DOL (ao/bo/longout/mbbo), DOL0-DOLF (seq — 16 groups), DOL1-DOLA
+/// (sseq — legacy 10 groups), NVL (sel), SELL (sseq), SGNL (histogram).
+///
+/// Shared by [`PvDatabase::record_link_fields`] (the single owner of
+/// "which fields on a record are links") and consumed transitively by
+/// both [`PvDatabase::setup_cp_links`] (CA CP/CPP) and the pvalink
+/// install scan (PVA CP/CPP), so the two enumerations cannot diverge.
+pub(crate) const CP_INPUT_LINK_FIELDS: &[&str] = &[
+    "DOL", "DOL0", "DOL1", "DOL2", "DOL3", "DOL4", "DOL5", "DOL6", "DOL7", "DOL8", "DOL9", "DOLA",
+    "DOLB", "DOLC", "DOLD", "DOLE", "DOLF", "NVL", "SELL", "SGNL",
+];
+
 /// Alarm state from a link source, used for MS/NMS propagation.
 ///
 /// `amsg` is the alarm-message string — propagated from the source
@@ -1593,60 +1606,17 @@ impl PvDatabase {
         let mut ext_links: Vec<(String, String, bool)> = Vec::new();
 
         for target_name in &names {
-            if let Some(rec_arc) = self.get_record(target_name).await {
-                let instance = rec_arc.read().await;
-                // Common INP link.
-                Self::classify_cp_link(
-                    &instance.common.inp,
-                    target_name,
-                    &mut db_links,
-                    &mut ext_links,
-                );
-                // Multi-input links (INPA..INPL for calc/calcout/sel/sub).
-                for (lf, _vf) in instance.record.multi_input_links() {
-                    if let Some(EpicsValue::String(link_str)) = instance.record.get_field(lf) {
-                        Self::classify_cp_link(
-                            &link_str.as_str_lossy(),
-                            target_name,
-                            &mut db_links,
-                            &mut ext_links,
-                        );
-                    }
-                }
-                // Additional input link fields that may use CP:
-                // DOL (ao/bo/longout/mbbo), DOL0-DOLF (seq — 16
-                // groups), DOL1-DOLA (sseq — legacy 10 groups),
-                // NVL (sel), SELL (sseq), SDIS (common), SGNL (histogram)
-                const CP_INPUT_LINK_FIELDS: &[&str] = &[
-                    "DOL", "DOL0", "DOL1", "DOL2", "DOL3", "DOL4", "DOL5", "DOL6", "DOL7", "DOL8",
-                    "DOL9", "DOLA", "DOLB", "DOLC", "DOLD", "DOLE", "DOLF", "NVL", "SELL", "SGNL",
-                ];
-                for field_name in CP_INPUT_LINK_FIELDS {
-                    if let Some(EpicsValue::String(link_str)) =
-                        instance.record.get_field(field_name)
-                    {
-                        Self::classify_cp_link(
-                            &link_str.as_str_lossy(),
-                            target_name,
-                            &mut db_links,
-                            &mut ext_links,
-                        );
-                    }
-                }
-                // TSEL in common fields.
-                Self::classify_cp_link(
-                    &instance.common.tsel,
-                    target_name,
-                    &mut db_links,
-                    &mut ext_links,
-                );
-                // SDIS in common fields.
-                Self::classify_cp_link(
-                    &instance.common.sdis,
-                    target_name,
-                    &mut db_links,
-                    &mut ext_links,
-                );
+            // Enumerate this record's link-bearing fields through the
+            // single shared owner (`record_link_fields`) so the CA CP/CPP
+            // setup here and the pvalink install scan can never diverge on
+            // which fields count as links — the structural cause of a
+            // device-support `INP`/`OUT` pvalink CP/CPP holder never being
+            // opened. `classify_cp_link` keeps only the CP/CPP-policy links
+            // and routes local `Db` vs external `Ca`; non-CP links (and
+            // `OUT`, which carries no CP/CPP) fall through its
+            // `cp_passive_only() == None` gate.
+            for (_field, raw, _parsed) in self.record_link_fields(target_name).await {
+                Self::classify_cp_link(&raw, target_name, &mut db_links, &mut ext_links);
             }
         }
 

@@ -643,20 +643,43 @@ impl PvDatabase {
         };
         let inst = rec.read().await;
         let mut out = Vec::new();
-        for fd in inst.record.field_list() {
-            if !matches!(fd.dbf_type, crate::types::DbFieldType::String) {
-                continue;
-            }
-            let raw = match inst.record.get_field(fd.name) {
-                Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
-                _ => continue,
-            };
+        let push = |field: &str, raw: &str, out: &mut Vec<_>| {
             if raw.is_empty() {
-                continue;
+                return;
             }
-            let parsed = crate::server::record::parse_link_v2(&raw);
+            let parsed = crate::server::record::parse_link_v2(raw);
             if !matches!(parsed, crate::server::record::ParsedLink::None) {
-                out.push((fd.name.to_string(), raw, parsed));
+                out.push((field.to_string(), raw.to_string(), parsed));
+            }
+        };
+        // Canonical link-bearing fields stored on `CommonFields` as raw
+        // String. These do NOT appear as `DbFieldType::String` entries in
+        // `field_list()`: an `ai`'s `INP` / an `ao`'s `OUT` carry
+        // `DBF_INLINK` / `DBF_OUTLINK` descriptors (and `INP`/`OUT` are
+        // not in the record's static field table at all), so the previous
+        // `field_list()` scan filtered by `String` silently dropped every
+        // device-support link — the holder's pvalink monitor was never
+        // opened. Enumerate the canonical storage directly so this method
+        // is the single owner of "which fields on a record are links",
+        // shared by `setup_cp_links` (CA CP/CPP) and the pvalink install
+        // scan (PVA CP/CPP).
+        push("INP", &inst.common.inp, &mut out);
+        push("OUT", &inst.common.out, &mut out);
+        push("TSEL", &inst.common.tsel, &mut out);
+        push("SDIS", &inst.common.sdis, &mut out);
+        // Record-specific multi-input links (INPA..INPL for
+        // calc/calcout/sel/sub) and the CP-capable input link fields
+        // (DOL family, NVL, SELL, SGNL).
+        let mut field_names: Vec<&str> = inst
+            .record
+            .multi_input_links()
+            .iter()
+            .map(|(lf, _vf)| *lf)
+            .collect();
+        field_names.extend_from_slice(crate::server::database::links::CP_INPUT_LINK_FIELDS);
+        for field in field_names {
+            if let Some(EpicsValue::String(s)) = inst.record.get_field(field) {
+                push(field, &s.as_str_lossy(), &mut out);
             }
         }
         out
@@ -1841,5 +1864,43 @@ mod tests {
         // even for the denied peer.
         assert!(db.has_name_from("REC", Some(denied)).await);
         assert!(db.find_entry_from("REC", Some(denied)).await.is_some());
+    }
+
+    /// `record_link_fields` must surface a record's device-support `INP`
+    /// link. An `ai`'s `INP` is a `DBF_INLINK` field stored in
+    /// `common.inp` — it is not a `DbFieldType::String` entry in
+    /// `field_list()` — so the earlier `field_list()` scan filtered by
+    /// `String` silently dropped it. The pvalink install scan walks this
+    /// method, so a Passive `ai` carrying a CP/CPP pvalink `INP` never had
+    /// its monitor opened at iocInit. Enumerating the canonical
+    /// `common.inp` storage fixes it; C `dbpvar`/`dbcar` likewise dump
+    /// every link field including device-support INP/OUT.
+    #[tokio::test]
+    async fn record_link_fields_surfaces_device_support_inp() {
+        use crate::server::record::ParsedLink;
+        use crate::server::records::ai::AiRecord;
+
+        let db = PvDatabase::new();
+        db.add_record("AI", Box::new(AiRecord::new(0.0)))
+            .await
+            .unwrap();
+        // Device-support INP lives in `common.inp` (DBF_INLINK), the
+        // exact storage a `field_list()` String scan cannot reach.
+        {
+            let rec = db.get_record("AI").await.unwrap();
+            rec.write().await.common.inp = "pva://mini:current?proc=CP".to_string();
+        }
+
+        let links = db.record_link_fields("AI").await;
+        let inp = links
+            .iter()
+            .find(|(f, _, _)| f == "INP")
+            .unwrap_or_else(|| panic!("INP link must be surfaced, got {links:?}"));
+        assert_eq!(inp.1, "pva://mini:current?proc=CP");
+        assert!(
+            matches!(inp.2, ParsedLink::Pva(_)),
+            "a pva:// INP must parse to ParsedLink::Pva, got {:?}",
+            inp.2
+        );
     }
 }

@@ -1619,8 +1619,21 @@ pub enum MonitorEvent {
     /// the server endpoint so callers can report `Connected to <peer>`
     /// like pvxs (`tools/monitor.cpp:152`).
     Connected { peer: std::net::SocketAddr },
-    /// Server pushed a value update.
-    Data { intro: FieldDesc, value: PvField },
+    /// Server pushed a value update. `value` is the full prior-merged
+    /// snapshot; `marked` carries the leaf paths the server flagged
+    /// changed in *this* update — the decoded changed `BitSet` resolved
+    /// to dotted leaf paths (the shape `format::format_value`'s `marked`
+    /// argument expects). It is `None` on the first update of a connect
+    /// cycle (a complete snapshot, no prior to delta against) so a delta
+    /// renderer shows every leaf, then `Some(set)` on later updates so it
+    /// prints only the changed leaves. pvxs renders a monitor delta from
+    /// the update's own marked set (`Value::imarked()`, datafmt.cpp:112-120;
+    /// the first monitor post is a full value).
+    Data {
+        intro: FieldDesc,
+        value: PvField,
+        marked: Option<std::collections::HashSet<String>>,
+    },
     /// Channel left Active (TCP closed, op error, channel closed).
     Disconnected,
     /// Server signalled end-of-stream via subcmd=0x10 (no further
@@ -2564,6 +2577,13 @@ async fn op_monitor_inner<F>(
 where
     F: FnMut(&FieldDesc, &PvField) + Send,
 {
+    // Adapt the public `FnMut(&FieldDesc, &PvField)` callback to the inner
+    // loop's marked-set-carrying signature; these whole-PV / raw monitor
+    // APIs deliver the merged value and do not surface the changed set.
+    let mut adapter =
+        |intro: &FieldDesc,
+         value: &PvField,
+         _marked: Option<&std::collections::HashSet<String>>| { callback(intro, value) };
     loop {
         let (server, sid) = match channel.ensure_active().await {
             Ok(p) => p,
@@ -2585,7 +2605,7 @@ where
             &fields_owned,
             raw_pv_req.as_deref(),
             flow,
-            &mut callback,
+            &mut adapter,
             None,
         )
         .await
@@ -2656,13 +2676,22 @@ where
                     continue;
                 }
             };
+            // Adapt the public `FnMut(&FieldDesc, &PvField)` callback to the
+            // inner loop's marked-set-carrying signature; the handle API
+            // delivers the merged value and does not surface the changed set.
+            let mut adapter =
+                |intro: &FieldDesc,
+                 value: &PvField,
+                 _marked: Option<&std::collections::HashSet<String>>| {
+                    callback(intro, value)
+                };
             match run_monitor_loop(
                 server.clone(),
                 sid,
                 &fields_owned,
                 None,
                 flow,
-                &mut callback,
+                &mut adapter,
                 Some(state_for_task.clone()),
             )
             .await
@@ -2731,12 +2760,16 @@ where
         if !mask.mask_connected {
             callback(MonitorEvent::Connected { peer: server.addr });
         }
-        let mut data_callback = |intro: &FieldDesc, value: &PvField| {
-            callback(MonitorEvent::Data {
-                intro: intro.clone(),
-                value: value.clone(),
-            });
-        };
+        let mut data_callback =
+            |intro: &FieldDesc,
+             value: &PvField,
+             marked: Option<&std::collections::HashSet<String>>| {
+                callback(MonitorEvent::Data {
+                    intro: intro.clone(),
+                    value: value.clone(),
+                    marked: marked.cloned(),
+                });
+            };
         let result = run_monitor_loop(
             server.clone(),
             sid,
@@ -2788,6 +2821,58 @@ enum MonitorEnd {
     Fatal(PvaError),
 }
 
+/// Resolve a decoded monitor changed `BitSet` to the set of dotted leaf
+/// paths it marks — the shape `format::format_value`'s `marked` argument
+/// expects (a `Structure` is a container; every other field is a leaf, so
+/// a leaf path is `value` / `alarm.severity` / `timeStamp.userTag`).
+///
+/// `bit_offset` uses the same depth-first numbering as
+/// `decode_pv_field_with_bitset` / `fill_unmarked_from_prior` (pvData spec
+/// §5.4): a structure occupies its own bit and its children follow. A
+/// structure whose own bit is set means the whole subtree was sent fresh
+/// (pvData BitSet compression), so every descendant leaf is marked — the
+/// same propagation `prune_to_marked` applies. pvxs builds a monitor delta
+/// from exactly these marked leaves (`Value::imarked()`, datafmt.cpp:112-120).
+fn changed_bitset_to_marked_paths(
+    desc: &FieldDesc,
+    bitset: &BitSet,
+) -> std::collections::HashSet<String> {
+    fn walk(
+        desc: &FieldDesc,
+        bit_offset: usize,
+        prefix: &str,
+        ancestor_marked: bool,
+        bitset: &BitSet,
+        out: &mut std::collections::HashSet<String>,
+    ) {
+        match desc {
+            FieldDesc::Structure { fields, .. } => {
+                let here_marked = ancestor_marked || bitset.get(bit_offset);
+                let mut child_bit = bit_offset + 1;
+                for (name, child) in fields {
+                    let cpath = if prefix.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{prefix}.{name}")
+                    };
+                    walk(child, child_bit, &cpath, here_marked, bitset, out);
+                    child_bit += child.total_bits();
+                }
+            }
+            // Leaf (scalar/array/union/any/struct-array): marked iff its own
+            // bit or any enclosing structure bit is set.
+            _ => {
+                if (ancestor_marked || bitset.get(bit_offset)) && !prefix.is_empty() {
+                    out.insert(prefix.to_string());
+                }
+            }
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    walk(desc, 0, "", false, bitset, &mut out);
+    out
+}
+
 async fn run_monitor_loop<F>(
     server: Arc<super::server_conn::ServerConn>,
     sid: u32,
@@ -2798,7 +2883,7 @@ async fn run_monitor_loop<F>(
     state: Option<Arc<SubscriptionState>>,
 ) -> Result<(), MonitorEnd>
 where
-    F: FnMut(&FieldDesc, &PvField) + Send,
+    F: FnMut(&FieldDesc, &PvField, Option<&std::collections::HashSet<String>>) + Send,
 {
     let order = server.byte_order();
     let big_endian = matches!(order, ByteOrder::Big);
@@ -2964,6 +3049,21 @@ where
                 // coalesced updates because we fell behind. Capture it
                 // before `d.value` is moved below.
                 let srv_squash = !d.overrun.is_empty();
+                // pvxs renders a monitor delta from the update's own changed
+                // set (`Value::imarked()`, datafmt.cpp:112-120). The first
+                // post of a connect cycle is a complete snapshot with no
+                // prior to delta against, so surface marked=None (every leaf
+                // shown); later posts carry only the server-marked changed
+                // leaves. A non-structure top has no addressable leaves —
+                // the value itself is the datum, always shown — so leave it
+                // None too (the delta formatter hides a struct-less top when
+                // a marked subset is supplied). Resolve before `d.value`
+                // moves; `d.changed` is still borrowable afterwards.
+                let marked = if prior.is_some() && matches!(intro, FieldDesc::Structure { .. }) {
+                    Some(changed_bitset_to_marked_paths(&intro, &d.changed))
+                } else {
+                    None
+                };
                 let value = if let Some(prev) = prior.as_ref() {
                     crate::pvdata::encode::fill_unmarked_from_prior(
                         &intro, &d.changed, 0, d.value, prev,
@@ -2972,7 +3072,7 @@ where
                     d.value
                 };
                 prior = Some(value.clone());
-                callback(&intro, &value);
+                callback(&intro, &value, marked.as_ref());
                 events_since_ack += 1;
                 if let Some(s) = &state {
                     let mut st = s.stats.lock();
@@ -4849,6 +4949,155 @@ mod tests {
         let value_only = build_pv_request_value_only(false);
         let value_only_frame = build_process_init(sid, ioid, &value_only, order);
         assert_ne!(frame, value_only_frame);
+    }
+
+    /// Monitor `-F delta` must mark only the leaves the server flagged
+    /// changed in *this* update. `changed_bitset_to_marked_paths` resolves
+    /// the decoded changed `BitSet` to the dotted leaf paths
+    /// `format::format_value`'s `marked` argument consumes, with pvData
+    /// BitSet-compression propagation (a set structure bit marks its whole
+    /// subtree) — pvxs `Value::imarked()` (datafmt.cpp:112-120).
+    mod monitor_delta_marks {
+        use super::*;
+
+        // NTScalar-shaped prototype: value + alarm{severity,status,message}
+        // + timeStamp{secondsPastEpoch,nanoseconds,userTag}. Depth-first
+        // bits: 0 root, 1 value, 2 alarm, 3 severity, 4 status, 5 message,
+        // 6 timeStamp, 7 secondsPastEpoch, 8 nanoseconds, 9 userTag.
+        fn nt_scalar() -> FieldDesc {
+            let sub = |fields: Vec<(&str, FieldDesc)>, id: &str| FieldDesc::Structure {
+                struct_id: id.to_string(),
+                fields: fields
+                    .into_iter()
+                    .map(|(n, d)| (n.to_string(), d))
+                    .collect(),
+            };
+            sub(
+                vec![
+                    ("value", FieldDesc::Scalar(ScalarType::Double)),
+                    (
+                        "alarm",
+                        sub(
+                            vec![
+                                ("severity", FieldDesc::Scalar(ScalarType::Int)),
+                                ("status", FieldDesc::Scalar(ScalarType::Int)),
+                                ("message", FieldDesc::Scalar(ScalarType::String)),
+                            ],
+                            "alarm_t",
+                        ),
+                    ),
+                    (
+                        "timeStamp",
+                        sub(
+                            vec![
+                                ("secondsPastEpoch", FieldDesc::Scalar(ScalarType::Long)),
+                                ("nanoseconds", FieldDesc::Scalar(ScalarType::Int)),
+                                ("userTag", FieldDesc::Scalar(ScalarType::Int)),
+                            ],
+                            "time_t",
+                        ),
+                    ),
+                ],
+                "epics:nt/NTScalar:1.0",
+            )
+        }
+
+        fn marks(bits: &[usize]) -> std::collections::HashSet<String> {
+            let mut bs = BitSet::new();
+            for &b in bits {
+                bs.set(b);
+            }
+            changed_bitset_to_marked_paths(&nt_scalar(), &bs)
+        }
+
+        fn set_of(paths: &[&str]) -> std::collections::HashSet<String> {
+            paths.iter().map(|s| s.to_string()).collect()
+        }
+
+        /// A value-only update (bit 1) marks exactly `value` — not the
+        /// untouched alarm/timeStamp leaves. This is the reprint bug the
+        /// fix closes.
+        #[test]
+        fn value_only_marks_only_value() {
+            assert_eq!(marks(&[1]), set_of(&["value"]));
+        }
+
+        /// A single nested leaf (bit 3 = alarm.severity) marks only that
+        /// leaf.
+        #[test]
+        fn single_nested_leaf() {
+            assert_eq!(marks(&[3]), set_of(&["alarm.severity"]));
+        }
+
+        /// A set structure bit (bit 2 = the `alarm` sub-struct) marks every
+        /// descendant leaf (BitSet compression), not the struct itself.
+        #[test]
+        fn struct_bit_marks_whole_subtree() {
+            assert_eq!(
+                marks(&[2]),
+                set_of(&["alarm.severity", "alarm.status", "alarm.message"])
+            );
+        }
+
+        /// The root bit (bit 0) marks every leaf — the first-snapshot /
+        /// full-value case (here surfaced explicitly; the live loop sends
+        /// `marked=None` on the first update instead).
+        #[test]
+        fn root_bit_marks_all_leaves() {
+            assert_eq!(
+                marks(&[0]),
+                set_of(&[
+                    "value",
+                    "alarm.severity",
+                    "alarm.status",
+                    "alarm.message",
+                    "timeStamp.secondsPastEpoch",
+                    "timeStamp.nanoseconds",
+                    "timeStamp.userTag",
+                ])
+            );
+        }
+
+        /// A multi-leaf update (value + timeStamp.userTag) marks exactly
+        /// those two and nothing else.
+        #[test]
+        fn disjoint_leaves() {
+            assert_eq!(marks(&[1, 9]), set_of(&["value", "timeStamp.userTag"]));
+        }
+
+        /// An empty changed set marks nothing.
+        #[test]
+        fn empty_marks_nothing() {
+            assert!(marks(&[]).is_empty());
+        }
+
+        /// The resolved paths match `format::format_value`'s `marked`
+        /// contract: feeding the set into the Delta formatter prints only
+        /// the marked leaves and omits the unmarked ones.
+        #[test]
+        fn marked_paths_drive_delta_formatter() {
+            let desc = nt_scalar();
+            // Full value so every leaf is present to (potentially) print.
+            let value = crate::pvdata::encode::default_value_for(&desc);
+            let mut bs = BitSet::new();
+            bs.set(1); // value only
+            let marked = changed_bitset_to_marked_paths(&desc, &bs);
+            let fmt = crate::format::ValueFmt {
+                format: crate::format::ValueFormat::Delta,
+                array_limit: 0,
+                show_value: true,
+            };
+            let out = crate::format::format_value(&desc, Some(&value), &fmt, Some(&marked), 0);
+            assert!(out.contains("value"), "value leaf must print: {out:?}");
+            assert!(
+                !out.contains("severity"),
+                "unmarked alarm.severity must not print: {out:?}"
+            );
+            assert!(
+                !out.contains("secondsPastEpoch"),
+                "unmarked timeStamp leaf must not print: {out:?}"
+            );
+        }
     }
 
     /// Legacy pvAccessCPP positional bare-token PUT classification

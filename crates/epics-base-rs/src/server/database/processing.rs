@@ -130,6 +130,18 @@ impl AsyncDbHandle {
         }
     }
 
+    /// Resolve a link's target field type for the sseq link-status
+    /// diagnostics — see [`PvDatabase::link_target_field_type`]. `None` if
+    /// the link is constant / external / unresolvable, or the database is
+    /// gone. (Distinct from the free `server::record::link_field_type`,
+    /// which returns the link *class* `LinkType`, not the target's type.)
+    pub async fn link_target_field_type(&self, link: &str) -> Option<crate::types::DbFieldType> {
+        match self.db() {
+            Some(db) => db.link_target_field_type(link).await,
+            None => None,
+        }
+    }
+
     /// Mint an async re-entry token — see [`PvDatabase::mint_async_token`].
     /// `None` if the record is absent or the database has been dropped.
     pub async fn mint_async_token(&self, name: &str) -> Option<AsyncToken> {
@@ -493,6 +505,38 @@ impl PvDatabase {
             posted.push(field);
         }
         Ok(posted)
+    }
+
+    /// Resolve a link's target field [`DbFieldType`] for a LOCAL `DB_LINK`,
+    /// or `None` for a constant / external / unresolvable link.
+    ///
+    /// Parity of C `dbGetLinkDBFtype` as `sseqRecord.c:checkLinks`
+    /// (sseqRecord.c:884-941) uses it to fill the `DTn`/`LTn` diagnostics:
+    /// a `DB_LINK` whose target record is on this IOC reports its addressed
+    /// field's type (C `dbNameToAddr` → `pAddr->field_type`). A constant or
+    /// `CA`/`PVA` (external) link returns `None` — epics-base-rs has no
+    /// client-side introspection of a remote field's type, so the caller
+    /// renders those as the `DBF_unknown` sentinel.
+    pub(crate) async fn link_target_field_type(
+        &self,
+        link: &str,
+    ) -> Option<crate::types::DbFieldType> {
+        let db = match crate::server::record::parse_link_v2(link) {
+            crate::server::record::ParsedLink::Db(db) => db,
+            _ => return None,
+        };
+        let rec = self.get_record(&db.record).await?;
+        let inst = rec.read().await;
+        let field = if db.field.is_empty() {
+            "VAL"
+        } else {
+            db.field.as_str()
+        };
+        inst.record
+            .field_list()
+            .iter()
+            .find(|f| f.name.eq_ignore_ascii_case(field))
+            .map(|f| f.dbf_type)
     }
 
     /// Create a put-notify wait-set for a downstream operation a record is

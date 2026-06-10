@@ -1,7 +1,7 @@
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
 use crate::server::record::{
-    FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+    FieldDesc, LinkType, ProcessAction, ProcessOutcome, Record, RecordProcessResult, parse_link_v2,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
@@ -30,6 +30,25 @@ const SELM_ALL: i16 = 0;
 const SELM_SPECIFIED: i16 = 1;
 const SELM_MASK: i16 = 2;
 
+/// `menu(sseqLNKV)` indices (sseqRecord.dbd:20): the per-step DOL/LNK
+/// connection status served by `DOLnV`/`LNKnV`. Index 1 (`EXT`, external
+/// PV connected) is a valid menu value but is never *produced* by this
+/// port: epics-base-rs has no CA/PVA client to confirm a remote link is
+/// connected, so an external link always reports `EXT_NC` (see
+/// `refresh_link_status`). The choice label is still served via
+/// `SSEQ_LNKV_CHOICES`.
+const LNKV_EXT_NC: i16 = 0; // external PV, not connected
+const LNKV_LOC: i16 = 2; // local PV (this IOC's database)
+const LNKV_CON: i16 = 3; // constant / unset link
+
+/// `DTn`/`LTn` sentinel for "no resolvable target field type", C
+/// `DBF_unknown` (-1). Used for every constant, external, and
+/// unresolvable link. C `init_record` further distinguishes a constant
+/// DOL (`DBF_NOACCESS`) from a constant LNK (`DBF_unknown`)
+/// (sseqRecord.c:206,225); that split is collapsed to a single unknown
+/// here because the Rust `DbFieldType` model has no `NOACCESS` variant.
+const DBF_UNKNOWN: i16 = -1;
+
 /// Per-step field-name tables (1-based suffix `1`..`9`, `A`), used to
 /// address `DOLn`/`DOn`/`LNKn`/`WTGn` as the `&'static str` link/target
 /// fields a [`ProcessAction`] carries.
@@ -44,6 +63,24 @@ const LNK_FIELDS: [&str; NUM_STEPS] = [
 ];
 const WTG_FIELDS: [&str; NUM_STEPS] = [
     "WTG1", "WTG2", "WTG3", "WTG4", "WTG5", "WTG6", "WTG7", "WTG8", "WTG9", "WTGA",
+];
+/// Per-step link-status diagnostic field names (C `checkLinks` posts), in
+/// step order. `DOLnV`/`LNKnV` carry `menu(sseqLNKV)` connection status;
+/// `DTn`/`LTn` the DOL/LNK target field type; `WERRn` the wait-config error.
+const DOLV_FIELDS: [&str; NUM_STEPS] = [
+    "DOL1V", "DOL2V", "DOL3V", "DOL4V", "DOL5V", "DOL6V", "DOL7V", "DOL8V", "DOL9V", "DOLAV",
+];
+const LNKV_FIELDS: [&str; NUM_STEPS] = [
+    "LNK1V", "LNK2V", "LNK3V", "LNK4V", "LNK5V", "LNK6V", "LNK7V", "LNK8V", "LNK9V", "LNKAV",
+];
+const DT_FIELDS: [&str; NUM_STEPS] = [
+    "DT1", "DT2", "DT3", "DT4", "DT5", "DT6", "DT7", "DT8", "DT9", "DTA",
+];
+const LT_FIELDS: [&str; NUM_STEPS] = [
+    "LT1", "LT2", "LT3", "LT4", "LT5", "LT6", "LT7", "LT8", "LT9", "LTA",
+];
+const WERR_FIELDS: [&str; NUM_STEPS] = [
+    "WERR1", "WERR2", "WERR3", "WERR4", "WERR5", "WERR6", "WERR7", "WERR8", "WERR9", "WERRA",
 ];
 
 /// State of the sseq async sequence machine.
@@ -72,7 +109,7 @@ enum SeqPhase {
 }
 
 /// A single step in the string sequence.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct SseqStep {
     dly: f64,          // Delay before executing this step
     dol: String,       // Input link (DOLn)
@@ -81,6 +118,35 @@ struct SseqStep {
     str_val: PvString, // String value (STRn)
     wait: i16,         // Wait mode: 0=NoWait, 1=Wait, 2..=After1..After9
     waiting: bool,     // WTGn — an outstanding put-callback for this step
+    // Link-status diagnostics, refreshed by `refresh_link_status` from C
+    // `sseqRecord.c:checkLinks` (sseqRecord.c:848-969). Defaulted to the
+    // C `init_record` classification of an empty (constant) link.
+    dol_status: i16,     // DOLnV — menu(sseqLNKV) DOL connection status
+    lnk_status: i16,     // LNKnV — menu(sseqLNKV) LNK connection status
+    dol_field_type: i16, // DTn — DOL target field type (DbFieldType / -1)
+    lnk_field_type: i16, // LTn — LNK target field type (DbFieldType / -1)
+    wait_err: i16,       // WERRn — wait-config error (see refresh_link_status)
+}
+
+impl Default for SseqStep {
+    fn default() -> Self {
+        Self {
+            dly: 0.0,
+            dol: String::new(),
+            dov: 0.0,
+            lnk: String::new(),
+            str_val: PvString::default(),
+            wait: 0,
+            waiting: false,
+            // An empty link is a CONSTANT link with no resolvable field type
+            // (C `init_record`, sseqRecord.c:204-206,222-225).
+            dol_status: LNKV_CON,
+            lnk_status: LNKV_CON,
+            dol_field_type: DBF_UNKNOWN,
+            lnk_field_type: DBF_UNKNOWN,
+            wait_err: 0,
+        }
+    }
 }
 
 /// Sseq record — string sequence record.
@@ -247,6 +313,12 @@ impl SseqRecord {
         if self.busy == 0 {
             self.busy = 1;
             live.push(("BUSY".to_string(), EpicsValue::Short(1)));
+            // Re-classify the link diagnostics at each genuine start. This is
+            // the stand-in for C's 0.5s `checkLinks` re-poll timer (skipped —
+            // epics-base-rs surfaces no connection-change signal): it picks up
+            // a LOCAL link whose target record was loaded after this record's
+            // init (init then saw EXT_NC; now it resolves to LOC).
+            self.refresh_link_status();
         }
         // C `process` (sseqRecord.c:318-335): resolve the selection. With
         // `SELM=Specified` an out-of-range `SELN` (> the 10 steps) is an
@@ -425,6 +497,116 @@ impl SseqRecord {
             });
         }
     }
+
+    /// Recompute the per-step DOL/LNK link-status diagnostics
+    /// (`DOLnV`/`LNKnV`/`DTn`/`LTn`/`WERRn`) and post them out-of-band,
+    /// mirroring C `sseqRecord.c:checkLinks` (sseqRecord.c:848-969) and the
+    /// `init_record` link classification (sseqRecord.c:202-250).
+    ///
+    /// Spawned because resolving a LOCAL link's target field type is an
+    /// async cross-record lookup; the spawned task begins with a
+    /// `yield_now` so that the init trigger (called from
+    /// `set_async_context`, before this record is inserted into the
+    /// database map) still posts after the record is registered. The
+    /// record write-lock is always released before the task runs, so a
+    /// self-targeting link cannot deadlock.
+    ///
+    /// Divergences from C, all forced by what epics-base-rs surfaces:
+    ///   * EXTERNAL (CA/PVA) links cannot be introspected here — there is no
+    ///     client-side connection state or remote field type — so an
+    ///     external link reports `EXT_NC` and `DTn`/`LTn` = unknown, not C's
+    ///     `EXT`/`EXT_NC` connection toggle (sseqRecord.c:862-941). This is
+    ///     a cross-crate limitation: epics-base-rs has no CA/PVA client.
+    ///   * `WERRn` is INVERTED from C. C raises it for a local DB link with
+    ///     `WAITn` set, because it cannot `dbCaPutLinkCallback` a non-CA
+    ///     link (sseqRecord.c:915-927). The Rust `WriteDbLinkNotify` seam
+    ///     DOES complete on a local PP link, so that is no longer an error.
+    ///     `WERRn` is redefined for the Rust-meaningful misconfig: `WAITn`
+    ///     set on a link that can never deliver a completion — a
+    ///     Constant/unset (`CON`) link.
+    ///   * C's 0.5s connection re-poll timer (sseqRecord.c:957-963) is
+    ///     skipped: epics-base-rs surfaces no link connection-change signal
+    ///     to drive it. The refresh runs at record init, on `special()` of
+    ///     a DOL/LNK/WAIT field, and at sequence start instead.
+    fn refresh_link_status(&self) {
+        let Some((name, handle)) = &self.async_ctx else {
+            return;
+        };
+        let name = name.clone();
+        let handle = handle.clone();
+        let groups: Vec<(String, String, i16)> = (0..NUM_STEPS)
+            .map(|i| {
+                let s = &self.steps[i];
+                (s.dol.clone(), s.lnk.clone(), s.wait)
+            })
+            .collect();
+        tokio::spawn(async move {
+            // Let `add_record` finish registering this record before the
+            // init post (this task may be spawned from `set_async_context`,
+            // which runs just before the record is inserted into the map).
+            tokio::task::yield_now().await;
+            let mut fields: Vec<(String, EpicsValue)> = Vec::with_capacity(NUM_STEPS * 5);
+            for (i, (dol, lnk, wait)) in groups.iter().enumerate() {
+                let (dol_status, dol_ft) = classify_link(&handle, dol).await;
+                let (lnk_status, lnk_ft) = classify_link(&handle, lnk).await;
+                // Redefined `WERRn`: `WAITn` on a link that can never deliver
+                // a completion (a Constant/unset = `CON` link). See the
+                // method doc-comment and sseqRecord.c:915-927.
+                let werr = if *wait != 0 && lnk_status == LNKV_CON {
+                    1
+                } else {
+                    0
+                };
+                fields.push((
+                    DOLV_FIELDS[i].to_string(),
+                    EpicsValue::Enum(dol_status as u16),
+                ));
+                fields.push((
+                    LNKV_FIELDS[i].to_string(),
+                    EpicsValue::Enum(lnk_status as u16),
+                ));
+                fields.push((DT_FIELDS[i].to_string(), EpicsValue::Short(dol_ft)));
+                fields.push((LT_FIELDS[i].to_string(), EpicsValue::Short(lnk_ft)));
+                fields.push((WERR_FIELDS[i].to_string(), EpicsValue::Short(werr)));
+            }
+            let _ = handle.post_fields(&name, fields).await;
+        });
+    }
+
+    /// True for the per-step link-config fields whose put must re-classify
+    /// the link diagnostics (C `sseqRecord.c:special` `SPC_MOD` →
+    /// `checkLinks`): `DOLn` / `LNKn` (the link strings) and `WAITn` (the
+    /// wait mode that drives `WERRn`). The read-only `DOLnV`/`LNKnV` status
+    /// menus are NOT included — they are outputs of this classification.
+    fn is_link_config_field(name: &str) -> bool {
+        matches!(
+            Self::step_index_from_suffix(name),
+            Some((_, "DOL")) | Some((_, "LNK")) | Some((_, "WAIT"))
+        )
+    }
+}
+
+/// Classify one DOL/LNK link into its `menu(sseqLNKV)` connection status
+/// and its `DTn`/`LTn` target field type, mirroring C `checkLinks`
+/// (sseqRecord.c:862-941) and `init_record` (sseqRecord.c:202-250).
+///
+/// Returns `(status, field_type)`. See [`SseqRecord::refresh_link_status`]
+/// for why an external (CA/PVA) link is reported as not-connected.
+async fn classify_link(handle: &AsyncDbHandle, link: &str) -> (i16, i16) {
+    match parse_link_v2(link).link_type() {
+        // Empty / constant link: C → CON, no resolvable field type.
+        LinkType::Empty | LinkType::Constant => (LNKV_CON, DBF_UNKNOWN),
+        // Local DB link: C `dbNameToAddr` ok → LOC + the addressed field's
+        // type. A DB-syntax link whose target is not on this IOC resolves to
+        // `None` and falls through to EXT_NC (C `init_record` else branch).
+        LinkType::Db => match handle.link_target_field_type(link).await {
+            Some(ft) => (LNKV_LOC, ft as i16),
+            None => (LNKV_EXT_NC, DBF_UNKNOWN),
+        },
+        // CA/PVA/other external link: epics-base-rs cannot introspect a
+        // remote field's connection state or type — report not-connected.
+        LinkType::Ca | LinkType::Other => (LNKV_EXT_NC, DBF_UNKNOWN),
+    }
 }
 
 /// Build the full `sseq` field table. The 7 base record fields plus the
@@ -435,14 +617,14 @@ impl SseqRecord {
 /// `static` while the per-step shape is generated once (no copy-paste
 /// drift across 130 entries).
 ///
-/// The read-only diagnostics fall into two groups. `WTGn` (outstanding
-/// put-callback) and top-level `ABORTING` are driven LIVE by the sequence
-/// machine (C `sseqRecord.c::processCallback`/`putCallbackCB`/`special`/
-/// `asyncFinish`) and posted via `post_live`. `DTn`/`LTn` (DOL/LNK link
-/// field type), `WERRn` (wait-config error), `IXn` (step index) and
-/// `DOLnV`/`LNKnV` (link connection status, `menu(sseqLNKV)`) come from C
-/// `checkLinks` — link introspection not modelled here — so they expose
-/// their DBD init defaults.
+/// The read-only diagnostics are all driven LIVE. `WTGn` (outstanding
+/// put-callback) and top-level `ABORTING` come from the sequence machine
+/// (C `sseqRecord.c::processCallback`/`putCallbackCB`/`special`/
+/// `asyncFinish`), posted via `post_live`. `DTn`/`LTn` (DOL/LNK link
+/// field type), `WERRn` (wait-config error) and `DOLnV`/`LNKnV` (link
+/// connection status, `menu(sseqLNKV)`) come from C `checkLinks`, posted
+/// by `refresh_link_status` (with the external-link / `WERRn` divergences
+/// documented there). `IXn` (step index) is a fixed per-step constant.
 macro_rules! sseq_fields {
     ($($s:literal),+ $(,)?) => {
         &[
@@ -543,11 +725,22 @@ impl Record for SseqRecord {
     }
 
     fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        if !after {
+            return Ok(());
+        }
+        // A put to a DOL/LNK/WAIT field re-classifies the link diagnostics:
+        // C `sseqRecord.c::special` (`SPC_MOD`) re-runs `checkLinks` so the
+        // `DOLnV`/`LNKnV`/`DTn`/`LTn`/`WERRn` surface tracks the new link.
+        // The link strings/wait mode the put just stored are re-read here.
+        if Self::is_link_config_field(field) {
+            self.refresh_link_status();
+            return Ok(());
+        }
         // C `sseqRecord.c::special` handles `ABORT` (SPC_MOD) entirely
         // outside the process cycle — a put to `ABORT` does NOT process the
         // record (only `VAL` is process-passive). `pR->abort` already holds
         // the value the put just stored.
-        if !after || !field.eq_ignore_ascii_case("ABORT") {
+        if !field.eq_ignore_ascii_case("ABORT") {
             return Ok(());
         }
         let mut live = Vec::new();
@@ -592,6 +785,10 @@ impl Record for SseqRecord {
 
     fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
         self.async_ctx = Some((name, db));
+        // C `init_record` classifies every DOL/LNK link and posts the
+        // initial status (sseqRecord.c:202-250). This is the framework's
+        // init-time hook, so refresh now that the async surface exists.
+        self.refresh_link_status();
     }
 
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
@@ -637,12 +834,16 @@ impl Record for SseqRecord {
                 // DOLnV / LNKnV link-status menu (menu(sseqLNKV),
                 // sseqRecord.dbd:118,125). The step digit sits before the
                 // trailing `V`, so `step_index_from_suffix` (which keys on
-                // the last char) does not recognise these. C init value is
-                // sseqLNKV_EXT (1); the live connection status is computed
-                // by `sseqRecord.c:checkLinks` (part of the async sequence
-                // machine not yet ported).
-                if Self::link_status_index(name).is_some() {
-                    return Some(EpicsValue::Enum(1));
+                // the last char) does not recognise these. Live connection
+                // status from `refresh_link_status` (C `checkLinks`); the
+                // default for an unconfigured (empty) link is `CON`.
+                if let Some(idx) = Self::link_status_index(name) {
+                    let status = if name.starts_with("DOL") {
+                        self.steps[idx].dol_status
+                    } else {
+                        self.steps[idx].lnk_status
+                    };
+                    return Some(EpicsValue::Enum(status as u16));
                 }
                 if let Some((idx, prefix)) = Self::step_index_from_suffix(name) {
                     let step = &self.steps[idx];
@@ -653,14 +854,13 @@ impl Record for SseqRecord {
                         "LNK" => Some(EpicsValue::String(step.lnk.clone().into())),
                         "STR" => Some(EpicsValue::String(step.str_val.clone())),
                         "WAIT" => Some(EpicsValue::Short(step.wait)),
-                        // Per-step diagnostics (sseqRecord.dbd). Read-only;
-                        // their live values come from the async sequence
-                        // owner (`sseqRecord.c:processNextLink`/`checkLinks`),
-                        // not yet ported — exposed at their C init defaults
-                        // so REC.DTn/LTn/WERRn/WTGn/IXn can be opened.
-                        "DT" => Some(EpicsValue::Short(0)),
-                        "LT" => Some(EpicsValue::Short(0)),
-                        "WERR" => Some(EpicsValue::Short(0)),
+                        // Per-step link diagnostics, refreshed by
+                        // `refresh_link_status` (C `checkLinks`): DOL/LNK
+                        // target field type and the wait-config error. The
+                        // default for an unconfigured link is unknown (-1).
+                        "DT" => Some(EpicsValue::Short(step.dol_field_type)),
+                        "LT" => Some(EpicsValue::Short(step.lnk_field_type)),
+                        "WERR" => Some(EpicsValue::Short(step.wait_err)),
                         // WTGn — live "outstanding put-callback" flag for
                         // this step (C `processCallback`/`putCallbackCB`
                         // toggle `waiting`); posted via `post_live`.
@@ -762,6 +962,21 @@ impl Record for SseqRecord {
                 Ok(())
             }
             _ => {
+                // DOLnV / LNKnV link-status menus are read-only to clients;
+                // the link-status refresh (`post_fields` → `put_field_internal`)
+                // lands here to store the connection status it just computed.
+                if let Some(idx) = Self::link_status_index(name) {
+                    let v = value
+                        .to_f64()
+                        .ok_or_else(|| CaError::TypeMismatch(name.into()))?
+                        as i16;
+                    if name.starts_with("DOL") {
+                        self.steps[idx].dol_status = v;
+                    } else {
+                        self.steps[idx].lnk_status = v;
+                    }
+                    return Ok(());
+                }
                 if let Some((idx, prefix)) = Self::step_index_from_suffix(name) {
                     let step = &mut self.steps[idx];
                     return match prefix {
@@ -813,6 +1028,31 @@ impl Record for SseqRecord {
                                 .to_f64()
                                 .ok_or_else(|| CaError::TypeMismatch(name.into()))?
                                 != 0.0;
+                            Ok(())
+                        }
+                        // DTn / LTn / WERRn are read-only to clients; the
+                        // link-status refresh posts them via `post_fields`
+                        // (`put_field_internal`), landing here. Store the
+                        // value the refresh just computed.
+                        "DT" => {
+                            step.dol_field_type = value
+                                .to_f64()
+                                .ok_or_else(|| CaError::TypeMismatch(name.into()))?
+                                as i16;
+                            Ok(())
+                        }
+                        "LT" => {
+                            step.lnk_field_type = value
+                                .to_f64()
+                                .ok_or_else(|| CaError::TypeMismatch(name.into()))?
+                                as i16;
+                            Ok(())
+                        }
+                        "WERR" => {
+                            step.wait_err = value
+                                .to_f64()
+                                .ok_or_else(|| CaError::TypeMismatch(name.into()))?
+                                as i16;
                             Ok(())
                         }
                         _ => Err(CaError::FieldNotFound(name.to_string())),
@@ -1013,25 +1253,45 @@ mod tests {
     #[test]
     fn test_sseq_status_fields_openable() {
         // The per-step diagnostics and top-level ABORTING must be
-        // openable/readable (clients previously got field-not-found).
-        // They expose their sseqRecord.dbd init defaults: the live values
-        // are driven by the async sequence owner, not yet ported.
+        // openable/readable (clients previously got field-not-found). With
+        // no async context wired, the link-status fields hold their C
+        // `init_record` classification of an empty (constant) link: `CON`
+        // status and `DBF_unknown` (-1) field type (sseqRecord.c:204-225).
         let rec = SseqRecord::new();
-        assert_eq!(rec.get_field("DT1"), Some(EpicsValue::Short(0)));
-        assert_eq!(rec.get_field("LT1"), Some(EpicsValue::Short(0)));
+        assert_eq!(rec.get_field("DT1"), Some(EpicsValue::Short(-1)));
+        assert_eq!(rec.get_field("LT1"), Some(EpicsValue::Short(-1)));
+        // WERRn = 0: an empty link with the default NoWait is not a misconfig.
         assert_eq!(rec.get_field("WERR1"), Some(EpicsValue::Short(0)));
         assert_eq!(rec.get_field("WTG1"), Some(EpicsValue::Short(0)));
         // A-suffix step variants.
-        assert_eq!(rec.get_field("DTA"), Some(EpicsValue::Short(0)));
+        assert_eq!(rec.get_field("DTA"), Some(EpicsValue::Short(-1)));
         assert_eq!(rec.get_field("WTGA"), Some(EpicsValue::Short(0)));
         assert_eq!(rec.get_field("WERRA"), Some(EpicsValue::Short(0)));
-        // DOLnV / LNKnV menu init = sseqLNKV_EXT (1).
-        assert_eq!(rec.get_field("DOL1V"), Some(EpicsValue::Enum(1)));
-        assert_eq!(rec.get_field("LNK1V"), Some(EpicsValue::Enum(1)));
-        assert_eq!(rec.get_field("DOLAV"), Some(EpicsValue::Enum(1)));
-        assert_eq!(rec.get_field("LNKAV"), Some(EpicsValue::Enum(1)));
+        // DOLnV / LNKnV: empty link → sseqLNKV_CON (3).
+        assert_eq!(rec.get_field("DOL1V"), Some(EpicsValue::Enum(3)));
+        assert_eq!(rec.get_field("LNK1V"), Some(EpicsValue::Enum(3)));
+        assert_eq!(rec.get_field("DOLAV"), Some(EpicsValue::Enum(3)));
+        assert_eq!(rec.get_field("LNKAV"), Some(EpicsValue::Enum(3)));
         // Top-level ABORTING.
         assert_eq!(rec.get_field("ABORTING"), Some(EpicsValue::Short(0)));
+    }
+
+    #[test]
+    fn test_sseq_werr_wait_on_constant_link_default() {
+        // WERRn is redefined (vs C): WAITn set on a link that can never
+        // deliver a completion — a Constant/unset (CON) link. A bare
+        // SseqRecord with no async context still classifies an empty link
+        // as CON, so a WAIT on it reads as a config error once a refresh
+        // posts. Here, with no runtime, the default WERRn stays 0 (the
+        // refresh that raises it needs the async surface); this pins that
+        // the static default is non-erroring. The live raise/clear boundary
+        // is covered by the async integration test.
+        let mut rec = SseqRecord::new();
+        rec.put_field("WAIT1", EpicsValue::Short(1)).unwrap();
+        assert_eq!(rec.get_field("WERR1"), Some(EpicsValue::Short(0)));
+        // The internal status post-back path stores what the refresh computes.
+        rec.put_field("WERR1", EpicsValue::Short(1)).unwrap();
+        assert_eq!(rec.get_field("WERR1"), Some(EpicsValue::Short(1)));
     }
 
     #[test]

@@ -118,6 +118,35 @@ async fn poll_short(db: &PvDatabase, pv: &str, want: i16, label: &str) {
     );
 }
 
+/// Poll an integer-valued status PV (DBF_SHORT or a DBF_MENU served as
+/// DBR_ENUM) until its numeric value equals `want`. Coerces through
+/// `to_f64` so it handles both `Short` (DTn/LTn/WERRn) and `Enum`
+/// (DOLnV/LNKnV) without caring which the field uses.
+async fn poll_i16(db: &PvDatabase, pv: &str, want: i16, label: &str) {
+    for _ in 0..400 {
+        if let Ok(v) = db.get_pv(pv).await {
+            if v.to_f64().map(|f| f as i16) == Some(want) {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!(
+        "{label}: {pv} did not reach {want} before timeout (last {:?})",
+        db.get_pv(pv).await
+    );
+}
+
+/// Read an integer-valued status PV's current numeric value as `i16`.
+async fn read_i16(db: &PvDatabase, pv: &str) -> i16 {
+    db.get_pv(pv)
+        .await
+        .ok()
+        .and_then(|v| v.to_f64())
+        .map(|f| f as i16)
+        .unwrap_or_else(|| panic!("{pv} not readable as a number"))
+}
+
 /// Poll a `DBF_DOUBLE` PV until it equals `want`.
 async fn poll_double(db: &PvDatabase, pv: &str, want: f64, label: &str) {
     for _ in 0..400 {
@@ -478,5 +507,108 @@ async fn sseq_seln_out_of_range_raises_invalid_alarm_and_no_dispatch() {
         read_short(db.get_pv("SSEQ_SELN.BUSY").await.ok()),
         0,
         "BUSY cleared after the invalid selection finished"
+    );
+}
+
+/// Boundary — `DOLnV`/`LNKnV` connection status and `DTn`/`LTn` target
+/// field type, classified by `checkLinks` (C `sseqRecord.c:862-941` /
+/// `init_record` 202-250). A LOCAL DB link → `LOC` (2) + the resolved
+/// target field type; an empty (constant) link → `CON` (3) + the unknown
+/// (-1) field type. The refresh runs at record init (`set_async_context`).
+#[tokio::test]
+async fn sseq_link_status_loc_vs_con() {
+    let db = PvDatabase::new();
+    // A local target (ao VAL is DBF_DOUBLE = DbFieldType::Double = 6) so a
+    // DB link to it resolves to LOC with a known field type.
+    db.add_record("SSEQ_LS_TGT", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let mut sseq = SseqRecord::new();
+    // Step 1: local DOL and local LNK → both LOC, field types resolved.
+    sseq.put_field("DOL1", EpicsValue::String("SSEQ_LS_TGT.VAL".into()))
+        .unwrap();
+    sseq.put_field("LNK1", EpicsValue::String("SSEQ_LS_TGT".into()))
+        .unwrap();
+    // Step 2: empty (constant) DOL and LNK → both CON, field types unknown.
+    db.add_record("SSEQ_LS", Box::new(sseq)).await.unwrap();
+
+    // Init refresh classifies the links and posts the diagnostics.
+    poll_i16(&db, "SSEQ_LS.DOL1V", 2, "local DOL → LOC").await;
+    poll_i16(&db, "SSEQ_LS.LNK1V", 2, "local LNK → LOC").await;
+    poll_i16(
+        &db,
+        "SSEQ_LS.DT1",
+        6,
+        "local DOL field type resolved (Double)",
+    )
+    .await;
+    poll_i16(
+        &db,
+        "SSEQ_LS.LT1",
+        6,
+        "local LNK field type resolved (Double)",
+    )
+    .await;
+
+    // Empty links classify as CON with unknown (-1) field type.
+    poll_i16(&db, "SSEQ_LS.DOL2V", 3, "empty DOL → CON").await;
+    poll_i16(&db, "SSEQ_LS.LNK2V", 3, "empty LNK → CON").await;
+    assert_eq!(
+        read_i16(&db, "SSEQ_LS.DT2").await,
+        -1,
+        "empty DOL field type is unknown (-1)"
+    );
+    assert_eq!(
+        read_i16(&db, "SSEQ_LS.LT2").await,
+        -1,
+        "empty LNK field type is unknown (-1)"
+    );
+}
+
+/// Boundary — `WERRn` is REDEFINED from C (sseqRecord.c:915-927). C raises
+/// it for a local DB link with `WAITn` (it cannot `dbCaPutLinkCallback` a
+/// non-CA link); the Rust `WriteDbLinkNotify` seam DOES complete on a local
+/// PP link, so that is not an error here. `WERRn` instead flags `WAITn` set
+/// on a link that can never deliver a completion — a Constant/unset (`CON`)
+/// link. So: WAIT on a local DB link → `WERRn` clears (0); WAIT on an empty
+/// (constant) link → `WERRn` raises (1).
+#[tokio::test]
+async fn sseq_werr_wait_on_constant_raises_wait_on_local_clears() {
+    let db = PvDatabase::new();
+    db.add_record("SSEQ_WE_TGT", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let mut sseq = SseqRecord::new();
+    // Step 1: WAIT on a LOCAL DB link — completable, so no error.
+    sseq.put_field("LNK1", EpicsValue::String("SSEQ_WE_TGT".into()))
+        .unwrap();
+    sseq.put_field("WAIT1", EpicsValue::Short(1)).unwrap(); // Wait
+    // Step 2: WAIT on an EMPTY (constant) link — can never complete → error.
+    sseq.put_field("WAIT2", EpicsValue::Short(1)).unwrap(); // Wait, LNK2 empty
+    // Step 3: control — NoWait on an empty link is not a misconfig.
+    db.add_record("SSEQ_WE", Box::new(sseq)).await.unwrap();
+
+    // The raise is the discriminating transition (default WERR2 == 0).
+    poll_i16(
+        &db,
+        "SSEQ_WE.WERR2",
+        1,
+        "WAIT on a constant link raises WERR",
+    )
+    .await;
+    // The local-DB step's WAIT must NOT be flagged (the C-inversion).
+    poll_i16(&db, "SSEQ_WE.LNK1V", 2, "local LNK → LOC").await;
+    assert_eq!(
+        read_i16(&db, "SSEQ_WE.WERR1").await,
+        0,
+        "WAIT on a local DB link is completable → WERR clears (vs C)"
+    );
+    poll_i16(&db, "SSEQ_WE.LNK2V", 3, "empty LNK → CON").await;
+    assert_eq!(
+        read_i16(&db, "SSEQ_WE.WERR3").await,
+        0,
+        "NoWait on an empty link is not a misconfig → WERR stays 0"
     );
 }

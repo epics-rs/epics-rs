@@ -2038,6 +2038,54 @@ impl PvaClient {
         op_get_put(&ch, self.inner.timeout).await
     }
 
+    /// Like [`Self::pvget_get`] but carries a caller-supplied pvRequest at
+    /// INIT, so a `getField(...)` selector projects the get-leg structure's
+    /// readback (pvDatabaseCPP `ChannelPutGetLocal::getGet`,
+    /// modules/pvDatabase/src/pvAccess/channelLocal.cpp). The pvRequest is
+    /// serialized in the connection's negotiated byte order. Absent a
+    /// `getField`, the server falls back to the common `field` selection.
+    pub async fn pvget_get_with_request_value(
+        &self,
+        pv_name: &str,
+        pv_request: &crate::pvdata::PvField,
+    ) -> PvaResult<(FieldDesc, PvField)> {
+        let ch = self.channel(pv_name).await?;
+        let order =
+            crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
+                .await?
+                .0
+                .byte_order();
+        let mut bytes = Vec::new();
+        let desc = pv_request.descriptor();
+        crate::pvdata::encode::encode_type_desc(&desc, order, &mut bytes);
+        crate::pvdata::encode::encode_pv_field(pv_request, &desc, order, &mut bytes);
+        crate::client_native::ops_v2::op_get_get_with_request(&ch, &bytes, self.inner.timeout).await
+    }
+
+    /// Like [`Self::pvget_put`] but carries a caller-supplied pvRequest at
+    /// INIT, so a `putField(...)` selector projects the put-leg structure's
+    /// readback (pvDatabaseCPP `ChannelPutGetLocal::getPut`,
+    /// modules/pvDatabase/src/pvAccess/channelLocal.cpp). The pvRequest is
+    /// serialized in the connection's negotiated byte order. Absent a
+    /// `putField`, the server falls back to the common `field` selection.
+    pub async fn pvget_put_with_request_value(
+        &self,
+        pv_name: &str,
+        pv_request: &crate::pvdata::PvField,
+    ) -> PvaResult<(FieldDesc, PvField)> {
+        let ch = self.channel(pv_name).await?;
+        let order =
+            crate::client_native::ops_v2::ensure_active_with_op_timeout(&ch, self.inner.timeout)
+                .await?
+                .0
+                .byte_order();
+        let mut bytes = Vec::new();
+        let desc = pv_request.descriptor();
+        crate::pvdata::encode::encode_type_desc(&desc, order, &mut bytes);
+        crate::pvdata::encode::encode_pv_field(pv_request, &desc, order, &mut bytes);
+        crate::client_native::ops_v2::op_get_put_with_request(&ch, &bytes, self.inner.timeout).await
+    }
+
     /// PVA `PROCESS` (cmd 16) — trigger record processing without
     /// transferring a value. The wire equivalent of an EPICS
     /// `caput .PROC` / `dbProcess`. Succeeds with `()`; a processing

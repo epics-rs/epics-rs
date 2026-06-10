@@ -3419,6 +3419,48 @@ pub async fn op_get_put(
     .await
 }
 
+/// [`op_get_get`] carrying a caller-supplied pvRequest. The INIT pvRequest
+/// can carry a `getField(...)` selector so the readback projects the get-leg
+/// structure (pvDatabaseCPP `ChannelPutGetLocal`,
+/// modules/pvDatabase/src/pvAccess/channelLocal.cpp); without one the server
+/// falls back to the common `field` selection. The default
+/// [`op_get_get`] sends only the value-only selector and so cannot express a
+/// distinct get-leg.
+pub async fn op_get_get_with_request(
+    channel: &Arc<Channel>,
+    pv_req: &[u8],
+    op_timeout: Duration,
+) -> PvaResult<(FieldDesc, PvField)> {
+    op_put_get_data(
+        channel,
+        QosFlags::GET,
+        Some(pv_req),
+        PutGetPut::None,
+        op_timeout,
+    )
+    .await
+}
+
+/// [`op_get_put`] carrying a caller-supplied pvRequest. The INIT pvRequest
+/// can carry a `putField(...)` selector so the readback projects the put-leg
+/// structure (pvDatabaseCPP `ChannelPutGetLocal::getPut`,
+/// modules/pvDatabase/src/pvAccess/channelLocal.cpp); without one the server
+/// falls back to the common `field` selection.
+pub async fn op_get_put_with_request(
+    channel: &Arc<Channel>,
+    pv_req: &[u8],
+    op_timeout: Duration,
+) -> PvaResult<(FieldDesc, PvField)> {
+    op_put_get_data(
+        channel,
+        QosFlags::GET_PUT,
+        Some(pv_req),
+        PutGetPut::None,
+        op_timeout,
+    )
+    .await
+}
+
 /// The put leg of a [`op_put_get_data`] round trip. The read-only
 /// getGet/getPut subcommands carry no payload (`None`); the default
 /// putGet writes a string-parsed value (`Str`); the typed putGet (gateway

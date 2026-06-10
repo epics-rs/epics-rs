@@ -698,3 +698,187 @@ async fn process_denied_for_read_only_peer() {
     server.stop();
     let _ = tokio::time::timeout(Duration::from_secs(2), server.wait()).await;
 }
+
+// ---------------------------------------------------------------------
+// Distinct put-leg / get-leg projection (ChannelPutGet putField/getField).
+//
+// EPICS ChannelPutGet negotiates two field selections at INIT: putField
+// (the writable leg) and getField (the readback leg) — pvDatabaseCPP
+// `ChannelPutGetLocal::create` builds a separate PVCopy for each
+// (modules/pvDatabase/src/pvAccess/channelLocal.cpp). getPut reads the
+// put-leg structure, getGet/putGet read the get-leg structure. The server
+// must mask each leg's readback by its own selector instead of collapsing
+// both to one mask.
+// ---------------------------------------------------------------------
+
+/// Two-scalar source (`value`, `aux`) with DISTINCT readings so each leg's
+/// projection is observable.
+#[derive(Clone)]
+struct TwoFieldSource {
+    value: Arc<Mutex<i32>>,
+    aux: Arc<Mutex<i32>>,
+}
+
+impl TwoFieldSource {
+    fn new() -> Self {
+        Self {
+            value: Arc::new(Mutex::new(7)),
+            aux: Arc::new(Mutex::new(9)),
+        }
+    }
+    fn desc() -> FieldDesc {
+        FieldDesc::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".into(),
+            fields: vec![
+                ("value".into(), FieldDesc::Scalar(ScalarType::Int)),
+                ("aux".into(), FieldDesc::Scalar(ScalarType::Int)),
+            ],
+        }
+    }
+}
+
+impl ChannelSource for TwoFieldSource {
+    fn list_pvs(&self) -> impl std::future::Future<Output = Vec<String>> + Send {
+        async { vec!["dut".into()] }
+    }
+    fn has_pv(&self, n: &str) -> impl std::future::Future<Output = bool> + Send {
+        let n = n.to_string();
+        async move { n == "dut" }
+    }
+    fn get_introspection(
+        &self,
+        _: &str,
+    ) -> impl std::future::Future<Output = Option<FieldDesc>> + Send {
+        async { Some(Self::desc()) }
+    }
+    fn get_value(&self, _: &str) -> impl std::future::Future<Output = Option<PvField>> + Send {
+        let v = *self.value.lock();
+        let a = *self.aux.lock();
+        async move {
+            let mut s = PvStructure::new("epics:nt/NTScalar:1.0");
+            s.fields
+                .push(("value".into(), PvField::Scalar(ScalarValue::Int(v))));
+            s.fields
+                .push(("aux".into(), PvField::Scalar(ScalarValue::Int(a))));
+            Some(PvField::Structure(s))
+        }
+    }
+    fn put_value(
+        &self,
+        _: &str,
+        value: PvField,
+    ) -> impl std::future::Future<Output = Result<(), OpError>> + Send {
+        let store = self.value.clone();
+        async move {
+            if let PvField::Structure(s) = &value {
+                if let Some(PvField::Scalar(ScalarValue::Int(i))) =
+                    s.fields.iter().find(|(k, _)| k == "value").map(|(_, v)| v)
+                {
+                    *store.lock() = *i;
+                }
+            }
+            Ok(())
+        }
+    }
+    fn is_writable(&self, _: &str) -> impl std::future::Future<Output = bool> + Send {
+        async { true }
+    }
+    fn subscribe(
+        &self,
+        _: &str,
+    ) -> impl std::future::Future<Output = Option<mpsc::Receiver<PvField>>> + Send {
+        async { None }
+    }
+}
+
+/// Read an `i32` member from a readback structure, or `None` when the field
+/// is absent / not the marked leaf (a partial-bitset readback fills only the
+/// projected fields).
+fn field_int(v: &PvField, name: &str) -> Option<i32> {
+    match v {
+        PvField::Structure(s) => s.fields.iter().find_map(|(k, f)| {
+            (k == name).then_some(f).and_then(|f| match f {
+                PvField::Scalar(ScalarValue::Int(i)) => Some(*i),
+                _ => None,
+            })
+        }),
+        _ => None,
+    }
+}
+
+/// Build a ChannelPutGet pvRequest carrying distinct `putField`/`getField`
+/// leaf selectors.
+fn put_get_request(put_field: &str, get_field: &str) -> PvField {
+    let leaf = |name: &str| {
+        let mut s = PvStructure::new("");
+        s.fields
+            .push((name.to_string(), PvField::Structure(PvStructure::new(""))));
+        PvField::Structure(s)
+    };
+    let mut root = PvStructure::new("");
+    root.fields.push(("putField".into(), leaf(put_field)));
+    root.fields.push(("getField".into(), leaf(get_field)));
+    PvField::Structure(root)
+}
+
+/// getPut must project the put-leg (`putField`) selection and getGet the
+/// get-leg (`getField`) selection — distinct fields, not the same collapsed
+/// mask. The source reads `value=7`, `aux=9`; with `putField(value)` /
+/// `getField(aux)`, getPut returns `value` (7) only and getGet returns `aux`
+/// (9) only.
+#[tokio::test]
+async fn get_put_and_get_get_project_distinct_legs() {
+    let (port, udp) = alloc_port();
+    let cfg = PvaServerConfig {
+        tcp_port: port,
+        udp_port: udp,
+        ..Default::default()
+    };
+    let src = TwoFieldSource::new();
+    let server = PvaServer::start(Arc::new(src.clone()), cfg).expect("test server must start");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = client_to(port);
+    let req = put_get_request("value", "aux");
+
+    // getPut → put-leg = putField(value): returns `value` (7), not `aux`.
+    let (_i, gp) = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.pvget_put_with_request_value("dut", &req),
+    )
+    .await
+    .expect("pvget_put_with_request_value timed out")
+    .expect("pvget_put_with_request_value failed");
+    assert_eq!(
+        field_int(&gp, "value"),
+        Some(7),
+        "getPut must project the put-leg `value` field"
+    );
+    assert_ne!(
+        field_int(&gp, "aux"),
+        Some(9),
+        "getPut must NOT carry the get-leg `aux` reading (distinct mask)"
+    );
+
+    // getGet → get-leg = getField(aux): returns `aux` (9), not `value`.
+    let (_i, gg) = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.pvget_get_with_request_value("dut", &req),
+    )
+    .await
+    .expect("pvget_get_with_request_value timed out")
+    .expect("pvget_get_with_request_value failed");
+    assert_eq!(
+        field_int(&gg, "aux"),
+        Some(9),
+        "getGet must project the get-leg `aux` field"
+    );
+    assert_ne!(
+        field_int(&gg, "value"),
+        Some(7),
+        "getGet must NOT carry the put-leg `value` reading (distinct mask)"
+    );
+
+    server.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(2), server.wait()).await;
+}

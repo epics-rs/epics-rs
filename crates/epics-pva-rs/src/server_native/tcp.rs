@@ -1371,8 +1371,16 @@ struct OpState {
     monitor_abort: Option<Arc<AbortOnDrop>>,
     /// Field mask derived from the client's pvRequest at INIT time.
     /// Drives the changed-bitset and partial-value encoding so the
-    /// server only emits what was requested.
+    /// server only emits what was requested. For a PUT_GET op this is
+    /// the GET-leg (`getField`) mask — the readback projection used by
+    /// `putGet` and `getGet`.
     mask: BitSet,
+    /// PUT-leg (`putField`) mask for a PUT_GET op, used by the `getPut`
+    /// sub-command to project the put-side structure's current value
+    /// (pvDatabaseCPP `ChannelPutGetLocal` builds separate putField /
+    /// getField copies, channelLocal.cpp). `None` for every other op
+    /// kind, which has a single selection mask in [`Self::mask`].
+    put_mask: Option<BitSet>,
     /// Pipeline credit window. pvxs `MonitorOp::window` —
     /// when pipeline mode is active, the server emits at most this
     /// many events before pausing until the client sends a
@@ -3668,6 +3676,7 @@ fn non_monitor_op_state(intro: FieldDesc, kind: OpKind, mask: BitSet) -> OpState
         monitor_started: false,
         monitor_abort: None,
         mask,
+        put_mask: None,
         monitor_window: None,
         monitor_window_notify: None,
         monitor_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3861,9 +3870,18 @@ async fn handle_put_get(
                     )));
                 }
             };
-        // empty mask is an INIT error.
-        let mask = match crate::pv_request::request_to_mask(&intro, &req_desc) {
-            Ok(m) => m,
+        // ChannelPutGet negotiates TWO field selections at INIT: the
+        // put-leg (`putField`) and the get-leg (`getField`). pvDatabaseCPP
+        // `ChannelPutGetLocal::create` builds a separate PVCopy for each
+        // (modules/pvDatabase/src/pvAccess/channelLocal.cpp), so `getPut`
+        // reads back the put-leg structure and `putGet`/`getGet` the
+        // get-leg structure. We derive both masks here. When the pvRequest
+        // carries no putField/getField the pvAccess `getRequestedStructure`
+        // fallback collapses both to the common `field` selection
+        // (modules/pvAccess/testApp/remote/testServer.cpp), so the common NT
+        // round trip is unchanged. An empty selection is an INIT error.
+        let (put_mask, get_mask) = match crate::pv_request::put_get_masks(&intro, &req_desc) {
+            Ok(masks) => masks,
             Err(e) => {
                 send_chan_op_error(
                     &chan_tx,
@@ -3883,7 +3901,12 @@ async fn handle_put_get(
         // through `ChannelContext.pv_request` to the source. The
         // dedicated PUT_GET path otherwise dropped it, so QSRV group
         // PUT_GET could not honor INIT options on the native wire.
-        let mut put_get_op = non_monitor_op_state(intro.clone(), OpKind::PutGet, mask);
+        //
+        // The get-leg mask is the op's primary selection mask (`OpState.mask`,
+        // drives the putGet/getGet readback); the put-leg mask rides in
+        // `OpState.put_mask` for getPut.
+        let mut put_get_op = non_monitor_op_state(intro.clone(), OpKind::PutGet, get_mask);
+        put_get_op.put_mask = Some(put_mask);
         put_get_op.pv_request = req_value;
         ch.ops.insert(ioid, put_get_op);
 
@@ -3914,7 +3937,7 @@ async fn handle_put_get(
 
     // PUT-GET data phase.
     let op = ch.ops.get(&ioid).cloned();
-    let (intro, mask, init_pv_request) = match op {
+    let (intro, mask, put_mask, init_pv_request) = match op {
         Some(o) => {
             // the data-phase command must match the operation
             // kind bound at INIT. pvxs `serverget.cpp:421-436` resets
@@ -3933,7 +3956,7 @@ async fn handle_put_get(
                     o.kind
                 )));
             }
-            (o.intro, o.mask, o.pv_request)
+            (o.intro, o.mask, o.put_mask, o.pv_request)
         }
         None => {
             send_chan_op_error(
@@ -3959,11 +3982,24 @@ async fn handle_put_get(
     // solely for the default branch and sends nothing for getGet/getPut.
     // Decoding a BitSet/value for those payload-less frames is what made
     // the operation fail, so gate both the decode and the write leg on the
-    // subcommand. Our INIT serves the same introspection for the put and
-    // get structures (see above), so both read-only legs reply with the
-    // current value under the negotiated mask, echoing the subcommand the
-    // client dispatches on (getGetDone vs getPutDone).
+    // subcommand.
     let read_only = subcmd & (QosFlags::GET | QosFlags::GET_PUT) != 0;
+
+    // The two read-back legs project distinct structures: getPut returns the
+    // put-leg (`putField`) structure's current value, putGet/getGet the
+    // get-leg (`getField`) structure's value (pvDatabaseCPP
+    // `ChannelPutGetLocal::getPut`/`getGet`,
+    // modules/pvDatabase/src/pvAccess/channelLocal.cpp). Both read the same
+    // backing value but mask it by their own selection — the INIT serves the
+    // full introspection for both descriptors, so the leg is carried by the
+    // changed-bitset rather than a projected type (uniform with GET/PUT/
+    // MONITOR). `mask` is the get-leg mask; `put_mask` the put-leg mask (set
+    // for every PUT_GET op at INIT, falling back to `mask` defensively).
+    let readback_mask = if subcmd & QosFlags::GET_PUT != 0 {
+        put_mask.unwrap_or_else(|| mask.clone())
+    } else {
+        mask.clone()
+    };
 
     // Decode the put payload inline (cursor is borrowed from the stack
     // frame) only for the write/readback putGet path.
@@ -4078,7 +4114,11 @@ async fn handle_put_get(
         match read_value {
             Ok(Some(v)) => {
                 Status::ok().write_into(order, &mut payload);
-                let wire_changed = crate::pvdata::encode::canonical_changed_bitset(&intro, &mask);
+                // Project the read-back value by this leg's selection mask
+                // (getPut → put-leg, putGet/getGet → get-leg). See the
+                // `readback_mask` derivation above.
+                let wire_changed =
+                    crate::pvdata::encode::canonical_changed_bitset(&intro, &readback_mask);
                 wire_changed.write_into(order, &mut payload);
                 crate::pvdata::encode::encode_pv_field_with_bitset(
                     &v,
@@ -6006,6 +6046,7 @@ async fn handle_op(
                 monitor_started: false,
                 monitor_abort: None,
                 mask,
+                put_mask: None,
                 monitor_window,
                 monitor_window_notify,
                 monitor_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -10989,6 +11030,7 @@ mod tests {
                 monitor_started: true,
                 monitor_abort: None,
                 mask: BitSet::new(),
+                put_mask: None,
                 monitor_window: Some(window),
                 monitor_window_notify: Some(Arc::new(tokio::sync::Notify::new())),
                 monitor_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -11954,6 +11996,7 @@ mod tests {
                 monitor_started: true,
                 monitor_abort: Some(abort.clone()),
                 mask: BitSet::new(),
+                put_mask: None,
                 monitor_window: None,
                 monitor_window_notify: None,
                 monitor_paused: paused.clone(),
@@ -16025,6 +16068,7 @@ mod tests {
                 monitor_started: false,
                 monitor_abort: None,
                 mask: BitSet::new(),
+                put_mask: None,
                 monitor_window: None,
                 monitor_window_notify: None,
                 monitor_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),

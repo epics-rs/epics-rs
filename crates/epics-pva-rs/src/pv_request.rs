@@ -199,52 +199,120 @@ pub fn request_to_mask(
     value_desc: &crate::pvdata::FieldDesc,
     request_desc: &crate::pvdata::FieldDesc,
 ) -> Result<crate::proto::BitSet, RequestMaskError> {
-    use crate::pvdata::FieldDesc;
-    let mut mask = crate::proto::BitSet::new();
+    // The standard selector key is `field`. No `field` entry at all (e.g.
+    // the "empty pvRequest" the Rust client sends as a 6-byte 0xFD-cached
+    // empty struct) → wildcard: select the whole structure. pvxs
+    // `request2mask` `else if(!fields.valid()) foundrequested = true`.
+    match mask_for_named_selector(value_desc, request_desc, "field") {
+        Some(result) => result,
+        None => Ok(select_all_bits(value_desc)),
+    }
+}
 
-    // Find the top-level "field" sub-structure inside the pvRequest.
+/// Derive the distinct put-leg and get-leg field masks for a `ChannelPutGet`
+/// pvRequest, returned as `(put_mask, get_mask)`.
+///
+/// pvDatabaseCPP `ChannelPutGetLocal::create` builds two separate copy views
+/// — `PVCopy::create(master, pvRequest, "putField")` for the writable leg and
+/// `PVCopy::create(master, pvRequest, "getField")` for the readback leg
+/// (modules/pvDatabase/src/pvAccess/channelLocal.cpp). `getPut` then returns
+/// the put-leg structure's current value and `getGet` the get-leg structure's
+/// value, so the two legs must mask the channel value by their own selector.
+///
+/// When a leg-specific selector (`putField` / `getField`) is absent, the
+/// pvAccess `getRequestedStructure` fallback uses the common request structure
+/// — i.e. the `field` selector, or the whole structure when even that is
+/// absent (modules/pvAccess/testApp/remote/testServer.cpp `getRequestedStructure`).
+/// That fallback is exactly [`request_to_mask`], so a plain `field`-only or
+/// empty pvRequest yields identical put/get masks (back-compat with the common
+/// NT round trip where the put and readback types coincide).
+pub fn put_get_masks(
+    value_desc: &crate::pvdata::FieldDesc,
+    request_desc: &crate::pvdata::FieldDesc,
+) -> Result<(crate::proto::BitSet, crate::proto::BitSet), RequestMaskError> {
+    let put_mask = match mask_for_named_selector(value_desc, request_desc, "putField") {
+        Some(result) => result?,
+        None => request_to_mask(value_desc, request_desc)?,
+    };
+    let get_mask = match mask_for_named_selector(value_desc, request_desc, "getField") {
+        Some(result) => result?,
+        None => request_to_mask(value_desc, request_desc)?,
+    };
+    Ok((put_mask, get_mask))
+}
+
+/// Set every bit of `value_desc` (root + all descendants) — the wildcard
+/// "select the whole structure" mask. pvxs `request2mask` wildcard branch.
+fn select_all_bits(value_desc: &crate::pvdata::FieldDesc) -> crate::proto::BitSet {
+    let mut mask = crate::proto::BitSet::new();
+    let total = value_desc.total_bits();
+    for i in 0..total {
+        mask.set(i);
+    }
+    mask
+}
+
+/// Compute the field mask for a single *named* top-level selector
+/// (`"field"`, `"putField"`, `"getField"`) inside `request_desc`.
+///
+/// Returns `None` when that selector key is absent at the top level, so the
+/// caller can fall back to a more general selector or a wildcard (the pvAccess
+/// `getRequestedStructure` fallback,
+/// modules/pvAccess/testApp/remote/testServer.cpp). Returns `Some(Ok(mask))`
+/// when the selector is present and matches at least one field, and
+/// `Some(Err(EmptyMask))` when it is present but selects nothing usable.
+fn mask_for_named_selector(
+    value_desc: &crate::pvdata::FieldDesc,
+    request_desc: &crate::pvdata::FieldDesc,
+    selector: &str,
+) -> Option<Result<crate::proto::BitSet, RequestMaskError>> {
+    use crate::pvdata::FieldDesc;
     let request_field = match request_desc {
-        FieldDesc::Structure { fields, .. } => fields.iter().find(|(n, _)| n == "field"),
+        FieldDesc::Structure { fields, .. } => fields.iter().find(|(n, _)| n == selector),
         _ => None,
     };
-    let request_field = match request_field {
-        // `field` is a sub-structure → walk its children below. pvxs
-        // `request2mask` (pvrequest.cpp): the `fields.type()==Struct`
-        // branch.
-        Some((_, FieldDesc::Structure { fields, .. })) => fields,
-        // No `field` entry at all (e.g. the standard "empty pvRequest"
-        // the Rust client sends as a 6-byte 0xFD-cached empty struct).
-        // pvxs `else if(!fields.valid()) foundrequested = true` →
-        // wildcard: select the whole structure.
-        None => {
-            let total = value_desc.total_bits();
-            for i in 0..total {
-                mask.set(i);
-            }
-            return Ok(mask);
+    match request_field {
+        // selector is a sub-structure → translate its children. pvxs
+        // `request2mask` (pvrequest.cpp): the `fields.type()==Struct` branch.
+        Some((_, FieldDesc::Structure { fields, .. })) => {
+            Some(mask_from_selector_fields(value_desc, fields))
         }
-        // `field` present but NOT a sub-structure (e.g. a scalar). pvxs's
+        // selector present but NOT a sub-structure (e.g. a scalar). pvxs's
         // trailing `else` leaves `foundrequested == false`, so it throws
-        // "pvRequest must select at least one field". Mirror that as an
-        // error rather than silently widening to a wildcard.
-        Some(_) => return Err(RequestMaskError::EmptyMask),
-    };
+        // "pvRequest must select at least one field". Mirror that as an error
+        // rather than silently widening to a wildcard.
+        Some(_) => Some(Err(RequestMaskError::EmptyMask)),
+        // selector absent → caller falls back.
+        None => None,
+    }
+}
 
-    // Empty `field {}` → all fields set.
-    if request_field.is_empty() {
-        let total = value_desc.total_bits();
-        for i in 0..total {
-            mask.set(i);
-        }
-        return Ok(mask);
+/// Translate the direct children of one pvRequest selector substructure
+/// (`field` / `putField` / `getField`) into a field `BitSet` over
+/// `value_desc`, using pvData spec §5.4 depth-first bit numbering.
+///
+/// An empty selector (`{}`) selects every bit (root + all descendants);
+/// otherwise each named child selects the matching top-level field of
+/// `value_desc` and, recursively, the sub-fields it names. Returns
+/// `Err(EmptyMask)` when no named child matched any existing field.
+fn mask_from_selector_fields(
+    value_desc: &crate::pvdata::FieldDesc,
+    selector_fields: &[(String, crate::pvdata::FieldDesc)],
+) -> Result<crate::proto::BitSet, RequestMaskError> {
+    use crate::pvdata::FieldDesc;
+
+    // Empty `{}` → all fields set.
+    if selector_fields.is_empty() {
+        return Ok(select_all_bits(value_desc));
     }
 
     // Walk each requested top-level name and recursively select bits.
+    let mut mask = crate::proto::BitSet::new();
     let mut any_matched = false;
     if let FieldDesc::Structure { fields, .. } = value_desc {
         let mut child_bit = 1usize;
         for (name, child_desc) in fields {
-            if let Some((_, sub_request)) = request_field.iter().find(|(n, _)| n == name) {
+            if let Some((_, sub_request)) = selector_fields.iter().find(|(n, _)| n == name) {
                 any_matched = true;
                 // Mark this field and recurse.
                 mark_path(&mut mask, child_bit, child_desc, sub_request);
@@ -1727,6 +1795,108 @@ mod tests {
         let mask = request_to_mask(&value, &req_no_field).expect("absent field → wildcard");
         for i in 0..value.total_bits() {
             assert!(mask.get(i), "wildcard must set bit {i}");
+        }
+    }
+
+    #[test]
+    fn put_get_masks_distinct_put_and_get_legs() {
+        // ChannelPutGet negotiates separate putField / getField selections
+        // (pvDatabaseCPP `ChannelPutGetLocal::create`). The put-leg mask and
+        // get-leg mask must reflect their own selector, not collapse to one.
+        use crate::pvdata::ScalarType;
+
+        // value { value: Double (bit 1), aux: Double (bit 2) }
+        let value = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![
+                ("value".to_string(), FieldDesc::Scalar(ScalarType::Double)),
+                ("aux".to_string(), FieldDesc::Scalar(ScalarType::Double)),
+            ],
+        };
+        let leaf = |name: &str| {
+            (
+                name.to_string(),
+                FieldDesc::Structure {
+                    struct_id: String::new(),
+                    fields: Vec::new(),
+                },
+            )
+        };
+        // putField(value), getField(aux)
+        let req = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![
+                (
+                    "putField".to_string(),
+                    FieldDesc::Structure {
+                        struct_id: String::new(),
+                        fields: vec![leaf("value")],
+                    },
+                ),
+                (
+                    "getField".to_string(),
+                    FieldDesc::Structure {
+                        struct_id: String::new(),
+                        fields: vec![leaf("aux")],
+                    },
+                ),
+            ],
+        };
+        let (put_mask, get_mask) = put_get_masks(&value, &req).expect("distinct masks");
+        // put-leg selects `value` (bit 1), not `aux` (bit 2).
+        assert!(put_mask.get(0) && put_mask.get(1) && !put_mask.get(2));
+        // get-leg selects `aux` (bit 2), not `value` (bit 1).
+        assert!(get_mask.get(0) && get_mask.get(2) && !get_mask.get(1));
+    }
+
+    #[test]
+    fn put_get_masks_fallback_to_field_then_wildcard() {
+        // Absent putField/getField → pvAccess `getRequestedStructure`
+        // fallback to the common `field` selector (testServer.cpp), so both
+        // legs collapse to the same mask — back-compat with the NT round
+        // trip. Fully empty pvRequest → both wildcards.
+        use crate::pvdata::ScalarType;
+
+        let value = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![
+                ("value".to_string(), FieldDesc::Scalar(ScalarType::Double)),
+                ("aux".to_string(), FieldDesc::Scalar(ScalarType::Double)),
+            ],
+        };
+
+        // field(value) only — both legs select `value`.
+        let req_field = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![(
+                "field".to_string(),
+                FieldDesc::Structure {
+                    struct_id: String::new(),
+                    fields: vec![(
+                        "value".to_string(),
+                        FieldDesc::Structure {
+                            struct_id: String::new(),
+                            fields: Vec::new(),
+                        },
+                    )],
+                },
+            )],
+        };
+        let (put_mask, get_mask) = put_get_masks(&value, &req_field).expect("field fallback");
+        assert_eq!(
+            put_mask, get_mask,
+            "absent putField/getField → both legs use the `field` selection"
+        );
+        assert!(put_mask.get(0) && put_mask.get(1) && !put_mask.get(2));
+
+        // Empty pvRequest (no field at all) — both legs wildcard.
+        let req_empty = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: Vec::new(),
+        };
+        let (put_mask, get_mask) = put_get_masks(&value, &req_empty).expect("empty → wildcard");
+        for i in 0..value.total_bits() {
+            assert!(put_mask.get(i) && get_mask.get(i), "wildcard bit {i}");
         }
     }
 

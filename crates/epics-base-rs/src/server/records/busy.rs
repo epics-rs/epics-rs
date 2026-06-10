@@ -287,27 +287,27 @@ static FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "RVAL",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: true,
     },
     FieldDesc {
         name: "ORAW",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: true,
     },
     FieldDesc {
         name: "MASK",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: false,
     },
     FieldDesc {
         name: "RBV",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: true,
     },
     FieldDesc {
         name: "ORBV",
-        dbf_type: DbFieldType::Long,
+        dbf_type: DbFieldType::ULong,
         read_only: true,
     },
 ];
@@ -324,9 +324,11 @@ impl Record for BusyRecord {
     /// trait contract (`bo`/`busy`/`mbbo`/`mbboDirect`: RVAL=IVOV,
     /// VAL=IVOV).
     fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
+        // RVAL is DBF_ULONG (boRecord.dbd.pod:252) — carry IVOV as the unsigned
+        // type the field now advertises.
         let rval = match &ivov {
-            EpicsValue::Enum(e) => EpicsValue::Long(*e as i32),
-            EpicsValue::Short(s) => EpicsValue::Long(*s as i32),
+            EpicsValue::Enum(e) => EpicsValue::ULong(*e as u32),
+            EpicsValue::Short(s) => EpicsValue::ULong(*s as u32),
             other => other.clone(),
         };
         self.put_field("RVAL", rval)?;
@@ -421,11 +423,15 @@ impl Record for BusyRecord {
             "OMSL" => Some(EpicsValue::Short(self.omsl.into())),
             "DOL" => Some(EpicsValue::String(self.dol.clone().into())),
             "MLST" => Some(EpicsValue::Enum(self.mlst)),
-            "RVAL" => Some(EpicsValue::Long(self.rval as i32)),
-            "ORAW" => Some(EpicsValue::Long(self.oraw as i32)),
-            "MASK" => Some(EpicsValue::Long(self.mask as i32)),
-            "RBV" => Some(EpicsValue::Long(self.rbv as i32)),
-            "ORBV" => Some(EpicsValue::Long(self.orbv as i32)),
+            // RVAL/ORAW/MASK/RBV/ORBV are DBF_ULONG (boRecord.dbd.pod:252,256,
+            // 261,299,303; busyRecord.dbd:55,59,69,108,112) — serve the native
+            // u32 as the unsigned carrier so a high-bit raw/mask value does not
+            // round-trip through a sign-losing `as i32`.
+            "RVAL" => Some(EpicsValue::ULong(self.rval)),
+            "ORAW" => Some(EpicsValue::ULong(self.oraw)),
+            "MASK" => Some(EpicsValue::ULong(self.mask)),
+            "RBV" => Some(EpicsValue::ULong(self.rbv)),
+            "ORBV" => Some(EpicsValue::ULong(self.orbv)),
             _ => None,
         }
     }
@@ -533,8 +539,12 @@ impl Record for BusyRecord {
                     Err(CaError::TypeMismatch(name.to_string()))
                 }
             }
+            // MASK is DBF_ULONG (boRecord.dbd.pod:261, busyRecord.dbd:69):
+            // accept the native unsigned carrier and tolerate the legacy signed
+            // `Long` (reinterpret preserves the bit pattern for a high-bit mask).
             "MASK" => {
                 self.mask = match value {
+                    EpicsValue::ULong(v) => v,
                     EpicsValue::Long(v) => v as u32,
                     _ => return Err(CaError::TypeMismatch(name.to_string())),
                 };
@@ -545,6 +555,7 @@ impl Record for BusyRecord {
             // (`apply_invalid_output_value`) can drive it directly.
             "RVAL" => {
                 self.rval = match value {
+                    EpicsValue::ULong(v) => v,
                     EpicsValue::Long(v) => v as u32,
                     EpicsValue::Enum(v) => v as u32,
                     EpicsValue::Short(v) => v as u32,
@@ -671,8 +682,40 @@ mod tests {
             Some(EpicsValue::String("some:link".into()))
         );
 
+        // MASK is DBF_ULONG — legacy signed `Long` puts are still accepted,
+        // but the field reads back as the unsigned carrier.
         rec.put_field("MASK", EpicsValue::Long(0xFF)).unwrap();
-        assert_eq!(rec.get_field("MASK"), Some(EpicsValue::Long(0xFF)));
+        assert_eq!(rec.get_field("MASK"), Some(EpicsValue::ULong(0xFF)));
+    }
+
+    /// RVAL/ORAW/MASK/RBV/ORBV are DBF_ULONG (boRecord.dbd.pod:252-303,
+    /// busyRecord.dbd:55-112): a high-bit raw/mask value must round-trip
+    /// through the unsigned carrier without the sign loss the old
+    /// `Long(x as i32)`/`x as i32` serving caused.
+    #[test]
+    fn test_ulong_raw_fields_high_bit_roundtrip() {
+        let mut rec = BusyRecord::new();
+        let hi: u32 = 0x8000_0001;
+
+        // Native unsigned carrier put for the writable fields.
+        rec.put_field("MASK", EpicsValue::ULong(hi)).unwrap();
+        assert_eq!(rec.get_field("MASK"), Some(EpicsValue::ULong(hi)));
+        rec.put_field("RVAL", EpicsValue::ULong(hi)).unwrap();
+        assert_eq!(rec.get_field("RVAL"), Some(EpicsValue::ULong(hi)));
+
+        // Read-only raw fields serve the unsigned carrier verbatim.
+        rec.oraw = hi;
+        rec.rbv = hi;
+        rec.orbv = hi;
+        assert_eq!(rec.get_field("ORAW"), Some(EpicsValue::ULong(hi)));
+        assert_eq!(rec.get_field("RBV"), Some(EpicsValue::ULong(hi)));
+        assert_eq!(rec.get_field("ORBV"), Some(EpicsValue::ULong(hi)));
+
+        // The advertised dbf type is unsigned for the whole raw family.
+        for name in ["RVAL", "ORAW", "MASK", "RBV", "ORBV"] {
+            let desc = FIELDS.iter().find(|f| f.name == name).unwrap();
+            assert_eq!(desc.dbf_type, DbFieldType::ULong, "{name} dbf_type");
+        }
     }
 
     #[test]

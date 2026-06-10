@@ -52,7 +52,8 @@ fn test_state_transition_full_cycle() {
     assert_eq!(rec.val, 1);
     rec.process().unwrap();
     assert_eq!(rec.oval, 1);
-    assert_eq!(rec.get_field("RVAL"), Some(EpicsValue::Long(1)));
+    // RVAL is DBF_ULONG (boRecord.dbd.pod:252) — served as the unsigned carrier.
+    assert_eq!(rec.get_field("RVAL"), Some(EpicsValue::ULong(1)));
 
     // Stay busy — FLNK suppressed
     rec.process().unwrap();
@@ -63,5 +64,5 @@ fn test_state_transition_full_cycle() {
     rec.process().unwrap();
     assert_eq!(rec.oval, 0);
     assert!(rec.should_fire_forward_link()); // val=0
-    assert_eq!(rec.get_field("RVAL"), Some(EpicsValue::Long(0)));
+    assert_eq!(rec.get_field("RVAL"), Some(EpicsValue::ULong(0)));
 }

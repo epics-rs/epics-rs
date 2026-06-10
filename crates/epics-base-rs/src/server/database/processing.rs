@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{CaError, CaResult};
 use crate::runtime::sync::RwLock;
@@ -7,6 +8,80 @@ use crate::server::record::{NotifyWaitSet, RecordInstance};
 use crate::types::EpicsValue;
 
 use super::{PvDatabase, apply_timestamp};
+
+/// A cancellable, generation-gated handle that re-enters an async record's
+/// `process()` exactly once.
+///
+/// C parity: epics-base `callbackRequest` / `callbackRequestDelayed`
+/// (`callback.c`) post a one-shot callback that later runs the record's
+/// `(*prset->process)(precord)` directly, bypassing `dbProcess`'s PACT
+/// entry guard. Here, firing the token re-enters via
+/// [`PvDatabase::process_record_continuation`] (the owner-driven
+/// continuation that also bypasses the PACT guard).
+///
+/// # Cancellation is structural, not a runtime check
+///
+/// The record owns a monotonic generation counter (`reprocess_generation`).
+/// Minting a token snapshots that counter as the token's `epoch` *after*
+/// bumping it, so:
+///
+/// - minting a newer token for the same record (C `callbackRequestDelayed`
+///   replacing an outstanding delayed callback), or
+/// - [`PvDatabase::cancel_async_reentry`] (C `callbackCancelDelayed`),
+///
+/// each advance the counter past every outstanding token's `epoch`. A
+/// stale token therefore re-enters *nothing*: [`AsyncToken::fire`] is the
+/// sole re-entry path, the epoch comparison is owned in one place, and the
+/// token is consumed (`self` by value) so it cannot fire twice. A consumer
+/// never writes an `if generation == ...` guard — it holds the token and
+/// calls `fire`; the no-op-when-stale is guaranteed by construction.
+pub struct AsyncToken {
+    /// Canonical record name to re-enter.
+    name: String,
+    /// Shared generation counter owned by the record
+    /// (`RecordInstance::reprocess_generation`).
+    generation: Arc<AtomicU64>,
+    /// Generation value captured at mint time. The token is current iff
+    /// `generation == epoch`.
+    epoch: u64,
+}
+
+impl AsyncToken {
+    /// The record this token re-enters.
+    pub fn record_name(&self) -> &str {
+        &self.name
+    }
+
+    /// True iff this token is still the current generation — no newer
+    /// token was minted and no [`PvDatabase::cancel_async_reentry`] has
+    /// run for the record since this token was minted. Read-only.
+    pub fn is_current(&self) -> bool {
+        self.generation.load(Ordering::Acquire) == self.epoch
+    }
+
+    /// Cancel this token (C `callbackCancelDelayed` for the holder's own
+    /// pending re-entry): advance the generation so this and any other
+    /// outstanding token for the record become stale, then consume the
+    /// token. Use when the holder itself decides not to re-enter; use
+    /// [`PvDatabase::cancel_async_reentry`] to cancel a token already
+    /// handed to a timer / notify task.
+    pub fn cancel(self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Fire the continuation: if still current, re-enter the record's
+    /// `process()` via [`PvDatabase::process_record_continuation`]. A
+    /// stale (superseded / cancelled) token is a no-op. Consumes the
+    /// token so it cannot fire twice.
+    pub async fn fire(self, db: &PvDatabase) -> CaResult<()> {
+        if self.generation.load(Ordering::Acquire) != self.epoch {
+            return Ok(());
+        }
+        let mut visited = HashSet::new();
+        db.process_record_continuation(&self.name, &mut visited, 0)
+            .await
+    }
+}
 
 /// C `dbNotifyAdd`: a will-process PP target (FLNK / OUT) joins the active
 /// put-notify wait-set exactly once, so the completion waits for it. Called
@@ -243,6 +318,124 @@ impl PvDatabase {
         Box::pin(async move {
             self.process_record_with_links_inner(name, visited, depth, true, true)
                 .await
+        })
+    }
+
+    /// Mint a fresh async re-entry [`AsyncToken`] for `name`.
+    ///
+    /// Minting advances the record's generation counter, so any
+    /// previously-minted token for the same record is superseded — its
+    /// [`AsyncToken::fire`] becomes a structural no-op. This mirrors C
+    /// `callbackRequestDelayed` replacing an outstanding delayed callback
+    /// for a record. `name` must be the canonical record name (the value
+    /// of `RecordInstance::name`). Returns `None` if the record is absent.
+    pub async fn mint_async_token(&self, name: &str) -> Option<AsyncToken> {
+        let records = self.inner.records.read().await;
+        let rec = records.get(name)?;
+        let generation = rec.read().await.reprocess_generation.clone();
+        let epoch = generation.fetch_add(1, Ordering::AcqRel) + 1;
+        Some(AsyncToken {
+            name: name.to_string(),
+            generation,
+            epoch,
+        })
+    }
+
+    /// Cancel any outstanding async re-entry token for `name` (C
+    /// `callbackCancelDelayed`): advance the record's generation counter so
+    /// every previously-minted [`AsyncToken`] for it becomes stale and its
+    /// `fire` is a no-op. A subsequent [`Self::mint_async_token`] produces a
+    /// fresh, current token. No-op if the record is absent.
+    pub async fn cancel_async_reentry(&self, name: &str) {
+        let records = self.inner.records.read().await;
+        if let Some(rec) = records.get(name) {
+            rec.read()
+                .await
+                .reprocess_generation
+                .fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Post an async-side field update for `name` — the C `db_post_events`
+    /// analogue called from device-support / async-callback context.
+    ///
+    /// Each `(field, value)` is written through the internal put (bypassing
+    /// the read-only field gate, like a record's own `process()` writes)
+    /// and a monitor event is posted with `DBE_VALUE | DBE_LOG` — the mask C
+    /// device support uses for an out-of-process value post
+    /// (`db_post_events(precord, &prec->field, DBE_VALUE | DBE_LOG)`).
+    /// Metadata-class writes invalidate the metadata cache via
+    /// `notify_field_written`, honouring the snapshot-cache contract.
+    ///
+    /// Unlike [`Self::complete_async_record`], this runs *no* alarm /
+    /// timestamp / FLNK tail: it is the immediate "push these fields to
+    /// monitors now" primitive (e.g. asyn TRACE info, motor intermediate
+    /// readback) that is independent of any process cycle. Returns the
+    /// field names actually posted, or [`CaError::ChannelNotFound`] if the
+    /// record is absent.
+    pub async fn post_fields(
+        &self,
+        name: &str,
+        fields: Vec<(String, EpicsValue)>,
+    ) -> CaResult<Vec<String>> {
+        let rec = {
+            let records = self.inner.records.read().await;
+            records.get(name).cloned()
+        };
+        let rec = rec.ok_or_else(|| CaError::ChannelNotFound(name.to_string()))?;
+        let mut inst = rec.write().await;
+        let mut posted = Vec::with_capacity(fields.len());
+        for (field, value) in fields {
+            inst.record.put_field_internal(&field, value)?;
+            // Snapshot-cache contract: a metadata-class write must
+            // invalidate the cache before the monitor snapshot is built.
+            inst.notify_field_written(&field);
+            inst.notify_field(
+                &field,
+                crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
+            );
+            posted.push(field);
+        }
+        Ok(posted)
+    }
+
+    /// Create a put-notify wait-set for a downstream operation a record is
+    /// about to drive, returning the wait-set (to attach to the downstream
+    /// target instance's `notify`) and the completion receiver.
+    ///
+    /// C `dbNotify.c` `processNotify`: the set arms `pending = 1` for the
+    /// downstream operation and fires the oneshot when that slot (plus any
+    /// FLNK/OUT chain members that `enter` it) drains to zero — i.e. on
+    /// `dbNotifyCompletion`. Pair with [`Self::reprocess_on_notify`] to
+    /// re-enter a waiting record when the downstream completes (SSEQ
+    /// `WAITn`).
+    pub fn new_put_notify() -> (
+        Arc<NotifyWaitSet>,
+        crate::runtime::sync::oneshot::Receiver<()>,
+    ) {
+        let (tx, rx) = crate::runtime::sync::oneshot::channel();
+        (NotifyWaitSet::new(tx), rx)
+    }
+
+    /// Wire a downstream put-notify completion to an async re-entry: spawn a
+    /// task that awaits `completion` (the oneshot from
+    /// [`Self::new_put_notify`], fired on `dbNotifyCompletion`) and then
+    /// `token.fire`s, re-entering the waiting record's `process()`. A
+    /// superseded / cancelled token re-enters nothing. Returns the spawned
+    /// task handle; fire-and-forget callers may drop it.
+    pub fn reprocess_on_notify(
+        &self,
+        token: AsyncToken,
+        completion: crate::runtime::sync::oneshot::Receiver<()>,
+    ) -> tokio::task::JoinHandle<()> {
+        let db = self.clone();
+        tokio::spawn(async move {
+            // `Err` means the sender was dropped without firing (the
+            // downstream op vanished); treat it the same as completion so a
+            // waiting record is never stranded — `fire` is a no-op if the
+            // token was meanwhile superseded.
+            let _ = completion.await;
+            let _ = token.fire(&db).await;
         })
     }
 
@@ -2267,37 +2460,24 @@ impl PvDatabase {
                     }
                 }
                 ProcessAction::ReprocessAfter(delay) => {
-                    // Use generation counter for timer cancellation.
-                    // Bump generation now; the spawned task only fires if
-                    // the generation hasn't been bumped again (i.e., no newer
-                    // timer replaced this one).
-                    let (gen_counter, gen_val) = {
-                        let instance = rec.read().await;
-                        let val = instance
-                            .reprocess_generation
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                            + 1;
-                        (instance.reprocess_generation.clone(), val)
+                    // Owner-driven delayed re-entry, mirroring C
+                    // `callbackRequestDelayed` dispatching to
+                    // `(*prset->process)(prec)` directly (callback.c). Mint
+                    // a fresh token — which advances the record's generation
+                    // and so supersedes any prior pending re-entry for this
+                    // record (a newer ReprocessAfter replaces the older
+                    // timer) — then fire it after the delay. A newer mint or
+                    // an explicit `cancel_async_reentry` makes this fire a
+                    // structural no-op: the gate lives entirely in
+                    // `AsyncToken`, not in an inline generation compare here.
+                    let token = match self.mint_async_token(record_name).await {
+                        Some(t) => t,
+                        None => continue,
                     };
                     let db = self.clone();
-                    let rec_name = record_name.to_string();
                     tokio::spawn(async move {
                         tokio::time::sleep(delay).await;
-                        // Only fire if no newer timer has been scheduled
-                        let current = gen_counter.load(std::sync::atomic::Ordering::Relaxed);
-                        if current == gen_val {
-                            let mut visited = HashSet::new();
-                            // Owner-driven continuation: bypass the PACT
-                            // entry guard so the timer fire reaches the
-                            // record's process() (which advances the
-                            // async state machine — e.g. scaler DLY
-                            // expiry, calc AFTC). Mirrors C
-                            // `callbackRequestDelayed` dispatching to
-                            // `(*prset->process)(prec)` directly.
-                            let _ = db
-                                .process_record_continuation(&rec_name, &mut visited, 0)
-                                .await;
-                        }
+                        let _ = token.fire(&db).await;
                     });
                 }
             }

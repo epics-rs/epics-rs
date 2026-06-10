@@ -10,6 +10,7 @@ mod scan_index;
 pub use link_set::{
     DynLinkSet, LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, LinkSetRegistry, RemoteAlarm,
 };
+pub use processing::AsyncToken;
 pub use record_lock::{ManyRecordWriteGuard, RecordWriteGuard};
 
 use crate::error::{CaError, CaResult};

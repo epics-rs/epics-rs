@@ -179,6 +179,21 @@ impl AsyncDbHandle {
         self.db()
             .map(|db| db.reprocess_on_notify(token, completion))
     }
+
+    /// Issue a non-blocking put-with-completion to an OUT link — see
+    /// [`PvDatabase::put_link_notify`]. `None` if the database is gone or
+    /// the source record is missing.
+    pub async fn put_link_notify(
+        &self,
+        record_name: &str,
+        link_str: &str,
+        value: EpicsValue,
+    ) -> Option<crate::runtime::sync::oneshot::Receiver<()>> {
+        match self.db() {
+            Some(db) => db.put_link_notify(record_name, link_str, value).await,
+            None => None,
+        }
+    }
 }
 
 /// C `dbNotifyAdd`: a will-process PP target (FLNK / OUT) joins the active
@@ -577,6 +592,78 @@ impl PvDatabase {
             let _ = completion.await;
             let _ = token.fire(&db).await;
         })
+    }
+
+    /// Issue a put-WITH-completion to an OUT link and hand the caller only
+    /// the completion receiver — the non-blocking sibling of
+    /// [`Self::reprocess_on_notify`].
+    ///
+    /// Each call mints its own put-notify wait-set (C `dbProcessNotify`),
+    /// writes the link through it with the source record's committed PUTF /
+    /// alarm propagated (C `recGblInheritSevrMsg`), releases the initiator
+    /// count, and returns the oneshot that fires on `dbNotifyCompletion`.
+    /// The caller owns when (and whether) to await each receiver, so several
+    /// puts can be outstanding at once — unlike
+    /// [`ProcessAction::WriteDbLinkNotify`], which wires the completion
+    /// straight to a single superseding async re-entry token and so allows
+    /// only one outstanding put per record. This is the seam C
+    /// `calcApp/src/sseqRecord.c` needs to run multiple `WAITn` put-callbacks
+    /// concurrently in flight (`processNextLink`).
+    ///
+    /// `record_name` is the source whose PUTF/alarm propagate into the
+    /// target, `link_str` the already-resolved OUT link spelling, `value`
+    /// the value to write. `None` if the source record is gone; an empty
+    /// `link_str` returns a receiver that fires immediately (nothing joined
+    /// the set).
+    pub async fn put_link_notify(
+        &self,
+        record_name: &str,
+        link_str: &str,
+        value: EpicsValue,
+    ) -> Option<crate::runtime::sync::oneshot::Receiver<()>> {
+        let (src_putf, src_alarm) = {
+            let rec = {
+                let records = self.inner.records.read().await;
+                records.get(record_name)?.clone()
+            };
+            let instance = rec.read().await;
+            (
+                instance.common.putf,
+                super::links::LinkAlarm {
+                    stat: instance.common.stat,
+                    sevr: instance.common.sevr,
+                    amsg: instance.common.amsg.clone(),
+                },
+            )
+        };
+        let (waitset, completion) = Self::new_put_notify();
+        if !link_str.is_empty() {
+            let parsed = crate::server::record::parse_link_v2(link_str);
+            // Seed the cycle-guard with the source so a target linking back
+            // does not re-process it, exactly as a top-level OUT-link write
+            // does (`process_record_with_links_inner` inserts its own name).
+            let mut visited = HashSet::new();
+            visited.insert(record_name.to_string());
+            self.write_out_link_value(
+                &parsed,
+                value,
+                super::links::OutLinkSrc {
+                    putf: src_putf,
+                    notify: Some(&waitset),
+                    alarm: &src_alarm,
+                },
+                &mut visited,
+                0,
+            )
+            .await;
+        }
+        // Release the initiator's own count (C `dbProcessNotify` holds one
+        // count for the requester and drops it after issuing the put). The
+        // set then drains — firing `completion` — when the downstream
+        // target(s) that joined via `join_put_notify` finish, or immediately
+        // when the link was empty / the target completed synchronously.
+        waitset.leave();
+        Some(completion)
     }
 
     async fn process_record_with_links_inner(

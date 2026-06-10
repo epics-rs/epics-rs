@@ -4,6 +4,7 @@ pub use registry::{
     register_port,
 };
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -1431,9 +1432,12 @@ impl AsynRecord {
     /// carries a database handle (`async_ctx`) and a runtime is available, the
     /// callback recomputes the trace readback fields from the trace manager
     /// and `post_fields`-es them now (the C `db_post_events` under
-    /// `dbScanLock`). With no handle / runtime — e.g. a record connected
-    /// outside a database — it falls back to raising a dirty flag that
-    /// `process()` drains through the single `read_trace_state` owner.
+    /// `dbScanLock`). Like C `POST_IF_NEW` (asynRecord.c:210-214) it keeps a
+    /// last-posted cache and posts only the fields whose value changed, so an
+    /// unrelated `setTrace*` does not re-post unchanged readback fields. With
+    /// no handle / runtime — e.g. a record connected outside a database — it
+    /// falls back to raising a dirty flag that `process()` drains through the
+    /// single `read_trace_state` owner.
     fn register_trace_exception_callback(&mut self) {
         self.clear_trace_exception_callback();
         let Some(ref entry) = self.port_entry else {
@@ -1458,6 +1462,23 @@ impl AsynRecord {
             (Some((name, db)), Some(handle)) => Some((name, db, handle)),
             _ => None,
         };
+        // C `monitorStatus` posts a trace readback field only when it differs
+        // from the per-record remembered value (`POST_IF_NEW`,
+        // asynRecord.c:210-214,1102-1117). The base `post_fields` path posts
+        // unconditionally, so the out-of-band re-post keeps its own last-posted
+        // cache — the asynRecord `old` analogue — to avoid re-posting unchanged
+        // trace fields on every `setTrace*`. Seed it with the current values
+        // (the C `old` after the connect-path `monitorStatus`) so the first
+        // external change posts only the fields that actually changed.
+        let last_posted: Arc<Mutex<HashMap<String, EpicsValue>>> = Arc::new(Mutex::new(
+            trace_readback_fields(
+                trace.get_trace_mask(Some(&port)).bits(),
+                trace.get_trace_io_mask(Some(&port)).bits(),
+                trace.get_trace_info_mask(Some(&port)).bits(),
+            )
+            .into_iter()
+            .collect(),
+        ));
         let id = mgr.add_callback(move |ev| {
             // Only the trace masks `monitorStatus` recomputes matter here; the
             // announce for a port-level `setTrace*` carries the port name
@@ -1476,15 +1497,32 @@ impl AsynRecord {
                 Some((name, db, handle)) => {
                     // Recompute the current trace readback fields and post them
                     // out of band now — the C `exceptCallback` → `monitorStatus`
-                    // immediate re-post (asynRecord.c:1102-1117).
-                    let fields = trace_readback_fields(
-                        trace.get_trace_mask(Some(&port)).bits(),
-                        trace.get_trace_io_mask(Some(&port)).bits(),
-                        trace.get_trace_info_mask(Some(&port)).bits(),
-                    );
+                    // immediate re-post (asynRecord.c:1102-1117). Mirror C
+                    // `POST_IF_NEW` (asynRecord.c:210-214): post only the fields
+                    // whose value changed since the last out-of-band post and
+                    // remember the new values, so an unchanged trace field is
+                    // not re-posted.
+                    let changed: Vec<(String, EpicsValue)> = {
+                        let mut cache = last_posted.lock().unwrap();
+                        let mut changed = Vec::new();
+                        for (field, value) in trace_readback_fields(
+                            trace.get_trace_mask(Some(&port)).bits(),
+                            trace.get_trace_io_mask(Some(&port)).bits(),
+                            trace.get_trace_info_mask(Some(&port)).bits(),
+                        ) {
+                            if cache.get(&field) != Some(&value) {
+                                cache.insert(field.clone(), value.clone());
+                                changed.push((field, value));
+                            }
+                        }
+                        changed
+                    };
+                    if changed.is_empty() {
+                        return;
+                    }
                     let (name, db) = (name.clone(), db.clone());
                     handle.spawn(async move {
-                        let _ = db.post_fields(&name, fields).await;
+                        let _ = db.post_fields(&name, changed).await;
                     });
                 }
                 None => {
@@ -3606,6 +3644,112 @@ mod tests {
             g.record.get_field("TB1"),
             Some(EpicsValue::Short(0)),
             "IO_DEVICE bit stays clear"
+        );
+    }
+
+    /// Boundary: the out-of-band trace post mirrors C `POST_IF_NEW`
+    /// (asynRecord.c:210-214,1102-1117) — `monitorStatus` posts a readback
+    /// field only when its value differs from the remembered value. An
+    /// `asynSetTraceIOMask` exception recomputes ALL trace readback fields, but
+    /// only the IO fields changed, so the unchanged `TMSK` must NOT be
+    /// re-posted to its monitor (the base `post_fields` path posts
+    /// unconditionally, so the dedup lives in the record's last-posted cache).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unchanged_trace_field_is_not_reposted() {
+        use crate::exception::ExceptionManager;
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::trace::{TraceIoMask, TraceManager};
+        use epics_base_rs::server::database::PvDatabase;
+        use epics_base_rs::server::database::db_access::DbSubscription;
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        struct TraceDriver(PortDriverBase);
+        impl PortDriver for TraceDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+
+        let port_name = "test_trace_post_if_new";
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(
+            Box::new(TraceDriver(PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags::default(),
+            ))),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), Arc::new(InterruptManager::new(256)));
+
+        let trace = Arc::new(TraceManager::new());
+        trace.set_exception_sink(Arc::new(ExceptionManager::new()));
+        // Baseline masks BEFORE connect so the callback seeds its last-posted
+        // cache with these values (the C `old` after the connect-path
+        // `monitorStatus`): TMSK = ERROR, all IO bits clear.
+        trace.set_trace_mask(Some(port_name), TraceMask::ERROR);
+        trace.set_trace_io_mask(Some(port_name), TraceIoMask::empty());
+        super::registry::register_port(port_name, handle, trace.clone());
+
+        let db = PvDatabase::new();
+        let rec_name = "TRACE_POSTIFNEW_REC";
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.set_async_context(rec_name.to_string(), db.async_handle());
+        rec.connect_device();
+        assert_eq!(rec.cnct, 1, "record must connect to the registered port");
+        db.add_record(rec_name, Box::new(rec)).await.unwrap();
+
+        let mut tmsk_sub = DbSubscription::subscribe(&db, &format!("{rec_name}.TMSK"))
+            .await
+            .expect("subscribe TMSK");
+        let mut tiom_sub = DbSubscription::subscribe(&db, &format!("{rec_name}.TIOM"))
+            .await
+            .expect("subscribe TIOM");
+
+        // Positive control: a trace-mask change DOES post the changed TMSK.
+        let new_tmsk = TraceMask::ERROR | TraceMask::FLOW;
+        {
+            let (tm, pn) = (trace.clone(), port_name.to_string());
+            std::thread::spawn(move || tm.set_trace_mask(Some(&pn), new_tmsk))
+                .join()
+                .unwrap();
+        }
+        assert_eq!(
+            tmsk_sub.recv().await,
+            Some(EpicsValue::Long(new_tmsk.bits() as i32)),
+            "a changed TMSK is posted to its monitor"
+        );
+
+        // The dedup case: change ONLY the IO mask. The callback recomputes all
+        // trace fields but TMSK is unchanged, so only the IO fields post.
+        {
+            let (tm, pn) = (trace.clone(), port_name.to_string());
+            std::thread::spawn(move || tm.set_trace_io_mask(Some(&pn), TraceIoMask::ASCII))
+                .join()
+                .unwrap();
+        }
+        // The changed IO field IS posted — this also synchronises the post
+        // task. `trace_readback_fields` orders TMSK (index 0) before TIOM
+        // (index 7) in the same `post_fields` call, so once the TIOM event
+        // arrives a non-deduped TMSK duplicate would already be queued.
+        assert_eq!(
+            tiom_sub.recv().await,
+            Some(EpicsValue::Long(TraceIoMask::ASCII.bits() as i32)),
+            "a changed TIOM is posted to its monitor"
+        );
+        // The unchanged TMSK must NOT have been re-posted.
+        let reposted = tokio::time::timeout(Duration::from_millis(500), tmsk_sub.recv()).await;
+        assert!(
+            reposted.is_err(),
+            "unchanged TMSK must not be re-posted on an IO-mask-only change, got {reposted:?}"
         );
     }
 }

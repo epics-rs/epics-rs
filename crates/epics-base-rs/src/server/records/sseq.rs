@@ -1143,8 +1143,17 @@ impl Record for SseqRecord {
                     let dov = other
                         .to_f64()
                         .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
+                    // C `processCallback` numeric arm: after reading `dov` it
+                    // runs `cvtDoubleToString(dov, str, prec)` and copies the
+                    // formatted value back into `s`/`STRn`, posting it when it
+                    // changed (sseqRecord.c:676-679). Mirror that so a numeric
+                    // `DOLn` refreshes `STRn` with the record-PREC rendering of
+                    // the value rather than leaving the prior string stale.
+                    let prec = self.prec.max(0) as u16;
+                    let s = crate::types::cvt_double_to_string(dov, prec);
                     let step = &mut self.steps[idx];
                     step.dov = dov;
+                    step.str_val = PvString::from(s);
                     step.dol_kind = DolKind::Numeric;
                     return Ok(());
                 }

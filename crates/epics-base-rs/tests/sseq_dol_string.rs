@@ -129,3 +129,45 @@ async fn sseq_numeric_dol_forwards_double_unchanged() {
         "numeric DOL must forward the Double unchanged; got {got:?}"
     );
 }
+
+/// After a numeric `DOLn` read, C makes `s`/`STRn` agree with `dov` via
+/// `cvtDoubleToString(dov, str, prec)` and posts it (sseqRecord.c:676-679). A
+/// client GET of `STRn` must return the record-PREC rendering of the numeric
+/// value, not the stale string left over from before the read.
+#[tokio::test]
+async fn sseq_numeric_dol_refreshes_strn_with_prec() {
+    let db = PvDatabase::new();
+
+    db.add_record("SSEQ_STRN_SRC", Box::new(AoRecord::new(42.5)))
+        .await
+        .unwrap();
+    db.add_record("SSEQ_STRN_DST", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let mut sseq = SseqRecord::new();
+    sseq.put_field("SELM", EpicsValue::Short(0)).unwrap(); // All
+    sseq.put_field("PREC", EpicsValue::Short(3)).unwrap();
+    sseq.put_field("DOL1", EpicsValue::String("SSEQ_STRN_SRC.VAL".into()))
+        .unwrap();
+    sseq.put_field("LNK1", EpicsValue::String("SSEQ_STRN_DST".into()))
+        .unwrap();
+    db.add_record("SSEQ_STRN", Box::new(sseq)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SSEQ_STRN", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // The LNK write lands AFTER the DOL read in the same Fire cycle, so once
+    // the forward reaches DST the numeric DOL read (and STRn refresh) is done.
+    let _ = poll_field(&db, "SSEQ_STRN_DST", "VAL", "numeric DOL → numeric LNK").await;
+
+    let rec = db.get_record("SSEQ_STRN").await.unwrap();
+    let str1 = rec.read().await.record.get_field("STR1");
+    assert_eq!(
+        str1,
+        Some(EpicsValue::String("42.500".into())),
+        "numeric DOL must refresh STR1 with the PREC=3 rendering of 42.5; got {str1:?}"
+    );
+}

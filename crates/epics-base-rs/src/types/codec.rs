@@ -139,7 +139,13 @@ fn enum_label(snapshot: &crate::server::snapshot::Snapshot, idx: u16) -> PvStrin
 }
 
 /// Port of libCom `cvtDoubleToString` (cvtFast.c:111-190).
-fn cvt_double_to_string(val: f64, precision: u16) -> String {
+///
+/// `pub(crate)` so records that mirror C's `cvtDoubleToString(value, str,
+/// prec)` (e.g. `sseq` refreshing `STRn` from a numeric `DOLn`,
+/// sseqRecord.c:676) format through the exact same converter the DBR-string
+/// wire encoder uses, instead of a divergent `format!` that rounds
+/// differently.
+pub(crate) fn cvt_double_to_string(val: f64, precision: u16) -> String {
     if val.is_nan() || precision > 8 || val > 1e7 || val < -1e7 {
         if precision > 8 || val > 1e16 || val < -1e16 {
             let p = precision.min(17) as usize;

@@ -114,9 +114,9 @@ fn convert_value_to_dbr_string(
         // C `getEnumString` (dbConvert.c, `[DBF_ENUM][DBR_STRING]`)
         // returns the state LABEL via `get_enum_str`, not the index. Map each
         // index to `snapshot.enums.strings[idx]`; see `enum_label`.
-        EpicsValue::Enum(v) => EpicsValue::String(enum_label(snapshot, *v).into()),
+        EpicsValue::Enum(v) => EpicsValue::String(enum_label(snapshot, *v)),
         EpicsValue::EnumArray(a) => {
-            EpicsValue::StringArray(a.iter().map(|v| enum_label(snapshot, *v).into()).collect())
+            EpicsValue::StringArray(a.iter().map(|v| enum_label(snapshot, *v)).collect())
         }
         other => other.convert_to(DbFieldType::String),
     }
@@ -129,13 +129,13 @@ fn convert_value_to_dbr_string(
 /// out-of-range sentinel (`"Illegal_Value"` / `"Illegal Value"`) is not
 /// reproducible without the record type, and a record's VAL is always a
 /// defined state in normal operation.
-fn enum_label(snapshot: &crate::server::snapshot::Snapshot, idx: u16) -> String {
+fn enum_label(snapshot: &crate::server::snapshot::Snapshot, idx: u16) -> PvString {
     snapshot
         .enums
         .as_ref()
         .and_then(|e| e.strings.get(idx as usize))
         .cloned()
-        .unwrap_or_else(|| idx.to_string())
+        .unwrap_or_else(|| PvString::from(idx.to_string()))
 }
 
 /// Port of libCom `cvtDoubleToString` (cvtFast.c:111-190).
@@ -845,12 +845,6 @@ fn read_f64(data: &[u8], off: usize) -> CaResult<f64> {
 /// ASCII-grammar identifiers, not arbitrary wire values — lossy decoding is
 /// the documented policy for labels. For string **values** use
 /// [`read_pv_string`], which preserves the raw bytes.
-fn read_string(data: &[u8], off: usize, max_len: usize) -> String {
-    read_pv_string(data, off, max_len)
-        .as_str_lossy()
-        .into_owned()
-}
-
 /// Decode a NUL-terminated fixed-width CA string field into a byte-preserving
 /// [`PvString`]. CA `DBR_STRING` slots are historically Latin-1 / arbitrary
 /// bytes; preserving them verbatim (no UTF-8 validation) matches pvxs and
@@ -1009,7 +1003,7 @@ fn decode_gr_ctrl(
         DbFieldType::Float => {
             let precision = read_i16(data, off)?;
             off += 4; // precision(2) + pad(2)
-            let units = read_string(data, off, MAX_UNITS_SIZE);
+            let units = read_pv_string(data, off, MAX_UNITS_SIZE);
             off += MAX_UNITS_SIZE;
             let n_limits = if ctrl { 8 } else { 6 };
             let mut limits = [0.0f64; 8];
@@ -1038,7 +1032,7 @@ fn decode_gr_ctrl(
         DbFieldType::Double => {
             let precision = read_i16(data, off)?;
             off += 4; // precision(2) + pad(2)
-            let units = read_string(data, off, MAX_UNITS_SIZE);
+            let units = read_pv_string(data, off, MAX_UNITS_SIZE);
             off += MAX_UNITS_SIZE;
             let n_limits = if ctrl { 8 } else { 6 };
             let mut limits = [0.0f64; 8];
@@ -1065,7 +1059,7 @@ fn decode_gr_ctrl(
             }
         }
         DbFieldType::Short => {
-            let units = read_string(data, off, MAX_UNITS_SIZE);
+            let units = read_pv_string(data, off, MAX_UNITS_SIZE);
             off += MAX_UNITS_SIZE;
             let n_limits = if ctrl { 8 } else { 6 };
             let mut limits = [0.0f64; 8];
@@ -1093,7 +1087,7 @@ fn decode_gr_ctrl(
         }
         // DBF_USHORT promotes to DBR_LONG; decode with the Long GR/CTRL layout.
         DbFieldType::Long | DbFieldType::UShort => {
-            let units = read_string(data, off, MAX_UNITS_SIZE);
+            let units = read_pv_string(data, off, MAX_UNITS_SIZE);
             off += MAX_UNITS_SIZE;
             let n_limits = if ctrl { 8 } else { 6 };
             let mut limits = [0.0f64; 8];
@@ -1120,7 +1114,7 @@ fn decode_gr_ctrl(
             }
         }
         DbFieldType::Char => {
-            let units = read_string(data, off, MAX_UNITS_SIZE);
+            let units = read_pv_string(data, off, MAX_UNITS_SIZE);
             off += MAX_UNITS_SIZE;
             let n_limits = if ctrl { 8 } else { 6 };
             let mut limits = [0.0f64; 8];
@@ -1159,7 +1153,7 @@ fn decode_gr_ctrl(
         DbFieldType::Int64 | DbFieldType::UInt64 | DbFieldType::ULong => {
             let precision = read_i16(data, off)?;
             off += 4; // precision(2) + pad(2)
-            let units = read_string(data, off, MAX_UNITS_SIZE);
+            let units = read_pv_string(data, off, MAX_UNITS_SIZE);
             off += MAX_UNITS_SIZE;
             let n_limits = if ctrl { 8 } else { 6 };
             let mut limits = [0.0f64; 8];
@@ -1200,7 +1194,7 @@ fn decode_enum_metadata(data: &[u8], off: usize) -> CaResult<(EnumInfo, usize)> 
     let mut pos = off + 2;
     let mut strings = Vec::with_capacity(no_str.min(MAX_ENUM_STATES));
     for i in 0..MAX_ENUM_STATES {
-        let s = read_string(data, pos, MAX_ENUM_STRING_SIZE);
+        let s = read_pv_string(data, pos, MAX_ENUM_STRING_SIZE);
         if i < no_str {
             strings.push(s);
         }
@@ -1532,7 +1526,7 @@ mod r58_enum_label_tests {
     fn snap_with_enum(value: EpicsValue, labels: &[&str]) -> Snapshot {
         let mut s = Snapshot::new(value, 0, 0, SystemTime::UNIX_EPOCH);
         s.enums = Some(EnumInfo {
-            strings: labels.iter().map(|x| x.to_string()).collect(),
+            strings: labels.iter().map(|x| (*x).into()).collect(),
         });
         s
     }

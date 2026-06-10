@@ -305,7 +305,7 @@ pub fn snapshot_to_nt_enum(snapshot: &Snapshot) -> PvStructure {
         .map(|e| {
             e.strings
                 .iter()
-                .map(|s| ScalarValue::String(s.clone().into()))
+                .map(|s| ScalarValue::String(s.clone()))
                 .collect()
         })
         .unwrap_or_default();
@@ -820,7 +820,7 @@ fn build_display(disp: &DisplayInfo, scalar_type: ScalarType, numeric: bool) -> 
     ));
     d.fields.push((
         "units".into(),
-        PvField::Scalar(ScalarValue::String(disp.units.clone().into())),
+        PvField::Scalar(ScalarValue::String(disp.units.clone())),
     ));
     if numeric {
         d.fields.push((

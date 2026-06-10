@@ -1,6 +1,6 @@
 use std::time::SystemTime;
 
-use crate::types::EpicsValue;
+use crate::types::{EpicsValue, PvString};
 
 /// Alarm status and severity.
 #[derive(Debug, Clone, Default)]
@@ -18,7 +18,12 @@ pub struct AlarmInfo {
 /// Display/graphic metadata for numeric types.
 #[derive(Debug, Clone, Default)]
 pub struct DisplayInfo {
-    pub units: String,
+    /// Engineering units (record EGU). Byte-preserving: CA `DBR_STRING`
+    /// and PVA `display.units` carry raw, not-guaranteed-UTF-8 bytes, so a
+    /// non-UTF-8 EGU must reach the wire unmangled (pvxs stores the wire
+    /// string verbatim, `pvaproto.h:403`). A `String` here forced a lossy
+    /// UTF-8 round-trip at this metadata boundary.
+    pub units: PvString,
     pub precision: i16,
     pub upper_disp_limit: f64,
     pub lower_disp_limit: f64,
@@ -41,9 +46,13 @@ pub struct ControlInfo {
 }
 
 /// Enum state strings (up to 16 states, each max 26 chars on wire).
+///
+/// Byte-preserving like [`DisplayInfo::units`]: enum choice labels are
+/// raw wire/record bytes with no UTF-8 guarantee, so they must reach the
+/// CA `DBR_GR_ENUM` slots and the PVA `value.choices` array unmangled.
 #[derive(Debug, Clone, Default)]
 pub struct EnumInfo {
-    pub strings: Vec<String>,
+    pub strings: Vec<PvString>,
 }
 
 /// Unified internal state representation for a PV read.
@@ -195,7 +204,7 @@ mod tests {
     fn test_snapshot_with_metadata() {
         let mut snap = Snapshot::new(EpicsValue::Double(3.14), 1, 2, SystemTime::UNIX_EPOCH);
         snap.display = Some(DisplayInfo {
-            units: "degC".to_string(),
+            units: "degC".into(),
             precision: 3,
             upper_disp_limit: 100.0,
             lower_disp_limit: -50.0,

@@ -8,7 +8,7 @@ use crate::runtime::sync::mpsc;
 use crate::error::{CaError, CaResult};
 use crate::server::pv::{MonitorEvent, Subscriber};
 use crate::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, PvString};
 
 use super::alarm::{AlarmSeverity, AnalogAlarmConfig};
 use super::common_fields::CommonFields;
@@ -479,7 +479,7 @@ impl RecordInstance {
         snap.value = self.promote_menu_value(field, snap.value.clone());
         if matches!(snap.value, EpicsValue::Enum(_)) {
             snap.enums = Some(super::super::snapshot::EnumInfo {
-                strings: choices.iter().map(|s| (*s).to_string()).collect(),
+                strings: choices.iter().map(|s| PvString::from(*s)).collect(),
             });
         }
     }
@@ -598,7 +598,7 @@ impl RecordInstance {
                     .unwrap_or(0.0);
                 let (hihi, high, low, lolo) = self.alarm_limits();
                 snap.display = Some(super::super::snapshot::DisplayInfo {
-                    units: egu.as_str_lossy().into_owned(),
+                    units: egu,
                     precision: prec,
                     upper_disp_limit: hopr,
                     lower_disp_limit: lopr,
@@ -639,7 +639,7 @@ impl RecordInstance {
                     _ => self.alarm_limits(),
                 };
                 snap.display = Some(super::super::snapshot::DisplayInfo {
-                    units: egu.as_str_lossy().into_owned(),
+                    units: egu,
                     precision: 0,
                     upper_disp_limit: hopr,
                     lower_disp_limit: lopr,
@@ -680,7 +680,7 @@ impl RecordInstance {
                     .and_then(|v| v.to_f64())
                     .unwrap_or(0.0);
                 snap.display = Some(super::super::snapshot::DisplayInfo {
-                    units: egu.as_str_lossy().into_owned(),
+                    units: egu,
                     precision: prec,
                     upper_disp_limit: hopr,
                     lower_disp_limit: lopr,
@@ -721,7 +721,7 @@ impl RecordInstance {
                     .and_then(|v| v.to_f64())
                     .unwrap_or(0.0);
                 snap.display = Some(super::super::snapshot::DisplayInfo {
-                    units: egu.as_str_lossy().into_owned(),
+                    units: egu,
                     precision: prec,
                     upper_disp_limit: hopr,
                     lower_disp_limit: lopr,
@@ -760,7 +760,7 @@ impl RecordInstance {
                     .and_then(|v| v.to_f64())
                     .unwrap_or(0.0);
                 snap.display = Some(super::super::snapshot::DisplayInfo {
-                    units: egu.as_str_lossy().into_owned(),
+                    units: egu,
                     precision: prec,
                     upper_disp_limit: hlm,
                     lower_disp_limit: llm,
@@ -897,10 +897,7 @@ impl RecordInstance {
                     })
                     .unwrap_or_default();
                 let no_str_1 = !znam.is_empty() && onam.is_empty();
-                let mut strings = vec![
-                    znam.as_str_lossy().into_owned(),
-                    onam.as_str_lossy().into_owned(),
-                ];
+                let mut strings = vec![znam, onam];
                 if no_str_1 {
                     strings.truncate(1);
                 }
@@ -912,7 +909,7 @@ impl RecordInstance {
                     "ZRST", "ONST", "TWST", "THST", "FRST", "FVST", "SXST", "SVST", "EIST", "NIST",
                     "TEST", "ELST", "TVST", "TTST", "FTST", "FFST",
                 ];
-                let mut strings: Vec<String> = state_fields
+                let mut strings: Vec<PvString> = state_fields
                     .iter()
                     .map(|f| {
                         self.record
@@ -924,7 +921,6 @@ impl RecordInstance {
                                     None
                                 }
                             })
-                            .map(|s| s.as_str_lossy().into_owned())
                             .unwrap_or_default()
                     })
                     .collect();

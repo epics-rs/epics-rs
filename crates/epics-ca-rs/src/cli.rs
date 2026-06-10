@@ -1,7 +1,7 @@
 //! Helpers shared across the `caget` / `caput` / `cainfo` / `camonitor`
 //! command-line binaries.
 
-use epics_base_rs::types::EpicsValue;
+use epics_base_rs::types::{EpicsValue, PvString};
 
 /// Default CA CLI timeout in seconds when neither `-w` nor a usable
 /// `EPICS_CLI_TIMEOUT` env var is set.
@@ -158,7 +158,7 @@ impl Default for ValueFormat {
 pub fn format_value(
     v: &EpicsValue,
     fmt: &ValueFormat,
-    enum_strings: Option<&[String]>,
+    enum_strings: Option<&[PvString]>,
     req_elems_present: bool,
 ) -> String {
     let sep = fmt.field_separator;
@@ -313,13 +313,16 @@ fn render_array_iter<I: Iterator<Item = String>>(
     parts.join(&sep.to_string())
 }
 
-fn format_enum(idx: i64, fmt: &ValueFormat, enum_strings: Option<&[String]>) -> String {
+fn format_enum(idx: i64, fmt: &ValueFormat, enum_strings: Option<&[PvString]>) -> String {
     if !fmt.enum_as_number
         && let Some(strs) = enum_strings
         && idx >= 0
         && (idx as usize) < strs.len()
     {
-        return strs[idx as usize].clone();
+        // Escape the label bytes exactly like a DBR_STRING (line 166):
+        // enum choice labels are raw, not-guaranteed-UTF-8 bytes, so a
+        // byte-wise escaper renders them faithfully on the CLI.
+        return escape_from_raw(strs[idx as usize].as_bytes());
     }
     format_int_i64(idx, fmt.int_style)
 }
@@ -654,7 +657,7 @@ mod tests {
 
     #[test]
     fn enum_with_strings_renders_string() {
-        let strs = vec!["off".to_string(), "on".to_string()];
+        let strs: Vec<PvString> = vec!["off".into(), "on".into()];
         let v = EpicsValue::Enum(1);
         let s = format_value(&v, &fmt_default(), Some(&strs), false);
         assert_eq!(s, "on");
@@ -662,7 +665,7 @@ mod tests {
 
     #[test]
     fn enum_n_flag_renders_index() {
-        let strs = vec!["off".to_string(), "on".to_string()];
+        let strs: Vec<PvString> = vec!["off".into(), "on".into()];
         let v = EpicsValue::Enum(1);
         let mut fmt = fmt_default();
         fmt.enum_as_number = true;

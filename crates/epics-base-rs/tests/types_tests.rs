@@ -297,7 +297,7 @@ fn bare_snapshot(value: EpicsValue) -> Snapshot {
 fn full_snapshot(value: EpicsValue) -> Snapshot {
     let mut snap = Snapshot::new(value, 3, 2, SystemTime::UNIX_EPOCH);
     snap.display = Some(DisplayInfo {
-        units: "degC".to_string(),
+        units: "degC".into(),
         precision: 3,
         upper_disp_limit: 100.0,
         lower_disp_limit: -50.0,
@@ -392,7 +392,7 @@ fn test_encode_ctrl_double_with_metadata() {
 fn test_encode_gr_short_with_metadata() {
     let mut snap = Snapshot::new(EpicsValue::Short(42), 0, 0, SystemTime::UNIX_EPOCH);
     snap.display = Some(DisplayInfo {
-        units: "mm".to_string(),
+        units: "mm".into(),
         precision: 0,
         upper_disp_limit: 1000.0,
         lower_disp_limit: -100.0,
@@ -413,7 +413,7 @@ fn test_encode_gr_short_with_metadata() {
 fn test_encode_gr_float_with_metadata() {
     let mut snap = Snapshot::new(EpicsValue::Float(1.5), 0, 0, SystemTime::UNIX_EPOCH);
     snap.display = Some(DisplayInfo {
-        units: "V".to_string(),
+        units: "V".into(),
         precision: 2,
         upper_disp_limit: 10.0,
         lower_disp_limit: 0.0,
@@ -430,7 +430,7 @@ fn test_encode_gr_float_with_metadata() {
 fn test_encode_gr_long_with_metadata() {
     let mut snap = Snapshot::new(EpicsValue::Long(99), 0, 0, SystemTime::UNIX_EPOCH);
     snap.display = Some(DisplayInfo {
-        units: "cnt".to_string(),
+        units: "cnt".into(),
         upper_disp_limit: 10000.0,
         lower_disp_limit: 0.0,
         ..Default::default()
@@ -450,7 +450,7 @@ fn test_encode_gr_char_with_metadata() {
     // -10.0 round-trips as 0xF6.
     let mut snap = Snapshot::new(EpicsValue::Char(42), 0, 0, SystemTime::UNIX_EPOCH);
     snap.display = Some(DisplayInfo {
-        units: "raw".to_string(),
+        units: "raw".into(),
         upper_disp_limit: 100.0,
         lower_disp_limit: -10.0,
         ..Default::default()
@@ -481,7 +481,7 @@ fn test_encode_gr_char_saturates_out_of_range() {
 fn test_encode_gr_enum_with_strings() {
     let mut snap = Snapshot::new(EpicsValue::Enum(1), 0, 0, SystemTime::UNIX_EPOCH);
     snap.enums = Some(EnumInfo {
-        strings: vec!["Off".to_string(), "On".to_string()],
+        strings: vec!["Off".into(), "On".into()],
     });
     let data = encode_dbr(24, &snap).unwrap();
     assert_eq!(data.len(), 424);
@@ -514,7 +514,7 @@ fn test_encode_ctrl_none_metadata_matches_serialize() {
 fn test_encode_ctrl_short_with_ctrl_limits() {
     let mut snap = Snapshot::new(EpicsValue::Short(10), 0, 0, SystemTime::UNIX_EPOCH);
     snap.display = Some(DisplayInfo {
-        units: "mA".to_string(),
+        units: "mA".into(),
         upper_disp_limit: 100.0,
         lower_disp_limit: 0.0,
         ..Default::default()

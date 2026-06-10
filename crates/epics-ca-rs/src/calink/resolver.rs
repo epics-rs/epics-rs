@@ -666,7 +666,11 @@ fn build_link_metadata(
             ));
             md.precision = Some(d.precision);
             if !d.units.is_empty() {
-                md.units = Some(d.units.clone());
+                // `LinkMetadata` is the dbCa client-side metadata cache, a
+                // separate representation from the byte-preserving wire
+                // encoders; it keeps a `String` rendering of the units (as
+                // lossy here as the previous decode was).
+                md.units = Some(d.units.as_str_lossy().into_owned());
             }
             if !d.description.is_empty() {
                 md.description = Some(d.description.clone());
@@ -1014,7 +1018,7 @@ mod tests {
             std::time::SystemTime::UNIX_EPOCH,
         );
         snap.display = Some(DisplayInfo {
-            units: "degC".to_string(),
+            units: "degC".into(),
             precision: 3,
             upper_disp_limit: 100.0,
             lower_disp_limit: -50.0,
@@ -1091,7 +1095,7 @@ mod tests {
             std::time::SystemTime::UNIX_EPOCH,
         );
         snap.display = Some(DisplayInfo {
-            units: String::new(),
+            units: "".into(),
             precision: 0,
             ..Default::default()
         });

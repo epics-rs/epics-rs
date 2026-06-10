@@ -16,7 +16,7 @@ use epics_base_rs::server::access_security::AccessSecurityConfig;
 use epics_base_rs::server::database::{PvDatabase, PvEntry, parse_pv_name};
 use epics_base_rs::server::recgbl::{alarm_condition_string, alarm_status};
 use epics_base_rs::server::snapshot::Snapshot;
-use epics_base_rs::types::EpicsValue;
+use epics_base_rs::types::{EpicsValue, PvString};
 use tokio::sync::RwLock;
 
 /// Shared, mutable ACF cell. Changed from
@@ -309,7 +309,7 @@ fn build_nt_enum(index: i32, snap: &Snapshot) -> PvField {
         .map(|e| {
             e.strings
                 .iter()
-                .map(|s| ScalarValue::String(s.clone().into()))
+                .map(|s| ScalarValue::String(s.clone()))
                 .collect()
         })
         .unwrap_or_default();
@@ -542,7 +542,7 @@ fn build_display(snap: &Snapshot) -> PvField {
             disp.precision as i32,
         )
     } else {
-        (0.0, 0.0, String::new(), String::new(), 0)
+        (0.0, 0.0, String::new(), PvString::new(), 0)
     };
     d.fields
         .push(("limitLow".into(), PvField::Scalar(ScalarValue::Double(lo))));
@@ -552,10 +552,8 @@ fn build_display(snap: &Snapshot) -> PvField {
         "description".into(),
         PvField::Scalar(ScalarValue::String(desc.into())),
     ));
-    d.fields.push((
-        "units".into(),
-        PvField::Scalar(ScalarValue::String(units.into())),
-    ));
+    d.fields
+        .push(("units".into(), PvField::Scalar(ScalarValue::String(units))));
     d.fields
         .push(("precision".into(), PvField::Scalar(ScalarValue::Int(prec))));
     PvField::Structure(d)
@@ -1390,6 +1388,91 @@ mod tests {
             bv.get_field("choices"),
             Some(PvField::ScalarArray(c)) if c.is_empty()
         ));
+    }
+
+    #[test]
+    fn non_utf8_units_and_enum_choices_survive_pva_metadata_encoder() {
+        // pvxs serialises wire strings verbatim (`pvaproto.h:403`). EPICS
+        // EGU (`display.units`) and enum state labels (`value.choices`) are
+        // raw record bytes with no UTF-8 guarantee, so a non-UTF-8 EGU or
+        // choice must reach the wire unmangled. The metadata boundary
+        // (DisplayInfo.units / EnumInfo.strings) must be byte-preserving,
+        // not a lossy `String` round-trip.
+        use crate::proto::buffer::ByteOrder;
+        use crate::pvdata::encode::{decode_scalar_value, encode_scalar_value};
+        use epics_base_rs::server::snapshot::{DisplayInfo, EnumInfo};
+        use std::io::Cursor;
+
+        // 0xFF/0x00/0xFE/0x80 make this byte sequence invalid UTF-8, so a
+        // `String` conversion anywhere on the path would mangle it.
+        let raw = vec![0xFFu8, 0x00, 0xFE, b'd', b'e', b'g', 0x80];
+
+        // Encode a String scalar to the wire and decode it back.
+        let round_trip = |sv: &ScalarValue| -> ScalarValue {
+            let mut buf = Vec::new();
+            encode_scalar_value(sv, ByteOrder::Little, &mut buf);
+            let mut cur = Cursor::new(buf.as_slice());
+            decode_scalar_value(ScalarType::String, &mut cur, ByteOrder::Little).unwrap()
+        };
+
+        // display.units boundary: producer struct, then wire round-trip.
+        let mut snap = Snapshot::new(EpicsValue::Double(1.0), 0, 0, std::time::UNIX_EPOCH);
+        snap.display = Some(DisplayInfo {
+            units: PvString::from_bytes(raw.clone()),
+            ..Default::default()
+        });
+        let PvField::Structure(d) = build_display(&snap) else {
+            panic!("display must be a structure");
+        };
+        let ScalarValue::String(units) = scalar(&d, "units") else {
+            panic!("units must be a string scalar");
+        };
+        assert_eq!(
+            units.as_bytes(),
+            raw.as_slice(),
+            "units bytes lost at the producer->struct boundary"
+        );
+        let ScalarValue::String(units_wire) = round_trip(&ScalarValue::String(units.clone()))
+        else {
+            panic!("decoded units must stay a string");
+        };
+        assert_eq!(
+            units_wire.as_bytes(),
+            raw.as_slice(),
+            "units bytes mangled by the wire encoder"
+        );
+
+        // value.choices boundary: producer struct, then wire round-trip.
+        let mut esnap = Snapshot::new(EpicsValue::Enum(0), 0, 0, std::time::UNIX_EPOCH);
+        esnap.enums = Some(EnumInfo {
+            strings: vec![PvString::from_bytes(raw.clone())],
+        });
+        let PvField::Structure(s) = snapshot_to_pv_field(&esnap) else {
+            panic!("NTEnum value must be a structure");
+        };
+        let Some(PvField::Structure(value)) = s.get_field("value") else {
+            panic!("NTEnum.value must be a structure");
+        };
+        let Some(PvField::ScalarArray(choices)) = value.get_field("choices") else {
+            panic!("choices must be a scalar array");
+        };
+        let ScalarValue::String(choice) = &choices[0] else {
+            panic!("choice must be a string scalar");
+        };
+        assert_eq!(
+            choice.as_bytes(),
+            raw.as_slice(),
+            "enum choice bytes lost at the producer->struct boundary"
+        );
+        let ScalarValue::String(choice_wire) = round_trip(&ScalarValue::String(choice.clone()))
+        else {
+            panic!("decoded choice must stay a string");
+        };
+        assert_eq!(
+            choice_wire.as_bytes(),
+            raw.as_slice(),
+            "enum choice bytes mangled by the wire encoder"
+        );
     }
 
     #[tokio::test]

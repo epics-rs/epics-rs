@@ -995,7 +995,7 @@ mod tests {
     fn ctrl_double_snap() -> Snapshot {
         let mut s = Snapshot::new(EpicsValue::Double(1.5), 0, 0, SystemTime::UNIX_EPOCH);
         s.display = Some(DisplayInfo {
-            units: "mm".to_string(),
+            units: "mm".into(),
             precision: 3,
             upper_disp_limit: 10.0,
             lower_disp_limit: -10.0,
@@ -1079,7 +1079,7 @@ mod tests {
         // GR_ENUM (24): status/severity then the enum table.
         let mut e = Snapshot::new(EpicsValue::Enum(1), 0, 0, SystemTime::UNIX_EPOCH);
         e.enums = Some(EnumInfo {
-            strings: vec!["OFF".to_string(), "ON".to_string()],
+            strings: vec!["OFF".into(), "ON".into()],
         });
         let es = dbr_extended_str(24, &e);
         assert!(es.contains("    Enums:            ( 2)"), "{es}");

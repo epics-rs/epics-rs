@@ -212,7 +212,7 @@ async fn main() {
     // state names (caput.c:487-494). A menu-read timeout aborts the put
     // exactly as C does (caput.c:461-465). The menu is empty for non-ENUM
     // fields, which makes `build_write_value` skip the ENUM path entirely.
-    let enum_menu: Vec<String> = if native_type == epics_ca_rs::DbFieldType::Enum {
+    let enum_menu: Vec<epics_ca_rs::PvString> = if native_type == epics_ca_rs::DbFieldType::Enum {
         match ch.get_with_metadata(DbrClass::Gr).await {
             Ok(snap) => snap.enums.map(|e| e.strings).unwrap_or_default(),
             Err(CaError::Timeout) => {
@@ -628,7 +628,7 @@ fn build_write_value(
     force_string: bool,
     long_string: bool,
     array_mode: bool,
-    enum_menu: &[String],
+    enum_menu: &[epics_ca_rs::PvString],
 ) -> Result<WriteValue, String> {
     if array_mode {
         // C `caput -a` (caput.c:413-418): after the PV name it skips the
@@ -736,7 +736,7 @@ fn classify_enum_token(
     token: &str,
     force_numeric: bool,
     force_string: bool,
-    menu: &[String],
+    menu: &[epics_ca_rs::PvString],
 ) -> Result<EnumToken, String> {
     if force_numeric {
         return parse_enum_double(token)
@@ -788,7 +788,7 @@ fn build_enum_array(
     tokens: &[String],
     force_numeric: bool,
     force_string: bool,
-    menu: &[String],
+    menu: &[epics_ca_rs::PvString],
 ) -> Result<WriteValue, String> {
     let classified: Vec<EnumToken> = tokens
         .iter()
@@ -833,6 +833,10 @@ mod tests {
 
     fn vals(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
+    }
+
+    fn menu_vals(s: &[&str]) -> Vec<epics_ca_rs::PvString> {
+        s.iter().map(|x| (*x).into()).collect()
     }
 
     /// C `caput.c:298-319` parses `-n`/`-s` and `-S`/`-a` as two
@@ -1006,7 +1010,7 @@ mod tests {
         // a menu state name routes to DBR_STRING (server resolves the
         // name), NOT a DBR_CHAR array. Pre-fix the top-level `-S` block
         // hijacked this.
-        let menu = vals(&["Stop", "Run", "not a number"]);
+        let menu = menu_vals(&["Stop", "Run", "not a number"]);
         let r = build_write_value(
             &vals(&["not a number"]),
             DbFieldType::Enum,
@@ -1051,7 +1055,7 @@ mod tests {
         // state — C matches the menu before the numeric fallback
         // (caput.c:487-494). Sending "1" as a native index instead could
         // mean a different state.
-        let menu = vals(&["0", "1", "2"]);
+        let menu = menu_vals(&["0", "1", "2"]);
         match build_write_value(
             &vals(&["1"]),
             DbFieldType::Enum,
@@ -1091,7 +1095,7 @@ mod tests {
         // `-s` (enumAsString) forbids the numeric fallback: a value that
         // matches no state name is an error, not a coerced index
         // (caput.c:499-503).
-        let menu = vals(&["Off", "On"]);
+        let menu = menu_vals(&["Off", "On"]);
         let err = build_write_value(
             &vals(&["3"]),
             DbFieldType::Enum,
@@ -1125,7 +1129,7 @@ mod tests {
         // `-n` (enumAsNr) interprets every value as a number sent as
         // DBR_DOUBLE, never matching the menu (caput.c:467-482) — even a
         // value that IS a state name.
-        let menu = vals(&["1", "2"]);
+        let menu = menu_vals(&["1", "2"]);
         match build_write_value(
             &vals(&["1"]),
             DbFieldType::Enum,
@@ -1163,7 +1167,7 @@ mod tests {
     #[test]
     fn enum_array_homogeneous_and_mixed_wire_types() {
         // ENUM waveform: all-name → DBR_STRING[]; all-number → DBR_DOUBLE[].
-        let menu = vals(&["Stop", "Run"]);
+        let menu = menu_vals(&["Stop", "Run"]);
         // `-a PV 2 Stop Run`: both are state names → DBR_STRING[].
         match build_write_value(
             &vals(&["2", "Stop", "Run"]),
@@ -1453,7 +1457,7 @@ mod tests {
         // ENUM-by-name scalar (`-s`) -> EnumString capped to 39. The value
         // is escape-decoded and truncated to 39 bytes BEFORE the menu
         // compare, so the matching state name is the 39-byte form.
-        let menu_label = "a".repeat(39);
+        let menu_label: epics_ca_rs::PvString = "a".repeat(39).into();
         match build_write_value(
             &vals(&[long.as_str()]),
             DbFieldType::Enum,

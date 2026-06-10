@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
+use crate::server::record::{FieldDesc, MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue};
 
 /// Histogram record — counts values into buckets.
@@ -30,6 +30,11 @@ pub struct HistogramRecord {
     pub sdel: f64,     // Signal deadband (monitor refresh period, seconds)
     pub mdel: i32,     // Monitor count deadband
     pub mcnt: i32,     // Counts accumulated since last monitor post
+    // SIMM is `DBF_MENU menu(menuYesNo)` (histogramRecord.dbd.pod:258-262):
+    // the NO/YES simulation-mode menu, served as DBR_ENUM. The rest of the
+    // simulation block (SIML/SIOL/SVAL/SIMS/OLDSIMM/SSCN) is not yet
+    // modelled — only the menu field is exposed here.
+    pub simm: i16,
 }
 
 impl Default for HistogramRecord {
@@ -53,6 +58,7 @@ impl Default for HistogramRecord {
             sdel: 0.0,
             mdel: 0,
             mcnt: 0,
+            simm: 0,
         }
     }
 }
@@ -186,6 +192,11 @@ static HISTOGRAM_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Long,
         read_only: true,
     },
+    FieldDesc {
+        name: "SIMM",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
 ];
 
 /// Choice labels for the histogram command menu, in index order.
@@ -222,6 +233,7 @@ impl Record for HistogramRecord {
             "SDEL" => Some(EpicsValue::Double(self.sdel)),
             "MDEL" => Some(EpicsValue::Long(self.mdel)),
             "MCNT" => Some(EpicsValue::Long(self.mcnt)),
+            "SIMM" => Some(EpicsValue::Short(self.simm)),
             _ => None,
         }
     }
@@ -297,6 +309,13 @@ impl Record for HistogramRecord {
                 }
                 _ => Err(CaError::TypeMismatch("MDEL".into())),
             },
+            "SIMM" => match value {
+                EpicsValue::Short(v) => {
+                    self.simm = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("SIMM".into())),
+            },
             "NELM" | "WDTH" | "MCNT" => Err(CaError::ReadOnlyField(name.to_string())),
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
@@ -308,9 +327,12 @@ impl Record for HistogramRecord {
 
     /// `CMD` is `DBF_MENU menu(histogramCMD)` (`histogramRecord.dbd.pod`);
     /// served as `DBR_ENUM` with the Read/Clear/Start/Stop choice labels.
+    /// `SIMM` is `DBF_MENU menu(menuYesNo)` (`histogramRecord.dbd.pod:258-262`),
+    /// served as `DBR_ENUM` with the NO/YES labels.
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
         match field {
             "CMD" => Some(HISTOGRAM_CMD_CHOICES),
+            "SIMM" => Some(MENU_YES_NO),
             _ => None,
         }
     }
@@ -347,6 +369,19 @@ mod tests {
         assert!(rec.csta);
         rec.add_sample(1.0);
         assert_eq!(rec.val[0], 1, "started histogram counts again");
+    }
+
+    /// SIMM is `menu(menuYesNo)` served as DBR_ENUM with the NO/YES labels.
+    #[test]
+    fn simm_snapshot_is_enum_with_yesno_labels() {
+        use crate::server::record::RecordInstance;
+        let mut rec = HistogramRecord::new(2, 0.0, 10.0);
+        rec.put_field("SIMM", EpicsValue::Short(1)).unwrap();
+        assert_eq!(rec.get_field("SIMM"), Some(EpicsValue::Short(1)));
+        let inst = RecordInstance::new("HIST:SIMM".into(), rec);
+        let snap = inst.snapshot_for_field("SIMM").unwrap();
+        assert_eq!(snap.value, EpicsValue::Enum(1));
+        assert_eq!(snap.enums.as_ref().unwrap().strings, vec!["NO", "YES"]);
     }
 
     /// CMD<=1 clears all buckets.

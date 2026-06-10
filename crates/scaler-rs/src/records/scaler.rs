@@ -14,6 +14,10 @@ pub const MAX_SCALER_CHANNELS: usize = 64;
 /// `menu(scalerCNT)`; `CONT` is `menu(scalerCONT)`.
 const SCALER_CNT_CHOICES: &[&str] = &["Done", "Count"];
 const SCALER_CONT_CHOICES: &[&str] = &["OneShot", "AutoCount"];
+/// `D1`..`D64` count direction — `menu(scalerD1)` (`scalerRecord.dbd:9-12`).
+const SCALER_D_CHOICES: &[&str] = &["Up", "Dn"];
+/// `G1`..`G64` gate/preset enable — `menu(scalerG1)` (`scalerRecord.dbd:13-16`).
+const SCALER_G_CHOICES: &[&str] = &["N", "Y"];
 
 const VERSION: f32 = 3.19;
 
@@ -1095,12 +1099,18 @@ impl Record for ScalerRecord {
     }
 
     /// `CNT`/`PCNT` are `DBF_MENU menu(scalerCNT)`; `CONT` is
-    /// `menu(scalerCONT)` (C `scalerRecord.dbd`). Served as `DBR_ENUM` with
-    /// the menu's choice labels in `.dbd` index order.
+    /// `menu(scalerCONT)`; `D1`..`D64` are `menu(scalerD1)` (Up/Dn) and
+    /// `G1`..`G64` are `menu(scalerG1)` (N/Y) (C `scalerRecord.dbd`). Served
+    /// as `DBR_ENUM` with the menu's choice labels in `.dbd` index order.
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
         match field {
             "CNT" | "PCNT" => Some(SCALER_CNT_CHOICES),
             "CONT" => Some(SCALER_CONT_CHOICES),
+            // D{n}/G{n} are indexed menu fields; reuse the same 1..=64
+            // index parser the get/put paths use so "DLY"/"DLY1" (which
+            // start with 'D' but are not indexed) do not falsely match.
+            _ if parse_indexed_field(field, "D").is_some() => Some(SCALER_D_CHOICES),
+            _ if parse_indexed_field(field, "G").is_some() => Some(SCALER_G_CHOICES),
             _ => None,
         }
     }
@@ -1160,5 +1170,44 @@ mod menu_choice_tests {
         assert_eq!(rec.menu_field_choices("CNT"), Some(&["Done", "Count"][..]));
         assert_eq!(rec.menu_field_choices("PCNT"), Some(&["Done", "Count"][..]));
         assert_eq!(rec.menu_field_choices("VAL"), None);
+    }
+
+    // D1..D64 are menu(scalerD1) (Up/Dn); G1..G64 are menu(scalerG1) (N/Y).
+    // The whole indexed range must resolve, while the 'D'-prefixed non-menu
+    // fields DLY/DLY1 must NOT falsely match the direction menu.
+    #[test]
+    fn scaler_direction_gate_menu_choices_match_dbd() {
+        let rec = ScalerRecord::default();
+        for i in 1..=super::MAX_SCALER_CHANNELS {
+            assert_eq!(
+                rec.menu_field_choices(&format!("D{i}")),
+                Some(&["Up", "Dn"][..]),
+                "D{i} must serve menu(scalerD1)"
+            );
+            assert_eq!(
+                rec.menu_field_choices(&format!("G{i}")),
+                Some(&["N", "Y"][..]),
+                "G{i} must serve menu(scalerG1)"
+            );
+        }
+        // 'D'-prefixed non-indexed fields are not direction menus.
+        assert_eq!(rec.menu_field_choices("DLY"), None);
+        assert_eq!(rec.menu_field_choices("DLY1"), None);
+        // Out-of-range indices do not resolve.
+        assert_eq!(rec.menu_field_choices("D0"), None);
+        assert_eq!(rec.menu_field_choices("D65"), None);
+        assert_eq!(rec.menu_field_choices("G65"), None);
+    }
+
+    // A G{n} field served as Short is promoted to DBR_ENUM by the base
+    // snapshot path, carrying the wire-visible N/Y labels.
+    #[test]
+    fn scaler_gate_snapshot_is_enum_with_labels() {
+        let mut rec = ScalerRecord::default();
+        rec.put_field("G3", EpicsValue::Short(1)).unwrap();
+        let inst = RecordInstance::new("SC:G3".into(), rec);
+        let snap = inst.snapshot_for_field("G3").unwrap();
+        assert_eq!(snap.value, EpicsValue::Enum(1));
+        assert_eq!(snap.enums.as_ref().unwrap().strings, vec!["N", "Y"]);
     }
 }

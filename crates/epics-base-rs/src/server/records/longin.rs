@@ -1,5 +1,6 @@
 use epics_macros_rs::EpicsRecord;
 
+use crate::server::record::MENU_YES_NO;
 use crate::types::PvString;
 
 #[derive(EpicsRecord)]
@@ -50,7 +51,9 @@ pub struct LonginRecord {
     pub alst: f64,
     #[field(type = "Double")]
     pub mlst: f64,
-    #[field(type = "Short")]
+    // SIMM is `DBF_MENU menu(menuYesNo)` (longinRecord.dbd.pod:475-479):
+    // the two-choice NO/YES simulation menu, served as DBR_ENUM.
+    #[field(type = "Short", menu_choices = MENU_YES_NO)]
     pub simm: i16,
     #[field(type = "String")]
     pub siml: String,

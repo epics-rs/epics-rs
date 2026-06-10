@@ -1,5 +1,7 @@
 use epics_macros_rs::EpicsRecord;
 
+use crate::server::record::MENU_YES_NO;
+
 /// `event` record — software-event source.
 ///
 /// C parity (`eventRecord.dbd.pod:71` `field(VAL,DBF_STRING)`,
@@ -19,7 +21,9 @@ pub struct EventRecord {
     /// pre-EPICS-7; a numeric string still works for back-compat).
     #[field(type = "String")]
     pub val: String,
-    #[field(type = "Short")]
+    // SIMM is `DBF_MENU menu(menuYesNo)` (eventRecord.dbd.pod:152-156):
+    // the two-choice NO/YES simulation menu, served as DBR_ENUM.
+    #[field(type = "Short", menu_choices = MENU_YES_NO)]
     pub simm: i16,
     #[field(type = "String")]
     pub siml: String,
@@ -48,5 +52,27 @@ impl EventRecord {
             val: val.into(),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::record::{Record, RecordInstance};
+    use crate::types::EpicsValue;
+
+    /// SIMM is `menu(menuYesNo)` served as DBR_ENUM. The derive macro must
+    /// wire the `menu_choices = MENU_YES_NO` attribute into
+    /// `menu_field_choices`, and the base snapshot path then promotes the
+    /// stored Short to `Enum` and attaches the NO/YES labels.
+    #[test]
+    fn simm_snapshot_is_enum_with_yesno_labels() {
+        let mut rec = EventRecord::default();
+        rec.put_field("SIMM", EpicsValue::Short(1)).unwrap();
+        assert_eq!(rec.menu_field_choices("SIMM"), Some(&["NO", "YES"][..]));
+        let inst = RecordInstance::new("EV:SIMM".into(), rec);
+        let snap = inst.snapshot_for_field("SIMM").unwrap();
+        assert_eq!(snap.value, EpicsValue::Enum(1));
+        assert_eq!(snap.enums.as_ref().unwrap().strings, vec!["NO", "YES"]);
     }
 }

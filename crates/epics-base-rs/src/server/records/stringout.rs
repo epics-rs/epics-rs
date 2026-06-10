@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_YES_NO, ProcessOutcome, Record};
+use crate::server::record::{FieldDesc, MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// EPICS `MAX_STRING_SIZE` — `val`/`oval`/`ivov` are fixed 40-byte
@@ -38,6 +38,10 @@ pub struct StringoutRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
+    /// `menu(stringoutPOST)` Post Value Monitors (0=On Change, 1=Always).
+    pub mpst: i16,
+    /// `menu(stringoutPOST)` Post Archive Monitors (0=On Change, 1=Always).
+    pub apst: i16,
 }
 
 impl Default for StringoutRecord {
@@ -53,6 +57,8 @@ impl Default for StringoutRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
+            mpst: 0,
+            apst: 0,
         }
     }
 }
@@ -117,6 +123,16 @@ static STRINGOUT_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    FieldDesc {
+        name: "MPST",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "APST",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
 ];
 
 impl Record for StringoutRecord {
@@ -129,12 +145,15 @@ impl Record for StringoutRecord {
     }
 
     /// `SIMM` is `DBF_MENU menu(menuYesNo)` (`stringoutRecord.dbd.pod`): the
-    /// two-choice NO/YES simulation menu. Served as `DBR_ENUM` with these
-    /// labels. `SIMS`/`OLDSIMM`/`OMSL`/`IVOA` are shared menus resolved
-    /// centrally.
+    /// two-choice NO/YES simulation menu. `MPST`/`APST` are
+    /// `menu(stringoutPOST)` (`stringoutRecord.dbd.pod:19-22,128-139`), whose
+    /// value order ("On Change", "Always") matches `menu(menuPost)`. Served
+    /// as `DBR_ENUM` with these labels. `SIMS`/`OLDSIMM`/`OMSL`/`IVOA` are
+    /// shared menus resolved centrally.
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
         match field {
             "SIMM" => Some(MENU_YES_NO),
+            "MPST" | "APST" => Some(MENU_POST),
             _ => None,
         }
     }
@@ -157,6 +176,8 @@ impl Record for StringoutRecord {
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
+            "MPST" => Some(EpicsValue::Short(self.mpst)),
+            "APST" => Some(EpicsValue::Short(self.apst)),
             _ => None,
         }
     }
@@ -234,6 +255,20 @@ impl Record for StringoutRecord {
                 }
                 _ => Err(CaError::TypeMismatch("SIMS".into())),
             },
+            "MPST" => match value {
+                EpicsValue::Short(v) => {
+                    self.mpst = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("MPST".into())),
+            },
+            "APST" => match value {
+                EpicsValue::Short(v) => {
+                    self.apst = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("APST".into())),
+            },
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
     }
@@ -250,6 +285,23 @@ mod tests {
         rec.put_field("VAL", EpicsValue::String("z".repeat(80).into()))
             .unwrap();
         assert_eq!(rec.val.len(), 39);
+    }
+
+    /// MPST/APST are `menu(stringoutPOST)` served as DBR_ENUM with the
+    /// wire-visible "On Change"/"Always" labels in `.dbd` value order.
+    #[test]
+    fn mpst_apst_snapshot_is_enum_with_post_labels() {
+        use crate::server::record::RecordInstance;
+        let mut rec = StringoutRecord::default();
+        rec.put_field("APST", EpicsValue::Short(1)).unwrap();
+        assert_eq!(rec.get_field("APST"), Some(EpicsValue::Short(1)));
+        let inst = RecordInstance::new("SO:APST".into(), rec);
+        let snap = inst.snapshot_for_field("APST").unwrap();
+        assert_eq!(snap.value, EpicsValue::Enum(1));
+        assert_eq!(
+            snap.enums.as_ref().unwrap().strings,
+            vec!["On Change", "Always"]
+        );
     }
 
     /// IVOA=2 (set output to IVOV) copies IVOV into VAL.

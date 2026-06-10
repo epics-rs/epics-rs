@@ -1,5 +1,6 @@
 use epics_macros_rs::EpicsRecord;
 
+use crate::server::record::MENU_YES_NO;
 use crate::types::PvString;
 
 // int64in: 64-bit integer input.
@@ -39,7 +40,9 @@ pub struct Int64inRecord {
     pub alst: f64,
     #[field(type = "Double")]
     pub mlst: f64,
-    #[field(type = "Short")]
+    // SIMM is `DBF_MENU menu(menuYesNo)` (int64inRecord.dbd.pod:279-283):
+    // the two-choice NO/YES simulation menu, served as DBR_ENUM.
+    #[field(type = "Short", menu_choices = MENU_YES_NO)]
     pub simm: i16,
     #[field(type = "String")]
     pub siml: String,

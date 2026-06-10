@@ -73,6 +73,15 @@ pub type SubArrayRecord = WaveformRecord;
 /// menuFtype constants for FTVL field.
 const MENU_FTYPE_DOUBLE: i16 = 10;
 
+/// `menu(waveformPOST)` choice labels for the `MPST`/`APST` fields, in
+/// `.dbd` value order (`waveformRecord.dbd.pod:20-23`). The order is the
+/// *reverse* of `menu(menuPost)` — "Always" is index 0 here — and is
+/// wire-visible, so this record keeps its own table rather than the
+/// shared `MENU_POST`. `aai`/`aao` use the identically-ordered
+/// `menu(aaiPOST)`/`menu(aaoPOST)`, so the same table serves every
+/// [`ArrayKind`].
+const WAVEFORM_POST: &[&str] = &["Always", "On Change"];
+
 impl Default for WaveformRecord {
     fn default() -> Self {
         Self {
@@ -356,6 +365,16 @@ impl Record for WaveformRecord {
         self.kind.is_output()
     }
 
+    /// `MPST`/`APST` are `DBF_MENU menu(waveformPOST)`
+    /// (`waveformRecord.dbd.pod:523-533`), served as `DBR_ENUM`. `FTVL`
+    /// (`menu(menuFtype)`) is a shared menu resolved centrally.
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "MPST" | "APST" => Some(WAVEFORM_POST),
+            _ => None,
+        }
+    }
+
     // EGU/HOPR/LOPR/PREC not exposed in get_field or put_field; populate_display_info
     // gets None for all four, leaving DBR_GR display limits zeroed (waveformRecord.c:251-252).
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -371,6 +390,8 @@ impl Record for WaveformRecord {
             "NELM" => Some(EpicsValue::Long(self.nelm)),
             "NORD" => Some(EpicsValue::Long(self.nord)),
             "FTVL" => Some(EpicsValue::Short(self.ftvl)),
+            "MPST" => Some(EpicsValue::Short(self.mpst)),
+            "APST" => Some(EpicsValue::Short(self.apst)),
             // subArray-specific INDX/MALM fields. Other array record
             // kinds expose them as zero (matches C dbpr output for a
             // record type that doesn't declare the field).
@@ -478,6 +499,22 @@ impl Record for WaveformRecord {
                     Err(CaError::InvalidValue(format!(
                         "FTVL requires Short, got {value:?}"
                     )))
+                }
+            }
+            "MPST" => {
+                if let EpicsValue::Short(v) = value {
+                    self.mpst = v;
+                    Ok(())
+                } else {
+                    Err(CaError::TypeMismatch("MPST".into()))
+                }
+            }
+            "APST" => {
+                if let EpicsValue::Short(v) = value {
+                    self.apst = v;
+                    Ok(())
+                } else {
+                    Err(CaError::TypeMismatch("APST".into()))
                 }
             }
             "NORD" => Err(CaError::ReadOnlyField(name.to_string())),
@@ -806,6 +843,26 @@ mod array_kind_tests {
             .find(|f| f.name == "VAL")
             .map(|f| f.dbf_type);
         assert_eq!(i64_dbf, Some(DbFieldType::Int64));
+    }
+
+    /// MPST/APST are `menu(waveformPOST)` served as DBR_ENUM. The base
+    /// snapshot path promotes the stored Short to `Enum` and attaches the
+    /// labels in `.dbd` value order — which is REVERSED vs `menu(menuPost)`:
+    /// "Always" is index 0, "On Change" is index 1.
+    #[test]
+    fn waveform_mpst_apst_snapshot_is_enum_with_reversed_post_labels() {
+        use crate::server::record::RecordInstance;
+        let mut rec = WaveformRecord::with_kind(ArrayKind::Waveform);
+        rec.put_field("MPST", EpicsValue::Short(0)).unwrap();
+        assert_eq!(rec.get_field("MPST"), Some(EpicsValue::Short(0)));
+        let inst = RecordInstance::new("WF:MPST".into(), rec);
+        let snap = inst.snapshot_for_field("MPST").unwrap();
+        assert_eq!(snap.value, EpicsValue::Enum(0));
+        assert_eq!(
+            snap.enums.as_ref().unwrap().strings,
+            vec!["Always", "On Change"],
+            "waveformPOST index 0 must be \"Always\" (reverse of menuPost)"
+        );
     }
 
     #[test]

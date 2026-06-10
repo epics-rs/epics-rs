@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_YES_NO, ProcessOutcome, Record};
+use crate::server::record::{FieldDesc, MENU_POST, MENU_YES_NO, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// EPICS `MAX_STRING_SIZE` — `val`/`oval`/`sval` are fixed 40-byte
@@ -31,6 +31,10 @@ pub struct StringinRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
+    /// `menu(stringinPOST)` Post Value Monitors (0=On Change, 1=Always).
+    pub mpst: i16,
+    /// `menu(stringinPOST)` Post Archive Monitors (0=On Change, 1=Always).
+    pub apst: i16,
 }
 
 impl Default for StringinRecord {
@@ -42,6 +46,8 @@ impl Default for StringinRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
+            mpst: 0,
+            apst: 0,
         }
     }
 }
@@ -86,6 +92,16 @@ static STRINGIN_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    FieldDesc {
+        name: "MPST",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "APST",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
 ];
 
 impl Record for StringinRecord {
@@ -98,11 +114,15 @@ impl Record for StringinRecord {
     }
 
     /// `SIMM` is `DBF_MENU menu(menuYesNo)` (`stringinRecord.dbd.pod`): the
-    /// two-choice NO/YES simulation menu. Served as `DBR_ENUM` with these
-    /// labels. `SIMS`/`OLDSIMM` are shared menus resolved centrally.
+    /// two-choice NO/YES simulation menu. `MPST`/`APST` are
+    /// `menu(stringinPOST)` (`stringinRecord.dbd.pod:21-24,95-107`), whose
+    /// value order ("On Change", "Always") matches `menu(menuPost)`. Served
+    /// as `DBR_ENUM` with these labels. `SIMS`/`OLDSIMM` are shared menus
+    /// resolved centrally.
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
         match field {
             "SIMM" => Some(MENU_YES_NO),
+            "MPST" | "APST" => Some(MENU_POST),
             _ => None,
         }
     }
@@ -121,6 +141,8 @@ impl Record for StringinRecord {
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
+            "MPST" => Some(EpicsValue::Short(self.mpst)),
+            "APST" => Some(EpicsValue::Short(self.apst)),
             _ => None,
         }
     }
@@ -170,6 +192,20 @@ impl Record for StringinRecord {
                 }
                 _ => Err(CaError::TypeMismatch("SIMS".into())),
             },
+            "MPST" => match value {
+                EpicsValue::Short(v) => {
+                    self.mpst = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("MPST".into())),
+            },
+            "APST" => match value {
+                EpicsValue::Short(v) => {
+                    self.apst = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("APST".into())),
+            },
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
     }
@@ -195,6 +231,25 @@ mod tests {
         let s = "y".repeat(39);
         let rec = StringinRecord::new(&s);
         assert_eq!(rec.val.len(), 39);
+    }
+
+    /// MPST/APST are `menu(stringinPOST)` served as DBR_ENUM: the base
+    /// snapshot path promotes the stored Short to `Enum` and attaches the
+    /// wire-visible "On Change"/"Always" labels in `.dbd` value order.
+    #[test]
+    fn mpst_apst_snapshot_is_enum_with_post_labels() {
+        use crate::server::record::RecordInstance;
+        let mut rec = StringinRecord::default();
+        rec.put_field("MPST", EpicsValue::Short(1)).unwrap();
+        rec.put_field("APST", EpicsValue::Short(0)).unwrap();
+        assert_eq!(rec.get_field("MPST"), Some(EpicsValue::Short(1)));
+        let inst = RecordInstance::new("SI:MPST".into(), rec);
+        let snap = inst.snapshot_for_field("MPST").unwrap();
+        assert_eq!(snap.value, EpicsValue::Enum(1));
+        assert_eq!(
+            snap.enums.as_ref().unwrap().strings,
+            vec!["On Change", "Always"]
+        );
     }
 
     /// A non-UTF-8 VAL (`0xff 0x00 0x80`) put through the field path is

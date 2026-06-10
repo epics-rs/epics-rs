@@ -1,7 +1,7 @@
 //! Request types for the port actor.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 use std::time::SystemTime;
 
 use crate::error::AsynStatus;
@@ -456,21 +456,99 @@ impl RequestResult {
     }
 }
 
-/// Token for cancelling a queued request before execution.
+/// Lifecycle of a queued request, mirroring C `asynManager` queue/callback
+/// state so that `AQR` cancellation reproduces the `cancelRequest` `wasQueued`
+/// split (asynManager.c:1630-1690) by construction rather than by a runtime
+/// guard.
+///
+/// `cancelRequest` removes the request and reports `wasQueued==1` ONLY while it
+/// is still on the queue (asynManager.c:1661-1668); once the port thread has
+/// dequeued it and is running the callback (`callbackActive`) or it has already
+/// finished, `wasQueued==0` and the I/O runs to completion and is reported
+/// normally (asynManager.c:1645-1659). `Queued` is the only state a cancel can
+/// win from; the executor's `Queued -> Running` transition closes that window.
+const STATE_QUEUED: u8 = 0;
+const STATE_RUNNING: u8 = 1;
+const STATE_DONE: u8 = 2;
+const STATE_CANCELLED: u8 = 3;
+
+/// Token tracking the queue/execution lifecycle of an off-thread request.
+///
+/// The state machine makes the C `wasQueued` semantics hold by construction:
+/// `cancel()` succeeds only from `Queued`, the executor claims the request with
+/// `begin_running()` (refused once cancelled) and releases it with `finish()`,
+/// so a cancel that arrives after execution started cannot transition the token
+/// and is a no-op — the I/O completes and applies normally.
 #[derive(Clone, Debug)]
-pub struct CancelToken(pub Arc<AtomicBool>);
+pub struct CancelToken(pub Arc<AtomicU8>);
 
 impl CancelToken {
     pub fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
+        Self(Arc::new(AtomicU8::new(STATE_QUEUED)))
     }
 
-    pub fn cancel(&self) {
-        self.0.store(true, AtomicOrdering::Release);
+    /// `AQR` / C `cancelRequest`: cancel the request iff it is still queued.
+    ///
+    /// Returns the C `wasQueued` flag — `true` when the request was removed
+    /// from the queue (the caller must report "I/O request canceled",
+    /// asynRecord.c:397-404); `false` when it had already been dequeued and was
+    /// running or had completed, in which case the I/O runs to completion and
+    /// reports normally (asynManager.c:1645-1659).
+    pub fn cancel(&self) -> bool {
+        self.0
+            .compare_exchange(
+                STATE_QUEUED,
+                STATE_CANCELLED,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .is_ok()
     }
 
+    /// Executor at dequeue: claim the request for execution (C dequeue under
+    /// `asynManagerLock`, asynManager.c:1661-1666 is the cancel counterpart).
+    ///
+    /// Returns `false` iff the request was cancelled while queued, in which
+    /// case the executor must drop it and report cancellation. Otherwise the
+    /// token enters `Running`. A multi-phase plan re-claims the same token for
+    /// its next phase from `Done`, so this transitions from either `Queued` or
+    /// `Done`; only `Cancelled` is terminal.
+    pub fn begin_running(&self) -> bool {
+        let mut cur = self.0.load(AtomicOrdering::Acquire);
+        loop {
+            if cur == STATE_CANCELLED {
+                return false;
+            }
+            match self.0.compare_exchange_weak(
+                cur,
+                STATE_RUNNING,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Executor at completion: mark the running request finished so a later
+    /// cancel is a no-op (the C `wasQueued==0` window). Idempotent and a no-op
+    /// from any state other than `Running`.
+    pub fn finish(&self) {
+        let _ = self.0.compare_exchange(
+            STATE_RUNNING,
+            STATE_DONE,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        );
+    }
+
+    /// True iff the request was cancelled while still queued — the C
+    /// `wasQueued==true` outcome. A cancel that lost the race (the executor had
+    /// already begun running) leaves the state `Running`/`Done`, so this stays
+    /// `false` and the completed I/O applies normally.
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(AtomicOrdering::Acquire)
+        self.0.load(AtomicOrdering::Acquire) == STATE_CANCELLED
     }
 }
 
@@ -485,10 +563,73 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cancel_token() {
+    fn cancel_succeeds_only_while_queued() {
+        // C `wasQueued==1`: a still-queued request is cancelled and removed.
         let token = CancelToken::new();
         assert!(!token.is_cancelled());
-        token.cancel();
+        assert!(token.cancel(), "a queued request reports wasQueued==true");
+        assert!(token.is_cancelled());
+        // The executor then refuses to run it (it was removed from the queue).
+        assert!(
+            !token.begin_running(),
+            "a cancelled request is not claimed for execution"
+        );
+    }
+
+    #[test]
+    fn cancel_after_begin_running_is_noop() {
+        // C `wasQueued==0` while `callbackActive`: the I/O runs to completion.
+        let token = CancelToken::new();
+        assert!(
+            token.begin_running(),
+            "the executor claims a queued request"
+        );
+        assert!(
+            !token.cancel(),
+            "a cancel during execution reports wasQueued==false"
+        );
+        assert!(
+            !token.is_cancelled(),
+            "the running I/O is not treated as cancelled"
+        );
+        token.finish();
+        assert!(!token.is_cancelled(), "the completed I/O applies normally");
+    }
+
+    #[test]
+    fn cancel_after_finish_is_noop() {
+        // C `wasQueued==0` after the callback finished: nothing to cancel.
+        let token = CancelToken::new();
+        assert!(token.begin_running());
+        token.finish();
+        assert!(
+            !token.cancel(),
+            "a cancel after completion reports wasQueued==false"
+        );
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn begin_running_reclaims_token_for_next_phase() {
+        // A WriteRead plan threads one token through two phases; the read phase
+        // re-claims the token the write phase finished.
+        let token = CancelToken::new();
+        assert!(token.begin_running(), "write phase claims the queued token");
+        token.finish();
+        assert!(
+            token.begin_running(),
+            "read phase re-claims the finished token"
+        );
+        token.finish();
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn cancel_is_terminal_across_phases() {
+        // Once cancelled while queued, no later phase may run.
+        let token = CancelToken::new();
+        assert!(token.cancel());
+        assert!(!token.begin_running(), "cancelled is terminal");
         assert!(token.is_cancelled());
     }
 }

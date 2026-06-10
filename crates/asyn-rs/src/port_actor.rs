@@ -56,6 +56,18 @@ impl ActorMessage {
     }
 }
 
+/// Marks a claimed request's cancel token `Done` when execution leaves the
+/// dispatch scope, on every exit path (reply, early return, panic). This is the
+/// C `callbackActive -> idle` transition: once the port thread finishes the
+/// callback, a pending `cancelRequest` reports `wasQueued==0` (asynManager.c:1645-1659).
+struct FinishGuard(CancelToken);
+
+impl Drop for FinishGuard {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
+
 // Heap ordering: higher priority first, then nearer deadline, then lower seq (FIFO)
 impl Eq for ActorMessage {}
 impl PartialEq for ActorMessage {
@@ -192,14 +204,24 @@ impl PortActor {
             ..
         } = msg;
 
-        // Cancel check
-        if cancel.is_cancelled() {
+        // Claim the request for execution. This is the C dequeue under
+        // `asynManagerLock`: `begin_running` transitions the cancel token
+        // `Queued -> Running`, which closes the window in which an `AQR`
+        // `cancelRequest` could report `wasQueued==1` (asynManager.c:1661-1666).
+        // It fails only if the request was already cancelled while queued, in
+        // which case it was removed from the queue and must be dropped.
+        if !cancel.begin_running() {
             let _ = reply.send(Err(AsynError::Status {
                 status: AsynStatus::Error,
                 message: "request cancelled".into(),
             }));
             return;
         }
+        // From here the request is running (C `callbackActive`): a concurrent
+        // cancel can no longer win, and `finish` marks it `Done` on every exit
+        // path so a late cancel stays a no-op and a multi-phase plan can
+        // re-claim the token for its next phase.
+        let _finish = FinishGuard(cancel);
 
         let is_connect_op = matches!(
             op,

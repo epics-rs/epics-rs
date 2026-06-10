@@ -2455,13 +2455,19 @@ impl Record for AsynRecord {
             //
             // When this record runs performIO off the scan thread (a
             // can_block port, see `spawn_async_io`), `io_inflight` holds the
-            // request's actor CancelToken. Cancelling it makes the actor drop
-            // a still-queued phase at its cancel check — the `wasQueued==true`
-            // analogue — so `run_io_plan` records the "I/O request canceled"
-            // outcome (CANCELED_MSG). The completion re-entry is the single
-            // owner that applies that outcome to ERRS and clears `io_inflight`
-            // (the `state = stateIdle` transition), so AQR must NOT touch
-            // `io_inflight` or supersede the re-entry token here: the
+            // request's actor CancelToken. The token's state machine reproduces
+            // the `wasQueued` split by construction: `cancel()` succeeds only
+            // while the phase is still queued (the executor has not yet claimed
+            // it with `begin_running`), so a still-queued phase is dropped and
+            // `run_io_plan` records the "I/O request canceled" outcome
+            // (CANCELED_MSG) — the `wasQueued==true` analogue. A cancel that
+            // arrives after the executor began running the phase loses the CAS
+            // and is a no-op: the I/O completes and applies normally, matching
+            // C `cancelRequest` returning `wasQueued==0` once the callback is
+            // active (asynManager.c:1645-1659). The completion re-entry is the
+            // single owner that applies the outcome to ERRS and clears
+            // `io_inflight` (the `state = stateIdle` transition), so AQR must
+            // NOT touch `io_inflight` or supersede the re-entry token here: the
             // completion token is minted post-I/O and is always current
             // (mint advances the generation), so `cancel_async_reentry` could
             // only strand the record by racing the mint, never suppress it.
@@ -3366,15 +3372,17 @@ mod tests {
         assert_eq!(rec.i32inp, 7, "the read value is applied on re-entry");
     }
 
-    /// Boundary: `AQR` (Abort Queue Request) cancels an in-flight off-thread
-    /// request. C `special()` for `AQR` (asynRecord.c:393-408) calls
-    /// `cancelRequest`; a request that was still queued is removed
-    /// (`wasQueued==true`, asynManager.c:1661-1666), reported as "I/O request
-    /// canceled" with the record left idle. Here the read is parked in the
-    /// driver while `AQR` cancels the request's actor token — the completion
-    /// re-entry then applies CANCELED, not the device value.
+    /// Boundary: `AQR` (Abort Queue Request) that loses the race to the port
+    /// thread is the C `wasQueued==0` / `callbackActive` case. C `special()`
+    /// for `AQR` (asynRecord.c:393-408) calls `cancelRequest`; once the request
+    /// has been dequeued and its callback is running, `cancelRequest` reports
+    /// `wasQueued==0` and waits for the callback (asynManager.c:1645-1659), so
+    /// the I/O runs to completion and is reported normally — `AQR` does NOT
+    /// raise "I/O request canceled". Here the read is already parked in the
+    /// driver (the executor has claimed the token, `Running`) when `AQR` fires,
+    /// so the completion re-entry applies the device value, not CANCELED.
     #[tokio::test]
-    async fn aqr_cancels_inflight_request_and_reports_canceled() {
+    async fn aqr_after_driver_dequeue_runs_to_completion() {
         use crate::interrupt::InterruptManager;
         use crate::param::ParamType;
         use crate::port::{PortDriver, PortDriverBase, PortFlags};
@@ -3458,7 +3466,8 @@ mod tests {
             "the off-thread read must reach the driver before AQR"
         );
 
-        // AQR cancels the in-flight request's actor token, then release the
+        // AQR fires while the read is already running in the driver: the token
+        // is `Running`, so the cancel loses (C `wasQueued==0`). Release the
         // parked read so the phase completes and the orchestration finishes.
         rec.special("AQR", true).unwrap();
         release.wait();
@@ -3472,22 +3481,21 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
-        assert!(
-            filled,
-            "the cancelled request must still produce an outcome"
-        );
+        assert!(filled, "the running request still produces an outcome");
 
-        // Completion re-entry applies CANCELED, not the device value.
+        // Completion re-entry applies the device value: the cancel lost the
+        // race (C `wasQueued==0`), so the I/O ran to completion and is reported
+        // normally — no "I/O request canceled".
         let out2 = rec.process().unwrap();
         assert_eq!(out2.result, RecordProcessResult::Complete);
-        assert!(rec.io_inflight.is_none(), "AQR leaves the record idle");
-        assert_eq!(
-            rec.errs, "I/O request canceled",
-            "a cancelled in-flight request reports the C AQR message"
+        assert!(rec.io_inflight.is_none(), "completion re-entry leaves idle");
+        assert!(
+            rec.errs.is_empty(),
+            "a cancel that lost the race does not report CANCELED (wasQueued==0)"
         );
         assert_eq!(
-            rec.i32inp, 0,
-            "the device read value is discarded when the request is cancelled"
+            rec.i32inp, 7,
+            "the device read value applies normally when the cancel loses the race"
         );
     }
 

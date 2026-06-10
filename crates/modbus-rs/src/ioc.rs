@@ -878,6 +878,23 @@ impl PortDriver for ModbusPortDriver {
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
         let dt = self.datatype_of(user.reason)?;
+        // C `writeOctet` (drvModbusAsyn.cpp:1545-1562) accepts only the
+        // write-multiple-registers functions; any other function returns
+        // asynError.
+        let function = self.engine.config().function;
+        if !matches!(
+            function,
+            ModbusFunctionCode::WriteMultipleRegisters
+                | ModbusFunctionCode::WriteMultipleRegistersF23
+        ) {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!(
+                    "Modbus function {function:?} cannot write a string; \
+                     configure a write-multiple-registers function"
+                ),
+            });
+        }
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
         // Word budget for the string. In relative mode the string shares the
         // polled buffer, so it is bounded by the registers above `addr`. In
@@ -889,7 +906,25 @@ impl PortDriver for ModbusPortDriver {
         } else {
             self.engine.config().length - user.addr as usize
         };
-        let (regs, _) = datatype::write_string(dt, data, budget).map_err(to_asyn)?;
+        // C `writeOctet` (drvModbusAsyn.cpp:1519-1529) writes a terminating
+        // zero for the Z-string types: it builds a copy guaranteed to end in
+        // '\0' and sizes the register write at `getStringLen(maxChars + 1)`, so
+        // the NUL lands in the registers (and is then excluded from the
+        // reported character count). Append it here so the PLC receives the
+        // terminator; `write_string` caps the output at `budget` registers.
+        let payload;
+        let bytes: &[u8] = if dt.is_zero_terminated_string() {
+            payload = {
+                let mut v = Vec::with_capacity(data.len() + 1);
+                v.extend_from_slice(data);
+                v.push(0);
+                v
+            };
+            &payload
+        } else {
+            data
+        };
+        let (regs, _) = datatype::write_string(dt, bytes, budget).map_err(to_asyn)?;
         self.flush_write(user.addr, &regs)?;
         // Relative mode caches the value and fans out its monitor (see
         // `cache_write_numeric`); absolute mode has no parameter-table slot
@@ -1960,6 +1995,103 @@ mod tests {
         assert!(
             driver.write_uint32_digital(&mut user, 1, 1).is_err(),
             "digital write on a read-function port must be rejected"
+        );
+    }
+
+    /// A Z-string (zero-terminated) octet write must place a terminating NUL
+    /// register on the wire. C `writeOctet` (drvModbusAsyn.cpp:1519-1529) sizes
+    /// the write at `getStringLen(maxChars + 1)`, so "Hi" through ZSTRING_HIGH
+    /// writes three registers — 'H', 'i', and a NUL — not two.
+    #[test]
+    fn zstring_octet_write_appends_terminating_nul() {
+        // FC16 echo: three registers written at address 0.
+        let echo = tcp_response(1, &[0x01, 0x10, 0x00, 0x00, 0x00, 0x03]);
+        let transport = ReplayTransport::new(vec![Ok(echo)]);
+        let written = transport.written_handle();
+        let mut cfg = test_config(0, 8);
+        cfg.function = ModbusFunctionCode::WriteMultipleRegisters;
+        let mut driver =
+            ModbusPortDriver::new("MB_ZSTR_W", cfg, LinkType::Tcp, Box::new(transport))
+                .expect("relative string config must build");
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::ZStringHigh.as_str())
+            .expect("ZSTRING_HIGH parameter must exist");
+        let mut user = AsynUser::new(reason);
+        user.addr = 0;
+        driver
+            .write_octet(&mut user, b"Hi")
+            .expect("zstring write must succeed");
+        let frames = written.lock().unwrap();
+        assert_eq!(frames.len(), 1, "one FC16 write request");
+        // FC16 header: [unit, 0x10, addr_hi, addr_lo, qty_hi, qty_lo, byte_ct].
+        assert_eq!(
+            &frames[0][6..13],
+            &[0x01, 0x10, 0x00, 0x00, 0x00, 0x03, 0x06],
+            "quantity 3 registers, byte count 6 — includes the NUL register"
+        );
+        // 'H'=0x4800, 'i'=0x6900, NUL=0x0000 (ZSTRING_HIGH = char in high byte).
+        assert_eq!(
+            &frames[0][13..19],
+            &[0x48, 0x00, 0x69, 0x00, 0x00, 0x00],
+            "third register is the terminating NUL"
+        );
+    }
+
+    /// A non-Z string octet write must NOT append a NUL — the distinction is
+    /// the whole point of the Z-string types. "Hi" through STRING_HIGH writes
+    /// exactly two registers.
+    #[test]
+    fn plain_string_octet_write_has_no_terminating_nul() {
+        let echo = tcp_response(1, &[0x01, 0x10, 0x00, 0x00, 0x00, 0x02]);
+        let transport = ReplayTransport::new(vec![Ok(echo)]);
+        let written = transport.written_handle();
+        let mut cfg = test_config(0, 8);
+        cfg.function = ModbusFunctionCode::WriteMultipleRegisters;
+        let mut driver = ModbusPortDriver::new("MB_STR_W", cfg, LinkType::Tcp, Box::new(transport))
+            .expect("relative string config must build");
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::StringHigh.as_str())
+            .expect("STRING_HIGH parameter must exist");
+        let mut user = AsynUser::new(reason);
+        user.addr = 0;
+        driver
+            .write_octet(&mut user, b"Hi")
+            .expect("plain string write must succeed");
+        let frames = written.lock().unwrap();
+        assert_eq!(frames.len(), 1, "one FC16 write request");
+        assert_eq!(
+            &frames[0][6..13],
+            &[0x01, 0x10, 0x00, 0x00, 0x00, 0x02, 0x04],
+            "quantity 2 registers, byte count 4 — no NUL register"
+        );
+        assert_eq!(
+            &frames[0][13..17],
+            &[0x48, 0x00, 0x69, 0x00],
+            "two registers, no terminator"
+        );
+    }
+
+    /// C `writeOctet` (drvModbusAsyn.cpp:1557-1562) accepts only the
+    /// write-multiple-registers functions; a string write on any other
+    /// function returns asynError.
+    #[test]
+    fn octet_write_rejects_non_multiple_register_function() {
+        let mut cfg = test_config(0, 8);
+        cfg.function = ModbusFunctionCode::WriteSingleRegister;
+        let mut driver =
+            ModbusPortDriver::new("MB_STR_BADFN", cfg, LinkType::Tcp, Box::new(NullTransport))
+                .expect("config must build");
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::StringHigh.as_str())
+            .expect("STRING_HIGH parameter must exist");
+        let mut user = AsynUser::new(reason);
+        user.addr = 0;
+        assert!(
+            driver.write_octet(&mut user, b"Hi").is_err(),
+            "string write on a single-register port must be rejected"
         );
     }
 

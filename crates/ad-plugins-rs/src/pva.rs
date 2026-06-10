@@ -62,7 +62,7 @@ impl NDPluginProcess for PvaProcessor {
     fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
         let payload = ndarray_to_pv_field(array);
 
-        // Regression R0604-BRQSRV-NATIVE-PVA-BAD-POST-CLEARS-VALUE-1.
+        // Regression.
         // `post` validates against the canonical NTNDArray descriptor and
         // is the single owner of `latest`/`subscribers`: a malformed frame
         // is rejected without replacing the last good snapshot or reaching
@@ -486,7 +486,7 @@ mod tests {
         );
     }
 
-    /// Regression R0604-BRQSRV-NATIVE-PVA-BAD-POST-CLEARS-VALUE-1.
+    /// Regression.
     /// A real NDArray frame must match the canonical `nt_nd_array_desc()`
     /// the producer advertises in its handle; otherwise `post` would reject
     /// every frame and the served value would stay empty. Posting a real
@@ -556,7 +556,7 @@ mod tests {
         }
     }
 
-    /// Regression R0604-ADPVA-ATTR-TIMESTAMP-1.
+    /// Regression.
     ///
     /// C ADCore converters set only name/descriptor/source/sourceType/value
     /// on each NTAttribute (ntndArrayConverterPvxs.cpp::fromAttributes);
@@ -603,7 +603,7 @@ mod tests {
         };
 
         // Top-level timestamps follow the image source, with the EPICS->POSIX
-        // offset added (see R0604-ADPVA-TIMESTAMP-1): dataTimeStamp from the
+        // offset added: dataTimeStamp from the
         // floating-point `time_stamp`, timeStamp from the integer `epicsTS`.
         let offset = ad_core_rs::timestamp::EPICS_EPOCH_OFFSET as i64;
         assert_eq!(read_ts(s, "dataTimeStamp"), (1234 + offset, 0));
@@ -712,7 +712,7 @@ mod tests {
         assert_eq!(src_type(4), 4);
     }
 
-    /// Regression R0604-ADPVA-TIMESTAMP-1.
+    /// Regression.
     ///
     /// C ADCore fills the two NTNDArray time fields from two distinct sources
     /// (ntndArrayConverter.cpp:477-501): `dataTimeStamp` from the floating-point

@@ -1,7 +1,10 @@
+use super::link_status::{
+    DBF_UNKNOWN, LINK_CON as LNKV_CON, LINK_STATUS_CHOICES as SSEQ_LNKV_CHOICES, classify_link,
+};
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
 use crate::server::record::{
-    FieldDesc, LinkType, ProcessAction, ProcessOutcome, Record, RecordProcessResult, parse_link_v2,
+    FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
 use std::sync::Arc;
@@ -21,36 +24,12 @@ const SSEQ_WAIT_CHOICES: &[&str] = &[
     "After8", "After9", "AfterA",
 ];
 
-/// Choice labels for the per-step DOL/LNK link-status menu, in index
-/// order. C `menu(sseqLNKV)` (sseqRecord.dbd:20): 0=Ext PV NC, 1=Ext PV
-/// OK, 2=Local PV, 3=Constant. Shared by every `DOLnV`/`LNKnV` field.
-const SSEQ_LNKV_CHOICES: &[&str] = &["Ext PV NC", "Ext PV OK", "Local PV", "Constant"];
-
 const NUM_STEPS: usize = 10;
 
 /// `SELM` menu indices (C `menu(sseqSELM)`): the step-selection mode.
 const SELM_ALL: i16 = 0;
 const SELM_SPECIFIED: i16 = 1;
 const SELM_MASK: i16 = 2;
-
-/// `menu(sseqLNKV)` indices (sseqRecord.dbd:20): the per-step DOL/LNK
-/// connection status served by `DOLnV`/`LNKnV`. Index 1 (`EXT`, external
-/// PV connected) is a valid menu value but is never *produced* by this
-/// port: epics-base-rs has no CA/PVA client to confirm a remote link is
-/// connected, so an external link always reports `EXT_NC` (see
-/// `refresh_link_status`). The choice label is still served via
-/// `SSEQ_LNKV_CHOICES`.
-const LNKV_EXT_NC: i16 = 0; // external PV, not connected
-const LNKV_LOC: i16 = 2; // local PV (this IOC's database)
-const LNKV_CON: i16 = 3; // constant / unset link
-
-/// `DTn`/`LTn` sentinel for "no resolvable target field type", C
-/// `DBF_unknown` (-1). Used for every constant, external, and
-/// unresolvable link. C `init_record` further distinguishes a constant
-/// DOL (`DBF_NOACCESS`) from a constant LNK (`DBF_unknown`)
-/// (sseqRecord.c:206,225); that split is collapsed to a single unknown
-/// here because the Rust `DbFieldType` model has no `NOACCESS` variant.
-const DBF_UNKNOWN: i16 = -1;
 
 /// Per-step field-name tables (1-based suffix `1`..`9`, `A`), used to
 /// address `DOLn`/`DOn`/`LNKn`/`WTGn` as the `&'static str` link/target
@@ -798,29 +777,6 @@ async fn reenter_now(name: &str, handle: &AsyncDbHandle) {
         let (waitset, completion) = AsyncDbHandle::new_put_notify();
         waitset.leave();
         handle.reprocess_on_notify(token, completion);
-    }
-}
-
-/// Classify one DOL/LNK link into its `menu(sseqLNKV)` connection status
-/// and its `DTn`/`LTn` target field type, mirroring C `checkLinks`
-/// (sseqRecord.c:862-941) and `init_record` (sseqRecord.c:202-250).
-///
-/// Returns `(status, field_type)`. See [`SseqRecord::refresh_link_status`]
-/// for why an external (CA/PVA) link is reported as not-connected.
-async fn classify_link(handle: &AsyncDbHandle, link: &str) -> (i16, i16) {
-    match parse_link_v2(link).link_type() {
-        // Empty / constant link: C → CON, no resolvable field type.
-        LinkType::Empty | LinkType::Constant => (LNKV_CON, DBF_UNKNOWN),
-        // Local DB link: C `dbNameToAddr` ok → LOC + the addressed field's
-        // type. A DB-syntax link whose target is not on this IOC resolves to
-        // `None` and falls through to EXT_NC (C `init_record` else branch).
-        LinkType::Db => match handle.link_target_field_type(link).await {
-            Some(ft) => (LNKV_LOC, ft as i16),
-            None => (LNKV_EXT_NC, DBF_UNKNOWN),
-        },
-        // CA/PVA/other external link: epics-base-rs cannot introspect a
-        // remote field's connection state or type — report not-connected.
-        LinkType::Ca | LinkType::Other => (LNKV_EXT_NC, DBF_UNKNOWN),
     }
 }
 

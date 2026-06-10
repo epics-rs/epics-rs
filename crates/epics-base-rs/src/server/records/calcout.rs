@@ -1,6 +1,19 @@
+use super::link_status::{LINK_CON, LINK_STATUS_CHOICES, classify_link};
 use crate::error::{CaError, CaResult};
+use crate::server::database::AsyncDbHandle;
 use crate::server::record::{FieldDesc, ProcessAction, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue, PvString};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Per-input link-status diagnostic field names (`INAV`..`INUV`), one per
+/// calc input A..U, in C `menu(calcoutINAV)` order
+/// (calcoutRecord.dbd.pod:865-1005). `OUTV` (the OUT-link status) is handled
+/// separately because the OUT link is a common field, not a calcout field.
+const CALCOUT_INAV_FIELDS: [&str; 21] = [
+    "INAV", "INBV", "INCV", "INDV", "INEV", "INFV", "INGV", "INHV", "INIV", "INJV", "INKV", "INLV",
+    "INMV", "INNV", "INOV", "INPV", "INQV", "INRV", "INSV", "INTV", "INUV",
+];
 
 /// Calcout record — calc with output.
 pub struct CalcoutRecord {
@@ -110,6 +123,28 @@ pub struct CalcoutRecord {
     // Cached compiled expressions (RPCL/ORPC equivalents)
     rpcl: Option<crate::calc::CompiledExpr>,
     orpc: Option<crate::calc::CompiledExpr>,
+    // Per-input link connection status INAV..INUV and the OUT-link status
+    // OUTV, menu(calcoutINAV). C `calcoutRecord.c::init_record`
+    // (calcoutRecord.c:160-189) classifies each INPA..INPU input link and
+    // the OUT link into these. Index 0..21 maps to inputs A..U.
+    in_status: [i16; 21],
+    out_status: i16,
+    // Mirror of the common OUT-link string, synced from `CommonFields::out`
+    // in `check_alarms`. The OUT link is a common field, not a calcout-owned
+    // field, so this is the only in-record path to observe it for OUTV
+    // classification (see `check_alarms`).
+    out: String,
+    // Async surface for posting the live INAV..INUV/OUTV diagnostics
+    // (C `checkLinks`), wired by `set_async_context`.
+    async_ctx: Option<(String, AsyncDbHandle)>,
+    // Monotonic generation guarding the link-status refresh. Each refresh
+    // classifies a *snapshot* of the link strings off-thread; a later
+    // refresh (an INP/OUT re-point) must win over an earlier one regardless
+    // of which spawned task finishes first. The invariant — only the latest
+    // classification may be published — is enforced by stamping each refresh
+    // with the bumped generation and dropping a post whose generation is no
+    // longer current.
+    link_gen: Arc<AtomicU64>,
 }
 
 impl Default for CalcoutRecord {
@@ -203,6 +238,14 @@ impl Default for CalcoutRecord {
             calc_alarm: false,
             rpcl: None,
             orpc: None,
+            // C `init_record` leaves an empty/unconfigured link CON
+            // (calcoutRecord.c:166-167); the refresh re-classifies once the
+            // async context exists.
+            in_status: [LINK_CON; 21],
+            out_status: LINK_CON,
+            out: String::new(),
+            async_ctx: None,
+            link_gen: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -234,6 +277,102 @@ impl CalcoutRecord {
             5 => self.pval == 0.0 && self.val != 0.0,      // Transition to Non-zero
             _ => false,                                    // Unknown: don't output (like C)
         }
+    }
+
+    /// The 21 input link strings (INPA..INPU) in input order A..U.
+    fn input_links(&self) -> [String; 21] {
+        [
+            self.inpa.clone(),
+            self.inpb.clone(),
+            self.inpc.clone(),
+            self.inpd.clone(),
+            self.inpe.clone(),
+            self.inpf.clone(),
+            self.inpg.clone(),
+            self.inph.clone(),
+            self.inpi.clone(),
+            self.inpj.clone(),
+            self.inpk.clone(),
+            self.inpl.clone(),
+            self.inpm.clone(),
+            self.inpn.clone(),
+            self.inpo.clone(),
+            self.inpp.clone(),
+            self.inpq.clone(),
+            self.inpr.clone(),
+            self.inps.clone(),
+            self.inpt.clone(),
+            self.inpu.clone(),
+        ]
+    }
+
+    /// Map an `INAV`..`INUV` field name to the input index 0..21 (A..U), or
+    /// `None` for any other name (including `OUTV`, which the caller handles
+    /// separately). The status fields are `IN<letter>V`, distinct from the
+    /// `INP<letter>` link fields (which have no trailing `V`).
+    fn input_status_index(name: &str) -> Option<usize> {
+        let mid = name.strip_prefix("IN")?.strip_suffix('V')?;
+        let [c] = mid.as_bytes() else { return None };
+        match c {
+            b'A'..=b'U' => Some((c - b'A') as usize),
+            _ => None,
+        }
+    }
+
+    /// True for the INP link-config fields whose put must re-classify the
+    /// link diagnostics (C `calcoutRecord.c::special` SPC_MOD → `checkLinks`).
+    /// `OUT` is excluded: it is a common field, so its post-put string is not
+    /// visible here — OUTV re-classifies from `check_alarms` instead.
+    fn is_link_config_field(name: &str) -> bool {
+        match name.strip_prefix("INP") {
+            Some(rest) => matches!(rest.as_bytes(), [b'A'..=b'U']),
+            None => false,
+        }
+    }
+
+    /// Classify every INP A..U link and the OUT link into their
+    /// `menu(calcoutINAV)` connection status and post the live
+    /// `INAV`..`INUV`/`OUTV` diagnostics, mirroring C
+    /// `calcoutRecord.c::init_record` (calcoutRecord.c:160-189) and the
+    /// `checkLinksCallback` re-poll. epics-base-rs surfaces no link
+    /// connection-change signal, so (like sseq) the refresh runs at record
+    /// init (`set_async_context`), on `special()` of an INP field, and when
+    /// `check_alarms` observes the OUT link change. No-op without an async
+    /// context.
+    fn refresh_link_status(&self) {
+        let Some((name, handle)) = &self.async_ctx else {
+            return;
+        };
+        let name = name.clone();
+        let handle = handle.clone();
+        let inputs = self.input_links();
+        let out = self.out.clone();
+        let gen_counter = self.link_gen.clone();
+        // Stamp this refresh. A concurrent later refresh bumps the counter
+        // again; this task then sees its `gen` is stale and drops its post so
+        // it cannot clobber the newer classification (e.g. an init-time
+        // snapshot finishing after a runtime INP re-point).
+        let gen_id = gen_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        tokio::spawn(async move {
+            // Let `add_record` finish registering this record before the init
+            // post (this task may be spawned from `set_async_context`, which
+            // runs just before the record is inserted into the map).
+            tokio::task::yield_now().await;
+            let mut fields: Vec<(String, EpicsValue)> = Vec::with_capacity(22);
+            for (i, link) in inputs.iter().enumerate() {
+                let (status, _ft) = classify_link(&handle, link).await;
+                fields.push((
+                    CALCOUT_INAV_FIELDS[i].to_string(),
+                    EpicsValue::Enum(status as u16),
+                ));
+            }
+            let (out_status, _ft) = classify_link(&handle, &out).await;
+            fields.push(("OUTV".to_string(), EpicsValue::Enum(out_status as u16)));
+            // Publish only if no newer refresh was issued meanwhile.
+            if gen_counter.load(Ordering::SeqCst) == gen_id {
+                let _ = handle.post_fields(&name, fields).await;
+            }
+        });
     }
 }
 
@@ -653,6 +792,119 @@ static CALCOUT_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         read_only: true,
     },
+    // INAV..INUV / OUTV link-status menus (menu(calcoutINAV),
+    // calcoutRecord.dbd.pod:865-1012): DBF_MENU served as DBR_ENUM, SPC_NOMOD
+    // (read-only to clients; the link-status refresh posts them internally).
+    FieldDesc {
+        name: "INAV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INBV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INCV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INDV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INEV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INFV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INGV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INHV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INIV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INJV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INKV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INLV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INMV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INNV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INOV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INPV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INQV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INRV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INSV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INTV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "INUV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "OUTV",
+        dbf_type: DbFieldType::Enum,
+        read_only: true,
+    },
 ];
 
 /// Choice labels for the output-execute-option menu, in index order.
@@ -883,7 +1135,18 @@ impl Record for CalcoutRecord {
             "LS" => Some(EpicsValue::Double(self.ls)),
             "LT" => Some(EpicsValue::Double(self.lt)),
             "LU" => Some(EpicsValue::Double(self.lu)),
-            _ => None,
+            // INAV..INUV / OUTV link-status menus (menu(calcoutINAV),
+            // calcoutRecord.dbd.pod:865-1012), served as DBR_ENUM; labels
+            // from menu_field_choices. Live status from refresh_link_status.
+            _ => {
+                if let Some(idx) = Self::input_status_index(name) {
+                    Some(EpicsValue::Enum(self.in_status[idx] as u16))
+                } else if name == "OUTV" {
+                    Some(EpicsValue::Enum(self.out_status as u16))
+                } else {
+                    None
+                }
+            }
         }
     }
 
@@ -1196,7 +1459,27 @@ impl Record for CalcoutRecord {
                 }
                 Ok(())
             }
-            _ => Err(CaError::FieldNotFound(name.to_string())),
+            _ => {
+                // INAV..INUV / OUTV link-status menus are read-only to
+                // clients (SPC_NOMOD, calcoutRecord.dbd.pod:867); the
+                // link-status refresh (`post_fields` → `put_field_internal`)
+                // lands here to store the connection status it just computed.
+                if let Some(idx) = Self::input_status_index(name) {
+                    self.in_status[idx] = value
+                        .to_f64()
+                        .ok_or_else(|| CaError::TypeMismatch(name.into()))?
+                        as i16;
+                    Ok(())
+                } else if name == "OUTV" {
+                    self.out_status = value
+                        .to_f64()
+                        .ok_or_else(|| CaError::TypeMismatch(name.into()))?
+                        as i16;
+                    Ok(())
+                } else {
+                    Err(CaError::FieldNotFound(name.to_string()))
+                }
+            }
         }
     }
 
@@ -1208,6 +1491,9 @@ impl Record for CalcoutRecord {
         match field {
             "OOPT" => Some(CALCOUT_OOPT_CHOICES),
             "DOPT" => Some(CALCOUT_DOPT_CHOICES),
+            // INAV..INUV / OUTV link-status menus (menu(calcoutINAV)).
+            "OUTV" => Some(LINK_STATUS_CHOICES),
+            _ if Self::input_status_index(field).is_some() => Some(LINK_STATUS_CHOICES),
             _ => None,
         }
     }
@@ -1245,5 +1531,140 @@ impl Record for CalcoutRecord {
     fn can_device_write(&self) -> bool {
         // calcout has a soft OUT link, not device support
         false
+    }
+
+    fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
+        self.async_ctx = Some((name, db));
+        // C `init_record` (calcoutRecord.c:160-189) classifies every INP and
+        // the OUT link into INAV..INUV/OUTV. This is the framework's
+        // init-time async hook, so refresh now. The OUT link is a common
+        // field not visible here; `out` syncs from `check_alarms` on the
+        // first process, so OUTV reaches its classification then.
+        self.refresh_link_status();
+    }
+
+    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        if !after {
+            return Ok(());
+        }
+        // A put to an INP link re-classifies the link diagnostics: C
+        // `calcoutRecord.c::special` (SPC_MOD) re-runs `checkLinks`. The INP
+        // string the put just stored is re-read by `refresh_link_status`.
+        // OUT is excluded here (see `is_link_config_field`); it re-classifies
+        // from `check_alarms`.
+        if Self::is_link_config_field(field) {
+            self.refresh_link_status();
+        }
+        Ok(())
+    }
+
+    fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        // The OUT link lives in the common fields, not a calcout-owned field,
+        // so mirror it here — the one in-record hook that carries
+        // `CommonFields` — and re-classify OUTV when it changes. C classifies
+        // the OUT link in the same `init_record` loop as the inputs, at
+        // `i == CALCPERFORM_NARGS` (calcoutRecord.c:160-189). A record that
+        // has not yet processed shows OUTV at its CON default until the first
+        // `check_alarms`; classifying it before that needs the OUT string at
+        // an init hook, which the common-field model does not expose to the
+        // record.
+        if self.out != common.out {
+            self.out = common.out.clone();
+            self.refresh_link_status();
+        }
+    }
+}
+
+#[cfg(test)]
+mod link_status_tests {
+    use super::*;
+
+    // The link-status menu choice labels, C `menu(calcoutINAV)`
+    // (calcoutRecord.dbd.pod:45-50): identical to sseqLNKV.
+    const CHOICES: &[&str] = &["Ext PV NC", "Ext PV OK", "Local PV", "Constant"];
+    const LOC: u16 = 2;
+    const CON: u16 = 3;
+
+    // Boundary: the `IN<letter>V` status field name maps to the input
+    // index A..U, and is distinct from the `INP<letter>` link field (no
+    // trailing `V`) and from `OUTV` (handled separately).
+    #[test]
+    fn input_status_index_boundaries() {
+        assert_eq!(CalcoutRecord::input_status_index("INAV"), Some(0)); // input A
+        assert_eq!(CalcoutRecord::input_status_index("INUV"), Some(20)); // input U (last)
+        assert_eq!(CalcoutRecord::input_status_index("INPV"), Some(15)); // status of input P
+        // OUTV is not an input-status field (caller handles it).
+        assert_eq!(CalcoutRecord::input_status_index("OUTV"), None);
+        // INP<letter> link fields have no trailing V → not a status field.
+        assert_eq!(CalcoutRecord::input_status_index("INPA"), None);
+        assert_eq!(CalcoutRecord::input_status_index("INPU"), None);
+        // 'V' is past 'U' (CALCPERFORM_NARGS == 21) → no such input.
+        assert_eq!(CalcoutRecord::input_status_index("INVV"), None);
+        // Two-letter middle → not a single input.
+        assert_eq!(CalcoutRecord::input_status_index("INABV"), None);
+    }
+
+    // Boundary: `special()` re-classifies only on an INP link put; OUT is a
+    // common field whose post-put string is invisible here.
+    #[test]
+    fn is_link_config_field_only_inp_links() {
+        assert!(CalcoutRecord::is_link_config_field("INPA"));
+        assert!(CalcoutRecord::is_link_config_field("INPU"));
+        assert!(!CalcoutRecord::is_link_config_field("OUT"));
+        assert!(!CalcoutRecord::is_link_config_field("INAV")); // status, not link
+        assert!(!CalcoutRecord::is_link_config_field("CALC"));
+    }
+
+    // Every INAV..INUV and OUTV serves the menu(calcoutINAV) labels; the
+    // INP link fields do not.
+    #[test]
+    fn link_status_menu_labels_served() {
+        let rec = CalcoutRecord::default();
+        for f in CALCOUT_INAV_FIELDS.iter().chain(std::iter::once(&"OUTV")) {
+            assert_eq!(
+                rec.menu_field_choices(f),
+                Some(CHOICES),
+                "{f} must serve menu(calcoutINAV) labels"
+            );
+        }
+        assert_eq!(rec.menu_field_choices("INPA"), None);
+    }
+
+    // Default-constructed record: empty/unconfigured links classify CON
+    // (C calcoutRecord.c:166-167), served as DBR_ENUM index 3.
+    #[test]
+    fn link_status_defaults_to_con() {
+        let rec = CalcoutRecord::default();
+        assert_eq!(rec.get_field("INAV"), Some(EpicsValue::Enum(CON)));
+        assert_eq!(rec.get_field("INUV"), Some(EpicsValue::Enum(CON)));
+        assert_eq!(rec.get_field("OUTV"), Some(EpicsValue::Enum(CON)));
+    }
+
+    // The internal link-status refresh writes through put_field
+    // (post_fields → put_field_internal); a write must round-trip.
+    #[test]
+    fn link_status_internal_put_roundtrips() {
+        let mut rec = CalcoutRecord::default();
+        rec.put_field("INAV", EpicsValue::Enum(LOC)).unwrap();
+        rec.put_field("OUTV", EpicsValue::Enum(LOC)).unwrap();
+        assert_eq!(rec.get_field("INAV"), Some(EpicsValue::Enum(LOC)));
+        assert_eq!(rec.get_field("OUTV"), Some(EpicsValue::Enum(LOC)));
+        // A non-status unknown field still errors.
+        assert!(rec.put_field("NOSUCH", EpicsValue::Enum(0)).is_err());
+    }
+
+    // All 22 status fields are in the field table as DBF_MENU→Enum,
+    // read-only to clients (SPC_NOMOD, calcoutRecord.dbd.pod:867).
+    #[test]
+    fn link_status_fields_are_read_only_enum_in_table() {
+        for name in CALCOUT_INAV_FIELDS.iter().chain(std::iter::once(&"OUTV")) {
+            let fd = CALCOUT_FIELDS
+                .iter()
+                .find(|f| f.name == *name)
+                .unwrap_or_else(|| panic!("{name} missing from CALCOUT_FIELDS"));
+            assert_eq!(fd.dbf_type, DbFieldType::Enum, "{name} must be ENUM");
+            assert!(fd.read_only, "{name} must be read-only (SPC_NOMOD)");
+        }
+        assert_eq!(CALCOUT_INAV_FIELDS.len(), 21);
     }
 }

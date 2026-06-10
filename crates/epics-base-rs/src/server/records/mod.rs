@@ -15,6 +15,7 @@ pub mod fanout;
 pub mod histogram;
 pub mod int64in;
 pub mod int64out;
+pub mod link_status;
 pub mod longin;
 pub mod longout;
 pub mod lsi;

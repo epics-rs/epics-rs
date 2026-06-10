@@ -5,8 +5,8 @@ mod status_update;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::record::{
-    FieldDesc, MENU_ALARM_SEVR, MENU_YES_NO, ProcessAction, ProcessOutcome, Record,
-    RecordProcessResult,
+    FieldDesc, MENU_ALARM_SEVR, MENU_YES_NO, ParsedLink, ProcessAction, ProcessOutcome, Record,
+    RecordProcessResult, parse_link_v2,
 };
 use epics_base_rs::types::EpicsValue;
 
@@ -282,15 +282,39 @@ impl Record for MotorRecord {
     /// exactly the synchronous reads C `motorRecord.cc` performs inside
     /// `do_work`/`process_motor_info`.
     ///
-    /// URIP=Yes: pull the external readback from the RDBL link. C
-    /// `process_motor_info` (motorRecord.cc:3687) does
-    /// `dbGetLink(&pmr->rdbl, DBR_DOUBLE, &rdblvalue, ...)` and scales it into
-    /// RRBV (`rrbv = NINT(rdblvalue*rres/mres)`). The scaling lives in the
-    /// status-update path; this just feeds it the raw link value through the
-    /// `RDBL_VAL` carrier. C reads with `dbGetLink` regardless of link type,
-    /// so any RDBL link form is read (the framework skips an empty link).
+    /// - CLOSED_LOOP DOL → VAL (motorRecord.cc:1994), gated below.
+    /// - URIP=Yes RDBL → RRBV: C `process_motor_info` (motorRecord.cc:3687)
+    ///   does `dbGetLink(&pmr->rdbl, DBR_DOUBLE, &rdblvalue, ...)` and scales it
+    ///   into RRBV (`rrbv = NINT(rdblvalue*rres/mres)`). The scaling lives in
+    ///   the status-update path; this just feeds it the raw link value through
+    ///   the `RDBL_VAL` carrier. C reads with `dbGetLink` regardless of link
+    ///   type, so any RDBL link form is read (the framework skips an empty
+    ///   link).
     fn pre_process_actions(&mut self) -> Vec<ProcessAction> {
         let mut actions = Vec::new();
+
+        // CLOSED_LOOP: drive VAL from the DOL link (motorRecord.cc:1994-1999).
+        // C reads DOL into .val only when `omsl == closed_loop && dol.type ==
+        // DB_LINK`; a constant DOL is initialised once (recGblInitConstantLink,
+        // :680) and never re-read, so gate on the link parsing as a local DB
+        // link. Writing VAL records a VAL command-source, so the following
+        // process() plans the move to the link value.
+        //
+        // Read only when DMOV (done): C calls do_work — the function holding
+        // the DOL read — for `pmr->dmov` or a non-callback process, but NOT on
+        // a CALLBACK_DATA poll mid-move (motorRecord.cc:1487-1492). Gating on
+        // DMOV mirrors that dominant condition and stops a device poll from
+        // re-reading DOL and clobbering the in-flight target every cycle.
+        if self.stat.dmov
+            && self.links.omsl == 1
+            && matches!(parse_link_v2(&self.links.dol), ParsedLink::Db(_))
+        {
+            actions.push(ProcessAction::ReadDbLink {
+                link_field: "DOL",
+                target_field: "VAL",
+            });
+        }
+
         if self.conv.urip {
             actions.push(ProcessAction::ReadDbLink {
                 link_field: "RDBL",
@@ -463,6 +487,70 @@ mod tests {
                 }
             )),
             "URIP=No must not read the RDBL link"
+        );
+    }
+
+    fn has_dol_read(actions: &[ProcessAction]) -> bool {
+        actions.iter().any(|a| {
+            matches!(
+                a,
+                ProcessAction::ReadDbLink {
+                    link_field: "DOL",
+                    target_field: "VAL",
+                }
+            )
+        })
+    }
+
+    // C motorRecord.cc:1994 — in CLOSED_LOOP mode VAL is driven by the DOL DB
+    // link each idle pass.
+    #[test]
+    fn closed_loop_db_dol_drives_val() {
+        let mut rec = MotorRecord::new();
+        rec.links.omsl = 1; // menuOmsl: closed_loop
+        rec.links.dol = "setpoint_src.VAL".to_string(); // resolves to a DB link
+        assert!(rec.stat.dmov, "record starts done");
+        assert!(
+            has_dol_read(&rec.pre_process_actions()),
+            "CLOSED_LOOP with a DB DOL must read DOL into VAL"
+        );
+    }
+
+    #[test]
+    fn supervisory_omsl_ignores_dol() {
+        let mut rec = MotorRecord::new();
+        rec.links.omsl = 0; // supervisory
+        rec.links.dol = "setpoint_src.VAL".to_string();
+        assert!(
+            !has_dol_read(&rec.pre_process_actions()),
+            "supervisory OMSL must not read DOL"
+        );
+    }
+
+    // C reads DOL only when dol.type == DB_LINK; a constant DOL is initialised
+    // once and not re-read (motorRecord.cc:1994 vs :680).
+    #[test]
+    fn closed_loop_constant_dol_not_reread() {
+        let mut rec = MotorRecord::new();
+        rec.links.omsl = 1;
+        rec.links.dol = "5.0".to_string(); // CONSTANT, not a DB link
+        assert!(
+            !has_dol_read(&rec.pre_process_actions()),
+            "a constant DOL must not be re-read each pass"
+        );
+    }
+
+    // C calls do_work (the DOL read) for pmr->dmov, not on a CALLBACK_DATA
+    // poll mid-move (motorRecord.cc:1487-1492).
+    #[test]
+    fn closed_loop_dol_not_read_mid_move() {
+        let mut rec = MotorRecord::new();
+        rec.links.omsl = 1;
+        rec.links.dol = "setpoint_src.VAL".to_string();
+        rec.stat.dmov = false; // a move is in flight
+        assert!(
+            !has_dol_read(&rec.pre_process_actions()),
+            "DOL must not be re-read while a move is in flight"
         );
     }
 

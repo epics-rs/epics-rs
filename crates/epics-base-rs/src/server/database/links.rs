@@ -109,21 +109,14 @@ pub(crate) struct SeqGroup {
     pub dov: f64,
 }
 
-/// One `sseq` link group — DOL / LNK plus the numeric `DO` and
-/// string `STR` value-storage fields.
-#[derive(Clone, Debug)]
-pub(crate) struct SseqGroup {
-    pub dol: String,
-    pub lnk: String,
-    pub do_val: f64,
-    pub str_val: String,
-    /// DLYn per-step delay in seconds.
-    pub dly: f64,
-}
-
 /// Typed multi-output payload — replaces the legacy `\0`-packed
 /// `Vec<String>` so a link string containing an embedded NUL can
 /// never mis-split (parity review 04-L3).
+///
+/// `sseq` is NOT a variant here: a `sseq` record drives its per-step
+/// `LNKn` writes itself, in `SseqRecord::process()`, through the async
+/// PACT machine (C `sseqRecord.c::processCallback`) — not via this
+/// all-at-once dispatch.
 pub(crate) enum MultiOut {
     /// fanout — 16 forward-link strings (LNK0..LNKF).
     Fanout(Vec<String>),
@@ -131,8 +124,6 @@ pub(crate) enum MultiOut {
     Dfanout(Vec<String>),
     /// seq — 16 link groups (0..F).
     Seq(Vec<SeqGroup>),
-    /// sseq — link groups with DO/STR value storage.
-    Sseq(Vec<SseqGroup>),
 }
 
 impl MultiOut {
@@ -142,7 +133,6 @@ impl MultiOut {
             MultiOut::Fanout(v) => v.len(),
             MultiOut::Dfanout(v) => v.len(),
             MultiOut::Seq(v) => v.len(),
-            MultiOut::Sseq(v) => v.len(),
         }
     }
 }
@@ -151,27 +141,30 @@ impl MultiOut {
 /// [`PvDatabase::dispatch_multi_output`].
 ///
 /// SINGLE-OWNER INVARIANT — each of these record types' output links
-/// (fanout `LNKn`, dfanout `OUTn`, seq/sseq `LNKn`) is dispatched
-/// (value written + target forward-link processed) **exactly once per
-/// process cycle, by `dispatch_multi_output` and by nothing else**.
+/// (fanout `LNKn`, dfanout `OUTn`, seq `LNKn`) is dispatched (value
+/// written + target forward-link processed) **exactly once per process
+/// cycle, by `dispatch_multi_output` and by nothing else**.
 ///
 /// `dispatch_multi_output` is the sole owner because it is the only
 /// path that performs the full C-record model: SELL→SELN resolution,
-/// SELM/OFFS/SHFT selection, per-group DOLn input fetch, sseq
-/// STR/DO value precedence, and per-group DLYn delay.
+/// SELM/OFFS/SHFT selection, per-group DOLn input fetch, and per-group
+/// DLYn delay.
 ///
-/// MUST NOT: the generic `multi_output_links` block in
-/// `processing.rs` (run unconditionally for every record after
-/// `dispatch_multi_output`) must skip any record type listed here.
-/// Without that gate, an `sseq` record — which also implemented the
-/// `Record::multi_output_links` trait method — was dispatched twice
-/// per cycle, writing every selected `LNKn` value to its target a
-/// second time. `multi_output_dispatch_owned` is consulted by that
-/// block (see `run_forward_link_tail_with_putf` §4.6) so the
-/// double-dispatch is structurally impossible, not merely removed at
-/// one call site.
+/// `sseq` is deliberately NOT listed: its `LNKn` writes are owned by
+/// `SseqRecord::process()` (the async PACT machine, C
+/// `sseqRecord.c::processCallback`), not by this dispatch. `sseq` also
+/// does not implement `Record::multi_output_links`, so the generic
+/// block skips it for that reason — there is no second dispatcher to
+/// gate against.
+///
+/// MUST NOT: the generic `multi_output_links` block in `processing.rs`
+/// (run unconditionally for every record after `dispatch_multi_output`)
+/// must skip any record type listed here. `multi_output_dispatch_owned`
+/// is consulted by that block (see `run_forward_link_tail_with_putf`
+/// §4.6) so a double-dispatch is structurally impossible, not merely
+/// removed at one call site.
 pub(crate) fn multi_output_dispatch_owned(record_type: &str) -> bool {
-    matches!(record_type, "fanout" | "dfanout" | "seq" | "sseq")
+    matches!(record_type, "fanout" | "dfanout" | "seq")
 }
 
 impl PvDatabase {
@@ -1127,17 +1120,17 @@ impl PvDatabase {
         // `seqRecord.c:152` all call
         // `dbGetLink(&prec->sell, DBR_USHORT, &prec->seln, 0, 0)` at
         // the top of `process()`, every cycle. Only the `sel` record's
-        // NVL->SELN binding was previously wired; fanout/dfanout/seq/
-        // sseq never read the SELL link, so a SELL pointing at another
+        // NVL->SELN binding was previously wired; fanout/dfanout/seq
+        // never read the SELL link, so a SELL pointing at another
         // record's value field never updated SELN — the selection was
-        // frozen at whatever SELN was initialised to.
+        // frozen at whatever SELN was initialised to. `sseq` reads its
+        // own SELL→SELN in `SseqRecord::pre_input_link_actions` (the
+        // async machine owns the whole cycle), so it is not handled here.
         {
             let sell = {
                 let instance = rec.read().await;
                 match instance.record.record_type() {
-                    "fanout" | "dfanout" | "seq" | "sseq" => {
-                        Some(Self::field_str(&instance, "SELL"))
-                    }
+                    "fanout" | "dfanout" | "seq" => Some(Self::field_str(&instance, "SELL")),
                     _ => None,
                 }
             };
@@ -1287,63 +1280,6 @@ impl PvDatabase {
                         groups.len(),
                     );
                     Some((sel, MultiOut::Seq(groups), None))
-                }
-                "sseq" => {
-                    let selm = Self::field_i16(&instance, "SELM");
-                    let seln = Self::field_u16(&instance, "SELN");
-                    // sseq keeps the legacy 10-group 1-based layout —
-                    // DOL1..DOLA / LNK1..LNKA with DO/STR value storage.
-                    // synApps `sseqRecord.dbd` has NO `OFFS`/`SHFT`
-                    // fields: `SELN` is the 1-based step number, so the
-                    // SELM=Specified base is `SELN - 1` and SELM=Mask
-                    // has no shift — exactly `SelmKind::Dfanout`. Using
-                    // `SelmKind::FanoutSeq` (0-based `SELN + OFFS`)
-                    // mis-selected every Specified/Mask step by one and
-                    // diverged from `SseqRecord::should_execute_step`.
-                    let dol_names = [
-                        "DOL1", "DOL2", "DOL3", "DOL4", "DOL5", "DOL6", "DOL7", "DOL8", "DOL9",
-                        "DOLA",
-                    ];
-                    let lnk_names = [
-                        "LNK1", "LNK2", "LNK3", "LNK4", "LNK5", "LNK6", "LNK7", "LNK8", "LNK9",
-                        "LNKA",
-                    ];
-                    let do_names = [
-                        "DO1", "DO2", "DO3", "DO4", "DO5", "DO6", "DO7", "DO8", "DO9", "DOA",
-                    ];
-                    let str_names = [
-                        "STR1", "STR2", "STR3", "STR4", "STR5", "STR6", "STR7", "STR8", "STR9",
-                        "STRA",
-                    ];
-                    // synApps `sseqRecord` carries a per-step DLYn
-                    // (DLY1..DLYA, 1-based) — C `sseqRecord.c` schedules
-                    // each selected step after its delay via
-                    // `callbackRequestDelayed`, exactly as the base
-                    // `seqRecord` does for its DLY0..DLYF groups.
-                    let dly_names = [
-                        "DLY1", "DLY2", "DLY3", "DLY4", "DLY5", "DLY6", "DLY7", "DLY8", "DLY9",
-                        "DLYA",
-                    ];
-                    let groups: Vec<SseqGroup> = (0..10)
-                        .map(|i| SseqGroup {
-                            dol: Self::field_str(&instance, dol_names[i]),
-                            lnk: Self::field_str(&instance, lnk_names[i]),
-                            do_val: instance
-                                .record
-                                .get_field(do_names[i])
-                                .and_then(|v| v.to_f64())
-                                .unwrap_or(0.0),
-                            str_val: Self::field_str(&instance, str_names[i]),
-                            dly: instance
-                                .record
-                                .get_field(dly_names[i])
-                                .and_then(|v| v.to_f64())
-                                .unwrap_or(0.0),
-                        })
-                        .collect();
-                    let sel =
-                        select_link_indices_ex(SelmKind::Dfanout, selm, seln, 0, 0, groups.len());
-                    Some((sel, MultiOut::Sseq(groups), None))
                 }
                 _ => None,
             }
@@ -1511,43 +1447,6 @@ impl PvDatabase {
                         // LNKn may be a local DB link or an external
                         // `ca://`/`pva://` link — C `dbPutLink` routes
                         // both through the link set's `putValue`
-                        // (dbLink.c:434-448).
-                        let lnk_parsed = crate::server::record::parse_output_link_v2(&grp.lnk);
-                        self.write_out_link_value(&lnk_parsed, value, out_src, visited, depth)
-                            .await;
-                    }
-                }
-            }
-            MultiOut::Sseq(groups) => {
-                for idx in indices {
-                    let grp = &groups[idx];
-                    if grp.lnk.is_empty() {
-                        continue;
-                    }
-                    // Per-step DLYn staggering — C `sseqRecord.c`
-                    // schedules each selected step after its delay
-                    // (`callbackRequestDelayed`). Steps process
-                    // sequentially in index order, each after its own
-                    // delay — identical to the `MultiOut::Seq` arm.
-                    if grp.dly > 0.0 {
-                        tokio::time::sleep(std::time::Duration::from_secs_f64(grp.dly)).await;
-                    }
-                    // Determine value: read from DOL link, or use DO/STR field
-                    let value = if !grp.dol.is_empty() {
-                        let dol_parsed = crate::server::record::parse_link_v2(&grp.dol);
-                        self.read_link_value(&dol_parsed, visited, depth).await
-                    } else if !grp.str_val.is_empty() {
-                        Some(EpicsValue::String(grp.str_val.clone().into()))
-                    } else {
-                        Some(EpicsValue::Double(grp.do_val))
-                    };
-                    if let Some(value) = value {
-                        // sseq `LNKn` is `DBF_OUTLINK` driven via
-                        // `dbPutLink` → `dbDbPutValue` (`dbDbLink.c:388`):
-                        // a bare `LNKn` is NPP. `parse_output_link_v2`
-                        // applies the OUT-link-correct NPP default. An
-                        // external `ca://`/`pva://` `LNKn` is routed
-                        // through the link set's `putValue`
                         // (dbLink.c:434-448).
                         let lnk_parsed = crate::server::record::parse_output_link_v2(&grp.lnk);
                         self.write_out_link_value(&lnk_parsed, value, out_src, visited, depth)

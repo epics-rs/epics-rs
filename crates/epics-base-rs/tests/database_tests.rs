@@ -4118,6 +4118,41 @@ async fn test_write_db_link_runs_before_flnk_target_reads_fresh() {
     }
 }
 
+/// Poll an atomic counter until it reaches `want`, then settle so any
+/// erroneous extra effect would also have landed. The sseq machine
+/// completes via spawned per-step re-entries, so the kicking call returns
+/// before the later steps' `LNKn` writes happen.
+async fn poll_atomic_reaches(label: &str, counter: &Arc<AtomicU32>, want: u32) {
+    for _ in 0..400 {
+        if counter.load(Ordering::SeqCst) >= want {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!(
+        "{label}: counter reached {} (< {want}) before timeout",
+        counter.load(Ordering::SeqCst)
+    );
+}
+
+/// Poll a PV until it equals `want`, with a timeout. Used to wait out the
+/// sseq machine's per-step `DLYn` delays + async re-entries.
+async fn poll_pv_double(db: &PvDatabase, pv: &str, want: f64) {
+    for _ in 0..400 {
+        if let Ok(EpicsValue::Double(v)) = db.get_pv(pv).await {
+            if (v - want).abs() < 1e-10 {
+                return;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!(
+        "{pv}: did not reach {want} before timeout (last {:?})",
+        db.get_pv(pv).await
+    );
+}
+
 // BUG 1 regression — sseq `LNKn` is `DBF_OUTLINK` driven via `dbPutLink`
 // → `dbDbPutValue` (`dbDbLink.c:388`). A bare sseq LNKn is NPP and must
 // not process its target; an explicit-PP LNKn must.
@@ -4161,6 +4196,9 @@ async fn test_sseq_bare_lnk_does_not_process_passive_target() {
     db.process_record_with_links("SSEQ_NPP_REC", &mut visited, 0)
         .await
         .unwrap();
+    // Step 2 (the PP target) is written in a later continuation; wait for
+    // it, then the settle window lets a stray bare-target process land too.
+    poll_atomic_reaches("sseq PP step", &pp_count, 1).await;
 
     assert_eq!(
         bare_count.load(Ordering::SeqCst),
@@ -4174,10 +4212,11 @@ async fn test_sseq_bare_lnk_does_not_process_passive_target() {
     );
 }
 
-// sseq per-step DLYn regression — C `sseqRecord.c` schedules each
-// selected step's LNKn write after its DLYn delay (`callbackRequestDelayed`),
-// exactly as the base `seqRecord` does for DLY0..DLYF. Pre-fix the
-// `MultiOut::Sseq` arm dispatched every step with no delay.
+// sseq per-step DLYn regression — C `sseqRecord.c::processNextLink`
+// schedules each selected step's LNKn write after its DLYn delay
+// (`callbackRequestDelayed`), exactly as the base `seqRecord` does for
+// DLY0..DLYF. The async machine ports this with a per-step
+// `ReprocessAfter(DLYn)`.
 #[tokio::test]
 async fn test_sseq_per_step_dly_delays_step_write() {
     use epics_base_rs::server::records::sseq::SseqRecord;
@@ -4207,17 +4246,16 @@ async fn test_sseq_per_step_dly_delays_step_write() {
         .unwrap();
     db.add_record("SSEQ_DLY_REC", Box::new(sseq)).await.unwrap();
 
-    // Dispatch concurrently so we can sample target state mid-delay.
-    let db_proc = db.clone();
-    let handle = tokio::spawn(async move {
-        let mut visited = HashSet::new();
-        db_proc
-            .process_record_with_links("SSEQ_DLY_REC", &mut visited, 0)
-            .await
-            .unwrap();
-    });
+    // Kick the sequence. The async machine returns to the caller after the
+    // first step is *scheduled* (PACT set); the per-step writes happen in
+    // spawned re-entries, so the kick does NOT block until completion.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SSEQ_DLY_REC", &mut visited, 0)
+        .await
+        .unwrap();
 
-    // Before DLY1 elapses, step 1's value must NOT be written yet.
+    // Before DLY1 (0.3 s) elapses, step 1's value must NOT be written yet,
+    // and step 2 must not fire before step 1.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(
         db.get_pv("SSEQ_DLY_TGT1").await.unwrap(),
@@ -4230,18 +4268,9 @@ async fn test_sseq_per_step_dly_delays_step_write() {
         "step 2 must not fire before step 1's delay completes"
     );
 
-    // After the dispatch finishes, both steps' values are written.
-    handle.await.unwrap();
-    assert_eq!(
-        db.get_pv("SSEQ_DLY_TGT1").await.unwrap(),
-        EpicsValue::Double(11.0),
-        "step 1 LNKn must fire after DLY1 elapses"
-    );
-    assert_eq!(
-        db.get_pv("SSEQ_DLY_TGT2").await.unwrap(),
-        EpicsValue::Double(22.0),
-        "step 2 LNKn must fire after step 1"
-    );
+    // After DLY1 elapses, step 1 writes, then step 2 writes after it.
+    poll_pv_double(&db, "SSEQ_DLY_TGT1", 11.0).await;
+    poll_pv_double(&db, "SSEQ_DLY_TGT2", 22.0).await;
 }
 
 #[tokio::test]

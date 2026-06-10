@@ -293,19 +293,36 @@ async fn fanout_lnk_skips_non_passive_target() {
 // ---------------------------------------------------------------------------
 // Single-owner invariant: sseq LNKn dispatched exactly once per cycle.
 //
-// Review found that an `sseq` record was dispatched by TWO
-// owners every process cycle: `dispatch_multi_output`'s `MultiOut::Sseq`
-// arm AND the generic `multi_output_links` block (because `SseqRecord`
-// also implemented `Record::multi_output_links`). Each selected `LNKn`
-// value was therefore written to its target TWICE. C
-// `sseqRecord.c::processNextLink` drives each step's `LNKn` via
-// `dbPutLink` exactly once.
+// A `sseq` record drives each selected step's `LNKn` exactly once, from
+// its own async sequence machine (`SseqRecord::process()`, C
+// `sseqRecord.c::processCallback` → `dbPutLink`). The retired all-at-once
+// `dispatch_multi_output` `MultiOut::Sseq` arm no longer exists, so there
+// is no second dispatcher; these tests guard that the machine writes each
+// target exactly once (never zero, never twice).
 // ---------------------------------------------------------------------------
 
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::record::FieldDesc;
 use epics_base_rs::server::records::sseq::SseqRecord;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// The sseq machine completes via spawned per-step re-entries
+/// (`ReprocessAfter` / put-notify), so `process_record_with_links`
+/// returns before the `LNKn` writes land — and the FINAL step's write
+/// runs in the framework `Complete` tail, AFTER `BUSY` is already 0.
+/// Poll the observable write effect itself (the counter), then settle so
+/// any erroneous extra dispatch would also have landed before asserting.
+async fn poll_until(label: &str, cond: impl Fn() -> bool) {
+    for _ in 0..400 {
+        if cond() {
+            // settle window — a spurious second dispatch would land here.
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("{label}: sseq sequence did not complete within timeout");
+}
 
 /// Target record that counts every `put_field("VAL", ..)` — one count
 /// per value-write that reaches it. A duplicate sseq dispatch shows up
@@ -389,6 +406,10 @@ async fn sseq_lnkn_dispatched_exactly_once_per_cycle() {
     db.process_record_with_links("SSEQ_REC", &mut visited, 0)
         .await
         .unwrap();
+    poll_until("both steps", || {
+        writes_a.load(Ordering::SeqCst) >= 1 && writes_b.load(Ordering::SeqCst) >= 1
+    })
+    .await;
 
     assert_eq!(
         writes_a.load(Ordering::SeqCst),
@@ -459,6 +480,7 @@ async fn sseq_selm_specified_writes_only_selected_step_once() {
     db.process_record_with_links("SSEQ_SEL_REC", &mut visited, 0)
         .await
         .unwrap();
+    poll_until("selected step", || writes_sel.load(Ordering::SeqCst) >= 1).await;
 
     assert_eq!(
         writes_sel.load(Ordering::SeqCst),

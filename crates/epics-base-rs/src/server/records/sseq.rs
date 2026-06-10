@@ -1,5 +1,8 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
+use crate::server::database::AsyncDbHandle;
+use crate::server::record::{
+    FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Choice labels for the SELM step-selection menu, in index order.
@@ -22,6 +25,47 @@ const SSEQ_LNKV_CHOICES: &[&str] = &["Ext PV NC", "Ext PV OK", "Local PV", "Cons
 
 const NUM_STEPS: usize = 10;
 
+/// Per-step field-name tables (1-based suffix `1`..`9`, `A`), used to
+/// address `DOLn`/`DOn`/`LNKn`/`WTGn` as the `&'static str` link/target
+/// fields a [`ProcessAction`] carries.
+const DOL_FIELDS: [&str; NUM_STEPS] = [
+    "DOL1", "DOL2", "DOL3", "DOL4", "DOL5", "DOL6", "DOL7", "DOL8", "DOL9", "DOLA",
+];
+const DO_FIELDS: [&str; NUM_STEPS] = [
+    "DO1", "DO2", "DO3", "DO4", "DO5", "DO6", "DO7", "DO8", "DO9", "DOA",
+];
+const LNK_FIELDS: [&str; NUM_STEPS] = [
+    "LNK1", "LNK2", "LNK3", "LNK4", "LNK5", "LNK6", "LNK7", "LNK8", "LNK9", "LNKA",
+];
+const WTG_FIELDS: [&str; NUM_STEPS] = [
+    "WTG1", "WTG2", "WTG3", "WTG4", "WTG5", "WTG6", "WTG7", "WTG8", "WTG9", "WTGA",
+];
+
+/// State of the sseq async sequence machine.
+///
+/// Mirrors the C `sseqRecord.c` control flow: a sequence is a series of
+/// per-step continuations driven through the framework PACT primitive,
+/// never an all-at-once loop. `Idle` is the only state in which a fresh
+/// `process()` trigger (scan / FLNK / `VAL` put) starts a sequence — the
+/// framework's PACT entry guard already rejects a foreign trigger while
+/// the record is mid-sequence, so a `process()` call reaching the body
+/// with `busy == 0` is necessarily a genuine start, exactly as C branches
+/// on `!pR->pact`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum SeqPhase {
+    /// No sequence running.
+    #[default]
+    Idle,
+    /// `active[cursor]` is scheduled to fire after its `DLYn` delay
+    /// (C `processNextLink` → `callbackRequestDelayed`); the next
+    /// continuation reads `DOLn` and writes `LNKn`.
+    Fire,
+    /// `active[cursor]` issued a put-WITH-completion (`WAITn != NoWait`,
+    /// C `dbCaPutLinkCallback`); the next continuation arrives when the
+    /// downstream completes (C `putCallbackCB`).
+    Wait,
+}
+
 /// A single step in the string sequence.
 #[derive(Clone, Default)]
 struct SseqStep {
@@ -31,6 +75,7 @@ struct SseqStep {
     lnk: String,       // Output link (LNKn)
     str_val: PvString, // String value (STRn)
     wait: i16,         // Wait mode: 0=NoWait, 1=Wait, 2..=After1..After9
+    waiting: bool,     // WTGn — an outstanding put-callback for this step
 }
 
 /// Sseq record — string sequence record.
@@ -38,6 +83,13 @@ struct SseqStep {
 /// Executes up to 10 steps, each with an optional delay, input link,
 /// numeric value, string value, and output link. Steps are selected
 /// by SELM (All, Specified, Mask) with SELN as the selection value.
+///
+/// Processing is a per-step async state machine built on the framework
+/// PACT primitive (C `sseqRecord.c::process`/`processNextLink`/
+/// `processCallback`/`putCallbackCB`/`asyncFinish`): each step waits out
+/// its `DLYn` delay, reads `DOLn`, writes `LNKn`, and — when `WAITn`
+/// requests it — blocks the sequence until the downstream put completes.
+/// `BUSY` is held across the whole sequence and cleared at the final step.
 pub struct SseqRecord {
     pub val: i32,
     pub selm: i16, // 0=All, 1=Specified, 2=Mask
@@ -46,7 +98,16 @@ pub struct SseqRecord {
     pub prec: i16,
     pub abort: i16,
     pub busy: i16,
+    aborting: i16,
+    phase: SeqPhase,
+    active: Vec<usize>,
+    cursor: usize,
     steps: [SseqStep; NUM_STEPS],
+    /// Canonical record name + cycle-free database handle, stashed at
+    /// `add_record` via [`Record::set_async_context`]. Drives out-of-band
+    /// status posts (`BUSY`/`WTGn`/`ABORTING`) and the `ABORT` finish
+    /// re-entry — the surfaces a `process()` cannot reach itself.
+    async_ctx: Option<(String, AsyncDbHandle)>,
 }
 
 impl Default for SseqRecord {
@@ -59,7 +120,12 @@ impl Default for SseqRecord {
             prec: 0,
             abort: 0,
             busy: 0,
+            aborting: 0,
+            phase: SeqPhase::Idle,
+            active: Vec::new(),
+            cursor: 0,
             steps: Default::default(),
+            async_ctx: None,
         }
     }
 }
@@ -121,6 +187,206 @@ impl SseqRecord {
             _ => false,
         }
     }
+
+    /// The value this step forwards to its `LNKn`.
+    ///
+    /// C `processCallback` (sseqRecord.c:643-705) reads `DOLn` into both a
+    /// string (`s`/`STRn`) and a double (`dov`/`DOn`) and writes whichever
+    /// the destination field type wants. Here `pre_process_actions` has
+    /// already folded a connected `DOLn` into `DOn` (a numeric read), so
+    /// the precedence is: a connected `DOLn` → `DOn`; otherwise a non-empty
+    /// `STRn` constant → the string; otherwise the `DOn` constant. A
+    /// string-typed `DOLn` source coerces through `DOn` (Double) — the one
+    /// value path `ReadDbLink` exposes (documented limitation).
+    fn step_value(&self, i: usize) -> EpicsValue {
+        let s = &self.steps[i];
+        if s.dol.is_empty() && !s.str_val.is_empty() {
+            EpicsValue::String(s.str_val.clone())
+        } else {
+            EpicsValue::Double(s.dov)
+        }
+    }
+
+    /// Post machine-driven status fields (`BUSY`/`WTGn`/`ABORTING`/`ABORT`)
+    /// to monitors out-of-band — the C `db_post_events` calls a record's
+    /// `process()` makes inline, which the Rust framework does not perform
+    /// for an `AsyncPending` cycle. Batched into one post per call so a
+    /// cycle's changes never reorder; cycles are themselves serialised by
+    /// the per-step re-entry chain. No-op without an async context.
+    fn post_live(&self, fields: Vec<(String, EpicsValue)>) {
+        if fields.is_empty() {
+            return;
+        }
+        if let Some((name, handle)) = &self.async_ctx {
+            let name = name.clone();
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                let _ = handle.post_fields(&name, fields).await;
+            });
+        }
+    }
+
+    /// Build the selection mask and start a sequence (C `process`, the
+    /// `!pact` branch). Returns the first step's scheduling outcome, or a
+    /// `Complete` (running the forward link) when nothing is selected.
+    fn start_sequence(&mut self, live: &mut Vec<(String, EpicsValue)>) -> ProcessOutcome {
+        // C `process` clears every `waiting` flag before building the list.
+        for i in 0..NUM_STEPS {
+            if self.steps[i].waiting {
+                self.steps[i].waiting = false;
+                live.push((WTG_FIELDS[i].to_string(), EpicsValue::Short(0)));
+            }
+        }
+        // C `process` (sseqRecord.c:346-365): a step joins the active list
+        // when it is selected AND has a non-constant `LNKn` or `DOLn`.
+        self.active = (0..NUM_STEPS)
+            .filter(|&i| {
+                self.should_execute_step(i)
+                    && (!self.steps[i].lnk.is_empty() || !self.steps[i].dol.is_empty())
+            })
+            .collect();
+        self.cursor = 0;
+        if self.active.is_empty() {
+            // C `asyncFinish` runs `recGblFwdLink` even with nothing to do;
+            // `busy` was never raised, so leave it untouched (no churn).
+            self.finish(live);
+            return ProcessOutcome::complete();
+        }
+        self.busy = 1;
+        live.push(("BUSY".to_string(), EpicsValue::Short(1)));
+        self.schedule_current_step(live)
+    }
+
+    /// Schedule `active[cursor]` to fire after its `DLYn` delay, or finish
+    /// the sequence when the cursor has passed the last active step.
+    ///
+    /// C `processNextLink` requests the per-step callback after `DLYn`
+    /// (`callbackRequestDelayed`) or immediately when `DLYn == 0`
+    /// (`callbackRequest`). `ReprocessAfter` is the uniform port of both:
+    /// a `Duration::ZERO` delay still re-enters through the same path, so
+    /// there is no special-cased `DLYn == 0` branch.
+    fn schedule_current_step(&mut self, live: &mut Vec<(String, EpicsValue)>) -> ProcessOutcome {
+        if self.cursor >= self.active.len() {
+            self.finish(live);
+            return ProcessOutcome::complete();
+        }
+        self.phase = SeqPhase::Fire;
+        let i = self.active[self.cursor];
+        let dly = std::time::Duration::from_secs_f64(self.steps[i].dly.max(0.0));
+        ProcessOutcome {
+            result: RecordProcessResult::AsyncPending,
+            actions: vec![ProcessAction::ReprocessAfter(dly)],
+            device_did_compute: false,
+        }
+    }
+
+    /// Fire `active[cursor]` (C `processCallback`): forward the step value
+    /// to `LNKn`, then either block for the put-callback (`WAITn`) or
+    /// advance to the next step.
+    fn fire_current_step(&mut self, live: &mut Vec<(String, EpicsValue)>) -> ProcessOutcome {
+        let i = self.active[self.cursor];
+        let value = self.step_value(i);
+        let has_lnk = !self.steps[i].lnk.is_empty();
+        // C `processCallback` (sseqRecord.c:717,739,763) uses
+        // `dbCaPutLinkCallback` — the put-WITH-completion that sets the
+        // `waiting` flag — only when `usePutCallback` (`WAITn != NoWait`).
+        // `WriteDbLinkNotify` carries that completion wait; for a local /
+        // bare target it drains immediately (no target process joins the
+        // wait-set), matching C's synchronous `dbPutLink` there.
+        let waits = self.steps[i].wait != 0;
+
+        if waits && has_lnk {
+            self.steps[i].waiting = true;
+            live.push((WTG_FIELDS[i].to_string(), EpicsValue::Short(1)));
+            self.phase = SeqPhase::Wait;
+            return ProcessOutcome {
+                result: RecordProcessResult::AsyncPending,
+                actions: vec![ProcessAction::WriteDbLinkNotify {
+                    link_field: LNK_FIELDS[i],
+                    value,
+                }],
+                device_did_compute: false,
+            };
+        }
+
+        // No-wait step: a plain `dbPutLink` (`WriteDbLink`), then advance in
+        // the same cycle. The write rides ahead of the next step's
+        // scheduling action (or the `Complete` tail's link-write phase for
+        // the last step), so `LNKn` lands before the sequence moves on.
+        let mut actions = Vec::new();
+        if has_lnk {
+            actions.push(ProcessAction::WriteDbLink {
+                link_field: LNK_FIELDS[i],
+                value,
+            });
+        }
+        self.cursor += 1;
+        let mut next = self.schedule_current_step(live);
+        actions.append(&mut next.actions);
+        next.actions = actions;
+        next
+    }
+
+    /// Advance after a `WAITn` put-callback completion (C `putCallbackCB`):
+    /// clear the step's `waiting` flag, then schedule the next step.
+    fn after_wait(&mut self, live: &mut Vec<(String, EpicsValue)>) -> ProcessOutcome {
+        let i = self.active[self.cursor];
+        if self.steps[i].waiting {
+            self.steps[i].waiting = false;
+            live.push((WTG_FIELDS[i].to_string(), EpicsValue::Short(0)));
+        }
+        self.cursor += 1;
+        self.schedule_current_step(live)
+    }
+
+    /// Finish the sequence (C `asyncFinish`): clear `abort`/`aborting`,
+    /// every `waiting` flag, and `busy`; return to `Idle`. The framework's
+    /// `Complete` tail runs `recGblFwdLink` and posts `VAL`; this only
+    /// resets the machine state and queues the status posts C makes inline.
+    fn finish(&mut self, live: &mut Vec<(String, EpicsValue)>) {
+        if self.abort != 0 {
+            self.abort = 0;
+            live.push(("ABORT".to_string(), EpicsValue::Short(0)));
+        }
+        if self.aborting != 0 {
+            self.aborting = 0;
+            live.push(("ABORTING".to_string(), EpicsValue::Short(0)));
+        }
+        for i in 0..NUM_STEPS {
+            if self.steps[i].waiting {
+                self.steps[i].waiting = false;
+                live.push((WTG_FIELDS[i].to_string(), EpicsValue::Short(0)));
+            }
+        }
+        if self.busy != 0 {
+            self.busy = 0;
+            live.push(("BUSY".to_string(), EpicsValue::Short(0)));
+        }
+        self.active.clear();
+        self.cursor = 0;
+        self.phase = SeqPhase::Idle;
+    }
+
+    /// Drive an immediate abort completion from `special` (C
+    /// `epicsTimerCancel` + `callbackRequest`): supersede any pending
+    /// `DLYn` re-entry, then mint a fresh re-entry wired to an
+    /// already-fired completion so the next `process()` runs the
+    /// `abort != 0` finish at once. The superseded timer, when it wakes,
+    /// re-enters nothing (the `AsyncToken` generation gate).
+    fn force_finish_reentry(&self) {
+        if let Some((name, handle)) = &self.async_ctx {
+            let name = name.clone();
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                handle.cancel_async_reentry(&name).await;
+                if let Some(token) = handle.mint_async_token(&name).await {
+                    let (waitset, completion) = AsyncDbHandle::new_put_notify();
+                    waitset.leave();
+                    handle.reprocess_on_notify(token, completion);
+                }
+            });
+        }
+    }
 }
 
 /// Build the full `sseq` field table. The 7 base record fields plus the
@@ -131,12 +397,14 @@ impl SseqRecord {
 /// `static` while the per-step shape is generated once (no copy-paste
 /// drift across 130 entries).
 ///
-/// `DTn`/`LTn` (DOL/LNK link field type), `WERRn` (wait-config error),
-/// `WTGn` (outstanding callback), `IXn` (step index), `DOLnV`/`LNKnV`
-/// (link connection status, `menu(sseqLNKV)`) and top-level `ABORTING`
-/// are read-only diagnostics: C `sseqRecord.c` updates them from the
-/// record's async sequence owner (checkLinks / processNextLink), which is
-/// not yet ported, so they expose their DBD init defaults here.
+/// The read-only diagnostics fall into two groups. `WTGn` (outstanding
+/// put-callback) and top-level `ABORTING` are driven LIVE by the sequence
+/// machine (C `sseqRecord.c::processCallback`/`putCallbackCB`/`special`/
+/// `asyncFinish`) and posted via `post_live`. `DTn`/`LTn` (DOL/LNK link
+/// field type), `WERRn` (wait-config error), `IXn` (step index) and
+/// `DOLnV`/`LNKnV` (link connection status, `menu(sseqLNKV)`) come from C
+/// `checkLinks` — link introspection not modelled here — so they expose
+/// their DBD init defaults.
 macro_rules! sseq_fields {
     ($($s:literal),+ $(,)?) => {
         &[
@@ -180,57 +448,120 @@ impl Record for SseqRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        self.busy = 1;
-        // For each selected step, prepare the output value.
-        // DOL reads are handled by pre_process_actions().
-        //
-        // SINGLE-OWNER INVARIANT: `LNKn` dispatch (per-step value
-        // write + target forward-link processing) is owned solely by
-        // `PvDatabase::dispatch_multi_output`'s `MultiOut::Sseq` arm —
-        // the only path with SELL/SELM/SELN selection, DOLn input
-        // fetch, and STR/DO value precedence. `SseqRecord` therefore
-        // MUST NOT implement `Record::multi_output_links`: doing so
-        // would make the generic `multi_output_links` block in
-        // `processing.rs` §4.6 dispatch every `LNKn` a second time per
-        // cycle. C `sseqRecord.c::processNextLink` drives each step's
-        // `LNKn` via `dbPutLink` exactly once.
-        self.busy = 0;
-        Ok(ProcessOutcome::complete())
+        let mut live = Vec::new();
+        // An abort in flight finishes the sequence on its next re-entry,
+        // ahead of any step work — C `process` takes the `pact` (completion)
+        // path straight to `asyncFinish`, and `processCallback` /
+        // `putCallbackCB` short-circuit to `process` when `pR->abort`.
+        let outcome = if self.busy != 0 && self.abort != 0 {
+            self.finish(&mut live);
+            ProcessOutcome::complete()
+        } else {
+            // `busy == 0` (phase `Idle`) is a genuine start: the framework
+            // PACT entry guard already rejected any foreign trigger while a
+            // sequence was running, so reaching the body un-busy mirrors C's
+            // `!pR->pact`. `busy == 1` is a per-step continuation.
+            match self.phase {
+                SeqPhase::Idle => self.start_sequence(&mut live),
+                SeqPhase::Fire => self.fire_current_step(&mut live),
+                SeqPhase::Wait => self.after_wait(&mut live),
+            }
+        };
+        self.post_live(live);
+        Ok(outcome)
     }
 
-    fn pre_process_actions(&mut self) -> Vec<crate::server::record::ProcessAction> {
-        use crate::server::record::ProcessAction;
+    fn pre_input_link_actions(&mut self) -> Vec<ProcessAction> {
+        // C `process` (sseqRecord.c:314-317) reads `SELL` into `SELN` before
+        // building the selection mask, and only when `SELM != All`. This is
+        // the earliest hook (it runs before the selection is resolved), and
+        // only at a sequence start (`busy == 0`); a continuation must not
+        // re-read `SELL` mid-sequence.
+        if self.busy == 0 && self.selm != 0 && !self.sell.is_empty() {
+            vec![ProcessAction::ReadDbLink {
+                link_field: "SELL",
+                target_field: "SELN",
+            }]
+        } else {
+            Vec::new()
+        }
+    }
 
-        static DOL_DOV: [(&str, &str); NUM_STEPS] = [
-            ("DOL1", "DO1"),
-            ("DOL2", "DO2"),
-            ("DOL3", "DO3"),
-            ("DOL4", "DO4"),
-            ("DOL5", "DO5"),
-            ("DOL6", "DO6"),
-            ("DOL7", "DO7"),
-            ("DOL8", "DO8"),
-            ("DOL9", "DO9"),
-            ("DOLA", "DOA"),
-        ];
-
-        let mut actions = Vec::new();
-        for i in 0..NUM_STEPS {
-            if self.should_execute_step(i) && !self.steps[i].dol.is_empty() {
-                actions.push(ProcessAction::ReadDbLink {
-                    link_field: DOL_DOV[i].0,
-                    target_field: DOL_DOV[i].1,
-                });
+    fn pre_process_actions(&mut self) -> Vec<ProcessAction> {
+        // C `processCallback` reads the current step's `DOLn` AFTER its delay
+        // has elapsed (sseqRecord.c:643-666). The per-step `ReprocessAfter`
+        // re-enters in phase `Fire` with `cursor` on that step, so the DOL
+        // read is scoped to exactly that step here — not all steps up front.
+        if self.phase == SeqPhase::Fire && self.cursor < self.active.len() {
+            let i = self.active[self.cursor];
+            if !self.steps[i].dol.is_empty() {
+                return vec![ProcessAction::ReadDbLink {
+                    link_field: DOL_FIELDS[i],
+                    target_field: DO_FIELDS[i],
+                }];
             }
         }
-        actions
+        Vec::new()
     }
 
-    // NOTE: `SseqRecord` deliberately does NOT implement
-    // `Record::multi_output_links`. Sseq `LNKn` dispatch is owned
-    // solely by `dispatch_multi_output`'s `MultiOut::Sseq` arm — see
-    // the single-owner invariant in `process()` above. Re-adding the
-    // override here would re-introduce double LNKn writes per cycle.
+    fn special(&mut self, field: &str, after: bool) -> CaResult<()> {
+        // C `sseqRecord.c::special` handles `ABORT` (SPC_MOD) entirely
+        // outside the process cycle — a put to `ABORT` does NOT process the
+        // record (only `VAL` is process-passive). `pR->abort` already holds
+        // the value the put just stored.
+        if !after || !field.eq_ignore_ascii_case("ABORT") {
+            return Ok(());
+        }
+        let mut live = Vec::new();
+        if self.busy == 0 {
+            // C: "no activity to abort" — drop the request.
+            if self.abort != 0 {
+                self.abort = 0;
+                live.push(("ABORT".to_string(), EpicsValue::Short(0)));
+            }
+            self.post_live(live);
+            return Ok(());
+        }
+        if self.aborting != 0 {
+            // Second abort while already aborting (C sseqRecord.c:1179-1190):
+            // a downstream put-callback may be hung. Clear every `waiting`
+            // flag, drop the remaining steps, and force the finish now.
+            for i in 0..NUM_STEPS {
+                if self.steps[i].waiting {
+                    self.steps[i].waiting = false;
+                    live.push((WTG_FIELDS[i].to_string(), EpicsValue::Short(0)));
+                }
+            }
+            self.cursor = self.active.len();
+            self.force_finish_reentry();
+            self.post_live(live);
+            return Ok(());
+        }
+        self.aborting = 1;
+        live.push(("ABORTING".to_string(), EpicsValue::Short(1)));
+        // C cancels a pending `DLYn` delay timer and completes the abort
+        // immediately (sseqRecord.c:1194-1215). When instead waiting on a
+        // put-callback (phase `Wait`), C does NOT force a re-entry — it lets
+        // the outstanding callback arrive and finish via the `abort` branch
+        // (sseqRecord.c:1161-1164). A still-stuck callback is escaped by a
+        // second abort above.
+        if self.phase == SeqPhase::Fire {
+            self.force_finish_reentry();
+        }
+        self.post_live(live);
+        Ok(())
+    }
+
+    fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
+        self.async_ctx = Some((name, db));
+    }
+
+    // `SseqRecord` does NOT implement `Record::multi_output_links`: the
+    // per-step `LNKn` writes are driven here, in `process()`, via
+    // `WriteDbLink`/`WriteDbLinkNotify` (C `sseqRecord.c::processCallback`),
+    // not by the generic multi-output block. The retired
+    // `dispatch_multi_output` `MultiOut::Sseq` arm was the old all-at-once
+    // path and no longer exists.
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
@@ -242,12 +573,12 @@ impl Record for SseqRecord {
             "SELL" => Some(EpicsValue::String(self.sell.clone().into())),
             "PREC" => Some(EpicsValue::Short(self.prec)),
             "ABORT" => Some(EpicsValue::Short(self.abort)),
-            // ABORTING (sseqRecord.dbd:820) is a machine-driven status:
-            // C `sseqRecord.c:special`/`asyncFinish` toggle it across an
-            // abort. That async sequence owner is not yet ported, so the
-            // record always reads the inactive default — exposed read-only
-            // so clients can still open REC.ABORTING.
-            "ABORTING" => Some(EpicsValue::Short(0)),
+            // ABORTING (sseqRecord.dbd:820) is machine-driven: C
+            // `sseqRecord.c:special`/`asyncFinish` toggle it across an abort.
+            // The sequence machine here holds it live (1 while an abort is
+            // draining the outstanding step, 0 otherwise) and posts it via
+            // `post_live`; read-only to clients.
+            "ABORTING" => Some(EpicsValue::Short(self.aborting)),
             "BUSY" => Some(EpicsValue::Short(self.busy)),
             _ => {
                 // DOLnV / LNKnV link-status menu (menu(sseqLNKV),
@@ -277,7 +608,10 @@ impl Record for SseqRecord {
                         "DT" => Some(EpicsValue::Short(0)),
                         "LT" => Some(EpicsValue::Short(0)),
                         "WERR" => Some(EpicsValue::Short(0)),
-                        "WTG" => Some(EpicsValue::Short(0)),
+                        // WTGn — live "outstanding put-callback" flag for
+                        // this step (C `processCallback`/`putCallbackCB`
+                        // toggle `waiting`); posted via `post_live`.
+                        "WTG" => Some(EpicsValue::Short(self.steps[idx].waiting as i16)),
                         // IXn holds the step's own 0-based index
                         // (sseqRecord.dbd initial: IX1=0 .. IXA=9).
                         "IX" => Some(EpicsValue::Short(idx as i16)),
@@ -355,6 +689,25 @@ impl Record for SseqRecord {
                 }
                 _ => Err(CaError::TypeMismatch("ABORT".into())),
             },
+            // BUSY / ABORTING are read-only to clients (the `field_io`
+            // read-only gate rejects external puts before this point), but
+            // the sequence machine drives them through `post_fields`
+            // (`put_field_internal`), which lands here. Store the value the
+            // machine already set so the monitor post reflects it.
+            "BUSY" => {
+                self.busy = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("BUSY".into()))?
+                    as i16;
+                Ok(())
+            }
+            "ABORTING" => {
+                self.aborting = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("ABORTING".into()))?
+                    as i16;
+                Ok(())
+            }
             _ => {
                 if let Some((idx, prefix)) = Self::step_index_from_suffix(name) {
                     let step = &mut self.steps[idx];
@@ -399,6 +752,16 @@ impl Record for SseqRecord {
                             }
                             _ => Err(CaError::TypeMismatch(name.into())),
                         },
+                        // WTGn is read-only to clients; the machine posts it
+                        // via `post_fields` (`put_field_internal`), which
+                        // lands here. Store the flag the machine already set.
+                        "WTG" => {
+                            step.waiting = value
+                                .to_f64()
+                                .ok_or_else(|| CaError::TypeMismatch(name.into()))?
+                                != 0.0;
+                            Ok(())
+                        }
                         _ => Err(CaError::FieldNotFound(name.to_string())),
                     };
                 }

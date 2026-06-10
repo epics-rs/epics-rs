@@ -84,6 +84,32 @@ async fn read_for(stream: &mut TcpStream, dur: Duration) -> Vec<u8> {
     buf
 }
 
+/// Read (stripping IAC) until `needle` appears in the accumulated,
+/// decoded output or `dur` elapses. Returns the text seen so far —
+/// callers assert on the returned string. Unlike [`read_for`] this
+/// returns as soon as the marker shows up, so timing assertions
+/// measure the real latency rather than a fixed window.
+async fn read_until(stream: &mut TcpStream, needle: &str, dur: Duration) -> String {
+    let deadline = Instant::now() + dur;
+    let mut buf = Vec::new();
+    let mut tmp = vec![0u8; 1024];
+    while Instant::now() < deadline {
+        match timeout(Duration::from_millis(100), stream.read(&mut tmp)).await {
+            Ok(Ok(0)) => break, // EOF
+            Ok(Ok(n)) => {
+                buf.extend_from_slice(&tmp[..n]);
+                let text = String::from_utf8_lossy(&strip_iac(&buf)).to_string();
+                if text.contains(needle) {
+                    return text;
+                }
+            }
+            Ok(Err(_)) => break,
+            Err(_) => continue, // timeout — keep waiting
+        }
+    }
+    String::from_utf8_lossy(&strip_iac(&buf)).to_string()
+}
+
 /// Strip telnet IAC sequences from a stream of bytes (just enough to
 /// make the test assertions readable). Mirrors the parser in
 /// procserv::telnet but without the supervisor overhead.
@@ -255,6 +281,71 @@ async fn server_messages_are_written_to_the_log() {
     assert!(
         contents.contains("@@@ Child started"),
         "supervisor start banner must be logged; got: {contents:?}"
+    );
+
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn manual_restart_preempts_active_holdoff() {
+    // C procServ's main poll loop keeps running during the crash-loop
+    // holdoff, so a manual restart keystroke (`restartOnce()` zeros
+    // `_restartTime`, processFactory.cc:289-291) relaunches the child
+    // immediately instead of waiting the holdoff out. The Rust
+    // supervisor must likewise service input while the restart deadline
+    // is pending — if the holdoff were a blocking `sleep`, the byte
+    // would queue until the deadline and then pass through as a no-op
+    // (the child would already have auto-restarted and be alive), so the
+    // "@@@ Manual restart" banner would never appear.
+    let port = pick_port().await;
+    let mut cfg = cat_config(port);
+    cfg.restart_mode = RestartMode::OnExit;
+    cfg.holdoff = Duration::from_secs(3); // long enough to observe the wait
+
+    let server = ProcServ::new(cfg).expect("build");
+    let server_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut conn = {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => {
+                    sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => panic!("could not connect: {e}"),
+            }
+        }
+    };
+
+    // Drain the initial banner + first "@@@ Child started".
+    let _ = read_for(&mut conn, Duration::from_millis(500)).await;
+
+    // Kill the child (Ctrl-X). Under OnExit this schedules an auto
+    // restart 3s out; "@@@ Child exited" confirms the child died and the
+    // holdoff deadline is now pending.
+    conn.write_all(&[0x18]).await.unwrap();
+    let exited = read_until(&mut conn, "Child exited", Duration::from_secs(3)).await;
+    assert!(
+        exited.contains("Child exited"),
+        "child should exit on kill keystroke, got: {exited:?}"
+    );
+
+    // Well within the 3s holdoff, press the manual restart key
+    // (Ctrl-R = 0x12). The non-blocking deadline lets this fire now.
+    let t0 = Instant::now();
+    conn.write_all(&[0x12]).await.unwrap();
+    let restarted = read_until(&mut conn, "Manual restart", Duration::from_secs(2)).await;
+    let elapsed = t0.elapsed();
+    assert!(
+        restarted.contains("Manual restart"),
+        "manual restart key must fire during the active holdoff, got: {restarted:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "manual restart must preempt the 3s holdoff; took {elapsed:?}"
     );
 
     server_task.abort();

@@ -100,6 +100,26 @@ struct SupervisorState {
     /// the policy (so `OneShot` selected mid-run still launches
     /// once); subsequent exits with `OneShot` exit the supervisor.
     has_run_once: bool,
+    /// A respawn that is waiting out the crash-loop holdoff. Mirrors C
+    /// procServ's `_restartTime` deadline (`processFactory.cc:188`): the
+    /// child has exited and an auto/one-shot relaunch is due once
+    /// `Instant::now() >= at`. Kept as state (not an inline `sleep`) so
+    /// the event loop keeps polling keystrokes during the wait — C's
+    /// main loop `while(!shutdownServer)` re-checks
+    /// `processFactoryNeedsRestart()` every poll, so a manual restart
+    /// (`restartOnce()` zeros `_restartTime`, `processFactory.cc:289-291`)
+    /// or a kill is honored live rather than queued behind the sleep.
+    /// Invariant: `pending_restart.is_some()` ⟹ `child.is_none()` — set
+    /// only on child exit, cleared by [`Self::respawn_child`] (the single
+    /// owner of the "child now running" transition).
+    pending_restart: Option<PendingRestart>,
+}
+
+/// A scheduled-but-not-yet-fired child relaunch: the holdoff deadline
+/// plus the banner to announce when it fires (e.g. `@@@ Auto restart`).
+struct PendingRestart {
+    at: tokio::time::Instant,
+    banner: &'static str,
 }
 
 struct ClientEntry {
@@ -173,6 +193,7 @@ impl SupervisorState {
             log,
             sighup,
             has_run_once: false,
+            pending_restart: None,
         };
 
         // Initial child spawn unless `--wait` (manual start).
@@ -185,6 +206,11 @@ impl SupervisorState {
 
     async fn event_loop(&mut self) -> ProcServResult<()> {
         loop {
+            // Snapshot the pending-restart deadline (Copy) before
+            // borrowing `self.child` mutably below, so the timer arm
+            // borrows only this local — not `self`.
+            let restart_at = self.pending_restart.as_ref().map(|p| p.at);
+
             // Build a future that resolves when the child sends an
             // event — only if there IS a child. When there isn't,
             // we use `pending` so the select arm is always polling
@@ -192,6 +218,18 @@ impl SupervisorState {
             let child_event = async {
                 match self.child.as_mut() {
                     Some(slot) => slot.rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            };
+
+            // Resolves when the crash-loop holdoff elapses; `pending`
+            // (never resolves) when no restart is scheduled. This is the
+            // non-blocking equivalent of C's poll-loop re-checking
+            // `now >= _restartTime` every iteration — input arms above
+            // are still serviced while we wait.
+            let restart_due = async {
+                match restart_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
                     None => std::future::pending().await,
                 }
             };
@@ -231,6 +269,21 @@ impl SupervisorState {
                 //    openLogFile() (procServ.cc:641-645).
                 _ = self.sighup.recv() => {
                     self.reopen_log().await;
+                }
+
+                // 5. Crash-loop holdoff elapsed → fire the scheduled
+                //    relaunch. Lowest priority so a manual restart/kill
+                //    keystroke (arm 1) that arrives during the wait
+                //    preempts it: that path respawns and clears
+                //    `pending_restart`, after which `restart_at` is
+                //    `None` and this arm parks again. C: the poll loop
+                //    restarts once `now >= _restartTime`, unless
+                //    `restartOnce()` already zeroed it.
+                _ = restart_due => {
+                    if let Some(pending) = self.pending_restart.take() {
+                        self.banner(pending.banner).await;
+                        self.respawn_child().await?;
+                    }
                 }
             }
         }
@@ -348,9 +401,11 @@ impl SupervisorState {
                     RestartMode::OnExit => {
                         match self.restart_tracker.try_record(&self.config.restart) {
                             Ok(()) => {
-                                self.holdoff_remaining(started_at).await;
-                                self.banner("@@@ Auto restart").await;
-                                self.respawn_child().await?;
+                                // Schedule the relaunch behind the holdoff
+                                // deadline rather than sleeping inline, so
+                                // the event loop keeps servicing keystrokes
+                                // during the wait (C polls continuously).
+                                self.schedule_restart(started_at, "@@@ Auto restart");
                                 Ok(ChildLoopOutcome::Continue)
                             }
                             Err((max, win)) => Err(ProcServError::RestartLimitExceeded {
@@ -364,9 +419,7 @@ impl SupervisorState {
                             // First-ever exit under OneShot —
                             // permitted to relaunch once more.
                             self.has_run_once = true;
-                            self.holdoff_remaining(started_at).await;
-                            self.banner("@@@ One-shot relaunch").await;
-                            self.respawn_child().await?;
+                            self.schedule_restart(started_at, "@@@ One-shot relaunch");
                             Ok(ChildLoopOutcome::Continue)
                         } else {
                             self.banner("@@@ One-shot mode: exiting").await;
@@ -428,6 +481,11 @@ impl SupervisorState {
         }
 
         self.has_run_once = true;
+        // A child is now running, so any holdoff that was waiting to
+        // relaunch one is satisfied — clear it here (the single owner of
+        // this transition) so a manual restart that fires mid-holdoff
+        // cancels the pending auto relaunch instead of double-spawning.
+        self.pending_restart = None;
         self.banner(&format!("@@@ Child started (pid {})", handle.pid()))
             .await;
         self.child = Some(ChildSlot {
@@ -531,23 +589,27 @@ impl SupervisorState {
         }
     }
 
-    /// Sleep out the remainder of the restart holdoff, measured from
-    /// the child's start instant. C procServ sets `_restartTime =
-    /// holdoffTime + time(0)` when the child is forked
+    /// Schedule the child relaunch behind the restart holdoff deadline,
+    /// measured from the child's start instant. C procServ sets
+    /// `_restartTime = holdoffTime + time(0)` when the child is forked
     /// (`processFactory.cc:188`) and `processFactoryNeedsRestart`
     /// relaunches as soon as `now >= _restartTime` — so a child that
     /// ran longer than the holdoff restarts immediately, and only a
-    /// fast crash-loop waits out `holdoff - uptime`. Sleeping the full
-    /// `holdoff` after every exit (regardless of uptime) penalised a
-    /// long-lived child that exited cleanly.
-    async fn holdoff_remaining(&self, started_at: Option<tokio::time::Instant>) {
+    /// fast crash-loop waits out `holdoff - uptime`.
+    ///
+    /// Unlike an inline `sleep`, recording the deadline as state lets the
+    /// event loop keep polling input during the wait (C's poll loop
+    /// re-checks the deadline every iteration), so a manual restart or
+    /// kill keystroke is honored live instead of queued behind the sleep.
+    fn schedule_restart(&mut self, started_at: Option<tokio::time::Instant>, banner: &'static str) {
         let remaining = match started_at {
             Some(t) => remaining_holdoff(self.config.holdoff, t.elapsed()),
             None => self.config.holdoff,
         };
-        if !remaining.is_zero() {
-            tokio::time::sleep(remaining).await;
-        }
+        self.pending_restart = Some(PendingRestart {
+            at: tokio::time::Instant::now() + remaining,
+            banner,
+        });
     }
 
     /// Convenience: emit a `@@@`-prefixed banner line to all clients.

@@ -25,7 +25,10 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(2);
 pub const HISTOGRAM_LENGTH: usize = 200;
 /// Register-readback address offset applied for Wago PLCs (C `WAGO_OFFSET`).
 pub const WAGO_OFFSET: i32 = 0x200;
-/// Number of UDP retransmits on a read failure before giving up.
+/// UDP read-failure retransmit threshold. C `modbusInterpose.c:356`
+/// retransmits the frame while `++retries < 5` (increment, then compare),
+/// so a frame is resent at most `UDP_MAX_RETRIES - 1` (four) times and the
+/// fifth consecutive read failure gives up.
 const UDP_MAX_RETRIES: u32 = 5;
 
 /// Maximum number of stale (mismatched-transaction-ID) frames `transact`
@@ -563,10 +566,18 @@ impl ModbusEngine {
                     }
                 }
                 Err(e) => {
-                    if is_udp && udp_retries < UDP_MAX_RETRIES {
+                    // C parity (modbusInterpose.c:356): a UDP read failure
+                    // retransmits the frame while `++retries < 5` — increment
+                    // first, then compare — so the frame is resent at most four
+                    // times and the fifth consecutive failure gives up. Mirror
+                    // the increment-before-compare order exactly; checking the
+                    // counter before incrementing would allow one extra resend.
+                    if is_udp {
                         udp_retries += 1;
-                        transport.write_frame(framed)?;
-                        continue;
+                        if udp_retries < UDP_MAX_RETRIES {
+                            transport.write_frame(framed)?;
+                            continue;
+                        }
                     }
                     return Err(e);
                 }
@@ -1253,6 +1264,46 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, ModbusError::Timeout));
+        assert_eq!(engine.stats.io_errors, 1);
+    }
+
+    #[test]
+    fn udp_retransmits_at_most_four_times_then_gives_up() {
+        // C parity (modbusInterpose.c:356): a UDP read failure retransmits
+        // while `++retries < 5`, i.e. four resends, and the fifth consecutive
+        // failure returns the error. Five read failures must therefore give up
+        // *before* a sixth read could observe success. Boundary: the first
+        // write is the initial send, then exactly four retransmits = five
+        // writes total, and the queued success frame is never consumed.
+        let mut engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReadHoldingRegisters, 1),
+            LinkType::Udp,
+        )
+        .unwrap();
+        // Five read failures, then a valid reply that the C-parity loop must
+        // never reach (it gives up on the fifth failure).
+        let valid = tcp_response(1, &[0x01, 0x03, 0x02, 0x12, 0x34]);
+        let mut transport = MockTransport::new(vec![
+            Err(ModbusError::Timeout),
+            Err(ModbusError::Timeout),
+            Err(ModbusError::Timeout),
+            Err(ModbusError::Timeout),
+            Err(ModbusError::Timeout),
+            Ok(valid),
+        ]);
+        let err = engine
+            .do_modbus_io(
+                &mut transport,
+                ModbusFunctionCode::ReadHoldingRegisters,
+                0,
+                &[],
+                1,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ModbusError::Timeout));
+        // 1 initial send + 4 retransmits; the success frame stays queued.
+        assert_eq!(transport.written.len(), 5);
+        assert_eq!(transport.responses.len(), 1);
         assert_eq!(engine.stats.io_errors, 1);
     }
 

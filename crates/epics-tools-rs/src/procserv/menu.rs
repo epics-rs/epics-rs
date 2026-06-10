@@ -50,7 +50,19 @@ impl Action {
         // unmodified. If dead, restart/quit are how the user comes
         // back from a manual kill.
         if !child_alive {
+            // While the child is shut down, BOTH the restart key and
+            // the kill key bring it back: C clientFactory.cc:207-213
+            // gates restartOnce() on `(restartChar && byte==restartChar)
+            // || (killChar && byte==killChar)` inside the
+            // `!processClass::exists()` branch. So a kill keystroke on
+            // an already-dead child is a restart, not a signal to a
+            // process that no longer exists.
             if let Some(c) = keys.restart
+                && byte == c
+            {
+                return Self::RestartChild;
+            }
+            if let Some(c) = keys.kill
                 && byte == c
             {
                 return Self::RestartChild;
@@ -116,10 +128,22 @@ mod tests {
     }
 
     #[test]
-    fn kill_fires_regardless_of_child_state() {
+    fn kill_signals_a_live_child_but_restarts_a_dead_one() {
         let k = keys();
+        // Child alive → kill key sends the signal.
         assert_eq!(Action::evaluate(0x18, &k, true), Action::KillChild);
-        assert_eq!(Action::evaluate(0x18, &k, false), Action::KillChild);
+        // Child dead → kill key restarts it (C clientFactory.cc:208-213
+        // restarts on restartChar OR killChar while the child is down).
+        assert_eq!(Action::evaluate(0x18, &k, false), Action::RestartChild);
+    }
+
+    #[test]
+    fn kill_restarts_dead_child_even_when_restart_key_disabled() {
+        // C ORs the two keys independently, so killChar still restarts
+        // a dead child even if restartChar is unbound.
+        let mut k = keys();
+        k.restart = None;
+        assert_eq!(Action::evaluate(0x18, &k, false), Action::RestartChild);
     }
 
     #[test]

@@ -5,7 +5,8 @@ mod status_update;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::record::{
-    FieldDesc, MENU_ALARM_SEVR, MENU_YES_NO, ProcessOutcome, Record, RecordProcessResult,
+    FieldDesc, MENU_ALARM_SEVR, MENU_YES_NO, ProcessAction, ProcessOutcome, Record,
+    RecordProcessResult,
 };
 use epics_base_rs::types::EpicsValue;
 
@@ -158,6 +159,27 @@ impl MotorRecord {
     pub fn set_rdbl_error(&mut self, error: bool) {
         self.conv.rdbl_error = error;
     }
+
+    /// Fire the readback output link (RLNK) with the current RBV.
+    ///
+    /// C `motorRecord.cc:1495` calls `dbPutLink(&rlnk, DBR_DOUBLE, &rbv, 1)`
+    /// unconditionally just before `process_exit` on every process pass, so a
+    /// record wired through RLNK re-processes whenever the motor record does.
+    /// We mirror that by emitting a `WriteDbLink` for every full-snapshot
+    /// (`Complete`) cycle; the framework writes it before FLNK, exactly where C
+    /// fires it. The empty link is skipped so motors with no RLNK emit nothing.
+    ///
+    /// The single move-start cycle returns `AsyncPendingNotify` (DMOV 1→0) and
+    /// carries no actions; RBV is unchanged there (the prior `Complete` cycle
+    /// already fired RLNK with that RBV), so no readback information is lost.
+    fn push_readback_link_write(&self, actions: &mut Vec<ProcessAction>) {
+        if !self.links.rlnk.is_empty() {
+            actions.push(ProcessAction::WriteDbLink {
+                link_field: "RLNK",
+                value: EpicsValue::Double(self.pos.rbv),
+            });
+        }
+    }
 }
 
 impl Record for MotorRecord {
@@ -245,7 +267,9 @@ impl Record for MotorRecord {
             if !move_started {
                 self.internal.dmov_notified = false;
             }
-            Ok(ProcessOutcome::complete())
+            let mut outcome = ProcessOutcome::complete();
+            self.push_readback_link_write(&mut outcome.actions);
+            Ok(outcome)
         }
     }
 
@@ -340,6 +364,44 @@ mod tests {
 
         rec.suppress_flnk = true;
         assert!(!rec.should_fire_forward_link());
+    }
+
+    // C motorRecord.cc:1495 — every process pass fires the RLNK readback
+    // output link with the current RBV via dbPutLink().
+    #[test]
+    fn rlnk_readback_link_fired_with_rbv_each_process() {
+        let mut rec = MotorRecord::new();
+        rec.links.rlnk = "readback_sink.PROC".to_string();
+        rec.pos.rbv = 12.5;
+        let outcome = rec.process().unwrap();
+        let rbv = rec.pos.rbv;
+        assert!(
+            outcome.actions.iter().any(|a| matches!(
+                a,
+                ProcessAction::WriteDbLink {
+                    link_field: "RLNK",
+                    value: EpicsValue::Double(v),
+                } if *v == rbv
+            )),
+            "process() must emit a WriteDbLink to RLNK carrying RBV"
+        );
+    }
+
+    #[test]
+    fn rlnk_not_fired_when_link_unset() {
+        let mut rec = MotorRecord::new();
+        assert!(rec.links.rlnk.is_empty());
+        let outcome = rec.process().unwrap();
+        assert!(
+            !outcome.actions.iter().any(|a| matches!(
+                a,
+                ProcessAction::WriteDbLink {
+                    link_field: "RLNK",
+                    ..
+                }
+            )),
+            "an unset RLNK must emit no readback link write"
+        );
     }
 
     // C: 0ef39053 — FLNK fires only on the DMOV false→true transition.

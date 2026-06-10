@@ -1155,6 +1155,16 @@ fn cmd_db_load_records() -> CommandDef {
                         if let Err(e) = instance.record.init_record(1) {
                             eprintln!("init_record(1) failed for {}: {e}", def.name);
                         }
+                        // Hand the record its resolved common link fields so
+                        // a link-classifying record (calcout INAV..INUV/OUTV)
+                        // runs its C `init_record` checkLinks step at load —
+                        // the common OUT link was applied above, after
+                        // `set_async_context` ran at `add_record`. Defaulted
+                        // no-op for records that do not classify common links.
+                        {
+                            let inst = &mut *instance;
+                            inst.record.init_links(&inst.common);
+                        }
                     }
                     Ok(())
                 });

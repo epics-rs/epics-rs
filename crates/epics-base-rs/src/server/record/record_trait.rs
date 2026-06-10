@@ -754,6 +754,25 @@ pub trait Record: Send + Sync + 'static {
     /// no out-of-band async posting.
     fn set_async_context(&mut self, _name: String, _db: crate::server::database::AsyncDbHandle) {}
 
+    /// Framework init hook: called once at record load *after* the common
+    /// link fields (`INP`/`OUT`/`FLNK`/...) have been resolved and the
+    /// `init_record` passes have run, with the record's resolved
+    /// [`CommonFields`](crate::server::record::CommonFields).
+    ///
+    /// This is the seam for records that classify their links into status
+    /// diagnostics at init the way C `init_record` does (e.g. calcout's
+    /// `INAV..INUV`/`OUTV` `menu(calcoutINAV)` checkLinks loop): a record's
+    /// *common* link strings (`OUT` is a common field, not a record field)
+    /// are invisible to [`Self::set_async_context`] — which runs at
+    /// `add_record`, *before* the common fields are applied — and to
+    /// `init_record`, which carries no `CommonFields`. The record captures
+    /// whichever common links it needs here so a passive, never-processed
+    /// record already exposes its link status. Records whose links are all
+    /// record-owned (e.g. sseq DOLn/LNKn) do not need this hook.
+    ///
+    /// Additive, framework-set-hook pattern. Default: ignore.
+    fn init_links(&mut self, _common: &crate::server::record::CommonFields) {}
+
     /// Called by the framework before process() to indicate whether device
     /// support's read() already performed the record's compute step.
     /// Override in records that have a built-in compute (e.g., epid PID)

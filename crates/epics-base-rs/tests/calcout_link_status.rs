@@ -8,15 +8,22 @@
 //!
 //!   * a local DB input link → `LOC`, an empty input link → `CON`, posted at
 //!     record init (`set_async_context`),
-//!   * the OUT link — a *common* field, not a calcout field — reaches `OUTV`
-//!     through `check_alarms` on the first process (it is invisible to the
-//!     record at init), so `OUTV` starts at its `CON` default and resolves to
-//!     `LOC` once the record processes with a local OUT link.
+//!   * the OUT link — a *common* field, not a calcout field, invisible to the
+//!     record at `set_async_context` (which receives only name+handle). C
+//!     `init_record` (calcoutRecord.c:160-189) still classifies it at load,
+//!     so the framework hands the resolved common fields to the record after
+//!     the common-field/init_record passes via `Record::init_links`
+//!     (`ioc_builder`/`iocsh` load path): a passive never-processed calcout
+//!     loaded through a `.db` already shows `OUTV = LOC` for a local OUT link.
+//!     On the lower-level `PvDatabase::add_record` path (no loader), `OUTV`
+//!     holds its `CON` default until the first process re-points it through
+//!     `check_alarms`.
 
 use std::collections::HashSet;
 use std::time::Duration;
 
 use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::ioc_builder::IocBuilder;
 use epics_base_rs::server::record::Record;
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::server::records::calcout::CalcoutRecord;
@@ -132,4 +139,42 @@ async fn calcout_outv_classifies_via_process() {
         "local OUT link → LOC after process",
     )
     .await;
+}
+
+/// C `calcoutRecord.c::init_record` (calcoutRecord.c:160-189) classifies the
+/// OUT link at load, before any scan. The OUT link is a *common* field,
+/// invisible to the record at `set_async_context`, so the framework hands the
+/// resolved common fields to the record via `Record::init_links` after the
+/// common-field/init_record passes on the `.db` load path. A passive,
+/// never-processed calcout loaded with a local OUT link must therefore already
+/// report `OUTV = LOC`; one with an empty OUT link keeps its `CON` default.
+#[tokio::test]
+async fn calcout_outv_classifies_at_init_via_loader() {
+    let db_content = r#"
+record(ao, "INIT_OUT_TGT") {
+    field(VAL, "0.0")
+}
+record(calcout, "CO_OUT_LOC") {
+    field(OUT, "INIT_OUT_TGT")
+}
+record(calcout, "CO_OUT_EMPTY") {
+    field(VAL, "0.0")
+}
+"#;
+    let (db, _) = IocBuilder::new()
+        .db_string(db_content, &std::collections::HashMap::new())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    // No record is processed: `OUTV` is set purely by the load-time
+    // `init_links` classification.  A local OUT link → LOC.
+    poll_status(&db, "CO_OUT_LOC.OUTV", LOC, "local OUT at init → LOC").await;
+    // An unconfigured OUT link keeps its CON default.
+    assert_eq!(
+        read_status(&db, "CO_OUT_EMPTY.OUTV").await,
+        CON,
+        "empty OUT at init → CON"
+    );
 }

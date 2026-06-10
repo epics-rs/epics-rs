@@ -1536,10 +1536,23 @@ impl Record for CalcoutRecord {
     fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
         self.async_ctx = Some((name, db));
         // C `init_record` (calcoutRecord.c:160-189) classifies every INP and
-        // the OUT link into INAV..INUV/OUTV. This is the framework's
-        // init-time async hook, so refresh now. The OUT link is a common
-        // field not visible here; `out` syncs from `check_alarms` on the
-        // first process, so OUTV reaches its classification then.
+        // the OUT link into INAV..INUV/OUTV. The INP links are calcout fields
+        // already applied (record fields load before `add_record`), so
+        // classify them now. The OUT link is a common field not yet applied
+        // at `add_record`; it is captured later in `init_links` (load) or
+        // `check_alarms` (a runtime OUT re-point). The generation gate lets
+        // that later, fuller refresh supersede this one.
+        self.refresh_link_status();
+    }
+
+    fn init_links(&mut self, common: &crate::server::record::CommonFields) {
+        // C `calcoutRecord.c::init_record` (calcoutRecord.c:160-189)
+        // classifies the OUT link at `i == CALCPERFORM_NARGS`, at load —
+        // before any process. The OUT link is a common field invisible to
+        // `set_async_context` (which ran before the common fields were
+        // applied), so capture it here, once the framework has resolved it,
+        // and classify so a passive never-processed record already shows OUTV.
+        self.out = common.out.clone();
         self.refresh_link_status();
     }
 
@@ -1559,15 +1572,12 @@ impl Record for CalcoutRecord {
     }
 
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
-        // The OUT link lives in the common fields, not a calcout-owned field,
-        // so mirror it here — the one in-record hook that carries
-        // `CommonFields` — and re-classify OUTV when it changes. C classifies
-        // the OUT link in the same `init_record` loop as the inputs, at
-        // `i == CALCPERFORM_NARGS` (calcoutRecord.c:160-189). A record that
-        // has not yet processed shows OUTV at its CON default until the first
-        // `check_alarms`; classifying it before that needs the OUT string at
-        // an init hook, which the common-field model does not expose to the
-        // record.
+        // The OUT link lives in the common fields, not a calcout-owned field.
+        // `init_links` captures it at load; this hook catches a *runtime* OUT
+        // re-point (a put to OUT does not process, so `special("OUT")` cannot
+        // re-classify it — see `is_link_config_field`). C re-runs the same
+        // `init_record`/`checkLinks` OUT classification on any link change
+        // (calcoutRecord.c:160-189). Only re-classify when OUT actually moved.
         if self.out != common.out {
             self.out = common.out.clone();
             self.refresh_link_status();

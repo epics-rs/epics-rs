@@ -254,6 +254,16 @@ impl IocBuilder {
                 if let Err(e) = instance.record.init_record(1) {
                     eprintln!("init_record(1) failed for {}: {e}", def.name);
                 }
+                // Hand the record its resolved common link fields so a
+                // link-classifying record (calcout INAV..INUV/OUTV) can run
+                // its C `init_record` checkLinks step now — the common OUT
+                // link is set above, after `set_async_context` already ran at
+                // `add_record`. Defaulted no-op for records that do not
+                // classify common links.
+                {
+                    let inst = &mut *instance;
+                    inst.record.init_links(&inst.common);
+                }
                 // epics-base PR dabcf89 (mbboDirect): after both init
                 // passes, give the record a chance to finalise UDF —
                 // e.g. fold initialised B0..B1F bits into VAL and

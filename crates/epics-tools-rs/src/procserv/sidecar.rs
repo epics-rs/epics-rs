@@ -31,7 +31,11 @@ pub struct LogFile {
     /// Path the log was opened from, kept so [`Self::reopen`] (the
     /// SIGHUP/logrotate path) can re-open the same target.
     path: PathBuf,
-    time_format: String,
+    /// Per-line stamp format, applied RAW (C `stampFormat`,
+    /// `procServ.cc:721`). Any bracketing/separator is part of this
+    /// string, not added here — C's default `"[" + timeFormat + "] "` is
+    /// just the default value, overridable verbatim.
+    stamp_format: String,
     /// Tracks whether we're mid-line (no newline since last write).
     /// Matches the C `_log_stamp_sent` per-connection flag at
     /// clientFactory.cc:138 — a stamp only fires at the start of
@@ -46,12 +50,12 @@ impl LogFile {
     /// path's parent directory doesn't exist (we don't `mkdir -p`;
     /// matches C procServ which expects the operator to set up the
     /// directory).
-    pub async fn open(path: &Path, time_format: impl Into<String>) -> ProcServResult<Self> {
+    pub async fn open(path: &Path, stamp_format: impl Into<String>) -> ProcServResult<Self> {
         let file = Self::open_handle(path).await?;
         Ok(Self {
             file: AsyncMutex::new(file),
             path: path.to_path_buf(),
-            time_format: time_format.into(),
+            stamp_format: stamp_format.into(),
             in_line: SyncMutex::new(false),
         })
     }
@@ -126,8 +130,12 @@ impl LogFile {
     }
 
     fn format_stamp(&self) -> String {
-        let now = Local::now();
-        format!("[{}] ", now.format(&self.time_format))
+        // Apply the stamp format RAW — C writes `strftime(stampFormat)`
+        // verbatim (procServ.cc:721). The default `stamp_format` already
+        // carries its own `"[" … "] "` bracketing (C procServ.cc:464-468),
+        // so the writer must not add any of its own or a caller-supplied
+        // un-bracketed format could never be honored.
+        Local::now().format(&self.stamp_format).to_string()
     }
 }
 
@@ -229,7 +237,9 @@ mod tests {
     async fn log_file_prefixes_each_line_with_timestamp() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.log");
-        let log = LogFile::open(&path, "%Y-%m-%dT%H:%M:%S".to_string())
+        // The bracketing is part of the stamp format string (C's default
+        // stampFormat shape), applied raw — not added by the writer.
+        let log = LogFile::open(&path, "[%Y-%m-%dT%H:%M:%S] ".to_string())
             .await
             .unwrap();
 
@@ -241,12 +251,33 @@ mod tests {
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 3);
         for line in &lines {
-            // Every line begins with `[...]` stamp.
+            // Every line begins with the `[...]` stamp from the format.
             assert!(line.starts_with('['), "no stamp on: {line}");
         }
         assert!(lines[0].ends_with("line1"));
         assert!(lines[1].ends_with("line2"));
         assert!(lines[2].ends_with("partial continued"));
+    }
+
+    #[tokio::test]
+    async fn log_stamp_is_applied_raw_without_added_brackets() {
+        // An un-bracketed stamp format must be honored verbatim — the
+        // writer adds no `[..]` of its own (C applies stampFormat raw,
+        // procServ.cc:721; only the *default* stampFormat is bracketed).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.log");
+        let log = LogFile::open(&path, "RAWSTAMP ".to_string()).await.unwrap();
+
+        log.write_chunk(b"hello\n").await.unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let line = content.lines().next().unwrap();
+        assert!(
+            line.starts_with("RAWSTAMP "),
+            "stamp format must be applied raw, got: {line}"
+        );
+        assert!(!line.contains('['), "writer must not add brackets: {line}");
+        assert!(line.ends_with("hello"));
     }
 
     #[tokio::test]

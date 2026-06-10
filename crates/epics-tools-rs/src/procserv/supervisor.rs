@@ -36,6 +36,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use chrono::{DateTime, Local};
 use tokio::sync::mpsc;
 
 use crate::procserv::child::{ChildEvent, ChildHandle, ChildSpec};
@@ -113,6 +114,11 @@ struct SupervisorState {
     /// only on child exit, cleared by [`Self::respawn_child`] (the single
     /// owner of the "child now running" transition).
     pending_restart: Option<PendingRestart>,
+    /// Wall-clock time the supervisor started, for the welcome banner's
+    /// "@@@ procServ server started at:" line (C `procServStart`,
+    /// `clientFactory.cc:131-132`). Distinct from any monotonic
+    /// `Instant`: this is for human display, not elapsed-time math.
+    proc_started: DateTime<Local>,
 }
 
 /// A scheduled-but-not-yet-fired child relaunch: the holdoff deadline
@@ -124,11 +130,9 @@ struct PendingRestart {
 
 struct ClientEntry {
     out_tx: mpsc::Sender<OutboundFrame>,
-    /// Held for future per-client logic (audit, future welcome
-    /// banner that includes peer info, host-based ACL). Not yet read
-    /// in the hot path so we mark it explicitly to silence the
-    /// unused-field lint.
-    #[allow(dead_code)]
+    /// Per-client metadata. `meta.readonly` is read when building the
+    /// welcome banner's connected-peer counts (user vs logger), so this
+    /// field is live rather than purely future-facing.
     meta: ClientMeta,
 }
 
@@ -139,6 +143,10 @@ struct ChildSlot {
     /// from here, mirroring C procServ's `_restartTime = holdoffTime +
     /// time(0)` set at fork (`processFactory.cc:188`).
     started_at: tokio::time::Instant,
+    /// Wall-clock spawn time for the welcome banner's "@@@ Child started
+    /// at:" line (C `IOCStart`, `clientFactory.cc:135-136`). Separate from
+    /// the monotonic `started_at`, which can't render as a calendar time.
+    started_wall: DateTime<Local>,
 }
 
 impl SupervisorState {
@@ -151,7 +159,9 @@ impl SupervisorState {
             write_pid_file(p, std::process::id() as i32)?;
         }
         let log = if let Some(p) = &config.logging.log_path {
-            Some(LogFile::open(p, config.logging.time_format.clone()).await?)
+            // The LOG uses `stamp_format` (raw line prefix), not the
+            // banner-facing `time_format`.
+            Some(LogFile::open(p, config.logging.stamp_format.clone()).await?)
         } else {
             None
         };
@@ -207,6 +217,7 @@ impl SupervisorState {
             sighup,
             has_run_once: false,
             pending_restart: None,
+            proc_started: Local::now(),
         };
 
         // Initial child spawn unless `--wait` (manual start).
@@ -342,8 +353,16 @@ impl SupervisorState {
                     match action {
                         Action::None => {}
                         Action::KillChild => {
-                            if let Some(slot) = self.child.as_ref() {
-                                let _ = slot.handle.signal(self.config.child.kill_signal);
+                            // C broadcasts the kill notice to all clients
+                            // (and the log) before signalling — SendToAll
+                            // with a NULL sender (clientFactory.cc:236-239).
+                            // Only the live-kill path reaches here; a kill
+                            // key on a dead child is a RestartChild action.
+                            if self.child.is_some() {
+                                self.fanout_to_all(b"\r\n@@@ Got a kill command\r\n").await;
+                                if let Some(slot) = self.child.as_ref() {
+                                    let _ = slot.handle.signal(self.config.child.kill_signal);
+                                }
                             }
                         }
                         Action::RestartChild => {
@@ -505,6 +524,7 @@ impl SupervisorState {
             handle,
             rx,
             started_at: tokio::time::Instant::now(),
+            started_wall: Local::now(),
         });
         Ok(())
     }
@@ -513,7 +533,7 @@ impl SupervisorState {
     /// banner.
     async fn handle_new_client(&mut self, incoming: IncomingClient) {
         let (meta, out_tx) = spawn_client(incoming, self.inbound_tx.clone());
-        let banner = self.welcome_banner();
+        let banner = self.welcome_banner(meta.readonly);
         let _ = out_tx.send(OutboundFrame::Bytes(banner.into_bytes())).await;
         self.clients.insert(
             meta.id,
@@ -525,33 +545,66 @@ impl SupervisorState {
         tracing::debug!(client = meta.id.raw(), peer = ?meta.peer, readonly = meta.readonly, "procserv-rs: client connected");
     }
 
-    /// Build the welcome banner per C `clientItem::clientItem`.
-    /// Simplified — no `_users`/`_loggers` counts, those would
-    /// require additional bookkeeping. Banner content is enough to
-    /// orient an operator.
-    fn welcome_banner(&self) -> String {
+    /// Build the welcome banner per C `clientItem::clientItem`
+    /// (`clientFactory.cc:95-165`). A read-only (log/viewer) client gets a
+    /// trimmed banner: C gates the greeting + key hints and the
+    /// connected-peer count on `!_readonly` (`clientFactory.cc:152-163`),
+    /// so a logger sees only the start-time lines.
+    fn welcome_banner(&self, readonly: bool) -> String {
         let mut s = String::new();
-        s.push_str("@@@ Welcome to procserv-rs\r\n");
+
+        // Greeting + key hints — interactive (read/write) clients only.
+        if !readonly {
+            s.push_str("@@@ Welcome to procserv-rs\r\n");
+            s.push_str(&format!(
+                "@@@ Wrapping: {} (mode: {})\r\n",
+                self.config.child.name,
+                self.restart_mode.label()
+            ));
+            if let Some(c) = self.config.keys.kill {
+                s.push_str(&format!(
+                    "@@@ Use ^{} to kill the child\r\n",
+                    ascii_caret(c)
+                ));
+            }
+            if let Some(c) = self.config.keys.toggle_restart {
+                s.push_str(&format!(
+                    "@@@ Use ^{} to toggle auto restart\r\n",
+                    ascii_caret(c)
+                ));
+            }
+            if let Some(c) = self.config.keys.logout {
+                s.push_str(&format!("@@@ Use ^{} to logout\r\n", ascii_caret(c)));
+            }
+        }
+
+        // Start times — shown to every client (C `buf1`,
+        // clientFactory.cc:131-145), formatted with the banner-facing
+        // `time_format` (un-bracketed, distinct from the log stamp).
+        let tf = &self.config.logging.time_format;
         s.push_str(&format!(
-            "@@@ Wrapping: {} (mode: {})\r\n",
-            self.config.child.name,
-            self.restart_mode.label()
+            "@@@ procServ server started at: {}\r\n",
+            self.proc_started.format(tf)
         ));
-        if let Some(c) = self.config.keys.kill {
+        if let Some(slot) = &self.child {
             s.push_str(&format!(
-                "@@@ Use ^{} to kill the child\r\n",
-                ascii_caret(c)
+                "@@@ Child \"{}\" started at: {}\r\n",
+                self.config.child.name,
+                slot.started_wall.format(tf)
             ));
         }
-        if let Some(c) = self.config.keys.toggle_restart {
+
+        // Connected-peer counts — interactive clients only (C `buf2`,
+        // clientFactory.cc:143-144,162-163). Counted before the new client
+        // is registered, so they exclude it → C's "(plus you)".
+        if !readonly {
+            let users = self.clients.values().filter(|e| !e.meta.readonly).count();
+            let loggers = self.clients.values().filter(|e| e.meta.readonly).count();
             s.push_str(&format!(
-                "@@@ Use ^{} to toggle auto restart\r\n",
-                ascii_caret(c)
+                "@@@ {users} user(s) and {loggers} logger(s) connected (plus you)\r\n"
             ));
         }
-        if let Some(c) = self.config.keys.logout {
-            s.push_str(&format!("@@@ Use ^{} to logout\r\n", ascii_caret(c)));
-        }
+
         s
     }
 

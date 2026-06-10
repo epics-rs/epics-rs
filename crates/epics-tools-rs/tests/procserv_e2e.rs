@@ -54,6 +54,7 @@ fn cat_config(port: u16) -> ProcServConfig {
             pid_path: None,
             info_path: None,
             time_format: "%Y-%m-%dT%H:%M:%S".into(),
+            stamp_format: "[%Y-%m-%dT%H:%M:%S] ".into(),
         },
         restart: RestartPolicy::default(),
         restart_mode: RestartMode::Disabled, // don't auto-restart in tests
@@ -189,6 +190,21 @@ async fn cat_round_trip_via_tcp_console() {
         cleaned.contains("Welcome to procserv-rs"),
         "missing welcome banner; got: {cleaned:?}"
     );
+    // The banner reports start times and connected-peer counts
+    // (C clientFactory.cc:131-145 / 143-144). The child is up at connect
+    // time, so its "started at" line is present too.
+    assert!(
+        cleaned.contains("procServ server started at:"),
+        "banner missing server start time; got: {cleaned:?}"
+    );
+    assert!(
+        cleaned.contains("Child \"cat\" started at:"),
+        "banner missing child start time; got: {cleaned:?}"
+    );
+    assert!(
+        cleaned.contains("user(s) and 0 logger(s) connected (plus you)"),
+        "banner missing connected-peer counts; got: {cleaned:?}"
+    );
 
     // Type a line — `cat` will echo it back. Through the party-line:
     // our typed bytes go to the supervisor → forwarded to PTY stdin
@@ -247,6 +263,12 @@ async fn kill_keystroke_signals_child() {
     assert!(
         cleaned.contains("Child exited"),
         "expected 'Child exited' banner, got: {cleaned:?}"
+    );
+    // C broadcasts a kill notice to all clients before signalling
+    // (clientFactory.cc:236-239).
+    assert!(
+        cleaned.contains("Got a kill command"),
+        "expected '@@@ Got a kill command' broadcast, got: {cleaned:?}"
     );
 
     server_task.abort();

@@ -89,8 +89,18 @@ pub struct LoggingConfig {
     pub pid_path: Option<PathBuf>,
     /// Path to write a status info file consumed by `manage-procs`.
     pub info_path: Option<PathBuf>,
-    /// Per-line timestamp format for the log file. Defaults to ISO-8601.
+    /// Human-facing time format for banner lines (e.g. "server started
+    /// at"). C procServ's `timeFormat` (`procServ.cc:80`, default `%c`),
+    /// applied raw with no surrounding punctuation.
     pub time_format: String,
+    /// Per-line LOG prefix format, applied verbatim to each new line.
+    /// C procServ's `stampFormat` (`procServ.cc:83`), written raw at
+    /// `procServ.cc:721`. Distinct from [`Self::time_format`]: C's default
+    /// `stampFormat` is `"[" + timeFormat + "] "` (`procServ.cc:464-468`)
+    /// — the brackets live in this format string, not in the writer, so a
+    /// caller can supply an un-bracketed stamp and have it honored
+    /// verbatim (C's `--logstamp <fmt>`, `procServ.cc:308-310`).
+    pub stamp_format: String,
 }
 
 /// Full procserv configuration.

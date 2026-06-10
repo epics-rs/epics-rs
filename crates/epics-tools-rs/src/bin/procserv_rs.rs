@@ -172,7 +172,11 @@ mod app {
             log_path: args.logfile,
             pid_path: args.pidfile,
             info_path: args.info_file,
+            // Banner times: raw, un-bracketed (C `timeFormat`).
             time_format: "%Y-%m-%d %H:%M:%S".into(),
+            // Log prefix: C's default `stampFormat` shape, "[" + timeFormat
+            // + "] " (procServ.cc:464-468), applied verbatim by the writer.
+            stamp_format: "[%Y-%m-%d %H:%M:%S] ".into(),
         };
 
         let nz = |c: u8| if c == 0 { None } else { Some(c) };

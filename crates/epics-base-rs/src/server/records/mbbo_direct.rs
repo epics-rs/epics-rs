@@ -33,7 +33,7 @@ pub struct MbboDirectRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
-    // Regression R0604-BASEREC-BINARY-MONITOR-1: VAL change gate. C
+    // VAL change gate. C
     // mbboDirectRecord.c:311-314 monitor() raises DBE_VALUE|DBE_LOG for VAL
     // only when `mlst != val`. Captured during process() because the
     // framework reads monitor_value_changed() after process() commits mlst.
@@ -257,7 +257,7 @@ impl Record for MbboDirectRecord {
         false
     }
 
-    /// Regression R0604-BASEREC-BINARY-MONITOR-1: VAL posts DBE_VALUE|DBE_LOG
+    /// VAL posts DBE_VALUE|DBE_LOG
     /// only when it changed (C mbboDirectRecord.c:311-314 `mlst != val`), not
     /// every process cycle. The comparison is captured in process(); see
     /// `value_changed`.
@@ -322,7 +322,7 @@ impl Record for MbboDirectRecord {
         // so we only roll `orbv` forward and leave `rbv` untouched.
         self.orbv = self.rbv;
         self.oraw = self.rval;
-        // Regression R0604-BASEREC-BINARY-MONITOR-1: capture the VAL-change
+        // Capture the VAL-change
         // gate now (C mbboDirectRecord.c:311-314 `mlst != val`); the framework
         // reads monitor_value_changed() after process().
         self.value_changed = self.mlst != self.val;

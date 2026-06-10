@@ -1063,8 +1063,6 @@ mod tests {
         assert!(matches!(v, EpicsValue::Double(x) if x == 13.0));
     }
 
-    /// Regression R0604-BRCAGW-PROP-1.
-    ///
     /// `set_pv_metadata` installs the upstream `DBR_CTRL_*` metadata on a
     /// shadow simple PV WITHOUT posting any event (the CA gateway's
     /// connect-time seed). A later GET-class read must then see the
@@ -1124,8 +1122,6 @@ mod tests {
         ));
     }
 
-    /// Regression R0604-BRCAGW-PROP-1.
-    ///
     /// `post_pv_property` refreshes the shadow metadata AND posts a
     /// `DBE_PROPERTY` event carrying the supplied snapshot's metadata,
     /// upstream status/severity, and (undefined control-DBR) timestamp — to
@@ -1269,8 +1265,7 @@ mod tests {
         assert_eq!(got, Some(5.0));
     }
 
-    /// Regression R0604-PVASRV-SOURCE-COALESCED-STALE-TAIL-1 (record-backed
-    /// consumer half).
+    /// Record-backed consumer half of the source-coalesced stale-tail rule.
     ///
     /// `DbSubscription::next_event` shares the `coalesce_consume` ordering
     /// rule with `PvSubscription`: a record-field monitor whose bounded

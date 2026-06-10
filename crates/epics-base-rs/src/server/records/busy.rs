@@ -131,7 +131,7 @@ pub struct BusyRecord {
     // Internal alarm state (highest severity from the last
     // check_alarms() — STATE vs COS). Retained for inspection/tests.
     nsev: AlarmSevr,
-    // Regression R0604-BASEREC-BINARY-MONITOR-1: VAL change gate. C
+    // VAL change gate. C
     // busyRecord.c:365-369 monitor() raises DBE_VALUE|DBE_LOG for VAL only
     // when `mlst != val`. Captured in the monitor() owner during process()
     // because the framework reads monitor_value_changed() afterwards.
@@ -201,7 +201,7 @@ impl BusyRecord {
 
     /// Update monitoring fields.
     fn monitor(&mut self) {
-        // Regression R0604-BASEREC-BINARY-MONITOR-1: capture the VAL-change
+        // Capture the VAL-change
         // gate (C busyRecord.c:365-369 `mlst != val`) here, the single owner
         // of the mlst update; the framework reads monitor_value_changed()
         // after process() runs this.
@@ -572,7 +572,7 @@ impl Record for BusyRecord {
         FIELDS
     }
 
-    /// Regression R0604-BASEREC-BINARY-MONITOR-1: VAL posts DBE_VALUE|DBE_LOG
+    /// VAL posts DBE_VALUE|DBE_LOG
     /// only when it changed (C busyRecord.c:365-369 `mlst != val`), not every
     /// process cycle. The comparison is captured in the monitor() owner; see
     /// `value_changed`.

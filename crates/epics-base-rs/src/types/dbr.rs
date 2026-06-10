@@ -588,7 +588,7 @@ mod dbf_link_class_tests {
         assert_eq!(dbf_link_class("ai", "SIML"), Some(DbfLinkClass::InLink));
     }
 
-    /// Regression R0604-BASEDB-LINK-CLASS-FANOUT-LNK-1: `LNK0..LNKF` shares
+    /// `LNK0..LNKF` shares
     /// its spelling across two DBF classes — `fanoutRecord` declares the
     /// family `DBF_FWDLINK`, while `seqRecord`/`sseqRecord` declare it
     /// `DBF_OUTLINK`. The classifier must resolve by `record_type`, not

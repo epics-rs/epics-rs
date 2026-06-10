@@ -69,9 +69,9 @@ fn mbbi_direct_nobt_above_16_sets_mask() {
 fn mbbo_direct_process_keeps_device_rbv() {
     // Device support wrote a hardware read-back that disagrees with VAL.
     // (Field assignment, not a struct literal: MbboDirectRecord carries a
-    // private `value_changed` monitor-gate flag — see
-    // R0604-BASEREC-BINARY-MONITOR-1 — so it is no longer literal-constructible
-    // from outside the crate, matching the other six binary records.)
+    // private `value_changed` monitor-gate flag, so it is no longer
+    // literal-constructible from outside the crate, matching the other six
+    // binary records.)
     let mut rec = MbboDirectRecord::default();
     rec.rbv = 999;
     rec.put_field("VAL", EpicsValue::Long(5)).unwrap();

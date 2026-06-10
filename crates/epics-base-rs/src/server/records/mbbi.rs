@@ -78,7 +78,7 @@ pub struct MbbiRecord {
     pub siol: String,
     pub sims: i16,
     skip_convert: bool,
-    // Regression R0604-BASEREC-BINARY-MONITOR-1: VAL change gate. C
+    // VAL change gate. C
     // mbbiRecord.c:355-358 monitor() raises DBE_VALUE|DBE_LOG for VAL only
     // when `mlst != val`. Captured during process() because the framework
     // reads monitor_value_changed() after process() has committed mlst.
@@ -668,7 +668,7 @@ impl Record for MbbiRecord {
         }
     }
 
-    /// Regression R0604-BASEREC-BINARY-MONITOR-1: VAL posts DBE_VALUE|DBE_LOG
+    /// VAL posts DBE_VALUE|DBE_LOG
     /// only when it changed (C mbbiRecord.c:355-358 `mlst != val`), not every
     /// process cycle. The comparison is captured in process(); see
     /// `value_changed`.
@@ -708,7 +708,7 @@ impl Record for MbbiRecord {
         }
         self.skip_convert = false;
         self.oraw = self.rval;
-        // Regression R0604-BASEREC-BINARY-MONITOR-1: capture the VAL-change
+        // Capture the VAL-change
         // gate now (C mbbiRecord.c:355-358 `mlst != val`); the framework reads
         // monitor_value_changed() after process().
         self.value_changed = self.mlst != self.val;

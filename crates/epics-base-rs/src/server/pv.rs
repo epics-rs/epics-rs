@@ -1126,8 +1126,6 @@ mod mask_gate_tests {
         );
     }
 
-    /// Regression R0604-PVASRV-SOURCE-COALESCED-STALE-TAIL-1.
-    ///
     /// A simple-PV monitor whose bounded queue overflows mid-burst must
     /// never deliver the coalesced newest value and then step back to an
     /// older queued one. The producer fills the cap-64 queue with values
@@ -1317,7 +1315,7 @@ mod metadata_tests {
         );
     }
 
-    /// Regression R0604-BASEPV-PROPERTY-POST-SNAPSHOT-1: a property post
+    /// A property post
     /// must carry the upstream CTRL event's status/severity and timestamp,
     /// not a fabricated `NO_ALARM` / wall-clock-now snapshot. C ca-gateway
     /// preserves `setStatSevr()` on the property callback
@@ -1485,8 +1483,6 @@ mod read_hook_tests {
         );
     }
 
-    /// Regression R0604-BRCAGW-NOCACHE-1.
-    ///
     /// A no-cache GET must report the FRESH upstream alarm and timestamp
     /// that travel with the value (C `getTimeCB` decodes the `DBR_TIME_*`
     /// event's status/severity/time before `setEventData`,

@@ -285,8 +285,8 @@ pub struct CaLink {
     /// equivalent (`calink`) must subscribe a monitor and process the
     /// link-holder on every remote change (C `dbCa.c:993-994`
     /// `CA_DBPROCESS`). Pre-fix this was dropped at parse time, so a
-    /// cross-IOC `CP`/`CPP` link silently never processed its holder
-    /// (Regression R0604-CALINK-CP-NO-PROCESS-1). `cp_passive_only()`
+    /// cross-IOC `CP`/`CPP` link silently never processed its holder.
+    /// `cp_passive_only()`
     /// reads it identically to the local DB path.
     pub policy: LinkProcessPolicy,
 }
@@ -434,7 +434,7 @@ impl ParsedLink {
 /// (longhand options). Every other root token — null, bool, integer, real,
 /// array — installs no channel name in pvxs, so [`classify_pva_root_value`]
 /// returns `None` for them rather than coercing the raw token into a PV
-/// name. Regression R0604-BRPVALINK-ROOT-NONSTRING-PVA-1.
+/// name.
 enum PvaRootValue<'a> {
     /// `{ ... }` longhand options map (handed to the sub-object parser).
     Object(&'a str),
@@ -448,8 +448,7 @@ enum PvaRootValue<'a> {
 /// `null`/`true`/`false`/number/array tokens the way the pvxs root JLink
 /// callbacks do — `pva_parse_string` assigns `channelName` only at depth 0
 /// while `pva_parse_null`/`bool`/`integer` ignore root-depth values
-/// (pvalink_jlif.cpp:74-100,143-154). Regression
-/// R0604-BRPVALINK-ROOT-NONSTRING-PVA-1.
+/// (pvalink_jlif.cpp:74-100,143-154).
 fn classify_pva_root_value(value: &str) -> Option<PvaRootValue<'_>> {
     let v = value.trim();
     if v.starts_with('{') {
@@ -531,7 +530,6 @@ fn try_parse_json_link(s: &str) -> Option<ParsedLink> {
             // installs no channel name in pvxs and must NOT be coerced into a
             // literal PV name. `?` returns `None` here so a non-string root
             // falls through to legacy parsing instead of dialing a remote PV.
-            // Regression R0604-BRPVALINK-ROOT-NONSTRING-PVA-1.
             match classify_pva_root_value(value)? {
                 PvaRootValue::Object(obj) => {
                     if key == "ca" {
@@ -847,7 +845,7 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
             pv: pv.to_string(),
             monitor_switch: ms,
             // Carry the parsed CP/CPP policy so `ca://OTHER:PV CPP`
-            // drives holder processing (R0604-CALINK-CP-NO-PROCESS-1);
+            // drives holder processing;
             // pre-fix it was discarded into a bare latest-value link.
             policy,
         });
@@ -875,7 +873,7 @@ pub fn parse_link_v2(s: &str) -> ParsedLink {
         // discarding it. It also carries the CP/CPP process policy
         // (`REC.VAL CP CA`): store it so the calink resolver processes
         // the holder on a remote change instead of dropping the CP
-        // intent (R0604-CALINK-CP-NO-PROCESS-1).
+        // intent.
         return ParsedLink::Ca(CaLink {
             pv: link_part.to_string(),
             monitor_switch: ms,
@@ -1095,8 +1093,6 @@ mod json_link_tests {
         );
     }
 
-    /// Regression R0604-BRPVALINK-ROOT-NONSTRING-PVA-1.
-    ///
     /// pvxs installs root JLink callbacks only for the JSON string (channel
     /// shorthand) and map (longhand) cases; `pva_parse_null`/`bool`/`integer`
     /// ignore root-depth values (pvalink_jlif.cpp:74-100,143-154). A bare
@@ -1294,8 +1290,7 @@ mod json_link_tests {
         // force-CA branch discarded it, reducing this to a bare
         // `CaLink::new`); no MS-class modifier → NoMaximize. `PP` is not
         // CP/CPP, so `cp_passive_only() == None` and this link is never
-        // registered as an external CP holder
-        // (Regression R0604-CALINK-CP-NO-PROCESS-1).
+        // registered as an external CP holder.
         assert_eq!(
             parse_link_v2("REC.VAL PP CA"),
             ParsedLink::Ca(CaLink {

@@ -1,5 +1,3 @@
-//! Regression R0604-BASEREC-BINARY-MONITOR-1.
-//!
 //! C binary-family records raise the VAL monitor `DBE_VALUE | DBE_LOG`
 //! ONLY when the value actually changed (`if (mlst != val)`), then advance
 //! `mlst`; an unchanged process cycle posts no VALUE/LOG event for VAL.

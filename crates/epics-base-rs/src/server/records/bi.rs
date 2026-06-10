@@ -29,7 +29,7 @@ pub struct BiRecord {
     pub sims: i16,
     // Internal: skip RVAL->VAL when soft INP set VAL directly
     skip_convert: bool,
-    // Regression R0604-BASEREC-BINARY-MONITOR-1: VAL change gate. C
+    // VAL change gate. C
     // biRecord.c:250-255 monitor() raises DBE_VALUE|DBE_LOG for VAL only
     // when `mlst != val`. Captured during process() because the framework
     // reads monitor_value_changed() after process() has committed mlst.
@@ -174,7 +174,7 @@ impl Record for BiRecord {
         self.skip_convert = false; // reset for next cycle
 
         self.oraw = self.rval;
-        // Regression R0604-BASEREC-BINARY-MONITOR-1: capture the VAL-change
+        // Capture the VAL-change
         // gate now (C biRecord.c:250-255 `mlst != val`); the framework reads
         // monitor_value_changed() after process().
         self.value_changed = self.mlst != self.val;
@@ -434,7 +434,7 @@ impl Record for BiRecord {
         }
     }
 
-    /// Regression R0604-BASEREC-BINARY-MONITOR-1: VAL posts DBE_VALUE|DBE_LOG
+    /// VAL posts DBE_VALUE|DBE_LOG
     /// only when it changed (C biRecord.c:250-255 `mlst != val`), not every
     /// process cycle. The comparison is captured in process(); see
     /// `value_changed`.

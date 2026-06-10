@@ -85,7 +85,7 @@ pub struct MbboRecord {
     /// raised in `check_alarms()` since `convert()` has no access to
     /// `CommonFields`.
     soft_alarm: bool,
-    // Regression R0604-BASEREC-BINARY-MONITOR-1: VAL change gate. C
+    // VAL change gate. C
     // mbboRecord.c:400-403 monitor() raises DBE_VALUE|DBE_LOG for VAL only
     // when `mlst != val`. Captured during process() because the framework
     // reads monitor_value_changed() after process() has committed mlst.
@@ -720,7 +720,7 @@ impl Record for MbboRecord {
         false
     }
 
-    /// Regression R0604-BASEREC-BINARY-MONITOR-1: VAL posts DBE_VALUE|DBE_LOG
+    /// VAL posts DBE_VALUE|DBE_LOG
     /// only when it changed (C mbboRecord.c:400-403 `mlst != val`), not every
     /// process cycle. The comparison is captured in process(); see
     /// `value_changed`.
@@ -756,7 +756,7 @@ impl Record for MbboRecord {
         self.convert();
         self.oraw = self.rval;
         self.orbv = self.rbv;
-        // Regression R0604-BASEREC-BINARY-MONITOR-1: capture the VAL-change
+        // Capture the VAL-change
         // gate now (C mbboRecord.c:400-403 `mlst != val`); the framework reads
         // monitor_value_changed() after process().
         self.value_changed = self.mlst != self.val;

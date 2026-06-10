@@ -3423,7 +3423,7 @@ impl PvDatabase {
     /// and the worker thread running `db_process(prec)` (`dbCa.c:1295`).
     /// A cross-IOC source never processes locally, so this callback is the
     /// only trigger; without it a `CP`/`CPP` link's holder never processes
-    /// on a remote change (Regression R0604-CALINK-CP-NO-PROCESS-1).
+    /// on a remote change.
     ///
     /// A fresh `visited` set and `depth = 0` start a new process chain —
     /// the monitor event is an independent external trigger, like a scan,

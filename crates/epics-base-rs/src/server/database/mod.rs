@@ -231,8 +231,7 @@ struct PvDatabaseInner {
     /// processes here; a cross-IOC source never processes locally, so its
     /// only trigger is the calink/pvalink CA monitor callback, which calls
     /// [`PvDatabase::dispatch_external_cp_targets`]. Parity with C
-    /// `dbCa.c:993-994` `eventCallback` adding `CA_DBPROCESS`
-    /// (Regression R0604-CALINK-CP-NO-PROCESS-1).
+    /// `dbCa.c:993-994` `eventCallback` adding `CA_DBPROCESS`.
     external_cp_links: RwLock<HashMap<String, Vec<CpTarget>>>,
     /// Alias map: alternate-name → real-record-name. Mirrors epics-base
     /// PR #336 (alias name validation + parsing). `find_entry` and

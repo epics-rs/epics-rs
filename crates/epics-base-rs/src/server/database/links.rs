@@ -1555,8 +1555,7 @@ impl PvDatabase {
     /// already knows — guarantees the registry key and the dispatch key can
     /// never diverge. The `target_record` (the local holder) IS alias-resolved
     /// so the dispatch processes the canonical record. CP dominates CPP on a
-    /// merged edge, identical to the local path
-    /// (Regression R0604-CALINK-CP-NO-PROCESS-1).
+    /// merged edge, identical to the local path.
     pub async fn register_external_cp_link(
         &self,
         external_pv: &str,
@@ -1681,7 +1680,7 @@ impl PvDatabase {
     /// Scan all records for CP/CPP input links and register them. Local
     /// `Db` links land in the local CP registry; external `Ca` links land
     /// in the external CP registry, whose holders are processed by the
-    /// calink monitor callback (Regression R0604-CALINK-CP-NO-PROCESS-1).
+    /// calink monitor callback.
     pub async fn setup_cp_links(&self) {
         let names = self.all_record_names().await;
         let mut db_links: Vec<(String, String, bool)> = Vec::new();
@@ -1774,8 +1773,6 @@ mod out_link_put_fail_tests {
     use crate::types::EpicsValue;
     use std::collections::HashSet;
 
-    /// Regression R0604-BASEDB-OUT-PUT-FAIL-PROCESS-1.
-    ///
     /// C `dbDbPutValue` (dbDbLink.c:382-390) runs `dbPut`, folds the
     /// source alarm via `recGblInheritSevrMsg`, then `if (status) return
     /// status;` — only a *successful* write reaches the `.PROC`/`PP`

@@ -6460,7 +6460,7 @@ async fn br_fr3_ca_link_applies_maximize_switch_at_processing() {
     assert_eq!(stat, alarm_status::LINK_ALARM, "MSI surfaces as LINK_ALARM");
 }
 
-// R0602-BASEREC-4 — lsi/lso `menuPost` MPST/APST "Always" mode.
+// lsi/lso `menuPost` MPST/APST "Always" mode.
 //
 // After fix 9587929c an unchanged lsi/lso process cycle posts NO
 // VALUE/LOG monitor (C `lsiRecord.c`/`lsoRecord.c` monitor gate on

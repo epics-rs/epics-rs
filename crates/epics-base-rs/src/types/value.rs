@@ -1425,8 +1425,6 @@ mod array_convert_tests {
         assert_eq!(v.convert_to(DbFieldType::Long), v);
     }
 
-    /// Regression R0604-PVASRV-UINT32-SIGNED-PUT-NARROW-1.
-    ///
     /// An integer array narrowed to a signed target truncates per element
     /// (pvxs `convertCast`'s `Dest(S[i])`, `sharedarray.cpp:160-166`), it
     /// must not saturate through f64. The native PVA `uint[]` carrier is
@@ -1452,7 +1450,7 @@ mod array_convert_tests {
     }
 }
 
-/// Regression R0604-PVASRV-UINT32-SIGNED-PUT-NARROW-1: integer-source
+/// Integer-source
 /// scalar narrowing must use C/pvxs `static_cast` truncation, never the
 /// f64 round-trip's saturation. Values pinned against pvxs
 /// `test/testdata.cpp:596-599`.

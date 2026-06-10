@@ -135,7 +135,6 @@ pub enum ScalarValue {
 /// the original reason for deriving it now carries its own manual `Default`
 /// (`VariantValue::null()`), so this impl no longer has an internal caller and
 /// exists only so the exported type's `Default` does not silently disappear.
-/// Regression R0604-PVDATA-SCALARVALUE-DEFAULT-API-1.
 ///
 /// ```
 /// use epics_pva_rs::pvdata::ScalarValue;

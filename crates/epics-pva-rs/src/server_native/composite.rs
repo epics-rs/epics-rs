@@ -1569,7 +1569,7 @@ mod tests {
         assert_eq!(<CompositeSource as ChannelSource>::beacon_change(&comp), v4);
     }
 
-    /// R0604-PVASRV-BEACON-SHAREDPV-MUTATION-1: the composite must fold an
+    /// The composite must fold an
     /// inner source's own `beacon_change()` into its returned counter, so
     /// a built-in `SharedSource` PV add/remove advances the beacon even
     /// when the composite's OWN add/remove counter is unchanged. pvxs

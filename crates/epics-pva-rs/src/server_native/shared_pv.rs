@@ -717,7 +717,7 @@ impl SharedPV {
         // Storing under the lock gives the read-merge-write invariant
         // (two concurrent disjoint delta PUTs cannot both read the same
         // prior and clobber each other). Delivering under the SAME lock
-        // closes R0604-PVASRV-SHAREDPV-PUTDELTA-CLOSE-RACE-1: `close()`
+        // closes the post-and-close race: `close()`
         // also takes `inner`, so a post and a close serialize exactly as
         // pvxs serializes `post()`/`close()` on `impl->lock`
         // (`sharedpv.cpp:394-407`) — there is no window in which a value
@@ -749,7 +749,6 @@ impl SharedPV {
                     let mut merged = crate::pvdata::encode::fill_unmarked_from_prior(
                         desc, changed, 0, delta, prior,
                     );
-                    // Regression R0604-PVASRV-SHAREDPV-MAILBOX-TIMESTAMP-1.
                     // pvxs `buildMailbox` installs an `onPut` that stamps an
                     // unmarked `timeStamp` with the server's current time
                     // before posting (`sharedpv.cpp:113-121`). Do that here,
@@ -2255,7 +2254,6 @@ mod tests {
         assert_eq!(extract_int(&v2.unwrap()), 22);
     }
 
-    /// Regression R0604-PVASRV-SHAREDPV-MAILBOX-TIMESTAMP-1.
     /// A mailbox PUT that marks only `value` (timeStamp left unset) must
     /// get a fresh server timestamp, mirroring pvxs `buildMailbox`'s
     /// `onPut` (`sharedpv.cpp:113-121`). The PV opened with a zero
@@ -2283,7 +2281,6 @@ mod tests {
         assert_eq!(extract_int(&pv.current().unwrap()), 11, "value stored");
     }
 
-    /// Regression R0604-PVASRV-SHAREDPV-MAILBOX-TIMESTAMP-1.
     /// A client that marks `timeStamp.secondsPastEpoch` keeps its own
     /// timestamp — pvxs only stamps when `!isMarked(true, true)`, so a
     /// marked child suppresses the server fill.
@@ -2308,7 +2305,6 @@ mod tests {
         );
     }
 
-    /// Regression R0604-PVASRV-SHAREDPV-MAILBOX-TIMESTAMP-1.
     /// A value type with no `timeStamp` field is unaffected: the PUT
     /// stores the value and the server fabricates no timeStamp.
     #[tokio::test]
@@ -2405,7 +2401,6 @@ mod tests {
         );
     }
 
-    /// Regression R0604-PVASRV-SHAREDPV-PUTDELTA-CLOSE-RACE-1.
     /// Mailbox `put_delta` now stores the merged value AND delivers it to
     /// subscribers under one `inner` lock — the same lock `close()` takes
     /// (pvxs serializes `post()`/`close()` on `impl->lock`,
@@ -2452,7 +2447,7 @@ mod tests {
         assert!(pv.current().is_none(), "closed PV has no current value");
     }
 
-    /// Regression R0604-PVASRV-SHAREDPV-PUTDELTA-CLOSE-RACE-1 (liveness).
+    /// Liveness.
     /// In-lock delivery must not deadlock against `close()`. Both `put_delta`
     /// (mailbox) and `close()` take the `inner` mutex, and delivery now runs
     /// while `inner` is held; this is safe only because `MonitorOutbox::post`
@@ -2518,7 +2513,7 @@ mod tests {
         }
     }
 
-    /// R0604-PVASRV-BEACON-SHAREDPV-MUTATION-1: a built-in `SharedSource`
+    /// A built-in `SharedSource`
     /// PV registry mutation must advance the beacon-change counter, the
     /// Rust analog of pvxs `Server::addPV` / `removePV` bumping
     /// `beaconChange` (server.cpp:180,189). The boundary case the PV-name

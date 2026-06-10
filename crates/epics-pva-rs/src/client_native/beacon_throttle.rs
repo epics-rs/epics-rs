@@ -296,7 +296,6 @@ mod tests {
         assert!(t.prune_stale(Duration::from_secs(0)).is_empty());
     }
 
-    /// Regression R0604-PVACLI-DISCOVERY-TIMEOUT-PROTO-1.
     /// One endpoint advertising both `tcp` and `tls` is two `(server, proto)`
     /// identities; stale cleanup must surface both with their proto so the
     /// caller can fire two *distinguishable* `Discovered::Timeout` events
@@ -321,7 +320,6 @@ mod tests {
         );
     }
 
-    /// Regression R0604-PVACLI-DISCOVERY-TIMEOUT-PROTO-1.
     /// A `tls` GUID/peerVersion change is scoped to the `tls` identity: it
     /// reports the *old* tls GUID+peerVersion for the Timeout and must NOT
     /// retire the coexisting `tcp` identity (still `Update` on next beacon).

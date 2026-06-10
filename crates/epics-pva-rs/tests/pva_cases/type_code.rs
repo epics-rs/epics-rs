@@ -134,8 +134,6 @@ fn type_code_roundtrip_variant_array() {
     both_orders(FieldDesc::VariantArray);
 }
 
-/// Regression R0604-PVDATA-BOUNDED-STRING-PVACCESSCPP-1.
-///
 /// EPICS base pvData serializes a `BoundedString` as `0x83` followed by
 /// `SerializeHelper::writeSize(maxLength)` (`FieldCreateFactory.cpp:201-206,
 /// 1512-1523`), and pvAccessCPP servers put it on the wire. pvxs has no
@@ -186,7 +184,7 @@ fn bounded_string_wire_tag_interop_decodes_strict_rejects() {
     }
 }
 
-/// Regression R0604-PVDATA-BOUNDED-STRING-PVACCESSCPP-1 (nested + normalize).
+/// Nested + normalize.
 ///
 /// A bounded string nested inside a structure must decode under the default
 /// interop policy — proving the policy threads through the recursive descent

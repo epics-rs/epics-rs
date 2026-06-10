@@ -1207,8 +1207,7 @@ fn route_frame(
             // name/counters because `register_channel` is `or_insert_with`.
             // The other per-SID teardown owners already drop it (set_state via
             // `unregister_channel`, connection drop via `chan_stats.clear()`);
-            // this closes the last bypass. Regression
-            // R0604-PVACLI-REPORT-DESTROY-CHANNEL-LEAK-1.
+            // this closes the last bypass.
             chan_stats.remove(&sid);
         }
         return;
@@ -1612,7 +1611,7 @@ mod tests {
         log_server_message(&[0u8; 5], ByteOrder::Little); // ioid + mtype but no string
     }
 
-    /// Regression R0604-PVASRV-MESSAGE-SEVERITY-MAP-1 (client half).
+    /// Client half.
     /// pvxs client `handle_MESSAGE` maps the level through the same
     /// `mtype2level` as the server (clientconn.cpp:457, pvaproto.h:704-712):
     /// 0=Info, 1=Warn, 2=Err, default (Fatal=3 and every unknown value)=Crit.
@@ -1804,7 +1803,7 @@ mod tests {
         assert!(!by_sid_close.contains_key(&sid));
     }
 
-    /// Regression R0604-PVACLI-REPORT-DESTROY-CHANNEL-LEAK-1: a
+    /// A
     /// server-initiated `CMD_DESTROY_CHANNEL` must also drop the destroyed
     /// SID's `ClientReport` (`chan_stats`) entry, matching pvxs
     /// `Channel::disconnect()` doing `chanBySID.erase(sid)` (client.cpp:170).
@@ -2345,7 +2344,7 @@ mod tests {
         assert!(!conn.is_alive());
     }
 
-    /// Regression (PVA-RS-2026-05-28-71): the client heartbeat must use an
+    /// The client heartbeat must use an
     /// application `CMD_ECHO`, which pvxs servers answer, NOT a control
     /// EchoRequest, which pvxs drains and ignores (conn.cpp:180-194). A
     /// pvxs-shaped peer that replies only to application echo must keep a

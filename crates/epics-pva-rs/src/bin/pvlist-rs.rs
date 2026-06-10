@@ -645,7 +645,6 @@ mod tests {
         );
     }
 
-    /// Regression R0604-PVACLI-DISCOVERY-TIMEOUT-PROTO-1.
     /// The non-verbose dedup erase is gated on `proto == "tcp"`
     /// (list.cpp:133-137): a `tls` Timeout must NOT clear the printed
     /// `tcp` identity. Before the fix `on_timeout` carried no proto and

@@ -98,7 +98,7 @@ struct PipelineOptions {
     /// options (`servermon.cpp:529,542,567,572`). Carried alongside the
     /// effective options so the MONITOR INIT owner can emit pvxs-shaped
     /// `CMD_MESSAGE` frames; never alters a negotiated value. Empty for a
-    /// clean request. Regression R0604-PVASRV-MONITOR-OPTION-REMOTE-LOG-1.
+    /// clean request.
     diagnostics: Vec<MonitorOptionDiag>,
 }
 
@@ -139,8 +139,7 @@ enum MonitorPipelineRequest {
 /// `"garbage"`) is SILENTLY ignored by pvxs — `as<string>` succeeds, the
 /// value has no `%` suffix, so neither branch fires and no diagnostic is
 /// emitted (`:560-569`). This faithfully differs from the review doc's
-/// imprecise `ackAny=garbage` Crit example. Regression
-/// R0604-PVASRV-MONITOR-OPTION-REMOTE-LOG-1.
+/// imprecise `ackAny=garbage` Crit example.
 fn ack_at_from(ack_any: Option<&PvField>, queue_size: u32) -> (u32, Option<MonitorOptionDiag>) {
     use crate::pvdata::ScalarValue;
     // pvxs `MonitorOp::ackAt` struct default.
@@ -984,8 +983,7 @@ struct ChannelState {
     /// does NOT rewrite the credential captured by an already-open channel
     /// control. Per-operation handlers still use the connection's *current*
     /// credential (pvxs builds each `ConnectOp`/`ExecOp` from `conn->cred`),
-    /// so only the open/close edges are pinned here (Regression
-    /// R0604-PVASRV-REAUTH-CHANNEL-LIFECYCLE-CRED-1).
+    /// so only the open/close edges are pinned here.
     open_cred: ClientCredentials,
     /// ioid → (introspection negotiated for this op, kind)
     ops: HashMap<u32, OpState>,
@@ -1257,7 +1255,7 @@ fn apply_exec_finish(channels: &mut HashMap<u32, ChannelState>, fin: ExecFinishe
         return;
     }
     let remove = match kind {
-        // R0604-PVASRV-LASTREQUEST-ERROR-1: GPR cleanup is gated on a
+        // GPR cleanup is gated on a
         // successful reply; an error reply keeps the op Idle with the sticky
         // last_request marker for a later EXEC.
         OpKind::Get | OpKind::Put | OpKind::Rpc => last_request && fin.success,
@@ -2316,7 +2314,7 @@ async fn process_connection_validation(
     // plain-TCP claim) is one this server advertised. It is the only gate on
     // the OK-vs-Error reply below, and `*cred` is committed only on the
     // advertised path — so a rejected re-auth never mutates the connection
-    // identity (Regression R0604-PVASRV-REAUTH-REJECT-CLEARS-CREDENTIAL-1).
+    // identity.
     let advertised;
     if x509_locked {
         // a decode fault here is still fatal —
@@ -2393,8 +2391,7 @@ async fn process_connection_validation(
     // Status::Error so the client knows its elevated identity claim was
     // rejected. The connection stays open and the effective credential is
     // whatever was already in force — never the rejected claim, and never a
-    // forced downgrade to anonymous (Regression
-    // R0604-PVASRV-REAUTH-REJECT-CLEARS-CREDENTIAL-1). Matches "No practical
+    // forced downgrade to anonymous. Matches "No practical
     // way to handle auth failure. So we accept all credentials, but may not
     // grant rights." `advertised` was decided above from the effective method
     // (mTLS x509 is always advertised) and `*cred` was committed only on the
@@ -2542,8 +2539,7 @@ fn parse_client_credentials(
     // a non-exact spelling like "CA" is not "ca", so this fallback does not
     // fire; it returns the claimed credential and the caller rejects it as
     // an unadvertised method, leaving the previous connection identity in
-    // force (the claim is never committed; see process_connection_validation,
-    // Regression R0604-PVASRV-REAUTH-REJECT-CLEARS-CREDENTIAL-1).
+    // force (the claim is never committed; see process_connection_validation).
     if creds.method == "ca" && creds.account.is_empty() {
         return Ok(None);
     }
@@ -2631,8 +2627,7 @@ struct CreateChannelCompletion {
     /// before the async resolver runs and carried back so the channel's
     /// lifecycle callbacks use the credential the channel was opened under —
     /// not whatever the connection re-authenticated to while the resolver
-    /// was still running (pvxs `serverchan.cpp:62`; Regression
-    /// R0604-PVASRV-REAUTH-CHANNEL-LIFECYCLE-CRED-1).
+    /// was still running (pvxs `serverchan.cpp:62`).
     open_cred: ClientCredentials,
     /// `Some` → PV was found; carries the negotiated descriptor and the
     /// owner source bound into the channel. `None` → not found; emit an
@@ -2832,7 +2827,7 @@ async fn handle_connection_io(
     // force-disconnects every channel in `channels` serving any of those
     // names with a server-initiated DESTROY_CHANNEL. The queue is unbounded
     // and per-connection, so a large `:flush` can never drop a name on this
-    // connection (R0604-BRPVAGW-FLUSH-1). Subscribing here (post-accept,
+    // connection. Subscribing here (post-accept,
     // pre-handshake) is sufficient: no channel exists until after
     // CONNECTION_VALIDATION, so any invalidation during the handshake names
     // a PV this connection cannot yet be serving and is harmlessly missed.
@@ -2998,8 +2993,7 @@ async fn handle_connection_io(
                             // Pinned to the channel's CREATE-time credential, not
                             // the connection's current `cred` — a re-auth between
                             // CREATE dispatch and this completion must not change
-                            // which identity the source sees the channel open under
-                            // (Regression R0604-PVASRV-REAUTH-CHANNEL-LIFECYCLE-CRED-1).
+                            // which identity the source sees the channel open under.
                             let ctx = channel_lifecycle_ctx(peer, &ch.open_cred);
                             ch.source.notify_channel_open(&ch.name, &ctx);
                         }
@@ -3113,7 +3107,7 @@ async fn handle_connection_io(
                         // One removal command publishes its whole removed set
                         // as a single unbounded-queue batch, so nothing is ever
                         // dropped, regardless of how many entries a `:flush`
-                        // cleared (R0604-BRPVAGW-FLUSH-1). Tear down each name
+                        // cleared. Tear down each name
                         // through the single teardown owner: a channel hosts
                         // every op under one name, so destroying it ends that
                         // name's GET/PUT/MONITOR alike — matching pva2pva's
@@ -5038,9 +5032,8 @@ async fn handle_create_channel(
         // the channel is created under this identity and its lifecycle
         // callbacks must use it even if the connection re-authenticates to a
         // different identity while the resolver is still in flight. The
-        // snapshot rides back in each completion and is stored on the channel
-        // (Regression R0604-PVASRV-REAUTH-CHANNEL-LIFECYCLE-CRED-1). The
-        // resolver's `ChannelContext` is built from the same snapshot, so
+        // snapshot rides back in each completion and is stored on the channel.
+        // The resolver's `ChannelContext` is built from the same snapshot, so
         // resolution and the open callback agree.
         let open_cred = cred.clone();
         let conn_ctx = channel_lifecycle_ctx(peer, &open_cred);
@@ -5115,8 +5108,7 @@ fn channel_lifecycle_ctx(
 /// `open_cred` reconstruct the identity the channel was *created* under —
 /// pvxs delivers `onClose` with the channel-control credential
 /// (`serverchan.cpp:62`), so a re-auth between open and teardown must not
-/// change the close identity (Regression
-/// R0604-PVASRV-REAUTH-CHANNEL-LIFECYCLE-CRED-1).
+/// change the close identity.
 fn close_channel(ch: ChannelState, peer: SocketAddr) {
     let ChannelState {
         name,
@@ -5141,7 +5133,7 @@ fn close_channel(ch: ChannelState, peer: SocketAddr) {
 /// callback is delivered with the channel's own stored open-time credential
 /// (`ChannelState::open_cred`), pinned at CREATE_CHANNEL, not the
 /// connection's current identity — which a re-auth can reassign after the
-/// channel is open (Regression R0604-PVASRV-REAUTH-CHANNEL-LIFECYCLE-CRED-1).
+/// channel is open.
 /// `close_channel` reconstructs the lifecycle [`ChannelContext`] from that
 /// stored snapshot and `ctx.peer`.
 struct ChannelTeardownCtx<'a> {
@@ -5153,8 +5145,7 @@ struct ChannelTeardownCtx<'a> {
 
 /// Why a channel is being torn down with a DESTROY_CHANNEL frame. pvxs
 /// attributes the 16-byte reply to the report differently for the two
-/// causes, so the single teardown owner must know which one it serves
-/// (Regression R0604-PVASRV-REPORT-CHANNEL-BYTE-ACCOUNTING-1).
+/// causes, so the single teardown owner must know which one it serves.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DestroyCause {
     /// Server-initiated unsolicited destroy: PVA gateway operator
@@ -5221,7 +5212,7 @@ async fn finalize_channel_destroy(
     let stat = ch.stat.clone();
     // `close_channel` delivers `onClose` with the channel's stored
     // open-time credential, not `ctx.cred` (the connection's current
-    // identity) — pinned per R0604-PVASRV-REAUTH-CHANNEL-LIFECYCLE-CRED-1.
+    // identity) — pinned.
     close_channel(ch, ctx.peer);
 
     // Client-initiated DESTROY: pvxs `handle_DESTROY_CHANNEL()` erases the
@@ -5879,8 +5870,7 @@ async fn handle_op(
         // RPC never negotiate these options), and after the Reject early-return
         // so a rejected pipeline INIT carries only its op-error (matching pvxs
         // `ctrl->error()`, which emits no logRemote). Borrowed before the move
-        // below consumes `pipeline_req`. Regression
-        // R0604-PVASRV-MONITOR-OPTION-REMOTE-LOG-1.
+        // below consumes `pipeline_req`.
         if kind == OpKind::Monitor
             && let Some(MonitorPipelineRequest::Options(o)) = &pipeline_req
         {
@@ -6582,7 +6572,6 @@ async fn handle_op(
             let is_destroy = subcmd & 0x10 != 0;
             // Validate-before-side-effect: decode and validate the optional
             // ACK count BEFORE any START/STOP or source callback.
-            // Regression R0604-PVASRV-MONITOR-ACK-VALIDATE-ORDER-1.
             //
             // pvxs `servermon.cpp:599-608` reads `from_wire(M, nack)` when
             // `subcmd & 0x80` and, on a truncated frame (`!M.good()`), calls
@@ -6711,7 +6700,6 @@ async fn handle_op(
             // after the ACK block). The ACK count for a combined frame was
             // already validated at the top of this arm, so reaching here means
             // the frame decoded cleanly and these side effects are safe.
-            // Regression R0604-PVASRV-MONITOR-ACK-VALIDATE-ORDER-1.
             if let Some(op) = ch.ops.get(&ioid) {
                 if is_stop {
                     op.monitor_paused
@@ -8066,7 +8054,6 @@ fn build_op_error_frame(
 /// `ioid:u32 + mtype:u8 + message:string`); the client logs `Warning`
 /// (1) at `warn!` and `Fatal` (3) at `error!`. Used by the MONITOR INIT
 /// owner to surface [`MonitorOptionDiag`] negotiation diagnostics.
-/// Regression R0604-PVASRV-MONITOR-OPTION-REMOTE-LOG-1.
 fn build_message_frame(ioid: u32, level: MessageType, msg: &str, order: ByteOrder) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.put_u32(ioid, order);
@@ -9176,7 +9163,7 @@ mod tests {
     /// limit, the `limit == 1` squash-into-front, and a boundary post — not
     /// by a narrative burst.
     ///
-    /// Regression R0604-PVASRV-MONITOR-QUEUE-OFFBYONE-1: before the fix the
+    /// Before the fix the
     /// in-hand `value` was held OUTSIDE the queue and only `pending.len()`
     /// was bounded, so under backpressure `queue_limit + 1` distinct posts
     /// went unsent. This reproduces the real loop state the old isolated
@@ -10072,7 +10059,6 @@ mod tests {
         );
     }
 
-    // ---- R0604-PVASRV-MONITOR-OPTION-REMOTE-LOG-1 ----
     // pvxs `ServerConn::logRemote()` diagnostics for PRESENT-but-invalid
     // monitor `_options` (`servermon.cpp:529/542/567/572`). Asserted by
     // the option/validity boundary (the diagnostics vec carried on the
@@ -10255,7 +10241,7 @@ mod tests {
         );
     }
 
-    /// Emission half of R0604-PVASRV-MONITOR-OPTION-REMOTE-LOG-1: a
+    /// Emission half of the remote-monitor-log path: a
     /// MONITOR INIT carrying a PRESENT-but-invalid option must put a
     /// pvxs-shaped CMD_MESSAGE (IOID-tagged) on the wire BEFORE the INIT
     /// reply. Here an unparseable `pipeline` string yields one Warn frame.
@@ -11224,8 +11210,8 @@ mod tests {
         );
     }
 
-    /// Recorder source for the MONITOR ACK validate-order regression
-    /// (R0604-PVASRV-MONITOR-ACK-VALIDATE-ORDER-1). Pushes every
+    /// Recorder source for the MONITOR ACK validate-order regression.
+    /// Pushes every
     /// `notify_monitor_start` and `notify_watermark` edge into one ordered
     /// log so a test can assert (a) NO edge fires when a malformed combined
     /// frame is rejected, and (b) ACK refill precedes START for a well-formed
@@ -11343,8 +11329,6 @@ mod tests {
         channels
     }
 
-    /// Regression R0604-PVASRV-MONITOR-ACK-VALIDATE-ORDER-1.
-    ///
     /// A truncated `0xC4` (ACK|START) frame with no ACK `u32` must be a
     /// connection-fatal Decode error with NO START side effect: `monitor_paused`
     /// stays paused and `notify_monitor_start` never fires. pvxs
@@ -11422,8 +11406,6 @@ mod tests {
         );
     }
 
-    /// Regression R0604-PVASRV-MONITOR-ACK-VALIDATE-ORDER-1.
-    ///
     /// A truncated `0x84` (ACK|STOP) frame with no ACK `u32` must be a
     /// connection-fatal Decode error with NO STOP side effect: `monitor_paused`
     /// stays cleared and `notify_monitor_start(false)` never fires. Pre-fix the
@@ -11500,8 +11482,6 @@ mod tests {
         );
     }
 
-    /// Regression R0604-PVASRV-MONITOR-ACK-VALIDATE-ORDER-1.
-    ///
     /// A well-formed `0xC4` (ACK|START) refills the window AND resumes, and
     /// pvxs (servermon.cpp:643-689) applies ACK refill THEN START, so the
     /// `onHighMark` (Resume watermark) precedes `onStart`. Pre-fix the START
@@ -11617,7 +11597,7 @@ mod tests {
         body
     }
 
-    /// Regression R0604-PVASRV-TCP-SEARCH-PROTOCOL-GATE-1: a SEARCH
+    /// A SEARCH
     /// arriving on an established **plaintext TCP** circuit that advertises
     /// only `["tls"]` must still match a hosted PV. pvxs `handle_SEARCH`
     /// parses the protocol strings into `foundtcp` but never consults it
@@ -11808,7 +11788,6 @@ mod tests {
         msg(999).expect("MESSAGE on unknown IOID dropped, not an error");
     }
 
-    /// Regression R0604-PVASRV-DATAPHASE-IOID-1.
     /// A data-phase (non-INIT) operation frame must resolve its channel
     /// through the connection-wide op owner, not the SID carried in the
     /// frame. pvxs GET/PUT/RPC EXEC looks the op up in `opByIOID` and acts
@@ -11877,7 +11856,6 @@ mod tests {
         assert_eq!(data_phase_owner_sid(&channels, 999, 1, true).unwrap(), None);
     }
 
-    /// Regression R0604-PVASRV-MESSAGE-SEVERITY-MAP-1.
     /// pvxs maps inbound CMD_MESSAGE mtypes through `mtype2level`: 0=Info,
     /// 1=Warn, 2=Err, default (Fatal=3 and every unknown value)=Crit
     /// (pvaproto.h:704-712, serverconn.cpp:346-351). The tracing stack has
@@ -12110,7 +12088,7 @@ mod tests {
         op.data_task_abort = Some(abort);
         op.last_request = true; // a last-request EXEC that is now cancelled
         let old_op_id = op.monitor_op_id;
-        // Regression R0604-PVASRV-CANCEL-LASTREQUEST-1: the sticky destroy
+        // The sticky destroy
         // marker must SURVIVE this cancel (asserted below).
 
         let mut channels: HashMap<u32, ChannelState> = HashMap::new();
@@ -12175,7 +12153,7 @@ mod tests {
         );
     }
 
-    /// Regression R0604-PVASRV-CANCEL-LASTREQUEST-1. pvxs `CANCEL_REQUEST`
+    /// pvxs `CANCEL_REQUEST`
     /// (`serverconn.cpp:262-289`) sets an executing op `Idle` but never clears
     /// `ServerGPR::lastRequest`. A client may therefore send a last-request
     /// EXEC, cancel it before the source replies, then send a non-last EXEC:
@@ -12932,8 +12910,8 @@ mod tests {
 
     /// Records the `(method, account)` each edge observed: channel open
     /// (`notify_channel_open`), channel close (`notify_channel_close`), and
-    /// the per-op GET ACF check (`get_value_checked`). Lets the
-    /// R0604-PVASRV-REAUTH-CHANNEL-LIFECYCLE-CRED-1 regressions assert which
+    /// the per-op GET ACF check (`get_value_checked`). Lets these
+    /// regression tests assert which
     /// identity each edge ran under.
     struct CredRecordingSource {
         opened: Arc<parking_lot::Mutex<Vec<(String, String)>>>,
@@ -13001,7 +12979,7 @@ mod tests {
         Arc::new(parking_lot::Mutex::new(Vec::new()))
     }
 
-    /// Regression R0604-PVASRV-REAUTH-CHANNEL-LIFECYCLE-CRED-1 — open edge.
+    /// Open edge.
     ///
     /// pvxs builds the channel's `ServerChannelControl` with `conn->cred` at
     /// CREATE_CHANNEL (serverchan.cpp:62) and runs the source attach under
@@ -13099,7 +13077,7 @@ mod tests {
         );
     }
 
-    /// Regression R0604-PVASRV-REAUTH-CHANNEL-LIFECYCLE-CRED-1 — client-DESTROY
+    /// Client-DESTROY
     /// close edge. A channel opened under `alice/ca` and destroyed by a client
     /// DESTROY_CHANNEL after the connection re-authed to `bob/ca` must deliver
     /// `notify_channel_close` under Alice — the close identity comes from the
@@ -13161,7 +13139,7 @@ mod tests {
         );
     }
 
-    /// Regression R0604-PVASRV-REAUTH-CHANNEL-LIFECYCLE-CRED-1 — server-teardown
+    /// Server-teardown
     /// close edge. The connection-teardown / operator `:drop`/`:flush` path
     /// tears channels down through `finalize_channel_destroy` (server-initiated
     /// DESTROY_CHANNEL). It must also deliver `notify_channel_close` under the
@@ -13221,7 +13199,7 @@ mod tests {
         );
     }
 
-    /// Regression R0604-PVASRV-REAUTH-CHANNEL-LIFECYCLE-CRED-1 — per-op edge
+    /// Per-op edge
     /// (the converse guard). Only the channel *lifecycle* edges are pinned to
     /// the CREATE-time credential; per-operation handlers must keep using the
     /// connection's *current* credential (pvxs builds each `ConnectOp`/`ExecOp`
@@ -16196,8 +16174,7 @@ mod tests {
     /// serverintrospect.cpp:45/164, where `rxlen = 8u + body`). Drives the
     /// real handler and reads back the SHARED `ChannelStat` Arc the report
     /// would observe, so a future send site that bypasses `chan_tx` (or an
-    /// rx charge that drops the 8-byte header) regresses this test
-    /// (Regression R0604-PVASRV-REPORT-CHANNEL-BYTE-ACCOUNTING-1).
+    /// rx charge that drops the 8-byte header) regresses this test.
     #[tokio::test]
     async fn get_field_attributes_tx_rx_to_channel_stat() {
         use crate::pvdata::FieldDesc;
@@ -16268,8 +16245,7 @@ mod tests {
         );
     }
 
-    /// Owner math for per-channel inbound op-RX accounting
-    /// (R0604-PVASRV-REPORT-CHANNEL-BYTE-ACCOUNTING-1): `add_op_rx` must
+    /// Owner math for per-channel inbound op-RX accounting: `add_op_rx` must
     /// charge the FULL framed length `PvaHeader::SIZE + body`, matching
     /// pvxs `rxlen = 8u + evbuffer_get_length(segBuf)`. Every op handler
     /// (PUT_GET / PROCESS / ARRAY / GET / PUT / MONITOR / RPC / GET_FIELD)
@@ -16308,8 +16284,7 @@ mod tests {
     /// "don't bother to increment for channel"). Both drop the per-channel
     /// report entry. One case per `DestroyCause` boundary; before the fix a
     /// single finalizer charged the channel reply unconditionally, so the
-    /// client case over-counted (Regression
-    /// R0604-PVASRV-REPORT-CHANNEL-BYTE-ACCOUNTING-1).
+    /// client case over-counted.
     #[tokio::test]
     async fn destroy_channel_tx_attribution_splits_by_cause() {
         use std::sync::atomic::Ordering;
@@ -17973,8 +17948,6 @@ mod tests {
         Frame { header, payload }
     }
 
-    /// Regression R0604-PVASRV-REAUTH-REJECT-CLEARS-CREDENTIAL-1.
-    ///
     /// A post-handshake CONNECTION_VALIDATION selecting an *unadvertised*
     /// method must reply Status::Error but leave the connection's effective
     /// credential at the previously committed identity — pvxs clones `cred`
@@ -18852,7 +18825,7 @@ mod bfr15_tests {
         assert_eq!(op_exec_state(&channels, sid, ioid), ExecState::Idle);
     }
 
-    /// Regression R0604-PVASRV-LASTREQUEST-ERROR-1. pvxs `ServerGPR::doReply`
+    /// pvxs `ServerGPR::doReply`
     /// (serverget.cpp:86-116) returns an executing GPR op to `Idle` on an ERROR
     /// reply WITHOUT cleanup — `lastRequest` stays sticky for a later EXEC — and
     /// cleans the op up only after a SUCCESSFUL last-request reply. The pre-fix
@@ -18933,7 +18906,7 @@ mod bfr15_tests {
 
     /// GET_FIELD is a `ServerIntrospect` one-shot (serverintrospect.cpp:47-49):
     /// it is removed on EVERY terminal reply — success OR error — unlike a GPR
-    /// op. The success-gating from R0604-PVASRV-LASTREQUEST-ERROR-1 must apply
+    /// op. The success-gating from that fix must apply
     /// ONLY to GPR kinds; a naive `last_request && success` for all kinds would
     /// leak a failed introspection's reserved IOID. Lock the kind distinction:
     /// an error completion of a GET_FIELD op still frees it.

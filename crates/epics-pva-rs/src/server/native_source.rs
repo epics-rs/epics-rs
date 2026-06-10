@@ -2081,7 +2081,7 @@ ASG(LOCKED) {
         );
     }
 
-    /// Regression R0604-PVASRV-UINT32-SIGNED-PUT-NARROW-1: a native PVA
+    /// A native PVA
     /// scalar `uint` PUT into a signed `DBF_LONG` field must truncate
     /// (C/pvxs `static_cast`: `uint32 0xffffffff -> int32 -1`,
     /// `testdata.cpp:596`), not saturate. The `uint` carrier is `Int64`;
@@ -2115,7 +2115,7 @@ ASG(LOCKED) {
         );
     }
 
-    /// Regression R0604-PVASRV-UINT32-SIGNED-PUT-NARROW-1: a native PVA
+    /// A native PVA
     /// `uint[]` PUT into a signed `waveform(FTVL=LONG)` must truncate each
     /// element (pvxs `convertCast` `Dest(S[i])`, `sharedarray.cpp:160-166`).
     /// `{1, 2, 0xffffffff}` lands as `{1, 2, -1}`; pre-fix the last element

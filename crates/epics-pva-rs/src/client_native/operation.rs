@@ -120,7 +120,6 @@ impl<T: Send + 'static> PvaOperation<T> {
                 "Operation result already consumed".into(),
             ));
         }
-        // Regression R0604-PVACLI-CANCEL-AFTER-COMPLETE-POISONS-WAIT-1.
         // A produced result is terminal and wins over a later cancellation.
         // pvxs treats a completed `Operation` as final: `cancel()` of it
         // returns false and leaves the buffered reply intact. `cancel()`
@@ -442,7 +441,6 @@ mod tests {
         assert_eq!(v, 5);
     }
 
-    /// Regression R0604-PVACLI-CANCEL-AFTER-COMPLETE-POISONS-WAIT-1.
     /// `cancel()` used as idempotent cleanup after an operation has already
     /// completed (but before its result is consumed) must report not-active
     /// and must NOT poison the buffered `Ok` result for a later `wait()`.
@@ -466,7 +464,6 @@ mod tests {
         );
     }
 
-    /// Regression R0604-PVACLI-CANCEL-AFTER-COMPLETE-POISONS-WAIT-1.
     /// The same precedence holds for an operation that completed with an
     /// `Err`: the real error survives a post-completion `cancel()`.
     #[tokio::test]

@@ -142,7 +142,7 @@ async fn main() {
     // its op finishes, hurryUp()s, and waits once. The serial await-per-PV
     // loop this replaces spent one timeout per PV; the prior
     // collect-then-zip loop buffered every completed PV behind the slowest
-    // sibling (Regression R0604-PVACLI-MULTIPV-OUTPUT-BATCHED-1). Each
+    // sibling. Each
     // output block leads with the PV name, so completion-order output
     // stays self-identifying — exactly as pvxs prints `argv[n]` first.
     let names: Vec<&str> = args.pv_names.iter().map(String::as_str).collect();

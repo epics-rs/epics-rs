@@ -2343,7 +2343,7 @@ mod tests {
         assert_eq!(format_value_inline(&dbls), "[1.5,2.25]");
     }
 
-    /// Regression R0604-PVACLI-NTTABLE-DOUBLE-PRECISION-1: an NTTable
+    /// An NTTable
     /// double column renders through Base `getAs<std::string>` — each cell
     /// passes `castUnsafe<std::string, double>` → `std::ostringstream <<
     /// value` at the C++ default precision of six significant digits

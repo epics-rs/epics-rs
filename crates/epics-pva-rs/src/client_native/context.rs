@@ -2571,8 +2571,7 @@ impl PvaClient {
                 // (`flatten_type_cache_markers`) has already flattened every
                 // `0xFD`/`0xFE` type-cache marker — including any
                 // `any`/`variant` `0xFE <slot>` back-reference inside the GET
-                // DATA value — into a self-contained frame in wire order
-                // (Regression R0604-PVACLI-DATA-TYPECACHE-SPLIT-OWNER-1), so
+                // DATA value — into a self-contained frame in wire order, so
                 // this frame embeds its own inline types.
                 // If the circuit is already gone the warm op cannot complete.
                 Ok(Ok(frame)) => match warm.server.upgrade() {
@@ -2639,7 +2638,6 @@ impl PvaClient {
     /// this for library callers that need an input-order `Vec`; CLIs that
     /// surface partial progress must call this directly so a completed PV
     /// is printed immediately instead of buffered behind a slow sibling.
-    /// Regression R0604-PVACLI-MULTIPV-OUTPUT-BATCHED-1.
     pub async fn pvget_many_full_streaming<F>(
         &self,
         pv_names: &[&str],
@@ -2708,7 +2706,6 @@ impl PvaClient {
     /// batch is bounded by one timeout. `idx` is the PV's position in
     /// `pv_names`. [`Self::pvinfo_many_full_with_credentials`] is the
     /// ordered-collection wrapper over this.
-    /// Regression R0604-PVACLI-MULTIPV-OUTPUT-BATCHED-1.
     pub async fn pvinfo_many_full_streaming<F>(&self, pv_names: &[&str], mut on_result: F)
     where
         F: FnMut(usize, PvaResult<PvInfoResult>),
@@ -3370,7 +3367,7 @@ mod tests {
         );
     }
 
-    /// Regression for PVA-RS-2026-05-28-48: `ConnectBuilder::exec()`
+    /// `ConnectBuilder::exec()`
     /// must fire the pvxs initial callback for the not-yet-connected
     /// channel WITHOUT depending on a separate GET/PUT/MONITOR
     /// operation. pvxs fires `onDisconnect` right after `Channel::build`

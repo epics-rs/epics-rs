@@ -137,8 +137,6 @@ fn mshim_forwards_search_and_drops_unrecognized() {
     }
 }
 
-/// Regression R0604-MSHIM-CHAINED-UDP-FORWARD-1.
-///
 /// A single received datagram that chains two SEARCHes (`A || B`) must be
 /// forwarded as ONLY the first rebuilt message — pvxs
 /// `UDPCollector::process_one` decodes one PVA header per datagram and

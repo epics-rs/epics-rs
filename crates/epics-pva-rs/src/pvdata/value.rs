@@ -1419,7 +1419,6 @@ mod tests {
 
     #[test]
     fn assign_marked_structure_node_marks_only_no_subtree_copy() {
-        // Regression R0604-PVA-VALUE-ASSIGN-STRUCT-MARK-1.
         // pvxs copyIn's struct branch (data.cpp:739-744) calls dfld.mark()
         // for a marked sub-struct and copies NO subtree payload. A bare
         // `alarm` mark therefore propagates only the changed-bit; the
@@ -1443,7 +1442,6 @@ mod tests {
 
     #[test]
     fn assign_parent_plus_leaf_mark_copies_only_marked_leaf() {
-        // Regression R0604-PVA-VALUE-ASSIGN-STRUCT-MARK-1.
         // Marking the `alarm` node AND the `alarm.severity` leaf transfers
         // only the individually-marked leaf; the unmarked sibling
         // (`alarm.status`) keeps the destination's own value.
@@ -1481,7 +1479,7 @@ mod tests {
         assert!(a.is_marked("alarm.severity"));
     }
 
-    // ── path traversal of union/any/array — PVA-RS-2026-05-28-104 ──
+    // ── path traversal of union/any/array ──
 
     fn struct_of(name: &str, fdesc: FieldDesc, field: PvField) -> Value {
         let desc = FieldDesc::Structure {
@@ -1544,7 +1542,6 @@ mod tests {
 
     #[test]
     fn set_selects_null_union_member() {
-        // Regression R0604-PVA-VALUE-SET-UNION-SELECT-1.
         // A freshly-created value has a null union (selector -1); pvxs
         // mutable traversal (data.cpp:877-887) selects the named member
         // when writing, so `set("value->floatValue", …)` must succeed and
@@ -1567,7 +1564,6 @@ mod tests {
 
     #[test]
     fn set_switches_selected_union_member() {
-        // Regression R0604-PVA-VALUE-SET-UNION-SELECT-1.
         // Writing a *different* member switches the arm (pvxs reselects
         // when fld.desc != the requested member, data.cpp:879-883).
         let mut v = struct_of(
@@ -1589,7 +1585,6 @@ mod tests {
 
     #[test]
     fn lookup_mut_selects_null_union_member_allocating_default() {
-        // Regression R0604-PVA-VALUE-SET-UNION-SELECT-1.
         // The public mutable lookup selects too: on a null union it
         // allocates the member's default payload (here Float(0.0)).
         let mut v = struct_of(
@@ -1607,7 +1602,6 @@ mod tests {
 
     #[test]
     fn set_switches_union_array_element_member() {
-        // Regression R0604-PVA-VALUE-SET-UNION-SELECT-1.
         // Member selection also applies to an *existing* union-array
         // element (allocating a new array element is the separately
         // deferred half of this finding). Switch a present `d` element to
@@ -1680,7 +1674,7 @@ mod tests {
         assert_eq!(v.get_as::<f64>("cells[0]->d").unwrap(), 3.5);
     }
 
-    // ── assign() is driven by the source mark set — PVA-RS-2026-05-28-103 ──
+    // ── assign() is driven by the source mark set ──
 
     #[test]
     fn assign_does_not_copy_unmarked_source_scalar() {
@@ -1717,7 +1711,7 @@ mod tests {
         assert!(matches!(err, ValueError::NoField(ref p) if p == "b"));
     }
 
-    // ── assign() copies non-scalar payloads — PVA-RS-2026-05-28-102 ──
+    // ── assign() copies non-scalar payloads ──
     //
     // pvxs copyIn() (data.cpp:609-769) copies array / union / any store
     // types; the old scalar-only loop dropped them while still copying

@@ -675,8 +675,6 @@ mod tests {
         );
     }
 
-    /// Regression R0604-MSHIM-BROADCAST-UNICAST-FLAG-1.
-    ///
     /// pvxs `mshim` clears the SEARCH `Unicast` flag for any destination
     /// `IfaceMap::is_broadcast` recognizes — a host interface's *subnet*
     /// broadcast (e.g. 192.168.1.255), not only the limited broadcast
@@ -717,7 +715,7 @@ mod tests {
         ));
     }
 
-    /// Regression R0604-MSHIM-BROADCAST-UNICAST-FLAG-1 (end-to-end wire).
+    /// End-to-end wire.
     ///
     /// A real SEARCH datagram forwarded to a `-F <subnet-broadcast>`
     /// target must be rebuilt with the wire `Unicast` flag (0x80)

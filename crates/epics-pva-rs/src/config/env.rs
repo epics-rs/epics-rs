@@ -339,8 +339,7 @@ pub fn resolve_iface_v4(spec: &str) -> Result<Ipv4Addr, String> {
 /// (`tcp_port`), `EPICS_PVA_ADDR_LIST` / beacon destinations (`udp_port`) —
 /// because port 0 is never a usable SEARCH/connect destination. When the
 /// caller passes `default_port == 0` (e.g. a server bind list that allows an
-/// ephemeral port), `setPort(0)` is a no-op, also matching pvxs. Regression
-/// R0604-PVACLI-NAMESERVER-EXPLICIT-ZERO-1.
+/// ephemeral port), `setPort(0)` is a no-op, also matching pvxs.
 ///
 /// P-6 (BUG_ARCHAEOLOGY libca a8e8d22c3): the previous parser only
 /// accepted literal IPs, silently dropping every DNS hostname. C libca had
@@ -457,7 +456,7 @@ pub fn parse_addr_list(env: &str) -> Vec<SocketAddr> {
 /// `val=="0"`), with NO surrounding-whitespace tolerance. `Y`, `TRUE`,
 /// `N`, `FALSE`, and any trimmed value such as `" NO "` are invalid
 /// (`None` + a warning), so the caller keeps its default — pvxs treats
-/// them the same. Regression R0604-PVA-BOOL-ENV-EXTENSIONS-1.
+/// them the same.
 fn parse_bool(name: &str, raw: &str) -> Option<bool> {
     if raw.eq_ignore_ascii_case("YES") || raw == "1" {
         Some(true)
@@ -1580,7 +1579,7 @@ mod tests {
         );
     }
 
-    /// Regression R0604-PVA-BOOL-ENV-EXTENSIONS-1: the env bool grammar
+    /// The env bool grammar
     /// must be EXACT to pvxs `parse_bool` (config.cpp:199-208). Tested by
     /// the accept/reject boundary, not a narrative: case-insensitive
     /// `YES`/`NO` and literal `1`/`0` accept; `Y`, `TRUE`, `N`, `FALSE`,
@@ -1614,7 +1613,7 @@ mod tests {
         assert_eq!(parse_bool(N, ""), None);
     }
 
-    /// Regression R0604-PVA-BOOL-ENV-EXTENSIONS-1 (caller side): a
+    /// Caller side: a
     /// non-pvxs bool value on a default-enabled var must leave the default
     /// ON, matching pvxs leaving `autoAddrList` untouched on an invalid
     /// value — `N`, `FALSE`, and `" NO "` no longer disable discovery.
@@ -2399,7 +2398,7 @@ mod tests {
         }
     }
 
-    /// Regression R0604-PVACLI-NAMESERVER-EXPLICIT-ZERO-1. An explicit
+    /// An explicit
     /// `host:0` in `EPICS_PVA_NAME_SERVERS` must normalize to the effective
     /// client TCP port (5075), not survive as a literal port-0 TCP
     /// destination — pvxs `split_addr_into` (`config.cpp:167-168`) sets the

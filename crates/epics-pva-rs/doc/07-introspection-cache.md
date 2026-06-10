@@ -105,8 +105,7 @@ Because the routed frames are self-contained, per-op decoders call
 carry no cross-frame decode state and cannot race over a shared cache.
 This is the parity equivalent of pvxs' single per-connection `rxRegistry`
 (`clientget.cpp:410-451`, `dataencode.cpp:542`), with the single-owner
-resolution moved to the reader. Regression
-R0604-PVACLI-DATA-TYPECACHE-SPLIT-OWNER-1.
+resolution moved to the reader.
 
 ChannelArray is the one exception: its DATA layout is sub-op dependent
 and cannot be flattened from the frame alone, so `op_array_*` resolve

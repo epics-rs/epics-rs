@@ -126,8 +126,7 @@ wire order, against one reader-owned cache plus a per-IOID introspection
 map (`ServerConn::op_introspection`). `op_get` / `op_monitor` / `op_put`
 then decode the routed frames with `decode_op_response` and an empty
 cache — no shared op-side cache, no cross-op decode race. See
-`doc/07-introspection-cache.md` (Regression
-R0604-PVACLI-DATA-TYPECACHE-SPLIT-OWNER-1). ChannelArray keeps an
+`doc/07-introspection-cache.md`. ChannelArray keeps an
 op-local cache (its DATA layout is sub-op dependent).
 
 ## ops_v2

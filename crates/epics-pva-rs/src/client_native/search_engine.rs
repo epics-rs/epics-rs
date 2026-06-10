@@ -439,7 +439,6 @@ impl SearchEngine {
         // unicast target through the wildcard socket via the OS route.
         // Constraining the bundle forced an explicit non-loopback target
         // onto a loopback-only socket under `INTF_ADDR_LIST=127.0.0.1`.
-        // Regression R0604-PVA-CLIENT-INTF-EXPLICIT-ADDR-1.
         let client_interfaces: Vec<Ipv4Addr> = crate::config::env::list_intf_addresses()
             .into_iter()
             .filter_map(|ip| match ip {
@@ -696,8 +695,7 @@ fn bind_ephemeral_udp() -> PvaResult<AsyncUdpV4> {
     // explicit non-loopback target onto a loopback-only socket under
     // `INTF_ADDR_LIST=127.0.0.1`; the interface constraint now lives only
     // in `search_targets` (auto-broadcast generation) and `broadcast`'s
-    // limited-broadcast / multicast fanout egress. Regression
-    // R0604-PVA-CLIENT-INTF-EXPLICIT-ADDR-1.
+    // limited-broadcast / multicast fanout egress.
     AsyncUdpV4::bind_ephemeral_same_port(true).map_err(PvaError::Io)
 }
 
@@ -903,8 +901,7 @@ fn addr_list_multicast_targets(
 ///
 /// A group with an explicit `@iface` modifier is joined on that interface
 /// alone via [`AsyncUdpV4::join_multicast_v4_on`]; a modifier-less group is
-/// joined on every external NIC. Regression
-/// R0604-PVASRV-MCAST-JOIN-IFACE-1: the previous code dropped the `@iface`
+/// joined on every external NIC. The previous code dropped the `@iface`
 /// and called the all-NIC [`AsyncUdpV4::join_multicast_v4`] for every
 /// group — the same `@iface`-dropping defect as the server beacon-join
 /// path, fixed here in the same change.
@@ -1090,8 +1087,6 @@ fn rearm_after_send(
 /// `PvaClientBuilder::name_servers()` lists. Order is preserved rather than
 /// sorted: name servers are queried in parallel, so pvxs's canonical sort is
 /// not observable, and first-seen order keeps the config's intent.
-///
-/// Regression R0604-PVA-NAMESERVER-DEDUP-1.
 fn dedup_name_servers(name_servers: Vec<SocketAddr>) -> Vec<SocketAddr> {
     let mut seen = std::collections::HashSet::with_capacity(name_servers.len());
     name_servers
@@ -1139,7 +1134,6 @@ async fn run_engine(
     // via `udp_collector.cpp:380 setPort`), so v6 frames carry the v6
     // socket's port while v4 frames keep `response_port`. With v6 disabled
     // this equals `response_port`, so v6/v4 frames are byte-identical.
-    // Regression R0604-PVASRV-V6-WILDCARD-SEARCH-PORT-1.
     let response_port_v6 = search_socket_v6
         .as_ref()
         .and_then(|s| s.local_addr().ok())
@@ -1190,7 +1184,7 @@ async fn run_engine(
     // ns_senders receives SEARCH frame bytes to forward over the connection.
     // Collapse duplicate name-server targets to one TCP connection each, matching
     // pvxs `split_addr_into` sort+unique (config.cpp:179-183). See
-    // `dedup_name_servers`. Regression R0604-PVA-NAMESERVER-DEDUP-1.
+    // `dedup_name_servers`.
     let name_servers = dedup_name_servers(name_servers);
     let (ns_response_tx, mut ns_response_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(64);
     let mut ns_senders: Vec<NsHandle> = Vec::with_capacity(name_servers.len());
@@ -1945,7 +1939,7 @@ fn search_targets(
 /// returns the last error. With the all-NIC search bundle this reproduces
 /// the egress of the pre-fix interface-constrained bundle's `fanout_to`,
 /// while leaving explicit unicast to route across the full bundle via
-/// `pick_nic` (Regression R0604-PVA-CLIENT-INTF-EXPLICIT-ADDR-1).
+/// `pick_nic`.
 async fn fanout_on_interfaces(
     socket: &AsyncUdpV4,
     packet: &[u8],
@@ -1984,7 +1978,6 @@ async fn broadcast(
     // every v6 destination. The two differ only in the 2-byte
     // `response_port` field (identical length → identical MTU batching),
     // so a caller that packs both with the same entries gets 1:1 frames.
-    // Regression R0604-PVASRV-V6-WILDCARD-SEARCH-PORT-1.
     packet_v4: &[u8],
     packet_v6: &[u8],
     dests: SearchDestinations<'_>,
@@ -2022,8 +2015,7 @@ async fn broadcast(
                     // broadcast egress exactly while the bundle itself stays
                     // all-NIC so explicit unicast routes via `pick_nic` below.
                     // Per-subnet directed broadcasts and explicit unicast take
-                    // the `send_to` path. Regression
-                    // R0604-PVA-CLIENT-INTF-EXPLICIT-ADDR-1.
+                    // the `send_to` path.
                     if client_interfaces.is_empty() {
                         socket.fanout_to(packet_v4, t).await.map(|_| ())
                     } else {
@@ -2856,8 +2848,8 @@ mod tests {
     use crate::proto::{ByteOrder, ControlCommand, WriteExt, encode_string_into};
     use serial_test::serial;
 
-    /// Regression R0604-PVASRV-MCAST-JOIN-IFACE-1 (client half, same
-    /// `@iface`-dropping defect family as the server beacon-join path): the
+    /// Client half, same
+    /// `@iface`-dropping defect family as the server beacon-join path: the
     /// `EPICS_PVA_ADDR_LIST` multicast projection must keep the `@iface`
     /// modifier so an explicit-interface group is joined on that interface
     /// alone (`Some(ip)`), while a modifier-less group stays an all-NIC join
@@ -2899,7 +2891,7 @@ mod tests {
 
     // ---- name-server dedup (pvxs split_addr_into sort+unique) ----
     //
-    // Regression R0604-PVA-NAMESERVER-DEDUP-1: a duplicate
+    // A duplicate
     // `EPICS_PVA_NAME_SERVERS` token must collapse to one connection target,
     // matching pvxs `split_addr_into` (config.cpp:179-183). One case per
     // boundary: an exact duplicate is dropped; distinct targets are kept in
@@ -2927,7 +2919,7 @@ mod tests {
         assert_eq!(dedup_name_servers(Vec::new()), Vec::<SocketAddr>::new());
     }
 
-    // ---- maybe_poke rate-limit invariant (pvxs pokeHoldoff, A8-R2-1) ----
+    // ---- maybe_poke rate-limit invariant (pvxs pokeHoldoff) ----
     //
     // One case per invariant boundary of the single poke gate, asserting
     // both the grant decision and the resulting state, so a regression in
@@ -3071,7 +3063,7 @@ mod tests {
         assert_eq!(r, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5075));
     }
 
-    // PVA-RS-2026-05-28-123: pvxs `procSearchReply` rewrites ONLY
+    // pvxs `procSearchReply` rewrites ONLY
     // `isAny()` (wildcard/unspecified) — never an explicit address. An
     // explicit `127.0.0.1` advertised in a SEARCH_RESPONSE that arrives
     // from a non-loopback peer must be PRESERVED, not rewritten to the
@@ -3475,7 +3467,7 @@ mod tests {
         );
     }
 
-    /// Regression R0604-PVACLI-SEARCH-GUID-DISCARD-1 (point 1): a found=true
+    /// Point 1: a found=true
     /// `SEARCH_RESPONSE` resolves the single-responder channel with the GUID
     /// decoded from *that reply*, even when no beacon has ever been observed
     /// for the server. pvxs stores `chan->guid = guid` straight off the reply
@@ -3548,7 +3540,7 @@ mod tests {
         assert_eq!(hit.server, server);
     }
 
-    /// Regression R0604-PVACLI-SEARCH-GUID-DISCARD-1 (point 3): a transient
+    /// Point 3: a transient
     /// `tls` beacon recorded for the *same server address* with a different
     /// GUID must NOT influence the GUID a `tcp` `SEARCH_RESPONSE` resolves
     /// with. The beacon tracker is keyed by `(server, proto)` and
@@ -3624,7 +3616,7 @@ mod tests {
         assert_ne!(hit.guid, G_TLS);
     }
 
-    /// Regression R0604-PVACLI-SEARCH-GUID-DISCARD-1 (point 2): when two
+    /// Point 2: when two
     /// servers with *different* GUIDs both claim one PV name, the multi-server
     /// collector logs the pvxs duplicate-PV diagnostic (`procSearchReply`,
     /// client.cpp:934-940) instead of silently dropping the second reply. The
@@ -3838,7 +3830,6 @@ mod tests {
         );
     }
 
-    /// Regression R0604-PVACLI-DISCOVERY-TIMEOUT-PROTO-1.
     /// A GUID/peerVersion change on the `tls` identity must emit
     /// `Timeout{proto:"tls", ..}` carrying the OLD GUID + peerVersion, then
     /// `Online{proto:"tls", ..}` for the new incarnation — mirroring pvxs
@@ -3893,7 +3884,7 @@ mod tests {
         assert!(rx.try_recv().is_err(), "exactly two events emitted");
     }
 
-    /// PVA-RS-2026-05-28-114: a found=true SEARCH_RESPONSE is resolved
+    /// A found=true SEARCH_RESPONSE is resolved
     /// only when its transport protocol is exactly `"tcp"`. pvxs drops
     /// any other found reply — including an empty/null-marker protocol —
     /// and keeps searching (client.cpp:872-904). An empty protocol used
@@ -4759,7 +4750,7 @@ mod tests {
         drop(server);
     }
 
-    /// Regression R0604-PVASRV-V6-WILDCARD-SEARCH-PORT-1 (client half):
+    /// Client half:
     /// the v6 SEARCH frame must advertise the v6 search socket's own port
     /// — the port it actually receives SEARCH_RESPONSE on — not the v4
     /// search socket's port. A pvxs-compatible server honours the
@@ -5289,8 +5280,6 @@ mod tests {
         );
     }
 
-    /// Regression R0604-PVA-CLIENT-INTF-EXPLICIT-ADDR-1.
-    ///
     /// `EPICS_PVA_INTF_ADDR_LIST` must NOT reduce the active-search socket
     /// bundle. pvxs binds the search socket to wildcard
     /// (`client.cpp:578-590`) and applies the interface list only to
@@ -5593,7 +5582,7 @@ mod tests {
         );
     }
 
-    /// PVA-RS-2026-05-28-63: many channel names pack into as few
+    /// Many channel names pack into as few
     /// datagrams as fit under MAX_SEARCH_PAYLOAD, each carrying the
     /// channel count once — not one datagram per name.
     #[test]

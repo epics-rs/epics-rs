@@ -60,8 +60,7 @@ pub enum ChannelState {
 /// `SEARCH_RESPONSE`; direct-connect resolvers carry `None` (no search,
 /// hence no reply GUID — matching pvxs forced-server, which also has no
 /// channel GUID). `ChannelState::Active::expected_guid` is taken from this
-/// `guid`, NOT re-derived from the beacon tracker
-/// (R0604-PVACLI-SEARCH-GUID-DISCARD-1).
+/// `guid`, NOT re-derived from the beacon tracker.
 #[derive(Debug, Clone, Copy)]
 struct Candidate {
     addr: std::net::SocketAddr,

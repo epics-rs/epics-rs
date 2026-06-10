@@ -1,5 +1,3 @@
-//! Regression R0604-PVACLI-MULTIPV-OUTPUT-BATCHED-1.
-//!
 //! pvxs `pvxget` / `pvxinfo` install a per-operation `.result()` callback
 //! that fires the instant *that* op completes (tools/get.cpp:107-119,
 //! tools/info.cpp:86-99), so a fast PV is visible before a slow or missing

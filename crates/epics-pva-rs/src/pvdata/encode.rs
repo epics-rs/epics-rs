@@ -774,7 +774,6 @@ fn decode_type_desc_cached_at_depth(
         // never emits `0x83` and faults on a bounded/fixed descriptor
         // (`dataencode.cpp:120-123,186-206`). The two dialects disagree, so
         // the rule is policy-driven (see `BoundedStringPolicy`).
-        // Regression R0604-PVDATA-BOUNDED-STRING-PVACCESSCPP-1.
         TAG_BOUNDED_STRING => match policy {
             // Interop: consume the size and surface the field as a plain
             // `String`. The bound is dropped — pvData treats a bounded
@@ -1720,8 +1719,7 @@ pub fn decode_pv_field_with_bitset_cached(
 // only `any` descriptors are decoded + re-emitted. Verbatim regions are
 // copied lazily (copy-on-write), so a frame whose `any` descriptors are all
 // inline — every pvxs / epics-rs server emits them inline — produces no
-// output and is routed untouched. Regression
-// R0604-PVACLI-DATA-TYPECACHE-SPLIT-OWNER-1.
+// output and is routed untouched.
 
 /// True iff `desc` contains a `Variant` or `VariantArray` anywhere in its
 /// tree — i.e. a value of this type *could* carry an embedded 0xFD/0xFE

@@ -579,8 +579,7 @@ pub async fn run_udp_responder_with_config(
     let mut lo_buf = vec![0u8; 64 * 1024];
     // Local IPv4 interface addresses for the loopback ORIGIN_TAG
     // origin-locality check (pvxs `ifinfo.byAddr`). See
-    // `classify_loopback_datagram`. Regression
-    // R0604-PVASRV-ORIGIN-TAG-MALFORMED-AS-FORWARDED-1.
+    // `classify_loopback_datagram`.
     let local_v4 = local_v4_addrs();
     loop {
         // Receive on whichever path is ready first. The per-NIC bundle
@@ -669,8 +668,7 @@ pub async fn run_udp_responder_with_config(
                 // `udp_collector.cpp:401-404`) is processed as Forwarded.
                 // A malformed tag, a non-local origin tag, or any other
                 // first header is dropped — NOT normalized into a forwarded
-                // SEARCH (Regression
-                // R0604-PVASRV-ORIGIN-TAG-MALFORMED-AS-FORWARDED-1). The
+                // SEARCH. The
                 // `Forwarded`/`FromOriginTag` rules downstream forbid
                 // re-forwarding (anti-loop) and reject `isAny()` reply
                 // addresses, so there is no amplification risk.
@@ -1070,7 +1068,7 @@ pub async fn run_udp_responder_v6(
 ///   number is stamped into the v6 SEARCH frame's `response_port`), so a
 ///   pvxs-compatible split-socket client that sends from one port and
 ///   listens on the advertised port is answered on the port it listens
-///   on. Regression R0604-PVASRV-V6-WILDCARD-SEARCH-PORT-1.
+///   on.
 fn resolve_reply_dest(
     reply_addr: Option<IpAddr>,
     reply_port: u16,
@@ -1401,7 +1399,7 @@ enum Origin {
 /// - a bare (unprefixed) `CMD_SEARCH` is tolerated and processed as
 ///   `Forwarded` (`:401-404`).
 ///
-/// Regression R0604-PVASRV-ORIGIN-TAG-MALFORMED-AS-FORWARDED-1: the prior
+/// The prior
 /// `try_peel_origin_tag(raw) == None` branch collapsed "malformed tag"
 /// and "bare SEARCH" into a single `Origin::Forwarded` path. Because
 /// `process_search_datagram` then drains the datagram header-by-header, a
@@ -2255,7 +2253,6 @@ mod tests {
         );
     }
 
-    // Regression R0604-PVASRV-ORIGIN-TAG-MALFORMED-AS-FORWARDED-1:
     // `classify_loopback_datagram` must route a loopback datagram by its
     // first PVA header exactly like pvxs `udp_collector.cpp::process_one`
     // — a malformed/non-local CMD_ORIGIN_TAG is dropped, a valid tag is
@@ -2703,7 +2700,7 @@ mod tests {
         assert!(try_build_forward_frame(&bcast, dest).is_none());
     }
 
-    /// Regression R0604-PVASRV-V4-FORWARD-V6-REPLYADDR-1: an explicit
+    /// An explicit
     /// IPv6 reply endpoint inside a forwarded SEARCH must be preserved as
     /// its raw 16-byte address, not downgraded to the IPv4 sender or
     /// wildcard. pvxs forwarding is transport-independent at the payload
@@ -2840,7 +2837,7 @@ mod tests {
     /// `udp_collector.cpp:377-380`), including a port that differs from
     /// the UDP source port; a wildcard (`None`) replies to the sender's
     /// source IP but with the advertised port (pvxs's unconditional
-    /// `:380 setPort`). Regression R0604-PVASRV-V6-WILDCARD-SEARCH-PORT-1.
+    /// `:380 setPort`).
     #[test]
     fn resolve_reply_dest_boundaries() {
         use std::net::Ipv6Addr;
@@ -3189,8 +3186,6 @@ mod tests {
         );
     }
 
-    /// Regression R0604-MSHIM-CHAINED-UDP-FORWARD-1.
-    ///
     /// pvxs `UDPCollector::process_one` decodes only the FIRST PVA header
     /// in a datagram and ignores trailing bytes (udp_collector.cpp:329-352),
     /// so `mshim` forwards exactly one message. A crafted
@@ -3224,7 +3219,7 @@ mod tests {
         );
     }
 
-    /// Regression R0604-MSHIM-CHAINED-UDP-FORWARD-1 (`SEARCH || BEACON`).
+    /// `SEARCH || BEACON`.
     ///
     /// A `SEARCH` followed by a `BEACON` in one datagram is forwarded as
     /// the single first message (the SEARCH); the trailing BEACON is
@@ -3320,7 +3315,7 @@ mod tests {
         );
     }
 
-    /// Regression R0604-PVASRV-MCAST-JOIN-IFACE-1: the join plan must honour
+    /// The join plan must honour
     /// the `@iface` modifier exactly like pvxs `addGroups`
     /// (`config.cpp:310-335`):
     ///

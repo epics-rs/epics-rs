@@ -62,7 +62,6 @@ use super::server_conn::ServerConn;
 /// markers into the same reader-owned cache is the parity equivalent. Per-op
 /// tasks therefore never share decode-time cache state, which makes the
 /// cross-op decode-order race structurally impossible.
-/// Regression R0604-PVACLI-DATA-TYPECACHE-SPLIT-OWNER-1.
 fn decode_op_or_reset(
     server: &ServerConn,
     frame: &Frame,
@@ -3076,8 +3075,7 @@ where
         // (`flatten_type_cache_markers`) has already flattened every
         // `0xFD`/`0xFE` type-cache marker — both the INIT descriptor and
         // any `any`/`variant` value markers — into a single self-contained
-        // frame in wire order (Regression R0604-PVACLI-DATA-TYPECACHE-
-        // SPLIT-OWNER-1), so this DATA frame embeds its own inline types
+        // frame in wire order, so this DATA frame embeds its own inline types
         // and needs no connection-level registry to resolve.
         let decoded = decode_op_response(&frame, Some(&intro));
         match decoded {
@@ -3511,7 +3509,6 @@ async fn op_put_get_data(
     // value is additionally reader-flattened (its layout is unambiguous), so
     // here it stays empty; ChannelArray's ambiguous DATA layout keeps it as
     // the op's resolver — see `flatten_type_cache_markers`.
-    // Regression R0604-PVACLI-DATA-TYPECACHE-SPLIT-OWNER-1.
     let mut cache = crate::pvdata::encode::TypeCache::new();
 
     // INIT — `sid + ioid + 0x08 + pvRequest`.
@@ -3769,7 +3766,6 @@ async fn op_array_data(
     // value is additionally reader-flattened (its layout is unambiguous), so
     // here it stays empty; ChannelArray's ambiguous DATA layout keeps it as
     // the op's resolver — see `flatten_type_cache_markers`.
-    // Regression R0604-PVACLI-DATA-TYPECACHE-SPLIT-OWNER-1.
     let mut cache = crate::pvdata::encode::TypeCache::new();
 
     // INIT — `sid + ioid + 0x08 + pvRequest`.
@@ -4049,7 +4045,7 @@ pub async fn op_array_describe(
     // Op-local type cache (ChannelArray): INIT and DATA run on one task in
     // wire order. The reader does not flatten ARRAY DATA (its layout is
     // sub-op dependent), so this op-local cache resolves its within-op
-    // markers. R0604-PVACLI-DATA-TYPECACHE-SPLIT-OWNER-1.
+    // markers.
     let mut cache = crate::pvdata::encode::TypeCache::new();
 
     let mut init = Vec::with_capacity(9 + pv_req.len());
@@ -4173,8 +4169,7 @@ pub async fn op_array_get_length_with_request(
 
 /// Build a PROCESS INIT frame (`sid + ioid + 0x08 + pvRequest`) carrying
 /// the caller-supplied `pv_req` bytes verbatim. Factored out so the
-/// caller's request can be verified at the wire level (PVA-RS-2026-05-28-62
-/// regression).
+/// caller's request can be verified at the wire level (regression).
 fn build_process_init(sid: u32, ioid: u32, pv_req: &[u8], order: ByteOrder) -> Vec<u8> {
     let mut init = Vec::with_capacity(9 + pv_req.len());
     init.put_u32(sid, order);
@@ -5395,7 +5390,7 @@ mod tests {
     use crate::pvdata::encode::{decode_pv_field, encode_pv_field};
     use std::io::Cursor;
 
-    /// PVA-RS-2026-05-28-62: the PROCESS INIT frame must carry the
+    /// The PROCESS INIT frame must carry the
     /// caller-supplied pvRequest verbatim (after the 9-byte
     /// `sid + ioid + subcmd` prefix), not a hard-coded `field(value)`
     /// request. Mirrors pvAccess serializing the stored PROCESS pvRequest
@@ -6703,7 +6698,7 @@ mod tests {
         ));
     }
 
-    /// Regression R0604-PVACLI-RAW-MONITOR-SECOND-INIT-1. A second INIT
+    /// A second INIT
     /// (`subcmd & 0x08`) on a running raw monitor is a state-machine
     /// violation: pvxs faults the buffer and resets the connection
     /// (clientmon.cpp:589-605). The classifier must surface it as
@@ -6721,7 +6716,7 @@ mod tests {
         }
     }
 
-    /// Regression R0604-PVACLI-RAW-MONITOR-SECOND-INIT-1 (structural). A
+    /// Structural. A
     /// server emits only DATA (0x00), INIT (0x08), and FINISH (0x10) on a
     /// monitor stream (servermon.cpp:133-149); START/STOP/ACK are
     /// client->server only. The classifier no longer treats an unexpected
@@ -6765,7 +6760,7 @@ mod tests {
             .collect()
     }
 
-    /// PVA-RS-2026-05-28-45: a custom monitor pvRequest's pipeline
+    /// A custom monitor pvRequest's pipeline
     /// options must drive the wire pipeline bit / `nack` trailer and ACK
     /// cadence — not the client's fixed builder window. Boundary cases
     /// from the finding, plus the pvxs `clientmon.cpp:761-808` defaults.
@@ -6928,7 +6923,7 @@ mod tests {
         })
     }
 
-    /// Regression for PVA-RS-2026-05-28-46: a monitor loop parked in
+    /// A monitor loop parked in
     /// `stream.recv().await` waits on `cancel` via `select!`. The single
     /// teardown owner must wake it. Model the loop's wait with a task
     /// that only awaits `cancel.notified()`; `teardown()` must make it
@@ -7331,7 +7326,6 @@ mod tests {
 
     #[test]
     fn process_init_phase_rejects_normal_subcmd() {
-        // Regression R0604-PVACLI-PROCESS-SUBCMD-1.
         // A normal (subcmd 0x00) reply to the INIT request is a phase
         // swap. pvAccess routes INIT vs done purely on QOS_INIT
         // (clientContextImpl.cpp:315): a normal response where INIT was
@@ -7346,7 +7340,6 @@ mod tests {
 
     #[test]
     fn process_done_phase_rejects_init_subcmd() {
-        // Regression R0604-PVACLI-PROCESS-SUBCMD-1.
         // An INIT-bit (0x08) reply to the process request must not be
         // reported as process completion.
         let frame = process_frame(
@@ -7363,7 +7356,7 @@ mod tests {
 
     #[test]
     fn process_init_phase_accepts_init_subcmd() {
-        // Regression R0604-PVACLI-PROCESS-SUBCMD-1: the matching INIT
+        // The matching INIT
         // phase (subcmd 0x08) decodes to Ok(success).
         let frame = process_frame(
             ByteOrder::Little,

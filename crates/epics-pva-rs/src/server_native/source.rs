@@ -274,7 +274,7 @@ impl From<OpError> for String {
 /// `DESTROYED`, so no force-disconnect is ever dropped. This type matches
 /// that property two ways, replacing the earlier bounded
 /// `tokio::broadcast<String>` whose 1024-deep ring could silently drop
-/// names on a large `:flush` (R0604-BRPVAGW-FLUSH-1):
+/// names on a large `:flush`:
 ///
 /// 1. **Per-connection unbounded queues.** Each connection holds its own
 ///    [`mpsc::UnboundedReceiver`] — there is no shared ring buffer to
@@ -2140,8 +2140,6 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
-    /// Regression R0604-BRPVAGW-FLUSH-1.
-    ///
     /// The channel invalidator must be lossless under backlog: a connection
     /// that has not yet drained must still see every published name, no matter
     /// how many a `:flush` produced. The pre-fix bounded `broadcast::<String>`

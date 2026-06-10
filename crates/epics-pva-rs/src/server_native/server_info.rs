@@ -180,7 +180,6 @@ impl ServerInfoSource {
         value
     }
 
-    /// Regression R0604-PVASRV-SERVER-RPC-QUERY-FALLBACK-1.
     /// The single argument structure pvxs `ServerSource::onRPC` inspects.
     /// pvxs does `args = raw; if(auto Q = args["query"]) args = Q;`
     /// (serversource.cpp:41-44) and then reads *both* `help` and `op` from
@@ -527,7 +526,7 @@ mod tests {
                     s.get_field("timeStamp").is_some(),
                     "help value must carry timeStamp"
                 );
-                // Regression R0604-PVASRV-SERVER-RPC-HELP-TEXT-1: the
+                // The
                 // `value` payload must be the exact pvxs literal
                 // (serversource.cpp:47), not Rust-specific descriptive text.
                 match s.get_field("value") {
@@ -602,7 +601,6 @@ mod tests {
 
     #[tokio::test]
     async fn rpc_query_op_wins_over_root_help() {
-        // Regression R0604-PVASRV-SERVER-RPC-QUERY-FALLBACK-1.
         // pvxs selects `args = query` then reads BOTH help and op from
         // that single view (serversource.cpp:41-53) — a root-level `help`
         // beside `query.op` is never consulted, so this returns the
@@ -640,7 +638,6 @@ mod tests {
 
     #[tokio::test]
     async fn rpc_present_query_does_not_fall_back_to_root_op() {
-        // Regression R0604-PVASRV-SERVER-RPC-QUERY-FALLBACK-1.
         // With a present (here empty) `query`, pvxs reads `op` ONLY from
         // the query view; a root-level `op` is not a fallback. So this
         // errors for a missing op rather than running root `op=channels`.

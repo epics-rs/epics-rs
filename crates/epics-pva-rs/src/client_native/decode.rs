@@ -357,7 +357,7 @@ pub enum OpResponse {
 /// already rewritten every `0xFD`/`0xFE` type-cache marker — both the
 /// INIT descriptor and any `any`/`variant` value markers — into a single
 /// self-contained frame in wire order before the frame ever reaches an op
-/// task (Regression R0604-PVACLI-DATA-TYPECACHE-SPLIT-OWNER-1). With the
+/// task. With the
 /// markers resolved into inline types, no shared connection-level registry
 /// is needed here, so op tasks carry no cross-frame decode state and cannot
 /// race over a shared cache. pvxs keeps one `rxRegistry` per connection
@@ -1171,7 +1171,7 @@ mod tests {
     /// in, and an empty cache misses. This is the decode-side mirror of what
     /// the reader's `flatten_value_markers` does in wire order.
     ///
-    /// In *production* (Regression R0604-PVACLI-DATA-TYPECACHE-SPLIT-OWNER-1)
+    /// In *production*
     /// op tasks no longer thread any shared cache: the reader has already
     /// flattened value markers into self-contained inline types before the
     /// frame is routed, so the per-op decode runs with an empty cache. See
@@ -1239,7 +1239,7 @@ mod tests {
         );
     }
 
-    /// End-to-end regression for R0604-PVACLI-DATA-TYPECACHE-SPLIT-OWNER-1.
+    /// End-to-end regression.
     ///
     /// The reader task flattens BOTH the INIT introspection descriptor AND
     /// the `any`/`variant` `0xFE <slot>` markers inside a later DATA value
@@ -1336,8 +1336,8 @@ mod tests {
         }
     }
 
-    /// Two concurrent ops, wire-order value-marker resolution
-    /// (R0604-PVACLI-DATA-TYPECACHE-SPLIT-OWNER-1). One op's DATA value
+    /// Two concurrent ops, wire-order value-marker resolution.
+    /// One op's DATA value
     /// *defines* a slot inline via `0xFD`; a later op's DATA value
     /// *references* it via `0xFE`. Because the reader flattens in strict
     /// wire order through one owned cache, the define is folded before the
@@ -1486,7 +1486,7 @@ mod tests {
         }
     }
 
-    /// PVA-RS-2026-05-28-110 input contract: a MONITOR DATA frame
+    /// Input contract: a MONITOR DATA frame
     /// truncated before its trailing overrun bitset must decode as an
     /// `Err`, so the typed monitor loop's `Err` arm fires and returns
     /// `MonitorEnd::Fatal` (matching pvxs `clientmon.cpp:601-605`, which
@@ -1519,7 +1519,7 @@ mod tests {
         );
     }
 
-    /// PVA-RS-2026-05-28-110 input contract: a MONITOR FINISH frame
+    /// Input contract: a MONITOR FINISH frame
     /// (`subcmd & 0x10`) whose Status cannot be decoded must be an `Err`,
     /// so the typed loop tears down fatally instead of skipping.
     #[test]
@@ -1539,7 +1539,7 @@ mod tests {
         );
     }
 
-    /// PVA-RS-2026-05-28-110 input contract: a MONITOR frame with the
+    /// Input contract: a MONITOR frame with the
     /// INIT bit (`subcmd & 0x08`) decodes as `OpResponse::Init`. The
     /// typed loop is only entered AFTER the initial INIT, so any Init
     /// here is a second INIT on a running subscription — a state-machine

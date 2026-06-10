@@ -193,7 +193,7 @@ pub enum LogFilterError {
 mod tests {
     use super::*;
 
-    /// Regression R0604-PVACLI-PVXS-LOG-ENV-1: the log env base must read
+    /// The log env base must read
     /// `PVXS_LOG` for pvxs `logger_config_env()` parity, with the documented
     /// precedence `PVXS_LOG` > `EPICS_PVA_LOG` > `RUST_LOG`, an empty value
     /// treated as unset (pvxs `if(!*env)`), and `None` when nothing is set.

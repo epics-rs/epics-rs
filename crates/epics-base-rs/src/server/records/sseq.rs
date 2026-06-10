@@ -122,6 +122,20 @@ struct InFlight {
     done: Arc<AtomicBool>,
 }
 
+/// Which native type the connected `DOLn` link last delivered, so the
+/// `LNKn` write forwards the matching DBR type. C `processCallback` selects
+/// this with `dol_field_type` at the `dbGetLink` — a string-class target is
+/// read with `DBR_STRING` into `s`/`STRn`, a numeric one with `DBR_DOUBLE`
+/// into `dov`/`DOn` (sseqRecord.c:643-705) — and writes `LNKn` with the
+/// matching type (sseqRecord.c:714-756). Captured from the actual value the
+/// `ReadDbLink` read delivered, so it does not depend on the asynchronously
+/// classified `dol_field_type` (`DTn`) being resolved yet.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DolKind {
+    Numeric,
+    String,
+}
+
 /// A single step in the string sequence.
 #[derive(Clone)]
 struct SseqStep {
@@ -130,8 +144,12 @@ struct SseqStep {
     dov: f64,          // Numeric value (DOn)
     lnk: String,       // Output link (LNKn)
     str_val: PvString, // String value (STRn)
-    wait: i16,         // Wait mode: 0=NoWait, 1=Wait, 2..=After1..After9
-    waiting: bool,     // WTGn — an outstanding put-callback for this step
+    // Native type the last connected-DOL read delivered (selects the LNKn
+    // forward type). A `DBF_STRING` DOL source must reach `LNKn` as a string,
+    // not collapse through `dov` (Double).
+    dol_kind: DolKind,
+    wait: i16,     // Wait mode: 0=NoWait, 1=Wait, 2..=After1..After9
+    waiting: bool, // WTGn — an outstanding put-callback for this step
     // Link-status diagnostics, refreshed by `refresh_link_status` from C
     // `sseqRecord.c:checkLinks` (sseqRecord.c:848-969). Defaulted to the
     // C `init_record` classification of an empty (constant) link.
@@ -150,6 +168,7 @@ impl Default for SseqStep {
             dov: 0.0,
             lnk: String::new(),
             str_val: PvString::default(),
+            dol_kind: DolKind::Numeric,
             wait: 0,
             waiting: false,
             // An empty link is a CONSTANT link with no resolvable field type
@@ -304,17 +323,29 @@ impl SseqRecord {
 
     /// The value this step forwards to its `LNKn`.
     ///
-    /// C `processCallback` (sseqRecord.c:643-705) reads `DOLn` into both a
-    /// string (`s`/`STRn`) and a double (`dov`/`DOn`) and writes whichever
-    /// the destination field type wants. Here `pre_process_actions` has
-    /// already folded a connected `DOLn` into `DOn` (a numeric read), so
-    /// the precedence is: a connected `DOLn` → `DOn`; otherwise a non-empty
-    /// `STRn` constant → the string; otherwise the `DOn` constant. A
-    /// string-typed `DOLn` source coerces through `DOn` (Double) — the one
-    /// value path `ReadDbLink` exposes (documented limitation).
+    /// C `processCallback` (sseqRecord.c:643-705) reads `DOLn` typed by
+    /// `dol_field_type` into both a string (`s`/`STRn`) and a double
+    /// (`dov`/`DOn`), then writes `LNKn` with the matching DBR type
+    /// (sseqRecord.c:714-756). A connected `DOLn` whose source is string-class
+    /// must therefore reach `LNKn` as the string, byte-exact — not collapse
+    /// through `DOn` (Double). `pre_process_actions` performs that typed read
+    /// via `ReadDbLink` and `put_field_internal` records which native type the
+    /// link delivered (`dol_kind`).
+    ///
+    /// Precedence: a connected `DOLn` → the type it delivered (`dol_kind`);
+    /// a constant link with a non-empty `STRn` → the string constant;
+    /// otherwise the `DOn` constant.
     fn step_value(&self, i: usize) -> EpicsValue {
         let s = &self.steps[i];
-        if s.dol.is_empty() && !s.str_val.is_empty() {
+        let forward_string = if s.dol.is_empty() {
+            // Constant link: a configured `STRn` is a string constant,
+            // otherwise the `DOn` numeric constant.
+            !s.str_val.is_empty()
+        } else {
+            // Connected `DOLn`: forward the type the link actually delivered.
+            s.dol_kind == DolKind::String
+        };
+        if forward_string {
             EpicsValue::String(s.str_val.clone())
         } else {
             EpicsValue::Double(s.dov)
@@ -1084,6 +1115,42 @@ impl Record for SseqRecord {
                 None
             }
         }
+    }
+
+    fn put_field_internal(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        // The framework's typed link read (`ProcessAction::ReadDbLink` →
+        // `DOn`) delivers the `DOLn` target's NATIVE value here. C
+        // `processCallback` reads `DOLn` by `dol_field_type`: a string-class
+        // source is read with `DBR_STRING` and kept byte-exact in `s`/`STRn`
+        // (then `dov = atof(s)`), NOT collapsed to a double
+        // (sseqRecord.c:643-705). A *client* put to `DOn` (`put_field`) is a
+        // plain `DBF_DOUBLE` convert, so this string-preserving capture is
+        // internal-only; it also records which native type the link delivered
+        // so the `LNKn` write forwards the matching DBR type.
+        if let Some((idx, "DO")) = Self::step_index_from_suffix(name) {
+            match value {
+                EpicsValue::String(s) => {
+                    // Numeric view tracks C's `dov = atof(s)`; `str_val` keeps
+                    // the bytes exactly (no lossy conversion on the value).
+                    let dov = EpicsValue::String(s.clone()).to_f64().unwrap_or(0.0);
+                    let step = &mut self.steps[idx];
+                    step.dov = dov;
+                    step.str_val = s;
+                    step.dol_kind = DolKind::String;
+                    return Ok(());
+                }
+                other => {
+                    let dov = other
+                        .to_f64()
+                        .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
+                    let step = &mut self.steps[idx];
+                    step.dov = dov;
+                    step.dol_kind = DolKind::Numeric;
+                    return Ok(());
+                }
+            }
+        }
+        self.put_field(name, value)
     }
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {

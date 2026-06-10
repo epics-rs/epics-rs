@@ -33,6 +33,13 @@ pub enum ProcessAction {
     /// and writes the result into `target_field` via an internal put that
     /// bypasses read-only checks.
     ///
+    /// The value delivered is the link target's **native** [`EpicsValue`] — it
+    /// is NOT coerced to a numeric type on the way in. The record coerces (or
+    /// preserves) it at its own `put_field`/`put_field_internal` boundary, so a
+    /// string-class source can reach a string field byte-exact (the `sseq`
+    /// `DOLn`→`STRn` path, C `sseqRecord.c:643-705`). Records whose
+    /// `target_field` is numeric simply convert there, exactly as before.
+    ///
     /// **Pre-process action**: executed BEFORE the next process() cycle so
     /// the value is immediately available. This matches C EPICS `dbGetLink()`
     /// which is synchronous/immediate.

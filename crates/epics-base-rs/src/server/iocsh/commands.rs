@@ -1268,7 +1268,16 @@ fn escape_char_array_for_dbgf(buf: &[u8]) -> String {
 /// `macExpandString`; this port substitutes the value directly with no
 /// second `macExpandString` pass, so both are stripped here to reach the
 /// same observable substitution.
-fn macro_defn_pairs(s: &str) -> Vec<(String, Option<String>)> {
+///
+/// Exposed (re-exported as `iocsh::macro_defn_pairs`) so that other macLib
+/// consumers — e.g. QSRV's `dbLoadGroup` macro parser — split definition
+/// strings through this one owner of the `macParseDefns` grammar instead
+/// of a second raw `split(',')` that would tear a quoted value on an
+/// embedded comma. Callers that defer `$(...)` expansion to their own
+/// `macExpandString` equivalent use these raw split pairs directly and do
+/// NOT run [`parse_macro_string`], which additionally substitutes the
+/// environment eagerly.
+pub fn macro_defn_pairs(s: &str) -> Vec<(String, Option<String>)> {
     #[derive(PartialEq, Clone, Copy)]
     enum St {
         PreName,

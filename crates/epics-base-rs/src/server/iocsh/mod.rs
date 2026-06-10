@@ -3,6 +3,12 @@ mod commands;
 mod core_commands;
 pub mod registry;
 
+/// libCom `macParseDefns`-equivalent quote/escape-aware splitter for IOC
+/// macro definition strings. Re-exported as the single owner of that
+/// grammar so cross-crate macLib consumers (QSRV `dbLoadGroup`) reuse it
+/// rather than duplicating a raw comma splitter.
+pub use commands::macro_defn_pairs;
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::sync::{Arc, RwLock};

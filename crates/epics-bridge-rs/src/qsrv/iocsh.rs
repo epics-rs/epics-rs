@@ -166,17 +166,36 @@ pub(crate) fn apply_group_file(
     Ok(provider.group_count())
 }
 
-/// Parse a `name=value,name=value` string into a map. Whitespace
-/// around tokens is stripped. Empty entries are skipped.
+/// Parse a `name=value,name=value` macro-definition string into a map,
+/// the way libCom `macParseDefns` does (`macUtil.c:74-196`): commas
+/// separate pairs and `=` separates name from value, but a comma or `=`
+/// inside single/double quotes or backslash-escaped is a literal, and
+/// unquoted whitespace around names/values is trimmed. So `DESC="a,b"`
+/// keeps `a,b` as one value instead of truncating it at the embedded
+/// comma, and `DESC=a\,b` is equally literal.
+///
+/// Splitting is delegated to the canonical quote-aware splitter
+/// [`epics_base_rs::server::iocsh::macro_defn_pairs`] — the single owner
+/// of the `macParseDefns` grammar — rather than a second raw `split(',')`.
+/// A name with no `=` is a macLib deletion entry; against the fresh map
+/// built here it has nothing to remove, so it is skipped (matching
+/// `macInstallMacros`).
+///
+/// Env-var fallback is intentionally NOT applied here. pvxs seeds the
+/// `environ` scope into the `MAC_HANDLE` and resolves `$(...)` references
+/// at `macExpandString` time with supplied macros taking precedence over
+/// the environment (`groupsourcehooks.cpp:154-169`). QSRV mirrors that in
+/// [`expand_macros`], which is the sole expansion owner; resolving the
+/// environment eagerly at parse time (as the base `parse_macro_string`
+/// does) would let env values shadow chained supplied-macro references.
 fn parse_macros(s: &str) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
-    for tok in s.split(',') {
-        let tok = tok.trim();
-        if tok.is_empty() {
-            continue;
-        }
-        if let Some((k, v)) = tok.split_once('=') {
-            out.insert(k.trim().to_string(), v.trim().to_string());
+    for (k, v) in epics_base_rs::server::iocsh::macro_defn_pairs(s) {
+        if let Some(v) = v {
+            if k.is_empty() {
+                continue;
+            }
+            out.insert(k, v);
         }
     }
     out
@@ -1366,6 +1385,23 @@ mod tests {
         let m = parse_macros(" name = TEST:val , unit = deg ,, ");
         assert_eq!(m.get("name"), Some(&"TEST:val".to_string()));
         assert_eq!(m.get("unit"), Some(&"deg".to_string()));
+        assert_eq!(m.len(), 2);
+    }
+
+    /// libCom `macParseDefns` (macUtil.c:74-196): a comma inside quotes or
+    /// backslash-escaped is a literal, not a pair separator. A raw
+    /// `split(',')` truncated `DESC="a,b"` to `DESC="a` and dropped `b"`;
+    /// the quote-aware splitter keeps `a,b` as one value.
+    #[test]
+    fn parse_macros_keeps_quoted_or_escaped_comma_in_one_value() {
+        let m = parse_macros(r#"DESC="a,b",P=IOC:"#);
+        assert_eq!(m.get("DESC"), Some(&"a,b".to_string()));
+        assert_eq!(m.get("P"), Some(&"IOC:".to_string()));
+        assert_eq!(m.len(), 2);
+
+        let m = parse_macros(r#"DESC=a\,b,P=IOC:"#);
+        assert_eq!(m.get("DESC"), Some(&"a,b".to_string()));
+        assert_eq!(m.get("P"), Some(&"IOC:".to_string()));
         assert_eq!(m.len(), 2);
     }
 

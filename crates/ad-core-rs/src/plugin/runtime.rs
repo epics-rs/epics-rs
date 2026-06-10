@@ -1784,10 +1784,31 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                     po.publish_arrays(&senders).await;
                                     po.batch.flush(&port).await;
                                 } else {
-                                    eprintln!(
-                                        "plugin {sender_port_name}: ProcessPlugin \
-                                         requested but no input array cached"
-                                    );
+                                    // C parity: NDPluginDriver::writeInt32
+                                    // (NDPluginDriver.cpp:743) logs this at
+                                    // ASYN_TRACE_WARNING, which is OFF in the
+                                    // default port trace mask. Gate through the
+                                    // port's trace facility so iocInit stays
+                                    // silent unless WARNING is enabled, instead
+                                    // of an unconditional eprintln! that spams
+                                    // stderr on every PINI ProcessPlugin trigger.
+                                    // The asyn port registry that exposes the
+                                    // per-port mask only exists with the `ioc`
+                                    // integration; a bare plugin build has no
+                                    // trace facility to consult, so it stays
+                                    // silent there too.
+                                    #[cfg(feature = "ioc")]
+                                    if let Some(entry) =
+                                        asyn_rs::asyn_record::get_port(&sender_port_name)
+                                    {
+                                        asyn_rs::asyn_trace!(
+                                            entry.trace,
+                                            sender_port_name.as_str(),
+                                            asyn_rs::trace::TraceMask::WARNING,
+                                            "plugin {sender_port_name}: ProcessPlugin \
+                                             requested but no input array cached"
+                                        );
+                                    }
                                 }
                             }
                             // B12: a control-plane write of ArrayCounter resets

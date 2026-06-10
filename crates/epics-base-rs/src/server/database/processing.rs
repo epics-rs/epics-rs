@@ -83,6 +83,92 @@ impl AsyncToken {
     }
 }
 
+/// A cycle-free handle for driving async-side database updates from
+/// OUTSIDE a record's `process()` cycle.
+///
+/// Wraps a [`std::sync::Weak`] reference to the database: a record stashes
+/// it (via [`crate::server::record::Record::set_async_context`]) without
+/// creating an ownership cycle — the database owns the record, so a strong
+/// `Arc<PvDatabaseInner>` stored on the record would leak the whole
+/// database. Every call upgrades the `Weak` to a temporary [`PvDatabase`];
+/// once the last strong owner drops, the upgrade fails and the call is a
+/// no-op (nothing is stranded).
+///
+/// This is the out-of-band counterpart to the in-band re-entry
+/// [`crate::server::record::ProcessAction`]s: a driver / callback thread
+/// (asyn TRACE post, AQR cancel, motor intermediate readback) holds the
+/// handle and pushes field updates or wires a completion-driven re-entry
+/// without going through `process()`. It exposes exactly the c401e2f0
+/// PACT primitive surface, each call guarded by the live-database check.
+#[derive(Clone)]
+pub struct AsyncDbHandle {
+    inner: std::sync::Weak<super::PvDatabaseInner>,
+}
+
+impl AsyncDbHandle {
+    /// Upgrade to a temporary owning [`PvDatabase`], or `None` if the
+    /// database has been dropped.
+    fn db(&self) -> Option<PvDatabase> {
+        self.inner.upgrade().map(|inner| PvDatabase { inner })
+    }
+
+    /// True while the backing database is still alive.
+    pub fn is_alive(&self) -> bool {
+        self.inner.strong_count() > 0
+    }
+
+    /// Out-of-band field post — see [`PvDatabase::post_fields`]. Returns an
+    /// empty `Vec` (no-op) if the database has been dropped.
+    pub async fn post_fields(
+        &self,
+        name: &str,
+        fields: Vec<(String, EpicsValue)>,
+    ) -> CaResult<Vec<String>> {
+        match self.db() {
+            Some(db) => db.post_fields(name, fields).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Mint an async re-entry token — see [`PvDatabase::mint_async_token`].
+    /// `None` if the record is absent or the database has been dropped.
+    pub async fn mint_async_token(&self, name: &str) -> Option<AsyncToken> {
+        match self.db() {
+            Some(db) => db.mint_async_token(name).await,
+            None => None,
+        }
+    }
+
+    /// Cancel an outstanding async re-entry — see
+    /// [`PvDatabase::cancel_async_reentry`]. No-op if the database is gone.
+    pub async fn cancel_async_reentry(&self, name: &str) {
+        if let Some(db) = self.db() {
+            db.cancel_async_reentry(name).await;
+        }
+    }
+
+    /// Arm a put-notify wait-set — see [`PvDatabase::new_put_notify`].
+    /// Database-independent (re-exported associated fn).
+    pub fn new_put_notify() -> (
+        Arc<NotifyWaitSet>,
+        crate::runtime::sync::oneshot::Receiver<()>,
+    ) {
+        PvDatabase::new_put_notify()
+    }
+
+    /// Wire a completion oneshot to an async re-entry — see
+    /// [`PvDatabase::reprocess_on_notify`]. `None` if the database is gone
+    /// (the `completion` receiver is dropped, stranding nothing).
+    pub fn reprocess_on_notify(
+        &self,
+        token: AsyncToken,
+        completion: crate::runtime::sync::oneshot::Receiver<()>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        self.db()
+            .map(|db| db.reprocess_on_notify(token, completion))
+    }
+}
+
 /// C `dbNotifyAdd`: a will-process PP target (FLNK / OUT) joins the active
 /// put-notify wait-set exactly once, so the completion waits for it. Called
 /// only on the `!pact` (will-process) branch — a busy target sets RPRO and
@@ -319,6 +405,16 @@ impl PvDatabase {
             self.process_record_with_links_inner(name, visited, depth, true, true)
                 .await
         })
+    }
+
+    /// A cycle-free [`AsyncDbHandle`] for this database, handed to each
+    /// record via [`crate::server::record::Record::set_async_context`] at
+    /// registration. Holds only a `Weak` reference, so a record stashing
+    /// it never keeps the database alive.
+    pub fn async_handle(&self) -> AsyncDbHandle {
+        AsyncDbHandle {
+            inner: Arc::downgrade(&self.inner),
+        }
     }
 
     /// Mint a fresh async re-entry [`AsyncToken`] for `name`.
@@ -1926,9 +2022,14 @@ impl PvDatabase {
         // delayed/reprocess and device-command actions (whose timing must
         // stay after the FLNK tail) run afterward. A downstream FLNK
         // target therefore reads the freshly written value, matching C.
-        let (link_writes, deferred_actions): (Vec<_>, Vec<_>) = process_actions
-            .into_iter()
-            .partition(|a| matches!(a, crate::server::record::ProcessAction::WriteDbLink { .. }));
+        let (link_writes, deferred_actions): (Vec<_>, Vec<_>) =
+            process_actions.into_iter().partition(|a| {
+                matches!(
+                    a,
+                    crate::server::record::ProcessAction::WriteDbLink { .. }
+                        | crate::server::record::ProcessAction::WriteDbLinkNotify { .. }
+                )
+            });
         self.execute_process_actions(name, &rec, link_writes, visited, depth)
             .await;
 
@@ -2479,6 +2580,79 @@ impl PvDatabase {
                         tokio::time::sleep(delay).await;
                         let _ = token.fire(&db).await;
                     });
+                }
+                ProcessAction::WriteDbLinkNotify { link_field, value } => {
+                    // C `sseqRecord.c` WAITn put-callback dependency: write
+                    // the OUT link as a put-WITH-completion and re-enter THIS
+                    // record's process() once the downstream record (plus its
+                    // FLNK/OUT chain) finishes. Same OUT-link write a plain
+                    // WriteDbLink performs, wrapped in the c401e2f0 put-notify
+                    // wait-set + async re-entry primitive.
+                    let (link_str, src_putf, src_alarm) = {
+                        let instance = rec.read().await;
+                        let link = instance
+                            .resolve_field(link_field)
+                            .and_then(|v| {
+                                if let EpicsValue::String(s) = v {
+                                    Some(s)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_default();
+                        (
+                            link,
+                            instance.common.putf,
+                            super::links::LinkAlarm {
+                                stat: instance.common.stat,
+                                sevr: instance.common.sevr,
+                                amsg: instance.common.amsg.clone(),
+                            },
+                        )
+                    };
+                    // Mint the re-entry token BEFORE issuing the put so a
+                    // synchronous downstream completion cannot fire the
+                    // oneshot before the waiter is wired. The mint supersedes
+                    // any prior pending re-entry for this record (newer
+                    // token), exactly like ReprocessAfter.
+                    let token = match self.mint_async_token(record_name).await {
+                        Some(t) => t,
+                        None => continue,
+                    };
+                    let (waitset, completion) = Self::new_put_notify();
+                    if !link_str.is_empty() {
+                        let parsed =
+                            crate::server::record::parse_link_v2(link_str.as_str_lossy().as_ref());
+                        self.write_out_link_value(
+                            &parsed,
+                            value,
+                            super::links::OutLinkSrc {
+                                putf: src_putf,
+                                notify: Some(&waitset),
+                                alarm: &src_alarm,
+                            },
+                            visited,
+                            depth,
+                        )
+                        .await;
+                    }
+                    // Release the initiator's own wait-set count (C
+                    // `dbProcessNotify` holds one count for the requester and
+                    // drops it after issuing the put). The set then drains —
+                    // and fires the completion — when the downstream
+                    // target(s) that joined via `join_put_notify` finish, or
+                    // immediately when the link was empty / the target
+                    // completed synchronously.
+                    waitset.leave();
+                    self.reprocess_on_notify(token, completion);
+                }
+                ProcessAction::CancelReprocess => {
+                    // C `callbackCancelDelayed` for `sseq` ABORT: advance the
+                    // record's re-entry generation so any pending DLYn timer
+                    // or WAITn notify re-entry becomes a structural no-op (the
+                    // AsyncToken gate), with no runtime is-aborted check on
+                    // the re-entry path.
+                    self.cancel_async_reentry(record_name).await;
                 }
             }
         }

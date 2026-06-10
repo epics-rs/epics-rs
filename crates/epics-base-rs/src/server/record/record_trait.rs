@@ -58,6 +58,37 @@ pub enum ProcessAction {
         command: &'static str,
         args: Vec<EpicsValue>,
     },
+
+    /// Write a value to a DB link as a put-*with-completion*, then re-enter
+    /// THIS record's `process()` when the downstream operation completes.
+    ///
+    /// The framework arms a put-notify wait-set (C `dbProcessNotify`),
+    /// writes `link_field`'s target through it, releases the initiator's
+    /// own count, and wires the completion to an async re-entry of this
+    /// record (`mint_async_token` + `reprocess_on_notify`). The record
+    /// returns [`RecordProcessResult::AsyncPending`] alongside this action
+    /// and is re-entered once the downstream record (and its FLNK/OUT
+    /// chain) finishes — the synApps `sseq` `WAITn` "wait for the put
+    /// callback" dependency (`sseqRecord.c::processNextLink`,
+    /// `dbCaPutLinkCallback`). Built on the same `new_put_notify` +
+    /// `reprocess_on_notify` primitive an out-of-band
+    /// [`crate::server::database::AsyncDbHandle`] caller uses.
+    ///
+    /// Executed before FLNK, like [`Self::WriteDbLink`].
+    WriteDbLinkNotify {
+        link_field: &'static str,
+        value: EpicsValue,
+    },
+
+    /// Cancel this record's outstanding async re-entry (C
+    /// `callbackCancelDelayed`): the framework advances the record's
+    /// re-entry generation so any pending `ReprocessAfter` timer or
+    /// `WriteDbLinkNotify` completion re-entry becomes a structural no-op
+    /// (the `AsyncToken` gate), with no runtime "is-aborted" check on the
+    /// re-entry path. Used by `sseq` `ABORT` to drop a pending `DLYn`
+    /// delay or `WAITn` wait; the record resets its own sequence state in
+    /// the same `process()` cycle that emits this.
+    CancelReprocess,
 }
 
 /// Result of a record's process() call.
@@ -696,6 +727,32 @@ pub trait Record: Send + Sync + 'static {
     /// [`Record::set_device_did_compute`]). Default: ignore — most
     /// records never need common state during `process()`.
     fn set_process_context(&mut self, _ctx: &ProcessContext) {}
+
+    /// Called once by the framework when the record is registered
+    /// (`add_record`), delivering the record its own canonical name plus a
+    /// cycle-free [`crate::server::database::AsyncDbHandle`] for driving
+    /// async-side updates from OUTSIDE a `process()` cycle.
+    ///
+    /// The handle wraps a `Weak` reference to the database, so a record
+    /// that stashes it creates no ownership cycle (the database owns the
+    /// record; a stored strong handle would leak it). It is the controlled
+    /// equivalent of C device support capturing `precord` plus the
+    /// dbCommon scan lock for an out-of-band `db_post_events` /
+    /// `callbackRequest`: e.g. the asyn TRACE/exception callback posts
+    /// trace-flag fields immediately from the driver thread, and AQR
+    /// cancels a queued I/O re-entry — neither happens inside `process()`.
+    ///
+    /// The in-band counterpart for a record's *own* process cycle is the
+    /// completion-driven [`ProcessAction`] family
+    /// ([`ProcessAction::WriteDbLinkNotify`],
+    /// [`ProcessAction::CancelReprocess`],
+    /// [`ProcessAction::ReprocessAfter`]); this hook exists for the
+    /// out-of-band path that has no `process()` return to ride on.
+    ///
+    /// Additive, framework-set-hook pattern (same shape as
+    /// [`Self::set_process_context`]). Default: ignore — most records do
+    /// no out-of-band async posting.
+    fn set_async_context(&mut self, _name: String, _db: crate::server::database::AsyncDbHandle) {}
 
     /// Called by the framework before process() to indicate whether device
     /// support's read() already performed the record's compute step.

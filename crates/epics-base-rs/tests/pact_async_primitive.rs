@@ -8,11 +8,13 @@
 //! `modules/database/src/ioc/db/callback.c` (delayed re-entry) and
 //! `dbNotify.c` (put-notify wait-set / completion).
 
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::database::PvDatabase;
+use epics_base_rs::server::database::{AsyncDbHandle, PvDatabase};
 use epics_base_rs::server::recgbl::EventMask;
 use epics_base_rs::server::record::*;
 use epics_base_rs::types::{DbFieldType, EpicsValue};
@@ -284,5 +286,307 @@ async fn reprocess_on_notify_with_cancelled_token_is_noop() {
         count.load(Ordering::Relaxed),
         baseline,
         "a cancelled token must not re-enter even when downstream completes"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Seam tests: the `AsyncDbHandle` delivered by `set_async_context`, and the
+// in-band `WriteDbLinkNotify` / `CancelReprocess` ProcessAction arms that the
+// `sseq` async machine (and the ASYN out-of-band panel) build on. C
+// references: sseqRecord.c (WAITn put-callback wait, ABORT cancel) and
+// dbNotify.c / callback.c (put-notify wait-set, delayed re-entry cancel).
+// ---------------------------------------------------------------------------
+
+/// Spin-wait (bounded) until `pred` holds — the `WriteDbLinkNotify` re-entry
+/// is driven by a detached `reprocess_on_notify` task whose handle the arm
+/// drops, so the test cannot join it directly.
+async fn poll_until<F: Fn() -> bool>(label: &str, pred: F) {
+    for _ in 0..2000 {
+        if pred() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    panic!("timed out waiting for: {label}");
+}
+
+/// Captures the `AsyncDbHandle` the framework delivers at `add_record` into a
+/// shared sink, so the test can drive out-of-band posts through it.
+struct HandleCaptureRecord {
+    val: i32,
+    sink: Arc<Mutex<Option<AsyncDbHandle>>>,
+}
+
+impl Record for HandleCaptureRecord {
+    fn record_type(&self) -> &'static str {
+        "handlecap"
+    }
+    fn process(&mut self) -> CaResult<ProcessOutcome> {
+        Ok(ProcessOutcome::complete())
+    }
+    fn get_field(&self, name: &str) -> Option<EpicsValue> {
+        match name {
+            "VAL" => Some(EpicsValue::Long(self.val)),
+            _ => None,
+        }
+    }
+    fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        match name {
+            "VAL" => match value {
+                EpicsValue::Long(v) => {
+                    self.val = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("VAL".into())),
+            },
+            _ => Err(CaError::FieldNotFound(name.to_string())),
+        }
+    }
+    fn field_list(&self) -> &'static [FieldDesc] {
+        TEST_FIELDS
+    }
+    fn set_async_context(&mut self, _name: String, db: AsyncDbHandle) {
+        *self.sink.lock().unwrap() = Some(db);
+    }
+}
+
+/// Source record for the `WriteDbLinkNotify` arm: on its first `process()`
+/// it returns `AsyncPending` with a `WriteDbLinkNotify` to its `LNK` target
+/// (the `sseq` `WAITn` shape — wait for the downstream put to complete), and
+/// `Complete` on the completion re-entry. Counts every `process()` entry.
+struct NotifySourceRecord {
+    lnk: &'static str,
+    process_count: Arc<AtomicU32>,
+}
+
+static NOTIFY_SRC_FIELDS: &[FieldDesc] = &[
+    FieldDesc {
+        name: "VAL",
+        dbf_type: DbFieldType::Long,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LNK",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+];
+
+impl Record for NotifySourceRecord {
+    fn record_type(&self) -> &'static str {
+        "notifysrc"
+    }
+    fn process(&mut self) -> CaResult<ProcessOutcome> {
+        let pass = self.process_count.fetch_add(1, Ordering::Relaxed);
+        if pass == 0 {
+            Ok(ProcessOutcome {
+                result: RecordProcessResult::AsyncPending,
+                actions: vec![ProcessAction::WriteDbLinkNotify {
+                    link_field: "LNK",
+                    value: EpicsValue::Long(42),
+                }],
+                device_did_compute: false,
+            })
+        } else {
+            Ok(ProcessOutcome::complete())
+        }
+    }
+    fn get_field(&self, name: &str) -> Option<EpicsValue> {
+        match name {
+            "VAL" => Some(EpicsValue::Long(0)),
+            "LNK" => Some(EpicsValue::String(self.lnk.into())),
+            _ => None,
+        }
+    }
+    fn put_field(&mut self, _name: &str, _value: EpicsValue) -> CaResult<()> {
+        Ok(())
+    }
+    fn field_list(&self) -> &'static [FieldDesc] {
+        NOTIFY_SRC_FIELDS
+    }
+}
+
+/// Source record for the `CancelReprocess` arm: every `process()` returns
+/// `Complete` carrying a single `CancelReprocess` action (the `sseq` `ABORT`
+/// shape — drop the pending DLYn/WAITn re-entry). Counts every entry.
+struct AbortSourceRecord {
+    process_count: Arc<AtomicU32>,
+}
+
+impl Record for AbortSourceRecord {
+    fn record_type(&self) -> &'static str {
+        "abortsrc"
+    }
+    fn process(&mut self) -> CaResult<ProcessOutcome> {
+        self.process_count.fetch_add(1, Ordering::Relaxed);
+        Ok(ProcessOutcome {
+            result: RecordProcessResult::Complete,
+            actions: vec![ProcessAction::CancelReprocess],
+            device_did_compute: false,
+        })
+    }
+    fn get_field(&self, name: &str) -> Option<EpicsValue> {
+        match name {
+            "VAL" => Some(EpicsValue::Long(0)),
+            _ => None,
+        }
+    }
+    fn put_field(&mut self, _name: &str, _value: EpicsValue) -> CaResult<()> {
+        Ok(())
+    }
+    fn field_list(&self) -> &'static [FieldDesc] {
+        TEST_FIELDS
+    }
+}
+
+/// (S1) `set_async_context` delivers a *working* and *cycle-free* handle: the
+/// record receives an `AsyncDbHandle` at registration that drives an
+/// out-of-band `post_fields`, and because the handle is a `Weak` reference,
+/// dropping the only strong `PvDatabase` reports the handle dead (no
+/// ownership-cycle leak) and makes further posts a no-op.
+#[tokio::test]
+async fn set_async_context_delivers_working_cycle_free_handle() {
+    let sink: Arc<Mutex<Option<AsyncDbHandle>>> = Arc::new(Mutex::new(None));
+    let db = PvDatabase::new();
+    db.add_record(
+        "H1",
+        Box::new(HandleCaptureRecord {
+            val: 0,
+            sink: sink.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    // The framework called set_async_context at add_record.
+    let handle = sink
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("set_async_context delivered the handle to the record");
+    assert!(
+        handle.is_alive(),
+        "handle is live while the database is alive"
+    );
+
+    // Out-of-band field post through the delivered handle.
+    let posted = handle
+        .post_fields("H1", vec![("VAL".to_string(), EpicsValue::Long(13))])
+        .await
+        .expect("post through a live handle");
+    assert_eq!(posted, vec!["VAL".to_string()], "VAL reported posted");
+    {
+        let rec = db.get_record("H1").await.unwrap();
+        let inst = rec.read().await;
+        assert_eq!(
+            inst.record.get_field("VAL"),
+            Some(EpicsValue::Long(13)),
+            "out-of-band post applied the field value"
+        );
+    }
+
+    // Cycle-free: the handle holds only a Weak, so dropping the sole strong
+    // PvDatabase drops the inner — proving a record stashing the handle does
+    // NOT keep the whole database alive.
+    drop(db);
+    assert!(
+        !handle.is_alive(),
+        "stashed handle is a Weak ref: dropping the database leaves no strong owner (no cycle)"
+    );
+    let after = handle
+        .post_fields("H1", vec![("VAL".to_string(), EpicsValue::Long(99))])
+        .await
+        .expect("post through a dead handle is Ok");
+    assert!(
+        after.is_empty(),
+        "a post through a handle whose database has dropped is a no-op"
+    );
+}
+
+/// (S2) The `WriteDbLinkNotify` ProcessAction arm writes the downstream OUT
+/// link (DST.VAL) through a put-notify wait-set and re-enters the *source*
+/// when the downstream completes — the in-band `sseq` `WAITn` step.
+#[tokio::test]
+async fn write_db_link_notify_action_drives_downstream_and_reenters_source() {
+    let db = PvDatabase::new();
+    let src_count = Arc::new(AtomicU32::new(0));
+    db.add_record(
+        "SRC",
+        Box::new(NotifySourceRecord {
+            lnk: "DST",
+            process_count: src_count.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+    let dst_count = Arc::new(AtomicU32::new(0));
+    db.add_record("DST", Box::new(TestAsyncRecord::new(dst_count)))
+        .await
+        .unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SRC", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // Pass 1 returned AsyncPending; the arm wrote DST and wired the
+    // completion to a re-entry. Wait for pass 2 (completion).
+    poll_until("SRC completion re-entry (pass 2)", || {
+        src_count.load(Ordering::Relaxed) >= 2
+    })
+    .await;
+    assert_eq!(
+        src_count.load(Ordering::Relaxed),
+        2,
+        "SRC processed exactly twice: initial AsyncPending + completion re-entry"
+    );
+
+    let rec = db.get_record("DST").await.unwrap();
+    let inst = rec.read().await;
+    assert_eq!(
+        inst.record.get_field("VAL"),
+        Some(EpicsValue::Long(42)),
+        "WriteDbLinkNotify drove the downstream put (DST.VAL = 42)"
+    );
+}
+
+/// (S3) The `CancelReprocess` ProcessAction arm advances the record's
+/// re-entry generation, so an outstanding token (a pending DLYn/WAITn
+/// re-entry) becomes a structural no-op — the `sseq` `ABORT` path, with no
+/// runtime is-aborted check on the re-entry.
+#[tokio::test]
+async fn cancel_reprocess_action_supersedes_outstanding_token() {
+    let db = PvDatabase::new();
+    let count = Arc::new(AtomicU32::new(0));
+    db.add_record(
+        "CR",
+        Box::new(AbortSourceRecord {
+            process_count: count.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    // An outstanding re-entry token, as a pending DLYn delay / WAITn wait
+    // would hold.
+    let token = db.mint_async_token("CR").await.unwrap();
+    assert!(token.is_current(), "freshly-minted token is current");
+
+    // Drive a process() that emits CancelReprocess.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("CR", &mut visited, 0)
+        .await
+        .unwrap();
+
+    assert!(
+        !token.is_current(),
+        "CancelReprocess action advanced the generation, superseding the outstanding token"
+    );
+    let before = count.load(Ordering::Relaxed);
+    token.fire(&db).await.expect("firing a stale token is Ok");
+    assert_eq!(
+        count.load(Ordering::Relaxed),
+        before,
+        "a token cancelled by CancelReprocess re-enters nothing"
     );
 }

@@ -10,7 +10,7 @@ mod scan_index;
 pub use link_set::{
     DynLinkSet, LinkDbfType, LinkMetadata, LinkPutOp, LinkSet, LinkSetRegistry, RemoteAlarm,
 };
-pub use processing::AsyncToken;
+pub use processing::{AsyncDbHandle, AsyncToken};
 pub use record_lock::{ManyRecordWriteGuard, RecordWriteGuard};
 
 use crate::error::{CaError, CaResult};
@@ -878,7 +878,17 @@ impl PvDatabase {
     pub async fn add_record(&self, name: &str, record: Box<dyn Record>) -> CaResult<()> {
         let _gate = self.inner.registration_mutex.lock().await;
         self.check_name_free(name).await?;
-        let instance = RecordInstance::new_boxed(name.to_string(), record);
+        let mut instance = RecordInstance::new_boxed(name.to_string(), record);
+        // Hand the record a cycle-free handle to its own database so it can
+        // post out-of-band field updates / wire completion-driven re-entry
+        // (asyn TRACE callback, sseq WAITn) without owning the database.
+        // C records reach `dbCommon::pdba`/the IOC the same way at
+        // `dbDefineRecord` init; the framework supplies the back-reference,
+        // the record never constructs it. Defaulted no-op for records that
+        // do not need it.
+        instance
+            .record
+            .set_async_context(name.to_string(), self.async_handle());
         let scan = instance.common.scan;
         let phas = instance.common.phas;
         self.inner

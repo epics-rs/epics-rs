@@ -821,28 +821,56 @@ impl PortDriver for ModbusPortDriver {
             return Ok(());
         }
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
-        // Read-modify-write the masked bits of the register. In relative mode
-        // the current value comes from the polled buffer; in absolute mode it
-        // is read from the slave's wire address first (C `writeUInt32Digital`
-        // does a `MODBUS_READ_HOLDING_REGISTERS` doModbusIO when the mask is
-        // partial — drvModbusAsyn.cpp:609-616).
-        let current = if mask == 0 {
-            0
-        } else if self.is_absolute() {
-            let read_fn = ModbusFunctionCode::ReadHoldingRegisters;
-            let readback = (user.addr + self.engine.config().readback_offset()).max(0);
-            let regs = self
-                .engine
-                .read_absolute(self.transport.as_mut(), read_fn, readback, 1)
-                .map_err(to_asyn)?;
-            regs.first().copied().unwrap_or(0) as u32
-        } else {
-            self.engine.data()[user.addr as usize] as u32
-        };
-        let merged = if mask == 0 {
-            value
-        } else {
-            (current & !mask) | (value & mask)
+        // C `writeUInt32Digital` (drvModbusAsyn.cpp:595-625) dispatches on the
+        // configured function:
+        //   - WRITE_SINGLE_COIL: write the value directly, ignoring the mask.
+        //   - WRITE_SINGLE_REGISTER / WRITE_MULTIPLE_REGISTERS: read/modify/
+        //     write the masked bits, but ONLY when the mask is partial. A mask
+        //     of 0 or 0xFFFF writes the value directly with no readback. The
+        //     readback is a fresh Modbus READ_HOLDING_REGISTERS at
+        //     `modbusAddress + readbackOffset_` (the Wago readback offset), in
+        //     both relative and absolute addressing.
+        //   - any other function: asynError.
+        let function = self.engine.config().function;
+        let merged = match function {
+            ModbusFunctionCode::WriteSingleCoil => value,
+            ModbusFunctionCode::WriteSingleRegister
+            | ModbusFunctionCode::WriteMultipleRegisters => {
+                if mask == 0 || mask == 0xFFFF {
+                    value
+                } else {
+                    // modbusAddress: the wire address (offset in absolute mode,
+                    // start_address + offset in relative mode).
+                    let modbus_address = if self.is_absolute() {
+                        user.addr
+                    } else {
+                        i32::from(self.modbus_address(user.addr))
+                    };
+                    let readback =
+                        (modbus_address + self.engine.config().readback_offset()).max(0) as u16;
+                    let regs = self
+                        .engine
+                        .do_modbus_io(
+                            self.transport.as_mut(),
+                            ModbusFunctionCode::ReadHoldingRegisters,
+                            readback,
+                            &[],
+                            1,
+                        )
+                        .map_err(to_asyn)?;
+                    let current = u32::from(regs.first().copied().unwrap_or(0));
+                    // data |= (value & mask); data &= (value | ~mask)
+                    (current & !mask) | (value & mask)
+                }
+            }
+            other => {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!(
+                        "Modbus function {other:?} cannot service a UInt32Digital write"
+                    ),
+                });
+            }
         };
         self.flush_write(user.addr, &[merged as u16])?;
         Ok(())
@@ -1789,6 +1817,149 @@ mod tests {
         assert!(
             driver.write_float64_array(&f64_user, &[1.0, 2.0]).is_err(),
             "float64-array write on FC06 port must be rejected"
+        );
+    }
+
+    /// C `writeUInt32Digital` (drvModbusAsyn.cpp:604) writes the value
+    /// directly when `mask == 0 || mask == 0xFFFF`; only a partial mask does a
+    /// read/modify/write. A full mask in absolute mode must therefore issue a
+    /// single write request and no readback read.
+    #[test]
+    fn uint32_digital_full_mask_writes_directly_without_readback() {
+        // One FC06 write echo; if a readback read were issued there would be a
+        // second written frame (the read request) before the write.
+        let echo = tcp_response(1, &[0x01, 0x06, 0x01, 0x00, 0xAB, 0xCD]);
+        let transport = ReplayTransport::new(vec![Ok(echo)]);
+        let written = transport.written_handle();
+        let mut cfg = test_config(-1, 4);
+        cfg.function = ModbusFunctionCode::WriteSingleRegister;
+        let mut driver =
+            ModbusPortDriver::new("MB_ABS_WSR_DIG", cfg, LinkType::Tcp, Box::new(transport))
+                .expect("absolute config must build");
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let mut user = AsynUser::new(reason);
+        user.addr = 0x0100;
+        driver
+            .write_uint32_digital(&mut user, 0xABCD, 0xFFFF)
+            .expect("full-mask digital write must succeed");
+        let frames = written.lock().unwrap();
+        assert_eq!(
+            frames.len(),
+            1,
+            "full mask writes directly, no readback read"
+        );
+        assert_eq!(
+            &frames[0][6..12],
+            &[0x01, 0x06, 0x01, 0x00, 0xAB, 0xCD],
+            "single FC06 write of the full value at the wire address"
+        );
+    }
+
+    /// A partial mask does a fresh READ_HOLDING_REGISTERS at
+    /// `modbusAddress + readbackOffset_` (drvModbusAsyn.cpp:608-616), merges
+    /// the masked bits, then writes — in relative mode too. The base value must
+    /// come from a wire read, not the polled buffer.
+    #[test]
+    fn uint32_digital_partial_mask_reads_then_writes() {
+        // Read echo (current = 0xAB12), then the merged write echo.
+        let read_echo = tcp_response(1, &[0x01, 0x03, 0x02, 0xAB, 0x12]);
+        // merged = (0xAB12 & 0xFF00) | (0x00F0 & 0x00FF) = 0xABF0.
+        let write_echo = tcp_response(2, &[0x01, 0x06, 0x00, 0x02, 0xAB, 0xF0]);
+        let transport = ReplayTransport::new(vec![Ok(read_echo), Ok(write_echo)]);
+        let written = transport.written_handle();
+        let mut cfg = test_config(0, 4);
+        cfg.function = ModbusFunctionCode::WriteSingleRegister;
+        let mut driver =
+            ModbusPortDriver::new("MB_REL_WSR_DIG", cfg, LinkType::Tcp, Box::new(transport))
+                .expect("relative config must build");
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let mut user = AsynUser::new(reason);
+        user.addr = 2;
+        driver
+            .write_uint32_digital(&mut user, 0x00F0, 0x00FF)
+            .expect("partial-mask digital write must succeed");
+        let frames = written.lock().unwrap();
+        assert_eq!(
+            frames.len(),
+            2,
+            "a fresh wire read precedes the masked write"
+        );
+        // FC03 read of one register at the readback wire address (start 0 +
+        // offset 2 + readbackOffset 0).
+        assert_eq!(
+            &frames[0][6..12],
+            &[0x01, 0x03, 0x00, 0x02, 0x00, 0x01],
+            "readback reads one holding register at the wire address"
+        );
+        // FC06 write of the merged value.
+        assert_eq!(
+            &frames[1][6..12],
+            &[0x01, 0x06, 0x00, 0x02, 0xAB, 0xF0],
+            "write carries (current & ~mask) | (value & mask)"
+        );
+    }
+
+    /// A WRITE_SINGLE_COIL port writes the value directly and ignores the mask
+    /// (drvModbusAsyn.cpp:596-599) — it must never do a holding-register
+    /// readback even with a partial mask.
+    #[test]
+    fn uint32_digital_coil_writes_directly_without_readback() {
+        let echo = tcp_response(1, &[0x01, 0x05, 0x00, 0x05, 0xFF, 0x00]);
+        let transport = ReplayTransport::new(vec![Ok(echo)]);
+        let written = transport.written_handle();
+        let mut cfg = test_config(-1, 16);
+        cfg.function = ModbusFunctionCode::WriteSingleCoil;
+        let mut driver =
+            ModbusPortDriver::new("MB_ABS_WSC_DIG", cfg, LinkType::Tcp, Box::new(transport))
+                .expect("absolute coil config must build");
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let mut user = AsynUser::new(reason);
+        user.addr = 5;
+        // Partial mask (1) would have triggered a readback under the old flat
+        // logic; the coil path must ignore it.
+        driver
+            .write_uint32_digital(&mut user, 1, 1)
+            .expect("coil digital write must succeed");
+        let frames = written.lock().unwrap();
+        assert_eq!(frames.len(), 1, "coil write is direct, no readback read");
+        assert_eq!(
+            &frames[0][6..12],
+            &[0x01, 0x05, 0x00, 0x05, 0xFF, 0x00],
+            "single FC05 coil write set ON"
+        );
+    }
+
+    /// A function that cannot service a digital write (a read function here)
+    /// returns an error, matching C's `default: asynError`
+    /// (drvModbusAsyn.cpp:620-625) — it must not fall through to a write.
+    #[test]
+    fn uint32_digital_rejects_invalid_function() {
+        // test_config defaults to ReadHoldingRegisters.
+        let mut driver = ModbusPortDriver::new(
+            "MB_DIG_RDFN",
+            test_config(0, 4),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("read config must build");
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let mut user = AsynUser::new(reason);
+        user.addr = 1;
+        assert!(
+            driver.write_uint32_digital(&mut user, 1, 1).is_err(),
+            "digital write on a read-function port must be rejected"
         );
     }
 

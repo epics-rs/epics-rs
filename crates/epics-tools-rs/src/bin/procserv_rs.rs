@@ -82,8 +82,14 @@ mod app {
         name: Option<String>,
 
         /// Restart-policy max attempts inside `--restart-window`.
-        #[arg(long, default_value_t = 10)]
-        max_restarts: u32,
+        /// Unset means unlimited: C procServ has no restart-count cap —
+        /// `processFactoryNeedsRestart()` (processFactory.cc:48-56) gates
+        /// only on mode + holdoff, and the main loop `while(!shutdownServer)`
+        /// (procServ.cc:599) never gives up on a count. The count limiter
+        /// is a Rust-only opt-in (shared `RestartPolicy` with ca-gateway);
+        /// leaving it unset preserves C's never-give-up behaviour.
+        #[arg(long)]
+        max_restarts: Option<u32>,
 
         /// Restart-policy sliding window in seconds.
         #[arg(long, default_value_t = 600)]
@@ -162,7 +168,11 @@ mod app {
             child,
             logging,
             restart: RestartPolicy {
-                max_restarts: args.max_restarts,
+                // Unlimited unless the operator opts in: matches C procServ
+                // which never caps restarts on a count (processFactory.cc:48-56,
+                // procServ.cc:599). `u32::MAX` is the "no cap" sentinel the
+                // shared RestartPolicy already treats as effectively unbounded.
+                max_restarts: args.max_restarts.unwrap_or(u32::MAX),
                 window: Duration::from_secs(args.restart_window),
                 delay: Duration::from_secs(1),
             },
@@ -244,6 +254,30 @@ mod app {
                 }
             }
         })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// With no `--max-restarts`, the count limiter is unlimited
+        /// (`u32::MAX`) so the supervisor never gives up on a count —
+        /// matching C procServ (processFactory.cc:48-56, procServ.cc:599).
+        #[test]
+        fn max_restarts_defaults_to_unlimited() {
+            let args = Args::try_parse_from(["procserv-rs", "/bin/echo"]).unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.restart.max_restarts, u32::MAX);
+        }
+
+        /// Opting in caps the count at the requested value.
+        #[test]
+        fn max_restarts_opt_in_is_honored() {
+            let args =
+                Args::try_parse_from(["procserv-rs", "--max-restarts", "5", "/bin/echo"]).unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.restart.max_restarts, 5);
+        }
     }
 }
 

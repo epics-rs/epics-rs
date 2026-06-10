@@ -1003,6 +1003,41 @@ async fn br_r6_gateway_typed_put_passthrough() {
     );
 }
 
+/// `is_writable` must proxy the UPSTREAM channel's connection state, not the
+/// gateway's local monitor-cache presence. pva2pva `GWChannel::getAccessRights`
+/// delegates to the connected upstream channel (channel.cpp:92-96), so a
+/// connectable PV is "writable" even before any prior op populated the cache —
+/// the pre-fix peek-only impl returned `false` here. A PV the gateway cannot
+/// connect to is not writable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gateway_is_writable_proxies_upstream_connection_not_cache_presence() {
+    let (_us_server, us_addr, _us_pv) = spawn_upstream("GW:WR:PV", 1.0);
+    let upstream_client = Arc::new(
+        PvaClient::builder()
+            .server_addr(us_addr)
+            .timeout(Duration::from_secs(2))
+            .build(),
+    );
+    let cache = ChannelCache::new(upstream_client, Duration::from_secs(60));
+    let mut src = GatewayChannelSource::new(cache);
+    src.connect_timeout = Duration::from_millis(400);
+
+    // Connectable upstream PV → writable, WITHOUT any prior op having cached a
+    // monitor. The pre-fix `self.cache.peek(name).is_some()` returned false on
+    // this cold-cache probe; the connection-state proxy returns true.
+    assert!(
+        src.is_writable("GW:WR:PV").await,
+        "is_writable must proxy the connectable upstream channel (cold cache)"
+    );
+
+    // A PV no upstream serves cannot be connected, so it is not writable — the
+    // probe fails within `connect_timeout` rather than reporting a stale flag.
+    assert!(
+        !src.is_writable("GW:NOSUCH:PV").await,
+        "is_writable must be false for a PV the gateway cannot connect to"
+    );
+}
+
 /// typed-subscribe fallback delivers live updates.
 ///
 /// `GatewayChannelSource::subscribe` routes through `subscribe_inner`

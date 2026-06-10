@@ -1415,16 +1415,30 @@ impl ChannelSource for GatewayChannelSource {
     }
 
     async fn is_writable(&self, name: &str) -> bool {
-        // Peek-only: report writable iff the entry is already in the
-        // cache. We deliberately do NOT trigger a fresh upstream
-        // lookup here. If we did, a malicious or buggy client could
-        // probe N random names against `is_writable` and force N
-        // upstream search-and-subscribe cycles, each holding an
-        // upstream-monitor task open until `connect_timeout` fires
-        // (search-storm vector). The honest answer for an unseen PV
-        // is "I don't know yet" — pvxs convention treats that as
-        // not-writable, which is what we return.
-        self.cache.peek(name).await.is_some()
+        // Proxy the UPSTREAM channel's connection state, not the local cache.
+        //
+        // pva2pva `GWChannel::getAccessRights` delegates to the connected
+        // upstream channel — `return entry->channel->getAccessRights(pvField)`
+        // (modules/pva2pva/p2pApp/channel.cpp:92-96) — so a gateway reports
+        // the proxied upstream's rights, never a gateway-local flag.
+        // Reporting mere monitor-cache presence advertised "writable"
+        // whenever any prior op had populated the cache (and "not writable"
+        // for a connectable PV not yet cached), independent of the upstream's
+        // actual access — wrong on both edges.
+        //
+        // PVA transmits no per-field access-rights message and this client
+        // exposes no per-field writability, so the faithful, physically-
+        // available proxy is the upstream channel's CONNECTION: a channel the
+        // gateway can connect to is the one whose rights pva2pva would
+        // forward. Route the probe through the gateway-owned cache (the same
+        // accounting as `has_pv`): a connectable PV counts in `cacheSize`, is
+        // charged against the admission cap, and is reachable by
+        // `:drop`/`:flush`, so repeated probes reuse the one cached channel
+        // rather than opening an untracked connection per call.
+        self.cache
+            .admit_connection(name, self.connect_timeout)
+            .await
+            .is_ok()
     }
 
     /// Forward an RPC request through the upstream client. The default

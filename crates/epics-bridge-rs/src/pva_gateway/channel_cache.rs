@@ -855,16 +855,17 @@ impl ChannelCache {
     /// now?". Returns the cached entry if present (and pokes its
     /// recency bit), or `None` without inserting / spawning.
     ///
-    /// Used by `is_writable` and similar advisory paths so a
-    /// downstream client probing N random PV names cannot trigger N
-    /// upstream search-and-spawn cycles. The full `lookup` path
-    /// remains for `has_pv`/`get_value`/`subscribe` etc. that
-    /// genuinely need to resolve.
+    /// Used by paths that act on an ALREADY-cached entry without wanting to
+    /// resolve a miss — e.g. the watermark applier, which folds a pause/resume
+    /// vote into an existing upstream monitor and simply skips when the entry
+    /// is gone. The full `lookup` path remains for
+    /// `has_pv`/`get_value`/`subscribe`/`is_writable` etc. that genuinely need
+    /// to resolve (connect) the PV.
     pub async fn peek(&self, pv_name: &str) -> Option<Arc<UpstreamEntry>> {
         let map = self.entries.lock().await;
-        // Existence probe by PV name: any cached monitor variant for the
-        // channel answers "writable". `is_writable` only needs presence,
-        // not a specific request variant.
+        // Existence probe by PV name: return any cached monitor variant for
+        // the channel — callers here need only the entry, not a specific
+        // request variant.
         let existing = map.get(pv_name)?.monitors.values().next()?.clone();
         existing.poke();
         Some(existing)

@@ -18,15 +18,16 @@
 //! ```
 
 use std::io::Cursor;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use clap::Parser;
-use socket2::{Domain, Protocol, Socket, Type};
-use tokio::net::UdpSocket;
+use tokio::sync::mpsc::Receiver;
 
 use epics_pva_rs::client_native::decode::try_parse_frame;
+use epics_pva_rs::client_native::udp::{CollectedDatagram, UdpManager};
+use epics_pva_rs::config::Endpoint;
 use epics_pva_rs::proto::{Command, ReadExt, decode_size, decode_string, ip_from_bytes};
 
 #[derive(Parser)]
@@ -70,7 +71,10 @@ struct Args {
     /// bind. Form `host[:port]` for a unicast/wildcard interface, or
     /// `mcast[,ttl][@iface][:port]` to join a multicast group. pvxs
     /// `tools/pvxvct.cpp:152-153,171-173,235-241` accepts repeated `-B`
-    /// and binds `0.0.0.0:5076` only when none is given.
+    /// and binds `0.0.0.0:5076` only when none is given. The socket is
+    /// always the shared wildcard collector for the port (pvxs `UDPManager`,
+    /// `src/udp_collector.cpp:140-151`); the destination address selects
+    /// which datagrams this listener is shown — it is never bound directly.
     #[arg(short = 'B', long = "bind")]
     binds: Vec<String>,
 
@@ -245,31 +249,30 @@ fn parse_bind(spec: &str, default_port: u16) -> Result<BindEndpoint, String> {
     Ok(BindEndpoint { addr, port, iface })
 }
 
-fn bind_endpoint(ep: &BindEndpoint) -> std::io::Result<UdpSocket> {
-    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    sock.set_reuse_address(true)?;
-    #[cfg(unix)]
-    {
-        let _ = sock.set_reuse_port(true);
+impl BindEndpoint {
+    /// The collector destination this `-B` requests. pvxvct never binds the
+    /// destination address itself: it hands the address to the shared
+    /// wildcard collector ([`UdpManager`]), which binds `0.0.0.0:port` and
+    /// fans datagrams out by their recovered original destination. This is
+    /// pvxs's rule — "Always bind to wildcard to receive all
+    /// uni/broad/multicast" (`src/udp_collector.cpp:140-151`) — so a
+    /// broadcast or specific-interface `-B` is received portably instead of
+    /// failing to bind a broadcast address (not portable) or silently
+    /// missing broadcast traffic on a unicast bind. A multicast endpoint
+    /// passes its `@iface` through (as a literal IPv4, which the collector's
+    /// `resolve_iface_v4` round-trips) for the group join; a unicast or
+    /// broadcast endpoint carries none — the wildcard bind already receives it.
+    fn to_endpoint(self) -> Endpoint {
+        Endpoint {
+            addr: SocketAddr::new(IpAddr::V4(self.addr), self.port),
+            ttl: None,
+            iface: if self.iface.is_unspecified() {
+                None
+            } else {
+                Some(self.iface.to_string())
+            },
+        }
     }
-    sock.set_broadcast(true)?;
-    sock.set_nonblocking(true)?;
-
-    let is_mcast = ep.addr.is_multicast();
-    // Multicast: bind the wildcard so the group can be joined and shared;
-    // unicast/wildcard: bind the requested interface address directly.
-    let bind_addr = if is_mcast {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), ep.port)
-    } else {
-        SocketAddr::new(IpAddr::V4(ep.addr), ep.port)
-    };
-    sock.bind(&bind_addr.into())?;
-    if is_mcast {
-        sock.join_multicast_v4(&ep.addr, &ep.iface)?;
-    }
-
-    let std_sock: StdUdpSocket = sock.into();
-    UdpSocket::from_std(std_sock)
 }
 
 fn now_iso() -> String {
@@ -294,25 +297,20 @@ fn fmt_guid(g: &[u8]) -> String {
     s
 }
 
-/// Decode and print SEARCH/BEACON frames arriving on one bound socket,
-/// applying the shared display filters. One of these runs per `-B`
-/// endpoint (pvxs starts one search/beacon listener pair per bind,
-/// `tools/pvxvct.cpp:235-241`).
-async fn run_listener(socket: UdpSocket, filters: Arc<Filters>) {
-    let mut buf = vec![0u8; 4096];
-    loop {
-        let (n, peer) = match socket.recv_from(&mut buf).await {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("pvxvct-rs: recv: {e}");
-                continue;
-            }
-        };
+/// Decode and print SEARCH/BEACON frames the wildcard collector delivers
+/// for one `-B` destination, applying the shared display filters. One of
+/// these runs per `-B` endpoint, fed by the collector's per-destination
+/// fan-out (pvxs starts one search/beacon listener pair per bind,
+/// `tools/pvxvct.cpp:235-241`; the collector routes each datagram by its
+/// original destination, `src/udp_collector.cpp:451`).
+async fn run_listener(mut rx: Receiver<CollectedDatagram>, filters: Arc<Filters>) {
+    while let Some(datagram) = rx.recv().await {
+        let peer = datagram.src;
         if !filters.allow_peer(peer.ip()) {
             continue;
         }
 
-        let bytes = &buf[..n];
+        let bytes = datagram.data.as_slice();
         let Ok(Some((frame, _consumed))) = try_parse_frame(bytes) else {
             continue;
         };
@@ -467,12 +465,28 @@ async fn main() {
         }
     }
 
+    // One shared wildcard collector per (family, port): it binds
+    // `0.0.0.0:port` and fans each datagram out to the listeners whose `-B`
+    // destination matches its recovered original destination — pvxs
+    // `UDPManager` (`src/udp_collector.cpp:102-151`). The collector handles
+    // must outlive their listeners: the background receive task runs only
+    // while a handle (or another listener) keeps the collector alive.
+    let manager = UdpManager::new();
+    let mut collectors = Vec::with_capacity(endpoints.len());
     let mut handles = Vec::with_capacity(endpoints.len());
     for ep in endpoints {
-        let socket = match bind_endpoint(&ep) {
-            Ok(s) => s,
+        let dest = ep.to_endpoint();
+        let collector = match manager.collect(&dest) {
+            Ok(c) => c,
             Err(e) => {
                 eprintln!("pvxvct-rs: bind {}:{}: {e}", ep.addr, ep.port);
+                std::process::exit(1);
+            }
+        };
+        let rx = match collector.add_listener(&dest) {
+            Ok(rx) => rx,
+            Err(e) => {
+                eprintln!("pvxvct-rs: listen {}:{}: {e}", ep.addr, ep.port);
                 std::process::exit(1);
             }
         };
@@ -484,13 +498,16 @@ async fn main() {
         } else {
             eprintln!("pvxvct-rs: listening on {}:{}", ep.addr, ep.port);
         }
+        collectors.push(collector);
         let f = filters.clone();
-        handles.push(tokio::spawn(run_listener(socket, f)));
+        handles.push(tokio::spawn(run_listener(rx, f)));
     }
 
     for h in handles {
         let _ = h.await;
     }
+    // Keep the collectors alive until every listener task has ended.
+    drop(collectors);
 }
 
 #[cfg(test)]
@@ -673,5 +690,37 @@ mod tests {
         let dflt = default_bind_port(None);
         assert_eq!(parse_bind("0.0.0.0", dflt).unwrap().port, 5076);
         assert_eq!(parse_bind("0.0.0.0:5099", dflt).unwrap().port, 5099);
+    }
+
+    /// Each `-B` is handed to the shared wildcard collector as a
+    /// *destination*, never bound directly: `to_endpoint` preserves the
+    /// address + port and passes a multicast `@iface` through (as a literal
+    /// IPv4 the collector round-trips), while a unicast or broadcast
+    /// endpoint carries no interface — the wildcard bind already receives it.
+    /// This is the structural change behind the pvxs `UDPManager` parity
+    /// (`src/udp_collector.cpp:140-151`): a broadcast `-B` no longer fails to
+    /// bind its broadcast address, and a unicast `-B` no longer misses
+    /// broadcast traffic.
+    #[test]
+    fn bind_endpoint_maps_to_collector_destination() {
+        // Broadcast destination: the collector dest is the broadcast
+        // address + port, with no join interface.
+        let bcast = parse_bind("255.255.255.255:5076", 5076).unwrap();
+        let dest = bcast.to_endpoint();
+        assert_eq!(dest.addr, "255.255.255.255:5076".parse().unwrap());
+        assert_eq!(dest.iface, None);
+
+        // Unicast interface destination: address preserved, still no join.
+        let uni = parse_bind("192.168.1.5", 5076).unwrap();
+        let dest = uni.to_endpoint();
+        assert_eq!(dest.addr, "192.168.1.5:5076".parse().unwrap());
+        assert_eq!(dest.iface, None);
+
+        // Multicast with `@iface`: the iface is passed to the collector for
+        // the group join, as a literal IPv4 that `resolve_iface_v4` accepts.
+        let mcast = parse_bind("224.0.1.1@10.0.0.2:5078", 5076).unwrap();
+        let dest = mcast.to_endpoint();
+        assert_eq!(dest.addr, "224.0.1.1:5078".parse().unwrap());
+        assert_eq!(dest.iface.as_deref(), Some("10.0.0.2"));
     }
 }

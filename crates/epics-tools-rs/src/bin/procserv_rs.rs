@@ -82,6 +82,16 @@ mod app {
         )]
         logstamp: Option<Option<String>>,
 
+        /// strftime format for banner / start-time lines (`-F` /
+        /// `--timefmt` in C, default `%c`). Sets C `timeFormat`
+        /// (procServ.cc:80,254,303-305) and is also the base for the
+        /// default log stamp, "[" + timefmt + "] " (procServ.cc:464-468).
+        /// C exposes this long-only (`--timefmt`); `-F` is a Rust
+        /// convenience, as 'F' is absent from C's getopt optstring
+        /// (procServ.cc:264).
+        #[arg(short = 'F', long = "timefmt", value_name = "FMT")]
+        timefmt: Option<String>,
+
         /// PID file (`--pidfile`).
         #[arg(long)]
         pidfile: Option<PathBuf>,
@@ -182,15 +192,21 @@ mod app {
             ignore_chars: Vec::new(),
         };
 
+        // C `timeFormat` defaults to "%c" (procServ.cc:80), overridable by
+        // -F/--timefmt (procServ.cc:254,303-305). Used for banner /
+        // start-time rendering and as the base for the default log stamp.
+        let time_format = args.timefmt.unwrap_or_else(|| "%c".into());
+
         // C `--logstamp [<FMT>]` (procServ.cc:307-311): the flag sets
         // stampLog=true; an attached value overrides stampFormat (raw),
-        // the bare flag keeps the bracketed default. Absent → unstamped.
+        // the bare flag keeps the default. Absent → unstamped.
         let stamp_log = args.logstamp.is_some();
         let stamp_format = match args.logstamp {
             Some(Some(fmt)) => fmt,
-            // C's default `stampFormat` shape: "[" + timeFormat + "] "
-            // (procServ.cc:464-468), applied verbatim by the writer.
-            _ => "[%Y-%m-%d %H:%M:%S] ".into(),
+            // C's default stampFormat = "[" + timeFormat + "] ", built from
+            // the (possibly --timefmt-overridden) timeFormat so the flag
+            // propagates to the log stamp exactly as in C (procServ.cc:464-468).
+            _ => format!("[{time_format}] "),
         };
 
         let logging = LoggingConfig {
@@ -198,8 +214,7 @@ mod app {
             pid_path: args.pidfile,
             info_path: args.info_file,
             stamp_log,
-            // Banner times: raw, un-bracketed (C `timeFormat`).
-            time_format: "%Y-%m-%d %H:%M:%S".into(),
+            time_format,
             stamp_format,
         };
 
@@ -371,13 +386,14 @@ mod app {
         }
 
         /// `--logstamp` alone enables stamping with the bracketed default
-        /// stamp format (C 'S' with no optarg, procServ.cc:307-311,464-468).
+        /// stamp format, built from the default timeFormat "%c"
+        /// (C 'S' with no optarg, procServ.cc:307-311,464-468).
         #[test]
         fn logstamp_flag_enables_stamping_with_default_format() {
             let args = Args::try_parse_from(["procserv-rs", "--logstamp", "/bin/echo"]).unwrap();
             let cfg = build_config(args).unwrap();
             assert!(cfg.logging.stamp_log);
-            assert_eq!(cfg.logging.stamp_format, "[%Y-%m-%d %H:%M:%S] ");
+            assert_eq!(cfg.logging.stamp_format, "[%c] ");
         }
 
         /// `--logstamp=<FMT>` enables stamping and uses FMT raw (C 'S'
@@ -389,6 +405,49 @@ mod app {
             let cfg = build_config(args).unwrap();
             assert!(cfg.logging.stamp_log);
             assert_eq!(cfg.logging.stamp_format, "%H:%M:%S ");
+        }
+
+        /// No `--timefmt` → C's default timeFormat "%c" (procServ.cc:80).
+        #[test]
+        fn timefmt_absent_uses_c_default() {
+            let args = Args::try_parse_from(["procserv-rs", "/bin/echo"]).unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.logging.time_format, "%c");
+        }
+
+        /// `--timefmt <FMT>` sets the banner format and (per C
+        /// procServ.cc:464-468) also rebases the default log stamp
+        /// "[" + timeFormat + "] ".
+        #[test]
+        fn timefmt_sets_banner_and_rebases_default_stamp() {
+            let args = Args::try_parse_from([
+                "procserv-rs",
+                "--timefmt",
+                "%H:%M",
+                "--logstamp",
+                "/bin/echo",
+            ])
+            .unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.logging.time_format, "%H:%M");
+            assert_eq!(cfg.logging.stamp_format, "[%H:%M] ");
+        }
+
+        /// An explicit `--logstamp=<FMT>` still wins over the
+        /// timefmt-derived default stamp (C uses the optarg verbatim).
+        #[test]
+        fn logstamp_value_overrides_timefmt_derived_stamp() {
+            let args = Args::try_parse_from([
+                "procserv-rs",
+                "--timefmt",
+                "%H:%M",
+                "--logstamp=RAW ",
+                "/bin/echo",
+            ])
+            .unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.logging.time_format, "%H:%M");
+            assert_eq!(cfg.logging.stamp_format, "RAW ");
         }
     }
 }

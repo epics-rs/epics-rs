@@ -377,6 +377,43 @@ async fn log_port_client_is_readonly_but_receives_output() {
 }
 
 #[tokio::test]
+async fn timefmt_controls_banner_timestamp_format() {
+    // C `--timefmt` sets `timeFormat` (procServ.cc:254,303-305), used to
+    // render the banner start-time lines (clientFactory.cc:124-130). A
+    // format with no `%` specifiers is emitted as a literal, so a custom
+    // timefmt shows up verbatim in the banner; the default ("%c") would
+    // render a real calendar time instead.
+    let port = pick_port().await;
+    let mut cfg = cat_config(port);
+    cfg.logging.time_format = "TIMEFMT_MARKER".into();
+
+    let server = ProcServ::new(cfg).expect("build");
+    let server_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut conn = {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(50)).await,
+                Err(e) => panic!("could not connect: {e}"),
+            }
+        }
+    };
+
+    let initial = read_for(&mut conn, Duration::from_millis(500)).await;
+    let cleaned = String::from_utf8_lossy(&strip_iac(&initial)).to_string();
+    assert!(
+        cleaned.contains("server started at: TIMEFMT_MARKER"),
+        "banner must render the start time with the configured timefmt; got: {cleaned:?}"
+    );
+
+    server_task.abort();
+}
+
+#[tokio::test]
 async fn manual_restart_preempts_active_holdoff() {
     // C procServ's main poll loop keeps running during the crash-loop
     // holdoff, so a manual restart keystroke (`restartOnce()` zeros

@@ -96,13 +96,17 @@ async fn main() {
 
     // Parse the custom pvRequest once, up front, so an invalid string
     // exits before any subscription task is spawned. `None` means use
-    // the channel-default request.
+    // the channel-default request. The strict pvxs grammar is used so
+    // acceptance matches pvxs's own `pvmonitor`: `tools/monitor.cpp:110`
+    // routes `-r` through `RequestBuilder::pvRequest()` (strict `PVRParser`,
+    // `src/clientreq.cpp:137-283`), which rejects the lenient pvDataCPP
+    // `createRequest` extensions the bare `parse` allows.
     let request: Option<PvRequestExpr> = {
         let trimmed = args.request.trim();
         if trimmed.is_empty() {
             None
         } else {
-            match PvRequestExpr::parse(trimmed) {
+            match PvRequestExpr::parse_pvxs_compat(trimmed) {
                 Ok(req) => Some(req),
                 Err(e) => {
                     eprintln!("error: invalid pvRequest {:?}: {e}", args.request);

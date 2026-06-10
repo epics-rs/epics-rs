@@ -144,12 +144,16 @@ async fn main() {
         .timeout(epics_pva_rs::cli::wait_timeout_duration(args.timeout))
         .build();
 
-    // Parse the optional pvRequest once (shared by both put forms).
+    // Parse the optional pvRequest once (shared by both put forms) with
+    // the strict pvxs grammar, so acceptance matches pvxs's own `pvput`:
+    // `tools/put.cpp:115` routes `-r` through `RequestBuilder::pvRequest()`
+    // (strict `PVRParser`, `src/clientreq.cpp:137-283`), which rejects the
+    // lenient pvDataCPP `createRequest` extensions the bare `parse` allows.
     let trimmed = args.request.trim();
     let request = if trimmed.is_empty() {
         None
     } else {
-        match PvRequestExpr::parse(trimmed) {
+        match PvRequestExpr::parse_pvxs_compat(trimmed) {
             Ok(req) => Some(req),
             Err(e) => {
                 eprintln!("error: invalid pvRequest {:?}: {e}", args.request);

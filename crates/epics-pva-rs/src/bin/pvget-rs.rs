@@ -96,18 +96,23 @@ async fn main() {
         cli::print_effective_config();
     }
 
-    // Parse the pvRequest once with the full grammar so `record[...]`
-    // options, server-side `_filter` chains, per-field option brackets,
-    // and nested field selections all reach the server verbatim — not
-    // just a field-name list. pvxs `pvget.cpp:375-380` hands the whole
-    // `-r` string to `createRequest`. Empty `-r` means the default
-    // all-fields GET. An invalid request exits before any GET.
+    // Parse the pvRequest once with the strict pvxs grammar, so the
+    // request strings this CLI accepts are exactly those pvxs's own
+    // `pvget` accepts: `field(...)` selections and `record[k=v]` options
+    // pass, while the lenient pvDataCPP `createRequest` extensions (brace
+    // member groups, per-field option brackets, quoted / `:`-bearing
+    // option values) are rejected. pvxs `tools/get.cpp:110` hands `-r` to
+    // `RequestBuilder::pvRequest()`, whose strict `PVRParser`
+    // (`src/clientreq.cpp:137-283`) is what `parse_pvxs_compat` mirrors —
+    // the lenient `parse` would let this CLI accept requests pvxs rejects.
+    // Empty `-r` means the default all-fields GET; an invalid request
+    // exits before any GET.
     let request: Option<PvRequestExpr> = {
         let trimmed = args.request.trim();
         if trimmed.is_empty() {
             None
         } else {
-            match PvRequestExpr::parse(trimmed) {
+            match PvRequestExpr::parse_pvxs_compat(trimmed) {
                 Ok(req) => Some(req),
                 Err(e) => {
                     eprintln!("error: invalid pvRequest {:?}: {e}", args.request);
@@ -231,15 +236,16 @@ mod tests {
         assert!(args.quiet);
     }
 
-    /// `-r` is parsed with the full pvRequest grammar, so `record[...]`
-    /// options survive instead of being dropped by a field-list split.
-    /// Pre-fix the ad-hoc parser would have treated `record[process=true]`
-    /// as a field name. pvxs `pvget.cpp:375-380` hands the whole string
-    /// to `createRequest`.
+    /// `-r` is parsed with the strict pvxs grammar (`parse_pvxs_compat`,
+    /// the parser `main` uses), so `record[...]` options survive instead
+    /// of being dropped by a field-list split, while acceptance matches
+    /// pvxs's own `pvget` (`tools/get.cpp:110` → `RequestBuilder::pvRequest`,
+    /// `src/clientreq.cpp:137-283`). `record[process=true]field(value)` is
+    /// strict-valid, so it must round-trip the record option and field.
     #[test]
-    fn request_record_options_parse_via_full_grammar() {
+    fn request_record_options_parse_via_strict_pvxs_grammar() {
         let args = Args::parse_from(["pvget-rs", "-r", "record[process=true]field(value)", "PV"]);
-        let req = PvRequestExpr::parse(args.request.trim()).expect("valid pvRequest");
+        let req = PvRequestExpr::parse_pvxs_compat(args.request.trim()).expect("valid pvRequest");
         assert_eq!(
             req.record_options,
             vec![(

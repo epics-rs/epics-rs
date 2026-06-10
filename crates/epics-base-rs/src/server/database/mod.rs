@@ -650,7 +650,18 @@ impl PvDatabase {
         let mut targets: Vec<(link_set::DynLinkSet, String)> = Vec::new();
         for (_scheme, lset) in &registry_snapshot {
             for n in lset.link_names() {
-                targets.push((lset.clone(), n));
+                // C parity (dbLink.c:130): iocInit only waits for links whose
+                // target is a LOCAL record —
+                //   int isLocal = dbChannelTest(pvname) == 0;
+                //   dbCaAddLinkCallbackOpt(..., isLocal ? DBCA_CALLBACK_INIT_WAIT : 0)
+                // A link to a non-local / nonexistent PV (e.g. areaDetector's
+                // `ShutterStatusEPICS_RBV.INP = "test CP MS"` placeholder) gets
+                // no init-wait flag, so iocInit must not block on it; it is left
+                // to connect asynchronously — or dangle silently — like C.
+                // `has_name_no_resolve` is the dbChannelTest twin.
+                if self.has_name_no_resolve(&n).await {
+                    targets.push((lset.clone(), n));
+                }
             }
         }
         targets
@@ -1463,6 +1474,10 @@ mod tests {
     #[tokio::test]
     async fn wait_for_external_links_connected_quickly() {
         let db = PvDatabase::new();
+        // Local-target forced-CA links (dbChannelTest==0 → isLocal): these
+        // get DBCA_CALLBACK_INIT_WAIT, so iocInit waits for them.
+        db.add_pv("pv:A", EpicsValue::Long(0)).await.unwrap();
+        db.add_pv("pv:B", EpicsValue::Long(0)).await.unwrap();
         let lset = Arc::new(DelayedConnectLset {
             names: vec!["pv:A".to_string(), "pv:B".to_string()],
             connect_at: tokio::time::Instant::now(),
@@ -1477,8 +1492,10 @@ mod tests {
     #[tokio::test]
     async fn wait_for_external_links_returns_partial_on_timeout() {
         let db = PvDatabase::new();
-        // Connect-time well past the budget below; the wait must
-        // return (0, 1) instead of blocking.
+        // Local target so the link is in the init-wait set (dbLink.c:130);
+        // connect-time well past the budget below, so the wait must return
+        // (0, 1) instead of blocking.
+        db.add_pv("slow:pv", EpicsValue::Long(0)).await.unwrap();
         let lset = Arc::new(DelayedConnectLset {
             names: vec!["slow:pv".to_string()],
             connect_at: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
@@ -1500,6 +1517,36 @@ mod tests {
             "wait must not exceed the budget by much, got {:?}",
             elapsed
         );
+    }
+
+    /// C parity (dbLink.c:130): a link whose target is NOT a local record
+    /// (`dbChannelTest != 0`) gets no DBCA_CALLBACK_INIT_WAIT, so iocInit
+    /// must not block on it. An areaDetector `test CP MS` placeholder — a CP
+    /// link to a PV that exists nowhere — must drop straight through, leaving
+    /// the link to connect (or dangle) asynchronously and silently, like C.
+    #[tokio::test]
+    async fn wait_for_external_links_skips_nonlocal_targets() {
+        let db = PvDatabase::new();
+        // "test" has no local record and would never connect.
+        let lset = Arc::new(DelayedConnectLset {
+            names: vec!["test".to_string()],
+            connect_at: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+        });
+        db.register_link_set("ca", lset).await;
+        let started = tokio::time::Instant::now();
+        let (c, t) = db
+            .wait_for_external_links(std::time::Duration::from_secs(10))
+            .await;
+        // Non-local target is excluded from the wait set entirely, so the
+        // call returns (0, 0) immediately rather than blocking the budget.
+        assert_eq!((c, t), (0, 0));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "non-local link must not be waited on, got {:?}",
+            started.elapsed()
+        );
+        // And it is reported as unconnected by neither path (silent, like C).
+        assert!(db.unconnected_external_links().await.is_empty());
     }
 
     // epics-base PR #336 — alias parsing + lookup integration tests.

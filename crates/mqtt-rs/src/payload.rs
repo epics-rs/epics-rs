@@ -608,7 +608,7 @@ mod tests {
         assert_eq!(val, DecodedValue::Int32Array(vec![42]));
     }
 
-    /// R0604-MQTT-JSON-STRING-NUMERIC-1 regression. C builds a string
+    /// Regression: C builds a string
     /// carrier from the matched JSON field — `get<std::string>()` for a
     /// JSON string, `dump()` otherwise (drvMqtt.cpp:262-265) — then runs
     /// the same flat numeric/array parsers. A broker that encodes every

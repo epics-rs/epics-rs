@@ -265,7 +265,13 @@ pub struct TraceConfig {
 impl Default for TraceConfig {
     fn default() -> Self {
         Self {
-            trace_mask: TraceMask::ERROR | TraceMask::WARNING,
+            // C parity: `tracePvtInit` (asynManager.c:454) initializes
+            // every port's mask to `ASYN_TRACE_ERROR` only. WARNING is
+            // OFF by default and must be enabled via `asynSetTraceMask`;
+            // shipping it ON makes ASYN_TRACE_WARNING diagnostics (e.g.
+            // NDPluginDriver's "no input array cached") spam stderr at
+            // iocInit, which C keeps silent.
+            trace_mask: TraceMask::ERROR,
             trace_io_mask: TraceIoMask::ASCII,
             trace_info_mask: TraceInfoMask::TIME | TraceInfoMask::PORT,
             io_truncate_size: 80,
@@ -735,7 +741,9 @@ impl TraceManager {
         self.global_config
             .lock()
             .map(|c| c.trace_mask)
-            .unwrap_or(TraceMask::ERROR | TraceMask::WARNING)
+            // C parity: default port mask is ERROR-only (asynManager.c:454);
+            // keep the poisoned-lock fallback in sync with TraceConfig::default.
+            .unwrap_or(TraceMask::ERROR)
     }
 
     pub fn get_trace_io_mask(&self, port: Option<&str>) -> TraceIoMask {
@@ -995,11 +1003,14 @@ macro_rules! asyn_trace_device_io {
 mod tests {
     use super::*;
 
+    /// C parity: `tracePvtInit` (asynManager.c:454) sets every port's
+    /// default mask to `ASYN_TRACE_ERROR` only — WARNING is OFF until a
+    /// caller raises it via `asynSetTraceMask`.
     #[test]
-    fn test_default_mask_error_warning() {
+    fn test_default_mask_error_only() {
         let mgr = TraceManager::new();
         assert!(mgr.is_enabled("port1", TraceMask::ERROR));
-        assert!(mgr.is_enabled("port1", TraceMask::WARNING));
+        assert!(!mgr.is_enabled("port1", TraceMask::WARNING));
         assert!(!mgr.is_enabled("port1", TraceMask::FLOW));
         assert!(!mgr.is_enabled("port1", TraceMask::IO_DRIVER));
     }
@@ -1211,19 +1222,14 @@ mod tests {
     #[test]
     fn test_get_masks() {
         let mgr = TraceManager::new();
-        assert_eq!(
-            mgr.get_trace_mask(None),
-            TraceMask::ERROR | TraceMask::WARNING
-        );
+        // Default global mask is ERROR-only (asynManager.c:454).
+        assert_eq!(mgr.get_trace_mask(None), TraceMask::ERROR);
         assert_eq!(mgr.get_trace_io_mask(None), TraceIoMask::ASCII);
 
         mgr.set_trace_mask(Some("p1"), TraceMask::FLOW);
         assert_eq!(mgr.get_trace_mask(Some("p1")), TraceMask::FLOW);
         // Global unaffected
-        assert_eq!(
-            mgr.get_trace_mask(None),
-            TraceMask::ERROR | TraceMask::WARNING
-        );
+        assert_eq!(mgr.get_trace_mask(None), TraceMask::ERROR);
     }
 
     #[test]

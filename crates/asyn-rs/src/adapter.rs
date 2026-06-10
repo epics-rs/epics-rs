@@ -1966,12 +1966,12 @@ mod tests {
 
         assert_eq!(
             rec.get_field("MASK"),
-            Some(EpicsValue::Long(0xFF00)),
+            Some(EpicsValue::ULong(0xFF00)),
             "MASK must propagate"
         );
         assert_eq!(
             rec.get_field("SHFT"),
-            Some(EpicsValue::Short(8)),
+            Some(EpicsValue::UShort(8)),
             "SHFT must equal computeShift(0xFF00) = 8"
         );
     }

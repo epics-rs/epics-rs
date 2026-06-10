@@ -4,16 +4,20 @@ pub use registry::{
     register_port,
 };
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use epics_base_rs::error::{CaError, CaResult};
+use epics_base_rs::server::database::AsyncDbHandle;
 use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
+use crate::error::AsynResult;
 use crate::exception::{AsynException, ExceptionCallbackId, ExceptionManager};
 use crate::port_handle::PortHandle;
+use crate::request::{CancelToken, RequestOp, RequestResult};
 use crate::trace::{TraceFile, TraceInfoMask, TraceIoMask, TraceManager, TraceMask};
+use crate::user::AsynUser;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -320,6 +324,22 @@ pub struct AsynRecord {
     port_entry: Option<PortEntry>,
     resolved_reason: usize,
 
+    // The record's canonical name plus a cycle-free handle to its own
+    // database, handed over by the framework at `add_record` via
+    // `set_async_context` (C records reach the IOC the same way at
+    // `dbDefineRecord`). Lets `process()` run port I/O off the scan thread
+    // and re-enter on completion, and lets the trace exception callback post
+    // readback fields out-of-band — neither of which the async callback can
+    // do by mutating the framework-owned record directly.
+    async_ctx: Option<(String, AsyncDbHandle)>,
+    // A non-blocking port request that is queued / in flight. `Some` exactly
+    // while `process()` has returned `AsyncPending` and the off-thread
+    // orchestration has not yet re-entered (C `stateIO`, asynRecord.c:216).
+    // Holds the shared `CancelToken` (the asynRecord `AQR`/`cancelRequest`
+    // target) and the slot the orchestration fills before it fires the
+    // completion re-entry.
+    io_inflight: Option<IoInFlight>,
+
     // Set by the trace exception callback (C `exceptCallback`,
     // asynRecord.c:903-917) when an external `setTrace{Mask,IOMask,
     // InfoMask}` fires; consumed by `process()`, which re-imports the
@@ -414,11 +434,261 @@ impl Default for AsynRecord {
             aqr: 0,
             port_entry: None,
             resolved_reason: 0,
+            async_ctx: None,
+            io_inflight: None,
             trace_status_dirty: Arc::new(AtomicBool::new(false)),
             trace_except_cb: None,
         }
     }
 }
+
+// ===== Non-blocking I/O orchestration =====
+//
+// C asynRecord queues `performIO` as one request (`queueRequest`,
+// asynRecord.c:342) that the port thread runs in `asynCallbackProcess`
+// (asynRecord.c:808-832); `process()` returns with `pact=TRUE` and the
+// record completes on the callback's `callbackRequestProcessCallback`
+// re-process. The Rust analogue runs `performIO` off the scan thread in a
+// spawned task and re-enters `process()` via the PACT async-record
+// primitive when the port I/O finishes.
+
+/// A non-blocking port request that is queued / in flight.
+struct IoInFlight {
+    /// The orchestration writes the completed `IoOutcome` here before it
+    /// fires the re-entry, so the completion `process()` can apply it.
+    result: Arc<Mutex<Option<IoOutcome>>>,
+}
+
+/// Immutable snapshot of the record fields `performIO` reads, built on the
+/// scan thread so the off-thread orchestration never touches the record.
+struct IoPlan {
+    tmod: TransferMode,
+    iface: InterfaceType,
+    // Per-request `asynUser` inputs. Stored as primitives (not a built
+    // `AsynUser`) because `AsynUser` owns a non-`Clone` `user_data` box, and
+    // every phase consumes a fresh user by value (`io_user`/`flush_user`).
+    reason: usize,
+    addr: i32,
+    timeout: std::time::Duration,
+    // Write inputs (`performOctetIO`/`performGPIBIO`, asynRecord.c:1470+).
+    octet_out: Vec<u8>,
+    octet_out_len: usize,
+    ofmt: i32,
+    i32out: i32,
+    ui32out: u32,
+    ui32mask: u32,
+    f64out: f64,
+    // Read inputs.
+    octet_buf_size: usize,
+    ifmt: i32,
+}
+
+/// The record fields `performIO` writes from the I/O results. Each `Some`
+/// is applied to the record on the completion re-entry; `None` leaves the
+/// field untouched (the phase did not run / produced no value).
+#[derive(Default)]
+struct IoOutcome {
+    nawt: Option<i32>,
+    eomr: Option<i32>,
+    nord: Option<i32>,
+    tinp: Option<String>,
+    ainp: Option<String>,
+    binp: Option<Vec<u8>>,
+    i32inp: Option<i32>,
+    ui32inp: Option<u32>,
+    f64inp: Option<f64>,
+    errs: Option<String>,
+}
+
+/// Build the per-transfer `asynUser` for a write/read phase. C `asynRecord.c`
+/// sets `pasynUser->timeout = precord->tmot` and the parameter reason/addr
+/// before every transfer. A fresh user per submit (the actor consumes it by
+/// value) and the plan's snapshot keep the off-thread orchestration off the
+/// record.
+fn io_user(plan: &IoPlan) -> AsynUser {
+    AsynUser::new(plan.reason)
+        .with_addr(plan.addr)
+        .with_timeout(plan.timeout)
+}
+
+/// Build the `asynUser` for a `Flush` phase. C `asynRecord.c` issues the flush
+/// with the same reason/addr but no transfer timeout.
+fn flush_user(plan: &IoPlan) -> AsynUser {
+    AsynUser::new(plan.reason).with_addr(plan.addr)
+}
+
+/// Build the write-phase `RequestOp` for an interface. C `performOctetIO`
+/// (asynRecord.c:1528-1546) suppresses the driver's output EOS for a binary
+/// write; `OctetWriteBinary` brackets that save/clear/restore in the actor.
+fn io_write_op(plan: &IoPlan) -> RequestOp {
+    match plan.iface {
+        InterfaceType::Octet => {
+            if plan.ofmt == ASYN_FMT_BINARY {
+                RequestOp::OctetWriteBinary {
+                    data: plan.octet_out.clone(),
+                }
+            } else {
+                RequestOp::OctetWrite {
+                    data: plan.octet_out.clone(),
+                }
+            }
+        }
+        InterfaceType::Int32 => RequestOp::Int32Write { value: plan.i32out },
+        InterfaceType::UInt32Digital => RequestOp::UInt32DigitalWrite {
+            value: plan.ui32out,
+            mask: plan.ui32mask,
+        },
+        InterfaceType::Float64 => RequestOp::Float64Write { value: plan.f64out },
+    }
+}
+
+/// Build the read-phase `RequestOp` for an interface. C `performOctetIO`
+/// (asynRecord.c:1564-1581) suppresses the driver's input EOS for a binary
+/// read; `OctetReadBinary` brackets that in the actor.
+fn io_read_op(plan: &IoPlan) -> RequestOp {
+    match plan.iface {
+        InterfaceType::Octet => {
+            if plan.ifmt == ASYN_FMT_BINARY {
+                RequestOp::OctetReadBinary {
+                    buf_size: plan.octet_buf_size,
+                }
+            } else {
+                RequestOp::OctetRead {
+                    buf_size: plan.octet_buf_size,
+                }
+            }
+        }
+        InterfaceType::Int32 => RequestOp::Int32Read,
+        InterfaceType::UInt32Digital => RequestOp::UInt32DigitalRead {
+            mask: plan.ui32mask,
+        },
+        InterfaceType::Float64 => RequestOp::Float64Read,
+    }
+}
+
+/// Record a write-phase result into the outcome — the C `performIO` write
+/// branch (asynRecord.c:1524-1556 octet, :1442-1453 register). A write
+/// failure reports `ERRS` but, like C, does not skip the read phase.
+fn record_write_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<RequestResult>) {
+    match res {
+        Ok(_) => {
+            if plan.iface == InterfaceType::Octet {
+                out.nawt = Some(plan.octet_out_len as i32);
+            }
+        }
+        Err(e) => out.errs = Some(format!("write: {e}")),
+    }
+}
+
+/// Record a read-phase result into the outcome — the C `performIO` read
+/// branch (asynRecord.c:1557-1631 octet, :1478-1527 register).
+fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<RequestResult>) {
+    match plan.iface {
+        InterfaceType::Octet => match res {
+            Ok(result) => {
+                out.eomr = Some(result.eom_reason as i32);
+                if let Some(data) = result.data {
+                    out.nord = Some(data.len() as i32);
+                    // C stores the device bytes into the single IFMT-selected
+                    // field (ASCII -> AINP, Binary/Hybrid -> BINP,
+                    // asynRecord.c:1503-1509) and posts TINP (escaped) for
+                    // every read mode.
+                    out.tinp = Some(crate::trace::format_io_data(&data, TraceIoMask::ESCAPE));
+                    if plan.ifmt == ASYN_FMT_ASCII {
+                        out.ainp = Some(String::from_utf8_lossy(&data).to_string());
+                    } else {
+                        out.binp = Some(data);
+                    }
+                }
+            }
+            Err(e) => out.errs = Some(format!("read: {e}")),
+        },
+        InterfaceType::Int32 => match res {
+            Ok(result) => match result.int_val {
+                Some(v) => out.i32inp = Some(v),
+                None => out.errs = Some("read: int32 read returned no value".to_string()),
+            },
+            Err(e) => out.errs = Some(format!("read: {e}")),
+        },
+        InterfaceType::UInt32Digital => match res {
+            Ok(result) => {
+                if let Some(v) = result.uint_val {
+                    out.ui32inp = Some(v);
+                }
+            }
+            Err(e) => out.errs = Some(format!("read: {e}")),
+        },
+        InterfaceType::Float64 => match res {
+            Ok(result) => match result.float_val {
+                Some(v) => out.f64inp = Some(v),
+                None => out.errs = Some("read: float64 read returned no value".to_string()),
+            },
+            Err(e) => out.errs = Some(format!("read: {e}")),
+        },
+    }
+}
+
+/// Run `performIO`'s write/read/flush phases off the scan thread against the
+/// port actor, threading the shared `CancelToken` so an `AQR`/`cancelRequest`
+/// (asynManager.c:1630) aborts a still-queued phase. Mirrors the synchronous
+/// [`AsynRecord::perform_io`] phase order; both feed
+/// [`AsynRecord::apply_io_outcome`], so the field mapping lives in one place.
+///
+/// A cancelled phase short-circuits with the C `cancelRequest` "I/O request
+/// canceled" message (asynRecord.c:398); other errors are recorded but, as in
+/// C `performIO`, do not skip the remaining phases.
+async fn run_io_plan(handle: PortHandle, plan: IoPlan, cancel: CancelToken) -> IoOutcome {
+    let mut out = IoOutcome::default();
+
+    if cancel.is_cancelled() {
+        out.errs = Some(CANCELED_MSG.to_string());
+        return out;
+    }
+
+    // Write phase.
+    if matches!(plan.tmod, TransferMode::Write | TransferMode::WriteRead) {
+        let res = handle
+            .submit_cancellable(io_write_op(&plan), io_user(&plan), cancel.clone())
+            .await;
+        if cancel.is_cancelled() {
+            out.errs = Some(CANCELED_MSG.to_string());
+            return out;
+        }
+        record_write_result(&plan, &mut out, res);
+    }
+
+    // Read phase.
+    if matches!(plan.tmod, TransferMode::Read | TransferMode::WriteRead) {
+        let res = handle
+            .submit_cancellable(io_read_op(&plan), io_user(&plan), cancel.clone())
+            .await;
+        if cancel.is_cancelled() {
+            out.errs = Some(CANCELED_MSG.to_string());
+            return out;
+        }
+        record_read_result(&plan, &mut out, res);
+    }
+
+    // Flush phase.
+    if matches!(plan.tmod, TransferMode::Flush) {
+        let res = handle
+            .submit_cancellable(RequestOp::Flush, flush_user(&plan), cancel.clone())
+            .await;
+        if cancel.is_cancelled() {
+            out.errs = Some(CANCELED_MSG.to_string());
+            return out;
+        }
+        if let Err(e) = res {
+            out.errs = Some(format!("flush: {e}"));
+        }
+    }
+
+    out
+}
+
+/// C `reportError(pasynRec, status, "I/O request canceled")` for a dequeued
+/// `AQR` request (asynRecord.c:398).
+const CANCELED_MSG: &str = "I/O request canceled";
 
 // ===== Field descriptor table =====
 
@@ -1300,21 +1570,6 @@ impl AsynRecord {
         }
     }
 
-    /// Build an `AsynUser` for an I/O transfer, applying the record's
-    /// `TMOT` timeout field. C `asynRecord.c` sets
-    /// `pasynUser->timeout = precord->tmot` before every transfer; a
-    /// non-positive `tmot` falls back to the 1 s default.
-    fn io_user(&self) -> crate::user::AsynUser {
-        let timeout = if self.tmot > 0.0 {
-            std::time::Duration::from_secs_f64(self.tmot)
-        } else {
-            std::time::Duration::from_secs(1)
-        };
-        crate::user::AsynUser::new(self.resolved_reason)
-            .with_addr(self.addr)
-            .with_timeout(timeout)
-    }
-
     /// Build the octet output payload by `OFMT`, mirroring
     /// `asynRecord.c:1486-1502`:
     ///   - ASCII  -> `dbTranslateEscape(AOUT)`: the AOUT string with escape
@@ -1347,6 +1602,89 @@ impl AsynRecord {
     }
 
     /// Perform I/O based on TMOD and IFACE.
+    /// Snapshot the record fields `performIO` reads into an [`IoPlan`] so the
+    /// I/O can run without touching the record (synchronously here, or off
+    /// the scan thread in [`run_io_plan`]).
+    fn build_io_plan(&self) -> IoPlan {
+        let octet_out = self.octet_output_buffer();
+        let octet_out_len = octet_out.len();
+        // Clamp against negative IMAX/NRRD — both are settable Long fields;
+        // a negative value sign-extends to a huge usize and would request a
+        // multi-GB buffer.
+        let imax = self.imax.max(0) as usize;
+        let octet_buf_size = if self.nrrd > 0 {
+            (self.nrrd as usize).min(imax)
+        } else {
+            imax
+        };
+        // C `asynRecord.c` sets `pasynUser->timeout = precord->tmot` before
+        // every transfer; a non-positive `tmot` falls back to the 1 s default.
+        let timeout = if self.tmot > 0.0 {
+            std::time::Duration::from_secs_f64(self.tmot)
+        } else {
+            std::time::Duration::from_secs(1)
+        };
+        IoPlan {
+            tmod: TransferMode::from_u16(self.tmod as u16),
+            iface: InterfaceType::from_u16(self.iface as u16),
+            reason: self.resolved_reason,
+            addr: self.addr,
+            timeout,
+            octet_out,
+            octet_out_len,
+            ofmt: self.ofmt,
+            i32out: self.i32out,
+            ui32out: self.ui32out,
+            ui32mask: self.ui32mask,
+            f64out: self.f64out,
+            octet_buf_size,
+            ifmt: self.ifmt,
+        }
+    }
+
+    /// Apply the results of a `performIO` cycle to the record's input/status
+    /// fields. Single owner of the result→field mapping (C `performIO`
+    /// stores into AINP/BINP/I32INP/.../NAWT/EOMR/NORD/ERRS); both the
+    /// synchronous [`Self::perform_io`] and the off-thread [`run_io_plan`]
+    /// feed it, so the mapping cannot drift between the two paths.
+    fn apply_io_outcome(&mut self, out: IoOutcome) {
+        if let Some(v) = out.nawt {
+            self.nawt = v;
+        }
+        if let Some(v) = out.eomr {
+            self.eomr = v;
+        }
+        if let Some(v) = out.nord {
+            self.nord = v;
+        }
+        if let Some(v) = out.tinp {
+            self.tinp = v;
+        }
+        if let Some(v) = out.ainp {
+            self.ainp = v;
+        }
+        if let Some(v) = out.binp {
+            self.binp = v;
+        }
+        if let Some(v) = out.i32inp {
+            self.i32inp = v;
+        }
+        if let Some(v) = out.ui32inp {
+            self.ui32inp = v;
+        }
+        if let Some(v) = out.f64inp {
+            self.f64inp = v;
+        }
+        if let Some(v) = out.errs {
+            self.errs = v;
+        }
+    }
+
+    /// Synchronous `performIO` — the C `process()` `canBlock==0` branch
+    /// (asynRecord.c:351-352) that runs the I/O inline rather than queuing
+    /// it. Shares the op builders and result recorders with the off-thread
+    /// [`run_io_plan`]; only the submit primitive differs (blocking here,
+    /// awaited there).
     fn perform_io(&mut self) -> CaResult<()> {
         let entry = match &self.port_entry {
             Some(e) => e.clone(),
@@ -1355,194 +1693,70 @@ impl AsynRecord {
                 return Ok(());
             }
         };
+        let plan = self.build_io_plan();
+        let mut out = IoOutcome::default();
 
-        let tmod = TransferMode::from_u16(self.tmod as u16);
-        let iface = InterfaceType::from_u16(self.iface as u16);
-
-        // Write phase
-        if matches!(tmod, TransferMode::Write | TransferMode::WriteRead) {
-            match iface {
-                InterfaceType::Octet => {
-                    let data = self.octet_output_buffer();
-                    let n = data.len();
-                    // C asynRecord.c:1528-1541: Binary output suppresses the
-                    // driver's output EOS for the raw write; ASCII/Hybrid keep
-                    // EOS active. The OctetWriteBinary op brackets the EOS
-                    // save/clear/restore inside the actor.
-                    let op = if self.ofmt == ASYN_FMT_BINARY {
-                        crate::request::RequestOp::OctetWriteBinary { data }
-                    } else {
-                        crate::request::RequestOp::OctetWrite { data }
-                    };
-                    match entry.handle.submit_blocking(op, self.io_user()) {
-                        Ok(_) => {
-                            self.nawt = n as i32;
-                        }
-                        Err(e) => {
-                            self.errs = format!("write: {e}");
-                        }
-                    }
-                }
-                InterfaceType::Int32 => {
-                    match entry.handle.submit_blocking(
-                        crate::request::RequestOp::Int32Write { value: self.i32out },
-                        self.io_user(),
-                    ) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            self.errs = format!("write: {e}");
-                        }
-                    }
-                }
-                InterfaceType::UInt32Digital => {
-                    match entry.handle.submit_blocking(
-                        crate::request::RequestOp::UInt32DigitalWrite {
-                            value: self.ui32out,
-                            mask: self.ui32mask,
-                        },
-                        self.io_user(),
-                    ) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            self.errs = format!("write: {e}");
-                        }
-                    }
-                }
-                InterfaceType::Float64 => {
-                    match entry.handle.submit_blocking(
-                        crate::request::RequestOp::Float64Write { value: self.f64out },
-                        self.io_user(),
-                    ) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            self.errs = format!("write: {e}");
-                        }
-                    }
-                }
+        if matches!(plan.tmod, TransferMode::Write | TransferMode::WriteRead) {
+            let res = entry
+                .handle
+                .submit_blocking(io_write_op(&plan), io_user(&plan));
+            record_write_result(&plan, &mut out, res);
+        }
+        if matches!(plan.tmod, TransferMode::Read | TransferMode::WriteRead) {
+            let res = entry
+                .handle
+                .submit_blocking(io_read_op(&plan), io_user(&plan));
+            record_read_result(&plan, &mut out, res);
+        }
+        if matches!(plan.tmod, TransferMode::Flush) {
+            if let Err(e) = entry
+                .handle
+                .submit_blocking(RequestOp::Flush, flush_user(&plan))
+            {
+                out.errs = Some(format!("flush: {e}"));
             }
         }
 
-        // Read phase
-        if matches!(tmod, TransferMode::Read | TransferMode::WriteRead) {
-            match iface {
-                InterfaceType::Octet => {
-                    // Clamp against negative IMAX/NRRD — both are settable
-                    // Long fields; a negative value sign-extends to a huge
-                    // usize and would request a multi-GB buffer.
-                    let imax = self.imax.max(0) as usize;
-                    let buf_size = if self.nrrd > 0 {
-                        (self.nrrd as usize).min(imax)
-                    } else {
-                        imax
-                    };
-                    // C asynRecord.c:1564-1577: Binary input suppresses the
-                    // driver's input EOS so a configured IEOS cannot stop the
-                    // read early or strip payload bytes; ASCII/Hybrid keep EOS
-                    // active. The OctetReadBinary op brackets the EOS
-                    // save/clear/restore inside the actor.
-                    let read_op = if self.ifmt == ASYN_FMT_BINARY {
-                        crate::request::RequestOp::OctetReadBinary { buf_size }
-                    } else {
-                        crate::request::RequestOp::OctetRead { buf_size }
-                    };
-                    match entry.handle.submit_blocking(read_op, self.io_user()) {
-                        Ok(result) => {
-                            // C asynRecord.c stores the driver's returned
-                            // EOM reason into EOMR after every octet read.
-                            self.eomr = result.eom_reason as i32;
-                            if let Some(data) = result.data {
-                                self.nord = data.len() as i32;
-                                // C asynRecord stores the device bytes into the
-                                // single IFMT-selected input field: ASCII -> AINP,
-                                // Binary/Hybrid -> the BINP byte buffer
-                                // (asynRecord.c:1503-1509); TINP is the escaped
-                                // textual view posted for every read mode, and the
-                                // monitor path posts only the selected field
-                                // (asynRecord.c:1012-1018,1627-1631). Writing both
-                                // AINP and BINP on every read makes clients watching
-                                // the unselected field see values Base never posts.
-                                self.tinp =
-                                    crate::trace::format_io_data(&data, TraceIoMask::ESCAPE);
-                                if self.ifmt == ASYN_FMT_ASCII {
-                                    self.ainp = String::from_utf8_lossy(&data).to_string();
-                                } else {
-                                    self.binp = data;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            self.errs = format!("read: {e}");
-                        }
-                    }
-                }
-                InterfaceType::Int32 => {
-                    match entry
-                        .handle
-                        .submit_blocking(crate::request::RequestOp::Int32Read, self.io_user())
-                    {
-                        Ok(result) => {
-                            if let Some(v) = result.int_val {
-                                self.i32inp = v;
-                            } else {
-                                self.errs = "read: int32 read returned no value".to_string();
-                            }
-                        }
-                        Err(e) => {
-                            self.errs = format!("read: {e}");
-                        }
-                    }
-                }
-                InterfaceType::UInt32Digital => {
-                    match entry.handle.submit_blocking(
-                        crate::request::RequestOp::UInt32DigitalRead {
-                            mask: self.ui32mask,
-                        },
-                        self.io_user(),
-                    ) {
-                        Ok(result) => {
-                            if let Some(v) = result.uint_val {
-                                self.ui32inp = v;
-                            }
-                        }
-                        Err(e) => {
-                            self.errs = format!("read: {e}");
-                        }
-                    }
-                }
-                InterfaceType::Float64 => {
-                    match entry
-                        .handle
-                        .submit_blocking(crate::request::RequestOp::Float64Read, self.io_user())
-                    {
-                        Ok(result) => {
-                            if let Some(v) = result.float_val {
-                                self.f64inp = v;
-                            } else {
-                                self.errs = "read: float64 read returned no value".to_string();
-                            }
-                        }
-                        Err(e) => {
-                            self.errs = format!("read: {e}");
-                        }
-                    }
-                }
-            }
-        }
-
-        // Flush
-        if matches!(tmod, TransferMode::Flush) {
-            match entry.handle.submit_blocking(
-                crate::request::RequestOp::Flush,
-                crate::user::AsynUser::new(self.resolved_reason).with_addr(self.addr),
-            ) {
-                Ok(_) => {}
-                Err(e) => {
-                    self.errs = format!("flush: {e}");
-                }
-            }
-        }
-
+        self.apply_io_outcome(out);
         Ok(())
+    }
+
+    /// Queue `performIO` to run off the scan thread (C `process()`
+    /// `canBlock!=0` branch, asynRecord.c:344-350). Submits the I/O to the
+    /// port actor non-blocking, then wires the actor completion to a fresh
+    /// async-record token so `process()` re-enters and applies the result —
+    /// the Rust analogue of `asynCallbackProcess` →
+    /// `callbackRequestProcessCallback` (asynRecord.c:808-831). Holds the
+    /// `state = stateIO` request in `io_inflight` and returns `AsyncPending`.
+    fn spawn_async_io(
+        &mut self,
+        handle: PortHandle,
+        name: String,
+        db: AsyncDbHandle,
+    ) -> ProcessOutcome {
+        let plan = self.build_io_plan();
+        let cancel = CancelToken::new();
+        let slot: Arc<Mutex<Option<IoOutcome>>> = Arc::new(Mutex::new(None));
+
+        let slot_task = slot.clone();
+        tokio::spawn(async move {
+            let outcome = run_io_plan(handle, plan, cancel).await;
+            *slot_task.lock().unwrap() = Some(outcome);
+            // Mint a fresh re-entry token (superseding any older one) wired
+            // to an already-fired completion, so the waiting record re-enters
+            // process() now and applies the result — same shape as sseq's
+            // force_finish_reentry / WAITn completion. A token whose record
+            // was meanwhile removed (mint `None`) or superseded by an AQR
+            // cancel re-enters nothing, by the generation gate.
+            if let Some(token) = db.mint_async_token(&name).await {
+                let (waitset, completion) = AsyncDbHandle::new_put_notify();
+                waitset.leave();
+                let _ = db.reprocess_on_notify(token, completion);
+            }
+        });
+
+        self.io_inflight = Some(IoInFlight { result: slot });
+        ProcessOutcome::async_pending()
     }
 }
 
@@ -1555,6 +1769,15 @@ impl Record for AsynRecord {
 
     fn field_list(&self) -> &'static [FieldDesc] {
         FIELD_LIST
+    }
+
+    /// Stash the canonical record name + a cycle-free database handle the
+    /// framework supplies at `add_record`. Enables the non-blocking
+    /// `process()` completion re-entry and the out-of-band trace post; a
+    /// record never built into a database keeps `None` and stays fully
+    /// synchronous.
+    fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
+        self.async_ctx = Some((name, db));
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -2176,13 +2399,25 @@ impl Record for AsynRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
+        // Completion re-entry of a non-blocking I/O cycle: the off-thread
+        // orchestration filled the result slot and fired the async-record
+        // token, re-entering here. This is C's `process()` `pact==TRUE`
+        // branch (asynRecord.c:362-363) — apply the I/O results the port
+        // thread produced and finish (`state = stateIdle`). Checked first so
+        // a completion never re-issues I/O.
+        if let Some(inflight) = self.io_inflight.take() {
+            let outcome = inflight.result.lock().unwrap().take().unwrap_or_default();
+            self.apply_io_outcome(outcome);
+            return Ok(ProcessOutcome::complete());
+        }
+
         // Re-import the trace masks if an external `setTrace*` fired since
         // the last cycle. C refreshes these readback fields from its
-        // `exceptCallback` immediately (asynRecord.c:903-917); epics-rs
-        // cannot mutate the record from the async callback, so the
-        // subscription (`register_trace_exception_callback`) only flags
-        // the change and the re-import happens here through the single
-        // `read_trace_state` owner.
+        // `exceptCallback` immediately (asynRecord.c:903-917); when the
+        // record carries no live database handle the async callback cannot
+        // post, so the subscription (`register_trace_exception_callback`)
+        // also flags the change and the re-import happens here through the
+        // single `read_trace_state` owner.
         if self.trace_status_dirty.swap(false, Ordering::AcqRel) {
             self.read_trace_state();
         }
@@ -2222,6 +2457,23 @@ impl Record for AsynRecord {
         }
 
         self.errs.clear();
+
+        // C `process()` (asynRecord.c:342-353) queues `performIO`, then
+        // `canBlock(&yesNo)`: a blocking port runs the I/O on the port
+        // thread (`pact = TRUE; return`) and the record completes on the
+        // callback re-process; a non-blocking port runs it inline (`goto
+        // done`). Mirror that split — a `can_block` port with a live
+        // database handle submits the I/O off the scan thread and re-enters
+        // on completion; everything else (non-blocking port, or a record
+        // not built into a database) keeps the synchronous inline path.
+        let blocking_handle = self
+            .port_entry
+            .as_ref()
+            .and_then(|e| e.handle.can_block().then(|| e.handle.clone()));
+        if let (Some(handle), Some((name, db))) = (blocking_handle, self.async_ctx.clone()) {
+            return Ok(self.spawn_async_io(handle, name, db));
+        }
+
         self.perform_io()?;
         Ok(ProcessOutcome::complete())
     }
@@ -2891,5 +3143,105 @@ mod tests {
             "re-opening a trace file must append, not truncate"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Minimal `can_block` port whose Int32 parameter 0 holds a known value,
+    /// backed by a real [`PortActor`] thread — the off-thread orchestration
+    /// submits against it exactly as a production blocking driver.
+    fn canblock_int32_entry(value: i32) -> super::registry::PortEntry {
+        use crate::interrupt::InterruptManager;
+        use crate::param::ParamType;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::trace::TraceManager;
+        use tokio::sync::mpsc;
+
+        struct ReadDriver {
+            base: PortDriverBase,
+        }
+        impl PortDriver for ReadDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+
+        let mut base = PortDriverBase::new("ASYNIO", 1, PortFlags::default());
+        let val = base.create_param("VAL", ParamType::Int32).unwrap();
+        base.set_int32_param(val, 0, value).unwrap();
+
+        let (tx, rx) = mpsc::channel(16);
+        let actor = PortActor::new(Box::new(ReadDriver { base }), rx);
+        std::thread::Builder::new()
+            .name("asynio-test-actor".into())
+            .spawn(move || actor.run())
+            .unwrap();
+
+        let mut handle = PortHandle::new(tx, "ASYNIO".into(), Arc::new(InterruptManager::new(16)));
+        handle.set_can_block(true);
+        super::registry::PortEntry {
+            handle,
+            trace: Arc::new(TraceManager::new()),
+        }
+    }
+
+    /// Boundary: a `can_block` port with a live async context defers `performIO`
+    /// off the scan thread (C `process()` `canBlock` branch, asynRecord.c:344-350)
+    /// — `process()` returns `AsyncPending` without the I/O result, and the
+    /// completion re-entry (C `pact==TRUE`, asynRecord.c:362-363) applies it.
+    #[tokio::test]
+    async fn nonblocking_canblock_port_defers_then_applies_on_reentry() {
+        use epics_base_rs::server::database::PvDatabase;
+
+        let mut rec = AsynRecord::default();
+        rec.port_entry = Some(canblock_int32_entry(7));
+        rec.tmod = TransferMode::Read as i32;
+        rec.iface = InterfaceType::Int32 as i32;
+        rec.resolved_reason = 0;
+
+        // A live database handle whose record set does NOT contain this record:
+        // the orchestration's re-entry token resolves to nothing, so the test
+        // drives the completion re-entry itself, isolating the apply path.
+        let db = PvDatabase::new();
+        rec.async_ctx = Some(("ASYNIO_REC".to_string(), db.async_handle()));
+
+        // Pass 1: submitted off-thread, parked — no inline I/O result.
+        let out = rec.process().unwrap();
+        assert_eq!(
+            out.result,
+            RecordProcessResult::AsyncPending,
+            "a can_block port with async context must defer, not run inline"
+        );
+        assert!(
+            rec.io_inflight.is_some(),
+            "the deferred request is held in io_inflight until completion"
+        );
+        assert_eq!(
+            rec.i32inp, 0,
+            "the scan thread returned before the read value landed"
+        );
+
+        // The off-thread orchestration fills the shared result slot.
+        let slot = rec.io_inflight.as_ref().unwrap().result.clone();
+        let mut filled = false;
+        for _ in 0..2000 {
+            if slot.lock().unwrap().is_some() {
+                filled = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(filled, "the orchestration must fill the result slot");
+
+        // Pass 2: completion re-entry applies the read value and finishes.
+        let out2 = rec.process().unwrap();
+        assert_eq!(out2.result, RecordProcessResult::Complete);
+        assert!(
+            rec.io_inflight.is_none(),
+            "completion re-entry clears the in-flight slot"
+        );
+        assert_eq!(rec.i32inp, 7, "the read value is applied on re-entry");
     }
 }

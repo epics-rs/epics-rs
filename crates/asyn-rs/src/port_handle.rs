@@ -184,8 +184,29 @@ impl PortHandle {
     /// Waits for channel space and returns the
     /// actor's reply. Use this for operations where delivery must be guaranteed.
     pub async fn submit_async(&self, op: RequestOp, user: AsynUser) -> AsynResult<RequestResult> {
+        self.submit_cancellable(op, user, CancelToken::new()).await
+    }
+
+    /// Submit a cancellable request and await completion, threading a
+    /// caller-owned [`CancelToken`].
+    ///
+    /// C parity: `asynManager::queueRequest` (`asynManager.c:1514`) enqueues
+    /// the request on the port thread and the caller's callback runs later;
+    /// `asynManager::cancelRequest` (`asynManager.c:1630`) removes a request
+    /// that is still queued. A caller that may need to abort the request
+    /// (asynRecord `AQR`, `asynRecord.c:393-408`) keeps the token and calls
+    /// [`CancelToken::cancel`]; the actor drops a still-queued message at its
+    /// cancel check. Unlike [`Self::submit_async`] (which mints a throwaway
+    /// token) the token belongs to the caller, so the same token both arms
+    /// and later cancels the request.
+    pub async fn submit_cancellable(
+        &self,
+        op: RequestOp,
+        user: AsynUser,
+        cancel: CancelToken,
+    ) -> AsynResult<RequestResult> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        let msg = ActorMessage::new(op, user, CancelToken::new(), reply_tx);
+        let msg = ActorMessage::new(op, user, cancel, reply_tx);
         self.tx.send(msg).await.map_err(|_| AsynError::Status {
             status: AsynStatus::Error,
             message: format!("actor channel closed for port {}", self.port_name),

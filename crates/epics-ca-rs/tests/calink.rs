@@ -177,7 +177,7 @@ async fn record_with_ca_inp_link_reads_remote_value() {
     );
 }
 
-/// Regression R0604-CALINK-CP-NO-PROCESS-1 — a Passive `ai` holder
+/// A Passive `ai` holder
 /// whose INP is a `CP` CA link MUST process (and read the new value into
 /// VAL) on every remote change, driven solely by the calink monitor
 /// callback — never by an explicit `process_record` call.
@@ -231,8 +231,8 @@ async fn ca_cp_holder_processes_on_remote_change() {
     }
 
     // Production wiring: installs the `ca` lset AND attaches the db so
-    // the monitor callback can dispatch CP holders (the
-    // R0604-CALINK-CP-NO-PROCESS-1 fix). Uses its own client, which picks
+    // the monitor callback can dispatch CP holders (this
+    // fix). Uses its own client, which picks
     // up the pinned env set above.
     let _resolver = install_calink_resolver(&db, tokio::runtime::Handle::current()).await;
 
@@ -572,7 +572,7 @@ fn ca_modifier_link_classifies_as_ca() {
     );
 }
 
-/// Regression R0604-CALINK-NOT-DEFAULT-WIRED-1 — the calink `ca` link set
+/// The calink `ca` link set
 /// must install at the base `AfterCaLinkInit` seam (BEFORE `setup_cp_links`)
 /// when an IOC is built with
 /// [`IocApplication::register_link_set_installer`], so a Passive CP holder

@@ -46,7 +46,6 @@ struct Args {
 }
 
 /// `cainfo.c:167-173` `sscanf(optarg, "%u", &statLevel)` parity.
-/// Regression R0604-CAINFO-STATLEVEL-SIGNED-1.
 ///
 /// C `%u` skips leading whitespace, accepts an OPTIONAL sign (`+`/`-`),
 /// then reads a decimal-digit run, stopping at the first non-digit. With
@@ -252,7 +251,7 @@ mod tests {
         assert_eq!(parse_stat_level(""), 0);
     }
 
-    // Regression R0604-CAINFO-STATLEVEL-SIGNED-1: C `%u` accepts an
+    // C `%u` accepts an
     // optional sign before the digit run, with unsigned wrapping. The
     // earlier digit-only parser returned 0 for these and wrongly chose
     // normal per-PV mode where C selects ca_client_status mode.

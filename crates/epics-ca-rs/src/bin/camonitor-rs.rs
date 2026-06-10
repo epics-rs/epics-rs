@@ -352,7 +352,7 @@ async fn monitor_pv(
     // so the monitor delivers labels. C `camonitor.c:162-166` requests
     // DBR_TIME_STRING for a FLOAT/DOUBLE field under `-s` so the server
     // renders it to a string. The ENUM case takes precedence over the float
-    // case (C `if/else if`). Regression R0604-CACLI-ENUM-NUMERIC-READBACK-1.
+    // case (C `if/else if`).
     let enum_readback = if fmt.enum_as_number {
         EnumReadback::Numeric
     } else {
@@ -783,7 +783,7 @@ mod tests {
         );
     }
 
-    /// CA-RS-2026-05-28-12: a BACKWARD server-stamp step must render a
+    /// A BACKWARD server-stamp step must render a
     /// NEGATIVE signed delta (C `epicsTimeDiffInSeconds` = pLeft - pRight,
     /// epicsTime.cpp:417-431). The previous magnitude-only formatting hid
     /// exactly the non-monotonic condition `-t si` is used to detect.

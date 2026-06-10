@@ -112,7 +112,7 @@ pub fn enum_cli_readback_dbr(native: DbFieldType, enum_as_number: bool) -> Optio
 /// plain library/gateway subscribe and `camonitor -n` BOTH passed `false`,
 /// yet the former must keep the native ENUM index while the latter must
 /// request `DBR_TIME_INT`. Disambiguating them by a runtime flag was the
-/// dual-meaning defect (R0604-CACLI-ENUM-NUMERIC-READBACK-1); a sum type
+/// dual-meaning defect; a sum type
 /// makes the three modes explicit at every call site and the illegal
 /// "native-vs-numeric on the same `false`" combination unrepresentable:
 ///
@@ -4651,7 +4651,7 @@ mod enum_readback_tests {
         }
     }
 
-    // Regression R0604-CACLI-ENUM-NUMERIC-READBACK-1: the caget/camonitor
+    // The caget/camonitor
     // ENUM substitution always replaces native ENUM (C `caget.c:177-181` /
     // `camonitor.c:156-162`): `-n` → DBR_TIME_INT, otherwise DBR_TIME_STRING.
     // Both branches are TIME class regardless of output mode; non-ENUM is
@@ -4697,7 +4697,6 @@ mod enum_readback_tests {
         // regardless of float_as_string (ENUM is not a float kind). C
         // `camonitor.c:158` `if (enumAsNr) ppv->dbrType = DBR_TIME_INT` — an
         // ENUM is never left on the native DBR_TIME_ENUM type under `-n`.
-        // Regression R0604-CACLI-ENUM-NUMERIC-READBACK-1.
         assert_eq!(
             subscription_readback_dbr(DbFieldType::Enum, EnumReadback::Numeric, true),
             DBR_TIME_INT
@@ -4706,8 +4705,7 @@ mod enum_readback_tests {
         // native ENUM TIME type — NOT substituted to INT/STRING — even when
         // float_as_string is set. This is the library contract the bool
         // `enum_as_string=false` conflated with `-n`: a sum type keeps
-        // Native distinct from Numeric. Regression
-        // R0604-CACLI-ENUM-NUMERIC-READBACK-1.
+        // Native distinct from Numeric.
         assert_eq!(
             subscription_readback_dbr(DbFieldType::Enum, EnumReadback::Native, true),
             DbFieldType::Enum.time_dbr_type()

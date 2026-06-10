@@ -309,7 +309,6 @@ async fn ca_fr_8_arr_on_scalar_channel_is_noop() {
     }
 }
 
-/// Regression R0604-CASRV-FILTER-FAILOPEN-1.
 /// A malformed / unknown / bad-config filter suffix must REJECT the
 /// channel at `CA_PROTO_CREATE_CHAN` (CREATE_CH_FAIL), matching EPICS
 /// `dbChannelCreate()` → `chf_parse()` failure deleting the channel and

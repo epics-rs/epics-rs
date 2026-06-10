@@ -481,8 +481,6 @@ enum FatalReadback {
 /// `Disconnected`/`Shutdown` as fatal; every other readback error is
 /// non-fatal (echo the submitted value, exit `0`), matching C's exit code.
 /// Returns `None` for the non-fatal case.
-///
-/// Regression R0604-CAPUT-POSTPUT-READBACK-STATUS-1.
 fn postput_read_fatal(err: &CaError) -> Option<FatalReadback> {
     match err {
         CaError::Timeout => Some(FatalReadback::Timeout),
@@ -882,7 +880,7 @@ mod tests {
         assert!(a.long_string && !a.array_mode, "-S alone → long string");
     }
 
-    /// Regression R0604-CAPUT-POSTPUT-READBACK-STATUS-1: the post-put readback
+    /// The post-put readback
     /// status must follow C `caput`'s exit-code contract — a read TIMEOUT and a
     /// total DISCONNECT fail the command (C `caget` returns ECA_TIMEOUT /
     /// `!nConn` returns 1, caput.c:181,186-188), while a synchronously-failed

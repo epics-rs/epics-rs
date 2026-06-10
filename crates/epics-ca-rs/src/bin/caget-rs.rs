@@ -348,7 +348,7 @@ fn dbr_text(code: u16) -> &'static str {
 ///
 /// Numeric limit formatting follows the C macros' spirit (`%8d` for
 /// integer classes, `%g` for float/double) but exact `sprint_long`/`%g`
-/// byte-parity is the separate concern of CA-RS-2026-05-28-11.
+/// byte-parity is a separate concern.
 fn dbr_extended_str(req_type: u16, snap: &Snapshot) -> String {
     if req_type <= 6 {
         return String::new();
@@ -366,7 +366,7 @@ fn dbr_extended_str(req_type: u16, snap: &Snapshot) -> String {
         // `tool_lib.c:350-352` routes DBR_GR_STRING and DBR_CTRL_STRING
         // through the DBR_STS_STRING arm (`PRN_DBR_STS`), so they carry no
         // units, precision, or display/control limits — unlike the numeric
-        // GR/CTRL types below. Regression R0604-CAGET-SPECDBR-GR-CTRL-STRING-1.
+        // GR/CTRL types below.
         7..=13 | 21 | 28 => sts,
         // TIME_* (14..=20): timestamp then status + severity.
         14..=20 => format!(
@@ -396,7 +396,7 @@ fn dbr_extended_str(req_type: u16, snap: &Snapshot) -> String {
         // by the arms above, so this arm lists only the numeric members,
         // mirroring the C `dbr2str` switch's per-type cases instead of a
         // broad `21..=34` range that fabricated a limit block for the two
-        // string types. Regression R0604-CAGET-SPECDBR-GR-CTRL-STRING-1.
+        // string types.
         22 | 23 | 25 | 26 | 27 | 29 | 30 | 32 | 33 | 34 => {
             let is_ctrl = req_type >= 28;
             let is_float = matches!(req_type, 23 | 27 | 30 | 34); // GR/CTRL FLOAT/DOUBLE
@@ -636,7 +636,6 @@ async fn main() {
             // callback path (`-c`) sends a count-0 autosize request so a
             // dynamic waveform returns its current NORD, while the
             // synchronous path requests the full native count.
-            // Regression R0604-CAGET-CALLBACK-AUTOSIZE-1.
             let native = ch.element_count().unwrap_or(0);
             let req_count = caget_req_count(callback, max_elements, native);
             // C `caget.c:172-187`: the request DBR type depends on the
@@ -670,7 +669,6 @@ async fn main() {
                 // FLOAT/DOUBLE field is read back as DBR_TIME_STRING so the
                 // SERVER converts it. Both substitutions are TIME class; the
                 // value-only output modes below just take `snap.value`.
-                // Regression R0604-CACLI-ENUM-NUMERIC-READBACK-1.
                 let nt = ch.native_field_type().ok();
                 let sub_dbr = nt
                     .and_then(|nt| enum_cli_readback_dbr(nt, enum_as_number))
@@ -930,7 +928,7 @@ mod tests {
         resolve_output_mode(&m)
     }
 
-    /// Regression R0604-CAGET-CALLBACK-AUTOSIZE-1: `caget -c` (callback,
+    /// `caget -c` (callback,
     /// `ca_array_get_callback`) must send the CA autosize request (count 0)
     /// when no positive `-#` is given, so a dynamic waveform returns its
     /// current `NORD`; the synchronous path (no `-c`, `ca_array_get`)
@@ -1087,7 +1085,7 @@ mod tests {
         assert!(es.contains("[ 1] ON"), "{es}");
     }
 
-    // Regression R0604-CAGET-SPECDBR-GR-CTRL-STRING-1: C `tool_lib.c:350-352`
+    // C `tool_lib.c:350-352`
     // marks DBR_GR_STRING (21) and DBR_CTRL_STRING (28) "not implemented" and
     // routes them through the DBR_STS_STRING arm (`PRN_DBR_STS`), so
     // `caget -d DBR_GR_STRING` / `-d DBR_CTRL_STRING` print only Status +

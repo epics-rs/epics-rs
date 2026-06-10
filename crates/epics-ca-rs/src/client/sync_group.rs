@@ -300,7 +300,7 @@ mod tests {
         assert_eq!(r.gets.len(), 1);
     }
 
-    /// C parity (CA-RS-2026-05-28-16): `block` discards the batch on the
+    /// C parity: `block` discards the batch on the
     /// timeout return path, just like a successful return. After
     /// `block(short)` returns `Timeout`, the group is already empty —
     /// `test() == Done`, `stat().outstanding == 0`, no explicit `reset`

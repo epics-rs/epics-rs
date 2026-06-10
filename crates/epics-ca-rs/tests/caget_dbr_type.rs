@@ -162,7 +162,7 @@ async fn enum_native_readback_is_numeric_index() {
 /// an ENUM field — `DBR_TIME_INT` (C `caget.c:180` /  `camonitor.c:158`
 /// `if (enumAsNr) dbrType = DBR_TIME_INT`) — must round-trip the numeric
 /// index from the server, not fall through to native `DBR_TIME_ENUM`.
-/// `bi` VAL=1 → short `1`. Regression R0604-CACLI-ENUM-NUMERIC-READBACK-1.
+/// `bi` VAL=1 → short `1`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn enum_numeric_readback_via_time_int() {
@@ -237,8 +237,7 @@ async fn enum_monitor_native_delivers_index() {
 /// ppv->dbrType = DBR_TIME_INT`. This is the subscribe-path companion to
 /// the GET-path `enum_numeric_readback_via_time_int`, exercising the full
 /// `subscribe_with_mask_readback_count` → coordinator →
-/// `subscription_readback_dbr` chain. Regression
-/// R0604-CACLI-ENUM-NUMERIC-READBACK-1.
+/// `subscription_readback_dbr` chain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn enum_monitor_numeric_delivers_index() {

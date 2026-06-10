@@ -454,6 +454,13 @@ impl Default for AsynRecord {
 
 /// A non-blocking port request that is queued / in flight.
 struct IoInFlight {
+    /// Shared with the orchestration task. Cancelling it makes the actor drop
+    /// the request at its cancel check (a still-queued phase is removed,
+    /// C `cancelRequest` `wasQueued==true`, asynManager.c:1630-1666), so
+    /// `run_io_plan` records the `AQR` "I/O request canceled" outcome. An
+    /// `AQR` write (asynRecord.c:393-408) sets this; the completion re-entry
+    /// then applies the cancel and finishes the record.
+    cancel: CancelToken,
     /// The orchestration writes the completed `IoOutcome` here before it
     /// fires the re-entry, so the completion `process()` can apply it.
     result: Arc<Mutex<Option<IoOutcome>>>,
@@ -1738,9 +1745,10 @@ impl AsynRecord {
         let cancel = CancelToken::new();
         let slot: Arc<Mutex<Option<IoOutcome>>> = Arc::new(Mutex::new(None));
 
+        let cancel_task = cancel.clone();
         let slot_task = slot.clone();
         tokio::spawn(async move {
-            let outcome = run_io_plan(handle, plan, cancel).await;
+            let outcome = run_io_plan(handle, plan, cancel_task).await;
             *slot_task.lock().unwrap() = Some(outcome);
             // Mint a fresh re-entry token (superseding any older one) wired
             // to an already-fired completion, so the waiting record re-enters
@@ -1755,7 +1763,10 @@ impl AsynRecord {
             }
         });
 
-        self.io_inflight = Some(IoInFlight { result: slot });
+        self.io_inflight = Some(IoInFlight {
+            cancel,
+            result: slot,
+        });
         ProcessOutcome::async_pending()
     }
 }
@@ -2339,22 +2350,35 @@ impl Record for AsynRecord {
             // --- AQR (Abort Queue Request) ---
             //
             // C special() for AQR (asynRecord.c:393-408) calls
-            // pasynManager->cancelRequest; only when a request was
-            // actually dequeued does it report "I/O request canceled",
-            // raise STATE_ALARM/MAJOR_ALARM and force a completion
-            // callback. In every case it then sets state = stateIdle.
+            // pasynManager->cancelRequest(pasynUser, &wasQueued); only when a
+            // request was still queued and is removed (cancelRequest
+            // `wasQueued==true`, asynManager.c:1661-1666) does it report
+            // "I/O request canceled", raise STATE_ALARM/MAJOR_ALARM and force
+            // a completion callback. In every case it then sets
+            // state = stateIdle.
             //
-            // This record's I/O is synchronous (perform_io ->
-            // submit_blocking), so the record stays locked for the whole
-            // transfer: an AQR write cannot arrive while one of this
-            // record's requests is queued or in flight. C's
-            // `wasQueued == true` branch is therefore unreachable here,
-            // and the reachable `wasQueued == false` case is exactly this
-            // idle no-op (no error, no alarm, no callback). Cancelling a
-            // live transfer would require async (PACT) record processing
-            // that returns immediately and holds the actor CancelToken;
-            // that completion framework lives in epics-base-rs.
-            "AQR" => {}
+            // When this record runs performIO off the scan thread (a
+            // can_block port, see `spawn_async_io`), `io_inflight` holds the
+            // request's actor CancelToken. Cancelling it makes the actor drop
+            // a still-queued phase at its cancel check — the `wasQueued==true`
+            // analogue — so `run_io_plan` records the "I/O request canceled"
+            // outcome (CANCELED_MSG). The completion re-entry is the single
+            // owner that applies that outcome to ERRS and clears `io_inflight`
+            // (the `state = stateIdle` transition), so AQR must NOT touch
+            // `io_inflight` or supersede the re-entry token here: the
+            // completion token is minted post-I/O and is always current
+            // (mint advances the generation), so `cancel_async_reentry` could
+            // only strand the record by racing the mint, never suppress it.
+            // STATE_ALARM/MAJOR_ALARM is not modeled (this record reports I/O
+            // errors via ERRS only, like its octet path).
+            //
+            // With no request in flight (synchronous port, or already
+            // completed) AQR is the C `wasQueued==false` idle no-op.
+            "AQR" => {
+                if let Some(inflight) = &self.io_inflight {
+                    inflight.cancel.cancel();
+                }
+            }
 
             // --- EOS (end-of-string) delimiters ---
             //
@@ -3243,5 +3267,130 @@ mod tests {
             "completion re-entry clears the in-flight slot"
         );
         assert_eq!(rec.i32inp, 7, "the read value is applied on re-entry");
+    }
+
+    /// Boundary: `AQR` (Abort Queue Request) cancels an in-flight off-thread
+    /// request. C `special()` for `AQR` (asynRecord.c:393-408) calls
+    /// `cancelRequest`; a request that was still queued is removed
+    /// (`wasQueued==true`, asynManager.c:1661-1666), reported as "I/O request
+    /// canceled" with the record left idle. Here the read is parked in the
+    /// driver while `AQR` cancels the request's actor token — the completion
+    /// re-entry then applies CANCELED, not the device value.
+    #[tokio::test]
+    async fn aqr_cancels_inflight_request_and_reports_canceled() {
+        use crate::interrupt::InterruptManager;
+        use crate::param::ParamType;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::trace::TraceManager;
+        use epics_base_rs::server::database::PvDatabase;
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicBool;
+        use tokio::sync::mpsc;
+
+        // A can_block port whose Int32 read parks on a barrier until released,
+        // signalling when it has entered the driver so the test can cancel
+        // mid-flight.
+        struct BlockingReadDriver {
+            base: PortDriverBase,
+            value: i32,
+            entered: Arc<AtomicBool>,
+            release: Arc<Barrier>,
+        }
+        impl PortDriver for BlockingReadDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn read_int32(&mut self, _user: &AsynUser) -> AsynResult<i32> {
+                self.entered.store(true, Ordering::SeqCst);
+                self.release.wait();
+                Ok(self.value)
+            }
+        }
+
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(Barrier::new(2));
+        let mut base = PortDriverBase::new("ASYNAQR", 1, PortFlags::default());
+        base.create_param("VAL", ParamType::Int32).unwrap();
+        let driver = BlockingReadDriver {
+            base,
+            value: 7,
+            entered: entered.clone(),
+            release: release.clone(),
+        };
+
+        let (tx, rx) = mpsc::channel(16);
+        let actor = PortActor::new(Box::new(driver), rx);
+        std::thread::Builder::new()
+            .name("asynaqr-test-actor".into())
+            .spawn(move || actor.run())
+            .unwrap();
+        let mut handle = PortHandle::new(tx, "ASYNAQR".into(), Arc::new(InterruptManager::new(16)));
+        handle.set_can_block(true);
+        let entry = super::registry::PortEntry {
+            handle,
+            trace: Arc::new(TraceManager::new()),
+        };
+
+        let mut rec = AsynRecord::default();
+        rec.port_entry = Some(entry);
+        rec.tmod = TransferMode::Read as i32;
+        rec.iface = InterfaceType::Int32 as i32;
+        rec.resolved_reason = 0;
+        let db = PvDatabase::new();
+        rec.async_ctx = Some(("ASYNAQR_REC".to_string(), db.async_handle()));
+
+        // No request in flight yet: AQR is the C `wasQueued==false` no-op.
+        rec.special("AQR", true).unwrap();
+        assert!(rec.errs.is_empty(), "AQR with no in-flight request is idle");
+
+        // Submit off-thread, then wait until the read is parked in the driver.
+        let out = rec.process().unwrap();
+        assert_eq!(out.result, RecordProcessResult::AsyncPending);
+        for _ in 0..2000 {
+            if entered.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            entered.load(Ordering::SeqCst),
+            "the off-thread read must reach the driver before AQR"
+        );
+
+        // AQR cancels the in-flight request's actor token, then release the
+        // parked read so the phase completes and the orchestration finishes.
+        rec.special("AQR", true).unwrap();
+        release.wait();
+
+        let slot = rec.io_inflight.as_ref().unwrap().result.clone();
+        let mut filled = false;
+        for _ in 0..2000 {
+            if slot.lock().unwrap().is_some() {
+                filled = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            filled,
+            "the cancelled request must still produce an outcome"
+        );
+
+        // Completion re-entry applies CANCELED, not the device value.
+        let out2 = rec.process().unwrap();
+        assert_eq!(out2.result, RecordProcessResult::Complete);
+        assert!(rec.io_inflight.is_none(), "AQR leaves the record idle");
+        assert_eq!(
+            rec.errs, "I/O request canceled",
+            "a cancelled in-flight request reports the C AQR message"
+        );
+        assert_eq!(
+            rec.i32inp, 0,
+            "the device read value is discarded when the request is cancelled"
+        );
     }
 }

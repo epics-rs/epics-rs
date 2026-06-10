@@ -25,6 +25,11 @@ const SSEQ_LNKV_CHOICES: &[&str] = &["Ext PV NC", "Ext PV OK", "Local PV", "Cons
 
 const NUM_STEPS: usize = 10;
 
+/// `SELM` menu indices (C `menu(sseqSELM)`): the step-selection mode.
+const SELM_ALL: i16 = 0;
+const SELM_SPECIFIED: i16 = 1;
+const SELM_MASK: i16 = 2;
+
 /// Per-step field-name tables (1-based suffix `1`..`9`, `A`), used to
 /// address `DOLn`/`DOn`/`LNKn`/`WTGn` as the `&'static str` link/target
 /// fields a [`ProcessAction`] carries.
@@ -99,6 +104,11 @@ pub struct SseqRecord {
     pub abort: i16,
     pub busy: i16,
     aborting: i16,
+    /// Set when `start_sequence` rejected the selection (C `process`
+    /// `SELM=Specified` with `SELN>10`, or an invalid `SELM` option):
+    /// the next `check_alarms` raises `SOFT_ALARM/INVALID`, mirroring C
+    /// `recGblSetSevr(pR,SOFT_ALARM,INVALID_ALARM)` before `asyncFinish`.
+    selm_invalid: bool,
     phase: SeqPhase,
     active: Vec<usize>,
     cursor: usize,
@@ -121,6 +131,7 @@ impl Default for SseqRecord {
             abort: 0,
             busy: 0,
             aborting: 0,
+            selm_invalid: false,
             phase: SeqPhase::Idle,
             active: Vec::new(),
             cursor: 0,
@@ -230,7 +241,37 @@ impl SseqRecord {
     /// `!pact` branch). Returns the first step's scheduling outcome, or a
     /// `Complete` (running the forward link) when nothing is selected.
     fn start_sequence(&mut self, live: &mut Vec<(String, EpicsValue)>) -> ProcessOutcome {
-        // C `process` clears every `waiting` flag before building the list.
+        // C `process` (sseqRecord.c:302-305) raises `busy` at the top of a
+        // start, before the selection is resolved — so an invalid selection
+        // posts the same `busy` 1→0 transition C does.
+        if self.busy == 0 {
+            self.busy = 1;
+            live.push(("BUSY".to_string(), EpicsValue::Short(1)));
+        }
+        // C `process` (sseqRecord.c:318-335): resolve the selection. With
+        // `SELM=Specified` an out-of-range `SELN` (> the 10 steps) is an
+        // error — `recGblSetSevr(pR,SOFT_ALARM,INVALID_ALARM)` then
+        // `asyncFinish`. `SELN==0` selects nothing WITHOUT an alarm (the
+        // empty-active path below). An unknown `SELM` option alarms the
+        // same way. `SELM=All`/`Mask` never raise the selection alarm.
+        self.selm_invalid = false;
+        match self.selm {
+            x if x == SELM_ALL || x == SELM_MASK => {}
+            x if x == SELM_SPECIFIED => {
+                if self.seln > NUM_STEPS as u16 {
+                    self.selm_invalid = true;
+                    self.finish(live);
+                    return ProcessOutcome::complete();
+                }
+            }
+            _ => {
+                self.selm_invalid = true;
+                self.finish(live);
+                return ProcessOutcome::complete();
+            }
+        }
+        // C `process` (sseqRecord.c:338-344) clears every `waiting` flag
+        // before building the list.
         for i in 0..NUM_STEPS {
             if self.steps[i].waiting {
                 self.steps[i].waiting = false;
@@ -247,13 +288,10 @@ impl SseqRecord {
             .collect();
         self.cursor = 0;
         if self.active.is_empty() {
-            // C `asyncFinish` runs `recGblFwdLink` even with nothing to do;
-            // `busy` was never raised, so leave it untouched (no churn).
+            // Nothing selected (C `asyncFinish` still runs `recGblFwdLink`).
             self.finish(live);
             return ProcessOutcome::complete();
         }
-        self.busy = 1;
-        live.push(("BUSY".to_string(), EpicsValue::Short(1)));
         self.schedule_current_step(live)
     }
 
@@ -554,6 +592,21 @@ impl Record for SseqRecord {
 
     fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
         self.async_ctx = Some((name, db));
+    }
+
+    fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        // C `process` raises `recGblSetSevr(pR,SOFT_ALARM,INVALID_ALARM)` for
+        // a bad `SELM`/`SELN` selection just before `asyncFinish`
+        // (sseqRecord.c:321,333). `start_sequence` flagged it; raise it here,
+        // in the framework `checkAlarms` hook, so it accumulates into
+        // `nsta`/`nsev` like every other record alarm.
+        if self.selm_invalid {
+            crate::server::recgbl::rec_gbl_set_sevr(
+                common,
+                crate::server::recgbl::alarm_status::SOFT_ALARM,
+                crate::server::record::AlarmSeverity::Invalid,
+            );
+        }
     }
 
     // `SseqRecord` does NOT implement `Record::multi_output_links`: the

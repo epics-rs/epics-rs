@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use epics_base_rs::error::CaResult;
 use epics_base_rs::server::database::PvDatabase;
-use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record};
+use epics_base_rs::server::record::{AlarmSeverity, FieldDesc, ProcessOutcome, Record};
 use epics_base_rs::server::records::ao::AoRecord;
 use epics_base_rs::server::records::sseq::SseqRecord;
 use epics_base_rs::types::EpicsValue;
@@ -418,5 +418,65 @@ async fn sseq_second_abort_escapes_hung_wait_callback() {
         read_short(db.get_pv("SSEQ_HUNG.ABORT").await.ok()),
         0,
         "ABORT cleared by the forced finish"
+    );
+}
+
+/// Boundary — `SELM=Specified` with an out-of-range `SELN` (> the 10
+/// steps) is an invalid selection: C `process` raises
+/// `recGblSetSevr(pR,SOFT_ALARM,INVALID_ALARM)` and finishes without
+/// running any step (sseqRecord.c:319-323). The async start path must
+/// raise the same alarm AND dispatch no `LNKn` — the regression the old
+/// `MultiOut::Sseq` dispatch covered via `apply_selm_alarm` and the
+/// per-step machine dropped (it finished silently).
+#[tokio::test]
+async fn sseq_seln_out_of_range_raises_invalid_alarm_and_no_dispatch() {
+    let db = PvDatabase::new();
+    let count = Arc::new(AtomicU32::new(0));
+    db.add_record(
+        "SSEQ_SELN_TGT",
+        Box::new(CountingTarget {
+            process_count: count.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    let mut sseq = SseqRecord::new();
+    sseq.selm = 1; // Specified
+    sseq.seln = 11; // out of range — only steps 1..10 exist
+    // A configured step so a stray dispatch would be observable.
+    sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
+    sseq.put_field("LNK1", EpicsValue::String("SSEQ_SELN_TGT PP".into()))
+        .unwrap();
+    db.add_record("SSEQ_SELN", Box::new(sseq)).await.unwrap();
+
+    // The invalid-selection path finishes synchronously (Complete), so the
+    // kick returns with the alarm already evaluated.
+    kick(&db, "SSEQ_SELN").await;
+
+    let rec = db.get_record("SSEQ_SELN").await.unwrap();
+    let inst = rec.read().await;
+    assert_eq!(
+        inst.common.sevr,
+        AlarmSeverity::Invalid,
+        "out-of-range SELN must raise INVALID severity"
+    );
+    assert_eq!(
+        inst.common.stat, 15,
+        "out-of-range SELN must raise SOFT_ALARM (status 15)"
+    );
+    drop(inst);
+
+    // Settle so any erroneous step dispatch would also have landed.
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        0,
+        "an invalid selection must dispatch no LNKn"
+    );
+    assert_eq!(
+        read_short(db.get_pv("SSEQ_SELN.BUSY").await.ok()),
+        0,
+        "BUSY cleared after the invalid selection finished"
     );
 }

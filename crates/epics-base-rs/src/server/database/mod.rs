@@ -607,28 +607,12 @@ impl PvDatabase {
     /// observed any record link yet — record processing will create
     /// the entries on first read, after iocInit returns).
     pub async fn wait_for_external_links(&self, timeout: std::time::Duration) -> (usize, usize) {
-        let registry_snapshot: Vec<(String, link_set::DynLinkSet)> = {
-            let registry = self.inner.link_sets.read().await;
-            registry
-                .schemes()
-                .into_iter()
-                .filter_map(|s| registry.get(&s).map(|l| (s, l)))
-                .collect()
-        };
-        if registry_snapshot.is_empty() {
-            return (0, 0);
-        }
-        // Collect (scheme, name) pairs once. `link_names()` may grow
+        // Collect (lset, name) pairs once. `link_names()` may grow
         // as record processing opens new links, but iocInit's wait
         // is bounded by the records loaded *before* Phase 3 — every
         // such link is already opened by the time wire_device_support
         // and setup_cp_links return.
-        let mut targets: Vec<(link_set::DynLinkSet, String)> = Vec::new();
-        for (_scheme, lset) in &registry_snapshot {
-            for n in lset.link_names() {
-                targets.push((lset.clone(), n));
-            }
-        }
+        let targets = self.external_link_targets().await;
         let total = targets.len();
         if total == 0 {
             return (0, 0);
@@ -647,6 +631,43 @@ impl PvDatabase {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+    }
+
+    /// Snapshot every `(lset, link_name)` pair currently opened across
+    /// all registered external link sets. Shared by
+    /// [`Self::wait_for_external_links`] and
+    /// [`Self::unconnected_external_links`] so both reason over the
+    /// identical working set.
+    async fn external_link_targets(&self) -> Vec<(link_set::DynLinkSet, String)> {
+        let registry_snapshot: Vec<(String, link_set::DynLinkSet)> = {
+            let registry = self.inner.link_sets.read().await;
+            registry
+                .schemes()
+                .into_iter()
+                .filter_map(|s| registry.get(&s).map(|l| (s, l)))
+                .collect()
+        };
+        let mut targets: Vec<(link_set::DynLinkSet, String)> = Vec::new();
+        for (_scheme, lset) in &registry_snapshot {
+            for n in lset.link_names() {
+                targets.push((lset.clone(), n));
+            }
+        }
+        targets
+    }
+
+    /// Names of external links (`ca://` / `pva://`) that are opened but
+    /// not yet connected. iocInit calls this after
+    /// [`Self::wait_for_external_links`] times out so the
+    /// "M/N connected" diagnostic can name the `N-M` it proceeded
+    /// without, instead of leaving the operator to run `dbcar`.
+    pub async fn unconnected_external_links(&self) -> Vec<String> {
+        self.external_link_targets()
+            .await
+            .into_iter()
+            .filter(|(lset, name)| !lset.is_connected(name))
+            .map(|(_, name)| name)
+            .collect()
     }
 
     /// Enumerate every link-shaped field on `record_name`. Returns

@@ -856,9 +856,11 @@ impl IocApplication {
                 if connected == total {
                     eprintln!("iocInit: {connected}/{total} external links connected");
                 } else {
+                    let unconnected = db.unconnected_external_links().await;
                     eprintln!(
                         "iocInit: {connected}/{total} external links connected after \
-                         {link_wait_secs}s — proceeding with unconnected links"
+                         {link_wait_secs}s — proceeding without: {}",
+                        unconnected.join(", ")
                     );
                 }
             }

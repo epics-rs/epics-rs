@@ -1216,23 +1216,38 @@ impl EpicsValue {
     }
 
     /// Parse an unsigned integer string with C-style radix prefixes
-    /// (`0x` hex, leading-`0` octal). Mirrors `parse_int` but keeps the
+    /// (`0x` hex, leading-`0` octal) and `strtoul` sign handling. Mirrors C
+    /// `epicsParseUInt8/16/32/64`, which dbStaticLib.c calls with `base = 0`
+    /// for DBF_UCHAR/USHORT/ULONG/UINT64: an optional leading `+`/`-` precedes
+    /// the radix prefix, and a `-` negates in wrapping unsigned arithmetic
+    /// exactly like `strtoul` (e.g. DBF_ULONG `TEVL="-1"` → `0xFFFFFFFF`,
+    /// the areaDetector "all-bits / undefined" convention). Parsing keeps the
     /// full unsigned 64-bit range — `i64`-based parsing would reject
-    /// `DBF_UINT64` values above `i64::MAX`. C parity: `epicsParseUInt64`
-    /// with `dbConvertBase = 0` auto-detects the radix.
+    /// `DBF_UINT64` values above `i64::MAX`; callers cast to the field width,
+    /// matching C's final `(epicsUIntN)` cast of the wrapped value.
     fn parse_uint(s: &str) -> CaResult<u64> {
         let s = s.trim();
-        if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-            u64::from_str_radix(hex, 16).map_err(|e| CaError::InvalidValue(e.to_string()))
-        } else if s.starts_with('0')
-            && s.len() > 1
-            && s.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
-        {
-            u64::from_str_radix(&s[1..], 8).map_err(|e| CaError::InvalidValue(e.to_string()))
+        let (negative, body) = match s.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, s.strip_prefix('+').unwrap_or(s)),
+        };
+        let magnitude =
+            if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+                u64::from_str_radix(hex, 16)
+            } else if body.starts_with('0')
+                && body.len() > 1
+                && body.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
+            {
+                u64::from_str_radix(&body[1..], 8)
+            } else {
+                body.parse::<u64>()
+            }
+            .map_err(|e| CaError::InvalidValue(e.to_string()))?;
+        Ok(if negative {
+            0u64.wrapping_sub(magnitude)
         } else {
-            s.parse::<u64>()
-                .map_err(|e| CaError::InvalidValue(e.to_string()))
-        }
+            magnitude
+        })
     }
 }
 
@@ -1297,6 +1312,45 @@ mod parse_radix_tests {
         assert_eq!(
             EpicsValue::parse(DbFieldType::Long, "010").unwrap(),
             EpicsValue::Long(8)
+        );
+    }
+
+    #[test]
+    fn parse_negative_unsigned_wraps_like_strtoul() {
+        // C parity: dbStaticLib.c parses DBF_USHORT/ULONG/UINT64 via
+        // epicsParseUInt16/32/64, which use strtoul/strtoull and accept a
+        // leading '-', negating in wrapping unsigned arithmetic then casting
+        // to the field width. areaDetector NDProcess/NDROI use TEVL="-1" for
+        // a DBF_ULONG field to mean 0xFFFFFFFF.
+        assert_eq!(
+            EpicsValue::parse(DbFieldType::ULong, "-1").unwrap(),
+            EpicsValue::ULong(0xFFFF_FFFF)
+        );
+        assert_eq!(
+            EpicsValue::parse(DbFieldType::ULong, "-5").unwrap(),
+            EpicsValue::ULong(0xFFFF_FFFB)
+        );
+        assert_eq!(
+            EpicsValue::parse(DbFieldType::UShort, "-1").unwrap(),
+            EpicsValue::UShort(0xFFFF)
+        );
+        assert_eq!(
+            EpicsValue::parse(DbFieldType::UInt64, "-1").unwrap(),
+            EpicsValue::UInt64(u64::MAX)
+        );
+        // Sign precedes the radix prefix, and '+' is accepted (strtoul).
+        assert_eq!(
+            EpicsValue::parse(DbFieldType::ULong, "-0x10").unwrap(),
+            EpicsValue::ULong(0xFFFF_FFF0)
+        );
+        assert_eq!(
+            EpicsValue::parse(DbFieldType::ULong, "+255").unwrap(),
+            EpicsValue::ULong(255)
+        );
+        // Positive hex/decimal still parse normally (asyn devInt32.db TEVL="0xa").
+        assert_eq!(
+            EpicsValue::parse(DbFieldType::ULong, "0xa").unwrap(),
+            EpicsValue::ULong(10)
         );
     }
 

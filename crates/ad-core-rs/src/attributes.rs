@@ -402,6 +402,8 @@ fn epics_value_to_nd_attr(value: &epics_ca_rs::EpicsValue) -> NDAttrValue {
         E::Double(v) => NDAttrValue::Float64(*v),
         E::Int64(v) => NDAttrValue::Int64(*v),
         E::UInt64(v) => NDAttrValue::UInt64(*v),
+        E::UShort(v) => NDAttrValue::UInt16(*v),
+        E::ULong(v) => NDAttrValue::UInt32(*v),
         E::ShortArray(a) => a
             .first()
             .map_or(NDAttrValue::Undefined, |v| NDAttrValue::Int16(*v)),
@@ -426,6 +428,12 @@ fn epics_value_to_nd_attr(value: &epics_ca_rs::EpicsValue) -> NDAttrValue {
         E::UInt64Array(a) => a
             .first()
             .map_or(NDAttrValue::Undefined, |v| NDAttrValue::UInt64(*v)),
+        E::UShortArray(a) => a
+            .first()
+            .map_or(NDAttrValue::Undefined, |v| NDAttrValue::UInt16(*v)),
+        E::ULongArray(a) => a
+            .first()
+            .map_or(NDAttrValue::Undefined, |v| NDAttrValue::UInt32(*v)),
         E::StringArray(a) => a.first().map_or(NDAttrValue::Undefined, |v| {
             NDAttrValue::String(v.as_str_lossy().into_owned())
         }),

@@ -173,6 +173,19 @@ impl SupervisorState {
                 }
             });
         }
+        // Read-only viewer/log port: a second TCP listener whose clients
+        // receive output but whose input is discarded. C creates this as
+        // `acceptFactory(logPort, logPortLocal, /*readonly=*/true)`
+        // (procServ.cc:533); the `readonly` flag flows to each accepted
+        // client and gates its input (client.rs read task).
+        if let Some(addr) = config.listen.log_bind {
+            let tx = incoming_tx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = super::listener::run_tcp(addr, true, tx).await {
+                    tracing::error!(error = %e, "procserv-rs: log listener exited");
+                }
+            });
+        }
         // Drop our copy so listeners' txs are the only owners.
         drop(incoming_tx);
 

@@ -44,6 +44,18 @@ mod app {
         #[arg(long)]
         allow: bool,
 
+        /// Read-only viewer/log TCP port (`-l` / `--logport` in C).
+        /// Clients here see all output but cannot inject input.
+        #[arg(short = 'l', long = "logport")]
+        log_port: Option<u16>,
+
+        /// Restrict the log/viewer port to localhost (C `--restrict`).
+        /// Unlike the control port, the log port binds all interfaces by
+        /// default (C `logPortLocal` defaults false); this flag mirrors
+        /// C flipping it to localhost-only.
+        #[arg(long)]
+        restrict: bool,
+
         /// UNIX-domain socket path (`--unixpath`).
         #[arg(long = "unixpath")]
         unix_path: Option<PathBuf>,
@@ -132,6 +144,16 @@ mod app {
                     std::net::SocketAddr::from(([0, 0, 0, 0], p))
                 } else {
                     std::net::SocketAddr::from(([127, 0, 0, 1], p))
+                }
+            }),
+            log_port: args.log_port,
+            // C `logPortLocal` defaults false → all interfaces; `--restrict`
+            // flips it to localhost (acceptFactory.cc:116, procServ.cc:377).
+            log_bind: args.log_port.map(|p| {
+                if args.restrict {
+                    std::net::SocketAddr::from(([127, 0, 0, 1], p))
+                } else {
+                    std::net::SocketAddr::from(([0, 0, 0, 0], p))
                 }
             }),
             unix_path: args.unix_path,
@@ -277,6 +299,39 @@ mod app {
                 Args::try_parse_from(["procserv-rs", "--max-restarts", "5", "/bin/echo"]).unwrap();
             let cfg = build_config(args).unwrap();
             assert_eq!(cfg.restart.max_restarts, 5);
+        }
+
+        /// The log/viewer port binds all interfaces by default (C
+        /// `logPortLocal` defaults false), the inverse of the control
+        /// port's localhost default.
+        #[test]
+        fn log_port_binds_all_interfaces_by_default() {
+            let args =
+                Args::try_parse_from(["procserv-rs", "--logport", "7000", "/bin/echo"]).unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.listen.log_port, Some(7000));
+            assert_eq!(
+                cfg.listen.log_bind,
+                Some(std::net::SocketAddr::from(([0, 0, 0, 0], 7000)))
+            );
+        }
+
+        /// `--restrict` flips the log port to localhost-only (C 'R').
+        #[test]
+        fn restrict_binds_log_port_to_localhost() {
+            let args = Args::try_parse_from([
+                "procserv-rs",
+                "--logport",
+                "7000",
+                "--restrict",
+                "/bin/echo",
+            ])
+            .unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(
+                cfg.listen.log_bind,
+                Some(std::net::SocketAddr::from(([127, 0, 0, 1], 7000)))
+            );
         }
     }
 }

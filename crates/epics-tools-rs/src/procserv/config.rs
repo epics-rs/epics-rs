@@ -23,6 +23,17 @@ pub struct ListenConfig {
     /// takes the explicit `SocketAddr` so both forms collapse onto
     /// one field. Defaults to `127.0.0.1` if `tcp_port` is set.
     pub tcp_bind: Option<SocketAddr>,
+    /// Read-only viewer/log TCP port (`-l` / `--logport`). Clients on
+    /// this port receive all output but their input is discarded —
+    /// C procServ's log listener, created with `readonly=true`
+    /// (`procServ.cc:533`, `acceptFactory.cc:395`). `None` disables it.
+    pub log_port: Option<u16>,
+    /// Bind address for the log/viewer port. C's `logPortLocal` defaults
+    /// to *false* — the log port binds all interfaces (`INADDR_ANY`)
+    /// unless `--restrict` restricts it to localhost
+    /// (`procServ.cc:51,377`, `acceptFactory.cc:116`), the inverse of the
+    /// control port's localhost-by-default + `--allow`.
+    pub log_bind: Option<SocketAddr>,
     /// Unix-domain socket path (`--unixpath`). `None` disables UNIX.
     pub unix_path: Option<PathBuf>,
 }

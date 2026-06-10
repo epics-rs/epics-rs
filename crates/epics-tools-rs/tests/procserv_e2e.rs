@@ -30,6 +30,8 @@ fn cat_config(port: u16) -> ProcServConfig {
         listen: ListenConfig {
             tcp_port: Some(port),
             tcp_bind: Some(SocketAddr::from(([127, 0, 0, 1], port))),
+            log_port: None,
+            log_bind: None,
             unix_path: None,
         },
         keys: KeyBindings {
@@ -281,6 +283,71 @@ async fn server_messages_are_written_to_the_log() {
     assert!(
         contents.contains("@@@ Child started"),
         "supervisor start banner must be logged; got: {contents:?}"
+    );
+
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn log_port_client_is_readonly_but_receives_output() {
+    // C procServ's log port is created `acceptFactory(logPort, local,
+    // /*readonly=*/true)` (procServ.cc:533): clients there see all
+    // output but their input is discarded (procServ.h:100,
+    // acceptFactory.cc:395). Verify a client on the log port (a) sees
+    // child/party-line output and (b) cannot inject input — bytes it
+    // sends never reach the child or the control client.
+    let ctl_port = pick_port().await;
+    let log_port = pick_port().await;
+    let mut cfg = cat_config(ctl_port);
+    cfg.listen.log_port = Some(log_port);
+    cfg.listen.log_bind = Some(SocketAddr::from(([127, 0, 0, 1], log_port)));
+
+    let server = ProcServ::new(cfg).expect("build");
+    let server_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // Connect a control (read/write) client and a log (read-only) client.
+    let connect = |port: u16| async move {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(50)).await,
+                Err(e) => panic!("could not connect to {port}: {e}"),
+            }
+        }
+    };
+    let mut ctl = connect(ctl_port).await;
+    let mut log = connect(log_port).await;
+
+    // Drain both welcome banners.
+    let _ = read_for(&mut ctl, Duration::from_millis(400)).await;
+    let _ = read_for(&mut log, Duration::from_millis(400)).await;
+
+    // (a) Control types; the log viewer must observe the echoed output.
+    ctl.write_all(b"hello from ctl\n").await.unwrap();
+    let log_seen = read_until(&mut log, "hello from ctl", Duration::from_secs(2)).await;
+    assert!(
+        log_seen.contains("hello from ctl"),
+        "log-port client must receive output, got: {log_seen:?}"
+    );
+
+    // (b) The log client tries to inject; then control sends a marker.
+    // The marker round-trips through the child, giving the injected
+    // bytes ample time to appear too — they must not, because a
+    // read-only client's input is dropped before it reaches the
+    // supervisor (so it is never echoed to control or fed to the child).
+    log.write_all(b"INJECTED_BY_LOG\n").await.unwrap();
+    ctl.write_all(b"CTL_MARKER\n").await.unwrap();
+    let ctl_seen = read_until(&mut ctl, "CTL_MARKER", Duration::from_secs(2)).await;
+    assert!(
+        ctl_seen.contains("CTL_MARKER"),
+        "control client must see its own marker echo, got: {ctl_seen:?}"
+    );
+    assert!(
+        !ctl_seen.contains("INJECTED_BY_LOG"),
+        "read-only log client input must not reach the party line, got: {ctl_seen:?}"
     );
 
     server_task.abort();

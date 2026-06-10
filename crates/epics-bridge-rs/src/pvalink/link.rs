@@ -2492,8 +2492,6 @@ mod tests {
 
     // ---- ungated remote alarm snapshot (pvxs pvaGetAlarmMsg) ----
 
-    /// Regression R0604-BRPVALINK-ALARM-SNAPSHOT-LATCH-1.
-    ///
     /// The ungated remote alarm snapshot is LATCHED at the value read,
     /// not read live from the cached monitor value — and it stays ungated
     /// by `sevr`. This is pvxs `testMeta()`

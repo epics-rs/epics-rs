@@ -37,7 +37,6 @@ impl FieldMapping {
     /// (`ioc/typeutils.cpp:65-77`). Used by the QSRV `pvxgl` diagnostic
     /// instead of Rust's `{:?}` (which would emit the capitalized variant
     /// names `Scalar`/`Plain`/… and break pvxs output compatibility).
-    /// Regression R0604-BRQSRV-PVXSL-PVXGL-DIAG-FORMAT-1.
     pub fn pvxs_name(self) -> &'static str {
         match self {
             FieldMapping::Scalar => "scalar",

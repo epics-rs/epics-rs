@@ -1268,7 +1268,7 @@ async fn br_99_decoded_monitor_gets_finish_on_upstream_descriptor_change() {
 }
 
 // ---------------------------------------------------------------------
-// BRIDGE-RS-2026-05-28-27 (PUT_GET leg): the gateway must forward a
+// PUT_GET leg: the gateway must forward a
 // downstream PUT_GET as ONE upstream PUT_GET — preserving the downstream
 // pvRequest — and return the *upstream* post-put readback, not a local
 // put plus a cached GET.

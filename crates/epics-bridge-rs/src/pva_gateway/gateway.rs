@@ -257,7 +257,7 @@ impl PvaGateway {
         source.connect_timeout = config.connect_timeout;
         source.max_subscribers = config.max_subscribers;
         // Carry the configured cache policy to per-credential caches too,
-        // not just the shared cache built above (BRIDGE-RS-2026-05-28-26).
+        // not just the shared cache built above.
         source.cleanup_interval = config.cleanup_interval;
         source.per_credential_max_entries = config.max_cache_entries;
 

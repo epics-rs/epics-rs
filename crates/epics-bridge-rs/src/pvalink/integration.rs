@@ -102,7 +102,7 @@ pub struct PvaLinkResolver {
     /// targets). Populated by [`Self::open_link_for_record`]. Keyed by
     /// [`MonitorKey`] — NOT bare PV name — so two records linking the
     /// same PV with different `Q` / `pipeline` each fan out from their
-    /// own monitor (BRIDGE-RS-2026-05-28-128).
+    /// own monitor.
     scan_targets: Arc<parking_lot::RwLock<std::collections::HashMap<MonitorKey, ScanFanout>>>,
     /// B3: monitor variants whose notification forwarder task is already
     /// running, so [`Self::open_link`] spawns it at most once per
@@ -130,7 +130,7 @@ pub struct PvaLinkResolver {
 ///
 /// Scan fan-out and forwarder dedup key on this rather than the bare PV
 /// name so a `Q=1` record's CP/CPP scans are driven by its own monitor,
-/// not whichever variant opened first (BRIDGE-RS-2026-05-28-128). Two
+/// not whichever variant opened first. Two
 /// links that differ only in `field` / `sevr` share one `MonitorKey`:
 /// the registry already folds them onto one subscription, so one
 /// forwarder correctly drives both (their per-`field` change tracking
@@ -301,7 +301,7 @@ impl PvaLinkResolver {
     /// Like [`Self::open_link_for_record`] but for a link parsed from
     /// the structured pvxs-parity JSON longhand `{pva:{pv,…}}`
     /// (`epics_base_rs` `PvaJsonLink`). The options arrive as JLink
-    /// members, not a `?key=value` query (BRIDGE-RS-2026-05-28-107), and
+    /// members, not a `?key=value` query, and
     /// the per-link config is keyed by the per-link IDENTITY KEY
     /// (`pvajson_identity_key`) — epics-base-rs resolves a `PvaJson` link
     /// through `external_pv_name()` → `link_identity_key()`
@@ -373,7 +373,7 @@ impl PvaLinkResolver {
         // forwarder spawned below already sees it. Keyed by the monitor
         // variant identity, NOT bare PV name, so a `Q=1` record's scan
         // targets are not merged with a `Q=64` sibling's
-        // (BRIDGE-RS-2026-05-28-128; pvxs keys links onto their channel
+        // (pvxs keys links onto their channel
         // by `(channelName, pvRequest)`, `pvxs/ioc/pvalink.h:115-120`).
         let monitor_key = MonitorKey::from_config(&cfg);
         // Track the newly-attached scan target so an attach-time scan
@@ -642,7 +642,7 @@ impl PvaLinkResolver {
     /// OUT counterpart of [`Self::open_json_link_for_record`]: open an
     /// OUT link from the structured pvxs-parity JSON longhand
     /// (`epics_base_rs` `PvaJsonLink`), reading options as JLink members
-    /// rather than a `?key=value` query (BRIDGE-RS-2026-05-28-107). Keyed
+    /// rather than a `?key=value` query. Keyed
     /// by the per-link IDENTITY KEY (`pvajson_identity_key`) — epics-base-rs
     /// writes a `PvaJson` OUT link through `external_pv_name()` →
     /// `link_identity_key()` (`server/database/links.rs`), so `put_value`
@@ -799,8 +799,8 @@ impl PvaLinkResolver {
             // monitor value. No `block_on`, no async runtime touch.
             // `try_get_inp` resolves THIS caller's monitor variant
             // (`pipeline` / `Q`), so a `Q=1` record reads from its own
-            // monitor, not a `Q=64` sibling sharing the PV name
-            // (BRIDGE-RS-2026-05-28-128). `try_read_cached_with_field`
+            // monitor, not a `Q=64` sibling sharing the PV name.
+            // `try_read_cached_with_field`
             // then applies the per-link field selector.
             if let Some(link) = resolver
                 .registry
@@ -900,7 +900,7 @@ pub async fn install_pvalink_resolver(
                 }
                 // pvxs-parity JSON longhand `{pva:{pv,…}}`: the options
                 // are structured JLink members, read directly without a
-                // `?key=value` query round-trip (BRIDGE-RS-2026-05-28-107).
+                // `?key=value` query round-trip.
                 // Always pre-registered — the longhand variant exists
                 // precisely to carry options (a pv-only longhand yields a
                 // plain `Pva`), so there is no bare-PV early-out here.
@@ -1156,7 +1156,7 @@ impl LinkSet for PvaLinkResolver {
         // resolve THIS link's monitor variant. `link_names()` hands back
         // one identity string per distinct `(pv, pipeline, Q)` variant,
         // so the wait confirms each variant's own monitor connected, not
-        // just the first to share the PV name (BRIDGE-RS-2026-05-28-128).
+        // just the first to share the PV name.
         if full != bare {
             lazy_register_inp_opts(&self.link_options, full);
         }
@@ -1185,7 +1185,7 @@ impl LinkSet for PvaLinkResolver {
 
         // Fast path: cached monitor value, no async runtime touch.
         // resolve THIS caller's monitor variant, then apply the per-link
-        // field selector (BRIDGE-RS-2026-05-28-128).
+        // field selector.
         if let Some(link) = self
             .registry
             .try_get_inp(bare, cfg.pipeline, cfg.queue_size)
@@ -1481,8 +1481,8 @@ impl LinkSet for PvaLinkResolver {
         // default variant, or `PV?pipeline=…&Q=…` for a non-default one.
         // Two records on the same PV with different `Q` / `pipeline`
         // therefore each get their own wait entry, and the per-name
-        // `is_connected` query lands on that record's own monitor
-        // (BRIDGE-RS-2026-05-28-128). OUT links are excluded: they
+        // `is_connected` query lands on that record's own monitor.
+        // OUT links are excluded: they
         // install no monitor and have no connection signal to report.
         let default_q = PvaLinkConfig::defaults_for("", LinkDirection::Inp).queue_size;
         self.registry
@@ -2571,7 +2571,7 @@ mod tests {
         );
     }
 
-    /// BRIDGE-RS-2026-05-28-51: repeated *identical* monitor values still
+    /// Repeated *identical* monitor values still
     /// process a CP target on EVERY event. pvxs has no value-difference
     /// gate and ignores the `always` option at scan time
     /// (`pvxs/documentation/pvalink.rst:102`,
@@ -2983,7 +2983,7 @@ mod tests {
     }
 
     /// B4 `atomic`: an atomic target scans on every monitor event,
-    /// including a repeated identical value. Post-BRIDGE-RS-2026-05-28-51
+    /// including a repeated identical value. After this fix,
     /// this is the same rule that governs every CP/CPP target (no no-op
     /// suppression); the test is retained to guard the atomic path
     /// specifically, since atomic targets run under the shared
@@ -3131,7 +3131,7 @@ mod tests {
         );
     }
 
-    /// R0604-BRPVALINK-OUT-LOCAL-GATE-1: an OUT link with `local=true` to
+    /// An OUT link with `local=true` to
     /// a PV not served by this IOC must be rejected at open time, exactly
     /// like the INP path. pvxs applies `pvaLinkConfig::local` inside
     /// `pvaOpenLink()` for every direction (`ioc/pvalink_lset.cpp:69-74`);
@@ -3151,7 +3151,7 @@ mod tests {
         );
     }
 
-    /// R0604-BRPVALINK-OUT-LOCAL-GATE-1: the structured pvxs-parity JSON
+    /// The structured pvxs-parity JSON
     /// OUT path (`open_json_out_link`) honours `local=true` the same way.
     #[tokio::test]
     async fn b4_local_json_out_link_rejects_non_local_pv() {
@@ -3173,7 +3173,7 @@ mod tests {
         );
     }
 
-    /// R0604-BRPVALINK-OUT-LOCAL-GATE-1: the lazy write path
+    /// The lazy write path
     /// (`LinkSet::put_value`, the hot path that opens an OUT link on first
     /// write) must reject a `local=true` write to a remote PV before
     /// opening/queuing, not send or stage a remote PUT. Asserts the error
@@ -3200,7 +3200,7 @@ mod tests {
         );
     }
 
-    /// R0604-BRPVALINK-OUT-LOCAL-GATE-1 (sibling-cache): a non-local OUT
+    /// Sibling-cache: a non-local OUT
     /// link to a remote PV opens first and seeds the shared channel owner;
     /// a later `local=true` OUT link to the SAME PV must still be rejected
     /// rather than reusing the already-open remote owner. The gate runs
@@ -3323,7 +3323,7 @@ mod tests {
 
     /// JSON-object pvalink options (field, proc, sevr, Q, …) survive the
     /// parse→bridge pipeline as STRUCTURED JLink members, not a synthetic
-    /// `?key=value` query (BRIDGE-RS-2026-05-28-107).
+    /// `?key=value` query.
     ///
     /// Three parts: (a) parse_link_v2 yields a `ParsedLink::PvaJson` whose
     /// `options` is the verbatim `(key, value)` pair list; (b)
@@ -3752,7 +3752,7 @@ mod tests {
         assert_eq!(link_pv_name(&key_a), "OUT:PV");
     }
 
-    /// BRIDGE-RS-2026-05-28-128: two records linking the SAME upstream
+    /// Two records linking the SAME upstream
     /// PV with different `Q` are distinct monitor variants (distinct
     /// pvxs subscriptions, `pvxs/ioc/pvalink.h:115-120`). Their CP scan
     /// fan-out must land in SEPARATE [`MonitorKey`] buckets — pre-fix
@@ -3820,7 +3820,7 @@ mod tests {
         );
     }
 
-    /// BRIDGE-RS-2026-05-28-37: the `pipeline` dimension of the monitor
+    /// The `pipeline` dimension of the monitor
     /// identity must also separate variants — a default link and a
     /// `Q=1&pipeline=true` link to the same PV are distinct monitor
     /// channels (distinct pvRequest, `pvxs/ioc/pvalink_link.cpp:49-65`,
@@ -4126,8 +4126,8 @@ mod tests {
             "resolver-level link_alarm_severity must use the caller's MS mode"
         );
 
-        // Ungated snapshot (pvxs pvaGetAlarmMsg / dbGetAlarm). Regression
-        // R0604-BRPVALINK-ALARM-SNAPSHOT-LATCH-1: the snapshot is LATCHED
+        // Ungated snapshot (pvxs pvaGetAlarmMsg / dbGetAlarm). The
+        // snapshot is LATCHED
         // at the value read, not read live from the cached value. BEFORE
         // any value read it is the pvxs initial INVALID_ALARM(3) /
         // LINK_ALARM(14) / blank (`pvxs/ioc/pvalink.h:250`) — exactly like

@@ -741,7 +741,6 @@ pub fn pvxsl_command(provider: Arc<BridgeProvider>) -> CommandDef {
 /// `onList()` reports a static record set (`List::dynamic` defaults false,
 /// `source.h:277`; `SingleSource::onList` returns `allRecords` unchanged,
 /// `singlesource.h:32`), so the ` [dynamic]` suffix is never appended.
-/// Regression R0604-BRQSRV-PVXSL-PVXGL-DIAG-FORMAT-1.
 fn pvxsl_lines(names: &[String], detail: i64) -> Vec<String> {
     let mut out = Vec::new();
     if detail != 0 && !names.is_empty() {
@@ -815,7 +814,6 @@ pub fn pvxgl_command(provider: Arc<BridgeProvider>) -> CommandDef {
 /// both derived from the one resolved trigger set
 /// ([`GroupPvDef::resolved_trigger_targets`]) so they can never disagree,
 /// exactly as pvxs derives both from `field.triggers`.
-/// Regression R0604-BRQSRV-PVXSL-PVXGL-DIAG-FORMAT-1.
 fn pvxgl_lines(
     groups: &std::collections::HashMap<String, super::group_config::GroupPvDef>,
     level: i64,
@@ -1096,8 +1094,6 @@ mod tests {
             .collect()
     }
 
-    /// Regression R0604-BRQSRV-PVXSL-PVXGL-DIAG-FORMAT-1.
-    ///
     /// `pvxsl 1` prints the pvxs source identity `SOURCE: qsrvSingle@0`
     /// (singlesourcehooks.cpp:52 with the `qsrvSingle`/IOID-0 registration
     /// at :159 and a static, non-dynamic `onList()`), inside the
@@ -1124,8 +1120,6 @@ mod tests {
         assert!(pvxsl_lines(&[], 1).is_empty());
     }
 
-    /// Regression R0604-BRQSRV-PVXSL-PVXGL-DIAG-FORMAT-1.
-    ///
     /// `pvxgl 2` prints each member mapping through the lowercase
     /// `MappingInfo::name()` spelling (`<scalar>`/`<plain>`/`<meta>`/
     /// `<const>`/`<structure>`), mirroring pvxs `Group::show`
@@ -1162,8 +1156,6 @@ mod tests {
         );
     }
 
-    /// Regression R0604-BRQSRV-PVXSL-PVXGL-DIAG-FORMAT-1.
-    ///
     /// `pvxgl 3` prints, under each member, one line per resolved
     /// `+trigger` target field name, mirroring pvxs `Group::show`
     /// level>2 (group.cpp:81-92). Targets are sorted to match pvxs's
@@ -1204,8 +1196,6 @@ mod tests {
         assert_eq!(s, r#"{"+id": "TEST:val_deg", "+atomic": false}"#);
     }
 
-    /// Regression R0604-BRQSRV-MACLIB-ERROR-STATE-1.
-    ///
     /// An undefined macro with no default is an expansion *error*: C `refer`
     /// sets `entry->error`, so `macExpandString` returns a negative length and
     /// `macDefExpand` returns `NULL` (macCore.c:895-896,210,220). pvxs skips
@@ -1273,8 +1263,6 @@ mod tests {
         assert_eq!(expand_macros("$(A)", &m).unwrap(), "deep");
     }
 
-    /// Regression R0604-BRQSRV-MACLIB-DISCARD-LEVEL-1.
-    ///
     /// C `macCore.c` expands a substituted macro value at `level > 0`, where
     /// `discard` removes the value's quote delimiters and escape backslashes
     /// (macCore.c:716-726,740-743). A site macro `P="IOC:"` therefore expands
@@ -1303,7 +1291,7 @@ mod tests {
         assert_eq!(expand_macros(r#"$(BAR,BAR="v")"#, &m).unwrap(), "v");
     }
 
-    /// Regression R0604-BRQSRV-MACLIB-DISCARD-LEVEL-1 (level-0 preservation).
+    /// Level-0 preservation.
     ///
     /// The user's own source string is translated at level 0 (`discard =
     /// false`), so its quote delimiters and escape backslashes survive — only
@@ -1321,8 +1309,6 @@ mod tests {
         );
     }
 
-    /// Regression R0604-BRQSRV-MACLIB-ERROR-STATE-1.
-    ///
     /// `A=$(A)` must not recurse forever (macLib `visited`), and the recursion
     /// is an *error*: C `refer` sets `entry->error` on the recursive reference,
     /// so `macExpandString` returns a negative length and `macDefExpand`
@@ -1336,8 +1322,6 @@ mod tests {
         assert_eq!(expand_macros("$(A)", &m), None);
     }
 
-    /// Regression R0604-BRQSRV-MACLIB-ERROR-STATE-1.
-    ///
     /// An undefined/recursive reference inside a *scoped definition* uses C's
     /// separate `MAC_ENTRY subs`, whose error flag is discarded
     /// (macCore.c:821-826,841,849). It must NOT fail the enclosing expansion,
@@ -1353,8 +1337,6 @@ mod tests {
         assert_eq!(expand_macros("$(P,K=$(UNDEF))", &m).unwrap(), "val");
     }
 
-    /// Regression R0604-BRQSRV-MACLIB-ERROR-STATE-1.
-    ///
     /// pvxs expands each group-config line through `macDefExpand` and skips a
     /// line whose expansion returns `NULL` (groupconfigprocessor.cpp:88-105).
     /// An undefined macro inside a quoted `+channel` value must therefore never

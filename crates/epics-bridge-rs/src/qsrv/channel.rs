@@ -176,7 +176,6 @@ pub fn dbe_mask_from_pv_request(request: &PvStructure) -> Option<u16> {
     // selects its bit. Folding to uppercase first (as Rust previously did)
     // made lowercase tokens select a narrower mask than pvxs, hiding value
     // changes from clients that used lowercase option strings.
-    // Regression R0604-BRQSRV-DBE-STRING-CASE-1.
     let mut raw_mask = 0u16;
     if raw.contains("VALUE") {
         raw_mask |= EventMask::VALUE.bits();
@@ -1113,7 +1112,7 @@ mod tests {
         assert_eq!(mask, (EventMask::VALUE | EventMask::ALARM).bits());
     }
 
-    /// Regression R0604-BRQSRV-DBE-STRING-CASE-1: pvxs's string DBE parse is
+    /// pvxs's string DBE parse is
     /// case-SENSITIVE (`mask.find("VALUE"/"ARCHIVE"/"ALARM")`,
     /// singlesource.cpp:122-125), so a lowercase token selects an empty value
     /// mask and falls back to `VALUE|ALARM`. Before the fix Rust uppercased
@@ -1133,7 +1132,7 @@ mod tests {
         }
     }
 
-    /// Regression R0604-BRQSRV-DBE-STRING-CASE-1: an uppercase substring inside
+    /// An uppercase substring inside
     /// mixed-case text still selects its bit, because pvxs searches for the
     /// exact uppercase substring rather than tokenizing. `"alarmALARM"`
     /// therefore selects ALARM (the embedded uppercase `ALARM`), proving the
@@ -1208,7 +1207,7 @@ mod tests {
         assert!(dbe_mask_from_pv_request(&req).is_none());
     }
 
-    /// Regression R0604-BRQSRV-DBE-COERCE-1. A numeric `record._options.DBE`
+    /// A numeric `record._options.DBE`
     /// option must select the requested value class regardless of which PVA
     /// numeric scalar type carries it. pvxs reads the field as
     /// `fld.as<uint8_t>()` (singlesource.cpp:134), coercing every Integer/Real

@@ -35,8 +35,8 @@
 //! [`epics_base_rs::server::access_security::AccessSecurityConfig`]
 //! (dumped via its `dump_report()`, shared with the `asdbdump` iocsh
 //! command) — never the raw `.access` file text, which could be stale
-//! relative to the live rules after a hot reload (the defect
-//! `R0604-BRCAGW-R3-RAW-ACCESS-REPORT-1` closes). The one piece C's
+//! relative to the live rules after a hot reload (the defect this
+//! closes). The one piece C's
 //! verbose `asDumpFP(..., TRUE)` adds that R3 omits is the live
 //! AS-member/client listing: this gateway models no `asgMemberList`
 //! (see the `aspmem` iocsh command note), so the dump covers the parsed

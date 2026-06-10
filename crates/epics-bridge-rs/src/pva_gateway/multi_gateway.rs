@@ -345,7 +345,7 @@ impl MultiTenantPvaGatewayBuilder {
                 ds.audit.clone().unwrap_or_else(|| Arc::new(NoopAudit));
             // Collect EVERY per-tenant proxy source (unlayered) so the
             // optional control source can administer all of them, not
-            // just the first (BRIDGE-RS-2026-05-28-73). The control
+            // just the first. The control
             // source operates on the unlayered proxies — its diagnostic
             // PVs are not access-gated.
             let mut gw_sources: Vec<GatewayChannelSource> = Vec::new();
@@ -354,7 +354,7 @@ impl MultiTenantPvaGatewayBuilder {
                 src.connect_timeout = self.connect_timeout;
                 src.max_subscribers = self.max_subscribers;
                 // Per-credential caches built lazily by this source must
-                // honor the configured policy too (BRIDGE-RS-2026-05-28-26).
+                // honor the configured policy too.
                 src.cleanup_interval = self.cleanup_interval;
                 src.per_credential_max_entries = self.max_cache_entries;
                 gw_sources.push(src.clone());

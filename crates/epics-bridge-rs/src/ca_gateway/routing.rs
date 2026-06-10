@@ -139,7 +139,6 @@ mod tests {
     /// (gateway.cc:369-372). `0` and `garbage` are present-non-NO, so both
     /// become `YES`; an already-`YES` value stays `YES`; an explicit `NO`
     /// (any case) and an absent variable are left untouched.
-    /// Regression R0604-BRCAGW-ROUTING-CIP-AUTOBEACON-1.
     #[test]
     fn cip_rewrites_present_non_no_beacon_auto_to_yes() {
         let beacon_pair = |beacon: Option<&str>| {
@@ -168,7 +167,6 @@ mod tests {
     /// The beacon-auto rewrite is gated on `-cip`: without `-cip` a present
     /// `EPICS_CAS_AUTO_BEACON_ADDR_LIST` is never touched (C only runs the
     /// rewrite inside the `client_ip_addr` branch).
-    /// Regression R0604-BRCAGW-ROUTING-CIP-AUTOBEACON-1.
     #[test]
     fn beacon_auto_rewrite_requires_cip() {
         let pairs = routing_env_pairs(None, None, None, None, Some("0"));

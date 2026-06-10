@@ -169,7 +169,6 @@ impl GroupPvDef {
     /// byte-identical to pvxs `Group::show`. Shares the channeled-target
     /// rules with the monitor mark path
     /// ([`super::group::GroupMonitor::value_event_mark`]).
-    /// Regression R0604-BRQSRV-PVXSL-PVXGL-DIAG-FORMAT-1.
     pub fn resolved_trigger_targets(&self, idx: usize) -> Vec<&str> {
         let Some(source) = self.members.get(idx) else {
             return Vec::new();
@@ -245,7 +244,7 @@ pub enum TriggerDef {
 /// deleted (deleting it with no separator would splice `1/*x*/2` into the
 /// single token `12`, turning input YAJL rejects into a different valid
 /// document), and an unterminated block comment returns an error instead
-/// of being silently stripped to EOF (`R0604-BRQSRV-GROUP-JSON-COMMENT-CONCAT-1`).
+/// of being silently stripped to EOF.
 ///
 /// Group names and member field names are always quoted in the upstream
 /// dialect, so only `+`-prefixed option keys are ever unquoted; this
@@ -708,7 +707,6 @@ fn raw_to_group_def(name: String, raw: RawGroupDef) -> BridgeResult<GroupPvDef> 
             // ID); the last-wins merge in `merge_group_defs` then keeps the
             // last NON-EMPTY id and leaves a prior id intact when a later
             // fragment supplies an empty `+id`, matching pvxs.
-            // Regression R0604-BRQSRV-GROUP-EMPTY-ID-MERGE-1.
             Some(s) if s.is_empty() => None,
             Some(s) => Some(s),
             None => {
@@ -862,7 +860,6 @@ fn parse_member(field_name: &str, value: &serde_json::Value) -> BridgeResult<Gro
             // it as a nonexistent field rather than triggering `b`. Trimming
             // here would make Rust trigger `b`, diverging from pvxs and
             // changing the group's changed-bitset/monitor fanout.
-            // Regression R0604-QSRV-TRIGGER-WHITESPACE-1.
             Some(s) => TriggerDef::Fields(s.split(',').map(|f| f.to_string()).collect()),
         }
     };
@@ -1118,7 +1115,7 @@ mod tests {
         }
     }
 
-    /// Regression R0604-QSRV-TRIGGER-WHITESPACE-1: pvxs `defineTriggers`
+    /// pvxs `defineTriggers`
     /// (groupconfigprocessor.cpp:299-309) splits `+trigger` on commas with
     /// `std::getline` and inserts each substring VERBATIM — no trim. So
     /// `"a, b"` yields targets `a` and `" b"`, and exact `fieldMap`
@@ -1205,7 +1202,7 @@ mod tests {
         assert_eq!(defs[0].members[0].channel, "A/*not a comment*/B//x");
     }
 
-    /// Regression R0604-BRQSRV-GROUP-JSON-COMMENT-CONCAT-1: YAJL treats a
+    /// YAJL treats a
     /// comment as whitespace (`allow_comments`, configparse.cpp:231/249), so
     /// it SEPARATES the tokens it stands between. A block comment wedged
     /// between two numbers (`1/*x*/2`) leaves two number tokens where a comma
@@ -1230,7 +1227,7 @@ mod tests {
         );
     }
 
-    /// Regression R0604-BRQSRV-GROUP-JSON-COMMENT-CONCAT-1: an unterminated
+    /// An unterminated
     /// `/* ... */` is a YAJL parse error, not silently stripped to EOF. The
     /// previous normalizer ran the strip past the end and accepted the
     /// preceding text if it happened to be valid.
@@ -1540,7 +1537,7 @@ mod tests {
         );
     }
 
-    /// Regression R0604-BRQSRV-GROUP-ATOMIC-CONFIG-1. pvxs assigns group
+    /// pvxs assigns group
     /// `+atomic` with `value.as<bool>()` (groupprocessorcontext.cpp:29),
     /// so a numeric, real, or `"true"`/`"false"` scalar sets atomicity by
     /// nonzero truthiness (data.cpp:402-461). A numeric `+atomic` must
@@ -1588,7 +1585,7 @@ mod tests {
         }
     }
 
-    /// Regression R0604-BRQSRV-GROUP-ATOMIC-CONFIG-1. A `+atomic` value
+    /// A `+atomic` value
     /// that `as<bool>` cannot coerce (a non-`"true"`/`"false"` string,
     /// array, object, null) raises NoConvert in pvxs, which is caught per
     /// group — the bad group is dropped, its valid siblings survive
@@ -1604,8 +1601,8 @@ mod tests {
         assert_eq!(groups[0].name, "G:good", "the bad +atomic group is dropped");
     }
 
-    /// Regression R0604-BRQSRV-GROUP-ATOMIC-CONFIG-1 (same defect family,
-    /// `+id`). pvxs assigns `+id` with `value.as<std::string>()`
+    /// Same defect family as `+atomic` coercion, applied to
+    /// `+id`. pvxs assigns `+id` with `value.as<std::string>()`
     /// (groupprocessorcontext.cpp:33), coercing a numeric `+id` to its
     /// base-10 string. A numeric `+id` must parse, not fail the whole file.
     #[test]
@@ -1620,8 +1617,8 @@ mod tests {
         );
     }
 
-    /// Regression R0604-BRQSRV-GROUP-ATOMIC-CONFIG-1 (same defect family,
-    /// `+id`). A `+id` that `as<std::string>` cannot coerce (array,
+    /// Same defect family as `+atomic` coercion, applied to
+    /// `+id`. A `+id` that `as<std::string>` cannot coerce (array,
     /// object, null) is a per-group NoConvert, not a whole-file failure.
     #[test]
     fn config_bad_id_skips_only_that_group() {
@@ -1634,7 +1631,7 @@ mod tests {
         assert_eq!(groups[0].name, "G:good", "the bad +id group is dropped");
     }
 
-    /// Regression R0604-BRQSRV-GROUP-EMPTY-ID-MERGE-1. pvxs merges `+id`
+    /// pvxs merges `+id`
     /// into the group definition only when the coerced string is non-empty
     /// (groupconfigprocessor.cpp:187-188), so a later fragment that supplies
     /// an empty `+id` must NOT clear an earlier non-empty structure ID, while

@@ -1,4 +1,4 @@
-//! Regression R0604-BRPVALINK-NOT-SEAM-WIRED-1 — the `pva` link set
+//! The `pva` link set
 //! (pvalink) must install at the base `AfterCaLinkInit` seam via
 //! [`IocApplication::register_link_set_installer`], so a `pva://` link
 //! loaded before iocInit lands in the working set of the iocInit

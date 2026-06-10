@@ -1787,7 +1787,7 @@ pub struct GroupMonitor {
     /// only pins the channel open so `poll()` *parks* on a quiet stream.
     /// `None` from `poll()` therefore means teardown (`stop()` cleared
     /// `event_rx`) or a read error — never "no member events left to
-    /// forward". Regression R0604-BRQSRV-GROUP-CONST-MONITOR-FINISH-1.
+    /// forward".
     event_tx: Option<tokio::sync::mpsc::Sender<MemberEvent>>,
     /// Handles for spawned per-member tasks. Wrapped in AbortOnDrop
     /// so a quiet PV (no events between subscribe-then-drop cycles)
@@ -2243,8 +2243,7 @@ impl super::provider::PvaMonitor for GroupMonitor {
         // quiet. poll() then *parks* instead of returning None, so the
         // forward task never reads source-close and never emits a premature
         // MONITOR FINISH — pvxs keeps an all-const subscription open until
-        // the client cancels (groupsource.cpp:240-300). Regression
-        // R0604-BRQSRV-GROUP-CONST-MONITOR-FINISH-1.
+        // the client cancels (groupsource.cpp:240-300).
         self.event_tx = Some(tx);
         self.group_channel = Some(group_channel);
         self.event_rx = Some(rx);
@@ -2266,8 +2265,7 @@ impl super::provider::PvaMonitor for GroupMonitor {
         // pvxs `groupsource.cpp:240-300` (an all-const subscription is left
         // open after the initial post). `None` here therefore means teardown
         // (`stop()` cleared `event_rx`) or a read error — never "no member
-        // events left to forward" (Regression
-        // R0604-BRQSRV-GROUP-CONST-MONITOR-FINISH-1). A channel-backed group
+        // events left to forward". A channel-backed group
         // forwards each member event
         // as it arrives, with NO gate on other members posting first: pvxs
         // primes every field from sampled values at start via
@@ -2319,7 +2317,7 @@ impl super::provider::PvaMonitor for GroupMonitor {
         // error and exits even before its AbortOnDrop guard fires. Clearing
         // the keepalive here is what lets a future poll() report teardown —
         // while running, the keepalive keeps poll() parking on a quiet
-        // stream (Regression R0604-BRQSRV-GROUP-CONST-MONITOR-FINISH-1).
+        // stream.
         self.event_rx = None;
         self.event_tx = None;
 
@@ -2806,7 +2804,7 @@ mod tests {
         );
     }
 
-    /// Regression R0604-BRQSRV-ENUM-BITSET-1. A value/alarm event on an
+    /// A value/alarm event on an
     /// NTEnum group member must narrow its `value` leaf to `value.index`,
     /// not mark the whole `value` subtree. pvxs assigns only `value.index`
     /// on a value event (`iocsource.cpp:107-109,331-351`) and fills
@@ -3219,7 +3217,7 @@ mod tests {
         }
     }
 
-    /// Regression R0604-BRQSRV-RECORD-OPTIONS-MERGE-1. A group member
+    /// A group member
     /// mapped under `record.*` (e.g. `record.status`) must survive
     /// alongside the built-in `record._options` branch in both the
     /// composed value (GET/MONITOR share `read_group`) and the
@@ -3551,8 +3549,7 @@ mod tests {
     /// all-const subscription open until the client cancels
     /// (`groupsource.cpp:240-300`). The keepalive sender in
     /// [`GroupMonitor::start`] now pins the channel open so poll() parks:
-    /// the client sees exactly one DATA frame and the stream stays open
-    /// (Regression R0604-BRQSRV-GROUP-CONST-MONITOR-FINISH-1).
+    /// the client sees exactly one DATA frame and the stream stays open.
     #[tokio::test]
     async fn bridge114_all_const_group_monitor_emits_no_stream_snapshot() {
         use crate::qsrv::provider::PvaMonitor;

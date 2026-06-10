@@ -440,7 +440,7 @@ mod tests {
     /// onto one entry); and (c) exclude OUT links (no monitor signal).
     /// `insert_for_test` seeds links without a PVA server.
     ///
-    /// BRIDGE-RS-2026-05-28-128: pre-fix this deduped by bare PV name,
+    /// Pre-fix this deduped by bare PV name,
     /// collapsing the `Q=1` and `Q=8` variants of `A:PV` into one wait
     /// entry — so a record could begin processing before its own
     /// monitor variant connected.

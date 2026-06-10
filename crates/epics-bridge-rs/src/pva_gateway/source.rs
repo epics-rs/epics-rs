@@ -285,7 +285,7 @@ pub struct GatewayChannelSource {
     /// carry the SAME policy to credentialed caches so a site that
     /// tunes `cleanup_interval` / `max_cache_entries` for resource
     /// control gets one uniform policy across anonymous and
-    /// authenticated peers (BRIDGE-RS-2026-05-28-26). pva2pva gives
+    /// authenticated peers. pva2pva gives
     /// each named client provider its own `ChannelCache` with the
     /// configured bound (`p2pApp/server.h:9-16`), so `max_cache_entries`
     /// is a per-cache cap here too — matching that one-cache-per-client
@@ -596,7 +596,7 @@ impl GatewayChannelSource {
         // not a hardcoded interval/ceiling. A site that lowers
         // `max_cache_entries` or changes `cleanup_interval` for resource
         // control now gets one uniform policy for anonymous AND
-        // credentialed peers (BRIDGE-RS-2026-05-28-26). pva2pva bounds
+        // credentialed peers. pva2pva bounds
         // each named client's `ChannelCache` by the configured cap
         // (`p2pApp/server.h:9-16`).
         let new_cache = ChannelCache::with_max_entries(
@@ -792,7 +792,7 @@ impl GatewayChannelSource {
     /// from the channel count (`p2pApp/server.cpp:158-175`), so the
     /// control surface can tell "many channels on one upstream" apart from
     /// "many credentialed upstreams" — the old single `cacheSize` counter
-    /// conflated the two (BRIDGE-RS-2026-05-28-77).
+    /// conflated the two.
     pub fn upstream_cache_count(&self) -> usize {
         1 + self.upstream_caches.lock().values().len()
     }

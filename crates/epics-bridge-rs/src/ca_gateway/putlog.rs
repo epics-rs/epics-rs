@@ -336,8 +336,6 @@ mod tests {
         let _ = std::fs::remove_file(&temp);
     }
 
-    /// Regression R0604-BRCAGW-PUTLOG-BODY-WITHOUT-CAPUTLOG-1.
-    ///
     /// The default `--putlog` ([`PutLogScope::TrapWrite`]) file line must
     /// be exactly the C default build's `"%s %s@%s %s\n"` —
     /// `timestamp user@host pv` — with NO value and NO `old=` field. Those

@@ -63,7 +63,7 @@ pub const DEFAULT_MAX_ENTRIES: usize = 50_000;
 // connection — it has no negative-admission table that suppresses
 // re-probing for a fixed TTL. A 30 s negative LRU here made a PV that
 // appears shortly after a failed search stay "not found" until the TTL
-// lapsed or an operator dropped the name (BRIDGE-RS-2026-05-28-87). The
+// lapsed or an operator dropped the name. The
 // probe-storm DoS the LRU originally guarded was structurally closed
 // separately: existence probes (`has_pv` / `get_introspection`) no
 // longer spawn upstream monitor tasks (they issue one-shot
@@ -768,7 +768,7 @@ pub struct ChannelCache {
     /// is the downstream effect of pva2pva dropping a `ChannelCacheEntry`
     /// (`channel->destroy()` → `channelStateChange(DESTROYED)` fanout,
     /// chancache.cpp:34-99). Delivery is lossless by construction, so even a
-    /// full-cache `:flush` cannot drop a name (R0604-BRPVAGW-FLUSH-1). Unset
+    /// full-cache `:flush` cannot drop a name. Unset
     /// until wired (standalone caches in tests, or before the server attaches).
     invalidator: OnceLock<ChannelInvalidator>,
 }
@@ -908,7 +908,7 @@ impl ChannelCache {
     /// cleanup tick (review §3f). A subsequent lookup for the same key
     /// re-probes upstream — there is no negative-admission TTL that
     /// would keep a now-available PV "not found" (pva2pva parity, see
-    /// the module-level note; BRIDGE-RS-2026-05-28-87).
+    /// the module-level note).
     ///
     /// **Cancel safety**: cleanup of the freshly-inserted entry uses
     /// a drop guard so an awaiting future being cancelled
@@ -1027,7 +1027,7 @@ impl ChannelCache {
             Err(e) => {
                 // Guard fires on drop to remove the unconnected entry.
                 // No negative-result record: the next lookup re-probes
-                // upstream (pva2pva parity, BRIDGE-RS-2026-05-28-87).
+                // upstream (pva2pva parity).
                 Err(e)
             }
         }
@@ -1484,8 +1484,8 @@ impl ChannelCache {
 
     /// Configured hard cap on cached entries for this cache. Exposed so
     /// the gateway can verify that per-credential caches inherit the
-    /// configured policy rather than a hardcoded default
-    /// (BRIDGE-RS-2026-05-28-26) and for control-status reporting.
+    /// configured policy rather than a hardcoded default,
+    /// and for control-status reporting.
     pub fn max_entries(&self) -> usize {
         self.max_entries
     }
@@ -1500,8 +1500,8 @@ impl ChannelCache {
         self.cleaner_removed.load(Ordering::Relaxed)
     }
 
-    /// Per-entry status snapshot for the control status report
-    /// (BRIDGE-RS-2026-05-28-77). Mirrors the per-channel detail
+    /// Per-entry status snapshot for the control status report.
+    /// Mirrors the per-channel detail
     /// pva2pva's `status_client` emits at verbose levels
     /// (`p2pApp/server.cpp:203-230`): upstream connection state,
     /// downstream subscriber count, and the idle-eviction grace bit.
@@ -1551,8 +1551,8 @@ impl ChannelCache {
     /// channels (the downstream effect of dropping the cache entry, pva2pva
     /// `channel->destroy()` fanout). One command = one batch regardless of how
     /// many entries it removed, and the per-connection queues are unbounded,
-    /// so no name is ever dropped even on a full-cache `:flush`
-    /// (R0604-BRPVAGW-FLUSH-1). No-op when the cache is not wired to a server
+    /// so no name is ever dropped even on a full-cache `:flush`.
+    /// No-op when the cache is not wired to a server
     /// (standalone caches in tests) or when the batch is empty. Only
     /// operator-driven removal publishes: the idle cleanup tick evicts entries
     /// that have no downstream interest, so disconnecting on eviction would
@@ -2406,8 +2406,6 @@ mod tests {
         );
     }
 
-    /// Regression R0604-BRPVAGW-FLUSH-1.
-    ///
     /// As the single removal owner, `drop_entry` publishes the
     /// removed PV name on the wired channel invalidator so the
     /// native server force-disconnects the downstream channel (the
@@ -2437,8 +2435,6 @@ mod tests {
         );
     }
 
-    /// Regression R0604-BRPVAGW-FLUSH-1.
-    ///
     /// `flush` publishes every distinct removed name so all downstream
     /// channels bound to dropped entries are force-disconnected, not merely
     /// starved of events — and it does so as ONE batch, not one message per
@@ -2467,8 +2463,6 @@ mod tests {
         );
     }
 
-    /// Regression R0604-BRPVAGW-MONITOR-VARIANT-CACHESIZE-1.
-    ///
     /// One PV asked for under several distinct pvRequests is ONE cached
     /// channel with several unique subscriptions — pva2pva keys the top-level
     /// `ChannelCache::entries` by channel name and nests the per-pvRequest

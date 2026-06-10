@@ -62,7 +62,7 @@ const GROUP_JSON_NAMED_TRIGGER: &str = r#"{
 // zero member tasks. pvxs `groupsource.cpp:240-300` posts the single
 // initial value and then leaves the subscription OPEN until the client
 // cancels ("maybe post initial here in pathological case with no +channel
-// (eg. all const)"). Regression R0604-BRQSRV-GROUP-CONST-MONITOR-FINISH-1.
+// (eg. all const)").
 const GROUP_JSON_ALLCONST: &str = r#"{
     "TEST:allconst": {
         "+id": "epics:nt/NTScalar:1.0",
@@ -294,8 +294,6 @@ async fn group_monitor_subscribes_archive_log_events() {
 /// makes the fan-in channel close as soon as `start()` returns, so `poll()`
 /// resolves to `None` immediately and `timeout(...)` is `Ok(None)` — the
 /// `is_err()` assertion fails.
-///
-/// Regression R0604-BRQSRV-GROUP-CONST-MONITOR-FINISH-1.
 #[tokio::test]
 async fn allconst_group_monitor_poll_parks_instead_of_finishing() {
     use epics_bridge_rs::qsrv::group::GroupMonitor;
@@ -347,8 +345,6 @@ async fn allconst_group_monitor_poll_parks_instead_of_finishing() {
 /// `tokio::select!` leaves `poll()` parked forever for an all-const group,
 /// so the monitor — and its `Arc<PvDatabase>` clones — never drop after the
 /// receiver is dropped, and the strong count never returns to baseline.
-///
-/// Regression R0604-BRQSRV-GROUP-CONST-MONITOR-FINISH-1.
 #[tokio::test]
 async fn allconst_group_subscribe_stays_open_then_tears_down_on_cancel() {
     use epics_bridge_rs::qsrv::QsrvPvStore;

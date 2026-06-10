@@ -470,7 +470,7 @@ fn expand_template(pattern: &Regex, input: &str, template: &str) -> String {
 /// previous `order` value unchanged (C never assigns `eval_order` on the
 /// invalid branch). The only hard error is an I/O failure reading the file,
 /// which lives in [`parse_pvlist_file`]; this string parser therefore always
-/// returns `Ok`. Regression R0604-BRCAGW-PVLIST-LINE-ERROR-ABORT-1.
+/// returns `Ok`.
 pub fn parse_pvlist(content: &str) -> BridgeResult<PvList> {
     let mut list = PvList::new();
 
@@ -667,7 +667,7 @@ fn parse_order_directive<'a>(
 /// when no digit follows the optional sign — the case where C `sscanf`
 /// returns 0 and the caller applies the `lev=1` fallback. Tokens reach here
 /// already split on whitespace, so there is no leading whitespace for
-/// `sscanf` to skip. Regression R0604-BRCAGW-PVLIST-ASL-PREFIX-1.
+/// `sscanf` to skip.
 fn sscanf_int_prefix(token: &str) -> Option<i32> {
     let bytes = token.as_bytes();
     let mut end = 0;
@@ -766,7 +766,6 @@ fn build_pattern(pat: &str, lineno: usize) -> BridgeResult<Regex> {
     // the alternation under both anchors without consuming a capture index, so
     // the `\1`..`\9` ALIAS backreference numbering in `expand_template` (which
     // indexes captures positionally) is unchanged.
-    // Regression R0604-BRCAGW-PVLIST-BRE-ALT-ANCHOR-1.
     let anchored = format!("^(?:{translated})$");
     Regex::new(&anchored).map_err(|e| {
         BridgeError::GroupConfigError(format!("line {lineno}: invalid regex '{pat}': {e}"))
@@ -1147,8 +1146,8 @@ mod tests {
             }
         }
 
-        // No-FROM combined with comma tokenization (BRIDGE-RS-2026-05-28-12
-        // host splitting still applies without the keyword).
+        // No-FROM combined with comma tokenization (host splitting still
+        // applies without the keyword).
         let list = parse_pvlist("PV.* DENY h1,h2 ,h3").unwrap();
         if let PvListEntry::Deny { from_hosts, .. } = &list.entries[0] {
             assert_eq!(from_hosts, &["h1", "h2", "h3"]);
@@ -1215,7 +1214,7 @@ mod tests {
         // Unknown command: C logs "invalid command '%s'" and the loop iterates
         // to the next line (gateAs.cc:627-629) — the malformed line is dropped,
         // not a whole-file abort. parse_rule_line still reports the error; the
-        // file parser skips it. Regression R0604-BRCAGW-PVLIST-LINE-ERROR-ABORT-1.
+        // file parser skips it.
         assert!(parse_rule_line("foo BAD", 1).is_err());
         let list = parse_pvlist("foo BAD").unwrap();
         assert!(list.entries.is_empty(), "unknown command line skipped");
@@ -1260,7 +1259,6 @@ mod tests {
         // Bad pattern: C's gateAsEntry::init() fails, the entry is deleted and
         // the loop continues (gateAs.cc:619-620). parse_rule_line reports the
         // error; the file parser skips just that line.
-        // Regression R0604-BRCAGW-PVLIST-LINE-ERROR-ABORT-1.
         assert!(parse_rule_line("[invalid ALLOW", 1).is_err());
         let list = parse_pvlist("[invalid ALLOW").unwrap();
         assert!(list.entries.is_empty(), "invalid-regex line skipped");
@@ -1271,13 +1269,12 @@ mod tests {
         // Missing ALIAS real-name target: C logs "missing real name in ALIAS
         // command" and `continue`s (gateAs.cc:602-605). parse_rule_line reports
         // the error; the file parser skips just that line, not the whole file.
-        // Regression R0604-BRCAGW-PVLIST-LINE-ERROR-ABORT-1.
         assert!(parse_rule_line("foo ALIAS", 1).is_err());
         let list = parse_pvlist("foo ALIAS").unwrap();
         assert!(list.entries.is_empty(), "ALIAS-missing-target line skipped");
     }
 
-    /// Regression R0604-BRCAGW-PVLIST-LINE-ERROR-ABORT-1: a single malformed
+    /// A single malformed
     /// `.pvlist` line must NOT abort the whole load/reload. C `gateAs::readPvList`
     /// (gateAs.cc:530-632) logs and `continue`s on every malformed line family —
     /// missing command (:532-535), missing/invalid ORDER operands (:585,:593-597,
@@ -1389,7 +1386,7 @@ mod tests {
         );
     }
 
-    /// Regression R0604-BRCAGW-PVLIST-ASL-PREFIX-1: C reads the ASL token with
+    /// C reads the ASL token with
     /// `sscanf(asl,"%d",&lev)` (gateAs.cc:611), which consumes a leading signed
     /// decimal prefix and ignores trailing bytes. A whole-token
     /// `s.parse::<i32>()` rejected `0junk`/`1foo`/`-1tail` and fell back to
@@ -1694,7 +1691,7 @@ mod tests {
         assert!(list.match_name("a").is_none(), "bare | does not alternate");
     }
 
-    /// Regression R0604-BRCAGW-PVLIST-BRE-ALT-ANCHOR-1. An UNGROUPED GNU/BRE
+    /// An UNGROUPED GNU/BRE
     /// alternation `foo\|bar` is C-valid: C compiles it with
     /// `re_compile_pattern` (gateAs.cc:236) and admits a name only when
     /// `re_match(...) == len` (gateAs.cc:386-405) — a WHOLE-string match of
@@ -1753,7 +1750,7 @@ mod tests {
         // ...but at the file level the unrepresentable line is skipped, not a
         // whole-file abort — C compiles BRE `\1` fine, so dropping just this
         // line keeps the Rust port's reload behaviour C-compatible for the
-        // valid siblings. Regression R0604-BRCAGW-PVLIST-LINE-ERROR-ABORT-1.
+        // valid siblings.
         let list = parse_pvlist(r"\(.*\)\1 ALLOW").unwrap();
         assert!(list.entries.is_empty(), "back-reference line skipped");
     }

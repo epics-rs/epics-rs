@@ -554,8 +554,6 @@ mod tests {
         );
     }
 
-    /// Regression R0604-BRCAGW-PROP-1.
-    ///
     /// `add_property_interest` returns `true` only on the empty→first edge;
     /// `remove_property_interest` returns `true` only on the last→empty
     /// edge. These two booleans are what the no-cache owner uses to create
@@ -615,8 +613,6 @@ mod tests {
         );
     }
 
-    /// Regression R0604-BRCAGW-PROP-1.
-    ///
     /// Value interest and property interest are independent refcounts: a
     /// value-only subscription (no DBE_PROPERTY bit) never adds to
     /// `prop_interest`, so `remove_property_interest` on its sid at close is

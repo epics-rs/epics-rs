@@ -566,8 +566,7 @@ mod tests {
         let pvlist = Arc::new(ArcSwap::from_pointee(PvList::new()));
         // R3 renders the *parsed* access-security structures (the
         // UAG/HAG/ASG/RULE dump), not the raw ACF file text — so load the
-        // ACF as parsed rules here. Regression
-        // R0604-BRCAGW-R3-RAW-ACCESS-REPORT-1.
+        // ACF as parsed rules here.
         let access = Arc::new(ArcSwap::from_pointee(
             AccessConfig::from_file(&acf_path).unwrap(),
         ));

@@ -81,8 +81,6 @@ impl PvaPvHandle {
     /// descriptor mismatch the previous `latest` is left untouched and no
     /// subscriber receives a frame. A descriptor-less PV (`None`) has no
     /// canonical contract and accepts every post.
-    ///
-    /// Regression R0604-BRQSRV-NATIVE-PVA-BAD-POST-CLEARS-VALUE-1.
     pub fn post(&self, value: PvField) -> Result<(), ValueDescMismatch> {
         if let Some(desc) = &self.descriptor {
             value_matches_descriptor(&value, desc)?;
@@ -320,8 +318,7 @@ fn spawn_db_monitor_updates(
             // a parked poll() would keep the monitor — and its member
             // DbSubscriptions — alive forever after the op tore down.
             // `poll() == None` still means a genuine source-close / read
-            // error and breaks. Regression
-            // R0604-BRQSRV-GROUP-CONST-MONITOR-FINISH-1.
+            // error and breaks.
             tokio::select! {
                 _ = tx.closed() => break,
                 poll = monitor.poll() => {
@@ -653,8 +650,6 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                             // See `spawn_db_monitor_updates`: park on poll()
                             // but tear down on downstream drop so a quiet /
                             // all-const monitor does not leak after cancel.
-                            // Regression
-                            // R0604-BRQSRV-GROUP-CONST-MONITOR-FINISH-1.
                             tokio::select! {
                                 _ = tx.closed() => break,
                                 poll = monitor.poll() => {
@@ -935,8 +930,7 @@ impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
                 loop {
                     // See `spawn_db_monitor_updates`: park on poll() but tear
                     // down on downstream drop so a quiet / all-const monitor
-                    // does not leak after cancel. Regression
-                    // R0604-BRQSRV-GROUP-CONST-MONITOR-FINISH-1.
+                    // does not leak after cancel.
                     tokio::select! {
                         _ = tx.closed() => break,
                         poll = monitor.poll() => {
@@ -1506,7 +1500,6 @@ mod tests {
     /// validating write owner that reproduces this: a bad post returns
     /// `Err`, leaves `latest` untouched, and fans out nothing — `latest`
     /// can only ever hold a descriptor-valid value, by construction.
-    /// Regression R0604-BRQSRV-NATIVE-PVA-BAD-POST-CLEARS-VALUE-1.
     #[tokio::test]
     async fn native_pva_bad_post_keeps_prior_value_and_skips_monitor() {
         use epics_base_rs::server::database::PvDatabase;
@@ -1580,7 +1573,6 @@ mod tests {
     /// `open()` / the first accepted post, where `fetch()` has nothing to
     /// return. The bad frame must not be coerced into a fabricated
     /// snapshot.
-    /// Regression R0604-BRQSRV-NATIVE-PVA-BAD-POST-CLEARS-VALUE-1.
     #[tokio::test]
     async fn native_pva_bad_first_post_leaves_no_current_value() {
         use epics_base_rs::server::database::PvDatabase;

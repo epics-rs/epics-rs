@@ -430,8 +430,7 @@ mod tests {
 
         // The pvxs `pvxrefshow`/`pvxrefsave`/`pvxrefdiff` reference-leak
         // diagnostic family belongs to the PVA library, not pvalink:
-        // pvalink must NOT squat any of those names
-        // (BRIDGE-RS-2026-05-28-83).
+        // pvalink must NOT squat any of those names.
         assert!(!names.contains(&"pvxrefdiff"));
         assert!(!names.contains(&"pvxrefsave"));
         assert!(!names.contains(&"pvxrefshow"));

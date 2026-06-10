@@ -839,7 +839,7 @@ mod tests {
         forwarder.abort();
     }
 
-    /// A9-R3-3: when the forwarder skips a span on its own raw-broadcast
+    /// When the forwarder skips a span on its own raw-broadcast
     /// lag (`seq += n` + `advance_high_water`, never recording the
     /// dropped events), the live stream jumps. The consumer must observe
     /// `GapTruncated{missed}` for the hole — pre-fix the Ok branch
@@ -895,7 +895,7 @@ mod tests {
         assert!(matches!(recv.recv().await, ConnEventRecv::Closed));
     }
 
-    /// A9-R3-3: an interior hole inside a *recovered* set, on a double
+    /// An interior hole inside a *recovered* set, on a double
     /// (forwarder + consumer) lag. The log holds 1,2,5,6 (3,4 skipped by
     /// the forwarder) and the consumer also lags so it recovers the
     /// whole set from the log. The single discontinuity gate must still

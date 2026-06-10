@@ -296,7 +296,6 @@ fn validate(cfg: &GatewayConfigFile) -> Result<(), String> {
     for (i, a) in cfg.clients.iter().enumerate() {
         // C gwmain.cpp:298-299 rejects an empty client name before the
         // duplicate check, configure_client, or any provider use.
-        // Regression R0604-BRPVAGW-CONFIG-EMPTY-NAMES-1.
         if a.name.is_empty() {
             return Err("Client with empty name not allowed".to_string());
         }
@@ -315,7 +314,7 @@ fn validate(cfg: &GatewayConfigFile) -> Result<(), String> {
     }
     for (i, a) in cfg.servers.iter().enumerate() {
         // C gwmain.cpp:314-315 rejects an empty server name before the
-        // duplicate check. Regression R0604-BRPVAGW-CONFIG-EMPTY-NAMES-1.
+        // duplicate check.
         if a.name.is_empty() {
             return Err("Server with empty name not allowed".to_string());
         }
@@ -756,7 +755,7 @@ mod tests {
 
     #[test]
     fn empty_client_name_rejected() {
-        // Regression R0604-BRPVAGW-CONFIG-EMPTY-NAMES-1: C gwmain.cpp:298-299
+        // C gwmain.cpp:298-299
         // rejects an empty client name before the duplicate check.
         let cfg = parse_config(
             r#"{"version":1,"clients":[{"name":"","provider":"pva"}],
@@ -771,7 +770,7 @@ mod tests {
 
     #[test]
     fn empty_server_name_rejected() {
-        // Regression R0604-BRPVAGW-CONFIG-EMPTY-NAMES-1: C gwmain.cpp:314-315
+        // C gwmain.cpp:314-315
         // rejects an empty server name before the duplicate check.
         let cfg = parse_config(
             r#"{"version":1,"clients":[{"name":"c","provider":"pva"}],

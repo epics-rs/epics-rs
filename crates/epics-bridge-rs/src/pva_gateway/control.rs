@@ -74,7 +74,7 @@ pub struct ControlSource {
     /// `flush` / `drop` reach ALL of them — pre-fix the control source
     /// held only the first upstream, so `<prefix>:cacheSize` could
     /// report zero and `flush` / `drop` could silently miss every
-    /// non-first tenant (BRIDGE-RS-2026-05-28-73). pva2pva's operator
+    /// non-first tenant. pva2pva's operator
     /// cache/status paths are client-aware, iterating every configured
     /// client (`p2pApp/server.cpp:102-138`, `:158-310`).
     gateway_sources: Vec<GatewayChannelSource>,
@@ -121,8 +121,7 @@ impl ControlSource {
     /// Register an additional upstream `GatewayChannelSource` under this
     /// control surface. A multi-tenant downstream calls this once per
     /// upstream label beyond the first so diagnostics and cache
-    /// administration span every tenant, not just the first
-    /// (BRIDGE-RS-2026-05-28-73).
+    /// administration span every tenant, not just the first.
     pub fn with_source(mut self, gateway_source: GatewayChannelSource) -> Self {
         self.gateway_sources.push(gateway_source);
         self
@@ -211,8 +210,8 @@ impl ControlSource {
     /// `(+N more)` tail.
     const REPORT_ROWS_PER_CACHE: usize = 64;
 
-    /// Build the multi-line `<prefix>:report` snapshot
-    /// (BRIDGE-RS-2026-05-28-77). pva2pva's status RPC walks every
+    /// Build the multi-line `<prefix>:report` snapshot.
+    /// pva2pva's status RPC walks every
     /// configured client and lists its cached channels with per-channel
     /// state (`p2pApp/server.cpp:158-230`); the old single-line report
     /// collapsed everything to three counters (and aliased
@@ -399,7 +398,7 @@ impl ControlSource {
             let cfg = epics_base_rs::server::access_security::parse_acf(&content)
                 .map_err(|e| format!("reload: cannot parse ACF file '{path}': {e}"))?;
             // Hot-swap the policy on EVERY upstream tenant of this
-            // downstream, not just the first (BRIDGE-RS-2026-05-28-73).
+            // downstream, not just the first.
             for src in &self.gateway_sources {
                 src.set_acf(Some(cfg.clone())).await;
             }
@@ -463,8 +462,7 @@ impl ChannelSource for ControlSource {
         // Aggregate across EVERY upstream tenant, and within each across
         // the shared cache AND every per-credential cache, so the
         // operator does not see zero while a non-first tenant's
-        // credentialed upstream monitors remain alive
-        // (BRIDGE-RS-2026-05-28-73).
+        // credentialed upstream monitors remain alive.
         let mut cache_size = 0i64;
         let mut upstream_count = 0i64;
         let mut live_subs = 0i64;
@@ -482,7 +480,7 @@ impl ChannelSource for ControlSource {
             // channel count. pva2pva reports these separately
             // (`p2pApp/server.cpp:158-175`); the old alias collapsed them
             // so an operator could not tell "many channels, one upstream"
-            // from "many credentialed upstreams" (BRIDGE-RS-2026-05-28-77).
+            // from "many credentialed upstreams".
             Some(Self::nt_scalar_long(upstream_count))
         } else if name.ends_with(":liveSubscribers") {
             Some(Self::nt_scalar_long(live_subs))
@@ -773,7 +771,7 @@ mod tests {
     /// same way `put_value` refuses a PUT. `process_checked`'s default
     /// delegates to `process` after its WRITE gate, so the single
     /// `process` override covers both entry points.
-    /// BRIDGE-RS-2026-05-28-73: control diagnostics and cache admin
+    /// Control diagnostics and cache admin
     /// must span EVERY upstream tenant of a multi-tenant downstream,
     /// not just the first. Only the SECOND tenant's cache is populated
     /// here; `cacheSize`, `drop`, and `flush` must all reach it.
@@ -837,7 +835,7 @@ mod tests {
         assert_eq!(reply_value(&v), 0, "drop + flush must empty all tenants");
     }
 
-    /// BRIDGE-RS-2026-05-28-77: `upstreamCount` must be distinct from
+    /// `upstreamCount` must be distinct from
     /// `cacheSize` (the old code aliased them), and `:report` must carry
     /// per-channel detail plus the cleaner counters rather than three
     /// collapsed numbers.

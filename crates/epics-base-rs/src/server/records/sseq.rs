@@ -1,5 +1,6 @@
 use super::link_status::{
-    DBF_UNKNOWN, LINK_CON as LNKV_CON, LINK_STATUS_CHOICES as SSEQ_LNKV_CHOICES, classify_link,
+    DBF_UNKNOWN, LINK_CON as LNKV_CON, LINK_STATUS_CHOICES as SSEQ_LNKV_CHOICES, LinkStatusGen,
+    classify_link,
 };
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
@@ -210,6 +211,13 @@ pub struct SseqRecord {
     /// status posts (`BUSY`/`WTGn`/`ABORTING`) and the `ABORT` finish
     /// re-entry — the surfaces a `process()` cannot reach itself.
     async_ctx: Option<(String, AsyncDbHandle)>,
+    /// Monotonic generation guarding `refresh_link_status`. Each refresh
+    /// classifies a *snapshot* of the `DOLn`/`LNKn`/`WAITn` link state
+    /// off-thread; a later refresh (a `special()` `DOLn`/`LNKn` re-point)
+    /// must win over an earlier one regardless of which spawned task finishes
+    /// first. The shared `LinkStatusGen` gate enforces the invariant — only
+    /// the latest classification may be published.
+    link_gen: LinkStatusGen,
 }
 
 impl Default for SseqRecord {
@@ -231,6 +239,7 @@ impl Default for SseqRecord {
             in_flight: Vec::new(),
             seq_wake: None,
             async_ctx: None,
+            link_gen: LinkStatusGen::default(),
         }
     }
 }
@@ -719,6 +728,12 @@ impl SseqRecord {
                 (s.dol.clone(), s.lnk.clone(), s.wait)
             })
             .collect();
+        let link_gen = self.link_gen.clone();
+        // Stamp this refresh. A concurrent later refresh (a runtime DOLn/LNKn
+        // re-point through `special()`) issues a newer token; this task then
+        // sees its token is stale and drops its post so an init-time snapshot
+        // finishing late cannot clobber the newer classification.
+        let token = link_gen.next();
         tokio::spawn(async move {
             // Let `add_record` finish registering this record before the
             // init post (this task may be spawned from `set_async_context`,
@@ -748,7 +763,10 @@ impl SseqRecord {
                 fields.push((LT_FIELDS[i].to_string(), EpicsValue::Short(lnk_ft)));
                 fields.push((WERR_FIELDS[i].to_string(), EpicsValue::Short(werr)));
             }
-            let _ = handle.post_fields(&name, fields).await;
+            // Publish only if no newer refresh was issued meanwhile.
+            if link_gen.is_current(token) {
+                let _ = handle.post_fields(&name, fields).await;
+            }
         });
     }
 

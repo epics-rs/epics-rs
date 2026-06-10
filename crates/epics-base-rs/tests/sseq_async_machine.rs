@@ -573,6 +573,45 @@ async fn sseq_link_status_loc_vs_con() {
     );
 }
 
+/// Boundary — a runtime `DOLn`/`LNKn` re-point (`special()` → `checkLinks`,
+/// sseqRecord.c:862-941) must not be clobbered by a *stale* concurrent
+/// refresh. `refresh_link_status` classifies a snapshot of the link strings
+/// off-thread; the init-time refresh (empty link → `CON`) can finish *after*
+/// the runtime re-point refresh (local link → `LOC`). The monotonic
+/// generation gate makes the later classification win regardless of which
+/// spawned task posts last, so `DOL1V` settles at `LOC` and stays there.
+#[tokio::test]
+async fn sseq_link_status_reclassifies_on_special() {
+    let db = PvDatabase::new();
+    db.add_record("SSEQ_SP_TGT", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    db.add_record("SSEQ_SP", Box::new(SseqRecord::new()))
+        .await
+        .unwrap();
+
+    // Empty DOL1 at init → CON (3).
+    poll_i16(&db, "SSEQ_SP.DOL1V", 3, "empty DOL1 → CON").await;
+
+    // A client put to the DOL1 link string re-runs checkLinks via special().
+    // The init-time CON refresh and this LOC refresh race; the gate must let
+    // the newer LOC classification win.
+    db.put_pv("SSEQ_SP.DOL1", EpicsValue::String("SSEQ_SP_TGT.VAL".into()))
+        .await
+        .unwrap();
+    poll_i16(&db, "SSEQ_SP.DOL1V", 2, "DOL1 repointed to local → LOC").await;
+
+    // And it must stay LOC — a stale CON post arriving late cannot clobber it.
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(
+            read_i16(&db, "SSEQ_SP.DOL1V").await,
+            2,
+            "DOL1V must remain LOC; a stale refresh must not clobber it",
+        );
+    }
+}
+
 /// Boundary — `WERRn` is REDEFINED from C (sseqRecord.c:915-927). C raises
 /// it for a local DB link with `WAITn` (it cannot `dbCaPutLinkCallback` a
 /// non-CA link); the Rust `WriteDbLinkNotify` seam DOES complete on a local

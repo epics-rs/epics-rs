@@ -1,10 +1,8 @@
-use super::link_status::{LINK_CON, LINK_STATUS_CHOICES, classify_link};
+use super::link_status::{LINK_CON, LINK_STATUS_CHOICES, LinkStatusGen, classify_link};
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
 use crate::server::record::{FieldDesc, ProcessAction, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue, PvString};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Per-input link-status diagnostic field names (`INAV`..`INUV`), one per
 /// calc input A..U, in C `menu(calcoutINAV)` order
@@ -140,11 +138,10 @@ pub struct CalcoutRecord {
     // Monotonic generation guarding the link-status refresh. Each refresh
     // classifies a *snapshot* of the link strings off-thread; a later
     // refresh (an INP/OUT re-point) must win over an earlier one regardless
-    // of which spawned task finishes first. The invariant — only the latest
-    // classification may be published — is enforced by stamping each refresh
-    // with the bumped generation and dropping a post whose generation is no
-    // longer current.
-    link_gen: Arc<AtomicU64>,
+    // of which spawned task finishes first. The shared `LinkStatusGen` gate
+    // enforces the invariant — only the latest classification may be
+    // published. See `link_status::LinkStatusGen`.
+    link_gen: LinkStatusGen,
 }
 
 impl Default for CalcoutRecord {
@@ -245,7 +242,7 @@ impl Default for CalcoutRecord {
             out_status: LINK_CON,
             out: String::new(),
             async_ctx: None,
-            link_gen: Arc::new(AtomicU64::new(0)),
+            link_gen: LinkStatusGen::default(),
         }
     }
 }
@@ -347,12 +344,12 @@ impl CalcoutRecord {
         let handle = handle.clone();
         let inputs = self.input_links();
         let out = self.out.clone();
-        let gen_counter = self.link_gen.clone();
-        // Stamp this refresh. A concurrent later refresh bumps the counter
-        // again; this task then sees its `gen` is stale and drops its post so
+        let link_gen = self.link_gen.clone();
+        // Stamp this refresh. A concurrent later refresh issues a newer
+        // token; this task then sees its token is stale and drops its post so
         // it cannot clobber the newer classification (e.g. an init-time
         // snapshot finishing after a runtime INP re-point).
-        let gen_id = gen_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        let token = link_gen.next();
         tokio::spawn(async move {
             // Let `add_record` finish registering this record before the init
             // post (this task may be spawned from `set_async_context`, which
@@ -369,7 +366,7 @@ impl CalcoutRecord {
             let (out_status, _ft) = classify_link(&handle, &out).await;
             fields.push(("OUTV".to_string(), EpicsValue::Enum(out_status as u16)));
             // Publish only if no newer refresh was issued meanwhile.
-            if gen_counter.load(Ordering::SeqCst) == gen_id {
+            if link_gen.is_current(token) {
                 let _ = handle.post_fields(&name, fields).await;
             }
         });

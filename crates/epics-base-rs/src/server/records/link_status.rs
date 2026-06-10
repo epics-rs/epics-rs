@@ -9,8 +9,42 @@
 //! per record (C `sseqRecord.dbd:20` and `calcoutRecord.dbd.pod:45-50` are
 //! byte-for-byte the same choice set).
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::server::database::AsyncDbHandle;
 use crate::server::record::{LinkType, parse_link_v2};
+
+/// Monotonic generation gate for spawned async link-status refreshes.
+///
+/// A record's `refresh_link_status` snapshots its link strings and
+/// classifies them off-thread (`tokio::spawn`) before posting the result.
+/// Two refreshes can race — e.g. an init-time refresh (links still empty →
+/// `CON`) finishing *after* a runtime re-point (`special()` of a
+/// `DOLn`/`LNKn`/`INPn` link → `LOC`) — and the stale task could clobber the
+/// newer classification when it posts last. This gate makes the invariant
+/// *only the latest classification may be published* hold by construction:
+/// each spawn takes a token via [`next`](Self::next), and the spawned task
+/// posts only while [`is_current`](Self::is_current) still holds for that
+/// token. Every refresh call site runs under the record instance's write
+/// lock, so the `fetch_add` that issues tokens is serialized and tokens are
+/// strictly increasing.
+#[derive(Clone, Default)]
+pub(crate) struct LinkStatusGen(Arc<AtomicU64>);
+
+impl LinkStatusGen {
+    /// Issue the token for a newly spawned refresh, superseding any token
+    /// already in flight. Call on the issuing thread, before `tokio::spawn`.
+    pub(crate) fn next(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// True while `token` is still the latest issued — i.e. no later refresh
+    /// has started. Check inside the spawned task immediately before posting.
+    pub(crate) fn is_current(&self, token: u64) -> bool {
+        self.0.load(Ordering::SeqCst) == token
+    }
+}
 
 /// Choice labels for the link-connection-status menu, in index order.
 /// C `menu(sseqLNKV)` (sseqRecord.dbd:20) and `menu(calcoutINAV)`

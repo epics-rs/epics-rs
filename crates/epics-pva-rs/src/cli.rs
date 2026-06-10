@@ -172,18 +172,38 @@ pub fn version_information() -> &'static str {
 /// `tools/call.cpp:122-123`, and `tools/info.cpp:76-79`. Every one of
 /// those tools emits the same block, so it lives here as a single owner
 /// rather than being re-implemented (or, worse, overloaded onto the
-/// output formatter) per binary. The values are read through the
-/// resolved [`crate::config`] getters so the output reflects
-/// environment + defaults exactly as the client will use them.
+/// output formatter) per binary.
 ///
-/// Known gap: `EPICS_PVA_ADDR_LIST` is shown as the configured value,
-/// not pvxs's post-`Config::expand()` search list (auto-address
-/// expansion, hostname→endpoint resolution, dedup, and the
-/// `AUTO_ADDR_LIST=NO` it leaves after expanding). That expansion needs
-/// a client `Config` value/`expand()` in the config module; until that
-/// exists this readback reflects the configured, not the expanded, list.
+/// The configuration shown is the *effective* one. pvxs's
+/// `ContextImpl::effective` is the environment config with `expand()`
+/// applied (`client.cpp:542-547`), and `-v` prints that expanded config
+/// (`ctxt.config()`), not the raw environment. So `EPICS_PVA_ADDR_LIST`
+/// is the post-`expand()` SEARCH list — the auto-address-list broadcast
+/// fan-out folded in and the `AUTO_ADDR_LIST` flag cleared to `NO`
+/// (`config.cpp:640-643`) — exactly as the client will search.
 pub fn print_effective_config() {
     print!("{}", effective_config_string());
+}
+
+/// Render one resolved [`crate::config::env::Endpoint`] the way pvxs prints
+/// an effective address-list entry. `expand()` gives every entry the
+/// effective UDP port, so the address always carries `:port` — matching pvxs,
+/// which prints `:port` whenever it is non-zero (`SockAddr::operator<<`,
+/// `util.cpp:660-673`). A multicast entry additionally carries its
+/// `,ttl@iface` modifiers, exactly as pvxs `SockEndpoint::operator<<` prints
+/// them (`config.cpp:125-135`).
+fn format_endpoint(ep: &crate::config::env::Endpoint) -> String {
+    use std::fmt::Write;
+    let mut s = ep.addr.to_string();
+    if ep.addr.ip().is_multicast() {
+        if let Some(ttl) = ep.ttl {
+            let _ = write!(s, ",{ttl}");
+        }
+        if let Some(iface) = &ep.iface {
+            let _ = write!(s, "@{iface}");
+        }
+    }
+    s
 }
 
 /// Render the `Effective config` block as a string (see
@@ -192,7 +212,23 @@ pub fn print_effective_config() {
 pub fn effective_config_string() -> String {
     use crate::config;
     use std::fmt::Write;
-    let addr_list = std::env::var("EPICS_PVA_ADDR_LIST").unwrap_or_default();
+
+    // Build and expand the client config exactly as the client Context does,
+    // so the readback shows the *effective* SEARCH configuration rather than
+    // the raw environment. pvxs builds `ContextImpl::effective` as the env
+    // config with `expand()` applied (`client.cpp:542-547`) and `-v` prints
+    // that effective config (`tools/get.cpp:99-100` prints `ctxt.config()`).
+    // `expand()` folds the auto-address-list broadcast fan-out into the
+    // address list and clears the flag (`config.cpp:640-643`).
+    let mut cfg = config::env::Config::from_client_env();
+    cfg.expand();
+
+    let addr_list = cfg
+        .address_list
+        .iter()
+        .map(format_endpoint)
+        .collect::<Vec<_>>()
+        .join(" ");
     let name_servers = config::name_servers()
         .iter()
         .map(|a| a.to_string())
@@ -209,14 +245,13 @@ pub fn effective_config_string() -> String {
     // (config.cpp:613-658), so the keys come out alphabetically and use
     // their canonical `EPICS_PVA_*` names.
     let _ = writeln!(s, "  EPICS_PVA_ADDR_LIST={addr_list}");
+    // After `expand()` the auto flag is always cleared (`config.cpp:643`),
+    // so the effective config reports `NO` — pvxs prints the same, because
+    // it too renders the post-`expand()` config.
     let _ = writeln!(
         s,
         "  EPICS_PVA_AUTO_ADDR_LIST={}",
-        if config::auto_addr_list_enabled() {
-            "YES"
-        } else {
-            "NO"
-        }
+        if cfg.auto_addr_list { "YES" } else { "NO" }
     );
     let _ = writeln!(s, "  EPICS_PVA_BROADCAST_PORT={}", config::broadcast_port());
     // pvxs keeps the connection timeout as a double and prints it in the
@@ -516,6 +551,51 @@ mod tests {
             !s.contains("  interfaces="),
             "non-pvxs `interfaces=` key must be replaced: {s}"
         );
+    }
+
+    /// The `-v` block reports the *effective* (post-`expand()`) client
+    /// config, not the raw environment: a configured `EPICS_PVA_ADDR_LIST`
+    /// comes back with its effective UDP port, and `EPICS_PVA_AUTO_ADDR_LIST`
+    /// always reads `NO` because `expand()` folds the broadcast fan-out into
+    /// the list and clears the flag — exactly what pvxs prints, since it too
+    /// renders `ctxt.config()` post-`expand()` (client.cpp:542-547,
+    /// config.cpp:640-643). Serialised on `epics_env` because it mutates the
+    /// process-global environment.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn effective_config_shows_expanded_addr_list_not_raw_env() {
+        // SAFETY: std::env mutation is unsafe in edition 2024; the `epics_env`
+        // serial guard makes it race-free.
+        unsafe {
+            std::env::set_var("EPICS_PVA_ADDR_LIST", "1.2.3.4");
+            std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "NO");
+            std::env::remove_var("EPICS_PVA_BROADCAST_PORT");
+        }
+        let s = effective_config_string();
+        // The configured address is rendered with its effective UDP port
+        // (default 5076), proving the readback ran through `expand()` instead
+        // of echoing the raw env string.
+        assert!(
+            s.contains("  EPICS_PVA_ADDR_LIST=1.2.3.4:5076\n"),
+            "expanded address list with effective port expected, got:\n{s}"
+        );
+        // AUTO_ADDR_LIST=NO disables broadcast fan-out, so the effective list
+        // is exactly the one configured address.
+        assert!(s.contains("  EPICS_PVA_AUTO_ADDR_LIST=NO\n"), "got:\n{s}");
+
+        // With AUTO_ADDR_LIST=YES the *raw* env says YES, but the effective
+        // (post-`expand()`) config always reports NO — the parity fix.
+        unsafe { std::env::set_var("EPICS_PVA_AUTO_ADDR_LIST", "YES") };
+        let s = effective_config_string();
+        assert!(
+            s.contains("  EPICS_PVA_AUTO_ADDR_LIST=NO\n"),
+            "post-expand AUTO_ADDR_LIST must read NO even when env=YES, got:\n{s}"
+        );
+
+        unsafe {
+            std::env::remove_var("EPICS_PVA_ADDR_LIST");
+            std::env::remove_var("EPICS_PVA_AUTO_ADDR_LIST");
+        }
     }
 
     /// The `pvinfo -D` server block emits the pvxs `EPICS_PVAS_*` key set

@@ -159,9 +159,17 @@ impl SupervisorState {
             write_pid_file(p, std::process::id() as i32)?;
         }
         let log = if let Some(p) = &config.logging.log_path {
-            // The LOG uses `stamp_format` (raw line prefix), not the
-            // banner-facing `time_format`.
-            Some(LogFile::open(p, config.logging.stamp_format.clone()).await?)
+            // The LOG uses `stamp_log` + `stamp_format` (raw line prefix),
+            // not the banner-facing `time_format`. With `stamp_log` off
+            // (C default) the log is written verbatim.
+            Some(
+                LogFile::open(
+                    p,
+                    config.logging.stamp_log,
+                    config.logging.stamp_format.clone(),
+                )
+                .await?,
+            )
         } else {
             None
         };

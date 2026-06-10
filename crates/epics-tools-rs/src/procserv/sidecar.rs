@@ -31,10 +31,15 @@ pub struct LogFile {
     /// Path the log was opened from, kept so [`Self::reopen`] (the
     /// SIGHUP/logrotate path) can re-open the same target.
     path: PathBuf,
+    /// Whether to prefix each line with a timestamp. C `stampLog`
+    /// (`procServ.cc:82`), default off: when `false` the chunk is written
+    /// verbatim (`procServ.cc:744`) and [`Self::stamp_format`] is unused.
+    stamp_log: bool,
     /// Per-line stamp format, applied RAW (C `stampFormat`,
-    /// `procServ.cc:721`). Any bracketing/separator is part of this
-    /// string, not added here — C's default `"[" + timeFormat + "] "` is
-    /// just the default value, overridable verbatim.
+    /// `procServ.cc:721`) when [`Self::stamp_log`] is set. Any
+    /// bracketing/separator is part of this string, not added here — C's
+    /// default `"[" + timeFormat + "] "` is just the default value,
+    /// overridable verbatim.
     stamp_format: String,
     /// Tracks whether we're mid-line (no newline since last write).
     /// Matches the C `_log_stamp_sent` per-connection flag at
@@ -50,11 +55,16 @@ impl LogFile {
     /// path's parent directory doesn't exist (we don't `mkdir -p`;
     /// matches C procServ which expects the operator to set up the
     /// directory).
-    pub async fn open(path: &Path, stamp_format: impl Into<String>) -> ProcServResult<Self> {
+    pub async fn open(
+        path: &Path,
+        stamp_log: bool,
+        stamp_format: impl Into<String>,
+    ) -> ProcServResult<Self> {
         let file = Self::open_handle(path).await?;
         Ok(Self {
             file: AsyncMutex::new(file),
             path: path.to_path_buf(),
+            stamp_log,
             stamp_format: stamp_format.into(),
             in_line: SyncMutex::new(false),
         })
@@ -93,6 +103,16 @@ impl LogFile {
     /// `\n`s; partial lines are appended without a stamp until the
     /// next newline.
     pub async fn write_chunk(&self, chunk: &[u8]) -> ProcServResult<()> {
+        // C default `stampLog == false`: write the child's bytes verbatim,
+        // no per-line timestamp (`procServ.cc:744`). The log is then
+        // byte-identical to the child output.
+        if !self.stamp_log {
+            let mut file = self.file.lock().await;
+            file.write_all(chunk).await.map_err(ProcServError::Io)?;
+            file.flush().await.map_err(ProcServError::Io)?;
+            return Ok(());
+        }
+
         // Build the output buffer inside an inner block so the
         // parking_lot guard is unambiguously dropped before the
         // first `.await`. parking_lot's `MutexGuard` is `!Send`, so
@@ -239,7 +259,7 @@ mod tests {
         let path = dir.path().join("test.log");
         // The bracketing is part of the stamp format string (C's default
         // stampFormat shape), applied raw — not added by the writer.
-        let log = LogFile::open(&path, "[%Y-%m-%dT%H:%M:%S] ".to_string())
+        let log = LogFile::open(&path, true, "[%Y-%m-%dT%H:%M:%S] ".to_string())
             .await
             .unwrap();
 
@@ -266,7 +286,9 @@ mod tests {
         // procServ.cc:721; only the *default* stampFormat is bracketed).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("raw.log");
-        let log = LogFile::open(&path, "RAWSTAMP ".to_string()).await.unwrap();
+        let log = LogFile::open(&path, true, "RAWSTAMP ".to_string())
+            .await
+            .unwrap();
 
         log.write_chunk(b"hello\n").await.unwrap();
 
@@ -281,10 +303,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unstamped_log_is_byte_identical_to_child_output() {
+        // C default `stampLog == false` writes the child's bytes verbatim
+        // (procServ.cc:82,744). Even with a stamp_format configured, no
+        // prefix is added when stamping is off, across multiple chunks and
+        // a mid-line partial write.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.log");
+        let log = LogFile::open(&path, false, "[%Y] ".to_string())
+            .await
+            .unwrap();
+
+        log.write_chunk(b"line1\nline2\n").await.unwrap();
+        log.write_chunk(b"partial").await.unwrap();
+        log.write_chunk(b" continued\n").await.unwrap();
+
+        let content = std::fs::read(&path).unwrap();
+        assert_eq!(content, b"line1\nline2\npartial continued\n");
+    }
+
+    #[tokio::test]
     async fn reopen_writes_to_a_fresh_file_after_rotation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rot.log");
-        let log = LogFile::open(&path, "%Y-%m-%dT%H:%M:%S".to_string())
+        let log = LogFile::open(&path, true, "%Y-%m-%dT%H:%M:%S".to_string())
             .await
             .unwrap();
 

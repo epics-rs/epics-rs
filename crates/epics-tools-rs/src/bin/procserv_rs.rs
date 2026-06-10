@@ -68,6 +68,20 @@ mod app {
         #[arg(short = 'L', long)]
         logfile: Option<PathBuf>,
 
+        /// Prefix log lines with a timestamp (`-S` / `--logstamp` in C).
+        /// Off by default (C `stampLog` defaults false → log written
+        /// verbatim). The flag alone uses the bracketed default stamp
+        /// format; an optional strftime value (`--logstamp=<FMT>`) is used
+        /// raw. Mirrors C's `optional_argument` getopt: the value must be
+        /// attached with `=`, never space-separated.
+        #[arg(
+            short = 'S',
+            long = "logstamp",
+            value_name = "FMT",
+            require_equals = true
+        )]
+        logstamp: Option<Option<String>>,
+
         /// PID file (`--pidfile`).
         #[arg(long)]
         pidfile: Option<PathBuf>,
@@ -168,15 +182,25 @@ mod app {
             ignore_chars: Vec::new(),
         };
 
+        // C `--logstamp [<FMT>]` (procServ.cc:307-311): the flag sets
+        // stampLog=true; an attached value overrides stampFormat (raw),
+        // the bare flag keeps the bracketed default. Absent → unstamped.
+        let stamp_log = args.logstamp.is_some();
+        let stamp_format = match args.logstamp {
+            Some(Some(fmt)) => fmt,
+            // C's default `stampFormat` shape: "[" + timeFormat + "] "
+            // (procServ.cc:464-468), applied verbatim by the writer.
+            _ => "[%Y-%m-%d %H:%M:%S] ".into(),
+        };
+
         let logging = LoggingConfig {
             log_path: args.logfile,
             pid_path: args.pidfile,
             info_path: args.info_file,
+            stamp_log,
             // Banner times: raw, un-bracketed (C `timeFormat`).
             time_format: "%Y-%m-%d %H:%M:%S".into(),
-            // Log prefix: C's default `stampFormat` shape, "[" + timeFormat
-            // + "] " (procServ.cc:464-468), applied verbatim by the writer.
-            stamp_format: "[%Y-%m-%d %H:%M:%S] ".into(),
+            stamp_format,
         };
 
         let nz = |c: u8| if c == 0 { None } else { Some(c) };
@@ -336,6 +360,35 @@ mod app {
                 cfg.listen.log_bind,
                 Some(std::net::SocketAddr::from(([127, 0, 0, 1], 7000)))
             );
+        }
+
+        /// No `--logstamp` → unstamped log (C `stampLog` defaults false).
+        #[test]
+        fn logstamp_absent_is_unstamped_by_default() {
+            let args = Args::try_parse_from(["procserv-rs", "/bin/echo"]).unwrap();
+            let cfg = build_config(args).unwrap();
+            assert!(!cfg.logging.stamp_log);
+        }
+
+        /// `--logstamp` alone enables stamping with the bracketed default
+        /// stamp format (C 'S' with no optarg, procServ.cc:307-311,464-468).
+        #[test]
+        fn logstamp_flag_enables_stamping_with_default_format() {
+            let args = Args::try_parse_from(["procserv-rs", "--logstamp", "/bin/echo"]).unwrap();
+            let cfg = build_config(args).unwrap();
+            assert!(cfg.logging.stamp_log);
+            assert_eq!(cfg.logging.stamp_format, "[%Y-%m-%d %H:%M:%S] ");
+        }
+
+        /// `--logstamp=<FMT>` enables stamping and uses FMT raw (C 'S'
+        /// with optarg sets stampFormat, procServ.cc:309-310).
+        #[test]
+        fn logstamp_with_value_sets_raw_format() {
+            let args =
+                Args::try_parse_from(["procserv-rs", "--logstamp=%H:%M:%S ", "/bin/echo"]).unwrap();
+            let cfg = build_config(args).unwrap();
+            assert!(cfg.logging.stamp_log);
+            assert_eq!(cfg.logging.stamp_format, "%H:%M:%S ");
         }
     }
 }

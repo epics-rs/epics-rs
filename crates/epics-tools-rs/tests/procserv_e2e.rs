@@ -53,6 +53,7 @@ fn cat_config(port: u16) -> ProcServConfig {
             log_path: None,
             pid_path: None,
             info_path: None,
+            stamp_log: false,
             time_format: "%Y-%m-%dT%H:%M:%S".into(),
             stamp_format: "[%Y-%m-%dT%H:%M:%S] ".into(),
         },

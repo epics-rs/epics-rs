@@ -89,6 +89,13 @@ pub struct LoggingConfig {
     pub pid_path: Option<PathBuf>,
     /// Path to write a status info file consumed by `manage-procs`.
     pub info_path: Option<PathBuf>,
+    /// Whether to prefix each log line with a timestamp. C procServ's
+    /// `stampLog` (`procServ.cc:82`), default `false`: the log is written
+    /// verbatim (`procServ.cc:744`) unless `--logstamp` is given, which
+    /// sets `stampLog = true` (`procServ.cc:307-311`). When `false`,
+    /// [`Self::stamp_format`] is unused and the log is byte-identical to
+    /// the child's output.
+    pub stamp_log: bool,
     /// Human-facing time format for banner lines (e.g. "server started
     /// at"). C procServ's `timeFormat` (`procServ.cc:80`, default `%c`),
     /// applied raw with no surrounding punctuation.

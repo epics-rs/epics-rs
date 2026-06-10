@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
+use crate::server::record::{FieldDesc, MENU_SIMM, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Multi-bit binary output record — manual Record impl for raw↔index conversion.
@@ -562,6 +562,30 @@ static MBBO_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::String,
         read_only: false,
     },
+    // Simulation block (mbboRecord.dbd.pod:663-695). SIMM is
+    // DBF_MENU menu(menuSimm) (NO/YES/RAW), SIMS is DBF_MENU
+    // menu(menuAlarmSevr) (centrally resolved); both served as DBR_ENUM
+    // shorts. SIML/SIOL are the simulation in/out links.
+    FieldDesc {
+        name: "SIMM",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIML",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIOL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIMS",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
 ];
 
 /// Helper macro: maps EPICS field name strings to struct fields.
@@ -665,6 +689,17 @@ impl Record for MbboRecord {
         MBBO_FIELDS
     }
 
+    /// `SIMM` is `DBF_MENU menu(menuSimm)` (`mbboRecord.dbd.pod:673-677`):
+    /// the multibit records carry the three-choice NO/YES/RAW simulation
+    /// menu. Served as `DBR_ENUM` with these labels. `SIMS` (menuAlarmSevr)
+    /// and the state severities are shared menus resolved centrally.
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "SIMM" => Some(MENU_SIMM),
+            _ => None,
+        }
+    }
+
     // C recMbbo.c IVOA=set_to_IVOV: val = ivov; rval = ivov. IVOV is
     // DBF_USHORT (mbboRecord.dbd.pod:717); RVAL is DBF_ULONG
     // (mbboRecord.dbd.pod:620). Coerce the incoming carrier to the
@@ -745,6 +780,7 @@ impl Record for MbboRecord {
             "TVSV" => tvsv: Short, "TTSV" => ttsv: Short, "FTSV" => ftsv: Short, "FFSV" => ffsv: Short,
             "UNSV" => unsv: Short, "COSV" => cosv: Short,
             "OMSL" => omsl: Short, "DOL" => dol: String,
+            "SIMM" => simm: Short, "SIML" => siml: String, "SIOL" => siol: String, "SIMS" => sims: Short,
             "ZRVL" => zrvl: ULong, "ONVL" => onvl: ULong, "TWVL" => twvl: ULong, "THVL" => thvl: ULong,
             "FRVL" => frvl: ULong, "FVVL" => fvvl: ULong, "SXVL" => sxvl: ULong, "SVVL" => svvl: ULong,
             "EIVL" => eivl: ULong, "NIVL" => nivl: ULong, "TEVL" => tevl: ULong, "ELVL" => elvl: ULong,
@@ -770,6 +806,7 @@ impl Record for MbboRecord {
             "TVSV" => tvsv: Short, "TTSV" => ttsv: Short, "FTSV" => ftsv: Short, "FFSV" => ffsv: Short,
             "UNSV" => unsv: Short, "COSV" => cosv: Short,
             "OMSL" => omsl: Short, "DOL" => dol: String,
+            "SIMM" => simm: Short, "SIML" => siml: String, "SIOL" => siol: String, "SIMS" => sims: Short,
             "ZRVL" => zrvl: ULong, "ONVL" => onvl: ULong, "TWVL" => twvl: ULong, "THVL" => thvl: ULong,
             "FRVL" => frvl: ULong, "FVVL" => fvvl: ULong, "SXVL" => sxvl: ULong, "SVVL" => svvl: ULong,
             "EIVL" => eivl: ULong, "NIVL" => nivl: ULong, "TEVL" => tevl: ULong, "ELVL" => elvl: ULong,
@@ -827,5 +864,52 @@ impl Record for MbboRecord {
             self.compute_sdef();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Simulation block (mbboRecord.dbd.pod:663-695) must be served:
+    /// SIMM/SIMS as DBR_ENUM shorts, SIML/SIOL as the in/out link strings.
+    /// SIMM's menu is menuSimm — three choices NO/YES/RAW, the RAW choice the
+    /// two-choice menuYesNo lacks — so the wire-visible enum labels include RAW.
+    #[test]
+    fn test_sim_block_served() {
+        let mut rec = MbboRecord::default();
+
+        // SIMM/SIMS are DBF_MENU served as DBR_ENUM shorts.
+        rec.put_field("SIMM", EpicsValue::Short(1)).unwrap();
+        assert_eq!(rec.get_field("SIMM"), Some(EpicsValue::Short(1)));
+        rec.put_field("SIMS", EpicsValue::Short(2)).unwrap();
+        assert_eq!(rec.get_field("SIMS"), Some(EpicsValue::Short(2)));
+
+        // SIML/SIOL are the simulation in/out links.
+        rec.put_field("SIML", EpicsValue::String("sim:mode".into()))
+            .unwrap();
+        assert_eq!(
+            rec.get_field("SIML"),
+            Some(EpicsValue::String("sim:mode".into()))
+        );
+        rec.put_field("SIOL", EpicsValue::String("sim:out".into()))
+            .unwrap();
+        assert_eq!(
+            rec.get_field("SIOL"),
+            Some(EpicsValue::String("sim:out".into()))
+        );
+
+        // SIMM carries the three-choice menuSimm (NO/YES/RAW), not menuYesNo.
+        let choices = rec.menu_field_choices("SIMM").unwrap();
+        assert_eq!(choices, &["NO", "YES", "RAW"]);
+        assert_eq!(choices, MENU_SIMM);
+
+        // All four are advertised in the field list.
+        for name in ["SIMM", "SIML", "SIOL", "SIMS"] {
+            assert!(
+                MBBO_FIELDS.iter().any(|f| f.name == name),
+                "{name} missing from field_list"
+            );
+        }
     }
 }

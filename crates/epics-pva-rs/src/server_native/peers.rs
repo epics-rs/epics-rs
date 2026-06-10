@@ -39,9 +39,11 @@ pub struct ChannelStat {
     pub tx: AtomicU64,
     /// Bytes received from the peer for this channel.
     pub rx: AtomicU64,
-    /// Source-supplied contextual info (pvxs `ReportInfo`). Sources do not
-    /// yet populate this; the field exists so the report SHAPE can carry it
-    /// once a source hook does. `None` until then.
+    /// Source-supplied contextual info (pvxs `ReportInfo`,
+    /// netcommon.h:70). Populated at CREATE_CHANNEL from the bound owner's
+    /// [`crate::server_native::ChannelSource::channel_report_info`] hook
+    /// via [`Self::set_report_info`] — the single writer — and `None` when
+    /// the source attaches nothing (the default).
     pub(crate) report_info: parking_lot::Mutex<Option<String>>,
 }
 
@@ -53,6 +55,17 @@ impl ChannelStat {
             rx: AtomicU64::new(0),
             report_info: parking_lot::Mutex::new(None),
         })
+    }
+
+    /// Record source-supplied contextual info for this channel — the
+    /// single writer of [`Self::report_info`]. Mirrors pvxs
+    /// `ServerChannelControl::updateInfo` (`serverchan.cpp`), which stashes
+    /// the `ReportInfo` a Source hands it so `Server::report()` can surface
+    /// it (`schan.info = chan->reportInfo`). Stored behind the existing
+    /// mutex so a later source update can overwrite the value captured at
+    /// channel open; `None` clears it.
+    pub(crate) fn set_report_info(&self, info: Option<String>) {
+        *self.report_info.lock() = info;
     }
 
     /// Attribute `n` transmitted bytes to this channel (pvxs
@@ -269,8 +282,8 @@ pub struct ChannelReport {
     pub tx: u64,
     /// Bytes received from the peer for this channel.
     pub rx: u64,
-    /// Source-supplied contextual info (pvxs `ReportInfo`); `None` until a
-    /// source populates it.
+    /// Source-supplied contextual info (pvxs `ReportInfo`); `None` when the
+    /// owning source's `channel_report_info` hook returned nothing.
     pub report_info: Option<String>,
 }
 

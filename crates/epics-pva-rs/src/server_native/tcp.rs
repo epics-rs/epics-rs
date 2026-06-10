@@ -2640,6 +2640,11 @@ struct CreateChannelCompletion {
 struct ResolvedChannel {
     intro: Option<FieldDesc>,
     owner: DynSource,
+    /// Source-supplied contextual info for the report's per-channel
+    /// `info` field, queried from the bound owner at resolution time —
+    /// pvxs `ServerChannelControl::updateInfo` (`source.h:192`) stashed
+    /// into `chan->reportInfo`. `None` when the source attaches nothing.
+    report_info: Option<String>,
 }
 /// Sender half of the CREATE_CHANNEL completion channel.
 type CcTx = mpsc::Sender<CreateChannelCompletion>;
@@ -2954,6 +2959,12 @@ async fn handle_connection_io(
                         // (keyed by SID) so handler-side tx/rx attribution is
                         // visible to the report (pvxs chan->statTx/statRx).
                         let stat = crate::server_native::peers::ChannelStat::new(cc.name.clone());
+                        // Attach the source-supplied report info captured at
+                        // resolution — the single writer of the channel's
+                        // `report_info`, surfaced as `Report::Channel::info`
+                        // (pvxs copies `chan->reportInfo` into the report at
+                        // `server.cpp`).
+                        stat.set_report_info(resolved.report_info);
                         reply_stat = Some(stat.clone());
                         channels.insert(cc.sid, ChannelState {
                             name: cc.name,
@@ -5008,7 +5019,16 @@ async fn handle_create_channel(
                     // Negotiate the descriptor through the bound owner, so
                     // it matches the source that will serve the operations.
                     let intro = owner.get_introspection_checked(&nm, conn_ctx.clone()).await;
-                    Some(ResolvedChannel { intro, owner })
+                    // Capture the owner's per-channel report info once at
+                    // admission — pvxs lets a Source stash a `ReportInfo`
+                    // on the channel control during onCreate
+                    // (`source.h:192`), surfaced later in `Report::Channel`.
+                    let report_info = owner.channel_report_info(&nm, conn_ctx.clone()).await;
+                    Some(ResolvedChannel {
+                        intro,
+                        owner,
+                        report_info,
+                    })
                 } else {
                     None
                 };

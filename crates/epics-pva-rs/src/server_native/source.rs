@@ -472,6 +472,29 @@ pub trait ChannelSource: Send + Sync + 'static {
         async { None }
     }
 
+    /// Source-supplied contextual info to attach to a channel at
+    /// CREATE_CHANNEL, surfaced verbatim in the server report's
+    /// per-channel `info` field.
+    ///
+    /// pvxs lets a Source stash an opaque `ReportInfo`
+    /// (`netcommon.h:70`) on the channel control it is handed during
+    /// `onCreate`, via `ServerChannelControl::updateInfo`
+    /// (`source.h:192`); `Server::report()` then copies that pointer
+    /// into `Report::Channel::info` (`netcommon.h:75`). The Rust server
+    /// simplifies the opaque base class to an `Option<String>` and
+    /// queries it ONCE at channel admission from the bound owner — the
+    /// source resolved by [`Self::resolve_owner`] — rather than handing
+    /// the source a mutable control handle. Default returns `None` (a
+    /// source that attaches no per-channel info, like pvxs leaving
+    /// `chan->reportInfo` null).
+    fn channel_report_info(
+        &self,
+        _name: &str,
+        _ctx: ChannelContext,
+    ) -> impl std::future::Future<Output = Option<String>> + Send {
+        async { None }
+    }
+
     /// Fetch the current value of a PV.
     fn get_value(&self, name: &str) -> impl std::future::Future<Output = Option<PvField>> + Send;
 
@@ -1517,6 +1540,12 @@ pub trait ChannelSourceObj: Send + Sync {
         name: &'a str,
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<DynSource>> + Send + 'a>>;
+    /// dyn forwarder for the channel's source-supplied report info.
+    fn channel_report_info<'a>(
+        &'a self,
+        name: &'a str,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>>;
     fn get_value<'a>(
         &'a self,
         name: &'a str,
@@ -1787,6 +1816,15 @@ impl<T: ChannelSource + 'static> ChannelSourceObj for T {
         ctx: ChannelContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<DynSource>> + Send + 'a>> {
         Box::pin(<Self as ChannelSource>::resolve_owner(self, name, ctx))
+    }
+    fn channel_report_info<'a>(
+        &'a self,
+        name: &'a str,
+        ctx: ChannelContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+        Box::pin(<Self as ChannelSource>::channel_report_info(
+            self, name, ctx,
+        ))
     }
     fn get_value<'a>(
         &'a self,

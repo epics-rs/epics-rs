@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, Record};
+use crate::server::record::{FieldDesc, MENU_YES_NO, Record};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Which EPICS record-type name an [`ArrayRecord`] reports. The four
@@ -61,6 +61,17 @@ pub struct WaveformRecord {
     /// for non-subArray kinds — those records ignore the field
     /// altogether.
     pub malm: i32,
+    /// Simulation block (waveform/aai/aao only; subArray has no sim block).
+    /// SIMM is DBF_MENU menu(menuYesNo), SIMS is menu(menuAlarmSevr),
+    /// OLDSIMM is menu(menuSimm) special(SPC_NOMOD); SIML/SIOL the sim
+    /// in/out links. waveformRecord.dbd.pod:475-507, aaiRecord.dbd.pod:374-402,
+    /// aaoRecord.dbd.pod:407-435. SSCN (menuScan) is served by the common
+    /// path (common.sscn).
+    pub simm: i16,
+    pub siml: String,
+    pub siol: String,
+    pub sims: i16,
+    pub oldsimm: i16,
 }
 
 /// Type aliases for documentation / pattern-match clarity. All point
@@ -100,6 +111,11 @@ impl Default for WaveformRecord {
             prec: 0,
             indx: 0,
             malm: 0,
+            simm: 0,
+            siml: String::new(),
+            siol: String::new(),
+            sims: 0,
+            oldsimm: 0,
         }
     }
 }
@@ -113,6 +129,14 @@ impl WaveformRecord {
             kind,
             ..Default::default()
         }
+    }
+
+    /// True for the kinds whose `.dbd` declares a simulation block
+    /// (waveform/aai/aao). `subArray` is a pure array-slicing record with
+    /// no SIMM/SIML/SIOL/SIMS/OLDSIMM fields (`subArrayRecord.dbd.pod`), so
+    /// it must not answer those names.
+    fn has_sim_block(&self) -> bool {
+        !matches!(self.kind, ArrayKind::SubArray)
     }
 }
 
@@ -371,6 +395,10 @@ impl Record for WaveformRecord {
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
         match field {
             "MPST" | "APST" => Some(WAVEFORM_POST),
+            // SIMM is menu(menuYesNo) (NO/YES) on the array records. SIMS
+            // (menuAlarmSevr) and OLDSIMM (menuSimm) resolve via the shared
+            // menu registry. Only the kinds that carry a sim block answer.
+            "SIMM" if self.has_sim_block() => Some(MENU_YES_NO),
             _ => None,
         }
     }
@@ -401,6 +429,12 @@ impl Record for WaveformRecord {
             "HOPR" => Some(EpicsValue::Double(self.hopr)),
             "LOPR" => Some(EpicsValue::Double(self.lopr)),
             "PREC" => Some(EpicsValue::Short(self.prec)),
+            // Simulation block — waveform/aai/aao only (not subArray).
+            "SIMM" if self.has_sim_block() => Some(EpicsValue::Short(self.simm)),
+            "SIML" if self.has_sim_block() => Some(EpicsValue::String(self.siml.clone().into())),
+            "SIOL" if self.has_sim_block() => Some(EpicsValue::String(self.siol.clone().into())),
+            "SIMS" if self.has_sim_block() => Some(EpicsValue::Short(self.sims)),
+            "OLDSIMM" if self.has_sim_block() => Some(EpicsValue::Short(self.oldsimm)),
             _ => None,
         }
     }
@@ -581,6 +615,37 @@ impl Record for WaveformRecord {
                     as i16;
                 Ok(())
             }
+            // Simulation block — waveform/aai/aao only (not subArray).
+            "SIMM" if self.has_sim_block() => match value {
+                EpicsValue::Short(v) => {
+                    self.simm = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("SIMM".into())),
+            },
+            "SIML" if self.has_sim_block() => match value {
+                EpicsValue::String(s) => {
+                    self.siml = s.as_str_lossy().into_owned();
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("SIML".into())),
+            },
+            "SIOL" if self.has_sim_block() => match value {
+                EpicsValue::String(s) => {
+                    self.siol = s.as_str_lossy().into_owned();
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("SIOL".into())),
+            },
+            "SIMS" if self.has_sim_block() => match value {
+                EpicsValue::Short(v) => {
+                    self.sims = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("SIMS".into())),
+            },
+            // OLDSIMM is special(SPC_NOMOD) — saved copy, not client-writable.
+            "OLDSIMM" if self.has_sim_block() => Err(CaError::ReadOnlyField(name.to_string())),
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
     }
@@ -863,6 +928,65 @@ mod array_kind_tests {
             vec!["Always", "On Change"],
             "waveformPOST index 0 must be \"Always\" (reverse of menuPost)"
         );
+    }
+
+    /// The simulation block (SIMM/SIML/SIOL/SIMS/OLDSIMM) is served on
+    /// waveform/aai/aao but NOT subArray. SIMM is menu(menuYesNo); SIMS
+    /// (menuAlarmSevr) and OLDSIMM (menuSimm) resolve via the shared
+    /// registry, so their wire labels come from the central tables.
+    #[test]
+    fn waveform_sim_block_served_per_kind() {
+        use crate::server::record::RecordInstance;
+
+        for kind in [ArrayKind::Waveform, ArrayKind::Aai, ArrayKind::Aao] {
+            let mut rec = WaveformRecord::with_kind(kind);
+            rec.put_field("SIMM", EpicsValue::Short(1)).unwrap();
+            assert_eq!(rec.get_field("SIMM"), Some(EpicsValue::Short(1)));
+            rec.put_field("SIML", EpicsValue::String("sim:mode".into()))
+                .unwrap();
+            assert_eq!(
+                rec.get_field("SIML"),
+                Some(EpicsValue::String("sim:mode".into()))
+            );
+            rec.put_field("SIOL", EpicsValue::String("sim:in".into()))
+                .unwrap();
+            assert_eq!(
+                rec.get_field("SIOL"),
+                Some(EpicsValue::String("sim:in".into()))
+            );
+            rec.put_field("SIMS", EpicsValue::Short(2)).unwrap();
+            assert_eq!(rec.get_field("SIMS"), Some(EpicsValue::Short(2)));
+            // OLDSIMM is special(SPC_NOMOD) — readable, not writable.
+            assert!(matches!(
+                rec.put_field("OLDSIMM", EpicsValue::Short(1)),
+                Err(crate::error::CaError::ReadOnlyField(_))
+            ));
+            assert_eq!(rec.get_field("OLDSIMM"), Some(EpicsValue::Short(0)));
+        }
+
+        // SIMM snapshot carries the NO/YES menuYesNo labels on these records.
+        let mut wf = WaveformRecord::with_kind(ArrayKind::Waveform);
+        wf.put_field("SIMM", EpicsValue::Short(1)).unwrap();
+        let inst = RecordInstance::new("WF:SIMM".into(), wf);
+        let snap = inst.snapshot_for_field("SIMM").unwrap();
+        assert_eq!(snap.value, EpicsValue::Enum(1));
+        assert_eq!(snap.enums.as_ref().unwrap().strings, vec!["NO", "YES"]);
+        // OLDSIMM resolves to the three-choice menuSimm via the shared registry.
+        let snap_old = inst.snapshot_for_field("OLDSIMM").unwrap();
+        assert_eq!(
+            snap_old.enums.as_ref().unwrap().strings,
+            vec!["NO", "YES", "RAW"]
+        );
+
+        // subArray has no sim block — those names must not resolve.
+        let sub = WaveformRecord::with_kind(ArrayKind::SubArray);
+        assert_eq!(sub.get_field("SIMM"), None);
+        assert_eq!(sub.get_field("OLDSIMM"), None);
+        let mut sub_mut = WaveformRecord::with_kind(ArrayKind::SubArray);
+        assert!(matches!(
+            sub_mut.put_field("SIMM", EpicsValue::Short(1)),
+            Err(crate::error::CaError::FieldNotFound(_))
+        ));
     }
 
     #[test]

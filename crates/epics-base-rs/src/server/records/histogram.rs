@@ -30,11 +30,18 @@ pub struct HistogramRecord {
     pub sdel: f64,     // Signal deadband (monitor refresh period, seconds)
     pub mdel: i32,     // Monitor count deadband
     pub mcnt: i32,     // Counts accumulated since last monitor post
-    // SIMM is `DBF_MENU menu(menuYesNo)` (histogramRecord.dbd.pod:258-262):
-    // the NO/YES simulation-mode menu, served as DBR_ENUM. The rest of the
-    // simulation block (SIML/SIOL/SVAL/SIMS/OLDSIMM/SSCN) is not yet
-    // modelled — only the menu field is exposed here.
+    // Simulation block (histogramRecord.dbd.pod:245-282). SIMM is
+    // DBF_MENU menu(menuYesNo) (NO/YES), SIMS is DBF_MENU menu(menuAlarmSevr),
+    // OLDSIMM is DBF_MENU menu(menuSimm) special(SPC_NOMOD) (read-only saved
+    // copy); all served as DBR_ENUM shorts. SIOL/SIML are the simulation
+    // input/mode links, SVAL the DBF_DOUBLE simulation value. SSCN
+    // (menuScan) is served by the common-field path (common.sscn).
     pub simm: i16,
+    pub siol: String,
+    pub sval: f64,
+    pub siml: String,
+    pub sims: i16,
+    pub oldsimm: i16,
 }
 
 impl Default for HistogramRecord {
@@ -59,6 +66,11 @@ impl Default for HistogramRecord {
             mdel: 0,
             mcnt: 0,
             simm: 0,
+            siol: String::new(),
+            sval: 0.0,
+            siml: String::new(),
+            sims: 0,
+            oldsimm: 0,
         }
     }
 }
@@ -197,6 +209,33 @@ static HISTOGRAM_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    FieldDesc {
+        name: "SIOL",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SVAL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIML",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SIMS",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    // OLDSIMM is special(SPC_NOMOD) — the saved previous simulation mode,
+    // not client-writable (histogramRecord.dbd.pod:270-274).
+    FieldDesc {
+        name: "OLDSIMM",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
 ];
 
 /// Choice labels for the histogram command menu, in index order.
@@ -234,6 +273,11 @@ impl Record for HistogramRecord {
             "MDEL" => Some(EpicsValue::Long(self.mdel)),
             "MCNT" => Some(EpicsValue::Long(self.mcnt)),
             "SIMM" => Some(EpicsValue::Short(self.simm)),
+            "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
+            "SVAL" => Some(EpicsValue::Double(self.sval)),
+            "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
+            "SIMS" => Some(EpicsValue::Short(self.sims)),
+            "OLDSIMM" => Some(EpicsValue::Short(self.oldsimm)),
             _ => None,
         }
     }
@@ -316,7 +360,36 @@ impl Record for HistogramRecord {
                 }
                 _ => Err(CaError::TypeMismatch("SIMM".into())),
             },
-            "NELM" | "WDTH" | "MCNT" => Err(CaError::ReadOnlyField(name.to_string())),
+            "SIOL" => match value {
+                EpicsValue::String(s) => {
+                    self.siol = s.as_str_lossy().into_owned();
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("SIOL".into())),
+            },
+            "SVAL" => match value {
+                EpicsValue::Double(v) => {
+                    self.sval = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("SVAL".into())),
+            },
+            "SIML" => match value {
+                EpicsValue::String(s) => {
+                    self.siml = s.as_str_lossy().into_owned();
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("SIML".into())),
+            },
+            "SIMS" => match value {
+                EpicsValue::Short(v) => {
+                    self.sims = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("SIMS".into())),
+            },
+            // OLDSIMM is special(SPC_NOMOD) — saved copy, not client-writable.
+            "NELM" | "WDTH" | "MCNT" | "OLDSIMM" => Err(CaError::ReadOnlyField(name.to_string())),
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
     }
@@ -413,5 +486,52 @@ mod tests {
         rec.add_sample(10.0); // >= ulim → rejected
         rec.add_sample(99.0);
         assert_eq!(rec.val, vec![0, 0]);
+    }
+
+    /// Simulation block (histogramRecord.dbd.pod:245-282) is served:
+    /// SIML/SIOL links, SVAL (DBF_DOUBLE), SIMS (menuAlarmSevr) round-trip;
+    /// OLDSIMM (menuSimm, SPC_NOMOD) is readable but not client-writable;
+    /// SIMS/OLDSIMM labels come from the shared menu registry.
+    #[test]
+    fn sim_block_served_and_oldsimm_read_only() {
+        use crate::server::record::RecordInstance;
+        let mut rec = HistogramRecord::new(2, 0.0, 10.0);
+
+        rec.put_field("SIML", EpicsValue::String("sim:mode".into()))
+            .unwrap();
+        assert_eq!(
+            rec.get_field("SIML"),
+            Some(EpicsValue::String("sim:mode".into()))
+        );
+        rec.put_field("SIOL", EpicsValue::String("sim:in".into()))
+            .unwrap();
+        assert_eq!(
+            rec.get_field("SIOL"),
+            Some(EpicsValue::String("sim:in".into()))
+        );
+        rec.put_field("SVAL", EpicsValue::Double(3.5)).unwrap();
+        assert_eq!(rec.get_field("SVAL"), Some(EpicsValue::Double(3.5)));
+        rec.put_field("SIMS", EpicsValue::Short(2)).unwrap();
+        assert_eq!(rec.get_field("SIMS"), Some(EpicsValue::Short(2)));
+
+        // OLDSIMM is special(SPC_NOMOD) — readable, not writable.
+        assert!(matches!(
+            rec.put_field("OLDSIMM", EpicsValue::Short(1)),
+            Err(CaError::ReadOnlyField(_))
+        ));
+        assert_eq!(rec.get_field("OLDSIMM"), Some(EpicsValue::Short(0)));
+
+        // SIMS (menuAlarmSevr) and OLDSIMM (menuSimm) resolve centrally.
+        let inst = RecordInstance::new("HIST:SIM".into(), rec);
+        let sims = inst.snapshot_for_field("SIMS").unwrap();
+        assert_eq!(
+            sims.enums.as_ref().unwrap().strings,
+            vec!["NO_ALARM", "MINOR", "MAJOR", "INVALID"]
+        );
+        let old = inst.snapshot_for_field("OLDSIMM").unwrap();
+        assert_eq!(
+            old.enums.as_ref().unwrap().strings,
+            vec!["NO", "YES", "RAW"]
+        );
     }
 }

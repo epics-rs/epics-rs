@@ -80,6 +80,20 @@ fn to_asyn(e: ModbusError) -> AsynError {
     }
 }
 
+/// Whether a Modbus function may carry a record *array* write. C
+/// `writeInt32Array`/`writeFloat64Array` (drvModbusAsyn.cpp:1398-1428 /
+/// 1230-...) switch only on `MODBUS_WRITE_MULTIPLE_COILS` and
+/// `MODBUS_WRITE_MULTIPLE_REGISTERS(_F23)`; every other function (the
+/// single-value writes and all read functions) hits `default: asynError`.
+fn is_array_write_function(function: ModbusFunctionCode) -> bool {
+    matches!(
+        function,
+        ModbusFunctionCode::WriteMultipleCoils
+            | ModbusFunctionCode::WriteMultipleRegisters
+            | ModbusFunctionCode::WriteMultipleRegistersF23
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Transport bridge
 // ---------------------------------------------------------------------------
@@ -405,14 +419,44 @@ impl ModbusPortDriver {
     /// nothing is staged — the buffer is only `config.length` words and the
     /// wire address can lie far outside it.
     fn flush_write(&mut self, offset: i32, regs: &[u16]) -> AsynResult<()> {
-        if self.is_absolute() {
-            return self.write_absolute_regs(offset, regs);
-        }
         let function = self.engine.config().function;
+        // C parity (drvModbusAsyn.cpp:760-767 / 920-927 / writeFloat64): a
+        // value that spans more than one register written through a
+        // WRITE_SINGLE_REGISTER port is sent as one single-register request
+        // per register at consecutive addresses — the FC06 PDU carries exactly
+        // one register, so C loops `for (i=0; i<bufferLen; i++) doModbusIO(...,
+        // modbusAddress+i, buffer+i, ...)`. Every other write function carries
+        // the whole block in one request. Without this loop a 32/64-bit value
+        // on an FC06 port would silently drop all registers past the first.
+        let per_register = function == ModbusFunctionCode::WriteSingleRegister && regs.len() > 1;
+        if self.is_absolute() {
+            if per_register {
+                for (i, &r) in regs.iter().enumerate() {
+                    self.write_absolute_regs(offset + i as i32, &[r])?;
+                }
+            } else {
+                self.write_absolute_regs(offset, regs)?;
+            }
+            return Ok(());
+        }
         let addr = self.modbus_address(offset);
-        self.engine
-            .do_modbus_io(self.transport.as_mut(), function, addr, regs, regs.len())
-            .map_err(to_asyn)?;
+        if per_register {
+            for (i, &r) in regs.iter().enumerate() {
+                self.engine
+                    .do_modbus_io(
+                        self.transport.as_mut(),
+                        function,
+                        addr.wrapping_add(i as u16),
+                        &[r],
+                        1,
+                    )
+                    .map_err(to_asyn)?;
+            }
+        } else {
+            self.engine
+                .do_modbus_io(self.transport.as_mut(), function, addr, regs, regs.len())
+                .map_err(to_asyn)?;
+        }
         let buf = self.engine.data_mut();
         for (i, &r) in regs.iter().enumerate() {
             if let Some(slot) = buf.get_mut(offset as usize + i) {
@@ -652,6 +696,20 @@ impl PortDriver for ModbusPortDriver {
 
     fn write_int32_array(&mut self, user: &AsynUser, data: &[i32]) -> AsynResult<()> {
         let dt = self.datatype_of(user.reason)?;
+        // C `writeInt32Array` accepts only write-multiple functions; any other
+        // function (single-value writes, read functions) returns asynError
+        // (drvModbusAsyn.cpp:1422-1427). Reject it here rather than emit a
+        // per-register fan-out the C driver never performs for arrays.
+        let function = self.engine.config().function;
+        if !is_array_write_function(function) {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!(
+                    "Modbus function {function:?} cannot write an array; \
+                     configure a write-multiple function"
+                ),
+            });
+        }
         // Reject a negative or out-of-range offset before it is cast to
         // `usize` in `flush_write` and wraps to a bogus wire address.
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
@@ -681,6 +739,18 @@ impl PortDriver for ModbusPortDriver {
 
     fn write_float64_array(&mut self, user: &AsynUser, data: &[f64]) -> AsynResult<()> {
         let dt = self.datatype_of(user.reason)?;
+        // C `writeFloat64Array` accepts only write-multiple functions; any
+        // other function returns asynError (drvModbusAsyn.cpp:1252-... default).
+        let function = self.engine.config().function;
+        if !is_array_write_function(function) {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!(
+                    "Modbus function {function:?} cannot write an array; \
+                     configure a write-multiple function"
+                ),
+            });
+        }
         // Reject a negative or out-of-range offset before it is cast to
         // `usize` in `flush_write` and wraps to a bogus wire address.
         self.engine.check_offset(user.addr).map_err(to_asyn)?;
@@ -1600,6 +1670,126 @@ mod tests {
         );
         assert_eq!(frames[0][12], 0x08, "byte count must be 8 (4 registers)");
         assert_eq!(frames[0].len(), 21, "frame carries only 4 registers");
+    }
+
+    /// A multi-register data type written through a WRITE_SINGLE_REGISTER
+    /// (FC06) port is sent as one single-register request per register at
+    /// consecutive addresses. C `writeInt32` loops
+    /// `for (i=0; i<bufferLen; i++) doModbusIO(..., modbusAddress+i, buffer+i,
+    /// ...)` (drvModbusAsyn.cpp:763-766). Boundary: an INT32_BE value writes
+    /// two FC06 requests — high word at `addr`, low word at `addr+1` — not a
+    /// single request that drops the second register.
+    #[test]
+    fn relative_write_single_register_loops_per_register() {
+        // Two FC06 echoes, one per single-register write (txid increments).
+        let echo_hi = tcp_response(1, &[0x01, 0x06, 0x00, 0x01, 0x12, 0x34]);
+        let echo_lo = tcp_response(2, &[0x01, 0x06, 0x00, 0x02, 0x56, 0x78]);
+        let transport = ReplayTransport::new(vec![Ok(echo_hi), Ok(echo_lo)]);
+        let written = transport.written_handle();
+        let mut cfg = test_config(0, 4);
+        cfg.function = ModbusFunctionCode::WriteSingleRegister;
+        let mut driver =
+            ModbusPortDriver::new("MB_REL_WSR_I32", cfg, LinkType::Tcp, Box::new(transport))
+                .expect("relative config must build");
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::Int32Be.as_str())
+            .expect("INT32_BE parameter must exist");
+        let mut user = AsynUser::new(reason);
+        user.addr = 1;
+        driver
+            .write_int32(&mut user, 0x1234_5678)
+            .expect("single-register int32 write must succeed");
+        let frames = written.lock().unwrap();
+        assert_eq!(
+            frames.len(),
+            2,
+            "two single-register requests, one per word"
+        );
+        // FC06 PDU: [unit, 0x06, addr_hi, addr_lo, val_hi, val_lo].
+        assert_eq!(
+            &frames[0][6..12],
+            &[0x01, 0x06, 0x00, 0x01, 0x12, 0x34],
+            "first request writes the high word at addr 1"
+        );
+        assert_eq!(
+            &frames[1][6..12],
+            &[0x01, 0x06, 0x00, 0x02, 0x56, 0x78],
+            "second request writes the low word at addr 2"
+        );
+    }
+
+    /// Absolute-mode counterpart: the per-register FC06 loop also applies when
+    /// `modbusAddress = offset` (C writeInt32 absolute branch,
+    /// drvModbusAsyn.cpp:747-766) — two requests at the wire address and the
+    /// next register.
+    #[test]
+    fn absolute_write_single_register_loops_per_register() {
+        let echo_hi = tcp_response(1, &[0x01, 0x06, 0x01, 0x00, 0x12, 0x34]);
+        let echo_lo = tcp_response(2, &[0x01, 0x06, 0x01, 0x01, 0x56, 0x78]);
+        let transport = ReplayTransport::new(vec![Ok(echo_hi), Ok(echo_lo)]);
+        let written = transport.written_handle();
+        let mut cfg = test_config(-1, 4);
+        cfg.function = ModbusFunctionCode::WriteSingleRegister;
+        let mut driver =
+            ModbusPortDriver::new("MB_ABS_WSR_I32", cfg, LinkType::Tcp, Box::new(transport))
+                .expect("absolute config must build");
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::Int32Be.as_str())
+            .expect("INT32_BE parameter must exist");
+        let mut user = AsynUser::new(reason);
+        user.addr = 0x0100;
+        driver
+            .write_int32(&mut user, 0x1234_5678)
+            .expect("absolute single-register int32 write must succeed");
+        let frames = written.lock().unwrap();
+        assert_eq!(
+            frames.len(),
+            2,
+            "two single-register requests, one per word"
+        );
+        assert_eq!(
+            &frames[0][6..12],
+            &[0x01, 0x06, 0x01, 0x00, 0x12, 0x34],
+            "first request writes the high word at wire addr 0x0100"
+        );
+        assert_eq!(
+            &frames[1][6..12],
+            &[0x01, 0x06, 0x01, 0x01, 0x56, 0x78],
+            "second request writes the low word at wire addr 0x0101"
+        );
+    }
+
+    /// C `writeInt32Array`/`writeFloat64Array` accept only write-multiple
+    /// functions and return asynError otherwise (drvModbusAsyn.cpp:1422-1427 /
+    /// 1252-1257). An array write on a WRITE_SINGLE_REGISTER port must error,
+    /// not silently fan out per-register or drop registers.
+    #[test]
+    fn array_write_rejects_non_multiple_write_function() {
+        let mut cfg = test_config(0, 8);
+        cfg.function = ModbusFunctionCode::WriteSingleRegister;
+        let mut driver =
+            ModbusPortDriver::new("MB_WSR_ARR", cfg, LinkType::Tcp, Box::new(NullTransport))
+                .expect("config must build");
+        let i32_reason = driver
+            .base
+            .find_param(ModbusDataType::Int32Be.as_str())
+            .expect("INT32_BE parameter must exist");
+        let f64_reason = driver
+            .base
+            .find_param(ModbusDataType::Float64Le.as_str())
+            .expect("FLOAT64_LE parameter must exist");
+        let i32_user = AsynUser::new(i32_reason);
+        let f64_user = AsynUser::new(f64_reason);
+        assert!(
+            driver.write_int32_array(&i32_user, &[1, 2, 3]).is_err(),
+            "int32-array write on FC06 port must be rejected"
+        );
+        assert!(
+            driver.write_float64_array(&f64_user, &[1.0, 2.0]).is_err(),
+            "float64-array write on FC06 port must be rejected"
+        );
     }
 
     /// An `addr` beyond `config.length` must yield a clean error from the

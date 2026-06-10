@@ -225,6 +225,42 @@ async fn kill_keystroke_signals_child() {
 }
 
 #[tokio::test]
+async fn server_messages_are_written_to_the_log() {
+    // C `SendToAll` logs every message whose sender is NULL or the
+    // child process (procServ.cc:725), so supervisor `@@@` annotations
+    // land in the log alongside child output. The "@@@ Child started"
+    // banner is emitted from the supervisor (sender == server) at spawn,
+    // so it must appear in the configured log file.
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("procserv.log");
+
+    let port = pick_port().await;
+    let mut cfg = cat_config(port);
+    cfg.logging.log_path = Some(log_path.clone());
+    let server = ProcServ::new(cfg).expect("build");
+    let server_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // Allow the supervisor to spawn the child and flush the start banner.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut contents = String::new();
+    while Instant::now() < deadline {
+        contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if contents.contains("@@@ Child started") {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        contents.contains("@@@ Child started"),
+        "supervisor start banner must be logged; got: {contents:?}"
+    );
+
+    server_task.abort();
+}
+
+#[tokio::test]
 async fn two_clients_share_same_party_line() {
     let port = pick_port().await;
     let cfg = cat_config(port);

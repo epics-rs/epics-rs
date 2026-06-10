@@ -484,13 +484,24 @@ impl SupervisorState {
         s
     }
 
-    /// Send `bytes` to every connected client.
+    /// Send `bytes` to every connected client, and record them to the
+    /// log file. Used for server-originated `@@@` annotations (banners,
+    /// restart-mode toggles, child-exit notices). C `SendToAll` writes
+    /// to the log whenever the sender is NULL or the child process
+    /// (`procServ.cc:725`), so these supervisor messages land in the
+    /// log alongside child output; only client keystroke echo
+    /// (`fanout_excluding` with a sender) is kept out of the log.
     async fn fanout_to_all(&self, bytes: &[u8]) {
         for entry in self.clients.values() {
             let _ = entry
                 .out_tx
                 .send(OutboundFrame::Bytes(bytes.to_vec()))
                 .await;
+        }
+        if let Some(log) = &self.log
+            && let Err(e) = log.write_chunk(bytes).await
+        {
+            tracing::warn!(error = %e, "procserv-rs: log write failed");
         }
     }
 

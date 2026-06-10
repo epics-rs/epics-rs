@@ -6,10 +6,12 @@
 //! 1. **Detach from controlling terminal**: double `fork` + `setsid`
 //!    + `chdir("/")` + redirect 0/1/2 to `/dev/null`.
 //! 2. **Signal forwarding**:
-//!    - `SIGHUP` — reload (no-op for now; reserved for live config
-//!      reload of pvlist/access analogues if procserv ever grows them)
 //!    - `SIGTERM`/`SIGINT` — graceful shutdown
 //!    - `SIGPIPE` — ignored (PTY writes to dead clients raise it)
+//!    - `SIGHUP` — reopen the log file (logrotate support); handled by
+//!      the supervisor, NOT here, because it owns the log handle and
+//!      must keep running. C `OnSigHup` sets a flag the main loop turns
+//!      into `openLogFile()` (`procServ.cc:641-645`), never a shutdown.
 
 use std::os::fd::AsRawFd;
 
@@ -81,8 +83,11 @@ pub fn fork_and_go() -> ProcServResult<()> {
 ///
 /// `SIGPIPE` is set to ignored synchronously (via `nix::sys::signal`)
 /// so a write to a dead client socket doesn't kill the supervisor.
-/// `SIGTERM`/`SIGINT`/`SIGHUP` are converted to a single
-/// [`ShutdownSignal`] future.
+/// `SIGTERM`/`SIGINT` are converted to a single [`ShutdownSignal`]
+/// future. `SIGHUP` is deliberately NOT handled here — it means
+/// "reopen the log file" (logrotate), which the supervisor owns; if it
+/// were folded into the shutdown set a logrotate `kill -HUP` would tear
+/// the IOC down.
 pub async fn install_signal_handlers() -> ProcServResult<ShutdownSignal> {
     // SIGPIPE → ignore. tokio::signal doesn't expose SIG_IGN
     // directly, so use nix.
@@ -97,8 +102,6 @@ pub async fn install_signal_handlers() -> ProcServResult<ShutdownSignal> {
         .map_err(ProcServError::Io)?;
     let mut intr = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .map_err(ProcServError::Io)?;
-    let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-        .map_err(ProcServError::Io)?;
 
     let (tx, rx) = oneshot::channel::<ShutdownReason>();
 
@@ -106,7 +109,6 @@ pub async fn install_signal_handlers() -> ProcServResult<ShutdownSignal> {
         let reason = tokio::select! {
             _ = term.recv() => ShutdownReason::Terminate,
             _ = intr.recv() => ShutdownReason::Interrupt,
-            _ = hup.recv() => ShutdownReason::Hangup,
         };
         let _ = tx.send(reason);
     });
@@ -114,12 +116,12 @@ pub async fn install_signal_handlers() -> ProcServResult<ShutdownSignal> {
     Ok(ShutdownSignal { rx })
 }
 
-/// Why the shutdown signal fired.
+/// Why the shutdown signal fired. SIGHUP is intentionally absent — it
+/// is a log-reopen request, handled by the supervisor, not a shutdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownReason {
     Terminate,
     Interrupt,
-    Hangup,
 }
 
 /// Future-like handle that resolves when a graceful-shutdown signal

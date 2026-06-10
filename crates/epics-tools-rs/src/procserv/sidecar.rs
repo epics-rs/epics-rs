@@ -28,6 +28,9 @@ use crate::procserv::error::{ProcServError, ProcServResult};
 pub struct LogFile {
     /// Async mutex because the file write is held across `.await`.
     file: AsyncMutex<File>,
+    /// Path the log was opened from, kept so [`Self::reopen`] (the
+    /// SIGHUP/logrotate path) can re-open the same target.
+    path: PathBuf,
     time_format: String,
     /// Tracks whether we're mid-line (no newline since last write).
     /// Matches the C `_log_stamp_sent` per-connection flag at
@@ -44,17 +47,41 @@ impl LogFile {
     /// matches C procServ which expects the operator to set up the
     /// directory).
     pub async fn open(path: &Path, time_format: impl Into<String>) -> ProcServResult<Self> {
-        let file = OpenOptions::new()
+        let file = Self::open_handle(path).await?;
+        Ok(Self {
+            file: AsyncMutex::new(file),
+            path: path.to_path_buf(),
+            time_format: time_format.into(),
+            in_line: SyncMutex::new(false),
+        })
+    }
+
+    /// Open (create + append) a handle to `path`. Shared by [`Self::open`]
+    /// and [`Self::reopen`].
+    async fn open_handle(path: &Path) -> ProcServResult<File> {
+        OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
             .await
-            .map_err(ProcServError::Io)?;
-        Ok(Self {
-            file: AsyncMutex::new(file),
-            time_format: time_format.into(),
-            in_line: SyncMutex::new(false),
-        })
+            .map_err(ProcServError::Io)
+    }
+
+    /// Re-open the log file in place, replacing the current handle.
+    ///
+    /// This is the SIGHUP / logrotate path: C procServ's `OnSigHup`
+    /// raises a flag the main loop turns into `openLogFile()`, which
+    /// closes the old fd and re-opens the configured path
+    /// (`procServ.cc:641-645`, `915-933`). After `logrotate` has
+    /// renamed the live file out from under us, the next write must go
+    /// to a freshly-created file at the original path, not the renamed
+    /// inode the old handle still points at. Resets the mid-line state
+    /// so the new file starts with a timestamp on its first line.
+    pub async fn reopen(&self) -> ProcServResult<()> {
+        let fresh = Self::open_handle(&self.path).await?;
+        *self.file.lock().await = fresh;
+        *self.in_line.lock() = false;
+        Ok(())
     }
 
     /// Append a chunk of PTY output to the log, prefixing each new
@@ -220,6 +247,47 @@ mod tests {
         assert!(lines[0].ends_with("line1"));
         assert!(lines[1].ends_with("line2"));
         assert!(lines[2].ends_with("partial continued"));
+    }
+
+    #[tokio::test]
+    async fn reopen_writes_to_a_fresh_file_after_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rot.log");
+        let log = LogFile::open(&path, "%Y-%m-%dT%H:%M:%S".to_string())
+            .await
+            .unwrap();
+
+        log.write_chunk(b"before\n").await.unwrap();
+
+        // Simulate logrotate: move the live file aside. The old handle
+        // still points at the renamed inode.
+        let rotated = dir.path().join("rot.log.1");
+        std::fs::rename(&path, &rotated).unwrap();
+
+        // SIGHUP → reopen: subsequent writes must land in a brand-new
+        // file at the original path, not the rotated inode.
+        log.reopen().await.unwrap();
+        log.write_chunk(b"after\n").await.unwrap();
+
+        let fresh = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            fresh.contains("after"),
+            "new file should hold post-reopen line"
+        );
+        assert!(
+            !fresh.contains("before"),
+            "new file must not contain pre-rotation content"
+        );
+
+        let old = std::fs::read_to_string(&rotated).unwrap();
+        assert!(
+            old.contains("before"),
+            "rotated file keeps pre-rotation line"
+        );
+        assert!(
+            !old.contains("after"),
+            "rotated file must not gain new writes"
+        );
     }
 
     #[test]

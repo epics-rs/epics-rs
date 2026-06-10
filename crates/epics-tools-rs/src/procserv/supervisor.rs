@@ -89,6 +89,12 @@ struct SupervisorState {
     restart_mode: RestartMode,
     restart_tracker: RestartTracker,
     log: Option<LogFile>,
+    /// SIGHUP stream. A hangup means "reopen the log file" (logrotate),
+    /// NOT shutdown — C `OnSigHup` → `openLogFile()`
+    /// (`procServ.cc:641-645`). The supervisor owns this rather than the
+    /// daemon's shutdown-signal layer so a `kill -HUP` rotates the log
+    /// instead of killing the IOC.
+    sighup: tokio::signal::unix::Signal,
     /// Set after first successful child spawn. Used by `OneShot`
     /// mode: it allows the FIRST exit to be honored by re-checking
     /// the policy (so `OneShot` selected mid-run still launches
@@ -150,6 +156,11 @@ impl SupervisorState {
         // Drop our copy so listeners' txs are the only owners.
         drop(incoming_tx);
 
+        // SIGHUP → reopen the log (logrotate). Registered here, not in
+        // the daemon shutdown layer, so a hangup never tears down the IOC.
+        let sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .map_err(ProcServError::Io)?;
+
         let mut state = Self {
             restart_mode: config.restart_mode,
             config,
@@ -160,6 +171,7 @@ impl SupervisorState {
             child: None,
             restart_tracker: RestartTracker::new(),
             log,
+            sighup,
             has_run_once: false,
         };
 
@@ -212,6 +224,28 @@ impl SupervisorState {
                 // 3. New client accepted.
                 Some(incoming) = self.incoming_rx.recv() => {
                     self.handle_new_client(incoming).await;
+                }
+
+                // 4. SIGHUP → reopen the log file (logrotate). Never a
+                //    shutdown — the loop continues. C OnSigHup →
+                //    openLogFile() (procServ.cc:641-645).
+                _ = self.sighup.recv() => {
+                    self.reopen_log().await;
+                }
+            }
+        }
+    }
+
+    /// Reopen the log file in response to SIGHUP. No-op when no log is
+    /// configured (matches C `openLogFile()` short-circuiting on a NULL
+    /// `logFile`). A reopen failure is logged but never shuts the
+    /// supervisor down.
+    async fn reopen_log(&self) {
+        if let Some(log) = &self.log {
+            match log.reopen().await {
+                Ok(()) => tracing::info!("procserv-rs: reopened log file on SIGHUP"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "procserv-rs: log reopen on SIGHUP failed")
                 }
             }
         }

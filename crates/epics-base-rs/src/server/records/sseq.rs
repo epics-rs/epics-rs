@@ -155,8 +155,8 @@ struct SseqStep {
     // C `init_record` classification of an empty (constant) link.
     dol_status: i16,     // DOLnV — menu(sseqLNKV) DOL connection status
     lnk_status: i16,     // LNKnV — menu(sseqLNKV) LNK connection status
-    dol_field_type: i16, // DTn — DOL target field type (DbFieldType / -1)
-    lnk_field_type: i16, // LTn — LNK target field type (DbFieldType / -1)
+    dol_field_type: i16, // DTn — DOL target field type (C dbStatic DBF_* / -1)
+    lnk_field_type: i16, // LTn — LNK target field type (C dbStatic DBF_* / -1)
     wait_err: i16,       // WERRn — wait-config error (see refresh_link_status)
 }
 

@@ -525,8 +525,9 @@ async fn sseq_seln_out_of_range_raises_invalid_alarm_and_no_dispatch() {
 #[tokio::test]
 async fn sseq_link_status_loc_vs_con() {
     let db = PvDatabase::new();
-    // A local target (ao VAL is DBF_DOUBLE = DbFieldType::Double = 6) so a
-    // DB link to it resolves to LOC with a known field type.
+    // A local target (ao VAL is DBF_DOUBLE = 10 in C dbStatic numbering,
+    // dbFldTypes.h:35) so a DB link to it resolves to LOC with a known field
+    // type. DTn/LTn report the dbStatic DBF_* index, not the CA DBR value (6).
     db.add_record("SSEQ_LS_TGT", Box::new(AoRecord::new(0.0)))
         .await
         .unwrap();
@@ -546,15 +547,15 @@ async fn sseq_link_status_loc_vs_con() {
     poll_i16(
         &db,
         "SSEQ_LS.DT1",
-        6,
-        "local DOL field type resolved (Double)",
+        10,
+        "local DOL field type resolved (DBF_DOUBLE = 10)",
     )
     .await;
     poll_i16(
         &db,
         "SSEQ_LS.LT1",
-        6,
-        "local LNK field type resolved (Double)",
+        10,
+        "local LNK field type resolved (DBF_DOUBLE = 10)",
     )
     .await;
 

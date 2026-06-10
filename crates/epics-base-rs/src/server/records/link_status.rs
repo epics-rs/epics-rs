@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::server::database::AsyncDbHandle;
 use crate::server::record::{LinkType, parse_link_v2};
+use crate::types::DbFieldType;
 
 /// Monotonic generation gate for spawned async link-status refreshes.
 ///
@@ -70,6 +71,38 @@ pub(crate) const LINK_CON: i16 = 3; // constant / unset link
 /// has no `NOACCESS` variant.
 pub(crate) const DBF_UNKNOWN: i16 = -1;
 
+/// Map a resolved [`DbFieldType`] to the C `dbStatic` `dbfType` integer
+/// (dbFldTypes.h:24-43) that `DTn`/`LTn` expose — NOT the CA `DBR` wire-type
+/// discriminant the Rust enum carries. C `init_record` stores
+/// `pAddr->field_type` (the dbStatic index) into `dol_field_type` /
+/// `lnk_field_type` (sseqRecord.c:210), and a client reading those diagnostic
+/// fields expects the dbStatic numbering, where `DBF_DOUBLE` is 10 — not the
+/// CA `DBR_DOUBLE` value 6. The two orderings diverge because `DBF_INT64` /
+/// `DBF_UINT64` occupy slots 7/8 ahead of `DBF_FLOAT` / `DBF_DOUBLE`.
+///
+/// The Rust model has a single `Char` (no signed/unsigned split): it maps to
+/// `DBF_CHAR` (1), the dbStatic field type CA `DBR_CHAR` resolves to
+/// (dbFldTypes.h:77). A `DBF_UCHAR` (2) source is not separately
+/// representable, and a `DBF_MENU` (12) field is modelled as `Enum`
+/// (`DBF_ENUM` = 11) — the same kind of collapse [`DBF_UNKNOWN`] documents
+/// for `DBF_NOACCESS`. The match is exhaustive so a new `DbFieldType` variant
+/// forces a deliberate code assignment here rather than a silent default.
+fn dbf_static_code(ft: DbFieldType) -> i16 {
+    match ft {
+        DbFieldType::String => 0,  // DBF_STRING
+        DbFieldType::Char => 1,    // DBF_CHAR
+        DbFieldType::Short => 3,   // DBF_SHORT
+        DbFieldType::UShort => 4,  // DBF_USHORT
+        DbFieldType::Long => 5,    // DBF_LONG
+        DbFieldType::ULong => 6,   // DBF_ULONG
+        DbFieldType::Int64 => 7,   // DBF_INT64
+        DbFieldType::UInt64 => 8,  // DBF_UINT64
+        DbFieldType::Float => 9,   // DBF_FLOAT
+        DbFieldType::Double => 10, // DBF_DOUBLE
+        DbFieldType::Enum => 11,   // DBF_ENUM
+    }
+}
+
 /// Classify one DOL/LNK/INP/OUT link string into its connection-status menu
 /// index and the target field type, mirroring C `checkLinks`/`init_record`
 /// (sseqRecord.c:862-941,202-250; calcoutRecord.c:160-189).
@@ -85,7 +118,7 @@ pub(crate) async fn classify_link(handle: &AsyncDbHandle, link: &str) -> (i16, i
         // type. A DB-syntax link whose target is not on this IOC resolves to
         // `None` and falls through to EXT_NC (C `init_record` else branch).
         LinkType::Db => match handle.link_target_field_type(link).await {
-            Some(ft) => (LINK_LOC, ft as i16),
+            Some(ft) => (LINK_LOC, dbf_static_code(ft)),
             None => (LINK_EXT_NC, DBF_UNKNOWN),
         },
         // CA/PVA/other external link: epics-base-rs cannot introspect a

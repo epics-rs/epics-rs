@@ -230,6 +230,86 @@ async fn tls_client_to_tls_server_full_handshake() {
     server_handle.abort();
 }
 
+/// A TLS-enabled server must bind a DEDICATED TLS listener on its own
+/// port (default `EPICS_PVAS_TLS_PORT` 5076 / ephemeral when 0),
+/// distinct from the plaintext `tcp_port`, and a client addressed
+/// straight at that port must complete a TLS handshake + GET. pvxs binds
+/// a separate per-interface TLS socket on `effective.tls_port`
+/// (server.cpp:595-608) and advertises it for protoTLS SEARCH
+/// (server.cpp:849-852). Pre-fix the Rust server had no `tls_port` at
+/// all — EPICS_PVAS_TLS_PORT was ignored and TLS was reachable only on
+/// the plaintext port.
+#[tokio::test]
+async fn tls_server_binds_dedicated_tls_port_distinct_from_plaintext() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let (cert, key) = generate_self_signed();
+    let server_cfg = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.clone()], key)
+        .expect("server tls config");
+    let server_tls = Arc::new(TlsServerConfig {
+        config: Arc::new(server_cfg),
+        require_client_cert: false,
+        trust_roots: Arc::new(RootCertStore::empty()),
+    });
+
+    let mut roots = RootCertStore::empty();
+    roots.add(cert).unwrap();
+    let client_cfg = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let client_tls = Arc::new(TlsClientConfig {
+        config: Arc::new(client_cfg),
+    });
+
+    let source = Arc::new(StaticSource::new());
+    source.put("TLS:PV", 7.5).await;
+
+    // Ephemeral plaintext AND TLS ports (both 0 via `isolated()`): the
+    // runtime must bind two DISTINCT TCP listeners and stamp both back.
+    let cfg = PvaServerConfig {
+        tls: Some(server_tls),
+        ..PvaServerConfig::isolated()
+    };
+    let server = epics_pva_rs::server_native::PvaServer::start(source, cfg).expect("server start");
+
+    let report = server.report();
+    assert!(report.tls_enabled, "TLS must be enabled");
+    assert_ne!(report.tls_port, 0, "a dedicated TLS port must be bound");
+    assert_ne!(
+        report.tls_port, report.tcp_port,
+        "the TLS listener must bind a port distinct from the plaintext port"
+    );
+
+    // The dedicated TLS endpoint must actually serve TLS: connect straight
+    // at tls_addr() (NOT the plaintext tcp port) and GET.
+    let tls_addr = server.tls_addr().expect("tls_addr present when TLS on");
+    assert_eq!(
+        tls_addr.port(),
+        report.tls_port,
+        "tls_addr() must report the bound TLS port"
+    );
+    let client = PvaClient::builder()
+        .timeout(Duration::from_secs(3))
+        .server_addr(tls_addr)
+        .with_tls(client_tls)
+        .build();
+    let v = tokio::time::timeout(Duration::from_secs(5), client.pvget("TLS:PV"))
+        .await
+        .expect("pvget timed out")
+        .expect("pvget over the dedicated TLS port failed");
+    match v {
+        PvField::Structure(s) => assert!(matches!(
+            s.get_value(),
+            Some(ScalarValue::Double(d)) if (d - 7.5).abs() < 1e-9
+        )),
+        other => panic!("expected NTScalar structure, got {other:?}"),
+    }
+
+    server.stop();
+}
+
 /// a client presenting an X.509 client certificate over mTLS must
 /// have its connection credentials populated with `method = "x509"`,
 /// `account` = the client leaf cert's subject CommonName, and

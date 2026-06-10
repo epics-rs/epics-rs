@@ -14,6 +14,24 @@ use super::udp::{random_guid, run_udp_responder_v6, run_udp_responder_with_confi
 pub struct PvaServerConfig {
     pub tcp_port: u16,
     pub udp_port: u16,
+    /// Dedicated TLS listen port. Only consulted when [`Self::tls`] is
+    /// `Some`: the runtime then binds a *second* TCP listener on this
+    /// port (in addition to the plaintext [`Self::tcp_port`] listener)
+    /// and advertises it as the `"tls"` endpoint in UDP / TCP-circuit
+    /// SEARCH replies. Mirrors pvxs, which binds a separate per-interface
+    /// TLS socket on `effective.tls_port` (`server.cpp:595-608`) and
+    /// returns it for a protoTLS SEARCH (`server.cpp:849-852`,
+    /// `serverchan.cpp:195,250`).
+    ///
+    /// `0` requests an OS-ephemeral TLS port (the bound value is stamped
+    /// back here at `start()`, like [`Self::tcp_port`]). When the
+    /// requested port collides with the bound plaintext port the runtime
+    /// skips the second bind and serves TLS on the shared port via the
+    /// first-byte dispatch in
+    /// [`crate::server_native::tcp::run_tcp_server_on_listener`]. Default
+    /// `5076` (pvxs `netcommon.h:133`); parsed from
+    /// `EPICS_PVAS_TLS_PORT` / `EPICS_PVA_TLS_PORT` by [`Self::with_env`].
+    pub tls_port: u16,
     /// server identity propagated into the TCP-circuit
     /// `Command::Search` reply (`pvxs serverchan.cpp:215-235`). UDP
     /// SEARCH_RESPONSE uses the same guid emitted by the UDP
@@ -253,6 +271,7 @@ impl Default for PvaServerConfig {
         Self {
             tcp_port: 5075,
             udp_port: 5076,
+            tls_port: 5076,
             guid: [0u8; 12],
             op_timeout: Duration::from_secs(64_000),
             bind_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -296,6 +315,7 @@ impl PvaServerConfig {
         Self {
             tcp_port: 0,
             udp_port: 0,
+            tls_port: 0,
             bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             auto_beacon: false,
             beacon_destinations: Vec::new(),
@@ -322,6 +342,12 @@ impl PvaServerConfig {
         // 402-408 PickOne precedence).
         if let Some(v) = env::pvas_server_port_opt() {
             self.tcp_port = v;
+        }
+        // Server TLS listen port: EPICS_PVAS_TLS_PORT first, then the
+        // shared EPICS_PVA_TLS_PORT (pvxs config.cpp:513-519 PickOne).
+        // Only takes effect when `tls` is configured (see `tls_port`).
+        if let Some(v) = env::pvas_tls_port_opt() {
+            self.tls_port = v;
         }
         if let Some(v) = env::server_broadcast_port_opt() {
             self.udp_port = v;
@@ -460,6 +486,10 @@ pub struct PvaServer {
     /// callers needing the post-bind port should query the listener
     /// directly (future work).
     bound_tcp_port: u16,
+    /// Bound dedicated-TLS port, advertised as the `"tls"` SEARCH endpoint.
+    /// Equals [`Self::bound_tcp_port`] when TLS shares the plaintext port
+    /// (no separate listener) and is meaningless when TLS is disabled.
+    bound_tls_port: u16,
     /// Programmatic interrupt for [`Self::run`]. Not used by `wait()`.
     interrupt: Arc<tokio::sync::Notify>,
     /// Per-peer book-keeping registry shared with `run_tcp_server`'s
@@ -702,6 +732,73 @@ impl PvaServer {
             tcp_listeners.push(tokio::net::TcpListener::from_std(std_listener)?);
         }
 
+        // Dedicated TLS listener(s). pvxs binds a SEPARATE per-interface TLS
+        // socket on `effective.tls_port` alongside the plaintext one
+        // (server.cpp:595-608) and advertises it for a protoTLS SEARCH
+        // (server.cpp:849-852). Without a distinct listener a deployment that
+        // sets EPICS_PVAS_TLS_PORT — or a client addressed straight at the
+        // TLS port via a name server — could not reach the server, since the
+        // Rust server otherwise only listens on `tcp_port`. The listener runs
+        // the same first-byte dispatch as the plaintext one
+        // (`run_tcp_server_on_listener`): a TLS ClientHello is upgraded; a
+        // plaintext peer is served plain unless `disable_plaintext` refuses
+        // it. `bound_tls_port` is the port advertised as the `"tls"` endpoint.
+        //
+        // Skip the extra bind when the requested TLS port resolves to the
+        // already-bound plaintext port (an explicit collision): the shared
+        // listener already serves TLS via the peek, and a second bind on the
+        // same (addr, port) would fail with AddrInUse.
+        let bound_tls_port = if config.tls.is_some() && config.tls_port != bound_tcp_port {
+            let first_tls_addr = SocketAddr::new(tcp_bind_ips[0], config.tls_port);
+            let first_tls = match std::net::TcpListener::bind(first_tls_addr) {
+                Ok(l) => l,
+                // Same single-retry ephemeral fallback as the plaintext bind
+                // (pvxs serverconn.cpp:493): a taken/forbidden explicit TLS
+                // port falls back to an OS-picked one rather than failing the
+                // whole server.
+                Err(e)
+                    if config.tls_port != 0
+                        && (e.kind() == std::io::ErrorKind::AddrInUse
+                            || e.kind() == std::io::ErrorKind::PermissionDenied) =>
+                {
+                    let listener =
+                        std::net::TcpListener::bind(SocketAddr::new(tcp_bind_ips[0], 0))?;
+                    tracing::warn!(
+                        requested = ?first_tls_addr,
+                        bound = ?listener.local_addr().ok(),
+                        error = %e,
+                        "PVA TLS port unavailable; falling back to ephemeral",
+                    );
+                    listener
+                }
+                Err(e) => return Err(PvaError::Io(e)),
+            };
+            first_tls.set_nonblocking(true)?;
+            let tls_port = first_tls.local_addr()?.port();
+            tcp_listeners.push(tokio::net::TcpListener::from_std(first_tls)?);
+            for ip in tcp_bind_ips.iter().skip(1) {
+                let addr = SocketAddr::new(*ip, tls_port);
+                let std_listener = std::net::TcpListener::bind(addr).map_err(PvaError::Io)?;
+                std_listener.set_nonblocking(true)?;
+                tcp_listeners.push(tokio::net::TcpListener::from_std(std_listener)?);
+            }
+            tls_port
+        } else {
+            // No separate TLS listener: when TLS is enabled the shared
+            // plaintext port serves it (peek dispatch), so the advertised
+            // TLS endpoint is that port. When TLS is disabled the value is
+            // inert (never advertised — see `protocol` below).
+            bound_tcp_port
+        };
+        // Single bound-port source of truth for the TLS endpoint, mirroring
+        // the `config.tcp_port = bound_tcp_port` stamp above. Only meaningful
+        // when TLS is enabled; left untouched otherwise so a disabled-TLS
+        // server's report keeps the configured value rather than aliasing the
+        // plaintext port.
+        if config.tls.is_some() {
+            config.tls_port = bound_tls_port;
+        }
+
         // v4 entries of the interface list constrain the UDP search
         // responder bind; v6 entries (rare) are handled by the wildcard
         // v6 responder below and are not part of the per-NIC v4 set.
@@ -715,10 +812,19 @@ impl PvaServer {
             .collect();
 
         let protocol: &'static str = if config.tls.is_some() { "tls" } else { "tcp" };
+        // The port advertised for `protocol` in SEARCH replies / beacons.
+        // pvxs returns `tls_port` for a protoTLS reply and `tcp_port`
+        // otherwise (server.cpp:849-857); on a TLS server clients are
+        // therefore steered to the dedicated TLS listener bound above.
+        let advertised_tcp_port = if config.tls.is_some() {
+            bound_tls_port
+        } else {
+            bound_tcp_port
+        };
         let udp_handle = tokio::spawn(run_udp_responder_with_config(
             dyn_source.clone(),
             config.udp_port,
-            bound_tcp_port,
+            advertised_tcp_port,
             guid,
             protocol,
             config.beacon_period,
@@ -739,7 +845,7 @@ impl PvaServer {
             Some(tokio::spawn(run_udp_responder_v6(
                 dyn_source.clone(),
                 config.udp_port,
-                bound_tcp_port,
+                advertised_tcp_port,
                 guid,
                 protocol,
                 config.ignore_addrs.clone(),
@@ -798,6 +904,7 @@ impl PvaServer {
             tcp_abort,
             effective_config: config,
             bound_tcp_port,
+            bound_tls_port,
             interrupt: Arc::new(tokio::sync::Notify::new()),
             peers,
         })
@@ -839,6 +946,21 @@ impl PvaServer {
             std::net::IpAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
         };
         SocketAddr::new(loopback, self.bound_tcp_port)
+    }
+
+    /// Loopback address the dedicated TLS listener bound to, or `None`
+    /// when TLS is disabled. When TLS shares the plaintext port (no
+    /// separate listener) this equals [`Self::tcp_addr`]. Useful for
+    /// raw-socket interop tests that drive a TLS ClientHello at the
+    /// advertised `"tls"` endpoint.
+    pub fn tls_addr(&self) -> Option<SocketAddr> {
+        // Only present when TLS is configured.
+        self.effective_config.tls.as_ref()?;
+        let loopback = match self.effective_config.bind_ip {
+            std::net::IpAddr::V4(_) => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            std::net::IpAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        };
+        Some(SocketAddr::new(loopback, self.bound_tls_port))
     }
 
     /// Block on this server until it stops, SIGINT/SIGTERM is received,
@@ -891,6 +1013,7 @@ impl PvaServer {
         ServerReport {
             tcp_port: self.bound_tcp_port,
             udp_port: self.effective_config.udp_port,
+            tls_port: self.bound_tls_port,
             tls_enabled: self.effective_config.tls.is_some(),
             ignore_addrs: self.effective_config.ignore_addrs.len(),
             beacon_period_secs: self.effective_config.beacon_period.as_secs(),
@@ -973,6 +1096,10 @@ impl PvaServer {
 pub struct ServerReport {
     pub tcp_port: u16,
     pub udp_port: u16,
+    /// Bound dedicated-TLS port advertised as the `"tls"` SEARCH endpoint.
+    /// Only meaningful when [`Self::tls_enabled`]; equals [`Self::tcp_port`]
+    /// when TLS shares the plaintext port.
+    pub tls_port: u16,
     pub tls_enabled: bool,
     pub ignore_addrs: usize,
     pub beacon_period_secs: u64,
@@ -1487,6 +1614,38 @@ mod with_env_preserve_tests {
             assert_eq!(
                 cfg.udp_port, 11111,
                 "absent broadcast-port var must leave udp_port"
+            );
+        });
+    }
+
+    const TLS_PORT_VARS: &[&str] = &["EPICS_PVAS_TLS_PORT", "EPICS_PVA_TLS_PORT"];
+
+    /// `EPICS_PVAS_TLS_PORT` overrides `tls_port`; with only the shared
+    /// `EPICS_PVA_TLS_PORT` set that form wins (pvxs `config.cpp:513`
+    /// `PickOne{EPICS_PVAS_TLS_PORT, EPICS_PVA_TLS_PORT}`); an absent var
+    /// preserves the caller value.
+    #[test]
+    fn with_env_tls_port_pvas_first_then_shared_then_preserve() {
+        with_cleared_env(TLS_PORT_VARS, || {
+            // Absent → caller value preserved.
+            let cfg = PvaServerConfig {
+                tls_port: 5555,
+                ..Default::default()
+            }
+            .with_env();
+            assert_eq!(cfg.tls_port, 5555, "absent TLS-port var must not reset");
+
+            // Shared form alone is honoured.
+            unsafe { std::env::set_var("EPICS_PVA_TLS_PORT", "5077") };
+            let cfg = PvaServerConfig::default().with_env();
+            assert_eq!(cfg.tls_port, 5077, "shared EPICS_PVA_TLS_PORT must apply");
+
+            // Server-specific form takes precedence over the shared form.
+            unsafe { std::env::set_var("EPICS_PVAS_TLS_PORT", "5078") };
+            let cfg = PvaServerConfig::default().with_env();
+            assert_eq!(
+                cfg.tls_port, 5078,
+                "EPICS_PVAS_TLS_PORT must win over EPICS_PVA_TLS_PORT"
             );
         });
     }

@@ -5502,6 +5502,15 @@ async fn handle_tcp_search(
     // Default protocol on TCP is "tcp" (or "tls" when TLS is in use); it
     // names the transport advertised back in the SEARCH_RESPONSE.
     let protocol: &'static str = if config.tls.is_some() { "tls" } else { "tcp" };
+    // Port advertised for `protocol`: pvxs returns `tls_port` for a
+    // protoTLS reply and `tcp_port` otherwise (server.cpp:849-857), so a
+    // TLS server steers the client to its dedicated TLS listener. The
+    // runtime stamps `config.tls_port` to the bound TLS port at start().
+    let advertised_port = if config.tls.is_some() {
+        config.tls_port
+    } else {
+        config.tcp_port
+    };
     // Match WITHOUT the UDP protocol gate. pvxs `handle_SEARCH` parses the
     // SEARCH protocol strings into `foundtcp` but never consults it before
     // calling every source's `onSearch` (serverchan.cpp:184-244): on an
@@ -5521,7 +5530,7 @@ async fn handle_tcp_search(
         let response = super::udp::build_search_response_proto(
             config.guid,
             req.seq,
-            config.tcp_port,
+            advertised_port,
             &matched,
             req.byte_order,
             protocol,

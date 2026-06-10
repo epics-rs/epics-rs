@@ -592,6 +592,25 @@ pub fn pvas_server_port_opt() -> Option<u16> {
         .and_then(|s| parse_port_env(&s))
 }
 
+/// Presence-aware server **TLS** listen port — `EPICS_PVAS_TLS_PORT`
+/// first, then the shared `EPICS_PVA_TLS_PORT`, returning `None` when
+/// neither is set so [`crate::server_native::PvaServerConfig::with_env`]
+/// preserves a caller-supplied `tls_port`.
+///
+/// Mirrors pvxs `server::Config::_fromDefs` `PickOne` precedence
+/// (`config.cpp:513-519`): the server reads the server-specific
+/// `EPICS_PVAS_TLS_PORT` first and falls back to the shared
+/// `EPICS_PVA_TLS_PORT`. The compiled default (pvxs `netcommon.h:133`,
+/// `tls_port = 5076`) lives on
+/// [`crate::server_native::PvaServerConfig::default`], not here, so an
+/// absent variable never overwrites the caller value.
+pub fn pvas_tls_port_opt() -> Option<u16> {
+    std::env::var("EPICS_PVAS_TLS_PORT")
+        .ok()
+        .or_else(|| std::env::var("EPICS_PVA_TLS_PORT").ok())
+        .and_then(|s| parse_port_env(&s))
+}
+
 /// `EPICS_PVA_AUTO_ADDR_LIST` — default YES. When truthy, the search
 /// engine adds per-NIC broadcast addresses to the SEARCH targets list.
 pub fn auto_addr_list_enabled() -> bool {

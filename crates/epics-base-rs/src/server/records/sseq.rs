@@ -15,6 +15,11 @@ const SSEQ_WAIT_CHOICES: &[&str] = &[
     "After8", "After9", "AfterA",
 ];
 
+/// Choice labels for the per-step DOL/LNK link-status menu, in index
+/// order. C `menu(sseqLNKV)` (sseqRecord.dbd:20): 0=Ext PV NC, 1=Ext PV
+/// OK, 2=Local PV, 3=Constant. Shared by every `DOLnV`/`LNKnV` field.
+const SSEQ_LNKV_CHOICES: &[&str] = &["Ext PV NC", "Ext PV OK", "Local PV", "Constant"];
+
 const NUM_STEPS: usize = 10;
 
 /// A single step in the string sequence.
@@ -78,6 +83,26 @@ impl SseqRecord {
         }
     }
 
+    /// Parse a `DOLnV` / `LNKnV` link-status field name into its 0-based
+    /// step index (suffix `1`..`9` or `A`). These `menu(sseqLNKV)` fields
+    /// (sseqRecord.dbd:118,125) carry the step digit *before* the trailing
+    /// `V`, so the generic `step_index_from_suffix` (which keys on the last
+    /// character) does not recognise them.
+    fn link_status_index(name: &str) -> Option<usize> {
+        let mid = name
+            .strip_prefix("DOL")
+            .or_else(|| name.strip_prefix("LNK"))?
+            .strip_suffix('V')?;
+        if mid.len() != 1 {
+            return None;
+        }
+        match mid.as_bytes()[0] {
+            c @ b'1'..=b'9' => Some((c - b'1') as usize),
+            b'A' => Some(9),
+            _ => None,
+        }
+    }
+
     pub fn should_execute_step(&self, step_idx: usize) -> bool {
         match self.selm {
             0 => true, // All
@@ -98,347 +123,56 @@ impl SseqRecord {
     }
 }
 
-static SSEQ_FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SELM",
-        // SELM is DBF_MENU menu(sseqSELM) (sseqRecord.dbd:34) — served as
-        // DBR_ENUM with the menu's choice labels, see SSEQ_SELM_CHOICES.
-        dbf_type: DbFieldType::Enum,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SELN",
-        dbf_type: DbFieldType::UShort,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SELL",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "PREC",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "ABORT",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BUSY",
-        dbf_type: DbFieldType::Short,
-        read_only: true,
-    },
-    // Steps 1-9
-    FieldDesc {
-        name: "DLY1",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOL1",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DO1",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LNK1",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "STR1",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "WAIT1",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DLY2",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOL2",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DO2",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LNK2",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "STR2",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "WAIT2",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DLY3",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOL3",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DO3",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LNK3",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "STR3",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "WAIT3",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DLY4",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOL4",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DO4",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LNK4",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "STR4",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "WAIT4",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DLY5",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOL5",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DO5",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LNK5",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "STR5",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "WAIT5",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DLY6",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOL6",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DO6",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LNK6",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "STR6",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "WAIT6",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DLY7",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOL7",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DO7",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LNK7",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "STR7",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "WAIT7",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DLY8",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOL8",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DO8",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LNK8",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "STR8",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "WAIT8",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DLY9",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOL9",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DO9",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LNK9",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "STR9",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "WAIT9",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    // Step 10 (A suffix)
-    FieldDesc {
-        name: "DLYA",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOLA",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DOA",
-        dbf_type: DbFieldType::Double,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "LNKA",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "STRA",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "WAITA",
-        dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-];
+/// Build the full `sseq` field table. The 7 base record fields plus the
+/// top-level `ABORTING` status, then the C "struct linkGroup" — 13 fields
+/// per step (sseqRecord.dbd) for each of the 10 steps (suffixes `1`..`9`,
+/// `A`), in DBD declaration order. `concat!` materialises each per-step
+/// field name as a `&'static str`, keeping the table a compile-time
+/// `static` while the per-step shape is generated once (no copy-paste
+/// drift across 130 entries).
+///
+/// `DTn`/`LTn` (DOL/LNK link field type), `WERRn` (wait-config error),
+/// `WTGn` (outstanding callback), `IXn` (step index), `DOLnV`/`LNKnV`
+/// (link connection status, `menu(sseqLNKV)`) and top-level `ABORTING`
+/// are read-only diagnostics: C `sseqRecord.c` updates them from the
+/// record's async sequence owner (checkLinks / processNextLink), which is
+/// not yet ported, so they expose their DBD init defaults here.
+macro_rules! sseq_fields {
+    ($($s:literal),+ $(,)?) => {
+        &[
+            FieldDesc { name: "VAL", dbf_type: DbFieldType::Long, read_only: false },
+            // SELM is DBF_MENU menu(sseqSELM) (sseqRecord.dbd:34) — served
+            // as DBR_ENUM with the menu's choice labels (SSEQ_SELM_CHOICES).
+            FieldDesc { name: "SELM", dbf_type: DbFieldType::Enum, read_only: false },
+            FieldDesc { name: "SELN", dbf_type: DbFieldType::UShort, read_only: false },
+            FieldDesc { name: "SELL", dbf_type: DbFieldType::String, read_only: false },
+            FieldDesc { name: "PREC", dbf_type: DbFieldType::Short, read_only: false },
+            FieldDesc { name: "ABORT", dbf_type: DbFieldType::Short, read_only: false },
+            FieldDesc { name: "ABORTING", dbf_type: DbFieldType::Short, read_only: true },
+            FieldDesc { name: "BUSY", dbf_type: DbFieldType::Short, read_only: true },
+            $(
+                FieldDesc { name: concat!("DLY", $s), dbf_type: DbFieldType::Double, read_only: false },
+                FieldDesc { name: concat!("DOL", $s), dbf_type: DbFieldType::String, read_only: false },
+                FieldDesc { name: concat!("DO", $s), dbf_type: DbFieldType::Double, read_only: false },
+                FieldDesc { name: concat!("LNK", $s), dbf_type: DbFieldType::String, read_only: false },
+                FieldDesc { name: concat!("STR", $s), dbf_type: DbFieldType::String, read_only: false },
+                FieldDesc { name: concat!("DT", $s), dbf_type: DbFieldType::Short, read_only: true },
+                FieldDesc { name: concat!("LT", $s), dbf_type: DbFieldType::Short, read_only: true },
+                // WAITn is DBF_MENU menu(sseqWAIT) — see SSEQ_WAIT_CHOICES.
+                FieldDesc { name: concat!("WAIT", $s), dbf_type: DbFieldType::Short, read_only: false },
+                FieldDesc { name: concat!("WERR", $s), dbf_type: DbFieldType::Short, read_only: true },
+                FieldDesc { name: concat!("WTG", $s), dbf_type: DbFieldType::Short, read_only: true },
+                FieldDesc { name: concat!("IX", $s), dbf_type: DbFieldType::Short, read_only: true },
+                // DOLnV / LNKnV are DBF_MENU menu(sseqLNKV) — served as
+                // DBR_ENUM with SSEQ_LNKV_CHOICES.
+                FieldDesc { name: concat!("DOL", $s, "V"), dbf_type: DbFieldType::Enum, read_only: true },
+                FieldDesc { name: concat!("LNK", $s, "V"), dbf_type: DbFieldType::Enum, read_only: true },
+            )+
+        ]
+    };
+}
+
+static SSEQ_FIELDS: &[FieldDesc] = sseq_fields!("1", "2", "3", "4", "5", "6", "7", "8", "9", "A");
 
 impl Record for SseqRecord {
     fn record_type(&self) -> &'static str {
@@ -508,8 +242,24 @@ impl Record for SseqRecord {
             "SELL" => Some(EpicsValue::String(self.sell.clone().into())),
             "PREC" => Some(EpicsValue::Short(self.prec)),
             "ABORT" => Some(EpicsValue::Short(self.abort)),
+            // ABORTING (sseqRecord.dbd:820) is a machine-driven status:
+            // C `sseqRecord.c:special`/`asyncFinish` toggle it across an
+            // abort. That async sequence owner is not yet ported, so the
+            // record always reads the inactive default — exposed read-only
+            // so clients can still open REC.ABORTING.
+            "ABORTING" => Some(EpicsValue::Short(0)),
             "BUSY" => Some(EpicsValue::Short(self.busy)),
             _ => {
+                // DOLnV / LNKnV link-status menu (menu(sseqLNKV),
+                // sseqRecord.dbd:118,125). The step digit sits before the
+                // trailing `V`, so `step_index_from_suffix` (which keys on
+                // the last char) does not recognise these. C init value is
+                // sseqLNKV_EXT (1); the live connection status is computed
+                // by `sseqRecord.c:checkLinks` (part of the async sequence
+                // machine not yet ported).
+                if Self::link_status_index(name).is_some() {
+                    return Some(EpicsValue::Enum(1));
+                }
                 if let Some((idx, prefix)) = Self::step_index_from_suffix(name) {
                     let step = &self.steps[idx];
                     return match prefix {
@@ -519,6 +269,18 @@ impl Record for SseqRecord {
                         "LNK" => Some(EpicsValue::String(step.lnk.clone().into())),
                         "STR" => Some(EpicsValue::String(step.str_val.clone())),
                         "WAIT" => Some(EpicsValue::Short(step.wait)),
+                        // Per-step diagnostics (sseqRecord.dbd). Read-only;
+                        // their live values come from the async sequence
+                        // owner (`sseqRecord.c:processNextLink`/`checkLinks`),
+                        // not yet ported — exposed at their C init defaults
+                        // so REC.DTn/LTn/WERRn/WTGn/IXn can be opened.
+                        "DT" => Some(EpicsValue::Short(0)),
+                        "LT" => Some(EpicsValue::Short(0)),
+                        "WERR" => Some(EpicsValue::Short(0)),
+                        "WTG" => Some(EpicsValue::Short(0)),
+                        // IXn holds the step's own 0-based index
+                        // (sseqRecord.dbd initial: IX1=0 .. IXA=9).
+                        "IX" => Some(EpicsValue::Short(idx as i16)),
                         _ => None,
                     };
                 }
@@ -656,6 +418,9 @@ impl Record for SseqRecord {
             _ if matches!(Self::step_index_from_suffix(field), Some((_, "WAIT"))) => {
                 Some(SSEQ_WAIT_CHOICES)
             }
+            // The per-step `DOLnV`/`LNKnV` link-status fields are
+            // `menu(sseqLNKV)` (sseqRecord.dbd:118,125).
+            _ if Self::link_status_index(field).is_some() => Some(SSEQ_LNKV_CHOICES),
             _ => None,
         }
     }
@@ -818,7 +583,86 @@ mod tests {
     fn test_sseq_field_list() {
         let rec = SseqRecord::new();
         let fields = rec.field_list();
-        // 7 base + 6*10 = 67 fields
-        assert!(fields.len() >= 67);
+        // 8 base (VAL/SELM/SELN/SELL/PREC/ABORT/ABORTING/BUSY) + 13 per
+        // step * 10 steps = 138 fields (full sseqRecord.dbd surface).
+        assert_eq!(fields.len(), 138);
+        // The generated per-step table must not collide on a field name.
+        let mut names: Vec<&str> = fields.iter().map(|f| f.name).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "field names must be unique");
+    }
+
+    #[test]
+    fn test_sseq_status_fields_openable() {
+        // The per-step diagnostics and top-level ABORTING must be
+        // openable/readable (clients previously got field-not-found).
+        // They expose their sseqRecord.dbd init defaults: the live values
+        // are driven by the async sequence owner, not yet ported.
+        let rec = SseqRecord::new();
+        assert_eq!(rec.get_field("DT1"), Some(EpicsValue::Short(0)));
+        assert_eq!(rec.get_field("LT1"), Some(EpicsValue::Short(0)));
+        assert_eq!(rec.get_field("WERR1"), Some(EpicsValue::Short(0)));
+        assert_eq!(rec.get_field("WTG1"), Some(EpicsValue::Short(0)));
+        // A-suffix step variants.
+        assert_eq!(rec.get_field("DTA"), Some(EpicsValue::Short(0)));
+        assert_eq!(rec.get_field("WTGA"), Some(EpicsValue::Short(0)));
+        assert_eq!(rec.get_field("WERRA"), Some(EpicsValue::Short(0)));
+        // DOLnV / LNKnV menu init = sseqLNKV_EXT (1).
+        assert_eq!(rec.get_field("DOL1V"), Some(EpicsValue::Enum(1)));
+        assert_eq!(rec.get_field("LNK1V"), Some(EpicsValue::Enum(1)));
+        assert_eq!(rec.get_field("DOLAV"), Some(EpicsValue::Enum(1)));
+        assert_eq!(rec.get_field("LNKAV"), Some(EpicsValue::Enum(1)));
+        // Top-level ABORTING.
+        assert_eq!(rec.get_field("ABORTING"), Some(EpicsValue::Short(0)));
+    }
+
+    #[test]
+    fn test_sseq_ix_is_step_index() {
+        // IXn holds the step's own 0-based index (sseqRecord.dbd
+        // initial: IX1=0 .. IXA=9).
+        let rec = SseqRecord::new();
+        assert_eq!(rec.get_field("IX1"), Some(EpicsValue::Short(0)));
+        assert_eq!(rec.get_field("IX2"), Some(EpicsValue::Short(1)));
+        assert_eq!(rec.get_field("IX9"), Some(EpicsValue::Short(8)));
+        assert_eq!(rec.get_field("IXA"), Some(EpicsValue::Short(9)));
+    }
+
+    #[test]
+    fn test_sseq_link_status_menu_choices() {
+        // DOLnV / LNKnV are menu(sseqLNKV); served as DBR_ENUM with the
+        // four connection-status labels. The link fields they shadow
+        // (DOL1 / LNK1) are NOT menus.
+        let rec = SseqRecord::new();
+        let choices = rec
+            .menu_field_choices("DOL1V")
+            .expect("DOL1V is a menu field");
+        assert_eq!(choices, &["Ext PV NC", "Ext PV OK", "Local PV", "Constant"]);
+        assert_eq!(rec.menu_field_choices("LNKAV"), Some(SSEQ_LNKV_CHOICES));
+        assert!(rec.menu_field_choices("DOL1").is_none());
+        assert!(rec.menu_field_choices("LNK1").is_none());
+    }
+
+    #[test]
+    fn test_sseq_status_fields_read_only() {
+        // Diagnostics are SPC_NOMOD in the DBD (sseqRecord.dbd); ABORTING's
+        // live transition is machine-owned. All are read-only here. The
+        // writable control/step fields stay writable.
+        let rec = SseqRecord::new();
+        let fields = rec.field_list();
+        for ro_name in [
+            "ABORTING", "DT1", "LT1", "WERR1", "WTG1", "IX1", "DOL1V", "LNK1V", "DTA", "LNKAV",
+        ] {
+            let f = fields
+                .iter()
+                .find(|f| f.name == ro_name)
+                .unwrap_or_else(|| panic!("{ro_name} present in field_list"));
+            assert!(f.read_only, "{ro_name} must be read-only");
+        }
+        for rw_name in ["VAL", "ABORT", "DLY1", "WAIT1", "LNK1", "STRA"] {
+            let f = fields.iter().find(|f| f.name == rw_name).unwrap();
+            assert!(!f.read_only, "{rw_name} stays writable");
+        }
     }
 }

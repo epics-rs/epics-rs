@@ -2022,6 +2022,26 @@ pub async fn run_tcp_server_on_listener(
                         }
                     };
 
+                    // Anti-downgrade: when the operator requires TLS
+                    // (`disable_plaintext`), refuse a non-TLS peer before it
+                    // can reach the plain code path. pvxs enforces the
+                    // refusal on the CLIENT (it drops a plaintext SEARCH
+                    // reply, client.cpp:944); the Rust server unifies TLS +
+                    // plaintext on each listener via the peek above, so the
+                    // equivalent server-side guarantee lives here. Gated on
+                    // `acceptor.is_some()` so a misconfigured server with no
+                    // TLS identity does not refuse every connection (a server
+                    // cannot be TLS-only without TLS). A TLS ClientHello
+                    // (`is_tls_client`) is served normally below.
+                    if cfg.disable_plaintext && acceptor.is_some() && !is_tls_client {
+                        debug!(
+                            ?peer,
+                            "refusing plaintext connection: disable_plaintext set (TLS required)"
+                        );
+                        active_dec.fetch_sub(1, Ordering::SeqCst);
+                        return;
+                    }
+
                     // register this connection in the peer registry
                     // so PvaServer::report() can surface it. Deferred to
                     // here (post-peek) so the `tls` flag reflects the

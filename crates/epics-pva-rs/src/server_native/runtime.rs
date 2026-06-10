@@ -82,6 +82,21 @@ pub struct PvaServerConfig {
     /// Per-monitor outbound queue depth. When exceeded, the back-pressure
     /// policy kicks in (squash to last value).
     pub monitor_queue_depth: usize,
+    /// Require TLS — refuse plaintext sessions (anti-downgrade). Parsed
+    /// from `disable_plaintext=true` in `EPICS_PVAS_TLS_OPTIONS` /
+    /// `EPICS_PVA_TLS_OPTIONS` by [`Self::with_env`]; default `false`.
+    ///
+    /// pvxs carries `tls_disable_plaintext` in the shared `ConfigCommon`
+    /// (`netcommon.h:172`) and enforces the downgrade refusal on the
+    /// CLIENT — it drops a plaintext (`"tcp"`) SEARCH reply
+    /// (`client.cpp:944`). Because the Rust server unifies TLS and
+    /// plaintext on each listener via the first-byte peek
+    /// (`run_tcp_server_on_listener`), the equivalent server-side
+    /// guarantee is to refuse a non-TLS peer at accept time so a
+    /// stripped/downgraded connection can never reach the plain code
+    /// path. Inert unless [`Self::tls`] is `Some` (a server with no TLS
+    /// identity cannot be TLS-only).
+    pub disable_plaintext: bool,
     /// Optional TLS server config. When `Some`, the accept loop peeks
     /// the first byte of each incoming connection with a 100 ms window:
     /// a TLS ClientHello (byte `0x16`, sent immediately by the TLS
@@ -280,6 +295,7 @@ impl Default for PvaServerConfig {
             max_ops_per_channel: 64,
             idle_timeout: Duration::from_secs(45),
             monitor_queue_depth: 64,
+            disable_plaintext: false,
             tls: None,
             access_gate_override: None,
             wire_byte_order: crate::proto::ByteOrder::Little,
@@ -351,6 +367,11 @@ impl PvaServerConfig {
         }
         if let Some(v) = env::server_broadcast_port_opt() {
             self.udp_port = v;
+        }
+        // Anti-downgrade: `disable_plaintext=true` in the TLS options makes
+        // the server refuse plaintext (pvxs parseTLSOptions, config.cpp:453).
+        if let Some(v) = env::server_tls_disable_plaintext_opt() {
+            self.disable_plaintext = v;
         }
         if let Some(v) = env::max_connections_opt() {
             self.max_connections = v;

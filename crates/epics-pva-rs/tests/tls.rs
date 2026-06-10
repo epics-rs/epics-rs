@@ -310,6 +310,81 @@ async fn tls_server_binds_dedicated_tls_port_distinct_from_plaintext() {
     server.stop();
 }
 
+/// With `disable_plaintext` set the server must REFUSE a plaintext peer
+/// (anti-downgrade) while still serving a TLS client. pvxs carries
+/// `tls_disable_plaintext` in the shared config and refuses the downgrade
+/// client-side (it drops a plaintext SEARCH reply, client.cpp:944); the
+/// Rust server unifies TLS + plaintext on each listener via the
+/// first-byte peek, so the server-side guarantee is to drop the non-TLS
+/// peer at accept time. Pre-fix the option was never parsed and a plain
+/// client was always served.
+#[tokio::test]
+async fn disable_plaintext_server_refuses_plain_but_serves_tls() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let (cert, key) = generate_self_signed();
+    let server_cfg = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.clone()], key)
+        .expect("server tls config");
+    let server_tls = Arc::new(TlsServerConfig {
+        config: Arc::new(server_cfg),
+        require_client_cert: false,
+        trust_roots: Arc::new(RootCertStore::empty()),
+    });
+
+    let mut roots = RootCertStore::empty();
+    roots.add(cert).unwrap();
+    let client_cfg = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let client_tls = Arc::new(TlsClientConfig {
+        config: Arc::new(client_cfg),
+    });
+
+    let source = Arc::new(StaticSource::new());
+    source.put("SECURE:PV", 3.25).await;
+
+    let cfg = PvaServerConfig {
+        tls: Some(server_tls),
+        disable_plaintext: true,
+        ..PvaServerConfig::isolated()
+    };
+    let server = epics_pva_rs::server_native::PvaServer::start(source, cfg).expect("server start");
+
+    // A plaintext client (no TLS) must be refused: the server drops the
+    // connection after the first-byte peek instead of serving plain PVA.
+    let plain = PvaClient::builder()
+        .timeout(Duration::from_millis(800))
+        .server_addr(server.tcp_addr())
+        .build();
+    match tokio::time::timeout(Duration::from_secs(3), plain.pvget("SECURE:PV")).await {
+        Ok(Err(_)) | Err(_) => {} // pvget errored / timed out — refused
+        Ok(Ok(v)) => panic!("plaintext GET must be refused under disable_plaintext, got {v:?}"),
+    }
+
+    // A TLS client on the dedicated TLS port is still served.
+    let tls_addr = server.tls_addr().expect("tls_addr present when TLS on");
+    let secure = PvaClient::builder()
+        .timeout(Duration::from_secs(3))
+        .server_addr(tls_addr)
+        .with_tls(client_tls)
+        .build();
+    let v = tokio::time::timeout(Duration::from_secs(5), secure.pvget("SECURE:PV"))
+        .await
+        .expect("tls pvget timed out")
+        .expect("tls pvget failed");
+    match v {
+        PvField::Structure(s) => assert!(matches!(
+            s.get_value(),
+            Some(ScalarValue::Double(d)) if (d - 3.25).abs() < 1e-9
+        )),
+        other => panic!("expected NTScalar structure, got {other:?}"),
+    }
+
+    server.stop();
+}
+
 /// a client presenting an X.509 client certificate over mTLS must
 /// have its connection credentials populated with `method = "x509"`,
 /// `account` = the client leaf cert's subject CommonName, and

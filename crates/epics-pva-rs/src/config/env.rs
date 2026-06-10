@@ -866,6 +866,32 @@ pub fn server_tls_options() -> String {
         .unwrap_or_default()
 }
 
+/// Presence-aware `disable_plaintext` flag parsed from the server TLS
+/// options (`EPICS_PVAS_TLS_OPTIONS` → `EPICS_PVA_TLS_OPTIONS`, see
+/// [`server_tls_options`]).
+///
+/// Mirrors pvxs `parseTLSOptions` (`config.cpp:435-464`): the option
+/// string is whitespace-split into `key=value` tokens (`split_into`,
+/// `config.cpp:224-239`) and the flag is set ONLY for the exact value
+/// `true` / `false`; an unknown value is ignored and a later token wins
+/// over an earlier one. Returns `None` when no `disable_plaintext=` token
+/// is present, so [`crate::server_native::PvaServerConfig::with_env`]
+/// preserves a caller-supplied value rather than forcing it to the
+/// default — the same `PickOne`-style presence rule the port helpers use.
+pub fn server_tls_disable_plaintext_opt() -> Option<bool> {
+    let mut out = None;
+    for tok in server_tls_options().split_ascii_whitespace() {
+        match tok.split_once('=') {
+            Some(("disable_plaintext", "true")) => out = Some(true),
+            Some(("disable_plaintext", "false")) => out = Some(false),
+            // Unknown value (or some other key) — pvxs logs + ignores,
+            // leaving the field unchanged.
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Non-pvxs fallback password for a client-side TLS keychain.
 ///
 /// pvxs sources the PKCS#12 password from the `;password` suffix of the
@@ -2126,6 +2152,52 @@ mod tests {
             std::env::remove_var("EPICS_PVA_TLS_OPTIONS");
         }
         assert_eq!(server_tls_options(), "", "neither set → empty");
+        unsafe {
+            match prev_pvas {
+                Some(v) => std::env::set_var("EPICS_PVAS_TLS_OPTIONS", v),
+                None => std::env::remove_var("EPICS_PVAS_TLS_OPTIONS"),
+            }
+            match prev_pva {
+                Some(v) => std::env::set_var("EPICS_PVA_TLS_OPTIONS", v),
+                None => std::env::remove_var("EPICS_PVA_TLS_OPTIONS"),
+            }
+        }
+    }
+
+    /// `disable_plaintext` is parsed out of the server TLS options the
+    /// way pvxs `parseTLSOptions` does (config.cpp:453-460): `true` /
+    /// `false` set the flag, an unknown value is ignored, and an absent
+    /// key yields `None` so `with_env` preserves the caller value.
+    #[test]
+    #[serial_test::serial(epics_env)]
+    fn server_tls_disable_plaintext_parses_like_pvxs() {
+        let prev_pvas = std::env::var("EPICS_PVAS_TLS_OPTIONS").ok();
+        let prev_pva = std::env::var("EPICS_PVA_TLS_OPTIONS").ok();
+        unsafe {
+            std::env::remove_var("EPICS_PVAS_TLS_OPTIONS");
+            std::env::remove_var("EPICS_PVA_TLS_OPTIONS");
+        }
+        // Absent key → None (preserve caller value).
+        assert_eq!(server_tls_disable_plaintext_opt(), None);
+        unsafe { std::env::set_var("EPICS_PVAS_TLS_OPTIONS", "client_cert=require") };
+        assert_eq!(
+            server_tls_disable_plaintext_opt(),
+            None,
+            "options present but no disable_plaintext key → None"
+        );
+        // Explicit true / false; coexists with other tokens.
+        unsafe {
+            std::env::set_var(
+                "EPICS_PVAS_TLS_OPTIONS",
+                "client_cert=require disable_plaintext=true",
+            )
+        };
+        assert_eq!(server_tls_disable_plaintext_opt(), Some(true));
+        unsafe { std::env::set_var("EPICS_PVAS_TLS_OPTIONS", "disable_plaintext=false") };
+        assert_eq!(server_tls_disable_plaintext_opt(), Some(false));
+        // Unknown value is ignored (pvxs logs + leaves the field unchanged).
+        unsafe { std::env::set_var("EPICS_PVAS_TLS_OPTIONS", "disable_plaintext=maybe") };
+        assert_eq!(server_tls_disable_plaintext_opt(), None);
         unsafe {
             match prev_pvas {
                 Some(v) => std::env::set_var("EPICS_PVAS_TLS_OPTIONS", v),

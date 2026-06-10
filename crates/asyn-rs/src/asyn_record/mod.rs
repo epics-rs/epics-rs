@@ -2848,7 +2848,7 @@ mod tests {
         assert_eq!(entry.unwrap().handle.port_name(), "test_asyn_rec");
     }
 
-    /// Regression R0604-ASYN-TRACE-ADDR-1.
+    /// Regression.
     ///
     /// On a multi-device port a record with ADDR >= 0 must route trace
     /// controls to the (PORT,ADDR) device trace state, not the port-wide
@@ -2914,7 +2914,7 @@ mod tests {
         assert!(rec0.trace_addr_target().is_none());
     }
 
-    /// Regression R0604-ASYN-TRACE-INFO-SYNC-1 (connect-time import).
+    /// Regression (connect-time import).
     ///
     /// C monitorStatus (asynRecord.c:1079-1084) imports the trace info mask
     /// into TINM/TINB0..3 on connect; previously Rust read only the trace
@@ -3033,7 +3033,7 @@ mod tests {
         assert_eq!(rec.tinb3, 1); // THREAD
     }
 
-    /// Regression R0604-ASYN-IFMT-FIELDS-1.
+    /// Regression.
     ///
     /// C asynRecord stores a device octet read into the single IFMT-selected
     /// input field — ASCII into AINP, Binary/Hybrid into the BINP byte buffer

@@ -1308,7 +1308,7 @@ mod tests {
         );
     }
 
-    /// Regression R0604-ASYN-HOSTINFO-OPTION-KEY-1.
+    /// Regression.
     ///
     /// C `drvAsynIPPort` compares option keys with `epicsStrCaseCmp`
     /// (drvAsynIPPort.c:899/937), so the asynRecord's lowercase

@@ -550,6 +550,98 @@ async fn write_db_link_notify_action_drives_downstream_and_reenters_source() {
     );
 }
 
+/// Source record whose `process()` returns `AsyncPendingNotify` (the
+/// intermediate move-start / sub-step notification shape) carrying a single
+/// `WriteDbLink` to its `LNK` target. C record support fires its link writes
+/// synchronously inside `process()` BEFORE returning with `pact=1`
+/// (motorRecord.cc:1495 fires the RLNK readback `dbPutLink` on the move-start
+/// pass, before `monitor()` at motorRecord.cc:1507 and the `recGblFwdLink`
+/// gate at motorRecord.cc:1509), so the framework must run the requested link
+/// writes on the async-pending cycle too.
+struct PendingNotifyWriteSource {
+    lnk: &'static str,
+}
+
+impl Record for PendingNotifyWriteSource {
+    fn record_type(&self) -> &'static str {
+        "pendnotifysrc"
+    }
+    fn process(&mut self) -> CaResult<ProcessOutcome> {
+        Ok(ProcessOutcome {
+            result: RecordProcessResult::AsyncPendingNotify(vec![(
+                "VAL".to_string(),
+                EpicsValue::Long(1),
+            )]),
+            actions: vec![ProcessAction::WriteDbLink {
+                link_field: "LNK",
+                value: EpicsValue::Long(42),
+            }],
+            device_did_compute: false,
+        })
+    }
+    fn get_field(&self, name: &str) -> Option<EpicsValue> {
+        match name {
+            "VAL" => Some(EpicsValue::Long(0)),
+            "LNK" => Some(EpicsValue::String(self.lnk.into())),
+            _ => None,
+        }
+    }
+    fn put_field(&mut self, _name: &str, _value: EpicsValue) -> CaResult<()> {
+        Ok(())
+    }
+    fn field_list(&self) -> &'static [FieldDesc] {
+        NOTIFY_SRC_FIELDS
+    }
+}
+
+/// (S4) A record that returns `AsyncPendingNotify` and emits a `WriteDbLink`
+/// must have that link write executed on the pending cycle: the PP target is
+/// written AND processed before the record's async work completes. C fires
+/// `dbPutLink` inside `process()` on every pass including an async (pact=1)
+/// pass (motorRecord.cc:1495), so dropping the action on the pending cycle
+/// would lose one of the target's process cycles. Pre-fix the
+/// `AsyncPendingNotify` branch dropped `outcome.actions` entirely.
+#[tokio::test]
+async fn async_pending_notify_runs_write_db_link_on_pending_cycle() {
+    let db = PvDatabase::new();
+
+    // PP target: stores VAL (Long) and counts every process() entry.
+    let dst_count = Arc::new(AtomicU32::new(0));
+    db.add_record(
+        "PEND_DST",
+        Box::new(TestAsyncRecord::new(dst_count.clone())),
+    )
+    .await
+    .unwrap();
+
+    // Source returns AsyncPendingNotify carrying a WriteDbLink to PEND_DST PP.
+    db.add_record(
+        "PEND_SRC",
+        Box::new(PendingNotifyWriteSource { lnk: "PEND_DST PP" }),
+    )
+    .await
+    .unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("PEND_SRC", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // The link write ran on the async-pending cycle.
+    let rec = db.get_record("PEND_DST").await.unwrap();
+    let inst = rec.read().await;
+    assert_eq!(
+        inst.record.get_field("VAL"),
+        Some(EpicsValue::Long(42)),
+        "WriteDbLink on the AsyncPendingNotify cycle must write the PP target's VAL"
+    );
+    assert_eq!(
+        dst_count.load(Ordering::Relaxed),
+        1,
+        "WriteDbLink on the AsyncPendingNotify cycle must process the PP target once"
+    );
+}
+
 /// (S3) The `CancelReprocess` ProcessAction arm advances the record's
 /// re-entry generation, so an outstanding token (a pending DLYn/WAITn
 /// re-entry) becomes a structural no-op — the `sseq` `ABORT` path, with no

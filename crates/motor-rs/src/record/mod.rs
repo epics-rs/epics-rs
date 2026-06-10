@@ -165,13 +165,15 @@ impl MotorRecord {
     /// C `motorRecord.cc:1495` calls `dbPutLink(&rlnk, DBR_DOUBLE, &rbv, 1)`
     /// unconditionally just before `process_exit` on every process pass, so a
     /// record wired through RLNK re-processes whenever the motor record does.
-    /// We mirror that by emitting a `WriteDbLink` for every full-snapshot
-    /// (`Complete`) cycle; the framework writes it before FLNK, exactly where C
-    /// fires it. The empty link is skipped so motors with no RLNK emit nothing.
-    ///
-    /// The single move-start cycle returns `AsyncPendingNotify` (DMOV 1→0) and
-    /// carries no actions; RBV is unchanged there (the prior `Complete` cycle
-    /// already fired RLNK with that RBV), so no readback information is lost.
+    /// We mirror that by emitting a `WriteDbLink` on every process cycle,
+    /// including the move-start `AsyncPendingNotify` (DMOV 1→0) pass: C fires
+    /// `dbPutLink` before `monitor()` (motorRecord.cc:1507) and before the
+    /// `recGblFwdLink` gate (motorRecord.cc:1509), so it runs even while the
+    /// move is still pending. A `dbPutLink` processes a PP readback target even
+    /// when RBV is unchanged, so skipping the pending pass would drop one of
+    /// the target's process cycles relative to C. The framework runs the
+    /// `WriteDbLink` before the deferred FLNK, exactly where C fires it. The
+    /// empty link is skipped so motors with no RLNK emit nothing.
     fn push_readback_link_write(&self, actions: &mut Vec<ProcessAction>) {
         if !self.links.rlnk.is_empty() {
             actions.push(ProcessAction::WriteDbLink {
@@ -256,9 +258,15 @@ impl Record for MotorRecord {
                 ("RBV".to_string(), EpicsValue::Double(self.pos.rbv)),
                 ("DRBV".to_string(), EpicsValue::Double(self.pos.drbv)),
             ];
+            // C fires `dbPutLink(&rlnk, ...)` (motorRecord.cc:1495) on this
+            // move-start pass too — before `monitor()` and the `recGblFwdLink`
+            // gate — so the RLNK readback target still re-processes while the
+            // move is pending.
+            let mut actions = Vec::new();
+            self.push_readback_link_write(&mut actions);
             Ok(ProcessOutcome {
                 result: RecordProcessResult::AsyncPendingNotify(fields),
-                actions: Vec::new(),
+                actions,
                 device_did_compute: false,
             })
         } else {
@@ -431,6 +439,37 @@ mod tests {
                 } if *v == rbv
             )),
             "process() must emit a WriteDbLink to RLNK carrying RBV"
+        );
+    }
+
+    // C motorRecord.cc:1495 fires `dbPutLink(&rlnk, ...)` on the move-start
+    // pass too — before `monitor()` (motorRecord.cc:1507) and the
+    // `recGblFwdLink` gate (motorRecord.cc:1509) — so the RLNK readback
+    // target re-processes even while the move is still pending. The framework
+    // executes the emitted WriteDbLink on the AsyncPendingNotify branch.
+    #[test]
+    fn rlnk_readback_link_fired_on_move_start_async_pending() {
+        let mut rec = MotorRecord::new();
+        rec.links.rlnk = "readback_sink.PROC".to_string();
+        // Enter a move: DMOV goes true→false. The first process() of a fresh
+        // move returns the intermediate DMOV=0 notification.
+        rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+        rec.set_event(MotorEvent::UserWrite(CommandSource::Val));
+        let outcome = rec.process().unwrap();
+        assert!(
+            matches!(outcome.result, RecordProcessResult::AsyncPendingNotify(_)),
+            "first process() of a fresh move must be the move-start notification"
+        );
+        let rbv = rec.pos.rbv;
+        assert!(
+            outcome.actions.iter().any(|a| matches!(
+                a,
+                ProcessAction::WriteDbLink {
+                    link_field: "RLNK",
+                    value: EpicsValue::Double(v),
+                } if *v == rbv
+            )),
+            "the move-start AsyncPendingNotify cycle must still emit the RLNK readback write"
         );
     }
 

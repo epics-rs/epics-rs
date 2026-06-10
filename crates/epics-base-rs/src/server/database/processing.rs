@@ -1595,8 +1595,21 @@ impl PvDatabase {
                 process_result
             {
                 // Intermediate notification (e.g. DMOV=0 at move start).
-                // Execute device write first so the move command reaches the driver,
-                // then flush DMOV=0 etc. to monitors.
+                // Execute device write first so the move command reaches the
+                // driver, then fire the record's link writes, then flush
+                // DMOV=0 etc. to monitors. This mirrors the C ordering on an
+                // async (pact=1) pass: `motorRecord.cc:1491` runs `do_work`
+                // (the device move), `motorRecord.cc:1495` then fires
+                // `dbPutLink(&pmr->rlnk, ...)` UNCONDITIONALLY — on every pass
+                // including the move-start pass where DMOV just went 0 — and
+                // only `motorRecord.cc:1507` afterwards calls `monitor()`. So
+                // the requested `WriteDbLink`/`WriteDbLinkNotify` actions must
+                // run on the pending cycle as well; a put processes a PP target
+                // even when the value is unchanged, so dropping them changes
+                // downstream process counts (motor RLNK, asyn async writes).
+                // The forward link stays deferred: C runs `recGblFwdLink` only
+                // when `pmr->dmov != 0` (motorRecord.cc:1509), i.e. on async
+                // completion, not on this pending pass.
                 if !is_soft {
                     if let Some(mut dev) = instance.device.take() {
                         let _ = dev.write(&mut *instance.record);
@@ -1632,12 +1645,30 @@ impl PvDatabase {
                     changed_fields,
                     event_mask,
                 };
+                let rec_name = instance.name.clone();
                 let rec_clone = rec.clone();
                 drop(instance);
+                // Partition exactly as the synchronous Complete path: link
+                // writes fire here (C `dbPutLink` precedes `monitor()`);
+                // delayed-reprocess / device-command actions run after the
+                // notify (the Complete path runs them after the FLNK tail,
+                // which is deferred to async completion on this pending pass).
+                let (link_writes, deferred_actions): (Vec<_>, Vec<_>) =
+                    process_actions.into_iter().partition(|a| {
+                        matches!(
+                            a,
+                            crate::server::record::ProcessAction::WriteDbLink { .. }
+                                | crate::server::record::ProcessAction::WriteDbLinkNotify { .. }
+                        )
+                    });
+                self.execute_process_actions(&rec_name, &rec, link_writes, visited, depth)
+                    .await;
                 {
                     let inst = rec_clone.read().await;
                     inst.notify_from_snapshot(&snapshot);
                 }
+                self.execute_process_actions(&rec_name, &rec, deferred_actions, visited, depth)
+                    .await;
                 return Ok(());
             }
 

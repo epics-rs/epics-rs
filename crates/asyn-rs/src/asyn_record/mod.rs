@@ -697,6 +697,66 @@ async fn run_io_plan(handle: PortHandle, plan: IoPlan, cancel: CancelToken) -> I
 /// `AQR` request (asynRecord.c:398).
 const CANCELED_MSG: &str = "I/O request canceled";
 
+/// Build the asyn trace readback fields from the three trace masks — the
+/// single source of the mask→field mapping that C `monitorStatus`
+/// recomputes and posts (asynRecord.c:1066-1117). The bit assignments mirror
+/// [`AsynRecord::update_trace_bits_from_mask`] /
+/// [`AsynRecord::update_io_bits_from_mask`] /
+/// [`AsynRecord::update_info_bits_from_mask`] and reference the same
+/// `Trace*Mask` constants, so the out-of-band trace post and the
+/// `process()`-path re-import (`read_trace_state`) cannot diverge. Field DBF
+/// types match `get_field`: the mask fields are `Long`, the bit fields
+/// `Short`.
+fn trace_readback_fields(
+    trace_mask: u32,
+    io_mask: u32,
+    info_mask: u32,
+) -> Vec<(String, EpicsValue)> {
+    let bit = |mask: u32, flag: u32| EpicsValue::Short(i16::from(mask & flag != 0));
+    vec![
+        ("TMSK".to_string(), EpicsValue::Long(trace_mask as i32)),
+        ("TB0".to_string(), bit(trace_mask, TraceMask::ERROR.bits())),
+        (
+            "TB1".to_string(),
+            bit(trace_mask, TraceMask::IO_DEVICE.bits()),
+        ),
+        (
+            "TB2".to_string(),
+            bit(trace_mask, TraceMask::IO_FILTER.bits()),
+        ),
+        (
+            "TB3".to_string(),
+            bit(trace_mask, TraceMask::IO_DRIVER.bits()),
+        ),
+        ("TB4".to_string(), bit(trace_mask, TraceMask::FLOW.bits())),
+        (
+            "TB5".to_string(),
+            bit(trace_mask, TraceMask::WARNING.bits()),
+        ),
+        ("TIOM".to_string(), EpicsValue::Long(io_mask as i32)),
+        ("TIB0".to_string(), bit(io_mask, TraceIoMask::ASCII.bits())),
+        ("TIB1".to_string(), bit(io_mask, TraceIoMask::ESCAPE.bits())),
+        ("TIB2".to_string(), bit(io_mask, TraceIoMask::HEX.bits())),
+        ("TINM".to_string(), EpicsValue::Long(info_mask as i32)),
+        (
+            "TINB0".to_string(),
+            bit(info_mask, TraceInfoMask::TIME.bits()),
+        ),
+        (
+            "TINB1".to_string(),
+            bit(info_mask, TraceInfoMask::PORT.bits()),
+        ),
+        (
+            "TINB2".to_string(),
+            bit(info_mask, TraceInfoMask::SOURCE.bits()),
+        ),
+        (
+            "TINB3".to_string(),
+            bit(info_mask, TraceInfoMask::THREAD.bits()),
+        ),
+    ]
+}
+
 // ===== Field descriptor table =====
 
 static FIELD_LIST: &[FieldDesc] = &[
@@ -1363,14 +1423,17 @@ impl AsynRecord {
     ///
     /// C registers `exceptCallback` with `exceptionCallbackAdd` in
     /// `connectDevice` (asynRecord.c:1269); the callback re-runs
-    /// `monitorStatus` (asynRecord.c:903-917,1066-1084), which re-imports
-    /// the trace masks and posts the changed fields. In epics-rs the
-    /// record is owned by the record framework and the async callback
-    /// can neither mutate it nor post monitors, so the callback only
-    /// raises a dirty flag; `process()` performs the re-import through the
-    /// single `read_trace_state` owner. The immediate, process-free
-    /// re-post that C does under `dbScanLock` requires the record
-    /// monitor/locking framework and is not done here.
+    /// `monitorStatus` (asynRecord.c:903-917,1066-1117) under `dbScanLock`,
+    /// which re-imports the trace masks and posts the changed fields
+    /// immediately, out of band — it does NOT wait for the next `process()`.
+    ///
+    /// The Rust analogue posts through the merged PACT seam: when the record
+    /// carries a database handle (`async_ctx`) and a runtime is available, the
+    /// callback recomputes the trace readback fields from the trace manager
+    /// and `post_fields`-es them now (the C `db_post_events` under
+    /// `dbScanLock`). With no handle / runtime — e.g. a record connected
+    /// outside a database — it falls back to raising a dirty flag that
+    /// `process()` drains through the single `read_trace_state` owner.
     fn register_trace_exception_callback(&mut self) {
         self.clear_trace_exception_callback();
         let Some(ref entry) = self.port_entry else {
@@ -1380,20 +1443,53 @@ impl AsynRecord {
             return;
         };
         let port = self.port.clone();
+        let trace = entry.trace.clone();
         let dirty = Arc::clone(&self.trace_status_dirty);
+        // The immediate out-of-band post needs both a database handle (to post
+        // through) and a runtime handle (the exception fires from a
+        // `setTrace*` caller's thread — iocsh or the port actor — which is not
+        // a tokio worker, so `tokio::spawn` would panic; an explicit `Handle`
+        // submits to the runtime from any thread). Capture them once here,
+        // where registration runs in the database's async init context.
+        let immediate = match (
+            self.async_ctx.clone(),
+            tokio::runtime::Handle::try_current().ok(),
+        ) {
+            (Some((name, db)), Some(handle)) => Some((name, db, handle)),
+            _ => None,
+        };
         let id = mgr.add_callback(move |ev| {
-            // Only the trace masks `read_trace_state` imports matter here;
-            // the announce for a port-level `setTrace*` carries the port
-            // name (TraceManager::announce uses addr -1).
-            if ev.port_name == port
-                && matches!(
+            // Only the trace masks `monitorStatus` recomputes matter here; the
+            // announce for a port-level `setTrace*` carries the port name
+            // (TraceManager::announce uses addr -1).
+            if ev.port_name != port
+                || !matches!(
                     ev.exception,
                     AsynException::TraceMask
                         | AsynException::TraceIoMask
                         | AsynException::TraceInfoMask
                 )
             {
-                dirty.store(true, Ordering::Release);
+                return;
+            }
+            match &immediate {
+                Some((name, db, handle)) => {
+                    // Recompute the current trace readback fields and post them
+                    // out of band now — the C `exceptCallback` → `monitorStatus`
+                    // immediate re-post (asynRecord.c:1102-1117).
+                    let fields = trace_readback_fields(
+                        trace.get_trace_mask(Some(&port)).bits(),
+                        trace.get_trace_io_mask(Some(&port)).bits(),
+                        trace.get_trace_info_mask(Some(&port)).bits(),
+                    );
+                    let (name, db) = (name.clone(), db.clone());
+                    handle.spawn(async move {
+                        let _ = db.post_fields(&name, fields).await;
+                    });
+                }
+                None => {
+                    dirty.store(true, Ordering::Release);
+                }
             }
         });
         self.trace_except_cb = Some((mgr, id));
@@ -2435,13 +2531,14 @@ impl Record for AsynRecord {
             return Ok(ProcessOutcome::complete());
         }
 
-        // Re-import the trace masks if an external `setTrace*` fired since
-        // the last cycle. C refreshes these readback fields from its
-        // `exceptCallback` immediately (asynRecord.c:903-917); when the
-        // record carries no live database handle the async callback cannot
-        // post, so the subscription (`register_trace_exception_callback`)
-        // also flags the change and the re-import happens here through the
-        // single `read_trace_state` owner.
+        // Re-import the trace masks if an external `setTrace*` fired since the
+        // last cycle. C refreshes these readback fields from its
+        // `exceptCallback` immediately (asynRecord.c:903-917). When the record
+        // carries a database handle the subscription
+        // (`register_trace_exception_callback`) does the same — it posts the
+        // fields out of band — and never sets this flag. This dirty path is
+        // the fallback for a record with no handle / runtime, draining through
+        // the single `read_trace_state` owner.
         if self.trace_status_dirty.swap(false, Ordering::AcqRel) {
             self.read_trace_state();
         }
@@ -3391,6 +3488,116 @@ mod tests {
         assert_eq!(
             rec.i32inp, 0,
             "the device read value is discarded when the request is cancelled"
+        );
+    }
+
+    /// Boundary: an external `setTraceMask` posts the trace readback fields
+    /// immediately, out of band, with no intervening `process()`. C
+    /// `exceptCallback` → `monitorStatus` re-posts the changed trace fields
+    /// under `dbScanLock` (asynRecord.c:903-917,1102-1117); the Rust callback
+    /// `post_fields`-es them through the database handle. The mask change is
+    /// driven from a non-runtime thread (the iocsh / port-actor case) to
+    /// exercise the captured runtime handle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trace_change_posts_readback_fields_immediately() {
+        use crate::exception::ExceptionManager;
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::trace::TraceManager;
+        use epics_base_rs::server::database::PvDatabase;
+        use tokio::sync::mpsc;
+
+        struct TraceDriver(PortDriverBase);
+        impl PortDriver for TraceDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+        }
+
+        let port_name = "test_trace_immediate_post";
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(
+            Box::new(TraceDriver(PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags::default(),
+            ))),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), Arc::new(InterruptManager::new(256)));
+
+        // A trace manager with an exception sink so trace changes announce
+        // (without it, `exception_manager()` is None and no callback registers).
+        let trace = Arc::new(TraceManager::new());
+        trace.set_exception_sink(Arc::new(ExceptionManager::new()));
+        // Known baseline mask, then register the port for the record to find.
+        trace.set_trace_mask(Some(port_name), TraceMask::empty());
+        super::registry::register_port(port_name, handle, trace.clone());
+
+        // Build the record, hand it the database handle, and connect it —
+        // connecting registers the trace exception callback with the same
+        // async_ctx + runtime handle the framework supplies at add_record.
+        let db = PvDatabase::new();
+        let rec_name = "TRACE_IMM_REC";
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.set_async_context(rec_name.to_string(), db.async_handle());
+        rec.connect_device();
+        assert_eq!(rec.cnct, 1, "record must connect to the registered port");
+        assert_eq!(rec.tmsk, 0, "baseline trace mask is empty");
+
+        db.add_record(rec_name, Box::new(rec)).await.unwrap();
+
+        // Externally change the trace mask from a non-runtime thread. The
+        // captured runtime handle must drive the out-of-band post.
+        let new_mask = TraceMask::ERROR | TraceMask::FLOW;
+        {
+            let tm = trace.clone();
+            let pn = port_name.to_string();
+            std::thread::spawn(move || tm.set_trace_mask(Some(&pn), new_mask))
+                .join()
+                .unwrap();
+        }
+
+        // TMSK/TB0/TB4 reflect the new mask with no intervening process().
+        let want = new_mask.bits() as i32;
+        let mut posted = false;
+        for _ in 0..2000 {
+            let inst = db.get_record(rec_name).await.unwrap();
+            let got = inst.read().await.record.get_field("TMSK");
+            if got == Some(EpicsValue::Long(want)) {
+                posted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            posted,
+            "trace change must post TMSK immediately, no process()"
+        );
+
+        let inst = db.get_record(rec_name).await.unwrap();
+        let g = inst.read().await;
+        assert_eq!(g.record.get_field("TMSK"), Some(EpicsValue::Long(want)));
+        assert_eq!(
+            g.record.get_field("TB0"),
+            Some(EpicsValue::Short(1)),
+            "ERROR bit posted"
+        );
+        assert_eq!(
+            g.record.get_field("TB4"),
+            Some(EpicsValue::Short(1)),
+            "FLOW bit posted"
+        );
+        assert_eq!(
+            g.record.get_field("TB1"),
+            Some(EpicsValue::Short(0)),
+            "IO_DEVICE bit stays clear"
         );
     }
 }

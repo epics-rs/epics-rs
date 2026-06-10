@@ -209,59 +209,91 @@ enum ChannelTarget {
     },
 }
 
-/// RAII gate for a per-channel `CA_PROTO_WRITE_NOTIFY` in flight.
-///
-/// C `write_notify_action` (`rsrv/camessage.c:1660-1729`) sets
-/// `pciu->pPutNotify->busy = TRUE` *before* `caNetConvert`,
-/// `asTrapWriteWithData`, and `dbProcessNotify` run — i.e. before any
-/// payload conversion, trap-write `BeforeWrite` dispatch, or the
-/// actual `dbProcessNotify` side effect. The flag is cleared in the
-/// completion callback (`putNotifyCompletion`) or by the timeout/
-/// cancel branch (`camessage.c:1691`). Rust must acquire the
-/// gate on the same boundary so a second same-channel WRITE_NOTIFY
-/// arriving while the first is pending cannot mutate the PV/device
-/// or alarm-ack state and then be told it was rejected.
-///
-/// The guard clears the flag on `Drop` — covering every early
-/// return (`?`), pre-write error, and panic after acquisition.
-/// `defuse()` transfers clearing responsibility to the async
-/// completion task; that task holds its own guard so an
-/// `abort()` from `CA_PROTO_CLEAR_CHANNEL` still releases the gate
-/// (C parity: `rsrvFreePutNotify` releases per-channel notify state
-/// on channel teardown).
-struct PutNotifyBusyGuard {
-    flag: Arc<AtomicBool>,
-    armed: bool,
+/// One async `CA_PROTO_WRITE_NOTIFY` put-callback awaiting record
+/// processing completion, owned by [`PutNotifySlot`].
+struct InFlightPutNotify {
+    /// Cancels the completion task's wait when this put-callback is
+    /// superseded by a newer WRITE_NOTIFY on the same channel
+    /// (C `dbNotifyCancel`, `camessage.c:1686`).
+    abort: tokio::task::AbortHandle,
+    /// Owns this put-callback's single client reply. The first of
+    /// {completion task, superseding request} to swap this `true`
+    /// sends the reply; the loser skips. Closes the race where a put
+    /// completes at the exact moment it is superseded — without it the
+    /// one ioid would get two replies (a success *and* an
+    /// ECA_PUTCBINPROG).
+    responded: Arc<AtomicBool>,
+    /// Reply shape echoed in the superseded request's ECA_PUTCBINPROG
+    /// (C `putNotifyErrorReply(client, &pPutNotify->msg, …)` preserves
+    /// the original `m_dataType`/`m_count`/ioid, `camessage.c:1703`).
+    ioid: u32,
+    dbr_type: u16,
+    count: u32,
 }
 
-impl PutNotifyBusyGuard {
-    /// Acquire the per-channel WRITE_NOTIFY gate. Returns `None` when
-    /// another WRITE_NOTIFY on the same channel is already in flight;
-    /// the caller must reply `ECA_PUTCBINPROG` in that case.
-    fn try_acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
-        if flag.swap(true, Ordering::AcqRel) {
-            None
-        } else {
-            Some(Self {
-                flag: flag.clone(),
-                armed: true,
-            })
-        }
+/// Single owner of a channel's in-flight `CA_PROTO_WRITE_NOTIFY`
+/// put-callback.
+///
+/// C `write_notify_action` (`rsrv/camessage.c:1660-1707`) keeps one
+/// `pciu->pPutNotify` per channel. A second WRITE_NOTIFY arriving while
+/// it is still busy does NOT reject the new request: it waits on
+/// `blockSem` for natural completion (up to 60s) and, only if the
+/// previous is still running, `dbNotifyCancel`s it and replies
+/// ECA_PUTCBINPROG to the *previous* request — then runs the new put.
+/// The new request is never refused.
+///
+/// The async port supersedes the previous put-callback immediately
+/// rather than parking the connection's dispatch task on a 60s blocking
+/// wait (which would stall every later message on the connection). This
+/// matches C's force-cancel branch: a still-in-flight put-callback is
+/// aborted and its request gets ECA_PUTCBINPROG, while a put that has
+/// already completed naturally keeps its real reply (the `responded`
+/// CAS makes the late supersede a no-op). Only `is_notify` puts occupy
+/// the slot; a put that completes synchronously within the handler
+/// never installs an entry.
+#[derive(Clone, Default)]
+struct PutNotifySlot {
+    inner: Arc<std::sync::Mutex<Option<InFlightPutNotify>>>,
+}
+
+impl PutNotifySlot {
+    /// Remove and return the channel's current in-flight put-callback
+    /// so the caller can supersede it. Leaves the slot empty.
+    fn take(&self) -> Option<InFlightPutNotify> {
+        self.inner.lock().expect("put-notify slot poisoned").take()
     }
 
-    /// Stop the guard from clearing the flag on `Drop`. Used when the
-    /// async completion task takes ownership of releasing the gate.
-    fn defuse(mut self) {
-        self.armed = false;
+    /// Install a freshly spawned put-callback as the channel's
+    /// in-flight one (replacing any stale completed entry the slot
+    /// still held).
+    fn install(&self, inflight: InFlightPutNotify) {
+        *self.inner.lock().expect("put-notify slot poisoned") = Some(inflight);
     }
 }
 
-impl Drop for PutNotifyBusyGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            self.flag.store(false, Ordering::Release);
+/// Supersede a previously in-flight put-callback, if any: cancel its
+/// completion-wait and, when this path wins the response-ownership
+/// race, reply ECA_PUTCBINPROG to the superseded request. C
+/// `write_notify_action` cancel branch (`camessage.c:1686-1704`). The
+/// new WRITE_NOTIFY then proceeds — it is never rejected.
+async fn supersede_put_notify<W: AsyncWrite + Unpin + Send + 'static>(
+    prev: Option<InFlightPutNotify>,
+    writer: &Arc<Mutex<BufWriter<W>>>,
+) -> CaResult<()> {
+    if let Some(prev) = prev {
+        prev.abort.abort();
+        if !prev.responded.swap(true, Ordering::AcqRel) {
+            send_put_notify_response(
+                writer,
+                prev.dbr_type,
+                prev.count,
+                ECA_PUTCBINPROG,
+                prev.ioid,
+            )
+            .await?;
         }
     }
+    Ok(())
 }
 
 struct ChannelEntry {
@@ -280,19 +312,14 @@ struct ChannelEntry {
     /// per delivery via `ChannelEntry::filter_chain` so each subscriber
     /// and the READ path get a fresh stateful chain.
     filter_suffix: Option<String>,
-    /// per-channel WRITE_NOTIFY busy gate. C
-    /// `write_notify_action` (`rsrv/camessage.c:1660-1707`) stores
-    /// one `pciu->pPutNotify` per channel; a second
-    /// `CA_PROTO_WRITE_NOTIFY` while one is still running waits up
-    /// to 60s and on timeout cancels with `ECA_PUTCBINPROG`. Rust
-    /// rejects the second arrival immediately with the same code
-    /// (simpler than C's wait-then-cancel but preserves the
-    /// serialisation invariant — a record implementation that
-    /// relies on rsrv's per-channel ordering doesn't see reentrant
-    /// writes). Set on async completion-task spawn, cleared when
-    /// the task finishes (`Arc` so the spawned task can clear it
-    /// without re-borrowing `state.channels`).
-    put_notify_busy: Arc<AtomicBool>,
+    /// Single owner of this channel's in-flight `CA_PROTO_WRITE_NOTIFY`
+    /// put-callback. C `write_notify_action`
+    /// (`rsrv/camessage.c:1660-1707`) keeps one `pciu->pPutNotify` per
+    /// channel; a second WRITE_NOTIFY supersedes (cancels) the previous
+    /// one rather than rejecting the new request. See [`PutNotifySlot`].
+    /// `Arc`-backed so the async completion task and a superseding
+    /// request share it without re-borrowing `state.channels`.
+    put_notify_slot: PutNotifySlot,
     /// long-string boundary conversion this channel applies on every
     /// GET/monitor delivery (and the matching native-type override set
     /// at channel-create time). `DollarChar` = client appended `$` to a
@@ -2271,7 +2298,7 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         cid: client_cid,
                         pv_name: pv_name.clone(),
                         filter_suffix: filter_suffix.clone(),
-                        put_notify_busy: Arc::new(AtomicBool::new(false)),
+                        put_notify_slot: PutNotifySlot::default(),
                         long_string_mode,
                     },
                 );
@@ -2849,32 +2876,20 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     "ACKS"
                 };
                 // DBR_PUT_ACKT/ACKS WRITE_NOTIFY travels C
-                // `write_notify_action`, so it is subject to the same
-                // per-channel busy gate as a regular WRITE_NOTIFY. The
-                // alarm-ack write below mutates ACKT/ACKS record state;
-                // acquire the gate *before* that side effect so a
-                // second concurrent put-notify on the channel cannot
-                // mutate alarm state and then be told it was rejected.
-                // The non-notify deprecated CA_PROTO_WRITE path is
-                // fire-and-forget in C `write_action` and not gated.
-                let ackt_busy_guard = if is_notify {
-                    match PutNotifyBusyGuard::try_acquire(&entry.put_notify_busy) {
-                        Some(g) => Some(g),
-                        None => {
-                            send_put_notify_response(
-                                writer,
-                                hdr.data_type,
-                                hdr.actual_count(),
-                                ECA_PUTCBINPROG,
-                                ioid,
-                            )
-                            .await?;
-                            return Ok(());
-                        }
-                    }
-                } else {
-                    None
-                };
+                // `write_notify_action`, so it shares the same
+                // per-channel put-callback serialisation as a regular
+                // WRITE_NOTIFY. Supersede any in-flight put-callback on
+                // this channel *before* the alarm-ack side effect — C
+                // cancels the previous `pPutNotify` and replies
+                // ECA_PUTCBINPROG to the superseded request rather than
+                // rejecting this one (`camessage.c:1660-1707`). The
+                // alarm-ack completes synchronously, so it never installs
+                // an entry of its own. The deprecated fire-and-forget
+                // CA_PROTO_WRITE path is not serialised in C.
+                if is_notify {
+                    let prev = entry.put_notify_slot.take();
+                    supersede_put_notify(prev, writer).await?;
+                }
                 let result = match &entry.target {
                     ChannelTarget::RecordField { record, .. } => {
                         let name = record.read().await.name.clone();
@@ -2897,12 +2912,6 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     };
                     send_put_notify_response(writer, hdr.data_type, hdr.actual_count(), eca, ioid)
                         .await?;
-                    // alarm-ack PUT_ACKT/ACKS completes
-                    // synchronously; release the per-channel
-                    // WRITE_NOTIFY gate now that the reply is on the
-                    // wire so the next put-notify on this channel can
-                    // proceed.
-                    drop(ackt_busy_guard);
                 } else if let Err(e) = &result {
                     // deprecated CA_PROTO_WRITE for DBR_PUT_ACKT/
                     // DBR_PUT_ACKS must surface put failure via
@@ -2950,6 +2959,10 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // error header. Captured here as a Copy so the error sites
             // below can use it after the `entry` borrow ends.
             let entry_cid = entry.cid;
+            // Clone the per-channel put-callback slot (Arc-backed) so the
+            // supersede gate and the async-completion install below use it
+            // without holding the `entry` borrow across them.
+            let put_notify_slot = entry.put_notify_slot.clone();
 
             // Resolve the audit-friendly PV name once. Cheap when audit
             // is off because state.audit() is a single None check.
@@ -3069,44 +3082,27 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // `rule_was_trap: true` for every accepted write.
             let rule_was_trap = write_grant.rule_was_trap();
 
-            // acquire the per-channel WRITE_NOTIFY busy gate
-            // here — after the SID/type/access checks and *before* any
-            // side effect (payload conversion, trap-write `BeforeWrite`
+            // Supersede any in-flight put-callback on this channel here —
+            // after the SID/type/access checks and *before* any side
+            // effect (payload conversion, trap-write `BeforeWrite`
             // dispatch, the database/PV write, or the async device
             // kickoff). C `write_notify_action`
-            // (`rsrv/camessage.c:1660-1729`) sets
-            // `pciu->pPutNotify->busy = TRUE` on exactly this boundary
-            // — after `rsrvCheckPut` and before `caNetConvert` /
-            // `asTrapWriteWithData` / `dbProcessNotify`. Pre-fix Rust
-            // acquired the gate only after the write had already run,
-            // so a second concurrent WRITE_NOTIFY could mutate the
-            // PV/device or alarm state and then receive
-            // ECA_PUTCBINPROG as if it had been rejected; a second
-            // write that completed synchronously bypassed the gate
-            // entirely. The guard clears the flag on every early
-            // return below (`?` on payload parse / response write)
-            // and is `defuse()`d when the async completion task takes
-            // ownership of clearing it. The deprecated fire-and-forget
-            // CA_PROTO_WRITE path is not gated (C `write_action` has
-            // no `pPutNotify` serialisation).
-            let mut put_notify_guard = if is_notify {
-                match PutNotifyBusyGuard::try_acquire(&entry.put_notify_busy) {
-                    Some(g) => Some(g),
-                    None => {
-                        send_put_notify_response(
-                            writer,
-                            write_type as u16,
-                            hdr.actual_count(),
-                            ECA_PUTCBINPROG,
-                            ioid,
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                }
-            } else {
-                None
-            };
+            // (`rsrv/camessage.c:1660-1707`) reaches this boundary —
+            // after `rsrvCheckPut` and before `caNetConvert` /
+            // `asTrapWriteWithData` / `dbProcessNotify` — with the
+            // channel's previous `pPutNotify` either already completed or
+            // cancelled (`dbNotifyCancel` + ECA_PUTCBINPROG to the
+            // superseded request). It never rejects the new request.
+            // `supersede_put_notify` does exactly that: it cancels the
+            // prior put-callback's completion-wait and replies
+            // ECA_PUTCBINPROG to the superseded ioid (when this path wins
+            // the response-ownership race), then this put proceeds. The
+            // deprecated fire-and-forget CA_PROTO_WRITE path is not
+            // serialised in C, so it is left untouched.
+            if is_notify {
+                let prev = put_notify_slot.take();
+                supersede_put_notify(prev, writer).await?;
+            }
 
             let count = hdr.actual_count() as usize;
             // Echo the FULL 32-bit count
@@ -3289,34 +3285,17 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     write_result.unwrap_or_default();
 
                 if let Some(rx) = completion_rx {
-                    // the per-channel WRITE_NOTIFY busy gate was
-                    // already acquired above, before any side effect.
-                    // The async device kickoff has now produced a
-                    // completion receiver, so ownership of clearing the
-                    // gate moves to the spawned completion task. Defuse
-                    // the request-scoped guard and hand the task its
-                    // own guard: a `Drop` on the task — whether from
-                    // normal completion or an `abort()` issued by
-                    // `CA_PROTO_CLEAR_CHANNEL` — releases the gate (C
-                    // parity: `rsrvFreePutNotify` releases per-channel
-                    // notify state on channel teardown).
-                    let task_busy_guard = match put_notify_guard.take() {
-                        Some(g) => {
-                            let flag = g.flag.clone();
-                            g.defuse();
-                            PutNotifyBusyGuard { flag, armed: true }
-                        }
-                        None => {
-                            // Unreachable: `is_notify` is true on this
-                            // branch and the guard is always `Some` for
-                            // `is_notify`. Treat a logic regression as a
-                            // protocol error rather than silently
-                            // leaving the gate state ambiguous.
-                            return Err(epics_base_rs::error::CaError::Protocol(
-                                "WRITE_NOTIFY async path reached without a busy guard".to_string(),
-                            ));
-                        }
-                    };
+                    // This put-callback is now async (record processing is
+                    // still running). Mint its response-ownership token:
+                    // whichever of {this completion task, a superseding
+                    // WRITE_NOTIFY} swaps `responded` to `true` first owns
+                    // the single client reply, so the two can never both
+                    // reply for this ioid. The handler installs the
+                    // matching `InFlightPutNotify` into the channel slot
+                    // after the spawn so a later WRITE_NOTIFY can supersede
+                    // it (C `dbNotifyCancel` + ECA_PUTCBINPROG).
+                    let responded = Arc::new(AtomicBool::new(false));
+                    let responded_task = responded.clone();
                     let writer_c = writer.clone();
                     // snapshot the trap-dispatch inputs so the
                     // async task can fire AfterWrite at *real*
@@ -3343,14 +3322,6 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         )
                     });
                     let join = tokio::spawn(async move {
-                        // own the per-channel WRITE_NOTIFY busy
-                        // gate for the lifetime of this completion
-                        // task. Its `Drop` clears the gate on every
-                        // exit — normal completion, `rx` sender drop,
-                        // or an `abort()` from `CA_PROTO_CLEAR_CHANNEL`
-                        // — so the next WRITE_NOTIFY on this channel
-                        // can always proceed and the flag never leaks.
-                        let _busy_guard = task_busy_guard;
                         // Wait indefinitely for record processing to complete,
                         // matching C EPICS rsrv behavior. RecvError means the
                         // Sender was dropped without firing — typically because
@@ -3360,6 +3331,16 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                             Ok(()) => eca_status,
                             Err(_) => ECA_PUTFAIL,
                         };
+
+                        // Claim this put-callback's single reply. If a
+                        // superseding WRITE_NOTIFY already won the race it
+                        // sent ECA_PUTCBINPROG for this ioid and aborted
+                        // this task; skip both the AfterWrite log and the
+                        // reply so the client never sees two replies for
+                        // one ioid.
+                        if responded_task.swap(true, Ordering::AcqRel) {
+                            return;
+                        }
 
                         // dispatch AfterWrite NOW, after real
                         // device-side completion. `status` carries
@@ -3403,8 +3384,19 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         let mut w = writer_c.lock().await;
                         let _ = w.flush().await;
                         drop(w);
-                        // `_busy_guard` drops here, clearing the
-                        // per-channel WRITE_NOTIFY gate.
+                    });
+                    // Publish as the channel's in-flight put-callback so a
+                    // later WRITE_NOTIFY on this channel supersedes it (C
+                    // `dbNotifyCancel` + ECA_PUTCBINPROG). Replaces any
+                    // stale completed entry the slot still held; that
+                    // entry's `responded` is already `true`, so superseding
+                    // it is a harmless no-op.
+                    put_notify_slot.install(InFlightPutNotify {
+                        abort: join.abort_handle(),
+                        responded,
+                        ioid,
+                        dbr_type: write_type as u16,
+                        count: write_count,
                     });
                     // Track for connection-scoped cleanup: a stuck
                     // async record would otherwise pin this task and the
@@ -5248,82 +5240,162 @@ mod write_notify_drain_tests {
 }
 
 #[cfg(test)]
-mod mr_r1_put_notify_gate_tests {
-    //! the per-channel `CA_PROTO_WRITE_NOTIFY` busy gate must
-    //! be acquired *before* any side effect and reject a concurrent
-    //! WRITE_NOTIFY on the same channel.
-    use super::PutNotifyBusyGuard;
+mod put_notify_supersede_tests {
+    //! A second `CA_PROTO_WRITE_NOTIFY` on a channel with an in-flight
+    //! put-callback must *supersede* the previous one (cancel it, reply
+    //! ECA_PUTCBINPROG to the superseded request) and proceed — never
+    //! reject the new request. C `write_notify_action`
+    //! (`rsrv/camessage.c:1660-1707`). The single owner of the channel's
+    //! in-flight put-callback is [`PutNotifySlot`]; the single owner of
+    //! each put-callback's reply is its `responded` token.
+    use super::{ECA_PUTCBINPROG, InFlightPutNotify, PutNotifySlot, supersede_put_notify};
+    use epics_base_rs::runtime::sync::Mutex;
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncWrite, BufWriter};
 
-    /// A second acquire while the first guard is live must fail, so
-    /// the dispatcher replies `ECA_PUTCBINPROG` instead of running a
-    /// reentrant write. Releasing the first guard re-opens the gate.
-    #[test]
-    fn mr_r1_concurrent_acquire_is_rejected() {
-        let flag = Arc::new(AtomicBool::new(false));
+    /// Mock writer recording every byte batch (mirrors monitor.rs).
+    #[derive(Default)]
+    struct RecordingWriter {
+        batches: Vec<Vec<u8>>,
+    }
 
-        let first = PutNotifyBusyGuard::try_acquire(&flag)
-            .expect("first WRITE_NOTIFY must acquire the idle gate");
+    impl AsyncWrite for RecordingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.batches.push(buf.to_vec());
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn recording_writer() -> Arc<Mutex<BufWriter<RecordingWriter>>> {
+        Arc::new(Mutex::new(BufWriter::with_capacity(
+            0,
+            RecordingWriter::default(),
+        )))
+    }
+
+    /// A never-completing task so the in-flight put-callback has a real
+    /// `AbortHandle` for the supersede to cancel.
+    fn pending_abort_handle() -> tokio::task::AbortHandle {
+        tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        })
+        .abort_handle()
+    }
+
+    fn inflight(ioid: u32, responded: Arc<AtomicBool>) -> InFlightPutNotify {
+        InFlightPutNotify {
+            abort: pending_abort_handle(),
+            responded,
+            ioid,
+            dbr_type: epics_base_rs::types::DBR_LONG,
+            count: 1,
+        }
+    }
+
+    /// take/install round-trips the channel's in-flight put-callback;
+    /// `take` leaves the slot empty so the same entry is never
+    /// superseded twice.
+    #[tokio::test]
+    async fn slot_take_install_roundtrip() {
+        let slot = PutNotifySlot::default();
+        assert!(slot.take().is_none(), "fresh slot holds no put-callback");
+        slot.install(inflight(7, Arc::new(AtomicBool::new(false))));
+        let taken = slot.take().expect("installed entry is taken back");
+        assert_eq!(taken.ioid, 7);
+        assert!(slot.take().is_none(), "take leaves the slot empty");
+    }
+
+    /// A still-in-flight put-callback (responded == false) that is
+    /// superseded gets ECA_PUTCBINPROG sent to ITS ioid — the new
+    /// request is never the one refused. Mirrors C
+    /// `putNotifyErrorReply(client, &pPutNotify->msg, ECA_PUTCBINPROG)`.
+    #[tokio::test]
+    async fn supersede_replies_putcbinprog_to_the_superseded_request() {
+        let writer = recording_writer();
+        let responded = Arc::new(AtomicBool::new(false));
+        let prev = Some(inflight(0x1234, responded.clone()));
+
+        supersede_put_notify(prev, &writer)
+            .await
+            .expect("supersede sends the superseded request its reply");
+
         assert!(
-            flag.load(Ordering::Acquire),
-            "gate flag set while in flight"
+            responded.load(Ordering::Acquire),
+            "supersede claims the superseded put-callback's reply"
         );
-
-        // A second WRITE_NOTIFY arriving while the first is pending
-        // must be refused — the dispatcher turns this `None` into an
-        // ECA_PUTCBINPROG reply without touching PV/device state.
-        assert!(
-            PutNotifyBusyGuard::try_acquire(&flag).is_none(),
-            "second concurrent WRITE_NOTIFY must be rejected, not run a \
-             reentrant write"
+        let guard = writer.lock().await;
+        let batches = &guard.get_ref().batches;
+        assert_eq!(batches.len(), 1, "exactly one ECA_PUTCBINPROG reply");
+        let frame = &batches[0];
+        // CA header: param1 (ECA status) at [8..12], param2 (ioid) at [12..16].
+        let eca = u32::from_be_bytes([frame[8], frame[9], frame[10], frame[11]]);
+        let ioid = u32::from_be_bytes([frame[12], frame[13], frame[14], frame[15]]);
+        assert_eq!(
+            eca, ECA_PUTCBINPROG,
+            "superseded request gets ECA_PUTCBINPROG"
         );
+        assert_eq!(ioid, 0x1234, "the reply targets the superseded ioid");
+    }
 
-        drop(first);
-        assert!(
-            !flag.load(Ordering::Acquire),
-            "gate must clear once the in-flight WRITE_NOTIFY guard drops"
-        );
+    /// A put-callback that completed naturally (its completion task
+    /// already won the `responded` race and replied) must NOT get a
+    /// second reply when a later WRITE_NOTIFY supersedes the stale slot
+    /// entry — one ioid, one reply.
+    #[tokio::test]
+    async fn supersede_after_completion_sends_no_second_reply() {
+        let writer = recording_writer();
+        let responded = Arc::new(AtomicBool::new(true)); // completion already replied
+        let prev = Some(inflight(0x55, responded.clone()));
 
-        // After release the next WRITE_NOTIFY may proceed.
+        supersede_put_notify(prev, &writer)
+            .await
+            .expect("supersede of a completed put-callback is a no-op reply");
+
+        let guard = writer.lock().await;
         assert!(
-            PutNotifyBusyGuard::try_acquire(&flag).is_some(),
-            "gate must re-open after the prior WRITE_NOTIFY completes"
+            guard.get_ref().batches.is_empty(),
+            "no second reply for an already-answered ioid"
         );
     }
 
-    /// `defuse()` transfers gate-clearing ownership to the async
-    /// completion task: the request-scoped guard must NOT clear the
-    /// flag, and a transferred guard's `Drop` (normal completion or an
-    /// `abort()` from `CA_PROTO_CLEAR_CHANNEL`) must clear it. A leak
-    /// here would wedge the channel — every later WRITE_NOTIFY would
-    /// be falsely rejected with ECA_PUTCBINPROG.
-    #[test]
-    fn mr_r1_defuse_transfers_release_to_async_task() {
-        let flag = Arc::new(AtomicBool::new(false));
+    /// Exactly one of {completion task, superseding request} owns the
+    /// reply. The first `responded` swap wins; the loser must observe
+    /// `true` and stay silent. This is the invariant that prevents a
+    /// double reply when a put completes at the instant it is
+    /// superseded.
+    #[tokio::test]
+    async fn responded_token_grants_a_single_reply_owner() {
+        let writer = recording_writer();
+        let responded = Arc::new(AtomicBool::new(false));
 
-        let request_guard = PutNotifyBusyGuard::try_acquire(&flag)
-            .expect("WRITE_NOTIFY acquires the gate before the write");
-
-        // Async device kickoff produced a completion receiver: hand a
-        // fresh guard to the task and defuse the request-scoped one.
-        let task_flag = request_guard.flag.clone();
-        request_guard.defuse();
-        let task_guard = PutNotifyBusyGuard {
-            flag: task_flag,
-            armed: true,
-        };
+        // Simulate the completion task winning first.
         assert!(
-            flag.load(Ordering::Acquire),
-            "defused request guard must NOT clear the gate — the async \
-             task still owns it"
+            !responded.swap(true, Ordering::AcqRel),
+            "completion task claims the reply"
         );
+        // The superseding request now finds it already claimed.
+        let prev = Some(inflight(0x99, responded.clone()));
+        supersede_put_notify(prev, &writer).await.unwrap();
 
-        // Task completes (or is aborted): its guard drops, gate clears.
-        drop(task_guard);
+        let guard = writer.lock().await;
         assert!(
-            !flag.load(Ordering::Acquire),
-            "async completion task's guard Drop must release the gate"
+            guard.get_ref().batches.is_empty(),
+            "superseding path must not reply once the completion task has"
         );
     }
 }

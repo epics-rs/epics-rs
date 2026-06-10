@@ -21,6 +21,7 @@
 //! implementation forwards calls verbatim by default; override the
 //! method to insert pre/post hooks.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use epics_pva_rs::pvdata::{FieldDesc, PvField};
@@ -339,6 +340,39 @@ impl<S: ChannelSource> ChannelSource for ReadOnly<S> {
     // Idle↔Executing edge unchanged.
     fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool) {
         self.inner.notify_monitor_start(name, ctx, start);
+    }
+    // Same wrapper-severs-override defect family as the `notify_*` and
+    // `*_checked` forwards above: a transparent middleware layer must
+    // delegate every descriptive / advertisement / channel-lifecycle
+    // method whose inner override the trait default would otherwise mask.
+    // All of these are queried or fired on the BOUND OWNER, which for a
+    // middleware wrapper is the wrapper itself (`resolve_owner` keeps the
+    // default `None` so every op keeps routing through this layer).
+    // Forwarding them preserves a wrapped source's SEARCH advertisement
+    // (`searchable`/`searchable_from`, e.g. a ServerInfoSource that hides
+    // from UDP discovery), its registry beacon-change signal, its
+    // per-channel report info (captured once at admission and surfaced in
+    // the server report), and its channel open/close lifecycle callbacks
+    // (e.g. a SharedPV acquiring/releasing a per-channel lease).
+    // `resolve_owner` is deliberately NOT forwarded — doing so would bind
+    // the inner as the channel owner and bypass this layer entirely.
+    fn beacon_change(&self) -> u64 {
+        self.inner.beacon_change()
+    }
+    async fn searchable(&self, name: &str) -> bool {
+        self.inner.searchable(name).await
+    }
+    async fn searchable_from(&self, name: &str, requester: SocketAddr) -> bool {
+        self.inner.searchable_from(name, requester).await
+    }
+    async fn channel_report_info(&self, name: &str, ctx: ChannelContext) -> Option<String> {
+        self.inner.channel_report_info(name, ctx).await
+    }
+    fn notify_channel_open(&self, name: &str, ctx: &ChannelContext) {
+        self.inner.notify_channel_open(name, ctx);
+    }
+    fn notify_channel_close(&self, name: &str, ctx: &ChannelContext) {
+        self.inner.notify_channel_close(name, ctx);
     }
 }
 
@@ -906,6 +940,39 @@ impl<S: ChannelSource> ChannelSource for Acl<S> {
     // Idle↔Executing edge unchanged.
     fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool) {
         self.inner.notify_monitor_start(name, ctx, start);
+    }
+    // Same wrapper-severs-override defect family as the `notify_*` and
+    // `*_checked` forwards above: a transparent middleware layer must
+    // delegate every descriptive / advertisement / channel-lifecycle
+    // method whose inner override the trait default would otherwise mask.
+    // All of these are queried or fired on the BOUND OWNER, which for a
+    // middleware wrapper is the wrapper itself (`resolve_owner` keeps the
+    // default `None` so every op keeps routing through this layer).
+    // Forwarding them preserves a wrapped source's SEARCH advertisement
+    // (`searchable`/`searchable_from`, e.g. a ServerInfoSource that hides
+    // from UDP discovery), its registry beacon-change signal, its
+    // per-channel report info (captured once at admission and surfaced in
+    // the server report), and its channel open/close lifecycle callbacks
+    // (e.g. a SharedPV acquiring/releasing a per-channel lease).
+    // `resolve_owner` is deliberately NOT forwarded — doing so would bind
+    // the inner as the channel owner and bypass this layer entirely.
+    fn beacon_change(&self) -> u64 {
+        self.inner.beacon_change()
+    }
+    async fn searchable(&self, name: &str) -> bool {
+        self.inner.searchable(name).await
+    }
+    async fn searchable_from(&self, name: &str, requester: SocketAddr) -> bool {
+        self.inner.searchable_from(name, requester).await
+    }
+    async fn channel_report_info(&self, name: &str, ctx: ChannelContext) -> Option<String> {
+        self.inner.channel_report_info(name, ctx).await
+    }
+    fn notify_channel_open(&self, name: &str, ctx: &ChannelContext) {
+        self.inner.notify_channel_open(name, ctx);
+    }
+    fn notify_channel_close(&self, name: &str, ctx: &ChannelContext) {
+        self.inner.notify_channel_close(name, ctx);
     }
 }
 
@@ -1719,6 +1786,41 @@ impl<S: ChannelSource, A: AuditSink> ChannelSource for Audited<S, A> {
     fn notify_monitor_start(&self, name: &str, ctx: &ChannelContext, start: bool) {
         self.inner.notify_monitor_start(name, ctx, start);
     }
+    // Same wrapper-severs-override defect family as the `notify_*` and
+    // `*_checked` forwards above: a transparent middleware layer must
+    // delegate every descriptive / advertisement / channel-lifecycle
+    // method whose inner override the trait default would otherwise mask.
+    // All of these are queried or fired on the BOUND OWNER, which for a
+    // middleware wrapper is the wrapper itself (`resolve_owner` keeps the
+    // default `None` so every op keeps routing through this layer).
+    // Forwarding them preserves a wrapped source's SEARCH advertisement
+    // (`searchable`/`searchable_from`, e.g. a ServerInfoSource that hides
+    // from UDP discovery), its registry beacon-change signal, its
+    // per-channel report info (captured once at admission and surfaced in
+    // the server report), and its channel open/close lifecycle callbacks
+    // (e.g. a SharedPV acquiring/releasing a per-channel lease). These are
+    // transparent pass-throughs, not audit events, so they are forwarded
+    // verbatim like the `notify_*` siblings. `resolve_owner` is
+    // deliberately NOT forwarded — doing so would bind the inner as the
+    // channel owner and bypass this layer entirely.
+    fn beacon_change(&self) -> u64 {
+        self.inner.beacon_change()
+    }
+    async fn searchable(&self, name: &str) -> bool {
+        self.inner.searchable(name).await
+    }
+    async fn searchable_from(&self, name: &str, requester: SocketAddr) -> bool {
+        self.inner.searchable_from(name, requester).await
+    }
+    async fn channel_report_info(&self, name: &str, ctx: ChannelContext) -> Option<String> {
+        self.inner.channel_report_info(name, ctx).await
+    }
+    fn notify_channel_open(&self, name: &str, ctx: &ChannelContext) {
+        self.inner.notify_channel_open(name, ctx);
+    }
+    fn notify_channel_close(&self, name: &str, ctx: &ChannelContext) {
+        self.inner.notify_channel_close(name, ctx);
+    }
 }
 
 /// Wrap a gateway proxy source in the canonical access-control chain
@@ -2388,6 +2490,110 @@ mod tests {
             stack.monitor_watermarks("X").await,
             Some((2, 5)),
             "monitor_watermarks must forward through every wrapper, not collapse to the default None"
+        );
+    }
+
+    /// A source's descriptive / advertisement / channel-lifecycle methods
+    /// must survive the full `Audited<ReadOnly<Acl<S>>>` wrapper stack.
+    /// `channel_report_info`, `searchable`/`searchable_from`,
+    /// `beacon_change`, and `notify_channel_open`/`notify_channel_close`
+    /// are all queried or fired on the BOUND OWNER — the wrapper itself,
+    /// since `resolve_owner` stays the default `None`. Without the per-layer
+    /// forwarders each wrapper returns the trait default (None / has_pv / 0
+    /// / no-op) and the inner override is severed — the same
+    /// wrapper-severs-override defect family as FR-8 and FR-11.
+    struct ReportInfoSource {
+        opened: Arc<AtomicBool>,
+        closed: Arc<AtomicBool>,
+    }
+    impl ChannelSource for ReportInfoSource {
+        async fn list_pvs(&self) -> Vec<String> {
+            vec!["X".into()]
+        }
+        async fn has_pv(&self, _name: &str) -> bool {
+            true
+        }
+        async fn get_introspection(&self, _name: &str) -> Option<FieldDesc> {
+            Some(FieldDesc::Scalar(ScalarType::Double))
+        }
+        async fn get_value(&self, _name: &str) -> Option<PvField> {
+            Some(PvField::Scalar(ScalarValue::Double(0.0)))
+        }
+        async fn put_value(&self, _name: &str, _value: PvField) -> Result<(), OpError> {
+            Ok(())
+        }
+        async fn is_writable(&self, _name: &str) -> bool {
+            true
+        }
+        async fn subscribe(&self, _name: &str) -> Option<mpsc::Receiver<PvField>> {
+            None
+        }
+        async fn channel_report_info(&self, _name: &str, _ctx: ChannelContext) -> Option<String> {
+            Some("gw-upstream".into())
+        }
+        // Deliberately distinct from `has_pv` (true) so a wrapper that
+        // collapses to the `searchable` default (→ has_pv) is caught.
+        async fn searchable(&self, _name: &str) -> bool {
+            false
+        }
+        async fn searchable_from(&self, _name: &str, _requester: SocketAddr) -> bool {
+            false
+        }
+        fn beacon_change(&self) -> u64 {
+            7
+        }
+        fn notify_channel_open(&self, _name: &str, _ctx: &ChannelContext) {
+            self.opened.store(true, Ordering::SeqCst);
+        }
+        fn notify_channel_close(&self, _name: &str, _ctx: &ChannelContext) {
+            self.closed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn wrapper_stack_forwards_channel_report_info_and_lifecycle_family() {
+        let opened = Arc::new(AtomicBool::new(false));
+        let closed = Arc::new(AtomicBool::new(false));
+        let inner = ReportInfoSource {
+            opened: opened.clone(),
+            closed: closed.clone(),
+        };
+        let stack = AuditLayer::new(NoopAudit)
+            .layer(ReadOnlyLayer.layer(AclLayer::new(AclConfig::default()).layer(inner)));
+
+        // The named finding: per-channel report info captured at admission
+        // must reach the inner through every wrapper, not collapse to None.
+        assert_eq!(
+            stack.channel_report_info("X", test_ctx()).await,
+            Some("gw-upstream".to_string()),
+            "channel_report_info must forward through every wrapper, not collapse to None"
+        );
+
+        // Same family: SEARCH advertisement, beacon signal, and channel
+        // open/close lifecycle callbacks must also forward to the inner.
+        assert!(
+            !stack.searchable("X").await,
+            "searchable must forward the inner override, not collapse to the has_pv default"
+        );
+        let requester: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        assert!(
+            !stack.searchable_from("X", requester).await,
+            "searchable_from must forward the inner override, not collapse to searchable/has_pv"
+        );
+        assert_eq!(
+            stack.beacon_change(),
+            7,
+            "beacon_change must forward through every wrapper, not collapse to 0"
+        );
+        stack.notify_channel_open("X", &test_ctx());
+        stack.notify_channel_close("X", &test_ctx());
+        assert!(
+            opened.load(Ordering::SeqCst),
+            "notify_channel_open must reach the inner through every wrapper"
+        );
+        assert!(
+            closed.load(Ordering::SeqCst),
+            "notify_channel_close must reach the inner through every wrapper"
         );
     }
 

@@ -4,6 +4,9 @@ use crate::server::record::{
     FieldDesc, LinkType, ProcessAction, ProcessOutcome, Record, RecordProcessResult, parse_link_v2,
 };
 use crate::types::{DbFieldType, EpicsValue, PvString};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Notify;
 
 /// Choice labels for the SELM step-selection menu, in index order.
 /// C `menu(sseqSELM)` (synApps sseqRecord.dbd): 0=All, 1=Specified, 2=Mask.
@@ -102,10 +105,41 @@ enum SeqPhase {
     /// (C `processNextLink` → `callbackRequestDelayed`); the next
     /// continuation reads `DOLn` and writes `LNKn`.
     Fire,
-    /// `active[cursor]` issued a put-WITH-completion (`WAITn != NoWait`,
-    /// C `dbCaPutLinkCallback`); the next continuation arrives when the
-    /// downstream completes (C `putCallbackCB`).
+    /// The machine is blocked with no per-step timer pending: either an
+    /// earlier in-flight `WAITn` put-callback must complete before
+    /// `active[cursor]` may fire (a barrier, C `processNextLink` lines
+    /// 420-441), or the cursor has passed the last step and the sequence is
+    /// draining the still-outstanding put-callbacks (C `processNextLink`
+    /// lines 407-414). Re-entry is driven by [`SseqRecord::arm_wake`] when a
+    /// completion (or abort) wakes the machine, not by a framework timer.
     Wait,
+}
+
+/// One in-flight `WAITn` put-callback.
+///
+/// C `sseqRecord.c` keeps several `dbCaPutLinkCallback`s outstanding at
+/// once: `processNextLink` (sseqRecord.c:420-441) scans the earlier
+/// link-groups' `waiting` flags to decide whether the next step may fire.
+/// This is the Rust record-local equivalent of one such still-`waiting`
+/// link-group — the set sseq owns so the framework's single-outstanding
+/// async re-entry token can stay unchanged (the value primitive supersedes
+/// by construction, correct for ai/ao/asyn/motor/calcout).
+struct InFlight {
+    /// Absolute step index (0-based `IXn`) — both the `steps[]` slot and the
+    /// value an `After<n>` barrier is compared against (C
+    /// `plinkGroupCurrent->index`).
+    step: usize,
+    /// The step's `WAITn` menu value: 1 = `Wait` (full barrier), ≥2 =
+    /// `After<n>` (conditional barrier, `n == wait - 1`). Stored so the
+    /// barrier scan needs no second `steps[]` lookup; equals C
+    /// `plinkGroup->usePutCallback`.
+    wait: i16,
+    /// Set by the completion-waiter task once the downstream put (plus its
+    /// FLNK/OUT chain) finishes. The machine prunes done entries and posts
+    /// `WTGn=0` under the record lock; the waiter never touches record
+    /// fields, so a stale waiter abandoned by a double `ABORT` cannot
+    /// corrupt a fresh sequence's `WTGn`.
+    done: Arc<AtomicBool>,
 }
 
 /// A single step in the string sequence.
@@ -179,6 +213,19 @@ pub struct SseqRecord {
     active: Vec<usize>,
     cursor: usize,
     steps: [SseqStep; NUM_STEPS],
+    /// The `WAITn` put-callbacks currently outstanding (C the still-`waiting`
+    /// entries of `pcb->plinkGroups`). A step is dispatched without awaiting
+    /// its completion, so several overlap in flight; the barrier scan
+    /// ([`SseqRecord::barrier_blocks`]) reads this set to decide when the
+    /// next step may fire. Pruned (and `WTGn` cleared) as completions land.
+    in_flight: Vec<InFlight>,
+    /// The per-sequence wake bridge: a completion-waiter task notifies it
+    /// when its put-callback finishes, and [`SseqRecord::arm_wake`] re-enters
+    /// the machine to re-scan `in_flight`. A fresh `Notify` per sequence (set
+    /// in `start_sequence`, cleared in `finish`) means a waiter abandoned by
+    /// a double `ABORT` notifies a bridge nobody listens on — it cannot
+    /// disturb the next sequence. `None` while `Idle`.
+    seq_wake: Option<Arc<Notify>>,
     /// Canonical record name + cycle-free database handle, stashed at
     /// `add_record` via [`Record::set_async_context`]. Drives out-of-band
     /// status posts (`BUSY`/`WTGn`/`ABORTING`) and the `ABORT` finish
@@ -202,6 +249,8 @@ impl Default for SseqRecord {
             active: Vec::new(),
             cursor: 0,
             steps: Default::default(),
+            in_flight: Vec::new(),
+            seq_wake: None,
             async_ctx: None,
         }
     }
@@ -350,6 +399,11 @@ impl SseqRecord {
                 live.push((WTG_FIELDS[i].to_string(), EpicsValue::Short(0)));
             }
         }
+        // Fresh per-sequence concurrency state: the in-flight put-callback set
+        // (C `pcb->plinkGroups` re-initialised each `process`) and the wake
+        // bridge that re-enters the machine when one completes.
+        self.in_flight.clear();
+        self.seq_wake = Some(Arc::new(Notify::new()));
         // C `process` (sseqRecord.c:346-365): a step joins the active list
         // when it is selected AND has a non-constant `LNKn` or `DOLn`.
         self.active = (0..NUM_STEPS)
@@ -364,25 +418,92 @@ impl SseqRecord {
             self.finish(live);
             return ProcessOutcome::complete();
         }
-        self.schedule_current_step(live)
+        self.advance_sequence(live)
     }
 
-    /// Schedule `active[cursor]` to fire after its `DLYn` delay, or finish
-    /// the sequence when the cursor has passed the last active step.
-    ///
-    /// C `processNextLink` requests the per-step callback after `DLYn`
-    /// (`callbackRequestDelayed`) or immediately when `DLYn == 0`
-    /// (`callbackRequest`). `ReprocessAfter` is the uniform port of both:
-    /// a `Duration::ZERO` delay still re-enters through the same path, so
-    /// there is no special-cased `DLYn == 0` branch.
-    fn schedule_current_step(&mut self, live: &mut Vec<(String, EpicsValue)>) -> ProcessOutcome {
-        if self.cursor >= self.active.len() {
-            self.finish(live);
-            return ProcessOutcome::complete();
+    /// A `ProcessOutcome` that leaves the record async-pending with no
+    /// framework action — the machine is blocked and will be re-entered by
+    /// [`Self::arm_wake`] (a completion or abort wake), not a timer.
+    fn async_pending() -> ProcessOutcome {
+        ProcessOutcome {
+            result: RecordProcessResult::AsyncPending,
+            actions: Vec::new(),
+            device_did_compute: false,
         }
+    }
+
+    /// Drop completed in-flight put-callbacks and post their `WTGn=0`.
+    ///
+    /// The completion-waiter only sets the `done` flag; the machine clears
+    /// `WTGn` here, under the record lock, so the post always belongs to the
+    /// current sequence (C `putCallbackCB` posts `waiting=0`, but doing it
+    /// owner-side keeps a stale waiter from clobbering a fresh sequence).
+    fn prune_done(&mut self, live: &mut Vec<(String, EpicsValue)>) {
+        let mut done_steps = Vec::new();
+        self.in_flight.retain(|f| {
+            if f.done.load(Ordering::SeqCst) {
+                done_steps.push(f.step);
+                false
+            } else {
+                true
+            }
+        });
+        for i in done_steps {
+            if self.steps[i].waiting {
+                self.steps[i].waiting = false;
+                live.push((WTG_FIELDS[i].to_string(), EpicsValue::Short(0)));
+            }
+        }
+    }
+
+    /// Whether firing the step at absolute index `current_abs` must wait for
+    /// an earlier in-flight put-callback.
+    ///
+    /// C `processNextLink` (sseqRecord.c:420-441) scans the earlier
+    /// link-groups still `waiting`: a `Wait` (full barrier) blocks the next
+    /// step unconditionally, while an `After<n>` blocks it only when
+    /// `(usePutCallback - 2) < plinkGroupCurrent->index`. Every `in_flight`
+    /// entry was dispatched at an earlier cursor than the current step, so
+    /// membership alone supplies C's `ix < pcb->index` (the set is pruned of
+    /// completed entries first, so each survivor is still `waiting`).
+    fn barrier_blocks(&self, current_abs: usize) -> bool {
+        let cur = current_abs as i16;
+        self.in_flight
+            .iter()
+            .any(|f| f.wait == 1 || (f.wait >= 2 && (f.wait - 2) < cur))
+    }
+
+    /// Advance the sequence from the current cursor (C `processNextLink`):
+    /// prune completed put-callbacks, then either finish, drain, block on a
+    /// barrier, or schedule the current step's `DLYn` delay.
+    fn advance_sequence(&mut self, live: &mut Vec<(String, EpicsValue)>) -> ProcessOutcome {
+        self.prune_done(live);
+        if self.cursor >= self.active.len() {
+            // C `processNextLink` plinkGroupCurrent == NULL (sseqRecord.c:
+            // 407-417): finish only once every outstanding put-callback has
+            // drained; otherwise return and let a completion wake the finish.
+            if self.in_flight.is_empty() {
+                self.finish(live);
+                return ProcessOutcome::complete();
+            }
+            self.phase = SeqPhase::Wait;
+            self.arm_wake();
+            return Self::async_pending();
+        }
+        let current = self.active[self.cursor];
+        if self.barrier_blocks(current) {
+            // An earlier in-flight step must complete before this one fires
+            // (C `processNextLink` set `waitingForPutCallback` and returned).
+            self.phase = SeqPhase::Wait;
+            self.arm_wake();
+            return Self::async_pending();
+        }
+        // Cleared to fire: schedule after `DLYn`. C `processNextLink` requests
+        // the callback after `DLYn` (`callbackRequestDelayed`) or immediately
+        // when `DLYn == 0` (`callbackRequest`); `ReprocessAfter` is the
+        // uniform port of both, so there is no special-cased `DLYn == 0`.
         self.phase = SeqPhase::Fire;
-        let i = self.active[self.cursor];
-        let dly = std::time::Duration::from_secs_f64(self.steps[i].dly.max(0.0));
+        let dly = std::time::Duration::from_secs_f64(self.steps[current].dly.max(0.0));
         ProcessOutcome {
             result: RecordProcessResult::AsyncPending,
             actions: vec![ProcessAction::ReprocessAfter(dly)],
@@ -390,39 +511,33 @@ impl SseqRecord {
         }
     }
 
-    /// Fire `active[cursor]` (C `processCallback`): forward the step value
-    /// to `LNKn`, then either block for the put-callback (`WAITn`) or
-    /// advance to the next step.
+    /// Fire `active[cursor]` (C `processCallback`): forward the step value to
+    /// `LNKn`, then advance. A `WAITn` step is dispatched WITHOUT blocking the
+    /// machine — its put-callback joins `in_flight` and the sequence moves on,
+    /// so several callbacks overlap exactly as C runs them.
     fn fire_current_step(&mut self, live: &mut Vec<(String, EpicsValue)>) -> ProcessOutcome {
         let i = self.active[self.cursor];
         let value = self.step_value(i);
         let has_lnk = !self.steps[i].lnk.is_empty();
-        // C `processCallback` (sseqRecord.c:717,739,763) uses
-        // `dbCaPutLinkCallback` — the put-WITH-completion that sets the
-        // `waiting` flag — only when `usePutCallback` (`WAITn != NoWait`).
-        // `WriteDbLinkNotify` carries that completion wait; for a local /
-        // bare target it drains immediately (no target process joins the
-        // wait-set), matching C's synchronous `dbPutLink` there.
+        // C `processCallback` (sseqRecord.c:717,739,763) uses the
+        // put-WITH-completion (`dbCaPutLinkCallback`, setting `waiting`) only
+        // when `usePutCallback` (`WAITn != NoWait`).
         let waits = self.steps[i].wait != 0;
 
         if waits && has_lnk {
-            self.steps[i].waiting = true;
-            live.push((WTG_FIELDS[i].to_string(), EpicsValue::Short(1)));
-            self.phase = SeqPhase::Wait;
-            return ProcessOutcome {
-                result: RecordProcessResult::AsyncPending,
-                actions: vec![ProcessAction::WriteDbLinkNotify {
-                    link_field: LNK_FIELDS[i],
-                    value,
-                }],
-                device_did_compute: false,
-            };
+            // Non-blocking dispatch: the put-callback goes in flight and the
+            // machine advances. C `processCallback` increments `pcb->index`
+            // and calls `processNextLink` straight after firing, leaving the
+            // just-fired step `waiting` for the barrier scan to honour.
+            self.dispatch_waiting_step(i, value, live);
+            self.cursor += 1;
+            return self.advance_sequence(live);
         }
 
         // No-wait step: a plain `dbPutLink` (`WriteDbLink`), then advance in
-        // the same cycle. The write rides ahead of the next step's
-        // scheduling action (or the `Complete` tail's link-write phase for
-        // the last step), so `LNKn` lands before the sequence moves on.
+        // the same cycle. The write rides ahead of the next step's scheduling
+        // action (or the drain / `Complete` tail), so `LNKn` lands before the
+        // sequence moves on.
         let mut actions = Vec::new();
         if has_lnk {
             actions.push(ProcessAction::WriteDbLink {
@@ -431,22 +546,104 @@ impl SseqRecord {
             });
         }
         self.cursor += 1;
-        let mut next = self.schedule_current_step(live);
+        let mut next = self.advance_sequence(live);
         actions.append(&mut next.actions);
         next.actions = actions;
         next
     }
 
-    /// Advance after a `WAITn` put-callback completion (C `putCallbackCB`):
-    /// clear the step's `waiting` flag, then schedule the next step.
-    fn after_wait(&mut self, live: &mut Vec<(String, EpicsValue)>) -> ProcessOutcome {
-        let i = self.active[self.cursor];
-        if self.steps[i].waiting {
-            self.steps[i].waiting = false;
-            live.push((WTG_FIELDS[i].to_string(), EpicsValue::Short(0)));
+    /// Dispatch a `WAITn` step's put-with-completion without blocking the
+    /// machine: record it in `in_flight`, raise `WTGn`, and spawn a waiter
+    /// that marks the entry done and wakes the machine on completion.
+    ///
+    /// The seam is `AsyncDbHandle::put_link_notify` (the non-blocking sibling
+    /// of `ProcessAction::WriteDbLinkNotify`): it issues the same OUT-link
+    /// put-notify but hands back the completion receiver instead of wiring it
+    /// to a single superseding re-entry token, so concurrent callbacks do not
+    /// clobber one another. The waiter never touches record fields — it only
+    /// sets `done` and notifies — so a waiter abandoned by a double `ABORT`
+    /// cannot corrupt a later sequence (C `putCallbackCB`'s `waiting == 0`
+    /// guard against abandoned callbacks, sseqRecord.c:540-560).
+    fn dispatch_waiting_step(
+        &mut self,
+        i: usize,
+        value: EpicsValue,
+        live: &mut Vec<(String, EpicsValue)>,
+    ) {
+        self.steps[i].waiting = true;
+        live.push((WTG_FIELDS[i].to_string(), EpicsValue::Short(1)));
+        let done = Arc::new(AtomicBool::new(false));
+        self.in_flight.push(InFlight {
+            step: i,
+            wait: self.steps[i].wait,
+            done: done.clone(),
+        });
+        if let (Some((name, handle)), Some(wake)) = (&self.async_ctx, &self.seq_wake) {
+            let name = name.clone();
+            let handle = handle.clone();
+            let wake = wake.clone();
+            let link = self.steps[i].lnk.clone();
+            tokio::spawn(async move {
+                if let Some(rx) = handle.put_link_notify(&name, &link, value).await {
+                    // `Err` means the put vanished without firing — treat it as
+                    // completion so the step is never stranded.
+                    let _ = rx.await;
+                }
+                done.store(true, Ordering::SeqCst);
+                wake.notify_one();
+            });
         }
-        self.cursor += 1;
-        self.schedule_current_step(live)
+    }
+
+    /// Park a task on the per-sequence wake bridge that re-enters the
+    /// machine's `process()` once a put-callback completion (or an abort)
+    /// notifies it. Called only while blocked in phase `Wait`, where no
+    /// per-step `ReprocessAfter` is pending — so minting the re-entry token
+    /// in the woken task supersedes no delay timer, keeping the framework's
+    /// single-outstanding token model intact.
+    ///
+    /// A single `Notify` permit coalesces multiple completions; the re-entry
+    /// re-scans the whole `in_flight` set, so no wake is lost. Each woken task
+    /// is one-shot and re-enters before the next `arm_wake`, so at most one
+    /// task is ever parked on the bridge.
+    fn arm_wake(&self) {
+        let (Some((name, handle)), Some(wake)) = (self.async_ctx.as_ref(), self.seq_wake.as_ref())
+        else {
+            return;
+        };
+        let name = name.clone();
+        let handle = handle.clone();
+        let wake = wake.clone();
+        tokio::spawn(async move {
+            wake.notified().await;
+            reenter_now(&name, &handle).await;
+        });
+    }
+
+    /// Notify the per-sequence wake bridge so a parked [`Self::arm_wake`] task
+    /// re-enters the machine. Used by `ABORT` to drive the drain when the
+    /// machine is blocked in phase `Wait` (the parked task fires the current,
+    /// un-superseded re-entry token — so no second re-entry task competes for
+    /// the bridge). No-op while `Idle`.
+    fn wake_machine(&self) {
+        if let Some(wake) = &self.seq_wake {
+            wake.notify_one();
+        }
+    }
+
+    /// Drain outstanding put-callbacks during an abort (C `processNextLink`
+    /// end path under `pR->abort`): no new step fires; prune completed
+    /// callbacks and finish once they have all drained, otherwise stay
+    /// blocked and let the next completion wake the finish.
+    fn drain_abort(&mut self, live: &mut Vec<(String, EpicsValue)>) -> ProcessOutcome {
+        self.prune_done(live);
+        if self.in_flight.is_empty() {
+            self.finish(live);
+            return ProcessOutcome::complete();
+        }
+        self.phase = SeqPhase::Wait;
+        self.arm_wake();
+        Self::async_pending()
     }
 
     /// Finish the sequence (C `asyncFinish`): clear `abort`/`aborting`,
@@ -475,25 +672,27 @@ impl SseqRecord {
         self.active.clear();
         self.cursor = 0;
         self.phase = SeqPhase::Idle;
+        // Drop the per-sequence concurrency state. Any waiter still running
+        // holds its own `done` Arc and a clone of the (now replaced-on-next-
+        // start) wake bridge, so it cannot touch this record's fields.
+        self.in_flight.clear();
+        self.seq_wake = None;
     }
 
     /// Drive an immediate abort completion from `special` (C
     /// `epicsTimerCancel` + `callbackRequest`): supersede any pending
-    /// `DLYn` re-entry, then mint a fresh re-entry wired to an
-    /// already-fired completion so the next `process()` runs the
-    /// `abort != 0` finish at once. The superseded timer, when it wakes,
-    /// re-enters nothing (the `AsyncToken` generation gate).
+    /// `DLYn` re-entry, then re-enter so the next `process()` runs the abort
+    /// drain at once. The superseded timer, when it wakes, re-enters nothing
+    /// (the `AsyncToken` generation gate). Used when the machine is in phase
+    /// `Fire` (a delay is pending); a phase-`Wait` abort instead wakes the
+    /// already-parked bridge task via [`Self::wake_machine`].
     fn force_finish_reentry(&self) {
         if let Some((name, handle)) = &self.async_ctx {
             let name = name.clone();
             let handle = handle.clone();
             tokio::spawn(async move {
                 handle.cancel_async_reentry(&name).await;
-                if let Some(token) = handle.mint_async_token(&name).await {
-                    let (waitset, completion) = AsyncDbHandle::new_put_notify();
-                    waitset.leave();
-                    handle.reprocess_on_notify(token, completion);
-                }
+                reenter_now(&name, &handle).await;
             });
         }
     }
@@ -519,8 +718,9 @@ impl SseqRecord {
     ///     a cross-crate limitation: epics-base-rs has no CA/PVA client.
     ///   * `WERRn` is INVERTED from C. C raises it for a local DB link with
     ///     `WAITn` set, because it cannot `dbCaPutLinkCallback` a non-CA
-    ///     link (sseqRecord.c:915-927). The Rust `WriteDbLinkNotify` seam
-    ///     DOES complete on a local PP link, so that is no longer an error.
+    ///     link (sseqRecord.c:915-927). The Rust put-with-completion seam
+    ///     (`put_link_notify`) DOES complete on a local PP link, so that is
+    ///     no longer an error.
     ///     `WERRn` is redefined for the Rust-meaningful misconfig: `WAITn`
     ///     set on a link that can never deliver a completion — a
     ///     Constant/unset (`CON`) link.
@@ -583,6 +783,21 @@ impl SseqRecord {
             Self::step_index_from_suffix(name),
             Some((_, "DOL")) | Some((_, "LNK")) | Some((_, "WAIT"))
         )
+    }
+}
+
+/// Mint a fresh async re-entry token wired to an already-fired completion,
+/// so the record's `process()` runs again as soon as the framework
+/// schedules it (C `callbackRequest`). Shared by `arm_wake` (after a
+/// completion notify) and `force_finish_reentry` (after cancelling a
+/// pending delay). Minting supersedes any prior pending token; callers
+/// invoke it only where that is intended (phase `Wait`, where nothing is
+/// pending, or right after `cancel_async_reentry`).
+async fn reenter_now(name: &str, handle: &AsyncDbHandle) {
+    if let Some(token) = handle.mint_async_token(name).await {
+        let (waitset, completion) = AsyncDbHandle::new_put_notify();
+        waitset.leave();
+        handle.reprocess_on_notify(token, completion);
     }
 }
 
@@ -669,22 +884,25 @@ impl Record for SseqRecord {
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         let mut live = Vec::new();
-        // An abort in flight finishes the sequence on its next re-entry,
-        // ahead of any step work — C `process` takes the `pact` (completion)
-        // path straight to `asyncFinish`, and `processCallback` /
-        // `putCallbackCB` short-circuit to `process` when `pR->abort`.
-        let outcome = if self.busy != 0 && self.abort != 0 {
-            self.finish(&mut live);
-            ProcessOutcome::complete()
+        // An abort in flight drains the outstanding put-callbacks, then
+        // finishes — C `processNextLink` under `pR->abort` returns until the
+        // last callback drains, and `process` takes the `pact` path to
+        // `asyncFinish`. `aborting` is the machine's own drain flag, set by
+        // `special` the moment an abort is accepted, so this gate fires ahead
+        // of any step work.
+        let outcome = if self.busy != 0 && self.aborting != 0 {
+            self.drain_abort(&mut live)
         } else {
             // `busy == 0` (phase `Idle`) is a genuine start: the framework
             // PACT entry guard already rejected any foreign trigger while a
             // sequence was running, so reaching the body un-busy mirrors C's
-            // `!pR->pact`. `busy == 1` is a per-step continuation.
+            // `!pR->pact`. `busy == 1` is a per-step continuation: phase
+            // `Fire` fires the current step, phase `Wait` re-scans the
+            // in-flight set (barrier release or drain).
             match self.phase {
                 SeqPhase::Idle => self.start_sequence(&mut live),
                 SeqPhase::Fire => self.fire_current_step(&mut live),
-                SeqPhase::Wait => self.after_wait(&mut live),
+                SeqPhase::Wait => self.advance_sequence(&mut live),
             }
         };
         self.post_live(live);
@@ -754,30 +972,48 @@ impl Record for SseqRecord {
             return Ok(());
         }
         if self.aborting != 0 {
-            // Second abort while already aborting (C sseqRecord.c:1179-1190):
-            // a downstream put-callback may be hung. Clear every `waiting`
-            // flag, drop the remaining steps, and force the finish now.
+            // Second abort while already draining (C sseqRecord.c:1179-1190):
+            // a downstream put-callback is hung. Abandon every outstanding
+            // callback — clear its `waiting`/`WTGn`, drop the in-flight set —
+            // and finish now. The abandoned waiters set their (now-dropped)
+            // `done` Arcs and notify the per-sequence bridge nobody listens
+            // on, so they are harmless (C's `waiting == 0` abandoned-callback
+            // guard).
             for i in 0..NUM_STEPS {
                 if self.steps[i].waiting {
                     self.steps[i].waiting = false;
                     live.push((WTG_FIELDS[i].to_string(), EpicsValue::Short(0)));
                 }
             }
+            self.in_flight.clear();
             self.cursor = self.active.len();
-            self.force_finish_reentry();
+            // With `in_flight` empty the drain finishes immediately on
+            // re-entry: wake the parked phase-`Wait` task, or mint a fresh
+            // re-entry if somehow not blocked.
+            if self.phase == SeqPhase::Wait {
+                self.wake_machine();
+            } else {
+                self.force_finish_reentry();
+            }
             self.post_live(live);
             return Ok(());
         }
         self.aborting = 1;
         live.push(("ABORTING".to_string(), EpicsValue::Short(1)));
+        // No further step dispatches; the drain only waits out the in-flight
+        // callbacks.
+        self.cursor = self.active.len();
         // C cancels a pending `DLYn` delay timer and completes the abort
-        // immediately (sseqRecord.c:1194-1215). When instead waiting on a
-        // put-callback (phase `Wait`), C does NOT force a re-entry — it lets
-        // the outstanding callback arrive and finish via the `abort` branch
-        // (sseqRecord.c:1161-1164). A still-stuck callback is escaped by a
-        // second abort above.
+        // immediately (sseqRecord.c:1194-1215); when instead blocked on a
+        // put-callback it lets the outstanding callback wake the finish
+        // (sseqRecord.c:1161-1164). Phase `Fire` has a `ReprocessAfter`
+        // pending, so cancel it and re-enter to drain; phase `Wait` already
+        // has a parked bridge task, so just wake it (firing its current,
+        // un-superseded token — no competing re-entry task).
         if self.phase == SeqPhase::Fire {
             self.force_finish_reentry();
+        } else if self.phase == SeqPhase::Wait {
+            self.wake_machine();
         }
         self.post_live(live);
         Ok(())
@@ -807,11 +1043,11 @@ impl Record for SseqRecord {
     }
 
     // `SseqRecord` does NOT implement `Record::multi_output_links`: the
-    // per-step `LNKn` writes are driven here, in `process()`, via
-    // `WriteDbLink`/`WriteDbLinkNotify` (C `sseqRecord.c::processCallback`),
-    // not by the generic multi-output block. The retired
-    // `dispatch_multi_output` `MultiOut::Sseq` arm was the old all-at-once
-    // path and no longer exists.
+    // per-step `LNKn` writes are driven here, in `process()` — a no-wait step
+    // via `WriteDbLink`, a `WAITn` step via the `put_link_notify` seam
+    // (C `sseqRecord.c::processCallback`) — not by the generic multi-output
+    // block. The retired `dispatch_multi_output` `MultiOut::Sseq` arm was the
+    // old all-at-once path and no longer exists.
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {

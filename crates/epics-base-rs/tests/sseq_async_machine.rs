@@ -17,6 +17,13 @@
 //!     gate — no stale double-fire), and
 //!   * the status fields (`BUSY`/`WTGn`/`ABORTING`) reflect live state
 //!     across the cycle and are cleared at the final step.
+//!
+//! The concurrency boundaries (C `processNextLink` selective barriers,
+//! sseqRecord.c:407-441) pin the `After<n>` overlap model: several `WAITn`
+//! put-callbacks run in flight at once; a `Wait` is a full barrier, an
+//! `After<n>` blocks only steps at absolute index `>= n`, the
+//! end-of-sequence drain waits for every outstanding callback, and an abort
+//! drains the in-flight set before finishing.
 #![allow(clippy::all)]
 
 use std::collections::HashSet;
@@ -611,4 +618,371 @@ async fn sseq_werr_wait_on_constant_raises_wait_on_local_clears() {
         0,
         "NoWait on an empty link is not a misconfig → WERR stays 0"
     );
+}
+
+/// Concurrency boundary (1) — a `Wait` (full barrier) keeps exactly ONE
+/// put-callback outstanding: the next step does not even dispatch while a
+/// `Wait` step is in flight. C `processNextLink` (sseqRecord.c:424-431):
+/// `usePutCallback == sseqWAIT_Wait` returns immediately, blocking every
+/// later step until that callback completes. Both steps are `Wait` into
+/// async holds; only `WTG1` is high until `HOLD1` completes, then `WTG2`.
+#[tokio::test]
+async fn sseq_wait_full_barrier_serialises_steps() {
+    let db = PvDatabase::new();
+    db.add_record("SSEQ_FB_HOLD1", Box::new(AsyncHold { val: 0.0 }))
+        .await
+        .unwrap();
+    db.add_record("SSEQ_FB_HOLD2", Box::new(AsyncHold { val: 0.0 }))
+        .await
+        .unwrap();
+
+    let mut sseq = SseqRecord::new();
+    sseq.selm = 0; // All steps.
+    // Step 1: Wait → async hold (full barrier for every later step).
+    sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
+    sseq.put_field("LNK1", EpicsValue::String("SSEQ_FB_HOLD1 PP".into()))
+        .unwrap();
+    sseq.put_field("WAIT1", EpicsValue::Short(1)).unwrap(); // Wait
+    // Step 2: also Wait → its own async hold.
+    sseq.put_field("DO2", EpicsValue::Double(22.0)).unwrap();
+    sseq.put_field("LNK2", EpicsValue::String("SSEQ_FB_HOLD2 PP".into()))
+        .unwrap();
+    sseq.put_field("WAIT2", EpicsValue::Short(1)).unwrap(); // Wait
+    db.add_record("SSEQ_FB", Box::new(sseq)).await.unwrap();
+
+    kick(&db, "SSEQ_FB").await;
+
+    // Step 1 in flight; step 2 blocked by the full barrier → NOT dispatched.
+    poll_short(&db, "SSEQ_FB.WTG1", 1, "step 1 Wait parks").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        read_short(db.get_pv("SSEQ_FB.WTG2").await.ok()),
+        0,
+        "a Wait full barrier blocks step 2 from even dispatching"
+    );
+    assert_eq!(
+        read_short(db.get_pv("SSEQ_FB.BUSY").await.ok()),
+        1,
+        "BUSY held while the Wait step is outstanding"
+    );
+
+    // Complete step 1 → step 2 now dispatches (and parks on its own hold).
+    db.complete_async_record("SSEQ_FB_HOLD1").await.unwrap();
+    poll_short(
+        &db,
+        "SSEQ_FB.WTG2",
+        1,
+        "step 2 dispatches after barrier clears",
+    )
+    .await;
+    poll_short(&db, "SSEQ_FB.WTG1", 0, "step 1 cleared on completion").await;
+
+    // Complete step 2 → the sequence drains and finishes.
+    db.complete_async_record("SSEQ_FB_HOLD2").await.unwrap();
+    poll_short(&db, "SSEQ_FB.BUSY", 0, "sequence finishes after both steps").await;
+    poll_short(&db, "SSEQ_FB.WTG2", 0, "step 2 cleared at finish").await;
+}
+
+/// Concurrency boundary (2) — `After<n>` lets earlier put-callbacks overlap
+/// in flight while still barriering a later step. C `processNextLink`
+/// (sseqRecord.c:432-439): an earlier `After<n>` step blocks the current one
+/// only when `(usePutCallback - 2) < plinkGroupCurrent->index`, i.e. the
+/// current step's absolute index `>= n`. Here `LNK1`/`LNK2` are `After2`
+/// (menu 3 → blocks absolute index `>= 2`) and `LNK3` is `Wait`:
+///   * steps 1 (index 0) and 2 (index 1) overlap — neither is `>= 2`;
+///   * step 3 (index 2) waits for BOTH `After2` steps to complete.
+///
+/// (The task brief's "After3" does not block step 3 under literal C
+/// arithmetic — `After3` gates index `>= 3` — so the overlap+barrier shape
+/// it describes is pinned with `After2`, the value that actually gates
+/// index 2.)
+#[tokio::test]
+async fn sseq_after_n_overlaps_then_barriers() {
+    let db = PvDatabase::new();
+    db.add_record("SSEQ_OV_HOLD1", Box::new(AsyncHold { val: 0.0 }))
+        .await
+        .unwrap();
+    db.add_record("SSEQ_OV_HOLD2", Box::new(AsyncHold { val: 0.0 }))
+        .await
+        .unwrap();
+    db.add_record("SSEQ_OV_HOLD3", Box::new(AsyncHold { val: 0.0 }))
+        .await
+        .unwrap();
+
+    let mut sseq = SseqRecord::new();
+    sseq.selm = 0; // All steps.
+    // After2 = menu index 3 (NoWait=0, Wait=1, After1=2, After2=3).
+    sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
+    sseq.put_field("LNK1", EpicsValue::String("SSEQ_OV_HOLD1 PP".into()))
+        .unwrap();
+    sseq.put_field("WAIT1", EpicsValue::Short(3)).unwrap(); // After2
+    sseq.put_field("DO2", EpicsValue::Double(22.0)).unwrap();
+    sseq.put_field("LNK2", EpicsValue::String("SSEQ_OV_HOLD2 PP".into()))
+        .unwrap();
+    sseq.put_field("WAIT2", EpicsValue::Short(3)).unwrap(); // After2
+    sseq.put_field("DO3", EpicsValue::Double(33.0)).unwrap();
+    sseq.put_field("LNK3", EpicsValue::String("SSEQ_OV_HOLD3 PP".into()))
+        .unwrap();
+    sseq.put_field("WAIT3", EpicsValue::Short(1)).unwrap(); // Wait
+    db.add_record("SSEQ_OV", Box::new(sseq)).await.unwrap();
+
+    kick(&db, "SSEQ_OV").await;
+
+    // Steps 1 and 2 are BOTH in flight simultaneously (After2 imposes no
+    // barrier on index 0 or 1); step 3 (index 2) is blocked → not dispatched.
+    poll_short(&db, "SSEQ_OV.WTG2", 1, "step 2 dispatches concurrently").await;
+    assert_eq!(
+        read_short(db.get_pv("SSEQ_OV.WTG1").await.ok()),
+        1,
+        "step 1 is still in flight while step 2 is also in flight (overlap)"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        read_short(db.get_pv("SSEQ_OV.WTG3").await.ok()),
+        0,
+        "step 3 (index 2) is barriered by the After2 steps → not dispatched"
+    );
+
+    // Complete only step 1 → step 3 STILL blocked (step 2's After2 holds it).
+    db.complete_async_record("SSEQ_OV_HOLD1").await.unwrap();
+    poll_short(&db, "SSEQ_OV.WTG1", 0, "step 1 cleared").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        read_short(db.get_pv("SSEQ_OV.WTG3").await.ok()),
+        0,
+        "step 3 waits for BOTH After2 steps — still blocked after only one"
+    );
+    assert_eq!(
+        read_short(db.get_pv("SSEQ_OV.WTG2").await.ok()),
+        1,
+        "step 2 remains in flight",
+    );
+
+    // Complete step 2 → both barriers cleared → step 3 dispatches.
+    db.complete_async_record("SSEQ_OV_HOLD2").await.unwrap();
+    poll_short(
+        &db,
+        "SSEQ_OV.WTG3",
+        1,
+        "step 3 dispatches after both barriers clear",
+    )
+    .await;
+    poll_short(&db, "SSEQ_OV.WTG2", 0, "step 2 cleared").await;
+
+    // Complete step 3 → finish.
+    db.complete_async_record("SSEQ_OV_HOLD3").await.unwrap();
+    poll_short(&db, "SSEQ_OV.BUSY", 0, "sequence finishes after step 3").await;
+}
+
+/// Concurrency boundary (3) — the end-of-sequence drain finishes only after
+/// EVERY outstanding put-callback completes. C `processNextLink`
+/// (sseqRecord.c:407-417): with `plinkGroupCurrent == NULL`, return while any
+/// earlier link-group is still `waiting`; call `process` (→ `asyncFinish`)
+/// only when none remain. Two `After2` steps (no later step, so no barrier
+/// between them) both dispatch and the sequence drains: completing one keeps
+/// `BUSY` high; completing the second finishes.
+#[tokio::test]
+async fn sseq_end_drain_waits_for_all_in_flight() {
+    let db = PvDatabase::new();
+    db.add_record("SSEQ_DR_HOLD1", Box::new(AsyncHold { val: 0.0 }))
+        .await
+        .unwrap();
+    db.add_record("SSEQ_DR_HOLD2", Box::new(AsyncHold { val: 0.0 }))
+        .await
+        .unwrap();
+
+    let mut sseq = SseqRecord::new();
+    sseq.selm = 0; // All steps.
+    // Two After2 steps; no step at index >= 2 exists, so neither barriers the
+    // other → both dispatch and overlap, then the sequence end-drains.
+    sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
+    sseq.put_field("LNK1", EpicsValue::String("SSEQ_DR_HOLD1 PP".into()))
+        .unwrap();
+    sseq.put_field("WAIT1", EpicsValue::Short(3)).unwrap(); // After2
+    sseq.put_field("DO2", EpicsValue::Double(22.0)).unwrap();
+    sseq.put_field("LNK2", EpicsValue::String("SSEQ_DR_HOLD2 PP".into()))
+        .unwrap();
+    sseq.put_field("WAIT2", EpicsValue::Short(3)).unwrap(); // After2
+    db.add_record("SSEQ_DR", Box::new(sseq)).await.unwrap();
+
+    kick(&db, "SSEQ_DR").await;
+
+    // Both in flight, sequence draining.
+    poll_short(&db, "SSEQ_DR.WTG1", 1, "step 1 in flight").await;
+    poll_short(&db, "SSEQ_DR.WTG2", 1, "step 2 in flight concurrently").await;
+    assert_eq!(
+        read_short(db.get_pv("SSEQ_DR.BUSY").await.ok()),
+        1,
+        "BUSY held while draining two in-flight callbacks"
+    );
+
+    // Complete ONE → drain is not done; BUSY must stay high.
+    db.complete_async_record("SSEQ_DR_HOLD1").await.unwrap();
+    poll_short(&db, "SSEQ_DR.WTG1", 0, "step 1 drained").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        read_short(db.get_pv("SSEQ_DR.BUSY").await.ok()),
+        1,
+        "the drain finishes only after BOTH complete — one is not enough"
+    );
+    assert_eq!(
+        read_short(db.get_pv("SSEQ_DR.WTG2").await.ok()),
+        1,
+        "step 2 still outstanding"
+    );
+
+    // Complete the second → drain finishes.
+    db.complete_async_record("SSEQ_DR_HOLD2").await.unwrap();
+    poll_short(&db, "SSEQ_DR.BUSY", 0, "drain finishes after both complete").await;
+    poll_short(&db, "SSEQ_DR.WTG2", 0, "step 2 cleared at finish").await;
+}
+
+/// Concurrency boundary (4) — `ABORT` while put-callbacks are in flight
+/// drains them before finishing; no completion is stranded and `BUSY`
+/// clears. C `process`/`processNextLink` under `pR->abort`: the first abort
+/// dispatches no new step and lets the outstanding callbacks drain
+/// (`asyncFinish` runs once they return). Two overlapping `After2` steps are
+/// in flight; the abort holds `ABORTING`/`BUSY` high until BOTH complete,
+/// then finishes cleanly.
+#[tokio::test]
+async fn sseq_abort_drains_in_flight_before_finish() {
+    let db = PvDatabase::new();
+    db.add_record("SSEQ_ABD_HOLD1", Box::new(AsyncHold { val: 0.0 }))
+        .await
+        .unwrap();
+    db.add_record("SSEQ_ABD_HOLD2", Box::new(AsyncHold { val: 0.0 }))
+        .await
+        .unwrap();
+
+    let mut sseq = SseqRecord::new();
+    sseq.selm = 0; // All steps.
+    sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
+    sseq.put_field("LNK1", EpicsValue::String("SSEQ_ABD_HOLD1 PP".into()))
+        .unwrap();
+    sseq.put_field("WAIT1", EpicsValue::Short(3)).unwrap(); // After2
+    sseq.put_field("DO2", EpicsValue::Double(22.0)).unwrap();
+    sseq.put_field("LNK2", EpicsValue::String("SSEQ_ABD_HOLD2 PP".into()))
+        .unwrap();
+    sseq.put_field("WAIT2", EpicsValue::Short(3)).unwrap(); // After2
+    db.add_record("SSEQ_ABD", Box::new(sseq)).await.unwrap();
+
+    kick(&db, "SSEQ_ABD").await;
+    poll_short(&db, "SSEQ_ABD.WTG1", 1, "step 1 in flight").await;
+    poll_short(&db, "SSEQ_ABD.WTG2", 1, "step 2 in flight concurrently").await;
+
+    // Abort while both are outstanding. C: no new step fires; drain first.
+    db.put_pv("SSEQ_ABD.ABORT", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    poll_short(&db, "SSEQ_ABD.ABORTING", 1, "abort accepted, draining").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        read_short(db.get_pv("SSEQ_ABD.BUSY").await.ok()),
+        1,
+        "abort does not finish while callbacks are still outstanding"
+    );
+
+    // Complete one → still draining the other.
+    db.complete_async_record("SSEQ_ABD_HOLD1").await.unwrap();
+    poll_short(
+        &db,
+        "SSEQ_ABD.WTG1",
+        0,
+        "first in-flight drained under abort",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        read_short(db.get_pv("SSEQ_ABD.BUSY").await.ok()),
+        1,
+        "abort drain still waits for the second outstanding callback"
+    );
+
+    // Complete the second → drain finishes; no stranded completion.
+    db.complete_async_record("SSEQ_ABD_HOLD2").await.unwrap();
+    poll_short(
+        &db,
+        "SSEQ_ABD.BUSY",
+        0,
+        "abort finishes after the drain completes",
+    )
+    .await;
+    poll_short(&db, "SSEQ_ABD.WTG2", 0, "second in-flight cleared").await;
+    assert_eq!(
+        read_short(db.get_pv("SSEQ_ABD.ABORTING").await.ok()),
+        0,
+        "ABORTING cleared by the finish"
+    );
+    assert_eq!(
+        read_short(db.get_pv("SSEQ_ABD.ABORT").await.ok()),
+        0,
+        "ABORT cleared by the finish"
+    );
+}
+
+/// Concurrency boundary (5) — `After<n>` does NOT block a step whose absolute
+/// index is `< n`: that step fires concurrently while the `After<n>` callback
+/// is still outstanding. C `processNextLink` (sseqRecord.c:432): the barrier
+/// applies only when `(usePutCallback - 2) < plinkGroupCurrent->index`, which
+/// is FALSE for a lower-indexed current step. Step 1 is `After2` (menu 3,
+/// gates index `>= 2`) into an async hold that stays in flight; step 2
+/// (index 1, `< 2`) is `NoWait` into a sync target and must fire immediately,
+/// landing its value while step 1's callback is still outstanding.
+#[tokio::test]
+async fn sseq_after_n_does_not_block_lower_index_step() {
+    let db = PvDatabase::new();
+    db.add_record("SSEQ_NB_HOLD1", Box::new(AsyncHold { val: 0.0 }))
+        .await
+        .unwrap();
+    // A sync AO target so step 2's NoWait write lands observably.
+    db.add_record("SSEQ_NB_TGT2", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let mut sseq = SseqRecord::new();
+    sseq.selm = 0; // All steps.
+    // Step 1: After2 (gates index >= 2) into the async hold → in flight.
+    sseq.put_field("DO1", EpicsValue::Double(11.0)).unwrap();
+    sseq.put_field("LNK1", EpicsValue::String("SSEQ_NB_HOLD1 PP".into()))
+        .unwrap();
+    sseq.put_field("WAIT1", EpicsValue::Short(3)).unwrap(); // After2
+    // Step 2 (index 1 < 2): NoWait → sync target; After2 imposes no barrier.
+    sseq.put_field("DO2", EpicsValue::Double(22.0)).unwrap();
+    sseq.put_field("LNK2", EpicsValue::String("SSEQ_NB_TGT2 PP".into()))
+        .unwrap();
+    db.add_record("SSEQ_NB", Box::new(sseq)).await.unwrap();
+
+    kick(&db, "SSEQ_NB").await;
+
+    // Step 1 parks in flight; step 2 fires concurrently (NOT blocked by the
+    // After2) — its value lands while step 1's callback is still outstanding.
+    poll_short(&db, "SSEQ_NB.WTG1", 1, "step 1 After2 in flight").await;
+    poll_double(
+        &db,
+        "SSEQ_NB_TGT2",
+        22.0,
+        "step 2 (index 1 < 2) fires concurrently — After2 does not block it",
+    )
+    .await;
+    assert_eq!(
+        read_short(db.get_pv("SSEQ_NB.WTG1").await.ok()),
+        1,
+        "step 1 is STILL in flight while step 2 has already fired (overlap)"
+    );
+    assert_eq!(
+        read_short(db.get_pv("SSEQ_NB.BUSY").await.ok()),
+        1,
+        "BUSY held: step 1's After2 callback is still draining"
+    );
+
+    // Complete step 1 → the sequence drains and finishes.
+    db.complete_async_record("SSEQ_NB_HOLD1").await.unwrap();
+    poll_short(
+        &db,
+        "SSEQ_NB.BUSY",
+        0,
+        "finish after the After2 callback drains",
+    )
+    .await;
+    poll_short(&db, "SSEQ_NB.WTG1", 0, "step 1 cleared at finish").await;
 }

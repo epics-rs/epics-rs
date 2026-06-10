@@ -277,6 +277,29 @@ impl Record for MotorRecord {
         !self.suppress_flnk
     }
 
+    /// Input links the framework must resolve via `dbGetLink` BEFORE each
+    /// `process()`, so their values are available to the move computation —
+    /// exactly the synchronous reads C `motorRecord.cc` performs inside
+    /// `do_work`/`process_motor_info`.
+    ///
+    /// URIP=Yes: pull the external readback from the RDBL link. C
+    /// `process_motor_info` (motorRecord.cc:3687) does
+    /// `dbGetLink(&pmr->rdbl, DBR_DOUBLE, &rdblvalue, ...)` and scales it into
+    /// RRBV (`rrbv = NINT(rdblvalue*rres/mres)`). The scaling lives in the
+    /// status-update path; this just feeds it the raw link value through the
+    /// `RDBL_VAL` carrier. C reads with `dbGetLink` regardless of link type,
+    /// so any RDBL link form is read (the framework skips an empty link).
+    fn pre_process_actions(&mut self) -> Vec<ProcessAction> {
+        let mut actions = Vec::new();
+        if self.conv.urip {
+            actions.push(ProcessAction::ReadDbLink {
+                link_field: "RDBL",
+                target_field: "RDBL_VAL",
+            });
+        }
+        actions
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         field_access::motor_get_field(self, name)
     }
@@ -401,6 +424,45 @@ mod tests {
                 }
             )),
             "an unset RLNK must emit no readback link write"
+        );
+    }
+
+    // C motorRecord.cc:3687 — URIP=Yes pulls the readback from the RDBL link
+    // before process(); the status path then scales it into RRBV.
+    #[test]
+    fn urip_pulls_rdbl_link_before_process() {
+        let mut rec = MotorRecord::new();
+        rec.conv.urip = true;
+        rec.links.rdbl = "ext_readback.RBV".to_string();
+        let actions = rec.pre_process_actions();
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                ProcessAction::ReadDbLink {
+                    link_field: "RDBL",
+                    target_field: "RDBL_VAL",
+                }
+            )),
+            "URIP=Yes must request a pre-process read of RDBL into RDBL_VAL"
+        );
+    }
+
+    #[test]
+    fn no_rdbl_pull_when_urip_off() {
+        let mut rec = MotorRecord::new();
+        // Link configured, but URIP=No — C reads RRBV from the controller.
+        rec.conv.urip = false;
+        rec.links.rdbl = "ext_readback.RBV".to_string();
+        let actions = rec.pre_process_actions();
+        assert!(
+            !actions.iter().any(|a| matches!(
+                a,
+                ProcessAction::ReadDbLink {
+                    link_field: "RDBL",
+                    ..
+                }
+            )),
+            "URIP=No must not read the RDBL link"
         );
     }
 

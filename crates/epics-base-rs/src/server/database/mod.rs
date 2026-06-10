@@ -648,18 +648,30 @@ impl PvDatabase {
                 .collect()
         };
         let mut targets: Vec<(link_set::DynLinkSet, String)> = Vec::new();
-        for (_scheme, lset) in &registry_snapshot {
+        for (scheme, lset) in &registry_snapshot {
+            // C parity (dbLink.c:128-130): the iocInit connection-wait gate
+            // (`DBCA_CALLBACK_INIT_WAIT`) is a property of the *CA link
+            // facility* (dbCa) alone — it is set only for a CA link whose
+            // target is a LOCAL record:
+            //   int isLocal = dbChannelTest(pvname) == 0;
+            //   dbCaAddLinkCallbackOpt(..., isLocal ? DBCA_CALLBACK_INIT_WAIT : 0)
+            // So a CA link to a non-local / nonexistent PV (e.g. areaDetector's
+            // `ShutterStatusEPICS_RBV.INP = "test CP MS"` placeholder) gets no
+            // init-wait flag and iocInit must not block on it — it dangles
+            // silently like C. `has_name_no_resolve` is the `dbChannelTest` twin.
+            //
+            // PVA links (pvalink, scheme "pva") have no such facility in C:
+            // pvxs `linkGlobal_t::init()` (ioc/pvalink.cpp) only opens channels
+            // in the background and never blocks iocInit. epics-rs instead lets
+            // pva links participate in this wait UNCONDITIONALLY by deliberate
+            // design (`qsrv::pva_adapter::pvalink_link_set_install` — the pvalink
+            // installer is registered at the AfterCaLinkInit hook so its links
+            // are visible to, and held by, this wait). That design choice is
+            // outside the CA-facility locality gate, so only "ca" is gated;
+            // every other scheme participates regardless of target locality.
+            let locality_gated = scheme == "ca";
             for n in lset.link_names() {
-                // C parity (dbLink.c:130): iocInit only waits for links whose
-                // target is a LOCAL record —
-                //   int isLocal = dbChannelTest(pvname) == 0;
-                //   dbCaAddLinkCallbackOpt(..., isLocal ? DBCA_CALLBACK_INIT_WAIT : 0)
-                // A link to a non-local / nonexistent PV (e.g. areaDetector's
-                // `ShutterStatusEPICS_RBV.INP = "test CP MS"` placeholder) gets
-                // no init-wait flag, so iocInit must not block on it; it is left
-                // to connect asynchronously — or dangle silently — like C.
-                // `has_name_no_resolve` is the dbChannelTest twin.
-                if self.has_name_no_resolve(&n).await {
+                if !locality_gated || self.has_name_no_resolve(&n).await {
                     targets.push((lset.clone(), n));
                 }
             }

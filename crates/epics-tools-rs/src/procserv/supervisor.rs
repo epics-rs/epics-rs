@@ -109,6 +109,10 @@ struct ClientEntry {
 struct ChildSlot {
     handle: ChildHandle,
     rx: mpsc::Receiver<ChildEvent>,
+    /// When this child was spawned. The restart holdoff is measured
+    /// from here, mirroring C procServ's `_restartTime = holdoffTime +
+    /// time(0)` set at fork (`processFactory.cc:188`).
+    started_at: tokio::time::Instant,
 }
 
 impl SupervisorState {
@@ -297,7 +301,7 @@ impl SupervisorState {
                 Ok(ChildLoopOutcome::Continue)
             }
             ChildEvent::Exited { status } => {
-                self.child = None;
+                let started_at = self.child.take().map(|slot| slot.started_at);
                 let msg = format!(
                     "\r\n@@@ Child exited (status: {:?})\r\n",
                     status
@@ -310,7 +314,7 @@ impl SupervisorState {
                     RestartMode::OnExit => {
                         match self.restart_tracker.try_record(&self.config.restart) {
                             Ok(()) => {
-                                tokio::time::sleep(self.config.holdoff).await;
+                                self.holdoff_remaining(started_at).await;
                                 self.banner("@@@ Auto restart").await;
                                 self.respawn_child().await?;
                                 Ok(ChildLoopOutcome::Continue)
@@ -326,7 +330,7 @@ impl SupervisorState {
                             // First-ever exit under OneShot —
                             // permitted to relaunch once more.
                             self.has_run_once = true;
-                            tokio::time::sleep(self.config.holdoff).await;
+                            self.holdoff_remaining(started_at).await;
                             self.banner("@@@ One-shot relaunch").await;
                             self.respawn_child().await?;
                             Ok(ChildLoopOutcome::Continue)
@@ -392,7 +396,11 @@ impl SupervisorState {
         self.has_run_once = true;
         self.banner(&format!("@@@ Child started (pid {})", handle.pid()))
             .await;
-        self.child = Some(ChildSlot { handle, rx });
+        self.child = Some(ChildSlot {
+            handle,
+            rx,
+            started_at: tokio::time::Instant::now(),
+        });
         Ok(())
     }
 
@@ -478,6 +486,25 @@ impl SupervisorState {
         }
     }
 
+    /// Sleep out the remainder of the restart holdoff, measured from
+    /// the child's start instant. C procServ sets `_restartTime =
+    /// holdoffTime + time(0)` when the child is forked
+    /// (`processFactory.cc:188`) and `processFactoryNeedsRestart`
+    /// relaunches as soon as `now >= _restartTime` — so a child that
+    /// ran longer than the holdoff restarts immediately, and only a
+    /// fast crash-loop waits out `holdoff - uptime`. Sleeping the full
+    /// `holdoff` after every exit (regardless of uptime) penalised a
+    /// long-lived child that exited cleanly.
+    async fn holdoff_remaining(&self, started_at: Option<tokio::time::Instant>) {
+        let remaining = match started_at {
+            Some(t) => remaining_holdoff(self.config.holdoff, t.elapsed()),
+            None => self.config.holdoff,
+        };
+        if !remaining.is_zero() {
+            tokio::time::sleep(remaining).await;
+        }
+    }
+
     /// Convenience: emit a `@@@`-prefixed banner line to all clients.
     async fn banner(&self, text: &str) {
         let mut line = text.trim_end_matches('\n').to_string();
@@ -490,6 +517,18 @@ impl SupervisorState {
 enum ChildLoopOutcome {
     Continue,
     Shutdown,
+}
+
+/// Remaining restart holdoff for a child that ran `uptime` before
+/// exiting: `holdoff - uptime`, clamped at zero. Mirrors C
+/// `processFactoryNeedsRestart`, which permits a restart once
+/// `now >= _restartTime` where `_restartTime = child_start + holdoff`
+/// (`processFactory.cc:188`, `processFactory.cc:51-54`).
+fn remaining_holdoff(
+    holdoff: std::time::Duration,
+    uptime: std::time::Duration,
+) -> std::time::Duration {
+    holdoff.saturating_sub(uptime)
 }
 
 /// Format byte `c` for `^c` notation (C `CTL_SC` macro).
@@ -511,5 +550,47 @@ impl Drop for SupervisorState {
             // so a panic in the supervisor doesn't leave a zombie.
             let _ = slot.handle.signal(self.config.child.kill_signal);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remaining_holdoff;
+    use std::time::Duration;
+
+    // Boundaries of `_restartTime = child_start + holdoff`: the wait is
+    // `holdoff - uptime`, clamped at zero (C processFactory.cc:51-54,188).
+    #[test]
+    fn holdoff_zero_uptime_waits_full() {
+        assert_eq!(
+            remaining_holdoff(Duration::from_secs(15), Duration::ZERO),
+            Duration::from_secs(15)
+        );
+    }
+
+    #[test]
+    fn holdoff_short_uptime_waits_difference() {
+        assert_eq!(
+            remaining_holdoff(Duration::from_secs(15), Duration::from_secs(4)),
+            Duration::from_secs(11)
+        );
+    }
+
+    #[test]
+    fn holdoff_uptime_equals_holdoff_no_wait() {
+        assert_eq!(
+            remaining_holdoff(Duration::from_secs(15), Duration::from_secs(15)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn holdoff_long_uptime_restarts_immediately() {
+        // A child that outlived the holdoff restarts with no delay,
+        // matching C's `now >= _restartTime` being already true.
+        assert_eq!(
+            remaining_holdoff(Duration::from_secs(15), Duration::from_secs(3600)),
+            Duration::ZERO
+        );
     }
 }

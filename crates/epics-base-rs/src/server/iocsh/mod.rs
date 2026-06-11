@@ -352,21 +352,33 @@ impl IocShell {
         // when stdout is not a TTY (already TTY-gated by `run_repl`
         // dispatch but defensive).
         let want_color = use_ansi_color();
-        // `\x1b[32;1m` = bright green (matches C `ANSI_GREEN`); `\x1b[0m`
-        // = reset. rustyline 14 auto-strips ANSI escape sequences when
-        // computing prompt visible width, so the `\x01...\x02` reader
-        // markers GNU readline expects are NOT required — and they
-        // were actively breaking some terminals (xterm/iTerm2 render
-        // SOH/STX as visible glyphs which then misalign the cursor
-        // when output prints from another thread between prompts).
-        let prompt = if want_color {
+        // Bright-green prompt: `\x1b[32;1m` = `ANSI_GREEN` (errlog.h:282),
+        // `\x1b[0m` = reset.
+        //
+        // rustyline 18 splits the prompt's *raw* text (what it measures for
+        // visible width) from its *styled* text (what it renders), via the
+        // `Prompt::raw()` / `Prompt::styled()` trait, and accepts a
+        // `(raw, styled)` tuple as a `Prompt`. We pass that tuple so width is
+        // always measured on the plain `epics> ` (7 columns) while the green
+        // tint still shows wherever the terminal renders ANSI. Embedding the
+        // escapes inline in a single prompt string (the pre-18 approach) made
+        // rustyline's Windows console backend count the escape bytes as
+        // visible columns — its `calculate_position` (tty/windows.rs) sums
+        // raw grapheme width, unlike the Unix backend's ANSI-stripping path —
+        // which pushed the cursor and any typed/echoed text ~9 columns to the
+        // right of `epics> `. Measuring `raw()` fixes that on every platform
+        // and satisfies rustyline 18's debug-assert that the measured text
+        // carries no `\x1b[`. The styled form keeps the same display width as
+        // the raw form, as the `Prompt` trait requires.
+        let styled_prompt = if want_color {
             "\x1b[32;1mepics> \x1b[0m"
         } else {
             "epics> "
         };
+        let prompt = ("epics> ", styled_prompt);
 
         loop {
-            match rl.readline(prompt) {
+            match rl.readline(&prompt) {
                 Ok(line) => {
                     let line = line.trim().to_string();
                     if line.is_empty() {

@@ -18,7 +18,7 @@ chrono = "0.4"
 parking_lot = "0.12"
 tracing = "0.1"
 epics-macros-rs = { workspace = true }
-rustyline = "14"
+rustyline = "18"
 # Cross-platform interface enumeration (Linux/macOS/Windows). Used by
 # `epics_base_rs::net::iface_map` to expose ifindex/IP/broadcast/mcast caps.
 if-addrs = "0.13"

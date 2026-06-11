@@ -349,13 +349,26 @@ mod tests {
         for _ in 0..3 {
             reg.record_failure(addr());
         }
-        std::thread::sleep(Duration::from_millis(60));
-        let _ = reg.allow(addr()); // probe permitted
+        // Tripped OPEN at the initial cooldown.
+        assert_eq!(
+            reg.breakers[&addr()].current_cooldown,
+            Duration::from_millis(50)
+        );
+        std::thread::sleep(Duration::from_millis(60)); // past the 50ms cooldown
+        assert!(reg.allow(addr())); // probe permitted (HALF_OPEN)
         reg.record_failure(addr()); // probe failed
-        assert!(!reg.allow(addr()));
-        std::thread::sleep(Duration::from_millis(60));
-        // Doubled cooldown is now 100ms; original 50ms wouldn't have helped.
-        assert!(!reg.allow(addr()));
+        // A half-open failure doubles the cooldown (50ms -> 100ms) and re-opens
+        // the breaker. Assert the doubled value directly rather than racing a
+        // wall-clock sleep against it: `thread::sleep` is only a lower bound,
+        // so `sleep(60ms)` can overshoot past the 100ms cooldown on a loaded
+        // CI runner, letting the cooldown elapse and flip the breaker
+        // probe-ready — the spurious failure this replaces.
+        assert_eq!(
+            reg.breakers[&addr()].current_cooldown,
+            Duration::from_millis(100)
+        );
+        assert!(reg.is_open(addr()));
+        assert!(!reg.allow(addr())); // still blocked immediately under the fresh cooldown
     }
 
     #[test]

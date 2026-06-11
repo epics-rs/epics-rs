@@ -72,13 +72,30 @@ impl AcquisitionContext {
     }
 }
 
-/// Check if a Stop command has been received within the given duration.
-async fn wait_for_stop(acq_rx: &mut rt::CommandReceiver<AcqCommand>, duration: Duration) -> bool {
+/// Outcome of waiting for a stop signal during an exposure/period delay.
+enum WaitOutcome {
+    /// `Stop` command received — the asyn port is still up, so finalize the
+    /// detector to Idle before breaking out of the acquisition loop.
+    Stop,
+    /// The command channel closed (IOC shutdown) — the asyn port is being torn
+    /// down, so break WITHOUT the idle writeback that would race the dead port
+    /// and log a spurious "actor channel closed" error.
+    Shutdown,
+    /// Timeout elapsed, or a stale `Start` arrived — keep acquiring.
+    Continue,
+}
+
+/// Wait up to `duration` for a stop signal, distinguishing an explicit `Stop`
+/// (finalize) from command-channel closure (IOC shutdown — skip the writeback).
+async fn wait_for_stop(
+    acq_rx: &mut rt::CommandReceiver<AcqCommand>,
+    duration: Duration,
+) -> WaitOutcome {
     match rt::timeout(duration, acq_rx.recv()).await {
-        Ok(Some(AcqCommand::Stop)) => true,
-        Ok(Some(AcqCommand::Start)) => false,
-        Ok(None) => true, // channel closed
-        Err(_) => false,  // timeout
+        Ok(Some(AcqCommand::Stop)) => WaitOutcome::Stop,
+        Ok(Some(AcqCommand::Start)) => WaitOutcome::Continue,
+        Ok(None) => WaitOutcome::Shutdown, // channel closed = IOC shutdown
+        Err(_) => WaitOutcome::Continue,   // timeout
     }
 }
 
@@ -184,9 +201,13 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             // Exposure time delay with stop interruption
             let elapsed = start_time.elapsed().as_secs_f64();
             let delay = (config.acquire_time - elapsed).max(MIN_DELAY_SECS);
-            if wait_for_stop(&mut ctx.acq_rx, Duration::from_secs_f64(delay)).await {
-                ctx.end_acquisition(config.wait_for_plugins).await;
-                break;
+            match wait_for_stop(&mut ctx.acq_rx, Duration::from_secs_f64(delay)).await {
+                WaitOutcome::Stop => {
+                    ctx.end_acquisition(config.wait_for_plugins).await;
+                    break;
+                }
+                WaitOutcome::Shutdown => break, // asyn port torn down; skip writeback
+                WaitOutcome::Continue => {}
             }
 
             // Update counters
@@ -249,9 +270,13 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             let total_elapsed = start_time.elapsed().as_secs_f64();
             let period_delay = config.acquire_period - total_elapsed;
             if period_delay > 0.0 {
-                if wait_for_stop(&mut ctx.acq_rx, Duration::from_secs_f64(period_delay)).await {
-                    ctx.end_acquisition(config.wait_for_plugins).await;
-                    break;
+                match wait_for_stop(&mut ctx.acq_rx, Duration::from_secs_f64(period_delay)).await {
+                    WaitOutcome::Stop => {
+                        ctx.end_acquisition(config.wait_for_plugins).await;
+                        break;
+                    }
+                    WaitOutcome::Shutdown => break, // asyn port torn down; skip writeback
+                    WaitOutcome::Continue => {}
                 }
             }
         }

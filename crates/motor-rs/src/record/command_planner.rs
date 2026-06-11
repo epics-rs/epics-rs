@@ -425,10 +425,13 @@ impl MotorRecord {
             self.stat.mip.insert(MipFlags::STOP);
             self.internal.backlash_pending = false;
             self.internal.pending_retarget = None;
-            // Sync VAL to RBV after stop
-            self.pos.val = self.pos.rbv;
-            self.pos.dval = self.pos.drbv;
-            self.pos.rval = self.pos.rrbv;
+            // No VAL<-RBV sync here: C's stop-while-moving branch only sets
+            // pp=TRUE (motorRecord.cc:1891-1893); the drive fields are
+            // synced to the readbacks by postProcess once the axis has
+            // actually stopped (835-849), which the stop-completion path in
+            // check_completion mirrors via sync_positions(). Syncing eagerly
+            // at stop-put time posted a transient VAL=RBV snapshot taken
+            // mid-deceleration, before the rest position was known.
         }
         // C motorRecord.cc — STOP_AXIS is sent unconditionally ("just in
         // case"): the driver may still be settling even when the record

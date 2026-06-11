@@ -264,6 +264,14 @@ fn stop_during_move_clears_pending_motion() {
     assert!(rec.stat.mip.contains(MipFlags::STOP));
     assert_eq!(effects.commands.len(), 1);
     assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
+    // C parity: no eager VAL<-RBV sync at stop-put time; the sync runs
+    // once the axis has actually stopped (postProcess). VAL still holds
+    // its pre-stop value (never written in this scenario).
+    assert_eq!(rec.pos.val, 0.0);
+
+    complete_move(&mut rec, 25.0);
+    let _ = rec.check_completion();
+    assert!(rec.stat.dmov);
     assert_eq!(rec.pos.val, rec.pos.rbv);
 }
 

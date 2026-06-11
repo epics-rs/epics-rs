@@ -218,7 +218,14 @@ fn test_stop_during_move() {
     assert!(rec.stat.mip.contains(MipFlags::STOP));
     assert_eq!(effects.commands.len(), 1);
     assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
-    // VAL synced to RBV
+    // C parity: drive fields are NOT synced at stop-put time (C only sets
+    // pp=TRUE while the axis decelerates, motorRecord.cc:1891-1893)...
+    assert_eq!(rec.pos.val, 0.0);
+
+    // ...the VAL<-RBV sync happens when the axis has actually stopped.
+    rec.stat.msta = MstaFlags::DONE;
+    let _ = rec.check_completion();
+    assert!(rec.stat.dmov);
     assert_eq!(rec.pos.val, 25.0);
 }
 
@@ -459,7 +466,9 @@ fn test_val_write_during_stop_deceleration_reissues_move() {
     let effects = rec.plan_motion(CommandSource::Stop);
     assert!(rec.stat.mip.contains(MipFlags::STOP));
     assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
-    assert_eq!(rec.pos.val, 25.0); // stop syncs target to readback
+    // C parity: no eager sync at stop-put time; VAL keeps the old target
+    // until the axis actually stops (postProcess sync).
+    assert_eq!(rec.pos.val, 50.0);
 
     // New target written while still decelerating (driver not done yet)
     rec.pos.dval = 80.0;

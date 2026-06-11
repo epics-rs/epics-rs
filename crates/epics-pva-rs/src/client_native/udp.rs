@@ -401,6 +401,7 @@ async fn recv_loop(sock: Arc<UdpSocket>, is_v6: bool, weak: Weak<CollectorState>
 /// * v4 Linux: `IP_PKTINFO` (yields `in_pktinfo.ipi_addr`).
 /// * v4 macOS/BSD: `IP_RECVDSTADDR` (yields a bare `in_addr`).
 /// * v6: `IPV6_RECVPKTINFO` (yields `in6_pktinfo.ipi6_addr`).
+#[cfg(unix)]
 fn enable_recv_orig_dest(sock: &Socket, is_v6: bool) -> io::Result<()> {
     use std::os::fd::AsRawFd;
 
@@ -435,9 +436,22 @@ fn enable_recv_orig_dest(sock: &Socket, is_v6: bool) -> io::Result<()> {
     Ok(())
 }
 
+/// Non-Unix fallback: original-destination recovery relies on
+/// `recvmsg`/cmsg ancillary data (`std::os::fd` + `libc`), which has no
+/// portable equivalent here. The collector still binds and receives — it
+/// just cannot recover a datagram's original destination, so a
+/// specific-destination listener is served nothing while wildcard
+/// listeners are unaffected (see [`recv_with_orig_dest`] and
+/// [`dest_matches`]). A full port would use `WSARecvMsg` + `IP_PKTINFO`.
+#[cfg(not(unix))]
+fn enable_recv_orig_dest(_sock: &Socket, _is_v6: bool) -> io::Result<()> {
+    Ok(())
+}
+
 /// Drive one non-blocking `recvmsg`, returning the byte count, source
 /// address, and recovered original destination. `Ok(None)` means the read
 /// would block (re-arm and wait).
+#[cfg(unix)]
 fn recv_with_orig_dest(
     sock: &UdpSocket,
     is_v6: bool,
@@ -480,12 +494,30 @@ fn recv_with_orig_dest(
     }
 }
 
+/// Non-Unix fallback: receive without ancillary data. Yields the source
+/// address and `None` for the original destination (see
+/// [`enable_recv_orig_dest`]'s non-Unix note). `try_recv_from` mirrors
+/// the Unix path's `WouldBlock` -> `Ok(None)` re-arm contract.
+#[cfg(not(unix))]
+fn recv_with_orig_dest(
+    sock: &UdpSocket,
+    _is_v6: bool,
+    buf: &mut [u8],
+) -> io::Result<Option<(usize, SocketAddr, Option<IpAddr>)>> {
+    match sock.try_recv_from(buf) {
+        Ok((n, src)) => Ok(Some((n, src, None))),
+        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Walk the ancillary-data list for the original-destination cmsg and
 /// decode it. Returns `None` when no matching cmsg is present.
 ///
 /// # Safety
 /// `msg.msg_control` must point at `msg.msg_controllen` valid bytes
 /// populated by a preceding `recvmsg`.
+#[cfg(unix)]
 unsafe fn orig_dest_from_cmsgs(msg: &libc::msghdr, is_v6: bool) -> Option<IpAddr> {
     let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(msg) };
     while !cmsg.is_null() {
@@ -503,6 +535,7 @@ unsafe fn orig_dest_from_cmsgs(msg: &libc::msghdr, is_v6: bool) -> Option<IpAddr
 /// # Safety
 /// `cmsg_ptr` must equal `&*hdr` and reference a cmsg whose payload was
 /// populated by `recvmsg`.
+#[cfg(unix)]
 unsafe fn decode_orig_dest_cmsg(
     hdr: &libc::cmsghdr,
     cmsg_ptr: *const libc::cmsghdr,
@@ -557,6 +590,7 @@ unsafe fn decode_orig_dest_cmsg(
 /// # Safety
 /// `storage` must be initialised by `recvmsg` and `len` is its
 /// `msg_namelen`.
+#[cfg(unix)]
 unsafe fn sockaddr_storage_to_socketaddr(
     storage: &libc::sockaddr_storage,
     _len: libc::socklen_t,
@@ -683,6 +717,10 @@ mod tests {
         assert_eq!(c.listener_count(), 3);
     }
 
+    // Asserts a recovered original destination, which comes from the
+    // Unix-only `recvmsg`/cmsg path; on non-Unix the collector reports
+    // `orig_dest == None` by construction (see `enable_recv_orig_dest`).
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wildcard_listener_receives_with_orig_dest() {
         let mgr = UdpManager::new();

@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.19.2 — 2026-06-11
+
+Patch release making the cross-platform CI matrix introduced in `v0.19.1`
+fully green. `v0.19.1` fixed the Windows *build*; this release fixes the
+Windows and macOS *test and runtime* failures the matrix then surfaced on
+the previously-untested cells (Windows × {x86_64, arm64}, macOS arm64).
+No API changes; behavior on the already-passing Linux x86_64 path is
+unchanged.
+
+- Windows `Instant` panics ("overflow when subtracting duration from
+  instant"): `Instant` is QPC-since-boot on Windows, so `Instant -
+  Duration` panics whenever machine uptime is shorter than the span.
+  Fixed the `IfaceMap::new` `last_refresh` seed (a back-dated `Instant`
+  that took down every NIC-enumerating test) and two production
+  rolling-window prunes — the CA circuit-breaker failure window and the
+  CA UDP rate-limiter GC — by reformulating as
+  `saturating_duration_since` instead of subtracting from an `Instant`.
+- Windows `SystemTime` precision: `Snapshot` timestamps now hold
+  nsec-precise `WallTime` instead of `SystemTime`, which truncates
+  sub-100 ns on Windows (FILETIME is 100 ns granularity).
+- Loopback NIC enumeration order: Windows does not enumerate the loopback
+  at socket index 0. The `recv_*_with_drop_count` tests that read
+  `sockets.first()` now bind a single loopback socket so the socket the
+  method reads is the one the test sends to on every platform.
+- PVA `ORIGIN_TAG`: receive the loopback-multicast forward on the
+  `lo_mcast` socket itself and drop the same-port co-bind that failed to
+  bind on Windows.
+- macOS timing-fragile test: the circuit-breaker half-open cooldown test
+  now asserts the doubled-cooldown value directly instead of racing a
+  `thread::sleep` lower bound against it, which flaked under macOS CI
+  load.
+- Detector examples: skip the idle-frame writeback when the asyn port is
+  torn down on shutdown, removing a teardown-race error on `exit`.
+- Portability hygiene: the `check_path` test uses the platform temp dir
+  rather than a hard-coded `/tmp`; the Windows `iocsh` prompt no longer
+  pads spaces after `epics>`; dropped an unused `spvirit-server` dev
+  dependency that broke the windows-arm64 build; scrubbed inert
+  `spvirit` references from comments and test names.
+
 ## v0.19.1 — 2026-06-11
 
 Patch release fixing cross-platform builds. `v0.19.0` did not compile on

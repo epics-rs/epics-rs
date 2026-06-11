@@ -40,7 +40,7 @@ epics-rs reimplements the core components of C/C++ EPICS in Rust:
 
 ## Installation
 
-**Current release: v0.19.1** — a large C/C++ parity-hardening release:
+**Current release: v0.19.2** — a large C/C++ parity-hardening release:
 761 commits since `v0.18.6` (~557 parity fixes + ~66 additive features)
 across the native PVA protocol, the QSRV/bridge gateway and pvalink, CA,
 asyn, and base/db — including sseq/PACT async records, DBF link-class

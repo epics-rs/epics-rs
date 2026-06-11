@@ -436,14 +436,48 @@ fn enable_recv_orig_dest(sock: &Socket, is_v6: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// Non-Unix fallback: original-destination recovery relies on
-/// `recvmsg`/cmsg ancillary data (`std::os::fd` + `libc`), which has no
-/// portable equivalent here. The collector still binds and receives — it
-/// just cannot recover a datagram's original destination, so a
-/// specific-destination listener is served nothing while wildcard
-/// listeners are unaffected (see [`recv_with_orig_dest`] and
-/// [`dest_matches`]). A full port would use `WSARecvMsg` + `IP_PKTINFO`.
-#[cfg(not(unix))]
+/// Windows: enable `IP_PKTINFO` / `IPV6_PKTINFO` so each datagram's
+/// destination arrives as ancillary data, and resolve the `WSARecvMsg`
+/// extension-fn pointer up front so the hot recv path can't fail on first
+/// use (mirrors pvxs `enable_IP_PKTINFO` + `oseDoOnce`,
+/// `os/WIN32/osdSockExt.cpp`). Unlike Unix, Windows recovers the v4
+/// destination from `IP_PKTINFO` too — there is no `IP_RECVDSTADDR`.
+#[cfg(windows)]
+fn enable_recv_orig_dest(sock: &Socket, is_v6: bool) -> io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        IP_PKTINFO, IPPROTO_IP, IPPROTO_IPV6, IPV6_PKTINFO, SOCKET, setsockopt,
+    };
+
+    let raw = sock.as_raw_socket() as SOCKET;
+    let on: i32 = 1;
+    let (level, optname) = if is_v6 {
+        (IPPROTO_IPV6 as i32, IPV6_PKTINFO as i32)
+    } else {
+        (IPPROTO_IP as i32, IP_PKTINFO as i32)
+    };
+    // SAFETY: `raw` is owned by `sock` for this call; `on` outlives it.
+    let r = unsafe {
+        setsockopt(
+            raw,
+            level,
+            optname,
+            &on as *const i32 as *const u8,
+            std::mem::size_of_val(&on) as i32,
+        )
+    };
+    if r != 0 {
+        return Err(io::Error::from_raw_os_error(win_orig_dest::last_wsa_error()));
+    }
+    // Resolve+cache the WSARecvMsg extension pointer while we hold a socket.
+    win_orig_dest::resolve_wsarecvmsg(raw)?;
+    Ok(())
+}
+
+/// Other non-Unix, non-Windows targets: no ancillary-data mechanism, so
+/// the collector receives without original-destination recovery
+/// (`orig_dest == None`). See [`recv_with_orig_dest`].
+#[cfg(all(not(unix), not(windows)))]
 fn enable_recv_orig_dest(_sock: &Socket, _is_v6: bool) -> io::Result<()> {
     Ok(())
 }
@@ -494,11 +528,37 @@ fn recv_with_orig_dest(
     }
 }
 
-/// Non-Unix fallback: receive without ancillary data. Yields the source
-/// address and `None` for the original destination (see
-/// [`enable_recv_orig_dest`]'s non-Unix note). `try_recv_from` mirrors
-/// the Unix path's `WouldBlock` -> `Ok(None)` re-arm contract.
-#[cfg(not(unix))]
+/// Windows: one non-blocking `WSARecvMsg`, recovering the original
+/// destination from the `IP_PKTINFO` / `IPV6_PKTINFO` ancillary data.
+/// `Ok(None)` on `WSAEWOULDBLOCK` mirrors the Unix re-arm contract; the
+/// `try_io` wrapper clears tokio's readiness on that.
+#[cfg(windows)]
+fn recv_with_orig_dest(
+    sock: &UdpSocket,
+    is_v6: bool,
+    buf: &mut [u8],
+) -> io::Result<Option<(usize, SocketAddr, Option<IpAddr>)>> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::SOCKET;
+
+    let raw = sock.as_raw_socket() as SOCKET;
+    let res = sock.try_io(tokio::io::Interest::READABLE, || {
+        // SAFETY: every pointer built inside refers to a local that
+        // outlives the single WSARecvMsg call; `buf` is borrowed for it.
+        unsafe { win_orig_dest::recvmsg_once(raw, is_v6, buf) }
+    });
+
+    match res {
+        Ok(v) => Ok(Some(v)),
+        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Other non-Unix, non-Windows targets: receive without ancillary data.
+/// Yields the source address and `None` for the original destination.
+/// `try_recv_from` mirrors the Unix `WouldBlock` -> `Ok(None)` contract.
+#[cfg(all(not(unix), not(windows)))]
 fn recv_with_orig_dest(
     sock: &UdpSocket,
     _is_v6: bool,
@@ -620,6 +680,220 @@ unsafe fn sockaddr_storage_to_socketaddr(
     }
 }
 
+/// Windows original-destination recovery via `WSARecvMsg` + `IP_PKTINFO`,
+/// the Winsock analog of the Unix `recvmsg`/cmsg path. Mirrors pvxs
+/// `os/WIN32/osdSockExt.cpp` (`recvfromx::call`). Scoped to 64-bit Windows
+/// targets (the matrix builds x86_64 + aarch64), where the cmsg header and
+/// data alignments both equal `align_of::<CMSGHDR>()`.
+#[cfg(windows)]
+mod win_orig_dest {
+    use super::*;
+    use core::ffi::c_void;
+    use std::mem::size_of;
+    use std::ptr::{null, null_mut, read_unaligned};
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_INET, AF_INET6, CMSGHDR, IN_PKTINFO, IN6_PKTINFO, IP_PKTINFO, IPPROTO_IP, IPPROTO_IPV6,
+        IPV6_PKTINFO, SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR_IN, SOCKADDR_IN6,
+        SOCKADDR_STORAGE, SOCKET, WSABUF, WSAGetLastError, WSAID_WSARECVMSG, WSAIoctl, WSAMSG,
+    };
+    use windows_sys::core::GUID;
+
+    /// `WSARecvMsg` extension fn. Its trailing `OVERLAPPED*` and completion
+    /// routine are always null here, so they are typed as opaque pointers to
+    /// avoid naming extra types.
+    type WsaRecvMsgFn =
+        unsafe extern "system" fn(SOCKET, *mut WSAMSG, *mut u32, *mut c_void, *mut c_void) -> i32;
+
+    static WSARECVMSG: OnceLock<WsaRecvMsgFn> = OnceLock::new();
+
+    pub(super) fn last_wsa_error() -> i32 {
+        // SAFETY: `WSAGetLastError` has no preconditions.
+        unsafe { WSAGetLastError() }
+    }
+
+    /// Resolve and cache the `WSARecvMsg` extension-fn pointer via
+    /// `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)` (pvxs `oseDoOnce`).
+    pub(super) fn resolve_wsarecvmsg(sock: SOCKET) -> io::Result<WsaRecvMsgFn> {
+        if let Some(f) = WSARECVMSG.get() {
+            return Ok(*f);
+        }
+        let guid: GUID = WSAID_WSARECVMSG;
+        let mut func: Option<WsaRecvMsgFn> = None;
+        let mut nout: u32 = 0;
+        // SAFETY: `guid`/`func`/`nout` outlive the call; the sizes match.
+        let rc = unsafe {
+            WSAIoctl(
+                sock,
+                SIO_GET_EXTENSION_FUNCTION_POINTER,
+                &guid as *const GUID as *const c_void,
+                size_of::<GUID>() as u32,
+                &mut func as *mut Option<WsaRecvMsgFn> as *mut c_void,
+                size_of::<Option<WsaRecvMsgFn>>() as u32,
+                &mut nout,
+                null_mut(),
+                None,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(last_wsa_error()));
+        }
+        let func = func.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "WSARecvMsg pointer unavailable")
+        })?;
+        let _ = WSARECVMSG.set(func);
+        Ok(func)
+    }
+
+    /// One non-blocking `WSARecvMsg`.
+    ///
+    /// # Safety
+    /// `buf` must be writable for its full length; the call borrows it.
+    pub(super) unsafe fn recvmsg_once(
+        sock: SOCKET,
+        is_v6: bool,
+        buf: &mut [u8],
+    ) -> io::Result<(usize, SocketAddr, Option<IpAddr>)> {
+        let recv = resolve_wsarecvmsg(sock)?;
+
+        // SAFETY: zeroed sockaddr/WSAMSG are valid initial states; every
+        // pointer below refers to a stack local that outlives the call.
+        let mut storage: SOCKADDR_STORAGE = unsafe { std::mem::zeroed() };
+        let mut iov = WSABUF {
+            len: buf.len() as u32,
+            buf: buf.as_mut_ptr(),
+        };
+        // Room for one in6_pktinfo cmsg (header + 20 bytes, aligned).
+        let mut cbuf = [0u8; 128];
+        let mut msg: WSAMSG = unsafe { std::mem::zeroed() };
+        msg.name = &mut storage as *mut SOCKADDR_STORAGE as *mut _;
+        msg.namelen = size_of::<SOCKADDR_STORAGE>() as i32;
+        msg.lpBuffers = &mut iov;
+        msg.dwBufferCount = 1;
+        msg.Control = WSABUF {
+            len: cbuf.len() as u32,
+            buf: cbuf.as_mut_ptr(),
+        };
+        msg.dwFlags = 0;
+
+        let mut nrx: u32 = 0;
+        // SAFETY: `recv` is the resolved WSARecvMsg; pointers outlive it.
+        let rc = unsafe { recv(sock, &mut msg, &mut nrx, null_mut(), null_mut()) };
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(last_wsa_error()));
+        }
+
+        let src = sockaddr_to_socketaddr(&storage)?;
+        // SAFETY: `msg.Control` was populated by the WSARecvMsg above.
+        let orig_dest = unsafe { orig_dest_from_wsacmsgs(&msg, is_v6) };
+        Ok((nrx as usize, src, orig_dest))
+    }
+
+    #[inline]
+    fn cmsg_align(len: usize) -> usize {
+        let a = std::mem::align_of::<CMSGHDR>();
+        (len + a - 1) & !(a - 1)
+    }
+
+    /// `WSA_CMSG_DATA`: payload pointer for a cmsg header.
+    ///
+    /// # Safety
+    /// `cmsg` must point at a valid `CMSGHDR` inside the control buffer.
+    unsafe fn wsa_cmsg_data(cmsg: *const CMSGHDR) -> *const u8 {
+        (cmsg as *const u8).wrapping_add(cmsg_align(size_of::<CMSGHDR>()))
+    }
+
+    /// `WSA_CMSG_FIRSTHDR`.
+    fn wsa_cmsg_firsthdr(msg: &WSAMSG) -> *const CMSGHDR {
+        if (msg.Control.len as usize) >= size_of::<CMSGHDR>() {
+            msg.Control.buf as *const CMSGHDR
+        } else {
+            null()
+        }
+    }
+
+    /// `WSA_CMSG_NXTHDR`. Bounds the walk by `Control.len` using integer
+    /// arithmetic so no out-of-range pointer is ever formed.
+    ///
+    /// # Safety
+    /// `cmsg`, when non-null, must point at a valid `CMSGHDR`.
+    unsafe fn wsa_cmsg_nxthdr(msg: &WSAMSG, cmsg: *const CMSGHDR) -> *const CMSGHDR {
+        if cmsg.is_null() {
+            return wsa_cmsg_firsthdr(msg);
+        }
+        // SAFETY: caller guarantees `cmsg` is a valid header.
+        let cmsg_len = unsafe { (*cmsg).cmsg_len } as usize;
+        let base = msg.Control.buf as usize;
+        let end = base + msg.Control.len as usize;
+        let next = (cmsg as usize) + cmsg_align(cmsg_len);
+        if next + size_of::<CMSGHDR>() > end {
+            null()
+        } else {
+            next as *const CMSGHDR
+        }
+    }
+
+    /// Walk the ancillary data for the `IP_PKTINFO` / `IPV6_PKTINFO` cmsg
+    /// and return the recovered destination IP, or `None`.
+    ///
+    /// # Safety
+    /// `msg.Control` must point at `Control.len` valid bytes from `WSARecvMsg`.
+    unsafe fn orig_dest_from_wsacmsgs(msg: &WSAMSG, is_v6: bool) -> Option<IpAddr> {
+        let mut cmsg = wsa_cmsg_firsthdr(msg);
+        while !cmsg.is_null() {
+            // SAFETY: `cmsg` is non-null and within the control buffer.
+            let hdr = unsafe { &*cmsg };
+            if is_v6 {
+                if hdr.cmsg_level == IPPROTO_IPV6 as i32 && hdr.cmsg_type == IPV6_PKTINFO as i32 {
+                    // SAFETY: an IPV6_PKTINFO cmsg payload is an in6_pktinfo.
+                    let info = unsafe { read_unaligned(wsa_cmsg_data(cmsg) as *const IN6_PKTINFO) };
+                    return Some(IpAddr::V6(Ipv6Addr::from(unsafe { info.ipi6_addr.u.Byte })));
+                }
+            } else if hdr.cmsg_level == IPPROTO_IP as i32 && hdr.cmsg_type == IP_PKTINFO as i32 {
+                // SAFETY: an IP_PKTINFO cmsg payload is an in_pktinfo.
+                let info = unsafe { read_unaligned(wsa_cmsg_data(cmsg) as *const IN_PKTINFO) };
+                return Some(IpAddr::V4(Ipv4Addr::from(unsafe {
+                    info.ipi_addr.S_un.S_addr.to_ne_bytes()
+                })));
+            }
+            // SAFETY: `cmsg` is a valid header from this same control buffer.
+            cmsg = unsafe { wsa_cmsg_nxthdr(msg, cmsg) };
+        }
+        None
+    }
+
+    /// Convert a `WSARecvMsg`-filled `SOCKADDR_STORAGE` into a [`SocketAddr`].
+    fn sockaddr_to_socketaddr(storage: &SOCKADDR_STORAGE) -> io::Result<SocketAddr> {
+        match storage.ss_family {
+            AF_INET => {
+                // SAFETY: ss_family == AF_INET ⟹ storage is a SOCKADDR_IN.
+                let sin = unsafe { &*(storage as *const SOCKADDR_STORAGE as *const SOCKADDR_IN) };
+                let ip = Ipv4Addr::from(unsafe { sin.sin_addr.S_un.S_addr }.to_ne_bytes());
+                Ok(SocketAddr::V4(SocketAddrV4::new(
+                    ip,
+                    u16::from_be(sin.sin_port),
+                )))
+            }
+            AF_INET6 => {
+                // SAFETY: ss_family == AF_INET6 ⟹ storage is a SOCKADDR_IN6.
+                let sin6 = unsafe { &*(storage as *const SOCKADDR_STORAGE as *const SOCKADDR_IN6) };
+                let ip = Ipv6Addr::from(unsafe { sin6.sin6_addr.u.Byte });
+                let scope = unsafe { sin6.Anonymous.sin6_scope_id };
+                Ok(SocketAddr::V6(SocketAddrV6::new(
+                    ip,
+                    u16::from_be(sin6.sin6_port),
+                    sin6.sin6_flowinfo,
+                    scope,
+                )))
+            }
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("WSARecvMsg returned unsupported address family {other}"),
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -717,10 +991,11 @@ mod tests {
         assert_eq!(c.listener_count(), 3);
     }
 
-    // Asserts a recovered original destination, which comes from the
-    // Unix-only `recvmsg`/cmsg path; on non-Unix the collector reports
-    // `orig_dest == None` by construction (see `enable_recv_orig_dest`).
-    #[cfg(unix)]
+    // Asserts a recovered original destination. Unix uses `recvmsg`/cmsg,
+    // Windows uses `WSARecvMsg`/`IP_PKTINFO`; only other targets report
+    // `orig_dest == None` by construction (see `enable_recv_orig_dest`),
+    // so the assertion is gated to the two that actually recover it.
+    #[cfg(any(unix, windows))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wildcard_listener_receives_with_orig_dest() {
         let mgr = UdpManager::new();

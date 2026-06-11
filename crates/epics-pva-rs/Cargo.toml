@@ -96,6 +96,17 @@ pkcs12 = [
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# WSARecvMsg + IP_PKTINFO for UDP original-destination recovery on
+# Windows (client_native::udp), mirroring pvxs os/WIN32/osdSockExt.cpp.
+# socket2 does not expose WSARecvMsg (a Winsock extension fn), so this
+# raw FFI is required.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_System_IO",
+] }
+
 [dev-dependencies]
 rcgen = "0.13"
 tempfile = "3"

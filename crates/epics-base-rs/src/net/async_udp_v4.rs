@@ -1624,17 +1624,18 @@ mod tests {
     /// identically to `recv_from`.
     #[tokio::test]
     async fn recv_from_with_drop_count_returns_zero_under_normal_load() {
-        let server = AsyncUdpV4::bind(0, false).expect("server bind");
+        // `recv_from_with_drop_count` reads `sockets.first()` only — its
+        // documented single-binding contract. Bind a single loopback socket
+        // so the socket the method reads IS the one we send to on every
+        // platform. Multi-NIC `bind()` places the loopback at an
+        // enumeration-order-dependent index (first on Linux/macOS, not first
+        // on Windows); sending to the loopback NIC while the method reads
+        // `sockets[0]` would then never deliver off those platforms. (The
+        // fan-in `recv_with_meta_with_drops` sibling can send to loopback
+        // because it receives across all sockets.)
+        let server = AsyncUdpV4::bind_single(Ipv4Addr::LOCALHOST, 0, false).expect("server bind");
         server.enable_so_rxq_ovfl().expect("enable counter");
-        // Loopback socket specifically — not `sockets[0]`, which is not the
-        // loopback NIC on every platform (see
-        // recv_with_meta_with_drops_returns_zero_under_normal_load).
-        let dest = server
-            .ifaces()
-            .iter()
-            .find(|n| n.is_loopback)
-            .map(|n| n.sock.local_addr().unwrap())
-            .expect("loopback NIC must exist");
+        let dest = server.ifaces()[0].sock.local_addr().expect("loopback addr");
 
         let client = tokio::net::UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .await

@@ -30,8 +30,12 @@ use crate::error::BridgeResult;
 use super::access::AccessConfig;
 use super::beacon::BeaconAnomaly;
 use super::cache::{CacheTimeouts, PvCache};
-// Used by the cfg(unix) signal handler AND the control-PV command owner.
-use super::command::{CommandHandler, GatewayCommand};
+// `CommandHandler` (the control-PV command owner) is used on all targets;
+// `GatewayCommand` is referenced only by the cfg(unix) signal handler, so
+// importing it unconditionally is an unused import on non-Unix.
+use super::command::CommandHandler;
+#[cfg(unix)]
+use super::command::GatewayCommand;
 use super::downstream::DownstreamServer;
 use super::putlog::{PutLog, PutLogScope};
 use super::pvlist::PvList;

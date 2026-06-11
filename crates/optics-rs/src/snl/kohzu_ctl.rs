@@ -1004,9 +1004,9 @@ pub async fn run(
                             auto_mode = false;
                             let _ = ch_auto_mode.put_i16(0).await;
                             let _ = ch_seq_msg2.put_string("Setting to Manual Mode").await;
-                            let _ = ch_theta_mot_stop.put_i16(1).await;
-                            let _ = ch_y_stop.put_i16(1).await;
-                            let _ = ch_z_stop.put_i16(1).await;
+                            let _ = ch_theta_mot_stop.put_i16_process(1).await;
+                            let _ = ch_y_stop.put_i16_process(1).await;
+                            let _ = ch_z_stop.put_i16_process(1).await;
                             tokio::time::sleep(Duration::from_secs(1)).await;
                             break;
                         }
@@ -1019,9 +1019,9 @@ pub async fn run(
                                 auto_mode = false;
                                 let _ = ch_auto_mode.put_i16(0).await;
                                 let _ = ch_seq_msg2.put_string("Setting to Manual Mode").await;
-                                let _ = ch_theta_mot_stop.put_i16(1).await;
-                                let _ = ch_y_stop.put_i16(1).await;
-                                let _ = ch_z_stop.put_i16(1).await;
+                                let _ = ch_theta_mot_stop.put_i16_process(1).await;
+                                let _ = ch_y_stop.put_i16_process(1).await;
+                                let _ = ch_z_stop.put_i16_process(1).await;
                                 tokio::time::sleep(Duration::from_secs(1)).await;
                                 break;
                             }
@@ -1035,9 +1035,9 @@ pub async fn run(
                                 auto_mode = false;
                                 let _ = ch_auto_mode.put_i16(0).await;
                                 let _ = ch_seq_msg2.put_string("Setting to Manual Mode").await;
-                                let _ = ch_theta_mot_stop.put_i16(1).await;
-                                let _ = ch_y_stop.put_i16(1).await;
-                                let _ = ch_z_stop.put_i16(1).await;
+                                let _ = ch_theta_mot_stop.put_i16_process(1).await;
+                                let _ = ch_y_stop.put_i16_process(1).await;
+                                let _ = ch_z_stop.put_i16_process(1).await;
                                 tokio::time::sleep(Duration::from_secs(1)).await;
                                 break;
                             }
@@ -1078,10 +1078,17 @@ pub async fn run(
                             continue;
                         }
                         tracing::debug!("kohzuCtl: new setpoint during move: {} = {}", changed_pv_new, new_val_new);
-                        // Stop current motors
-                        let _ = ch_theta_mot_stop.put_i16(1).await;
-                        let _ = ch_y_stop.put_i16(1).await;
-                        let _ = ch_z_stop.put_i16(1).await;
+                        // Stop current motors — with processing, like a C
+                        // pvPut (motorRecord.dbd STOP is pp(TRUE)). A bare
+                        // field write leaves the stop latent until the next
+                        // record process, which is the very put that commands
+                        // the retargeted move — the latent stop then cancels
+                        // that move at the following poll, so the motor stays
+                        // at the pre-retarget position while the seq reports
+                        // the move done.
+                        let _ = ch_theta_mot_stop.put_i16_process(1).await;
+                        let _ = ch_y_stop.put_i16_process(1).await;
+                        let _ = ch_z_stop.put_i16_process(1).await;
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         // Update internal state directly (don't defer —
                         // deferred events would be filtered as "no change"

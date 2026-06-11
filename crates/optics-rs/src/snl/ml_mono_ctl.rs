@@ -711,9 +711,9 @@ pub async fn run(
                     let _ = ch_alert.put_i16(1).await;
                     auto_mode = false;
                     let _ = ch_auto_mode.put_i16(0).await;
-                    let _ = ch_theta_mot_stop.put_i16(1).await;
-                    let _ = ch_theta2_mot_stop.put_i16(1).await;
-                    let _ = ch_z_stop.put_i16(1).await;
+                    let _ = ch_theta_mot_stop.put_i16_process(1).await;
+                    let _ = ch_theta2_mot_stop.put_i16_process(1).await;
+                    let _ = ch_z_stop.put_i16_process(1).await;
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     break;
                 }
@@ -724,9 +724,9 @@ pub async fn run(
                     let _ = ch_alert.put_i16(1).await;
                     auto_mode = false;
                     let _ = ch_auto_mode.put_i16(0).await;
-                    let _ = ch_theta_mot_stop.put_i16(1).await;
-                    let _ = ch_theta2_mot_stop.put_i16(1).await;
-                    let _ = ch_z_stop.put_i16(1).await;
+                    let _ = ch_theta_mot_stop.put_i16_process(1).await;
+                    let _ = ch_theta2_mot_stop.put_i16_process(1).await;
+                    let _ = ch_z_stop.put_i16_process(1).await;
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     break;
                 }

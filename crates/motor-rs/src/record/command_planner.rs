@@ -106,6 +106,25 @@ impl MotorRecord {
             self.ctrl.homr = false;
         }
 
+        // C's home/jog sections run before the tweak/val move blocks and
+        // act on latched button STATE every pass — evaluate latent
+        // buttons for the move-block srcs so a bare button put overtaken
+        // in last_write still fires here. The button srcs dispatch their
+        // own arms below; for the housekeeping srcs the arms must run
+        // unconditionally (see the latent-SPMG gate above).
+        if matches!(
+            src,
+            CommandSource::Val
+                | CommandSource::Dval
+                | CommandSource::Rval
+                | CommandSource::Rlv
+                | CommandSource::Twf
+                | CommandSource::Twr
+        ) && self.dispatch_latent_buttons(&mut effects)
+        {
+            return effects;
+        }
+
         match src {
             CommandSource::Val | CommandSource::Dval | CommandSource::Rval => {
                 // Check for retarget if motion is in progress
@@ -612,6 +631,94 @@ impl MotorRecord {
         });
     }
 
+    /// Whether the limit switch in the (user-direction-adjusted) home
+    /// direction blocks a home command. C's home-section entry gate and
+    /// start check (motorRecord.cc:2010-2013): HOMF blocked by HLS when
+    /// DIR=Pos, by LLS when DIR=Neg; HOMR mirrored.
+    fn home_blocked_by_limit(&self, forward: bool) -> bool {
+        if forward == (self.conv.dir == MotorDir::Pos) {
+            self.limits.hls
+        } else {
+            self.limits.lls
+        }
+    }
+
+    /// C do_work evaluates the latched HOMF/HOMR/JOGF/JOGR buttons by
+    /// STATE on every put-processing pass — home section
+    /// (motorRecord.cc:2010), jog start (2079), jog stop (2148) — before
+    /// the tweak/val move blocks, not by which field write triggered the
+    /// pass. The Rust dispatcher acts on `last_write`, so a bare button
+    /// put (dbPut, no process) overtaken in `last_write` by a later
+    /// write would otherwise stay latched and never fire. Called for the
+    /// move-block srcs before their own handling; returns true when a
+    /// button action consumed the pass (the C sections return OK, so the
+    /// position write that triggered the pass is overtaken).
+    fn dispatch_latent_buttons(&mut self, effects: &mut ProcessEffects) -> bool {
+        // Home (C 2010-2013): pure button-state gate per direction,
+        // skipping a direction already homing or blocked by its limit.
+        let homf_ready = self.ctrl.homf
+            && !self.stat.mip.contains(MipFlags::HOMF)
+            && !self.home_blocked_by_limit(true);
+        let homr_ready = self.ctrl.homr
+            && !self.stat.mip.contains(MipFlags::HOMR)
+            && !self.home_blocked_by_limit(false);
+        if homf_ready || homr_ready {
+            self.start_home(homf_ready, effects);
+            return true;
+        }
+
+        let jog_active = self
+            .stat
+            .mip
+            .intersects(MipFlags::JOGF | MipFlags::JOGR | MipFlags::JOG_BL1 | MipFlags::JOG_BL2);
+        // Jog start (C 2079): a latched button with no jog in flight.
+        // The hardware-limit check mirrors C special()'s MIP_JOG_REQ
+        // arming gate (3042-3053); on a blocked direction the button
+        // stays latched and the pass falls through, like C's home/jog
+        // gates failing into the move block. Soft-limit refusal happens
+        // inside start_jog like the C section body.
+        if !jog_active && (self.ctrl.jogf || self.ctrl.jogr) {
+            let forward = self.ctrl.jogf;
+            let dir = if forward {
+                MotionDirection::Positive
+            } else {
+                MotionDirection::Negative
+            };
+            if !self.is_blocked_by_hw_limit(dir) {
+                // epics-modules/motor #170 latest-wins, as in the
+                // Jogf/Jogr dispatch arm.
+                if forward {
+                    self.ctrl.jogr = false;
+                } else {
+                    self.ctrl.jogf = false;
+                }
+                self.start_jog(forward, effects);
+                return true;
+            }
+            return false;
+        }
+        // Jog stop (C 2148): a jog in flight whose button is no longer
+        // held. With the opposite button latched, stop and queue the
+        // reverse jog (start_jog's moving branch) like the dispatch
+        // arm's latest-wins path.
+        if self.stat.phase == MotionPhase::Jog {
+            let held = if self.stat.mip.contains(MipFlags::JOGF) {
+                self.ctrl.jogf
+            } else {
+                self.ctrl.jogr
+            };
+            if !held {
+                if self.ctrl.jogf || self.ctrl.jogr {
+                    self.start_jog(self.ctrl.jogf, effects);
+                } else {
+                    self.stop_jog(effects);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
     /// Start homing.
     fn start_home(&mut self, forward: bool, effects: &mut ProcessEffects) {
         // C: if motor is moving, stop first then queue home for after stop.
@@ -631,20 +738,7 @@ impl MotorRecord {
 
         // C: check limit switch in direction of home before starting
         // HOMF blocked by HLS (when DIR=Pos) or LLS (when DIR=Neg)
-        let blocked = if forward {
-            if self.conv.dir == MotorDir::Pos {
-                self.limits.hls
-            } else {
-                self.limits.lls
-            }
-        } else {
-            if self.conv.dir == MotorDir::Pos {
-                self.limits.lls
-            } else {
-                self.limits.hls
-            }
-        };
-        if blocked {
+        if self.home_blocked_by_limit(forward) {
             if forward {
                 self.ctrl.homf = false;
             } else {

@@ -1054,6 +1054,230 @@ fn test_queued_home_button_clears_at_home_completion() {
 }
 
 #[test]
+fn test_latent_homf_fires_on_move_block_pass() {
+    // A bare HOMF put overtaken in last_write must still fire: C's home
+    // section evaluates the latched button state on every do_work pass
+    // (motorRecord.cc:2010-2013) BEFORE the val move block, and returns
+    // — the position write is overtaken.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.ctrl.homf = true; // bare put, never dispatched
+
+    rec.pos.val = 30.0;
+    rec.pos.dval = 30.0;
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Home { forward: true, .. })),
+        "latent HOMF must fire the home"
+    );
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "home wins over the same-pass VAL write (C section order)"
+    );
+    assert_eq!(rec.stat.mip, MipFlags::HOMF);
+    assert!(!rec.ctrl.homf, "button pulses off when the home starts");
+    assert_eq!(rec.stat.phase, MotionPhase::Homing);
+}
+
+#[test]
+fn test_latent_homf_during_move_stops_and_queues_home() {
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.pos.dval = 50.0;
+    rec.plan_motion(CommandSource::Val);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    rec.ctrl.homf = true; // bare put while moving
+    rec.pos.val = 80.0;
+    rec.pos.dval = 80.0;
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Stop { .. })),
+        "stop first, home after (C home-section movn branch)"
+    );
+    assert!(matches!(
+        rec.internal.queued_motion,
+        Some(QueuedMotion::Home { forward: true })
+    ));
+    assert_eq!(rec.stat.mip, MipFlags::STOP);
+}
+
+#[test]
+fn test_latent_jogf_fires_on_move_block_pass() {
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.ctrl.jogf = true; // bare put, never dispatched
+
+    rec.pos.val = 30.0;
+    rec.pos.dval = 30.0;
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(
+        effects.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveVelocity {
+                direction: true,
+                ..
+            }
+        )),
+        "latent JOGF must start the jog (C jog section, 2079)"
+    );
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "jog wins over the same-pass VAL write"
+    );
+    assert_eq!(rec.stat.mip, MipFlags::JOGF);
+}
+
+#[test]
+fn test_latent_jog_release_stops_jog() {
+    // A bare JOGF=0 put (button released) overtaken in last_write must
+    // still stop the jog: C's jog-stop section (2148) fires on state.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.ctrl.jogf = true;
+    rec.plan_motion(CommandSource::Jogf);
+    assert_eq!(rec.stat.phase, MotionPhase::Jog);
+
+    rec.ctrl.jogf = false; // bare release
+    rec.pos.val = 30.0;
+    rec.pos.dval = 30.0;
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Stop { .. })),
+        "latent release must stop the jog"
+    );
+    assert!(rec.stat.mip.contains(MipFlags::JOG_STOP));
+    assert_eq!(rec.stat.phase, MotionPhase::JogStopping);
+}
+
+#[test]
+fn test_latent_opposite_jog_stops_and_queues_reverse() {
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.ctrl.jogf = true;
+    rec.plan_motion(CommandSource::Jogf);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    // Bare puts: release JOGF, press JOGR.
+    rec.ctrl.jogf = false;
+    rec.ctrl.jogr = true;
+    rec.pos.val = 30.0;
+    rec.pos.dval = 30.0;
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Stop { .. })),
+        "reversal stops the forward jog first"
+    );
+    assert!(matches!(
+        rec.internal.queued_motion,
+        Some(QueuedMotion::Jog { forward: false })
+    ));
+}
+
+#[test]
+fn test_latent_home_blocked_by_limit_falls_through_to_val() {
+    // C's home gate includes the direction's limit switch (2010-2013):
+    // with HLS active the HOMF clause fails and the pass falls through
+    // to the move block — the VAL write must proceed.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.ctrl.homf = true;
+    rec.limits.hls = true;
+
+    rec.pos.val = -30.0;
+    rec.pos.dval = -30.0;
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Home { .. })),
+        "blocked home direction must not fire"
+    );
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "the VAL write proceeds like C's gate failing into the move block"
+    );
+}
+
+#[test]
+fn test_held_jog_button_does_not_refire_during_own_jog() {
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.ctrl.jogf = true;
+    rec.plan_motion(CommandSource::Jogf);
+    assert_eq!(rec.stat.phase, MotionPhase::Jog);
+
+    // VAL write while the jog button is still held: no second jog
+    // command, no jog stop, and the position write is ignored while
+    // jogging (pre-existing retarget semantics).
+    rec.pos.val = 30.0;
+    rec.pos.dval = 30.0;
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(effects.commands.is_empty());
+    assert_eq!(rec.stat.phase, MotionPhase::Jog);
+    assert!(rec.stat.mip.contains(MipFlags::JOGF));
+}
+
+#[test]
+fn test_latent_home_wins_over_latent_jog() {
+    // C section order: the home section (2010) runs before the jog
+    // section (2079) — with both buttons latched, home fires.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.ctrl.homf = true;
+    rec.ctrl.jogf = true;
+
+    rec.pos.val = 30.0;
+    rec.pos.dval = 30.0;
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Home { .. })),
+        "home outranks jog (C do_work order)"
+    );
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. }))
+    );
+}
+
+#[test]
 fn test_latent_spmg_stop_halts_in_flight_motion() {
     // A bare SPMG=Stop put (dbPut, no process) overtaken in last_write
     // by a VAL write must still halt the axis on that pass — C compares

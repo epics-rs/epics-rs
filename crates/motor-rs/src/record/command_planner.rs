@@ -11,22 +11,60 @@ impl MotorRecord {
         self.internal.dmov_notified = false;
         let mut effects = ProcessEffects::default();
 
-        // C do_work evaluates `pmr->stop` at the TOP of every
-        // put-processing pass, before any other work (motorRecord.cc
-        // ~1860). A latent stop — a bare dbPut that never processed the
-        // record, later overtaken in `last_write` by another field's
-        // write — therefore wins over whatever src triggered this pass.
-        // The overtaken position write is not replayed: C discards it at
-        // stop completion via the `(val != lval) && !(mip & MIP_STOP)`
-        // gate (motorRecord.cc:1385) followed by the postProcess
-        // VAL<-RBV sync, which the Rust stop-completion path mirrors.
-        // (The C top block also covers SPMG changes; a latent SPMG mode
-        // already refuses new motions through can_accept_command below,
-        // and its Go branch falls through in C rather than returning, so
-        // it is not redirected here.)
+        // C do_work evaluates `pmr->stop` and `spmg != lspg` at the TOP
+        // of every put-processing pass, before any other work
+        // (motorRecord.cc:1855-1932). A latent stop or SPMG change — a
+        // bare dbPut that never processed the record, later overtaken in
+        // `last_write` by another field's write — therefore wins over
+        // whatever src triggered this pass. The overtaken position write
+        // is not replayed: C discards it at stop completion via the
+        // `(val != lval) && !(mip & MIP_STOP)` gate (motorRecord.cc:1385)
+        // followed by the postProcess VAL<-RBV sync, which the Rust
+        // stop-completion path mirrors.
+        //
+        // When a stop pulse rides the same pass as an SPMG change, C
+        // consumes both at once (1858: lspg <- spmg right before the stop
+        // branch) — sync LSPG whenever this pass takes a stop path, so an
+        // overtaken Pause→Go is not replayed as a resume on a later pass.
+        // (This includes src == Spmg with a latent stop: the stop gate
+        // below wins the pass and the Spmg arm never runs, like C's
+        // stop_or_pause return skipping the Go branch.)
+        if self.ctrl.spmg != self.internal.lspg && (self.ctrl.stop || src == CommandSource::Stop) {
+            self.internal.lspg = self.ctrl.spmg;
+        }
         if self.ctrl.stop && src != CommandSource::Stop {
             self.handle_stop(&mut effects);
             return effects;
+        }
+
+        // Latent SPMG change with no stop pulse: run the C top block's
+        // SPMG handling now. Stop/Pause halt the axis and return like C;
+        // a Go/Move transition falls through to normal dispatch (C falls
+        // through to the rest of do_work) unless the transition itself
+        // resumed motion — that resume already targets the freshest DVAL,
+        // so dispatching src as well would double-plan. For the
+        // housekeeping srcs (Sync/Set/Cnen/PcoEnable) the gate defers to
+        // the next pass instead: their arms map to C special()-time
+        // actions that precede do_work, and a Go-resume must not swallow
+        // or reorder them.
+        if self.ctrl.spmg != self.internal.lspg && src != CommandSource::Spmg {
+            match src {
+                CommandSource::Sync
+                | CommandSource::Set
+                | CommandSource::Cnen
+                | CommandSource::PcoEnable => {}
+                _ => {
+                    self.handle_spmg_change(&mut effects);
+                    match self.ctrl.spmg {
+                        SpmgMode::Stop | SpmgMode::Pause => return effects,
+                        SpmgMode::Go | SpmgMode::Move => {
+                            if !effects.commands.is_empty() {
+                                return effects;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // SPMG, STOP, and SYNC always processed regardless of command gate

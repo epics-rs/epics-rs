@@ -1054,6 +1054,184 @@ fn test_queued_home_button_clears_at_home_completion() {
 }
 
 #[test]
+fn test_latent_spmg_stop_halts_in_flight_motion() {
+    // A bare SPMG=Stop put (dbPut, no process) overtaken in last_write
+    // by a VAL write must still halt the axis on that pass — C compares
+    // SPMG to LSPG by state at the top of every do_work pass
+    // (motorRecord.cc:1855-1932) and returns, discarding the position
+    // write.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.pos.dval = 50.0;
+    rec.plan_motion(CommandSource::Val);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    // Bare SPMG=Stop, then a processed VAL write wins last_write.
+    rec.ctrl.spmg = SpmgMode::Stop;
+    rec.pos.val = 80.0;
+    rec.pos.dval = 80.0;
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Stop { .. })),
+        "latent SPMG=Stop must halt the in-flight motion"
+    );
+    assert!(
+        !effects.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveAbsolute { .. } | MotorCommand::MoveRelative { .. }
+        )),
+        "the overtaken VAL write must not start a move"
+    );
+    assert_eq!(rec.stat.mip, MipFlags::STOP);
+    assert_eq!(rec.internal.lspg, SpmgMode::Stop, "LSPG synced like C 1858");
+}
+
+#[test]
+fn test_latent_spmg_pause_halts_in_flight_motion() {
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.pos.dval = 50.0;
+    rec.plan_motion(CommandSource::Val);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.pos.val = 80.0;
+    rec.pos.dval = 80.0;
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Stop { .. })),
+        "latent SPMG=Pause must halt the in-flight motion"
+    );
+    assert!(!effects.commands.iter().any(|c| matches!(
+        c,
+        MotorCommand::MoveAbsolute { .. } | MotorCommand::MoveRelative { .. }
+    )));
+    assert!(rec.stat.mip.contains(MipFlags::STOP));
+    // Pause preserves the drive fields for a Go resume.
+    assert_eq!(rec.pos.dval, 80.0);
+}
+
+#[test]
+fn test_latent_spmg_go_resumes_without_double_plan() {
+    // Paused with an unreached target; a bare SPMG=Go put overtaken by a
+    // VAL write. The latent Go's resume already targets the freshest
+    // DVAL, so the pass must emit exactly one move.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.conv.mres = 0.01;
+    rec.internal.lspg = SpmgMode::Pause;
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.pos.drbv = 25.0;
+    rec.pos.rbv = 25.0;
+
+    // Bare Go + processed VAL=80 in the same pass.
+    rec.ctrl.spmg = SpmgMode::Go;
+    rec.pos.val = 80.0;
+    rec.pos.dval = 80.0;
+    let effects = rec.plan_motion(CommandSource::Val);
+    let moves: Vec<_> = effects
+        .commands
+        .iter()
+        .filter(|c| {
+            matches!(
+                c,
+                MotorCommand::MoveAbsolute { .. } | MotorCommand::MoveRelative { .. }
+            )
+        })
+        .collect();
+    assert_eq!(moves.len(), 1, "exactly one move — no double plan");
+    assert!(
+        matches!(moves[0], MotorCommand::MoveAbsolute { position, .. } if (position - 80.0).abs() < 1e-9),
+        "the resume targets the freshest DVAL, got {:?}",
+        moves[0]
+    );
+    assert_eq!(rec.internal.lspg, SpmgMode::Go);
+}
+
+#[test]
+fn test_latent_spmg_go_without_resume_falls_through_to_src() {
+    // A latent Stop→Go transition has nothing to resume (C only re-arms
+    // from Pause); the pass falls through to normal dispatch like C's
+    // Go branch falling through to the rest of do_work.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.conv.mres = 0.01;
+    rec.internal.lspg = SpmgMode::Stop;
+    rec.ctrl.spmg = SpmgMode::Go;
+    rec.pos.val = 30.0;
+    rec.pos.dval = 30.0;
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "the VAL write dispatches normally after the consumed Go"
+    );
+    assert_eq!(rec.internal.lspg, SpmgMode::Go);
+}
+
+#[test]
+fn test_latent_stop_consumes_latent_spmg_go() {
+    // A latent stop pulse and a latent Pause→Go in the same pass: C
+    // consumes both at once (1858: lspg <- spmg before the stop branch),
+    // so the Go must not be replayed as a resume on a later pass.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.conv.mres = 0.01;
+    rec.internal.lspg = SpmgMode::Pause;
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.pos.drbv = 25.0;
+    rec.pos.rbv = 25.0;
+    rec.pos.val = 80.0;
+    rec.pos.dval = 80.0;
+
+    // Both bare: stop pulse + Go, then a TWF write processes the record.
+    rec.ctrl.stop = true;
+    rec.ctrl.spmg = SpmgMode::Go;
+    rec.ctrl.twf = true;
+    let effects = rec.plan_motion(CommandSource::Twf);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Stop { .. })),
+        "the latent stop wins the pass"
+    );
+    assert_eq!(rec.internal.lspg, SpmgMode::Go, "Go consumed with the stop");
+
+    // A later pass dispatches normally: a replayed Go-resume would win
+    // the pass (swallowing the tweak) and target the stale 80.
+    rec.ctrl.twv = 5.0;
+    rec.ctrl.twf = true;
+    let effects = rec.plan_motion(CommandSource::Twf);
+    assert!(
+        !rec.ctrl.twf,
+        "tweak dispatched, not swallowed by a replayed Go"
+    );
+    assert!(
+        effects.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveAbsolute { position, .. } if (position - 85.0).abs() < 1e-9
+        )),
+        "the tweak targets VAL+TWV=85; a replayed Go would have targeted 80"
+    );
+}
+
+#[test]
 fn test_stop_field_clears_latched_buttons_while_moving() {
     // C 1891-1893: the stop-while-moving branch calls clear_buttons() —
     // a latched jog/home button must not survive an explicit stop and

@@ -378,14 +378,28 @@ fn dly_delays_final_dmov_assertion() {
 #[test]
 fn spmg_stop_blocks_new_commands() {
     let mut rec = make_record();
+    // Bare SPMG=Stop (lspg still Go): the next pass runs the C top block
+    // — STOP_AXIS goes out "just in case" and the position write is
+    // discarded (motorRecord.cc:1871-1911).
     rec.ctrl.spmg = SpmgMode::Stop;
 
     rec.pos.dval = 50.0;
     let effects = rec.plan_motion(CommandSource::Val);
 
-    // Should be blocked
-    assert!(effects.commands.is_empty());
+    assert!(
+        !effects.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveAbsolute { .. } | MotorCommand::MoveRelative { .. }
+        )),
+        "no move under SPMG=Stop"
+    );
+    assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
     assert!(rec.stat.dmov);
+    assert_eq!(rec.internal.lspg, SpmgMode::Stop);
+
+    // With LSPG synced, a further write is refused outright.
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(effects.commands.is_empty());
 }
 
 #[test]

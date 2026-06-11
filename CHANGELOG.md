@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.19.1 — 2026-06-11
+
+Patch release fixing cross-platform builds. `v0.19.0` did not compile on
+Windows: the wildcard UDP collector's original-destination recovery in
+`epics-pva-rs` referenced the `libc` crate (a `cfg(unix)`-only
+dependency) without `#[cfg(unix)]` gating, so a Windows build failed with
+`error[E0433]: failed to resolve: use of unresolved module or unlinked
+crate 'libc'`. No API changes; Unix behavior is identical to `v0.19.0`
+and consumer code builds unchanged.
+
+- Gate the Unix-only UDP orig-dest recovery path behind `#[cfg(unix)]`
+  with non-Unix fallbacks, fixing the Windows build break.
+- Recover each datagram's original destination on Windows via the
+  Winsock `WSARecvMsg` extension function plus `IP_PKTINFO`/
+  `IPV6_PKTINFO`, mirroring the Unix `recvmsg`/cmsg path (pvxs
+  `os/WIN32/osdSockExt.cpp` parity).
+- Select the v4 orig-dest socket option by IP-stack family
+  (`linux`/`android` → `IP_PKTINFO`; the BSD/Apple family, including the
+  `IP_PKTINFO`-less freebsd/openbsd/dragonfly → `IP_RECVDSTADDR`)
+  instead of a `linux`/`not(linux)` split, fixing an `android` build
+  break where `libc::IP_RECVDSTADDR` is undefined.
+- `epics-bridge-rs`: gate a Unix-only `GatewayCommand` import behind
+  `#[cfg(unix)]` to silence a Windows-only unused-import warning.
+- CI: add a cross-platform build matrix (macOS / Linux / Windows ×
+  arm64 / x86_64) that builds and tests the whole workspace per cell.
+
 ## v0.19.0 — 2026-06-11
 
 A large C/C++ parity-hardening release: 761 commits since `v0.18.6`

@@ -40,21 +40,21 @@ epics-rs reimplements the core components of C/C++ EPICS in Rust:
 
 ## Installation
 
-**Current release: v0.18.0** — codebase-hardening rollup of the
-`v0.17.1` C-parity hardening pass (eleven review rounds, 126
-commits across `epics-base-rs`, `epics-ca-rs`, `epics-pva-rs`,
-`epics-bridge-rs`, `asyn-rs`, `ad-core-rs`, `ad-plugins-rs`,
-`motor-rs`, `scaler-rs`, `std-rs`, `mqtt-rs`) + `v0.17.2`
-areaDetector static-RBV constructor fix + the new
-`epics-modbus-rs` crate (Modbus TCP/RTU/ASCII driver) + post-tag
-modbus array-length clamp fixes. See
+**Current release: v0.19.0** — a large C/C++ parity-hardening release:
+761 commits since `v0.18.6` (~557 parity fixes + ~66 additive features)
+across the native PVA protocol, the QSRV/bridge gateway and pvalink, CA,
+asyn, and base/db — including sseq/PACT async records, DBF link-class
+typing, the CA/PVA gateways, and a CA-facility-only iocInit external-link
+wait. Versioned as a minor bump for its breadth and source-facing
+trait-contract refinements (e.g. `ChannelSource`); source/driver authors
+implementing those traits should review them before upgrading. See
 [`CHANGELOG.md`](./CHANGELOG.md) for the full audit trail.
 
 All crates are published on [crates.io](https://crates.io/crates/epics-rs). Add `epics-rs` with the feature flags you need:
 
 ```toml
 [dependencies]
-epics-rs = { version = "0.18", features = ["ad"] }
+epics-rs = { version = "0.19", features = ["ad"] }
 ```
 
 This single dependency pulls in everything needed. In your code:
@@ -85,18 +85,18 @@ use epics_rs::asyn;        // port driver framework
 | `optics` | Optics (table, monochromator, slit, filter, BPM) | no |
 | `full` | Everything above | no |
 
-> The `mqtt` driver is not surfaced through the umbrella crate. Depend on `mqtt-rs = "0.18"` directly when needed.
+> The `mqtt` driver is not surfaced through the umbrella crate. Depend on `mqtt-rs = "0.19"` directly when needed.
 >
 > The Modbus driver is not surfaced through the umbrella crate either.
-> Depend on `epics-modbus-rs = "0.18"` directly when needed; the Rust
+> Depend on `epics-modbus-rs = "0.19"` directly when needed; the Rust
 > library name is `modbus_rs`, so consumers write `use modbus_rs::...`.
 
 ```toml
 # Motor + areaDetector
-epics-rs = { version = "0.18", features = ["motor", "ad"] }
+epics-rs = { version = "0.19", features = ["motor", "ad"] }
 
 # Everything
-epics-rs = { version = "0.18", features = ["full"] }
+epics-rs = { version = "0.19", features = ["full"] }
 ```
 
 ### Individual Crates
@@ -105,8 +105,8 @@ You can also depend on sub-crates directly if you only need specific functionali
 
 ```toml
 [dependencies]
-ad-plugins-rs = "0.18"  # just the areaDetector plugins
-epics-base-rs = "0.18"  # just the IOC runtime
+ad-plugins-rs = "0.19"  # just the areaDetector plugins
+epics-base-rs = "0.19"  # just the IOC runtime
 ```
 
 ## Workspace Structure
@@ -358,11 +358,11 @@ either way.
 ```toml
 [dependencies]
 # Client + server, both protocols (recommended for new projects):
-epics-rs = { version = "0.18", features = ["pva"] }   # ca enabled by default
+epics-rs = { version = "0.19", features = ["pva"] }   # ca enabled by default
 
 # Or per-protocol, no umbrella:
-epics-ca-rs  = "0.18"
-epics-pva-rs = "0.18"
+epics-ca-rs  = "0.19"
+epics-pva-rs = "0.19"
 ```
 
 Standard EPICS environment variables (`EPICS_CA_ADDR_LIST` /

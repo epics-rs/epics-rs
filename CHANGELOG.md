@@ -1,5 +1,84 @@
 # Changelog
 
+## v0.19.0 — 2026-06-11
+
+A large C/C++ parity-hardening release: 761 commits since `v0.18.6`
+(integration merges included), dominated by ~557 parity/bug fixes across
+the native PVA protocol, the QSRV/bridge gateway and pvalink, CA, asyn,
+and base/db, plus ~66 additive features.
+
+Versioned as a minor (`0.19.0`) bump given the breadth of the change,
+which includes source-facing trait-contract refinements (e.g. the
+`ChannelSource` cluster) accumulated since `v0.18.6`. No commit in the
+range carries an explicit breaking-change marker (`feat!`/`fix!`), but
+external source/driver authors implementing the affected traits should
+review those surfaces before upgrading; consumer code that only uses the
+client/server/IOC APIs is expected to build unchanged.
+
+### Native PVA protocol (epics-pva-rs)
+
+- Typed multi-field PUT path (`PutLeaf`, no stringify); GET-with-request-
+  value client API; `ChannelArray` (cmd 14) operation surface; `PUT_GET`
+  `getGet`/`getPut` subcommands gated behind a `serve_put_get` capability.
+- pvRequest: typed record options + a `RawPvRequest` escape hatch;
+  effective `Config` with `expand()`; per-client UDP `SEARCH` config; a
+  core wildcard UDP collector with orig-dest fanout; requester endpoint
+  in `SEARCH` advertisements.
+- CLI: `pvget`/`pvmonitor` `Value::format()` `-F tree|delta` and `-#`
+  array-limit; `pvput` JSON-value args, NTEnum-by-label, and the legacy
+  positional bare-token array form; `pvinfo -D` effective-config report;
+  default NTTable rendering via Base `printTable` parity.
+- Monitor overrun carried through coalesce into the wire bitset; a
+  periodic client channel-cache cleaner.
+
+### QSRV / bridge (epics-bridge-rs)
+
+- pvalink folded into the `qsrv` feature (default-on PVA links); pvalink
+  is NOT held by the iocInit external-link wait (pvxs parity — it opens
+  in the background); pvxs async shared-channel owner for OUT links;
+  alarm split into an ungated snapshot + a gated contribution; remote
+  `timeStamp.userTag` adopted on `time=true` links.
+- QSRV: group loading wired into the IOC startup lifecycle; `asTrapWrite`
+  put-logging on every PUT via `WriteGrant`; EPICS `$` long-string field
+  modifier; pvxs-compatible `pvxsl`/`pvxgl` diagnostics; `DbSubscription`s
+  gated on PVA monitor `START`/`STOP` (onStart parity).
+- CA/PVA gateways: ACF/access enforcement; no-cache forwarding modes;
+  C-compatible report files + split downstream/upstream routing and
+  cache-timeout knobs; procfs-derived load/CPU and event/post-rate stats;
+  control PVs for caput-triggered commands.
+
+### base / db / records (epics-base-rs)
+
+- DBF link-class types + a canonical per-field link classifier; a unified
+  `macLib` expander (full macro language in autosave); shadowed
+  `DBR_GR`/`DBR_CTRL` metadata + `DBE_PROPERTY` on `ProcessVariable`.
+- sseq driven as a per-step async PACT machine with concurrent `WAITn`
+  put-callbacks; a PACT async-record re-entry primitive; live
+  `DOL`/`LNK`/`checkLinks` diagnostics.
+- calcout link-status menus (`INAV`..`OUTV`); simulation blocks for
+  `mbbo`/`histogram`/`waveform`/`aai`/`aao`; `lsi`/`lso` `MPST`/`APST`
+  menuPost fields.
+- iocInit external-link wait gated to the CA facility's local-target
+  links (C `dbCaRun`/`dbLink.c` parity) — non-local CA links and
+  `pva://` links no longer block startup; `DBF_USHORT`/`DBF_ULONG` are
+  first-class field types (signed-literal `strtoul` parity).
+
+### CA (epics-ca-rs) / asyn (asyn-rs) / drivers
+
+- CA: cumulative subscription event posted/processed counters; gateway
+  `serverEventRate`/`serverPostRate` from downstream `CaServer` stats.
+- asyn: default port trace mask is `ERROR` only (C `asynManager.c`
+  parity); immediate trace-readback posts on a trace change; abort an
+  in-flight async request on `AQR`; off-scan-thread `performIO` on
+  `can_block` ports.
+- ad-core: ProcessPlugin "no input array cached" warning gated behind the
+  asyn `WARNING` trace mask; `DBF_USHORT`/`DBF_ULONG` → `NDAttr` mapping.
+  motor: `DOL`/`RDBL`/`RLNK` link wiring. procserv: read-only log/viewer
+  port (`-l`/`--logport`, `--restrict`) and `-F`/`--timefmt` banner.
+
+See the `git log v0.18.6..v0.18.7` history for the full per-commit audit
+trail.
+
 ## v0.18.6 — 2026-05-27
 
 A parity-hardening release. Multiple rounds of C/C++ parity audit against

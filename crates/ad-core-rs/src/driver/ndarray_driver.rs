@@ -939,8 +939,13 @@ mod tests {
     #[test]
     fn test_check_path_exists() {
         let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        // The platform temp dir exists on every OS; a hard-coded `/tmp`
+        // does not exist on Windows, so `check_path`'s `is_dir()` reported
+        // it missing and the assertion failed there. Mirrors the
+        // `std::env::temp_dir()` already used by `test_create_file_path_recursive`.
+        let tmp = std::env::temp_dir();
         drv.port_base
-            .set_string_param(drv.params.file_path, 0, "/tmp".into())
+            .set_string_param(drv.params.file_path, 0, tmp.to_string_lossy().into_owned())
             .unwrap();
         assert!(drv.check_path().unwrap());
     }

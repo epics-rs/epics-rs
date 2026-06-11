@@ -224,9 +224,14 @@ impl CircuitBreakerRegistry {
                 // Already open — failures while OPEN are external noise.
             }
             BreakerState::Closed => {
-                // Drop entries older than the rolling window.
-                let cutoff = now - self.config.window;
-                breaker.failures.retain(|t| *t >= cutoff);
+                // Drop entries older than the rolling window. Measure age
+                // forward (`now - t`) rather than a `now - window` cutoff:
+                // subtracting a Duration from an Instant panics on Windows
+                // (QPC-since-boot) when machine uptime is shorter than the
+                // window, e.g. a failure recorded within `window` of boot.
+                breaker
+                    .failures
+                    .retain(|t| now.saturating_duration_since(*t) <= self.config.window);
                 breaker.failures.push(now);
                 if breaker.failures.len() >= self.config.failure_threshold {
                     breaker.cooldown_until = Some(now + breaker.current_cooldown);

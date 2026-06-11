@@ -795,8 +795,12 @@ impl UdpRateLimiter {
         // Periodic GC: prune stale entries every 1024 packets to keep
         // the map bounded under DDoS conditions where sources rotate.
         if counts.len() > 4096 {
-            let cutoff = now - std::time::Duration::from_secs(5);
-            counts.retain(|_, (t, _)| *t >= cutoff);
+            // Age forward (`now - t`) rather than a `now - 5s` cutoff:
+            // subtracting a Duration from an Instant panics on Windows
+            // (QPC-since-boot) when machine uptime is shorter than 5s.
+            counts.retain(|_, (t, _)| {
+                now.saturating_duration_since(*t) <= std::time::Duration::from_secs(5)
+            });
         }
         true
     }

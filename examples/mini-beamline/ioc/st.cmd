@@ -44,10 +44,17 @@ dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=slit:mtr,PORT=slit_mtr")
 dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dot:mtrx,PORT=dot_mtrx,VELO=500,ACCL=0.1,HLM=500,LLM=-500")
 dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dot:mtry,PORT=dot_mtry,VELO=500,ACCL=0.1,HLM=500,LLM=-500")
 
-# Load DCM motors and sequencer database
-dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dcm:theta,PORT=dcm_theta")
-dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dcm:y,PORT=dcm_y")
-dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dcm:z,PORT=dcm_z")
+# Load DCM motors and sequencer database.
+# VELO/ACCL are set so coordinated moves (KohzuSpeedCtrl=Enable) complete in
+# a few seconds. The Kohzu speed coordination scales every motor's VELO so all
+# finish together, pacing the fastest axes to the slowest. Z travels the most
+# (zMotDesired = yOffset/sin(theta), up to ~200mm over the 5-20 keV range), so
+# at the motor.template default VELO it dominates the coordinated time and drags
+# Theta down to a crawl (~0.04 deg/s) — the move looks frozen. Give Z the
+# highest velocity so its travel time, not Theta's, sets a sane move duration.
+dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dcm:theta,PORT=dcm_theta,VELO=5,ACCL=0.2")
+dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dcm:y,PORT=dcm_y,VELO=10,ACCL=0.2")
+dbLoadRecords("$(MOTOR)/motor.template", "P=$(PREFIX),M=dcm:z,PORT=dcm_z,VELO=50,ACCL=0.2")
 # Widen DCM Z soft limits for full energy range (5-20 keV needs Z up to ~200mm)
 dbpf("$(PREFIX)dcm:z.DHLM", "250")
 dbpf("$(PREFIX)dcm:z.DLLM", "-250")

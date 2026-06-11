@@ -1470,20 +1470,21 @@ impl LinkSet for PvaLinkResolver {
     }
 
     fn link_names(&self) -> Vec<String> {
-        // surface one identity per opened INP monitor variant so the
-        // base iocInit external-link wait
-        // (`PvDatabase::wait_for_external_links`) waits for every
-        // pvalink monitor to connect, exactly as CA links already do.
+        // The [`LinkSet::link_names`] enumeration contract: surface one
+        // identity per opened INP monitor variant, for link introspection.
+        // NOT consumed by the iocInit external-link wait — that wait is
+        // CA-facility only (`PvDatabase::external_link_targets` looks up
+        // the `"ca"` set alone), and pvalink never blocks iocInit (pvxs
+        // parity). A `pva://` monitor connects in the background.
         //
         // Each name is a canonical link string that round-trips back to
-        // the same `(pv_name, pipeline, queue_size)` variant when base
-        // hands it to `is_connected(name)`: a bare PV name for the
-        // default variant, or `PV?pipeline=…&Q=…` for a non-default one.
-        // Two records on the same PV with different `Q` / `pipeline`
-        // therefore each get their own wait entry, and the per-name
-        // `is_connected` query lands on that record's own monitor.
-        // OUT links are excluded: they
-        // install no monitor and have no connection signal to report.
+        // the same `(pv_name, pipeline, queue_size)` variant when fed to
+        // `is_connected(name)`: a bare PV name for the default variant, or
+        // `PV?pipeline=…&Q=…` for a non-default one. Two records on the
+        // same PV with different `Q` / `pipeline` therefore each get their
+        // own identity, and the per-name `is_connected` query lands on
+        // that record's own monitor. OUT links are excluded: they install
+        // no monitor and have no connection signal to report.
         let default_q = PvaLinkConfig::defaults_for("", LinkDirection::Inp).queue_size;
         self.registry
             .inp_identities()
@@ -2831,13 +2832,13 @@ mod tests {
         assert_eq!(resolver.inp_cfg_for("UNSEEN").sevr, SevrMode::Nms);
     }
 
-    /// `LinkSet::link_names()` must surface the opened
-    /// INP upstream PV names so the base iocInit external-link wait can
-    /// poll `is_connected(name)` for each. Pre-fix it returned an empty
-    /// `Vec`, so pvalinks never participated in the wait. The names it
-    /// returns must land on the right link when fed back through
-    /// `is_connected` (the wait's companion query); OUT links are
-    /// excluded (no monitor connection signal).
+    /// `LinkSet::link_names()` must surface the opened INP upstream PV
+    /// names (the lset enumeration contract), each landing on the right
+    /// link when fed back through its `is_connected` companion query; OUT
+    /// links are excluded (no monitor connection signal). These names are
+    /// NOT consumed by the iocInit wait — that is CA-facility only and
+    /// pvalink never blocks init (pvxs parity) — but the round-trip
+    /// `link_names → is_connected` identity contract still holds.
     #[tokio::test]
     async fn fr15_link_names_reports_opened_inp_pvs_queryable_by_is_connected() {
         let resolver = PvaLinkResolver::new(tokio::runtime::Handle::current());
@@ -2868,11 +2869,11 @@ mod tests {
         assert_eq!(
             names,
             vec!["FR15:CONNECTED".to_string(), "FR15:PENDING".to_string()],
-            "wait set = opened INP PV names; OUT excluded"
+            "opened INP PV names; OUT excluded"
         );
 
-        // Each returned name is queryable via is_connected — the exact
-        // query the base wait runs per name.
+        // Each returned name is queryable via is_connected — the
+        // round-trip identity the enumeration contract guarantees.
         assert!(
             LinkSet::is_connected(&resolver, "FR15:CONNECTED"),
             "cached INP link reports connected"

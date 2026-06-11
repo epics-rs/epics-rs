@@ -324,21 +324,23 @@ impl PvaLinkRegistry {
     /// Distinct monitor-variant identities `(pv_name, pipeline,
     /// queue_size)` of every opened INP link, sorted for a stable order.
     ///
-    /// The base iocInit external-link wait
-    /// (`PvDatabase::wait_for_external_links`) drives off
-    /// `LinkSet::link_names()` and then queries `is_connected(name)` for
-    /// each. Only INP links carry a monitor connection signal — OUT
-    /// links install no monitor — so OUT keys are excluded here.
+    /// Backs [`PvaLinkResolver::link_names`] (the `LinkSet` enumeration
+    /// contract): each identity round-trips to an `is_connected(name)`
+    /// query that lands on that variant's own monitor. Only INP links
+    /// carry a monitor connection signal — OUT links install no monitor —
+    /// so OUT keys are excluded here. (This enumeration is not consumed by
+    /// the iocInit wait: that is CA-facility only and pvalink never blocks
+    /// init — pvxs parity.)
     ///
     /// Two INP links to the same upstream PV with different `pipeline` /
-    /// `queue_size` are DISTINCT monitor variants (distinct
-    /// subscriptions in pvxs, `pvxs/ioc/pvalink.h:115-120`), so each is
-    /// reported separately: the wait must confirm every variant's own
-    /// monitor connected, not just the first to share the PV name. Links
-    /// that share the exact `(pv_name, pipeline, queue_size)` variant
-    /// (differing only in `field` / `sevr`, which the registry folds
-    /// onto one entry) collapse to a single identity, matching the one
-    /// shared subscription that actually backs them.
+    /// `queue_size` are DISTINCT monitor variants (distinct subscriptions
+    /// in pvxs, `pvxs/ioc/pvalink.h:115-120`), so each is reported
+    /// separately: a per-variant `is_connected` must land on that
+    /// variant's own monitor, not just the first to share the PV name.
+    /// Links that share the exact `(pv_name, pipeline, queue_size)`
+    /// variant (differing only in `field` / `sevr`, which the registry
+    /// folds onto one entry) collapse to a single identity, matching the
+    /// one shared subscription that actually backs them.
     pub fn inp_identities(&self) -> Vec<(String, bool, usize)> {
         let mut ids: Vec<(String, bool, usize)> = self
             .map
@@ -431,19 +433,19 @@ mod tests {
         assert_eq!(reg.len(), 0);
     }
 
-    /// `inp_identities` feeds the base iocInit external-link wait. It
-    /// must (a) report each DISTINCT INP monitor variant — two links to
-    /// the same upstream PV with different `queue_size` / `pipeline` are
-    /// distinct subscriptions and each must be waited on independently;
-    /// (b) collapse links that share the exact `(pv, pipeline, Q)`
-    /// variant (the registry already folds `field`/`sevr` differences
-    /// onto one entry); and (c) exclude OUT links (no monitor signal).
+    /// `inp_identities` backs `link_names` (the lset enumeration
+    /// contract). It must (a) report each DISTINCT INP monitor variant —
+    /// two links to the same upstream PV with different `queue_size` /
+    /// `pipeline` are distinct subscriptions and each must surface its own
+    /// identity so a per-variant `is_connected` lands correctly;
+    /// (b) collapse links that share the exact `(pv, pipeline, Q)` variant
+    /// (the registry already folds `field`/`sevr` differences onto one
+    /// entry); and (c) exclude OUT links (no monitor signal).
     /// `insert_for_test` seeds links without a PVA server.
     ///
-    /// Pre-fix this deduped by bare PV name,
-    /// collapsing the `Q=1` and `Q=8` variants of `A:PV` into one wait
-    /// entry — so a record could begin processing before its own
-    /// monitor variant connected.
+    /// Pre-fix this deduped by bare PV name, collapsing the `Q=1` and
+    /// `Q=8` variants of `A:PV` into one identity — so an `is_connected`
+    /// query could land on the wrong variant's monitor.
     #[tokio::test]
     async fn fr15_inp_identities_separate_variants_and_exclude_out() {
         let reg = PvaLinkRegistry::new();

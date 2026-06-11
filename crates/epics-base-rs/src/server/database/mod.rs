@@ -590,21 +590,24 @@ impl PvDatabase {
         s
     }
 
-    /// Wait for every PV opened by every registered [`LinkSet`] to
-    /// report `is_connected() == true`. Mirrors `dbCa: iocInit wait
-    /// for local CA links to connect` (epics-base PR #768/#856).
+    /// Wait for the CA links to local records to report
+    /// `is_connected() == true`. Mirrors `dbCa: iocInit wait for local CA
+    /// links to connect` (epics-base PR #768/#856). The working set is
+    /// exactly [`Self::external_link_targets`]: only the CA facility's
+    /// local-target links — `pva://` links and non-local CA links connect
+    /// in the background and are never waited on (pvxs parity).
     ///
     /// Polls every 100 ms. Returns:
     /// * `Ok(connected_count)` — the number of links that ended up
-    ///   connected. May be smaller than the registered total when
-    ///   the timeout expired before everyone was ready.
+    ///   connected. May be smaller than the total when the timeout
+    ///   expired before everyone was ready.
     /// * The total link count — i.e. the size of the working set
     ///   that was checked. `(connected, total)` lets the caller log
     ///   "M/N CA links connected".
     ///
-    /// Pure no-op when no link sets are registered, or when their
-    /// `link_names()` is empty (e.g. lazy-open lsets that haven't
-    /// observed any record link yet — record processing will create
+    /// Pure no-op when no CA link set is registered, or when its
+    /// `link_names()` has no local-target link yet (e.g. lazy-open lsets
+    /// that haven't observed any record link — record processing creates
     /// the entries on first read, after iocInit returns).
     pub async fn wait_for_external_links(&self, timeout: std::time::Duration) -> (usize, usize) {
         // Collect (lset, name) pairs once. `link_names()` may grow
@@ -633,57 +636,51 @@ impl PvDatabase {
         }
     }
 
-    /// Snapshot every `(lset, link_name)` pair currently opened across
-    /// all registered external link sets. Shared by
-    /// [`Self::wait_for_external_links`] and
-    /// [`Self::unconnected_external_links`] so both reason over the
-    /// identical working set.
+    /// Snapshot the `(lset, link_name)` pairs the iocInit external-link
+    /// wait reasons over. Shared by [`Self::wait_for_external_links`] and
+    /// [`Self::unconnected_external_links`] so both see the identical
+    /// working set.
+    ///
+    /// C parity: the iocInit connection-wait is a property of the CA link
+    /// facility (dbCa) alone. `dbCaRun` (dbCa.c:370-380) blocks on
+    /// `initOutstanding`, the count of CA links flagged
+    /// `DBCA_CALLBACK_INIT_WAIT` — set only for a CA link whose target is
+    /// a LOCAL record (dbLink.c:128-130):
+    ///   int isLocal = dbChannelTest(pvname) == 0;
+    ///   dbCaAddLinkCallbackOpt(..., isLocal ? DBCA_CALLBACK_INIT_WAIT : 0)
+    /// No other external facility waits: pvxs pvalink's `linkGlobal_t::init`
+    /// (ioc/pvalink.cpp) only calls `chan->open()` per channel — it opens
+    /// in the background and never blocks iocInit. So the wait targets
+    /// exactly the CA link set's local-target links; a non-local CA link
+    /// (e.g. areaDetector's `ShutterStatusEPICS_RBV.INP = "test CP MS"`
+    /// placeholder) and every `pva://` link connect asynchronously and are
+    /// never held by iocInit, like C.
     async fn external_link_targets(&self) -> Vec<(link_set::DynLinkSet, String)> {
-        let registry_snapshot: Vec<(String, link_set::DynLinkSet)> = {
+        // Only the CA facility participates — look it up directly rather
+        // than iterating every registered scheme. `has_name_no_resolve`
+        // is the `dbChannelTest` twin (target is a local record).
+        let Some(ca_lset) = ({
             let registry = self.inner.link_sets.read().await;
-            registry
-                .schemes()
-                .into_iter()
-                .filter_map(|s| registry.get(&s).map(|l| (s, l)))
-                .collect()
+            registry.get("ca")
+        }) else {
+            return Vec::new();
         };
         let mut targets: Vec<(link_set::DynLinkSet, String)> = Vec::new();
-        for (scheme, lset) in &registry_snapshot {
-            // C parity (dbLink.c:128-130): the iocInit connection-wait gate
-            // (`DBCA_CALLBACK_INIT_WAIT`) is a property of the *CA link
-            // facility* (dbCa) alone — it is set only for a CA link whose
-            // target is a LOCAL record:
-            //   int isLocal = dbChannelTest(pvname) == 0;
-            //   dbCaAddLinkCallbackOpt(..., isLocal ? DBCA_CALLBACK_INIT_WAIT : 0)
-            // So a CA link to a non-local / nonexistent PV (e.g. areaDetector's
-            // `ShutterStatusEPICS_RBV.INP = "test CP MS"` placeholder) gets no
-            // init-wait flag and iocInit must not block on it — it dangles
-            // silently like C. `has_name_no_resolve` is the `dbChannelTest` twin.
-            //
-            // PVA links (pvalink, scheme "pva") have no such facility in C:
-            // pvxs `linkGlobal_t::init()` (ioc/pvalink.cpp) only opens channels
-            // in the background and never blocks iocInit. epics-rs instead lets
-            // pva links participate in this wait UNCONDITIONALLY by deliberate
-            // design (`qsrv::pva_adapter::pvalink_link_set_install` — the pvalink
-            // installer is registered at the AfterCaLinkInit hook so its links
-            // are visible to, and held by, this wait). That design choice is
-            // outside the CA-facility locality gate, so only "ca" is gated;
-            // every other scheme participates regardless of target locality.
-            let locality_gated = scheme == "ca";
-            for n in lset.link_names() {
-                if !locality_gated || self.has_name_no_resolve(&n).await {
-                    targets.push((lset.clone(), n));
-                }
+        for n in ca_lset.link_names() {
+            if self.has_name_no_resolve(&n).await {
+                targets.push((ca_lset.clone(), n));
             }
         }
         targets
     }
 
-    /// Names of external links (`ca://` / `pva://`) that are opened but
-    /// not yet connected. iocInit calls this after
+    /// Names of the waited-on CA links (local-target, per
+    /// [`Self::external_link_targets`]) that are opened but not yet
+    /// connected. iocInit calls this after
     /// [`Self::wait_for_external_links`] times out so the
     /// "M/N connected" diagnostic can name the `N-M` it proceeded
     /// without, instead of leaving the operator to run `dbcar`.
+    /// `pva://` links are not in this set — they never block iocInit.
     pub async fn unconnected_external_links(&self) -> Vec<String> {
         self.external_link_targets()
             .await
@@ -1494,7 +1491,10 @@ mod tests {
             names: vec!["pv:A".to_string(), "pv:B".to_string()],
             connect_at: tokio::time::Instant::now(),
         });
-        db.register_link_set("pva", lset).await;
+        // Registered under "ca": the iocInit wait is CA-facility only, so
+        // the working set comes from the "ca" link set (these forced-CA
+        // local-target links), never from a "pva" set.
+        db.register_link_set("ca", lset).await;
         let (c, t) = db
             .wait_for_external_links(std::time::Duration::from_secs(1))
             .await;

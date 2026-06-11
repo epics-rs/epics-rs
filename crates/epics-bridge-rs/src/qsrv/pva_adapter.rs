@@ -1076,12 +1076,18 @@ fn qsrv2_enabled() -> bool {
 /// `pvxr` / `dbpvxr` / `pvalink_enable` / `pvalink_disable` iocsh
 /// commands. Registered at IOC construction, it is fired by
 /// `IocApplication::run` at the `AfterCaLinkInit` hook — BEFORE
-/// `setup_cp_links` and, crucially, before the iocInit external-link
-/// wait (`wait_for_external_links`). So PVA links participate in the
-/// iocInit "wait for links to connect before PINI" step, matching the
-/// `"ca"` link set installed at the same hook. Installing pvalink in
+/// `setup_cp_links` and before record processing (PINI), so a `pva://`
+/// CP link is opened and its background connect kicked off while iocInit
+/// is still running, matching pvxs opening pvalink channels at
+/// `initHookAfterIocBuilt` (`linkGlobal_t::init`). Installing pvalink in
 /// the Phase-3 protocol runner (where it lived previously) ran after
-/// that wait, so PVA links were silently excluded from it.
+/// `setup_cp_links`, so a Passive CP holder's warm no-op'd.
+///
+/// PVA links do NOT participate in the iocInit external-link wait
+/// (`wait_for_external_links`): that wait is CA-facility-only, exactly as
+/// in C, where `dbCaRun` blocks on CA links alone and pvxs pvalink never
+/// blocks iocInit. A `pva://` link that cannot connect therefore does not
+/// hold up PINI; it connects asynchronously in the background.
 ///
 /// QSRV2-gated (pvxs `iochooks.cpp:461-496`: `pvalink_enable()` runs
 /// only when `enable2()` is true) and feature-gated on `pvalink`. When
@@ -1189,11 +1195,16 @@ pub async fn run_ca_pva_qsrv_ioc(
     //   * `"ca"`  — `calink_link_set_install`
     //   * `"pva"` — `pvalink_link_set_install`
     // The hook fires BEFORE `setup_cp_links` (which warms Passive `ca://`
-    // CP holders) AND before the iocInit external-link wait
-    // (`wait_for_external_links`, which holds PINI until links connect).
-    // Installing either set here in Phase 3 is too late: a Passive `ca://`
-    // CP holder's `resolve_external_pv` warm would no-op, and PVA links
-    // would be silently excluded from the iocInit link-wait.
+    // CP holders) and before record processing, so both link sets' CP
+    // links are opened while iocInit runs. Installing either set here in
+    // Phase 3 is too late: a Passive `ca://` CP holder's
+    // `resolve_external_pv` warm would no-op, and a `pva://` CP link would
+    // open only after record processing began.
+    //
+    // Only the `"ca"` set's local-target links are then held by the
+    // iocInit external-link wait (`wait_for_external_links`, CA-facility
+    // only, like C `dbCaRun`); `pva://` links connect in the background
+    // and never block PINI (pvxs parity — pvalink does not wait at init).
     // `config.shell_commands` already carries the `caxr` / `dbcaxr` /
     // `pvxr` / `dbpvxr` commands those installers returned at the hook.
     let mut shell_commands = config.shell_commands;

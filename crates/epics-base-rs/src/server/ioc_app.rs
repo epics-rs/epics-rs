@@ -839,11 +839,14 @@ impl IocApplication {
         let io_intr_count = setup_io_intr(db.clone()).await;
         db.setup_cp_links().await;
 
-        // Phase 2b.5: wait for external CA/PVA links to connect before
-        // PINI runs (epics-base PR #768/#856 — `dbCa: iocInit wait`).
-        // Default 10s timeout, override via `EPICS_RS_INIT_LINK_TIMEOUT`
-        // (seconds, fractional accepted). Pass-through when no LinkSet
-        // is registered.
+        // Phase 2b.5: wait for the CA links to local records to connect
+        // before PINI runs (epics-base PR #768/#856 — `dbCa: iocInit
+        // wait`). This is a CA-facility wait only: `pva://` links and
+        // non-local CA links open in the background and never block
+        // iocInit (pvxs parity — pvalink `linkGlobal_t::init` just opens
+        // channels). Default 10s timeout, override via
+        // `EPICS_RS_INIT_LINK_TIMEOUT` (seconds, fractional accepted).
+        // Pass-through when no CA link set is registered.
         let link_wait_secs = crate::runtime::env::get("EPICS_RS_INIT_LINK_TIMEOUT")
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(10.0)

@@ -1,24 +1,25 @@
-//! The `pva` link set
-//! (pvalink) must install at the base `AfterCaLinkInit` seam via
+//! The `pva` link set (pvalink) must install at the base
+//! `AfterCaLinkInit` seam via
 //! [`IocApplication::register_link_set_installer`], so a `pva://` link
-//! loaded before iocInit lands in the working set of the iocInit
-//! external-link wait (`PvDatabase::wait_for_external_links`) — exactly
-//! as CA links already do.
+//! loaded before iocInit has its link set registered and its CP link
+//! opened (background connect started) while iocInit is still running —
+//! matching pvxs opening pvalink channels at `initHookAfterIocBuilt`
+//! (`linkGlobal_t::init`).
 //!
 //! Pre-fix, pvalink installed inside the Phase-3 protocol runner
-//! (`run_ca_pva_qsrv_ioc`), AFTER iocInit had already snapshotted the
-//! registered link sets for its wait. This test drives the PRODUCTION
-//! `IocApplication::run` path with a CUSTOM runner that installs nothing
-//! itself: the registered seam installer is therefore the ONLY thing
-//! that can make the `pva` scheme appear and populate the wait set, so a
-//! pre-fix tree (no seam installer) fails both assertions below.
+//! (`run_ca_pva_qsrv_ioc`), AFTER iocInit. This test drives the
+//! PRODUCTION `IocApplication::run` path with a CUSTOM runner that
+//! installs nothing itself: the registered seam installer is therefore
+//! the ONLY thing that can make the `pva` scheme appear, so a pre-fix
+//! tree (no seam installer) fails assertion 1 below.
 //!
-//! No PVA server is stood up. `PvaLink::open` registers the link's
-//! monitor identity and connects in the background, so the link is a
-//! wait TARGET (`link_names()` non-empty) even while `is_connected()` is
-//! still false — which is all this test needs: it asserts the link is in
-//! the wait's working set, not that it connects (the connect path is
-//! pvalink's own, separately-tested behaviour).
+//! Crucially, pvalink does NOT participate in the iocInit external-link
+//! wait (`PvDatabase::wait_for_external_links`). That wait is
+//! CA-facility only — C `dbCaRun` blocks on CA links alone and pvxs
+//! pvalink never blocks iocInit — so a `pva://` CP link is registered
+//! and connecting in the background, but is NOT a wait target
+//! (assertion 2). No PVA server is stood up; the link's background
+//! connect is pvalink's own, separately-tested behaviour.
 //!
 //! Needs both `qsrv` (the runner + the `pvalink_link_set_install` shim
 //! live there) and `pvalink` (the resolver); the shim is an empty no-op
@@ -32,7 +33,7 @@ use serial_test::serial;
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial(epics_env)]
-async fn pvalink_link_is_in_iocinit_external_link_wait_via_run_seam() {
+async fn pvalink_installs_at_iocinit_seam_and_not_in_external_link_wait() {
     // SAFETY (edition 2024): these process-env writes are serialised
     // against the other `epics_env`-group tests by `#[serial]`, so no
     // other thread reads/writes the environment concurrently.
@@ -42,8 +43,9 @@ async fn pvalink_link_is_in_iocinit_external_link_wait_via_run_seam() {
         // the ambient environment.
         std::env::set_var("PVXS_QSRV_ENABLE", "YES");
         std::env::remove_var("EPICS_IOC_IGNORE_SERVERS");
-        // The link never connects (no server), so iocInit's own
-        // external-link wait would otherwise block the full 10s default.
+        // No `ca` link set is registered here, so iocInit's CA-facility
+        // external-link wait has an empty working set and returns at once;
+        // pin a short timeout anyway so the test can never block on it.
         std::env::set_var("EPICS_RS_INIT_LINK_TIMEOUT", "0.2");
         // Confine the pvalink monitor's background UDP search to
         // localhost so the test does not broadcast on the LAN.
@@ -92,6 +94,8 @@ async fn pvalink_link_is_in_iocinit_external_link_wait_via_run_seam() {
 
             // 1) The `pva` link set is registered — the installer fired
             //    at the `AfterCaLinkInit` seam, not in a Phase-3 runner.
+            //    The custom runner installs nothing, so a pre-fix tree
+            //    (no seam installer) would leave `pva` unregistered here.
             let schemes = config.db.registered_link_schemes().await;
             assert!(
                 schemes.iter().any(|s| s == "pva"),
@@ -99,19 +103,20 @@ async fn pvalink_link_is_in_iocinit_external_link_wait_via_run_seam() {
                  AfterCaLinkInit seam (registered schemes: {schemes:?})"
             );
 
-            // 2) The CP pvalink loaded before iocInit is in the wait's
-            //    working set. `total >= 1` is the crux: the iocInit wait
-            //    now treats the PVA link as something to wait on. (No
-            //    server → `connected` stays 0; that is fine, we are
-            //    asserting membership in the wait set, not connection.)
+            // 2) The CP pvalink loaded before iocInit is NOT a target of
+            //    the iocInit external-link wait: that wait is CA-facility
+            //    only (C `dbCaRun`), and pvalink never blocks iocInit
+            //    (pvxs parity — `linkGlobal_t::init` just opens channels
+            //    in the background). With no `ca` link set registered in
+            //    this pva-only IOC, the wait's working set is empty.
             let (_connected, total) = config
                 .db
                 .wait_for_external_links(Duration::from_millis(50))
                 .await;
-            assert!(
-                total >= 1,
-                "the pvalink CP link loaded before iocInit must be in the \
-                 external-link wait's working set (waited-on link count: {total})"
+            assert_eq!(
+                total, 0,
+                "a pvalink CP link must NOT be a target of the iocInit \
+                 external-link wait (CA-facility only); got total={total}"
             );
             Ok(())
         })

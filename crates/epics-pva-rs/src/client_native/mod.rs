@@ -1,4 +1,4 @@
-//! Native pvAccess client — no `spvirit_client` dependency.
+//! Native pvAccess client.
 //!
 //! Layered structure (mirrors pvxs `src/client*.cpp`):
 //!

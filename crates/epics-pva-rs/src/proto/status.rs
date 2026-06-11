@@ -248,8 +248,8 @@ mod tests {
     }
 
     #[test]
-    fn matches_spvirit_layout() {
-        // spvirit::encode_status_error("oops", false) yields:
+    fn matches_reference_layout() {
+        // pvAccess wire: encode_status_error("oops", false) yields:
         //   [0x02, 0x04, b'o', b'o', b'p', b's', 0x00]
         let s = Status::error("oops");
         assert_eq!(

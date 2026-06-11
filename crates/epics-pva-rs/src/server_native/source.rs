@@ -1,7 +1,7 @@
 //! [`ChannelSource`] — the trait every native PVA server is generic over.
 //!
-//! Replaces the spvirit `PvStore` trait. Uses our own [`crate::pvdata`]
-//! types, so no `spvirit_*` types appear in the public surface.
+//! Uses our own [`crate::pvdata`] types, so only native types appear in the
+//! public surface.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

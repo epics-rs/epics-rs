@@ -1,7 +1,6 @@
 //! PVA server wrapper — mirrors the `CaServer` pattern for pvAccess.
 //!
-//! Built on top of the native runtime in [`crate::server_native`]. No
-//! `spvirit_server` dependency.
+//! Built on top of the native runtime in [`crate::server_native`].
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -79,8 +79,8 @@ mod tests {
     }
 
     #[test]
-    fn matches_spvirit() {
-        // spvirit::ip_to_bytes(192.168.1.1) → [0,0,0,0,0,0,0,0,0,0,0xFF,0xFF,192,168,1,1]
+    fn matches_reference_wire() {
+        // pvAccess wire: ip_to_bytes(192.168.1.1) → [0,0,0,0,0,0,0,0,0,0,0xFF,0xFF,192,168,1,1]
         let bytes = ip_to_bytes(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
         assert_eq!(
             bytes,

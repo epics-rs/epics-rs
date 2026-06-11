@@ -1,8 +1,7 @@
 //! pvxs-compatible output formatting for PVA values and type descriptors.
 //!
 //! Operates on native [`crate::pvdata`] types (`FieldDesc` / `PvField` /
-//! `PvStructure`) — no `spvirit_codec` dependency. Mirrors the layout pvxs
-//! `pvget` / `pvinfo` produce.
+//! `PvStructure`). Mirrors the layout pvxs `pvget` / `pvinfo` produce.
 
 use std::fmt::Write as _;
 

@@ -136,8 +136,8 @@ mod tests {
     }
 
     #[test]
-    fn matches_spvirit_byte_layout() {
-        // spvirit::encode_string("MY:PV") → [0x05, b'M', b'Y', b':', b'P', b'V']
+    fn matches_reference_byte_layout() {
+        // pvAccess wire: encode_string("MY:PV") → [0x05, b'M', b'Y', b':', b'P', b'V']
         assert_eq!(
             encode_string("MY:PV", ByteOrder::Little),
             vec![0x05, b'M', b'Y', b':', b'P', b'V']

@@ -1,8 +1,7 @@
 //! [`ChannelSource`] implementation backed by an epics-rs [`PvDatabase`].
 //!
-//! Replaces the spvirit-shaped `bridge.rs::PvDatabaseStore`. Builds NTScalar
-//! and NTScalarArray `PvField` values directly from `Snapshot`s, with full
-//! alarm/timeStamp/display metadata.
+//! Builds NTScalar and NTScalarArray `PvField` values directly from
+//! `Snapshot`s, with full alarm/timeStamp/display metadata.
 
 use std::sync::Arc;
 

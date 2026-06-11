@@ -4,8 +4,8 @@
 //! sequences expected by clients (`build_search`, `build_get_init`, ...) and
 //! servers (`build_connection_validated`).
 //!
-//! It is byte-exact compatible with `spvirit_codec::spvirit_encode` for the
-//! commands we emit; see `tests/proto_spvirit_parity.rs` for the cross-check.
+//! It is byte-exact compatible with the pvAccess wire protocol for the
+//! commands we emit; see the `proto::*` module tests for the cross-check.
 
 use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr};
@@ -35,7 +35,7 @@ pub const ORIGIN_TAG_PREFIX_SIZE: usize = PvaHeader::SIZE + 16;
 
 /// PVA message codec — manages byte order and provides message building helpers.
 ///
-/// All encoding is fully native — no `spvirit_codec` dependency.
+/// All encoding is fully native.
 pub struct PvaCodec {
     pub big_endian: bool,
 }

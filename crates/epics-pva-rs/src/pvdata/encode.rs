@@ -2,9 +2,9 @@
 //! [`PvField`] (values).
 //!
 //! Source: pvxs `dataencode.cpp` + `data.cpp`. Designed to be byte-exact with
-//! `spvirit_codec::spvd_encode`/`spvd_decode` for the shapes our `FieldDesc`
-//! covers (scalars, scalar arrays, structures, structure arrays, unions,
-//! union arrays, variants).
+//! the pvAccess wire format for the shapes our `FieldDesc` covers (scalars,
+//! scalar arrays, structures, structure arrays, unions, union arrays,
+//! variants).
 //!
 //! Wire-format type tags (from pvxs `dataencode.cpp`):
 //!

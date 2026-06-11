@@ -3,8 +3,11 @@
 End-to-end and byte-level parity tests against the upstream EPICS C++
 reference implementation [`pvxs`](https://github.com/epics-base/pvxs).
 
-This directory backs Phase 0 of the spvirit-removal plan
-(`/Users/stevek/.claude/plans/crystalline-roaming-quilt.md`).
+This directory holds the byte-exact golden-wire fixtures and the
+cross-implementation interop runners. The per-command encode/decode parity
+checks themselves live as in-module `#[test]`s next to the code they cover
+(see the **Current coverage** table); this harness layers the captured
+`pvxs` fixtures and the interop matrix on top of them.
 
 ## Layout
 
@@ -36,20 +39,20 @@ tests/parity/
 
 ## Current coverage
 
-| Area | Status |
+| Area | Covered by (in-module tests) |
 |---|---|
-| Size encoding parity | ✅ `proto_spvirit_parity::size_matches_spvirit` |
-| String encoding parity | ✅ `proto_spvirit_parity::string_matches_spvirit` |
-| Header parity | ✅ `proto_spvirit_parity::header_matches_spvirit_application` |
-| Status OK parity | ✅ `proto_spvirit_parity::status_ok_matches_spvirit` |
-| IPv4 wire conversion | ✅ `proto_spvirit_parity::ip_to_bytes_matches_spvirit` |
-| FieldDesc structure encoding | ✅ `proto_spvirit_parity::field_desc_matches_spvirit_structure_desc` |
-| `pvRequest` builder | ✅ `proto_spvirit_parity::pv_request_matches_spvirit` |
-| SEARCH command | ✅ `proto_spvirit_parity::codec_search_matches_spvirit` |
-| CREATE_CHANNEL | ✅ `proto_spvirit_parity::codec_create_channel_matches_spvirit` |
-| GET/PUT/MONITOR/GET_FIELD/DESTROY | ✅ `proto_spvirit_parity::codec_op_requests_match_spvirit` |
-| CONNECTION_VALIDATED | ✅ `proto_spvirit_parity::codec_connection_validated_matches_spvirit` |
-| BitSet decode of all-bits-set | ✅ `proto_spvirit_parity::bitset_decodes_spvirit_first_event_payload` |
+| Size encoding parity | ✅ `src/proto/size.rs` |
+| String encoding parity | ✅ `src/proto/string.rs` |
+| Header parity | ✅ `src/proto/header.rs` |
+| Status OK parity | ✅ `src/proto/status.rs` |
+| IPv4 wire conversion | ✅ `src/proto/ip.rs` |
+| FieldDesc structure encoding | ✅ `src/pvdata/encode.rs` |
+| `pvRequest` builder | ✅ `src/pv_request.rs` |
+| SEARCH command | ✅ `src/codec.rs` |
+| CREATE_CHANNEL | ✅ `src/codec.rs` |
+| GET/PUT/MONITOR/GET_FIELD/DESTROY | ✅ `src/codec.rs` |
+| CONNECTION_VALIDATED | ✅ `src/codec.rs` |
+| BitSet decode of all-bits-set | ✅ `src/proto/bitset.rs` |
 | GET response decode | ⏳ Phase 3 |
 | MONITOR delta apply | ⏳ Phase 3 |
 | NTScalar conformance | ⏳ Phase 5 |
@@ -90,10 +93,10 @@ these `.bin` files and asserts byte-exact decode + re-encode.
 ## Running
 
 ```bash
-cargo test -p epics-pva-rs --test proto_spvirit_parity   # Phase 1+2
-cargo test -p epics-pva-rs --test 'parity_*'             # all parity tests
+cargo test -p epics-pva-rs                   # in-module wire-parity unit tests
+cargo test -p epics-pva-rs --test 'parity_*' # golden-wire + interop runners
 ```
 
-Once `spvirit-codec` is removed in Phase 6, the cross-check tests in
-`tests/proto_spvirit_parity.rs` will be deleted; the golden-wire fixtures
-remain as the long-term parity ground truth.
+The in-module unit tests are the per-command cross-checks; the golden-wire
+fixtures under `fixtures/golden_wire/` remain the long-term parity ground
+truth as the harness fills in the ⏳ rows above.

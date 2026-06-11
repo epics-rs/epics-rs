@@ -1,4 +1,4 @@
-//! Native pvAccess server runtime — no `spvirit_server` dependency.
+//! Native pvAccess server runtime.
 
 pub mod composite;
 pub mod monitor_control;

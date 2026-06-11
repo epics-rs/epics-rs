@@ -4,7 +4,7 @@
 //! PVs) plus NTNDArray plugin PVs over pvAccess.
 //!
 //! All values flow through [`epics_pva_rs::pvdata::PvField`] end-to-end —
-//! no spvirit_* types appear in this module.
+//! only native types appear in this module.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -26,7 +26,7 @@ use super::provider::{
 /// Registered via [`QsrvPvStore::register_pva_pv`] so the native PVA
 /// server can serve structure-shaped values produced directly by IOC code
 /// (for example NTNDArray or aggregate benchmark PVs). Snapshots and
-/// notifications use native [`PvField`] values; no spvirit dependency.
+/// notifications use native [`PvField`] values.
 ///
 /// `descriptor` lets the producer pass the authoritative wire shape,
 /// bypassing the lossy [`PvField::descriptor`] recovery for types it
@@ -343,10 +343,10 @@ fn spawn_db_monitor_updates(
 
 // ── ChannelSource impl (native PvAccess server) ──────────────────────────
 //
-// In addition to the legacy spvirit `PvStore` impl above, expose the same
-// data via the native [`epics_pva_rs::server_native::ChannelSource`] trait.
-// This is the path used by `epics_pva_rs::server::PvaServer::run_with_source`
-// (no spvirit_server runtime involvement).
+// In addition to the legacy `PvStore` impl above, expose the same data via
+// the native [`epics_pva_rs::server_native::ChannelSource`] trait. This is
+// the path used by `epics_pva_rs::server::PvaServer::run_with_source`
+// (fully native, no external server runtime).
 
 impl epics_pva_rs::server_native::ChannelSource for QsrvPvStore {
     // thread identity through the type-state

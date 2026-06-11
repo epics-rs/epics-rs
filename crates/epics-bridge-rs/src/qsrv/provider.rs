@@ -3,7 +3,7 @@
 //! Corresponds to C++ QSRV's `PDBProvider` (pdb.h/pdb.cpp).
 //!
 //! The trait definitions here are temporary — they will move to `epics-pva-rs`
-//! once the PVA server is implemented by the spvirit maintainer.
+//! once that crate's native PVA server exposes them directly.
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -2,7 +2,7 @@
 //!
 //! Mirrors the layout from pvxs `nt.h::NTNDArray` and the C++ areaDetector
 //! `NDPluginPva` plugin. Produces both a [`FieldDesc`] introspection and a
-//! [`PvField`] value composed entirely of native types — no spvirit_types.
+//! [`PvField`] value composed entirely of native types.
 //!
 //! Structure:
 //!

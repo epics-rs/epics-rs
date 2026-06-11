@@ -37,7 +37,7 @@ pub use error::{PvaError, PvaResult};
 pub use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 // Re-export commonly used pvData types so downstream callers can pull them
-// from the crate root (mirrors the previous spvirit-codec re-exports).
+// from the crate root.
 pub use pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 
 /// Runtime version packed as `(major << 24) | (minor << 16) | (patch << 8)`.

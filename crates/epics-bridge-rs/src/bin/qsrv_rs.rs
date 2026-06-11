@@ -1,7 +1,7 @@
 //! qsrv-rs — Record ↔ pvAccess bridge daemon (Rust port of C++ QSRV).
 //!
 //! Loads EPICS records from a `.db` file and optional group PV definitions
-//! from a JSON config, then exposes them over pvAccess using the spvirit
+//! from a JSON config, then exposes them over pvAccess using the native
 //! PVA server via [`QsrvPvStore`].
 //!
 //! Usage:

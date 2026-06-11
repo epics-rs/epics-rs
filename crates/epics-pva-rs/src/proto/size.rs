@@ -6,9 +6,8 @@
 //! - 254..=u32::MAX → 0xFE prefix + u32
 //! - null marker   → 0xFF (used by nullable strings / unselected variant)
 //!
-//! For lengths 254..=2³¹-1 spvirit and pvxs both encode as `0xFE` + 4-byte
-//! native u32; the wire format is byte-exact when both peers use the same
-//! [`ByteOrder`].
+//! For lengths 254..=2³¹-1 pvxs encodes as `0xFE` + 4-byte native u32; the
+//! wire format is byte-exact when both peers use the same [`ByteOrder`].
 
 use std::io::Cursor;
 
@@ -101,9 +100,9 @@ mod tests {
     }
 
     #[test]
-    fn matches_spvirit_encoding() {
-        // Cross-check exact byte sequences against spvirit::encode_common::encode_size.
-        // Confirmed by reading the spvirit source: 0 → [0x00], 253 → [0xFD],
+    fn matches_reference_encoding() {
+        // Cross-check exact byte sequences against the pvAccess size encoding.
+        // Per the pvxs `pvaproto.h` wire spec: 0 → [0x00], 253 → [0xFD],
         // 254 → [0xFE,0xFE,0x00,0x00,0x00] (LE) / [0xFE,0x00,0x00,0x00,0xFE] (BE).
         assert_eq!(encode_size(0, ByteOrder::Little), vec![0x00]);
         assert_eq!(encode_size(253, ByteOrder::Little), vec![0xFD]);

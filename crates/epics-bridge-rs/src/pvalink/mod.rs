@@ -5,7 +5,7 @@
 //! resolves that link to a live PVA client that periodically reads the
 //! remote PV (INP) or pushes record output to it (OUT).
 //!
-//! Mirror of pvxs `ioc/pvalink*.cpp`. Pure Rust, no spvirit_*.
+//! Mirror of pvxs `ioc/pvalink*.cpp`. Pure Rust.
 //!
 //! ## Usage
 //!

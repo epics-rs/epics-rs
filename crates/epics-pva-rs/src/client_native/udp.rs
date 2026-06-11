@@ -398,9 +398,21 @@ async fn recv_loop(sock: Arc<UdpSocket>, is_v6: bool, weak: Weak<CollectorState>
 /// Enable the socket option that makes the kernel attach each datagram's
 /// original destination address as ancillary data.
 ///
-/// * v4 Linux: `IP_PKTINFO` (yields `in_pktinfo.ipi_addr`).
-/// * v4 macOS/BSD: `IP_RECVDSTADDR` (yields a bare `in_addr`).
+/// * v4 Linux family (`linux`, `android`): `IP_PKTINFO` (yields
+///   `in_pktinfo.ipi_addr`). These share the Linux IP stack but carry
+///   distinct `target_os` values, and `libc` defines `IP_RECVDSTADDR`
+///   for neither — gating on `target_os = "linux"` alone would fail to
+///   compile on `android`.
+/// * v4 BSD/Apple family — `macos`, `netbsd`, and the *BSDs that do NOT
+///   provide `IP_PKTINFO` (`freebsd`, `openbsd`, `dragonfly`):
+///   `IP_RECVDSTADDR` (yields a bare `in_addr`). It is the only v4
+///   option `libc` defines across the whole BSD family, so it is
+///   preferred over pvxs's `IP_ORIGDSTADDR` (freebsd-only in `libc`;
+///   absent on `openbsd`/`netbsd`).
 /// * v6: `IPV6_RECVPKTINFO` (yields `in6_pktinfo.ipi6_addr`).
+///
+/// The `optname` selected here MUST equal the `cmsg_type` matched in
+/// [`decode_orig_dest_cmsg`]; keep the two cfg groups identical.
 #[cfg(unix)]
 fn enable_recv_orig_dest(sock: &Socket, is_v6: bool) -> io::Result<()> {
     use std::os::fd::AsRawFd;
@@ -408,11 +420,11 @@ fn enable_recv_orig_dest(sock: &Socket, is_v6: bool) -> io::Result<()> {
     let (level, optname) = if is_v6 {
         (libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO)
     } else {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             (libc::IPPROTO_IP, libc::IP_PKTINFO)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             (libc::IPPROTO_IP, libc::IP_RECVDSTADDR)
         }
@@ -617,8 +629,9 @@ unsafe fn decode_orig_dest_cmsg(
         return None;
     }
 
-    // v4 Linux: IP_PKTINFO carries in_pktinfo with the destination in ipi_addr.
-    #[cfg(target_os = "linux")]
+    // v4 Linux family (linux, android): IP_PKTINFO carries in_pktinfo with
+    // the destination in ipi_addr. Mirrors `enable_recv_orig_dest`'s cfg.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     if hdr.cmsg_level == libc::IPPROTO_IP
         && hdr.cmsg_type == libc::IP_PKTINFO
         && fits(std::mem::size_of::<libc::in_pktinfo>())
@@ -631,8 +644,10 @@ unsafe fn decode_orig_dest_cmsg(
         )));
     }
 
-    // v4 macOS/BSD: IP_RECVDSTADDR carries a bare in_addr (the destination).
-    #[cfg(not(target_os = "linux"))]
+    // v4 BSD/Apple family (macos, netbsd, and the IP_PKTINFO-less freebsd/
+    // openbsd/dragonfly): IP_RECVDSTADDR carries a bare in_addr (the
+    // destination). Mirrors `enable_recv_orig_dest`'s cfg.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     if hdr.cmsg_level == libc::IPPROTO_IP
         && hdr.cmsg_type == libc::IP_RECVDSTADDR
         && fits(std::mem::size_of::<libc::in_addr>())

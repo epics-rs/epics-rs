@@ -11,6 +11,24 @@ impl MotorRecord {
         self.internal.dmov_notified = false;
         let mut effects = ProcessEffects::default();
 
+        // C do_work evaluates `pmr->stop` at the TOP of every
+        // put-processing pass, before any other work (motorRecord.cc
+        // ~1860). A latent stop — a bare dbPut that never processed the
+        // record, later overtaken in `last_write` by another field's
+        // write — therefore wins over whatever src triggered this pass.
+        // The overtaken position write is not replayed: C discards it at
+        // stop completion via the `(val != lval) && !(mip & MIP_STOP)`
+        // gate (motorRecord.cc:1385) followed by the postProcess
+        // VAL<-RBV sync, which the Rust stop-completion path mirrors.
+        // (The C top block also covers SPMG changes; a latent SPMG mode
+        // already refuses new motions through can_accept_command below,
+        // and its Go branch falls through in C rather than returning, so
+        // it is not redirected here.)
+        if self.ctrl.stop && src != CommandSource::Stop {
+            self.handle_stop(&mut effects);
+            return effects;
+        }
+
         // SPMG, STOP, and SYNC always processed regardless of command gate
         match src {
             CommandSource::Spmg

@@ -544,6 +544,49 @@ fn test_val_write_during_stop_replan_supersedes_parked_target() {
 }
 
 #[test]
+fn test_latent_stop_wins_over_same_pass_val_write() {
+    // C do_work evaluates pmr->stop at the top of every put-processing
+    // pass (motorRecord.cc ~1860): a bare .STOP write (no process)
+    // followed by a VAL write that does process must execute the stop,
+    // not the move, even though last_write was overtaken by VAL.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.limits.dhlm = 100.0;
+    rec.limits.dllm = -100.0;
+    rec.stat.msta = MstaFlags::DONE;
+
+    rec.pos.dval = 50.0;
+    rec.pos.val = 50.0;
+    let _ = rec.plan_motion(CommandSource::Val);
+    assert_eq!(rec.stat.phase, MotionPhase::MainMove);
+
+    // Bare .STOP write latches ctrl.stop without processing; the next
+    // process pass is triggered by a VAL write.
+    rec.pos.rbv = 25.0;
+    rec.pos.drbv = 25.0;
+    rec.pos.rrbv = 2500;
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.ctrl.stop = true;
+    rec.pos.dval = 80.0;
+    rec.pos.val = 80.0;
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
+    assert!(!effects.commands.iter().any(|c| matches!(
+        c,
+        MotorCommand::MoveAbsolute { .. } | MotorCommand::MoveRelative { .. }
+    )));
+    assert!(rec.stat.mip.contains(MipFlags::STOP));
+    assert!(!rec.ctrl.stop); // consumed by the stop, not left latent
+
+    // The overtaken target is discarded by the stop-completion sync,
+    // exactly as C's (val != lval) && !(mip & MIP_STOP) gate does.
+    rec.stat.msta = MstaFlags::DONE;
+    let _ = rec.check_completion();
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.pos.val, 25.0);
+}
+
+#[test]
 fn test_ueip_eres_readback() {
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.001;

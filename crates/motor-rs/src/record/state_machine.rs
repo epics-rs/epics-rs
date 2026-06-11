@@ -63,8 +63,9 @@ impl MotorRecord {
             }
             // Resume a jog/home command that was queued behind this motion.
             // Only an explicit queued request (internal.queued_motion) is
-            // replayed — an active jog/home that a plain STOP just halted is
-            // NOT, even though its JOGF/HOMF MIP bit is still set.
+            // replayed — an active jog/home that a plain STOP just halted
+            // is NOT (the stop path replaces MIP wholesale and clears the
+            // buttons, C motorRecord.cc:1893/1903).
             if let Some(queued) = self.internal.queued_motion.take() {
                 self.stat.mip.remove(MipFlags::STOP);
                 match queued {

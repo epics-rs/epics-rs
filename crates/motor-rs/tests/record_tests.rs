@@ -811,21 +811,213 @@ fn test_cnen_no_command_without_gain_support() {
 }
 
 #[test]
-fn test_spmg_stop_finalizes() {
+fn test_spmg_stop_defers_sync_and_dmov_to_completion() {
+    // C top block (motorRecord.cc:1890-1906): SPMG=Stop while moving only
+    // sets pp=TRUE and mip=MIP_STOP — the VAL<-RBV sync and DMOV happen
+    // when the axis actually stops (postProcess), not at put time.
     let mut rec = MotorRecord::new();
     rec.stat.phase = MotionPhase::MainMove;
     rec.stat.mip = MipFlags::MOVE;
     rec.stat.dmov = false;
+    rec.pos.val = 50.0;
+    rec.pos.dval = 50.0;
     rec.pos.rbv = 25.0;
     rec.pos.drbv = 25.0;
     rec.pos.rrbv = 2500;
 
     rec.ctrl.spmg = SpmgMode::Stop;
     let effects = rec.plan_motion(CommandSource::Spmg);
-    assert!(rec.stat.dmov); // finalized
-    assert_eq!(rec.stat.phase, MotionPhase::Idle);
-    assert_eq!(rec.pos.val, 25.0); // synced
     assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
+    // Not finalized at put time: still decelerating.
+    assert!(!rec.stat.dmov);
+    assert_eq!(rec.stat.mip, MipFlags::STOP);
+    assert_eq!(rec.pos.val, 50.0, "no eager VAL<-RBV sync mid-deceleration");
+
+    // Axis comes to rest at 30 — completion syncs and finalizes.
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.movn = false;
+    rec.pos.rbv = 30.0;
+    rec.pos.drbv = 30.0;
+    rec.pos.rrbv = 3000;
+    let _ = rec.check_completion();
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert_eq!(rec.pos.val, 30.0, "synced to the actual rest position");
+    assert_eq!(rec.pos.dval, 30.0);
+}
+
+#[test]
+fn test_stop_during_retry_finalizes_immediately_without_sync() {
+    // C 1874-1885: a stop while MIP_RETRY abandons the retry and reports
+    // done at once (mip=MIP_DONE, dmov=TRUE) WITHOUT a readback sync —
+    // the drive fields keep the user target.
+    let mut rec = MotorRecord::new();
+    rec.stat.phase = MotionPhase::Retry;
+    rec.stat.mip = MipFlags::RETRY;
+    rec.stat.dmov = false;
+    rec.pos.val = 50.0;
+    rec.pos.dval = 50.0;
+    rec.pos.rbv = 49.9;
+    rec.pos.drbv = 49.9;
+
+    rec.put_field("STOP", EpicsValue::Short(1)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Stop);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Stop { .. }))
+    );
+    assert!(rec.stat.dmov, "retry stop reports done immediately");
+    assert_eq!(rec.stat.mip, MipFlags::empty());
+    assert_eq!(rec.pos.val, 50.0, "target retained, no readback sync");
+    assert_eq!(rec.pos.dval, 50.0);
+}
+
+#[test]
+fn test_spmg_stop_preserves_queued_motion_behind_in_flight_stop() {
+    // C: SPMG=Stop while a stop is already in flight takes the early
+    // return (1874-1888) BEFORE the button/MIP clears — a home queued
+    // behind that stop survives and postProcess re-fires it once the
+    // axis stops.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.pos.dval = 50.0;
+    rec.plan_motion(CommandSource::Val);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    // HOMF while moving: stop first, queue the home.
+    rec.ctrl.homf = true;
+    rec.plan_motion(CommandSource::Homf);
+    assert!(rec.stat.mip.contains(MipFlags::STOP));
+    assert!(rec.internal.queued_motion.is_some());
+
+    // SPMG=Stop while that stop is still decelerating.
+    rec.ctrl.spmg = SpmgMode::Stop;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
+    assert!(
+        rec.internal.queued_motion.is_some(),
+        "queued home survives the early return like C"
+    );
+
+    // Axis stops — the queued home fires.
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.movn = false;
+    let effects = rec.check_completion();
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Home { .. })),
+        "queued home resumes at stop completion (C postProcess parity)"
+    );
+}
+
+#[test]
+fn test_spmg_pause_cancels_queued_home() {
+    // C (1898-1906): Pause reaches `mip = MIP_STOP`, erasing
+    // MIP_HOMF|MIP_STOP, and clear_buttons() drops the home buttons —
+    // a Pause cancels a queued home and Go must NOT resume it.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.pos.dval = 50.0;
+    rec.plan_motion(CommandSource::Val);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    rec.ctrl.homf = true;
+    rec.plan_motion(CommandSource::Homf);
+    assert!(rec.internal.queued_motion.is_some());
+
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        rec.internal.queued_motion.is_none(),
+        "Pause cancels the queued home"
+    );
+    assert!(!rec.ctrl.homf, "home button dropped (C clear_buttons)");
+
+    // Stop completes; Go must not fire a home.
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.movn = false;
+    let _ = rec.check_completion();
+    rec.internal.lspg = SpmgMode::Pause;
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Home { .. })),
+        "Go after Pause must not resume the canceled home"
+    );
+}
+
+#[test]
+fn test_spmg_pause_then_go_resumes_queued_jog_from_button() {
+    // C: Pause's `mip = MIP_STOP` erases MIP_JOG_REQ (queued jog), but
+    // the still-latched jog BUTTON survives; Go re-arms the jog from the
+    // button (motorRecord.cc:1916-1918).
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.pos.dval = 50.0;
+    rec.plan_motion(CommandSource::Val);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    // JOGF while moving: stop first, queue the jog.
+    rec.ctrl.jogf = true;
+    rec.plan_motion(CommandSource::Jogf);
+    assert!(rec.internal.queued_motion.is_some());
+
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        rec.internal.queued_motion.is_none(),
+        "Pause cancels the queued jog (C: MIP_JOG_REQ erased)"
+    );
+    assert!(rec.ctrl.jogf, "jog button stays latched through Pause");
+
+    // Stop completes while paused — no jog resume yet.
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.movn = false;
+    let effects = rec.check_completion();
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
+        "no jog resume while paused"
+    );
+}
+
+#[test]
+fn test_stop_field_clears_latched_buttons_while_moving() {
+    // C 1891-1893: the stop-while-moving branch calls clear_buttons() —
+    // a latched jog/home button must not survive an explicit stop and
+    // re-fire later.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.pos.dval = 50.0;
+    rec.plan_motion(CommandSource::Val);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    // Buttons latched by bare puts that never processed the record.
+    rec.ctrl.jogf = true;
+    rec.ctrl.homr = true;
+
+    rec.put_field("STOP", EpicsValue::Short(1)).unwrap();
+    rec.plan_motion(CommandSource::Stop);
+    assert!(!rec.ctrl.jogf, "stop clears the latched jog button");
+    assert!(!rec.ctrl.homr, "stop clears the latched home button");
+    assert_eq!(rec.stat.mip, MipFlags::STOP);
 }
 
 // --- ACCS / ACCU (C: 36177f7b, 7b87f3b9, 63bfe5d0, 7291b556) ---

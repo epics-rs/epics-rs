@@ -435,22 +435,52 @@ impl MotorRecord {
     /// Handle STOP command.
     fn handle_stop(&mut self, effects: &mut ProcessEffects) {
         self.ctrl.stop = false; // pulse field
-        // Record-side state changes (MIP_STOP, target sync) apply only when
-        // the record believes motion is in flight.
+        self.stop_axis(effects);
+    }
+
+    /// The C do_work top-block stop path, shared by the STOP field pulse
+    /// and SPMG=Stop (motorRecord.cc:1871: `spmg == motorSPMG_Stop ||
+    /// stop == true`). Single owner so the two entries cannot drift.
+    fn stop_axis(&mut self, effects: &mut ProcessEffects) {
         let in_motion =
             self.stat.phase != MotionPhase::Idle || self.stat.mip.contains(MipFlags::EXTERNAL);
-        if in_motion {
-            self.stat.mip.insert(MipFlags::STOP);
+        if self.stat.mip.contains(MipFlags::RETRY) {
+            // C 1874-1885: a stop during retry abandons the retry and
+            // reports done immediately (mip = MIP_DONE, dmov = TRUE).
+            // No readback sync — the axis is already within RDBD of the
+            // target, so the drive fields keep the user target.
+            self.finalize_motion(effects);
+        } else if in_motion && !self.stat.mip.contains(MipFlags::STOP) {
+            // C 1890-1906: while moving, only mark the stop — pp = TRUE,
+            // clear_buttons(), mip = MIP_STOP (replaced wholesale,
+            // erasing MOVE/JOG/HOME/EXTERNAL bits). The VAL/DVAL/RVAL <-
+            // readback sync and DMOV happen once the axis has actually
+            // stopped (postProcess, 826-849), mirrored by
+            // check_completion's MIP_STOP branch via sync_positions().
+            // Syncing or finalizing eagerly here would post a transient
+            // mid-deceleration snapshot before the rest position is known.
             self.internal.backlash_pending = false;
+            self.ctrl.jogf = false;
+            self.ctrl.jogr = false;
+            self.ctrl.homf = false;
+            self.ctrl.homr = false;
+            // C 1901-1905: "When we wait for DLY, keep it. Otherwise the
+            // record may lock up."
+            if !self.stat.mip.contains(MipFlags::DELAY_REQ) {
+                self.stat.mip = MipFlags::STOP;
+            }
+        } else if in_motion {
+            // A stop already in flight (C 1874-1888 early return). The
+            // explicit stop drops a parked NTM retarget — C discards the
+            // overtaken target at stop completion via the
+            // `(val != lval) && !(mip & MIP_STOP)` gate (1385) plus the
+            // postProcess sync. A queued jog/home survives, matching C
+            // where the buttons/MIP_JOG_REQ outlive the early return and
+            // postProcess re-fires the queued request.
             self.internal.pending_retarget = None;
-            // No VAL<-RBV sync here: C's stop-while-moving branch only sets
-            // pp=TRUE (motorRecord.cc:1891-1893); the drive fields are
-            // synced to the readbacks by postProcess once the axis has
-            // actually stopped (835-849), which the stop-completion path in
-            // check_completion mirrors via sync_positions(). Syncing eagerly
-            // at stop-put time posted a transient VAL=RBV snapshot taken
-            // mid-deceleration, before the rest position was known.
         }
+        // else: idle — bare STOP_AXIS only.
+        //
         // C motorRecord.cc — STOP_AXIS is sent unconditionally ("just in
         // case"): the driver may still be settling even when the record
         // considers itself idle (e.g. after an InPosition retry, which
@@ -698,31 +728,31 @@ impl MotorRecord {
 
         match new {
             SpmgMode::Stop => {
-                let in_motion = self.stat.phase != MotionPhase::Idle
-                    || self.stat.mip.contains(MipFlags::EXTERNAL);
-                if in_motion {
-                    self.internal.backlash_pending = false;
-                    self.internal.pending_retarget = None;
-                    // Sync VAL = RBV
-                    self.pos.val = self.pos.rbv;
-                    self.pos.dval = self.pos.drbv;
-                    self.pos.rval = self.pos.rrbv;
-                    self.finalize_motion(effects);
-                }
-                // C: STOP_AXIS is sent unconditionally — the driver may still
-                // be settling even when the record is idle.
-                effects.commands.push(MotorCommand::Stop {
-                    acceleration: self.move_accel_egu(),
-                });
+                // C shares one top-block stop path between SPMG=Stop and
+                // the STOP field pulse (motorRecord.cc:1871); stop_axis is
+                // that shared owner. The drive-field sync and DMOV are
+                // deferred to actual stop completion, not applied here.
+                self.stop_axis(effects);
             }
             SpmgMode::Pause => {
                 if self.stat.phase != MotionPhase::Idle {
-                    // C: Pause sends STOP and sets MIP_STOP, but does NOT
-                    // clear phase/MIP or set DMOV here. The normal stop
-                    // completion pipeline handles that. DVAL is preserved
-                    // for potential resume via Go.
-                    self.stat.mip.insert(MipFlags::STOP);
+                    // C (1898-1906): Pause sends STOP and sets MIP_STOP,
+                    // but does NOT set pp — the drive fields keep the
+                    // target so Go can resume. `mip = MIP_STOP` erases a
+                    // queued jog (MIP_JOG_REQ) and a queued/active home
+                    // (MIP_HOMF|HOMR), and clear_buttons() drops the home
+                    // buttons: a paused jog resumes from its still-latched
+                    // button on Go, a canceled home does not.
+                    if matches!(self.internal.queued_motion, Some(QueuedMotion::Home { .. })) {
+                        self.ctrl.homf = false;
+                        self.ctrl.homr = false;
+                    }
+                    self.internal.queued_motion = None;
                     self.internal.pending_retarget = None;
+                    // C 1901-1905: keep MIP while waiting on DLY.
+                    if !self.stat.mip.contains(MipFlags::DELAY_REQ) {
+                        self.stat.mip.insert(MipFlags::STOP);
+                    }
                     effects.commands.push(MotorCommand::Stop {
                         acceleration: self.move_accel_egu(),
                     });
@@ -905,10 +935,16 @@ impl MotorRecord {
     /// suppress no-op moves). NTM only promotes an opposite-direction,
     /// beyond-deadband retarget to [`RetargetAction::StopAndReplan`].
     pub fn handle_retarget(&mut self, new_dval: f64) -> RetargetAction {
-        // Only retarget during active move or retry phases. C's `do_work`
-        // re-issue and the `movn`-block STOP both require an in-flight
-        // move.
-        let in_move = self.stat.mip.intersects(MipFlags::MOVE | MipFlags::RETRY);
+        // Only retarget during an active move, retry, or stop
+        // deceleration. C's `do_work` re-issue and the `movn`-block STOP
+        // both require an in-flight move; MIP_STOP counts as in-flight
+        // because the C stop path replaces MIP wholesale (`mip =
+        // MIP_STOP`, motorRecord.cc:1903) yet the move block still fires
+        // on a new target during the deceleration.
+        let in_move = self
+            .stat
+            .mip
+            .intersects(MipFlags::MOVE | MipFlags::RETRY | MipFlags::STOP);
         if !in_move {
             return RetargetAction::Ignore;
         }
@@ -925,6 +961,13 @@ impl MotorRecord {
         // (C gate at 1331: `(pmr->mip & MIP_STOP) == 0`), so no
         // double-stop is possible.
         if self.stat.mip.contains(MipFlags::STOP) {
+            if self.internal.queued_motion.is_some() {
+                // An explicit queued jog/home owns this stop's
+                // completion — in C the do_work jog/home sections run
+                // before the move block and re-fire the queued request,
+                // so the position write is overtaken.
+                return RetargetAction::Ignore;
+            }
             return RetargetAction::ExtendMove;
         }
 

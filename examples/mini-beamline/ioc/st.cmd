@@ -15,9 +15,14 @@ simMotorCreate("dot_mtrx", -500, 500, 100)
 simMotorCreate("dot_mtry", -500, 500, 100)
 
 # ===== Kohzu DCM (Double Crystal Monochromator) =====
+# Y/Z hard travel must cover the dbpf'd +-250 soft limits below: Z needs
+# yOffset/sin(theta) (up to ~180mm over 5-20 keV at yOffset=17.5). With a
+# narrower simulated range the motor slams into the simulator's limit switch
+# mid-move and kohzuCtl aborts the whole move and drops to Manual mode
+# ("Z Motor hit a limit switch!").
 simMotorCreate("dcm_theta", -10, 90, 100)
-simMotorCreate("dcm_y", -50, 50, 100)
-simMotorCreate("dcm_z", -50, 50, 100)
+simMotorCreate("dcm_y", -250, 250, 100)
+simMotorCreate("dcm_z", -250, 250, 100)
 
 # ===== Simulated HSC-1 Slit Controller =====
 simHscCreate("HSC1", 100)

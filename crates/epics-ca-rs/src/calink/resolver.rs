@@ -229,7 +229,7 @@ impl CaLink {
     /// always `0` — only PVA links can adopt a remote `timeStamp.userTag`.
     pub fn time_stamp(&self) -> Option<(i64, i32, u64)> {
         self.with_servable(|s| {
-            let dur = s.timestamp.duration_since(std::time::UNIX_EPOCH).ok()?;
+            let dur = s.timestamp.since_unix_epoch();
             Some((dur.as_secs() as i64, dur.subsec_nanos() as i32, 0))
         })
         .flatten()

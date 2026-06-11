@@ -1132,8 +1132,7 @@ mod tests {
     async fn post_pv_property_refreshes_and_posts_property_event() {
         use crate::error::CaError;
         use crate::server::snapshot::{DisplayInfo, Snapshot};
-        use crate::types::DbFieldType;
-        use std::time::{Duration, SystemTime};
+        use crate::types::{DbFieldType, WallTime};
 
         const DBE_PROPERTY: u16 = 8;
         const DBE_VALUE: u16 = 1;
@@ -1155,7 +1154,7 @@ mod tests {
 
         // Upstream CTRL event: metadata + MAJOR/HIGH alarm + a fixed past
         // timestamp that is unmistakably not a fresh wall clock.
-        let upstream_ts = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let upstream_ts = WallTime::from_unix(2_000_000, 0);
         let mut ctrl = Snapshot::new(EpicsValue::Double(5.0), HIGH, MAJOR, upstream_ts);
         ctrl.display = Some(DisplayInfo {
             units: "V".into(),
@@ -1199,7 +1198,7 @@ mod tests {
         );
 
         // Unknown / non-simple PV is rejected.
-        let again = Snapshot::new(EpicsValue::Double(0.0), 0, 0, SystemTime::UNIX_EPOCH);
+        let again = Snapshot::new(EpicsValue::Double(0.0), 0, 0, WallTime::UNIX_EPOCH);
         assert!(matches!(
             db.post_pv_property("no:such:pv", again).await,
             Err(CaError::ChannelNotFound(_))

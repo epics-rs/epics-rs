@@ -1,7 +1,7 @@
 use chrono::{DateTime, Local};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
-use epics_base_rs::types::DBR_CLASS_NAME;
+use epics_base_rs::types::{DBR_CLASS_NAME, WallTime};
 use epics_ca_rs::cli::{
     FloatFormat, FloatStyle, IntStyle, PV_NAME_WIDTH, ValueFormat, format_value,
 };
@@ -230,8 +230,10 @@ enum GetResult {
     },
 }
 
-fn format_server_timestamp(ts: SystemTime) -> String {
-    let dt: DateTime<Local> = ts.into();
+fn format_server_timestamp(ts: WallTime) -> String {
+    // Display only, to microseconds (`%.6f`), so converting through
+    // `SystemTime` (100 ns-granular on Windows) loses nothing visible.
+    let dt: DateTime<Local> = SystemTime::from(ts).into();
     dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
 }
 

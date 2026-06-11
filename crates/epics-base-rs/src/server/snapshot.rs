@@ -1,6 +1,4 @@
-use std::time::SystemTime;
-
-use crate::types::{EpicsValue, PvString};
+use crate::types::{EpicsValue, PvString, WallTime};
 
 /// Alarm status and severity.
 #[derive(Debug, Clone, Default)]
@@ -67,7 +65,14 @@ pub struct EnumInfo {
 pub struct Snapshot {
     pub value: EpicsValue,
     pub alarm: AlarmInfo,
-    pub timestamp: SystemTime,
+    /// Wall-clock timestamp with full EPICS `nsec` precision on every platform.
+    /// Held as [`WallTime`] rather than [`SystemTime`] because the latter is
+    /// 100 ns-granular on Windows and truncated externally supplied `nsec`
+    /// (wire decode, PVA PUT, `Q:time:tag` split). [`Snapshot::new`] still
+    /// accepts a `SystemTime` (via `Into`), so "now"-style call sites are
+    /// unchanged; precise integer sources construct it with
+    /// [`WallTime::from_unix`].
+    pub timestamp: WallTime,
     pub display: Option<DisplayInfo>,
     pub control: Option<ControlInfo>,
     pub enums: Option<EnumInfo>,
@@ -94,25 +99,29 @@ pub struct Snapshot {
 /// before reaching this helper (out-of-range is a no-op at the
 /// caller site).
 pub fn apply_nsec_lsb_split(snap: &mut Snapshot, n: u8) {
-    use std::time::{Duration, UNIX_EPOCH};
-
     debug_assert!((1..=30).contains(&n));
-    let dur = match snap.timestamp.duration_since(UNIX_EPOCH) {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-    let secs = dur.as_secs();
-    let nanos = dur.subsec_nanos();
+    let secs = snap.timestamp.unix_secs();
+    let nanos = snap.timestamp.subsec_nanos();
     let mask = (1u32 << n) - 1;
     let user_tag_bits = nanos & mask;
     let cleared_nanos = nanos & !mask;
     snap.user_tag = user_tag_bits as i32;
-    snap.timestamp = UNIX_EPOCH + Duration::new(secs, cleared_nanos);
+    snap.timestamp = WallTime::from_unix(secs, cleared_nanos);
 }
 
 impl Snapshot {
     /// Create a new snapshot with minimal metadata (no display/control/enum info).
-    pub fn new(value: EpicsValue, status: u16, severity: u16, timestamp: SystemTime) -> Self {
+    ///
+    /// `timestamp` accepts anything convertible into [`WallTime`] — a plain
+    /// [`SystemTime`] (for "now"-style clock reads, which lose no precision the
+    /// OS clock already lacks) or a [`WallTime::from_unix`] built from an exact
+    /// integer `(secs, nsec)` taken off the wire.
+    pub fn new(
+        value: EpicsValue,
+        status: u16,
+        severity: u16,
+        timestamp: impl Into<WallTime>,
+    ) -> Self {
         Self {
             value,
             alarm: AlarmInfo {
@@ -121,7 +130,7 @@ impl Snapshot {
                 ackt: None,
                 acks: None,
             },
-            timestamp,
+            timestamp: timestamp.into(),
             display: None,
             control: None,
             enums: None,
@@ -158,36 +167,35 @@ impl DbrClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
 
     /// With N=20, the low 20 nanosecond bits land in userTag
     /// and are cleared from the timestamp. Use a known nanosecond
     /// value so the bit math is easy to verify.
     #[test]
     fn nsec_lsb_split_extracts_user_tag() {
-        use std::time::{Duration, UNIX_EPOCH};
         let nanos: u32 = 123_456_789; // 0x075BCD15 — sub-second
-        let ts = UNIX_EPOCH + Duration::new(42, nanos);
+        // Inject the exact integer (secs, nsec); a `SystemTime` would truncate
+        // these low nanosecond digits to 100 ns on Windows before the split.
+        let ts = WallTime::from_unix(42, nanos);
         let mut snap = Snapshot::new(EpicsValue::Double(0.0), 0, 0, ts);
         apply_nsec_lsb_split(&mut snap, 20);
         let mask: u32 = (1 << 20) - 1;
         let expected_user_tag = (nanos & mask) as i32;
         let expected_nanos = nanos & !mask;
         assert_eq!(snap.user_tag, expected_user_tag);
-        let dur = snap.timestamp.duration_since(UNIX_EPOCH).unwrap();
-        assert_eq!(dur.as_secs(), 42);
-        assert_eq!(dur.subsec_nanos(), expected_nanos);
+        assert_eq!(snap.timestamp.unix_secs(), 42);
+        assert_eq!(snap.timestamp.subsec_nanos(), expected_nanos);
     }
 
     /// N=1 splits the single LSB into the userTag.
     #[test]
     fn nsec_lsb_split_n1_keeps_high_bits() {
-        use std::time::{Duration, UNIX_EPOCH};
-        let ts = UNIX_EPOCH + Duration::new(0, 7); // ...0111
+        let ts = WallTime::from_unix(0, 7); // ...0111
         let mut snap = Snapshot::new(EpicsValue::Double(0.0), 0, 0, ts);
         apply_nsec_lsb_split(&mut snap, 1);
         assert_eq!(snap.user_tag, 1);
-        let dur = snap.timestamp.duration_since(UNIX_EPOCH).unwrap();
-        assert_eq!(dur.subsec_nanos(), 6);
+        assert_eq!(snap.timestamp.subsec_nanos(), 6);
     }
 
     #[test]

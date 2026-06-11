@@ -1,13 +1,16 @@
 use chrono::{DateTime, Local};
 use clap::Parser;
 use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
+use epics_base_rs::types::WallTime;
 use epics_ca_rs::CaError;
 use epics_ca_rs::cli::{PV_NAME_WIDTH, ValueFormat, format_value};
 use epics_ca_rs::client::{CaChannel, CaClient, enum_string_readback_dbr};
 use std::time::SystemTime;
 
-fn format_server_timestamp(ts: SystemTime) -> String {
-    let dt: DateTime<Local> = ts.into();
+fn format_server_timestamp(ts: WallTime) -> String {
+    // Display only, to microseconds (`%.6f`), so converting through
+    // `SystemTime` (100 ns-granular on Windows) loses nothing visible.
+    let dt: DateTime<Local> = SystemTime::from(ts).into();
     dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
 }
 

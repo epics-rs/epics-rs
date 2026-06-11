@@ -4,6 +4,7 @@ use std::time::SystemTime;
 
 use chrono::{DateTime, Local};
 use clap::Parser;
+use epics_base_rs::types::WallTime;
 use epics_ca_rs::cli::{
     FloatFormat, FloatStyle, IntStyle, PV_NAME_WIDTH, ValueFormat, format_value,
 };
@@ -549,11 +550,17 @@ struct TimestampState<'a> {
 /// (`tsStart`) is the CLIENT-relative baseline.
 fn render_timestamp(
     spec: TimestampSpec,
-    server_ts: SystemTime,
+    server_ts: WallTime,
     client_ts: SystemTime,
     start: SystemTime,
     state: &mut TimestampState<'_>,
 ) -> Option<String> {
+    // The server stamp is a `WallTime`; join it to the local-clock comparison
+    // domain (client/start/baselines are `SystemTime`) for the µs-formatted
+    // display and f64-seconds diffs below. The conversion is 100 ns-granular
+    // on Windows, which neither the `%.6f` (µs) format nor the `%+12.6f`
+    // (µs) diffs can observe.
+    let server_ts: SystemTime = server_ts.into();
     // C `epicsTimeDiffInSeconds(pLeft, pRight)` is the SIGNED difference
     // `pLeft - pRight` (epicsTime.cpp:417-431) — a backward stamp step
     // (server clock correction, NTP step, device-support timestamp change,
@@ -740,13 +747,13 @@ mod tests {
         };
         let (mut fsv, mut fp, mut ps, mut pc) = (None, false, None, None);
         let mut st = ts_state(&mut fsv, &mut fp, &mut ps, &mut pc);
-        assert!(render_timestamp(none, t1, t1, start, &mut st).is_none());
+        assert!(render_timestamp(none, t1.into(), t1, start, &mut st).is_none());
 
         // Server relative: first event ABSOLUTE (== absolute render of
         // t1), NOT "10.000000".
         let (mut fsv, mut fp, mut ps, mut pc) = (None, false, None, None);
         let mut st = ts_state(&mut fsv, &mut fp, &mut ps, &mut pc);
-        let first = render_timestamp(srv(TimestampKind::Relative), t1, t1, start, &mut st);
+        let first = render_timestamp(srv(TimestampKind::Relative), t1.into(), t1, start, &mut st);
         assert_eq!(
             first.as_deref(),
             Some(super::format_server_timestamp(t1).as_str()),
@@ -754,7 +761,7 @@ mod tests {
         );
         // Second event: diff against the FIRST SERVER stamp (t1), so
         // t2 - t1 = 3s — NOT t2 - start (= 13s).
-        let second = render_timestamp(srv(TimestampKind::Relative), t2, t2, start, &mut st);
+        let second = render_timestamp(srv(TimestampKind::Relative), t2.into(), t2, start, &mut st);
         assert_eq!(second.as_deref(), Some(srv_diff(3.0).as_str()));
     }
 
@@ -772,12 +779,12 @@ mod tests {
         let (mut fsv, mut fp, mut ps, mut pc) = (None, false, None, None);
         let mut st = ts_state(&mut fsv, &mut fp, &mut ps, &mut pc);
         assert_eq!(
-            render_timestamp(srv, t1, t1, start, &mut st).as_deref(),
+            render_timestamp(srv, t1.into(), t1, start, &mut st).as_deref(),
             Some(super::format_server_timestamp(t1).as_str()),
             "leading incremental event is absolute"
         );
         assert_eq!(
-            render_timestamp(srv, t2, t2, start, &mut st).as_deref(),
+            render_timestamp(srv, t2.into(), t2, start, &mut st).as_deref(),
             Some(srv_diff(3.0).as_str()),
             "second incremental event diffs against the prior stamp"
         );
@@ -800,9 +807,9 @@ mod tests {
         let (mut fsv, mut fp, mut ps, mut pc) = (None, false, None, None);
         let mut st = ts_state(&mut fsv, &mut fp, &mut ps, &mut pc);
         // First event is absolute.
-        render_timestamp(srv, t1, t1, start, &mut st);
+        render_timestamp(srv, t1.into(), t1, start, &mut st);
         // Second event: 7 - 10 = -3s, rendered with a leading '-'.
-        let second = render_timestamp(srv, t2, t2, start, &mut st);
+        let second = render_timestamp(srv, t2.into(), t2, start, &mut st);
         assert_eq!(
             second.as_deref(),
             Some(srv_diff(-3.0).as_str()),
@@ -830,13 +837,13 @@ mod tests {
         let (mut fsv, mut fp, mut ps, mut pc) = (None, false, None, None);
         let mut st = ts_state(&mut fsv, &mut fp, &mut ps, &mut pc);
         // First: absolute client receive time in parens.
-        let first = render_timestamp(cr, start, c1, start, &mut st);
+        let first = render_timestamp(cr, start.into(), c1, start, &mut st);
         assert_eq!(
             first.as_deref(),
             Some(format!("({})", super::format_server_timestamp(c1)).as_str())
         );
         // Second: client diff vs program start → 10s (NOT vs c1).
-        let second = render_timestamp(cr, start, c2, start, &mut st);
+        let second = render_timestamp(cr, start.into(), c2, start, &mut st);
         assert_eq!(second.as_deref(), Some(cli_diff(10.0).as_str()));
     }
 
@@ -857,7 +864,7 @@ mod tests {
         let (mut fsv, mut fp, mut ps, mut pc) = (None, false, None, None);
         let mut st = ts_state(&mut fsv, &mut fp, &mut ps, &mut pc);
         // Leading event absolute: server stamp then (client stamp).
-        let first = render_timestamp(both, s1, c1, start, &mut st);
+        let first = render_timestamp(both, s1.into(), c1, start, &mut st);
         assert_eq!(
             first.as_deref(),
             Some(
@@ -871,7 +878,7 @@ mod tests {
         );
         // Second event: server (s2 - tsFirst=s1) = 3s, client
         // (c2 - tsStart=start) = 10s.
-        let second = render_timestamp(both, s2, c2, start, &mut st);
+        let second = render_timestamp(both, s2.into(), c2, start, &mut st);
         assert_eq!(
             second.as_deref(),
             Some(format!("{}{}", srv_diff(3.0), cli_diff(10.0)).as_str())

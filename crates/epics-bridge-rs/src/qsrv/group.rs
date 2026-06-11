@@ -2543,13 +2543,10 @@ fn build_timestamp_from_snapshot(
     snapshot: &epics_base_rs::server::snapshot::Snapshot,
 ) -> PvStructure {
     use epics_pva_rs::pvdata::ScalarValue;
-    use std::time::UNIX_EPOCH;
 
     let mut ts = PvStructure::new("time_t");
-    let (secs, nanos) = match snapshot.timestamp.duration_since(UNIX_EPOCH) {
-        Ok(d) => (d.as_secs() as i64, d.subsec_nanos() as i32),
-        Err(_) => (0, 0),
-    };
+    let dur = snapshot.timestamp.since_unix_epoch();
+    let (secs, nanos) = (dur.as_secs() as i64, dur.subsec_nanos() as i32);
     ts.fields.push((
         "secondsPastEpoch".into(),
         PvField::Scalar(ScalarValue::Long(secs)),
@@ -2594,20 +2591,22 @@ mod tests {
     #[test]
     fn group_timestamp_serves_record_snapshot_verbatim() {
         use epics_base_rs::server::snapshot::Snapshot;
-        use epics_base_rs::types::EpicsValue;
+        use epics_base_rs::types::{EpicsValue, WallTime};
         use epics_pva_rs::pvdata::{PvField, ScalarValue};
-        use std::time::UNIX_EPOCH;
 
         let int_field = |s: &PvStructure, name: &str| match s.get_field(name) {
             Some(PvField::Scalar(ScalarValue::Int(v))) => *v,
             other => panic!("{name} must be Int, got {other:?}"),
         };
 
+        // 0xFF ns (255) injected as exact integers; a `SystemTime` rounds it
+        // to 200 ns on Windows (FILETIME 100 ns units) and breaks the verbatim
+        // pass-through this test asserts.
         let mut snap = Snapshot::new(
             EpicsValue::Double(1.0),
             0,
             0,
-            UNIX_EPOCH + Duration::new(1_700_000_000, 0x0000_00FF),
+            WallTime::from_unix(1_700_000_000, 0x0000_00FF),
         );
         snap.user_tag = 0x9000_0000u32 as i32;
 

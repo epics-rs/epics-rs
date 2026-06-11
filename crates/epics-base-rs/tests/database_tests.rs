@@ -4980,8 +4980,7 @@ async fn test_new_common_fields_get_put() {
 async fn test_array_records_nord_monitor_uses_post_process_timestamp() {
     use epics_base_rs::server::recgbl::EventMask;
     use epics_base_rs::server::records::waveform::{ArrayKind, WaveformRecord};
-    use epics_base_rs::types::DbFieldType;
-    use std::time::SystemTime;
+    use epics_base_rs::types::{DbFieldType, WallTime};
 
     for (kind, name) in [
         (ArrayKind::Waveform, "WF_KIND"),
@@ -5011,7 +5010,7 @@ async fn test_array_records_nord_monitor_uses_post_process_timestamp() {
 
         // Wall-clock baseline AFTER record setup; the NORD event
         // timestamp must be ≥ this value.
-        let start = SystemTime::now();
+        let start = WallTime::now();
 
         // Subscribe to NORD with VALUE mask. add_subscriber seeds
         // last_posted with the current NORD (=0), so the next
@@ -5049,7 +5048,7 @@ async fn test_array_records_nord_monitor_uses_post_process_timestamp() {
         );
         let ts = event.snapshot.timestamp;
         assert!(
-            ts != SystemTime::UNIX_EPOCH,
+            ts != WallTime::UNIX_EPOCH,
             "{name}: NORD event timestamp must not be the epoch sentinel"
         );
         assert!(
@@ -5351,8 +5350,8 @@ async fn test_output_link_cascade_uses_post_process_source_timestamp() {
 #[tokio::test]
 async fn test_complete_async_record_updates_timestamp_at_completion() {
     use epics_base_rs::server::recgbl::EventMask;
-    use epics_base_rs::types::DbFieldType;
-    use std::time::{Duration, SystemTime};
+    use epics_base_rs::types::{DbFieldType, WallTime};
+    use std::time::Duration;
 
     let db = PvDatabase::new();
     db.add_record("ASYNC_TS", Box::new(AsyncRecord { val: 1.0 }))
@@ -5380,7 +5379,7 @@ async fn test_complete_async_record_updates_timestamp_at_completion() {
     // Sleep a measurable interval so the completion timestamp is
     // distinguishable from the process-start timestamp.
     tokio::time::sleep(Duration::from_millis(20)).await;
-    let post_sleep = SystemTime::now();
+    let post_sleep = WallTime::now();
 
     // Second half: completion fires snapshot/notify with a fresh
     // apply_timestamp.

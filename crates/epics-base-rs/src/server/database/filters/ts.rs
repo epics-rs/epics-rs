@@ -23,7 +23,7 @@
 //! on every emission.
 
 use super::{FilteredMonitorEvent, SubscriptionFilter};
-use crate::types::EpicsValue;
+use crate::types::{EpicsValue, WallTime};
 
 /// EPICS epoch (1990-01-01 00:00:00 UTC) offset from the Unix epoch.
 /// Identical to `EPICS_UNIX_EPOCH_OFFSET_SECS` in `types/codec.rs`;
@@ -93,12 +93,10 @@ impl Default for TimestampFilter {
     }
 }
 
-/// Extract `(sec, nsec)` from a `SystemTime`, optionally offset by
+/// Extract `(sec, nsec)` from a [`WallTime`], optionally offset by
 /// the EPICS→Unix epoch difference per `epoch`.
-fn ts_parts(t: std::time::SystemTime, epoch: TsEpoch) -> (i64, u32) {
-    let unix = t
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .unwrap_or(std::time::Duration::ZERO);
+fn ts_parts(t: WallTime, epoch: TsEpoch) -> (i64, u32) {
+    let unix = t.since_unix_epoch();
     let sec_unix = unix.as_secs() as i64;
     let nsec = unix.subsec_nanos();
     let sec = match epoch {
@@ -108,12 +106,9 @@ fn ts_parts(t: std::time::SystemTime, epoch: TsEpoch) -> (i64, u32) {
     (sec, nsec)
 }
 
-fn format_epics_string(t: std::time::SystemTime) -> String {
+fn format_epics_string(t: WallTime) -> String {
     use chrono::{DateTime, Local, Utc};
-    let unix_secs = t
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
+    let unix_secs = t.since_unix_epoch().as_secs_f64();
     let utc: DateTime<Utc> =
         DateTime::from_timestamp(unix_secs.trunc() as i64, ((unix_secs.fract()) * 1e9) as u32)
             .unwrap_or_else(Utc::now);
@@ -129,12 +124,9 @@ fn format_epics_string(t: std::time::SystemTime) -> String {
         .to_string()
 }
 
-fn format_iso_string(t: std::time::SystemTime) -> String {
+fn format_iso_string(t: WallTime) -> String {
     use chrono::{DateTime, Local, Utc};
-    let unix_secs = t
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
+    let unix_secs = t.since_unix_epoch().as_secs_f64();
     let utc: DateTime<Utc> =
         DateTime::from_timestamp(unix_secs.trunc() as i64, ((unix_secs.fract()) * 1e9) as u32)
             .unwrap_or_else(Utc::now);
@@ -207,7 +199,7 @@ mod tests {
     use crate::types::EpicsValue;
     use std::time::{Duration, SystemTime};
 
-    fn make_event(t: SystemTime) -> FilteredMonitorEvent {
+    fn make_event(t: impl Into<WallTime>) -> FilteredMonitorEvent {
         FilteredMonitorEvent::new(
             MonitorEvent {
                 snapshot: Snapshot::new(EpicsValue::Double(1.0), 0, 0, t),
@@ -221,11 +213,11 @@ mod tests {
     #[test]
     fn rewrites_snapshot_timestamp_to_now() {
         let f = TimestampFilter::new();
-        let before = SystemTime::now();
+        let before: WallTime = SystemTime::now().into();
         let out = f.apply(make_event(SystemTime::UNIX_EPOCH)).unwrap();
         let stamped = out.event.snapshot.timestamp;
         assert!(
-            stamped >= before - Duration::from_millis(1),
+            stamped >= before.saturating_sub(Duration::from_millis(1)),
             "stamp must reflect current wall clock"
         );
     }
@@ -244,7 +236,7 @@ mod tests {
         let mut ev = make_event(SystemTime::UNIX_EPOCH);
         ev.mask = EventMask::ALARM;
         let out = f.apply(ev).unwrap();
-        assert!(out.event.snapshot.timestamp > SystemTime::UNIX_EPOCH);
+        assert!(out.event.snapshot.timestamp > WallTime::UNIX_EPOCH);
     }
 
     /// `num=sec` with `epoch=epics`: a wall time at EPICS-epoch+10s
@@ -277,7 +269,9 @@ mod tests {
     /// `num=nsec` extracts the sub-second nanoseconds (epoch-independent).
     #[test]
     fn nsec_mode_extracts_subsecond_only() {
-        let ts = SystemTime::UNIX_EPOCH + Duration::new(EPICS_UNIX_EPOCH_OFFSET_SECS, 123_456_789);
+        // Exact integer (secs, nsec): a `SystemTime` rounds 123_456_789 to
+        // 100 ns on Windows, so this nsec must be injected as a `WallTime`.
+        let ts = WallTime::from_unix(EPICS_UNIX_EPOCH_OFFSET_SECS, 123_456_789);
         let f = TimestampFilter::with_mode(TsMode::Nanoseconds);
         let out = f.apply(make_event(ts)).unwrap();
         match out.event.snapshot.value {
@@ -289,8 +283,7 @@ mod tests {
     /// `num=dbl` returns `sec + nsec * 1e-9` (Double).
     #[test]
     fn double_mode_combines_sec_and_nsec() {
-        let ts =
-            SystemTime::UNIX_EPOCH + Duration::new(EPICS_UNIX_EPOCH_OFFSET_SECS + 5, 250_000_000);
+        let ts = WallTime::from_unix(EPICS_UNIX_EPOCH_OFFSET_SECS + 5, 250_000_000);
         let f = TimestampFilter::with_mode_epoch(TsMode::Double, TsEpoch::Epics);
         let out = f.apply(make_event(ts)).unwrap();
         match out.event.snapshot.value {
@@ -304,8 +297,7 @@ mod tests {
     /// `num=ts` returns a `ULongArray[sec, nsec]` (C DBF_ULONG pair).
     #[test]
     fn array_mode_returns_sec_nsec_pair() {
-        let ts =
-            SystemTime::UNIX_EPOCH + Duration::new(EPICS_UNIX_EPOCH_OFFSET_SECS + 7, 500_000_000);
+        let ts = WallTime::from_unix(EPICS_UNIX_EPOCH_OFFSET_SECS + 7, 500_000_000);
         let f = TimestampFilter::with_mode(TsMode::Array);
         let out = f.apply(make_event(ts)).unwrap();
         match out.event.snapshot.value {

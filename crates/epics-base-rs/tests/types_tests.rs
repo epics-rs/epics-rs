@@ -346,7 +346,7 @@ fn test_encode_time_matches_serialize() {
     let val = EpicsValue::Double(1.23);
     let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(EPICS_UNIX_EPOCH_OFFSET_SECS + 500);
     let mut snap = bare_snapshot(val.clone());
-    snap.timestamp = ts;
+    snap.timestamp = ts.into();
     snap.alarm = AlarmInfo {
         status: 1,
         severity: 2,
@@ -666,11 +666,7 @@ fn test_decode_time_double_roundtrip() {
     assert_eq!(snap.alarm.status, 5);
     assert_eq!(snap.alarm.severity, 1);
     let orig_secs = ts.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
-    let decoded_secs = snap
-        .timestamp
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let decoded_secs = snap.timestamp.since_unix_epoch().as_secs();
     assert_eq!(orig_secs, decoded_secs);
 }
 

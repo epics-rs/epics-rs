@@ -6,7 +6,7 @@ use crate::runtime::sync::{Mutex, RwLock, mpsc};
 
 use crate::error::CaError;
 use crate::server::snapshot::{ControlInfo, DisplayInfo, EnumInfo, Snapshot};
-use crate::types::{DbFieldType, EpicsValue};
+use crate::types::{DbFieldType, EpicsValue, WallTime};
 
 /// Per-subscriber bounded mpsc depth. Lifted from
 /// `EPICS_CAS_MAX_EVENTS_PER_CHAN`, default 64. Floor 4 so even
@@ -367,7 +367,7 @@ pub struct PvMetadata {
 #[derive(Clone)]
 struct PostedMeta {
     alarm: crate::server::snapshot::AlarmInfo,
-    timestamp: std::time::SystemTime,
+    timestamp: WallTime,
     user_tag: i32,
 }
 
@@ -966,7 +966,10 @@ mod mask_gate_tests {
     async fn set_snapshot_metadata_persists_then_value_set_clears() {
         let pv = pv();
 
-        let posted_time = std::time::UNIX_EPOCH + std::time::Duration::new(1_600_000_000, 42);
+        // 42 ns exact: a `SystemTime` rounds this to 0 on Windows, so the
+        // round-trip is built from `WallTime` integers to actually exercise
+        // sub-100 ns persistence through `PostedMeta`.
+        let posted_time = WallTime::from_unix(1_600_000_000, 42);
         let mut snap = Snapshot::new(EpicsValue::Double(7.0), 3, 2, posted_time);
         snap.user_tag = 9;
         pv.set_snapshot(snap).await;
@@ -1335,8 +1338,7 @@ mod metadata_tests {
             .expect("subscriber added");
         // The upstream CTRL event timestamp: a fixed point in the past, so
         // it is unmistakably NOT a fresh wall clock minted by the post.
-        let upstream_ts =
-            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let upstream_ts = WallTime::from_unix(1_000_000, 0);
         pv.post_property(Snapshot::new(
             EpicsValue::Double(2.0),
             HIGH,
@@ -1502,7 +1504,7 @@ mod read_hook_tests {
         pv.set_snapshot(Snapshot::new(EpicsValue::Double(1.0), 7, 1, shadow_time))
             .await;
         // The fresh upstream GET reports a different value, alarm, and time.
-        let upstream_time = UNIX_EPOCH + Duration::from_secs(2_000);
+        let upstream_time = WallTime::from_unix(2_000, 0);
         pv.set_read_hook(Arc::new(move || {
             Box::pin(
                 async move { Ok(Snapshot::new(EpicsValue::Double(5.0), 17, 2, upstream_time)) },

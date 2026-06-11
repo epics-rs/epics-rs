@@ -1,7 +1,7 @@
 use crate::error::{CaError, CaResult};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
-use super::{DbFieldType, EpicsValue, PvString};
+use super::{DbFieldType, EpicsValue, PvString, WallTime};
 
 // db_access.h constants
 const MAX_UNITS_SIZE: usize = 8;
@@ -15,8 +15,9 @@ pub fn serialize_dbr(
     value: &EpicsValue,
     status: u16,
     severity: u16,
-    timestamp: SystemTime,
+    timestamp: impl Into<WallTime>,
 ) -> CaResult<Vec<u8>> {
+    let timestamp: WallTime = timestamp.into();
     // DBR_CLASS_NAME (38) carries a single 40-byte string with the
     // record's recordType. The metadata-free encoding mirrors the C
     // `dbChannel_classify` reply path. `value` here is expected to
@@ -43,10 +44,8 @@ pub fn serialize_dbr(
     }
 }
 
-fn epics_timestamp_parts(timestamp: SystemTime) -> (u32, u32) {
-    let unix = timestamp
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO);
+fn epics_timestamp_parts(timestamp: WallTime) -> (u32, u32) {
+    let unix = timestamp.since_unix_epoch();
     let sec_past_epoch = unix
         .as_secs()
         .saturating_sub(EPICS_UNIX_EPOCH_OFFSET_SECS)
@@ -397,7 +396,7 @@ fn serialize_time(
     val_bytes: &[u8],
     status: u16,
     severity: u16,
-    timestamp: SystemTime,
+    timestamp: WallTime,
 ) -> CaResult<Vec<u8>> {
     let (secs, nanos) = epics_timestamp_parts(timestamp);
     let pad = time_pad(native);
@@ -865,9 +864,11 @@ fn read_pv_string(data: &[u8], off: usize, max_len: usize) -> PvString {
     PvString::from_bytes(&slice[..nul])
 }
 
-fn epics_secs_to_system_time(secs: u32, nanos: u32) -> SystemTime {
+fn epics_secs_to_wall_time(secs: u32, nanos: u32) -> WallTime {
     let unix_secs = secs as u64 + EPICS_UNIX_EPOCH_OFFSET_SECS;
-    SystemTime::UNIX_EPOCH + Duration::from_secs(unix_secs) + Duration::from_nanos(nanos as u64)
+    // Build from the exact wire integers: a `SystemTime` would round `nanos`
+    // to 100 ns on Windows, dropping the low nsec a CA TIME response carries.
+    WallTime::from_unix(unix_secs, nanos)
 }
 
 /// Decode a DBR wire response into a Snapshot.
@@ -976,7 +977,7 @@ fn decode_time(native: DbFieldType, data: &[u8], count: usize) -> CaResult<Snaps
     let severity = read_u16(data, 2)?;
     let secs = read_u32(data, 4)?;
     let nanos = read_u32(data, 8)?;
-    let timestamp = epics_secs_to_system_time(secs, nanos);
+    let timestamp = epics_secs_to_wall_time(secs, nanos);
     let pad_len = time_pad(native).len();
     let val_off = 12 + pad_len;
     let value = EpicsValue::from_bytes_array(native, &data[val_off..], count)?;

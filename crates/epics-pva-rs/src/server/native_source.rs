@@ -15,7 +15,7 @@ use epics_base_rs::server::access_security::AccessSecurityConfig;
 use epics_base_rs::server::database::{PvDatabase, PvEntry, parse_pv_name};
 use epics_base_rs::server::recgbl::{alarm_condition_string, alarm_status};
 use epics_base_rs::server::snapshot::Snapshot;
-use epics_base_rs::types::{EpicsValue, PvString};
+use epics_base_rs::types::{EpicsValue, PvString, WallTime};
 use tokio::sync::RwLock;
 
 /// Shared, mutable ACF cell. Changed from
@@ -498,7 +498,7 @@ fn alarm_status_class(condition: u16) -> i32 {
 fn build_timestamp(snap: &Snapshot) -> PvField {
     // pvxs `iocsource.cpp:240-248`: `timeStamp` carries the record's
     // acquisition time and userTag, NOT the serialization wall-clock.
-    // `Snapshot.timestamp` is the acquisition `SystemTime` (POSIX epoch;
+    // `Snapshot.timestamp` is the acquisition `WallTime` (POSIX epoch;
     // the codec already added POSIX_TIME_AT_EPICS_EPOCH on decode) and
     // `Snapshot.user_tag` is the nsec-LSB / pulse-id tag that
     // `apply_nsec_lsb_split` strips out of `nanoseconds` (mirroring
@@ -506,10 +506,7 @@ fn build_timestamp(snap: &Snapshot) -> PvField {
     // `meta.time.nsec & info.nsecMask` for userTag). Using `now()` here
     // overwrote the acquisition time with serialization time and zeroed
     // the userTag on every record-backed GET/MONITOR.
-    let dur = snap
-        .timestamp
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
+    let dur = snap.timestamp.since_unix_epoch();
     let mut t = PvStructure::new("time_t");
     t.fields.push((
         "secondsPastEpoch".into(),
@@ -906,8 +903,10 @@ fn pv_field_to_snapshot(value: &PvField, prior: &Snapshot) -> Option<Snapshot> {
             ) {
                 if secs >= 0 {
                     let nanos = nanos.clamp(0, 999_999_999) as u32;
-                    snap.timestamp =
-                        std::time::UNIX_EPOCH + std::time::Duration::new(secs as u64, nanos);
+                    // Inject the exact wire integers; a `SystemTime` would
+                    // round `nanos` to 100 ns on Windows, dropping the low
+                    // nsec a PVA PUT's `timeStamp.nanoseconds` carries.
+                    snap.timestamp = WallTime::from_unix(secs as u64, nanos);
                 }
             }
             if let Some(tag) = scalar_field_i64(ts, "userTag") {
@@ -1184,7 +1183,9 @@ mod tests {
     fn build_timestamp_uses_snapshot_acquisition_time_and_user_tag() {
         // pvxs `iocsource.cpp:240-248`: timeStamp carries the record's
         // acquisition time + userTag, not the serialization wall-clock.
-        let ts = std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 123_456_789);
+        // Inject the exact (secs, nsec); a `SystemTime` rounds 123_456_789 to
+        // 100 ns on Windows before `build_timestamp` ever reads it.
+        let ts = WallTime::from_unix(1_700_000_000, 123_456_789);
         let mut snap = Snapshot::new(EpicsValue::Double(1.0), 0, 0, ts);
         snap.user_tag = 42;
         let PvField::Structure(t) = build_timestamp(&snap) else {
@@ -2299,10 +2300,7 @@ ASG(LOCKED) {
         assert_eq!(snap.alarm.severity, 2, "alarm.severity persisted");
         assert_eq!(snap.alarm.status, 3, "alarm.status persisted");
         assert_eq!(snap.user_tag, 7, "timeStamp.userTag persisted");
-        let dur = snap
-            .timestamp
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("post-epoch");
+        let dur = snap.timestamp.since_unix_epoch();
         assert_eq!(dur.as_secs(), 1_600_000_000, "secondsPastEpoch persisted");
         assert_eq!(dur.subsec_nanos(), 123_456_789, "nanoseconds persisted");
     }

@@ -2,10 +2,8 @@
 //!
 //! Corresponds to C++ QSRV's `pvif.h/pvif.cpp` (ScalarBuilder, etc.).
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use epics_base_rs::server::snapshot::{ControlInfo, DisplayInfo, Snapshot};
-use epics_base_rs::types::{EpicsValue, PvString};
+use epics_base_rs::types::{EpicsValue, PvString, WallTime};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, ScalarValue};
 
 use crate::convert::{epics_to_pv_field, epics_to_scalar};
@@ -746,15 +744,13 @@ fn is_empty_array(value: &EpicsValue) -> bool {
     )
 }
 
-fn build_timestamp(time: SystemTime, user_tag: i32) -> PvStructure {
+fn build_timestamp(time: WallTime, user_tag: i32) -> PvStructure {
     let mut ts = PvStructure::new("time_t");
-    let (secs, nanos) = match time.duration_since(UNIX_EPOCH) {
-        Ok(d) => (d.as_secs() as i64, d.subsec_nanos() as i32),
-        Err(_) => (0, 0),
-    };
+    let dur = time.since_unix_epoch();
+    let (secs, nanos) = (dur.as_secs() as i64, dur.subsec_nanos() as i32);
     // PVA Normative Types define secondsPastEpoch as POSIX/UNIX epoch
     // (pvxs iocsource.cpp:240 adds POSIX_TIME_AT_EPICS_EPOCH to convert
-    // from internal EPICS epoch). Rust SystemTime is already UNIX-based,
+    // from internal EPICS epoch). `WallTime` is already UNIX-based,
     // so no conversion is needed here.
     ts.fields.push((
         "secondsPastEpoch".into(),
@@ -1061,6 +1057,7 @@ pub(crate) fn alarm_condition_string(condition: u16) -> &'static str {
 mod tests {
     use super::*;
     use epics_base_rs::server::snapshot::{EnumInfo, Snapshot};
+    use std::time::UNIX_EPOCH;
 
     fn test_snapshot(value: EpicsValue) -> Snapshot {
         let mut snap = Snapshot::new(value, 0, 0, UNIX_EPOCH);

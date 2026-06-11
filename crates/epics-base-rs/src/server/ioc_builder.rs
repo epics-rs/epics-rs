@@ -183,6 +183,23 @@ impl IocBuilder {
         // 2. Inline records
         for (name, record) in self.records {
             db.add_record(&name, record).await?;
+            // C iocInit runs init_record on EVERY record in the database;
+            // inline records previously skipped both passes, so a record
+            // type with init-time invariants (e.g. the motor speed/limit
+            // sync behind init_invariants_synced) behaved differently
+            // inline vs .db-loaded. Common-link classification
+            // (init_links) and the mbboDirect UDF finalisation stay on
+            // the .db path only: an inline record has no parsed common
+            // fields to classify or fold.
+            if let Some(rec_arc) = db.get_record(&name).await {
+                let mut instance = rec_arc.write().await;
+                if let Err(e) = instance.record.init_record(0) {
+                    eprintln!("init_record(0) failed for {name}: {e}");
+                }
+                if let Err(e) = instance.record.init_record(1) {
+                    eprintln!("init_record(1) failed for {name}: {e}");
+                }
+            }
         }
 
         // 3. .db definitions — create records, apply fields, init, wire device support & subs

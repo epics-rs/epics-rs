@@ -83,6 +83,13 @@ impl MotorRecord {
                             // plan_absolute_move emits the new move and also
                             // updates ldvl/lval/lrvl per C load_pos semantics.
                             //
+                            // plan_absolute_move replaces MIP with MOVE,
+                            // clearing an in-flight STOP; drop any target
+                            // parked behind that stop so it cannot resurrect
+                            // over this newer explicit one (invariant:
+                            // pending_retarget is Some ⟹ MIP_STOP committed).
+                            self.internal.pending_retarget = None;
+                            //
                             // Rust-only defensive layer: arm a completion-time
                             // verification so that, if a driver silently ignores
                             // the in-flight retarget and stops at the old target,
@@ -879,10 +886,25 @@ impl MotorRecord {
     pub fn handle_retarget(&mut self, new_dval: f64) -> RetargetAction {
         // Only retarget during active move or retry phases. C's `do_work`
         // re-issue and the `movn`-block STOP both require an in-flight
-        // move; MIP_STOP means a stop is already committed.
+        // move.
         let in_move = self.stat.mip.intersects(MipFlags::MOVE | MipFlags::RETRY);
-        if !in_move || self.stat.mip.contains(MipFlags::STOP) {
+        if !in_move {
             return RetargetAction::Ignore;
+        }
+        // A stop in flight does not make the record deaf to new targets.
+        // C routes a put-initiated process straight to `do_work` even
+        // while the axis is decelerating, and the `do_work` move block
+        // (motorRecord.cc:2241, `dval != ldvl || !dmov`) never tests
+        // MIP_STOP — the new move is dispatched immediately and
+        // `mip = MIP_MOVE` replaces the stop state. Discarding the write
+        // here instead would let the stop-completion path sync VAL back
+        // to RBV and silently lose the target (the kohzuCtl
+        // stop-then-rewrite retarget sequence hits exactly this window).
+        // Only the NTM stop-first branch is excluded while stopping
+        // (C gate at 1331: `(pmr->mip & MIP_STOP) == 0`), so no
+        // double-stop is possible.
+        if self.stat.mip.contains(MipFlags::STOP) {
+            return RetargetAction::ExtendMove;
         }
 
         let diff = new_dval - self.pos.drbv;

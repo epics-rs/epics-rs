@@ -433,6 +433,108 @@ fn test_ntm_retarget_direction_change() {
 }
 
 #[test]
+fn test_val_write_during_stop_deceleration_reissues_move() {
+    // C parity: the kohzuCtl retarget sequence is a STOP put followed by a
+    // VAL rewrite a few ms later, while the axis is still decelerating.
+    // C do_work (motorRecord.cc:2241) dispatches the new move immediately
+    // (the move block never tests MIP_STOP); the stop must not eat it.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.limits.dhlm = 100.0;
+    rec.limits.dllm = -100.0;
+    rec.stat.msta = MstaFlags::DONE;
+
+    // Start a move to 50
+    rec.pos.dval = 50.0;
+    rec.pos.val = 50.0;
+    let _ = rec.plan_motion(CommandSource::Val);
+    assert_eq!(rec.stat.phase, MotionPhase::MainMove);
+
+    // Axis under way at 25 when a STOP put processes
+    rec.pos.rbv = 25.0;
+    rec.pos.drbv = 25.0;
+    rec.pos.rrbv = 2500;
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.ctrl.stop = true;
+    let effects = rec.plan_motion(CommandSource::Stop);
+    assert!(rec.stat.mip.contains(MipFlags::STOP));
+    assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
+    assert_eq!(rec.pos.val, 25.0); // stop syncs target to readback
+
+    // New target written while still decelerating (driver not done yet)
+    rec.pos.dval = 80.0;
+    rec.pos.val = 80.0;
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(
+        matches!(effects.commands[0], MotorCommand::MoveAbsolute { .. }),
+        "VAL during stop deceleration must re-issue the move"
+    );
+    assert_eq!(rec.stat.mip, MipFlags::MOVE); // stop state replaced
+
+    // Driver finishes at the new target: completion finalizes there
+    // instead of running the plain-stop VAL<-RBV sync.
+    rec.pos.rbv = 80.0;
+    rec.pos.drbv = 80.0;
+    rec.pos.rrbv = 8000;
+    rec.stat.msta = MstaFlags::DONE;
+    let _ = rec.check_completion();
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.pos.val, 80.0);
+}
+
+#[test]
+fn test_val_write_during_stop_replan_supersedes_parked_target() {
+    // An NTM StopAndReplan parks its retarget in pending_retarget while
+    // the stop decelerates. A newer explicit VAL write during that window
+    // must win: the parked target is dropped (invariant: pending_retarget
+    // is Some only while MIP_STOP is committed) and the new move
+    // dispatched, exactly as C's last do_work pass would.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.limits.dhlm = 100.0;
+    rec.limits.dllm = -100.0;
+    rec.timing.ntm = true;
+    rec.timing.ntmf = 2.0;
+    rec.stat.msta = MstaFlags::DONE;
+
+    rec.pos.dval = 50.0;
+    rec.pos.val = 50.0;
+    let _ = rec.plan_motion(CommandSource::Val);
+
+    // Opposite-direction retarget mid-move -> StopAndReplan parks -10
+    rec.pos.rbv = 25.0;
+    rec.pos.drbv = 25.0;
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.pos.dval = -10.0;
+    rec.pos.val = -10.0;
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
+    assert!(rec.stat.mip.contains(MipFlags::STOP));
+    assert_eq!(rec.internal.pending_retarget, Some(-10.0));
+
+    // Newer explicit target during the same stop window
+    rec.pos.dval = 30.0;
+    rec.pos.val = 30.0;
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(matches!(
+        effects.commands[0],
+        MotorCommand::MoveAbsolute { .. }
+    ));
+    assert_eq!(rec.internal.pending_retarget, None);
+    assert_eq!(rec.stat.mip, MipFlags::MOVE);
+
+    // Completion at 30 finalizes there; the parked -10 must not resurrect.
+    rec.pos.rbv = 30.0;
+    rec.pos.drbv = 30.0;
+    rec.pos.rrbv = 3000;
+    rec.stat.msta = MstaFlags::DONE;
+    let effects = rec.check_completion();
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.pos.val, 30.0);
+    assert!(effects.commands.is_empty());
+}
+
+#[test]
 fn test_ueip_eres_readback() {
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.001;

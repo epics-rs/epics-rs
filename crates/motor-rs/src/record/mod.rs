@@ -372,12 +372,17 @@ impl Record for MotorRecord {
     }
 
     /// C `init_record`: on pass 1, once all `field()` values have been
-    /// applied, establish the limit invariant from the loaded DHLM/DLLM
-    /// (C `set_dial_highlimit`/`set_dial_lowlimit`). See
+    /// applied, reconcile the rev↔EGU speed pairs (C
+    /// `check_speed_and_resolution`) and establish the limit invariant from
+    /// the loaded DHLM/DLLM (C `set_dial_highlimit`/`set_dial_lowlimit`),
+    /// then enable the runtime cascade semantics in `put_field`. See
+    /// [`field_access::motor_sync_speed_at_init`] and
     /// [`field_access::motor_sync_limits_at_init`].
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 1 {
+            field_access::motor_sync_speed_at_init(self);
             field_access::motor_sync_limits_at_init(self);
+            self.internal.init_invariants_synced = true;
         }
         Ok(())
     }

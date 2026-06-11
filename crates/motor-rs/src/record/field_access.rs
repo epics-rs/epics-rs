@@ -1148,9 +1148,15 @@ pub(crate) fn motor_put_field(
         "VELO" => match value {
             EpicsValue::Double(v) => {
                 rec.vel.velo = v;
-                let urev_abs = rec.conv.urev.abs();
-                if urev_abs > 0.0 {
-                    rec.vel.s = v / urev_abs;
+                // The rev↔EGU cross-calc is C special() — runtime only.
+                // During dbLoadRecords each field() lands raw (C writes the
+                // struct directly); `motor_sync_speed_at_init` reconciles
+                // the pairs once all fields are applied.
+                if rec.internal.init_invariants_synced {
+                    let urev_abs = rec.conv.urev.abs();
+                    if urev_abs > 0.0 {
+                        rec.vel.s = v / urev_abs;
+                    }
                 }
                 // C: 7291b556 — recalc ACCL/ACCS based on ACCU
                 apply_accu_cascade(rec);
@@ -1161,9 +1167,11 @@ pub(crate) fn motor_put_field(
         "VBAS" => match value {
             EpicsValue::Double(v) => {
                 rec.vel.vbas = v;
-                let urev_abs = rec.conv.urev.abs();
-                if urev_abs > 0.0 {
-                    rec.vel.sbas = v / urev_abs;
+                if rec.internal.init_invariants_synced {
+                    let urev_abs = rec.conv.urev.abs();
+                    if urev_abs > 0.0 {
+                        rec.vel.sbas = v / urev_abs;
+                    }
                 }
                 apply_accu_cascade(rec);
                 Ok(())
@@ -1173,9 +1181,11 @@ pub(crate) fn motor_put_field(
         "VMAX" => match value {
             EpicsValue::Double(v) => {
                 rec.vel.vmax = v;
-                let urev_abs = rec.conv.urev.abs();
-                if urev_abs > 0.0 {
-                    rec.vel.smax = v / urev_abs;
+                if rec.internal.init_invariants_synced {
+                    let urev_abs = rec.conv.urev.abs();
+                    if urev_abs > 0.0 {
+                        rec.vel.smax = v / urev_abs;
+                    }
                 }
                 Ok(())
             }
@@ -1184,9 +1194,11 @@ pub(crate) fn motor_put_field(
         "S" => match value {
             EpicsValue::Double(v) => {
                 rec.vel.s = v;
-                let urev_abs = rec.conv.urev.abs();
-                if urev_abs > 0.0 {
-                    rec.vel.velo = v * urev_abs;
+                if rec.internal.init_invariants_synced {
+                    let urev_abs = rec.conv.urev.abs();
+                    if urev_abs > 0.0 {
+                        rec.vel.velo = v * urev_abs;
+                    }
                 }
                 Ok(())
             }
@@ -1195,9 +1207,11 @@ pub(crate) fn motor_put_field(
         "SBAS" => match value {
             EpicsValue::Double(v) => {
                 rec.vel.sbas = v;
-                let urev_abs = rec.conv.urev.abs();
-                if urev_abs > 0.0 {
-                    rec.vel.vbas = v * urev_abs;
+                if rec.internal.init_invariants_synced {
+                    let urev_abs = rec.conv.urev.abs();
+                    if urev_abs > 0.0 {
+                        rec.vel.vbas = v * urev_abs;
+                    }
                 }
                 Ok(())
             }
@@ -1206,9 +1220,11 @@ pub(crate) fn motor_put_field(
         "SMAX" => match value {
             EpicsValue::Double(v) => {
                 rec.vel.smax = v;
-                let urev_abs = rec.conv.urev.abs();
-                if urev_abs > 0.0 {
-                    rec.vel.vmax = v * urev_abs;
+                if rec.internal.init_invariants_synced {
+                    let urev_abs = rec.conv.urev.abs();
+                    if urev_abs > 0.0 {
+                        rec.vel.vmax = v * urev_abs;
+                    }
                 }
                 Ok(())
             }
@@ -1253,9 +1269,11 @@ pub(crate) fn motor_put_field(
         "BVEL" => match value {
             EpicsValue::Double(v) => {
                 rec.vel.bvel = v;
-                let urev_abs = rec.conv.urev.abs();
-                if urev_abs > 0.0 {
-                    rec.vel.sbak = v / urev_abs;
+                if rec.internal.init_invariants_synced {
+                    let urev_abs = rec.conv.urev.abs();
+                    if urev_abs > 0.0 {
+                        rec.vel.sbak = v / urev_abs;
+                    }
                 }
                 Ok(())
             }
@@ -1293,9 +1311,11 @@ pub(crate) fn motor_put_field(
         "SBAK" => match value {
             EpicsValue::Double(v) => {
                 rec.vel.sbak = v;
-                let urev_abs = rec.conv.urev.abs();
-                if urev_abs > 0.0 {
-                    rec.vel.bvel = v * urev_abs;
+                if rec.internal.init_invariants_synced {
+                    let urev_abs = rec.conv.urev.abs();
+                    if urev_abs > 0.0 {
+                        rec.vel.bvel = v * urev_abs;
+                    }
                 }
                 Ok(())
             }
@@ -1815,25 +1835,33 @@ fn apply_accu_cascade(rec: &mut MotorRecord) {
 /// `fd808eb2` (PR #206) — when MRES < 0, the high/low pair must be ordered
 /// so DHLM >= DLLM.
 fn apply_mres_cascade(rec: &mut MotorRecord, old_mres: f64) {
-    let urev_abs = rec.conv.urev.abs();
-    if urev_abs > 0.0 {
-        rec.vel.velo = urev_abs * rec.vel.s;
-        rec.vel.vbas = urev_abs * rec.vel.sbas;
-        rec.vel.bvel = urev_abs * rec.vel.sbak;
-        rec.vel.vmax = urev_abs * rec.vel.smax;
+    // Both re-derivations below are C special() semantics for a *runtime*
+    // MRES/UREV/SREV change. During `dbLoadRecords` neither invariant is
+    // established yet: `apply_fields` feeds every `field()` through
+    // `put_field` (unlike C, which applies `field()` as raw struct writes),
+    // so `field(MRES,…)` may run after `field(VELO,…)` / `field(DHLM,…)`.
+    // Cascading mid-load would rewrite the freshly-loaded VELO from an S
+    // derived against the pre-MRES default UREV, and rescale the
+    // freshly-loaded DHLM against the pre-MRES default resolution.
+    // `motor_sync_speed_at_init` / `motor_sync_limits_at_init` reconcile
+    // once loading completes (C check_speed_and_resolution /
+    // set_dial_highlimit / set_dial_lowlimit).
+    //
+    // C velcheckB (motorRecord.cc:2855-2875): across a resolution change
+    // the rev-unit speeds are invariant — re-derive the EGU speeds.
+    if rec.internal.init_invariants_synced {
+        let urev_abs = rec.conv.urev.abs();
+        if urev_abs > 0.0 {
+            rec.vel.velo = urev_abs * rec.vel.s;
+            rec.vel.vbas = urev_abs * rec.vel.sbas;
+            rec.vel.bvel = urev_abs * rec.vel.sbak;
+            rec.vel.vmax = urev_abs * rec.vel.smax;
+        }
     }
     if rec.conv.mres == 0.0 {
         return;
     }
-    // The dial/user limit rescale only applies to a *runtime* MRES change.
-    // During `dbLoadRecords` the limit invariant is not yet established:
-    // `apply_fields` feeds every `field()` through `put_field` (unlike C,
-    // which applies `field()` as raw struct writes), so `field(MRES,…)`
-    // may run after `field(DHLM,…)`. Rescaling here would scale the
-    // freshly-loaded DHLM against the pre-MRES default resolution.
-    // `motor_sync_limits_at_init` re-derives the raw limits from DHLM/DLLM
-    // once loading completes (C set_dial_highlimit/set_dial_lowlimit).
-    if rec.internal.limit_invariant_synced {
+    if rec.internal.init_invariants_synced {
         // Seed raw limits from the dial limits the first time MRES changes
         // after init: RHLM/RLLM default to 0. Once any
         // HLM/LLM/DHLM/DLLM/RHLM/RLLM put has run, rhlm/rllm hold a
@@ -1867,6 +1895,80 @@ fn apply_mres_cascade(rec: &mut MotorRecord, old_mres: f64) {
     rec.enforce_min_retry_deadband();
 }
 
+/// C `range_check` (motorRecord.cc:4358): clamp `parm` up to `min`, and
+/// down to `max` unless `max` is 0 (no ceiling configured).
+fn range_check(parm: &mut f64, min: f64, max: f64) {
+    if *parm < min {
+        *parm = min;
+    }
+    if max != 0.0 && *parm > max {
+        *parm = max;
+    }
+}
+
+/// Reconcile the rev↔EGU speed pairs at IOC init — the speed half of C
+/// `check_speed_and_resolution` (motorRecord.cc:3895), which C
+/// `init_record` runs once after `dbLoadRecords` has applied every
+/// `field()` as a raw struct write.
+///
+/// The cross-calcs in `put_field` stay inert during load, so each loaded
+/// field still holds exactly its `field()` value here. A nonzero rev-unit
+/// field (S/SBAS/SMAX/SBAK) therefore means the .db specified it and, as in
+/// C, it wins over its EGU partner (motorRecord.cc:3929-3966, 4019-4029);
+/// otherwise the EGU value is authoritative and the rev value is derived at
+/// the final UREV. Without this split, `field(VELO,…)` applied before
+/// `field(MRES,…)` derives S against the default UREV and the MRES cascade
+/// then rewrites VELO from that stale S — a `motor.template` load scaled
+/// every VELO by final-UREV/default-UREV (0.2× for the default template).
+///
+/// C's preceding SREV/MRES/UREV reconcile (motorRecord.cc:3904-3927) is not
+/// ported: the MRES/SREV/UREV handlers reject zero/non-positive puts and
+/// re-derive the other two on every put, so the resolution triple is
+/// already mutually consistent when init runs.
+pub(crate) fn motor_sync_speed_at_init(rec: &mut MotorRecord) {
+    let urev_abs = rec.conv.urev.abs();
+    if urev_abs > 0.0 {
+        // SMAX (rev/s) <-> VMAX (EGU/s)
+        if rec.vel.smax > 0.0 {
+            rec.vel.vmax = rec.vel.smax * urev_abs;
+        } else if rec.vel.vmax > 0.0 {
+            rec.vel.smax = rec.vel.vmax / urev_abs;
+        } else {
+            rec.vel.smax = 0.0;
+            rec.vel.vmax = 0.0;
+        }
+        // SBAS (rev/s) <-> VBAS (EGU/s)
+        if rec.vel.sbas != 0.0 {
+            range_check(&mut rec.vel.sbas, 0.0, rec.vel.smax);
+            rec.vel.vbas = rec.vel.sbas * urev_abs;
+        } else {
+            range_check(&mut rec.vel.vbas, 0.0, rec.vel.vmax);
+            rec.vel.sbas = rec.vel.vbas / urev_abs;
+        }
+        // S (rev/s) <-> VELO (EGU/s)
+        if rec.vel.s != 0.0 {
+            range_check(&mut rec.vel.s, rec.vel.sbas, rec.vel.smax);
+            rec.vel.velo = rec.vel.s * urev_abs;
+        } else {
+            range_check(&mut rec.vel.velo, rec.vel.vbas, rec.vel.vmax);
+            rec.vel.s = rec.vel.velo / urev_abs;
+        }
+        // SBAK (rev/s) <-> BVEL (EGU/s)
+        if rec.vel.sbak != 0.0 {
+            range_check(&mut rec.vel.sbak, rec.vel.sbas, rec.vel.smax);
+            rec.vel.bvel = rec.vel.sbak * urev_abs;
+        } else {
+            range_check(&mut rec.vel.bvel, rec.vel.vbas, rec.vel.vmax);
+            rec.vel.sbak = rec.vel.bvel / urev_abs;
+        }
+    }
+    // ACCS <-> ACCL. C keys on ACCS > 0 — its dbd default is 0, so nonzero
+    // means the .db set it (motorRecord.cc:4033-4047). The Rust default
+    // ACCS is derived (nonzero), so the master is whichever field ACCU
+    // names; the .db loading ACCS or ACCU flips it to Accs.
+    apply_accu_cascade(rec);
+}
+
 /// Establish the limit invariant at IOC init — the load-time counterpart of
 /// [`apply_mres_cascade`].
 ///
@@ -1895,7 +1997,6 @@ pub(crate) fn motor_sync_limits_at_init(rec: &mut MotorRecord) {
     );
     rec.limits.hlm = hlm;
     rec.limits.llm = llm;
-    rec.internal.limit_invariant_synced = true;
 }
 
 /// Re-evaluate LVIO after a soft-limit put.

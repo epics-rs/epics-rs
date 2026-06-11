@@ -2401,6 +2401,104 @@ fn test_template_load_dhlm_before_mres_preserves_egu_limits() {
     );
 }
 
+// --- Speed invariant at init (C check_speed_and_resolution, motorRecord.cc:3895) ---
+
+#[test]
+fn test_template_load_velo_before_mres_preserves_velo() {
+    // Reproduces the standard motor.template field order — field(VELO),
+    // field(ACCL) then field(MRES) — all applied through put_field by
+    // dbLoadRecords::apply_fields, followed by init_record. VELO=50 must
+    // survive: it must NOT be rewritten to UREV×S = 0.2×50 = 10 by the MRES
+    // cascade consuming the S that the VELO put derived against the default
+    // UREV (regression: every motor.template VELO came up scaled 0.2×).
+    let mut rec = MotorRecord::new();
+    rec.put_field("VELO", EpicsValue::Double(50.0)).unwrap();
+    rec.put_field("ACCL", EpicsValue::Double(0.2)).unwrap();
+    rec.put_field("MRES", EpicsValue::Double(0.001)).unwrap();
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+
+    assert!((rec.vel.velo - 50.0).abs() < 1e-9, "VELO={}", rec.vel.velo);
+    // S derived from VELO at the final UREV = 0.001 × 200 = 0.2
+    assert!((rec.vel.s - 250.0).abs() < 1e-9, "S={}", rec.vel.s);
+    assert!(
+        (rec.conv.urev - 0.2).abs() < 1e-12,
+        "UREV={}",
+        rec.conv.urev
+    );
+    // ACCU=Accl master: ACCS reconciled from the surviving VELO
+    assert!((rec.vel.accs - 250.0).abs() < 1e-9, "ACCS={}", rec.vel.accs);
+}
+
+#[test]
+fn test_load_velo_clamped_to_vmax_at_init() {
+    // C check_speed_and_resolution range_check: VELO is clamped into
+    // [VBAS, VMAX] at init (max enforced only when nonzero).
+    let mut rec = MotorRecord::new();
+    rec.put_field("VELO", EpicsValue::Double(50.0)).unwrap();
+    rec.put_field("VMAX", EpicsValue::Double(20.0)).unwrap();
+    rec.put_field("MRES", EpicsValue::Double(0.001)).unwrap();
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+
+    assert!((rec.vel.vmax - 20.0).abs() < 1e-9, "VMAX={}", rec.vel.vmax);
+    assert!((rec.vel.smax - 100.0).abs() < 1e-9, "SMAX={}", rec.vel.smax);
+    assert!((rec.vel.velo - 20.0).abs() < 1e-9, "VELO={}", rec.vel.velo);
+    assert!((rec.vel.s - 100.0).abs() < 1e-9, "S={}", rec.vel.s);
+}
+
+#[test]
+fn test_load_s_specified_wins_over_velo_at_init() {
+    // C: a nonzero S at init means the .db specified it — S wins and VELO
+    // is derived (motorRecord.cc:3955-3958), even if VELO was also loaded.
+    let mut rec = MotorRecord::new();
+    rec.put_field("VELO", EpicsValue::Double(50.0)).unwrap();
+    rec.put_field("S", EpicsValue::Double(2.5)).unwrap();
+    rec.put_field("MRES", EpicsValue::Double(0.001)).unwrap();
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+
+    assert!((rec.vel.s - 2.5).abs() < 1e-9, "S={}", rec.vel.s);
+    assert!((rec.vel.velo - 0.5).abs() < 1e-9, "VELO={}", rec.vel.velo);
+}
+
+#[test]
+fn test_runtime_velo_s_puts_cross_calc_after_init() {
+    // After init the C special() semantics apply: a VELO put re-derives S
+    // and an S put re-derives VELO at the current UREV.
+    let mut rec = MotorRecord::new();
+    rec.put_field("MRES", EpicsValue::Double(0.001)).unwrap();
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+
+    rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap();
+    assert!((rec.vel.s - 50.0).abs() < 1e-9, "S={}", rec.vel.s);
+    rec.put_field("S", EpicsValue::Double(100.0)).unwrap();
+    assert!((rec.vel.velo - 20.0).abs() < 1e-9, "VELO={}", rec.vel.velo);
+}
+
+#[test]
+fn test_runtime_mres_change_rederives_velo_from_s() {
+    // C velcheckB (motorRecord.cc:2855-2875): a runtime resolution change
+    // keeps the rev-unit speeds invariant and re-derives the EGU speeds.
+    let mut rec = MotorRecord::new();
+    rec.put_field("VELO", EpicsValue::Double(50.0)).unwrap();
+    rec.put_field("MRES", EpicsValue::Double(0.001)).unwrap();
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+    assert!((rec.vel.s - 250.0).abs() < 1e-9, "S={}", rec.vel.s);
+
+    rec.put_field("MRES", EpicsValue::Double(0.002)).unwrap();
+    // UREV = 0.002 × 200 = 0.4; VELO = UREV × S = 0.4 × 250 = 100
+    assert!(
+        (rec.conv.urev - 0.4).abs() < 1e-12,
+        "UREV={}",
+        rec.conv.urev
+    );
+    assert!((rec.vel.s - 250.0).abs() < 1e-9, "S={}", rec.vel.s);
+    assert!((rec.vel.velo - 100.0).abs() < 1e-9, "VELO={}", rec.vel.velo);
+}
+
 // --- RSTM (C: 2906f3d8, PR #160) ---
 
 #[test]

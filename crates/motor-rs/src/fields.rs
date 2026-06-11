@@ -399,13 +399,19 @@ pub struct InternalFields {
     /// driver actually followed the retarget and, if not, replans once
     /// independent of retry settings. Cleared after the check.
     pub verify_retarget_on_completion: bool,
-    /// Set once `init_record` has established the limit invariant
-    /// (RHLM/RLLM derived from the loaded DHLM/DLLM at the final MRES).
+    /// Set once `init_record` pass 1 has reconciled the load-time
+    /// invariants: raw limits (RHLM/RLLM derived from the loaded DHLM/DLLM
+    /// at the final MRES) and the rev↔EGU speed pairs (S/VELO, SBAS/VBAS,
+    /// SMAX/VMAX, SBAK/BVEL).
     ///
     /// Until then — i.e. while `dbLoadRecords` is still applying `field()`
-    /// entries through `put_field` — an MRES change must NOT rescale the
-    /// dial limits: the standard `motor.template` lists `field(DHLM,…)`
-    /// before `field(MRES,…)`, so cascading mid-load would rescale a
+    /// entries through `put_field` — the MRES/UREV/SREV cascade and the
+    /// speed cross-calcs must stay inert: C applies `field()` as raw struct
+    /// writes and reconciles once in `init_record`
+    /// (`check_speed_and_resolution` / `set_dial_highlimit`). The standard
+    /// `motor.template` lists `field(VELO,…)` and `field(DHLM,…)` before
+    /// `field(MRES,…)`, so cascading mid-load would derive S against the
+    /// default UREV (and then rewrite VELO from that stale S), or rescale a
     /// freshly-loaded DHLM against the pre-MRES default resolution.
-    pub limit_invariant_synced: bool,
+    pub init_invariants_synced: bool,
 }

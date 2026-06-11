@@ -1832,12 +1832,12 @@ mod tests {
     /// End-to-end forward path: `process_search_datagram` invoked
     /// with `Origin::Direct` and a unicast-flagged SEARCH MUST emit
     /// a CMD_ORIGIN_TAG-prefixed packet on `224.0.0.128:port` (the
-    /// loopback ORIGIN_TAG channel). A second observer socket joined
-    /// to the same group via `bind_loopback_mcast` should receive it,
-    /// and peeling the prefix should yield the inner SEARCH with the
-    /// Unicast flag cleared and the reply addr rewritten to the
-    /// resolved destination — pvxs `udp_collector.cpp:387-396` end-
-    /// to-end parity.
+    /// loopback ORIGIN_TAG channel). The sending `lo_mcast` socket is
+    /// itself joined to the group with IP_MULTICAST_LOOP=1, so it
+    /// receives its own emission; peeling the prefix should yield the
+    /// inner SEARCH with the Unicast flag cleared and the reply addr
+    /// rewritten to the resolved destination — pvxs
+    /// `udp_collector.cpp:387-396` end-to-end parity.
     #[tokio::test]
     async fn forward_path_emits_origin_tag_on_unicast_search() {
         use crate::pvdata::{FieldDesc, PvField};
@@ -1893,13 +1893,12 @@ mod tests {
         let source: DynSource = Arc::new(EmptySource);
         let socket = Arc::new(AsyncUdpV4::bind(0, false).expect("bind per-NIC"));
 
-        // Bind the lo_mcast send socket on an ephemeral port AND a
-        // second observer socket on the same port (SO_REUSEPORT).
-        // Both are joined to 224.0.0.128 — the observer will receive
-        // the forwarded packet via IP_MULTICAST_LOOP=1.
+        // Bind the lo_mcast send/receive socket on an ephemeral port. It
+        // joins 224.0.0.128 with IP_MULTICAST_LOOP=1, so it receives its
+        // own forwarded packet — no second co-bound observer needed (a
+        // co-bind would require SO_REUSEPORT, which Windows lacks).
         let lo_mcast = Arc::new(bind_loopback_mcast(0).expect("lo_mcast bind"));
         let port = lo_mcast.local_addr().unwrap().port();
-        let observer = bind_loopback_mcast(port).expect("observer bind");
 
         // Build a unicast SEARCH for "MY:PV" with reply 127.0.0.1:9999.
         let codec = PvaCodec { big_endian: false };
@@ -1926,10 +1925,10 @@ mod tests {
         .await;
 
         let mut buf = [0u8; 4096];
-        let (n, _src) = tokio::time::timeout(Duration::from_secs(2), observer.recv_from(&mut buf))
+        let (n, _src) = tokio::time::timeout(Duration::from_secs(2), lo_mcast.recv_from(&mut buf))
             .await
-            .expect("observer recv timeout — forward not emitted")
-            .expect("observer recv ok");
+            .expect("lo_mcast recv timeout — forward not emitted")
+            .expect("lo_mcast recv ok");
         let raw = &buf[..n];
 
         let (peeled, inner) = PvaCodec::try_peel_origin_tag(raw).expect("peel ok");
@@ -1958,8 +1957,8 @@ mod tests {
     /// NOT re-forward — anti-loop guard (pvxs `udp_collector.cpp`
     /// only enters the Forwarding branch when origin is the
     /// non-loopback per-NIC path). Verify by sending a unicast SEARCH
-    /// with `FromOriginTag` origin and asserting the observer never
-    /// sees a forwarded packet.
+    /// with `FromOriginTag` origin and asserting the group-joined
+    /// `lo_mcast` socket never sees a forwarded packet.
     #[tokio::test]
     async fn forward_path_skipped_when_origin_is_from_origin_tag() {
         use crate::pvdata::{FieldDesc, PvField};
@@ -2012,9 +2011,11 @@ mod tests {
 
         let source: DynSource = Arc::new(EmptySource);
         let socket = Arc::new(AsyncUdpV4::bind(0, false).expect("bind per-NIC"));
+        // lo_mcast is joined to the forward group with IP_MULTICAST_LOOP=1,
+        // so it would see any re-forward itself — no co-bound observer (and
+        // no Windows-absent SO_REUSEPORT) required.
         let lo_mcast = Arc::new(bind_loopback_mcast(0).expect("lo_mcast bind"));
         let port = lo_mcast.local_addr().unwrap().port();
-        let observer = bind_loopback_mcast(port).expect("observer bind");
 
         let codec = PvaCodec { big_endian: false };
         let frame = codec.build_search(7, 42, "MY:PV", [127, 0, 0, 1], 9999, true);
@@ -2034,14 +2035,14 @@ mod tests {
         )
         .await;
 
-        // Observer must NOT receive anything — short timeout proves
+        // lo_mcast must NOT receive anything — short timeout proves
         // the absence of forward emission.
         let mut buf = [0u8; 4096];
         let r =
-            tokio::time::timeout(Duration::from_millis(150), observer.recv_from(&mut buf)).await;
+            tokio::time::timeout(Duration::from_millis(150), lo_mcast.recv_from(&mut buf)).await;
         assert!(
             r.is_err(),
-            "FromOriginTag origin must NOT trigger re-forward, but observer got {r:?}"
+            "FromOriginTag origin must NOT trigger re-forward, but lo_mcast got {r:?}"
         );
     }
 
@@ -2199,10 +2200,11 @@ mod tests {
 
         let source: DynSource = Arc::new(PresentSource);
         let socket = Arc::new(AsyncUdpV4::bind(0, false).expect("bind per-NIC"));
+        // lo_mcast joins the forward group with IP_MULTICAST_LOOP=1, so it
+        // catches any re-forward itself — no co-bound observer (and no
+        // Windows-absent SO_REUSEPORT) required.
         let lo_mcast = Arc::new(bind_loopback_mcast(0).expect("lo_mcast bind"));
         let port = lo_mcast.local_addr().unwrap().port();
-        // Observer joined to the forward group would catch any re-forward.
-        let observer = bind_loopback_mcast(port).expect("observer bind");
         // Requester socket — the concrete reply destination.
         let requester = tokio::net::UdpSocket::bind("127.0.0.1:0")
             .await
@@ -2243,13 +2245,13 @@ mod tests {
             "reply to a forwarded SEARCH must be a SEARCH_RESPONSE"
         );
 
-        // The observer MUST NOT see a re-forward (anti-loop).
+        // lo_mcast MUST NOT see a re-forward (anti-loop).
         let mut obuf = [0u8; 4096];
         let reforward =
-            tokio::time::timeout(Duration::from_millis(150), observer.recv_from(&mut obuf)).await;
+            tokio::time::timeout(Duration::from_millis(150), lo_mcast.recv_from(&mut obuf)).await;
         assert!(
             reforward.is_err(),
-            "Forwarded origin must NOT re-forward, but observer got {reforward:?}"
+            "Forwarded origin must NOT re-forward, but lo_mcast got {reforward:?}"
         );
     }
 

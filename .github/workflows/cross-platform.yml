@@ -1,0 +1,81 @@
+name: Cross-platform build
+
+# Build + test the whole workspace on macOS, Linux, and Windows,
+# each on both arm64 and x86_64. The strict lint gate (clippy
+# `-D warnings`, doctests, feature-gated suites) stays in `rust.yml`
+# on Linux x86_64 — running it 6× would only add platform-specific
+# clippy noise. This workflow proves the code *compiles and tests*
+# everywhere; `rust.yml` proves it's *clean* on the canonical target.
+#
+# Hosted-runner notes:
+#   * `ubuntu-24.04-arm` / `windows-11-arm` are GitHub-hosted arm64
+#     runners — free for public repositories, billed for private ones.
+#   * `macos-15-intel` is an Intel (x86_64) macOS image; `macos-latest`
+#     (macos-15) is Apple Silicon (arm64).
+# The crates carry no native C `-sys` dependencies (TLS is rustls+ring,
+# compression is the pure-Rust lz4_flex), so no platform C toolchain or
+# vendored library is needed beyond the runner default.
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+# A new push to the same ref cancels the in-flight matrix.
+concurrency:
+  group: cross-platform-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      # One platform failing must not cancel the others — each cell
+      # reports portability independently.
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+          - name: macos-arm64
+            os: macos-latest
+          - name: macos-x86_64
+            os: macos-15-intel
+          - name: windows-x86_64
+            os: windows-latest
+          - name: windows-arm64
+            os: windows-11-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+
+      - uses: taiki-e/install-action@nextest
+
+      # Per-platform target cache. Keyed on the matrix name so the
+      # six cells don't clobber each other's cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      # Compiles libs, bins, AND test targets — the surest catch for
+      # platform-specific source that isn't `#[cfg]`-gated.
+      - name: Build (workspace + tests)
+        run: cargo build --workspace --tests --verbose
+
+      # `ci` profile (.config/nextest.toml) adds retries for the
+      # genuinely flaky network/timing integration suites.
+      - name: Test (nextest)
+        run: cargo nextest run --workspace --profile ci

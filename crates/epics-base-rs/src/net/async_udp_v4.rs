@@ -1585,12 +1585,18 @@ mod tests {
     async fn recv_with_meta_with_drops_returns_zero_under_normal_load() {
         let server = AsyncUdpV4::bind(0, false).expect("server bind");
         server.enable_so_rxq_ovfl().expect("enable counter");
-        let server_port = server.sockets[0]
-            .sock
-            .local_addr()
-            .expect("local_addr")
-            .port();
-        let dest = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port));
+        // Send to the server's LOOPBACK socket specifically. `bind(0,..)`
+        // binds one socket per NIC on independent ephemeral ports, and the
+        // loopback socket is not guaranteed to be index 0 — NIC enumeration
+        // order differs across platforms (it is last on Windows), so a send
+        // to `sockets[0]`'s port over 127.0.0.1 would never arrive there and
+        // the recv timed out. Select by `is_loopback`, as `loopback_send_and_recv`.
+        let dest = server
+            .ifaces()
+            .iter()
+            .find(|n| n.is_loopback)
+            .map(|n| n.sock.local_addr().unwrap())
+            .expect("loopback NIC must exist");
 
         let client = tokio::net::UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .await
@@ -1620,16 +1626,19 @@ mod tests {
     async fn recv_from_with_drop_count_returns_zero_under_normal_load() {
         let server = AsyncUdpV4::bind(0, false).expect("server bind");
         server.enable_so_rxq_ovfl().expect("enable counter");
-        let server_port = server.sockets[0]
-            .sock
-            .local_addr()
-            .expect("local_addr")
-            .port();
+        // Loopback socket specifically — not `sockets[0]`, which is not the
+        // loopback NIC on every platform (see
+        // recv_with_meta_with_drops_returns_zero_under_normal_load).
+        let dest = server
+            .ifaces()
+            .iter()
+            .find(|n| n.is_loopback)
+            .map(|n| n.sock.local_addr().unwrap())
+            .expect("loopback NIC must exist");
 
         let client = tokio::net::UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("client bind");
-        let dest = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port));
         let payload = b"hello-rxq-ovfl";
         client.send_to(payload, dest).await.expect("send");
 

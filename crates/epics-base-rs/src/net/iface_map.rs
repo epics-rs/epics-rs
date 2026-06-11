@@ -62,7 +62,11 @@ impl IfaceMap {
         let me = Self {
             inner: Arc::new(Mutex::new(Inner {
                 ifaces: Vec::new(),
-                last_refresh: Instant::now() - Duration::from_secs(3600),
+                // Overwritten by `refresh()` on the next line, so any valid
+                // Instant works. Must NOT back-date with `Instant - Duration`:
+                // that panics on Windows (where `Instant` is QPC-since-boot)
+                // whenever the machine's uptime is shorter than the span.
+                last_refresh: Instant::now(),
             })),
         };
         me.refresh();

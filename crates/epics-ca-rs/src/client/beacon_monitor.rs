@@ -1309,7 +1309,11 @@ mod tests {
 
     #[test]
     fn stale_prune_drops_idle_entries_only() {
-        let now = Instant::now();
+        // Anchor `now` a fixed span ahead of a real `base` so the back-dated
+        // `last_seen` values below subtract without underflowing Instant on
+        // Windows (QPC-since-boot, where uptime may be shorter than the span).
+        let base = Instant::now();
+        let now = base + Duration::from_secs(300);
         let mut servers: HashMap<SocketAddr, BeaconState> = HashMap::new();
         let fresh: SocketAddr = "127.0.0.1:5064".parse().unwrap();
         let stale: SocketAddr = "127.0.0.1:5065".parse().unwrap();

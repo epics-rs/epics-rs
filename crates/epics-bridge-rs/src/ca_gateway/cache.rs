@@ -729,18 +729,23 @@ mod tests {
         let dead = cache.insert(GwPvEntry::new_connecting("DEAD"));
         let active = cache.insert(GwPvEntry::new_connecting("ALIVE"));
 
-        // Backdate the dead one and put it in Dead state
+        // Put the dead one in Dead state. `state_since` stays "now"; expiry is
+        // driven by a zero `dead_timeout` below rather than back-dating the
+        // Instant (`Instant - Duration` panics on Windows, where Instant is
+        // QPC-since-boot, when uptime is shorter than the span).
         {
             let mut e = dead.write().await;
             e.state = PvState::Dead;
-            e.state_since = Instant::now() - Duration::from_secs(60 * 60);
         }
         {
             let mut e = active.write().await;
             e.state = PvState::Active;
         }
 
-        let timeouts = CacheTimeouts::default();
+        let timeouts = CacheTimeouts {
+            dead_timeout: Duration::ZERO,
+            ..CacheTimeouts::default()
+        };
         let removed = cache.cleanup(&timeouts).await;
 
         assert_eq!(removed, vec!["DEAD".to_string()]);
@@ -753,26 +758,29 @@ mod tests {
         let mut cache = PvCache::new();
         let stuck = cache.insert(GwPvEntry::new_connecting("STUCK"));
 
-        // Backdate so connect_timeout (1s default) has elapsed.
-        {
-            let mut e = stuck.write().await;
-            e.state_since = Instant::now() - Duration::from_secs(5);
-        }
-
-        let timeouts = CacheTimeouts::default();
-        let removed = cache.cleanup(&timeouts).await;
+        // Drive timing via injected timeouts rather than back-dating
+        // `state_since` (`Instant - Duration` panics on Windows when the
+        // machine's uptime is shorter than the span). A zero `connect_timeout`
+        // demotes the Connecting entry on the first sweep; the default
+        // `dead_timeout` keeps it alive that same pass.
+        let demote = CacheTimeouts {
+            connect_timeout: Duration::ZERO,
+            ..CacheTimeouts::default()
+        };
+        let removed = cache.cleanup(&demote).await;
 
         // First sweep: still in cache, but now in Dead state.
         assert!(removed.is_empty());
         assert!(cache.get("STUCK").is_some());
         assert_eq!(stuck.read().await.state, PvState::Dead);
 
-        // Second sweep with backdated state_since past dead_timeout: evicts.
-        {
-            let mut e = stuck.write().await;
-            e.state_since = Instant::now() - Duration::from_secs(60 * 5);
-        }
-        let removed = cache.cleanup(&timeouts).await;
+        // Second sweep with a zero `dead_timeout`: evicts the now-Dead entry
+        // (demotion reset `state_since` to "now", so a zero window suffices).
+        let evict = CacheTimeouts {
+            dead_timeout: Duration::ZERO,
+            ..CacheTimeouts::default()
+        };
+        let removed = cache.cleanup(&evict).await;
         assert_eq!(removed, vec!["STUCK".to_string()]);
         assert!(cache.get("STUCK").is_none());
     }

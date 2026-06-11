@@ -119,6 +119,18 @@ impl MotorRecord {
                 self.evaluate_position_error(&mut effects);
             }
             MotionPhase::Jog | MotionPhase::JogStopping => {
+                // C 1357-1364 (9c8a8e8c, PR #56): the driver reported done
+                // while the record still thinks it is jogging (no commanded
+                // stop — that would have moved us to JogStopping or
+                // MIP_STOP). The controller stopped on its own (internal
+                // limit, fault, host stop): clear_buttons() so the latched
+                // button does not re-fire the jog on the next pass.
+                if self.stat.phase == MotionPhase::Jog {
+                    self.ctrl.jogf = false;
+                    self.ctrl.jogr = false;
+                    self.ctrl.homf = false;
+                    self.ctrl.homr = false;
+                }
                 // C: postProcess syncs VAL<-RBV, DVAL<-DRBV before jog backlash
                 // This ensures start_jog_backlash uses the jog-end position as base
                 self.sync_positions();
@@ -139,6 +151,12 @@ impl MotorRecord {
             }
             MotionPhase::Homing => {
                 self.stat.athm = true;
+                // C postProcess home-done (893-906): clear the HOMF/HOMR
+                // buttons at home completion. Matters for a home resumed
+                // from queued_motion, whose button stayed latched through
+                // the stop (the C re-fire path keeps it until done).
+                self.ctrl.homf = false;
+                self.ctrl.homr = false;
                 // Sync positions after homing
                 self.sync_positions();
                 self.finalize_or_delay(&mut effects);
@@ -188,14 +206,12 @@ impl MotorRecord {
         self.internal.pending_retarget = None;
         self.internal.queued_motion = None;
         self.internal.verify_retarget_on_completion = false;
-        // C: 9c8a8e8c (PR #56) — clear motion buttons. When the controller
-        // stops on its own (internal limit, fault, host-issued stop) the
-        // JOGF/JOGR/HOMF/HOMR buttons must reset, otherwise the next process
-        // pass re-fires the motion.
-        self.ctrl.jogf = false;
-        self.ctrl.jogr = false;
-        self.ctrl.homf = false;
-        self.ctrl.homr = false;
+        // No blanket button clear here: C clears the buttons only at
+        // specific sites — the stop/pause pass while moving (1893/1900),
+        // a controller that stops a jog on its own (1357-1364, 9c8a8e8c),
+        // home completion (postProcess 893-906), and limit/LVIO handling.
+        // A jog button latched through SPMG=Pause must survive its stop
+        // completion so Go can resume the jog (C 1916-1918).
         // Sync last values
         self.internal.lval = self.pos.val;
         self.internal.ldvl = self.pos.dval;

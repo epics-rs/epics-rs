@@ -994,6 +994,63 @@ fn test_spmg_pause_then_go_resumes_queued_jog_from_button() {
             .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
         "no jog resume while paused"
     );
+    assert!(
+        rec.ctrl.jogf,
+        "jog button survives the pause-stop completion (C: no blanket \
+         button clear at finalize)"
+    );
+
+    // Go resumes the jog from the latched button (C 1916-1918).
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        effects.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveVelocity {
+                direction: true,
+                ..
+            }
+        )),
+        "Go re-arms the jog from the still-latched button"
+    );
+}
+
+#[test]
+fn test_queued_home_button_clears_at_home_completion() {
+    // A home queued behind a stop keeps its button latched until the
+    // resumed home completes (C postProcess re-fire keeps it, the
+    // home-done path at 893-906 clears it).
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.pos.dval = 50.0;
+    rec.plan_motion(CommandSource::Val);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    rec.ctrl.homf = true;
+    rec.plan_motion(CommandSource::Homf);
+    assert!(rec.internal.queued_motion.is_some());
+    assert!(rec.ctrl.homf, "button stays latched while queued");
+
+    // Stop completes → queued home fires.
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.movn = false;
+    let effects = rec.check_completion();
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Home { .. }))
+    );
+    assert_eq!(rec.stat.phase, MotionPhase::Homing);
+
+    // Home completes → button cleared, no re-fire fuel left.
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.movn = false;
+    let _ = rec.check_completion();
+    assert!(rec.stat.dmov);
+    assert!(!rec.ctrl.homf, "home button cleared at home completion");
 }
 
 #[test]

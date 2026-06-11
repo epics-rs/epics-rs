@@ -538,10 +538,24 @@ pub async fn run(
         let put_requested = ch_put_vals.get_i16().await != 0;
         if auto_mode || put_requested || use_set_mode {
             let speed_control = ch_speed_ctrl.get_i16().await != 0;
+            // Save the pre-coordination motor speeds for restoration after the
+            // move. Without it each coordinated move leaves a reduced `.VELO`
+            // that the next move reads back as its baseline, decaying the
+            // speeds geometrically toward zero. C `kohzuCtl_soft.st` saves
+            // oldThSpeed/oldYSpeed/oldZSpeed (kohzuCtl_soft.st:854-856) and
+            // restores them once the motors stop (kohzuCtl_soft.st:1040-1044).
+            let mut old_th_speed = 0.0;
+            let mut old_y_speed = 0.0;
+            let mut old_z_speed = 0.0;
+            let mut speeds_coordinated = false;
             if speed_control {
                 let th_speed = ch_theta_mot_velo.get_f64().await;
                 let y_speed = ch_y_mot_velo.get_f64().await;
                 let z_speed = ch_z_mot_velo.get_f64().await;
+                old_th_speed = th_speed;
+                old_y_speed = y_speed;
+                old_z_speed = z_speed;
+                speeds_coordinated = true;
                 let (new_th, new_y, new_z) = coordinate_speeds(
                     theta_val - current_rbv,
                     y_mot_desired - ch_y_mot_rbv.get_f64().await,
@@ -636,6 +650,18 @@ pub async fn run(
 
                 if th_dmov != 0 && y_dmov != 0 && z_dmov != 0 {
                     break;
+                }
+            }
+
+            // Restore the pre-coordination motor speeds now the move has
+            // stopped (C `kohzuCtl_soft.st` state thetaMotStopped).
+            if speeds_coordinated {
+                let _ = ch_theta_mot_velo.put_f64(old_th_speed).await;
+                if !cc_mode.y_frozen() {
+                    let _ = ch_y_mot_velo.put_f64(old_y_speed).await;
+                }
+                if !cc_mode.z_frozen() {
+                    let _ = ch_z_mot_velo.put_f64(old_z_speed).await;
                 }
             }
 

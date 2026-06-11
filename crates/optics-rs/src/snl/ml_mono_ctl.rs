@@ -663,6 +663,17 @@ pub async fn run(
         if auto_mode || put_requested || use_set_mode {
             let th_speed = ch_theta_mot_velo.get_f64().await;
             let z_speed = ch_z_mot_velo.get_f64().await;
+            // Save the pre-coordination motor speeds for restoration after the
+            // move; without it each coordinated move leaves a reduced `.VELO`
+            // that the next move reads back as its baseline, decaying the
+            // speeds geometrically toward zero. C `ml_monoCtl.st` saves
+            // oldThSpeed/oldTh2Speed/oldZSpeed (ml_monoCtl.st:905-907) and
+            // restores them once the motors stop (ml_monoCtl.st:1049-1054).
+            // Theta2 tracks Theta's speed, so read its baseline before it is
+            // overwritten below.
+            let old_th_speed = th_speed;
+            let old_th2_speed = ch_theta2_mot_velo.get_f64().await;
+            let old_z_speed = z_speed;
             let (new_th, new_z) = coordinate_speeds(
                 theta_val - current_rbv,
                 z_mot_desired - ch_z_mot_rbv.get_f64().await,
@@ -735,6 +746,16 @@ pub async fn run(
                 if th_dmov != 0 && th2_dmov != 0 && z_dmov != 0 {
                     break;
                 }
+            }
+
+            // Restore the pre-coordination motor speeds now the move has
+            // stopped (C `ml_monoCtl.st` state thetaMotStopped,
+            // ml_monoCtl.st:1049-1054). Theta2 tracks Theta's speed and is
+            // restored alongside it.
+            let _ = ch_theta_mot_velo.put_f64(old_th_speed).await;
+            let _ = ch_theta2_mot_velo.put_f64(old_th2_speed).await;
+            if !cc_mode.z_frozen() {
+                let _ = ch_z_mot_velo.put_f64(old_z_speed).await;
             }
 
             if _caused_move {

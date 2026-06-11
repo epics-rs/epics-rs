@@ -920,12 +920,28 @@ pub async fn run(
         if auto_mode || put_requested || use_set_mode {
             let _ = ch_moving.put_i16(1).await;
 
+            // Save the pre-coordination motor speeds so they can be restored
+            // once the move finishes. C `kohzuCtl.st` saves oldThSpeed/
+            // oldYSpeed/oldZSpeed before applying the coordinated speeds
+            // (state moveKohzu) and restores them when the motors stop
+            // (state thetaMotStopped). Without the restore, each coordinated
+            // move leaves a reduced `.VELO` that the next move reads back as
+            // its baseline, so the speeds decay geometrically toward zero.
+            let mut old_th_speed = 0.0;
+            let mut old_y_speed = 0.0;
+            let mut old_z_speed = 0.0;
+            let mut speeds_coordinated = false;
+
             // Coordinate speeds
             speed_control = ch_speed_ctrl.get_i16().await != 0;
             if speed_control {
                 let th_speed = ch_theta_mot_velo.get_f64().await;
                 let y_speed = ch_y_mot_velo.get_f64().await;
                 let z_speed = ch_z_mot_velo.get_f64().await;
+                old_th_speed = th_speed;
+                old_y_speed = y_speed;
+                old_z_speed = z_speed;
+                speeds_coordinated = true;
                 let th_delta = theta_val - current_rbv;
                 let y_delta = y_mot_desired - ch_y_mot_rbv.get_f64().await;
                 let z_delta = z_mot_desired - ch_z_mot_rbv.get_f64().await;
@@ -1093,6 +1109,23 @@ pub async fn run(
                     }
                 }
             }
+            // Restore the pre-coordination motor speeds on every exit from
+            // the move — normal completion, limit-switch stop, or retarget.
+            // C `kohzuCtl.st` restores them in state thetaMotStopped
+            // (kohzuCtl.st:1147-1153). Restoring *before* the retarget
+            // `continue` is what keeps the baseline read at the top of the
+            // next move clean, so coordinated speeds never compound across
+            // retargets.
+            if speeds_coordinated {
+                let _ = ch_theta_mot_velo.put_f64(old_th_speed).await;
+                if !cc_mode.y_frozen() {
+                    let _ = ch_y_mot_velo.put_f64(old_y_speed).await;
+                }
+                if !cc_mode.z_frozen() {
+                    let _ = ch_z_mot_velo.put_f64(old_z_speed).await;
+                }
+            }
+
             // If retarget, recalculate and immediately re-enter move logic
             if retarget {
                 let _ = ch_seq_msg1.put_string("Retargeting...").await;
@@ -1101,11 +1134,6 @@ pub async fn run(
                 continue;
             }
 
-            // Restore speeds if we changed them
-            if speed_control && _caused_move {
-                // Speeds were already replaced; the SNL code restores old speeds.
-                // In practice the next move recalculates anyway.
-            }
             _caused_move = false;
 
             // Final readback update

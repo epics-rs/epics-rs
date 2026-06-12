@@ -150,7 +150,12 @@ fn rmod_geometric_retry() {
 }
 
 #[test]
-fn rmod_inposition_no_retry() {
+fn rmod_inposition_settle_loop_holds_dmov() {
+    // C RMOD_I (motorRecord.cc:1432-1438): no move is re-issued; the
+    // settle watchdog re-arms unconditionally — with DLY == 0 it fires
+    // immediately — and maybeRetry (1077-1080) holds DMOV at FALSE
+    // across the loop. Each cycle counts against RTRY (1059 ++rcnt has
+    // no RMOD_I exemption); only close-enough or give-up finalizes.
     let mut rec = make_record();
     rec.retry.rdbd = 0.1;
     rec.retry.rtry = 5;
@@ -159,17 +164,70 @@ fn rmod_inposition_no_retry() {
     rec.pos.dval = 10.0;
     rec.plan_motion(CommandSource::Val);
 
-    // Motor stops with error > rdbd
+    // Cycle 1: motor stops with error > rdbd — no move re-issued, the
+    // settle wait re-arms, DMOV stays low.
     complete_move(&mut rec, 9.0);
     let effects = rec.check_completion();
-
-    // InPosition mode: no move re-issued (C do_work 2384 returns before
-    // dispatching), but the maybeRetry pass still counts the cycle
-    // against RTRY (C 1059 ++rcnt has no RMOD_I exemption).
-    assert!(rec.stat.dmov);
-    assert_eq!(rec.stat.phase, MotionPhase::Idle);
-    assert!(effects.commands.is_empty());
+    assert!(effects.commands.is_empty(), "no move re-issued");
+    assert!(!rec.stat.dmov, "DMOV holds FALSE through the settle loop");
+    assert_eq!(rec.stat.phase, MotionPhase::DelayWait);
+    assert!(rec.stat.mip.contains(MipFlags::RETRY));
+    assert!(rec.stat.mip.contains(MipFlags::DELAY_REQ));
+    assert!(effects.schedule_delay.is_some(), "watchdog re-armed");
     assert_eq!(rec.retry.rcnt, 1);
+
+    // Cycle 2: watchdog fires, servo still out of position — another
+    // settle cycle, still not done.
+    rec.set_event(MotorEvent::DelayExpired);
+    let _ = rec.do_process();
+    complete_move(&mut rec, 9.05);
+    let effects = rec.check_completion();
+    assert!(effects.commands.is_empty());
+    assert!(!rec.stat.dmov);
+    assert_eq!(rec.retry.rcnt, 2);
+
+    // Servo settles within RDBD: the next evaluation finalizes.
+    rec.set_event(MotorEvent::DelayExpired);
+    let _ = rec.do_process();
+    complete_move(&mut rec, 10.0);
+    let _ = rec.check_completion();
+    assert!(rec.stat.dmov, "close-enough ends the settle loop");
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert!(rec.stat.mip.is_empty());
+    assert_eq!(rec.retry.rcnt, 2, "the converged pass does not count");
+}
+
+#[test]
+fn rmod_inposition_settle_loop_gives_up_at_rtry() {
+    // C 1059-1075: the give-up branch has no RMOD_I exemption — when
+    // the servo never settles, ++rcnt exceeds RTRY, MISS latches, and
+    // the record finalizes.
+    let mut rec = make_record();
+    rec.retry.rdbd = 0.1;
+    rec.retry.rtry = 2;
+    rec.retry.rmod = RetryMode::InPosition;
+
+    rec.pos.dval = 10.0;
+    rec.plan_motion(CommandSource::Val);
+
+    complete_move(&mut rec, 9.0);
+    rec.check_completion();
+    assert_eq!(rec.retry.rcnt, 1);
+    rec.set_event(MotorEvent::DelayExpired);
+    let _ = rec.do_process();
+    complete_move(&mut rec, 9.0);
+    rec.check_completion();
+    assert_eq!(rec.retry.rcnt, 2);
+    assert!(!rec.stat.dmov);
+
+    // rcnt == rtry: the next far evaluation gives up.
+    rec.set_event(MotorEvent::DelayExpired);
+    let _ = rec.do_process();
+    complete_move(&mut rec, 9.0);
+    rec.check_completion();
+    assert!(rec.retry.miss, "give-up latches MISS");
+    assert!(rec.stat.dmov, "give-up finalizes");
+    assert_eq!(rec.retry.rcnt, 3, "the give-up pass still counts");
 }
 
 #[test]

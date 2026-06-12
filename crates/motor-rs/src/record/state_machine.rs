@@ -616,11 +616,17 @@ impl MotorRecord {
             }
             if self.retry.rmod == RetryMode::InPosition {
                 // C RMOD_I (motorRecord.cc:1432-1438): no move is
-                // re-issued — re-arm the delay and let the servo settle,
-                // counting the cycle against RTRY.
+                // re-issued — callbackRequestDelayed(dly) re-arms the
+                // settle watchdog UNCONDITIONALLY (dly == 0 fires it
+                // immediately), counting the cycle against RTRY. DMOV
+                // holds FALSE across the whole settle loop (maybeRetry
+                // 1077-1080); only the close-enough or give-up branch
+                // ends it.
                 self.retry.rcnt += 1;
-                self.stat.mip = MipFlags::RETRY;
-                self.finalize_or_delay(effects);
+                self.stat.mip = MipFlags::RETRY | MipFlags::DELAY_REQ;
+                self.set_phase(MotionPhase::DelayWait);
+                effects.schedule_delay =
+                    Some(std::time::Duration::from_secs_f64(self.timing.dly.max(0.0)));
                 return;
             }
 

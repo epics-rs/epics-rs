@@ -1148,14 +1148,16 @@ pub(crate) fn motor_put_field(
         "VELO" => match value {
             EpicsValue::Double(v) => {
                 rec.vel.velo = v;
-                // The rev↔EGU cross-calc is C special() — runtime only.
-                // During dbLoadRecords each field() lands raw (C writes the
-                // struct directly); `motor_sync_speed_at_init` reconciles
+                // The clamp and rev↔EGU cross-calc are C special() — runtime
+                // only. During dbLoadRecords each field() lands raw (C writes
+                // the struct directly); `motor_sync_speed_at_init` reconciles
                 // the pairs once all fields are applied.
                 if rec.internal.init_invariants_synced {
+                    // C motorRecord.cc:2690: VELO is clamped into [VBAS, VMAX].
+                    range_check(&mut rec.vel.velo, rec.vel.vbas, rec.vel.vmax);
                     let urev_abs = rec.conv.urev.abs();
                     if urev_abs > 0.0 {
-                        rec.vel.s = v / urev_abs;
+                        rec.vel.s = rec.vel.velo / urev_abs;
                     }
                 }
                 // C: 7291b556 — recalc ACCL/ACCS based on ACCU
@@ -1168,12 +1170,25 @@ pub(crate) fn motor_put_field(
             EpicsValue::Double(v) => {
                 rec.vel.vbas = v;
                 if rec.internal.init_invariants_synced {
+                    // C motorRecord.cc:2629-2633: VBAS is forced non-negative.
+                    if rec.vel.vbas < 0.0 {
+                        rec.vel.vbas = 0.0;
+                    }
                     let urev_abs = rec.conv.urev.abs();
                     if urev_abs > 0.0 {
-                        rec.vel.sbas = v / urev_abs;
+                        rec.vel.sbas = rec.vel.vbas / urev_abs;
                     }
                 }
                 apply_accu_cascade(rec);
+                if rec.internal.init_invariants_synced {
+                    // C motorRecord.cc:3121-3127: a VBAS raised above VMAX
+                    // drags VMAX (and SMAX) up with it.
+                    if rec.vel.vmax != 0.0 && rec.vel.vbas > rec.vel.vmax {
+                        rec.vel.vmax = rec.vel.vbas;
+                        rec.vel.smax = rec.vel.sbas;
+                    }
+                    revalidate_velocities(rec);
+                }
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1182,10 +1197,21 @@ pub(crate) fn motor_put_field(
             EpicsValue::Double(v) => {
                 rec.vel.vmax = v;
                 if rec.internal.init_invariants_synced {
+                    // C motorRecord.cc:2660-2664: VMAX is forced non-negative.
+                    if rec.vel.vmax < 0.0 {
+                        rec.vel.vmax = 0.0;
+                    }
                     let urev_abs = rec.conv.urev.abs();
                     if urev_abs > 0.0 {
-                        rec.vel.smax = v / urev_abs;
+                        rec.vel.smax = rec.vel.vmax / urev_abs;
                     }
+                    // C motorRecord.cc:3110-3117: a VMAX dropped below VBAS
+                    // drags VBAS (and SBAS) down with it.
+                    if rec.vel.vmax != 0.0 && rec.vel.vmax < rec.vel.vbas {
+                        rec.vel.vbas = rec.vel.vmax;
+                        rec.vel.sbas = rec.vel.smax;
+                    }
+                    revalidate_velocities(rec);
                 }
                 Ok(())
             }
@@ -1195,11 +1221,15 @@ pub(crate) fn motor_put_field(
             EpicsValue::Double(v) => {
                 rec.vel.s = v;
                 if rec.internal.init_invariants_synced {
+                    // C motorRecord.cc:2702: S is clamped into [SBAS, SMAX].
+                    range_check(&mut rec.vel.s, rec.vel.sbas, rec.vel.smax);
                     let urev_abs = rec.conv.urev.abs();
                     if urev_abs > 0.0 {
-                        rec.vel.velo = v * urev_abs;
+                        rec.vel.velo = rec.vel.s * urev_abs;
                     }
                 }
+                // C motorRecord.cc:2710: ACCL/ACCS follow the VELO change.
+                apply_accu_cascade(rec);
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1208,10 +1238,24 @@ pub(crate) fn motor_put_field(
             EpicsValue::Double(v) => {
                 rec.vel.sbas = v;
                 if rec.internal.init_invariants_synced {
+                    // C motorRecord.cc:2644-2648: SBAS is forced non-negative.
+                    if rec.vel.sbas < 0.0 {
+                        rec.vel.sbas = 0.0;
+                    }
                     let urev_abs = rec.conv.urev.abs();
                     if urev_abs > 0.0 {
-                        rec.vel.vbas = v * urev_abs;
+                        rec.vel.vbas = rec.vel.sbas * urev_abs;
                     }
+                }
+                // C motorRecord.cc:2655: ACCL/ACCS follow the VBAS change.
+                apply_accu_cascade(rec);
+                if rec.internal.init_invariants_synced {
+                    // C motorRecord.cc:3121-3127 (shared VBAS/SBAS tail).
+                    if rec.vel.vmax != 0.0 && rec.vel.vbas > rec.vel.vmax {
+                        rec.vel.vmax = rec.vel.vbas;
+                        rec.vel.smax = rec.vel.sbas;
+                    }
+                    revalidate_velocities(rec);
                 }
                 Ok(())
             }
@@ -1221,10 +1265,20 @@ pub(crate) fn motor_put_field(
             EpicsValue::Double(v) => {
                 rec.vel.smax = v;
                 if rec.internal.init_invariants_synced {
+                    // C motorRecord.cc:2675-2679: SMAX is forced non-negative.
+                    if rec.vel.smax < 0.0 {
+                        rec.vel.smax = 0.0;
+                    }
                     let urev_abs = rec.conv.urev.abs();
                     if urev_abs > 0.0 {
-                        rec.vel.vmax = v * urev_abs;
+                        rec.vel.vmax = rec.vel.smax * urev_abs;
                     }
+                    // C motorRecord.cc:3110-3117 (shared VMAX/SMAX tail).
+                    if rec.vel.vmax != 0.0 && rec.vel.vmax < rec.vel.vbas {
+                        rec.vel.vbas = rec.vel.vmax;
+                        rec.vel.sbas = rec.vel.smax;
+                    }
+                    revalidate_velocities(rec);
                 }
                 Ok(())
             }
@@ -1270,9 +1324,11 @@ pub(crate) fn motor_put_field(
             EpicsValue::Double(v) => {
                 rec.vel.bvel = v;
                 if rec.internal.init_invariants_synced {
+                    // C motorRecord.cc:2714: BVEL is clamped into [VBAS, VMAX].
+                    range_check(&mut rec.vel.bvel, rec.vel.vbas, rec.vel.vmax);
                     let urev_abs = rec.conv.urev.abs();
                     if urev_abs > 0.0 {
-                        rec.vel.sbak = v / urev_abs;
+                        rec.vel.sbak = rec.vel.bvel / urev_abs;
                     }
                 }
                 Ok(())
@@ -1290,6 +1346,10 @@ pub(crate) fn motor_put_field(
         "HVEL" => match value {
             EpicsValue::Double(v) => {
                 rec.vel.hvel = v;
+                if rec.internal.init_invariants_synced {
+                    // C motorRecord.cc:3081: HVEL is clamped into [VBAS, VMAX].
+                    range_check(&mut rec.vel.hvel, rec.vel.vbas, rec.vel.vmax);
+                }
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1297,6 +1357,10 @@ pub(crate) fn motor_put_field(
         "JVEL" => match value {
             EpicsValue::Double(v) => {
                 rec.vel.jvel = v;
+                if rec.internal.init_invariants_synced {
+                    // C motorRecord.cc:3057: JVEL is clamped into [VBAS, VMAX].
+                    range_check(&mut rec.vel.jvel, rec.vel.vbas, rec.vel.vmax);
+                }
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1312,9 +1376,11 @@ pub(crate) fn motor_put_field(
             EpicsValue::Double(v) => {
                 rec.vel.sbak = v;
                 if rec.internal.init_invariants_synced {
+                    // C motorRecord.cc:2725: SBAK is clamped into [SBAS, SMAX].
+                    range_check(&mut rec.vel.sbak, rec.vel.sbas, rec.vel.smax);
                     let urev_abs = rec.conv.urev.abs();
                     if urev_abs > 0.0 {
-                        rec.vel.bvel = v * urev_abs;
+                        rec.vel.bvel = rec.vel.sbak * urev_abs;
                     }
                 }
                 Ok(())
@@ -1957,6 +2023,24 @@ fn range_check(parm: &mut f64, min: f64, max: f64) {
     if max != 0.0 && *parm > max {
         *parm = max;
     }
+}
+
+/// C special() `velcheckA` tail (motorRecord.cc:3128-3148): after a
+/// VBAS/SBAS/VMAX/SMAX write changes the velocity window, re-clamp every
+/// dependent velocity into the new [VBAS, VMAX] and re-derive the rev-unit
+/// partners of VELO and BVEL.
+fn revalidate_velocities(rec: &mut MotorRecord) {
+    let urev_abs = rec.conv.urev.abs();
+    range_check(&mut rec.vel.velo, rec.vel.vbas, rec.vel.vmax);
+    if urev_abs > 0.0 {
+        rec.vel.s = rec.vel.velo / urev_abs;
+    }
+    range_check(&mut rec.vel.bvel, rec.vel.vbas, rec.vel.vmax);
+    if urev_abs > 0.0 {
+        rec.vel.sbak = rec.vel.bvel / urev_abs;
+    }
+    range_check(&mut rec.vel.jvel, rec.vel.vbas, rec.vel.vmax);
+    range_check(&mut rec.vel.hvel, rec.vel.vbas, rec.vel.vmax);
 }
 
 /// Reconcile the rev↔EGU speed pairs at IOC init — the speed half of C

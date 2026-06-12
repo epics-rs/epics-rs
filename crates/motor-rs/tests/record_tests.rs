@@ -5051,3 +5051,120 @@ mod one_sided_limit_writes {
         assert_eq!(rec.limits.hlm, 33.0, "HLM untouched");
     }
 }
+
+// =============================================================================
+// Runtime velocity clamps — C special() range_check and the VBAS/VMAX
+// coupling tail (motorRecord.cc:2627-2732, 3056-3082, 3107-3148)
+// =============================================================================
+
+mod velocity_clamps {
+    use super::*;
+
+    fn inited() -> MotorRecord {
+        let mut rec = MotorRecord::new();
+        rec.conv.urev = 1.0;
+        rec.init_record(1).unwrap();
+        rec
+    }
+
+    // C 2690: a VELO above VMAX is clamped down; S follows.
+    #[test]
+    fn velo_clamped_into_vbas_vmax_window() {
+        let mut rec = inited();
+        rec.put_field("VBAS", EpicsValue::Double(0.5)).unwrap();
+        rec.put_field("VMAX", EpicsValue::Double(4.0)).unwrap();
+        rec.put_field("VELO", EpicsValue::Double(9.0)).unwrap();
+        assert_eq!(rec.vel.velo, 4.0);
+        assert_eq!(rec.vel.s, 4.0);
+        rec.put_field("VELO", EpicsValue::Double(0.1)).unwrap();
+        assert_eq!(rec.vel.velo, 0.5);
+    }
+
+    // C 4364-4372: max == 0 means "no ceiling" — only the VBAS floor applies.
+    #[test]
+    fn vmax_zero_means_no_ceiling() {
+        let mut rec = inited();
+        rec.put_field("VBAS", EpicsValue::Double(0.5)).unwrap();
+        rec.put_field("VELO", EpicsValue::Double(900.0)).unwrap();
+        assert_eq!(rec.vel.velo, 900.0);
+    }
+
+    // C 2629-2633 / 2660-2664: VBAS and VMAX are forced non-negative.
+    #[test]
+    fn negative_vbas_and_vmax_forced_to_zero() {
+        let mut rec = inited();
+        rec.put_field("VBAS", EpicsValue::Double(-1.0)).unwrap();
+        assert_eq!(rec.vel.vbas, 0.0);
+        rec.put_field("VMAX", EpicsValue::Double(-2.0)).unwrap();
+        assert_eq!(rec.vel.vmax, 0.0);
+    }
+
+    // C 3110-3117: VMAX dropped below VBAS drags VBAS (and SBAS) down,
+    // then every dependent velocity re-clamps into the new window.
+    #[test]
+    fn vmax_below_vbas_drags_vbas_down_and_reclamps() {
+        let mut rec = inited();
+        rec.put_field("VBAS", EpicsValue::Double(2.0)).unwrap();
+        rec.put_field("VMAX", EpicsValue::Double(10.0)).unwrap();
+        rec.put_field("VELO", EpicsValue::Double(8.0)).unwrap();
+        rec.put_field("JVEL", EpicsValue::Double(8.0)).unwrap();
+        rec.put_field("VMAX", EpicsValue::Double(1.0)).unwrap();
+        assert_eq!(rec.vel.vbas, 1.0, "VBAS dragged down to VMAX");
+        assert_eq!(rec.vel.sbas, 1.0, "SBAS follows VBAS");
+        assert_eq!(rec.vel.velo, 1.0, "VELO re-clamped");
+        assert_eq!(rec.vel.jvel, 1.0, "JVEL re-clamped");
+    }
+
+    // C 3121-3127: VBAS raised above VMAX drags VMAX (and SMAX) up.
+    #[test]
+    fn vbas_above_vmax_drags_vmax_up() {
+        let mut rec = inited();
+        rec.put_field("VMAX", EpicsValue::Double(3.0)).unwrap();
+        rec.put_field("VBAS", EpicsValue::Double(5.0)).unwrap();
+        assert_eq!(rec.vel.vmax, 5.0, "VMAX dragged up to VBAS");
+        assert_eq!(rec.vel.smax, 5.0, "SMAX follows VMAX");
+        assert_eq!(rec.vel.velo, 5.0, "VELO re-clamped up to the new floor");
+    }
+
+    // C 3128-3148 velcheckA: BVEL/JVEL/HVEL re-clamp on a VBAS write, and
+    // SBAK follows the clamped BVEL.
+    #[test]
+    fn vbas_write_reclamps_bvel_jvel_hvel() {
+        let mut rec = inited();
+        rec.put_field("VMAX", EpicsValue::Double(10.0)).unwrap();
+        rec.put_field("BVEL", EpicsValue::Double(0.2)).unwrap();
+        rec.put_field("JVEL", EpicsValue::Double(0.2)).unwrap();
+        rec.put_field("HVEL", EpicsValue::Double(0.2)).unwrap();
+        rec.put_field("VBAS", EpicsValue::Double(1.0)).unwrap();
+        assert_eq!(rec.vel.bvel, 1.0);
+        assert_eq!(rec.vel.sbak, 1.0);
+        assert_eq!(rec.vel.jvel, 1.0);
+        assert_eq!(rec.vel.hvel, 1.0);
+    }
+
+    // C 2702 / 2725: the rev-unit pair members clamp in rev units
+    // ([SBAS, SMAX]) and their EGU partner follows.
+    #[test]
+    fn s_and_sbak_clamp_in_rev_units() {
+        let mut rec = inited();
+        rec.conv.urev = 2.0;
+        rec.put_field("SMAX", EpicsValue::Double(3.0)).unwrap();
+        rec.put_field("S", EpicsValue::Double(5.0)).unwrap();
+        assert_eq!(rec.vel.s, 3.0);
+        assert_eq!(rec.vel.velo, 6.0, "VELO = S * |UREV|");
+        rec.put_field("SBAK", EpicsValue::Double(7.0)).unwrap();
+        assert_eq!(rec.vel.sbak, 3.0);
+        assert_eq!(rec.vel.bvel, 6.0, "BVEL = SBAK * |UREV|");
+    }
+
+    // The clamps are C special() semantics — runtime only. During
+    // dbLoadRecords (pre-init) every field() must land raw.
+    #[test]
+    fn clamps_inert_before_init() {
+        let mut rec = MotorRecord::new();
+        rec.put_field("VBAS", EpicsValue::Double(-1.0)).unwrap();
+        assert_eq!(rec.vel.vbas, -1.0, "raw during load");
+        rec.put_field("VELO", EpicsValue::Double(900.0)).unwrap();
+        assert_eq!(rec.vel.velo, 900.0, "raw during load");
+    }
+}

@@ -400,6 +400,16 @@ impl MotorRecord {
                     self.postprocess_sync();
                     self.finalize_motion(&mut effects);
                 }
+                // C do_work gate (motorRecord.cc:1486-1492): a
+                // done-record callback falls into do_work through the
+                // dmov arm, where the home/jog/tweak sections act on
+                // latched button state. The idle poll is the
+                // level-triggered pass that picks up a button latched
+                // while its gate failed — limit switch active, or the
+                // closed-loop DOL collection bypass — once the gate
+                // clears. The LOAD_P and pp completion returns above
+                // skip one pass; the next poll lands here.
+                self.dispatch_latent_collection(&mut effects);
             }
         }
 

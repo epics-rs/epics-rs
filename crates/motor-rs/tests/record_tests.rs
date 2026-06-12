@@ -4274,6 +4274,127 @@ fn test_closed_loop_latent_tweak_skipped_on_val_pass() {
     assert!(rec.ctrl.twf, "button stays latched");
 }
 
+// --- Level-triggered latent collection (C do_work gate, 1486-1492) ---
+
+#[test]
+fn test_latent_jog_fires_on_no_event_pass_after_omsl_flip() {
+    // C do_work runs on every put pass (1486-1492) and its jog section
+    // (2079) acts on latched button STATE: a JOGF latched under the
+    // closed-loop bypass dispatches on the first supervisory pass —
+    // here the no-event process pass after the OMSL flip — without
+    // JOGF being re-written.
+    let mut rec = MotorRecord::new();
+    rec.links.omsl = 1;
+    rec.links.dol = "setpoint_src.VAL".to_string();
+    rec.stat.msta = MstaFlags::DONE;
+
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    rec.do_process();
+    assert_eq!(
+        rec.stat.phase,
+        MotionPhase::Idle,
+        "bypassed under closed loop"
+    );
+    assert!(rec.ctrl.jogf, "button latched");
+
+    rec.put_field("OMSL", EpicsValue::Short(0)).unwrap();
+    rec.do_process();
+    assert_eq!(rec.stat.phase, MotionPhase::Jog, "latched jog dispatches");
+    assert!(rec.stat.mip.contains(MipFlags::JOGF));
+    assert!(!rec.stat.dmov);
+}
+
+#[test]
+fn test_latent_tweak_folds_and_moves_after_omsl_flip() {
+    // C tweak section (2167-2181): a TWF latched under the closed-loop
+    // bypass folds into VAL on the first supervisory do_work pass and
+    // the move block dispatches the combined move.
+    let mut rec = MotorRecord::new();
+    rec.links.omsl = 1;
+    rec.links.dol = "setpoint_src.VAL".to_string();
+    rec.conv.mres = 0.01;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.pos.val = 10.0;
+    rec.pos.dval = 10.0;
+    rec.ctrl.twv = 1.0;
+
+    rec.put_field("TWF", EpicsValue::Short(1)).unwrap();
+    rec.do_process();
+    assert_eq!(rec.pos.val, 10.0, "no fold under closed loop");
+    assert!(rec.ctrl.twf, "TWF latched");
+
+    rec.put_field("OMSL", EpicsValue::Short(0)).unwrap();
+    rec.do_process();
+    assert_eq!(rec.pos.val, 11.0, "fold lands on the supervisory pass");
+    assert!(!rec.ctrl.twf, "button consumed by the fold");
+    assert_eq!(rec.stat.phase, MotionPhase::MainMove, "move dispatched");
+}
+
+#[test]
+fn test_limit_blocked_homf_fires_on_idle_poll_when_limit_clears() {
+    use asyn_rs::interfaces::motor::MotorStatus;
+    // C home-section gate (2013-2014): a HOMF blocked by the high-limit
+    // switch stays latched; the section re-evaluates the STATE on every
+    // do_work pass, so the done-record callback reporting the switch
+    // released (the dmov arm of the 1486-1492 gate) dispatches the home.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.limits.hls = true;
+    rec.stat.msta = MstaFlags::DONE;
+
+    rec.put_field("HOMF", EpicsValue::Short(1)).unwrap();
+    rec.do_process();
+    assert_eq!(rec.stat.phase, MotionPhase::Idle, "blocked by HLS");
+    assert!(rec.ctrl.homf, "button stays latched");
+
+    // The poll that reports the switch released.
+    let cleared = MotorStatus {
+        done: true,
+        ..Default::default()
+    };
+    rec.set_event(MotorEvent::DeviceUpdate(cleared));
+    rec.do_process();
+    assert_eq!(
+        rec.stat.phase,
+        MotionPhase::Homing,
+        "latched home dispatches"
+    );
+    assert!(rec.stat.mip.contains(MipFlags::HOMF));
+    assert!(rec.ctrl.homf, "button reads back 1 for the whole home");
+}
+
+#[test]
+fn test_stup_ack_pass_runs_latent_collection() {
+    use asyn_rs::interfaces::motor::MotorStatus;
+    // C 1345 + 1486-1492: the GET_INFO ack callback skips the
+    // motor-stopped branch but still falls into do_work via the dmov
+    // arm, so a home latched behind a limit switch dispatches on the
+    // ack pass that reports the switch released.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.limits.hls = true;
+    rec.stat.msta = MstaFlags::DONE;
+
+    rec.put_field("HOMF", EpicsValue::Short(1)).unwrap();
+    rec.do_process();
+    assert!(rec.ctrl.homf, "blocked HOMF stays latched");
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+
+    let cleared = MotorStatus {
+        done: true,
+        ..Default::default()
+    };
+    rec.internal.stup_ack = true;
+    rec.set_event(MotorEvent::DeviceUpdate(cleared));
+    rec.do_process();
+    assert_eq!(
+        rec.stat.phase,
+        MotionPhase::Homing,
+        "ack pass dispatches the latched home"
+    );
+    assert!(rec.stat.mip.contains(MipFlags::HOMF));
+}
+
 #[test]
 fn test_stop_sync_skipped_under_closed_loop_omsl() {
     // C postProcess 827: the VAL/DVAL/RVAL <- readback resync at stop

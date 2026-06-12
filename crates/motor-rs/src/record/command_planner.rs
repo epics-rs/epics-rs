@@ -1066,6 +1066,39 @@ impl MotorRecord {
         false
     }
 
+    /// C do_work gate (motorRecord.cc:1486-1492): do_work runs on every
+    /// put pass (`process_reason != CALLBACK_DATA`) and on done-record
+    /// callbacks (the `dmov` arm), and its home (2010), jog (2079), and
+    /// tweak (2167-2181) sections act on latched button STATE — not on
+    /// which write triggered the pass. plan_motion covers the move-block
+    /// srcs and the SPMG=Go resume; this runs the same collection on the
+    /// level-triggered passes with no command source (the None event,
+    /// the idle poll, the STUP ack), so a button latched while its gate
+    /// failed — limit switch active, or the closed-loop DOL collection
+    /// bypass (1994-2008) — fires once the gate clears.
+    ///
+    /// Gates, all C's: SPMG Go/Move (stop_or_pause returns at 2237
+    /// before the sections), the closed-loop bypass else (2008), and
+    /// dmov (1490). The dmov gate means a put pass during motion defers
+    /// the latched state to the completion/idle poll instead of queueing
+    /// through the movn branches — a deferral bounded by one poll
+    /// period, and it keeps the in-flight retarget invariants owned by
+    /// the explicit Val-arm path.
+    pub(super) fn dispatch_latent_collection(&mut self, effects: &mut ProcessEffects) {
+        if !self.stat.dmov || !self.can_accept_command() || self.closed_loop_dol_collection() {
+            return;
+        }
+        if self.dispatch_latent_buttons(effects) {
+            return;
+        }
+        // C tweak section (2167-2181) + move block: the fold lands in
+        // VAL/DVAL on this pass and the move block dispatches it, like
+        // the Twf/Twr arm.
+        if self.collect_tweak() {
+            self.plan_absolute_move(effects);
+        }
+    }
+
     /// Start homing.
     fn start_home(&mut self, forward: bool, effects: &mut ProcessEffects) {
         // C: if motor is moving, stop first then queue home for after stop.
@@ -1930,7 +1963,13 @@ impl MotorRecord {
                 // C also runs: the gate only covers the stopped case),
                 // and the next poll evaluates completion.
                 if stup_ack && !self.stat.movn {
-                    return ProcessEffects::default();
+                    // C do_work gate (1486-1492): the GET_INFO ack pass
+                    // still reaches do_work through the dmov arm, so a
+                    // button/tweak latched while the STUP was in flight
+                    // dispatches here even though completion is skipped.
+                    let mut effects = ProcessEffects::default();
+                    self.dispatch_latent_collection(&mut effects);
+                    return effects;
                 }
                 self.check_completion()
             }
@@ -1969,9 +2008,16 @@ impl MotorRecord {
                 // pipeline still has to run so MIP_EXTERNAL clears and DMOV
                 // returns to 1 once the driver finishes.
                 if self.stat.mip.contains(MipFlags::EXTERNAL) {
+                    // check_completion's Idle arm runs the latent
+                    // collection at its tail, so this pass is covered.
                     self.check_completion()
                 } else {
-                    ProcessEffects::default()
+                    // C do_work gate (1486-1492): the put pass continues
+                    // into do_work, whose home/jog/tweak sections act on
+                    // latched button state.
+                    let mut effects = ProcessEffects::default();
+                    self.dispatch_latent_collection(&mut effects);
+                    effects
                 }
             }
         }

@@ -1603,8 +1603,11 @@ pub(crate) fn motor_put_field(
                 if rec.stat.mip.intersects(MipFlags::HOMF | MipFlags::HOMR) {
                     return Err(CaError::InvalidValue("HOMF: home in progress".into()));
                 }
+                // C writes the field value: a 0-write un-latches a parked
+                // button (e.g. one blocked at its limit switch) without
+                // triggering a dispatch pass.
+                rec.ctrl.homf = v != 0;
                 if v != 0 {
-                    rec.ctrl.homf = true;
                     rec.last_write = Some(CommandSource::Homf);
                 }
                 Ok(())
@@ -1618,8 +1621,9 @@ pub(crate) fn motor_put_field(
                 if rec.stat.mip.intersects(MipFlags::HOMF | MipFlags::HOMR) {
                     return Err(CaError::InvalidValue("HOMR: home in progress".into()));
                 }
+                // C writes the field value, like HOMF above.
+                rec.ctrl.homr = v != 0;
                 if v != 0 {
-                    rec.ctrl.homr = true;
                     rec.last_write = Some(CommandSource::Homr);
                 }
                 Ok(())

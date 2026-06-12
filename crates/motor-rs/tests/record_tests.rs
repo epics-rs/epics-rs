@@ -266,11 +266,66 @@ fn test_home_forward() {
     assert!(!rec.stat.dmov);
     assert_eq!(rec.stat.phase, MotionPhase::Homing);
     assert!(rec.stat.mip.contains(MipFlags::HOMF));
-    assert!(!rec.ctrl.homf); // pulse cleared
+    // C does not clear the button at dispatch: HOMF reads back 1 for
+    // the whole home and clears at completion (postProcess 893-906).
+    assert!(rec.ctrl.homf);
     assert!(matches!(
         effects.commands[0],
         MotorCommand::Home { forward: true, .. }
     ));
+}
+
+#[test]
+fn test_blocked_homf_stays_latched_and_zero_write_unlatches() {
+    // C home gate (2013-2014): a HOMF blocked by its limit switch
+    // simply fails the gate — the button stays latched (no clear, no
+    // DMOV change). A HOMF=0 put writes the field and un-latches it.
+    let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::DONE;
+    rec.limits.hls = true;
+
+    rec.put_field("HOMF", EpicsValue::Short(1)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Homf);
+    assert!(effects.commands.is_empty(), "blocked home must not fire");
+    assert!(rec.ctrl.homf, "button stays latched like C's failed gate");
+    assert!(rec.stat.dmov, "no DMOV drop outside the gate");
+    assert!(rec.stat.mip.is_empty());
+
+    rec.put_field("HOMF", EpicsValue::Short(0)).unwrap();
+    assert!(!rec.ctrl.homf, "a 0-write un-latches the parked button");
+}
+
+#[test]
+fn test_pause_during_active_home_clears_buttons() {
+    // C 1899-1900: `if (mip & MIP_HOME) clear_buttons()` — the Pause
+    // path cancels an ACTIVE home's latched button, not only a queued
+    // one, so Go must not re-dispatch the home.
+    let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::DONE;
+    rec.put_field("HOMF", EpicsValue::Short(1)).unwrap();
+    rec.plan_motion(CommandSource::Homf);
+    assert!(rec.stat.mip.contains(MipFlags::HOMF));
+    assert!(rec.ctrl.homf, "button reads 1 during the home");
+
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.plan_motion(CommandSource::Spmg);
+    assert!(!rec.ctrl.homf, "Pause cancels the active home's button");
+    assert_eq!(rec.stat.mip, MipFlags::STOP);
+
+    // Axis stops; pp armed by the home dispatch syncs and finalizes.
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.movn = false;
+    rec.check_completion();
+
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Home { .. })),
+        "Go after Pause must not resume the canceled home"
+    );
 }
 
 #[test]
@@ -366,8 +421,13 @@ fn test_homf_homr_puts_rejected_while_home_in_flight() {
 
     assert!(rec.put_field("HOMF", EpicsValue::Short(1)).is_err());
     assert!(rec.put_field("HOMR", EpicsValue::Short(1)).is_err());
-    assert!(!rec.ctrl.homf, "vetoed put must not latch the button");
+    // HOMF reads 1 from its own dispatch latch (C 893-906); the vetoed
+    // opposite-direction put must not latch.
+    assert!(rec.ctrl.homf, "button reads 1 during its own home");
     assert!(!rec.ctrl.homr, "vetoed put must not latch the button");
+    // A vetoed 0-write must not un-latch it either.
+    assert!(rec.put_field("HOMF", EpicsValue::Short(0)).is_err());
+    assert!(rec.ctrl.homf);
 }
 
 #[test]
@@ -1264,7 +1324,7 @@ fn test_latent_homf_fires_on_move_block_pass() {
         "home wins over the same-pass VAL write (C section order)"
     );
     assert_eq!(rec.stat.mip, MipFlags::HOMF);
-    assert!(!rec.ctrl.homf, "button pulses off when the home starts");
+    assert!(rec.ctrl.homf, "button reads 1 during the home (C 893-906)");
     assert_eq!(rec.stat.phase, MotionPhase::Homing);
 }
 

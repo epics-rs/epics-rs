@@ -305,9 +305,10 @@ impl MotorRecord {
             MotionPhase::Homing => {
                 self.stat.athm = true;
                 // C postProcess home-done (893-906): clear the HOMF/HOMR
-                // buttons at home completion. Matters for a home resumed
-                // from queued_motion, whose button stayed latched through
-                // the stop (the C re-fire path keeps it until done).
+                // buttons at home completion. The dispatch leaves the
+                // button latched (it reads back 1 for the whole home), so
+                // this is the lifecycle owner for the done path; stops
+                // and pauses clear via clear_buttons (1893/1899-1900).
                 self.ctrl.homf = false;
                 self.ctrl.homr = false;
                 // C 1387-1397: a VAL written while homing could not

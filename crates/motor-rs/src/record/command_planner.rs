@@ -91,8 +91,12 @@ impl MotorRecord {
                     // no MIP change, no dispatch, button stays latched.
                     // The Go pass falls through the top block into the
                     // home section and dispatches it (handle_spmg_change
-                    // mirrors that fall-through).
-                    if matches!(src, CommandSource::Homf | CommandSource::Homr) {
+                    // mirrors that fall-through). The DMOV drop sits
+                    // INSIDE the entry gate — a button that fails it
+                    // (blocked by its limit switch) changes nothing.
+                    if matches!(src, CommandSource::Homf | CommandSource::Homr)
+                        && self.latent_home_request().is_some()
+                    {
                         self.stat.dmov = false;
                     }
                     // C 2167-2181: the tweak fold is NOT gated by
@@ -315,8 +319,14 @@ impl MotorRecord {
                 // no-op.
             }
             CommandSource::Homf | CommandSource::Homr => {
-                let forward = src == CommandSource::Homf;
-                self.start_home(forward, &mut effects);
+                // C home-section entry gate (2013-2014) acts on the
+                // latched button STATE the put left behind, not on src; a
+                // direction already homing or blocked by its limit switch
+                // fails the gate and the button stays latched (C falls
+                // through the section without touching it).
+                if let Some(forward) = self.latent_home_request() {
+                    self.start_home(forward, &mut effects);
+                }
             }
             CommandSource::Twf | CommandSource::Twr => {
                 // The fold already ran in the collection above (SET-mode
@@ -974,17 +984,6 @@ impl MotorRecord {
             return;
         }
 
-        // C: check limit switch in direction of home before starting
-        // HOMF blocked by HLS (when DIR=Pos) or LLS (when DIR=Neg)
-        if self.home_blocked_by_limit(forward) {
-            if forward {
-                self.ctrl.homf = false;
-            } else {
-                self.ctrl.homr = false;
-            }
-            return;
-        }
-
         self.stat.dmov = false;
         // C 2069: the home dispatch resets the retry counter.
         self.retry.rcnt = 0;
@@ -992,12 +991,16 @@ impl MotorRecord {
         // the direct branch before the movn test).
         self.internal.pp = true;
 
+        // C does NOT clear the button at dispatch: HOMF/HOMR read back 1
+        // for the whole home and clear at completion (postProcess
+        // 893-906) or on a stop/pause (clear_buttons, 1893/1899-1900).
+        // Every caller enters through latent_home_request (the C
+        // 2013-2014 gate: button latched, direction not already homing,
+        // limit switch clear), so a latched button cannot re-dispatch.
         if forward {
             self.stat.mip = MipFlags::HOMF;
-            self.ctrl.homf = false; // pulse
         } else {
             self.stat.mip = MipFlags::HOMR;
-            self.ctrl.homr = false; // pulse
         }
         self.set_phase(MotionPhase::Homing);
 
@@ -1129,7 +1132,10 @@ impl MotorRecord {
                 // queued/active home (MIP_HOMF|HOMR), and clear_buttons()
                 // drops the home buttons: a paused jog resumes from its
                 // still-latched button on Go, a canceled home does not.
-                if matches!(self.internal.queued_motion, Some(QueuedMotion::Home { .. })) {
+                // C 1899-1900: `if (mip & MIP_HOME) clear_buttons()` —
+                // the MIP test covers both an active home (HOMF/HOMR)
+                // and one queued behind a stop (HOMF|STOP).
+                if self.stat.mip.intersects(MipFlags::HOMF | MipFlags::HOMR) {
                     self.ctrl.homf = false;
                     self.ctrl.homr = false;
                 }

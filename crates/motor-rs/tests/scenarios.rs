@@ -334,7 +334,7 @@ fn home_forward_reverse_marks_homed() {
     assert!(!rec.stat.dmov);
     assert_eq!(rec.stat.phase, MotionPhase::Homing);
     assert!(rec.stat.mip.contains(MipFlags::HOMF));
-    assert!(!rec.ctrl.homf); // pulse cleared
+    assert!(rec.ctrl.homf); // stays latched until home completion (C 893-906)
     assert!(matches!(
         effects.commands[0],
         MotorCommand::Home { forward: true, .. }

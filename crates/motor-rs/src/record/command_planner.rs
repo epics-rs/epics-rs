@@ -367,6 +367,17 @@ impl MotorRecord {
 
     /// Plan an absolute move to current DVAL.
     pub(crate) fn plan_absolute_move(&mut self, effects: &mut ProcessEffects) {
+        // C move-block entry (2248-2255): DIFF and RDIF are recomputed
+        // from the requested target before anything else — they post
+        // even when the pass is then suppressed (too_small) or refused
+        // (LVIO). The VAL/DVAL/RVAL/RLV/TWF write paths update
+        // `pos.dval` but never refresh them; only the poll does.
+        self.pos.diff = self.pos.dval - self.pos.drbv;
+        self.pos.rdif = if self.conv.mres != 0.0 {
+            (self.pos.diff / self.conv.mres).round() as i64
+        } else {
+            0
+        };
         // Check soft limits (C: disabled only when dhlm == dllm == 0.0)
         if !(self.limits.dhlm == self.limits.dllm && self.limits.dllm == 0.0) {
             // C: DLLM > DHLM means limits are inverted => always violation
@@ -574,24 +585,11 @@ impl MotorRecord {
 
         // tdir reflects the actual first-command direction
         self.stat.tdir = move_target > self.pos.drbv;
-        // C parity (motorRecord.cc do_work): `diff` is recomputed
-        // fresh as `dval - drbv` immediately before CDIR is derived.
-        // The VAL/DVAL/RVAL/RLV/TWF write paths update `pos.dval` but
-        // never refresh `pos.diff` — only `process_motor_info` (poll)
-        // and the `Set` branch do. A user VAL write while idle with no
-        // poll update in the same cycle would otherwise compute CDIR
-        // (and the downstream consumers in `handle_retarget` /
-        // `ls_blocks_retry`) from a stale `diff`. Recompute here so
-        // CDIR always reflects the target being dispatched.
-        self.pos.diff = self.pos.dval - self.pos.drbv;
-        // CDIR: commanded direction from the position error
-        // C: cdir = (rdif < 0) ? 0 : 1, where rdif = diff/mres
-        // When MRES < 0, the sign inverts
-        self.stat.cdir = if self.conv.mres >= 0.0 {
-            self.pos.diff >= 0.0
-        } else {
-            self.pos.diff < 0.0
-        };
+        // C 2526: cdir = (rdif < 0) ? 0 : 1 — the INTEGER raw error
+        // posted at the move-block entry, so a sub-half-step negative
+        // error (rdif rounds to 0) and a zero error under MRES < 0 both
+        // read forward, unlike the f64 sign of `diff`.
+        self.stat.cdir = self.pos.rdif >= 0;
 
         // Set MIP and phase. C 2461 is `mip |= MIP_MOVE` behind the
         // `mip == MIP_DONE || mip == MIP_RETRY` gate (2455): the RETRY

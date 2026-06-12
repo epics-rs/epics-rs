@@ -473,3 +473,44 @@ fn same_direction_retarget_safety_net_replans_if_driver_ignores_inflight() {
     assert!(rec.stat.dmov);
     assert!((rec.pos.drbv - 45.0).abs() < 1e-6);
 }
+
+#[test]
+fn dispatch_posts_rdif_without_a_poll() {
+    // C move-block entry (motorRecord.cc:2248-2255): DIFF and RDIF are
+    // recomputed from the requested target before dispatch — a VAL
+    // write posts them immediately, not on the next poll.
+    let mut rec = make_record();
+    rec.pos.drbv = 0.0;
+
+    rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+
+    assert!((rec.pos.diff - 10.0).abs() < 1e-9);
+    assert_eq!(rec.pos.rdif, 10_000, "RDIF = NINT(diff/mres) at dispatch");
+}
+
+#[test]
+fn cdir_reads_forward_for_sub_half_step_negative_error() {
+    // C 2526: cdir = (rdif < 0) ? 0 : 1 with rdif = NINT(diff/mres) —
+    // the INTEGER raw error. A dispatch whose error is negative but
+    // under half a step (rdif rounds to 0) reads FORWARD in C; deriving
+    // CDIR from the f64 sign of diff read it backward.
+    let mut rec = make_record();
+    rec.pos.drbv = -0.0001;
+
+    // npos = NINT(-0.5) = -1, rpos = NINT(-0.1) = 0: one step, so the
+    // move dispatches; rdif = NINT(-0.4) = 0.
+    rec.put_field("VAL", EpicsValue::Double(-0.0005)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "setup: the sub-half-step move must dispatch, got {:?}",
+        effects.commands
+    );
+
+    assert_eq!(rec.pos.rdif, 0);
+    assert!(rec.stat.cdir, "rdif 0 reads forward (C 2526)");
+}

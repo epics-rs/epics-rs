@@ -37,7 +37,7 @@ impl MotorRecord {
         // C: after DLY expires and fresh readback arrives, evaluate for retry
         if self.stat.mip.contains(MipFlags::DELAY_ACK) {
             self.stat.mip.remove(MipFlags::DELAY_ACK);
-            self.evaluate_position_error_after_delay(&mut effects);
+            self.evaluate_position_error(&mut effects);
             return effects;
         }
 
@@ -205,14 +205,14 @@ impl MotorRecord {
                 if self.internal.backlash_pending {
                     self.start_backlash_final(&mut effects);
                 } else {
-                    self.evaluate_position_error(&mut effects);
+                    self.settle_then_evaluate(&mut effects);
                 }
             }
             MotionPhase::BacklashFinal => {
-                self.evaluate_position_error(&mut effects);
+                self.settle_then_evaluate(&mut effects);
             }
             MotionPhase::Retry => {
-                self.evaluate_position_error(&mut effects);
+                self.settle_then_evaluate(&mut effects);
             }
             MotionPhase::Jog | MotionPhase::JogStopping => {
                 // C 1357-1364 (9c8a8e8c, PR #56): the driver reported done
@@ -289,8 +289,12 @@ impl MotorRecord {
                 self.finalize_or_delay(&mut effects);
             }
             MotionPhase::DelayWait => {
-                // Delay already handled
-                self.finalize_motion(&mut effects);
+                // Waiting out DLY. A poll landing here only refreshes the
+                // readback (process_motor_info already applied it) — C
+                // restores dmov=FALSE and exits until the watchdog fires
+                // (motorRecord.cc:1441-1455). The DELAY_ACK pass above
+                // owns the post-settle evaluation; finalizing here would
+                // truncate the delay on the first poll tick.
             }
             MotionPhase::Idle => {
                 // C: ea063f5f — if the record marked an externally initiated
@@ -441,9 +445,28 @@ impl MotorRecord {
         self.stat.phase = new_phase;
     }
 
-    /// Evaluate position error after DLY expires (C: maybeRetry after delay).
-    /// Same as evaluate_position_error but finalizes directly (no re-delay).
-    fn evaluate_position_error_after_delay(&mut self, effects: &mut ProcessEffects) {
+    /// C process() completion (motorRecord.cc:1410-1456): with DLY > 0 a
+    /// fresh completion edge only arms the delay watchdog
+    /// (MIP_DELAY_REQ + callbackRequestDelayed, 1441-1455). The retry
+    /// decision (`maybeRetry`, 1431) runs only after the watchdog fires
+    /// and the fresh status it requests (GET_INFO, 1416-1426) lands —
+    /// never on the raw completion pass. With DLY <= 0 the evaluation
+    /// runs on this pass.
+    fn settle_then_evaluate(&mut self, effects: &mut ProcessEffects) {
+        if self.timing.dly > 0.0 {
+            self.set_phase(MotionPhase::DelayWait);
+            self.stat.mip.insert(MipFlags::DELAY_REQ);
+            effects.schedule_delay = Some(std::time::Duration::from_secs_f64(self.timing.dly));
+        } else {
+            self.evaluate_position_error(effects);
+        }
+    }
+
+    /// The C `maybeRetry` port (motorRecord.cc:1042-1104) — the single
+    /// post-settle completion evaluation, reached either directly (DLY
+    /// <= 0) via [`Self::settle_then_evaluate`] or from the DELAY_ACK
+    /// pass after the delay watchdog and its status refresh.
+    fn evaluate_position_error(&mut self, effects: &mut ProcessEffects) {
         if self.check_retarget_verification(effects) {
             return;
         }
@@ -468,7 +491,9 @@ impl MotorRecord {
         // and when RDBD is 0 `fabs(diff) >= 0` is trivially true.
         if diff >= self.retry.rdbd && self.retry.rcnt < self.retry.rtry && !ls_blocks_retry {
             if self.retry.rmod == RetryMode::InPosition {
-                // C: InPosition mode re-delays to let servo settle
+                // C RMOD_I (motorRecord.cc:1432-1438): no move is
+                // re-issued — re-arm the delay and let the servo settle,
+                // counting the cycle against RTRY.
                 self.retry.rcnt += 1;
                 self.retry.miss = false;
                 self.stat.mip = MipFlags::RETRY;
@@ -513,75 +538,6 @@ impl MotorRecord {
                 self.retry.miss = true;
             }
             self.finalize_motion(effects);
-        }
-    }
-
-    /// Evaluate position error after motion completes.
-    fn evaluate_position_error(&mut self, effects: &mut ProcessEffects) {
-        let diff = (self.pos.dval - self.pos.drbv).abs();
-
-        // Safety net: if a same-direction retarget happened during this
-        // motion, verify the driver reached the new target. If not, replan
-        // once — independent of retry settings. Keeps retarget correctness
-        // from depending on driver-specific in-flight retarget support.
-        if self.check_retarget_verification(effects) {
-            return;
-        }
-
-        // C: compute user_cdir for retry direction check with mapped limit switches
-        let same_polarity = (self.conv.dir == MotorDir::Pos) == (self.conv.mres >= 0.0);
-        let user_cdir = if same_polarity {
-            self.stat.cdir
-        } else {
-            !self.stat.cdir
-        };
-        let ls_blocks_retry = (self.limits.hls && user_cdir) || (self.limits.lls && !user_cdir);
-
-        // C `maybeRetry` (motorRecord.cc:1049): `fabs(pmr->diff) >= pmr->rdbd`
-        // — boundary-inclusive. Retry gated only on `rtry != 0`
-        // (`rcnt < rtry`); C has no `rdbd > 0` condition.
-        if diff >= self.retry.rdbd && self.retry.rcnt < self.retry.rtry && !ls_blocks_retry {
-            // InPosition mode: don't reissue, just finalize
-            if self.retry.rmod == RetryMode::InPosition {
-                self.finalize_or_delay(effects);
-                return;
-            }
-
-            // Retry
-            self.retry.rcnt += 1;
-            self.retry.miss = false;
-            self.set_phase(MotionPhase::Retry);
-            self.stat.mip = MipFlags::RETRY;
-
-            let frac = self.retry.frac;
-            if self.use_relative_moves() {
-                // C use_rel retry: position = relpos * frac, where relpos is
-                // the RMOD-scaled remaining distance (compute_retry_target).
-                let retry_target = self.compute_retry_target();
-                let rel_distance = (retry_target - self.pos.drbv) * frac;
-                effects.commands.push(MotorCommand::MoveRelative {
-                    distance: rel_distance,
-                    velocity: self.vel.velo,
-                    acceleration: self.move_accel_egu(),
-                });
-            } else {
-                // C absolute retry: currpos == newpos == dval (the prior
-                // move's load_pos set ldvl = dval), so position is dval.
-                // RMOD scaling applies only to the use_rel path.
-                effects.commands.push(MotorCommand::MoveAbsolute {
-                    position: self.pos.dval,
-                    velocity: self.vel.velo,
-                    acceleration: self.move_accel_egu(),
-                });
-            }
-            effects.request_poll = true;
-        } else {
-            // C `maybeRetry`: MISS latches when finalizing with
-            // `fabs(diff) >= rdbd`. Boundary-inclusive, matching C line 1049.
-            if diff >= self.retry.rdbd {
-                self.retry.miss = true;
-            }
-            self.finalize_or_delay(effects);
         }
     }
 

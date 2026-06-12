@@ -1622,11 +1622,27 @@ fn test_stop_during_delaywait_emits_stop_but_keeps_waiting() {
 
 #[test]
 fn test_delaywait_finalizes_after_delay_expires() {
-    // After the DLY timer fires, DelayWait finalizes to Idle/DMOV=1.
+    // C 1441-1455: a poll landing during the DLY wait must NOT finalize —
+    // only the watchdog expiry (DELAY_REQ -> DELAY_ACK) plus the status
+    // refresh it requests drive the post-settle evaluation.
     let mut rec = MotorRecord::new();
     rec.stat.phase = MotionPhase::DelayWait;
     rec.stat.dmov = false;
     rec.stat.msta = MstaFlags::DONE;
+    rec.stat.mip = MipFlags::MOVE | MipFlags::DELAY_REQ;
+    // Poll tick mid-wait: stays waiting.
+    rec.check_completion();
+    assert_eq!(
+        rec.stat.phase,
+        MotionPhase::DelayWait,
+        "poll must not truncate DLY"
+    );
+    assert!(!rec.stat.dmov);
+    // Watchdog fires: REQ -> ACK, then the refreshed status lands and the
+    // evaluation finalizes (diff == 0).
+    rec.set_event(MotorEvent::DelayExpired);
+    rec.do_process();
+    assert!(rec.stat.mip.contains(MipFlags::DELAY_ACK));
     rec.check_completion();
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
     assert!(rec.stat.dmov);
@@ -5385,5 +5401,89 @@ mod dly_orphan_guard {
         assert!(rec.stat.mip.contains(MipFlags::DELAY_ACK));
         assert!(!rec.stat.mip.contains(MipFlags::DELAY_REQ));
         assert!(effects.status_refresh);
+    }
+}
+
+// =============================================================================
+// Retry decision deferred past DLY — C process() 1410-1456: maybeRetry runs
+// only after the delay watchdog fires and the fresh status lands
+// =============================================================================
+
+mod retry_after_dly_settle {
+    use super::*;
+
+    // A completion with position error and DLY > 0 must arm the delay
+    // (no retry command on the completion pass); the retry dispatches
+    // only after DELAY_ACK.
+    #[test]
+    fn retry_waits_for_dly_settle() {
+        let mut rec = MotorRecord::new();
+        rec.conv.mres = 0.1;
+        rec.retry.rtry = 3;
+        rec.retry.rdbd = 0.5;
+        rec.timing.dly = 0.2;
+        rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+        rec.do_process();
+        assert_eq!(rec.stat.phase, MotionPhase::MainMove);
+
+        // Driver stops 2.0 short of the target: completion pass.
+        rec.stat.msta = MstaFlags::DONE;
+        rec.stat.movn = false;
+        rec.pos.drbv = 8.0;
+        rec.pos.rbv = 8.0;
+        let effects = rec.check_completion();
+        assert!(
+            !effects
+                .commands
+                .iter()
+                .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+            "no retry before the DLY settle: {:?}",
+            effects.commands
+        );
+        assert_eq!(rec.stat.phase, MotionPhase::DelayWait);
+        assert!(rec.stat.mip.contains(MipFlags::DELAY_REQ));
+        assert!(effects.schedule_delay.is_some(), "delay armed");
+        assert_eq!(rec.retry.rcnt, 0, "no retry counted yet");
+
+        // Watchdog fires, refreshed status lands: NOW the retry dispatches.
+        rec.set_event(MotorEvent::DelayExpired);
+        let effects = rec.do_process();
+        assert!(effects.status_refresh, "C GET_INFO before maybeRetry");
+        let effects = rec.check_completion();
+        assert!(
+            effects
+                .commands
+                .iter()
+                .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+            "retry dispatches after the settle: {:?}",
+            effects.commands
+        );
+        assert_eq!(rec.retry.rcnt, 1);
+        assert!(rec.stat.mip.contains(MipFlags::RETRY));
+    }
+
+    // DLY == 0: the evaluation runs on the completion pass itself.
+    #[test]
+    fn dly_zero_evaluates_immediately() {
+        let mut rec = MotorRecord::new();
+        rec.conv.mres = 0.1;
+        rec.retry.rtry = 3;
+        rec.retry.rdbd = 0.5;
+        rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+        rec.do_process();
+        rec.stat.msta = MstaFlags::DONE;
+        rec.stat.movn = false;
+        rec.pos.drbv = 8.0;
+        rec.pos.rbv = 8.0;
+        let effects = rec.check_completion();
+        assert!(
+            effects
+                .commands
+                .iter()
+                .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+            "immediate retry with DLY=0: {:?}",
+            effects.commands
+        );
+        assert_eq!(rec.retry.rcnt, 1);
     }
 }

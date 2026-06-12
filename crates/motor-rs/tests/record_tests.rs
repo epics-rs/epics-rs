@@ -3679,3 +3679,190 @@ fn test_retry_resume_within_deadband_quiesces() {
     assert_eq!(rec.stat.mip, MipFlags::empty());
     assert_eq!(rec.internal.ldvl, 50.0, "quiesced against the target");
 }
+
+// --- Overtaken-target replay (C 1383-1397) ---
+
+#[test]
+fn test_val_written_during_home_replays_at_completion() {
+    // A VAL written while homing is ignored by the dispatcher
+    // (handle_retarget: HOMF is not in-move). C replays it at the home
+    // completion (1387-1397) instead of syncing it away.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.ctrl.homf = true;
+    rec.plan_motion(CommandSource::Homf);
+    assert_eq!(rec.stat.phase, MotionPhase::Homing);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    rec.put_field("VAL", EpicsValue::Double(80.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(effects.commands.is_empty(), "no dispatch while homing");
+
+    let effects = complete_stop_at(&mut rec, 5.0);
+    assert!(
+        effects.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveAbsolute { position, .. } if (position - 80.0).abs() < 1e-9
+        )),
+        "home completion replays the overtaken target"
+    );
+    assert_eq!(rec.pos.val, 80.0, "target not synced away");
+    assert_eq!(rec.stat.mip, MipFlags::MOVE);
+}
+
+#[test]
+fn test_home_without_write_syncs_at_completion() {
+    // Boundary: val == lval at the home completion — no replay, the
+    // normal post-home sync runs.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.ctrl.homf = true;
+    rec.plan_motion(CommandSource::Homf);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    let effects = complete_stop_at(&mut rec, 5.0);
+    assert!(effects.commands.is_empty());
+    assert_eq!(rec.pos.val, 5.0, "home completion syncs to readback");
+    assert!(rec.stat.dmov);
+}
+
+#[test]
+fn test_val_written_during_jog_replays_on_sudden_stop() {
+    // C 1357-1364 + 1383-1397: the controller stopped the jog on its own
+    // (mip collapses to DONE), so the replay gate passes and the VAL
+    // written during the jog re-fires.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.ctrl.jogf = true;
+    rec.plan_motion(CommandSource::Jogf);
+    assert_eq!(rec.stat.phase, MotionPhase::Jog);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    rec.put_field("VAL", EpicsValue::Double(80.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(effects.commands.is_empty(), "no dispatch while jogging");
+
+    // Driver reports done without a commanded stop.
+    let effects = complete_stop_at(&mut rec, 30.0);
+    assert!(
+        effects.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveAbsolute { position, .. } if (position - 80.0).abs() < 1e-9
+        )),
+        "sudden jog stop replays the overtaken target"
+    );
+    assert_eq!(rec.pos.val, 80.0);
+}
+
+#[test]
+fn test_val_written_during_jog_dropped_on_commanded_stop() {
+    // C 1385-1386: MIP_JOG_STOP is excluded from the replay — a release
+    // of the jog button drops the mid-jog write via the postProcess sync.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.ctrl.jogf = true;
+    rec.plan_motion(CommandSource::Jogf);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    rec.put_field("VAL", EpicsValue::Double(80.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+
+    // Button released: commanded jog stop.
+    rec.ctrl.jogf = false;
+    rec.plan_motion(CommandSource::Jogf);
+    assert_eq!(rec.stat.phase, MotionPhase::JogStopping);
+
+    let effects = complete_stop_at(&mut rec, 30.0);
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "commanded jog stop must not replay"
+    );
+    assert_eq!(rec.pos.val, 30.0, "write dropped by the completion sync");
+}
+
+#[test]
+fn test_val_written_during_jog_backlash_replays_at_bl2_done() {
+    // C: MIP_JOG_BL2 passes the replay gate — a VAL written during the
+    // jog backlash correction re-fires when BL2 completes.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.retry.bdst = 2.0;
+    rec.ctrl.jogf = true;
+    rec.plan_motion(CommandSource::Jogf);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    // Commanded stop → jog backlash runs (BL1 then BL2).
+    rec.ctrl.jogf = false;
+    rec.plan_motion(CommandSource::Jogf);
+    let effects = complete_stop_at(&mut rec, 30.0);
+    assert_eq!(rec.stat.phase, MotionPhase::JogBacklash);
+    assert!(!effects.commands.is_empty(), "BL1 dispatched");
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    // VAL written during the backlash: ignored by the dispatcher.
+    rec.put_field("VAL", EpicsValue::Double(80.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(effects.commands.is_empty());
+
+    // BL1 done → BL2 dispatched.
+    let effects = complete_stop_at(&mut rec, 28.0);
+    assert!(!effects.commands.is_empty(), "BL2 dispatched");
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    // BL2 done → replay toward the overtaken target.
+    let effects = complete_stop_at(&mut rec, 30.0);
+    assert!(
+        effects.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveAbsolute { position, .. } if (position - 80.0).abs() < 1e-9
+        )),
+        "BL2 completion replays the overtaken target"
+    );
+}
+
+#[test]
+fn test_sub_step_replay_quiesces_without_loop() {
+    // A replayed target within one motor step quiesces (commit: too_small
+    // lasts update) — the next completion pass must not re-replay.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.ctrl.homf = true;
+    rec.plan_motion(CommandSource::Homf);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    // Written target lands within one step of the home rest position.
+    rec.put_field("VAL", EpicsValue::Double(5.4)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+
+    let effects = complete_stop_at(&mut rec, 5.0);
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "sub-step replay must quiesce, not dispatch"
+    );
+    assert_eq!(rec.internal.lval, 5.4, "lasts adopted the written target");
+    assert_eq!(rec.stat.mip, MipFlags::empty());
+
+    // Another completion pass: nothing left to replay.
+    let effects = complete_stop_at(&mut rec, 5.0);
+    assert!(effects.commands.is_empty(), "no replay loop");
+}

@@ -198,6 +198,14 @@ impl MotorRecord {
                     self.ctrl.jogr = false;
                     self.ctrl.homf = false;
                     self.ctrl.homr = false;
+                    // C 1357-1364 collapses the sudden stop to MIP_DONE,
+                    // so the replay gate (1385) passes — a VAL written
+                    // during the jog re-fires now. A commanded stop
+                    // (JogStopping = MIP_JOG_STOP) is excluded: the write
+                    // is dropped by the sync below, like C postProcess.
+                    if self.replay_overtaken_target(&mut effects) {
+                        return effects;
+                    }
                 }
                 // C: postProcess syncs VAL<-RBV, DVAL<-DRBV before jog backlash
                 // This ensures start_jog_backlash uses the jog-end position as base
@@ -213,6 +221,11 @@ impl MotorRecord {
                     // BL1 complete -> start BL2 (final approach)
                     self.start_jog_backlash_final(&mut effects);
                 } else {
+                    // C: MIP_JOG_BL2 passes the replay gate (1385) — a
+                    // VAL written during the jog backlash re-fires here.
+                    if self.replay_overtaken_target(&mut effects) {
+                        return effects;
+                    }
                     // BL2 complete -> finalize
                     self.finalize_or_delay(&mut effects);
                 }
@@ -225,6 +238,14 @@ impl MotorRecord {
                 // the stop (the C re-fire path keeps it until done).
                 self.ctrl.homf = false;
                 self.ctrl.homr = false;
+                // C 1387-1397: a VAL written while homing could not
+                // dispatch (handle_retarget ignores HOMF/HOMR) — replay
+                // it instead of syncing it away. The button clear above
+                // doubles as C's VAL-HOMF-VAL infinite-home-loop guard
+                // (1389-1393).
+                if self.replay_overtaken_target(&mut effects) {
+                    return effects;
+                }
                 // Sync positions after homing
                 self.sync_positions();
                 self.finalize_or_delay(&mut effects);
@@ -293,6 +314,28 @@ impl MotorRecord {
             self.ctrl.spmg = SpmgMode::Pause;
             self.internal.lspg = SpmgMode::Pause;
         }
+    }
+
+    /// C overtaken-target replay (motorRecord.cc:1383-1397): at a motion
+    /// completion, `val != lval` means a position was written mid-motion
+    /// on a path that could not dispatch it (jog in flight, home in
+    /// flight, jog backlash — handle_retarget ignores those). C collapses
+    /// MIP to DONE and re-enters do_work so the move block fires toward
+    /// the new target instead of postProcess syncing it away. Commanded
+    /// stops are excluded by the gate (`!(mip & MIP_STOP)`,
+    /// `!(mip & MIP_JOG_STOP)`, 1385-1386) — the callers encode that by
+    /// only invoking this from the sudden-jog-stop, home-done and
+    /// jog-backlash-done branches. Returns true when the write was
+    /// replayed (a sub-step replay quiesces inside plan_absolute_move).
+    fn replay_overtaken_target(&mut self, effects: &mut ProcessEffects) -> bool {
+        if self.pos.val == self.internal.lval {
+            return false;
+        }
+        self.stat.mip = MipFlags::empty();
+        self.set_phase(MotionPhase::Idle);
+        self.plan_absolute_move(effects);
+        effects.suppress_forward_link = true;
+        true
     }
 
     /// If a same-direction retarget was armed during motion, verify on

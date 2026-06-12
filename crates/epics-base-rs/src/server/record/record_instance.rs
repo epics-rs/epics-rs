@@ -1714,49 +1714,78 @@ impl RecordInstance {
             .processing
             .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
-            self.common.lcnt = self.common.lcnt.saturating_add(1);
-            if self.common.lcnt >= LCNT_ALARM_THRESHOLD {
-                self.common.sevr = AlarmSeverity::Invalid;
-                self.common.stat = recgbl::alarm_status::SCAN_ALARM;
-                // Post the SCAN_ALARM transition so subscribers see it.
-                // The synchronous link path (`process_record_with_links_inner`,
-                // mirroring C `dbAccess.c:559-583`) posts VAL with
-                // DBE_VALUE|DBE_LOG|DBE_ALARM when the LCNT guard raises
-                // SCAN_ALARM/INVALID. The pre-fix branch here flipped
-                // sevr/stat but returned an empty snapshot, so a
-                // `process_local`-driven reentrant record went INVALID
-                // silently — no monitor ever reached the operator.
-                // Per-field C masks (recGbl.c:201-220): this guard only
-                // runs on a fresh SCAN_ALARM/INVALID raise, so sevr AND
-                // stat both moved — SEVR posts DBE_VALUE, STAT posts
-                // `stat_mask` = DBE_ALARM|DBE_VALUE, VAL posts
-                // DBE_VALUE|DBE_LOG plus `val_mask = DBE_ALARM`.
-                let mut changed_fields = Vec::new();
-                if let Some(val) = self.record.val() {
-                    changed_fields.push((
-                        "VAL".to_string(),
-                        val,
-                        EventMask::VALUE | EventMask::LOG | EventMask::ALARM,
-                    ));
-                }
-                changed_fields.push((
-                    "SEVR".to_string(),
-                    EpicsValue::Short(self.common.sevr as i16),
-                    EventMask::VALUE,
+            // C `dbProcess` PACT-active guard (dbAccess.c:544-557):
+            //
+            //   if ((precord->stat == SCAN_ALARM) ||
+            //       (precord->lcnt++ < MAX_LOCK) ||
+            //       (precord->sevr >= INVALID_ALARM)) goto all_done;
+            //   recGblSetSevrMsg(precord, SCAN_ALARM, INVALID_ALARM,
+            //                    "Async in progress");
+            //
+            // The alarm fires EXACTLY ONCE — on the attempt whose
+            // pre-increment lcnt equals MAX_LOCK — and is then blocked
+            // by the stat == SCAN_ALARM / sevr >= INVALID bails, the
+            // same shape as the link path
+            // (`process_record_with_links_inner`). The pre-fix guard
+            // here used post-increment `lcnt >= threshold` with no
+            // already-raised bail, so every reentrant attempt past the
+            // threshold re-posted the unchanged SEVR/STAT/VAL (and the
+            // first fire came one attempt early); it also wrote
+            // sevr/stat directly, skipping `recGblSetSevrMsg` +
+            // `recGblResetAlarms` — losing the "Async in progress"
+            // AMSG and the acks bookkeeping the reset performs.
+            let already_scan_alarm = self.common.stat == recgbl::alarm_status::SCAN_ALARM;
+            let already_invalid = self.common.sevr >= AlarmSeverity::Invalid;
+            let lcnt_before = self.common.lcnt;
+            self.common.lcnt = lcnt_before.saturating_add(1);
+            if already_scan_alarm || lcnt_before < LCNT_ALARM_THRESHOLD || already_invalid {
+                return Ok((
+                    ProcessSnapshot {
+                        changed_fields: Vec::new(),
+                    },
+                    Vec::new(),
                 ));
-                changed_fields.push((
-                    "STAT".to_string(),
-                    EpicsValue::Short(self.common.stat as i16),
-                    EventMask::ALARM | EventMask::VALUE,
-                ));
-                return Ok((ProcessSnapshot { changed_fields }, Vec::new()));
             }
-            return Ok((
-                ProcessSnapshot {
-                    changed_fields: Vec::new(),
-                },
-                Vec::new(),
+            recgbl::rec_gbl_set_sevr_msg(
+                &mut self.common,
+                recgbl::alarm_status::SCAN_ALARM,
+                AlarmSeverity::Invalid,
+                "Async in progress",
+            );
+            let _ = recgbl::rec_gbl_reset_alarms(&mut self.common);
+            // Per-field C masks (recGbl.c:201-220): this guard only
+            // runs on a fresh SCAN_ALARM/INVALID raise, so sevr AND
+            // stat both moved — SEVR posts DBE_VALUE, STAT/AMSG post
+            // the shared `stat_mask` = DBE_ALARM|DBE_VALUE, VAL posts
+            // DBE_VALUE|DBE_LOG plus `val_mask` = DBE_ALARM.
+            let stat_mask = EventMask::ALARM | EventMask::VALUE;
+            let mut changed_fields = Vec::new();
+            if let Some(val) = self.record.val() {
+                changed_fields.push((
+                    "VAL".to_string(),
+                    val,
+                    EventMask::VALUE | EventMask::LOG | EventMask::ALARM,
+                ));
+            }
+            changed_fields.push((
+                "SEVR".to_string(),
+                EpicsValue::Short(self.common.sevr as i16),
+                EventMask::VALUE,
             ));
+            changed_fields.push((
+                "STAT".to_string(),
+                EpicsValue::Short(self.common.stat as i16),
+                stat_mask,
+            ));
+            // AMSG carries "Async in progress" alongside the STAT
+            // transition (C recGbl.c posts STAT and AMSG together
+            // when any alarm field moved).
+            changed_fields.push((
+                "AMSG".to_string(),
+                EpicsValue::String(self.common.amsg.clone().into()),
+                stat_mask,
+            ));
+            return Ok((ProcessSnapshot { changed_fields }, Vec::new()));
         }
         self.common.lcnt = 0;
         // RAII guard that resets `self.processing` to false on drop —

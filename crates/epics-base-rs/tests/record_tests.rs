@@ -997,6 +997,9 @@ fn test_lcnt_increments_on_reentrance() {
 
 #[test]
 fn test_lcnt_alarm_threshold() {
+    // C `dbProcess` (dbAccess.c:544-557): the SCAN_ALARM raise fires on
+    // the attempt whose PRE-increment lcnt equals MAX_LOCK=10 — i.e.
+    // the 11th consecutive reentrant attempt, not the 10th.
     let mut instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
     instance
         .processing
@@ -1004,12 +1007,50 @@ fn test_lcnt_alarm_threshold() {
     for _ in 0..10 {
         let _ = instance.process_local().unwrap();
     }
-    assert!(instance.common.lcnt >= 10);
+    assert_eq!(instance.common.lcnt, 10);
+    assert_eq!(
+        instance.common.sevr,
+        AlarmSeverity::NoAlarm,
+        "C fires at lcnt++ == MAX_LOCK: 10 attempts only increment"
+    );
+    let _ = instance.process_local().unwrap();
     assert_eq!(instance.common.sevr, AlarmSeverity::Invalid);
     // C `menuAlarmStat.dbd`: SCAN_ALARM = 13.
     assert_eq!(
         instance.common.stat,
         epics_base_rs::server::recgbl::alarm_status::SCAN_ALARM
+    );
+    // C `recGblSetSevrMsg(..., "Async in progress")` — the alarm text
+    // lands in AMSG via the reset (epics-base PR #568).
+    assert_eq!(instance.common.amsg, "Async in progress");
+}
+
+#[test]
+fn test_lcnt_alarm_posts_exactly_once() {
+    // C posts the SCAN_ALARM transition exactly once: subsequent
+    // reentrant attempts bail on `stat == SCAN_ALARM` / `sevr >=
+    // INVALID_ALARM` (dbAccess.c:545-547). The pre-fix guard re-posted
+    // the unchanged SEVR/STAT/VAL on every attempt past the threshold.
+    let mut instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
+    instance
+        .processing
+        .store(true, std::sync::atomic::Ordering::Release);
+    for _ in 0..10 {
+        let _ = instance.process_local().unwrap();
+    }
+    // 11th attempt: fresh raise — snapshot carries the transition.
+    let (snapshot, _) = instance.process_local().unwrap();
+    assert!(
+        snapshot.changed_fields.iter().any(|(f, _, _)| f == "SEVR"),
+        "the fresh SCAN_ALARM raise must post SEVR"
+    );
+    // 12th and later attempts: already raised — nothing re-posts.
+    let (snapshot, _) = instance.process_local().unwrap();
+    assert!(
+        snapshot.changed_fields.is_empty(),
+        "an already-raised SCAN_ALARM must not re-post on later \
+         reentrant attempts, got {:?}",
+        snapshot.changed_fields
     );
 }
 

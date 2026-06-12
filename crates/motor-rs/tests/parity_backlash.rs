@@ -478,3 +478,64 @@ fn jog_bl2_relative_leg_is_frac_times_bdst() {
         "BL2 = frac*bdst, got {distance}"
     );
 }
+
+#[test]
+fn backlash_final_leg_posts_cdir_and_frac_scaled_rval() {
+    // C MOVE_BL arm (motorRecord.cc:967, 973): the absolute final leg
+    // posts RVAL = NINT of the FRAC-scaled commanded raw position and
+    // re-derives CDIR from the raw error sign.
+    let mut rec = make_record();
+    rec.retry.bdst = 1.0;
+    rec.retry.frac = 0.5;
+
+    // bdst > 0, moving negative: two legs through pretarget -11.
+    rec.put_field("VAL", EpicsValue::Double(-10.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    assert!(rec.internal.backlash_pending);
+    assert!(!rec.stat.cdir, "first leg runs negative");
+
+    // First leg lands at the pretarget; final leg goes forward to
+    // pretarget + frac*bdst = -10.5.
+    complete_move(&mut rec, -11.0);
+    let effects = rec.check_completion();
+    assert!(rec.stat.mip.contains(MipFlags::MOVE_BL));
+    let MotorCommand::MoveAbsolute { position, .. } = &effects.commands[0] else {
+        panic!("expected absolute final leg, got {:?}", effects.commands);
+    };
+    assert!((*position - (-10.5)).abs() < 1e-9, "got {position}");
+    assert!(rec.stat.cdir, "final leg runs positive (C 973)");
+    assert_eq!(
+        rec.pos.rval, -10500,
+        "RVAL posts the FRAC-scaled raw target (C 967), not DVAL/MRES"
+    );
+}
+
+#[test]
+fn jog_bl2_posts_cdir_from_scaled_stroke() {
+    // C MIP_JOG_BL1 branch (motorRecord.cc:1020): CDIR follows the
+    // sign of the (frac-scaled) relative stroke = BDST direction.
+    let mut rec = make_record();
+    rec.retry.bdst = -2.0; // negative backlash: final leg runs negative
+    rec.retry.rtry = 5;
+    rec.conv.ueip = true;
+    rec.conv.eres = rec.conv.mres;
+    rec.retry.frac = 1.0;
+
+    rec.ctrl.jogf = true;
+    rec.plan_motion(CommandSource::Jogf);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+    rec.ctrl.jogf = false;
+    rec.plan_motion(CommandSource::Jogf);
+
+    // Stop at 30: takeout leg goes to 32 (dval - bdst), positive.
+    complete_move(&mut rec, 30.0);
+    rec.check_completion();
+    assert!(rec.stat.mip.contains(MipFlags::JOG_BL1));
+
+    // Takeout done; BL2 strokes bdst*frac = -2.0, so CDIR flips negative.
+    complete_move(&mut rec, 32.0);
+    rec.check_completion();
+    assert!(rec.stat.mip.contains(MipFlags::JOG_BL2));
+    assert!(!rec.stat.cdir, "BL2 direction follows BDST sign (C 1020)");
+}

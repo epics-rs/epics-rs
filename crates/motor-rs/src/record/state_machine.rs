@@ -562,6 +562,8 @@ impl MotorRecord {
         if self.use_relative_moves() {
             // C relative: relpos = (dval - drbv) * frac / mres
             let rel_distance = (self.pos.dval - self.pos.drbv) * frac;
+            // C 973: CDIR follows the (frac-scaled) raw-unit stroke.
+            self.stat.cdir = rel_distance / self.conv.mres >= 0.0;
             effects.commands.push(MotorCommand::MoveRelative {
                 distance: rel_distance,
                 velocity: self.vel.bvel,
@@ -572,6 +574,10 @@ impl MotorRecord {
             // = (dval - bdst) + frac * bdst = dval - bdst*(1-frac)
             let pretarget = Self::compute_backlash_pretarget(self.pos.dval, self.retry.bdst);
             let position = pretarget + frac * (self.pos.dval - pretarget);
+            // C 967: the FRAC-scaled commanded raw position is posted to
+            // RVAL; 973 derives CDIR from the unscaled raw error.
+            self.pos.rval = (position / self.conv.mres).round() as i64;
+            self.stat.cdir = (self.pos.dval - self.pos.drbv) / self.conv.mres >= 0.0;
             effects.commands.push(MotorCommand::MoveAbsolute {
                 position,
                 velocity: self.vel.bvel,
@@ -590,6 +596,11 @@ impl MotorRecord {
         self.set_phase(MotionPhase::JogBacklash);
         self.stat.mip = MipFlags::JOG_BL1;
         self.internal.backlash_pending = true;
+        // C 973: CDIR derives from relpos = diff/mres, NOT from the
+        // takeout leg actually dispatched (relbpos/bpos). DVAL was just
+        // synced to DRBV, so relpos is 0 and CDIR reads forward — C
+        // verbatim (the sync at postProcess entry zeroes diff).
+        self.stat.cdir = (self.pos.dval - self.pos.drbv) / self.conv.mres >= 0.0;
         if self.use_relative_moves() {
             effects.commands.push(MotorCommand::MoveRelative {
                 distance: pretarget - self.pos.drbv,
@@ -620,6 +631,8 @@ impl MotorRecord {
             // stopped. The remaining-error form (dval - drbv) * frac is
             // the MOVE_BL formula (957), not the jog one.
             let rel_distance = self.retry.bdst * frac;
+            // C 1020: CDIR follows the scaled raw-unit stroke.
+            self.stat.cdir = rel_distance / self.conv.mres >= 0.0;
             effects.commands.push(MotorCommand::MoveRelative {
                 distance: rel_distance,
                 velocity: self.vel.bvel,
@@ -627,6 +640,10 @@ impl MotorRecord {
             });
         } else {
             let position = pretarget + frac * (self.pos.dval - pretarget);
+            // C 1016: the FRAC-scaled commanded raw position is posted to
+            // RVAL; 1020 derives CDIR from the unscaled raw error.
+            self.pos.rval = (position / self.conv.mres).round() as i64;
+            self.stat.cdir = (self.pos.dval - self.pos.drbv) / self.conv.mres >= 0.0;
             effects.commands.push(MotorCommand::MoveAbsolute {
                 position,
                 velocity: self.vel.bvel,

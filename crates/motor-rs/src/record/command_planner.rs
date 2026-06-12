@@ -284,18 +284,24 @@ impl MotorRecord {
                     // propagates to DVAL and the move block's set test
                     // routes the dispatch to load_pos.
                     if self.conv.set && !self.conv.igset {
-                        // #231: LOAD_POS blocked — refuse the
-                        // redefinition; consume the latched RLV.
+                        if self.conv.foff == FreezeOffset::Variable {
+                            // Offset-only (C 2206-2227): no controller
+                            // command, so the #231 LOAD_POS block does
+                            // not apply.
+                            self.pos.val += self.pos.rlv;
+                            self.pos.rlv = 0.0;
+                            self.set_mode_redefine_val(self.pos.val);
+                            return effects;
+                        }
+                        // #231: LOAD_POS blocked — refuse the Frozen-leg
+                        // redefinition (C load_pos sends LOAD_POS
+                        // unconditionally, 3811); consume the latched RLV.
                         if self.conv.loadpos_blocked {
                             self.pos.rlv = 0.0;
                             return effects;
                         }
                         self.pos.val += self.pos.rlv;
                         self.pos.rlv = 0.0;
-                        if self.conv.foff == FreezeOffset::Variable {
-                            self.set_mode_redefine_val(self.pos.val);
-                            return effects;
-                        }
                         let dval =
                             coordinate::user_to_dial(self.pos.val, self.conv.dir, self.pos.off);
                         if let Ok(rval) = coordinate::dial_to_raw(dval, self.conv.mres) {
@@ -1168,16 +1174,19 @@ impl MotorRecord {
         // VAL-change path: in SET mode it redefines coordinates rather than
         // moving the motor.
         if self.conv.set && !self.conv.igset {
-            // #231: LOAD_POS blocked — refuse the redefinition entirely.
-            if self.conv.loadpos_blocked {
-                self.pos.val -= delta; // undo: keep VAL/DVAL/OFF consistent
-                return false;
-            }
             if self.conv.foff == FreezeOffset::Variable {
                 // C 2206-2227 via the tweak fold: offset-only
-                // redefinition — DVAL untouched, no controller command,
-                // complete on the spot (mip = MIP_DONE, dmov = TRUE).
+                // redefinition — DVAL untouched, no controller command
+                // (so the #231 LOAD_POS block does not apply), complete
+                // on the spot (mip = MIP_DONE, dmov = TRUE).
                 self.set_mode_redefine_val(self.pos.val);
+                return false;
+            }
+            // #231: LOAD_POS blocked — refuse the Frozen-leg
+            // redefinition (C load_pos sends LOAD_POS unconditionally,
+            // 3811); undo the fold to keep VAL/DVAL/OFF consistent.
+            if self.conv.loadpos_blocked {
+                self.pos.val -= delta;
                 return false;
             }
             // C Frozen: the fold propagates VAL -> DVAL (2233); the

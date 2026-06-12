@@ -1165,10 +1165,14 @@ fn test_tweak_in_set_mode_redefines_coordinates_without_moving() {
 
 #[test]
 fn test_tweak_blocked_when_loadpos_blocked_in_set_mode() {
+    // The #231 LOAD_POS block applies only to the FOFF=Frozen leg,
+    // whose redefinition needs the controller write (C load_pos sends
+    // LOAD_POS unconditionally, 3811).
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.01;
     rec.stat.msta = MstaFlags::DONE;
     rec.conv.set = true;
+    rec.conv.foff = FreezeOffset::Frozen;
     rec.conv.loadpos_blocked = true;
     rec.ctrl.twv = 5.0;
     rec.pos.val = 10.0;
@@ -1182,6 +1186,32 @@ fn test_tweak_blocked_when_loadpos_blocked_in_set_mode() {
     assert_eq!(rec.pos.dval, 10.0);
     assert_eq!(rec.pos.off, 0.0);
     assert!(effects.commands.is_empty());
+}
+
+#[test]
+fn test_tweak_offset_only_escapes_loadpos_block_in_set_mode() {
+    // C 2206-2227: the SET+FOFF=Variable tweak fold is an offset-only
+    // redefinition — no controller command — so the #231 LOAD_POS
+    // block must not refuse it.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.conv.set = true;
+    rec.conv.loadpos_blocked = true;
+    rec.ctrl.twv = 5.0;
+    rec.pos.val = 10.0;
+    rec.pos.dval = 10.0;
+    rec.pos.off = 0.0;
+
+    rec.ctrl.twf = true;
+    let effects = rec.plan_motion(CommandSource::Twf);
+    assert_eq!(rec.pos.val, 15.0, "fold lands in VAL");
+    assert_eq!(rec.pos.dval, 10.0, "DVAL untouched (offset-only)");
+    assert_eq!(rec.pos.off, 5.0, "OFF absorbs the redefinition");
+    assert!(
+        effects.commands.is_empty(),
+        "no controller command from the offset-only redefinition"
+    );
 }
 
 #[test]
@@ -4432,6 +4462,26 @@ fn test_rstm_near_zero_uses_motor_position_not_encoder() {
 
 #[test]
 fn test_loadpos_block_refuses_set_mode_redefinition() {
+    // FOFF=Frozen: the VAL redefinition propagates to DVAL and needs
+    // the controller LOAD_POS (C 3811) — refused under the block.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.conv.set = true;
+    rec.conv.foff = FreezeOffset::Frozen;
+    rec.conv.loadpos_blocked = true;
+    rec.pos.dval = 5.0;
+    rec.pos.off = 0.0;
+
+    // SET-mode VAL write would normally redefine DVAL — must be refused.
+    rec.put_field("VAL", EpicsValue::Double(100.0)).unwrap();
+    assert_eq!(rec.pos.dval, 5.0); // unchanged
+    assert_eq!(rec.pos.off, 0.0); // unchanged — DVAL/OFF stay consistent
+}
+
+#[test]
+fn test_loadpos_block_allows_offset_only_val_redefinition() {
+    // FOFF=Variable: C 2206-2227 redefines VAL by adjusting OFF only —
+    // no controller command — so the #231 block must not refuse it.
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.01;
     rec.conv.set = true;
@@ -4439,10 +4489,9 @@ fn test_loadpos_block_refuses_set_mode_redefinition() {
     rec.pos.dval = 5.0;
     rec.pos.off = 0.0;
 
-    // SET-mode VAL write would normally redefine OFF/DVAL — must be refused.
     rec.put_field("VAL", EpicsValue::Double(100.0)).unwrap();
-    assert_eq!(rec.pos.dval, 5.0); // unchanged
-    assert_eq!(rec.pos.off, 0.0); // unchanged — DVAL/OFF stay consistent
+    assert_eq!(rec.pos.off, 95.0, "OFF absorbs the redefinition");
+    assert_eq!(rec.pos.dval, 5.0, "DVAL untouched (offset-only)");
 }
 
 #[test]

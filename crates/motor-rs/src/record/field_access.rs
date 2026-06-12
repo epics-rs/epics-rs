@@ -833,18 +833,22 @@ pub(crate) fn motor_put_field(
                 _ => return Err(CaError::TypeMismatch(name.into())),
             };
             if rec.conv.set && !rec.conv.igset {
-                // #231: LOAD_POS blocked — refuse the SET-mode redefinition so
-                // DVAL/OFF stay consistent with the controller.
-                if rec.conv.loadpos_blocked {
-                    return Ok(());
-                }
                 if rec.conv.foff == FreezeOffset::Variable {
                     // C 2206-2227: redefine VAL without moving the motor
                     // and without touching DVAL — offset-only, completes
                     // on the spot. No last_write: C returns from the
-                    // collection block (2227), nothing to dispatch.
+                    // collection block (2227), nothing to dispatch. No
+                    // controller command is involved, so the #231
+                    // LOAD_POS block does not apply.
                     rec.set_mode_redefine_val(v);
                 } else {
+                    // #231: LOAD_POS blocked — refuse the Frozen-leg
+                    // redefinition, which needs the controller write
+                    // (C load_pos sends LOAD_POS unconditionally, 3811),
+                    // so DVAL/OFF stay consistent with the controller.
+                    if rec.conv.loadpos_blocked {
+                        return Ok(());
+                    }
                     // SET+FOFF=Frozen: cascade VAL->DVAL normally, then SetPosition
                     // C: dval = (val - off) / dir, then load_pos(dval/mres)
                     let dval = coordinate::user_to_dial(v, rec.conv.dir, rec.pos.off);

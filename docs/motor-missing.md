@@ -8,22 +8,14 @@ parity sweep (2026-06, families #6–#15)에서 나온 항목 중, 코드 수정
 finding)은 git log의 `fix(motor):` 커밋이 원장이며 여기 중복하지
 않습니다.
 
-## BLOCKED — published API 동결 (motor-rs 0.19.2)
+## ~~BLOCKED — published API 동결~~ (0.20.0 major bump으로 해제)
 
-`MotorCommand`는 public **exhaustive** enum (`flags.rs:248`,
-`#[non_exhaustive]` 없음)이고 `MotorDriver` trait와 함께 0.19.2로
-crates.io에 publish됨. variant/메서드 추가는 downstream exhaustive
-match를 깨는 semver-major. major bump 전까지 다음 driver forward는
-emit 불가:
-
-| 항목 | C 출처 | Rust 현재 동작 |
-|---|---|---|
-| H2 — PID gain forward (`SET_PGAIN`/`SET_IGAIN`/`SET_DGAIN`) | `motorRecord.cc` special pidcof (3003-3026): GAIN_SUPPORT일 때 0.0–1.0 clamp 후 driver로 전송 | `field_access.rs` PCOF/ICOF/DCOF arm — clamp + raw store만 수행, command 미전송 (소스 주석에 명시) |
-| H3 — soft-limit forward (`SET_HIGH_LIMIT`/`SET_LOW_LIMIT`) | `set_dial_highlimit`/`set_user_highlimit` (4101-4160대): DHLM/DLLM/HLM/LLM 변경을 device로 전송 | limit put은 record-내부 cascade만 수행, driver command 미전송 |
-
-Major bump 시점에 `MotorCommand::SetPidGain { which, gain }` /
-`SetSoftLimit { high, low }` 류 variant + `MotorDriver` 기본 구현
-메서드로 닫는다.
+H2(PID gain forward)와 H3(soft-limit forward)는 `MotorCommand`
+public exhaustive enum의 variant 추가가 semver-major라서 0.19.x에서
+차단되어 있었다. 사용자가 major bump(0.19.2 → 0.20.0)를 승인하여
+둘 다 이식 완료 — `MotorCommand::SetPidGain`/`SetHighLimit`/
+`SetLowLimit` variant와 `AsynMotor` 기본 구현 메서드로 닫힘. 상세는
+git log의 `feat(motor):` 커밋이 원장.
 
 ## BLOCKED — 프레임워크 구조 (epics-base-rs, cross-crate)
 

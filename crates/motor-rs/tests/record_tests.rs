@@ -7436,6 +7436,81 @@ fn test_pid_gain_put_no_forward_without_gain_support() {
 }
 
 #[test]
+fn test_dial_limit_put_forwards_one_sided() {
+    // C set_dial_highlimit (4236-4277) / set_dial_lowlimit (4287-4328):
+    // a dial-limit put sends exactly ONE limit command. The boundary is
+    // dial-frame EGU (like SetPosition), so DHLM maps to SetHighLimit
+    // unswapped — C's MRES-sign register swap lives in the raw pair.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.internal.init_invariants_synced = true;
+
+    rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
+    let effects = rec.do_process();
+    assert_eq!(
+        effects.commands,
+        vec![MotorCommand::SetHighLimit { position: 10.0 }]
+    );
+
+    rec.put_field("DLLM", EpicsValue::Double(-10.0)).unwrap();
+    let effects = rec.do_process();
+    assert_eq!(
+        effects.commands,
+        vec![MotorCommand::SetLowLimit { position: -10.0 }]
+    );
+}
+
+#[test]
+fn test_user_limit_put_folds_dir_into_forwarded_side() {
+    // C set_user_highlimit (4076-4154): with DIR=Neg the user HIGH
+    // limit lands on the dial LOW side, so the driver forward is the
+    // LOW limit (C folds `dir_positive`); DIR=Pos forwards HIGH.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.internal.init_invariants_synced = true;
+
+    rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
+    let effects = rec.do_process();
+    assert_eq!(
+        effects.commands,
+        vec![MotorCommand::SetHighLimit { position: 10.0 }]
+    );
+
+    rec.conv.dir = MotorDir::Neg;
+    rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
+    let effects = rec.do_process();
+    assert_eq!(
+        effects.commands,
+        vec![MotorCommand::SetLowLimit { position: -10.0 }],
+        "user high under DIR=Neg is the dial low limit"
+    );
+}
+
+#[test]
+fn test_limit_put_during_load_does_not_forward() {
+    // C: dbLoadRecords applies field() as raw struct writes — special()
+    // never runs, so a loaded limit emits no driver command. The queue
+    // helper is init-gated like the raw-pair helpers.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.stat.msta = MstaFlags::DONE;
+    assert!(!rec.internal.init_invariants_synced);
+
+    rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
+    rec.internal.init_invariants_synced = true;
+    let effects = rec.do_process();
+    assert!(
+        !effects.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::SetHighLimit { .. } | MotorCommand::SetLowLimit { .. }
+        )),
+        "load-time limit put must not reach the driver"
+    );
+}
+
+#[test]
 fn test_special_cmds_drain_in_front_of_pass_commands() {
     // C wire order: special() sends fire when the put lands, BEFORE the
     // pp pass enters do_work — a coefficient put followed by a VAL move

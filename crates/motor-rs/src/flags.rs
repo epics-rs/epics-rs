@@ -316,6 +316,21 @@ pub enum MotorCommand {
         kind: PidGainKind,
         gain: f64,
     },
+    /// Forward the high soft-travel limit, dial-frame EGU (C
+    /// set_dial_highlimit, motorRecord.cc 4236-4277). C's wire value is
+    /// raw steps (dhlm/mres) with an MRES-sign register swap; the
+    /// AsynMotor boundary speaks dial EGU (like SetPosition), so the
+    /// dial high limit is forwarded as the high limit unconditionally —
+    /// the raw-frame fold lives where the raw pair is tracked
+    /// (RHLM/RLLM).
+    SetHighLimit {
+        position: f64,
+    },
+    /// Forward the low soft-travel limit, dial-frame EGU (C
+    /// set_dial_lowlimit, motorRecord.cc 4287-4328).
+    SetLowLimit {
+        position: f64,
+    },
 }
 
 /// Effects returned by process logic.

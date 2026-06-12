@@ -382,6 +382,48 @@ async fn init_does_not_reseed_controller_when_nothing_restored() {
     );
 }
 
+/// C init_record 716-718 ("Reset limits in case database values are
+/// invalid"): both dial limits are forwarded to the driver at init,
+/// after the initial readback.
+#[tokio::test]
+async fn init_forwards_dial_limits_to_driver() {
+    let sim = Arc::new(Mutex::new(SimMotor::new()));
+    let motor: Arc<Mutex<dyn AsynMotor>> = sim.clone();
+    let mut setup = make_builder(motor).build();
+
+    setup.device_support.init(&mut setup.record).unwrap();
+
+    let m = sim.lock().unwrap();
+    assert_eq!(m.forwarded_high_limit, Some(100.0));
+    assert_eq!(m.forwarded_low_limit, Some(-100.0));
+}
+
+/// C special set_dial_highlimit (motorRecord.cc:4236-4277): a runtime
+/// DHLM put sends the new limit; devMotorAsyn lands it on the
+/// motorHighLimit parameter.
+#[tokio::test]
+async fn limit_put_forward_reaches_driver() {
+    let sim = Arc::new(Mutex::new(SimMotor::new()));
+    let motor: Arc<Mutex<dyn AsynMotor>> = sim.clone();
+    let mut setup = make_builder(motor).build();
+
+    setup.device_support.init(&mut setup.record).unwrap();
+    // The builder harness skips the record init passes; the live IOC
+    // sets this in init_record(pass1).
+    setup.record.internal.init_invariants_synced = true;
+    setup.record.process().unwrap();
+    setup.device_support.write(&mut setup.record).unwrap();
+
+    setup
+        .record
+        .put_field("DHLM", EpicsValue::Double(50.0))
+        .unwrap();
+    setup.record.process().unwrap();
+    setup.device_support.write(&mut setup.record).unwrap();
+
+    assert_eq!(sim.lock().unwrap().forwarded_high_limit, Some(50.0));
+}
+
 /// C special pidcof (motorRecord.cc:3003-3026): a PCOF put under
 /// GAIN_SUPPORT sends SET_PGAIN with the clamped value; devMotorAsyn
 /// lands it on motorPGain.

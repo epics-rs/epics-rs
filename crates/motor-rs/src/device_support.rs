@@ -176,6 +176,14 @@ impl MotorDeviceSupport {
                     tracing::info!("motor command: SetPidGain kind={kind:?} gain={gain}");
                     motor.set_pid_gain(&user, *kind, *gain)
                 }
+                MotorCommand::SetHighLimit { position } => {
+                    tracing::info!("motor command: SetHighLimit pos={position}");
+                    motor.set_high_limit(&user, *position)
+                }
+                MotorCommand::SetLowLimit { position } => {
+                    tracing::info!("motor command: SetLowLimit pos={position}");
+                    motor.set_low_limit(&user, *position)
+                }
                 MotorCommand::Poll => Ok(()),
             };
 
@@ -291,6 +299,30 @@ impl DeviceSupport for MotorDeviceSupport {
         {
             motor_rec.process_motor_info(&status);
             motor_rec.clear_last_write();
+        }
+
+        // C init_record 716-718 ("Reset limits in case database values
+        // are invalid"): both dial limits are forwarded to the driver
+        // unconditionally after the initial readback, high first.
+        let dial_limits = record
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<crate::record::MotorRecord>())
+            .map(|rec| {
+                let read =
+                    |rec: &mut crate::record::MotorRecord, name: &str| match rec.get_field(name) {
+                        Some(EpicsValue::Double(d)) => d,
+                        _ => 0.0,
+                    };
+                (read(rec, "DHLM"), read(rec, "DLLM"))
+            });
+        if let Some((dhlm, dllm)) = dial_limits {
+            let mut motor = self.motor.lock().map_err(|e| {
+                epics_base_rs::error::CaError::InvalidValue(format!("motor lock: {e}"))
+            })?;
+            // Errors are non-fatal, as in C (init_record ignores the
+            // build_trans return for these two sends).
+            let _ = motor.set_high_limit(&user, dhlm);
+            let _ = motor.set_low_limit(&user, dllm);
         }
 
         self.initialized = true;

@@ -36,6 +36,13 @@ pub struct SimMotor {
     /// PID gains forwarded by the record, in arrival order (C
     /// devMotorAsyn motorPGain/motorIGain/motorDGain parameters).
     pub pid_gains: Vec<(PidGainKind, f64)>,
+    /// Limits forwarded by the record (C devMotorAsyn motorHighLimit/
+    /// motorLowLimit parameters). Stored, not enforced — the sim's
+    /// `high_limit`/`low_limit` model independent hardware travel
+    /// limits, like asyn drivers that record the parameter without
+    /// acting on it.
+    pub forwarded_high_limit: Option<f64>,
+    pub forwarded_low_limit: Option<f64>,
 }
 
 impl SimMotor {
@@ -65,6 +72,8 @@ impl SimMotor {
             pco_increment: 0.0,
             pco_pulse_width_us: 0.0,
             pid_gains: Vec::new(),
+            forwarded_high_limit: None,
+            forwarded_low_limit: None,
         }
     }
 
@@ -205,6 +214,16 @@ impl AsynMotor for SimMotor {
 
     fn set_pid_gain(&mut self, _user: &AsynUser, kind: PidGainKind, gain: f64) -> AsynResult<()> {
         self.pid_gains.push((kind, gain));
+        Ok(())
+    }
+
+    fn set_high_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        self.forwarded_high_limit = Some(position);
+        Ok(())
+    }
+
+    fn set_low_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        self.forwarded_low_limit = Some(position);
         Ok(())
     }
 

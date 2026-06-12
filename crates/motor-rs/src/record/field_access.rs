@@ -1635,9 +1635,11 @@ pub(crate) fn motor_put_field(
                 if rec.conv.dir == MotorDir::Pos {
                     rec.limits.dhlm = dial;
                     update_raw_from_dial_high(rec, dial);
+                    queue_limit_forward(rec, DialLimit::High, dial);
                 } else {
                     rec.limits.dllm = dial;
                     update_raw_from_dial_low(rec, dial);
+                    queue_limit_forward(rec, DialLimit::Low, dial);
                 }
                 detect_inverted_limits(&mut rec.limits, rec.pos.dval);
                 Ok(())
@@ -1653,9 +1655,11 @@ pub(crate) fn motor_put_field(
                 if rec.conv.dir == MotorDir::Pos {
                     rec.limits.dllm = dial;
                     update_raw_from_dial_low(rec, dial);
+                    queue_limit_forward(rec, DialLimit::Low, dial);
                 } else {
                     rec.limits.dhlm = dial;
                     update_raw_from_dial_high(rec, dial);
+                    queue_limit_forward(rec, DialLimit::High, dial);
                 }
                 detect_inverted_limits(&mut rec.limits, rec.pos.dval);
                 Ok(())
@@ -1666,6 +1670,7 @@ pub(crate) fn motor_put_field(
             EpicsValue::Double(v) => {
                 rec.limits.dhlm = v;
                 update_raw_from_dial_high(rec, v);
+                queue_limit_forward(rec, DialLimit::High, v);
                 // C set_dial_highlimit (motorRecord.cc:4236-4277): a dial
                 // high-limit write updates exactly ONE user limit — HLM
                 // when DIR=Pos, LLM when DIR=Neg. No re-ordering.
@@ -1684,6 +1689,7 @@ pub(crate) fn motor_put_field(
             EpicsValue::Double(v) => {
                 rec.limits.dllm = v;
                 update_raw_from_dial_low(rec, v);
+                queue_limit_forward(rec, DialLimit::Low, v);
                 // C set_dial_lowlimit (motorRecord.cc:4287-4328): mirror
                 // of DHLM — LLM when DIR=Pos, HLM when DIR=Neg.
                 let user = coordinate::dial_to_user(v, rec.conv.dir, rec.pos.off);
@@ -2411,6 +2417,34 @@ fn detect_inverted_limits(limits: &mut LimitFields, dval: f64) {
     }
 }
 
+/// Which side of the soft-travel-limit pair a put landed on, in the
+/// dial frame (after the DIR fold for user-limit puts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DialLimit {
+    High,
+    Low,
+}
+
+/// Queue the driver forward for a soft-limit put (C set_dial_highlimit
+/// 4236-4277 / set_dial_lowlimit 4287-4328 send SET_HIGH/LOW_LIMIT from
+/// special() before the pp pass runs do_work; `do_process` drains the
+/// buffer in front of the pass's own commands). Init-gated like the raw
+/// helpers: during dbLoadRecords C applies field() as raw struct writes
+/// and special never runs, so a load must not emit. The boundary speaks
+/// dial-frame EGU (like `MotorCommand::SetPosition`) — C's raw-steps
+/// wire value and the MRES-sign register swap live only in the raw pair
+/// (`update_raw_from_dial_high`/`_low`), so the dial side maps to the
+/// command unswapped.
+fn queue_limit_forward(rec: &mut MotorRecord, side: DialLimit, dial: f64) {
+    if !rec.internal.init_invariants_synced {
+        return;
+    }
+    rec.internal.special_cmds.push(match side {
+        DialLimit::High => MotorCommand::SetHighLimit { position: dial },
+        DialLimit::Low => MotorCommand::SetLowLimit { position: dial },
+    });
+}
+
 /// Queue the driver forward for a PID-coefficient put (C special pidcof,
 /// motorRecord.cc 3003-3026: build_trans SET_PGAIN/SET_IGAIN/SET_DGAIN
 /// at put time). Callers gate on GAIN_SUPPORT and clamp to 0.0–1.0
@@ -2427,9 +2461,7 @@ fn queue_pid_gain_forward(rec: &mut MotorRecord, kind: PidGainKind, gain: f64) {
 /// (SET_LOW_LIMIT -> RLLM). Gated on init: during dbLoadRecords a dial
 /// field() must leave the raw pair at 0 so the raw-wins rule at init
 /// can tell a loaded RHLM/RLLM apart from a derived one (C applies
-/// field() as raw struct writes — special never runs at load). The
-/// SET_HIGH/LOW_LIMIT driver command itself is not emitted: the
-/// published MotorDriver trait has no limit call.
+/// field() as raw struct writes — special never runs at load).
 fn update_raw_from_dial_high(rec: &mut MotorRecord, dial: f64) {
     if !rec.internal.init_invariants_synced || rec.conv.mres == 0.0 {
         return;

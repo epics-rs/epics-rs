@@ -150,6 +150,24 @@ pub trait AsynMotor: Send + Sync {
         Ok(())
     }
 
+    /// Set the controller's high soft-travel limit, dial-frame EGU.
+    /// C set_dial_highlimit (motorRecord.cc 4236-4277) forwards the
+    /// limit so controllers with their own read-only travel limits can
+    /// vet it; C's wire value is raw steps (dhlm/mres) with an
+    /// MRES-sign register swap — this interface speaks dial EGU like
+    /// [`set_position`](Self::set_position), so the dial high limit
+    /// arrives here unconditionally and raw-frame drivers fold below.
+    fn set_high_limit(&mut self, _user: &AsynUser, _position: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// Set the controller's low soft-travel limit, dial-frame EGU.
+    /// Mirror of [`set_high_limit`](Self::set_high_limit) (C
+    /// set_dial_lowlimit, motorRecord.cc 4287-4328).
+    fn set_low_limit(&mut self, _user: &AsynUser, _position: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
     /// Enable or disable deferred moves for coordinated multi-axis motion.
     fn set_deferred_moves(&mut self, _user: &AsynUser, _defer: bool) -> AsynResult<()> {
         Ok(())

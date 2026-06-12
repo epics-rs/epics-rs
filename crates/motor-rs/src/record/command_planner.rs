@@ -1962,9 +1962,9 @@ impl MotorRecord {
         }
         let jvel_retune = std::mem::take(&mut self.jog_retune_pending);
         // Driver commands queued by put handlers (C sends these from
-        // special() — pidcof 3003-3026 — which runs before the pp pass
-        // enters do_work). Spliced in FRONT of the pass's own commands
-        // to preserve C's wire order.
+        // special() — pidcof 3003-3026, set_user/dial_*limit 4076-4328 —
+        // which runs before the pp pass enters do_work). Spliced in
+        // FRONT of the pass's own commands to preserve C's wire order.
         let mut special_cmds = std::mem::take(&mut self.internal.special_cmds);
         let mut effects = self.do_process_inner();
         if !special_cmds.is_empty() {

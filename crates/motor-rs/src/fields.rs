@@ -495,8 +495,9 @@ pub struct InternalFields {
     pub idle_status_pass: bool,
     /// Driver commands a put queued at special() time (C sends them
     /// from special() before the pp pass runs do_work: pidcof
-    /// 3003-3026). Every motor put is followed by a process pass;
-    /// `do_process` drains this buffer in front of the pass's own
-    /// commands, preserving C's emission order.
+    /// 3003-3026, set_user/dial_*limit 4076-4328). Every motor put is
+    /// followed by a process pass; `do_process` drains this buffer in
+    /// front of the pass's own commands, preserving C's emission
+    /// order.
     pub special_cmds: Vec<crate::flags::MotorCommand>,
 }

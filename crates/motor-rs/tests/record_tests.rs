@@ -4944,6 +4944,81 @@ fn test_resolution_init_nonpositive_srev_clamped() {
 }
 
 #[test]
+fn test_runtime_srev_put_recomputes_mres_only() {
+    // C special SREV (2913-2924): make MRES agree and break — UREV, the
+    // EGU velocities and the dial limits are all left alone (only the
+    // MRES/UREV cases run velcheckB and the limit rescale).
+    let mut rec = MotorRecord::new();
+    rec.put_field("MRES", EpicsValue::Double(0.5)).unwrap();
+    rec.put_field("VELO", EpicsValue::Double(8.0)).unwrap();
+    rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+    assert!(
+        (rec.conv.urev - 100.0).abs() < 1e-9,
+        "UREV={}",
+        rec.conv.urev
+    );
+    assert!(
+        (rec.limits.rhlm - 20.0).abs() < 1e-9,
+        "RHLM={}",
+        rec.limits.rhlm
+    );
+
+    rec.put_field("SREV", EpicsValue::Long(400)).unwrap();
+    assert_eq!(rec.conv.srev, 400);
+    assert!(
+        (rec.conv.mres - 0.25).abs() < 1e-12,
+        "MRES={}",
+        rec.conv.mres
+    );
+    // UREV unchanged (C leaves it; the triple stays consistent).
+    assert!(
+        (rec.conv.urev - 100.0).abs() < 1e-9,
+        "UREV={}",
+        rec.conv.urev
+    );
+    // No velcheckB: VELO/S untouched.
+    assert!((rec.vel.velo - 8.0).abs() < 1e-9, "VELO={}", rec.vel.velo);
+    assert!((rec.vel.s - 0.08).abs() < 1e-9, "S={}", rec.vel.s);
+    // No limit rescale: DHLM stays, raw register stays.
+    assert!(
+        (rec.limits.dhlm - 10.0).abs() < 1e-9,
+        "DHLM={}",
+        rec.limits.dhlm
+    );
+    assert!(
+        (rec.limits.rhlm - 20.0).abs() < 1e-9,
+        "RHLM={}",
+        rec.limits.rhlm
+    );
+}
+
+#[test]
+fn test_runtime_srev_nonpositive_clamped_to_200() {
+    // C special SREV (2914-2918): a non-positive runtime put is clamped
+    // to 200 (the old handler rejected it and kept the previous SREV).
+    let mut rec = MotorRecord::new();
+    rec.put_field("MRES", EpicsValue::Double(0.5)).unwrap();
+    rec.put_field("SREV", EpicsValue::Long(400)).unwrap();
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+    assert!(
+        (rec.conv.urev - 200.0).abs() < 1e-9,
+        "UREV={}",
+        rec.conv.urev
+    );
+
+    rec.put_field("SREV", EpicsValue::Long(-3)).unwrap();
+    assert_eq!(rec.conv.srev, 200);
+    assert!(
+        (rec.conv.mres - 1.0).abs() < 1e-12,
+        "MRES={}",
+        rec.conv.mres
+    );
+}
+
+#[test]
 fn test_eres_seeded_from_mres_at_init() {
     // C init_record 692-696: ERES == 0 is seeded from MRES at init —
     // whether the .db never set it or loaded an explicit 0, and

@@ -1176,16 +1176,22 @@ pub(crate) fn motor_put_field(
                     rec.conv.srev = v;
                     return Ok(());
                 }
-                if v <= 0 {
-                    return Ok(());
-                }
+                // C special SREV (2914-2918): a non-positive put is
+                // clamped to 200, not rejected.
+                let v = if v <= 0 { 200 } else { v };
                 let old_mres = rec.conv.mres;
                 rec.conv.srev = v;
-                // C special SREV (2919-2923): make MRES agree.
+                // C special SREV (2919-2923): make MRES agree — and
+                // nothing else. Unlike the MRES/UREV cases, SREV breaks
+                // straight out: no velcheckB velocity re-derive, no
+                // dial-limit rescale (UREV is unchanged, so the EGU
+                // speeds already agree).
+                // The urev != 0 gate is a Rust guard, not C: C divides
+                // unconditionally and lets MRES go to 0; the Rust
+                // division sites require a nonzero resolution.
                 if rec.conv.urev != 0.0 {
                     rec.conv.mres = rec.conv.urev / v as f64;
                 }
-                apply_mres_cascade(rec);
                 // C special SREV (2919-2922): MARK(M_MRES) only when
                 // MRES actually changed.
                 if rec.conv.mres != old_mres {

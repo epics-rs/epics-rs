@@ -379,6 +379,14 @@ pub struct InternalFields {
     pub nmap: i64,
     pub lspg: SpmgMode,
     pub sync: bool,
+    /// C `pmr->pp` — post-process this motion when the axis stops. Armed by
+    /// the commanded stop while moving (motorRecord.cc:1892), jog/home
+    /// arming (2025, 2110, 2125), jog stop (2152) and backlash arming
+    /// (2523); cleared by the NTM stop-and-replan (1341, "Don't post
+    /// process the previous move") and consumed at completion. A Pause
+    /// never sets it — that is what keeps a paused move's target alive in
+    /// VAL/DVAL for the Go resume instead of syncing it back to readback.
+    pub pp: bool,
     /// Backlash final move pending after MainMove completes
     pub backlash_pending: bool,
     /// Pending retarget value (for NTM stop-and-replan)

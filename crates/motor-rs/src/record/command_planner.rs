@@ -85,6 +85,10 @@ impl MotorRecord {
                 if self.conv.urip && self.conv.rdbl_error {
                     if self.stat.phase != MotionPhase::Idle {
                         self.stat.mip.insert(MipFlags::STOP);
+                        // An error stop post-processes like a commanded
+                        // stop: sync the drive fields at completion rather
+                        // than arming the paused-resume state.
+                        self.internal.pp = true;
                         effects.commands.push(MotorCommand::Stop {
                             acceleration: self.move_accel_egu(),
                         });
@@ -142,6 +146,10 @@ impl MotorRecord {
                             // disarm any safety-net verify flag armed by a
                             // prior ExtendMove in this motion.
                             self.internal.verify_retarget_on_completion = false;
+                            // C 1341: pp = FALSE — "Don't post process the
+                            // previous move." The replanned target must not
+                            // be synced away at the stop completion.
+                            self.internal.pp = false;
                             self.internal.pending_retarget = Some(self.pos.dval);
                             self.stat.mip.insert(MipFlags::STOP);
                             effects.commands.push(MotorCommand::Stop {
@@ -388,7 +396,13 @@ impl MotorRecord {
 
         // DMOV pulse: set false before starting
         self.stat.dmov = false;
-        self.retry.rcnt = 0;
+        // C 2351-2356: the retry counter resets only when this dispatch is
+        // NOT a retry. A Go resume of a paused move re-enters here with
+        // mip = MIP_RETRY (maybeRetry armed it at the pause stop), and C
+        // preserves rcnt so repeated Pause/Go cycles count against RTRY.
+        if !self.stat.mip.contains(MipFlags::RETRY) {
+            self.retry.rcnt = 0;
+        }
         self.retry.miss = false;
 
         // tdir reflects the actual first-command direction
@@ -416,6 +430,13 @@ impl MotorRecord {
         self.stat.mip = MipFlags::MOVE;
         self.set_phase(MotionPhase::MainMove);
         self.internal.backlash_pending = backlash;
+        // C 2523: a move that will need a backlash correction arms pp
+        // ("do backlash from postprocess()"). Collaterally, a Pause that
+        // interrupts such a move syncs at its stop completion instead of
+        // arming the paused-resume state — matching C.
+        if backlash {
+            self.internal.pp = true;
+        }
 
         let use_rel = self.use_relative_moves();
         let frac = self.retry.frac;
@@ -516,6 +537,7 @@ impl MotorRecord {
             // check_completion's MIP_STOP branch via sync_positions().
             // Syncing or finalizing eagerly here would post a transient
             // mid-deceleration snapshot before the rest position is known.
+            self.internal.pp = true;
             self.internal.backlash_pending = false;
             self.ctrl.jogf = false;
             self.ctrl.jogr = false;
@@ -555,6 +577,9 @@ impl MotorRecord {
         // leaves JOGF|STOP set) would be replayed as a queued jog.
         if self.stat.phase != MotionPhase::Idle && self.stat.movn {
             self.stat.mip = MipFlags::STOP;
+            // C 2110: pp = TRUE — the stop completion post-processes
+            // (VAL/DVAL <- readback) before the queued jog re-fires.
+            self.internal.pp = true;
             self.internal.queued_motion = Some(QueuedMotion::Jog { forward });
             self.internal.backlash_pending = false;
             effects.commands.push(MotorCommand::Stop {
@@ -590,6 +615,9 @@ impl MotorRecord {
         }
 
         self.stat.dmov = false;
+        // C 2125: pp = TRUE at jog dispatch — a pause that interrupts the
+        // jog post-processes (syncs) at its stop completion.
+        self.internal.pp = true;
 
         if forward {
             self.stat.mip = MipFlags::JOGF;
@@ -624,6 +652,9 @@ impl MotorRecord {
 
     /// Stop jogging.
     fn stop_jog(&mut self, effects: &mut ProcessEffects) {
+        // C 2152: pp = TRUE — "When stopped, process() will correct
+        // backlash" (and sync the drive fields via postProcess).
+        self.internal.pp = true;
         self.stat.mip.insert(MipFlags::JOG_STOP);
         self.set_phase(MotionPhase::JogStopping);
         effects.commands.push(MotorCommand::Stop {
@@ -725,6 +756,9 @@ impl MotorRecord {
         // Queued request goes in internal.queued_motion (see start_jog).
         if self.stat.phase != MotionPhase::Idle && self.stat.movn {
             self.stat.mip = MipFlags::STOP;
+            // C 2025: pp = TRUE — the stop completion post-processes
+            // (VAL/DVAL <- readback) before the queued home re-fires.
+            self.internal.pp = true;
             self.internal.queued_motion = Some(QueuedMotion::Home { forward });
             self.internal.backlash_pending = false;
             self.internal.pending_retarget = None;
@@ -748,6 +782,9 @@ impl MotorRecord {
         }
 
         self.stat.dmov = false;
+        // C 2025: pp = TRUE at home dispatch (set for both the queued and
+        // the direct branch before the movn test).
+        self.internal.pp = true;
 
         if forward {
             self.stat.mip = MipFlags::HOMF;
@@ -854,7 +891,6 @@ impl MotorRecord {
 
     /// Handle SPMG mode change.
     fn handle_spmg_change(&mut self, effects: &mut ProcessEffects) {
-        let old = self.internal.lspg;
         let new = self.ctrl.spmg;
         self.internal.lspg = new;
 
@@ -891,23 +927,40 @@ impl MotorRecord {
                 }
             }
             SpmgMode::Go => {
-                if matches!(old, SpmgMode::Pause) && self.stat.phase == MotionPhase::Idle {
-                    // C: on Go, a still-latched jog button resumes jogging;
-                    // otherwise replan toward the saved DVAL target.
+                if self.stat.phase == MotionPhase::Idle {
+                    // C top-block Go branch (1909-1925): a still-latched
+                    // jog button re-arms the jog (MIP_JOG_REQ); else a bare
+                    // mip == MIP_STOP collapses to DONE. The pass then
+                    // falls through to the move block (2241), which
+                    // re-fires on `dval != ldvl || !dmov`: that resumes a
+                    // paused move (maybeRetry left mip=RETRY, dmov=FALSE)
+                    // and dispatches a target written under Stop/Pause
+                    // (collected but not acted on, 2237). A completed or
+                    // synced state has dval == ldvl and dmov, so nothing
+                    // fires.
                     if self.ctrl.jogf || self.ctrl.jogr {
                         let forward = self.ctrl.jogf;
                         self.start_jog(forward, effects);
-                    } else if (self.pos.dval - self.pos.drbv).abs() > self.retry.rdbd.max(1e-12) {
-                        self.plan_absolute_move(effects);
+                    } else {
+                        if self.stat.mip == MipFlags::STOP {
+                            self.stat.mip = MipFlags::empty();
+                        }
+                        if !self.stat.dmov || self.pos.dval != self.internal.ldvl {
+                            self.plan_absolute_move(effects);
+                        }
                     }
                 }
             }
             SpmgMode::Move => {
-                // One-shot: like Go but will restore to Pause after completion
-                if matches!(old, SpmgMode::Pause | SpmgMode::Stop)
-                    && self.stat.phase == MotionPhase::Idle
-                {
-                    if (self.pos.dval - self.pos.drbv).abs() > self.retry.rdbd.max(1e-12) {
+                // One-shot: like Go but will restore to Pause after
+                // completion. C top-block else-branch (1927-1933):
+                // mip = MIP_DONE and rcnt = 0 (unlike Go, a Move resume
+                // abandons the retry accounting), then the move block
+                // re-fires exactly as for Go.
+                if self.stat.phase == MotionPhase::Idle {
+                    self.stat.mip = MipFlags::empty();
+                    self.retry.rcnt = 0;
+                    if !self.stat.dmov || self.pos.dval != self.internal.ldvl {
                         self.plan_absolute_move(effects);
                     }
                 }

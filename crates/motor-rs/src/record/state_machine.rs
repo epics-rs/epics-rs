@@ -25,6 +25,9 @@ impl MotorRecord {
             && !self.stat.mip.contains(MipFlags::STOP)
         {
             self.stat.mip.insert(MipFlags::STOP);
+            // An error stop post-processes like a commanded stop (sync at
+            // completion), not like a Pause (resume armed).
+            self.internal.pp = true;
             effects.commands.push(MotorCommand::Stop {
                 acceleration: self.move_accel_egu(),
             });
@@ -68,6 +71,16 @@ impl MotorRecord {
             // buttons, C motorRecord.cc:1893/1903).
             if let Some(queued) = self.internal.queued_motion.take() {
                 self.stat.mip.remove(MipFlags::STOP);
+                // C: the queued request armed pp=TRUE (2025/2110), so this
+                // stop completion runs postProcess first — VAL/DVAL/RVAL
+                // sync to the rest position (826-849) — and only then
+                // re-fires the request (858-890). A target written while
+                // the stop was in flight is dropped here, like C's replay
+                // gate refusing `mip & MIP_STOP` (1385). The re-fired
+                // motion starts with pp armed again (887, 2125), so a
+                // pause interrupting it syncs at its own stop completion.
+                self.sync_positions();
+                self.internal.pp = true;
                 match queued {
                     QueuedMotion::Home { forward } => {
                         self.set_phase(MotionPhase::Homing);
@@ -97,10 +110,65 @@ impl MotorRecord {
                 effects.suppress_forward_link = true;
                 return effects;
             }
-            // Plain stop -- sync target to readback then finalize
-            // C: postProcess syncs VAL<-RBV, DVAL<-DRBV after stop
-            self.sync_positions();
-            self.finalize_or_delay(&mut effects);
+            // Plain stop. C discriminates by pp (motorRecord.cc:1383-1402):
+            // a commanded stop (or interrupted jog/home/backlash, all of
+            // which armed pp) runs postProcess — VAL/DVAL/RVAL <- readback
+            // and MIP_STOP cleared (826-849, 1027-1032) — so maybeRetry
+            // never runs (mip == MIP_DONE at its 1432 gate).
+            let pp = std::mem::take(&mut self.internal.pp);
+            if pp {
+                self.sync_positions();
+                self.finalize_or_delay(&mut effects);
+                return effects;
+            }
+            // A Pause never set pp: postProcess is skipped, mip stays
+            // MIP_STOP, and maybeRetry (1040-1100) runs against the
+            // preserved target. A limit switch in the commanded direction
+            // blocks the retry (1048).
+            let diff = (self.pos.dval - self.pos.drbv).abs();
+            let same_polarity = (self.conv.dir == MotorDir::Pos) == (self.conv.mres >= 0.0);
+            let user_cdir = if same_polarity {
+                self.stat.cdir
+            } else {
+                !self.stat.cdir
+            };
+            let ls_blocks = (self.limits.hls && user_cdir) || (self.limits.lls && !user_cdir);
+            if diff >= self.retry.rdbd && !ls_blocks && self.retry.rtry != 0 {
+                if self.retry.rcnt >= self.retry.rtry {
+                    // C 1060-1075: too many retries — give up, MISS
+                    // latches, the lasts adopt the unreached target
+                    // (finalize_motion's lval/ldvl sync matches 1067-1069).
+                    self.retry.miss = true;
+                    self.finalize_or_delay(&mut effects);
+                } else {
+                    // C 1077-1082 with 1356's dmov=TRUE UNMARKed and
+                    // reversed: DMOV never posts 1 — the paused move stays
+                    // "not done" with mip = MIP_RETRY armed. The Go pass
+                    // re-fires it via the move-block `!dmov` gate (2241);
+                    // rcnt counts each paused stop against RTRY.
+                    self.retry.rcnt += 1;
+                    self.stat.mip = MipFlags::RETRY;
+                    self.set_phase(MotionPhase::Idle);
+                    effects.suppress_forward_link = true;
+                }
+            } else {
+                // Close enough, RTRY disabled, or LS blocked: C maybeRetry
+                // else-branch (1084-1099) — collapse to DONE without any
+                // sync (the lasts already equal the reached target from
+                // the dispatch-time load). MISS clears only on the
+                // close-enough/LS path (1087-1091); the rtry==0 path
+                // leaves it. DLY arms only on a real completion edge
+                // (C 1457 needs a fresh M_DMOV mark): an idle Pause
+                // convergence pass (dmov already true) finalizes quietly.
+                if diff < self.retry.rdbd || ls_blocks {
+                    self.retry.miss = false;
+                }
+                if self.stat.dmov {
+                    self.finalize_motion(&mut effects);
+                } else {
+                    self.finalize_or_delay(&mut effects);
+                }
+            }
             return effects;
         }
 
@@ -202,6 +270,10 @@ impl MotorRecord {
         self.stat.dmov = true;
         self.stat.movn = false;
         self.retry.rcnt = 0;
+        // C postProcess clears pp on entry (825); every normal completion
+        // runs it, so a leftover pp from a revived stop (ExtendMove over a
+        // decelerating axis) must not leak into the next motion.
+        self.internal.pp = false;
         self.internal.backlash_pending = false;
         self.internal.pending_retarget = None;
         self.internal.queued_motion = None;

@@ -311,7 +311,7 @@ fn stop_and_replan_with_backlash() {
 }
 
 #[test]
-fn spmg_pause_stops_and_syncs_after_completion() {
+fn spmg_pause_preserves_target_and_resumes_on_go() {
     let mut rec = make_record();
 
     // Start move
@@ -326,20 +326,35 @@ fn spmg_pause_stops_and_syncs_after_completion() {
     assert!(rec.stat.mip.contains(MipFlags::STOP));
     assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
 
-    // Motor stops at position 25.0
+    // Motor stops at 25. C: Pause never set pp, so postProcess is skipped
+    // (1383-1402) — the target survives in VAL/DVAL — and maybeRetry
+    // (1077-1082) arms MIP_RETRY with DMOV left FALSE (1356 UNMARKed).
     complete_move(&mut rec, 25.0);
-    let _effects = rec.check_completion();
+    let effects = rec.check_completion();
+    assert!(effects.commands.is_empty());
+    assert!(!rec.stat.dmov); // paused move never reports done
+    assert_eq!(rec.stat.mip, MipFlags::RETRY);
+    assert_eq!(rec.pos.dval, 50.0); // target preserved, not synced
+    assert_eq!(rec.pos.val, 50.0);
+    assert_eq!(rec.retry.rcnt, 1); // C: each paused stop counts a retry
 
-    // C: postProcess syncs positions (VAL=RBV, DVAL=DRBV)
-    assert!(rec.stat.dmov);
-    assert_eq!(rec.pos.dval, 25.0); // synced to readback
-    assert_eq!(rec.pos.val, 25.0);
-
-    // Go: no resume since positions are synced
+    // Go: the move-block pass (2241) re-fires on !dmov toward the
+    // preserved DVAL, keeping the retry count (C 2351-2356).
     rec.ctrl.spmg = SpmgMode::Go;
-    rec.internal.lspg = SpmgMode::Pause;
     let effects = rec.plan_motion(CommandSource::Spmg);
-    assert!(effects.commands.is_empty()); // no move, already at target
+    assert_eq!(effects.commands.len(), 1);
+    assert!(matches!(
+        effects.commands[0],
+        MotorCommand::MoveAbsolute { position, .. } if (position - 50.0).abs() < 1e-9
+    ));
+    assert_eq!(rec.stat.mip, MipFlags::MOVE);
+    assert_eq!(rec.retry.rcnt, 1);
+
+    // The resumed move completes at the target.
+    complete_move(&mut rec, 50.0);
+    rec.check_completion();
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.pos.dval, 50.0);
 }
 
 #[test]

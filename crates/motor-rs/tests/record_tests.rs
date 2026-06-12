@@ -3361,3 +3361,232 @@ fn test_monitor_deadband_value_is_rbv_not_val() {
     rec.pos.val = 10.0; // setpoint differs from readback
     assert_eq!(rec.monitor_deadband_value(), Some(EpicsValue::Double(42.0)));
 }
+
+// --- Pause/Go resume semantics (C pp + maybeRetry, motorRecord.cc
+// 1383-1402, 1040-1100, 2241) ---
+
+/// Shared setup: move 0 → 50, axis reported moving.
+fn paused_move_setup() -> MotorRecord {
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+    rec
+}
+
+/// Drive the axis to a stop at `pos` and run the completion pass.
+fn complete_stop_at(rec: &mut MotorRecord, pos: f64) -> ProcessEffects {
+    rec.pos.drbv = pos;
+    rec.pos.rbv = pos;
+    rec.pos.rrbv = pos as i64;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.movn = false;
+    rec.check_completion()
+}
+
+#[test]
+fn test_pause_resume_targets_value_written_during_pause() {
+    // C: a position write while paused is collected into VAL/DVAL but not
+    // acted on (do_work returns at 2237 before the move block); the Go
+    // pass move block then fires toward the freshest DVAL (2241).
+    let mut rec = paused_move_setup();
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.plan_motion(CommandSource::Spmg);
+    complete_stop_at(&mut rec, 25.0);
+    assert_eq!(rec.stat.mip, MipFlags::RETRY, "paused resume armed");
+
+    rec.put_field("VAL", EpicsValue::Double(80.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(effects.commands.is_empty(), "no dispatch while paused");
+
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        effects.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveAbsolute { position, .. } if (position - 80.0).abs() < 1e-9
+        )),
+        "Go resumes toward the target written during the pause"
+    );
+}
+
+#[test]
+fn test_pause_stop_close_to_target_finalizes_without_resume() {
+    // Boundary |dval - drbv| < RDBD: C maybeRetry close-enough path
+    // (1084-1099) collapses to DONE — DMOV posts, nothing armed.
+    let mut rec = paused_move_setup();
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.plan_motion(CommandSource::Spmg);
+    // RDBD is enforced to >= |MRES| = 1.0; 0.5 is inside the deadband.
+    complete_stop_at(&mut rec, 49.5);
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.stat.mip, MipFlags::empty());
+
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(effects.commands.is_empty(), "nothing to resume");
+}
+
+#[test]
+fn test_pause_stop_with_rtry_zero_does_not_arm_resume() {
+    // C maybeRetry RTRY==0 (1052-1055): clear MIP, no retry arming. The
+    // drive fields keep the target (no postProcess ran) but Go finds
+    // dval == ldvl with DMOV true and fires nothing.
+    let mut rec = paused_move_setup();
+    rec.retry.rtry = 0;
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.plan_motion(CommandSource::Spmg);
+    complete_stop_at(&mut rec, 25.0);
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.stat.mip, MipFlags::empty());
+    assert_eq!(rec.pos.dval, 50.0, "C: target not synced away either");
+
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(effects.commands.is_empty(), "RTRY=0 has no paused resume");
+}
+
+#[test]
+fn test_pause_stop_retry_exhaustion_latches_miss() {
+    // Boundary ++rcnt > rtry at the pause stop: C 1060-1075 gives up —
+    // MIP_DONE, MISS latched, lasts adopt the unreached target.
+    let mut rec = paused_move_setup();
+    rec.retry.rtry = 2;
+    rec.retry.rcnt = 2; // two paused stops already counted
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.plan_motion(CommandSource::Spmg);
+    complete_stop_at(&mut rec, 25.0);
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.stat.mip, MipFlags::empty());
+    assert!(rec.retry.miss, "MISS latches on retry exhaustion");
+
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        effects.commands.is_empty(),
+        "exhausted retry does not resume"
+    );
+}
+
+#[test]
+fn test_stop_during_pause_defuses_resume() {
+    // C top-block stop branch (1874-1888): a STOP pulse on the armed
+    // MIP_RETRY collapses it to DONE with DMOV=TRUE — Go must not resume.
+    let mut rec = paused_move_setup();
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.plan_motion(CommandSource::Spmg);
+    complete_stop_at(&mut rec, 25.0);
+    assert_eq!(rec.stat.mip, MipFlags::RETRY);
+
+    rec.ctrl.stop = true;
+    let effects = rec.plan_motion(CommandSource::Stop);
+    assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.stat.mip, MipFlags::empty());
+
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        effects.commands.is_empty(),
+        "STOP defused the paused resume"
+    );
+}
+
+#[test]
+fn test_target_written_under_spmg_stop_dispatches_on_go() {
+    // C: a position write under SPMG=Stop is collected (2205-2235) but the
+    // pass returns before the move block (2237); the Go pass fires it via
+    // `dval != ldvl` (2241).
+    let mut rec = paused_move_setup();
+    rec.ctrl.spmg = SpmgMode::Stop;
+    rec.plan_motion(CommandSource::Spmg);
+    complete_stop_at(&mut rec, 25.0);
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.pos.dval, 25.0, "commanded stop syncs (pp armed)");
+
+    rec.put_field("VAL", EpicsValue::Double(80.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(effects.commands.is_empty(), "no dispatch under SPMG=Stop");
+
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        effects.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveAbsolute { position, .. } if (position - 80.0).abs() < 1e-9
+        )),
+        "Go dispatches the target collected under SPMG=Stop"
+    );
+}
+
+#[test]
+fn test_pause_during_active_jog_syncs_and_button_resumes_jog() {
+    // C: the jog dispatch armed pp (2125), so the pause-stop completion
+    // post-processes (sync) instead of arming a move resume; the
+    // still-latched button resumes the JOG on Go (1916-1918).
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.ctrl.jogf = true;
+    rec.plan_motion(CommandSource::Jogf);
+    assert_eq!(rec.stat.phase, MotionPhase::Jog);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.plan_motion(CommandSource::Spmg);
+    complete_stop_at(&mut rec, 25.0);
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.pos.dval, 25.0, "interrupted jog syncs at the stop");
+    assert!(rec.ctrl.jogf, "jog button survives the pause");
+
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        effects.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveVelocity {
+                direction: true,
+                ..
+            }
+        )),
+        "Go resumes the jog, not a position move"
+    );
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "no move-block resume after the jog sync"
+    );
+}
+
+#[test]
+fn test_pause_during_backlash_move_syncs_at_completion() {
+    // C 2523: a move dispatched with a pending backlash correction arms pp
+    // ("do backlash from postprocess()"), so a Pause syncs at the stop
+    // completion instead of arming the paused resume.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.retry.bdst = -5.0; // forward move opposes BDST → backlash arming
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    assert!(rec.internal.backlash_pending);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.plan_motion(CommandSource::Spmg);
+    complete_stop_at(&mut rec, 25.0);
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.stat.mip, MipFlags::empty());
+    assert_eq!(rec.pos.dval, 25.0, "backlash-armed move syncs on pause");
+
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(effects.commands.is_empty());
+}

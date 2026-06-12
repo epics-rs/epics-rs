@@ -403,7 +403,7 @@ fn spmg_stop_blocks_new_commands() {
 }
 
 #[test]
-fn spmg_pause_sends_stop_and_syncs_after_completion() {
+fn spmg_pause_sends_stop_and_arms_paused_resume() {
     let mut rec = make_record();
 
     // Start a move
@@ -421,13 +421,14 @@ fn spmg_pause_sends_stop_and_syncs_after_completion() {
     assert!(!rec.stat.dmov); // still moving
     assert!(rec.stat.mip.contains(MipFlags::STOP));
 
-    // Motor stops at 25
+    // Motor stops at 25. C: Pause never set pp — postProcess is skipped
+    // (1383-1402), the target survives, and maybeRetry (1077-1082) arms
+    // MIP_RETRY with DMOV left FALSE for the Go resume.
     complete_move(&mut rec, 25.0);
     let _effects = rec.check_completion();
-    // C: postProcess syncs VAL=RBV, DVAL=DRBV
-    assert!(rec.stat.dmov);
-    assert_eq!(rec.pos.dval, 25.0);
-    assert_eq!(rec.pos.val, 25.0);
+    assert!(!rec.stat.dmov);
+    assert_eq!(rec.stat.mip, MipFlags::RETRY);
+    assert_eq!(rec.pos.dval, 50.0); // target preserved
 }
 
 #[test]

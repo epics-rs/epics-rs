@@ -29,6 +29,9 @@ fn complete_move(rec: &mut MotorRecord, target_pos: f64) {
         encoder_position: target_pos,
         done: true,
         moving: false,
+        // The modeled axis has an encoder; without this the poll-time
+        // encoder check (C 3671-3675) demotes the UEIP=Yes tests.
+        has_encoder: true,
         ..Default::default()
     };
     rec.process_motor_info(&status);
@@ -40,6 +43,7 @@ fn motor_moving(rec: &mut MotorRecord, current_pos: f64) {
         encoder_position: current_pos,
         done: false,
         moving: true,
+        has_encoder: true,
         ..Default::default()
     };
     rec.process_motor_info(&status);

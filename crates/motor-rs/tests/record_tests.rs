@@ -220,6 +220,7 @@ fn test_athm_tracks_home_switch_every_poll() {
     rec.conv.mres = 1.0;
     let on_switch = asyn_rs::interfaces::motor::MotorStatus {
         home: true,
+        has_encoder: true,
         ..Default::default()
     };
     rec.process_motor_info(&on_switch);
@@ -235,6 +236,7 @@ fn test_athm_tracks_home_switch_every_poll() {
     assert!(!rec.stat.athm, "RA_HOME is ignored under UEIP=Yes");
     let encoder_home = asyn_rs::interfaces::motor::MotorStatus {
         encoder_home: true,
+        has_encoder: true,
         ..Default::default()
     };
     rec.process_motor_info(&encoder_home);
@@ -582,6 +584,7 @@ fn test_sset_suse_fof_vof_momentary_commands() {
     // triggers too.
     let mut rec = MotorRecord::new();
     rec.stat.msta = MstaFlags::DONE;
+    rec.internal.init_invariants_synced = true;
 
     rec.put_field("SSET", EpicsValue::Short(0)).unwrap();
     assert!(rec.conv.set, "any SSET write forces SET mode");
@@ -695,6 +698,132 @@ fn test_plain_ueip_change_does_not_reanchor() {
         "UEIP forced off re-anchors via load_pos"
     );
     assert_eq!(rec.stat.mip, MipFlags::LOAD_P);
+}
+
+#[test]
+fn test_db_loaded_ueip_survives_until_first_poll() {
+    // C applies .db field() values as raw struct writes (special() never
+    // runs during dbLoadRecords), so field(UEIP,"Yes") survives load even
+    // though MSTA is still empty. The first poll performs the encoder
+    // check (C 3671-3675) and demotes UEIP without MARKing M_UEIP.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.001;
+
+    rec.put_field("UEIP", EpicsValue::Short(1)).unwrap();
+    assert!(rec.conv.ueip, "load-time UEIP=Yes stored raw, not vetoed");
+
+    let no_encoder = asyn_rs::interfaces::motor::MotorStatus {
+        position: 10.0,
+        done: true,
+        ..Default::default()
+    };
+    rec.process_motor_info(&no_encoder);
+    assert!(!rec.conv.ueip, "first poll without encoder demotes UEIP");
+    assert!(
+        !rec.internal.res_reanchor,
+        "C 3671-3675 posts the demotion without MARK — no re-anchor"
+    );
+
+    // After init, a runtime put repeats the C special() veto (2947-2948):
+    // UEIP=Yes with no encoder is overridden back and MARKs M_UEIP.
+    rec.internal.init_invariants_synced = true;
+    rec.put_field("UEIP", EpicsValue::Short(1)).unwrap();
+    assert!(!rec.conv.ueip, "runtime no-encoder put is vetoed");
+    assert!(rec.internal.res_reanchor, "the veto path MARKs M_UEIP");
+}
+
+#[test]
+fn test_db_loaded_ueip_kept_when_encoder_present() {
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.001;
+    rec.conv.eres = 0.002;
+
+    rec.put_field("UEIP", EpicsValue::Short(1)).unwrap();
+    let status = asyn_rs::interfaces::motor::MotorStatus {
+        position: 10.0,
+        encoder_position: 10.0,
+        done: true,
+        has_encoder: true,
+        ..Default::default()
+    };
+    rec.process_motor_info(&status);
+    assert!(rec.conv.ueip, "encoder present: loaded UEIP=Yes is kept");
+    assert_eq!(rec.pos.rrbv, 5000, "readback follows the encoder (REP)");
+}
+
+#[test]
+fn test_db_loaded_urip_does_not_kill_ueip() {
+    // C special URIP (2955-2959) is runtime-only: a .db loading both
+    // UEIP=Yes and URIP=Yes stores both raw; the poll readback checks
+    // UEIP first (C 3676), so UEIP wins while the encoder is present.
+    let mut rec = MotorRecord::new();
+    rec.put_field("UEIP", EpicsValue::Short(1)).unwrap();
+    rec.put_field("URIP", EpicsValue::Short(1)).unwrap();
+    assert!(rec.conv.ueip, "load-time URIP write leaves UEIP alone");
+    assert!(rec.conv.urip);
+
+    // At runtime the special interplay applies: URIP=Yes forces UEIP=No.
+    rec.internal.init_invariants_synced = true;
+    rec.put_field("URIP", EpicsValue::Short(1)).unwrap();
+    assert!(!rec.conv.ueip, "runtime URIP=Yes forces UEIP off");
+}
+
+#[test]
+fn test_sset_fof_load_time_writes_store_raw() {
+    // C special SSET/SUSE/FOF/VOF (2963-2984) never runs during
+    // dbLoadRecords — a load-time write stores the short without
+    // forcing SET/FOFF.
+    let mut rec = MotorRecord::new();
+
+    rec.put_field("SSET", EpicsValue::Short(1)).unwrap();
+    assert!(!rec.conv.set, "load-time SSET does not force SET mode");
+    assert_eq!(rec.get_field("SSET"), Some(EpicsValue::Short(1)));
+
+    rec.put_field("FOF", EpicsValue::Short(1)).unwrap();
+    assert_eq!(
+        rec.conv.foff,
+        FreezeOffset::Variable,
+        "load-time FOF does not force FOFF (dbd default Variable)"
+    );
+    assert_eq!(rec.get_field("FOF"), Some(EpicsValue::Short(1)));
+}
+
+#[test]
+fn test_encoder_loss_demotes_ueip_on_poll() {
+    // C overwrites pmr->msta wholesale each poll, so EA_PRESENT is pure
+    // driver truth — an axis that stops reporting its encoder demotes
+    // UEIP on the next poll (3671-3675). The record must not latch the
+    // bit and keep the encoder path alive.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.001;
+    rec.conv.eres = 0.002;
+    rec.conv.ueip = true;
+
+    let with_encoder = asyn_rs::interfaces::motor::MotorStatus {
+        position: 10.0,
+        encoder_position: 10.0,
+        done: true,
+        has_encoder: true,
+        ..Default::default()
+    };
+    rec.process_motor_info(&with_encoder);
+    assert!(rec.conv.ueip);
+    assert!(rec.stat.msta.contains(MstaFlags::ENCODER_PRESENT));
+
+    let lost_encoder = asyn_rs::interfaces::motor::MotorStatus {
+        position: 10.0,
+        encoder_position: 10.0,
+        done: true,
+        has_encoder: false,
+        ..Default::default()
+    };
+    rec.process_motor_info(&lost_encoder);
+    assert!(!rec.conv.ueip, "encoder loss demotes UEIP");
+    assert!(
+        !rec.stat.msta.contains(MstaFlags::ENCODER_PRESENT),
+        "EA_PRESENT follows the driver, not a record-side latch"
+    );
+    assert_eq!(rec.pos.rrbv, 10000, "readback fell back to the motor path");
 }
 
 #[test]
@@ -1276,6 +1405,7 @@ fn test_ueip_eres_readback() {
         position: 10.0,
         encoder_position: 10.0,
         done: true,
+        has_encoder: true,
         ..Default::default()
     };
     rec.process_motor_info(&status);
@@ -1297,6 +1427,7 @@ fn test_ueip_eres_nan_fallback_to_mres() {
         position: 10.0,
         encoder_position: 10.0,
         done: true,
+        has_encoder: true,
         ..Default::default()
     };
     rec.process_motor_info(&status);
@@ -3696,6 +3827,7 @@ fn test_rstm_near_zero_uses_motor_position_not_encoder() {
         position: 0.0,         // motor at zero → restore expected
         encoder_position: 5.0, // encoder reads non-zero
         done: true,
+        has_encoder: true,
         ..Default::default()
     };
     let effects = rec.initial_readback(&status);

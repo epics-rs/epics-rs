@@ -87,6 +87,15 @@ impl MotorRecord {
 
     /// Update readback positions from driver status.
     pub fn process_motor_info(&mut self, status: &asyn_rs::interfaces::motor::MotorStatus) {
+        // C 3671-3675: UEIP=Yes is demoted to No on any poll where the
+        // driver reports no encoder. This — not the put handler — is
+        // what vets a .db-loaded UEIP=Yes: dbLoadRecords writes field()
+        // values raw, and the first poll performs the encoder check.
+        // C posts the change without MARKing M_UEIP, so no re-anchor.
+        if self.conv.ueip && !status.has_encoder {
+            self.conv.ueip = false;
+        }
+
         // Layer 1: update raw positions
         self.pos.rmp = (status.position / self.conv.mres).round() as i64;
 
@@ -226,13 +235,12 @@ impl MotorRecord {
         if !status.vbas_supported {
             msta |= MstaFlags::VBAS_UNSUPPORTED;
         }
-        // Preserve record-managed bits
+        // Preserve record-managed bits. EA_PRESENT is NOT preserved:
+        // C overwrites pmr->msta wholesale from the driver each poll,
+        // and the UEIP demotion above depends on that bit being pure
+        // driver truth rather than a record-side latch.
         if self.stat.msta.contains(MstaFlags::HOMED) || status.homed {
             msta |= MstaFlags::HOMED;
-        }
-        // Preserve ENCODER_PRESENT if record set it (via UEIP)
-        if self.stat.msta.contains(MstaFlags::ENCODER_PRESENT) {
-            msta |= MstaFlags::ENCODER_PRESENT;
         }
         self.stat.msta = msta;
 
@@ -358,11 +366,6 @@ impl MotorRecord {
         if status.moving {
             // At startup, the poll loop may not be active yet — request it.
             effects.request_poll = true;
-        }
-
-        // Check encoder presence
-        if self.conv.ueip {
-            self.stat.msta.insert(MstaFlags::ENCODER_PRESENT);
         }
 
         effects

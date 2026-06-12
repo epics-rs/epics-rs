@@ -1025,10 +1025,14 @@ pub(crate) fn motor_put_field(
         // C special (motorRecord.cc:2975-2984): FOF/VOF are momentary
         // command fields — ANY write (including 0) forces FOFF to
         // Frozen/Variable; the written value is only stored for reads.
+        // special() never runs during dbLoadRecords, so a load-time
+        // field() write stores the value raw without forcing FOFF.
         "FOF" => match value {
             EpicsValue::Short(v) => {
                 rec.conv.fof = v;
-                rec.conv.foff = FreezeOffset::Frozen;
+                if rec.internal.init_invariants_synced {
+                    rec.conv.foff = FreezeOffset::Frozen;
+                }
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1036,7 +1040,9 @@ pub(crate) fn motor_put_field(
         "VOF" => match value {
             EpicsValue::Short(v) => {
                 rec.conv.vof = v;
-                rec.conv.foff = FreezeOffset::Variable;
+                if rec.internal.init_invariants_synced {
+                    rec.conv.foff = FreezeOffset::Variable;
+                }
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1050,10 +1056,14 @@ pub(crate) fn motor_put_field(
         },
         // C special (motorRecord.cc:2963-2972): SSET/SUSE are momentary
         // command fields — ANY write forces SET to Set/Use mode.
+        // special() never runs during dbLoadRecords, so a load-time
+        // field() write stores the value raw without forcing SET.
         "SSET" => match value {
             EpicsValue::Short(v) => {
                 rec.conv.sset = v;
-                rec.conv.set = true;
+                if rec.internal.init_invariants_synced {
+                    rec.conv.set = true;
+                }
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1061,7 +1071,9 @@ pub(crate) fn motor_put_field(
         "SUSE" => match value {
             EpicsValue::Short(v) => {
                 rec.conv.suse = v;
-                rec.conv.set = false;
+                if rec.internal.init_invariants_synced {
+                    rec.conv.set = false;
+                }
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1148,7 +1160,11 @@ pub(crate) fn motor_put_field(
         "UEIP" => match value {
             EpicsValue::Short(v) => {
                 let ueip = v != 0;
-                if ueip {
+                // C special UEIP (2934-2950) runs only on runtime puts —
+                // dbLoadRecords writes field() values raw, so a template's
+                // UEIP=Yes survives load (MSTA is still empty) until the
+                // first poll's encoder check (process_motor_info 3671-3675).
+                if ueip && rec.internal.init_invariants_synced {
                     // C: if UEIP=Yes and encoder present, set URIP=No
                     // If no encoder present, override UEIP back to No
                     if rec.stat.msta.contains(MstaFlags::ENCODER_PRESENT) {
@@ -1159,9 +1175,7 @@ pub(crate) fn motor_put_field(
                         // path MARKs M_UEIP — a plain UEIP change never
                         // fires the do_work re-anchor.
                         rec.conv.ueip = false;
-                        if rec.internal.init_invariants_synced {
-                            rec.internal.res_reanchor = true;
-                        }
+                        rec.internal.res_reanchor = true;
                         return Ok(());
                     }
                 }
@@ -1173,14 +1187,15 @@ pub(crate) fn motor_put_field(
         "URIP" => match value {
             EpicsValue::Short(v) => {
                 let urip = v != 0;
-                if urip {
-                    // C: if URIP=Yes and UEIP=Yes, set UEIP=No.
-                    // C special URIP (2955-2959): MARK(M_UEIP) only when
-                    // UEIP was actually forced off.
-                    if rec.conv.ueip && rec.internal.init_invariants_synced {
-                        rec.internal.res_reanchor = true;
-                    }
+                // C: if URIP=Yes and UEIP=Yes, set UEIP=No.
+                // C special URIP (2955-2959): MARK(M_UEIP) only when UEIP
+                // was actually forced off. Runtime-only — at .db load both
+                // may land Yes (raw field() writes); the first poll
+                // resolves precedence (UEIP is checked first at 3676,
+                // unless the encoder check demotes it).
+                if urip && rec.conv.ueip && rec.internal.init_invariants_synced {
                     rec.conv.ueip = false;
+                    rec.internal.res_reanchor = true;
                 }
                 rec.conv.urip = urip;
                 Ok(())

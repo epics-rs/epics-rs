@@ -23,6 +23,9 @@ fn make_status(pos: f64, enc: f64) -> MotorStatus {
         encoder_position: enc,
         done: true,
         moving: false,
+        // The modeled axis has an encoder; without this the poll-time
+        // encoder check (C 3671-3675) demotes the UEIP=Yes tests.
+        has_encoder: true,
         ..Default::default()
     }
 }

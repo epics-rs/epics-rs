@@ -369,6 +369,16 @@ impl Record for MotorRecord {
     /// skipped by the framework (CONSTANT link in C — a successful
     /// dbGetLink), so it never reports as an error here.
     fn set_resolved_input_links(&mut self, resolved: &[&'static str]) {
+        // C closed-loop DOL collection (motorRecord.cc:1994-2005): a
+        // failed dbGetLink on DOL sets `udf = TRUE` and aborts the pass
+        // (return ERROR — the motion side is inert anyway because the
+        // failed read delivers no VAL); a successful read clears it.
+        // The outcome is latched here — gated exactly like the
+        // pre_process_actions request — and applied to the framework's
+        // CommonFields.udf in check_alarms (the C alarm_sub consumer).
+        if self.stat.dmov && self.closed_loop_dol_collection() {
+            self.internal.dol_udf = Some(!resolved.contains(&"DOL"));
+        }
         if self.conv.urip && !self.conv.ueip && !self.links.rdbl.is_empty() {
             self.conv.rdbl_error = !resolved.contains(&"RDBL");
         }
@@ -482,6 +492,15 @@ impl Record for MotorRecord {
     fn check_alarms(&mut self, common: &mut epics_base_rs::server::record::CommonFields) {
         use epics_base_rs::server::recgbl::{alarm_status, rec_gbl_set_sevr};
         use epics_base_rs::server::record::AlarmSeverity;
+
+        // C closed-loop DOL (1999-2005): the DOL read outcome drives
+        // UDF — a failed dbGetLink marks VAL undefined, a successful
+        // one clears it. Applied here because this hook is where the
+        // record sees CommonFields; a pass without a DOL read leaves
+        // udf as-is, like C falling through the collection block.
+        if let Some(undefined) = self.internal.dol_udf.take() {
+            common.udf = undefined;
+        }
 
         // C 3372-3376: an undefined VAL short-circuits every other check.
         if common.udf {
@@ -763,6 +782,36 @@ mod tests {
             !has_dol_read(&rec.pre_process_actions()),
             "supervisory OMSL must not read DOL"
         );
+    }
+
+    // C closed-loop DOL collection (motorRecord.cc:1999-2005): a failed
+    // dbGetLink sets udf = TRUE (UDF/INVALID alarm); a successful read
+    // clears it. A pass without a DOL read leaves udf untouched.
+    #[test]
+    fn closed_loop_dol_read_failure_drives_udf() {
+        use epics_base_rs::server::record::CommonFields;
+        let mut rec = MotorRecord::new();
+        rec.links.omsl = 1; // closed_loop
+        rec.links.dol = "setpoint_src.VAL".to_string();
+        assert!(rec.stat.dmov, "record starts done");
+        let mut common = CommonFields::default();
+
+        // Failed read: the resolved report omits DOL.
+        rec.set_resolved_input_links(&[]);
+        rec.check_alarms(&mut common);
+        assert!(common.udf, "failed DOL read marks VAL undefined");
+
+        // Successful read clears it.
+        rec.set_resolved_input_links(&["DOL"]);
+        rec.check_alarms(&mut common);
+        assert!(!common.udf, "successful DOL read clears UDF");
+
+        // Supervisory pass (no DOL request): udf stays as-is.
+        common.udf = true;
+        rec.links.omsl = 0;
+        rec.set_resolved_input_links(&[]);
+        rec.check_alarms(&mut common);
+        assert!(common.udf, "a pass without a DOL read leaves udf alone");
     }
 
     // C reads DOL only when dol.type == DB_LINK; a constant DOL is initialised

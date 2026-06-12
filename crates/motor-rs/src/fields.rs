@@ -471,4 +471,11 @@ pub struct InternalFields {
     /// done branch applies the C 1345 gate — a GET_INFO acknowledgement
     /// is not a motion completion — and the pass consumes it.
     pub stup_ack: bool,
+    /// Outcome of this cycle's closed-loop DOL read (C motorRecord.cc
+    /// 1999-2005): `Some(true)` — the dbGetLink failed, VAL is
+    /// undefined (C `udf = TRUE; return(ERROR)`); `Some(false)` — the
+    /// read succeeded (C `udf = FALSE`). Latched by
+    /// `set_resolved_input_links`, consumed by `check_alarms`, which
+    /// owns the framework `CommonFields.udf` handoff.
+    pub dol_udf: Option<bool>,
 }

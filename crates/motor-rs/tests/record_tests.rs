@@ -1111,7 +1111,9 @@ fn test_latent_homf_during_move_stops_and_queues_home() {
         rec.internal.queued_motion,
         Some(QueuedMotion::Home { forward: true })
     ));
-    assert_eq!(rec.stat.mip, MipFlags::STOP);
+    // C 2023/2028: mip = MIP_HOMF wholesale, then the movn branch ORs in
+    // MIP_STOP — the queued home is visible in the readback.
+    assert_eq!(rec.stat.mip, MipFlags::HOMF | MipFlags::STOP);
 }
 
 #[test]
@@ -4308,4 +4310,282 @@ fn test_hlm_put_while_idle_does_not_stop() {
     let effects = rec.do_process();
     assert!(effects.commands.is_empty());
     assert_eq!(rec.stat.mip, MipFlags::empty());
+}
+
+// === MIP_JOG_REQ lifecycle and queued/resumed MIP readback ===
+// C special() 3042-3054 (arm/clear), do_work 2082 (park across
+// stop_or_pause), 2106/2111 (wholesale consume, queued = JOGF|STOP),
+// 2023/2028 (queued home = HOMF|STOP), postProcess 866 (resume keeps
+// the direction bit), top block 1901-1922 (wholesale STOP / Go re-arm).
+
+/// Settle an idle record into SPMG=Pause: the Pause transition parks
+/// mip = MIP_STOP (C 1901-1905); the stop completion collapses it back
+/// to DONE via maybeRetry's close-enough branch.
+fn paused_idle_record() -> MotorRecord {
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.plan_motion(CommandSource::Spmg);
+    assert_eq!(rec.stat.mip, MipFlags::STOP);
+    let _ = complete_stop_at(&mut rec, 0.0);
+    assert_eq!(rec.stat.mip, MipFlags::empty(), "pause settles to DONE");
+    rec
+}
+
+#[test]
+fn test_jogf_put_while_paused_parks_jog_req() {
+    // C special() 3045-3046: JOGF=1 on an idle record (mip == MIP_DONE,
+    // !hls) arms MIP_JOG_REQ; the dispatch gate (2082) refuses while
+    // stop_or_pause, so the request parks in the MIP readback.
+    let mut rec = paused_idle_record();
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    assert_eq!(rec.stat.mip, MipFlags::JOG_REQ, "armed at the put");
+    let effects = rec.plan_motion(CommandSource::Jogf);
+    assert!(effects.commands.is_empty(), "no dispatch while paused");
+    assert_eq!(rec.stat.mip, MipFlags::JOG_REQ, "request stays parked");
+
+    // Go re-arms from the button and dispatches; the wholesale
+    // `mip = MIP_JOGF` consumes the parked request (C 1914-1918 + 2106).
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        effects.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveVelocity {
+                direction: true,
+                ..
+            }
+        )),
+        "Go dispatches the parked jog"
+    );
+    assert_eq!(rec.stat.mip, MipFlags::JOGF, "JOG_REQ consumed at dispatch");
+}
+
+#[test]
+fn test_jogf_release_clears_parked_jog_req() {
+    // C special() 3043-3044: jogf == 0 clears a parked MIP_JOG_REQ.
+    let mut rec = paused_idle_record();
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    assert_eq!(rec.stat.mip, MipFlags::JOG_REQ);
+    rec.put_field("JOGF", EpicsValue::Short(0)).unwrap();
+    assert_eq!(rec.stat.mip, MipFlags::empty());
+
+    // Go with nothing parked dispatches no jog.
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. }))
+    );
+}
+
+#[test]
+fn test_jogf_put_at_limit_switch_does_not_arm_jog_req() {
+    // C special() 3045: `mip == MIP_DONE && !pmr->hls` — at the limit
+    // switch the press latches the button but arms nothing.
+    let mut rec = paused_idle_record();
+    rec.limits.hls = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    assert!(rec.ctrl.jogf);
+    assert_eq!(rec.stat.mip, MipFlags::empty());
+}
+
+#[test]
+fn test_stop_kills_parked_jog_req_but_keeps_button() {
+    // C's stop branch early-returns only for mip DONE/STOP/RETRY
+    // (1874-1888); a parked MIP_JOG_REQ falls through to the wholesale
+    // `mip = MIP_STOP` (1901-1905). clear_buttons runs only in the movn
+    // branch (1893), so the button itself survives.
+    let mut rec = paused_idle_record();
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    assert_eq!(rec.stat.mip, MipFlags::JOG_REQ);
+    rec.put_field("STOP", EpicsValue::Short(1)).unwrap();
+    rec.plan_motion(CommandSource::Stop);
+    assert_eq!(rec.stat.mip, MipFlags::STOP, "parked request killed");
+    assert!(rec.ctrl.jogf, "button survives the stop");
+}
+
+#[test]
+fn test_jogf_release_while_idle_is_noop() {
+    // C 2148 gate: stop-jogging requires MIP_JOGF/JOGR in mip. A release
+    // on an idle record must not fabricate a deceleration.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+    rec.put_field("JOGF", EpicsValue::Short(0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Jogf);
+    assert!(effects.commands.is_empty(), "no spurious stop command");
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert_eq!(rec.stat.mip, MipFlags::empty());
+}
+
+#[test]
+fn test_queued_jog_resumes_with_jogf_mip_and_live_lvio() {
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    // JOGF mid-move: stop first, queue the jog — readback JOGF|STOP
+    // (C 2106 wholesale + 2111 `mip |= MIP_STOP`).
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Jogf);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Stop { .. }))
+    );
+    assert_eq!(rec.stat.mip, MipFlags::JOGF | MipFlags::STOP);
+
+    // Stop completes: the resume drops STOP and keeps the direction bit
+    // (C postProcess 866 `mip &= ~MIP_STOP`).
+    let effects = complete_stop_at(&mut rec, 30.0);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. }))
+    );
+    assert_eq!(rec.stat.mip, MipFlags::JOGF, "resumed jog visible in MIP");
+    assert_eq!(rec.stat.phase, MotionPhase::Jog);
+
+    // Regression: the resumed jog must satisfy the live-RBV LVIO
+    // recompute (C 1466-1468), which keys on the MIP jog bits — with the
+    // old empty MIP the jog would coast through the soft-limit window.
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+    let effects = poll_moving_at(&mut rec, 99.5);
+    assert!(rec.limits.lvio, "rbv > hlm - jvel raises LVIO");
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Stop { .. })),
+        "rising LVIO stops the resumed jog"
+    );
+    assert!(!rec.ctrl.jogf, "buttons released (C 1481 clear_buttons)");
+}
+
+#[test]
+fn test_queued_home_resumes_with_homf_mip() {
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    rec.ctrl.homf = true;
+    rec.plan_motion(CommandSource::Homf);
+    assert_eq!(
+        rec.stat.mip,
+        MipFlags::HOMF | MipFlags::STOP,
+        "queued home readback (C 2023/2028)"
+    );
+
+    let effects = complete_stop_at(&mut rec, 30.0);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Home { forward: true, .. }))
+    );
+    assert_eq!(rec.stat.mip, MipFlags::HOMF, "C 866 keeps the HOME bit");
+    assert_eq!(rec.stat.phase, MotionPhase::Homing);
+}
+
+#[test]
+fn test_jogf_release_cancels_queued_jog() {
+    // C 2148-2155 on a queued jog (mip = JOGF|STOP): the release pass
+    // drops JOGF from MIP, so the request dies with the in-flight stop.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    rec.plan_motion(CommandSource::Jogf);
+    assert_eq!(rec.stat.mip, MipFlags::JOGF | MipFlags::STOP);
+
+    rec.put_field("JOGF", EpicsValue::Short(0)).unwrap();
+    rec.plan_motion(CommandSource::Jogf);
+    assert!(rec.internal.queued_motion.is_none(), "queued jog cancelled");
+    assert_eq!(rec.stat.mip, MipFlags::STOP | MipFlags::JOG_STOP);
+
+    let effects = complete_stop_at(&mut rec, 30.0);
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
+        "cancelled request must not resurrect at the stop completion"
+    );
+    assert!(rec.stat.dmov);
+}
+
+#[test]
+fn test_bare_release_kills_queued_jog_at_resume() {
+    // A release that lands only in the button state (overtaken in
+    // last_write, never processed as Jogf) must still kill the queued
+    // jog at the resume point — C kills it on the release pass itself
+    // (2148-2155), so a resurrected jog with no held button has no C
+    // counterpart.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    rec.plan_motion(CommandSource::Jogf);
+    assert_eq!(rec.stat.mip, MipFlags::JOGF | MipFlags::STOP);
+
+    rec.ctrl.jogf = false; // bare release, no process pass
+    let effects = complete_stop_at(&mut rec, 30.0);
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
+        "released queued jog must not resurrect"
+    );
+    assert!(rec.stat.dmov, "plain pp stop finalizes");
+    assert_eq!(rec.stat.mip, MipFlags::empty());
+}
+
+#[test]
+fn test_go_with_jog_button_at_limit_switch_collapses_stop() {
+    // C 1914-1922: at the limit switch the latched button does not
+    // re-arm the jog; the bare MIP_STOP collapses to DONE instead of
+    // leaving the record stuck in STOP.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.plan_motion(CommandSource::Spmg);
+    assert_eq!(rec.stat.mip, MipFlags::STOP);
+
+    rec.ctrl.jogf = true; // latched during the pause
+    rec.limits.hls = true;
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
+        "C 1914: jogf && !hls required to re-arm"
+    );
+    assert_eq!(rec.stat.mip, MipFlags::empty(), "STOP collapses to DONE");
 }

@@ -77,7 +77,30 @@ impl MotorRecord {
             // Only an explicit queued request (internal.queued_motion) is
             // replayed — an active jog/home that a plain STOP just halted
             // is NOT (the stop path replaces MIP wholesale and clears the
-            // buttons, C motorRecord.cc:1893/1903).
+            // buttons, C motorRecord.cc:1893/1903). The queue parked MIP
+            // as JOGF/JOGR|STOP or HOMF/HOMR|STOP (2028/2111), so dropping
+            // STOP leaves the direction bit — like C postProcess re-firing
+            // a home with `mip &= ~MIP_STOP` (866) — and the resumed
+            // motion stays visible to the LVIO recompute and MIP readback.
+            //
+            // A queued jog whose button was released while the stop was
+            // in flight is dead — C kills it on the release pass itself
+            // (2148-2155 drop JOGF/JOGR from MIP); a release that only
+            // landed in the button state must not resurrect it here.
+            // Fall through to the plain pp stop instead. A queued home
+            // re-fires regardless of its button, like C postProcess
+            // (855-890 keys on MIP alone).
+            if let Some(QueuedMotion::Jog { forward }) = self.internal.queued_motion {
+                let held = if forward {
+                    self.ctrl.jogf
+                } else {
+                    self.ctrl.jogr
+                };
+                if !held {
+                    self.internal.queued_motion = None;
+                    self.stat.mip.remove(MipFlags::JOGF | MipFlags::JOGR);
+                }
+            }
             if let Some(queued) = self.internal.queued_motion.take() {
                 self.stat.mip.remove(MipFlags::STOP);
                 // C: the queued request armed pp=TRUE (2025/2110), so this

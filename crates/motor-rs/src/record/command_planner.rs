@@ -270,9 +270,23 @@ impl MotorRecord {
                         self.ctrl.jogf = false;
                     }
                     self.start_jog(forward, &mut effects);
-                } else {
+                } else if matches!(self.internal.queued_motion, Some(QueuedMotion::Jog { .. })) {
+                    // C 2148-2155 on a queued jog (mip = JOGF|STOP): the
+                    // release pass takes the stop-jogging branch — the
+                    // JOGF/JOGR bits drop out of MIP and MIP_JOG_STOP
+                    // rides the already-in-flight stop, so the request is
+                    // dead at the stop completion (postProcess re-fires
+                    // nothing). pp was armed by the queue branch; the
+                    // completion syncs and finalizes like a plain stop.
+                    self.internal.queued_motion = None;
+                    self.stat.mip.remove(MipFlags::JOGF | MipFlags::JOGR);
+                    self.stat.mip.insert(MipFlags::JOG_STOP);
+                } else if self.stat.mip.intersects(MipFlags::JOGF | MipFlags::JOGR) {
                     self.stop_jog(&mut effects);
                 }
+                // else: C 2148 gate — no jog in MIP (idle, or already
+                // decelerating with the bits dropped), the release is a
+                // no-op.
             }
             CommandSource::Homf | CommandSource::Homr => {
                 let forward = src == CommandSource::Homf;
@@ -634,8 +648,17 @@ impl MotorRecord {
             // where the buttons/MIP_JOG_REQ outlive the early return and
             // postProcess re-fires the queued request.
             self.internal.pending_retarget = None;
+        } else if self.stat.mip.contains(MipFlags::JOG_REQ) {
+            // Idle with a parked jog request. C's stop branch early-
+            // returns only for mip DONE/STOP/RETRY (1874-1888); a parked
+            // MIP_JOG_REQ falls through to the wholesale `mip = MIP_STOP`
+            // (1901-1905) — an explicit stop kills the parked request.
+            // The button itself survives (clear_buttons runs only in the
+            // movn branch, 1893), so Go can still re-arm from it.
+            self.stat.mip = MipFlags::STOP;
         }
-        // else: idle — bare STOP_AXIS only.
+        // else: idle — bare STOP_AXIS only (C 1874-1888 early return for
+        // mip DONE/STOP/RETRY keeps MIP untouched).
         //
         // C motorRecord.cc — STOP_AXIS is sent unconditionally ("just in
         // case"): the driver may still be settling even when the record
@@ -649,11 +672,18 @@ impl MotorRecord {
     /// Start jogging.
     fn start_jog(&mut self, forward: bool, effects: &mut ProcessEffects) {
         // C: if motor is moving, stop first then queue jog for after stop.
-        // The queued request lives in internal.queued_motion, NOT in the MIP
-        // JOGF/JOGR bits — otherwise a plain STOP on an active jog (which also
-        // leaves JOGF|STOP set) would be replayed as a queued jog.
+        // C 2106-2113: the dispatch consumes MIP_JOG_REQ wholesale (mip =
+        // MIP_JOGF/JOGR) and the movn branch ORs in MIP_STOP, so a queued
+        // jog reads back as JOGF|STOP. The replay discriminator stays
+        // internal.queued_motion — a plain STOP wholesale-replaces MIP and
+        // clears the buttons (C 1893/1903), so it never resembles this
+        // state, and only an explicit queued request is re-fired.
         if self.stat.phase != MotionPhase::Idle && self.stat.movn {
-            self.stat.mip = MipFlags::STOP;
+            self.stat.mip = if forward {
+                MipFlags::JOGF
+            } else {
+                MipFlags::JOGR
+            } | MipFlags::STOP;
             // C 2110: pp = TRUE — the stop completion post-processes
             // (VAL/DVAL <- readback) before the queued jog re-fires.
             self.internal.pp = true;
@@ -686,6 +716,11 @@ impl MotorRecord {
             } else {
                 self.ctrl.jogr = false;
             }
+            // C 2092-2104 clears only the buttons and leaves a parked
+            // MIP_JOG_REQ in mip (its arming lives in special(), blind to
+            // internal clears). Here the request is dropped with its
+            // button: JOG_REQ set means a latched, undispatched request.
+            self.stat.mip.remove(MipFlags::JOG_REQ);
             self.limits.lvio = true;
             effects.suppress_forward_link = true;
             return;
@@ -732,7 +767,13 @@ impl MotorRecord {
         // C 2152: pp = TRUE — "When stopped, process() will correct
         // backlash" (and sync the drive fields via postProcess).
         self.internal.pp = true;
+        // C 2153-2154: mip |= MIP_JOG_STOP; mip &= ~(MIP_JOGF | MIP_JOGR).
+        // With the JOG bits gone, the deceleration is no longer "a jog"
+        // to the enter_do_work LVIO recompute (1466 gates on MIP_JOG,
+        // which excludes JOG_STOP) — the latch is preserved while
+        // stopping. The jog direction survives in jog_was_forward.
         self.stat.mip.insert(MipFlags::JOG_STOP);
+        self.stat.mip.remove(MipFlags::JOGF | MipFlags::JOGR);
         self.set_phase(MotionPhase::JogStopping);
         effects.commands.push(MotorCommand::Stop {
             acceleration: self.jog_accel_egu(),
@@ -830,9 +871,16 @@ impl MotorRecord {
     /// Start homing.
     fn start_home(&mut self, forward: bool, effects: &mut ProcessEffects) {
         // C: if motor is moving, stop first then queue home for after stop.
-        // Queued request goes in internal.queued_motion (see start_jog).
+        // C 2023-2033: mip = MIP_HOMF/HOMR wholesale, then the movn branch
+        // ORs in MIP_STOP — a queued home reads back as HOMF|STOP. The
+        // replay discriminator stays internal.queued_motion (see
+        // start_jog).
         if self.stat.phase != MotionPhase::Idle && self.stat.movn {
-            self.stat.mip = MipFlags::STOP;
+            self.stat.mip = if forward {
+                MipFlags::HOMF
+            } else {
+                MipFlags::HOMR
+            } | MipFlags::STOP;
             // C 2025: pp = TRUE — the stop completion post-processes
             // (VAL/DVAL <- readback) before the queued home re-fires.
             self.internal.pp = true;
@@ -1007,9 +1055,12 @@ impl MotorRecord {
                 }
                 self.internal.queued_motion = None;
                 self.internal.pending_retarget = None;
-                // C 1901-1905: keep MIP while waiting on DLY.
+                // C 1901-1905: `mip = MIP_STOP` — wholesale, erasing a
+                // parked MIP_JOG_REQ and the JOGF/HOMF bits of a queued
+                // request — except while waiting on DLY ("keep it,
+                // otherwise the record may lock up").
                 if !self.stat.mip.contains(MipFlags::DELAY_REQ) {
-                    self.stat.mip.insert(MipFlags::STOP);
+                    self.stat.mip = MipFlags::STOP;
                 }
                 effects.commands.push(MotorCommand::Stop {
                     acceleration: self.move_accel_egu(),
@@ -1027,7 +1078,12 @@ impl MotorRecord {
                     // (collected but not acted on, 2237). A completed or
                     // synced state has dval == ldvl and dmov, so nothing
                     // fires.
-                    if self.ctrl.jogf || self.ctrl.jogr {
+                    // C 1914: `(jogf && !hls) || (jogr && !lls)` — a
+                    // latched button at its limit switch does not re-arm;
+                    // the pass falls to the STOP collapse instead of
+                    // leaving the record stuck in MIP_STOP.
+                    if (self.ctrl.jogf && !self.limits.hls) || (self.ctrl.jogr && !self.limits.lls)
+                    {
                         let forward = self.ctrl.jogf;
                         self.start_jog(forward, effects);
                     } else {

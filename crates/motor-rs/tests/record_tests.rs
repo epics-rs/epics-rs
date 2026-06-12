@@ -2327,11 +2327,13 @@ fn test_jogf_command_clears_latched_jogr() {
 
 #[test]
 fn test_forward_jog_at_high_limit_is_rejected_and_clears_button() {
+    // C 2087: refuse when val > hlm - jvel — one JVEL of decel margin.
     let mut rec = MotorRecord::new();
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
-    rec.pos.val = 10.0; // at high limit
-    rec.pos.dval = 10.0;
+    rec.vel.jvel = 1.0;
+    rec.pos.val = 9.5; // inside the limit but within the JVEL window
+    rec.pos.dval = 9.5;
     rec.ctrl.jogf = true;
     let effects = rec.plan_motion(CommandSource::Jogf);
     assert!(
@@ -2339,7 +2341,7 @@ fn test_forward_jog_at_high_limit_is_rejected_and_clears_button() {
             .commands
             .iter()
             .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
-        "forward jog at HLM should not emit MoveVelocity"
+        "forward jog inside the JVEL window should not emit MoveVelocity"
     );
     assert!(!rec.ctrl.jogf, "JOGF button cleared");
     assert!(rec.limits.lvio);
@@ -2348,11 +2350,13 @@ fn test_forward_jog_at_high_limit_is_rejected_and_clears_button() {
 
 #[test]
 fn test_reverse_jog_at_low_limit_is_rejected_and_clears_button() {
+    // C 2088: refuse when val < llm + jvel.
     let mut rec = MotorRecord::new();
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
-    rec.pos.val = -10.0;
-    rec.pos.dval = -10.0;
+    rec.vel.jvel = 1.0;
+    rec.pos.val = -9.5;
+    rec.pos.dval = -9.5;
     rec.ctrl.jogr = true;
     rec.plan_motion(CommandSource::Jogr);
     assert!(!rec.ctrl.jogr);
@@ -2368,6 +2372,7 @@ fn test_jog_soft_limit_uses_user_frame_with_dir_neg() {
     rec.conv.dir = MotorDir::Neg;
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
+    rec.vel.jvel = 1.0;
     rec.pos.val = 10.0; // at user high limit
     rec.ctrl.jogf = true;
     rec.plan_motion(CommandSource::Jogf);
@@ -5770,4 +5775,70 @@ fn test_lvio_refused_retry_collapses_to_done() {
     assert!(rec.stat.dmov, "refused retry completes (C 2446-2451)");
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
     assert_eq!(rec.retry.rcnt, 1, "the armed retry kept its count");
+}
+
+#[test]
+fn test_jog_with_inverted_limits_is_rejected() {
+    // C 2089: DLLM > DHLM refuses the jog in either direction.
+    let mut rec = MotorRecord::new();
+    rec.limits.dhlm = -5.0;
+    rec.limits.dllm = 5.0;
+    rec.limits.hlm = -5.0;
+    rec.limits.llm = 5.0;
+    rec.vel.jvel = 1.0;
+    rec.pos.val = 0.0;
+    rec.ctrl.jogf = true;
+    let effects = rec.plan_motion(CommandSource::Jogf);
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
+        "inverted limits refuse the jog"
+    );
+    assert!(rec.limits.lvio);
+    assert!(!rec.ctrl.jogf);
+}
+
+#[test]
+fn test_jog_limit_disable_gate_is_dial_frame() {
+    // C 2085-2086: the disabled-limits gate tests DHLM == DLLM == 0.0 —
+    // the DIAL pair. A nonzero OFF leaves the user pair offset from
+    // zero, but the limits are still disabled.
+    let mut rec = MotorRecord::new();
+    rec.limits.dhlm = 0.0;
+    rec.limits.dllm = 0.0;
+    rec.pos.off = 3.0;
+    rec.limits.hlm = 3.0;
+    rec.limits.llm = 3.0;
+    rec.vel.jvel = 1.0;
+    rec.pos.val = 50.0;
+    rec.ctrl.jogf = true;
+    let effects = rec.plan_motion(CommandSource::Jogf);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
+        "disabled dial limits allow the jog, got {:?}",
+        effects.commands
+    );
+    assert!(!rec.limits.lvio);
+}
+
+#[test]
+fn test_jog_refusal_clears_both_buttons() {
+    // C 2095-2104: the refusal releases BOTH buttons, not just the
+    // pressed one.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
+    rec.vel.jvel = 1.0;
+    rec.pos.val = 9.5;
+    rec.ctrl.jogf = true;
+    rec.ctrl.jogr = true; // both held (e.g. racing writes)
+    rec.plan_motion(CommandSource::Jogf);
+    assert!(rec.limits.lvio);
+    assert!(!rec.ctrl.jogf, "JOGF released");
+    assert!(!rec.ctrl.jogr, "JOGR released too (C 2100-2104)");
 }

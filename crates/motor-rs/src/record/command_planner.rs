@@ -765,11 +765,11 @@ impl MotorRecord {
         // and the button must be released manually. The opposite direction
         // (back inside the soft window) is still allowed.
         if self.jog_violates_soft_limit(forward) {
-            if forward {
-                self.ctrl.jogf = false;
-            } else {
-                self.ctrl.jogr = false;
-            }
+            // C 2095-2104: BOTH buttons release on refusal ("prevent
+            // record from locking up in mip = JOG_REQ"), not just the
+            // pressed one.
+            self.ctrl.jogf = false;
+            self.ctrl.jogr = false;
             // C 2092-2104 clears only the buttons and leaves a parked
             // MIP_JOG_REQ in mip (its arming lives in special(), blind to
             // internal clears). Here the request is dropped with its
@@ -1477,14 +1477,22 @@ impl MotorRecord {
     /// Whether a velocity jog in the requested direction would push past a
     /// soft limit in user coordinates. C: `9e5b5432` PR #99.
     fn jog_violates_soft_limit(&self, forward: bool) -> bool {
-        // C: soft limits disabled when HLM == LLM == 0.0
-        if self.limits.hlm == self.limits.llm && self.limits.llm == 0.0 {
+        // C 2085-2086: soft limits disabled when DHLM == DLLM == 0.0 —
+        // the DIAL pair, like the move-block gate (a nonzero OFF leaves
+        // the user pair offset, so HLM == LLM == 0.0 is the wrong test).
+        if self.limits.dhlm == self.limits.dllm && self.limits.dllm == 0.0 {
             return false;
         }
+        // C 2089: inverted limits always refuse.
+        if self.limits.dllm > self.limits.dhlm {
+            return true;
+        }
+        // C 2087-2088: USER frame, strict compare, one JVEL of margin —
+        // a jog must have room to decelerate before the limit.
         if forward {
-            self.pos.val >= self.limits.hlm
+            self.pos.val > self.limits.hlm - self.vel.jvel
         } else {
-            self.pos.val <= self.limits.llm
+            self.pos.val < self.limits.llm + self.vel.jvel
         }
     }
 

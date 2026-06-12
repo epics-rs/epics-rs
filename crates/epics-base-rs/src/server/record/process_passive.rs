@@ -22,11 +22,13 @@
 //! - base records: `epics-base/modules/database/src/std/rec/<rec>Record.dbd.pod`
 //! - synApps calc records: `epics-modules/calc/calcApp/src/`
 //! - busy: `epics-modules/busy/busyApp/src/busyRecord.dbd`
+//! - motor: `epics-modules/motor/motorApp/MotorSrc/motorRecord.dbd`
+//!   (plus motor-rs extension fields documented at the entry)
 //!
 //! A record type that is **not** listed here returns `None`: the put gate
 //! then falls back to the legacy "process on every put" behavior, so
 //! record types whose DBD pp-flags have not been modeled (records in other
-//! crates — motor, scaler, std, optics — and test records) keep working
+//! crates — scaler, std, optics — and test records) keep working
 //! unchanged. `asynRecord` is intentionally omitted: it has two impls
 //! across crates (`epics-base-rs` and `asyn-rs`) and is covered by the
 //! ASYN parity findings, so it stays on the legacy path here.
@@ -101,6 +103,55 @@ pub fn pp_fields_for(record_type: &str) -> Option<&'static [&'static str]> {
             "VAL", "OMSL", "RVAL", "B0", "B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B9",
             "BA", "BB", "BC", "BD", "BE", "BF", "B10", "B11", "B12", "B13", "B14", "B15", "B16",
             "B17", "B18", "B19", "B1A", "B1B", "B1C", "B1D", "B1E", "B1F",
+        ],
+        // motorRecord.dbd pp(TRUE) set (OFF through SYNC), plus five
+        // motor-rs extension fields (PCOF/ICOF/DCOF/JVEL/PCO_ENABLE)
+        // whose driver commands ride the process pass that follows the
+        // put — C sends those from special() without processing, but
+        // motor-rs has no put-time driver channel, so dropping their
+        // pass would strand the commands in the special_cmds buffer.
+        "motor" => &[
+            "OFF",
+            "DIR",
+            "SREV",
+            "UREV",
+            "MRES",
+            "ERES",
+            "UEIP",
+            "URIP",
+            "HLM",
+            "LLM",
+            "DHLM",
+            "DLLM",
+            "HIHI",
+            "LOLO",
+            "HIGH",
+            "LOW",
+            "HHSV",
+            "LLSV",
+            "HSV",
+            "LSV",
+            "HLSV",
+            "SPMG",
+            "STOP",
+            "HOMF",
+            "HOMR",
+            "JOGF",
+            "JOGR",
+            "TWF",
+            "TWR",
+            "VAL",
+            "DVAL",
+            "RVAL",
+            "RLV",
+            "CNEN",
+            "STUP",
+            "SYNC",
+            "PCOF",
+            "ICOF",
+            "DCOF",
+            "JVEL",
+            "PCO_ENABLE",
         ],
         "printf" => &["VAL", "FMT"],
         "sel" => &[

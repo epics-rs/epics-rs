@@ -50,6 +50,7 @@ pvdata/encode leaf-family marking)는 bridge-rs 측 잔여 작업으로 이
 | F5 잔여 — coalesced latent-SPMG-Go | C는 put마다 process 1회 — SPMG 전이가 다른 put과 같은 패스에 겹치지 않음 | 프레임워크 put-coalescing으로 **3개 이상**의 미처리 put이 한 패스에 합쳐질 때만 SPMG 전이가 parked되어 latent gate가 다음 패스에 replay. micro-deviation으로 문서화 (전이 자체는 소실되지 않음) |
 | U2 — RRBV/RMP/REP 선언 타입 | dbd `DBF_LONG` (32-bit) | `Int64` 선언 — 64-bit raw count 표현을 위한 의도적 Rust extension (round-3에서 intentional로 종결) |
 | in-flight retarget 즉시 emit | do_work 이동 dispatch가 `mip == DONE \|\| RETRY`로 gate — 새 target은 park 후 완료 시 dispatch (2455) | `RetargetAction::ExtendMove`: on-the-fly retarget 컨트롤러를 위해 즉시 emit + 완료 시 verify (`command_planner.rs` ExtendMove arm에 deliberate divergence로 명시, 이전 sweep에서 종결) |
+| special()-transport pass (PCOF/ICOF/DCOF, JVEL, PCO_ENABLE) | special()이 put 시점에 driver로 직접 전송, process pass 없음 (pidcof 3003-3026, JVEL 3059-3072; PCO는 C dbd에 없음) | motor-rs는 put-time driver channel이 없어 put 직후의 process pass가 명령 transport — 이 5개 필드만 `process_passive.rs`의 motor pp set에 extension으로 유지되어 put마다 pass 1회가 돈다 (C에 없는 FLNK/monitor/암묵 GET_INFO 동반). 나머지 non-pp 필드는 gate가 pass 자체를 차단해 C와 동일 |
 
 ## 관련 결정 기록 (이번 closeout에서 dbd-faithful로 정렬)
 
@@ -67,7 +68,10 @@ pvdata/encode leaf-family marking)는 bridge-rs 측 잔여 작업으로 이
   미소비(unconsumed) leg가 C do_work의 in-block return 구조 그대로
   chain end로 떨어져 같은 pass에서 암묵 GET_INFO를 발화한다 (소비된
   pass — 이동 dispatch, soft-limit 거부, Stop/Pause top block — 는
-  C의 return(OK)처럼 발화하지 않음). 남은 생략은 C dbd에 pp가 없어
-  process pass 자체가 존재하지 않는 필드(PCOF/ICOF/DCOF, SET,
-  SSET/SUSE, FOFF)와 C dbd에 없는 Rust 확장 PCO 필드뿐 — C도 해당
-  put에서 pass를 돌지 않으므로 deviation이 아니다.
+  C의 return(OK)처럼 발화하지 않음). C dbd에 pp가 없는 필드(SET,
+  SSET/SUSE, FOFF, VELO/BDST 등 config 전부)는 epics-base-rs
+  `process_passive.rs`의 motor pp(TRUE) set 모델링으로 put 시 process
+  pass 자체가 돌지 않는다 — 모델링 전에는 legacy always-process가
+  모든 put에 pass(+FLNK/monitor/암묵 GET_INFO)를 돌렸다. 예외 5개
+  필드(PCOF/ICOF/DCOF/JVEL/PCO_ENABLE)는 위 "의도적 deviation" 표의
+  special()-transport 행 참조.

@@ -172,8 +172,9 @@ impl MotorRecord {
                     // C 1077-1082 with 1356's dmov=TRUE UNMARKed and
                     // reversed: DMOV never posts 1 — the paused move stays
                     // "not done" with mip = MIP_RETRY armed. The Go pass
-                    // re-fires it via the move-block `!dmov` gate (2241);
-                    // rcnt counts each paused stop against RTRY.
+                    // re-fires it: the move block is entered via `!dmov`
+                    // (2240) and mip == MIP_RETRY passes the 2455 dispatch
+                    // gate; rcnt counts each paused stop against RTRY.
                     self.retry.rcnt += 1;
                     self.stat.mip = MipFlags::RETRY;
                     self.set_phase(MotionPhase::Idle);

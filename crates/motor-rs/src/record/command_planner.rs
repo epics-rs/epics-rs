@@ -200,11 +200,23 @@ impl MotorRecord {
                             return effects;
                         }
                         RetargetAction::ExtendMove => {
-                            // C parity (motorRecord.cc:2241, 2532-2535): same-
-                            // direction retarget while moving re-enters do_work
-                            // and dispatches a new MOVE_ABS/MOVE_REL in-flight.
-                            // plan_absolute_move emits the new move and also
-                            // updates ldvl/lval/lrvl per C load_pos semantics.
+                            // Deliberate divergence from C. C never sends a
+                            // move while one is in flight: do_work's move
+                            // block is *entered* on every in-flight write
+                            // (motorRecord.cc:2240, `dval != ldvl || !dmov`)
+                            // and val/dval/rval take the new target, but the
+                            // command dispatch is gated at 2455 on
+                            // `mip == MIP_DONE || mip == MIP_RETRY` — the
+                            // target is parked and dispatched only at
+                            // completion (maybeRetry at 1431 measures diff
+                            // against the new dval, and the same pass
+                            // re-enters do_work where the gate passes). Here
+                            // the new move is emitted immediately so
+                            // controllers that accept on-the-fly retargets
+                            // track the newest target without the parked
+                            // round trip. plan_absolute_move also updates
+                            // ldvl/lval/lrvl as the C dispatch block does
+                            // (2469-2471).
                             //
                             // plan_absolute_move replaces MIP with MOVE,
                             // clearing an in-flight STOP; drop any target
@@ -213,13 +225,12 @@ impl MotorRecord {
                             // pending_retarget is Some ⟹ MIP_STOP committed).
                             self.internal.pending_retarget = None;
                             //
-                            // Rust-only defensive layer: arm a completion-time
-                            // verification so that, if a driver silently ignores
-                            // the in-flight retarget and stops at the old target,
-                            // we replan once before finalizing — independent of
-                            // RTRY/RDBD. Not in C (C assumes driver supports
-                            // in-flight target updates); kept here as robustness
-                            // against drivers that don't.
+                            // Completion-time verification: if a driver
+                            // silently ignores the in-flight retarget and
+                            // stops at the old target, replan once before
+                            // finalizing — independent of RTRY/RDBD. For such
+                            // controllers this restores C's park-then-
+                            // dispatch-at-completion behavior.
                             self.plan_absolute_move(&mut effects);
                             self.internal.verify_retarget_on_completion = true;
                             return effects;
@@ -1252,33 +1263,44 @@ impl MotorRecord {
     /// Handle a new target (VAL/DVAL/RVAL/RLV write) that arrives while a
     /// motion is in progress.
     ///
-    /// C parity (`motorRecord.cc`):
+    /// C behavior (`motorRecord.cc`), for reference:
     ///
-    /// - `do_work` (line 2241) re-issues the move block on *every*
-    ///   `dval != ldvl || !dmov` — completely INDEPENDENT of NTM. A
-    ///   VAL/DVAL/RVAL/RLV write during motion always re-dispatches a
-    ///   move. An earlier Rust version returned [`RetargetAction::Ignore`]
-    ///   whenever `ntm == No` (its `motorRecord.dbd` default, since NTM
-    ///   has no `initial()`), silently discarding the write.
-    /// - NTM gates only the *opposite-direction* stop-and-replan in the
-    ///   `process()` `movn` block (line 1327-1331): when
+    /// - A put-initiated process always reaches `do_work`, even while the
+    ///   axis is moving (gate at 1487-1491, `process_reason !=
+    ///   CALLBACK_DATA`). The move block is *entered* on every
+    ///   `dval != ldvl || !dmov` (2240) — independent of NTM — and
+    ///   val/dval/rval take the new target, but the command dispatch
+    ///   inside is gated at 2455 on `mip == MIP_DONE || mip == MIP_RETRY`,
+    ///   so C never sends a new move while MIP_MOVE or MIP_STOP is
+    ///   active. The parked target converges at completion: maybeRetry
+    ///   (1431) measures `diff` against the *new* dval, collapses MIP to
+    ///   RETRY/DONE, and the same pass re-enters `do_work` where the 2455
+    ///   gate now passes and dispatches. An earlier Rust version returned
+    ///   [`RetargetAction::Ignore`] whenever `ntm == No` (its
+    ///   `motorRecord.dbd` default, since NTM has no `initial()`),
+    ///   silently discarding the write — NTM does not gate this at all.
+    /// - NTM gates only the *opposite-direction* stop-first path in the
+    ///   `process()` `movn` block (1326-1341): when
     ///   `ntm == menuYesNoYES && sign_rdif != cdir &&
     ///   fabs(diff) > ntm_deadband && move_or_retry && !MIP_STOP`, C
-    ///   sends `STOP_AXIS`. With `ntm == No` C never stops first — the
-    ///   axis retargets directly via the `do_work` re-issue.
+    ///   sends `STOP_AXIS` with `pp = FALSE` so the new target survives
+    ///   the stop completion and dispatches from there.
     ///
-    /// Therefore: a write during motion always re-issues the move
-    /// ([`RetargetAction::ExtendMove`], which routes through
-    /// `plan_absolute_move` whose own too-small/SPDB deadband checks
-    /// suppress no-op moves). NTM only promotes an opposite-direction,
-    /// beyond-deadband retarget to [`RetargetAction::StopAndReplan`].
+    /// Rust divergence (deliberate): [`RetargetAction::ExtendMove`]
+    /// dispatches the new target in-flight instead of parking it until
+    /// completion, so controllers that accept on-the-fly retargets track
+    /// the newest target immediately; the completion-time verification
+    /// armed by the ExtendMove arm in `plan_motion` restores C's
+    /// park-then-dispatch behavior for controllers that ignore in-flight
+    /// retargets. `plan_absolute_move`'s own too-small/SPDB deadband
+    /// checks suppress no-op moves. NTM mapping matches C: only an
+    /// opposite-direction, beyond-deadband retarget promotes to
+    /// [`RetargetAction::StopAndReplan`].
     pub fn handle_retarget(&mut self, new_dval: f64) -> RetargetAction {
         // Only retarget during an active move, retry, or stop
-        // deceleration. C's `do_work` re-issue and the `movn`-block STOP
-        // both require an in-flight move; MIP_STOP counts as in-flight
-        // because the C stop path replaces MIP wholesale (`mip =
-        // MIP_STOP`, motorRecord.cc:1903) yet the move block still fires
-        // on a new target during the deceleration.
+        // deceleration. MIP_STOP counts as in-flight because the C stop
+        // path replaces MIP wholesale (`mip = MIP_STOP`,
+        // motorRecord.cc:1903) while the axis keeps decelerating.
         let in_move = self
             .stat
             .mip
@@ -1286,18 +1308,19 @@ impl MotorRecord {
         if !in_move {
             return RetargetAction::Ignore;
         }
-        // A stop in flight does not make the record deaf to new targets.
-        // C routes a put-initiated process straight to `do_work` even
-        // while the axis is decelerating, and the `do_work` move block
-        // (motorRecord.cc:2241, `dval != ldvl || !dmov`) never tests
-        // MIP_STOP — the new move is dispatched immediately and
-        // `mip = MIP_MOVE` replaces the stop state. Discarding the write
-        // here instead would let the stop-completion path sync VAL back
-        // to RBV and silently lose the target (the kohzuCtl
+        // Deliberate divergence from C: a target written during a
+        // commanded stop deceleration is honored here. In C the write
+        // reaches the do_work move block (entry 2240) but the 2455
+        // dispatch gate refuses while MIP_STOP, and the completion
+        // replay (motorRecord.cc:1384-1386) excludes MIP_STOP /
+        // MIP_JOG_STOP, so postProcess (827-849) syncs VAL/DVAL back to
+        // the readback — the write is silently lost (the kohzuCtl
         // stop-then-rewrite retarget sequence hits exactly this window).
-        // Only the NTM stop-first branch is excluded while stopping
-        // (C gate at 1331: `(pmr->mip & MIP_STOP) == 0`), so no
-        // double-stop is possible.
+        // Retargeting through the stop keeps the explicit user target
+        // instead; `mip = MIP_MOVE` replaces the stop state. The NTM
+        // stop-first branch stays excluded while stopping (C gate at
+        // 1330: `(pmr->mip & MIP_STOP) == 0`), so no double-stop is
+        // possible.
         if self.stat.mip.contains(MipFlags::STOP) {
             if self.internal.queued_motion.is_some() {
                 // An explicit queued jog/home owns this stop's
@@ -1320,8 +1343,10 @@ impl MotorRecord {
         if self.timing.ntm && direction_changed && diff.abs() > deadband {
             RetargetAction::StopAndReplan
         } else {
-            // C `do_work` re-issues the move on every DVAL write during
-            // motion, regardless of NTM and regardless of direction.
+            // Same-direction or within-deadband: extend the move
+            // in-flight. C parks the new target until completion behind
+            // the 2455 dispatch gate; see the doc comment above for the
+            // divergence rationale.
             RetargetAction::ExtendMove
         }
     }

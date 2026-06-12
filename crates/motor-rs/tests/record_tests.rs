@@ -7486,6 +7486,96 @@ mod retry_after_dly_settle {
         assert!(rec.stat.mip.contains(MipFlags::RETRY));
     }
 
+    // C 1427: `mip != MIP_DONE` gates maybeRetry on the post-delay
+    // pass. A home completion collapsed MIP via postProcess (894-906)
+    // before the delay armed, so its post-delay pass finalizes without
+    // the retry evaluation — a latched MISS survives (maybeRetry's
+    // close-enough branch, which clears it, is never reached).
+    #[test]
+    fn home_completion_post_delay_skips_retry_eval() {
+        let mut rec = MotorRecord::new();
+        rec.conv.mres = 0.1;
+        rec.retry.rtry = 3;
+        rec.retry.rdbd = 0.5;
+        rec.timing.dly = 0.2;
+        rec.stat.msta = MstaFlags::DONE;
+        rec.put_field("HOMF", EpicsValue::Short(1)).unwrap();
+        rec.do_process();
+        assert_eq!(rec.stat.phase, MotionPhase::Homing);
+        rec.retry.miss = true; // latched by an earlier give-up
+
+        rec.stat.msta = MstaFlags::DONE;
+        rec.stat.movn = false;
+        let effects = rec.check_completion();
+        assert_eq!(rec.stat.phase, MotionPhase::DelayWait);
+        assert!(effects.schedule_delay.is_some(), "delay armed");
+
+        rec.set_event(MotorEvent::DelayExpired);
+        let _ = rec.do_process();
+        let effects = rec.check_completion();
+        assert!(
+            !effects
+                .commands
+                .iter()
+                .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+            "no retry from a home completion"
+        );
+        assert!(rec.stat.dmov, "finalized after the settle");
+        assert!(rec.stat.mip.is_empty());
+        assert!(
+            rec.retry.miss,
+            "MISS survives: C skips maybeRetry when mip == MIP_DONE (1427)"
+        );
+        assert_eq!(rec.retry.rcnt, 0);
+    }
+
+    // Same key for a commanded stop: C postProcess (826-849) cleared
+    // MIP_STOP before the delay, so the post-delay pass never runs
+    // maybeRetry — no retry dispatch, MISS untouched.
+    #[test]
+    fn stop_completion_post_delay_skips_retry_eval() {
+        let mut rec = MotorRecord::new();
+        rec.conv.mres = 0.1;
+        rec.retry.rtry = 3;
+        rec.retry.rdbd = 0.5;
+        rec.timing.dly = 0.2;
+        rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+        rec.do_process();
+        rec.stat.msta = MstaFlags::MOVING;
+        rec.stat.movn = true;
+        rec.retry.miss = true; // latched by an earlier give-up
+
+        rec.put_field("STOP", EpicsValue::Short(1)).unwrap();
+        rec.do_process();
+        assert!(rec.stat.mip.contains(MipFlags::STOP));
+
+        // Axis halts 2.0 short; pp syncs the drive fields, then DLY arms.
+        rec.stat.msta = MstaFlags::DONE;
+        rec.stat.movn = false;
+        rec.pos.drbv = 8.0;
+        rec.pos.rbv = 8.0;
+        let effects = rec.check_completion();
+        assert_eq!(rec.stat.phase, MotionPhase::DelayWait);
+        assert!(effects.schedule_delay.is_some(), "delay armed");
+
+        rec.set_event(MotorEvent::DelayExpired);
+        let _ = rec.do_process();
+        let effects = rec.check_completion();
+        assert!(
+            !effects
+                .commands
+                .iter()
+                .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+            "no retry from a stop completion"
+        );
+        assert!(rec.stat.dmov, "finalized after the settle");
+        assert!(
+            rec.retry.miss,
+            "MISS survives: C skips maybeRetry when mip == MIP_DONE (1427)"
+        );
+        assert_eq!(rec.retry.rcnt, 0);
+    }
+
     // DLY == 0: the evaluation runs on the completion pass itself.
     #[test]
     fn dly_zero_evaluates_immediately() {

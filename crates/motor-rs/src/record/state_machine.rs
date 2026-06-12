@@ -38,10 +38,30 @@ impl MotorRecord {
             return effects;
         }
 
-        // C: after DLY expires and fresh readback arrives, evaluate for retry
+        // C post-delay readback pass (motorRecord.cc:1427-1439):
+        // `stup != motorSTUP_ON && mip != MIP_DONE` gates maybeRetry.
+        // In C every completion that must not retry-evaluate (commanded
+        // stop, jog stop, home done) had postProcess collapse MIP to
+        // DONE before the delay armed, so its post-delay pass falls
+        // through without maybeRetry; only a move/backlash/retry
+        // completion still carries motion bits. Rust keeps the
+        // completion-type bits in MIP through DelayWait, so the same
+        // key reads as "MIP still carries MOVE/MOVE_BL/RETRY" — the
+        // finalize family must not reach the close-enough branch,
+        // which clears MISS and restores SPMG Move->Pause. The stup
+        // half of the key is structural here: a STUP acknowledgment
+        // pass returns before check_completion (do_process_inner).
         if self.stat.mip.contains(MipFlags::DELAY_ACK) {
             self.stat.mip.remove(MipFlags::DELAY_ACK);
-            self.evaluate_position_error(&mut effects);
+            if self
+                .stat
+                .mip
+                .intersects(MipFlags::MOVE | MipFlags::MOVE_BL | MipFlags::RETRY)
+            {
+                self.evaluate_position_error(&mut effects);
+            } else {
+                self.finalize_motion(&mut effects);
+            }
             return effects;
         }
 

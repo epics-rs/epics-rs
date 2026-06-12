@@ -378,6 +378,10 @@ pub struct InternalFields {
     /// SPC_NOMOD).
     pub nmap: i64,
     pub lspg: SpmgMode,
+    /// C `pmr->sync` — latched SYNC request. Set by a nonzero SYNC put,
+    /// consumed by `apply_latent_sync` only when the record is idle under
+    /// SPMG Go/Move on a pass that dispatched nothing
+    /// (motorRecord.cc:2540-2544 chain end).
     pub sync: bool,
     /// C `pmr->pp` — post-process this motion when the axis stops. Armed by
     /// the commanded stop while moving (motorRecord.cc:1892), jog/home

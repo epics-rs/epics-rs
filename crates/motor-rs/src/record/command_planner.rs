@@ -281,7 +281,10 @@ impl MotorRecord {
                 self.handle_spmg_change(&mut effects);
             }
             CommandSource::Sync => {
-                self.sync_positions();
+                // C 2540-2544: the latched SYNC applies only when idle
+                // (`mip == MIP_DONE`); written during a motion it stays
+                // latched and finalize_motion consumes it at completion.
+                self.apply_latent_sync();
             }
             CommandSource::Set => {
                 // SET mode: recalculate RBV from new offset, then issue SetPosition
@@ -1043,6 +1046,11 @@ impl MotorRecord {
                 }
             }
         }
+        // C 2540-2544: a Go/Move pass that resumed nothing reaches the
+        // do_work chain end, where a SYNC latched under Stop/Pause
+        // applies. The internal gates refuse while a resume is in flight
+        // (phase left Idle) — the latch then consumes at its completion.
+        self.apply_latent_sync();
     }
 
     /// Helper to emit either MoveRelative or MoveAbsolute.
@@ -1264,6 +1272,26 @@ impl MotorRecord {
     /// Check if a new command can be accepted.
     pub fn can_accept_command(&self) -> bool {
         matches!(self.ctrl.spmg, SpmgMode::Go | SpmgMode::Move)
+    }
+
+    /// C SYNC apply (motorRecord.cc:2540-2544): `else if (sync != 0 &&
+    /// mip == MIP_DONE)` at the end of the do_work dispatch chain — the
+    /// latched SYNC consumes only on a pass that dispatched nothing, with
+    /// the record idle and done. SPMG Stop/Pause never reaches the chain
+    /// end (the stop_or_pause return at 2237 precedes it), so the latch
+    /// survives a pause and applies on Go. Returns true when it applied.
+    pub(super) fn apply_latent_sync(&mut self) -> bool {
+        if !self.internal.sync
+            || self.stat.phase != MotionPhase::Idle
+            || !self.stat.mip.is_empty()
+            || !self.stat.dmov
+            || !matches!(self.ctrl.spmg, SpmgMode::Go | SpmgMode::Move)
+        {
+            return false;
+        }
+        self.internal.sync = false;
+        self.sync_positions();
+        true
     }
 
     /// Check if a hardware limit blocks motion in the given direction.

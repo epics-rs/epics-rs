@@ -2851,10 +2851,15 @@ fn test_sync_pv_reseeds_val_dval_rval_from_readback() {
 }
 
 #[test]
-fn test_sync_pv_get_returns_zero() {
+fn test_sync_pv_get_reflects_latch() {
     let mut rec = MotorRecord::new();
     rec.put_field("SYNC", EpicsValue::Short(1)).unwrap();
-    // SYNC is write-only trigger; readback always 0.
+    // C pmr->sync is a real field: it reads 1 while the request is
+    // latched (put happened, record not yet processed)...
+    assert_eq!(rec.get_field("SYNC"), Some(EpicsValue::Short(1)));
+    // ...and posts back to 0 once the idle-gated apply consumes it
+    // (motorRecord.cc:2542-2543).
+    rec.plan_motion(CommandSource::Sync);
     assert_eq!(rec.get_field("SYNC"), Some(EpicsValue::Short(0)));
 }
 
@@ -4071,4 +4076,112 @@ fn test_tweak_under_spmg_pause_collects_and_fires_on_go() {
         )),
         "Go fires the collected tweak"
     );
+}
+
+// --- Latent SYNC (C 2540-2544) ---
+
+#[test]
+fn test_sync_while_idle_applies_immediately() {
+    // C: sync != 0 && mip == MIP_DONE at the chain end of an idle pass
+    // — syncTargetPosition runs and the latch consumes.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.pos.val = 50.0;
+    rec.pos.dval = 50.0;
+    rec.pos.drbv = 20.0;
+    rec.pos.rbv = 20.0;
+
+    rec.put_field("SYNC", EpicsValue::Short(1)).unwrap();
+    assert_eq!(rec.get_field("SYNC"), Some(EpicsValue::Short(1)));
+    rec.plan_motion(CommandSource::Sync);
+    assert_eq!(rec.pos.val, 20.0, "target synced to readback");
+    assert!(!rec.internal.sync, "latch consumed");
+    assert_eq!(rec.get_field("SYNC"), Some(EpicsValue::Short(0)));
+}
+
+#[test]
+fn test_sync_during_move_defers_to_completion() {
+    // C: during the move mip != MIP_DONE — the latch survives the pass
+    // (no mid-move target yank) and consumes at the completion pass
+    // (do_work runs on dmov, 1485).
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    rec.put_field("SYNC", EpicsValue::Short(1)).unwrap();
+    rec.plan_motion(CommandSource::Sync);
+    assert_eq!(rec.pos.val, 50.0, "no mid-move yank");
+    assert!(rec.internal.sync, "latch survives the busy pass");
+
+    complete_stop_at(&mut rec, 49.9995);
+    assert!(rec.stat.dmov);
+    assert!(!rec.internal.sync, "latch consumed at completion");
+    assert_eq!(rec.pos.val, 49.9995, "completion applied the sync");
+}
+
+#[test]
+fn test_latent_sync_overtaken_by_position_write() {
+    // A bare SYNC put whose last_write was overtaken by a VAL write: the
+    // move dispatches (C move block fires, sync else-if skipped) and the
+    // latch consumes at that move's completion.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.put_field("SYNC", EpicsValue::Short(1)).unwrap();
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "the position write still dispatches"
+    );
+    assert!(rec.internal.sync, "latch not lost to the overtake");
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    complete_stop_at(&mut rec, 49.9995);
+    assert!(!rec.internal.sync, "latch consumed at completion");
+    assert_eq!(rec.pos.val, 49.9995);
+}
+
+#[test]
+fn test_sync_under_pause_defers_until_go() {
+    // C: SPMG Stop/Pause returns at 2237 before the sync else-if — the
+    // latch survives the pause and applies on the Go pass.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.pos.val = 50.0;
+    rec.pos.dval = 50.0;
+    rec.internal.lval = 50.0;
+    rec.internal.ldvl = 50.0;
+    rec.pos.drbv = 20.0;
+    rec.pos.rbv = 20.0;
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.internal.lspg = SpmgMode::Pause;
+
+    rec.put_field("SYNC", EpicsValue::Short(1)).unwrap();
+    rec.plan_motion(CommandSource::Sync);
+    assert_eq!(rec.pos.val, 50.0, "no apply under Pause");
+    assert!(rec.internal.sync);
+
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "nothing to resume (dval == ldvl, dmov)"
+    );
+    assert_eq!(rec.pos.val, 20.0, "Go pass applies the latched sync");
+    assert!(!rec.internal.sync);
 }

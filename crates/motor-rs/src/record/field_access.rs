@@ -727,7 +727,7 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "ADEL" => Some(EpicsValue::Double(rec.disp.adel)),
         "MDEL" => Some(EpicsValue::Double(rec.disp.mdel)),
         // SYNC is a write-only trigger; readback always 0.
-        "SYNC" => Some(EpicsValue::Short(0)),
+        "SYNC" => Some(EpicsValue::Short(if rec.internal.sync { 1 } else { 0 })),
         // Position-compare output
         "PCO_START" => Some(EpicsValue::Double(rec.pco.start)),
         "PCO_END" => Some(EpicsValue::Double(rec.pco.end)),
@@ -1668,6 +1668,11 @@ pub(crate) fn motor_put_field(
         "SYNC" => match value {
             EpicsValue::Short(v) => {
                 if v != 0 {
+                    // C `pmr->sync` is the field value itself — latch it
+                    // so the request survives a busy/paused pass (the
+                    // apply is idle-gated, motorRecord.cc:2540-2544) and
+                    // a last_write overtaken by a later put.
+                    rec.internal.sync = true;
                     rec.last_write = Some(CommandSource::Sync);
                 }
                 Ok(())

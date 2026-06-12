@@ -323,6 +323,12 @@ impl MotorRecord {
             self.ctrl.spmg = SpmgMode::Pause;
             self.internal.lspg = SpmgMode::Pause;
         }
+        // C 2540-2544: a SYNC latched during the motion consumes at the
+        // completion pass (do_work runs on dmov, 1485 gate; the move
+        // block no longer fires, so the chain end is reached). After the
+        // Move->Pause restore above the gate refuses, like C's
+        // stop_or_pause return on that pass.
+        self.apply_latent_sync();
     }
 
     /// C overtaken-target replay (motorRecord.cc:1383-1397): at a motion

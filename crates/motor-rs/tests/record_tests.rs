@@ -246,14 +246,41 @@ fn test_athm_tracks_home_switch_every_poll() {
 #[test]
 fn test_sync_positions() {
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
     rec.pos.drbv = 5.0;
     rec.pos.rbv = 5.0;
     rec.pos.rrbv = 500;
     rec.sync_positions();
     assert_eq!(rec.pos.dval, 5.0);
     assert_eq!(rec.pos.val, 5.0);
+    // C 843: rval = NINT(dval / mres)
     assert_eq!(rec.pos.rval, 500);
     assert_eq!(rec.pos.diff, 0.0);
+}
+
+#[test]
+fn test_sync_positions_rval_is_motor_raw_not_rrbv() {
+    // C 712/843/4455: the synced RVAL is NINT(dval/mres) — under
+    // UEIP=Yes RRBV holds encoder counts (ERES scale), which must not
+    // land in the raw MOTOR command field.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.001;
+    rec.conv.eres = 0.002;
+    rec.conv.ueip = true;
+    let status = asyn_rs::interfaces::motor::MotorStatus {
+        position: 10.0,
+        encoder_position: 10.0,
+        done: true,
+        has_encoder: true,
+        ..Default::default()
+    };
+    rec.process_motor_info(&status);
+    assert_eq!(rec.pos.rrbv, 5000, "encoder counts");
+
+    rec.sync_positions();
+    assert_eq!(rec.pos.dval, 10.0);
+    assert_eq!(rec.pos.rval, 10000, "raw motor steps = dval/mres");
+    assert_eq!(rec.internal.lrvl, 10000);
 }
 
 #[test]
@@ -3820,6 +3847,7 @@ fn test_spmg_stop_during_external_move_emits_stop() {
 #[test]
 fn test_sync_pv_reseeds_val_dval_rval_from_readback() {
     let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
     rec.pos.drbv = 25.0;
     rec.pos.rrbv = 2500;
     rec.pos.rbv = 25.0;
@@ -3833,6 +3861,7 @@ fn test_sync_pv_reseeds_val_dval_rval_from_readback() {
 
     assert_eq!(rec.pos.val, 25.0);
     assert_eq!(rec.pos.dval, 25.0);
+    // C syncTargetPosition (4455): rval = NINT(dval / mres)
     assert_eq!(rec.pos.rval, 2500);
 }
 

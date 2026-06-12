@@ -292,7 +292,11 @@ impl MotorRecord {
     pub fn sync_positions(&mut self) {
         self.pos.dval = self.pos.drbv;
         self.pos.val = self.pos.rbv;
-        self.pos.rval = self.pos.rrbv;
+        // C 712/843/4455: the synced RVAL is the raw MOTOR command
+        // equivalent of the dial value — NINT(dval/mres) — never RRBV,
+        // which is encoder counts under UEIP=Yes (or the RDBL scaling
+        // under URIP) and differs whenever ERES != MRES.
+        self.pos.rval = (self.pos.dval / self.conv.mres).round() as i64;
         self.pos.diff = 0.0;
         self.pos.rdif = 0;
         self.internal.lval = self.pos.val;

@@ -452,4 +452,9 @@ pub struct InternalFields {
     /// return — by the next process pass. Like C's mmap marks, it never
     /// outlives that pass.
     pub res_reanchor: bool,
+    /// The device callback consumed this pass acknowledged a BUSY STUP
+    /// (C process_exit 1498-1502 returned it to OFF). One-pass mark: the
+    /// done branch applies the C 1345 gate — a GET_INFO acknowledgement
+    /// is not a motion completion — and the pass consumes it.
+    pub stup_ack: bool,
 }

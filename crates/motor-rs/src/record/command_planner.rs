@@ -1760,14 +1760,14 @@ impl MotorRecord {
         // C: do_work calls enforceMinRetryDeadband every pass.
         self.enforce_min_retry_deadband();
 
-        // STUP: one-shot status refresh request. C handles STUP at the top of
-        // do_work and then *continues* the pass — it does not early-return.
-        // Consume the flag here, run the normal process pipeline, and OR the
-        // status_refresh into whatever effects result so a user write or
-        // device update arriving in the same cycle is not dropped.
-        let stup_requested = self.stat.stup > 0;
+        // STUP protocol. C do_work top (1817-1830): STUP=ON transitions to
+        // BUSY and fires GET_INFO, then *continues* the pass — it does not
+        // early-return — so a user write or device update arriving in the
+        // same cycle is not dropped. The data callback returns BUSY to OFF
+        // (process_exit 1498-1502, ported in determine_event).
+        let stup_requested = self.stat.stup == 1;
         if stup_requested {
-            self.stat.stup = 0;
+            self.stat.stup = 2;
         }
         let jvel_retune = std::mem::take(&mut self.jog_retune_pending);
         let mut effects = self.do_process_inner();
@@ -1795,6 +1795,11 @@ impl MotorRecord {
     }
 
     fn do_process_inner(&mut self) -> ProcessEffects {
+        // One-pass STUP acknowledgement mark from determine_event (C
+        // process_exit 1498-1502); consumed here so it never outlives
+        // the pass that carried the callback.
+        let stup_ack = std::mem::take(&mut self.internal.stup_ack);
+
         // C do_work resolution block (1936-1991) on the pass a
         // pp(TRUE) MRES/SREV/UREV/ERES/UEIP put triggers — in this
         // dispatcher that pass carries no command source. The mark
@@ -1864,6 +1869,16 @@ impl MotorRecord {
             Some(MotorEvent::UserWrite(cmd_src)) => self.plan_motion(cmd_src),
             Some(MotorEvent::DeviceUpdate(status)) => {
                 self.process_motor_info(&status);
+                // C 1345: the callback acknowledging a BUSY STUP skips
+                // the motor-stopped branch — it is the GET_INFO
+                // response, not a motion completion. The moving branch
+                // already ran via process_motor_info (poll-time NTM
+                // lives in check_completion's still-moving path, which
+                // C also runs: the gate only covers the stopped case),
+                // and the next poll evaluates completion.
+                if stup_ack && !self.stat.movn {
+                    return ProcessEffects::default();
+                }
                 self.check_completion()
             }
             Some(MotorEvent::DelayExpired) => {

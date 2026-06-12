@@ -36,6 +36,14 @@ impl MotorRecord {
         if let Some(stamped) = new_status {
             self.last_seen_seq = stamped.seq;
             let status = stamped.status;
+            // C process_exit (1498-1502): a CALLBACK_DATA pass returns a
+            // BUSY STUP to OFF — the GET_INFO response has arrived. The
+            // pre-clear value is latched one pass so the done branch can
+            // apply the C 1345 gate (the ack is not a motion completion).
+            if self.stat.stup == 2 {
+                self.stat.stup = 0;
+                self.internal.stup_ack = true;
+            }
             if !self.initialized {
                 self.initialized = true;
                 return Some(MotorEvent::Startup);

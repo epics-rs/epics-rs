@@ -1509,7 +1509,9 @@ fn test_stup_triggers_status_refresh() {
     rec.stat.stup = 1;
     let effects = rec.do_process();
     assert!(effects.status_refresh);
-    assert_eq!(rec.stat.stup, 0);
+    // C do_work top (1817-1830): ON transitions to BUSY until the data
+    // callback acknowledges (process_exit 1498-1502).
+    assert_eq!(rec.stat.stup, 2, "STUP holds BUSY until the callback");
     assert!(effects.commands.is_empty());
 }
 
@@ -1528,7 +1530,7 @@ fn test_stup_does_not_drop_concurrent_user_write() {
     let effects = rec.do_process();
     // STUP honoured…
     assert!(effects.status_refresh);
-    assert_eq!(rec.stat.stup, 0);
+    assert_eq!(rec.stat.stup, 2, "BUSY until the callback");
     // …and the move command is still planned, not dropped.
     assert!(
         effects
@@ -1537,6 +1539,65 @@ fn test_stup_does_not_drop_concurrent_user_write() {
             .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
         "concurrent VAL write must still produce a move"
     );
+}
+
+#[test]
+fn test_stup_put_rejects_non_on_and_busy_retrigger() {
+    // C special (3084-3090): a written value other than ON is forced
+    // back to OFF and does not trigger the protocol; (2615-2617): a put
+    // while the previous request is in flight is refused.
+    let mut rec = MotorRecord::new();
+
+    rec.put_field("STUP", EpicsValue::Short(2)).unwrap();
+    assert_eq!(rec.stat.stup, 0, "BUSY write forced to OFF");
+    let effects = rec.do_process();
+    assert!(!effects.status_refresh, "forced-OFF write triggers nothing");
+
+    rec.put_field("STUP", EpicsValue::Short(1)).unwrap();
+    rec.do_process();
+    assert_eq!(rec.stat.stup, 2);
+    assert!(
+        rec.put_field("STUP", EpicsValue::Short(1)).is_err(),
+        "re-trigger while BUSY is refused"
+    );
+}
+
+#[test]
+fn test_stup_busy_ack_callback_skips_completion() {
+    use asyn_rs::interfaces::motor::MotorStatus;
+    // C 1345: the data callback that acknowledges a BUSY STUP takes
+    // neither the moving nor the motor-stopped branch — the GET_INFO
+    // response must not complete an in-flight motion; the next poll
+    // does.
+    let mut rec = MotorRecord::new();
+    rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    assert_eq!(rec.stat.phase, MotionPhase::MainMove);
+    assert!(!rec.stat.dmov);
+
+    let done = MotorStatus {
+        position: 10.0,
+        encoder_position: 10.0,
+        done: true,
+        ..Default::default()
+    };
+    // The ack pass: determine_event returned BUSY to OFF and latched
+    // the one-pass mark.
+    rec.internal.stup_ack = true;
+    rec.set_event(MotorEvent::DeviceUpdate(done.clone()));
+    rec.do_process();
+    assert_eq!(
+        rec.stat.phase,
+        MotionPhase::MainMove,
+        "ack callback does not complete the motion"
+    );
+    assert!(!rec.stat.dmov);
+
+    // The next ordinary poll completes it.
+    rec.set_event(MotorEvent::DeviceUpdate(done));
+    rec.do_process();
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert!(rec.stat.dmov);
 }
 
 #[test]

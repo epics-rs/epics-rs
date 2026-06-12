@@ -1771,9 +1771,21 @@ pub(crate) fn motor_put_field(
             _ => Err(CaError::TypeMismatch(name.into())),
         },
         // Status (read-only handled by validate_put)
+        // C motorSTUP menu: OFF=0, ON=1, BUSY=2.
         "STUP" => match value {
             EpicsValue::Short(v) => {
-                rec.stat.stup = v;
+                // C special() before-write (2615-2617): a STUP put while
+                // the previous request is still in flight (stup != OFF)
+                // returns ERROR — the field is not written.
+                if rec.stat.stup != 0 {
+                    return Err(CaError::InvalidValue(
+                        "STUP: status update in progress".into(),
+                    ));
+                }
+                // C special() after-write (3084-3090): any value other
+                // than ON is forced back to OFF and does not trigger the
+                // protocol.
+                rec.stat.stup = if v == 1 { 1 } else { 0 };
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),

@@ -645,6 +645,49 @@ fn startup_closed_loop_omsl_skips_readback_adoption() {
 }
 
 #[test]
+fn stup_protocol_round_trip_through_live_path() {
+    // C STUP lifecycle: ON (put) → BUSY + GET_INFO (do_work top,
+    // 1817-1830) → OFF when the data callback arrives (process_exit,
+    // 1498-1502).
+    use motor_rs::device_state::{StampedStatus, new_shared_state};
+
+    let state = new_shared_state();
+    let idle = MotorStatus {
+        done: true,
+        moving: false,
+        ..Default::default()
+    };
+    {
+        let mut ds = state.lock().unwrap();
+        ds.latest_status = Some(StampedStatus {
+            seq: 1,
+            status: idle.clone(),
+        });
+    }
+
+    let mut rec = make_record();
+    rec.set_device_state(state.clone());
+    rec.process().unwrap(); // startup
+
+    rec.put_field("STUP", EpicsValue::Short(1)).unwrap();
+    rec.process().unwrap();
+    assert_eq!(rec.get_field("STUP"), Some(EpicsValue::Short(2)), "BUSY");
+    let actions = state.lock().unwrap().pending_actions.take().unwrap();
+    assert!(actions.status_refresh, "GET_INFO equivalent requested");
+
+    // The driver's status callback acknowledges the request.
+    {
+        let mut ds = state.lock().unwrap();
+        ds.latest_status = Some(StampedStatus {
+            seq: 2,
+            status: idle,
+        });
+    }
+    rec.process().unwrap();
+    assert_eq!(rec.get_field("STUP"), Some(EpicsValue::Short(0)), "OFF");
+}
+
+#[test]
 fn comm_error_sets_alarm_and_safe_state() {
     let mut rec = make_record();
 

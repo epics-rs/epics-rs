@@ -434,3 +434,47 @@ fn frac_dispatch_walks_from_previous_target_not_readback() {
         panic!("expected MoveAbsolute, got {:?}", effects.commands);
     }
 }
+
+#[test]
+fn jog_bl2_relative_leg_is_frac_times_bdst() {
+    // C MIP_JOG_BL1 branch (motorRecord.cc:1009): the relative final leg
+    // is (relpos - relbpos) * frac == BDST * frac — a fixed stroke,
+    // independent of where the takeout leg actually stopped. The
+    // remaining-error form (dval - drbv) * frac belongs to MOVE_BL (957).
+    let mut rec = make_record();
+    rec.retry.bdst = 2.0;
+    rec.retry.rtry = 5; // use_rel needs RTRY != 0 ...
+    rec.conv.ueip = true; // ... and the encoder in use
+    rec.conv.eres = rec.conv.mres;
+    rec.retry.frac = 0.5;
+
+    rec.ctrl.jogf = true;
+    rec.plan_motion(CommandSource::Jogf);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+    rec.ctrl.jogf = false;
+    rec.plan_motion(CommandSource::Jogf); // commanded release -> JogStopping
+
+    // Stop lands at 30.0: BL1 takeout leg goes bdst back (-2.0).
+    complete_move(&mut rec, 30.0);
+    let effects = rec.check_completion();
+    assert_eq!(rec.stat.phase, MotionPhase::JogBacklash);
+    let MotorCommand::MoveRelative { distance, .. } = &effects.commands[0] else {
+        panic!("expected relative BL1 leg, got {:?}", effects.commands);
+    };
+    assert!((*distance - (-2.0)).abs() < 1e-9, "BL1 leg, got {distance}");
+
+    // BL1 stops short of the pretarget (28.0) at 27.9. C still strokes
+    // exactly frac * bdst = 1.0; the old remaining-error form would
+    // emit (30 - 27.9) * 0.5 = 1.05.
+    complete_move(&mut rec, 27.9);
+    let effects = rec.check_completion();
+    assert!(rec.stat.mip.contains(MipFlags::JOG_BL2));
+    let MotorCommand::MoveRelative { distance, .. } = &effects.commands[0] else {
+        panic!("expected relative BL2 leg, got {:?}", effects.commands);
+    };
+    assert!(
+        (*distance - 1.0).abs() < 1e-9,
+        "BL2 = frac*bdst, got {distance}"
+    );
+}

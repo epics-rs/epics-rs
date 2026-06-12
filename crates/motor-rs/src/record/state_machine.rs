@@ -613,7 +613,13 @@ impl MotorRecord {
         self.internal.backlash_pending = false;
         let pretarget = Self::compute_backlash_pretarget(self.pos.dval, self.retry.bdst);
         if self.use_relative_moves() {
-            let rel_distance = (self.pos.dval - self.pos.drbv) * frac;
+            // C MIP_JOG_BL1 (motorRecord.cc:1009): the relative final leg
+            // is `(relpos - relbpos) * frac` — with relpos = dval - drbv
+            // and relbpos = (dval - bdst) - drbv that difference is
+            // exactly BDST, independent of where the takeout leg actually
+            // stopped. The remaining-error form (dval - drbv) * frac is
+            // the MOVE_BL formula (957), not the jog one.
+            let rel_distance = self.retry.bdst * frac;
             effects.commands.push(MotorCommand::MoveRelative {
                 distance: rel_distance,
                 velocity: self.vel.bvel,

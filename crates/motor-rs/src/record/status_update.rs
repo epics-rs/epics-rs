@@ -51,6 +51,11 @@ impl MotorRecord {
             // Always apply readback even in Idle
             if self.stat.phase == MotionPhase::Idle {
                 self.process_motor_info(&status);
+                // C process_reason: this pass IS a CALLBACK_DATA pass
+                // even though no event is reported — mark it so
+                // do_process_inner routes it through the idle completion
+                // pipeline (LOAD_P collapse, pp sync, C 1396-1409).
+                self.internal.idle_status_pass = true;
                 return None;
             }
             return Some(MotorEvent::DeviceUpdate(status));

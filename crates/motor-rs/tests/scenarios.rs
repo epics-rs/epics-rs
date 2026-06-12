@@ -687,6 +687,61 @@ fn stup_protocol_round_trip_through_live_path() {
     assert_eq!(rec.get_field("STUP"), Some(EpicsValue::Short(0)), "OFF");
 }
 
+/// Helper: an idle done status stamped with the given seq.
+fn idle_status_at(seq: u64, pos: f64) -> motor_rs::device_state::StampedStatus {
+    motor_rs::device_state::StampedStatus {
+        seq,
+        status: MotorStatus {
+            position: pos,
+            encoder_position: pos,
+            done: true,
+            moving: false,
+            ..Default::default()
+        },
+    }
+}
+
+#[test]
+fn set_mode_load_pos_collapses_through_live_path() {
+    // C process (1404-1409): the GET_INFO callback after a LOAD_POS
+    // collapses MIP_LOAD_P to MIP_DONE and DMOV returns TRUE. In the
+    // live IOC that callback lands at phase Idle, where
+    // determine_event consumes the status in place — the pass must
+    // still reach the idle completion pipeline, or the SET-mode load
+    // wedges with DMOV stuck low.
+    use motor_rs::device_state::new_shared_state;
+
+    let state = new_shared_state();
+    state.lock().unwrap().latest_status = Some(idle_status_at(1, 0.0));
+
+    let mut rec = make_record();
+    rec.set_device_state(state.clone());
+    rec.process().unwrap(); // startup
+
+    rec.put_field("SET", EpicsValue::Short(1)).unwrap();
+    rec.process().unwrap();
+    rec.put_field("DVAL", EpicsValue::Double(3.0)).unwrap();
+    rec.process().unwrap();
+    assert!(rec.stat.mip.contains(MipFlags::LOAD_P));
+    assert!(!rec.stat.dmov);
+    let actions = state.lock().unwrap().pending_actions.take().unwrap();
+    assert!(
+        actions
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::SetPosition { position } if *position == 3.0)),
+        "redefinition reaches the driver"
+    );
+
+    // The GET_INFO response confirms the redefined position.
+    state.lock().unwrap().latest_status = Some(idle_status_at(2, 3.0));
+    rec.process().unwrap();
+    assert!(
+        rec.stat.mip.is_empty(),
+        "LOAD_P collapses on the live idle poll"
+    );
+    assert!(rec.stat.dmov, "DMOV returns TRUE");
+}
 #[test]
 fn comm_error_sets_alarm_and_safe_state() {
     let mut rec = make_record();

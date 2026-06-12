@@ -484,4 +484,12 @@ pub struct InternalFields {
     /// `set_resolved_input_links`, consumed by `check_alarms`, which
     /// owns the framework `CommonFields.udf` handoff.
     pub dol_udf: Option<bool>,
+    /// One-pass mark: this process pass carries an idle-phase device
+    /// status that `determine_event` consumed in place (it applies the
+    /// readback and reports no event). The C equivalent is
+    /// `process_reason == CALLBACK_DATA` — the pass must run the
+    /// idle-completion pipeline (LOAD_P collapse, pp sync, C
+    /// 1396-1409). Set by `determine_event`, consumed at
+    /// `do_process_inner` entry.
+    pub idle_status_pass: bool,
 }

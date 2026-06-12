@@ -1891,6 +1891,12 @@ impl MotorRecord {
         // process_exit 1498-1502); consumed here so it never outlives
         // the pass that carried the callback.
         let stup_ack = std::mem::take(&mut self.internal.stup_ack);
+        // One-pass CALLBACK_DATA mark from determine_event's Idle
+        // consume — the C process_reason discriminator. Taken here so
+        // it never outlives this pass: when a coalesced user write owns
+        // the pass below, the mark drops unconsumed (the readback was
+        // already applied; C would have run two passes).
+        let idle_status_pass = std::mem::take(&mut self.internal.idle_status_pass);
 
         // C do_work resolution block (1936-1991) on the pass a
         // pp(TRUE) MRES/SREV/UREV/ERES/UEIP put triggers — in this
@@ -2008,14 +2014,15 @@ impl MotorRecord {
                     self.stop_axis(&mut effects);
                     return effects;
                 }
-                // C: ea063f5f — an externally initiated move is flagged by
-                // process_motor_info() during the Idle-phase readback, which
-                // determine_event() reports as no event. The completion
-                // pipeline still has to run so MIP_EXTERNAL clears and DMOV
-                // returns to 1 once the driver finishes.
-                if self.stat.mip.contains(MipFlags::EXTERNAL) {
-                    // check_completion's Idle arm runs the latent
-                    // collection at its tail, so this pass is covered.
+                // C process (1301-1409): a CALLBACK_DATA pass on an idle
+                // record runs the stopped branch — LOAD_P collapse
+                // (1404-1409), the pp re-sync (1396-1402), the EXTERNAL
+                // close — before falling into do_work. determine_event
+                // consumed the status in place and left the one-pass
+                // mark; route it through check_completion so the live
+                // idle poll reaches that pipeline (its Idle arm), not
+                // only the EXTERNAL case.
+                if idle_status_pass || self.stat.mip.contains(MipFlags::EXTERNAL) {
                     self.check_completion()
                 } else {
                     // C do_work gate (1486-1492): the put pass continues

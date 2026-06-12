@@ -1456,6 +1456,27 @@ fn test_ueip_false_uses_motor_position() {
 }
 
 #[test]
+fn test_rep_scales_by_eres_even_under_ueip_no() {
+    // C devMotorAsyn.c:459-464: REP is the raw encoder count whether or
+    // not the readback uses it — UEIP selects the RRBV source, not the
+    // REP scale.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.001;
+    rec.conv.eres = 0.002;
+    rec.conv.ueip = false;
+    let status = asyn_rs::interfaces::motor::MotorStatus {
+        position: 10.0,
+        encoder_position: 10.0,
+        done: true,
+        ..Default::default()
+    };
+    rec.process_motor_info(&status);
+    assert_eq!(rec.pos.rep, 5000, "REP in encoder counts via ERES");
+    assert_eq!(rec.pos.rrbv, 10000, "readback still follows the motor");
+    assert_eq!(rec.pos.drbv, 10.0);
+}
+
+#[test]
 fn test_stup_triggers_status_refresh() {
     let mut rec = MotorRecord::new();
     rec.stat.stup = 1;

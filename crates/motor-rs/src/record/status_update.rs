@@ -99,12 +99,16 @@ impl MotorRecord {
         // Layer 1: update raw positions
         self.pos.rmp = (status.position / self.conv.mres).round() as i64;
 
-        // REP: use ERES when UEIP is set, MRES otherwise
+        // C devMotorAsyn.c:459-464 — REP is the raw encoder count,
+        // independent of UEIP (C rounds the count the asyn layer already
+        // reports raw; the Rust EGU convention converts at the boundary,
+        // so the encoder scale is ERES whether or not the readback uses
+        // it). MRES is only a fallback for an invalid runtime ERES.
         let eres_valid = self.conv.eres.is_finite() && self.conv.eres != 0.0;
-        if self.conv.ueip && eres_valid {
+        if eres_valid {
             self.pos.rep = (status.encoder_position / self.conv.eres).round() as i64;
         } else {
-            if self.conv.ueip && !eres_valid {
+            if self.conv.ueip {
                 tracing::warn!(
                     "UEIP set but ERES invalid ({:.6}), falling back to MRES for REP",
                     self.conv.eres

@@ -1596,6 +1596,13 @@ pub(crate) fn motor_put_field(
         },
         "HOMF" => match value {
             EpicsValue::Short(v) => {
+                // C special() (motorRecord.cc:2610-2614): a HOMF/HOMR put
+                // while a home is in flight (mip & MIP_HOME) returns
+                // ERROR — the button is not written and the record does
+                // not process.
+                if rec.stat.mip.intersects(MipFlags::HOMF | MipFlags::HOMR) {
+                    return Err(CaError::InvalidValue("HOMF: home in progress".into()));
+                }
                 if v != 0 {
                     rec.ctrl.homf = true;
                     rec.last_write = Some(CommandSource::Homf);
@@ -1606,6 +1613,11 @@ pub(crate) fn motor_put_field(
         },
         "HOMR" => match value {
             EpicsValue::Short(v) => {
+                // C special() (motorRecord.cc:2610-2614), same veto as
+                // HOMF.
+                if rec.stat.mip.intersects(MipFlags::HOMF | MipFlags::HOMR) {
+                    return Err(CaError::InvalidValue("HOMR: home in progress".into()));
+                }
                 if v != 0 {
                     rec.ctrl.homr = true;
                     rec.last_write = Some(CommandSource::Homr);

@@ -274,6 +274,42 @@ fn test_home_forward() {
 }
 
 #[test]
+fn test_homf_homr_puts_rejected_while_home_in_flight() {
+    // C special() (motorRecord.cc:2610-2614): a HOMF/HOMR put while
+    // mip & MIP_HOME returns ERROR — button not written, no processing.
+    let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::DONE;
+    assert!(rec.put_field("HOMF", EpicsValue::Short(1)).is_ok());
+    rec.plan_motion(CommandSource::Homf);
+    assert!(rec.stat.mip.contains(MipFlags::HOMF));
+
+    assert!(rec.put_field("HOMF", EpicsValue::Short(1)).is_err());
+    assert!(rec.put_field("HOMR", EpicsValue::Short(1)).is_err());
+    assert!(!rec.ctrl.homf, "vetoed put must not latch the button");
+    assert!(!rec.ctrl.homr, "vetoed put must not latch the button");
+}
+
+#[test]
+fn test_homf_put_rejected_while_home_queued_behind_stop() {
+    // A queued home reads back as MIP_HOMF|MIP_STOP (C 2023-2033),
+    // which still intersects MIP_HOME — the 2610-2614 veto applies.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.pos.dval = 50.0;
+    rec.plan_motion(CommandSource::Val);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    rec.ctrl.homf = true;
+    rec.plan_motion(CommandSource::Homf);
+    assert!(rec.stat.mip.contains(MipFlags::HOMF | MipFlags::STOP));
+
+    assert!(rec.put_field("HOMF", EpicsValue::Short(1)).is_err());
+    assert!(rec.put_field("HOMR", EpicsValue::Short(1)).is_err());
+}
+
+#[test]
 fn test_home_accel_derives_from_hvel_not_velo() {
     // C home dispatch (motorRecord.cc:2046-2048) computes the home
     // acceleration from HVEL, not VELO:

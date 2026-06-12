@@ -134,6 +134,15 @@ impl MotorRecord {
         self.last_write = None;
     }
 
+    /// C do_work collection gate (motorRecord.cc:1994): `omsl ==
+    /// menuOmslclosed_loop && dol.type == DB_LINK`. While it holds, the
+    /// entire button/tweak/relative/raw collection block (2008-2198) is
+    /// bypassed and VAL arrives only through the DOL link; a constant or
+    /// CA DOL leaves the collection active even under closed loop.
+    pub(crate) fn closed_loop_dol_collection(&self) -> bool {
+        self.links.omsl == 1 && matches!(parse_link_v2(&self.links.dol), ParsedLink::Db(_))
+    }
+
     /// True when a position field (VAL/DVAL/RVAL/RLV) was written during
     /// pass0 — i.e. autosave restored a saved position.
     ///
@@ -313,10 +322,7 @@ impl Record for MotorRecord {
         // a CALLBACK_DATA poll mid-move (motorRecord.cc:1487-1492). Gating on
         // DMOV mirrors that dominant condition and stops a device poll from
         // re-reading DOL and clobbering the in-flight target every cycle.
-        if self.stat.dmov
-            && self.links.omsl == 1
-            && matches!(parse_link_v2(&self.links.dol), ParsedLink::Db(_))
-        {
+        if self.stat.dmov && self.closed_loop_dol_collection() {
             actions.push(ProcessAction::ReadDbLink {
                 link_field: "DOL",
                 target_field: "VAL",

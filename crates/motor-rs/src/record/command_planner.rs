@@ -119,6 +119,30 @@ impl MotorRecord {
                 }
             }
             _ => {
+                // C do_work collection gate (1994-2008): under closed-loop
+                // OMSL with a DB-link DOL the whole button/tweak/relative/
+                // raw collection block (2008-2198) is bypassed — VAL
+                // arrives only through the DOL link. The fields keep the
+                // written value (C writes them raw; the collection just
+                // never reads them), so a later OMSL flip back to
+                // supervisory can act on a held button. The VAL collection
+                // (2204) sits outside the C else: Val/Dval stay live for
+                // the DOL cascade.
+                if self.closed_loop_dol_collection()
+                    && matches!(
+                        src,
+                        CommandSource::Homf
+                            | CommandSource::Homr
+                            | CommandSource::Jogf
+                            | CommandSource::Jogr
+                            | CommandSource::Twf
+                            | CommandSource::Twr
+                            | CommandSource::Rlv
+                            | CommandSource::Rval
+                    )
+                {
+                    return effects;
+                }
                 if !self.can_accept_command() {
                     // C home section under stop_or_pause (2015-2020): a
                     // latched home button only drops DMOV and returns —
@@ -138,16 +162,20 @@ impl MotorRecord {
                     // return at 2237 comes after collection). Collect it
                     // before refusing this pass so the fold lands in
                     // VAL/DVAL and SPMG=Go fires it like any position
-                    // write collected while stopped.
-                    if matches!(
-                        src,
-                        CommandSource::Val
-                            | CommandSource::Dval
-                            | CommandSource::Rval
-                            | CommandSource::Rlv
-                            | CommandSource::Twf
-                            | CommandSource::Twr
-                    ) {
+                    // write collected while stopped. The fold sits inside
+                    // the closed-loop-bypassed collection else, so it
+                    // never runs under closed loop with a DB-link DOL.
+                    if !self.closed_loop_dol_collection()
+                        && matches!(
+                            src,
+                            CommandSource::Val
+                                | CommandSource::Dval
+                                | CommandSource::Rval
+                                | CommandSource::Rlv
+                                | CommandSource::Twf
+                                | CommandSource::Twr
+                        )
+                    {
                         self.collect_tweak();
                     }
                     return effects;
@@ -196,16 +224,21 @@ impl MotorRecord {
         // buttons for the move-block srcs so a bare button put overtaken
         // in last_write still fires here. The button srcs dispatch their
         // own arms below; for the housekeeping srcs the arms must run
-        // unconditionally (see the latent-SPMG gate above).
-        if matches!(
-            src,
-            CommandSource::Val
-                | CommandSource::Dval
-                | CommandSource::Rval
-                | CommandSource::Rlv
-                | CommandSource::Twf
-                | CommandSource::Twr
-        ) && self.dispatch_latent_buttons(&mut effects)
+        // unconditionally (see the latent-SPMG gate above). The sections
+        // live inside the closed-loop-bypassed collection else (2008),
+        // so a latched button never fires under closed loop with a
+        // DB-link DOL.
+        if !self.closed_loop_dol_collection()
+            && matches!(
+                src,
+                CommandSource::Val
+                    | CommandSource::Dval
+                    | CommandSource::Rval
+                    | CommandSource::Rlv
+                    | CommandSource::Twf
+                    | CommandSource::Twr
+            )
+            && self.dispatch_latent_buttons(&mut effects)
         {
             return effects;
         }
@@ -214,16 +247,20 @@ impl MotorRecord {
         // (which return early when they dispatch) and folds latched
         // buttons into VAL on every pass — a bare TWF/TWR put overtaken
         // in last_write rides this pass's val processing as one combined
-        // move toward `written value + TWV`.
-        let tweak_pending = matches!(
-            src,
-            CommandSource::Val
-                | CommandSource::Dval
-                | CommandSource::Rval
-                | CommandSource::Rlv
-                | CommandSource::Twf
-                | CommandSource::Twr
-        ) && self.collect_tweak();
+        // move toward `written value + TWV`. Inside the closed-loop-
+        // bypassed collection else: no fold under closed loop with a
+        // DB-link DOL.
+        let tweak_pending = !self.closed_loop_dol_collection()
+            && matches!(
+                src,
+                CommandSource::Val
+                    | CommandSource::Dval
+                    | CommandSource::Rval
+                    | CommandSource::Rlv
+                    | CommandSource::Twf
+                    | CommandSource::Twr
+            )
+            && self.collect_tweak();
 
         match src {
             CommandSource::Val | CommandSource::Dval | CommandSource::Rval | CommandSource::Rlv => {
@@ -763,7 +800,7 @@ impl MotorRecord {
             // erasing MOVE/JOG/HOME/EXTERNAL bits). The VAL/DVAL/RVAL <-
             // readback sync and DMOV happen once the axis has actually
             // stopped (postProcess, 826-849), mirrored by
-            // check_completion's MIP_STOP branch via sync_positions().
+            // check_completion's MIP_STOP branch via postprocess_sync().
             // Syncing or finalizing eagerly here would post a transient
             // mid-deceleration snapshot before the rest position is known.
             self.internal.pp = true;

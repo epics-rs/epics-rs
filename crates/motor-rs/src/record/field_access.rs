@@ -916,6 +916,17 @@ pub(crate) fn motor_put_field(
                 EpicsValue::Long(v) => v as i64,
                 _ => return Err(CaError::TypeMismatch(name.into())),
             };
+            // C special() has no RVAL cascade — the RVAL->DVAL
+            // propagation lives in the do_work collection block
+            // (2196-2197), inside the else that closed-loop OMSL with a
+            // DB-link DOL bypasses (1994). Under that gate a put is a raw
+            // struct write that stays inert (both move and SET-mode
+            // redefinition) until OMSL leaves closed loop.
+            if rec.closed_loop_dol_collection() {
+                rec.pos.rval = v;
+                rec.last_write = Some(CommandSource::Rval);
+                return Ok(());
+            }
             if rec.conv.set && !rec.conv.igset {
                 // #231: LOAD_POS blocked — refuse SET-mode redefinition.
                 if rec.conv.loadpos_blocked {

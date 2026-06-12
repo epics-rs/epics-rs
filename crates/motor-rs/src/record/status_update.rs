@@ -312,6 +312,21 @@ impl MotorRecord {
         self.internal.lrvl = self.pos.rval;
     }
 
+    /// Motion-completion drive resync (C postProcess 826-849).
+    ///
+    /// C gates the resync on `omsl != menuOmslclosed_loop` (827): under
+    /// closed-loop OMSL the drive values belong to the DOL cascade, and a
+    /// stop or completion must not overwrite them with the readback. The
+    /// remaining C conjuncts — `!(mip & (MIP_MOVE | MIP_MOVE_BL |
+    /// MIP_JOG_BL1 | MIP_JOG_BL2))` — hold structurally at the call
+    /// sites: the state machine reaches them only at genuine completions,
+    /// never with a move/backlash continuation still pending.
+    pub(crate) fn postprocess_sync(&mut self) {
+        if self.links.omsl != 1 {
+            self.sync_positions();
+        }
+    }
+
     /// Initial readback and position sync at startup.
     ///
     /// On entry `self.pos.dval` holds the autosave-restored target (or 0 if

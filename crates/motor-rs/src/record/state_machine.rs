@@ -141,7 +141,7 @@ impl MotorRecord {
                 // gate refusing `mip & MIP_STOP` (1385). The re-fired
                 // motion starts with pp armed again (887, 2125), so a
                 // pause interrupting it syncs at its own stop completion.
-                self.sync_positions();
+                self.postprocess_sync();
                 self.internal.pp = true;
                 match queued {
                     QueuedMotion::Home { forward } => {
@@ -180,7 +180,7 @@ impl MotorRecord {
             // never runs (mip == MIP_DONE at its 1432 gate).
             let pp = std::mem::take(&mut self.internal.pp);
             if pp {
-                self.sync_positions();
+                self.postprocess_sync();
                 self.finalize_or_delay(&mut effects);
                 return effects;
             }
@@ -279,7 +279,7 @@ impl MotorRecord {
                     // correction needs MIP_JOG_STOP or MIP_MOVE (908) —
                     // so a controller self-stop syncs and finalizes
                     // WITHOUT a jog backlash move.
-                    self.sync_positions();
+                    self.postprocess_sync();
                     self.finalize_or_delay(&mut effects);
                     return effects;
                 }
@@ -287,7 +287,7 @@ impl MotorRecord {
                 // 908-947): sync VAL<-RBV, DVAL<-DRBV first so
                 // start_jog_backlash uses the jog-end position as base,
                 // then correct when |BDST| >= |MRES|.
-                self.sync_positions();
+                self.postprocess_sync();
                 if self.needs_jog_backlash() {
                     self.start_jog_backlash(&mut effects);
                 } else {
@@ -328,7 +328,7 @@ impl MotorRecord {
                     return effects;
                 }
                 // Sync positions after homing
-                self.sync_positions();
+                self.postprocess_sync();
                 self.finalize_or_delay(&mut effects);
             }
             MotionPhase::DelayWait => {
@@ -364,7 +364,7 @@ impl MotorRecord {
                 // resolution.
                 if self.internal.pp && self.stat.msta.contains(MstaFlags::DONE) && !self.stat.movn {
                     self.internal.pp = false;
-                    self.sync_positions();
+                    self.postprocess_sync();
                     return effects;
                 }
                 // C: ea063f5f — if the record marked an externally initiated
@@ -375,7 +375,7 @@ impl MotorRecord {
                     && self.stat.msta.contains(MstaFlags::DONE)
                     && !self.stat.movn
                 {
-                    self.sync_positions();
+                    self.postprocess_sync();
                     self.finalize_motion(&mut effects);
                 }
             }
@@ -655,16 +655,19 @@ impl MotorRecord {
     /// Start jog backlash correction (phase 1: move to pretarget at slew velocity).
     /// C has two phases: BL1 moves to (dval - bdst) at slew vel, BL2 moves to dval at backlash vel.
     fn start_jog_backlash(&mut self, effects: &mut ProcessEffects) {
-        // dval was synced to drbv by sync_positions() above
+        // dval was synced to drbv by postprocess_sync() above when OMSL
+        // is supervisory; under closed loop C 827 skips that sync and
+        // the backlash base keeps the DOL target — C verbatim (the
+        // MIP_JOG_STOP branch at 908-947 runs after the gated entry).
         // Phase 1 (BL1): move to backlash pretarget (dval - bdst) at slew velocity
         let pretarget = self.pos.dval - self.retry.bdst;
         self.set_phase(MotionPhase::JogBacklash);
         self.stat.mip = MipFlags::JOG_BL1;
         self.internal.backlash_pending = true;
         // C 973: CDIR derives from relpos = diff/mres, NOT from the
-        // takeout leg actually dispatched (relbpos/bpos). DVAL was just
-        // synced to DRBV, so relpos is 0 and CDIR reads forward — C
-        // verbatim (the sync at postProcess entry zeroes diff).
+        // takeout leg actually dispatched (relbpos/bpos). When the entry
+        // sync ran, relpos is 0 and CDIR reads forward — C verbatim (the
+        // sync at postProcess entry zeroes diff).
         self.stat.cdir = (self.pos.dval - self.pos.drbv) / self.conv.mres >= 0.0;
         if self.use_relative_moves() {
             effects.commands.push(MotorCommand::MoveRelative {

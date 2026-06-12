@@ -3939,6 +3939,173 @@ fn test_sync_pv_get_reflects_latch() {
     assert_eq!(rec.get_field("SYNC"), Some(EpicsValue::Short(0)));
 }
 
+// --- Closed-loop OMSL collection gate (C do_work 1994-2198, postProcess 827) ---
+
+#[test]
+fn test_closed_loop_db_dol_suppresses_button_dispatch() {
+    // C 1994-2008: with OMSL=closed_loop and a DB-link DOL, the whole
+    // button/jog/tweak collection else (2008-2198) is bypassed — a
+    // latched JOGF/HOMF never dispatches, and the button keeps its
+    // value (C writes the field; the collection never reads it), so an
+    // OMSL flip back to supervisory can still act on it.
+    let mut rec = MotorRecord::new();
+    rec.links.omsl = 1;
+    rec.links.dol = "setpoint_src.VAL".to_string();
+    rec.stat.msta = MstaFlags::DONE;
+
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Jogf);
+    assert!(effects.commands.is_empty(), "no jog under closed loop");
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert!(rec.ctrl.jogf, "button stays latched for an OMSL flip");
+
+    rec.ctrl.jogf = false;
+    rec.put_field("HOMF", EpicsValue::Short(1)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Homf);
+    assert!(effects.commands.is_empty(), "no home under closed loop");
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert!(rec.ctrl.homf, "button stays latched");
+}
+
+#[test]
+fn test_closed_loop_constant_dol_keeps_buttons_active() {
+    // C 1994 requires dol.type == DB_LINK: a constant DOL under closed
+    // loop leaves the collection block running.
+    let mut rec = MotorRecord::new();
+    rec.links.omsl = 1;
+    rec.links.dol = "5.0".to_string(); // CONSTANT, not a DB link
+    rec.stat.msta = MstaFlags::DONE;
+
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Jogf);
+    assert!(
+        !effects.commands.is_empty(),
+        "constant DOL: jog still dispatches"
+    );
+}
+
+#[test]
+fn test_closed_loop_tweak_and_rlv_not_collected() {
+    // C 2167-2197: the tweak fold and the RLV fold sit inside the
+    // bypassed else — the writes land in the fields and stay inert.
+    let mut rec = MotorRecord::new();
+    rec.links.omsl = 1;
+    rec.links.dol = "setpoint_src.VAL".to_string();
+    rec.stat.msta = MstaFlags::DONE;
+    rec.pos.val = 10.0;
+    rec.pos.dval = 10.0;
+    rec.ctrl.twv = 1.0;
+
+    rec.put_field("TWF", EpicsValue::Short(1)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Twf);
+    assert!(effects.commands.is_empty(), "no tweak move");
+    assert_eq!(rec.pos.val, 10.0, "no tweak fold under closed loop");
+    assert!(rec.ctrl.twf, "TWF stays latched");
+
+    rec.put_field("RLV", EpicsValue::Double(2.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Rlv);
+    assert!(effects.commands.is_empty(), "no relative move");
+    assert_eq!(rec.pos.val, 10.0, "no RLV fold");
+    assert_eq!(rec.pos.rlv, 2.0, "RLV stays latched");
+}
+
+#[test]
+fn test_closed_loop_rval_put_is_raw_struct_write() {
+    // C special() has no RVAL branch; the RVAL->DVAL propagation
+    // (2196-2197) is inside the bypassed else — a closed-loop RVAL put
+    // lands in the field and stays inert, in move and SET mode alike.
+    let mut rec = MotorRecord::new();
+    rec.links.omsl = 1;
+    rec.links.dol = "setpoint_src.VAL".to_string();
+    rec.conv.mres = 0.01;
+    rec.pos.val = 10.0;
+    rec.pos.dval = 10.0;
+    rec.stat.msta = MstaFlags::DONE;
+
+    rec.put_field("RVAL", EpicsValue::Int64(5000)).unwrap();
+    assert_eq!(rec.pos.rval, 5000, "field takes the raw write");
+    assert_eq!(rec.pos.dval, 10.0, "no RVAL->DVAL propagation");
+    assert_eq!(rec.pos.val, 10.0);
+    let effects = rec.plan_motion(CommandSource::Rval);
+    assert!(effects.commands.is_empty(), "inert under closed loop");
+
+    rec.conv.set = true;
+    rec.put_field("RVAL", EpicsValue::Int64(7000)).unwrap();
+    assert_eq!(rec.pos.rval, 7000);
+    assert_eq!(rec.pos.dval, 10.0, "no SET redefinition under closed loop");
+}
+
+#[test]
+fn test_closed_loop_latent_tweak_skipped_on_val_pass() {
+    // A latched TWF must not ride a closed-loop VAL pass: the fold
+    // (2167) is inside the bypassed else even when the pass itself is
+    // the DOL cascade arriving through VAL.
+    let mut rec = MotorRecord::new();
+    rec.links.omsl = 1;
+    rec.links.dol = "setpoint_src.VAL".to_string();
+    rec.stat.msta = MstaFlags::DONE;
+    rec.ctrl.twv = 1.0;
+    rec.ctrl.twf = true; // latched before the DOL pass
+
+    rec.put_field("VAL", EpicsValue::Double(20.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(!effects.commands.is_empty(), "DOL cascade still moves");
+    assert_eq!(rec.pos.val, 20.0, "no +TWV fold");
+    assert!(rec.ctrl.twf, "button stays latched");
+}
+
+#[test]
+fn test_stop_sync_skipped_under_closed_loop_omsl() {
+    // C postProcess 827: the VAL/DVAL/RVAL <- readback resync at stop
+    // completion is gated on omsl != closed_loop ALONE (no dol.type
+    // test) — the drive values belong to the DOL cascade.
+    let mut rec = MotorRecord::new();
+    rec.links.omsl = 1; // no DB-link DOL needed: the C gate tests OMSL only
+    rec.stat.phase = MotionPhase::MainMove;
+    rec.stat.mip = MipFlags::MOVE;
+    rec.stat.dmov = false;
+    rec.pos.val = 50.0;
+    rec.pos.dval = 50.0;
+    rec.pos.rbv = 25.0;
+    rec.pos.drbv = 25.0;
+
+    rec.ctrl.spmg = SpmgMode::Stop;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
+
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.movn = false;
+    rec.pos.rbv = 30.0;
+    rec.pos.drbv = 30.0;
+    let _ = rec.check_completion();
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert_eq!(rec.pos.val, 50.0, "closed loop keeps the DOL target");
+    assert_eq!(rec.pos.dval, 50.0);
+}
+
+#[test]
+fn test_sync_pv_resyncs_under_closed_loop() {
+    // C syncTargetPosition (4445-4460) has NO OMSL gate — unlike the
+    // postProcess resync, a SYNC=1 put reseeds the drive triplet even
+    // under closed loop.
+    let mut rec = MotorRecord::new();
+    rec.links.omsl = 1;
+    rec.links.dol = "setpoint_src.VAL".to_string();
+    rec.conv.mres = 0.01;
+    rec.pos.drbv = 25.0;
+    rec.pos.rbv = 25.0;
+    rec.pos.rrbv = 2500;
+    rec.pos.val = 0.0;
+    rec.pos.dval = 0.0;
+
+    rec.put_field("SYNC", EpicsValue::Short(1)).unwrap();
+    rec.plan_motion(CommandSource::Sync);
+    assert_eq!(rec.pos.val, 25.0);
+    assert_eq!(rec.pos.dval, 25.0);
+    assert_eq!(rec.pos.rval, 2500);
+}
+
 // --- RSTM init integration (C: devMotorAsyn.c init_controller) ---
 
 #[test]

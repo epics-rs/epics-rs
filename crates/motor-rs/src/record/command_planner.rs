@@ -998,7 +998,7 @@ impl MotorRecord {
         effects.commands.push(MotorCommand::Home {
             forward: hw_forward,
             velocity: self.vel.hvel,
-            acceleration: self.move_accel_egu(),
+            acceleration: self.home_accel_egu(),
         });
         effects.request_poll = true;
     }
@@ -1273,6 +1273,30 @@ impl MotorRecord {
             rate
         } else {
             self.vel.bvel.abs().max(1.0) / bacc
+        }
+    }
+
+    /// Acceleration for a home, EGU/sec². C derives it from HVEL, not
+    /// VELO — both the direct dispatch (motorRecord.cc:2046-2048) and the
+    /// queued-home re-fire (859-862) compute
+    /// `(hvel - vbase) > 0 ? (hvel - vbase) / accl : hvel / accl`.
+    /// Always strictly positive (see `move_accel_egu`).
+    pub(crate) fn home_accel_egu(&self) -> f64 {
+        let accl = if self.vel.accl > 0.0 {
+            self.vel.accl
+        } else {
+            0.1
+        };
+        let span = self.vel.hvel - self.effective_vbas();
+        let rate = if span > 0.0 {
+            span / accl
+        } else {
+            self.vel.hvel / accl
+        };
+        if rate > 0.0 {
+            rate
+        } else {
+            self.vel.hvel.abs().max(1.0) / accl
         }
     }
 

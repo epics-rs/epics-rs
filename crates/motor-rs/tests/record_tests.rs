@@ -274,6 +274,65 @@ fn test_home_forward() {
 }
 
 #[test]
+fn test_home_accel_derives_from_hvel_not_velo() {
+    // C home dispatch (motorRecord.cc:2046-2048) computes the home
+    // acceleration from HVEL, not VELO:
+    // (hvel - vbase) > 0 ? (hvel - vbase) / accl : hvel / accl.
+    let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::DONE;
+    rec.vel.vbas = 0.5;
+    rec.vel.velo = 5.0;
+    rec.vel.hvel = 2.0;
+    rec.vel.accl = 0.5;
+
+    rec.ctrl.homf = true;
+    let effects = rec.plan_motion(CommandSource::Homf);
+    let accel = effects
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            MotorCommand::Home { acceleration, .. } => Some(*acceleration),
+            _ => None,
+        })
+        .expect("home command dispatched");
+    assert_eq!(accel, (2.0 - 0.5) / 0.5, "HVEL-based, not VELO-based");
+}
+
+#[test]
+fn test_queued_home_refire_accel_derives_from_hvel() {
+    // The stop-completion re-fire (C 859-862) uses the same HVEL-based
+    // acceleration as the direct dispatch.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.vel.vbas = 0.5;
+    rec.vel.velo = 5.0;
+    rec.vel.hvel = 2.0;
+    rec.vel.accl = 0.5;
+    rec.pos.dval = 50.0;
+    rec.plan_motion(CommandSource::Val);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    rec.ctrl.homf = true;
+    rec.plan_motion(CommandSource::Homf);
+    assert!(rec.internal.queued_motion.is_some());
+
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.movn = false;
+    let effects = rec.check_completion();
+    let accel = effects
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            MotorCommand::Home { acceleration, .. } => Some(*acceleration),
+            _ => None,
+        })
+        .expect("queued home re-fired at stop completion");
+    assert_eq!(accel, (2.0 - 0.5) / 0.5, "HVEL-based, not VELO-based");
+}
+
+#[test]
 fn test_tweak_forward() {
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.01;

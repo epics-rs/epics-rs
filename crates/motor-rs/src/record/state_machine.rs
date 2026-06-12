@@ -149,7 +149,7 @@ impl MotorRecord {
                         effects.commands.push(MotorCommand::Home {
                             forward: hw_forward,
                             velocity: self.vel.hvel,
-                            acceleration: self.move_accel_egu(),
+                            acceleration: self.home_accel_egu(),
                         });
                     }
                     QueuedMotion::Jog { forward } => {

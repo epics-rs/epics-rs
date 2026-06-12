@@ -1083,6 +1083,11 @@ impl MotorRecord {
                 self.pos.dval = dval;
                 self.pos.rval = rval;
                 self.pos.off = off;
+                // C 2220: a Variable-offset redefinition retranslates the
+                // user limits (Frozen leaves OFF untouched — idempotent).
+                if self.conv.foff == FreezeOffset::Variable {
+                    self.set_userlimits();
+                }
             }
             effects.commands.push(MotorCommand::SetPosition {
                 position: self.pos.dval,
@@ -1381,6 +1386,21 @@ impl MotorRecord {
         } else {
             self.move_accel_egu()
         }
+    }
+
+    /// C set_userlimits (motorRecord.cc:4334-4348): translate the dial
+    /// limits to user limits through DIR/OFF. Single owner — called
+    /// wherever OFF or the dial pair changes (offset redefinition, DIR
+    /// flip, limit writes, MRES rescale, load_pos Variable leg).
+    pub(crate) fn set_userlimits(&mut self) {
+        let (hlm, llm) = coordinate::dial_limits_to_user(
+            self.limits.dhlm,
+            self.limits.dllm,
+            self.conv.dir,
+            self.pos.off,
+        );
+        self.limits.hlm = hlm;
+        self.limits.llm = llm;
     }
 
     /// C: use_rel = rtry != 0 && rmod != InPosition && (ueip || urip)

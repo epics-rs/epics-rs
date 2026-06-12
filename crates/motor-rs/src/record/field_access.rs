@@ -804,6 +804,9 @@ pub(crate) fn motor_put_field(
                         rec.pos.dval = dval;
                         rec.pos.rval = rval;
                         rec.pos.off = off;
+                        // C 2220: the offset redefinition retranslates the
+                        // user limits.
+                        rec.set_userlimits();
                     }
                     rec.last_write = Some(CommandSource::Set);
                 } else {
@@ -862,6 +865,9 @@ pub(crate) fn motor_put_field(
                         rec.pos.val = val;
                         rec.pos.rval = rval;
                         rec.pos.off = off;
+                        // C load_pos Variable leg (motorRecord.cc:3800):
+                        // the recomputed offset retranslates user limits.
+                        rec.set_userlimits();
                     }
                 } else {
                     // SET+FOFF=Frozen: DVAL changes directly, SetPosition
@@ -920,6 +926,8 @@ pub(crate) fn motor_put_field(
                     rec.pos.val = val;
                     rec.pos.dval = dval;
                     rec.pos.off = off;
+                    // C load_pos Variable leg (motorRecord.cc:3800).
+                    rec.set_userlimits();
                 } else {
                     // SET+FOFF=Frozen: RVAL->DVAL directly, SetPosition
                     let dval = coordinate::raw_to_dial(v, rec.conv.mres);
@@ -966,14 +974,7 @@ pub(crate) fn motor_put_field(
                     // C: also update LVAL so offset change doesn't trigger false retarget
                     rec.internal.lval =
                         coordinate::dial_to_user(rec.internal.ldvl, rec.conv.dir, rec.pos.off);
-                    let (hlm, llm) = coordinate::dial_limits_to_user(
-                        rec.limits.dhlm,
-                        rec.limits.dllm,
-                        rec.conv.dir,
-                        rec.pos.off,
-                    );
-                    rec.limits.hlm = hlm;
-                    rec.limits.llm = llm;
+                    rec.set_userlimits();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -998,14 +999,7 @@ pub(crate) fn motor_put_field(
                         }
                     }
                     rec.pos.rbv = coordinate::dial_to_user(rec.pos.drbv, rec.conv.dir, rec.pos.off);
-                    let (hlm, llm) = coordinate::dial_limits_to_user(
-                        rec.limits.dhlm,
-                        rec.limits.dllm,
-                        rec.conv.dir,
-                        rec.pos.off,
-                    );
-                    rec.limits.hlm = hlm;
-                    rec.limits.llm = llm;
+                    rec.set_userlimits();
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -1539,14 +1533,7 @@ pub(crate) fn motor_put_field(
                 rec.limits.rhlm = v;
                 rec.limits.dhlm = v * rec.conv.mres;
                 normalize_raw_limit_pair(&mut rec.limits, rec.conv.mres);
-                let (hlm, llm) = coordinate::dial_limits_to_user(
-                    rec.limits.dhlm,
-                    rec.limits.dllm,
-                    rec.conv.dir,
-                    rec.pos.off,
-                );
-                rec.limits.hlm = hlm;
-                rec.limits.llm = llm;
+                rec.set_userlimits();
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1556,14 +1543,7 @@ pub(crate) fn motor_put_field(
                 rec.limits.rllm = v;
                 rec.limits.dllm = v * rec.conv.mres;
                 normalize_raw_limit_pair(&mut rec.limits, rec.conv.mres);
-                let (hlm, llm) = coordinate::dial_limits_to_user(
-                    rec.limits.dhlm,
-                    rec.limits.dllm,
-                    rec.conv.dir,
-                    rec.pos.off,
-                );
-                rec.limits.hlm = hlm;
-                rec.limits.llm = llm;
+                rec.set_userlimits();
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -2028,14 +2008,7 @@ fn apply_mres_cascade(rec: &mut MotorRecord, old_mres: f64) {
         rec.limits.dhlm = rec.limits.rhlm * rec.conv.mres;
         rec.limits.dllm = rec.limits.rllm * rec.conv.mres;
         normalize_raw_limit_pair(&mut rec.limits, rec.conv.mres);
-        let (hlm, llm) = crate::coordinate::dial_limits_to_user(
-            rec.limits.dhlm,
-            rec.limits.dllm,
-            rec.conv.dir,
-            rec.pos.off,
-        );
-        rec.limits.hlm = hlm;
-        rec.limits.llm = llm;
+        rec.set_userlimits();
     }
     // C: special() calls enforceMinRetryDeadband on MRES change.
     rec.enforce_min_retry_deadband();
@@ -2172,14 +2145,7 @@ pub(crate) fn motor_sync_limits_at_init(rec: &mut MotorRecord) {
         rec.limits.rllm = rec.limits.dllm / rec.conv.mres;
     }
     normalize_raw_limit_pair(&mut rec.limits, rec.conv.mres);
-    let (hlm, llm) = crate::coordinate::dial_limits_to_user(
-        rec.limits.dhlm,
-        rec.limits.dllm,
-        rec.conv.dir,
-        rec.pos.off,
-    );
-    rec.limits.hlm = hlm;
-    rec.limits.llm = llm;
+    rec.set_userlimits();
 }
 
 /// Re-evaluate LVIO after a soft-limit put.

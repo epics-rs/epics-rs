@@ -276,6 +276,54 @@ fn test_home_forward() {
 }
 
 #[test]
+fn test_set_mode_offset_redefinition_retranslates_user_limits() {
+    // C set_userlimits at every offset redefinition: SET VAL collection
+    // (motorRecord.cc:2220) and the load_pos Variable leg (3800) —
+    // HLM/LLM re-derive from DHLM/DLLM through the new offset.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("DLLM", EpicsValue::Double(-10.0)).unwrap();
+    rec.pos.val = 5.0;
+    rec.pos.dval = 5.0;
+    rec.put_field("SET", EpicsValue::Short(1)).unwrap();
+
+    // DVAL redefinition (FOFF=Variable default): off = 5 - 0 = 5.
+    rec.put_field("DVAL", EpicsValue::Double(0.0)).unwrap();
+    assert_eq!(rec.pos.off, 5.0);
+    assert_eq!(rec.limits.hlm, 15.0, "HLM follows the new offset");
+    assert_eq!(rec.limits.llm, -5.0, "LLM follows the new offset");
+
+    // VAL redefinition: off = 7 - 0 = 7.
+    rec.put_field("VAL", EpicsValue::Double(7.0)).unwrap();
+    assert_eq!(rec.pos.off, 7.0);
+    assert_eq!(rec.limits.hlm, 17.0);
+    assert_eq!(rec.limits.llm, -3.0);
+}
+
+#[test]
+fn test_set_mode_tweak_redefinition_retranslates_user_limits() {
+    // The tweak fold in SET mode runs the same VAL redefinition (C
+    // 2167-2181 feeding 2204-2227) — limits follow the offset.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("DLLM", EpicsValue::Double(-10.0)).unwrap();
+    rec.pos.val = 0.0;
+    rec.pos.dval = 0.0;
+    rec.put_field("SET", EpicsValue::Short(1)).unwrap();
+    rec.ctrl.twv = 2.0;
+
+    rec.ctrl.twf = true;
+    rec.plan_motion(CommandSource::Twf);
+    assert_eq!(rec.pos.off, 2.0, "tweak fold redefined the offset");
+    assert_eq!(rec.limits.hlm, 12.0);
+    assert_eq!(rec.limits.llm, -8.0);
+}
+
+#[test]
 fn test_blocked_homf_stays_latched_and_zero_write_unlatches() {
     // C home gate (2013-2014): a HOMF blocked by its limit switch
     // simply fails the gate — the button stays latched (no clear, no

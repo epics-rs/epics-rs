@@ -1538,6 +1538,7 @@ fn test_rep_scales_by_eres_even_under_ueip_no() {
 #[test]
 fn test_stup_triggers_status_refresh() {
     let mut rec = MotorRecord::new();
+    rec.set_device_state(motor_rs::device_state::new_shared_state());
     rec.stat.stup = 1;
     let effects = rec.do_process();
     assert!(effects.status_refresh);
@@ -1548,11 +1549,29 @@ fn test_stup_triggers_status_refresh() {
 }
 
 #[test]
+fn test_stup_without_driver_returns_to_off() {
+    // C do_work 1824-1828: a device that cannot service GET_INFO
+    // (WRITE_MSG returns ERROR, e.g. Soft Channel) drops STUP back to
+    // OFF instead of holding BUSY. With no driver the BUSY->OFF
+    // callback can never arrive, and a stuck BUSY would refuse every
+    // later STUP put.
+    let mut rec = MotorRecord::new();
+    rec.stat.stup = 1;
+    let effects = rec.do_process();
+    assert!(!effects.status_refresh, "no consumer for the refresh");
+    assert_eq!(rec.stat.stup, 0, "STUP returns to OFF, not stuck BUSY");
+    // The field stays writable for a later request.
+    rec.put_field("STUP", EpicsValue::Short(1)).unwrap();
+    assert_eq!(rec.stat.stup, 1);
+}
+
+#[test]
 fn test_stup_does_not_drop_concurrent_user_write() {
     // C handles STUP at the top of do_work and continues the pass. A user
     // write (last_write) arriving in the same cycle must still be planned —
     // the STUP must not early-return and discard it.
     let mut rec = MotorRecord::new();
+    rec.set_device_state(motor_rs::device_state::new_shared_state());
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.stat.stup = 1;
@@ -1579,6 +1598,7 @@ fn test_stup_put_rejects_non_on_and_busy_retrigger() {
     // back to OFF and does not trigger the protocol; (2615-2617): a put
     // while the previous request is in flight is refused.
     let mut rec = MotorRecord::new();
+    rec.set_device_state(motor_rs::device_state::new_shared_state());
 
     rec.put_field("STUP", EpicsValue::Short(2)).unwrap();
     assert_eq!(rec.stat.stup, 0, "BUSY write forced to OFF");

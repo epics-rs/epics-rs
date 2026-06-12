@@ -1850,14 +1850,20 @@ impl MotorRecord {
         // BUSY and fires GET_INFO, then *continues* the pass — it does not
         // early-return — so a user write or device update arriving in the
         // same cycle is not dropped. The data callback returns BUSY to OFF
-        // (process_exit 1498-1502, ported in determine_event).
+        // (process_exit 1498-1502, ported in determine_event). C 1824-1828:
+        // a device that cannot service GET_INFO (WRITE_MSG returns ERROR,
+        // e.g. Soft Channel) drops STUP back to OFF instead of holding
+        // BUSY — with no driver attached the refresh has no consumer and
+        // the BUSY->OFF callback never arrives, so a stuck BUSY would
+        // refuse every later STUP put (special before-write, 2615-2617).
         let stup_requested = self.stat.stup == 1;
+        let stup_fired = stup_requested && self.device_state.is_some();
         if stup_requested {
-            self.stat.stup = 2;
+            self.stat.stup = if stup_fired { 2 } else { 0 };
         }
         let jvel_retune = std::mem::take(&mut self.jog_retune_pending);
         let mut effects = self.do_process_inner();
-        if stup_requested {
+        if stup_fired {
             effects.status_refresh = true;
         }
         // C special() motorRecordJVEL (motorRecord.cc:3059-3072): a JVEL

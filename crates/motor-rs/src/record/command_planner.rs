@@ -157,6 +157,9 @@ impl MotorRecord {
                 // motion is in flight, emit a STOP so the axis halts.
                 if self.conv.urip && self.conv.rdbl_error {
                     if self.stat.phase != MotionPhase::Idle {
+                        // C 3692-3694: the failed-RDBL stop releases the
+                        // latched motion buttons too.
+                        self.clear_buttons();
                         self.stat.mip.insert(MipFlags::STOP);
                         // An error stop post-processes like a commanded
                         // stop: sync the drive fields at completion rather

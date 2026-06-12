@@ -24,6 +24,10 @@ impl MotorRecord {
             && self.stat.phase != MotionPhase::Idle
             && !self.stat.mip.contains(MipFlags::STOP)
         {
+            // C 3692-3694: the failed-RDBL stop also releases every
+            // latched motion button, so the halted axis is not
+            // re-commanded by a jog/home still held high.
+            self.clear_buttons();
             self.stat.mip.insert(MipFlags::STOP);
             // An error stop post-processes like a commanded stop (sync at
             // completion), not like a Pause (resume armed).

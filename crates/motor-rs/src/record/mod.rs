@@ -323,13 +323,30 @@ impl Record for MotorRecord {
             });
         }
 
-        if self.conv.urip {
+        // C process_motor_info (3676-3699) is an else-if chain: UEIP=Yes
+        // takes the encoder and the RDBL dbGetLink never executes, so a
+        // failed RDBL must not stop the axis while the encoder is in use.
+        if self.conv.urip && !self.conv.ueip {
             actions.push(ProcessAction::ReadDbLink {
                 link_field: "RDBL",
                 target_field: "RDBL_VAL",
             });
         }
         actions
+    }
+
+    /// Framework report of which requested link reads produced a value
+    /// this cycle — the analogue of C inspecting
+    /// `RTN_SUCCESS(dbGetLink(&pmr->rdbl, ...))` in `process_motor_info`
+    /// (motorRecord.cc:3687-3698). A failed RDBL read latches
+    /// `rdbl_error`; the completion/planner paths stop an in-flight
+    /// motion and refuse new ones while it is set. An empty RDBL is
+    /// skipped by the framework (CONSTANT link in C — a successful
+    /// dbGetLink), so it never reports as an error here.
+    fn set_resolved_input_links(&mut self, resolved: &[&'static str]) {
+        if self.conv.urip && !self.conv.ueip && !self.links.rdbl.is_empty() {
+            self.conv.rdbl_error = !resolved.contains(&"RDBL");
+        }
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -588,6 +605,27 @@ mod tests {
                 }
             )),
             "URIP=No must not read the RDBL link"
+        );
+    }
+
+    #[test]
+    fn no_rdbl_pull_when_ueip_wins() {
+        // C process_motor_info (3676-3699) else-if: UEIP=Yes takes the
+        // encoder and the RDBL dbGetLink never executes.
+        let mut rec = MotorRecord::new();
+        rec.conv.urip = true;
+        rec.conv.ueip = true;
+        rec.links.rdbl = "ext_readback.RBV".to_string();
+        let actions = rec.pre_process_actions();
+        assert!(
+            !actions.iter().any(|a| matches!(
+                a,
+                ProcessAction::ReadDbLink {
+                    link_field: "RDBL",
+                    ..
+                }
+            )),
+            "UEIP=Yes must suppress the RDBL read"
         );
     }
 

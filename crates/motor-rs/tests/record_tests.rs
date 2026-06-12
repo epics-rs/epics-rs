@@ -3481,6 +3481,54 @@ fn test_urip_rdbl_error_does_not_affect_ueip_path() {
     assert!(!effects.commands.is_empty()); // move proceeds
 }
 
+#[test]
+fn test_urip_rdbl_error_stop_clears_latched_buttons() {
+    // C 3692-3694: the failed-RDBL stop runs clear_buttons() before
+    // setting stop=1, releasing any held jog/home button so the halted
+    // axis is not re-commanded on the next pass.
+    let mut rec = MotorRecord::new();
+    rec.conv.urip = true;
+    rec.ctrl.jogf = true;
+    rec.plan_motion(CommandSource::Jogf);
+    assert_ne!(rec.stat.phase, MotionPhase::Idle);
+
+    rec.set_rdbl_error(true);
+    let effects = rec.check_completion();
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Stop { .. }))
+    );
+    assert!(!rec.ctrl.jogf, "JOGF released by the error stop");
+}
+
+#[test]
+fn test_rdbl_resolution_report_drives_rdbl_error() {
+    // The framework reports which requested link reads resolved
+    // (set_resolved_input_links) — the analogue of C inspecting
+    // RTN_SUCCESS(dbGetLink(&pmr->rdbl,...)) at motorRecord.cc:3687.
+    use epics_base_rs::server::record::Record;
+    let mut rec = MotorRecord::new();
+    rec.conv.urip = true;
+    rec.links.rdbl = "ext_readback.RBV".to_string();
+
+    rec.set_resolved_input_links(&[]);
+    assert!(
+        rec.conv.rdbl_error,
+        "missing RDBL in the report = failed read"
+    );
+
+    rec.set_resolved_input_links(&["RDBL"]);
+    assert!(!rec.conv.rdbl_error, "resolved RDBL clears the error");
+
+    // UEIP=Yes wins the C else-if chain (3676): the RDBL read is not
+    // requested, so a stale report must not re-latch the error.
+    rec.conv.ueip = true;
+    rec.set_resolved_input_links(&[]);
+    assert!(!rec.conv.rdbl_error, "no RDBL read under UEIP=Yes");
+}
+
 // --- Inverted soft limits (C: 270347df PR #108) ---
 
 #[test]

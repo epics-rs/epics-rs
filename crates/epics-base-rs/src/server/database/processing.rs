@@ -1425,13 +1425,11 @@ impl PvDatabase {
                 }
             }
 
-            // Tell the record which input link fields actually resolved
-            // a value this cycle — the framework analogue of C device
-            // support inspecting `RTN_SUCCESS(dbGetLink(...))`
-            // (`epidRecord.c:191-193`).
-            instance
-                .record
-                .set_resolved_input_links(&resolved_link_fields);
+            // The set_resolved_input_links report is deferred until after
+            // the pre-process ReadDbLink reads below, so the record sees
+            // ONE per-cycle resolution list covering both fetch paths —
+            // records reset per-cycle resolution state in that hook, so
+            // it must not run twice with partial lists.
 
             // Apply sel NVL -> SELN. SELN is DBF_USHORT (selRecord.dbd.pod:295),
             // an unsigned 0..65535 index. Carry the native unsigned value so a
@@ -1520,10 +1518,21 @@ impl PvDatabase {
             if !pre_actions.is_empty() {
                 let rec_name = instance.name.clone();
                 drop(instance);
-                self.execute_read_db_links(&rec_name, &rec, &pre_actions, visited, depth)
+                let pre_resolved = self
+                    .execute_read_db_links(&rec_name, &rec, &pre_actions, visited, depth)
                     .await;
                 instance = rec.write().await;
+                resolved_link_fields.extend(pre_resolved);
             }
+
+            // Tell the record which input link fields actually resolved
+            // a value this cycle — the union of the multi-input fetch and
+            // the pre-process ReadDbLink reads; the framework analogue of
+            // C device support inspecting `RTN_SUCCESS(dbGetLink(...))`
+            // (`epidRecord.c:191-193`, `motorRecord.cc:3687-3698`).
+            instance
+                .record
+                .set_resolved_input_links(&resolved_link_fields);
 
             // Note: C EPICS LCNT prevents reentrant processing of the same
             // record within a single processing chain. In Rust, this is handled
@@ -2559,6 +2568,11 @@ impl PvDatabase {
 
     /// Execute ReadDbLink actions before process().
     /// Reads linked PV values and writes them into record fields via put_field_internal.
+    /// Returns the `link_field` names whose read produced a value, so the
+    /// caller can fold them into the per-cycle `set_resolved_input_links`
+    /// report (C `RTN_SUCCESS(dbGetLink(...))`). An empty link is skipped
+    /// and NOT reported — it is a CONSTANT link in C, which records must
+    /// not treat as a failed fetch.
     async fn execute_read_db_links(
         &self,
         _record_name: &str,
@@ -2566,8 +2580,9 @@ impl PvDatabase {
         actions: &[crate::server::record::ProcessAction],
         visited: &mut HashSet<String>,
         depth: usize,
-    ) {
+    ) -> Vec<&'static str> {
         use crate::server::record::ProcessAction;
+        let mut resolved = Vec::new();
         for action in actions {
             if let ProcessAction::ReadDbLink {
                 link_field,
@@ -2595,9 +2610,11 @@ impl PvDatabase {
                 if let Some(value) = self.read_link_value(&parsed, visited, depth).await {
                     let mut instance = rec.write().await;
                     let _ = instance.record.put_field_internal(target_field, value);
+                    resolved.push(*link_field);
                 }
             }
         }
+        resolved
     }
 
     /// Execute ProcessActions returned by a record's process() call.

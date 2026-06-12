@@ -1905,6 +1905,64 @@ impl AsynRecord {
     }
 }
 
+// ===== asynRecord DBF_MENU choice tables =====
+//
+// Verbatim from `asynRecord.dbd` `menu(...)` definitions, in menu index
+// order (index = stored value). Served to clients as the `DBR_ENUM`
+// choice strings via `menu_field_choices` below: the framework promotes a
+// matching `Short` field value to `DBR_ENUM` and attaches these labels
+// (`RecordInstance::promote_menu_value` / `attach_menu_enum`). Without
+// them every `DBF_MENU` field is served as a plain numeric `Short`, so
+// MEDM `choice button` / `menu` widgets bound to TB0..TB5 / IFACE / CNCT /
+// BAUD / ... render blank (no states to label), while `text entry`
+// widgets on the same screen show their numbers fine.
+const MENU_ASYN_TMOD: &[&str] = &["Write/Read", "Write", "Read", "Flush", "NoI/O"];
+const MENU_ASYN_INTERFACE: &[&str] =
+    &["asynOctet", "asynInt32", "asynUInt32Digital", "asynFloat64"];
+const MENU_ASYN_FMT: &[&str] = &["ASCII", "Hybrid", "Binary"];
+const MENU_ASYN_TRACE: &[&str] = &["Off", "On"];
+const MENU_ASYN_AUTOCONNECT: &[&str] = &["noAutoConnect", "autoConnect"];
+const MENU_ASYN_CONNECT: &[&str] = &["Disconnect", "Connect"];
+const MENU_ASYN_ENABLE: &[&str] = &["Disable", "Enable"];
+const MENU_ASYN_EOMREASON: &[&str] = &[
+    "None",
+    "Count",
+    "Eos",
+    "Count Eos",
+    "End",
+    "Count End",
+    "Eos End",
+    "Count Eos End",
+];
+const MENU_SERIAL_BAUD: &[&str] = &[
+    "Unknown", "300", "600", "1200", "2400", "4800", "9600", "19200", "38400", "57600", "115200",
+    "230400", "460800", "576000", "921600", "1152000",
+];
+const MENU_SERIAL_PRTY: &[&str] = &["Unknown", "None", "Even", "Odd"];
+const MENU_SERIAL_DBIT: &[&str] = &["Unknown", "5", "6", "7", "8"];
+const MENU_SERIAL_SBIT: &[&str] = &["Unknown", "1", "2"];
+const MENU_SERIAL_MCTL: &[&str] = &["Unknown", "CLOCAL", "YES"];
+const MENU_SERIAL_FCTL: &[&str] = &["Unknown", "None", "Hardware"];
+const MENU_SERIAL_IX: &[&str] = &["Unknown", "No", "Yes"];
+const MENU_IP_DRTO: &[&str] = &["Unknown", "No", "Yes"];
+const MENU_GPIB_UCMD: &[&str] = &[
+    "None",
+    "Device Clear (DCL)",
+    "Local Lockout (LL0)",
+    "Serial Poll Disable (SPD)",
+    "Serial Poll Enable (SPE)",
+    "Unlisten (UNL)",
+    "Untalk (UNT)",
+];
+const MENU_GPIB_ACMD: &[&str] = &[
+    "None",
+    "Group Execute Trig. (GET)",
+    "Go To Local (GTL)",
+    "Selected Dev. Clear (SDC)",
+    "Take Control (TCT)",
+    "Serial Poll",
+];
+
 // ===== Record trait implementation =====
 
 impl Record for AsynRecord {
@@ -1914,6 +1972,38 @@ impl Record for AsynRecord {
 
     fn field_list(&self) -> &'static [FieldDesc] {
         FIELD_LIST
+    }
+
+    /// Choice strings for every asynRecord `DBF_MENU` field, in menu index
+    /// order (verbatim from `asynRecord.dbd`). The field value is held as a
+    /// `Short` menu index; returning the choices here makes the framework
+    /// promote it to `DBR_ENUM` and serve these labels, so MEDM
+    /// `choice button` / `menu` widgets render. C `dbStaticLib` serves any
+    /// `DBF_MENU` field as `DBR_ENUM` with its `menu()` choices — this
+    /// restores that parity for the asyn record.
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        match field {
+            "TMOD" => Some(MENU_ASYN_TMOD),
+            "IFACE" => Some(MENU_ASYN_INTERFACE),
+            "OFMT" | "IFMT" => Some(MENU_ASYN_FMT),
+            "TB0" | "TB1" | "TB2" | "TB3" | "TB4" | "TB5" | "TIB0" | "TIB1" | "TIB2" | "TINB0"
+            | "TINB1" | "TINB2" | "TINB3" => Some(MENU_ASYN_TRACE),
+            "AUCT" => Some(MENU_ASYN_AUTOCONNECT),
+            "CNCT" | "PCNCT" => Some(MENU_ASYN_CONNECT),
+            "ENBL" => Some(MENU_ASYN_ENABLE),
+            "EOMR" => Some(MENU_ASYN_EOMREASON),
+            "BAUD" => Some(MENU_SERIAL_BAUD),
+            "PRTY" => Some(MENU_SERIAL_PRTY),
+            "DBIT" => Some(MENU_SERIAL_DBIT),
+            "SBIT" => Some(MENU_SERIAL_SBIT),
+            "MCTL" => Some(MENU_SERIAL_MCTL),
+            "FCTL" => Some(MENU_SERIAL_FCTL),
+            "IXON" | "IXOFF" | "IXANY" => Some(MENU_SERIAL_IX),
+            "DRTO" => Some(MENU_IP_DRTO),
+            "UCMD" => Some(MENU_GPIB_UCMD),
+            "ACMD" => Some(MENU_GPIB_ACMD),
+            _ => None,
+        }
     }
 
     /// Stash the canonical record name + a cycle-free database handle the
@@ -2682,6 +2772,73 @@ mod tests {
     fn test_field_list_count() {
         let rec = AsynRecord::default();
         assert_eq!(rec.field_list().len(), 76);
+    }
+
+    /// Every asynRecord `DBF_MENU` field must (a) serve enum choice strings
+    /// and (b) hold its value as a `Short` menu index, so the framework
+    /// promotes it to `DBR_ENUM`. Regression guard for the blank
+    /// choice-button / menu widget symptom (field served as a plain `Short`
+    /// with no states). The 34 names are the full `field(...,DBF_MENU)` set
+    /// in asynRecord.dbd.
+    #[test]
+    fn menu_fields_have_choices_and_short_values() {
+        let rec = AsynRecord::default();
+        const MENU_FIELDS: &[&str] = &[
+            "TMOD", "IFACE", "OFMT", "IFMT", "EOMR", "TB0", "TB1", "TB2", "TB3", "TB4", "TB5",
+            "TIB0", "TIB1", "TIB2", "TINB0", "TINB1", "TINB2", "TINB3", "AUCT", "CNCT", "PCNCT",
+            "ENBL", "BAUD", "PRTY", "DBIT", "SBIT", "MCTL", "FCTL", "IXON", "IXOFF", "IXANY",
+            "DRTO", "UCMD", "ACMD",
+        ];
+        assert_eq!(MENU_FIELDS.len(), 34, "asynRecord has 34 DBF_MENU fields");
+        for f in MENU_FIELDS {
+            let choices = rec.menu_field_choices(f);
+            assert!(choices.is_some(), "{f} must serve menu choices");
+            assert!(
+                !choices.unwrap().is_empty(),
+                "{f} choices must be non-empty"
+            );
+            assert!(
+                matches!(rec.get_field(f), Some(EpicsValue::Short(_))),
+                "{f} value must be a Short menu index for DBR_ENUM promotion"
+            );
+        }
+    }
+
+    /// Exact choice strings for representative menus, verbatim from
+    /// asynRecord.dbd — catches a typo, reordering, or renamed choice.
+    #[test]
+    fn menu_choice_strings_match_dbd() {
+        let rec = AsynRecord::default();
+        assert_eq!(rec.menu_field_choices("TB0"), Some(&["Off", "On"][..]));
+        assert_eq!(
+            rec.menu_field_choices("IFACE"),
+            Some(&["asynOctet", "asynInt32", "asynUInt32Digital", "asynFloat64"][..])
+        );
+        assert_eq!(
+            rec.menu_field_choices("CNCT"),
+            Some(&["Disconnect", "Connect"][..])
+        );
+        assert_eq!(
+            rec.menu_field_choices("SBIT"),
+            Some(&["Unknown", "1", "2"][..])
+        );
+        // serialBAUD has 16 entries; check length + both boundaries.
+        let baud = rec.menu_field_choices("BAUD").unwrap();
+        assert_eq!(baud.len(), 16);
+        assert_eq!(baud[0], "Unknown");
+        assert_eq!(baud[15], "1152000");
+    }
+
+    /// Plain numeric / string fields (text-entry widgets) must NOT be
+    /// promoted to enum — they keep their number/string wire form.
+    #[test]
+    fn non_menu_fields_have_no_choices() {
+        let rec = AsynRecord::default();
+        for f in [
+            "PORT", "ADDR", "REASON", "TMSK", "TIOM", "TINM", "TSIZ", "LBAUD", "ERRS",
+        ] {
+            assert_eq!(rec.menu_field_choices(f), None, "{f} is not a menu field");
+        }
     }
 
     #[test]

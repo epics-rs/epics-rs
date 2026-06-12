@@ -208,15 +208,17 @@ impl MotorRecord {
         }
 
         // C: 0aaf02d7 (2025-02 PR #224) — if a VAL/DVAL/RVAL/RLV write
-        // arrives while a home is in progress, clear the HOMF/HOMR buttons.
-        // Without this, the next do_work pass re-issues HOME and loops.
+        // arrives while a home is in progress, release the latched
+        // buttons. Without this, the next do_work pass re-issues HOME
+        // and loops. C's guard (1388-1393) calls clear_buttons() — ALL
+        // FOUR buttons (4386-4408) — so a jog latched behind the home
+        // dies with it.
         if matches!(
             src,
             CommandSource::Val | CommandSource::Dval | CommandSource::Rval | CommandSource::Rlv
         ) && self.stat.mip.intersects(MipFlags::HOMF | MipFlags::HOMR)
         {
-            self.ctrl.homf = false;
-            self.ctrl.homr = false;
+            self.clear_buttons();
         }
 
         // C's home/jog sections run before the tweak/val move blocks and
@@ -1224,15 +1226,15 @@ impl MotorRecord {
                 // DONE (1922-1925). Pause does NOT set pp — the drive
                 // fields keep the target so Go can resume. `mip =
                 // MIP_STOP` erases a queued jog (MIP_JOG_REQ) and a
-                // queued/active home (MIP_HOMF|HOMR), and clear_buttons()
-                // drops the home buttons: a paused jog resumes from its
-                // still-latched button on Go, a canceled home does not.
+                // queued/active home (MIP_HOMF|HOMR).
                 // C 1899-1900: `if (mip & MIP_HOME) clear_buttons()` —
-                // the MIP test covers both an active home (HOMF/HOMR)
+                // ALL FOUR buttons (4386-4408), so a jog latched behind
+                // the home is canceled with it; a paused plain jog (no
+                // HOME bit in MIP) keeps its button and resumes on Go.
+                // The MIP test covers both an active home (HOMF/HOMR)
                 // and one queued behind a stop (HOMF|STOP).
                 if self.stat.mip.intersects(MipFlags::HOMF | MipFlags::HOMR) {
-                    self.ctrl.homf = false;
-                    self.ctrl.homr = false;
+                    self.clear_buttons();
                 }
                 self.internal.queued_motion = None;
                 self.internal.pending_retarget = None;

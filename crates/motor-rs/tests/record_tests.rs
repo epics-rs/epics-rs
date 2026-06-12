@@ -1921,6 +1921,71 @@ fn test_spmg_pause_cancels_queued_home() {
 }
 
 #[test]
+fn test_spmg_pause_with_queued_home_clears_latched_jog_button() {
+    // C 1899-1900: `if (mip & MIP_HOME) clear_buttons()` releases ALL
+    // FOUR buttons (4386-4408) — a jog button latched while a home is
+    // queued dies with the home, and Go resumes neither.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.pos.dval = 50.0;
+    rec.plan_motion(CommandSource::Val);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    rec.ctrl.homf = true;
+    rec.plan_motion(CommandSource::Homf);
+    assert!(rec.stat.mip.contains(MipFlags::HOMF));
+    rec.ctrl.jogf = true; // latched behind the queued home
+
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.plan_motion(CommandSource::Spmg);
+    assert!(!rec.ctrl.homf, "home button dropped (C clear_buttons)");
+    assert!(
+        !rec.ctrl.jogf,
+        "C clear_buttons (1899-1900) drops the latched jog button too"
+    );
+
+    // Stop completes; Go resumes neither the home nor the jog.
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.movn = false;
+    let _ = rec.check_completion();
+    rec.internal.lspg = SpmgMode::Pause;
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        !effects.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::Home { .. } | MotorCommand::MoveVelocity { .. }
+        )),
+        "Go after Pause resumes nothing — every button was cleared"
+    );
+}
+
+#[test]
+fn test_val_during_home_clears_latched_jog_button() {
+    // C 1388-1393 (0aaf02d7, PR #224): a VAL written during a home
+    // calls clear_buttons() — ALL FOUR buttons — so a jog latched
+    // behind the home cannot fire after the retarget replays.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.stat.msta = MstaFlags::DONE;
+    rec.put_field("HOMF", EpicsValue::Short(1)).unwrap();
+    rec.plan_motion(CommandSource::Homf);
+    assert!(rec.stat.mip.contains(MipFlags::HOMF));
+    rec.ctrl.jogf = true; // latched during the home, not yet dispatched
+
+    rec.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    assert!(!rec.ctrl.homf, "VAL during home releases the home button");
+    assert!(
+        !rec.ctrl.jogf,
+        "C clear_buttons (1392) drops the latched jog button too"
+    );
+}
+
+#[test]
 fn test_spmg_pause_then_go_resumes_queued_jog_from_button() {
     // C: Pause's `mip = MIP_STOP` erases MIP_JOG_REQ (queued jog), but
     // the still-latched jog BUTTON survives; Go re-arms the jog from the

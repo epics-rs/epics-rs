@@ -313,3 +313,33 @@ fn no_backlash_when_bdst_zero() {
         panic!("expected MoveAbsolute");
     }
 }
+
+#[test]
+fn frac_dispatch_walks_from_previous_target_not_readback() {
+    // C 2268/2488: the absolute dispatch is
+    // position = currpos + frac*(newpos - currpos) with currpos = LDVL —
+    // the previously dispatched target — not DRBV. After an undershot
+    // move finalizes (ldvl=10, drbv=9.4), a new FRAC=0.5 move to 20 must
+    // dispatch 10 + 0.5*(20-10) = 15.0, not 9.4 + 0.5*10.6 = 14.7.
+    let mut rec = make_record();
+    rec.retry.frac = 0.5;
+    rec.retry.rtry = 0; // finalize on first completion
+
+    rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    complete_move(&mut rec, 9.4); // undershoot; rtry=0 finalizes
+    rec.check_completion();
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.internal.ldvl, 10.0);
+
+    rec.put_field("VAL", EpicsValue::Double(20.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    if let MotorCommand::MoveAbsolute { position, .. } = &effects.commands[0] {
+        assert!(
+            (*position - 15.0).abs() < 1e-9,
+            "FRAC walks from LDVL (expected 15.0), got {position}"
+        );
+    } else {
+        panic!("expected MoveAbsolute, got {:?}", effects.commands);
+    }
+}

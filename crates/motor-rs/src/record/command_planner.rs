@@ -545,6 +545,13 @@ impl MotorRecord {
         // so is_preferred_direction must run before we update ldvl below.
         let preferred = self.is_preferred_direction(self.pos.dval, self.pos.drbv);
         let position_error = self.pos.dval - self.pos.drbv;
+        // C 2268: currpos ("where we are") is LDVL — the previously
+        // dispatched target, NOT the readback. The absolute FRAC dispatch
+        // (2488/2513) walks from the previous target toward the new one:
+        // position = currpos + frac * (newpos - currpos). Only the
+        // relative legs (relpos/relbpos, 2280-2281) measure from DRBV.
+        // Captured before the load_pos update below overwrites ldvl.
+        let currpos = self.internal.ldvl;
 
         // C parity (motorRecord.cc:2469 load_pos): ldvl/lval/lrvl reflect
         // the target being dispatched. For in-flight same-direction retarget,
@@ -580,7 +587,7 @@ impl MotorRecord {
                 effects,
                 use_rel,
                 position_error * frac,
-                self.pos.drbv + position_error * frac,
+                currpos + frac * (self.pos.dval - currpos),
                 self.vel.velo,
                 self.move_accel_egu(),
             );
@@ -591,7 +598,7 @@ impl MotorRecord {
                 effects,
                 use_rel,
                 position_error * frac,
-                self.pos.drbv + position_error * frac,
+                currpos + frac * (self.pos.dval - currpos),
                 self.vel.bvel,
                 self.backlash_accel_egu(),
             );
@@ -602,7 +609,7 @@ impl MotorRecord {
                 effects,
                 use_rel,
                 position_error * frac,
-                self.pos.drbv + position_error * frac,
+                currpos + frac * (self.pos.dval - currpos),
                 self.vel.velo,
                 self.move_accel_egu(),
             );

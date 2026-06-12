@@ -156,6 +156,62 @@ fn test_process_motor_info() {
 }
 
 #[test]
+fn test_limit_strike_completes_move_and_clears_buttons() {
+    // C: a struck limit in the commanded direction zeroes MOVN
+    // (3741-3743) and releases the latched buttons (3744-3747) even
+    // while the driver still reports done=false/moving=true; the
+    // process callback then takes the stopped branch (1301/1345)
+    // instead of waiting for RA_DONE.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.vel.jvel = 2.0;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    rec.plan_motion(CommandSource::Jogf);
+    assert_eq!(rec.stat.phase, MotionPhase::Jog);
+    assert!(rec.stat.cdir, "forward jog commands positive direction");
+
+    let struck = asyn_rs::interfaces::motor::MotorStatus {
+        position: 9.0,
+        high_limit: true,
+        done: false,
+        moving: true,
+        ..Default::default()
+    };
+    rec.process_motor_info(&struck);
+    assert!(!rec.stat.movn, "ls_active zeroes MOVN");
+    assert!(!rec.ctrl.jogf, "C 3744-3747: buttons released");
+
+    let _ = rec.check_completion();
+    assert!(rec.stat.dmov, "the jog completes despite done=false");
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+}
+
+#[test]
+fn test_driver_problem_completes_and_clears_buttons() {
+    // Same C gate, RA_PROBLEM leg: a driver fault mid-home stops the
+    // record's bookkeeping and drops the latched button.
+    let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::DONE;
+    rec.put_field("HOMF", EpicsValue::Short(1)).unwrap();
+    rec.plan_motion(CommandSource::Homf);
+    assert_eq!(rec.stat.phase, MotionPhase::Homing);
+
+    let fault = asyn_rs::interfaces::motor::MotorStatus {
+        problem: true,
+        done: false,
+        moving: true,
+        ..Default::default()
+    };
+    rec.process_motor_info(&fault);
+    assert!(!rec.stat.movn, "RA_PROBLEM zeroes MOVN");
+    assert!(!rec.ctrl.homf, "C 3744-3747: button released");
+
+    let _ = rec.check_completion();
+    assert!(rec.stat.dmov, "completion proceeds despite done=false");
+}
+
+#[test]
 fn test_athm_tracks_home_switch_every_poll() {
     // C 3755-3762: ATHM is the home-switch state on every poll —
     // RA_HOME normally, EA_HOME when UEIP=Yes — and drops when the
@@ -3099,8 +3155,10 @@ fn test_jog_command_while_moving_is_queued_and_resumes_after_stop() {
             .any(|c| matches!(c, MotorCommand::Stop { .. }))
     );
 
-    // Driver reports done → queued jog resumes.
+    // Driver reports done → queued jog resumes. The completion gate is
+    // MOVN (C 1301/1345), which the poll recomputes from the status.
     rec.stat.msta = MstaFlags::DONE;
+    rec.stat.movn = false;
     let effects = rec.check_completion();
     assert_eq!(rec.stat.phase, MotionPhase::Jog);
     assert!(effects.commands.iter().any(|c| matches!(

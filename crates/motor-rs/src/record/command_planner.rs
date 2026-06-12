@@ -765,10 +765,7 @@ impl MotorRecord {
             // mid-deceleration snapshot before the rest position is known.
             self.internal.pp = true;
             self.internal.backlash_pending = false;
-            self.ctrl.jogf = false;
-            self.ctrl.jogr = false;
-            self.ctrl.homf = false;
-            self.ctrl.homr = false;
+            self.clear_buttons();
             // C 1901-1905: "When we wait for DLY, keep it. Otherwise the
             // record may lock up."
             if !self.stat.mip.contains(MipFlags::DELAY_REQ) {
@@ -1694,6 +1691,15 @@ impl MotorRecord {
     /// Check if a new command can be accepted.
     pub fn can_accept_command(&self) -> bool {
         matches!(self.ctrl.spmg, SpmgMode::Go | SpmgMode::Move)
+    }
+
+    /// C clear_buttons (motorRecord.cc:4386-4413): release all four
+    /// latched motion buttons (JOGF/JOGR/HOMF/HOMR).
+    pub(crate) fn clear_buttons(&mut self) {
+        self.ctrl.jogf = false;
+        self.ctrl.jogr = false;
+        self.ctrl.homf = false;
+        self.ctrl.homr = false;
     }
 
     /// C SYNC apply (motorRecord.cc:2540-2544): `else if (sync != 0 &&

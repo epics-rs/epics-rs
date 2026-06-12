@@ -41,8 +41,13 @@ impl MotorRecord {
             return effects;
         }
 
-        let driver_done =
-            self.stat.msta.contains(MstaFlags::DONE) && !self.stat.msta.contains(MstaFlags::MOVING);
+        // C process (1301/1345) branches the callback on MOVN, not on
+        // the raw RA_DONE bit — and process_motor_info (3741-3748)
+        // computes movn = 0 for ls_active and RA_PROBLEM too, so an
+        // axis stopped by its limit switch or a driver fault completes
+        // (maybeRetry's ls_blocks then refuses the retry) instead of
+        // waiting forever for a DONE that never comes.
+        let driver_done = !self.stat.movn;
 
         if !driver_done {
             // C movn block (1327-1342): poll-time NTM. The axis moving
@@ -256,10 +261,7 @@ impl MotorRecord {
                 // limit, fault, host stop): clear_buttons() so the latched
                 // button does not re-fire the jog on the next pass.
                 if self.stat.phase == MotionPhase::Jog {
-                    self.ctrl.jogf = false;
-                    self.ctrl.jogr = false;
-                    self.ctrl.homf = false;
-                    self.ctrl.homr = false;
+                    self.clear_buttons();
                     // C 1357-1364 collapses the sudden stop to MIP_DONE,
                     // so the replay gate (1385) passes — a VAL written
                     // during the jog re-fires now. A commanded stop

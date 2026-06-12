@@ -148,6 +148,12 @@ impl MotorRecord {
         let ls_active =
             (status.high_limit && self.stat.cdir) || (status.low_limit && !self.stat.cdir);
         self.stat.movn = !(ls_active || status.done || status.problem);
+        // C 3744-3747: a struck limit in the commanded direction or a
+        // driver problem releases every latched motion button, so the
+        // stopped axis is not re-commanded on the next pass.
+        if ls_active || status.problem {
+            self.clear_buttons();
+        }
 
         // C: ea063f5f (2008) — when the driver is moving but the record had no
         // pending motion, this is an externally initiated move (someone called

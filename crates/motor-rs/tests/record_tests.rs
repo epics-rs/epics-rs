@@ -6019,6 +6019,89 @@ fn test_spmg_move_during_deceleration_abandons_queued_jog_and_resumes() {
 }
 
 #[test]
+fn test_spmg_move_restores_to_pause_on_close_enough() {
+    // C maybeRetry close-enough (1096-1101): a motion initiated under
+    // SPMG=Move reverts to Pause when the target is reached.
+    let mut rec = MotorRecord::new();
+    rec.ctrl.spmg = SpmgMode::Move;
+    rec.internal.lspg = SpmgMode::Move; // settled, not a fresh edge
+    rec.retry.rdbd = 0.1;
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    assert_eq!(rec.stat.phase, MotionPhase::MainMove);
+
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.movn = false;
+    rec.pos.rbv = 50.0;
+    rec.pos.drbv = 50.0;
+    rec.check_completion();
+    assert_eq!(rec.ctrl.spmg, SpmgMode::Pause, "Move is a one-shot");
+    assert_eq!(
+        rec.internal.lspg,
+        SpmgMode::Pause,
+        "restore is not a user transition: the latent-SPMG tracker follows"
+    );
+}
+
+#[test]
+fn test_spmg_move_giveup_miss_keeps_move() {
+    // C maybeRetry give-up (1059-1074): too many retries latches MISS
+    // and collapses to DONE WITHOUT the Move->Pause restore — C keeps
+    // that assignment commented out (1062). Only the close-enough
+    // branch restores.
+    let mut rec = MotorRecord::new();
+    rec.ctrl.spmg = SpmgMode::Move;
+    rec.internal.lspg = SpmgMode::Move;
+    rec.retry.rtry = 1;
+    rec.retry.rdbd = 0.1;
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+
+    // First completion far from target: arms the retry (rcnt 0 -> 1).
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.movn = false;
+    rec.pos.rbv = 45.0;
+    rec.pos.drbv = 45.0;
+    rec.check_completion();
+    assert_eq!(rec.retry.rcnt, 1);
+
+    // Second completion still far: rcnt >= rtry — give up, MISS.
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.movn = false;
+    rec.check_completion();
+    assert!(rec.retry.miss, "give-up latches MISS");
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert_eq!(
+        rec.ctrl.spmg,
+        SpmgMode::Move,
+        "give-up keeps SPMG=Move (C 1062 restore is commented out)"
+    );
+}
+
+#[test]
+fn test_spmg_move_home_completion_keeps_move() {
+    // A home completion goes through postProcess (893-906) and never
+    // reaches maybeRetry (process 1427 sees mip == MIP_DONE), so the
+    // Move->Pause restore does not apply to it.
+    let mut rec = MotorRecord::new();
+    rec.ctrl.spmg = SpmgMode::Move;
+    rec.internal.lspg = SpmgMode::Move;
+    rec.ctrl.homf = true;
+    rec.plan_motion(CommandSource::Homf);
+    assert_eq!(rec.stat.phase, MotionPhase::Homing);
+
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.movn = false;
+    rec.check_completion();
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert_eq!(
+        rec.ctrl.spmg,
+        SpmgMode::Move,
+        "home completion never reaches the maybeRetry restore"
+    );
+}
+
+#[test]
 fn test_mlst_alst_writable_by_framework_deadband_owner() {
     // C monitor() 3485-3501 anchors the MDEL/ADEL deadbands at the
     // last POSTED readback by writing MLST/ALST. The framework's

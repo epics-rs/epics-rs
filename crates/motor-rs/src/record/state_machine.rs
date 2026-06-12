@@ -224,15 +224,17 @@ impl MotorRecord {
                 }
             } else {
                 // Close enough, RTRY disabled, or LS blocked: C maybeRetry
-                // else-branch (1084-1099) — collapse to DONE without any
+                // else-branch (1084-1102) — collapse to DONE without any
                 // sync (the lasts already equal the reached target from
-                // the dispatch-time load). MISS clears only on the
-                // close-enough/LS path (1087-1091); the rtry==0 path
-                // leaves it. DLY arms only on a real completion edge
-                // (C 1457 needs a fresh M_DMOV mark): an idle Pause
-                // convergence pass (dmov already true) finalizes quietly.
+                // the dispatch-time load). MISS clears and SPMG restores
+                // Move->Pause only on the close-enough/LS path
+                // (1087-1101); the rtry==0 path leaves both. DLY arms
+                // only on a real completion edge (C 1457 needs a fresh
+                // M_DMOV mark): an idle Pause convergence pass (dmov
+                // already true) finalizes quietly.
                 if diff < self.retry.rdbd || ls_blocks {
                     self.retry.miss = false;
+                    self.restore_spmg_move_to_pause();
                 }
                 if self.stat.dmov {
                     self.finalize_motion(&mut effects);
@@ -423,17 +425,36 @@ impl MotorRecord {
         self.internal.lval = self.pos.val;
         self.internal.ldvl = self.pos.dval;
         self.internal.lrvl = self.pos.rval;
-        // SPMG::Move one-shot: restore to Pause after completion
-        if self.ctrl.spmg == SpmgMode::Move {
-            self.ctrl.spmg = SpmgMode::Pause;
-            self.internal.lspg = SpmgMode::Pause;
-        }
+        // No SPMG Move->Pause restore here: C performs it only in
+        // maybeRetry's close-enough branch (1096-1101) — see
+        // restore_spmg_move_to_pause(). A completion that reached this
+        // point through that branch has already restored.
+        //
         // C 2540-2544: a SYNC latched during the motion consumes at the
         // completion pass (do_work runs on dmov, 1485 gate; the move
-        // block no longer fires, so the chain end is reached). After the
-        // Move->Pause restore above the gate refuses, like C's
-        // stop_or_pause return on that pass.
+        // block no longer fires, so the chain end is reached). After a
+        // maybeRetry Move->Pause restore the gate refuses, like C's
+        // stop_or_pause return on that pass; completions that keep
+        // SPMG=Move reach the chain end and apply, like C.
         self.apply_latent_sync();
+    }
+
+    /// C maybeRetry close-enough restore (motorRecord.cc:1096-1101): a
+    /// motion initiated by the SPMG "Move" one-shot reverts to Pause
+    /// when the target is reached. Only that maybeRetry branch
+    /// restores — the give-up/MISS branch leaves SPMG=Move (C keeps the
+    /// restore commented out at 1062), the rtry==0-far branch (1054)
+    /// does too, and completions that never reach maybeRetry (home,
+    /// jog, commanded stop with pp, LOAD_POS, limit collapse at
+    /// 1405-1408) never restore.
+    fn restore_spmg_move_to_pause(&mut self) {
+        if self.ctrl.spmg == SpmgMode::Move {
+            self.ctrl.spmg = SpmgMode::Pause;
+            // Keep the latent-SPMG tracker in step: the restore is not
+            // a user transition and must not replay through the
+            // Go/Stop machinery.
+            self.internal.lspg = SpmgMode::Pause;
+        }
     }
 
     /// C overtaken-target replay (motorRecord.cc:1383-1397): at a motion
@@ -597,10 +618,12 @@ impl MotorRecord {
         } else {
             // Close enough, LS-blocked, or RTRY disabled. C maybeRetry:
             // the close-enough/LS-blocked else-branch clears MISS
-            // (1083-1092); the rtry==0 branch (1054-1056) leaves it
-            // untouched — retry-disabled never latches a miss.
+            // (1083-1092) and restores SPMG Move->Pause (1096-1101); the
+            // rtry==0 branch (1054-1056) leaves both untouched —
+            // retry-disabled never latches a miss.
             if diff < self.retry.rdbd || ls_blocks_retry {
                 self.retry.miss = false;
+                self.restore_spmg_move_to_pause();
             }
             self.finalize_motion(effects);
         }

@@ -398,7 +398,17 @@ impl MotorRecord {
                         }
                     }
                 }
-                self.plan_absolute_move(&mut effects);
+                // C move-block entry (2240): `dval != ldvl || !dmov`. A
+                // same-value re-put does not re-enter the move block —
+                // notably after a retry give-up, where maybeRetry adopted
+                // the unreached target into the lasts (1067-1069) with
+                // MISS latched — the pass falls to the chain end instead
+                // (latched SYNC, implicit GET_INFO, 2540-2557).
+                if !self.stat.dmov || self.pos.dval != self.internal.ldvl {
+                    self.plan_absolute_move(&mut effects);
+                } else {
+                    self.dispatch_latent_collection(&mut effects, true);
+                }
             }
             CommandSource::Stop => {
                 self.handle_stop(&mut effects);
@@ -471,9 +481,15 @@ impl MotorRecord {
             CommandSource::Twf | CommandSource::Twr => {
                 // The fold already ran in the collection above (SET-mode
                 // redefinition included); dispatch the pending move (C
-                // move block firing on the folded val change).
+                // move block firing on the folded val change). A zero
+                // fold (TWV = 0) leaves DVAL at the lasts and the entry
+                // gate (2240) refuses like C — chain end instead.
                 if tweak_pending {
-                    self.plan_absolute_move(&mut effects);
+                    if !self.stat.dmov || self.pos.dval != self.internal.ldvl {
+                        self.plan_absolute_move(&mut effects);
+                    } else {
+                        self.dispatch_latent_collection(&mut effects, true);
+                    }
                 }
             }
             CommandSource::Spmg => {
@@ -488,8 +504,16 @@ impl MotorRecord {
             CommandSource::Set => {
                 // C: the SET-mode redefinition dispatches through the
                 // move block (2240-2263) — plan_absolute_move recomputes
-                // DIFF/RDIF and its set test routes to load_pos.
-                self.plan_absolute_move(&mut effects);
+                // DIFF/RDIF and its set test routes to load_pos. The
+                // entry gate (2240) applies first: a same-value
+                // redefinition re-put (load_pos synced the lasts at
+                // dispatch) does not re-send LOAD_POS — like C it falls
+                // to the chain end.
+                if !self.stat.dmov || self.pos.dval != self.internal.ldvl {
+                    self.plan_absolute_move(&mut effects);
+                } else {
+                    self.dispatch_latent_collection(&mut effects, true);
+                }
             }
             CommandSource::Cnen => {
                 // C: case motorRecordCNEN — only drives ENABLE/DISABL_TORQUE
@@ -1157,10 +1181,14 @@ impl MotorRecord {
             // returns inside the section, never reaching the chain end.
             let had_tweak = self.ctrl.twf || self.ctrl.twr;
             if self.collect_tweak() {
-                self.plan_absolute_move(effects);
-                return;
-            }
-            if had_tweak {
+                // C move-block entry (2240): a zero fold (TWV = 0)
+                // leaves DVAL at the lasts and the gate refuses — the
+                // pass continues to the chain end below instead.
+                if self.pos.dval != self.internal.ldvl {
+                    self.plan_absolute_move(effects);
+                    return;
+                }
+            } else if had_tweak {
                 return;
             }
         }

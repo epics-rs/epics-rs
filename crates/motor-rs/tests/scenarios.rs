@@ -986,8 +986,10 @@ fn comm_error_sets_alarm_and_safe_state() {
 fn sub_step_move_pulses_dmov() {
     let mut rec = make_record();
 
-    // Move to current position (< 1 step) -- no motor command, but DMOV pulses
-    rec.pos.dval = 0.0;
+    // Sub-step move: the target differs from the last-dispatched one
+    // (C 2240 enters via dval != ldvl) but by < 1 step -- no motor
+    // command, DMOV pulses (deliberate ophyd/bluesky deviation).
+    rec.pos.dval = 0.0004; // 0.4 steps at mres = 0.001
     rec.pos.drbv = 0.0;
     let effects = rec.plan_motion(CommandSource::Val);
     assert!(!rec.stat.dmov); // DMOV pulsed to 0
@@ -1083,7 +1085,7 @@ fn sim_motor_end_to_end() {
 /// Setting VAL to the current position must still produce a DMOV 1→0→1
 /// transition. ophyd/bluesky rely on this to detect move completion.
 #[test]
-fn move_to_same_position_pulses_dmov() {
+fn move_to_same_position_refuses_without_dmov_pulse() {
     let mut rec = make_record();
 
     rec.pos.val = 0.0;
@@ -1094,40 +1096,35 @@ fn move_to_same_position_pulses_dmov() {
     rec.stat.dmov = true;
     rec.stat.phase = MotionPhase::Idle;
 
-    // Write VAL=0 (same position) — DMOV pulses 1→0→1
+    // Write VAL=0 (same as the last-dispatched target): C do_work
+    // refuses the pass at the entry gates (motorRecord.cc:2204, 2240)
+    // — no command, no DMOV edge; the pass is pure housekeeping.
     rec.put_field("VAL", EpicsValue::Double(0.0)).unwrap();
     let effects = rec.plan_motion(CommandSource::Val);
 
-    assert!(!rec.stat.dmov, "DMOV should pulse to 0");
-    assert!(effects.commands.is_empty(), "no motor command for sub-step");
-
-    // Next process cycle restores DMOV=1
-    let _effects = rec.do_process();
-    assert!(rec.stat.dmov, "DMOV should return to 1");
+    assert!(rec.stat.dmov, "DMOV stays 1 — C refuses the pass");
+    assert!(effects.commands.is_empty(), "no motor command");
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
 }
 
-/// Same-position DMOV transition with SimMotor end-to-end.
+/// Same-position re-put after a genuinely completed move: the lasts
+/// were synced at the dispatch, so the C entry gate (2240) refuses —
+/// no command, no DMOV edge — end-to-end through the completion flow.
 #[test]
-fn sim_motor_same_position_pulses_dmov() {
+fn same_position_reput_after_completed_move_refuses() {
     let mut rec = make_record();
-    rec.pos.val = 5.0;
-    rec.pos.dval = 5.0;
-    rec.pos.rval = 5000;
-    rec.pos.rbv = 5.0;
-    rec.pos.drbv = 5.0;
-    rec.stat.dmov = true;
-    rec.stat.phase = MotionPhase::Idle;
 
-    // Write VAL=5 (same position) — DMOV pulses
     rec.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
     let effects = rec.plan_motion(CommandSource::Val);
+    assert!(!effects.commands.is_empty(), "real move dispatched");
+    complete_move(&mut rec, 5.0);
+    let _ = rec.check_completion();
+    assert!(rec.stat.dmov);
 
-    assert!(!rec.stat.dmov, "DMOV should pulse to 0");
-    assert!(effects.commands.is_empty());
-
-    let _effects = rec.do_process();
-    assert!(rec.stat.dmov, "DMOV should return to 1");
+    rec.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(rec.stat.dmov, "DMOV stays 1 — C refuses the pass");
+    assert!(effects.commands.is_empty(), "no motor command");
 }
 
 /// Sequential moves: move to multiple positions and verify each.
@@ -1187,13 +1184,13 @@ fn calibration_set_current_position_updates_offset() {
     rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
     let effects = rec.plan_motion(CommandSource::Set);
 
-    // Should issue SetPosition, not a move
+    // C 2206-2227: a FOFF=Variable redefinition is offset-only — no
+    // controller command (LOAD_POS belongs to the Frozen leg and the
+    // DVAL/RVAL paths). DVAL is untouched, so the C entry gate (2240)
+    // refuses the put pass outright.
     assert!(
-        effects
-            .commands
-            .iter()
-            .any(|c| matches!(c, MotorCommand::SetPosition { .. })),
-        "SET mode should issue SetPosition command"
+        effects.commands.is_empty(),
+        "Variable-offset SET redefinition must not send a controller command"
     );
 
     // Verify offset changed: OFF = new_val - dial = 10.0 - 0.0 = 10.0

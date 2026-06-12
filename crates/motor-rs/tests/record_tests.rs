@@ -454,6 +454,11 @@ fn test_set_dval_load_pos_pulses_dmov_and_refreshes_status() {
     rec.pos.val = 5.0;
     rec.pos.dval = 5.0;
     rec.pos.drbv = 5.0;
+    // The lasts track the established position (C: synced at the
+    // dispatch that reached 5.0) — the redefinition below must differ
+    // from them to pass the move-block entry gate (2240).
+    rec.internal.lval = 5.0;
+    rec.internal.ldvl = 5.0;
     rec.put_field("SET", EpicsValue::Short(1)).unwrap();
 
     rec.put_field("DVAL", EpicsValue::Double(0.0)).unwrap();
@@ -8724,5 +8729,155 @@ fn test_alarm_cycle_fans_out_alarm_mask_to_monitored_fields() {
         dmov_mask,
         Some(EventMask::ALARM),
         "alarm cycle posts unchanged listed fields with DBE_ALARM alone"
+    );
+}
+
+#[test]
+fn test_same_value_reput_after_miss_giveup_refuses_with_get_info() {
+    // C do_work entry gates (motorRecord.cc:2204, 2240): after a retry
+    // give-up (maybeRetry 1060-1075 adopts the unreached target into
+    // lval/ldvl/lrvl with MISS latched), a re-put of the SAME target
+    // fails `val != lval` and `dval != ldvl || !dmov` — no new move
+    // dispatches; the pass falls to the chain end and fires the
+    // implicit GET_INFO (2546-2557).
+    let mut rec = MotorRecord::new();
+    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.phase = MotionPhase::MainMove;
+    rec.stat.dmov = false;
+    rec.conv.mres = 0.001;
+    rec.retry.rdbd = 0.1;
+    rec.retry.rtry = 3;
+    rec.retry.rcnt = 3; // exhausted
+    rec.pos.val = 10.0;
+    rec.pos.dval = 10.0;
+    rec.pos.drbv = 9.5; // error 0.5 > rdbd -> give-up
+
+    let _ = rec.check_completion();
+    assert!(rec.retry.miss, "give-up latches MISS");
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.internal.ldvl, 10.0, "lasts adopt the unreached target");
+
+    // Same-value re-put: the write cascade leaves VAL/DVAL unchanged.
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(
+        effects.commands.is_empty(),
+        "C 2240: same-value re-put does not re-dispatch the move"
+    );
+    assert!(
+        rec.retry.miss,
+        "MISS stays latched (only maybeRetry clears it)"
+    );
+    assert!(rec.stat.dmov, "no DMOV pulse on the refused pass");
+    assert!(
+        effects.status_refresh,
+        "chain end fires the implicit GET_INFO"
+    );
+    assert_eq!(rec.stat.stup, 2, "STUP goes BUSY for the refresh");
+}
+
+#[test]
+fn test_new_target_after_miss_giveup_dispatches() {
+    // The give-up only adopts the OLD target into the lasts — a fresh
+    // target re-enters the move block via `dval != ldvl` (C 2240).
+    let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.phase = MotionPhase::MainMove;
+    rec.stat.dmov = false;
+    rec.conv.mres = 0.001;
+    rec.retry.rdbd = 0.1;
+    rec.retry.rtry = 3;
+    rec.retry.rcnt = 3; // exhausted
+    rec.pos.val = 10.0;
+    rec.pos.dval = 10.0;
+    rec.pos.drbv = 9.5;
+
+    let _ = rec.check_completion();
+    assert!(rec.retry.miss);
+
+    rec.pos.val = 11.0;
+    rec.pos.dval = 11.0;
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "a new target dispatches normally after the give-up"
+    );
+    assert!(!rec.stat.dmov);
+    assert_eq!(rec.stat.phase, MotionPhase::MainMove);
+}
+
+#[test]
+fn test_same_value_set_redefinition_does_not_resend_load_pos() {
+    // C 2240 sits ahead of the set test (2257-2263): load_pos synced
+    // the lasts at dispatch (3771-3817), so re-putting the same DVAL in
+    // SET mode falls to the chain end instead of re-sending LOAD_POS.
+    let mut rec = MotorRecord::new();
+    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    rec.conv.mres = 1.0;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.pos.val = 5.0;
+    rec.pos.dval = 5.0;
+    rec.pos.drbv = 5.0;
+    rec.internal.lval = 5.0;
+    rec.internal.ldvl = 5.0;
+    rec.put_field("SET", EpicsValue::Short(1)).unwrap();
+
+    rec.put_field("DVAL", EpicsValue::Double(0.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Set);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::SetPosition { .. })),
+        "first redefinition dispatches LOAD_POS"
+    );
+    let status = asyn_rs::interfaces::motor::MotorStatus {
+        position: 0.0,
+        done: true,
+        ..Default::default()
+    };
+    rec.process_motor_info(&status);
+    let _ = rec.check_completion();
+    assert!(rec.stat.dmov, "LOAD_P cycle completed");
+
+    rec.put_field("DVAL", EpicsValue::Double(0.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Set);
+    assert!(
+        effects.commands.is_empty(),
+        "no second LOAD_POS for the same value"
+    );
+    assert!(
+        effects.status_refresh,
+        "chain end fires the implicit GET_INFO"
+    );
+}
+
+#[test]
+fn test_zero_tweak_refuses_and_falls_to_chain_end() {
+    // C: the tweak fold (2167-2181) with TWV = 0 leaves VAL unchanged;
+    // the collection gate (2204) and the move-block entry (2240) both
+    // refuse, and the pass ends at the chain end (implicit GET_INFO,
+    // 2546-2557) — no move, no DMOV pulse.
+    let mut rec = MotorRecord::new();
+    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    rec.stat.msta = MstaFlags::DONE;
+    rec.conv.mres = 0.001;
+    rec.pos.val = 10.0;
+    rec.pos.dval = 10.0;
+    rec.pos.drbv = 10.0;
+    rec.internal.lval = 10.0;
+    rec.internal.ldvl = 10.0;
+    rec.ctrl.twv = 0.0;
+    rec.ctrl.twf = true;
+
+    let effects = rec.plan_motion(CommandSource::Twf);
+    assert!(effects.commands.is_empty(), "zero fold dispatches nothing");
+    assert!(rec.stat.dmov, "no DMOV pulse on the refused pass");
+    assert!(
+        effects.status_refresh,
+        "chain end fires the implicit GET_INFO"
     );
 }

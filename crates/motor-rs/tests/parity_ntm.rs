@@ -559,3 +559,44 @@ fn ntm_direction_sign_is_raw_frame_under_negative_mres() {
         effects.commands
     );
 }
+
+#[test]
+fn poll_time_wrong_direction_stops_then_retries_target() {
+    // C movn block (motorRecord.cc:1327-1342): a poll showing the axis
+    // beyond the target — raw error sign opposite CDIR, |diff| past
+    // ntmf*(|bdst|+rdbd) — stops it with pp = FALSE, so the target
+    // survives; the stop completion's maybeRetry then re-dispatches in
+    // the same pass (SPMG is Go, so do_work reaches the 2455 gate).
+    let mut rec = make_record();
+    rec.retry.rdbd = 0.1;
+    rec.retry.rtry = 5;
+
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    assert!(rec.stat.cdir);
+
+    // Poll: still moving, but the readback has run past the target.
+    motor_moving(&mut rec, 55.0);
+    let effects = rec.check_completion();
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Stop { .. })),
+        "wrong-direction poll stops the axis, got {:?}",
+        effects.commands
+    );
+    assert!(rec.stat.mip.contains(MipFlags::STOP));
+
+    // Stop completes at 55: no postProcess sync (pp = FALSE) — the
+    // target is intact and the retry re-dispatches toward it.
+    complete_move(&mut rec, 55.0);
+    let effects = rec.check_completion();
+    assert_eq!(rec.pos.dval, 50.0, "target survives the NTM stop");
+    assert!(rec.stat.mip.contains(MipFlags::RETRY));
+    assert_eq!(rec.stat.phase, MotionPhase::MainMove);
+    let MotorCommand::MoveAbsolute { position, .. } = &effects.commands[0] else {
+        panic!("expected re-dispatch, got {:?}", effects.commands);
+    };
+    assert!((*position - 50.0).abs() < 1e-9, "got {position}");
+}

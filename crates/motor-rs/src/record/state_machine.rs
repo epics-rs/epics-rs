@@ -45,6 +45,29 @@ impl MotorRecord {
             self.stat.msta.contains(MstaFlags::DONE) && !self.stat.msta.contains(MstaFlags::MOVING);
 
         if !driver_done {
+            // C movn block (1327-1342): poll-time NTM. The axis moving
+            // OPPOSITE to the commanded direction (raw-frame rounded
+            // sign vs CDIR, both refreshed by process_motor_info) beyond
+            // ntmf*(|bdst|+rdbd) while a move/retry is in flight stops
+            // it — "We're going in the wrong direction. Readback
+            // problem?". pp = FALSE (1342): the stop completion skips
+            // postProcess, so maybeRetry re-evaluates against the intact
+            // target and re-dispatches. Runs before the LVIO recompute,
+            // like C's movn block preceding enter_do_work.
+            if self.timing.ntm
+                && (self.pos.rdif >= 0) != self.stat.cdir
+                && self.pos.diff.abs()
+                    > self.timing.ntmf * (self.retry.bdst.abs() + self.retry.rdbd)
+                && self.stat.mip.intersects(MipFlags::MOVE | MipFlags::RETRY)
+                && !self.stat.mip.contains(MipFlags::STOP)
+            {
+                self.stat.mip.insert(MipFlags::STOP);
+                self.internal.pp = false;
+                effects.commands.push(MotorCommand::Stop {
+                    acceleration: self.move_accel_egu(),
+                });
+                return effects;
+            }
             // C enter_do_work (1462-1483) re-evaluates LVIO on every
             // process pass; for an in-flight motion the poll is the pass
             // where RBV changes. A rising violation outside SET mode
@@ -175,14 +198,20 @@ impl MotorRecord {
                     self.finalize_or_delay(&mut effects);
                 } else {
                     // C 1077-1082 with 1356's dmov=TRUE UNMARKed and
-                    // reversed: DMOV never posts 1 — the paused move stays
-                    // "not done" with mip = MIP_RETRY armed. The Go pass
-                    // re-fires it: the move block is entered via `!dmov`
-                    // (2240) and mip == MIP_RETRY passes the 2455 dispatch
-                    // gate; rcnt counts each paused stop against RTRY.
+                    // reversed: DMOV never posts 1 — the move stays "not
+                    // done" with mip = MIP_RETRY armed. C's maybeRetry only
+                    // arms; the SAME pass re-enters do_work, where SPMG
+                    // Stop/Pause returns at 2237 (the armed retry parks
+                    // until Go) but Go/Move reaches the 2455 dispatch gate
+                    // and re-fires immediately — the poll-time NTM stop
+                    // resumes toward the intact target this way.
                     self.retry.rcnt += 1;
                     self.stat.mip = MipFlags::RETRY;
-                    self.set_phase(MotionPhase::Idle);
+                    if self.can_accept_command() {
+                        self.plan_absolute_move(&mut effects);
+                    } else {
+                        self.set_phase(MotionPhase::Idle);
+                    }
                 }
             } else {
                 // Close enough, RTRY disabled, or LS blocked: C maybeRetry

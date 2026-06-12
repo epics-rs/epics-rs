@@ -880,6 +880,100 @@ fn noop_put_pass_fires_implicit_get_info_through_live_path() {
 }
 
 #[test]
+fn coalesced_put_and_status_split_into_two_passes() {
+    // C dbScanLock runs one pass per signal: a dbPutField pass never
+    // consumes the device callback's payload — the callback's own
+    // dbProcess (devMotorAsyn.c statusCallback 757-766) follows as a
+    // CALLBACK_DATA pass with the completion pipeline. A put racing a
+    // fresh status must not reduce the status to a readback apply.
+    use motor_rs::device_state::new_shared_state;
+
+    let state = new_shared_state();
+    state.lock().unwrap().latest_status = Some(idle_status_at(1, 0.0));
+
+    let mut rec = make_record();
+    rec.set_device_state(state.clone());
+    rec.process().unwrap(); // startup
+
+    rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+    rec.process().unwrap();
+    assert_eq!(rec.stat.phase, MotionPhase::MainMove);
+    assert!(!rec.stat.dmov);
+    state.lock().unwrap().pending_actions.take();
+
+    // The done status and a CNEN put land before the next pass.
+    state.lock().unwrap().latest_status = Some(idle_status_at(2, 10.0));
+    rec.put_field("CNEN", EpicsValue::Short(1)).unwrap();
+    rec.process().unwrap(); // the put's pass
+    assert_eq!(rec.pos.rbv, 0.0, "put pass leaves the status unconsumed");
+    assert_eq!(
+        rec.stat.phase,
+        MotionPhase::MainMove,
+        "completion is not swallowed by the put pass"
+    );
+    assert!(!rec.stat.dmov);
+
+    rec.process().unwrap(); // the status's own pass (its io_intr pulse)
+    assert_eq!(rec.pos.rbv, 10.0);
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert!(rec.stat.dmov);
+}
+
+#[test]
+fn coalesced_put_and_delay_expiry_keeps_watchdog() {
+    // The settle-delay timer is one-shot (poll_loop::spawn_delay): an
+    // expiry consumed by a put-owned pass has no second chance, and
+    // ScheduleDelay idled the poll loop — the record would wedge with
+    // DMOV low. The expiry must survive the put pass and run its own.
+    use motor_rs::device_state::new_shared_state;
+
+    let state = new_shared_state();
+    state.lock().unwrap().latest_status = Some(idle_status_at(1, 0.0));
+
+    let mut rec = make_record();
+    rec.timing.dly = 0.5;
+    rec.set_device_state(state.clone());
+    rec.process().unwrap(); // startup
+
+    rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+    rec.process().unwrap();
+    state.lock().unwrap().pending_actions.take();
+
+    // The move completes: DLY schedules the settle watchdog.
+    state.lock().unwrap().latest_status = Some(idle_status_at(2, 10.0));
+    rec.process().unwrap();
+    assert_eq!(rec.stat.phase, MotionPhase::DelayWait);
+    assert!(rec.stat.mip.contains(MipFlags::DELAY_REQ));
+    let actions = state.lock().unwrap().pending_actions.take().unwrap();
+    let delay = actions.schedule_delay.expect("watchdog armed");
+
+    // The timer fires while a CNEN put is pending: coalesced signals.
+    state.lock().unwrap().expired_delay_id = Some(delay.id);
+    rec.put_field("CNEN", EpicsValue::Short(1)).unwrap();
+    rec.process().unwrap(); // the put's pass
+    assert!(
+        rec.stat.mip.contains(MipFlags::DELAY_REQ),
+        "watchdog still armed after the put pass"
+    );
+    assert!(!rec.stat.mip.contains(MipFlags::DELAY_ACK));
+    assert!(
+        state.lock().unwrap().expired_delay_id.is_some(),
+        "expiry not consumed by the put pass"
+    );
+
+    rec.process().unwrap(); // the expiry's own pass
+    assert!(rec.stat.mip.contains(MipFlags::DELAY_ACK));
+    let actions = state.lock().unwrap().pending_actions.take().unwrap();
+    assert!(actions.status_refresh, "DELAY_ACK requests the fresh poll");
+
+    // The fresh poll finalizes the motion.
+    state.lock().unwrap().latest_status = Some(idle_status_at(3, 10.0));
+    rec.process().unwrap();
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+}
+
+#[test]
 fn comm_error_sets_alarm_and_safe_state() {
     let mut rec = make_record();
 

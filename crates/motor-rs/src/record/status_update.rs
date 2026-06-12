@@ -3,6 +3,18 @@ use super::*;
 impl MotorRecord {
     /// Determine the event for this process cycle by reading shared device state.
     pub(crate) fn determine_event(&mut self) -> Option<MotorEvent> {
+        // C dbScanLock serializes one pass per signal: a dbPutField pass
+        // never consumes the device callback's payload — the callback's
+        // own dbProcess (devMotorAsyn.c statusCallback 757-766, delay
+        // callbackFunc) follows with a CALLBACK_DATA pass. When a
+        // put-side signal owns this pass (last_write, or the resolution
+        // re-anchor mark a pp(TRUE) MRES-family put parked), leave the
+        // mailbox untouched — no status consume, no STUP ack, no delay
+        // take. The io_intr pulse that announced a pending status or
+        // delay expiry is already queued and triggers its own pass.
+        if self.last_write.is_some() || self.internal.res_reanchor {
+            return None;
+        }
         // Extract data from shared state, then drop the lock before mutating self
         let (delay_id, new_status) = {
             let state = self.device_state.as_ref()?;

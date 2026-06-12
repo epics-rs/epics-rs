@@ -2030,22 +2030,21 @@ impl MotorRecord {
             return effects;
         }
 
-        let event = self.pending_event.take();
-        let src = self.last_write.take();
-
-        // User write takes priority: if a field was put while a poll
-        // update arrived, handle the write first. The poll status was
-        // already applied in determine_event() for Idle phase.
-        if let Some(src) = src {
-            // If there was also a DeviceUpdate, apply it first so
-            // plan_motion sees the latest readback.
-            if let Some(MotorEvent::DeviceUpdate(status)) = &event {
-                self.process_motor_info(status);
-            }
+        // C dbScanLock: one signal owns one pass. A put-owned pass
+        // consumes only last_write — pending_event stays untouched for
+        // the pass its io_intr pulse triggers, so a coalesced device
+        // update keeps its completion pipeline and a coalesced
+        // DelayExpired keeps the settle watchdog (a dropped expiry has
+        // no second timer; with the poll loop idled by ScheduleDelay it
+        // wedged DMOV low for good). determine_event defers the mailbox
+        // consume while a put is pending, so the two cannot co-occur on
+        // the live path; not taking the event here keeps the invariant
+        // for directly injected events too.
+        if let Some(src) = self.last_write.take() {
             return self.plan_motion(src);
         }
 
-        match event {
+        match self.pending_event.take() {
             Some(MotorEvent::Startup) => {
                 // C init_record (motorRecord.cc:687-733): the first device
                 // readback runs process_motor_info(initcall), the RSTM

@@ -223,8 +223,11 @@ impl Record for MotorRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        // If wired to device state, determine event from shared mailbox
-        if self.device_state.is_some() {
+        // If wired to device state, determine event from shared mailbox.
+        // An event that survived a put-owned pass is a still-pending
+        // signal: this pass consumes it before pulling a new one from
+        // the mailbox (one signal, one pass — never overwrite).
+        if self.pending_event.is_none() && self.device_state.is_some() {
             if let Some(event) = self.determine_event() {
                 self.pending_event = Some(event);
             }

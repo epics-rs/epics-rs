@@ -1844,6 +1844,75 @@ fn test_go_resume_dispatch_consumes_pass_no_get_info() {
 }
 
 #[test]
+fn test_put_pass_leaves_injected_device_update_pending() {
+    use asyn_rs::interfaces::motor::MotorStatus;
+    // One signal, one pass (C dbScanLock): a put-owned pass must not
+    // consume a coalesced DeviceUpdate — the update keeps its
+    // completion pipeline on the following pass instead of being
+    // reduced to a readback apply.
+    let mut rec = MotorRecord::new();
+    rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+    rec.do_process();
+    assert_eq!(rec.stat.phase, MotionPhase::MainMove);
+
+    let done = MotorStatus {
+        position: 10.0,
+        encoder_position: 10.0,
+        done: true,
+        ..Default::default()
+    };
+    rec.put_field("CNEN", EpicsValue::Short(1)).unwrap();
+    rec.set_event(MotorEvent::DeviceUpdate(done));
+    rec.do_process(); // the put's pass
+    assert_eq!(
+        rec.stat.phase,
+        MotionPhase::MainMove,
+        "completion not consumed by the put pass"
+    );
+    assert!(!rec.stat.dmov);
+
+    rec.do_process(); // the update's own pass
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert!(rec.stat.dmov);
+}
+
+#[test]
+fn test_put_pass_leaves_delay_expiry_pending() {
+    use asyn_rs::interfaces::motor::MotorStatus;
+    // A DelayExpired coalesced with a put must survive the put pass:
+    // the settle watchdog timer is one-shot, so consuming it without
+    // acting would leave DELAY_REQ armed forever.
+    let mut rec = MotorRecord::new();
+    rec.timing.dly = 0.5;
+    rec.pos.dval = 10.0;
+    rec.plan_motion(CommandSource::Val);
+
+    let done = MotorStatus {
+        position: 10.0,
+        encoder_position: 10.0,
+        done: true,
+        ..Default::default()
+    };
+    rec.process_motor_info(&done);
+    rec.check_completion();
+    assert_eq!(rec.stat.phase, MotionPhase::DelayWait);
+    assert!(rec.stat.mip.contains(MipFlags::DELAY_REQ));
+
+    rec.put_field("CNEN", EpicsValue::Short(1)).unwrap();
+    rec.set_event(MotorEvent::DelayExpired);
+    rec.do_process(); // the put's pass
+    assert!(
+        rec.stat.mip.contains(MipFlags::DELAY_REQ),
+        "watchdog survives the put pass"
+    );
+    assert!(!rec.stat.mip.contains(MipFlags::DELAY_ACK));
+
+    let effects = rec.do_process(); // the expiry's own pass
+    assert!(rec.stat.mip.contains(MipFlags::DELAY_ACK));
+    assert!(effects.status_refresh);
+}
+
+#[test]
 fn test_closed_loop_button_put_fires_implicit_get_info() {
     // C 1994-2007: the closed-loop else bypasses only the collection
     // sections (2008-2198); the pass still falls through to the chain

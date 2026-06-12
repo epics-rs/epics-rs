@@ -4244,3 +4244,68 @@ fn test_commanded_jog_stop_still_corrects_backlash() {
         "commanded jog stop dispatches the backlash correction"
     );
 }
+
+// --- LVIO re-evaluation on the write pass (C 1462-1483 + pp(TRUE) limits) ---
+
+#[test]
+fn test_hlm_put_during_jog_stops_on_write_pass() {
+    // HLM/LLM/DHLM/DLLM are pp(TRUE) in C: lowering a limit onto a
+    // running jog processes the record, the enter_do_work re-evaluation
+    // trips and the same pass stops the axis — no poll round-trip.
+    let mut rec = jogging_record(); // HLM=100, LLM=-100, JVEL=1, jogging fwd
+    rec.pos.rbv = 50.0;
+    rec.pos.drbv = 50.0;
+
+    // Lower HLM to 50.5: rbv > hlm - jvel immediately.
+    rec.put_field("HLM", EpicsValue::Double(50.5)).unwrap();
+    // The put sets no last_write — the framework's process pass lands in
+    // the no-event arm.
+    let _ = rec.do_process();
+    assert!(rec.limits.lvio, "write pass raised LVIO");
+    assert_eq!(rec.stat.mip, MipFlags::STOP, "write pass stopped the axis");
+    assert!(!rec.ctrl.jogf, "buttons released");
+}
+
+#[test]
+fn test_lvio_recompute_runs_on_command_pass_during_jog() {
+    // C runs the same re-evaluation before do_work on every
+    // put-processing pass: a VAL write landing while the jog has run
+    // into the limit window stops the axis instead of dispatching.
+    let mut rec = jogging_record();
+    rec.pos.rbv = 99.5; // already inside the violation window
+    rec.pos.drbv = 99.5;
+
+    rec.put_field("VAL", EpicsValue::Double(20.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(rec.limits.lvio);
+    assert_eq!(rec.stat.mip, MipFlags::STOP);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Stop { .. })),
+        "the pass stops instead of dispatching the write"
+    );
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "no move dispatched on the stop pass"
+    );
+}
+
+#[test]
+fn test_hlm_put_while_idle_does_not_stop() {
+    // Boundary: the same put while idle preserves the latch (mip empty
+    // -> C else-branch) and sends nothing.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+    rec.pos.rbv = 50.0;
+    rec.pos.drbv = 50.0;
+    rec.put_field("HLM", EpicsValue::Double(50.5)).unwrap();
+    let effects = rec.do_process();
+    assert!(effects.commands.is_empty());
+    assert_eq!(rec.stat.mip, MipFlags::empty());
+}

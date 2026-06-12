@@ -11,6 +11,15 @@ impl MotorRecord {
         self.internal.dmov_notified = false;
         let mut effects = ProcessEffects::default();
 
+        // C enter_do_work (1462-1483) re-evaluates LVIO on EVERY process
+        // pass before do_work — including put-processing passes, since
+        // HLM/LLM/DHLM/DLLM are pp(TRUE). A rising violation sets
+        // stop = 1 (1480), which the latent-stop gate below consumes in
+        // this same pass, exactly like C's do_work stop branch.
+        if self.recompute_lvio_during_motion() {
+            self.ctrl.stop = true;
+        }
+
         // C do_work evaluates `pmr->stop` and `spmg != lspg` at the TOP
         // of every put-processing pass, before any other work
         // (motorRecord.cc:1855-1932). A latent stop or SPMG change — a
@@ -1381,6 +1390,17 @@ impl MotorRecord {
                 effects
             }
             None => {
+                // A pass with no command source and no device event — in
+                // the live IOC this is the process cycle a put to a field
+                // that sets no last_write triggers (HLM/LLM/DHLM/DLLM are
+                // pp(TRUE) in C). C still runs the enter_do_work LVIO
+                // re-evaluation (1462-1483) on it: a limit lowered onto a
+                // running jog must stop the axis on the write pass.
+                if self.recompute_lvio_during_motion() {
+                    let mut effects = ProcessEffects::default();
+                    self.stop_axis(&mut effects);
+                    return effects;
+                }
                 // C: ea063f5f — an externally initiated move is flagged by
                 // process_motor_info() during the Idle-phase readback, which
                 // determine_event() reports as no event. The completion

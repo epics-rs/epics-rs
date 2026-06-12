@@ -372,7 +372,7 @@ impl MotorRecord {
     /// outside SET mode (`!set && !igset`, 1478) — C sets stop = 1 and
     /// clear_buttons() (1480-1482); the caller routes that through
     /// stop_axis, whose in-motion branch clears the same four buttons.
-    fn recompute_lvio_during_motion(&mut self) -> bool {
+    pub(super) fn recompute_lvio_during_motion(&mut self) -> bool {
         let old_lvio = self.limits.lvio;
         if self.limits.dhlm == self.limits.dllm && self.limits.dllm == 0.0 {
             self.limits.lvio = false;

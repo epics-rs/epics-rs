@@ -46,7 +46,11 @@ fn rmod_default_retry_moves_to_original_target() {
     complete_move(&mut rec, 9.0);
     let effects = rec.check_completion();
 
-    assert_eq!(rec.stat.phase, MotionPhase::Retry);
+    assert_eq!(rec.stat.phase, MotionPhase::MainMove);
+    assert!(
+        rec.stat.mip.contains(MipFlags::RETRY),
+        "retry marked in MIP"
+    );
     assert_eq!(rec.retry.rcnt, 1);
     // C Default: retry moves to the original target position (dval)
     if let MotorCommand::MoveAbsolute { position, .. } = &effects.commands[0] {
@@ -70,7 +74,11 @@ fn rmod_arithmetic_retry() {
     complete_move(&mut rec, 9.0);
     let effects = rec.check_completion();
 
-    assert_eq!(rec.stat.phase, MotionPhase::Retry);
+    assert_eq!(rec.stat.phase, MotionPhase::MainMove);
+    assert!(
+        rec.stat.mip.contains(MipFlags::RETRY),
+        "retry marked in MIP"
+    );
     // C absolute (use_rel=false) retry: position = dval, regardless of RMOD.
     if let MotorCommand::MoveAbsolute { position, .. } = &effects.commands[0] {
         assert!((*position - 10.0).abs() < 1e-10);
@@ -98,7 +106,11 @@ fn rmod_arithmetic_absolute_retry_targets_dval_for_rcnt_ge_2() {
     complete_move(&mut rec, 9.0); // error 1.0 > rdbd
     let effects = rec.check_completion();
 
-    assert_eq!(rec.stat.phase, MotionPhase::Retry);
+    assert_eq!(rec.stat.phase, MotionPhase::MainMove);
+    assert!(
+        rec.stat.mip.contains(MipFlags::RETRY),
+        "retry marked in MIP"
+    );
     assert_eq!(rec.retry.rcnt, 2); // factor = (5-2+1)/5 = 0.8 < 1
     if let MotorCommand::MoveAbsolute { position, .. } = &effects.commands[0] {
         // Old (buggy) behaviour scaled this to 9.84; C parity is dval = 10.0.
@@ -121,7 +133,11 @@ fn rmod_geometric_retry() {
     complete_move(&mut rec, 9.0);
     let effects = rec.check_completion();
 
-    assert_eq!(rec.stat.phase, MotionPhase::Retry);
+    assert_eq!(rec.stat.phase, MotionPhase::MainMove);
+    assert!(
+        rec.stat.mip.contains(MipFlags::RETRY),
+        "retry marked in MIP"
+    );
     // Geometric: target = dval
     if let MotorCommand::MoveAbsolute { position, .. } = &effects.commands[0] {
         assert!((*position - 10.0).abs() < 1e-10);
@@ -218,11 +234,11 @@ fn retry_fires_when_diff_exactly_equals_rdbd() {
     let effects = rec.check_completion();
 
     // C `>=`: at the boundary the axis retries.
-    assert_eq!(
-        rec.stat.phase,
-        MotionPhase::Retry,
+    assert!(
+        rec.stat.mip.contains(MipFlags::RETRY),
         "diff == rdbd must trigger a retry (C uses >=)"
     );
+    assert_eq!(rec.stat.phase, MotionPhase::MainMove);
     assert_eq!(rec.retry.rcnt, 1);
     assert_eq!(effects.commands.len(), 1, "retry must emit a move command");
 }
@@ -301,7 +317,76 @@ fn spdb_vs_rdbd_are_independent() {
     let effects = rec.check_completion();
 
     // Should still retry (RDBD controls retry, not SPDB)
-    assert_eq!(rec.stat.phase, MotionPhase::Retry);
+    assert_eq!(rec.stat.phase, MotionPhase::MainMove);
+    assert!(
+        rec.stat.mip.contains(MipFlags::RETRY),
+        "retry marked in MIP"
+    );
     assert_eq!(rec.retry.rcnt, 1);
     assert!(!effects.commands.is_empty());
+}
+
+#[test]
+fn rmod_geometric_use_rel_scales_and_floors_relative_leg() {
+    // C 2370-2383: a use_rel retry scales relpos by 1/2^(rcnt-1) and
+    // floors the scaled leg at one raw step. mres=0.1, remaining error
+    // 0.3 EGU, rcnt 4→5: factor 1/16 gives 0.01875 EGU = 0.1875 steps,
+    // floored to 1 step = 0.1 EGU.
+    let mut rec = make_record();
+    rec.conv.mres = 0.1;
+    rec.conv.ueip = true; // → use_rel
+    rec.retry.rdbd = 0.1;
+    rec.retry.rtry = 10;
+    rec.retry.frac = 1.0;
+    rec.retry.rmod = RetryMode::Geometric;
+
+    rec.pos.dval = 10.0;
+    rec.plan_motion(CommandSource::Val);
+    rec.retry.rcnt = 4; // four retries already counted
+
+    complete_move(&mut rec, 9.7); // step-aligned; diff = 0.3 >= rdbd
+    let effects = rec.check_completion();
+
+    assert_eq!(rec.retry.rcnt, 5);
+    assert!(rec.stat.mip.contains(MipFlags::RETRY));
+    let dist = effects.commands.iter().find_map(|c| match c {
+        MotorCommand::MoveRelative { distance, .. } => Some(*distance),
+        _ => None,
+    });
+    let dist = dist.expect("use_rel retry emits MoveRelative");
+    assert!(
+        (dist - 0.1).abs() < 1e-9,
+        "scaled leg floored at one step (0.1 EGU), got {dist}"
+    );
+}
+
+#[test]
+fn rmod_arithmetic_use_rel_scales_relative_leg() {
+    // C 2358-2368: arithmetic retry scales relpos by (rtry-rcnt+1)/rtry.
+    // rtry=5, rcnt 1→2: factor (5-2+1)/5 = 0.8; relpos = 1.0 EGU → 0.8.
+    let mut rec = make_record();
+    rec.conv.mres = 0.001;
+    rec.conv.ueip = true;
+    rec.retry.rdbd = 0.01;
+    rec.retry.rtry = 5;
+    rec.retry.frac = 1.0;
+    rec.retry.rmod = RetryMode::Arithmetic;
+
+    rec.pos.dval = 10.0;
+    rec.plan_motion(CommandSource::Val);
+    rec.retry.rcnt = 1;
+
+    complete_move(&mut rec, 9.0); // diff = 1.0
+    let effects = rec.check_completion();
+
+    assert_eq!(rec.retry.rcnt, 2);
+    let dist = effects.commands.iter().find_map(|c| match c {
+        MotorCommand::MoveRelative { distance, .. } => Some(*distance),
+        _ => None,
+    });
+    let dist = dist.expect("use_rel retry emits MoveRelative");
+    assert!(
+        (dist - 0.8).abs() < 1e-9,
+        "arithmetic factor 0.8 scales the leg, got {dist}"
+    );
 }

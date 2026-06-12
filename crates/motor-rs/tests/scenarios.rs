@@ -203,7 +203,11 @@ fn retry_reissues_move_when_error_exceeds_rdbd() {
     complete_move(&mut rec, 9.95); // error=0.05 > rdbd=0.01
     let effects = rec.check_completion();
 
-    assert_eq!(rec.stat.phase, MotionPhase::Retry);
+    assert_eq!(rec.stat.phase, MotionPhase::MainMove);
+    assert!(
+        rec.stat.mip.contains(MipFlags::RETRY),
+        "retry marked in MIP"
+    );
     assert_eq!(rec.retry.rcnt, 1);
     assert!(!rec.retry.miss);
     assert!(matches!(

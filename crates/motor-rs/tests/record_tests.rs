@@ -393,7 +393,11 @@ fn test_retry_on_position_error() {
     rec.pos.drbv = 9.5; // error = 0.5 > rdbd
 
     let effects = rec.check_completion();
-    assert_eq!(rec.stat.phase, MotionPhase::Retry);
+    assert_eq!(rec.stat.phase, MotionPhase::MainMove);
+    assert!(
+        rec.stat.mip.contains(MipFlags::RETRY),
+        "retry marked in MIP"
+    );
     assert_eq!(rec.retry.rcnt, 1);
     assert!(!effects.commands.is_empty());
 }
@@ -852,7 +856,9 @@ fn test_stop_during_retry_finalizes_immediately_without_sync() {
     // done at once (mip=MIP_DONE, dmov=TRUE) WITHOUT a readback sync —
     // the drive fields keep the user target.
     let mut rec = MotorRecord::new();
-    rec.stat.phase = MotionPhase::Retry;
+    // Armed-but-undispatched retry (paused): mip = MIP_RETRY with the
+    // axis at rest. An in-flight retry would be MainMove + RETRY|MOVE.
+    rec.stat.phase = MotionPhase::Idle;
     rec.stat.mip = MipFlags::RETRY;
     rec.stat.dmov = false;
     rec.pos.val = 50.0;
@@ -1715,7 +1721,11 @@ fn test_retry_when_diff_exceeds_rdbd() {
     rec.pos.drbv = 9.0; // diff == 1.0 > rdbd
 
     rec.check_completion();
-    assert_eq!(rec.stat.phase, MotionPhase::Retry);
+    assert_eq!(rec.stat.phase, MotionPhase::MainMove);
+    assert!(
+        rec.stat.mip.contains(MipFlags::RETRY),
+        "retry marked in MIP"
+    );
     assert_eq!(rec.retry.rcnt, 1);
 }
 
@@ -5587,7 +5597,11 @@ mod miss_semantics {
         rec.retry.rtry = 3;
         rec.retry.miss = true;
         rec.check_completion();
-        assert_eq!(rec.stat.phase, MotionPhase::Retry);
+        assert_eq!(rec.stat.phase, MotionPhase::MainMove);
+        assert!(
+            rec.stat.mip.contains(MipFlags::RETRY),
+            "retry marked in MIP"
+        );
         assert_eq!(rec.retry.rcnt, 1);
         assert!(
             rec.retry.miss,

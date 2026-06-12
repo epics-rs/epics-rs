@@ -367,14 +367,26 @@ fn backlash_then_retry_on_position_error() {
     complete_move(&mut rec, -9.9); // error=0.1 > rdbd=0.05
     let effects = rec.check_completion();
 
-    // Should enter retry
-    assert_eq!(rec.stat.phase, MotionPhase::Retry);
+    // Retry replays the full move block (C: maybeRetry arms MIP_RETRY,
+    // do_work re-dispatches with mip |= MIP_MOVE at 2461): the retry of
+    // dval == ldvl with BDST > 0 is non-preferred (C 2391-2395), so it
+    // re-runs the backlash sequence starting at the pretarget.
+    assert_eq!(rec.stat.phase, MotionPhase::MainMove);
+    assert!(
+        rec.stat.mip.contains(MipFlags::RETRY),
+        "retry marked in MIP"
+    );
+    assert!(rec.stat.mip.contains(MipFlags::MOVE));
     assert_eq!(rec.retry.rcnt, 1);
-    assert!(rec.stat.mip.contains(MipFlags::RETRY));
-    assert!(matches!(
-        effects.commands[0],
-        MotorCommand::MoveAbsolute { .. }
-    ));
+    assert!(rec.internal.backlash_pending);
+    if let MotorCommand::MoveAbsolute { position, .. } = &effects.commands[0] {
+        assert!(
+            (*position - (-11.0)).abs() < 1e-10,
+            "retry with backlash dispatches to the pretarget, got {position}"
+        );
+    } else {
+        panic!("expected MoveAbsolute, got {:?}", effects.commands);
+    }
 }
 
 #[test]

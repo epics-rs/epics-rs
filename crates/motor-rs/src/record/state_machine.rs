@@ -507,34 +507,17 @@ impl MotorRecord {
                 return;
             }
 
+            // C maybeRetry 1077-1082 only arms the retry (mip = MIP_RETRY,
+            // dmov = FALSE); the next do_work pass re-enters the FULL move
+            // block — entry via !dmov (2240), dispatch gate via MIP_RETRY
+            // (2455) — so RMOD scaling with its one-step floors, the
+            // retry-deadband too_small suppression, LVIO, and the
+            // three-case backlash dispatch all re-run for the retry.
+            // Routing through plan_absolute_move replays that block; its
+            // dispatch keeps the RETRY bit (C 2461 mip |= MIP_MOVE).
             self.retry.rcnt += 1;
-            self.set_phase(MotionPhase::Retry);
             self.stat.mip = MipFlags::RETRY;
-
-            let frac = self.retry.frac;
-            if self.use_relative_moves() {
-                // C use_rel retry: position = relpos * frac, where relpos is
-                // the RMOD-scaled remaining distance (compute_retry_target).
-                let retry_target = self.compute_retry_target();
-                let rel_distance = (retry_target - self.pos.drbv) * frac;
-                effects.commands.push(MotorCommand::MoveRelative {
-                    distance: rel_distance,
-                    velocity: self.vel.velo,
-                    acceleration: self.move_accel_egu(),
-                });
-            } else {
-                // C absolute retry: position = currpos + frac*(newpos-currpos)
-                // with currpos = ldvl/mres and newpos = dval/mres. The prior
-                // move's load_pos set ldvl = dval, so currpos == newpos and
-                // position collapses to dval. RMOD scaling never reaches the
-                // absolute path in C — it only scales relpos (use_rel).
-                effects.commands.push(MotorCommand::MoveAbsolute {
-                    position: self.pos.dval,
-                    velocity: self.vel.velo,
-                    acceleration: self.move_accel_egu(),
-                });
-            }
-            effects.request_poll = true;
+            self.plan_absolute_move(effects);
         } else {
             // Close enough, LS-blocked, or RTRY disabled. C maybeRetry:
             // the close-enough/LS-blocked else-branch clears MISS
@@ -544,41 +527,6 @@ impl MotorRecord {
                 self.retry.miss = false;
             }
             self.finalize_motion(effects);
-        }
-    }
-
-    /// Compute retry target based on retry mode.
-    /// Matches C motorRecord.cc do_work() retry logic.
-    fn compute_retry_target(&self) -> f64 {
-        match self.retry.rmod {
-            RetryMode::Default => {
-                // C default: move to the original target position (dval)
-                self.pos.dval
-            }
-            RetryMode::Arithmetic => {
-                // C: relpos *= (rtry - rcnt + 1) / rtry
-                // relpos is the remaining distance from current position to target
-                let relpos = self.pos.dval - self.pos.drbv;
-                let rtry = self.retry.rtry as f64;
-                let rcnt = self.retry.rcnt as f64;
-                let factor = if rtry > 0.0 {
-                    (rtry - rcnt + 1.0) / rtry
-                } else {
-                    1.0
-                };
-                self.pos.drbv + relpos * factor
-            }
-            RetryMode::Geometric => {
-                // C: relpos *= 1 / (2 ^ (rcnt - 1))
-                let relpos = self.pos.dval - self.pos.drbv;
-                let power = (self.retry.rcnt - 1).max(0) as u32;
-                let factor = 1.0 / (2.0_f64.powi(power as i32));
-                self.pos.drbv + relpos * factor
-            }
-            RetryMode::InPosition => {
-                // InPosition: don't reissue move, just wait for driver
-                self.pos.dval
-            }
         }
     }
 

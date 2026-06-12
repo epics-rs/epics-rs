@@ -485,12 +485,48 @@ impl MotorRecord {
         // C compares BVEL/VELO and BACC/ACCL with exact == (2487-2488).
         let preferred = self.is_preferred_direction(self.pos.dval, self.pos.drbv);
         let same_vel = self.vel.bvel == self.vel.velo && self.vel.bacc == self.vel.accl;
-        let within_range = if self.use_relative_moves() {
-            // C 2493: relbpos in (signed-MRES) steps against one step.
-            let relbpos = (Self::compute_backlash_pretarget(self.pos.dval, self.retry.bdst)
-                - self.pos.drbv)
-                / self.conv.mres;
-            (self.retry.bdst >= 0.0 && relbpos <= 1.0) || (self.retry.bdst < 0.0 && relbpos >= 1.0)
+        let use_rel = self.use_relative_moves();
+
+        // C 2280-2281: the relative legs measure from DRBV. A RETRY
+        // dispatch RMOD-scales both — arithmetic (rtry-rcnt+1)/rtry
+        // (2358-2368) or geometric 1/2^(rcnt-1) (2370-2383) — and each
+        // scaled leg is floored at one raw step (the ±1 clamps). RMOD_D
+        // scales nothing and has no floor; non-retry dispatches are
+        // untouched. The clamp works in signed-MRES steps like C.
+        let mut relpos = self.pos.dval - self.pos.drbv;
+        let mut relbpos =
+            Self::compute_backlash_pretarget(self.pos.dval, self.retry.bdst) - self.pos.drbv;
+        if self.stat.mip.contains(MipFlags::RETRY) {
+            let factor = match self.retry.rmod {
+                RetryMode::Arithmetic => {
+                    let rtry = f64::from(self.retry.rtry);
+                    Some((rtry - f64::from(self.retry.rcnt) + 1.0) / rtry)
+                }
+                RetryMode::Geometric => Some(1.0 / 2.0_f64.powi(i32::from(self.retry.rcnt) - 1)),
+                _ => None,
+            };
+            if let Some(factor) = factor {
+                let mres = self.conv.mres;
+                let scale_and_floor = |egu: f64| {
+                    let steps = egu * factor / mres;
+                    let steps = if steps.abs() < 1.0 {
+                        if steps > 0.0 { 1.0 } else { -1.0 }
+                    } else {
+                        steps
+                    };
+                    steps * mres
+                };
+                relpos = scale_and_floor(relpos);
+                relbpos = scale_and_floor(relbpos);
+            }
+        }
+
+        let within_range = if use_rel {
+            // C 2493: relbpos in (signed-MRES) steps against one step —
+            // the RMOD-scaled value, since C scales before the dispatch.
+            let relbpos_steps = relbpos / self.conv.mres;
+            (self.retry.bdst >= 0.0 && relbpos_steps <= 1.0)
+                || (self.retry.bdst < 0.0 && relbpos_steps >= 1.0)
         } else {
             // C 2284/2496: |newpos - currpos| <= rbdst1, with
             // rbdst1 = 1 + |bdst|/|mres| steps and currpos = LDVL —
@@ -557,8 +593,15 @@ impl MotorRecord {
             self.pos.diff < 0.0
         };
 
-        // Set MIP and phase
+        // Set MIP and phase. C 2461 is `mip |= MIP_MOVE` behind the
+        // `mip == MIP_DONE || mip == MIP_RETRY` gate (2455): the RETRY
+        // bit survives into the in-flight move, keeping the dispatch
+        // marked as a retry (the AJF readback-link retry-count fix).
+        let is_retry = self.stat.mip.contains(MipFlags::RETRY);
         self.stat.mip = MipFlags::MOVE;
+        if is_retry {
+            self.stat.mip.insert(MipFlags::RETRY);
+        }
         self.set_phase(MotionPhase::MainMove);
         self.internal.backlash_pending = backlash;
         // C 2523: a move that will need a backlash correction arms pp
@@ -569,9 +612,7 @@ impl MotorRecord {
             self.internal.pp = true;
         }
 
-        let use_rel = self.use_relative_moves();
         let frac = self.retry.frac;
-        let position_error = self.pos.dval - self.pos.drbv;
         // C 2268: currpos ("where we are") is LDVL — the previously
         // dispatched target, NOT the readback. The absolute FRAC dispatch
         // (2488/2513) walks from the previous target toward the new one:
@@ -591,20 +632,22 @@ impl MotorRecord {
         if backlash {
             // Case 3 (C 2518-2524): first leg to the pretarget at slew
             // speed, no FRAC; the final approach runs from postprocess.
+            // The relative leg is the (RMOD-scaled) relbpos.
             self.emit_move(
                 effects,
                 use_rel,
-                move_target - self.pos.drbv,
+                relbpos,
                 move_target,
                 self.vel.velo,
                 self.move_accel_egu(),
             );
         } else if single_leg_slew {
-            // Case 1 (C 2479-2489): one leg at slew speed, FRAC applied.
+            // Case 1 (C 2479-2489): one leg at slew speed; FRAC scales
+            // the (RMOD-scaled) relpos (2487-2488).
             self.emit_move(
                 effects,
                 use_rel,
-                position_error * frac,
+                relpos * frac,
                 currpos + frac * (self.pos.dval - currpos),
                 self.vel.velo,
                 self.move_accel_egu(),
@@ -614,7 +657,7 @@ impl MotorRecord {
             self.emit_move(
                 effects,
                 use_rel,
-                position_error * frac,
+                relpos * frac,
                 currpos + frac * (self.pos.dval - currpos),
                 self.vel.bvel,
                 self.backlash_accel_egu(),

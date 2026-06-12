@@ -260,7 +260,11 @@ fn retarget_during_retry_resets_rcnt() {
     // Enter retry
     complete_move(&mut rec, 9.5);
     rec.check_completion();
-    assert_eq!(rec.stat.phase, MotionPhase::Retry);
+    assert_eq!(rec.stat.phase, MotionPhase::MainMove);
+    assert!(
+        rec.stat.mip.contains(MipFlags::RETRY),
+        "retry marked in MIP"
+    );
     assert_eq!(rec.retry.rcnt, 1);
 
     // Motor retrying
@@ -339,7 +343,9 @@ fn spmg_pause_preserves_target_and_resumes_on_go() {
     assert_eq!(rec.retry.rcnt, 1); // C: each paused stop counts a retry
 
     // Go: the move-block pass (2241) re-fires on !dmov toward the
-    // preserved DVAL, keeping the retry count (C 2351-2356).
+    // preserved DVAL, keeping the retry count (C 2351-2356). C's Go arm
+    // (1912-1926) leaves mip == MIP_RETRY untouched, so the dispatch
+    // (2461 mip |= MIP_MOVE) resumes as a marked retry.
     rec.ctrl.spmg = SpmgMode::Go;
     let effects = rec.plan_motion(CommandSource::Spmg);
     assert_eq!(effects.commands.len(), 1);
@@ -347,7 +353,7 @@ fn spmg_pause_preserves_target_and_resumes_on_go() {
         effects.commands[0],
         MotorCommand::MoveAbsolute { position, .. } if (position - 50.0).abs() < 1e-9
     ));
-    assert_eq!(rec.stat.mip, MipFlags::MOVE);
+    assert_eq!(rec.stat.mip, MipFlags::MOVE | MipFlags::RETRY);
     assert_eq!(rec.retry.rcnt, 1);
 
     // The resumed move completes at the target.

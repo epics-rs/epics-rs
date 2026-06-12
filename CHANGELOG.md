@@ -1,5 +1,82 @@
 # Changelog
 
+## v0.20.0 — 2026-06-13
+
+Minor-major release: the motor record completes a full C-parity sweep
+against `epics-modules/motor` `motorRecord.cc`, and the monitor
+subsystem gains per-field DBE event masks end to end. The version bumps
+to `0.20.0` (not a patch) because the motor driver-forward work adds
+variants to the public exhaustive `MotorCommand` enum and methods to the
+`AsynMotor` trait — a semver-breaking API change.
+
+### Breaking changes
+
+- `MotorCommand` gained `SetPidGain`, `SetHighLimit`, and `SetLowLimit`
+  variants so PID-gain (`PCOF`/`ICOF`/`DCOF`) and soft-limit
+  (`HLM`/`LLM`/`DHLM`/`DLLM`) puts forward to the driver, mirroring C
+  `special()` (pidcof `3003-3026`, soft-limit `4076-4328`). Matching on
+  `MotorCommand` exhaustively now requires handling the new variants;
+  `AsynMotor` provides default implementations so existing drivers
+  compile unchanged.
+- New motor fields: `RHLS`/`RLLS` raw limit-switch readbacks, `VERS`
+  driver-version, and the momentary command fields `SSET`/`SUSE`/`FOF`/
+  `VOF`.
+
+### Motor record C-parity
+
+The round-3 parity sweep closed the remaining `do_work` / `process` /
+`special` divergences (one commit per finding; the `fix(motor):` git log
+is the ledger). Highlights:
+
+- Closed-loop DOL read failure drives UDF (C `1999-2005`); the
+  `LOAD_POS` block exempts the offset-only `SET` redefinition (C
+  `2206-2227`); RDBL-error refusal gates only positional moves (C
+  `2418-2453`).
+- Retry / MIP timing: `RMOD_I` re-arms the settle watchdog
+  unconditionally (C `1432-1438`); post-delay retry evaluation gates on
+  MIP motion bits (C `1427`).
+- The move-block entry gate (`dval != ldvl || !dmov`, C `2240`) now
+  refuses an exact same-target re-put after a MISS give-up, falling to
+  the chain-end implicit `GET_INFO` (C `2540-2557`) instead of
+  re-dispatching. A consequence: an exact same-target re-put no longer
+  pulses `DMOV`; sub-step (`< 1` step) requests still do.
+- The `dbPutField` processing gate now models the `motorRecord.dbd`
+  `pp(TRUE)` set (plus five `special()`-transport extension fields), so
+  a put to a non-`pp` field no longer runs a spurious process pass
+  (extra FLNK / monitors / implicit `GET_INFO`).
+
+### Monitor posting — per-field DBE masks (epics-base-rs)
+
+- `MonitorEvent` now carries the per-event DBE mask (C
+  `db_field_log.mask`), and `ProcessSnapshot` carries per-field posting
+  masks, restoring C `db_post_events(field, mask)` granularity: the
+  deadband-tracked field narrows per crossing (MDEL → `DBE_VALUE`,
+  ADEL → `DBE_LOG`), and the alarm fields post with their individual C
+  masks (`SEVR`=`DBE_VALUE`, `STAT`/`AMSG`=`DBE_ALARM`|`DBE_VALUE`).
+- The SIMM (simulation) monitor tail now posts per-field with change
+  detection and honors the MDEL/ADEL deadband, instead of re-sending
+  `VAL`/`SEVR`/`STAT` on every simulated cycle under one shared mask.
+- The `process_local` `LCNT` reentrancy guard raises `SCAN_ALARM`
+  exactly once (C `dbAccess.c:544-557`) rather than re-posting the
+  unchanged alarm fields on every reentrant attempt past the threshold.
+
+### QSRV group monitor (BRIDGE-79)
+
+- A group monitor now narrows each member's marked leaves to the wire
+  fields the event's update type actually assigns: the self-triggered
+  field uses the event's own DBE mask intersected with
+  `DBE_VALUE|DBE_ALARM|DBE_PROPERTY` (pvxs `groupsource.cpp:331-337`),
+  while other triggered targets keep the `Value|Alarm` refresh. An
+  alarm-only post no longer re-sends the value leaf, and an
+  archive-only post contributes no self leaves.
+
+### Other fixes
+
+- `optics`, `ca`, `asyn`, `server`, and the `mini-beamline` example
+  received targeted parity / correctness fixes (see the `fix(...)` git
+  log).
+- `asyn-rs` now enables the `epics` feature by default.
+
 ## v0.19.2 — 2026-06-11
 
 Patch release making the cross-platform CI matrix introduced in `v0.19.1`

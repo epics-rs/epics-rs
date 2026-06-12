@@ -20,7 +20,7 @@ tracing = "0.1"
 epics-base-rs = { workspace = true, optional = true }
 
 [features]
-default = []
+default = ["epics"]
 epics = ["dep:epics-base-rs"]
 # Opt-in FTDI MPSSE / D2XX hardware support. Without this flag the
 # `drivers::ftdi::DrvAsynFtdiPort` scaffold compiles cleanly but

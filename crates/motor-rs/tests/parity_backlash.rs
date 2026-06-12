@@ -138,25 +138,57 @@ fn backlash_negative_bdst_positive_move() {
 #[test]
 fn negative_bdst_relative_move_preferred_direction() {
     // C: 524696a8 PR #182 / issue #181 — negative BDST with RTRY>0 and a
-    // relative-move axis (UEIP). Negative move + negative BDST is the
-    // preferred direction: no backlash pretarget, single move to target.
+    // relative-move axis (UEIP). The negative-BDST within-range arm
+    // (C 2493: bdst < 0 && relbpos >= 1.0) selects the single-leg
+    // backlash-speed dispatch: a preferred move already within one
+    // backlash of the target goes straight there at BVEL.
     let mut rec = make_record();
     rec.retry.bdst = -1.0;
     rec.retry.rtry = 3;
     rec.conv.ueip = true; // → use_relative_moves() == true
+    rec.pos.drbv = -9.5; // relbpos = (-9 - (-9.5))/mres = +500 steps >= 1
+
+    rec.put_field("VAL", EpicsValue::Double(-10.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+
+    // Preferred + within range: single leg, no pretarget.
+    assert!(!rec.internal.backlash_pending);
+    let leg = effects.commands.iter().find_map(|c| match c {
+        MotorCommand::MoveRelative {
+            distance, velocity, ..
+        } => Some((*distance, *velocity)),
+        _ => None,
+    });
+    let (dist, vel) = leg.expect("MoveRelative expected");
+    assert!(
+        (dist - (-0.5)).abs() < 1e-9,
+        "remaining error leg, got {dist}"
+    );
+    assert_eq!(vel, 5.0, "within-range leg runs at BVEL");
+}
+
+#[test]
+fn negative_bdst_relative_move_outside_range_two_legs() {
+    // Same axis far from the target: relbpos = (-9 - 0)/0.001 = -9000
+    // steps fails the bdst<0 within-range arm (C 2493), and BVEL != VELO
+    // keeps it out of case 1 — the move takes the two-leg correction
+    // through the pretarget (C 2518-2524) even though the direction is
+    // preferred.
+    let mut rec = make_record();
+    rec.retry.bdst = -1.0;
+    rec.retry.rtry = 3;
+    rec.conv.ueip = true;
     rec.pos.drbv = 0.0;
 
     rec.put_field("VAL", EpicsValue::Double(-10.0)).unwrap();
     let effects = rec.plan_motion(CommandSource::Val);
 
-    // Preferred direction: no backlash
-    assert!(!rec.internal.backlash_pending);
-    // Relative move axis → MoveRelative emitted
+    assert!(rec.internal.backlash_pending);
     let dist = effects.commands.iter().find_map(|c| match c {
         MotorCommand::MoveRelative { distance, .. } => Some(*distance),
         _ => None,
     });
-    assert_eq!(dist, Some(-10.0), "relative distance should be -10");
+    assert_eq!(dist, Some(-9.0), "first leg to pretarget dval - bdst = -9");
 }
 
 #[test]
@@ -194,9 +226,12 @@ fn negative_bdst_relative_move_non_preferred_uses_backlash() {
 
 #[test]
 fn no_backlash_when_already_from_preferred_side() {
-    // BDST=+1.0, moving positive → preferred direction, no backlash
+    // BDST=+1.0, moving positive (preferred) with BVEL == VELO and
+    // BACC == ACCL: C case 1 (2479-2489) — one leg straight to dval.
     let mut rec = make_record();
     rec.retry.bdst = 1.0;
+    rec.vel.bvel = rec.vel.velo;
+    rec.vel.bacc = rec.vel.accl;
 
     rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
     let effects = rec.plan_motion(CommandSource::Val);
@@ -211,6 +246,50 @@ fn no_backlash_when_already_from_preferred_side() {
 
     complete_move(&mut rec, 10.0);
     let _effects = rec.check_completion();
+    assert!(rec.stat.dmov);
+}
+
+#[test]
+fn preferred_direction_bvel_differs_takes_two_legs() {
+    // BDST=+1.0, moving positive (preferred) but BVEL != VELO and the
+    // target is outside the backlash range: C falls to the else case
+    // (2518-2524) — first leg to the pretarget at slew speed, final
+    // BDST stretch at backlash speed from postprocess.
+    let mut rec = make_record();
+    rec.retry.bdst = 1.0;
+
+    rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+
+    assert!(rec.internal.backlash_pending);
+    if let MotorCommand::MoveAbsolute {
+        position, velocity, ..
+    } = &effects.commands[0]
+    {
+        assert!(
+            (*position - 9.0).abs() < 1e-10,
+            "first leg to pretarget dval - bdst = 9, got {position}"
+        );
+        assert_eq!(*velocity, 10.0, "first leg at VELO");
+    } else {
+        panic!("expected MoveAbsolute");
+    }
+
+    complete_move(&mut rec, 9.0);
+    let effects = rec.check_completion();
+    assert_eq!(rec.stat.phase, MotionPhase::BacklashFinal);
+    if let MotorCommand::MoveAbsolute {
+        position, velocity, ..
+    } = &effects.commands[0]
+    {
+        assert!((*position - 10.0).abs() < 1e-10);
+        assert_eq!(*velocity, 5.0, "final leg at BVEL");
+    } else {
+        panic!("expected MoveAbsolute");
+    }
+
+    complete_move(&mut rec, 10.0);
+    rec.check_completion();
     assert!(rec.stat.dmov);
 }
 

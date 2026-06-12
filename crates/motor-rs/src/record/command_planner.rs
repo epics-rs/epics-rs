@@ -471,8 +471,38 @@ impl MotorRecord {
             }
         }
 
-        // Determine if backlash correction is needed
-        let backlash = self.needs_backlash_for_move(self.pos.dval, self.pos.drbv);
+        // C dispatch case selection (do_work 2479-2524):
+        //   Case 1 (2479-2489): backlash disabled (|BDST| < |MRES|), or
+        //     preferred direction with BVEL == VELO and BACC == ACCL —
+        //     one leg at slew speed, FRAC applied.
+        //   Case 2 (2491-2517): preferred direction, already within one
+        //     backlash of the target — one leg at backlash speed, FRAC.
+        //   Case 3 (2518-2524): everything else — two legs through the
+        //     pretarget (dval - bdst), final approach from postprocess
+        //     (pp = TRUE). A preferred move outside the range with
+        //     BVEL != VELO takes this path too: the final BDST stretch
+        //     is always traversed at backlash speed.
+        // C compares BVEL/VELO and BACC/ACCL with exact == (2487-2488).
+        let preferred = self.is_preferred_direction(self.pos.dval, self.pos.drbv);
+        let same_vel = self.vel.bvel == self.vel.velo && self.vel.bacc == self.vel.accl;
+        let within_range = if self.use_relative_moves() {
+            // C 2493: relbpos in (signed-MRES) steps against one step.
+            let relbpos = (Self::compute_backlash_pretarget(self.pos.dval, self.retry.bdst)
+                - self.pos.drbv)
+                / self.conv.mres;
+            (self.retry.bdst >= 0.0 && relbpos <= 1.0) || (self.retry.bdst < 0.0 && relbpos >= 1.0)
+        } else {
+            // C 2284/2496: |newpos - currpos| <= rbdst1, with
+            // rbdst1 = 1 + |bdst|/|mres| steps and currpos = LDVL —
+            // in EGU: |dval - ldvl| <= |mres| + |bdst|.
+            (self.pos.dval - self.internal.ldvl).abs()
+                <= self.conv.mres.abs() + self.retry.bdst.abs()
+        };
+        let single_leg_slew =
+            self.retry.bdst.abs() < self.conv.mres.abs() || (preferred && same_vel);
+        let single_leg_bvel = !single_leg_slew && preferred && within_range;
+        // Case 3: the two-leg correction through the pretarget.
+        let backlash = !single_leg_slew && !single_leg_bvel;
 
         // Compute move target: pretarget if backlash, otherwise dval
         let move_target = if backlash {
@@ -541,9 +571,6 @@ impl MotorRecord {
 
         let use_rel = self.use_relative_moves();
         let frac = self.retry.frac;
-        // preferred_dir uses the OLD ldvl (the previous dispatched target),
-        // so is_preferred_direction must run before we update ldvl below.
-        let preferred = self.is_preferred_direction(self.pos.dval, self.pos.drbv);
         let position_error = self.pos.dval - self.pos.drbv;
         // C 2268: currpos ("where we are") is LDVL — the previously
         // dispatched target, NOT the readback. The absolute FRAC dispatch
@@ -561,17 +588,9 @@ impl MotorRecord {
         self.internal.lval = self.pos.val;
         self.internal.lrvl = self.pos.rval;
 
-        // C has 3 cases (do_work lines 2479-2524):
-        // Case 1: No backlash OR (preferred + same vel/accel): slew vel, FRAC
-        // Case 2: Preferred + within backlash range: backlash vel, FRAC
-        // Case 3: Non-preferred (backlash): pretarget, no FRAC
-        let same_vel = (self.vel.bvel - self.vel.velo).abs() < 1e-12
-            && (self.vel.bacc - self.vel.accl).abs() < 1e-12;
-        let within_backlash_range =
-            preferred && self.retry.bdst != 0.0 && position_error.abs() <= self.retry.bdst.abs();
-
-        if backlash && !preferred {
-            // Case 3: Non-preferred direction: move to pretarget, no FRAC
+        if backlash {
+            // Case 3 (C 2518-2524): first leg to the pretarget at slew
+            // speed, no FRAC; the final approach runs from postprocess.
             self.emit_move(
                 effects,
                 use_rel,
@@ -580,9 +599,8 @@ impl MotorRecord {
                 self.vel.velo,
                 self.move_accel_egu(),
             );
-        } else if !backlash || (preferred && same_vel) {
-            // Case 1: No backlash or preferred with matching vel/accel
-            // Apply FRAC scaling
+        } else if single_leg_slew {
+            // Case 1 (C 2479-2489): one leg at slew speed, FRAC applied.
             self.emit_move(
                 effects,
                 use_rel,
@@ -591,9 +609,8 @@ impl MotorRecord {
                 self.vel.velo,
                 self.move_accel_egu(),
             );
-        } else if within_backlash_range {
-            // Case 2: Preferred direction, within backlash range
-            // Use backlash velocity, apply FRAC
+        } else {
+            // Case 2 (C 2491-2517): one leg at backlash speed, FRAC.
             self.emit_move(
                 effects,
                 use_rel,
@@ -601,17 +618,6 @@ impl MotorRecord {
                 currpos + frac * (self.pos.dval - currpos),
                 self.vel.bvel,
                 self.backlash_accel_egu(),
-            );
-        } else {
-            // Preferred direction, outside backlash range, vel differs
-            // Use slew velocity, apply FRAC
-            self.emit_move(
-                effects,
-                use_rel,
-                position_error * frac,
-                currpos + frac * (self.pos.dval - currpos),
-                self.vel.velo,
-                self.move_accel_egu(),
             );
         }
         effects.request_poll = true;
@@ -1254,20 +1260,18 @@ impl MotorRecord {
     /// C: when use_rel=false, compares dval vs ldvl (previous target).
     ///    when use_rel=true, compares diff (dval - drbv) vs 0.
     fn is_preferred_direction(&self, dval: f64, drbv: f64) -> bool {
-        if self.retry.bdst == 0.0 {
-            return true;
-        }
-        let move_dir = if self.use_relative_moves() {
-            // use_rel: compare target vs current position
-            dval - drbv
+        // C preferred_dir (motorRecord.cc:2391-2395):
+        //   ((use_rel == false) && ((dval > ldvl) == (bdst > 0))) ||
+        //   ((use_rel == true)  && ((diff > 0)    == (bdst > 0)))
+        // Strict comparisons, no equality slack: a retry (dval == ldvl)
+        // with BDST > 0 is NON-preferred, which is what makes C retries
+        // re-run the backlash correction.
+        let toward_positive = if self.use_relative_moves() {
+            dval - drbv > 0.0
         } else {
-            // !use_rel: compare target vs previous target (ldvl)
-            dval - self.internal.ldvl
+            dval > self.internal.ldvl
         };
-        if move_dir == 0.0 {
-            return true;
-        }
-        (move_dir > 0.0) == (self.retry.bdst > 0.0)
+        toward_positive == (self.retry.bdst > 0.0)
     }
 
     /// Handle a new target (VAL/DVAL/RVAL/RLV write) that arrives while a

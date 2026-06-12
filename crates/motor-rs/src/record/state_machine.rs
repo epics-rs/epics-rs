@@ -582,25 +582,6 @@ impl MotorRecord {
         }
     }
 
-    /// Check if backlash correction is needed for a move from current position to dval.
-    /// Backlash is needed when the direction of travel opposes the BDST sign direction.
-    pub(crate) fn needs_backlash_for_move(&self, dval: f64, drbv: f64) -> bool {
-        if self.retry.bdst == 0.0 {
-            return false;
-        }
-        // C: disable backlash when |BDST| < |MRES| (less than one step)
-        if self.retry.bdst.abs() < self.conv.mres.abs() {
-            return false;
-        }
-        let move_direction = dval - drbv;
-        if move_direction == 0.0 {
-            return false;
-        }
-        // Need backlash if move direction opposes BDST sign
-        // (i.e., approaching target from the wrong side)
-        (move_direction > 0.0) != (self.retry.bdst > 0.0)
-    }
-
     /// Compute the backlash pre-target position.
     /// The pre-target overshoots past dval so the final approach comes from the BDST direction.
     pub(crate) fn compute_backlash_pretarget(dval: f64, bdst: f64) -> f64 {

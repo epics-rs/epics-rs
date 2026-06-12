@@ -3822,6 +3822,9 @@ fn test_val_written_during_jog_backlash_replays_at_bl2_done() {
     rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
     rec.retry.bdst = 2.0;
+    // Keep the replayed move single-leg (C case 1 needs BVEL == VELO
+    // AND BACC == ACCL) so the replay assertion sees the target itself.
+    rec.vel.bacc = rec.vel.accl;
     rec.ctrl.jogf = true;
     rec.plan_motion(CommandSource::Jogf);
     rec.stat.msta = MstaFlags::MOVING;

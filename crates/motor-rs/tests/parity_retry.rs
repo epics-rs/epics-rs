@@ -160,11 +160,13 @@ fn rmod_inposition_no_retry() {
     complete_move(&mut rec, 9.0);
     let effects = rec.check_completion();
 
-    // InPosition mode: no retry, just finalize
+    // InPosition mode: no move re-issued (C do_work 2384 returns before
+    // dispatching), but the maybeRetry pass still counts the cycle
+    // against RTRY (C 1059 ++rcnt has no RMOD_I exemption).
     assert!(rec.stat.dmov);
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
     assert!(effects.commands.is_empty());
-    assert_eq!(rec.retry.rcnt, 0); // never incremented
+    assert_eq!(rec.retry.rcnt, 1);
 }
 
 #[test]
@@ -389,4 +391,58 @@ fn rmod_arithmetic_use_rel_scales_relative_leg() {
         (dist - 0.8).abs() < 1e-9,
         "arithmetic factor 0.8 scales the leg, got {dist}"
     );
+}
+
+#[test]
+fn rcnt_persists_after_giveup_until_next_dispatch() {
+    // C maybeRetry 1059: the give-up pass is `++rcnt > rtry`, so RCNT
+    // posts rtry+1 and KEEPS that value through the finalize — no
+    // completion-time zeroing. Only the next dispatch resets it
+    // (2352-2356).
+    let mut rec = make_record();
+    rec.retry.rdbd = 0.1;
+    rec.retry.rtry = 2;
+    rec.retry.rmod = RetryMode::Default;
+
+    rec.pos.dval = 10.0;
+    rec.plan_motion(CommandSource::Val);
+
+    complete_move(&mut rec, 9.0);
+    rec.check_completion(); // rcnt 1
+    complete_move(&mut rec, 9.2);
+    rec.check_completion(); // rcnt 2
+    complete_move(&mut rec, 9.3); // still short: exhausted
+    rec.check_completion();
+
+    assert!(rec.stat.dmov);
+    assert!(rec.retry.miss);
+    assert_eq!(rec.retry.rcnt, 3, "give-up pass counts: RCNT = rtry + 1");
+
+    // Next (non-retry) dispatch resets it.
+    rec.pos.dval = 20.0;
+    rec.plan_motion(CommandSource::Val);
+    assert_eq!(rec.retry.rcnt, 0);
+}
+
+#[test]
+fn home_dispatch_resets_rcnt() {
+    // C 2069: the home dispatch resets the retry counter.
+    let mut rec = make_record();
+    rec.retry.rdbd = 0.1;
+    rec.retry.rtry = 2;
+
+    rec.pos.dval = 10.0;
+    rec.plan_motion(CommandSource::Val);
+    complete_move(&mut rec, 9.0);
+    rec.check_completion();
+    assert_eq!(rec.retry.rcnt, 1);
+    // Abandon the retry with a stop, then home.
+    rec.ctrl.stop = true;
+    rec.plan_motion(CommandSource::Stop);
+    complete_move(&mut rec, 9.0);
+    rec.check_completion();
+
+    rec.ctrl.homf = true;
+    rec.plan_motion(CommandSource::Homf);
+    assert_eq!(rec.retry.rcnt, 0, "home dispatch resets RCNT (C 2069)");
 }

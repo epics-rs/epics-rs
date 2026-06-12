@@ -973,6 +973,8 @@ impl MotorRecord {
         }
 
         self.stat.dmov = false;
+        // C 2069: the home dispatch resets the retry counter.
+        self.retry.rcnt = 0;
         // C 2025: pp = TRUE at home dispatch (set for both the queued and
         // the direct branch before the movn test).
         self.internal.pp = true;

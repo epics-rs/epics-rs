@@ -114,6 +114,9 @@ impl MotorRecord {
                 match queued {
                     QueuedMotion::Home { forward } => {
                         self.set_phase(MotionPhase::Homing);
+                        // C 869: the postProcess home re-fire resets the
+                        // retry counter, like the direct dispatch (2069).
+                        self.retry.rcnt = 0;
                         let hw_forward = if self.conv.mres >= 0.0 {
                             forward
                         } else {
@@ -166,6 +169,8 @@ impl MotorRecord {
                     // C 1060-1075: too many retries — give up, MISS
                     // latches, the lasts adopt the unreached target
                     // (finalize_motion's lval/ldvl sync matches 1067-1069).
+                    // The give-up pass still counts (`++rcnt > rtry`).
+                    self.retry.rcnt += 1;
                     self.retry.miss = true;
                     self.finalize_or_delay(&mut effects);
                 } else {
@@ -331,7 +336,10 @@ impl MotorRecord {
         self.stat.mip = MipFlags::empty();
         self.stat.dmov = true;
         self.stat.movn = false;
-        self.retry.rcnt = 0;
+        // RCNT is NOT zeroed at completion: C resets it only at dispatch
+        // sites — a non-retry move (2352-2356), home (2069, 869), and a
+        // Move-resume (1931). After a give-up it stays at rtry+1 (the
+        // ++rcnt of the exhausted maybeRetry pass) until the next move.
         // C postProcess clears pp on entry (825); every normal completion
         // runs it, so a leftover pp from a revived stop (ExtendMove over a
         // decelerating axis) must not leak into the next motion.
@@ -492,7 +500,10 @@ impl MotorRecord {
         if diff >= self.retry.rdbd && !ls_blocks_retry && self.retry.rtry != 0 {
             if self.retry.rcnt >= self.retry.rtry {
                 // C 1059-1073: too many retries — give up and latch MISS
-                // (1072). The retry branches below never touch miss.
+                // (1072). The give-up pass still counts (`++rcnt > rtry`),
+                // so RCNT reads rtry+1 until the next dispatch resets it.
+                // The retry branches below never touch miss.
+                self.retry.rcnt += 1;
                 self.retry.miss = true;
                 self.finalize_motion(effects);
                 return;

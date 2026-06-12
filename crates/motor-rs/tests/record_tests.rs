@@ -16,7 +16,9 @@ fn test_default_values() {
     assert_eq!(rec.vel.velo, 1.0);
     assert_eq!(rec.vel.accl, 0.2);
     assert_eq!(rec.retry.rtry, 10);
-    assert!(rec.limits.lvio); // default true (no limits set)
+    // C dbd LVIO has no initial() and init_record clears it before the
+    // initial-readback check (motorRecord.cc:734-743).
+    assert!(!rec.limits.lvio);
 }
 
 #[test]
@@ -5016,6 +5018,65 @@ fn test_runtime_srev_nonpositive_clamped_to_200() {
         "MRES={}",
         rec.conv.mres
     );
+}
+
+// --- Initial LVIO (C init_record, motorRecord.cc:734-743) ---
+
+#[test]
+fn test_initial_lvio_clear_when_limits_disabled() {
+    // C 734-737: LVIO is explicitly cleared at init and the violation
+    // check is skipped when the dial pair is disabled (DHLM == DLLM ==
+    // 0). Regression: the Rust default was lvio: true, so a
+    // never-processed record served LVIO = 1.
+    let mut rec = MotorRecord::new();
+    rec.pos.drbv = 5.0;
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+    assert!(!rec.limits.lvio);
+}
+
+#[test]
+fn test_initial_lvio_set_when_drbv_outside_limits() {
+    // C 738-743: an initial dial readback beyond DHLM + MRES raises
+    // LVIO at init, before any processing.
+    let mut rec = MotorRecord::new();
+    rec.put_field("MRES", EpicsValue::Double(0.5)).unwrap();
+    rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("DLLM", EpicsValue::Double(-10.0)).unwrap();
+    rec.pos.drbv = 10.6;
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+    assert!(rec.limits.lvio, "DRBV=10.6 > DHLM+MRES=10.5 must set LVIO");
+}
+
+#[test]
+fn test_initial_lvio_respects_mres_slop() {
+    // C 738: the comparison allows one MRES of slop — a readback inside
+    // DHLM + MRES does not violate.
+    let mut rec = MotorRecord::new();
+    rec.put_field("MRES", EpicsValue::Double(0.5)).unwrap();
+    rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("DLLM", EpicsValue::Double(-10.0)).unwrap();
+    rec.pos.drbv = 10.4;
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+    assert!(
+        !rec.limits.lvio,
+        "DRBV=10.4 <= DHLM+MRES=10.5 must not set LVIO"
+    );
+}
+
+#[test]
+fn test_initial_lvio_set_on_inverted_limits() {
+    // C 739: DLLM > DHLM raises LVIO at init regardless of the readback.
+    let mut rec = MotorRecord::new();
+    rec.put_field("MRES", EpicsValue::Double(0.5)).unwrap();
+    rec.put_field("DHLM", EpicsValue::Double(-5.0)).unwrap();
+    rec.put_field("DLLM", EpicsValue::Double(0.0)).unwrap();
+    rec.pos.drbv = -2.0;
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+    assert!(rec.limits.lvio);
 }
 
 #[test]

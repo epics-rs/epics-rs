@@ -218,7 +218,9 @@ impl Default for LimitFields {
             dllm: 0.0,
             rhlm: 0.0,
             rllm: 0.0,
-            lvio: true,
+            // C dbd LVIO has no initial() (0), and init_record resets it
+            // before the initial-readback check (motorRecord.cc:734-743).
+            lvio: false,
             hls: false,
             lls: false,
             rhls: false,

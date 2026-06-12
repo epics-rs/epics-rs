@@ -437,6 +437,21 @@ impl Record for MotorRecord {
             if self.conv.eres == 0.0 {
                 self.conv.eres = self.conv.mres;
             }
+            // C 734-743: LVIO starts clear; with soft limits enabled
+            // (the dial pair not both 0), an initial dial readback
+            // outside the dial window by more than one MRES, or an
+            // inverted pair, raises it. The slop is the SIGNED
+            // resolution (C verbatim — a negative MRES narrows the
+            // window).
+            self.limits.lvio = false;
+            let limits_disabled = self.limits.dhlm == self.limits.dllm && self.limits.dllm == 0.0;
+            if !limits_disabled
+                && (self.pos.drbv > self.limits.dhlm + self.conv.mres
+                    || self.pos.drbv < self.limits.dllm - self.conv.mres
+                    || self.limits.dllm > self.limits.dhlm)
+            {
+                self.limits.lvio = true;
+            }
             self.internal.init_invariants_synced = true;
         }
         Ok(())

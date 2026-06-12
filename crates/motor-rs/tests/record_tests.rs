@@ -1643,6 +1643,45 @@ fn test_cnen_no_command_without_gain_support() {
 }
 
 #[test]
+fn test_cnen_tracks_ea_position_under_gain_support() {
+    use asyn_rs::interfaces::motor::MotorStatus;
+    // C monitor() (3541-3549): a GAIN_SUPPORT controller syncs CNEN
+    // from the EA_POSITION torque readback on every MSTA post, so an
+    // externally toggled torque shows up in the field.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+
+    let torque_on = MotorStatus {
+        done: true,
+        gain_support: true,
+        powered: true,
+        ..Default::default()
+    };
+    rec.process_motor_info(&torque_on);
+    assert!(rec.ctrl.cnen, "EA_POSITION on syncs CNEN=Enable");
+
+    let torque_off = MotorStatus {
+        done: true,
+        gain_support: true,
+        powered: false,
+        ..Default::default()
+    };
+    rec.process_motor_info(&torque_off);
+    assert!(!rec.ctrl.cnen, "EA_POSITION off syncs CNEN=Disable");
+
+    // Without GAIN_SUPPORT the user's CNEN is left alone.
+    rec.ctrl.cnen = true;
+    let no_gain = MotorStatus {
+        done: true,
+        gain_support: false,
+        powered: false,
+        ..Default::default()
+    };
+    rec.process_motor_info(&no_gain);
+    assert!(rec.ctrl.cnen, "CNEN untouched without GAIN_SUPPORT");
+}
+
+#[test]
 fn test_spmg_stop_defers_sync_and_dmov_to_completion() {
     // C top block (motorRecord.cc:1890-1906): SPMG=Stop while moving only
     // sets pp=TRUE and mip=MIP_STOP — the VAL<-RBV sync and DMOV happen

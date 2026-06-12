@@ -248,6 +248,14 @@ impl MotorRecord {
         }
         self.stat.msta = msta;
 
+        // C monitor() (3541-3549): when the controller supports
+        // closed-loop gain (GAIN_SUPPORT), CNEN is a readback of the
+        // EA_POSITION (position-maintenance/torque) bit on every MSTA
+        // post — an externally toggled torque updates the field.
+        if msta.contains(MstaFlags::GAIN_SUPPORT) {
+            self.ctrl.cnen = msta.contains(MstaFlags::POSITION);
+        }
+
         // C: tdir = msta.RA_DIRECTION (from driver on every poll)
         self.stat.tdir = status.direction;
 

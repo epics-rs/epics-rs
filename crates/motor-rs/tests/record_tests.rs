@@ -3624,3 +3624,58 @@ fn test_idle_pause_sends_stop_axis_and_converges() {
         "nothing to resume after idle pause"
     );
 }
+
+// --- too_small quiesce parity (C 2308-2348) ---
+
+#[test]
+fn test_sub_step_move_quiesces_lasts() {
+    // C 2343-2347: the too-small suppress path updates the previous-target
+    // registers so the divergence is not re-detected on later passes.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.put_field("VAL", EpicsValue::Double(0.4)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(effects.commands.is_empty(), "sub-step move suppressed");
+    assert_eq!(rec.internal.lval, 0.4);
+    assert_eq!(rec.internal.ldvl, 0.4);
+}
+
+#[test]
+fn test_spdb_window_quiesces_lasts() {
+    // C 2317-2326: SPDB folds into the too_small decision (open window
+    // around DRBV) and shares the same quiesce.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.conv.mres = 0.001;
+    rec.retry.spdb = 2.0;
+    rec.put_field("VAL", EpicsValue::Double(1.5)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(effects.commands.is_empty(), "SPDB window suppressed");
+    assert_eq!(rec.internal.ldvl, 1.5);
+    assert_eq!(rec.internal.lval, 1.5);
+}
+
+#[test]
+fn test_retry_resume_within_deadband_quiesces() {
+    // C 2329-2342: a RETRY dispatch compares against RDBD in steps; the
+    // paused resume completes without moving (mip -> DONE) when the axis
+    // drifted inside the deadband during the pause.
+    let mut rec = paused_move_setup();
+    rec.retry.rdbd = 5.0;
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.plan_motion(CommandSource::Spmg);
+    complete_stop_at(&mut rec, 25.0);
+    assert_eq!(rec.stat.mip, MipFlags::RETRY);
+
+    // Axis drifts into the retry deadband while paused.
+    rec.pos.drbv = 47.0;
+    rec.pos.rbv = 47.0;
+
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(effects.commands.is_empty(), "within RDBD: no resume move");
+    assert_eq!(rec.stat.mip, MipFlags::empty());
+    assert_eq!(rec.internal.ldvl, 50.0, "quiesced against the target");
+}

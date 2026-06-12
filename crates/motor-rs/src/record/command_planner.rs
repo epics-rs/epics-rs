@@ -349,28 +349,56 @@ impl MotorRecord {
         }
         self.limits.lvio = false;
 
-        // C: too_small check -- suppress moves smaller than one motor step
+        // C too_small (2308-2348): a RETRY dispatch is too small when the
+        // remaining error is under RDBD in steps (2329-2330); a plain
+        // dispatch when under one motor step or inside the open SPDB
+        // window around DRBV (2313-2326).
         if self.conv.mres != 0.0 {
             let npos = (self.pos.dval / self.conv.mres).round() as i64;
             let rpos = (self.pos.drbv / self.conv.mres).round() as i64;
-            if (npos - rpos).abs() < 1 {
-                // Sub-step move: pulse DMOV 1→0→1 so clients
-                // (ophyd/bluesky) detect the move completed.
-                // Set dmov=false now; process() will flush DMOV=0 via
-                // AsyncPendingNotify, then the immediate re-process
-                // (with no pending event) will finalize with DMOV=1.
-                self.stat.dmov = false;
-                self.stat.movn = true;
-                // Request a poll so the next I/O Intr cycle completes
-                effects.request_poll = true;
+            let steps = (npos - rpos).abs();
+            let too_small = if self.stat.mip.contains(MipFlags::RETRY) {
+                let rdbd_steps = (self.retry.rdbd / self.conv.mres.abs()).round() as i64;
+                steps < rdbd_steps
+            } else {
+                steps < 1
+                    || (self.retry.spdb > 0.0
+                        && (self.pos.dval - self.retry.spdb) < self.pos.drbv
+                        && (self.pos.dval + self.retry.spdb) > self.pos.drbv)
+            };
+            if too_small {
+                // C 2333-2342: a pending non-move (paused-RETRY resume
+                // whose error drifted under RDBD) completes here with
+                // mip = DONE; the quiesce below plus the DMOV pulse
+                // recovery in do_process_inner restore DMOV=1.
+                let pending_completion = !self.stat.dmov;
+                if pending_completion
+                    && (self.stat.mip.is_empty() || self.stat.mip == MipFlags::RETRY)
+                {
+                    self.stat.mip = MipFlags::empty();
+                }
+                // C 2343-2347: update the previous-target registers so the
+                // suppressed divergence is not re-detected on every later
+                // pass (move-block gate, overtaken-target replay).
+                self.internal.ldvl = self.pos.dval;
+                self.internal.lval = self.pos.val;
+                self.internal.lrvl = self.pos.rval;
+                // Rust-side deviation from C (deliberate, ophyd/bluesky):
+                // a sub-step request pulses DMOV 1→0→1 so clients watching
+                // DMOV see the "move" complete; a pending completion runs
+                // the same flow to restore DMOV=1. dmov=false flushes
+                // DMOV=0 via AsyncPendingNotify; the immediate re-process
+                // (no pending event) finalizes with DMOV=1. An SPDB
+                // suppress with DMOV already 1 stays quiet, like C's
+                // dmov==FALSE gate (2333).
+                if steps < 1 || pending_completion {
+                    self.stat.dmov = false;
+                    self.stat.movn = true;
+                    effects.request_poll = true;
+                }
                 effects.suppress_forward_link = true;
                 return;
             }
-        }
-
-        // SPDB deadband: suppress move if already within setpoint deadband
-        if self.retry.spdb > 0.0 && (self.pos.dval - self.pos.drbv).abs() <= self.retry.spdb {
-            return;
         }
 
         // Determine if backlash correction is needed

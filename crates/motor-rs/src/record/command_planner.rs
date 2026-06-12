@@ -176,7 +176,30 @@ impl MotorRecord {
         ) && self.collect_tweak(&mut effects);
 
         match src {
-            CommandSource::Val | CommandSource::Dval | CommandSource::Rval => {
+            CommandSource::Val | CommandSource::Dval | CommandSource::Rval | CommandSource::Rlv => {
+                // C 2187-2193: RLV folds into VAL in the do_work
+                // collection section ("Later, we'll act on this") and the
+                // pass proceeds exactly like a VAL change — including the
+                // in-flight retarget handling below. A separate RLV arm
+                // that dispatched directly bypassed the NTM stop-first
+                // path and the retarget invariants.
+                if src == CommandSource::Rlv {
+                    self.pos.val += self.pos.rlv;
+                    self.pos.rlv = 0.0;
+                    if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
+                        self.pos.val,
+                        self.conv.dir,
+                        self.pos.off,
+                        self.conv.foff,
+                        self.conv.mres,
+                        false,
+                        self.pos.dval,
+                    ) {
+                        self.pos.dval = dval;
+                        self.pos.rval = rval;
+                        self.pos.off = off;
+                    }
+                }
                 // Check for retarget if motion is in progress
                 if self.stat.phase != MotionPhase::Idle {
                     let action = self.handle_retarget(self.pos.dval);
@@ -241,26 +264,6 @@ impl MotorRecord {
                             return effects;
                         }
                     }
-                }
-                self.plan_absolute_move(&mut effects);
-            }
-            CommandSource::Rlv => {
-                // Relative move: VAL += RLV
-                self.pos.val += self.pos.rlv;
-                self.pos.rlv = 0.0;
-                // Cascade from VAL
-                if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
-                    self.pos.val,
-                    self.conv.dir,
-                    self.pos.off,
-                    self.conv.foff,
-                    self.conv.mres,
-                    false,
-                    self.pos.dval,
-                ) {
-                    self.pos.dval = dval;
-                    self.pos.rval = rval;
-                    self.pos.off = off;
                 }
                 self.plan_absolute_move(&mut effects);
             }

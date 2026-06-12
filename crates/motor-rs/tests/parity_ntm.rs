@@ -600,3 +600,38 @@ fn poll_time_wrong_direction_stops_then_retries_target() {
     };
     assert!((*position - 50.0).abs() < 1e-9, "got {position}");
 }
+
+#[test]
+fn rlv_mid_move_routes_through_retarget() {
+    // C 2187-2193: RLV folds into VAL inside the do_work collection
+    // section and the pass proceeds exactly like a VAL change — an
+    // opposite-direction relative move beyond the NTM deadband takes
+    // the stop-first path, not an immediate dispatch.
+    let mut rec = make_record();
+
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    motor_moving(&mut rec, 25.0);
+
+    // RLV = -70: new target -20, opposite the in-flight direction.
+    rec.pos.rlv = -70.0;
+    let effects = rec.plan_motion(CommandSource::Rlv);
+
+    assert_eq!(rec.pos.val, -20.0, "RLV folded into VAL");
+    assert_eq!(rec.pos.rlv, 0.0, "RLV self-clears");
+    assert!(
+        matches!(effects.commands[..], [MotorCommand::Stop { .. }]),
+        "opposite-direction RLV stops first (NTM), got {:?}",
+        effects.commands
+    );
+    assert!(rec.stat.mip.contains(MipFlags::STOP));
+    assert_eq!(rec.internal.pending_retarget, Some(-20.0));
+
+    // Stop completes; the parked target dispatches.
+    complete_move(&mut rec, 25.0);
+    let effects = rec.check_completion();
+    let MotorCommand::MoveAbsolute { position, .. } = &effects.commands[0] else {
+        panic!("expected replan, got {:?}", effects.commands);
+    };
+    assert!((*position - (-20.0)).abs() < 1e-9, "got {position}");
+}

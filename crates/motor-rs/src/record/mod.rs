@@ -56,6 +56,10 @@ pub struct MotorRecord {
     pending_event: Option<MotorEvent>,
     /// Track which field was last written (for process)
     last_write: Option<CommandSource>,
+    /// One-shot request from a runtime JVEL put: re-emit the jog command
+    /// with the new JVEL/JAR if a jog is active when the put's process
+    /// pass runs (C special() motorRecordJVEL, motorRecord.cc:3059-3072).
+    jog_retune_pending: bool,
     /// Shared state mailbox for device communication
     device_state: Option<SharedDeviceState>,
     /// Last seen status sequence number
@@ -85,6 +89,7 @@ impl Default for MotorRecord {
             alarm: AlarmFields::default(),
             pending_event: None,
             last_write: None,
+            jog_retune_pending: false,
             device_state: None,
             last_seen_seq: 0,
             initialized: false,

@@ -1423,9 +1423,27 @@ impl MotorRecord {
         if stup_requested {
             self.stat.stup = 0;
         }
+        let jvel_retune = std::mem::take(&mut self.jog_retune_pending);
         let mut effects = self.do_process_inner();
         if stup_requested {
             effects.status_refresh = true;
+        }
+        // C special() motorRecordJVEL (motorRecord.cc:3059-3072): a JVEL
+        // write landing on an active jog retunes it in place — C sends
+        // SET_ACCEL + JOG_VELOCITY immediately from special(). Every put
+        // is followed by a process pass here, so the JVEL put arm parks a
+        // one-shot request and this pass re-emits the jog command with
+        // the new JVEL/JAR. Direction comes from the active MIP jog bit,
+        // folded to the dial frame exactly as emit_jog does.
+        if jvel_retune && self.stat.mip.intersects(MipFlags::JOGF | MipFlags::JOGR) {
+            let forward = self.stat.mip.contains(MipFlags::JOGF);
+            let dial_forward = forward != (self.conv.dir == MotorDir::Neg);
+            effects.commands.push(MotorCommand::MoveVelocity {
+                direction: dial_forward,
+                velocity: self.vel.jvel,
+                acceleration: self.jog_accel_egu(),
+            });
+            effects.request_poll = true;
         }
         effects
     }

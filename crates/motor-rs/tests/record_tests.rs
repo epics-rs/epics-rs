@@ -5231,3 +5231,115 @@ mod init_jog_home_velocity_defaults {
         assert_eq!(rec.vel.hvel, 0.5);
     }
 }
+
+// =============================================================================
+// Live JVEL retune + runtime JAR fallback — C special() motorRecordJVEL /
+// motorRecordJAR (motorRecord.cc:3056-3078)
+// =============================================================================
+
+mod jvel_live_retune {
+    use super::*;
+
+    fn jogging_after_init(forward: bool) -> MotorRecord {
+        let mut rec = MotorRecord::new();
+        rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+        rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+        rec.put_field("VELO", EpicsValue::Double(1.0)).unwrap();
+        rec.init_record(1).unwrap(); // JVEL <- VELO = 1.0
+        if forward {
+            rec.ctrl.jogf = true;
+            rec.plan_motion(CommandSource::Jogf);
+        } else {
+            rec.ctrl.jogr = true;
+            rec.plan_motion(CommandSource::Jogr);
+        }
+        assert_eq!(rec.stat.phase, MotionPhase::Jog);
+        rec.stat.msta = MstaFlags::MOVING;
+        rec.stat.movn = true;
+        rec
+    }
+
+    // C 3059-3072: JVEL written mid-jog re-sends the jog command with
+    // the new velocity, same direction.
+    #[test]
+    fn jvel_write_during_active_jog_reemits_move_velocity() {
+        let mut rec = jogging_after_init(true);
+        rec.put_field("JVEL", EpicsValue::Double(2.5)).unwrap();
+        let effects = rec.do_process();
+        assert!(
+            effects.commands.iter().any(|c| matches!(
+                c,
+                MotorCommand::MoveVelocity {
+                    direction: true,
+                    velocity,
+                    ..
+                } if *velocity == 2.5
+            )),
+            "retune re-emits the jog at the new JVEL: {:?}",
+            effects.commands
+        );
+    }
+
+    // C 3064-3065: a reverse jog keeps its direction through the retune.
+    #[test]
+    fn jvel_retune_keeps_reverse_direction() {
+        let mut rec = jogging_after_init(false);
+        rec.put_field("JVEL", EpicsValue::Double(2.5)).unwrap();
+        let effects = rec.do_process();
+        assert!(
+            effects.commands.iter().any(|c| matches!(
+                c,
+                MotorCommand::MoveVelocity {
+                    direction: false,
+                    ..
+                }
+            )),
+            "reverse jog retunes in the reverse direction: {:?}",
+            effects.commands
+        );
+    }
+
+    // C 3059: the retune is gated on an active MIP jog bit — a JVEL
+    // write while idle emits nothing.
+    #[test]
+    fn jvel_write_when_idle_emits_nothing() {
+        let mut rec = MotorRecord::new();
+        rec.init_record(1).unwrap();
+        rec.put_field("JVEL", EpicsValue::Double(2.5)).unwrap();
+        let effects = rec.do_process();
+        assert!(
+            !effects
+                .commands
+                .iter()
+                .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
+            "no jog active, no retune: {:?}",
+            effects.commands
+        );
+    }
+
+    // C 3074-3078: a non-positive JAR put is replaced by JVEL / 0.1 at
+    // runtime.
+    #[test]
+    fn nonpositive_jar_put_takes_jvel_over_tenth() {
+        let mut rec = MotorRecord::new();
+        rec.init_record(1).unwrap();
+        rec.put_field("JVEL", EpicsValue::Double(2.0)).unwrap();
+        rec.put_field("JAR", EpicsValue::Double(-1.0)).unwrap();
+        assert_eq!(rec.vel.jar, 20.0);
+        rec.put_field("JAR", EpicsValue::Double(0.0)).unwrap();
+        assert_eq!(rec.vel.jar, 20.0);
+    }
+
+    // During load the JAR fallback must stay inert: field() lands raw and
+    // init derives the unconfigured value from VELO/ACCL.
+    #[test]
+    fn jar_zero_raw_during_load_then_init_derives() {
+        let mut rec = MotorRecord::new();
+        rec.put_field("VELO", EpicsValue::Double(4.0)).unwrap();
+        rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
+        rec.put_field("JAR", EpicsValue::Double(0.0)).unwrap();
+        assert_eq!(rec.vel.jar, 0.0, "raw during load");
+        rec.init_record(1).unwrap();
+        assert_eq!(rec.vel.jar, 8.0, "init derives VELO/ACCL");
+    }
+}

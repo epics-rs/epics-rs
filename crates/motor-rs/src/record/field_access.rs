@@ -1360,6 +1360,10 @@ pub(crate) fn motor_put_field(
                 if rec.internal.init_invariants_synced {
                     // C motorRecord.cc:3057: JVEL is clamped into [VBAS, VMAX].
                     range_check(&mut rec.vel.jvel, rec.vel.vbas, rec.vel.vmax);
+                    // C motorRecord.cc:3059-3072: a JVEL write landing on an
+                    // active jog retunes it in place. The retune command is
+                    // emitted by the process pass that follows this put.
+                    rec.jog_retune_pending = true;
                 }
                 Ok(())
             }
@@ -1368,6 +1372,13 @@ pub(crate) fn motor_put_field(
         "JAR" => match value {
             EpicsValue::Double(v) => {
                 rec.vel.jar = v;
+                // C motorRecord.cc:3074-3078: a non-positive JAR is replaced
+                // by JVEL / 0.1. Runtime special() only — during load field()
+                // lands raw, and an unconfigured JAR (== 0) is derived from
+                // VELO/ACCL at init.
+                if rec.internal.init_invariants_synced && rec.vel.jar <= 0.0 {
+                    rec.vel.jar = rec.vel.jvel / 0.1;
+                }
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),

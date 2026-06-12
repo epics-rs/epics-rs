@@ -4185,3 +4185,62 @@ fn test_sync_under_pause_defers_until_go() {
     assert_eq!(rec.pos.val, 20.0, "Go pass applies the latched sync");
     assert!(!rec.internal.sync);
 }
+
+// --- Sudden jog stop: no backlash (C 1357-1364 + postProcess 908) ---
+
+#[test]
+fn test_sudden_jog_stop_skips_backlash() {
+    // C: a controller self-stop collapses mip to MIP_DONE (1357-1364);
+    // postProcess's backlash branch requires MIP_JOG_STOP or MIP_MOVE
+    // (908) — so no correction fires, the record syncs and finishes.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.retry.bdst = 2.0;
+    rec.ctrl.jogf = true;
+    rec.plan_motion(CommandSource::Jogf);
+    assert_eq!(rec.stat.phase, MotionPhase::Jog);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    // Driver reports done with no commanded stop.
+    let effects = complete_stop_at(&mut rec, 30.0);
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "no backlash correction on a controller self-stop"
+    );
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.pos.val, 30.0, "synced at the rest position");
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+}
+
+#[test]
+fn test_commanded_jog_stop_still_corrects_backlash() {
+    // Boundary: the commanded release (JogStopping = C MIP_JOG_STOP)
+    // keeps the postProcess backlash correction (932-947).
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.retry.bdst = 2.0;
+    rec.ctrl.jogf = true;
+    rec.plan_motion(CommandSource::Jogf);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    rec.ctrl.jogf = false;
+    rec.plan_motion(CommandSource::Jogf);
+    assert_eq!(rec.stat.phase, MotionPhase::JogStopping);
+
+    let effects = complete_stop_at(&mut rec, 30.0);
+    assert_eq!(rec.stat.phase, MotionPhase::JogBacklash);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "commanded jog stop dispatches the backlash correction"
+    );
+}

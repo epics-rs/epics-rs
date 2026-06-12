@@ -215,9 +215,19 @@ impl MotorRecord {
                     if self.replay_overtaken_target(&mut effects) {
                         return effects;
                     }
+                    // C: with mip collapsed to MIP_DONE, postProcess
+                    // matches none of its re-fire branches — the backlash
+                    // correction needs MIP_JOG_STOP or MIP_MOVE (908) —
+                    // so a controller self-stop syncs and finalizes
+                    // WITHOUT a jog backlash move.
+                    self.sync_positions();
+                    self.finalize_or_delay(&mut effects);
+                    return effects;
                 }
-                // C: postProcess syncs VAL<-RBV, DVAL<-DRBV before jog backlash
-                // This ensures start_jog_backlash uses the jog-end position as base
+                // Commanded stop (C postProcess MIP_JOG_STOP branch,
+                // 908-947): sync VAL<-RBV, DVAL<-DRBV first so
+                // start_jog_backlash uses the jog-end position as base,
+                // then correct when |BDST| >= |MRES|.
                 self.sync_positions();
                 if self.needs_jog_backlash() {
                     self.start_jog_backlash(&mut effects);

@@ -4944,6 +4944,50 @@ fn test_resolution_init_nonpositive_srev_clamped() {
 }
 
 #[test]
+fn test_eres_seeded_from_mres_at_init() {
+    // C init_record 692-696: ERES == 0 is seeded from MRES at init —
+    // whether the .db never set it or loaded an explicit 0, and
+    // regardless of where MRES appeared in the load order. Regression:
+    // the load-time ERES put mapped 0 -> the mid-load MRES (default
+    // 1.0 when field(ERES) preceded field(MRES)).
+    // Unset ERES.
+    let mut rec = MotorRecord::new();
+    rec.put_field("MRES", EpicsValue::Double(0.25)).unwrap();
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+    assert_eq!(rec.conv.eres, 0.25);
+
+    // Explicit zero ERES loaded before MRES.
+    let mut rec = MotorRecord::new();
+    rec.put_field("ERES", EpicsValue::Double(0.0)).unwrap();
+    rec.put_field("MRES", EpicsValue::Double(0.25)).unwrap();
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+    assert_eq!(rec.conv.eres, 0.25);
+
+    // A configured nonzero ERES survives.
+    let mut rec = MotorRecord::new();
+    rec.put_field("ERES", EpicsValue::Double(0.5)).unwrap();
+    rec.put_field("MRES", EpicsValue::Double(0.25)).unwrap();
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+    assert_eq!(rec.conv.eres, 0.5);
+}
+
+#[test]
+fn test_runtime_eres_zero_put_maps_to_mres() {
+    // C special ERES (2927-2929): a runtime put of 0 maps to MRES.
+    let mut rec = MotorRecord::new();
+    rec.put_field("MRES", EpicsValue::Double(0.25)).unwrap();
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+    rec.put_field("ERES", EpicsValue::Double(0.002)).unwrap();
+    assert_eq!(rec.conv.eres, 0.002);
+    rec.put_field("ERES", EpicsValue::Double(0.0)).unwrap();
+    assert_eq!(rec.conv.eres, 0.25);
+}
+
+#[test]
 fn test_resolution_init_zero_mres_forced_to_one() {
     // C 3917-3921: an explicitly loaded MRES of 0 lands raw and init
     // forces 1.0.

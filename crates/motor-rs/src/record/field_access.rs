@@ -1152,12 +1152,18 @@ pub(crate) fn motor_put_field(
         },
         "ERES" => match value {
             EpicsValue::Double(v) => {
-                // C: if ERES==0, set to MRES
+                if !rec.internal.init_invariants_synced {
+                    // Raw store during load; init seeds a zero ERES from
+                    // the reconciled MRES (C init_record 692-696) —
+                    // mapping here would capture whatever MRES holds
+                    // mid-load.
+                    rec.conv.eres = v;
+                    return Ok(());
+                }
+                // C special ERES (2927-2929): don't allow ERES = 0.
                 rec.conv.eres = if v == 0.0 { rec.conv.mres } else { v };
                 // C special ERES (2930): MARK(M_ERES) unconditionally.
-                if rec.internal.init_invariants_synced {
-                    rec.internal.res_reanchor = true;
-                }
+                rec.internal.res_reanchor = true;
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),

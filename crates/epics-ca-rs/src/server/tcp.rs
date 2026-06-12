@@ -2893,13 +2893,17 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 let result = match &entry.target {
                     ChannelTarget::RecordField { record, .. } => {
                         let name = record.read().await.name.clone();
-                        db.put_record_field_from_ca(
+                        // Alarm-ack puts are immediate in C even for the
+                        // notify variant — `rsrv/camessage.c` writes ACKT/
+                        // ACKS via `dbPutField` and replies straight away,
+                        // never building a putNotify. Neither mode here
+                        // awaits a completion receiver, so park nothing.
+                        db.put_record_field_from_ca_no_notify(
                             &name,
                             field_name,
                             EpicsValue::Short(value_u16 as i16),
                         )
                         .await
-                        .map(|_| ())
                     }
                     ChannelTarget::SimplePv(_) => Err(epics_base_rs::error::CaError::Protocol(
                         "PUT_ACKT/PUT_ACKS only valid on record-backed channels".to_string(),
@@ -3219,7 +3223,22 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 }
                 ChannelTarget::RecordField { record, field } => {
                     let name = record.read().await.name.clone();
-                    db.put_record_field_from_ca(&name, field, new_value).await
+                    if is_notify {
+                        db.put_record_field_from_ca(&name, field, new_value).await
+                    } else {
+                        // C `write_action` (`rsrv/camessage.c:781-789`)
+                        // routes CA_PROTO_WRITE through `dbPutField` —
+                        // no putNotify is ever built. Parking a wait-set
+                        // whose receiver this fire-and-forget arm drops
+                        // would occupy the record's notify slot until
+                        // any async processing it starts settles (a
+                        // motor's whole motion), failing every
+                        // legitimate WRITE_NOTIFY on the record with
+                        // ECA_PUTCBINPROG in the meantime.
+                        db.put_record_field_from_ca_no_notify(&name, field, new_value)
+                            .await
+                            .map(|()| None)
+                    }
                 }
             };
 

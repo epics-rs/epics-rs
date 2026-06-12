@@ -454,7 +454,7 @@ impl PvDatabase {
         field: &str,
         value: EpicsValue,
     ) -> CaResult<Option<crate::runtime::sync::oneshot::Receiver<()>>> {
-        self.put_record_field_from_ca_inner(record_name, field, value, true)
+        self.put_record_field_from_ca_inner(record_name, field, value, true, true)
             .await
     }
 
@@ -471,8 +471,42 @@ impl PvDatabase {
         field: &str,
         value: EpicsValue,
     ) -> CaResult<Option<crate::runtime::sync::oneshot::Receiver<()>>> {
-        self.put_record_field_from_ca_inner(record_name, field, value, false)
+        self.put_record_field_from_ca_inner(record_name, field, value, false, true)
             .await
+    }
+
+    /// Fire-and-forget variant — C `dbPutField` semantics: the put
+    /// processes the record but creates NO put-notify wait-set (C
+    /// builds a `putNotify` only in `dbPutNotify`, i.e. for
+    /// WRITE_NOTIFY). A caller that does not await the returned
+    /// receiver MUST use this entry: parking a wait-set whose receiver
+    /// is dropped occupies `RecordInstance::notify` until the record's
+    /// async work ends (a motor's whole motion), failing every
+    /// legitimate WRITE_NOTIFY on the record with ECA_PUTCBINPROG in
+    /// the meantime.
+    pub async fn put_record_field_from_ca_no_notify(
+        &self,
+        record_name: &str,
+        field: &str,
+        value: EpicsValue,
+    ) -> CaResult<()> {
+        self.put_record_field_from_ca_inner(record_name, field, value, true, false)
+            .await
+            .map(|_| ())
+    }
+
+    /// Fire-and-forget + caller-held gate: see
+    /// [`Self::put_record_field_from_ca_no_notify`] and
+    /// [`Self::put_record_field_from_ca_already_locked`].
+    pub async fn put_record_field_from_ca_no_notify_already_locked(
+        &self,
+        record_name: &str,
+        field: &str,
+        value: EpicsValue,
+    ) -> CaResult<()> {
+        self.put_record_field_from_ca_inner(record_name, field, value, false, false)
+            .await
+            .map(|_| ())
     }
 
     async fn put_record_field_from_ca_inner(
@@ -481,6 +515,7 @@ impl PvDatabase {
         field: &str,
         value: EpicsValue,
         acquire_gate: bool,
+        want_notify: bool,
     ) -> CaResult<Option<crate::runtime::sync::oneshot::Receiver<()>>> {
         let field = field.to_ascii_uppercase();
 
@@ -542,19 +577,28 @@ impl PvDatabase {
                 drop(instance);
                 // Continue to the put-notify setup + process below
                 // by jumping past the field-write step (the value
-                // itself isn't stored; PROC is a trigger).
-                let (completion_tx, completion_rx) = crate::runtime::sync::oneshot::channel();
-                let notify = crate::server::record::NotifyWaitSet::new(completion_tx);
-                {
-                    let rec = self.inner.records.read().await;
-                    if let Some(rec_arc) = rec.get(record_name) {
-                        let mut guard = rec_arc.write().await;
-                        if guard.notify.is_some() {
-                            return Err(CaError::PutCallbackInProgress(record_name.to_string()));
+                // itself isn't stored; PROC is a trigger). A
+                // fire-and-forget caller parks nothing — C `dbPutField`
+                // on PROC processes the record with no putNotify.
+                let parked = if want_notify {
+                    let (completion_tx, completion_rx) = crate::runtime::sync::oneshot::channel();
+                    let notify = crate::server::record::NotifyWaitSet::new(completion_tx);
+                    {
+                        let rec = self.inner.records.read().await;
+                        if let Some(rec_arc) = rec.get(record_name) {
+                            let mut guard = rec_arc.write().await;
+                            if guard.notify.is_some() {
+                                return Err(CaError::PutCallbackInProgress(
+                                    record_name.to_string(),
+                                ));
+                            }
+                            guard.notify = Some(notify.clone());
                         }
-                        guard.notify = Some(notify.clone());
                     }
-                }
+                    Some((notify, completion_rx))
+                } else {
+                    None
+                };
                 let mut visited = HashSet::new();
                 // this PROC trigger already holds `record_name`'s
                 // advisory write gate — either `_record_gate` above, or
@@ -570,10 +614,15 @@ impl PvDatabase {
                 // already completed the chain was fully synchronous —
                 // report immediate success; otherwise hand the receiver
                 // to the CA layer to await the deferred completion.
-                return if notify.completed() {
-                    Ok(None)
-                } else {
-                    Ok(Some(completion_rx))
+                return match parked {
+                    Some((notify, completion_rx)) => {
+                        if notify.completed() {
+                            Ok(None)
+                        } else {
+                            Ok(Some(completion_rx))
+                        }
+                    }
+                    None => Ok(None),
                 };
             }
 
@@ -821,18 +870,28 @@ impl PvDatabase {
         // overwriting the wait-set would drop the prior Sender, waking
         // the prior caller's rx with RecvError that the CA dispatcher
         // treats as success.
-        let (completion_tx, completion_rx) = crate::runtime::sync::oneshot::channel();
-        let notify = crate::server::record::NotifyWaitSet::new(completion_tx);
-        {
-            let rec = self.inner.records.read().await;
-            if let Some(rec_arc) = rec.get(record_name) {
-                let mut guard = rec_arc.write().await;
-                if guard.notify.is_some() {
-                    return Err(CaError::PutCallbackInProgress(record_name.to_string()));
+        //
+        // A fire-and-forget put parks NOTHING — C builds a `putNotify`
+        // only in `dbPutNotify`; `dbPutField` processes the record with
+        // no notify state at all. It therefore neither conflicts with
+        // nor disturbs a WRITE_NOTIFY already parked on the record.
+        let parked = if want_notify {
+            let (completion_tx, completion_rx) = crate::runtime::sync::oneshot::channel();
+            let notify = crate::server::record::NotifyWaitSet::new(completion_tx);
+            {
+                let rec = self.inner.records.read().await;
+                if let Some(rec_arc) = rec.get(record_name) {
+                    let mut guard = rec_arc.write().await;
+                    if guard.notify.is_some() {
+                        return Err(CaError::PutCallbackInProgress(record_name.to_string()));
+                    }
+                    guard.notify = Some(notify.clone());
                 }
-                guard.notify = Some(notify.clone());
             }
-        }
+            Some((notify, completion_rx))
+        } else {
+            None
+        };
 
         // When a CA put writes directly to VAL on an INPUT record whose
         // VAL is the engineering value, the built-in `RVAL → VAL`
@@ -885,7 +944,13 @@ impl PvDatabase {
         // is still in flight. This gates only the originating record's
         // PUTF clear — independent of whether downstream chain targets
         // are still pending.
-        let originating_pending = {
+        //
+        // A fire-and-forget put parked nothing, and a `notify` it sees
+        // on the instance belongs to some other caller's WRITE_NOTIFY —
+        // not evidence about THIS put. Fall through to the guarded
+        // clear; its `!is_processing()` gate already preserves PUTF
+        // across an async-pending device round-trip.
+        let originating_pending = want_notify && {
             let rec = self.inner.records.read().await;
             if let Some(rec_arc) = rec.get(record_name) {
                 rec_arc.read().await.notify.is_some()
@@ -921,10 +986,15 @@ impl PvDatabase {
         // wait-set drained to zero during this call (fully synchronous
         // chain); otherwise the receiver fires later from the last
         // chain member's `leave`.
-        if notify.completed() {
-            Ok(None)
-        } else {
-            Ok(Some(completion_rx))
+        match parked {
+            Some((notify, completion_rx)) => {
+                if notify.completed() {
+                    Ok(None)
+                } else {
+                    Ok(Some(completion_rx))
+                }
+            }
+            None => Ok(None),
         }
     }
 

@@ -1198,13 +1198,22 @@ impl GroupChannel {
                     .map_err(to_err)?;
                 }
                 ProcessMode::Passive => {
+                    // Group member puts never await completion — use the
+                    // fire-and-forget entry so no put-notify wait-set is
+                    // parked on the member record (a dropped receiver
+                    // would occupy its notify slot until async
+                    // processing settles).
                     if already_locked {
                         self.db
-                            .put_record_field_from_ca_already_locked(record_name, field_name, value)
+                            .put_record_field_from_ca_no_notify_already_locked(
+                                record_name,
+                                field_name,
+                                value,
+                            )
                             .await
                     } else {
                         self.db
-                            .put_record_field_from_ca(record_name, field_name, value)
+                            .put_record_field_from_ca_no_notify(record_name, field_name, value)
                             .await
                     }
                     .map_err(to_err)?;

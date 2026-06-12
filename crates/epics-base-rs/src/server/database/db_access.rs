@@ -158,43 +158,41 @@ impl DbChannel {
 
     /// Write a value AND trigger record processing (like CA put).
     /// Use for motor VAL, busy records, etc. where processing drives hardware.
+    /// Fire-and-forget — C `dbPutField` semantics; no put-notify is
+    /// parked, so concurrent `ca_put_callback`s on the record stay legal.
     pub async fn put_f64_process(&self, v: f64) -> CaResult<()> {
         let (record_name, field) = parse_pv_name(&self.name);
-        let _ = self
-            .db
-            .put_record_field_from_ca(record_name, field, EpicsValue::Double(v))
-            .await?;
-        Ok(())
+        self.db
+            .put_record_field_from_ca_no_notify(record_name, field, EpicsValue::Double(v))
+            .await
     }
 
     /// Write i16 + trigger processing. For bo/mbbo commands.
     pub async fn put_i16_process(&self, v: i16) -> CaResult<()> {
         let (record_name, field) = parse_pv_name(&self.name);
-        let _ = self
-            .db
-            .put_record_field_from_ca(record_name, field, EpicsValue::Short(v))
-            .await?;
-        Ok(())
+        self.db
+            .put_record_field_from_ca_no_notify(record_name, field, EpicsValue::Short(v))
+            .await
     }
 
     /// Write i32 + trigger processing. For longout commands.
     pub async fn put_i32_process(&self, v: i32) -> CaResult<()> {
         let (record_name, field) = parse_pv_name(&self.name);
-        let _ = self
-            .db
-            .put_record_field_from_ca(record_name, field, EpicsValue::Long(v))
-            .await?;
-        Ok(())
+        self.db
+            .put_record_field_from_ca_no_notify(record_name, field, EpicsValue::Long(v))
+            .await
     }
 
     /// Write string + trigger processing. For stringout commands.
     pub async fn put_string_process(&self, v: &str) -> CaResult<()> {
         let (record_name, field) = parse_pv_name(&self.name);
-        let _ = self
-            .db
-            .put_record_field_from_ca(record_name, field, EpicsValue::String(v.to_string().into()))
-            .await?;
-        Ok(())
+        self.db
+            .put_record_field_from_ca_no_notify(
+                record_name,
+                field,
+                EpicsValue::String(v.to_string().into()),
+            )
+            .await
     }
 
     /// Read i32 value. For longin/longout.

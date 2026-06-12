@@ -691,15 +691,31 @@ impl BridgeChannel {
                         .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
                 }
                 ProcessMode::Passive => {
-                    let notify_rx = self
-                        .db
-                        .put_record_field_from_ca(&self.record_name, &self.field, value)
-                        .await
-                        .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
-                    if opts.block
-                        && let Some(rx) = notify_rx
-                    {
-                        let _ = rx.await;
+                    if opts.block {
+                        let notify_rx = self
+                            .db
+                            .put_record_field_from_ca(&self.record_name, &self.field, value)
+                            .await
+                            .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
+                        if let Some(rx) = notify_rx {
+                            let _ = rx.await;
+                        }
+                    } else {
+                        // Non-blocking PVA put — pvxs completes it
+                        // without `dbNotify` state (C parity:
+                        // `dbPutField`, not `dbPutNotify`). Parking a
+                        // wait-set here and dropping its receiver would
+                        // occupy the record's notify slot until any
+                        // async processing settles, failing legitimate
+                        // blocking puts in the meantime.
+                        self.db
+                            .put_record_field_from_ca_no_notify(
+                                &self.record_name,
+                                &self.field,
+                                value,
+                            )
+                            .await
+                            .map_err(|e| BridgeError::PutRejected(e.to_string()))?;
                     }
                 }
                 ProcessMode::Force => {

@@ -3275,6 +3275,118 @@ async fn test_put_notify_refuses_second_in_flight() {
     );
 }
 
+/// Boundary (the live defect): a fire-and-forget put — C `dbPutField`
+/// semantics: CA_PROTO_WRITE, `dbpf`, the internal `put_*_process`
+/// helpers, non-blocking PVA puts — parks NO put-notify wait-set, even
+/// when the record goes async-pending. Pre-fix EVERY processing put
+/// parked one; a caller that dropped the receiver left the record's
+/// notify slot occupied for the whole async round trip (a motor's
+/// whole motion), refusing every legitimate WRITE_NOTIFY on the record
+/// with PutCallbackInProgress in the meantime.
+#[tokio::test]
+async fn test_fire_and_forget_put_parks_no_notify_write_notify_stays_legal() {
+    let db = PvDatabase::new();
+    db.add_record("PN_FF", Box::new(AsyncRecord { val: 0.0 }))
+        .await
+        .unwrap();
+
+    db.put_record_field_from_ca_no_notify("PN_FF", "VAL", EpicsValue::Double(1.0))
+        .await
+        .expect("fire-and-forget put must succeed");
+    {
+        let rec = db.get_record("PN_FF").await.unwrap();
+        let inst = rec.read().await;
+        assert!(inst.is_processing(), "async pending → PACT=true");
+        assert!(
+            inst.notify.is_none(),
+            "a fire-and-forget put must not park a put-notify wait-set \
+             (C builds a putNotify only in dbPutNotify, never dbPutField)"
+        );
+        assert!(
+            inst.common.putf,
+            "PUTF must survive the async round trip in no-notify mode \
+             (the !is_processing() gate, not originating_pending, must \
+             carry it)"
+        );
+    }
+
+    // A WRITE_NOTIFY arriving mid-flight must be accepted — pre-fix it
+    // was refused with PutCallbackInProgress because the fire-and-forget
+    // put's orphaned wait-set occupied the slot.
+    let rx = db
+        .put_record_field_from_ca("PN_FF", "VAL", EpicsValue::Double(2.0))
+        .await
+        .expect("WRITE_NOTIFY after a fire-and-forget put must be accepted")
+        .expect("record is still async-pending → completion is deferred");
+
+    db.complete_async_record("PN_FF").await.unwrap();
+    rx.await
+        .expect("deferred WRITE_NOTIFY completion must fire at async completion");
+}
+
+/// Boundary (other direction): a fire-and-forget put on a record with
+/// a WRITE_NOTIFY already parked is accepted (C `dbPutField` carries no
+/// notify state to conflict) and leaves the parked wait-set undisturbed
+/// — it neither steals nor fires the prior caller's completion.
+#[tokio::test]
+async fn test_fire_and_forget_put_does_not_disturb_parked_notify() {
+    let db = PvDatabase::new();
+    db.add_record("PN_FF2", Box::new(AsyncRecord { val: 0.0 }))
+        .await
+        .unwrap();
+
+    let mut rx = db
+        .put_record_field_from_ca("PN_FF2", "VAL", EpicsValue::Double(1.0))
+        .await
+        .expect("WRITE_NOTIFY must succeed")
+        .expect("async record defers completion");
+
+    db.put_record_field_from_ca_no_notify("PN_FF2", "VAL", EpicsValue::Double(2.0))
+        .await
+        .expect("fire-and-forget put must be accepted while a notify is parked");
+    assert!(
+        matches!(
+            rx.try_recv(),
+            Err(epics_base_rs::runtime::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "the fire-and-forget put fired or dropped the parked WRITE_NOTIFY \
+         completion — it must leave the prior caller's wait-set alone"
+    );
+
+    db.complete_async_record("PN_FF2").await.unwrap();
+    rx.await
+        .expect("parked WRITE_NOTIFY completion must still fire at async completion");
+}
+
+/// Boundary: synchronous-completion PUTF clear still runs in no-notify
+/// mode. `originating_pending` keys on the instance's parked notify;
+/// a fire-and-forget put parks nothing, so it must fall through to the
+/// guarded clear rather than mistaking an empty slot for "pending".
+#[tokio::test]
+async fn test_fire_and_forget_put_clears_putf_on_sync_completion() {
+    let db = PvDatabase::new();
+    db.add_record("PN_FF_SYNC", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    db.put_record_field_from_ca_no_notify("PN_FF_SYNC", "VAL", EpicsValue::Double(42.0))
+        .await
+        .expect("fire-and-forget put must succeed");
+
+    let rec = db.get_record("PN_FF_SYNC").await.unwrap();
+    let inst = rec.read().await;
+    assert!(
+        !inst.common.putf,
+        "after synchronous completion the fire-and-forget put must clear \
+         PUTF (mirrors C recGblFwdLink:302)"
+    );
+    assert_eq!(
+        inst.record.get_field("VAL"),
+        Some(EpicsValue::Double(42.0)),
+        "the value must have been applied"
+    );
+}
+
 #[tokio::test]
 async fn test_sdis_disable_notifies_alarm() {
     // C `dbAccess.c:587-592` — the disable branch of `dbProcess` posts:

@@ -267,14 +267,15 @@ fn cmd_dbpf() -> CommandDef {
                 EpicsValue::String(value_str.clone().into())
             };
 
-            // Use put_record_field_from_ca for records (triggers process like CA put).
-            // Fall back to put_pv for simple PVs.
+            // C `dbpf` writes via `dbPutField` — processing put, but no
+            // putNotify and no completion wait. Use the fire-and-forget
+            // entry so the shell put never parks a notify wait-set on
+            // the record. Fall back to put_pv for simple PVs.
             let put_result: CaResult<()> = ctx.block_on(async {
                 let db = ctx.db();
                 if db.get_record(base).await.is_some() {
-                    db.put_record_field_from_ca(base, &field, value)
+                    db.put_record_field_from_ca_no_notify(base, &field, value)
                         .await
-                        .map(|_| ())
                 } else {
                     db.put_pv(name, value).await
                 }

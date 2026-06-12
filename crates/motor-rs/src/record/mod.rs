@@ -465,8 +465,12 @@ mod tests {
         // Offset should be updated, DVAL unchanged
         assert_eq!(rec.pos.dval, 5.0);
         assert_eq!(rec.pos.off, 95.0); // 100 - 1*5
-        // SET mode produces SetPosition command via process path
-        assert_eq!(rec.last_write, Some(CommandSource::Set));
+        // C 2206-2227: the FOFF=Variable redefinition completes on the
+        // spot — no controller command is dispatched (LOAD_POS belongs
+        // to the Frozen/DVAL/RVAL paths) and DMOV stays TRUE.
+        assert_eq!(rec.last_write, None);
+        assert!(rec.stat.dmov);
+        assert!(rec.stat.mip.is_empty());
     }
 
     #[test]

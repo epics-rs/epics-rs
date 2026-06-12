@@ -303,6 +303,28 @@ fn test_set_mode_offset_redefinition_retranslates_user_limits() {
 }
 
 #[test]
+fn test_set_foff_variable_val_completes_without_command() {
+    // C 2206-2227: SET + FOFF=Variable VAL acts directly — offset and
+    // RBV retranslate, mip = MIP_DONE, dmov = TRUE, and the pass
+    // returns before the move block: no LOAD_POS, no motion.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.pos.val = 5.0;
+    rec.pos.dval = 5.0;
+    rec.pos.drbv = 5.0;
+    rec.stat.dmov = false; // a stale low DMOV completes on the spot
+    rec.put_field("SET", EpicsValue::Short(1)).unwrap();
+
+    rec.put_field("VAL", EpicsValue::Double(100.0)).unwrap();
+    assert_eq!(rec.pos.off, 95.0);
+    assert_eq!(rec.pos.dval, 5.0, "DVAL untouched");
+    assert_eq!(rec.pos.rbv, 100.0, "RBV retranslated through new OFF");
+    assert!(rec.stat.dmov, "C 2225: dmov = TRUE");
+    assert!(rec.stat.mip.is_empty(), "C 2223: mip = MIP_DONE");
+}
+
+#[test]
 fn test_set_mode_tweak_redefinition_retranslates_user_limits() {
     // The tweak fold in SET mode runs the same VAL redefinition (C
     // 2167-2181 feeding 2204-2227) — limits follow the offset.

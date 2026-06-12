@@ -4949,3 +4949,54 @@ mod alarm_sub {
         );
     }
 }
+
+// C process_exit (motorRecord.cc:1509-1510, restored by c970afbf after
+// the 0ef39053 transition-only experiment): FLNK fires on every process
+// pass that exits with DMOV true. Two passes the old per-path
+// suppression wrongly silenced — both leave DMOV at 1, so C fires FLNK.
+mod flnk_dmov_gate {
+    use super::*;
+
+    // A VAL write swallowed by the SPDB window (steps >= 1, inside
+    // SPDB) leaves DMOV at 1 the whole pass — C's too_small branch
+    // returns OK without touching dmov (2329-2348) and process_exit
+    // fires FLNK.
+    #[test]
+    fn spdb_suppressed_write_with_dmov_high_fires_flnk() {
+        let mut rec = MotorRecord::new();
+        rec.conv.mres = 1.0;
+        rec.retry.spdb = 5.0;
+        assert!(rec.stat.dmov);
+        rec.put_field("VAL", EpicsValue::Double(2.0)).unwrap();
+        rec.set_event(MotorEvent::UserWrite(CommandSource::Val));
+        let _ = rec.process();
+        assert!(rec.stat.dmov, "SPDB-suppressed write must not drop DMOV");
+        assert!(
+            rec.should_fire_forward_link(),
+            "C fires FLNK on the too-small pass (dmov stayed 1)"
+        );
+    }
+
+    // A jog refused at a soft limit (C 2087-2105) clears the button and
+    // returns OK with DMOV untouched — FLNK fires on that pass.
+    #[test]
+    fn refused_jog_at_soft_limit_fires_flnk() {
+        let mut rec = MotorRecord::new();
+        rec.conv.mres = 1.0;
+        rec.vel.jvel = 1.0;
+        rec.limits.hlm = 10.0;
+        rec.limits.llm = -10.0;
+        rec.limits.dhlm = 10.0;
+        rec.limits.dllm = -10.0;
+        rec.pos.val = 10.0; // at HLM: val >= hlm - refusal
+        rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+        rec.set_event(MotorEvent::UserWrite(CommandSource::Jogf));
+        let _ = rec.process();
+        assert!(!rec.ctrl.jogf, "refused jog must release the button");
+        assert!(rec.stat.dmov, "refused jog never starts motion");
+        assert!(
+            rec.should_fire_forward_link(),
+            "C fires FLNK on the refusal pass (dmov stayed 1)"
+        );
+    }
+}

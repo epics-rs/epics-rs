@@ -31,7 +31,6 @@ impl MotorRecord {
             effects.commands.push(MotorCommand::Stop {
                 acceleration: self.move_accel_egu(),
             });
-            effects.suppress_forward_link = true;
             return effects;
         }
 
@@ -55,8 +54,7 @@ impl MotorRecord {
                 self.stop_axis(&mut effects);
                 return effects;
             }
-            // Still moving — poll loop is already active, just suppress FLNK.
-            effects.suppress_forward_link = true;
+            // Still moving — poll loop is already active.
             return effects;
         }
 
@@ -138,7 +136,6 @@ impl MotorRecord {
                     }
                 }
                 effects.request_poll = true;
-                effects.suppress_forward_link = true;
                 return effects;
             }
             // Plain stop. C discriminates by pp (motorRecord.cc:1383-1402):
@@ -180,7 +177,6 @@ impl MotorRecord {
                     self.retry.rcnt += 1;
                     self.stat.mip = MipFlags::RETRY;
                     self.set_phase(MotionPhase::Idle);
-                    effects.suppress_forward_link = true;
                 }
             } else {
                 // Close enough, RTRY disabled, or LS blocked: C maybeRetry
@@ -319,7 +315,6 @@ impl MotorRecord {
             self.set_phase(MotionPhase::DelayWait);
             self.stat.mip.insert(MipFlags::DELAY_REQ);
             effects.schedule_delay = Some(std::time::Duration::from_secs_f64(self.timing.dly));
-            effects.suppress_forward_link = true;
         } else {
             self.finalize_motion(effects);
         }
@@ -381,7 +376,6 @@ impl MotorRecord {
         self.stat.mip = MipFlags::empty();
         self.set_phase(MotionPhase::Idle);
         self.plan_absolute_move(effects);
-        effects.suppress_forward_link = true;
         true
     }
 
@@ -437,7 +431,6 @@ impl MotorRecord {
             return false;
         }
         self.plan_absolute_move(effects);
-        effects.suppress_forward_link = true;
         true
     }
 
@@ -511,7 +504,6 @@ impl MotorRecord {
                 });
             }
             effects.request_poll = true;
-            effects.suppress_forward_link = true;
         } else {
             // C `maybeRetry`: MISS latches when the axis finalizes with
             // `fabs(diff) >= rdbd` (retries exhausted / disabled but not
@@ -582,7 +574,6 @@ impl MotorRecord {
                 });
             }
             effects.request_poll = true;
-            effects.suppress_forward_link = true;
         } else {
             // C `maybeRetry`: MISS latches when finalizing with
             // `fabs(diff) >= rdbd`. Boundary-inclusive, matching C line 1049.
@@ -685,7 +676,6 @@ impl MotorRecord {
             });
         }
         effects.request_poll = true;
-        effects.suppress_forward_link = true;
     }
 
     /// Start jog backlash correction (phase 1: move to pretarget at slew velocity).
@@ -711,7 +701,6 @@ impl MotorRecord {
             });
         }
         effects.request_poll = true;
-        effects.suppress_forward_link = true;
     }
 
     /// Start jog backlash phase 2 (final approach at backlash velocity).
@@ -736,6 +725,5 @@ impl MotorRecord {
             });
         }
         effects.request_poll = true;
-        effects.suppress_forward_link = true;
     }
 }

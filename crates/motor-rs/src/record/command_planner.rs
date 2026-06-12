@@ -197,7 +197,6 @@ impl MotorRecord {
                                 acceleration: self.move_accel_egu(),
                             });
                             effects.request_poll = true;
-                            effects.suppress_forward_link = true;
                             return effects;
                         }
                         RetargetAction::ExtendMove => {
@@ -223,7 +222,6 @@ impl MotorRecord {
                             // against drivers that don't.
                             self.plan_absolute_move(&mut effects);
                             self.internal.verify_retarget_on_completion = true;
-                            effects.suppress_forward_link = true;
                             return effects;
                         }
                     }
@@ -458,7 +456,6 @@ impl MotorRecord {
                     self.stat.movn = true;
                     effects.request_poll = true;
                 }
-                effects.suppress_forward_link = true;
                 return;
             }
         }
@@ -597,7 +594,6 @@ impl MotorRecord {
             );
         }
         effects.request_poll = true;
-        effects.suppress_forward_link = true;
     }
 
     /// Handle STOP command.
@@ -693,7 +689,6 @@ impl MotorRecord {
                 acceleration: self.move_accel_egu(),
             });
             effects.request_poll = true;
-            effects.suppress_forward_link = true;
             return;
         }
 
@@ -722,7 +717,6 @@ impl MotorRecord {
             // button: JOG_REQ set means a latched, undispatched request.
             self.stat.mip.remove(MipFlags::JOG_REQ);
             self.limits.lvio = true;
-            effects.suppress_forward_link = true;
             return;
         }
 
@@ -763,7 +757,6 @@ impl MotorRecord {
             acceleration: self.jog_accel_egu(),
         });
         effects.request_poll = true;
-        effects.suppress_forward_link = true;
     }
 
     /// Stop jogging.
@@ -895,7 +888,6 @@ impl MotorRecord {
                 acceleration: self.move_accel_egu(),
             });
             effects.request_poll = true;
-            effects.suppress_forward_link = true;
             return;
         }
 
@@ -945,7 +937,6 @@ impl MotorRecord {
             acceleration: self.move_accel_egu(),
         });
         effects.request_poll = true;
-        effects.suppress_forward_link = true;
     }
 
     /// Handle tweak (TWF/TWR).
@@ -1454,7 +1445,6 @@ impl MotorRecord {
                 self.stat.mip.remove(MipFlags::DELAY_REQ);
                 self.stat.mip.insert(MipFlags::DELAY_ACK);
                 effects.status_refresh = true;
-                effects.suppress_forward_link = true;
                 effects
             }
             None => {

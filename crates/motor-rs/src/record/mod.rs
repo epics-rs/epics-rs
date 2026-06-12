@@ -56,8 +56,6 @@ pub struct MotorRecord {
     pending_event: Option<MotorEvent>,
     /// Track which field was last written (for process)
     last_write: Option<CommandSource>,
-    /// Suppress FLNK during motion
-    suppress_flnk: bool,
     /// Shared state mailbox for device communication
     device_state: Option<SharedDeviceState>,
     /// Last seen status sequence number
@@ -87,7 +85,6 @@ impl Default for MotorRecord {
             alarm: AlarmFields::default(),
             pending_event: None,
             last_write: None,
-            suppress_flnk: false,
             device_state: None,
             last_seen_seq: 0,
             initialized: false,
@@ -202,10 +199,6 @@ impl Record for MotorRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        // DMOV state on entry — C: 0ef39053 fires FLNK only on the
-        // DMOV false→true transition (motion completion).
-        let dmov_before = self.stat.dmov;
-
         // If wired to device state, determine event from shared mailbox
         if self.device_state.is_some() {
             if let Some(event) = self.determine_event() {
@@ -217,11 +210,6 @@ impl Record for MotorRecord {
         // DMOV=0 means a move started (or sub-step pulse).
         // Flush DMOV=0 even if no commands were emitted (sub-step case).
         let move_started = !self.stat.dmov;
-
-        // C: 0ef39053 — FLNK fires only when DMOV transitions false→true.
-        // An explicit suppression request (NTM, in-flight retarget) still wins.
-        let dmov_completed = !dmov_before && self.stat.dmov;
-        self.suppress_flnk = effects.suppress_forward_link || !dmov_completed;
 
         // Write effects to shared mailbox for DeviceSupport.write() to consume.
         // If a previous batch has not been consumed yet (two process() cycles
@@ -281,8 +269,15 @@ impl Record for MotorRecord {
         }
     }
 
+    /// C process_exit (motorRecord.cc:1509-1510): `if (dmov != 0)
+    /// recGblFwdLink(pmr)` — FLNK fires on EVERY pass that exits with
+    /// DMOV true, and on nothing else. (`0ef39053` gated this on the
+    /// DMOV false→true transition; `c970afbf` reverted it: "Except for
+    /// the condition that DMOV == FALSE, FLNK processing was
+    /// standard.") Reading DMOV directly at FLNK time IS the C gate by
+    /// construction — there is no per-path suppression state to track.
     fn should_fire_forward_link(&self) -> bool {
-        !self.suppress_flnk
+        self.stat.dmov
     }
 
     /// Input links the framework must resolve via `dbGetLink` BEFORE each
@@ -474,7 +469,8 @@ mod tests {
         let mut rec = MotorRecord::new();
         assert!(rec.should_fire_forward_link());
 
-        rec.suppress_flnk = true;
+        // C motorRecord.cc:1509-1510: DMOV is the only FLNK gate.
+        rec.stat.dmov = false;
         assert!(!rec.should_fire_forward_link());
     }
 
@@ -650,17 +646,16 @@ mod tests {
         );
     }
 
-    // C: 0ef39053 — FLNK fires only on the DMOV false→true transition.
+    // C motorRecord.cc:1509-1510 (restored by c970afbf): FLNK fires on
+    // every pass exiting with DMOV true — including a bare idle pass.
     #[test]
-    fn test_flnk_suppressed_on_idle_process_without_transition() {
+    fn test_flnk_fires_on_idle_pass_with_dmov_true() {
         let mut rec = MotorRecord::new();
-        // Already idle (DMOV=true). A bare process() with no motion must
-        // not fire FLNK — there is no false→true transition.
         assert!(rec.stat.dmov);
         let _ = rec.process();
         assert!(
-            !rec.should_fire_forward_link(),
-            "idle process with no DMOV transition must suppress FLNK"
+            rec.should_fire_forward_link(),
+            "an idle pass exits with DMOV true — C fires FLNK on it"
         );
     }
 

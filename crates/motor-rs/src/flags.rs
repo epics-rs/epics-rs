@@ -315,6 +315,10 @@ pub struct ProcessEffects {
     pub commands: Vec<MotorCommand>,
     pub schedule_delay: Option<std::time::Duration>,
     pub request_poll: bool,
+    /// Not consulted: FLNK is gated solely on DMOV at process exit
+    /// (C motorRecord.cc:1509-1510, `if (dmov != 0) recGblFwdLink`) —
+    /// the record core neither sets nor reads this. Retained only so
+    /// the public struct shape is unchanged.
     pub suppress_forward_link: bool,
     pub status_refresh: bool,
 }

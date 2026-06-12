@@ -92,8 +92,8 @@ fn val_during_motion_same_direction_accepted() {
     // is_preferred_direction comparing against the most recent target
     // across successive in-flight retargets.
     assert_eq!(rec.internal.ldvl, 80.0);
-    // FLNK must still be suppressed since motion continues.
-    assert!(effects.suppress_forward_link);
+    // Motion continues: DMOV stays 0 — C's only FLNK gate
+    // (motorRecord.cc:1509-1510 fires recGblFwdLink iff dmov != 0).
     assert!(!rec.stat.dmov);
 }
 

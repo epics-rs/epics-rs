@@ -603,35 +603,52 @@ fn test_hyst_alarm_hysteresis() {
 
 #[test]
 fn test_deadband_mdel() {
+    // MDEL gates the DBE_VALUE class only. ADEL=0 archives every
+    // actual change (C `recGblCheckDeadband` with deadband 0 fires on
+    // any non-zero delta, aiRecord.c `monitor()` posts DBE_ARCHIVE),
+    // so a sub-MDEL change still posts VAL — with DBE_LOG alone.
+    use epics_base_rs::server::recgbl::EventMask;
     let mut rec = AiRecord::default();
     rec.mdel = 5.0;
     rec.adel = 0.0;
     let mut instance = RecordInstance::new("TEST".into(), rec);
+    let val_mask = |snap: &epics_base_rs::server::record::ProcessSnapshot| {
+        snap.changed_fields
+            .iter()
+            .find(|(k, _, _)| k == "VAL")
+            .map(|(_, _, m)| *m)
+            .unwrap_or(EventMask::NONE)
+    };
 
+    // Unchanged value: neither deadband fires, no VAL post.
     instance.record.set_val(EpicsValue::Double(0.0)).unwrap();
     instance.record.set_device_did_compute(true);
     let (snap, _alarm_posts) = instance.process_local().unwrap();
-    assert!(!snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
+    assert_eq!(val_mask(&snap), EventMask::NONE);
 
+    // |3-0| < MDEL=5: VALUE throttled; ADEL=0 archives the change.
     instance.record.set_val(EpicsValue::Double(3.0)).unwrap();
     instance.record.set_device_did_compute(true);
     let (snap, _alarm_posts) = instance.process_local().unwrap();
-    assert!(!snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
+    assert_eq!(val_mask(&snap), EventMask::LOG);
 
+    // |6-0| > 5: both classes fire, MLST -> 6.
     instance.record.set_val(EpicsValue::Double(6.0)).unwrap();
     instance.record.set_device_did_compute(true);
     let (snap, _alarm_posts) = instance.process_local().unwrap();
-    assert!(snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
+    assert_eq!(val_mask(&snap), EventMask::VALUE | EventMask::LOG);
 
+    // |10-6| < 5: VALUE throttled again.
     instance.record.set_val(EpicsValue::Double(10.0)).unwrap();
     instance.record.set_device_did_compute(true);
     let (snap, _alarm_posts) = instance.process_local().unwrap();
-    assert!(!snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
+    assert_eq!(val_mask(&snap), EventMask::LOG);
 
+    // |12-6| > 5: both classes fire.
     instance.record.set_val(EpicsValue::Double(12.0)).unwrap();
     instance.record.set_device_did_compute(true);
     let (snap, _alarm_posts) = instance.process_local().unwrap();
-    assert!(snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
+    assert_eq!(val_mask(&snap), EventMask::VALUE | EventMask::LOG);
 }
 
 #[test]
@@ -643,12 +660,12 @@ fn test_deadband_mdel_zero() {
     instance.record.set_val(EpicsValue::Double(0.0)).unwrap();
     instance.record.set_device_did_compute(true);
     let (snap, _alarm_posts) = instance.process_local().unwrap();
-    assert!(!snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
+    assert!(!snap.changed_fields.iter().any(|(k, _, _)| k == "VAL"));
 
     instance.record.set_val(EpicsValue::Double(0.001)).unwrap();
     instance.record.set_device_did_compute(true);
     let (snap, _alarm_posts) = instance.process_local().unwrap();
-    assert!(snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
+    assert!(snap.changed_fields.iter().any(|(k, _, _)| k == "VAL"));
 }
 
 #[test]
@@ -660,7 +677,7 @@ fn test_deadband_mdel_negative() {
     instance.record.set_val(EpicsValue::Double(0.0)).unwrap();
     instance.record.set_device_did_compute(true);
     let (snap, _alarm_posts) = instance.process_local().unwrap();
-    assert!(snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
+    assert!(snap.changed_fields.iter().any(|(k, _, _)| k == "VAL"));
 }
 
 #[test]
@@ -744,10 +761,13 @@ fn test_deadband_alarm_on_change_bypasses_value_deadband() {
     // `db_post_events(&pdbc->stat, …)` runs independently of the
     // value-change check. This test verifies the C-correct behavior:
     // a genuine SEVR transition posts SEVR and STAT even though the
-    // VAL change is smaller than MDEL and is therefore deadband-
-    // filtered out of the same snapshot. `process_local` returns
+    // VAL change is smaller than MDEL. `process_local` returns
     // SEVR/STAT in `alarm_posts` (each with its own C event mask),
-    // not in the record-wide `changed_fields` snapshot.
+    // not in the `changed_fields` snapshot. VAL itself still posts —
+    // with `val_mask = DBE_ALARM` alone (recGbl.c:212; ai `monitor()`
+    // posts VAL whenever `monitor_mask` is non-zero), so a
+    // `DBE_ALARM`-only subscriber sees the value at the alarm moment
+    // while `DBE_VALUE` subscribers stay deadband-throttled.
     use epics_base_rs::server::recgbl::EventMask;
     let mut rec = AiRecord::default();
     rec.mdel = 100.0; // VAL change of 1.0 is below the value deadband.
@@ -768,12 +788,26 @@ fn test_deadband_alarm_on_change_bypasses_value_deadband() {
     instance.record.set_val(EpicsValue::Double(1.0)).unwrap();
     instance.record.set_device_did_compute(true);
     let (snap, alarm_posts) = instance.process_local().unwrap();
-    // VAL is deadband-filtered (|1.0 - 0.0| < MDEL=100).
-    assert!(!snap.changed_fields.iter().any(|(k, _)| k == "VAL"));
-    // SEVR / STAT are NOT in the record-wide snapshot — they ride
-    // the per-field `alarm_posts` list instead.
-    assert!(!snap.changed_fields.iter().any(|(k, _)| k == "SEVR"));
-    assert!(!snap.changed_fields.iter().any(|(k, _)| k == "STAT"));
+    // VAL's DBE_VALUE class is deadband-filtered (|1.0 - 0.0| <
+    // MDEL=100), but the default ADEL=0 archives the change (DBE_LOG)
+    // and the alarm transition adds `val_mask = DBE_ALARM`
+    // (recGbl.c:212) — so VAL posts with DBE_LOG|DBE_ALARM, never
+    // DBE_VALUE.
+    let val_mask = snap
+        .changed_fields
+        .iter()
+        .find(|(k, _, _)| k == "VAL")
+        .map(|(_, _, m)| *m);
+    assert_eq!(
+        val_mask,
+        Some(EventMask::LOG | EventMask::ALARM),
+        "alarm transition under a silent MDEL must post VAL with \
+         DBE_LOG|DBE_ALARM, without DBE_VALUE"
+    );
+    // SEVR / STAT are NOT in the snapshot — they ride the per-field
+    // `alarm_posts` list instead.
+    assert!(!snap.changed_fields.iter().any(|(k, _, _)| k == "SEVR"));
+    assert!(!snap.changed_fields.iter().any(|(k, _, _)| k == "STAT"));
     // SEVR posted DBE_VALUE on a sevr change.
     let sevr_mask = alarm_posts
         .iter()
@@ -808,6 +842,62 @@ fn test_deadband_alarm_on_change_bypasses_value_deadband() {
 }
 
 #[test]
+fn test_per_field_masks_narrow_deadband_and_aux_posts() {
+    // C posts each field with its own mask in one `db_post_events`
+    // call per field; one record-wide mask collapses that. Two rules
+    // pinned here (aiRecord.c `monitor()`; motorRecord.cc:3477-3645):
+    //   * the deadband-tracked field narrows to the deadbands that
+    //     crossed — ADEL-only crossing posts DBE_LOG, NOT DBE_VALUE,
+    //     even when another field changed in the same pass (the
+    //     pre-fix record-wide mask leaked that field's DBE_VALUE into
+    //     the deadband post, breaking the MDEL throttle for
+    //     DBE_VALUE-only subscribers);
+    //   * a change-detected auxiliary field posts DBE_VALUE|DBE_LOG
+    //     (C `monitor_mask | DBE_VALUE | DBE_LOG`, calcRecord.c:420).
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::types::DbFieldType;
+    let mut rec = AiRecord::default();
+    rec.mdel = 100.0; // VALUE class stays deadband-throttled
+    rec.adel = 0.5; // LOG class fires on |delta| > 0.5
+    let mut instance = RecordInstance::new("TEST".into(), rec);
+    let _rval_rx = instance
+        .add_subscriber("RVAL", 1, DbFieldType::Long, EventMask::VALUE.bits())
+        .expect("RVAL subscriber");
+
+    // Priming pass: MLST/ALST start at the never-posted sentinel, so
+    // the first cycle posts VAL unconditionally and seeds both.
+    instance.record.set_device_did_compute(true);
+    let _ = instance.process_local().unwrap();
+
+    // ADEL crosses (|1.0 - 0.0| > 0.5), MDEL does not (< 100), and
+    // RVAL changes in the same pass.
+    instance.record.set_val(EpicsValue::Double(1.0)).unwrap();
+    instance
+        .record
+        .put_field("RVAL", EpicsValue::Long(42))
+        .unwrap();
+    instance.record.set_device_did_compute(true);
+    let (snap, _) = instance.process_local().unwrap();
+    let mask_of = |f: &str| {
+        snap.changed_fields
+            .iter()
+            .find(|(k, _, _)| k == f)
+            .map(|(_, _, m)| *m)
+    };
+    assert_eq!(
+        mask_of("VAL"),
+        Some(EventMask::LOG),
+        "ADEL-only crossing posts VAL with DBE_LOG alone; the changed \
+         RVAL must not leak DBE_VALUE into the deadband post"
+    );
+    assert_eq!(
+        mask_of("RVAL"),
+        Some(EventMask::VALUE | EventMask::LOG),
+        "change-detected auxiliary field posts DBE_VALUE|DBE_LOG"
+    );
+}
+
+#[test]
 fn test_no_alarm_change_does_not_post_sevr_stat() {
     // C `recGbl.c:202-207`: when `prev_sevr == new_sevr` and
     // `prev_stat == new_stat`, `recGblResetAlarms` posts neither
@@ -820,8 +910,8 @@ fn test_no_alarm_change_does_not_post_sevr_stat() {
     instance.record.set_val(EpicsValue::Double(1.0)).unwrap();
     instance.record.set_device_did_compute(true);
     let (snap, alarm_posts) = instance.process_local().unwrap();
-    assert!(!snap.changed_fields.iter().any(|(k, _)| k == "SEVR"));
-    assert!(!snap.changed_fields.iter().any(|(k, _)| k == "STAT"));
+    assert!(!snap.changed_fields.iter().any(|(k, _, _)| k == "SEVR"));
+    assert!(!snap.changed_fields.iter().any(|(k, _, _)| k == "STAT"));
     assert!(!alarm_posts.iter().any(|(f, _)| *f == "SEVR"));
     assert!(!alarm_posts.iter().any(|(f, _)| *f == "STAT"));
 }

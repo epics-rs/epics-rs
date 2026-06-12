@@ -1726,30 +1726,34 @@ impl RecordInstance {
                 // sevr/stat but returned an empty snapshot, so a
                 // `process_local`-driven reentrant record went INVALID
                 // silently — no monitor ever reached the operator.
+                // Per-field C masks (recGbl.c:201-220): this guard only
+                // runs on a fresh SCAN_ALARM/INVALID raise, so sevr AND
+                // stat both moved — SEVR posts DBE_VALUE, STAT posts
+                // `stat_mask` = DBE_ALARM|DBE_VALUE, VAL posts
+                // DBE_VALUE|DBE_LOG plus `val_mask = DBE_ALARM`.
                 let mut changed_fields = Vec::new();
                 if let Some(val) = self.record.val() {
-                    changed_fields.push(("VAL".to_string(), val));
+                    changed_fields.push((
+                        "VAL".to_string(),
+                        val,
+                        EventMask::VALUE | EventMask::LOG | EventMask::ALARM,
+                    ));
                 }
                 changed_fields.push((
                     "SEVR".to_string(),
                     EpicsValue::Short(self.common.sevr as i16),
+                    EventMask::VALUE,
                 ));
                 changed_fields.push((
                     "STAT".to_string(),
                     EpicsValue::Short(self.common.stat as i16),
+                    EventMask::ALARM | EventMask::VALUE,
                 ));
-                return Ok((
-                    ProcessSnapshot {
-                        changed_fields,
-                        event_mask: EventMask::VALUE | EventMask::LOG | EventMask::ALARM,
-                    },
-                    Vec::new(),
-                ));
+                return Ok((ProcessSnapshot { changed_fields }, Vec::new()));
             }
             return Ok((
                 ProcessSnapshot {
                     changed_fields: Vec::new(),
-                    event_mask: EventMask::NONE,
                 },
                 Vec::new(),
             ));
@@ -1849,7 +1853,6 @@ impl RecordInstance {
             return Ok((
                 ProcessSnapshot {
                     changed_fields: Vec::new(),
-                    event_mask: EventMask::NONE,
                 },
                 Vec::new(),
             ));
@@ -1860,7 +1863,11 @@ impl RecordInstance {
             // subsequent I/O Intr cycles can continue processing normally.
             self.common.time = crate::runtime::general_time::get_current();
             // Filter out fields that haven't actually changed, and update
-            // MLST/last_posted for those that have.
+            // MLST/last_posted for those that have. Each intermediate
+            // post carries DBE_VALUE|DBE_LOG — C motor's mid-move
+            // `db_post_events` calls use `DBE_VAL_LOG`
+            // (motorRecord.cc:2606 DMOV, and every other do_work post);
+            // no alarm transition ran on this pending pass.
             let mut changed_fields = Vec::new();
             for (name, val) in fields {
                 let changed = match self.last_posted.get(&name) {
@@ -1875,22 +1882,11 @@ impl RecordInstance {
                         }
                     }
                     self.last_posted.insert(name.clone(), val.clone());
-                    changed_fields.push((name, val));
+                    changed_fields.push((name, val, EventMask::VALUE | EventMask::LOG));
                 }
             }
-            let event_mask = if changed_fields.is_empty() {
-                EventMask::NONE
-            } else {
-                EventMask::VALUE | EventMask::ALARM
-            };
             // _guard drops here, clearing the processing flag
-            return Ok((
-                ProcessSnapshot {
-                    changed_fields,
-                    event_mask,
-                },
-                Vec::new(),
-            ));
+            return Ok((ProcessSnapshot { changed_fields }, Vec::new()));
         }
 
         // UDF update before alarm evaluation — C parity (see
@@ -1912,44 +1908,46 @@ impl RecordInstance {
         self.common.time = crate::runtime::general_time::get_current();
         // UDF already updated above — do not clear unconditionally.
 
-        // Compute event mask
-        let mut event_mask = EventMask::NONE;
-
         // Deadband check for VAL monitor filtering
         let (include_val, include_archive) = self.check_deadband_ext();
-        if include_val {
-            event_mask |= EventMask::VALUE;
-        }
-        if include_archive {
-            event_mask |= EventMask::LOG;
-        }
-        // Carry DBE_ALARM on the record-wide event mask whenever the
-        // severity/status OR the alarm message moved — aligning with
-        // the `processing.rs` link path (`event_mask |= ALARM` on
-        // `alarm_changed || amsg_changed`). The pre-fix branch checked
-        // only `alarm_changed`, so a put that changed AMSG without
-        // moving SEVR/STAT posted VAL without the DBE_ALARM bit.
-        if alarm_result.alarm_changed || alarm_result.amsg_changed {
-            event_mask |= EventMask::ALARM;
-        }
+        // C `recGblResetAlarms` `val_mask = DBE_ALARM`
+        // (recGbl.c:194/203/212): every monitored-value post this cycle
+        // carries DBE_ALARM when the severity/status OR the alarm
+        // message moved — same parity rule as the `processing.rs`
+        // paths.
+        let alarm_bits = if alarm_result.alarm_changed || alarm_result.amsg_changed {
+            EventMask::ALARM
+        } else {
+            EventMask::NONE
+        };
 
         // Build snapshot
         let mut changed_fields = Vec::new();
-        // Same deadband-field routing as the `processing.rs` paths: the
-        // deadband triggers deliver the field the deadband tracks; a
-        // non-primary deadband field (motor RBV — C motor `monitor()`,
-        // motorRecord.cc:3468-3507) leaves VAL to the generic
-        // change-detection loop below.
+        // Same deadband-field routing and per-field mask as the
+        // `processing.rs` paths: the tracked field posts the classes
+        // that actually fired (MDEL → DBE_VALUE, ADEL → DBE_LOG, alarm
+        // movement → DBE_ALARM); a non-primary deadband field (motor
+        // RBV — C motor `monitor()`, motorRecord.cc:3468-3507) leaves
+        // VAL to the generic change-detection loop below.
         let deadband_field = self.record.monitor_deadband_field();
-        if deadband_field == "VAL" {
+        let deadband_mask = {
+            let mut m = alarm_bits;
             if include_val {
-                if let Some(val) = self.record.val() {
-                    changed_fields.push(("VAL".to_string(), val));
-                }
+                m |= EventMask::VALUE;
             }
-        } else if include_val || include_archive {
-            if let Some(val) = self.resolve_field(deadband_field) {
-                changed_fields.push((deadband_field.to_string(), val));
+            if include_archive {
+                m |= EventMask::LOG;
+            }
+            m
+        };
+        if !deadband_mask.is_empty() {
+            let dval = if deadband_field == "VAL" {
+                self.record.val()
+            } else {
+                self.resolve_field(deadband_field)
+            };
+            if let Some(val) = dval {
+                changed_fields.push((deadband_field.to_string(), val, deadband_mask));
             }
         }
         // C `recGblResetAlarms` (recGbl.c:201-220) posts each alarm
@@ -1996,31 +1994,18 @@ impl RecordInstance {
             alarm_posts.push(("ACKS", EventMask::VALUE));
         }
 
-        // Post UDF on the snapshot whenever any monitor event fires this
-        // cycle — mirrors the two `processing.rs` UDF pushes
-        // (`database/processing.rs:1327` and `:1948`,
-        // `if !event_mask.is_empty()`). C `recGblResetAlarms` /
-        // `recGblCheckUDF` (recGbl.c) keep UDF current every process
-        // cycle, and `db_post_events` delivers `.UDF` alongside the
-        // record-wide post. `process_local` is the foreign-process path
-        // (`db.process_record`, e.g. QSRV group-process members); without
-        // this push a UDF change here is never delivered to `.UDF`
-        // subscribers — the `sub_updates` loop below deliberately excludes
-        // UDF to avoid a double-post, so the push must be here.
-        if !event_mask.is_empty() {
-            changed_fields.push((
-                "UDF".to_string(),
-                EpicsValue::Char(if self.common.udf { 1 } else { 0 }),
-            ));
-        }
-
         // Add subscribed fields that actually changed since last notification.
         // Exclude {deadband-field}/SEVR/STAT/AMSG/UDF — all five are already
         // emitted by this path (the deadband field, default VAL, in
         // `changed_fields`, SEVR/STAT/AMSG via `alarm_posts`, UDF via the
-        // explicit UDF push above). Mirrors the two `processing.rs`
+        // explicit UDF push below). Mirrors the two `processing.rs`
         // snapshot gates, which exclude the same five; excluding only the
-        // first three would double-post AMSG and UDF.
+        // first three would double-post AMSG and UDF. Each carries
+        // DBE_VALUE|DBE_LOG plus the cycle's alarm bits — the C
+        // convention for change-detected auxiliary posts
+        // (`monitor_mask | DBE_VALUE | DBE_LOG`, calcRecord.c:420,
+        // subRecord.c:400; motor `DBE_VAL_LOG` for marked fields,
+        // motorRecord.cc:3522-3645).
         let mut sub_updates: Vec<(String, EpicsValue)> = Vec::new();
         for (field, subs) in &self.subscribers {
             if !subs.is_empty()
@@ -2041,21 +2026,41 @@ impl RecordInstance {
                 }
             }
         }
+        let aux_mask = alarm_bits | EventMask::VALUE | EventMask::LOG;
         if !sub_updates.is_empty() {
             for (field, val) in &sub_updates {
                 self.last_posted.insert(field.clone(), val.clone());
             }
-            changed_fields.extend(sub_updates);
-            event_mask |= EventMask::VALUE;
+            changed_fields.extend(
+                sub_updates
+                    .into_iter()
+                    .map(|(field, val)| (field, val, aux_mask)),
+            );
         }
 
-        Ok((
-            ProcessSnapshot {
-                changed_fields,
-                event_mask,
-            },
-            alarm_posts,
-        ))
+        // Post UDF on the snapshot whenever any monitor event fires this
+        // cycle, carrying the union of the cycle's posted classes —
+        // mirrors the two `processing.rs` UDF pushes. C
+        // `recGblResetAlarms` / `recGblCheckUDF` (recGbl.c) keep UDF
+        // current every process cycle, and `db_post_events` delivers
+        // `.UDF` alongside the record-wide post. `process_local` is the
+        // foreign-process path (`db.process_record`, e.g. QSRV
+        // group-process members); without this push a UDF change here is
+        // never delivered to `.UDF` subscribers — the `sub_updates` loop
+        // above deliberately excludes UDF to avoid a double-post, so the
+        // push must be here.
+        let cycle_mask = changed_fields
+            .iter()
+            .fold(EventMask::NONE, |m, (_, _, fm)| m | *fm);
+        if !cycle_mask.is_empty() {
+            changed_fields.push((
+                "UDF".to_string(),
+                EpicsValue::Char(if self.common.udf { 1 } else { 0 }),
+                cycle_mask,
+            ));
+        }
+
+        Ok((ProcessSnapshot { changed_fields }, alarm_posts))
     }
 
     /// Put a f64 value into a record field, coercing to the field's native type.
@@ -2234,13 +2239,16 @@ impl RecordInstance {
     }
 
     /// Notify subscribers from a snapshot (call outside lock).
-    /// Uses event_mask to filter: only notify subscribers whose mask intersects.
+    /// Each entry carries its own posting mask: only subscribers whose
+    /// mask intersects that field's mask are notified, and the
+    /// delivered [`MonitorEvent`] reports exactly that field's classes
+    /// (C `db_post_events(prec, &field, mask)` per-field granularity).
     pub fn notify_from_snapshot(&self, snapshot: &ProcessSnapshot) {
         use crate::server::database::filters::FilteredMonitorEvent;
         use crate::server::recgbl::EventMask;
-        let posting_mask = snapshot.event_mask;
 
-        for (field, value) in &snapshot.changed_fields {
+        for (field, value, posting_mask) in &snapshot.changed_fields {
+            let posting_mask = *posting_mask;
             if let Some(subs) = self.subscribers.get(field) {
                 // Build a full snapshot once per field (with display metadata)
                 let mon_snap = self.make_monitor_snapshot(field, value.clone());
@@ -2960,7 +2968,7 @@ mod metadata_cache_tests {
         let names = |snap: &ProcessSnapshot| {
             snap.changed_fields
                 .iter()
-                .map(|(n, _)| n.clone())
+                .map(|(n, _, _)| n.clone())
                 .collect::<Vec<_>>()
         };
 

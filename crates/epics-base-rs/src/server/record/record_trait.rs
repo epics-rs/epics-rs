@@ -251,9 +251,19 @@ pub const EPICS_TIME_EVENT_DEVICE_TIME: i16 = -2;
 
 /// Snapshot of changes from a process cycle, used for notify outside lock.
 pub struct ProcessSnapshot {
-    pub changed_fields: Vec<(String, EpicsValue)>,
-    /// Event mask computed for this cycle.
-    pub event_mask: crate::server::recgbl::EventMask,
+    /// `(field, value, mask)` — every posted field carries its own
+    /// `DBE_*` posting mask, mirroring C's per-field
+    /// `db_post_events(prec, &field, mask)`. One process cycle posts
+    /// different classes per field: a deadband-gated readback narrows
+    /// to the deadbands that actually crossed (MDEL → `DBE_VALUE`,
+    /// ADEL → `DBE_LOG`; motorRecord.cc `monitor()` 3477-3507,
+    /// aiRecord.c `monitor()`), while a change-detected auxiliary
+    /// field posts `DBE_VALUE | DBE_LOG` (motorRecord.cc 3522-3645
+    /// `DBE_VAL_LOG`; calcRecord.c:420). A single record-wide mask
+    /// collapses that granularity — an archive-only deadband crossing
+    /// would wrongly reach `DBE_VALUE` subscribers whenever any other
+    /// field changed in the same pass.
+    pub changed_fields: Vec<(String, EpicsValue, crate::server::recgbl::EventMask)>,
 }
 
 /// Trait that all EPICS record types must implement.

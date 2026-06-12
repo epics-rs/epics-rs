@@ -788,19 +788,33 @@ impl PvDatabase {
                     "Async in progress",
                 );
                 let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
-                // Post VAL event with VALUE | LOG mask (mirrors C
-                // `db_post_events(prec, &VAL, DBE_VALUE|DBE_LOG)`).
+                // Post VAL with VALUE|LOG|ALARM (C `db_post_events(prec,
+                // &VAL, DBE_VALUE|DBE_LOG)` plus recGblResetAlarms'
+                // `val_mask = DBE_ALARM` for the fresh transition). The
+                // alarm fields carry their C per-field masks
+                // (recGbl.c:201-220): this guard only runs on a fresh
+                // SCAN_ALARM/INVALID raise, so sevr AND stat both moved —
+                // SEVR posts DBE_VALUE, STAT/AMSG post the shared
+                // `stat_mask` = DBE_ALARM|DBE_VALUE.
+                use crate::server::recgbl::EventMask;
+                let stat_mask = EventMask::ALARM | EventMask::VALUE;
                 let mut changed_fields = Vec::new();
                 if let Some(val) = instance.record.val() {
-                    changed_fields.push(("VAL".to_string(), val));
+                    changed_fields.push((
+                        "VAL".to_string(),
+                        val,
+                        EventMask::VALUE | EventMask::LOG | EventMask::ALARM,
+                    ));
                 }
                 changed_fields.push((
                     "SEVR".to_string(),
                     EpicsValue::Short(instance.common.sevr as i16),
+                    EventMask::VALUE,
                 ));
                 changed_fields.push((
                     "STAT".to_string(),
                     EpicsValue::Short(instance.common.stat as i16),
+                    stat_mask,
                 ));
                 // Include AMSG so subscribers reading the alarm text
                 // observe "Async in progress" alongside the SCAN_ALARM
@@ -809,13 +823,9 @@ impl PvDatabase {
                 changed_fields.push((
                     "AMSG".to_string(),
                     EpicsValue::String(instance.common.amsg.clone().into()),
+                    stat_mask,
                 ));
-                let snapshot = crate::server::record::ProcessSnapshot {
-                    changed_fields,
-                    event_mask: crate::server::recgbl::EventMask::VALUE
-                        | crate::server::recgbl::EventMask::LOG
-                        | crate::server::recgbl::EventMask::ALARM,
-                };
+                let snapshot = crate::server::record::ProcessSnapshot { changed_fields };
                 drop(instance);
                 let inst = rec.read().await;
                 inst.notify_from_snapshot(&snapshot);
@@ -1627,6 +1637,11 @@ impl PvDatabase {
                 }
                 apply_timestamp(&mut instance.common, is_soft);
                 // Filter out fields that haven't changed, update MLST/last_posted.
+                // Each intermediate post carries DBE_VALUE|DBE_LOG — C motor's
+                // mid-move `db_post_events` calls use `DBE_VAL_LOG`
+                // (motorRecord.cc:2606 DMOV, and every other do_work post);
+                // no alarm transition ran on this pending pass, so no
+                // DBE_ALARM bit.
                 let mut changed_fields = Vec::new();
                 for (name, val) in fields {
                     let changed = match instance.last_posted.get(&name) {
@@ -1641,19 +1656,15 @@ impl PvDatabase {
                             }
                         }
                         instance.last_posted.insert(name.clone(), val.clone());
-                        changed_fields.push((name, val));
+                        changed_fields.push((
+                            name,
+                            val,
+                            crate::server::recgbl::EventMask::VALUE
+                                | crate::server::recgbl::EventMask::LOG,
+                        ));
                     }
                 }
-                let event_mask = if changed_fields.is_empty() {
-                    crate::server::recgbl::EventMask::NONE
-                } else {
-                    crate::server::recgbl::EventMask::VALUE
-                        | crate::server::recgbl::EventMask::ALARM
-                };
-                let snapshot = crate::server::record::ProcessSnapshot {
-                    changed_fields,
-                    event_mask,
-                };
+                let snapshot = crate::server::record::ProcessSnapshot { changed_fields };
                 let rec_name = instance.name.clone();
                 let rec_clone = rec.clone();
                 drop(instance);
@@ -1959,10 +1970,10 @@ impl PvDatabase {
                 None
             };
 
-            // Compute event mask (after OUT stage so async writes don't
-            // update MLST/ALST prematurely before returning early)
+            // Compute per-field posting masks (after OUT stage so async
+            // writes don't update MLST/ALST prematurely before returning
+            // early)
             use crate::server::recgbl::EventMask;
-            let mut event_mask = EventMask::NONE;
 
             let (include_val, include_archive) = match instance.record.monitor_value_changed() {
                 // lsi/lso post VALUE|LOG only when the string actually
@@ -1986,55 +1997,59 @@ impl PvDatabase {
                     }
                 }
             };
-            if include_val {
-                event_mask |= EventMask::VALUE;
-            }
-            if include_archive {
-                event_mask |= EventMask::LOG;
-            }
-            if alarm_result.alarm_changed || alarm_result.amsg_changed {
-                // C `recGbl.c:194/203` — amsg-only OR sevr-changed sets
-                // `stat_mask = DBE_ALARM`, which raises `val_mask =
-                // DBE_ALARM` at line 212. Without this, an alarm whose
-                // sevr/stat is unchanged but whose amsg shifted (e.g.
-                // device re-flagging the same severity with a different
-                // human-readable cause) silently drops the AMSG event
-                // and any DBE_ALARM-only subscribers stay stale.
-                event_mask |= EventMask::ALARM;
-            }
+            // C `recGblResetAlarms` returns `val_mask = DBE_ALARM`
+            // (recGbl.c:194/203/212) when the severity/status OR the
+            // alarm message moved — every monitored-value post this
+            // cycle carries DBE_ALARM so a `DBE_ALARM`-only subscriber
+            // sees the value at the moment the alarm changed.
+            let alarm_bits = if alarm_result.alarm_changed || alarm_result.amsg_changed {
+                EventMask::ALARM
+            } else {
+                EventMask::NONE
+            };
 
             // Build snapshot
             let mut changed_fields = Vec::new();
-            // C `recGblResetAlarms` returns `val_mask = DBE_ALARM`
-            // when any alarm field moved — the record's VAL is posted
-            // with DBE_ALARM even if the value deadband did not fire,
-            // so a `DBE_ALARM`-only subscriber sees the value at the
-            // moment the alarm changed.
-            let val_on_alarm = alarm_result.alarm_changed || alarm_result.amsg_changed;
-            // The deadband triggers deliver the field the deadband
-            // tracks. For most records that IS the primary value; a
-            // record like motor deadbands its readback (C motor
-            // `monitor()`, motorRecord.cc:3468-3507: MDEL/ADEL
-            // throttle the RBV post), and its VAL routes through the
-            // generic change-detection loop below — an unchanged
-            // setpoint is not re-posted on every readback poll.
+            // The deadband-tracked field posts with the classes that
+            // actually fired: MDEL crossing → DBE_VALUE, ADEL crossing
+            // → DBE_LOG, alarm movement → DBE_ALARM — and nothing else
+            // (C `monitor()` per-field masks: motorRecord.cc:3477-3507
+            // RBV, aiRecord.c VAL). For most records the tracked field
+            // IS the primary value; a record like motor deadbands its
+            // readback, and its VAL routes through the generic
+            // change-detection loop below — an unchanged setpoint is
+            // not re-posted on every readback poll.
             let deadband_field = instance.record.monitor_deadband_field();
-            if deadband_field == "VAL" {
-                if include_val || val_on_alarm {
-                    if let Some(val) = instance.record.val() {
-                        changed_fields.push(("VAL".to_string(), val));
-                    }
+            let deadband_mask = {
+                let mut m = alarm_bits;
+                if include_val {
+                    m |= EventMask::VALUE;
                 }
-            } else if include_val || include_archive || val_on_alarm {
-                if let Some(val) = instance.resolve_field(deadband_field) {
-                    changed_fields.push((deadband_field.to_string(), val));
+                if include_archive {
+                    m |= EventMask::LOG;
+                }
+                m
+            };
+            if !deadband_mask.is_empty() {
+                let dval = if deadband_field == "VAL" {
+                    instance.record.val()
+                } else {
+                    instance.resolve_field(deadband_field)
+                };
+                if let Some(val) = dval {
+                    changed_fields.push((deadband_field.to_string(), val, deadband_mask));
                 }
             }
             // Add subscribed fields that actually changed since last
             // notification. The deadband-gated field is excluded — it is
             // delivered by the trigger branch above, never by raw
             // change-detection (for the default `deadband_field ==
-            // "VAL"` this is the same VAL exclusion as before).
+            // "VAL"` this is the same VAL exclusion as before). Each
+            // carries DBE_VALUE|DBE_LOG plus the cycle's alarm bits —
+            // the C convention for change-detected auxiliary posts
+            // (`monitor_mask | DBE_VALUE | DBE_LOG`, calcRecord.c:420,
+            // subRecord.c:400; motor `DBE_VAL_LOG` for marked fields,
+            // motorRecord.cc:3522-3645).
             let mut sub_updates: Vec<(String, EpicsValue)> = Vec::new();
             for (field, subs) in &instance.subscribers {
                 if !subs.is_empty()
@@ -2055,12 +2070,16 @@ impl PvDatabase {
                     }
                 }
             }
+            let aux_mask = alarm_bits | EventMask::VALUE | EventMask::LOG;
             if !sub_updates.is_empty() {
                 for (field, val) in &sub_updates {
                     instance.last_posted.insert(field.clone(), val.clone());
                 }
-                changed_fields.extend(sub_updates);
-                event_mask |= crate::server::recgbl::EventMask::VALUE;
+                changed_fields.extend(
+                    sub_updates
+                        .into_iter()
+                        .map(|(field, val)| (field, val, aux_mask)),
+                );
             }
             // C `recGblResetAlarms` (recGbl.c:201-220) posts each
             // alarm field with its own per-field mask:
@@ -2085,11 +2104,6 @@ impl PvDatabase {
                 }
                 m
             };
-            if !stat_mask.is_empty() {
-                // C `val_mask = DBE_ALARM` — the value field carries
-                // DBE_ALARM whenever any alarm field moved.
-                event_mask |= EventMask::ALARM;
-            }
             // Defer the SEVR/STAT/AMSG/ACKS posts to dedicated
             // `notify_field` calls (collected here, fired after the
             // snapshot notify below) so each gets its exact C mask.
@@ -2106,16 +2120,19 @@ impl PvDatabase {
             if alarm_result.acks_changed && !stat_mask.is_empty() {
                 alarm_posts.push(("ACKS", EventMask::VALUE));
             }
-            if !event_mask.is_empty() {
+            // UDF rides along whenever any monitored post fired this
+            // cycle, carrying the union of the cycle's posted classes.
+            let cycle_mask = changed_fields
+                .iter()
+                .fold(EventMask::NONE, |m, (_, _, fm)| m | *fm);
+            if !cycle_mask.is_empty() {
                 changed_fields.push((
                     "UDF".to_string(),
                     EpicsValue::Char(if instance.common.udf { 1 } else { 0 }),
+                    cycle_mask,
                 ));
             }
-            let snapshot = crate::server::record::ProcessSnapshot {
-                changed_fields,
-                event_mask,
-            };
+            let snapshot = crate::server::record::ProcessSnapshot { changed_fields };
 
             let flnk_name = if instance.record.should_fire_forward_link() {
                 if let crate::server::record::ParsedLink::Db(ref l) = instance.parsed_flnk {
@@ -2975,7 +2992,6 @@ impl PvDatabase {
             // has joined. See `complete_put_notify` at the tail.
 
             use crate::server::recgbl::EventMask;
-            let mut event_mask = EventMask::NONE;
             let (include_val, include_archive) = match instance.record.monitor_value_changed() {
                 // lsi/lso post VALUE|LOG only when the string actually
                 // changed (C `lsiRecord.c`/`lsoRecord.c` monitor: `len !=
@@ -2998,47 +3014,54 @@ impl PvDatabase {
                     }
                 }
             };
-            if include_val {
-                event_mask |= EventMask::VALUE;
-            }
-            if include_archive {
-                event_mask |= EventMask::LOG;
-            }
-            if alarm_result.alarm_changed || alarm_result.amsg_changed {
-                // C `recGbl.c:194/203` — same parity rule as the main
-                // process path above (see comment there): amsg-only OR
-                // sevr/stat change → DBE_ALARM.
-                event_mask |= EventMask::ALARM;
-            }
+            // C `recGblResetAlarms` `val_mask = DBE_ALARM`
+            // (recGbl.c:194/203/212) — same parity rule as the main
+            // process path above (see comment there).
+            let alarm_bits = if alarm_result.alarm_changed || alarm_result.amsg_changed {
+                EventMask::ALARM
+            } else {
+                EventMask::NONE
+            };
 
             let mut changed_fields = Vec::new();
-            // Same deadband-field routing as the main process path: the
-            // triggers deliver the tracked field; a non-primary
-            // deadband field (motor RBV) leaves VAL to the generic
-            // change-detection loop below.
+            // Same deadband-field routing and per-field mask as the main
+            // process path: the tracked field posts the classes that
+            // actually fired (MDEL → DBE_VALUE, ADEL → DBE_LOG, alarm
+            // movement → DBE_ALARM); a non-primary deadband field
+            // (motor RBV) leaves VAL to the generic change-detection
+            // loop below.
             let deadband_field = instance.record.monitor_deadband_field();
-            if deadband_field == "VAL" {
+            let deadband_mask = {
+                let mut m = alarm_bits;
                 if include_val {
-                    if let Some(val) = instance.record.val() {
-                        changed_fields.push(("VAL".to_string(), val));
-                    }
+                    m |= EventMask::VALUE;
                 }
-            } else if include_val || include_archive {
-                if let Some(val) = instance.resolve_field(deadband_field) {
-                    changed_fields.push((deadband_field.to_string(), val));
+                if include_archive {
+                    m |= EventMask::LOG;
+                }
+                m
+            };
+            if !deadband_mask.is_empty() {
+                let dval = if deadband_field == "VAL" {
+                    instance.record.val()
+                } else {
+                    instance.resolve_field(deadband_field)
+                };
+                if let Some(val) = dval {
+                    changed_fields.push((deadband_field.to_string(), val, deadband_mask));
                 }
             }
             // C `recGblResetAlarms` (recGbl.c:201-220) posts each alarm
-            // field with its OWN per-field mask, not the record-wide
-            // `event_mask`. Mirror the synchronous link path
-            // (`process_record_with_links_inner`) and `process_local`
-            // exactly: SEVR=DBE_VALUE on a sevr change; STAT/AMSG share
-            // `stat_mask` which carries DBE_ALARM when sevr OR amsg
-            // moved and DBE_VALUE on a stat change; ACKS=DBE_VALUE only
-            // when an alarm field moved AND recGblResetAlarms raised it.
-            // Collapsing these into `changed_fields` would post them all
-            // on one record-wide mask — losing C's per-field
-            // granularity for `.SEVR`/`.STAT`-only subscribers.
+            // field with its OWN per-field mask. Mirror the synchronous
+            // link path (`process_record_with_links_inner`) and
+            // `process_local` exactly: SEVR=DBE_VALUE on a sevr change;
+            // STAT/AMSG share `stat_mask` which carries DBE_ALARM when
+            // sevr OR amsg moved and DBE_VALUE on a stat change;
+            // ACKS=DBE_VALUE only when an alarm field moved AND
+            // recGblResetAlarms raised it. Collapsing these into
+            // `changed_fields` would post them all on one shared mask —
+            // losing C's per-field granularity for `.SEVR`/`.STAT`-only
+            // subscribers.
             let sevr_changed = instance.common.sevr != alarm_result.prev_sevr;
             let stat_changed = instance.common.stat != alarm_result.prev_stat;
             let stat_mask = {
@@ -3058,20 +3081,11 @@ impl PvDatabase {
             if !stat_mask.is_empty() {
                 alarm_posts.push(("STAT", stat_mask));
                 alarm_posts.push(("AMSG", stat_mask));
-                // C `val_mask = DBE_ALARM` — the value field carries
-                // DBE_ALARM whenever any alarm field moved.
-                event_mask |= EventMask::ALARM;
             }
             // C parity (recGbl.c:216): ACKS is posted (DBE_VALUE) only
             // when an alarm field moved AND recGblResetAlarms raised it.
             if alarm_result.acks_changed && !stat_mask.is_empty() {
                 alarm_posts.push(("ACKS", EventMask::VALUE));
-            }
-            if !event_mask.is_empty() {
-                changed_fields.push((
-                    "UDF".to_string(),
-                    EpicsValue::Char(if instance.common.udf { 1 } else { 0 }),
-                ));
             }
             // Add subscribed non-{deadband-field,SEVR,STAT,AMSG,UDF}
             // fields that actually changed since last notification —
@@ -3082,7 +3096,10 @@ impl PvDatabase {
             // multiplying the monitor traffic for any record that pairs
             // an async write with a sticky metadata field. The
             // deadband-gated field (default VAL) is delivered by the
-            // trigger branch above, never by raw change-detection.
+            // trigger branch above, never by raw change-detection. Each
+            // carries DBE_VALUE|DBE_LOG plus the cycle's alarm bits (C
+            // `monitor_mask | DBE_VALUE | DBE_LOG` for change-detected
+            // auxiliary posts).
             let mut sub_updates: Vec<(String, EpicsValue)> = Vec::new();
             for (field, subs) in &instance.subscribers {
                 if !subs.is_empty()
@@ -3103,17 +3120,31 @@ impl PvDatabase {
                     }
                 }
             }
+            let aux_mask = alarm_bits | EventMask::VALUE | EventMask::LOG;
             if !sub_updates.is_empty() {
                 for (field, val) in &sub_updates {
                     instance.last_posted.insert(field.clone(), val.clone());
                 }
-                changed_fields.extend(sub_updates);
-                event_mask |= crate::server::recgbl::EventMask::VALUE;
+                changed_fields.extend(
+                    sub_updates
+                        .into_iter()
+                        .map(|(field, val)| (field, val, aux_mask)),
+                );
             }
-            let snapshot = crate::server::record::ProcessSnapshot {
-                changed_fields,
-                event_mask,
-            };
+            // UDF rides along whenever any monitored post fired this
+            // cycle, carrying the union of the cycle's posted classes —
+            // same rule as the main process path.
+            let cycle_mask = changed_fields
+                .iter()
+                .fold(EventMask::NONE, |m, (_, _, fm)| m | *fm);
+            if !cycle_mask.is_empty() {
+                changed_fields.push((
+                    "UDF".to_string(),
+                    EpicsValue::Char(if instance.common.udf { 1 } else { 0 }),
+                    cycle_mask,
+                ));
+            }
+            let snapshot = crate::server::record::ProcessSnapshot { changed_fields };
 
             // IVOA check
             let skip_out = if instance.common.sevr == crate::server::record::AlarmSeverity::Invalid
@@ -3793,23 +3824,23 @@ impl PvDatabase {
                     let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
 
                     // Build snapshot and notify
+                    let sim_mask = crate::server::recgbl::EventMask::VALUE
+                        | crate::server::recgbl::EventMask::ALARM;
                     let mut changed_fields = Vec::new();
                     if let Some(val) = instance.record.val() {
-                        changed_fields.push(("VAL".to_string(), val));
+                        changed_fields.push(("VAL".to_string(), val, sim_mask));
                     }
                     changed_fields.push((
                         "SEVR".to_string(),
                         EpicsValue::Short(instance.common.sevr as i16),
+                        sim_mask,
                     ));
                     changed_fields.push((
                         "STAT".to_string(),
                         EpicsValue::Short(instance.common.stat as i16),
+                        sim_mask,
                     ));
-                    let snapshot = crate::server::record::ProcessSnapshot {
-                        changed_fields,
-                        event_mask: crate::server::recgbl::EventMask::VALUE
-                            | crate::server::recgbl::EventMask::ALARM,
-                    };
+                    let snapshot = crate::server::record::ProcessSnapshot { changed_fields };
                     instance.notify_from_snapshot(&snapshot);
                 }
             } else {
@@ -3865,23 +3896,23 @@ impl PvDatabase {
                 let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
 
                 // Notify subscribers of simulation output
+                let sim_mask = crate::server::recgbl::EventMask::VALUE
+                    | crate::server::recgbl::EventMask::ALARM;
                 let mut changed_fields = Vec::new();
                 if let Some(val) = instance.record.val() {
-                    changed_fields.push(("VAL".to_string(), val));
+                    changed_fields.push(("VAL".to_string(), val, sim_mask));
                 }
                 changed_fields.push((
                     "SEVR".to_string(),
                     EpicsValue::Short(instance.common.sevr as i16),
+                    sim_mask,
                 ));
                 changed_fields.push((
                     "STAT".to_string(),
                     EpicsValue::Short(instance.common.stat as i16),
+                    sim_mask,
                 ));
-                let snapshot = crate::server::record::ProcessSnapshot {
-                    changed_fields,
-                    event_mask: crate::server::recgbl::EventMask::VALUE
-                        | crate::server::recgbl::EventMask::ALARM,
-                };
+                let snapshot = crate::server::record::ProcessSnapshot { changed_fields };
                 instance.notify_from_snapshot(&snapshot);
             }
         }

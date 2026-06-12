@@ -2104,6 +2104,25 @@ pub(crate) fn motor_sync_speed_at_init(rec: &mut MotorRecord) {
     // ACCS is derived (nonzero), so the master is whichever field ACCU
     // names; the .db loading ACCS or ACCU flips it to Accs.
     apply_accu_cascade(rec);
+
+    // C motorRecord.cc:4054-4067 — jog/home velocity sanity checks, after
+    // the speed pairs and accelerations settle. A zero field means "not
+    // configured" (JVEL/JAR/HVEL have no initial() in the dbd): JVEL
+    // defaults to VELO, JAR to VELO/ACCL, HVEL to VBAS; a configured value
+    // is clamped into [VBAS, VMAX].
+    if rec.vel.jvel == 0.0 {
+        rec.vel.jvel = rec.vel.velo;
+    } else {
+        range_check(&mut rec.vel.jvel, rec.vel.vbas, rec.vel.vmax);
+    }
+    if rec.vel.jar == 0.0 {
+        rec.vel.jar = rec.vel.velo / rec.vel.accl;
+    }
+    if rec.vel.hvel == 0.0 {
+        rec.vel.hvel = rec.vel.vbas;
+    } else {
+        range_check(&mut rec.vel.hvel, rec.vel.vbas, rec.vel.vmax);
+    }
 }
 
 /// Establish the limit invariant at IOC init — the load-time counterpart of

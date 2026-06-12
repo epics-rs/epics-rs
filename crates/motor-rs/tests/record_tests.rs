@@ -3882,6 +3882,9 @@ fn jogging_record() -> MotorRecord {
     let mut rec = MotorRecord::new();
     rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+    // JVEL has no dbd initial (defaults 0.0 = "not configured"); set it
+    // as a .db would — the LVIO jog window tests depend on JVEL=1.
+    rec.vel.jvel = 1.0;
     rec.ctrl.jogf = true;
     rec.plan_motion(CommandSource::Jogf);
     assert_eq!(rec.stat.phase, MotionPhase::Jog);
@@ -4427,6 +4430,9 @@ fn test_queued_jog_resumes_with_jogf_mip_and_live_lvio() {
     let mut rec = MotorRecord::new();
     rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+    // JVEL has no dbd initial (defaults 0.0); the LVIO window below
+    // (rbv > hlm - jvel) needs a configured JVEL=1.
+    rec.vel.jvel = 1.0;
     rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
     rec.plan_motion(CommandSource::Val);
     rec.stat.msta = MstaFlags::MOVING;
@@ -5166,5 +5172,62 @@ mod velocity_clamps {
         assert_eq!(rec.vel.vbas, -1.0, "raw during load");
         rec.put_field("VELO", EpicsValue::Double(900.0)).unwrap();
         assert_eq!(rec.vel.velo, 900.0, "raw during load");
+    }
+}
+
+// =============================================================================
+// Init-time JVEL/JAR/HVEL derivation — C check_speed_and_resolution
+// (motorRecord.cc:4054-4067)
+// =============================================================================
+
+mod init_jog_home_velocity_defaults {
+    use super::*;
+
+    // C 4055-4056: an unconfigured JVEL (no dbd initial → 0) takes VELO.
+    #[test]
+    fn unconfigured_jvel_defaults_to_velo() {
+        let mut rec = MotorRecord::new();
+        rec.put_field("VELO", EpicsValue::Double(3.0)).unwrap();
+        rec.init_record(1).unwrap();
+        assert_eq!(rec.vel.jvel, 3.0);
+    }
+
+    // C 4057-4058: a configured JVEL is clamped into [VBAS, VMAX].
+    #[test]
+    fn configured_jvel_clamped_at_init() {
+        let mut rec = MotorRecord::new();
+        rec.put_field("VMAX", EpicsValue::Double(2.0)).unwrap();
+        rec.put_field("JVEL", EpicsValue::Double(9.0)).unwrap();
+        rec.init_record(1).unwrap();
+        assert_eq!(rec.vel.jvel, 2.0);
+    }
+
+    // C 4060-4061: an unconfigured JAR takes VELO/ACCL.
+    #[test]
+    fn unconfigured_jar_defaults_to_velo_over_accl() {
+        let mut rec = MotorRecord::new();
+        rec.put_field("VELO", EpicsValue::Double(4.0)).unwrap();
+        rec.put_field("ACCL", EpicsValue::Double(0.5)).unwrap();
+        rec.init_record(1).unwrap();
+        assert_eq!(rec.vel.jar, 8.0);
+    }
+
+    // C 4064-4065: an unconfigured HVEL takes VBAS.
+    #[test]
+    fn unconfigured_hvel_defaults_to_vbas() {
+        let mut rec = MotorRecord::new();
+        rec.put_field("VBAS", EpicsValue::Double(0.7)).unwrap();
+        rec.init_record(1).unwrap();
+        assert_eq!(rec.vel.hvel, 0.7);
+    }
+
+    // C 4066-4067: a configured HVEL is clamped into [VBAS, VMAX].
+    #[test]
+    fn configured_hvel_clamped_at_init() {
+        let mut rec = MotorRecord::new();
+        rec.put_field("VBAS", EpicsValue::Double(0.5)).unwrap();
+        rec.put_field("HVEL", EpicsValue::Double(0.1)).unwrap();
+        rec.init_record(1).unwrap();
+        assert_eq!(rec.vel.hvel, 0.5);
     }
 }

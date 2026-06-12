@@ -128,8 +128,12 @@ impl Default for VelocityFields {
             accu: AccsUsed::Accl,
             bvel: 1.0,
             bacc: 0.5,
-            hvel: 1.0,
-            jvel: 1.0,
+            // JVEL/HVEL have no initial() in motorRecord.dbd — 0.0 means
+            // "not configured"; init derives JVEL from VELO and HVEL from
+            // VBAS (C check_speed_and_resolution, motorRecord.cc:4054-4067,
+            // ported in motor_sync_speed_at_init).
+            hvel: 0.0,
+            jvel: 0.0,
             jar: 0.0,
             sbak: 0.0,
         }

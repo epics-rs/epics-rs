@@ -5693,3 +5693,81 @@ fn test_lvio_refused_fresh_move_still_resets_rcnt() {
     assert!(rec.limits.lvio, "target past DHLM refused");
     assert_eq!(rec.retry.rcnt, 0, "RCNT reset precedes the refusal");
 }
+
+#[test]
+fn test_lvio_refused_write_rolls_back_drive_fields() {
+    // C 2434-2452: a refused request restores VAL/DVAL/RVAL from the
+    // last dispatched target — the refused value does not stick.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.001;
+    rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
+    rec.stat.msta = MstaFlags::DONE;
+
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+
+    assert!(rec.limits.lvio);
+    assert_eq!(rec.pos.val, 0.0, "VAL rolled back to LVAL");
+    assert_eq!(rec.pos.dval, 0.0, "DVAL rolled back to LDVL");
+    assert_eq!(rec.pos.rval, 0, "RVAL rolled back to LRVL");
+    assert!(rec.stat.dmov, "no motion started");
+}
+
+#[test]
+fn test_lvio_refused_retry_collapses_to_done() {
+    // C 2441-2451: an armed retry refused by LVIO collapses to MIP_DONE
+    // and completes with DMOV = TRUE instead of leaving the record
+    // stuck mid-retry. The retry turns non-preferred (dval == ldvl with
+    // BDST > 0), so the pretarget check refuses what the original
+    // preferred dispatch allowed.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.001;
+    rec.limits.dhlm = 10.0;
+    rec.limits.dllm = -10.0;
+    rec.limits.hlm = 10.0;
+    rec.limits.llm = -10.0;
+    rec.vel.velo = 10.0;
+    rec.vel.accl = 0.5;
+    rec.vel.bvel = 5.0;
+    rec.vel.bacc = 0.5;
+    rec.retry.bdst = 1.0;
+    rec.retry.rdbd = 0.1;
+    rec.retry.rtry = 5;
+    rec.stat.msta = MstaFlags::DONE;
+    // Stranded below the valid range: the move up to -9.5 is preferred,
+    // so its LVIO pass checks DVAL only (C 2410) and dispatches the
+    // two-leg correction through the out-of-range pretarget -10.5.
+    rec.pos.drbv = -12.0;
+    rec.pos.rbv = -12.0;
+    rec.internal.ldvl = -12.0;
+    rec.internal.lval = -12.0;
+
+    rec.put_field("VAL", EpicsValue::Double(-9.5)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    assert!(!rec.limits.lvio, "preferred dispatch allowed");
+    assert!(rec.internal.backlash_pending);
+
+    // Both legs run; the final approach stops short by 0.2 (> RDBD).
+    for stop_at in [-10.5, -9.7] {
+        let status = asyn_rs::interfaces::motor::MotorStatus {
+            position: stop_at,
+            encoder_position: stop_at,
+            done: true,
+            moving: false,
+            ..Default::default()
+        };
+        rec.process_motor_info(&status);
+        rec.check_completion();
+    }
+
+    assert!(rec.limits.lvio, "retry pretarget past DLLM refused");
+    assert!(
+        !rec.stat.mip.contains(MipFlags::RETRY),
+        "RETRY collapsed to DONE (C 2441-2445)"
+    );
+    assert!(rec.stat.mip.is_empty());
+    assert!(rec.stat.dmov, "refused retry completes (C 2446-2451)");
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert_eq!(rec.retry.rcnt, 1, "the armed retry kept its count");
+}

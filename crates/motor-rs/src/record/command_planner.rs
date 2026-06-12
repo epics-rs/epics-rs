@@ -118,6 +118,11 @@ impl MotorRecord {
                         effects.commands.push(MotorCommand::Stop {
                             acceleration: self.move_accel_egu(),
                         });
+                    } else {
+                        // C couples the failed-RDBL refusal into the same
+                        // restore gate as LVIO (2434: `lvio || rtnstat ==
+                        // FALSE`): the refused target rolls back.
+                        self.refuse_move_restore_lasts();
                     }
                     return effects;
                 }
@@ -472,6 +477,7 @@ impl MotorRecord {
                 self.limits.dllm,
                 self.limits.dhlm
             );
+            self.refuse_move_restore_lasts();
             return;
         }
 
@@ -1264,6 +1270,24 @@ impl MotorRecord {
             rate
         } else {
             self.vel.bvel.abs().max(1.0) / bacc
+        }
+    }
+
+    /// C refusal of a new motion (2434-2452, the `lvio || rtnstat == FALSE`
+    /// gate): the drive fields roll back to the last dispatched target
+    /// (VAL/DVAL/RVAL <- LVAL/LDVL/LRVL), an armed retry collapses to
+    /// DONE, and a pending completion (DMOV still low with nothing left
+    /// in flight) finishes with DMOV = TRUE.
+    pub(crate) fn refuse_move_restore_lasts(&mut self) {
+        self.pos.val = self.internal.lval;
+        self.pos.dval = self.internal.ldvl;
+        self.pos.rval = self.internal.lrvl;
+        if self.stat.mip.contains(MipFlags::RETRY) {
+            self.stat.mip = MipFlags::empty();
+        }
+        if self.stat.mip.is_empty() && !self.stat.dmov {
+            self.stat.dmov = true;
+            self.set_phase(MotionPhase::Idle);
         }
     }
 

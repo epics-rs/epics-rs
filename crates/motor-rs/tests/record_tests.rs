@@ -5343,3 +5343,47 @@ mod jvel_live_retune {
         assert_eq!(rec.vel.jar, 8.0, "init derives VELO/ACCL");
     }
 }
+
+// =============================================================================
+// DLY watchdog orphan guard — C callbackFunc (motorRecord.cc:460-480)
+// =============================================================================
+
+mod dly_orphan_guard {
+    use super::*;
+
+    // A DelayExpired that fires after the wait was rescinded (a new move
+    // replaced MIP and dropped DELAY_REQ) must do nothing — C callbackFunc
+    // ignores the orphaned watchdog.
+    #[test]
+    fn orphaned_delay_expiry_is_ignored() {
+        let mut rec = MotorRecord::new();
+        rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+        rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+        // Mid-move state with no DELAY_REQ armed (the wait was rescinded).
+        rec.stat.mip = MipFlags::MOVE;
+        rec.stat.dmov = false;
+        rec.set_event(MotorEvent::DelayExpired);
+        let effects = rec.do_process();
+        assert!(
+            !rec.stat.mip.contains(MipFlags::DELAY_ACK),
+            "orphaned expiry must not set DELAY_ACK"
+        );
+        assert!(!effects.status_refresh, "no status refresh for an orphan");
+        assert_eq!(rec.stat.mip, MipFlags::MOVE, "MIP untouched");
+    }
+
+    // A live DELAY_REQ converts to DELAY_ACK with a status refresh
+    // (C 470-478 REQ->ACK + scanOnce; the refresh is the GET_INFO step).
+    #[test]
+    fn armed_delay_expiry_acks_and_refreshes() {
+        let mut rec = MotorRecord::new();
+        rec.stat.mip = MipFlags::MOVE | MipFlags::DELAY_REQ;
+        rec.stat.dmov = false;
+        rec.stat.phase = MotionPhase::DelayWait;
+        rec.set_event(MotorEvent::DelayExpired);
+        let effects = rec.do_process();
+        assert!(rec.stat.mip.contains(MipFlags::DELAY_ACK));
+        assert!(!rec.stat.mip.contains(MipFlags::DELAY_REQ));
+        assert!(effects.status_refresh);
+    }
+}

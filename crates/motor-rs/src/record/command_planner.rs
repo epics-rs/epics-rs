@@ -1483,11 +1483,20 @@ impl MotorRecord {
                 self.check_completion()
             }
             Some(MotorEvent::DelayExpired) => {
-                // C: after DLY, request fresh poll then evaluate for retry
+                // C callbackFunc (motorRecord.cc:460-480): the delay
+                // watchdog may have been rescinded between arming and
+                // firing — a new move dispatched during the wait replaces
+                // MIP wholesale and drops DELAY_REQ. Only a still-armed
+                // DELAY_REQ turns into ACK (plus the GET_INFO-equivalent
+                // status refresh); an orphaned expiry does nothing, so it
+                // cannot inject a stale completion evaluation into the
+                // new motion.
                 let mut effects = ProcessEffects::default();
-                self.stat.mip.remove(MipFlags::DELAY_REQ);
-                self.stat.mip.insert(MipFlags::DELAY_ACK);
-                effects.status_refresh = true;
+                if self.stat.mip.contains(MipFlags::DELAY_REQ) {
+                    self.stat.mip.remove(MipFlags::DELAY_REQ);
+                    self.stat.mip.insert(MipFlags::DELAY_ACK);
+                    effects.status_refresh = true;
+                }
                 effects
             }
             None => {

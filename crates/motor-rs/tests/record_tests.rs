@@ -6134,6 +6134,30 @@ fn test_vers_reports_ported_record_version() {
 }
 
 #[test]
+fn test_pid_gain_clamp_under_gain_support() {
+    // C special pidcof (3003-3014): GAIN_SUPPORT clamps the PID gains
+    // to [0,1] at write time.
+    let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::GAIN_SUPPORT;
+    rec.put_field("PCOF", EpicsValue::Double(1.5)).unwrap();
+    rec.put_field("ICOF", EpicsValue::Double(-0.5)).unwrap();
+    rec.put_field("DCOF", EpicsValue::Double(0.25)).unwrap();
+    assert_eq!(rec.pid.pcof, 1.0);
+    assert_eq!(rec.pid.icof, 0.0);
+    assert_eq!(rec.pid.dcof, 0.25);
+}
+
+#[test]
+fn test_pid_gain_raw_store_without_gain_support() {
+    // C: the whole pidcof block is inside `if (GAIN_SUPPORT)` — a
+    // controller without it stores the raw value, unclamped.
+    let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::DONE;
+    rec.put_field("PCOF", EpicsValue::Double(1.5)).unwrap();
+    assert_eq!(rec.pid.pcof, 1.5);
+}
+
+#[test]
 fn test_mlst_alst_writable_by_framework_deadband_owner() {
     // C monitor() 3485-3501 anchors the MDEL/ADEL deadbands at the
     // last POSTED readback by writing MLST/ALST. The framework's

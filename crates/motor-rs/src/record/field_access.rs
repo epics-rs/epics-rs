@@ -1825,23 +1825,40 @@ pub(crate) fn motor_put_field(
             _ => Err(CaError::TypeMismatch(name.into())),
         },
         // PID
+        // C special pidcof (3003-3026): with GAIN_SUPPORT the gain is
+        // clamped to 0.0 <= gain <= 1.0 and forwarded as SET_PGAIN/
+        // SET_IGAIN/SET_DGAIN; without it the write is a raw store (no
+        // clamp, no command). The driver forward is not emitted: the
+        // MotorDriver trait has no gain call (published 0.19.2 surface).
         "PCOF" => match value {
             EpicsValue::Double(v) => {
-                rec.pid.pcof = v;
+                rec.pid.pcof = if rec.stat.msta.contains(MstaFlags::GAIN_SUPPORT) {
+                    v.clamp(0.0, 1.0)
+                } else {
+                    v
+                };
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
         },
         "ICOF" => match value {
             EpicsValue::Double(v) => {
-                rec.pid.icof = v;
+                rec.pid.icof = if rec.stat.msta.contains(MstaFlags::GAIN_SUPPORT) {
+                    v.clamp(0.0, 1.0)
+                } else {
+                    v
+                };
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
         },
         "DCOF" => match value {
             EpicsValue::Double(v) => {
-                rec.pid.dcof = v;
+                rec.pid.dcof = if rec.stat.msta.contains(MstaFlags::GAIN_SUPPORT) {
+                    v.clamp(0.0, 1.0)
+                } else {
+                    v
+                };
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),

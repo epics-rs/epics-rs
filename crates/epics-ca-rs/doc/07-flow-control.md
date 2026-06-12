@@ -231,7 +231,7 @@ EPICS_CA_MAX_SEARCH_PERIOD=60         # faster search recovery
 For a server expecting many slow clients:
 
 ```bash
-EPICS_CAS_MAX_CHANNELS=16384          # raise channel cap
+EPICS_CAS_MAX_CHANNELS=16384          # opt into a per-client channel cap (default: unbounded)
 EPICS_CAS_INACTIVITY_TMO=300          # tighter idle cap
 EPICS_CAS_BEACON_PERIOD=15            # default
 ```

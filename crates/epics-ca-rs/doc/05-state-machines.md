@@ -341,8 +341,8 @@ spawn handle_client(stream, peer)
      │  inactivity timeout: read with EPICS_CAS_INACTIVITY_TMO
      │  accumulated buffer: capped at 1 MB
      │
-     │  CREATE_CHAN check: < EPICS_CAS_MAX_CHANNELS
-     │  EVENT_ADD check:   < EPICS_CAS_MAX_SUBS_PER_CHAN
+     │  CREATE_CHAN check: < EPICS_CAS_MAX_CHANNELS    (only when set)
+     │  EVENT_ADD check:   < EPICS_CAS_MAX_SUBS_PER_CHAN (only when set)
      │
      ▼
 loop: read frame → dispatch → reply

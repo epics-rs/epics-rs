@@ -186,16 +186,25 @@ guarantees clients don't pin server resources indefinitely.
 
 ### `EPICS_CAS_MAX_CHANNELS` (rust-only)
 
-Maximum number of channels per client connection. Default: 4096.
-Minimum: 1.
+Maximum number of channels per client connection. **Default:
+unbounded** (opt-in) — C rsrv `claim_ciu_action` imposes no per-client
+channel count limit, refusing only on genuine memory exhaustion, so a
+single legitimate client (e.g. `caget` over thousands of PVs on one
+circuit) is never refused at a fixed boundary. A fixed default
+diverged from this and produced a latency cliff at the cap boundary.
+Minimum (when set): 1.
 
-When a client tries to create the (N+1)st channel the server replies
-`CREATE_CH_FAIL` instead of allocating.
+When the variable is set and a client tries to create the (N+1)st
+channel, the server replies `ECA_ALLOCMEM` and closes the connection
+(matching C `claim_ciu_action`'s `send_err(ECA_ALLOCMEM)` + RSRV_ERROR).
 
 ### `EPICS_CAS_MAX_SUBS_PER_CHAN` (rust-only)
 
-Maximum number of subscriptions per channel. Default: 100. Minimum:
-1. Excess `EVENT_ADD` requests get `ECA_ALLOCMEM`.
+Maximum number of subscriptions per channel. **Default: unbounded**
+(opt-in) — C rsrv `event_add_action` imposes no per-channel
+subscription count limit, refusing only on genuine memory exhaustion.
+Minimum (when set): 1. When the variable is set, excess `EVENT_ADD`
+requests get `ECA_ALLOCMEM`.
 
 ### `EPICS_CAS_AUDIT_FILE` (rust-only)
 

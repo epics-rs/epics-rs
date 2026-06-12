@@ -90,8 +90,8 @@ the C ABI surface**. Details below.
 |---------|--------------|-------------|
 | Max accumulated TCP buffer per client | implicit | ✅ 1 MB |
 | Per-client inactivity timeout | partial (OS keepalive) | ✅ `EPICS_CAS_INACTIVITY_TMO` |
-| Max channels per client | implicit (memory) | ✅ `EPICS_CAS_MAX_CHANNELS` |
-| Max subscriptions per channel | implicit | ✅ `EPICS_CAS_MAX_SUBS_PER_CHAN` |
+| Max channels per client | implicit (memory) | implicit by default; opt-in `EPICS_CAS_MAX_CHANNELS` |
+| Max subscriptions per channel | implicit | implicit by default; opt-in `EPICS_CAS_MAX_SUBS_PER_CHAN` |
 | TCP keepalive on accepted sockets | ⚠️ off by default | ✅ enabled (15/5/3) |
 | Max payload size cap | ✅ `EPICS_CA_MAX_ARRAY_BYTES` | ✅ `EPICS_CA_MAX_ARRAY_BYTES` |
 

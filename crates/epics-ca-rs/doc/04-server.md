@@ -368,12 +368,17 @@ Both `ProcessVariable` and `RecordInstance` have matching
 |-------|---------|----------|
 | Inactivity timeout | 600 s | `EPICS_CAS_INACTIVITY_TMO` |
 | Accumulated buffer cap | `max_payload_size()` + 64 KiB | `EPICS_CA_MAX_ARRAY_BYTES` |
-| Max channels per client | 4096 | `EPICS_CAS_MAX_CHANNELS` |
-| Max subscriptions per channel | 100 | `EPICS_CAS_MAX_SUBS_PER_CHAN` |
+| Max channels per client | unbounded (opt-in) | `EPICS_CAS_MAX_CHANNELS` |
+| Max subscriptions per channel | unbounded (opt-in) | `EPICS_CAS_MAX_SUBS_PER_CHAN` |
 
-Exceeding any cap results in either a CREATE_CH_FAIL response, an
-ECA_ALLOCMEM error, or a clean TCP close — never an unbounded memory
-allocation.
+The channel and subscription caps are **unbounded by default** to match
+C rsrv, which imposes no per-client channel count limit
+(`claim_ciu_action`) and no per-channel subscription count limit
+(`event_add_action`) — both refuse only on genuine memory exhaustion.
+Set the corresponding variable to opt into a fixed cap. Exceeding a
+*configured* cap (or hitting the buffer/timeout guards) results in
+either a CREATE_CH_FAIL response, an ECA_ALLOCMEM error, or a clean TCP
+close — never an unbounded memory allocation.
 
 ## Connection event broadcast
 

@@ -66,20 +66,66 @@ async fn read_with_optional_timeout<R: tokio::io::AsyncReadExt + Unpin>(
     }
 }
 
-/// Maximum simultaneous channels per CA client (EPICS_CAS_MAX_CHANNELS).
-fn max_channels_per_client() -> usize {
-    epics_base_rs::runtime::env::get("EPICS_CAS_MAX_CHANNELS")
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(4096)
-        .max(1)
+/// Parse an opt-in resource cap from an env value. `None` (variable
+/// unset, empty, or unparseable) means **unbounded** — C rsrv imposes
+/// no per-client channel count limit in `claim_ciu_action`
+/// (`camessage.c:1182-1291`) and no per-channel subscription count
+/// limit in `event_add_action` (`camessage.c:1762-1823`); both refuse
+/// only on genuine memory exhaustion (`casCreateChannel` /
+/// `freeListCalloc` / `db_add_event` returning NULL → `ECA_ALLOCMEM`),
+/// never on a fixed count. A default cap diverged from this: a single
+/// legitimate client (e.g. `caget` over a 5000-PV database) creating
+/// more than the cap on one circuit was refused with `ECA_ALLOCMEM`,
+/// producing a hard latency cliff at the cap boundary. A present value
+/// clamps to `>= 1` (a zero cap would refuse every request).
+fn parse_opt_cap(raw: Option<String>) -> Option<usize> {
+    raw.and_then(|s| s.parse::<usize>().ok()).map(|n| n.max(1))
 }
 
-/// Maximum subscriptions per channel (EPICS_CAS_MAX_SUBS_PER_CHAN).
-fn max_subs_per_channel() -> usize {
-    epics_base_rs::runtime::env::get("EPICS_CAS_MAX_SUBS_PER_CHAN")
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(100)
-        .max(1)
+/// Optional per-client channel cap (`EPICS_CAS_MAX_CHANNELS`).
+/// Default-unbounded (C `claim_ciu_action` parity); opt-in only.
+fn max_channels_per_client() -> Option<usize> {
+    parse_opt_cap(epics_base_rs::runtime::env::get("EPICS_CAS_MAX_CHANNELS"))
+}
+
+/// Optional per-channel subscription cap (`EPICS_CAS_MAX_SUBS_PER_CHAN`).
+/// Default-unbounded (C `event_add_action` parity); opt-in only.
+fn max_subs_per_channel() -> Option<usize> {
+    parse_opt_cap(epics_base_rs::runtime::env::get(
+        "EPICS_CAS_MAX_SUBS_PER_CHAN",
+    ))
+}
+
+#[cfg(test)]
+mod cap_parse_tests {
+    use super::parse_opt_cap;
+
+    /// C rsrv parity: with the env var unset there is **no** cap, so a
+    /// legitimate client can create unboundedly many channels /
+    /// subscriptions on one circuit. This is the regression guard for
+    /// the 4096-channel (and 100-subscription) latency cliff: the prior
+    /// code returned a fixed default (`4096` / `100`) here.
+    #[test]
+    fn unset_env_is_unbounded() {
+        assert_eq!(parse_opt_cap(None), None);
+    }
+
+    /// An unparseable / empty value is treated as "no valid cap
+    /// configured" → unbounded, consistent with unset.
+    #[test]
+    fn unparseable_or_empty_is_unbounded() {
+        assert_eq!(parse_opt_cap(Some(String::new())), None);
+        assert_eq!(parse_opt_cap(Some("not-a-number".into())), None);
+    }
+
+    /// An explicit value still opts into a cap and clamps to `>= 1` so a
+    /// stray `0` cannot refuse every request.
+    #[test]
+    fn explicit_value_caps_and_clamps_to_one() {
+        assert_eq!(parse_opt_cap(Some("4096".into())), Some(4096));
+        assert_eq!(parse_opt_cap(Some("1".into())), Some(1));
+        assert_eq!(parse_opt_cap(Some("0".into())), Some(1));
+    }
 }
 
 /// Forward-DNS verification for `EPICS_CAS_USE_HOST_NAMES=YES`.
@@ -2008,59 +2054,67 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 state.client_minor_version = hdr.available as u16;
             }
 
-            // DoS guard: refuse new channels once the per-client cap is hit.
-            let cap = max_channels_per_client();
-            // Pre-warning at 90% — fired once per crossing, not once per
-            // CREATE_CHAN, to avoid log spam.
-            let warn_threshold = (cap * 9) / 10;
-            if !state.channel_limit_warned && state.channels.len() >= warn_threshold {
-                tracing::warn!(
-                    channels = state.channels.len(),
-                    cap,
-                    "approaching per-client channel limit (90%)"
-                );
-                metrics::counter!("ca_server_channel_limit_warnings_total").increment(1);
-                state.channel_limit_warned = true;
-            }
-            if state.channels.len() >= cap {
-                tracing::warn!(
-                    channels = state.channels.len(),
-                    cap,
-                    "rejecting CREATE_CHAN: per-client channel limit reached"
-                );
-                metrics::counter!("ca_server_channel_limit_rejects_total").increment(1);
-                // C parity: `claim_ciu_action` (rsrv/camessage.c:1229-1239)
-                // routes channel-allocation failure through
-                // `send_err(mp, ECA_ALLOCMEM, …)`, NOT
-                // CREATE_CH_FAIL. CREATE_CH_FAIL is reserved for the
-                // `dbChannel_create` (PV/field not found) branch
-                // (camessage.c:1212-1219). libca
-                // `exceptionRespAction` surfaces the ECA_ALLOCMEM
-                // status to the user-level callback so the client
-                // knows "server out of resources" vs CREATE_CH_FAIL's
-                // "PV does not exist on this server" — the existing
-                // Rust path conflated the two, leading clients to
-                // remove our address from their resolution cache on
-                // a transient server saturation. Per `vsend_err`'s
-                // switch, CA_PROTO_CREATE_CHAN falls to `default`
-                // and uses `0xffffffff` for `m_cid`.
-                send_ca_error(writer, hdr, ECA_ALLOCMEM, u32::MAX, "channel limit reached").await?;
-                // C `claim_ciu_action` (camessage.c:1229-1240): when
-                // the server's channel-allocation pool is exhausted,
-                // send_err(ECA_ALLOCMEM) is followed by RSRV_ERROR
-                // which tears the connection down. The Rust per-
-                // client cap is the closest analogue: same root
-                // cause (this client requested more channels than
-                // the server is willing to hold) and the same
-                // ECA_ALLOCMEM wire byte. Match C by dropping the
-                // connection so a misbehaving client doesn't sit
-                // and spam CREATE_CHAN frames against a saturated
-                // cap; the next reconnect re-baselines.
-                return Err(epics_base_rs::error::CaError::Protocol(
-                    "CREATE_CHAN per-client cap reached \
-                     (matches C claim_ciu_action ECA_ALLOCMEM + RSRV_ERROR)"
-                        .into(),
-                ));
+            // DoS guard: refuse new channels once an opt-in per-client
+            // cap is hit. Default-unbounded (`None`) — C `claim_ciu_action`
+            // imposes no per-client channel count limit (see
+            // `max_channels_per_client`). When no cap is configured the
+            // whole block is inert, so a legitimate large-fan-out client
+            // (e.g. `caget` over thousands of PVs on one circuit) is never
+            // refused at a fixed boundary.
+            if let Some(cap) = max_channels_per_client() {
+                // Pre-warning at 90% — fired once per crossing, not once per
+                // CREATE_CHAN, to avoid log spam.
+                let warn_threshold = (cap * 9) / 10;
+                if !state.channel_limit_warned && state.channels.len() >= warn_threshold {
+                    tracing::warn!(
+                        channels = state.channels.len(),
+                        cap,
+                        "approaching per-client channel limit (90%)"
+                    );
+                    metrics::counter!("ca_server_channel_limit_warnings_total").increment(1);
+                    state.channel_limit_warned = true;
+                }
+                if state.channels.len() >= cap {
+                    tracing::warn!(
+                        channels = state.channels.len(),
+                        cap,
+                        "rejecting CREATE_CHAN: per-client channel limit reached"
+                    );
+                    metrics::counter!("ca_server_channel_limit_rejects_total").increment(1);
+                    // C parity: `claim_ciu_action` (rsrv/camessage.c:1229-1239)
+                    // routes channel-allocation failure through
+                    // `send_err(mp, ECA_ALLOCMEM, …)`, NOT
+                    // CREATE_CH_FAIL. CREATE_CH_FAIL is reserved for the
+                    // `dbChannel_create` (PV/field not found) branch
+                    // (camessage.c:1212-1219). libca
+                    // `exceptionRespAction` surfaces the ECA_ALLOCMEM
+                    // status to the user-level callback so the client
+                    // knows "server out of resources" vs CREATE_CH_FAIL's
+                    // "PV does not exist on this server" — the existing
+                    // Rust path conflated the two, leading clients to
+                    // remove our address from their resolution cache on
+                    // a transient server saturation. Per `vsend_err`'s
+                    // switch, CA_PROTO_CREATE_CHAN falls to `default`
+                    // and uses `0xffffffff` for `m_cid`.
+                    send_ca_error(writer, hdr, ECA_ALLOCMEM, u32::MAX, "channel limit reached")
+                        .await?;
+                    // C `claim_ciu_action` (camessage.c:1229-1240): when
+                    // the server's channel-allocation pool is exhausted,
+                    // send_err(ECA_ALLOCMEM) is followed by RSRV_ERROR
+                    // which tears the connection down. The Rust per-
+                    // client cap is the closest analogue: same root
+                    // cause (this client requested more channels than
+                    // the server is willing to hold) and the same
+                    // ECA_ALLOCMEM wire byte. Match C by dropping the
+                    // connection so a misbehaving client doesn't sit
+                    // and spam CREATE_CHAN frames against a saturated
+                    // cap; the next reconnect re-baselines.
+                    return Err(epics_base_rs::error::CaError::Protocol(
+                        "CREATE_CHAN per-client cap reached \
+                         (matches C claim_ciu_action ECA_ALLOCMEM + RSRV_ERROR)"
+                            .into(),
+                    ));
+                }
             }
 
             // C `claim_ciu_action` (`rsrv/camessage.c`) forces
@@ -3452,34 +3506,39 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // `read_reply` / `event_cancel_reply` use).
             let requested_count = hdr.actual_count();
 
-            // DoS guard: cap subscriptions per channel.
-            let subs_for_channel = state
-                .subscriptions
-                .values()
-                .filter(|s| s.channel_sid == sid)
-                .count();
-            if subs_for_channel >= max_subs_per_channel() {
-                // C `event_add_action` sends admission
-                // failures through `send_err(ECA_ALLOCMEM, ...)`
-                // i.e. CA_PROTO_ERROR — libca's
-                // `cac::eventRespAction` returns immediately for
-                // zero-payload EVENT_ADD because that shape is the
-                // historical cancel-confirmation no-op. Pre-fix
-                // Rust used `send_cmd_error` which emits zero-
-                // payload EVENT_ADD, so a libca client treated the
-                // refusal as a cancel ack and waited forever for
-                // monitor updates that never arrived. Use
-                // CA_PROTO_ERROR so the exception path fires.
-                let entry_cid = state.channels.get(&sid).map(|e| e.cid).unwrap_or(u32::MAX);
-                send_ca_error(
-                    writer,
-                    hdr,
-                    ECA_ALLOCMEM,
-                    entry_cid,
-                    "EVENT_ADD refused: per-channel subscription cap",
-                )
-                .await?;
-                return Ok(());
+            // DoS guard: cap subscriptions per channel. Default-unbounded
+            // (`None`) — C `event_add_action` imposes no per-channel
+            // subscription count limit (see `max_subs_per_channel`). The
+            // O(n) count is only paid when an opt-in cap is configured.
+            if let Some(cap) = max_subs_per_channel() {
+                let subs_for_channel = state
+                    .subscriptions
+                    .values()
+                    .filter(|s| s.channel_sid == sid)
+                    .count();
+                if subs_for_channel >= cap {
+                    // C `event_add_action` sends admission
+                    // failures through `send_err(ECA_ALLOCMEM, ...)`
+                    // i.e. CA_PROTO_ERROR — libca's
+                    // `cac::eventRespAction` returns immediately for
+                    // zero-payload EVENT_ADD because that shape is the
+                    // historical cancel-confirmation no-op. Pre-fix
+                    // Rust used `send_cmd_error` which emits zero-
+                    // payload EVENT_ADD, so a libca client treated the
+                    // refusal as a cancel ack and waited forever for
+                    // monitor updates that never arrived. Use
+                    // CA_PROTO_ERROR so the exception path fires.
+                    let entry_cid = state.channels.get(&sid).map(|e| e.cid).unwrap_or(u32::MAX);
+                    send_ca_error(
+                        writer,
+                        hdr,
+                        ECA_ALLOCMEM,
+                        entry_cid,
+                        "EVENT_ADD refused: per-channel subscription cap",
+                    )
+                    .await?;
+                    return Ok(());
+                }
             }
 
             let native_type = match native_type_for_dbr(requested_type) {

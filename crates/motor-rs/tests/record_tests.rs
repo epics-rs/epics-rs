@@ -3684,7 +3684,12 @@ fn test_urip_rdbl_error_blocks_new_move() {
 }
 
 #[test]
-fn test_urip_rdbl_error_stops_in_flight_move_on_new_target() {
+fn test_urip_rdbl_error_refuses_in_flight_retarget_without_stop() {
+    // C move-block gate (2418-2453): a target write with the RDBL link
+    // down is refused and rolled back to the lasts — the put pass
+    // itself sends nothing. Halting the axis is owned by the poll-time
+    // read failure (3687-3697), exercised below and in the
+    // _on_completion_check test.
     let mut rec = MotorRecord::new();
     rec.conv.urip = true;
     rec.set_rdbl_error(false); // start healthy
@@ -3692,16 +3697,75 @@ fn test_urip_rdbl_error_stops_in_flight_move_on_new_target() {
     rec.plan_motion(CommandSource::Val);
     assert_eq!(rec.stat.phase, MotionPhase::MainMove);
 
-    // Now RDBL link errors. New write should trigger STOP.
+    // RDBL link errors; a new target arrives.
     rec.set_rdbl_error(true);
     rec.put_field("VAL", EpicsValue::Double(20.0)).unwrap();
     let effects = rec.plan_motion(CommandSource::Val);
+    assert!(effects.commands.is_empty(), "refusal sends no command");
+    assert_eq!(
+        rec.pos.val, 10.0,
+        "refused target rolls back to the in-flight target (C 2436)"
+    );
+    assert_eq!(rec.stat.phase, MotionPhase::MainMove);
+
+    // The next poll pass stops the axis (C 3691-3697).
+    let effects = rec.check_completion();
     assert!(
         effects
             .commands
             .iter()
             .any(|c| matches!(c, MotorCommand::Stop { .. }))
     );
+}
+
+#[test]
+fn test_urip_rdbl_error_jog_and_home_dispatch_normally() {
+    // C 7493d50b changelog: the refusal is "sans Home search or Jog" —
+    // the home (2010) and jog (2078) sections run before the
+    // move-block rtnstat gate (2418-2453), so both dispatch with the
+    // readback link down.
+    let mut rec = MotorRecord::new();
+    rec.conv.urip = true;
+    rec.set_rdbl_error(true);
+    rec.stat.msta = MstaFlags::DONE;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Jogf);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
+        "jog dispatches with the RDBL link down"
+    );
+
+    let mut rec = MotorRecord::new();
+    rec.conv.urip = true;
+    rec.set_rdbl_error(true);
+    rec.stat.msta = MstaFlags::DONE;
+    rec.put_field("HOMF", EpicsValue::Short(1)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Homf);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Home { .. })),
+        "home dispatches with the RDBL link down"
+    );
+}
+
+#[test]
+fn test_urip_rdbl_error_set_mode_write_escapes_refusal() {
+    // C SET branches (2207, 2257-2262) return before the rtnstat gate:
+    // a SET-mode redefinition proceeds with the RDBL link down and is
+    // not rolled back.
+    let mut rec = MotorRecord::new();
+    rec.conv.urip = true;
+    rec.set_rdbl_error(true);
+    rec.conv.set = true;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.put_field("DVAL", EpicsValue::Double(5.0)).unwrap();
+    rec.plan_motion(CommandSource::Dval);
+    assert_eq!(rec.pos.dval, 5.0, "SET-mode write not rolled back");
 }
 
 #[test]

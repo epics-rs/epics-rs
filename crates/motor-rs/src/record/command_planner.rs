@@ -180,28 +180,33 @@ impl MotorRecord {
                     }
                     return effects;
                 }
-                // C: db5da2f0 + 7493d50b — when URIP=Yes and the external
-                // RDBL link is in error, refuse to start a new motion. If a
-                // motion is in flight, emit a STOP so the axis halts.
-                if self.conv.urip && self.conv.rdbl_error {
-                    if self.stat.phase != MotionPhase::Idle {
-                        // C 3692-3694: the failed-RDBL stop releases the
-                        // latched motion buttons too.
-                        self.clear_buttons();
-                        self.stat.mip.insert(MipFlags::STOP);
-                        // An error stop post-processes like a commanded
-                        // stop: sync the drive fields at completion rather
-                        // than arming the paused-resume state.
-                        self.internal.pp = true;
-                        effects.commands.push(MotorCommand::Stop {
-                            acceleration: self.move_accel_egu(),
-                        });
-                    } else {
-                        // C couples the failed-RDBL refusal into the same
-                        // restore gate as LVIO (2434: `lvio || rtnstat ==
-                        // FALSE`): the refused target rolls back.
-                        self.refuse_move_restore_lasts();
-                    }
+                // C: 7493d50b — when URIP=Yes and the external RDBL link
+                // is in error, "do not start a new target position move
+                // (sans Home search or Jog)". The refusal is the
+                // move-block gate (`lvio || rtnstat == FALSE`,
+                // 2418-2453): it sits AFTER the home (2010) and jog
+                // (2078) sections — those dispatch normally with the
+                // readback link down — and the SET branches (2207,
+                // 2257-2262) return before reaching it, so a SET-mode
+                // write is never rolled back. Stopping an in-flight
+                // motion is owned by the poll-time read failure
+                // (3687-3697, db5da2f0), ported in check_completion;
+                // a refused write while moving only rolls back to the
+                // in-flight target like C.
+                if self.conv.urip
+                    && self.conv.rdbl_error
+                    && (!self.conv.set || self.conv.igset)
+                    && matches!(
+                        src,
+                        CommandSource::Val
+                            | CommandSource::Dval
+                            | CommandSource::Rval
+                            | CommandSource::Rlv
+                            | CommandSource::Twf
+                            | CommandSource::Twr
+                    )
+                {
+                    self.refuse_move_restore_lasts();
                     return effects;
                 }
             }

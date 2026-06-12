@@ -545,6 +545,106 @@ fn startup_moving_starts_polling() {
 }
 
 #[test]
+fn startup_event_runs_initial_readback_through_live_path() {
+    // C init_record (motorRecord.cc:687-733) + devMotorAsyn.c
+    // init_controller: the FIRST device status must flow through
+    // initial_readback — readback adoption and the RSTM restore — not
+    // just flip `initialized`. Drives the real process() path: shared
+    // mailbox → determine_event(Startup) → do_process.
+    use motor_rs::device_state::{StampedStatus, new_shared_state};
+
+    let state = new_shared_state();
+    {
+        let mut ds = state.lock().unwrap();
+        ds.latest_status = Some(StampedStatus {
+            seq: 1,
+            status: MotorStatus {
+                position: 25.0,
+                encoder_position: 25.0,
+                done: true,
+                moving: false,
+                ..Default::default()
+            },
+        });
+    }
+
+    let mut rec = make_record();
+    rec.set_device_state(state.clone());
+    rec.process().unwrap();
+
+    assert_eq!(rec.pos.rbv, 25.0);
+    assert_eq!(rec.pos.val, 25.0, "boot VAL adopted from the readback");
+    assert_eq!(rec.pos.dval, 25.0);
+    assert!(rec.stat.dmov);
+}
+
+#[test]
+fn startup_event_applies_rstm_restore_through_live_path() {
+    // The RSTM near-zero restore (devMotorAsyn.c init_controller) must
+    // reach the driver via the live mailbox: the SetPosition command
+    // lands in pending_actions for DeviceSupport.write().
+    use motor_rs::device_state::{StampedStatus, new_shared_state};
+
+    let state = new_shared_state();
+    {
+        let mut ds = state.lock().unwrap();
+        ds.latest_status = Some(StampedStatus {
+            seq: 1,
+            status: MotorStatus {
+                position: 0.0, // controller lost its position
+                encoder_position: 0.0,
+                done: true,
+                moving: false,
+                ..Default::default()
+            },
+        });
+    }
+
+    let mut rec = make_record();
+    rec.conv.rstm = RestoreMode::NearZero;
+    rec.retry.rdbd = 0.05;
+    rec.pos.dval = 5.0; // autosave-restored target
+    rec.set_device_state(state.clone());
+    rec.process().unwrap();
+
+    assert_eq!(rec.pos.dval, 5.0, "autosaved DVAL kept, not overwritten");
+    let actions = state.lock().unwrap().pending_actions.take().unwrap();
+    assert!(
+        actions
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::SetPosition { position } if *position == 5.0)),
+        "restore pushes the autosaved position to the driver"
+    );
+}
+
+#[test]
+fn startup_closed_loop_omsl_skips_readback_adoption() {
+    // C init_record (705-714): under OMSL=closed_loop the DOL link owns
+    // VAL initialization — the boot readback must not overwrite the
+    // drive triplet, only RBV/DRBV update.
+    let mut rec = make_record();
+    rec.links.omsl = 1; // menuOmsl: closed_loop
+    rec.pos.val = 7.0; // DOL-initialized setpoint
+    rec.pos.dval = 7.0;
+
+    let status = MotorStatus {
+        position: 25.0,
+        encoder_position: 25.0,
+        done: true,
+        moving: false,
+        ..Default::default()
+    };
+    let effects = rec.initial_readback(&status);
+
+    assert_eq!(rec.pos.rbv, 25.0, "readback still updates RBV");
+    assert_eq!(rec.pos.val, 7.0, "closed-loop VAL untouched");
+    assert_eq!(rec.pos.dval, 7.0, "closed-loop DVAL untouched");
+    assert_eq!(rec.internal.lval, 7.0, "lasts anchored to current VAL");
+    assert!(effects.commands.is_empty());
+}
+
+#[test]
 fn comm_error_sets_alarm_and_safe_state() {
     let mut rec = make_record();
 

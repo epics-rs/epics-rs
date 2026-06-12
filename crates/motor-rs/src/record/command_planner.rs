@@ -1842,8 +1842,21 @@ impl MotorRecord {
 
         match event {
             Some(MotorEvent::Startup) => {
-                // Handled by device support init
-                ProcessEffects::default()
+                // C init_record (motorRecord.cc:687-733): the first device
+                // readback runs process_motor_info(initcall), the RSTM
+                // restore decision (devMotorAsyn.c init_controller), and
+                // the OMSL-gated drive-triplet sync. determine_event()
+                // consumed the seq but left the status in the shared slot.
+                let status = self.device_state.as_ref().and_then(|state| {
+                    state
+                        .lock()
+                        .ok()
+                        .and_then(|ds| ds.latest_status.as_ref().map(|s| s.status.clone()))
+                });
+                match status {
+                    Some(status) => self.initial_readback(&status),
+                    None => ProcessEffects::default(),
+                }
             }
             Some(MotorEvent::UserWrite(cmd_src)) => self.plan_motion(cmd_src),
             Some(MotorEvent::DeviceUpdate(status)) => {

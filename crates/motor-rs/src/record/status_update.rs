@@ -356,6 +356,14 @@ impl MotorRecord {
             effects.commands.push(MotorCommand::SetPosition {
                 position: autosaved_dval,
             });
+        } else if self.links.omsl == 1 {
+            // C init_record (705-714) skips the readback adoption under
+            // closed-loop OMSL — the DOL link owns the drive-value
+            // initialization — but still anchors the change-detection
+            // lasts (730-732).
+            self.internal.lval = self.pos.val;
+            self.internal.ldvl = self.pos.dval;
+            self.internal.lrvl = self.pos.rval;
         } else {
             self.sync_positions();
         }

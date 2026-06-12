@@ -1415,9 +1415,17 @@ impl MotorRecord {
         let deadband = self.timing.ntmf * (self.retry.bdst.abs() + self.retry.rdbd);
 
         // C `movn`-block STOP_AXIS gate: opposite direction AND error
-        // beyond the NTM deadband AND NTM enabled.
-        let sign_diff = diff >= 0.0;
-        let direction_changed = sign_diff != self.stat.cdir;
+        // beyond the NTM deadband AND NTM enabled. The direction sign is
+        // C 1303 `sign_rdif = (rdif < 0) ? 0 : 1` — the RAW-frame INTEGER
+        // error, like CDIR itself (2526): under MRES < 0 the dial sign
+        // inverts, and a sub-half-step error rounds to 0 (forward).
+        let rdif = if self.conv.mres != 0.0 {
+            (diff / self.conv.mres).round() as i64
+        } else {
+            0
+        };
+        let sign_rdif = rdif >= 0;
+        let direction_changed = sign_rdif != self.stat.cdir;
 
         if self.timing.ntm && direction_changed && diff.abs() > deadband {
             RetargetAction::StopAndReplan

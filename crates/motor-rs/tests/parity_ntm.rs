@@ -514,3 +514,48 @@ fn cdir_reads_forward_for_sub_half_step_negative_error() {
     assert_eq!(rec.pos.rdif, 0);
     assert!(rec.stat.cdir, "rdif 0 reads forward (C 2526)");
 }
+
+#[test]
+fn ntm_direction_sign_is_raw_frame_under_negative_mres() {
+    // C 1303: sign_rdif = (rdif < 0) ? 0 : 1 with rdif = NINT(diff/mres)
+    // — RAW frame, like CDIR. Under MRES < 0 a dial-NEGATIVE error is
+    // raw-POSITIVE: comparing the dial sign against the raw CDIR would
+    // misread a same-direction retarget as a reversal (and vice versa).
+    let mut rec = make_record();
+    rec.conv.mres = -0.001;
+
+    // Move down from 0 to -50: raw error = -50/-0.001 > 0, so the
+    // dispatch reads CDIR = forward (raw frame).
+    rec.put_field("VAL", EpicsValue::Double(-50.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    assert!(rec.stat.cdir, "raw-frame CDIR forward under MRES < 0");
+
+    motor_moving(&mut rec, -25.0);
+
+    // Same dial direction (further down): raw sign still positive —
+    // NOT a reversal. The dial-sign comparison would have stopped here.
+    rec.put_field("VAL", EpicsValue::Double(-60.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Stop { .. })),
+        "same-direction retarget must not NTM-stop, got {:?}",
+        effects.commands
+    );
+    assert!(!rec.stat.mip.contains(MipFlags::STOP));
+
+    // True reversal (back up to +40): raw sign flips — NTM stops.
+    motor_moving(&mut rec, -30.0);
+    rec.put_field("VAL", EpicsValue::Double(40.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Stop { .. })),
+        "opposite-direction retarget NTM-stops, got {:?}",
+        effects.commands
+    );
+}

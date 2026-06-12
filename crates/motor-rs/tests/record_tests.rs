@@ -156,6 +156,36 @@ fn test_process_motor_info() {
 }
 
 #[test]
+fn test_athm_tracks_home_switch_every_poll() {
+    // C 3755-3762: ATHM is the home-switch state on every poll —
+    // RA_HOME normally, EA_HOME when UEIP=Yes — and drops when the
+    // axis leaves the switch.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    let on_switch = asyn_rs::interfaces::motor::MotorStatus {
+        home: true,
+        ..Default::default()
+    };
+    rec.process_motor_info(&on_switch);
+    assert!(rec.stat.athm, "RA_HOME drives ATHM under UEIP=No");
+
+    let off_switch = asyn_rs::interfaces::motor::MotorStatus::default();
+    rec.process_motor_info(&off_switch);
+    assert!(!rec.stat.athm, "ATHM drops when the switch releases");
+
+    // UEIP=Yes reads the encoder home signal instead.
+    rec.conv.ueip = true;
+    rec.process_motor_info(&on_switch);
+    assert!(!rec.stat.athm, "RA_HOME is ignored under UEIP=Yes");
+    let encoder_home = asyn_rs::interfaces::motor::MotorStatus {
+        encoder_home: true,
+        ..Default::default()
+    };
+    rec.process_motor_info(&encoder_home);
+    assert!(rec.stat.athm, "EA_HOME drives ATHM under UEIP=Yes");
+}
+
+#[test]
 fn test_sync_positions() {
     let mut rec = MotorRecord::new();
     rec.pos.drbv = 5.0;
@@ -3282,6 +3312,7 @@ fn test_external_move_detected_when_driver_moves_while_idle() {
         high_limit: false,
         low_limit: false,
         home: false,
+        encoder_home: false,
         homed: false,
         powered: true,
         problem: false,
@@ -3311,6 +3342,7 @@ fn test_external_move_idempotent_on_repeat_poll() {
         high_limit: false,
         low_limit: false,
         home: false,
+        encoder_home: false,
         homed: false,
         powered: true,
         problem: false,
@@ -3343,6 +3375,7 @@ fn test_external_move_completion_syncs_and_clears_mip() {
         high_limit: false,
         low_limit: false,
         home: false,
+        encoder_home: false,
         homed: false,
         powered: true,
         problem: false,
@@ -3366,6 +3399,7 @@ fn test_external_move_completion_syncs_and_clears_mip() {
         high_limit: false,
         low_limit: false,
         home: false,
+        encoder_home: false,
         homed: false,
         powered: true,
         problem: false,

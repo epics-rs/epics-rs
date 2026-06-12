@@ -21,8 +21,13 @@ pub struct MotorStatus {
     pub high_limit: bool,
     /// True if a negative (raw) limit switch is active.
     pub low_limit: bool,
-    /// True if the home switch is active.
+    /// True if the motor's home switch is active (C asynMotorController
+    /// `motorStatusAtHome_`, MSTA bit 3 RA_HOME).
     pub home: bool,
+    /// True if the encoder's home signal is active (C asynMotorController
+    /// `motorStatusHome_`, MSTA bit 7 EA_HOME). The motor record reads
+    /// this one for ATHM when UEIP=Yes.
+    pub encoder_home: bool,
     /// True if the motor is powered on / closed-loop is active.
     pub powered: bool,
     /// True if a problem was detected (driver stopped polling).
@@ -57,6 +62,7 @@ impl Default for MotorStatus {
             high_limit: false,
             low_limit: false,
             home: false,
+            encoder_home: false,
             powered: true,
             problem: false,
             direction: false,

@@ -303,7 +303,9 @@ impl MotorRecord {
                 }
             }
             MotionPhase::Homing => {
-                self.stat.athm = true;
+                // No ATHM write here: C never sets it outside the poll —
+                // process_motor_info owns it as pure home-switch readback
+                // (3755-3762).
                 // C postProcess home-done (893-906): clear the HOMF/HOMR
                 // buttons at home completion. The dispatch leaves the
                 // button latched (it reads back 1 for the whole home), so

@@ -194,6 +194,9 @@ impl MotorRecord {
         if status.home {
             msta |= MstaFlags::HOME_LS;
         }
+        if status.encoder_home {
+            msta |= MstaFlags::EA_HOME;
+        }
         if status.powered {
             msta |= MstaFlags::POSITION;
         }
@@ -229,6 +232,16 @@ impl MotorRecord {
 
         // C: tdir = msta.RA_DIRECTION (from driver on every poll)
         self.stat.tdir = status.direction;
+
+        // C 3755-3762: ATHM tracks the motor's home switch — or the
+        // encoder's home signal when UEIP=Yes — on every poll. It is
+        // pure switch readback, not a "has homed" latch (that is MSTA
+        // bit 14, RA_HOMED).
+        self.stat.athm = if self.conv.ueip {
+            msta.contains(MstaFlags::EA_HOME)
+        } else {
+            msta.contains(MstaFlags::HOME_LS)
+        };
 
         // C: devMotorAsyn.c — RVEL is the raw velocity reported by the
         // driver, stored as floor(status.velocity) (motorRecord.dbd RVEL is

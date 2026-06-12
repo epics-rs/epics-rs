@@ -340,8 +340,17 @@ fn home_forward_reverse_marks_homed() {
         MotorCommand::Home { forward: true, .. }
     ));
 
-    // Homing completes
-    complete_move(&mut rec, 0.0);
+    // Homing completes standing on the home switch — ATHM is pure
+    // switch readback from the poll (C 3755-3762), not a homed latch.
+    let status = MotorStatus {
+        position: 0.0,
+        encoder_position: 0.0,
+        done: true,
+        moving: false,
+        home: true,
+        ..Default::default()
+    };
+    rec.process_motor_info(&status);
     let _effects = rec.check_completion();
     assert!(rec.stat.athm);
     assert!(rec.stat.dmov);

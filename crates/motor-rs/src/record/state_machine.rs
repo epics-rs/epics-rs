@@ -46,6 +46,15 @@ impl MotorRecord {
             self.stat.msta.contains(MstaFlags::DONE) && !self.stat.msta.contains(MstaFlags::MOVING);
 
         if !driver_done {
+            // C enter_do_work (1462-1483) re-evaluates LVIO on every
+            // process pass; for an in-flight motion the poll is the pass
+            // where RBV changes. A rising violation outside SET mode
+            // stops the axis and releases the buttons in the same pass
+            // (1476-1482 sets stop=1, the do_work top block consumes it).
+            if self.recompute_lvio_during_motion() {
+                self.stop_axis(&mut effects);
+                return effects;
+            }
             // Still moving — poll loop is already active, just suppress FLNK.
             effects.suppress_forward_link = true;
             return effects;
@@ -336,6 +345,33 @@ impl MotorRecord {
         self.plan_absolute_move(effects);
         effects.suppress_forward_link = true;
         true
+    }
+
+    /// C enter_do_work LVIO re-evaluation (motorRecord.cc:1462-1483).
+    /// Disabled limits (DHLM == DLLM == 0) clear it; an active jog checks
+    /// the live readback against the soft limits widened by one second of
+    /// jog travel (RBV > HLM - JVEL / RBV < LLM + JVEL) or an inverted
+    /// dial pair; a home search disables the check; every other state
+    /// preserves the latched value. Returns true on a rising violation
+    /// outside SET mode (`!set && !igset`, 1478) — C sets stop = 1 and
+    /// clear_buttons() (1480-1482); the caller routes that through
+    /// stop_axis, whose in-motion branch clears the same four buttons.
+    fn recompute_lvio_during_motion(&mut self) -> bool {
+        let old_lvio = self.limits.lvio;
+        if self.limits.dhlm == self.limits.dllm && self.limits.dllm == 0.0 {
+            self.limits.lvio = false;
+        } else if self
+            .stat
+            .mip
+            .intersects(MipFlags::JOGF | MipFlags::JOGR | MipFlags::JOG_BL1 | MipFlags::JOG_BL2)
+        {
+            self.limits.lvio = (self.ctrl.jogf && self.pos.rbv > self.limits.hlm - self.vel.jvel)
+                || (self.ctrl.jogr && self.pos.rbv < self.limits.llm + self.vel.jvel)
+                || (self.limits.dllm > self.limits.dhlm);
+        } else if self.stat.mip.intersects(MipFlags::HOMF | MipFlags::HOMR) {
+            self.limits.lvio = false;
+        }
+        self.limits.lvio && !old_lvio && !self.conv.set && !self.conv.igset
     }
 
     /// If a same-direction retarget was armed during motion, verify on

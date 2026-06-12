@@ -3866,3 +3866,121 @@ fn test_sub_step_replay_quiesces_without_loop() {
     let effects = complete_stop_at(&mut rec, 5.0);
     assert!(effects.commands.is_empty(), "no replay loop");
 }
+
+// --- LVIO re-evaluation during an active jog (C 1462-1483) ---
+
+/// Start a forward jog from rest with HLM=100/LLM=-100, JVEL=1, then
+/// report the axis moving.
+fn jogging_record() -> MotorRecord {
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+    rec.ctrl.jogf = true;
+    rec.plan_motion(CommandSource::Jogf);
+    assert_eq!(rec.stat.phase, MotionPhase::Jog);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+    rec
+}
+
+/// One in-flight poll: update the readbacks, keep MSTA=MOVING, run the
+/// completion pipeline like a DeviceUpdate pass.
+fn poll_moving_at(rec: &mut MotorRecord, pos: f64) -> ProcessEffects {
+    rec.pos.rbv = pos;
+    rec.pos.drbv = pos;
+    rec.check_completion()
+}
+
+#[test]
+fn test_jog_into_soft_limit_window_stops_axis() {
+    // C 1466-1468: jogf && rbv > hlm - jvel raises LVIO from the live
+    // readback; 1476-1482 stops the axis and releases the buttons.
+    let mut rec = jogging_record();
+
+    let effects = poll_moving_at(&mut rec, 50.0);
+    assert!(!rec.limits.lvio, "well inside the window: no violation");
+    assert!(effects.commands.is_empty());
+
+    let effects = poll_moving_at(&mut rec, 99.5);
+    assert!(rec.limits.lvio, "rbv > hlm - jvel raises LVIO");
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Stop { .. })),
+        "rising LVIO stops the axis"
+    );
+    assert!(!rec.ctrl.jogf, "buttons released (C clear_buttons, 1481)");
+    assert_eq!(rec.stat.mip, MipFlags::STOP);
+
+    // Next deceleration poll: MIP_STOP is outside the jog family, the
+    // latched LVIO is preserved and no second stop fires.
+    let effects = poll_moving_at(&mut rec, 99.8);
+    assert!(rec.limits.lvio);
+    assert!(effects.commands.is_empty());
+
+    // The jog dispatch armed pp: the stop completion syncs to rest.
+    complete_stop_at(&mut rec, 99.9);
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.pos.val, 99.9, "post-stop sync to readback");
+}
+
+#[test]
+fn test_jog_away_from_limit_does_not_stop() {
+    // jogr near the HIGH limit: the reverse-jog window (rbv < llm + jvel)
+    // is not violated, so the jog keeps running.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+    rec.pos.rbv = 95.0;
+    rec.pos.drbv = 95.0;
+    rec.pos.val = 95.0;
+    rec.pos.dval = 95.0;
+    rec.ctrl.jogr = true;
+    rec.plan_motion(CommandSource::Jogr);
+    assert_eq!(rec.stat.phase, MotionPhase::Jog);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    let effects = poll_moving_at(&mut rec, 99.5);
+    assert!(!rec.limits.lvio);
+    assert!(effects.commands.is_empty());
+    assert!(rec.ctrl.jogr, "jog keeps running");
+}
+
+#[test]
+fn test_home_search_disables_lvio_check() {
+    // C 1471-1472: MIP_HOME forces lvio = false even when the readback
+    // runs outside the soft limits.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+    rec.ctrl.homf = true;
+    rec.plan_motion(CommandSource::Homf);
+    assert_eq!(rec.stat.phase, MotionPhase::Homing);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+    rec.limits.lvio = true; // latched from an earlier refusal
+
+    let effects = poll_moving_at(&mut rec, 150.0);
+    assert!(!rec.limits.lvio, "home search clears/disables LVIO");
+    assert!(effects.commands.is_empty());
+    // ctrl.homf is a pulse (cleared at dispatch); MIP_HOMF marks the
+    // home in flight.
+    assert!(rec.stat.mip.contains(MipFlags::HOMF), "home keeps running");
+    assert_eq!(rec.stat.phase, MotionPhase::Homing);
+}
+
+#[test]
+fn test_jog_lvio_in_set_mode_does_not_stop() {
+    // C 1478: the stop fires only when !set && !igset. LVIO itself is
+    // still raised and posted.
+    let mut rec = jogging_record();
+    rec.conv.set = true;
+
+    let effects = poll_moving_at(&mut rec, 99.5);
+    assert!(rec.limits.lvio, "violation still recorded");
+    assert!(effects.commands.is_empty(), "SET mode suppresses the stop");
+    assert!(rec.ctrl.jogf, "buttons untouched");
+    assert_eq!(rec.stat.phase, MotionPhase::Jog);
+}

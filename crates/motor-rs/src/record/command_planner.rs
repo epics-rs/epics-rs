@@ -544,10 +544,11 @@ impl MotorRecord {
         self.stop_axis(effects);
     }
 
-    /// The C do_work top-block stop path, shared by the STOP field pulse
-    /// and SPMG=Stop (motorRecord.cc:1871: `spmg == motorSPMG_Stop ||
-    /// stop == true`). Single owner so the two entries cannot drift.
-    fn stop_axis(&mut self, effects: &mut ProcessEffects) {
+    /// The C do_work top-block stop path, shared by the STOP field pulse,
+    /// SPMG=Stop (motorRecord.cc:1871: `spmg == motorSPMG_Stop ||
+    /// stop == true`) and the rising-LVIO stop (1476-1482). Single owner
+    /// so the entries cannot drift.
+    pub(super) fn stop_axis(&mut self, effects: &mut ProcessEffects) {
         let in_motion =
             self.stat.phase != MotionPhase::Idle || self.stat.mip.contains(MipFlags::EXTERNAL);
         if self.stat.mip.contains(MipFlags::RETRY) {

@@ -235,9 +235,12 @@ impl MotorRecord {
         // DBF_LONG "Raw Velocity").
         self.stat.rvel = status.velocity.floor() as i64;
 
-        // Recompute LVIO from current position and soft limits
-        self.limits.lvio =
-            coordinate::check_soft_limits(self.pos.dval, self.limits.dhlm, self.limits.dllm);
+        // LVIO is NOT recomputed here. C re-evaluates it only at
+        // enter_do_work (1462-1483: jog from live RBV, home disabled,
+        // everything else preserves the latched value) — ported in
+        // check_completion's still-moving path — and in the do_work move
+        // block / soft-limit puts, ported in plan_absolute_move and
+        // detect_inverted_limits.
     }
 
     /// Sync all positions from readback.

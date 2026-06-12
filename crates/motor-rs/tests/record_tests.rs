@@ -3984,3 +3984,91 @@ fn test_jog_lvio_in_set_mode_does_not_stop() {
     assert!(rec.ctrl.jogf, "buttons untouched");
     assert_eq!(rec.stat.phase, MotionPhase::Jog);
 }
+
+// --- Latent tweak collection (C 2167-2181) ---
+
+#[test]
+fn test_latent_tweak_folds_into_val_write() {
+    // A bare TWF put latched the button but its last_write was overtaken
+    // by a VAL write before the record processed. C folds the tweak into
+    // the same pass's val processing (2167-2181 precede 2204): one
+    // combined move toward written-VAL + TWV.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.ctrl.twv = 5.0;
+    rec.ctrl.twf = true; // bare put, never dispatched
+
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+    assert_eq!(rec.pos.val, 55.0, "tweak folded into the written target");
+    assert!(!rec.ctrl.twf, "button consumed by the fold");
+    let moves: Vec<f64> = effects
+        .commands
+        .iter()
+        .filter_map(|c| match c {
+            MotorCommand::MoveAbsolute { position, .. } => Some(*position),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(moves.len(), 1, "one combined move, not two");
+    assert!((moves[0] - 55.0).abs() < 1e-9);
+}
+
+#[test]
+fn test_latent_tweak_twf_priority_when_both_latched() {
+    // C 2169: `val += twv * (twf ? 1 : -1)` — TWF wins when both buttons
+    // are latched, and BOTH are released (2171-2180).
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.ctrl.twv = 5.0;
+    rec.ctrl.twf = true;
+    rec.ctrl.twr = true;
+
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    assert_eq!(rec.pos.val, 55.0, "forward fold (TWF priority)");
+    assert!(!rec.ctrl.twf);
+    assert!(!rec.ctrl.twr, "both buttons released");
+}
+
+#[test]
+fn test_tweak_under_spmg_pause_collects_and_fires_on_go() {
+    // C: the tweak fold (2167) is not gated by stop_or_pause — only the
+    // move dispatch is (2237). A tweak pressed under SPMG=Pause lands in
+    // VAL/DVAL and Go fires the move, like any write collected while
+    // stopped.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(1000.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-1000.0)).unwrap();
+    rec.pos.val = 10.0;
+    rec.pos.dval = 10.0;
+    rec.internal.lval = 10.0;
+    rec.internal.ldvl = 10.0;
+    rec.ctrl.twv = 5.0;
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.internal.lspg = SpmgMode::Pause;
+
+    rec.ctrl.twf = true;
+    let effects = rec.plan_motion(CommandSource::Twf);
+    assert_eq!(rec.pos.val, 15.0, "fold collected under Pause");
+    assert!(!rec.ctrl.twf);
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "no dispatch while paused"
+    );
+
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        effects.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveAbsolute { position, .. } if (position - 15.0).abs() < 1e-9
+        )),
+        "Go fires the collected tweak"
+    );
+}

@@ -77,6 +77,23 @@ impl MotorRecord {
             | CommandSource::PcoEnable => {}
             _ => {
                 if !self.can_accept_command() {
+                    // C 2167-2181: the tweak fold is NOT gated by
+                    // stop_or_pause — only the move dispatch is (the
+                    // return at 2237 comes after collection). Collect it
+                    // before refusing this pass so the fold lands in
+                    // VAL/DVAL and SPMG=Go fires it like any position
+                    // write collected while stopped.
+                    if matches!(
+                        src,
+                        CommandSource::Val
+                            | CommandSource::Dval
+                            | CommandSource::Rval
+                            | CommandSource::Rlv
+                            | CommandSource::Twf
+                            | CommandSource::Twr
+                    ) {
+                        self.collect_tweak(&mut effects);
+                    }
                     return effects;
                 }
                 // C: db5da2f0 + 7493d50b — when URIP=Yes and the external
@@ -128,6 +145,21 @@ impl MotorRecord {
         {
             return effects;
         }
+
+        // C tweak section (2167-2181): runs after the home/jog sections
+        // (which return early when they dispatch) and folds latched
+        // buttons into VAL on every pass — a bare TWF/TWR put overtaken
+        // in last_write rides this pass's val processing as one combined
+        // move toward `written value + TWV`.
+        let tweak_pending = matches!(
+            src,
+            CommandSource::Val
+                | CommandSource::Dval
+                | CommandSource::Rval
+                | CommandSource::Rlv
+                | CommandSource::Twf
+                | CommandSource::Twr
+        ) && self.collect_tweak(&mut effects);
 
         match src {
             CommandSource::Val | CommandSource::Dval | CommandSource::Rval => {
@@ -238,8 +270,12 @@ impl MotorRecord {
                 self.start_home(forward, &mut effects);
             }
             CommandSource::Twf | CommandSource::Twr => {
-                let forward = src == CommandSource::Twf;
-                self.handle_tweak(forward, &mut effects);
+                // The fold already ran in the collection above (SET-mode
+                // redefinition included); dispatch the pending move (C
+                // move block firing on the folded val change).
+                if tweak_pending {
+                    self.plan_absolute_move(&mut effects);
+                }
             }
             CommandSource::Spmg => {
                 self.handle_spmg_change(&mut effects);
@@ -849,12 +885,23 @@ impl MotorRecord {
     }
 
     /// Handle tweak (TWF/TWR).
-    fn handle_tweak(&mut self, forward: bool, effects: &mut ProcessEffects) {
-        if forward {
-            self.ctrl.twf = false; // pulse
-        } else {
-            self.ctrl.twr = false; // pulse
+    /// C tweak collection (motorRecord.cc:2167-2181) plus the VAL change
+    /// it feeds (2204-2235): fold the latched tweak button(s) into VAL —
+    /// `val += twv * (twf ? 1 : -1)`, TWF wins when both are latched —
+    /// and release BOTH buttons. The fold acts on latched button STATE,
+    /// not on the src that triggered the pass, so a bare TWF/TWR put
+    /// overtaken in `last_write` still lands. In SET mode the VAL change
+    /// redefines coordinates without moving (C 2207-2227). Returns true
+    /// when a non-SET fold landed in DVAL — a move toward it is now
+    /// pending and the caller's pass dispatches (or, under SPMG
+    /// Stop/Pause, SPMG=Go later fires it via `dval != ldvl`).
+    fn collect_tweak(&mut self, effects: &mut ProcessEffects) -> bool {
+        if !self.ctrl.twf && !self.ctrl.twr {
+            return false;
         }
+        let forward = self.ctrl.twf;
+        self.ctrl.twf = false;
+        self.ctrl.twr = false;
 
         let dir = if forward {
             MotionDirection::Positive
@@ -862,7 +909,7 @@ impl MotorRecord {
             MotionDirection::Negative
         };
         if self.is_blocked_by_hw_limit(dir) {
-            return;
+            return false;
         }
 
         let delta = if forward {
@@ -879,7 +926,7 @@ impl MotorRecord {
             // #231: LOAD_POS blocked — refuse the redefinition entirely.
             if self.conv.loadpos_blocked {
                 self.pos.val -= delta; // undo: keep VAL/DVAL/OFF consistent
-                return;
+                return false;
             }
             if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
                 self.pos.val,
@@ -897,10 +944,10 @@ impl MotorRecord {
             effects.commands.push(MotorCommand::SetPosition {
                 position: self.pos.dval,
             });
-            return;
+            return false;
         }
 
-        // Normal (non-SET) tweak: cascade VAL->DVAL and issue a move.
+        // Normal (non-SET) tweak: cascade VAL->DVAL; the caller moves.
         if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
             self.pos.val,
             self.conv.dir,
@@ -914,8 +961,7 @@ impl MotorRecord {
             self.pos.rval = rval;
             self.pos.off = off;
         }
-
-        self.plan_absolute_move(effects);
+        true
     }
 
     /// Handle SPMG mode change.

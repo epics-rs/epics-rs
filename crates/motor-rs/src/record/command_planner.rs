@@ -86,6 +86,15 @@ impl MotorRecord {
             | CommandSource::PcoEnable => {}
             _ => {
                 if !self.can_accept_command() {
+                    // C home section under stop_or_pause (2015-2020): a
+                    // latched home button only drops DMOV and returns —
+                    // no MIP change, no dispatch, button stays latched.
+                    // The Go pass falls through the top block into the
+                    // home section and dispatches it (handle_spmg_change
+                    // mirrors that fall-through).
+                    if matches!(src, CommandSource::Homf | CommandSource::Homr) {
+                        self.stat.dmov = false;
+                    }
                     // C 2167-2181: the tweak fold is NOT gated by
                     // stop_or_pause — only the move dispatch is (the
                     // return at 2237 comes after collection). Collect it
@@ -861,9 +870,11 @@ impl MotorRecord {
     /// move-block srcs before their own handling; returns true when a
     /// button action consumed the pass (the C sections return OK, so the
     /// position write that triggered the pass is overtaken).
-    fn dispatch_latent_buttons(&mut self, effects: &mut ProcessEffects) -> bool {
-        // Home (C 2010-2013): pure button-state gate per direction,
-        // skipping a direction already homing or blocked by its limit.
+    /// C home-section entry gate (motorRecord.cc:2013-2014): a latched
+    /// button for a direction not already homing and not blocked by its
+    /// limit switch. Returns the home direction, forward winning when
+    /// both buttons are latched.
+    fn latent_home_request(&self) -> Option<bool> {
         let homf_ready = self.ctrl.homf
             && !self.stat.mip.contains(MipFlags::HOMF)
             && !self.home_blocked_by_limit(true);
@@ -871,7 +882,17 @@ impl MotorRecord {
             && !self.stat.mip.contains(MipFlags::HOMR)
             && !self.home_blocked_by_limit(false);
         if homf_ready || homr_ready {
-            self.start_home(homf_ready, effects);
+            Some(homf_ready)
+        } else {
+            None
+        }
+    }
+
+    fn dispatch_latent_buttons(&mut self, effects: &mut ProcessEffects) -> bool {
+        // Home (C 2010-2013): pure button-state gate per direction,
+        // skipping a direction already homing or blocked by its limit.
+        if let Some(forward) = self.latent_home_request() {
+            self.start_home(forward, effects);
             return true;
         }
 
@@ -1143,7 +1164,17 @@ impl MotorRecord {
                 // button at its limit switch does not re-arm; the pass
                 // falls to the STOP collapse instead of leaving the
                 // record stuck in MIP_STOP.
-                if (self.ctrl.jogf && !self.limits.hls) || (self.ctrl.jogr && !self.limits.lls) {
+                //
+                // The Go pass FALLS THROUGH the top block into do_work's
+                // home section (2010-2076), which precedes the jog
+                // dispatch and overwrites MIP wholesale (2023) — a home
+                // button latched while paused (its 2015-2020 return kept
+                // it) fires here and wins over a latched jog.
+                if let Some(forward) = self.latent_home_request() {
+                    self.start_home(forward, effects);
+                } else if (self.ctrl.jogf && !self.limits.hls)
+                    || (self.ctrl.jogr && !self.limits.lls)
+                {
                     let forward = self.ctrl.jogf;
                     self.start_jog(forward, effects);
                 } else {
@@ -1173,7 +1204,12 @@ impl MotorRecord {
                 self.stat.mip = MipFlags::empty();
                 self.retry.rcnt = 0;
                 self.internal.queued_motion = None;
-                if !self.stat.dmov || self.pos.dval != self.internal.ldvl {
+                // Like Go, the Move pass falls through to the home
+                // section (2010-2076) before the move block — a latched
+                // home button fires instead of the move replan.
+                if let Some(forward) = self.latent_home_request() {
+                    self.start_home(forward, effects);
+                } else if !self.stat.dmov || self.pos.dval != self.internal.ldvl {
                     self.plan_absolute_move(effects);
                 }
             }

@@ -274,6 +274,87 @@ fn test_home_forward() {
 }
 
 #[test]
+fn test_homf_while_paused_drops_dmov_and_stays_latched() {
+    // C home section under stop_or_pause (motorRecord.cc:2015-2020): a
+    // home button latched while SPMG is Stop/Pause only drops DMOV —
+    // no MIP change, no dispatch, button stays latched.
+    let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::DONE;
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.plan_motion(CommandSource::Spmg);
+    assert!(rec.stat.dmov);
+
+    rec.put_field("HOMF", EpicsValue::Short(1)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Homf);
+    assert!(!rec.stat.dmov, "C 2017: dmov = FALSE");
+    assert!(!rec.stat.mip.contains(MipFlags::HOMF), "no MIP change");
+    assert!(rec.ctrl.homf, "button stays latched for the Go pass");
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Home { .. })),
+        "no dispatch while paused"
+    );
+}
+
+#[test]
+fn test_paused_homf_dispatches_at_go() {
+    // C: the Go pass falls through the top block into the home section
+    // (2010-2076), which fires the still-latched button.
+    let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::DONE;
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.plan_motion(CommandSource::Spmg);
+    rec.put_field("HOMF", EpicsValue::Short(1)).unwrap();
+    rec.plan_motion(CommandSource::Homf);
+
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Home { forward: true, .. })),
+        "Go dispatches the home latched while paused"
+    );
+    assert!(rec.stat.mip.contains(MipFlags::HOMF));
+    assert_eq!(rec.stat.phase, MotionPhase::Homing);
+    assert!(!rec.stat.dmov);
+}
+
+#[test]
+fn test_paused_homf_wins_over_latched_jog_at_go() {
+    // C do_work order: the home section (2010) precedes the jog
+    // dispatch and overwrites MIP wholesale (2023) — with both a home
+    // and a jog button latched, the Go pass homes.
+    let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::DONE;
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.plan_motion(CommandSource::Spmg);
+    rec.put_field("HOMF", EpicsValue::Short(1)).unwrap();
+    rec.plan_motion(CommandSource::Homf);
+    rec.ctrl.jogf = true;
+
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Home { forward: true, .. })),
+        "home wins the Go pass"
+    );
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
+        "latched jog does not dispatch on the same pass"
+    );
+}
+
+#[test]
 fn test_homf_homr_puts_rejected_while_home_in_flight() {
     // C special() (motorRecord.cc:2610-2614): a HOMF/HOMR put while
     // mip & MIP_HOME returns ERROR — button not written, no processing.

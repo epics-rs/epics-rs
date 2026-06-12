@@ -1207,6 +1207,13 @@ pub(crate) fn motor_put_field(
                     rec.conv.urev = v;
                     return Ok(());
                 }
+                // Rust guard, not C: special UREV (2848-2853) accepts a
+                // zero put and derives MRES = 0; the Rust division sites
+                // require a nonzero resolution, so drop it — uniform
+                // with the zero-MRES-put reject above.
+                if v == 0.0 {
+                    return Ok(());
+                }
                 let old_mres = rec.conv.mres;
                 rec.conv.urev = v;
                 // C special UREV (2849-2853): make MRES agree.

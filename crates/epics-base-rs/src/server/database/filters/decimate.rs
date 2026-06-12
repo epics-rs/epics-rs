@@ -61,7 +61,7 @@ impl SubscriptionFilter for DecimateFilter {
         // emission and a `DBE_PROPERTY` event both bypass the counter
         // unchanged. `DBE_ALARM` runs through the decimation logic
         // and may be dropped.
-        if event.read_context || event.mask.intersects(EventMask::PROPERTY) {
+        if event.read_context || event.event.mask.intersects(EventMask::PROPERTY) {
             return Some(event);
         }
         let mut counter = self.counter.lock();
@@ -84,13 +84,11 @@ mod tests {
     use std::time::SystemTime;
 
     fn ev(v: f64, mask: EventMask) -> FilteredMonitorEvent {
-        FilteredMonitorEvent::new(
-            MonitorEvent {
-                snapshot: Snapshot::new(EpicsValue::Double(v), 0, 0, SystemTime::UNIX_EPOCH),
-                origin: 0,
-            },
+        FilteredMonitorEvent::new(MonitorEvent {
+            snapshot: Snapshot::new(EpicsValue::Double(v), 0, 0, SystemTime::UNIX_EPOCH),
+            origin: 0,
             mask,
-        )
+        })
     }
 
     /// `every(3)` passes the 1st, 4th, 7th, ...

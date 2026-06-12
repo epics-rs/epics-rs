@@ -382,6 +382,7 @@ mod tests {
         let event = MonitorEvent {
             snapshot,
             origin: 0,
+            mask: epics_base_rs::server::recgbl::EventMask::VALUE,
         };
 
         // data_count = 0 means autosize (use snapshot's actual count);
@@ -580,6 +581,7 @@ mod tests {
                     std::time::SystemTime::UNIX_EPOCH,
                 ),
                 origin: 0,
+                mask: epics_base_rs::server::recgbl::EventMask::VALUE,
             }
         }
 

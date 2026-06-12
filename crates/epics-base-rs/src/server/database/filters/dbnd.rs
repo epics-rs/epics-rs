@@ -174,8 +174,9 @@ impl SubscriptionFilter for DeadbandFilter {
         // only ALARM / PROPERTY (446e0d4a) bypass the deadband. Stripping
         // LOG here too is what stops the widened `VALUE|LOG` emission
         // mask from defeating the `.{dbnd}` filter on every value change.
-        let bypass =
-            EventMask::from_bits(event.mask.bits() & !(EventMask::VALUE | EventMask::LOG).bits());
+        let bypass = EventMask::from_bits(
+            event.event.mask.bits() & !(EventMask::VALUE | EventMask::LOG).bits(),
+        );
         if supra || !bypass.is_empty() {
             Some(event)
         } else {
@@ -199,13 +200,11 @@ mod tests {
     use std::time::SystemTime;
 
     fn ev(v: f64, mask: EventMask) -> FilteredMonitorEvent {
-        FilteredMonitorEvent::new(
-            MonitorEvent {
-                snapshot: Snapshot::new(EpicsValue::Double(v), 0, 0, SystemTime::UNIX_EPOCH),
-                origin: 0,
-            },
+        FilteredMonitorEvent::new(MonitorEvent {
+            snapshot: Snapshot::new(EpicsValue::Double(v), 0, 0, SystemTime::UNIX_EPOCH),
+            origin: 0,
             mask,
-        )
+        })
     }
 
     /// First event always passes — there is no `last_sent` baseline yet.
@@ -391,13 +390,11 @@ mod tests {
             0,
             SystemTime::UNIX_EPOCH,
         );
-        let event = FilteredMonitorEvent::new(
-            MonitorEvent {
-                snapshot: snap,
-                origin: 0,
-            },
-            EventMask::VALUE,
-        );
+        let event = FilteredMonitorEvent::new(MonitorEvent {
+            snapshot: snap,
+            origin: 0,
+            mask: EventMask::VALUE,
+        });
         assert!(f.apply(event).is_some());
     }
 

@@ -215,13 +215,11 @@ mod tests {
     use std::time::SystemTime;
 
     fn ev_array(v: Vec<f64>) -> FilteredMonitorEvent {
-        FilteredMonitorEvent::new(
-            MonitorEvent {
-                snapshot: Snapshot::new(EpicsValue::DoubleArray(v), 0, 0, SystemTime::UNIX_EPOCH),
-                origin: 0,
-            },
-            EventMask::VALUE,
-        )
+        FilteredMonitorEvent::new(MonitorEvent {
+            snapshot: Snapshot::new(EpicsValue::DoubleArray(v), 0, 0, SystemTime::UNIX_EPOCH),
+            origin: 0,
+            mask: EventMask::VALUE,
+        })
     }
 
     fn unpack(event: FilteredMonitorEvent) -> Vec<f64> {
@@ -314,13 +312,11 @@ mod tests {
     #[test]
     fn scalar_passes_unchanged() {
         let f = ArrayFilter::new(ArrayFilterConfig::default());
-        let ev = FilteredMonitorEvent::new(
-            MonitorEvent {
-                snapshot: Snapshot::new(EpicsValue::Double(3.14), 0, 0, SystemTime::UNIX_EPOCH),
-                origin: 0,
-            },
-            EventMask::VALUE,
-        );
+        let ev = FilteredMonitorEvent::new(MonitorEvent {
+            snapshot: Snapshot::new(EpicsValue::Double(3.14), 0, 0, SystemTime::UNIX_EPOCH),
+            origin: 0,
+            mask: EventMask::VALUE,
+        });
         let out = f.apply(ev).unwrap();
         assert!(
             matches!(out.event.snapshot.value, EpicsValue::Double(v) if (v - 3.14).abs() < 1e-9)
@@ -334,7 +330,7 @@ mod tests {
     fn alarm_event_is_also_sliced() {
         let f = ArrayFilter::new(ArrayFilterConfig::new(0, 1, 0));
         let mut ev = ev_array(vec![1.0, 2.0, 3.0]);
-        ev.mask = EventMask::ALARM;
+        ev.event.mask = EventMask::ALARM;
         let out = f.apply(ev).unwrap();
         assert_eq!(unpack(out), vec![1.0]);
     }
@@ -349,18 +345,16 @@ mod tests {
     fn mr_r25_uint64_array_is_sliced() {
         let big = u64::MAX; // > i64::MAX, must survive the slice
         let f = ArrayFilter::new(ArrayFilterConfig::new(1, 1, 2));
-        let ev = FilteredMonitorEvent::new(
-            MonitorEvent {
-                snapshot: Snapshot::new(
-                    EpicsValue::UInt64Array(vec![0, big, big - 1, 7]),
-                    0,
-                    0,
-                    SystemTime::UNIX_EPOCH,
-                ),
-                origin: 0,
-            },
-            EventMask::VALUE,
-        );
+        let ev = FilteredMonitorEvent::new(MonitorEvent {
+            snapshot: Snapshot::new(
+                EpicsValue::UInt64Array(vec![0, big, big - 1, 7]),
+                0,
+                0,
+                SystemTime::UNIX_EPOCH,
+            ),
+            origin: 0,
+            mask: EventMask::VALUE,
+        });
         let out = f.apply(ev).unwrap();
         match out.event.snapshot.value {
             EpicsValue::UInt64Array(v) => assert_eq!(v, vec![big, big - 1]),

@@ -2257,6 +2257,7 @@ impl RecordInstance {
                         let event = MonitorEvent {
                             snapshot: mon_snap.clone(),
                             origin: 0,
+                            mask: posting_mask,
                         };
                         // Server-side filter chain (3.15.7). Empty chain
                         // is identity, so no behaviour change for the
@@ -2265,7 +2266,7 @@ impl RecordInstance {
                             Some(event)
                         } else {
                             sub.filters
-                                .apply(FilteredMonitorEvent::new(event, posting_mask))
+                                .apply(FilteredMonitorEvent::new(event))
                                 .map(|fe| fe.event)
                         };
                         let Some(event) = filtered else {
@@ -2312,6 +2313,7 @@ impl RecordInstance {
                         let event = MonitorEvent {
                             snapshot: mon_snap.clone(),
                             origin,
+                            mask,
                         };
                         // Server-side filter chain (3.15.7). Empty
                         // chain (the default for every subscriber
@@ -2324,7 +2326,7 @@ impl RecordInstance {
                             Some(event)
                         } else {
                             sub.filters
-                                .apply(FilteredMonitorEvent::new(event, mask))
+                                .apply(FilteredMonitorEvent::new(event))
                                 .map(|fe| fe.event)
                         };
                         let Some(event) = filtered else {

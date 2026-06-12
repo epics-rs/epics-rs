@@ -267,13 +267,11 @@ fn pv_field_to_filter_event(
     use std::time::SystemTime;
 
     let val = pv_value_leaf_to_epics(value)?;
-    Some(FilteredMonitorEvent::new(
-        MonitorEvent {
-            snapshot: Snapshot::new(val, 0, 0, SystemTime::UNIX_EPOCH),
-            origin: 0,
-        },
-        EventMask::VALUE,
-    ))
+    Some(FilteredMonitorEvent::new(MonitorEvent {
+        snapshot: Snapshot::new(val, 0, 0, SystemTime::UNIX_EPOCH),
+        origin: 0,
+        mask: EventMask::VALUE,
+    }))
 }
 
 /// Extract the value leaf of a PVA monitor `PvField` as an

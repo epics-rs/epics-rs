@@ -747,6 +747,113 @@ async fn test_mss_propagates_amsg_only_change_posts_amsg_event() {
     );
 }
 
+/// Per-event `DBE_*` mask delivery through the record posting path
+/// (C `db_field_log.mask`, the discriminator pvxs narrows monitor
+/// updates with — `groupsource.cpp:331-337`). Each delivered
+/// `MonitorEvent.mask` must be THAT event's posting class, not a
+/// subscription-wide constant:
+///   * a pass that changes the value AND raises the alarm posts VAL
+///     with `DBE_VALUE | DBE_LOG | DBE_ALARM` (C `recGblResetAlarms`
+///     `val_mask` folded into the monitor mask);
+///   * an amsg-only pass posts VAL with `DBE_ALARM` alone (the value
+///     deadband did not fire; `recGbl.c:212` `val_mask = DBE_ALARM`)
+///     and AMSG with `stat_mask = DBE_ALARM` (`recGbl.c:194/210-211`).
+#[tokio::test]
+async fn test_record_posts_carry_per_event_dbe_mask() {
+    use epics_base_rs::server::recgbl::{EventMask, alarm_status};
+    use epics_base_rs::server::record::AlarmSeverity;
+    use epics_base_rs::types::DbFieldType;
+
+    let db = PvDatabase::new();
+    db.add_record("SRC_MASK", Box::new(AoRecord::new(7.0)))
+        .await
+        .unwrap();
+    db.add_record("DST_MASK", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    // Source: Major severity with first amsg.
+    if let Some(rec) = db.get_record("SRC_MASK").await {
+        let mut inst = rec.write().await;
+        inst.common.stat = alarm_status::HIHI_ALARM;
+        inst.common.sevr = AlarmSeverity::Major;
+        inst.common.amsg = "msg1".to_string();
+    }
+    // Dest: MSS link to source.
+    if let Some(rec) = db.get_record("DST_MASK").await {
+        let mut inst = rec.write().await;
+        inst.put_common_field("INP", EpicsValue::String("SRC_MASK NPP MSS".into()))
+            .unwrap();
+        inst.common.udf = false;
+    }
+
+    let mut val_rx = {
+        let rec = db.get_record("DST_MASK").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.add_subscriber(
+            "VAL",
+            21,
+            DbFieldType::Double,
+            (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits(),
+        )
+    }
+    .expect("VAL subscription must be accepted");
+
+    // Cycle 1: value 0→7 (MDEL/ADEL fire) and sevr 0→Major in one pass.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("DST_MASK", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let event = val_rx.try_recv().expect("cycle 1 must post a VAL event");
+    assert_eq!(
+        event.mask,
+        EventMask::VALUE | EventMask::LOG | EventMask::ALARM,
+        "value change + alarm raise in one pass: VAL's event mask must \
+         carry all three classes, got {:?}",
+        event.mask
+    );
+
+    // Subscribe AMSG after cycle 1 so last_posted seeds at "msg1".
+    let mut amsg_rx = {
+        let rec = db.get_record("DST_MASK").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.add_subscriber("AMSG", 22, DbFieldType::String, EventMask::ALARM.bits())
+    }
+    .expect("AMSG subscription must be accepted");
+
+    // Source: keep severity Major, change amsg only.
+    if let Some(rec) = db.get_record("SRC_MASK").await {
+        let mut inst = rec.write().await;
+        inst.common.amsg = "msg2".to_string();
+    }
+    // Cycle 2: value unchanged (deadband silent), amsg-only alarm update.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("DST_MASK", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let event = val_rx
+        .try_recv()
+        .expect("alarm movement must post VAL even when the deadband is silent");
+    assert_eq!(
+        event.mask,
+        EventMask::ALARM,
+        "amsg-only pass: VAL posts with DBE_ALARM alone (C recGbl.c:212 \
+         val_mask), got {:?}",
+        event.mask
+    );
+
+    let event = amsg_rx.try_recv().expect("amsg-only change must post AMSG");
+    assert_eq!(
+        event.mask,
+        EventMask::ALARM,
+        "AMSG posts with stat_mask = DBE_ALARM (C recGbl.c:194/210-211), \
+         got {:?}",
+        event.mask
+    );
+}
+
 // BUG 2 regression — `process_record` (the foreign-process / QSRV-group
 // path) calls `process_local`. A recent fix excluded UDF from the
 // `process_local` `sub_updates` snapshot loop, citing "UDF via the

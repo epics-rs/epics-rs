@@ -184,7 +184,7 @@ impl SubscriptionFilter for SyncFilter {
         // machine unchanged. DBE_ALARM runs through the configured
         // mode like a value event. The 446e0d4a rule applies to
         // dbnd, not sync.
-        if event.read_context || event.mask.intersects(EventMask::PROPERTY) {
+        if event.read_context || event.event.mask.intersects(EventMask::PROPERTY) {
             return Some(event);
         }
         let actstate = self.state.get();
@@ -256,13 +256,11 @@ mod tests {
     use std::time::SystemTime;
 
     fn ev(v: f64, mask: EventMask) -> FilteredMonitorEvent {
-        FilteredMonitorEvent::new(
-            MonitorEvent {
-                snapshot: Snapshot::new(EpicsValue::Double(v), 0, 0, SystemTime::UNIX_EPOCH),
-                origin: 0,
-            },
+        FilteredMonitorEvent::new(MonitorEvent {
+            snapshot: Snapshot::new(EpicsValue::Double(v), 0, 0, SystemTime::UNIX_EPOCH),
+            origin: 0,
             mask,
-        )
+        })
     }
 
     fn val(e: &FilteredMonitorEvent) -> f64 {

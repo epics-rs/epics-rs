@@ -215,6 +215,17 @@ pub struct MonitorEvent {
     /// too, origin tagging can be extended to the process path by passing
     /// origin through `ProcessOutcome` or `process_record_with_links`.
     pub origin: u64,
+    /// The `DBE_*` event class(es) this post carries — C attaches the
+    /// posting mask to each event's field log (`db_field_log.mask`,
+    /// dbEvent.c) and pvxs narrows per event from `pDbFieldLog->mask`
+    /// (`groupsource.cpp:331-337`). Producer-side it was already used to
+    /// gate delivery (`Subscriber::accepts`); carrying it on the event
+    /// lets subscribers narrow what they decode (e.g. a QSRV group
+    /// monitor updating only alarm leaves on a `DBE_ALARM`-only event).
+    /// When events coalesce under a slow consumer, masks accumulate by
+    /// OR — the surviving snapshot is the newest, the mask reports every
+    /// class that changed since the last delivered event.
+    pub mask: crate::server::recgbl::EventMask,
 }
 
 /// A subscriber waiting for PV value updates.
@@ -271,10 +282,15 @@ impl Subscriber {
     /// cannot undercount one path: the record-field path previously
     /// overwrote the slot directly and never bumped the counter, hiding
     /// slow-consumer loss for the path most CA/PVA database monitors use.
-    pub(crate) fn coalesce_overflow(&self, event: MonitorEvent) {
+    pub(crate) fn coalesce_overflow(&self, mut event: MonitorEvent) {
         if let Ok(mut slot) = self.coalesced.lock() {
-            if slot.is_some() {
+            if let Some(prior) = slot.as_ref() {
                 record_dropped_monitor();
+                // The displaced value is lost but its event class must
+                // not be: fold it into the surviving event so a narrow
+                // consumer still learns that class changed (C keeps the
+                // mask on the squashed field log).
+                event.mask |= prior.mask;
             }
             *slot = Some(event);
         }
@@ -317,15 +333,20 @@ pub fn coalesce_consume(
     queued: MonitorEvent,
     coalesced: Option<MonitorEvent>,
 ) -> MonitorEvent {
-    let Some(newest) = coalesced else {
+    let Some(mut newest) = coalesced else {
         return queued;
     };
     // `queued` and everything still queued in `rx` predate `newest`;
     // discard them so delivery converges to the newest value without
-    // ever stepping backward to an older queued snapshot.
+    // ever stepping backward to an older queued snapshot. Their event
+    // classes are folded into the delivered mask — the values are
+    // superseded, but a narrow consumer must still learn which classes
+    // changed since its last delivery.
     record_dropped_monitor();
-    while rx.try_recv().is_ok() {
+    newest.mask |= queued.mask;
+    while let Ok(stale) = rx.try_recv() {
         record_dropped_monitor();
+        newest.mask |= stale.mask;
     }
     newest
 }
@@ -659,15 +680,16 @@ impl ProcessVariable {
             let event = MonitorEvent {
                 snapshot: snapshot.clone(),
                 origin: 0,
+                mask: post,
             };
             // The channel-filter chain may suppress this event (e.g.
-            // `dbnd` deadband not crossed); `post` tells value filters
-            // whether to pass through (446e0d4a).
+            // `dbnd` deadband not crossed); the event's mask tells value
+            // filters whether to pass through (446e0d4a).
             let filtered = if sub.filters.is_empty() {
                 Some(event)
             } else {
                 sub.filters
-                    .apply(FilteredMonitorEvent::new(event, post))
+                    .apply(FilteredMonitorEvent::new(event))
                     .map(|fe| fe.event)
             };
             let Some(event) = filtered else {
@@ -1126,6 +1148,76 @@ mod mask_gate_tests {
         assert!(
             rx.try_recv().is_ok(),
             "DBE_LOG subscriber must receive an alarm post"
+        );
+    }
+
+    /// Every delivered event carries its post's `DBE_*` class — the
+    /// per-event mask C attaches to the field log (`db_field_log.mask`)
+    /// and pvxs narrows monitor decoding with (`groupsource.cpp:331-337`).
+    #[tokio::test]
+    async fn monitor_event_carries_post_class_mask() {
+        use crate::server::recgbl::EventMask;
+        let pv = pv();
+        let mut rx = pv
+            .add_subscriber(1, DbFieldType::Double, DBE_VALUE | DBE_LOG | DBE_ALARM)
+            .await
+            .expect("subscriber added");
+        pv.set(EpicsValue::Double(1.0)).await;
+        assert_eq!(
+            rx.try_recv().expect("value event").mask,
+            EventMask::VALUE | EventMask::LOG,
+            "value post carries VALUE|LOG"
+        );
+        pv.post_alarm(2, 3).await;
+        assert_eq!(
+            rx.try_recv().expect("alarm event").mask,
+            EventMask::ALARM | EventMask::LOG,
+            "alarm post carries ALARM|LOG"
+        );
+    }
+
+    /// When a slow consumer forces coalescing, the surviving event's
+    /// mask is the OR of every squashed event's class — the values are
+    /// superseded by the newest snapshot, but a narrow consumer must
+    /// still learn that an ALARM-class change happened inside the
+    /// squashed burst. Covers both accumulation points: the producer's
+    /// coalesce-slot displacement (`Subscriber::coalesce_overflow`) and
+    /// the consumer's stale-tail drain (`coalesce_consume`).
+    #[tokio::test]
+    async fn coalescing_accumulates_event_class_masks() {
+        use crate::server::recgbl::EventMask;
+        let pv = Arc::new(ProcessVariable::new(
+            "coalesce:mask".into(),
+            EpicsValue::Double(0.0),
+        ));
+        let mut rx = pv
+            .add_subscriber(7, DbFieldType::Double, DBE_VALUE | DBE_LOG | DBE_ALARM)
+            .await
+            .expect("subscriber added");
+        // Fill the bounded queue (cap 64) with VALUE|LOG posts.
+        for i in 1..=64u32 {
+            pv.set(EpicsValue::Double(i as f64)).await;
+        }
+        // Overflow: the alarm post (ALARM|LOG) parks in the coalesce slot.
+        pv.post_alarm(2, 3).await;
+        // Displace the slot with a newer value post — the displaced
+        // alarm's class must fold into the survivor.
+        pv.set(EpicsValue::Double(99.0)).await;
+
+        let queued = rx.recv().await.expect("queued event");
+        let coalesced = pv.pop_coalesced(7).await;
+        let delivered = coalesce_consume(&mut rx, queued, coalesced);
+        assert_eq!(
+            delivered.snapshot.value.to_f64(),
+            Some(99.0),
+            "delivery converges on the newest value"
+        );
+        assert!(
+            delivered
+                .mask
+                .contains(EventMask::VALUE | EventMask::ALARM | EventMask::LOG),
+            "squashed alarm class survives in the delivered mask (got {:?})",
+            delivered.mask
         );
     }
 

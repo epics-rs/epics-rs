@@ -47,13 +47,14 @@ pub use sync::{DbState, DbStateRegistry, SyncFilter, SyncMode, db_state_registry
 pub use ts::TimestampFilter;
 
 /// One event passed through the filter chain. Wraps the standard
-/// [`MonitorEvent`] with the originating [`EventMask`] so filters
-/// can implement the "always-pass alarm / property" rule from
-/// epics-base 446e0d4a without poking at the snapshot internals.
+/// [`MonitorEvent`] with the C field-log context flag. The originating
+/// [`EventMask`] filters consult for the "always-pass alarm / property"
+/// rule (epics-base 446e0d4a) lives on the event itself
+/// (`event.mask`) — one mask, one owner, so a filter that transforms
+/// the event cannot leave a stale duplicate behind.
 #[derive(Debug, Clone)]
 pub struct FilteredMonitorEvent {
     pub event: MonitorEvent,
-    pub mask: EventMask,
     /// `true` when this event originates from a single-read context
     /// (DB-link / `caget`), not a monitor stream. Mirrors C
     /// `db_field_log.ctx == dbfl_context_read`: `decimate.c:64` and
@@ -65,20 +66,18 @@ pub struct FilteredMonitorEvent {
 
 impl FilteredMonitorEvent {
     /// Construct a monitor-stream event (`read_context = false`).
-    pub fn new(event: MonitorEvent, mask: EventMask) -> Self {
+    pub fn new(event: MonitorEvent) -> Self {
         Self {
             event,
-            mask,
             read_context: false,
         }
     }
 
     /// Construct a single-read-context event — `decimate` / `sync`
     /// pass these through unchanged (C `dbfl_context_read`).
-    pub fn new_read(event: MonitorEvent, mask: EventMask) -> Self {
+    pub fn new_read(event: MonitorEvent) -> Self {
         Self {
             event,
-            mask,
             read_context: true,
         }
     }
@@ -189,17 +188,17 @@ impl FilterChain {
             return Some(value);
         }
         use crate::server::pv::MonitorEvent;
-        use crate::server::recgbl::EventMask;
         use crate::server::snapshot::Snapshot;
         let snap = Snapshot::new(value, 0, 0, std::time::SystemTime::now());
         let event = MonitorEvent {
             snapshot: snap,
             origin: 0,
+            mask: EventMask::VALUE,
         };
         let wrapped = if read_context {
-            FilteredMonitorEvent::new_read(event, EventMask::VALUE)
+            FilteredMonitorEvent::new_read(event)
         } else {
-            FilteredMonitorEvent::new(event, EventMask::VALUE)
+            FilteredMonitorEvent::new(event)
         };
         let filtered = self.apply(wrapped)?;
         Some(filtered.event.snapshot.value)
@@ -304,13 +303,11 @@ mod tests {
 
     fn make_event(v: f64) -> FilteredMonitorEvent {
         let snapshot = Snapshot::new(EpicsValue::Double(v), 0, 0, SystemTime::UNIX_EPOCH);
-        FilteredMonitorEvent::new(
-            MonitorEvent {
-                snapshot,
-                origin: 0,
-            },
-            EventMask::VALUE,
-        )
+        FilteredMonitorEvent::new(MonitorEvent {
+            snapshot,
+            origin: 0,
+            mask: EventMask::VALUE,
+        })
     }
 
     /// Empty chain is the identity — every event passes unchanged.

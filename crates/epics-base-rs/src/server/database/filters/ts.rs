@@ -200,13 +200,11 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     fn make_event(t: impl Into<WallTime>) -> FilteredMonitorEvent {
-        FilteredMonitorEvent::new(
-            MonitorEvent {
-                snapshot: Snapshot::new(EpicsValue::Double(1.0), 0, 0, t),
-                origin: 0,
-            },
-            EventMask::VALUE,
-        )
+        FilteredMonitorEvent::new(MonitorEvent {
+            snapshot: Snapshot::new(EpicsValue::Double(1.0), 0, 0, t),
+            origin: 0,
+            mask: EventMask::VALUE,
+        })
     }
 
     /// The default `Generate` mode rewrites snapshot timestamp to "now".
@@ -234,7 +232,7 @@ mod tests {
     fn restamps_alarm_events_too() {
         let f = TimestampFilter::new();
         let mut ev = make_event(SystemTime::UNIX_EPOCH);
-        ev.mask = EventMask::ALARM;
+        ev.event.mask = EventMask::ALARM;
         let out = f.apply(ev).unwrap();
         assert!(out.event.snapshot.timestamp > WallTime::UNIX_EPOCH);
     }

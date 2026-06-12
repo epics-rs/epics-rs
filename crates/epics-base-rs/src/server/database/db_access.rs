@@ -402,6 +402,20 @@ impl DbSubscription {
         Some(event.snapshot)
     }
 
+    /// Wait for the next change, returning the full [`MonitorEvent`] —
+    /// snapshot plus the per-event `DBE_*` mask (C `db_field_log.mask`,
+    /// the discriminator pvxs narrows monitor updates with,
+    /// `groupsource.cpp:331-337`). Consumers that decode differently per
+    /// event class (e.g. a QSRV group monitor updating only alarm leaves
+    /// on a `DBE_ALARM`-only post) use this instead of
+    /// [`recv_snapshot`](Self::recv_snapshot). When events coalesced
+    /// under a slow consumer, the mask is the OR of every squashed
+    /// event's class — what changed since the previous delivery.
+    /// Silently skips events matching `ignore_origin`.
+    pub async fn recv_event(&mut self) -> Option<MonitorEvent> {
+        self.next_event().await
+    }
+
     pub fn pv_name(&self) -> &str {
         &self.pv_name
     }

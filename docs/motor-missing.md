@@ -32,9 +32,9 @@ H6 잔여 두 건 모두 epics-base-rs 구조 변경으로 이식 완료:
   alarm 전이가 있는 패스에서 미변경 구독 필드도 `DBE_ALARM`으로 post.
 
 상세는 git log의 `feat(base):`/`feat(motor):` 커밋이 원장. BRIDGE-79
-본체(qsrv group monitor의 leaf 협폭 — `MemberEvent` 분류 +
-pvdata/encode leaf-family marking)는 bridge-rs 측 잔여 작업으로 이
-문서 범위 밖.
+본체(qsrv group monitor의 leaf 협폭)도 bridge-rs 측에서 이식 완료 —
+per-kind leaf narrowing에 이어 self-trigger의 per-event DBE mask
+교차(pvxs `groupsource.cpp:331-337`)까지 `feat(bridge):` 커밋이 원장.
 
 ## OUT OF SCOPE — motor sweep 외부
 

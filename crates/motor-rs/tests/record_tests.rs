@@ -1604,16 +1604,55 @@ fn test_stup_put_rejects_non_on_and_busy_retrigger() {
 
     rec.put_field("STUP", EpicsValue::Short(2)).unwrap();
     assert_eq!(rec.stat.stup, 0, "BUSY write forced to OFF");
+    // The write pass itself is a NOTHING_DONE pass that dispatches
+    // nothing, so C's implicit GET_INFO (2546-2557) fires on it: STUP
+    // goes BUSY and a refresh is requested even though the put was
+    // forced to OFF — the protocol is triggered by the pass, not by
+    // the written value.
     let effects = rec.do_process();
-    assert!(!effects.status_refresh, "forced-OFF write triggers nothing");
-
-    rec.put_field("STUP", EpicsValue::Short(1)).unwrap();
-    rec.do_process();
-    assert_eq!(rec.stat.stup, 2);
+    assert!(
+        effects.status_refresh,
+        "implicit GET_INFO fires on the no-op put pass"
+    );
+    assert_eq!(rec.stat.stup, 2, "BUSY until the data callback");
     assert!(
         rec.put_field("STUP", EpicsValue::Short(1)).is_err(),
         "re-trigger while BUSY is refused"
     );
+
+    // The data callback returns BUSY to OFF (C process_exit 1498-1502,
+    // ported in determine_event); the field is writable again.
+    rec.stat.stup = 0;
+    rec.put_field("STUP", EpicsValue::Short(1)).unwrap();
+    assert_eq!(rec.stat.stup, 1);
+}
+
+#[test]
+fn test_idle_status_pass_blocks_implicit_get_info() {
+    // C 2546: the implicit GET_INFO arm gates on `proc_ind ==
+    // NOTHING_DONE` — a CALLBACK_DATA pass firing it would request a
+    // fresh status from every status, an unbounded poll loop. The
+    // one-pass mark from determine_event's Idle consume carries that
+    // discriminator.
+    let mut rec = MotorRecord::new();
+    rec.set_device_state(motor_rs::device_state::new_shared_state());
+
+    rec.internal.idle_status_pass = true;
+    let effects = rec.do_process();
+    assert!(
+        !effects.status_refresh,
+        "CALLBACK_DATA pass: no implicit GET_INFO"
+    );
+    assert_eq!(rec.stat.stup, 0);
+
+    // The same no-op pass without the mark is a put/scan pass — the
+    // chain end fires the refresh.
+    let effects = rec.do_process();
+    assert!(
+        effects.status_refresh,
+        "put/scan pass fires the implicit GET_INFO"
+    );
+    assert_eq!(rec.stat.stup, 2, "STUP holds BUSY until the callback");
 }
 
 #[test]

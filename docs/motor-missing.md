@@ -57,5 +57,13 @@ Major bump 시점에 `MotorCommand::SetPidGain { which, gain }` /
   configured record는 init pass가 S/SBAK/ACCL에서 도출하므로 무영향.
 - driverless STUP: C 1824-1828 (GET_INFO 불가 device → OFF 복귀)에
   맞춰 device_state 부재 시 BUSY 진입 차단 (ab8ee3b3). C의
-  NOTHING_DONE 암묵 GET_INFO 분기(2546-2557)는 Rust에 미이식 —
-  stuck-BUSY defect를 일으킬 수 없어 별도 finding으로만 남김.
+  NOTHING_DONE 암묵 GET_INFO 분기(2546-2557)는 이후 이식 완료 —
+  no-op put/scan pass(`None` arm, `put_pass=true`)가 chain end에서
+  STUP→BUSY + status refresh를 발화하고, CALLBACK_DATA pass는
+  process_reason 판별자(`internal.idle_status_pass`)로 제외되어 C와
+  동일한 poll-feedback 방지를 가진다. 잔여 micro-deviation:
+  plan_motion이 직접 처리하는 housekeeping put pass(CNEN, SET 전환,
+  PCO config 등 last_write를 세우는 put)는 chain end로 떨어지지 않아
+  그 pass에서는 암묵 GET_INFO가 생략됨 — C는 같은 pass에서 발화.
+  해당 arm 대부분이 자체적으로 poll을 요청하므로 refresh 목적은
+  동일하게 달성되고, STUP 상태 전이만 생략된다.

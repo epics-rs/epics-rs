@@ -54,7 +54,9 @@ impl MotorRecord {
                 // C process_reason: this pass IS a CALLBACK_DATA pass
                 // even though no event is reported — mark it so
                 // do_process_inner routes it through the idle completion
-                // pipeline (LOAD_P collapse, pp sync, C 1396-1409).
+                // pipeline (LOAD_P collapse, pp sync, C 1396-1409) and
+                // keeps the put-pass-only implicit GET_INFO (C 2546)
+                // off, which is C's status-refresh loop prevention.
                 self.internal.idle_status_pass = true;
                 return None;
             }

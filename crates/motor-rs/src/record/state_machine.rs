@@ -411,9 +411,10 @@ impl MotorRecord {
                 // level-triggered pass that picks up a button latched
                 // while its gate failed — limit switch active, or the
                 // closed-loop DOL collection bypass — once the gate
-                // clears. The pp completion return above skips one
-                // pass; the next poll lands here.
-                self.dispatch_latent_collection(&mut effects);
+                // clears. CALLBACK_DATA pass — the implicit GET_INFO
+                // (C 2546) stays off; the pp completion return above
+                // skips one pass and the next poll lands here.
+                self.dispatch_latent_collection(&mut effects, false);
             }
         }
 

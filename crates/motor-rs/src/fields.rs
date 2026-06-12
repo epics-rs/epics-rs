@@ -489,7 +489,8 @@ pub struct InternalFields {
     /// readback and reports no event). The C equivalent is
     /// `process_reason == CALLBACK_DATA` — the pass must run the
     /// idle-completion pipeline (LOAD_P collapse, pp sync, C
-    /// 1396-1409). Set by `determine_event`, consumed at
-    /// `do_process_inner` entry.
+    /// 1396-1409) and must NOT fire the put-pass-only implicit
+    /// GET_INFO (C 2546 gates on `proc_ind == NOTHING_DONE`). Set by
+    /// `determine_event`, consumed at `do_process_inner` entry.
     pub idle_status_pass: bool,
 }

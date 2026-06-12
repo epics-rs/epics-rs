@@ -1086,9 +1086,17 @@ impl MotorRecord {
     /// the explicit Val-arm path.
     ///
     /// After the sections, the C else-if chain end runs: the move block
-    /// (2240) whose set test replays a parked SET redefinition, and the
-    /// latent SYNC arm (2540-2544).
-    pub(super) fn dispatch_latent_collection(&mut self, effects: &mut ProcessEffects) {
+    /// (2240) whose set test replays a parked SET redefinition, the
+    /// latent SYNC arm (2540-2544), and the implicit GET_INFO arm
+    /// (2546-2557). `put_pass` is C's `proc_ind == NOTHING_DONE`: only
+    /// a put/scan pass may fire the implicit GET_INFO — a CALLBACK_DATA
+    /// pass firing it would request a fresh status from every status,
+    /// an unbounded poll feedback loop C prevents with the same test.
+    pub(super) fn dispatch_latent_collection(
+        &mut self,
+        effects: &mut ProcessEffects,
+        put_pass: bool,
+    ) {
         if !self.stat.dmov || !self.can_accept_command() {
             return;
         }
@@ -1129,7 +1137,19 @@ impl MotorRecord {
             return;
         }
         // C SYNC arm (2540-2544): chain end, idle and done.
-        self.apply_latent_sync();
+        if self.apply_latent_sync() {
+            return;
+        }
+        // C implicit GET_INFO (2546-2557): a put/scan pass that
+        // dispatched nothing refreshes the device status — STUP goes
+        // BUSY and GET_INFO is sent; a device that cannot deliver it
+        // returns STUP to OFF (here: never enters BUSY, like the
+        // explicit driverless STUP put). determine_event's stup==2
+        // clear + ack on the next fresh status closes the cycle.
+        if put_pass && self.stat.stup == 0 && self.device_state.is_some() {
+            self.stat.stup = 2;
+            effects.status_refresh = true;
+        }
     }
 
     /// Start homing.
@@ -2012,8 +2032,9 @@ impl MotorRecord {
                     // still reaches do_work through the dmov arm, so a
                     // button/tweak latched while the STUP was in flight
                     // dispatches here even though completion is skipped.
+                    // CALLBACK_DATA pass — no implicit GET_INFO (C 2546).
                     let mut effects = ProcessEffects::default();
-                    self.dispatch_latent_collection(&mut effects);
+                    self.dispatch_latent_collection(&mut effects, false);
                     return effects;
                 }
                 self.check_completion()
@@ -2060,9 +2081,11 @@ impl MotorRecord {
                 } else {
                     // C do_work gate (1486-1492): the put pass continues
                     // into do_work, whose home/jog/tweak sections act on
-                    // latched button state.
+                    // latched button state and whose chain end may fire
+                    // the implicit GET_INFO (2546-2557, NOTHING_DONE
+                    // passes only — put_pass carries that discriminator).
                     let mut effects = ProcessEffects::default();
-                    self.dispatch_latent_collection(&mut effects);
+                    self.dispatch_latent_collection(&mut effects, true);
                     effects
                 }
             }

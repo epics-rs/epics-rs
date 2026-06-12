@@ -837,6 +837,49 @@ fn latent_sync_latched_during_load_pos_applies_at_collapse() {
 }
 
 #[test]
+fn noop_put_pass_fires_implicit_get_info_through_live_path() {
+    // C 2546-2557: a put/scan pass (NOTHING_DONE) that dispatched
+    // nothing falls to the end of the do_work chain — STUP goes BUSY
+    // and a GET_INFO refreshes the device status. The data callback
+    // returns STUP to OFF (process_exit 1498-1502) and, being a
+    // CALLBACK_DATA pass, must not re-fire — C's loop prevention.
+    use motor_rs::device_state::new_shared_state;
+
+    let state = new_shared_state();
+    state.lock().unwrap().latest_status = Some(idle_status_at(1, 0.0));
+
+    let mut rec = make_record();
+    rec.set_device_state(state.clone());
+    rec.process().unwrap(); // startup
+    state.lock().unwrap().pending_actions.take();
+
+    // HLM is pp(TRUE) in C with no dispatch of its own: the put pass
+    // reaches the chain end having done nothing.
+    rec.put_field("HLM", EpicsValue::Double(50.0)).unwrap();
+    rec.process().unwrap();
+    assert_eq!(rec.get_field("STUP"), Some(EpicsValue::Short(2)), "BUSY");
+    let actions = state.lock().unwrap().pending_actions.take().unwrap();
+    assert!(actions.status_refresh, "implicit GET_INFO requested");
+
+    // The data callback acknowledges and must not re-trigger.
+    state.lock().unwrap().latest_status = Some(idle_status_at(2, 0.0));
+    rec.process().unwrap();
+    assert_eq!(rec.get_field("STUP"), Some(EpicsValue::Short(0)), "OFF");
+    let ack = state.lock().unwrap().pending_actions.take();
+    assert!(
+        ack.is_none_or(|a| !a.status_refresh),
+        "CALLBACK_DATA pass does not re-fire the refresh"
+    );
+
+    // A plain idle poll is also a CALLBACK_DATA pass: no refresh.
+    state.lock().unwrap().latest_status = Some(idle_status_at(3, 0.0));
+    rec.process().unwrap();
+    assert_eq!(rec.get_field("STUP"), Some(EpicsValue::Short(0)));
+    let poll = state.lock().unwrap().pending_actions.take();
+    assert!(poll.is_none_or(|a| !a.status_refresh));
+}
+
+#[test]
 fn comm_error_sets_alarm_and_safe_state() {
     let mut rec = make_record();
 

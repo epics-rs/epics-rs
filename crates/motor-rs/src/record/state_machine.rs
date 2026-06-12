@@ -347,6 +347,18 @@ impl MotorRecord {
                     self.stat.dmov = true;
                     return effects;
                 }
+                // C process (1396-1402): a done status callback with pp
+                // armed and no motion runs postProcess, whose first
+                // block re-syncs the drive values from the readback
+                // (826-849). The SET-mode resolution re-anchor
+                // (do_work 1980-1986: pp = TRUE + GET_INFO) completes
+                // here, re-deriving VAL/DVAL/RVAL at the new
+                // resolution.
+                if self.internal.pp && self.stat.msta.contains(MstaFlags::DONE) && !self.stat.movn {
+                    self.internal.pp = false;
+                    self.sync_positions();
+                    return effects;
+                }
                 // C: ea063f5f — if the record marked an externally initiated
                 // move (MIP_EXTERNAL set during process_motor_info), close
                 // the loop once the driver reports done. Reseed VAL/DVAL/RVAL

@@ -514,6 +514,129 @@ fn test_sset_suse_fof_vof_momentary_commands() {
 }
 
 #[test]
+fn test_runtime_mres_change_use_mode_reanchors_with_load_pos() {
+    // C do_work (motorRecord.cc:1936-1991): the pp(TRUE) process pass
+    // after a runtime MRES write re-anchors a USE-mode record via
+    // load_pos — LOAD_POS at the current DVAL, MIP_LOAD_P, DMOV low,
+    // GET_INFO.
+    let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::DONE;
+    rec.internal.init_invariants_synced = true;
+
+    rec.put_field("MRES", EpicsValue::Double(0.5)).unwrap();
+    let effects = rec.do_process();
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::SetPosition { .. })),
+        "USE-mode re-anchor dispatches LOAD_POS"
+    );
+    assert!(effects.request_poll, "C: LOAD_POS is followed by GET_INFO");
+    assert_eq!(rec.stat.mip, MipFlags::LOAD_P);
+    assert!(!rec.stat.dmov, "DMOV pulses low during the load");
+    assert!(
+        !rec.internal.res_reanchor,
+        "the mark dies with its process pass"
+    );
+}
+
+#[test]
+fn test_runtime_mres_change_set_mode_resyncs_drive_values() {
+    // C do_work 1980-1986: in SET mode the resolution change arms pp
+    // and sends GET_INFO — no LOAD_POS. The status callback then runs
+    // postProcess (process 1396-1402 -> 826-849), re-deriving the
+    // drive values from the readback at the new resolution.
+    let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::DONE;
+    rec.internal.init_invariants_synced = true;
+    rec.pos.val = 5.0;
+    rec.pos.dval = 5.0;
+    rec.pos.drbv = 5.0;
+    rec.put_field("SET", EpicsValue::Short(1)).unwrap();
+
+    rec.put_field("MRES", EpicsValue::Double(0.5)).unwrap();
+    let effects = rec.do_process();
+    assert!(
+        effects.commands.is_empty(),
+        "SET mode re-anchors without LOAD_POS"
+    );
+    assert!(effects.request_poll, "C 1983-1985: GET_INFO");
+    assert!(rec.internal.pp, "C 1982: pp = TRUE");
+    assert!(rec.stat.dmov, "no motion: DMOV stays TRUE");
+
+    // GET_INFO callback: readback now reports in the new resolution.
+    let status = asyn_rs::interfaces::motor::MotorStatus {
+        position: 4.0,
+        done: true,
+        ..Default::default()
+    };
+    rec.process_motor_info(&status);
+    let _ = rec.check_completion();
+    assert!(!rec.internal.pp, "postProcess consumed pp");
+    assert_eq!(rec.pos.dval, 4.0, "DVAL re-synced from the readback");
+    assert_eq!(rec.pos.val, rec.pos.rbv, "VAL re-synced from RBV");
+}
+
+#[test]
+fn test_plain_ueip_change_does_not_reanchor() {
+    // C special UEIP (2934-2950): a plain UEIP change never MARKs
+    // M_UEIP — only the no-encoder override does — so the do_work
+    // re-anchor must NOT fire. URIP forcing UEIP off (2955-2959) DOES
+    // mark and re-anchors.
+    let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::DONE | MstaFlags::ENCODER_PRESENT;
+    rec.internal.init_invariants_synced = true;
+
+    rec.put_field("UEIP", EpicsValue::Short(1)).unwrap();
+    assert!(rec.conv.ueip);
+    let effects = rec.do_process();
+    assert!(
+        effects.commands.is_empty(),
+        "plain UEIP change: no LOAD_POS in C"
+    );
+    assert!(rec.stat.mip.is_empty());
+
+    // URIP=Yes forces UEIP off — that override path marks M_UEIP.
+    rec.put_field("URIP", EpicsValue::Short(1)).unwrap();
+    assert!(!rec.conv.ueip);
+    let effects = rec.do_process();
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::SetPosition { .. })),
+        "UEIP forced off re-anchors via load_pos"
+    );
+    assert_eq!(rec.stat.mip, MipFlags::LOAD_P);
+}
+
+#[test]
+fn test_mres_reanchor_mark_dies_on_stop_pass() {
+    // C mmap marks live one process pass: when the pass takes the
+    // do_work top-block stop return (1866-1911), monitor() clears the
+    // mark and the re-anchor never fires for that write.
+    let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::DONE;
+    rec.internal.init_invariants_synced = true;
+
+    rec.put_field("MRES", EpicsValue::Double(0.5)).unwrap();
+    rec.ctrl.stop = true; // latent stop pulse rides the same pass
+    let effects = rec.do_process();
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::SetPosition { .. })),
+        "stop wins the pass; no LOAD_POS"
+    );
+    assert!(
+        !rec.internal.res_reanchor,
+        "the mark dies with the pass, like C monitor() clearing mmap"
+    );
+}
+
+#[test]
 fn test_blocked_homf_stays_latched_and_zero_write_unlatches() {
     // C home gate (2013-2014): a HOMF blocked by its limit switch
     // simply fails the gate — the button stays latched (no clear, no

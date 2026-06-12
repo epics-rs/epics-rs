@@ -444,4 +444,12 @@ pub struct InternalFields {
     /// default UREV (and then rewrite VELO from that stale S), or rescale a
     /// freshly-loaded DHLM against the pre-MRES default resolution.
     pub init_invariants_synced: bool,
+    /// C `MARK(M_MRES)` / `M_ERES` / `M_UEIP` — a runtime resolution (or
+    /// encoder-use) change is pending its do_work re-anchor pass
+    /// (motorRecord.cc:1936-1991). Armed by the MRES/SREV/UREV/ERES put
+    /// arms (and the UEIP/URIP override paths) once init has completed;
+    /// consumed — or dropped, when the pass takes a C top-block stop
+    /// return — by the next process pass. Like C's mmap marks, it never
+    /// outlives that pass.
+    pub res_reanchor: bool,
 }

@@ -11,6 +11,12 @@ impl MotorRecord {
         self.internal.dmov_notified = false;
         let mut effects = ProcessEffects::default();
 
+        // C mmap marks live exactly one process pass (monitor() clears
+        // them at the end): take the resolution re-anchor mark now, so
+        // a pass that returns from the stop/SPMG top block below drops
+        // it exactly like C's early return(OK) before line 1938.
+        let res_reanchor = std::mem::take(&mut self.internal.res_reanchor);
+
         // C enter_do_work (1462-1483) re-evaluates LVIO on EVERY process
         // pass before do_work — including put-processing passes, since
         // HLM/LLM/DHLM/DLLM are pp(TRUE). A rising violation sets
@@ -74,6 +80,23 @@ impl MotorRecord {
                     }
                 }
             }
+        }
+
+        // C do_work resolution block (1936-1991): fires after the
+        // stop/SPMG top block and before every other section — ungated
+        // by stop_or_pause (a steady Stop/Pause does not suppress it) —
+        // and ends the pass; a coalesced position write parks as
+        // dval != ldvl like in C. The stop srcs instead run their C
+        // top-block branch (which returns before 1938), dropping the
+        // taken mark with the pass; a coalesced SPMG transition is
+        // parked unsynced, so the latent-SPMG gate replays it.
+        if res_reanchor
+            && src != CommandSource::Stop
+            && !(src == CommandSource::Spmg
+                && matches!(self.ctrl.spmg, SpmgMode::Stop | SpmgMode::Pause))
+        {
+            self.dispatch_res_reanchor(&mut effects);
+            return effects;
         }
 
         // SPMG, STOP, and SYNC always processed regardless of command gate
@@ -1454,6 +1477,40 @@ impl MotorRecord {
         effects.request_poll = true;
     }
 
+    /// C do_work resolution block (motorRecord.cc:1936-1991): a runtime
+    /// MRES/ERES/UEIP change re-anchors the record. USE mode loads the
+    /// controller position at the redefined DVAL (load_pos, 1988-1989);
+    /// SET mode arms post-process and re-reads the controller
+    /// (1980-1986), so the status callback re-derives the drive values
+    /// at the new resolution. Runs ungated by stop_or_pause — a steady
+    /// SPMG Stop/Pause does not suppress it in C.
+    ///
+    /// Deviation from C: SET_ENC_RATIO (1944-1968, 1973-1978) is not
+    /// ported — motor-rs drivers take the encoder scale from ERES at
+    /// readback time, there is no per-axis ratio download. The
+    /// mres/eres normalization C performs around that ratio math is
+    /// kept: it is observable field state.
+    pub(crate) fn dispatch_res_reanchor(&mut self, effects: &mut ProcessEffects) {
+        if self.stat.msta.contains(MstaFlags::ENCODER_PRESENT) {
+            // C 1949-1958: defend the ratio math against MRES ~ 0 and
+            // an unset ERES.
+            if self.conv.mres.abs() < 1e-9 {
+                self.conv.mres = 1.0;
+            }
+            if self.conv.eres == 0.0 {
+                self.conv.eres = self.conv.mres;
+            }
+        }
+        // C 1971: make sure the retry deadband is achievable.
+        self.enforce_min_retry_deadband();
+        if self.conv.set && !self.conv.igset {
+            self.internal.pp = true;
+            effects.request_poll = true;
+        } else if !self.stat.mip.contains(MipFlags::LOAD_P) {
+            self.load_pos(effects);
+        }
+    }
+
     /// C set_userlimits (motorRecord.cc:4334-4348): translate the dial
     /// limits to user limits through DIR/OFF. Single owner — called
     /// wherever OFF or the dial pair changes (offset redefinition, DIR
@@ -1729,6 +1786,31 @@ impl MotorRecord {
     }
 
     fn do_process_inner(&mut self) -> ProcessEffects {
+        // C do_work resolution block (1936-1991) on the pass a
+        // pp(TRUE) MRES/SREV/UREV/ERES/UEIP put triggers — in this
+        // dispatcher that pass carries no command source. The mark
+        // lives exactly one pass: when the pass would take a C
+        // top-block stop return (LVIO rising, latent stop pulse, SPMG
+        // transition to Stop/Pause), it is dropped unconsumed and the
+        // existing latent handling owns the pass.
+        if self.internal.res_reanchor && self.last_write.is_none() {
+            self.internal.res_reanchor = false;
+            // C enter_do_work LVIO (1462-1483) precedes do_work.
+            if self.recompute_lvio_during_motion() {
+                let mut effects = ProcessEffects::default();
+                self.stop_axis(&mut effects);
+                return effects;
+            }
+            let top_block_returns = self.ctrl.stop
+                || (self.ctrl.spmg != self.internal.lspg
+                    && matches!(self.ctrl.spmg, SpmgMode::Stop | SpmgMode::Pause));
+            if !top_block_returns {
+                let mut effects = ProcessEffects::default();
+                self.dispatch_res_reanchor(&mut effects);
+                return effects;
+            }
+        }
+
         // Sub-step pulse recovery: if DMOV is false but phase is Idle
         // (no real motion started), finalize to restore DMOV=1.
         if !self.stat.dmov && self.stat.phase == MotionPhase::Idle && self.stat.mip.is_empty() {

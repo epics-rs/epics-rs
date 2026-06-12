@@ -1083,6 +1083,11 @@ pub(crate) fn motor_put_field(
                 // C: cascade UREV from MRES
                 rec.conv.urev = v * rec.conv.srev as f64;
                 apply_mres_cascade(rec, old_mres);
+                // C special MRES (2834): MARK(M_MRES) unconditionally —
+                // the pp(TRUE) process pass re-anchors (do_work 1936).
+                if rec.internal.init_invariants_synced {
+                    rec.internal.res_reanchor = true;
+                }
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1091,6 +1096,10 @@ pub(crate) fn motor_put_field(
             EpicsValue::Double(v) => {
                 // C: if ERES==0, set to MRES
                 rec.conv.eres = if v == 0.0 { rec.conv.mres } else { v };
+                // C special ERES (2930): MARK(M_ERES) unconditionally.
+                if rec.internal.init_invariants_synced {
+                    rec.internal.res_reanchor = true;
+                }
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1108,6 +1117,11 @@ pub(crate) fn motor_put_field(
                 }
                 // Cascade velocity and limits like MRES handler
                 apply_mres_cascade(rec, old_mres);
+                // C special SREV (2919-2922): MARK(M_MRES) only when
+                // MRES actually changed.
+                if rec.internal.init_invariants_synced && rec.conv.mres != old_mres {
+                    rec.internal.res_reanchor = true;
+                }
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1122,6 +1136,11 @@ pub(crate) fn motor_put_field(
                 }
                 // C: cascade velocities and limits from new UREV
                 apply_mres_cascade(rec, old_mres);
+                // C special UREV (2848-2853): MARK(M_MRES) only when
+                // MRES actually changed.
+                if rec.internal.init_invariants_synced && rec.conv.mres != old_mres {
+                    rec.internal.res_reanchor = true;
+                }
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1135,8 +1154,14 @@ pub(crate) fn motor_put_field(
                     if rec.stat.msta.contains(MstaFlags::ENCODER_PRESENT) {
                         rec.conv.urip = false;
                     } else {
-                        // No encoder available, cannot use UEIP
+                        // No encoder available, cannot use UEIP.
+                        // C special UEIP (2947-2948): only this override
+                        // path MARKs M_UEIP — a plain UEIP change never
+                        // fires the do_work re-anchor.
                         rec.conv.ueip = false;
+                        if rec.internal.init_invariants_synced {
+                            rec.internal.res_reanchor = true;
+                        }
                         return Ok(());
                     }
                 }
@@ -1149,7 +1174,12 @@ pub(crate) fn motor_put_field(
             EpicsValue::Short(v) => {
                 let urip = v != 0;
                 if urip {
-                    // C: if URIP=Yes and UEIP=Yes, set UEIP=No
+                    // C: if URIP=Yes and UEIP=Yes, set UEIP=No.
+                    // C special URIP (2955-2959): MARK(M_UEIP) only when
+                    // UEIP was actually forced off.
+                    if rec.conv.ueip && rec.internal.init_invariants_synced {
+                        rec.internal.res_reanchor = true;
+                    }
                     rec.conv.ueip = false;
                 }
                 rec.conv.urip = urip;

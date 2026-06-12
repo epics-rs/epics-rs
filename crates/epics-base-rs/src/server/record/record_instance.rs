@@ -94,13 +94,18 @@ pub(crate) struct MetadataSnapshot {
     pub enums: Option<EnumInfo>,
 }
 
-/// Returns true if writing to this field should invalidate the metadata
-/// cache. Field name is expected uppercase.
+/// Returns true if this field is property-class — the C `prop(YES)`
+/// dbd attribute: writing a changed value posts `DBE_PROPERTY` to the
+/// record's subscribers AND invalidates the metadata cache. Field name
+/// is expected uppercase.
 ///
-/// **MUST be kept in sync with `populate_display_info`,
-/// `populate_control_info`, and `populate_enum_info`.** If you add a
-/// new source field there, add it here too — otherwise the cache will
-/// serve stale metadata until some other tracked field is written.
+/// **Every field read by `populate_display_info`,
+/// `populate_control_info`, or `populate_enum_info` MUST be in this
+/// set** — otherwise the cache serves stale metadata until some other
+/// tracked field is written. The reverse does not hold: a field may be
+/// property-class without being a cache source (e.g. the motor fields
+/// below feed the live-computed `field_metadata_override`, never the
+/// cache — its invalidation on their write is harmless).
 ///
 /// Currently uncovered (because they are not yet populated by any
 /// `populate_*` function): `DESC` (would map to `display.description`
@@ -121,6 +126,13 @@ fn is_metadata_field(name: &str) -> bool {
         | "HHSV" | "HSV" | "LSV" | "LLSV"
         // Output ctrl limits — ao/longout `prop(YES)`.
         | "DRVH" | "DRVL"
+        // motor `prop(YES)` (`motorRecord.dbd` 154/161/289/361/368):
+        // VBAS/VMAX bound VELO's range, MRES the RVAL/RRBV raw range,
+        // DHLM/DLLM the DVAL/DRBV range — all served per field by
+        // `Record::field_metadata_override` (C get_graphic_double /
+        // get_control_double). HLM/LLM/EGU/PREC and the alarm limits
+        // are motor `prop(YES)` too, already listed above.
+        | "VBAS" | "VMAX" | "MRES" | "DHLM" | "DLLM"
         // bi/bo/busy enum strings — `prop(YES)`.
         | "ZNAM" | "ONAM"
         // bi/bo state severities — `biRecord.dbd.pod` / `boRecord.dbd.pod`
@@ -2983,6 +2995,18 @@ mod metadata_cache_tests {
     }
 
     // ── Regression: DBE_PROPERTY event delivery boundaries ──────────────
+
+    /// motor `prop(YES)` fields (motorRecord.dbd 154/161/289/361/368)
+    /// are property-class: a changed write must post DBE_PROPERTY
+    /// (C dbAccess.c dbPut, `pfldDes->prop`). They feed the
+    /// live-computed `field_metadata_override`, not the cache, but the
+    /// posting gate is this same set.
+    #[test]
+    fn motor_prop_yes_fields_are_property_class() {
+        for f in ["VBAS", "VMAX", "MRES", "DHLM", "DLLM"] {
+            assert!(is_metadata_field(f), "{f} must be property-class");
+        }
+    }
 
     /// Boundary 1: metadata field written with a CHANGED value, subscriber
     /// mask includes PROPERTY → subscriber receives an event.

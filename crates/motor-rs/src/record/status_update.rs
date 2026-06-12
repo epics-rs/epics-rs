@@ -257,10 +257,16 @@ impl MotorRecord {
             msta.contains(MstaFlags::HOME_LS)
         };
 
-        // C: devMotorAsyn.c — RVEL is the raw velocity reported by the
-        // driver, stored as floor(status.velocity) (motorRecord.dbd RVEL is
-        // DBF_LONG "Raw Velocity").
-        self.stat.rvel = status.velocity.floor() as i64;
+        // C devMotorAsyn.c:469-474 — RVEL is the RAW velocity in steps/s
+        // (motorRecord.dbd DBF_LONG "Raw Velocity"), floor()ed as in C.
+        // The C asyn layer reports controller units (raw steps); the Rust
+        // driver convention is EGU (AsynMotor docs), so convert through
+        // MRES at the record boundary exactly like RMP above.
+        self.stat.rvel = if self.conv.mres != 0.0 {
+            (status.velocity / self.conv.mres).floor() as i64
+        } else {
+            0
+        };
 
         // LVIO is NOT recomputed here. C re-evaluates it only at
         // enter_do_work (1462-1483: jog from live RBV, home disabled,

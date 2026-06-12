@@ -2955,8 +2955,40 @@ fn test_rvel_is_floored_raw_velocity() {
         ..Default::default()
     };
     rec.process_motor_info(&status);
-    // C devMotorAsyn: rvel = floor(status.velocity)
+    // C devMotorAsyn: rvel = floor(raw velocity); mres=1 → floor(3.7)
     assert_eq!(rec.get_field("RVEL"), Some(EpicsValue::Int64(3)));
+}
+
+#[test]
+fn test_rvel_converts_egu_velocity_to_raw_steps() {
+    use asyn_rs::interfaces::motor::MotorStatus;
+    // C devMotorAsyn.c:469-474 fills RVEL with the raw steps/s the
+    // controller reports. The Rust driver reports EGU/s, so the record
+    // converts through MRES like it does for RMP.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.001;
+    let status = MotorStatus {
+        velocity: 2.5, // EGU/s
+        ..Default::default()
+    };
+    rec.process_motor_info(&status);
+    assert_eq!(
+        rec.get_field("RVEL"),
+        Some(EpicsValue::Int64(2500)),
+        "2.5 EGU/s at 0.001 EGU/step = 2500 steps/s"
+    );
+
+    // Negative raw velocity keeps C's floor() semantics.
+    let status = MotorStatus {
+        velocity: -0.0015,
+        ..Default::default()
+    };
+    rec.process_motor_info(&status);
+    assert_eq!(
+        rec.get_field("RVEL"),
+        Some(EpicsValue::Int64(-2)),
+        "floor(-1.5) = -2, matching C floor()"
+    );
 }
 
 #[test]

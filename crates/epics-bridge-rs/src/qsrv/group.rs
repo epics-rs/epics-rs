@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use epics_base_rs::server::database::PvDatabase;
 use epics_base_rs::server::database::db_access::{DbSubscription, SubscriptionActivation};
+use epics_base_rs::server::recgbl::EventMask as DbeMask;
 use epics_base_rs::types::{DbFieldType, dbf_link_class};
 use epics_pva_rs::pvdata::{FieldDesc, PvField, PvStructure, ScalarType, VariantValue};
 
@@ -1754,6 +1755,16 @@ enum MemberEventKind {
 struct MemberEvent {
     member_index: usize,
     kind: MemberEventKind,
+    /// The per-event DBE mask (`MonitorEvent.mask`, C `db_field_log.mask`;
+    /// OR-accumulated when the subscription coalesced). A *value* event
+    /// narrows the SELF-triggered member's marked leaves to the classes
+    /// that actually fired — pvxs `subscriptionValueCallback` uses
+    /// `pDbFieldLog->mask & UpdateType::Everything` for the self-trigger
+    /// and `Value | Alarm` for every other triggered field
+    /// (`groupsource.cpp:331-337`). A *property* event ignores it: pvxs
+    /// passes `UpdateType::Property` unconditionally
+    /// (`groupsource.cpp:378`).
+    mask: DbeMask,
 }
 
 /// A PVA monitor for a group PV that subscribes to all member records.
@@ -1916,7 +1927,18 @@ impl GroupMonitor {
     /// Takes `&GroupPvDef` (not `&self`) so `poll` can call it while
     /// holding the `&mut self.event_rx` borrow — `def` is a disjoint
     /// field.
-    fn value_event_mark(def: &GroupPvDef, source_idx: usize) -> EventMark {
+    ///
+    /// `event_mask` is the event's DBE mask. pvxs refreshes every
+    /// triggered target with `Value | Alarm`, EXCEPT the self-triggered
+    /// field, which uses `pDbFieldLog->mask & UpdateType::Everything`
+    /// (`groupsource.cpp:331-337`) — so an ALARM-only post on the source
+    /// re-sends its own alarm/timeStamp but not its value, and an
+    /// ARCHIVE-only post (DBE_LOG, masked out of `Everything`)
+    /// contributes no self leaves at all. An empty mask (a legacy
+    /// unmasked post carries no classification) falls back to
+    /// `Value | Alarm`, the same default pvxs uses when no field log is
+    /// available (pre-7.0.6 builds).
+    fn value_event_mark(def: &GroupPvDef, source_idx: usize, event_mask: DbeMask) -> EventMark {
         let Some(source) = def.members.get(source_idx) else {
             return EventMark::Skip;
         };
@@ -1926,10 +1948,24 @@ impl GroupMonitor {
                 _ => EventMark::Derive,
             };
         }
-        let targets: Vec<&GroupMember> = match &source.triggers {
+        let trigger_change = DbeMask::VALUE | DbeMask::ALARM;
+        let everything = DbeMask::VALUE | DbeMask::ALARM | DbeMask::PROPERTY;
+        let self_change = if event_mask.is_empty() {
+            trigger_change
+        } else {
+            event_mask & everything
+        };
+        let change_for = |idx: usize| {
+            if idx == source_idx {
+                self_change
+            } else {
+                trigger_change
+            }
+        };
+        let targets: Vec<(&GroupMember, DbeMask)> = match &source.triggers {
             TriggerDef::None => return EventMark::Skip,
             // Self-trigger inside a mixed group marks only its own field.
-            TriggerDef::SelfOnly => vec![source],
+            TriggerDef::SelfOnly => vec![(source, self_change)],
             // `"*"` marks every member field WITH A CHANNEL. pvxs drops
             // channel-less Const/Structure targets from the `*` expansion
             // (`groupconfigprocessor.cpp:387-388`: `if(!…channel.empty())`)
@@ -1939,7 +1975,9 @@ impl GroupMonitor {
             TriggerDef::All => def
                 .members
                 .iter()
-                .filter(|m| !m.channel.is_empty())
+                .enumerate()
+                .filter(|(_, m)| !m.channel.is_empty())
+                .map(|(i, m)| (m, change_for(i)))
                 .collect(),
             // Named targets: pvxs resolves only references that name an
             // existing field WITH A CHANNEL (`groupconfigprocessor.cpp:
@@ -1949,10 +1987,12 @@ impl GroupMonitor {
             TriggerDef::Fields(refs) => def
                 .members
                 .iter()
-                .filter(|m| !m.channel.is_empty() && refs.iter().any(|r| r == &m.field_name))
+                .enumerate()
+                .filter(|(_, m)| !m.channel.is_empty() && refs.iter().any(|r| r == &m.field_name))
+                .map(|(i, m)| (m, change_for(i)))
                 .collect(),
         };
-        Self::leaves_or_derive(targets, MemberEventKind::Value)
+        Self::leaves_or_derive(targets)
     }
 
     /// a *property* event marks only the source field's
@@ -1967,35 +2007,38 @@ impl GroupMonitor {
         if def.is_pure_self_trigger() {
             return EventMark::Derive;
         }
-        Self::leaves_or_derive(vec![source], MemberEventKind::Property)
+        // pvxs passes `UpdateType::Property` unconditionally for a
+        // property event (`groupsource.cpp:378`) — the event's own DBE
+        // mask is not consulted.
+        Self::leaves_or_derive(vec![(source, DbeMask::PROPERTY)])
     }
 
-    /// Expand each marked member into the wire leaves its update kind
-    /// actually assigns, mirroring pvxs `IOCSource::get`
-    /// (`iocsource.cpp:312-352`): a *value/alarm* event marks
-    /// `value` + `alarm` + `timeStamp`; a *property* event marks
-    /// `display` + `control` + `valueAlarm` (+ enum `value.choices`).
-    /// This is the leaf narrowing — previously a marked member flagged
-    /// its WHOLE subtree, so a DBE_PROPERTY event re-sent value/alarm/
-    /// timeStamp and a DBE_VALUE event re-sent the display/control limits.
+    /// Expand each `(member, change)` pair into the wire leaves its
+    /// change classes actually assign, mirroring pvxs `IOCSource::get`
+    /// (`iocsource.cpp:312-352`). This is the leaf narrowing —
+    /// previously a marked member flagged its WHOLE subtree, so a
+    /// DBE_PROPERTY event re-sent value/alarm/timeStamp and a DBE_VALUE
+    /// event re-sent the display/control limits.
     ///
     /// An empty target list → [`EventMark::Skip`]. A target whose field
     /// path is empty (a root-flattened `Meta` member that cannot be
     /// addressed by a structure path) → [`EventMark::Derive`] (full
-    /// mask) rather than under-marking. A target that contributes no leaf
-    /// for this kind (a `Const`/`Structure`/`Proc` member, or a
-    /// `Meta`/`Plain`/`Any` member on a property event) is dropped; if
-    /// every target drops, the post carries nothing → [`EventMark::Skip`].
-    fn leaves_or_derive(targets: Vec<&GroupMember>, kind: MemberEventKind) -> EventMark {
+    /// mask) rather than under-marking. A target whose change classes
+    /// contribute no leaf (a `Const`/`Structure`/`Proc` member, a
+    /// `Meta`/`Plain`/`Any` member on a property change, or a
+    /// self-trigger whose event was ARCHIVE-only) is dropped; if every
+    /// target drops, the post carries nothing → [`EventMark::Skip`]
+    /// (pvxs `subscriptionPost` `if(empty && !first) return`).
+    fn leaves_or_derive(targets: Vec<(&GroupMember, DbeMask)>) -> EventMark {
         if targets.is_empty() {
             return EventMark::Skip;
         }
-        if targets.iter().any(|m| m.field_name.is_empty()) {
+        if targets.iter().any(|(m, _)| m.field_name.is_empty()) {
             return EventMark::Derive;
         }
         let mut leaves = Vec::new();
-        for m in targets {
-            for suffix in Self::member_event_leaves(m.mapping, kind) {
+        for (m, change) in targets {
+            for suffix in Self::member_change_leaves(m.mapping, change) {
                 leaves.push(if suffix.is_empty() {
                     m.field_name.clone()
                 } else {
@@ -2009,46 +2052,71 @@ impl GroupMonitor {
         EventMark::Marked(leaves)
     }
 
-    /// The wire leaves a group member contributes for one update kind,
+    /// The wire leaves a group member contributes for one change mask,
     /// as field-path suffixes relative to the member's field name
     /// (`""` = the member node itself, for value-only mappings that carry
     /// no metadata sub-structure). Ports pvxs `IOCSource::get`'s
-    /// per-`UpdateType` assignment (`iocsource.cpp:312-352`).
-    fn member_event_leaves(
-        mapping: FieldMapping,
-        kind: MemberEventKind,
-    ) -> &'static [&'static str] {
-        match (mapping, kind) {
-            // NTScalar value/alarm event: pvxs `Value|Alarm` for a
-            // triggered field assigns the scalar `value` plus `alarm` +
-            // `timeStamp` (getTimeAlarm). `value` is the *semantic* leaf;
-            // for an NTEnum member it is the structure `{index, choices}`,
-            // and a bare `value` mark would re-send the property-only
-            // `value.choices` (the PVA selection layer expands a marked
-            // structure path to its whole subtree). [`poll`] narrows each
-            // enum `value` leaf to `value.index` against the concrete
-            // composed value — see [`narrow_enum_value_leaves`] — matching
-            // pvxs (`iocsource.cpp:107-109,331-351`).
-            (FieldMapping::Scalar, MemberEventKind::Value) => &["value", "alarm", "timeStamp"],
-            // NTScalar property event: getProperties fills `display` +
-            // `control` + `valueAlarm` limits, plus enum `value.choices`.
-            // getProperties is gated on `info.type==Scalar`, so only Scalar
-            // members carry property leaves.
-            (FieldMapping::Scalar, MemberEventKind::Property) => {
-                &["display", "control", "valueAlarm", "value.choices"]
+    /// per-`UpdateType` assignment (`iocsource.cpp:312-352`):
+    ///
+    /// * properties (`display` + `control` + `valueAlarm` limits, plus
+    ///   enum `value.choices`) iff `change & Property` — getProperties
+    ///   is gated on `info.type == Scalar`, so only Scalar members carry
+    ///   property leaves;
+    /// * `timeStamp` iff `change & (Value | Alarm)` — getTimeAlarm
+    ///   always fills the timestamp when it runs, but its `alarm`
+    ///   leaves only under `change & Alarm` (`iocsource.cpp:183-251`);
+    /// * `value` iff `change & Value`, never for `Meta`. The `value`
+    ///   leaf is *semantic*: for an NTEnum member it is the structure
+    ///   `{index, choices}`, and a bare `value` mark would re-send the
+    ///   property-only `value.choices` (the PVA selection layer expands
+    ///   a marked structure path to its whole subtree). [`poll`] narrows
+    ///   each enum `value` leaf to `value.index` against the concrete
+    ///   composed value — see [`narrow_enum_value_leaves`] — matching
+    ///   pvxs (`iocsource.cpp:107-109,331-351`).
+    fn member_change_leaves(mapping: FieldMapping, change: DbeMask) -> Vec<&'static str> {
+        let mut leaves = Vec::new();
+        match mapping {
+            FieldMapping::Scalar => {
+                if change.intersects(DbeMask::PROPERTY) {
+                    leaves.extend_from_slice(&[
+                        "display",
+                        "control",
+                        "valueAlarm",
+                        "value.choices",
+                    ]);
+                }
+                if change.intersects(DbeMask::VALUE | DbeMask::ALARM) {
+                    leaves.push("timeStamp");
+                    if change.intersects(DbeMask::ALARM) {
+                        leaves.push("alarm");
+                    }
+                }
+                if change.intersects(DbeMask::VALUE) {
+                    leaves.push("value");
+                }
             }
-            // `+type:meta`: `alarm` + `timeStamp` only, and only on a
-            // value/alarm event — pvxs has no value leaf for Meta and skips
-            // getProperties for it.
-            (FieldMapping::Meta, MemberEventKind::Value) => &["alarm", "timeStamp"],
+            // `+type:meta`: `alarm` + `timeStamp` only — pvxs has no
+            // value leaf for Meta and skips getProperties for it.
+            FieldMapping::Meta => {
+                if change.intersects(DbeMask::VALUE | DbeMask::ALARM) {
+                    leaves.push("timeStamp");
+                    if change.intersects(DbeMask::ALARM) {
+                        leaves.push("alarm");
+                    }
+                }
+            }
             // Value-only mappings: the member node IS the value (pvxs
             // `value = node`), marked whole; no metadata sub-tree exists,
             // so there is nothing to over-mark.
-            (FieldMapping::Plain | FieldMapping::Any, MemberEventKind::Value) => &[""],
-            // Const/Structure/Proc carry no runtime event leaf; Meta/Plain
-            // /Any contribute nothing on a property event.
-            _ => &[],
+            FieldMapping::Plain | FieldMapping::Any => {
+                if change.intersects(DbeMask::VALUE) {
+                    leaves.push("");
+                }
+            }
+            // Const/Structure/Proc carry no runtime event leaf.
+            _ => {}
         }
+        leaves
     }
 
     /// Resolve value-shape-dependent leaves in a value/alarm event's
@@ -2183,11 +2251,15 @@ impl super::provider::PvaMonitor for GroupMonitor {
                 self.activation_handles.push(sub.activation_handle());
                 let tx = tx.clone();
                 let handle = tokio::spawn(async move {
-                    while sub.recv_snapshot().await.is_some() {
+                    // `recv_event` (not `recv_snapshot`) so the per-event
+                    // DBE mask reaches the mark resolution — pvxs reads
+                    // `pDbFieldLog->mask` for the self-trigger narrowing.
+                    while let Some(event) = sub.recv_event().await {
                         if tx
                             .send(MemberEvent {
                                 member_index: idx,
                                 kind: MemberEventKind::Value,
+                                mask: event.mask,
                             })
                             .await
                             .is_err()
@@ -2215,11 +2287,12 @@ impl super::provider::PvaMonitor for GroupMonitor {
                     self.activation_handles.push(sub.activation_handle());
                     let tx = tx.clone();
                     let handle = tokio::spawn(async move {
-                        while sub.recv_snapshot().await.is_some() {
+                        while let Some(event) = sub.recv_event().await {
                             if tx
                                 .send(MemberEvent {
                                     member_index: idx,
                                     kind: MemberEventKind::Property,
+                                    mask: event.mask,
                                 })
                                 .await
                                 .is_err()
@@ -2297,7 +2370,9 @@ impl super::provider::PvaMonitor for GroupMonitor {
             // the marked set is what the PVA layer turns into the wire
             // changed-bitset.
             let mark = match event.kind {
-                MemberEventKind::Value => Self::value_event_mark(&self.def, event.member_index),
+                MemberEventKind::Value => {
+                    Self::value_event_mark(&self.def, event.member_index, event.mask)
+                }
                 MemberEventKind::Property => {
                     Self::property_event_mark(&self.def, event.member_index)
                 }
@@ -2659,7 +2734,7 @@ mod tests {
             "meta": { "+type": "structure", "+id": "x/v1" }
         } }"#;
         let def = parse_group_config(star).unwrap().pop().unwrap();
-        match GroupMonitor::value_event_mark(&def, src_idx(&def)) {
+        match GroupMonitor::value_event_mark(&def, src_idx(&def), DbeMask::VALUE | DbeMask::ALARM) {
             EventMark::Marked(paths) => {
                 assert!(
                     paths.iter().any(|p| p == "chan" || p.starts_with("chan.")),
@@ -2681,7 +2756,7 @@ mod tests {
             "meta": { "+type": "structure", "+id": "x/v1" }
         } }"#;
         let def = parse_group_config(named).unwrap().pop().unwrap();
-        match GroupMonitor::value_event_mark(&def, src_idx(&def)) {
+        match GroupMonitor::value_event_mark(&def, src_idx(&def), DbeMask::VALUE | DbeMask::ALARM) {
             EventMark::Marked(paths) => {
                 assert!(
                     paths.iter().any(|p| p == "chan" || p.starts_with("chan.")),
@@ -2722,7 +2797,9 @@ mod tests {
 
         // Value event: value/alarm/timeStamp of every channeled member,
         // never the property-metadata leaves.
-        let EventMark::Marked(v) = GroupMonitor::value_event_mark(&def, src) else {
+        let EventMark::Marked(v) =
+            GroupMonitor::value_event_mark(&def, src, DbeMask::VALUE | DbeMask::ALARM)
+        else {
             panic!("expected Marked from a `*` value event");
         };
         for member in ["a", "b"] {
@@ -2782,7 +2859,9 @@ mod tests {
             .position(|m| m.field_name == "m")
             .unwrap();
 
-        let EventMark::Marked(v) = GroupMonitor::value_event_mark(&def, src) else {
+        let EventMark::Marked(v) =
+            GroupMonitor::value_event_mark(&def, src, DbeMask::VALUE | DbeMask::ALARM)
+        else {
             panic!("expected Marked");
         };
         // meta member: alarm + timeStamp, no value leaf.
@@ -2810,6 +2889,131 @@ mod tests {
             ),
             "meta member carries no property-metadata leaves"
         );
+    }
+
+    /// the SELF-triggered member's leaves narrow to the
+    /// event's own DBE classes, while every other triggered member keeps
+    /// the fixed `Value | Alarm` refresh — pvxs `subscriptionValueCallback`
+    /// uses `pDbFieldLog->mask & UpdateType::Everything` only for
+    /// `isSelfTrig` (`groupsource.cpp:331-337`), then `IOCSource::get`
+    /// assigns `value` iff `change & Value` and the alarm leaves iff
+    /// `change & Alarm` (`iocsource.cpp:327-351`, `:183-251`).
+    #[test]
+    fn self_trigger_leaves_narrow_to_event_dbe_mask() {
+        use crate::qsrv::group_config::parse_group_config;
+
+        let json = r#"{ "GRP": {
+            "a": { "+channel": "R:a", "+trigger": "*" },
+            "b": { "+channel": "R:b" }
+        } }"#;
+        let def = parse_group_config(json).unwrap().pop().unwrap();
+        let src = def
+            .members
+            .iter()
+            .position(|m| m.field_name == "a")
+            .unwrap();
+
+        // ALARM-only event: self re-sends alarm + timeStamp but NOT its
+        // value; the triggered member keeps the full Value|Alarm refresh.
+        let EventMark::Marked(v) = GroupMonitor::value_event_mark(&def, src, DbeMask::ALARM) else {
+            panic!("expected Marked from an ALARM-only event");
+        };
+        assert!(v.contains(&"a.alarm".to_string()), "{v:?}");
+        assert!(v.contains(&"a.timeStamp".to_string()), "{v:?}");
+        assert!(
+            !v.contains(&"a.value".to_string()),
+            "ALARM-only event must not mark the self value: {v:?}"
+        );
+        assert!(v.contains(&"b.value".to_string()), "{v:?}");
+        assert!(v.contains(&"b.alarm".to_string()), "{v:?}");
+
+        // VALUE-only event: self marks value + timeStamp but NOT alarm.
+        let EventMark::Marked(v) = GroupMonitor::value_event_mark(&def, src, DbeMask::VALUE) else {
+            panic!("expected Marked from a VALUE-only event");
+        };
+        assert!(v.contains(&"a.value".to_string()), "{v:?}");
+        assert!(v.contains(&"a.timeStamp".to_string()), "{v:?}");
+        assert!(
+            !v.contains(&"a.alarm".to_string()),
+            "VALUE-only event must not mark the self alarm: {v:?}"
+        );
+    }
+
+    /// an ARCHIVE-only (DBE_LOG) event contributes no
+    /// self leaves — pvxs masks the field-log mask with
+    /// `UpdateType::Everything` = `DBE_VALUE | DBE_ALARM | DBE_PROPERTY`
+    /// (`iocsource.h:36-41`), which has no Archive bit. A `SelfOnly`
+    /// trigger therefore marks nothing and the post is suppressed
+    /// entirely (pvxs `subscriptionPost` `if(empty && !first) return`,
+    /// `groupsource.cpp:268-275`); with other triggered targets the
+    /// group still posts, carrying only those targets' leaves.
+    #[test]
+    fn archive_only_event_contributes_no_self_leaves() {
+        use crate::qsrv::group_config::parse_group_config;
+
+        // SelfOnly trigger in a mixed group: LOG-only → Skip.
+        let json = r#"{ "GRP": {
+            "a": { "+channel": "R:a", "+trigger": "a" },
+            "b": { "+channel": "R:b", "+trigger": "*" }
+        } }"#;
+        let def = parse_group_config(json).unwrap().pop().unwrap();
+        let src = def
+            .members
+            .iter()
+            .position(|m| m.field_name == "a")
+            .unwrap();
+        assert!(
+            matches!(
+                GroupMonitor::value_event_mark(&def, src, DbeMask::LOG),
+                EventMark::Skip
+            ),
+            "an ARCHIVE-only self-trigger event must be suppressed"
+        );
+
+        // `*` trigger: the LOG-only source contributes nothing, the
+        // other triggered member still refreshes with Value|Alarm.
+        let src_b = def
+            .members
+            .iter()
+            .position(|m| m.field_name == "b")
+            .unwrap();
+        let EventMark::Marked(v) = GroupMonitor::value_event_mark(&def, src_b, DbeMask::LOG) else {
+            panic!("expected Marked: the non-self target still refreshes");
+        };
+        assert!(
+            !v.iter().any(|p| p.starts_with("b.")),
+            "the ARCHIVE-only source must contribute no self leaves: {v:?}"
+        );
+        assert!(v.contains(&"a.value".to_string()), "{v:?}");
+        assert!(v.contains(&"a.alarm".to_string()), "{v:?}");
+        assert!(v.contains(&"a.timeStamp".to_string()), "{v:?}");
+    }
+
+    /// a legacy unmasked post (empty DBE mask) carries no
+    /// classification — the self-trigger falls back to the fixed
+    /// `Value | Alarm` refresh, the same default pvxs uses when no
+    /// `db_field_log` is available (`groupsource.cpp:331-337`,
+    /// pre-7.0.6 builds).
+    #[test]
+    fn empty_event_mask_falls_back_to_value_alarm() {
+        use crate::qsrv::group_config::parse_group_config;
+
+        let json = r#"{ "GRP": {
+            "a": { "+channel": "R:a", "+trigger": "a" },
+            "b": { "+channel": "R:b", "+trigger": "*" }
+        } }"#;
+        let def = parse_group_config(json).unwrap().pop().unwrap();
+        let src = def
+            .members
+            .iter()
+            .position(|m| m.field_name == "a")
+            .unwrap();
+        let EventMark::Marked(v) = GroupMonitor::value_event_mark(&def, src, DbeMask::NONE) else {
+            panic!("expected Marked from an unmasked event");
+        };
+        assert!(v.contains(&"a.value".to_string()), "{v:?}");
+        assert!(v.contains(&"a.alarm".to_string()), "{v:?}");
+        assert!(v.contains(&"a.timeStamp".to_string()), "{v:?}");
     }
 
     /// A value/alarm event on an

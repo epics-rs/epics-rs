@@ -81,9 +81,20 @@ impl MotorRecord {
             CommandSource::Spmg
             | CommandSource::Stop
             | CommandSource::Sync
-            | CommandSource::Set
             | CommandSource::Cnen
             | CommandSource::PcoEnable => {}
+            CommandSource::Set => {
+                // C 2237: stop_or_pause returns before the move block —
+                // a pending SET redefinition keeps its dval != ldvl
+                // signal and load_pos dispatches on the Go/Move pass.
+                // No tweak collection or RDBL-error rollback here: C's
+                // set branch (2257) precedes the readback-validity
+                // check, and an RDBL error must not roll back a
+                // redefinition.
+                if !self.can_accept_command() {
+                    return effects;
+                }
+            }
             _ => {
                 if !self.can_accept_command() {
                     // C home section under stop_or_pause (2015-2020): a
@@ -114,7 +125,7 @@ impl MotorRecord {
                             | CommandSource::Twf
                             | CommandSource::Twr
                     ) {
-                        self.collect_tweak(&mut effects);
+                        self.collect_tweak();
                     }
                     return effects;
                 }
@@ -186,7 +197,7 @@ impl MotorRecord {
                 | CommandSource::Rlv
                 | CommandSource::Twf
                 | CommandSource::Twr
-        ) && self.collect_tweak(&mut effects);
+        ) && self.collect_tweak();
 
         match src {
             CommandSource::Val | CommandSource::Dval | CommandSource::Rval | CommandSource::Rlv => {
@@ -197,20 +208,46 @@ impl MotorRecord {
                 // that dispatched directly bypassed the NTM stop-first
                 // path and the retarget invariants.
                 if src == CommandSource::Rlv {
-                    self.pos.val += self.pos.rlv;
-                    self.pos.rlv = 0.0;
-                    if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
-                        self.pos.val,
-                        self.conv.dir,
-                        self.pos.off,
-                        self.conv.foff,
-                        self.conv.mres,
-                        false,
-                        self.pos.dval,
-                    ) {
-                        self.pos.dval = dval;
-                        self.pos.rval = rval;
-                        self.pos.off = off;
+                    // The folded VAL change takes the same SET collection
+                    // branch as a direct VAL write (C 2204-2235):
+                    // Variable redefines the offset on the spot, Frozen
+                    // propagates to DVAL and the move block's set test
+                    // routes the dispatch to load_pos.
+                    if self.conv.set && !self.conv.igset {
+                        // #231: LOAD_POS blocked — refuse the
+                        // redefinition; consume the latched RLV.
+                        if self.conv.loadpos_blocked {
+                            self.pos.rlv = 0.0;
+                            return effects;
+                        }
+                        self.pos.val += self.pos.rlv;
+                        self.pos.rlv = 0.0;
+                        if self.conv.foff == FreezeOffset::Variable {
+                            self.set_mode_redefine_val(self.pos.val);
+                            return effects;
+                        }
+                        let dval =
+                            coordinate::user_to_dial(self.pos.val, self.conv.dir, self.pos.off);
+                        if let Ok(rval) = coordinate::dial_to_raw(dval, self.conv.mres) {
+                            self.pos.dval = dval;
+                            self.pos.rval = rval;
+                        }
+                    } else {
+                        self.pos.val += self.pos.rlv;
+                        self.pos.rlv = 0.0;
+                        if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
+                            self.pos.val,
+                            self.conv.dir,
+                            self.pos.off,
+                            self.conv.foff,
+                            self.conv.mres,
+                            false,
+                            self.pos.dval,
+                        ) {
+                            self.pos.dval = dval;
+                            self.pos.rval = rval;
+                            self.pos.off = off;
+                        }
                     }
                 }
                 // Check for retarget if motion is in progress
@@ -346,18 +383,10 @@ impl MotorRecord {
                 self.apply_latent_sync();
             }
             CommandSource::Set => {
-                // C move-block entry (2248-2255): DIFF/RDIF recompute
-                // precedes the set test (2257-2263), which routes to
-                // load_pos unless one is already in flight.
-                self.pos.diff = self.pos.dval - self.pos.drbv;
-                self.pos.rdif = if self.conv.mres != 0.0 {
-                    (self.pos.diff / self.conv.mres).round() as i64
-                } else {
-                    0
-                };
-                if !self.stat.mip.contains(MipFlags::LOAD_P) {
-                    self.load_pos(&mut effects);
-                }
+                // C: the SET-mode redefinition dispatches through the
+                // move block (2240-2263) — plan_absolute_move recomputes
+                // DIFF/RDIF and its set test routes to load_pos.
+                self.plan_absolute_move(&mut effects);
             }
             CommandSource::Cnen => {
                 // C: case motorRecordCNEN — only drives ENABLE/DISABL_TORQUE
@@ -400,6 +429,17 @@ impl MotorRecord {
         } else {
             0
         };
+        // C set test (2257-2263): in SET mode every move-block dispatch
+        // is a position redefinition routed to load_pos, never a motion
+        // — including deferred passes (Go/Move resume, retry, queued
+        // replay). Sits right after the DIFF/RDIF recompute and before
+        // too_small/LVIO, as in C.
+        if self.conv.set && !self.conv.igset {
+            if !self.stat.mip.contains(MipFlags::LOAD_P) {
+                self.load_pos(effects);
+            }
+            return;
+        }
         // C too_small (2308-2348): a RETRY dispatch is too small when the
         // remaining error is under RDBD in steps (2329-2330); a plain
         // dispatch when under one motor step or inside the open SPDB
@@ -1033,7 +1073,7 @@ impl MotorRecord {
     /// when a non-SET fold landed in DVAL — a move toward it is now
     /// pending and the caller's pass dispatches (or, under SPMG
     /// Stop/Pause, SPMG=Go later fires it via `dval != ldvl`).
-    fn collect_tweak(&mut self, effects: &mut ProcessEffects) -> bool {
+    fn collect_tweak(&mut self) -> bool {
         if !self.ctrl.twf && !self.ctrl.twr {
             return false;
         }
@@ -1070,39 +1110,19 @@ impl MotorRecord {
                 // C 2206-2227 via the tweak fold: offset-only
                 // redefinition — DVAL untouched, no controller command,
                 // complete on the spot (mip = MIP_DONE, dmov = TRUE).
-                if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
-                    self.pos.val,
-                    self.conv.dir,
-                    self.pos.off,
-                    self.conv.foff,
-                    self.conv.mres,
-                    true,
-                    self.pos.dval,
-                ) {
-                    self.pos.dval = dval;
-                    self.pos.rval = rval;
-                    self.pos.off = off;
-                    self.set_userlimits();
-                    self.pos.rbv =
-                        coordinate::dial_to_user(self.pos.drbv, self.conv.dir, self.pos.off);
-                    self.internal.lval = self.pos.val;
-                    self.stat.mip = MipFlags::empty();
-                    self.stat.dmov = true;
-                    self.set_phase(MotionPhase::Idle);
-                }
-            } else {
-                // C Frozen: the fold propagates VAL -> DVAL (2233) and
-                // the move block routes it to load_pos (2257-2263).
-                let dval = coordinate::user_to_dial(self.pos.val, self.conv.dir, self.pos.off);
-                if let Ok(rval) = coordinate::dial_to_raw(dval, self.conv.mres) {
-                    self.pos.dval = dval;
-                    self.pos.rval = rval;
-                }
-                if !self.stat.mip.contains(MipFlags::LOAD_P) {
-                    self.load_pos(effects);
-                }
+                self.set_mode_redefine_val(self.pos.val);
+                return false;
             }
-            return false;
+            // C Frozen: the fold propagates VAL -> DVAL (2233); the
+            // dispatch is the move block's, whose set test routes it to
+            // load_pos (2257-2263) — so a fold collected under
+            // stop_or_pause (2237) defers like any position write.
+            let dval = coordinate::user_to_dial(self.pos.val, self.conv.dir, self.pos.off);
+            if let Ok(rval) = coordinate::dial_to_raw(dval, self.conv.mres) {
+                self.pos.dval = dval;
+                self.pos.rval = rval;
+            }
+            return true;
         }
 
         // Normal (non-SET) tweak: cascade VAL->DVAL; the caller moves.
@@ -1447,6 +1467,36 @@ impl MotorRecord {
         );
         self.limits.hlm = hlm;
         self.limits.llm = llm;
+    }
+
+    /// C SET + FOFF=Variable VAL collection (motorRecord.cc:2206-2227):
+    /// redefine VAL to `new_val` by adjusting the offset (DVAL
+    /// untouched), retranslate the user limits and RBV, sync LVAL, and
+    /// complete on the spot — mip = MIP_DONE, dmov = TRUE, no
+    /// controller command (LOAD_POS belongs to the Frozen/DVAL/RVAL
+    /// redefinition paths). Single owner for the direct-VAL,
+    /// tweak-fold, and RLV-fold entry points.
+    pub(crate) fn set_mode_redefine_val(&mut self, new_val: f64) {
+        if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
+            new_val,
+            self.conv.dir,
+            self.pos.off,
+            self.conv.foff,
+            self.conv.mres,
+            true,
+            self.pos.dval,
+        ) {
+            self.pos.val = new_val;
+            self.pos.dval = dval;
+            self.pos.rval = rval;
+            self.pos.off = off;
+            self.set_userlimits();
+            self.pos.rbv = coordinate::dial_to_user(self.pos.drbv, self.conv.dir, self.pos.off);
+            self.internal.lval = self.pos.val;
+            self.stat.mip = MipFlags::empty();
+            self.stat.dmov = true;
+            self.set_phase(MotionPhase::Idle);
+        }
     }
 
     /// C: use_rel = rtry != 0 && rmod != InPosition && (ueip || urip)

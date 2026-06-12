@@ -384,6 +384,111 @@ fn test_set_mode_tweak_redefinition_retranslates_user_limits() {
 }
 
 #[test]
+fn test_set_dval_under_pause_defers_load_pos_to_go() {
+    // C 2237: stop_or_pause returns before the move block, so a
+    // SET-mode DVAL written under Pause keeps its dval != ldvl signal
+    // and the Go pass's set test (2257-2263) dispatches the load_pos.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.pos.val = 5.0;
+    rec.pos.dval = 5.0;
+    rec.pos.drbv = 5.0;
+    rec.internal.ldvl = 5.0;
+    rec.internal.lval = 5.0;
+    rec.put_field("SET", EpicsValue::Short(1)).unwrap();
+
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.plan_motion(CommandSource::Spmg);
+
+    rec.put_field("DVAL", EpicsValue::Double(0.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Set);
+    assert!(
+        effects.commands.is_empty(),
+        "C 2237: no LOAD_POS while paused"
+    );
+    assert!(
+        !rec.stat.mip.contains(MipFlags::LOAD_P),
+        "the redefinition stays pending, not in flight"
+    );
+
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::SetPosition { position } if *position == 0.0)),
+        "Go dispatches the deferred load_pos"
+    );
+    assert_eq!(rec.stat.mip, MipFlags::LOAD_P);
+    assert!(!rec.stat.dmov, "DMOV pulses low during the load");
+    assert!(effects.request_poll, "C: LOAD_POS is followed by GET_INFO");
+}
+
+#[test]
+fn test_set_frozen_tweak_under_pause_defers_load_pos_to_go() {
+    // The tweak fold is collected under stop_or_pause (C 2167-2181
+    // precede the 2237 return) and propagates VAL -> DVAL, but the
+    // load_pos dispatch belongs to the move block — it must wait for
+    // the Go pass, not fire from the fold.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.conv.foff = FreezeOffset::Frozen;
+    rec.internal.ldvl = 0.0;
+    rec.put_field("SET", EpicsValue::Short(1)).unwrap();
+    rec.ctrl.twv = 2.0;
+
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.plan_motion(CommandSource::Spmg);
+
+    rec.ctrl.twf = true;
+    let effects = rec.plan_motion(CommandSource::Twf);
+    assert!(
+        effects.commands.is_empty(),
+        "paused fold collects, never dispatches"
+    );
+    assert_eq!(rec.pos.dval, 2.0, "fold propagated VAL -> DVAL");
+    assert!(!rec.stat.mip.contains(MipFlags::LOAD_P));
+
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::SetPosition { position } if *position == 2.0)),
+        "Go dispatches the deferred load_pos at the folded target"
+    );
+    assert_eq!(rec.stat.mip, MipFlags::LOAD_P);
+}
+
+#[test]
+fn test_rlv_in_set_mode_redefines_offset_without_motion() {
+    // C 2187-2193 fold + 2204-2227 collection: an RLV written in SET
+    // mode (FOFF=Variable) redefines the offset like a direct VAL
+    // write — DVAL untouched, no command, completes on the spot.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.pos.val = 5.0;
+    rec.pos.dval = 5.0;
+    rec.pos.drbv = 5.0;
+    rec.put_field("SET", EpicsValue::Short(1)).unwrap();
+
+    rec.put_field("RLV", EpicsValue::Double(2.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Rlv);
+    assert!(effects.commands.is_empty(), "no motion, no LOAD_POS");
+    assert_eq!(rec.pos.val, 7.0, "RLV folded into VAL");
+    assert_eq!(rec.pos.rlv, 0.0, "RLV consumed by the fold");
+    assert_eq!(rec.pos.dval, 5.0, "DVAL untouched");
+    assert_eq!(rec.pos.off, 2.0, "offset adopts the redefinition");
+    assert!(rec.stat.dmov);
+    assert!(rec.stat.mip.is_empty());
+}
+
+#[test]
 fn test_blocked_homf_stays_latched_and_zero_write_unlatches() {
     // C home gate (2013-2014): a HOMF blocked by its limit switch
     // simply fails the gate — the button stays latched (no clear, no

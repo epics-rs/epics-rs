@@ -791,36 +791,10 @@ pub(crate) fn motor_put_field(
                 }
                 if rec.conv.foff == FreezeOffset::Variable {
                     // C 2206-2227: redefine VAL without moving the motor
-                    // and without touching DVAL — adjust the offset,
-                    // retranslate RBV and the user limits, and complete
-                    // on the spot (mip = MIP_DONE, dmov = TRUE, lval
-                    // synced). NO controller command is sent; LOAD_POS
-                    // belongs to the Frozen/DVAL/RVAL paths.
-                    if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
-                        v,
-                        rec.conv.dir,
-                        rec.pos.off,
-                        rec.conv.foff,
-                        rec.conv.mres,
-                        true,
-                        rec.pos.dval,
-                    ) {
-                        rec.pos.val = v;
-                        rec.pos.dval = dval;
-                        rec.pos.rval = rval;
-                        rec.pos.off = off;
-                        // C 2220: the offset redefinition retranslates the
-                        // user limits.
-                        rec.set_userlimits();
-                        rec.pos.rbv =
-                            coordinate::dial_to_user(rec.pos.drbv, rec.conv.dir, rec.pos.off);
-                        rec.internal.lval = rec.pos.val;
-                        rec.stat.mip = MipFlags::empty();
-                        rec.stat.dmov = true;
-                        rec.set_phase(MotionPhase::Idle);
-                    }
-                    // No last_write: C returns from the collection block
-                    // (2227) — there is nothing to dispatch.
+                    // and without touching DVAL — offset-only, completes
+                    // on the spot. No last_write: C returns from the
+                    // collection block (2227), nothing to dispatch.
+                    rec.set_mode_redefine_val(v);
                 } else {
                     // SET+FOFF=Frozen: cascade VAL->DVAL normally, then SetPosition
                     // C: dval = (val - off) / dir, then load_pos(dval/mres)

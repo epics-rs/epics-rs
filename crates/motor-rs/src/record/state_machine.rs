@@ -332,15 +332,19 @@ impl MotorRecord {
                 // truncate the delay on the first poll tick.
             }
             MotionPhase::Idle => {
-                // C process (1404-1409): the GET_INFO callback after a
-                // LOAD_POS completes the load — MIP_LOAD_P collapses to
-                // MIP_DONE and DMOV returns TRUE, with no DLY and no
-                // retry evaluation.
+                // C process (1404-1409, postProcess 851-852): the
+                // GET_INFO callback after a LOAD_POS collapses MIP_LOAD_P
+                // to MIP_DONE and DMOV returns TRUE — nothing else. No
+                // DLY, no retry evaluation, and no drive-triplet resync
+                // (load_pos synced ldvl/lval/lrvl at dispatch); a second
+                // redefinition written during the load keeps its
+                // dval != ldvl signal for the next move-block pass.
                 if self.stat.mip.contains(MipFlags::LOAD_P)
                     && self.stat.msta.contains(MstaFlags::DONE)
                     && !self.stat.movn
                 {
-                    self.finalize_motion(&mut effects);
+                    self.stat.mip = MipFlags::empty();
+                    self.stat.dmov = true;
                     return effects;
                 }
                 // C: ea063f5f — if the record marked an externally initiated

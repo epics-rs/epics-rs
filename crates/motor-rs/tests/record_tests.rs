@@ -2630,9 +2630,14 @@ fn test_rdbd_forced_to_at_least_abs_mres() {
 
 #[test]
 fn test_mres_change_enforces_min_retry_deadband() {
-    // C: special() calls enforceMinRetryDeadband on MRES change.
+    // A runtime MRES change restores RDBD >= |MRES| (C does it at the
+    // next do_work pass, 1971; the Rust cascade enforces immediately).
+    // Runtime semantics — during load the put lands raw and init owns
+    // the reconcile.
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.001;
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
     rec.retry.rdbd = 0.0005; // below |mres| after the change below
     rec.put_field("MRES", EpicsValue::Double(0.002)).unwrap();
     assert!(rec.retry.rdbd >= 0.002, "RDBD must be raised to |MRES|");
@@ -4781,6 +4786,128 @@ fn test_runtime_mres_change_rederives_velo_from_s() {
     );
     assert!((rec.vel.s - 250.0).abs() < 1e-9, "S={}", rec.vel.s);
     assert!((rec.vel.velo - 100.0).abs() < 1e-9, "VELO={}", rec.vel.velo);
+}
+
+// --- Resolution triple at init (C check_speed_and_resolution, motorRecord.cc:3904-3927) ---
+
+#[test]
+fn test_resolution_triple_default_init() {
+    // Nothing configured: C forces MRES = 1.0 (3917-3921) and makes UREV
+    // agree, UREV = MRES × SREV = 200 (3922-3927).
+    let mut rec = MotorRecord::new();
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+
+    assert_eq!(rec.conv.srev, 200);
+    assert!(
+        (rec.conv.mres - 1.0).abs() < 1e-12,
+        "MRES={}",
+        rec.conv.mres
+    );
+    assert!(
+        (rec.conv.urev - 200.0).abs() < 1e-9,
+        "UREV={}",
+        rec.conv.urev
+    );
+}
+
+#[test]
+fn test_resolution_init_urev_wins_over_loaded_mres() {
+    // C 3911-3916: a nonzero loaded UREV derives MRES — regardless of the
+    // order the .db listed the two fields (raw struct writes at load).
+    for mres_first in [true, false] {
+        let mut rec = MotorRecord::new();
+        if mres_first {
+            rec.put_field("MRES", EpicsValue::Double(0.1)).unwrap();
+            rec.put_field("UREV", EpicsValue::Double(36.0)).unwrap();
+        } else {
+            rec.put_field("UREV", EpicsValue::Double(36.0)).unwrap();
+            rec.put_field("MRES", EpicsValue::Double(0.1)).unwrap();
+        }
+        rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
+
+        assert!(
+            (rec.conv.mres - 0.18).abs() < 1e-12,
+            "mres_first={mres_first} MRES={}",
+            rec.conv.mres
+        );
+        assert!(
+            (rec.conv.urev - 36.0).abs() < 1e-12,
+            "mres_first={mres_first} UREV={}",
+            rec.conv.urev
+        );
+    }
+}
+
+#[test]
+fn test_resolution_init_loaded_mres_and_srev_any_order() {
+    // No UREV in the .db: the loaded MRES survives at the loaded SREV and
+    // UREV is derived (C 3922-3927). Regression: the load-time SREV put
+    // used to re-derive MRES from the mid-load UREV, so field(MRES)
+    // followed by field(SREV,400) came up with MRES = 0.5×200/400 = 0.25.
+    for mres_first in [true, false] {
+        let mut rec = MotorRecord::new();
+        if mres_first {
+            rec.put_field("MRES", EpicsValue::Double(0.5)).unwrap();
+            rec.put_field("SREV", EpicsValue::Long(400)).unwrap();
+        } else {
+            rec.put_field("SREV", EpicsValue::Long(400)).unwrap();
+            rec.put_field("MRES", EpicsValue::Double(0.5)).unwrap();
+        }
+        rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
+
+        assert_eq!(rec.conv.srev, 400);
+        assert!(
+            (rec.conv.mres - 0.5).abs() < 1e-12,
+            "mres_first={mres_first} MRES={}",
+            rec.conv.mres
+        );
+        assert!(
+            (rec.conv.urev - 200.0).abs() < 1e-9,
+            "mres_first={mres_first} UREV={}",
+            rec.conv.urev
+        );
+    }
+}
+
+#[test]
+fn test_resolution_init_nonpositive_srev_clamped() {
+    // C 3904-3909: a loaded SREV <= 0 lands raw and init clamps it to 200.
+    let mut rec = MotorRecord::new();
+    rec.put_field("SREV", EpicsValue::Long(-5)).unwrap();
+    rec.put_field("MRES", EpicsValue::Double(0.5)).unwrap();
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+
+    assert_eq!(rec.conv.srev, 200);
+    assert!(
+        (rec.conv.mres - 0.5).abs() < 1e-12,
+        "MRES={}",
+        rec.conv.mres
+    );
+}
+
+#[test]
+fn test_resolution_init_zero_mres_forced_to_one() {
+    // C 3917-3921: an explicitly loaded MRES of 0 lands raw and init
+    // forces 1.0.
+    let mut rec = MotorRecord::new();
+    rec.put_field("MRES", EpicsValue::Double(0.0)).unwrap();
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+
+    assert!(
+        (rec.conv.mres - 1.0).abs() < 1e-12,
+        "MRES={}",
+        rec.conv.mres
+    );
+    assert!(
+        (rec.conv.urev - 200.0).abs() < 1e-9,
+        "UREV={}",
+        rec.conv.urev
+    );
 }
 
 // --- RSTM (C: 2906f3d8, PR #160) ---

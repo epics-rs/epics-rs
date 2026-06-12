@@ -1123,18 +1123,29 @@ pub(crate) fn motor_put_field(
         },
         "MRES" => match value {
             EpicsValue::Double(v) => {
+                if !rec.internal.init_invariants_synced {
+                    // dbLoadRecords lands field() raw (C writes the struct
+                    // directly — special() never runs at load);
+                    // `motor_sync_resolution_at_init` reconciles the
+                    // SREV/UREV/MRES triple once loading completes
+                    // (C check_speed_and_resolution, 3904-3927).
+                    rec.conv.mres = v;
+                    return Ok(());
+                }
+                // Rust guard, not C: special MRES (2834-2843) accepts a
+                // zero put and lets the record degenerate; the Rust
+                // division sites (raw conversions, RDBD-in-steps) require
+                // a nonzero resolution, so a zero put is dropped.
                 if v == 0.0 {
-                    return Ok(()); // C: reject zero MRES
+                    return Ok(());
                 }
                 rec.conv.mres = v;
-                // C: cascade UREV from MRES
+                // C special MRES (2837-2842): make UREV agree.
                 rec.conv.urev = v * rec.conv.srev as f64;
                 apply_mres_cascade(rec);
-                // C special MRES (2834): MARK(M_MRES) unconditionally —
+                // C special MRES (2835): MARK(M_MRES) unconditionally —
                 // the pp(TRUE) process pass re-anchors (do_work 1936).
-                if rec.internal.init_invariants_synced {
-                    rec.internal.res_reanchor = true;
-                }
+                rec.internal.res_reanchor = true;
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1153,20 +1164,25 @@ pub(crate) fn motor_put_field(
         },
         "SREV" => match value {
             EpicsValue::Long(v) => {
+                if !rec.internal.init_invariants_synced {
+                    // Raw store during load (even non-positive — C raw-writes
+                    // it and the init reconcile clamps, 3904-3909).
+                    rec.conv.srev = v;
+                    return Ok(());
+                }
                 if v <= 0 {
-                    return Ok(()); // C: reject non-positive SREV
+                    return Ok(());
                 }
                 let old_mres = rec.conv.mres;
                 rec.conv.srev = v;
-                // C: recalculate MRES from UREV/SREV
+                // C special SREV (2919-2923): make MRES agree.
                 if rec.conv.urev != 0.0 {
                     rec.conv.mres = rec.conv.urev / v as f64;
                 }
-                // Cascade velocity and limits like MRES handler
                 apply_mres_cascade(rec);
                 // C special SREV (2919-2922): MARK(M_MRES) only when
                 // MRES actually changed.
-                if rec.internal.init_invariants_synced && rec.conv.mres != old_mres {
+                if rec.conv.mres != old_mres {
                     rec.internal.res_reanchor = true;
                 }
                 Ok(())
@@ -1175,17 +1191,20 @@ pub(crate) fn motor_put_field(
         },
         "UREV" => match value {
             EpicsValue::Double(v) => {
+                if !rec.internal.init_invariants_synced {
+                    rec.conv.urev = v;
+                    return Ok(());
+                }
                 let old_mres = rec.conv.mres;
                 rec.conv.urev = v;
-                // C: recalculate MRES from UREV/SREV
+                // C special UREV (2849-2853): make MRES agree.
                 if rec.conv.srev > 0 {
                     rec.conv.mres = v / rec.conv.srev as f64;
                 }
-                // C: cascade velocities and limits from new UREV
                 apply_mres_cascade(rec);
                 // C special UREV (2848-2853): MARK(M_MRES) only when
                 // MRES actually changed.
-                if rec.internal.init_invariants_synced && rec.conv.mres != old_mres {
+                if rec.conv.mres != old_mres {
                     rec.internal.res_reanchor = true;
                 }
                 Ok(())
@@ -2101,50 +2120,43 @@ fn apply_accu_cascade(rec: &mut MotorRecord) {
 /// invariant across MRES changes. Dial and user limits are recomputed.
 /// `fd808eb2` (PR #206) — when MRES < 0, the high/low pair must be ordered
 /// so DHLM >= DLLM.
+/// C velcheckB (motorRecord.cc:2855-2909) — the runtime tail of a
+/// resolution change. Callers (the MRES/UREV/SREV runtime put branches)
+/// own the load gate: during `dbLoadRecords` the resolution handlers
+/// store raw and never reach here; `motor_sync_resolution_at_init` /
+/// `motor_sync_speed_at_init` / `motor_sync_limits_at_init` reconcile
+/// once loading completes (C check_speed_and_resolution /
+/// set_dial_highlimit / set_dial_lowlimit).
 fn apply_mres_cascade(rec: &mut MotorRecord) {
-    // Both re-derivations below are C special() semantics for a *runtime*
-    // MRES/UREV/SREV change. During `dbLoadRecords` neither invariant is
-    // established yet: `apply_fields` feeds every `field()` through
-    // `put_field` (unlike C, which applies `field()` as raw struct writes),
-    // so `field(MRES,…)` may run after `field(VELO,…)` / `field(DHLM,…)`.
-    // Cascading mid-load would rewrite the freshly-loaded VELO from an S
-    // derived against the pre-MRES default UREV, and rescale the
-    // freshly-loaded DHLM against the pre-MRES default resolution.
-    // `motor_sync_speed_at_init` / `motor_sync_limits_at_init` reconcile
-    // once loading completes (C check_speed_and_resolution /
-    // set_dial_highlimit / set_dial_lowlimit).
-    //
     // C velcheckB (motorRecord.cc:2855-2875): across a resolution change
     // the rev-unit speeds are invariant — re-derive the EGU speeds.
-    if rec.internal.init_invariants_synced {
-        let urev_abs = rec.conv.urev.abs();
-        if urev_abs > 0.0 {
-            rec.vel.velo = urev_abs * rec.vel.s;
-            rec.vel.vbas = urev_abs * rec.vel.sbas;
-            rec.vel.bvel = urev_abs * rec.vel.sbak;
-            rec.vel.vmax = urev_abs * rec.vel.smax;
-        }
+    let urev_abs = rec.conv.urev.abs();
+    if urev_abs > 0.0 {
+        rec.vel.velo = urev_abs * rec.vel.s;
+        rec.vel.vbas = urev_abs * rec.vel.sbas;
+        rec.vel.bvel = urev_abs * rec.vel.sbak;
+        rec.vel.vmax = urev_abs * rec.vel.smax;
     }
     if rec.conv.mres == 0.0 {
         return;
     }
-    if rec.internal.init_invariants_synced {
-        // C special MRES (2877-2906): the raw pair is the invariant —
-        // recompute dial from raw. MRES < 0 crosses the assignment with
-        // the SIGNED resolution (dhlm = rllm * mres, dllm = rhlm * mres,
-        // "MRES < 0 swaps DHLM DLLM"), leaving the raw registers
-        // untouched. Raw is always populated here: init seeds it and
-        // every runtime dial/user limit put maintains it.
-        if rec.conv.mres > 0.0 {
-            rec.limits.dllm = rec.limits.rllm * rec.conv.mres;
-            rec.limits.dhlm = rec.limits.rhlm * rec.conv.mres;
-        } else {
-            rec.limits.dhlm = rec.limits.rllm * rec.conv.mres;
-            rec.limits.dllm = rec.limits.rhlm * rec.conv.mres;
-        }
-        rec.set_userlimits();
+    // C special MRES (2877-2906): the raw pair is the invariant —
+    // recompute dial from raw. MRES < 0 crosses the assignment with
+    // the SIGNED resolution (dhlm = rllm * mres, dllm = rhlm * mres,
+    // "MRES < 0 swaps DHLM DLLM"), leaving the raw registers
+    // untouched. Raw is always populated here: init seeds it and
+    // every runtime dial/user limit put maintains it.
+    if rec.conv.mres > 0.0 {
+        rec.limits.dllm = rec.limits.rllm * rec.conv.mres;
+        rec.limits.dhlm = rec.limits.rhlm * rec.conv.mres;
+    } else {
+        rec.limits.dhlm = rec.limits.rllm * rec.conv.mres;
+        rec.limits.dllm = rec.limits.rhlm * rec.conv.mres;
     }
-    // C: special() calls enforceMinRetryDeadband on MRES change.
+    rec.set_userlimits();
+    // C restores the RDBD >= |MRES| invariant at the next process pass
+    // (do_work 1971); enforcing here is the same invariant, one pass
+    // earlier.
     rec.enforce_min_retry_deadband();
 }
 
@@ -2177,6 +2189,35 @@ fn revalidate_velocities(rec: &mut MotorRecord) {
     range_check(&mut rec.vel.hvel, rec.vel.vbas, rec.vel.vmax);
 }
 
+/// Reconcile the SREV/UREV/MRES resolution triple at IOC init — the head
+/// of C `check_speed_and_resolution` (motorRecord.cc:3904-3927), run once
+/// after `dbLoadRecords` has applied every `field()` as a raw struct
+/// write. A nonzero loaded UREV wins over a loaded MRES; SREV is clamped
+/// sane first so both derivations divide by the final value.
+///
+/// The Rust default MRES is 1.0 where the dbd leaves it 0.0: the C
+/// `mres == 0 → 1.0` arm (3917-3921) makes both starting points converge,
+/// and the UREV-wins arm overwrites MRES regardless, so no load scenario
+/// can tell the defaults apart.
+pub(crate) fn motor_sync_resolution_at_init(rec: &mut MotorRecord) {
+    // C 3904-3909: SREV (steps/revolution) must be sane.
+    if rec.conv.srev <= 0 {
+        rec.conv.srev = 200;
+    }
+    // C 3911-3916: UREV (EGU/revolution) <--> MRES (EGU/step).
+    if rec.conv.urev != 0.0 {
+        rec.conv.mres = rec.conv.urev / rec.conv.srev as f64;
+    }
+    // C 3917-3921: MRES must end up nonzero.
+    if rec.conv.mres == 0.0 {
+        rec.conv.mres = 1.0;
+    }
+    // C 3922-3927: keep the triple consistent at the final MRES.
+    if rec.conv.urev != rec.conv.mres * rec.conv.srev as f64 {
+        rec.conv.urev = rec.conv.mres * rec.conv.srev as f64;
+    }
+}
+
 /// Reconcile the rev↔EGU speed pairs at IOC init — the speed half of C
 /// `check_speed_and_resolution` (motorRecord.cc:3895), which C
 /// `init_record` runs once after `dbLoadRecords` has applied every
@@ -2192,10 +2233,9 @@ fn revalidate_velocities(rec: &mut MotorRecord) {
 /// then rewrites VELO from that stale S — a `motor.template` load scaled
 /// every VELO by final-UREV/default-UREV (0.2× for the default template).
 ///
-/// C's preceding SREV/MRES/UREV reconcile (motorRecord.cc:3904-3927) is not
-/// ported: the MRES/SREV/UREV handlers reject zero/non-positive puts and
-/// re-derive the other two on every put, so the resolution triple is
-/// already mutually consistent when init runs.
+/// Must run after [`motor_sync_resolution_at_init`] — the rev↔EGU pairs
+/// divide by the final UREV (C runs both inside the same
+/// check_speed_and_resolution call, resolution first).
 pub(crate) fn motor_sync_speed_at_init(rec: &mut MotorRecord) {
     let urev_abs = rec.conv.urev.abs();
     if urev_abs > 0.0 {

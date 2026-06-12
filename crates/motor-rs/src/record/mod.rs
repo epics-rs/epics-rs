@@ -422,6 +422,10 @@ impl Record for MotorRecord {
     /// [`field_access::motor_sync_limits_at_init`].
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 1 {
+            // C init_record runs check_speed_and_resolution (641) with the
+            // resolution triple first (3904-3927), then the speed pairs,
+            // then the raw-limit rules.
+            field_access::motor_sync_resolution_at_init(self);
             field_access::motor_sync_speed_at_init(self);
             field_access::motor_sync_limits_at_init(self);
             self.internal.init_invariants_synced = true;

@@ -92,7 +92,12 @@ impl Default for ConversionFields {
             mres: 1.0,
             eres: 0.0,
             srev: 200,
-            urev: 1.0,
+            // dbd-true default — UREV has no initial(). The init-time
+            // resolution reconcile (C check_speed_and_resolution,
+            // motorRecord.cc:3911-3916) treats a nonzero UREV as
+            // "configured by the .db" and derives MRES from it; a
+            // nonzero default here would clobber every loaded MRES.
+            urev: 0.0,
             ueip: false,
             urip: false,
             rres: 0.0,

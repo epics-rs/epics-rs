@@ -378,59 +378,6 @@ impl MotorRecord {
         } else {
             0
         };
-        // Check soft limits (C: disabled only when dhlm == dllm == 0.0)
-        if !(self.limits.dhlm == self.limits.dllm && self.limits.dllm == 0.0) {
-            // C: DLLM > DHLM means limits are inverted => always violation
-            if self.limits.dllm > self.limits.dhlm {
-                self.limits.lvio = true;
-                tracing::warn!(
-                    "limit violation: inverted limits dllm={:.4} > dhlm={:.4}",
-                    self.limits.dllm,
-                    self.limits.dhlm
-                );
-                return;
-            }
-
-            let preferred = self.is_preferred_direction(self.pos.dval, self.pos.drbv);
-
-            if preferred {
-                // C preferred_dir: check dval against limits
-                let target_outside =
-                    self.pos.dval > self.limits.dhlm || self.pos.dval < self.limits.dllm;
-                if target_outside {
-                    // C: allow if dval is closer to valid range than ldvl
-                    let ldvl_above = self.internal.ldvl > self.limits.dhlm;
-                    let ldvl_below = self.internal.ldvl < self.limits.dllm;
-                    let moving_toward_valid = (ldvl_above && self.pos.dval < self.internal.ldvl)
-                        || (ldvl_below && self.pos.dval > self.internal.ldvl);
-                    if !moving_toward_valid {
-                        self.limits.lvio = true;
-                        tracing::warn!(
-                            "limit violation: dval={:.4}, limits=[{:.4}, {:.4}]",
-                            self.pos.dval,
-                            self.limits.dllm,
-                            self.limits.dhlm
-                        );
-                        return;
-                    }
-                }
-            } else {
-                // C non-preferred: check backlash pretarget against limits
-                let pretarget = Self::compute_backlash_pretarget(self.pos.dval, self.retry.bdst);
-                if pretarget > self.limits.dhlm || pretarget < self.limits.dllm {
-                    self.limits.lvio = true;
-                    tracing::warn!(
-                        "limit violation: backlash pretarget={:.4}, limits=[{:.4}, {:.4}]",
-                        pretarget,
-                        self.limits.dllm,
-                        self.limits.dhlm
-                    );
-                    return;
-                }
-            }
-        }
-        self.limits.lvio = false;
-
         // C too_small (2308-2348): a RETRY dispatch is too small when the
         // remaining error is under RDBD in steps (2329-2330); a plain
         // dispatch when under one motor step or inside the open SPDB
@@ -482,6 +429,52 @@ impl MotorRecord {
             }
         }
 
+        // C 2351-2356: the retry counter resets only when this dispatch is
+        // NOT a retry — and BEFORE the LVIO check, so a refused fresh move
+        // still zeroes it. A Go resume of a paused move re-enters here
+        // with mip = MIP_RETRY (maybeRetry armed it at the pause stop),
+        // and C preserves rcnt so repeated Pause/Go cycles count against
+        // RTRY.
+        if !self.stat.mip.contains(MipFlags::RETRY) {
+            self.retry.rcnt = 0;
+        }
+
+        // C 2391-2395: preferred_dir, computed once for the LVIO check
+        // and the dispatch case selection.
+        let preferred = self.is_preferred_direction(self.pos.dval, self.pos.drbv);
+
+        // C LVIO evaluation (2396-2415), AFTER the too_small suppression:
+        // a request whose error is already inside the deadband completes
+        // quietly even when the target sits past a limit. The
+        // moving-toward-valid exception (2403-2405) is its own arm,
+        // granted on DVAL whether or not the move is preferred — only the
+        // final else discriminates: preferred checks DVAL, non-preferred
+        // checks the backlash pretarget.
+        self.limits.lvio = if self.limits.dhlm == self.limits.dllm && self.limits.dllm == 0.0 {
+            false
+        } else if self.limits.dllm > self.limits.dhlm {
+            true
+        } else if (self.pos.dval > self.limits.dhlm && self.pos.dval < self.internal.ldvl)
+            || (self.pos.dval < self.limits.dllm && self.pos.dval > self.internal.ldvl)
+        {
+            false
+        } else if preferred {
+            self.pos.dval > self.limits.dhlm || self.pos.dval < self.limits.dllm
+        } else {
+            let bdstpos = Self::compute_backlash_pretarget(self.pos.dval, self.retry.bdst);
+            bdstpos > self.limits.dhlm || bdstpos < self.limits.dllm
+        };
+        if self.limits.lvio {
+            tracing::warn!(
+                "limit violation: dval={:.4}, bdst={:.4}, limits=[{:.4}, {:.4}]",
+                self.pos.dval,
+                self.retry.bdst,
+                self.limits.dllm,
+                self.limits.dhlm
+            );
+            return;
+        }
+
         // C dispatch case selection (do_work 2479-2524):
         //   Case 1 (2479-2489): backlash disabled (|BDST| < |MRES|), or
         //     preferred direction with BVEL == VELO and BACC == ACCL —
@@ -494,7 +487,6 @@ impl MotorRecord {
         //     BVEL != VELO takes this path too: the final BDST stretch
         //     is always traversed at backlash speed.
         // C compares BVEL/VELO and BACC/ACCL with exact == (2487-2488).
-        let preferred = self.is_preferred_direction(self.pos.dval, self.pos.drbv);
         let same_vel = self.vel.bvel == self.vel.velo && self.vel.bacc == self.vel.accl;
         let use_rel = self.use_relative_moves();
 
@@ -571,13 +563,6 @@ impl MotorRecord {
 
         // DMOV pulse: set false before starting
         self.stat.dmov = false;
-        // C 2351-2356: the retry counter resets only when this dispatch is
-        // NOT a retry. A Go resume of a paused move re-enters here with
-        // mip = MIP_RETRY (maybeRetry armed it at the pause stop), and C
-        // preserves rcnt so repeated Pause/Go cycles count against RTRY.
-        if !self.stat.mip.contains(MipFlags::RETRY) {
-            self.retry.rcnt = 0;
-        }
         // MISS is not cleared at dispatch: C touches it only inside
         // maybeRetry (1072 set, 1092 clear), so a latched miss stays
         // visible through the next move until its evaluation lands

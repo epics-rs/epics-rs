@@ -5609,3 +5609,87 @@ mod miss_semantics {
         );
     }
 }
+
+// --- C do_work ordering: too_small before LVIO; the toward-valid
+// --- exception; RCNT reset ahead of the refusal (2308/2351/2396) ---
+
+#[test]
+fn test_sub_step_write_past_limit_completes_without_lvio() {
+    // C checks too_small (2308-2348) BEFORE the LVIO evaluation (2396):
+    // a request whose raw error is under one step completes quietly even
+    // when the target sits past a soft limit.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.001;
+    rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
+    rec.pos.drbv = 10.0;
+    rec.pos.rbv = 10.0;
+    rec.stat.msta = MstaFlags::DONE;
+
+    // 10.0004 is past DHLM but NINT(0.0004/0.001) rounds to 0 steps.
+    rec.put_field("VAL", EpicsValue::Double(10.0004)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+
+    assert!(!rec.limits.lvio, "too_small wins over LVIO (C ordering)");
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "no move dispatched"
+    );
+    assert_eq!(rec.internal.ldvl, 10.0004, "suppressed target adopted");
+}
+
+#[test]
+fn test_toward_valid_exception_applies_to_non_preferred_move() {
+    // C 2403-2405: a target beyond a limit but closer to the valid range
+    // than LDVL is allowed — the arm precedes the preferred/non-preferred
+    // split, so it is granted on DVAL even when the move would do a
+    // backlash leg whose pretarget is also outside.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.001;
+    rec.vel.velo = 10.0;
+    rec.vel.accl = 0.5;
+    rec.vel.bvel = 5.0;
+    rec.vel.bacc = 0.5;
+    rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
+    rec.retry.bdst = 1.0; // dval < ldvl with bdst > 0: non-preferred
+    rec.pos.drbv = 15.0;
+    rec.pos.rbv = 15.0;
+    rec.internal.ldvl = 15.0; // stranded above the (lowered) limit
+    rec.stat.msta = MstaFlags::DONE;
+
+    rec.put_field("VAL", EpicsValue::Double(12.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Val);
+
+    assert!(!rec.limits.lvio, "toward-valid move allowed (C 2403-2405)");
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "move dispatched, got {:?}",
+        effects.commands
+    );
+}
+
+#[test]
+fn test_lvio_refused_fresh_move_still_resets_rcnt() {
+    // C resets the retry counter (2351-2356) BEFORE the LVIO refusal
+    // (2434-2452): a refused fresh move zeroes a latched RCNT.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.001;
+    rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
+    rec.pos.drbv = 0.0;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.retry.rcnt = 3; // latched from an exhausted retry cycle
+
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+
+    assert!(rec.limits.lvio, "target past DHLM refused");
+    assert_eq!(rec.retry.rcnt, 0, "RCNT reset precedes the refusal");
+}

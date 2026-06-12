@@ -1656,6 +1656,29 @@ pub(crate) fn motor_put_field(
             }
             _ => Err(CaError::TypeMismatch(name.into())),
         },
+        // MLST/ALST are SPC_NOMOD toward CA (read_only in FIELDS), but
+        // the framework's deadband owner updates them through
+        // `put_field` after a monitor/archive trigger — C monitor()
+        // 3485-3501: `mlst = rbv` / `alst = rbv` track the last POSTED
+        // readback. Without these arms the update was silently
+        // swallowed and the anchor stayed 0.0 forever: with the
+        // default MDEL=0 every process pass with RBV != 0 fired the
+        // VAL monitor/archive triggers, and a nonzero MDEL anchored
+        // the deadband at zero instead of at the last posted RBV.
+        "MLST" => match value {
+            EpicsValue::Double(v) => {
+                rec.disp.mlst = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "ALST" => match value {
+            EpicsValue::Double(v) => {
+                rec.disp.alst = v;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
         // Timing
         "DLY" => match value {
             EpicsValue::Double(v) => {

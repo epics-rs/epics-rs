@@ -4766,3 +4766,18 @@ fn test_spmg_move_during_deceleration_abandons_queued_jog_and_resumes() {
         "queued jog was abandoned wholesale by the Move resume (C 1927-1933)"
     );
 }
+
+#[test]
+fn test_mlst_alst_writable_by_framework_deadband_owner() {
+    // C monitor() 3485-3501 anchors the MDEL/ADEL deadbands at the
+    // last POSTED readback by writing MLST/ALST. The framework's
+    // deadband owner performs that write through put_field
+    // (put_coerced); the arms must accept it even though the fields
+    // stay SPC_NOMOD toward CA. Pre-fix the write was FieldNotFound
+    // (silently swallowed) and the anchor read 0.0 forever.
+    let mut rec = MotorRecord::new();
+    rec.put_field("MLST", EpicsValue::Double(3.5)).unwrap();
+    rec.put_field("ALST", EpicsValue::Double(4.5)).unwrap();
+    assert_eq!(rec.get_field("MLST"), Some(EpicsValue::Double(3.5)));
+    assert_eq!(rec.get_field("ALST"), Some(EpicsValue::Double(4.5)));
+}

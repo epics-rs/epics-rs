@@ -11,6 +11,26 @@ pub struct FieldDesc {
     pub read_only: bool,
 }
 
+/// Per-field metadata deltas returned by
+/// [`Record::field_metadata_override`].
+///
+/// Each `Some` member replaces the corresponding member of the
+/// snapshot's record-level display/control metadata; `None` members
+/// keep the record-level value.
+#[derive(Debug, Clone, Default)]
+pub struct FieldMetadataOverride {
+    /// `display.units` — C RSET `get_units`.
+    pub units: Option<crate::types::PvString>,
+    /// `display.precision` — C RSET `get_precision`.
+    pub precision: Option<i16>,
+    /// `(upper, lower)` display limits — C RSET `get_graphic_double`.
+    pub disp_limits: Option<(f64, f64)>,
+    /// `(upper, lower)` control limits — C RSET `get_control_double`.
+    pub ctrl_limits: Option<(f64, f64)>,
+    /// `(hihi, high, low, lolo)` — C RSET `get_alarm_double`.
+    pub alarm_limits: Option<(f64, f64, f64, f64)>,
+}
+
 /// Side-effect actions that a record requests from the processing framework.
 ///
 /// Records return these from `process()` via `ProcessOutcome::actions`.
@@ -297,6 +317,31 @@ pub trait Record: Send + Sync + 'static {
     /// fields. The dbCommon menu fields (`SCAN`, etc.) are handled
     /// separately by the framework, not here.
     fn menu_field_choices(&self, _field: &str) -> Option<&'static [&'static str]> {
+        None
+    }
+
+    /// Per-field override of the record-level display/control metadata
+    /// for a GET / monitor snapshot of `field`.
+    ///
+    /// C record support serves metadata PER FIELD: the RSET functions
+    /// `get_units` / `get_precision` / `get_graphic_double` /
+    /// `get_control_double` / `get_alarm_double` all key on
+    /// `dbGetFieldIndex(paddr)` and fall back to the `recGbl*` defaults
+    /// for unlisted fields. The framework's metadata cache is per
+    /// record (built by `populate_display_info` /
+    /// `populate_control_info` from the VAL-class fields); a record
+    /// whose RSET serves different metadata for non-VAL fields
+    /// overrides this hook to patch the cached values for that field
+    /// (e.g. the motor record: VELO's display range is VMAX/VBAS, not
+    /// HLM/LLM — `motorRecord.cc:3247-3250`).
+    ///
+    /// Applied on both the GET path (`snapshot_for_field`) and the
+    /// monitor path (`make_monitor_snapshot`), AFTER the cached
+    /// record-level metadata — and computed live on each call, so an
+    /// override derived from non-cached fields can never go stale.
+    /// `field` is uppercase, as declared in [`Record::field_list`].
+    /// Default: `None` — record-level metadata serves every field.
+    fn field_metadata_override(&self, _field: &str) -> Option<FieldMetadataOverride> {
         None
     }
 

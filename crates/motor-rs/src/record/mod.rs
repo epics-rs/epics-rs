@@ -212,6 +212,16 @@ impl Record for MotorRecord {
         self.stat.dmov
     }
 
+    // C RSET per-field metadata (motorRecord.cc get_units 3156-3208,
+    // get_precision 3313-3337, get_graphic_double 3213-3258,
+    // get_control_double 3263-3308, get_alarm_double 3344-3361).
+    fn field_metadata_override(
+        &self,
+        field: &str,
+    ) -> Option<epics_base_rs::server::record::FieldMetadataOverride> {
+        Some(field_access::metadata_override(self, field))
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // If wired to device state, determine event from shared mailbox
         if self.device_state.is_some() {

@@ -511,6 +511,11 @@ impl RecordInstance {
         snap.control = meta.control;
         snap.enums = meta.enums;
 
+        // Per-field RSET metadata (C get_units/get_precision/
+        // get_graphic_double/get_control_double/get_alarm_double key on
+        // dbGetFieldIndex) patches the record-level cache for this field.
+        self.apply_field_metadata_override(field, &mut snap);
+
         // Common-field enum mapping (e.g. .SCAN choices) is field-specific
         // and not part of the per-record cache.
         self.populate_common_enum_info(field, &mut snap);
@@ -2147,11 +2152,60 @@ impl RecordInstance {
         snap.display = meta.display;
         snap.control = meta.control;
         snap.enums = meta.enums;
+        // Per-field RSET metadata, same as the GET path
+        // (`snapshot_for_field`) — a monitor update for VELO must carry
+        // VELO's limits, not the record-level VAL limits.
+        self.apply_field_metadata_override(field, &mut snap);
         // A monitored DBF_MENU field carries the same DBR_ENUM value and
         // choice labels as the GET path, so a `camonitor`/`pvmonitor`
         // update shows the menu label, not a bare index.
         self.attach_menu_enum(field, &mut snap);
         snap
+    }
+
+    /// Apply a record's per-field metadata override (C RSET
+    /// `get_units`/`get_precision`/`get_graphic_double`/
+    /// `get_control_double`/`get_alarm_double`, all keyed by field)
+    /// over the cached record-level metadata. Shared by the GET and
+    /// monitor snapshot builders. Computed live on every call — never
+    /// cached — so overrides derived from fields outside the
+    /// `is_metadata_field` set cannot go stale.
+    fn apply_field_metadata_override(
+        &self,
+        field: &str,
+        snap: &mut super::super::snapshot::Snapshot,
+    ) {
+        let Some(ov) = self.record.field_metadata_override(field) else {
+            return;
+        };
+        if ov.units.is_some()
+            || ov.precision.is_some()
+            || ov.disp_limits.is_some()
+            || ov.alarm_limits.is_some()
+        {
+            let d = snap.display.get_or_insert_with(Default::default);
+            if let Some(units) = ov.units {
+                d.units = units;
+            }
+            if let Some(precision) = ov.precision {
+                d.precision = precision;
+            }
+            if let Some((upper, lower)) = ov.disp_limits {
+                d.upper_disp_limit = upper;
+                d.lower_disp_limit = lower;
+            }
+            if let Some((hihi, high, low, lolo)) = ov.alarm_limits {
+                d.upper_alarm_limit = hihi;
+                d.upper_warning_limit = high;
+                d.lower_warning_limit = low;
+                d.lower_alarm_limit = lolo;
+            }
+        }
+        if let Some((upper, lower)) = ov.ctrl_limits {
+            let c = snap.control.get_or_insert_with(Default::default);
+            c.upper_ctrl_limit = upper;
+            c.lower_ctrl_limit = lower;
+        }
     }
 
     /// Notify subscribers from a snapshot (call outside lock).
@@ -2715,6 +2769,86 @@ mod metadata_cache_tests {
         let d2 = snap2.display.unwrap();
         assert_eq!(d1.units, d2.units);
         assert_eq!(d1.precision, d2.precision);
+    }
+
+    /// Stub record with a per-field metadata override on SPD only —
+    /// models a C RSET whose get_units/get_graphic_double key on
+    /// dbGetFieldIndex (e.g. motorRecord.cc:3156-3361).
+    struct PerFieldMetaRecord;
+
+    impl Record for PerFieldMetaRecord {
+        fn record_type(&self) -> &'static str {
+            "ai" // record-level metadata populates from EGU/PREC/HOPR/LOPR
+        }
+        fn get_field(&self, name: &str) -> Option<EpicsValue> {
+            match name {
+                "VAL" | "SPD" => Some(EpicsValue::Double(1.0)),
+                "EGU" => Some(EpicsValue::String("mm".into())),
+                "PREC" => Some(EpicsValue::Short(3)),
+                "HOPR" => Some(EpicsValue::Double(100.0)),
+                "LOPR" => Some(EpicsValue::Double(-100.0)),
+                _ => None,
+            }
+        }
+        fn put_field(&mut self, name: &str, _value: EpicsValue) -> CaResult<()> {
+            Err(CaError::FieldNotFound(name.to_string()))
+        }
+        fn field_list(&self) -> &'static [crate::server::record::FieldDesc] {
+            &[]
+        }
+        fn field_metadata_override(
+            &self,
+            field: &str,
+        ) -> Option<crate::server::record::FieldMetadataOverride> {
+            if field != "SPD" {
+                return None;
+            }
+            Some(crate::server::record::FieldMetadataOverride {
+                units: Some("mm/sec".into()),
+                precision: Some(1),
+                disp_limits: Some((5.0, 0.5)),
+                ctrl_limits: Some((4.0, 1.0)),
+                alarm_limits: Some((9.0, 8.0, -8.0, -9.0)),
+            })
+        }
+    }
+
+    #[test]
+    fn field_metadata_override_applies_on_get_and_monitor_paths() {
+        let inst = RecordInstance::new("PFM".to_string(), PerFieldMetaRecord);
+
+        // VAL: no override — record-level metadata serves it.
+        let snap = inst.snapshot_for_field("VAL").unwrap();
+        let d = snap.display.unwrap();
+        assert_eq!(d.units, "mm");
+        assert_eq!(d.precision, 3);
+        assert_eq!(d.upper_disp_limit, 100.0);
+
+        // SPD via the GET path: every member patched over the cache.
+        let snap = inst.snapshot_for_field("SPD").unwrap();
+        let d = snap.display.unwrap();
+        assert_eq!(d.units, "mm/sec");
+        assert_eq!(d.precision, 1);
+        assert_eq!((d.upper_disp_limit, d.lower_disp_limit), (5.0, 0.5));
+        assert_eq!(
+            (
+                d.upper_alarm_limit,
+                d.upper_warning_limit,
+                d.lower_warning_limit,
+                d.lower_alarm_limit
+            ),
+            (9.0, 8.0, -8.0, -9.0)
+        );
+        let c = snap.control.unwrap();
+        assert_eq!((c.upper_ctrl_limit, c.lower_ctrl_limit), (4.0, 1.0));
+
+        // SPD via the monitor path: identical override.
+        let snap = inst.make_monitor_snapshot("SPD", EpicsValue::Double(2.0));
+        let d = snap.display.unwrap();
+        assert_eq!(d.units, "mm/sec");
+        assert_eq!((d.upper_disp_limit, d.lower_disp_limit), (5.0, 0.5));
+        let c = snap.control.unwrap();
+        assert_eq!((c.upper_ctrl_limit, c.lower_ctrl_limit), (4.0, 1.0));
     }
 
     /// Stub record that simulates a record whose process() mutates an

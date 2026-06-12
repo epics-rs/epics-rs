@@ -2364,3 +2364,128 @@ fn update_raw_from_dial_low(rec: &mut MotorRecord, dial: f64) {
         rec.limits.rllm = tmp_raw;
     }
 }
+
+/// Per-field RSET metadata (C motorRecord.cc): get_units (3156-3208),
+/// get_precision (3313-3337), get_graphic_double (3213-3258),
+/// get_control_double (3263-3308), get_alarm_double (3344-3361).
+/// The graphic and control switches are identical in C, so one
+/// `limits_for` serves both.
+pub(crate) fn metadata_override(
+    rec: &MotorRecord,
+    field: &str,
+) -> epics_base_rs::server::record::FieldMetadataOverride {
+    let limits = limits_for(rec, field);
+    epics_base_rs::server::record::FieldMetadataOverride {
+        units: units_for(rec, field),
+        precision: precision_for(rec, field),
+        disp_limits: limits,
+        ctrl_limits: limits,
+        alarm_limits: Some(alarm_limits_for(rec, field)),
+    }
+}
+
+/// C get_units (motorRecord.cc:3156-3208): velocity-class fields
+/// decorate EGU; acceleration/speed fields carry fixed unit strings.
+/// Default (`None`) is the bare EGU, which the record-level metadata
+/// already serves. Byte-level concat — EGU is not guaranteed UTF-8.
+fn units_for(rec: &MotorRecord, field: &str) -> Option<epics_base_rs::types::PvString> {
+    use epics_base_rs::types::PvString;
+    let decorate = |suffix: &[u8]| PvString::from_bytes([rec.disp.egu.as_bytes(), suffix].concat());
+    match field {
+        "VELO" | "VMAX" | "BVEL" | "VBAS" | "JVEL" | "HVEL" => Some(decorate(b"/sec")),
+        "JAR" => Some(decorate(b"/s/s")),
+        "ACCL" | "BACC" => Some(PvString::from_bytes(&b"sec"[..])),
+        "S" | "SBAS" | "SBAK" => Some(PvString::from_bytes(&b"rev/sec"[..])),
+        "SREV" => Some(PvString::from_bytes(&b"steps/rev"[..])),
+        "UREV" => Some(decorate(b"/rev")),
+        _ => None,
+    }
+}
+
+/// C get_precision (motorRecord.cc:3313-3337): raw readbacks and the
+/// encoder/motor pulse counts are integers (0), VERS is stamped with
+/// 2 digits; every other field seeds PREC and runs recGblGetPrec
+/// (recGbl.c:119-141) — integer DBF types force 0, float/double clamp
+/// an out-of-range PREC to 15, string fields keep PREC untouched
+/// (`None` keeps the record-level PREC).
+fn precision_for(rec: &MotorRecord, field: &str) -> Option<i16> {
+    match field {
+        "RRBV" | "RMP" | "REP" => Some(0),
+        "VERS" => Some(2),
+        _ => match FIELDS.iter().find(|f| f.name == field)?.dbf_type {
+            DbFieldType::Short
+            | DbFieldType::Long
+            | DbFieldType::Int64
+            | DbFieldType::Char
+            | DbFieldType::Enum
+            | DbFieldType::UShort
+            | DbFieldType::ULong
+            | DbFieldType::UInt64 => Some(0),
+            DbFieldType::Float | DbFieldType::Double => {
+                if (0..=15).contains(&rec.disp.prec) {
+                    None
+                } else {
+                    Some(15)
+                }
+            }
+            DbFieldType::String => None,
+        },
+    }
+}
+
+/// C get_graphic_double (motorRecord.cc:3213-3258) and
+/// get_control_double (3263-3308) — identical switches: positions get
+/// the matching limit pair, the raw pair divides the dial limits by
+/// the SIGNED resolution (crossed under MRES < 0, C 3235-3244), VELO
+/// ranges over VMAX/VBAS, and unlisted fields fall back to
+/// recGblGetGraphicDouble's type range (recGbl.c getMaxRangeValues,
+/// 372-419, keyed by the declared DBF type).
+fn limits_for(rec: &MotorRecord, field: &str) -> Option<(f64, f64)> {
+    match field {
+        "VAL" | "RBV" => Some((rec.limits.hlm, rec.limits.llm)),
+        "DVAL" | "DRBV" => Some((rec.limits.dhlm, rec.limits.dllm)),
+        "RVAL" | "RRBV" => {
+            if rec.conv.mres >= 0.0 {
+                Some((
+                    rec.limits.dhlm / rec.conv.mres,
+                    rec.limits.dllm / rec.conv.mres,
+                ))
+            } else {
+                Some((
+                    rec.limits.dllm / rec.conv.mres,
+                    rec.limits.dhlm / rec.conv.mres,
+                ))
+            }
+        }
+        "VELO" => Some((rec.vel.vmax, rec.vel.vbas)),
+        _ => match FIELDS.iter().find(|f| f.name == field)?.dbf_type {
+            DbFieldType::Char => Some((255.0, 0.0)),
+            DbFieldType::Short => Some((32767.0, -32768.0)),
+            DbFieldType::Enum | DbFieldType::UShort => Some((65535.0, 0.0)),
+            DbFieldType::Long => Some((2147483647.0, -2147483648.0)),
+            DbFieldType::ULong => Some((4294967295.0, 0.0)),
+            DbFieldType::Int64 => Some((9223372036854775808.0, -9223372036854775808.0)),
+            DbFieldType::UInt64 => Some((18446744073709551615.0, 0.0)),
+            DbFieldType::Float => Some((1e30, -1e30)),
+            DbFieldType::Double => Some((1e300, -1e300)),
+            DbFieldType::String => None,
+        },
+    }
+}
+
+/// C get_alarm_double (motorRecord.cc:3344-3361): VAL/DVAL serve
+/// HIHI/HIGH/LOW/LOLO unconditionally (no severity gate); every other
+/// field gets recGblGetAlarmDouble's "no alarm limits" NaNs
+/// (recGbl.c:155-162).
+fn alarm_limits_for(rec: &MotorRecord, field: &str) -> (f64, f64, f64, f64) {
+    if field == "VAL" || field == "DVAL" {
+        (
+            rec.alarm.hihi,
+            rec.alarm.high,
+            rec.alarm.low,
+            rec.alarm.lolo,
+        )
+    } else {
+        (f64::NAN, f64::NAN, f64::NAN, f64::NAN)
+    }
+}

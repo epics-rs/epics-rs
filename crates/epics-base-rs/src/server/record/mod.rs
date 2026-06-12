@@ -22,7 +22,8 @@ pub use menu_choices::{
 };
 pub use record_instance::{NotifyWaitSet, RecordInstance};
 pub use record_trait::{
-    CommonFieldPutResult, EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc, ProcessAction, ProcessContext,
-    ProcessOutcome, ProcessSnapshot, Record, RecordProcessResult, SubroutineFn,
+    CommonFieldPutResult, EPICS_TIME_EVENT_DEVICE_TIME, FieldDesc, FieldMetadataOverride,
+    ProcessAction, ProcessContext, ProcessOutcome, ProcessSnapshot, Record, RecordProcessResult,
+    SubroutineFn,
 };
 pub use scan::ScanType;

@@ -4576,6 +4576,115 @@ fn test_runtime_dial_high_put_under_negative_mres_lands_in_rllm() {
     );
 }
 
+// --- Per-field metadata (C RSET get_units 3156-3208, get_precision
+//     3313-3337, get_graphic_double 3213-3258, get_control_double
+//     3263-3308, get_alarm_double 3344-3361) ---
+
+#[test]
+fn test_field_metadata_units() {
+    let mut rec = MotorRecord::new();
+    rec.put_field("EGU", EpicsValue::String("deg".into()))
+        .unwrap();
+    let units = |f: &str| rec.field_metadata_override(f).unwrap().units;
+    for f in ["VELO", "VMAX", "BVEL", "VBAS", "JVEL", "HVEL"] {
+        assert_eq!(units(f).unwrap(), "deg/sec", "{f}");
+    }
+    assert_eq!(units("JAR").unwrap(), "deg/s/s");
+    assert_eq!(units("ACCL").unwrap(), "sec");
+    assert_eq!(units("BACC").unwrap(), "sec");
+    for f in ["S", "SBAS", "SBAK"] {
+        assert_eq!(units(f).unwrap(), "rev/sec", "{f}");
+    }
+    assert_eq!(units("SREV").unwrap(), "steps/rev");
+    assert_eq!(units("UREV").unwrap(), "deg/rev");
+    // C default branch: bare EGU — the record-level metadata serves it.
+    assert!(units("VAL").is_none());
+    assert!(units("RBV").is_none());
+}
+
+#[test]
+fn test_field_metadata_precision() {
+    let mut rec = MotorRecord::new();
+    rec.put_field("PREC", EpicsValue::Short(4)).unwrap();
+    let prec = |f: &str| rec.field_metadata_override(f).unwrap().precision;
+    assert_eq!(prec("RRBV"), Some(0));
+    assert_eq!(prec("RMP"), Some(0));
+    assert_eq!(prec("REP"), Some(0));
+    assert_eq!(prec("VERS"), Some(2));
+    // Integer DBF types: recGblGetPrec forces 0 (recGbl.c:124-133).
+    assert_eq!(prec("DMOV"), Some(0));
+    assert_eq!(prec("RCNT"), Some(0));
+    // Double field with in-range PREC keeps the record-level value.
+    assert_eq!(prec("VAL"), None);
+    // Out-of-range PREC clamps to 15 (recGbl.c:135-138).
+    rec.put_field("PREC", EpicsValue::Short(99)).unwrap();
+    assert_eq!(
+        rec.field_metadata_override("VAL").unwrap().precision,
+        Some(15)
+    );
+}
+
+#[test]
+fn test_field_metadata_graphic_control_limits() {
+    let mut rec = MotorRecord::new();
+    rec.put_field("DHLM", EpicsValue::Double(100.0)).unwrap();
+    rec.put_field("DLLM", EpicsValue::Double(-50.0)).unwrap();
+    rec.put_field("MRES", EpicsValue::Double(0.5)).unwrap();
+    rec.init_record(1).unwrap();
+    rec.vel.vmax = 20.0;
+    rec.vel.vbas = 0.1;
+
+    let lim = |f: &str| rec.field_metadata_override(f).unwrap().disp_limits;
+    assert_eq!(lim("VAL"), Some((rec.limits.hlm, rec.limits.llm)));
+    assert_eq!(lim("RBV"), lim("VAL"));
+    assert_eq!(lim("DVAL"), Some((100.0, -50.0)));
+    assert_eq!(lim("DRBV"), Some((100.0, -50.0)));
+    // Raw pair: dial / mres with the SIGNED resolution (C 3235-3239).
+    assert_eq!(lim("RVAL"), Some((200.0, -100.0)));
+    assert_eq!(lim("RRBV"), Some((200.0, -100.0)));
+    assert_eq!(lim("VELO"), Some((20.0, 0.1)));
+    // Unlisted double field: recGblGetGraphicDouble type range.
+    assert_eq!(lim("ACCL"), Some((1e300, -1e300)));
+    // Control mirrors graphic — the C switches are identical.
+    let ov = rec.field_metadata_override("VELO").unwrap();
+    assert_eq!(ov.ctrl_limits, Some((20.0, 0.1)));
+    let ov = rec.field_metadata_override("DVAL").unwrap();
+    assert_eq!(ov.ctrl_limits, Some((100.0, -50.0)));
+}
+
+#[test]
+fn test_field_metadata_raw_limits_cross_under_negative_mres() {
+    let mut rec = MotorRecord::new();
+    rec.limits.dhlm = 100.0;
+    rec.limits.dllm = -50.0;
+    rec.conv.mres = -0.5;
+    // C 3240-3244: upper = dllm/mres, lower = dhlm/mres.
+    let ov = rec.field_metadata_override("RVAL").unwrap();
+    assert_eq!(ov.disp_limits, Some((100.0, -200.0)));
+    assert_eq!(ov.ctrl_limits, Some((100.0, -200.0)));
+}
+
+#[test]
+fn test_field_metadata_alarm_limits() {
+    let mut rec = MotorRecord::new();
+    rec.alarm.hihi = 90.0;
+    rec.alarm.high = 80.0;
+    rec.alarm.low = -80.0;
+    rec.alarm.lolo = -90.0;
+    let al = |f: &str| {
+        rec.field_metadata_override(f)
+            .unwrap()
+            .alarm_limits
+            .unwrap()
+    };
+    // C 3349-3355: VAL/DVAL serve the limits unconditionally.
+    assert_eq!(al("VAL"), (90.0, 80.0, -80.0, -90.0));
+    assert_eq!(al("DVAL"), (90.0, 80.0, -80.0, -90.0));
+    // Every other field: recGblGetAlarmDouble NaNs (recGbl.c:155-162).
+    let (hihi, high, low, lolo) = al("RBV");
+    assert!(hihi.is_nan() && high.is_nan() && low.is_nan() && lolo.is_nan());
+}
+
 // --- Speed invariant at init (C check_speed_and_resolution, motorRecord.cc:3895) ---
 
 #[test]

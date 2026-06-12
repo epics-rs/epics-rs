@@ -269,6 +269,15 @@ impl Record for MotorRecord {
                 ("RVAL".to_string(), EpicsValue::Int64(self.pos.rval)),
                 ("RBV".to_string(), EpicsValue::Double(self.pos.rbv)),
                 ("DRBV".to_string(), EpicsValue::Double(self.pos.drbv)),
+                // C do_work marks M_MIP on every move dispatch and
+                // M_RCNT when the retry count resets (motorRecord.cc:
+                // 1929-1932), so the move-start monitor() pass posts
+                // both.
+                (
+                    "MIP".to_string(),
+                    EpicsValue::Short(self.stat.mip.bits() as i16),
+                ),
+                ("RCNT".to_string(), EpicsValue::Short(self.retry.rcnt)),
             ];
             // C fires `dbPutLink(&rlnk, ...)` (motorRecord.cc:1495) on this
             // move-start pass too — before `monitor()` and the `recGblFwdLink`
@@ -431,6 +440,14 @@ impl Record for MotorRecord {
         Some(EpicsValue::Double(self.pos.rbv))
     }
 
+    /// The deadband gates RBV's monitor delivery (C motorRecord.cc
+    /// 3468-3507); with this, the framework routes VAL through generic
+    /// change-detection — posted only when the setpoint actually moved
+    /// (C M_VAL mark semantics), not on every readback poll.
+    fn monitor_deadband_field(&self) -> &'static str {
+        "RBV"
+    }
+
     /// C `alarm_sub()` (motorRecord.cc:3367-3406) — motor-specific alarm
     /// severities, raised into `nsta`/`nsev` before the framework's
     /// `evaluate_alarms`.
@@ -583,6 +600,44 @@ mod tests {
             )),
             "an unset RLNK must emit no readback link write"
         );
+    }
+
+    // C do_work marks M_MIP on the move dispatch and M_RCNT on the retry
+    // counter reset (motorRecord.cc:1929-1932); monitor() posts both on
+    // the move-start pass.
+    #[test]
+    fn move_start_notify_carries_mip_and_rcnt() {
+        let mut rec = MotorRecord::new();
+        rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+        rec.set_event(MotorEvent::UserWrite(CommandSource::Val));
+        let outcome = rec.process().unwrap();
+        let RecordProcessResult::AsyncPendingNotify(fields) = outcome.result else {
+            panic!("first process() of a fresh move must be the move-start notification");
+        };
+        let mip = rec.stat.mip.bits() as i16;
+        assert!(
+            fields
+                .iter()
+                .any(|(n, v)| n == "MIP" && *v == EpicsValue::Short(mip)),
+            "move-start notify must carry MIP: {fields:?}"
+        );
+        assert!(
+            fields
+                .iter()
+                .any(|(n, v)| n == "RCNT" && *v == EpicsValue::Short(rec.retry.rcnt)),
+            "move-start notify must carry RCNT: {fields:?}"
+        );
+    }
+
+    // C monitor() (motorRecord.cc:3468-3507): the MDEL/ADEL deadband
+    // gates the RBV post. The framework keys delivery off this hook
+    // pair — both must track RBV.
+    #[test]
+    fn monitor_deadband_hooks_track_rbv() {
+        let mut rec = MotorRecord::new();
+        rec.pos.rbv = 7.25;
+        assert_eq!(rec.monitor_deadband_field(), "RBV");
+        assert_eq!(rec.monitor_deadband_value(), Some(EpicsValue::Double(7.25)));
     }
 
     // C motorRecord.cc:3687 — URIP=Yes pulls the readback from the RDBL link

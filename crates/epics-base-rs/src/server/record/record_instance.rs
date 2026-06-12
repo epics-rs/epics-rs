@@ -1935,9 +1935,21 @@ impl RecordInstance {
 
         // Build snapshot
         let mut changed_fields = Vec::new();
-        if include_val {
-            if let Some(val) = self.record.val() {
-                changed_fields.push(("VAL".to_string(), val));
+        // Same deadband-field routing as the `processing.rs` paths: the
+        // deadband triggers deliver the field the deadband tracks; a
+        // non-primary deadband field (motor RBV — C motor `monitor()`,
+        // motorRecord.cc:3468-3507) leaves VAL to the generic
+        // change-detection loop below.
+        let deadband_field = self.record.monitor_deadband_field();
+        if deadband_field == "VAL" {
+            if include_val {
+                if let Some(val) = self.record.val() {
+                    changed_fields.push(("VAL".to_string(), val));
+                }
+            }
+        } else if include_val || include_archive {
+            if let Some(val) = self.resolve_field(deadband_field) {
+                changed_fields.push((deadband_field.to_string(), val));
             }
         }
         // C `recGblResetAlarms` (recGbl.c:201-220) posts each alarm
@@ -2003,15 +2015,16 @@ impl RecordInstance {
         }
 
         // Add subscribed fields that actually changed since last notification.
-        // Exclude VAL/SEVR/STAT/AMSG/UDF — all five are already emitted by
-        // this path (VAL in `changed_fields`, SEVR/STAT/AMSG via
-        // `alarm_posts`, UDF via the explicit UDF push above). Mirrors the
-        // two `processing.rs` snapshot gates, which exclude the same five;
-        // excluding only the first three would double-post AMSG and UDF.
+        // Exclude {deadband-field}/SEVR/STAT/AMSG/UDF — all five are already
+        // emitted by this path (the deadband field, default VAL, in
+        // `changed_fields`, SEVR/STAT/AMSG via `alarm_posts`, UDF via the
+        // explicit UDF push above). Mirrors the two `processing.rs`
+        // snapshot gates, which exclude the same five; excluding only the
+        // first three would double-post AMSG and UDF.
         let mut sub_updates: Vec<(String, EpicsValue)> = Vec::new();
         for (field, subs) in &self.subscribers {
             if !subs.is_empty()
-                && field != "VAL"
+                && field != deadband_field
                 && field != "SEVR"
                 && field != "STAT"
                 && field != "AMSG"
@@ -2861,6 +2874,140 @@ mod metadata_cache_tests {
         assert_eq!((d.upper_disp_limit, d.lower_disp_limit), (5.0, 0.5));
         let c = snap.control.unwrap();
         assert_eq!((c.upper_ctrl_limit, c.lower_ctrl_limit), (4.0, 1.0));
+    }
+
+    /// Stub modelling the motor monitor() shape (C motorRecord.cc:
+    /// 3468-3507): VAL is a setpoint, the MDEL/ADEL deadband tracks
+    /// the RBV readback, which advances on every process.
+    struct ReadbackDeadbandRecord {
+        val: f64,
+        rbv: f64,
+        deadband: f64,
+    }
+
+    impl Record for ReadbackDeadbandRecord {
+        fn record_type(&self) -> &'static str {
+            "ai"
+        }
+        fn process(&mut self) -> CaResult<crate::server::record::ProcessOutcome> {
+            self.rbv += 30.0;
+            Ok(crate::server::record::ProcessOutcome::complete())
+        }
+        fn get_field(&self, name: &str) -> Option<EpicsValue> {
+            match name {
+                "VAL" => Some(EpicsValue::Double(self.val)),
+                "RBV" => Some(EpicsValue::Double(self.rbv)),
+                "MDEL" | "ADEL" => Some(EpicsValue::Double(self.deadband)),
+                _ => None,
+            }
+        }
+        fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+            match (name, value) {
+                ("VAL", EpicsValue::Double(v)) => {
+                    self.val = v;
+                    Ok(())
+                }
+                ("MDEL", EpicsValue::Double(v)) => {
+                    self.deadband = v;
+                    Ok(())
+                }
+                _ => Err(CaError::FieldNotFound(name.to_string())),
+            }
+        }
+        fn field_list(&self) -> &'static [crate::server::record::FieldDesc] {
+            &[]
+        }
+        fn monitor_deadband_value(&self) -> Option<EpicsValue> {
+            Some(EpicsValue::Double(self.rbv))
+        }
+        fn monitor_deadband_field(&self) -> &'static str {
+            "RBV"
+        }
+    }
+
+    /// C motor monitor() parity: MDEL/ADEL throttle the deadband
+    /// field's (RBV) delivery; VAL posts only when the setpoint
+    /// actually changed — not on every readback poll.
+    #[test]
+    fn deadband_field_routes_readback_and_val_posts_only_on_change() {
+        use crate::server::recgbl::EventMask;
+        let mut inst = RecordInstance::new(
+            "RDB".to_string(),
+            ReadbackDeadbandRecord {
+                val: 5.0,
+                rbv: 0.0,
+                deadband: 10.0,
+            },
+        );
+        let _val_rx = inst
+            .add_subscriber(
+                "VAL",
+                1,
+                crate::types::DbFieldType::Double,
+                EventMask::VALUE.bits(),
+            )
+            .expect("VAL subscriber");
+        let _rbv_rx = inst
+            .add_subscriber(
+                "RBV",
+                2,
+                crate::types::DbFieldType::Double,
+                EventMask::VALUE.bits(),
+            )
+            .expect("RBV subscriber");
+        let names = |snap: &ProcessSnapshot| {
+            snap.changed_fields
+                .iter()
+                .map(|(n, _)| n.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // Cycle 1 (first publish): RBV fires via the deadband trigger
+        // (MLST starts at the NaN never-posted sentinel). VAL must NOT
+        // post: `add_subscriber` seeded `last_posted` with the current
+        // value (the initial value already went out with EVENT_ADD), and
+        // C monitor() posts VAL only when MARKED(M_VAL) — nothing marked
+        // it.
+        let (snap, _) = inst.process_local().unwrap();
+        let n = names(&snap);
+        assert!(n.contains(&"RBV".to_string()), "{n:?}");
+        assert!(
+            !n.contains(&"VAL".to_string()),
+            "VAL unchanged since subscribe must not post: {n:?}"
+        );
+
+        // Cycle 2: RBV moved past MDEL, VAL unchanged → RBV posted,
+        // VAL not re-posted.
+        let (snap, _) = inst.process_local().unwrap();
+        let n = names(&snap);
+        assert!(n.contains(&"RBV".to_string()), "RBV crossed MDEL: {n:?}");
+        assert!(
+            !n.contains(&"VAL".to_string()),
+            "unchanged VAL must not post: {n:?}"
+        );
+
+        // Cycle 3: widen the deadband — RBV moves within it → throttled.
+        let _ = inst.record.put_field("MDEL", EpicsValue::Double(1000.0));
+        let (snap, _) = inst.process_local().unwrap();
+        let n = names(&snap);
+        assert!(
+            !n.contains(&"RBV".to_string()),
+            "MDEL must throttle RBV: {n:?}"
+        );
+
+        // Cycle 4: setpoint moves while RBV stays inside the deadband →
+        // VAL posts via change detection, RBV stays throttled.
+        let _ = inst.record.put_field("VAL", EpicsValue::Double(42.0));
+        let (snap, _) = inst.process_local().unwrap();
+        let n = names(&snap);
+        assert!(
+            n.contains(&"VAL".to_string()),
+            "changed VAL must post: {n:?}"
+        );
+        assert!(
+            !n.contains(&"RBV".to_string()),
+            "MDEL must throttle RBV: {n:?}"
+        );
     }
 
     /// Stub record that simulates a record whose process() mutates an

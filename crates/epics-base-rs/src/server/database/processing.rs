@@ -2011,16 +2011,34 @@ impl PvDatabase {
             // so a `DBE_ALARM`-only subscriber sees the value at the
             // moment the alarm changed.
             let val_on_alarm = alarm_result.alarm_changed || alarm_result.amsg_changed;
-            if include_val || val_on_alarm {
-                if let Some(val) = instance.record.val() {
-                    changed_fields.push(("VAL".to_string(), val));
+            // The deadband triggers deliver the field the deadband
+            // tracks. For most records that IS the primary value; a
+            // record like motor deadbands its readback (C motor
+            // `monitor()`, motorRecord.cc:3468-3507: MDEL/ADEL
+            // throttle the RBV post), and its VAL routes through the
+            // generic change-detection loop below — an unchanged
+            // setpoint is not re-posted on every readback poll.
+            let deadband_field = instance.record.monitor_deadband_field();
+            if deadband_field == "VAL" {
+                if include_val || val_on_alarm {
+                    if let Some(val) = instance.record.val() {
+                        changed_fields.push(("VAL".to_string(), val));
+                    }
+                }
+            } else if include_val || include_archive || val_on_alarm {
+                if let Some(val) = instance.resolve_field(deadband_field) {
+                    changed_fields.push((deadband_field.to_string(), val));
                 }
             }
-            // Add subscribed fields that actually changed since last notification.
+            // Add subscribed fields that actually changed since last
+            // notification. The deadband-gated field is excluded — it is
+            // delivered by the trigger branch above, never by raw
+            // change-detection (for the default `deadband_field ==
+            // "VAL"` this is the same VAL exclusion as before).
             let mut sub_updates: Vec<(String, EpicsValue)> = Vec::new();
             for (field, subs) in &instance.subscribers {
                 if !subs.is_empty()
-                    && field != "VAL"
+                    && field != deadband_field
                     && field != "SEVR"
                     && field != "STAT"
                     && field != "AMSG"
@@ -2994,9 +3012,20 @@ impl PvDatabase {
             }
 
             let mut changed_fields = Vec::new();
-            if include_val {
-                if let Some(val) = instance.record.val() {
-                    changed_fields.push(("VAL".to_string(), val));
+            // Same deadband-field routing as the main process path: the
+            // triggers deliver the tracked field; a non-primary
+            // deadband field (motor RBV) leaves VAL to the generic
+            // change-detection loop below.
+            let deadband_field = instance.record.monitor_deadband_field();
+            if deadband_field == "VAL" {
+                if include_val {
+                    if let Some(val) = instance.record.val() {
+                        changed_fields.push(("VAL".to_string(), val));
+                    }
+                }
+            } else if include_val || include_archive {
+                if let Some(val) = instance.resolve_field(deadband_field) {
+                    changed_fields.push((deadband_field.to_string(), val));
                 }
             }
             // C `recGblResetAlarms` (recGbl.c:201-220) posts each alarm
@@ -3044,18 +3073,20 @@ impl PvDatabase {
                     EpicsValue::Char(if instance.common.udf { 1 } else { 0 }),
                 ));
             }
-            // Add subscribed non-{VAL,SEVR,STAT,AMSG,UDF} fields that
-            // actually changed since last notification — mirrors the
-            // main-path snapshot gate (process_record_with_links_inner
-            // L794-820). Without this, every async-completion cycle
-            // re-sends every subscribed auxiliary field even when its
-            // value is unchanged, multiplying the monitor traffic for
-            // any record that pairs an async write with a sticky
-            // metadata field.
+            // Add subscribed non-{deadband-field,SEVR,STAT,AMSG,UDF}
+            // fields that actually changed since last notification —
+            // mirrors the main-path snapshot gate
+            // (process_record_with_links_inner L794-820). Without this,
+            // every async-completion cycle re-sends every subscribed
+            // auxiliary field even when its value is unchanged,
+            // multiplying the monitor traffic for any record that pairs
+            // an async write with a sticky metadata field. The
+            // deadband-gated field (default VAL) is delivered by the
+            // trigger branch above, never by raw change-detection.
             let mut sub_updates: Vec<(String, EpicsValue)> = Vec::new();
             for (field, subs) in &instance.subscribers {
                 if !subs.is_empty()
-                    && field != "VAL"
+                    && field != deadband_field
                     && field != "SEVR"
                     && field != "STAT"
                     && field != "AMSG"

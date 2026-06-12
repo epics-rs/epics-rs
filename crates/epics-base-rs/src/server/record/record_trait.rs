@@ -574,6 +574,27 @@ pub trait Record: Send + Sync + 'static {
         self.val()
     }
 
+    /// The FIELD whose VALUE/LOG monitor delivery the MDEL/ADEL
+    /// deadband gates — the field [`Self::monitor_deadband_value`]
+    /// reads. A record overriding one must override both consistently.
+    ///
+    /// For most records the deadband gates the primary value itself,
+    /// so the default returns [`Self::primary_field`] and nothing
+    /// changes. The motor record deadbands RBV: C `monitor()`
+    /// (motorRecord.cc:3468-3507) throttles the RBV post with
+    /// MDEL/ADEL, while VAL is posted only when an actual setpoint
+    /// change marked it (M_VAL). When this returns a non-primary
+    /// field, the framework's snapshot builders:
+    ///
+    /// * deliver THIS field on the deadband triggers (instead of raw
+    ///   change-detection), and
+    /// * route the primary field through generic change-detection, so
+    ///   an unchanged setpoint is not re-posted on every readback
+    ///   poll.
+    fn monitor_deadband_field(&self) -> &'static str {
+        self.primary_field()
+    }
+
     /// Initialize record (pass 0: field defaults; pass 1: dependent init).
     fn init_record(&mut self, _pass: u8) -> CaResult<()> {
         Ok(())

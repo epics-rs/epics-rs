@@ -428,6 +428,10 @@ impl Record for MotorRecord {
             field_access::motor_sync_resolution_at_init(self);
             field_access::motor_sync_speed_at_init(self);
             field_access::motor_sync_limits_at_init(self);
+            // C 642: the single load-order-independent enforcement of
+            // RDBD >= |MRES|, against the reconciled resolution. The RDBD
+            // put handler stays inert during load.
+            self.enforce_min_retry_deadband();
             self.internal.init_invariants_synced = true;
         }
         Ok(())

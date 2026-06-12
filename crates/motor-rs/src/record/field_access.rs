@@ -1542,6 +1542,12 @@ pub(crate) fn motor_put_field(
         "BDST" => match value {
             EpicsValue::Double(v) => {
                 rec.retry.bdst = v;
+                // C special BDST (2986-2989): "New backlash distance.
+                // Make sure retry deadband is achievable." Runtime only,
+                // same load/init split as RDBD.
+                if rec.internal.init_invariants_synced {
+                    rec.enforce_min_retry_deadband();
+                }
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1557,8 +1563,15 @@ pub(crate) fn motor_put_field(
         "RDBD" => match value {
             EpicsValue::Double(v) => {
                 rec.retry.rdbd = v;
-                // C: enforceMinRetryDeadband — RDBD must be >= |MRES|.
-                rec.enforce_min_retry_deadband();
+                // C special RDBD (2764-2766): enforceMinRetryDeadband —
+                // RDBD must be >= |MRES|. Runtime only: during load the
+                // value lands raw (C field() is a raw struct write) and
+                // init_record enforces once against the final MRES
+                // (C 642) — enforcing mid-load would clamp against
+                // whatever MRES happens to hold at that point in the .db.
+                if rec.internal.init_invariants_synced {
+                    rec.enforce_min_retry_deadband();
+                }
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),

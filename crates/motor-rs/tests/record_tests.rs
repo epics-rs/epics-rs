@@ -2613,9 +2613,12 @@ fn test_delaywait_finalizes_after_delay_expires() {
 
 #[test]
 fn test_rdbd_forced_to_at_least_abs_mres() {
-    // C: enforceMinRetryDeadband — RDBD must be >= |MRES|.
+    // C special RDBD (2764-2766): a runtime RDBD put is clamped to
+    // >= |MRES| on the spot. Runtime semantics — init first.
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.5;
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
     rec.put_field("RDBD", EpicsValue::Double(0.1)).unwrap();
     assert_eq!(rec.retry.rdbd, 0.5); // forced up to |MRES|
 
@@ -2626,6 +2629,57 @@ fn test_rdbd_forced_to_at_least_abs_mres() {
     rec.conv.mres = -0.3;
     rec.put_field("RDBD", EpicsValue::Double(0.0)).unwrap();
     assert_eq!(rec.retry.rdbd, 0.3);
+}
+
+#[test]
+fn test_rdbd_load_order_independent_at_init() {
+    // C: dbLoadRecords writes RDBD raw and the single enforcement runs
+    // at init against the final MRES (642, after
+    // check_speed_and_resolution). Regression: the load-time RDBD put
+    // used to clamp against the default MRES of 1.0, so field(RDBD,0.05)
+    // before field(MRES,0.01) booted with RDBD = 1.0.
+    for rdbd_first in [true, false] {
+        let mut rec = MotorRecord::new();
+        if rdbd_first {
+            rec.put_field("RDBD", EpicsValue::Double(0.05)).unwrap();
+            rec.put_field("MRES", EpicsValue::Double(0.01)).unwrap();
+        } else {
+            rec.put_field("MRES", EpicsValue::Double(0.01)).unwrap();
+            rec.put_field("RDBD", EpicsValue::Double(0.05)).unwrap();
+        }
+        rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
+
+        assert_eq!(
+            rec.retry.rdbd, 0.05,
+            "rdbd_first={rdbd_first}: loaded RDBD above |MRES| must survive init"
+        );
+    }
+}
+
+#[test]
+fn test_rdbd_below_mres_raised_at_init() {
+    // C 642: a loaded RDBD below |MRES| is raised to |MRES| at init.
+    let mut rec = MotorRecord::new();
+    rec.put_field("RDBD", EpicsValue::Double(0.005)).unwrap();
+    rec.put_field("MRES", EpicsValue::Double(0.01)).unwrap();
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+
+    assert_eq!(rec.retry.rdbd, 0.01);
+}
+
+#[test]
+fn test_bdst_put_enforces_min_retry_deadband() {
+    // C special BDST (2986-2989): a runtime BDST put re-runs
+    // enforceMinRetryDeadband.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.5;
+    rec.init_record(0).unwrap();
+    rec.init_record(1).unwrap();
+    rec.retry.rdbd = 0.1; // direct write below |MRES|
+    rec.put_field("BDST", EpicsValue::Double(1.0)).unwrap();
+    assert_eq!(rec.retry.rdbd, 0.5);
 }
 
 #[test]

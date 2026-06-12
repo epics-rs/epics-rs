@@ -9,6 +9,10 @@ use crate::flags::*;
 
 use super::MotorRecord;
 
+/// The motorRecord version this port tracks (C `#define VERSION 7.4`,
+/// stamped into VERS at init_record:608; SPC_NOMOD).
+const MOTOR_RECORD_VERSION: f32 = 7.4;
+
 pub(crate) static FIELDS: &[FieldDesc] = &[
     // Position
     FieldDesc {
@@ -323,6 +327,21 @@ pub(crate) static FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "LLS",
         dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "RHLS",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "RLLS",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "VERS",
+        dbf_type: DbFieldType::Float,
         read_only: true,
     },
     FieldDesc {
@@ -719,6 +738,10 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         "LVIO" => Some(EpicsValue::Short(if rec.limits.lvio { 1 } else { 0 })),
         "HLS" => Some(EpicsValue::Short(if rec.limits.hls { 1 } else { 0 })),
         "LLS" => Some(EpicsValue::Short(if rec.limits.lls { 1 } else { 0 })),
+        "RHLS" => Some(EpicsValue::Short(if rec.limits.rhls { 1 } else { 0 })),
+        "RLLS" => Some(EpicsValue::Short(if rec.limits.rlls { 1 } else { 0 })),
+        // C 196/608: init_record stamps the ported motorRecord version.
+        "VERS" => Some(EpicsValue::Float(MOTOR_RECORD_VERSION)),
         "HLSV" => Some(EpicsValue::Short(rec.limits.hlsv)),
         // Control
         "SPMG" => Some(EpicsValue::Short(rec.ctrl.spmg as i16)),

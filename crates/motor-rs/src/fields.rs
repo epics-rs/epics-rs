@@ -196,6 +196,11 @@ pub struct LimitFields {
     pub lvio: bool,
     pub hls: bool,
     pub lls: bool,
+    /// Raw high limit switch readback (C 3727: `rhls = msta.Bits.RA_PLUS_LS`),
+    /// unmapped by DIR/MRES polarity — HLS/LLS derive from these (C 3733-3734).
+    pub rhls: bool,
+    /// Raw low limit switch readback (C 3728: `rlls = msta.Bits.RA_MINUS_LS`).
+    pub rlls: bool,
     pub hlsv: i16,
 }
 
@@ -211,6 +216,8 @@ impl Default for LimitFields {
             lvio: true,
             hls: false,
             lls: false,
+            rhls: false,
+            rlls: false,
             hlsv: 0,
         }
     }

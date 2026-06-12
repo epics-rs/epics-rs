@@ -6102,6 +6102,38 @@ fn test_spmg_move_home_completion_keeps_move() {
 }
 
 #[test]
+fn test_rhls_rlls_raw_limit_readbacks() {
+    // C 3727-3734: RHLS/RLLS hold the raw MSTA limit bits unmapped;
+    // HLS/LLS derive from them by DIR/MRES polarity. Under inverted
+    // polarity the user pair swaps while the raw pair does not.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = -1.0; // inverted polarity with DIR=Pos
+    let status = asyn_rs::interfaces::motor::MotorStatus {
+        high_limit: true,
+        low_limit: false,
+        done: true,
+        ..Default::default()
+    };
+    rec.process_motor_info(&status);
+    assert_eq!(rec.get_field("RHLS"), Some(EpicsValue::Short(1)));
+    assert_eq!(rec.get_field("RLLS"), Some(EpicsValue::Short(0)));
+    assert_eq!(
+        rec.get_field("HLS"),
+        Some(EpicsValue::Short(0)),
+        "user high maps from raw LOW under inverted polarity"
+    );
+    assert_eq!(rec.get_field("LLS"), Some(EpicsValue::Short(1)));
+}
+
+#[test]
+fn test_vers_reports_ported_record_version() {
+    // C 196/608: VERS is stamped with the motorRecord VERSION (7.4),
+    // SPC_NOMOD.
+    let rec = MotorRecord::new();
+    assert_eq!(rec.get_field("VERS"), Some(EpicsValue::Float(7.4)));
+}
+
+#[test]
 fn test_mlst_alst_writable_by_framework_deadband_owner() {
     // C monitor() 3485-3501 anchors the MDEL/ADEL deadbands at the
     // last POSTED readback by writing MLST/ALST. The framework's

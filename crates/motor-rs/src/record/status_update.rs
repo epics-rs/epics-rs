@@ -190,15 +190,18 @@ impl MotorRecord {
             self.stat.mip |= MipFlags::EXTERNAL;
         }
 
-        // Limit switches: map raw -> user based on DIR and MRES sign
-        // C: hls = ((dir == Pos) == (mres >= 0)) ? rhls : rlls
+        // Raw limit switch readbacks (C 3727-3728), then the user-mapped
+        // pair derives from them by DIR/MRES polarity (C 3733-3734:
+        // hls = ((dir == Pos) == (mres >= 0)) ? rhls : rlls).
+        self.limits.rhls = status.high_limit;
+        self.limits.rlls = status.low_limit;
         let same_polarity = (self.conv.dir == MotorDir::Pos) == (self.conv.mres >= 0.0);
         if same_polarity {
-            self.limits.hls = status.high_limit;
-            self.limits.lls = status.low_limit;
+            self.limits.hls = self.limits.rhls;
+            self.limits.lls = self.limits.rlls;
         } else {
-            self.limits.hls = status.low_limit;
-            self.limits.lls = status.high_limit;
+            self.limits.hls = self.limits.rlls;
+            self.limits.lls = self.limits.rhls;
         }
 
         // Build MSTA from driver status

@@ -3814,51 +3814,9 @@ impl PvDatabase {
                         // VAL; no conversion to run.
                         let _ = instance.record.set_val(siol_val);
                     }
-                    apply_timestamp(&mut instance.common, true);
-                    instance.common.udf = false;
-
-                    // Simulation alarm + alarm tail. C `aiRecord.c`
-                    // (and every soft-input record): `readValue()` raises
-                    // `recGblSetSevr(prec, SIMM_ALARM, prec->sims)` —
-                    // MAXIMIZE into the pending nsta/nsev, not a direct
-                    // commit — and then `process()` ALWAYS runs
-                    // `checkAlarms` + `recGblResetAlarms` even for a
-                    // simulated value, so the sim VAL still trips its own
-                    // limit/state alarms and the SIMM severity maximizes
-                    // against them. Set SIMM_ALARM first so it wins
-                    // severity ties (C order: readValue before checkAlarms).
-                    let sev = crate::server::record::AlarmSeverity::from_u16(sims as u16);
-                    crate::server::recgbl::rec_gbl_set_sevr(
-                        &mut instance.common,
-                        crate::server::recgbl::alarm_status::SIMM_ALARM,
-                        sev,
-                    );
-                    {
-                        let inst = &mut *instance;
-                        inst.record.check_alarms(&mut inst.common);
-                    }
-                    instance.evaluate_alarms();
-                    let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
-
-                    // Build snapshot and notify
-                    let sim_mask = crate::server::recgbl::EventMask::VALUE
-                        | crate::server::recgbl::EventMask::ALARM;
-                    let mut changed_fields = Vec::new();
-                    if let Some(val) = instance.record.val() {
-                        changed_fields.push(("VAL".to_string(), val, sim_mask));
-                    }
-                    changed_fields.push((
-                        "SEVR".to_string(),
-                        EpicsValue::Short(instance.common.sevr as i16),
-                        sim_mask,
-                    ));
-                    changed_fields.push((
-                        "STAT".to_string(),
-                        EpicsValue::Short(instance.common.stat as i16),
-                        sim_mask,
-                    ));
-                    let snapshot = crate::server::record::ProcessSnapshot { changed_fields };
-                    instance.notify_from_snapshot(&snapshot);
+                    // Simulation alarm + per-field monitor tail — see
+                    // `sim_process_tail`.
+                    sim_process_tail(&mut instance, sims);
                 }
             } else {
                 // Output record: write VAL (or RVAL for SIMM=RAW) to
@@ -3891,49 +3849,178 @@ impl PvDatabase {
                 }
 
                 let mut instance = rec.write().await;
-                apply_timestamp(&mut instance.common, true);
-                instance.common.udf = false;
-
-                // Simulation alarm + alarm tail (same C parity as the
-                // input branch above): maximize SIMM_ALARM into the
-                // pending state, then run the record's checkAlarms and
-                // recGblResetAlarms so the sim output value trips its own
-                // alarms and the SIMM severity maximizes against them.
-                let sev = crate::server::record::AlarmSeverity::from_u16(sims as u16);
-                crate::server::recgbl::rec_gbl_set_sevr(
-                    &mut instance.common,
-                    crate::server::recgbl::alarm_status::SIMM_ALARM,
-                    sev,
-                );
-                {
-                    let inst = &mut *instance;
-                    inst.record.check_alarms(&mut inst.common);
-                }
-                instance.evaluate_alarms();
-                let _ = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
-
-                // Notify subscribers of simulation output
-                let sim_mask = crate::server::recgbl::EventMask::VALUE
-                    | crate::server::recgbl::EventMask::ALARM;
-                let mut changed_fields = Vec::new();
-                if let Some(val) = instance.record.val() {
-                    changed_fields.push(("VAL".to_string(), val, sim_mask));
-                }
-                changed_fields.push((
-                    "SEVR".to_string(),
-                    EpicsValue::Short(instance.common.sevr as i16),
-                    sim_mask,
-                ));
-                changed_fields.push((
-                    "STAT".to_string(),
-                    EpicsValue::Short(instance.common.stat as i16),
-                    sim_mask,
-                ));
-                let snapshot = crate::server::record::ProcessSnapshot { changed_fields };
-                instance.notify_from_snapshot(&snapshot);
+                // Simulation alarm + per-field monitor tail — see
+                // `sim_process_tail`.
+                sim_process_tail(&mut instance, sims);
             }
         }
 
         SimOutcome::Simulated
+    }
+}
+
+/// Shared tail of a simulated (`SIMM` != NO) process cycle — the part of
+/// C `process()` that still runs when `readValue`/`writeValue` divert to
+/// the SIOL (`aiRecord.c` and every SIML/SIMM-bearing record):
+/// `recGblSetSevr(prec, SIMM_ALARM, prec->sims)` — a MAXIMIZE into the
+/// pending nsta/nsev raised first so it wins severity ties (C order:
+/// readValue before checkAlarms) — then `checkAlarms`,
+/// `recGblResetAlarms`, and `monitor()`, so the simulated value still
+/// trips its own limit/state alarms and the SIMM severity maximizes
+/// against them.
+///
+/// The posting masks are per-field, identical to the async-completion
+/// path (`complete_async_record`) and `process_local`:
+///
+/// * the deadband-tracked field (default `VAL`) posts the classes that
+///   actually fired — MDEL → `DBE_VALUE`, ADEL → `DBE_LOG`, alarm
+///   movement → `DBE_ALARM` (C `recGblResetAlarms` `val_mask`); the
+///   lsi/lso explicit change gate, MPST/APST always-post override, and
+///   binary always-post route through the same hooks as those paths;
+/// * `SEVR` posts `DBE_VALUE` only on a sevr change; `STAT`/`AMSG`
+///   share a mask carrying `DBE_ALARM` (sevr/amsg moved) and/or
+///   `DBE_VALUE` (stat moved); `ACKS` posts `DBE_VALUE` when the reset
+///   raised it (recGbl.c:201-220);
+/// * subscribed auxiliary fields post on value change with
+///   `DBE_VALUE|DBE_LOG` plus the cycle's alarm bits (C change-detected
+///   posts in each record's `monitor()`, e.g. ai `oraw != rval`), and
+///   `UDF` rides along with the union of the cycle's posted classes.
+///
+/// The pre-fix tails (duplicated across the input and output SIMM
+/// branches) pushed `VAL`/`SEVR`/`STAT` unconditionally with one shared
+/// `DBE_VALUE|DBE_ALARM` mask and discarded the `rec_gbl_reset_alarms`
+/// result — every simulated cycle re-sent unchanged alarm fields,
+/// stamped `DBE_ALARM` on cycles whose alarm state never moved, and
+/// bypassed the MDEL/ADEL deadband entirely.
+fn sim_process_tail(instance: &mut RecordInstance, sims: i16) {
+    use crate::server::recgbl::EventMask;
+
+    apply_timestamp(&mut instance.common, true);
+    instance.common.udf = false;
+
+    let sev = crate::server::record::AlarmSeverity::from_u16(sims as u16);
+    crate::server::recgbl::rec_gbl_set_sevr(
+        &mut instance.common,
+        crate::server::recgbl::alarm_status::SIMM_ALARM,
+        sev,
+    );
+    {
+        let inst = &mut *instance;
+        inst.record.check_alarms(&mut inst.common);
+    }
+    instance.evaluate_alarms();
+    let alarm_result = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
+
+    let alarm_bits = if alarm_result.alarm_changed || alarm_result.amsg_changed {
+        EventMask::ALARM
+    } else {
+        EventMask::NONE
+    };
+
+    let (include_val, include_archive) = match instance.record.monitor_value_changed() {
+        Some(changed) => {
+            let (val_always, archive_always) = instance.record.monitor_always_post();
+            (changed || val_always, changed || archive_always)
+        }
+        None => {
+            if instance.record.uses_monitor_deadband() {
+                instance.check_deadband_ext()
+            } else {
+                (true, true)
+            }
+        }
+    };
+    let deadband_field = instance.record.monitor_deadband_field();
+    let deadband_mask = {
+        let mut m = alarm_bits;
+        if include_val {
+            m |= EventMask::VALUE;
+        }
+        if include_archive {
+            m |= EventMask::LOG;
+        }
+        m
+    };
+    let mut changed_fields = Vec::new();
+    if !deadband_mask.is_empty() {
+        let dval = if deadband_field == "VAL" {
+            instance.record.val()
+        } else {
+            instance.resolve_field(deadband_field)
+        };
+        if let Some(val) = dval {
+            changed_fields.push((deadband_field.to_string(), val, deadband_mask));
+        }
+    }
+
+    let sevr_changed = instance.common.sevr != alarm_result.prev_sevr;
+    let stat_changed = instance.common.stat != alarm_result.prev_stat;
+    let stat_mask = {
+        let mut m = EventMask::NONE;
+        if sevr_changed || alarm_result.amsg_changed {
+            m |= EventMask::ALARM;
+        }
+        if stat_changed {
+            m |= EventMask::VALUE;
+        }
+        m
+    };
+
+    let aux_mask = alarm_bits | EventMask::VALUE | EventMask::LOG;
+    let alarm_fanout: &[&str] = if alarm_bits.is_empty() {
+        &[]
+    } else {
+        instance.record.alarm_cycle_monitored_fields()
+    };
+    let mut sub_updates: Vec<(String, EpicsValue, EventMask)> = Vec::new();
+    for (field, subs) in &instance.subscribers {
+        if !subs.is_empty()
+            && field != deadband_field
+            && field != "SEVR"
+            && field != "STAT"
+            && field != "AMSG"
+            && field != "UDF"
+        {
+            if let Some(val) = instance.resolve_field(field) {
+                let changed = match instance.last_posted.get(field) {
+                    Some(prev) => prev != &val,
+                    None => true,
+                };
+                if changed {
+                    sub_updates.push((field.clone(), val, aux_mask));
+                } else if alarm_fanout.contains(&field.as_str()) {
+                    sub_updates.push((field.clone(), val, alarm_bits));
+                }
+            }
+        }
+    }
+    if !sub_updates.is_empty() {
+        for (field, val, _) in &sub_updates {
+            instance.last_posted.insert(field.clone(), val.clone());
+        }
+        changed_fields.extend(sub_updates);
+    }
+    let cycle_mask = changed_fields
+        .iter()
+        .fold(EventMask::NONE, |m, (_, _, fm)| m | *fm);
+    if !cycle_mask.is_empty() {
+        changed_fields.push((
+            "UDF".to_string(),
+            EpicsValue::Char(if instance.common.udf { 1 } else { 0 }),
+            cycle_mask,
+        ));
+    }
+
+    let snapshot = crate::server::record::ProcessSnapshot { changed_fields };
+    instance.notify_from_snapshot(&snapshot);
+    if sevr_changed {
+        instance.notify_field("SEVR", EventMask::VALUE);
+    }
+    if !stat_mask.is_empty() {
+        instance.notify_field("STAT", stat_mask);
+        instance.notify_field("AMSG", stat_mask);
+    }
+    if alarm_result.acks_changed && !stat_mask.is_empty() {
+        instance.notify_field("ACKS", EventMask::VALUE);
     }
 }

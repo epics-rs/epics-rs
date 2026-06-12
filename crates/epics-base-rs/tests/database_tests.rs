@@ -1645,6 +1645,207 @@ async fn test_sim_value_trips_own_limit_and_maximizes_over_simm() {
     );
 }
 
+/// C `recGblResetAlarms` (recGbl.c:201-220) posts the alarm fields only
+/// when the alarm state moved this cycle. The pre-fix SIMM tail pushed
+/// SEVR/STAT into every simulated snapshot with one shared
+/// `DBE_VALUE|DBE_ALARM` mask and bypassed the MDEL deadband, so a
+/// steady simulated record re-sent its unchanged alarm fields and VAL on
+/// every cycle.
+#[tokio::test]
+async fn test_sim_steady_cycle_does_not_repost_unchanged_fields() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::types::DbFieldType;
+
+    let db = PvDatabase::new();
+    db.add_record("SIM_SW3", Box::new(AoRecord::new(1.0)))
+        .await
+        .unwrap();
+    db.add_record("SIM_VAL3", Box::new(AoRecord::new(42.0)))
+        .await
+        .unwrap();
+
+    let mut ai = AiRecord::new(0.0);
+    ai.siml = "SIM_SW3".to_string();
+    ai.siol = "SIM_VAL3".to_string();
+    ai.sims = 1; // SIMM severity = MINOR
+    db.add_record("SIM_AI3", Box::new(ai)).await.unwrap();
+
+    // Cycle 1 commits the NO_ALARM -> MINOR/SIMM transition and VAL=42.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SIM_AI3", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // Subscribe AFTER the transition committed.
+    let (mut sevr_rx, mut stat_rx, mut val_rx) = {
+        let rec = db.get_record("SIM_AI3").await.unwrap();
+        let mut inst = rec.write().await;
+        let s = inst
+            .add_subscriber(
+                "SEVR",
+                31,
+                DbFieldType::Short,
+                (EventMask::VALUE | EventMask::ALARM).bits(),
+            )
+            .unwrap();
+        let t = inst
+            .add_subscriber(
+                "STAT",
+                32,
+                DbFieldType::Short,
+                (EventMask::VALUE | EventMask::ALARM).bits(),
+            )
+            .unwrap();
+        let v = inst
+            .add_subscriber("VAL", 33, DbFieldType::Double, EventMask::VALUE.bits())
+            .unwrap();
+        (s, t, v)
+    };
+
+    // Cycle 2: same SIOL value, same alarm state — nothing posts.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SIM_AI3", &mut visited, 0)
+        .await
+        .unwrap();
+
+    assert!(
+        sevr_rx.try_recv().is_err(),
+        "unchanged SEVR must not be re-posted on a steady simulated cycle"
+    );
+    assert!(
+        stat_rx.try_recv().is_err(),
+        "unchanged STAT must not be re-posted on a steady simulated cycle"
+    );
+    assert!(
+        val_rx.try_recv().is_err(),
+        "unchanged VAL must not be re-posted (MDEL deadband, delta = 0)"
+    );
+}
+
+/// The simulated alarm transition posts each alarm field with its OWN C
+/// mask (recGbl.c:201-220): SEVR is `DBE_VALUE` only — a
+/// `DBE_ALARM`-only `.SEVR` subscriber must NOT be notified — while
+/// STAT's mask carries `DBE_ALARM` when the severity moved. The pre-fix
+/// SIMM tail collapsed both onto a shared `DBE_VALUE|DBE_ALARM` mask.
+#[tokio::test]
+async fn test_sim_alarm_transition_posts_per_field_masks() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::types::DbFieldType;
+
+    let db = PvDatabase::new();
+    db.add_record("SIM_SW4", Box::new(AoRecord::new(1.0)))
+        .await
+        .unwrap();
+    db.add_record("SIM_VAL4", Box::new(AoRecord::new(42.0)))
+        .await
+        .unwrap();
+
+    let mut ai = AiRecord::new(0.0);
+    ai.siml = "SIM_SW4".to_string();
+    ai.siol = "SIM_VAL4".to_string();
+    ai.sims = 1; // SIMM severity = MINOR
+    db.add_record("SIM_AI4", Box::new(ai)).await.unwrap();
+
+    // Subscribe BEFORE the first simulated cycle.
+    let (mut sevr_value_rx, mut sevr_alarm_rx, mut stat_alarm_rx) = {
+        let rec = db.get_record("SIM_AI4").await.unwrap();
+        let mut inst = rec.write().await;
+        let v = inst
+            .add_subscriber("SEVR", 41, DbFieldType::Short, EventMask::VALUE.bits())
+            .unwrap();
+        let a = inst
+            .add_subscriber("SEVR", 42, DbFieldType::Short, EventMask::ALARM.bits())
+            .unwrap();
+        let s = inst
+            .add_subscriber("STAT", 43, DbFieldType::Short, EventMask::ALARM.bits())
+            .unwrap();
+        (v, a, s)
+    };
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SIM_AI4", &mut visited, 0)
+        .await
+        .unwrap();
+
+    assert!(
+        sevr_value_rx.try_recv().is_ok(),
+        "DBE_VALUE SEVR subscriber must receive the SIMM alarm transition"
+    );
+    assert!(
+        sevr_alarm_rx.try_recv().is_err(),
+        "DBE_ALARM-only SEVR subscriber must NOT be notified — SEVR's C \
+         mask is DBE_VALUE only"
+    );
+    assert!(
+        stat_alarm_rx.try_recv().is_ok(),
+        "DBE_ALARM STAT subscriber must receive the transition — \
+         stat_mask carries DBE_ALARM when the severity moved"
+    );
+}
+
+/// SIMM mode runs the record's normal `monitor()` in C — the MDEL
+/// deadband throttles simulated values exactly like real reads
+/// (`aiRecord.c` `monitor()`: `delta > mdel`). The pre-fix SIMM tail
+/// posted VAL on every cycle regardless of MDEL.
+#[tokio::test]
+async fn test_sim_val_respects_mdel_deadband() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::types::DbFieldType;
+
+    let db = PvDatabase::new();
+    db.add_record("SIM_SW5", Box::new(AoRecord::new(1.0)))
+        .await
+        .unwrap();
+    db.add_record("SIM_VAL5", Box::new(AoRecord::new(42.0)))
+        .await
+        .unwrap();
+
+    let mut ai = AiRecord::new(0.0);
+    ai.siml = "SIM_SW5".to_string();
+    ai.siol = "SIM_VAL5".to_string();
+    ai.mdel = 0.5;
+    db.add_record("SIM_AI5", Box::new(ai)).await.unwrap();
+
+    // Cycle 1: VAL 0 -> 42 crosses MDEL, posts, MLST=42.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SIM_AI5", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let mut val_rx = {
+        let rec = db.get_record("SIM_AI5").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.add_subscriber("VAL", 51, DbFieldType::Double, EventMask::VALUE.bits())
+            .unwrap()
+    };
+
+    // Sub-deadband change: |42.2 - 42| = 0.2 < MDEL=0.5 — no VALUE post.
+    db.put_pv("SIM_VAL5", EpicsValue::Double(42.2))
+        .await
+        .unwrap();
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SIM_AI5", &mut visited, 0)
+        .await
+        .unwrap();
+    assert!(
+        val_rx.try_recv().is_err(),
+        "sub-MDEL simulated change must not post DBE_VALUE"
+    );
+
+    // Crossing change: |43.0 - 42| = 1.0 > MDEL=0.5 — posts.
+    db.put_pv("SIM_VAL5", EpicsValue::Double(43.0))
+        .await
+        .unwrap();
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SIM_AI5", &mut visited, 0)
+        .await
+        .unwrap();
+    assert!(
+        val_rx.try_recv().is_ok(),
+        "MDEL-crossing simulated change must post DBE_VALUE"
+    );
+}
+
 #[tokio::test]
 async fn test_sim_mode_toggle() {
     let db = PvDatabase::new();

@@ -903,28 +903,30 @@ impl MotorRecord {
                 self.stop_axis(effects);
             }
             SpmgMode::Pause => {
-                if self.stat.phase != MotionPhase::Idle {
-                    // C (1898-1906): Pause sends STOP and sets MIP_STOP,
-                    // but does NOT set pp — the drive fields keep the
-                    // target so Go can resume. `mip = MIP_STOP` erases a
-                    // queued jog (MIP_JOG_REQ) and a queued/active home
-                    // (MIP_HOMF|HOMR), and clear_buttons() drops the home
-                    // buttons: a paused jog resumes from its still-latched
-                    // button on Go, a canceled home does not.
-                    if matches!(self.internal.queued_motion, Some(QueuedMotion::Home { .. })) {
-                        self.ctrl.homf = false;
-                        self.ctrl.homr = false;
-                    }
-                    self.internal.queued_motion = None;
-                    self.internal.pending_retarget = None;
-                    // C 1901-1905: keep MIP while waiting on DLY.
-                    if !self.stat.mip.contains(MipFlags::DELAY_REQ) {
-                        self.stat.mip.insert(MipFlags::STOP);
-                    }
-                    effects.commands.push(MotorCommand::Stop {
-                        acceleration: self.move_accel_egu(),
-                    });
+                // C (1898-1911): the Pause pass runs unconditionally —
+                // even on an idle axis it sets mip = MIP_STOP and sends
+                // STOP_AXIS ("just in case" the driver is still settling);
+                // the next completion pass collapses the bare MIP_STOP via
+                // maybeRetry's close-enough path, and Go round-trips it to
+                // DONE (1922-1925). Pause does NOT set pp — the drive
+                // fields keep the target so Go can resume. `mip =
+                // MIP_STOP` erases a queued jog (MIP_JOG_REQ) and a
+                // queued/active home (MIP_HOMF|HOMR), and clear_buttons()
+                // drops the home buttons: a paused jog resumes from its
+                // still-latched button on Go, a canceled home does not.
+                if matches!(self.internal.queued_motion, Some(QueuedMotion::Home { .. })) {
+                    self.ctrl.homf = false;
+                    self.ctrl.homr = false;
                 }
+                self.internal.queued_motion = None;
+                self.internal.pending_retarget = None;
+                // C 1901-1905: keep MIP while waiting on DLY.
+                if !self.stat.mip.contains(MipFlags::DELAY_REQ) {
+                    self.stat.mip.insert(MipFlags::STOP);
+                }
+                effects.commands.push(MotorCommand::Stop {
+                    acceleration: self.move_accel_egu(),
+                });
             }
             SpmgMode::Go => {
                 if self.stat.phase == MotionPhase::Idle {

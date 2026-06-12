@@ -3590,3 +3590,37 @@ fn test_pause_during_backlash_move_syncs_at_completion() {
     let effects = rec.plan_motion(CommandSource::Spmg);
     assert!(effects.commands.is_empty());
 }
+
+#[test]
+fn test_idle_pause_sends_stop_axis_and_converges() {
+    // C 1899-1911: the Pause pass sends STOP_AXIS unconditionally and
+    // sets mip = MIP_STOP even on an idle axis ("just in case" — e.g. a
+    // servo still settling after an InPosition retry). The next
+    // completion pass collapses the bare MIP_STOP via maybeRetry's
+    // close-enough path (mip != DONE at 1432) without arming DLY
+    // (C 1457 needs a fresh M_DMOV mark).
+    let mut rec = MotorRecord::new();
+    rec.timing.dly = 1.0;
+    rec.ctrl.spmg = SpmgMode::Pause;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(matches!(effects.commands[0], MotorCommand::Stop { .. }));
+    assert_eq!(rec.stat.mip, MipFlags::STOP);
+    assert!(rec.stat.dmov);
+
+    rec.stat.msta = MstaFlags::DONE;
+    let effects = rec.check_completion();
+    assert!(effects.commands.is_empty());
+    assert!(
+        effects.schedule_delay.is_none(),
+        "idle pause must not arm DLY"
+    );
+    assert_eq!(rec.stat.mip, MipFlags::empty());
+    assert!(rec.stat.dmov);
+
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        effects.commands.is_empty(),
+        "nothing to resume after idle pause"
+    );
+}

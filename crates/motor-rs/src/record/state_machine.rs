@@ -364,18 +364,22 @@ impl MotorRecord {
             MotionPhase::Idle => {
                 // C process (1404-1409, postProcess 851-852): the
                 // GET_INFO callback after a LOAD_POS collapses MIP_LOAD_P
-                // to MIP_DONE and DMOV returns TRUE — nothing else. No
-                // DLY, no retry evaluation, and no drive-triplet resync
-                // (load_pos synced ldvl/lval/lrvl at dispatch); a second
-                // redefinition written during the load keeps its
-                // dval != ldvl signal for the next move-block pass.
+                // to MIP_DONE and DMOV returns TRUE — no DLY, no retry
+                // evaluation, no drive-triplet resync (load_pos synced
+                // ldvl/lval/lrvl at dispatch). The pass then continues
+                // into do_work like any stopped CALLBACK_DATA pass: the
+                // collection below runs the move-block set test, which
+                // replays a second redefinition written during the load
+                // (its dval != ldvl divergence was parked by the
+                // MIP_LOAD_P skip in load_pos's set test). The pp and
+                // EXTERNAL blocks below self-gate: load_pos arms
+                // neither, and MIP is empty after the collapse.
                 if self.stat.mip.contains(MipFlags::LOAD_P)
                     && self.stat.msta.contains(MstaFlags::DONE)
                     && !self.stat.movn
                 {
                     self.stat.mip = MipFlags::empty();
                     self.stat.dmov = true;
-                    return effects;
                 }
                 // C process (1396-1402): a done status callback with pp
                 // armed and no motion runs postProcess, whose first
@@ -407,8 +411,8 @@ impl MotorRecord {
                 // level-triggered pass that picks up a button latched
                 // while its gate failed — limit switch active, or the
                 // closed-loop DOL collection bypass — once the gate
-                // clears. The LOAD_P and pp completion returns above
-                // skip one pass; the next poll lands here.
+                // clears. The pp completion return above skips one
+                // pass; the next poll lands here.
                 self.dispatch_latent_collection(&mut effects);
             }
         }

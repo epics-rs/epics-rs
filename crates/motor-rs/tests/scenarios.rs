@@ -742,6 +742,100 @@ fn set_mode_load_pos_collapses_through_live_path() {
     );
     assert!(rec.stat.dmov, "DMOV returns TRUE");
 }
+
+#[test]
+fn parked_set_redefinition_replays_at_load_pos_collapse() {
+    // C move-block set test (2257-2263): a second SET redefinition
+    // written while a LOAD_POS is in flight parks (load_pos is skipped
+    // while MIP_LOAD_P is set); the collapse pass re-enters do_work
+    // and its `dval != ldvl` entry (2240) replays it through load_pos.
+    use motor_rs::device_state::new_shared_state;
+
+    let state = new_shared_state();
+    state.lock().unwrap().latest_status = Some(idle_status_at(1, 0.0));
+
+    let mut rec = make_record();
+    rec.set_device_state(state.clone());
+    rec.process().unwrap(); // startup
+
+    rec.put_field("SET", EpicsValue::Short(1)).unwrap();
+    rec.process().unwrap();
+    rec.put_field("DVAL", EpicsValue::Double(3.0)).unwrap();
+    rec.process().unwrap();
+    assert!(rec.stat.mip.contains(MipFlags::LOAD_P));
+    state.lock().unwrap().pending_actions.take();
+
+    // Second redefinition while the load is in flight: parked.
+    rec.put_field("DVAL", EpicsValue::Double(7.0)).unwrap();
+    rec.process().unwrap();
+    assert!(rec.stat.mip.contains(MipFlags::LOAD_P), "still loading");
+    let parked = state.lock().unwrap().pending_actions.take();
+    assert!(
+        parked.is_none_or(|a| a.commands.is_empty()),
+        "parked redefinition sends nothing yet"
+    );
+
+    // The first load's GET_INFO response arrives: the collapse pass
+    // replays the parked redefinition.
+    state.lock().unwrap().latest_status = Some(idle_status_at(2, 3.0));
+    rec.process().unwrap();
+    assert!(rec.stat.mip.contains(MipFlags::LOAD_P), "replayed load");
+    assert!(!rec.stat.dmov);
+    let actions = state.lock().unwrap().pending_actions.take().unwrap();
+    assert!(
+        actions
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::SetPosition { position } if *position == 7.0)),
+        "parked redefinition replays to the driver"
+    );
+
+    // The second response completes it.
+    state.lock().unwrap().latest_status = Some(idle_status_at(3, 7.0));
+    rec.process().unwrap();
+    assert!(rec.stat.mip.is_empty());
+    assert!(rec.stat.dmov);
+}
+
+#[test]
+fn latent_sync_latched_during_load_pos_applies_at_collapse() {
+    // C SYNC arm (2540-2544): the latched SYNC consumes only on a
+    // chain-end pass with mip == MIP_DONE. A SYNC put while a LOAD_POS
+    // is in flight stays latched (the Sync dispatch arm's apply is
+    // mip-gated) and applies on the collapse pass.
+    use motor_rs::device_state::new_shared_state;
+
+    let state = new_shared_state();
+    state.lock().unwrap().latest_status = Some(idle_status_at(1, 0.0));
+
+    let mut rec = make_record();
+    rec.set_device_state(state.clone());
+    rec.process().unwrap(); // startup
+
+    rec.put_field("SET", EpicsValue::Short(1)).unwrap();
+    rec.process().unwrap();
+    rec.put_field("DVAL", EpicsValue::Double(3.0)).unwrap();
+    rec.process().unwrap();
+    assert!(rec.stat.mip.contains(MipFlags::LOAD_P));
+
+    rec.put_field("SYNC", EpicsValue::Short(1)).unwrap();
+    rec.process().unwrap();
+    assert_eq!(
+        rec.get_field("SYNC"),
+        Some(EpicsValue::Short(1)),
+        "SYNC latched behind the in-flight load"
+    );
+
+    // The controller confirms the load with a rounded position; the
+    // collapse pass applies the latched SYNC against that readback.
+    state.lock().unwrap().latest_status = Some(idle_status_at(2, 2.9));
+    rec.process().unwrap();
+    assert!(rec.stat.mip.is_empty());
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.get_field("SYNC"), Some(EpicsValue::Short(0)));
+    assert_eq!(rec.pos.dval, 2.9, "SYNC reseeded DVAL from the readback");
+}
+
 #[test]
 fn comm_error_sets_alarm_and_safe_state() {
     let mut rec = make_record();

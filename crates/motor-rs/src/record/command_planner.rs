@@ -1084,19 +1084,52 @@ impl MotorRecord {
     /// through the movn branches — a deferral bounded by one poll
     /// period, and it keeps the in-flight retarget invariants owned by
     /// the explicit Val-arm path.
+    ///
+    /// After the sections, the C else-if chain end runs: the move block
+    /// (2240) whose set test replays a parked SET redefinition, and the
+    /// latent SYNC arm (2540-2544).
     pub(super) fn dispatch_latent_collection(&mut self, effects: &mut ProcessEffects) {
-        if !self.stat.dmov || !self.can_accept_command() || self.closed_loop_dol_collection() {
+        if !self.stat.dmov || !self.can_accept_command() {
             return;
         }
-        if self.dispatch_latent_buttons(effects) {
+        // C closed-loop bypass (1994-2008): its else covers only the
+        // home/jog/tweak sections (2010-2198) — the chain end below
+        // still runs on a closed-loop pass.
+        if !self.closed_loop_dol_collection() {
+            if self.dispatch_latent_buttons(effects) {
+                return;
+            }
+            // C tweak section (2167-2181) + move block: the fold lands
+            // in VAL/DVAL on this pass and the move block dispatches
+            // it, like the Twf/Twr arm. A fold that consumed the
+            // buttons without arming a move (SET Variable redefinition
+            // C 2227, blocked direction) still owns the pass — C
+            // returns inside the section, never reaching the chain end.
+            let had_tweak = self.ctrl.twf || self.ctrl.twr;
+            if self.collect_tweak() {
+                self.plan_absolute_move(effects);
+                return;
+            }
+            if had_tweak {
+                return;
+            }
+        }
+        // C move block entry (2240): `dval != ldvl || !dmov` — dmov is
+        // true past the gate above, so only a diverged DVAL enters.
+        // Its set test (2257-2263) replays a SET redefinition parked
+        // while a LOAD_POS was in flight (plan_absolute_move routes it
+        // to load_pos, which skips while MIP_LOAD_P is set). A non-SET
+        // divergence cannot reach here by construction — refusal paths
+        // restore the lasts and every dispatch/too_small path anchors
+        // them — so like C the pass is consumed either way.
+        if self.pos.dval != self.internal.ldvl {
+            if self.conv.set && !self.conv.igset {
+                self.plan_absolute_move(effects);
+            }
             return;
         }
-        // C tweak section (2167-2181) + move block: the fold lands in
-        // VAL/DVAL on this pass and the move block dispatches it, like
-        // the Twf/Twr arm.
-        if self.collect_tweak() {
-            self.plan_absolute_move(effects);
-        }
+        // C SYNC arm (2540-2544): chain end, idle and done.
+        self.apply_latent_sync();
     }
 
     /// Start homing.

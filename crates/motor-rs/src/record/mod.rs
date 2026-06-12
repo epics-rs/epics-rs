@@ -397,6 +397,58 @@ impl Record for MotorRecord {
     fn monitor_deadband_value(&self) -> Option<EpicsValue> {
         Some(EpicsValue::Double(self.pos.rbv))
     }
+
+    /// C `alarm_sub()` (motorRecord.cc:3367-3406) — motor-specific alarm
+    /// severities, raised into `nsta`/`nsev` before the framework's
+    /// `evaluate_alarms`.
+    fn check_alarms(&mut self, common: &mut epics_base_rs::server::record::CommonFields) {
+        use epics_base_rs::server::recgbl::{alarm_status, rec_gbl_set_sevr};
+        use epics_base_rs::server::record::AlarmSeverity;
+
+        // C 3372-3376: an undefined VAL short-circuits every other check.
+        if common.udf {
+            rec_gbl_set_sevr(common, alarm_status::UDF_ALARM, AlarmSeverity::Invalid);
+            return;
+        }
+
+        // C 3379-3388: limit-switch and soft-limit violations. BOTH the
+        // high and low arms gate on HLSV and raise at HLSV — motorRecord
+        // has no low-side severity field. Limit switches count even when
+        // not in the direction of travel (externally triggered move),
+        // and a DVAL outside the dial soft limits alarms too.
+        let hlsv = AlarmSeverity::from_u16(self.limits.hlsv as u16);
+        if hlsv != AlarmSeverity::NoAlarm {
+            if self.limits.hls || self.pos.dval > self.limits.dhlm {
+                rec_gbl_set_sevr(common, alarm_status::HIGH_ALARM, hlsv);
+                return;
+            }
+            if self.limits.lls || self.pos.dval < self.limits.dllm {
+                rec_gbl_set_sevr(common, alarm_status::LOW_ALARM, hlsv);
+                return;
+            }
+        }
+
+        // C 3392-3398: controller communication error — COMM/INVALID,
+        // and the MSTA bit is CLEARED (C `msta.Bits.CNTRL_COMM_ERR = 0`
+        // + `MARK(M_MSTA)`) so the alarm is one-shot until the driver
+        // re-reports it. The framework builds the monitor snapshot after
+        // this hook, so the cleared MSTA posts in the same cycle.
+        if self.stat.msta.contains(MstaFlags::COMM_ERR) {
+            self.stat.msta.remove(MstaFlags::COMM_ERR);
+            rec_gbl_set_sevr(common, alarm_status::COMM_ALARM, AlarmSeverity::Invalid);
+        }
+
+        // C 3400-3403: slip/stall or controller problem → STATE/MAJOR.
+        // No early return above COMM — C falls through from the comm
+        // check, so both can accumulate (set_sevr keeps the higher).
+        if self
+            .stat
+            .msta
+            .intersects(MstaFlags::SLIP_STALL | MstaFlags::PROBLEM)
+        {
+            rec_gbl_set_sevr(common, alarm_status::STATE_ALARM, AlarmSeverity::Major);
+        }
+    }
 }
 
 #[cfg(test)]

@@ -4781,3 +4781,171 @@ fn test_mlst_alst_writable_by_framework_deadband_owner() {
     assert_eq!(rec.get_field("MLST"), Some(EpicsValue::Double(3.5)));
     assert_eq!(rec.get_field("ALST"), Some(EpicsValue::Double(4.5)));
 }
+
+// C alarm_sub (motorRecord.cc:3367-3406) ported as the Record::check_alarms
+// hook. One test per C arm/boundary.
+mod alarm_sub {
+    use super::*;
+    use epics_base_rs::server::recgbl::alarm_status;
+    use epics_base_rs::server::record::{AlarmSeverity, CommonFields};
+
+    fn common() -> CommonFields {
+        CommonFields {
+            udf: false,
+            ..Default::default()
+        }
+    }
+
+    // C 3372-3376: UDF raises UDF_ALARM/INVALID and short-circuits the
+    // limit checks — even with a limit switch active.
+    #[test]
+    fn udf_short_circuits_all_other_alarms() {
+        let mut rec = MotorRecord::new();
+        rec.limits.hlsv = 2; // MAJOR
+        rec.limits.hls = true;
+        let mut c = common();
+        c.udf = true;
+        rec.check_alarms(&mut c);
+        assert_eq!(c.nsta, alarm_status::UDF_ALARM);
+        assert_eq!(c.nsev, AlarmSeverity::Invalid);
+    }
+
+    // C 3379-3383: HLS at HLSV severity.
+    #[test]
+    fn hls_raises_high_alarm_at_hlsv() {
+        let mut rec = MotorRecord::new();
+        rec.limits.hlsv = 2; // MAJOR
+        rec.limits.hls = true;
+        let mut c = common();
+        rec.check_alarms(&mut c);
+        assert_eq!(c.nsta, alarm_status::HIGH_ALARM);
+        assert_eq!(c.nsev, AlarmSeverity::Major);
+    }
+
+    // C 3379: dval STRICTLY above DHLM trips the soft-limit arm; exactly
+    // at the limit does not.
+    #[test]
+    fn dval_above_dhlm_raises_high_alarm_but_at_limit_does_not() {
+        let mut rec = MotorRecord::new();
+        rec.limits.hlsv = 1; // MINOR
+        rec.limits.dhlm = 10.0;
+        rec.limits.dllm = -10.0;
+        rec.pos.dval = 10.0;
+        let mut c = common();
+        rec.check_alarms(&mut c);
+        assert_eq!(
+            c.nsta,
+            alarm_status::NO_ALARM,
+            "dval == dhlm must not alarm"
+        );
+
+        rec.pos.dval = 10.5;
+        let mut c = common();
+        rec.check_alarms(&mut c);
+        assert_eq!(c.nsta, alarm_status::HIGH_ALARM);
+        assert_eq!(c.nsev, AlarmSeverity::Minor);
+    }
+
+    // C 3384-3388: the LOW arm gates on (and raises at) HLSV too — the
+    // motor record has no low-side severity field.
+    #[test]
+    fn lls_raises_low_alarm_at_hlsv() {
+        let mut rec = MotorRecord::new();
+        rec.limits.hlsv = 3; // INVALID
+        rec.limits.lls = true;
+        let mut c = common();
+        rec.check_alarms(&mut c);
+        assert_eq!(c.nsta, alarm_status::LOW_ALARM);
+        assert_eq!(c.nsev, AlarmSeverity::Invalid);
+    }
+
+    #[test]
+    fn dval_below_dllm_raises_low_alarm() {
+        let mut rec = MotorRecord::new();
+        rec.limits.hlsv = 2;
+        rec.limits.dhlm = 10.0;
+        rec.limits.dllm = -10.0;
+        rec.pos.dval = -10.5;
+        let mut c = common();
+        rec.check_alarms(&mut c);
+        assert_eq!(c.nsta, alarm_status::LOW_ALARM);
+        assert_eq!(c.nsev, AlarmSeverity::Major);
+    }
+
+    // C: `if (pmr->hlsv && ...)` — HLSV=NO_ALARM disables both limit arms.
+    #[test]
+    fn hlsv_no_alarm_gates_limit_alarms_off() {
+        let mut rec = MotorRecord::new();
+        rec.limits.hlsv = 0;
+        rec.limits.hls = true;
+        rec.limits.lls = true;
+        let mut c = common();
+        rec.check_alarms(&mut c);
+        assert_eq!(c.nsta, alarm_status::NO_ALARM);
+        assert_eq!(c.nsev, AlarmSeverity::NoAlarm);
+    }
+
+    // C 3392-3398: CNTRL_COMM_ERR raises COMM/INVALID and CLEARS the MSTA
+    // bit (one-shot until the driver re-reports).
+    #[test]
+    fn comm_err_raises_comm_invalid_and_clears_msta_bit() {
+        let mut rec = MotorRecord::new();
+        rec.stat.msta = MstaFlags::COMM_ERR | MstaFlags::DONE;
+        let mut c = common();
+        rec.check_alarms(&mut c);
+        assert_eq!(c.nsta, alarm_status::COMM_ALARM);
+        assert_eq!(c.nsev, AlarmSeverity::Invalid);
+        assert!(
+            !rec.stat.msta.contains(MstaFlags::COMM_ERR),
+            "C clears msta.Bits.CNTRL_COMM_ERR after raising the alarm"
+        );
+        assert!(rec.stat.msta.contains(MstaFlags::DONE), "other bits kept");
+
+        // Second pass without a driver re-report: no comm alarm.
+        let mut c2 = common();
+        rec.check_alarms(&mut c2);
+        assert_eq!(c2.nsta, alarm_status::NO_ALARM);
+    }
+
+    // C 3400-3403: EA_SLIP_STALL or RA_PROBLEM → STATE/MAJOR.
+    #[test]
+    fn slip_stall_or_problem_raises_state_major() {
+        for bit in [MstaFlags::SLIP_STALL, MstaFlags::PROBLEM] {
+            let mut rec = MotorRecord::new();
+            rec.stat.msta = bit;
+            let mut c = common();
+            rec.check_alarms(&mut c);
+            assert_eq!(c.nsta, alarm_status::STATE_ALARM, "{bit:?}");
+            assert_eq!(c.nsev, AlarmSeverity::Major, "{bit:?}");
+        }
+    }
+
+    // C falls through from the comm check to the slip/stall check;
+    // recGblSetSevr keeps the higher severity, so COMM/INVALID wins.
+    #[test]
+    fn comm_err_and_problem_accumulate_comm_invalid_wins() {
+        let mut rec = MotorRecord::new();
+        rec.stat.msta = MstaFlags::COMM_ERR | MstaFlags::PROBLEM;
+        let mut c = common();
+        rec.check_alarms(&mut c);
+        assert_eq!(c.nsta, alarm_status::COMM_ALARM);
+        assert_eq!(c.nsev, AlarmSeverity::Invalid);
+    }
+
+    // C 3379-3388: an active limit switch outranks a comm/state alarm —
+    // the limit arms return early.
+    #[test]
+    fn limit_switch_arm_returns_before_msta_checks() {
+        let mut rec = MotorRecord::new();
+        rec.limits.hlsv = 2;
+        rec.limits.hls = true;
+        rec.stat.msta = MstaFlags::COMM_ERR;
+        let mut c = common();
+        rec.check_alarms(&mut c);
+        assert_eq!(c.nsta, alarm_status::HIGH_ALARM);
+        assert!(
+            rec.stat.msta.contains(MstaFlags::COMM_ERR),
+            "early return must leave the comm bit for the next pass"
+        );
+    }
+}

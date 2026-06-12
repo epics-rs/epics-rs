@@ -45,7 +45,17 @@ impl Default for PositionFields {
 pub struct ConversionFields {
     pub dir: MotorDir,
     pub foff: FreezeOffset,
+    /// FOF/VOF momentary command fields (C special, motorRecord.cc:
+    /// 2975-2984): any write forces FOFF to Frozen/Variable. The cells
+    /// only echo the last written value back on reads, like the C
+    /// fields the special() handler leaves untouched.
+    pub fof: i16,
+    pub vof: i16,
     pub set: bool,
+    /// SSET/SUSE momentary command fields (C special, motorRecord.cc:
+    /// 2963-2972): any write forces SET to Set/Use mode.
+    pub sset: i16,
+    pub suse: i16,
     pub igset: bool,
     pub mres: f64,
     pub eres: f64,
@@ -73,7 +83,11 @@ impl Default for ConversionFields {
         Self {
             dir: MotorDir::Pos,
             foff: FreezeOffset::Variable,
+            fof: 0,
+            vof: 0,
             set: false,
+            sset: 0,
+            suse: 0,
             igset: false,
             mres: 1.0,
             eres: 0.0,

@@ -489,6 +489,31 @@ fn test_rlv_in_set_mode_redefines_offset_without_motion() {
 }
 
 #[test]
+fn test_sset_suse_fof_vof_momentary_commands() {
+    // C special (motorRecord.cc:2963-2984): SSET/SUSE force SET to
+    // Set/Use and FOF/VOF force FOFF to Frozen/Variable on ANY write —
+    // the handler never looks at the written value, so a 0 write
+    // triggers too.
+    let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::DONE;
+
+    rec.put_field("SSET", EpicsValue::Short(0)).unwrap();
+    assert!(rec.conv.set, "any SSET write forces SET mode");
+    rec.put_field("SUSE", EpicsValue::Short(0)).unwrap();
+    assert!(!rec.conv.set, "any SUSE write forces USE mode");
+
+    rec.put_field("FOF", EpicsValue::Short(0)).unwrap();
+    assert_eq!(rec.conv.foff, FreezeOffset::Frozen, "FOF freezes FOFF");
+    rec.put_field("VOF", EpicsValue::Short(0)).unwrap();
+    assert_eq!(rec.conv.foff, FreezeOffset::Variable, "VOF unfreezes FOFF");
+
+    // The cells echo the last written value, like the C fields the
+    // special() handler leaves untouched.
+    rec.put_field("SSET", EpicsValue::Short(7)).unwrap();
+    assert_eq!(rec.get_field("SSET"), Some(EpicsValue::Short(7)));
+}
+
+#[test]
 fn test_blocked_homf_stays_latched_and_zero_write_unlatches() {
     // C home gate (2013-2014): a HOMF blocked by its limit switch
     // simply fails the gate — the button stays latched (no clear, no

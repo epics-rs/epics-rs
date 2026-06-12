@@ -83,7 +83,27 @@ pub(crate) static FIELDS: &[FieldDesc] = &[
         read_only: false,
     },
     FieldDesc {
+        name: "FOF",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "VOF",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
         name: "SET",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SSET",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SUSE",
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
@@ -644,7 +664,11 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         // Conversion
         "DIR" => Some(EpicsValue::Short(rec.conv.dir as i16)),
         "FOFF" => Some(EpicsValue::Short(rec.conv.foff as i16)),
+        "FOF" => Some(EpicsValue::Short(rec.conv.fof)),
+        "VOF" => Some(EpicsValue::Short(rec.conv.vof)),
         "SET" => Some(EpicsValue::Short(if rec.conv.set { 1 } else { 0 })),
+        "SSET" => Some(EpicsValue::Short(rec.conv.sset)),
+        "SUSE" => Some(EpicsValue::Short(rec.conv.suse)),
         "IGSET" => Some(EpicsValue::Short(if rec.conv.igset { 1 } else { 0 })),
         "MRES" => Some(EpicsValue::Double(rec.conv.mres)),
         "ERES" => Some(EpicsValue::Double(rec.conv.eres)),
@@ -998,9 +1022,46 @@ pub(crate) fn motor_put_field(
             }
             _ => Err(CaError::TypeMismatch(name.into())),
         },
+        // C special (motorRecord.cc:2975-2984): FOF/VOF are momentary
+        // command fields — ANY write (including 0) forces FOFF to
+        // Frozen/Variable; the written value is only stored for reads.
+        "FOF" => match value {
+            EpicsValue::Short(v) => {
+                rec.conv.fof = v;
+                rec.conv.foff = FreezeOffset::Frozen;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "VOF" => match value {
+            EpicsValue::Short(v) => {
+                rec.conv.vof = v;
+                rec.conv.foff = FreezeOffset::Variable;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
         "SET" => match value {
             EpicsValue::Short(v) => {
                 rec.conv.set = v != 0;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        // C special (motorRecord.cc:2963-2972): SSET/SUSE are momentary
+        // command fields — ANY write forces SET to Set/Use mode.
+        "SSET" => match value {
+            EpicsValue::Short(v) => {
+                rec.conv.sset = v;
+                rec.conv.set = true;
+                Ok(())
+            }
+            _ => Err(CaError::TypeMismatch(name.into())),
+        },
+        "SUSE" => match value {
+            EpicsValue::Short(v) => {
+                rec.conv.suse = v;
+                rec.conv.set = false;
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),

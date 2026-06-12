@@ -13,7 +13,9 @@ fn test_default_values() {
     assert_eq!(rec.stat.mip, MipFlags::empty());
     assert_eq!(rec.ctrl.spmg, SpmgMode::Go);
     assert_eq!(rec.conv.mres, 1.0);
-    assert_eq!(rec.vel.velo, 1.0);
+    // C dbd: VELO has no initial() (0.0, like JVEL/HVEL); ACCL carries
+    // initial("0.2").
+    assert_eq!(rec.vel.velo, 0.0);
     assert_eq!(rec.vel.accl, 0.2);
     assert_eq!(rec.retry.rtry, 10);
     // C dbd LVIO has no initial() and init_record clears it before the
@@ -2565,8 +2567,9 @@ fn test_stop_field_clears_latched_buttons_while_moving() {
 fn test_accs_default_mirrors_accl() {
     let rec = MotorRecord::new();
     assert_eq!(rec.vel.accu, AccsUsed::Accl);
-    // (velo=1.0 - vbas=0.0) / accl=0.2 == 5.0
-    assert!((rec.vel.accs - 5.0).abs() < 1e-12);
+    // C dbd: ACCS has no initial() — it loads 0.0 and derives from ACCL
+    // at init ((velo=0.0 - vbas=0.0) / accl=0.2 == 0.0).
+    assert!((rec.vel.accs - 0.0).abs() < 1e-12);
 }
 
 #[test]

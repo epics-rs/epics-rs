@@ -136,16 +136,22 @@ pub struct VelocityFields {
 impl Default for VelocityFields {
     fn default() -> Self {
         Self {
-            velo: 1.0,
+            // VELO/BVEL/ACCS have no initial() in motorRecord.dbd — they
+            // load as 0.0 like JVEL/HVEL below; only ACCL ("0.2") and
+            // BACC ("0.5") carry dbd initials. The init pass derives the
+            // speed family from the configured side (S/SBAK drive
+            // VELO/BVEL when nonzero, ACCS derives from ACCL) in
+            // check_speed_and_resolution (C 3954-4067).
+            velo: 0.0,
             vbas: 0.0,
             vmax: 0.0,
             s: 0.0,
             sbas: 0.0,
             smax: 0.0,
             accl: 0.2,
-            accs: 5.0, // (velo=1.0 - vbas=0.0) / accl=0.2
+            accs: 0.0,
             accu: AccsUsed::Accl,
-            bvel: 1.0,
+            bvel: 0.0,
             bacc: 0.5,
             // JVEL/HVEL have no initial() in motorRecord.dbd — 0.0 means
             // "not configured"; init derives JVEL from VELO and HVEL from

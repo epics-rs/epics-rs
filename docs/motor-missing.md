@@ -17,15 +17,24 @@ public exhaustive enum의 variant 추가가 semver-major라서 0.19.x에서
 `SetLowLimit` variant와 `AsynMotor` 기본 구현 메서드로 닫힘. 상세는
 git log의 `feat(motor):` 커밋이 원장.
 
-## BLOCKED — 프레임워크 구조 (epics-base-rs, cross-crate)
+## ~~BLOCKED — 프레임워크 구조 (epics-base-rs, cross-crate)~~ (epics-base-rs 구조 변경으로 해제)
 
-| 항목 | C 동작 | 구조적 차단 지점 |
-|---|---|---|
-| H6 잔여 — per-field DBE mask 협폭 posting | `monitor()`이 MARK된 필드별로 `db_post_events(field, mask)` — 구독자는 필드×마스크 단위로 수신 | `epics-base-rs` `MonitorEvent`가 `{snapshot, origin}`만 운반, per-event mask 미전달 (BRIDGE-79와 동일 차단). record-wide posting mask는 유지되어 구독자는 mask 교집합 필터만 가능 |
-| H6 잔여 — alarm-only cycle posting | alarm 변화만 있는 process cycle에서 deadband 필드/MARK 필드를 `DBE_ALARM` mask로 post | 전 record type 공통의 기존 프레임워크 deviation — snapshot 단위 게시 구조에서는 alarm-only 판별이 post 지점에 없음 |
+H6 잔여 두 건 모두 epics-base-rs 구조 변경으로 이식 완료:
 
-둘 다 `MonitorEvent`에 mask를 싣는 epics-base-rs 구조 변경(BRIDGE-79
-선행 작업)이 닫는다. motor-rs 단독으로는 수정 불가.
+- `MonitorEvent`가 per-event DBE mask를 운반하고 (coalesce 시 OR 누적,
+  `DbSubscription::recv_event`로 구독측 수신 — BRIDGE-79 선행 차단
+  해제), `ProcessSnapshot.changed_fields`가 필드별 posting mask를
+  실어 C `db_post_events(field, mask)`의 per-field 협폭이 복원됨
+  (RBV: MDEL 교차 → `DBE_VALUE`, ADEL 교차 → `DBE_LOG` 독립; MARK
+  상당 필드: `DBE_VAL_LOG`).
+- alarm-only cycle posting은 `Record::alarm_cycle_monitored_fields`
+  (motor가 C `monitor()` 3513-3645의 posting list를 반환)로 닫힘 —
+  alarm 전이가 있는 패스에서 미변경 구독 필드도 `DBE_ALARM`으로 post.
+
+상세는 git log의 `feat(base):`/`feat(motor):` 커밋이 원장. BRIDGE-79
+본체(qsrv group monitor의 leaf 협폭 — `MemberEvent` 분류 +
+pvdata/encode leaf-family marking)는 bridge-rs 측 잔여 작업으로 이
+문서 범위 밖.
 
 ## OUT OF SCOPE — motor sweep 외부
 

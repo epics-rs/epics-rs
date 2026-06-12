@@ -539,3 +539,53 @@ fn jog_bl2_posts_cdir_from_scaled_stroke() {
     assert!(rec.stat.mip.contains(MipFlags::JOG_BL2));
     assert!(!rec.stat.cdir, "BL2 direction follows BDST sign (C 1020)");
 }
+
+#[test]
+fn backlash_final_leg_velocity_floored_above_vbas() {
+    // C MOVE_BL arm (motorRecord.cc:953-954): a backlash velocity that
+    // does not exceed VBAS is floored to one raw step/s above it —
+    // vbas + |mres| in EGU. C compares with <=, so equality clamps too.
+    let mut rec = make_record();
+    rec.retry.bdst = 1.0;
+    rec.vel.vbas = rec.vel.bvel; // bvel == vbas: clamp fires
+
+    rec.put_field("VAL", EpicsValue::Double(-10.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    complete_move(&mut rec, -11.0);
+    let effects = rec.check_completion();
+    assert!(rec.stat.mip.contains(MipFlags::MOVE_BL));
+    let MotorCommand::MoveAbsolute { velocity, .. } = &effects.commands[0] else {
+        panic!("expected absolute final leg, got {:?}", effects.commands);
+    };
+    assert!(
+        (*velocity - (rec.vel.vbas + 0.001)).abs() < 1e-9,
+        "bvel <= vbas floors to vbas + |mres|, got {velocity}"
+    );
+}
+
+#[test]
+fn jog_takeout_leg_velocity_floored_above_vbas() {
+    // C MIP_JOG_STOP arm (motorRecord.cc:936-937): same floor for the
+    // takeout leg, which runs at VELO.
+    let mut rec = make_record();
+    rec.retry.bdst = 2.0;
+    rec.vel.vbas = rec.vel.velo; // velo == vbas: clamp fires
+
+    rec.ctrl.jogf = true;
+    rec.plan_motion(CommandSource::Jogf);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+    rec.ctrl.jogf = false;
+    rec.plan_motion(CommandSource::Jogf);
+
+    complete_move(&mut rec, 30.0);
+    let effects = rec.check_completion();
+    assert!(rec.stat.mip.contains(MipFlags::JOG_BL1));
+    let MotorCommand::MoveAbsolute { velocity, .. } = &effects.commands[0] else {
+        panic!("expected absolute takeout leg, got {:?}", effects.commands);
+    };
+    assert!(
+        (*velocity - (rec.vel.vbas + 0.001)).abs() < 1e-9,
+        "velo <= vbas floors to vbas + |mres|, got {velocity}"
+    );
+}

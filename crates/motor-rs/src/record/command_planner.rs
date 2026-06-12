@@ -1282,6 +1282,19 @@ impl MotorRecord {
         }
     }
 
+    /// C postProcess floors a backlash-leg velocity that does not exceed
+    /// VBAS to one raw step/s above it (936-937, 953-954, 1002-1003):
+    /// raw `vel = vbase + 1` is `vbas + |mres|` in EGU. The move-block
+    /// dispatch (2240-2540) has no such clamp — postProcess legs only.
+    pub(crate) fn backlash_leg_velocity(&self, vel: f64) -> f64 {
+        let vbas = self.effective_vbas();
+        if vel <= vbas {
+            vbas + self.conv.mres.abs()
+        } else {
+            vel
+        }
+    }
+
     /// Acceleration for a jog, EGU/sec². JAR is already an EGU/sec² rate;
     /// fall back to the normal move acceleration when JAR is unset.
     pub(crate) fn jog_accel_egu(&self) -> f64 {

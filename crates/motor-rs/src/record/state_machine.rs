@@ -566,7 +566,7 @@ impl MotorRecord {
             self.stat.cdir = rel_distance / self.conv.mres >= 0.0;
             effects.commands.push(MotorCommand::MoveRelative {
                 distance: rel_distance,
-                velocity: self.vel.bvel,
+                velocity: self.backlash_leg_velocity(self.vel.bvel),
                 acceleration: self.backlash_accel_egu(),
             });
         } else {
@@ -580,7 +580,7 @@ impl MotorRecord {
             self.stat.cdir = (self.pos.dval - self.pos.drbv) / self.conv.mres >= 0.0;
             effects.commands.push(MotorCommand::MoveAbsolute {
                 position,
-                velocity: self.vel.bvel,
+                velocity: self.backlash_leg_velocity(self.vel.bvel),
                 acceleration: self.backlash_accel_egu(),
             });
         }
@@ -604,13 +604,13 @@ impl MotorRecord {
         if self.use_relative_moves() {
             effects.commands.push(MotorCommand::MoveRelative {
                 distance: pretarget - self.pos.drbv,
-                velocity: self.vel.velo,
+                velocity: self.backlash_leg_velocity(self.vel.velo),
                 acceleration: self.move_accel_egu(),
             });
         } else {
             effects.commands.push(MotorCommand::MoveAbsolute {
                 position: pretarget,
-                velocity: self.vel.velo,
+                velocity: self.backlash_leg_velocity(self.vel.velo),
                 acceleration: self.move_accel_egu(),
             });
         }
@@ -635,7 +635,7 @@ impl MotorRecord {
             self.stat.cdir = rel_distance / self.conv.mres >= 0.0;
             effects.commands.push(MotorCommand::MoveRelative {
                 distance: rel_distance,
-                velocity: self.vel.bvel,
+                velocity: self.backlash_leg_velocity(self.vel.bvel),
                 acceleration: self.backlash_accel_egu(),
             });
         } else {
@@ -646,7 +646,7 @@ impl MotorRecord {
             self.stat.cdir = (self.pos.dval - self.pos.drbv) / self.conv.mres >= 0.0;
             effects.commands.push(MotorCommand::MoveAbsolute {
                 position,
-                velocity: self.vel.bvel,
+                velocity: self.backlash_leg_velocity(self.vel.bvel),
                 acceleration: self.backlash_accel_egu(),
             });
         }

@@ -7389,6 +7389,86 @@ fn test_pid_gain_raw_store_without_gain_support() {
 }
 
 #[test]
+fn test_pid_gain_put_forwards_driver_command() {
+    // C special pidcof (3003-3026): with GAIN_SUPPORT each coefficient
+    // put builds SET_PGAIN/SET_IGAIN/SET_DGAIN with the CLAMPED value
+    // and sends it from special(); the pp pass that follows carries it.
+    let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::DONE | MstaFlags::GAIN_SUPPORT;
+    rec.put_field("PCOF", EpicsValue::Double(1.5)).unwrap();
+    rec.put_field("ICOF", EpicsValue::Double(0.3)).unwrap();
+    rec.put_field("DCOF", EpicsValue::Double(-0.5)).unwrap();
+    let effects = rec.do_process();
+    assert_eq!(
+        &effects.commands[..3],
+        &[
+            MotorCommand::SetPidGain {
+                kind: PidGainKind::Proportional,
+                gain: 1.0,
+            },
+            MotorCommand::SetPidGain {
+                kind: PidGainKind::Integral,
+                gain: 0.3,
+            },
+            MotorCommand::SetPidGain {
+                kind: PidGainKind::Derivative,
+                gain: 0.0,
+            },
+        ],
+        "put order preserved, values clamped before emission (C 3005-3017)"
+    );
+}
+
+#[test]
+fn test_pid_gain_put_no_forward_without_gain_support() {
+    // C: no GAIN_SUPPORT — no build_trans, the put is a raw store.
+    let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::DONE;
+    rec.put_field("PCOF", EpicsValue::Double(0.5)).unwrap();
+    let effects = rec.do_process();
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::SetPidGain { .. })),
+        "no SET_PGAIN without GAIN_SUPPORT"
+    );
+}
+
+#[test]
+fn test_special_cmds_drain_in_front_of_pass_commands() {
+    // C wire order: special() sends fire when the put lands, BEFORE the
+    // pp pass enters do_work — a coefficient put followed by a VAL move
+    // in the same pass puts SET_PGAIN ahead of the move on the wire.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 0.01;
+    rec.limits.dhlm = 100.0;
+    rec.limits.dllm = -100.0;
+    rec.limits.hlm = 100.0;
+    rec.limits.llm = -100.0;
+    rec.stat.msta = MstaFlags::DONE | MstaFlags::GAIN_SUPPORT;
+    rec.internal.init_invariants_synced = true;
+
+    rec.put_field("PCOF", EpicsValue::Double(0.5)).unwrap();
+    rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+    let effects = rec.do_process();
+    assert_eq!(
+        effects.commands[0],
+        MotorCommand::SetPidGain {
+            kind: PidGainKind::Proportional,
+            gain: 0.5,
+        }
+    );
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "the pass's own move follows the special() send"
+    );
+}
+
+#[test]
 fn test_mlst_alst_writable_by_framework_deadband_owner() {
     // C monitor() 3485-3501 anchors the MDEL/ADEL deadbands at the
     // last POSTED readback by writing MLST/ALST. The framework's

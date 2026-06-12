@@ -172,6 +172,10 @@ impl MotorDeviceSupport {
                     );
                     motor.set_pco_config(&user, *start, *end, *increment, *pulse_width_us)
                 }
+                MotorCommand::SetPidGain { kind, gain } => {
+                    tracing::info!("motor command: SetPidGain kind={kind:?} gain={gain}");
+                    motor.set_pid_gain(&user, *kind, *gain)
+                }
                 MotorCommand::Poll => Ok(()),
             };
 

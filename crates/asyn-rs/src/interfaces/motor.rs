@@ -76,6 +76,16 @@ impl Default for MotorStatus {
     }
 }
 
+/// Which closed-loop gain a [`AsynMotor::set_pid_gain`] call addresses.
+/// C devMotorAsyn build_trans maps SET_PGAIN/SET_IGAIN/SET_DGAIN onto
+/// the motorPGain/motorIGain/motorDGain float64 parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PidGainKind {
+    Proportional,
+    Integral,
+    Derivative,
+}
+
 /// Motor interface trait.
 ///
 /// Provides motor axis control for motor-capable drivers.
@@ -129,6 +139,14 @@ pub trait AsynMotor: Send + Sync {
 
     /// Enable or disable closed-loop control.
     fn set_closed_loop(&mut self, _user: &AsynUser, _enable: bool) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// Set a closed-loop gain coefficient (0.0 ..= 1.0, unitless — the
+    /// motor record clamps before calling; C special pidcof,
+    /// motorRecord.cc 3003-3026). Only meaningful for controllers that
+    /// report gain support.
+    fn set_pid_gain(&mut self, _user: &AsynUser, _kind: PidGainKind, _gain: f64) -> AsynResult<()> {
         Ok(())
     }
 

@@ -381,3 +381,33 @@ async fn init_does_not_reseed_controller_when_nothing_restored() {
         "controller must be untouched when nothing was restored, got {pos}"
     );
 }
+
+/// C special pidcof (motorRecord.cc:3003-3026): a PCOF put under
+/// GAIN_SUPPORT sends SET_PGAIN with the clamped value; devMotorAsyn
+/// lands it on motorPGain.
+#[tokio::test]
+async fn pid_gain_put_forward_reaches_driver() {
+    let sim = Arc::new(Mutex::new(SimMotor::new()));
+    let motor: Arc<Mutex<dyn AsynMotor>> = sim.clone();
+    let mut setup = make_builder(motor).build();
+
+    setup.device_support.init(&mut setup.record).unwrap();
+    setup.record.process().unwrap();
+    setup.device_support.write(&mut setup.record).unwrap();
+
+    // SimMotor's status does not report gain support; model a
+    // gain-capable controller the way C reads it — from MSTA.
+    setup.record.stat.msta.insert(MstaFlags::GAIN_SUPPORT);
+    setup
+        .record
+        .put_field("PCOF", EpicsValue::Double(1.5))
+        .unwrap();
+    setup.record.process().unwrap();
+    setup.device_support.write(&mut setup.record).unwrap();
+
+    assert_eq!(
+        sim.lock().unwrap().pid_gains,
+        vec![(PidGainKind::Proportional, 1.0)],
+        "clamped before emission (C 3005-3017)"
+    );
+}

@@ -1,5 +1,7 @@
 use bitflags::bitflags;
 
+pub use asyn_rs::interfaces::motor::PidGainKind;
+
 bitflags! {
     /// MIP (Motion In Progress) flags — exposed as a PV field.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -306,6 +308,13 @@ pub enum MotorCommand {
         end: f64,
         increment: f64,
         pulse_width_us: f64,
+    },
+    /// Forward a closed-loop gain coefficient (C special pidcof,
+    /// motorRecord.cc 3003-3026: GAIN_SUPPORT-gated, clamped 0.0–1.0
+    /// before emission → SET_PGAIN/SET_IGAIN/SET_DGAIN).
+    SetPidGain {
+        kind: PidGainKind,
+        gain: f64,
     },
 }
 

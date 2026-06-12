@@ -1869,12 +1869,13 @@ pub(crate) fn motor_put_field(
         // C special pidcof (3003-3026): with GAIN_SUPPORT the gain is
         // clamped to 0.0 <= gain <= 1.0 and forwarded as SET_PGAIN/
         // SET_IGAIN/SET_DGAIN; without it the write is a raw store (no
-        // clamp, no command). The driver forward is not emitted: the
-        // MotorDriver trait has no gain call (published 0.19.2 surface).
+        // clamp, no command).
         "PCOF" => match value {
             EpicsValue::Double(v) => {
                 rec.pid.pcof = if rec.stat.msta.contains(MstaFlags::GAIN_SUPPORT) {
-                    v.clamp(0.0, 1.0)
+                    let gain = v.clamp(0.0, 1.0);
+                    queue_pid_gain_forward(rec, PidGainKind::Proportional, gain);
+                    gain
                 } else {
                     v
                 };
@@ -1885,7 +1886,9 @@ pub(crate) fn motor_put_field(
         "ICOF" => match value {
             EpicsValue::Double(v) => {
                 rec.pid.icof = if rec.stat.msta.contains(MstaFlags::GAIN_SUPPORT) {
-                    v.clamp(0.0, 1.0)
+                    let gain = v.clamp(0.0, 1.0);
+                    queue_pid_gain_forward(rec, PidGainKind::Integral, gain);
+                    gain
                 } else {
                     v
                 };
@@ -1896,7 +1899,9 @@ pub(crate) fn motor_put_field(
         "DCOF" => match value {
             EpicsValue::Double(v) => {
                 rec.pid.dcof = if rec.stat.msta.contains(MstaFlags::GAIN_SUPPORT) {
-                    v.clamp(0.0, 1.0)
+                    let gain = v.clamp(0.0, 1.0);
+                    queue_pid_gain_forward(rec, PidGainKind::Derivative, gain);
+                    gain
                 } else {
                     v
                 };
@@ -2404,6 +2409,16 @@ fn detect_inverted_limits(limits: &mut LimitFields, dval: f64) {
     } else {
         limits.lvio = coordinate::check_soft_limits(dval, limits.dhlm, limits.dllm);
     }
+}
+
+/// Queue the driver forward for a PID-coefficient put (C special pidcof,
+/// motorRecord.cc 3003-3026: build_trans SET_PGAIN/SET_IGAIN/SET_DGAIN
+/// at put time). Callers gate on GAIN_SUPPORT and clamp to 0.0–1.0
+/// first, matching C's order (gate 3003, clamp 3005-3014, send 3017).
+fn queue_pid_gain_forward(rec: &mut MotorRecord, kind: PidGainKind, gain: f64) {
+    rec.internal
+        .special_cmds
+        .push(MotorCommand::SetPidGain { kind, gain });
 }
 
 /// C set_dial_highlimit (motorRecord.cc:4243-4275, fd808eb2 PR #206):

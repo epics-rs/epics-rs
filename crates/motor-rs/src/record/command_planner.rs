@@ -1961,7 +1961,16 @@ impl MotorRecord {
             self.stat.stup = if stup_fired { 2 } else { 0 };
         }
         let jvel_retune = std::mem::take(&mut self.jog_retune_pending);
+        // Driver commands queued by put handlers (C sends these from
+        // special() — pidcof 3003-3026 — which runs before the pp pass
+        // enters do_work). Spliced in FRONT of the pass's own commands
+        // to preserve C's wire order.
+        let mut special_cmds = std::mem::take(&mut self.internal.special_cmds);
         let mut effects = self.do_process_inner();
+        if !special_cmds.is_empty() {
+            special_cmds.append(&mut effects.commands);
+            effects.commands = special_cmds;
+        }
         if stup_fired {
             effects.status_refresh = true;
         }

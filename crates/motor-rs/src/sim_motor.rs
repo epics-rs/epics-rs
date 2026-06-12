@@ -1,5 +1,5 @@
 use asyn_rs::error::AsynResult;
-use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus};
+use asyn_rs::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
 use asyn_rs::user::AsynUser;
 use std::time::Instant;
 
@@ -33,6 +33,9 @@ pub struct SimMotor {
     pub pco_end: f64,
     pub pco_increment: f64,
     pub pco_pulse_width_us: f64,
+    /// PID gains forwarded by the record, in arrival order (C
+    /// devMotorAsyn motorPGain/motorIGain/motorDGain parameters).
+    pub pid_gains: Vec<(PidGainKind, f64)>,
 }
 
 impl SimMotor {
@@ -61,6 +64,7 @@ impl SimMotor {
             pco_end: 0.0,
             pco_increment: 0.0,
             pco_pulse_width_us: 0.0,
+            pid_gains: Vec::new(),
         }
     }
 
@@ -196,6 +200,11 @@ impl AsynMotor for SimMotor {
 
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
         self.closed_loop_enabled = enable;
+        Ok(())
+    }
+
+    fn set_pid_gain(&mut self, _user: &AsynUser, kind: PidGainKind, gain: f64) -> AsynResult<()> {
+        self.pid_gains.push((kind, gain));
         Ok(())
     }
 

@@ -493,4 +493,10 @@ pub struct InternalFields {
     /// GET_INFO (C 2546 gates on `proc_ind == NOTHING_DONE`). Set by
     /// `determine_event`, consumed at `do_process_inner` entry.
     pub idle_status_pass: bool,
+    /// Driver commands a put queued at special() time (C sends them
+    /// from special() before the pp pass runs do_work: pidcof
+    /// 3003-3026). Every motor put is followed by a process pass;
+    /// `do_process` drains this buffer in front of the pass's own
+    /// commands, preserving C's emission order.
+    pub special_cmds: Vec<crate::flags::MotorCommand>,
 }

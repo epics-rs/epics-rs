@@ -141,6 +141,13 @@ impl MotorRecord {
                             | CommandSource::Rval
                     )
                 {
+                    // C 1994-2007: the closed-loop else bypasses only the
+                    // collection sections — the pass still falls through
+                    // to the move block / chain end, so a put that
+                    // dispatched nothing fires the implicit GET_INFO
+                    // (2546). The collection skips its sections under
+                    // closed loop on its own.
+                    self.dispatch_latent_collection(&mut effects, true);
                     return effects;
                 }
                 if !self.can_accept_command() {
@@ -412,7 +419,15 @@ impl MotorRecord {
                     } else {
                         self.ctrl.jogf = false;
                     }
-                    self.start_jog(forward, &mut effects);
+                    if !self.start_jog(forward, &mut effects) {
+                        // C special (3042-3053): a hardware-blocked
+                        // direction never arms MIP_JOG_REQ, so the put
+                        // pass skips the jog section and falls through
+                        // to the do_work chain end (implicit GET_INFO,
+                        // 2546). The button stays latched for the
+                        // latent collection.
+                        self.dispatch_latent_collection(&mut effects, true);
+                    }
                 } else if matches!(self.internal.queued_motion, Some(QueuedMotion::Jog { .. })) {
                     // C 2148-2155 on a queued jog (mip = JOGF|STOP): the
                     // release pass takes the stop-jogging branch — the
@@ -426,10 +441,14 @@ impl MotorRecord {
                     self.stat.mip.insert(MipFlags::JOG_STOP);
                 } else if self.stat.mip.intersects(MipFlags::JOGF | MipFlags::JOGR) {
                     self.stop_jog(&mut effects);
+                } else {
+                    // C: a release pass with no jog in MIP matches no jog
+                    // branch — an idle release falls through to the chain
+                    // end (implicit GET_INFO, 2546); a decelerating
+                    // release returns at 2160-2161, reproduced by the
+                    // collection's dmov gate.
+                    self.dispatch_latent_collection(&mut effects, true);
                 }
-                // else: C 2148 gate — no jog in MIP (idle, or already
-                // decelerating with the bits dropped), the release is a
-                // no-op.
             }
             CommandSource::Homf | CommandSource::Homr => {
                 // C home-section entry gate (2013-2014) acts on the
@@ -439,6 +458,14 @@ impl MotorRecord {
                 // through the section without touching it).
                 if let Some(forward) = self.latent_home_request() {
                     self.start_home(forward, &mut effects);
+                } else {
+                    // C: the failed gate (blocked, already homing, or a
+                    // button release) skips the section and the pass
+                    // falls through to the chain end (implicit GET_INFO,
+                    // 2546). A homing-in-progress pass is consumed by
+                    // the move block instead (!dmov) — the collection's
+                    // dmov gate reproduces that.
+                    self.dispatch_latent_collection(&mut effects, true);
                 }
             }
             CommandSource::Twf | CommandSource::Twr => {
@@ -473,6 +500,13 @@ impl MotorRecord {
                         enable: self.ctrl.cnen,
                     });
                 }
+                // C: CNEN is pp(TRUE) and special() owns the torque send,
+                // so the process pass it triggers runs the full do_work —
+                // the sections act on latched button state and the chain
+                // end fires the implicit GET_INFO (2546) when nothing
+                // dispatches. Runs regardless of GAIN_SUPPORT (the pp
+                // pass is unconditional in C).
+                self.dispatch_latent_collection(&mut effects, true);
             }
             CommandSource::PcoEnable => {
                 // C: 05b25c1d (PR #248) — push the latched PCO configuration
@@ -855,7 +889,12 @@ impl MotorRecord {
     }
 
     /// Start jogging.
-    fn start_jog(&mut self, forward: bool, effects: &mut ProcessEffects) {
+    /// Returns true when the pass was consumed in-section like C's jog
+    /// section returns (dispatch, queue-behind-stop, or the soft-limit
+    /// refusal at 2092-2104); false only for the hardware-blocked
+    /// direction, which C never arms (special 3042-3053) — that put
+    /// pass falls through to the do_work chain end.
+    fn start_jog(&mut self, forward: bool, effects: &mut ProcessEffects) -> bool {
         // C: if motor is moving, stop first then queue jog for after stop.
         // C 2106-2113: the dispatch consumes MIP_JOG_REQ wholesale (mip =
         // MIP_JOGF/JOGR) and the movn branch ORs in MIP_STOP, so a queued
@@ -878,7 +917,7 @@ impl MotorRecord {
                 acceleration: self.move_accel_egu(),
             });
             effects.request_poll = true;
-            return;
+            return true;
         }
 
         let dir = if forward {
@@ -887,7 +926,7 @@ impl MotorRecord {
             MotionDirection::Negative
         };
         if self.is_blocked_by_hw_limit(dir) {
-            return;
+            return false;
         }
 
         // C: 9e5b5432 PR #99 — refuse a jog command that would push past a
@@ -906,7 +945,8 @@ impl MotorRecord {
             // button: JOG_REQ set means a latched, undispatched request.
             self.stat.mip.remove(MipFlags::JOG_REQ);
             self.limits.lvio = true;
-            return;
+            // C 2104: the refusal returns in-section — pass consumed.
+            return true;
         }
 
         self.stat.dmov = false;
@@ -921,6 +961,8 @@ impl MotorRecord {
         }
         self.set_phase(MotionPhase::Jog);
         self.emit_jog(forward, effects);
+        // C 2146: the jog dispatch returns in-section — pass consumed.
+        true
     }
 
     /// Dispatch the jog velocity command — the single owner of the
@@ -1384,15 +1426,21 @@ impl MotorRecord {
                     if self.stat.mip == MipFlags::STOP {
                         self.stat.mip = MipFlags::empty();
                     }
-                    // C 2455 dispatch gate: only mip == MIP_DONE or
-                    // MIP_RETRY may issue the move. A queued jog/home
-                    // (JOGF|STOP, HOMF|STOP) keeps its direction bits, so
-                    // it is NOT re-dispatched here — it replays at stop
-                    // completion exactly as before.
-                    if (self.stat.mip.is_empty() || self.stat.mip == MipFlags::RETRY)
-                        && (!self.stat.dmov || self.pos.dval != self.internal.ldvl)
-                    {
+                    // C move-block entry (2241): `dval != ldvl || !dmov`
+                    // consumes the pass whether or not the inner 2455
+                    // gate (`mip == MIP_DONE || MIP_RETRY`) dispatches —
+                    // a queued jog/home (JOGF|STOP, HOMF|STOP) keeps its
+                    // direction bits and is NOT re-dispatched here; it
+                    // replays at stop completion exactly as before.
+                    let entry = !self.stat.dmov || self.pos.dval != self.internal.ldvl;
+                    if entry && (self.stat.mip.is_empty() || self.stat.mip == MipFlags::RETRY) {
                         self.plan_absolute_move(effects);
+                    }
+                    if !entry {
+                        // C chain end (2540/2546): a Go pass the move
+                        // block did not consume applies a latched SYNC
+                        // or fires the implicit GET_INFO.
+                        self.dispatch_latent_collection(effects, true);
                     }
                 }
             }
@@ -1414,14 +1462,12 @@ impl MotorRecord {
                     self.start_home(forward, effects);
                 } else if !self.stat.dmov || self.pos.dval != self.internal.ldvl {
                     self.plan_absolute_move(effects);
+                } else {
+                    // C chain end (2540/2546), as in the Go branch.
+                    self.dispatch_latent_collection(effects, true);
                 }
             }
         }
-        // C 2540-2544: a Go/Move pass that resumed nothing reaches the
-        // do_work chain end, where a SYNC latched under Stop/Pause
-        // applies. The internal gates refuse while a resume is in flight
-        // (phase left Idle) — the latch then consumes at its completion.
-        self.apply_latent_sync();
     }
 
     /// Helper to emit either MoveRelative or MoveAbsolute.

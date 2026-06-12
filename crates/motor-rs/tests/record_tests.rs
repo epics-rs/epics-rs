@@ -1656,6 +1656,216 @@ fn test_idle_status_pass_blocks_implicit_get_info() {
 }
 
 #[test]
+fn test_cnen_put_pass_fires_implicit_get_info() {
+    // C: CNEN is special(SPC_MOD) + pp(TRUE) — special() owns the torque
+    // send (3029-3040, GAIN_SUPPORT gated) and the pp pass runs the full
+    // do_work, where nothing dispatches and the chain end fires the
+    // implicit GET_INFO (2546-2557). The refresh comes from the pass,
+    // not from gain support.
+    let mut rec = MotorRecord::new();
+    rec.set_device_state(motor_rs::device_state::new_shared_state());
+
+    // Without GAIN_SUPPORT: no torque command, the refresh still fires.
+    rec.put_field("CNEN", EpicsValue::Short(1)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Cnen);
+    assert!(
+        effects.commands.is_empty(),
+        "no torque send without GAIN_SUPPORT"
+    );
+    assert!(
+        effects.status_refresh,
+        "implicit GET_INFO fires on the CNEN put pass"
+    );
+    assert_eq!(rec.stat.stup, 2);
+
+    // With GAIN_SUPPORT: the torque command plus the same refresh.
+    rec.stat.stup = 0; // data callback acked the previous request
+    rec.stat.msta.insert(MstaFlags::GAIN_SUPPORT);
+    rec.put_field("CNEN", EpicsValue::Short(0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Cnen);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::SetClosedLoop { enable: false }))
+    );
+    assert!(effects.status_refresh);
+    assert_eq!(rec.stat.stup, 2);
+}
+
+#[test]
+fn test_spmg_noop_go_flip_fires_implicit_get_info() {
+    // C: SPMG is pp(TRUE). A Pause pass returns inside the top block
+    // (1898-1911) — consumed, no implicit GET_INFO. A Go written back
+    // on an idle in-position axis collapses the bare MIP_STOP, fails
+    // the move-block entry (2241: dval == ldvl && dmov) and falls to
+    // the chain end — the implicit GET_INFO fires.
+    let mut rec = MotorRecord::new();
+    rec.set_device_state(motor_rs::device_state::new_shared_state());
+
+    rec.ctrl.spmg = SpmgMode::Pause;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Stop { .. })),
+        "Pause sends the just-in-case stop"
+    );
+    assert!(
+        !effects.status_refresh,
+        "Pause pass is consumed in the top block"
+    );
+    assert_eq!(rec.stat.stup, 0);
+
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(effects.commands.is_empty(), "nothing to resume");
+    assert!(
+        effects.status_refresh,
+        "no-op Go flip falls to the chain end"
+    );
+    assert_eq!(rec.stat.stup, 2);
+}
+
+#[test]
+fn test_blocked_home_put_fires_implicit_get_info_button_stays() {
+    // C: the home-section entry gate (2013-2014) fails for a direction
+    // blocked by its limit switch — the pass falls through the section
+    // to the chain end (implicit GET_INFO) and the button stays latched.
+    let mut rec = MotorRecord::new();
+    rec.set_device_state(motor_rs::device_state::new_shared_state());
+
+    rec.limits.hls = true;
+    rec.put_field("HOMF", EpicsValue::Short(1)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Homf);
+    assert!(
+        effects.commands.is_empty(),
+        "blocked home dispatches nothing"
+    );
+    assert!(
+        effects.status_refresh,
+        "the unconsumed pass falls to the chain end"
+    );
+    assert!(rec.ctrl.homf, "button stays latched");
+    assert_eq!(rec.stat.mip, MipFlags::empty());
+}
+
+#[test]
+fn test_idle_jog_release_fires_implicit_get_info() {
+    // C: a JOGF=0 release on an idle axis matches no jog branch (no
+    // MIP_JOGF/JOGR, no queued jog) — the pass falls through to the
+    // chain end (2546).
+    let mut rec = MotorRecord::new();
+    rec.set_device_state(motor_rs::device_state::new_shared_state());
+
+    rec.put_field("JOGF", EpicsValue::Short(0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Jogf);
+    assert!(effects.commands.is_empty());
+    assert!(
+        effects.status_refresh,
+        "idle release falls to the chain end"
+    );
+    assert_eq!(rec.stat.stup, 2);
+}
+
+#[test]
+fn test_hw_blocked_jog_fires_implicit_get_info_button_stays() {
+    // C special (3042-3053): a hardware-blocked direction never arms
+    // MIP_JOG_REQ, so the put pass skips the jog section and falls to
+    // the chain end; the button stays latched for the latent collection.
+    let mut rec = MotorRecord::new();
+    rec.set_device_state(motor_rs::device_state::new_shared_state());
+
+    rec.limits.hls = true;
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Jogf);
+    assert!(
+        effects.commands.is_empty(),
+        "blocked jog dispatches nothing"
+    );
+    assert!(effects.status_refresh);
+    assert!(rec.ctrl.jogf, "button stays latched");
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+}
+
+#[test]
+fn test_lvio_refused_jog_consumes_pass_no_get_info() {
+    // C 2092-2104: the soft-limit jog refusal returns IN-SECTION — the
+    // pass is consumed (buttons released, LVIO raised) and never
+    // reaches the implicit GET_INFO arm.
+    let mut rec = MotorRecord::new();
+    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    rec.limits.dhlm = 10.0;
+    rec.limits.dllm = -10.0;
+    rec.limits.hlm = 10.0;
+    rec.limits.llm = -10.0;
+    rec.vel.jvel = 5.0;
+    rec.pos.val = 8.0; // 8.0 > HLM - JVEL = 5.0: forward jog violates
+
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Jogf);
+    assert!(effects.commands.is_empty());
+    assert!(
+        !effects.status_refresh,
+        "in-section refusal consumes the pass"
+    );
+    assert!(!rec.ctrl.jogf, "refusal releases the buttons");
+    assert!(rec.limits.lvio);
+    assert_eq!(rec.stat.stup, 0);
+}
+
+#[test]
+fn test_go_resume_dispatch_consumes_pass_no_get_info() {
+    // C: a Go pass the move block consumes (entry true, dispatch at
+    // 2455) never reaches the chain end — no implicit GET_INFO.
+    let mut rec = MotorRecord::new();
+    rec.set_device_state(motor_rs::device_state::new_shared_state());
+
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.plan_motion(CommandSource::Spmg);
+    // Target parked while paused (stop_or_pause returns before the
+    // move block).
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "Go resumes the parked move"
+    );
+    assert!(
+        !effects.status_refresh,
+        "consumed pass: no implicit GET_INFO"
+    );
+    assert_eq!(rec.stat.stup, 0);
+}
+
+#[test]
+fn test_closed_loop_button_put_fires_implicit_get_info() {
+    // C 1994-2007: the closed-loop else bypasses only the collection
+    // sections (2008-2198); the pass still falls through to the chain
+    // end, so a button put that dispatched nothing fires the implicit
+    // GET_INFO while the button stays latched for an OMSL flip.
+    let mut rec = MotorRecord::new();
+    rec.set_device_state(motor_rs::device_state::new_shared_state());
+    rec.links.omsl = 1;
+    rec.links.dol = "setpoint_src.VAL".to_string();
+
+    rec.put_field("JOGF", EpicsValue::Short(1)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Jogf);
+    assert!(effects.commands.is_empty(), "no jog under closed loop");
+    assert!(
+        effects.status_refresh,
+        "the bypassed pass still reaches the chain end"
+    );
+    assert!(rec.ctrl.jogf, "button stays latched");
+    assert_eq!(rec.stat.stup, 2);
+}
+
+#[test]
 fn test_stup_busy_ack_callback_skips_completion() {
     use asyn_rs::interfaces::motor::MotorStatus;
     // C 1345: the data callback that acknowledges a BUSY STUP takes

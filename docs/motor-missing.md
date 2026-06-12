@@ -61,9 +61,12 @@ Major bump 시점에 `MotorCommand::SetPidGain { which, gain }` /
   no-op put/scan pass(`None` arm, `put_pass=true`)가 chain end에서
   STUP→BUSY + status refresh를 발화하고, CALLBACK_DATA pass는
   process_reason 판별자(`internal.idle_status_pass`)로 제외되어 C와
-  동일한 poll-feedback 방지를 가진다. 잔여 micro-deviation:
-  plan_motion이 직접 처리하는 housekeeping put pass(CNEN, SET 전환,
-  PCO config 등 last_write를 세우는 put)는 chain end로 떨어지지 않아
-  그 pass에서는 암묵 GET_INFO가 생략됨 — C는 같은 pass에서 발화.
-  해당 arm 대부분이 자체적으로 poll을 요청하므로 refresh 목적은
-  동일하게 달성되고, STUP 상태 전이만 생략된다.
+  동일한 poll-feedback 방지를 가진다. housekeeping put pass도 이식
+  완료: plan_motion의 CNEN/SPMG arm과 jog/home/closed-loop의
+  미소비(unconsumed) leg가 C do_work의 in-block return 구조 그대로
+  chain end로 떨어져 같은 pass에서 암묵 GET_INFO를 발화한다 (소비된
+  pass — 이동 dispatch, soft-limit 거부, Stop/Pause top block — 는
+  C의 return(OK)처럼 발화하지 않음). 남은 생략은 C dbd에 pp가 없어
+  process pass 자체가 존재하지 않는 필드(PCOF/ICOF/DCOF, SET,
+  SSET/SUSE, FOFF)와 C dbd에 없는 Rust 확장 PCO 필드뿐 — C도 해당
+  put에서 pass를 돌지 않으므로 deviation이 아니다.

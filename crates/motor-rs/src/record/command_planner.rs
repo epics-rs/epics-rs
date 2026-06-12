@@ -501,7 +501,10 @@ impl MotorRecord {
         if !self.stat.mip.contains(MipFlags::RETRY) {
             self.retry.rcnt = 0;
         }
-        self.retry.miss = false;
+        // MISS is not cleared at dispatch: C touches it only inside
+        // maybeRetry (1072 set, 1092 clear), so a latched miss stays
+        // visible through the next move until its evaluation lands
+        // close enough.
 
         // tdir reflects the actual first-command direction
         self.stat.tdir = move_target > self.pos.drbv;

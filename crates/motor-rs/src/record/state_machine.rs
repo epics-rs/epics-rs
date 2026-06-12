@@ -489,20 +489,25 @@ impl MotorRecord {
         // (`rcnt < rtry` here); C `maybeRetry` has NO `rdbd > 0`
         // condition — RDBD is kept >= |MRES| by `enforceMinRetryDeadband`,
         // and when RDBD is 0 `fabs(diff) >= 0` is trivially true.
-        if diff >= self.retry.rdbd && self.retry.rcnt < self.retry.rtry && !ls_blocks_retry {
+        if diff >= self.retry.rdbd && !ls_blocks_retry && self.retry.rtry != 0 {
+            if self.retry.rcnt >= self.retry.rtry {
+                // C 1059-1073: too many retries — give up and latch MISS
+                // (1072). The retry branches below never touch miss.
+                self.retry.miss = true;
+                self.finalize_motion(effects);
+                return;
+            }
             if self.retry.rmod == RetryMode::InPosition {
                 // C RMOD_I (motorRecord.cc:1432-1438): no move is
                 // re-issued — re-arm the delay and let the servo settle,
                 // counting the cycle against RTRY.
                 self.retry.rcnt += 1;
-                self.retry.miss = false;
                 self.stat.mip = MipFlags::RETRY;
                 self.finalize_or_delay(effects);
                 return;
             }
 
             self.retry.rcnt += 1;
-            self.retry.miss = false;
             self.set_phase(MotionPhase::Retry);
             self.stat.mip = MipFlags::RETRY;
 
@@ -531,11 +536,12 @@ impl MotorRecord {
             }
             effects.request_poll = true;
         } else {
-            // C `maybeRetry`: MISS latches when the axis finalizes with
-            // `fabs(diff) >= rdbd` (retries exhausted / disabled but not
-            // in position). Boundary-inclusive, matching C line 1049.
-            if diff >= self.retry.rdbd {
-                self.retry.miss = true;
+            // Close enough, LS-blocked, or RTRY disabled. C maybeRetry:
+            // the close-enough/LS-blocked else-branch clears MISS
+            // (1083-1092); the rtry==0 branch (1054-1056) leaves it
+            // untouched — retry-disabled never latches a miss.
+            if diff < self.retry.rdbd || ls_blocks_retry {
+                self.retry.miss = false;
             }
             self.finalize_motion(effects);
         }

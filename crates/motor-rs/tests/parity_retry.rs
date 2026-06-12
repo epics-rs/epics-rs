@@ -182,11 +182,16 @@ fn rcnt_increments_and_resets() {
     assert!(rec.retry.miss);
     assert!(rec.stat.dmov);
 
-    // New move resets RCNT
+    // New move resets RCNT; MISS stays latched through the dispatch —
+    // C touches miss only inside maybeRetry (1072 set, 1092 clear) —
+    // and clears when the new move lands close enough.
     rec.pos.dval = 20.0;
     rec.plan_motion(CommandSource::Val);
     assert_eq!(rec.retry.rcnt, 0);
-    assert!(!rec.retry.miss);
+    assert!(rec.retry.miss, "dispatch must not clear MISS");
+    complete_move(&mut rec, 20.0);
+    rec.check_completion();
+    assert!(!rec.retry.miss, "close-enough evaluation clears MISS");
 }
 
 /// BUG 4 regression: the retry deadband comparison must be
@@ -229,7 +234,7 @@ fn retry_fires_when_diff_exactly_equals_rdbd() {
 fn miss_latches_when_diff_exactly_equals_rdbd_at_exhaustion() {
     let mut rec = make_record();
     rec.retry.rdbd = 0.25;
-    rec.retry.rtry = 0; // retry disabled — finalize immediately
+    rec.retry.rtry = 1;
     rec.retry.rmod = RetryMode::Default;
 
     // Exactly representable: diff = 0.5 - 0.25 == 0.25 == rdbd.
@@ -237,15 +242,16 @@ fn miss_latches_when_diff_exactly_equals_rdbd_at_exhaustion() {
     rec.plan_motion(CommandSource::Val);
 
     complete_move(&mut rec, 0.25);
+    rec.retry.rcnt = 1; // retries exhausted (C ++rcnt > rtry)
     let diff = (rec.pos.dval - rec.pos.drbv).abs();
     assert_eq!(diff, rec.retry.rdbd, "test setup: diff must equal rdbd");
 
     let _effects = rec.check_completion();
 
-    assert!(rec.stat.dmov, "axis finalizes (retry disabled)");
+    assert!(rec.stat.dmov, "axis finalizes (retries exhausted)");
     assert!(
         rec.retry.miss,
-        "MISS must latch at diff == rdbd on finalize (C uses >=)"
+        "MISS must latch at diff == rdbd on exhaustion (C uses >=)"
     );
 }
 

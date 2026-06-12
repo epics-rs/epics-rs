@@ -5487,3 +5487,108 @@ mod retry_after_dly_settle {
         assert_eq!(rec.retry.rcnt, 1);
     }
 }
+
+// =============================================================================
+// MISS semantics — C maybeRetry is the only writer (1072 set, 1092 clear):
+// rtry==0 leaves miss untouched, LS-blocked/close-enough clear it, dispatch
+// never touches it
+// =============================================================================
+
+mod miss_semantics {
+    use super::*;
+
+    fn completed_short(rec: &mut MotorRecord) {
+        rec.stat.msta = MstaFlags::DONE;
+        rec.stat.phase = MotionPhase::MainMove;
+        rec.conv.mres = 0.001;
+        rec.retry.rdbd = 0.1;
+        rec.pos.dval = 10.0;
+        rec.pos.drbv = 9.5; // diff = 0.5 >= rdbd
+    }
+
+    // C 1054-1056: rtry == 0 disables retry — mip collapses, miss untouched.
+    #[test]
+    fn rtry_zero_does_not_latch_miss() {
+        let mut rec = MotorRecord::new();
+        completed_short(&mut rec);
+        rec.retry.rtry = 0;
+        rec.check_completion();
+        assert_eq!(rec.stat.phase, MotionPhase::Idle);
+        assert!(!rec.retry.miss, "rtry==0 must not latch MISS");
+    }
+
+    // C 1054-1056: untouched also means a previously latched miss survives.
+    #[test]
+    fn rtry_zero_preserves_latched_miss() {
+        let mut rec = MotorRecord::new();
+        completed_short(&mut rec);
+        rec.retry.rtry = 0;
+        rec.retry.miss = true;
+        rec.check_completion();
+        assert!(rec.retry.miss, "rtry==0 leaves a latched MISS in place");
+    }
+
+    // C 1049 + 1083-1092: a limit switch in the commanded direction routes
+    // the evaluation into the close-enough branch, which CLEARS miss.
+    #[test]
+    fn ls_blocked_clears_miss() {
+        let mut rec = MotorRecord::new();
+        completed_short(&mut rec);
+        rec.retry.rtry = 3;
+        rec.retry.miss = true;
+        rec.stat.cdir = true; // commanded toward high limit
+        rec.limits.hls = true;
+        rec.check_completion();
+        assert_eq!(rec.stat.phase, MotionPhase::Idle);
+        assert!(
+            !rec.retry.miss,
+            "LS-blocked evaluation clears MISS (C 1092)"
+        );
+        assert_eq!(rec.retry.rcnt, 0, "no retry dispatched against the limit");
+    }
+
+    // C 1083-1092: landing close enough clears a latched miss.
+    #[test]
+    fn close_enough_clears_miss() {
+        let mut rec = MotorRecord::new();
+        completed_short(&mut rec);
+        rec.pos.drbv = 9.99; // diff = 0.01 < rdbd
+        rec.retry.rtry = 3;
+        rec.retry.miss = true;
+        rec.check_completion();
+        assert!(!rec.retry.miss, "close-enough evaluation clears MISS");
+    }
+
+    // Dispatch is not a miss writer: a latched miss stays visible through
+    // the next move until its own evaluation lands.
+    #[test]
+    fn dispatch_preserves_latched_miss() {
+        let mut rec = MotorRecord::new();
+        rec.conv.mres = 0.001;
+        rec.retry.miss = true;
+        rec.put_field("VAL", EpicsValue::Double(5.0)).unwrap();
+        rec.do_process();
+        assert_eq!(rec.stat.phase, MotionPhase::MainMove);
+        assert!(
+            rec.retry.miss,
+            "dispatch must not clear MISS (C only writes it in maybeRetry)"
+        );
+    }
+
+    // Retry branch does not touch miss: a latched miss survives a retry
+    // dispatch and clears only when the retry lands close enough.
+    #[test]
+    fn retry_dispatch_preserves_latched_miss() {
+        let mut rec = MotorRecord::new();
+        completed_short(&mut rec);
+        rec.retry.rtry = 3;
+        rec.retry.miss = true;
+        rec.check_completion();
+        assert_eq!(rec.stat.phase, MotionPhase::Retry);
+        assert_eq!(rec.retry.rcnt, 1);
+        assert!(
+            rec.retry.miss,
+            "retry branch leaves MISS untouched (C 1077-1082)"
+        );
+    }
+}

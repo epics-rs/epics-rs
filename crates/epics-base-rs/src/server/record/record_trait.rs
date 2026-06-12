@@ -605,6 +605,27 @@ pub trait Record: Send + Sync + 'static {
         self.primary_field()
     }
 
+    /// Fields the record's C `monitor()` posts on every cycle whose
+    /// alarm transition fired, even when their value did not change.
+    ///
+    /// C motorRecord.cc `monitor()` (3513-3645) computes
+    /// `local_mask = monitor_mask | (MARKED(x) ? DBE_VAL_LOG : 0)`
+    /// for each field in its posting list — when the alarm moved
+    /// (`monitor_mask != 0`), `local_mask` is non-zero for UNMARKED
+    /// fields too, so every listed field posts with `DBE_ALARM` and a
+    /// `DBE_ALARM`-only subscriber observes the alarm moment on any of
+    /// them. The framework's change-detection loop posts a listed,
+    /// subscribed, unchanged field with the cycle's alarm bits when
+    /// this list names it.
+    ///
+    /// Default: empty — most C record types post only their value
+    /// field(s) on an alarm transition (aiRecord.c `monitor()` posts
+    /// VAL with `monitor_mask` and RVAL only when it changed), which
+    /// the deadband-field post already covers.
+    fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Initialize record (pass 0: field defaults; pass 1: dependent init).
     fn init_record(&mut self, _pass: u8) -> CaResult<()> {
         Ok(())

@@ -917,6 +917,49 @@ fn test_no_alarm_change_does_not_post_sevr_stat() {
 }
 
 #[test]
+fn test_alarm_cycle_does_not_fan_out_for_default_records() {
+    // The alarm-cycle fanout (posting unchanged monitored fields with
+    // DBE_ALARM) is record-type-specific: C motorRecord.cc `monitor()`
+    // posts its whole list once `monitor_mask != 0`, but
+    // aiRecord.c `monitor()` posts only VAL with `monitor_mask` and
+    // RVAL when it actually changed. `alarm_cycle_monitored_fields`
+    // defaults to empty, so an ai alarm transition must NOT post an
+    // unchanged subscribed RVAL.
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::types::DbFieldType;
+    let mut rec = AiRecord::default();
+    rec.mdel = 100.0;
+    let mut instance = RecordInstance::new("TEST".into(), rec);
+    instance.common.analog_alarm = Some(AnalogAlarmConfig {
+        hihi: 1000.0,
+        high: 0.5,
+        low: -1000.0,
+        lolo: -2000.0,
+        hhsv: AlarmSeverity::Major,
+        hsv: AlarmSeverity::Major,
+        lsv: AlarmSeverity::Minor,
+        llsv: AlarmSeverity::Major,
+    });
+    let _rval_rx = instance
+        .add_subscriber("RVAL", 1, DbFieldType::Long, EventMask::ALARM.bits())
+        .expect("RVAL subscriber");
+
+    // VAL=1.0 trips HIGH/Major — a real alarm transition; RVAL is
+    // untouched.
+    instance.record.set_val(EpicsValue::Double(1.0)).unwrap();
+    instance.record.set_device_did_compute(true);
+    let (snap, _alarm_posts) = instance.process_local().unwrap();
+    assert!(
+        snap.changed_fields.iter().any(|(k, _, _)| k == "VAL"),
+        "the alarm transition posts VAL"
+    );
+    assert!(
+        !snap.changed_fields.iter().any(|(k, _, _)| k == "RVAL"),
+        "ai has no alarm-cycle fanout list: unchanged RVAL must not post"
+    );
+}
+
+#[test]
 fn test_pact_reads_zero_when_idle() {
     let instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
     match instance.get_common_field("PACT") {

@@ -489,6 +489,27 @@ impl Record for MotorRecord {
         "RBV"
     }
 
+    /// C `monitor()` posts every field in its list on a cycle whose
+    /// alarm transition fired, even when unmarked — `local_mask =
+    /// monitor_mask | (MARKED(x) ? DBE_VAL_LOG : 0)` is non-zero for
+    /// unmarked fields once `monitor_mask != 0` (motorRecord.cc
+    /// 3513-3645), so a `DBE_ALARM`-only subscriber on any of them
+    /// observes the alarm moment. The list is C's posting order, minus
+    /// RBV (the deadband-gated field, delivered by the deadband
+    /// trigger with the same alarm bits) and CNEN (C posts it only on
+    /// an actual EA_POSITION-driven change, which generic
+    /// change-detection covers). Both raw limit-switch mirrors RHLS
+    /// and RLLS are listed: C's M_HLS and M_LLS branches each post one
+    /// of them, and on an alarm cycle both branches run.
+    fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
+        &[
+            "RRBV", "DRBV", "DIFF", "RDIF", "MSTA", "VAL", "DVAL", "RVAL", "TDIR", "MIP", "HLM",
+            "LLM", "SPMG", "RCNT", "RLV", "OFF", "DHLM", "DLLM", "HLS", "RHLS", "RLLS", "LLS",
+            "ATHM", "MRES", "ERES", "UEIP", "LVIO", "STOP", "SBAS", "SREV", "UREV", "VELO", "VBAS",
+            "MISS", "MOVN", "DMOV", "STUP", "JOGF", "JOGR", "HOMF", "HOMR", "RHLM", "RLLM",
+        ]
+    }
+
     /// C `alarm_sub()` (motorRecord.cc:3367-3406) — motor-specific alarm
     /// severities, raised into `nsta`/`nsev` before the framework's
     /// `evaluate_alarms`.

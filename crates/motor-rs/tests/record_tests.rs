@@ -8668,3 +8668,61 @@ fn test_jog_refusal_clears_both_buttons() {
     assert!(!rec.ctrl.jogf, "JOGF released");
     assert!(!rec.ctrl.jogr, "JOGR released too (C 2100-2104)");
 }
+
+#[test]
+fn test_alarm_cycle_fans_out_alarm_mask_to_monitored_fields() {
+    // C `monitor()` (motorRecord.cc:3513-3645): on a cycle whose alarm
+    // transition fired, every field in the posting list goes out even
+    // when unmarked — `local_mask = monitor_mask | (MARKED(x) ?
+    // DBE_VAL_LOG : 0)` is non-zero for unmarked fields once
+    // `monitor_mask != 0`. A subscriber on DMOV must observe the alarm
+    // moment with a DBE_ALARM-only event even though DMOV itself did
+    // not change.
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::server::record::RecordInstance;
+    use epics_base_rs::types::DbFieldType;
+
+    let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::DONE;
+    let mut instance = RecordInstance::new("M1".into(), rec);
+    instance.common.udf = false;
+
+    let _dmov_rx = instance
+        .add_subscriber(
+            "DMOV",
+            1,
+            DbFieldType::Char,
+            (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits(),
+        )
+        .expect("DMOV subscriber");
+
+    // Quiescent pass: no alarm transition, DMOV unchanged — no DMOV post.
+    let (snap, _) = instance.process_local().unwrap();
+    assert!(
+        !snap.changed_fields.iter().any(|(k, _, _)| k == "DMOV"),
+        "no alarm and no change: DMOV must not post"
+    );
+
+    // Raise a motor alarm without touching DMOV: MSTA RA_PROBLEM drives
+    // STATE_ALARM/MAJOR in the alarm hook (C `alarm_sub`,
+    // motorRecord.cc:3400-3403).
+    instance
+        .record
+        .as_any_mut()
+        .and_then(|a| a.downcast_mut::<MotorRecord>())
+        .expect("motor record downcast")
+        .stat
+        .msta
+        .insert(MstaFlags::PROBLEM);
+    let (snap, _) = instance.process_local().unwrap();
+    let dmov_mask = snap
+        .changed_fields
+        .iter()
+        .find(|(k, _, _)| k == "DMOV")
+        .map(|(_, _, m)| *m);
+    assert_eq!(
+        dmov_mask,
+        Some(EventMask::ALARM),
+        "alarm cycle posts unchanged listed fields with DBE_ALARM alone"
+    );
+}

@@ -2050,7 +2050,20 @@ impl PvDatabase {
             // (`monitor_mask | DBE_VALUE | DBE_LOG`, calcRecord.c:420,
             // subRecord.c:400; motor `DBE_VAL_LOG` for marked fields,
             // motorRecord.cc:3522-3645).
-            let mut sub_updates: Vec<(String, EpicsValue)> = Vec::new();
+            //
+            // On a cycle whose alarm transition fired, fields named by
+            // `alarm_cycle_monitored_fields` post even when unchanged,
+            // with the alarm bits alone — C motor `monitor()`
+            // (motorRecord.cc:3513-3645) posts every listed field once
+            // `monitor_mask != 0`, so a `DBE_ALARM`-only subscriber
+            // observes the alarm moment on any of them.
+            let aux_mask = alarm_bits | EventMask::VALUE | EventMask::LOG;
+            let alarm_fanout: &[&str] = if alarm_bits.is_empty() {
+                &[]
+            } else {
+                instance.record.alarm_cycle_monitored_fields()
+            };
+            let mut sub_updates: Vec<(String, EpicsValue, EventMask)> = Vec::new();
             for (field, subs) in &instance.subscribers {
                 if !subs.is_empty()
                     && field != deadband_field
@@ -2065,21 +2078,18 @@ impl PvDatabase {
                             None => true,
                         };
                         if changed {
-                            sub_updates.push((field.clone(), val));
+                            sub_updates.push((field.clone(), val, aux_mask));
+                        } else if alarm_fanout.contains(&field.as_str()) {
+                            sub_updates.push((field.clone(), val, alarm_bits));
                         }
                     }
                 }
             }
-            let aux_mask = alarm_bits | EventMask::VALUE | EventMask::LOG;
             if !sub_updates.is_empty() {
-                for (field, val) in &sub_updates {
+                for (field, val, _) in &sub_updates {
                     instance.last_posted.insert(field.clone(), val.clone());
                 }
-                changed_fields.extend(
-                    sub_updates
-                        .into_iter()
-                        .map(|(field, val)| (field, val, aux_mask)),
-                );
+                changed_fields.extend(sub_updates);
             }
             // C `recGblResetAlarms` (recGbl.c:201-220) posts each
             // alarm field with its own per-field mask:
@@ -3099,8 +3109,18 @@ impl PvDatabase {
             // trigger branch above, never by raw change-detection. Each
             // carries DBE_VALUE|DBE_LOG plus the cycle's alarm bits (C
             // `monitor_mask | DBE_VALUE | DBE_LOG` for change-detected
-            // auxiliary posts).
-            let mut sub_updates: Vec<(String, EpicsValue)> = Vec::new();
+            // auxiliary posts). On a cycle whose alarm transition
+            // fired, fields named by `alarm_cycle_monitored_fields`
+            // post even when unchanged, with the alarm bits alone — C
+            // motor `monitor()` (motorRecord.cc:3513-3645) posts every
+            // listed field once `monitor_mask != 0`.
+            let aux_mask = alarm_bits | EventMask::VALUE | EventMask::LOG;
+            let alarm_fanout: &[&str] = if alarm_bits.is_empty() {
+                &[]
+            } else {
+                instance.record.alarm_cycle_monitored_fields()
+            };
+            let mut sub_updates: Vec<(String, EpicsValue, EventMask)> = Vec::new();
             for (field, subs) in &instance.subscribers {
                 if !subs.is_empty()
                     && field != deadband_field
@@ -3115,21 +3135,18 @@ impl PvDatabase {
                             None => true,
                         };
                         if changed {
-                            sub_updates.push((field.clone(), val));
+                            sub_updates.push((field.clone(), val, aux_mask));
+                        } else if alarm_fanout.contains(&field.as_str()) {
+                            sub_updates.push((field.clone(), val, alarm_bits));
                         }
                     }
                 }
             }
-            let aux_mask = alarm_bits | EventMask::VALUE | EventMask::LOG;
             if !sub_updates.is_empty() {
-                for (field, val) in &sub_updates {
+                for (field, val, _) in &sub_updates {
                     instance.last_posted.insert(field.clone(), val.clone());
                 }
-                changed_fields.extend(
-                    sub_updates
-                        .into_iter()
-                        .map(|(field, val)| (field, val, aux_mask)),
-                );
+                changed_fields.extend(sub_updates);
             }
             // UDF rides along whenever any monitored post fired this
             // cycle, carrying the union of the cycle's posted classes —

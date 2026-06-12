@@ -4359,7 +4359,11 @@ fn test_rstm_restore_proceeds_when_mres_consistent() {
 // --- RHLM / RLLM (C: 2e89b552 PR #193, fd808eb2 PR #206) ---
 
 #[test]
-fn test_rhlm_rllm_roundtrip_via_pv() {
+fn test_rhlm_rllm_loaded_raw_wins_at_init() {
+    // C dbd: RHLM/RLLM are SPC_NOMOD — a put models the database
+    // field() load (raw struct write, no cascade); the raw-wins rule
+    // (check_speed_and_resolution 3968-3992) derives the dial pair at
+    // init.
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.001;
     rec.put_field("RHLM", EpicsValue::Double(10_000.0)).unwrap();
@@ -4367,7 +4371,10 @@ fn test_rhlm_rllm_roundtrip_via_pv() {
         .unwrap();
     assert_eq!(rec.get_field("RHLM"), Some(EpicsValue::Double(10_000.0)));
     assert_eq!(rec.get_field("RLLM"), Some(EpicsValue::Double(-10_000.0)));
-    // Dial limits derived from raw * mres
+    // No cascade at load time (C: special never runs during dbLoadRecords).
+    assert_eq!(rec.limits.dhlm, 0.0);
+    rec.init_record(1).unwrap();
+    // Raw wins: dial derived as raw * mres.
     assert!((rec.limits.dhlm - 10.0).abs() < 1e-9);
     assert!((rec.limits.dllm + 10.0).abs() < 1e-9);
 }
@@ -4378,13 +4385,16 @@ fn test_mres_change_preserves_raw_limits() {
     rec.conv.mres = 0.01;
     rec.put_field("DHLM", EpicsValue::Double(100.0)).unwrap();
     rec.put_field("DLLM", EpicsValue::Double(-100.0)).unwrap();
-    // Raw limits set from dial on first DHLM/DLLM put
-    assert!((rec.limits.rhlm - 10_000.0).abs() < 1e-6);
-    assert!((rec.limits.rllm + 10_000.0).abs() < 1e-6);
+    // A load-time dial put leaves the raw pair at 0 (C: raw struct
+    // write); init seeds it from the dial values.
+    assert_eq!(rec.limits.rhlm, 0.0);
+    assert_eq!(rec.limits.rllm, 0.0);
 
     // init_record establishes the limit invariant — only after this does a
     // runtime MRES change keep RHLM/RLLM invariant and rescale DHLM/DLLM.
     rec.init_record(1).unwrap();
+    assert!((rec.limits.rhlm - 10_000.0).abs() < 1e-6);
+    assert!((rec.limits.rllm + 10_000.0).abs() < 1e-6);
 
     // Change MRES: raw stays, dial rescales
     rec.put_field("MRES", EpicsValue::Double(0.001)).unwrap();
@@ -4450,6 +4460,117 @@ fn test_template_load_dhlm_before_mres_preserves_egu_limits() {
     );
     assert!(
         (rec.limits.rllm + 100_000.0).abs() < 1e-3,
+        "RLLM={}",
+        rec.limits.rllm
+    );
+}
+
+#[test]
+fn test_rhlm_rllm_registry_read_only() {
+    // C dbd (2e89b552): RHLM/RLLM carry special(SPC_NOMOD) — runtime CA
+    // writes are refused at the server layer via FieldDesc.read_only.
+    let rec = MotorRecord::new();
+    let fields = rec.field_list();
+    for name in ["RHLM", "RLLM"] {
+        let f = fields
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("{name} missing from field list"));
+        assert!(f.read_only, "{name} must be SPC_NOMOD (read-only)");
+    }
+}
+
+#[test]
+fn test_init_negative_mres_loaded_rllm_drives_dhlm() {
+    // C check_speed_and_resolution (3993-4017): under MRES < 0 a loaded
+    // RLLM seeds DHLM through fabs(mres). Then init_record 716-718 runs
+    // set_dial_high/lowlimit, whose SIGNED re-derivation lands
+    // dhlm/mres in the LOW raw register — flipping the sign of the
+    // fabs-seeded raw value (C verbatim quirk).
+    let mut rec = MotorRecord::new();
+    rec.put_field("MRES", EpicsValue::Double(-0.001)).unwrap();
+    rec.put_field("RLLM", EpicsValue::Double(50_000.0)).unwrap();
+    rec.init_record(1).unwrap();
+    assert!(
+        (rec.limits.dhlm - 50.0).abs() < 1e-9,
+        "DHLM={}",
+        rec.limits.dhlm
+    );
+    assert_eq!(rec.limits.dllm, 0.0);
+    assert!(
+        (rec.limits.rllm + 50_000.0).abs() < 1e-6,
+        "RLLM={}",
+        rec.limits.rllm
+    );
+    assert!(rec.limits.rhlm.abs() < 1e-6, "RHLM={}", rec.limits.rhlm);
+}
+
+#[test]
+fn test_runtime_negative_mres_crosses_dial_keeps_raw() {
+    // C special MRES (2877-2906): the raw pair is the invariant across a
+    // resolution change; MRES < 0 crosses the dial assignment with the
+    // SIGNED resolution (dhlm = rllm * mres, dllm = rhlm * mres).
+    let mut rec = MotorRecord::new();
+    rec.put_field("DHLM", EpicsValue::Double(100.0)).unwrap();
+    rec.put_field("DLLM", EpicsValue::Double(-10.0)).unwrap();
+    rec.init_record(1).unwrap();
+    assert!((rec.limits.rhlm - 100.0).abs() < 1e-9);
+    assert!((rec.limits.rllm + 10.0).abs() < 1e-9);
+
+    rec.put_field("MRES", EpicsValue::Double(-1.0)).unwrap();
+    assert!(
+        (rec.limits.dhlm - 10.0).abs() < 1e-9,
+        "DHLM={}",
+        rec.limits.dhlm
+    );
+    assert!(
+        (rec.limits.dllm + 100.0).abs() < 1e-9,
+        "DLLM={}",
+        rec.limits.dllm
+    );
+    // Raw registers untouched by the cascade.
+    assert!(
+        (rec.limits.rhlm - 100.0).abs() < 1e-9,
+        "RHLM={}",
+        rec.limits.rhlm
+    );
+    assert!(
+        (rec.limits.rllm + 10.0).abs() < 1e-9,
+        "RLLM={}",
+        rec.limits.rllm
+    );
+}
+
+#[test]
+fn test_runtime_dial_high_put_under_negative_mres_lands_in_rllm() {
+    // C set_dial_highlimit (4243-4275, fd808eb2): dhlm / mres with the
+    // SIGNED resolution addresses the LOW raw register under MRES < 0
+    // (SET_LOW_LIMIT). set_user_highlimit (4076-4147) keys the same way
+    // (dir_positive ^ (mres < 0)) — with DIR=Pos an HLM put writes the
+    // dial HIGH limit and likewise lands in RLLM.
+    let mut rec = MotorRecord::new();
+    rec.put_field("MRES", EpicsValue::Double(-1.0)).unwrap();
+    rec.put_field("DHLM", EpicsValue::Double(10.0)).unwrap();
+    rec.init_record(1).unwrap();
+    assert!(
+        (rec.limits.rllm + 10.0).abs() < 1e-9,
+        "RLLM={}",
+        rec.limits.rllm
+    );
+
+    rec.put_field("DHLM", EpicsValue::Double(20.0)).unwrap();
+    assert!((rec.limits.dhlm - 20.0).abs() < 1e-9);
+    assert!(
+        (rec.limits.rllm + 20.0).abs() < 1e-9,
+        "RLLM={}",
+        rec.limits.rllm
+    );
+    assert!(rec.limits.rhlm.abs() < 1e-6, "RHLM={}", rec.limits.rhlm);
+
+    rec.put_field("HLM", EpicsValue::Double(30.0)).unwrap();
+    assert!((rec.limits.dhlm - 30.0).abs() < 1e-9);
+    assert!(
+        (rec.limits.rllm + 30.0).abs() < 1e-9,
         "RLLM={}",
         rec.limits.rllm
     );

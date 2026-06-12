@@ -304,15 +304,17 @@ pub(crate) static FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         read_only: false,
     },
+    // C dbd (2e89b552): RHLM/RLLM are SPC_NOMOD — runtime writes are
+    // refused; only a database field() load lands in them.
     FieldDesc {
         name: "RHLM",
         dbf_type: DbFieldType::Double,
-        read_only: false,
+        read_only: true,
     },
     FieldDesc {
         name: "RLLM",
         dbf_type: DbFieldType::Double,
-        read_only: false,
+        read_only: true,
     },
     FieldDesc {
         name: "LVIO",
@@ -1124,11 +1126,10 @@ pub(crate) fn motor_put_field(
                 if v == 0.0 {
                     return Ok(()); // C: reject zero MRES
                 }
-                let old_mres = rec.conv.mres;
                 rec.conv.mres = v;
                 // C: cascade UREV from MRES
                 rec.conv.urev = v * rec.conv.srev as f64;
-                apply_mres_cascade(rec, old_mres);
+                apply_mres_cascade(rec);
                 // C special MRES (2834): MARK(M_MRES) unconditionally —
                 // the pp(TRUE) process pass re-anchors (do_work 1936).
                 if rec.internal.init_invariants_synced {
@@ -1162,7 +1163,7 @@ pub(crate) fn motor_put_field(
                     rec.conv.mres = rec.conv.urev / v as f64;
                 }
                 // Cascade velocity and limits like MRES handler
-                apply_mres_cascade(rec, old_mres);
+                apply_mres_cascade(rec);
                 // C special SREV (2919-2922): MARK(M_MRES) only when
                 // MRES actually changed.
                 if rec.internal.init_invariants_synced && rec.conv.mres != old_mres {
@@ -1181,7 +1182,7 @@ pub(crate) fn motor_put_field(
                     rec.conv.mres = v / rec.conv.srev as f64;
                 }
                 // C: cascade velocities and limits from new UREV
-                apply_mres_cascade(rec, old_mres);
+                apply_mres_cascade(rec);
                 // C special UREV (2848-2853): MARK(M_MRES) only when
                 // MRES actually changed.
                 if rec.internal.init_invariants_synced && rec.conv.mres != old_mres {
@@ -1570,21 +1571,18 @@ pub(crate) fn motor_put_field(
                 rec.limits.hlm = v;
                 // C set_user_highlimit (motorRecord.cc:4076-4147): a user
                 // high-limit write moves exactly ONE dial limit — DHLM
-                // when DIR=Pos, DLLM when DIR=Neg — plus that side's raw
-                // register. The pair is never re-ordered: writing HLM
-                // below LLM leaves an inverted dial pair, which latches
-                // LVIO below and blocks every move until corrected.
+                // when DIR=Pos, DLLM when DIR=Neg — plus the raw register
+                // selected by `dir_positive ^ (mres < 0)` (4098-4107).
+                // The pair is never re-ordered: writing HLM below LLM
+                // leaves an inverted dial pair, which latches LVIO below
+                // and blocks every move until corrected.
                 let dial = coordinate::user_to_dial(v, rec.conv.dir, rec.pos.off);
                 if rec.conv.dir == MotorDir::Pos {
                     rec.limits.dhlm = dial;
-                    if rec.conv.mres != 0.0 {
-                        rec.limits.rhlm = dial / rec.conv.mres;
-                    }
+                    update_raw_from_dial_high(rec, dial);
                 } else {
                     rec.limits.dllm = dial;
-                    if rec.conv.mres != 0.0 {
-                        rec.limits.rllm = dial / rec.conv.mres;
-                    }
+                    update_raw_from_dial_low(rec, dial);
                 }
                 detect_inverted_limits(&mut rec.limits, rec.pos.dval);
                 Ok(())
@@ -1599,14 +1597,10 @@ pub(crate) fn motor_put_field(
                 let dial = coordinate::user_to_dial(v, rec.conv.dir, rec.pos.off);
                 if rec.conv.dir == MotorDir::Pos {
                     rec.limits.dllm = dial;
-                    if rec.conv.mres != 0.0 {
-                        rec.limits.rllm = dial / rec.conv.mres;
-                    }
+                    update_raw_from_dial_low(rec, dial);
                 } else {
                     rec.limits.dhlm = dial;
-                    if rec.conv.mres != 0.0 {
-                        rec.limits.rhlm = dial / rec.conv.mres;
-                    }
+                    update_raw_from_dial_high(rec, dial);
                 }
                 detect_inverted_limits(&mut rec.limits, rec.pos.dval);
                 Ok(())
@@ -1616,10 +1610,7 @@ pub(crate) fn motor_put_field(
         "DHLM" => match value {
             EpicsValue::Double(v) => {
                 rec.limits.dhlm = v;
-                // Update raw limit for MRES cascade invariance
-                if rec.conv.mres != 0.0 {
-                    rec.limits.rhlm = v / rec.conv.mres;
-                }
+                update_raw_from_dial_high(rec, v);
                 // C set_dial_highlimit (motorRecord.cc:4236-4277): a dial
                 // high-limit write updates exactly ONE user limit — HLM
                 // when DIR=Pos, LLM when DIR=Neg. No re-ordering.
@@ -1637,9 +1628,7 @@ pub(crate) fn motor_put_field(
         "DLLM" => match value {
             EpicsValue::Double(v) => {
                 rec.limits.dllm = v;
-                if rec.conv.mres != 0.0 {
-                    rec.limits.rllm = v / rec.conv.mres;
-                }
+                update_raw_from_dial_low(rec, v);
                 // C set_dial_lowlimit (motorRecord.cc:4287-4328): mirror
                 // of DHLM — LLM when DIR=Pos, HLM when DIR=Neg.
                 let user = coordinate::dial_to_user(v, rec.conv.dir, rec.pos.off);
@@ -1655,11 +1644,11 @@ pub(crate) fn motor_put_field(
         },
         "RHLM" => match value {
             EpicsValue::Double(v) => {
-                // C: 2e89b552 — raw input drives dial/user (raw-master path).
+                // C dbd (2e89b552): SPC_NOMOD — a database field() load
+                // is a raw struct write; the raw-wins rule at init
+                // (motor_sync_limits_at_init) derives the dial pair.
+                // Runtime CA writes never reach here (read_only).
                 rec.limits.rhlm = v;
-                rec.limits.dhlm = v * rec.conv.mres;
-                normalize_raw_limit_pair(&mut rec.limits, rec.conv.mres);
-                rec.set_userlimits();
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -1667,9 +1656,6 @@ pub(crate) fn motor_put_field(
         "RLLM" => match value {
             EpicsValue::Double(v) => {
                 rec.limits.rllm = v;
-                rec.limits.dllm = v * rec.conv.mres;
-                normalize_raw_limit_pair(&mut rec.limits, rec.conv.mres);
-                rec.set_userlimits();
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),
@@ -2115,7 +2101,7 @@ fn apply_accu_cascade(rec: &mut MotorRecord) {
 /// invariant across MRES changes. Dial and user limits are recomputed.
 /// `fd808eb2` (PR #206) — when MRES < 0, the high/low pair must be ordered
 /// so DHLM >= DLLM.
-fn apply_mres_cascade(rec: &mut MotorRecord, old_mres: f64) {
+fn apply_mres_cascade(rec: &mut MotorRecord) {
     // Both re-derivations below are C special() semantics for a *runtime*
     // MRES/UREV/SREV change. During `dbLoadRecords` neither invariant is
     // established yet: `apply_fields` feeds every `field()` through
@@ -2143,26 +2129,19 @@ fn apply_mres_cascade(rec: &mut MotorRecord, old_mres: f64) {
         return;
     }
     if rec.internal.init_invariants_synced {
-        // Seed raw limits from the dial limits the first time MRES changes
-        // after init: RHLM/RLLM default to 0. Once any
-        // HLM/LLM/DHLM/DLLM/RHLM/RLLM put has run, rhlm/rllm hold a
-        // meaningful value and seeding is skipped.
-        //
-        // Invariant: every put that can leave rhlm==rllm==0 also leaves
-        // dhlm==dllm==0 (HLM/LLM/DHLM/DLLM/RHLM/RLLM handlers always update
-        // the raw/dial pair together). So when raw_unset is true, dhlm/dllm
-        // are 0 too and the seed below is a 0->0 no-op. 0/0 is the "limits
-        // disabled" convention (see check_soft_limits), never an active
-        // limit pair.
-        let raw_unset = rec.limits.rhlm == 0.0 && rec.limits.rllm == 0.0;
-        if raw_unset && old_mres != 0.0 {
-            rec.limits.rhlm = rec.limits.dhlm / old_mres;
-            rec.limits.rllm = rec.limits.dllm / old_mres;
+        // C special MRES (2877-2906): the raw pair is the invariant —
+        // recompute dial from raw. MRES < 0 crosses the assignment with
+        // the SIGNED resolution (dhlm = rllm * mres, dllm = rhlm * mres,
+        // "MRES < 0 swaps DHLM DLLM"), leaving the raw registers
+        // untouched. Raw is always populated here: init seeds it and
+        // every runtime dial/user limit put maintains it.
+        if rec.conv.mres > 0.0 {
+            rec.limits.dllm = rec.limits.rllm * rec.conv.mres;
+            rec.limits.dhlm = rec.limits.rhlm * rec.conv.mres;
+        } else {
+            rec.limits.dhlm = rec.limits.rllm * rec.conv.mres;
+            rec.limits.dllm = rec.limits.rhlm * rec.conv.mres;
         }
-        // Raw is invariant — recompute dial.
-        rec.limits.dhlm = rec.limits.rhlm * rec.conv.mres;
-        rec.limits.dllm = rec.limits.rllm * rec.conv.mres;
-        normalize_raw_limit_pair(&mut rec.limits, rec.conv.mres);
         rec.set_userlimits();
     }
     // C: special() calls enforceMinRetryDeadband on MRES change.
@@ -2283,23 +2262,57 @@ pub(crate) fn motor_sync_speed_at_init(rec: &mut MotorRecord) {
 /// Establish the limit invariant at IOC init — the load-time counterpart of
 /// [`apply_mres_cascade`].
 ///
-/// C `init_record` calls `set_dial_highlimit`/`set_dial_lowlimit`, which take
-/// the dial limits DHLM/DLLM loaded by `dbLoadRecords` as authoritative and
-/// derive the raw limits (RHLM/RLLM = DHLM/DLLM ÷ MRES) and user limits
-/// (HLM/LLM) from them. From this point on a runtime MRES change keeps
-/// RHLM/RLLM invariant and rescales DHLM/DLLM (C PR #193,
-/// [`apply_mres_cascade`]).
+/// Two C steps, in order:
 ///
-/// This must run after all `field()` values are applied: it repairs the
-/// RHLM/RLLM that the DHLM/DLLM `put_field` handlers computed against
-/// whatever MRES happened to be in effect at the time (the default 1.0 when
-/// `field(DHLM,…)` precedes `field(MRES,…)`, as in `motor.template`).
+/// 1. `check_speed_and_resolution` (motorRecord.cc:3968-4017): the raw-wins
+///    rule — a NONZERO raw limit loaded from the database rescales its dial
+///    partner; a zero raw is seeded from the dial value. Under MRES < 0 the
+///    pairs cross (raw low <-> dial high) and scale by |MRES|.
+/// 2. `init_record` 716-718 ("Reset limits in case database values are
+///    invalid"): `set_dial_highlimit`/`set_dial_lowlimit` run last and
+///    re-derive the raw pair with the SIGNED resolution — under MRES < 0
+///    the |MRES|-seeded raw value from step 1 flips sign here (C verbatim).
+///
+/// Must run after all `field()` values are applied (the dial put handlers
+/// leave the raw pair untouched until init), and before
+/// `init_invariants_synced` is set — the helpers below are init-gated, so
+/// step 2 inlines their arithmetic.
 pub(crate) fn motor_sync_limits_at_init(rec: &mut MotorRecord) {
-    if rec.conv.mres != 0.0 {
-        rec.limits.rhlm = rec.limits.dhlm / rec.conv.mres;
-        rec.limits.rllm = rec.limits.dllm / rec.conv.mres;
+    let mres = rec.conv.mres;
+    if mres != 0.0 {
+        if mres > 0.0 {
+            // C 3968-3992.
+            if rec.limits.rllm != 0.0 {
+                rec.limits.dllm = rec.limits.rllm * mres;
+            }
+            rec.limits.rllm = rec.limits.dllm / mres;
+            if rec.limits.rhlm != 0.0 {
+                rec.limits.dhlm = rec.limits.rhlm * mres;
+            }
+            rec.limits.rhlm = rec.limits.dhlm / mres;
+        } else {
+            // C 3993-4017: MRES < 0 register convention.
+            let abs_mres = mres.abs();
+            if rec.limits.rllm != 0.0 {
+                rec.limits.dhlm = rec.limits.rllm * abs_mres;
+            }
+            rec.limits.rllm = rec.limits.dhlm / abs_mres;
+            if rec.limits.rhlm != 0.0 {
+                rec.limits.dllm = rec.limits.rhlm * abs_mres;
+            }
+            rec.limits.rhlm = rec.limits.dllm / abs_mres;
+        }
+        // Step 2 (C 716-718 via set_dial_high/lowlimit 4243/4294):
+        // signed re-derivation, crossed under MRES < 0.
+        let (raw_high, raw_low) = (rec.limits.dhlm / mres, rec.limits.dllm / mres);
+        if mres < 0.0 {
+            rec.limits.rllm = raw_high;
+            rec.limits.rhlm = raw_low;
+        } else {
+            rec.limits.rhlm = raw_high;
+            rec.limits.rllm = raw_low;
+        }
     }
-    normalize_raw_limit_pair(&mut rec.limits, rec.conv.mres);
     rec.set_userlimits();
 }
 
@@ -2317,11 +2330,37 @@ fn detect_inverted_limits(limits: &mut LimitFields, dval: f64) {
     }
 }
 
-/// When MRES < 0, dial limits derived from raw end up with DHLM < DLLM.
-/// C `fd808eb2` (PR #206) swaps the pair so the high/low semantics hold.
-fn normalize_raw_limit_pair(limits: &mut LimitFields, mres: f64) {
-    if mres < 0.0 && limits.dhlm < limits.dllm {
-        std::mem::swap(&mut limits.dhlm, &mut limits.dllm);
-        std::mem::swap(&mut limits.rhlm, &mut limits.rllm);
+/// C set_dial_highlimit (motorRecord.cc:4243-4275, fd808eb2 PR #206):
+/// the raw image of a dial HIGH limit is `dhlm / mres` with the SIGNED
+/// resolution; under MRES < 0 it addresses the LOW raw register
+/// (SET_LOW_LIMIT -> RLLM). Gated on init: during dbLoadRecords a dial
+/// field() must leave the raw pair at 0 so the raw-wins rule at init
+/// can tell a loaded RHLM/RLLM apart from a derived one (C applies
+/// field() as raw struct writes — special never runs at load). The
+/// SET_HIGH/LOW_LIMIT driver command itself is not emitted: the
+/// published MotorDriver trait has no limit call.
+fn update_raw_from_dial_high(rec: &mut MotorRecord, dial: f64) {
+    if !rec.internal.init_invariants_synced || rec.conv.mres == 0.0 {
+        return;
+    }
+    let tmp_raw = dial / rec.conv.mres;
+    if rec.conv.mres < 0.0 {
+        rec.limits.rllm = tmp_raw;
+    } else {
+        rec.limits.rhlm = tmp_raw;
+    }
+}
+
+/// C set_dial_lowlimit (motorRecord.cc:4294-4326): mirror — under
+/// MRES < 0 the dial LOW limit addresses the HIGH raw register.
+fn update_raw_from_dial_low(rec: &mut MotorRecord, dial: f64) {
+    if !rec.internal.init_invariants_synced || rec.conv.mres == 0.0 {
+        return;
+    }
+    let tmp_raw = dial / rec.conv.mres;
+    if rec.conv.mres < 0.0 {
+        rec.limits.rhlm = tmp_raw;
+    } else {
+        rec.limits.rllm = tmp_raw;
     }
 }

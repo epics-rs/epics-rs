@@ -130,12 +130,11 @@ impl MotorRecord {
                     }
                     QueuedMotion::Jog { forward } => {
                         self.set_phase(MotionPhase::Jog);
-                        self.internal.jog_was_forward = forward;
-                        effects.commands.push(MotorCommand::MoveVelocity {
-                            direction: forward,
-                            velocity: self.vel.jvel,
-                            acceleration: self.jog_accel_egu(),
-                        });
+                        // C replays through the same do_work jog section
+                        // (2118-2143), re-deriving both the commanded
+                        // direction and CDIR — route through the single
+                        // jog-emission owner.
+                        self.emit_jog(forward, &mut effects);
                     }
                 }
                 effects.request_poll = true;

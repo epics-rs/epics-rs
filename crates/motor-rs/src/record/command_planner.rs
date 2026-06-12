@@ -737,24 +737,28 @@ impl MotorRecord {
             self.stat.mip = MipFlags::JOGR;
         }
         self.set_phase(MotionPhase::Jog);
+        self.emit_jog(forward, effects);
+    }
+
+    /// Dispatch the jog velocity command — the single owner of the
+    /// `MoveVelocity` emission and its direction bookkeeping. The jog
+    /// button is USER-frame (JOGF = jog toward growing user
+    /// coordinate); the device command is DIAL-frame, so the button
+    /// direction must fold through DIR: C `motorRecord.cc:2119`
+    /// commands the raw velocity `jogv = (jvel * dir) / mres`, whose
+    /// dial equivalent is `±jvel * dir`. CDIR stays RAW-frame
+    /// (C 2126-2137: jogf, inverted once for MRES<0 and once for
+    /// DIR=Neg). Both the fresh dispatch and the queued-jog replay
+    /// (C re-enters the same do_work jog section on replay) come
+    /// through here so the commanded direction and the CDIR ledger
+    /// cannot disagree.
+    pub(super) fn emit_jog(&mut self, forward: bool, effects: &mut ProcessEffects) {
         // Remember jog direction for backlash (MIP flags get cleared by stop_jog)
         self.internal.jog_was_forward = forward;
-
-        // CDIR for jog: account for DIR and MRES sign
-        // C: cdir computed from jog direction considering dir polarity and MRES sign
-        let user_forward = if self.conv.dir == MotorDir::Neg {
-            !forward
-        } else {
-            forward
-        };
-        self.stat.cdir = if self.conv.mres >= 0.0 {
-            user_forward
-        } else {
-            !user_forward
-        };
-
+        let dial_forward = forward != (self.conv.dir == MotorDir::Neg);
+        self.stat.cdir = dial_forward != (self.conv.mres < 0.0);
         effects.commands.push(MotorCommand::MoveVelocity {
-            direction: forward,
+            direction: dial_forward,
             velocity: self.vel.jvel,
             acceleration: self.jog_accel_egu(),
         });

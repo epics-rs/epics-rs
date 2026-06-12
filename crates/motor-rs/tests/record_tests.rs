@@ -4589,3 +4589,64 @@ fn test_go_with_jog_button_at_limit_switch_collapses_stop() {
     );
     assert_eq!(rec.stat.mip, MipFlags::empty(), "STOP collapses to DONE");
 }
+
+#[test]
+fn test_jog_direction_folds_dir_into_dial_command() {
+    // C 2119: jogv = (jvel * dir) / mres — the commanded velocity sign
+    // carries DIR, so a JOGF (user-forward) on a DIR=Neg axis must be
+    // dial-negative. CDIR stays raw: jogf, inverted for DIR=Neg and
+    // MRES<0 (C 2126-2137).
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+    rec.put_field("DIR", EpicsValue::Short(1)).unwrap(); // Neg
+    rec.ctrl.jogf = true;
+    let effects = rec.plan_motion(CommandSource::Jogf);
+    let dial_dir = effects.commands.iter().find_map(|c| match c {
+        MotorCommand::MoveVelocity { direction, .. } => Some(*direction),
+        _ => None,
+    });
+    assert_eq!(
+        dial_dir,
+        Some(false),
+        "JOGF with DIR=Neg commands dial-negative (C 2119 jvel*dir)"
+    );
+    assert!(!rec.stat.cdir, "CDIR raw-frame: jogf ^ DIR=Neg ^ MRES>0");
+}
+
+#[test]
+fn test_queued_jog_replay_folds_dir_and_updates_cdir() {
+    // The queued-jog replay re-enters the C jog section (2118-2143) on
+    // re-fire, re-deriving the commanded direction and CDIR — the
+    // replay must match a fresh dispatch on a DIR=Neg axis.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+    rec.put_field("DIR", EpicsValue::Short(1)).unwrap(); // Neg
+    // Start a move, then press JOGF mid-move: queues Jog + STOP.
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+    rec.ctrl.jogf = true;
+    rec.plan_motion(CommandSource::Jogf);
+    assert_eq!(rec.stat.mip, MipFlags::JOGF | MipFlags::STOP);
+
+    // Stop completes → queued jog replays.
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.movn = false;
+    let effects = rec.check_completion();
+    let dial_dir = effects.commands.iter().find_map(|c| match c {
+        MotorCommand::MoveVelocity { direction, .. } => Some(*direction),
+        _ => None,
+    });
+    assert_eq!(
+        dial_dir,
+        Some(false),
+        "queued JOGF replay on DIR=Neg commands dial-negative"
+    );
+    assert!(
+        !rec.stat.cdir,
+        "replay refreshes CDIR like C's re-entered jog section"
+    );
+}

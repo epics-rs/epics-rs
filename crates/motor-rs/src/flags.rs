@@ -257,6 +257,10 @@ pub enum MotorCommand {
         acceleration: f64,
     },
     MoveVelocity {
+        /// DIAL-frame forward. The jog button is USER-frame; the
+        /// planner folds DIR before emitting (C motorRecord.cc:2119
+        /// commands `jogv = (jvel * dir) / mres` — the velocity sign
+        /// carries DIR).
         direction: bool,
         velocity: f64,
         acceleration: f64,

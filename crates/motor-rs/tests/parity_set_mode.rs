@@ -21,26 +21,21 @@ fn make_record() -> MotorRecord {
 }
 
 #[test]
-fn set_mode_val_produces_set_position() {
+fn set_mode_val_foff_variable_redefines_without_command() {
     let mut rec = make_record();
     rec.pos.dval = 10.0;
     rec.pos.val = 10.0;
     rec.conv.set = true;
 
     rec.put_field("VAL", EpicsValue::Double(100.0)).unwrap();
-    let effects = rec.plan_motion(CommandSource::Set);
 
-    // Should produce SetPosition command
-    assert_eq!(effects.commands.len(), 1);
-    assert!(matches!(
-        effects.commands[0],
-        MotorCommand::SetPosition { .. }
-    ));
-
-    // No DMOV change, no phase change
+    // C 2206-2227: SET + FOFF=Variable VAL acts directly in the
+    // collection block — offset adjusted, nothing dispatched (no
+    // LOAD_POS), mip = MIP_DONE, dmov = TRUE.
     assert!(rec.stat.dmov);
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
     assert!(!rec.stat.movn);
+    assert!(rec.stat.mip.is_empty());
 
     // DVAL unchanged, OFF updated
     assert_eq!(rec.pos.dval, 10.0);
@@ -48,7 +43,7 @@ fn set_mode_val_produces_set_position() {
 }
 
 #[test]
-fn set_mode_dval_produces_set_position() {
+fn set_mode_dval_load_pos_produces_set_position() {
     let mut rec = make_record();
     rec.pos.dval = 10.0;
     rec.pos.val = 10.0;
@@ -62,7 +57,11 @@ fn set_mode_dval_produces_set_position() {
         effects.commands[0],
         MotorCommand::SetPosition { .. }
     ));
-    assert!(rec.stat.dmov);
+    // C load_pos (3802-3808): MIP_LOAD_P, DMOV pulses low, GET_INFO
+    // follows the LOAD_POS.
+    assert!(!rec.stat.dmov);
+    assert_eq!(rec.stat.mip, MipFlags::LOAD_P);
+    assert!(effects.request_poll);
     assert_eq!(rec.stat.phase, MotionPhase::Idle);
 }
 

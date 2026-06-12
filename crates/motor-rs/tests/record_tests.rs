@@ -325,6 +325,44 @@ fn test_set_foff_variable_val_completes_without_command() {
 }
 
 #[test]
+fn test_set_dval_load_pos_pulses_dmov_and_refreshes_status() {
+    // C load_pos (motorRecord.cc:3771-3817): SET-mode DVAL re-anchors
+    // the controller — LOAD_POS then GET_INFO, mip = MIP_LOAD_P, DMOV
+    // pulses low; the status callback completes it (1404-1409).
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.stat.msta = MstaFlags::DONE;
+    rec.pos.val = 5.0;
+    rec.pos.dval = 5.0;
+    rec.pos.drbv = 5.0;
+    rec.put_field("SET", EpicsValue::Short(1)).unwrap();
+
+    rec.put_field("DVAL", EpicsValue::Double(0.0)).unwrap();
+    let effects = rec.plan_motion(CommandSource::Set);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::SetPosition { position } if *position == 0.0)),
+        "LOAD_POS dispatched at the redefined DVAL"
+    );
+    assert!(effects.request_poll, "C: LOAD_POS is followed by GET_INFO");
+    assert_eq!(rec.stat.mip, MipFlags::LOAD_P);
+    assert!(!rec.stat.dmov, "DMOV pulses low during the load");
+
+    // GET_INFO callback: driver reports done at the new position.
+    let status = asyn_rs::interfaces::motor::MotorStatus {
+        position: 0.0,
+        done: true,
+        ..Default::default()
+    };
+    rec.process_motor_info(&status);
+    let _ = rec.check_completion();
+    assert!(rec.stat.mip.is_empty(), "C 1404-1409: LOAD_P -> DONE");
+    assert!(rec.stat.dmov, "DMOV returns TRUE on the status callback");
+}
+
+#[test]
 fn test_set_mode_tweak_redefinition_retranslates_user_limits() {
     // The tweak fold in SET mode runs the same VAL redefinition (C
     // 2167-2181 feeding 2204-2227) — limits follow the offset.
@@ -619,20 +657,13 @@ fn test_tweak_in_set_mode_redefines_coordinates_without_moving() {
     // SET + FOFF=Variable: DVAL unchanged, OFF re-derived (15 - 1*10 = 5).
     assert_eq!(rec.pos.dval, 10.0);
     assert_eq!(rec.pos.off, 5.0);
-    // No move command — only SetPosition (coordinate redefinition).
+    // C 2206-2227: the Variable-offset redefinition sends NOTHING — no
+    // move and no LOAD_POS — and completes on the spot.
     assert!(
-        !effects.commands.iter().any(|c| matches!(
-            c,
-            MotorCommand::MoveAbsolute { .. } | MotorCommand::MoveRelative { .. }
-        )),
-        "SET-mode tweak must not move the motor"
+        effects.commands.is_empty(),
+        "SET+FOFF=Variable tweak redefines without any controller command"
     );
-    assert!(
-        effects
-            .commands
-            .iter()
-            .any(|c| matches!(c, MotorCommand::SetPosition { .. }))
-    );
+    assert!(rec.stat.dmov);
 }
 
 #[test]

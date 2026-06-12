@@ -332,6 +332,17 @@ impl MotorRecord {
                 // truncate the delay on the first poll tick.
             }
             MotionPhase::Idle => {
+                // C process (1404-1409): the GET_INFO callback after a
+                // LOAD_POS completes the load — MIP_LOAD_P collapses to
+                // MIP_DONE and DMOV returns TRUE, with no DLY and no
+                // retry evaluation.
+                if self.stat.mip.contains(MipFlags::LOAD_P)
+                    && self.stat.msta.contains(MstaFlags::DONE)
+                    && !self.stat.movn
+                {
+                    self.finalize_motion(&mut effects);
+                    return effects;
+                }
                 // C: ea063f5f — if the record marked an externally initiated
                 // move (MIP_EXTERNAL set during process_motor_info), close
                 // the loop once the driver reports done. Reseed VAL/DVAL/RVAL

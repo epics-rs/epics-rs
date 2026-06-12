@@ -346,23 +346,18 @@ impl MotorRecord {
                 self.apply_latent_sync();
             }
             CommandSource::Set => {
-                // SET mode: recalculate RBV from new offset, then issue SetPosition
-                self.pos.rbv = coordinate::dial_to_user(self.pos.drbv, self.conv.dir, self.pos.off);
+                // C move-block entry (2248-2255): DIFF/RDIF recompute
+                // precedes the set test (2257-2263), which routes to
+                // load_pos unless one is already in flight.
                 self.pos.diff = self.pos.dval - self.pos.drbv;
-                // C: rdif = NINT(diff / mres)
                 self.pos.rdif = if self.conv.mres != 0.0 {
                     (self.pos.diff / self.conv.mres).round() as i64
                 } else {
                     0
                 };
-                // C: load_pos updates ldvl/lval/lrvl
-                self.internal.ldvl = self.pos.dval;
-                self.internal.lval = self.pos.val;
-                self.internal.lrvl = self.pos.rval;
-                // AsynMotor operates in dial coordinates
-                effects.commands.push(MotorCommand::SetPosition {
-                    position: self.pos.dval,
-                });
+                if !self.stat.mip.contains(MipFlags::LOAD_P) {
+                    self.load_pos(&mut effects);
+                }
             }
             CommandSource::Cnen => {
                 // C: case motorRecordCNEN — only drives ENABLE/DISABL_TORQUE
@@ -1071,27 +1066,42 @@ impl MotorRecord {
                 self.pos.val -= delta; // undo: keep VAL/DVAL/OFF consistent
                 return false;
             }
-            if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
-                self.pos.val,
-                self.conv.dir,
-                self.pos.off,
-                self.conv.foff,
-                self.conv.mres,
-                true,
-                self.pos.dval,
-            ) {
-                self.pos.dval = dval;
-                self.pos.rval = rval;
-                self.pos.off = off;
-                // C 2220: a Variable-offset redefinition retranslates the
-                // user limits (Frozen leaves OFF untouched — idempotent).
-                if self.conv.foff == FreezeOffset::Variable {
+            if self.conv.foff == FreezeOffset::Variable {
+                // C 2206-2227 via the tweak fold: offset-only
+                // redefinition — DVAL untouched, no controller command,
+                // complete on the spot (mip = MIP_DONE, dmov = TRUE).
+                if let Ok((dval, rval, off)) = coordinate::cascade_from_val(
+                    self.pos.val,
+                    self.conv.dir,
+                    self.pos.off,
+                    self.conv.foff,
+                    self.conv.mres,
+                    true,
+                    self.pos.dval,
+                ) {
+                    self.pos.dval = dval;
+                    self.pos.rval = rval;
+                    self.pos.off = off;
                     self.set_userlimits();
+                    self.pos.rbv =
+                        coordinate::dial_to_user(self.pos.drbv, self.conv.dir, self.pos.off);
+                    self.internal.lval = self.pos.val;
+                    self.stat.mip = MipFlags::empty();
+                    self.stat.dmov = true;
+                    self.set_phase(MotionPhase::Idle);
+                }
+            } else {
+                // C Frozen: the fold propagates VAL -> DVAL (2233) and
+                // the move block routes it to load_pos (2257-2263).
+                let dval = coordinate::user_to_dial(self.pos.val, self.conv.dir, self.pos.off);
+                if let Ok(rval) = coordinate::dial_to_raw(dval, self.conv.mres) {
+                    self.pos.dval = dval;
+                    self.pos.rval = rval;
+                }
+                if !self.stat.mip.contains(MipFlags::LOAD_P) {
+                    self.load_pos(effects);
                 }
             }
-            effects.commands.push(MotorCommand::SetPosition {
-                position: self.pos.dval,
-            });
             return false;
         }
 
@@ -1386,6 +1396,42 @@ impl MotorRecord {
         } else {
             self.move_accel_egu()
         }
+    }
+
+    /// C load_pos (motorRecord.cc:3771-3817): calc and load a new raw
+    /// position into the controller WITHOUT moving it. The drive triplet
+    /// re-anchors (ldvl/lval/lrvl), the FOFF branch keeps either the
+    /// user value (Variable: offset recomputed + limits retranslated)
+    /// or the offset (Frozen: VAL retranslated), MIP becomes LOAD_P
+    /// wholesale and DMOV pulses low (3802-3808). LOAD_POS is followed
+    /// by GET_INFO — `request_poll` — and the status callback completes
+    /// the cycle (process 1404-1409: MIP_LOAD_P -> MIP_DONE, DMOV ->
+    /// TRUE, no DLY and no retry evaluation).
+    pub(crate) fn load_pos(&mut self, effects: &mut ProcessEffects) {
+        self.internal.ldvl = self.pos.dval;
+        self.internal.lval = self.pos.val;
+        if self.conv.mres != 0.0 {
+            self.pos.rval = (self.pos.dval / self.conv.mres).round() as i64;
+        }
+        self.internal.lrvl = self.pos.rval;
+        if self.conv.foff == FreezeOffset::Frozen {
+            // C 3782-3791: translate dial to user through the frozen
+            // offset.
+            self.pos.val = coordinate::dial_to_user(self.pos.dval, self.conv.dir, self.pos.off);
+            self.internal.lval = self.pos.val;
+        } else {
+            // C 3792-3800: adjust the offset to keep VAL and retranslate
+            // the user limits.
+            self.pos.off = coordinate::calc_offset(self.pos.val, self.pos.dval, self.conv.dir);
+            self.set_userlimits();
+        }
+        self.pos.rbv = coordinate::dial_to_user(self.pos.drbv, self.conv.dir, self.pos.off);
+        self.stat.mip = MipFlags::LOAD_P;
+        self.stat.dmov = false;
+        effects.commands.push(MotorCommand::SetPosition {
+            position: self.pos.dval,
+        });
+        effects.request_poll = true;
     }
 
     /// C set_userlimits (motorRecord.cc:4334-4348): translate the dial

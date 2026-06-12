@@ -1071,47 +1071,55 @@ impl MotorRecord {
                 });
             }
             SpmgMode::Go => {
-                if self.stat.phase == MotionPhase::Idle {
-                    // C top-block Go branch (1909-1925): a still-latched
-                    // jog button re-arms the jog (MIP_JOG_REQ); else a bare
-                    // mip == MIP_STOP collapses to DONE. The pass then
-                    // falls through to the move block (2241), which
-                    // re-fires on `dval != ldvl || !dmov`: that resumes a
-                    // paused move (maybeRetry left mip=RETRY, dmov=FALSE)
-                    // and dispatches a target written under Stop/Pause
-                    // (collected but not acted on, 2237). A completed or
-                    // synced state has dval == ldvl and dmov, so nothing
-                    // fires.
-                    // C 1914: `(jogf && !hls) || (jogr && !lls)` — a
-                    // latched button at its limit switch does not re-arm;
-                    // the pass falls to the STOP collapse instead of
-                    // leaving the record stuck in MIP_STOP.
-                    if (self.ctrl.jogf && !self.limits.hls) || (self.ctrl.jogr && !self.limits.lls)
+                // C top-block Go branch (1909-1925) runs UNGATED — there
+                // is no idle/phase test, so a Go written while the pause
+                // stop is still decelerating acts on this very pass: a
+                // still-latched jog button re-arms the jog (MIP_JOG_REQ;
+                // start_jog queues it when the axis is still moving,
+                // C 2106); else a bare mip == MIP_STOP collapses to DONE
+                // and the pass falls through to the move block (2241),
+                // whose dispatch re-fires on `dval != ldvl || !dmov` —
+                // the new MOVE supersedes the decelerating stop in the
+                // controller. Gating this on an idle phase consumed the
+                // Go edge with no replay: the paused move never resumed
+                // (stuck at DMOV=0, MIP=RETRY, SPMG reading Go).
+                //
+                // C 1914: `(jogf && !hls) || (jogr && !lls)` — a latched
+                // button at its limit switch does not re-arm; the pass
+                // falls to the STOP collapse instead of leaving the
+                // record stuck in MIP_STOP.
+                if (self.ctrl.jogf && !self.limits.hls) || (self.ctrl.jogr && !self.limits.lls) {
+                    let forward = self.ctrl.jogf;
+                    self.start_jog(forward, effects);
+                } else {
+                    if self.stat.mip == MipFlags::STOP {
+                        self.stat.mip = MipFlags::empty();
+                    }
+                    // C 2455 dispatch gate: only mip == MIP_DONE or
+                    // MIP_RETRY may issue the move. A queued jog/home
+                    // (JOGF|STOP, HOMF|STOP) keeps its direction bits, so
+                    // it is NOT re-dispatched here — it replays at stop
+                    // completion exactly as before.
+                    if (self.stat.mip.is_empty() || self.stat.mip == MipFlags::RETRY)
+                        && (!self.stat.dmov || self.pos.dval != self.internal.ldvl)
                     {
-                        let forward = self.ctrl.jogf;
-                        self.start_jog(forward, effects);
-                    } else {
-                        if self.stat.mip == MipFlags::STOP {
-                            self.stat.mip = MipFlags::empty();
-                        }
-                        if !self.stat.dmov || self.pos.dval != self.internal.ldvl {
-                            self.plan_absolute_move(effects);
-                        }
+                        self.plan_absolute_move(effects);
                     }
                 }
             }
             SpmgMode::Move => {
                 // One-shot: like Go but will restore to Pause after
-                // completion. C top-block else-branch (1927-1933):
-                // mip = MIP_DONE and rcnt = 0 (unlike Go, a Move resume
-                // abandons the retry accounting), then the move block
-                // re-fires exactly as for Go.
-                if self.stat.phase == MotionPhase::Idle {
-                    self.stat.mip = MipFlags::empty();
-                    self.retry.rcnt = 0;
-                    if !self.stat.dmov || self.pos.dval != self.internal.ldvl {
-                        self.plan_absolute_move(effects);
-                    }
+                // completion. C top-block else-branch (1927-1933) runs
+                // ungated and assigns mip = MIP_DONE WHOLESALE with
+                // rcnt = 0 — a Move resume abandons the retry accounting
+                // AND any queued jog/home (their MIP direction bits are
+                // overwritten), then the move block re-fires exactly as
+                // for Go.
+                self.stat.mip = MipFlags::empty();
+                self.retry.rcnt = 0;
+                self.internal.queued_motion = None;
+                if !self.stat.dmov || self.pos.dval != self.internal.ldvl {
+                    self.plan_absolute_move(effects);
                 }
             }
         }

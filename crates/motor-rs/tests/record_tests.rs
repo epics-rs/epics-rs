@@ -4650,3 +4650,119 @@ fn test_queued_jog_replay_folds_dir_and_updates_cdir() {
         "replay refreshes CDIR like C's re-entered jog section"
     );
 }
+
+#[test]
+fn test_go_during_pause_deceleration_resumes_move() {
+    // C 1862-1925: Pause mid-move stops the axis (wholesale MIP_STOP);
+    // a Go written BEFORE the stop completes collapses MIP_STOP to DONE
+    // on that same pass (C runs the top block ungated) and falls
+    // through to the move block, which re-fires the unfinished move
+    // (!dmov, C 2241/2455) — the new MOVE supersedes the decelerating
+    // stop in the controller. The Go edge must not be dropped.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+
+    rec.ctrl.spmg = SpmgMode::Pause;
+    rec.plan_motion(CommandSource::Spmg);
+    assert_eq!(rec.stat.mip, MipFlags::STOP);
+
+    // Go arrives while still decelerating (no completion poll yet).
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        effects.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveAbsolute { position, .. } if (*position - 50.0).abs() < 1e-9
+        )),
+        "Go during the pause deceleration must re-fire the move"
+    );
+    assert!(rec.stat.mip.contains(MipFlags::MOVE));
+}
+
+#[test]
+fn test_go_with_queued_home_defers_to_replay_not_move_dispatch() {
+    // C 2455 dispatch gate: mip = HOMF|STOP (queued home) is neither
+    // MIP_DONE nor MIP_RETRY, so a Go pass must NOT dispatch a move
+    // over it; the queued home replays at stop completion (856-890).
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+    rec.ctrl.spmg = SpmgMode::Move; // so the later Go write is an edge
+    rec.plan_motion(CommandSource::Spmg);
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+    rec.ctrl.homf = true;
+    rec.plan_motion(CommandSource::Homf);
+    assert_eq!(rec.stat.mip, MipFlags::HOMF | MipFlags::STOP);
+
+    rec.ctrl.spmg = SpmgMode::Go;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "queued home keeps its replay path; Go must not dispatch a move"
+    );
+    assert_eq!(rec.stat.mip, MipFlags::HOMF | MipFlags::STOP);
+
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.movn = false;
+    let effects = rec.check_completion();
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Home { .. })),
+        "queued home replays at stop completion"
+    );
+}
+
+#[test]
+fn test_spmg_move_during_deceleration_abandons_queued_jog_and_resumes() {
+    // C 1927-1933: the Move arm assigns mip = MIP_DONE WHOLESALE with
+    // rcnt = 0 — a queued jog loses its MIP direction bits (never
+    // replayed) and the move block re-fires the unfinished target.
+    let mut rec = MotorRecord::new();
+    rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+    rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
+    rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
+    rec.plan_motion(CommandSource::Val);
+    rec.stat.msta = MstaFlags::MOVING;
+    rec.stat.movn = true;
+    rec.ctrl.jogf = true;
+    rec.plan_motion(CommandSource::Jogf);
+    assert_eq!(rec.stat.mip, MipFlags::JOGF | MipFlags::STOP);
+
+    rec.ctrl.spmg = SpmgMode::Move;
+    let effects = rec.plan_motion(CommandSource::Spmg);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveAbsolute { .. })),
+        "Move resumes the unfinished target"
+    );
+    assert!(rec.stat.mip.contains(MipFlags::MOVE));
+
+    // Completion: the abandoned jog must not replay.
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.movn = false;
+    rec.pos.rbv = 50.0;
+    rec.pos.drbv = 50.0;
+    let effects = rec.check_completion();
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
+        "queued jog was abandoned wholesale by the Move resume (C 1927-1933)"
+    );
+}

@@ -2603,8 +2603,8 @@ fn test_dllm_greater_than_dhlm_sets_lvio_immediately() {
 #[test]
 fn test_llm_greater_than_hlm_sets_lvio_immediately() {
     let mut rec = MotorRecord::new();
-    // HLM put first; user-side normalization swaps dial but record-side user
-    // pair stays as written, so detect_inverted_limits flags LVIO.
+    // Each user-limit write moves one dial limit (C set_user_*limit), so
+    // the inverted pair lands in BOTH frames and latches LVIO.
     rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(100.0)).unwrap();
     assert!(rec.limits.llm > rec.limits.hlm);
@@ -4998,5 +4998,56 @@ mod flnk_dmov_gate {
             rec.should_fire_forward_link(),
             "C fires FLNK on the refusal pass (dmov stayed 1)"
         );
+    }
+}
+
+// C set_user_highlimit / set_user_lowlimit / set_dial_highlimit /
+// set_dial_lowlimit (motorRecord.cc:4076-4328): every limit write moves
+// exactly ONE field in the other frame — the pair is never re-ordered.
+mod one_sided_limit_writes {
+    use super::*;
+
+    // Writing HLM below the existing LLM must NOT swap the dial pair:
+    // DHLM alone moves, the inverted pair persists, and LVIO latches.
+    #[test]
+    fn hlm_below_llm_preserves_inverted_dial_pair_and_latches_lvio() {
+        let mut rec = MotorRecord::new();
+        rec.conv.mres = 1.0;
+        rec.put_field("HLM", EpicsValue::Double(10.0)).unwrap();
+        rec.put_field("LLM", EpicsValue::Double(-10.0)).unwrap();
+        assert!(!rec.limits.lvio || rec.pos.dval > 10.0);
+
+        rec.put_field("HLM", EpicsValue::Double(-20.0)).unwrap();
+        assert_eq!(rec.limits.dhlm, -20.0, "only DHLM moves");
+        assert_eq!(rec.limits.dllm, -10.0, "DLLM must stay as written");
+        assert!(rec.limits.dllm > rec.limits.dhlm, "inverted pair kept");
+        assert!(rec.limits.lvio, "inverted pair must latch LVIO");
+    }
+
+    // DIR=Neg: an HLM write lands in DLLM only (C 4090-4092), an LLM
+    // write in DHLM only (C 4169-4171).
+    #[test]
+    fn dir_neg_hlm_write_updates_dllm_only() {
+        let mut rec = MotorRecord::new();
+        rec.conv.dir = MotorDir::Neg;
+        rec.pos.off = 5.0;
+        rec.limits.dhlm = 77.0;
+        rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
+        assert_eq!(rec.limits.dllm, -95.0); // -(100 - 5)
+        assert_eq!(rec.limits.dhlm, 77.0, "DHLM untouched");
+    }
+
+    // DIR=Neg: a DHLM write lands in LLM only (C 4261-4264), a DLLM
+    // write in HLM only (C 4312-4315).
+    #[test]
+    fn dir_neg_dhlm_write_updates_llm_only() {
+        let mut rec = MotorRecord::new();
+        rec.conv.dir = MotorDir::Neg;
+        rec.conv.mres = 1.0;
+        rec.pos.off = 5.0;
+        rec.limits.hlm = 33.0;
+        rec.put_field("DHLM", EpicsValue::Double(50.0)).unwrap();
+        assert_eq!(rec.limits.llm, -45.0); // -(50) + 5
+        assert_eq!(rec.limits.hlm, 33.0, "HLM untouched");
     }
 }

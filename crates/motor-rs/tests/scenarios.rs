@@ -572,9 +572,9 @@ fn dir_neg_swaps_limit_mapping() {
     rec.put_field("HLM", EpicsValue::Double(100.0)).unwrap();
     rec.put_field("LLM", EpicsValue::Double(-100.0)).unwrap();
 
-    // DIR=Neg: user HLM=100 → dial = (100-0)*(-1) = -100
-    // user LLM=-100 → dial = (-100-0)*(-1) = 100
-    // After normalization: DHLM=100, DLLM=-100
+    // C set_user_highlimit/lowlimit (motorRecord.cc:4076-4225): under
+    // DIR=Neg, the HLM write lands in DLLM = -(100-0) = -100 and the
+    // LLM write lands in DHLM = -(-100-0) = 100 — one dial limit each.
     assert_eq!(rec.limits.dhlm, 100.0);
     assert_eq!(rec.limits.dllm, -100.0);
 }

@@ -1371,18 +1371,23 @@ pub(crate) fn motor_put_field(
         "HLM" => match value {
             EpicsValue::Double(v) => {
                 rec.limits.hlm = v;
-                let (dhlm, dllm) = coordinate::user_limits_to_dial(
-                    rec.limits.hlm,
-                    rec.limits.llm,
-                    rec.conv.dir,
-                    rec.pos.off,
-                );
-                rec.limits.dhlm = dhlm;
-                rec.limits.dllm = dllm;
-                // Update raw limits
-                if rec.conv.mres != 0.0 {
-                    rec.limits.rhlm = rec.limits.dhlm / rec.conv.mres;
-                    rec.limits.rllm = rec.limits.dllm / rec.conv.mres;
+                // C set_user_highlimit (motorRecord.cc:4076-4147): a user
+                // high-limit write moves exactly ONE dial limit — DHLM
+                // when DIR=Pos, DLLM when DIR=Neg — plus that side's raw
+                // register. The pair is never re-ordered: writing HLM
+                // below LLM leaves an inverted dial pair, which latches
+                // LVIO below and blocks every move until corrected.
+                let dial = coordinate::user_to_dial(v, rec.conv.dir, rec.pos.off);
+                if rec.conv.dir == MotorDir::Pos {
+                    rec.limits.dhlm = dial;
+                    if rec.conv.mres != 0.0 {
+                        rec.limits.rhlm = dial / rec.conv.mres;
+                    }
+                } else {
+                    rec.limits.dllm = dial;
+                    if rec.conv.mres != 0.0 {
+                        rec.limits.rllm = dial / rec.conv.mres;
+                    }
                 }
                 detect_inverted_limits(&mut rec.limits, rec.pos.dval);
                 Ok(())
@@ -1392,17 +1397,19 @@ pub(crate) fn motor_put_field(
         "LLM" => match value {
             EpicsValue::Double(v) => {
                 rec.limits.llm = v;
-                let (dhlm, dllm) = coordinate::user_limits_to_dial(
-                    rec.limits.hlm,
-                    rec.limits.llm,
-                    rec.conv.dir,
-                    rec.pos.off,
-                );
-                rec.limits.dhlm = dhlm;
-                rec.limits.dllm = dllm;
-                if rec.conv.mres != 0.0 {
-                    rec.limits.rhlm = rec.limits.dhlm / rec.conv.mres;
-                    rec.limits.rllm = rec.limits.dllm / rec.conv.mres;
+                // C set_user_lowlimit (motorRecord.cc:4155-4225): mirror
+                // of HLM — DLLM when DIR=Pos, DHLM when DIR=Neg.
+                let dial = coordinate::user_to_dial(v, rec.conv.dir, rec.pos.off);
+                if rec.conv.dir == MotorDir::Pos {
+                    rec.limits.dllm = dial;
+                    if rec.conv.mres != 0.0 {
+                        rec.limits.rllm = dial / rec.conv.mres;
+                    }
+                } else {
+                    rec.limits.dhlm = dial;
+                    if rec.conv.mres != 0.0 {
+                        rec.limits.rhlm = dial / rec.conv.mres;
+                    }
                 }
                 detect_inverted_limits(&mut rec.limits, rec.pos.dval);
                 Ok(())
@@ -1416,14 +1423,15 @@ pub(crate) fn motor_put_field(
                 if rec.conv.mres != 0.0 {
                     rec.limits.rhlm = v / rec.conv.mres;
                 }
-                let (hlm, llm) = coordinate::dial_limits_to_user(
-                    rec.limits.dhlm,
-                    rec.limits.dllm,
-                    rec.conv.dir,
-                    rec.pos.off,
-                );
-                rec.limits.hlm = hlm;
-                rec.limits.llm = llm;
+                // C set_dial_highlimit (motorRecord.cc:4236-4277): a dial
+                // high-limit write updates exactly ONE user limit — HLM
+                // when DIR=Pos, LLM when DIR=Neg. No re-ordering.
+                let user = coordinate::dial_to_user(v, rec.conv.dir, rec.pos.off);
+                if rec.conv.dir == MotorDir::Pos {
+                    rec.limits.hlm = user;
+                } else {
+                    rec.limits.llm = user;
+                }
                 detect_inverted_limits(&mut rec.limits, rec.pos.dval);
                 Ok(())
             }
@@ -1435,14 +1443,14 @@ pub(crate) fn motor_put_field(
                 if rec.conv.mres != 0.0 {
                     rec.limits.rllm = v / rec.conv.mres;
                 }
-                let (hlm, llm) = coordinate::dial_limits_to_user(
-                    rec.limits.dhlm,
-                    rec.limits.dllm,
-                    rec.conv.dir,
-                    rec.pos.off,
-                );
-                rec.limits.hlm = hlm;
-                rec.limits.llm = llm;
+                // C set_dial_lowlimit (motorRecord.cc:4287-4328): mirror
+                // of DHLM — LLM when DIR=Pos, HLM when DIR=Neg.
+                let user = coordinate::dial_to_user(v, rec.conv.dir, rec.pos.off);
+                if rec.conv.dir == MotorDir::Pos {
+                    rec.limits.llm = user;
+                } else {
+                    rec.limits.hlm = user;
+                }
                 detect_inverted_limits(&mut rec.limits, rec.pos.dval);
                 Ok(())
             }

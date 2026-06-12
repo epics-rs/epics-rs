@@ -37,23 +37,16 @@ pub fn raw_to_dial(raw: i64, mres: f64) -> f64 {
     raw as f64 * mres
 }
 
-/// Normalize limits so high >= low.
-pub fn normalize_limits(a: f64, b: f64) -> (f64, f64) {
-    if a >= b { (a, b) } else { (b, a) }
-}
-
-/// Convert user limits to dial limits considering direction.
-pub fn user_limits_to_dial(hlm: f64, llm: f64, dir: MotorDir, off: f64) -> (f64, f64) {
-    let a = user_to_dial(hlm, dir, off);
-    let b = user_to_dial(llm, dir, off);
-    normalize_limits(a, b)
-}
-
-/// Convert dial limits to user limits considering direction.
+/// Translate dial limits to user limits — C `set_userlimits`
+/// (motorRecord.cc:4334-4348). DIR=Neg cross-maps the pair: the user
+/// high limit comes from the dial LOW limit (`hlm = -dllm + off`) and
+/// vice versa. An inverted pair is carried through as written, never
+/// re-ordered — C blocks all moves on it via LVIO instead.
 pub fn dial_limits_to_user(dhlm: f64, dllm: f64, dir: MotorDir, off: f64) -> (f64, f64) {
-    let a = dial_to_user(dhlm, dir, off);
-    let b = dial_to_user(dllm, dir, off);
-    normalize_limits(a, b)
+    match dir {
+        MotorDir::Pos => (dhlm + off, dllm + off),
+        MotorDir::Neg => (-dllm + off, -dhlm + off),
+    }
 }
 
 /// Check soft limit violation.
@@ -214,25 +207,32 @@ mod tests {
         assert_eq!(dial_to_raw(0.004, 0.01).unwrap(), 0); // 0.4 rounds to 0
     }
 
+    // C set_userlimits (motorRecord.cc:4336-4340): DIR=Pos maps each
+    // dial limit straight across.
     #[test]
-    fn test_normalize_limits() {
-        assert_eq!(normalize_limits(10.0, -10.0), (10.0, -10.0));
-        assert_eq!(normalize_limits(-10.0, 10.0), (10.0, -10.0));
-        assert_eq!(normalize_limits(5.0, 5.0), (5.0, 5.0));
+    fn test_dial_limits_to_user_pos() {
+        let (hlm, llm) = dial_limits_to_user(100.0, -50.0, MotorDir::Pos, 10.0);
+        assert_eq!(hlm, 110.0);
+        assert_eq!(llm, -40.0);
     }
 
+    // C set_userlimits (motorRecord.cc:4341-4345): DIR=Neg cross-maps —
+    // hlm = -dllm + off, llm = -dhlm + off.
     #[test]
-    fn test_user_limits_to_dial_pos() {
-        let (dhlm, dllm) = user_limits_to_dial(100.0, -100.0, MotorDir::Pos, 0.0);
-        assert_eq!(dhlm, 100.0);
-        assert_eq!(dllm, -100.0);
+    fn test_dial_limits_to_user_neg_cross_maps() {
+        let (hlm, llm) = dial_limits_to_user(100.0, -50.0, MotorDir::Neg, 10.0);
+        assert_eq!(hlm, 60.0); // -(-50) + 10
+        assert_eq!(llm, -90.0); // -(100) + 10
     }
 
+    // An inverted dial pair stays inverted in user coordinates — C never
+    // re-orders limits; LVIO blocks moves instead.
     #[test]
-    fn test_user_limits_to_dial_neg() {
-        let (dhlm, dllm) = user_limits_to_dial(100.0, -100.0, MotorDir::Neg, 0.0);
-        assert_eq!(dhlm, 100.0);
-        assert_eq!(dllm, -100.0);
+    fn test_dial_limits_to_user_preserves_inverted_pair() {
+        let (hlm, llm) = dial_limits_to_user(-20.0, -10.0, MotorDir::Pos, 0.0);
+        assert_eq!(hlm, -20.0);
+        assert_eq!(llm, -10.0);
+        assert!(hlm < llm, "inverted pair must be carried through");
     }
 
     #[test]
@@ -325,17 +325,6 @@ mod tests {
         assert_eq!(dval, 10.0);
         assert_eq!(val, -5.0); // -1*10 + 5
         assert_eq!(off, 5.0);
-    }
-
-    #[test]
-    fn test_dir_neg_swaps_limit_mapping() {
-        // When DIR=Neg, user HLM maps to dial LLM and vice versa
-        let (dhlm, dllm) = user_limits_to_dial(100.0, -50.0, MotorDir::Neg, 10.0);
-        // user 100 -> dial: (100-10)*(-1) = -90
-        // user -50 -> dial: (-50-10)*(-1) = 60
-        // normalize: (60, -90)
-        assert_eq!(dhlm, 60.0);
-        assert_eq!(dllm, -90.0);
     }
 
     #[test]

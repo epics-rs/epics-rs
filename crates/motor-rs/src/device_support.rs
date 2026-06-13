@@ -358,4 +358,13 @@ impl DeviceSupport for MotorDeviceSupport {
     fn io_intr_receiver(&mut self) -> Option<mpsc::Receiver<()>> {
         self.io_intr_rx.take()
     }
+
+    /// The motor's poll `statusCallback` drives `dbProcess` on every readback
+    /// regardless of `SCAN` (C `motorRecord` parity), and the record stays
+    /// `SCAN="Passive"` so a `dbPutField` to a `pp(TRUE)` motion field
+    /// (VAL/DVAL/RVAL/RLV/JOG/HOME/...) still re-processes it. Decouple the
+    /// poll-feedback wiring from the `SCAN` menu.
+    fn io_intr_scan_independent(&self) -> bool {
+        true
+    }
 }

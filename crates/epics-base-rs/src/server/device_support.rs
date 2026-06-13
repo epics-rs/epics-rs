@@ -156,9 +156,29 @@ pub trait DeviceSupport: Send + Sync + 'static {
     fn apply_record_info(&mut self, _info: &std::collections::HashMap<String, String>) {}
 
     /// Return a receiver for I/O Intr scan notifications.
-    /// Only called for records with SCAN=I/O Intr.
+    /// Called for records with `SCAN="I/O Intr"`, and for any device that
+    /// reports [`io_intr_scan_independent`](Self::io_intr_scan_independent).
     fn io_intr_receiver(&mut self) -> Option<crate::runtime::sync::mpsc::Receiver<()>> {
         None
+    }
+
+    /// Whether this device drives record processing from its own callback
+    /// channel independently of the runtime `SCAN` menu.
+    ///
+    /// C parity: a `motorRecord` device callback (`statusCallback`) does its
+    /// own `dbScanLock` + `dbProcess` on every poll readback regardless of
+    /// `SCAN`, and the record stays `SCAN="Passive"` so a `dbPutField` to a
+    /// `pp(TRUE)` field (VAL/DVAL/...) still re-processes it
+    /// (`dbAccess.c:1263-1268`). asyn readback records behave the same way
+    /// (upstream PRs #60/#208 — output records follow driver-side changes
+    /// regardless of `SCAN`).
+    ///
+    /// When `true`, the I/O Intr wiring processes the record on every pulse
+    /// even when `SCAN != "I/O Intr"`. When `false` (default), processing is
+    /// gated on the record's current `SCAN` being `"I/O Intr"`, matching C
+    /// `scanIoRequest`, which honors scan-list membership.
+    fn io_intr_scan_independent(&self) -> bool {
+        false
     }
 
     /// Begin an asynchronous write (submit only, no blocking).

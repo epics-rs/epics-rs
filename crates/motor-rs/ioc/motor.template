@@ -1,6 +1,6 @@
 record(motor, "$(P)$(M)") {
     field(DTYP, "simMotor_$(PORT)")
-    field(SCAN, "I/O Intr")
+    field(SCAN, "Passive")
     field(VELO, "$(VELO=1.0)")
     field(ACCL, "$(ACCL=0.5)")
     field(DHLM, "$(HLM=100.0)")

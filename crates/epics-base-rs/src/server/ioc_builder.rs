@@ -360,7 +360,17 @@ impl IocBuilder {
 
         for (name, rec_arc) in io_intr_recs {
             let mut inst = rec_arc.write().await;
-            if inst.common.scan == record::ScanType::IoIntr {
+            // Wire poll feedback when the record is on I/O Intr scan, OR when
+            // the device drives processing from its own callback independently
+            // of the SCAN menu (motorRecord statusCallback; asyn readback
+            // records, PRs #60/#208). The device's decision is authoritative —
+            // the SCAN check alone would suppress callbacks for a
+            // SCAN="Passive" motor, breaking the pp(TRUE) dbPutField gate.
+            let independent = inst
+                .device
+                .as_ref()
+                .is_some_and(|d| d.io_intr_scan_independent());
+            if inst.common.scan == record::ScanType::IoIntr || independent {
                 if let Some(mut dev) = inst.device.take() {
                     if let Some(mut intr_rx) = dev.io_intr_receiver() {
                         let db_clone = db.clone();
@@ -368,11 +378,11 @@ impl IocBuilder {
                         let rec_arc_clone = rec_arc.clone();
                         crate::runtime::task::spawn(async move {
                             while intr_rx.recv().await.is_some() {
-                                let is_io_intr = {
+                                let process = independent || {
                                     let inst = rec_arc_clone.read().await;
                                     inst.common.scan == record::ScanType::IoIntr
                                 };
-                                if !is_io_intr {
+                                if !process {
                                     continue;
                                 }
                                 let mut visited = std::collections::HashSet::new();

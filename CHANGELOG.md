@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.20.1 — 2026-06-13
+
+Patch release: two C-parity regression fixes on top of `v0.20.0`. No API
+changes.
+
+### Motor: `caput` to a motor field moves the motor again
+
+`v0.20.0` added `"motor"` to the `dbPutField` pp-field processing gate
+(`fix(base)` `750851bd`), so a CA put to a `pp(TRUE)` field re-processes
+the record only when `SCAN=="Passive"` (C `dbAccess.c:1263-1268`). But
+`motor.template` shipped `SCAN="I/O Intr"` — a Rust-only hack to route
+SimMotor poll feedback through `setup_io_intr` — so `SCAN != Passive`
+and a `caput` to `VAL`/`DVAL`/`RVAL`/`JOG`/... no longer re-processed:
+the motor sat idle. `kohzuCtl`'s coordinated moves write `VAL` through
+the same gated put path, so the kohzu DCM was a victim too.
+
+The structural cause was that `setup_io_intr` wired poll feedback *only*
+for `SCAN=="I/O Intr"`, forcing a motor to choose between poll feedback
+(needs `I/O Intr`) and put re-processing (needs `Passive`) when it needs
+both. C has no such conflict: `motorRecord` stays `SCAN="Passive"`
+(`dbCommon` default) and its asyn `statusCallback` does
+`dbScanLock`+`dbProcess` on every readback regardless of `SCAN`.
+
+Fix (`fix(motor)` `12b666fb`): the device support is now authoritative
+over its own callback-driven processing via the new
+`DeviceSupport::io_intr_scan_independent()` (default `false`; `motor` →
+`true`). The I/O Intr wiring processes a record on every callback pulse
+when `SCAN=="I/O Intr"` **or** the device reports independence, and
+`motor.template` reverts to `SCAN="Passive"`. Behavior is unchanged for
+every device that keeps the default.
+
+### asyn: revive the SCAN-independent readback path
+
+`fix(asyn)` `4507d164`: an asyn record flagged
+`info(asyn:READBACK,"1")` on a non-`I/O Intr` scan (upstream PRs
+#60/#208 — output records that follow driver-side changes regardless of
+`SCAN`) had a working `io_intr_receiver` but was never wired end to end,
+because the old `setup_io_intr` SCAN gate dropped it. The asyn adapter
+now overrides `io_intr_scan_independent()` to `self.asyn_readback`, so a
+readback-flagged record is wired and processed on every interrupt
+callback even at `SCAN="Passive"`. Records without the info tag are
+unaffected.
+
 ## v0.20.0 — 2026-06-13
 
 Minor-major release: the motor record completes a full C-parity sweep

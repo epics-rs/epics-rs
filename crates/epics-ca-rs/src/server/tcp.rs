@@ -2436,14 +2436,15 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // wire frame, so READ_NOTIFY is handled here, silently.
             //
             // C `read_action` (`rsrv/camessage.c:608-619`) resolves the
-            // channel FIRST (`if(!pciu){logBadId;return}` — a silent
-            // drop on unknown SID) and only THEN, if the type is
+            // channel FIRST (`if(!pciu){logBadId;return}` — `logBadId`
+            // sends an ECA_INTERNAL "Bad Resource ID" frame with a
+            // cid=0xFFFFFFFF sentinel) and only THEN, if the type is
             // invalid, sends ECA_BADTYPE carrying the channel's real cid
             // + record name. So the deprecated-READ bad-type frame must
             // be gated on the channel existing: it is emitted below,
             // after the lookup, never with a `u32::MAX` sentinel here.
             // Otherwise an unknown SID + bad type drew a spurious
-            // ECA_BADTYPE(cid=0xFFFFFFFF) where C silently drops.
+            // ECA_BADTYPE where C sends the bad-SID ECA_INTERNAL frame.
             //
             // `LAST_BUFFER_TYPE = 38` (caProto.h); request types above
             // that are not encodable.
@@ -2459,15 +2460,19 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             let entry = match state.channels.get(&sid) {
                 Some(e) => e,
                 None => {
-                    // C `read_action` (camessage.c:608-610):
-                    // `if (!pciu) { logBadId; return RSRV_ERROR; }` —
-                    // silent disconnect, no wire reply. Matches the
-                    // EVENT_ADD silent-disconnect pattern (commit
-                    // 9fdbc37) where C's logBadId path is "log
-                    // server-side, drop the connection". Pre-fix
-                    // Rust sent ECA_BADCHID for READ_NOTIFY and
-                    // silently kept the connection for READ; both
-                    // diverged from C's silent + drop.
+                    // C `read_action` (camessage.c:608-610) and
+                    // `read_notify_action` (700-703) bad-SID:
+                    // `if (!pciu) { logBadId; return RSRV_ERROR; }`.
+                    // `logBadId` (camessage.c:307-320) is NOT log-only —
+                    // it calls `send_err(ECA_INTERNAL, "Bad Resource ID
+                    // at %s.%d")`, buffering a CA_PROTO_ERROR frame that
+                    // camsgtask.c:142 flushes ("flush any queued messages
+                    // before shutdown") before the disconnect. Since
+                    // `MPTOPCIU` returned NULL, `vsend_err` stamps
+                    // cid=0xFFFFFFFF (camessage.c:163-167). So C emits one
+                    // ECA_INTERNAL frame, then drops the connection.
+                    send_ca_error(writer, hdr, ECA_INTERNAL, 0xFFFF_FFFF, "Bad Resource ID")
+                        .await?;
                     return Err(epics_base_rs::error::CaError::Protocol(format!(
                         "READ on unknown SID {} (matches C read_action logBadId + RSRV_ERROR)",
                         sid
@@ -2864,10 +2869,13 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     None => {
                         // C `write_action` (camessage.c:736-738) +
                         // `write_notify_action` (camessage.c:1642-1645):
-                        // `if (!pciu) { logBadId; return RSRV_ERROR; }`
-                        // — silent disconnect on missing channel. Same
-                        // family as the EVENT_ADD bad-SID and the
-                        // matching READ branch below.
+                        // `if (!pciu) { logBadId; return RSRV_ERROR; }`.
+                        // `logBadId` emits an ECA_INTERNAL "Bad Resource
+                        // ID" frame (cid=0xFFFFFFFF), flushed before the
+                        // disconnect — same family as the EVENT_ADD bad-SID
+                        // and the matching READ branch below.
+                        send_ca_error(writer, hdr, ECA_INTERNAL, 0xFFFF_FFFF, "Bad Resource ID")
+                            .await?;
                         return Err(epics_base_rs::error::CaError::Protocol(format!(
                             "WRITE (ACKT/ACKS) on unknown SID {} \
                              (matches C write_action logBadId + RSRV_ERROR)",
@@ -2993,16 +3001,21 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             // C `write_action` (`rsrv/camessage.c:735-739`) and
             // `write_notify_action` (`camessage.c:1641-1645`) call
             // `MPTOPCIU(mp)` BEFORE any DBR-type check, so a bad SID
-            // path goes through `logBadId` + RSRV_ERROR (silent drop)
+            // path goes through `logBadId` + RSRV_ERROR — emitting the
+            // ECA_INTERNAL "Bad Resource ID" frame (cid=0xFFFFFFFF)
             // regardless of whether the type is also invalid. Pre-fix
             // Rust ran the type check first and emitted an ECA_BADTYPE
-            // error frame for the SID+type combo where rsrv would
-            // have closed silently. Reorder to match C.
+            // error frame for the SID+type combo where rsrv sends the
+            // bad-SID ECA_INTERNAL frame instead. Reorder to match C.
             let entry = match state.channels.get(&sid) {
                 Some(e) => e,
                 None => {
                     // Same C logBadId + RSRV_ERROR family as the
-                    // ACKT/ACKS branch above and the READ branch.
+                    // ACKT/ACKS branch above and the READ branch: an
+                    // ECA_INTERNAL "Bad Resource ID" frame (cid=0xFFFFFFFF)
+                    // is buffered then flushed ahead of the disconnect.
+                    send_ca_error(writer, hdr, ECA_INTERNAL, 0xFFFF_FFFF, "Bad Resource ID")
+                        .await?;
                     return Err(epics_base_rs::error::CaError::Protocol(format!(
                         "WRITE on unknown SID {} (matches C write_action logBadId + RSRV_ERROR)",
                         sid
@@ -3568,14 +3581,18 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 Some(e) => e,
                 None => {
                     // C `event_add_action` (camessage.c:1773-1777):
-                    // `logBadId` + RSRV_ERROR on missing channel —
-                    // logs server-side, no wire reply, then drops the
-                    // connection. Same silent-disconnect pattern as
-                    // the INVALID_DB_REQ branch above. This MUST run
+                    // `logBadId` + RSRV_ERROR on missing channel.
+                    // `logBadId` emits an ECA_INTERNAL "Bad Resource ID"
+                    // frame (cid=0xFFFFFFFF) before the disconnect — the
+                    // genuinely-silent EVENT_ADD path is only the
+                    // pre-lookup INVALID_DB_REQ (bad-TYPE) branch above,
+                    // which returns RSRV_ERROR with no send. This MUST run
                     // before the mask==0 ALLOCMEM check below: in C the
                     // missing-channel branch precedes the `db_add_event`
-                    // NULL (select==0) path, so an unknown SID stays a
-                    // silent drop regardless of mask.
+                    // NULL (select==0) path, so an unknown SID draws the
+                    // ECA_INTERNAL frame regardless of mask.
+                    send_ca_error(writer, hdr, ECA_INTERNAL, 0xFFFF_FFFF, "Bad Resource ID")
+                        .await?;
                     return Err(epics_base_rs::error::CaError::Protocol(format!(
                         "EVENT_ADD on unknown SID {} (matches C event_add_action logBadId + RSRV_ERROR)",
                         sid
@@ -4203,25 +4220,28 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
         CA_PROTO_EVENT_CANCEL => {
             let sub_id = hdr.available;
             let req_channel_sid = hdr.cid;
-            // C `event_cancel_reply` (`camessage.c:1998-2021`)
+            // C `event_cancel_reply` (`camessage.c:1992-1996`)
             // calls `MPTOPCIU(mp)` first. If the request's channel id
             // is unknown or belongs to another client, rsrv calls
-            // `logBadId` and returns RSRV_ERROR WITHOUT sending a
-            // wire error frame. Only after a valid channel resolves
+            // `logBadId` — which sends an ECA_INTERNAL "Bad Resource ID"
+            // frame (cid=0xFFFFFFFF), flushed before the disconnect —
+            // and returns RSRV_ERROR. Only after a valid channel resolves
             // does rsrv walk that channel's event queue and emit
             // ECA_BADMONID for an unknown monitor id.
             //
             // Pre-fix Rust checked the flat subscription map first,
             // so an unknown SID elicited ECA_BADMONID (the diagnostic
             // path that resolves a fallback PV name for the bad-SID
-            // case). Mirror C: silent close on bad SID; ECA_BADMONID
-            // only when SID is good but sub-id doesn't belong.
+            // case). Mirror C: ECA_INTERNAL frame + close on bad SID;
+            // ECA_BADMONID only when SID is good but sub-id doesn't belong.
             let (entry_cid, entry_pv_name) = match state.channels.get(&req_channel_sid) {
                 Some(entry) => (entry.cid, entry.pv_name.clone()),
                 None => {
+                    send_ca_error(writer, hdr, ECA_INTERNAL, 0xFFFF_FFFF, "Bad Resource ID")
+                        .await?;
                     return Err(epics_base_rs::error::CaError::Protocol(format!(
                         "EVENT_CANCEL on unknown SID {} (matches C event_cancel_reply \
-                         logBadId + RSRV_ERROR silent close)",
+                         logBadId + RSRV_ERROR)",
                         req_channel_sid
                     )));
                 }
@@ -4525,16 +4545,18 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
         CA_PROTO_CLEAR_CHANNEL => {
             let sid = hdr.cid;
             let cid = hdr.available;
-            // C `clear_channel_reply` (camessage.c:1883-1887) silently
-            // disconnects on a bad SID via `logBadId` + RSRV_ERROR
-            // (no wire reply). Channels in this Rust state are per-
-            // client by construction, so the "foreign channel"
-            // sub-case of the C check (`pciu->client != client`)
+            // C `clear_channel_reply` (camessage.c:1883-1887)
+            // disconnects on a bad SID via `logBadId` + RSRV_ERROR;
+            // `logBadId` emits an ECA_INTERNAL "Bad Resource ID" frame
+            // (cid=0xFFFFFFFF) flushed before the close. Channels in this
+            // Rust state are per-client by construction, so the "foreign
+            // channel" sub-case of the C check (`pciu->client != client`)
             // can't happen — the only failure mode is unknown SID.
             // Pre-fix Rust silently skipped without disconnecting,
             // so a probing peer could send CLEAR_CHANNEL on random
             // SIDs indefinitely.
             if !state.channels.contains_key(&sid) {
+                send_ca_error(writer, hdr, ECA_INTERNAL, 0xFFFF_FFFF, "Bad Resource ID").await?;
                 return Err(epics_base_rs::error::CaError::Protocol(format!(
                     "CLEAR_CHANNEL on unknown SID {} (matches C clear_channel_reply logBadId + RSRV_ERROR)",
                     sid
@@ -7525,17 +7547,20 @@ mod r46_zero_mask_event_add_tests {
     }
 
     /// Guard-ordering regression: an EVENT_ADD carrying an unknown/stale
-    /// SID *and* mask==0 must fall through to the silent missing-channel
-    /// drop, NOT emit a spurious ECA_ALLOCMEM. In C `event_add_action`
-    /// the missing-channel branch (`if (!pciu) { logBadId; return
-    /// RSRV_ERROR; }`, camessage.c:1773-1777) is silent and runs *before*
-    /// the `db_add_event` NULL (select==0) ALLOCMEM path
-    /// (camessage.c:1814-1822), so an unknown SID stays silent regardless
-    /// of mask. The defective guard ran the mask==0 check before the
-    /// channel lookup and replied `CA_PROTO_ERROR(ECA_ALLOCMEM,
-    /// m_cid=0xFFFF_FFFF)` here.
+    /// SID *and* mask==0 must emit the bad-SID `ECA_INTERNAL` "Bad
+    /// Resource ID" frame, NOT the spurious `ECA_ALLOCMEM` mask frame. In
+    /// C `event_add_action` the missing-channel branch (`if (!pciu) {
+    /// logBadId; return RSRV_ERROR; }`, camessage.c:1773-1777) runs
+    /// *before* the `db_add_event` NULL (select==0) ALLOCMEM path
+    /// (camessage.c:1814-1822). `logBadId` (camessage.c:307-320) sends
+    /// `send_err(ECA_INTERNAL, "Bad Resource ID")` with the cid=0xFFFFFFFF
+    /// sentinel (MPTOPCIU→NULL), flushed by camsgtask.c:142 before the
+    /// disconnect — so an unknown SID draws ECA_INTERNAL regardless of
+    /// mask. The defective guard ran the mask==0 check before the channel
+    /// lookup and replied `CA_PROTO_ERROR(ECA_ALLOCMEM, m_cid=0xFFFF_FFFF)`
+    /// here.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn unknown_sid_zero_mask_event_add_drops_silently() {
+    async fn unknown_sid_zero_mask_event_add_sends_bad_resource_id() {
         let db = Arc::new(PvDatabase::new());
         db.add_pv("r46:pv", EpicsValue::Double(0.0))
             .await
@@ -7592,48 +7617,32 @@ mod r46_zero_mask_event_add_tests {
             .await
             .expect("flush unknown-sid zero-mask event_add");
 
-        // Read server output until EOF; the unknown SID must produce NO
-        // wire reply (silent drop) — in particular no CA_PROTO_ERROR.
-        let mut acc: Vec<u8> = Vec::new();
-        let mut buf = [0u8; 256];
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            assert!(
-                !remaining.is_zero(),
-                "timed out waiting for server to close"
-            );
-            match tokio::time::timeout(remaining, client.read(&mut buf)).await {
-                Ok(Ok(0)) => break, // EOF — server closed
-                Ok(Ok(n)) => acc.extend_from_slice(&buf[..n]),
-                Ok(Err(_)) | Err(_) => break,
-            }
-        }
+        // Read server output until EOF; the unknown SID must produce the
+        // bad-SID `ECA_INTERNAL` frame, then the server closes.
+        let acc = drain_to_eof(&mut client, Duration::from_secs(3)).await;
 
-        // Scan the accumulated bytes: there must be NO CA_PROTO_ERROR frame.
-        let mut got_error = false;
-        let mut offset = 0;
-        while offset + CaHeader::SIZE <= acc.len() {
-            if let Ok((hdr, hdr_size)) = CaHeader::from_bytes_extended(&acc[offset..]) {
-                if hdr.cmmd == CA_PROTO_ERROR {
-                    got_error = true;
-                    break;
-                }
-                let msg_len = hdr_size + hdr.actual_postsize();
-                if msg_len == 0 {
-                    break;
-                }
-                offset += msg_len;
-            } else {
-                break;
-            }
-        }
-        assert!(
-            !got_error,
-            "Guard ordering: EVENT_ADD on an unknown SID with mask=0 must be a \
-             silent drop (C logBadId + RSRV_ERROR), but a CA_PROTO_ERROR frame was \
-             emitted (received {} bytes: {acc:?})",
-            acc.len()
+        // The first CA_PROTO_ERROR frame must be the bad-SID ECA_INTERNAL
+        // ("Bad Resource ID") frame with the 0xFFFFFFFF cid sentinel — NOT
+        // the mask-path ECA_ALLOCMEM frame the defective guard emitted.
+        let err = first_ca_proto_error(&acc).unwrap_or_else(|| {
+            panic!(
+                "EVENT_ADD on an unknown SID with mask=0 must emit the bad-SID \
+                 ECA_INTERNAL frame (C logBadId), but no CA_PROTO_ERROR was emitted \
+                 (received {} bytes: {acc:?})",
+                acc.len()
+            )
+        });
+        assert_eq!(
+            err.available, ECA_INTERNAL,
+            "Guard ordering: unknown-SID EVENT_ADD must reply ECA_INTERNAL \
+             (bad-SID logBadId), not ECA_ALLOCMEM (mask path); got eca={:#x}",
+            err.available
+        );
+        assert_eq!(
+            err.cid, 0xFFFF_FFFF,
+            "bad-SID ECA_INTERNAL frame echoes the 0xFFFFFFFF cid sentinel \
+             (MPTOPCIU→NULL ⇒ vsend_err cid=0xffffffff), got {:#x}",
+            err.cid
         );
 
         // The handler still closes the connection with Err (RSRV_ERROR).
@@ -7704,12 +7713,15 @@ mod r46_zero_mask_event_add_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn deprecated_read_unknown_sid_bad_type_drops_silently() {
-        // C `read_action` (`rsrv/camessage.c:608-619`) resolves
-        // the channel BEFORE checking the DBR type, so an unknown SID
-        // is a silent `logBadId` drop even when the requested type is
-        // also invalid. Pre-fix Rust checked the type first and emitted
-        // a spurious ECA_BADTYPE(cid=0xFFFFFFFF) ahead of the lookup.
+    async fn deprecated_read_unknown_sid_bad_type_sends_bad_resource_id() {
+        // C `read_action` (`rsrv/camessage.c:608-619`) resolves the
+        // channel BEFORE checking the DBR type, so an unknown SID takes
+        // the bad-SID `logBadId` branch even when the requested type is
+        // also invalid. `logBadId` (camessage.c:307-320) sends
+        // ECA_INTERNAL ("Bad Resource ID", cid=0xFFFFFFFF), flushed by
+        // camsgtask.c:142 before the disconnect — NOT the post-lookup
+        // ECA_BADTYPE. Pre-fix Rust checked the type first and emitted a
+        // spurious ECA_BADTYPE(cid=0xFFFFFFFF) ahead of the lookup.
         let db = Arc::new(PvDatabase::new());
         db.add_pv("a41:pv", EpicsValue::Double(0.0))
             .await
@@ -7764,12 +7776,24 @@ mod r46_zero_mask_event_add_tests {
         client.flush().await.expect("flush read");
 
         let acc = drain_to_eof(&mut client, Duration::from_secs(3)).await;
-        assert!(
-            first_ca_proto_error(&acc).is_none(),
-            "deprecated READ on an unknown SID with a bad type must be a silent \
-             drop (C read_action logBadId), but a CA_PROTO_ERROR frame was emitted \
-             (received {} bytes: {acc:?})",
-            acc.len()
+        let err = first_ca_proto_error(&acc).unwrap_or_else(|| {
+            panic!(
+                "deprecated READ on an unknown SID with a bad type must emit the \
+                 bad-SID ECA_INTERNAL frame (C read_action logBadId), but no \
+                 CA_PROTO_ERROR was emitted (received {} bytes: {acc:?})",
+                acc.len()
+            )
+        });
+        assert_eq!(
+            err.available, ECA_INTERNAL,
+            "unknown-SID READ takes the bad-SID logBadId branch (ECA_INTERNAL), \
+             not the post-lookup ECA_BADTYPE; got eca={:#x}",
+            err.available
+        );
+        assert_eq!(
+            err.cid, 0xFFFF_FFFF,
+            "bad-SID ECA_INTERNAL frame echoes the 0xFFFFFFFF cid sentinel, got {:#x}",
+            err.cid
         );
 
         let res = tokio::time::timeout(Duration::from_secs(2), handle)

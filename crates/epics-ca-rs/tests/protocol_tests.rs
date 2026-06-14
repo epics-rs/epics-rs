@@ -915,21 +915,24 @@ async fn server_echo_round_trips_request_header_and_payload() {
     );
 }
 
-/// C `event_cancel_reply` (`rsrv/camessage.c:1998-2021`)
+/// C `event_cancel_reply` (`rsrv/camessage.c:1992-1996`)
 /// calls `MPTOPCIU(mp)` first. If the request's channel id is
-/// unknown or belongs to another client, rsrv calls `logBadId` and
-/// returns RSRV_ERROR WITHOUT sending a wire error frame. Only
-/// after a valid channel resolves does rsrv walk that channel's
+/// unknown or belongs to another client, rsrv calls `logBadId` —
+/// which sends `send_err(ECA_INTERNAL, "Bad Resource ID")` with the
+/// cid=0xFFFFFFFF sentinel (`camessage.c:307-320`), flushed by
+/// `camsgtask.c:142` before the disconnect — and returns RSRV_ERROR.
+/// Only after a valid channel resolves does rsrv walk that channel's
 /// event queue and emit ECA_BADMONID for an unknown monitor id.
 ///
 /// Pre-fix Rust checked the flat subscription map first, so an
 /// unknown SID elicited ECA_BADMONID via the diagnostic fallback
-/// path. This test now asserts the silent-close behaviour for the
-/// bad-SID case (matches C `logBadId`); the valid-SID + bad-sub_id
-/// case is covered by `server_event_cancel_bad_subid_on_valid_sid_replies_eca_badmonid`.
+/// path. This test asserts the bad-SID case replies ECA_INTERNAL
+/// then disconnects (matches C `logBadId`); the valid-SID +
+/// bad-sub_id case is covered by
+/// `server_event_cancel_bad_subid_on_valid_sid_replies_eca_badmonid`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn server_event_cancel_unknown_sid_closes_silently() {
+async fn server_event_cancel_unknown_sid_replies_eca_internal_and_disconnects() {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
@@ -983,9 +986,10 @@ async fn server_event_cancel_unknown_sid_closes_silently() {
         "expected 2 VERSION frames (32 bytes); got {drained} bytes"
     );
 
-    // Send EVENT_CANCEL with an SID that was never opened. The
-    // server must close the connection without emitting a wire frame
-    // (C `event_cancel_reply` MPTOPCIU → logBadId silent path).
+    // Send EVENT_CANCEL with an SID that was never opened. The server
+    // must reply with the bad-SID CA_PROTO_ERROR(ECA_INTERNAL) frame,
+    // then close the connection (C `event_cancel_reply` MPTOPCIU →
+    // logBadId → send_err(ECA_INTERNAL) → RSRV_ERROR).
     let mut cancel = CaHeader::new(CA_PROTO_EVENT_CANCEL);
     cancel.data_type = 6; // DBR_DOUBLE
     cancel.count = 1;
@@ -993,18 +997,55 @@ async fn server_event_cancel_unknown_sid_closes_silently() {
     cancel.available = 0xCAFE_BABE; // bogus sub_id
     sock.write_all(&cancel.to_bytes()).await.unwrap();
 
-    // Expect silent EOF — no wire frame, just connection drop.
-    let mut resp = [0u8; 64];
-    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut resp))
+    // Expect CA_PROTO_ERROR with ECA_INTERNAL + 0xFFFFFFFF sentinel cid.
+    let mut resp = [0u8; 256];
+    let mut total = 0;
+    while total < 16 {
+        let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut resp[total..]))
+            .await
+            .expect("server error-reply timed out")
+            .expect("read error reply");
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    assert!(
+        total >= 16,
+        "expected a CA_PROTO_ERROR header before disconnect, got {total} bytes"
+    );
+    let err_hdr = CaHeader::from_bytes(&resp[..16]).expect("parse error header");
+    assert_eq!(err_hdr.cmmd, CA_PROTO_ERROR);
+    assert_eq!(
+        err_hdr.available, ECA_INTERNAL,
+        "EVENT_CANCEL on an unknown SID takes the bad-SID logBadId branch \
+         (ECA_INTERNAL); got eca={:#x}",
+        err_hdr.available
+    );
+    assert_eq!(err_hdr.cid, 0xFFFF_FFFF);
+
+    // Drain the trailing echo header + diagnostic string the server
+    // queued before closing.
+    let drain_start = total;
+    let _ = tokio::time::timeout(
+        Duration::from_millis(200),
+        sock.read(&mut resp[drain_start..]),
+    )
+    .await;
+
+    // Server must close the connection: a subsequent read returns EOF.
+    let mut tail = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut tail))
         .await
         .expect("server did not close after EVENT_CANCEL bad-SID")
         .expect("read after bad-SID cancel");
     assert_eq!(
         n,
         0,
-        "EVENT_CANCEL with unknown SID must elicit a silent close \
-         (matches C event_cancel_reply logBadId); got {n} bytes: {:02x?}",
-        &resp[..n]
+        "EVENT_CANCEL with unknown SID must close the connection after the \
+         ECA_INTERNAL reply (matches C event_cancel_reply logBadId + RSRV_ERROR); \
+         got {n} more bytes: {:02x?}",
+        &tail[..n]
     );
 }
 

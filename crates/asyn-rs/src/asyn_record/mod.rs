@@ -1557,8 +1557,12 @@ impl AsynRecord {
                 _ => 0, // unknown
             };
         }
-        // Data bits
-        if let Ok(val) = handle.get_option_blocking("csize") {
+        // Data bits. The serial driver's get_option exposes data bits
+        // under the key `"bits"` (C asynRecord.c:1884 likewise reads
+        // "bits"); `"csize"` is consumed by no driver, so the readback
+        // must use "bits" to match the DBIT write path (write_option
+        // "bits" below).
+        if let Ok(val) = handle.get_option_blocking("bits") {
             self.dbit = match val.as_str() {
                 "5" => 1,
                 "6" => 2,

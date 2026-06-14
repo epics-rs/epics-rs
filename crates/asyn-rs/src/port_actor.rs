@@ -1335,6 +1335,24 @@ mod tests {
     }
 
     #[test]
+    fn actor_setenable_refuses_defunct_port() {
+        // SetEnable is a lifecycle op that bypasses check_ready's
+        // defunct-first gate, so the refusal must come from the enable
+        // owner itself (C `enable`, asynManager.c:2236-2241). A defunct
+        // port must answer SetEnable with asynDisabled, not silently
+        // re-enable.
+        let mut drv = TestDriver::new();
+        drv.base.defunct = true;
+        let tx = spawn_actor(drv);
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let result = send_and_wait(&tx, RequestOp::SetEnable { yes: true }, user);
+        match result {
+            Err(AsynError::Status { status, .. }) => assert_eq!(status, AsynStatus::Disabled),
+            other => panic!("expected Disabled, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn actor_auto_connect() {
         let mut drv = TestDriver::new();
         drv.base.connected = false;

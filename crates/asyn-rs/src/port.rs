@@ -287,6 +287,45 @@ impl PortDriverBase {
         self.enabled
     }
 
+    /// Single owner-API for the port-level `enabled` transition.
+    ///
+    /// C `enable` (asynManager.c:2222-2249) refuses a shut-down port:
+    /// when `defunct` it returns `asynDisabled` *without* touching
+    /// `enabled` and *without* firing the `asynExceptionEnable` fan-out.
+    /// Otherwise it sets `enabled` and announces unconditionally (no
+    /// state-change guard). The actor's `SetEnable` op is a lifecycle op
+    /// that bypasses [`Self::check_ready`], so this guard is the only
+    /// thing that stops a defunct port from being re-enabled or fanning
+    /// out a spurious exception — it must live here, in the one owner of
+    /// the transition.
+    pub fn set_enabled(&mut self, enabled: bool) -> AsynResult<()> {
+        if self.defunct {
+            return Err(AsynError::Status {
+                status: AsynStatus::Disabled,
+                message: format!("port {} has been shut down (defunct)", self.port_name),
+            });
+        }
+        self.enabled = enabled;
+        self.announce_exception(AsynException::Enable, -1);
+        Ok(())
+    }
+
+    /// Per-address variant — same defunct refusal as [`Self::set_enabled`].
+    /// `defunct` is modelled at the port level (a shut-down port takes its
+    /// devices with it), so a defunct port refuses per-device enable/disable
+    /// too, matching C's `dpCommon.defunct` check on the resolved device.
+    pub fn set_addr_enabled(&mut self, addr: i32, enabled: bool) -> AsynResult<()> {
+        if self.defunct {
+            return Err(AsynError::Status {
+                status: AsynStatus::Disabled,
+                message: format!("port {} has been shut down (defunct)", self.port_name),
+            });
+        }
+        self.device_state(addr).enabled = enabled;
+        self.announce_exception(AsynException::Enable, addr);
+        Ok(())
+    }
+
     /// Query whether auto-connect is enabled.
     pub fn is_auto_connect(&self) -> bool {
         self.auto_connect
@@ -442,16 +481,16 @@ impl PortDriverBase {
         self.set_addr_connected(addr, false);
     }
 
-    /// Enable a specific device address.
+    /// Enable a specific device address. Convenience facade over the
+    /// guarded owner [`Self::set_addr_enabled`]; a defunct port no-ops.
     pub fn enable_addr(&mut self, addr: i32) {
-        self.device_state(addr).enabled = true;
-        self.announce_exception(AsynException::Enable, addr);
+        let _ = self.set_addr_enabled(addr, true);
     }
 
-    /// Disable a specific device address.
+    /// Disable a specific device address. Convenience facade over the
+    /// guarded owner [`Self::set_addr_enabled`]; a defunct port no-ops.
     pub fn disable_addr(&mut self, addr: i32) {
-        self.device_state(addr).enabled = false;
-        self.announce_exception(AsynException::Enable, addr);
+        let _ = self.set_addr_enabled(addr, false);
     }
 
     /// Set a custom timestamp source callback.
@@ -797,15 +836,13 @@ pub trait PortDriver: Send + Sync + 'static {
     }
 
     fn enable(&mut self, _user: &AsynUser) -> AsynResult<()> {
-        self.base_mut().enabled = true;
-        self.base().announce_exception(AsynException::Enable, -1);
-        Ok(())
+        // C `enable` refuses a defunct port (asynManager.c:2236-2241);
+        // the guard lives in the single owner.
+        self.base_mut().set_enabled(true)
     }
 
     fn disable(&mut self, _user: &AsynUser) -> AsynResult<()> {
-        self.base_mut().enabled = false;
-        self.base().announce_exception(AsynException::Enable, -1);
-        Ok(())
+        self.base_mut().set_enabled(false)
     }
 
     fn connect_addr(&mut self, user: &AsynUser) -> AsynResult<()> {
@@ -819,13 +856,12 @@ pub trait PortDriver: Send + Sync + 'static {
     }
 
     fn enable_addr(&mut self, user: &AsynUser) -> AsynResult<()> {
-        self.base_mut().enable_addr(user.addr);
-        Ok(())
+        // Guarded owner — propagates asynDisabled on a defunct port.
+        self.base_mut().set_addr_enabled(user.addr, true)
     }
 
     fn disable_addr(&mut self, user: &AsynUser) -> AsynResult<()> {
-        self.base_mut().disable_addr(user.addr);
-        Ok(())
+        self.base_mut().set_addr_enabled(user.addr, false)
     }
 
     fn get_option(&self, key: &str) -> AsynResult<String> {
@@ -2203,6 +2239,86 @@ mod tests {
         base.stamp_auto_connect_attempt(2, t0);
         assert!(!base.auto_connect_throttle_ok(2, t0));
         assert!(base.auto_connect_throttle_ok(2, t0 + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn set_enabled_refuses_defunct_port() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // C `enable` on a defunct port: asynDisabled, no `enabled` toggle,
+        // no asynExceptionEnable fan-out (asynManager.c:2236-2241).
+        let flags = PortFlags {
+            destructible: true,
+            ..PortFlags::default()
+        };
+        let mut base = PortDriverBase::new("def", 1, flags);
+        let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
+        base.exception_sink = Some(exc_mgr.clone());
+        let enable_hits = Arc::new(AtomicUsize::new(0));
+        let h = enable_hits.clone();
+        exc_mgr.add_callback(move |event| {
+            if event.exception == AsynException::Enable {
+                h.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        // Shut the port down → defunct (shutdown sets enabled=false).
+        base.shutdown_lifecycle().unwrap();
+        assert!(base.is_defunct());
+        assert!(!base.is_enabled());
+
+        let err = base.set_enabled(true).unwrap_err();
+        match err {
+            AsynError::Status { status, .. } => assert_eq!(status, AsynStatus::Disabled),
+            other => panic!("expected Disabled, got {other:?}"),
+        }
+        assert!(!base.is_enabled(), "defunct port must not re-enable");
+        assert_eq!(
+            enable_hits.load(Ordering::Relaxed),
+            0,
+            "no Enable exception may fire on a defunct port"
+        );
+    }
+
+    #[test]
+    fn set_addr_enabled_refuses_defunct_port() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let flags = PortFlags {
+            multi_device: true,
+            destructible: true,
+            ..PortFlags::default()
+        };
+        let mut base = PortDriverBase::new("def", 4, flags);
+        let exc_mgr = Arc::new(crate::exception::ExceptionManager::new());
+        base.exception_sink = Some(exc_mgr.clone());
+        let enable_hits = Arc::new(AtomicUsize::new(0));
+        let h = enable_hits.clone();
+        exc_mgr.add_callback(move |event| {
+            if event.exception == AsynException::Enable {
+                h.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        base.shutdown_lifecycle().unwrap();
+
+        let err = base.set_addr_enabled(1, false).unwrap_err();
+        match err {
+            AsynError::Status { status, .. } => assert_eq!(status, AsynStatus::Disabled),
+            other => panic!("expected Disabled, got {other:?}"),
+        }
+        // The guard returns before `device_state(addr)` would insert an
+        // entry, so the refused call mutates no per-device state.
+        assert!(
+            !base.device_states.contains_key(&1),
+            "refused per-device enable must not create device state"
+        );
+        // The `()` convenience facade also no-ops on a defunct port.
+        base.disable_addr(1);
+        assert!(!base.device_states.contains_key(&1));
+        assert_eq!(
+            enable_hits.load(Ordering::Relaxed),
+            0,
+            "no Enable exception may fire on a defunct port"
+        );
     }
 
     /// C parity: `asynPortDriver::setInterruptUInt32Digital` /

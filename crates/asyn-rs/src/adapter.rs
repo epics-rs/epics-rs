@@ -22,6 +22,58 @@ pub struct AsynLink {
     pub drv_info: String,
 }
 
+/// Strip an optional sign and detect the C `strtol(.., 0)` base of a
+/// numeric link field: a leading `0x`/`0X` selects hexadecimal, a leading
+/// `0` (with further digits) octal, otherwise decimal. Returns
+/// `(negative, digit_str, radix)`.
+///
+/// Unlike C — which consumes the longest valid prefix and leaves the rest
+/// in `endp` — these require the *whole* (trimmed) token to be a valid
+/// number. asyn's comma/space split already isolates each numeric field,
+/// so there is no trailing remainder for C's `endp` walk to pick up;
+/// rejecting a partly-numeric field is closer to the link parser's intent
+/// than silently binding its leading digits.
+fn split_base0(tok: &str) -> Option<(bool, &str, u32)> {
+    let tok = tok.trim();
+    let (neg, rest) = match tok.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, tok.strip_prefix('+').unwrap_or(tok)),
+    };
+    if let Some(hex) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+        // `0x` with no following digits is not a number (C: endp stays at 'x').
+        (!hex.is_empty()).then_some((neg, hex, 16))
+    } else if rest.len() > 1 && rest.starts_with('0') {
+        // Leading `0` + more digits → octal. C `strtol(.., 0)` does NOT
+        // recognise a `0o` prefix, so `0o..` falls here and fails the
+        // octal digit parse (matching C, which stops at the 'o').
+        Some((neg, &rest[1..], 8))
+    } else if rest.is_empty() {
+        None
+    } else {
+        // Plain decimal, including a bare "0".
+        Some((neg, rest, 10))
+    }
+}
+
+/// C `strtol(s, _, 0)` for the signed `addr` link field. The `long`→`int`
+/// assignment in C truncates on overflow, mirrored here by the `as i32`
+/// wrap.
+fn strtol_base0_i32(tok: &str) -> Option<i32> {
+    let (neg, digits, radix) = split_base0(tok)?;
+    let mag = i64::from_str_radix(digits, radix).ok()?;
+    Some((if neg { mag.wrapping_neg() } else { mag }) as i32)
+}
+
+/// C `strtoul(s, _, 0)` for the unsigned `mask` link field. A leading `-`
+/// negates modulo 2^32 (the C standard mandates strtoul negate-then-cast),
+/// so `-8` yields `0xFFFFFFF8` — the bit pattern asynInt32 reinterprets as
+/// signed nbits via [`Int32Mask::from_nbits`].
+fn strtoul_base0_u32(tok: &str) -> Option<u32> {
+    let (neg, digits, radix) = split_base0(tok)?;
+    let mag = u64::from_str_radix(digits, radix).ok()?;
+    Some((if neg { mag.wrapping_neg() } else { mag }) as u32)
+}
+
 /// Parse an asyn link string.
 ///
 /// Accepted formats (comma or space delimited, matching C EPICS):
@@ -56,9 +108,9 @@ pub fn parse_asyn_link(s: &str) -> Result<AsynLink, AsynError> {
 
     let port_name = parts[0].to_string();
     let addr = if parts.len() > 1 {
-        parts[1]
-            .parse::<i32>()
-            .map_err(|_| AsynError::InvalidLinkSyntax(format!("invalid addr: {}", parts[1])))?
+        // C asynEpicsUtils.c:114 `strtol(pnext, &endp, 0)` — base auto.
+        strtol_base0_i32(parts[1])
+            .ok_or_else(|| AsynError::InvalidLinkSyntax(format!("invalid addr: {}", parts[1])))?
     } else {
         0
     };
@@ -113,32 +165,19 @@ pub fn parse_asyn_mask_link(s: &str) -> Result<AsynMaskLink, AsynError> {
     }
 
     let port_name = parts[0].to_string();
-    let addr = parts[1]
-        .parse::<i32>()
-        .map_err(|_| AsynError::InvalidLinkSyntax(format!("invalid addr: {}", parts[1])))?;
+    // C asynEpicsUtils.c:186 `strtol(pnext, &endp, 0)` — base auto.
+    let addr = strtol_base0_i32(parts[1])
+        .ok_or_else(|| AsynError::InvalidLinkSyntax(format!("invalid addr: {}", parts[1])))?;
 
-    // Parse mask: support hex (0x...) and decimal. The decimal form may
-    // be a *signed* nbits — the asynInt32 `@asynMask` 3rd arg is a bit
-    // count whose sign selects bipolar handling (C devAsynInt32.c:232-237),
-    // and a negative count must bind, not fail. Store the 32-bit pattern;
-    // each interface reinterprets it (asynInt32 as nbits via `as i32`,
-    // asynUInt32Digital as a raw mask).
+    // C asynEpicsUtils.c:193 `strtoul(pnext, &endp, 0)` — base auto
+    // (0x hex, leading-0 octal, else decimal). The resulting 32-bit
+    // pattern is reinterpreted per interface: asynInt32 reads it as a
+    // signed nbits via `as i32` (a negative count like `-8` parses through
+    // strtoul to 0xFFFFFFF8; see `Int32Mask::from_nbits`), asynUInt32Digital
+    // as a raw bitmask.
     let mask_str = parts[2];
-    let mask = if let Some(hex) = mask_str
-        .strip_prefix("0x")
-        .or_else(|| mask_str.strip_prefix("0X"))
-    {
-        u32::from_str_radix(hex, 16)
-            .map_err(|_| AsynError::InvalidLinkSyntax(format!("invalid mask: {mask_str}")))?
-    } else {
-        // i32 first (admits negatives); fall back to u32 for masks above
-        // i32::MAX (asynUInt32Digital bitmasks written in decimal).
-        mask_str
-            .parse::<i32>()
-            .map(|v| v as u32)
-            .or_else(|_| mask_str.parse::<u32>())
-            .map_err(|_| AsynError::InvalidLinkSyntax(format!("invalid mask: {mask_str}")))?
-    };
+    let mask = strtoul_base0_u32(mask_str)
+        .ok_or_else(|| AsynError::InvalidLinkSyntax(format!("invalid mask: {mask_str}")))?;
 
     let timeout = if parts.len() > 3 {
         let secs: f64 = parts[3]
@@ -1694,6 +1733,31 @@ mod tests {
         assert_eq!(link.drv_info, "PARAM");
     }
 
+    #[test]
+    fn test_parse_addr_hex_base0() {
+        // C asynEpicsUtils.c:114 strtol(.., 0): `0x10` is hex 16.
+        let link = parse_asyn_link("@asyn(port, 0x10) PARAM").unwrap();
+        assert_eq!(link.addr, 16);
+        let upper = parse_asyn_link("@asyn(port, 0X1F) PARAM").unwrap();
+        assert_eq!(upper.addr, 31);
+    }
+
+    #[test]
+    fn test_parse_addr_octal_base0() {
+        // strtol(.., 0): a leading `0` selects octal, so `010` is 8 — NOT
+        // decimal 10, which the old decimal-only parser silently bound.
+        let link = parse_asyn_link("@asyn(port, 010) PARAM").unwrap();
+        assert_eq!(link.addr, 8);
+    }
+
+    #[test]
+    fn test_parse_addr_decimal_and_zero_unchanged() {
+        // Plain decimal and a bare "0" still parse as base 10.
+        assert_eq!(parse_asyn_link("@asyn(p, 10) X").unwrap().addr, 10);
+        assert_eq!(parse_asyn_link("@asyn(p, 0) X").unwrap().addr, 0);
+        assert_eq!(parse_asyn_link("@asyn(p, -5) X").unwrap().addr, -5);
+    }
+
     // --- asynMask link tests ---
 
     #[test]
@@ -1736,6 +1800,45 @@ mod tests {
         // 32-bit pattern: -8 => 0xFFFFFFF8, recoverable via `as i32`.
         let link = parse_asyn_mask_link("@asynMask(p, 0, -8) X").unwrap();
         assert_eq!(link.mask as i32, -8);
+    }
+
+    #[test]
+    fn test_parse_mask_link_octal_base0() {
+        // C asynEpicsUtils.c:193 strtoul(.., 0): mask `010` is octal 8.
+        let link = parse_asyn_mask_link("@asynMask(p, 0, 010) X").unwrap();
+        assert_eq!(link.mask, 8);
+    }
+
+    #[test]
+    fn test_parse_mask_link_addr_hex_base0() {
+        // The mask-link addr is also strtol(.., 0) (asynEpicsUtils.c:186).
+        let link = parse_asyn_mask_link("@asynMask(p, 0x2, 0xFF) X").unwrap();
+        assert_eq!(link.addr, 2);
+        assert_eq!(link.mask, 0xFF);
+    }
+
+    #[test]
+    fn strtol_base0_covers_hex_octal_decimal_sign() {
+        assert_eq!(strtol_base0_i32("0x10"), Some(16));
+        assert_eq!(strtol_base0_i32("010"), Some(8));
+        assert_eq!(strtol_base0_i32("10"), Some(10));
+        assert_eq!(strtol_base0_i32("0"), Some(0));
+        assert_eq!(strtol_base0_i32("-0x10"), Some(-16));
+        assert_eq!(strtol_base0_i32("+7"), Some(7));
+        // Invalid digit for the detected base / non-numeric → reject.
+        assert_eq!(strtol_base0_i32("08"), None);
+        assert_eq!(strtol_base0_i32("0o20"), None);
+        assert_eq!(strtol_base0_i32("abc"), None);
+        assert_eq!(strtol_base0_i32("0x"), None);
+    }
+
+    #[test]
+    fn strtoul_base0_negation_wraps_mod_2_32() {
+        // C strtoul negates-then-casts: -8 => 0xFFFFFFF8.
+        assert_eq!(strtoul_base0_u32("-8"), Some(0xFFFF_FFF8));
+        assert_eq!(strtoul_base0_u32("0xFF00"), Some(0xFF00));
+        assert_eq!(strtoul_base0_u32("010"), Some(8));
+        assert_eq!(strtoul_base0_u32("255"), Some(255));
     }
 
     #[test]

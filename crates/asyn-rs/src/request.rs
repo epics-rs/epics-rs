@@ -257,6 +257,11 @@ pub struct RequestResult {
     pub reason: Option<usize>,
     /// Enum index (from EnumRead).
     pub enum_index: Option<usize>,
+    /// Driver enum string/value/severity table (from EnumRead). C asyn
+    /// device support reads this via `asynEnum->read` and pushes it onto
+    /// the record's state fields (ZRST/ZRVL/ZRSV…, ZNAM/ONAM…) at init —
+    /// see `devAsynInt32.c::initCommon` (297-324) / `setEnums` (415-435).
+    pub enum_entries: Option<Arc<[crate::param::EnumEntry]>>,
     /// i32 array data (from Int32ArrayRead).
     pub int32_array: Option<Vec<i32>>,
     /// f64 array data (from Float64ArrayRead).
@@ -303,6 +308,7 @@ impl RequestResult {
             uint_val: None,
             reason: None,
             enum_index: None,
+            enum_entries: None,
             int32_array: None,
             float64_array: None,
             int8_array: None,
@@ -382,6 +388,17 @@ impl RequestResult {
     pub fn enum_read(index: usize) -> Self {
         Self {
             enum_index: Some(index),
+            ..Self::base()
+        }
+    }
+
+    /// [`Self::enum_read`] carrying the driver's full enum table so the
+    /// device-support init path can propagate it to the record's state
+    /// fields (C `setEnums`). The index is the current selection.
+    pub fn enum_read_with_entries(index: usize, entries: Arc<[crate::param::EnumEntry]>) -> Self {
+        Self {
+            enum_index: Some(index),
+            enum_entries: Some(entries),
             ..Self::base()
         }
     }

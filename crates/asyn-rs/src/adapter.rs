@@ -544,6 +544,33 @@ impl WriteCompletion for AsynAsyncWriteCompletion {
     }
 }
 
+/// mbbi/mbbo state-string fields ZRST..FFST in state order (16 states).
+/// C `setEnums` writes the driver's enum strings starting at `&pr->zrst`
+/// (devAsynInt32.c:720) into this contiguous block.
+const MBB_STRING_FIELDS: [&str; 16] = [
+    "ZRST", "ONST", "TWST", "THST", "FRST", "FVST", "SXST", "SVST", "EIST", "NIST", "TEST", "ELST",
+    "TVST", "TTST", "FTST", "FFST",
+];
+/// mbbi/mbbo state raw-value fields ZRVL..FFVL (parallel to [`MBB_STRING_FIELDS`]).
+const MBB_VALUE_FIELDS: [&str; 16] = [
+    "ZRVL", "ONVL", "TWVL", "THVL", "FRVL", "FVVL", "SXVL", "SVVL", "EIVL", "NIVL", "TEVL", "ELVL",
+    "TVVL", "TTVL", "FTVL", "FFVL",
+];
+/// mbbi/mbbo state severity fields ZRSV..FFSV (parallel to [`MBB_STRING_FIELDS`]).
+const MBB_SEVERITY_FIELDS: [&str; 16] = [
+    "ZRSV", "ONSV", "TWSV", "THSV", "FRSV", "FVSV", "SXSV", "SVSV", "EISV", "NISV", "TESV", "ELSV",
+    "TVSV", "TTSV", "FTSV", "FFSV",
+];
+/// bi/bo state-string fields ZNAM/ONAM (2 states; C `initBi` passes
+/// `maxEnums=2`, `&pr->znam`, devAsynInt32.c:1138-1140).
+const BI_STRING_FIELDS: [&str; 2] = ["ZNAM", "ONAM"];
+/// bi/bo state severity fields ZSV/OSV (bi/bo carry no raw-value fields,
+/// so C passes a NULL value pointer).
+const BI_SEVERITY_FIELDS: [&str; 2] = ["ZSV", "OSV"];
+/// C `MAX_ENUM_STRING_SIZE` (devAsynInt32.c:66): enum strings are capped
+/// at 25 chars + NUL when copied into the record's DBF_STRING slots.
+const MAX_ENUM_STRING_LEN: usize = 25;
+
 impl AsynDeviceSupport {
     /// C parity for `devAsynInt32.c::initAi` (lines 821-828) +
     /// `convertAi` (lines 437-454): query the driver's int32 / int64
@@ -806,6 +833,51 @@ impl AsynDeviceSupport {
         self.smoo_primed = true;
         out
     }
+
+    /// Push a driver's asynEnum table onto the record's state fields — the
+    /// single owner for C `setEnums` (devAsynInt32.c:415-435, called from
+    /// initCommon:314 and the runtime callbackEnum:720-762). The record
+    /// family is discriminated by the fields it exposes (mirroring C's
+    /// per-record initMbbi vs initBi): a `ZRST` field => mbbi/mbbo (16
+    /// states, ZRST/ZRVL/ZRSV…); a `ZNAM` field => bi/bo (2 states,
+    /// ZNAM/ONAM + ZSV/OSV, no raw-value fields). Anything else is not an
+    /// enum record and is left untouched.
+    ///
+    /// Faithful to `setEnums`: every output slot up to the record's state
+    /// count is first cleared (empty string / value 0 / severity 0), then
+    /// the driver's entries fill slots `0..numIn`. So a driver advertising
+    /// fewer states than the record blanks the record's surplus `.db`
+    /// strings, exactly as C does.
+    fn apply_enum_table(&self, record: &mut dyn Record, entries: &[crate::param::EnumEntry]) {
+        let (strings, values, severities): (&[&str], Option<&[&str]>, &[&str]) =
+            if record.get_field("ZRST").is_some() {
+                (
+                    &MBB_STRING_FIELDS,
+                    Some(&MBB_VALUE_FIELDS),
+                    &MBB_SEVERITY_FIELDS,
+                )
+            } else if record.get_field("ZNAM").is_some() {
+                (&BI_STRING_FIELDS, None, &BI_SEVERITY_FIELDS)
+            } else {
+                return;
+            };
+        for i in 0..strings.len() {
+            let entry = entries.get(i);
+            let mut s = entry.map(|e| e.string.clone()).unwrap_or_default();
+            // C `setEnums` truncates to MAX_ENUM_STRING_SIZE-1 (byte memcpy);
+            // EPICS state strings are ASCII so a char boundary at 25 is safe.
+            if s.chars().count() > MAX_ENUM_STRING_LEN {
+                s = s.chars().take(MAX_ENUM_STRING_LEN).collect();
+            }
+            let value = entry.map(|e| e.value).unwrap_or(0);
+            let severity = entry.map(|e| e.severity).unwrap_or(0);
+            let _ = record.put_field(strings[i], EpicsValue::String(s.into()));
+            if let Some(value_fields) = values {
+                let _ = record.put_field(value_fields[i], EpicsValue::ULong(value as u32));
+            }
+            let _ = record.put_field(severities[i], EpicsValue::Short(severity as i16));
+        }
+    }
 }
 
 impl DeviceSupport for AsynDeviceSupport {
@@ -889,6 +961,28 @@ impl DeviceSupport for AsynDeviceSupport {
             && record.get_field("ESLO").is_some()
         {
             self.apply_linear_eslo_eoff(record);
+        }
+
+        // Driver enum-string table -> record state fields. C asyn int32/uint32
+        // device support (devAsynInt32.c::initCommon:297-324,
+        // devAsynUInt32Digital.c:547-601) queries the driver's asynEnum
+        // interface and `setEnums` the strings/values/severities onto the
+        // record (ZRST/ZRVL/ZRSV… for mbbi/mbbo, ZNAM/ONAM… for bi/bo). The
+        // record family is identified by the state fields it exposes (ZRST or
+        // ZNAM); the EnumRead itself only returns a table when the driver
+        // provides one (an Enum param or an overridden read_enum), mirroring
+        // C's `findInterface(asynEnumType) != NULL` gate — a driver without
+        // an enum table makes EnumRead fail and the record keeps its .db
+        // strings.
+        if record.get_field("ZRST").is_some() || record.get_field("ZNAM").is_some() {
+            let user = AsynUser::new(self.reason)
+                .with_addr(self.addr)
+                .with_timeout(self.timeout);
+            if let Ok(result) = self.handle.submit_blocking(RequestOp::EnumRead, user) {
+                if let Some(entries) = result.enum_entries {
+                    self.apply_enum_table(record, &entries);
+                }
+            }
         }
 
         if self.initial_readback {
@@ -2018,6 +2112,154 @@ mod tests {
             _ => panic!(),
         };
         assert_eq!(val, 77, "longin VAL set directly to the raw count");
+    }
+
+    // --- driver enum-string table -> record state fields
+    //     (C devAsynInt32.c::initCommon enum block + setEnums) ---
+
+    /// Build an `asynEnum` adapter whose driver exposes a `MODE` enum param
+    /// carrying `choices`. `init()` reads this table and pushes it onto the
+    /// bound record's state fields.
+    fn make_enum_adapter(choices: std::sync::Arc<[crate::param::EnumEntry]>) -> AsynDeviceSupport {
+        struct EnumPort {
+            base: PortDriverBase,
+        }
+        impl PortDriver for EnumPort {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+
+        let mut base = PortDriverBase::new("test_enum", 1, PortFlags::default());
+        base.create_param("MODE", ParamType::Enum).unwrap();
+        base.set_enum_choices_param(0, 0, choices).unwrap();
+        let driver = EnumPort { base };
+
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let actor = PortActor::new(Box::new(driver), rx);
+        std::thread::Builder::new()
+            .name("test-enum-actor".into())
+            .spawn(move || actor.run())
+            .unwrap();
+        let handle = PortHandle::new(tx, "test_enum".into(), interrupts);
+        let link = AsynLink {
+            port_name: "test_enum".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: "MODE".into(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynEnum");
+        ads.set_record_info("TEST:ENUM", ScanType::Passive);
+        ads
+    }
+
+    fn enum_entry(s: &str, value: i32, severity: u16) -> crate::param::EnumEntry {
+        crate::param::EnumEntry {
+            string: s.into(),
+            value,
+            severity,
+        }
+    }
+
+    fn field_string(rec: &dyn Record, name: &str) -> String {
+        match rec.get_field(name).unwrap() {
+            EpicsValue::String(s) => s.as_str_lossy().into_owned(),
+            other => panic!("{name} not a String: {other:?}"),
+        }
+    }
+
+    /// C `devAsynInt32::initCommon` (297-324) reads the driver's asynEnum
+    /// table and `setEnums` (415-435) copies strings/values/severities onto
+    /// the mbbi state fields ZRST/ZRVL/ZRSV…. Before the fix the actor
+    /// dropped the table (`let (idx, _entries)`) so the record kept its .db
+    /// strings.
+    #[test]
+    fn mbbi_init_propagates_driver_enum_table() {
+        use epics_base_rs::server::records::mbbi::MbbiRecord;
+        let choices: std::sync::Arc<[crate::param::EnumEntry]> =
+            std::sync::Arc::from(vec![enum_entry("OFF", 0, 0), enum_entry("ON", 5, 2)]);
+        let mut ads = make_enum_adapter(choices);
+        let mut rec = MbbiRecord::new(0);
+        // A surplus .db string on a state the driver does not define must be
+        // blanked, matching C setEnums zeroing all numOut slots first.
+        rec.put_field("TWST", EpicsValue::String("STALE".into()))
+            .unwrap();
+
+        ads.init(&mut rec).unwrap();
+
+        assert_eq!(field_string(&rec, "ZRST"), "OFF");
+        assert_eq!(field_string(&rec, "ONST"), "ON");
+        assert_eq!(
+            rec.get_field("ZRVL").unwrap(),
+            EpicsValue::ULong(0),
+            "ZRVL from entry 0 value"
+        );
+        assert_eq!(
+            rec.get_field("ONVL").unwrap(),
+            EpicsValue::ULong(5),
+            "ONVL from entry 1 value"
+        );
+        assert_eq!(
+            rec.get_field("ZRSV").unwrap(),
+            EpicsValue::Short(0),
+            "ZRSV from entry 0 severity"
+        );
+        assert_eq!(
+            rec.get_field("ONSV").unwrap(),
+            EpicsValue::Short(2),
+            "ONSV from entry 1 severity"
+        );
+        assert_eq!(
+            field_string(&rec, "TWST"),
+            "",
+            "state beyond the driver table is cleared (C setEnums zeroes numOut)"
+        );
+    }
+
+    /// C `initBi` (devAsynInt32.c:1138-1140) passes `maxEnums=2`,
+    /// `&pr->znam`, NULL values, `&pr->zsv`: bi/bo get only ZNAM/ONAM and
+    /// ZSV/OSV — no raw-value fields.
+    #[test]
+    fn bi_init_propagates_znam_onam_and_severities() {
+        use epics_base_rs::server::records::bi::BiRecord;
+        let choices: std::sync::Arc<[crate::param::EnumEntry]> =
+            std::sync::Arc::from(vec![enum_entry("CLOSED", 0, 0), enum_entry("OPEN", 1, 1)]);
+        let mut ads = make_enum_adapter(choices);
+        let mut rec = BiRecord::new(0);
+
+        ads.init(&mut rec).unwrap();
+
+        assert_eq!(field_string(&rec, "ZNAM"), "CLOSED");
+        assert_eq!(field_string(&rec, "ONAM"), "OPEN");
+        assert_eq!(
+            rec.get_field("ZSV").unwrap(),
+            EpicsValue::Short(0),
+            "ZSV from entry 0 severity"
+        );
+        assert_eq!(
+            rec.get_field("OSV").unwrap(),
+            EpicsValue::Short(1),
+            "OSV from entry 1 severity"
+        );
+    }
+
+    /// A record exposing no enum state fields (ai) must be left untouched —
+    /// `apply_enum_table` returns early and `init` performs no enum read.
+    #[test]
+    fn ai_init_ignores_enum_table() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let choices: std::sync::Arc<[crate::param::EnumEntry]> =
+            std::sync::Arc::from(vec![enum_entry("X", 0, 0)]);
+        let mut ads = make_enum_adapter(choices);
+        let mut rec = AiRecord::new(0.0);
+        // Must not panic or error; ai has no ZRST/ZNAM so nothing is written.
+        ads.init(&mut rec).unwrap();
+        assert!(rec.get_field("ZRST").is_none());
+        assert!(rec.get_field("ZNAM").is_none());
     }
 
     /// Every getBounds default returns (0, 0), matching C

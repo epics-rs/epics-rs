@@ -540,8 +540,13 @@ impl PortActor {
                 Ok(RequestResult::drv_user_create(reason))
             }
             RequestOp::EnumRead => {
-                let (idx, _entries) = self.driver.read_enum(user)?;
-                Ok(RequestResult::enum_read(idx))
+                // Carry the driver's enum table (strings/values/severities)
+                // alongside the current index so device-support init can push
+                // it onto the record's state fields — C devAsynInt32.c::initCommon
+                // reads asynEnum and calls setEnums (297-324, 415-435). Dropping
+                // the table left mbbi/mbbo/bi/bo with their .db state strings.
+                let (idx, entries) = self.driver.read_enum(user)?;
+                Ok(RequestResult::enum_read_with_entries(idx, entries))
             }
             RequestOp::EnumWrite { index } => {
                 self.driver.write_enum(user, *index)?;

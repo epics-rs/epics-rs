@@ -704,7 +704,7 @@ impl PortActor {
         // Attach alarm/timestamp metadata on successful reads
         if is_read {
             if let Ok(r) = result {
-                let (_, alarm_status, alarm_severity) = self
+                let (status, alarm_status, alarm_severity) = self
                     .driver
                     .base()
                     .params
@@ -716,12 +716,50 @@ impl PortActor {
                     .params
                     .get_timestamp(user.reason, user.addr)
                     .unwrap_or(None);
+                // C devAsynInt32.c:844-847 — a non-success read/param status
+                // maps to a record alarm (asynStatusToEpicsAlarm) and is
+                // recGblSetSevr'd together with the explicit setParamAlarm.
+                // The old `_` discarded the status, so a setParamStatus(error
+                // /timeout) read returned clean (no INVALID, UDF-clearing).
+                let (alarm_status, alarm_severity) =
+                    combine_read_alarm(status, alarm_status, alarm_severity);
                 return Ok(r.with_alarm(alarm_status, alarm_severity, ts));
             }
         }
 
         result
     }
+}
+
+/// Combine a param's stored asynStatus with its explicit setParamAlarm into
+/// the record alarm for a READ, mirroring C `asynStatusToEpicsAlarm`
+/// (asynEpicsUtils.c:234) as invoked by devAsynXxx processXxx
+/// (devAsynInt32.c:844-847): the explicit alarm wins per field, and a
+/// non-success status fills any field still None — status maps to a
+/// condition with READ_ALARM as the asynError/default condition and INVALID
+/// as the severity.
+fn combine_read_alarm(status: AsynStatus, alarm_status: u16, alarm_severity: u16) -> (u16, u16) {
+    use epics_base_rs::server::recgbl::alarm_status as al;
+    use epics_base_rs::server::record::AlarmSeverity;
+    let stat_default = match status {
+        AsynStatus::Success => return (alarm_status, alarm_severity),
+        AsynStatus::Timeout => al::TIMEOUT_ALARM,
+        AsynStatus::Overflow => al::HW_LIMIT_ALARM,
+        AsynStatus::Disconnected => al::COMM_ALARM,
+        AsynStatus::Disabled => al::DISABLE_ALARM,
+        AsynStatus::Error => al::READ_ALARM,
+    };
+    let stat = if alarm_status == al::NO_ALARM {
+        stat_default
+    } else {
+        alarm_status
+    };
+    let sevr = if alarm_severity == AlarmSeverity::NoAlarm as u16 {
+        AlarmSeverity::Invalid as u16
+    } else {
+        alarm_severity
+    };
+    (stat, sevr)
 }
 
 #[cfg(test)]
@@ -786,6 +824,72 @@ mod tests {
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let result = send_and_wait(&tx, RequestOp::Int32Read, user).unwrap();
         assert_eq!(result.int_val, Some(42));
+    }
+
+    #[test]
+    fn combine_read_alarm_matches_c_status_to_epics_alarm() {
+        use epics_base_rs::server::recgbl::alarm_status as al;
+        use epics_base_rs::server::record::AlarmSeverity;
+        let none = AlarmSeverity::NoAlarm as u16;
+        let major = AlarmSeverity::Major as u16;
+        let invalid = AlarmSeverity::Invalid as u16;
+        // Success: the explicit alarm passes through unchanged (incl. clean).
+        assert_eq!(
+            combine_read_alarm(AsynStatus::Success, al::NO_ALARM, none),
+            (al::NO_ALARM, none)
+        );
+        assert_eq!(
+            combine_read_alarm(AsynStatus::Success, al::HW_LIMIT_ALARM, major),
+            (al::HW_LIMIT_ALARM, major)
+        );
+        // Non-success, no explicit alarm: status-derived condition + INVALID.
+        assert_eq!(
+            combine_read_alarm(AsynStatus::Error, al::NO_ALARM, none),
+            (al::READ_ALARM, invalid)
+        );
+        assert_eq!(
+            combine_read_alarm(AsynStatus::Timeout, al::NO_ALARM, none),
+            (al::TIMEOUT_ALARM, invalid)
+        );
+        assert_eq!(
+            combine_read_alarm(AsynStatus::Overflow, al::NO_ALARM, none),
+            (al::HW_LIMIT_ALARM, invalid)
+        );
+        assert_eq!(
+            combine_read_alarm(AsynStatus::Disconnected, al::NO_ALARM, none),
+            (al::COMM_ALARM, invalid)
+        );
+        assert_eq!(
+            combine_read_alarm(AsynStatus::Disabled, al::NO_ALARM, none),
+            (al::DISABLE_ALARM, invalid)
+        );
+        // Explicit alarm present wins per field over the status-derived one.
+        assert_eq!(
+            combine_read_alarm(AsynStatus::Error, al::COMM_ALARM, major),
+            (al::COMM_ALARM, major)
+        );
+    }
+
+    #[test]
+    fn actor_read_surfaces_param_status_alarm() {
+        use epics_base_rs::server::recgbl::alarm_status as al;
+        use epics_base_rs::server::record::AlarmSeverity;
+        // A defined param flagged setParamStatus(Error) with no explicit
+        // setParamAlarm: the read must surface READ_ALARM/INVALID (C
+        // devAsynInt32.c:844-847), not a clean (UDF-clearing) read.
+        let mut drv = TestDriver::new();
+        drv.base.params.set_int32(0, 0, 5).unwrap(); // define VAL
+        drv.base
+            .params
+            .set_param_status(0, 0, AsynStatus::Error, 0, 0)
+            .unwrap();
+        let tx = spawn_actor(drv);
+
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let result = send_and_wait(&tx, RequestOp::Int32Read, user).unwrap();
+        assert_eq!(result.int_val, Some(5));
+        assert_eq!(result.alarm_status, al::READ_ALARM);
+        assert_eq!(result.alarm_severity, AlarmSeverity::Invalid as u16);
     }
 
     #[test]

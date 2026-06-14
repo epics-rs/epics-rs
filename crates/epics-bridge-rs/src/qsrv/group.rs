@@ -1679,7 +1679,23 @@ impl super::provider::Channel for GroupChannel {
                     let (nt_type, scalar_type) = self.introspect_member(member).await?;
                     match member.mapping {
                         FieldMapping::Scalar => pvif::build_field_desc_for_nt(nt_type, scalar_type),
-                        FieldMapping::Plain => FieldDesc::Scalar(scalar_type),
+                        // A `+type:"plain"` leaf carries the bare value with
+                        // no NT wrapper, but its array-ness must still follow
+                        // the bound field: pvxs `getChannelValueType`
+                        // (iocsource.cpp:632-643) returns `valueType.arrayOf()`
+                        // when `dbChannelFinalElements != 1`, and
+                        // `addMembersForPlainType`
+                        // (groupconfigprocessor.cpp:886-895) builds the leaf
+                        // from that type. `introspect_member` already resolved
+                        // the array-ness into `nt_type` (ScalarArray for every
+                        // array-variant value, length-independent), and the
+                        // read path serves `PvField::ScalarArray` for an array
+                        // backing field — so a scalar descriptor would
+                        // disagree with the wire bytes.
+                        FieldMapping::Plain => match nt_type {
+                            NtType::ScalarArray => FieldDesc::ScalarArray(scalar_type),
+                            _ => FieldDesc::Scalar(scalar_type),
+                        },
                         FieldMapping::Meta => meta_desc(),
                         // pvxs advertises `+type:"any"` as `Member(TypeCode
                         // ::Any, …)` (groupconfigprocessor.cpp:904-910), an
@@ -3658,6 +3674,68 @@ mod tests {
                 m.get_field("value")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn group_plain_array_member_advertises_scalar_array_descriptor() {
+        // BR-1 regression. A `+type:"plain"` member bound to a waveform
+        // VAL (an array field) must advertise a scalar-ARRAY leaf, not a
+        // bare scalar: pvxs `getChannelValueType` returns `arrayOf()` for
+        // `dbChannelFinalElements != 1` (iocsource.cpp:632-643), and the
+        // read path serves a `double[]`. A scalar descriptor would
+        // disagree with the length-prefixed array on the wire.
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+
+        // Pull a Plain member's bare leaf descriptor directly from the
+        // group structure (Plain members carry no NT wrapper).
+        fn member_leaf<'a>(group: &'a FieldDesc, name: &str) -> &'a FieldDesc {
+            let FieldDesc::Structure { fields, .. } = group else {
+                panic!("group descriptor must be a structure");
+            };
+            &fields
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("member '{name}' missing from group descriptor"))
+                .1
+        }
+
+        let db = Arc::new(PvDatabase::new());
+        db.add_record(
+            "BR1:wf",
+            Box::new(WaveformRecord::new(8, DbFieldType::Double)),
+        )
+        .await
+        .unwrap();
+
+        let cfg = r#"{
+            "BR1:GRP": {
+                "w": {"+type": "plain", "+channel": "BR1:wf.VAL"}
+            }
+        }"#;
+        let def = super::super::group_config::parse_group_config(cfg)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let channel = GroupChannel::new(db.clone(), def);
+
+        // ---- descriptor (introspect_member / build_introspection) ----
+        let desc = channel.get_field().await.expect("get_field");
+        assert_eq!(
+            member_leaf(&desc, "w"),
+            &FieldDesc::ScalarArray(ScalarType::Double),
+            "plain waveform member must advertise a scalar-ARRAY leaf, not a scalar"
+        );
+
+        // ---- runtime value (decode_member) agrees with the descriptor ----
+        let val = channel
+            .get(&PvStructure::new("structure"))
+            .await
+            .expect("group GET");
+        assert!(
+            matches!(val.get_field("w"), Some(PvField::ScalarArray(_))),
+            "plain waveform member GET value must be a scalar array, got {:?}",
+            val.get_field("w")
+        );
     }
 
     /// Regression. Two boundaries in one

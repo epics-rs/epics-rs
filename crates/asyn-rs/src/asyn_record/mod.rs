@@ -584,7 +584,18 @@ fn record_write_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reque
                 out.nawt = Some(plan.octet_out_len as i32);
             }
         }
-        Err(e) => out.errs = Some(format!("write: {e}")),
+        Err(e) => {
+            out.errs = Some(format!("write: {e}"));
+            // C performOctetIO assigns `nawt = nbytesTransfered`
+            // unconditionally (asynRecord.c:1547) — before the error check
+            // at :1551. A failed write moved no bytes, so land NAWT=0 rather
+            // than leaving the prior write's count. (Register writes touch no
+            // input/count field on error — recGblSetSevr only — so this is
+            // gated to Octet, matching the Ok branch.)
+            if plan.iface == InterfaceType::Octet {
+                out.nawt = Some(0);
+            }
+        }
     }
 }
 
@@ -609,7 +620,26 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
                     }
                 }
             }
-            Err(e) => out.errs = Some(format!("read: {e}")),
+            Err(e) => {
+                out.errs = Some(format!("read: {e}"));
+                // C performOctetIO `memset(inptr, 0, inlen)` (asynRecord.c:1560)
+                // before the read, then assigns EOMR/NORD/TINP from the (zero
+                // on error) transfer unconditionally (:1591/:1627/:1629) — the
+                // error branch at :1583 does not skip them. A failed asyn-rs
+                // read carries no bytes, so reflect a zero transfer: empty
+                // IFMT-selected input field (the buffer C memsets), NORD/EOMR=0,
+                // TINP="". This replaces the prior read's stale fields rather
+                // than leaving them. (Register reads stay stale here, matching
+                // their C handlers which never memset.)
+                out.eomr = Some(0);
+                out.nord = Some(0);
+                out.tinp = Some(String::new());
+                if plan.ifmt == ASYN_FMT_ASCII {
+                    out.ainp = Some(String::new());
+                } else {
+                    out.binp = Some(Vec::new());
+                }
+            }
         },
         InterfaceType::Int32 => match res {
             Ok(result) => match result.int_val {
@@ -3328,6 +3358,134 @@ mod tests {
         assert_eq!(binary.nord, PAYLOAD.len() as i32);
         assert_eq!(binary.binp, PAYLOAD.to_vec());
         assert_eq!(binary.ainp, "SENTINEL", "Binary read must not touch AINP");
+    }
+
+    /// C parity for `performOctetIO` on an I/O *error* (asynRecord.c:1547,
+    /// :1560-1631). C `memset(inptr,0,inlen)` before the read and assigns
+    /// `nawt`/`nord`/`eomr`/`tinp` from the (zero-on-error) transfer
+    /// unconditionally — the error branch does not skip them — so a failed
+    /// transfer lands zero/empty input fields, not the prior transfer's stale
+    /// values. asyn-rs surfaces a failed octet read/write as `Err` carrying no
+    /// bytes; the result-recorders must mirror the same zero transfer.
+    #[test]
+    fn octet_error_resets_transfer_fields() {
+        use crate::error::{AsynError, AsynStatus};
+        use crate::interpose::EomReason;
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::user::AsynUser;
+        use tokio::sync::mpsc;
+
+        struct FailingOctetDriver(PortDriverBase);
+        impl PortDriver for FailingOctetDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn io_read_octet_eom(
+                &mut self,
+                _user: &AsynUser,
+                _buf: &mut [u8],
+            ) -> crate::error::AsynResult<(usize, EomReason)> {
+                Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "read boom".into(),
+                })
+            }
+            fn io_write_octet(
+                &mut self,
+                _user: &mut AsynUser,
+                _data: &[u8],
+            ) -> crate::error::AsynResult<()> {
+                Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "write boom".into(),
+                })
+            }
+        }
+
+        let port_name = "test_octet_error_reset";
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(
+            Box::new(FailingOctetDriver(PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags::default(),
+            ))),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), interrupts);
+        register_port(port_name, handle, Arc::new(TraceManager::new()));
+
+        // ASCII read failure: NORD/EOMR cleared to 0, AINP/TINP cleared to "",
+        // and BINP (not the IFMT-selected field) left as it was — matching C,
+        // which memsets only `inptr` (the ASCII buffer here).
+        let mut ascii = AsynRecord::default();
+        ascii.port = port_name.to_string();
+        ascii.connect_device();
+        ascii.iface = 0; // asynOctet
+        ascii.tmod = TransferMode::Read as i32;
+        ascii.imax = 256;
+        ascii.ifmt = ASYN_FMT_ASCII;
+        ascii.nord = 5;
+        ascii.eomr = 2;
+        ascii.ainp = "STALE".to_string();
+        ascii.tinp = "STALE".to_string();
+        ascii.binp = b"KEEP".to_vec();
+        ascii.process().unwrap();
+        assert!(!ascii.errs.is_empty(), "read error must set ERRS");
+        assert_eq!(ascii.nord, 0, "failed read must reset NORD to 0");
+        assert_eq!(ascii.eomr, 0, "failed read must reset EOMR to 0");
+        assert_eq!(ascii.ainp, "", "failed ASCII read must clear AINP");
+        assert_eq!(ascii.tinp, "", "failed read must clear TINP");
+        assert_eq!(
+            ascii.binp,
+            b"KEEP".to_vec(),
+            "ASCII path must not touch BINP"
+        );
+
+        // Binary read failure: BINP cleared, AINP (not selected) untouched.
+        let mut binary = AsynRecord::default();
+        binary.port = port_name.to_string();
+        binary.connect_device();
+        binary.iface = 0;
+        binary.tmod = TransferMode::Read as i32;
+        binary.imax = 256;
+        binary.ifmt = ASYN_FMT_BINARY;
+        binary.nord = 7;
+        binary.eomr = 3;
+        binary.binp = b"STALE".to_vec();
+        binary.ainp = "KEEP".to_string();
+        binary.tinp = "STALE".to_string();
+        binary.process().unwrap();
+        assert!(!binary.errs.is_empty(), "read error must set ERRS");
+        assert_eq!(binary.nord, 0, "failed read must reset NORD to 0");
+        assert_eq!(binary.eomr, 0, "failed read must reset EOMR to 0");
+        assert_eq!(
+            binary.binp,
+            Vec::<u8>::new(),
+            "failed binary read must clear BINP"
+        );
+        assert_eq!(binary.tinp, "", "failed read must clear TINP");
+        assert_eq!(binary.ainp, "KEEP", "Binary path must not touch AINP");
+
+        // Write failure: NAWT reset to 0 (C assigns nbytesTransfered=0).
+        let mut writer = AsynRecord::default();
+        writer.port = port_name.to_string();
+        writer.connect_device();
+        writer.iface = 0;
+        writer.tmod = TransferMode::Write as i32;
+        writer.ofmt = ASYN_FMT_ASCII;
+        writer.aout = "hello".to_string();
+        writer.nawt = 9;
+        writer.process().unwrap();
+        assert!(!writer.errs.is_empty(), "write error must set ERRS");
+        assert_eq!(writer.nawt, 0, "failed write must reset NAWT to 0");
     }
 
     #[test]

@@ -368,6 +368,12 @@ impl OrientController {
                 true
             }
             None => {
+                // C `calc_A0` (orient.c:195-200) fills the A0/A0_i arrays with
+                // identity when the matrix is singular, and the SNL pvPuts that
+                // identity to A0_11..A0_33 (orient_st.st:496-503). Mirror that so
+                // a singular recalc publishes identity, not the previous matrix.
+                self.a0 = IDENTITY;
+                self.a0_inv = IDENTITY;
                 self.a0_state = CalcState::Failed;
                 false
             }
@@ -418,6 +424,12 @@ impl OrientController {
                 }
             }
             None => {
+                // C `calc_OMTX` (orient.c:279-285) fills OMTX/OMTX_i with identity
+                // on a singular result and the SNL pvPuts that identity to
+                // OMTX_11..OMTX_33 (orient_st.st:534-539). Match it: a singular
+                // recalc publishes identity, not the stale matrix.
+                self.omtx = IDENTITY;
+                self.omtx_inv = IDENTITY;
                 self.omtx_state = CalcState::Failed;
                 false
             }
@@ -627,8 +639,12 @@ impl OrientController {
                     actions.message = Some("Cannot calc OMTX: no valid A0".into());
                     return actions;
                 }
-                if self.recalc_omtx() {
-                    actions.write_omtx = Some(self.omtx);
+                let ok = self.recalc_omtx();
+                // C `newOMTX` (orient_st.st:637-642) pvPuts OMTX_11..OMTX_33
+                // unconditionally after calc_OMTX — identity on a singular result,
+                // the real matrix otherwise — before deciding success/failure.
+                actions.write_omtx = Some(self.omtx);
+                if ok {
                     actions.message = Some("Successful OMTX calc".into());
                     // Recompute angles from current HKL
                     if self.hkl_to_trial_angles() {
@@ -1078,6 +1094,35 @@ mod tests {
     fn test_a0_calculation() {
         let ctrl = make_controller();
         assert_eq!(ctrl.a0_state, CalcState::Succeeded);
+    }
+
+    #[test]
+    fn test_singular_omtx_recalc_sets_identity() {
+        // Two identical reflections make the OMTX intermediate matrices
+        // singular, so calc_omtx returns None. C calc_OMTX fills OMTX/OMTX_i
+        // with identity on a singular result (orient.c:279-285) and the SNL
+        // pvPuts that identity; recalc_omtx must do the same so the published
+        // OMTX_* PVs read identity, not the previous (stale) matrix.
+        let mut ctrl = make_controller();
+        // Seed a non-identity OMTX so stale-vs-identity is observable.
+        ctrl.omtx = [[2.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 4.0]];
+        ctrl.omtx_inv = ctrl.omtx;
+        let refl = Reflection {
+            h: 1.0,
+            k: 1.0,
+            l: 0.0,
+            tth: 20.0,
+            th: 10.0,
+            chi: 5.0,
+            phi: 0.0,
+        };
+        ctrl.ref1 = refl.clone();
+        ctrl.ref2 = refl; // identical reflection → singular OMTX
+        let ok = ctrl.recalc_omtx();
+        assert!(!ok);
+        assert_eq!(ctrl.omtx_state, CalcState::Failed);
+        assert_eq!(ctrl.omtx, IDENTITY);
+        assert_eq!(ctrl.omtx_inv, IDENTITY);
     }
 
     #[test]

@@ -117,7 +117,12 @@ pub fn parse_asyn_mask_link(s: &str) -> Result<AsynMaskLink, AsynError> {
         .parse::<i32>()
         .map_err(|_| AsynError::InvalidLinkSyntax(format!("invalid addr: {}", parts[1])))?;
 
-    // Parse mask: support hex (0x...) and decimal
+    // Parse mask: support hex (0x...) and decimal. The decimal form may
+    // be a *signed* nbits — the asynInt32 `@asynMask` 3rd arg is a bit
+    // count whose sign selects bipolar handling (C devAsynInt32.c:232-237),
+    // and a negative count must bind, not fail. Store the 32-bit pattern;
+    // each interface reinterprets it (asynInt32 as nbits via `as i32`,
+    // asynUInt32Digital as a raw mask).
     let mask_str = parts[2];
     let mask = if let Some(hex) = mask_str
         .strip_prefix("0x")
@@ -126,8 +131,12 @@ pub fn parse_asyn_mask_link(s: &str) -> Result<AsynMaskLink, AsynError> {
         u32::from_str_radix(hex, 16)
             .map_err(|_| AsynError::InvalidLinkSyntax(format!("invalid mask: {mask_str}")))?
     } else {
+        // i32 first (admits negatives); fall back to u32 for masks above
+        // i32::MAX (asynUInt32Digital bitmasks written in decimal).
         mask_str
-            .parse::<u32>()
+            .parse::<i32>()
+            .map(|v| v as u32)
+            .or_else(|_| mask_str.parse::<u32>())
             .map_err(|_| AsynError::InvalidLinkSyntax(format!("invalid mask: {mask_str}")))?
     };
 
@@ -149,6 +158,75 @@ pub fn parse_asyn_mask_link(s: &str) -> Result<AsynMaskLink, AsynError> {
     })
 }
 
+/// asynInt32 `@asynMask` bit-count (nbits) configuration.
+///
+/// For the **asynInt32** interface the third `@asynMask` argument is a
+/// signed bit COUNT, not a raw bitmask (C devAsynInt32.c:232-247):
+/// a negative count selects *bipolar* handling (sign-extend on read),
+/// a positive count *unipolar* (plain low-bit mask). The derived `mask`
+/// keeps the low `|nbits|` bits; `sign_bit` is the top of that field;
+/// `device_low`/`device_high` are the raw device range used for the
+/// LINEAR ESLO/EOFF slope (convertAi:444-451), and they take precedence
+/// over the driver's `getBounds` (initAi:822-826).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Int32Mask {
+    mask: u32,
+    sign_bit: u32,
+    bipolar: bool,
+    device_low: i32,
+    device_high: i32,
+}
+
+impl Int32Mask {
+    /// Derive from the signed nbits value (the reinterpreted `@asynMask`
+    /// 3rd arg). Returns `None` for `nbits == 0` — C leaves `mask = 0`,
+    /// so the read/interrupt masking blocks are skipped entirely.
+    fn from_nbits(nbits_signed: i32) -> Option<Self> {
+        if nbits_signed == 0 {
+            return None;
+        }
+        let bipolar = nbits_signed < 0;
+        // Clamp to 32 so the shifts below stay defined (C relies on the
+        // platform `int` width; asynInt32 is 32-bit).
+        let nbits = nbits_signed.unsigned_abs().min(32);
+        // C `~(~0 << nbits)`: the low `nbits` bits set. `<< 32` is UB in
+        // C and panics in Rust, so the full-width case is taken directly.
+        let mask = if nbits >= 32 {
+            u32::MAX
+        } else {
+            !(!0u32 << nbits)
+        };
+        let sign_bit = 1u32 << (nbits - 1);
+        let (device_low, device_high) = if bipolar {
+            // C: deviceLow = ~(mask/2)+1 (= -(mask/2)); deviceHigh = mask/2.
+            let half = (mask / 2) as i32;
+            (-half, half)
+        } else {
+            // C: deviceLow = 0; deviceHigh = mask.
+            (0, mask as i32)
+        };
+        Some(Self {
+            mask,
+            sign_bit,
+            bipolar,
+            device_low,
+            device_high,
+        })
+    }
+
+    /// C `processCallbackInput` / `interruptCallbackInput` mask +
+    /// sign-extend (devAsynInt32.c:485-488 / 537-540): keep the low
+    /// `nbits`, then for bipolar fields with the sign bit set, extend the
+    /// sign into the high bits.
+    fn apply(self, value: i32) -> i32 {
+        let mut v = (value as u32) & self.mask;
+        if self.bipolar && (v & self.sign_bit) != 0 {
+            v |= !self.mask;
+        }
+        v as i32
+    }
+}
+
 /// Adapter bridging an asyn-rs PortDriver to epics-base-rs DeviceSupport.
 pub struct AsynDeviceSupport {
     handle: PortHandle,
@@ -162,6 +240,10 @@ pub struct AsynDeviceSupport {
     iface: Option<InterfaceType>,
     /// Bit mask for UInt32Digital read/write. Default: 0xFFFFFFFF.
     mask: u32,
+    /// asynInt32 `@asynMask` nbits config (mask + sign-extend + device
+    /// bounds), derived when the interface is `asynInt32` and a non-zero
+    /// bit count was given. `None` for every other case (no masking).
+    int32_mask: Option<Int32Mask>,
     last_alarm_status: u16,
     last_alarm_severity: u16,
     last_ts: Option<SystemTime>,
@@ -291,6 +373,7 @@ impl AsynDeviceSupport {
             iface_type: iface_type.to_string(),
             iface,
             mask: 0xFFFFFFFF,
+            int32_mask: None,
             max_array_elements: 307200,
             octet_max_size: 256,
             last_alarm_status: 0,
@@ -313,8 +396,16 @@ impl AsynDeviceSupport {
     }
 
     /// Set the bit mask for UInt32Digital read/write operations.
+    ///
+    /// For the `asynInt32` interface the same `@asynMask` 3rd arg is a
+    /// signed bit COUNT (nbits), not a raw bitmask (C devAsynInt32.c:
+    /// 232-247): reinterpret the stored 32-bit pattern as `i32` and derive
+    /// the mask + sign-extend + device-bounds config from it.
     pub fn with_mask(mut self, mask: u32) -> Self {
         self.mask = mask;
+        if self.iface_type == "asynInt32" {
+            self.int32_mask = Int32Mask::from_nbits(mask as i32);
+        }
         self
     }
 
@@ -579,21 +670,28 @@ impl AsynDeviceSupport {
     /// them on the record. Caller has already verified the record
     /// exposes ESLO and the interface is `asynInt32` / `asynInt64`.
     fn apply_linear_eslo_eoff(&self, record: &mut dyn Record) {
-        let op = if self.iface_type == "asynInt64" {
-            RequestOp::GetBoundsInt64
+        // C devAsynInt32.c:822-826 — the nbits-derived deviceLow/High (set
+        // when @asynMask gives a bit count) take precedence; `getBounds` is
+        // the fallback only when no nbits was specified.
+        let (low, high) = if let Some(m) = self.int32_mask {
+            (m.device_low as f64, m.device_high as f64)
         } else {
-            RequestOp::GetBoundsInt32
-        };
-        let user = AsynUser::new(self.reason)
-            .with_addr(self.addr)
-            .with_timeout(self.timeout);
-        let result = match self.handle.submit_blocking(op, user) {
-            Ok(r) => r,
-            Err(_) => return,
-        };
-        let (low, high) = match result.bounds {
-            Some((l, h)) => (l as f64, h as f64),
-            None => return,
+            let op = if self.iface_type == "asynInt64" {
+                RequestOp::GetBoundsInt64
+            } else {
+                RequestOp::GetBoundsInt32
+            };
+            let user = AsynUser::new(self.reason)
+                .with_addr(self.addr)
+                .with_timeout(self.timeout);
+            let result = match self.handle.submit_blocking(op, user) {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            match result.bounds {
+                Some((l, h)) => (l as f64, h as f64),
+                None => return,
+            }
         };
         // C parity: `if (deviceHigh != deviceLow)` (convertAi:444).
         // A degenerate driver that reports 0,0 (the "I don't know"
@@ -650,10 +748,19 @@ impl AsynDeviceSupport {
         }
     }
 
+    /// Apply the asynInt32 `@asynMask` mask + sign-extend to a raw read
+    /// value (C `processCallbackInput`, devAsynInt32.c:485-488). A no-op
+    /// when no nbits was configured (`int32_mask == None`).
+    fn apply_int32_mask(&self, value: i32) -> i32 {
+        self.int32_mask.map_or(value, |m| m.apply(value))
+    }
+
     /// Extract an EpicsValue from a RequestResult based on interface type.
     fn result_to_value(&self, result: &RequestResult) -> Option<EpicsValue> {
         match self.iface_type.as_str() {
-            "asynInt32" => result.int_val.map(EpicsValue::Long),
+            "asynInt32" => result
+                .int_val
+                .map(|v| EpicsValue::Long(self.apply_int32_mask(v))),
             "asynInt64" => result.int64_val.map(|v| EpicsValue::Double(v as f64)),
             "asynFloat64" => result.float_val.map(EpicsValue::Double),
             "asynOctet" => result.data.as_ref().map(|d| {
@@ -1219,6 +1326,11 @@ impl DeviceSupport for AsynDeviceSupport {
         // UInt32Digital.
         let is_uint32 = self.iface_type == "asynUInt32Digital";
         let mask = self.mask;
+        // asynInt32 @asynMask nbits config, applied to interrupt values
+        // the same way the polled read masks them (C interruptCallbackInput,
+        // devAsynInt32.c:537-540). `None` for every non-int32 / no-nbits
+        // case, so the closure leaves the value untouched.
+        let int32_mask = self.int32_mask;
         let filter = InterruptFilter {
             reason: Some(self.reason),
             addr: Some(self.addr),
@@ -1239,15 +1351,16 @@ impl DeviceSupport for AsynDeviceSupport {
                 // deliver `mask & value` for UInt32Digital so the I/O-Intr value
                 // matches the polled read (RequestOp::UInt32DigitalRead { mask }).
                 // interruptCallbackInput stores the already-masked value in the
-                // ring buffer; mirror that here. Non-UInt32 values pass through.
-                // C parity (asynPortDriver.cpp:729 + devAsynUInt32Digital.c:464):
-                // deliver `mask & value` for UInt32Digital so the I/O-Intr value
-                // matches the polled read (RequestOp::UInt32DigitalRead { mask }).
-                // interruptCallbackInput stores the already-masked value in the
-                // ring buffer; mirror that here. Non-UInt32 values pass through.
+                // ring buffer; mirror that here. For asynInt32 apply the
+                // @asynMask nbits mask + sign-extend (devAsynInt32.c:537-540),
+                // matching the polled `result_to_value` path. Other values
+                // pass through.
                 let value = match iv.value {
                     crate::param::ParamValue::UInt32Digital(v) if is_uint32 => {
                         crate::param::ParamValue::UInt32Digital(v & mask)
+                    }
+                    crate::param::ParamValue::Int32(v) => {
+                        crate::param::ParamValue::Int32(int32_mask.map_or(v, |m| m.apply(v)))
                     }
                     other => other,
                 };
@@ -1614,6 +1727,104 @@ mod tests {
     #[test]
     fn test_parse_mask_link_invalid_prefix() {
         assert!(parse_asyn_mask_link("@asyn(port1, 0, 0xFF) BITS").is_err());
+    }
+
+    #[test]
+    fn test_parse_mask_link_negative_nbits_binds() {
+        // asynInt32 @asynMask 3rd arg is a signed bit count; a negative
+        // count (bipolar) must bind, not fail the u32 parse. Stored as the
+        // 32-bit pattern: -8 => 0xFFFFFFF8, recoverable via `as i32`.
+        let link = parse_asyn_mask_link("@asynMask(p, 0, -8) X").unwrap();
+        assert_eq!(link.mask as i32, -8);
+    }
+
+    #[test]
+    fn int32_mask_unipolar_from_nbits() {
+        // C devAsynInt32.c:239-246 unipolar (positive nbits): mask = low
+        // nbits, deviceLow=0, deviceHigh=mask, no sign extension.
+        let m = Int32Mask::from_nbits(8).unwrap();
+        assert!(!m.bipolar);
+        assert_eq!(m.mask, 0xFF);
+        assert_eq!(m.sign_bit, 0x80);
+        assert_eq!(m.device_low, 0);
+        assert_eq!(m.device_high, 255);
+        // Masks the low byte; the high "sign" bit is NOT extended.
+        assert_eq!(m.apply(0xFF), 255);
+        assert_eq!(m.apply(0x80), 128);
+        assert_eq!(m.apply(0x1_2345), 0x45);
+    }
+
+    #[test]
+    fn int32_mask_bipolar_from_nbits() {
+        // C devAsynInt32.c:235-243 bipolar (negative nbits): sign-extend on
+        // read; deviceLow=~(mask/2)+1, deviceHigh=mask/2.
+        let m = Int32Mask::from_nbits(-8).unwrap();
+        assert!(m.bipolar);
+        assert_eq!(m.mask, 0xFF);
+        assert_eq!(m.sign_bit, 0x80);
+        assert_eq!(m.device_low, -127);
+        assert_eq!(m.device_high, 127);
+        // Sign bit set => extend to a negative i32.
+        assert_eq!(m.apply(0xFF), -1);
+        assert_eq!(m.apply(0x80), -128);
+        // Sign bit clear => positive, masked to the low byte.
+        assert_eq!(m.apply(0x7F), 127);
+        assert_eq!(m.apply(0x1_2345), 0x45);
+    }
+
+    #[test]
+    fn int32_mask_zero_nbits_is_none() {
+        // C leaves mask=0 when no bit count is given => masking is a no-op.
+        assert!(Int32Mask::from_nbits(0).is_none());
+    }
+
+    #[test]
+    fn int32_mask_only_for_asyn_int32_interface() {
+        // with_mask derives the nbits config only for the asynInt32
+        // interface; a UInt32Digital adapter keeps the raw mask, no nbits.
+        // No submit happens here, so the channels need no actor.
+        let mk_handle = |name: &str| {
+            let interrupts = Arc::new(InterruptManager::new(256));
+            let (tx, _rx) = tokio::sync::mpsc::channel(256);
+            (PortHandle::new(tx, name.into(), interrupts), _rx)
+        };
+        let link = |port: &str| AsynLink {
+            port_name: port.into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: String::new(),
+        };
+
+        let (h1, _rx1) = mk_handle("p1");
+        let int32 =
+            AsynDeviceSupport::from_handle(h1, link("p1"), "asynInt32").with_mask((-8i32) as u32);
+        assert_eq!(int32.int32_mask, Int32Mask::from_nbits(-8));
+
+        let (h2, _rx2) = mk_handle("p2");
+        let uint =
+            AsynDeviceSupport::from_handle(h2, link("p2"), "asynUInt32Digital").with_mask(0xFF00);
+        assert!(uint.int32_mask.is_none());
+        assert_eq!(uint.mask, 0xFF00);
+    }
+
+    #[test]
+    fn result_to_value_masks_and_sign_extends_int32() {
+        // The polled read path (result_to_value) must apply the nbits mask +
+        // sign-extend (C processCallbackInput, devAsynInt32.c:485-488).
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let handle = PortHandle::new(tx, "p".into(), interrupts);
+        let link = AsynLink {
+            port_name: "p".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: String::new(),
+        };
+        // bipolar 8-bit (@asynMask ... -8): raw 0xFF reads back as -1.
+        let ads =
+            AsynDeviceSupport::from_handle(handle, link, "asynInt32").with_mask((-8i32) as u32);
+        let result = RequestResult::int32_read(0xFF);
+        assert_eq!(ads.result_to_value(&result), Some(EpicsValue::Long(-1)));
     }
 
     use crate::error::AsynResult;

@@ -201,6 +201,13 @@ pub struct AsynDeviceSupport {
     /// **only** sent on a fresh-entry add (not on overflow
     /// overwrite) so the dbScan queue does not flood.
     interrupt_fifo: Arc<std::sync::Mutex<InterruptFifo>>,
+    /// True once the `asynFloat64` ai path has written VAL at least once.
+    /// The SMOO filter primes on the first read (C `processAi` skips
+    /// smoothing while `pr->udf`, devAsynFloat64.c:599); this is the
+    /// adapter-side `!udf` for that path, where the adapter is the sole
+    /// VAL writer so "have I produced a value yet" is exactly C's prime
+    /// signal — and it does not depend on the framework's UDF lifecycle.
+    smoo_primed: bool,
 }
 
 /// Cached interrupt value with metadata for alarm/timestamp propagation.
@@ -296,6 +303,7 @@ impl AsynDeviceSupport {
             write_only: false,
             interrupt_sub: None,
             interrupt_fifo: Arc::new(std::sync::Mutex::new(InterruptFifo::new())),
+            smoo_primed: false,
         }
     }
 
@@ -720,6 +728,63 @@ impl AsynDeviceSupport {
             _ => None,
         }
     }
+
+    /// Store a freshly-read scalar value into the record's VAL. For the
+    /// `asynFloat64` ai input path this reproduces C `devAsynFloat64`'s
+    /// `processAi` (devAsynFloat64.c:594-604): the float64 device support
+    /// computes the engineering VAL itself — ASLO/AOFF scaling then the SMOO
+    /// filter — and returns RTN_DO_NOT_CONVERT so the record's RVAL->VAL
+    /// convert is skipped. The asyn-rs adapter likewise returns `computed()`
+    /// (skip_convert), so without reproducing ASLO/AOFF/SMOO here the raw
+    /// driver double would reach VAL unscaled and unfiltered. The conversion
+    /// is gated on the record exposing `SMOO` (the ai-only field) so an `ao`
+    /// readback — which has ASLO/AOFF but no SMOO and a different (output)
+    /// conversion — is not disturbed.
+    fn store_read_value(&mut self, record: &mut dyn Record, val: EpicsValue) {
+        if self.iface_type == "asynFloat64" {
+            if let EpicsValue::Double(raw) = val {
+                if record.get_field("SMOO").is_some() {
+                    let eng = self.apply_float64_ai_conversion(record, raw);
+                    let _ = record.set_val(EpicsValue::Double(eng));
+                    return;
+                }
+            }
+        }
+        let _ = record.set_val(val);
+    }
+
+    /// The ASLO/AOFF/SMOO arithmetic of C `devAsynFloat64::processAi`
+    /// (devAsynFloat64.c:595-602). `ASLO`/`AOFF`/`SMOO` are read live so a
+    /// runtime change takes effect on the next read. SMOO primes on the first
+    /// read (C skips smoothing while `pr->udf`); `smoo_primed` is the
+    /// adapter-side `!udf` for the float64 path (the adapter is the sole VAL
+    /// writer there), and the `!cur.is_finite()` guard mirrors C's
+    /// `!finite(pr->val)`.
+    fn apply_float64_ai_conversion(&mut self, record: &mut dyn Record, raw: f64) -> f64 {
+        let field = |name: &str| match record.get_field(name) {
+            Some(EpicsValue::Double(v)) => v,
+            _ => 0.0,
+        };
+        let aslo = field("ASLO");
+        let aoff = field("AOFF");
+        let smoo = field("SMOO");
+        let mut val64 = raw;
+        if aslo != 0.0 {
+            val64 *= aslo;
+        }
+        val64 += aoff;
+        let cur = match record.val() {
+            Some(EpicsValue::Double(v)) => v,
+            _ => f64::NAN,
+        };
+        let out = if smoo == 0.0 || !self.smoo_primed || !cur.is_finite() {
+            val64
+        } else {
+            cur * smoo + val64 * (1.0 - smoo)
+        };
+        self.smoo_primed = true;
+        out
+    }
 }
 
 impl DeviceSupport for AsynDeviceSupport {
@@ -859,7 +924,7 @@ impl DeviceSupport for AsynDeviceSupport {
             }
             if let Some(ci) = entry {
                 if let Some(val) = param_value_to_epics_value(&ci.value) {
-                    let _ = record.set_val(val);
+                    self.store_read_value(record, val);
                 }
                 self.last_ts = Some(ci.timestamp);
                 // C devAsynInt32.c:843-847 — apply the driver alarm carried
@@ -880,7 +945,7 @@ impl DeviceSupport for AsynDeviceSupport {
             match self.handle.submit_blocking(op, user) {
                 Ok(result) => {
                     if let Some(val) = self.result_to_value(&result) {
-                        let _ = record.set_val(val);
+                        self.store_read_value(record, val);
                     }
                     self.last_alarm_status = result.alarm_status;
                     self.last_alarm_severity = result.alarm_severity;
@@ -2148,6 +2213,121 @@ mod tests {
         ads.read(&mut rec).unwrap();
         assert_eq!(rec.val(), Some(EpicsValue::Long(9)));
         assert_eq!(ads.last_alarm(), None, "clean entry => no alarm");
+    }
+
+    /// A `ScanType::IoIntr` adapter on `asynFloat64` whose driver exposes a
+    /// `Float64` VAL param (so `init`/`drv_user_create` resolves `reason_set`).
+    fn make_float64_io_intr_adapter() -> AsynDeviceSupport {
+        struct F64Port {
+            base: PortDriverBase,
+        }
+        impl F64Port {
+            fn new() -> Self {
+                let mut base = PortDriverBase::new("test_f64", 1, PortFlags::default());
+                base.create_param("VAL", ParamType::Float64).unwrap();
+                Self { base }
+            }
+        }
+        impl PortDriver for F64Port {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+        }
+
+        let driver = F64Port::new();
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let actor = PortActor::new(Box::new(driver), rx);
+        std::thread::Builder::new()
+            .name("test-f64-actor".into())
+            .spawn(move || actor.run())
+            .unwrap();
+        let handle = PortHandle::new(tx, "test_f64".into(), interrupts);
+        let link = AsynLink {
+            port_name: "test_f64".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: "VAL".into(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynFloat64");
+        ads.set_record_info("TEST:AI", ScanType::IoIntr);
+        ads
+    }
+
+    fn push_f64(ads: &AsynDeviceSupport, raw: f64) {
+        let mut g = ads.interrupt_fifo.lock().unwrap();
+        g.push_with_overflow(CachedInterrupt {
+            value: crate::param::ParamValue::Float64(raw),
+            timestamp: SystemTime::UNIX_EPOCH,
+            alarm_status: 0,
+            alarm_severity: 0,
+        });
+    }
+
+    /// C `devAsynFloat64::processAi` (devAsynFloat64.c:594-604) computes the ai
+    /// VAL itself: ASLO/AOFF scaling then the SMOO filter, then returns
+    /// RTN_DO_NOT_CONVERT. The asyn-rs adapter returns `computed()` (skips the
+    /// record convert) so it must apply the same ASLO/AOFF/SMOO — otherwise the
+    /// raw driver double reaches VAL unscaled and unfiltered.
+    #[test]
+    fn float64_ai_read_applies_aslo_aoff_and_smoo() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut ads = make_float64_io_intr_adapter();
+        let mut rec = AiRecord::new(0.0);
+        ads.init(&mut rec).unwrap(); // reason_set
+        rec.put_field("ASLO", EpicsValue::Double(2.0)).unwrap();
+        rec.put_field("AOFF", EpicsValue::Double(1.0)).unwrap();
+        rec.put_field("SMOO", EpicsValue::Double(0.0)).unwrap();
+
+        // First read: SMOO=0 -> pure ASLO/AOFF: 10*2 + 1 = 21.
+        push_f64(&ads, 10.0);
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            rec.val(),
+            Some(EpicsValue::Double(21.0)),
+            "ASLO/AOFF applied: raw*aslo + aoff"
+        );
+
+        // Second read with SMOO=0.5: val = prev*smoo + val64*(1-smoo)
+        //   val64 = 20*2 + 1 = 41; val = 21*0.5 + 41*0.5 = 31.
+        rec.put_field("SMOO", EpicsValue::Double(0.5)).unwrap();
+        push_f64(&ads, 20.0);
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            rec.val(),
+            Some(EpicsValue::Double(31.0)),
+            "SMOO filter: prev*smoo + (raw*aslo+aoff)*(1-smoo)"
+        );
+    }
+
+    /// SMOO primes on the first read — C skips smoothing while `pr->udf`
+    /// (devAsynFloat64.c:599), so the first value is taken whole rather than
+    /// smoothed toward the record's initial VAL.
+    #[test]
+    fn float64_ai_smoo_primes_on_first_read() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut ads = make_float64_io_intr_adapter();
+        let mut rec = AiRecord::new(0.0);
+        ads.init(&mut rec).unwrap();
+        // SMOO=0.5 from the very first read; ASLO/AOFF identity.
+        rec.put_field("SMOO", EpicsValue::Double(0.5)).unwrap();
+
+        push_f64(&ads, 10.0);
+        ads.read(&mut rec).unwrap();
+        // Primed: VAL = 10, NOT 0*0.5 + 10*0.5 = 5.
+        assert_eq!(
+            rec.val(),
+            Some(EpicsValue::Double(10.0)),
+            "first read primes the SMOO filter (no smoothing toward VAL=0)"
+        );
+
+        // Now smoothing engages: 10*0.5 + 20*0.5 = 15.
+        push_f64(&ads, 20.0);
+        ads.read(&mut rec).unwrap();
+        assert_eq!(rec.val(), Some(EpicsValue::Double(15.0)));
     }
 
     /// PR #162: `aai` (array analog input) and `aao` (array analog output)

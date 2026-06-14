@@ -199,6 +199,9 @@ impl IocBuilder {
                 if let Err(e) = instance.record.init_record(1) {
                     eprintln!("init_record(1) failed for {name}: {e}");
                 }
+                // Seed MLST/ALST/LALM from val so the first process posts a
+                // monitor only on a real change (C init_record invariant).
+                instance.record.seed_deadband_tracking();
             }
         }
 
@@ -290,6 +293,10 @@ impl IocBuilder {
                     eprintln!("post_init_finalize_undef failed for {}: {e}", def.name);
                 }
                 instance.common.udf = udf;
+                // Seed MLST/ALST/LALM from val (after any UDF/bit fold that
+                // may have changed val) so the first process posts a monitor
+                // only on a real change (C init_record invariant).
+                instance.record.seed_deadband_tracking();
 
                 // Device support based on DTYP
                 let dtyp = instance.common.dtyp.clone();

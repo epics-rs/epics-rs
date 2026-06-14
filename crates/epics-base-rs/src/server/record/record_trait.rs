@@ -645,6 +645,39 @@ pub trait Record: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Seed the monitor/archive/alarm deadband trackers (MLST/ALST/LALM)
+    /// from the initial value at iocInit, called once by the builder after
+    /// both `init_record` passes and `post_init_finalize_undef`.
+    ///
+    /// Every C value record's `init_record` ends with
+    /// `prec->mlst = prec->alst = prec->lalm = prec->val`
+    /// (e.g. `longinRecord.c:120-122`, `aiRecord.c`), so the first
+    /// `monitor()` evaluates `DELTA(mlst, val) > mdel` with `mlst == val`
+    /// (= 0) and posts no DBE_VALUE/DBE_LOG event when the value is
+    /// unchanged from its initial state. Records expose MLST/ALST/LALM as
+    /// plain `f64` fields default-initialised to `0.0`; that default
+    /// conflates "never published" with "published 0", so a record
+    /// initialised to a *nonzero* value (constant DOL, initial VAL) used
+    /// to post a spurious first-cycle update that C does not.
+    ///
+    /// The default seeds whichever of MLST/ALST/LALM the record actually
+    /// serves from its monitor-deadband value (`val` for most records),
+    /// making the invariant hold by construction for every record rather
+    /// than per-type `init_record` code. It is idempotent for the record
+    /// types that already seed inside `init_record`, and a no-op for
+    /// records that serve none of these fields.
+    fn seed_deadband_tracking(&mut self) {
+        let seed = match self.monitor_deadband_value().and_then(|v| v.to_f64()) {
+            Some(v) if v.is_finite() => v,
+            _ => return,
+        };
+        for field in ["MLST", "ALST", "LALM"] {
+            if self.get_field(field).is_some() {
+                let _ = self.put_field(field, EpicsValue::Double(seed));
+            }
+        }
+    }
+
     /// Called by the framework immediately after applying this cycle's
     /// [`Record::multi_input_links`] fetches, before `process()`.
     ///

@@ -604,6 +604,27 @@ mod tests {
     }
 
     #[test]
+    fn seed_deadband_tracking_seeds_trackers_from_val() {
+        use crate::server::record::Record;
+        // C `longoutRecord.c` init_record ends with mlst=alst=lalm=val, so a
+        // record initialised to a nonzero VAL posts no spurious first-cycle
+        // monitor (DELTA(mlst,val)==0). The trackers default to 0.0, which
+        // conflates "never published" with "published 0"; the framework seed
+        // must lift them to val via the generic get_field/put_field path.
+        let mut r = LongoutRecord::new(5);
+        assert_eq!(r.mlst, 0.0, "precondition: tracker is the 0.0 default");
+        assert_eq!(r.alst, 0.0);
+        assert_eq!(r.lalm, 0.0);
+        r.seed_deadband_tracking();
+        assert_eq!(r.mlst, 5.0, "mlst seeded from val");
+        assert_eq!(r.alst, 5.0, "alst seeded from val");
+        assert_eq!(r.lalm, 5.0, "lalm seeded from val");
+        // First process leaves val unchanged: DELTA(mlst=5, val=5)=0 is not
+        // > mdel(0), so no DBE_VALUE/DBE_LOG post — matching C.
+        assert!((5.0_f64 - r.mlst).abs() <= 0.0);
+    }
+
+    #[test]
     fn oopt_on_change() {
         let mut r = LongoutRecord::new(0);
         r.oopt = 1;

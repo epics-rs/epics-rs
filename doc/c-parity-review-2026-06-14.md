@@ -33,6 +33,32 @@ rationale.
 - **verify** — reachability uncertain; confirm an observable divergence
   exists in the Rust model before fixing.
 
+## Resolution status (round 1 — closed 2026-06-15)
+
+All 15 findings dispositioned. The 12 fixable findings landed as one
+commit each; the 3 **signoff** findings were presented to the user and,
+on the user's decision (2026-06-15), are kept as documented design
+deviations (the divergence is an output-form difference that only closes
+via a semantic/architectural change to an intentional port design).
+
+| ID    | Disposition | Resolution |
+|-------|-------------|------------|
+| BASE-1 | fix      | **Fixed** — `f4592969` (ACKT/ACKS posts DBE_ALARM mask + record-wide alarm event) |
+| BASE-2 | fix      | **Fixed** — `1e806cc1` (scalar DBF_CHAR rendered signed in DBR_STRING) |
+| BASE-3 | fix      | **Fixed** — `4fd5885c` (seed MLST/ALST/LALM from val to suppress first-cycle post) |
+| CA-1  | fix       | **Fixed** — `b6eda40e` (bad-SID handlers emit ECA_INTERNAL frame before close) |
+| CA-2  | fix       | **Fixed** — `7c46a3dd` (READ_NOTIFY get-failure preserves server ECA code) |
+| CA-3  | fix-low   | **Fixed** — `396cbbd4` (READ_NOTIFY get-failure ships dbr_size_n zero body at requested count) |
+| PVA-1 | fix       | **Fixed** — `0c659f4b` (cooked monitor builders emit empty overrun bitset) |
+| PVA-2 | fix-low   | **Fixed** — `fb675345` (monitor INIT reply subcmd state-derived 0x08, not echoed) |
+| PVA-3 | signoff   | **Kept (documented)** — user decision 2026-06-15: keep hold-latest coalescing; unreachable for shipped QSRV/gateway sources (honor the start gate), sibling of the SR-19 unbounded-queueSize decision. |
+| MOT-1 | fix       | **Fixed** — `a036ee16` (re-post DIFF/RDIF on every device-callback pass) |
+| MOT-2 | fix-low   | **Fixed** — `b53e42af` (load_pos leaves RBV in pre-LOAD_POS frame) |
+| MOT-3 | verify→signoff | **Verified, kept (documented)** — finding premise (Rust never resumes a held jog) is inaccurate; Rust resumes via its level-triggered `ctrl.jogf` re-evaluation. Residual divergence is narrow (transient MIP=0x1000 on give-up; close-enough resume) and stems from the intentional level-triggered button model. User decision 2026-06-15: keep. |
+| BR-1  | fix       | **Fixed** — `aa020064` (plain array group member advertises scalar-array leaf) |
+| BR-2  | fix       | **Fixed** — `7daea2db` (forward upstream changedBitSet to cooked monitors) |
+| BR-3  | signoff   | **Kept (documented)** — user decision 2026-06-15: keep alarm-post-on-disconnect; common case (default camonitor mask `DBE_VALUE|DBE_ALARM`) receives the disconnect alarm, the gap is value-only/log-only subscribers, and the full fix is a channel-teardown architecture change. |
+
 ## Open Findings
 
 ### BASE-1: Alarm-acknowledge put (ACKT/ACKS) posts wrong monitor mask and skips the record-wide DBE_ALARM event
@@ -156,3 +182,14 @@ Disposition summary: 9 **fix**, 2 **fix-low** (CA-3, PVA-2; MOT-2 fix-low),
 2 **signoff** (PVA-3, BR-3), 1 **verify** (MOT-3). Sign-off items differ in
 observable output but only close via an intentional-design/architecture
 change; presented to the user rather than silently rewritten.
+
+### Round 1 closure — 2026-06-15
+
+All 15 findings dispositioned (see **Resolution status** above). 12 fixed
+(one commit per finding, `f4592969`…`7daea2db`); MOT-3 verified (premise
+inaccurate — Rust resumes a held jog via the level-triggered button model);
+the 3 sign-off items (PVA-3, BR-3, MOT-3) presented to the user and kept as
+documented design deviations on the user's decision. No finding left in an
+unfixed/undecided state. The Rust-side improvements that nevertheless broke
+wire parity (PVA-1 overrun bitset, BR-1 scalar-vs-array leaf, BR-2 cooked
+changedBitSet) were corrected to the upstream output form.

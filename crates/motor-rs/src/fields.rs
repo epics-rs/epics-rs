@@ -493,6 +493,15 @@ pub struct InternalFields {
     /// GET_INFO (C 2546 gates on `proc_ind == NOTHING_DONE`). Set by
     /// `determine_event`, consumed at `do_process_inner` entry.
     pub idle_status_pass: bool,
+    /// One-pass mark: `process_motor_info` recomputed DIFF/RDIF this
+    /// cycle — the C `MARK(M_DIFF)` / `MARK(M_RDIF)` of
+    /// `process_motor_info` (motorRecord.cc:3764-3767), set on every
+    /// `CALLBACK_DATA` pass. C `monitor()` (3522-3531) then posts both
+    /// with `monitor_mask | DBE_VAL_LOG` regardless of whether the value
+    /// changed, so a `camonitor DIFF/RDIF` on a settled axis parked at a
+    /// constant non-zero following error gets an event every poll. Read by
+    /// `force_posted_fields`; reset at the top of each `process()`.
+    pub diff_rdif_marked: bool,
     /// Driver commands a put queued at special() time (C sends them
     /// from special() before the pp pass runs do_work: pidcof
     /// 3003-3026, set_user/dial_*limit 4076-4328). Every motor put is

@@ -248,6 +248,30 @@ fn test_athm_tracks_home_switch_every_poll() {
 }
 
 #[test]
+fn test_process_motor_info_marks_diff_rdif_for_force_post() {
+    // C process_motor_info (motorRecord.cc:3764-3767) MARKs M_DIFF/M_RDIF
+    // on every CALLBACK_DATA pass; monitor() (3522-3531) then posts both
+    // with DBE_VAL_LOG regardless of change. The Rust record records the
+    // mark so the framework re-posts DIFF/RDIF this cycle even when the
+    // following error is constant. A record that has not run
+    // process_motor_info this pass must name no force-posted field.
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    assert!(
+        rec.force_posted_fields().is_empty(),
+        "a fresh record (no CALLBACK_DATA pass) force-posts nothing"
+    );
+
+    let status = asyn_rs::interfaces::motor::MotorStatus::default();
+    rec.process_motor_info(&status);
+    assert_eq!(
+        rec.force_posted_fields(),
+        &["DIFF", "RDIF"],
+        "a CALLBACK_DATA pass marks DIFF/RDIF for unconditional re-post"
+    );
+}
+
+#[test]
 fn test_sync_positions() {
     let mut rec = MotorRecord::new();
     rec.conv.mres = 0.01;

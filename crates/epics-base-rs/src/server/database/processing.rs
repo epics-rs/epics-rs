@@ -2097,6 +2097,10 @@ impl PvDatabase {
             } else {
                 instance.record.alarm_cycle_monitored_fields()
             };
+            // Fields the record force-posts every cycle it recomputed them
+            // (C unconditional MARK + DBE_VAL_LOG), even when unchanged —
+            // see `Record::force_posted_fields`. Empty for most records.
+            let force_fields = instance.record.force_posted_fields();
             let mut sub_updates: Vec<(String, EpicsValue, EventMask)> = Vec::new();
             for (field, subs) in &instance.subscribers {
                 if !subs.is_empty()
@@ -2112,6 +2116,10 @@ impl PvDatabase {
                             None => true,
                         };
                         if changed {
+                            sub_updates.push((field.clone(), val, aux_mask));
+                        } else if force_fields.contains(&field.as_str()) {
+                            // C `monitor()` posts a re-marked field with
+                            // `monitor_mask | DBE_VAL_LOG` even when unchanged.
                             sub_updates.push((field.clone(), val, aux_mask));
                         } else if alarm_fanout.contains(&field.as_str()) {
                             sub_updates.push((field.clone(), val, alarm_bits));
@@ -3154,6 +3162,10 @@ impl PvDatabase {
             } else {
                 instance.record.alarm_cycle_monitored_fields()
             };
+            // Fields the record force-posts every cycle it recomputed them
+            // (C unconditional MARK + DBE_VAL_LOG), even when unchanged —
+            // see `Record::force_posted_fields`. Empty for most records.
+            let force_fields = instance.record.force_posted_fields();
             let mut sub_updates: Vec<(String, EpicsValue, EventMask)> = Vec::new();
             for (field, subs) in &instance.subscribers {
                 if !subs.is_empty()
@@ -3169,6 +3181,10 @@ impl PvDatabase {
                             None => true,
                         };
                         if changed {
+                            sub_updates.push((field.clone(), val, aux_mask));
+                        } else if force_fields.contains(&field.as_str()) {
+                            // C `monitor()` posts a re-marked field with
+                            // `monitor_mask | DBE_VAL_LOG` even when unchanged.
                             sub_updates.push((field.clone(), val, aux_mask));
                         } else if alarm_fanout.contains(&field.as_str()) {
                             sub_updates.push((field.clone(), val, alarm_bits));
@@ -4006,6 +4022,10 @@ fn sim_process_tail(instance: &mut RecordInstance, sims: i16) {
     } else {
         instance.record.alarm_cycle_monitored_fields()
     };
+    // Fields the record force-posts every cycle it recomputed them
+    // (C unconditional MARK + DBE_VAL_LOG), even when unchanged —
+    // see `Record::force_posted_fields`. Empty for most records.
+    let force_fields = instance.record.force_posted_fields();
     let mut sub_updates: Vec<(String, EpicsValue, EventMask)> = Vec::new();
     for (field, subs) in &instance.subscribers {
         if !subs.is_empty()
@@ -4021,6 +4041,10 @@ fn sim_process_tail(instance: &mut RecordInstance, sims: i16) {
                     None => true,
                 };
                 if changed {
+                    sub_updates.push((field.clone(), val, aux_mask));
+                } else if force_fields.contains(&field.as_str()) {
+                    // C `monitor()` posts a re-marked field with
+                    // `monitor_mask | DBE_VAL_LOG` even when unchanged.
                     sub_updates.push((field.clone(), val, aux_mask));
                 } else if alarm_fanout.contains(&field.as_str()) {
                     sub_updates.push((field.clone(), val, alarm_bits));

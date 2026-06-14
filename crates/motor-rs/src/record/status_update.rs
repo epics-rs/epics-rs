@@ -182,6 +182,14 @@ impl MotorRecord {
         } else {
             0
         };
+        // C `process_motor_info` MARKs M_DIFF / M_RDIF unconditionally on
+        // every CALLBACK_DATA pass (motorRecord.cc:3765,3767); `monitor()`
+        // (3522-3531) posts both with `monitor_mask | DBE_VAL_LOG` whether
+        // or not the value moved. Record the mark so `force_posted_fields`
+        // re-posts DIFF/RDIF this cycle even when unchanged — a settled
+        // axis at constant non-zero following error still emits them each
+        // poll. The mark is one-pass: reset at the top of `process()`.
+        self.internal.diff_rdif_marked = true;
 
         // MOVN: C uses RAW limit switches (rhls/rlls) with RAW cdir
         // Must compute ls_active BEFORE mapping limits to user coordinates

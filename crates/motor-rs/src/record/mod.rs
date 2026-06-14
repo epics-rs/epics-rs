@@ -223,6 +223,12 @@ impl Record for MotorRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
+        // Clear the one-pass DIFF/RDIF mark before any `process_motor_info`
+        // can set it this cycle (it runs from `determine_event` below and
+        // from `do_process`). The post-process snapshot reads it through
+        // `force_posted_fields`; a pass that does not recompute DIFF/RDIF
+        // (no CALLBACK_DATA) leaves it false and does not force-post.
+        self.internal.diff_rdif_marked = false;
         // If wired to device state, determine event from shared mailbox.
         // An event that survived a put-owned pass is a still-pending
         // signal: this pass consumes it before pulling a new one from
@@ -508,6 +514,22 @@ impl Record for MotorRecord {
             "ATHM", "MRES", "ERES", "UEIP", "LVIO", "STOP", "SBAS", "SREV", "UREV", "VELO", "VBAS",
             "MISS", "MOVN", "DMOV", "STUP", "JOGF", "JOGR", "HOMF", "HOMR", "RHLM", "RLLM",
         ]
+    }
+
+    /// C `process_motor_info` (motorRecord.cc:3764-3767) MARKs M_DIFF /
+    /// M_RDIF unconditionally every CALLBACK_DATA pass, and `monitor()`
+    /// (3522-3531) posts both with `monitor_mask | DBE_VAL_LOG`. So on a
+    /// cycle that ran `process_motor_info`, DIFF and RDIF re-post even when
+    /// their value did not change — a `camonitor DIFF` on an axis parked at
+    /// a constant non-zero following error gets an event each poll. Gated on
+    /// the one-pass `diff_rdif_marked` mark so a non-CALLBACK_DATA pass (a
+    /// put that ran `do_work`, not `process_motor_info`) does not over-post.
+    fn force_posted_fields(&self) -> &'static [&'static str] {
+        if self.internal.diff_rdif_marked {
+            &["DIFF", "RDIF"]
+        } else {
+            &[]
+        }
     }
 
     /// C `alarm_sub()` (motorRecord.cc:3367-3406) — motor-specific alarm

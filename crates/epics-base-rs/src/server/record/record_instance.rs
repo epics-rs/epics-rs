@@ -2048,6 +2048,10 @@ impl RecordInstance {
         } else {
             self.record.alarm_cycle_monitored_fields()
         };
+        // Fields the record force-posts every cycle it recomputed them
+        // (C unconditional MARK + DBE_VAL_LOG), even when unchanged —
+        // see `Record::force_posted_fields`. Empty for most records.
+        let force_fields = self.record.force_posted_fields();
         let mut sub_updates: Vec<(String, EpicsValue, EventMask)> = Vec::new();
         for (field, subs) in &self.subscribers {
             if !subs.is_empty()
@@ -2063,6 +2067,10 @@ impl RecordInstance {
                         None => true,
                     };
                     if changed {
+                        sub_updates.push((field.clone(), val, aux_mask));
+                    } else if force_fields.contains(&field.as_str()) {
+                        // C `monitor()` posts a re-marked field with
+                        // `monitor_mask | DBE_VAL_LOG` even when unchanged.
                         sub_updates.push((field.clone(), val, aux_mask));
                     } else if alarm_fanout.contains(&field.as_str()) {
                         sub_updates.push((field.clone(), val, alarm_bits));
@@ -3069,6 +3077,118 @@ mod metadata_cache_tests {
         assert!(
             !n.contains(&"RBV".to_string()),
             "MDEL must throttle RBV: {n:?}"
+        );
+    }
+
+    /// Record that names DIFF in `force_posted_fields` (the motor's C
+    /// `process_motor_info` unconditional `MARK(M_DIFF)`) while keeping
+    /// every value constant — a settled axis parked at a fixed non-zero
+    /// following error. VAL is a control: not force-listed, so it must
+    /// fall back to change-detection.
+    struct ForcePostRecord {
+        diff: f64,
+        val: f64,
+    }
+
+    impl Record for ForcePostRecord {
+        fn record_type(&self) -> &'static str {
+            "ai"
+        }
+        fn process(&mut self) -> CaResult<crate::server::record::ProcessOutcome> {
+            // Values never change — the readback already matches; only the
+            // unconditional MARK should keep DIFF flowing.
+            Ok(crate::server::record::ProcessOutcome::complete())
+        }
+        fn get_field(&self, name: &str) -> Option<EpicsValue> {
+            match name {
+                "DIFF" => Some(EpicsValue::Double(self.diff)),
+                "VAL" => Some(EpicsValue::Double(self.val)),
+                _ => None,
+            }
+        }
+        fn put_field(&mut self, name: &str, _value: EpicsValue) -> CaResult<()> {
+            Err(CaError::FieldNotFound(name.to_string()))
+        }
+        fn field_list(&self) -> &'static [crate::server::record::FieldDesc] {
+            &[]
+        }
+        fn force_posted_fields(&self) -> &'static [&'static str] {
+            &["DIFF"]
+        }
+    }
+
+    /// C motorRecord parity: `process_motor_info` MARKs M_DIFF/M_RDIF every
+    /// CALLBACK_DATA pass and `monitor()` posts them with `DBE_VAL_LOG`
+    /// regardless of change, so a force-posted field re-posts on an
+    /// otherwise-idle cycle while an unchanged non-force field does not.
+    #[test]
+    fn force_posted_field_reposts_unchanged_value_each_cycle() {
+        use crate::server::recgbl::EventMask;
+        let mut inst = RecordInstance::new(
+            "FP".to_string(),
+            ForcePostRecord {
+                diff: 2.5,
+                val: 1.0,
+            },
+        );
+        let _diff_rx = inst
+            .add_subscriber(
+                "DIFF",
+                1,
+                crate::types::DbFieldType::Double,
+                EventMask::VALUE.bits(),
+            )
+            .expect("DIFF subscriber");
+        let _val_rx = inst
+            .add_subscriber(
+                "VAL",
+                2,
+                crate::types::DbFieldType::Double,
+                EventMask::VALUE.bits(),
+            )
+            .expect("VAL subscriber");
+        let names = |snap: &ProcessSnapshot| {
+            snap.changed_fields
+                .iter()
+                .map(|(n, _, _)| n.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // Cycle 1 (first publish): both DIFF and VAL post — last_posted is
+        // empty so change-detection treats every subscribed field as new.
+        let (snap1, _) = inst.process_local().unwrap();
+        assert!(
+            names(&snap1).contains(&"DIFF".to_string()),
+            "DIFF posts on first publish: {:?}",
+            names(&snap1)
+        );
+
+        // Cycle 2: nothing changed. VAL (not force-listed) must NOT re-post;
+        // DIFF (force-listed) MUST re-post — the C unconditional MARK +
+        // DBE_VAL_LOG. This is the divergence MOT-1 closes.
+        let (snap2, _) = inst.process_local().unwrap();
+        assert!(
+            names(&snap2).contains(&"DIFF".to_string()),
+            "force-posted DIFF must re-post when unchanged: {:?}",
+            names(&snap2)
+        );
+        assert!(
+            !names(&snap2).contains(&"VAL".to_string()),
+            "an unchanged non-force field must not re-post: {:?}",
+            names(&snap2)
+        );
+        // The forced re-post carries DBE_VALUE|DBE_LOG (no alarm bits this
+        // cycle), matching C `monitor_mask | DBE_VAL_LOG` with monitor_mask=0.
+        let diff_mask = snap2
+            .changed_fields
+            .iter()
+            .find(|(n, _, _)| n == "DIFF")
+            .map(|(_, _, m)| *m)
+            .expect("DIFF post present");
+        assert_eq!(
+            diff_mask.bits(),
+            (EventMask::VALUE | EventMask::LOG).bits(),
+            "forced re-post mask is DBE_VAL_LOG"
         );
     }
 

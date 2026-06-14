@@ -626,6 +626,31 @@ pub trait Record: Send + Sync + 'static {
         &[]
     }
 
+    /// Fields the record's C `monitor()` re-posts with `DBE_VAL_LOG` on
+    /// every cycle that recomputed them, even when the value did not
+    /// change — the analogue of an unconditional `MARK(field)` in C.
+    ///
+    /// Unlike [`Self::alarm_cycle_monitored_fields`] (which posts unchanged
+    /// fields only on a cycle whose alarm transition fired), these post on
+    /// any cycle the record names them, with `DBE_VALUE | DBE_LOG` (plus the
+    /// cycle's alarm bits when one fired). The framework's change-detection
+    /// loop posts a listed, subscribed, unchanged field with that mask.
+    ///
+    /// C motorRecord `process_motor_info` (motorRecord.cc:3764-3767)
+    /// `MARK`s `M_DIFF`/`M_RDIF` unconditionally on every `CALLBACK_DATA`
+    /// pass, and `monitor()` (3522-3531) posts them with `monitor_mask |
+    /// DBE_VAL_LOG`; a `camonitor DIFF` on an axis parked at a constant
+    /// non-zero following error thus gets an event every poll. The record
+    /// returns the fields ONLY on the cycles it actually re-marked them (it
+    /// reads its own per-cycle state), so a pass that did not recompute them
+    /// does not over-post.
+    ///
+    /// Default: empty — most record types post a field only when it
+    /// changed (or on an alarm transition), which the existing gates cover.
+    fn force_posted_fields(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Initialize record (pass 0: field defaults; pass 1: dependent init).
     fn init_record(&mut self, _pass: u8) -> CaResult<()> {
         Ok(())

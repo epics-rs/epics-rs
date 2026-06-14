@@ -15,9 +15,16 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use std::any::Any;
+
+/// C `autoConnectDevice` reconnect throttle window (asynManager.c:713).
+/// A disconnected `auto_connect` device is refused a fresh connect attempt
+/// until this much time has elapsed since its last connect/disconnect
+/// transition or attempt, bounding reconnect storms to one attempt per
+/// window.
+const AUTO_CONNECT_THROTTLE: Duration = Duration::from_secs(2);
 
 /// Per-address device state for multi-device ports.
 #[derive(Debug, Clone)]
@@ -25,6 +32,12 @@ pub struct DeviceState {
     pub connected: bool,
     pub enabled: bool,
     pub auto_connect: bool,
+    /// Monotonic instant of the last connect/disconnect transition or
+    /// auto-connect attempt for this device — the anchor for the 2s
+    /// reconnect throttle (C `dpCommon.lastConnectDisconnect`). `None`
+    /// mirrors C's zero-initialised timestamp: the first attempt is
+    /// always permitted.
+    pub last_connect_disconnect: Option<Instant>,
 }
 
 impl Default for DeviceState {
@@ -33,6 +46,7 @@ impl Default for DeviceState {
             connected: true,
             enabled: true,
             auto_connect: true,
+            last_connect_disconnect: None,
         }
     }
 }
@@ -132,6 +146,11 @@ pub struct PortDriverBase {
     pub device_states: HashMap<i32, DeviceState>,
     /// Timestamp source callback for custom timestamps.
     pub timestamp_source: Option<Arc<dyn Fn() -> SystemTime + Send + Sync>>,
+    /// Port-level anchor for the 2s auto-reconnect throttle — the
+    /// monotonic instant of the last connect/disconnect transition or
+    /// auto-connect attempt (C `dpCommon.lastConnectDisconnect`). `None`
+    /// = no transition yet, so the first attempt is always permitted.
+    pub last_connect_disconnect: Option<Instant>,
 }
 
 impl PortDriverBase {
@@ -154,6 +173,7 @@ impl PortDriverBase {
             trace: None,
             device_states: HashMap::new(),
             timestamp_source: None,
+            last_connect_disconnect: None,
         }
     }
 
@@ -191,6 +211,12 @@ impl PortDriverBase {
             return false;
         }
         self.connected = connected;
+        if !connected {
+            // C `exceptionDisconnect` stamps `lastConnectDisconnect` on
+            // every disconnect (asynManager.c:2184) so the auto-reconnect
+            // throttle measures from the moment the link dropped.
+            self.last_connect_disconnect = Some(Instant::now());
+        }
         self.announce_exception(AsynException::Connect, -1);
         true
     }
@@ -203,8 +229,57 @@ impl PortDriverBase {
             return false;
         }
         self.device_state(addr).connected = connected;
+        if !connected {
+            // Per-device disconnect stamp — same throttle anchor as the
+            // port-level path (C `exceptionDisconnect`, asynManager.c:2184).
+            self.device_state(addr).last_connect_disconnect = Some(Instant::now());
+        }
         self.announce_exception(AsynException::Connect, addr);
         true
+    }
+
+    /// 2.0s auto-reconnect throttle gate — C `autoConnectDevice`
+    /// (asynManager.c:712-713, 729-730).
+    ///
+    /// Returns `true` when a fresh auto-connect attempt is permitted:
+    /// either no transition has been recorded yet (mirrors C's
+    /// zero-initialised `lastConnectDisconnect`, whose diff against `now`
+    /// is effectively infinite), or at least [`AUTO_CONNECT_THROTTLE`] has
+    /// elapsed since the last transition or attempt. A disconnected
+    /// `auto_connect` device that just dropped — or whose previous
+    /// reconnect just failed — is refused until the window passes, so a
+    /// burst of N queued requests triggers at most one full connect
+    /// attempt per window instead of N back-to-back attempts.
+    ///
+    /// Uses monotonic [`Instant`], not wall clock: the throttle is purely
+    /// internal timing, never serialised, so it must be immune to NTP
+    /// steps. `addr` selects the per-device anchor on multi-device ports;
+    /// single-device ports use the port-level anchor.
+    pub fn auto_connect_throttle_ok(&self, addr: i32, now: Instant) -> bool {
+        let last = if self.flags.multi_device {
+            self.device_states
+                .get(&addr)
+                .and_then(|d| d.last_connect_disconnect)
+        } else {
+            self.last_connect_disconnect
+        };
+        match last {
+            None => true,
+            Some(t) => now.saturating_duration_since(t) >= AUTO_CONNECT_THROTTLE,
+        }
+    }
+
+    /// Single owner for the post-attempt throttle stamp. C
+    /// `autoConnectDevice` stamps `lastConnectDisconnect` immediately after
+    /// every `connectAttempt`, success or failure (asynManager.c:718,
+    /// 735), so the window restarts from the end of the attempt — a failed
+    /// reconnect is not retried until the throttle elapses again.
+    pub fn stamp_auto_connect_attempt(&mut self, addr: i32, now: Instant) {
+        if self.flags.multi_device {
+            self.device_state(addr).last_connect_disconnect = Some(now);
+        } else {
+            self.last_connect_disconnect = Some(now);
+        }
     }
 
     /// Query whether the port is enabled.
@@ -2063,6 +2138,71 @@ mod tests {
         base.set_auto_connect(false);
         base.set_auto_connect(false);
         assert_eq!(hits.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn auto_connect_throttle_gate_boundaries() {
+        // C autoConnectDevice 2.0s gate (asynManager.c:712-713). Boundary
+        // cases, not narrative: never-stamped, exactly-2s, just-under-2s.
+        let mut base = PortDriverBase::new("thr", 1, PortFlags::default());
+
+        // No transition recorded yet => always permitted (C's
+        // zero-initialised lastConnectDisconnect).
+        let t0 = Instant::now();
+        assert!(base.auto_connect_throttle_ok(-1, t0));
+
+        // Stamp at t0; only `+` arithmetic on Instant (no `- Duration`,
+        // which panics on Windows when uptime < the span).
+        base.last_connect_disconnect = Some(t0);
+        // elapsed 0 < 2s => refused.
+        assert!(!base.auto_connect_throttle_ok(-1, t0));
+        // elapsed just under 2s => refused.
+        assert!(!base.auto_connect_throttle_ok(-1, t0 + Duration::from_millis(1999)));
+        // elapsed exactly 2s => permitted (>=).
+        assert!(base.auto_connect_throttle_ok(-1, t0 + Duration::from_secs(2)));
+        // elapsed well past => permitted.
+        assert!(base.auto_connect_throttle_ok(-1, t0 + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn auto_connect_throttle_stamps_on_disconnect_not_connect() {
+        // C exceptionDisconnect stamps lastConnectDisconnect (asynManager.c
+        // :2184); exceptionConnect does not (:2157-2159). Mirror both edges.
+        let mut base = PortDriverBase::new("thr", 1, PortFlags::default());
+        // Starts connected, no stamp.
+        assert!(base.last_connect_disconnect.is_none());
+
+        // Disconnect edge stamps.
+        assert!(base.set_connected(false));
+        assert!(base.last_connect_disconnect.is_some());
+
+        // Clear, then connect edge must NOT re-stamp.
+        base.last_connect_disconnect = None;
+        assert!(base.set_connected(true));
+        assert!(base.last_connect_disconnect.is_none());
+    }
+
+    #[test]
+    fn auto_connect_throttle_per_device_anchor() {
+        // Multi-device ports throttle per address (C dpCommon is per-device).
+        let flags = PortFlags {
+            multi_device: true,
+            ..PortFlags::default()
+        };
+        let mut base = PortDriverBase::new("thr", 4, flags);
+        let t0 = Instant::now();
+
+        // addr 1 disconnect stamps only addr 1's anchor.
+        assert!(base.set_addr_connected(1, false));
+        assert!(base.device_state(1).last_connect_disconnect.is_some());
+        // addr 1 is throttled; addr 2 (never stamped) is still permitted.
+        assert!(!base.auto_connect_throttle_ok(1, t0));
+        assert!(base.auto_connect_throttle_ok(2, t0));
+
+        // Post-attempt stamp restarts addr 2's window.
+        base.stamp_auto_connect_attempt(2, t0);
+        assert!(!base.auto_connect_throttle_ok(2, t0));
+        assert!(base.auto_connect_throttle_ok(2, t0 + Duration::from_secs(2)));
     }
 
     /// C parity: `asynPortDriver::setInterruptUInt32Digital` /

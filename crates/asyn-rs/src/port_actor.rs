@@ -283,18 +283,46 @@ impl PortActor {
         // Connect ops and Connect-priority requests bypass enabled/connected checks
         // (C parity: Connect priority processed even when disabled/disconnected)
         if !is_connect_op && !is_connect_priority {
-            // Auto-connect: try to reconnect if disconnected and auto_connect is set
+            // Auto-connect: try to reconnect if disconnected and
+            // auto_connect is set, throttled to at most one attempt per 2s
+            // window (C `autoConnectDevice`, asynManager.c:704-739).
+            // Without the gate a burst of N queued requests to an offline
+            // auto_connect port fires N back-to-back full connect attempts.
+            // `auto_connect_throttle_ok` is the gate;
+            // `stamp_auto_connect_attempt` restarts the window after the
+            // attempt — success or failure — mirroring the C stamp at
+            // :718/:735. The single-threaded actor owns the driver
+            // throughout, so C's `autoConnectActive` re-entry guard has no
+            // observable analogue here (no concurrent dispatch can re-enter).
             if self.driver.base().flags.multi_device {
                 let ds = self.driver.base().device_states.get(&user.addr);
                 let dev_disconnected = !ds.map_or(true, |d| d.connected);
                 let dev_auto = ds.map_or(self.driver.base().auto_connect, |d| d.auto_connect);
-                if dev_disconnected && dev_auto {
+                if dev_disconnected
+                    && dev_auto
+                    && self
+                        .driver
+                        .base()
+                        .auto_connect_throttle_ok(user.addr, Instant::now())
+                {
                     // For multi-device, auto-connect the specific address
                     let connect_user = AsynUser::new(user.reason).with_addr(user.addr);
                     let _ = self.driver.connect_addr(&connect_user);
+                    self.driver
+                        .base_mut()
+                        .stamp_auto_connect_attempt(user.addr, Instant::now());
                 }
-            } else if !self.driver.base().connected && self.driver.base().auto_connect {
+            } else if !self.driver.base().connected
+                && self.driver.base().auto_connect
+                && self
+                    .driver
+                    .base()
+                    .auto_connect_throttle_ok(-1, Instant::now())
+            {
                 let _ = self.driver.connect(&AsynUser::default());
+                self.driver
+                    .base_mut()
+                    .stamp_auto_connect_attempt(-1, Instant::now());
             }
 
             // Check ready
@@ -1320,6 +1348,65 @@ mod tests {
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         let result = send_and_wait(&tx, RequestOp::Int32Read, user);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn actor_auto_connect_throttled_to_one_attempt_per_window() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A driver whose `connect()` counts the attempt but leaves the port
+        // disconnected — simulating a hardware reconnect that keeps failing.
+        // Without the 2s throttle (C autoConnectDevice, asynManager.c:713),
+        // every queued request to an offline auto_connect port would fire a
+        // fresh full connect attempt.
+        struct ThrottleDriver {
+            base: PortDriverBase,
+            connect_calls: Arc<AtomicUsize>,
+        }
+        impl PortDriver for ThrottleDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.base
+            }
+            fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+                self.connect_calls.fetch_add(1, Ordering::SeqCst);
+                // Stay disconnected: the throttle, not a state change, must
+                // be what bounds retries.
+                Ok(())
+            }
+        }
+
+        let connect_calls = Arc::new(AtomicUsize::new(0));
+        let mut base = PortDriverBase::new("throttle_test", 1, PortFlags::default());
+        base.create_param("VAL", ParamType::Int32).unwrap();
+        base.connected = false;
+        base.auto_connect = true;
+        let drv = ThrottleDriver {
+            base,
+            connect_calls: connect_calls.clone(),
+        };
+        let tx = spawn_actor(drv);
+
+        // Three back-to-back reads to the disconnected auto_connect port.
+        for _ in 0..3 {
+            let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+            let result = send_and_wait(&tx, RequestOp::Int32Read, user);
+            // The port never reconnects, so each request fails Disconnected
+            // (C autoConnectDevice returns FALSE => queueRequest fails).
+            match result {
+                Err(AsynError::Status { status, .. }) => {
+                    assert_eq!(status, AsynStatus::Disconnected)
+                }
+                other => panic!("expected Disconnected, got {other:?}"),
+            }
+        }
+
+        // Only the first request's attempt fired; the second and third fell
+        // inside the 2s throttle window and were refused without a connect
+        // call (C autoConnectDevice 2.0s gate, asynManager.c:712-713).
+        assert_eq!(connect_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

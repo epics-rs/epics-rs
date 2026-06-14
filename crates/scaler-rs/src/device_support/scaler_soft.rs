@@ -106,14 +106,27 @@ impl ScalerDriver for SoftScalerDriver {
         Ok(preset)
     }
 
-    /// C `drvScalerSoft.c:315-329` — `scalerArmCommand`: on arm, the
-    /// driver first **clears the scaler data** (`counts[i] = 0` and the
-    /// PV that backs each channel) so a stale count cannot make the
-    /// scaler report "done" immediately; then it sets `acquiring`.
+    /// C `drvScalerSoft.c:315-329` — `scalerArmCommand`: the driver
+    /// **clears the scaler data** (`counts[i] = 0` plus a `0` write to
+    /// each input PV) for EVERY arm command — both arm (`value != 0`)
+    /// and disarm (`value == 0`) — before setting `acquiring = value`.
+    /// On arm the clear stops a stale count from making the scaler
+    /// report "done" immediately; on disarm it zeroes the counts a
+    /// subsequent idle read returns, so a disarmed scaler reads `0`
+    /// rather than its last value. The port's `shared_counts` is the
+    /// external count source standing in for those input PVs, so both
+    /// the local buffer and the shared source are zeroed.
+    ///
+    /// Note: a normal preset-reached completion disarms inside `read()`
+    /// (`self.armed = false`, no count clear), NOT via an arm command —
+    /// matching C, where the done path sets `ss = IDLE` and the record's
+    /// stop branch skips `arm(0)`. So the final counts survive a normal
+    /// completion; only an explicit disarm (manual stop / pre-restart)
+    /// clears them.
     fn arm(&mut self, start: bool) -> CaResult<()> {
-        if start {
-            // C:319-322 — clear scaler data to avoid an immediate done.
-            self.counts = [0; MAX_SCALER_CHANNELS];
+        // C:319-322 — clear scaler data on arm AND disarm.
+        self.counts = [0; MAX_SCALER_CHANNELS];
+        {
             let mut shared = self.shared_counts.lock().unwrap();
             *shared = [0; MAX_SCALER_CHANNELS];
         }

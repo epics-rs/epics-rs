@@ -406,6 +406,33 @@ fn test_soft_driver_arm_disarm() {
     driver.arm(false).unwrap();
 }
 
+// C `drvScalerSoft.c:319-322` clears the counts on EVERY arm command,
+// disarm included, before setting `acquiring`. A disarm must therefore
+// zero what a subsequent idle read returns.
+#[test]
+fn test_soft_driver_disarm_clears_counts() {
+    let mut driver = SoftScalerDriver::new(8);
+    // Simulate accumulated counts via the external source.
+    {
+        let shared = driver.shared_counts();
+        let mut guard = shared.lock().unwrap();
+        guard[0] = 1234;
+        guard[1] = 5678;
+    }
+    // A read latches them into the driver's local buffer.
+    let mut counts = [0u32; MAX_SCALER_CHANNELS];
+    driver.read(&mut counts).unwrap();
+    assert_eq!(counts[0], 1234);
+    assert_eq!(counts[1], 5678);
+
+    // Disarm: C clears unconditionally — the next read must return 0.
+    driver.arm(false).unwrap();
+    let mut after = [0u32; MAX_SCALER_CHANNELS];
+    driver.read(&mut after).unwrap();
+    assert_eq!(after[0], 0, "disarm must zero the counts (C parity)");
+    assert_eq!(after[1], 0, "disarm must zero the counts (C parity)");
+}
+
 #[test]
 fn test_soft_driver_write_preset() {
     let mut driver = SoftScalerDriver::new(8);

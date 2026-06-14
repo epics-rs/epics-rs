@@ -207,6 +207,13 @@ pub struct AsynDeviceSupport {
 struct CachedInterrupt {
     value: crate::param::ParamValue,
     timestamp: SystemTime,
+    /// Driver-reported alarm (EPICS alarm status/severity) captured at
+    /// callback time. C devAsynInt32.c:561-563 stores rp->alarmStatus /
+    /// rp->alarmSeverity in each ring-buffer element so processXxx can
+    /// recGblSetSevr them (devAsynInt32.c:843-847). Mirrors the polled
+    /// read path's `RequestResult` alarm carrier.
+    alarm_status: u16,
+    alarm_severity: u16,
 }
 
 /// Per-record ring buffer for I/O Intr callbacks. Mirrors C
@@ -855,6 +862,11 @@ impl DeviceSupport for AsynDeviceSupport {
                     let _ = record.set_val(val);
                 }
                 self.last_ts = Some(ci.timestamp);
+                // C devAsynInt32.c:843-847 — apply the driver alarm carried
+                // by the ring-buffer element. Symmetric with the polled
+                // read path (last_alarm_* set from RequestResult below).
+                self.last_alarm_status = ci.alarm_status;
+                self.last_alarm_severity = ci.alarm_severity;
             }
             // Return computed() so the record skips its built-in
             // RVAL→VAL conversion and uses the value we just set.
@@ -1049,6 +1061,12 @@ impl DeviceSupport for AsynDeviceSupport {
                 let entry = CachedInterrupt {
                     value,
                     timestamp: iv.timestamp,
+                    // Carry the driver alarm so the IoIntr read path can
+                    // recGblSetSevr it (C devAsynInt32.c:561-563/843-847);
+                    // dropping it left I/O-Intr records permanently
+                    // NO_ALARM even when the driver flagged an alarm.
+                    alarm_status: iv.alarm_status,
+                    alarm_severity: iv.alarm_severity,
                 };
                 // C parity (devAsynInt32.c:564-576):
                 //   - On overflow (ring full), drop oldest +
@@ -1841,6 +1859,8 @@ mod tests {
         CachedInterrupt {
             value: crate::param::ParamValue::Int32(v),
             timestamp: SystemTime::UNIX_EPOCH + Duration::from_millis(t_ms),
+            alarm_status: 0,
+            alarm_severity: 0,
         }
     }
 
@@ -2085,6 +2105,49 @@ mod tests {
         let mut rec2 = LonginRecord::new(0);
         ads.read(&mut rec2).unwrap();
         assert_eq!(rec2.val(), Some(EpicsValue::Long(42)));
+    }
+
+    #[test]
+    fn io_intr_read_applies_cached_driver_alarm() {
+        // C devAsynInt32.c:561-563/843-847 — the I/O-Intr ring element
+        // carries the driver alarm and processXxx recGblSetSevr's it.
+        // The CachedInterrupt previously dropped it, leaving I/O-Intr
+        // records permanently NO_ALARM.
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut ads = make_adapter(ScanType::IoIntr);
+        let mut rec = LonginRecord::new(0);
+        ads.init(&mut rec).unwrap(); // resolves reason_set
+        {
+            let mut g = ads.interrupt_fifo.lock().unwrap();
+            g.push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32(7),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 3,   // e.g. READ_ALARM
+                alarm_severity: 1, // e.g. MINOR
+            });
+        }
+        ads.read(&mut rec).unwrap();
+        assert_eq!(rec.val(), Some(EpicsValue::Long(7)));
+        assert_eq!(
+            ads.last_alarm(),
+            Some((3, 1)),
+            "IoIntr read must surface the driver alarm carried by the ring entry"
+        );
+    }
+
+    #[test]
+    fn io_intr_read_no_alarm_when_entry_clean() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut ads = make_adapter(ScanType::IoIntr);
+        let mut rec = LonginRecord::new(0);
+        ads.init(&mut rec).unwrap(); // resolves reason_set
+        {
+            let mut g = ads.interrupt_fifo.lock().unwrap();
+            g.push_with_overflow(intr_entry(9, 0)); // alarm 0/0
+        }
+        ads.read(&mut rec).unwrap();
+        assert_eq!(rec.val(), Some(EpicsValue::Long(9)));
+        assert_eq!(ads.last_alarm(), None, "clean entry => no alarm");
     }
 
     /// PR #162: `aai` (array analog input) and `aao` (array analog output)

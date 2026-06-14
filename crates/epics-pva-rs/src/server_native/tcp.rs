@@ -6056,9 +6056,27 @@ async fn handle_op(
         // Build INIT response: ioid + subcmd + status + introspection
         let cmd = kind.command();
 
+        // pvxs derives the INIT reply subcommand from operation STATE, not by
+        // echoing the request byte. GET/PUT/RPC/PUT_GET replies echo the
+        // stored `op->subcmd` (`serverget.cpp:83`), which for an INIT request
+        // is exactly `0x08`. The MONITOR reply path differs: `doReply` sets
+        // `subcmd = 0x08` unconditionally for the Creating→Idle INIT frame
+        // (`servermon.cpp:133-135`) and NEVER sets the `0x80` pipeline bit a
+        // client put on the inbound MONITOR INIT (`0x88`). Echoing the request
+        // here would ship `0x88`, which a pvAccessCPP client decodes as a
+        // pipeline-flagged INIT reply. Mirror pvxs: a monitor INIT replies
+        // exactly `0x08`; the other op kinds echo their (already `0x08`)
+        // inbound INIT subcmd, matching the data-phase echo `send_op_error`
+        // documents (hardcoding `0x08` for those would mis-frame data-phase).
+        let reply_subcmd = if matches!(kind, OpKind::Monitor) {
+            0x08
+        } else {
+            subcmd
+        };
+
         let mut payload = Vec::new();
         payload.put_u32(ioid, order);
-        payload.put_u8(subcmd);
+        payload.put_u8(reply_subcmd);
         Status::ok().write_into(order, &mut payload);
         // RPC INIT carries no type descriptor (pvxs serverget.cpp:97 —
         // `if (cmd != CMD_RPC) to_wire(R, type)`). GET/PUT/MONITOR INIT
@@ -10324,6 +10342,103 @@ mod tests {
             reply[3],
             Command::Monitor.code(),
             "the INIT reply is a MONITOR frame after the diagnostic"
+        );
+    }
+
+    /// pvxs `servermon.cpp:133-135` parity: the MONITOR INIT reply
+    /// subcommand is derived from operation STATE (`subcmd = 0x08` for the
+    /// Creating→Idle frame), NOT echoed from the request. A client that set
+    /// the `0x80` pipeline bit on its INIT (`subcmd = 0x88`) must still
+    /// receive a reply subcmd of exactly `0x08` — pvxs never sets `0x80` on
+    /// a server→client monitor frame. (GET/PUT/RPC replies echo their inbound
+    /// INIT subcmd, which is already `0x08`, so the strip is monitor-only.)
+    #[tokio::test]
+    async fn monitor_pipeline_init_reply_subcmd_strips_pipeline_bit() {
+        use crate::server_native::SharedSource;
+        use crate::server_native::runtime::PvaServerConfig;
+        use crate::server_native::shared_pv::SharedPV;
+
+        let order = ByteOrder::Little;
+        let sid: u32 = 1;
+        let ioid: u32 = 877;
+
+        let intro = three_field_intro();
+        let pv = SharedPV::new();
+        pv.open(intro.clone(), three_field_value(0, 0, 0)).unwrap();
+        let shared = SharedSource::new();
+        shared.add("dut", pv);
+        let source: DynSource = Arc::new(shared);
+
+        let mut channels: HashMap<u32, ChannelState> = HashMap::new();
+        channels.insert(
+            sid,
+            ChannelState {
+                name: "dut".into(),
+                cid: 0,
+                sid,
+                introspection: Some(intro.clone()),
+                source,
+                stat: crate::server_native::peers::ChannelStat::new(String::new()),
+                open_cred: ClientCredentials::anonymous(),
+                ops: HashMap::new(),
+            },
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let config = PvaServerConfig::default();
+        let mut encode_cache = crate::pvdata::encode::EncodeTypeCache::new();
+        let peer: SocketAddr = "127.0.0.1:5075".parse().unwrap();
+        let cred = ClientCredentials::anonymous();
+
+        // Pipeline MONITOR INIT: subcmd 0x88 (INIT | pipeline), a valid
+        // pipeline pvRequest, and the trailing u32 initial-nack rider the
+        // 0x80 bit requires (`servermon.cpp:494-496`).
+        let req_val = make_pipeline_request(
+            PvField::Scalar(ScalarValue::Boolean(true)),
+            PvField::Scalar(ScalarValue::Int(16)),
+        );
+        let req_desc = req_val.descriptor();
+        let mut init_payload = Vec::new();
+        init_payload.put_u32(sid, order);
+        init_payload.put_u32(ioid, order);
+        init_payload.put_u8(0x88);
+        crate::pvdata::encode::encode_type_desc(&req_desc, order, &mut init_payload);
+        crate::pvdata::encode::encode_pv_field(&req_val, &req_desc, order, &mut init_payload);
+        init_payload.put_u32(4, order); // initial nack (window credit)
+        let init_frame = synth_frame(Command::Monitor, order, init_payload);
+        handle_op(
+            &init_frame,
+            &tx,
+            &mut channels,
+            order,
+            &fixed_out_order(order),
+            OpKind::Monitor,
+            &config,
+            &mut encode_cache,
+            &mut TypeCache::new(),
+            peer,
+            &cred,
+            &discard_mon_fin(),
+            &discard_exec_fin(),
+        )
+        .await
+        .expect("pipeline MONITOR INIT ok");
+
+        // A clean pipeline request emits no diagnostic, and the monitor data
+        // task starts only on START (0x04), so the first (only) frame is the
+        // INIT reply: header(8) + ioid:u32(4) + subcmd:u8 at byte 12.
+        let reply = rx.recv().await.expect("INIT reply");
+        assert_eq!(
+            reply[3],
+            Command::Monitor.code(),
+            "the INIT reply is a MONITOR frame"
+        );
+        let got_ioid = u32::from_le_bytes([reply[8], reply[9], reply[10], reply[11]]);
+        assert_eq!(got_ioid, ioid, "reply is tagged with the op IOID");
+        assert_eq!(
+            reply[12], 0x08,
+            "the MONITOR INIT reply subcmd must be exactly 0x08 (pvxs \
+             servermon.cpp:135) with the inbound 0x80 pipeline bit stripped"
         );
     }
 

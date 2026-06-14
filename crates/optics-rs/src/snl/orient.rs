@@ -18,6 +18,20 @@ const HC: f64 = 12.3984244;
 /// Threshold below which a value is treated as "effectively zero".
 const SMALL: f64 = 1.0e-9;
 
+/// Map the `Mode` mbbo wire value to a diffractometer [`Constraint`].
+///
+/// Mirrors the C `orient.h:27-29` enum / `orient.db` `Mode` mbbo menu:
+/// `OMEGA_ZERO=0` ("TH=TTH/2"), `MIN_CHI_PHIm90=1` ("CHI~90; PHI~0"),
+/// `PHI_CONST=2` ("PHI_CONST"). Any out-of-range value falls back to
+/// `OMEGA_ZERO`, matching the C default branch.
+fn constraint_from_mode(m: i32) -> Constraint {
+    match m {
+        1 => Constraint::MinChiPhiMinus90,
+        2 => Constraint::PhiConst,
+        _ => Constraint::OmegaZero,
+    }
+}
+
 /// Calculation state for A0 or OMTX.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CalcState {
@@ -960,12 +974,7 @@ pub async fn run(
             let phi = ch_mot_phi_rbv.get_f64().await;
             Some(OrientEvent::MotorRBVChanged { tth, th, chi, phi })
         } else if changed_pv == pv_mode {
-            let m = new_val as i32;
-            let constraint = match m {
-                1 => Constraint::PhiConst,
-                2 => Constraint::MinChiPhiMinus90,
-                _ => Constraint::OmegaZero,
-            };
+            let constraint = constraint_from_mode(new_val as i32);
             Some(OrientEvent::ModeChanged(constraint))
         } else if changed_pv == pv_mot_put {
             if new_val as i32 != 0 {
@@ -1052,6 +1061,17 @@ mod tests {
         ctrl.recalc_a0();
         assert_eq!(ctrl.a0_state, CalcState::Succeeded);
         ctrl
+    }
+
+    #[test]
+    fn test_constraint_from_mode() {
+        // C orient.h:27-29 / orient.db Mode mbbo menu ordering.
+        assert_eq!(constraint_from_mode(0), Constraint::OmegaZero);
+        assert_eq!(constraint_from_mode(1), Constraint::MinChiPhiMinus90);
+        assert_eq!(constraint_from_mode(2), Constraint::PhiConst);
+        // Out-of-range falls back to the C default branch (OMEGA_ZERO).
+        assert_eq!(constraint_from_mode(3), Constraint::OmegaZero);
+        assert_eq!(constraint_from_mode(-1), Constraint::OmegaZero);
     }
 
     #[test]

@@ -5,14 +5,21 @@ use super::matrix3::*;
 const D2R: f64 = PI / 180.0;
 
 /// Angle constraint for HKL → angles conversion.
+///
+/// Discriminants mirror the C `orient.h:27-29` constant values (which are
+/// also the `$(P)orient:Mode` mbbo menu indices, `orient.db`): `OMEGA_ZERO`
+/// 0, `MIN_CHI_PHIm90` 1, `PHI_CONST` 2. The variants were previously
+/// numbered with `PHI_CONST` and `MIN_CHI_PHIm90` swapped; the values are
+/// never cast, but they are corrected here so the repr is a faithful mirror
+/// of the wire menu (see `constraint_from_mode`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Constraint {
-    /// TH = TTH/2 (omega = 0).
+    /// TH = TTH/2 (omega = 0). C `OMEGA_ZERO`.
     OmegaZero = 0,
-    /// Use supplied PHI, calculate TH and CHI.
-    PhiConst = 1,
-    /// Minimize CHI and (PHI − π/2).
-    MinChiPhiMinus90 = 2,
+    /// Minimize CHI and (PHI − π/2). C `MIN_CHI_PHIm90`.
+    MinChiPhiMinus90 = 1,
+    /// Use supplied PHI, calculate TH and CHI. C `PHI_CONST`.
+    PhiConst = 2,
 }
 
 /// Angle vector indices.

@@ -691,6 +691,11 @@ impl PvDatabase {
             // For record-owned fields, call on_put() and special() after successful put,
             // matching what put_common_field() does for common fields.
             use crate::server::record::CommonFieldPutResult;
+            // Snapshot alarm-ack state so the post block can replicate C
+            // putAckt/putAcks (dbAccess.c:1285-1315), which post only when
+            // `ackt`/`acks` actually change.
+            let ackt_before = instance.common.ackt;
+            let acks_before = instance.common.acks;
             let common_result = match instance.record.put_field(&field, value.clone()) {
                 Ok(()) => {
                     instance.record.on_put(&field);
@@ -759,32 +764,66 @@ impl PvDatabase {
             // because the `should_process` gate below skips the cycle for a
             // non-`pp` value field — without this post a direct VAL put would
             // fire no monitor at all.
-            let suppress_value_field_post = field == instance.record.primary_field()
-                && match instance.record.process_passive_fields() {
-                    Some(pp) => pp.iter().any(|f| f.eq_ignore_ascii_case(&field)),
-                    // Un-modeled record types keep the legacy "process on every
-                    // put" behavior (`should_process = true` below), so the
-                    // reprocess cycle posts the value field — suppress the
-                    // immediate post here to avoid a duplicate event.
-                    None => true,
-                };
-            if !suppress_value_field_post {
-                instance.notify_field(
-                    &field,
-                    crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
-                );
-            }
+            if field.eq_ignore_ascii_case("ACKT") || field.eq_ignore_ascii_case("ACKS") {
+                // Alarm-acknowledge fields are C `dbPut`'s DBR_PUT_ACKT/ACKS
+                // special handlers (`dbAccess.c:1285-1315`), NOT a plain
+                // common-field put. They post with DBE_VALUE|DBE_ALARM (never
+                // DBE_LOG), and post a record-wide DBE_ALARM
+                // (`db_post_events(precord, NULL, DBE_ALARM)`) so an
+                // alarm-mask monitor on ANY field observes the ack — but only
+                // when the ack state actually changed, so the generic
+                // DBE_VALUE|DBE_LOG post below is fully suppressed here.
+                use crate::server::recgbl::EventMask;
+                let ack_mask = EventMask::VALUE | EventMask::ALARM;
+                if field.eq_ignore_ascii_case("ACKT") {
+                    // putAckt: post only on a real ackt change; re-post ACKS
+                    // when turning ACKT off lowered it (C:1294-1297).
+                    if instance.common.ackt != ackt_before {
+                        instance.notify_field(&field, ack_mask);
+                        if instance.common.acks != acks_before {
+                            instance.notify_field("ACKS", ack_mask);
+                        }
+                        instance.notify_record_alarm();
+                    }
+                } else {
+                    // putAcks: post only when the write actually cleared ACKS
+                    // (C:1309-1313); a too-low ack severity posts nothing.
+                    if instance.common.acks != acks_before {
+                        instance.notify_field(&field, ack_mask);
+                        instance.notify_record_alarm();
+                    }
+                }
+            } else {
+                let suppress_value_field_post = field == instance.record.primary_field()
+                    && match instance.record.process_passive_fields() {
+                        Some(pp) => pp.iter().any(|f| f.eq_ignore_ascii_case(&field)),
+                        // Un-modeled record types keep the legacy "process on
+                        // every put" behavior (`should_process = true` below),
+                        // so the reprocess cycle posts the value field —
+                        // suppress the immediate post here to avoid a
+                        // duplicate event.
+                        None => true,
+                    };
+                if !suppress_value_field_post {
+                    instance.notify_field(
+                        &field,
+                        crate::server::recgbl::EventMask::VALUE
+                            | crate::server::recgbl::EventMask::LOG,
+                    );
+                }
 
-            // Fields a `special()` changed as a side effect of this put
-            // (e.g. compress RES reset zeroing NUSE/VAL) get their monitors
-            // posted here, mirroring the explicit `db_post_events` a C
-            // `special()` makes — these fields are not pp(TRUE), so no
-            // process cycle would otherwise post them.
-            for sf in instance.record.monitor_side_effect_fields(&field) {
-                instance.notify_field(
-                    sf,
-                    crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
-                );
+                // Fields a `special()` changed as a side effect of this put
+                // (e.g. compress RES reset zeroing NUSE/VAL) get their monitors
+                // posted here, mirroring the explicit `db_post_events` a C
+                // `special()` makes — these fields are not pp(TRUE), so no
+                // process cycle would otherwise post them.
+                for sf in instance.record.monitor_side_effect_fields(&field) {
+                    instance.notify_field(
+                        sf,
+                        crate::server::recgbl::EventMask::VALUE
+                            | crate::server::recgbl::EventMask::LOG,
+                    );
+                }
             }
 
             common_result
@@ -1300,6 +1339,64 @@ mod tests {
         // right record.
         let v = db.get_pv("CANON.VAL").await.unwrap();
         assert!(matches!(v, EpicsValue::Double(x) if x == 2.5));
+    }
+
+    /// Regression: a DBR_PUT_ACKT alarm-acknowledge put posts a record-wide
+    /// DBE_ALARM (C `dbAccess.c:1299` putAckt
+    /// `db_post_events(precord, NULL, DBE_ALARM)`), so an alarm-mask monitor
+    /// on ANY field is notified — and a DBE_VALUE-only monitor is not.
+    /// Pre-fix the ack field posted only itself with DBE_VALUE|DBE_LOG, so no
+    /// alarm-mask subscriber observed the acknowledgement, and the post fired
+    /// on every put regardless of whether `ackt` changed.
+    #[tokio::test]
+    async fn alarm_ack_put_posts_record_wide_dbe_alarm() {
+        use crate::server::recgbl::EventMask;
+        use crate::server::records::ai::AiRecord;
+        use crate::types::DbFieldType;
+
+        let db = PvDatabase::new();
+        db.add_record("A:REC", Box::new(AiRecord::new(1.0)))
+            .await
+            .unwrap();
+        let rec = db.get_record("A:REC").await.expect("record exists");
+
+        let (mut alarm_rx, mut value_rx) = {
+            let mut inst = rec.write().await;
+            let a = inst
+                .add_subscriber("VAL", 1, DbFieldType::Double, EventMask::ALARM.bits())
+                .expect("alarm subscriber");
+            let v = inst
+                .add_subscriber("VAL", 2, DbFieldType::Double, EventMask::VALUE.bits())
+                .expect("value subscriber");
+            (a, v)
+        };
+
+        // DBR_PUT_ACKT arrives as Short. ACKT defaults YES (true), so writing
+        // 0 (disable transient acknowledgement) is a real change.
+        db.put_record_field_from_ca_no_notify("A:REC", "ACKT", EpicsValue::Short(0))
+            .await
+            .expect("ackt put");
+
+        // The alarm-mask monitor on VAL receives the record-wide DBE_ALARM.
+        assert!(
+            alarm_rx.try_recv().is_ok(),
+            "DBE_ALARM subscriber must receive the record-wide alarm post"
+        );
+        // The DBE_VALUE-only monitor on VAL must NOT: VAL's value is unchanged.
+        assert!(
+            value_rx.try_recv().is_err(),
+            "DBE_VALUE-only subscriber must not receive the alarm post"
+        );
+
+        // Re-putting the same ACKT value is a no-op: C putAckt returns early
+        // on an unchanged ackt, so no further alarm post fires.
+        db.put_record_field_from_ca_no_notify("A:REC", "ACKT", EpicsValue::Short(0))
+            .await
+            .expect("ackt re-put");
+        assert!(
+            alarm_rx.try_recv().is_err(),
+            "unchanged ACKT must post nothing"
+        );
     }
 
     /// `post_property_fields` writes each field through the internal put and

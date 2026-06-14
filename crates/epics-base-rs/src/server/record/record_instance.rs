@@ -2338,6 +2338,19 @@ impl RecordInstance {
         self.notify_field_with_origin(field, mask, 0);
     }
 
+    /// C `db_post_events(precord, NULL, DBE_ALARM)`: post a record-wide
+    /// alarm event. Delivers to every subscriber on any field whose mask
+    /// includes DBE_ALARM, each carrying its own monitored field's current
+    /// value (the per-field `notify_field` already filters by mask
+    /// intersection). Used by the alarm-acknowledge (ACKT/ACKS) put path so
+    /// an alarm-mask monitor on any field observes the acknowledgement.
+    pub fn notify_record_alarm(&self) {
+        let fields: Vec<String> = self.subscribers.keys().cloned().collect();
+        for field in fields {
+            self.notify_field(&field, crate::server::recgbl::EventMask::ALARM);
+        }
+    }
+
     /// Notify subscribers with an origin tag for self-write filtering.
     pub fn notify_field_with_origin(
         &self,

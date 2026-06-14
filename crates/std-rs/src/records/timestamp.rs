@@ -162,7 +162,12 @@ impl TimestampRecord {
             // stamp's nanoseconds; `subsec_millis()` is the equivalent
             // 3-digit truncation of the same fraction.
             9 | 10 => {
-                let ms = now.timestamp_subsec_millis();
+                // C `epicsTime.cpp:234-239`: the `%03f` fractional field
+                // ROUNDS to the nearest millisecond (see
+                // `round_subsec_to_millis`). `timestamp_subsec_millis()`
+                // (= nsec / 1e6) truncates instead, shifting every value
+                // on a half-ms boundary down by one.
+                let ms = round_subsec_to_millis(now.timestamp_subsec_nanos());
                 let base = if tst == 9 {
                     now.format("%b %d %Y %H:%M:%S").to_string()
                 } else {
@@ -196,6 +201,26 @@ fn truncate_to(s: PvString, max: usize) -> PvString {
     } else {
         s
     }
+}
+
+/// Round a sub-second nanosecond count to a 3-digit millisecond field.
+///
+/// C `epicsTime.cpp:234-239` renders the `%03f` fractional field by
+/// ROUNDING the nanoseconds to the nearest millisecond, with a clamp
+/// that prevents the rounded value from carrying into whole seconds:
+/// ```text
+/// frac = nsec + div[fracWid]/2;            // div[3] = 1e6, so +5e5
+/// if (frac >= 1000000000) frac = 1000000000 - 1;
+/// frac /= div[fracWid];                    // /1e6 -> 0..=999
+/// ```
+/// A naive `nsec / 1_000_000` truncates, biasing every value on a
+/// half-millisecond boundary down by one (e.g. 1.7 ms → `.001` instead
+/// of `.002`). The `min` clamp keeps a near-`1e9` nanosecond count from
+/// rounding up to `1000` ms (which would need a carry into the seconds
+/// field C never performs here).
+fn round_subsec_to_millis(nsec: u32) -> u32 {
+    let frac = (nsec + 500_000).min(1_000_000_000 - 1);
+    frac / 1_000_000
 }
 
 impl Record for TimestampRecord {
@@ -278,6 +303,36 @@ impl Record for TimestampRecord {
 
     fn clears_udf(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod subsec_round_tests {
+    use super::round_subsec_to_millis;
+
+    // C `epicsTime.cpp:234-239` rounds the `%03f` fractional field to
+    // the nearest millisecond; the previous `nsec / 1e6` truncated.
+    #[test]
+    fn rounds_to_nearest_millisecond() {
+        // Below the half-ms point: rounds down.
+        assert_eq!(round_subsec_to_millis(0), 0);
+        assert_eq!(round_subsec_to_millis(499_999), 0);
+        assert_eq!(round_subsec_to_millis(1_400_000), 1);
+        // Exactly half a millisecond: C's `+ div/2` rounds up.
+        assert_eq!(round_subsec_to_millis(500_000), 1);
+        assert_eq!(round_subsec_to_millis(1_500_000), 2);
+        // Above the half-ms point: rounds up — the case truncation got
+        // wrong (1.7 ms truncated to .001, now rounds to .002).
+        assert_eq!(round_subsec_to_millis(1_700_000), 2);
+    }
+
+    // The clamp keeps a near-1e9 nanosecond count from rounding up to
+    // 1000 ms (C `if (frac >= 1e9) frac = 1e9 - 1`), which would need a
+    // carry into the seconds field the record never performs.
+    #[test]
+    fn clamps_instead_of_carrying_into_seconds() {
+        assert_eq!(round_subsec_to_millis(999_500_000), 999);
+        assert_eq!(round_subsec_to_millis(999_999_999), 999);
     }
 }
 

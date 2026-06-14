@@ -82,7 +82,11 @@ impl fmt::Display for EpicsValue {
             // `Enum`. The labels are only consumed by a string-target
             // `put_field`, never by Display.
             Self::EnumWithChoices { index, .. } => write!(f, "{index}"),
-            Self::Char(v) => write!(f, "{v}"),
+            // DBF_CHAR is epicsInt8 (signed); C `getCharString`
+            // (dbConvert.c) renders it via cvtCharToString → signed
+            // cvtInt32ToString, so 0xFF -> "-1". Render the storage byte as
+            // i8 to match — consistent with the signed `to_f64` view below.
+            Self::Char(v) => write!(f, "{}", *v as i8),
             Self::Long(v) => write!(f, "{v}"),
             Self::Double(v) => write!(f, "{v}"),
             Self::Int64(v) => write!(f, "{v}"),
@@ -1406,6 +1410,20 @@ mod parse_radix_tests {
             EpicsValue::parse(DbFieldType::Char, "0xFF").unwrap(),
             EpicsValue::Char(255)
         );
+    }
+
+    #[test]
+    fn char_renders_signed_to_string() {
+        // C getCharString sign-extends DBF_CHAR (epicsInt8): 0xFF -> "-1",
+        // 0x80 -> "-128". A DBR_STRING GET of a scalar DBF_CHAR routes the
+        // value through Display, so the rendered byte must be signed.
+        assert_eq!(EpicsValue::Char(0xFF).to_string(), "-1");
+        assert_eq!(EpicsValue::Char(0x80).to_string(), "-128");
+        assert_eq!(EpicsValue::Char(0xC8).to_string(), "-56");
+        assert_eq!(EpicsValue::Char(0x7F).to_string(), "127");
+        assert_eq!(EpicsValue::Char(0).to_string(), "0");
+        // The same byte promotes to f64 signed, so the two views agree.
+        assert_eq!(EpicsValue::Char(0xFF).to_f64(), Some(-1.0));
     }
 }
 

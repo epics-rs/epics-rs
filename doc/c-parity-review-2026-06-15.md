@@ -59,9 +59,17 @@ population). One commit per finding.
 | STD-4 (epid MLST/ALST double-advance) | fix | Fixed | 1e79cc76 |
 | STD-5 (timestamp `.%03f` round vs truncate) | fix-low | Fixed | 4adf6ec8 |
 | STD-6 (timestamp VAL posts every cycle) | fix | Fixed | 4e3d4990 |
+| SCAL-3 (arm(0) disarm clears counts) | fix | Fixed | b83b8af1 |
+| SCAL-1 (idle S1..Sn DBE_LOG sweep) | fix | Fixed | 3486badf |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
+
+SCAL-1 added a `Record::log_swept_fields()` hook (LOG-only analogue of
+`force_posted_fields`), wired into the four monitor-snapshot builders — same
+monitor-post-fidelity family as round-1 MOT-1. SCAL-2 (fix-low) is the
+residual completion-cycle VALUE|LOG packet-bundling, left open; SCAL-4/5 are
+signoff (see tally).
 
 ## Open Findings
 

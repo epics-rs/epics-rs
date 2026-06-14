@@ -1681,7 +1681,12 @@ impl MotorRecord {
             self.pos.off = coordinate::calc_offset(self.pos.val, self.pos.dval, self.conv.dir);
             self.set_userlimits();
         }
-        self.pos.rbv = coordinate::dial_to_user(self.pos.drbv, self.conv.dir, self.pos.off);
+        // C load_pos (motorRecord.cc:3771-3817) marks M_RVAL/M_VAL/M_OFF/
+        // M_MIP/M_DMOV but never recomputes or MARKs RBV: the readback is
+        // left in the pre-LOAD_POS frame until the GET_INFO callback re-runs
+        // process_motor_info (3717), which re-derives RBV from the fresh
+        // DRBV and the new OFF. Recomputing RBV here would post it in the
+        // new frame one poll early while DRBV is still the old readback.
         self.stat.mip = MipFlags::LOAD_P;
         self.stat.dmov = false;
         effects.commands.push(MotorCommand::SetPosition {

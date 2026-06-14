@@ -744,6 +744,54 @@ fn set_mode_load_pos_collapses_through_live_path() {
 }
 
 #[test]
+fn load_pos_leaves_rbv_in_old_frame_until_get_info_callback() {
+    // C load_pos (motorRecord.cc:3771-3817) marks M_RVAL/M_VAL/M_OFF but
+    // NEVER recomputes or MARKs RBV. A SET-mode FOFF=Variable DVAL
+    // redefinition shifts OFF on the dispatch pass (here 0 -> -3.0); if
+    // RBV were recomputed there it would post in the new frame (-3.0)
+    // while DRBV is still the pre-LOAD_POS readback (0). C leaves RBV in
+    // the old frame until the GET_INFO callback re-runs process_motor_info
+    // (3717) with the fresh DRBV, where RBV converges to 0 because the
+    // motor never physically moved.
+    use motor_rs::device_state::new_shared_state;
+
+    let state = new_shared_state();
+    state.lock().unwrap().latest_status = Some(idle_status_at(1, 0.0));
+
+    let mut rec = make_record();
+    rec.set_device_state(state.clone());
+    rec.process().unwrap(); // startup: drbv=0, off=0, rbv=0
+
+    rec.put_field("SET", EpicsValue::Short(1)).unwrap();
+    rec.process().unwrap();
+    let rbv_before = rec.pos.rbv;
+    assert_eq!(rbv_before, 0.0);
+
+    // SET-mode DVAL redefinition: FOFF=Variable recomputes OFF, dispatches
+    // LOAD_POS, and must NOT touch RBV on this pass.
+    rec.put_field("DVAL", EpicsValue::Double(3.0)).unwrap();
+    rec.process().unwrap();
+    assert!(rec.stat.mip.contains(MipFlags::LOAD_P));
+    assert_eq!(
+        rec.pos.off, -3.0,
+        "Variable leg shifts OFF to the new frame"
+    );
+    assert_eq!(
+        rec.pos.rbv, rbv_before,
+        "load_pos leaves RBV in the pre-LOAD_POS frame (DRBV unchanged), \
+         not the new -3.0 frame"
+    );
+
+    // GET_INFO callback: controller confirms dial 3.0. process_motor_info
+    // re-derives RBV = 3.0 + (-3.0) = 0.0 -> converges, no transient.
+    state.lock().unwrap().latest_status = Some(idle_status_at(2, 3.0));
+    rec.process().unwrap();
+    assert!(rec.stat.mip.is_empty(), "LOAD_P collapses");
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.pos.rbv, 0.0, "RBV converges via the GET_INFO callback");
+}
+
+#[test]
 fn parked_set_redefinition_replays_at_load_pos_collapse() {
     // C move-block set test (2257-2263): a second SET redefinition
     // written while a LOAD_POS is in flight parks (load_pos is skipped

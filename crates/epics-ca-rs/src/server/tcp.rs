@@ -2570,12 +2570,25 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 Err(e) => {
                     tracing::debug!(error = %e, "ca server: read hook (no-cache get) failed");
                     if is_notify {
-                        send_cmd_error(
+                        // C `read_reply` get-failure branch
+                        // (`rsrv/camessage.c:548-562`): on
+                        // `dbChannel_get_count() < 0` it keeps the
+                        // CA_PROTO_READ_NOTIFY reply, abuses `m_cid` to
+                        // carry ECA_GETFAIL, and commits a
+                        // `dbr_size_n(type, count)` ZEROED body at the
+                        // requested count (autosize `m_count==0` resets
+                        // count to 0 and sizes `dbr_size_n(type, 0)`).
+                        // Same abused-cid wire shape as the no-read-access
+                        // frame, so it shares the builder below; the prior
+                        // `send_cmd_error` emitted `count=0` + an empty
+                        // body, which diverged from the C wire form.
+                        send_no_read_access_event(
                             writer,
                             CA_PROTO_READ_NOTIFY,
                             requested_type,
-                            ECA_GETFAIL,
+                            requested_count,
                             ioid,
+                            ECA_GETFAIL,
                         )
                         .await?;
                     } else {
@@ -2592,12 +2605,18 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
             };
             let Some(mut snapshot) = snapshot else {
                 if is_notify {
-                    send_cmd_error(
+                    // No snapshot (no-cache shadow PV with no upstream
+                    // value): surface ECA_BADCHID through the same C
+                    // `read_reply` abused-cid frame as the get-failure
+                    // branch above — requested count + `dbr_size_n` zeroed
+                    // body — not the prior `count=0`/empty `send_cmd_error`.
+                    send_no_read_access_event(
                         writer,
                         CA_PROTO_READ_NOTIFY,
                         requested_type,
-                        ECA_BADCHID,
+                        requested_count,
                         ioid,
+                        ECA_BADCHID,
                     )
                     .await?;
                 }
@@ -4989,26 +5008,6 @@ async fn reeval_access_rights<W: AsyncWrite + Unpin + Send + 'static>(
     Ok(())
 }
 
-/// Send a command-specific zero-payload error response.
-/// Used for READ_NOTIFY, WRITE_NOTIFY, and EVENT_ADD error replies.
-async fn send_cmd_error<W: AsyncWrite + Unpin + Send + 'static>(
-    writer: &Arc<Mutex<BufWriter<W>>>,
-    cmd: u16,
-    data_type: u16,
-    eca_status: u32,
-    ioid_or_subid: u32,
-) -> CaResult<()> {
-    let mut resp = CaHeader::new(cmd);
-    resp.data_type = data_type;
-    resp.count = 0;
-    resp.cid = eca_status;
-    resp.available = ioid_or_subid;
-    let mut w = writer.lock().await;
-    w.write_all(&resp.to_bytes()).await?;
-    // flush deferred to handle_client outer loop (batched)
-    Ok(())
-}
-
 /// CA_PROTO_WRITE_NOTIFY reply with extended-form
 /// count support. C `putNotifyErrorReply` / `write_notify_reply`
 /// (`rsrv/camessage.c:1482-1501` / `1731+`) call
@@ -6814,6 +6813,76 @@ mod single_write_all_framing_tests {
             16 + payload_size,
             frame.len(),
             "CA_PROTO_ERROR header-declared size must match the contiguous frame",
+        );
+    }
+
+    /// READ_NOTIFY get-failure / no-snapshot wire shape: C `read_reply`
+    /// `status < 0` branch (`rsrv/camessage.c:548-562`) keeps the
+    /// CA_PROTO_READ_NOTIFY reply at the requested count, abuses `m_cid`
+    /// to carry the ECA status, and commits a `dbr_size_n(type, count)`
+    /// ZEROED body. The pre-fix `send_cmd_error` shipped `count=0` + an
+    /// empty body; this locks the corrected `send_no_read_access_event`
+    /// shape the get-failure and no-snapshot paths now use.
+    #[tokio::test]
+    async fn read_notify_get_failure_frame_keeps_count_and_zero_body() {
+        let writer = recording_writer();
+        let requested_count = 3u32;
+        // DBR_TIME_DOUBLE = compound type with 16-byte metadata, so the
+        // get-failure body is non-empty even though every byte is zero —
+        // exactly where `count=0`/empty diverged from C.
+        send_no_read_access_event(
+            &writer,
+            CA_PROTO_READ_NOTIFY,
+            epics_base_rs::types::DBR_TIME_DOUBLE,
+            requested_count,
+            0x4242_4242, // ioid echoed into m_available
+            ECA_GETFAIL,
+        )
+        .await
+        .expect("send_no_read_access_event succeeds");
+
+        let guard = writer.lock().await;
+        let batches = &guard.get_ref().batches;
+        assert_eq!(batches.len(), 1, "one contiguous write_all");
+        let frame = &batches[0];
+        let hdr = CaHeader::from_bytes(&frame[..16]).expect("parse READ_NOTIFY header");
+        assert_eq!(hdr.cmmd, CA_PROTO_READ_NOTIFY, "stays a READ_NOTIFY reply");
+        assert_eq!(hdr.data_type, epics_base_rs::types::DBR_TIME_DOUBLE);
+        assert_eq!(
+            hdr.actual_count(),
+            requested_count,
+            "C preserves the requested count, not 0"
+        );
+        assert_eq!(hdr.cid, ECA_GETFAIL, "m_cid abused to carry the ECA status");
+        assert_eq!(hdr.available, 0x4242_4242);
+
+        // body = dbr_size_n(type, count), 8-aligned, all zero.
+        let native =
+            epics_base_rs::types::native_type_for_dbr(epics_base_rs::types::DBR_TIME_DOUBLE)
+                .expect("native type");
+        let body_size = epics_base_rs::types::dbr_buffer_size(
+            epics_base_rs::types::DBR_TIME_DOUBLE,
+            native,
+            requested_count as usize,
+        );
+        let padded = align8(body_size);
+        assert!(
+            padded > 0,
+            "compound DBR get-failure body must be non-empty"
+        );
+        assert_eq!(
+            hdr.actual_postsize(),
+            padded,
+            "m_postsize is dbr_size_n(type, count), not 0"
+        );
+        assert_eq!(
+            frame.len(),
+            16 + padded,
+            "single frame = header + zero body"
+        );
+        assert!(
+            frame[16..].iter().all(|&b| b == 0),
+            "the get-failure body is entirely zero-filled"
         );
     }
 

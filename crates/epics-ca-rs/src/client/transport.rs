@@ -1578,13 +1578,22 @@ async fn read_loop<R: AsyncRead + Unpin + Send + 'static>(
                             make_read_reply(mode, hdr.data_type, hdr.actual_count(), data)
                         });
                     } else {
+                        // libca `cac::readNotifyRespAction`
+                        // (`cac.cpp`) calls
+                        // `pmiu->exception(hdr.m_cid, "read failed", …)`,
+                        // propagating the server's exact ECA code (the C
+                        // server stamps `m_cid = ECA_GETFAIL` on a GET
+                        // failure via `cas_set_header_cid`). Carry that
+                        // raw code through `ServerError` — matching the
+                        // sibling CA_PROTO_ERROR read path (below) and the
+                        // EVENT_ADD `MonitorStatusError` path. Wrapping it
+                        // in `Protocol` would lose the code: `Protocol(_)
+                        // .to_eca_status()` falls to `ECA_PUTFAIL`, so a
+                        // GET failure would surface as a *put* error.
                         dispatch_read_error(
                             &in_flight,
                             ioid,
-                            epics_base_rs::error::CaError::Protocol(format!(
-                                "server returned ECA error {:#06x}",
-                                hdr.cid
-                            )),
+                            epics_base_rs::error::CaError::ServerError(hdr.cid),
                         );
                     }
                 }

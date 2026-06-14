@@ -598,6 +598,16 @@ impl PortDriverBase {
         let now = self.current_timestamp();
         for reason in changed {
             let value = self.params.get_value(reason, addr)?.clone();
+            // C asynPortDriver.cpp:845 — callCallbacks skips firing for an
+            // undefined param even though its changed flag is consumed
+            // (flags.clear() at :871). A status/alarm change or bare
+            // mark_changed on a never-set scalar must not emit an I/O Intr.
+            // Array/generic-pointer params have no callCallbacks analog
+            // (:846-865 switch is scalar-only) and Rust fires them as a
+            // read-trigger regardless, so gate scalars only.
+            if !value.is_array() && !self.params.is_param_defined(reason, addr).unwrap_or(false) {
+                continue;
+            }
             let ts = self.params.get_timestamp(reason, addr)?.unwrap_or(now);
             // C parity: read the accumulated callback mask and reset it
             // (asynPortDriver.cpp:854-855 fires uint32Callback then sets
@@ -635,8 +645,14 @@ impl PortDriverBase {
     /// flushing unrelated parameters (e.g. rapidly-updating CP-linked params).
     pub fn call_param_callback(&mut self, addr: i32, reason: usize) -> AsynResult<()> {
         if self.params.take_changed_single(reason, addr)? {
-            let now = self.current_timestamp();
             let value = self.params.get_value(reason, addr)?.clone();
+            // C asynPortDriver.cpp:845 — see `call_param_callbacks`: an
+            // undefined scalar consumes its changed flag but fires no
+            // callback. Array/generic-pointer triggers fire regardless.
+            if !value.is_array() && !self.params.is_param_defined(reason, addr).unwrap_or(false) {
+                return Ok(());
+            }
+            let now = self.current_timestamp();
             let ts = self.params.get_timestamp(reason, addr)?.unwrap_or(now);
             // C parity: read the accumulated callback mask and reset it
             // (asynPortDriver.cpp:854-855 fires uint32Callback then sets
@@ -1299,6 +1315,49 @@ mod tests {
         let v2 = rx.try_recv().unwrap();
         assert_eq!(v2.reason, 1);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn flush_skips_undefined_scalar_but_keeps_array_trigger() {
+        // C asynPortDriver.cpp:845 — a status/alarm change (or bare
+        // mark_changed) on a never-set scalar consumes the changed flag
+        // but fires no callback. Array/generic-pointer triggers have no
+        // callCallbacks analog (:846-865 switch is scalar-only) and must
+        // still fire even while undefined.
+        let mut drv = TestDriver::new();
+        let arr = drv
+            .base_mut()
+            .create_param("ARR", ParamType::Int32Array)
+            .unwrap();
+        let mut rx = drv.base_mut().interrupts.subscribe_async();
+
+        // Status change on the never-set scalar VAL (index 0): marks it
+        // changed but it stays undefined.
+        drv.base_mut()
+            .params
+            .set_param_status(0, 0, AsynStatus::Error, 0, 0)
+            .unwrap();
+        // Mark the never-set array param changed: an override-served trigger.
+        drv.base_mut().mark_param_changed(arr, 0).unwrap();
+
+        drv.base_mut().call_param_callbacks(0).unwrap();
+
+        // Only the array trigger is delivered; the undefined scalar is gated.
+        let iv = rx.try_recv().unwrap();
+        assert_eq!(
+            iv.reason, arr,
+            "array trigger must still fire while undefined"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "undefined scalar must not emit an I/O Intr"
+        );
+
+        // Once the scalar is defined, a subsequent change does fire.
+        drv.base_mut().set_int32_param(0, 0, 7).unwrap();
+        drv.base_mut().call_param_callbacks(0).unwrap();
+        let iv2 = rx.try_recv().unwrap();
+        assert_eq!(iv2.reason, 0, "defined scalar must fire");
     }
 
     #[test]

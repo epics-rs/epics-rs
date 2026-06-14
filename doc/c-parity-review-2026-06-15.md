@@ -47,6 +47,22 @@ highest-impact items personally (the agents' notes mark which). Findings tagged
 independently confirmed on both sides — confirm before editing, per the
 "defect citation is a sample" rule.
 
+## Resolution status (round 2 — closing 2026-06-15)
+
+Each finding re-verified at file:line on BOTH the C and Rust sides before
+editing (the audit was a read-only fan-out; citations are samples, not the
+population). One commit per finding.
+
+| Finding | Disposition | Status | Commit |
+|---------|-------------|--------|--------|
+| STD-1/2/3 (epid OUTL-write gating) | fix | Fixed | 818148c7 |
+| STD-4 (epid MLST/ALST double-advance) | fix | Fixed | 1e79cc76 |
+| STD-5 (timestamp `.%03f` round vs truncate) | fix-low | Fixed | 4adf6ec8 |
+| STD-6 (timestamp VAL posts every cycle) | fix | Fixed | 4e3d4990 |
+
+STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
+`do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
+
 ## Open Findings
 
 ### ad-core-rs (ADC)

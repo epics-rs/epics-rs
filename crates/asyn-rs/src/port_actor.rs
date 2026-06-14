@@ -182,11 +182,48 @@ impl PortActor {
         }
     }
 
+    /// The asynManager methods that run **directly** under `asynManagerLock`
+    /// rather than through `queueRequest` — connect/disconnect, enable/disable,
+    /// auto-connect, the enable/auto-connect queries, block/unblock, and port
+    /// shutdown (asynManager.c: `enable` 2222-2249, `autoConnectAsyn` 2310-2324,
+    /// `isConnected`/`isEnabled` 2326-2354, `blockProcessCallback` 1692-1723).
+    ///
+    /// Because C never queues these, the block holder (`pblockProcessHolder`,
+    /// which only gates the portThread's I/O `processUser` dispatch) cannot
+    /// stall them, and neither the queue deadline nor the enabled/connected
+    /// checks apply. This single predicate is the one owner of that
+    /// classification: it governs the deadline bypass and the
+    /// enabled/connected bypass in [`Self::process_one`] AND the block-divert
+    /// exemption in [`Self::enqueue_message`] / the [`RequestOp::BlockProcess`]
+    /// heap sweep, so all three gates stay consistent.
+    fn is_lifecycle_op(op: &RequestOp) -> bool {
+        matches!(
+            op,
+            RequestOp::Connect
+                | RequestOp::Disconnect
+                | RequestOp::ConnectAddr
+                | RequestOp::DisconnectAddr
+                | RequestOp::EnableAddr
+                | RequestOp::DisableAddr
+                | RequestOp::SetEnable { .. }
+                | RequestOp::SetAutoConnect { .. }
+                | RequestOp::GetEnable
+                | RequestOp::GetAutoConnect
+                | RequestOp::BlockProcess
+                | RequestOp::UnblockProcess
+                | RequestOp::ShutdownPort
+        )
+    }
+
     fn enqueue_message(&mut self, msg: ActorMessage) {
         if let Some((owner, _)) = self.blocked_by {
             let is_owner = msg.block_token == Some(owner);
-            let is_unblock = matches!(msg.op, RequestOp::UnblockProcess);
-            if !is_owner && !is_unblock {
+            // C parity: lifecycle/state ops are not queued, so the block
+            // holder never stalls them — only non-owner I/O is diverted.
+            // Previously only UnblockProcess was exempt, so a non-owner's
+            // enable/auto-connect/connect/disconnect/get stalled until
+            // UnblockProcess.
+            if !is_owner && !Self::is_lifecycle_op(&msg.op) {
                 self.pending_while_blocked.push(msg);
                 return;
             }
@@ -228,22 +265,7 @@ impl PortActor {
         // re-claim the token for its next phase.
         let _finish = FinishGuard(cancel);
 
-        let is_connect_op = matches!(
-            op,
-            RequestOp::Connect
-                | RequestOp::Disconnect
-                | RequestOp::ConnectAddr
-                | RequestOp::DisconnectAddr
-                | RequestOp::EnableAddr
-                | RequestOp::DisableAddr
-                | RequestOp::SetEnable { .. }
-                | RequestOp::SetAutoConnect { .. }
-                | RequestOp::GetEnable
-                | RequestOp::GetAutoConnect
-                | RequestOp::BlockProcess
-                | RequestOp::UnblockProcess
-                | RequestOp::ShutdownPort
-        );
+        let is_connect_op = Self::is_lifecycle_op(&op);
 
         // Deadline check — I/O ops only. Lifecycle / queue-management ops
         // (connect, block, unblock, shutdown) are not subject to the queue
@@ -503,8 +525,11 @@ impl PortActor {
                     let drained: Vec<ActorMessage> = self.heap.drain().collect();
                     for msg in drained {
                         let is_owner = msg.block_token == Some(token);
-                        let is_unblock = matches!(msg.op, RequestOp::UnblockProcess);
-                        if is_owner || is_unblock {
+                        // Same exemption as enqueue_message: lifecycle/state
+                        // ops are never gated by the block holder, so an
+                        // already-heaped non-owner enable/connect/get is kept,
+                        // not diverted to pending_while_blocked.
+                        if is_owner || Self::is_lifecycle_op(&msg.op) {
                             self.heap.push(msg);
                         } else {
                             self.pending_while_blocked.push(msg);
@@ -1394,6 +1419,42 @@ mod tests {
         let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
         send_and_wait(&tx, RequestOp::Int32Read, user)
             .expect("port should be unblocked after UnblockProcess");
+    }
+
+    /// C runs enable/auto-connect/get/connect/disconnect directly under
+    /// asynManagerLock — never via queueRequest — so the block holder (which
+    /// only gates the portThread's I/O `processUser` dispatch) cannot stall
+    /// them. A non-owner's lifecycle op must complete while the port is
+    /// blocked by another owner. Before the fix only UnblockProcess was exempt
+    /// from the block divert, so a non-owner SetEnable/GetEnable/Connect/
+    /// Disconnect sat in `pending_while_blocked` until UnblockProcess (the
+    /// `send_and_wait` here would hang).
+    #[test]
+    fn actor_nonowner_lifecycle_runs_while_blocked() {
+        let tx = spawn_actor(TestDriver::new());
+
+        // Block the port with owner token 42.
+        let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        user.block_token = Some(42);
+        send_and_wait(&tx, RequestOp::BlockProcess, user).unwrap();
+
+        // A non-owner (no block_token) SetEnable(false) must run immediately,
+        // not divert — otherwise this call never returns.
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        send_and_wait(&tx, RequestOp::SetEnable { yes: false }, user)
+            .expect("non-owner SetEnable must run while the port is blocked");
+
+        // And it took effect while still blocked: a non-owner GetEnable
+        // reflects the disable.
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let r = send_and_wait(&tx, RequestOp::GetEnable, user)
+            .expect("non-owner GetEnable must run while the port is blocked");
+        assert_eq!(r.int_val, Some(0), "SetEnable(false) applied while blocked");
+
+        // The owner can still unblock cleanly (token must match).
+        let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        user.block_token = Some(42);
+        send_and_wait(&tx, RequestOp::UnblockProcess, user).unwrap();
     }
 
     #[test]

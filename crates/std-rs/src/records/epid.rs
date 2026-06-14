@@ -203,6 +203,21 @@ pub struct EpidRecord {
     /// such a cycle the framework must NOT write the OUTL link
     /// (`multi_output_links`) or fire the forward link.
     compute_skipped: bool,
+    /// True iff the device-support compute decided to write the OUTL
+    /// output link this cycle. In C the OUTL `dbPutLink` lives INSIDE
+    /// `do_pid` and fires only when `pepid->fbon && outl.type != CONSTANT`
+    /// (`devEpidSoft.c:220`, `devEpidSoftCallback.c:256`), and only when
+    /// `do_pid` reached that line — i.e. NOT on the sub-MDT early return
+    /// (`devEpidSoft.c:125`) nor the CONSTANT-INP early return
+    /// (`devEpidSoft.c:110-112`). The Fast support (`devEpidFast.c`)
+    /// drives the DAC through its own output port and never writes OUTL.
+    /// `do_pid` is the single owner: it clears this at entry (so every
+    /// early return leaves it false) and sets it to `fbon != 0` only on
+    /// the success path. Records whose device support never calls
+    /// `do_pid` (Fast) leave it false → no framework OUTL write, matching
+    /// C. The CONSTANT/empty-link skip (`outl.type != CONSTANT`) is the
+    /// framework's no-op on a constant OUTL `WriteDbLink`.
+    outl_write: bool,
     /// True iff the framework's input-link fetch for `STPL` actually
     /// produced a value this cycle — the framework analogue of C
     /// `RTN_SUCCESS(dbGetLink(&prec->stpl, ...))`. Pushed by the
@@ -323,6 +338,7 @@ impl Default for EpidRecord {
             dtyp: String::new(),
             udf: true,
             compute_skipped: false,
+            outl_write: false,
             stpl_resolved: false,
             // C `epidRecord.c` init: `udf` starts TRUE and is cleared
             // only by the two clear-conditions — see `value_undefined`.
@@ -411,6 +427,15 @@ impl EpidRecord {
     /// `epidRecord.c:205-210`. See [`EpidRecord::ca_trig_pending`].
     pub fn set_ca_trig_pending(&mut self) {
         self.ca_trig_pending = true;
+    }
+
+    /// Owner setter for [`EpidRecord::outl_write`]. Only `do_pid` calls
+    /// this — it clears the flag at entry and re-enables it per `fbon`
+    /// on the success path, mirroring C's OUTL `dbPutLink` gate
+    /// (`devEpidSoft.c:220`). Keeping it private to a setter preserves
+    /// the single-owner invariant.
+    pub fn set_outl_write(&mut self, write: bool) {
+        self.outl_write = write;
     }
 
     /// Update monitor tracking fields. Returns list of fields that changed.
@@ -1403,7 +1428,14 @@ impl Record for EpidRecord {
         // C `epidRecord.c:195-202`: on a UDF-gated cycle `process()`
         // returns before `do_pid` writes the output — suppress the
         // OUTL->OVAL write so a stale OVAL is not pushed downstream.
-        if self.compute_skipped {
+        //
+        // C `devEpidSoft.c:220` / `devEpidSoftCallback.c:256`: the OUTL
+        // `dbPutLink` fires only when `fbon && outl.type != CONSTANT`,
+        // and only when `do_pid` reached that line (not the sub-MDT or
+        // CONSTANT-INP early returns); the Fast support never writes
+        // OUTL. `do_pid` owns `outl_write` and encodes exactly that
+        // condition, so the framework OUTL write is gated on it.
+        if self.compute_skipped || !self.outl_write {
             return &[];
         }
         // OUTL -> OVAL (output link)

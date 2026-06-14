@@ -662,12 +662,89 @@ fn test_multi_input_links() {
     assert_eq!(links[0], ("INP", "CVAL"));
 }
 
+/// C `devEpidSoft.c:218-224`: the OUTL `dbPutLink` fires only when
+/// `pepid->fbon && outl.type != CONSTANT`, and only when `do_pid`
+/// reached that line — NOT after the sub-MDT (`:125`) or CONSTANT-INP
+/// (`:110-112`) early returns. The framework drives the OUTL write via
+/// `multi_output_links`, so it must be empty unless `do_pid` ran with
+/// feedback ON. Boundary test, one case per gate condition.
 #[test]
-fn test_multi_output_links() {
+fn test_multi_output_links_gated_on_fbon_and_compute() {
+    // Before any compute: no OUTL write (C writes OUTL only inside do_pid).
     let rec = EpidRecord::default();
-    let links = rec.multi_output_links();
+    assert!(
+        rec.multi_output_links().is_empty(),
+        "OUTL must not be written before do_pid runs"
+    );
+
+    // Feedback ON, dt >= mdt, non-constant INP → C reaches the OUTL write.
+    let mut on = EpidRecord::default();
+    on.kp = 1.0;
+    on.val = 100.0;
+    on.cval = 90.0;
+    on.fbon = 1;
+    on.fbop = 1;
+    on.drvh = 200.0;
+    on.drvl = -200.0;
+    on.mdt = 0.0;
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    EpidSoftDeviceSupport::do_pid(&mut on);
+    let links = on.multi_output_links();
     assert_eq!(links.len(), 1);
-    assert_eq!(links[0], ("OUTL", "OVAL"));
+    assert_eq!(
+        links[0],
+        ("OUTL", "OVAL"),
+        "feedback ON must write OUTL <- OVAL"
+    );
+
+    // Feedback OFF → C `:220` `if (fbon && ...)` is false, no OUTL write,
+    // even though do_pid still computes/updates OVAL.
+    let mut off = EpidRecord::default();
+    off.kp = 1.0;
+    off.val = 100.0;
+    off.cval = 90.0;
+    off.fbon = 0;
+    off.drvh = 200.0;
+    off.drvl = -200.0;
+    off.mdt = 0.0;
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    EpidSoftDeviceSupport::do_pid(&mut off);
+    assert!(
+        off.multi_output_links().is_empty(),
+        "feedback OFF must not write OUTL (C devEpidSoft.c:220)"
+    );
+
+    // Sub-MDT cycle → C `:125` returns before the OUTL write.
+    let mut fast = EpidRecord::default();
+    fast.kp = 1.0;
+    fast.val = 100.0;
+    fast.cval = 90.0;
+    fast.fbon = 1;
+    fast.fbop = 1;
+    fast.drvh = 200.0;
+    fast.drvl = -200.0;
+    fast.mdt = 3600.0; // far larger than the elapsed dt → sub-MDT skip
+    EpidSoftDeviceSupport::do_pid(&mut fast);
+    assert!(
+        fast.multi_output_links().is_empty(),
+        "sub-MDT cycle must not write OUTL (C devEpidSoft.c:125)"
+    );
+
+    // CONSTANT INP → C `:110-112` returns before the OUTL write.
+    let mut konst = EpidRecord::default();
+    konst.inp = "5.0".to_string();
+    assert_eq!(link_field_type(&konst.inp), LinkType::Constant);
+    konst.fbon = 1;
+    konst.fbop = 1;
+    konst.drvh = 200.0;
+    konst.drvl = -200.0;
+    konst.mdt = 0.0;
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    EpidSoftDeviceSupport::do_pid(&mut konst);
+    assert!(
+        konst.multi_output_links().is_empty(),
+        "CONSTANT INP must not write OUTL (C devEpidSoft.c:110-112)"
+    );
 }
 
 // ============================================================

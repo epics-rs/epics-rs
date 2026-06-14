@@ -35,6 +35,14 @@ impl EpidSoftDeviceSupport {
     /// Execute the PID algorithm on the epid record.
     /// This is the core computation, equivalent to `do_pid()` in devEpidSoft.c.
     pub fn do_pid(epid: &mut EpidRecord) {
+        // OUTL-write ownership: clear at entry so every early return
+        // below (CONSTANT INP, sub-MDT) leaves the framework OUTL write
+        // suppressed. C performs the OUTL `dbPutLink` only at the very
+        // end of `do_pid` and only when `fbon` (`devEpidSoft.c:220`); a
+        // sub-MDT (`:125`) or CONSTANT-INP (`:110-112`) return happens
+        // before that line. `epid.set_outl_write(...)` at the success
+        // path re-enables it per `fbon`.
+        epid.set_outl_write(false);
         // C `devEpidSoft.c:110-112`:
         //   if (pepid->inp.type == CONSTANT) { /* nothing to control */
         //       if (recGblSetSevr(pepid,SOFT_ALARM,INVALID_ALARM)) return(0);
@@ -208,6 +216,16 @@ impl EpidSoftDeviceSupport {
         epid.i = i;
         epid.d = d;
         epid.fbop = epid.fbon;
+
+        // C `devEpidSoft.c:218-224` / `devEpidSoftCallback.c:254-258`:
+        //   if (pepid->fbon && (pepid->outl.type != CONSTANT))
+        //       dbPutLink(&pepid->outl, DBR_DOUBLE, &pepid->oval, 1);
+        // The OUTL write is reached only here (after the early returns)
+        // and only with feedback ON. The framework performs the actual
+        // `dbPutLink` via `multi_output_links`; gate it on `fbon`. The
+        // `outl.type != CONSTANT` half is the framework's no-op on a
+        // constant/empty OUTL link.
+        epid.set_outl_write(epid.fbon != 0);
     }
 }
 

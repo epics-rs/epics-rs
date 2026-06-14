@@ -1,4 +1,4 @@
-//! Delay interpose — inserts a delay between each character on write.
+//! Delay interpose — inserts a delay after each character on write.
 
 use std::time::Duration;
 
@@ -45,16 +45,18 @@ impl OctetInterpose for DelayInterpose {
         data: &[u8],
         next: &mut dyn OctetNext,
     ) -> AsynResult<usize> {
-        if self.delay.is_zero() || data.len() <= 1 {
+        if self.delay.is_zero() {
             return next.write(user, data);
         }
+        // C asynInterposeDelay.c:41-50 writeIt: write one char, then
+        // epicsThreadSleep(delay) — AFTER every char, including the last
+        // and including a single-char write. On a write error it breaks
+        // before sleeping (here `?` propagates before the sleep).
         let mut total = 0;
-        for (i, byte) in data.iter().enumerate() {
-            if i > 0 {
-                std::thread::sleep(self.delay);
-            }
+        for byte in data.iter() {
             let n = next.write(user, std::slice::from_ref(byte))?;
             total += n;
+            std::thread::sleep(self.delay);
         }
         Ok(total)
     }
@@ -127,6 +129,51 @@ mod tests {
         assert_eq!(n, 3);
         // Zero delay: single write
         assert_eq!(base.written.len(), 1);
+    }
+
+    #[test]
+    fn test_single_char_incurs_delay() {
+        // C writeIt sleeps after every char, including a lone one; the
+        // old `data.len() <= 1` short-circuit skipped the delay entirely.
+        let mut stack = OctetInterposeStack::new();
+        let delay = Duration::from_millis(5);
+        stack.push(Box::new(DelayInterpose::new(delay)));
+
+        let mut base = RecordingBase::new();
+        let mut user = AsynUser::default();
+
+        let start = std::time::Instant::now();
+        let n = stack.dispatch_write(&mut user, b"x", &mut base).unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(n, 1);
+        assert_eq!(base.written.len(), 1);
+        assert!(
+            elapsed >= delay,
+            "single-char write must incur one delay (>= {delay:?}), got {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn test_trailing_delay_after_last_char() {
+        // N chars => N delays (incl. the trailing one after the last
+        // char). The old `if i > 0` guard produced only N-1 delays.
+        let mut stack = OctetInterposeStack::new();
+        let delay = Duration::from_millis(5);
+        stack.push(Box::new(DelayInterpose::new(delay)));
+
+        let mut base = RecordingBase::new();
+        let mut user = AsynUser::default();
+
+        let start = std::time::Instant::now();
+        stack.dispatch_write(&mut user, b"abc", &mut base).unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= 3 * delay,
+            "3 chars must incur 3 delays incl. trailing (>= {:?}), got {elapsed:?}",
+            3 * delay
+        );
     }
 
     #[test]

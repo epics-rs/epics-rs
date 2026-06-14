@@ -68,7 +68,13 @@ impl Drop for FinishGuard {
     }
 }
 
-// Heap ordering: higher priority first, then nearer deadline, then lower seq (FIFO)
+// Heap ordering: higher priority first, then lower seq (strict FIFO
+// within a priority). C asynManager queues each priority as a FIFO list
+// (queueRequest ellAdd to the queueList[priority] tail; portThread walks
+// ellFirst->ellNext, asynManager.c:1612-1613/869-898) — a request's
+// timeout never reorders it relative to same-priority peers. An earlier
+// deadline-based tiebreaker let a later-submitted request with a shorter
+// timeout jump ahead of an earlier one, violating that FIFO.
 impl Eq for ActorMessage {}
 impl PartialEq for ActorMessage {
     fn eq(&self, other: &Self) -> bool {
@@ -79,7 +85,6 @@ impl Ord for ActorMessage {
     fn cmp(&self, other: &Self) -> Ordering {
         self.priority
             .cmp(&other.priority)
-            .then_with(|| other.deadline.cmp(&self.deadline))
             .then_with(|| other.seq.cmp(&self.seq))
     }
 }
@@ -1073,6 +1078,60 @@ mod tests {
         assert!(eom.contains(EomReason::CNT));
         assert!(!eom.contains(EomReason::EOS));
         assert!(!eom.contains(EomReason::END));
+    }
+
+    #[test]
+    fn heap_pops_fifo_within_priority() {
+        // C asynManager services each priority as a strict FIFO; a nearer
+        // deadline must not let a later same-priority request jump ahead.
+        let mk = |seq: u64, deadline: Instant| {
+            let (reply, _rx) = oneshot::channel();
+            ActorMessage {
+                op: RequestOp::Int32Read,
+                user: AsynUser::new(0),
+                deadline,
+                cancel: CancelToken::new(),
+                reply,
+                seq,
+                priority: QueuePriority::Medium,
+                block_token: None,
+            }
+        };
+        let now = Instant::now();
+        let mut heap = BinaryHeap::new();
+        // seq 0 submitted first with a far deadline; seq 1 next with a
+        // much nearer deadline.
+        heap.push(mk(0, now + Duration::from_secs(100)));
+        heap.push(mk(1, now + Duration::from_millis(1)));
+        // FIFO: seq 0 pops first despite seq 1's nearer deadline.
+        assert_eq!(heap.pop().unwrap().seq, 0);
+        assert_eq!(heap.pop().unwrap().seq, 1);
+    }
+
+    #[test]
+    fn heap_pops_higher_priority_first() {
+        // Removing the deadline tiebreaker must not disturb priority order.
+        let mk = |seq: u64, priority: QueuePriority| {
+            let (reply, _rx) = oneshot::channel();
+            ActorMessage {
+                op: RequestOp::Int32Read,
+                user: AsynUser::new(0),
+                deadline: Instant::now() + Duration::from_secs(1),
+                cancel: CancelToken::new(),
+                reply,
+                seq,
+                priority,
+                block_token: None,
+            }
+        };
+        let mut heap = BinaryHeap::new();
+        heap.push(mk(0, QueuePriority::Low));
+        heap.push(mk(1, QueuePriority::High));
+        heap.push(mk(2, QueuePriority::Medium));
+        // High then Medium then Low, regardless of submission order.
+        assert_eq!(heap.pop().unwrap().seq, 1);
+        assert_eq!(heap.pop().unwrap().seq, 2);
+        assert_eq!(heap.pop().unwrap().seq, 0);
     }
 
     #[test]

@@ -747,6 +747,36 @@ fn test_multi_output_links_gated_on_fbon_and_compute() {
     );
 }
 
+/// Regression for the suppressed VAL deadband monitor. C
+/// `epidRecord.c:346-374` `monitor()` posts VAL when `mlst-val > mdel`
+/// and only THEN advances `mlst = val`. The port's `update_monitors`
+/// pre-advanced MLST/ALST to VAL, so the framework's `check_deadband_ext`
+/// (which owns the post + advance) then saw a zero delta and never posted
+/// VAL. `update_monitors` must leave MLST/ALST untouched.
+#[test]
+fn test_update_monitors_does_not_advance_val_deadband_baselines() {
+    let mut rec = EpidRecord::default();
+    // Default MLST/ALST are 0.0; a VAL far beyond the deadband would,
+    // under the old code, advance them to VAL inside update_monitors.
+    rec.mdel = 0.5;
+    rec.adel = 0.5;
+    rec.val = 100.0;
+
+    rec.update_monitors();
+
+    assert_eq!(
+        rec.get_field("MLST").and_then(|v| v.to_f64()),
+        Some(0.0),
+        "update_monitors must NOT advance MLST — the framework \
+         check_deadband_ext owns that, after firing the VAL post"
+    );
+    assert_eq!(
+        rec.get_field("ALST").and_then(|v| v.to_f64()),
+        Some(0.0),
+        "update_monitors must NOT advance ALST"
+    );
+}
+
 // ============================================================
 // ERR field — C devEpidSoft.c:208 writes ERR for EVERY mode
 // ============================================================

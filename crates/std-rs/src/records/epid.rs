@@ -450,13 +450,17 @@ impl EpidRecord {
         self.errp = self.err;
         self.cvlp = self.cval;
 
-        // VAL deadband tracking
-        if self.mdel == 0.0 || (self.mlst - self.val).abs() > self.mdel {
-            self.mlst = self.val;
-        }
-        if self.adel == 0.0 || (self.alst - self.val).abs() > self.adel {
-            self.alst = self.val;
-        }
+        // VAL deadband baselines (MLST/ALST) are NOT advanced here. C
+        // `epidRecord.c:346-374` `monitor()` computes `delta = mlst - val`,
+        // posts VAL when `delta > mdel`, and only THEN sets `mlst = val`
+        // — the post and the advance are one owner. In Rust that owner is
+        // the framework's `check_deadband_ext`
+        // (`record_instance.rs:2180-2203`): it reads MLST, fires the VAL
+        // monitor, then advances `mlst`/`alst` via `put_coerced`. Advancing
+        // them here (before that runs) made the framework see a zero delta
+        // and silently suppress every VAL post. `update_monitors` owns only
+        // the epid-specific previous-value fields above (`pp`/`ip`/`dp`/
+        // `cvlp`/...), not the MLST/ALST deadband state.
     }
 }
 

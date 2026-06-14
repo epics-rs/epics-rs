@@ -729,28 +729,49 @@ impl AsynDeviceSupport {
         }
     }
 
-    /// Store a freshly-read scalar value into the record's VAL. For the
-    /// `asynFloat64` ai input path this reproduces C `devAsynFloat64`'s
-    /// `processAi` (devAsynFloat64.c:594-604): the float64 device support
-    /// computes the engineering VAL itself — ASLO/AOFF scaling then the SMOO
-    /// filter — and returns RTN_DO_NOT_CONVERT so the record's RVAL->VAL
-    /// convert is skipped. The asyn-rs adapter likewise returns `computed()`
-    /// (skip_convert), so without reproducing ASLO/AOFF/SMOO here the raw
-    /// driver double would reach VAL unscaled and unfiltered. The conversion
-    /// is gated on the record exposing `SMOO` (the ai-only field) so an `ao`
-    /// readback — which has ASLO/AOFF but no SMOO and a different (output)
-    /// conversion — is not disturbed.
-    fn store_read_value(&mut self, record: &mut dyn Record, val: EpicsValue) {
+    /// Store a freshly-read scalar value into the record and report whether
+    /// the record's built-in RVAL→VAL conversion should be **skipped**
+    /// (`true`) or **run** (`false`). This mirrors C device support's
+    /// `processXxx` return value:
+    ///
+    /// - `asynFloat64` ai (devAsynFloat64.c:594-604): the device support
+    ///   computes the engineering VAL itself — ASLO/AOFF then the SMOO filter
+    ///   — and returns RTN_DO_NOT_CONVERT (`2`). Here: set VAL via
+    ///   [`Self::apply_float64_ai_conversion`], return `true`. Gated on the
+    ///   record exposing `SMOO` (the ai-only field) so an `ao` readback — which
+    ///   has ASLO/AOFF but no SMOO and a different (output) conversion — is not
+    ///   disturbed.
+    /// - `asynInt32` ai (devAsynInt32.c:848-851): the device support sets
+    ///   `pr->rval = value` and returns `0`, letting the ai record's `convert()`
+    ///   apply ROFF/ASLO/AOFF, the LINR linearization (ESLO/EOFF), and SMOO.
+    ///   Here: route the raw int through RVAL, return `false`. Gated on the
+    ///   record exposing `ESLO` (the ai linearization field, same discriminator
+    ///   as the init-time [`Self::apply_linear_eslo_eoff`]); without it the raw
+    ///   counts reached VAL straight and the computed ESLO/EOFF were dead.
+    ///   mbbi/bi (no ESLO) keep the direct VAL path — their `set_val` re-derives
+    ///   from RVAL+state-table internally.
+    /// - everything else: set VAL directly, return `true` (device support
+    ///   produced the final value, as before).
+    fn store_read_value(&mut self, record: &mut dyn Record, val: EpicsValue) -> bool {
         if self.iface_type == "asynFloat64" {
             if let EpicsValue::Double(raw) = val {
                 if record.get_field("SMOO").is_some() {
                     let eng = self.apply_float64_ai_conversion(record, raw);
                     let _ = record.set_val(EpicsValue::Double(eng));
-                    return;
+                    return true;
+                }
+            }
+        }
+        if self.iface_type == "asynInt32" {
+            if let EpicsValue::Long(raw) = val {
+                if record.get_field("ESLO").is_some() {
+                    let _ = record.put_field("RVAL", EpicsValue::Long(raw));
+                    return false;
                 }
             }
         }
         let _ = record.set_val(val);
+        true
     }
 
     /// The ASLO/AOFF/SMOO arithmetic of C `devAsynFloat64::processAi`
@@ -922,9 +943,10 @@ impl DeviceSupport for AsynDeviceSupport {
                     "ring buffer overflows (C asyn ASYN_TRACE_WARNING)"
                 );
             }
+            let mut skip_convert = true;
             if let Some(ci) = entry {
                 if let Some(val) = param_value_to_epics_value(&ci.value) {
-                    self.store_read_value(record, val);
+                    skip_convert = self.store_read_value(record, val);
                 }
                 self.last_ts = Some(ci.timestamp);
                 // C devAsynInt32.c:843-847 — apply the driver alarm carried
@@ -933,11 +955,18 @@ impl DeviceSupport for AsynDeviceSupport {
                 self.last_alarm_status = ci.alarm_status;
                 self.last_alarm_severity = ci.alarm_severity;
             }
-            // Return computed() so the record skips its built-in
-            // RVAL→VAL conversion and uses the value we just set.
-            return Ok(DeviceReadOutcome::computed());
+            // Honor store_read_value's skip-convert decision: computed()
+            // (skip RVAL→VAL convert, C return 2) for paths that produced
+            // the final VAL themselves, ok() (run the record convert, C
+            // return 0) for the asynInt32 ai path that routed raw to RVAL.
+            return Ok(if skip_convert {
+                DeviceReadOutcome::computed()
+            } else {
+                DeviceReadOutcome::ok()
+            });
         }
 
+        let mut skip_convert = true;
         if let Some(op) = self.read_op() {
             let user = AsynUser::new(self.reason)
                 .with_addr(self.addr)
@@ -945,7 +974,7 @@ impl DeviceSupport for AsynDeviceSupport {
             match self.handle.submit_blocking(op, user) {
                 Ok(result) => {
                     if let Some(val) = self.result_to_value(&result) {
-                        self.store_read_value(record, val);
+                        skip_convert = self.store_read_value(record, val);
                     }
                     self.last_alarm_status = result.alarm_status;
                     self.last_alarm_severity = result.alarm_severity;
@@ -959,7 +988,12 @@ impl DeviceSupport for AsynDeviceSupport {
                 }
             }
         }
-        Ok(DeviceReadOutcome::computed())
+        // computed()/ok() per store_read_value (see the I/O Intr branch above).
+        Ok(if skip_convert {
+            DeviceReadOutcome::computed()
+        } else {
+            DeviceReadOutcome::ok()
+        })
     }
 
     fn write(&mut self, record: &mut dyn Record) -> CaResult<()> {
@@ -1882,6 +1916,108 @@ mod tests {
             "EOFF must be untouched when the driver relies on the default (0,0) bounds: got {}",
             rec.eoff
         );
+    }
+
+    /// C `devAsynInt32::processAi` (devAsynInt32.c:848-851) sets
+    /// `pr->rval = value` and returns `0`, so the ai record's own
+    /// `convert()` runs — applying ROFF/ASLO/AOFF and the LINR
+    /// linearisation (ESLO/EOFF). The asyn-rs adapter must therefore route
+    /// the raw count through RVAL and return `ok()` (run convert), NOT
+    /// `computed()` (skip convert). Before the fix the read wrote VAL
+    /// directly + returned `computed()`, so the init-computed ESLO/EOFF
+    /// were dead and a LINEAR ai surfaced raw counts.
+    #[test]
+    fn int32_ai_linear_read_applies_eslo_eoff() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut ads = make_bounded_adapter(0, 4095, "asynInt32");
+        let mut rec = AiRecord::new(0.0);
+        // EGUF/EGUL/LINR before init so init's convertAi fills ESLO/EOFF:
+        // ESLO=(10-0)/(4095-0)=10/4095, EOFF=0.
+        rec.eguf = 10.0;
+        rec.egul = 0.0;
+        rec.linr = 2; // LINEAR
+        ads.init(&mut rec).unwrap();
+        // Drive the I/O Intr read path with a raw full-scale count.
+        ads.set_record_info("TEST:AI", ScanType::IoIntr);
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(intr_entry(4095, 0));
+
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(
+            !outcome.did_compute,
+            "asynInt32 ai routes raw→RVAL and runs the record convert (C return 0)"
+        );
+        // Framework runs the record convert when did_compute is false.
+        rec.process().unwrap();
+        let val = match rec.get_field("VAL").unwrap() {
+            EpicsValue::Double(v) => v,
+            _ => panic!(),
+        };
+        assert!(
+            (val - 10.0).abs() < 1e-6,
+            "LINEAR ESLO/EOFF applied at read: 4095*(10/4095) = 10.0, got {val}"
+        );
+    }
+
+    /// LINR=NO_CONVERSION ai: the record convert still runs (C returns 0
+    /// unconditionally) but applies no ESLO/EOFF, so VAL == raw count —
+    /// confirming the raw→RVAL + run-convert path preserves the identity
+    /// case the old direct-VAL path produced.
+    #[test]
+    fn int32_ai_no_conversion_read_passes_raw() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut ads = make_bounded_adapter(0, 4095, "asynInt32");
+        let mut rec = AiRecord::new(0.0);
+        rec.linr = 0; // NO_CONVERSION
+        ads.init(&mut rec).unwrap();
+        ads.set_record_info("TEST:AI", ScanType::IoIntr);
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(intr_entry(1234, 0));
+
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(!outcome.did_compute);
+        rec.process().unwrap();
+        let val = match rec.get_field("VAL").unwrap() {
+            EpicsValue::Double(v) => v,
+            _ => panic!(),
+        };
+        assert!(
+            (val - 1234.0).abs() < 1e-9,
+            "NO_CONVERSION ai: VAL == raw count, got {val}"
+        );
+    }
+
+    /// A record without an ESLO field (longin) is not an ai — the
+    /// `get_field("ESLO").is_some()` discriminator keeps the direct VAL
+    /// path and `computed()` (skip convert), unchanged from before. This
+    /// scopes the convert-routing fix to ai records; mbbi/bi/longin (no
+    /// ESLO) are unaffected.
+    #[test]
+    fn int32_longin_read_stays_direct_computed() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut ads = make_bounded_adapter(0, 4095, "asynInt32");
+        let mut rec = LonginRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        ads.set_record_info("TEST:LI", ScanType::IoIntr);
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(intr_entry(77, 0));
+
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(
+            outcome.did_compute,
+            "non-ai (no ESLO) keeps the direct VAL path + computed()"
+        );
+        let val = match rec.get_field("VAL").unwrap() {
+            EpicsValue::Long(v) => v,
+            _ => panic!(),
+        };
+        assert_eq!(val, 77, "longin VAL set directly to the raw count");
     }
 
     /// Every getBounds default returns (0, 0), matching C

@@ -301,6 +301,30 @@ impl Record for TimestampRecord {
         self.tse = ctx.tse;
     }
 
+    /// The timestamp record has NO value deadband: its monitored
+    /// quantity is the formatted `VAL` string, and `timestampRecord.dbd`
+    /// declares no MDEL/ADEL. C `monitor()` (`timestampRecord.c:152-163`)
+    /// posts `VAL` (and `RVAL`) only inside
+    /// `if (strncmp(oval, val, sizeof(val)))` — i.e. exactly when the
+    /// formatted string changed since the previous process — then copies
+    /// `val` into `oval`. That is plain change-detection, not a deadband.
+    ///
+    /// The framework's snapshot builders force-post the deadband field on
+    /// every cycle the deadband gate fires (and the gate always fires for
+    /// a non-numeric value — see [`RecordInstance::check_deadband_ext`],
+    /// whose `to_f64()` returns `None` for a string `VAL`). Returning the
+    /// default `"VAL"` here would therefore re-post `VAL` on every scan,
+    /// even when the rendered string is unchanged — diverging from C's
+    /// `strncmp` gate. Returning `""` (a name no field resolves to)
+    /// suppresses that force-post (`resolve_field("")` is `None`, so the
+    /// `if let Some(val) = dval` push is skipped) and routes `VAL`
+    /// through the generic change-detection loop, which posts it only
+    /// when it differs from the last posted value — matching C exactly.
+    /// `RVAL` already change-detects through that same loop.
+    fn monitor_deadband_field(&self) -> &'static str {
+        ""
+    }
+
     fn clears_udf(&self) -> bool {
         true
     }
@@ -362,5 +386,26 @@ mod menu_choice_tests {
         let rec = TimestampRecord::default();
         assert_eq!(rec.menu_field_choices("TST"), Some(TIMESTAMP_TST_CHOICES));
         assert_eq!(rec.menu_field_choices("VAL"), None);
+    }
+
+    // C `timestampRecord.c:152-163`: `monitor()` posts VAL (and RVAL)
+    // only inside `if (strncmp(oval, val))` — when the formatted string
+    // changed. There is no value deadband. The record routes VAL through
+    // the framework's generic change-detection loop by reporting an
+    // empty deadband field; the framework's deadband force-post is then
+    // skipped because that name resolves to nothing.
+    #[test]
+    fn timestamp_has_no_deadband_field_so_val_change_detects() {
+        let rec = TimestampRecord::default();
+        // No numeric value deadband — the sentinel routes VAL to the
+        // change-detection loop (cf. motor's "RBV").
+        assert_eq!(rec.monitor_deadband_field(), "");
+
+        // The framework's deadband force-post fires only
+        // `if let Some(val) = resolve_field(deadband_field)`. The "" name
+        // must resolve to None so VAL is never force-posted on an
+        // unchanged-string cycle.
+        let inst = RecordInstance::new("TS:DB".into(), TimestampRecord::default());
+        assert_eq!(inst.resolve_field(""), None);
     }
 }

@@ -320,6 +320,14 @@ struct MonitorEventOutcome {
     /// The merged value after decode+merge, read under the state write lock.
     /// `None` when the body could not be decoded.
     value: Option<PvField>,
+    /// The upstream event's changed-leaf field paths, decoded from the
+    /// frame's `changed` bitset. `None` means "let the server derive the
+    /// changed-bitset" — used for a whole-structure (root-bit) event and
+    /// when the body could not be decoded. `Some(paths)` carries the real
+    /// changed leaves so the downstream cooked monitor advertises the
+    /// upstream's actual changed-bitset, not a synthesised full mask
+    /// (pva2pva `p2pApp/moncache.cpp:142,189`).
+    marked: Option<Vec<String>>,
 }
 
 /// Decode one upstream raw monitor frame and fold it into `state`.
@@ -368,7 +376,22 @@ fn apply_monitor_event(
             was_first: state.read().introspection.is_none(),
             type_changed: false,
             value: None,
+            marked: None,
         };
+    };
+
+    // Translate the upstream event's `changed` bitset into the changed-leaf
+    // field paths so the downstream cooked monitor advertises the real
+    // changed-bitset (pva2pva copies `*update->changedBitSet` verbatim,
+    // moncache.cpp:142,189) rather than a synthesised full mask. A set root
+    // bit (0) means the whole structure changed — represented as `None`
+    // (full mask) since the root has no path.
+    let marked = if changed.get(0) {
+        None
+    } else {
+        Some(epics_pva_rs::pvdata::encode::changed_bitset_paths(
+            desc, &changed,
+        ))
     };
 
     let mut s = state.write();
@@ -393,6 +416,7 @@ fn apply_monitor_event(
         was_first,
         type_changed,
         value,
+        marked,
     }
 }
 
@@ -1232,8 +1256,19 @@ impl ChannelCache {
                         // state_inner.read() re-acquisition needed.
                         if !outcome.was_first {
                             if let Some(val) = outcome.value {
-                                let _ = tx_inner
-                                    .send(epics_pva_rs::server_native::MonitorUpdate::from(val));
+                                // Carry the upstream event's real changed-leaf
+                                // paths so the downstream cooked monitor's
+                                // changedBitSet matches what the upstream IOC
+                                // marked, not a full mask of every requested
+                                // leaf (pva2pva moncache.cpp:142,189 copy the
+                                // upstream changedBitSet verbatim). `overrun`
+                                // is filled later by `subscribe_inner` on lag.
+                                let _ = tx_inner.send(epics_pva_rs::server_native::MonitorUpdate {
+                                    value: val,
+                                    marked: outcome.marked,
+                                    type_changed: false,
+                                    overrun: Vec::new(),
+                                });
                             }
                         }
                         // cache latest raw event for initial
@@ -2187,6 +2222,59 @@ mod tests {
             Some(full(99, 20)),
             "delta merge must keep unmarked field `b` at its prior value"
         );
+    }
+
+    /// BR-2 regression: `apply_monitor_event` must report the upstream
+    /// event's real changed-leaf paths in `outcome.marked`, so the
+    /// downstream cooked monitor advertises the upstream changedBitSet
+    /// (pva2pva `p2pApp/moncache.cpp:142,189` copy it verbatim) instead of
+    /// a full mask of every requested leaf. A whole-structure (root-bit)
+    /// event reports `None` (= full mask); a delta reports exactly its
+    /// changed leaves.
+    #[test]
+    fn br2_apply_monitor_event_reports_upstream_changed_leaves() {
+        let desc = FieldDesc::Structure {
+            struct_id: String::new(),
+            fields: vec![
+                ("a".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+                ("b".to_string(), FieldDesc::Scalar(ScalarType::Int)),
+            ],
+        };
+        let full = |a: i32, b: i32| {
+            let mut s = epics_pva_rs::pvdata::PvStructure::new("");
+            s.fields
+                .push(("a".to_string(), PvField::Scalar(ScalarValue::Int(a))));
+            s.fields
+                .push(("b".to_string(), PvField::Scalar(ScalarValue::Int(b))));
+            PvField::Structure(s)
+        };
+        let state = RwLock::new(EntryState::default());
+
+        // First event: whole struct (root bit 0). The whole structure
+        // changed → `marked` None (full mask), matching pva2pva's first
+        // element carrying the full changedBitSet.
+        let body1 = encode_body(&desc, &full(10, 20), &[0, 1, 2]);
+        let o1 = apply_monitor_event(&state, &desc, &body1, ByteOrder::Little);
+        assert!(
+            o1.marked.is_none(),
+            "root-bit event reports the whole structure as a full mask"
+        );
+
+        // Delta: only `a` changed (bit 1) → marks exactly `a`, NOT a full
+        // mask. This is the BR-2 fix: pre-fix every delta fanned out
+        // marked:None and the server synthesised an all-leaves bitset.
+        let body2 = encode_body(&desc, &full(99, 0), &[1]);
+        let o2 = apply_monitor_event(&state, &desc, &body2, ByteOrder::Little);
+        assert_eq!(
+            o2.marked,
+            Some(vec!["a".to_string()]),
+            "a single-leaf delta marks only the leaf the upstream changed"
+        );
+
+        // Delta: only `b` changed (bit 2) → marks exactly `b`.
+        let body3 = encode_body(&desc, &full(0, 77), &[2]);
+        let o3 = apply_monitor_event(&state, &desc, &body3, ByteOrder::Little);
+        assert_eq!(o3.marked, Some(vec!["b".to_string()]));
     }
 
     /// `apply_monitor_event` flags a descriptor change so

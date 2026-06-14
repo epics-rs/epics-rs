@@ -1484,6 +1484,54 @@ pub fn marked_changed_bitset(desc: &FieldDesc, marked_paths: &[String]) -> crate
     out
 }
 
+/// Inverse of [`marked_changed_bitset`]: collect the dot-separated field
+/// paths whose bit is set in `changed`, respecting pvData parent-bit
+/// compression — a node whose OWN bit is set yields that node's path and
+/// its subtree is not descended (matching how `marked_changed_bitset`
+/// expands a marked parent path back into the whole subtree). The walk
+/// (bit numbering, prefix construction, `total_bits` stride) is identical
+/// to `marked_changed_bitset`'s, so the round trip
+/// `marked_changed_bitset(desc, &changed_bitset_paths(desc, &bs))`
+/// reproduces any node-aligned `bs`.
+///
+/// The root bit (0) carries no path and is NOT emitted: a set root bit
+/// denotes "the whole structure changed", which the caller represents as
+/// `marked == None` (full request mask) rather than an empty path list.
+/// Used by the PVA gateway to forward the upstream monitor's real changed
+/// leaves downstream (pva2pva `p2pApp/moncache.cpp:142,189` copy the
+/// upstream `changedBitSet` verbatim) instead of a synthesised full mask.
+pub fn changed_bitset_paths(desc: &FieldDesc, changed: &crate::proto::BitSet) -> Vec<String> {
+    fn walk(
+        desc: &FieldDesc,
+        bit_offset: usize,
+        prefix: &str,
+        changed: &crate::proto::BitSet,
+        out: &mut Vec<String>,
+    ) {
+        // A node whose own bit is set contributes its whole subtree; emit
+        // its path and stop descending (pvData parent-bit compression).
+        if !prefix.is_empty() && changed.get(bit_offset) {
+            out.push(prefix.to_string());
+            return;
+        }
+        if let FieldDesc::Structure { fields, .. } = desc {
+            let mut child_bit = bit_offset + 1;
+            for (name, child) in fields {
+                let child_path = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}.{name}")
+                };
+                walk(child, child_bit, &child_path, changed, out);
+                child_bit += child.total_bits();
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(desc, 0, "", changed, &mut out);
+    out
+}
+
 /// Encode the value bytes for `value` consulting `bitset` to know which
 /// fields to emit. Mirrors pvxs `to_wire_valid(buf, value)`.
 ///
@@ -3539,6 +3587,62 @@ mod tests {
             0,
             "unknown path marks nothing"
         );
+    }
+
+    /// `changed_bitset_paths` is the faithful inverse of
+    /// `marked_changed_bitset`: it recovers the changed-leaf paths from a
+    /// wire `changed` bitset, respecting parent-bit compression, so the
+    /// PVA gateway can forward the upstream monitor's real changed leaves
+    /// (pva2pva copies the upstream changedBitSet verbatim). Structure
+    /// desc: root=0, value(leaf)=1, alarm(struct)=2, alarm.severity=3,
+    /// alarm.status=4.
+    #[test]
+    fn changed_bitset_paths_inverts_marked_changed_bitset() {
+        let desc = nested_alarm_desc();
+
+        // Single leaf bit → its path; round-trips to exactly that bit.
+        let mut bs = crate::proto::BitSet::new();
+        bs.set(1);
+        assert_eq!(changed_bitset_paths(&desc, &bs), vec!["value".to_string()]);
+        let rt = marked_changed_bitset(&desc, &changed_bitset_paths(&desc, &bs));
+        assert!(rt.get(1) && rt.count() == 1, "value round-trips to bit 1");
+
+        // Two disjoint leaves (value + alarm.status) → both paths, exact
+        // round trip to bits {1, 4}.
+        let mut bs2 = crate::proto::BitSet::new();
+        bs2.set(1);
+        bs2.set(4);
+        let mut paths2 = changed_bitset_paths(&desc, &bs2);
+        paths2.sort();
+        assert_eq!(
+            paths2,
+            vec!["alarm.status".to_string(), "value".to_string()]
+        );
+        let rt2 = marked_changed_bitset(&desc, &changed_bitset_paths(&desc, &bs2));
+        assert!(
+            rt2.get(1) && rt2.get(4) && rt2.count() == 2,
+            "two leaves round-trip to bits {{1,4}}"
+        );
+
+        // Parent-bit compression: a set struct own-bit yields the parent
+        // path (subtree not descended); round trip re-expands the subtree.
+        let mut bs_parent = crate::proto::BitSet::new();
+        bs_parent.set(2); // alarm struct own bit
+        assert_eq!(
+            changed_bitset_paths(&desc, &bs_parent),
+            vec!["alarm".to_string()]
+        );
+        let expanded = marked_changed_bitset(&desc, &changed_bitset_paths(&desc, &bs_parent));
+        assert!(
+            expanded.get(2) && expanded.get(3) && expanded.get(4) && expanded.count() == 3,
+            "parent path re-expands the whole alarm subtree"
+        );
+
+        // The root bit carries no path: the helper emits nothing (the
+        // caller maps a set root bit to `marked == None` = full mask).
+        let mut bs_root = crate::proto::BitSet::new();
+        bs_root.set(0);
+        assert!(changed_bitset_paths(&desc, &bs_root).is_empty());
     }
 
     /// Root bit set → the entire value (every leaf) is emitted and

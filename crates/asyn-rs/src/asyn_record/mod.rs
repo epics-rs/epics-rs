@@ -10,11 +10,15 @@ use std::sync::{Arc, Mutex};
 
 use epics_base_rs::error::{CaError, CaResult};
 use epics_base_rs::server::database::AsyncDbHandle;
-use epics_base_rs::server::record::{FieldDesc, ProcessOutcome, Record};
+use epics_base_rs::server::recgbl::{alarm_status, rec_gbl_set_sevr};
+use epics_base_rs::server::record::{
+    AlarmSeverity, CommonFields, FieldDesc, ProcessOutcome, Record,
+};
 use epics_base_rs::types::{DbFieldType, EpicsValue};
 
 use crate::error::AsynResult;
 use crate::exception::{AsynException, ExceptionCallbackId, ExceptionManager};
+use crate::interpose::EomReason;
 use crate::port_handle::PortHandle;
 use crate::request::{CancelToken, RequestOp, RequestResult};
 use crate::trace::{TraceFile, TraceInfoMask, TraceIoMask, TraceManager, TraceMask};
@@ -352,6 +356,15 @@ pub struct AsynRecord {
     // be removed on disconnect / drop (C `exceptionCallbackRemove`,
     // asynRecord.c:523,1154,1313).
     trace_except_cb: Option<(Arc<ExceptionManager>, ExceptionCallbackId)>,
+    // The record alarm `(stat, sevr)` raised by this process cycle's I/O —
+    // the C `recGblSetSevr(pasynRec, …)` calls in `performIO`
+    // (asynRecord.c:1380-1621) and the no-asynGpib-interface COMM alarm
+    // (:1649/:1695). Set by `apply_io_outcome` / the UCMD-ACMD short-circuits;
+    // the single consumer is `check_alarms`, which `take()`s it and commits it
+    // via `rec_gbl_set_sevr`. Every complete-returning process cycle reaches
+    // `check_alarms`, so the `take()` is the single clear point — no path
+    // stages an alarm and then bypasses the consumer.
+    io_alarm: Option<(u16, AlarmSeverity)>,
 }
 
 impl Default for AsynRecord {
@@ -439,6 +452,7 @@ impl Default for AsynRecord {
             io_inflight: None,
             trace_status_dirty: Arc::new(AtomicBool::new(false)),
             trace_except_cb: None,
+            io_alarm: None,
         }
     }
 }
@@ -488,6 +502,12 @@ struct IoPlan {
     f64out: f64,
     // Read inputs.
     octet_buf_size: usize,
+    // Full input-buffer capacity (IMAX). `octet_buf_size` is the per-request
+    // read length (`min(NRRD, IMAX)` or IMAX); overflow is keyed on the full
+    // capacity so an NRRD-limited short read never reads as overflow — C
+    // `performOctetIO` checks `nbytes >= inlen` where `inlen == sizeof(ainp)`
+    // / IMAX, independent of NRRD (asynRecord.c:1602/1609).
+    imax: usize,
     ifmt: i32,
 }
 
@@ -506,6 +526,30 @@ struct IoOutcome {
     ui32inp: Option<u32>,
     f64inp: Option<f64>,
     errs: Option<String>,
+    /// Record alarm `(stat, sevr)` this I/O cycle raises — the C
+    /// `recGblSetSevr(pasynRec, …)` calls scattered through `performIO`
+    /// (asynRecord.c:1380-1621). Accumulated with the "raise only if strictly
+    /// higher" rule via [`raise_io_alarm`] so a write-then-read `Write_Read`
+    /// keeps the first equal-severity stat, exactly as C's repeated
+    /// `recGblSetSevr` does. Applied to the record in [`AsynRecord::apply_io_outcome`]
+    /// and committed by [`AsynRecord::check_alarms`].
+    alarm: Option<(u16, AlarmSeverity)>,
+}
+
+/// Raise `(stat, sevr)` into an [`IoOutcome`] mirroring `recGblSetSevr`
+/// (recGbl.c:258, [`rec_gbl_set_sevr`]): a new severity replaces the pending
+/// alarm only when it is **strictly higher**, so an equal-severity later call
+/// keeps the earlier `stat`. C's `performIO` relies on this when both the
+/// write and read phase of a `Write_Read` fail at MAJOR — the write's stat is
+/// the one that survives.
+fn raise_io_alarm(out: &mut IoOutcome, stat: u16, sevr: AlarmSeverity) {
+    let higher = match out.alarm {
+        Some((_, cur)) => (sevr as u16) > (cur as u16),
+        None => true,
+    };
+    if higher {
+        out.alarm = Some((stat, sevr));
+    }
 }
 
 /// Build the per-transfer `asynUser` for a write/read phase. C `asynRecord.c`
@@ -586,14 +630,19 @@ fn record_write_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reque
         }
         Err(e) => {
             out.errs = Some(format!("write: {e}"));
-            // C performOctetIO assigns `nawt = nbytesTransfered`
-            // unconditionally (asynRecord.c:1547) — before the error check
-            // at :1551. A failed write moved no bytes, so land NAWT=0 rather
-            // than leaving the prior write's count. (Register writes touch no
-            // input/count field on error — recGblSetSevr only — so this is
-            // gated to Octet, matching the Ok branch.)
             if plan.iface == InterfaceType::Octet {
+                // C performOctetIO assigns `nawt = nbytesTransfered`
+                // unconditionally (asynRecord.c:1547) — before the error check
+                // at :1551. A failed write moved no bytes, so land NAWT=0
+                // rather than leaving the prior write's count. The octet write
+                // branch (:1551-1555) raises NO record severity — only a
+                // reportError — so unlike register writes it sets no alarm.
                 out.nawt = Some(0);
+            } else {
+                // C performInt32IO/performUInt32DigitalIO/performFloat64IO
+                // write error -> recGblSetSevr(WRITE_ALARM, MAJOR)
+                // (asynRecord.c:1380/1416/1452).
+                raise_io_alarm(out, alarm_status::WRITE_ALARM, AlarmSeverity::Major);
             }
         }
     }
@@ -607,21 +656,54 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
             Ok(result) => {
                 out.eomr = Some(result.eom_reason as i32);
                 if let Some(data) = result.data {
+                    // NORD is the raw transfer count (C `nord = nbytesTransfered`,
+                    // asynRecord.c:1627) — independent of the AINP overflow
+                    // NUL-truncation below and of UTF-8-lossy expansion.
                     out.nord = Some(data.len() as i32);
+                    // C performOctetIO flags an ASCII/Hybrid read that filled
+                    // the whole input buffer with no terminator as a MINOR
+                    // READ alarm and NUL-truncates the buffer
+                    // (asynRecord.c:1602-1615). The buffer-full-without-EOS
+                    // condition is exactly asyn's `ASYN_EOM_CNT` set with
+                    // neither END nor EOS; pairing it with `len >= IMAX` keeps
+                    // an NRRD-limited short read from reading as overflow.
+                    // Binary uses `>` (C says "should not happen") so it never
+                    // flags — restrict to ASCII/Hybrid.
+                    let eom = result.eom_reason;
+                    let overflow = plan.ifmt != ASYN_FMT_BINARY
+                        && plan.imax > 0
+                        && data.len() >= plan.imax
+                        && (eom & EomReason::CNT.bits()) != 0
+                        && (eom & (EomReason::END.bits() | EomReason::EOS.bits())) == 0;
                     // C stores the device bytes into the single IFMT-selected
                     // field (ASCII -> AINP, Binary/Hybrid -> BINP,
                     // asynRecord.c:1503-1509) and posts TINP (escaped) for
                     // every read mode.
                     out.tinp = Some(crate::trace::format_io_data(&data, TraceIoMask::ESCAPE));
                     if plan.ifmt == ASYN_FMT_ASCII {
-                        out.ainp = Some(String::from_utf8_lossy(&data).to_string());
+                        // On overflow C terminates AINP at the buffer end
+                        // (`inptr[sizeof(ainp)-1] = '\0'`, :1608) — drop the
+                        // final byte so the string leaves room for the
+                        // conceptual terminator.
+                        let bytes = if overflow {
+                            &data[..plan.imax - 1]
+                        } else {
+                            &data[..]
+                        };
+                        out.ainp = Some(String::from_utf8_lossy(bytes).to_string());
                     } else {
                         out.binp = Some(data);
+                    }
+                    if overflow {
+                        raise_io_alarm(out, alarm_status::READ_ALARM, AlarmSeverity::Minor);
                     }
                 }
             }
             Err(e) => {
                 out.errs = Some(format!("read: {e}"));
+                // C performOctetIO read error -> recGblSetSevr(READ_ALARM,
+                // MAJOR) (asynRecord.c:1599).
+                raise_io_alarm(out, alarm_status::READ_ALARM, AlarmSeverity::Major);
                 // C performOctetIO `memset(inptr, 0, inlen)` (asynRecord.c:1560)
                 // before the read, then assigns EOMR/NORD/TINP from the (zero
                 // on error) transfer unconditionally (:1591/:1627/:1629) — the
@@ -646,7 +728,12 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
                 Some(v) => out.i32inp = Some(v),
                 None => out.errs = Some("read: int32 read returned no value".to_string()),
             },
-            Err(e) => out.errs = Some(format!("read: {e}")),
+            // C performInt32IO read error -> recGblSetSevr(READ_ALARM, MAJOR)
+            // (asynRecord.c:1393).
+            Err(e) => {
+                out.errs = Some(format!("read: {e}"));
+                raise_io_alarm(out, alarm_status::READ_ALARM, AlarmSeverity::Major);
+            }
         },
         InterfaceType::UInt32Digital => match res {
             Ok(result) => {
@@ -654,14 +741,24 @@ fn record_read_result(plan: &IoPlan, out: &mut IoOutcome, res: AsynResult<Reques
                     out.ui32inp = Some(v);
                 }
             }
-            Err(e) => out.errs = Some(format!("read: {e}")),
+            // C performUInt32DigitalIO read error -> recGblSetSevr(READ_ALARM,
+            // MAJOR) (asynRecord.c:1431).
+            Err(e) => {
+                out.errs = Some(format!("read: {e}"));
+                raise_io_alarm(out, alarm_status::READ_ALARM, AlarmSeverity::Major);
+            }
         },
         InterfaceType::Float64 => match res {
             Ok(result) => match result.float_val {
                 Some(v) => out.f64inp = Some(v),
                 None => out.errs = Some("read: float64 read returned no value".to_string()),
             },
-            Err(e) => out.errs = Some(format!("read: {e}")),
+            // C performFloat64IO read error -> recGblSetSevr(READ_ALARM, MAJOR)
+            // (asynRecord.c:1465).
+            Err(e) => {
+                out.errs = Some(format!("read: {e}"));
+                raise_io_alarm(out, alarm_status::READ_ALARM, AlarmSeverity::Major);
+            }
         },
     }
 }
@@ -1813,6 +1910,7 @@ impl AsynRecord {
             ui32mask: self.ui32mask,
             f64out: self.f64out,
             octet_buf_size,
+            imax,
             ifmt: self.ifmt,
         }
     }
@@ -1852,6 +1950,13 @@ impl AsynRecord {
         }
         if let Some(v) = out.errs {
             self.errs = v;
+        }
+        // The I/O cycle's record alarm (C `recGblSetSevr` in `performIO`).
+        // `check_alarms` — invoked by the framework on this same completion
+        // cycle (sync `process()` return or async re-entry) — is the sole
+        // consumer; it `take()`s and commits it via `rec_gbl_set_sevr`.
+        if let Some(a) = out.alarm {
+            self.io_alarm = Some(a);
         }
     }
 
@@ -2047,6 +2152,21 @@ impl Record for AsynRecord {
     /// synchronous.
     fn set_async_context(&mut self, name: String, db: AsyncDbHandle) {
         self.async_ctx = Some((name, db));
+    }
+
+    /// C `performIO`'s `recGblSetSevr` calls raise a record alarm severity for
+    /// every I/O failure: read error -> READ/MAJOR, ASCII/Hybrid input overflow
+    /// -> READ/MINOR, register write error -> WRITE/MAJOR, missing GPIB
+    /// interface -> COMM/MAJOR (asynRecord.c:1380-1621/1649/1695). The record
+    /// stages the cycle's alarm in `io_alarm` as the I/O result is applied; the
+    /// framework calls this hook on the same completion cycle (sync return or
+    /// async re-entry), where it commits the staged alarm via `rec_gbl_set_sevr`
+    /// — the single owner of the I/O-error → NSEV/NSTA transition. `take()`
+    /// consumes it so it raises exactly once.
+    fn check_alarms(&mut self, common: &mut CommonFields) {
+        if let Some((stat, sevr)) = self.io_alarm.take() {
+            rec_gbl_set_sevr(common, stat, sevr);
+        }
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
@@ -2725,17 +2845,17 @@ impl Record for AsynRecord {
         // COMM_ALARM/MAJOR_ALARM, and return without touching the bus.
         // epics-rs ports carry no asynGpib interface (GPIBIV is always 0,
         // set in connect_device), so that no-interface branch is the only
-        // reachable path here. The COMM_ALARM/MAJOR_ALARM severity is a
-        // recGblSetSevr on the record's alarm fields, which this record
-        // type does not model (its octet I/O errors likewise report only
-        // via ERRS).
+        // reachable path here. The COMM/MAJOR severity is staged in `io_alarm`
+        // and committed by `check_alarms` on this same cycle.
         if self.ucmd != 0 {
             self.errs = "No asynGpib interface".to_string();
+            self.io_alarm = Some((alarm_status::COMM_ALARM, AlarmSeverity::Major));
             self.ucmd = 0;
             return Ok(ProcessOutcome::complete());
         }
         if self.acmd != 0 {
             self.errs = "No asynGpib interface".to_string();
+            self.io_alarm = Some((alarm_status::COMM_ALARM, AlarmSeverity::Major));
             self.acmd = 0;
             return Ok(ProcessOutcome::complete());
         }
@@ -3486,6 +3606,227 @@ mod tests {
         writer.process().unwrap();
         assert!(!writer.errs.is_empty(), "write error must set ERRS");
         assert_eq!(writer.nawt, 0, "failed write must reset NAWT to 0");
+    }
+
+    /// C `performIO` raises a record alarm severity for every I/O failure via
+    /// `recGblSetSevr` (asynRecord.c:1380-1621): octet/register read error ->
+    /// READ/MAJOR, register write error -> WRITE/MAJOR, while the octet *write*
+    /// branch (:1551-1555) raises none. The asyn record stages the alarm in
+    /// `io_alarm` and `check_alarms` commits it to NSEV/NSTA.
+    #[test]
+    fn io_errors_raise_record_alarm() {
+        use crate::error::{AsynError, AsynStatus};
+        use crate::interpose::EomReason;
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::user::AsynUser;
+        use epics_base_rs::server::recgbl::alarm_status;
+        use epics_base_rs::server::record::{AlarmSeverity, CommonFields};
+        use tokio::sync::mpsc;
+
+        fn boom() -> AsynError {
+            AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "boom".into(),
+            }
+        }
+
+        struct FailDriver(PortDriverBase);
+        impl PortDriver for FailDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn io_read_octet_eom(
+                &mut self,
+                _user: &AsynUser,
+                _buf: &mut [u8],
+            ) -> crate::error::AsynResult<(usize, EomReason)> {
+                Err(boom())
+            }
+            fn io_write_octet(
+                &mut self,
+                _user: &mut AsynUser,
+                _data: &[u8],
+            ) -> crate::error::AsynResult<()> {
+                Err(boom())
+            }
+            fn io_read_int32(&mut self, _user: &AsynUser) -> crate::error::AsynResult<i32> {
+                Err(boom())
+            }
+            fn io_write_int32(
+                &mut self,
+                _user: &mut AsynUser,
+                _value: i32,
+            ) -> crate::error::AsynResult<()> {
+                Err(boom())
+            }
+        }
+
+        let port_name = "test_io_alarm_fail";
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(
+            Box::new(FailDriver(PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags::default(),
+            ))),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), interrupts);
+        register_port(port_name, handle, Arc::new(TraceManager::new()));
+
+        let mk = |iface: i32, tmod: TransferMode| {
+            let mut rec = AsynRecord::default();
+            rec.port = port_name.to_string();
+            rec.connect_device();
+            rec.iface = iface;
+            rec.tmod = tmod as i32;
+            rec.imax = 256;
+            rec
+        };
+
+        // Octet read error -> READ_ALARM / MAJOR (C asynRecord.c:1599).
+        let mut octet_rd = mk(0, TransferMode::Read);
+        octet_rd.ifmt = ASYN_FMT_ASCII;
+        octet_rd.process().unwrap();
+        let mut c = CommonFields::default();
+        octet_rd.check_alarms(&mut c);
+        assert_eq!(c.nsta, alarm_status::READ_ALARM, "octet read err -> READ");
+        assert_eq!(c.nsev, AlarmSeverity::Major, "octet read err -> MAJOR");
+
+        // Octet write error raises NO record severity (C :1551-1555 reportError
+        // only) — only ERRS.
+        let mut octet_wr = mk(0, TransferMode::Write);
+        octet_wr.ofmt = ASYN_FMT_ASCII;
+        octet_wr.aout = "x".to_string();
+        octet_wr.process().unwrap();
+        let mut c = CommonFields::default();
+        octet_wr.check_alarms(&mut c);
+        assert_eq!(
+            c.nsev,
+            AlarmSeverity::NoAlarm,
+            "octet write err raises no record alarm (C parity)"
+        );
+
+        // Register read error -> READ_ALARM / MAJOR (C :1393).
+        let mut int_rd = mk(1, TransferMode::Read);
+        int_rd.process().unwrap();
+        let mut c = CommonFields::default();
+        int_rd.check_alarms(&mut c);
+        assert_eq!(c.nsta, alarm_status::READ_ALARM, "int32 read err -> READ");
+        assert_eq!(c.nsev, AlarmSeverity::Major, "int32 read err -> MAJOR");
+
+        // Register write error -> WRITE_ALARM / MAJOR (C :1380).
+        let mut int_wr = mk(1, TransferMode::Write);
+        int_wr.process().unwrap();
+        let mut c = CommonFields::default();
+        int_wr.check_alarms(&mut c);
+        assert_eq!(
+            c.nsta,
+            alarm_status::WRITE_ALARM,
+            "int32 write err -> WRITE"
+        );
+        assert_eq!(c.nsev, AlarmSeverity::Major, "int32 write err -> MAJOR");
+    }
+
+    /// C `performOctetIO` flags an ASCII/Hybrid read that fills the input
+    /// buffer with no terminator as READ/MINOR and NUL-truncates the buffer
+    /// (asynRecord.c:1602-1615). asyn keys this on `ASYN_EOM_CNT` set without
+    /// END/EOS and a transfer that reaches IMAX.
+    #[test]
+    fn octet_overflow_raises_minor_and_truncates() {
+        use crate::interpose::EomReason;
+        use crate::interrupt::InterruptManager;
+        use crate::port::{PortDriver, PortDriverBase, PortFlags};
+        use crate::port_actor::PortActor;
+        use crate::user::AsynUser;
+        use epics_base_rs::server::recgbl::alarm_status;
+        use epics_base_rs::server::record::{AlarmSeverity, CommonFields};
+        use tokio::sync::mpsc;
+
+        const IMAX: usize = 4;
+
+        struct OverflowDriver(PortDriverBase);
+        impl PortDriver for OverflowDriver {
+            fn base(&self) -> &PortDriverBase {
+                &self.0
+            }
+            fn base_mut(&mut self) -> &mut PortDriverBase {
+                &mut self.0
+            }
+            fn io_read_octet_eom(
+                &mut self,
+                _user: &AsynUser,
+                buf: &mut [u8],
+            ) -> crate::error::AsynResult<(usize, EomReason)> {
+                // Fill the whole buffer; CNT only (count reached, no EOS/END).
+                let n = IMAX.min(buf.len());
+                for b in buf[..n].iter_mut() {
+                    *b = b'Z';
+                }
+                Ok((n, EomReason::CNT))
+            }
+        }
+
+        let port_name = "test_io_alarm_overflow";
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = mpsc::channel(256);
+        let actor = PortActor::new(
+            Box::new(OverflowDriver(PortDriverBase::new(
+                port_name,
+                1,
+                PortFlags::default(),
+            ))),
+            rx,
+        );
+        std::thread::spawn(move || actor.run());
+        let handle = PortHandle::new(tx, port_name.into(), interrupts);
+        register_port(port_name, handle, Arc::new(TraceManager::new()));
+
+        let mut rec = AsynRecord::default();
+        rec.port = port_name.to_string();
+        rec.connect_device();
+        rec.iface = 0;
+        rec.tmod = TransferMode::Read as i32;
+        rec.imax = IMAX as i32;
+        rec.ifmt = ASYN_FMT_ASCII;
+        rec.process().unwrap();
+
+        assert_eq!(rec.errs, "", "overflow is not an error, only a MINOR alarm");
+        assert_eq!(rec.nord, IMAX as i32, "NORD is the raw transfer count");
+        assert_eq!(
+            rec.ainp, "ZZZ",
+            "ASCII overflow NUL-truncates AINP at the buffer end (IMAX-1 chars)"
+        );
+
+        let mut c = CommonFields::default();
+        rec.check_alarms(&mut c);
+        assert_eq!(c.nsta, alarm_status::READ_ALARM, "overflow -> READ");
+        assert_eq!(c.nsev, AlarmSeverity::Minor, "overflow -> MINOR");
+    }
+
+    /// C `gpibUniversalCmd`/`gpibAddressedCmd` raise COMM/MAJOR when the port
+    /// has no asynGpib interface (asynRecord.c:1649/1695); epics-rs ports never
+    /// do, so UCMD/ACMD always hits that branch.
+    #[test]
+    fn gpib_command_raises_comm_alarm() {
+        use epics_base_rs::server::recgbl::alarm_status;
+        use epics_base_rs::server::record::{AlarmSeverity, CommonFields};
+
+        let mut rec = AsynRecord::default();
+        rec.ucmd = 5; // any non-zero GPIB universal command
+        rec.process().unwrap();
+        assert_eq!(rec.errs, "No asynGpib interface");
+        let mut c = CommonFields::default();
+        rec.check_alarms(&mut c);
+        assert_eq!(c.nsta, alarm_status::COMM_ALARM, "no GPIB iface -> COMM");
+        assert_eq!(c.nsev, AlarmSeverity::Major, "no GPIB iface -> MAJOR");
     }
 
     #[test]

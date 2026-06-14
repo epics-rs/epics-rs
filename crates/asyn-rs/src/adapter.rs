@@ -329,6 +329,21 @@ pub struct AsynDeviceSupport {
     /// VAL writer so "have I produced a value yet" is exactly C's prime
     /// signal — and it does not depend on the framework's UDF lifecycle.
     smoo_primed: bool,
+    /// Enum state-field family captured at init when the record exposes
+    /// ZRST/ZNAM and the driver provided an asynEnum table. `Some` arms the
+    /// runtime re-propagation callback ([`Self::property_post_receiver`]);
+    /// `None` means no enum table (mirrors C's
+    /// `findInterface(asynEnumType) && maxEnums>0` gate).
+    enum_shape: Option<EnumRecordShape>,
+    /// The driver enum table applied at init — the diff seed for the
+    /// runtime callback so a value-only change (enum index moves, choices
+    /// unchanged) fires no DBE_PROPERTY post (C's asynEnum callback only
+    /// fires on `doCallbacksEnum`, never on an int32 value callback).
+    enum_choices: Option<Arc<[crate::param::EnumEntry]>>,
+    /// RAII subscription for the runtime enum-table interrupt — dropping
+    /// unsubscribes. Distinct from `interrupt_sub` (the value I/O Intr
+    /// subscription); C registers the asynEnum callback separately.
+    enum_interrupt_sub: Option<InterruptSubscription>,
 }
 
 /// Cached interrupt value with metadata for alarm/timestamp propagation.
@@ -426,6 +441,9 @@ impl AsynDeviceSupport {
             interrupt_sub: None,
             interrupt_fifo: Arc::new(std::sync::Mutex::new(InterruptFifo::new())),
             smoo_primed: false,
+            enum_shape: None,
+            enum_choices: None,
+            enum_interrupt_sub: None,
         }
     }
 
@@ -700,6 +718,86 @@ const BI_SEVERITY_FIELDS: [&str; 2] = ["ZSV", "OSV"];
 /// C `MAX_ENUM_STRING_SIZE` (devAsynInt32.c:66): enum strings are capped
 /// at 25 chars + NUL when copied into the record's DBF_STRING slots.
 const MAX_ENUM_STRING_LEN: usize = 25;
+
+/// The state-field family an enum record exposes — the C `initMbbi` vs
+/// `initBi` distinction. `Mbb` covers mbbi/mbbo (16 states, ZRST/ZRVL/ZRSV…);
+/// `Bi` covers bi/bo (2 states, ZNAM/ONAM + ZSV/OSV, no raw-value fields).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnumRecordShape {
+    Mbb,
+    Bi,
+}
+
+impl EnumRecordShape {
+    /// Discriminate by the state fields the record exposes (mirroring C's
+    /// per-record init: a `ZRST` field => mbbi/mbbo, a `ZNAM` field =>
+    /// bi/bo). `None` for any record that is not an enum state record.
+    fn of_record(record: &dyn Record) -> Option<Self> {
+        if record.get_field("ZRST").is_some() {
+            Some(Self::Mbb)
+        } else if record.get_field("ZNAM").is_some() {
+            Some(Self::Bi)
+        } else {
+            None
+        }
+    }
+
+    /// (string-fields, optional value-fields, severity-fields) for this
+    /// shape. bi/bo carry no raw-value fields (C passes a NULL value ptr).
+    #[allow(clippy::type_complexity)]
+    fn fields(
+        self,
+    ) -> (
+        &'static [&'static str],
+        Option<&'static [&'static str]>,
+        &'static [&'static str],
+    ) {
+        match self {
+            Self::Mbb => (
+                &MBB_STRING_FIELDS,
+                Some(&MBB_VALUE_FIELDS),
+                &MBB_SEVERITY_FIELDS,
+            ),
+            Self::Bi => (&BI_STRING_FIELDS, None, &BI_SEVERITY_FIELDS),
+        }
+    }
+}
+
+/// Build the `(field, value)` list C `setEnums` (devAsynInt32.c:415-435)
+/// writes for `entries` onto a record of the given `shape` — the single
+/// producer shared by init (apply directly to the record) and the runtime
+/// callback (post DBE_PROPERTY). Faithful to `setEnums`: every output slot
+/// up to the record's state count is first cleared (empty string / value 0
+/// / severity 0), then the driver's entries fill slots `0..numIn`, so a
+/// driver advertising fewer states blanks the record's surplus `.db`
+/// strings. Strings are truncated to MAX_ENUM_STRING_SIZE-1.
+fn enum_table_fields(
+    shape: EnumRecordShape,
+    entries: &[crate::param::EnumEntry],
+) -> Vec<(String, EpicsValue)> {
+    let (strings, values, severities) = shape.fields();
+    let mut out = Vec::with_capacity(strings.len() * 3);
+    for i in 0..strings.len() {
+        let entry = entries.get(i);
+        let mut s = entry.map(|e| e.string.clone()).unwrap_or_default();
+        // C `setEnums` truncates to MAX_ENUM_STRING_SIZE-1 (byte memcpy);
+        // EPICS state strings are ASCII so a char boundary at 25 is safe.
+        if s.chars().count() > MAX_ENUM_STRING_LEN {
+            s = s.chars().take(MAX_ENUM_STRING_LEN).collect();
+        }
+        out.push((strings[i].to_string(), EpicsValue::String(s.into())));
+        if let Some(value_fields) = values {
+            let value = entry.map(|e| e.value).unwrap_or(0);
+            out.push((value_fields[i].to_string(), EpicsValue::ULong(value as u32)));
+        }
+        let severity = entry.map(|e| e.severity).unwrap_or(0);
+        out.push((
+            severities[i].to_string(),
+            EpicsValue::Short(severity as i16),
+        ));
+    }
+    out
+}
 
 impl AsynDeviceSupport {
     /// C parity for `devAsynInt32.c::initAi` (lines 821-828) +
@@ -980,48 +1078,20 @@ impl AsynDeviceSupport {
         out
     }
 
-    /// Push a driver's asynEnum table onto the record's state fields — the
-    /// single owner for C `setEnums` (devAsynInt32.c:415-435, called from
-    /// initCommon:314 and the runtime callbackEnum:720-762). The record
-    /// family is discriminated by the fields it exposes (mirroring C's
-    /// per-record initMbbi vs initBi): a `ZRST` field => mbbi/mbbo (16
-    /// states, ZRST/ZRVL/ZRSV…); a `ZNAM` field => bi/bo (2 states,
-    /// ZNAM/ONAM + ZSV/OSV, no raw-value fields). Anything else is not an
-    /// enum record and is left untouched.
-    ///
-    /// Faithful to `setEnums`: every output slot up to the record's state
-    /// count is first cleared (empty string / value 0 / severity 0), then
-    /// the driver's entries fill slots `0..numIn`. So a driver advertising
-    /// fewer states than the record blanks the record's surplus `.db`
-    /// strings, exactly as C does.
+    /// Push a driver's asynEnum table onto the record's state fields at init
+    /// — the C `setEnums` call from `initCommon:314`. Discriminates the
+    /// record family via [`EnumRecordShape::of_record`] and applies the
+    /// [`enum_table_fields`] delta directly to the record. Anything that is
+    /// not an enum state record is left untouched. The runtime
+    /// re-propagation path ([`Self::property_post_receiver`]) reuses the
+    /// same [`enum_table_fields`] producer, posting the delta DBE_PROPERTY
+    /// instead of writing the record in-band.
     fn apply_enum_table(&self, record: &mut dyn Record, entries: &[crate::param::EnumEntry]) {
-        let (strings, values, severities): (&[&str], Option<&[&str]>, &[&str]) =
-            if record.get_field("ZRST").is_some() {
-                (
-                    &MBB_STRING_FIELDS,
-                    Some(&MBB_VALUE_FIELDS),
-                    &MBB_SEVERITY_FIELDS,
-                )
-            } else if record.get_field("ZNAM").is_some() {
-                (&BI_STRING_FIELDS, None, &BI_SEVERITY_FIELDS)
-            } else {
-                return;
-            };
-        for i in 0..strings.len() {
-            let entry = entries.get(i);
-            let mut s = entry.map(|e| e.string.clone()).unwrap_or_default();
-            // C `setEnums` truncates to MAX_ENUM_STRING_SIZE-1 (byte memcpy);
-            // EPICS state strings are ASCII so a char boundary at 25 is safe.
-            if s.chars().count() > MAX_ENUM_STRING_LEN {
-                s = s.chars().take(MAX_ENUM_STRING_LEN).collect();
-            }
-            let value = entry.map(|e| e.value).unwrap_or(0);
-            let severity = entry.map(|e| e.severity).unwrap_or(0);
-            let _ = record.put_field(strings[i], EpicsValue::String(s.into()));
-            if let Some(value_fields) = values {
-                let _ = record.put_field(value_fields[i], EpicsValue::ULong(value as u32));
-            }
-            let _ = record.put_field(severities[i], EpicsValue::Short(severity as i16));
+        let Some(shape) = EnumRecordShape::of_record(record) else {
+            return;
+        };
+        for (field, value) in enum_table_fields(shape, entries) {
+            let _ = record.put_field(&field, value);
         }
     }
 }
@@ -1120,13 +1190,20 @@ impl DeviceSupport for AsynDeviceSupport {
         // C's `findInterface(asynEnumType) != NULL` gate — a driver without
         // an enum table makes EnumRead fail and the record keeps its .db
         // strings.
-        if record.get_field("ZRST").is_some() || record.get_field("ZNAM").is_some() {
+        if let Some(shape) = EnumRecordShape::of_record(record) {
             let user = AsynUser::new(self.reason)
                 .with_addr(self.addr)
                 .with_timeout(self.timeout);
             if let Ok(result) = self.handle.submit_blocking(RequestOp::EnumRead, user) {
                 if let Some(entries) = result.enum_entries {
                     self.apply_enum_table(record, &entries);
+                    // Capture the shape + table so the runtime callback
+                    // (property_post_receiver) can re-propagate on change.
+                    // Only set when the driver actually provided a table —
+                    // C registers callbackEnum only inside the
+                    // `findInterface(asynEnumType) && maxEnums>0` block.
+                    self.enum_shape = Some(shape);
+                    self.enum_choices = Some(entries);
                 }
             }
         }
@@ -1439,6 +1516,62 @@ impl DeviceSupport for AsynDeviceSupport {
     /// records (`asyn_readback == false`) keep the SCAN-gated behaviour.
     fn io_intr_scan_independent(&self) -> bool {
         self.asyn_readback
+    }
+
+    fn property_post_receiver(
+        &mut self,
+    ) -> Option<tokio::sync::mpsc::Receiver<Vec<(String, EpicsValue)>>> {
+        // Runtime asynEnum table re-propagation. C devAsynInt32.c registers a
+        // per-record enum callback (callbackEnum, :711-762) that re-applies
+        // `setEnums` + `db_post_events(DBE_PROPERTY)` whenever the driver
+        // changes the table via `doCallbacksEnum`. Gate exactly as C's
+        // `findInterface(asynEnumType) && maxEnums>0`: only a record that
+        // exposed an enum state family AND received a driver table at init
+        // (so `enum_shape` is set) arms the callback. Independent of SCAN —
+        // a property post is not a value scan, so it never processes the
+        // record.
+        let shape = self.enum_shape?;
+        if !self.reason_set {
+            return None;
+        }
+
+        // Subscribe to the enum param's interrupts. In asyn-rs the enum value
+        // (index) and the enum table (choices) live on one `ParamValue::Enum`
+        // param, so both a value change and a `set_enum_choices` change arrive
+        // here; C separates them across the asynInt32 and asynEnum interfaces.
+        // The bridge below recovers that separation by posting only when the
+        // *choices* differ from the last-applied table (seeded with the init
+        // table) — so an int32 value change fires no DBE_PROPERTY, matching C.
+        let filter = InterruptFilter {
+            reason: Some(self.reason),
+            addr: Some(self.addr),
+            uint32_mask: None,
+        };
+        let (sub, mut intr_rx) = self.handle.interrupts().register_interrupt_user(filter);
+        self.enum_interrupt_sub = Some(sub);
+
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let mut last_choices = self.enum_choices.clone();
+        tokio::spawn(async move {
+            while let Some(iv) = intr_rx.recv().await {
+                let crate::param::ParamValue::Enum { choices, .. } = &iv.value else {
+                    continue;
+                };
+                let changed = match &last_choices {
+                    Some(prev) => prev.as_ref() != choices.as_ref(),
+                    None => true,
+                };
+                if !changed {
+                    continue;
+                }
+                last_choices = Some(choices.clone());
+                let fields = enum_table_fields(shape, choices);
+                if tx.send(fields).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Some(rx)
     }
 }
 
@@ -2574,6 +2707,125 @@ mod tests {
         ads.init(&mut rec).unwrap();
         assert!(rec.get_field("ZRST").is_none());
         assert!(rec.get_field("ZNAM").is_none());
+    }
+
+    /// The `enum_table_fields` producer (shared by init + runtime callback)
+    /// yields the full mbb state block: string/value/severity per slot, with
+    /// surplus slots cleared (empty / 0 / 0) — C `setEnums` semantics.
+    #[test]
+    fn enum_table_fields_mbb_shape() {
+        let entries = vec![enum_entry("OFF", 0, 0), enum_entry("ON", 5, 2)];
+        let fields = enum_table_fields(EnumRecordShape::Mbb, &entries);
+        // 16 states x (string + value + severity) = 48 entries.
+        assert_eq!(fields.len(), 48);
+        let get = |name: &str| {
+            fields
+                .iter()
+                .find(|(f, _)| f == name)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(get("ZRST"), Some(EpicsValue::String("OFF".into())));
+        assert_eq!(get("ONST"), Some(EpicsValue::String("ON".into())));
+        assert_eq!(get("ZRVL"), Some(EpicsValue::ULong(0)));
+        assert_eq!(get("ONVL"), Some(EpicsValue::ULong(5)));
+        assert_eq!(get("ZRSV"), Some(EpicsValue::Short(0)));
+        assert_eq!(get("ONSV"), Some(EpicsValue::Short(2)));
+        // Surplus state beyond the driver table is blanked.
+        assert_eq!(get("TWST"), Some(EpicsValue::String("".into())));
+        assert_eq!(get("TWVL"), Some(EpicsValue::ULong(0)));
+    }
+
+    /// bi/bo shape: 2 states, ZNAM/ONAM + ZSV/OSV, no raw-value fields.
+    #[test]
+    fn enum_table_fields_bi_shape() {
+        let entries = vec![enum_entry("CLOSED", 0, 0), enum_entry("OPEN", 1, 1)];
+        let fields = enum_table_fields(EnumRecordShape::Bi, &entries);
+        // 2 states x (string + severity) = 4 entries; no value fields.
+        assert_eq!(fields.len(), 4);
+        assert!(!fields.iter().any(|(f, _)| f == "ZRVL" || f == "ONVL"));
+        let get = |name: &str| {
+            fields
+                .iter()
+                .find(|(f, _)| f == name)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(get("ZNAM"), Some(EpicsValue::String("CLOSED".into())));
+        assert_eq!(get("ONAM"), Some(EpicsValue::String("OPEN".into())));
+        assert_eq!(get("ZSV"), Some(EpicsValue::Short(0)));
+        assert_eq!(get("OSV"), Some(EpicsValue::Short(1)));
+    }
+
+    /// Runtime asynEnum re-propagation: after init captures the table, a
+    /// driver enum-table change delivered through the interrupt path must
+    /// surface on the `property_post_receiver` channel as the new mbb field
+    /// block — but an interrupt carrying the SAME choices (a value-only
+    /// change) must fire NO post (C's asynEnum callback only runs on a table
+    /// change, never on an int32 value callback).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn property_post_receiver_emits_only_on_table_change() {
+        use crate::interrupt::InterruptValue;
+        use crate::param::{EnumEntry, ParamValue};
+        use epics_base_rs::server::records::mbbi::MbbiRecord;
+
+        let init_choices: Arc<[EnumEntry]> =
+            Arc::from(vec![enum_entry("OFF", 0, 0), enum_entry("ON", 1, 0)]);
+        let mut ads = make_enum_adapter(init_choices.clone());
+        let mut rec = MbbiRecord::new(0);
+        ads.init(&mut rec).unwrap();
+
+        let mut rx = ads
+            .property_post_receiver()
+            .expect("enum record arms the property callback");
+
+        // 1. A value-only interrupt (same choices) → no post.
+        ads.handle.interrupts().notify(InterruptValue {
+            reason: ads.reason,
+            addr: ads.addr,
+            value: ParamValue::Enum {
+                index: 1,
+                choices: init_choices.clone(),
+            },
+            ..Default::default()
+        });
+
+        // 2. A table-change interrupt (new choices) → post the new block.
+        let new_choices: Arc<[EnumEntry]> = Arc::from(vec![
+            enum_entry("LOW", 0, 0),
+            enum_entry("MID", 1, 1),
+            enum_entry("HIGH", 2, 2),
+        ]);
+        ads.handle.interrupts().notify(InterruptValue {
+            reason: ads.reason,
+            addr: ads.addr,
+            value: ParamValue::Enum {
+                index: 0,
+                choices: new_choices.clone(),
+            },
+            ..Default::default()
+        });
+
+        let fields = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("property post must arrive within timeout")
+            .expect("channel open");
+        let get = |name: &str| {
+            fields
+                .iter()
+                .find(|(f, _)| f == name)
+                .map(|(_, v)| v.clone())
+        };
+        // The delivered block is the NEW table (value-only #1 was suppressed).
+        assert_eq!(get("ZRST"), Some(EpicsValue::String("LOW".into())));
+        assert_eq!(get("ONST"), Some(EpicsValue::String("MID".into())));
+        assert_eq!(get("TWST"), Some(EpicsValue::String("HIGH".into())));
+        assert_eq!(get("TWVL"), Some(EpicsValue::ULong(2)));
+        assert_eq!(get("TWSV"), Some(EpicsValue::Short(2)));
+
+        // No further post is queued (the value-only interrupt produced none).
+        assert!(
+            rx.try_recv().is_err(),
+            "value-only interrupt must not post a property update"
+        );
     }
 
     /// Every getBounds default returns (0, 0), matching C

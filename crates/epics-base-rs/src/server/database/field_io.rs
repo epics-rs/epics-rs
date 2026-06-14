@@ -1302,6 +1302,62 @@ mod tests {
         assert!(matches!(v, EpicsValue::Double(x) if x == 2.5));
     }
 
+    /// `post_property_fields` writes each field through the internal put and
+    /// posts a `DBE_PROPERTY` monitor — the C
+    /// `db_post_events(precord, &precord->val, DBE_PROPERTY)` that asyn's
+    /// runtime enum re-propagation drives (devAsynInt32.c callbackEnum). A
+    /// `DBE_VALUE`-only subscriber on the same field must NOT receive it:
+    /// re-keying enum strings is a property change, not a value change.
+    #[tokio::test]
+    async fn post_property_fields_writes_and_posts_dbe_property_only() {
+        use crate::server::recgbl::EventMask;
+        use crate::server::records::mbbi::MbbiRecord;
+        use crate::types::DbFieldType;
+
+        let db = PvDatabase::new();
+        db.add_record("M:ENUM", Box::new(MbbiRecord::new(0)))
+            .await
+            .unwrap();
+        let rec = db.get_record("M:ENUM").await.expect("record exists");
+
+        let (mut prop_rx, mut val_rx) = {
+            let mut inst = rec.write().await;
+            let p = inst
+                .add_subscriber("ZRST", 1, DbFieldType::String, EventMask::PROPERTY.bits())
+                .expect("property subscriber");
+            let v = inst
+                .add_subscriber("ZRST", 2, DbFieldType::String, EventMask::VALUE.bits())
+                .expect("value subscriber");
+            (p, v)
+        };
+
+        let posted = db
+            .post_property_fields(
+                "M:ENUM",
+                vec![("ZRST".to_string(), EpicsValue::String("LABEL".into()))],
+            )
+            .await
+            .expect("post_property_fields succeeds");
+        assert_eq!(posted, vec!["ZRST".to_string()]);
+
+        // The field landed on the record.
+        assert_eq!(
+            db.get_pv("M:ENUM.ZRST").await.unwrap(),
+            EpicsValue::String("LABEL".into())
+        );
+
+        // The DBE_PROPERTY subscriber received the event; the DBE_VALUE-only
+        // subscriber did not (mask 0x08 vs 0x01, no intersection).
+        assert!(
+            prop_rx.try_recv().is_ok(),
+            "DBE_PROPERTY subscriber must receive the property post"
+        );
+        assert!(
+            val_rx.try_recv().is_err(),
+            "DBE_VALUE-only subscriber must not receive a property post"
+        );
+    }
+
     /// Regression: a direct CA put to a record whose value field VAL is NOT
     /// `pp(TRUE)` (calc / calcout / aSub) must still fire a DBE_VALUE monitor.
     /// C `dbAccess.c::dbPut:1408-1414` posts the value field immediately

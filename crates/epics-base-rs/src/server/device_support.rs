@@ -162,6 +162,31 @@ pub trait DeviceSupport: Send + Sync + 'static {
         None
     }
 
+    /// Return a receiver of out-of-band PROPERTY-class field posts.
+    ///
+    /// C parity: `registerInterruptUser(callbackEnum)` (devAsynInt32.c:319)
+    /// plus the per-record enum callback
+    /// (`interruptCallbackEnumMbbi`/`…Bi`, devAsynInt32.c:711-762), which
+    /// calls `setEnums` to re-key the record's state strings/values/
+    /// severities and then `db_post_events(precord, &precord->val,
+    /// DBE_PROPERTY)` so CA/PVA clients re-read the enum choices. This is
+    /// driven by the driver's `doCallbacksEnum`, independent of the
+    /// record's `SCAN` (it is not a value scan, so it does not process the
+    /// record).
+    ///
+    /// Each delivered message is the full `(field, value)` set to
+    /// write-and-post (the C `setEnums` field block). The framework drains
+    /// this receiver and calls
+    /// [`crate::server::database::PvDatabase::post_property_fields`].
+    /// Mirrors [`io_intr_receiver`](Self::io_intr_receiver): the device owns
+    /// the source subscription, the framework owns the post. Default:
+    /// `None` (device drives no property posts).
+    fn property_post_receiver(
+        &mut self,
+    ) -> Option<crate::runtime::sync::mpsc::Receiver<Vec<(String, crate::types::EpicsValue)>>> {
+        None
+    }
+
     /// Whether this device drives record processing from its own callback
     /// channel independently of the runtime `SCAN` menu.
     ///

@@ -837,6 +837,7 @@ impl IocApplication {
         announce!(InitHookState::AfterInitDevSup);
         wire_subroutines(&db, &subroutine_registry).await;
         let io_intr_count = setup_io_intr(db.clone()).await;
+        setup_property_posts(db.clone()).await;
         db.setup_cp_links().await;
 
         // Phase 2b.5: wait for the CA links to local records to connect
@@ -1143,6 +1144,8 @@ async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
         // #60/#208). The device's decision is authoritative — the SCAN check
         // alone would suppress callbacks for a SCAN="Passive" motor, breaking
         // the pp(TRUE) dbPutField re-process gate.
+        // NOTE: property-post wiring (setup_property_posts) is a separate
+        // pass — an enum re-propagation callback is independent of SCAN.
         let independent = inst
             .device
             .as_ref()
@@ -1168,6 +1171,40 @@ async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
                             let _ = db_clone
                                 .process_record_with_links(&rec_name, &mut visited, 0)
                                 .await;
+                        }
+                    });
+                    count += 1;
+                }
+                inst.device = Some(dev);
+            }
+        }
+    }
+    count
+}
+
+/// Spawn the out-of-band PROPERTY-post drains for every device exposing a
+/// [`DeviceSupport::property_post_receiver`] (asyn enum-string runtime
+/// re-propagation). C `registerInterruptUser(callbackEnum)` registers the
+/// callback at init; the per-record callback re-applies the enum table and
+/// `db_post_events(DBE_PROPERTY)` independently of `SCAN`. This mirrors
+/// [`setup_io_intr`]: the device owns the source subscription (the asyn
+/// interrupt) and yields a channel of field-deltas; the framework owns the
+/// post (`post_property_fields`). Returns the number of drains wired.
+pub(crate) async fn setup_property_posts(db: Arc<PvDatabase>) -> usize {
+    let names = db.all_record_names().await;
+    let mut count = 0;
+    for name in names {
+        if let Some(rec_arc) = db.get_record(&name).await {
+            let mut inst = rec_arc.write().await;
+            if let Some(mut dev) = inst.device.take() {
+                if let Some(mut rx) = dev.property_post_receiver() {
+                    let db_clone = db.clone();
+                    let rec_name = name.clone();
+                    crate::runtime::task::spawn(async move {
+                        // Each message is the full setEnums field block; post
+                        // it DBE_PROPERTY so clients re-read the choices.
+                        while let Some(fields) = rx.recv().await {
+                            let _ = db_clone.post_property_fields(&rec_name, fields).await;
                         }
                     });
                     count += 1;

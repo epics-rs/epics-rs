@@ -397,6 +397,12 @@ impl IocBuilder {
             }
         }
 
+        // 6. Out-of-band PROPERTY-post setup (asyn enum-string runtime
+        // re-propagation). Independent of SCAN, so it is a separate pass
+        // from the I/O Intr wiring above. Shared with the IocApplication
+        // iocInit path so both builders arm the enum callback identically.
+        crate::server::ioc_app::setup_property_posts(db.clone()).await;
+
         Ok((db, self.autosave_config))
     }
 }

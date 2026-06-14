@@ -501,6 +501,43 @@ impl PvDatabase {
         name: &str,
         fields: Vec<(String, EpicsValue)>,
     ) -> CaResult<Vec<String>> {
+        self.post_fields_with_mask(
+            name,
+            fields,
+            crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
+        )
+        .await
+    }
+
+    /// Out-of-band PROPERTY-class field post — the C
+    /// `db_post_events(precord, &precord->val, DBE_PROPERTY)` analogue used
+    /// for enum-string table re-propagation (asyn `callbackEnum`,
+    /// devAsynInt32.c:711-762). Writes each `(field, value)` through the
+    /// internal put, invalidates the metadata cache, and posts a
+    /// `DBE_PROPERTY` event so subscribers re-read enum choices / control
+    /// metadata.
+    ///
+    /// Unlike [`Self::post_fields`] (which posts `DBE_VALUE | DBE_LOG`) this
+    /// signals a *property* change, not a value change: a driver that re-keys
+    /// its enum strings has not produced a new reading, only new choice
+    /// labels. Returns the field names actually posted.
+    pub async fn post_property_fields(
+        &self,
+        name: &str,
+        fields: Vec<(String, EpicsValue)>,
+    ) -> CaResult<Vec<String>> {
+        self.post_fields_with_mask(name, fields, crate::server::recgbl::EventMask::PROPERTY)
+            .await
+    }
+
+    /// Shared body of [`Self::post_fields`] / [`Self::post_property_fields`]:
+    /// write+notify each field under one record-write lock, posting `mask`.
+    async fn post_fields_with_mask(
+        &self,
+        name: &str,
+        fields: Vec<(String, EpicsValue)>,
+        mask: crate::server::recgbl::EventMask,
+    ) -> CaResult<Vec<String>> {
         let rec = {
             let records = self.inner.records.read().await;
             records.get(name).cloned()
@@ -513,10 +550,7 @@ impl PvDatabase {
             // Snapshot-cache contract: a metadata-class write must
             // invalidate the cache before the monitor snapshot is built.
             inst.notify_field_written(&field);
-            inst.notify_field(
-                &field,
-                crate::server::recgbl::EventMask::VALUE | crate::server::recgbl::EventMask::LOG,
-            );
+            inst.notify_field(&field, mask);
             posted.push(field);
         }
         Ok(posted)

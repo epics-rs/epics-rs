@@ -2052,6 +2052,10 @@ impl RecordInstance {
         // (C unconditional MARK + DBE_VAL_LOG), even when unchanged —
         // see `Record::force_posted_fields`. Empty for most records.
         let force_fields = self.record.force_posted_fields();
+        // Fields the record re-posts with DBE_LOG only every cycle it
+        // names them, regardless of change — see `Record::log_swept_fields`
+        // (the scaler's idle S1..Snch sweep). Empty for most records.
+        let log_swept = self.record.log_swept_fields();
         let mut sub_updates: Vec<(String, EpicsValue, EventMask)> = Vec::new();
         for (field, subs) in &self.subscribers {
             if !subs.is_empty()
@@ -2074,6 +2078,14 @@ impl RecordInstance {
                         sub_updates.push((field.clone(), val, aux_mask));
                     } else if alarm_fanout.contains(&field.as_str()) {
                         sub_updates.push((field.clone(), val, alarm_bits));
+                    } else if log_swept.contains(&field.as_str()) {
+                        // C scalerRecord.c:770-787 `monitor()`: every idle
+                        // process re-posts each S1..Snch with a literal
+                        // DBE_LOG regardless of change. A changed field is
+                        // already delivered above with DBE_VALUE|DBE_LOG
+                        // (covering the LOG subscriber), so only the
+                        // unchanged sweep lands here — no double post.
+                        sub_updates.push((field.clone(), val, EventMask::LOG));
                     }
                 }
             }
@@ -3189,6 +3201,144 @@ mod metadata_cache_tests {
             diff_mask.bits(),
             (EventMask::VALUE | EventMask::LOG).bits(),
             "forced re-post mask is DBE_VAL_LOG"
+        );
+    }
+
+    /// Record that names S1 in `log_swept_fields` (the scaler's idle
+    /// `monitor()` DBE_LOG sweep) while keeping every value constant. S2
+    /// is a control: subscribed but NOT swept, so an unchanged S2 must
+    /// not re-post. Neither field is the primary `VAL`, so the default
+    /// deadband field resolves to nothing and does not confound the test.
+    struct LogSweepRecord {
+        s1: i32,
+        s2: i32,
+    }
+
+    impl Record for LogSweepRecord {
+        fn record_type(&self) -> &'static str {
+            "scaler"
+        }
+        fn process(&mut self) -> CaResult<crate::server::record::ProcessOutcome> {
+            // Counts never change — only the unconditional idle LOG sweep
+            // should keep S1 flowing to a DBE_LOG (archiver) subscriber.
+            Ok(crate::server::record::ProcessOutcome::complete())
+        }
+        fn get_field(&self, name: &str) -> Option<EpicsValue> {
+            match name {
+                "S1" => Some(EpicsValue::Long(self.s1)),
+                "S2" => Some(EpicsValue::Long(self.s2)),
+                _ => None,
+            }
+        }
+        fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+            match (name, value) {
+                ("S1", EpicsValue::Long(v)) => {
+                    self.s1 = v;
+                    Ok(())
+                }
+                ("S2", EpicsValue::Long(v)) => {
+                    self.s2 = v;
+                    Ok(())
+                }
+                _ => Err(CaError::FieldNotFound(name.to_string())),
+            }
+        }
+        fn field_list(&self) -> &'static [crate::server::record::FieldDesc] {
+            &[]
+        }
+        fn log_swept_fields(&self) -> &'static [&'static str] {
+            &["S1"]
+        }
+    }
+
+    /// C scalerRecord.c:770-787 `monitor()` sweeps each active channel
+    /// with a literal `DBE_LOG` on every idle process: an UNCHANGED swept
+    /// field re-posts with `DBE_LOG` ONLY, while a CHANGED swept field is
+    /// delivered once by change-detection with `DBE_VALUE|DBE_LOG` (NOT
+    /// double-posted by the sweep). A non-swept field never re-posts when
+    /// unchanged. `add_subscriber` seeds `last_posted` with the current
+    /// value (the initial value goes out via EVENT_ADD), so a freshly
+    /// subscribed unchanged field already takes the sweep path on cycle 1.
+    #[test]
+    fn log_swept_field_reposts_unchanged_with_log_mask_only() {
+        use crate::server::recgbl::EventMask;
+        let mut inst = RecordInstance::new("SW".to_string(), LogSweepRecord { s1: 7, s2: 9 });
+        let _s1_rx = inst
+            .add_subscriber(
+                "S1",
+                1,
+                crate::types::DbFieldType::Long,
+                EventMask::LOG.bits(),
+            )
+            .expect("S1 subscriber");
+        let _s2_rx = inst
+            .add_subscriber(
+                "S2",
+                2,
+                crate::types::DbFieldType::Long,
+                EventMask::VALUE.bits(),
+            )
+            .expect("S2 subscriber");
+        let names = |snap: &ProcessSnapshot| {
+            snap.changed_fields
+                .iter()
+                .map(|(n, _, _)| n.clone())
+                .collect::<Vec<_>>()
+        };
+        let count_of = |snap: &ProcessSnapshot, f: &str| {
+            snap.changed_fields
+                .iter()
+                .filter(|(n, _, _)| n == f)
+                .count()
+        };
+        let mask_of = |snap: &ProcessSnapshot, f: &str| {
+            snap.changed_fields
+                .iter()
+                .find(|(n, _, _)| n == f)
+                .map(|(_, _, m)| *m)
+        };
+
+        // Cycle 1: nothing changed since subscribe. S1 (swept) re-posts
+        // with DBE_LOG ONLY; S2 (not swept) must NOT re-post.
+        let (snap1, _) = inst.process_local().unwrap();
+        assert!(
+            names(&snap1).contains(&"S1".to_string()),
+            "log-swept S1 must re-post when unchanged: {:?}",
+            names(&snap1)
+        );
+        assert!(
+            !names(&snap1).contains(&"S2".to_string()),
+            "unchanged non-swept S2 must not re-post: {:?}",
+            names(&snap1)
+        );
+        assert_eq!(
+            mask_of(&snap1, "S1").unwrap().bits(),
+            EventMask::LOG.bits(),
+            "idle sweep posts DBE_LOG only (no DBE_VALUE)"
+        );
+
+        // Cycle 2: S1's count changed. Change-detection delivers it ONCE
+        // with DBE_VALUE|DBE_LOG; the sweep does NOT add a second post.
+        inst.record.put_field("S1", EpicsValue::Long(8)).unwrap();
+        let (snap2, _) = inst.process_local().unwrap();
+        assert_eq!(
+            count_of(&snap2, "S1"),
+            1,
+            "a changed swept field posts exactly once (no double-post): {:?}",
+            snap2.changed_fields
+        );
+        assert_eq!(
+            mask_of(&snap2, "S1").unwrap().bits(),
+            (EventMask::VALUE | EventMask::LOG).bits(),
+            "a changed swept field posts VALUE|LOG via change-detection"
+        );
+
+        // Cycle 3: unchanged again — back to the DBE_LOG-only sweep.
+        let (snap3, _) = inst.process_local().unwrap();
+        assert_eq!(
+            mask_of(&snap3, "S1").unwrap().bits(),
+            EventMask::LOG.bits(),
+            "unchanged-again S1 returns to the DBE_LOG-only sweep"
         );
     }
 

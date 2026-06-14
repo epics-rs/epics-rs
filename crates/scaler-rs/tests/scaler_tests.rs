@@ -309,6 +309,30 @@ fn test_process_idle_no_change() {
     assert_eq!(rec.us, 0);
 }
 
+// C `scalerRecord.c:471,770-787` — `process()` calls `monitor()` (the
+// S1..Snch DBE_LOG sweep) ONLY while `ss == SCALER_STATE_IDLE`. So the
+// record advertises the active-channel sweep set only when idle, and an
+// empty set while counting or waiting.
+#[test]
+fn test_log_swept_fields_idle_active_channels_only() {
+    let mut rec = ScalerRecord::default();
+    rec.nch = 3;
+
+    rec.ss = 0; // IDLE — sweeps exactly the active channels S1..S3.
+    assert_eq!(rec.log_swept_fields(), &["S1", "S2", "S3"]);
+
+    rec.ss = 2; // COUNTING — C does not call monitor(); no sweep.
+    assert_eq!(rec.log_swept_fields(), &[] as &[&str]);
+
+    rec.ss = 1; // WAITING — also not idle; no sweep.
+    assert_eq!(rec.log_swept_fields(), &[] as &[&str]);
+
+    // nch is clamped to the channel cap, never out of bounds.
+    rec.ss = 0;
+    rec.nch = (MAX_SCALER_CHANNELS as i16) + 5;
+    assert_eq!(rec.log_swept_fields().len(), MAX_SCALER_CHANNELS);
+}
+
 #[test]
 fn test_count_start_via_special() {
     let mut rec = ScalerRecord::default();

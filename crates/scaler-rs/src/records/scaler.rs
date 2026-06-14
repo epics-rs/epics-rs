@@ -589,6 +589,17 @@ static ALL_FIELDS: LazyLock<Vec<FieldDesc>> = LazyLock::new(|| {
     fields
 });
 
+/// `S1..S{MAX_SCALER_CHANNELS}` field names, in channel order, for
+/// [`ScalerRecord::log_swept_fields`]. C `scalerRecord.c:770-787`
+/// `monitor()` sweeps each active channel `S1..Snch` with a literal
+/// `DBE_LOG` on every idle process; this static is sliced to `nch` so
+/// the record can return the exact set without per-call allocation.
+static SN_FIELD_NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    (1..=MAX_SCALER_CHANNELS)
+        .map(|i| Box::leak(format!("S{}", i).into_boxed_str()) as &'static str)
+        .collect()
+});
+
 impl Record for ScalerRecord {
     fn record_type(&self) -> &'static str {
         "scaler"
@@ -1096,6 +1107,28 @@ impl Record for ScalerRecord {
     fn field_list(&self) -> &'static [FieldDesc] {
         let fields: &Vec<FieldDesc> = &ALL_FIELDS;
         unsafe { std::slice::from_raw_parts(fields.as_ptr(), fields.len()) }
+    }
+
+    /// C `scalerRecord.c:471,770-787`: `process()` calls `monitor()` only
+    /// while `ss == SCALER_STATE_IDLE`, and `monitor()` re-posts every
+    /// active channel `S1..Snch` with a literal `DBE_LOG` regardless of
+    /// change — so an archiver `camonitor SCALER:Sn` receives an event on
+    /// every idle scan, even when the count is unchanged. A counting or
+    /// WAITING cycle does not call `monitor()`, so the sweep is empty
+    /// there. The framework's snapshot builder posts each returned field
+    /// with `DBE_LOG` only (a field that also changed this cycle is
+    /// already delivered with `DBE_VALUE|DBE_LOG`, so it is not
+    /// double-posted). Slicing the static `SN_FIELD_NAMES` to `nch`
+    /// avoids a per-call allocation; the unsafe `'static` re-view matches
+    /// `field_list` above (the `LazyLock` lives for the program and
+    /// `active_channels() <= SN_FIELD_NAMES.len()`).
+    fn log_swept_fields(&self) -> &'static [&'static str] {
+        if self.ss == SCALER_STATE_IDLE {
+            let names: &Vec<&'static str> = &SN_FIELD_NAMES;
+            unsafe { std::slice::from_raw_parts(names.as_ptr(), self.active_channels()) }
+        } else {
+            &[]
+        }
     }
 
     /// `CNT`/`PCNT` are `DBF_MENU menu(scalerCNT)`; `CONT` is

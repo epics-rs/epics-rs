@@ -651,6 +651,31 @@ pub trait Record: Send + Sync + 'static {
         &[]
     }
 
+    /// Fields the record's C `monitor()` re-posts with `DBE_LOG` ONLY on
+    /// every cycle it names them, regardless of change — the analogue of
+    /// an unconditional `db_post_events(field, DBE_LOG)` sweep.
+    ///
+    /// Distinct from [`Self::force_posted_fields`], which posts with
+    /// `DBE_VALUE | DBE_LOG`: these post with `DBE_LOG` alone, so only a
+    /// `DBE_LOG` (archiver) subscriber receives the unchanged-value
+    /// event. A field that ALSO changed this cycle is already delivered
+    /// by the change-detection post (`DBE_VALUE | DBE_LOG`, which carries
+    /// the LOG bit), so the framework does not double-post it — the LOG
+    /// sweep lands only for the fields that did not change.
+    ///
+    /// C `scalerRecord.c` `monitor()` (scalerRecord.c:770-787) runs on
+    /// every IDLE process and posts each active channel `S1..Snch` with a
+    /// literal `DBE_LOG`. The scaler returns those channel field names
+    /// here ONLY while idle (it reads its own `ss` state), so an archiver
+    /// `camonitor SCALER:Sn` gets an event every idle scan even when the
+    /// count is unchanged — while a counting cycle (which does not run C
+    /// `monitor()`) returns empty.
+    ///
+    /// Default: empty — most record types have no LOG-only sweep.
+    fn log_swept_fields(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Initialize record (pass 0: field defaults; pass 1: dependent init).
     fn init_record(&mut self, _pass: u8) -> CaResult<()> {
         Ok(())

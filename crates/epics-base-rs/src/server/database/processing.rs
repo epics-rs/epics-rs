@@ -2101,6 +2101,10 @@ impl PvDatabase {
             // (C unconditional MARK + DBE_VAL_LOG), even when unchanged —
             // see `Record::force_posted_fields`. Empty for most records.
             let force_fields = instance.record.force_posted_fields();
+            // Fields re-posted with DBE_LOG only every cycle, regardless
+            // of change — see `Record::log_swept_fields` (scaler idle Sn
+            // sweep). Empty for most records.
+            let log_swept = instance.record.log_swept_fields();
             let mut sub_updates: Vec<(String, EpicsValue, EventMask)> = Vec::new();
             for (field, subs) in &instance.subscribers {
                 if !subs.is_empty()
@@ -2123,6 +2127,15 @@ impl PvDatabase {
                             sub_updates.push((field.clone(), val, aux_mask));
                         } else if alarm_fanout.contains(&field.as_str()) {
                             sub_updates.push((field.clone(), val, alarm_bits));
+                        } else if log_swept.contains(&field.as_str()) {
+                            // C scalerRecord.c:770-787 `monitor()`: every
+                            // idle process re-posts each S1..Snch with a
+                            // literal DBE_LOG regardless of change. A
+                            // changed field is already delivered above
+                            // with DBE_VALUE|DBE_LOG (covering the LOG
+                            // subscriber), so only the unchanged sweep
+                            // lands here — no double post.
+                            sub_updates.push((field.clone(), val, EventMask::LOG));
                         }
                     }
                 }
@@ -3166,6 +3179,10 @@ impl PvDatabase {
             // (C unconditional MARK + DBE_VAL_LOG), even when unchanged —
             // see `Record::force_posted_fields`. Empty for most records.
             let force_fields = instance.record.force_posted_fields();
+            // Fields re-posted with DBE_LOG only every cycle, regardless
+            // of change — see `Record::log_swept_fields` (scaler idle Sn
+            // sweep). Empty for most records.
+            let log_swept = instance.record.log_swept_fields();
             let mut sub_updates: Vec<(String, EpicsValue, EventMask)> = Vec::new();
             for (field, subs) in &instance.subscribers {
                 if !subs.is_empty()
@@ -3188,6 +3205,15 @@ impl PvDatabase {
                             sub_updates.push((field.clone(), val, aux_mask));
                         } else if alarm_fanout.contains(&field.as_str()) {
                             sub_updates.push((field.clone(), val, alarm_bits));
+                        } else if log_swept.contains(&field.as_str()) {
+                            // C scalerRecord.c:770-787 `monitor()`: every
+                            // idle process re-posts each S1..Snch with a
+                            // literal DBE_LOG regardless of change. A
+                            // changed field is already delivered above
+                            // with DBE_VALUE|DBE_LOG (covering the LOG
+                            // subscriber), so only the unchanged sweep
+                            // lands here — no double post.
+                            sub_updates.push((field.clone(), val, EventMask::LOG));
                         }
                     }
                 }
@@ -4026,6 +4052,10 @@ fn sim_process_tail(instance: &mut RecordInstance, sims: i16) {
     // (C unconditional MARK + DBE_VAL_LOG), even when unchanged —
     // see `Record::force_posted_fields`. Empty for most records.
     let force_fields = instance.record.force_posted_fields();
+    // Fields re-posted with DBE_LOG only every cycle, regardless of
+    // change — see `Record::log_swept_fields` (scaler idle Sn sweep).
+    // Empty for most records.
+    let log_swept = instance.record.log_swept_fields();
     let mut sub_updates: Vec<(String, EpicsValue, EventMask)> = Vec::new();
     for (field, subs) in &instance.subscribers {
         if !subs.is_empty()
@@ -4048,6 +4078,14 @@ fn sim_process_tail(instance: &mut RecordInstance, sims: i16) {
                     sub_updates.push((field.clone(), val, aux_mask));
                 } else if alarm_fanout.contains(&field.as_str()) {
                     sub_updates.push((field.clone(), val, alarm_bits));
+                } else if log_swept.contains(&field.as_str()) {
+                    // C scalerRecord.c:770-787 `monitor()`: every idle
+                    // process re-posts each S1..Snch with a literal
+                    // DBE_LOG regardless of change. A changed field is
+                    // already delivered above with DBE_VALUE|DBE_LOG
+                    // (covering the LOG subscriber), so only the unchanged
+                    // sweep lands here — no double post.
+                    sub_updates.push((field.clone(), val, EventMask::LOG));
                 }
             }
         }

@@ -25,7 +25,6 @@ static ACTOR_SEQ: AtomicU64 = AtomicU64::new(0);
 pub(crate) struct ActorMessage {
     pub op: RequestOp,
     pub user: AsynUser,
-    pub deadline: Instant,
     pub cancel: CancelToken,
     pub reply: oneshot::Sender<AsynResult<RequestResult>>,
     pub seq: u64,
@@ -42,11 +41,9 @@ impl ActorMessage {
     ) -> Self {
         let priority = user.priority;
         let block_token = user.block_token;
-        let deadline = Instant::now() + user.timeout;
         Self {
             op,
             user,
-            deadline,
             cancel,
             reply,
             seq: ACTOR_SEQ.fetch_add(1, AtomicOrdering::Relaxed),
@@ -190,12 +187,11 @@ impl PortActor {
     ///
     /// Because C never queues these, the block holder (`pblockProcessHolder`,
     /// which only gates the portThread's I/O `processUser` dispatch) cannot
-    /// stall them, and neither the queue deadline nor the enabled/connected
-    /// checks apply. This single predicate is the one owner of that
-    /// classification: it governs the deadline bypass and the
+    /// stall them, and the enabled/connected checks do not apply. This single
+    /// predicate is the one owner of that classification: it governs the
     /// enabled/connected bypass in [`Self::process_one`] AND the block-divert
     /// exemption in [`Self::enqueue_message`] / the [`RequestOp::BlockProcess`]
-    /// heap sweep, so all three gates stay consistent.
+    /// heap sweep, so both gates stay consistent.
     fn is_lifecycle_op(op: &RequestOp) -> bool {
         matches!(
             op,
@@ -240,7 +236,6 @@ impl PortActor {
         let ActorMessage {
             op,
             mut user,
-            deadline,
             cancel,
             reply,
             ..
@@ -267,17 +262,18 @@ impl PortActor {
 
         let is_connect_op = Self::is_lifecycle_op(&op);
 
-        // Deadline check — I/O ops only. Lifecycle / queue-management ops
-        // (connect, block, unblock, shutdown) are not subject to the queue
-        // deadline: an UnblockProcess that waited out its deadline must
-        // still run, or the port stays wedged for every non-owner caller.
-        if !is_connect_op && Instant::now() > deadline {
-            let _ = reply.send(Err(AsynError::Status {
-                status: AsynStatus::Timeout,
-                message: "request deadline expired before execution".into(),
-            }));
-            return;
-        }
+        // C parity: a request that reaches the head of the queue always
+        // executes — a dequeued request is never aborted by a queue
+        // timeout. C arms a *queue-wait* timer only when queueRequest is
+        // passed timeout > 0 (asynManager.c:1590-1623), and the port
+        // thread cancels that timer the instant it dequeues the request
+        // (:906/:827); standard device support passes
+        // `queueRequest(..., 0.0)`, arming no timer at all. `user.timeout`
+        // is the *I/O* timeout handed to the driver's read/write, not a
+        // queue pre-execution deadline — reusing it as one aborted a
+        // request that a slow predecessor had merely delayed past its I/O
+        // budget. A genuine queue-wait timeout would be a separate async
+        // timer, not derived from the I/O timeout.
         let is_connect_priority = user.priority == QueuePriority::Connect;
 
         // Connect ops and Connect-priority requests bypass enabled/connected checks
@@ -1244,14 +1240,14 @@ mod tests {
 
     #[test]
     fn heap_pops_fifo_within_priority() {
-        // C asynManager services each priority as a strict FIFO; a nearer
-        // deadline must not let a later same-priority request jump ahead.
-        let mk = |seq: u64, deadline: Instant| {
+        // C asynManager services each priority as a strict FIFO (queueRequest
+        // ellAdd to the tail; portThread walks ellFirst->ellNext): submission
+        // order is preserved within a priority by the seq tiebreaker alone.
+        let mk = |seq: u64| {
             let (reply, _rx) = oneshot::channel();
             ActorMessage {
                 op: RequestOp::Int32Read,
                 user: AsynUser::new(0),
-                deadline,
                 cancel: CancelToken::new(),
                 reply,
                 seq,
@@ -1259,26 +1255,23 @@ mod tests {
                 block_token: None,
             }
         };
-        let now = Instant::now();
         let mut heap = BinaryHeap::new();
-        // seq 0 submitted first with a far deadline; seq 1 next with a
-        // much nearer deadline.
-        heap.push(mk(0, now + Duration::from_secs(100)));
-        heap.push(mk(1, now + Duration::from_millis(1)));
-        // FIFO: seq 0 pops first despite seq 1's nearer deadline.
+        // seq 0 submitted before seq 1, same priority.
+        heap.push(mk(0));
+        heap.push(mk(1));
+        // FIFO: seq 0 pops first.
         assert_eq!(heap.pop().unwrap().seq, 0);
         assert_eq!(heap.pop().unwrap().seq, 1);
     }
 
     #[test]
     fn heap_pops_higher_priority_first() {
-        // Removing the deadline tiebreaker must not disturb priority order.
+        // Priority dominates the seq FIFO tiebreaker.
         let mk = |seq: u64, priority: QueuePriority| {
             let (reply, _rx) = oneshot::channel();
             ActorMessage {
                 op: RequestOp::Int32Read,
                 user: AsynUser::new(0),
-                deadline: Instant::now() + Duration::from_secs(1),
                 cancel: CancelToken::new(),
                 reply,
                 seq,
@@ -1310,15 +1303,22 @@ mod tests {
     }
 
     #[test]
-    fn actor_deadline_expired() {
-        let tx = spawn_actor(TestDriver::new());
+    fn actor_dequeued_request_runs_despite_elapsed_timeout() {
+        // C parity: a request that reaches the head of the queue always
+        // executes I/O — the queue-wait timer (when armed at all) is
+        // cancelled at dequeue (asynManager.c:906), and standard device
+        // support passes queueRequest(..., 0.0) so no timer exists. The
+        // I/O `user.timeout` must NOT abort a dequeued request just because
+        // a slow predecessor delayed it past that budget.
+        let mut drv = TestDriver::new();
+        drv.base.params.set_int32(0, 0, 7).unwrap();
+        let tx = spawn_actor(drv);
+        // Tiny I/O timeout; let it lapse before the request is serviced.
         let user = AsynUser::new(0).with_timeout(Duration::from_nanos(1));
         std::thread::sleep(Duration::from_millis(1));
         let result = send_and_wait(&tx, RequestOp::Int32Read, user);
-        match result {
-            Err(AsynError::Status { status, .. }) => assert_eq!(status, AsynStatus::Timeout),
-            other => panic!("expected Timeout, got {other:?}"),
-        }
+        // No queue-deadline abort: the read runs and returns the value.
+        assert_eq!(result.unwrap().int_val, Some(7));
     }
 
     #[test]
@@ -1479,9 +1479,10 @@ mod tests {
 
     #[test]
     fn actor_unblock_with_expired_deadline_still_runs() {
-        // An UnblockProcess that waited out its queue deadline must still
-        // execute — otherwise the port stays wedged for every non-owner
-        // caller forever. Lifecycle ops bypass the deadline short-circuit.
+        // An UnblockProcess that waited out its nominal I/O timeout must
+        // still execute once dequeued — otherwise the port stays wedged for
+        // every non-owner caller forever. No dequeued request (lifecycle or
+        // I/O) is aborted by a queue deadline (C parity, asynManager.c:906).
         let mut drv = TestDriver::new();
         // Seed VAL so the post-unblock read probe returns a value rather than
         // the C-parity ParamUndefined for an unset param; this test asserts

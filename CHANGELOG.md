@@ -1,5 +1,112 @@
 # Changelog
 
+## v0.20.2 — 2026-06-15
+
+Patch release: 46 C-parity regression fixes plus 2 additive parity
+features (asyn runtime enum re-propagation, kohzu/ml-mono tweak
+buttons) on top of `v0.20.1`, one commit per finding (the `fix(...)` /
+`feat(...)` git log is the ledger). No public API changes. The
+output-form sweep covers asyn device support, base/db monitor +
+conversion, CA `READ_NOTIFY` error replies, the native PVA monitor and
+the QSRV/gateway, motor readback, and the std / scaler / optics synApps
+modules.
+
+### asyn
+
+The round-1 asyn parity batch against `epics-modules/asyn` closed
+device-support, conversion, and policy gaps:
+
+- Reads surface driver alarm state: I/O Intr and scalar reads map the
+  stored param `asynStatus` to a record alarm (C
+  `devAsynInt32.c:561-563/843-847`), `callParamCallbacks` skips
+  undefined scalars (C `asynPortDriver.cpp:845`), and the asyn record
+  raises READ/WRITE/COMM severities with an overflow `MINOR` (C
+  `performIO`).
+- Conversion parity: `asynInt32` ai routes raw to `RVAL` and runs
+  `convert` (C `processAi`); `asynFloat64` ai applies `ASLO`/`AOFF` +
+  `SMOO`; an octet I/O error resets the transfer fields (C
+  `1547/1560-1631`).
+- Queue/transport policy: strict FIFO within a priority (C
+  `asynManager.c:1612-1613`), no abort of a dequeued request on the I/O
+  timeout, auto-reconnect throttled to one attempt per 2s window (C
+  `autoConnectDevice 712-739`), lifecycle/state ops bypass the block
+  divert, and `enable`/`disable` refuses a defunct port.
+- Link parsing and enums: `@asynMask` 3rd arg is signed `nbits` for
+  `asynInt32`, addr/mask parse with C `strtol` base-0 (hex/octal), the
+  driver `asynEnum` table propagates onto record state fields at init
+  and re-propagates at runtime posting `DBE_PROPERTY`. The delay
+  interpose sleeps after every char including the last; the asyn record
+  `DBIT` readback queries `"bits"`, not `"csize"`.
+
+### base/db
+
+- A scalar `DBF_CHAR` renders signed in the `DBR_STRING` conversion.
+- `MLST`/`ALST`/`LALM` seed from `VAL` at init, suppressing a spurious
+  first-cycle monitor.
+- An alarm-ack (`ACKT`/`ACKS`) put posts the `DBE_ALARM` mask plus a
+  record-wide alarm event.
+
+### CA
+
+- A `READ_NOTIFY` get-failure ships a `dbr_size_n` zero body at the
+  requested element count and preserves the server `ECA` code via
+  `ServerError`; bad-SID handlers emit an `ECA_INTERNAL` frame before
+  closing (C `logBadId`).
+
+### PVA (native + QSRV/gateway)
+
+- Cooked monitor builders emit an empty overrun bitset, and the monitor
+  INIT reply subcommand is the state-derived `0x08`, not echoed (pvxs
+  `servermon.cpp 135,174-176`).
+- A QSRV plain-array group member advertises a scalar-array leaf (pvxs
+  `iocsource.cpp:632-643`); the PVA gateway forwards the upstream
+  `changedBitSet` to cooked monitors (pva2pva `moncache.cpp:142,189`).
+
+### motor
+
+- `DIFF`/`RDIF` re-post on every device-callback pass (C `3764-3767`);
+  `LOAD_POS` leaves `RBV` in the pre-`LOAD_POS` frame (C `3771-3817`).
+
+### std
+
+- `timestamp` posts `VAL` only when the rendered string changes (C
+  `timestampRecord.c:152-163`) and rounds the `%03f` fractional field
+  to the nearest ms; `epid` `VAL` deadband is owned solely by
+  `check_deadband_ext` (C `epidRecord.c:346-374`), and the `OUTL` write
+  is gated on `fbon` with early returns.
+
+### scaler
+
+- The soft driver disarm clears counts unconditionally (C
+  `drvScalerSoft.c:315-329`); `S1..Snch` re-post with `DBE_LOG` on
+  every idle process (C `scalerRecord.c:770-787`).
+
+### optics (synApps)
+
+- `orient`: the Mode constraint mapping matches the C menu order
+  (`orient.h 27-29`), and a singular A0/OMTX recalc publishes identity,
+  not a stale matrix.
+- `kohzu`/`ml-mono`: implements the E/lambda/theta tweak (inc/dec)
+  buttons, writes the forbidden-reflection Alert flag from
+  `calc2dSpacing`, reverts setpoints to the prior command on a
+  soft-limit violation; a standalone ml-mono Y move retracks `yOffset`
+  and the Z setpoint.
+- `PF4`: Al/Ti/Glass use the analytic absorption-length fits (not the
+  Chantler table); `filterAl/Ti/Gl` post only when a blade uses that
+  material and the bank is on; `invTrans` posts only when `trans > 0`,
+  via a single emitter.
+- `flexCombinedMotion`: a standard-mode give-up no longer writes
+  `{FM}.VAL`.
+- `QXBPM`: `set_defaults` preserves the calibrated offsets, and
+  `pos:x`/`pos:y` divide unguarded to match C `NaN`/`Inf`.
+
+### Tooling
+
+- New `examples/regression-ioc` end-to-end harness boots a real
+  in-process CA+PVA IOC and pins recurring bug-fix families
+  (v0.15.x–v0.20.x) over the wire (11 tests, `publish = false`).
+- Lockfile: `aes` `0.9.0 -> 0.9.1` (`0.9.0` yanked).
+
 ## v0.20.1 — 2026-06-13
 
 Patch release: two C-parity regression fixes on top of `v0.20.0`. No API

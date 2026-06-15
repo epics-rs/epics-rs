@@ -224,36 +224,35 @@ macro_rules! draw_on_typed_buffer {
                     }
                 }
                 OverlayShape::Rectangle { x, y, width, height } => {
-                    // Border thickness grows inward
-                    let bx = wx.min(*width);
-                    let by = wy.min(*height);
-                    // Top edge
-                    for dy in 0..by {
-                        for dx in 0..*width {
-                            set_pixel(x + dx, y + dy);
+                    // C doOverlayT Rectangle (NDPluginOverlay.cpp:119-145):
+                    // xmax = PositionX + SizeX is INCLUSIVE, so the rectangle is
+                    // SizeX+1 px wide / SizeY+1 tall. Border thickness grows
+                    // inward; xwide/ywide = MIN(Width, Size-1) (raw width, signed
+                    // so a zero size yields an empty border as in C).
+                    let xmin = *x as i64;
+                    let xmax = (*x + *width) as i64;
+                    let ymin = *y as i64;
+                    let ymax = (*y + *height) as i64;
+                    let xwide = (overlay.width_x as i64).min(*width as i64 - 1);
+                    let ywide = (overlay.width_y as i64).min(*height as i64 - 1);
+                    let mut put = |x: i64, y: i64| {
+                        if x >= 0 && y >= 0 {
+                            set_pixel(x as usize, y as usize);
                         }
-                    }
-                    // Bottom edge
-                    for dy in 0..by {
-                        if *height > dy {
-                            for dx in 0..*width {
-                                set_pixel(x + dx, y + height - 1 - dy);
+                    };
+                    for iy in ymin..=ymax {
+                        if iy < ymin + ywide || iy > ymax - ywide {
+                            // Top/bottom border rows: full horizontal span.
+                            for ix in xmin..=xmax {
+                                put(ix, iy);
                             }
-                        }
-                    }
-                    // Left edge (between top and bottom borders)
-                    let inner_start = by;
-                    let inner_end = height.saturating_sub(by);
-                    for dy in inner_start..inner_end {
-                        for t in 0..bx {
-                            set_pixel(x + t, y + dy);
-                        }
-                    }
-                    // Right edge (between top and bottom borders)
-                    for dy in inner_start..inner_end {
-                        for t in 0..bx {
-                            if *width > t {
-                                set_pixel(x + width - 1 - t, y + dy);
+                        } else {
+                            // Interior rows: left and right vertical borders.
+                            for ix in xmin..(xmin + xwide) {
+                                put(ix, iy);
+                            }
+                            for ix in (xmax - xwide + 1)..=xmax {
+                                put(ix, iy);
                             }
                         }
                     }
@@ -872,6 +871,52 @@ mod tests {
             // Inside should still be 0
             assert_eq!(v[2 * 8 + 2], 0);
         }
+    }
+
+    #[test]
+    fn test_adp21_rectangle_inclusive_bounds() {
+        // C Rectangle (NDPluginOverlay.cpp:119-145): xmax = PositionX + SizeX
+        // is inclusive, so a width=4/height=3 rectangle at (1,1) spans
+        // x[1..=5], y[1..=4] — SizeX+1 by SizeY+1 pixels.
+        let arr = NDArray::new(
+            vec![NDDimension::new(10), NDDimension::new(10)],
+            NDDataType::UInt8,
+        );
+        let overlays = vec![OverlayDef {
+            shape: OverlayShape::Rectangle {
+                x: 1,
+                y: 1,
+                width: 4,
+                height: 3,
+            },
+            draw_mode: DrawMode::Set,
+            color: [0, 255, 0],
+            width_x: 1,
+            width_y: 1,
+        }];
+        let out = draw_overlays(&arr, &overlays);
+        let px = |x: usize, y: usize| {
+            if let NDDataBuffer::U8(ref v) = out.data {
+                v[y * 10 + x]
+            } else {
+                0
+            }
+        };
+        // Right edge x=5 (= PositionX+SizeX, inclusive) is now drawn.
+        assert_eq!(
+            px(5, 1),
+            255,
+            "top-right corner x=PositionX+SizeX inclusive"
+        );
+        assert_eq!(px(5, 4), 255, "bottom-right corner");
+        // Bottom edge y=4 (= PositionY+SizeY, inclusive) drawn full width.
+        assert_eq!(px(1, 4), 255);
+        assert_eq!(px(3, 4), 255);
+        // Nothing beyond xmax / ymax.
+        assert_eq!(px(6, 1), 0, "no pixel past PositionX+SizeX");
+        assert_eq!(px(1, 5), 0, "no pixel past PositionY+SizeY");
+        // Interior is hollow.
+        assert_eq!(px(3, 2), 0);
     }
 
     #[test]

@@ -211,6 +211,21 @@ impl Hdf5Layout {
         found
     }
 
+    /// Find the layout `<dataset source="ndattribute" ndattribute="name">`
+    /// declared for the NDAttribute `name`, returning `(parent group full path,
+    /// dataset name)`. C `find_dset_ndattr` (NDFileHDF5.cpp:2792) routes a
+    /// matching NDAttribute into its XML-declared dataset/group instead of the
+    /// default attribute group.
+    pub fn ndattribute_dataset(&self, name: &str) -> Option<(String, String)> {
+        let mut found = None;
+        self.for_each_dataset(|path, d| {
+            if found.is_none() && d.source == LayoutSource::NdAttribute && d.ndattribute == name {
+                found = Some((path.to_string(), d.name.clone()));
+            }
+        });
+        found
+    }
+
     /// Find the group flagged `ndattr_default`, returning its full path.
     pub fn ndattr_default_group(&self) -> Option<String> {
         fn recurse(g: &LayoutGroup, path: &str) -> Option<String> {

@@ -1673,22 +1673,34 @@ impl Hdf5Writer {
         }
         let chunk_depth = self.attribute_chunking();
         let ndattr_group = self.resolved_ndattr_group.clone();
+        // Route each attribute to its XML-declared `<dataset source="ndattribute">`
+        // parent group + dataset name (C `find_dset_ndattr`, NDFileHDF5.cpp:2792),
+        // falling back to the default ndattr group keyed by the raw attribute name.
+        let targets: Vec<(String, String)> = self
+            .attr_datasets
+            .iter()
+            .map(|ad| {
+                match self
+                    .layout
+                    .as_ref()
+                    .and_then(|l| l.ndattribute_dataset(&ad.name))
+                {
+                    Some((g, name)) => (g.trim_start_matches('/').to_string(), name),
+                    None => (ndattr_group.clone(), ad.name.clone()),
+                }
+            })
+            .collect();
         let h5file = match self.handle {
             Some(Hdf5Handle::Standard { ref file, .. }) => file,
             _ => return Ok(()),
         };
-        // With a valid layout the `ndattr_default` group was already created
-        // by `build_layout_groups`; re-open it. Without a layout, fall back
-        // to a flat `NDAttributes` group at the file root.
-        let group = if ndattr_group.is_empty() {
-            h5file
-                .create_group("NDAttributes")
-                .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 group error: {}", e)))?
-        } else {
-            Self::open_write_group(h5file, &ndattr_group)?
-        };
+        // Group handles, cached by path. A non-empty path is a layout group
+        // already created by `build_layout_groups` (re-open it); an empty path
+        // is the flat `NDAttributes` fallback (no layout) created at the root.
+        let mut group_cache: std::collections::HashMap<String, rust_hdf5::H5Group> =
+            std::collections::HashMap::new();
 
-        for ad in self.attr_datasets.iter() {
+        for (ad, (group_path, ds_name)) in self.attr_datasets.iter().zip(targets.iter()) {
             if ad.frames == 0 {
                 continue;
             }
@@ -1698,6 +1710,18 @@ impl Hdf5Writer {
             // the current extent (`calculateAttributeChunking` → numCapture).
             let chunk = chunk_depth;
 
+            if !group_cache.contains_key(group_path) {
+                let g = if group_path.is_empty() {
+                    h5file.create_group("NDAttributes").map_err(|e| {
+                        ADError::UnsupportedConversion(format!("HDF5 group error: {}", e))
+                    })?
+                } else {
+                    Self::open_write_group(h5file, group_path)?
+                };
+                group_cache.insert(group_path.clone(), g);
+            }
+            let group = &group_cache[group_path];
+
             macro_rules! create_attr_ds {
                 ($t:ty) => {{
                     let es = std::mem::size_of::<$t>();
@@ -1706,7 +1730,7 @@ impl Hdf5Writer {
                         .shape(&[n])
                         .chunk(&[chunk])
                         .max_shape(&[None])
-                        .create(&ad.name)
+                        .create(ds_name)
                         .map_err(|e| {
                             ADError::UnsupportedConversion(format!(
                                 "HDF5 attribute dataset error: {}",
@@ -3116,8 +3140,10 @@ mod tests {
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
+        // The default layout declares ColorMode as a `<dataset source="ndattribute">`
+        // in the detector subgroup, so it is routed there, not the default group.
         let ds = h5
-            .dataset("entry/instrument/NDAttributes/ColorMode")
+            .dataset("entry/instrument/detector/NDAttributes/ColorMode")
             .unwrap();
         // Rank-1 [2] of a 256-byte fixed-length string element, not [2,256] u8.
         assert_eq!(ds.shape(), vec![2]);
@@ -3133,6 +3159,50 @@ mod tests {
         };
         assert_eq!(decode(&frames[0]), "Mono");
         assert_eq!(decode(&frames[1]), "RGB1");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_ndattribute_dataset_routed_to_declared_group() {
+        // C `find_dset_ndattr` (NDFileHDF5.cpp:2792) places an NDAttribute that
+        // matches a `<dataset source="ndattribute">` declaration into that
+        // dataset's parent group; the default layout declares ColorMode in the
+        // detector subgroup. An NDAttribute with no declaration falls back to
+        // the `ndattr_default` group. Verify both in a single file.
+        let path = temp_path("hdf5_attr_route");
+        let mut writer = Hdf5Writer::new();
+
+        let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        arr.attributes.add(NDAttribute::new_static(
+            "ColorMode",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::String("Mono".to_string()),
+        ));
+        arr.attributes.add(NDAttribute::new_static(
+            "count",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(7),
+        ));
+
+        writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        // Declared → routed into the detector subgroup.
+        assert!(
+            h5.dataset("entry/instrument/detector/NDAttributes/ColorMode")
+                .is_ok()
+        );
+        // Undeclared → default ndattr group.
+        assert!(h5.dataset("entry/instrument/NDAttributes/count").is_ok());
+        // ColorMode must NOT also appear in the default group.
+        assert!(
+            h5.dataset("entry/instrument/NDAttributes/ColorMode")
+                .is_err()
+        );
         std::fs::remove_file(&path).ok();
     }
 

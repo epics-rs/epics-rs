@@ -17,6 +17,51 @@ const THRESHOLD_SIZE_RATIO: f64 = 1.5;
 /// NDArrayPool.cpp:352 checks `pArray->pNDArrayPool == this`).
 static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Accumulator for `convert`'s binning sum. C `convertDim`
+/// (NDArrayPool.cpp:465) does `*pDOut += (dataTypeOut)*pDIn` — each source
+/// element is cast to the OUTPUT type and summed in the OUTPUT type, with
+/// C integer arithmetic wrapping on overflow. The Rust port reproduces
+/// that by accumulating in the *target* type's arithmetic, then casting the
+/// accumulator to the target element type:
+///
+/// * Integer targets accumulate in `i128` — wide enough that the running
+///   sum of any realistic bin window of 8/16/32/64-bit source elements
+///   never itself overflows — and the final `as`-cast to the narrower
+///   target reduces modulo 2^width, identical to C's per-step wrapping by
+///   the ring homomorphism `Z -> Z/2^width`. (This also avoids the old
+///   f64 accumulator's precision loss for |value| > 2^53, which corrupted
+///   i64/u64 arrays even at binning == 1.)
+/// * Float targets accumulate in the target float type (`f32`/`f64`)
+///   exactly as C does, so the same rounding / precision applies.
+trait BinAcc: Copy {
+    const ZERO: Self;
+    fn bin_add(self, rhs: Self) -> Self;
+}
+
+impl BinAcc for i128 {
+    const ZERO: Self = 0;
+    #[inline]
+    fn bin_add(self, rhs: Self) -> Self {
+        self.wrapping_add(rhs)
+    }
+}
+
+impl BinAcc for f32 {
+    const ZERO: Self = 0.0;
+    #[inline]
+    fn bin_add(self, rhs: Self) -> Self {
+        self + rhs
+    }
+}
+
+impl BinAcc for f64 {
+    const ZERO: Self = 0.0;
+    #[inline]
+    fn bin_add(self, rhs: Self) -> Self {
+        self + rhs
+    }
+}
+
 /// NDArray factory with free-list reuse and memory tracking.
 ///
 /// Mimics C++ ADCore's NDArrayPool: on alloc, checks the free list for a
@@ -456,8 +501,6 @@ impl NDArrayPool {
             out_sizes.push(out_size);
         }
 
-        let src_type = src.data.data_type();
-
         // Build output dimension metadata.
         // C++ NDArrayPool.cpp:719-724 makes `reverse` cumulative:
         //   if (pIn->dims[i].reverse) pOut->dims[i].reverse = !pOut->dims[i].reverse;
@@ -487,10 +530,16 @@ impl NDArrayPool {
             out_strides[i] = out_strides[i - 1] * out_sizes[i - 1];
         }
 
-        // Macro to handle binning/offset/reverse for a specific typed buffer
-        macro_rules! convert_buf {
-            ($src_vec:expr, $T:ty, $zero:expr, $variant:ident) => {{
-                let mut out = vec![$zero; total_out];
+        // Macro: bin/offset/reverse a single (source -> target) type pair,
+        // accumulating directly in the TARGET type to match C `convertDim`
+        // (NDArrayPool.cpp:434-471), which sums `(dataTypeOut)*pDIn` in the
+        // output type. `$AccT` is the accumulator (`i128` for integer
+        // targets, the target float type otherwise — see [`BinAcc`]);
+        // `$DstT` / `$variant` are the target element type and its
+        // `NDDataBuffer` variant.
+        macro_rules! bin_loop {
+            ($src_vec:expr, $DstT:ty, $AccT:ty, $variant:ident) => {{
+                let mut out = vec![0 as $DstT; total_out];
 
                 // Iterate over all output pixels
                 for out_idx in 0..total_out {
@@ -512,8 +561,8 @@ impl NDArrayPool {
                         };
                     }
 
-                    // Sum over binning window
-                    let mut sum = 0.0f64;
+                    // Sum over the binning window in the TARGET type.
+                    let mut acc = <$AccT as BinAcc>::ZERO;
                     let bin_total: usize = dims_out.iter().map(|d| d.binning.max(1)).product();
 
                     // Iterate over all bin offsets
@@ -536,28 +585,50 @@ impl NDArrayPool {
                         }
 
                         if valid {
-                            sum += $src_vec[src_flat] as f64;
+                            // C `(dataTypeOut)*pDIn`: cast the source element
+                            // into the accumulator (target) type, then add.
+                            acc = acc.bin_add($src_vec[src_flat] as $AccT);
                         }
                     }
 
-                    out[out_idx] = sum as $T;
+                    out[out_idx] = acc as $DstT;
                 }
 
                 NDDataBuffer::$variant(out)
             }};
         }
 
+        // For a given typed source buffer, dispatch on the target type.
+        // Integer targets accumulate in `i128`; float targets in their own
+        // float type, matching C `convertDim`'s output-typed accumulator.
+        macro_rules! bin_to_target {
+            ($src_vec:expr) => {
+                match target_type {
+                    NDDataType::Int8 => bin_loop!($src_vec, i8, i128, I8),
+                    NDDataType::UInt8 => bin_loop!($src_vec, u8, i128, U8),
+                    NDDataType::Int16 => bin_loop!($src_vec, i16, i128, I16),
+                    NDDataType::UInt16 => bin_loop!($src_vec, u16, i128, U16),
+                    NDDataType::Int32 => bin_loop!($src_vec, i32, i128, I32),
+                    NDDataType::UInt32 => bin_loop!($src_vec, u32, i128, U32),
+                    NDDataType::Int64 => bin_loop!($src_vec, i64, i128, I64),
+                    NDDataType::UInt64 => bin_loop!($src_vec, u64, i128, U64),
+                    NDDataType::Float32 => bin_loop!($src_vec, f32, f32, F32),
+                    NDDataType::Float64 => bin_loop!($src_vec, f64, f64, F64),
+                }
+            };
+        }
+
         let out_data = match &src.data {
-            NDDataBuffer::I8(v) => convert_buf!(v, i8, 0i8, I8),
-            NDDataBuffer::U8(v) => convert_buf!(v, u8, 0u8, U8),
-            NDDataBuffer::I16(v) => convert_buf!(v, i16, 0i16, I16),
-            NDDataBuffer::U16(v) => convert_buf!(v, u16, 0u16, U16),
-            NDDataBuffer::I32(v) => convert_buf!(v, i32, 0i32, I32),
-            NDDataBuffer::U32(v) => convert_buf!(v, u32, 0u32, U32),
-            NDDataBuffer::I64(v) => convert_buf!(v, i64, 0i64, I64),
-            NDDataBuffer::U64(v) => convert_buf!(v, u64, 0u64, U64),
-            NDDataBuffer::F32(v) => convert_buf!(v, f32, 0.0f32, F32),
-            NDDataBuffer::F64(v) => convert_buf!(v, f64, 0.0f64, F64),
+            NDDataBuffer::I8(v) => bin_to_target!(v),
+            NDDataBuffer::U8(v) => bin_to_target!(v),
+            NDDataBuffer::I16(v) => bin_to_target!(v),
+            NDDataBuffer::U16(v) => bin_to_target!(v),
+            NDDataBuffer::I32(v) => bin_to_target!(v),
+            NDDataBuffer::U32(v) => bin_to_target!(v),
+            NDDataBuffer::I64(v) => bin_to_target!(v),
+            NDDataBuffer::U64(v) => bin_to_target!(v),
+            NDDataBuffer::F32(v) => bin_to_target!(v),
+            NDDataBuffer::F64(v) => bin_to_target!(v),
         };
 
         // Allocate the output array THROUGH the pool so it counts against
@@ -568,17 +639,10 @@ impl NDArrayPool {
         arr.time_stamp = src.time_stamp;
         arr.attributes.copy_from(&src.attributes);
 
-        // `out_data` holds the binned result in the SOURCE type. If the target
-        // type differs, convert; otherwise install it directly.
-        if target_type != src_type {
-            let staging = NDArray::new(arr.dims.clone(), src_type);
-            let mut staging = staging;
-            staging.data = out_data;
-            let converted = crate::color::convert_data_type(&staging, target_type)?;
-            arr.data = converted.data;
-        } else {
-            arr.data = out_data;
-        }
+        // `out_data` already holds the binned result in the TARGET type
+        // (C `convertDim` sums in the output type), so install it directly —
+        // no separate, lossy source-typed staging + conversion step.
+        arr.data = out_data;
 
         Ok(arr)
     }
@@ -1009,6 +1073,121 @@ mod tests {
         // Verify cumulative binning
         assert_eq!(out.dims[0].binning, 2); // src binning 1 * dims_out binning 2
         assert_eq!(out.dims[1].binning, 2);
+    }
+
+    // Build a 2x2 array of `data_type` with every element set to `val`
+    // (`val` is `as`-cast to the element type).
+    fn make_2x2_filled(data_type: NDDataType, val: i128) -> NDArray {
+        let mut src = NDArray::new(vec![NDDimension::new(2), NDDimension::new(2)], data_type);
+        macro_rules! fill {
+            ($variant:ident, $t:ty) => {
+                if let NDDataBuffer::$variant(ref mut v) = src.data {
+                    for e in v.iter_mut() {
+                        *e = val as $t;
+                    }
+                }
+            };
+        }
+        match data_type {
+            NDDataType::Int8 => fill!(I8, i8),
+            NDDataType::UInt8 => fill!(U8, u8),
+            NDDataType::Int16 => fill!(I16, i16),
+            NDDataType::UInt16 => fill!(U16, u16),
+            NDDataType::Int32 => fill!(I32, i32),
+            NDDataType::UInt32 => fill!(U32, u32),
+            NDDataType::Int64 => fill!(I64, i64),
+            NDDataType::UInt64 => fill!(U64, u64),
+            NDDataType::Float32 => fill!(F32, f32),
+            NDDataType::Float64 => fill!(F64, f64),
+        }
+        src
+    }
+
+    fn bin_2x2_to_one() -> Vec<NDDimension> {
+        // 2x2 -> 1x1, summing the whole 2x2 window.
+        vec![
+            NDDimension {
+                size: 2,
+                offset: 0,
+                binning: 2,
+                reverse: false,
+            },
+            NDDimension {
+                size: 2,
+                offset: 0,
+                binning: 2,
+                reverse: false,
+            },
+        ]
+    }
+
+    /// ADC-8 case (b) — widening target. C `convertDim` sums in the
+    /// OUTPUT type: four u8 200s binned into a u16 give 800. The old f64
+    /// accumulator cast the sum to the SOURCE type first (200*4=800 -> u8
+    /// saturates to 255 -> widen to 255), losing the high bits.
+    #[test]
+    fn test_convert_binning_widening_target_keeps_full_sum() {
+        let pool = NDArrayPool::new(1_000_000);
+        let src = make_2x2_filled(NDDataType::UInt8, 200);
+        let out = pool
+            .convert(&src, &bin_2x2_to_one(), NDDataType::UInt16)
+            .unwrap();
+        match out.data {
+            NDDataBuffer::U16(ref v) => assert_eq!(v[0], 800, "C sums in u16: 200*4"),
+            ref other => panic!("expected U16, got {:?}", other.data_type()),
+        }
+    }
+
+    /// ADC-8 case (a) — integer overflow wraps, it does not saturate. C
+    /// accumulates in the u8 output type, so four 100s = 400 wrap to
+    /// 400 % 256 = 144. The old f64 accumulator saturated to 255.
+    #[test]
+    fn test_convert_binning_integer_overflow_wraps() {
+        let pool = NDArrayPool::new(1_000_000);
+        let src = make_2x2_filled(NDDataType::UInt8, 100);
+        let out = pool
+            .convert(&src, &bin_2x2_to_one(), NDDataType::UInt8)
+            .unwrap();
+        match out.data {
+            NDDataBuffer::U8(ref v) => assert_eq!(v[0], 144, "400 wraps mod 256 in u8"),
+            ref other => panic!("expected U8, got {:?}", other.data_type()),
+        }
+    }
+
+    /// ADC-8 case (c) — i64 magnitudes above 2^53 survive. At binning == 1
+    /// (the wired ROI path) C copies `(i64)*pDIn` exactly. The old f64
+    /// accumulator round-tripped through f64 and dropped the low bit of
+    /// 2^53 + 1 even when source and target type are identical.
+    #[test]
+    fn test_convert_binning1_int64_above_2pow53_exact() {
+        let pool = NDArrayPool::new(1_000_000);
+        let value: i64 = (1i64 << 53) + 1;
+        let mut src = NDArray::new(
+            vec![NDDimension::new(1), NDDimension::new(1)],
+            NDDataType::Int64,
+        );
+        if let NDDataBuffer::I64(ref mut v) = src.data {
+            v[0] = value;
+        }
+        let dims_out = vec![
+            NDDimension {
+                size: 1,
+                offset: 0,
+                binning: 1,
+                reverse: false,
+            },
+            NDDimension {
+                size: 1,
+                offset: 0,
+                binning: 1,
+                reverse: false,
+            },
+        ];
+        let out = pool.convert(&src, &dims_out, NDDataType::Int64).unwrap();
+        match out.data {
+            NDDataBuffer::I64(ref v) => assert_eq!(v[0], value, "2^53+1 kept exactly"),
+            ref other => panic!("expected I64, got {:?}", other.data_type()),
+        }
     }
 
     #[test]

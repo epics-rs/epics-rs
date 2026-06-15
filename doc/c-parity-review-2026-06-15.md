@@ -907,13 +907,13 @@ C: `NDPosPlugin.cpp:161` `NDAttrFloat64` with a `double`.
 Impact: None — both emit NDAttrFloat64, so the attribute type matches. The header comment (`NDPosPlugin.h:9`) says "1D integer valued attribute" but the C code attaches Float64; Rust matches the code. Listed for completeness.
 
 #### ADP-40: NDPluginCircularBuff CIRC_BUFF_STATUS is an Octet string in C, Int32 in Rust
-Severity: Medium — fix
+Severity: Medium — fix — **FIXED d26eec7f**
 Rust: `circular_buff.rs:394-401` maps status enum to int32 `0..3`; `CIRC_BUFF_STATUS` registered as `ParamType::Int32`; no "Dropping frames"/"Buffer Wrapping" string states.
 C: `NDPluginCircularBuff.h:12` `CIRC_BUFF_STATUS` is **asynOctet**, set to `"Idle"`, `"Buffer filling"`, `"Buffer Wrapping"`, `"Dropping frames"`, `"Flushing"`, `"Acquisition Completed"`, `"Acquisition Stopped"`, `"Stop acquisition to set pre-count"`, `"Pre-count too high"`, `"Invalid pre-count value"` (`NDPluginCircularBuff.cpp:153-260`).
 Impact: The DBR type of `CIRC_BUFF_STATUS` differs (Octet vs Int32) and the status text a client reads is entirely different — a wire/param-type divergence, not just internal representation.
 
 #### ADP-41: NDPluginCircularBuff TriggerAVal/TriggerBVal/TriggerCalcVal float params never posted
-Severity: High — fix
+Severity: High — fix — **FIXED 3792f90c**
 Rust: `circular_buff.rs:393-414` posts only status, current_image, triggered, actual_trigger_count; the Calc branch (`circular_buff.rs:199-224`) computes `a`, `b`, `expression.evaluate_vars` but never writes `trigger_a_val`, `trigger_b_val`, `trigger_calc_val`.
 C: `NDPluginCircularBuff.cpp:67-78` `setDoubleParam(NDCircBuffTriggerAVal, args[0])`, `…TriggerBVal, args[1])`, `…TriggerCalcVal, calcResult)` on every frame's trigger calc.
 Impact: Clients reading `CIRC_BUFF_TRIGGER_A_VAL`/`_B_VAL`/`_CALC_VAL` (asynFloat64) see live values in C; in Rust these registered Float64 params always remain at default 0.0.
@@ -925,16 +925,17 @@ C: `NDPluginCircularBuff.cpp:43-77` args default to `epicsNAN`; trigger fires on
 Impact: When the calc result is NaN/Inf (e.g. expression `A` with A absent), C does **not** trigger; Rust's `!= 0.0` is true for NaN, so Rust fires a spurious trigger (pre-buffer flush + post frames) where C does not.
 
 #### ADP-43: NDPluginCircularBuff currentImage not reset to 0 on stop
-Severity: Low — fix-low
+Severity: Low — fix-low — **FIXED 732f55bc**
 Rust: `circular_buff.rs:489-491` on Control==0 sets `status = Idle` but does not zero the reported current-image count until the next reset.
 C: `NDPluginCircularBuff.cpp:259` writeInt32(Control off) `setIntegerParam(NDCircBuffCurrentImage, 0)`.
 Impact: After stopping, a client reading `CIRC_BUFF_CURRENT_IMAGE` reads 0 in C; in Rust the stop path leaves the last value posted until the next frame.
 
 #### ADP-44: NDPluginCircularBuff pre-count validation status outputs not produced
-Severity: Low — fix-low
+Severity: Low — fix-low — **PARTIAL 9f8666c6** (running + negative rejects done; maxBuffers "Pre-count too high" deferred)
 Rust: `circular_buff.rs:492-493` on pre_trigger change just clamps to `>=0` and stores; no rejection, no status feedback, no `maxBuffers-1` ceiling.
 C: `NDPluginCircularBuff.cpp:280-292` rejects pre-count when running ("Stop acquisition to set pre-count"), when `> maxBuffers_-1` ("Pre-count too high"), when `<0` ("Invalid pre-count value"), and only then commits.
 Impact: Setting an out-of-range/in-flight pre-count: C refuses the update and posts an explanatory `CIRC_BUFF_STATUS` string; Rust silently accepts the clamped value. The observable PRE_TRIGGER readback and STATUS differ.
+DEFERRED: the "Pre-count too high" (> maxBuffers_-1) check is not implemented — the Rust CircularBuff processor carries no maxBuffers bound (the NDArrayPool buffer cap is not plumbed into it), and C's own check is degenerate at the common maxBuffers=-1 (unlimited) config. The running-reject and negative-reject (with status string + param revert) and the accept path are done.
 
 #### ADP-45: NDPluginScatter overflow-reroute / nextClient wrap semantics not reproduced
 Severity: Medium — verify

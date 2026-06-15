@@ -558,9 +558,8 @@ pub async fn run(
     let (mut two_d, forbidden, msg) = calc_2d_spacing(a, h, k, l);
     let _ = ch_d.put_f64(two_d).await;
     let _ = ch_seq_msg1.put_string(msg).await;
-    if forbidden {
-        let _ = ch_alert.put_i16(1).await;
-    }
+    // C calc2dSpacing sets opAlert from the forbidden-reflection check (1/0).
+    let _ = ch_alert.put_i16(forbidden as i16).await;
 
     // Read motor limits and compute theta/energy limits
     let mut theta_mot_hi = ch_theta_mot_hilim.get_f64().await;
@@ -798,10 +797,14 @@ pub async fn run(
             }
         } else if changed_pv == pv_h {
             h = ch_h.get_f64().await;
-            let (d, _forb, msg) = calc_2d_spacing(a, h, k, l);
+            let (d, forbidden, msg) = calc_2d_spacing(a, h, k, l);
             two_d = d;
             let _ = ch_d.put_f64(two_d).await;
             let _ = ch_seq_msg1.put_string(msg).await;
+            // C kohzuCtl_calc2dSpacing (kohzuCtl.st:1410-1421) sets opAlert from the
+            // (H,K,L) parity check and dInputChanged pvPuts it (kohzuCtl.st:817):
+            // forbidden -> 1, valid -> 0 (cleared on return to a valid reflection).
+            let _ = ch_alert.put_i16(forbidden as i16).await;
             auto_mode = false;
             let _ = ch_auto_mode.put_i16(0).await;
             let _ = ch_seq_msg2.put_string("Set to Manual Mode").await;
@@ -812,10 +815,14 @@ pub async fn run(
             let _ = ch_lambda_lo.put_f64(ll).await;
         } else if changed_pv == pv_k {
             k = ch_k.get_f64().await;
-            let (d, _forb, msg) = calc_2d_spacing(a, h, k, l);
+            let (d, forbidden, msg) = calc_2d_spacing(a, h, k, l);
             two_d = d;
             let _ = ch_d.put_f64(two_d).await;
             let _ = ch_seq_msg1.put_string(msg).await;
+            // C kohzuCtl_calc2dSpacing (kohzuCtl.st:1410-1421) sets opAlert from the
+            // (H,K,L) parity check and dInputChanged pvPuts it (kohzuCtl.st:817):
+            // forbidden -> 1, valid -> 0 (cleared on return to a valid reflection).
+            let _ = ch_alert.put_i16(forbidden as i16).await;
             auto_mode = false;
             let _ = ch_auto_mode.put_i16(0).await;
             let _ = ch_seq_msg2.put_string("Set to Manual Mode").await;
@@ -826,10 +833,14 @@ pub async fn run(
             let _ = ch_lambda_lo.put_f64(ll).await;
         } else if changed_pv == pv_l {
             l = ch_l.get_f64().await;
-            let (d, _forb, msg) = calc_2d_spacing(a, h, k, l);
+            let (d, forbidden, msg) = calc_2d_spacing(a, h, k, l);
             two_d = d;
             let _ = ch_d.put_f64(two_d).await;
             let _ = ch_seq_msg1.put_string(msg).await;
+            // C kohzuCtl_calc2dSpacing (kohzuCtl.st:1410-1421) sets opAlert from the
+            // (H,K,L) parity check and dInputChanged pvPuts it (kohzuCtl.st:817):
+            // forbidden -> 1, valid -> 0 (cleared on return to a valid reflection).
+            let _ = ch_alert.put_i16(forbidden as i16).await;
             auto_mode = false;
             let _ = ch_auto_mode.put_i16(0).await;
             let _ = ch_seq_msg2.put_string("Set to Manual Mode").await;
@@ -840,10 +851,14 @@ pub async fn run(
             let _ = ch_lambda_lo.put_f64(ll).await;
         } else if changed_pv == pv_a {
             a = ch_a.get_f64().await;
-            let (d, _forb, msg) = calc_2d_spacing(a, h, k, l);
+            let (d, forbidden, msg) = calc_2d_spacing(a, h, k, l);
             two_d = d;
             let _ = ch_d.put_f64(two_d).await;
             let _ = ch_seq_msg1.put_string(msg).await;
+            // C kohzuCtl_calc2dSpacing (kohzuCtl.st:1410-1421) sets opAlert from the
+            // (H,K,L) parity check and dInputChanged pvPuts it (kohzuCtl.st:817):
+            // forbidden -> 1, valid -> 0 (cleared on return to a valid reflection).
+            let _ = ch_alert.put_i16(forbidden as i16).await;
             auto_mode = false;
             let _ = ch_auto_mode.put_i16(0).await;
             let _ = ch_seq_msg2.put_string("Set to Manual Mode").await;

@@ -418,9 +418,8 @@ pub async fn run(
     let mut d_val = ch_d.get_f64().await;
     let (mut two_d, err, msg) = calc_2d_spacing(d_val, order_val);
     let _ = ch_msg1.put_string(msg).await;
-    if err {
-        let _ = ch_alert.put_i16(1).await;
-    }
+    // C calc2dSpacing sets opAlert from the Order<1 check (1/0).
+    let _ = ch_alert.put_i16(err as i16).await;
 
     // Theta limits
     let mut theta_mot_hi = ch_theta_mot_hilim.get_f64().await;
@@ -613,9 +612,10 @@ pub async fn run(
             let (td, err, msg) = calc_2d_spacing(d_val, order_val);
             two_d = td;
             let _ = ch_msg1.put_string(msg).await;
-            if err {
-                let _ = ch_alert.put_i16(1).await;
-            }
+            // C ml_monoCtl_calc2dSpacing (ml_monoCtl.st:1321-1322) sets opAlert
+            // from the Order<1 check and dInputChanged pvPuts it
+            // (ml_monoCtl.st:792): bad Order -> 1, valid -> 0 (cleared on return).
+            let _ = ch_alert.put_i16(err as i16).await;
             auto_mode = false;
             let _ = ch_auto_mode.put_i16(0).await;
             let _ = ch_msg2.put_string("Set to Manual Mode").await;
@@ -629,9 +629,10 @@ pub async fn run(
             let (td, err, msg) = calc_2d_spacing(d_val, order_val);
             two_d = td;
             let _ = ch_msg1.put_string(msg).await;
-            if err {
-                let _ = ch_alert.put_i16(1).await;
-            }
+            // C ml_monoCtl_calc2dSpacing (ml_monoCtl.st:1321-1322) sets opAlert
+            // from the Order<1 check and dInputChanged pvPuts it
+            // (ml_monoCtl.st:792): bad Order -> 1, valid -> 0 (cleared on return).
+            let _ = ch_alert.put_i16(err as i16).await;
             auto_mode = false;
             let _ = ch_auto_mode.put_i16(0).await;
             let _ = ch_msg2.put_string("Set to Manual Mode").await;

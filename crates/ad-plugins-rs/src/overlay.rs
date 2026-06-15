@@ -401,7 +401,7 @@ const MAX_OVERLAYS: usize = 8;
 #[derive(Debug, Clone)]
 struct OverlaySlot {
     use_overlay: bool,
-    shape: i32,     // 0=Cross, 1=Rectangle, 2=Ellipse, 3=Text
+    shape: i32,     // C NDOverlayShape_t: 0=Cross, 1=Rectangle, 2=Text, 3=Ellipse
     draw_mode: i32, // 0=Set, 1=XOR
     position_x: usize,
     position_y: usize,
@@ -475,13 +475,9 @@ impl OverlaySlot {
                 width: self.size_x,
                 height: self.size_y,
             },
-            2 => OverlayShape::Ellipse {
-                center_x: self.position_x + self.size_x / 2,
-                center_y: self.position_y + self.size_y / 2,
-                rx: self.size_x / 2,
-                ry: self.size_y / 2,
-            },
-            3 => OverlayShape::Text {
+            // C `NDOverlayShape_t` enum (NDPluginOverlay.h:8-13):
+            // Cross=0, Rectangle=1, Text=2, Ellipse=3.
+            2 => OverlayShape::Text {
                 x: self.position_x,
                 y: self.position_y,
                 size_x: self.size_x,
@@ -489,6 +485,12 @@ impl OverlaySlot {
                 text: self.display_text.clone(),
                 font: self.font,
                 timestamp_format: self.timestamp_format.clone(),
+            },
+            3 => OverlayShape::Ellipse {
+                center_x: self.position_x + self.size_x / 2,
+                center_y: self.position_y + self.size_y / 2,
+                rx: self.size_x / 2,
+                ry: self.size_y / 2,
             },
             _ => OverlayShape::Rectangle {
                 x: self.position_x,
@@ -577,7 +579,7 @@ impl OverlayProcessor {
                     rx,
                     ry,
                 } => {
-                    slot.shape = 2;
+                    slot.shape = 3;
                     slot.position_x = center_x.saturating_sub(rx);
                     slot.position_y = center_y.saturating_sub(ry);
                     slot.size_x = rx * 2;
@@ -592,7 +594,7 @@ impl OverlayProcessor {
                     font,
                     timestamp_format,
                 } => {
-                    slot.shape = 3;
+                    slot.shape = 2;
                     slot.position_x = x;
                     slot.position_y = y;
                     slot.size_x = size_x;
@@ -797,6 +799,42 @@ mod tests {
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt8,
         )
+    }
+
+    #[test]
+    fn test_adp10_shape_ordinals_match_c_enum() {
+        // C NDOverlayShape_t (NDPluginOverlay.h:8-13): Cross=0, Rectangle=1,
+        // Text=2, Ellipse=3. The 2/3 ordinals must not be swapped.
+        let mut slot = OverlaySlot {
+            use_overlay: true,
+            ..Default::default()
+        };
+        slot.shape = 0;
+        assert!(matches!(
+            slot.to_overlay_def().map(|d| d.shape),
+            Some(OverlayShape::Cross { .. })
+        ));
+        slot.shape = 1;
+        assert!(matches!(
+            slot.to_overlay_def().map(|d| d.shape),
+            Some(OverlayShape::Rectangle { .. })
+        ));
+        slot.shape = 2;
+        assert!(
+            matches!(
+                slot.to_overlay_def().map(|d| d.shape),
+                Some(OverlayShape::Text { .. })
+            ),
+            "OVERLAY_SHAPE=2 must draw Text (C NDOverlayText)"
+        );
+        slot.shape = 3;
+        assert!(
+            matches!(
+                slot.to_overlay_def().map(|d| d.shape),
+                Some(OverlayShape::Ellipse { .. })
+            ),
+            "OVERLAY_SHAPE=3 must draw Ellipse (C NDOverlayEllipse)"
+        );
     }
 
     #[test]

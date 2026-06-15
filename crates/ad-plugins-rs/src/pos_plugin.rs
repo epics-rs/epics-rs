@@ -56,19 +56,27 @@ impl PosPluginProcessor {
         Ok(count)
     }
 
-    /// Load positions from an XML string (C++ NDPosPlugin format).
+    /// Load positions from an XML string (C++ NDPosPlugin `pos_layout` format).
     ///
-    /// Expected XML format:
+    /// Expected XML format (matching `NDPosPluginFileReader`):
     /// ```xml
-    /// <positions>
-    ///   <position index="0">value1</position>
-    ///   <position index="1">value2</position>
-    /// </positions>
+    /// <pos_layout>
+    ///   <dimensions>
+    ///     <dimension name="x"/>
+    ///     <dimension name="y"/>
+    ///   </dimensions>
+    ///   <positions>
+    ///     <position x="1" y="2"/>
+    ///     <position x="3" y="4"/>
+    ///   </positions>
+    /// </pos_layout>
     /// ```
     ///
-    /// Each `<position>` element becomes a single-entry HashMap with key "position"
-    /// mapped to the parsed f64 value. If the value cannot be parsed as f64,
-    /// the position is skipped.
+    /// Each `<dimension name="N"/>` declares an ordered dimension; each
+    /// `<position .../>` carries one attribute per dimension, and the attribute
+    /// value (parsed as f64) is stored under the dimension name. A position
+    /// missing any declared dimension's attribute is rejected (matching C
+    /// `addPosition` returning `asynError`).
     pub fn load_positions_xml(&mut self, xml_str: &str) -> Result<usize, String> {
         let positions = parse_positions_xml(xml_str)?;
         let count = positions.len();
@@ -158,107 +166,138 @@ impl PosPluginProcessor {
     }
 }
 
-/// Parse positions from the C++ NDPosPlugin XML format.
+/// Parse positions from the C++ NDPosPlugin `pos_layout` XML format.
 ///
-/// Handles the simple format:
-/// ```xml
-/// <positions>
-///   <position index="0">123.45</position>
-///   <position index="1">678.90</position>
-/// </positions>
-/// ```
+/// Mirrors `NDPosPluginFileReader`: ordered dimension names are collected from
+/// `<dimension name="N"/>` elements, then each `<position .../>` element is read
+/// for one attribute per declared dimension, building a `map<dimension, value>`.
+/// A position missing any declared dimension's attribute — or whose attribute
+/// value does not parse as f64 — is rejected entirely (C `addPosition` returns
+/// `asynError` and does not push that position).
 ///
-/// This is a minimal hand-written parser for this trivial XML format,
-/// avoiding the need for an external XML crate dependency.
-/// Check if a character can follow `<position` in a valid opening tag.
-/// Valid: whitespace (attributes), '>' (end of tag), '/' (self-closing).
-/// Invalid: 's' (which would mean `<positions`).
-fn is_position_tag_boundary(c: char) -> bool {
+/// This is a minimal hand-written parser for this trivial XML format, avoiding
+/// the need for an external XML crate dependency.
+fn parse_positions_xml(xml: &str) -> Result<Vec<HashMap<String, f64>>, String> {
+    // Collect ordered dimension names from <dimension name="N"/> elements.
+    let dimensions: Vec<String> = element_tag_contents(xml, "dimension")
+        .into_iter()
+        .filter_map(|content| parse_tag_attributes(content).remove("name"))
+        .collect();
+
+    let mut positions: Vec<HashMap<String, f64>> = Vec::new();
+    for content in element_tag_contents(xml, "position") {
+        let attrs = parse_tag_attributes(content);
+        // C addPosition first requires the element to carry attributes at all.
+        if attrs.is_empty() {
+            continue;
+        }
+        let mut pos = HashMap::new();
+        let mut ok = true;
+        for dim in &dimensions {
+            match attrs.get(dim).and_then(|v| v.parse::<f64>().ok()) {
+                Some(value) => {
+                    pos.insert(dim.clone(), value);
+                }
+                None => {
+                    // Missing or unparseable dimension attribute → reject position.
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            positions.push(pos);
+        }
+    }
+
+    Ok(positions)
+}
+
+/// True if `c` validly terminates the element name in `<name` of an opening tag:
+/// whitespace (attributes follow), '>' (tag end), or '/' (self-closing). Used to
+/// reject the longer-named sibling — e.g. `<positions`/`<dimensions` when
+/// scanning for `<position`/`<dimension`.
+fn is_tag_boundary(c: char) -> bool {
     c.is_ascii_whitespace() || c == '>' || c == '/'
 }
 
-fn parse_positions_xml(xml: &str) -> Result<Vec<HashMap<String, f64>>, String> {
-    let mut positions: Vec<(usize, f64)> = Vec::new();
-    let tag_prefix = "<position";
+/// Collect the attribute-region slice (the text between `<name` and `>`) of
+/// every `<name ...>` opening tag, skipping any longer-named sibling
+/// (`<names ...>`).
+fn element_tag_contents<'a>(xml: &'a str, name: &str) -> Vec<&'a str> {
+    let prefix = format!("<{}", name);
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = xml[from..].find(&prefix) {
+        let open = from + rel;
+        let after = open + prefix.len();
+        match xml[after..].chars().next() {
+            Some(c) if is_tag_boundary(c) => {}
+            _ => {
+                // <names ...> or end of string — not this element.
+                from = after;
+                continue;
+            }
+        }
+        let Some(rel_end) = xml[after..].find('>') else {
+            break;
+        };
+        let end = after + rel_end;
+        out.push(&xml[after..end]);
+        from = end + 1;
+    }
+    out
+}
 
-    // Find all <position ...>value</position> elements
-    let mut search_from = 0;
-    while let Some(rel_start) = xml[search_from..].find(tag_prefix) {
-        let open_start = search_from + rel_start;
-        let after_prefix = open_start + tag_prefix.len();
-
-        // Check that this is actually <position ...> and not <positions> or </positions>
-        if after_prefix >= xml.len() {
+/// Parse `key="value"` / `key='value'` attribute pairs from a tag's
+/// attribute region.
+fn parse_tag_attributes(content: &str) -> HashMap<String, String> {
+    let mut attrs = HashMap::new();
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    while let Some(eq_rel) = content[i..].find('=') {
+        let eq = i + eq_rel;
+        // Key: the identifier immediately preceding '=' (skipping whitespace).
+        let mut k_end = eq;
+        while k_end > i && bytes[k_end - 1].is_ascii_whitespace() {
+            k_end -= 1;
+        }
+        let mut k_start = k_end;
+        while k_start > i
+            && !bytes[k_start - 1].is_ascii_whitespace()
+            && bytes[k_start - 1] != b'/'
+            && bytes[k_start - 1] != b'='
+        {
+            k_start -= 1;
+        }
+        let key = &content[k_start..k_end];
+        // Value: quoted string after '='.
+        let mut j = eq + 1;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() {
             break;
         }
-        let next_char = xml[after_prefix..].chars().next().unwrap_or(' ');
-        if !is_position_tag_boundary(next_char) {
-            // This is <positions> or similar, skip past it
-            search_from = after_prefix;
+        let quote = bytes[j];
+        if quote != b'"' && quote != b'\'' {
+            i = eq + 1;
             continue;
         }
-
-        let tag_end = xml[open_start..]
-            .find('>')
-            .ok_or_else(|| "Malformed XML: unclosed <position tag".to_string())?;
-        let tag_end = open_start + tag_end;
-
-        // Parse index attribute from the opening tag
-        let tag_content = &xml[open_start..tag_end];
-        let index = if let Some(idx_start) = tag_content.find("index=") {
-            let after_eq = &tag_content[idx_start + 6..];
-            // Handle both index="0" and index='0'
-            let quote_char = after_eq.chars().next().unwrap_or('"');
-            if quote_char == '"' || quote_char == '\'' {
-                let inner = &after_eq[1..];
-                let end = inner.find(quote_char).ok_or_else(|| {
-                    "Malformed XML: unclosed quote in index attribute".to_string()
-                })?;
-                inner[..end]
-                    .parse::<usize>()
-                    .map_err(|e| format!("Invalid index value: {}", e))?
-            } else {
-                // No quotes, read digits
-                let end = after_eq
-                    .find(|c: char| !c.is_ascii_digit())
-                    .unwrap_or(after_eq.len());
-                after_eq[..end]
-                    .parse::<usize>()
-                    .map_err(|e| format!("Invalid index value: {}", e))?
-            }
-        } else {
-            // No index attribute, use sequential ordering
-            positions.len()
-        };
-
-        // Extract value between > and </position>
-        let value_start = tag_end + 1;
-        let close_tag = xml[value_start..]
-            .find("</position>")
-            .ok_or_else(|| "Malformed XML: missing </position> closing tag".to_string())?;
-        let value_str = xml[value_start..value_start + close_tag].trim();
-
-        if let Ok(value) = value_str.parse::<f64>() {
-            positions.push((index, value));
+        j += 1;
+        let val_start = j;
+        while j < bytes.len() && bytes[j] != quote {
+            j += 1;
         }
-        // Skip non-numeric values silently
-
-        search_from = value_start + close_tag + "</position>".len();
+        if j >= bytes.len() {
+            break; // unterminated quote
+        }
+        if !key.is_empty() {
+            attrs.insert(key.to_string(), content[val_start..j].to_string());
+        }
+        i = j + 1;
     }
-
-    // Sort by index and build the result
-    positions.sort_by_key(|(idx, _)| *idx);
-
-    let result: Vec<HashMap<String, f64>> = positions
-        .into_iter()
-        .map(|(_, value)| {
-            let mut map = HashMap::new();
-            map.insert("position".into(), value);
-            map
-        })
-        .collect();
-
-    Ok(result)
+    attrs
 }
 
 impl NDPluginProcess for PosPluginProcessor {
@@ -493,59 +532,69 @@ mod tests {
     #[test]
     fn test_load_xml() {
         let mut proc = PosPluginProcessor::new(PosMode::Discard);
-        let xml = r#"<positions>
-  <position index="0">1.5</position>
-  <position index="1">2.3</position>
-  <position index="2">3.7</position>
-</positions>"#;
+        let xml = r#"<pos_layout>
+  <dimensions>
+    <dimension name="x"/>
+  </dimensions>
+  <positions>
+    <position x="1.5"/>
+    <position x="2.3"/>
+    <position x="3.7"/>
+  </positions>
+</pos_layout>"#;
         let count = proc.load_positions_xml(xml).unwrap();
         assert_eq!(count, 3);
         assert_eq!(proc.remaining_positions(), 3);
     }
 
     #[test]
-    fn test_load_xml_out_of_order() {
+    fn test_load_xml_dimension_keyed() {
+        // C NDPosPluginFileReader keys each position attribute by dimension name
+        // and keeps positions in document order (no index sort).
         let mut proc = PosPluginProcessor::new(PosMode::Discard);
-        let xml = r#"<positions>
-  <position index="2">30.0</position>
-  <position index="0">10.0</position>
-  <position index="1">20.0</position>
-</positions>"#;
+        let xml = r#"<pos_layout>
+  <dimensions>
+    <dimension name="x"/>
+    <dimension name="y"/>
+  </dimensions>
+  <positions>
+    <position x="10" y="100"/>
+    <position x="20" y="200"/>
+  </positions>
+</pos_layout>"#;
         let count = proc.load_positions_xml(xml).unwrap();
-        assert_eq!(count, 3);
+        assert_eq!(count, 2);
 
         proc.start();
         let pool = NDArrayPool::new(1_000_000);
 
-        // Should be sorted by index: 10.0, 20.0, 30.0
         let result = proc.process_array(&make_array(1), &pool);
-        let pos = result.output_arrays[0]
-            .attributes
-            .get("position")
-            .unwrap()
-            .value
-            .as_f64()
-            .unwrap();
-        assert!((pos - 10.0).abs() < 1e-10);
+        let attrs = &result.output_arrays[0].attributes;
+        assert!((attrs.get("x").unwrap().value.as_f64().unwrap() - 10.0).abs() < 1e-10);
+        assert!((attrs.get("y").unwrap().value.as_f64().unwrap() - 100.0).abs() < 1e-10);
 
         let result = proc.process_array(&make_array(2), &pool);
-        let pos = result.output_arrays[0]
-            .attributes
-            .get("position")
-            .unwrap()
-            .value
-            .as_f64()
-            .unwrap();
-        assert!((pos - 20.0).abs() < 1e-10);
+        let attrs = &result.output_arrays[0].attributes;
+        assert!((attrs.get("x").unwrap().value.as_f64().unwrap() - 20.0).abs() < 1e-10);
+        assert!((attrs.get("y").unwrap().value.as_f64().unwrap() - 200.0).abs() < 1e-10);
     }
 
     #[test]
-    fn test_load_xml_no_index() {
+    fn test_load_xml_rejects_incomplete_position() {
+        // A position missing a declared dimension's attribute is rejected whole
+        // (C addPosition returns asynError), matching the per-position drop.
         let mut proc = PosPluginProcessor::new(PosMode::Discard);
-        let xml = r#"<positions>
-  <position>5.5</position>
-  <position>6.6</position>
-</positions>"#;
+        let xml = r#"<pos_layout>
+  <dimensions>
+    <dimension name="x"/>
+    <dimension name="y"/>
+  </dimensions>
+  <positions>
+    <position x="1" y="2"/>
+    <position x="3"/>
+    <position x="5" y="6"/>
+  </positions>
+</pos_layout>"#;
         let count = proc.load_positions_xml(xml).unwrap();
         assert_eq!(count, 2);
     }
@@ -561,7 +610,7 @@ mod tests {
     #[test]
     fn test_load_auto_xml() {
         let mut proc = PosPluginProcessor::new(PosMode::Discard);
-        let xml = r#"<positions><position index="0">99.9</position></positions>"#;
+        let xml = r#"<pos_layout><dimensions><dimension name="x"/></dimensions><positions><position x="99.9"/></positions></pos_layout>"#;
         let count = proc.load_positions_auto(xml).unwrap();
         assert_eq!(count, 1);
     }
@@ -569,7 +618,7 @@ mod tests {
     #[test]
     fn test_load_xml_empty() {
         let mut proc = PosPluginProcessor::new(PosMode::Discard);
-        let xml = r#"<positions></positions>"#;
+        let xml = r#"<pos_layout><dimensions><dimension name="x"/></dimensions><positions></positions></pos_layout>"#;
         let count = proc.load_positions_xml(xml).unwrap();
         assert_eq!(count, 0);
     }

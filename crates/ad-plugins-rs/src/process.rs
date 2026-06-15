@@ -350,6 +350,14 @@ impl ProcessState {
             self.config.auto_offset_scale_pending = false;
         }
 
+        // Recompute valid background / flat field each frame from the element
+        // count (C NDPluginProcess.cpp:120-125): a saved buffer is usable only
+        // when its length matches the current frame. A size mismatch
+        // invalidates it — the buffer is dropped entirely, never applied to a
+        // matching prefix.
+        self.config.valid_background = self.background.as_ref().is_some_and(|b| b.len() == n);
+        self.config.valid_flat_field = self.flat_field.as_ref().is_some_and(|f| f.len() == n);
+
         // Stages 1-4: element-wise operations (background, flat field, offset+scale, clipping)
         // These can be combined into a single pass and parallelized.
         let needs_element_ops = self.config.enable_background
@@ -359,12 +367,14 @@ impl ProcessState {
             || self.config.enable_high_clip;
 
         if needs_element_ops {
-            let bg = if self.config.enable_background {
+            // C only takes the background/flat-field pointer when the buffer is
+            // BOTH enabled AND valid for this frame (NDPluginProcess.cpp:127-130).
+            let bg = if self.config.enable_background && self.config.valid_background {
                 self.background.as_ref()
             } else {
                 None
             };
-            let (ff, ff_scale) = if self.config.enable_flat_field {
+            let (ff, ff_scale) = if self.config.enable_flat_field && self.config.valid_flat_field {
                 if let Some(ref ff) = self.flat_field {
                     // C++: value *= scaleFlatField / flatField[i]
                     // (NDPluginProcess.cpp:172). scaleFlatField is used directly
@@ -387,15 +397,15 @@ impl ProcessState {
             let high_clip_value = self.config.high_clip_value;
 
             let apply_stages = |i: usize, v: &mut f64| {
-                // Stage 1: Background subtraction
+                // Stage 1: Background subtraction. bg.len() == n is guaranteed by
+                // the validity gate above, so index directly (C subtracts
+                // background[i] unconditionally for every element).
                 if let Some(bg) = bg {
-                    if i < bg.len() {
-                        *v -= bg[i];
-                    }
+                    *v -= bg[i];
                 }
                 // Stage 2: Flat field normalization
                 if let Some(ff) = ff {
-                    if i < ff.len() && ff[i] != 0.0 {
+                    if ff[i] != 0.0 {
                         *v = *v * ff_scale / ff[i];
                     }
                 }
@@ -907,6 +917,32 @@ mod tests {
             assert_eq!(v[0], 5);
             assert_eq!(v[1], 5);
             assert_eq!(v[2], 5);
+        }
+    }
+
+    #[test]
+    fn test_adp7_size_mismatched_background_invalidated_not_partial() {
+        // C recomputes validBackground each frame as (pBackground && nElements ==
+        // nBackgroundElements) (NDPluginProcess.cpp:121). A size mismatch
+        // invalidates the whole buffer — it is NOT applied to the matching
+        // prefix.
+        let bg_arr = make_array(&[10, 20]); // 2 elements
+        let input = make_array(&[15, 25, 35]); // 3 elements
+        let mut state = ProcessState::new(ProcessConfig {
+            enable_background: true,
+            ..Default::default()
+        });
+        state.save_background(&bg_arr);
+        assert!(state.config.valid_background); // set at save time (C writeInt32)
+
+        let result = state.process(&input).unwrap();
+        // Size mismatch → background ignored → output unchanged; valid recomputed
+        // false at process time.
+        assert!(!state.config.valid_background);
+        if let NDDataBuffer::U8(ref v) = result.data {
+            assert_eq!(v, &[15, 25, 35]);
+        } else {
+            panic!("expected U8 output");
         }
     }
 

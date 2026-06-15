@@ -10,7 +10,11 @@ pub enum OverlayShape {
     Cross {
         center_x: usize,
         center_y: usize,
-        size: usize,
+        /// X arm half-extent source — C draws the horizontal arm over
+        /// `SizeX/2` each side of the center, independent of `SizeY`.
+        size_x: usize,
+        /// Y arm half-extent source — C draws the vertical arm over `SizeY/2`.
+        size_y: usize,
     },
     Rectangle {
         x: usize,
@@ -185,16 +189,19 @@ macro_rules! draw_on_typed_buffer {
             };
 
             match &overlay.shape {
-                OverlayShape::Cross { center_x, center_y, size } => {
-                    // C++ doOverlayT Cross: xwide/ywide are WidthX/2, WidthY/2
-                    // (half-widths). Rows inside the horizontal band
-                    // [ycent-ywide, ycent+ywide] draw the full arm; other rows
-                    // draw only the vertical strip [xcent-xwide, xcent+xwide].
-                    // This structure visits every pixel exactly once, so the
-                    // center pixel is not double-XOR'd.
+                OverlayShape::Cross { center_x, center_y, size_x, size_y } => {
+                    // C++ doOverlayT Cross (NDPluginOverlay.cpp:94-117): the
+                    // horizontal arm spans SizeX/2 each side of the center, the
+                    // vertical arm SizeY/2 — independent extents. xwide/ywide
+                    // are WidthX/2, WidthY/2 (half-thicknesses). Rows inside the
+                    // band [ycent-ywide, ycent+ywide] draw the full horizontal
+                    // arm; other rows draw only the vertical strip
+                    // [xcent-xwide, xcent+xwide]. Each pixel is visited exactly
+                    // once, so the center is not double-XOR'd.
                     let cx = *center_x as i64;
                     let cy = *center_y as i64;
-                    let half = (*size / 2) as i64;
+                    let half_x = (*size_x / 2) as i64;
+                    let half_y = (*size_y / 2) as i64;
                     let xwide = (wx / 2) as i64;
                     let ywide = (wy / 2) as i64;
                     let mut put = |x: i64, y: i64| {
@@ -202,10 +209,10 @@ macro_rules! draw_on_typed_buffer {
                             set_pixel(x as usize, y as usize);
                         }
                     };
-                    for iy in (cy - half)..=(cy + half) {
+                    for iy in (cy - half_y)..=(cy + half_y) {
                         if iy >= cy - ywide && iy <= cy + ywide {
-                            // Inside the horizontal band: full row.
-                            for ix in (cx - half)..=(cx + half) {
+                            // Inside the horizontal band: full horizontal arm.
+                            for ix in (cx - half_x)..=(cx + half_x) {
                                 put(ix, iy);
                             }
                         } else {
@@ -467,7 +474,8 @@ impl OverlaySlot {
             0 => OverlayShape::Cross {
                 center_x: self.position_x + self.size_x / 2,
                 center_y: self.position_y + self.size_y / 2,
-                size: self.size_x.max(self.size_y),
+                size_x: self.size_x,
+                size_y: self.size_y,
             },
             1 => OverlayShape::Rectangle {
                 x: self.position_x,
@@ -553,13 +561,14 @@ impl OverlayProcessor {
                 OverlayShape::Cross {
                     center_x,
                     center_y,
-                    size,
+                    size_x,
+                    size_y,
                 } => {
                     slot.shape = 0;
-                    slot.position_x = center_x.saturating_sub(size / 2);
-                    slot.position_y = center_y.saturating_sub(size / 2);
-                    slot.size_x = size;
-                    slot.size_y = size;
+                    slot.position_x = center_x.saturating_sub(size_x / 2);
+                    slot.position_y = center_y.saturating_sub(size_y / 2);
+                    slot.size_x = size_x;
+                    slot.size_y = size_y;
                 }
                 OverlayShape::Rectangle {
                     x,
@@ -876,7 +885,8 @@ mod tests {
             shape: OverlayShape::Cross {
                 center_x: 0,
                 center_y: 0,
-                size: 2,
+                size_x: 2,
+                size_y: 2,
             },
             draw_mode: DrawMode::XOR,
             color: [0, 0xFF, 0],
@@ -903,7 +913,8 @@ mod tests {
             shape: OverlayShape::Cross {
                 center_x: 4,
                 center_y: 4,
-                size: 4,
+                size_x: 4,
+                size_y: 4,
             },
             draw_mode: DrawMode::Set,
             color: [0, 200, 0],
@@ -917,6 +928,50 @@ mod tests {
             assert_eq!(v[4 * 8 + 6], 200); // right arm
             assert_eq!(v[6 * 8 + 4], 200); // bottom arm
         }
+    }
+
+    #[test]
+    fn test_adp20_cross_independent_size_x_size_y() {
+        // C Cross (NDPluginOverlay.cpp:94-117): the horizontal arm spans
+        // SizeX/2 and the vertical arm SizeY/2 — independent. A 6x2 cross must
+        // NOT collapse to a 6x6 square (the prior max(SizeX,SizeY) bug).
+        let arr = NDArray::new(
+            vec![NDDimension::new(20), NDDimension::new(20)],
+            NDDataType::UInt8,
+        );
+        let overlays = vec![OverlayDef {
+            shape: OverlayShape::Cross {
+                center_x: 10,
+                center_y: 10,
+                size_x: 6,
+                size_y: 2,
+            },
+            draw_mode: DrawMode::Set,
+            color: [0, 200, 0],
+            width_x: 1,
+            width_y: 1,
+        }];
+        let out = draw_overlays(&arr, &overlays);
+        let px = |x: usize, y: usize| {
+            if let NDDataBuffer::U8(ref v) = out.data {
+                v[y * 20 + x]
+            } else {
+                0
+            }
+        };
+        // Horizontal arm reaches half_x = SizeX/2 = 3 → x in [7..=13] on row 10.
+        assert_eq!(px(13, 10), 200, "horizontal arm spans SizeX/2 = 3");
+        assert_eq!(px(7, 10), 200);
+        // Vertical arm reaches only half_y = SizeY/2 = 1 → rows 9 and 11.
+        assert_eq!(px(10, 9), 200);
+        assert_eq!(px(10, 11), 200);
+        // Rows beyond half_y must be untouched (set only if collapsed to square).
+        assert_eq!(
+            px(10, 7),
+            0,
+            "vertical arm must span SizeY/2, not SizeX/2 (no square collapse)"
+        );
+        assert_eq!(px(10, 13), 0);
     }
 
     #[test]
@@ -1072,7 +1127,8 @@ mod tests {
             shape: OverlayShape::Cross {
                 center_x: 4,
                 center_y: 4,
-                size: 2,
+                size_x: 2,
+                size_y: 2,
             },
             draw_mode: DrawMode::XOR, // should be treated as Set for floats
             color: [0, 100, 0],
@@ -1099,7 +1155,8 @@ mod tests {
             shape: OverlayShape::Cross {
                 center_x: 10,
                 center_y: 10,
-                size: 8,
+                size_x: 8,
+                size_y: 8,
             },
             draw_mode: DrawMode::Set,
             color: [0, 255, 0],

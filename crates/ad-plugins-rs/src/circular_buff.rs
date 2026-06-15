@@ -311,6 +311,43 @@ impl CircularBuffer {
 
 // --- New CircularBuffProcessor (NDPluginProcess-based) ---
 
+/// The status string C `NDPluginCircularBuff::processCallbacks` leaves in
+/// `NDCircBuffStatus` (asynOctet) after one frame, given the post-push state.
+///
+/// Mirrors NDPluginCircularBuff.cpp:153-195: on a flushing frame the status is
+/// "Flushing"; once the post-trigger count is reached it becomes
+/// "Buffer filling"/"Dropping frames" (more triggers allowed) or
+/// "Acquisition Completed" (preset reached); while filling it only changes when
+/// the pre-buffer reaches its capacity ("Buffer Wrapping"/"Dropping frames").
+/// `None` means C makes no `setStringParam` call this frame (status unchanged).
+fn flush_path_status(
+    sequence_done: bool,
+    acquisition_completed: bool,
+    forwarded: bool,
+    pre_buffer_full: bool,
+    pre_count: usize,
+) -> Option<&'static str> {
+    if sequence_done {
+        Some(if acquisition_completed {
+            "Acquisition Completed"
+        } else if pre_count > 0 {
+            "Buffer filling"
+        } else {
+            "Dropping frames"
+        })
+    } else if forwarded {
+        Some("Flushing")
+    } else if pre_buffer_full {
+        Some(if pre_count > 0 {
+            "Buffer Wrapping"
+        } else {
+            "Dropping frames"
+        })
+    } else {
+        None
+    }
+}
+
 /// CircularBuff processor: maintains ring buffer state, emits captured arrays on trigger.
 #[derive(Default)]
 struct CBParamIndices {
@@ -392,13 +429,19 @@ impl NDPluginProcess for CircularBuffProcessor {
 
         let mut updates = Vec::new();
         if let Some(idx) = self.params.status {
-            let status_val = match self.buffer.status() {
-                BufferStatus::Idle => 0,
-                BufferStatus::BufferFilling => 1,
-                BufferStatus::Flushing => 2,
-                BufferStatus::AcquisitionCompleted => 3,
-            };
-            updates.push(ParamUpdate::int32(idx, status_val));
+            // C NDCircBuffStatus is asynOctet: emit the status string C leaves
+            // after this frame (NDPluginCircularBuff.cpp:153-195), or nothing
+            // when C makes no setStringParam call (still filling below capacity).
+            let pre_count = self.buffer.pre_count;
+            if let Some(s) = flush_path_status(
+                push_result.sequence_done,
+                self.buffer.status() == BufferStatus::AcquisitionCompleted,
+                !push_result.forward.is_empty(),
+                self.buffer.pre_buffer_len() == pre_count,
+                pre_count,
+            ) {
+                updates.push(ParamUpdate::octet(idx, s.to_string()));
+            }
         }
         if let Some(idx) = self.params.current_image {
             updates.push(ParamUpdate::int32(idx, self.buffer.pre_buffer_len() as i32));
@@ -435,7 +478,9 @@ impl NDPluginProcess for CircularBuffProcessor {
     ) -> asyn_rs::error::AsynResult<()> {
         use asyn_rs::param::ParamType;
         base.create_param("CIRC_BUFF_CONTROL", ParamType::Int32)?;
-        base.create_param("CIRC_BUFF_STATUS", ParamType::Int32)?;
+        // C NDCircBuffStatus is asynParamOctet (NDPluginCircularBuff.cpp:411);
+        // the db binds it to a stringin/asynOctetRead record.
+        base.create_param("CIRC_BUFF_STATUS", ParamType::Octet)?;
         base.create_param("CIRC_BUFF_TRIGGER_A", ParamType::Octet)?;
         base.create_param("CIRC_BUFF_TRIGGER_B", ParamType::Octet)?;
         base.create_param("CIRC_BUFF_TRIGGER_A_VAL", ParamType::Float64)?;
@@ -469,6 +514,12 @@ impl NDPluginProcess for CircularBuffProcessor {
         self.params.preset_trigger_count = base.find_param("CIRC_BUFF_PRESET_TRIGGER_COUNT");
         self.params.actual_trigger_count = base.find_param("CIRC_BUFF_ACTUAL_TRIGGER_COUNT");
         self.params.flush_on_soft_trigger = base.find_param("CIRC_BUFF_FLUSH_ON_SOFTTRIGGER");
+
+        // C sets NDCircBuffStatus to "Idle" in the constructor
+        // (NDPluginCircularBuff.cpp:432).
+        if let Some(idx) = self.params.status {
+            base.set_string_param(idx, 0, "Idle".into())?;
+        }
         Ok(())
     }
 
@@ -477,17 +528,33 @@ impl NDPluginProcess for CircularBuffProcessor {
         reason: usize,
         params: &ad_core_rs::plugin::runtime::PluginParamSnapshot,
     ) -> ad_core_rs::plugin::runtime::ParamChangeResult {
-        use ad_core_rs::plugin::runtime::{ParamChangeResult, ParamChangeValue};
+        use ad_core_rs::plugin::runtime::{ParamChangeResult, ParamChangeValue, ParamUpdate};
 
+        let mut updates = Vec::new();
         if Some(reason) == self.params.control {
             let v = params.value.as_i32();
             if v == 1 {
                 // Start
                 self.buffer.reset();
                 self.buffer.status = BufferStatus::BufferFilling;
+                // C writeInt32(Control=1): "Buffer filling"/"Dropping frames"
+                // (NDPluginCircularBuff.cpp:252-253).
+                if let Some(idx) = self.params.status {
+                    let s = if self.buffer.pre_count > 0 {
+                        "Buffer filling"
+                    } else {
+                        "Dropping frames"
+                    };
+                    updates.push(ParamUpdate::octet(idx, s.to_string()));
+                }
             } else {
                 // Stop
                 self.buffer.status = BufferStatus::Idle;
+                // C writeInt32(Control=0): "Acquisition Stopped"
+                // (NDPluginCircularBuff.cpp:260).
+                if let Some(idx) = self.params.status {
+                    updates.push(ParamUpdate::octet(idx, "Acquisition Stopped".to_string()));
+                }
             }
         } else if Some(reason) == self.params.pre_trigger {
             self.buffer.pre_count = params.value.as_i32().max(0) as usize;
@@ -520,7 +587,7 @@ impl NDPluginProcess for CircularBuffProcessor {
             }
         }
 
-        ParamChangeResult::updates(vec![])
+        ParamChangeResult::updates(updates)
     }
 }
 
@@ -848,6 +915,44 @@ mod tests {
         // Further triggers should be ignored
         cb.trigger();
         assert_eq!(cb.trigger_count(), 2); // unchanged
+    }
+
+    #[test]
+    fn test_flush_path_status_strings() {
+        // Regression for ADP-40: NDCircBuffStatus is an Octet string; the
+        // processCallbacks path must leave the exact C strings.
+        // Flushing frame (a frame was forwarded, sequence not done).
+        assert_eq!(
+            flush_path_status(false, false, true, false, 5),
+            Some("Flushing")
+        );
+        // Sequence completes, more triggers allowed, preCount>0.
+        assert_eq!(
+            flush_path_status(true, false, true, false, 5),
+            Some("Buffer filling")
+        );
+        // Sequence completes, more triggers allowed, preCount==0.
+        assert_eq!(
+            flush_path_status(true, false, true, false, 0),
+            Some("Dropping frames")
+        );
+        // Sequence completes, preset trigger count reached.
+        assert_eq!(
+            flush_path_status(true, true, true, false, 5),
+            Some("Acquisition Completed")
+        );
+        // Filling, pre-buffer just reached capacity, preCount>0.
+        assert_eq!(
+            flush_path_status(false, false, false, true, 5),
+            Some("Buffer Wrapping")
+        );
+        // Filling at capacity with preCount==0 → frames are dropped.
+        assert_eq!(
+            flush_path_status(false, false, false, true, 0),
+            Some("Dropping frames")
+        );
+        // Still filling below capacity → C makes no setStringParam call.
+        assert_eq!(flush_path_status(false, false, false, false, 5), None);
     }
 
     #[test]

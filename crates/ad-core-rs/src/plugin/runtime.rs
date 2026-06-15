@@ -858,6 +858,38 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
                     value: report_arr.timestamp.nsec as i32,
                 },
             ]);
+
+            // NDCodec / NDCompressedSize — C++ beginProcessCallbacks
+            // (NDPluginDriver.cpp:213-214) sets these on every array. An
+            // uncompressed array carries an empty codec name and a
+            // compressedSize equal to the raw byte count (matching the
+            // driver-base path in ndarray_driver::prepare_array).
+            match &report_arr.codec {
+                Some(codec) => {
+                    addr0.push(ParamSetValue::Octet {
+                        reason: self.ndarray_params.codec,
+                        addr: 0,
+                        value: codec.name.as_str().to_string(),
+                    });
+                    addr0.push(ParamSetValue::Int32 {
+                        reason: self.ndarray_params.compressed_size,
+                        addr: 0,
+                        value: codec.compressed_size as i32,
+                    });
+                }
+                None => {
+                    addr0.push(ParamSetValue::Octet {
+                        reason: self.ndarray_params.codec,
+                        addr: 0,
+                        value: String::new(),
+                    });
+                    addr0.push(ParamSetValue::Int32 {
+                        reason: self.ndarray_params.compressed_size,
+                        addr: 0,
+                        value: info.total_bytes as i32,
+                    });
+                }
+            }
         }
 
         addr0.push(ParamSetValue::Float64 {
@@ -2852,6 +2884,87 @@ mod tests {
         send_array(handle.array_sender(), make_test_array(2));
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert_eq!(downstream_rx.blocking_recv().unwrap().unique_id, 2);
+    }
+
+    #[test]
+    fn test_plugin_output_publishes_compressed_size() {
+        // ADC-3: every processed array publishes NDCodec / NDCompressedSize
+        // (C++ beginProcessCallbacks NDPluginDriver.cpp:213-214). An
+        // uncompressed output carries an empty codec name and compressedSize ==
+        // raw bytes; a compressed output carries the codec name and its
+        // compressed size. CompressedSize_RBV (Int32) exercises both arms.
+        struct CompressProcessor;
+        impl NDPluginProcess for CompressProcessor {
+            fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
+                let mut out = array.clone();
+                out.codec = Some(crate::codec::Codec {
+                    name: crate::codec::CodecName::JPEG,
+                    compressed_size: 7,
+                    level: 0,
+                    shuffle: 0,
+                    compressor: 0,
+                    original_data_type: NDDataType::UInt8,
+                });
+                ProcessResult::arrays(vec![Arc::new(out)])
+            }
+            fn plugin_type(&self) -> &str {
+                "Compress"
+            }
+        }
+
+        // Uncompressed passthrough: a 4-byte UInt8 array → compressedSize == 4.
+        {
+            let pool = Arc::new(NDArrayPool::new(1_000_000));
+            let (ds, _rx) = ndarray_channel("DS_RAW", 10);
+            let mut output = NDArrayOutput::new();
+            output.add(ds);
+            let (handle, _jh) = create_plugin_runtime_with_output(
+                "CODEC_RAW",
+                PassthroughProcessor,
+                pool,
+                10,
+                output,
+                "",
+                test_wiring(),
+            );
+            enable_callbacks(&handle);
+            let port = handle.port_runtime().port_handle().clone();
+            send_array(handle.array_sender(), make_test_array(1));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert_eq!(
+                port.read_int32_blocking(handle.ndarray_params.compressed_size, 0)
+                    .unwrap(),
+                4,
+                "uncompressed output must publish CompressedSize == raw byte count"
+            );
+        }
+
+        // Compressed output: compressedSize == codec.compressed_size (7).
+        {
+            let pool = Arc::new(NDArrayPool::new(1_000_000));
+            let (ds, _rx) = ndarray_channel("DS_CMP", 10);
+            let mut output = NDArrayOutput::new();
+            output.add(ds);
+            let (handle, _jh) = create_plugin_runtime_with_output(
+                "CODEC_CMP",
+                CompressProcessor,
+                pool,
+                10,
+                output,
+                "",
+                test_wiring(),
+            );
+            enable_callbacks(&handle);
+            let port = handle.port_runtime().port_handle().clone();
+            send_array(handle.array_sender(), make_test_array(1));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert_eq!(
+                port.read_int32_blocking(handle.ndarray_params.compressed_size, 0)
+                    .unwrap(),
+                7,
+                "compressed output must publish CompressedSize == codec.compressed_size"
+            );
+        }
     }
 
     #[test]

@@ -61,6 +61,18 @@ population). One commit per finding.
 | STD-6 (timestamp VAL posts every cycle) | fix | Fixed | 4e3d4990 |
 | SCAL-3 (arm(0) disarm clears counts) | fix | Fixed | b83b8af1 |
 | SCAL-1 (idle S1..Sn DBE_LOG sweep) | fix | Fixed | 3486badf |
+| OPT-1 (orient Mode constraint 1/2 swap) | fix | Fixed | 0d744983 |
+| OPT-2 (singular A0/OMTX publishes stale, C identity) | fix | Fixed | 8f5bec53 |
+| OPT-4 (kohzu soft-limit setpoint revert) | fix | Fixed | 1f3cf86f |
+| OPT-5 (kohzu/ml-mono tweak inc/dec feature) | fix | Fixed | 7e852463 |
+| OPT-6 (kohzu/ml-mono forbidden-reflection Alert flag) | fix | Fixed | 5888a507 |
+| OPT-7 (ml-mono standalone Y move retracks Z) | fix | Fixed | c73488ad |
+| OPT-8 (PF4 Al/Ti/Glass analytic absorption fits) | fix | Fixed | 543cc7e3 |
+| OPT-9 (PF4 filterAl/Ti/Gl material+bank gate) | fix-low | Fixed | 5baac515 |
+| OPT-10 (flexCombinedMotion give-up extra {FM}.VAL write) | fix | Fixed | 50b2c6cd |
+| OPT-11 (QXBPM set_defaults preserves offsets) | fix | Fixed | 4fc2e166 |
+| OPT-12 (QXBPM pos:x/y unguarded divide → NaN/Inf) | verify→fix | Fixed | 3eeda648 |
+| OPT-16 (PF4 invTrans gated on trans>0) | fix | Fixed | de2beb9f |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -505,6 +517,12 @@ Severity: Low — fix-low
 Rust: `crates/optics-rs/src/snl/io.rs:648` clamps `icChannel.max(2)`; `:372-374` zeros outputs incl. ion_abs on ticks<=0; `:133-241,312-317` 5-sig-fig constants.
 C: `Io.st:409-426,427,444,592-770` — channel 0/1 → cps=0; ticks==0 → finite ionAbs; 6-sig-fig constants.
 Impact: (a) channel 0/1 → C zero outputs vs Rust nonzero; (b) ticks==0 → C-finite ionAbs vs Rust 0; (c) ~5th-sig-fig drift.
+
+#### OPT-16: PF4 invTrans posted unconditionally where C gates on trans > 0 (found during OPT-12 family sweep)
+Severity: Low — fix
+Rust: `crates/optics-rs/src/snl/pf4.rs` recalculate/BitsChanged/FilterPosChanged each set `write_inv_transmission = Some(+inf)` when transmission is 0.
+C: `pf4.st:281-282` `PVPUT(trans,...); if(trans>0.0) PVPUT(invtrans,1/trans);` — a zero transmission (glass blade < 2 keV) leaves `{H}invTrans{B}` at its prior value.
+Impact: `{H}invTrans{B}` carries +inf in Rust vs stale prior in C for a fully-absorbing position. Sibling of OPT-9; closed structurally via a single `emit_transmission` owner. Fixed de2beb9f.
 
 #### OPT-T1..T6 (table record): six candidates NOT independently verified
 Severity: unknown — verify

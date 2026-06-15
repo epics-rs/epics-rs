@@ -18,10 +18,6 @@ pub const MAT_TI: u8 = 1;
 pub const MAT_GLASS: u8 = 2;
 pub const MAT_OTHER: u8 = 3;
 
-/// Built-in material names for the fixed material indices.
-#[allow(dead_code)]
-const BUILTIN_MATERIALS: [&str; 3] = ["Al", "Ti", "Si"]; // Si used as proxy for borosilicate glass
-
 /// State of the PF4 bank state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pf4State {
@@ -73,21 +69,128 @@ impl Pf4Config {
     }
 }
 
-/// Look up the material name for a given material index and "other" name.
-fn material_name(mat_idx: u8, other_name: &str) -> &str {
-    match mat_idx {
-        0 => "Al",
-        1 => "Ti",
-        2 => "Si", // Glass approximated as Si for Chantler data
-        3 => {
-            if other_name.is_empty() {
-                "Al" // fallback
-            } else {
-                other_name
-            }
-        }
-        _ => "Al",
+/// Absorption length of aluminium in microns at the given photon energy.
+///
+/// Direct port of `pf4.st`'s `AlAbsorptionLength` (`:484-505`): a 7-term
+/// polynomial in eV with two coefficient sets split at the `kink` energy, the
+/// input clamped to 60 keV. Returns microns.
+fn al_absorption_length_microns(kev: f64) -> f64 {
+    const WCOEF0: [f64; 7] = [
+        1.90195,
+        -0.00120447,
+        4.3745e-7,
+        8.68635e-11,
+        3.40793e-15,
+        -1.05816e-19,
+        5.83389e-25,
+    ];
+    const WCOEF1: [f64; 7] = [
+        -1625.33,
+        0.328256,
+        -2.68391e-5,
+        1.26554e-9,
+        -2.41557e-14,
+        2.12864e-19,
+        -7.28743e-25,
+    ];
+    const KINK: f64 = 26797.5;
+
+    let mut ev = kev * 1000.0; // convert to eV
+    if ev > 60000.0 {
+        ev = 60000.0;
     }
+    let coef = if ev < KINK { &WCOEF0 } else { &WCOEF1 };
+    let mut sum = 0.0;
+    let mut power = 1.0;
+    for &c in coef.iter() {
+        sum += c * power;
+        power *= ev;
+    }
+    sum
+}
+
+/// Absorption length of titanium in microns at the given photon energy.
+///
+/// Direct port of `pf4.st`'s `TiAbsorptionLength` (`:509-538`): below 1 keV the
+/// coefficient `mu` is 0 (returns +inf → full transmission); separate fits
+/// between the L- and K-edges and above the K-edge. Returns `1/mu` in microns.
+fn ti_absorption_length_microns(kev: f64) -> f64 {
+    let ev = kev * 1000.0; // convert keV to eV
+    let mu = if ev < 1e3 {
+        0.0 // this routine only good above 1000 eV
+    } else if ev < 4966.4 {
+        // above L-edge, and below K-edge
+        let c0 = 0.00092284;
+        let c1 = 2.5891e+08;
+        let pow_a = -2.6651;
+        c0 + c1 * ev.powf(pow_a)
+    } else {
+        // above the K-edge
+        let offset = 5.63768167444831e-5;
+        let amp = 24061652313.4169;
+        let pow_b = -2.91380053083527;
+        let intercept = -0.268162843203489;
+        let slope = 3.74221014277593e-5;
+        let amp_exp = -1.05663835782997;
+        let inv_tau = -0.000570785180739491;
+        let extra = if ev < 6456.0 {
+            intercept + slope * ev
+        } else {
+            amp_exp * (inv_tau * ev).exp()
+        };
+        offset + amp * ev.powf(pow_b) + extra
+    };
+    1.0 / mu
+}
+
+/// Absorption length of borosilicate glass in microns at the given photon energy.
+///
+/// Direct port of `pf4.st`'s `GlassAbsorptionLength` (`:553-610`): a piecewise
+/// polynomial in keV with breakpoints at the S, K, Ca and Fe K-edges, finally
+/// scaled by energy^3. Below 2 keV returns 0 (full absorption). Returns microns.
+fn glass_absorption_length_microns(kev: f64) -> f64 {
+    let kev2 = kev * kev;
+    let mut abs_length;
+    if kev < 2.0 {
+        abs_length = 0.0; // this routine only good above 2 keV
+    } else if kev < 2.472 {
+        // below Sulphur K edge
+        abs_length = 0.5059463974 + -0.1259565387 * kev + 0.01763933889 * kev2;
+    } else if kev < 3.6084 {
+        // above Sulphur K and below Potassium K
+        abs_length = 0.4570603245 + -0.08869920063 * kev + 0.01032934773 * kev2;
+    } else if kev < 4.0385 {
+        // above Potassium K and below Calcium K
+        abs_length = 0.3708574258 + -0.04453063888 * kev + 3.979930821e-3 * kev2;
+    } else if kev < 7.112 {
+        // above Calcium K and below Iron K
+        abs_length = 0.2830642538 + -0.0223186563 * kev + 1.412011413e-3 * kev2;
+    } else {
+        // above Iron K
+        let c0 = 0.2715022686;
+        let c1 = -0.02428526798;
+        let c2 = 2.984228845e-3;
+        let c3 = -2.003675391e-4;
+        let c4 = 7.983398893e-6;
+        let c5 = -1.869726202e-7;
+        let c6 = 2.378962632e-9;
+        let c7 = -1.270082060e-11;
+        abs_length = c0 + c1 * kev;
+        let mut kevn = kev2;
+        abs_length += c2 * kevn;
+        kevn *= kev;
+        abs_length += c3 * kevn;
+        kevn *= kev;
+        abs_length += c4 * kevn;
+        kevn *= kev;
+        abs_length += c5 * kevn;
+        kevn *= kev;
+        abs_length += c6 * kevn;
+        kevn *= kev;
+        abs_length += c7 * kevn;
+    }
+    abs_length *= kev * kev * kev; // finally scale by energy^3
+    abs_length
 }
 
 /// Check whether an "Other" material name is legal (found in Chantler tables).
@@ -97,7 +200,11 @@ pub fn is_legal_other(name: &str) -> bool {
 
 /// Calculate the transmission for a single filter blade.
 ///
-/// `thickness_mm` is in millimetres. The material is looked up from Chantler data.
+/// `thickness_mm` is in millimetres. Al, Ti and Glass use the analytic
+/// absorption-length fits ported from `pf4.st`; only "Other" reads the Chantler
+/// table, mirroring `RecalcFilters` (`pf4.st:661-699`) where the three named
+/// materials use `AlAbsorptionLength`/`TiAbsorptionLength`/`GlassAbsorptionLength`
+/// and only `z==3` calls `OtherAbsorptionLength`.
 pub fn calc_blade_transmission(
     energy_kev: f64,
     thickness_mm: f64,
@@ -107,15 +214,26 @@ pub fn calc_blade_transmission(
     if thickness_mm <= 0.0 || energy_kev <= 0.0 {
         return 1.0;
     }
-    let name = material_name(mat_idx, other_name);
-    match find_material(name) {
-        Some(mat) => {
-            // Convert mm to cm: 1 mm = 0.1 cm
-            let thickness_cm = thickness_mm * 0.1;
-            transmission(mat, energy_kev, thickness_cm).unwrap_or(1.0)
+    let abs_len_microns = match mat_idx {
+        MAT_AL => al_absorption_length_microns(energy_kev),
+        MAT_TI => ti_absorption_length_microns(energy_kev),
+        MAT_GLASS => glass_absorption_length_microns(energy_kev),
+        MAT_OTHER => {
+            // "Other" stays on the Chantler table. C computes
+            // exp(-t_mm*1000/absLen_microns) with absLen = 1e4/(rho*mu); that is
+            // algebraically exp(-mu*rho*t_cm), exactly what `transmission` returns
+            // for in-range energies (t_cm = t_mm * 0.1).
+            return match find_material(other_name) {
+                Some(mat) => transmission(mat, energy_kev, thickness_mm * 0.1).unwrap_or(1.0),
+                None => 1.0,
+            };
         }
-        None => 1.0,
-    }
+        _ => return 1.0,
+    };
+    // C: xmit *= exp(-thickness_mm*1000 / absLen_microns). A zero absLen
+    // (Glass < 2 keV) yields exp(-inf) = 0; an infinite absLen (Ti < 1 keV)
+    // yields exp(0) = 1 — both reproduce the C floating-point result.
+    (-thickness_mm * 1000.0 / abs_len_microns).exp()
 }
 
 /// Calculate transmissions for all 16 combinations in a bank, sorted by
@@ -753,6 +871,49 @@ mod tests {
     fn test_calc_blade_transmission_zero_thickness() {
         let t = calc_blade_transmission(10.0, 0.0, MAT_AL, "");
         assert_eq!(t, 1.0);
+    }
+
+    #[test]
+    fn test_al_absorption_length_analytic() {
+        // AlAbsorptionLength(10 keV): WCOEF0 poly at eV=10000 ~ 144.55 microns.
+        let len = al_absorption_length_microns(10.0);
+        assert!((144.0..145.0).contains(&len), "Al absLen at 10keV = {len}");
+        // 60 keV cap: above 60 keV clamps to the 60 keV value.
+        assert_eq!(
+            al_absorption_length_microns(70.0),
+            al_absorption_length_microns(60.0)
+        );
+    }
+
+    #[test]
+    fn test_ti_below_1kev_transmits_fully() {
+        // TiAbsorptionLength returns 1/0 = +inf below 1 keV → exp(0) = 1.0.
+        assert!(ti_absorption_length_microns(0.5).is_infinite());
+        let t = calc_blade_transmission(0.5, 1.0, MAT_TI, "");
+        assert_eq!(t, 1.0);
+    }
+
+    #[test]
+    fn test_glass_below_2kev_absorbs_fully() {
+        // GlassAbsorptionLength returns 0 below 2 keV → exp(-inf) = 0.0.
+        assert_eq!(glass_absorption_length_microns(1.5), 0.0);
+        let t = calc_blade_transmission(1.5, 1.0, MAT_GLASS, "");
+        assert_eq!(t, 0.0);
+    }
+
+    #[test]
+    fn test_glass_is_analytic_fit_not_silicon() {
+        // GlassAbsorptionLength(10 keV) ~ 190 microns (above-Iron-K branch * keV^3),
+        // distinct from the Si Chantler proxy the port previously used (~130 microns
+        // → a ~10x smaller transmission for a 1 mm blade).
+        let len = glass_absorption_length_microns(10.0);
+        assert!(
+            (185.0..195.0).contains(&len),
+            "Glass absLen at 10keV = {len}"
+        );
+        let t = calc_blade_transmission(10.0, 1.0, MAT_GLASS, "");
+        // exp(-1000/190.1) ~ 5.18e-3, well above the ~4.5e-4 a Si proxy would give.
+        assert!((4.5e-3..6.0e-3).contains(&t), "Glass 1mm at 10keV = {t}");
     }
 
     #[test]

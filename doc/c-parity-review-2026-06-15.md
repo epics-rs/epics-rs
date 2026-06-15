@@ -989,8 +989,9 @@ Rust: `attr_plot.rs:143-145` `set_data_select` rejects `value >= 0 && (value as 
 C: `NDPluginAttrPlot.cpp:283-285` rejects only `value > 0 && (unsigned)value >= attributes_.size()` — `value==0` always accepted.
 Impact: `caput AP_DataSelect 0` before any frame (empty attribute list) succeeds in C but errors in Rust; divergent write status and stored DataSelect.
 
-#### ADP-52: AttrPlot is not wired into the IOC; no NDAttrPlotConfig command exists
+#### ADP-52: AttrPlot is not wired into the IOC; no NDAttrPlotConfig command exists — **FIXED 2e15bceb**
 Severity: Medium — verify
+**Fix:** registered the `NDAttrPlotConfig` startup command in `ioc.rs` with its own positional arg layout matching C (`port, n_attributes, cache_size, n_selected_blocks, in_port, in_addr, queue_size, ...`, `NDPluginAttrPlot.cpp:308`) — distinct from the generic `portName/queueSize/blockingCallbacks/NDArrayPort` order, so it parses its own args via `parse_attr_plot_args`. The port is created with `max(n_attributes, n_data_blocks)` asyn addresses via `create_plugin_runtime_multi_addr` (matching C `NDPluginAttrPlot.cpp:48`), then wired to the upstream `in_port`. ADP-53 (per-frame vs 1 Hz cadence) is a signoff, so the `ExposeDataTask` background timer is intentionally not replicated — `process_array` emits per frame. Tests: `parse_attr_plot_args_maps_c_positional_order`, `parse_attr_plot_args_requires_port_name`, `parse_attr_plot_args_honours_explicit_zero_and_defaults_absent`. This unblocks ADP-51/53/54/55 (no longer latent).
 Rust: `AttrPlotProcessor` is referenced only inside `attr_plot.rs` (its own tests); no `NDAttrPlotConfig` startup command in `ioc.rs`, no runtime factory. `rg` across `crates/` finds zero production instantiations.
 C: `NDPluginAttrPlot.cpp:308-318` registers `NDAttrPlotConfig` iocsh command and constructs the plugin.
 Impact: A db invoking `NDAttrPlotConfig` fails to create the plugin in the Rust IOC; no AP_Data/AP_DataLabel/AP_Attribute/AP_NPts records are ever served. ADP-51/53/54/55 are latent until this is wired.

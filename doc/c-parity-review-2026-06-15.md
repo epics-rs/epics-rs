@@ -473,12 +473,14 @@ Severity: Low — signoff
 Rust: `crates/scaler-rs/src/device_support/scaler_soft.rs:70-79` zeroes counts.
 C: `drvScalerSoft.c:303-313` clears acquiring/presets only.
 Impact: transient (next read repopulates on both sides); documented deviation. Signoff.
+RESOLVED 2026-06-15 — keep Rust (user): the count-zeroing is transient (next read repopulates on both sides); same class as the approved keep-Rust batch.
 
 #### SCAL-5 (RATE): `special("RATE")` posts a different field than C
 Severity: Low — signoff
 Rust: `crates/scaler-rs/src/records/scaler.rs:844-846` clamps RATE → framework posts RATE.
 C: `scalerRecord.c:690-693` clamps `rate` but `db_post_events(&tp,...)` posts TP (apparent copy-paste bug).
 Impact: a clamped RATE write posts RATE in Rust, a spurious TP in C. Replicating the C bug is not advisable. Signoff.
+RESOLVED 2026-06-15 — keep Rust (user): C posts TP on a RATE clamp (copy-paste bug, `db_post_events(&tp,...)`); Rust posts RATE correctly. Reproducing the C bug is not wanted.
 
 Verified-equivalent (scaler): count→done sequence, CNT/US/SS transitions, preset reconciliation (NINT vs trunc), COUT/COUTP, VAL=T-on-completion, FwdLink gating, UDF via clears_udf; device-support read/done/preset-compare (`>=`, preset>0 gate, once-per-arm).
 
@@ -696,6 +698,7 @@ Severity: Medium — signoff
 Rust: `crates/mqtt-rs/src/payload.rs:32-45`, `driver.rs:123-132` publish a JSON PUBLISH for `PayloadFormat::Json`.
 C: `drvMqtt.cpp:587,629,656,692,722` all `throw "JSON support not implemented"` → asynError, no PUBLISH.
 Impact: Rust adds outbound JSON the C lacks (the Z2M `/set` control records depend on it). Sign-off — closing it would delete the only outbound-JSON path Z2M uses.
+RESOLVED 2026-06-15 — keep Rust JSON publish (user): functional superset; no C-produced output regresses (C only errored), and the Z2M `/set` path depends on it.
 
 #### MQTT-4: `write_octet` publishes the whole string; C truncates the published payload at the first NUL
 Severity: Low — fix-low
@@ -727,6 +730,7 @@ Severity: Medium — signoff
 Rust: `crates/epics-tools-rs/src/procserv/supervisor.rs:561-617,431-438` — `@@@ Welcome to procserv-rs`, reworded Wrapping/kill/toggle lines, different child-exit text.
 C: `clientFactory.cc:100,109-124` `@@@ Welcome to procServ (procServ-X.Y.Z)` + a single combined kill/restart-mode/toggle line; `procServ.cc:572-586,789-807` add server-PID/startup-dir/`Child "<name>" PID:`/shutdown lines and the `@@@ @@@ @@@ @@@ @@@` + sigChild exit banner.
 Impact: nearly every `@@@` banner string differs verbatim; an operator script grepping `Welcome to procServ`/`Received a sigChild`/PID lines fails. Intentional branding rewrite — sign-off vs a string-by-string restoration.
+RESOLVED 2026-06-15 — keep procserv-rs branding (user): the reworded banner / child-lifecycle strings stay; procserv-rs is a distinct product, not a drop-in console-string clone of procServ.
 
 Verified-equivalent (procServ): IAC framing (0xFF, IAC-IAC unescape, outbound IAC doubling, `IAC SB..IAC SE` skip), initial offer bytes order, caret control-char rendering (c+64), RestartMode labels ON/OFF/ONESHOT, kill-command broadcast.
 

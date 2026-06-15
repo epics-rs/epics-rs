@@ -1034,8 +1034,8 @@ impl NDPluginProcess for StatsProcessor {
             ParamUpdate::float64(p.kurtosis_y, centroid.kurtosis_y),
             ParamUpdate::float64(p.eccentricity, centroid.eccentricity),
             ParamUpdate::float64(p.orientation, centroid.orientation),
-            ParamUpdate::float64(p.hist_below, result.hist_below),
-            ParamUpdate::float64(p.hist_above, result.hist_above),
+            ParamUpdate::int32(p.hist_below, result.hist_below as i32),
+            ParamUpdate::int32(p.hist_above, result.hist_above as i32),
             ParamUpdate::float64(p.hist_entropy, result.hist_entropy),
             ParamUpdate::float64(p.cursor_val, result.cursor_value),
             ParamUpdate::int32(p.profile_size_x, info.x_size as i32),
@@ -1185,8 +1185,12 @@ impl NDPluginProcess for StatsProcessor {
         self.params.hist_min = base.create_param("HIST_MIN", ParamType::Float64)?;
         self.params.hist_max = base.create_param("HIST_MAX", ParamType::Float64)?;
         base.set_float64_param(self.params.hist_max, 0, 255.0)?;
-        self.params.hist_below = base.create_param("HIST_BELOW", ParamType::Float64)?;
-        self.params.hist_above = base.create_param("HIST_ABOVE", ParamType::Float64)?;
+        // HIST_BELOW/HIST_ABOVE are integer pixel counts: C registers them as
+        // asynInt32 and pushes via setIntegerParam (NDPluginStats.cpp:827-828,
+        // 627-628; epicsInt32 fields NDPluginStats.h:86-87). A client reading
+        // these RBVs must see DBR_LONG, not DBR_DOUBLE.
+        self.params.hist_below = base.create_param("HIST_BELOW", ParamType::Int32)?;
+        self.params.hist_above = base.create_param("HIST_ABOVE", ParamType::Int32)?;
         self.params.hist_entropy = base.create_param("HIST_ENTROPY", ParamType::Float64)?;
 
         self.params.compute_profiles = base.create_param("COMPUTE_PROFILES", ParamType::Int32)?;
@@ -1891,6 +1895,70 @@ mod tests {
                 assert!(
                     !profile_reasons.contains(reason),
                     "no profile waveform may be emitted for ndims>2"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_adp30_hist_below_above_emitted_as_int32() {
+        use ad_core_rs::plugin::runtime::ParamUpdate;
+        // C registers HIST_BELOW/HIST_ABOVE as asynParamInt32 and writes them
+        // via setIntegerParam (NDPluginStats.cpp:827-828,627-628); a client
+        // reading the RBVs must get DBR_LONG (Int32), not DBR_DOUBLE.
+        let mut proc = StatsProcessor::new();
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "_stats_adp30_",
+            1,
+            asyn_rs::port::PortFlags::default(),
+        );
+        let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
+        let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
+        proc.register_params(&mut base).unwrap();
+        proc.do_compute_histogram = true;
+        proc.hist_size = 4;
+        proc.hist_min = 2.0;
+        proc.hist_max = 5.0;
+        let pool = NDArrayPool::new(1_000_000);
+
+        // 8 pixels: 0,1 below min(2) → below=2; 9,9,9 above max(5) → above=3;
+        // 3,3,4 in range.
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(2)],
+            NDDataType::UInt8,
+        );
+        if let NDDataBuffer::U8(ref mut v) = arr.data {
+            v.copy_from_slice(&[0, 1, 3, 3, 9, 9, 9, 4]);
+        }
+
+        let result = proc.process_array(&arr, &pool);
+        let p = proc.params;
+
+        let below = result.param_updates.iter().find_map(|u| match u {
+            ParamUpdate::Int32 { reason, value, .. } if *reason == p.hist_below => Some(*value),
+            _ => None,
+        });
+        let above = result.param_updates.iter().find_map(|u| match u {
+            ParamUpdate::Int32 { reason, value, .. } if *reason == p.hist_above => Some(*value),
+            _ => None,
+        });
+        assert_eq!(
+            below,
+            Some(2),
+            "HIST_BELOW must be emitted as an Int32 count"
+        );
+        assert_eq!(
+            above,
+            Some(3),
+            "HIST_ABOVE must be emitted as an Int32 count"
+        );
+
+        // And never as Float64 — the param type must be Int32 end to end.
+        for u in &result.param_updates {
+            if let ParamUpdate::Float64 { reason, .. } = u {
+                assert!(
+                    *reason != p.hist_below && *reason != p.hist_above,
+                    "HIST_BELOW/HIST_ABOVE must not be emitted as Float64"
                 );
             }
         }

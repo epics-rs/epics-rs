@@ -279,10 +279,6 @@ pub struct Hdf5Writer {
     open_data_type: Option<NDDataType>,
     /// Cached spatial (per-frame) dimensions, fastest-varying last.
     open_frame_dims: Option<Vec<usize>>,
-    /// `Some(total)` when the open dataset has a fixed extra-dim leading
-    /// layout (created at full size, no per-frame extend); `None` when the
-    /// leading frame axis is extended per write.
-    open_extra_extent: Option<usize>,
     // compression
     compression_type: i32,
     z_compress_level: u32,
@@ -358,7 +354,6 @@ impl Hdf5Writer {
             dataset_name: "data".to_string(),
             open_data_type: None,
             open_frame_dims: None,
-            open_extra_extent: None,
             compression_type: 0,
             z_compress_level: 6,
             szip_num_pixels: 16,
@@ -480,7 +475,12 @@ impl Hdf5Writer {
     }
 
     pub fn set_n_extra_dims(&mut self, v: usize) {
-        self.n_extra_dims = v.min(MAX_EXTRA_DIMS);
+        // C `NDFileHDF5::writeInt32` rejects `HDF5_nExtraDims > MAXEXTRADIMS-1`
+        // (NDFileHDF5.cpp:1789). The dataset gains `nExtraDims+1` leading axes
+        // (the virtual scan dims plus the innermost frames-per-point axis), so
+        // axis i reads `extra_dims[nExtraDims - i]`; the highest index used is
+        // `nExtraDims`, which must stay within `extra_dims[0..MAX_EXTRA_DIMS]`.
+        self.n_extra_dims = v.min(MAX_EXTRA_DIMS - 1);
     }
 
     pub fn set_extra_dim_size(&mut self, idx: usize, size: usize) {
@@ -663,25 +663,92 @@ impl Hdf5Writer {
         }
     }
 
-    /// Compute the dataset shape and chunk geometry for the primary image
-    /// dataset.
+    /// Chunk dims for the frame (image) axes only — no leading dims.
     ///
-    /// Layout, fastest-varying last: `[frame, Y, X]`. The leading frame axis
-    /// is extensible. When `HDF5_nExtraDims = N` is set, the leading axis is
-    /// fixed at `product(extraDimSizeN..)` and the dataset is created at full
-    /// size up front; the extra-dimension sizes and names are recorded as
-    /// HDF5 attributes (`HDF5_nExtraDims`, `HDF5_extraDimSize0..`,
-    /// `HDF5_extraDimName0..`) so the N-dimensional layout is recoverable.
-    ///
-    /// The chunk shape is `[fc, rc, cc]` for a 2-D frame: `fc` frames per
-    /// chunk (`HDF5_nFramesChunks`), and `rc`/`cc` the row/column chunk sizes
+    /// For a 2-D frame these are the row/column chunk sizes
     /// (`HDF5_nRowChunks` / `HDF5_nColChunks`; 0, auto, or out-of-range → the
-    /// full dimension, matching C++ `NDFileHDF5` chunk-size selection). A
-    /// chunk band is written as a grid of `write_chunk_at` tiles; `close_file`
-    /// calls `set_extent` to trim the logical extent to the exact frame count
-    /// (`rust-hdf5` 0.2.15), so a non-dividing chunk size or a partial final
-    /// band never pads the frame shape. With a fixed extra-dim layout the
-    /// frame axis stays one frame per chunk (the extra dims own that axis).
+    /// full dimension, matching C++ `NDFileHDF5` chunk-size selection). Other
+    /// ranks get one full per-frame tile (no sub-tiling).
+    fn frame_chunk_dims(&self, frame_dims: &[usize]) -> Vec<usize> {
+        if frame_dims.len() == 2 {
+            let y = frame_dims[0].max(1);
+            let x = frame_dims[1].max(1);
+            vec![
+                Self::clamp_chunk(self.chunk.n_row_chunks, y, self.chunk.auto),
+                Self::clamp_chunk(self.chunk.n_col_chunks, x, self.chunk.auto),
+            ]
+        } else {
+            frame_dims.iter().map(|&d| d.max(1)).collect()
+        }
+    }
+
+    /// The fixed leading extra-dimension axes, outermost-first, for the
+    /// standard (non-SWMR) write path; `None` when `HDF5_nExtraDims == 0`.
+    ///
+    /// `HDF5_nExtraDims = N` produces `N+1` leading axes: the `N` virtual scan
+    /// dimensions plus the innermost frames-per-point axis. C builds them in
+    /// reverse param order (NDFileHDF5.cpp:3182-3215, doc order
+    /// `{Nth virtual, …, Y, X, frames-per-point, frame Y, frame X}`): axis `i`
+    /// uses `extraDimSize[N - i]`, so outermost is `extraDimSize[N]` and the
+    /// innermost leading axis is `extraDimSize[0]` ("N", frames per point).
+    fn extra_dim_axes(&self) -> Option<Vec<usize>> {
+        if self.n_extra_dims == 0 {
+            return None;
+        }
+        Some(
+            (0..=self.n_extra_dims)
+                .rev()
+                .map(|i| self.extra_dims[i].size.max(1))
+                .collect(),
+        )
+    }
+
+    /// Standard (non-SWMR) dataset shape and chunk geometry for the primary
+    /// image dataset, faithful to C `NDFileHDF5::configureDims`.
+    ///
+    /// Layout, fastest-varying last. With no extra dims it is `[frame, Y, X]`
+    /// and the single leading axis is extensible. With `HDF5_nExtraDims = N`
+    /// it is `[eds[N], …, eds[1], eds[0], Y, X]` — `N+1` fixed leading axes
+    /// created at full configured size, each chunked at 1 (the frame data is
+    /// row-major identical to the collapsed form, only the dataspace rank
+    /// differs). `close_file` calls `set_extent` to trim any frame-axis
+    /// chunk-rounding back to the exact frame shape.
+    ///
+    /// Returns `(shape, chunk, leading)` where `leading` is `Some([eds…])`
+    /// (the fixed leading axes, outermost-first) when extra dims fix the
+    /// dataset up front, or `None` when the single leading frame axis is
+    /// extended per write.
+    fn standard_layout(
+        &self,
+        frame_dims: &[usize],
+    ) -> (Vec<usize>, Vec<usize>, Option<Vec<usize>>) {
+        let frame_chunk = self.frame_chunk_dims(frame_dims);
+        match self.extra_dim_axes() {
+            Some(leading) => {
+                let mut shape = leading.clone();
+                shape.extend_from_slice(frame_dims);
+                // Each leading axis is chunked at 1 (extraDimChunk defaults to
+                // 1; per-axis chunking is not plumbed in this port).
+                let mut chunk = vec![1usize; leading.len()];
+                chunk.extend_from_slice(&frame_chunk);
+                (shape, chunk, Some(leading))
+            }
+            None => {
+                let mut shape = vec![1usize];
+                shape.extend_from_slice(frame_dims);
+                let mut chunk = vec![self.chunk.n_frames_chunks.max(1)];
+                chunk.extend_from_slice(&frame_chunk);
+                (shape, chunk, None)
+            }
+        }
+    }
+
+    /// Collapsed single-leading-axis layout used by the SWMR streaming path,
+    /// whose backend (`SwmrFileWriter`) supports only one extensible frame
+    /// axis. With extra dims the leading axis is fixed at the product of the
+    /// extra-dim sizes (the N-dimensional structure is recorded as HDF5
+    /// attributes); the non-SWMR path uses [`standard_layout`], which builds
+    /// C's full multi-extra-dimension dataspace.
     ///
     /// Returns `(shape, chunk, extra_dim_extent)` where `extra_dim_extent` is
     /// `Some(total_frames)` when extra dims fix the dataset size up front, or
@@ -697,33 +764,31 @@ impl Hdf5Writer {
             None
         };
 
-        let mut shape: Vec<usize> = Vec::new();
-        // Leading frame axis: full extra-dim product, or 1 (extensible).
-        shape.push(extra_extent.unwrap_or(1));
+        let mut shape: Vec<usize> = vec![extra_extent.unwrap_or(1)];
         shape.extend_from_slice(frame_dims);
 
-        let ndims = shape.len();
-        let mut chunk = vec![1usize; ndims];
-        // Frames per chunk: the extra-dim layout owns the leading axis, so it
-        // stays one frame per chunk; otherwise honor HDF5_nFramesChunks.
-        chunk[0] = if extra_extent.is_some() {
+        let mut chunk = vec![if extra_extent.is_some() {
             1
         } else {
             self.chunk.n_frames_chunks.max(1)
-        };
-        if frame_dims.len() == 2 {
-            // 2-D frame: honor the user row/column chunk sizes.
-            let y = frame_dims[0].max(1);
-            let x = frame_dims[1].max(1);
-            chunk[1] = Self::clamp_chunk(self.chunk.n_row_chunks, y, self.chunk.auto);
-            chunk[2] = Self::clamp_chunk(self.chunk.n_col_chunks, x, self.chunk.auto);
-        } else {
-            // Other rank: one full per-frame tile (no sub-tiling).
-            for (i, &d) in frame_dims.iter().enumerate() {
-                chunk[1 + i] = d.max(1);
-            }
-        }
+        }];
+        chunk.extend_from_slice(&self.frame_chunk_dims(frame_dims));
         (shape, chunk, extra_extent)
+    }
+
+    /// Row-major unravel of a flat frame index into per-axis coordinates over
+    /// `dims` (outermost first; the innermost axis varies fastest). This is C's
+    /// extra-dimension odometer — `NDFileHDF5Dataset::extendDataSet`
+    /// (NDFileHDF5Dataset.cpp:137-157) increments the innermost axis first and
+    /// carries outward.
+    fn unravel(mut idx: usize, dims: &[usize]) -> Vec<usize> {
+        let mut coords = vec![0usize; dims.len()];
+        for d in (0..dims.len()).rev() {
+            let s = dims[d].max(1);
+            coords[d] = idx % s;
+            idx /= s;
+        }
+        coords
     }
 
     /// C++ `NDFileHDF5` chunk-size rule: 0, auto, or a value larger than the
@@ -736,40 +801,48 @@ impl Hdf5Writer {
         }
     }
 
-    /// Write one chunk band (`chunk[0]` consecutive frames) into the primary
-    /// dataset at band index `band_idx`.
+    /// Write one chunk band of `chunk[0]` consecutive frames into the primary
+    /// dataset at the given `leading_coords` (the chunk-grid coordinates of the
+    /// leading axes, outermost-first).
     ///
-    /// The band is split into `ceil(Y/rc) x ceil(X/cc)` chunk tiles, each
-    /// written with `write_chunk_at(&[band_idx, row_tile, col_tile], ..)`.
+    /// For the extensible single-axis layout `leading_coords` is `[band_idx]`
+    /// and up to `fc = chunk[0]` frames stack along that axis. For the fixed
+    /// multi-extra-dimension layout `leading_coords` is the full
+    /// `[eds[N], …, eds[0]]` odometer position (each leading chunk is 1, so
+    /// `fc == 1` and one frame is written per call).
+    ///
+    /// The frame is split into `ceil(Y/rc) x ceil(X/cc)` chunk tiles, each
+    /// written with `write_chunk_at(leading_coords ++ [row_tile, col_tile], ..)`.
     /// Tiles are `[fc, rc, cc]`; edge tiles and a partial final band (fewer
     /// than `fc` frames) are zero-padded. `close_file`'s `set_extent` trims
-    /// the resulting over-extension back to the exact frame count.
+    /// the resulting over-extension back to the exact frame shape.
     fn flush_band(
         ds: &rust_hdf5::H5Dataset,
-        band_idx: usize,
+        leading_coords: &[usize],
         frames: &[Vec<u8>],
         frame_dims: &[usize],
         chunk: &[usize],
         elem_size: usize,
     ) -> ADResult<()> {
+        let lead = leading_coords.len();
         let fc = chunk[0];
-        // Non-2-D frame: one chunk per band, frames stacked along the band
-        // axis (a partial band leaves trailing frames zero).
+        // Non-2-D frame: one chunk per band, frames stacked along the first
+        // leading axis (a partial band leaves trailing frames zero).
         if frame_dims.len() != 2 {
             let frame_len = frame_dims.iter().product::<usize>() * elem_size;
             let mut buf = vec![0u8; fc * frame_len];
             for (f, fb) in frames.iter().take(fc).enumerate() {
                 buf[f * frame_len..f * frame_len + frame_len].copy_from_slice(fb);
             }
-            let mut coords = vec![0usize; chunk.len()];
-            coords[0] = band_idx;
+            let mut coords = leading_coords.to_vec();
+            coords.extend(std::iter::repeat_n(0, frame_dims.len()));
             return ds.write_chunk_at(&coords, &buf).map_err(|e| {
                 ADError::UnsupportedConversion(format!("HDF5 write_chunk_at error: {}", e))
             });
         }
 
         let (y, x) = (frame_dims[0], frame_dims[1]);
-        let (rc, cc) = (chunk[1], chunk[2]);
+        let (rc, cc) = (chunk[lead], chunk[lead + 1]);
         let row_tiles = y.div_ceil(rc);
         let col_tiles = x.div_ceil(cc);
         for ry in 0..row_tiles {
@@ -795,7 +868,10 @@ impl Hdf5Writer {
                         }
                     }
                 }
-                ds.write_chunk_at(&[band_idx, ry, cx], &tile).map_err(|e| {
+                let mut coords = leading_coords.to_vec();
+                coords.push(ry);
+                coords.push(cx);
+                ds.write_chunk_at(&coords, &tile).map_err(|e| {
                     ADError::UnsupportedConversion(format!("HDF5 write_chunk_at error: {}", e))
                 })?;
             }
@@ -809,7 +885,7 @@ impl Hdf5Writer {
         let Some(frame_dims) = self.open_frame_dims.clone() else {
             return Ok(());
         };
-        let (_, chunk, extra_extent) = self.primary_layout(&frame_dims);
+        let (_, chunk, leading) = self.standard_layout(&frame_dims);
         let elem_size = self.open_data_type.map(|t| t.element_size()).unwrap_or(1);
         let total = self.frame_count;
         let fc = chunk[0];
@@ -820,11 +896,17 @@ impl Hdf5Writer {
                 }) => ds,
                 _ => return Ok(()),
             };
+            // A partial band only survives the extensible single-axis layout
+            // (the fixed multi-dim layout writes one frame per call, `fc == 1`).
             if !self.frame_band.is_empty() {
-                let band_idx = total.saturating_sub(1) / fc;
+                let last = total.saturating_sub(1);
+                let leading_coords = match &leading {
+                    Some(lead) => Self::unravel(last, lead),
+                    None => vec![last / fc],
+                };
                 Self::flush_band(
                     ds,
-                    band_idx,
+                    &leading_coords,
                     &self.frame_band,
                     &frame_dims,
                     &chunk,
@@ -832,10 +914,11 @@ impl Hdf5Writer {
                 )?;
             }
             // Trim the logical extent: write_chunk_at rounds dims up to chunk
-            // boundaries; set_extent restores the exact [N, Y, X] (extensible
-            // datasets only — a fixed extra-dim dataset has no over-extension).
-            if extra_extent.is_none() && total > 0 {
-                let mut dims = vec![total];
+            // boundaries; set_extent restores the exact frame shape. The
+            // extensible axis trims to `total`; the fixed leading axes are
+            // already exact and only the frame axes may have over-extended.
+            if total > 0 {
+                let mut dims = leading.clone().unwrap_or_else(|| vec![total]);
                 dims.extend_from_slice(&frame_dims);
                 ds.set_extent(&dims).map_err(|e| {
                     ADError::UnsupportedConversion(format!("HDF5 set_extent error: {}", e))
@@ -1312,12 +1395,13 @@ impl Hdf5Writer {
     /// frames extend the leading dimension (C++ `NDFileHDF5Dataset`).
     fn create_primary_dataset(&mut self, array: &NDArray) -> ADResult<()> {
         let frame_dims: Vec<usize> = array.dims.iter().rev().map(|d| d.size).collect();
-        let (shape, chunk, extra_extent) = self.primary_layout(&frame_dims);
+        let (shape, chunk, leading) = self.standard_layout(&frame_dims);
         let element_size = array.data.data_type().element_size();
         let pipeline = self.build_pipeline(element_size);
-        // Max shape: with extra dims the dataset is created at full size, so
-        // every axis is fixed (`Some`). Without extra dims the leading frame
-        // axis is extensible (`None`); spatial axes get headroom to the
+        // Max shape: with extra dims the dataset is created at its full fixed
+        // multi-dimensional size (every leading axis chunked at 1, so its
+        // ceiling equals its size). Without extra dims the single leading frame
+        // axis is extensible (`None`). Every other axis gets headroom to the
         // chunk-aligned ceiling so a `write_chunk_at` edge tile of a
         // non-dividing chunk can extend into it — `close_file`'s `set_extent`
         // trims back to the exact frame shape.
@@ -1326,16 +1410,10 @@ impl Hdf5Writer {
             .zip(chunk.iter())
             .enumerate()
             .map(|(i, (&s, &c))| {
-                if i == 0 {
-                    if extra_extent.is_none() {
-                        None
-                    } else {
-                        Some(s)
-                    }
-                } else if extra_extent.is_none() {
-                    Some(s.div_ceil(c) * c)
+                if leading.is_none() && i == 0 {
+                    None
                 } else {
-                    Some(s)
+                    Some(s.div_ceil(c) * c)
                 }
             })
             .collect();
@@ -1565,7 +1643,6 @@ impl Hdf5Writer {
         }
         self.open_data_type = Some(array.data.data_type());
         self.open_frame_dims = Some(frame_dims);
-        self.open_extra_extent = extra_extent;
         Ok(())
     }
 
@@ -1589,15 +1666,15 @@ impl Hdf5Writer {
             )));
         }
 
-        let (_shape, chunk, _extra) = self.primary_layout(&frame_dims);
+        let (_shape, chunk, leading) = self.standard_layout(&frame_dims);
         let frame_idx = self.frame_count;
-        let extra_extent = self.open_extra_extent;
         let elem_size = array.data.data_type().element_size();
         let fc = chunk[0];
 
         // With a fixed extra-dim layout, the frame counter must not exceed
         // the product of the extra-dim sizes.
-        if let Some(total) = extra_extent {
+        if let Some(ref lead) = leading {
+            let total: usize = lead.iter().product();
             if frame_idx >= total {
                 return Err(ADError::UnsupportedConversion(format!(
                     "HDF5 extra-dimension capacity exceeded: frame {} >= {}",
@@ -1610,10 +1687,15 @@ impl Hdf5Writer {
         // frame to LE explicitly rather than passing host-endian bytes
         // (see `nd_buffer_to_le_bytes`). Frames accumulate in a band buffer
         // and a full `fc`-deep band is flushed as a grid of write_chunk_at
-        // tiles; close_file flushes the partial final band.
+        // tiles; close_file flushes the partial final band. With a fixed
+        // multi-extra-dim layout every leading chunk is 1, so `fc == 1` and
+        // each frame is placed at its odometer position via `unravel`.
         self.frame_band.push(nd_buffer_to_le_bytes(&array.data));
         if self.frame_band.len() >= fc {
-            let band_idx = frame_idx / fc;
+            let leading_coords = match &leading {
+                Some(lead) => Self::unravel(frame_idx, lead),
+                None => vec![frame_idx / fc],
+            };
             let ds = match self.handle {
                 Some(Hdf5Handle::Standard {
                     primary: Some(ref ds),
@@ -1627,7 +1709,7 @@ impl Hdf5Writer {
             };
             Self::flush_band(
                 ds,
-                band_idx,
+                &leading_coords,
                 &self.frame_band,
                 &frame_dims,
                 &chunk,
@@ -2288,7 +2370,6 @@ impl NDFileWriter for Hdf5Writer {
         self.swmr_cb_counter = 0;
         self.open_data_type = None;
         self.open_frame_dims = None;
-        self.open_extra_extent = None;
         self.perf_rows.clear();
         self.perf_prev = None;
         self.perf_first = None;
@@ -4090,16 +4171,88 @@ mod tests {
 
     #[test]
     fn test_extra_dimensions_layout() {
-        // HDF5_nExtraDims=2 with sizes [2,3] => 6-frame [6,Y,X] dataset with
-        // the extra-dim sizes/names recorded as attributes (the flat leading
-        // axis reshapes to the intended [2,3,Y,X]).
+        // HDF5_nExtraDims=2 builds 2+1 fixed leading axes. With the param sizes
+        // extraDimSizeN(=eds[0])=2, extraDimSizeX(=eds[1])=3, extraDimSizeY(=
+        // eds[2])=4 the dataspace is rank-5 `{Y, X, N, frameY, frameX}` =
+        // [4,3,2,4,4] — C `NDFileHDF5::configureDims` order
+        // (NDFileHDF5.cpp:3121-3230; docs/ADCore/NDFileHDF5.rst:379-380). The
+        // frame data is row-major identical to the collapsed [24,4,4] form
+        // (the innermost leading axis "N" varies fastest), so frame `f` lands
+        // at flat leading index `f`.
         let path = temp_path("hdf5_extradims");
         let mut writer = Hdf5Writer::new();
         writer.set_n_extra_dims(2);
-        writer.set_extra_dim_size(0, 2);
-        writer.set_extra_dim_size(1, 3);
-        writer.set_extra_dim_name(0, "scanY");
+        writer.set_extra_dim_size(0, 2); // N: frames per point
+        writer.set_extra_dim_size(1, 3); // X
+        writer.set_extra_dim_size(2, 4); // Y
+        writer.set_extra_dim_name(0, "n");
         writer.set_extra_dim_name(1, "scanX");
+        writer.set_extra_dim_name(2, "scanY");
+
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt16,
+        );
+        for f in 0..24u16 {
+            if let NDDataBuffer::U16(ref mut v) = arr.data {
+                for x in v.iter_mut() {
+                    *x = f;
+                }
+            }
+            if f == 0 {
+                writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+            }
+            writer.write_file(&arr).unwrap();
+        }
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let ds = h5.dataset("entry/instrument/detector/data").unwrap();
+        // Rank-5 multi-extra-dimension dataspace: [Y, X, N, frameY, frameX].
+        assert_eq!(ds.shape(), vec![4, 3, 2, 4, 4]);
+        let data: Vec<u16> = ds.read_raw().unwrap();
+        assert_eq!(data.len(), 24 * 16);
+        for f in 0..24usize {
+            for i in 0..16usize {
+                assert_eq!(data[f * 16 + i], f as u16, "frame {} elem {}", f, i);
+            }
+        }
+        // Extra-dim sizes/names still recorded as recovery attributes.
+        assert_eq!(
+            ds.attr("HDF5_nExtraDims")
+                .unwrap()
+                .read_numeric::<i32>()
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            ds.attr("HDF5_extraDimSize0")
+                .unwrap()
+                .read_numeric::<i32>()
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            ds.attr("HDF5_extraDimName0")
+                .unwrap()
+                .read_string()
+                .unwrap(),
+            "n"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_extra_dimensions_one_virtual() {
+        // HDF5_nExtraDims=1 builds 1+1 fixed leading axes:
+        // {X, N, frameY, frameX}. With eds[0]=N=2, eds[1]=X=3 the dataspace is
+        // rank-4 [3,2,Y,X] (NDFileHDF5.rst:377-378). 6 frames, value==frame.
+        let path = temp_path("hdf5_extradims_1");
+        let mut writer = Hdf5Writer::new();
+        writer.set_n_extra_dims(1);
+        writer.set_extra_dim_size(0, 2); // N: frames per point
+        writer.set_extra_dim_size(1, 3); // X
 
         let mut arr = NDArray::new(
             vec![NDDimension::new(4), NDDimension::new(4)],
@@ -4120,8 +4273,7 @@ mod tests {
 
         let h5 = H5File::open(&path).unwrap();
         let ds = h5.dataset("entry/instrument/detector/data").unwrap();
-        // Flat leading axis = product(2,3) = 6.
-        assert_eq!(ds.shape(), vec![6, 4, 4]);
+        assert_eq!(ds.shape(), vec![3, 2, 4, 4]);
         let data: Vec<u16> = ds.read_raw().unwrap();
         assert_eq!(data.len(), 6 * 16);
         for f in 0..6usize {
@@ -4129,35 +4281,6 @@ mod tests {
                 assert_eq!(data[f * 16 + i], f as u16, "frame {} elem {}", f, i);
             }
         }
-        // Extra-dim layout recoverable from attributes.
-        assert_eq!(
-            ds.attr("HDF5_nExtraDims")
-                .unwrap()
-                .read_numeric::<i32>()
-                .unwrap(),
-            2
-        );
-        assert_eq!(
-            ds.attr("HDF5_extraDimSize0")
-                .unwrap()
-                .read_numeric::<i32>()
-                .unwrap(),
-            2
-        );
-        assert_eq!(
-            ds.attr("HDF5_extraDimSize1")
-                .unwrap()
-                .read_numeric::<i32>()
-                .unwrap(),
-            3
-        );
-        assert_eq!(
-            ds.attr("HDF5_extraDimName0")
-                .unwrap()
-                .read_string()
-                .unwrap(),
-            "scanY"
-        );
 
         std::fs::remove_file(&path).ok();
     }

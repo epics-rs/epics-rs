@@ -1076,13 +1076,13 @@ C: `calculateAttributeChunking` (`NDFileHDF5.cpp:2869-2920`): param default `0` 
 Impact: When `HDF5_NDAttributeChunk` is default (0), C chunks at numCapture (or 16384), Rust at 16 (clamped to frame count). Different chunk dimension in the DCPL (`H5Pget_chunk`); data values identical.
 
 #### ADP-66: SZIP filter uses entropy-coding mask (4); C uses nearest-neighbor mask (32)
-Severity: Medium — fix
+Severity: Medium — fix — **FIXED 77c33163** (NN mask 32; round-trips. The library-OR'd CHIP/K13 bits and the block/pixel-count cd_values libhdf5's H5Z_set_local_szip appends are not replicable through rust-hdf5's hand-built pipeline — full cd_values byte-parity vs libhdf5 remains an unverified residual)
 Rust: `build_pipeline` SZIP arm `cd_values: vec![4, self.szip_num_pixels]` (`file_hdf5.rs:457`).
 C: `NDFileHDF5.cpp:3372` `H5Pset_szip(this->cparms, H5_SZIP_NN_OPTION_MASK, szipNumPixels)`.
 Impact: `H5_SZIP_EC_OPTION_MASK==4` (entropy) vs `H5_SZIP_NN_OPTION_MASK==32` (nearest-neighbor). Rust selects the wrong SZIP coding mode, so the compressed bytes and stored cd_values differ. (C also relies on the library to OR in CHIP/ALLOW_K13 bits and append block/pixel-count cd_values the hand-built Rust pipeline does not replicate.) Decodable but not byte-parity and a different compression result.
 
 #### ADP-67: N-bit filter implemented as cd_values; C sets datatype precision/offset + paramless H5Pset_nbit
-Severity: High — fix
+Severity: High — fix — **MITIGATED 8367f639; output-form parity BLOCKED by rust-hdf5 0.2.17.** The malformed-filter defect is removed: the old `cd_values: vec![precision, offset]` was shorter than `apply_nbit`'s 4-element minimum (so precision>0 errored the write) and was dropped entirely at the default precision==0 (so a default nbit request produced no compression). Faithful N-bit output requires a reduced-precision dataset datatype message (C `H5Tset_precision`/`H5Tset_offset`), which rust-hdf5 0.2.17's high-level `DatasetBuilder<T: H5Type>` cannot emit — `T::hdf5_type()` is a static fn with no runtime precision input, and the low-level `create_chunked_dataset_with_pipeline(datatype: DatatypeMessage)` is not reachable through `H5File`. N-bit now degrades to lossless uncompressed (data round-trips exactly; SWMR flags `compression_dropped`). **Remaining (UNFIXED, blocked): true N-bit byte parity** needs a rust-hdf5 API addition (expose a reduced-precision `FixedPoint` datatype + the nbit parameter tree `[nparms, need_not_compress, d_nelmts, class, size, order, precision, offset]`) or a dep bump; not closable in source.
 Rust: `build_pipeline` NBIT arm adds `Filter { id: FILTER_NBIT, cd_values: vec![precision, offset] }` (`file_hdf5.rs:497-509`); dataset datatype left full-width.
 C: `NDFileHDF5.cpp:3355-3357` `H5Tset_precision(datatype, nbitPrecision); H5Tset_offset(datatype, nbitOffset); H5Pset_nbit(cparms);` — the N-bit filter takes no client cd_values; bit packing is driven by the dataset datatype's precision/offset.
 Impact: In C the on-disk datatype carries reduced precision/offset and nbit packs to it (observably narrower datatype). In Rust the datatype stays full-width and an nbit filter is written with a `[precision, offset]` cd_values pair the standard nbit filter does not interpret — datatype, filter message, and packed bytes all differ. C nbit precision default is `8` (`NDFileHDF5.cpp:2340`); Rust defaults precision `0` and drops the filter entirely when precision==0, so a default-config nbit request produces no compression at all in Rust.
@@ -1094,7 +1094,7 @@ C: `NDFileHDF5.cpp:3387-3391` declares `cds[7]`, fills only `cds[4]=level, cds[5
 Impact: C leaves cds[0..3] for the blosc plugin to fill at runtime (format version, blosc version, typesize, blocksize); Rust hardcodes `[2,2,element_size,0]`. The stored filter message's first four cd_values differ between a C file (plugin-populated) and the Rust file. Whether the Rust file still decompresses depends on the reader's blosc plugin tolerating the authored typesize/blocksize. Verify because the exact C-side plugin-written values are runtime-dependent.
 
 #### ADP-69: BLOSC default compressor/level/shuffle defaults differ
-Severity: Low — fix-low
+Severity: Low — fix-low — **FIXED 44d05a47** (default `blosc_shuffle_type` 0→1 = byte shuffle, matching C `NDFileHDF5.cpp:2344`; compressor 0 and level 5 already matched)
 Rust: defaults `blosc_shuffle_type=0`, `blosc_compressor=0`, `blosc_compress_level=5` (`file_hdf5.rs:261-263`).
 C: `NDFileHDF5.cpp:2344-2346` `bloscShuffleType=1`, `bloscCompressor=0`, `bloscCompressLevel=5`.
 Impact: C's default BLOSC shuffle is `1` (byte shuffle); Rust's is `0` (none). A default-config BLOSC write produces a different `cds[5]` and a different compressed byte stream. Level (5) and compressor (0) match.

@@ -117,6 +117,7 @@ population). One commit per finding.
 | ADP-4 (Bayer demosaic border keeps native channel only) | fix | Fixed | 3b1669c6 |
 | ADP-9 (FFT rank from input ndims, not a fixed mode; 2-D input → full 2-D FFT) | fix | Fixed | 7943d427 |
 | ADP-25 (FFT TimeSeries/TimeAxis posted at padded nTimeX) | fix | Fixed | 61b9964d |
+| ADP-12 (JPEG RGB2/RGB3 → RGB; convert_rgb_layout tags output ColorMode) | fix | Fixed | 487d3bd4 |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -290,11 +291,12 @@ Rust: `crates/ad-plugins-rs/src/codec.rs:1080-1088` maps `1=JPEG,2=Zlib,3=Blosc,
 C: `Codec.h:12-18` `NONE=0,JPEG=1,BLOSC=2,LZ4=3,BSLZ4=4`.
 Impact: `COMPRESSOR=2` → Blosc in C, Zlib in Rust; `=3` → LZ4 vs Blosc; `=4` → BSLZ4 vs LZ4. Different codec + bytes. (Structural cause: ADC-10.)
 
-#### ADP-12: JPEG RGB2/RGB3 written with wrong dims and as grayscale
+#### ADP-12: JPEG RGB2/RGB3 written with wrong dims and as grayscale — FIXED (487d3bd4)
 Severity: Medium — fix
 Rust: `crates/ad-plugins-rs/src/file_jpeg.rs:81-105` converts to RGB1 but leaves the stale `ColorMode=RGB2/RGB3` attribute; `ndarray.rs:407-419` then mis-reads dims.
 C: `NDFileJPEG.cpp:67-78,158-167` width=dims[0], JCS_RGB, re-interleaves.
 Impact: RGB2 `[x=5,c=3,y=4]` → JPEG SOF width=3,height=4,1 grayscale component. Every RGB2/RGB3 JPEG wrong.
+FIXED at the root: `convert_rgb_layout` (ad-core-rs/color.rs) now tags its output with `dst_mode`'s ColorMode attribute instead of cloning the source's, so dims and attribute agree by construction. The JPEG writer (the only consumer that calls `.info()` on the *converted* array) then reads RGB1 → writes a correct width=x, height=y, 3-component RGB JPEG. Defect-family audit of the 5 `convert_rgb_layout` callers: color_convert.rs (876,894) overwrites ColorMode on its final output (intermediates unaffected); file_tiff.rs:120 reads `rgb1.dims[1]/[2]` directly (distinct — not via `.info()`); file_magick.rs:143 calls `.info()` on the *original* array (distinct); only file_jpeg.rs:87 read the converted array's `.info()` → SAME defect, now fixed. The broader color.rs converter family (mono_to_rgb1, yuv*→rgb1, rgb1_to_mono…) also clones ColorMode but no current consumer `.info()`-mis-reads them (distinct, latent — not fixed). Tests: test_adp12_rgb2/rgb3_jpeg_written_as_rgb_not_grayscale.
 
 #### ADP-13: Stats centroid/profiles computed for ndims>2; C rejects them
 Severity: Medium — fix

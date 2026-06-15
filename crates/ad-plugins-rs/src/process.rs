@@ -405,12 +405,14 @@ impl ProcessState {
                 if do_offset_scale {
                     *v = (*v + offset) * scale;
                 }
-                // Stage 4: Clipping
-                if do_low_clip && *v < low_clip_thresh {
-                    *v = low_clip_value;
-                }
+                // Stage 4: Clipping — C applies high-clip THEN low-clip
+                // (NDPluginProcess.cpp:175-176). When the two thresholds cross
+                // (high < low) the order changes the result, so it must match.
                 if do_high_clip && *v > high_clip_thresh {
                     *v = high_clip_value;
+                }
+                if do_low_clip && *v < low_clip_thresh {
+                    *v = low_clip_value;
                 }
             };
 
@@ -969,6 +971,30 @@ mod tests {
             assert_eq!(v[0], 10); // clipped up
             assert_eq!(v[1], 50); // unchanged
             assert_eq!(v[2], 100); // clipped down
+        }
+    }
+
+    #[test]
+    fn test_adp5_clip_order_high_before_low() {
+        // C applies high-clip THEN low-clip (NDPluginProcess.cpp:175-176). With
+        // crossing thresholds (high < low) the order is observable:
+        //   v=200 → high(>100 ⇒ 10) → low(<50 ⇒ 999) ⇒ 999
+        // Low-then-high would instead give 200 → (not <50) → high(>100 ⇒ 10) ⇒ 10.
+        let input = make_f64_array(&[200.0]);
+        let mut state = ProcessState::new(ProcessConfig {
+            enable_high_clip: true,
+            high_clip_thresh: 100.0,
+            high_clip_value: 10.0,
+            enable_low_clip: true,
+            low_clip_thresh: 50.0,
+            low_clip_value: 999.0,
+            ..Default::default()
+        });
+        let result = state.process(&input).unwrap();
+        if let NDDataBuffer::F64(ref v) = result.data {
+            assert_eq!(v[0], 999.0);
+        } else {
+            panic!("expected F64 output");
         }
     }
 

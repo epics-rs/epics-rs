@@ -925,7 +925,7 @@ C: `NDPluginCircularBuff.cpp:67-78` `setDoubleParam(NDCircBuffTriggerAVal, args[
 Impact: Clients reading `CIRC_BUFF_TRIGGER_A_VAL`/`_B_VAL`/`_CALC_VAL` (asynFloat64) see live values in C; in Rust these registered Float64 params always remain at default 0.0.
 
 #### ADP-42: NDPluginCircularBuff Calc trigger fires on NaN/Inf where C guards against it
-Severity: Medium — verify
+Severity: Medium — verify → **FIXED 11d7ae68** (verified REAL: NaN/Inf calc results are reachable — a missing trigger attribute defaults to `f64::NAN` (existing test `test_calc_trigger_values_nan_when_attr_absent`), and `A/B`-style expressions with a zero denominator yield Inf; both `NaN != 0.0` and `Inf != 0.0` are true in Rust so the bare gate fired where C does not. Gate changed to `calc.is_finite() && calc != 0.0` at `circular_buff.rs:243` — `is_finite` is exactly C's `!isnan && !isinf`. Regression test `test_calc_trigger_skips_nan_and_inf_results`.)
 Rust: `circular_buff.rs:204-223` missing attribute → `f64::NAN` for A/B; trigger fires when `evaluate_vars(…) != 0.0`.
 C: `NDPluginCircularBuff.cpp:43-77` args default to `epicsNAN`; trigger fires only when `!isnan(calcResult) && !isinf(calcResult) && (calcResult != 0)`.
 Impact: When the calc result is NaN/Inf (e.g. expression `A` with A absent), C does **not** trigger; Rust's `!= 0.0` is true for NaN, so Rust fires a spurious trigger (pre-buffer flush + post frames) where C does not.

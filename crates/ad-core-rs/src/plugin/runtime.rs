@@ -577,7 +577,14 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
         // non-delivering frame must not enter the MaxByteRate throttle or the
         // sort buffer — only the metadata params (beginProcessCallbacks) are
         // published. Route (throttle + sort) only when delivering.
-        let ready = if self.array_callbacks {
+        //
+        // NDPluginStdArrays is the exception: it sets NDArrayCallbacks=0 yet
+        // still serves its typed-array waveforms (STD_ARRAY_DATA). Those are
+        // NOT the `doCallbacksGenericPointer` downstream path — they fire
+        // regardless of NDArrayCallbacks and ARE subject to the MaxByteRate
+        // throttle (NDPluginStdArrays.cpp:58 per-interface `throttled()`). So
+        // route whenever we deliver downstream OR serve the StdArray waveforms.
+        let ready = if self.array_callbacks || self.std_array_data_param.is_some() {
             self.route_output_arrays(result.output_arrays)
         } else {
             Vec::new()
@@ -711,11 +718,14 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
         if let Some(report_arr) = output_arrays.first().map(|a| a.as_ref()).or(fallback_array) {
             self.array_counter += 1;
 
-            // Fire array data interrupt directly (C EPICS pattern). Gated by
-            // `deliver` (NDArrayCallbacks) — C++ `doCallbacksGenericPointer`
-            // runs only past the `endProcessCallbacks` NDArrayCallbacks==0
-            // early-return (NDPluginDriver.cpp:258-265).
-            if let (true, Some(param)) = (deliver, self.std_array_data_param) {
+            // Fire the StdArray waveform interrupt directly (C EPICS pattern).
+            // This is NDPluginStdArrays' typed-array callback
+            // (NDPluginStdArrays.cpp:71-73 `arrayInterruptCallback`), NOT the
+            // `doCallbacksGenericPointer` downstream path: C fires it whether or
+            // not NDArrayCallbacks is set (StdArrays defaults NDArrayCallbacks=0),
+            // so it must NOT be gated by `deliver`. The MaxByteRate throttle was
+            // already applied to `report_arr` upstream in `route_output_arrays`.
+            if let Some(param) = self.std_array_data_param {
                 use crate::ndarray::NDDataBuffer;
                 use asyn_rs::param::ParamValue;
                 let value = match &report_arr.data {

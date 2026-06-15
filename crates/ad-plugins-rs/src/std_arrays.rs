@@ -171,4 +171,58 @@ mod tests {
         // A non-terminal plugin keeps the default: it does deliver downstream.
         assert!(PassthroughProcessor::new("NDPluginProcess").does_array_callbacks());
     }
+
+    #[test]
+    fn test_std_arrays_serves_waveform_with_callbacks_off() {
+        // C NDPluginStdArrays fires its typed-array waveform callbacks
+        // (NDPluginStdArrays.cpp:71-73) regardless of NDArrayCallbacks — and it
+        // defaults NDArrayCallbacks=0. So the ArrayData waveform on I/O Intr
+        // must still update with NDArrayCallbacks=0. This guards against the
+        // STD_ARRAY_DATA interrupt being gated by the downstream-delivery flag.
+        use asyn_rs::param::ParamValue;
+        use std::time::Duration;
+
+        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let wiring = Arc::new(WiringRegistry::new());
+        let (handle, _data, _jh) = create_std_arrays_runtime("IMAGE1", pool, "", wiring);
+
+        let port = handle.port_runtime().port_handle();
+        port.write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1)
+            .unwrap();
+        // Force NDArrayCallbacks=0 at runtime (StdArrays' C default) — the
+        // waveform output must still fire.
+        port.write_int32_blocking(handle.ndarray_params.array_callbacks, 0, 0)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+
+        let mut rx = port.interrupts().subscribe_async();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(handle.array_sender().publish(make_array(7)));
+        std::thread::sleep(Duration::from_millis(100));
+
+        // make_array(7) is a 4-element UInt8 array → the STD_ARRAY_DATA
+        // interrupt carries it as an Int8Array; the dimensions interrupt carries
+        // an Int32Array. Finding an Int8Array interrupt proves the waveform was
+        // served despite NDArrayCallbacks=0.
+        let mut served = false;
+        loop {
+            match rx.try_recv() {
+                Ok(v) => {
+                    if matches!(v.value, ParamValue::Int8Array(_)) {
+                        served = true;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            served,
+            "StdArrays must serve STD_ARRAY_DATA with NDArrayCallbacks=0"
+        );
+    }
 }

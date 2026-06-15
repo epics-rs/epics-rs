@@ -40,21 +40,21 @@ epics-rs reimplements the core components of C/C++ EPICS in Rust:
 
 ## Installation
 
-**Current release: v0.19.2** — a large C/C++ parity-hardening release:
-761 commits since `v0.18.6` (~557 parity fixes + ~66 additive features)
-across the native PVA protocol, the QSRV/bridge gateway and pvalink, CA,
-asyn, and base/db — including sseq/PACT async records, DBF link-class
-typing, the CA/PVA gateways, and a CA-facility-only iocInit external-link
-wait. Versioned as a minor bump for its breadth and source-facing
-trait-contract refinements (e.g. `ChannelSource`); source/driver authors
-implementing those traits should review them before upgrading. See
-[`CHANGELOG.md`](./CHANGELOG.md) for the full audit trail.
+**Current release: v0.20.2** — the `v0.20.x` line completes a full C-parity
+sweep of the motor record against `epics-modules/motor` and adds per-field
+DBE monitor event masks end to end (`v0.20.0`), then layers ~60 commits of
+C-parity regression fixes (one commit per finding) across base/db, CA, the
+native PVA protocol, the QSRV/bridge gateway, asyn, motor, and the std /
+scaler / optics modules (`v0.20.1`, `v0.20.2`). `v0.20.0` is a semver-minor
+bump for its breaking `MotorCommand` / `AsynMotor` additions; the `.1` and
+`.2` patches are non-breaking. See [`CHANGELOG.md`](./CHANGELOG.md) for the
+full audit trail.
 
 All crates are published on [crates.io](https://crates.io/crates/epics-rs). Add `epics-rs` with the feature flags you need:
 
 ```toml
 [dependencies]
-epics-rs = { version = "0.19", features = ["ad"] }
+epics-rs = { version = "0.20", features = ["ad"] }
 ```
 
 This single dependency pulls in everything needed. In your code:
@@ -85,18 +85,18 @@ use epics_rs::asyn;        // port driver framework
 | `optics` | Optics (table, monochromator, slit, filter, BPM) | no |
 | `full` | Everything above | no |
 
-> The `mqtt` driver is not surfaced through the umbrella crate. Depend on `mqtt-rs = "0.19"` directly when needed.
+> The `mqtt` driver is not surfaced through the umbrella crate. Depend on `mqtt-rs = "0.20"` directly when needed.
 >
 > The Modbus driver is not surfaced through the umbrella crate either.
-> Depend on `epics-modbus-rs = "0.19"` directly when needed; the Rust
+> Depend on `epics-modbus-rs = "0.20"` directly when needed; the Rust
 > library name is `modbus_rs`, so consumers write `use modbus_rs::...`.
 
 ```toml
 # Motor + areaDetector
-epics-rs = { version = "0.19", features = ["motor", "ad"] }
+epics-rs = { version = "0.20", features = ["motor", "ad"] }
 
 # Everything
-epics-rs = { version = "0.19", features = ["full"] }
+epics-rs = { version = "0.20", features = ["full"] }
 ```
 
 ### Individual Crates
@@ -105,8 +105,8 @@ You can also depend on sub-crates directly if you only need specific functionali
 
 ```toml
 [dependencies]
-ad-plugins-rs = "0.19"  # just the areaDetector plugins
-epics-base-rs = "0.19"  # just the IOC runtime
+ad-plugins-rs = "0.20"  # just the areaDetector plugins
+epics-base-rs = "0.20"  # just the IOC runtime
 ```
 
 ## Workspace Structure
@@ -358,11 +358,11 @@ either way.
 ```toml
 [dependencies]
 # Client + server, both protocols (recommended for new projects):
-epics-rs = { version = "0.19", features = ["pva"] }   # ca enabled by default
+epics-rs = { version = "0.20", features = ["pva"] }   # ca enabled by default
 
 # Or per-protocol, no umbrella:
-epics-ca-rs  = "0.19"
-epics-pva-rs = "0.19"
+epics-ca-rs  = "0.20"
+epics-pva-rs = "0.20"
 ```
 
 Standard EPICS environment variables (`EPICS_CA_ADDR_LIST` /
@@ -679,7 +679,7 @@ Port of the EPICS [optics](https://github.com/epics-modules/optics) synApps modu
 - **Ion chamber** — I₀ intensity calculation with gas mixture absorption
 - **`seqStart` command** — general-purpose launcher for all optics state machines (replaces C EPICS `seq`)
 - **36 database templates** and PyDM UI screens bundled
-- **362 tests** including 46 golden tests verified against compiled C tableRecord.c output
+- **374 tests** including 46 golden tests verified against compiled C tableRecord.c output
 
 ### Autosave (in epics-base-rs)
 
@@ -963,11 +963,28 @@ pydm opi/pydm/ADTop.ui -m "P=SIM1:,R=cam1:"
 ## Testing
 
 ```bash
-# All tests (3,000+)
+# All tests (6,000+)
 cargo test --workspace
 ```
 
 Test coverage: protocol encoding, wire-format golden packets (CA + PVA), pvxs interop fixtures, search-engine deadline scheduling, ORIGIN_TAG forwarding, snapshot generation, GR/CTRL metadata serialization, record processing, link chains, calc engine, .db parsing, access security, autosave, iocsh, IOC builder, event scheduling, motor state machine, asyn port driver, PID algorithms, scaler state machine, optics table record (46 golden tests vs C), crystallography, X-ray absorption, monochromator/slit/filter/BPM controllers, derive macros, etc.
+
+### Regression IOC (end-to-end)
+
+[`examples/regression-ioc`](examples/regression-ioc/) boots a real in-process
+IOC — CA + PVA servers over one shared database — and asserts fixed behavior
+**over the wire**, pinning recurring bug-fix families from v0.15.x–v0.20.x
+(processing-chain/FLNK, monitor-on-change, periodic SCAN, motor
+move-on-Passive-VAL, enum/`DBR_ENUM`, `DBF_MENU`, alarm severity, timestamp).
+
+```bash
+cargo nextest run -p regression-ioc          # or: cargo test -p regression-ioc
+cargo run -p regression-ioc --bin regression_ioc   # run the IOC by hand
+```
+
+Because `examples/*` are workspace members, these run automatically in CI under
+`cargo nextest run --workspace` (`rust.yml`) and the cross-platform matrix
+(`--profile ci`, `cross-platform.yml`); no external tools are needed.
 
 ## Requirements
 

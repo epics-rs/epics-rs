@@ -47,6 +47,43 @@ const MAX_EXTRA_DIMS: usize = 10;
 /// (matches C `NDDataType_t`). `read_file` uses it to recover the exact type.
 const DTYPE_ATTR: &str = "NDArrayDataType";
 
+/// Built-in NeXus layout used when no user layout XML is configured, mirroring
+/// C `LayoutXML::DEFAULT_LAYOUT` (NDFileHDF5LayoutXML.cpp:43-70) which C loads
+/// via `layout.load_xml()` for an empty `HDF5_layoutFilename` (NDFileHDF5.cpp:
+/// 3896-3906). It places the detector image at `/entry/instrument/detector/data`
+/// inside a full NXentry/NXinstrument/NXdetector/NXcollection/NXdata tree, with
+/// an `/entry/data/data` hardlink to the detector dataset.
+const DEFAULT_LAYOUT_XML: &str = r#"
+<hdf5_layout>
+<group name="entry">
+  <attribute name="NX_class" source="constant" value="NXentry" type="string"></attribute>
+  <group name="instrument">
+    <attribute name="NX_class" source="constant" value="NXinstrument" type="string"></attribute>
+    <group name="detector">
+      <attribute name="NX_class" source="constant" value="NXdetector" type="string"></attribute>
+      <dataset name="data" source="detector" det_default="true">
+        <attribute name="signal" source="constant" value="1" type="int"></attribute>
+      </dataset>
+      <group name="NDAttributes">
+        <attribute name="NX_class" source="constant" value="NXcollection" type="string"></attribute>
+        <dataset name="ColorMode" source="ndattribute" ndattribute="ColorMode"></dataset>
+      </group>
+    </group>
+    <group name="NDAttributes" ndattr_default="true">
+      <attribute name="NX_class" source="constant" value="NXcollection" type="string"></attribute>
+    </group>
+    <group name="performance">
+      <dataset name="timestamp"></dataset>
+    </group>
+  </group>
+  <group name="data">
+    <attribute name="NX_class" source="constant" value="NXdata" type="string"></attribute>
+    <hardlink name="data" target="/entry/instrument/detector/data"></hardlink>
+  </group>
+</group>
+</hdf5_layout>
+"#;
+
 /// User-controlled chunk geometry (C `HDF5_*Chunks` params).
 #[derive(Clone)]
 struct ChunkConfig {
@@ -341,7 +378,8 @@ impl Hdf5Writer {
             perf_first: None,
             attr_datasets: Vec::new(),
             layout_filename: None,
-            layout: None,
+            // No user layout XML by default → C's built-in NeXus DEFAULT_LAYOUT.
+            layout: Some(Self::default_layout()),
             layout_valid: false,
             layout_error: String::new(),
             resolved_dataset_path: "data".to_string(),
@@ -452,12 +490,22 @@ impl Hdf5Writer {
         self.dim_att_datasets = v;
     }
 
+    /// Parse the built-in [`DEFAULT_LAYOUT_XML`] into an `Hdf5Layout`. The
+    /// constant is known-good (covered by a unit test), so a parse failure is a
+    /// build bug, not a runtime condition.
+    fn default_layout() -> Hdf5Layout {
+        Hdf5Layout::parse(DEFAULT_LAYOUT_XML).expect("built-in default layout must parse")
+    }
+
     /// Set the layout XML filename and (re)parse it. Returns whether parsing
     /// succeeded; `layout_error` carries any message (C `HDF5_layoutErrorMsg`).
     pub fn set_layout_filename(&mut self, path: &str) -> bool {
         if path.trim().is_empty() {
+            // C loads the built-in DEFAULT_LAYOUT for an empty filename
+            // (NDFileHDF5.cpp:3896-3906); `layout_valid` tracks user-file
+            // validity, so it stays false here.
             self.layout_filename = None;
-            self.layout = None;
+            self.layout = Some(Self::default_layout());
             self.layout_valid = false;
             self.layout_error.clear();
             return true;
@@ -2561,7 +2609,7 @@ mod tests {
 
         // Single-frame standard mode: dataset is [1, 4, 4].
         let h5 = H5File::open(&path).unwrap();
-        let ds = h5.dataset("data").unwrap();
+        let ds = h5.dataset("entry/instrument/detector/data").unwrap();
         assert_eq!(ds.shape(), vec![1, 4, 4]);
         let data: Vec<u8> = ds.read_raw().unwrap();
         assert_eq!(data[0], 0);
@@ -2609,12 +2657,12 @@ mod tests {
         // Single extensible dataset [3, 4, 4] — NOT one dataset per frame.
         let h5 = H5File::open(&path).unwrap();
         let names = h5.dataset_names();
-        assert!(names.contains(&"data".to_string()));
+        assert!(names.contains(&"entry/instrument/detector/data".to_string()));
         assert!(
             !names.contains(&"data_1".to_string()),
             "must not write per-frame datasets"
         );
-        let ds = h5.dataset("data").unwrap();
+        let ds = h5.dataset("entry/instrument/detector/data").unwrap();
         assert_eq!(
             ds.shape(),
             vec![3, 4, 4],
@@ -2659,7 +2707,7 @@ mod tests {
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
-        let ds = h5.dataset("data").unwrap();
+        let ds = h5.dataset("entry/instrument/detector/data").unwrap();
         assert_eq!(ds.shape(), vec![3, 8, 8], "shape must not be chunk-padded");
         assert_eq!(
             ds.chunk_dims(),
@@ -2712,7 +2760,7 @@ mod tests {
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
-        let ds = h5.dataset("data").unwrap();
+        let ds = h5.dataset("entry/instrument/detector/data").unwrap();
         assert_eq!(ds.shape(), vec![2, 8, 8]);
         assert_eq!(ds.chunk_dims(), Some(vec![1, 4, 4]));
         let raw: Vec<u16> = ds.read_raw().unwrap();
@@ -2751,7 +2799,7 @@ mod tests {
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
-        let ds = h5.dataset("data").unwrap();
+        let ds = h5.dataset("entry/instrument/detector/data").unwrap();
         assert_eq!(ds.shape(), vec![2, 8, 8], "extent trimmed, not padded");
         assert_eq!(ds.chunk_dims(), Some(vec![1, 3, 4]));
         let raw: Vec<u16> = ds.read_raw().unwrap();
@@ -2792,7 +2840,7 @@ mod tests {
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
-        let ds = h5.dataset("data").unwrap();
+        let ds = h5.dataset("entry/instrument/detector/data").unwrap();
         assert_eq!(ds.shape(), vec![5, 4, 4], "exact frame count, no padding");
         assert_eq!(ds.chunk_dims(), Some(vec![2, 4, 4]));
         let raw: Vec<u16> = ds.read_raw().unwrap();
@@ -2836,7 +2884,7 @@ mod tests {
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
-        let ds = h5.dataset("data").unwrap();
+        let ds = h5.dataset("entry/instrument/detector/data").unwrap();
         assert_eq!(ds.shape(), vec![3, 8, 8], "exact frame count");
         assert_eq!(ds.chunk_dims(), Some(vec![2, 4, 4]));
         let raw: Vec<u16> = ds.read_raw().unwrap();
@@ -2887,12 +2935,14 @@ mod tests {
 
         let h5 = H5File::open(&path).unwrap();
         // One HDF5 dataset per NDAttribute, under NDAttributes/, [nframes].
-        let exp = h5.dataset("NDAttributes/exposure").unwrap();
+        let exp = h5
+            .dataset("entry/instrument/NDAttributes/exposure")
+            .unwrap();
         assert_eq!(exp.shape(), vec![3]);
         let exp_vals: Vec<f64> = exp.read_raw().unwrap();
         assert_eq!(exp_vals, vec![0.5, 0.75, 1.25]);
 
-        let cnt = h5.dataset("NDAttributes/count").unwrap();
+        let cnt = h5.dataset("entry/instrument/NDAttributes/count").unwrap();
         assert_eq!(cnt.shape(), vec![3]);
         // Numeric type preserved: i32, not stringified.
         let cnt_vals: Vec<i32> = cnt.read_raw().unwrap();
@@ -2932,7 +2982,7 @@ mod tests {
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
-        let ds = h5.dataset("NDAttributes/count").unwrap();
+        let ds = h5.dataset("entry/instrument/NDAttributes/count").unwrap();
         assert_eq!(ds.shape(), vec![3]);
         assert_eq!(ds.chunk_dims(), Some(vec![10]));
         let vals: Vec<i32> = ds.read_raw().unwrap();
@@ -2961,7 +3011,7 @@ mod tests {
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
-        let ds = h5.dataset("NDAttributes/count").unwrap();
+        let ds = h5.dataset("entry/instrument/NDAttributes/count").unwrap();
         assert_eq!(ds.chunk_dims(), Some(vec![1]));
         std::fs::remove_file(&path).ok();
     }
@@ -2993,7 +3043,9 @@ mod tests {
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
-        let ds = h5.dataset("NDAttributes/ColorMode").unwrap();
+        let ds = h5
+            .dataset("entry/instrument/NDAttributes/ColorMode")
+            .unwrap();
         // Rank-1 [2] of a 256-byte fixed-length string element, not [2,256] u8.
         assert_eq!(ds.shape(), vec![2]);
         assert_eq!(ds.element_size(), MAX_ATTRIBUTE_STRING_SIZE);
@@ -3037,7 +3089,9 @@ mod tests {
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
-        let ds = h5.dataset("NDAttributes/AcquireTime").unwrap();
+        let ds = h5
+            .dataset("entry/instrument/NDAttributes/AcquireTime")
+            .unwrap();
         let read = |n: &str| ds.attr(n).unwrap().read_string().unwrap();
         assert_eq!(read("NDAttrName"), "AcquireTime");
         assert_eq!(read("NDAttrDescription"), "exposure time");
@@ -3066,7 +3120,7 @@ mod tests {
         writer.write_file(&arr).unwrap();
         writer.close_file().unwrap();
         let h5 = H5File::open(&path).unwrap();
-        let ds = h5.dataset("data").unwrap();
+        let ds = h5.dataset("entry/instrument/detector/data").unwrap();
         let geti = |n: &str| -> i32 { ds.attr(n).unwrap().read_numeric().unwrap() };
         assert_eq!(geti("NDArrayNumDims"), 1);
         assert_eq!(geti("NDArrayDimOffset"), 3);
@@ -3086,7 +3140,7 @@ mod tests {
         writer.write_file(&arr).unwrap();
         writer.close_file().unwrap();
         let h5 = H5File::open(&path).unwrap();
-        let ds = h5.dataset("data").unwrap();
+        let ds = h5.dataset("entry/instrument/detector/data").unwrap();
         let numdims: i32 = ds.attr("NDArrayNumDims").unwrap().read_numeric().unwrap();
         assert_eq!(numdims, 2);
         let names = ds.attr_names().unwrap();
@@ -3113,7 +3167,7 @@ mod tests {
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
-        let ds = h5.dataset("data").unwrap();
+        let ds = h5.dataset("entry/instrument/detector/data").unwrap();
         let fv: f64 = ds.attr("HDF5_fillValue").unwrap().read_numeric().unwrap();
         assert_eq!(fv, 7.5);
         std::fs::remove_file(&path).ok();
@@ -3152,7 +3206,9 @@ mod tests {
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
-        let ts = h5.dataset("performance/timestamp").unwrap();
+        let ts = h5
+            .dataset("entry/instrument/performance/timestamp")
+            .unwrap();
         assert_eq!(ts.shape(), vec![2, 5]);
         let vals: Vec<f64> = ts.read_raw().unwrap();
         assert_eq!(vals.len(), 10);
@@ -3182,7 +3238,9 @@ mod tests {
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
-        let ts = h5.dataset("performance/timestamp").unwrap();
+        let ts = h5
+            .dataset("entry/instrument/performance/timestamp")
+            .unwrap();
         assert_eq!(ts.shape(), vec![2, 5]);
         assert_eq!(ts.chunk_dims(), Some(vec![8, 5]));
         let vals: Vec<f64> = ts.read_raw().unwrap();
@@ -3308,7 +3366,7 @@ mod tests {
         );
 
         let h5file = H5File::open(&path).unwrap();
-        let ds = h5file.dataset("data").unwrap();
+        let ds = h5file.dataset("entry/instrument/detector/data").unwrap();
         let data: Vec<u16> = ds.read_raw().unwrap();
         assert_eq!(data.len(), 64 * 64);
         assert_eq!(data[0], 0);
@@ -3339,7 +3397,7 @@ mod tests {
         writer.close_file().unwrap();
 
         let h5file = H5File::open(&path).unwrap();
-        let ds = h5file.dataset("data").unwrap();
+        let ds = h5file.dataset("entry/instrument/detector/data").unwrap();
         let data: Vec<u8> = ds.read_raw().unwrap();
         assert_eq!(data.len(), 32 * 32);
         assert_eq!(data[0], 0);
@@ -3369,7 +3427,7 @@ mod tests {
         writer.close_file().unwrap();
 
         let h5file = H5File::open(&path).unwrap();
-        let ds = h5file.dataset("data").unwrap();
+        let ds = h5file.dataset("entry/instrument/detector/data").unwrap();
         let data: Vec<u16> = ds.read_raw().unwrap();
         assert_eq!(data.len(), 64 * 64);
         assert_eq!(data[0], 0);
@@ -3402,7 +3460,7 @@ mod tests {
         writer.close_file().unwrap();
 
         let h5file = H5File::open(&path).unwrap();
-        let ds = h5file.dataset("data").unwrap();
+        let ds = h5file.dataset("entry/instrument/detector/data").unwrap();
         let data: Vec<u8> = ds.read_raw().unwrap();
         assert_eq!(data.len(), 64 * 64);
         assert_eq!(data[20], (20 % 13) as u8);
@@ -3453,7 +3511,7 @@ mod tests {
         writer.close_file().unwrap();
 
         let h5file = H5File::open(&path).unwrap();
-        let ds = h5file.dataset("data").unwrap();
+        let ds = h5file.dataset("entry/instrument/detector/data").unwrap();
         let data: Vec<u16> = ds.read_raw().unwrap();
         assert_eq!(data.len(), 8 * 8);
         for (i, &v) in data.iter().enumerate() {
@@ -3493,7 +3551,7 @@ mod tests {
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
-        let ds = h5.dataset("data").unwrap();
+        let ds = h5.dataset("entry/instrument/detector/data").unwrap();
         assert_eq!(ds.shape(), vec![2, 8, 8]);
         // Data still round-trips correctly through the per-frame chunks.
         let data: Vec<u16> = ds.read_raw().unwrap();
@@ -3559,7 +3617,7 @@ mod tests {
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
-        let ds = h5.dataset("data").unwrap();
+        let ds = h5.dataset("entry/instrument/detector/data").unwrap();
         // Flat leading axis = product(2,3) = 6.
         assert_eq!(ds.shape(), vec![6, 4, 4]);
         let data: Vec<u16> = ds.read_raw().unwrap();
@@ -3624,12 +3682,16 @@ mod tests {
 
         // Read back via SwmrFileReader
         let mut reader = rust_hdf5::swmr::SwmrFileReader::open(&path).unwrap();
-        let shape = reader.dataset_shape("data").unwrap();
+        let shape = reader
+            .dataset_shape("entry/instrument/detector/data")
+            .unwrap();
         assert_eq!(shape[0], 3); // 3 frames
         assert_eq!(shape[1], 8);
         assert_eq!(shape[2], 8);
 
-        let data: Vec<f32> = reader.read_dataset("data").unwrap();
+        let data: Vec<f32> = reader
+            .read_dataset("entry/instrument/detector/data")
+            .unwrap();
         assert_eq!(data.len(), 3 * 8 * 8);
 
         std::fs::remove_file(&path).ok();
@@ -3660,9 +3722,13 @@ mod tests {
 
         // The compressed SWMR dataset round-trips.
         let mut reader = rust_hdf5::swmr::SwmrFileReader::open(&path).unwrap();
-        let shape = reader.dataset_shape("data").unwrap();
+        let shape = reader
+            .dataset_shape("entry/instrument/detector/data")
+            .unwrap();
         assert_eq!(shape, vec![2, 8, 8]);
-        let data: Vec<u16> = reader.read_dataset("data").unwrap();
+        let data: Vec<u16> = reader
+            .read_dataset("entry/instrument/detector/data")
+            .unwrap();
         assert_eq!(data.len(), 2 * 8 * 8);
 
         std::fs::remove_file(&path).ok();
@@ -4050,9 +4116,32 @@ mod tests {
     }
 
     #[test]
-    fn test_no_layout_keeps_flat_root_default() {
-        // Without a layout file the writer keeps the flat-root `data` default.
-        let path = temp_path("hdf5_flat_default");
+    fn test_default_layout_parses_and_resolves_nexus_paths() {
+        // Guards DEFAULT_LAYOUT_XML + the `default_layout()` expect(): the
+        // built-in layout must parse and resolve C's NeXus placements
+        // (NDFileHDF5LayoutXML.cpp:43-70).
+        let layout = Hdf5Writer::default_layout();
+        assert_eq!(
+            layout.detector_dataset_path().as_deref(),
+            Some("/entry/instrument/detector/data")
+        );
+        assert_eq!(
+            layout.ndattr_default_group().as_deref(),
+            Some("/entry/instrument/NDAttributes")
+        );
+        assert_eq!(
+            layout.dataset_group_path("timestamp").as_deref(),
+            Some("/entry/instrument/performance")
+        );
+    }
+
+    #[test]
+    fn test_no_layout_uses_default_nexus_layout() {
+        // With no layout file the writer loads C's built-in DEFAULT_LAYOUT
+        // (NDFileHDF5LayoutXML.cpp:43-70): the detector image lands at
+        // /entry/instrument/detector/data inside the NeXus tree, with an
+        // /entry/data/data hardlink to it — not a flat-root `data`.
+        let path = temp_path("hdf5_default_layout");
         let mut writer = Hdf5Writer::new();
         let arr = NDArray::new(
             vec![NDDimension::new(4), NDDimension::new(4)],
@@ -4063,7 +4152,17 @@ mod tests {
         writer.close_file().unwrap();
 
         let h5 = H5File::open(&path).unwrap();
-        assert!(h5.dataset_names().contains(&"data".to_string()));
+        // Detector dataset at the NeXus path, not flat root.
+        let det = h5.dataset("entry/instrument/detector/data").unwrap();
+        assert_eq!(det.shape(), vec![1, 4, 4]);
+        assert!(
+            !h5.dataset_names().contains(&"data".to_string()),
+            "must not write a flat-root `data`; got {:?}",
+            h5.dataset_names()
+        );
+        // The NXdata hardlink /entry/data/data resolves to the same image.
+        let linked = h5.dataset("entry/data/data").unwrap();
+        assert_eq!(linked.shape(), vec![1, 4, 4]);
         std::fs::remove_file(&path).ok();
     }
 }

@@ -216,6 +216,50 @@ fn push_str(updates: &mut Vec<ParamUpdate>, idx: Option<usize>, value: String) {
     }
 }
 
+/// Format `v` the way C++ `std::ostream << double` does by default
+/// (`defaultfloat`, stream precision 6) — equivalent to C `printf("%g", v)`.
+/// C builds the NDPos_CurrentPos string by streaming each position double
+/// (NDPosPlugin.cpp:159), so the observable octet value must use this format
+/// rather than Rust's shortest-round-trip `Display`.
+fn format_cpp_g6(v: f64) -> String {
+    const PREC: i32 = 6;
+    if v == 0.0 {
+        return if v.is_sign_negative() { "-0" } else { "0" }.to_string();
+    }
+    if v.is_nan() {
+        return "nan".to_string();
+    }
+    if v.is_infinite() {
+        return if v < 0.0 { "-inf" } else { "inf" }.to_string();
+    }
+    // Round to PREC significant figures via scientific form, then read the
+    // decimal exponent — this avoids log10 floor off-by-one at powers of ten.
+    let sci = format!("{:.*e}", (PREC - 1) as usize, v);
+    let epos = sci.find('e').unwrap();
+    let exp: i32 = sci[epos + 1..].parse().unwrap();
+    if exp >= -4 && exp < PREC {
+        // %f branch: precision = PREC-1-exp digits after the point.
+        let prec = (PREC - 1 - exp).max(0) as usize;
+        strip_g_trailing(&format!("{:.*}", prec, v))
+    } else {
+        // %e branch: strip mantissa trailing zeros, render a signed 2+digit
+        // exponent (C printf style: "1.23457e+06", "1e-05").
+        let mantissa = strip_g_trailing(&sci[..epos]);
+        let sign = if exp < 0 { '-' } else { '+' };
+        format!("{}e{}{:02}", mantissa, sign, exp.abs())
+    }
+}
+
+/// Strip `%g` trailing zeros: remove trailing '0' digits after a '.', then a
+/// dangling '.'. No-op for strings without a decimal point.
+fn strip_g_trailing(s: &str) -> String {
+    if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        s.to_string()
+    }
+}
+
 /// Parse positions from the C++ NDPosPlugin `pos_layout` XML format.
 ///
 /// Mirrors `NDPosPluginFileReader`: ordered dimension names are collected from
@@ -405,16 +449,29 @@ impl NDPluginProcess for PosPluginProcessor {
         };
 
         let mut out = array.clone();
-        for (key, value) in &position {
-            // C NDPosPlugin.cpp:161 constructs each attribute with the fixed
-            // description "Position of NDArray".
+        // C iterates the position std::map (sorted ascending by key), building
+        // the CurrentPos string "[k=v,...]" and attaching each attribute in the
+        // same loop (NDPosPlugin.cpp:149-166). The attribute description is the
+        // fixed "Position of NDArray" (line 161).
+        let mut keys: Vec<&String> = position.keys().collect();
+        keys.sort();
+        let mut current_pos = String::from("[");
+        for (n, key) in keys.iter().enumerate() {
+            let value = position[*key];
+            if n > 0 {
+                current_pos.push(',');
+            }
+            current_pos.push_str(key);
+            current_pos.push('=');
+            current_pos.push_str(&format_cpp_g6(value));
             out.attributes.add(NDAttribute::new_static(
-                key.clone(),
+                (*key).clone(),
                 "Position of NDArray",
                 NDAttrSource::Driver,
-                NDAttrValue::Float64(*value),
+                NDAttrValue::Float64(value),
             ));
         }
+        current_pos.push(']');
 
         self.advance();
         self.expected_id = array.unique_id + 1;
@@ -443,6 +500,8 @@ impl NDPluginProcess for PosPluginProcessor {
             self.params.current_index,
             self.current_index_param(),
         );
+        // C setStringParam(NDPos_CurrentPos, ...) (NDPosPlugin.cpp:166).
+        push_str(&mut updates, self.params.current_pos, current_pos);
 
         ProcessResult {
             output_arrays: vec![Arc::new(out)],
@@ -964,5 +1023,47 @@ mod tests {
         };
         proc.on_param_change(3, &stop);
         assert!(!proc.running);
+    }
+
+    #[test]
+    fn test_current_pos_string_posted() {
+        // ADP-32: process_array posts NDPos_CurrentPos as "[k=v,...]" in sorted
+        // key order (C std::map), C++ %g(6) value formatting.
+        use ad_core_rs::plugin::runtime::ParamUpdate;
+        let mut proc = PosPluginProcessor::new(PosMode::Discard);
+        proc.params.current_pos = Some(30);
+
+        let mut p = HashMap::new();
+        p.insert("y".into(), 2.0);
+        p.insert("x".into(), 1.5);
+        proc.load_positions(vec![p]);
+        proc.start();
+
+        let pool = NDArrayPool::new(1_000_000);
+        let result = proc.process_array(&make_array(1), &pool);
+        let s = result.param_updates.iter().find_map(|u| match u {
+            ParamUpdate::Octet {
+                reason: 30, value, ..
+            } => Some(value.clone()),
+            _ => None,
+        });
+        assert_eq!(s.as_deref(), Some("[x=1.5,y=2]"));
+    }
+
+    #[test]
+    fn test_format_cpp_g6() {
+        // Matches C printf("%g") / C++ default ostream<<double (precision 6).
+        assert_eq!(format_cpp_g6(1.0), "1");
+        assert_eq!(format_cpp_g6(1.5), "1.5");
+        assert_eq!(format_cpp_g6(42.5), "42.5");
+        assert_eq!(format_cpp_g6(100.0), "100");
+        assert_eq!(format_cpp_g6(0.1), "0.1");
+        assert_eq!(format_cpp_g6(0.0001), "0.0001");
+        assert_eq!(format_cpp_g6(0.00001), "1e-05");
+        assert_eq!(format_cpp_g6(1_000_000.0), "1e+06");
+        assert_eq!(format_cpp_g6(1_234_567.0), "1.23457e+06");
+        assert_eq!(format_cpp_g6(123456.0), "123456");
+        assert_eq!(format_cpp_g6(-1.5), "-1.5");
+        assert_eq!(format_cpp_g6(0.0), "0");
     }
 }

@@ -583,6 +583,11 @@ impl NDPluginProcess for CircularBuffProcessor {
             } else {
                 // Stop
                 self.buffer.status = BufferStatus::Idle;
+                // C writeInt32(Control=0) resets the displayed image count to 0
+                // (NDPluginCircularBuff.cpp:259).
+                if let Some(idx) = self.params.current_image {
+                    updates.push(ParamUpdate::int32(idx, 0));
+                }
                 // C writeInt32(Control=0): "Acquisition Stopped"
                 // (NDPluginCircularBuff.cpp:260).
                 if let Some(idx) = self.params.status {
@@ -999,6 +1004,45 @@ mod tests {
         // Further triggers should be ignored
         cb.trigger();
         assert_eq!(cb.trigger_count(), 2); // unchanged
+    }
+
+    #[test]
+    fn test_stop_resets_current_image_and_status() {
+        // Regression for ADP-43 (+ ADP-40 stop string): a Control=0 write posts
+        // CURRENT_IMAGE=0 and STATUS="Acquisition Stopped".
+        use ad_core_rs::plugin::runtime::{ParamChangeValue, ParamUpdate, PluginParamSnapshot};
+
+        let mut processor = CircularBuffProcessor::new(2, 1, TriggerCondition::External);
+        processor.params.control = Some(10);
+        processor.params.current_image = Some(11);
+        processor.params.status = Some(12);
+
+        let snapshot = PluginParamSnapshot {
+            enable_callbacks: true,
+            reason: 10,
+            addr: 0,
+            value: ParamChangeValue::Int32(0), // stop
+        };
+        let result = processor.on_param_change(10, &snapshot);
+
+        assert!(
+            result.param_updates.iter().any(|u| matches!(
+                u,
+                ParamUpdate::Int32 {
+                    reason: 11,
+                    value: 0,
+                    ..
+                }
+            )),
+            "stop must post CURRENT_IMAGE=0"
+        );
+        assert!(
+            result.param_updates.iter().any(|u| matches!(
+                u,
+                ParamUpdate::Octet { reason: 12, value, .. } if value == "Acquisition Stopped"
+            )),
+            "stop must post STATUS=Acquisition Stopped"
+        );
     }
 
     #[test]

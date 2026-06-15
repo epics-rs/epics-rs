@@ -95,6 +95,7 @@ population). One commit per finding.
 | ADC-1 (PARAM NDAttribute type follows configured `datatype`, not runtime type) | verify→fix | Fixed (option: honor datatype) | eecf79c8 |
 | ADC-2 (`NDArrayCallbacks=0` must stop downstream NDArray delivery, plugin path) | fix | Fixed | cf59bf78 |
 | ADC-3 (plugin output must publish NDCodec / NDCompressedSize per array) | fix | Fixed | f3f44a39 |
+| ADC-5 (NDDimensions posts fixed ND_ARRAY_MAX_DIMS=10 zero-filled, not ndims) | fix-low | Fixed | 600adb66 |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -136,8 +137,9 @@ C: `NDPluginDriver.cpp:405-449` — a `deltaTime <= minCallbackTime` frame skips
 Impact: with nonzero MinCallbackTime under fast input, Rust's `DroppedArrays_RBV` over-counts vs C.
 Fix: `process_and_publish` throttle path returns `None` (no param post) and no longer increments `dropped_arrays`; the surviving increments (compression-unaware runtime path, queue-full channel.rs) match C:388/:440. Test `test_min_callback_time_throttle_not_counted` asserts DroppedArrays stays 0 after a throttled frame.
 
-#### ADC-5: NDDimensions int32-array post carries `ndims` elements, not `ND_ARRAY_MAX_DIMS` (10)
+#### ADC-5: NDDimensions int32-array post carries `ndims` elements, not `ND_ARRAY_MAX_DIMS` (10) — FIXED 600adb66
 Severity: Medium — fix-low
+Fix: new `ND_ARRAY_MAX_DIMS=10` constant; both posting sites (driver-base `write_array_params`, plugin runtime G8 interrupt) now build a 10-element zero-filled array, and the plugin `dims_prev` seed is zero-filled length-10 to match C's `dimsPrev_` change-detection.
 Rust: `crates/ad-core-rs/src/plugin/runtime.rs:742-757` (and `driver/ndarray_driver.rs:281-284`) post a length-`ndims` int32 array.
 C: `NDPluginDriver.cpp:221-231` posts `dimsPrev_[ND_ARRAY_MAX_DIMS]` (zero-filled) → `readInt32Array` returns 10.
 Impact: caget on `Dimensions_RBV` reads NORD=ndims in Rust vs 10 (trailing zeros) in C.

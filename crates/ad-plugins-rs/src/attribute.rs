@@ -176,17 +176,17 @@ impl NDPluginProcess for AttributeProcessor {
                 }
             }
         } else if reason == self.params.reset {
-            if params.value.as_i32() != 0 {
-                let mut updates = Vec::new();
-                for (i, ch) in self.channels.iter_mut().enumerate() {
-                    ch.value = 0.0;
-                    ch.value_sum = 0.0;
-                    let a = i as i32;
-                    updates.push(ParamUpdate::float64_addr(self.params.value, a, 0.0));
-                    updates.push(ParamUpdate::float64_addr(self.params.value_sum, a, 0.0));
-                }
-                return ParamChangeResult::updates(updates);
+            // C zeros Val/ValSum for all channels on ANY write to the reset
+            // param — there is no value test (NDPluginAttribute.cpp:123-128).
+            let mut updates = Vec::new();
+            for (i, ch) in self.channels.iter_mut().enumerate() {
+                ch.value = 0.0;
+                ch.value_sum = 0.0;
+                let a = i as i32;
+                updates.push(ParamUpdate::float64_addr(self.params.value, a, 0.0));
+                updates.push(ParamUpdate::float64_addr(self.params.value_sum, a, 0.0));
             }
+            return ParamChangeResult::updates(updates);
         }
 
         ParamChangeResult::updates(vec![])
@@ -378,6 +378,42 @@ mod tests {
 
         proc.process_array(&arr, &pool);
         assert!((proc.value() - 7.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_reset_clears_on_zero_write() {
+        // C NDPluginAttribute::writeInt32 zeros Val/ValSum on ANY write to the
+        // reset param, including value 0 (NDPluginAttribute.cpp:123-128).
+        let mut proc = AttributeProcessor::new("Count");
+        proc.params.value = 2;
+        proc.params.value_sum = 3;
+        proc.params.reset = 7;
+
+        let pool = NDArrayPool::new(1_000_000);
+        proc.process_array(&make_array_with_attr("Count", 100.0, 1), &pool);
+        assert!((proc.value_sum() - 100.0).abs() < 1e-10);
+
+        let snapshot = PluginParamSnapshot {
+            enable_callbacks: true,
+            reason: 7,
+            addr: 0,
+            value: ParamChangeValue::Int32(0),
+        };
+        let result = proc.on_param_change(7, &snapshot);
+
+        assert!((proc.value() - 0.0).abs() < 1e-10);
+        assert!((proc.value_sum() - 0.0).abs() < 1e-10);
+        assert!(
+            result.param_updates.iter().any(|u| matches!(
+                u,
+                ParamUpdate::Float64 {
+                    reason: 2,
+                    value,
+                    ..
+                } if *value == 0.0
+            )),
+            "zero write must post cleared ATTR_VAL"
+        );
     }
 
     #[test]

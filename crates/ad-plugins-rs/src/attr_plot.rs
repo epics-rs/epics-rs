@@ -377,10 +377,10 @@ impl NDPluginProcess for AttrPlotProcessor {
                 return ParamChangeResult::updates(self.build_updates());
             }
         } else if Some(reason) == self.params.reset {
-            if params.value.as_i32() != 0 {
-                self.reset();
-                return ParamChangeResult::updates(self.build_updates());
-            }
+            // C calls reset_data() on ANY write to the reset param — there is no
+            // value test (NDPluginAttrPlot.cpp:290-292).
+            self.reset();
+            return ParamChangeResult::updates(self.build_updates());
         }
         ParamChangeResult::updates(vec![])
     }

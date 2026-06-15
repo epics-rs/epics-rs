@@ -159,6 +159,32 @@ impl AttributeDataset {
 /// (C++ `MAX_ATTRIBUTE_STRING_SIZE`).
 const MAX_ATTRIBUTE_STRING_SIZE: usize = 256;
 
+/// Element marker for a 256-byte fixed-length HDF5 string attribute dataset.
+///
+/// C `NDFileHDF5AttributeDataset.cpp:321-323` stores a string-valued
+/// NDAttribute as a rank-1 dataset whose element datatype is `H5T_C_S1` sized
+/// to `MAX_ATTRIBUTE_STRING_SIZE` bytes (null-terminated, ASCII). Implementing
+/// `H5Type` so `hdf5_type()` returns that fixed-length string datatype lets the
+/// high-level dataset builder emit `H5T_STR_NULLTERM` strings rather than a 2-D
+/// `H5T_STD_U8LE` byte array. The element is byte-identical to the raw 256-byte
+/// field already accumulated per frame, so the existing byte-oriented write
+/// path is reused unchanged.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct FixedStr256([u8; MAX_ATTRIBUTE_STRING_SIZE]);
+
+impl rust_hdf5::types::H5Type for FixedStr256 {
+    fn hdf5_type() -> rust_hdf5::format::messages::datatype::DatatypeMessage {
+        rust_hdf5::format::messages::datatype::DatatypeMessage::fixed_string(
+            MAX_ATTRIBUTE_STRING_SIZE as u32,
+        )
+    }
+
+    fn element_size() -> usize {
+        MAX_ATTRIBUTE_STRING_SIZE
+    }
+}
+
 /// Internal handle: either a standard H5File or a SWMR streaming writer.
 enum Hdf5Handle {
     Standard {
@@ -1554,13 +1580,18 @@ impl Hdf5Writer {
                 NDAttrDataType::Float32 => write_attr_ds!(f32),
                 NDAttrDataType::Float64 => write_attr_ds!(f64),
                 NDAttrDataType::String => {
-                    // Fixed-width u8 field per frame.
+                    // C stores a string attribute as a rank-1 `[n]` dataset of a
+                    // fixed 256-byte `H5T_C_S1` string, not a 2-D byte array
+                    // (NDFileHDF5AttributeDataset.cpp:321-323, rank_=1). The
+                    // accumulated buffer already holds one 256-byte field per
+                    // frame, so the element datatype carries the width and the
+                    // dataset is 1-D.
                     let es = MAX_ATTRIBUTE_STRING_SIZE;
                     let ds = group
-                        .new_dataset::<u8>()
-                        .shape([n, es])
-                        .chunk(&[chunk, es])
-                        .max_shape(&[None, Some(es)])
+                        .new_dataset::<FixedStr256>()
+                        .shape([n])
+                        .chunk(&[chunk])
+                        .max_shape(&[None])
                         .create(&ad.name)
                         .map_err(|e| {
                             ADError::UnsupportedConversion(format!(
@@ -2737,6 +2768,51 @@ mod tests {
         let cnt_vals: Vec<i32> = cnt.read_raw().unwrap();
         assert_eq!(cnt_vals, vec![10, 20, 30]);
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_string_attribute_dataset_is_rank1_fixed_string() {
+        // C stores a string-valued NDAttribute as a rank-1 `[n]` dataset of a
+        // fixed 256-byte H5T_C_S1 string (NDFileHDF5AttributeDataset.cpp:321-323,
+        // rank_=1), NOT a 2-D `[n,256]` uint8 array. Verify rank 1, a 256-byte
+        // string element, and that the null-terminated bytes round-trip.
+        let path = temp_path("hdf5_attr_str");
+        let mut writer = Hdf5Writer::new();
+
+        let mk = |mode_name: &str| {
+            let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+            arr.attributes.add(NDAttribute::new_static(
+                "ColorMode",
+                "",
+                NDAttrSource::Driver,
+                NDAttrValue::String(mode_name.to_string()),
+            ));
+            arr
+        };
+
+        let a0 = mk("Mono");
+        writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
+        writer.write_file(&a0).unwrap();
+        writer.write_file(&mk("RGB1")).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let ds = h5.dataset("NDAttributes/ColorMode").unwrap();
+        // Rank-1 [2] of a 256-byte fixed-length string element, not [2,256] u8.
+        assert_eq!(ds.shape(), vec![2]);
+        assert_eq!(ds.element_size(), MAX_ATTRIBUTE_STRING_SIZE);
+
+        let frames: Vec<FixedStr256> = ds.read_raw().unwrap();
+        assert_eq!(frames.len(), 2);
+        let decode = |f: &FixedStr256| -> String {
+            f.0.iter()
+                .take_while(|&&b| b != 0)
+                .map(|&b| b as char)
+                .collect()
+        };
+        assert_eq!(decode(&frames[0]), "Mono");
+        assert_eq!(decode(&frames[1]), "RGB1");
         std::fs::remove_file(&path).ok();
     }
 

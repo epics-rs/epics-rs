@@ -232,7 +232,7 @@ impl PosPluginProcessor {
         ProcessResult {
             output_arrays: vec![],
             param_updates: updates,
-            scatter_index: None,
+            scatter: false,
         }
     }
 }
@@ -477,7 +477,7 @@ impl NDPluginProcess for PosPluginProcessor {
             return ProcessResult {
                 output_arrays: vec![],
                 param_updates: updates,
-                scatter_index: None,
+                scatter: false,
             };
         }
 
@@ -544,7 +544,7 @@ impl NDPluginProcess for PosPluginProcessor {
         ProcessResult {
             output_arrays: vec![Arc::new(out)],
             param_updates: updates,
-            scatter_index: None,
+            scatter: false,
         }
     }
 

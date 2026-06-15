@@ -555,7 +555,7 @@ impl NDPluginProcess for ROIProcessor {
             Some(roi_arr) => ProcessResult {
                 output_arrays: vec![Arc::new(roi_arr)],
                 param_updates: updates,
-                scatter_index: None,
+                scatter: false,
             },
             None => ProcessResult::sink(updates),
         }

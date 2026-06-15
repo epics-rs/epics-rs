@@ -30,7 +30,9 @@ use crate::ndarray::NDArray;
 use crate::ndarray_pool::NDArrayPool;
 use crate::params::ndarray_driver::NDArrayDriverParams;
 
-use super::channel::{NDArrayOutput, NDArrayReceiver, NDArraySender, ndarray_channel};
+use super::channel::{
+    NDArrayOutput, NDArrayReceiver, NDArraySender, PublishOutcome, ndarray_channel,
+};
 use super::params::PluginBaseParams;
 use super::wiring::{WiringRegistry, upstream_key};
 
@@ -162,8 +164,13 @@ impl ParamUpdate {
 pub struct ProcessResult {
     pub output_arrays: Vec<Arc<NDArray>>,
     pub param_updates: Vec<ParamUpdate>,
-    /// If set, only publish to the subscriber at this index (round-robin scatter).
-    pub scatter_index: Option<usize>,
+    /// When `true`, the output arrays are *scattered* — delivered to a single
+    /// downstream consumer in round-robin order rather than broadcast to all.
+    /// The target consumer (and reroute-past-full / drop-on-last decisions) is
+    /// owned by the runtime delivery path, which holds the persistent cursor
+    /// (C++ `NDPluginScatter::nextClient_`); the processor only marks the frame
+    /// as a scatter frame.
+    pub scatter: bool,
 }
 
 impl ProcessResult {
@@ -172,7 +179,7 @@ impl ProcessResult {
         Self {
             output_arrays: vec![],
             param_updates,
-            scatter_index: None,
+            scatter: false,
         }
     }
 
@@ -181,7 +188,7 @@ impl ProcessResult {
         Self {
             output_arrays,
             param_updates: vec![],
-            scatter_index: None,
+            scatter: false,
         }
     }
 
@@ -190,16 +197,17 @@ impl ProcessResult {
         Self {
             output_arrays: vec![],
             param_updates: vec![],
-            scatter_index: None,
+            scatter: false,
         }
     }
 
-    /// Convenience: scatter output — send to a single subscriber by index.
-    pub fn scatter(output_arrays: Vec<Arc<NDArray>>, index: usize) -> Self {
+    /// Convenience: scatter output — deliver to the next downstream consumer in
+    /// round-robin order (the runtime owns the cursor and reroute logic).
+    pub fn scatter(output_arrays: Vec<Arc<NDArray>>) -> Self {
         Self {
             output_arrays,
             param_updates: vec![],
-            scatter_index: Some(index),
+            scatter: true,
         }
     }
 }
@@ -599,7 +607,7 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
         let mut output = self.build_publish_batch(
             ready,
             result.param_updates,
-            result.scatter_index,
+            result.scatter,
             Some(array.as_ref()),
             elapsed_ms,
             self.array_callbacks,
@@ -614,7 +622,7 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
     fn dropped_arrays_only_batch(&self) -> ProcessOutput {
         ProcessOutput {
             arrays: vec![],
-            scatter_index: None,
+            scatter: false,
             batch: self.build_status_params_batch(),
         }
     }
@@ -647,14 +655,14 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
             // on (route_output_arrays runs past the delivery gate); the C++
             // sort thread delivers them regardless of the *current* flag, so
             // they always deliver here.
-            let output = self.build_publish_batch(arrays, vec![], None, None, 0.0, true, true);
+            let output = self.build_publish_batch(arrays, vec![], false, None, 0.0, true, true);
             all_arrays.extend(output.arrays);
             combined.merge(output.batch);
         }
         combined.merge(self.build_sort_params_batch());
         ProcessOutput {
             arrays: all_arrays,
-            scatter_index: None,
+            scatter: false,
             batch: combined,
         }
     }
@@ -712,7 +720,7 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
         &mut self,
         output_arrays: Vec<Arc<NDArray>>,
         param_updates: Vec<ParamUpdate>,
-        scatter_index: Option<usize>,
+        scatter: bool,
         fallback_array: Option<&NDArray>,
         elapsed_ms: f64,
         deliver: bool,
@@ -1029,7 +1037,7 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
             // endProcessCallbacks early-return); the metadata params above are
             // still published.
             arrays: if deliver { output_arrays } else { Vec::new() },
-            scatter_index,
+            scatter,
             batch: ParamBatch { addr0, extra },
         }
     }
@@ -1038,25 +1046,73 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
 /// Output from processing: arrays to publish + param batch to flush.
 struct ProcessOutput {
     arrays: Vec<Arc<NDArray>>,
-    scatter_index: Option<usize>,
+    scatter: bool,
     batch: ParamBatch,
 }
 
 impl ProcessOutput {
     /// Publish arrays to downstream senders (async, concurrent fan-out).
     ///
-    /// Each array is published to all senders concurrently (independent
-    /// backpressure per sender). Arrays are published in order — the next
-    /// array's fan-out starts only after the previous one completes.
-    async fn publish_arrays(&self, senders: &[NDArraySender]) {
+    /// Broadcast frames are published to every sender concurrently (independent
+    /// backpressure per sender). Scatter frames are routed to a single consumer
+    /// via `scatter_publish`, which advances the persistent `scatter_cursor`.
+    /// Arrays are published in order — the next array's fan-out starts only
+    /// after the previous one completes.
+    async fn publish_arrays(&self, senders: &[NDArraySender], scatter_cursor: &mut usize) {
         for arr in &self.arrays {
-            if let Some(idx) = self.scatter_index {
-                if let Some(sender) = senders.get(idx % senders.len().max(1)) {
-                    sender.publish(arr.clone()).await;
-                }
+            if self.scatter {
+                Self::scatter_publish(arr, senders, scatter_cursor).await;
             } else {
                 let futs = senders.iter().map(|s| s.publish(arr.clone()));
                 futures_util::future::join_all(futs).await;
+            }
+        }
+    }
+
+    /// Deliver one array to the next downstream consumer in round-robin order,
+    /// rerouting past full queues — a port of C++
+    /// `NDPluginScatter::doNDArrayCallbacks` (NDPluginScatter.cpp:59-90).
+    ///
+    /// `cursor` is the persistent `nextClient_`: it advances by one per
+    /// *attempt*, so a frame that reroutes past a full consumer leaves the
+    /// cursor pointing just past the consumer it actually delivered to (not
+    /// merely one past the starting point). Walking begins at `cursor % n` and
+    /// makes at most `n` attempts. A full (or disabled/closed) consumer is
+    /// rerouted past unless this is the last attempt; only the last node is
+    /// allowed to drop the array (C++ sets `auxStatus=asynSuccess` for the last
+    /// node so its full queue drops rather than reroutes). Earlier full
+    /// consumers are passed `is_last=false` so the rerouted-away drop is *not*
+    /// counted (C++ `ignoreQueueFull`, NDPluginDriver.cpp:406,433-442).
+    ///
+    /// Routing is over the *enabled* senders only: a downstream with callbacks
+    /// disabled is unregistered from the interrupt list in C
+    /// (`setArrayInterrupt(0)`) and is therefore not a scatter target, so it
+    /// must not consume a round-robin slot.
+    async fn scatter_publish(arr: &Arc<NDArray>, senders: &[NDArraySender], cursor: &mut usize) {
+        let active: Vec<&NDArraySender> = senders.iter().filter(|s| s.is_enabled()).collect();
+        let n = active.len();
+        if n == 0 {
+            return;
+        }
+        for attempt in 0..n {
+            let target = *cursor % n;
+            *cursor = cursor.wrapping_add(1);
+            let is_last = attempt == n - 1;
+            match active[target].publish_scatter(arr.clone(), is_last).await {
+                // Delivered: done. (In blocking mode publish always delivers,
+                // so the loop breaks on the first attempt — matching C++ where
+                // a blocking scatter calls processCallbacks inline and breaks.)
+                PublishOutcome::Delivered => break,
+                // Full / disabled / closed: reroute to the next consumer unless
+                // this was the last attempt (then the array is dropped — already
+                // counted by publish_scatter when is_last).
+                PublishOutcome::DroppedQueueFull
+                | PublishOutcome::Disabled
+                | PublishOutcome::ChannelClosed => {
+                    if is_last {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -1763,6 +1819,11 @@ fn plugin_data_loop<P: NDPluginProcess>(
         // Last published QueueFree value — only flush the queue params when it
         // changes, so a steady queue depth does not spam param callbacks.
         let mut last_queue_free: Option<i32> = None;
+        // Persistent scatter cursor (C++ NDPluginScatter::nextClient_): advances
+        // per delivery *attempt* across frames so the round-robin survives
+        // reroutes past full consumers. One per plugin instance, for its
+        // lifetime — matching `nextClient_(1)` set once at construction.
+        let mut scatter_cursor: usize = 0;
 
         loop {
             tokio::select! {
@@ -1814,7 +1875,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                             // msg dropped here → completion signaled (if tracked)
                             // Publish arrays and flush params outside the lock, in async context.
                             if let Some(po) = process_output {
-                                po.publish_arrays(&senders).await;
+                                po.publish_arrays(&senders, &mut scatter_cursor).await;
                                 po.batch.flush(&port).await;
                             }
                             if let Some(qb) = queue_batch {
@@ -1920,7 +1981,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                     (output, senders, port)
                                 };
                                 if let Some(po) = process_output {
-                                    po.publish_arrays(&senders).await;
+                                    po.publish_arrays(&senders, &mut scatter_cursor).await;
                                     po.batch.flush(&port).await;
                                 } else {
                                     // C parity: NDPluginDriver::writeInt32
@@ -1980,7 +2041,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                     }
                                 };
                                 if let Some((output, senders, port)) = flush_work {
-                                    output.publish_arrays(&senders).await;
+                                    output.publish_arrays(&senders, &mut scatter_cursor).await;
                                     output.batch.flush(&port).await;
                                 }
                             }
@@ -2033,7 +2094,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                 let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
                                 let output = if !result.output_arrays.is_empty() || !result.param_updates.is_empty() {
                                     let deliver = guard.array_callbacks;
-                                    Some(guard.build_publish_batch(result.output_arrays, result.param_updates, None, None, elapsed_ms, deliver, true))
+                                    Some(guard.build_publish_batch(result.output_arrays, result.param_updates, false, None, elapsed_ms, deliver, true))
                                 } else {
                                     None
                                 };
@@ -2041,7 +2102,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                 (output, senders, guard.port_handle.clone())
                             };
                             if let Some(po) = process_output {
-                                po.publish_arrays(&senders).await;
+                                po.publish_arrays(&senders, &mut scatter_cursor).await;
                                 po.batch.flush(&port).await;
                             }
                         }
@@ -2058,7 +2119,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                         let port = guard.port_handle.clone();
                         (output, senders, port)
                     };
-                    output.publish_arrays(&senders).await;
+                    output.publish_arrays(&senders, &mut scatter_cursor).await;
                     output.batch.flush(&port).await;
                 }
             }
@@ -3225,5 +3286,109 @@ mod tests {
         let mut fout = [0i32; 1];
         copy_convert(&[42.9f64], &mut fout);
         assert_eq!(fout[0], 42, "f64 -> i32 truncates toward zero");
+    }
+
+    // ---- ADP-45: scatter overflow-reroute (C++ NDPluginScatter) ----
+
+    /// Run an async body on a throwaway current-thread runtime.
+    fn block<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    #[test]
+    fn test_scatter_reroutes_past_full_consumer() {
+        // 3 consumers, queue size 1. Pre-fill A so its queue is full; a scatter
+        // that would target A must reroute to B (C++ auxStatus=asynOverflow),
+        // and the rerouted-away full queue must NOT count a dropped array
+        // (driverCallback ignoreQueueFull, NDPluginDriver.cpp:406,433-442).
+        let (sa, mut ra) = ndarray_channel("A", 1);
+        let (sb, mut rb) = ndarray_channel("B", 1);
+        let (sc, _rc) = ndarray_channel("C", 1);
+        block(async {
+            assert_eq!(
+                sa.publish(make_test_array(99)).await,
+                PublishOutcome::Delivered
+            );
+            let senders = vec![sa.clone(), sb.clone(), sc.clone()];
+            let mut cursor = 0usize;
+            ProcessOutput::scatter_publish(&make_test_array(1), &senders, &mut cursor).await;
+            // A rerouted (attempt 0), B delivered (attempt 1): cursor +2.
+            assert_eq!(cursor, 2);
+            assert_eq!(rb.recv().await.unwrap().unique_id, 1);
+            // A still holds only its filler; the rerouted-away drop was not counted.
+            assert_eq!(ra.recv().await.unwrap().unique_id, 99);
+            assert_eq!(sa.dropped_arrays_counter().load(Ordering::Acquire), 0);
+        });
+    }
+
+    #[test]
+    fn test_scatter_drops_on_last_when_all_full_counts_once() {
+        // Both consumers full. The array is dropped on the last node only, and
+        // the drop is counted exactly once (C++ sets auxStatus=asynSuccess for
+        // the last node so its full queue drops and counts).
+        let (sa, mut ra) = ndarray_channel("A", 1);
+        let (sb, mut rb) = ndarray_channel("B", 1);
+        block(async {
+            sa.publish(make_test_array(91)).await;
+            sb.publish(make_test_array(92)).await;
+            let senders = vec![sa.clone(), sb.clone()];
+            let mut cursor = 0usize;
+            ProcessOutput::scatter_publish(&make_test_array(7), &senders, &mut cursor).await;
+            assert_eq!(cursor, 2); // both attempted
+            // A rerouted-away (not counted); B last (dropped, counted once).
+            assert_eq!(sa.dropped_arrays_counter().load(Ordering::Acquire), 0);
+            assert_eq!(sb.dropped_arrays_counter().load(Ordering::Acquire), 1);
+            // Neither queue received frame 7 — both still hold their fillers.
+            assert_eq!(ra.recv().await.unwrap().unique_id, 91);
+            assert_eq!(rb.recv().await.unwrap().unique_id, 92);
+        });
+    }
+
+    #[test]
+    fn test_scatter_cursor_advances_per_attempt_across_frames() {
+        // A is permanently full; B and C are free. Frame 0 reroutes A->B, so
+        // the persistent cursor (C++ nextClient_) ends past B. Frame 1 must
+        // therefore start at C, NOT back at B: a per-frame cursor would send
+        // frame 1 to B; the per-attempt cursor sends it to C.
+        let (sa, _ra) = ndarray_channel("A", 1);
+        let (sb, mut rb) = ndarray_channel("B", 10);
+        let (sc, mut rc) = ndarray_channel("C", 10);
+        block(async {
+            sa.publish(make_test_array(90)).await; // fill A permanently
+            let senders = vec![sa.clone(), sb.clone(), sc.clone()];
+            let mut cursor = 0usize;
+            ProcessOutput::scatter_publish(&make_test_array(0), &senders, &mut cursor).await;
+            assert_eq!(cursor, 2); // A(reroute) + B(deliver)
+            assert_eq!(rb.recv().await.unwrap().unique_id, 0);
+            ProcessOutput::scatter_publish(&make_test_array(1), &senders, &mut cursor).await;
+            assert_eq!(cursor, 3); // C(deliver) on the first attempt
+            assert_eq!(rc.recv().await.unwrap().unique_id, 1);
+        });
+    }
+
+    #[test]
+    fn test_scatter_skips_disabled_consumer() {
+        // A disabled downstream is unregistered from the interrupt list in C++
+        // (setArrayInterrupt(0)) and must not consume a round-robin slot.
+        let (sa, mut ra) = ndarray_channel("A", 10);
+        let (mut sb, _rb) = ndarray_channel("B", 10);
+        let (sc, mut rc) = ndarray_channel("C", 10);
+        sb.set_mode_flags(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        block(async {
+            let senders = vec![sa.clone(), sb.clone(), sc.clone()];
+            let mut cursor = 0usize;
+            // Active set = [A, C] (n=2): frame 0 -> A, frame 1 -> C.
+            ProcessOutput::scatter_publish(&make_test_array(0), &senders, &mut cursor).await;
+            ProcessOutput::scatter_publish(&make_test_array(1), &senders, &mut cursor).await;
+            assert_eq!(ra.recv().await.unwrap().unique_id, 0);
+            assert_eq!(rc.recv().await.unwrap().unique_id, 1);
+        });
     }
 }

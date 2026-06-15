@@ -1133,7 +1133,7 @@ impl NDPluginProcess for StatsProcessor {
         ProcessResult {
             output_arrays: vec![Arc::new(array.clone())],
             param_updates: updates,
-            scatter_index: None,
+            scatter: false,
         }
     }
 

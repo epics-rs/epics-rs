@@ -140,6 +140,25 @@ impl NDArraySender {
     /// - `blocking_callbacks=1`: reliable `send().await` + awaits downstream
     ///   processing completion (explicit opt-in, never drops).
     pub async fn publish(&self, array: Arc<NDArray>) -> PublishOutcome {
+        self.publish_inner(array, true).await
+    }
+
+    /// Publish for the scatter reroute path. Mirrors C++ `NDPluginScatter`'s
+    /// `auxStatus` protocol: scatter sets `auxStatus=asynOverflow` for every
+    /// node except the last so that a full-queue consumer is *rerouted past*
+    /// without counting a dropped array — the receiving `driverCallback` reads
+    /// `auxStatus==asynOverflow` as `ignoreQueueFull` and skips the
+    /// `DroppedArrays++` (NDPluginDriver.cpp:406,433-442). Only the last node
+    /// (`is_last`) is allowed to actually drop and count the array.
+    pub async fn publish_scatter(&self, array: Arc<NDArray>, is_last: bool) -> PublishOutcome {
+        self.publish_inner(array, is_last).await
+    }
+
+    /// Shared publish body. `count_drop` controls whether a full-queue drop
+    /// increments `DroppedArrays`: `true` for the normal broadcast path (C++
+    /// `ignoreQueueFull=false`), `false` for a scatter reroute attempt that is
+    /// not the last node (C++ `ignoreQueueFull=true`).
+    async fn publish_inner(&self, array: Arc<NDArray>, count_drop: bool) -> PublishOutcome {
         if !self.enabled.load(Ordering::Acquire) {
             return PublishOutcome::Disabled;
         }
@@ -161,7 +180,9 @@ impl NDArraySender {
                 Ok(()) => PublishOutcome::Delivered,
                 // `msg` is dropped here → counter decremented by ArrayMessage::drop.
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    self.dropped_arrays.fetch_add(1, Ordering::AcqRel);
+                    if count_drop {
+                        self.dropped_arrays.fetch_add(1, Ordering::AcqRel);
+                    }
                     PublishOutcome::DroppedQueueFull
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {

@@ -112,6 +112,7 @@ population). One commit per finding.
 | ADP-14 (stats clamps out-of-range cursor/centroid to edge, not zeros) | fix | Fixed | b1b6f336 |
 | ADP-13 (stats skips centroid/profiles/cursor for ndims>2) | fix | Fixed | 6cfb6d1e |
 | ADP-15 (stats histogram upper-boundary clamp) | fix→N/A | Not applicable (clamp is a no-op for in-range values; guards already match C; proof in finding block) | — |
+| ADP-1 (stats centroid moments: raw-pixel vs threshold-profile) | fix→signoff | Signoff — precision-only fork, recommend keep Rust direct-central (OPT-3 precedent); routed to #58 | — |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -208,10 +209,11 @@ Clean in ad-core (verified): `ndarray.rs` getInfo layout, pool alloc/release/fre
 ### ad-plugins-rs (ADP)
 
 #### ADP-1: Stats centroid higher moments from raw 2-D pixels, not threshold projection profiles
-Severity: High — fix
+Severity: High — fix → SIGNOFF (precision-only fork; recommend keep Rust, per OPT-3 precedent)
 Rust: `crates/ad-plugins-rs/src/stats.rs:493-524` accumulates mu20/mu02/mu11/m30..m04 per raw pixel.
 C: `NDPluginStats.cpp:224-241` — M20/M30/M40 from `profileX[profThreshold]`, M02/M03/M04 from `profileY[profThreshold]`; only M11 (`:215`) is a raw cross-sum.
 Impact: SIGMAXY/ECCENTRICITY/ORIENTATION diverge even at threshold 0; all marginal moments diverge for centroidThreshold>0.
+— RE-VERIFIED — NOT an algorithmic divergence; it is a floating-point precision fork. The two methods are mathematically IDENTICAL: C's `profileX[profThreshold][ix]=Σ_iy value` then `M20=Σ_ix profileX_thresh[ix]·ix²` equals `Σ_thresholded-pixels value·ix²` because the moment weight `ix^k`/`iy^k` is separable and the threshold is applied PER PIXEL in both (so the finding's "diverge for threshold>0" premise does not hold — the per-pixel threshold preserves separability). Both reduce to the same central moments: C computes raw moments then `μ20=M20−M10²/M00` (and the full 3rd/4th-order expansions at :248-253), which equals `Σv·(ix−cx)²` — exactly Rust's direct form (verified the μ3/μ4 expansions algebraically). Every downstream formula (sigmaX=√(μ20/M00), sigmaXY=varXY/(σX·σY), skew=μ30/(M00·varX^1.5), kurtosis=μ40/(M00·varX²)−3, eccentricity, orientation) is byte-identical between the two. The ONLY difference is fp rounding: C's `M20−M10²/M00` suffers catastrophic cancellation once the raw moments exceed 2^53 (reachable only for large/bright images, e.g. 4096² UInt16: M20≈1e19 > 9e15), where Rust's direct `Σv·(ix−cx)²` is numerically STABLE and MORE accurate. For realistic integer image data with moments ≤ 2^53 the two are bit-identical. This is the same class as OPT-3 (kept Rust precision, user call) — a numerical-method decision for the user, not a silent rewrite that would deliberately reintroduce C's cancellation. Recommend KEEP Rust's stable direct-central method. No code change pending sign-off. Routed to the #58 signoff batch.
 
 #### ADP-2: ColorConvert RGB→Mono luminance vs `(R+G+B)/3` (= ADC-6, fix in color.rs) — FIXED 1273b533
 Severity: High — fix

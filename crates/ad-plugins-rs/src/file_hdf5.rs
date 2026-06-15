@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use ad_core_rs::attributes::{NDAttrDataType, NDAttrValue};
+use ad_core_rs::attributes::{NDAttrDataType, NDAttrSource, NDAttrValue, NDAttribute};
 use ad_core_rs::error::{ADError, ADResult};
 use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core_rs::ndarray_pool::NDArrayPool;
@@ -84,17 +84,40 @@ struct ExtraDim {
 /// one numeric (or string) value per frame.
 struct AttributeDataset {
     name: String,
+    /// The three remaining self-describing strings C writes as HDF5 attributes
+    /// on each attribute dataset (NDFileHDF5.cpp:2715, 2785-2788): description,
+    /// source, and the source-type string. Captured at create time because the
+    /// source NDArray is gone by flush.
+    description: String,
+    source: String,
+    source_type: String,
     data_type: NDAttrDataType,
     /// Raw little-endian bytes accumulated, one element per frame.
     buffer: Vec<u8>,
     frames: usize,
 }
 
+/// C `NDAttribute` source-type string (NDAttribute.cpp:49-62), recorded as the
+/// `NDAttrSourceType` HDF5 attribute on each NDAttribute dataset.
+fn nd_attr_source_type_string(source: &NDAttrSource) -> &'static str {
+    match source {
+        NDAttrSource::Driver => "NDAttrSourceDriver",
+        NDAttrSource::Param { .. } => "NDAttrSourceParam",
+        NDAttrSource::EpicsPV(_) => "NDAttrSourceEPICSPV",
+        NDAttrSource::Function(_) => "NDAttrSourceFunct",
+        NDAttrSource::Constant(_) => "NDAttrSourceConst",
+        NDAttrSource::Undefined => "Undefined",
+    }
+}
+
 impl AttributeDataset {
-    fn new(name: String, data_type: NDAttrDataType) -> Self {
+    fn new(attr: &NDAttribute) -> Self {
         Self {
-            name,
-            data_type,
+            name: attr.name.clone(),
+            description: attr.description.clone(),
+            source: attr.source.source_string().to_string(),
+            source_type: nd_attr_source_type_string(&attr.source).to_string(),
+            data_type: attr.value.data_type(),
             buffer: Vec::new(),
             frames: 0,
         }
@@ -1510,9 +1533,7 @@ impl Hdf5Writer {
             return;
         }
         for attr in array.attributes.iter() {
-            let dt = attr.value.data_type();
-            self.attr_datasets
-                .push(AttributeDataset::new(attr.name.clone(), dt));
+            self.attr_datasets.push(AttributeDataset::new(attr));
         }
     }
 
@@ -1546,7 +1567,7 @@ impl Hdf5Writer {
             let n = ad.frames;
             let chunk = chunk_depth.min(n).max(1);
 
-            macro_rules! write_attr_ds {
+            macro_rules! create_attr_ds {
                 ($t:ty) => {{
                     let es = std::mem::size_of::<$t>();
                     let ds = group
@@ -1565,20 +1586,21 @@ impl Hdf5Writer {
                     // chunk's whole byte span (zero-padded for the trailing
                     // partial chunk, as rust-hdf5 requires full-chunk writes).
                     write_chunked_buffer(&ds, &ad.buffer, chunk * es)?;
+                    ds
                 }};
             }
 
-            match ad.data_type {
-                NDAttrDataType::Int8 => write_attr_ds!(i8),
-                NDAttrDataType::UInt8 => write_attr_ds!(u8),
-                NDAttrDataType::Int16 => write_attr_ds!(i16),
-                NDAttrDataType::UInt16 => write_attr_ds!(u16),
-                NDAttrDataType::Int32 => write_attr_ds!(i32),
-                NDAttrDataType::UInt32 => write_attr_ds!(u32),
-                NDAttrDataType::Int64 => write_attr_ds!(i64),
-                NDAttrDataType::UInt64 => write_attr_ds!(u64),
-                NDAttrDataType::Float32 => write_attr_ds!(f32),
-                NDAttrDataType::Float64 => write_attr_ds!(f64),
+            let ds = match ad.data_type {
+                NDAttrDataType::Int8 => create_attr_ds!(i8),
+                NDAttrDataType::UInt8 => create_attr_ds!(u8),
+                NDAttrDataType::Int16 => create_attr_ds!(i16),
+                NDAttrDataType::UInt16 => create_attr_ds!(u16),
+                NDAttrDataType::Int32 => create_attr_ds!(i32),
+                NDAttrDataType::UInt32 => create_attr_ds!(u32),
+                NDAttrDataType::Int64 => create_attr_ds!(i64),
+                NDAttrDataType::UInt64 => create_attr_ds!(u64),
+                NDAttrDataType::Float32 => create_attr_ds!(f32),
+                NDAttrDataType::Float64 => create_attr_ds!(f64),
                 NDAttrDataType::String => {
                     // C stores a string attribute as a rank-1 `[n]` dataset of a
                     // fixed 256-byte `H5T_C_S1` string, not a 2-D byte array
@@ -1600,8 +1622,14 @@ impl Hdf5Writer {
                             ))
                         })?;
                     write_chunked_buffer(&ds, &ad.buffer, chunk * es)?;
+                    ds
                 }
-            }
+            };
+
+            // C attaches up to four self-describing string attributes to every
+            // NDAttribute dataset (NDFileHDF5.cpp:2817-2822), each written only
+            // when non-empty.
+            write_ndattr_descriptors(&ds, ad);
         }
         Ok(())
     }
@@ -1756,6 +1784,30 @@ fn write_chunked_buffer(
         .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 chunk write error: {}", e)))?;
     }
     Ok(())
+}
+
+/// Attach the four self-describing string HDF5 attributes C writes on each
+/// NDAttribute dataset — `NDAttrName`, `NDAttrDescription`, `NDAttrSourceType`,
+/// `NDAttrSource` (NDFileHDF5.cpp:2715, 2817-2822) — each only when non-empty
+/// (C `if (strlen <= 0) continue`). Written as scalar strings, consistent with
+/// the port's other string dataset attributes.
+fn write_ndattr_descriptors(ds: &rust_hdf5::H5Dataset, ad: &AttributeDataset) {
+    for (aname, avalue) in [
+        ("NDAttrName", ad.name.as_str()),
+        ("NDAttrDescription", ad.description.as_str()),
+        ("NDAttrSourceType", ad.source_type.as_str()),
+        ("NDAttrSource", ad.source.as_str()),
+    ] {
+        if avalue.is_empty() {
+            continue;
+        }
+        let s = rust_hdf5::types::VarLenUnicode(avalue.to_string());
+        let _ = ds
+            .new_attr::<rust_hdf5::types::VarLenUnicode>()
+            .shape(())
+            .create(aname)
+            .and_then(|a| a.write_scalar(&s));
+    }
 }
 
 impl Default for Hdf5Writer {
@@ -2813,6 +2865,41 @@ mod tests {
         };
         assert_eq!(decode(&frames[0]), "Mono");
         assert_eq!(decode(&frames[1]), "RGB1");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_ndattr_descriptor_attributes_written() {
+        // C attaches NDAttrName/NDAttrDescription/NDAttrSourceType/NDAttrSource
+        // string HDF5 attributes (non-empty only) to every NDAttribute dataset
+        // (NDFileHDF5.cpp:2715, 2817-2822).
+        let path = temp_path("hdf5_attr_desc");
+        let mut writer = Hdf5Writer::new();
+
+        let mk = |v: f64| {
+            let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+            arr.attributes.add(NDAttribute::new_static(
+                "AcquireTime",
+                "exposure time",
+                NDAttrSource::EpicsPV("13SIM1:cam1:AcquireTime_RBV".to_string()),
+                NDAttrValue::Float64(v),
+            ));
+            arr
+        };
+
+        let a0 = mk(0.1);
+        writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
+        writer.write_file(&a0).unwrap();
+        writer.write_file(&mk(0.2)).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let ds = h5.dataset("NDAttributes/AcquireTime").unwrap();
+        let read = |n: &str| ds.attr(n).unwrap().read_string().unwrap();
+        assert_eq!(read("NDAttrName"), "AcquireTime");
+        assert_eq!(read("NDAttrDescription"), "exposure time");
+        assert_eq!(read("NDAttrSourceType"), "NDAttrSourceEPICSPV");
+        assert_eq!(read("NDAttrSource"), "13SIM1:cam1:AcquireTime_RBV");
         std::fs::remove_file(&path).ok();
     }
 

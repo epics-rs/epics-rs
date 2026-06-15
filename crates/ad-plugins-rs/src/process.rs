@@ -366,12 +366,10 @@ impl ProcessState {
             };
             let (ff, ff_scale) = if self.config.enable_flat_field {
                 if let Some(ref ff) = self.flat_field {
-                    let scale = if self.config.scale_flat_field > 0.0 {
-                        self.config.scale_flat_field
-                    } else {
-                        ff.iter().sum::<f64>() / ff.len().max(1) as f64
-                    };
-                    (Some(ff.as_slice()), scale)
+                    // C++: value *= scaleFlatField / flatField[i]
+                    // (NDPluginProcess.cpp:172). scaleFlatField is used directly
+                    // — there is no mean substitution when it is <= 0.
+                    (Some(ff.as_slice()), self.config.scale_flat_field)
                 } else {
                     (None, 0.0)
                 }
@@ -914,23 +912,46 @@ mod tests {
 
     #[test]
     fn test_flat_field() {
+        // C++: value *= scaleFlatField / flatField[i] (NDPluginProcess.cpp:172).
+        // scaleFlatField is used directly (no mean substitution).
         let ff_arr = make_array(&[100, 200, 50]);
-        let input = make_array(&[100, 200, 50]);
+        let input = make_array(&[100, 100, 100]);
 
         let mut state = ProcessState::new(ProcessConfig {
             enable_flat_field: true,
-            scale_flat_field: 0.0, // use mean
+            scale_flat_field: 100.0,
             ..Default::default()
         });
         state.save_flat_field(&ff_arr);
 
         let result = state.process(&input).unwrap();
-        // After flat field: all values should be normalized to the mean
         if let NDDataBuffer::U8(ref v) = result.data {
-            // ff_mean ~= 116.67, so all values should be ~= 116
-            assert!((v[0] as f64 - 116.67).abs() < 1.0);
-            assert!((v[1] as f64 - 116.67).abs() < 1.0);
-            assert!((v[2] as f64 - 116.67).abs() < 1.0);
+            assert_eq!(v[0], 100); // 100*100/100
+            assert_eq!(v[1], 50); //  100*100/200
+            assert_eq!(v[2], 200); // 100*100/50
+        } else {
+            panic!("expected U8 output");
+        }
+    }
+
+    #[test]
+    fn test_adp24_scale_flat_field_zero_zeroes_output() {
+        // C uses scaleFlatField directly: value *= scaleFlatField/flatField[i].
+        // With scaleFlatField == 0 every pixel (whose flatField != 0) becomes 0
+        // — there is NO mean substitution (NDPluginProcess.cpp:171-172).
+        let ff_arr = make_array(&[100, 200, 50]);
+        let input = make_array(&[100, 100, 100]);
+        let mut state = ProcessState::new(ProcessConfig {
+            enable_flat_field: true,
+            scale_flat_field: 0.0,
+            ..Default::default()
+        });
+        state.save_flat_field(&ff_arr);
+        let result = state.process(&input).unwrap();
+        if let NDDataBuffer::U8(ref v) = result.data {
+            assert_eq!(v, &[0, 0, 0]);
+        } else {
+            panic!("expected U8 output");
         }
     }
 

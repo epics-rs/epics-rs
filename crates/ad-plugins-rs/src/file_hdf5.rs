@@ -12,7 +12,7 @@ use ad_core_rs::plugin::runtime::{
 
 use rust_hdf5::H5File;
 use rust_hdf5::format::messages::filter::{
-    FILTER_BLOSC, FILTER_BSHUF, FILTER_JPEG, FILTER_NBIT, FILTER_SZIP, Filter, FilterPipeline,
+    FILTER_BLOSC, FILTER_BSHUF, FILTER_JPEG, FILTER_SZIP, Filter, FilterPipeline,
 };
 use rust_hdf5::swmr::SwmrFileWriter;
 
@@ -504,17 +504,32 @@ impl Hdf5Writer {
                 })
             }
             COMPRESS_NBIT => {
-                if self.nbit_precision > 0 {
-                    Some(FilterPipeline {
-                        filters: vec![Filter {
-                            id: FILTER_NBIT,
-                            flags: 0,
-                            cd_values: vec![self.nbit_precision, self.nbit_offset],
-                        }],
-                    })
-                } else {
-                    None
-                }
+                // C (NDFileHDF5.cpp:3355-3357) applies N-bit compression by
+                // narrowing the dataset DATATYPE — H5Tset_precision /
+                // H5Tset_offset — and then registering a parameterless
+                // H5Pset_nbit filter; libhdf5's set_local callback derives the
+                // nbit parameter tree from that reduced-precision datatype.
+                // rust-hdf5 0.2.17's high-level dataset builder
+                // (`DatasetBuilder<T: H5Type>`, the only dataset-creation path
+                // this writer has) hardcodes the full-width datatype returned by
+                // `T::hdf5_type()` and exposes no reduced-precision datatype
+                // message, so a faithful N-bit dataset (reduced-precision
+                // `FixedPoint` datatype + matching nbit parameter tree +
+                // bit-packed chunks) cannot be produced through this API. The
+                // filter expects `cd_values` to be that datatype parameter tree
+                // (`apply_nbit`), not `[precision, offset]`; emitting it over a
+                // full-width datatype yields a file no HDF5 reader can decode.
+                // N-bit therefore degrades to the unsupported-compressor
+                // fallback: the array is stored UNCOMPRESSED and lossless (SWMR
+                // mode additionally flags this via `compression_dropped`).
+                eprintln!(
+                    "NDFileHDF5: WARNING — N-bit compression (precision={} bit, \
+                     offset={} bit) is not supported by the rust-hdf5 backend \
+                     (no reduced-precision datatype path); the data will be \
+                     written UNCOMPRESSED and lossless.",
+                    self.nbit_precision, self.nbit_offset
+                );
+                None
             }
             COMPRESS_JPEG => Some(FilterPipeline {
                 filters: vec![Filter {
@@ -3017,6 +3032,53 @@ mod tests {
         writer.set_compression_type(COMPRESS_BLOSC);
         let pipeline = writer.build_pipeline(2).expect("blosc pipeline");
         assert_eq!(pipeline.filters[0].cd_values[5], 1);
+    }
+
+    #[test]
+    fn test_nbit_degrades_to_uncompressed_lossless() {
+        // C's N-bit codec (NDFileHDF5.cpp:3355-3357) narrows the dataset
+        // datatype (H5Tset_precision/H5Tset_offset) and registers a
+        // parameterless H5Pset_nbit filter. rust-hdf5 0.2.17's high-level
+        // builder cannot emit a reduced-precision datatype, so selecting N-bit
+        // must drop to lossless uncompressed (no filter pipeline) rather than
+        // emit a malformed nbit filter that no reader can decode. A 16-bit value
+        // above an 8-bit precision must survive intact — proof the bytes were
+        // NOT bit-truncated as a real (lossy) N-bit pack would.
+        let mut writer = Hdf5Writer::new();
+        writer.set_compression_type(COMPRESS_NBIT);
+        writer.set_nbit_precision(8);
+        writer.set_nbit_offset(0);
+        assert!(
+            writer.build_pipeline(2).is_none(),
+            "N-bit must not build a filter pipeline (backend cannot narrow datatype)"
+        );
+
+        let path = temp_path("hdf5_nbit_lossless");
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(8), NDDimension::new(8)],
+            NDDataType::UInt16,
+        );
+        if let NDDataBuffer::U16(ref mut v) = arr.data {
+            for (i, x) in v.iter_mut().enumerate() {
+                *x = i as u16 * 17 + 300; // values exceed the 8-bit range
+            }
+        }
+        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
+
+        let h5file = H5File::open(&path).unwrap();
+        let ds = h5file.dataset("data").unwrap();
+        let data: Vec<u16> = ds.read_raw().unwrap();
+        assert_eq!(data.len(), 8 * 8);
+        for (i, &v) in data.iter().enumerate() {
+            assert_eq!(
+                v,
+                i as u16 * 17 + 300,
+                "value {i} must round-trip losslessly"
+            );
+        }
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

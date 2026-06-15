@@ -6,9 +6,18 @@
 //! files in a known directory to enumerate / attach / restart
 //! procserv instances.
 //!
-//! Convention preserved exactly (per kodex commit-history note
-//! `4d2aee67`): `PROCSERV_INFO` env-var carries `KEY=value` pairs
-//! mirroring the info file content.
+//! The info file and the `PROCSERV_INFO` env var use the two distinct
+//! formats `manage-procs` parses (`manage.py:38-44`), NOT a shared
+//! `KEY=value` form:
+//!
+//! - info file (`writeInfoFile`, `procServ.cc:935-941`):
+//!   `pid:<supervisor-pid>\n` followed by one `tcp:<ip>:<port>\n` /
+//!   `unix:<path>\n` line per listener (`writeAddress`,
+//!   `acceptFactory.cc:45-49,80-85`).
+//! - `PROCSERV_INFO` env (`setEnvVar`, `procServ.cc:943-953`):
+//!   `PID=<supervisor-pid>;CTL=tcp:<ip>:<port>;LOG=tcp:<ip>:<port>` with
+//!   `CTL=`/`LOG=` per listener (`writeAddressEnv`,
+//!   `acceptFactory.cc:52-61,88-98`) and the trailing `;` stripped.
 
 use std::path::{Path, PathBuf};
 
@@ -18,6 +27,7 @@ use tokio::fs::{File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::procserv::config::ListenConfig;
 use crate::procserv::error::{ProcServError, ProcServResult};
 
 /// Per-line writer to the supervisor log. Wraps a file with timestamp
@@ -185,16 +195,16 @@ pub fn remove_pid_file(path: &Path) {
     }
 }
 
-/// Status info file. Format matches C procServ + `manage-procs`:
+/// Status info file (C `writeInfoFile`, `procServ.cc:935-941`), the form
+/// `manage-procs` parses (`manage.py:38-44`):
 ///
 /// ```text
-/// procservpid=NNNN
-/// childpid=NNNN
-/// childexe=/path/to/foo
-/// childargs=arg1 arg2
+/// pid:NNNN
+/// tcp:127.0.0.1:5000
+/// unix:/run/ioc.sock
 /// ```
 ///
-/// Updated whenever the child respawns. Atomic via tmp+rename.
+/// Atomic via tmp+rename.
 pub fn write_info_file(path: &Path, info: &InfoSnapshot) -> ProcServResult<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let tmp = parent.join(format!(
@@ -203,34 +213,106 @@ pub fn write_info_file(path: &Path, info: &InfoSnapshot) -> ProcServResult<()> {
             .and_then(|s| s.to_str())
             .unwrap_or("procserv.info")
     ));
-    let body = render_procserv_info(info);
+    let body = render_info_file(info);
     std::fs::write(&tmp, body).map_err(ProcServError::Io)?;
     std::fs::rename(&tmp, path).map_err(ProcServError::Io)?;
     Ok(())
 }
 
-/// Snapshot of supervisor + child state, serialized into the info
-/// file and the `PROCSERV_INFO` env var. Construct a fresh one on
-/// each child respawn.
+/// One listening endpoint, as procServ writes it (`writeAddress` /
+/// `writeAddressEnv`, `acceptFactory.cc:45-99`).
 #[derive(Debug, Clone)]
-pub struct InfoSnapshot {
-    pub procserv_pid: i32,
-    pub child_pid: Option<i32>,
-    pub child_exe: PathBuf,
-    pub child_args: Vec<String>,
+pub struct ListenAddress {
+    /// `true` ⇒ read-only log/viewer port (env prefix `LOG=`); `false` ⇒
+    /// control port (`CTL=`). The info file does not distinguish them.
+    pub readonly: bool,
+    /// Address token: `tcp:<ip>:<port>` or `unix:<path>` / `unix:@<abstract>`.
+    pub addr: String,
 }
 
-/// Build the `KEY=value` form for `PROCSERV_INFO` env var (passed to
-/// the child on `execvp` so the IOC can introspect its supervision
-/// context).
-pub fn render_procserv_info(info: &InfoSnapshot) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("procservpid={}\n", info.procserv_pid));
-    if let Some(p) = info.child_pid {
-        out.push_str(&format!("childpid={p}\n"));
+impl ListenAddress {
+    /// `tcp:<ip>:<port>` — C `inet_ntop` + `ntohs(port)`, bare (no `[]`),
+    /// `acceptFactory.cc:45-49,52-61`.
+    pub fn tcp(addr: std::net::SocketAddr, readonly: bool) -> Self {
+        Self {
+            readonly,
+            addr: format!("tcp:{}:{}", addr.ip(), addr.port()),
+        }
     }
-    out.push_str(&format!("childexe={}\n", info.child_exe.display()));
-    out.push_str(&format!("childargs={}\n", info.child_args.join(" ")));
+
+    /// `unix:<path>` — filesystem socket (`acceptFactory.cc:80-85`). The
+    /// `unix:@<abstract>` form is not produced; the Rust port binds only
+    /// filesystem sockets.
+    pub fn unix(path: &Path, readonly: bool) -> Self {
+        Self {
+            readonly,
+            addr: format!("unix:{}", path.display()),
+        }
+    }
+}
+
+/// Snapshot of supervisor identity + listening addresses, serialized into
+/// the info file and the `PROCSERV_INFO` env var. Both are fixed for the
+/// supervisor's lifetime (procServ writes them once at startup,
+/// `procServ.cc:560-563`).
+#[derive(Debug, Clone)]
+pub struct InfoSnapshot {
+    /// procServ supervisor pid — C `getpid()` (`procServ.cc:938,946`), the
+    /// pid `manage-procs` probes for liveness, NOT the child IOC pid.
+    pub procserv_pid: i32,
+    /// Listening endpoints, in C `connectionItem::head` iteration order.
+    pub addresses: Vec<ListenAddress>,
+}
+
+/// Render the info-file body (C `writeInfoFile`, `procServ.cc:935-941`):
+/// `pid:` line then one address line per listener.
+pub fn render_info_file(info: &InfoSnapshot) -> String {
+    let mut out = format!("pid:{}\n", info.procserv_pid);
+    for a in &info.addresses {
+        out.push_str(&a.addr);
+        out.push('\n');
+    }
+    out
+}
+
+/// Render the `PROCSERV_INFO` env value (C `setEnvVar`,
+/// `procServ.cc:943-953`): `PID=<pid>;` then `CTL=`/`LOG=` per listener,
+/// with the trailing `;` stripped.
+pub fn render_procserv_info_env(info: &InfoSnapshot) -> String {
+    let mut out = format!("PID={};", info.procserv_pid);
+    for a in &info.addresses {
+        out.push_str(if a.readonly { "LOG=" } else { "CTL=" });
+        out.push_str(&a.addr);
+        out.push(';');
+    }
+    // C `env_str.substr(0, env_str.size()-1)` strips the final ';'.
+    if out.ends_with(';') {
+        out.pop();
+    }
+    out
+}
+
+/// Build the listener address list in C `connectionItem::head` iteration
+/// order. C prepends each acceptItem on creation (`procServ.cc:824-832`) and
+/// creates the control listeners before the log listener
+/// (`procServ.cc:515-534`), so head order is the reverse: the log port first,
+/// then the control listeners. The Rust supervisor creates control TCP,
+/// control UNIX, then log (`supervisor.rs:178-206`); reversed, that is log,
+/// UNIX, control TCP. `manage-procs` is order-independent (`manage.py:68`
+/// joins all ports), so this ordering is functional parity for any
+/// combination and byte-exact for the common control-only / control+log
+/// cases.
+pub fn listen_addresses(listen: &ListenConfig) -> Vec<ListenAddress> {
+    let mut out = Vec::new();
+    if let Some(addr) = listen.log_bind {
+        out.push(ListenAddress::tcp(addr, true));
+    }
+    if let Some(path) = &listen.unix_path {
+        out.push(ListenAddress::unix(path, false));
+    }
+    if let Some(addr) = listen.tcp_bind {
+        out.push(ListenAddress::tcp(addr, false));
+    }
     out
 }
 
@@ -239,18 +321,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn render_info_keys_match_c_procserv_convention() {
+    fn info_file_matches_manage_procs_format() {
+        // C writeInfoFile (procServ.cc:935-941): pid: line then a tcp:/unix:
+        // line per listener, in connectionItem::head order (log first).
         let info = InfoSnapshot {
             procserv_pid: 1234,
-            child_pid: Some(1235),
-            child_exe: PathBuf::from("/usr/bin/softIoc"),
-            child_args: vec!["-d".into(), "test.db".into()],
+            addresses: vec![
+                ListenAddress::tcp("0.0.0.0:7001".parse().unwrap(), true),
+                ListenAddress::tcp("127.0.0.1:7000".parse().unwrap(), false),
+            ],
         };
-        let rendered = render_procserv_info(&info);
-        assert!(rendered.contains("procservpid=1234"));
-        assert!(rendered.contains("childpid=1235"));
-        assert!(rendered.contains("childexe=/usr/bin/softIoc"));
-        assert!(rendered.contains("childargs=-d test.db"));
+        assert_eq!(
+            render_info_file(&info),
+            "pid:1234\ntcp:0.0.0.0:7001\ntcp:127.0.0.1:7000\n"
+        );
+    }
+
+    #[test]
+    fn procserv_info_env_uses_pid_ctl_log_form() {
+        // C setEnvVar (procServ.cc:943-953): PID=<pid>; then CTL=/LOG= per
+        // listener, trailing ';' stripped.
+        let info = InfoSnapshot {
+            procserv_pid: 1234,
+            addresses: vec![
+                ListenAddress::tcp("0.0.0.0:7001".parse().unwrap(), true),
+                ListenAddress::tcp("127.0.0.1:7000".parse().unwrap(), false),
+            ],
+        };
+        assert_eq!(
+            render_procserv_info_env(&info),
+            "PID=1234;LOG=tcp:0.0.0.0:7001;CTL=tcp:127.0.0.1:7000"
+        );
+    }
+
+    #[test]
+    fn procserv_info_env_strips_trailing_semicolon_with_no_listeners() {
+        let info = InfoSnapshot {
+            procserv_pid: 42,
+            addresses: vec![],
+        };
+        assert_eq!(render_procserv_info_env(&info), "PID=42");
+        assert_eq!(render_info_file(&info), "pid:42\n");
+    }
+
+    #[test]
+    fn listen_addresses_orders_log_then_unix_then_control() {
+        let listen = ListenConfig {
+            tcp_port: Some(7000),
+            tcp_bind: Some("127.0.0.1:7000".parse().unwrap()),
+            log_port: Some(7001),
+            log_bind: Some("0.0.0.0:7001".parse().unwrap()),
+            unix_path: Some(PathBuf::from("/run/ioc.sock")),
+        };
+        let addrs = listen_addresses(&listen);
+        let tokens: Vec<(&str, bool)> = addrs
+            .iter()
+            .map(|a| (a.addr.as_str(), a.readonly))
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![
+                ("tcp:0.0.0.0:7001", true),
+                ("unix:/run/ioc.sock", false),
+                ("tcp:127.0.0.1:7000", false),
+            ]
+        );
     }
 
     #[tokio::test]

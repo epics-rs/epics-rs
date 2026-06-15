@@ -336,6 +336,16 @@ pub struct Hdf5Writer {
     resolved_ndattr_group: String,
     /// Group prefix for the performance dataset. Empty when flat.
     resolved_perf_group: String,
+    /// Live NDAttribute values for the names referenced by layout
+    /// `<attribute source="ndattribute">` element-attrs (ADP-79). `first` is
+    /// the open-time frame (C `storeOnOpenAttributes` → OnFileOpen/OnFrame),
+    /// `last` the most recent frame (C `storeOnCloseAttributes` → OnFileClose).
+    /// Empty for the default layout, which declares no such element-attrs.
+    ndattr_first_values: std::collections::HashMap<String, NDAttrValue>,
+    ndattr_last_values: std::collections::HashMap<String, NDAttrValue>,
+    /// Distinct NDAttribute names referenced by element-attrs, captured at
+    /// open so per-frame updates need not re-walk the layout.
+    ndattr_element_names: Vec<String>,
 }
 
 impl Hdf5Writer {
@@ -385,6 +395,9 @@ impl Hdf5Writer {
             resolved_dataset_path: "data".to_string(),
             resolved_ndattr_group: String::new(),
             resolved_perf_group: String::new(),
+            ndattr_first_values: std::collections::HashMap::new(),
+            ndattr_last_values: std::collections::HashMap::new(),
+            ndattr_element_names: Vec::new(),
         }
     }
 
@@ -939,6 +952,9 @@ impl Hdf5Writer {
         }
         self.write_swmr_layout_dataset_attrs(&mut swmr, ds_index)?;
         self.build_swmr_layout_hardlinks(&mut swmr)?;
+        // Open-time `<attribute source="ndattribute">` group element-attrs must
+        // be created before the SWMR lock (ADP-79); close-time ones cannot.
+        self.write_swmr_ndattr_element_attrs(&mut swmr)?;
 
         swmr.start_swmr()
             .map_err(|e| ADError::UnsupportedConversion(format!("SWMR start error: {}", e)))?;
@@ -1665,6 +1681,133 @@ impl Hdf5Writer {
         }
     }
 
+    /// Reset and seed the NDAttribute element-attr value caches (ADP-79) from
+    /// the open-time frame. The distinct referenced names are cached so the
+    /// per-frame update (`update_ndattr_element_values`) need not re-walk the
+    /// layout. No-op unless the layout declares `<attribute source="ndattribute">`
+    /// on a group or dataset (the default NeXus layout declares none).
+    fn seed_ndattr_element_values(&mut self, array: &NDArray) {
+        self.ndattr_first_values.clear();
+        self.ndattr_last_values.clear();
+        self.ndattr_element_names.clear();
+        let Some(layout) = self.layout.as_ref() else {
+            return;
+        };
+        let mut names: Vec<String> = Vec::new();
+        for e in layout.ndattribute_element_attrs() {
+            if !names.contains(&e.ndattribute) {
+                names.push(e.ndattribute);
+            }
+        }
+        for name in &names {
+            if let Some(attr) = array.attributes.get(name) {
+                self.ndattr_first_values
+                    .insert(name.clone(), attr.value.clone());
+                self.ndattr_last_values
+                    .insert(name.clone(), attr.value.clone());
+            }
+        }
+        self.ndattr_element_names = names;
+    }
+
+    /// Update the last-frame value cache for every referenced element-attr
+    /// NDAttribute name (C `pFileAttributes` tracks the most recent frame, so a
+    /// `when="OnFileClose"` attribute records the final value). First-frame
+    /// values are left untouched — an attribute absent at open stays unwritten
+    /// for `OnFileOpen`/`OnFrame`, matching C's open-time `find` miss.
+    fn update_ndattr_element_values(&mut self, array: &NDArray) {
+        if self.ndattr_element_names.is_empty() {
+            return;
+        }
+        for name in &self.ndattr_element_names {
+            if let Some(attr) = array.attributes.get(name) {
+                self.ndattr_last_values
+                    .insert(name.clone(), attr.value.clone());
+            }
+        }
+    }
+
+    /// Materialise every layout `<attribute source="ndattribute">` as an HDF5
+    /// attribute on its group/dataset (C `storeOnOpenCloseAttribute`). Called at
+    /// close on the standard path, when every group and dataset exists: an
+    /// `OnFileOpen`/`OnFrame` attribute takes the first-frame value (C writes it
+    /// at open, where a later close re-create would fail as a duplicate, so the
+    /// open value wins), an `OnFileClose` attribute the last-frame value.
+    /// `OnFileWrite` is not materialised by this path, matching C. The HDF5
+    /// attribute datatype follows the live NDAttribute value (C `typeNd2Hdf` on
+    /// the runtime type); an undefined/absent value is skipped.
+    ///
+    /// Group attributes are written through the file handle. Dataset attributes
+    /// need a live dataset handle (rust-hdf5 cannot reopen a dataset by name in
+    /// write mode), which only the primary image dataset retains at close — so
+    /// dataset element-attrs are honoured for the detector dataset and skipped
+    /// for the lazily-created attribute/performance datasets (an exotic case,
+    /// recorded as a residual in the parity inventory).
+    fn flush_ndattr_element_attrs(
+        &self,
+        file: &H5File,
+        primary: Option<&rust_hdf5::H5Dataset>,
+    ) -> ADResult<()> {
+        use crate::hdf5_layout::LayoutWhen;
+        let Some(layout) = self.layout.as_ref() else {
+            return Ok(());
+        };
+        for e in layout.ndattribute_element_attrs() {
+            let value = match e.when {
+                LayoutWhen::OnFileOpen | LayoutWhen::OnFrame => {
+                    self.ndattr_first_values.get(&e.ndattribute)
+                }
+                LayoutWhen::OnFileClose => self.ndattr_last_values.get(&e.ndattribute),
+                LayoutWhen::OnFileWrite => None,
+            };
+            let Some(value) = value else {
+                continue;
+            };
+            let path = e.element_path.trim_start_matches('/');
+            if e.is_dataset {
+                // Only the primary image dataset has a live write handle at
+                // close; other datasets are skipped (residual).
+                if path == self.resolved_dataset_path {
+                    if let Some(ds) = primary {
+                        write_ndattr_dataset_attr(ds, &e.attr_name, value);
+                    }
+                }
+            } else {
+                let group = Self::open_write_group(file, path)?;
+                write_ndattr_group_attr(&group, &e.attr_name, value);
+            }
+        }
+        Ok(())
+    }
+
+    /// SWMR counterpart of [`Hdf5Writer::flush_ndattr_element_attrs`], limited
+    /// to the open-time set that can be written before `start_swmr()` locks the
+    /// file: `OnFileOpen`/`OnFrame` `<attribute source="ndattribute">` nodes on
+    /// groups, using the first-frame value. `OnFileClose` cannot be honoured in
+    /// SWMR (HDF5 forbids creating attributes after the SWMR lock — C's
+    /// close-time `H5Acreate2` fails identically), and dataset element-attrs are
+    /// not addressable through `SwmrFileWriter` (datasets are keyed by index,
+    /// not path); both are recorded as residuals in the parity inventory.
+    fn write_swmr_ndattr_element_attrs(&self, swmr: &mut SwmrFileWriter) -> ADResult<()> {
+        use crate::hdf5_layout::LayoutWhen;
+        let Some(layout) = self.layout.as_ref() else {
+            return Ok(());
+        };
+        for e in layout.ndattribute_element_attrs() {
+            if e.is_dataset {
+                continue;
+            }
+            if !matches!(e.when, LayoutWhen::OnFileOpen | LayoutWhen::OnFrame) {
+                continue;
+            }
+            let Some(value) = self.ndattr_first_values.get(&e.ndattribute) else {
+                continue;
+            };
+            write_swmr_ndattr_group_attr(swmr, &e.element_path, &e.attr_name, value)?;
+        }
+        Ok(())
+    }
+
     /// Flush accumulated NDAttribute datasets into the open standard file.
     /// Each becomes a chunked, extensible 1-D dataset under `NDAttributes/`.
     fn flush_attribute_datasets(&mut self) -> ADResult<()> {
@@ -1965,11 +2108,112 @@ fn write_ndattr_descriptors(ds: &rust_hdf5::H5Dataset, ad: &AttributeDataset) {
     }
 }
 
+/// Write a live NDAttribute value as an HDF5 attribute on a standard-mode
+/// group (C `storeOnOpenCloseAttribute` group branch). The datatype follows
+/// the runtime NDAttribute value (C `typeNd2Hdf`); a string writes a scalar
+/// string, an `Undefined` value is skipped. Errors are non-fatal, mirroring
+/// C's per-attribute warn-and-skip.
+fn write_ndattr_group_attr(group: &rust_hdf5::H5Group, attr_name: &str, value: &NDAttrValue) {
+    macro_rules! num {
+        ($v:expr) => {{
+            let _ = group.set_attr_numeric(attr_name, &$v);
+        }};
+    }
+    match value {
+        NDAttrValue::Int8(v) => num!(*v),
+        NDAttrValue::UInt8(v) => num!(*v),
+        NDAttrValue::Int16(v) => num!(*v),
+        NDAttrValue::UInt16(v) => num!(*v),
+        NDAttrValue::Int32(v) => num!(*v),
+        NDAttrValue::UInt32(v) => num!(*v),
+        NDAttrValue::Int64(v) => num!(*v),
+        NDAttrValue::UInt64(v) => num!(*v),
+        NDAttrValue::Float32(v) => num!(*v),
+        NDAttrValue::Float64(v) => num!(*v),
+        NDAttrValue::String(s) => {
+            let _ = group.set_attr_string(attr_name, s);
+        }
+        NDAttrValue::Undefined => {}
+    }
+}
+
+/// Write a live NDAttribute value as an HDF5 attribute on a standard-mode
+/// dataset, via a live dataset handle. rust-hdf5 0.2.17 cannot reopen a
+/// dataset by name while the file is in write mode (`H5File::dataset` errors
+/// with "cannot open a dataset by name in write mode"), so the caller supplies
+/// the handle obtained at create time. C `storeOnOpenCloseAttribute` dataset
+/// branch; `Undefined` is skipped, errors are non-fatal.
+fn write_ndattr_dataset_attr(ds: &rust_hdf5::H5Dataset, attr_name: &str, value: &NDAttrValue) {
+    macro_rules! num {
+        ($v:expr, $t:ty) => {{
+            let v: $t = $v;
+            let _ = ds
+                .new_attr::<$t>()
+                .shape(())
+                .create(attr_name)
+                .and_then(|a| a.write_numeric(&v));
+        }};
+    }
+    match value {
+        NDAttrValue::Int8(v) => num!(*v, i8),
+        NDAttrValue::UInt8(v) => num!(*v, u8),
+        NDAttrValue::Int16(v) => num!(*v, i16),
+        NDAttrValue::UInt16(v) => num!(*v, u16),
+        NDAttrValue::Int32(v) => num!(*v, i32),
+        NDAttrValue::UInt32(v) => num!(*v, u32),
+        NDAttrValue::Int64(v) => num!(*v, i64),
+        NDAttrValue::UInt64(v) => num!(*v, u64),
+        NDAttrValue::Float32(v) => num!(*v, f32),
+        NDAttrValue::Float64(v) => num!(*v, f64),
+        NDAttrValue::String(s) => {
+            let sv = rust_hdf5::types::VarLenUnicode(s.clone());
+            let _ = ds
+                .new_attr::<rust_hdf5::types::VarLenUnicode>()
+                .shape(())
+                .create(attr_name)
+                .and_then(|a| a.write_scalar(&sv));
+        }
+        NDAttrValue::Undefined => {}
+    }
+}
+
+/// SWMR counterpart of [`write_ndattr_element_attr`] for group element-attrs:
+/// write a live NDAttribute value as a group HDF5 attribute, addressed by the
+/// group's absolute path. The datatype follows the runtime NDAttribute value
+/// (C `typeNd2Hdf`); `Undefined` is skipped.
+fn write_swmr_ndattr_group_attr(
+    swmr: &mut SwmrFileWriter,
+    group_path: &str,
+    attr_name: &str,
+    value: &NDAttrValue,
+) -> ADResult<()> {
+    let res = match value {
+        NDAttrValue::Int8(v) => swmr.set_group_attr_numeric(group_path, attr_name, v),
+        NDAttrValue::UInt8(v) => swmr.set_group_attr_numeric(group_path, attr_name, v),
+        NDAttrValue::Int16(v) => swmr.set_group_attr_numeric(group_path, attr_name, v),
+        NDAttrValue::UInt16(v) => swmr.set_group_attr_numeric(group_path, attr_name, v),
+        NDAttrValue::Int32(v) => swmr.set_group_attr_numeric(group_path, attr_name, v),
+        NDAttrValue::UInt32(v) => swmr.set_group_attr_numeric(group_path, attr_name, v),
+        NDAttrValue::Int64(v) => swmr.set_group_attr_numeric(group_path, attr_name, v),
+        NDAttrValue::UInt64(v) => swmr.set_group_attr_numeric(group_path, attr_name, v),
+        NDAttrValue::Float32(v) => swmr.set_group_attr_numeric(group_path, attr_name, v),
+        NDAttrValue::Float64(v) => swmr.set_group_attr_numeric(group_path, attr_name, v),
+        NDAttrValue::String(s) => swmr.set_group_attr_string(group_path, attr_name, s),
+        NDAttrValue::Undefined => return Ok(()),
+    };
+    res.map_err(|e| {
+        ADError::UnsupportedConversion(format!(
+            "SWMR ndattribute group attribute '{}/{}': {}",
+            group_path, attr_name, e
+        ))
+    })
+}
+
 /// Write a layout group's `constant`-sourced `<attribute>` nodes (e.g. the
 /// NeXus `NX_class` markers) to an open standard-mode group, typed per the XML
 /// `type` attribute. `ndattribute`-sourced group attributes carry per-frame
-/// values and are out of scope here. Errors are non-fatal, mirroring the
-/// standard dataset-attribute materialisation.
+/// values and are written separately by [`write_ndattr_group_attr`]. Errors are
+/// non-fatal.
 fn write_group_constant_attrs(
     group: &rust_hdf5::H5Group,
     attrs: &[crate::hdf5_layout::LayoutAttribute],
@@ -2052,6 +2296,9 @@ impl NDFileWriter for Hdf5Writer {
         // Resolve where image/attribute/performance datasets land for this
         // file: the loaded layout XML tree, or the flat root default.
         self.resolve_layout_paths();
+        // Seed the open-time NDAttribute values for any layout
+        // `<attribute source="ndattribute">` element-attrs (ADP-79).
+        self.seed_ndattr_element_values(array);
 
         if self.swmr_mode && mode == NDFileMode::Stream {
             self.open_swmr(path, array)
@@ -2079,6 +2326,9 @@ impl NDFileWriter for Hdf5Writer {
         } else {
             self.write_standard(array)?;
         }
+        // Track the latest NDAttribute values for `when="OnFileClose"`
+        // element-attrs (ADP-79); no-op unless the layout declares any.
+        self.update_ndattr_element_values(array);
         self.frame_count += 1;
 
         let elapsed = start.elapsed().as_secs_f64();
@@ -2170,8 +2420,15 @@ impl NDFileWriter for Hdf5Writer {
                 // Materialise layout `<hardlink>` elements last, once every
                 // dataset a link may target exists on disk.
                 match self.handle {
-                    Some(Hdf5Handle::Standard { ref file, .. }) => {
-                        self.build_layout_hardlinks(file)?
+                    Some(Hdf5Handle::Standard {
+                        ref file,
+                        ref primary,
+                    }) => {
+                        self.build_layout_hardlinks(file)?;
+                        // Every group and dataset now exists, so layout
+                        // `<attribute source="ndattribute">` element-attrs can
+                        // be attached with their open/close values (ADP-79).
+                        self.flush_ndattr_element_attrs(file, primary.as_ref())?;
                     }
                     _ => unreachable!("handle is Standard in this arm"),
                 }
@@ -3204,6 +3461,102 @@ mod tests {
                 .is_err()
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_ndattribute_element_attr_open_close_values() {
+        // C `storeOnOpenCloseAttribute` (NDFileHDF5.cpp:553-632) writes a
+        // layout `<attribute source="ndattribute">` as an HDF5 attribute on its
+        // group/dataset: `when="OnFileOpen"` (and the default `OnFrame`) take
+        // the first-frame value, `when="OnFileClose"` the last. Cover a group
+        // string attribute and a dataset numeric attribute, both phases.
+        let dir = std::env::temp_dir();
+        let layout = dir.join("adcore_layout_elem_attr.xml");
+        std::fs::write(
+            &layout,
+            r#"<hdf5_layout>
+              <group name="entry">
+                <group name="instrument">
+                  <group name="detector">
+                    <attribute name="FirstColorMode" source="ndattribute" ndattribute="ColorMode" when="OnFileOpen"/>
+                    <attribute name="LastColorMode" source="ndattribute" ndattribute="ColorMode" when="OnFileClose"/>
+                    <attribute name="DefaultColorMode" source="ndattribute" ndattribute="ColorMode"/>
+                    <dataset name="data" source="detector" det_default="true">
+                      <attribute name="GainAtOpen" source="ndattribute" ndattribute="Gain" when="OnFileOpen"/>
+                      <attribute name="GainAtClose" source="ndattribute" ndattribute="Gain" when="OnFileClose"/>
+                    </dataset>
+                  </group>
+                  <group name="NDAttributes" ndattr_default="true"/>
+                </group>
+              </group>
+            </hdf5_layout>"#,
+        )
+        .unwrap();
+
+        let path = temp_path("hdf5_elem_attr");
+        let mut writer = Hdf5Writer::new();
+        assert!(
+            writer.set_layout_filename(layout.to_str().unwrap()),
+            "layout XML must parse: {}",
+            writer.layout_error
+        );
+
+        let mk = |mode: &str, gain: i32| {
+            let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+            arr.attributes.add(NDAttribute::new_static(
+                "ColorMode",
+                "",
+                NDAttrSource::Driver,
+                NDAttrValue::String(mode.to_string()),
+            ));
+            arr.attributes.add(NDAttribute::new_static(
+                "Gain",
+                "",
+                NDAttrSource::Driver,
+                NDAttrValue::Int32(gain),
+            ));
+            arr
+        };
+
+        let a0 = mk("Mono", 10);
+        writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
+        writer.write_file(&a0).unwrap();
+        writer.write_file(&mk("RGB1", 20)).unwrap();
+        writer.write_file(&mk("Bayer", 30)).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+
+        // Group string element-attributes on /entry/instrument/detector.
+        let mut grp = h5.root_group();
+        for seg in ["entry", "instrument", "detector"] {
+            grp = grp.group(seg).unwrap();
+        }
+        // OnFileOpen and the default (OnFrame, open wins) take the first value.
+        assert_eq!(grp.attr_string("FirstColorMode").unwrap(), "Mono");
+        assert_eq!(grp.attr_string("DefaultColorMode").unwrap(), "Mono");
+        // OnFileClose takes the last value.
+        assert_eq!(grp.attr_string("LastColorMode").unwrap(), "Bayer");
+
+        // Dataset numeric element-attributes on the detector dataset.
+        let ds = h5.dataset("entry/instrument/detector/data").unwrap();
+        assert_eq!(
+            ds.attr("GainAtOpen")
+                .unwrap()
+                .read_numeric::<i32>()
+                .unwrap(),
+            10
+        );
+        assert_eq!(
+            ds.attr("GainAtClose")
+                .unwrap()
+                .read_numeric::<i32>()
+                .unwrap(),
+            30
+        );
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&layout).ok();
     }
 
     #[test]

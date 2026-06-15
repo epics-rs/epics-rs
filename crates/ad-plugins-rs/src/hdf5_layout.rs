@@ -75,6 +75,25 @@ pub struct LayoutAttribute {
     pub when: LayoutWhen,
 }
 
+/// A `<attribute source="ndattribute">` declared on a group or dataset,
+/// resolved to the owning element's full path. Used by the writer to attach
+/// an HDF5 attribute carrying the live NDAttribute value (C
+/// `storeOnOpenCloseAttribute`).
+#[derive(Debug, Clone)]
+pub struct NdAttrElementAttr {
+    /// Full path (leading slash) of the owning group or dataset.
+    pub element_path: String,
+    /// True if the owning element is a dataset, false if a group.
+    pub is_dataset: bool,
+    /// HDF5 attribute name to create on the element.
+    pub attr_name: String,
+    /// NDAttribute name supplying the value.
+    pub ndattribute: String,
+    /// `OnFileOpen`/`OnFrame` take the first frame's value, `OnFileClose` the
+    /// last (C `is_onFileOpen`/`is_onFileClose`, NDFileHDF5Layout.cpp:54-64).
+    pub when: LayoutWhen,
+}
+
 /// A `<dataset>` element.
 #[derive(Debug, Clone)]
 pub struct LayoutDataset {
@@ -224,6 +243,52 @@ impl Hdf5Layout {
             }
         });
         found
+    }
+
+    /// Enumerate every `<attribute source="ndattribute">` declared on a group
+    /// or dataset in the tree, in document order, with the owning element's
+    /// full path. C `storeOnOpenCloseAttribute` (NDFileHDF5.cpp:553-632) writes
+    /// each as an HDF5 attribute on its element, sourcing the value from the
+    /// live NDAttribute (`get_attributes()` over groups *and* datasets).
+    pub fn ndattribute_element_attrs(&self) -> Vec<NdAttrElementAttr> {
+        fn push_attrs(
+            out: &mut Vec<NdAttrElementAttr>,
+            element_path: &str,
+            is_dataset: bool,
+            attrs: &[LayoutAttribute],
+        ) {
+            for a in attrs {
+                if a.source == LayoutSource::NdAttribute {
+                    out.push(NdAttrElementAttr {
+                        element_path: element_path.to_string(),
+                        is_dataset,
+                        attr_name: a.name.clone(),
+                        ndattribute: a.ndattribute.clone(),
+                        when: a.when,
+                    });
+                }
+            }
+        }
+        fn recurse(out: &mut Vec<NdAttrElementAttr>, g: &LayoutGroup, path: &str) {
+            let here = if path.is_empty() {
+                format!("/{}", g.name)
+            } else {
+                format!("{}/{}", path, g.name)
+            };
+            push_attrs(out, &here, false, &g.attributes);
+            for d in &g.datasets {
+                let dpath = format!("{}/{}", here, d.name);
+                push_attrs(out, &dpath, true, &d.attributes);
+            }
+            for sub in &g.groups {
+                recurse(out, sub, &here);
+            }
+        }
+        let mut out = Vec::new();
+        for g in &self.groups {
+            recurse(&mut out, g, "");
+        }
+        out
     }
 
     /// Find the group flagged `ndattr_default`, returning its full path.

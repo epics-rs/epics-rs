@@ -1019,11 +1019,12 @@ Rust: `plugin/runtime.rs:1291-1310` `cast_from_f64` uses Rust `as` (f64→iN sat
 C: `NDArrayPool.cpp:378-387` `convertType` uses `(dataTypeOut)(*pDataIn++)` — plain C cast; out-of-range float→int is undefined.
 Impact: In-range values truncate identically. They diverge only for out-of-range float→int when a float NDArray is read as an integer waveform; C's result is undefined/platform-dependent, so not a well-defined parity target — signoff. (int→int already uses C-cast truncation via `copy_ccast`, `runtime.rs:1218-1228`.)
 
-#### ADP-57: StdArrays does not special-case codec/compressed arrays on read
-Severity: Low — verify
+#### ADP-57: StdArrays does not special-case codec/compressed arrays on read — **SIGNOFF**
+Severity: Low — verify → signoff
 Rust: `plugin/runtime.rs:1324-1346` `impl_read_array!` always reads `array.data` (typed buffer) with no codec branch; `std_arrays.rs:34-38` stores `array.clone()` unconditionally.
 C: `NDPluginStdArrays.cpp:43-57,98-120` branches on `pArray->codec.empty()` — for a compressed array copies the raw compressed bytes (`compressedSize`) instead of converting, `numElements = compressedSize/bytesPerElement + 1`.
 Impact: If a compressed NDArray reaches StdArrays, C emits the raw compressed byte stream; Rust emits the decompressed/typed buffer. Reachability depends on whether the Rust input can carry an undecoded codec — verify the upstream wiring.
+**Verdict — SIGNOFF: a compressed array never reaches StdArrays in either port.** C `NDPluginStdArrays` does NOT pass `compressionAware=true` (no `compressionAware` token anywhere in `NDPluginStdArrays.cpp`/`.h`), so it inherits the base default `false` (`NDPluginDriver.h:63`). The base `driverCallback` then drops any compressed array up-front — `if (!compressionAware_ && !pArray->codec.empty())` increments `DroppedArrays` and `return`s before `processCallbacks`/`arrayInterruptCallback` run (`NDPluginDriver.cpp:383-393`). So C's codec branch at `:43-57` is dead defensive code, never reached. Rust mirrors this exactly: `StdArraysProcessor` does not override `compression_aware()` (default `false`, `runtime.rs:256`), so the runtime gate `if compressed && !guard.compression_aware` drops the array and increments `DroppedArrays` before `process_array` (`runtime.rs:1785-1789`) — the same up-front drop. Both ports drop a compressed input to StdArrays identically; the cited divergence cannot manifest. (This investigation surfaced [ADP-98]: `CodecProcessor`, which C marks `compressionAware=true`, is missing the same override and is thus broken in the opposite direction.)
 
 #### ADP-58: passthrough.rs has no direct C plugin counterpart
 Severity: Low — signoff

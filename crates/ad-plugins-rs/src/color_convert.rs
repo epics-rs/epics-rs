@@ -47,145 +47,71 @@ pub fn bayer_to_rgb1(src: &NDArray, pattern: NDBayerPattern) -> Option<NDArray> 
         r_row_even = !r_row_even;
     }
 
-    // Helper to demosaic a single row into (r, g, b) slices
+    // Helper to demosaic a single row into (r, g, b) slices.
+    //
+    // C interpolates only pixels not touching a border
+    // (NDPluginColorConvert.cpp:305): a pixel with x in 0/rowSize-1 or y in
+    // 0/numRows-1 keeps only its native Bayer channel, the other two stay 0.
+    // Interior pixels always have all 8 neighbours, so C's fixed divisors
+    // (/4 for the red/blue arms, /2 for green) apply directly.
     let demosaic_row = |y: usize, r_row: &mut [f64], g_row: &mut [f64], b_row: &mut [f64]| {
         let even_row = (y % 2 == 0) == r_row_even;
         for x in 0..w {
             let val = get_val(x, y);
             let even_col = (x % 2 == 0) == r_col_even;
+            let interior = x > 0 && x + 1 < w && y > 0 && y + 1 < h;
 
             match (even_row, even_col) {
                 (true, true) => {
+                    // Red pixel: green = orthogonal mean, blue = diagonal mean
+                    // (NDPluginColorConvert.cpp:308-309).
                     r_row[x] = val;
-                    let mut gsum = 0.0;
-                    let mut gc = 0;
-                    if x > 0 {
-                        gsum += get_val(x - 1, y);
-                        gc += 1;
+                    if interior {
+                        g_row[x] = (get_val(x - 1, y)
+                            + get_val(x + 1, y)
+                            + get_val(x, y - 1)
+                            + get_val(x, y + 1))
+                            / 4.0;
+                        b_row[x] = (get_val(x - 1, y - 1)
+                            + get_val(x + 1, y - 1)
+                            + get_val(x - 1, y + 1)
+                            + get_val(x + 1, y + 1))
+                            / 4.0;
                     }
-                    if x < w - 1 {
-                        gsum += get_val(x + 1, y);
-                        gc += 1;
-                    }
-                    if y > 0 {
-                        gsum += get_val(x, y - 1);
-                        gc += 1;
-                    }
-                    if y < h - 1 {
-                        gsum += get_val(x, y + 1);
-                        gc += 1;
-                    }
-                    g_row[x] = if gc > 0 { gsum / gc as f64 } else { 0.0 };
-                    let mut bsum = 0.0;
-                    let mut bc = 0;
-                    if x > 0 && y > 0 {
-                        bsum += get_val(x - 1, y - 1);
-                        bc += 1;
-                    }
-                    if x < w - 1 && y > 0 {
-                        bsum += get_val(x + 1, y - 1);
-                        bc += 1;
-                    }
-                    if x > 0 && y < h - 1 {
-                        bsum += get_val(x - 1, y + 1);
-                        bc += 1;
-                    }
-                    if x < w - 1 && y < h - 1 {
-                        bsum += get_val(x + 1, y + 1);
-                        bc += 1;
-                    }
-                    b_row[x] = if bc > 0 { bsum / bc as f64 } else { 0.0 };
                 }
                 (true, false) | (false, true) => {
+                    // Green pixel.
                     g_row[x] = val;
-                    if even_row {
-                        let mut rsum = 0.0;
-                        let mut rc = 0;
-                        if x > 0 {
-                            rsum += get_val(x - 1, y);
-                            rc += 1;
+                    if interior {
+                        if even_row {
+                            // Green next to red: red horizontal, blue vertical
+                            // (NDPluginColorConvert.cpp:313-314).
+                            r_row[x] = (get_val(x - 1, y) + get_val(x + 1, y)) / 2.0;
+                            b_row[x] = (get_val(x, y - 1) + get_val(x, y + 1)) / 2.0;
+                        } else {
+                            // Green next to blue: blue horizontal, red vertical
+                            // (NDPluginColorConvert.cpp:318-319).
+                            b_row[x] = (get_val(x - 1, y) + get_val(x + 1, y)) / 2.0;
+                            r_row[x] = (get_val(x, y - 1) + get_val(x, y + 1)) / 2.0;
                         }
-                        if x < w - 1 {
-                            rsum += get_val(x + 1, y);
-                            rc += 1;
-                        }
-                        r_row[x] = if rc > 0 { rsum / rc as f64 } else { 0.0 };
-                        let mut bsum = 0.0;
-                        let mut bc = 0;
-                        if y > 0 {
-                            bsum += get_val(x, y - 1);
-                            bc += 1;
-                        }
-                        if y < h - 1 {
-                            bsum += get_val(x, y + 1);
-                            bc += 1;
-                        }
-                        b_row[x] = if bc > 0 { bsum / bc as f64 } else { 0.0 };
-                    } else {
-                        let mut bsum = 0.0;
-                        let mut bc = 0;
-                        if x > 0 {
-                            bsum += get_val(x - 1, y);
-                            bc += 1;
-                        }
-                        if x < w - 1 {
-                            bsum += get_val(x + 1, y);
-                            bc += 1;
-                        }
-                        b_row[x] = if bc > 0 { bsum / bc as f64 } else { 0.0 };
-                        let mut rsum = 0.0;
-                        let mut rc = 0;
-                        if y > 0 {
-                            rsum += get_val(x, y - 1);
-                            rc += 1;
-                        }
-                        if y < h - 1 {
-                            rsum += get_val(x, y + 1);
-                            rc += 1;
-                        }
-                        r_row[x] = if rc > 0 { rsum / rc as f64 } else { 0.0 };
                     }
                 }
                 (false, false) => {
+                    // Blue pixel: green = orthogonal mean, red = diagonal mean
+                    // (NDPluginColorConvert.cpp:308-309, blue branch).
                     b_row[x] = val;
-                    let mut gsum = 0.0;
-                    let mut gc = 0;
-                    if x > 0 {
-                        gsum += get_val(x - 1, y);
-                        gc += 1;
+                    if interior {
+                        g_row[x] = (get_val(x - 1, y)
+                            + get_val(x + 1, y)
+                            + get_val(x, y - 1)
+                            + get_val(x, y + 1))
+                            / 4.0;
+                        r_row[x] = (get_val(x - 1, y - 1)
+                            + get_val(x + 1, y - 1)
+                            + get_val(x - 1, y + 1)
+                            + get_val(x + 1, y + 1))
+                            / 4.0;
                     }
-                    if x < w - 1 {
-                        gsum += get_val(x + 1, y);
-                        gc += 1;
-                    }
-                    if y > 0 {
-                        gsum += get_val(x, y - 1);
-                        gc += 1;
-                    }
-                    if y < h - 1 {
-                        gsum += get_val(x, y + 1);
-                        gc += 1;
-                    }
-                    g_row[x] = if gc > 0 { gsum / gc as f64 } else { 0.0 };
-                    let mut rsum = 0.0;
-                    let mut rc = 0;
-                    if x > 0 && y > 0 {
-                        rsum += get_val(x - 1, y - 1);
-                        rc += 1;
-                    }
-                    if x < w - 1 && y > 0 {
-                        rsum += get_val(x + 1, y - 1);
-                        rc += 1;
-                    }
-                    if x > 0 && y < h - 1 {
-                        rsum += get_val(x - 1, y + 1);
-                        rc += 1;
-                    }
-                    if x < w - 1 && y < h - 1 {
-                        rsum += get_val(x + 1, y + 1);
-                        rc += 1;
-                    }
-                    r_row[x] = if rc > 0 { rsum / rc as f64 } else { 0.0 };
                 }
             }
         }
@@ -1026,6 +952,67 @@ mod tests {
         assert_eq!(rgb.dims[0].size, 3); // color
         assert_eq!(rgb.dims[1].size, 4); // x
         assert_eq!(rgb.dims[2].size, 4); // y
+    }
+
+    // RGB1 pixel (x,y) channel c lives at out[(y*w + x)*3 + c].
+    fn rgb1_pixel(arr: &NDArray, w: usize, x: usize, y: usize) -> [u8; 3] {
+        let i = (y * w + x) * 3;
+        if let NDDataBuffer::U8(ref v) = arr.data {
+            [v[i], v[i + 1], v[i + 2]]
+        } else {
+            panic!("expected UInt8 RGB1 output");
+        }
+    }
+
+    #[test]
+    fn test_adp4_bayer_border_keeps_native_channel_only() {
+        // 4x4 RGGB, all pixels = 100. C interpolates only interior pixels
+        // (NDPluginColorConvert.cpp:305); border pixels keep only their native
+        // Bayer channel, the other two stay 0. Previously the Rust border was
+        // interpolated from available neighbours (e.g. corner -> (100,100,100)).
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        if let NDDataBuffer::U8(ref mut v) = arr.data {
+            v.iter_mut().for_each(|p| *p = 100);
+        }
+        let rgb = bayer_to_rgb1(&arr, NDBayerPattern::RGGB).unwrap();
+
+        // Border pixels: native channel only.
+        assert_eq!(rgb1_pixel(&rgb, 4, 0, 0), [100, 0, 0]); // corner, red
+        assert_eq!(rgb1_pixel(&rgb, 4, 1, 0), [0, 100, 0]); // top edge, green
+        assert_eq!(rgb1_pixel(&rgb, 4, 0, 1), [0, 100, 0]); // left edge, green
+        assert_eq!(rgb1_pixel(&rgb, 4, 3, 3), [0, 0, 100]); // corner, blue
+
+        // Interior pixels: fully interpolated (all neighbours = 100).
+        assert_eq!(rgb1_pixel(&rgb, 4, 1, 1), [100, 100, 100]); // blue
+        assert_eq!(rgb1_pixel(&rgb, 4, 1, 2), [100, 100, 100]); // green
+        assert_eq!(rgb1_pixel(&rgb, 4, 2, 2), [100, 100, 100]); // red
+    }
+
+    #[test]
+    fn test_adp4_bayer_interior_uses_fixed_quarter_divisor() {
+        // 3x3 RGGB: the only interior pixel is the blue centre (1,1). Its red is
+        // the diagonal mean /4 and green the orthogonal mean /4
+        // (NDPluginColorConvert.cpp:308-309). Distinct neighbour values pin the
+        // divisor: diagonals all 200 -> red 200; orthogonals 40,40,80,80 ->
+        // green 60.
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(3), NDDimension::new(3)],
+            NDDataType::UInt8,
+        );
+        if let NDDataBuffer::U8(ref mut v) = arr.data {
+            // row0: 200 40 200 / row1: 80 128 80 / row2: 200 40 200
+            v.copy_from_slice(&[200, 40, 200, 80, 128, 80, 200, 40, 200]);
+        }
+        let rgb = bayer_to_rgb1(&arr, NDBayerPattern::RGGB).unwrap();
+
+        // Interior blue centre: red = (200*4)/4 = 200, green = (40+40+80+80)/4 = 60.
+        assert_eq!(rgb1_pixel(&rgb, 3, 1, 1), [200, 60, 128]);
+        // All eight surrounding pixels are border: native channel only.
+        assert_eq!(rgb1_pixel(&rgb, 3, 0, 0), [200, 0, 0]); // red
+        assert_eq!(rgb1_pixel(&rgb, 3, 1, 0), [0, 40, 0]); // green
     }
 
     #[test]

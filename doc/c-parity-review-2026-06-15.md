@@ -118,6 +118,8 @@ population). One commit per finding.
 | ADP-9 (FFT rank from input ndims, not a fixed mode; 2-D input → full 2-D FFT) | fix | Fixed | 7943d427 |
 | ADP-25 (FFT TimeSeries/TimeAxis posted at padded nTimeX) | fix | Fixed | 61b9964d |
 | ADP-12 (JPEG RGB2/RGB3 → RGB; convert_rgb_layout tags output ColorMode) | fix | Fixed | 487d3bd4 |
+| ADP-17 (ROIStat dispatches stats by array rank; 1-D background sums only the two X-end strips) | fix | Fixed | a8ac8287 |
+| ADP-16 (ROIStat clamps out-of-range/zero ROI to one edge pixel; writes back clamped geometry) | fix | Fixed | 017d3497 |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -324,12 +326,14 @@ Severity: Medium — fix
 Rust: `crates/ad-plugins-rs/src/roi_stat.rs:218-222` offset>=size/zero → all-zero.
 C: `NDPluginROIStat.cpp:241-260` clamps to ≥1 pixel and writes back clamped geometry.
 Impact: per-ROI values and geometry readbacks diverge.
+— FIXED 017d3497: new `clamp_roi_geometry` mirrors the C clamp loop (offset→[0,dim-1], size→[1,dim-offset]) so a degenerate ROI collapses to a single edge pixel instead of vanishing, and `process_array` writes the clamped Dim0/1Min, Dim0/1Size and array Dim0/1MaxSize back to the per-ROI readback params (NDPluginROIStat.cpp:250-261). Tests test_adp16_clamp_out_of_range_offset_to_one_pixel / _zero_size / _geometry_writeback_uses_clamped_values; test_empty_roi and test_roi_out_of_bounds updated from zero stats to the clamped edge pixel. (Built on the rank-dispatch restructure landed for ADP-17.)
 
 #### ADP-17: ROIStat 1-D background includes nonexistent Y-edges
 Severity: Medium — fix
 Rust: `crates/ad-plugins-rs/src/roi_stat.rs:288-309` always treats ROI as 2-D (4 edges).
 C: `NDPluginROIStat.cpp:57-79` — ndims==1 background is only the 2 X-end strips.
 Impact: 1-D ROI NET diverges.
+— FIXED a8ac8287: `compute_roi_stats` now reads the raw array dims and dispatches by rank like the C `doComputeStatistics` (NDPluginROIStat.cpp:30-139): 1-D sums one X strip for stats and the two X-end strips of width MIN(bgdWidth,sizeX) for background; 2-D keeps the four-edge border, summed exactly as C (including the degenerate thick-border double-count). The previous path derived geometry from `info()` (y_size==0 for a 1-D array → every stat zeroed) and used a 2-D distance-from-edge ring on all ranks. Test test_adp17_1d_background_uses_x_strips_only.
 
 #### ADP-18: ROI 3-D RGB path ignores the requested output dataType
 Severity: Medium — fix

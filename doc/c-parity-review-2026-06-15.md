@@ -102,6 +102,8 @@ population). One commit per finding.
 | ADP-20 (overlay Cross independent SizeX/SizeY arms) | fix | Fixed | 314b5912 |
 | ADP-21 (overlay Rectangle inclusive bounds, SizeX+1 wide) | fix | Fixed | ad15297a |
 | ADP-22 (overlay text skips codes ≥128, C signed-char rule) | fix | Fixed | 5d767953 |
+| ADP-11 (COMPRESSOR ordinal Blosc=2/LZ4=3/BSLZ4=4; zlib/lz4hdf5→5/6) | fix | Fixed | 39e07250 |
+| ADP-29 (Blosc default clevel 5; record real codec params) | fix-low | Fixed | e92d42be |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -258,8 +260,9 @@ Rust: `crates/ad-plugins-rs/src/overlay.rs:466-499` maps `2=Ellipse, 3=Text`.
 C: `NDPluginOverlay.h:9-13` `Cross=0,Rectangle=1,Text=2,Ellipse=3`.
 Impact: `OVERLAY_SHAPE=2/3` draws the wrong shape vs C.
 
-#### ADP-11: Codec COMPRESSOR ordinal mapping diverges (extra zlib/lz4hdf5 shift)
+#### ADP-11: Codec COMPRESSOR ordinal mapping diverges (extra zlib/lz4hdf5 shift) — FIXED 39e07250
 Severity: High — fix
+Fix: ordinals 0-4 aligned to C `NDCodecCompressor_t` (NONE/JPEG/BLOSC/LZ4/BSLZ4); Rust-only zlib/lz4hdf5 moved to 5/6 so they never shadow a C ordinal. (Structural ADP-26 sign-off — keep vs remove the extra codecs — still open under #58.)
 Rust: `crates/ad-plugins-rs/src/codec.rs:1080-1088` maps `1=JPEG,2=Zlib,3=Blosc,4=LZ4,5=LZ4HDF5,6=BSLZ4` (the comment `:1078` mis-states the C ordinals).
 C: `Codec.h:12-18` `NONE=0,JPEG=1,BLOSC=2,LZ4=3,BSLZ4=4`.
 Impact: `COMPRESSOR=2` → Blosc in C, Zlib in Rust; `=3` → LZ4 vs Blosc; `=4` → BSLZ4 vs LZ4. Different codec + bytes. (Structural cause: ADC-10.)
@@ -366,11 +369,12 @@ Rust: `crates/ad-plugins-rs/src/file_tiff.rs:115-135,243-313` converts to interl
 C: `NDFileTIFF.cpp:204-219,390-405` PLANARCONFIG_SEPARATE + planar strips.
 Impact: a reader branching on PlanarConfiguration sees 2 (C) vs 1/absent (Rust).
 
-#### ADP-29: Blosc codec params (level/shuffle/compressor) dropped from stored metadata; default clevel 3 vs 5
+#### ADP-29: Blosc codec params (level/shuffle/compressor) dropped from stored metadata; default clevel 3 vs 5 — FIXED e92d42be
 Severity: Low — fix-low
 Rust: `crates/ad-plugins-rs/src/codec.rs:830-837` writes 0/0/0; `:790-797` default clevel 3.
 C: `NDPluginCodec.cpp:399-403,894` stores real params, default clevel 5.
 Impact: NTNDArray codec metadata 0/0/0 + different compressed bytes/size.
+Note: verified the codec level/shuffle/compressor fields are NOT serialized to the NTNDArray wire (`codec.parameters` carries only the original scalar type, `epics-pva-rs/src/nt/nd_array.rs`) nor read by the HDF5 writer (it uses its own `blosc_*` config). The observable divergence is the **default clevel 3→5** (changes compressed bytes + `compressedSize`); the stored-params 0→real change matches C `Codec_t` and removes a latent divergence if the fields are ever serialized.
 
 #### ADP-30: Stats HIST_BELOW/HIST_ABOVE param type Float64 vs C Int32; TIFF extra IFD tags / RowsPerStrip
 Severity: Low — fix-low / signoff

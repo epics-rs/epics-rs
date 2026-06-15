@@ -104,6 +104,10 @@ population). One commit per finding.
 | ADP-22 (overlay text skips codes ≥128, C signed-char rule) | fix | Fixed | 5d767953 |
 | ADP-11 (COMPRESSOR ordinal Blosc=2/LZ4=3/BSLZ4=4; zlib/lz4hdf5→5/6) | fix | Fixed | 39e07250 |
 | ADP-29 (Blosc default clevel 5; record real codec params) | fix-low | Fixed | e92d42be |
+| ADP-5 (process clip order high-then-low) | fix | Fixed | b2eea48b |
+| ADP-24 (flat-field uses scaleFlatField directly, no mean substitution) | fix | Fixed | bbd7fd5e |
+| ADP-7 (valid bg/flat-field recomputed per frame; size mismatch invalidates) | fix | Fixed | afead50f |
+| ADP-6 (auto offset/scale arms next frame, not the trigger frame) | fix | Fixed | 570965ea |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -228,18 +232,21 @@ Severity: High — fix
 Rust: `crates/ad-plugins-rs/src/process.rs:409-413` low-clip then high-clip.
 C: `NDPluginProcess.cpp:175-176` high-clip then low-clip.
 Impact: when the two thresholds cross, per-pixel output differs (v=200, high=100→10, low=50→999: C 999, Rust 10).
+— FIXED b2eea48b: apply_stages now clips high-then-low; test test_adp5_clip_order_high_before_low.
 
 #### ADP-6: Process auto-offset-scale transforms the trigger frame; C only measures it
 Severity: High — fix
 Rust: `crates/ad-plugins-rs/src/process.rs:348-351` runs auto_offset_scale at stage 0b and scales the same frame.
 C: `NDPluginProcess.cpp:164-178,238-249` outputs raw that frame, applies new scaling from the next.
 Impact: the trigger frame's whole array diverges.
+— FIXED 570965ea: stage 0b consumes the one-shot, arming deferred to after the output array is built (skipped on suppressed frames, matching pArrayOut==NULL); test test_adp6_auto_offset_scale_arms_next_frame_not_trigger.
 
 #### ADP-7: Process valid background/flat-field never invalidated on element-count change
 Severity: High — fix
 Rust: `crates/ad-plugins-rs/src/process.rs:160,171,394,400,601-620` keeps valid_*=true permanently; applies over `min(n, bg.len())`.
 C: `NDPluginProcess.cpp:120-130` recomputes validBackground/validFlatField from `nElements==nBackgroundElements` each frame and NULLs the pointer on mismatch.
 Impact: after an input-size change, C posts VALID_*=0 and skips; Rust posts 1 and applies a partial-prefix op. Status params and array diverge.
+— FIXED afead50f: process() recomputes valid_background/valid_flat_field each frame from buffer.len()==n; bg/ff gated on enable&&valid; partial-prefix `i<len` guards removed (length now guaranteed); test test_adp7_size_mismatched_background_invalidated_not_partial. save_*=true at save time retained (matches C writeInt32 ValidBackground=1).
 
 #### ADP-8: TimeSeries per-point average kept as f64; C truncates to the integer element type before dividing
 Severity: High — fix
@@ -344,6 +351,7 @@ Severity: Medium — fix
 Rust: `crates/ad-plugins-rs/src/process.rs:369-373` uses the flat-field mean when scaleFlatField≤0.
 C: `NDPluginProcess.cpp:172` `value *= scaleFlatField/flatField[i]` unconditionally (≤0 → 0).
 Impact: SCALE_FLAT_FIELD≤0 — C all-zero, Rust mean-normalized.
+— FIXED bbd7fd5e: flat-field uses self.config.scale_flat_field directly; mean fallback removed; tests test_flat_field (rewritten to C-direct) + test_adp24_scale_flat_field_zero_zeroes_output.
 
 #### ADP-25: FFT FFTTimeSeries/FFTTimeAxis posted at unpadded width; C posts the padded length
 Severity: Medium — fix

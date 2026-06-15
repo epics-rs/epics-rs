@@ -225,4 +225,53 @@ mod tests {
             "StdArrays must serve STD_ARRAY_DATA with NDArrayCallbacks=0"
         );
     }
+
+    #[test]
+    fn test_std_arrays_throttled_frame_does_not_advance_array_counter() {
+        // C NDPluginStdArrays.cpp:202-211 decrements NDArrayCounter when its
+        // MaxByteRate throttle drops the waveform output, so a throttled frame
+        // leaves ArrayCounter unchanged (ImageJ etc. see no new data) while
+        // DroppedArrays advances.
+        use std::time::Duration;
+
+        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let wiring = Arc::new(WiringRegistry::new());
+        let (handle, _data, _jh) = create_std_arrays_runtime("IMAGE1", pool, "", wiring);
+        let port = handle.port_runtime().port_handle();
+        port.write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1)
+            .unwrap();
+        // MaxByteRate = 4 bytes/sec; make_array is a 4-byte UInt8 array. The
+        // bucket starts full at 4, so the first frame passes and the next
+        // (sent before a meaningful refill) is throttled.
+        port.write_float64_blocking(handle.plugin_params.max_byte_rate, 0, 4.0)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(handle.array_sender().publish(make_array(1)));
+        std::thread::sleep(Duration::from_millis(40));
+        let counter_after_first = port
+            .read_int32_blocking(handle.ndarray_params.array_counter, 0)
+            .unwrap();
+
+        rt.block_on(handle.array_sender().publish(make_array(2)));
+        std::thread::sleep(Duration::from_millis(40));
+        let counter_after_second = port
+            .read_int32_blocking(handle.ndarray_params.array_counter, 0)
+            .unwrap();
+        let dropped = port
+            .read_int32_blocking(handle.plugin_params.dropped_output_arrays, 0)
+            .unwrap();
+
+        assert_eq!(counter_after_first, 1, "first frame is served and counted");
+        assert_eq!(
+            counter_after_second, 1,
+            "throttled frame must NOT advance ArrayCounter"
+        );
+        assert_eq!(dropped, 1, "throttled frame advances DroppedArrays");
+    }
 }

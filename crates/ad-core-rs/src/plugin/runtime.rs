@@ -584,11 +584,18 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
         // regardless of NDArrayCallbacks and ARE subject to the MaxByteRate
         // throttle (NDPluginStdArrays.cpp:58 per-interface `throttled()`). So
         // route whenever we deliver downstream OR serve the StdArray waveforms.
+        let produced = result.output_arrays.len();
         let ready = if self.array_callbacks || self.std_array_data_param.is_some() {
             self.route_output_arrays(result.output_arrays)
         } else {
             Vec::new()
         };
+        // A StdArrays frame that produced a waveform which the MaxByteRate
+        // throttle then dropped (`produced > 0` but `ready` empty) must not
+        // advance ArrayCounter — C nets it back out
+        // (NDPluginStdArrays.cpp:202-211).
+        let count_frame =
+            !(self.std_array_data_param.is_some() && produced > 0 && ready.is_empty());
         let mut output = self.build_publish_batch(
             ready,
             result.param_updates,
@@ -596,6 +603,7 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
             Some(array.as_ref()),
             elapsed_ms,
             self.array_callbacks,
+            count_frame,
         );
         output.batch.merge(self.build_status_params_batch());
         Some(output)
@@ -639,7 +647,7 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
             // on (route_output_arrays runs past the delivery gate); the C++
             // sort thread delivers them regardless of the *current* flag, so
             // they always deliver here.
-            let output = self.build_publish_batch(arrays, vec![], None, None, 0.0, true);
+            let output = self.build_publish_batch(arrays, vec![], None, None, 0.0, true, true);
             all_arrays.extend(output.arrays);
             combined.merge(output.batch);
         }
@@ -708,6 +716,7 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
         fallback_array: Option<&NDArray>,
         elapsed_ms: f64,
         deliver: bool,
+        count_frame: bool,
     ) -> ProcessOutput {
         use asyn_rs::request::ParamSetValue;
 
@@ -716,19 +725,31 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
             std::collections::HashMap::new();
 
         if let Some(report_arr) = output_arrays.first().map(|a| a.as_ref()).or(fallback_array) {
-            self.array_counter += 1;
+            // A StdArrays frame whose waveform output the MaxByteRate throttle
+            // dropped (`count_frame == false`) must not bump ArrayCounter — C
+            // decrements it back so clients monitoring ArrayCounter see no new
+            // data (NDPluginStdArrays.cpp:202-211).
+            if count_frame {
+                self.array_counter += 1;
+            }
 
             // Fire the StdArray waveform interrupt directly (C EPICS pattern).
             // This is NDPluginStdArrays' typed-array callback
             // (NDPluginStdArrays.cpp:71-73 `arrayInterruptCallback`), NOT the
             // `doCallbacksGenericPointer` downstream path: C fires it whether or
             // not NDArrayCallbacks is set (StdArrays defaults NDArrayCallbacks=0),
-            // so it must NOT be gated by `deliver`. The MaxByteRate throttle was
-            // already applied to `report_arr` upstream in `route_output_arrays`.
-            if let Some(param) = self.std_array_data_param {
+            // so it must NOT be gated by `deliver`. It fires only with the
+            // routed/served output (`output_arrays.first()`), never the
+            // `fallback_array`: C skips the interface callback on throttle
+            // (NDPluginStdArrays.cpp:58), so a throttled frame leaves
+            // `output_arrays` empty and serves nothing.
+            if let (Some(param), Some(served)) = (
+                self.std_array_data_param,
+                output_arrays.first().map(|a| a.as_ref()),
+            ) {
                 use crate::ndarray::NDDataBuffer;
                 use asyn_rs::param::ParamValue;
-                let value = match &report_arr.data {
+                let value = match &served.data {
                     NDDataBuffer::I8(v) => {
                         Some(ParamValue::Int8Array(std::sync::Arc::from(v.as_slice())))
                     }
@@ -761,7 +782,7 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
                     }
                 };
                 if let Some(value) = value {
-                    let ts = report_arr.timestamp.to_system_time();
+                    let ts = served.timestamp.to_system_time();
                     self.port_handle
                         .interrupts()
                         .notify(asyn_rs::interrupt::InterruptValue {
@@ -2012,7 +2033,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                 let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
                                 let output = if !result.output_arrays.is_empty() || !result.param_updates.is_empty() {
                                     let deliver = guard.array_callbacks;
-                                    Some(guard.build_publish_batch(result.output_arrays, result.param_updates, None, None, elapsed_ms, deliver))
+                                    Some(guard.build_publish_batch(result.output_arrays, result.param_updates, None, None, elapsed_ms, deliver, true))
                                 } else {
                                     None
                                 };

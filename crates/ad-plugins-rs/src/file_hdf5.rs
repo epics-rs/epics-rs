@@ -258,7 +258,8 @@ impl Hdf5Writer {
             nbit_precision: 0,
             nbit_offset: 0,
             jpeg_quality: 90,
-            blosc_shuffle_type: 0,
+            // C default bloscShuffleType=1 (byte shuffle), NDFileHDF5.cpp:2344.
+            blosc_shuffle_type: 1,
             blosc_compressor: 0,
             blosc_compress_level: 5,
             chunk: ChunkConfig::default(),
@@ -2967,6 +2968,16 @@ mod tests {
         assert_eq!(data[9], 1);
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_blosc_default_shuffle_is_byte_shuffle() {
+        // C default bloscShuffleType=1 (byte shuffle), NDFileHDF5.cpp:2344;
+        // BLOSC cd_values[5] carries the shuffle type.
+        let mut writer = Hdf5Writer::new();
+        writer.set_compression_type(COMPRESS_BLOSC);
+        let pipeline = writer.build_pipeline(2).expect("blosc pipeline");
+        assert_eq!(pipeline.filters[0].cd_values[5], 1);
     }
 
     #[test]

@@ -380,6 +380,7 @@ pub async fn run(
         config.pv("OperAck"),
         config.motor_pv(&config.m_theta, ".RBV"),
         config.motor_pv(&config.m_theta2, ".RBV"),
+        config.motor_pv(&config.m_y, ".RBV"),
         config.motor_pv(&config.m_theta, ".HLM"),
         config.motor_pv(&config.m_theta, ".LLM"),
         config.pv("_yOffset"),
@@ -472,6 +473,7 @@ pub async fn run(
     let pv_oper_ack = config.pv("OperAck");
     let pv_theta_mot_rbv = config.motor_pv(&config.m_theta, ".RBV");
     let pv_theta2_mot_rbv = config.motor_pv(&config.m_theta2, ".RBV");
+    let pv_y_mot_rbv = config.motor_pv(&config.m_y, ".RBV");
     let pv_theta_hilim = config.motor_pv(&config.m_theta, ".HLM");
     let pv_theta_lolim = config.motor_pv(&config.m_theta, ".LLM");
     let pv_y_offset = config.pv("_yOffset");
@@ -693,6 +695,23 @@ pub async fn run(
             let _ = ch_lambda_lo.put_f64(ll).await;
         } else if changed_pv == pv_y_offset {
             y_offset_val = new_val;
+            auto_mode = false;
+            let _ = ch_auto_mode.put_i16(0).await;
+            let _ = ch_msg1
+                .put_string(&format!("y offset changed to {:.4}", y_offset_val))
+                .await;
+            let _ = ch_msg2.put_string("Set to Manual Mode").await;
+            proceed_to_theta_changed = true;
+        } else if changed_pv == pv_y_mot_rbv {
+            // C ml_monoCtl.st:1204-1207 (yMotRdbk_mon): a Y-motor readback change
+            // sets yOffset = yMotRdbk and pvPuts it; the resulting yOffset_mon
+            // (ml_monoCtl.st:689) drops to Manual mode and recomputes the Z
+            // setpoint (calcMovements zMotDesired = yOffset/tan(2θ),
+            // ml_monoCtl.st:885). A standalone Y move must retrack Z geometry,
+            // so mirror that here (a self put_f64 posts no monitor event, so the
+            // recompute is driven inline rather than via a yOffset re-trigger).
+            y_offset_val = new_val;
+            let _ = ch_y_offset.put_f64(y_offset_val).await;
             auto_mode = false;
             let _ = ch_auto_mode.put_i16(0).await;
             let _ = ch_msg1

@@ -263,6 +263,30 @@ pub fn extract_roi_3d(src: &NDArray, config: &ROIConfig) -> Option<NDArray> {
         NDDataBuffer::F64(v) => NDDataBuffer::F64(extract3d!(v, f64, 0.0)),
     };
 
+    // Single-color selection: when the color axis collapses to 1 and the
+    // source is an RGB mode, C forces collapseDims and tags the output Mono
+    // (NDPluginROI.cpp:177-200). The user collapseDims param otherwise still
+    // collapses any size-1 dimension (NDPluginROI.cpp:202-215). When out_c == 1
+    // the extracted buffer is already in [x, y] row-major order for every RGB
+    // layout, so dropping the size-1 axes needs no data reordering.
+    let single_color = out_c == 1
+        && matches!(
+            info.color_mode,
+            ad_core_rs::color::NDColorMode::RGB1
+                | ad_core_rs::color::NDColorMode::RGB2
+                | ad_core_rs::color::NDColorMode::RGB3
+        );
+    let dims = if single_color || config.collapse_dims {
+        let collapsed: Vec<NDDimension> = dims.into_iter().filter(|d| d.size > 1).collect();
+        if collapsed.is_empty() {
+            vec![NDDimension::new(1)]
+        } else {
+            collapsed
+        }
+    } else {
+        dims
+    };
+
     // Apply the requested output data type (C converts to ROIDataType, or the
     // input type when ROIDataType == -1, NDPluginROI.cpp:144,166-174). Mirrors
     // the 2-D path so a 3-D RGB ROI honours ROI_DATA_TYPE.
@@ -290,6 +314,17 @@ pub fn extract_roi_3d(src: &NDArray, config: &ROIConfig) -> Option<NDArray> {
     arr.timestamp = src.timestamp;
     arr.time_stamp = src.time_stamp;
     arr.attributes = src.attributes.clone();
+    // A single selected color plane is mono (C NDPluginROI.cpp:185/192/199
+    // overrides the ColorMode attribute on the collapsed output).
+    if single_color {
+        use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+        arr.attributes.add(NDAttribute::new_static(
+            "ColorMode",
+            "Color mode",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(ad_core_rs::color::NDColorMode::Mono as i32),
+        ));
+    }
     Some(arr)
 }
 
@@ -1239,6 +1274,60 @@ mod tests {
             assert_eq!(&v[0..3], &[0, 1, 2]);
         } else {
             panic!("not u16");
+        }
+    }
+
+    #[test]
+    fn test_adp19_single_color_collapses_to_2d_mono() {
+        use ad_core_rs::color::NDColorMode;
+        // Select a single color plane (channel 1) of an RGB1 image. C forces
+        // collapseDims and sets ColorMode=Mono (NDPluginROI.cpp:177-215), so
+        // the output is a 2-D mono [x,y] array, not a 3-D RGB1 with a size-1
+        // color axis.
+        let arr = make_rgb1_2x2();
+        let mut config = ROIConfig::default();
+        config.dims[0] = ROIDimConfig {
+            min: 0,
+            size: 2,
+            bin: 1,
+            reverse: false,
+            enable: true,
+            auto_size: false,
+        };
+        config.dims[1] = ROIDimConfig {
+            min: 0,
+            size: 2,
+            bin: 1,
+            reverse: false,
+            enable: true,
+            auto_size: false,
+        };
+        config.dims[2] = ROIDimConfig {
+            min: 1,
+            size: 1,
+            bin: 1,
+            reverse: false,
+            enable: true,
+            auto_size: false,
+        };
+
+        let roi = extract_roi(&arr, &config).unwrap();
+        // Collapsed to 2-D [x=2, y=2].
+        assert_eq!(roi.dims.len(), 2);
+        assert_eq!(roi.dims[0].size, 2);
+        assert_eq!(roi.dims[1].size, 2);
+        // ColorMode forced to Mono.
+        let cm = roi
+            .attributes
+            .get("ColorMode")
+            .and_then(|a| a.value.as_i64())
+            .unwrap();
+        assert_eq!(cm, NDColorMode::Mono as i64);
+        // Channel-1 value of pixel (x,y) = 100*y + 10*x + 1, in [x,y] order.
+        if let NDDataBuffer::U8(ref v) = roi.data {
+            assert_eq!(v, &[1, 11, 101, 111]);
+        } else {
+            panic!("not u8");
         }
     }
 }

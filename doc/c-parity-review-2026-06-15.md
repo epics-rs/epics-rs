@@ -783,3 +783,472 @@ extra IFD tags), SCAL-4, SCAL-5, OPT-3, MQTT-3, PROC-3,
 MODB-1/2/3 — surfaced for the user rather than silently changed. STD-7 and
 STD-8 were re-dispositioned signoff→fix (user: "Match C") and ADC-8 verify→fix
 (user: "fix-now"); all three are now Fixed (c079c35e, 515c1b5c).
+
+### Round 3 — 2026-06-15 (ad-plugins-rs full-plugin sweep, ADP-31..95)
+
+Second ad-plugins fan-out (4 parallel read-only agents) covering the plugin
+modules round 2 did not reach: routing/buffer (`NDPosPlugin` /
+`NDPluginCircularBuff` / `NDPluginScatter` / `NDPluginGather`), attribute/array
+(`NDPluginStdArrays` / `NDPluginAttribute` / `NDPluginAttrPlot` / passthrough),
+the `NDFileHDF5` writer, and the NeXus/Magick file writers + the PVA NTNDArray
+converter. 65 findings, ADP-31..95.
+
+Numbering note: Agent 1 (routing) and Agent 2 (attribute/array) both emitted an
+ADP-46. Agent 1's ADP-46 was a parity-clean "no divergence" scatter
+first-consumer-offset check — folded into ADP-45 (`NDPluginScatter`) below — so
+ADP-46 is Agent 2's StdArrays finding and the sequence stays contiguous:
+31-45 routing, 46-60 attr/array, 61-80 HDF5, 81-95 nexus/magick/pva.
+
+Cluster summary:
+
+- **Routing/buffer param surface (ADP-31..44).** `NDPosPlugin` is the worst —
+  it registers none of its 17 asyn params and posts the two values it does
+  compute to hardcoded port indices 0/1 (ADP-33), parses a position-XML format
+  with entirely different attribute names than C (ADP-31), never builds the
+  `CurrentPos` octet string (ADP-32), and forwards frames downstream while idle
+  where C drops them (ADP-35). `NDPluginCircularBuff` carries the same family:
+  `CIRC_BUFF_STATUS` is an asynOctet *string* in C but Int32 in Rust (ADP-40),
+  and the TriggerA/B/CalcVal float params are never posted (ADP-41).
+- **Attribute/array channel counts (ADP-46..60).** `NDPluginStdArrays` posts
+  only the array's *native* element type, not all six asyn array interfaces C
+  type-converts to (ADP-46); `NDPluginAttribute` hardcodes 8 channels and
+  ignores the `maxAttributes` configure arg (ADP-47), which also fixes the TS
+  waveform length (ADP-49). `NDPluginAttrPlot` is not wired into the IOC at all
+  (ADP-52) — its other findings are latent until it is.
+- **HDF5 NeXus default layout (ADP-61..80).** The largest single divergence:
+  with no user XML (the default mode) C writes the image at
+  `/entry/instrument/detector/data` inside a full NeXus group tree with
+  `NX_class` group attributes and hardlinks; Rust writes a single flat `/data`
+  dataset with none of it (ADP-61, ADP-62). Filter encodings diverge: N-bit
+  is implemented as cd_values instead of datatype precision/offset + paramless
+  `H5Pset_nbit` (ADP-67), SZIP uses the EC mask where C uses NN (ADP-66),
+  string-attribute datasets are `[n,256]` u8 vs C's `[n]` fixed-length string
+  (ADP-77).
+- **PVA / NeXus / Magick output form (ADP-81..95).** Almost entirely
+  parity-clean or deliberate-improvement signoff. The PVA NTNDArray wire
+  structure is byte-faithful on every field except `dimension[].binning`, which
+  clamps 0→1 where C serializes the raw value (ADP-86, the only wire divergence
+  in this group). NeXus/Magick diverge from C only by *adding* correct output
+  or *correcting* C bugs (RGB2/RGB3 uninitialized-pixel bug ADP-95), never by
+  omitting/corrupting a C-written object.
+
+Disposition tally (pre-fix): **22 fix, 9 fix-low, 9 verify, 25 signoff**.
+
+- **fix (High/Medium):** ADP-31, 32, 33, 35, 36, 37, 38, 40, 41 (routing);
+  46, 47, 48, 49 (attr); 61, 62, 63, 64, 66, 67, 71, 77, 79 (HDF5).
+- **fix-low:** ADP-34, 43, 44 (routing); 50, 51 (attr); 65, 69, 72 (HDF5);
+  86 (PVA).
+- **verify:** ADP-42, 45 (routing); 52, 57, 59, 60 (attr); 68, 74, 80 (HDF5).
+- **signoff:** ADP-39 (routing); 53, 54, 55, 56, 58 (attr); 70, 73, 75, 76, 78
+  (HDF5); 81-85, 87-95 (PVA/NeXus/Magick).
+
+Highest-impact fixes: ADP-33 (no param registration), ADP-31 (XML attr names),
+ADP-40 (STATUS DBR type Octet vs Int32), ADP-41 (trigger value params never
+posted), ADP-35 (idle frames forwarded), ADP-46 (single native-type post),
+ADP-47 (maxAttributes ignored), ADP-61/62 (no default NeXus layout/NX_class),
+ADP-67 (N-bit filter wrong).
+
+## Round 3 Open Findings (ADP-31 – ADP-95)
+
+### routing / buffer plugins — NDPosPlugin / NDPluginCircularBuff / NDPluginScatter / NDPluginGather (ADP-31..45)
+
+#### ADP-31: NDPosPlugin XML position format is completely different (attribute names diverge)
+Severity: High — fix
+Rust: `pos_plugin.rs:180-262` `parse_positions_xml` reads `<position index="N">value</position>`, emits a single map key literally named `"position"`.
+C: `NDPosPluginFileReader.cpp:144-213` reads `<dimensions><dimension name="X"/>…</dimensions>` then `<position X="1" Y="2"/>`, where each map key is a **dimension name** and the value comes from a `<position>` **attribute** of that name.
+Impact: Downstream NDArray attributes have entirely different names/structure. A real `pos_layout` XML (`<dimension name="x"/>` + `<position x="..."/>`) attaches attributes named `x`, `y`, … in C, but the Rust parser finds zero matches in that format and attaches nothing.
+
+#### ADP-32: NDPos_CurrentPos octet param never produced
+Severity: High — fix
+Rust: `pos_plugin.rs:306-322` attaches attributes but posts only `ParamUpdate::int32(0,…)`/`int32(1,…)`; no CurrentPos string is built or posted.
+C: `NDPosPlugin.cpp:149-166` builds `sspos = "[" + key "=" value ("," …) + "]"` and `setStringParam(NDPos_CurrentPos, …)`.
+Impact: A client reading `NDPos_CurrentPos` (asynParamOctet) gets `"[x=1,y=2]"` in C; in Rust the param does not exist and is never updated.
+
+#### ADP-33: NDPosPlugin registers none of its 17 params; processor emits hardcoded indices 0/1
+Severity: High — fix
+Rust: `pos_plugin.rs` has no `register_params`; `process_array` posts `ParamUpdate::int32(0, missing)` and `int32(1, duplicate)` to fixed indices 0/1.
+C: `NDPosPlugin.cpp:383-399` `createParam` for 17 params with explicit asyn types (Octet: Filename, CurrentPos, IDName; Int32: FileValid, Clear, Running, Restart, Delete, Mode, Append, CurrentQty, CurrentIndex, MissingFrames, DuplicateFrames, ExpectedID, IDDifference, IDStart).
+Impact: Clients cannot read CurrentQty/CurrentIndex/Running/ExpectedID/FileValid, and the two values that *are* posted land on whatever params live at indices 0/1 — not MissingFrames/DuplicateFrames — so even those go to the wrong DBR-typed params.
+
+#### ADP-34: NDPosPlugin attribute description string differs ("" vs "Position of NDArray")
+Severity: Low — fix-low
+Rust: `pos_plugin.rs:308-313` `NDAttribute::new_static(key, String::new(), …)` — empty description.
+C: `NDPosPlugin.cpp:161` `new NDAttribute(name, "Position of NDArray", NDAttrSourceDriver, driverName, NDAttrFloat64, &value)`.
+Impact: The NDAttribute `description` (observable when attributes serialize to HDF5/PVA) is empty in Rust where C carries `"Position of NDArray"`; the `source` (driverName) string also differs (Rust passes empty).
+
+#### ADP-35: NDPosPlugin forwards arrays downstream while idle; C drops them
+Severity: High — fix
+Rust: `pos_plugin.rs:266-268` when `!running`, returns `ProcessResult::arrays(vec![clone])` — forwards the input unchanged.
+C: `NDPosPlugin.cpp:54,202-205` `endProcessCallbacks` is reached only inside `if (running == NDPOS_RUNNING)` and only `if (skip == 0 && running == NDPOS_RUNNING)`; when idle, no downstream callback.
+Impact: Stopped (NDPOS_IDLE), C produces no downstream callbacks; Rust passes every frame through. Downstream plugins observe frames in Rust that C withholds.
+
+#### ADP-36: NDPosPlugin expected-ID stepping ignores IDDifference and re-syncs to actual uniqueId
+Severity: Medium — fix
+Rust: `pos_plugin.rs:317` `self.expected_id = array.unique_id + 1` (re-anchors to received ID, step hardcoded +1).
+C: `NDPosPlugin.cpp:192-194` `expectedID += IDDifference` (steps by configurable `NDPos_IDDifference`, default 1, never re-anchoring).
+Impact: With `IDDifference != 1`, or any sequence where uniqueId does not advance by exactly the step, the missing/duplicate classification and MissingFrames/DuplicateFrames values diverge. Even at step 1, Rust's re-anchor masks cumulative drift C keeps reporting.
+
+#### ADP-37: NDPosPlugin first-frame ID check is suppressed (expected_id starts at 0)
+Severity: Medium — fix
+Rust: `pos_plugin.rs:104,280` `start()` sets `expected_id = 0`; gate `if self.expected_id > 0` skips ID checking on the first running frame; expected is armed only after the first via `unique_id + 1`.
+C: `NDPosPlugin.cpp:234,421-422` writeInt32(Running) sets `ExpectedID = IDStart` (default 1), so the first frame is compared against ExpectedID=1 immediately and can already be drop/duplicate.
+Impact: A first frame whose uniqueId ≠ 1 is counted missing/duplicate in C but accepted silently in Rust, so the counters and which frame gets a position attached differ on the first frame after start.
+
+#### ADP-38: NDPosPlugin position-exhaustion does not stop/abort the documented way
+Severity: Medium — fix
+Rust: `pos_plugin.rs:285-298` on a gap, advances `diff` times and, if positions run out, forwards the array **with no position attached** and returns.
+C: `NDPosPlugin.cpp:98-124,140` on a gap in Discard mode erases from the front; if size hits 0 it sets `NDPos_Running = IDLE` (stops) and does **not** call endProcessCallbacks (no downstream emit). Keep mode advances index and stops at `index == size`.
+Impact: Positions exhausted mid-gap: C stops the plugin and drops the frame; Rust forwards the bare frame and keeps running. Downstream gets an extra unattributed frame in Rust and Running stays on.
+
+#### ADP-39: NDPosPlugin position values are Float64 in both (header comment says integer)
+Severity: Low — signoff
+Rust: `pos_plugin.rs:312` `NDAttrValue::Float64(*value)`.
+C: `NDPosPlugin.cpp:161` `NDAttrFloat64` with a `double`.
+Impact: None — both emit NDAttrFloat64, so the attribute type matches. The header comment (`NDPosPlugin.h:9`) says "1D integer valued attribute" but the C code attaches Float64; Rust matches the code. Listed for completeness.
+
+#### ADP-40: NDPluginCircularBuff CIRC_BUFF_STATUS is an Octet string in C, Int32 in Rust
+Severity: Medium — fix
+Rust: `circular_buff.rs:394-401` maps status enum to int32 `0..3`; `CIRC_BUFF_STATUS` registered as `ParamType::Int32`; no "Dropping frames"/"Buffer Wrapping" string states.
+C: `NDPluginCircularBuff.h:12` `CIRC_BUFF_STATUS` is **asynOctet**, set to `"Idle"`, `"Buffer filling"`, `"Buffer Wrapping"`, `"Dropping frames"`, `"Flushing"`, `"Acquisition Completed"`, `"Acquisition Stopped"`, `"Stop acquisition to set pre-count"`, `"Pre-count too high"`, `"Invalid pre-count value"` (`NDPluginCircularBuff.cpp:153-260`).
+Impact: The DBR type of `CIRC_BUFF_STATUS` differs (Octet vs Int32) and the status text a client reads is entirely different — a wire/param-type divergence, not just internal representation.
+
+#### ADP-41: NDPluginCircularBuff TriggerAVal/TriggerBVal/TriggerCalcVal float params never posted
+Severity: High — fix
+Rust: `circular_buff.rs:393-414` posts only status, current_image, triggered, actual_trigger_count; the Calc branch (`circular_buff.rs:199-224`) computes `a`, `b`, `expression.evaluate_vars` but never writes `trigger_a_val`, `trigger_b_val`, `trigger_calc_val`.
+C: `NDPluginCircularBuff.cpp:67-78` `setDoubleParam(NDCircBuffTriggerAVal, args[0])`, `…TriggerBVal, args[1])`, `…TriggerCalcVal, calcResult)` on every frame's trigger calc.
+Impact: Clients reading `CIRC_BUFF_TRIGGER_A_VAL`/`_B_VAL`/`_CALC_VAL` (asynFloat64) see live values in C; in Rust these registered Float64 params always remain at default 0.0.
+
+#### ADP-42: NDPluginCircularBuff Calc trigger fires on NaN/Inf where C guards against it
+Severity: Medium — verify
+Rust: `circular_buff.rs:204-223` missing attribute → `f64::NAN` for A/B; trigger fires when `evaluate_vars(…) != 0.0`.
+C: `NDPluginCircularBuff.cpp:43-77` args default to `epicsNAN`; trigger fires only when `!isnan(calcResult) && !isinf(calcResult) && (calcResult != 0)`.
+Impact: When the calc result is NaN/Inf (e.g. expression `A` with A absent), C does **not** trigger; Rust's `!= 0.0` is true for NaN, so Rust fires a spurious trigger (pre-buffer flush + post frames) where C does not.
+
+#### ADP-43: NDPluginCircularBuff currentImage not reset to 0 on stop
+Severity: Low — fix-low
+Rust: `circular_buff.rs:489-491` on Control==0 sets `status = Idle` but does not zero the reported current-image count until the next reset.
+C: `NDPluginCircularBuff.cpp:259` writeInt32(Control off) `setIntegerParam(NDCircBuffCurrentImage, 0)`.
+Impact: After stopping, a client reading `CIRC_BUFF_CURRENT_IMAGE` reads 0 in C; in Rust the stop path leaves the last value posted until the next frame.
+
+#### ADP-44: NDPluginCircularBuff pre-count validation status outputs not produced
+Severity: Low — fix-low
+Rust: `circular_buff.rs:492-493` on pre_trigger change just clamps to `>=0` and stores; no rejection, no status feedback, no `maxBuffers-1` ceiling.
+C: `NDPluginCircularBuff.cpp:280-292` rejects pre-count when running ("Stop acquisition to set pre-count"), when `> maxBuffers_-1` ("Pre-count too high"), when `<0` ("Invalid pre-count value"), and only then commits.
+Impact: Setting an out-of-range/in-flight pre-count: C refuses the update and posts an explanatory `CIRC_BUFF_STATUS` string; Rust silently accepts the clamped value. The observable PRE_TRIGGER readback and STATUS differ.
+
+#### ADP-45: NDPluginScatter overflow-reroute / nextClient wrap semantics not reproduced
+Severity: Medium — verify
+Rust: `scatter.rs:60-68` emits `current_index % num_outputs` (raw index when `num_outputs==0`), advancing by 1 each frame; the runtime maps it onto consumers. No replication of C's "skip a full-queue consumer, advance to next, drop only on the last node" logic.
+C: `NDPluginScatter.cpp:59-90` walks the interrupt client list from `nextClient_`, sets `auxStatus = asynOverflow` for all but the last node so a full queue **advances to the next client** rather than dropping; only the final node drops; `nextClient_` persists/wraps (`if (nextClient_ > numNodes) nextClient_ = 1`).
+Impact: Under backpressure C reroutes the frame to the next available consumer and keeps `nextClient_` advancing; Rust delivers strictly to `index % N` regardless of queue state, so per-consumer distribution and drop-vs-reroute differ. With all queues free the round-robin order matches. Verify because the routing is partly in the runtime, not audited here.
+First-consumer offset (folded from Agent-1's ADP-46): parity-clean — C `nextClient_(1)` with 1-based `ellNth(1)` = first node, Rust `current_index` starts at 0 = first consumer; both send the first frame to the first registered consumer. Registration order is an IOC-wiring concern outside these files.
+Module note — `gather.rs`: output-form parity-clean on the pass-through path (C `NDPluginGather.cpp:80-91` forwards each array; Rust `gather.rs:96-99` matches). The Rust-invented `GATHER_NDARRAY_PORT_N/ADDR_N/NUM_PORTS` params do not exist in C (C uses the base-class `NDPluginDriverArrayPort/Addr` multi-address params); an added param surface, not a C-output divergence — flagged for orchestrator, unnumbered.
+
+### attribute / array plugins — NDPluginStdArrays / NDPluginAttribute / NDPluginAttrPlot / passthrough (ADP-46..60)
+
+#### ADP-46: NDPluginStdArrays posts only the array's native element type, not all six asyn array types
+Severity: High — fix
+Rust: `plugin/runtime.rs:708-756` (`build_publish_batch`) fires a single `notify` whose `ParamValue` array variant is the NDArray's native `NDDataBuffer` type (F64→Float64Array, I32→Int32Array, …).
+C: `NDPluginStdArrays.cpp:169-197` calls `arrayInterruptCallback` for **all six** interfaces (int8/16/32/64, float32/64), each running `pNDArrayPool->convert(pArray, &pOutput, signedType)` and pushing the type-converted copy to every subscribed client.
+Impact: A waveform/aai record bound to STD_ARRAY_DATA whose FTVL differs from the array's native type (e.g. FTVL=SHORT fed by an F64 array) gets no correctly-converted update on the I/O Intr frame path. Confirmed: the interrupt consumer (`asyn-rs/adapter.rs:1249-1284`) takes the native-typed array verbatim and never routes through the typed `read_int16_array`/`read_int32_array` converters (those run only on the polled path, `runtime.rs:1393-1442`).
+
+#### ADP-47: NDAttrConfigure ignores `maxAttributes` arg; channel count hardcoded to 8
+Severity: High — fix
+Rust: `attribute.rs:20` `MAX_ATTR_CHANNELS = 8`; `attribute.rs:228-236` always builds the runtime with 8; `ioc.rs:409`/`helpers.rs:65-79` `extract_plugin_args` never reads arg index 5 (`maxAttributes`).
+C: `NDPluginAttribute.cpp:169-184` takes `maxAttributes`, sets `maxAttributes_` (floored ≥1), uses it as asyn address count `std::max<int>(maxAttributes,2)`; `processCallbacks` loops `i<maxAttributes_` (line 55).
+Impact: The number of attribute channels (and ATTR_VAL/ATTR_VAL_SUM/ATTR_ATTRNAME records serviced, per-channel `callParamCallbacks(i)` posts) is fixed at 8 regardless of the `NDAttrConfigure` arg. A db configured for 16 loses channels 8-15; one for 2 still allocates 8. Also drives the TS length (ADP-49).
+
+#### ADP-48: ATTR_RESET only clears on non-zero writes; C clears on every write
+Severity: Medium — fix
+Rust: `attribute.rs:178-189` guards `if params.value.as_i32() != 0` before zeroing Val/ValSum.
+C: `NDPluginAttribute.cpp:123-128` zeros `NDPluginAttributeVal`/`ValSum` for all channels on **any** write to `NDPluginAttributeReset` (no value test), then `callParamCallbacks()`.
+Impact: `caput ATTR_RESET 0` in C zeros all Val/ValSum and posts monitors; in Rust it is a no-op. Downstream monitors observe a clear event in C that never fires in Rust for a zero write.
+
+#### ADP-49: Attribute time-series array length is fixed at 8, not `maxAttributes_`
+Severity: Medium — fix
+Rust: `attribute.rs:146` collects exactly 8 channel values; `attr_ts_channel_names()` (197-208) defines 8 TS channels.
+C: `NDPluginAttribute.cpp:93-110` `doTimeSeriesCallbacks` allocates an NDArray of `dims=maxAttributes_` NDFloat64 and posts via `doCallbacksGenericPointer`.
+Impact: The per-frame time-series waveform has `maxAttributes_` elements in C vs always 8 in Rust. For any `maxAttributes != 8` the element count differs. (Consequence of ADP-47.)
+
+#### ADP-50: Attribute plugin re-posts stale Val/ValSum for a missing attribute; C skips the post
+Severity: Low — fix-low
+Rust: `attribute.rs:131-142` — when `extract_value` returns `None` it keeps the previous `ch.value` but still pushes `ParamUpdate::float64_addr` for Val and ValSum (re-posting the old value).
+C: `NDPluginAttribute.cpp:72-80` — on a read error/missing attribute it `continue`s, skipping setDoubleParam(Val), the ValSum accumulation, and `callParamCallbacks(i)` for that channel.
+Impact: On a frame missing the tracked attribute, C emits no monitor update for that channel; Rust emits a redundant post of the unchanged value (extra monitor traffic / spurious timestamps).
+
+#### ADP-51: AttrPlot rejects DataSelect=0 when no attributes are tracked; C allows it
+Severity: Low — fix-low
+Rust: `attr_plot.rs:143-145` `set_data_select` rejects `value >= 0 && (value as usize) >= attributes.len()` — so `value==0` with empty list is rejected.
+C: `NDPluginAttrPlot.cpp:283-285` rejects only `value > 0 && (unsigned)value >= attributes_.size()` — `value==0` always accepted.
+Impact: `caput AP_DataSelect 0` before any frame (empty attribute list) succeeds in C but errors in Rust; divergent write status and stored DataSelect.
+
+#### ADP-52: AttrPlot is not wired into the IOC; no NDAttrPlotConfig command exists
+Severity: Medium — verify
+Rust: `AttrPlotProcessor` is referenced only inside `attr_plot.rs` (its own tests); no `NDAttrPlotConfig` startup command in `ioc.rs`, no runtime factory. `rg` across `crates/` finds zero production instantiations.
+C: `NDPluginAttrPlot.cpp:308-318` registers `NDAttrPlotConfig` iocsh command and constructs the plugin.
+Impact: A db invoking `NDAttrPlotConfig` fails to create the plugin in the Rust IOC; no AP_Data/AP_DataLabel/AP_Attribute/AP_NPts records are ever served. ADP-51/53/54/55 are latent until this is wired.
+
+#### ADP-53: AttrPlot exposes AP_Data on every frame; C exposes it only every 1 s from a background task
+Severity: Low — signoff
+Rust: `attr_plot.rs:325-338` `process_array` calls `build_updates()` emitting per-block AP_Data on **every** frame.
+C: `NDPluginAttrPlot.cpp:96-124` `callback_data` is invoked not from `processCallbacks` but from `ExposeDataTask::run` every `ND_ATTRPLOT_DATA_EXPOSURE_PERIOD = 1.0` s (plus once per DataSelect write); `processCallbacks` only updates AP_NPts.
+Impact: AP_Data monitor cadence differs: per-frame (Rust) vs 1 Hz (C). Steady-state values match. Latent (see ADP-52).
+
+#### ADP-54: AttrPlot unlimited-cache (cache_size=0) emits live-count-length AP_Data; C always emits cache_size
+Severity: Low — signoff
+Rust: `attr_plot.rs:258-276` `block_waveform` targets `cache_size` when fixed but the live `size` when `cache_size==0`.
+C: `NDPluginAttrPlot.cpp:96-121` always `doCallbacksFloat64Array(tmp_arr, cache_size, …)`; C has no unlimited mode (`cache_size==0` → `max_length_==0`, modulo-by-zero, invalid config).
+Impact: With a fixed cache both emit `cache_size`-length tail-padded arrays (match). The Rust unlimited mode is a Rust-only extension with no valid C counterpart — no C-observable divergence.
+
+#### ADP-55: AttrPlot tracks at most `n_attributes`; C off-by-one tracks up to `n_attributes_+1`
+Severity: Low — signoff
+Rust: `attr_plot.rs:205` `names.truncate(self.n_attributes)` — caps at exactly `n_attributes`.
+C: `NDPluginAttrPlot.cpp:162-164` loop `attributes_.size() <= n_attributes_` admits one extra name, but `data_` holds only `n_attributes_` buffers, so `push_data` indexes `data_[n_attributes_]` out of bounds.
+Impact: For an array with more than `n_attributes_` numeric attributes, C tracks one more (or crashes on the OOB write); the Rust cap is a safety improvement. The only "observable" C difference is the extra `AP_Attribute[n_attributes]` name before the crash — signoff (C path is a latent bug).
+
+#### ADP-56: float→int out-of-range conversion: Rust saturates, C wraps (UB)
+Severity: Low — signoff
+Rust: `plugin/runtime.rs:1291-1310` `cast_from_f64` uses Rust `as` (f64→iN saturates; NaN→0).
+C: `NDArrayPool.cpp:378-387` `convertType` uses `(dataTypeOut)(*pDataIn++)` — plain C cast; out-of-range float→int is undefined.
+Impact: In-range values truncate identically. They diverge only for out-of-range float→int when a float NDArray is read as an integer waveform; C's result is undefined/platform-dependent, so not a well-defined parity target — signoff. (int→int already uses C-cast truncation via `copy_ccast`, `runtime.rs:1218-1228`.)
+
+#### ADP-57: StdArrays does not special-case codec/compressed arrays on read
+Severity: Low — verify
+Rust: `plugin/runtime.rs:1324-1346` `impl_read_array!` always reads `array.data` (typed buffer) with no codec branch; `std_arrays.rs:34-38` stores `array.clone()` unconditionally.
+C: `NDPluginStdArrays.cpp:43-57,98-120` branches on `pArray->codec.empty()` — for a compressed array copies the raw compressed bytes (`compressedSize`) instead of converting, `numElements = compressedSize/bytesPerElement + 1`.
+Impact: If a compressed NDArray reaches StdArrays, C emits the raw compressed byte stream; Rust emits the decompressed/typed buffer. Reachability depends on whether the Rust input can carry an undecoded codec — verify the upstream wiring.
+
+#### ADP-58: passthrough.rs has no direct C plugin counterpart
+Severity: Low — signoff
+Rust: `passthrough.rs:11-43` `PassthroughProcessor` is a stub returning `ProcessResult::empty()` for not-yet-implemented plugin types; adds a `PV_NAME` Octet param only when `plugin_type == "NDPvaConfigure"`.
+C: no single upstream "passthrough" plugin (`NDFileNull`/`NDFileDummy` are file-writer stubs; base `NDPluginDriver` passthrough is the framework).
+Impact: No C plugin to diverge from; a deliberate placeholder, no wire-parity claim applies.
+
+#### ADP-59: StdArrays/Attribute NDArrayCallbacks initial value — Rust defaults on, C off
+Severity: Low — verify
+Rust: `plugin/runtime.rs:1104` sets `ndarray_params.array_callbacks = 1` for every plugin port; no StdArrays-specific override to 0.
+C: `NDPluginStdArrays.cpp:343` and `NDPluginAttribute.cpp:203` both `setIntegerParam(NDArrayCallbacks, 0)` in the constructor.
+Impact: The initial `ArrayCallbacks` param a client reads for StdArrays/Attribute ports is 1 in Rust but 0 in C. Primarily an initial-param-value divergence; verify whether any downstream behavior keys off ArrayCallbacks==0 for these two plugins.
+
+#### ADP-60: StdArrays throttle does not decrement ArrayCounter; Rust has no throttle-rollback
+Severity: Low — verify
+Rust: `plugin/runtime.rs:701-702` increments `array_counter` per processed array; the generic dropped-output throttle path is not shown to roll the counter back for StdArrays' per-interface throttle.
+C: `NDPluginStdArrays.cpp:59-67` per-interface `throttled()` increments `NDPluginDriverDroppedOutputArrays`; `:206-211` decrements `NDArrayCounter` once if any interface throttled, so clients monitoring ArrayCounter see no bump for a throttled frame.
+Impact: On a byte-rate-throttled frame, C presents ArrayCounter unchanged + DroppedOutputArrays incremented; the Rust counter/dropped accounting for this case needs verification against the decrement-on-throttle behavior.
+
+### NDFileHDF5 writer (ADP-61..80)
+
+#### ADP-61: Default layout is flat `/data`, not the C NeXus `/entry/instrument/detector/data` tree
+Severity: High — fix
+Rust: `file_hdf5.rs:284,1010-1014` `resolved_dataset_path = "data"` when no layout XML is loaded; `resolve_layout_paths` falls back to flat root.
+C: `NDFileHDF5LayoutXML.cpp:43-70` `DEFAULT_LAYOUT`; `NDFileHDF5.cpp:3899-3906` loads it when the layout filename param is empty.
+Impact: With NO user XML (the default mode), C writes the image at `/entry/instrument/detector/data` inside a full NeXus tree (NXentry/NXinstrument/NXdetector/NXcollection/NXdata) plus a `/entry/data/data` hardlink, an `NDAttributes` NXcollection, and a `performance` group. Rust writes a single flat dataset `data` at the root with none of the NeXus groups, NX_class attrs, or hardlink. The single largest divergence in the writer.
+
+#### ADP-62: No NX_class / NeXus group attributes emitted for the default layout
+Severity: High — fix
+Rust: no built-in default layout; `build_layout_groups` runs only when `self.layout` is `Some`, and even then materialises only group nodes, never `NX_class` constant attributes (only dataset-level constant attrs, `file_hdf5.rs:1317-1347`); `for_each_dataset` (`file_hdf5.rs:1204`) visits datasets only, so a `<group><attribute>` constant is dropped.
+C: `NDFileHDF5LayoutXML.cpp:45,47,49,54,60,67` (NXentry/NXinstrument/NXdetector/NXcollection/NXdata); written via `NDFileHDF5.cpp:693-695` `writeHdfAttributes(new_group, root)` when `storeAttributes==1`.
+Impact: C attaches `NX_class` string attributes to the entry/instrument/detector/NDAttributes/data groups; Rust never writes any group-level constant attribute. NeXus readers will not recognise the file as NeXus.
+
+#### ADP-63: Default ColorMode NDAttribute dataset and per-dataset ndattribute placement missing
+Severity: Medium — fix
+Rust: NDAttribute datasets come from the live `array.attributes` list (`file_hdf5.rs:1457-1467`) and always land in the flat `NDAttributes` group or the layout `ndattr_default` group; the layout's `<dataset source="ndattribute">` nodes are never honoured for placement.
+C: `NDFileHDF5LayoutXML.cpp:55` default `<dataset name="ColorMode" source="ndattribute" ndattribute="ColorMode">`; `NDFileHDF5.cpp:2792-2800` routes a matching NDAttribute into the XML-declared dataset/group via `find_dset_ndattr`/`setDsetName`.
+Impact: C writes `ColorMode` at `/entry/instrument/detector/NDAttributes/ColorMode` (the XML-pinned path) and any user `<dataset source="ndattribute">` at its declared path/name; Rust ignores this placement and writes every attribute under the single ndattr group keyed by raw name. Different on-disk dataset paths.
+
+#### ADP-64: NDAttribute datasets omit the four NDAttr* self-describing HDF5 attributes
+Severity: Medium — fix
+Rust: `flush_attribute_datasets` (`file_hdf5.rs:1471-1551`) creates each attribute dataset with no attached HDF5 attributes.
+C: `NDFileHDF5.cpp:2715` `attrNames[] = {"NDAttrName","NDAttrDescription","NDAttrSourceType","NDAttrSource"}`; values at 2785-2788; written (each only when non-empty) via `writeStringAttribute` (3019-3040) as scalar NULLTERM C strings.
+Impact: C attaches up to four string HDF5 attributes to every NDAttribute dataset; Rust writes none, so a reader sees no source/description metadata.
+
+#### ADP-65: Attribute dataset chunk default differs (C: numCapture/16K; Rust: 16)
+Severity: Low — fix-low
+Rust: `ChunkConfig::ndattr_chunk` default `16` (`file_hdf5.rs:66`); chunk = `min(ndattr_chunk, n).max(1)` (`file_hdf5.rs:1497`).
+C: `calculateAttributeChunking` (`NDFileHDF5.cpp:2869-2920`): param default `0` (`2324`) → uses `NDFileNumCapture`; if capture ≤ 0 → `16*1024`.
+Impact: When `HDF5_NDAttributeChunk` is default (0), C chunks at numCapture (or 16384), Rust at 16 (clamped to frame count). Different chunk dimension in the DCPL (`H5Pget_chunk`); data values identical.
+
+#### ADP-66: SZIP filter uses entropy-coding mask (4); C uses nearest-neighbor mask (32)
+Severity: Medium — fix
+Rust: `build_pipeline` SZIP arm `cd_values: vec![4, self.szip_num_pixels]` (`file_hdf5.rs:457`).
+C: `NDFileHDF5.cpp:3372` `H5Pset_szip(this->cparms, H5_SZIP_NN_OPTION_MASK, szipNumPixels)`.
+Impact: `H5_SZIP_EC_OPTION_MASK==4` (entropy) vs `H5_SZIP_NN_OPTION_MASK==32` (nearest-neighbor). Rust selects the wrong SZIP coding mode, so the compressed bytes and stored cd_values differ. (C also relies on the library to OR in CHIP/ALLOW_K13 bits and append block/pixel-count cd_values the hand-built Rust pipeline does not replicate.) Decodable but not byte-parity and a different compression result.
+
+#### ADP-67: N-bit filter implemented as cd_values; C sets datatype precision/offset + paramless H5Pset_nbit
+Severity: High — fix
+Rust: `build_pipeline` NBIT arm adds `Filter { id: FILTER_NBIT, cd_values: vec![precision, offset] }` (`file_hdf5.rs:497-509`); dataset datatype left full-width.
+C: `NDFileHDF5.cpp:3355-3357` `H5Tset_precision(datatype, nbitPrecision); H5Tset_offset(datatype, nbitOffset); H5Pset_nbit(cparms);` — the N-bit filter takes no client cd_values; bit packing is driven by the dataset datatype's precision/offset.
+Impact: In C the on-disk datatype carries reduced precision/offset and nbit packs to it (observably narrower datatype). In Rust the datatype stays full-width and an nbit filter is written with a `[precision, offset]` cd_values pair the standard nbit filter does not interpret — datatype, filter message, and packed bytes all differ. C nbit precision default is `8` (`NDFileHDF5.cpp:2340`); Rust defaults precision `0` and drops the filter entirely when precision==0, so a default-config nbit request produces no compression at all in Rust.
+
+#### ADP-68: BLOSC cd_values layout differs from C's reserved-slot convention
+Severity: Medium — verify
+Rust: `build_pipeline` BLOSC arm writes 7 cd_values `[2, 2, element_size, 0, level, shuffle, compressor]` (`file_hdf5.rs:485-493`).
+C: `NDFileHDF5.cpp:3387-3391` declares `cds[7]`, fills only `cds[4]=level, cds[5]=shuffle, cds[6]=compressor`, leaves slots 0-3 uninitialised (comment: "0 to 3 inclusive reserved"), calls `H5Pset_filter(FILTER_BLOSC, MANDATORY, 7, cds)`.
+Impact: C leaves cds[0..3] for the blosc plugin to fill at runtime (format version, blosc version, typesize, blocksize); Rust hardcodes `[2,2,element_size,0]`. The stored filter message's first four cd_values differ between a C file (plugin-populated) and the Rust file. Whether the Rust file still decompresses depends on the reader's blosc plugin tolerating the authored typesize/blocksize. Verify because the exact C-side plugin-written values are runtime-dependent.
+
+#### ADP-69: BLOSC default compressor/level/shuffle defaults differ
+Severity: Low — fix-low
+Rust: defaults `blosc_shuffle_type=0`, `blosc_compressor=0`, `blosc_compress_level=5` (`file_hdf5.rs:261-263`).
+C: `NDFileHDF5.cpp:2344-2346` `bloscShuffleType=1`, `bloscCompressor=0`, `bloscCompressLevel=5`.
+Impact: C's default BLOSC shuffle is `1` (byte shuffle); Rust's is `0` (none). A default-config BLOSC write produces a different `cds[5]` and a different compressed byte stream. Level (5) and compressor (0) match.
+
+#### ADP-70: On-disk numeric datatype byte order is hardcoded LE; C uses native-endian
+Severity: Low — signoff
+Rust: rust-hdf5 emits every fixed/floating datatype message with `ByteOrder::LittleEndian` hardcoded (`rust-hdf5-0.2.17/src/format/messages/datatype.rs:133-228`); the writer also LE-serialises data (`nd_buffer_to_le_bytes`, `file_hdf5.rs:1666-1679`).
+C: `typeNd2Hdf` (`NDFileHDF5.cpp:3484-3524`) and `typeAsHdf` (`NDFileHDF5AttributeDataset.cpp:327-363`) use `H5T_NATIVE_*` — records the writing machine's byte order.
+Impact: On a little-endian host (the common case) identical. They diverge only on a big-endian host: C records BE, Rust still records LE (byte-swapping data to match). On-disk identical on LE hardware; signoff since BE EPICS IOCs are vanishingly rare and the Rust behaviour is arguably more portable.
+
+#### ADP-71: Detector dataset omits C's NDArrayNumDims/DimOffset/DimBinning/DimReverse + signal attributes
+Severity: Medium — fix
+Rust: `create_primary_dataset` attaches only `NDArrayDataType`, `HDF5_fillValue`, `HDF5_nRowChunks/nColChunks/nFramesChunks/nExtraDims`, `HDF5_extraDimSize*/Name*` (`file_hdf5.rs:1272-1316`) plus layout constant attrs.
+C: `writeDefaultDatasetAttributes` (`NDFileHDF5.cpp:3684-3739`) attaches `NDArrayNumDims`, `NDArrayDimOffset`, `NDArrayDimBinning`, `NDArrayDimReverse` (int32, comma-source, OnFileOpen) to every detector dataset; the default layout adds `signal=1` (`NDFileHDF5LayoutXML.cpp:51`).
+Impact: A C-written detector dataset carries five extra HDF5 attributes the Rust port never writes; conversely Rust writes a set of `HDF5_*`/`NDArrayDataType` attrs C does not. The attribute name/value sets a reader observes are disjoint except by accident.
+
+#### ADP-72: Performance dataset chunk dim differs (C `[chunking,5]`; Rust `[1,5]`)
+Severity: Low — fix-low
+Rust: `flush_performance_dataset` creates `timestamp` with `chunk(&[1,5])` (`file_hdf5.rs:1588`).
+C: `NDFileHDF5.cpp:2645-2647` `chunk[2] = {chunking, 5}` where `chunking = calculateAttributeChunking(...)` (numCapture or 16K).
+Impact: The `[N,5]` shape, `H5T_NATIVE_DOUBLE` type, and five column meanings match C. Only the chunk dimension differs: C chunks deep, Rust one row per chunk (`H5Pget_chunk`); values identical.
+
+#### ADP-73: Performance dataset group default differs when no layout (`performance` vs root)
+Severity: Low — signoff
+Rust: with no layout, performance lands in a flat `performance` group (`file_hdf5.rs:1578-1581`).
+C: with the default layout the perf group is `/entry/instrument/performance`; if no perf group found and `auto_ndattr_default` true, C falls back to `timestamp` at root (`NDFileHDF5.cpp:2622-2626`).
+Impact: Consequence of ADP-61. C default `/entry/instrument/performance/timestamp`; Rust `/performance/timestamp`. Folds into the ADP-61 fix; the group name itself (`performance`) is right, only the parent tree is missing.
+
+#### ADP-74: Extra-dim dataspace collapses N extra dims into one leading axis; C builds multiple unlimited axes
+Severity: Medium — verify
+Rust: `primary_layout` produces rank `1 + frame_dims.len()`; with extra dims the single leading axis is fixed at `product(extraDimSize)` and never extended; without extra dims one leading axis is unlimited (`file_hdf5.rs:544-582`).
+C: dataset-level `configureDims` (`NDFileHDF5Dataset.cpp:59,88,101-105`) builds rank `pArray->ndims + (nExtraDims+1)`, marking EACH leading extra-dim axis `H5S_UNLIMITED`.
+Impact: For `HDF5_nExtraDims=N`, C writes a rank `ndims+N+1` dataset with separate unlimited extra-dim axes; Rust collapses all extra dims into ONE leading axis of size `product(sizes)`, rank `1+ndims`, recording the intended shape only as `HDF5_extraDimSize*` attrs. A reader sees a different rank/shape with extra dims configured. Verify because the C multi-extra-dim path is gated on `multiFrameFile`/dimAttDataset modes; the common single-extra-frame-dim case matches.
+
+#### ADP-75: Chunk-selection rule is parity-faithful (clean)
+Severity: Low — signoff
+Rust: `clamp_chunk` returns full dim when `auto || requested==0 || requested>dim` (`file_hdf5.rs:586-592`); frame-axis chunk = `n_frames_chunks.max(1)` default 1.
+C: image-axis loop `NDFileHDF5.cpp:3254-3257` clamps to dim then full-dim on auto/<1; frame-axis `3267-3271` default 1.
+Impact: None — too-large clamps to dim, auto/0 → full dim, frame axis default 1. Parity-clean; recorded as positive verification.
+
+#### ADP-76: Fill value handling is parity-faithful (always set, default 0) (clean)
+Severity: Low — signoff
+Rust: `create_primary_dataset` always calls `.fill_value(fill as $t)`, default `fill_value=0.0` (`file_hdf5.rs:267,1264`).
+C: `NDFileHDF5.cpp:3882` `H5Pset_fill_value(cparms, datatype, ptrFillValue)` unconditionally; default 0.
+Impact: None — both always set a fill value defaulting to 0 cast to the dataset type. Parity-clean. (The extra `HDF5_fillValue` float64 attr Rust writes is covered under ADP-71.)
+
+#### ADP-77: NDAttribute string dataset stored as `[n,256]` byte array; C stores `[n]` of a fixed 256-byte H5T_C_S1 string
+Severity: Medium — fix
+Rust: string attribute dataset `new_dataset::<u8>().shape([n, es]).chunk([chunk, es])` with `es=256` (`file_hdf5.rs:1532-1547`) — a 2-D uint8 array.
+C: `NDFileHDF5AttributeDataset.cpp:321-323` `datatype_ = H5Tcopy(H5T_C_S1); H5Tset_size(256)` with rank 1 (`configureDims` rank_=1, `:234,257`) — a 1-D dataset of a fixed-length string type.
+Impact: For a string-valued NDAttribute, C writes a 1-D `[nframes]` dataset of 256-byte fixed-length C strings; Rust writes a 2-D `[nframes,256]` `H5T_STD_U8LE` array. Different rank, different element datatype (string vs uint8). HDF5 string tooling will not recognise the Rust version as strings.
+
+#### ADP-78: NDAttribute Int64/UInt64 width and Undefined-type handling
+Severity: Low — signoff
+Rust: `AttributeDataset::element_size`/`push` handle Int64/UInt64 as 8-byte; `String` fixed 256 (`file_hdf5.rs:101-148`). An attribute absent in a frame pushes `NDAttrValue::Undefined` which `as_i64/as_f64` coerce to 0 (`file_hdf5.rs:1444-1449`).
+C: `NDFileHDF5AttributeDataset.cpp:351-355` Int64/UInt64 → `H5T_NATIVE_INT64/UINT64`; undefined/default type → `H5T_NATIVE_FLOAT` with fill `epicsNAN`, skips the write (`:366-370,160`).
+Impact: Numeric widths and the 256-byte string size match. Divergence: for an Undefined-typed attribute, C creates a float dataset and leaves missing frames NaN; Rust resolves type from the first concrete value and writes 0 for missing frames. The dtype for a genuinely-undefined attribute and the missing-frame sentinel (0 vs NaN) differ. Low because undefined-typed attributes are rare — signoff.
+
+#### ADP-79: Layout `<attribute source="ndattribute">` on groups/datasets and `when` (OnFileOpen/Close) not materialised
+Severity: Medium — fix
+Rust: only `LayoutSource::Constant` attributes are materialised, on datasets only (`file_hdf5.rs:1206-1212,956-960`); `ndattribute`-sourced `<attribute>` nodes are skipped, and `LayoutWhen` is parsed (`hdf5_layout.rs:46-64`) but never consulted.
+C: `NDFileHDF5.cpp:553-632` `storeOnOpenCloseAttribute` writes an `<attribute source="ndattribute">` as an HDF5 attribute on its group/dataset — OnFileOpen → first value, OnFileClose → last value (`:302`, `:1662`).
+Impact: A layout with `<attribute source="ndattribute" when="OnFileClose">` produces an on-disk HDF5 attribute carrying the live NDAttribute value in C; Rust writes nothing. Observable missing attributes for any non-constant layout attribute. (Constant attributes are unaffected — C ignores `when` for constants, `NDFileHDF5LayoutXML.cpp:413-430`, and so does Rust, correctly.)
+
+#### ADP-80: `<global name="detector_data_destination">` parsed but never used to route the detector dataset
+Severity: Low — verify
+Rust: `Hdf5Layout::detector_data_destination` is parsed (`hdf5_layout.rs:131-133,432-436`) but never read by `resolve_layout_paths` or any writer; the detector dataset is always placed by `det_default`/first-detector-source (`hdf5_layout.rs:183-199`).
+C: `NDFileHDF5.cpp:498` reads `get_global("detector_data_destination")` to select which NDAttribute names the destination dataset for detector data.
+Impact: When a layout uses `<global name="detector_data_destination" ndattribute="..."/>` to route detector frames to one of several datasets by attribute value, C honours it; Rust ignores it and always writes to the static `det_default`. Observable only for layouts using this dynamic-destination feature (uncommon) — verify.
+
+### NeXus / Magick writers + PVA NTNDArray converter (ADP-81..95)
+
+#### ADP-81: PVA NTNDArray wire structure is byte-faithful to the canonical NT definition (clean)
+Severity: Low — signoff
+Rust: `crates/epics-pva-rs/src/nt/nd_array.rs:395-415` `nt_nd_array_desc()`.
+C: `pvxs/src/nt.cpp:196-251` `NTNDArray::build()`.
+Impact: None. Top-level field order (`value, codec, compressedSize, uncompressedSize, uniqueId, dataTimeStamp, alarm, timeStamp, dimension, attribute`), struct IDs, value-union variant ordering (signed-first then unsigned), `dimension_t` member set (`size/offset/fullSize/binning/reverse`), NTAttribute member set, and `time_t` all match exactly. A pvData NTNDArray consumer decodes the Rust frame identically.
+
+#### ADP-82: PVA value-union member chosen per NDDataType matches C fromValue (clean)
+Severity: Low — signoff
+Rust: `crates/ad-plugins-rs/src/pva.rs:127-138`, `nd_array.rs:90-104,136-151`.
+C: `ntndArrayConverter.cpp:433-454` `fromValue`.
+Impact: None. Each NDDataType selects its type-specific arm exactly as C's `switch(src->dataType)`; compressed emits raw bytes under `ubyteValue` matching C's `fromValue<PVUByteArray>`; union selector indices agree.
+
+#### ADP-83: PVA codec.parameters original-type integer matches C NDDataTypeToScalar (clean)
+Severity: Low — signoff
+Rust: `crates/ad-plugins-rs/src/pva.rs:257-270` `nd_data_type_to_scalar`; `crates/epics-pva-rs/src/pvdata/scalar.rs:11-23`.
+C: `ntndArrayConverter.cpp:25-36` `NDDataTypeToScalar[]`, written at `416-419`.
+Impact: None. C writes the pvData ScalarType ordinal per array; the table maps Int64→pvLong(4), UInt64→pvULong(8) (its index-6/7 comments are typos, the values are correct). Rust reproduces the same integer per type with matching ScalarType discriminants.
+
+#### ADP-84: PVA uncompressedSize is the original byte count on both branches (clean)
+Severity: Low — signoff
+Rust: `crates/ad-plugins-rs/src/pva.rs:116-138`.
+C: `ntndArrayConverter.cpp:404-411` (`uncompressedSize = arrayInfo.totalBytes` always).
+Impact: None. C always publishes `uncompressedSize = nElements*bytesPerElement` of the ORIGINAL type; Rust computes `num_elements * original_type.element_size()`. Coincide in the common path (see ADP-85 for the over-allocation edge).
+
+#### ADP-85: PVA uncompressed compressedSize uses recomputed totalBytes, not the NDArray field
+Severity: Low — signoff
+Rust: `crates/ad-plugins-rs/src/pva.rs:133-137` (uncompressed branch → `compressed_size = uncompressed_size`).
+C: `ntndArrayConverter.cpp:407,410` `compressedSize = src->compressedSize`.
+Impact: For an uncompressed array C copies the NDArray's own `compressedSize` (= `dataSize`, normally `totalBytes` but LARGER when a driver over-allocates, `NDArray.cpp:58`). In that rare case C's wire `compressedSize` exceeds `uncompressedSize`; Rust always emits exactly `uncompressedSize`. Requires a non-default over-allocating driver — observable-but-marginal, signoff.
+
+#### ADP-86: PVA dimension[].binning clamps 0→1 where C serializes the raw value
+Severity: Low — fix-low
+Rust: `crates/ad-plugins-rs/src/pva.rs:151` `binning: d.binning.max(1) as i32`.
+C: `ntndArrayConverter.cpp:471` `…->put(src->dims[i].binning)` (no clamp).
+Impact: C copies `dims[i].binning` verbatim into the wire field; Rust forces a minimum of 1. If an upstream source sets `binning = 0`, the C wire shows `0` and Rust shows `1` — an observable `dimension[].binning` difference. `NDDimension::new` default is already 1, so this manifests only when something explicitly sets binning to 0 (non-physical) — low severity. The only wire divergence in the PVA group.
+
+#### ADP-87: PVA dataTimeStamp/timeStamp dual-source + POSIX offset match C (clean)
+Severity: Low — signoff
+Rust: `crates/ad-plugins-rs/src/pva.rs:160-161,221-246`.
+C: `ntndArrayConverter.cpp:477-503` `fromDataTimeStamp`/`fromTimeStamp`.
+Impact: None. `dataTimeStamp` from the float `NDArray::timeStamp` (floor secs, frac→ns), `timeStamp` from integer `epicsTS`; both add `POSIX_TIME_AT_EPICS_EPOCH`; `userTag` 0. Rust reproduces both sources and the offset.
+
+#### ADP-88: PVA NTAttribute fields incl. null-variant handling match C (clean)
+Severity: Low — signoff
+Rust: `crates/ad-plugins-rs/src/pva.rs:163-185,275-310`.
+C: `ntndArrayConverter.cpp:544-591` `fromAttributes`/`fromAttribute`/`fromUndefinedAttribute`.
+Impact: None. Per attribute C sets only `name`, `descriptor`, `source`, `sourceType` (raw int), and the `value` any (typed scalar or null for `NDAttrUndefined`). Rust matches: defined → tagged scalar, `Undefined` → `VariantValue::null()`, per-attribute timeStamp/alarm/tags stay at NT defaults (C never populates them).
+
+#### ADP-89: PVA codec.name and uniqueId match C (clean)
+Severity: Low — signoff
+Rust: `crates/ad-plugins-rs/src/pva.rs:127-142,193,248-250`.
+C: `ntndArrayConverter.cpp:420,231-232`.
+Impact: None. Uncompressed → empty `codec.name`; compressed → the codec's name. `uniqueId` copied directly; `alarm` fixed `NO_ALARM`/0/0.
+
+#### ADP-90: NeXus group/dataset layout and dtype mapping match C processNode (clean)
+Severity: Low — signoff
+Rust: `crates/ad-plugins-rs/src/file_nexus.rs:263-308,442-544,719-748`.
+C: `NDFileNexus.cpp:205-475`.
+Impact: None for the on-disk tree. The 44 NeXus base-class group names + the `UserGroup` rule match C's list/test; group naming (name attr else tag, NX_class = tag) matches; the dtype switch maps each NDDataType to the same HDF5 type; CONST/ND_ATTR node handling parallels C.
+
+#### ADP-91: NeXus NX_class is a true group attribute; C writes it via NXmakegroup (clean)
+Severity: Low — signoff
+Rust: `crates/ad-plugins-rs/src/file_nexus.rs:391-400,470`.
+C: `NDFileNexus.cpp:254-255` `NXmakegroup(handle, name, class)`.
+Impact: None. C's NXmakegroup records the class via the napi group-class mechanism (an NX_class HDF5 group attribute); Rust writes NX_class as a real group attribute. A NeXus reader sees the same class.
+
+#### ADP-92: NeXus capture/stream leading frame dimension matches C slab layout (clean)
+Severity: Low — signoff
+Rust: `crates/ad-plugins-rs/src/file_nexus.rs:703-856`.
+C: `NDFileNexus.cpp:400-411,498-536`.
+Impact: None observable in shape/contents. C prepends a frame axis (`rank+1`, leading dim `numCapture`) writing each frame as a slab at `slabOffset[0]=imageNumber`; Rust creates a `[1,…]` chunked dataset extended per frame to `[N,…]`. Both index frames on the leading axis with identical reversed per-frame dims. C pre-sizes to numCapture, Rust grows to actual count — differs only if capture ends early (C leaves trailing uninitialized frames), a benign capacity-vs-actual difference.
+
+#### ADP-93: NeXus per-frame uniqueId/timeStamp datasets and DTYPE attribute are Rust additions absent from C output
+Severity: Medium — signoff
+Rust: `crates/ad-plugins-rs/src/file_nexus.rs:32,753-757,787-818` (`NDArrayDataType` attr, `uniqueId`/`timeStamp` datasets).
+C: `NDFileNexus.cpp` — no such datasets/attributes are written.
+Impact: The Rust NeXus file contains extra objects C never emits (an `NDArrayDataType` i32 attr on the data dataset, sibling `uniqueId` i32[] and `timeStamp` f64[] datasets). C writes per-frame provenance only if the template contains nodes for it; the built-in/default file has none. A byte-for-byte diff against C differs (extra datasets/attrs), but no C-written object is missing or wrong — additive. Recorded as a deliberate additive divergence for sign-off (backs lossless `read_file` round-tripping, which C's reader does not implement).
+
+#### ADP-94: NeXus built-in /entry/data NXdata group + hard-link to detector dataset has no C analog (template-only in C)
+Severity: Low — signoff
+Rust: `crates/ad-plugins-rs/src/file_nexus.rs:642-666,775-785`.
+C: `NDFileNexus.cpp` — all placement is template-driven; no built-in hierarchy.
+Impact: C's NDFileNexus produces NO structure without a loaded XML template; Rust adds a built-in `entry/instrument/detector` + `entry/data` hierarchy (with a hard link) for the no-template case. When a template IS loaded, Rust's `process_template` drives placement exactly like C and the built-in hierarchy is not created (`nxdata_group_path = None`). No divergence in template mode; in no-template mode C writes nothing usable, so no C output to diverge from.
+
+#### ADP-95: Magick RGB2/RGB3 correct where C writes uninitialized pixels (C bug); Magick infers RGB from dims where C requires the ColorMode attribute
+Severity: Medium — signoff
+Rust: `crates/ad-plugins-rs/src/file_magick.rs:81-93,131-147,279-333`.
+C: `NDFileMagick.cpp:41-96` (`openFile`), `125-146` (`writeFile`).
+Impact: Two intentional output-form deviations, both improvements over C:
+- (a) RGB2/RGB3: C `writeFile`'s `switch(colorMode)` has EMPTY `case NDColorModeRGB2/RGB3:` bodies (136-139) — `image.read()` is never called, so C writes an uninitialized/empty Image. Rust converts RGB2/RGB3 to interleaved RGB1 (`convert_rgb_layout`) and writes correct pixels.
+- (b) Color-mode source: C `openFile` reads ONLY the `ColorMode` attribute (default Mono); a 3-D `[3,X,Y]` array with no attribute fails C's RGB conditions and returns `asynError` (no file). Rust `color_mode` falls back to inferring RGB1/RGB2/RGB3 from a size-3 dimension, producing a file where C produces none.
+Both deliberate corrections; recorded for sign-off. The storage-type/pixel-depth per NDDataType and the Mono grayscale path otherwise match C.

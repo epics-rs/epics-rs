@@ -76,14 +76,14 @@ population). One commit per finding.
 | OPT-14 (Io scaler.DESC = selected channel name) | fix | Fixed | 18a2795b |
 | OPT-15a/b (Io out-of-range channel + zero-ticks ionAbs) | fix-low | Fixed | 67fa074b |
 | OPT-15c (Io 6-sig-fig absorption coefficients) | fix-low | Fixed | 01d9fc5d |
-| OPT-13 (Io init force-writes 19 default PVs) | verify→fork | OPEN — needs user call | — |
+| OPT-13 (Io init force-writes 19 default PVs) | fork→B | Fixed (option B) | 7e968506 |
 | OPT-T1 (table YANG put rotates user offsets) | verify→fix | Fixed | 7b443c58 |
 | OPT-T2 (table restores speed on every speed-capable motor) | verify→fix | Fixed | d7318d2d |
 | OPT-T3 (table zeroes motor limits on read failure) | verify→fix | Fixed | 9dc07384 |
 | OPT-T4 (Newport user limits use raw-angle rotation matrix) | verify→fix | Fixed | c82703ec |
-| OPT-T5 (table sqrt/asin domain clamps vs C bare NaN/Inf) | verify→signoff | OPEN — needs user call | — |
-| OPT-T6 (table speed-ratio NaN guard vs C 0/0 poison) | verify→signoff | OPEN — needs user call | — |
-| OPT-3 (orient invertArray x/det vs x*(1/det) de-precision) | signoff | OPEN — needs user call | — |
+| OPT-T5 (table sqrt/asin domain clamps vs C bare NaN/Inf) | signoff | Signoff — keep Rust guards (user call) | — |
+| OPT-T6 (table speed-ratio NaN guard vs C 0/0 poison) | signoff | Signoff — keep Rust guard (user call) | — |
+| OPT-3 (orient invertArray x/det vs x*(1/det) de-precision) | signoff | Signoff — keep Rust precision (user call) | — |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -517,6 +517,7 @@ Rust: `crates/optics-rs/src/snl/io.rs:578-585` writes only E_using.
 C: `Io.st:174-196` pvPuts 19 constants + seeds 4 outputs.
 Impact: Rust keeps stale DB/autosave values, outputs unseeded. (C's clobber-DB is arguably the questionable side — verify which to match.)
 Investigated (2026-06-15): the 19 PVs C force-writes (`Io.st:174-195`) are all operator-tunable defaults, not fixed physical constants — the C comments say so (`icChannel` "likely scaler channel", `VperA` "likely setting", `xAir=1` "assume 1 atmosphere", `activeLen=60` "assume CHESS ion chambers", `dEff=1` "assume NaI(Tl)"). They are exactly the fields autosave restores (gas mix, chamber geometry, gains), so C's boot-time force-write clobbers autosaved operator settings. This is a genuine semantic fork, NOT output-form parity: (A) write all 22 like C (clobbers autosave for the 18 tunables); (B) seed only the 4 computed outputs (flux=0/ionPhotons=0/ionAbs=1/detector=0), leave operator params to autosave/.db defaults; (C) keep current (E_using only). Needs user sign-off; not silently picked.
+Resolved 2026-06-15 (user chose option B), Fixed 7e968506: run() init now seeds flux=0/ionPhotons=0/ionAbs=1/detector=0 (Io.st:192-195); the 18 operator-tunable defaults (Io.st:174-191) are deliberately left to autosave/.db so a saved configuration is not clobbered on boot.
 
 #### OPT-14: Io `scaler.DESC` (icName) string never written by Rust
 Severity: Medium — fix

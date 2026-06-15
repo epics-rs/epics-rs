@@ -439,6 +439,26 @@ pub struct Pf4Actions {
 }
 
 impl Pf4Controller {
+    /// Recompute transmission / inverse-transmission for the current filter
+    /// position and stage the matching writes.
+    ///
+    /// C (pf4.st:281-282) PVPUTs `trans` unconditionally but `invtrans` only when
+    /// `trans > 0.0`; a zero transmission (e.g. a glass blade below 2 keV) leaves
+    /// `{H}invTrans{B}` at its prior value rather than publishing +inf. This is the
+    /// single owner of both writes so the gate holds on every path.
+    fn emit_transmission(&mut self, actions: &mut Pf4Actions) {
+        self.transmission = self.xmit[self.filter_pos];
+        self.inv_transmission = if self.transmission > 0.0 {
+            1.0 / self.transmission
+        } else {
+            f64::INFINITY
+        };
+        actions.write_transmission = Some(self.transmission);
+        if self.transmission > 0.0 {
+            actions.write_inv_transmission = Some(self.inv_transmission);
+        }
+    }
+
     /// Recalculate all filter transmissions and update derived values.
     pub fn recalculate(&mut self) -> Pf4Actions {
         let mut actions = Pf4Actions::default();
@@ -462,12 +482,7 @@ impl Pf4Controller {
             self.bit_states[3],
         );
         self.filter_pos = find_position(&self.bits, current_pattern);
-        self.transmission = self.xmit[self.filter_pos];
-        self.inv_transmission = if self.transmission > 0.0 {
-            1.0 / self.transmission
-        } else {
-            f64::INFINITY
-        };
+        self.emit_transmission(&mut actions);
 
         // Material thicknesses
         self.filter_al = thickness_by_material(
@@ -498,8 +513,8 @@ impl Pf4Controller {
             *label = format!("{:.3e}", x);
         }
         actions.write_labels = Some(labels);
-        actions.write_transmission = Some(self.transmission);
-        actions.write_inv_transmission = Some(self.inv_transmission);
+        // trans / invtrans were staged by emit_transmission above (invtrans gated
+        // on trans > 0).
         // C only PVPUTs filterAl/Ti/Gl when a blade uses that material
         // (pf4.st:277-279: `if(z1==0||z2==0||z3==0||z4==0)` etc.), and only in
         // the bankctl==2 recompute branch, which is reached solely while the bank
@@ -528,14 +543,7 @@ impl Pf4Controller {
                     bits_to_pattern(new_bits[0], new_bits[1], new_bits[2], new_bits[3]);
                 self.filter_pos = find_position(&self.bits, current_pattern);
                 let mut actions = Pf4Actions::default();
-                self.transmission = self.xmit[self.filter_pos];
-                self.inv_transmission = if self.transmission > 0.0 {
-                    1.0 / self.transmission
-                } else {
-                    f64::INFINITY
-                };
-                actions.write_transmission = Some(self.transmission);
-                actions.write_inv_transmission = Some(self.inv_transmission);
+                self.emit_transmission(&mut actions);
                 actions
             }
 
@@ -607,14 +615,7 @@ impl Pf4Controller {
                         ..Default::default()
                     };
                     self.bit_states = new_bits;
-                    self.transmission = self.xmit[pos];
-                    self.inv_transmission = if self.transmission > 0.0 {
-                        1.0 / self.transmission
-                    } else {
-                        f64::INFINITY
-                    };
-                    actions.write_transmission = Some(self.transmission);
-                    actions.write_inv_transmission = Some(self.inv_transmission);
+                    self.emit_transmission(&mut actions);
                     actions
                 } else {
                     Pf4Actions::default()
@@ -1035,6 +1036,25 @@ mod tests {
         assert!(actions.write_filter_al.is_none());
         assert!(actions.write_filter_ti.is_none());
         assert!(actions.write_filter_glass.is_none());
+    }
+
+    #[test]
+    fn test_zero_transmission_skips_inv_write() {
+        // A glass blade in beam below 2 keV gives transmission 0. C writes trans
+        // but skips invtrans (pf4.st:282 `if(trans>0.0)`); we must do the same
+        // rather than publishing +inf to {H}invTrans{B}.
+        let mut ctrl = Pf4Controller::default();
+        ctrl.bank_on = true;
+        ctrl.use_mono = true;
+        ctrl.mono_energy = 1.5;
+        ctrl.local_energy = 1.5;
+        ctrl.bank_config.thicknesses = [1.0, 0.0, 0.0, 0.0];
+        ctrl.bank_config.material_indices = [MAT_GLASS, MAT_AL, MAT_AL, MAT_AL];
+        ctrl.bit_states = [true, false, false, false];
+        let actions = ctrl.recalculate();
+        assert_eq!(ctrl.transmission, 0.0);
+        assert_eq!(actions.write_transmission, Some(0.0));
+        assert!(actions.write_inv_transmission.is_none());
     }
 
     #[test]

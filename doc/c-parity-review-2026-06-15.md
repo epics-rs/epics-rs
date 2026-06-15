@@ -1046,19 +1046,19 @@ Impact: On a byte-rate-throttled frame, C presents ArrayCounter unchanged + Drop
 ### NDFileHDF5 writer (ADP-61..80)
 
 #### ADP-61: Default layout is flat `/data`, not the C NeXus `/entry/instrument/detector/data` tree
-Severity: High — fix
+Severity: High — fix — **FIXED 5051638b** (added a built-in `DEFAULT_LAYOUT_XML` const mirroring C `LayoutXML::DEFAULT_LAYOUT`, parsed into `self.layout` at construction and when `HDF5_layoutFilename` is empty; the existing layout machinery — `resolve_layout_paths`, `build_layout_groups`, `build_layout_hardlinks`, dataset/perf/ndattr placement — now materialises the full NeXus tree uniformly. Image lands at `/entry/instrument/detector/data` with the `/entry/data/data` hardlink. This also closes ADP-73 (perf group is now `/entry/instrument/performance`). Layout XML is wrapped in `<hdf5_layout>` because the Rust parser requires that root; the resulting tree is identical to C's.)
 Rust: `file_hdf5.rs:284,1010-1014` `resolved_dataset_path = "data"` when no layout XML is loaded; `resolve_layout_paths` falls back to flat root.
 C: `NDFileHDF5LayoutXML.cpp:43-70` `DEFAULT_LAYOUT`; `NDFileHDF5.cpp:3899-3906` loads it when the layout filename param is empty.
 Impact: With NO user XML (the default mode), C writes the image at `/entry/instrument/detector/data` inside a full NeXus tree (NXentry/NXinstrument/NXdetector/NXcollection/NXdata) plus a `/entry/data/data` hardlink, an `NDAttributes` NXcollection, and a `performance` group. Rust writes a single flat dataset `data` at the root with none of the NeXus groups, NX_class attrs, or hardlink. The single largest divergence in the writer.
 
 #### ADP-62: No NX_class / NeXus group attributes emitted for the default layout
-Severity: High — fix
+Severity: High — fix — **FIXED 0b4488dd** (`build_layout_groups`/`build_swmr_layout_groups` now carry each `&LayoutGroup` through the collect step and call `write_group_constant_attrs`/`write_swmr_group_constant_attrs`, which write every `source="constant"` `<attribute>` as a group-level HDF5 attribute — `NX_class` strings included — on both the standard and SWMR backends. Verified by `test_default_layout_group_nx_class_attributes` and `test_swmr_default_layout_group_nx_class_attributes`.)
 Rust: no built-in default layout; `build_layout_groups` runs only when `self.layout` is `Some`, and even then materialises only group nodes, never `NX_class` constant attributes (only dataset-level constant attrs, `file_hdf5.rs:1317-1347`); `for_each_dataset` (`file_hdf5.rs:1204`) visits datasets only, so a `<group><attribute>` constant is dropped.
 C: `NDFileHDF5LayoutXML.cpp:45,47,49,54,60,67` (NXentry/NXinstrument/NXdetector/NXcollection/NXdata); written via `NDFileHDF5.cpp:693-695` `writeHdfAttributes(new_group, root)` when `storeAttributes==1`.
 Impact: C attaches `NX_class` string attributes to the entry/instrument/detector/NDAttributes/data groups; Rust never writes any group-level constant attribute. NeXus readers will not recognise the file as NeXus.
 
 #### ADP-63: Default ColorMode NDAttribute dataset and per-dataset ndattribute placement missing
-Severity: Medium — fix
+Severity: Medium — fix — **FIXED b44be071** (added `Hdf5Layout::ndattribute_dataset(name) -> (parent group, dataset name)` resolver mirroring C `find_dset_ndattr`; `flush_attribute_datasets` pre-computes a per-attribute target from the matching `<dataset source="ndattribute" ndattribute="name">` and caches group handles, so a declared attribute lands in its XML-pinned group/name and an undeclared one falls back to the `ndattr_default` group. The default layout's `ColorMode` now materialises at `/entry/instrument/detector/NDAttributes/ColorMode`. SWMR mode creates no per-attribute datasets, so the routing site is singular. Verified by `test_ndattribute_dataset_routed_to_declared_group`.)
 Rust: NDAttribute datasets come from the live `array.attributes` list (`file_hdf5.rs:1457-1467`) and always land in the flat `NDAttributes` group or the layout `ndattr_default` group; the layout's `<dataset source="ndattribute">` nodes are never honoured for placement.
 C: `NDFileHDF5LayoutXML.cpp:55` default `<dataset name="ColorMode" source="ndattribute" ndattribute="ColorMode">`; `NDFileHDF5.cpp:2792-2800` routes a matching NDAttribute into the XML-declared dataset/group via `find_dset_ndattr`/`setDsetName`.
 Impact: C writes `ColorMode` at `/entry/instrument/detector/NDAttributes/ColorMode` (the XML-pinned path) and any user `<dataset source="ndattribute">` at its declared path/name; Rust ignores this placement and writes every attribute under the single ndattr group keyed by raw name. Different on-disk dataset paths.
@@ -1118,7 +1118,7 @@ C: `NDFileHDF5.cpp:2645-2647` `chunk[2] = {chunking, 5}` where `chunking = calcu
 Impact: The `[N,5]` shape, `H5T_NATIVE_DOUBLE` type, and five column meanings match C. Only the chunk dimension differs: C chunks deep, Rust one row per chunk (`H5Pget_chunk`); values identical.
 
 #### ADP-73: Performance dataset group default differs when no layout (`performance` vs root)
-Severity: Low — signoff
+Severity: Low — signoff — **RESOLVED by ADP-61 (5051638b)** (the built-in default layout declares `<group name="performance">` under `entry/instrument`, so the perf dataset now materialises at `/entry/instrument/performance/timestamp`, matching C; no longer a flat-root `performance`.)
 Rust: with no layout, performance lands in a flat `performance` group (`file_hdf5.rs:1578-1581`).
 C: with the default layout the perf group is `/entry/instrument/performance`; if no perf group found and `auto_ndattr_default` true, C falls back to `timestamp` at root (`NDFileHDF5.cpp:2622-2626`).
 Impact: Consequence of ADP-61. C default `/entry/instrument/performance/timestamp`; Rust `/performance/timestamp`. Folds into the ADP-61 fix; the group name itself (`performance`) is right, only the parent tree is missing.

@@ -122,6 +122,7 @@ population). One commit per finding.
 | ADP-16 (ROIStat clamps out-of-range/zero ROI to one edge pixel; writes back clamped geometry) | fix | Fixed | 017d3497 |
 | ADP-18 (ROI 3-D RGB path converts output to the requested dataType) | fix | Fixed | 3064f514 |
 | ADP-19 (ROI single-color selection collapses to 2-D Mono) | fix | Fixed | c87ac8c3 |
+| ADP-23 (transform layout: array attr vs NDColorMode param) | verify→N/A | Not applicable (C refreshes the param from the array ColorMode attr each frame before use; same Mono default — equivalent, mismatch unreachable) | — |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -374,6 +375,7 @@ Severity: Medium — verify
 Rust: `crates/ad-plugins-rs/src/transform.rs:133,152,185` derives layout from the array's ColorMode attr.
 C: `NDPluginTransform.cpp:527-529` reads the operator-set NDColorMode param.
 Impact: when attr and record disagree, channel handling diverges. Verify reachability of the mismatch.
+— NOT APPLICABLE (verified, no code change): the mismatch is unreachable. C's `transformImage` reads the NDColorMode *param* (NDPluginTransform.cpp:528), but `NDPluginTransform::processCallbacks` calls `NDPluginDriver::beginProcessCallbacks` first (line 485), which overwrites that param from the input array's `ColorMode` attribute every frame (NDPluginDriver.cpp:201-211, default Mono when absent) *before* transformImage runs. So C's param is just a per-frame copy of the array attribute at the point of use — an operator caput to NDColorMode is clobbered before transformImage reads it. The Rust `apply_transform` derives `info.color_mode` from the same `ColorMode` attribute via `info()` (same Mono default), so both pick layout from identical data. Equivalence already covered by test_rgb1_flip_horiz_keeps_color_grouping / test_rgb1_rot90cw_swaps_dims_and_keeps_color (RGB1 array carrying a ColorMode attribute). (The C `NDArraySizeZ=3` hardcode at line 513 is a separate readback-param quirk, not this finding.)
 
 #### ADP-24: Process flat-field substitutes the field mean when scaleFlatField ≤ 0
 Severity: Medium — fix

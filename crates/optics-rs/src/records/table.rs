@@ -1688,7 +1688,16 @@ fn calc_local_user_limits(
         geom, torad, yang, pp0, pp1, pp2, ppo0, ppo1, ppo2, a, lnk_stat, ax0, ax,
     );
 
-    // Get naive pivot points for motor hi and lo limits
+    // Get naive pivot points for motor hi and lo limits.
+    // For Newport, C NaiveMotorToPivotPointVector rebuilds the rotation matrix
+    // from the RAW user angles (MakeRotationMatrix(&ptbl->ax), tableRecord.c:1281)
+    // -- not the offset+yaw matrix user_to_motor left in `a` -- and the rebuild
+    // clobbers ptbl->a for the rest of the cycle. Mirror both: overwrite `a`
+    // from raw ax so the Newport `norm` (a[*][Y]) matches C. Other geometries
+    // ignore the matrix in naive_motor_to_pivot_point_vector, so leave `a` as is.
+    if geom == Geometry::Newport {
+        *a = make_rotation_matrix(torad, ax);
+    }
     let (pp0h, pp1h, pp2h) = naive_motor_to_pivot_point_vector(geom, ppo0, ppo1, ppo2, a, hm);
     let (pp0l, pp1l, pp2l) = naive_motor_to_pivot_point_vector(geom, ppo0, ppo1, ppo2, a, lm);
 
@@ -3964,6 +3973,46 @@ mod tests {
         t.geom = Geometry::Newport;
         t.do_init_geometry();
         t
+    }
+
+    #[test]
+    fn test_newport_translation_limits_use_raw_angle_norm() {
+        // C NaiveMotorToPivotPointVector rebuilds the Newport rotation matrix
+        // from the RAW user angles (MakeRotationMatrix(&ptbl->ax),
+        // tableRecord.c:1281), so the `norm` (a[*][Y]) used for the X/Z
+        // translation limits comes from raw ax -- not the offset+yaw matrix
+        // user_to_motor builds. With yaw=30 and AZ=7 the two norms differ, so
+        // the translation limits differ. Golden values are the raw-angle-norm
+        // (C-faithful) results; the offset+yaw norm would give hlx=21.0287,
+        // hlz=13.6376.
+        let mut t = make_newport_table();
+        t.yang = 30.0;
+        t.az = 7.0; // raw user AZ angle
+        t.set_hi_motor_limit(&[10.0; 6]);
+        t.set_lo_motor_limit(&[-10.0; 6]);
+
+        t.do_calc_user_limits();
+
+        assert!(
+            (t.hlx - 21.473_060_058_124_826).abs() < 1e-9,
+            "hlx = {}",
+            t.hlx
+        );
+        assert!(
+            (t.hlz - 14.244_655_435_846_859).abs() < 1e-9,
+            "hlz = {}",
+            t.hlz
+        );
+        assert!(
+            (t.llx - -7.958_286_964_191_689).abs() < 1e-9,
+            "llx = {}",
+            t.llx
+        );
+        assert!(
+            (t.llz - -14.294_546_073_893_386).abs() < 1e-9,
+            "llz = {}",
+            t.llz
+        );
     }
 
     #[test]

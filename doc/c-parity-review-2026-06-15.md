@@ -114,6 +114,7 @@ population). One commit per finding.
 | ADP-15 (stats histogram upper-boundary clamp) | fix→N/A | Not applicable (clamp is a no-op for in-range values; guards already match C; proof in finding block) | — |
 | ADP-1 (stats centroid moments: raw-pixel vs threshold-profile) | fix→signoff | Signoff — precision-only fork, recommend keep Rust direct-central (OPT-3 precedent); routed to #58 | — |
 | ADP-3 (false-color Rainbow/Iron LUTs by index, not generated jet) | fix | Fixed | 81d90f28 |
+| ADP-4 (Bayer demosaic border keeps native channel only) | fix | Fixed | 3b1669c6 |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -231,11 +232,12 @@ FIXED: ported the exact `RAINBOW_COLOR_MAP`/`IRON_COLOR_MAP` 256-entry tables ve
 
 > ADP-3-note (distinct, deferred): C applies false color for both NDInt8 and NDUInt8 (cast `(unsigned char)*pIn`). Rust `false_color_mono_to_rgb1` gates on `NDDataType::UInt8` only. Whether NDInt8 mono is reachable through this crate's pipeline needs a separate check before flagging; not part of the ADP-3 LUT fix.
 
-#### ADP-4: ColorConvert Bayer demosaic interpolates the image border; C leaves non-native channels 0
+#### ADP-4: ColorConvert Bayer demosaic interpolates the image border; C leaves non-native channels 0 — FIXED (3b1669c6)
 Severity: High — fix
 Rust: `crates/ad-plugins-rs/src/color_convert.rs:51-191` interpolates every pixel incl. the 1-px border.
 C: `NDPluginColorConvert.cpp:305` gates interpolation on interior; border keeps 2 channels at 0.
 Impact: the one-pixel border of every demosaiced RGB output differs.
+FIXED: gated all non-native interpolation on `interior = x>0 && x+1<w && y>0 && y+1<h` (= C line 305). Border pixels keep only the native Bayer channel (other two stay 0, vecs zero-initialised). Interior pixels always have all 8 neighbours, so the count-based edge divisor (the divergence source) is replaced by C's fixed /4 (red/blue arms) and /2 (green) — one uniform rule, interior output unchanged. Single demosaic site (rg `demosaic` workspace-wide). Tests: test_adp4_bayer_border_keeps_native_channel_only, test_adp4_bayer_interior_uses_fixed_quarter_divisor.
 
 #### ADP-5: Process clip order reversed (C high-then-low, Rust low-then-high)
 Severity: High — fix

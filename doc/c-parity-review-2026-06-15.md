@@ -1070,7 +1070,7 @@ C: `NDFileHDF5.cpp:2715` `attrNames[] = {"NDAttrName","NDAttrDescription","NDAtt
 Impact: C attaches up to four string HDF5 attributes to every NDAttribute dataset; Rust writes none, so a reader sees no source/description metadata.
 
 #### ADP-65: Attribute dataset chunk default differs (C: numCapture/16K; Rust: 16)
-Severity: Low — fix-low
+Severity: Low — fix-low — **FIXED c78dbac3** (added `NDFileWriter::set_num_capture` default-no-op hook the controller pushes before each open; `Hdf5Writer` stores the open mode + capture target and resolves the chunk via `attribute_chunking` mirroring C `calculateAttributeChunking` — auto(0)→Single 1, else numCapture, else 16*1024; `ndattr_chunk` keeps 0 as the auto sentinel instead of clamping to 1, and the chunk is no longer clamped to the frame count since the dataset is extensible)
 Rust: `ChunkConfig::ndattr_chunk` default `16` (`file_hdf5.rs:66`); chunk = `min(ndattr_chunk, n).max(1)` (`file_hdf5.rs:1497`).
 C: `calculateAttributeChunking` (`NDFileHDF5.cpp:2869-2920`): param default `0` (`2324`) → uses `NDFileNumCapture`; if capture ≤ 0 → `16*1024`.
 Impact: When `HDF5_NDAttributeChunk` is default (0), C chunks at numCapture (or 16384), Rust at 16 (clamped to frame count). Different chunk dimension in the DCPL (`H5Pget_chunk`); data values identical.
@@ -1112,7 +1112,7 @@ C: `writeDefaultDatasetAttributes` (`NDFileHDF5.cpp:3684-3739`) attaches `NDArra
 Impact: A C-written detector dataset carries five extra HDF5 attributes the Rust port never writes; conversely Rust writes a set of `HDF5_*`/`NDArrayDataType` attrs C does not. The attribute name/value sets a reader observes are disjoint except by accident.
 
 #### ADP-72: Performance dataset chunk dim differs (C `[chunking,5]`; Rust `[1,5]`)
-Severity: Low — fix-low
+Severity: Low — fix-low — **FIXED 27950c3d** (`flush_performance_dataset` now chunks `[chunking,5]` reusing `attribute_chunking` (the same C `calculateAttributeChunking` value, depends on ADP-65) and bands the writes through `write_chunked_buffer`; extent `[n,5]`, type, and column meanings unchanged)
 Rust: `flush_performance_dataset` creates `timestamp` with `chunk(&[1,5])` (`file_hdf5.rs:1588`).
 C: `NDFileHDF5.cpp:2645-2647` `chunk[2] = {chunking, 5}` where `chunking = calculateAttributeChunking(...)` (numCapture or 16K).
 Impact: The `[N,5]` shape, `H5T_NATIVE_DOUBLE` type, and five column meanings match C. Only the chunk dimension differs: C chunks deep, Rust one row per chunk (`H5Pget_chunk`); values identical.

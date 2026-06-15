@@ -263,8 +263,29 @@ pub fn extract_roi_3d(src: &NDArray, config: &ROIConfig) -> Option<NDArray> {
         NDDataBuffer::F64(v) => NDDataBuffer::F64(extract3d!(v, f64, 0.0)),
     };
 
-    let mut arr = NDArray::new(dims, src.data.data_type());
-    arr.data = out_data;
+    // Apply the requested output data type (C converts to ROIDataType, or the
+    // input type when ROIDataType == -1, NDPluginROI.cpp:144,166-174). Mirrors
+    // the 2-D path so a 3-D RGB ROI honours ROI_DATA_TYPE.
+    let target_type = config.data_type.unwrap_or(src.data.data_type());
+    let mut arr = NDArray::new(dims, target_type);
+    if target_type == src.data.data_type() {
+        arr.data = out_data;
+    } else {
+        let mut temp = NDArray::new(arr.dims.clone(), src.data.data_type());
+        temp.data = out_data;
+        match ad_core_rs::color::convert_data_type(&temp, target_type) {
+            Ok(converted) => arr.data = converted.data,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    from = ?src.data.data_type(),
+                    to = ?target_type,
+                    "ROI 3-D output data-type conversion failed; dropping frame"
+                );
+                return None;
+            }
+        }
+    }
     arr.unique_id = src.unique_id;
     arr.timestamp = src.timestamp;
     arr.time_stamp = src.time_stamp;
@@ -1171,6 +1192,53 @@ mod tests {
             assert_eq!(&v[3..6], &[110, 111, 112]);
         } else {
             panic!("not u8");
+        }
+    }
+
+    #[test]
+    fn test_adp18_3d_rgb_honors_output_data_type() {
+        // A 3-D RGB ROI with ROI_DATA_TYPE set must convert the output, like
+        // the 2-D path (C NDPluginROI.cpp:144,166-174). The old 3-D path kept
+        // the source type regardless of config.data_type.
+        let arr = make_rgb1_2x2();
+        let mut config = ROIConfig::default();
+        config.dims[0] = ROIDimConfig {
+            min: 0,
+            size: 2,
+            bin: 1,
+            reverse: false,
+            enable: true,
+            auto_size: false,
+        };
+        config.dims[1] = ROIDimConfig {
+            min: 0,
+            size: 2,
+            bin: 1,
+            reverse: false,
+            enable: true,
+            auto_size: false,
+        };
+        config.dims[2] = ROIDimConfig {
+            min: 0,
+            size: 3,
+            bin: 1,
+            reverse: false,
+            enable: true,
+            auto_size: false,
+        };
+        config.data_type = Some(NDDataType::UInt16);
+
+        let roi = extract_roi(&arr, &config).unwrap();
+        assert_eq!(roi.data.data_type(), NDDataType::UInt16);
+        // RGB1 dims preserved: [color=3, x=2, y=2].
+        assert_eq!(roi.dims[0].size, 3);
+        assert_eq!(roi.dims[1].size, 2);
+        assert_eq!(roi.dims[2].size, 2);
+        // Values preserved through the widening conversion: pixel (0,0) = 0,1,2.
+        if let NDDataBuffer::U16(ref v) = roi.data {
+            assert_eq!(&v[0..3], &[0, 1, 2]);
+        } else {
+            panic!("not u16");
         }
     }
 }

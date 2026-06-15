@@ -74,6 +74,18 @@ pub enum BufferStatus {
     AcquisitionCompleted,
 }
 
+/// Trigger calc inputs and result for one frame, mirroring C's
+/// `triggerCalcArgs_[0]`/`[1]` and `calcResult` (NDPluginCircularBuff.cpp:67-78).
+#[derive(Debug, Clone, Copy)]
+pub struct TriggerValues {
+    /// Value of the TriggerA attribute (NaN if absent).
+    pub a: f64,
+    /// Value of the TriggerB attribute (NaN if absent).
+    pub b: f64,
+    /// Result of the trigger calc expression.
+    pub calc: f64,
+}
+
 /// Result of pushing a frame: which frames to forward downstream now, and
 /// whether a capture sequence completed on this push.
 #[derive(Debug, Default)]
@@ -82,6 +94,10 @@ pub struct PushResult {
     pub forward: Vec<Arc<NDArray>>,
     /// True if the post-trigger count was reached on this push.
     pub sequence_done: bool,
+    /// Trigger calc inputs/result when the calc was evaluated this frame
+    /// (C `calculateTrigger` path). `None` when already triggered or for a
+    /// non-calc trigger condition.
+    pub trigger_values: Option<TriggerValues>,
 }
 
 /// Circular buffer state for pre/post-trigger capture.
@@ -220,7 +236,11 @@ impl CircularBuffer {
                 vars[3] = self.post_count as f64; // D
                 vars[4] = self.buffer.len() as f64; // E (currentImage)
                 vars[5] = if self.triggered { 1.0 } else { 0.0 }; // F
-                expression.evaluate_vars(&vars) != 0.0
+                let calc = expression.evaluate_vars(&vars);
+                // C posts TriggerAVal/BVal/CalcVal every evaluated frame
+                // (NDPluginCircularBuff.cpp:67-78), regardless of the outcome.
+                result.trigger_values = Some(TriggerValues { a, b, calc });
+                calc != 0.0
             }
         };
 
@@ -454,6 +474,19 @@ impl NDPluginProcess for CircularBuffProcessor {
         }
         if let Some(idx) = self.params.actual_trigger_count {
             updates.push(ParamUpdate::int32(idx, self.buffer.trigger_count() as i32));
+        }
+        // C posts the trigger calc inputs/result each evaluated frame
+        // (NDPluginCircularBuff.cpp:67-78).
+        if let Some(tv) = push_result.trigger_values {
+            if let Some(idx) = self.params.trigger_a_val {
+                updates.push(ParamUpdate::float64(idx, tv.a));
+            }
+            if let Some(idx) = self.params.trigger_b_val {
+                updates.push(ParamUpdate::float64(idx, tv.b));
+            }
+            if let Some(idx) = self.params.trigger_calc_val {
+                updates.push(ParamUpdate::float64(idx, tv.calc));
+            }
         }
 
         // Stream frames downstream as the C++ plugin does: pre-buffer frames
@@ -787,6 +820,57 @@ mod tests {
         assert_eq!(captured[0].unique_id, 1);
         assert_eq!(captured[1].unique_id, 2);
         assert_eq!(captured[2].unique_id, 3);
+    }
+
+    #[test]
+    fn test_calc_trigger_values_surface() {
+        // Regression for ADP-41: the Calc path must surface A, B, and the calc
+        // result so the processor can post TriggerAVal/BVal/CalcVal.
+        let expr = CalcExpression::parse("A+B").unwrap();
+        // post_count=3 so the triggering frame does not finish the sequence and
+        // frame 2 stays in the flushing branch.
+        let mut cb = CircularBuffer::new(
+            2,
+            3,
+            TriggerCondition::Calc {
+                attr_a: "attr_a".into(),
+                attr_b: "attr_b".into(),
+                expression: expr,
+            },
+        );
+
+        // Frame with A=3, B=4 → calc=7 (nonzero → triggers).
+        let r = cb.push(make_array_with_attrs(1, 3.0, 4.0));
+        let tv = r.trigger_values.expect("calc path surfaces trigger values");
+        assert_eq!(tv.a, 3.0);
+        assert_eq!(tv.b, 4.0);
+        assert_eq!(tv.calc, 7.0);
+
+        // Once triggered, the calc is not re-evaluated (C calculateTrigger is
+        // skipped while triggered), so no trigger values this frame.
+        let r2 = cb.push(make_array(2));
+        assert!(r2.trigger_values.is_none());
+    }
+
+    #[test]
+    fn test_calc_trigger_values_nan_when_attr_absent() {
+        // C posts NaN for a missing trigger attribute (triggerCalcArgs_ default
+        // epicsNAN); the calc of "A" with A absent is NaN.
+        let expr = CalcExpression::parse("A").unwrap();
+        let mut cb = CircularBuffer::new(
+            2,
+            1,
+            TriggerCondition::Calc {
+                attr_a: "missing_a".into(),
+                attr_b: "missing_b".into(),
+                expression: expr,
+            },
+        );
+        let r = cb.push(make_array(1));
+        let tv = r.trigger_values.expect("calc path surfaces trigger values");
+        assert!(tv.a.is_nan());
+        assert!(tv.b.is_nan());
+        assert!(tv.calc.is_nan());
     }
 
     #[test]

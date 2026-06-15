@@ -128,17 +128,21 @@ impl NDPluginProcess for AttributeProcessor {
             if ch.name.is_empty() {
                 continue;
             }
+            // C `continue`s on a missing or non-numeric attribute: no
+            // setDoubleParam, no ValSum accumulation, no callParamCallbacks(i)
+            // for that channel (NDPluginAttribute.cpp:72-80). Only post when the
+            // value was actually refreshed this frame.
             if let Some(val) = ch.extract_value(array) {
                 ch.value = val;
                 ch.value_sum += val;
+                let addr = i as i32;
+                updates.push(ParamUpdate::float64_addr(self.params.value, addr, ch.value));
+                updates.push(ParamUpdate::float64_addr(
+                    self.params.value_sum,
+                    addr,
+                    ch.value_sum,
+                ));
             }
-            let addr = i as i32;
-            updates.push(ParamUpdate::float64_addr(self.params.value, addr, ch.value));
-            updates.push(ParamUpdate::float64_addr(
-                self.params.value_sum,
-                addr,
-                ch.value_sum,
-            ));
         }
 
         // Send to time series
@@ -378,6 +382,35 @@ mod tests {
 
         proc.process_array(&arr, &pool);
         assert!((proc.value() - 7.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_missing_attribute_skips_post() {
+        // C `continue`s (no setDoubleParam / callParamCallbacks) for a channel
+        // whose attribute is absent this frame (NDPluginAttribute.cpp:72-80).
+        let mut proc = AttributeProcessor::new("Temp");
+        proc.params.value = 2;
+        proc.params.value_sum = 3;
+        let pool = NDArrayPool::new(1_000_000);
+
+        let r1 = proc.process_array(&make_array_with_attr("Temp", 5.0, 1), &pool);
+        assert!(
+            r1.param_updates
+                .iter()
+                .any(|u| matches!(u, ParamUpdate::Float64 { reason: 2, .. })),
+            "present attribute must post ATTR_VAL"
+        );
+
+        let bare = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        let r2 = proc.process_array(&bare, &pool);
+        assert!(
+            !r2.param_updates
+                .iter()
+                .any(|u| matches!(u, ParamUpdate::Float64 { reason: 2, .. })),
+            "missing attribute must not re-post stale ATTR_VAL"
+        );
+        // C retains the last successfully-read Val across the missing frame.
+        assert!((proc.value() - 5.0).abs() < 1e-10);
     }
 
     #[test]

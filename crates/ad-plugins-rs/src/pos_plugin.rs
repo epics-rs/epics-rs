@@ -221,6 +221,20 @@ impl PosPluginProcessor {
             PosMode::Keep => self.index as i32,
         }
     }
+
+    /// C exhaustion path: positions ran out, so set `NDPos_Running = IDLE` and
+    /// emit no downstream callback for this frame (NDPosPlugin.cpp:56-59,
+    /// 107-122,197-204).
+    fn exhausted_result(&mut self) -> ProcessResult {
+        self.running = false;
+        let mut updates = Vec::new();
+        push_int(&mut updates, self.params.running, 0);
+        ProcessResult {
+            output_arrays: vec![],
+            param_updates: updates,
+            scatter_index: None,
+        }
+    }
 }
 
 /// Push an `Int32` param update only when the param index is resolved.
@@ -424,13 +438,11 @@ impl NDPluginProcess for PosPluginProcessor {
             return ProcessResult::empty();
         }
 
-        let has_positions = match self.mode {
-            PosMode::Discard => !self.positions.is_empty(),
-            PosMode::Keep => !self.all_positions.is_empty(),
-        };
-
-        if !has_positions {
-            return ProcessResult::arrays(vec![Arc::new(array.clone())]);
+        // C checks `index >= size` up front and, when the list is already
+        // exhausted, sets Running=IDLE and emits nothing (NDPosPlugin.cpp:56-59,
+        // 197-200).
+        if !self.has_position() {
+            return self.exhausted_result();
         }
 
         // Frame ID tracking. C compares against ExpectedID = IDStart from the
@@ -448,7 +460,9 @@ impl NDPluginProcess for PosPluginProcessor {
                 self.missing_frames += 1;
             }
             if !self.has_position() {
-                return ProcessResult::arrays(vec![Arc::new(array.clone())]);
+                // Positions exhausted mid-gap: C stops and drops the frame
+                // (NDPosPlugin.cpp:107-110,119-122).
+                return self.exhausted_result();
             }
         } else if uid < self.expected_id {
             self.duplicate_frames += 1;
@@ -467,10 +481,8 @@ impl NDPluginProcess for PosPluginProcessor {
             };
         }
 
-        let position = match self.current_position() {
-            Some(pos) => pos.clone(),
-            None => return ProcessResult::arrays(vec![Arc::new(array.clone())]),
-        };
+        // Guaranteed `Some` here: has_position() was rechecked above.
+        let position = self.current_position().unwrap().clone();
 
         let mut out = array.clone();
         // C iterates the position std::map (sorted ascending by key), building
@@ -787,10 +799,41 @@ mod tests {
             .unwrap();
         assert!((x - 20.0).abs() < 1e-10);
 
-        // Stops at end of list (no wrapping)
+        // Stops at end of list (no wrapping): the exhausted frame is dropped and
+        // the plugin goes idle (ADP-38).
         let result = proc.process_array(&make_array(3), &pool);
-        assert_eq!(result.output_arrays.len(), 1);
-        assert!(result.output_arrays[0].attributes.get("X").is_none());
+        assert!(result.output_arrays.is_empty());
+        assert!(!proc.running);
+    }
+
+    #[test]
+    fn test_exhaustion_stops_and_drops() {
+        // ADP-38: when positions run out, C sets Running=IDLE and emits no
+        // downstream callback (no bare frame forwarded).
+        let mut proc = PosPluginProcessor::new(PosMode::Discard);
+        proc.params.running = Some(5);
+        let mut p1 = HashMap::new();
+        p1.insert("x".into(), 1.0);
+        proc.load_positions(vec![p1]);
+        proc.start();
+
+        let pool = NDArrayPool::new(1_000_000);
+        // Frame 1 consumes the only position.
+        let r1 = proc.process_array(&make_array(1), &pool);
+        assert_eq!(r1.output_arrays.len(), 1);
+        // Frame 2 finds no positions: dropped, Running posted IDLE, plugin idle.
+        let r2 = proc.process_array(&make_array(2), &pool);
+        assert!(r2.output_arrays.is_empty());
+        assert!(!proc.running);
+        use ad_core_rs::plugin::runtime::ParamUpdate;
+        assert!(r2.param_updates.iter().any(|u| matches!(
+            u,
+            ParamUpdate::Int32 {
+                reason: 5,
+                value: 0,
+                ..
+            }
+        )));
     }
 
     #[test]

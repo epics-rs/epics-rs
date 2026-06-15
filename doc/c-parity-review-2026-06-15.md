@@ -124,6 +124,7 @@ population). One commit per finding.
 | ADP-19 (ROI single-color selection collapses to 2-D Mono) | fix | Fixed | c87ac8c3 |
 | ADP-23 (transform layout: array attr vs NDColorMode param) | verify→N/A | Not applicable (C refreshes the param from the array ColorMode attr each frame before use; same Mono default — equivalent, mismatch unreachable) | — |
 | ADP-27 (netCDF global-attr set: add NDNetCDFFileVersion=3.1; drop extra uniqueId/numArrays) | fix | Fixed | dbe09fd4 |
+| ADP-28 (TIFF RGB2/RGB3 PlanarConfig=SEPARATE vs Rust chunky-RGB1) | fix→signoff | Signoff — decoded-image-equivalent; byte-faithful planar needs hand-rolled writer (tiff crate is chunky-only); routed to #58 | — |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -405,11 +406,19 @@ C: `NDFileNetCDF.cpp:96-101` writes NDNetCDFFileVersion=3.1; uniqueId/numArrays 
 Impact: a version-gating reader fails; Rust files carry two extra globals.
 Fix: added the `NDNetCDFFileVersion` NC_DOUBLE=3.1 global (C :99, NDFileNetCDF.h:19) and removed the extra `uniqueId` (a per-frame variable, C :183) and `numArrays` (the unlimited dimension, C :119) globals. Regression `test_global_attrs_match_c_set` asserts the version double is present and the two extras are absent while uniqueId remains a variable.
 
-#### ADP-28: TIFF RGB2/RGB3 written chunky (no PlanarConfig); C writes PlanarConfig=2 separate planes
-Severity: Medium — fix
+#### ADP-28: TIFF RGB2/RGB3 written chunky (no PlanarConfig); C writes PlanarConfig=2 separate planes — SIGNOFF (routed to #58)
+Severity: Medium — fix→signoff
 Rust: `crates/ad-plugins-rs/src/file_tiff.rs:115-135,243-313` converts to interleaved RGB1, never writes PlanarConfiguration.
 C: `NDFileTIFF.cpp:204-219,390-405` PLANARCONFIG_SEPARATE + planar strips.
 Impact: a reader branching on PlanarConfiguration sees 2 (C) vs 1/absent (Rust).
+
+Analysis (decoded-equivalent vs byte-faithful fork):
+- C color-mode → tag map (NDFileTIFF.cpp:180-219): ndims 1/2 → Mono, CONTIG; ndims 3 + dims[0]==3 + RGB1 → samplesPerPixel=3, **PLANARCONFIG_CONTIG** (chunky); dims[1]==3 + RGB2 → rowsPerStrip=1, **PLANARCONFIG_SEPARATE**; dims[2]==3 + RGB3 → **PLANARCONFIG_SEPARATE**. writeFile (:385-405) writes RGB1 as one chunky strip; RGB2 as per-row red/green/blue strips into separate planes; RGB3 as three whole-plane strips.
+- Rust (file_tiff.rs:115-135) normalizes **all** 3-D color to interleaved RGB1 via `convert_rgb_layout(...→RGB1)`, then writes through the `tiff` crate's high-level `ImageEncoder`, which is chunky-only and **omits** `Tag::PlanarConfiguration` (tiff-0.9.1 encoder/mod.rs:373-390 writes width/length/bits/sampleformat/photometric/rowsperstrip/samplesperpixel — no PlanarConfiguration). An absent tag defaults to 1=Chunky per the TIFF spec.
+- Decoded result: identical. Both files are valid RGB TIFFs of the same dimensions and pixel values; a standards-compliant reader (libtiff/PIL/the `tiff` crate) yields the same image from CONTIG or SEPARATE. For RGB1 input the two writers agree exactly (both chunky; C's explicit PlanarConfiguration=1 == Rust's absent-defaults-to-1). The only divergence is RGB2/RGB3: C tags PlanarConfiguration=2 and lays the bytes out per-plane; Rust re-interleaves to chunky and omits the tag.
+- Fix cost: the `tiff` 0.9.1 `ImageEncoder` has no separate-plane mode — its strip offset/bytecount bookkeeping assumes chunky sample interleave. Emitting a true PLANARCONFIG_SEPARATE file means dropping to `DirectoryEncoder` and hand-writing the IFD + per-plane StripOffsets/StripByteCounts arrays across all 10 data types (i8…f64), duplicating the crate's tested strip logic, for zero decoded-image difference.
+
+Recommendation: keep the chunky-RGB1 normalization (decoded-equivalent; chunky RGB is the universally-supported TIFF layout). Surface for sign-off because the parity contract names "file-format bytes/tags": if byte-faithful PLANARCONFIG_SEPARATE output is required (e.g. round-tripping through a C areaDetector reader that inspects PlanarConfiguration), the hand-rolled planar writer above is the work. No source change this round; routed to #58.
 
 #### ADP-29: Blosc codec params (level/shuffle/compressor) dropped from stored metadata; default clevel 3 vs 5 — FIXED e92d42be
 Severity: Low — fix-low
@@ -737,6 +746,7 @@ Cluster summary:
 
 Disposition tally (pre-fix): ~46 **fix**, ~7 **fix-low**, ~10 **signoff**,
 ~9 **verify** (incl. the 6 table-record T-candidates and the unwired ad-core
-library paths). Signoff items: ADC-7, ADC-10/ADP-26 (codec vocab), SCAL-4,
+library paths). Signoff items: ADC-7, ADC-10/ADP-26 (codec vocab), ADP-1
+(stats centroid precision fork), ADP-28 (TIFF planar config), SCAL-4,
 SCAL-5, STD-7, STD-8, OPT-3, MQTT-3, PROC-3, MODB-1/2/3 — surfaced for the
 user rather than silently changed.

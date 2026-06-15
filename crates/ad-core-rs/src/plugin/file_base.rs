@@ -235,10 +235,16 @@ impl NDPluginFileBase {
         if !self.delete_driver_file {
             return;
         }
-        if let Some(attr) = array.attributes.get("DriverFileName") {
-            let driver_file = attr.value.as_string();
+        // C reads DriverFileName via `getValue(NDAttrString, …)` and only
+        // deletes on `asynSuccess`; a numeric attribute returns `ND_ERROR`, so
+        // no file is removed (the decimal rendering is never used as a path).
+        if let Some(driver_file) = array
+            .attributes
+            .get("DriverFileName")
+            .and_then(|attr| attr.value.as_string_typed())
+        {
             if !driver_file.is_empty() {
-                let _ = std::fs::remove_file(&driver_file);
+                let _ = std::fs::remove_file(driver_file);
             }
         }
     }

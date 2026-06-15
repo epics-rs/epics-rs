@@ -198,9 +198,15 @@ impl<W: NDFileWriter> FilePluginController<W> {
     /// If the attribute is set and is neither "all" nor this plugin's port
     /// name, the frame is not for this plugin.
     fn destination_matches(&self, array: &NDArray) -> bool {
-        match array.attributes.get("FilePluginDestination") {
-            Some(attr) => {
-                let dest = attr.value.as_string();
+        match array
+            .attributes
+            .get("FilePluginDestination")
+            .and_then(|attr| attr.value.as_string_typed())
+        {
+            // C `getValueInfo` only runs the compare when the attribute is
+            // string-typed; a numeric attribute is read as `ND_ERROR` and the
+            // frame is processed (treated as "no destination set").
+            Some(dest) => {
                 if dest.len() <= 1 {
                     return true;
                 }
@@ -240,19 +246,23 @@ impl<W: NDFileWriter> FilePluginController<W> {
         updates: &mut Vec<ParamUpdate>,
     ) -> bool {
         let mut reopen = false;
-        if let Some(attr) = array.attributes.get("FilePluginFileName") {
-            let name = attr.value.as_string();
-            if !name.is_empty() {
-                if name != self.file_base.file_name {
-                    self.file_base.file_name = name.clone();
-                    reopen = true;
-                    if let Some(idx) = self.params.file_name {
-                        updates.push(ParamUpdate::Octet {
-                            reason: idx,
-                            addr: 0,
-                            value: name,
-                        });
-                    }
+        // C `attrFileNameSet` guards on `attrDataType == NDAttrString` before
+        // touching NDFileName; a numeric FilePluginFileName attribute is ignored
+        // (the filename is not redefined to its decimal rendering).
+        if let Some(name) = array
+            .attributes
+            .get("FilePluginFileName")
+            .and_then(|attr| attr.value.as_string_typed())
+        {
+            if !name.is_empty() && name != self.file_base.file_name {
+                self.file_base.file_name = name.to_string();
+                reopen = true;
+                if let Some(idx) = self.params.file_name {
+                    updates.push(ParamUpdate::Octet {
+                        reason: idx,
+                        addr: 0,
+                        value: name.to_string(),
+                    });
                 }
             }
         }
@@ -811,6 +821,52 @@ mod tests {
         // Destination = "all" → written.
         c.process_array(&with_str_attr(array(3), "FilePluginDestination", "all"));
         assert_eq!(c.writer.writes, 2);
+    }
+
+    #[test]
+    fn test_g9_numeric_destination_attr_processed_not_stringified() {
+        // ADC-11 parity: C `attrIsProcessingRequired` only compares a
+        // *string-typed* FilePluginDestination (getValueInfo guard); a numeric
+        // attribute reads as ND_ERROR and the frame is processed. The Rust port
+        // must not stringify the numeric (42 -> "42") and then skip the frame.
+        let mut c = FilePluginController::new(MockWriter::new(true));
+        c.set_port_name("MYFILE");
+        c.file_base.set_mode(NDFileMode::Single);
+        c.auto_save = true;
+
+        c.process_array(&with_i32_attr(array(1), "FilePluginDestination", 42));
+        assert_eq!(
+            c.writer.writes, 1,
+            "numeric FilePluginDestination must be ignored (frame processed), \
+             not stringified to \"42\" and skipped"
+        );
+    }
+
+    #[test]
+    fn test_g9_numeric_filename_attr_ignored() {
+        // ADC-11 parity: C `attrFileNameSet` only adopts a string-typed
+        // FilePluginFileName; a numeric attribute leaves NDFileName unchanged
+        // and forces no reopen.
+        let mut c = FilePluginController::new(MockWriter::new(true));
+        c.set_port_name("F");
+        let before = c.file_base.file_name.clone();
+        let mut updates = Vec::new();
+        let reopen = c.apply_filename_attributes(
+            &with_i32_attr(array(1), "FilePluginFileName", 7),
+            &mut updates,
+        );
+        assert!(
+            !reopen,
+            "numeric FilePluginFileName must not force a reopen"
+        );
+        assert_eq!(
+            c.file_base.file_name, before,
+            "numeric FilePluginFileName must not redefine the filename"
+        );
+        assert!(
+            updates.is_empty(),
+            "numeric FilePluginFileName must not post a FileName param update"
+        );
     }
 
     #[test]

@@ -141,6 +141,20 @@ impl NDAttrValue {
             Self::Undefined => String::new(),
         }
     }
+
+    /// String value of a *string-typed* attribute, mirroring C++
+    /// `NDAttribute::getValue(NDAttrString, …)` which returns `ND_ERROR`
+    /// (leaving the caller's buffer unchanged) for any non-string attribute.
+    /// Unlike [`as_string`], a numeric attribute yields `None` rather than its
+    /// decimal rendering, so callers that drive control behaviour off a
+    /// string-typed attribute (filename, file number, destination port) ignore
+    /// a mis-typed numeric attribute exactly as the C reader does.
+    pub fn as_string_typed(&self) -> Option<&str> {
+        match self {
+            Self::String(v) => Some(v.as_str()),
+            _ => None,
+        }
+    }
 }
 
 /// A live source backing an [`NDAttribute`].

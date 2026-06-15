@@ -77,6 +77,13 @@ population). One commit per finding.
 | OPT-15a/b (Io out-of-range channel + zero-ticks ionAbs) | fix-low | Fixed | 67fa074b |
 | OPT-15c (Io 6-sig-fig absorption coefficients) | fix-low | Fixed | 01d9fc5d |
 | OPT-13 (Io init force-writes 19 default PVs) | verify→fork | OPEN — needs user call | — |
+| OPT-T1 (table YANG put rotates user offsets) | verify→fix | Fixed | 7b443c58 |
+| OPT-T2 (table restores speed on every speed-capable motor) | verify→fix | Fixed | d7318d2d |
+| OPT-T3 (table zeroes motor limits on read failure) | verify→fix | Fixed | 9dc07384 |
+| OPT-T4 (Newport user limits use raw-angle rotation matrix) | verify→fix | Fixed | c82703ec |
+| OPT-T5 (table sqrt/asin domain clamps vs C bare NaN/Inf) | verify→signoff | OPEN — needs user call | — |
+| OPT-T6 (table speed-ratio NaN guard vs C 0/0 poison) | verify→signoff | OPEN — needs user call | — |
+| OPT-3 (orient invertArray x/det vs x*(1/det) de-precision) | signoff | OPEN — needs user call | — |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -534,6 +541,14 @@ Impact: `{H}invTrans{B}` carries +inf in Rust vs stale prior in C for a fully-ab
 #### OPT-T1..T6 (table record): six candidates NOT independently verified
 Severity: unknown — verify
 The table sub-agent flagged: T-1 YANG offset rotation, T-2 speed-restore mask gate, T-3 limit-read-failure zeroing, T-4 Newport limit matrix frame, T-5 sqrt/asin clamps, T-6 speed-ratio NaN guard, in `crates/optics-rs/src/records/table.rs` vs `tableRecord.c`. Confirm at file:line on both sides before any fix.
+
+Verified 2026-06-15 (all six confirmed REAL output-form divergences, each line-checked on both sides):
+- **T-1 Fixed 7b443c58** — C special() (tableRecord.c:626-633) rotates ax0 by (old-new) yaw; Rust dropped it. Now tracks curr_yang and applies the two-pass RotY.
+- **T-2 Fixed d7318d2d** — C RestoreMotorSpeeds (tableRecord.c:998-1006, called unconditionally) restores saved speed on every can_RW_speed motor; Rust gated on motor_move_mask. Mask gate dropped.
+- **T-3 Fixed 9dc07384** — C GetMotorLimits (tableRecord.c:1024-1031) zeroes h0x/l0x on read failure; Rust kept the stale value. Pre-zero in pre_process_actions; reads overwrite on success.
+- **T-4 Fixed c82703ec** — C NaiveMotorToPivotPointVector (tableRecord.c:1281) rebuilds the Newport matrix from raw ax for the translation-limit norm; Rust reused the offset+yaw matrix. Rebuild from raw ax for Newport.
+- **T-5 OPEN (signoff)** — C does bare sqrt()/asin()/cos-division (tableRecord.c:1327,1333,1435-1438,...) producing NaN/±Inf at AY≈90° / asin round-off past ±1; Rust clamps to a finite value (Rust is the more-correct side; equivalent across the normal operating range, divergent only at the singular boundary). Matching C means reproducing its boundary NaN/Inf; keeping the clamp corrects a latent C round-off defect. Genuine fork — needs user sign-off (cf. OPT-12 matched C's NaN, but MODB-1/2/3 kept Rust's correction of a latent C defect).
+- **T-6 OPEN (signoff)** — C computes speed_ratio = MIN(speed_ratio, sv0x[i]/v0x[i]) for every can_RW_speed motor with no guard (tableRecord.c:556-566); a stationary zero-saved-speed motor gives 0/0 = NaN, MIN(real,NaN)=NaN poisons speed_ratio so C skips the `<1` down-scaling and writes un-scaled speeds. Rust guards `v[i] > 0.0` and scales correctly. Same Rust-is-more-correct fork as T-5 — needs user sign-off.
 
 Precision note (not a fixable finding): C `orient.c:15` `M_PI 3.14159265359` and kohzu/ml_mono `radConv 57.2958` are lower-precision than Rust's `std::f64::consts::PI`; Rust is *more* accurate. ~1e-6 relative on published angles. Surfaced, not "fixed" by de-precisioning.
 Verified-equivalent (optics): matrix3 ops, orient per-constraint math, table forward/inverse geometry (4 geometries incl. 5-motor Newport), xia_slit/xiahsc/hsc raw↔dial, chantler table (22 species digit-for-digit), filter_drive/hr_ctl math, db_access re-export.

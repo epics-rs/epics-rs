@@ -397,7 +397,10 @@ fn parse_tag_attributes(content: &str) -> HashMap<String, String> {
 impl NDPluginProcess for PosPluginProcessor {
     fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
         if !self.running {
-            return ProcessResult::arrays(vec![Arc::new(array.clone())]);
+            // C only reaches endProcessCallbacks inside `if (running ==
+            // NDPOS_RUNNING)` (NDPosPlugin.cpp:54,202); an idle plugin emits no
+            // downstream callback, it does not pass the frame through.
+            return ProcessResult::empty();
         }
 
         let has_positions = match self.mode {
@@ -819,12 +822,13 @@ mod tests {
     }
 
     #[test]
-    fn test_not_running_passthrough() {
+    fn test_idle_drops_frame() {
+        // ADP-35: when idle (not running) C emits no downstream callback; the
+        // frame is dropped, not passed through.
         let mut proc = PosPluginProcessor::new(PosMode::Discard);
         let pool = NDArrayPool::new(1_000_000);
         let result = proc.process_array(&make_array(1), &pool);
-        assert_eq!(result.output_arrays.len(), 1);
-        assert!(result.output_arrays[0].attributes.get("X").is_none());
+        assert!(result.output_arrays.is_empty());
     }
 
     #[test]

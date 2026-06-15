@@ -1064,7 +1064,7 @@ C: `NDFileHDF5LayoutXML.cpp:55` default `<dataset name="ColorMode" source="ndatt
 Impact: C writes `ColorMode` at `/entry/instrument/detector/NDAttributes/ColorMode` (the XML-pinned path) and any user `<dataset source="ndattribute">` at its declared path/name; Rust ignores this placement and writes every attribute under the single ndattr group keyed by raw name. Different on-disk dataset paths.
 
 #### ADP-64: NDAttribute datasets omit the four NDAttr* self-describing HDF5 attributes
-Severity: Medium — fix
+Severity: Medium — fix — **FIXED 03f4aaac** (`AttributeDataset` now derives `description`/`source`/`source_type` from the `NDAttribute`; `write_ndattr_descriptors` attaches `NDAttrName`/`NDAttrDescription`/`NDAttrSourceType`/`NDAttrSource` as scalar string attrs, each skipped when empty, mirroring C's per-name non-empty `writeStringAttribute`. Datatype is the port's `VarLenUnicode` scalar-string convention rather than C's fixed-length NULLTERM `H5T_C_S1`; that vlen-vs-fixed divergence is a port-wide string-attr concern, not this finding's cited defect)
 Rust: `flush_attribute_datasets` (`file_hdf5.rs:1471-1551`) creates each attribute dataset with no attached HDF5 attributes.
 C: `NDFileHDF5.cpp:2715` `attrNames[] = {"NDAttrName","NDAttrDescription","NDAttrSourceType","NDAttrSource"}`; values at 2785-2788; written (each only when non-empty) via `writeStringAttribute` (3019-3040) as scalar NULLTERM C strings.
 Impact: C attaches up to four string HDF5 attributes to every NDAttribute dataset; Rust writes none, so a reader sees no source/description metadata.
@@ -1106,7 +1106,7 @@ C: `typeNd2Hdf` (`NDFileHDF5.cpp:3484-3524`) and `typeAsHdf` (`NDFileHDF5Attribu
 Impact: On a little-endian host (the common case) identical. They diverge only on a big-endian host: C records BE, Rust still records LE (byte-swapping data to match). On-disk identical on LE hardware; signoff since BE EPICS IOCs are vanishingly rare and the Rust behaviour is arguably more portable.
 
 #### ADP-71: Detector dataset omits C's NDArrayNumDims/DimOffset/DimBinning/DimReverse + signal attributes
-Severity: Medium — fix
+Severity: Medium — fix — **PARTIALLY FIXED 9ef09199** (`create_primary_dataset` now writes `NDArrayNumDims` (scalar int32, always) and `NDArrayDimOffset`/`NDArrayDimBinning`/`NDArrayDimReverse` (scalar int32) for the 1-D case, native dim order. **UNFIXED, blocked:** for `ndims>1` C writes the three `Dim*` as 1-D int32 *arrays* of length ndims; rust-hdf5 0.2.17's `AttrBuilder` is scalar-only (`shape()` ignores its arg, "we only support scalar attributes") so the multi-dim array case cannot be emitted in source. **Deferred to ADP-61/62/63:** the default-layout `signal=1` attr is part of the NeXus default-layout feature, not this finding)
 Rust: `create_primary_dataset` attaches only `NDArrayDataType`, `HDF5_fillValue`, `HDF5_nRowChunks/nColChunks/nFramesChunks/nExtraDims`, `HDF5_extraDimSize*/Name*` (`file_hdf5.rs:1272-1316`) plus layout constant attrs.
 C: `writeDefaultDatasetAttributes` (`NDFileHDF5.cpp:3684-3739`) attaches `NDArrayNumDims`, `NDArrayDimOffset`, `NDArrayDimBinning`, `NDArrayDimReverse` (int32, comma-source, OnFileOpen) to every detector dataset; the default layout adds `signal=1` (`NDFileHDF5LayoutXML.cpp:51`).
 Impact: A C-written detector dataset carries five extra HDF5 attributes the Rust port never writes; conversely Rust writes a set of `HDF5_*`/`NDArrayDataType` attrs C does not. The attribute name/value sets a reader observes are disjoint except by accident.
@@ -1142,7 +1142,7 @@ C: `NDFileHDF5.cpp:3882` `H5Pset_fill_value(cparms, datatype, ptrFillValue)` unc
 Impact: None — both always set a fill value defaulting to 0 cast to the dataset type. Parity-clean. (The extra `HDF5_fillValue` float64 attr Rust writes is covered under ADP-71.)
 
 #### ADP-77: NDAttribute string dataset stored as `[n,256]` byte array; C stores `[n]` of a fixed 256-byte H5T_C_S1 string
-Severity: Medium — fix
+Severity: Medium — fix — **FIXED 05bc160d** (`FixedStr256` newtype implements `rust_hdf5::types::H5Type` emitting `DatatypeMessage::fixed_string(256)` = `H5Tcopy(H5T_C_S1)`+`H5Tset_size(256)`, NULLTERM/ASCII; string dataset now `new_dataset::<FixedStr256>().shape([n]).chunk([chunk]).max_shape([None])` — rank-1 fixed-length string, matching C)
 Rust: string attribute dataset `new_dataset::<u8>().shape([n, es]).chunk([chunk, es])` with `es=256` (`file_hdf5.rs:1532-1547`) — a 2-D uint8 array.
 C: `NDFileHDF5AttributeDataset.cpp:321-323` `datatype_ = H5Tcopy(H5T_C_S1); H5Tset_size(256)` with rank 1 (`configureDims` rank_=1, `:234,257`) — a 1-D dataset of a fixed-length string type.
 Impact: For a string-valued NDAttribute, C writes a 1-D `[nframes]` dataset of 256-byte fixed-length C strings; Rust writes a 2-D `[nframes,256]` `H5T_STD_U8LE` array. Different rank, different element datatype (string vs uint8). HDF5 string tooling will not recognise the Rust version as strings.

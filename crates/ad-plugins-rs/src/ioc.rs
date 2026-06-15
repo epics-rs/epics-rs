@@ -583,7 +583,10 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 let pool = drv.pool();
 
                 // C++ NDPvaConfigure args[5] is pvName (6th argument).
-                // If not provided, fall back to "{portName}:Image".
+                // If not provided, fall back to "{portName}:Image". Only the
+                // `pva`-feature processor consumes it, so gate the binding to
+                // avoid an unused-variable warning when `ioc` is built without `pva`.
+                #[cfg(feature = "pva")]
                 let pva_pv_name = match args.get(5) {
                     Some(ArgValue::String(s)) if !s.is_empty() => s.clone(),
                     _ => format!("{port_name}:Image"),

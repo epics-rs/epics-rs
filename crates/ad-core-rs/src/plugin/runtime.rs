@@ -422,6 +422,13 @@ struct SharedProcessorInner<P: NDPluginProcess> {
     array_counter: i32,
     /// Param index for STD_ARRAY_DATA (if this is a StdArrays plugin).
     std_array_data_param: Option<usize>,
+    /// NDArrayCallbacks (C++ `NDArrayCallbacks`): when `false`, the plugin
+    /// still processes and updates its metadata params but does NOT deliver the
+    /// output array downstream — `endProcessCallbacks` (NDPluginDriver.cpp:
+    /// 257-265) returns before the sort/throttle/`doCallbacksGenericPointer`
+    /// path. Distinct from `enabled` (`EnableCallbacks`), which gates whether
+    /// the plugin processes the input at all.
+    array_callbacks: bool,
     /// MinCallbackTime throttling: minimum seconds between process calls.
     min_callback_time: f64,
     /// Last time process_and_publish was called (for throttling).
@@ -554,13 +561,24 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         self.last_process_time = Some(t0);
 
-        let ready = self.route_output_arrays(result.output_arrays);
+        // C++ endProcessCallbacks (NDPluginDriver.cpp:257-265): when
+        // NDArrayCallbacks==0 the method caches the array and returns BEFORE the
+        // throttle / sort-admission / `doCallbacksGenericPointer` path. So a
+        // non-delivering frame must not enter the MaxByteRate throttle or the
+        // sort buffer — only the metadata params (beginProcessCallbacks) are
+        // published. Route (throttle + sort) only when delivering.
+        let ready = if self.array_callbacks {
+            self.route_output_arrays(result.output_arrays)
+        } else {
+            Vec::new()
+        };
         let mut output = self.build_publish_batch(
             ready,
             result.param_updates,
             result.scatter_index,
             Some(array.as_ref()),
             elapsed_ms,
+            self.array_callbacks,
         );
         output.batch.merge(self.build_status_params_batch());
         Some(output)
@@ -600,7 +618,11 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
         let mut all_arrays = Vec::new();
         let mut combined = ParamBatch::empty();
         for (_unique_id, arrays) in entries {
-            let output = self.build_publish_batch(arrays, vec![], None, None, 0.0);
+            // Sort-buffer entries were admitted only while NDArrayCallbacks was
+            // on (route_output_arrays runs past the delivery gate); the C++
+            // sort thread delivers them regardless of the *current* flag, so
+            // they always deliver here.
+            let output = self.build_publish_batch(arrays, vec![], None, None, 0.0, true);
             all_arrays.extend(output.arrays);
             combined.merge(output.batch);
         }
@@ -655,6 +677,12 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
     /// Build a ProcessOutput: fires direct interrupts (sync) and collects
     /// param updates into a batch. Does NOT publish arrays — the caller
     /// must publish them in async context.
+    ///
+    /// `deliver` is the NDArrayCallbacks gate (C++ `endProcessCallbacks`,
+    /// NDPluginDriver.cpp:257-265): when `false`, the downstream array
+    /// delivery — the STD_ARRAY_DATA generic-pointer interrupt and the returned
+    /// `ProcessOutput.arrays` — is suppressed, while the metadata params from
+    /// `beginProcessCallbacks` (counter, dims, datatype, …) are still set.
     fn build_publish_batch(
         &mut self,
         output_arrays: Vec<Arc<NDArray>>,
@@ -662,6 +690,7 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
         scatter_index: Option<usize>,
         fallback_array: Option<&NDArray>,
         elapsed_ms: f64,
+        deliver: bool,
     ) -> ProcessOutput {
         use asyn_rs::request::ParamSetValue;
 
@@ -672,8 +701,11 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
         if let Some(report_arr) = output_arrays.first().map(|a| a.as_ref()).or(fallback_array) {
             self.array_counter += 1;
 
-            // Fire array data interrupt directly (C EPICS pattern).
-            if let Some(param) = self.std_array_data_param {
+            // Fire array data interrupt directly (C EPICS pattern). Gated by
+            // `deliver` (NDArrayCallbacks) — C++ `doCallbacksGenericPointer`
+            // runs only past the `endProcessCallbacks` NDArrayCallbacks==0
+            // early-return (NDPluginDriver.cpp:258-265).
+            if let (true, Some(param)) = (deliver, self.std_array_data_param) {
                 use crate::ndarray::NDDataBuffer;
                 use asyn_rs::param::ParamValue;
                 let value = match &report_arr.data {
@@ -908,7 +940,10 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
         }
 
         ProcessOutput {
-            arrays: output_arrays,
+            // NDArrayCallbacks==0 suppresses downstream delivery (C++
+            // endProcessCallbacks early-return); the metadata params above are
+            // still published.
+            arrays: if deliver { output_arrays } else { Vec::new() },
             scatter_index,
             batch: ParamBatch { addr0, extra },
         }
@@ -1491,6 +1526,8 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
         port_handle,
         array_counter: 0,
         std_array_data_param,
+        // C++ default NDArrayCallbacks = 1 (deliver downstream).
+        array_callbacks: true,
         min_callback_time: 0.0,
         last_process_time: None,
         sort_mode: 0,
@@ -1617,6 +1654,7 @@ fn plugin_data_loop<P: NDPluginProcess>(
     let max_byte_rate_reason = plugin_params.max_byte_rate;
     let num_threads_reason = plugin_params.num_threads;
     let max_threads_reason = plugin_params.max_threads;
+    let array_callbacks_reason = shared.lock().ndarray_params.array_callbacks;
     // G6: the upstream connection is keyed by (port, addr). `current_upstream`
     // is the base port name; `current_addr` is the selected NDArrayAddr; the
     // effective WiringRegistry key is computed by `upstream_key`.
@@ -1709,6 +1747,13 @@ fn plugin_data_loop<P: NDPluginProcess>(
                             }
                             if reason == blocking_callbacks_reason {
                                 blocking_mode.store(value.as_i32() != 0, Ordering::Release);
+                            }
+                            // NDArrayCallbacks gates downstream array delivery
+                            // (C++ endProcessCallbacks NDPluginDriver.cpp:
+                            // 257-265). Processing still runs; only delivery is
+                            // suppressed when 0.
+                            if reason == array_callbacks_reason {
+                                shared.lock().array_callbacks = value.as_i32() != 0;
                             }
                             // Handle MinCallbackTime param change
                             if reason == min_callback_time_reason {
@@ -1896,7 +1941,8 @@ fn plugin_data_loop<P: NDPluginProcess>(
                                 let result = guard.processor.on_param_change(reason, &snapshot);
                                 let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
                                 let output = if !result.output_arrays.is_empty() || !result.param_updates.is_empty() {
-                                    Some(guard.build_publish_batch(result.output_arrays, result.param_updates, None, None, elapsed_ms))
+                                    let deliver = guard.array_callbacks;
+                                    Some(guard.build_publish_batch(result.output_arrays, result.param_updates, None, None, elapsed_ms, deliver))
                                 } else {
                                     None
                                 };
@@ -2000,6 +2046,8 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
         port_handle,
         array_counter: 0,
         std_array_data_param,
+        // C++ default NDArrayCallbacks = 1 (deliver downstream).
+        array_callbacks: true,
         min_callback_time: 0.0,
         last_process_time: None,
         sort_mode: 0,
@@ -2743,6 +2791,67 @@ mod tests {
             0,
             "a MinCallbackTime-throttled frame must NOT increment DroppedArrays"
         );
+    }
+
+    #[test]
+    fn test_array_callbacks_zero_withholds_downstream_delivery() {
+        // ADC-2: NDArrayCallbacks==0 stops downstream NDArray delivery while
+        // the plugin still processes and updates its metadata params — C++
+        // endProcessCallbacks (NDPluginDriver.cpp:257-265) caches the array and
+        // returns before doCallbacksGenericPointer. Distinct from
+        // EnableCallbacks, which gates whether the plugin processes at all.
+        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWNSTREAM", 10);
+        let mut output = NDArrayOutput::new();
+        output.add(downstream_sender);
+
+        let (handle, _data_jh) = create_plugin_runtime_with_output(
+            "ARRAY_CB_TEST",
+            PassthroughProcessor,
+            pool,
+            10,
+            output,
+            "",
+            test_wiring(),
+        );
+        enable_callbacks(&handle);
+        let port = handle.port_runtime().port_handle().clone();
+
+        // Disable downstream array callbacks.
+        port.write_int32_blocking(handle.ndarray_params.array_callbacks, 0, 0)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        send_array(handle.array_sender(), make_test_array(1));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // No downstream delivery.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let got = rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(50), downstream_rx.recv()).await
+        });
+        assert!(
+            got.is_err(),
+            "NDArrayCallbacks=0 must withhold downstream delivery"
+        );
+        // But the plugin still processed: ArrayCounter advanced.
+        assert_eq!(
+            port.read_int32_blocking(handle.ndarray_params.array_counter, 0)
+                .unwrap(),
+            1,
+            "processing (and metadata params) must continue while delivery is off"
+        );
+
+        // Re-enable: the next array IS delivered downstream.
+        port.write_int32_blocking(handle.ndarray_params.array_callbacks, 0, 1)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        send_array(handle.array_sender(), make_test_array(2));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(downstream_rx.blocking_recv().unwrap().unique_id, 2);
     }
 
     #[test]

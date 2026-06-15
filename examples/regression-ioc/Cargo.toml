@@ -1,0 +1,21 @@
+[package]
+name = "regression-ioc"
+version.workspace = true
+edition.workspace = true
+description = "In-process regression IOC: pins recurring bug-fix behaviors (v0.15.x–v0.20.x) under real CA+PVA servers"
+publish = false
+
+[dependencies]
+epics-base-rs = { workspace = true }
+epics-ca-rs = { workspace = true }
+epics-pva-rs = { workspace = true }
+motor-rs = { workspace = true }
+asyn-rs = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+serial_test = "3"
+
+[[bin]]
+name = "regression_ioc"
+path = "src/bin/regression_ioc.rs"

@@ -1,0 +1,120 @@
+# Regression IOC database.
+#
+# Each record block exists to pin a recurring bug-fix behavior observed across
+# v0.15.x-v0.20.x. The companion e2e tests boot this db under real CA+PVA
+# servers and assert the FIXED behavior over the wire, so a future regression
+# in the same family fails the test rather than silently shipping.
+#
+# Naming: REG:<family>:<role>
+#   A = processing-chain ordering (OUT/FLNK/DOL/PUTF)
+#   B = monitor / DBE event posting (post-only-on-change)
+#   C = SCAN / process gating (periodic scan runs while a server is up)
+#   E = enum / DBF_MENU -> DBR_ENUM (choice labels, caput-by-label)
+#   F = field typing (raw/index fields keep their integer DBF type)
+#   G = alarm / SEVR / STAT (severity raised on limit violation)
+#   H = timestamp (advances on each process, nsec WallTime)
+# Families D (motor) and the motor SCAN=Passive regression live in db sections
+# added with their device support; asyn records likewise.
+
+#### Family A — processing-chain ordering ####################################
+# caput to A:SRC must walk its FLNK to A:SINK, which reads SRC fresh through a
+# DB input link. Pins "FLNK chain runs on a caput to a Passive record" and the
+# OUT-before-FLNK / processTarget family.
+record(longout, "REG:A:SRC") {
+    field(DESC, "FLNK chain source")
+    field(VAL,  "0")
+    field(FLNK, "REG:A:SINK")
+}
+record(calc, "REG:A:SINK") {
+    field(DESC, "FLNK chain sink")
+    field(SCAN, "Passive")
+    field(INPA, "REG:A:SRC")
+    field(CALC, "A")
+}
+# calcout OUT-link leg: caput to CO.A processes CO, whose result is written
+# through a PP OUT link to A:OTGT. Pins "OUT-link write happens on process".
+record(calcout, "REG:A:CO") {
+    field(DESC, "OUT-link source")
+    field(SCAN, "Passive")
+    field(CALC, "A+1")
+    field(OUT,  "REG:A:OTGT PP")
+}
+record(longout, "REG:A:OTGT") {
+    field(DESC, "OUT-link target")
+    field(VAL,  "0")
+}
+
+#### Family B — monitor posts only on change ################################
+record(bo, "REG:B:BO") {
+    field(DESC, "monitor on-change")
+    field(ZNAM, "Lo")
+    field(ONAM, "Hi")
+    field(VAL,  "0")
+}
+
+#### Family C — periodic SCAN runs while a server is up #####################
+record(longout, "REG:C:SRC") {
+    field(DESC, "periodic-scan source")
+    field(VAL,  "0")
+}
+record(calc, "REG:C:SCAN") {
+    field(DESC, "1-second scanned mirror")
+    field(SCAN, "1 second")
+    field(INPA, "REG:C:SRC")
+    field(CALC, "A")
+}
+
+#### Family E — enum / DBF_MENU -> DBR_ENUM #################################
+record(mbbo, "REG:E:MBBO") {
+    field(DESC, "enum choice + caput-by-label")
+    field(ZRST, "Off")
+    field(ONST, "On")
+    field(TWST, "Standby")
+    field(ZRVL, "0")
+    field(ONVL, "1")
+    field(TWVL, "2")
+    field(VAL,  "0")
+}
+
+#### Family F — field typing (covered via REG:E:MBBO.RVAL integer type) #####
+# (no extra record; the F assertion reads REG:E:MBBO.RVAL's DBF type)
+
+#### Family G — alarm severity raised on limit violation ####################
+record(ai, "REG:G:AI") {
+    field(DESC, "alarm-limit severity")
+    field(VAL,  "50")
+    field(PINI, "YES")
+    field(HIHI, "90")
+    field(HIGH, "80")
+    field(LOW,  "20")
+    field(LOLO, "10")
+    field(HHSV, "MAJOR")
+    field(HSV,  "MINOR")
+    field(LSV,  "MINOR")
+    field(LLSV, "MAJOR")
+    field(HYST, "0")
+}
+
+#### Family H — timestamp advances on each process #########################
+record(ai, "REG:H:AI") {
+    field(DESC, "timestamp advance")
+    field(VAL,  "0")
+}
+
+#### Family D — motor record moves on a caput to VAL (SCAN=Passive) #########
+# The v0.20.0 regression: a caput to a SCAN=Passive motor's VAL did not move
+# it (the I/O-Intr-vs-Passive dbPutField processing gate). Pins "caput to a
+# Passive motor VAL actually drives the move; RBV converges, DMOV cycles".
+# Device support (sim driver + poll loop) is supplied by the harness, keyed on
+# DTYP "simMotor".
+record(motor, "REG:D:MTR") {
+    field(DESC, "sim motor move-on-caput")
+    field(DTYP, "simMotor")
+    field(SCAN, "Passive")
+    field(VELO, "20.0")
+    field(ACCL, "0.2")
+    field(MRES, "0.01")
+    field(DHLM, "100.0")
+    field(DLLM, "-100.0")
+    field(PREC, "3")
+}

@@ -3129,6 +3129,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
+name = "regression-ioc"
+version = "0.20.1"
+dependencies = [
+ "asyn-rs",
+ "epics-base-rs",
+ "epics-ca-rs",
+ "epics-pva-rs",
+ "motor-rs",
+ "serial_test",
+ "tokio",
+]
+
+[[package]]
 name = "resolv-conf"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

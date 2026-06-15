@@ -203,6 +203,39 @@ impl NDAttributeSource for LiveValueCell {
     }
 }
 
+/// The read type a `Param`-type attribute uses, selected from the XML
+/// `datatype` attribute (C++ `paramAttribute::paramType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamAttrType {
+    Int32,
+    Int64,
+    Float64,
+    String,
+    /// Unrecognized / omitted `datatype` — C++ leaves `paramType` at
+    /// `paramAttrTypeUnknown`, so the attribute keeps its constructed
+    /// `NDAttrUndefined` value and `updateValue()` never refreshes it.
+    Unknown,
+}
+
+impl ParamAttrType {
+    /// Map the XML `datatype` string to a read type, mirroring C++
+    /// `paramAttribute` (paramAttribute.cpp:80-95). The comparison is
+    /// case-sensitive against the upper-case schema tokens
+    /// (asynNDArrayDriver.cpp:280: "always uppercase for datatype"); anything
+    /// else — including the lower-case `"int"` default asynNDArrayDriver
+    /// substitutes when `datatype` is omitted (asynNDArrayDriver.cpp:446) —
+    /// yields `Unknown`, which C leaves as an un-typed, never-updated attribute.
+    pub fn from_datatype(datatype: &str) -> Self {
+        match datatype {
+            "INT" => Self::Int32,
+            "INT64" => Self::Int64,
+            "DOUBLE" => Self::Float64,
+            "STRING" => Self::String,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// Live source for a `Param`-type attribute (C++ `paramAttribute`).
 ///
 /// The driver owns the asyn parameter library; on each
@@ -216,14 +249,24 @@ pub struct ParamAttributeSource {
     pub param_name: String,
     /// The address (asyn `paramAddr`) to read from.
     pub addr: i32,
+    /// The read type selected from the XML `datatype` attribute. The published
+    /// `NDAttribute` value type follows this, NOT the param's runtime type —
+    /// C++ `paramAttribute` reads `getIntegerParam`/`getDoubleParam`/… per
+    /// `datatype` and sets a fixed `NDAttrDataType`.
+    pub param_type: ParamAttrType,
     cell: std::sync::Arc<LiveValueCell>,
 }
 
 impl ParamAttributeSource {
-    pub fn new(param_name: impl Into<String>, addr: i32) -> std::sync::Arc<Self> {
+    pub fn new(
+        param_name: impl Into<String>,
+        addr: i32,
+        param_type: ParamAttrType,
+    ) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             param_name: param_name.into(),
             addr,
+            param_type,
             cell: LiveValueCell::new(NDAttrValue::Undefined),
         })
     }
@@ -789,7 +832,7 @@ mod tests {
     fn test_param_source_cell_reevaluates() {
         // G10: a ParamAttributeSource returns whatever the driver last fed
         // into its cell — update() re-reads the fresh value.
-        let src = ParamAttributeSource::new("GAIN", 0);
+        let src = ParamAttributeSource::new("GAIN", 0, ParamAttrType::Float64);
         let mut attr = NDAttribute::new_with_source(
             "Gain",
             "",

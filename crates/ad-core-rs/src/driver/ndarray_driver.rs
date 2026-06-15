@@ -94,7 +94,17 @@ fn parse_attributes_xml(
                 let addr = xml_attr(tag, "addr")
                     .and_then(|s| s.parse::<i32>().ok())
                     .unwrap_or(0);
-                let src = ParamAttributeSource::new(source_str, addr);
+                // The `datatype` attr selects the read/publish type, NOT the
+                // param's runtime type (asynNDArrayDriver.cpp:445-446 →
+                // paramAttribute.cpp:80-95). Omitted → C substitutes the
+                // lower-case `"int"`, which matches no upper-case branch and
+                // leaves the attribute un-typed / never-updated.
+                let datatype = xml_attr(tag, "datatype").unwrap_or("int");
+                let src = ParamAttributeSource::new(
+                    source_str,
+                    addr,
+                    crate::attributes::ParamAttrType::from_datatype(datatype),
+                );
                 NDAttribute::new_with_source(
                     name,
                     description,
@@ -766,7 +776,7 @@ impl NDArrayDriverBase {
         //    subsequent update_values() re-read picks up the fresh value.
         for attr in self.attributes.iter() {
             if let Some(param_src) = attr.param_source() {
-                if let Some(value) = self.read_param_value(&param_src.param_name, param_src.addr) {
+                if let Some(value) = self.read_param_value(param_src) {
                     param_src.cell().set(value);
                 }
             }
@@ -777,39 +787,50 @@ impl NDArrayDriverBase {
         self.attributes.clone()
     }
 
-    /// Read a parameter's current value from the asyn parameter library,
-    /// converting it to an [`NDAttrValue`]. Returns `None` when the parameter
-    /// name is unknown or its value is undefined.
-    fn read_param_value(&self, param_name: &str, addr: i32) -> Option<NDAttrValue> {
-        use asyn_rs::param::ParamType;
-        let index = self.port_base.params.find_param(param_name)?;
-        match self.port_base.params.param_type(index)? {
-            ParamType::Int32 | ParamType::Enum | ParamType::UInt32Digital => self
+    /// Read a `Param` attribute's current value from the asyn parameter
+    /// library, using the read type the XML `datatype` selected — NOT the
+    /// param's runtime type. Mirrors C++ `paramAttribute::updateValue`
+    /// (paramAttribute.cpp:131-151), which dispatches on `paramType` to the
+    /// matching `getXxxParam` and publishes a fixed `NDAttrDataType`.
+    ///
+    /// Returns `None` (leaving the attribute's cell at its prior / `Undefined`
+    /// value) when the param is unknown, the value is undefined, the read type
+    /// mismatches the param's actual type, or the `datatype` was unrecognized
+    /// (`ParamAttrType::Unknown` — C's `paramAttrTypeUnknown`, which never
+    /// refreshes the attribute).
+    fn read_param_value(
+        &self,
+        src: &crate::attributes::ParamAttributeSource,
+    ) -> Option<NDAttrValue> {
+        use crate::attributes::ParamAttrType;
+        let index = self.port_base.params.find_param(&src.param_name)?;
+        let addr = src.addr;
+        match src.param_type {
+            ParamAttrType::Int32 => self
                 .port_base
                 .params
                 .get_int32(index, addr)
                 .ok()
                 .map(NDAttrValue::Int32),
-            ParamType::Int64 => self
+            ParamAttrType::Int64 => self
                 .port_base
                 .params
                 .get_int64(index, addr)
                 .ok()
                 .map(NDAttrValue::Int64),
-            ParamType::Float64 => self
+            ParamAttrType::Float64 => self
                 .port_base
                 .params
                 .get_float64(index, addr)
                 .ok()
                 .map(NDAttrValue::Float64),
-            ParamType::Octet => self
+            ParamAttrType::String => self
                 .port_base
                 .params
                 .get_string(index, addr)
                 .ok()
                 .map(|s| NDAttrValue::String(s.to_string())),
-            // Array / pointer parameters have no scalar attribute mapping.
-            _ => None,
+            ParamAttrType::Unknown => None,
         }
     }
 }
@@ -1185,6 +1206,64 @@ mod tests {
             .unwrap();
         let snap2 = drv.update_attributes();
         assert_eq!(snap2.get("Counter").unwrap().value, NDAttrValue::Int32(99));
+    }
+
+    #[test]
+    fn test_param_attribute_omitted_datatype_stays_undefined() {
+        // ADC-1: C++ selects the attribute's published type from the XML
+        // `datatype`. An omitted `datatype` defaults to the lower-case "int"
+        // (asynNDArrayDriver.cpp:446), which matches none of the upper-case
+        // `strcmp` branches (paramAttribute.cpp:80-95) → paramType Unknown →
+        // updateValue()'s switch falls through `default` and never refreshes
+        // the attribute, so it stays NDAttrUndefined. (The port previously
+        // derived the type from the param's runtime type and published an
+        // Int32 value.)
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let xml = r#"<Attributes>
+            <Attribute name="Counter" type="PARAM" source="ARRAY_COUNTER"/>
+        </Attributes>"#;
+        drv.port_base
+            .set_string_param(drv.params.attributes_file, 0, xml.into())
+            .unwrap();
+        drv.read_nd_attributes_file().unwrap();
+        drv.port_base
+            .set_int32_param(drv.params.array_counter, 0, 17)
+            .unwrap();
+        let snap = drv.update_attributes();
+        assert_eq!(
+            snap.get("Counter").unwrap().value,
+            NDAttrValue::Undefined,
+            "an omitted datatype must leave the PARAM attribute Undefined"
+        );
+    }
+
+    #[test]
+    fn test_param_attribute_datatype_selects_read_type() {
+        // ADC-1: the read getter is chosen by `datatype`, NOT the param's
+        // runtime type. ARRAY_COUNTER is an Int32 param; reading it with
+        // datatype="DOUBLE" dispatches to getDoubleParam, which wrong-types on
+        // an Int32 param — so the attribute is not refreshed (stays Undefined)
+        // rather than coercing the Int32 into a Float64. With the matching
+        // datatype="INT" the same param publishes Int32(value).
+        let mut drv = NDArrayDriverBase::new("TEST", 1_000_000).unwrap();
+        let xml = r#"<Attributes>
+            <Attribute name="AsDouble" type="PARAM" source="ARRAY_COUNTER" datatype="DOUBLE"/>
+            <Attribute name="AsInt" type="PARAM" source="ARRAY_COUNTER" datatype="INT"/>
+        </Attributes>"#;
+        drv.port_base
+            .set_string_param(drv.params.attributes_file, 0, xml.into())
+            .unwrap();
+        drv.read_nd_attributes_file().unwrap();
+        drv.port_base
+            .set_int32_param(drv.params.array_counter, 0, 42)
+            .unwrap();
+        let snap = drv.update_attributes();
+        assert_eq!(
+            snap.get("AsDouble").unwrap().value,
+            NDAttrValue::Undefined,
+            "datatype=DOUBLE on an Int32 param must not coerce — stays Undefined"
+        );
+        assert_eq!(snap.get("AsInt").unwrap().value, NDAttrValue::Int32(42));
     }
 
     #[test]

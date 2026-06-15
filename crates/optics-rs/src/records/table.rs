@@ -3257,6 +3257,24 @@ impl Record for TableRecord {
     }
 
     fn pre_process_actions(&mut self) -> Vec<ProcessAction> {
+        // C GetMotorLimits zeroes h0x[i]/l0x[i] whenever the limit read fails
+        // (tableRecord.c:1024-1031), so a stale prior value never survives a
+        // failed read. The Rust ReadDbLink leaves the target field unchanged on
+        // read failure, so pre-zero every can_read_limits motor's limit fields
+        // here: the reads below overwrite them on success, a failed read leaves
+        // 0. This keeps MotorLimitViol's fabs(h0x)>SMALL gate (and the user
+        // limits derived from them) consistent with C when a link is unreadable.
+        let mut hm = self.hi_motor_limit();
+        let mut lm = self.lo_motor_limit();
+        for i in 0..6 {
+            if self.lnk_stat[i].can_read_limits {
+                hm[i] = 0.0;
+                lm[i] = 0.0;
+            }
+        }
+        self.set_hi_motor_limit(&hm);
+        self.set_lo_motor_limit(&lm);
+
         let mut actions = Vec::new();
         actions.extend(self.build_read_rbv_actions());
         actions.extend(self.build_read_encoder_actions());
@@ -4431,6 +4449,25 @@ mod tests {
             restored("V0YL", 22.0),
             "stationary speed-capable motor 1 speed restored"
         );
+    }
+
+    #[test]
+    fn test_pre_process_zeroes_readable_motor_limits() {
+        // C GetMotorLimits pre-zeroes the limit so a failed read leaves 0
+        // (tableRecord.c:1024-1031). pre_process pre-zeroes can_read_limits
+        // motors; the framework's reads overwrite them on success.
+        let mut t = TableRecord::new();
+        t.h0x = 50.0;
+        t.l0x = -50.0;
+        t.h0y = 99.0; // motor 1 — NOT readable, must be left alone
+        t.lnk_stat[0].can_read_limits = true;
+        t.lnk_stat[1].can_read_limits = false;
+
+        let _ = t.pre_process_actions();
+
+        assert_eq!(t.h0x, 0.0, "readable motor 0 hi-limit pre-zeroed");
+        assert_eq!(t.l0x, 0.0, "readable motor 0 lo-limit pre-zeroed");
+        assert_eq!(t.h0y, 99.0, "non-readable motor 1 limit untouched");
     }
 
     #[test]

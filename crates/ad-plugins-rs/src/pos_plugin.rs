@@ -20,6 +20,30 @@ pub struct PositionList {
     pub positions: Vec<HashMap<String, f64>>,
 }
 
+/// Asyn param indices for the 17 NDPosPlugin params (resolved in
+/// `register_params`). Names match the C `str_NDPos_*` drvInfo strings
+/// (`NDPosPlugin.h:39-55`) so the `NDPosPlugin.template` records bind.
+#[derive(Default)]
+struct PosParamIndices {
+    filename: Option<usize>,
+    file_valid: Option<usize>,
+    clear: Option<usize>,
+    running: Option<usize>,
+    restart: Option<usize>,
+    delete: Option<usize>,
+    mode: Option<usize>,
+    append: Option<usize>,
+    current_qty: Option<usize>,
+    current_index: Option<usize>,
+    current_pos: Option<usize>,
+    missing_frames: Option<usize>,
+    duplicate_frames: Option<usize>,
+    expected_id: Option<usize>,
+    id_name: Option<usize>,
+    id_difference: Option<usize>,
+    id_start: Option<usize>,
+}
+
 /// NDPosPlugin processor: attaches position metadata to arrays from a position list.
 pub struct PosPluginProcessor {
     positions: VecDeque<HashMap<String, f64>>,
@@ -30,6 +54,7 @@ pub struct PosPluginProcessor {
     expected_id: i32,
     missing_frames: usize,
     duplicate_frames: usize,
+    params: PosParamIndices,
 }
 
 impl PosPluginProcessor {
@@ -43,6 +68,7 @@ impl PosPluginProcessor {
             expected_id: 0,
             missing_frames: 0,
             duplicate_frames: 0,
+            params: PosParamIndices::default(),
         }
     }
 
@@ -163,6 +189,30 @@ impl PosPluginProcessor {
                 self.index += 1;
             }
         }
+    }
+
+    /// The value C reports in `NDPos_CurrentIndex`: 0 in Discard mode (the
+    /// cursor never moves, the front is always consumed) and the running index
+    /// in Keep mode (NDPosPlugin.cpp:190; Discard never sets CurrentIndex).
+    fn current_index_param(&self) -> i32 {
+        match self.mode {
+            PosMode::Discard => 0,
+            PosMode::Keep => self.index as i32,
+        }
+    }
+}
+
+/// Push an `Int32` param update only when the param index is resolved.
+fn push_int(updates: &mut Vec<ParamUpdate>, idx: Option<usize>, value: i32) {
+    if let Some(i) = idx {
+        updates.push(ParamUpdate::int32(i, value));
+    }
+}
+
+/// Push an `Octet` param update only when the param index is resolved.
+fn push_str(updates: &mut Vec<ParamUpdate>, idx: Option<usize>, value: String) {
+    if let Some(i) = idx {
+        updates.push(ParamUpdate::octet(i, value));
     }
 }
 
@@ -333,7 +383,19 @@ impl NDPluginProcess for PosPluginProcessor {
                 }
             } else if uid < self.expected_id {
                 self.duplicate_frames += 1;
-                return ProcessResult::empty();
+                // C sets skip=1 (no downstream emit) but still posts
+                // DuplicateFrames (NDPosPlugin.cpp:132-135).
+                let mut updates = Vec::new();
+                push_int(
+                    &mut updates,
+                    self.params.duplicate_frames,
+                    self.duplicate_frames as i32,
+                );
+                return ProcessResult {
+                    output_arrays: vec![],
+                    param_updates: updates,
+                    scatter_index: None,
+                };
             }
         }
 
@@ -357,10 +419,30 @@ impl NDPluginProcess for PosPluginProcessor {
         self.advance();
         self.expected_id = array.unique_id + 1;
 
-        let updates = vec![
-            ParamUpdate::int32(0, self.missing_frames as i32),
-            ParamUpdate::int32(1, self.duplicate_frames as i32),
-        ];
+        // C posts MissingFrames/DuplicateFrames and, after advancing, the new
+        // CurrentQty (Discard) / CurrentIndex (Keep) (NDPosPlugin.cpp:126,134,
+        // 187,190).
+        let mut updates = Vec::new();
+        push_int(
+            &mut updates,
+            self.params.missing_frames,
+            self.missing_frames as i32,
+        );
+        push_int(
+            &mut updates,
+            self.params.duplicate_frames,
+            self.duplicate_frames as i32,
+        );
+        push_int(
+            &mut updates,
+            self.params.current_qty,
+            self.remaining_positions() as i32,
+        );
+        push_int(
+            &mut updates,
+            self.params.current_index,
+            self.current_index_param(),
+        );
 
         ProcessResult {
             output_arrays: vec![Arc::new(out)],
@@ -371,6 +453,146 @@ impl NDPluginProcess for PosPluginProcessor {
 
     fn plugin_type(&self) -> &str {
         "NDPosPlugin"
+    }
+
+    fn register_params(
+        &mut self,
+        base: &mut asyn_rs::port::PortDriverBase,
+    ) -> asyn_rs::error::AsynResult<()> {
+        use asyn_rs::param::ParamType;
+        // 17 params in C createParam order (NDPosPlugin.cpp:383-399).
+        base.create_param("NDPos_Filename", ParamType::Octet)?;
+        base.create_param("NDPos_FileValid", ParamType::Int32)?;
+        base.create_param("NDPos_Clear", ParamType::Int32)?;
+        base.create_param("NDPos_Running", ParamType::Int32)?;
+        base.create_param("NDPos_Restart", ParamType::Int32)?;
+        base.create_param("NDPos_Delete", ParamType::Int32)?;
+        base.create_param("NDPos_Mode", ParamType::Int32)?;
+        base.create_param("NDPos_Append", ParamType::Int32)?;
+        base.create_param("NDPos_CurrentQty", ParamType::Int32)?;
+        base.create_param("NDPos_CurrentIndex", ParamType::Int32)?;
+        base.create_param("NDPos_CurrentPos", ParamType::Octet)?;
+        base.create_param("NDPos_MissingFrames", ParamType::Int32)?;
+        base.create_param("NDPos_DuplicateFrames", ParamType::Int32)?;
+        base.create_param("NDPos_ExpectedID", ParamType::Int32)?;
+        base.create_param("NDPos_IDName", ParamType::Octet)?;
+        base.create_param("NDPos_IDDifference", ParamType::Int32)?;
+        base.create_param("NDPos_IDStart", ParamType::Int32)?;
+
+        self.params.filename = base.find_param("NDPos_Filename");
+        self.params.file_valid = base.find_param("NDPos_FileValid");
+        self.params.clear = base.find_param("NDPos_Clear");
+        self.params.running = base.find_param("NDPos_Running");
+        self.params.restart = base.find_param("NDPos_Restart");
+        self.params.delete = base.find_param("NDPos_Delete");
+        self.params.mode = base.find_param("NDPos_Mode");
+        self.params.append = base.find_param("NDPos_Append");
+        self.params.current_qty = base.find_param("NDPos_CurrentQty");
+        self.params.current_index = base.find_param("NDPos_CurrentIndex");
+        self.params.current_pos = base.find_param("NDPos_CurrentPos");
+        self.params.missing_frames = base.find_param("NDPos_MissingFrames");
+        self.params.duplicate_frames = base.find_param("NDPos_DuplicateFrames");
+        self.params.expected_id = base.find_param("NDPos_ExpectedID");
+        self.params.id_name = base.find_param("NDPos_IDName");
+        self.params.id_difference = base.find_param("NDPos_IDDifference");
+        self.params.id_start = base.find_param("NDPos_IDStart");
+
+        // C constructor defaults (NDPosPlugin.cpp:402-426).
+        if let Some(i) = self.params.mode {
+            base.set_int32_param(i, 0, self.mode as i32)?;
+        }
+        if let Some(i) = self.params.file_valid {
+            base.set_int32_param(i, 0, 0)?;
+        }
+        if let Some(i) = self.params.current_index {
+            base.set_int32_param(i, 0, 0)?;
+        }
+        if let Some(i) = self.params.current_qty {
+            base.set_int32_param(i, 0, self.remaining_positions() as i32)?;
+        }
+        if let Some(i) = self.params.current_pos {
+            base.set_string_param(i, 0, String::new())?;
+        }
+        if let Some(i) = self.params.running {
+            base.set_int32_param(i, 0, 0)?;
+        }
+        if let Some(i) = self.params.id_name {
+            base.set_string_param(i, 0, String::new())?;
+        }
+        if let Some(i) = self.params.id_difference {
+            base.set_int32_param(i, 0, 1)?;
+        }
+        if let Some(i) = self.params.id_start {
+            base.set_int32_param(i, 0, 1)?;
+        }
+        if let Some(i) = self.params.expected_id {
+            base.set_int32_param(i, 0, 1)?;
+        }
+        if let Some(i) = self.params.missing_frames {
+            base.set_int32_param(i, 0, 0)?;
+        }
+        if let Some(i) = self.params.duplicate_frames {
+            base.set_int32_param(i, 0, 0)?;
+        }
+        Ok(())
+    }
+
+    fn on_param_change(
+        &mut self,
+        reason: usize,
+        params: &ad_core_rs::plugin::runtime::PluginParamSnapshot,
+    ) -> ad_core_rs::plugin::runtime::ParamChangeResult {
+        use ad_core_rs::plugin::runtime::{ParamChangeResult, ParamChangeValue};
+
+        let mut updates = Vec::new();
+        if Some(reason) == self.params.running {
+            // C writeInt32(NDPos_Running): start/stop (NDPosPlugin.cpp:230-234).
+            if params.value.as_i32() == 0 {
+                self.stop();
+            } else {
+                self.start();
+            }
+        } else if Some(reason) == self.params.mode {
+            // C writeInt32(NDPos_Mode): reset index to 0 (NDPosPlugin.cpp:235-237).
+            self.mode = match params.value.as_i32() {
+                1 => PosMode::Keep,
+                _ => PosMode::Discard,
+            };
+            self.index = 0;
+            push_int(&mut updates, self.params.current_index, 0);
+        } else if Some(reason) == self.params.restart {
+            // C writeInt32(NDPos_Restart): reset index, clear CurrentPos
+            // (NDPosPlugin.cpp:238-242).
+            self.index = 0;
+            push_int(&mut updates, self.params.current_index, 0);
+            push_str(&mut updates, self.params.current_pos, String::new());
+        } else if Some(reason) == self.params.delete {
+            // C writeInt32(NDPos_Delete): reset index, clear CurrentPos, clear
+            // positions, CurrentQty=0 (NDPosPlugin.cpp:243-250).
+            self.clear();
+            push_int(&mut updates, self.params.current_index, 0);
+            push_int(&mut updates, self.params.current_qty, 0);
+            push_str(&mut updates, self.params.current_pos, String::new());
+        } else if Some(reason) == self.params.filename {
+            // C writeOctet(NDPos_Filename): validate + load XML, set FileValid,
+            // append positions, set CurrentQty (NDPosPlugin.cpp:295-315).
+            if let ParamChangeValue::Octet(ref xml) = params.value {
+                match self.load_positions_auto(xml) {
+                    Ok(_) => {
+                        push_int(&mut updates, self.params.file_valid, 1);
+                        push_int(
+                            &mut updates,
+                            self.params.current_qty,
+                            self.remaining_positions() as i32,
+                        );
+                    }
+                    Err(_) => {
+                        push_int(&mut updates, self.params.file_valid, 0);
+                    }
+                }
+            }
+        }
+        ParamChangeResult::updates(updates)
     }
 }
 
@@ -638,5 +860,109 @@ mod tests {
         let xml = r#"<pos_layout><dimensions><dimension name="x"/></dimensions><positions></positions></pos_layout>"#;
         let count = proc.load_positions_xml(xml).unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_param_posts_to_registered_indices() {
+        // ADP-33: posts land on the registered MissingFrames/DuplicateFrames/
+        // CurrentQty indices, never the old hardcoded 0/1.
+        use ad_core_rs::plugin::runtime::ParamUpdate;
+        let mut proc = PosPluginProcessor::new(PosMode::Discard);
+        proc.params.missing_frames = Some(20);
+        proc.params.duplicate_frames = Some(21);
+        proc.params.current_qty = Some(22);
+
+        let mut p1 = HashMap::new();
+        p1.insert("x".into(), 1.0);
+        let mut p2 = HashMap::new();
+        p2.insert("x".into(), 2.0);
+        proc.load_positions(vec![p1, p2]);
+        proc.start();
+
+        let pool = NDArrayPool::new(1_000_000);
+        let result = proc.process_array(&make_array(1), &pool);
+        // CurrentQty drops to 1 remaining after consuming the first position.
+        assert!(
+            result
+                .param_updates
+                .iter()
+                .any(|u| matches!(u, ParamUpdate::Int32 { reason: 20, .. }))
+        );
+        assert!(result.param_updates.iter().any(|u| matches!(
+            u,
+            ParamUpdate::Int32 {
+                reason: 22,
+                value: 1,
+                ..
+            }
+        )));
+        assert!(
+            !result
+                .param_updates
+                .iter()
+                .any(|u| matches!(u, ParamUpdate::Int32 { reason: 0, .. }))
+        );
+    }
+
+    #[test]
+    fn test_filename_param_loads_positions() {
+        // ADP-33: writing NDPos_Filename loads the XML, posts FileValid=1 + CurrentQty.
+        use ad_core_rs::plugin::runtime::{ParamChangeValue, ParamUpdate, PluginParamSnapshot};
+        let mut proc = PosPluginProcessor::new(PosMode::Discard);
+        proc.params.filename = Some(0);
+        proc.params.file_valid = Some(1);
+        proc.params.current_qty = Some(8);
+
+        let xml = r#"<pos_layout><dimensions><dimension name="x"/></dimensions><positions><position x="1"/><position x="2"/></positions></pos_layout>"#;
+        let snapshot = PluginParamSnapshot {
+            enable_callbacks: true,
+            reason: 0,
+            addr: 0,
+            value: ParamChangeValue::Octet(xml.to_string()),
+        };
+        let result = proc.on_param_change(0, &snapshot);
+        assert_eq!(proc.remaining_positions(), 2);
+        assert!(result.param_updates.iter().any(|u| matches!(
+            u,
+            ParamUpdate::Int32 {
+                reason: 1,
+                value: 1,
+                ..
+            }
+        )));
+        assert!(result.param_updates.iter().any(|u| matches!(
+            u,
+            ParamUpdate::Int32 {
+                reason: 8,
+                value: 2,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn test_running_param_starts_and_stops() {
+        // ADP-33: writing NDPos_Running routes to start()/stop().
+        use ad_core_rs::plugin::runtime::{ParamChangeValue, PluginParamSnapshot};
+        let mut proc = PosPluginProcessor::new(PosMode::Discard);
+        proc.params.running = Some(3);
+
+        let start = PluginParamSnapshot {
+            enable_callbacks: true,
+            reason: 3,
+            addr: 0,
+            value: ParamChangeValue::Int32(1),
+        };
+        proc.on_param_change(3, &start);
+        assert!(proc.running);
+
+        let stop = PluginParamSnapshot {
+            enable_callbacks: true,
+            reason: 3,
+            addr: 0,
+            value: ParamChangeValue::Int32(0),
+        };
+        proc.on_param_change(3, &stop);
+        assert!(!proc.running);
     }
 }

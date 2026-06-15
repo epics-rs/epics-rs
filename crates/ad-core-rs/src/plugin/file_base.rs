@@ -31,6 +31,11 @@ pub trait NDFileWriter: Send + Sync {
     fn supports_multiple_arrays(&self) -> bool {
         true
     }
+    /// Inform the writer of the configured capture count (`NDFileNumCapture`)
+    /// before the next `open_file`. A writer whose on-disk layout depends on
+    /// the capture target (e.g. HDF5 chunk sizing, C `calculateAttributeChunking`)
+    /// uses it; the default ignores it.
+    fn set_num_capture(&mut self, _n: usize) {}
 }
 
 /// File path/name management and capture buffering for file plugins.
@@ -255,6 +260,9 @@ impl NDPluginFileBase {
         array: Arc<NDArray>,
         writer: &mut dyn NDFileWriter,
     ) -> ADResult<()> {
+        // The writer's open-time layout (e.g. HDF5 attribute/performance chunk
+        // sizing) depends on the capture target; keep it current before any open.
+        writer.set_num_capture(self.num_capture);
         match self.mode {
             NDFileMode::Single => {
                 self.last_written_name = self.create_file_name();
@@ -309,6 +317,7 @@ impl NDPluginFileBase {
         if self.capture_buffer.is_empty() {
             return Ok(());
         }
+        writer.set_num_capture(self.num_capture);
 
         if writer.supports_multiple_arrays() {
             // Multi-array format: open once, write all, close once.
@@ -370,6 +379,7 @@ impl NDPluginFileBase {
         if self.is_open {
             return Ok(());
         }
+        writer.set_num_capture(self.num_capture);
         self.last_written_name = self.create_file_name();
         let (write_path, _) = self.write_path();
         writer.open_file(&write_path, NDFileMode::Stream, array)?;

@@ -57,6 +57,7 @@ struct ChunkConfig {
     n_col_chunks: usize,
     n_frames_chunks: usize,
     /// `HDF5_NDAttributeChunk` — chunk depth for NDAttribute datasets.
+    /// `0` means auto (C param default), resolved by `attribute_chunking`.
     ndattr_chunk: usize,
 }
 
@@ -67,7 +68,7 @@ impl Default for ChunkConfig {
             n_row_chunks: 0,
             n_col_chunks: 0,
             n_frames_chunks: 1,
-            ndattr_chunk: 16,
+            ndattr_chunk: 0,
         }
     }
 }
@@ -257,6 +258,12 @@ pub struct Hdf5Writer {
     blosc_compress_level: u32,
     // chunking & layout
     chunk: ChunkConfig,
+    /// File write mode of the currently-open file (C `NDFileWriteMode`), and the
+    /// configured capture target (C `NDFileNumCapture`, pushed by the controller
+    /// before `open_file`). Both feed `attribute_chunking` — C's
+    /// `calculateAttributeChunking` resolves the auto (0) chunk from them.
+    open_mode: NDFileMode,
+    num_capture: usize,
     n_extra_dims: usize,
     extra_dims: [ExtraDim; MAX_EXTRA_DIMS],
     fill_value: f64,
@@ -316,6 +323,8 @@ impl Hdf5Writer {
             blosc_compressor: 0,
             blosc_compress_level: 5,
             chunk: ChunkConfig::default(),
+            open_mode: NDFileMode::Single,
+            num_capture: 1,
             n_extra_dims: 0,
             extra_dims: Default::default(),
             fill_value: 0.0,
@@ -414,7 +423,9 @@ impl Hdf5Writer {
     }
 
     pub fn set_ndattr_chunk(&mut self, v: usize) {
-        self.chunk.ndattr_chunk = v.max(1);
+        // `0` is the auto sentinel (C `HDF5_NDAttributeChunk` default); preserve
+        // it rather than clamping to 1, so `attribute_chunking` can resolve it.
+        self.chunk.ndattr_chunk = v;
     }
 
     pub fn set_n_extra_dims(&mut self, v: usize) {
@@ -1576,13 +1587,32 @@ impl Hdf5Writer {
         }
     }
 
+    /// Effective chunk depth for the NDAttribute datasets and the performance
+    /// dataset's leading dimension, mirroring C `calculateAttributeChunking`
+    /// (NDFileHDF5.cpp:2869-2920). The `HDF5_NDAttributeChunk` param (0 = auto):
+    /// when auto, Single mode chunks at 1; otherwise at the capture target
+    /// (`NDFileNumCapture`), or `16*1024` when that is unlimited (≤ 0).
+    fn attribute_chunking(&self) -> usize {
+        if self.chunk.ndattr_chunk != 0 {
+            return self.chunk.ndattr_chunk;
+        }
+        if self.open_mode == NDFileMode::Single {
+            return 1;
+        }
+        if self.num_capture > 0 {
+            self.num_capture
+        } else {
+            16 * 1024
+        }
+    }
+
     /// Flush accumulated NDAttribute datasets into the open standard file.
     /// Each becomes a chunked, extensible 1-D dataset under `NDAttributes/`.
     fn flush_attribute_datasets(&mut self) -> ADResult<()> {
         if self.attr_datasets.is_empty() {
             return Ok(());
         }
-        let chunk_depth = self.chunk.ndattr_chunk.max(1);
+        let chunk_depth = self.attribute_chunking();
         let ndattr_group = self.resolved_ndattr_group.clone();
         let h5file = match self.handle {
             Some(Hdf5Handle::Standard { ref file, .. }) => file,
@@ -1604,7 +1634,10 @@ impl Hdf5Writer {
                 continue;
             }
             let n = ad.frames;
-            let chunk = chunk_depth.min(n).max(1);
+            // C does not clamp the chunk to the frame count: the attribute
+            // dataset is extensible (unlimited dim 0), so the chunk may exceed
+            // the current extent (`calculateAttributeChunking` → numCapture).
+            let chunk = chunk_depth;
 
             macro_rules! create_attr_ds {
                 ($t:ty) => {{
@@ -1858,6 +1891,7 @@ impl Default for Hdf5Writer {
 impl NDFileWriter for Hdf5Writer {
     fn open_file(&mut self, path: &Path, mode: NDFileMode, array: &NDArray) -> ADResult<()> {
         self.current_path = Some(path.to_path_buf());
+        self.open_mode = mode;
         self.frame_count = 0;
         self.frame_band.clear();
         self.total_runtime = 0.0;
@@ -1885,6 +1919,10 @@ impl NDFileWriter for Hdf5Writer {
             });
             Ok(())
         }
+    }
+
+    fn set_num_capture(&mut self, n: usize) {
+        self.num_capture = n;
     }
 
     fn write_file(&mut self, array: &NDArray) -> ADResult<()> {
@@ -2403,9 +2441,10 @@ impl NDPluginProcess for Hdf5FileProcessor {
             return ParamChangeResult::updates(vec![]);
         }
         if Some(reason) == self.hdf5_params.ndattr_chunk {
+            // `0` (auto) is valid; only negatives are coerced away.
             self.ctrl
                 .writer
-                .set_ndattr_chunk(params.value.as_i32().max(1) as usize);
+                .set_ndattr_chunk(params.value.as_i32().max(0) as usize);
             return ParamChangeResult::updates(vec![]);
         }
         // -- extra dimensions --
@@ -2859,6 +2898,71 @@ mod tests {
         let cnt_vals: Vec<i32> = cnt.read_raw().unwrap();
         assert_eq!(cnt_vals, vec![10, 20, 30]);
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_attribute_dataset_chunk_matches_capture_target() {
+        // C `calculateAttributeChunking` (NDFileHDF5.cpp:2869-2920): with the
+        // default auto chunk param (0) in a non-Single mode, the attribute
+        // dataset chunks at NDFileNumCapture, NOT the actual frame count — the
+        // dataset is extensible so the chunk may exceed the current extent.
+        // Capture target 10, only 3 frames written: chunk dim 0 must be 10,
+        // extent 3; values still round-trip through the single padded chunk.
+        let path = temp_path("hdf5_attr_chunk_cap");
+        let mut writer = Hdf5Writer::new();
+        writer.set_num_capture(10);
+
+        let mk = |c: i32| {
+            let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+            arr.attributes.add(NDAttribute::new_static(
+                "count",
+                "",
+                NDAttrSource::Driver,
+                NDAttrValue::Int32(c),
+            ));
+            arr
+        };
+
+        let a0 = mk(1);
+        writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
+        writer.write_file(&a0).unwrap();
+        writer.write_file(&mk(2)).unwrap();
+        writer.write_file(&mk(3)).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let ds = h5.dataset("NDAttributes/count").unwrap();
+        assert_eq!(ds.shape(), vec![3]);
+        assert_eq!(ds.chunk_dims(), Some(vec![10]));
+        let vals: Vec<i32> = ds.read_raw().unwrap();
+        assert_eq!(vals, vec![1, 2, 3]);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_attribute_dataset_chunk_single_mode_is_one() {
+        // Auto chunk param (0) in Single mode resolves to 1
+        // (`calculateAttributeChunking`: fileWriteMode == NDFileModeSingle → 1),
+        // regardless of the capture target.
+        let path = temp_path("hdf5_attr_chunk_single");
+        let mut writer = Hdf5Writer::new();
+        writer.set_num_capture(64);
+
+        let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        arr.attributes.add(NDAttribute::new_static(
+            "count",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(7),
+        ));
+        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let ds = h5.dataset("NDAttributes/count").unwrap();
+        assert_eq!(ds.chunk_dims(), Some(vec![1]));
         std::fs::remove_file(&path).ok();
     }
 

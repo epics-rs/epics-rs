@@ -123,6 +123,7 @@ population). One commit per finding.
 | ADP-18 (ROI 3-D RGB path converts output to the requested dataType) | fix | Fixed | 3064f514 |
 | ADP-19 (ROI single-color selection collapses to 2-D Mono) | fix | Fixed | c87ac8c3 |
 | ADP-23 (transform layout: array attr vs NDColorMode param) | verify→N/A | Not applicable (C refreshes the param from the array ColorMode attr each frame before use; same Mono default — equivalent, mismatch unreachable) | — |
+| ADP-27 (netCDF global-attr set: add NDNetCDFFileVersion=3.1; drop extra uniqueId/numArrays) | fix | Fixed | dbe09fd4 |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -397,11 +398,12 @@ Rust: `crates/ad-plugins-rs/src/codec.rs:229-289,318-420`; names from `ad-core/c
 C: `Codec.h:4-18` codec universe is `{"","jpeg","blosc","lz4","bslz4"}`.
 Impact: a Rust array tagged "zlib"/"lz4hdf5" cannot be decompressed by stock C NDPluginCodec. Structural cause of ADP-11. Sign-off vs the ordinal-only fix.
 
-#### ADP-27: netCDF missing NDNetCDFFileVersion global; writes extra uniqueId/numArrays globals
+#### ADP-27: netCDF missing NDNetCDFFileVersion global; writes extra uniqueId/numArrays globals — FIXED dbe09fd4
 Severity: Medium — fix
 Rust: `crates/ad-plugins-rs/src/file_netcdf.rs:469-495` writes uniqueId/numArrays globals, no NDNetCDFFileVersion.
 C: `NDFileNetCDF.cpp:96-101` writes NDNetCDFFileVersion=3.1; uniqueId/numArrays are a variable/dimension, not globals.
 Impact: a version-gating reader fails; Rust files carry two extra globals.
+Fix: added the `NDNetCDFFileVersion` NC_DOUBLE=3.1 global (C :99, NDFileNetCDF.h:19) and removed the extra `uniqueId` (a per-frame variable, C :183) and `numArrays` (the unlimited dimension, C :119) globals. Regression `test_global_attrs_match_c_set` asserts the version double is present and the two extras are absent while uniqueId remains a variable.
 
 #### ADP-28: TIFF RGB2/RGB3 written chunky (no PlanarConfig); C writes PlanarConfig=2 separate planes
 Severity: Medium — fix

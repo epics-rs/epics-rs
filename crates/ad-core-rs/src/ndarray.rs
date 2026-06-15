@@ -3,6 +3,12 @@ use crate::codec::Codec;
 use crate::error::{ADError, ADResult};
 use crate::timestamp::EpicsTimestamp;
 
+/// Maximum number of NDArray dimensions (C++ `ND_ARRAY_MAX_DIMS`,
+/// NDArray.h:26). The `Dimensions` int32-array param is always posted at this
+/// fixed length, zero-filled beyond the array's actual `ndims`, matching
+/// `doCallbacksInt32Array(dimsPrev_, ND_ARRAY_MAX_DIMS, …)`.
+pub const ND_ARRAY_MAX_DIMS: usize = 10;
+
 /// NDArray data types matching areaDetector NDDataType_t.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

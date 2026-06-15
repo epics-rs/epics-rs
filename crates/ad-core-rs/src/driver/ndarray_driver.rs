@@ -286,9 +286,17 @@ pub(crate) fn write_array_params(
     port_base.set_int32_param(params.array_size, 0, info.total_bytes as i32)?;
     port_base.set_int32_param(params.unique_id, 0, array.unique_id)?;
 
-    // G7: dimensions.
+    // G7: dimensions. C++ posts the fixed-length `dimsPrev_[ND_ARRAY_MAX_DIMS]`
+    // (NDPluginDriver.cpp:220-231) — always 10 elements, zero-filled beyond the
+    // array's `ndims` — so `readInt32Array` returns NORD=10, not `ndims`.
     port_base.set_int32_param(params.n_dimensions, 0, array.dims.len() as i32)?;
-    let dim_sizes: Vec<i32> = array.dims.iter().map(|d| d.size as i32).collect();
+    let mut dim_sizes = vec![0i32; crate::ndarray::ND_ARRAY_MAX_DIMS];
+    for (slot, d) in dim_sizes
+        .iter_mut()
+        .zip(array.dims.iter().take(crate::ndarray::ND_ARRAY_MAX_DIMS))
+    {
+        *slot = d.size as i32;
+    }
     port_base
         .params
         .set_int32_array(params.array_dimensions, 0, dim_sizes)?;
@@ -1013,7 +1021,9 @@ mod tests {
             .params
             .get_int32_array(drv.params.array_dimensions, 0)
             .unwrap();
-        assert_eq!(&dims[..], &[64, 48]);
+        // C++ posts the fixed ND_ARRAY_MAX_DIMS (10) array, zero-filled beyond
+        // the 2 real dims (NDPluginDriver.cpp:220-231).
+        assert_eq!(&dims[..], &[64, 48, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(
             drv.port_base
                 .get_int32_param(drv.params.data_type, 0)

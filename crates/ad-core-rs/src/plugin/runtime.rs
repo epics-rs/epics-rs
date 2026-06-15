@@ -773,8 +773,20 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
                 .unwrap_or(0);
 
             // G8: fire an int32-array callback on NDDimensions when the array
-            // dimensions change (C++ beginProcessCallbacks dimsPrev_).
-            let cur_dims: Vec<i32> = report_arr.dims.iter().map(|d| d.size as i32).collect();
+            // dimensions change (C++ beginProcessCallbacks dimsPrev_). C++ keeps
+            // a fixed `dimsPrev_[ND_ARRAY_MAX_DIMS]` zero-filled beyond `ndims`,
+            // compares element-wise over all 10 slots, and posts the full
+            // 10-element array (NDPluginDriver.cpp:220-231) — so a caget reads
+            // NORD=10 with trailing zeros, not `ndims`.
+            let mut cur_dims = vec![0i32; crate::ndarray::ND_ARRAY_MAX_DIMS];
+            for (slot, d) in cur_dims.iter_mut().zip(
+                report_arr
+                    .dims
+                    .iter()
+                    .take(crate::ndarray::ND_ARRAY_MAX_DIMS),
+            ) {
+                *slot = d.size as i32;
+            }
             if cur_dims != self.dims_prev {
                 self.dims_prev = cur_dims.clone();
                 self.port_handle
@@ -1571,7 +1583,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
         max_byte_rate: 0.0,
         throttler: super::throttler::Throttler::new(0.0),
         prev_input_array: None,
-        dims_prev: Vec::new(),
+        dims_prev: vec![0i32; crate::ndarray::ND_ARRAY_MAX_DIMS],
         nd_array_addr: 0,
         max_threads: 1,
         num_threads: 1,
@@ -2091,7 +2103,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
         max_byte_rate: 0.0,
         throttler: super::throttler::Throttler::new(0.0),
         prev_input_array: None,
-        dims_prev: Vec::new(),
+        dims_prev: vec![0i32; crate::ndarray::ND_ARRAY_MAX_DIMS],
         nd_array_addr: 0,
         max_threads: 1,
         num_threads: 1,

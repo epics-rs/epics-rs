@@ -1,8 +1,8 @@
 //! NDPluginAttribute: extracts named attribute values from each array.
 //!
-//! Supports up to 8 attribute channels (addr 0..7), each tracking a different
-//! attribute by name. Special pseudo-attribute names "NDArrayUniqueId" and
-//! "NDArrayTimeStamp" read from the array header.
+//! Supports `maxAttributes` attribute channels (addr 0..maxAttributes-1), each
+//! tracking a different attribute by name. Special pseudo-attribute names
+//! "NDArrayUniqueId" and "NDArrayTimeStamp" read from the array header.
 
 use ad_core_rs::ndarray::NDArray;
 use ad_core_rs::ndarray_pool::NDArrayPool;
@@ -15,9 +15,6 @@ use asyn_rs::param::ParamType;
 use asyn_rs::port::PortDriverBase;
 
 use crate::time_series::{TimeSeriesData, TimeSeriesSender};
-
-/// Maximum number of attribute channels.
-const MAX_ATTR_CHANNELS: usize = 8;
 
 /// Parameter indices for NDPluginAttribute.
 #[derive(Clone, Copy, Default)]
@@ -66,14 +63,16 @@ impl AttrChannel {
 
 /// Processor that extracts multiple attribute values from each array.
 pub struct AttributeProcessor {
-    channels: [AttrChannel; MAX_ATTR_CHANNELS],
+    channels: Vec<AttrChannel>,
     params: AttributeParams,
     ts_sender: Option<TimeSeriesSender>,
 }
 
 impl AttributeProcessor {
-    pub fn new(attr_name: &str) -> Self {
-        let mut channels: [AttrChannel; MAX_ATTR_CHANNELS] = Default::default();
+    /// `num_channels` is C `maxAttributes_` (the per-frame channel count, floored
+    /// to >=1; NDPluginAttribute.cpp:184). Channel 0 is seeded with `attr_name`.
+    pub fn new(attr_name: &str, num_channels: usize) -> Self {
+        let mut channels = vec![AttrChannel::default(); num_channels.max(1)];
         channels[0].name = attr_name.to_string();
         Self {
             channels,
@@ -174,7 +173,7 @@ impl NDPluginProcess for AttributeProcessor {
         let addr = params.addr as usize;
 
         if reason == self.params.attr_name {
-            if addr < MAX_ATTR_CHANNELS {
+            if addr < self.channels.len() {
                 if let ParamChangeValue::Octet(s) = &params.value {
                     self.channels[addr].name = s.clone();
                 }
@@ -197,18 +196,19 @@ impl NDPluginProcess for AttributeProcessor {
     }
 }
 
-/// Channel names for time series (one per attribute channel).
-pub fn attr_ts_channel_names() -> Vec<&'static str> {
-    vec![
-        "TSArrayValue",
-        "TSArrayValue1",
-        "TSArrayValue2",
-        "TSArrayValue3",
-        "TSArrayValue4",
-        "TSArrayValue5",
-        "TSArrayValue6",
-        "TSArrayValue7",
-    ]
+/// Time-series channel names, one per attribute channel. The length is C
+/// `maxAttributes_` (the TS NDArray dim, NDPluginAttribute.cpp:98), so it tracks
+/// the configured channel count rather than a fixed 8.
+pub fn attr_ts_channel_names(num_channels: usize) -> Vec<String> {
+    (0..num_channels.max(1))
+        .map(|i| {
+            if i == 0 {
+                "TSArrayValue".to_string()
+            } else {
+                format!("TSArrayValue{i}")
+            }
+        })
+        .collect()
 }
 
 /// Create an Attribute plugin runtime. The TS receiver is stored in the registry
@@ -220,13 +220,20 @@ pub fn create_attribute_runtime(
     ndarray_port: &str,
     wiring: std::sync::Arc<ad_core_rs::plugin::wiring::WiringRegistry>,
     ts_registry: &crate::time_series::TsReceiverRegistry,
+    max_attributes: i32,
 ) -> (
     ad_core_rs::plugin::runtime::PluginRuntimeHandle,
     std::thread::JoinHandle<()>,
 ) {
+    // C: maxAttributes_ = max(maxAttributes, 1) is the per-frame channel count
+    // and the TS length; the NDPluginDriver base address count is
+    // max(maxAttributes, 2) (NDPluginAttribute.cpp:175,184).
+    let num_channels = max_attributes.max(1) as usize;
+    let num_addr = max_attributes.max(2) as usize;
+
     let (ts_tx, ts_rx) = tokio::sync::mpsc::channel(256);
 
-    let mut processor = AttributeProcessor::new("");
+    let mut processor = AttributeProcessor::new("", num_channels);
     processor.set_ts_sender(ts_tx);
 
     let (handle, data_jh) = ad_core_rs::plugin::runtime::create_plugin_runtime_multi_addr(
@@ -236,14 +243,10 @@ pub fn create_attribute_runtime(
         queue_size,
         ndarray_port,
         wiring,
-        MAX_ATTR_CHANNELS,
+        num_addr,
     );
 
-    let channel_names: Vec<String> = attr_ts_channel_names()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    ts_registry.store(port_name, ts_rx, channel_names);
+    ts_registry.store(port_name, ts_rx, attr_ts_channel_names(num_channels));
 
     (handle, data_jh)
 }
@@ -268,7 +271,7 @@ mod tests {
 
     #[test]
     fn test_extract_named_attribute() {
-        let mut proc = AttributeProcessor::new("Temperature");
+        let mut proc = AttributeProcessor::new("Temperature", 8);
         let pool = NDArrayPool::new(1_000_000);
 
         let arr = make_array_with_attr("Temperature", 25.5, 1);
@@ -284,7 +287,7 @@ mod tests {
 
     #[test]
     fn test_sum_accumulation() {
-        let mut proc = AttributeProcessor::new("Intensity");
+        let mut proc = AttributeProcessor::new("Intensity", 8);
         let pool = NDArrayPool::new(1_000_000);
 
         let arr1 = make_array_with_attr("Intensity", 10.0, 1);
@@ -299,7 +302,7 @@ mod tests {
 
     #[test]
     fn test_reset() {
-        let mut proc = AttributeProcessor::new("Count");
+        let mut proc = AttributeProcessor::new("Count", 8);
         let pool = NDArrayPool::new(1_000_000);
 
         let arr1 = make_array_with_attr("Count", 100.0, 1);
@@ -313,7 +316,7 @@ mod tests {
 
     #[test]
     fn test_special_attr_unique_id() {
-        let mut proc = AttributeProcessor::new("NDArrayUniqueId");
+        let mut proc = AttributeProcessor::new("NDArrayUniqueId", 8);
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
@@ -325,7 +328,7 @@ mod tests {
 
     #[test]
     fn test_special_attr_timestamp() {
-        let mut proc = AttributeProcessor::new("NDArrayTimeStamp");
+        let mut proc = AttributeProcessor::new("NDArrayTimeStamp", 8);
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
@@ -340,7 +343,7 @@ mod tests {
 
     #[test]
     fn test_missing_attribute() {
-        let mut proc = AttributeProcessor::new("NonExistent");
+        let mut proc = AttributeProcessor::new("NonExistent", 8);
         let pool = NDArrayPool::new(1_000_000);
 
         let arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
@@ -352,7 +355,7 @@ mod tests {
 
     #[test]
     fn test_string_attribute_ignored() {
-        let mut proc = AttributeProcessor::new("Label");
+        let mut proc = AttributeProcessor::new("Label", 8);
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
@@ -369,7 +372,7 @@ mod tests {
 
     #[test]
     fn test_int32_attribute() {
-        let mut proc = AttributeProcessor::new("Counter");
+        let mut proc = AttributeProcessor::new("Counter", 8);
         let pool = NDArrayPool::new(1_000_000);
 
         let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
@@ -385,10 +388,48 @@ mod tests {
     }
 
     #[test]
+    fn test_channel_count_follows_max_attributes() {
+        // C maxAttributes_ sizes the per-frame channel loop and the TS NDArray
+        // length (NDPluginAttribute.cpp:55,98,184); neither is fixed at 8.
+        assert_eq!(attr_ts_channel_names(16).len(), 16);
+        assert_eq!(attr_ts_channel_names(2).len(), 2);
+        assert_eq!(attr_ts_channel_names(0).len(), 1); // floored to >=1
+
+        let mut proc = AttributeProcessor::new("Temp", 16);
+        proc.params.value = 2;
+        proc.params.value_sum = 3;
+        proc.channels[15].name = "High".to_string();
+
+        let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+        arr.attributes.add(NDAttribute::new_static(
+            "Temp",
+            String::new(),
+            NDAttrSource::Driver,
+            NDAttrValue::Float64(1.0),
+        ));
+        arr.attributes.add(NDAttribute::new_static(
+            "High",
+            String::new(),
+            NDAttrSource::Driver,
+            NDAttrValue::Float64(9.0),
+        ));
+
+        let r = proc.process_array(&arr, &NDArrayPool::new(1_000_000));
+        // Channel 15 — beyond the old fixed 8 — must post its value.
+        assert!(
+            r.param_updates.iter().any(|u| matches!(
+                u,
+                ParamUpdate::Float64 { reason: 2, addr: 15, value } if *value == 9.0
+            )),
+            "channel 15 must post with a 16-channel processor"
+        );
+    }
+
+    #[test]
     fn test_missing_attribute_skips_post() {
         // C `continue`s (no setDoubleParam / callParamCallbacks) for a channel
         // whose attribute is absent this frame (NDPluginAttribute.cpp:72-80).
-        let mut proc = AttributeProcessor::new("Temp");
+        let mut proc = AttributeProcessor::new("Temp", 8);
         proc.params.value = 2;
         proc.params.value_sum = 3;
         let pool = NDArrayPool::new(1_000_000);
@@ -417,7 +458,7 @@ mod tests {
     fn test_reset_clears_on_zero_write() {
         // C NDPluginAttribute::writeInt32 zeros Val/ValSum on ANY write to the
         // reset param, including value 0 (NDPluginAttribute.cpp:123-128).
-        let mut proc = AttributeProcessor::new("Count");
+        let mut proc = AttributeProcessor::new("Count", 8);
         proc.params.value = 2;
         proc.params.value_sum = 3;
         proc.params.reset = 7;
@@ -451,7 +492,7 @@ mod tests {
 
     #[test]
     fn test_set_attr_name() {
-        let mut proc = AttributeProcessor::new("A");
+        let mut proc = AttributeProcessor::new("A", 8);
         assert_eq!(proc.attr_name(), "A");
 
         proc.set_attr_name("B");

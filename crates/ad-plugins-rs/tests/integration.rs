@@ -647,7 +647,7 @@ fn test_attribute_plugin_value_extraction() {
     use ad_plugins_rs::attribute::AttributeProcessor;
 
     let pool = NDArrayPool::new(1_000_000);
-    let mut proc = AttributeProcessor::new("exposure");
+    let mut proc = AttributeProcessor::new("exposure", 8);
 
     let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
     arr.attributes.add(NDAttribute::new_static(

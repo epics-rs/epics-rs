@@ -12,5 +12,7 @@ mod helpers;
 mod plugin_manager;
 
 pub use driver_context::{DriverContext, GenericDriverContext};
-pub use helpers::{dtyp_from_port, extract_plugin_args, plugin_arg_defs, register_noop_commands};
+pub use helpers::{
+    attr_arg_defs, dtyp_from_port, extract_plugin_args, plugin_arg_defs, register_noop_commands,
+};
 pub use plugin_manager::PluginManager;

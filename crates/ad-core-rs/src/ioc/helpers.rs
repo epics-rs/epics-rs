@@ -59,6 +59,40 @@ pub fn plugin_arg_defs() -> Vec<ArgDesc> {
     ]
 }
 
+/// Arg descriptors for `NDAttrConfigure`, whose C signature inserts
+/// `maxAttributes` at index 5 (NDPluginAttribute.cpp:222-242):
+/// `(portName, queueSize, blockingCallbacks, NDArrayPort, NDArrayAddr,
+/// maxAttributes, maxBuffers, maxMemory, priority, stackSize)` — note there is
+/// no `maxThreads` arg, unlike the generic plugin layout.
+pub fn attr_arg_defs() -> Vec<ArgDesc> {
+    let int = |name| ArgDesc {
+        name,
+        arg_type: ArgType::Int,
+        optional: true,
+    };
+    let string = |name| ArgDesc {
+        name,
+        arg_type: ArgType::String,
+        optional: true,
+    };
+    vec![
+        ArgDesc {
+            name: "portName",
+            arg_type: ArgType::String,
+            optional: false,
+        },
+        int("queueSize"),
+        int("blockingCallbacks"),
+        string("NDArrayPort"),
+        int("NDArrayAddr"),
+        int("maxAttributes"),
+        int("maxBuffers"),
+        int("maxMemory"),
+        int("priority"),
+        int("stackSize"),
+    ]
+}
+
 /// Extract port_name, queue_size, and ndarray_port from C-compatible plugin args.
 ///
 /// C format: `(portName, queueSize, blockingCallbacks, NDArrayPort, NDArrayAddr, ...)`

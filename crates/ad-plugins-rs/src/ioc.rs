@@ -9,7 +9,8 @@
 use std::sync::{Arc, Mutex};
 
 use ad_core_rs::ioc::{
-    PluginManager, dtyp_from_port, extract_plugin_args, plugin_arg_defs, register_noop_commands,
+    PluginManager, attr_arg_defs, dtyp_from_port, extract_plugin_args, plugin_arg_defs,
+    register_noop_commands,
 };
 use ad_core_rs::plugin::runtime::create_plugin_runtime;
 use ad_core_rs::plugin::wiring::WiringRegistry;
@@ -398,10 +399,16 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         let tsr = ts_registry.clone();
         app = app.register_startup_command(CommandDef::new(
             "NDAttrConfigure",
-            plugin_arg_defs(),
+            attr_arg_defs(),
             "NDAttrConfigure portName [queueSize] ...",
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let (port_name, queue_size, ndarray_port) = extract_plugin_args(args)?;
+                // C arg index 5 is maxAttributes (NDPluginAttribute.cpp:245); a
+                // missing iocsh int arg defaults to 0, which C floors to 1.
+                let max_attributes = match args.get(5) {
+                    Some(ArgValue::Int(n)) => *n as i32,
+                    _ => 0,
+                };
                 let dtyp = dtyp_from_port(&port_name);
                 let drv = m.driver()?;
                 let pool = drv.pool();
@@ -413,6 +420,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                     &ndarray_port,
                     m.wiring().clone(),
                     &tsr,
+                    max_attributes,
                 );
                 m.add_plugin(&dtyp, &handle);
                 if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port) {

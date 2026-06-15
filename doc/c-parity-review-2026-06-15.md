@@ -87,6 +87,9 @@ population). One commit per finding.
 | MQTT-1 (FLAT inbound INT/FLOAT/DIGITAL parses raw, rejects surrounding ws) | fix | Fixed | cb9ba4e9 |
 | MQTT-2 (FLAT:STRING inbound stored verbatim) | fix | Fixed | db0fc076 |
 | MQTT-4 (octet value terminates at first NUL) | fix-low | Fixed | 36f96ca1 |
+| PROC-1 (telnet RFC1143 negotiation, not blanket option refusal) | fix | Fixed | 40770a28 |
+| PROC-2 (info file/PROCSERV_INFO manage-procs format) | fix | Fixed | 7bf565d8 |
+| PROC-3 (procServ branding/version string) | signoff | Signoff — keep Rust branding (user call) | — |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -615,12 +618,14 @@ Severity: High — fix
 Rust: `crates/epics-tools-rs/src/procserv/telnet.rs:104-111` — any `DO opt` → `WONT opt`; any `WILL opt` → `DONT opt`; no per-option state, no ECHO/LINEMODE exception. The test `refuses_unknown_will` (`:189-203`) encodes the wrong behavior.
 C: `libtelnet.c:453-461,396-403` accept ECHO (`WILL ECHO`) and LINEMODE (`DO LINEMODE`) per the option table (`clientFactory.cc:26-27`); confirmations of the server's own startup offers (`:475-478,417-420`) send nothing.
 Impact: 4 wire-byte divergences vs any RFC client: `DO ECHO` → C `FF FB 01` vs Rust `FF FC 01`; `WILL LINEMODE` → C `FF FD 22` vs Rust `FF FE 22`; spurious refusal of the confirmation bytes. The Rust server contradicts its own `initial_negotiation()` (`telnet.rs:144-153`) → a standard client double-echoes or stops echoing.
+- **Fixed 40770a28.** Ported libtelnet's RFC1143 Q-method (`_negotiate`) for ECHO/LINEMODE; the parser seeds each offered side to `WANTYES` at construction so confirmations stay silent and fresh ECHO/LINEMODE are accepted; unknown options stay refused. `QState` restricted to `{No, Yes, WantYes}` (the states reachable from a once-only, never-retracted offer); the `refuses_unknown_will` test was replaced with per-behaviour tests.
 
 #### PROC-2: Info file and `PROCSERV_INFO` env use a `KEY=value` form `manage-procs` cannot parse; C writes `pid:`/`tcp:` lines and `PID=;CTL=` env
 Severity: High — fix
 Rust: `crates/epics-tools-rs/src/procserv/sidecar.rs:198-235` emits `procservpid=…\nchildpid=…\nchildexe=…\nchildargs=…` for both the info file and `PROCSERV_INFO` (comment `:9-11` claims it is "preserved exactly").
 C: `procServ.cc:938-940,946-952` + `acceptFactory.cc:49,56-61` emit `pid:<pid>\n` + `tcp:<ip>:<port>\n` (info file) and `PID=<pid>;CTL=tcp:...;` (env); `manage.py:39-43` parses `pid:`/`tcp:`/`unix:`.
 Impact: `manage-procs list/attach` finds neither PID nor listener address from a Rust info file; `PROCSERV_INFO` format differs. Both machine contracts break; the "preserved exactly" comment is false against this upstream.
+- **Fixed 7bf565d8.** Info file now emits `pid:<supervisor-pid>` + `tcp:`/`unix:` lines; `PROCSERV_INFO` emits `PID=<supervisor-pid>;CTL=/LOG=tcp:…` with the trailing `;` stripped. `pid:` is `getpid()` (supervisor), the pid manage-procs probes for liveness — C never writes the child pid. `InfoSnapshot` carries listener addresses (from config) instead of child exe/args; `listen_addresses()` reproduces C's `connectionItem::head` order (prepend-reversed: log, unix, control).
 
 #### PROC-3: Connection banner / child-lifecycle message strings rebranded `procserv-rs` and restructured
 Severity: Medium — signoff

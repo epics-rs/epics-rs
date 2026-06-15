@@ -954,7 +954,12 @@ impl NDPluginProcess for StatsProcessor {
         // Centroid computation
         let mut centroid = CentroidResult::default();
         if self.do_compute_centroid {
-            if info.color_size <= 1 && array.dims.len() >= 2 {
+            // C rejects ndims>2 (NDPluginStats.cpp:205 `if (ndims>2) return
+            // asynError`): centroid is computed only for a true 2-D image, never
+            // by treating the first two dims of a 4-D (or [x,y,1]) array as a
+            // slice. The `>= 2` lower bound is unchanged (1-D is handled
+            // elsewhere); adding `== 2` only removes the ndims>2 path.
+            if info.color_size <= 1 && array.dims.len() == 2 {
                 centroid = compute_centroid(
                     &array.data,
                     info.x_size,
@@ -974,8 +979,9 @@ impl NDPluginProcess for StatsProcessor {
             result.hist_entropy = entropy;
         }
 
-        // Profile computation
-        if self.do_compute_profiles && info.color_size <= 1 && array.dims.len() >= 2 {
+        // Profile computation. C also rejects ndims>2 here (NDPluginStats.cpp:338),
+        // so profiles are computed only for a true 2-D image.
+        if self.do_compute_profiles && info.color_size <= 1 && array.dims.len() == 2 {
             let profiles = compute_profiles(
                 &array.data,
                 info.x_size,
@@ -999,7 +1005,7 @@ impl NDPluginProcess for StatsProcessor {
         // Compute cursor value: pixel at (cursor_x, cursor_y). C clamps the
         // cursor to the last valid pixel (NDPluginStats.cpp:357-362) and always
         // reads it — an out-of-range cursor yields the edge pixel, never 0.
-        if info.color_size <= 1 && array.dims.len() >= 2 && info.x_size > 0 && info.y_size > 0 {
+        if info.color_size <= 1 && array.dims.len() == 2 && info.x_size > 0 && info.y_size > 0 {
             let cx = self.cursor_x.min(info.x_size - 1);
             let cy = self.cursor_y.min(info.y_size - 1);
             result.cursor_value = array.data.get_as_f64(cy * info.x_size + cx).unwrap_or(0.0);
@@ -1816,6 +1822,77 @@ mod tests {
                 array_reasons.contains(&reason),
                 "missing array update for reason {reason}"
             );
+        }
+    }
+
+    #[test]
+    fn test_adp13_ndims_gt_2_skips_centroid_and_profiles() {
+        use ad_core_rs::plugin::runtime::ParamUpdate;
+        // C rejects ndims>2 for centroid/profiles (NDPluginStats.cpp:205,338):
+        // a 4-D array must NOT have its centroid/profiles computed on the first
+        // two dims as if it were a 2-D image.
+        let mut proc = StatsProcessor::new();
+        let mut base = asyn_rs::port::PortDriverBase::new(
+            "_stats_adp13_",
+            1,
+            asyn_rs::port::PortFlags::default(),
+        );
+        let _ = ad_core_rs::params::ndarray_driver::NDArrayDriverParams::create(&mut base);
+        let _ = ad_core_rs::plugin::params::PluginBaseParams::create(&mut base);
+        proc.register_params(&mut base).unwrap();
+        proc.do_compute_centroid = true;
+        proc.do_compute_profiles = true;
+        let pool = NDArrayPool::new(1_000_000);
+
+        // 4-D mono array [x=4, y=4, z=2, w=2]. The first 4x4 plane has a bright
+        // column at x=3, so a (wrong) 2-D centroid would be clearly nonzero.
+        let mut arr = NDArray::new(
+            vec![
+                NDDimension::new(4),
+                NDDimension::new(4),
+                NDDimension::new(2),
+                NDDimension::new(2),
+            ],
+            NDDataType::UInt8,
+        );
+        if let NDDataBuffer::U8(ref mut v) = arr.data {
+            for (i, val) in v.iter_mut().enumerate() {
+                *val = if i % 4 == 3 { 100 } else { 0 };
+            }
+        }
+
+        let result = proc.process_array(&arr, &pool);
+        let p = proc.params;
+
+        // Centroid left at 0 (not computed on a slice).
+        let centroid_x = result.param_updates.iter().find_map(|u| match u {
+            ParamUpdate::Float64 { reason, value, .. } if *reason == p.centroid_x => Some(*value),
+            _ => None,
+        });
+        assert_eq!(
+            centroid_x,
+            Some(0.0),
+            "centroid_x must not be computed for ndims>2"
+        );
+
+        // No profile waveforms emitted for a >2-D array.
+        let profile_reasons = [
+            p.profile_average_x,
+            p.profile_average_y,
+            p.profile_threshold_x,
+            p.profile_threshold_y,
+            p.profile_centroid_x,
+            p.profile_centroid_y,
+            p.profile_cursor_x,
+            p.profile_cursor_y,
+        ];
+        for u in &result.param_updates {
+            if let ParamUpdate::Float64Array { reason, .. } = u {
+                assert!(
+                    !profile_reasons.contains(reason),
+                    "no profile waveform may be emitted for ndims>2"
+                );
+            }
         }
     }
 

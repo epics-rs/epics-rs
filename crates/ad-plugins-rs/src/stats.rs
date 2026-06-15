@@ -841,42 +841,28 @@ pub fn compute_profiles(
         .map(|(&s, &c)| if c > 0 { s / c as f64 } else { 0.0 })
         .collect();
 
-    // Centroid profiles: extract single row/column at centroid position
-    let cy_row = (centroid_y + 0.5) as usize;
-    let cx_col = (centroid_x + 0.5) as usize;
+    // Centroid/cursor profiles: extract a single row/column at the requested
+    // position. C clamps the index to the valid range (NDPluginStats.cpp:341-360,
+    // `MAX(.,0)` then `MIN(.,size-1)`): an out-of-range centroid or user cursor
+    // collapses to the edge row/column, never a zero-filled profile. (x_size and
+    // y_size are both > 0 here — the function early-returns on a zero dimension.)
+    let cy_row = ((centroid_y + 0.5).max(0.0) as usize).min(y_size - 1);
+    let cx_col = ((centroid_x + 0.5).max(0.0) as usize).min(x_size - 1);
+    let cur_y = cursor_y.min(y_size - 1);
+    let cur_x = cursor_x.min(x_size - 1);
 
-    let centroid_x_profile = if cy_row < y_size {
-        (0..x_size)
-            .map(|ix| data.get_as_f64(cy_row * x_size + ix).unwrap_or(0.0))
-            .collect()
-    } else {
-        vec![0.0; x_size]
-    };
-
-    let centroid_y_profile = if cx_col < x_size {
-        (0..y_size)
-            .map(|iy| data.get_as_f64(iy * x_size + cx_col).unwrap_or(0.0))
-            .collect()
-    } else {
-        vec![0.0; y_size]
-    };
-
-    // Cursor profiles: extract single row/column at cursor position
-    let cursor_x_profile = if cursor_y < y_size {
-        (0..x_size)
-            .map(|ix| data.get_as_f64(cursor_y * x_size + ix).unwrap_or(0.0))
-            .collect()
-    } else {
-        vec![0.0; x_size]
-    };
-
-    let cursor_y_profile = if cursor_x < x_size {
-        (0..y_size)
-            .map(|iy| data.get_as_f64(iy * x_size + cursor_x).unwrap_or(0.0))
-            .collect()
-    } else {
-        vec![0.0; y_size]
-    };
+    let centroid_x_profile: Vec<f64> = (0..x_size)
+        .map(|ix| data.get_as_f64(cy_row * x_size + ix).unwrap_or(0.0))
+        .collect();
+    let centroid_y_profile: Vec<f64> = (0..y_size)
+        .map(|iy| data.get_as_f64(iy * x_size + cx_col).unwrap_or(0.0))
+        .collect();
+    let cursor_x_profile: Vec<f64> = (0..x_size)
+        .map(|ix| data.get_as_f64(cur_y * x_size + ix).unwrap_or(0.0))
+        .collect();
+    let cursor_y_profile: Vec<f64> = (0..y_size)
+        .map(|iy| data.get_as_f64(iy * x_size + cur_x).unwrap_or(0.0))
+        .collect();
 
     ProfileResult {
         avg_x,
@@ -1010,13 +996,13 @@ impl NDPluginProcess for StatsProcessor {
             result.profile_cursor_y = profiles.cursor_y;
         }
 
-        // Compute cursor value: pixel at (cursor_x, cursor_y)
-        if info.color_size <= 1 && array.dims.len() >= 2 {
-            let cx = self.cursor_x;
-            let cy = self.cursor_y;
-            if cx < info.x_size && cy < info.y_size {
-                result.cursor_value = array.data.get_as_f64(cy * info.x_size + cx).unwrap_or(0.0);
-            }
+        // Compute cursor value: pixel at (cursor_x, cursor_y). C clamps the
+        // cursor to the last valid pixel (NDPluginStats.cpp:357-362) and always
+        // reads it — an out-of-range cursor yields the edge pixel, never 0.
+        if info.color_size <= 1 && array.dims.len() >= 2 && info.x_size > 0 && info.y_size > 0 {
+            let cx = self.cursor_x.min(info.x_size - 1);
+            let cy = self.cursor_y.min(info.y_size - 1);
+            result.cursor_value = array.data.get_as_f64(cy * info.x_size + cx).unwrap_or(0.0);
         }
 
         let mut updates = vec![
@@ -1669,6 +1655,52 @@ mod tests {
         assert_eq!(profiles.centroid_y.len(), 8);
         for (iy, &v) in profiles.centroid_y.iter().enumerate() {
             assert!((v - iy as f64).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn test_adp14_out_of_range_cursor_clamps_to_edge_not_zeros() {
+        // C clamps an out-of-range cursor/centroid to the last valid line
+        // (NDPluginStats.cpp:341-360), never returning a zero-filled profile.
+        // 8x8 image with value = row index.
+        let mut pixels = vec![0.0f64; 64];
+        for iy in 0..8 {
+            for ix in 0..8 {
+                pixels[iy * 8 + ix] = iy as f64;
+            }
+        }
+        let data = NDDataBuffer::F64(pixels);
+
+        let profiles = compute_profiles(
+            &data, 8, 8, 0.0,   // threshold
+            100.0, // centroid_x out of range -> clamp to col 7
+            100.0, // centroid_y out of range -> clamp to row 7
+            50,    // cursor_x out of range -> clamp to col 7
+            50,    // cursor_y out of range -> clamp to row 7
+        );
+
+        // Cursor X profile: clamped row 7 -> all 7.0 (NOT zeros).
+        assert_eq!(profiles.cursor_x.len(), 8);
+        for &v in &profiles.cursor_x {
+            assert!((v - 7.0).abs() < 1e-10, "cursor_x should clamp to row 7");
+        }
+        // Cursor Y profile: clamped col 7 -> values 0..7 (NOT zeros).
+        for (iy, &v) in profiles.cursor_y.iter().enumerate() {
+            assert!(
+                (v - iy as f64).abs() < 1e-10,
+                "cursor_y should clamp to col 7"
+            );
+        }
+        // Centroid X profile: clamped row 7 -> all 7.0.
+        for &v in &profiles.centroid_x {
+            assert!((v - 7.0).abs() < 1e-10, "centroid_x should clamp to row 7");
+        }
+        // Centroid Y profile: clamped col 7 -> values 0..7.
+        for (iy, &v) in profiles.centroid_y.iter().enumerate() {
+            assert!(
+                (v - iy as f64).abs() < 1e-10,
+                "centroid_y should clamp to col 7"
+            );
         }
     }
 

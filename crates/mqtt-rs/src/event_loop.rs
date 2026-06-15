@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use crate::address::{TopicAddress, ValueType};
 use crate::config::MqttConfig;
 use crate::driver::PublishRequest;
-use crate::payload::{DecodedValue, decode_payload};
+use crate::payload::{DecodedValue, decode_payload, octet_cstr};
 
 /// Run the MQTT event loop.
 ///
@@ -187,10 +187,12 @@ async fn handle_incoming_message(
                         });
                     }
                     DecodedValue::String(v) => {
+                        // asyn octet store truncates at the first NUL
+                        // (setStringParam(index, val.c_str()), drvMqtt.cpp:299).
                         batch_updates.push(ParamSetValue::Octet {
                             reason: *reason,
                             addr: 0,
-                            value: v,
+                            value: octet_cstr(&v).to_string(),
                         });
                     }
                     DecodedValue::Float64Array(v) => {

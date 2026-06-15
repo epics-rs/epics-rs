@@ -25,6 +25,19 @@ pub fn decode_payload(raw: &str, addr: &TopicAddress) -> MqttResult<DecodedValue
     }
 }
 
+/// An asyn octet value is a NUL-terminated C-string. Both C octet boundaries
+/// terminate the value at the first NUL byte: the inbound store
+/// `setStringParam(index, val.c_str())` (drvMqtt.cpp:299) and the outbound
+/// `mqttClient.publish(addr.topicName, stringData.data())`
+/// (`publish(const std::string&)` from a `char*`, drvMqtt.cpp:716). Return the
+/// prefix up to the first NUL so the Rust octet value matches that C-string view.
+pub fn octet_cstr(s: &str) -> &str {
+    match s.find('\0') {
+        Some(i) => &s[..i],
+        None => s,
+    }
+}
+
 /// Encode a value for publishing according to the topic address format.
 ///
 /// If `addr.normalize_on_off` is true, string values are normalized
@@ -401,6 +414,16 @@ mod tests {
         let addr = TopicAddress::parse("FLAT:STRING test/t").unwrap();
         let val = decode_payload("  hello  ", &addr).unwrap();
         assert_eq!(val, DecodedValue::String("  hello  ".into()));
+    }
+
+    #[test]
+    fn octet_cstr_truncates_at_first_nul() {
+        // asyn octet values are NUL-terminated C-strings (drvMqtt.cpp:299,716).
+        assert_eq!(octet_cstr("hi\0there"), "hi");
+        assert_eq!(octet_cstr("\0rest"), "");
+        // No NUL: full string, surrounding whitespace preserved.
+        assert_eq!(octet_cstr("  hello  "), "  hello  ");
+        assert_eq!(octet_cstr(""), "");
     }
 
     #[test]

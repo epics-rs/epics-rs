@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use crate::address::TopicAddress;
 use crate::config::{MqttConfig, QoS};
 use crate::error::MqttError;
-use crate::payload::{DecodedValue, encode_payload};
+use crate::payload::{DecodedValue, encode_payload, octet_cstr};
 
 /// Request to publish a message to the MQTT broker.
 #[derive(Debug, Clone)]
@@ -171,7 +171,12 @@ impl PortDriver for MqttDriver {
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
-        let s = String::from_utf8_lossy(data).into_owned();
+        // asyn octet values are NUL-terminated C-strings: C stringWrite publishes
+        // std::string(stringData.data()), terminating the payload at the first NUL
+        // (drvMqtt.cpp:716). Truncate at the first NUL so the published payload
+        // (and the cached value, which holds the same octet) matches.
+        let full = String::from_utf8_lossy(data).into_owned();
+        let s = octet_cstr(&full).to_string();
         self.publish_value(user.reason, &DecodedValue::String(s.clone()))?;
         self.base.params.set_string(user.reason, user.addr, s)?;
         self.base.call_param_callbacks(user.addr)
@@ -339,6 +344,24 @@ mod tests {
         let req = rx.try_recv().unwrap();
         assert_eq!(req.topic, "test/str_topic");
         assert_eq!(req.payload, "hello");
+    }
+
+    /// C parity: stringWrite publishes std::string(stringData.data()), which
+    /// terminates at the first NUL (drvMqtt.cpp:716). An embedded-NUL octet
+    /// write must publish only the bytes up to that NUL, not the full buffer.
+    #[test]
+    fn write_octet_truncates_published_payload_at_first_nul() {
+        let (mut driver, mut rx) = make_driver(&["FLAT:STRING test/str_topic"]);
+        let reason = driver
+            .drv_user_create("FLAT:STRING test/str_topic")
+            .unwrap();
+        let mut user = AsynUser::new(reason);
+
+        driver.write_octet(&mut user, b"hi\0there").unwrap();
+
+        let req = rx.try_recv().unwrap();
+        assert_eq!(req.topic, "test/str_topic");
+        assert_eq!(req.payload, "hi");
     }
 
     /// C parity: a partial-mask DIGITAL write before any current value is

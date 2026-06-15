@@ -853,49 +853,49 @@ ADP-67 (N-bit filter wrong).
 ### routing / buffer plugins — NDPosPlugin / NDPluginCircularBuff / NDPluginScatter / NDPluginGather (ADP-31..45)
 
 #### ADP-31: NDPosPlugin XML position format is completely different (attribute names diverge)
-Severity: High — fix
+Severity: High — fix — **FIXED 677e70a3**
 Rust: `pos_plugin.rs:180-262` `parse_positions_xml` reads `<position index="N">value</position>`, emits a single map key literally named `"position"`.
 C: `NDPosPluginFileReader.cpp:144-213` reads `<dimensions><dimension name="X"/>…</dimensions>` then `<position X="1" Y="2"/>`, where each map key is a **dimension name** and the value comes from a `<position>` **attribute** of that name.
 Impact: Downstream NDArray attributes have entirely different names/structure. A real `pos_layout` XML (`<dimension name="x"/>` + `<position x="..."/>`) attaches attributes named `x`, `y`, … in C, but the Rust parser finds zero matches in that format and attaches nothing.
 
 #### ADP-32: NDPos_CurrentPos octet param never produced
-Severity: High — fix
+Severity: High — fix — **FIXED 6a788fe0**
 Rust: `pos_plugin.rs:306-322` attaches attributes but posts only `ParamUpdate::int32(0,…)`/`int32(1,…)`; no CurrentPos string is built or posted.
 C: `NDPosPlugin.cpp:149-166` builds `sspos = "[" + key "=" value ("," …) + "]"` and `setStringParam(NDPos_CurrentPos, …)`.
 Impact: A client reading `NDPos_CurrentPos` (asynParamOctet) gets `"[x=1,y=2]"` in C; in Rust the param does not exist and is never updated.
 
 #### ADP-33: NDPosPlugin registers none of its 17 params; processor emits hardcoded indices 0/1
-Severity: High — fix
+Severity: High — fix — **FIXED 6d505b9f**
 Rust: `pos_plugin.rs` has no `register_params`; `process_array` posts `ParamUpdate::int32(0, missing)` and `int32(1, duplicate)` to fixed indices 0/1.
 C: `NDPosPlugin.cpp:383-399` `createParam` for 17 params with explicit asyn types (Octet: Filename, CurrentPos, IDName; Int32: FileValid, Clear, Running, Restart, Delete, Mode, Append, CurrentQty, CurrentIndex, MissingFrames, DuplicateFrames, ExpectedID, IDDifference, IDStart).
 Impact: Clients cannot read CurrentQty/CurrentIndex/Running/ExpectedID/FileValid, and the two values that *are* posted land on whatever params live at indices 0/1 — not MissingFrames/DuplicateFrames — so even those go to the wrong DBR-typed params.
 
 #### ADP-34: NDPosPlugin attribute description string differs ("" vs "Position of NDArray")
-Severity: Low — fix-low
+Severity: Low — fix-low — **FIXED 4423e6f6** (description fixed; the `source`/driverName-string sub-point is a port-wide `NDAttrSource::Driver`→"Driver" modeling decision, left as-is)
 Rust: `pos_plugin.rs:308-313` `NDAttribute::new_static(key, String::new(), …)` — empty description.
 C: `NDPosPlugin.cpp:161` `new NDAttribute(name, "Position of NDArray", NDAttrSourceDriver, driverName, NDAttrFloat64, &value)`.
 Impact: The NDAttribute `description` (observable when attributes serialize to HDF5/PVA) is empty in Rust where C carries `"Position of NDArray"`; the `source` (driverName) string also differs (Rust passes empty).
 
 #### ADP-35: NDPosPlugin forwards arrays downstream while idle; C drops them
-Severity: High — fix
+Severity: High — fix — **FIXED fbe9db6c**
 Rust: `pos_plugin.rs:266-268` when `!running`, returns `ProcessResult::arrays(vec![clone])` — forwards the input unchanged.
 C: `NDPosPlugin.cpp:54,202-205` `endProcessCallbacks` is reached only inside `if (running == NDPOS_RUNNING)` and only `if (skip == 0 && running == NDPOS_RUNNING)`; when idle, no downstream callback.
 Impact: Stopped (NDPOS_IDLE), C produces no downstream callbacks; Rust passes every frame through. Downstream plugins observe frames in Rust that C withholds.
 
 #### ADP-36: NDPosPlugin expected-ID stepping ignores IDDifference and re-syncs to actual uniqueId
-Severity: Medium — fix
+Severity: Medium — fix — **FIXED 9f53c170**
 Rust: `pos_plugin.rs:317` `self.expected_id = array.unique_id + 1` (re-anchors to received ID, step hardcoded +1).
 C: `NDPosPlugin.cpp:192-194` `expectedID += IDDifference` (steps by configurable `NDPos_IDDifference`, default 1, never re-anchoring).
 Impact: With `IDDifference != 1`, or any sequence where uniqueId does not advance by exactly the step, the missing/duplicate classification and MissingFrames/DuplicateFrames values diverge. Even at step 1, Rust's re-anchor masks cumulative drift C keeps reporting.
 
 #### ADP-37: NDPosPlugin first-frame ID check is suppressed (expected_id starts at 0)
-Severity: Medium — fix
+Severity: Medium — fix — **FIXED 63d8951a**
 Rust: `pos_plugin.rs:104,280` `start()` sets `expected_id = 0`; gate `if self.expected_id > 0` skips ID checking on the first running frame; expected is armed only after the first via `unique_id + 1`.
 C: `NDPosPlugin.cpp:234,421-422` writeInt32(Running) sets `ExpectedID = IDStart` (default 1), so the first frame is compared against ExpectedID=1 immediately and can already be drop/duplicate.
 Impact: A first frame whose uniqueId ≠ 1 is counted missing/duplicate in C but accepted silently in Rust, so the counters and which frame gets a position attached differ on the first frame after start.
 
 #### ADP-38: NDPosPlugin position-exhaustion does not stop/abort the documented way
-Severity: Medium — fix
+Severity: Medium — fix — **FIXED 3e1d2fa1**
 Rust: `pos_plugin.rs:285-298` on a gap, advances `diff` times and, if positions run out, forwards the array **with no position attached** and returns.
 C: `NDPosPlugin.cpp:98-124,140` on a gap in Discard mode erases from the front; if size hits 0 it sets `NDPos_Running = IDLE` (stops) and does **not** call endProcessCallbacks (no downstream emit). Keep mode advances index and stops at `index == size`.
 Impact: Positions exhausted mid-gap: C stops the plugin and drops the frame; Rust forwards the bare frame and keeps running. Downstream gets an extra unattributed frame in Rust and Running stays on.
@@ -905,6 +905,12 @@ Severity: Low — signoff
 Rust: `pos_plugin.rs:312` `NDAttrValue::Float64(*value)`.
 C: `NDPosPlugin.cpp:161` `NDAttrFloat64` with a `double`.
 Impact: None — both emit NDAttrFloat64, so the attribute type matches. The header comment (`NDPosPlugin.h:9`) says "1D integer valued attribute" but the C code attaches Float64; Rust matches the code. Listed for completeness.
+
+#### ADP-96: PluginType param value mismatches C for NDPositionPlugin and NDAttrPlot
+Severity: Low — fix — **FIXED 357dbba1** (found during the ADP-31..38 fix phase)
+Rust: `pos_plugin.rs:551` `plugin_type()` returned `"NDPosPlugin"`; `attr_plot.rs:340` returned `"NDPluginAttrPlot"` (the class names). The runtime sets the `PLUGIN_TYPE` asyn param (PluginType_RBV) from `plugin_type()` (`runtime.rs:1103`).
+C: `NDPosPlugin.cpp:402` `setStringParam(…PluginType, "NDPositionPlugin")`; `NDPluginAttrPlot.cpp:87` `setStringParam(…PluginType, "NDAttrPlot")`.
+Impact: A client reading `PluginType_RBV` saw the wrong string for these two plugins. Defect-family sweep over all 24 `plugin_type()` impls: only these two diverged; the other 22 match C verbatim. `file_hdf5.rs` is distinct — C embeds the ADCore build version (`"NDFileHDF5 ver%d.%d.%d"`, `NDFileHDF5.cpp:2387-2388`), which the Rust port cannot fabricate, so it is intentionally left as `"NDFileHDF5"`.
 
 #### ADP-40: NDPluginCircularBuff CIRC_BUFF_STATUS is an Octet string in C, Int32 in Rust
 Severity: Medium — fix — **FIXED d26eec7f**

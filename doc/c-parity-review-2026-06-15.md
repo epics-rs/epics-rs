@@ -1031,11 +1031,12 @@ Rust: `passthrough.rs:11-43` `PassthroughProcessor` is a stub returning `Process
 C: no single upstream "passthrough" plugin (`NDFileNull`/`NDFileDummy` are file-writer stubs; base `NDPluginDriver` passthrough is the framework).
 Impact: No C plugin to diverge from; a deliberate placeholder, no wire-parity claim applies.
 
-#### ADP-59: StdArrays/Attribute NDArrayCallbacks initial value — Rust defaults on, C off
+#### ADP-59: StdArrays/Attribute NDArrayCallbacks initial value — Rust defaults on, C off — **FIXED 883768c9**
 Severity: Low — verify
 Rust: `plugin/runtime.rs:1104` sets `ndarray_params.array_callbacks = 1` for every plugin port; no StdArrays-specific override to 0.
 C: `NDPluginStdArrays.cpp:343` and `NDPluginAttribute.cpp:203` both `setIntegerParam(NDArrayCallbacks, 0)` in the constructor.
 Impact: The initial `ArrayCallbacks` param a client reads for StdArrays/Attribute ports is 1 in Rust but 0 in C. Primarily an initial-param-value divergence; verify whether any downstream behavior keys off ArrayCallbacks==0 for these two plugins.
+**Fix:** Defect-family sweep `rg "setIntegerParam\(NDArrayCallbacks, 0\)"` in ADCore found a THIRD site the citation missed: `NDPluginFile.cpp:948` (the base class of every file writer — HDF5/JPEG/TIFF/netCDF/Nexus/Magick), with the same "this plugin currently does not do array callbacks" rationale. Added an `NDPluginProcess::does_array_callbacks()` trait method (default `true`); the shared `PluginPortDriver::new` now sets the initial `array_callbacks` param to `does_array_callbacks() as i32` instead of hardcoded `1`, and the runtime delivery field (`SharedProcessorInner.array_callbacks`, both constructor paths) reads the same value, so the initial param and the runtime gate agree by construction. Overridden to `false` in `StdArraysProcessor`, `AttributeProcessor`, and all six file processors. Regression: `test_std_arrays_initial_array_callbacks_off` (param read-back == 0 through a live runtime) + `test_terminal_plugins_do_not_do_array_callbacks` (all 8 terminal processors false, a non-terminal Passthrough still true).
 
 #### ADP-60: StdArrays throttle does not decrement ArrayCounter; Rust has no throttle-rollback
 Severity: Low — verify

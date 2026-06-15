@@ -148,7 +148,8 @@ fn ndarray_to_pv_field(array: &NDArray) -> PvField {
             size: d.size as i32,
             offset: d.offset as i32,
             full_size: d.size as i32,
-            binning: d.binning.max(1) as i32,
+            // C ntndArrayConverter.cpp:471 puts dims[i].binning verbatim (no clamp).
+            binning: d.binning as i32,
             reverse: d.reverse,
         })
         .collect();
@@ -335,6 +336,31 @@ mod tests {
             }
             _ => panic!("expected structure"),
         }
+    }
+
+    /// Regression: the NTNDArray `dimension[].binning` field must serialize the
+    /// raw NDDimension binning verbatim. C ntndArrayConverter.cpp:471 does
+    /// `put(src->dims[i].binning)` with no clamp, so a binning of 0 goes out as
+    /// 0. Pre-fix Rust applied `.max(1)`, turning a 0 into a wire 1.
+    #[test]
+    fn dimension_binning_serializes_zero_verbatim() {
+        let mut dim = NDDimension::new(8);
+        dim.binning = 0;
+        let arr = NDArray::new(vec![dim], NDDataType::UInt8);
+
+        let payload = ndarray_to_pv_field(&arr);
+        let PvField::Structure(s) = &payload else {
+            panic!("expected structure, got {payload:?}");
+        };
+        let Some(PvField::StructureArray(dims)) = s.get_field("dimension") else {
+            panic!("expected dimension StructureArray");
+        };
+        let d0 = dims[0].as_ref().expect("dimension[0] present");
+        assert_eq!(
+            d0.get_field("binning"),
+            Some(&PvField::Scalar(ScalarValue::Int(0))),
+            "binning 0 must stay 0 on the wire, not clamp to 1"
+        );
     }
 
     /// Regression for the compressed NTNDArray wire contract.

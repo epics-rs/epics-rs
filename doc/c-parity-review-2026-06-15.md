@@ -73,6 +73,10 @@ population). One commit per finding.
 | OPT-11 (QXBPM set_defaults preserves offsets) | fix | Fixed | 4fc2e166 |
 | OPT-12 (QXBPM pos:x/y unguarded divide → NaN/Inf) | verify→fix | Fixed | 3eeda648 |
 | OPT-16 (PF4 invTrans gated on trans>0) | fix | Fixed | de2beb9f |
+| OPT-14 (Io scaler.DESC = selected channel name) | fix | Fixed | 18a2795b |
+| OPT-15a/b (Io out-of-range channel + zero-ticks ionAbs) | fix-low | Fixed | 67fa074b |
+| OPT-15c (Io 6-sig-fig absorption coefficients) | fix-low | Fixed | 01d9fc5d |
+| OPT-13 (Io init force-writes 19 default PVs) | verify→fork | OPEN — needs user call | — |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -505,18 +509,21 @@ Severity: Medium — verify
 Rust: `crates/optics-rs/src/snl/io.rs:578-585` writes only E_using.
 C: `Io.st:174-196` pvPuts 19 constants + seeds 4 outputs.
 Impact: Rust keeps stale DB/autosave values, outputs unseeded. (C's clobber-DB is arguably the questionable side — verify which to match.)
+Investigated (2026-06-15): the 19 PVs C force-writes (`Io.st:174-195`) are all operator-tunable defaults, not fixed physical constants — the C comments say so (`icChannel` "likely scaler channel", `VperA` "likely setting", `xAir=1` "assume 1 atmosphere", `activeLen=60` "assume CHESS ion chambers", `dEff=1` "assume NaI(Tl)"). They are exactly the fields autosave restores (gas mix, chamber geometry, gains), so C's boot-time force-write clobbers autosaved operator settings. This is a genuine semantic fork, NOT output-form parity: (A) write all 22 like C (clobbers autosave for the 18 tunables); (B) seed only the 4 computed outputs (flux=0/ionPhotons=0/ionAbs=1/detector=0), leave operator params to autosave/.db defaults; (C) keep current (E_using only). Needs user sign-off; not silently picked.
 
 #### OPT-14: Io `scaler.DESC` (icName) string never written by Rust
 Severity: Medium — fix
 Rust: `crates/optics-rs/src/snl/io.rs:499-666` never writes `{P}scaler.DESC`.
 C: `Io.st:351-364` pvGets `{VSC}.NMn` and PVPUTSTRs it into `{P}scaler.DESC`.
 Impact: C keeps scaler.DESC updated; Rust never writes it.
+Fixed 18a2795b: run() connects {VSC}.NM2..NM15 and writes the selected channel's name to {P}scaler.DESC each update (gated on channel 2-15).
 
 #### OPT-15: Io coefficient/edge-case divergences (clamp + truncated constants)
 Severity: Low — fix-low
 Rust: `crates/optics-rs/src/snl/io.rs:648` clamps `icChannel.max(2)`; `:372-374` zeros outputs incl. ion_abs on ticks<=0; `:133-241,312-317` 5-sig-fig constants.
 C: `Io.st:409-426,427,444,592-770` — channel 0/1 → cps=0; ticks==0 → finite ionAbs; 6-sig-fig constants.
 Impact: (a) channel 0/1 → C zero outputs vs Rust nonzero; (b) ticks==0 → C-finite ionAbs vs Rust 0; (c) ~5th-sig-fig drift.
+Fixed: (a)+(b) 67fa074b — eval_flux gates cps on the 2-15 channel window (0/1/>15 → cps=0, matching C switch default) and run() drops the .max(2) clamp; the ticks<=0 early-return is removed so ionAbs stays finite (cps→0 zeros flux/detector/ionPhotons). (c) 01d9fc5d — restored the exact 6-sig-fig C absorption coefficients (Io.st:592-770) in abs_h/he/be/c/n/o/ar, abs_ar_photo, and photon().
 
 #### OPT-16: PF4 invTrans posted unconditionally where C gates on trans > 0 (found during OPT-12 family sweep)
 Severity: Low — fix

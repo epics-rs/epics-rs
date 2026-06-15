@@ -109,8 +109,15 @@ pub fn mono_to_rgb1(src: &NDArray) -> ADResult<NDArray> {
     Ok(arr)
 }
 
-/// Convert RGB1 (3-channel interleaved) to mono using luminance formula.
-/// Y = 0.299*R + 0.587*G + 0.114*B
+/// Convert RGB1 (3-channel interleaved) to mono.
+///
+/// C `NDPluginColorConvert::convertColor` uses the unweighted mean
+/// `value = (R + G + B) / 3.` cast to the output type — a C cast that
+/// truncates toward zero, not luminance weighting and not rounding
+/// (`NDPluginColorConvert.cpp:392-395`; the RGB2/RGB3 mono paths `:462`/`:`
+/// and the Bayer mono path `:331` use the same `(R+G+B)/3`). This is the
+/// single chokepoint: ad-plugins routes RGB2/RGB3/Bayer→mono through here
+/// after converting to RGB1 (`color_convert.rs:437`).
 pub fn rgb1_to_mono(src: &NDArray) -> ADResult<NDArray> {
     if src.dims.len() != 3 || src.dims[0].size != 3 {
         return Err(ADError::InvalidDimensions(
@@ -128,8 +135,8 @@ pub fn rgb1_to_mono(src: &NDArray) -> ADResult<NDArray> {
                 let r = $v[i * 3] as f64;
                 let g = $v[i * 3 + 1] as f64;
                 let b = $v[i * 3 + 2] as f64;
-                let lum = 0.299 * r + 0.587 * g + 0.114 * b;
-                out[i] = lum.round() as $T;
+                // C: value = (R+G+B)/3. then (epicsType)value — truncate.
+                out[i] = ((r + g + b) / 3.0) as $T;
             }
             NDDataBuffer::$variant(out)
         }};
@@ -833,8 +840,9 @@ mod tests {
         assert_eq!(mono.dims.len(), 2);
         assert_eq!(mono.dims[0].size, 2);
         if let NDDataBuffer::U8(ref v) = mono.data {
-            assert_eq!(v[0], 76); // 0.299 * 255 ≈ 76
-            assert_eq!(v[1], 150); // 0.587 * 255 ≈ 150
+            // C (R+G+B)/3 truncated, NOT luminance: (255+0+0)/3 = 85.
+            assert_eq!(v[0], 85);
+            assert_eq!(v[1], 85); // (0+255+0)/3 = 85
         } else {
             panic!("wrong type");
         }

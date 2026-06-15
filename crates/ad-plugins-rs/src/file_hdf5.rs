@@ -1320,6 +1320,27 @@ impl Hdf5Writer {
             })
             .collect();
 
+        // C writeDefaultDatasetAttributes (NDFileHDF5.cpp:3695-3719) attaches
+        // NDArrayNumDims (scalar int32) and one int32 value per dimension for
+        // NDArrayDimOffset/Binning/Reverse to every detector dataset. Dim order
+        // is native NDArray order (dims[0]…), not the reversed HDF5 axis order.
+        let nd_num_dims = array.dims.len() as i32;
+        // writeH5attrInt32 (NDFileHDF5.cpp:1142-1176) writes a single value as a
+        // scalar and multiple values as a 1-D array. A 1-D NDArray takes the
+        // scalar path, which rust-hdf5 can emit; multi-dim arrays need int32
+        // ARRAY attributes that rust-hdf5 0.2.17's scalar-only attribute API
+        // cannot produce — those per-dimension arrays are a residual here.
+        let dim_scalars: Option<[(&str, i32); 3]> = if array.dims.len() == 1 {
+            let d = &array.dims[0];
+            Some([
+                ("NDArrayDimOffset", d.offset as i32),
+                ("NDArrayDimBinning", d.binning as i32),
+                ("NDArrayDimReverse", d.reverse as i32),
+            ])
+        } else {
+            None
+        };
+
         macro_rules! create_ds {
             ($t:ty) => {{
                 let mut builder = match ds_group.as_ref() {
@@ -1416,6 +1437,24 @@ impl Hdf5Writer {
                                 .create(aname)
                                 .and_then(|a| a.write_scalar(&s));
                         }
+                    }
+                }
+                // C parity (writeDefaultDatasetAttributes): NDArrayNumDims plus
+                // the per-dimension offset/binning/reverse. The per-dimension
+                // values are written only for a 1-D array (scalar path); see
+                // `dim_scalars`.
+                let _ = ds
+                    .new_attr::<i32>()
+                    .shape(())
+                    .create("NDArrayNumDims")
+                    .and_then(|a| a.write_numeric(&nd_num_dims));
+                if let Some(dims_attrs) = dim_scalars {
+                    for (name, val) in dims_attrs {
+                        let _ = ds
+                            .new_attr::<i32>()
+                            .shape(())
+                            .create(name)
+                            .and_then(|a| a.write_numeric(&val));
                     }
                 }
                 ds
@@ -2900,6 +2939,54 @@ mod tests {
         assert_eq!(read("NDAttrDescription"), "exposure time");
         assert_eq!(read("NDAttrSourceType"), "NDAttrSourceEPICSPV");
         assert_eq!(read("NDAttrSource"), "13SIM1:cam1:AcquireTime_RBV");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_detector_dataset_ndarray_dim_attributes() {
+        // C writeDefaultDatasetAttributes (NDFileHDF5.cpp:3695-3719) attaches
+        // NDArrayNumDims (scalar) and the per-dimension NDArrayDimOffset/Binning/
+        // Reverse. The 1-D (single-value) case is a scalar int32 rust-hdf5 can
+        // emit exactly; multi-dim arrays only get NDArrayNumDims (the int32 array
+        // attributes are a scalar-only-attribute-API residual).
+
+        // 1-D array: all four attributes present and scalar, in native order.
+        let path = temp_path("hdf5_dimattr_1d");
+        let mut writer = Hdf5Writer::new();
+        let mut d = NDDimension::new(8);
+        d.offset = 3;
+        d.binning = 2;
+        d.reverse = true;
+        let arr = NDArray::new(vec![d], NDDataType::UInt16);
+        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
+        let h5 = H5File::open(&path).unwrap();
+        let ds = h5.dataset("data").unwrap();
+        let geti = |n: &str| -> i32 { ds.attr(n).unwrap().read_numeric().unwrap() };
+        assert_eq!(geti("NDArrayNumDims"), 1);
+        assert_eq!(geti("NDArrayDimOffset"), 3);
+        assert_eq!(geti("NDArrayDimBinning"), 2);
+        assert_eq!(geti("NDArrayDimReverse"), 1);
+        std::fs::remove_file(&path).ok();
+
+        // 2-D array: NDArrayNumDims present (=2); the Dim* int32 arrays are not
+        // emitted (rust-hdf5 scalar-only attribute limitation).
+        let path = temp_path("hdf5_dimattr_2d");
+        let mut writer = Hdf5Writer::new();
+        let arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(8)],
+            NDDataType::UInt16,
+        );
+        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
+        let h5 = H5File::open(&path).unwrap();
+        let ds = h5.dataset("data").unwrap();
+        let numdims: i32 = ds.attr("NDArrayNumDims").unwrap().read_numeric().unwrap();
+        assert_eq!(numdims, 2);
+        let names = ds.attr_names().unwrap();
+        assert!(!names.contains(&"NDArrayDimOffset".to_string()));
         std::fs::remove_file(&path).ok();
     }
 

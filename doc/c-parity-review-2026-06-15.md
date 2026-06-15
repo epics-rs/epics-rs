@@ -81,9 +81,9 @@ population). One commit per finding.
 | OPT-T2 (table restores speed on every speed-capable motor) | verify→fix | Fixed | d7318d2d |
 | OPT-T3 (table zeroes motor limits on read failure) | verify→fix | Fixed | 9dc07384 |
 | OPT-T4 (Newport user limits use raw-angle rotation matrix) | verify→fix | Fixed | c82703ec |
-| OPT-T5 (table sqrt/asin domain clamps vs C bare NaN/Inf) | signoff | Signoff — keep Rust guards (user call) | — |
-| OPT-T6 (table speed-ratio NaN guard vs C 0/0 poison) | signoff | Signoff — keep Rust guard (user call) | — |
-| OPT-3 (orient invertArray x/det vs x*(1/det) de-precision) | signoff | Signoff — keep Rust precision (user call) | — |
+| OPT-T5 (table sqrt/asin domain clamps vs C bare NaN/Inf) | signoff | Resolved — keep Rust guards (user 2026-06-15) | — |
+| OPT-T6 (table speed-ratio NaN guard vs C 0/0 poison) | signoff | Resolved — keep Rust guard (user 2026-06-15) | — |
+| OPT-3 (orient invertArray x/det vs x*(1/det) de-precision) | signoff | Resolved — keep Rust precision (user 2026-06-15) | — |
 | MQTT-1 (FLAT inbound INT/FLOAT/DIGITAL parses raw, rejects surrounding ws) | fix | Fixed | cb9ba4e9 |
 | MQTT-2 (FLAT:STRING inbound stored verbatim) | fix | Fixed | db0fc076 |
 | MQTT-4 (octet value terminates at first NUL) | fix-low | Fixed | 36f96ca1 |
@@ -112,7 +112,7 @@ population). One commit per finding.
 | ADP-14 (stats clamps out-of-range cursor/centroid to edge, not zeros) | fix | Fixed | b1b6f336 |
 | ADP-13 (stats skips centroid/profiles/cursor for ndims>2) | fix | Fixed | 6cfb6d1e |
 | ADP-15 (stats histogram upper-boundary clamp) | fix→N/A | Not applicable (clamp is a no-op for in-range values; guards already match C; proof in finding block) | — |
-| ADP-1 (stats centroid moments: raw-pixel vs threshold-profile) | fix→signoff | Signoff — precision-only fork, recommend keep Rust direct-central (OPT-3 precedent); routed to #58 | — |
+| ADP-1 (stats centroid moments: raw-pixel vs threshold-profile) | fix→signoff | Resolved — keep Rust direct-central moments, decoded-equivalent precision fork (user 2026-06-15) | — |
 | ADP-3 (false-color Rainbow/Iron LUTs by index, not generated jet) | fix | Fixed | 81d90f28 |
 | ADP-4 (Bayer demosaic border keeps native channel only) | fix | Fixed | 3b1669c6 |
 | ADP-9 (FFT rank from input ndims, not a fixed mode; 2-D input → full 2-D FFT) | fix | Fixed | 7943d427 |
@@ -124,9 +124,9 @@ population). One commit per finding.
 | ADP-19 (ROI single-color selection collapses to 2-D Mono) | fix | Fixed | c87ac8c3 |
 | ADP-23 (transform layout: array attr vs NDColorMode param) | verify→N/A | Not applicable (C refreshes the param from the array ColorMode attr each frame before use; same Mono default — equivalent, mismatch unreachable) | — |
 | ADP-27 (netCDF global-attr set: add NDNetCDFFileVersion=3.1; drop extra uniqueId/numArrays) | fix | Fixed | dbe09fd4 |
-| ADP-28 (TIFF RGB2/RGB3 PlanarConfig=SEPARATE vs Rust chunky-RGB1) | fix→signoff | Signoff — decoded-image-equivalent; byte-faithful planar needs hand-rolled writer (tiff crate is chunky-only); routed to #58 | — |
+| ADP-28 (TIFF RGB2/RGB3 PlanarConfig=SEPARATE vs Rust chunky-RGB1) | fix→signoff | Resolved — keep Rust chunky-RGB1, decoded-image-equivalent (user 2026-06-15) | — |
 | ADP-30a (Stats HIST_BELOW/HIST_ABOVE Int32 param, not Float64) | fix-low | Fixed | 064b8011 |
-| ADP-30b (TIFF extra IFD tags / RowsPerStrip≠height) | signoff | Signoff — decoded-equivalent, crate-controlled (ADP-28 family); routed to #58 | — |
+| ADP-30b (TIFF extra IFD tags / RowsPerStrip≠height) | signoff | Resolved — keep Rust IFD tags, decoded-equivalent (user 2026-06-15) | — |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -186,6 +186,7 @@ Severity: Low — signoff
 Rust: `crates/ad-core-rs/src/color.rs:373-777` (rgb↔yuv444/422/411).
 C: `NDPluginColorConvert.cpp` handles only Mono↔RGB1/2/3 + Bayer; no YUV anywhere in ADCore.
 Impact: no divergence today (unwired). Conversely the C Bayer→RGB demosaic has a Rust counterpart only in ad-plugins (ADP-4). Flagged so the YUV paths are not mistaken for a faithful port.
+RESOLVED 2026-06-15 — keep the extra YUV paths (user): additive, unwired, no output-form divergence.
 
 #### ADC-8: `pool.convert` binning sums in f64 then casts once; C casts each element to the output type and accumulates there
 Severity: Low — verify (unwired: wired ROI does pure cropping, no binning)
@@ -404,6 +405,7 @@ Severity: Medium — signoff
 Rust: `crates/ad-plugins-rs/src/codec.rs:229-289,318-420`; names from `ad-core/codec.rs:9-27`.
 C: `Codec.h:4-18` codec universe is `{"","jpeg","blosc","lz4","bslz4"}`.
 Impact: a Rust array tagged "zlib"/"lz4hdf5" cannot be decompressed by stock C NDPluginCodec. Structural cause of ADP-11. Sign-off vs the ordinal-only fix.
+RESOLVED 2026-06-15 — keep the extra zlib/lz4hdf5 codecs (user): additive; the ordinal-shadowing they caused is already fixed (ADP-11 @ 39e07250, moved to 5/6 so they never collide with a C ordinal). Files tagged with them are Rust-to-Rust by design.
 
 #### ADP-27: netCDF missing NDNetCDFFileVersion global; writes extra uniqueId/numArrays globals — FIXED dbe09fd4
 Severity: Medium — fix
@@ -657,18 +659,21 @@ Severity: Low — signoff
 Rust: `crates/modbus-rs/src/interpose.rs:252-254` computes the spec-correct LRC over slave+data (NOTE `:246-251`).
 C: `modbusInterpose.c:423-430` sums body+received-LRC (→0x00 for any valid frame) and compares against `data[i]` one byte past the decoded region (stale buffer) — never validates the real LRC.
 Impact: on valid uppercase frames they agree; Rust rejects a genuinely-wrong LRC that C does not check. Intentional correction of a buggy C path. Signoff.
+RESOLVED 2026-06-15 — keep Rust (user): matching C would reproduce a checksum path that never validates the real LRC. Rust's spec-correct LRC is the intended behavior.
 
 #### MODB-2: ASCII reader rejects lowercase hex / runt frames that C silently mis-handles
 Severity: Low — signoff
 Rust: `crates/modbus-rs/src/interpose.rs:92-98,204-208,239-244` errors on non-`0-9A-F` and sub-minimum frames.
 C: `modbusInterpose.c:218-222,400-406` decodes lowercase to garbage / returns empty-success on runts.
 Impact: no wire divergence on valid frames; Rust stricter. Signoff.
+RESOLVED 2026-06-15 — keep Rust (user): rejecting lowercase-hex/runt frames is the intended strictness; C's garbage/empty-success decode is a latent defect not worth reproducing.
 
 #### MODB-3: Request frame-size overflow guarded in Rust, unchecked in C
 Severity: Low — signoff
 Rust: `crates/modbus-rs/src/interpose.rs:151,161,172,270-276` errors above MAX_MODBUS_FRAME_SIZE=600.
 C: `modbusInterpose.c:260-263` memcpy into the fixed buffer with no bound check.
 Impact: no divergence for valid-size requests; Rust adds a guard. Signoff.
+RESOLVED 2026-06-15 — keep Rust (user): the frame-size bound prevents an unchecked overflow C has; matching C would reintroduce the unguarded memcpy.
 
 Verified-equivalent (modbus): CRC-16 (0xA001/0xFFFF/low-byte-first), MBAP build+unwrap+txid correlation, all request PDUs (FC 1/2/3/4/5/6/15/16/23 incl. coil LSB-first packing, byteCount, FC23 read mode), response parse + exception 0x80 + code-5-as-success, all 37 data-type conversions (int16/uint16/int16sm/bcd/int32/uint32/int64/uint64/float32/float64 + LE/BE/BS variants, word order ABCD/CDAB/BADC/DCBA), BCD masking, string/zstring.
 

@@ -313,6 +313,14 @@ macro_rules! draw_on_typed_buffer {
                         .saturating_add(*size_y)
                         .min(y.saturating_add(bmp.height));
                     for (ci, ch) in rendered.chars().enumerate() {
+                        // C tests `if (cp[ii] < 32) continue;` on a signed
+                        // `char`, so bytes >= 128 are negative and skipped along
+                        // with control codes: only printable ASCII 32..=127 is
+                        // drawn. The cell still advances (C `continue`, ci++).
+                        let code = ch as u32;
+                        if !(32..128).contains(&code) {
+                            continue;
+                        }
                         let char_x0 = xmin + ci * bmp.width;
                         if char_x0 >= xmax {
                             break; // none of this character fits
@@ -1017,6 +1025,46 @@ mod tests {
             "vertical arm must span SizeY/2, not SizeX/2 (no square collapse)"
         );
         assert_eq!(px(10, 13), 0);
+    }
+
+    #[test]
+    fn test_adp22_extended_chars_not_drawn() {
+        // C `if (cp[ii] < 32) continue;` on a signed char skips codes >= 128.
+        // The Rust font covers codes 32..=222, so extended Latin letters used
+        // to render; they must now draw nothing while ASCII still does.
+        let count_set = |s: &str| {
+            let arr = NDArray::new(
+                vec![NDDimension::new(40), NDDimension::new(20)],
+                NDDataType::UInt8,
+            );
+            let overlays = vec![OverlayDef {
+                shape: OverlayShape::Text {
+                    x: 0,
+                    y: 0,
+                    size_x: 40,
+                    size_y: 20,
+                    text: s.to_string(),
+                    font: 0,
+                    timestamp_format: String::new(),
+                },
+                draw_mode: DrawMode::Set,
+                color: [0, 255, 0],
+                width_x: 1,
+                width_y: 1,
+            }];
+            let out = draw_overlays(&arr, &overlays);
+            if let NDDataBuffer::U8(ref v) = out.data {
+                v.iter().filter(|&&p| p != 0).count()
+            } else {
+                0
+            }
+        };
+        assert!(count_set("A") > 0, "printable ASCII 'A' must render");
+        assert_eq!(
+            count_set("\u{00C0}\u{00C9}\u{00D1}"),
+            0,
+            "codes >= 128 (À É Ñ) must not draw (C signed-char skip)"
+        );
     }
 
     #[test]

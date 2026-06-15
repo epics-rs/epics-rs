@@ -202,24 +202,30 @@ impl ROIStatProcessor {
         self.ts_sender = Some(sender);
     }
 
-    /// Resolve a ROI's geometry against the array dimensions: clamp each
-    /// size to fit within the array, returning `None` if the ROI is
-    /// out of range (offset past the last pixel) or empty (zero size).
+    /// Clamp a ROI's geometry to the array dimensions, mirroring the C
+    /// NDPluginROIStat clamp loop (NDPluginROIStat.cpp:241-247): for each
+    /// dimension present in the array, `offset ∈ [0, dim-1]` and
+    /// `size ∈ [1, dim-offset]`. Offsets are already non-negative (the
+    /// param-change handler clamps at 0), so only the upper bounds apply.
     /// `dims` holds the array's [X, Y] sizes; `ndims` selects how many of
-    /// them are real (1 or 2).
-    fn roi_geometry(
+    /// them are real (1 or 2). A clamped size is always ≥ 1, so an
+    /// out-of-range or zero-size ROI collapses to a single edge pixel
+    /// rather than yielding zero stats. Returns `None` only for a
+    /// degenerate zero-length dimension (empty array).
+    fn clamp_roi_geometry(
         roi: &ROIStatROI,
         ndims: usize,
         dims: [usize; 2],
     ) -> Option<([usize; 2], [usize; 2])> {
-        let offset = roi.offset;
+        let mut offset = roi.offset;
         let mut size = roi.size;
         for d in 0..ndims.min(2) {
             let dim = dims[d];
-            if offset[d] >= dim || size[d] == 0 {
+            if dim == 0 {
                 return None;
             }
-            size[d] = size[d].min(dim - offset[d]);
+            offset[d] = offset[d].min(dim - 1);
+            size[d] = size[d].max(1).min(dim - offset[d]);
         }
         Some((offset, size))
     }
@@ -363,15 +369,15 @@ impl NDPluginProcess for ROIStatProcessor {
         self.results
             .resize(self.rois.len(), ROIStatResult::default());
 
-        // Resolve each enabled ROI's geometry against the array bounds.
-        // `None` for disabled ROIs, unsupported ranks, or out-of-range /
-        // empty ROIs — those keep zero stats.
+        // Clamp each enabled ROI's geometry to the array bounds (C clamp
+        // loop). `None` for disabled ROIs or unsupported ranks — those keep
+        // zero stats and skip the geometry write-back.
         let clamped: Vec<Option<([usize; 2], [usize; 2])>> = self
             .rois
             .iter()
             .map(|roi| {
                 if roi.enabled && supported {
-                    Self::roi_geometry(roi, ndims, dims)
+                    Self::clamp_roi_geometry(roi, ndims, dims)
                 } else {
                     None
                 }
@@ -502,6 +508,11 @@ impl NDPluginProcess for ROIStatProcessor {
             updates.push(ParamUpdate::float64_addr(p.mean_value, addr, result.mean));
             updates.push(ParamUpdate::float64_addr(p.total, addr, result.total));
             updates.push(ParamUpdate::float64_addr(p.net, addr, result.net));
+
+            // Write back array sizes and the clamped geometry, matching the
+            // C clamp loop's setIntegerParam calls (NDPluginROIStat.cpp:250-261).
+            // MaxSize is 0 for an absent dimension; Dim*Min/Size readbacks
+            // reflect the clamped values for supported ranks.
             updates.push(ParamUpdate::int32_addr(
                 p.dim0_max_size,
                 addr,
@@ -512,6 +523,16 @@ impl NDPluginProcess for ROIStatProcessor {
                 addr,
                 if ndims >= 2 { dims[1] as i32 } else { 0 },
             ));
+            if let Some((offset, size)) = clamped[i] {
+                if ndims >= 1 {
+                    updates.push(ParamUpdate::int32_addr(p.dim0_min, addr, offset[0] as i32));
+                    updates.push(ParamUpdate::int32_addr(p.dim0_size, addr, size[0] as i32));
+                }
+                if ndims >= 2 {
+                    updates.push(ParamUpdate::int32_addr(p.dim1_min, addr, offset[1] as i32));
+                    updates.push(ParamUpdate::int32_addr(p.dim1_size, addr, size[1] as i32));
+                }
+            }
         }
         updates.push(ParamUpdate::int32(
             p.ts_current_point,
@@ -891,8 +912,11 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         proc.process_array(&arr, &pool);
 
+        // C clamps a zero-size ROI to a single pixel (size >= 1) at the
+        // clamped offset (0,0), so stats reflect that one pixel, not zero.
         let r = &proc.results()[0];
-        assert!((r.total - 0.0).abs() < 1e-10);
+        assert!((r.total - 10.0).abs() < 1e-10);
+        assert!((r.mean - 10.0).abs() < 1e-10);
     }
 
     #[test]
@@ -930,11 +954,14 @@ mod tests {
         let pool = NDArrayPool::new(1_000_000);
         proc.process_array(&arr, &pool);
 
+        // C clamps offset to dim-1 (3,3) and size to 1, so the ROI is the
+        // single corner pixel — stats reflect it, not zero.
         let r = &proc.results()[0];
         assert!(
-            (r.total - 0.0).abs() < 1e-10,
-            "out-of-bounds ROI should produce zero stats"
+            (r.total - 10.0).abs() < 1e-10,
+            "out-of-bounds ROI clamps to one edge pixel, not zero"
         );
+        assert!((r.mean - 10.0).abs() < 1e-10);
     }
 
     #[test]
@@ -1067,6 +1094,72 @@ mod tests {
             }
         }
         arr
+    }
+
+    #[test]
+    fn test_adp16_clamp_out_of_range_offset_to_one_pixel() {
+        // 4x4 array. offset (10,1) is out of range in X; size (4,9) overflows
+        // Y. C clamps offset to [0,dim-1] and size to [1,dim-offset].
+        let roi = ROIStatROI {
+            enabled: true,
+            offset: [10, 1],
+            size: [4, 9],
+            bgd_width: 0,
+        };
+        let (offset, size) = ROIStatProcessor::clamp_roi_geometry(&roi, 2, [4, 4]).unwrap();
+        assert_eq!(offset, [3, 1]); // X: min(10,3); Y: min(1,3)
+        assert_eq!(size, [1, 3]); // X: min(4,4-3)=1; Y: min(9,4-1)=3
+    }
+
+    #[test]
+    fn test_adp16_clamp_zero_size_to_one_pixel() {
+        let roi = ROIStatROI {
+            enabled: true,
+            offset: [0, 0],
+            size: [0, 0],
+            bgd_width: 0,
+        };
+        let (offset, size) = ROIStatProcessor::clamp_roi_geometry(&roi, 2, [4, 4]).unwrap();
+        assert_eq!(offset, [0, 0]);
+        assert_eq!(size, [1, 1]); // zero size clamps up to 1 in each dim
+    }
+
+    #[test]
+    fn test_adp16_geometry_writeback_uses_clamped_values() {
+        use asyn_rs::port::{PortDriverBase, PortFlags};
+
+        let arr = make_2d_array(4, 4, |_, _| 10.0);
+        let rois = vec![ROIStatROI {
+            enabled: true,
+            offset: [10, 1],
+            size: [4, 9],
+            bgd_width: 0,
+        }];
+        let mut proc = ROIStatProcessor::new(rois, 0);
+        let mut base = PortDriverBase::new("roistat_adp16", 1, PortFlags::default());
+        proc.register_params(&mut base).unwrap();
+        let p = *proc.params_handle().lock();
+
+        let pool = NDArrayPool::new(1_000_000);
+        let res = proc.process_array(&arr, &pool);
+
+        let find = |reason: usize, addr: i32| {
+            res.param_updates.iter().find_map(|u| match u {
+                ParamUpdate::Int32 {
+                    reason: r,
+                    addr: a,
+                    value,
+                } if *r == reason && *a == addr => Some(*value),
+                _ => None,
+            })
+        };
+        // offset (10,1) -> (3,1); size (4,9) -> (1,3); MaxSize = dims (4,4).
+        assert_eq!(find(p.dim0_min, 0), Some(3));
+        assert_eq!(find(p.dim0_size, 0), Some(1));
+        assert_eq!(find(p.dim1_min, 0), Some(1));
+        assert_eq!(find(p.dim1_size, 0), Some(3));
+        assert_eq!(find(p.dim0_max_size, 0), Some(4));
+        assert_eq!(find(p.dim1_max_size, 0), Some(4));
     }
 
     #[test]

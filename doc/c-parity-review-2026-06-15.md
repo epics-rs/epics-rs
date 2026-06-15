@@ -120,6 +120,8 @@ population). One commit per finding.
 | ADP-12 (JPEG RGB2/RGB3 → RGB; convert_rgb_layout tags output ColorMode) | fix | Fixed | 487d3bd4 |
 | ADP-17 (ROIStat dispatches stats by array rank; 1-D background sums only the two X-end strips) | fix | Fixed | a8ac8287 |
 | ADP-16 (ROIStat clamps out-of-range/zero ROI to one edge pixel; writes back clamped geometry) | fix | Fixed | 017d3497 |
+| ADP-18 (ROI 3-D RGB path converts output to the requested dataType) | fix | Fixed | 3064f514 |
+| ADP-19 (ROI single-color selection collapses to 2-D Mono) | fix | Fixed | c87ac8c3 |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -340,12 +342,14 @@ Severity: Medium — fix
 Rust: `crates/ad-plugins-rs/src/roi.rs:266` builds output with `src.data.data_type()`, ignoring `config.data_type` (the 2-D path `:414` applies it).
 C: `NDPluginROI.cpp:144,166-174` converts to the requested type for RGB and mono.
 Impact: 3-D RGB ROI with ROI_DATA_TYPE set — wrong output type/byte width.
+— FIXED 3064f514: extract_roi_3d now resolves the target type as `config.data_type.unwrap_or(src type)` and converts the source-typed buffer via `convert_data_type` (dropping the frame on a conversion error), the same shape as the 2-D path. Test test_adp18_3d_rgb_honors_output_data_type. Note: like the 2-D path, the scaled value is cast to the source type before the type conversion, so a fractional scale on an integer→float ROI truncates in both paths — a shared latent precision gap vs C's f64→target single conversion, not introduced here and out of scope for this finding.
 
 #### ADP-19: ROI single-color selection not collapsed; ColorMode not forced Mono
 Severity: Medium — fix
 Rust: `crates/ad-plugins-rs/src/roi.rs:138-273` ignores collapse_dims, keeps size-1 color dim with RGB ColorMode.
 C: `NDPluginROI.cpp:180-215` forces collapseDims, ColorMode=Mono, removes size-1 dims.
 Impact: dim count, ColorMode readback, shape diverge.
+— FIXED c87ac8c3: extract_roi_3d collapses size-1 dimensions when the user collapseDims param is set, and force-collapses + tags ColorMode=Mono when an RGB input's color axis selects down to 1 (single_color). With out_c==1 the extracted buffer is already [x,y] row-major for every RGB layout, so dropping the size-1 axes is data-preserving. Test test_adp19_single_color_collapses_to_2d_mono.
 
 #### ADP-20: Overlay Cross collapses independent SizeX/SizeY into one square — FIXED 314b5912
 Severity: Medium — fix

@@ -190,10 +190,10 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
         mgr,
         "NDFFTConfigure",
         |port_name, queue_size, ndarray_port, pool, wiring| {
-            use crate::fft::{FFTMode, FFTProcessor};
+            use crate::fft::FFTProcessor;
             create_plugin_runtime(
                 port_name,
-                FFTProcessor::new(FFTMode::Rows1D),
+                FFTProcessor::new(),
                 pool,
                 queue_size,
                 ndarray_port,

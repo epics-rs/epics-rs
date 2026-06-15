@@ -6,13 +6,6 @@ use ad_core_rs::plugin::runtime::{NDPluginProcess, ProcessResult};
 use rustfft::FftPlanner;
 use rustfft::num_complex::Complex;
 
-/// FFT mode selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FFTMode {
-    Rows1D,
-    Full2D,
-}
-
 /// FFT direction (forward or inverse transform).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FFTDirection {
@@ -21,8 +14,12 @@ pub enum FFTDirection {
 }
 
 /// Configuration for FFT processing.
+///
+/// The transform rank (1-D vs 2-D) is NOT configured here: like C
+/// `NDPluginFFT::processCallbacks` (NDPluginFFT.cpp:298-315) it is taken from
+/// the input array's `ndims` on every frame, so a 1-D input drives a 1-D FFT
+/// and a 2-D input a full 2-D FFT.
 pub struct FFTConfig {
-    pub mode: FFTMode,
     pub direction: FFTDirection,
     /// Zero out DC component (k=0) in the output magnitudes.
     pub suppress_dc: bool,
@@ -33,7 +30,6 @@ pub struct FFTConfig {
 impl Default for FFTConfig {
     fn default() -> Self {
         Self {
-            mode: FFTMode::Rows1D,
             direction: FFTDirection::Forward,
             suppress_dc: false,
             num_average: 0,
@@ -244,21 +240,8 @@ pub struct FFTProcessor {
 }
 
 impl FFTProcessor {
-    pub fn new(mode: FFTMode) -> Self {
-        Self {
-            config: FFTConfig {
-                mode,
-                direction: FFTDirection::Forward,
-                suppress_dc: false,
-                num_average: 0,
-            },
-            planner: FftPlanner::new(),
-            avg_buffer: None,
-            avg_count: 0,
-            cached_dims: Vec::new(),
-            time_per_point: 1.0,
-            params: FFTParamIndices::default(),
-        }
+    pub fn new() -> Self {
+        Self::with_config(FFTConfig::default())
     }
 
     pub fn with_config(config: FFTConfig) -> Self {
@@ -284,22 +267,20 @@ impl FFTProcessor {
     }
 
     /// Compute FFT using cached planner for plan reuse across frames.
+    ///
+    /// The rank is taken from the input array's dimension count, matching C
+    /// `NDPluginFFT::processCallbacks` (NDPluginFFT.cpp:298-315): `ndims==1`
+    /// drives a 1-D FFT, `ndims==2` a full 2-D FFT, and any other rank is
+    /// rejected (C prints an error and returns with no output).
     fn compute_fft(&mut self, src: &NDArray) -> Option<NDArray> {
         let suppress_dc = self.config.suppress_dc;
 
-        match (self.config.mode, self.config.direction) {
-            (FFTMode::Rows1D, FFTDirection::Forward) => {
-                self.compute_fft_1d_rows_forward(src, suppress_dc)
-            }
-            (FFTMode::Rows1D, FFTDirection::Inverse) => {
-                self.compute_fft_1d_rows_inverse(src, suppress_dc)
-            }
-            (FFTMode::Full2D, FFTDirection::Forward) => {
-                self.compute_fft_2d_forward(src, suppress_dc)
-            }
-            (FFTMode::Full2D, FFTDirection::Inverse) => {
-                self.compute_fft_2d_inverse(src, suppress_dc)
-            }
+        match (src.dims.len(), self.config.direction) {
+            (1, FFTDirection::Forward) => self.compute_fft_1d_rows_forward(src, suppress_dc),
+            (1, FFTDirection::Inverse) => self.compute_fft_1d_rows_inverse(src, suppress_dc),
+            (2, FFTDirection::Forward) => self.compute_fft_2d_forward(src, suppress_dc),
+            (2, FFTDirection::Inverse) => self.compute_fft_2d_inverse(src, suppress_dc),
+            _ => None,
         }
     }
 
@@ -647,9 +628,24 @@ impl FFTProcessor {
     }
 }
 
+impl Default for FFTProcessor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NDPluginProcess for FFTProcessor {
     fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
         use ad_core_rs::plugin::runtime::ParamUpdate;
+
+        // C processes only 1-D and 2-D inputs (NDPluginFFT.cpp:298-315); any
+        // other rank prints an error and returns before allocating, computing,
+        // or emitting any waveform. Gate the whole frame on the input rank so a
+        // 3-D+ array yields no NDArray and no first-row waveforms.
+        let rank = array.dims.len();
+        if rank != 1 && rank != 2 {
+            return ProcessResult::sink(Vec::new());
+        }
 
         self.check_dims_changed(&array.dims);
 
@@ -965,7 +961,6 @@ mod tests {
     #[test]
     fn test_processor_with_config() {
         let config = FFTConfig {
-            mode: FFTMode::Rows1D,
             direction: FFTDirection::Forward,
             suppress_dc: true,
             num_average: 0,
@@ -993,7 +988,6 @@ mod tests {
     #[test]
     fn test_processor_averaging() {
         let config = FFTConfig {
-            mode: FFTMode::Rows1D,
             direction: FFTDirection::Forward,
             suppress_dc: false,
             num_average: 2,
@@ -1035,7 +1029,6 @@ mod tests {
     #[test]
     fn test_processor_averaging_dimension_change_resets() {
         let config = FFTConfig {
-            mode: FFTMode::Rows1D,
             direction: FFTDirection::Forward,
             suppress_dc: false,
             num_average: 3,
@@ -1111,7 +1104,6 @@ mod tests {
         }
 
         let config = FFTConfig {
-            mode: FFTMode::Rows1D,
             direction: FFTDirection::Inverse,
             suppress_dc: false,
             num_average: 0,
@@ -1185,6 +1177,71 @@ mod tests {
         let result = fft_2d(&arr, false).unwrap();
         assert_eq!(result.dims[0].size, 4); // 8 / 2
         assert_eq!(result.dims[1].size, 2); // 4 / 2
+    }
+
+    #[test]
+    fn test_adp9_processor_selects_2d_fft_from_input_rank() {
+        // C dispatches on ndims (NDPluginFFT.cpp:298-315): a 2-D input drives a
+        // full 2-D FFT, NOT per-row 1-D FFTs. The processor must produce 2-D
+        // magnitude dims nFreqX x nFreqY ([2,2] for a 4x4 input), not [2,4].
+        let mut proc = FFTProcessor::new();
+        let pool = NDArrayPool::new(0);
+
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::Float64,
+        );
+        if let NDDataBuffer::F64(ref mut v) = arr.data {
+            v.iter_mut().for_each(|x| *x = 2.0);
+        }
+        let result = proc.process_array(&arr, &pool);
+        assert_eq!(result.output_arrays.len(), 1);
+        let out = &result.output_arrays[0];
+        assert_eq!(out.dims.len(), 2);
+        assert_eq!(out.dims[0].size, 2); // nFreqX = 4/2
+        assert_eq!(out.dims[1].size, 2); // nFreqY = 4/2 (per-row 1-D would be 4)
+        if let NDDataBuffer::F64(ref v) = out.data {
+            // 2-D DC: 32 / 16 = 2.0.
+            assert!((v[0] - 2.0).abs() < 1e-10, "DC = {}", v[0]);
+        }
+    }
+
+    #[test]
+    fn test_adp9_processor_keeps_1d_input_1d() {
+        // A 1-D input still drives a 1-D FFT (ndims==1): dims [nFreqX].
+        let mut proc = FFTProcessor::new();
+        let pool = NDArrayPool::new(0);
+        let mut arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::Float64);
+        if let NDDataBuffer::F64(ref mut v) = arr.data {
+            v.iter_mut().for_each(|x| *x = 1.0);
+        }
+        let result = proc.process_array(&arr, &pool);
+        let out = &result.output_arrays[0];
+        assert_eq!(out.dims.len(), 1);
+        assert_eq!(out.dims[0].size, 4); // 8/2
+    }
+
+    #[test]
+    fn test_adp9_processor_rejects_rank_above_2() {
+        // ndims>2 is rejected with no NDArray and no waveforms (C error+return
+        // before allocate/compute/callbacks).
+        let mut proc = fft_proc_with_params(FFTConfig::default());
+        let pool = NDArrayPool::new(0);
+        let arr = NDArray::new(
+            vec![
+                NDDimension::new(3),
+                NDDimension::new(4),
+                NDDimension::new(4),
+            ],
+            NDDataType::Float64,
+        );
+        let result = proc.process_array(&arr, &pool);
+        assert_eq!(result.output_arrays.len(), 0);
+        assert!(
+            result.param_updates.is_empty(),
+            "rank>2 must emit no waveforms, got {} updates",
+            result.param_updates.len()
+        );
     }
 
     // ---- FFT waveform emission tests ----
@@ -1342,7 +1399,6 @@ mod tests {
     fn test_fft_inverse_emits_no_spectrum_waveforms() {
         // The inverse transform has no spectrum to publish.
         let config = FFTConfig {
-            mode: FFTMode::Rows1D,
             direction: FFTDirection::Inverse,
             suppress_dc: false,
             num_average: 0,
@@ -1379,7 +1435,6 @@ mod tests {
             v[n - 1] = 4.0;
         }
         let config = FFTConfig {
-            mode: FFTMode::Rows1D,
             direction: FFTDirection::Inverse,
             suppress_dc: false,
             num_average: 0,

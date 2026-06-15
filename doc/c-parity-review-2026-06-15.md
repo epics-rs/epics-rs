@@ -109,6 +109,9 @@ population). One commit per finding.
 | ADP-7 (valid bg/flat-field recomputed per frame; size mismatch invalidates) | fix | Fixed | afead50f |
 | ADP-6 (auto offset/scale arms next frame, not the trigger frame) | fix | Fixed | 570965ea |
 | ADP-8 (TimeSeries integer truncation before dividing) | fix→N/A | Not applicable (Rust accumulate fed only f64 stats = C NDFloat64 path; raw-array TS unimplemented) | — |
+| ADP-14 (stats clamps out-of-range cursor/centroid to edge, not zeros) | fix | Fixed | b1b6f336 |
+| ADP-13 (stats skips centroid/profiles/cursor for ndims>2) | fix | Fixed | 6cfb6d1e |
+| ADP-15 (stats histogram upper-boundary clamp) | fix→N/A | Not applicable (clamp is a no-op for in-range values; guards already match C; proof in finding block) | — |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -287,18 +290,21 @@ Severity: Medium — fix
 Rust: `crates/ad-plugins-rs/src/stats.rs:970-978,992` gates only color_size/ndims>=2.
 C: `NDPluginStats.cpp:205,338` return asynError for ndims>2.
 Impact: 3-D mono array — Rust overwrites CENTROID/SIGMA/PROFILE/CURSOR; C leaves them stale.
+— FIXED 6cfb6d1e: centroid/profile/cursor gates changed from `dims.len()>=2` to `==2`, so Rust no longer computes wrong-slice values for >2-D arrays. Reachability correction: a 3-D *mono* array gets `color_size=dims[2]` (ndarray.rs:436), so it was already skipped unless dims[2]==1; the truly-reachable cases are 4-D arrays (color_size=0) and `[x,y,1]`. Boundary note: C's ndims>2 emission is partly UB (centroid/cursor read the uninitialised stack-local `NDStats_t stats`, NDPluginStats.cpp:430 — no zero-init) and partly defined (profileX/Y are calloc-zeroed); perfect parity is impossible (centroid is genuine UB). Rust now posts deterministic 0 centroid/cursor and leaves the profile waveforms unposted (stale) rather than computing a misleading slice — the residual profile-stale-vs-C-zero and centroid-0-vs-C-garbage differences are UB-adjacent and intentionally not replicated. Test test_adp13_ndims_gt_2_skips_centroid_and_profiles.
 
 #### ADP-14: Stats profile/cursor index not clamped to last valid line; Rust emits zeros
 Severity: Medium — fix
 Rust: `crates/ad-plugins-rs/src/stats.rs:845-878,1013-1020` out-of-range → all-zero profile, CURSOR_VAL=0.
 C: `NDPluginStats.cpp:341-362` clamps `MAX(.,0)`/`MIN(.,size-1)` → edge row/col/pixel.
 Impact: hot pixel at the far edge / cursor beyond image — Rust zeros, C edge pixels.
+— FIXED b1b6f336: compute_profiles clamps centroid/cursor line indices to [0,size-1] (`(c+0.5).max(0).min(size-1)`, `cursor.min(size-1)`) and always extracts the edge row/col; the cursor-value read clamps to the last pixel too. Reachable mainly via the user-set CursorX/CursorY params (centroid stays in-range for non-negative data). Test test_adp14_out_of_range_cursor_clamps_to_edge_not_zeros.
 
 #### ADP-15: Stats histogram upper-boundary value clamped into the last bin; C counts it as above
 Severity: Medium — fix
 Rust: `crates/ad-plugins-rs/src/stats.rs:733-735,758-760` `.min(hs-1)` clamps a top-edge value into the last bin.
 C: `NDPluginStats.cpp:42-54` `if (bin>histSize-1 || value>histMax) histAbove++`.
 Impact: last-bin count, HIST_ABOVE, HIST_ENTROPY diverge.
+— NOT APPLICABLE (re-verified, no code change): the Rust `.min(hs-1)` clamp provably never fires for an in-range value, and both the serial (stats.rs:753-760) and parallel (728-735) paths already route out-of-range values via `val < hmin → below` / `val > hmax → above`, identical to C's `value<histMin` / `value>histMax`. Proof the clamp is dead: in the `else` branch hmin≤val≤hmax, and the bin expression `(val-hmin)·(hs-1)/(hmax-hmin)+0.5` is maximised at val=hmax giving exactly `(hs-1)+0.5 = hs-0.5`, which `as usize` truncates to `hs-1`. So the pre-clamp index is ≤ hs-1 for every in-range value (the 0.5 margin absorbs any fp error). C's extra `bin>histSize-1` disjunct is likewise redundant given its scale = (histSize-1)/(histMax-histMin): bin>histSize-1 ⟹ value>histMax. Both implementations: `(int)/(as usize)` truncate non-negative operands identically. histogram[], HIST_BELOW, HIST_ABOVE and HIST_ENTROPY (deterministic from histogram) all match. The clamp is harmless defensive code; removing it is out of scope (risks a panic if the fp proof has a hole, no observable benefit).
 
 #### ADP-16: ROIStat out-of-range/zero ROI returns zeros; C clamps to one edge pixel
 Severity: Medium — fix

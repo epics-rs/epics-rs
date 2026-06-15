@@ -338,7 +338,9 @@ impl NDPluginProcess for AttrPlotProcessor {
     }
 
     fn plugin_type(&self) -> &str {
-        "NDPluginAttrPlot"
+        // C sets PluginType to "NDAttrPlot" (NDPluginAttrPlot.cpp:87), not the
+        // class name.
+        "NDAttrPlot"
     }
 
     fn register_params(
@@ -627,7 +629,8 @@ mod tests {
 
     #[test]
     fn test_plugin_type() {
+        // C PluginType is "NDAttrPlot" (NDPluginAttrPlot.cpp:87).
         let proc = AttrPlotProcessor::new(8, 100, 1);
-        assert_eq!(proc.plugin_type(), "NDPluginAttrPlot");
+        assert_eq!(proc.plugin_type(), "NDAttrPlot");
     }
 }

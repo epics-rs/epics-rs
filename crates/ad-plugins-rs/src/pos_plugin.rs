@@ -549,7 +549,9 @@ impl NDPluginProcess for PosPluginProcessor {
     }
 
     fn plugin_type(&self) -> &str {
-        "NDPosPlugin"
+        // C sets PluginType to "NDPositionPlugin" (NDPosPlugin.cpp:402), not the
+        // class name.
+        "NDPositionPlugin"
     }
 
     fn register_params(

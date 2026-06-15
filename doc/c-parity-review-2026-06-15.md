@@ -92,6 +92,7 @@ population). One commit per finding.
 | PROC-3 (procServ branding/version string) | signoff | Signoff — keep Rust branding (user call) | — |
 | ADC-6 / ADP-2 (RGB→Mono `(R+G+B)/3` truncated, not luminance+round) | fix | Fixed | 1273b533 |
 | ADC-4 (MinCallbackTime-throttled frame must not count as dropped) | fix | Fixed | a1cb7e0c |
+| ADC-1 (PARAM NDAttribute type follows configured `datatype`, not runtime type) | verify→fix | Fixed (option: honor datatype) | eecf79c8 |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -106,8 +107,9 @@ signoff (see tally).
 
 ### ad-core-rs (ADC)
 
-#### ADC-1: PARAM-type NDAttribute publishes the param's runtime type, not the configured `datatype` (default int)
+#### ADC-1: PARAM-type NDAttribute publishes the param's runtime type, not the configured `datatype` (default int) — FIXED eecf79c8
 Severity: High — fix
+Re-verification (2026-06-15): the finding's stated impact is imprecise — C's omitted-`datatype` default is the lower-case `"int"` (asynNDArrayDriver.cpp:446), which matches NONE of the upper-case `strcmp` branches (paramAttribute.cpp:80-95) → `paramAttrTypeUnknown` → the attribute is NDAttrUndefined and never updated, NOT an `NDAttrInt32` truncated int. For every schema-valid config (datatype == the param's actual type, documented as required at :297) the Rust runtime-type derivation already produced byte-identical output; divergence existed only on out-of-schema input (omitted/mismatched datatype). User chose "honor datatype (parity)": parse `datatype` → `ParamAttrType`, dispatch the getter by it, leave Unknown / wrong-type reads Undefined (matching C's never-refreshed path). The typed-zero C writes on a wrong-type read (documented misconfig) is intentionally not reproduced.
 Rust: `crates/ad-core-rs/src/driver/ndarray_driver.rs:92-107` (`parse_attributes_xml` PARAM branch) ignores the XML `datatype`; `:783-814` (`read_param_value`) derives the published `NDAttrValue` from the param's runtime type.
 C: `ADApp/ADSrc/asynNDArrayDriver.cpp:445-446` reads `datatype` (default `"int"`); `paramAttribute.cpp:80-95,131-151` maps it to a fixed NDAttr type and reads the param accordingly.
 Impact: `<Attribute type="PARAM" source="GAIN"/>` on a Float64 param publishes, in C, an NDAttrInt32 (code 4) holding the truncated integer (default `datatype="int"`); Rust publishes NDAttrFloat64 (code 9) with the float. NTNDArray/file attribute carries a different dataType code AND value.

@@ -980,26 +980,29 @@ impl Hdf5Writer {
             Some(l) => l,
             None => return Ok(()),
         };
-        fn collect(g: &crate::hdf5_layout::LayoutGroup, prefix: &str, out: &mut Vec<String>) {
+        fn collect<'a>(
+            g: &'a crate::hdf5_layout::LayoutGroup,
+            prefix: &str,
+            out: &mut Vec<(String, &'a crate::hdf5_layout::LayoutGroup)>,
+        ) {
             let here = if prefix.is_empty() {
                 g.name.clone()
             } else {
                 format!("{}/{}", prefix, g.name)
             };
-            out.push(here.clone());
+            out.push((here.clone(), g));
             for sub in &g.groups {
                 collect(sub, &here, out);
             }
         }
-        let mut paths = Vec::new();
+        let mut nodes = Vec::new();
         for g in &layout.groups {
-            collect(g, "", &mut paths);
+            collect(g, "", &mut nodes);
         }
-        paths.sort_by_key(|p| p.matches('/').count());
-        paths.dedup();
+        nodes.sort_by_key(|(p, _)| p.matches('/').count());
         let mut created: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for path in &paths {
-            if created.contains(path) {
+        for (path, node) in &nodes {
+            if !created.insert(path.clone()) {
                 continue;
             }
             let (parent, leaf) = match path.rsplit_once('/') {
@@ -1009,7 +1012,10 @@ impl Hdf5Writer {
             swmr.create_group(&parent, leaf).map_err(|e| {
                 ADError::UnsupportedConversion(format!("SWMR layout group '{}': {}", path, e))
             })?;
-            created.insert(path.clone());
+            // C attaches the group's constant <attribute> nodes (NX_class) via
+            // writeHdfAttributes (NDFileHDF5.cpp:693-695); the absolute group
+            // path is `/<path>`.
+            write_swmr_group_constant_attrs(swmr, &format!("/{}", path), &node.attributes)?;
         }
         Ok(())
     }
@@ -1160,26 +1166,29 @@ impl Hdf5Writer {
             Some(l) => l,
             None => return Ok(()),
         };
-        fn collect(g: &crate::hdf5_layout::LayoutGroup, prefix: &str, out: &mut Vec<String>) {
+        fn collect<'a>(
+            g: &'a crate::hdf5_layout::LayoutGroup,
+            prefix: &str,
+            out: &mut Vec<(String, &'a crate::hdf5_layout::LayoutGroup)>,
+        ) {
             let here = if prefix.is_empty() {
                 g.name.clone()
             } else {
                 format!("{}/{}", prefix, g.name)
             };
-            out.push(here.clone());
+            out.push((here.clone(), g));
             for sub in &g.groups {
                 collect(sub, &here, out);
             }
         }
-        let mut paths = Vec::new();
+        let mut nodes = Vec::new();
         for g in &layout.groups {
-            collect(g, "", &mut paths);
+            collect(g, "", &mut nodes);
         }
-        paths.sort_by_key(|p| p.matches('/').count());
-        paths.dedup();
+        nodes.sort_by_key(|(p, _)| p.matches('/').count());
         let mut created: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for path in &paths {
-            if created.contains(path) {
+        for (path, node) in &nodes {
+            if !created.insert(path.clone()) {
                 continue;
             }
             let (parent, leaf) = match path.rsplit_once('/') {
@@ -1192,14 +1201,16 @@ impl Hdf5Writer {
             } else {
                 Some(Self::open_write_group(file, parent)?)
             };
-            match parent_group.as_ref() {
+            let group = match parent_group.as_ref() {
                 Some(g) => g.create_group(leaf),
                 None => file.create_group(leaf),
             }
             .map_err(|e| {
                 ADError::UnsupportedConversion(format!("HDF5 layout group '{}': {}", path, e))
             })?;
-            created.insert(path.clone());
+            // C attaches the group's constant <attribute> nodes (e.g. the NeXus
+            // NX_class markers) via writeHdfAttributes (NDFileHDF5.cpp:693-695).
+            write_group_constant_attrs(&group, &node.attributes);
         }
         Ok(())
     }
@@ -1928,6 +1939,68 @@ fn write_ndattr_descriptors(ds: &rust_hdf5::H5Dataset, ad: &AttributeDataset) {
             .create(aname)
             .and_then(|a| a.write_scalar(&s));
     }
+}
+
+/// Write a layout group's `constant`-sourced `<attribute>` nodes (e.g. the
+/// NeXus `NX_class` markers) to an open standard-mode group, typed per the XML
+/// `type` attribute. `ndattribute`-sourced group attributes carry per-frame
+/// values and are out of scope here. Errors are non-fatal, mirroring the
+/// standard dataset-attribute materialisation.
+fn write_group_constant_attrs(
+    group: &rust_hdf5::H5Group,
+    attrs: &[crate::hdf5_layout::LayoutAttribute],
+) {
+    use crate::hdf5_layout::{LayoutDataType, LayoutSource};
+    for a in attrs {
+        if a.source != LayoutSource::Constant {
+            continue;
+        }
+        let _ = match a.data_type {
+            LayoutDataType::Int => {
+                group.set_attr_numeric(&a.name, &a.value.trim().parse::<i64>().unwrap_or(0))
+            }
+            LayoutDataType::Float => {
+                group.set_attr_numeric(&a.name, &a.value.trim().parse::<f64>().unwrap_or(0.0))
+            }
+            LayoutDataType::String => group.set_attr_string(&a.name, &a.value),
+        };
+    }
+}
+
+/// SWMR counterpart of [`write_group_constant_attrs`]: write a layout group's
+/// `constant` `<attribute>` nodes against a `SwmrFileWriter`, addressing the
+/// group by its absolute path.
+fn write_swmr_group_constant_attrs(
+    swmr: &mut SwmrFileWriter,
+    group_path: &str,
+    attrs: &[crate::hdf5_layout::LayoutAttribute],
+) -> ADResult<()> {
+    use crate::hdf5_layout::{LayoutDataType, LayoutSource};
+    for a in attrs {
+        if a.source != LayoutSource::Constant {
+            continue;
+        }
+        match a.data_type {
+            LayoutDataType::Int => swmr.set_group_attr_numeric(
+                group_path,
+                &a.name,
+                &a.value.trim().parse::<i64>().unwrap_or(0),
+            ),
+            LayoutDataType::Float => swmr.set_group_attr_numeric(
+                group_path,
+                &a.name,
+                &a.value.trim().parse::<f64>().unwrap_or(0.0),
+            ),
+            LayoutDataType::String => swmr.set_group_attr_string(group_path, &a.name, &a.value),
+        }
+        .map_err(|e| {
+            ADError::UnsupportedConversion(format!(
+                "SWMR layout group attribute '{}/{}': {}",
+                group_path, a.name, e
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 impl Default for Hdf5Writer {
@@ -4163,6 +4236,67 @@ mod tests {
         // The NXdata hardlink /entry/data/data resolves to the same image.
         let linked = h5.dataset("entry/data/data").unwrap();
         assert_eq!(linked.shape(), vec![1, 4, 4]);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_default_layout_group_nx_class_attributes() {
+        // C attaches NX_class markers to the default-layout NeXus groups via
+        // writeHdfAttributes (NDFileHDF5.cpp:693-695): NXentry/NXinstrument/
+        // NXdetector/NXcollection/NXdata.
+        let path = temp_path("hdf5_nxclass");
+        let mut writer = Hdf5Writer::new();
+        let arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt8,
+        );
+        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let nx = |g: &str| {
+            let mut grp = h5.root_group();
+            for seg in g.split('/') {
+                grp = grp.group(seg).unwrap();
+            }
+            grp.attr_string("NX_class").unwrap()
+        };
+        assert_eq!(nx("entry"), "NXentry");
+        assert_eq!(nx("entry/instrument"), "NXinstrument");
+        assert_eq!(nx("entry/instrument/detector"), "NXdetector");
+        assert_eq!(nx("entry/instrument/NDAttributes"), "NXcollection");
+        assert_eq!(nx("entry/instrument/detector/NDAttributes"), "NXcollection");
+        assert_eq!(nx("entry/data"), "NXdata");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_swmr_default_layout_group_nx_class_attributes() {
+        // The SWMR path materialises the same NX_class group markers
+        // (build_swmr_layout_groups → write_swmr_group_constant_attrs).
+        let path = temp_path("hdf5_swmr_nxclass");
+        let mut writer = Hdf5Writer::new();
+        writer.set_swmr_mode(true);
+        let arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::Float32,
+        );
+        writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let nx = |g: &str| {
+            let mut grp = h5.root_group();
+            for seg in g.split('/') {
+                grp = grp.group(seg).unwrap();
+            }
+            grp.attr_string("NX_class").unwrap()
+        };
+        assert_eq!(nx("entry"), "NXentry");
+        assert_eq!(nx("entry/instrument/detector"), "NXdetector");
+        assert_eq!(nx("entry/data"), "NXdata");
         std::fs::remove_file(&path).ok();
     }
 }

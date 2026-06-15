@@ -352,6 +352,19 @@ pub async fn run(
 
     let ch_y_offset = DbChannel::new(&db, &config.pv("_yOffset"));
 
+    // Tweak (inc/dec) feature: ± step buttons for E / lambda / theta.
+    // C ml_monoCtl.st:710-773 (state tweak): each button adds ± the matching
+    // step value, limit-checks, and resets the pressed BO to 0.
+    let ch_e_tweak_val = DbChannel::new(&db, &config.pv("ETweak"));
+    let ch_e_inc = DbChannel::new(&db, &config.pv("EInc"));
+    let ch_e_dec = DbChannel::new(&db, &config.pv("EDec"));
+    let ch_lambda_tweak_val = DbChannel::new(&db, &config.pv("LambdaTweak"));
+    let ch_lambda_inc = DbChannel::new(&db, &config.pv("LambdaInc"));
+    let ch_lambda_dec = DbChannel::new(&db, &config.pv("LambdaDec"));
+    let ch_theta_tweak_val = DbChannel::new(&db, &config.pv("ThetaTweak"));
+    let ch_theta_inc = DbChannel::new(&db, &config.pv("ThetaInc"));
+    let ch_theta_dec = DbChannel::new(&db, &config.pv("ThetaDec"));
+
     // Wait for key channels
 
     // Build multi-monitor
@@ -371,6 +384,12 @@ pub async fn run(
         config.motor_pv(&config.m_theta, ".LLM"),
         config.pv("_yOffset"),
         config.pv("UseSet"),
+        config.pv("EInc"),
+        config.pv("EDec"),
+        config.pv("LambdaInc"),
+        config.pv("LambdaDec"),
+        config.pv("ThetaInc"),
+        config.pv("ThetaDec"),
     ];
     let mut monitor = DbMultiMonitor::new_filtered(&db, &monitored_pvs, my_origin).await;
     println!(
@@ -458,6 +477,12 @@ pub async fn run(
     let pv_theta_lolim = config.motor_pv(&config.m_theta, ".LLM");
     let pv_y_offset = config.pv("_yOffset");
     let pv_use_set = config.pv("UseSet");
+    let pv_e_inc = config.pv("EInc");
+    let pv_e_dec = config.pv("EDec");
+    let pv_lambda_inc = config.pv("LambdaInc");
+    let pv_lambda_dec = config.pv("LambdaDec");
+    let pv_theta_inc = config.pv("ThetaInc");
+    let pv_theta_dec = config.pv("ThetaDec");
 
     println!(
         "ml_monoCtl: ready (two_d={:.4}, theta=[{:.1}..{:.1}])",
@@ -510,6 +535,78 @@ pub async fn run(
             if (new_th - theta_val).abs() > 1e-12 {
                 theta_val = new_th;
                 proceed_to_theta_changed = true;
+            }
+        } else if changed_pv == pv_e_inc || changed_pv == pv_e_dec {
+            // C ml_monoCtl.st:711-730 — E tweak by ± ETweakVal, limit-checked,
+            // then (on success) eChanged→lChanged→thChanged recompute & move.
+            if new_val as i16 != 0 {
+                let inc = changed_pv == pv_e_inc;
+                let step = ch_e_tweak_val.get_f64().await;
+                let temp = e_val + step * if inc { 1.0 } else { -1.0 };
+                let e_hi = ch_e_hi.get_f64().await;
+                let e_lo = ch_e_lo.get_f64().await;
+                if temp >= e_lo && temp <= e_hi {
+                    e_val = temp;
+                    let _ = ch_e.put_f64(e_val).await;
+                    lambda_val = energy_to_lambda(e_val);
+                    let _ = ch_lambda.put_f64(lambda_val).await;
+                    if lambda_val > two_d {
+                        let _ = ch_msg1.put_string("Wavelength > 2d spacing.").await;
+                        let _ = ch_alert.put_i16(1).await;
+                    } else if let Some(th) = lambda_to_theta(lambda_val, two_d) {
+                        theta_val = th;
+                        let _ = ch_theta.put_f64(theta_val).await;
+                    }
+                    proceed_to_theta_changed = true;
+                } else {
+                    let _ = ch_msg1.put_string("E tweak exceeds limit").await;
+                    let _ = ch_alert.put_i16(1).await;
+                }
+                let reset = if inc { &ch_e_inc } else { &ch_e_dec };
+                let _ = reset.put_i16(0).await;
+            }
+        } else if changed_pv == pv_lambda_inc || changed_pv == pv_lambda_dec {
+            // C ml_monoCtl.st:732-751 — lambda tweak by ± LTweakVal, limit-checked.
+            if new_val as i16 != 0 {
+                let inc = changed_pv == pv_lambda_inc;
+                let step = ch_lambda_tweak_val.get_f64().await;
+                let temp = lambda_val + step * if inc { 1.0 } else { -1.0 };
+                let l_hi = ch_lambda_hi.get_f64().await;
+                let l_lo = ch_lambda_lo.get_f64().await;
+                if temp >= l_lo && temp <= l_hi {
+                    lambda_val = temp;
+                    let _ = ch_lambda.put_f64(lambda_val).await;
+                    if lambda_val > two_d {
+                        let _ = ch_msg1.put_string("Wavelength > 2d spacing.").await;
+                        let _ = ch_alert.put_i16(1).await;
+                    } else if let Some(th) = lambda_to_theta(lambda_val, two_d) {
+                        theta_val = th;
+                        let _ = ch_theta.put_f64(theta_val).await;
+                    }
+                    proceed_to_theta_changed = true;
+                } else {
+                    let _ = ch_msg1.put_string("Lambda tweak exceeds limit").await;
+                    let _ = ch_alert.put_i16(1).await;
+                }
+                let reset = if inc { &ch_lambda_inc } else { &ch_lambda_dec };
+                let _ = reset.put_i16(0).await;
+            }
+        } else if changed_pv == pv_theta_inc || changed_pv == pv_theta_dec {
+            // C ml_monoCtl.st:753-772 — theta tweak by ± thTweakVal, limit-checked.
+            if new_val as i16 != 0 {
+                let inc = changed_pv == pv_theta_inc;
+                let step = ch_theta_tweak_val.get_f64().await;
+                let temp = theta_val + step * if inc { 1.0 } else { -1.0 };
+                if temp >= theta_lo && temp <= theta_hi {
+                    theta_val = temp;
+                    let _ = ch_theta.put_f64(theta_val).await;
+                    proceed_to_theta_changed = true;
+                } else {
+                    let _ = ch_msg1.put_string("Theta tweak exceeds limit").await;
+                    let _ = ch_alert.put_i16(1).await;
+                }
+                let reset = if inc { &ch_theta_inc } else { &ch_theta_dec };
+                let _ = reset.put_i16(0).await;
             }
         } else if changed_pv == pv_order {
             order_val = ch_order.get_f64().await;

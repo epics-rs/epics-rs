@@ -674,6 +674,57 @@ fn param_value_to_epics_value(pv: &crate::param::ParamValue) -> Option<EpicsValu
     }
 }
 
+/// Convert a native-typed array interrupt to the element type of the consuming
+/// record's asyn array interface.
+///
+/// C `NDPluginStdArrays::processCallbacks` fires an interrupt on every one of
+/// the six array interfaces, each running `pNDArrayPool->convert(pArray, ...,
+/// signedType)` so a record on any interface receives its own type-converted
+/// copy (NDPluginStdArrays.cpp:169-197). The Rust runtime carries a single
+/// native-typed array per param; this routes it through the same per-interface
+/// `convert` the polled `readArray` path uses ([`AsynDeviceSupport::result_to_value`]),
+/// so an I/O Intr waveform whose FTVL differs from the array's native element
+/// type still gets correctly-converted data each frame instead of the raw
+/// native array. Returns `None` for non-array interfaces (scalar records keep
+/// [`param_value_to_epics_value`]).
+fn convert_param_array_to_iface(
+    iface_type: &str,
+    pv: &crate::param::ParamValue,
+) -> Option<EpicsValue> {
+    use crate::param::ParamValue;
+    // `src as $t` is exactly the polled converter: integer->integer is a
+    // truncating C cast, float->integer saturates, and casts to float round —
+    // matching `copy_ccast`/`copy_convert` in the plugin runtime.
+    macro_rules! cast_vec {
+        ($t:ty) => {{
+            match pv {
+                ParamValue::Int8Array(a) => a.iter().map(|&x| x as $t).collect::<Vec<$t>>(),
+                ParamValue::Int16Array(a) => a.iter().map(|&x| x as $t).collect(),
+                ParamValue::Int32Array(a) => a.iter().map(|&x| x as $t).collect(),
+                ParamValue::Int64Array(a) => a.iter().map(|&x| x as $t).collect(),
+                ParamValue::Float32Array(a) => a.iter().map(|&x| x as $t).collect(),
+                ParamValue::Float64Array(a) => a.iter().map(|&x| x as $t).collect(),
+                _ => return None,
+            }
+        }};
+    }
+    match iface_type {
+        // i8 then reinterpret to u8, matching result_to_value's CharArray mapping.
+        "asynInt8Array" => Some(EpicsValue::CharArray(
+            cast_vec!(i8).into_iter().map(|x| x as u8).collect(),
+        )),
+        "asynInt16Array" => Some(EpicsValue::ShortArray(cast_vec!(i16))),
+        "asynInt32Array" => Some(EpicsValue::LongArray(cast_vec!(i32))),
+        // i64 then down-cast to i32, matching result_to_value's asynInt64Array mapping.
+        "asynInt64Array" => Some(EpicsValue::LongArray(
+            cast_vec!(i64).into_iter().map(|x| x as i32).collect(),
+        )),
+        "asynFloat32Array" => Some(EpicsValue::FloatArray(cast_vec!(f32))),
+        "asynFloat64Array" => Some(EpicsValue::DoubleArray(cast_vec!(f64))),
+        _ => None,
+    }
+}
+
 /// Bridges async `AsyncCompletionHandle` to epics-base-rs `WriteCompletion`.
 struct AsynAsyncWriteCompletion {
     handle: parking_lot::Mutex<Option<AsyncCompletionHandle>>,
@@ -1262,7 +1313,14 @@ impl DeviceSupport for AsynDeviceSupport {
             }
             let mut skip_convert = true;
             if let Some(ci) = entry {
-                if let Some(val) = param_value_to_epics_value(&ci.value) {
+                // Array interrupts carry the native element type; convert to this
+                // record's interface type so a mismatched FTVL gets the same
+                // per-type `convert` the polled path applies (C fires all six
+                // array interfaces, NDPluginStdArrays.cpp:169-197). Scalar
+                // interfaces fall back to the verbatim mapping.
+                let val = convert_param_array_to_iface(&self.iface_type, &ci.value)
+                    .or_else(|| param_value_to_epics_value(&ci.value));
+                if let Some(val) = val {
                     skip_convert = self.store_read_value(record, val);
                 }
                 self.last_ts = Some(ci.timestamp);
@@ -2061,6 +2119,44 @@ mod tests {
             AsynDeviceSupport::from_handle(handle, link, "asynInt32").with_mask((-8i32) as u32);
         let result = RequestResult::int32_read(0xFF);
         assert_eq!(ads.result_to_value(&result), Some(EpicsValue::Long(-1)));
+    }
+
+    #[test]
+    fn array_interrupt_converts_to_record_interface_type() {
+        use crate::param::ParamValue;
+        // An F64-native array delivered on the I/O Intr path must be converted to
+        // each consuming interface's element type (C fires all six array
+        // interfaces type-converted, NDPluginStdArrays.cpp:169-197).
+        let f64arr = ParamValue::Float64Array(std::sync::Arc::from([1.7f64, 2.9, -3.1].as_slice()));
+
+        assert_eq!(
+            convert_param_array_to_iface("asynInt16Array", &f64arr),
+            Some(EpicsValue::ShortArray(vec![1, 2, -3])),
+        );
+        assert_eq!(
+            convert_param_array_to_iface("asynFloat64Array", &f64arr),
+            Some(EpicsValue::DoubleArray(vec![1.7, 2.9, -3.1])),
+        );
+
+        // Integer narrowing is a truncating C cast, matching the polled ccast
+        // path (40000 as i16 wraps to -25536), not a saturating convert.
+        let i32arr = ParamValue::Int32Array(std::sync::Arc::from([40000i32].as_slice()));
+        assert_eq!(
+            convert_param_array_to_iface("asynInt16Array", &i32arr),
+            Some(EpicsValue::ShortArray(vec![-25536])),
+        );
+
+        // asynInt8Array goes through i8 then reinterprets to u8 (300.0 -> i8
+        // saturates to 127 -> u8 127), matching result_to_value's CharArray map.
+        let over = ParamValue::Float64Array(std::sync::Arc::from([300.0f64].as_slice()));
+        assert_eq!(
+            convert_param_array_to_iface("asynInt8Array", &over),
+            Some(EpicsValue::CharArray(vec![127])),
+        );
+
+        // Scalar interfaces are not array interfaces: returns None so the caller
+        // falls back to the verbatim mapping.
+        assert_eq!(convert_param_array_to_iface("asynFloat64", &f64arr), None);
     }
 
     use crate::error::AsynResult;

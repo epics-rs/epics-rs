@@ -289,9 +289,12 @@ impl FFTProcessor {
     ///
     /// This drives the C++ `FFTTimeSeries`/`FFTReal`/`FFTImaginary`/
     /// `FFTAbsValue` waveform records, which in C++ are 1D arrays over the
-    /// first time axis. Returns `(time_series, real, imag)` where `real`/
-    /// `imag` have `padded/2` elements (nFreqX). The DC bin is zeroed in all
-    /// three spectral arrays when `suppress_dc` is set (C++ behaviour).
+    /// first time axis. Returns `(time_series, real, imag)` where `time_series`
+    /// has `padded` elements (nTimeX) — C posts the zero-extended padded series
+    /// (NDPluginFFT.cpp: timeSeries is the nTimeX-long calloc buffer) — and
+    /// `real`/`imag` have `padded/2` elements (nFreqX). The DC bin is zeroed in
+    /// the two spectral arrays when `suppress_dc` is set (C++ behaviour); the
+    /// time series is never DC-suppressed.
     fn compute_row_spectrum(
         &mut self,
         src: &NDArray,
@@ -311,10 +314,13 @@ impl FFTProcessor {
         }
         let fft = self.planner.plan_fft_forward(padded);
 
-        // Extract the first row as the time series (nTimeX = width points).
-        let time_series: Vec<f64> = (0..width)
-            .map(|i| src.data.get_as_f64(i).unwrap_or(0.0))
-            .collect();
+        // The first row, zero-extended to the padded length nTimeX. C posts the
+        // padded series (calloc'd to nTimeX, the input copied into [0,width)),
+        // so FFTTimeSeries and FFTTimeAxis are nTimeX long, not width long.
+        let mut time_series = vec![0.0f64; padded];
+        for (i, slot) in time_series.iter_mut().enumerate().take(width) {
+            *slot = src.data.get_as_f64(i).unwrap_or(0.0);
+        }
 
         let mut row_buf = vec![Complex::new(0.0, 0.0); padded];
         for (i, &v) in time_series.iter().enumerate() {
@@ -1393,6 +1399,44 @@ mod tests {
         let step = 0.5 / 0.5 / 3.0;
         assert!((freq_axis[1] - step).abs() < 1e-12);
         assert!((freq_axis[3] - 3.0 * step).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_adp25_timeseries_and_timeaxis_use_padded_length() {
+        // C posts FFTTimeSeries and FFTTimeAxis at nTimeX = nextPow2(width),
+        // zero-extending the series (NDPluginFFT.cpp allocateArrays +
+        // doArrayCallbacks/createAxisArrays). width=5 -> padded 8.
+        let mut proc = fft_proc_with_params(FFTConfig::default());
+        let ts_reason = proc.params.time_series.unwrap();
+        let time_axis_reason = proc.params.time_axis.unwrap();
+        let real_reason = proc.params.real.unwrap();
+        let freq_axis_reason = proc.params.freq_axis.unwrap();
+        let pool = NDArrayPool::new(0);
+
+        let n = 5;
+        let mut arr = NDArray::new(vec![NDDimension::new(n)], NDDataType::Float64);
+        if let NDDataBuffer::F64(ref mut v) = arr.data {
+            for (i, x) in v.iter_mut().enumerate() {
+                *x = (i + 1) as f64; // 1,2,3,4,5
+            }
+        }
+        let result = proc.process_array(&arr, &pool);
+        let u = &result.param_updates;
+
+        let ts = find_array_update(u, ts_reason).unwrap();
+        let time_axis = find_array_update(u, time_axis_reason).unwrap();
+        let real = find_array_update(u, real_reason).unwrap();
+        let freq_axis = find_array_update(u, freq_axis_reason).unwrap();
+
+        // TimeSeries padded to nTimeX=8, zero-extended past the 5 inputs.
+        assert_eq!(ts.len(), 8);
+        assert_eq!(&ts[..5], &[1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(&ts[5..], &[0.0, 0.0, 0.0]);
+        // TimeAxis matches the padded length.
+        assert_eq!(time_axis.len(), 8);
+        // Real spectrum and FreqAxis stay at nFreqX = padded/2 = 4.
+        assert_eq!(real.len(), 4);
+        assert_eq!(freq_axis.len(), 4);
     }
 
     #[test]

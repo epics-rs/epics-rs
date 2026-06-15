@@ -108,6 +108,7 @@ population). One commit per finding.
 | ADP-24 (flat-field uses scaleFlatField directly, no mean substitution) | fix | Fixed | bbd7fd5e |
 | ADP-7 (valid bg/flat-field recomputed per frame; size mismatch invalidates) | fix | Fixed | afead50f |
 | ADP-6 (auto offset/scale arms next frame, not the trigger frame) | fix | Fixed | 570965ea |
+| ADP-8 (TimeSeries integer truncation before dividing) | fix→N/A | Not applicable (Rust accumulate fed only f64 stats = C NDFloat64 path; raw-array TS unimplemented) | — |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -253,6 +254,7 @@ Severity: High — fix
 Rust: `crates/ad-plugins-rs/src/time_series.rs:270-274` `average_store[i]/divisor` in f64.
 C: `NDPluginTimeSeries.cpp:191` `(epicsType)averageStore_[signal]/numAveraged_`.
 Impact: integer source, numAverage>1: UInt8 200,200,200 → C 29, Rust 200. Waveform values diverge (C can wrap).
+— NOT APPLICABLE (re-verified, no code change): the Rust generic `accumulate` (SharedTsState) is fed exclusively by Stats/ROIStat/Attribute, all of which send computed **f64** values (`TimeSeriesData.values: Vec<f64>`). This is the exact analogue of the C data flow: `NDPluginStats.cpp:549` allocates the per-frame time-series array as `NDFloat64` (all 23 stats stored as doubles) and feeds it to a downstream NDPluginTimeSeries — so `epicsType==epicsFloat64` there and C's `(epicsFloat64)sum/numAveraged_` is **float** division, no truncation. The integer-truncation case at `:191` only fires when NDPluginTimeSeries ingests a raw integer NDArray directly (`NDTimeSeriesConfigure` on a detector port). The Rust TS port can only attach to a pre-registered receiver (ioc.rs:516 `tsr.take`), and only Stats/Attr/ROIStat register one — there is no raw-array TS plugin (`time_series.rs` has no `process_array`). So the truncation path is unreachable; for every path the port implements, C also divides in f64 → output matches. The unimplemented raw-array-ingestion configuration is a missing-feature gap (a whole separate plugin), not this truncation finding; left for a follow-up round, not silently scope-expanded here.
 
 #### ADP-9: FFT processes 2-D input as per-row 1-D FFTs; C does a full 2-D FFT
 Severity: High — fix

@@ -595,7 +595,35 @@ impl NDPluginProcess for CircularBuffProcessor {
                 }
             }
         } else if Some(reason) == self.params.pre_trigger {
-            self.buffer.pre_count = params.value.as_i32().max(0) as usize;
+            // C writeInt32(NDCircBuffPreTrigger) validates before committing
+            // (NDPluginCircularBuff.cpp:280-292): reject while running or for a
+            // negative value (status string + leave the param at its old value),
+            // otherwise commit. The "Pre-count too high" (> maxBuffers_-1) check
+            // is not modelled — the Rust processor carries no maxBuffers bound.
+            let value = params.value.as_i32();
+            let running = matches!(
+                self.buffer.status(),
+                BufferStatus::BufferFilling | BufferStatus::Flushing
+            );
+            let reject_msg = if running {
+                Some("Stop acquisition to set pre-count")
+            } else if value < 0 {
+                Some("Invalid pre-count value")
+            } else {
+                None
+            };
+            if let Some(msg) = reject_msg {
+                if let Some(idx) = self.params.status {
+                    updates.push(ParamUpdate::octet(idx, msg.to_string()));
+                }
+                // Revert the pre-committed param to the last accepted value
+                // (C never calls setIntegerParam on the reject paths).
+                if let Some(idx) = self.params.pre_trigger {
+                    updates.push(ParamUpdate::int32(idx, self.buffer.pre_count as i32));
+                }
+            } else {
+                self.buffer.pre_count = value as usize;
+            }
         } else if Some(reason) == self.params.post_trigger {
             self.buffer.post_count = params.value.as_i32().max(0) as usize;
         } else if Some(reason) == self.params.preset_trigger_count {
@@ -1043,6 +1071,67 @@ mod tests {
             )),
             "stop must post STATUS=Acquisition Stopped"
         );
+    }
+
+    #[test]
+    fn test_pre_count_validation() {
+        // Regression for ADP-44: pre-count writes are rejected (status string +
+        // param reverted) while running and for negative values, accepted
+        // otherwise.
+        use ad_core_rs::plugin::runtime::{ParamChangeValue, ParamUpdate, PluginParamSnapshot};
+
+        let make_proc = || {
+            let mut p = CircularBuffProcessor::new(3, 1, TriggerCondition::External);
+            p.params.pre_trigger = Some(20);
+            p.params.status = Some(12);
+            p
+        };
+        let write = |p: &mut CircularBuffProcessor, v: i32| {
+            let snap = PluginParamSnapshot {
+                enable_callbacks: true,
+                reason: 20,
+                addr: 0,
+                value: ParamChangeValue::Int32(v),
+            };
+            p.on_param_change(20, &snap)
+        };
+
+        // Running → reject, status string, param reverted to old (3), unchanged.
+        let mut p = make_proc();
+        p.buffer.status = BufferStatus::BufferFilling;
+        let r = write(&mut p, 7);
+        assert_eq!(
+            p.buffer.pre_count, 3,
+            "reject while running, value unchanged"
+        );
+        assert!(r.param_updates.iter().any(|u| matches!(
+            u,
+            ParamUpdate::Octet { reason: 12, value, .. } if value == "Stop acquisition to set pre-count"
+        )));
+        assert!(r.param_updates.iter().any(|u| matches!(
+            u,
+            ParamUpdate::Int32 {
+                reason: 20,
+                value: 3,
+                ..
+            }
+        )));
+
+        // Stopped + negative → reject with "Invalid pre-count value".
+        let mut p = make_proc();
+        p.buffer.status = BufferStatus::Idle;
+        let r = write(&mut p, -1);
+        assert_eq!(p.buffer.pre_count, 3, "negative rejected, value unchanged");
+        assert!(r.param_updates.iter().any(|u| matches!(
+            u,
+            ParamUpdate::Octet { reason: 12, value, .. } if value == "Invalid pre-count value"
+        )));
+
+        // Stopped + valid → accept.
+        let mut p = make_proc();
+        p.buffer.status = BufferStatus::Idle;
+        write(&mut p, 9);
+        assert_eq!(p.buffer.pre_count, 9, "valid pre-count committed");
     }
 
     #[test]

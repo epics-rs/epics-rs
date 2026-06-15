@@ -113,6 +113,7 @@ population). One commit per finding.
 | ADP-13 (stats skips centroid/profiles/cursor for ndims>2) | fix | Fixed | 6cfb6d1e |
 | ADP-15 (stats histogram upper-boundary clamp) | fix→N/A | Not applicable (clamp is a no-op for in-range values; guards already match C; proof in finding block) | — |
 | ADP-1 (stats centroid moments: raw-pixel vs threshold-profile) | fix→signoff | Signoff — precision-only fork, recommend keep Rust direct-central (OPT-3 precedent); routed to #58 | — |
+| ADP-3 (false-color Rainbow/Iron LUTs by index, not generated jet) | fix | Fixed | 81d90f28 |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -221,11 +222,14 @@ Rust: `crates/ad-core-rs/src/color.rs:131-132`; wired by `color_convert.rs:437`.
 C: `NDPluginColorConvert.cpp:393,462,533`.
 Impact: every non-gray RGB→Mono pixel differs.
 
-#### ADP-3: ColorConvert false-color uses a generated jet LUT, not Rainbow/Iron tables
+#### ADP-3: ColorConvert false-color uses a generated jet LUT, not Rainbow/Iron tables — FIXED (81d90f28)
 Severity: High — fix
 Rust: `crates/ad-plugins-rs/src/color_convert.rs:270-281,414-418` — any nonzero falseColor → jet table (index 0 → (0,0,127)); 1-vs-2 ignored.
 C: `NDPluginColorConvert.cpp:62-77` selects RainbowColor (1) / IronColor (2) from `colorMaps.h`; Rainbow[0]=(0,0,0).
 Impact: every false-color output pixel differs; Iron mode is not distinct.
+FIXED: ported the exact `RAINBOW_COLOR_MAP`/`IRON_COLOR_MAP` 256-entry tables verbatim from `colorMaps.h`; `false_color_lut(false_color)` selects 1=Rainbow, 2=Iron, else None (→ plain mono→RGB1, matching C's `default: falseColor=0`). Verified colorMapRGB interleaved == separate R/G/B channels, so mono→RGB1 + layout repack equals C's per-channel RGB2/RGB3 application. C only consults the LUT for NDInt8/NDUInt8 input (`int falseColor=0` at line 45 stays 0 otherwise); the Rust UInt8-only restriction matches except the NDInt8-signed path — see ADP-3-note. Tests: test_false_color_conversion (Rainbow), test_false_color_iron_table (Iron), test_false_color_table_endpoints.
+
+> ADP-3-note (distinct, deferred): C applies false color for both NDInt8 and NDUInt8 (cast `(unsigned char)*pIn`). Rust `false_color_mono_to_rgb1` gates on `NDDataType::UInt8` only. Whether NDInt8 mono is reachable through this crate's pipeline needs a separate check before flagging; not part of the ADP-3 LUT fix.
 
 #### ADP-4: ColorConvert Bayer demosaic interpolates the image border; C leaves non-native channels 0
 Severity: High — fix

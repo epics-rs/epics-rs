@@ -1191,7 +1191,7 @@ C: `ntndArrayConverter.cpp:407,410` `compressedSize = src->compressedSize`.
 Impact: For an uncompressed array C copies the NDArray's own `compressedSize` (= `dataSize`, normally `totalBytes` but LARGER when a driver over-allocates, `NDArray.cpp:58`). In that rare case C's wire `compressedSize` exceeds `uncompressedSize`; Rust always emits exactly `uncompressedSize`. Requires a non-default over-allocating driver — observable-but-marginal, signoff.
 
 #### ADP-86: PVA dimension[].binning clamps 0→1 where C serializes the raw value
-Severity: Low — fix-low
+Severity: Low — fix-low — **FIXED cb41b18d**
 Rust: `crates/ad-plugins-rs/src/pva.rs:151` `binning: d.binning.max(1) as i32`.
 C: `ntndArrayConverter.cpp:471` `…->put(src->dims[i].binning)` (no clamp).
 Impact: C copies `dims[i].binning` verbatim into the wire field; Rust forces a minimum of 1. If an upstream source sets `binning = 0`, the C wire shows `0` and Rust shows `1` — an observable `dimension[].binning` difference. `NDDimension::new` default is already 1, so this manifests only when something explicitly sets binning to 0 (non-physical) — low severity. The only wire divergence in the PVA group.

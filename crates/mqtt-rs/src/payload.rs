@@ -181,26 +181,31 @@ fn boolean_payload_to_int(s: &str) -> Option<i64> {
 fn decode_flat(raw: &str, value_type: ValueType) -> MqttResult<DecodedValue> {
     let trimmed = raw.trim();
     match value_type {
+        // INT/FLOAT/DIGITAL parse the RAW payload: C's isInteger/isFloat
+        // (drvMqtt.cpp:376-401) require the whole string to be digits/number
+        // with no surrounding whitespace, so a payload like "42\n" is rejected
+        // (the prior value is kept), not silently accepted as 42. Rust's
+        // integer/float FromStr rejects leading/trailing whitespace identically.
         ValueType::Int => {
-            if let Some(b) = boolean_payload_to_int(trimmed) {
+            if let Some(b) = boolean_payload_to_int(raw) {
                 return Ok(DecodedValue::Int32(b as i32));
             }
-            let v: i32 = trimmed
+            let v: i32 = raw
                 .parse()
                 .map_err(|e| MqttError::ValueConversion(format!("INT parse: {e}")))?;
             Ok(DecodedValue::Int32(v))
         }
         ValueType::Float => {
-            let v: f64 = trimmed
+            let v: f64 = raw
                 .parse()
                 .map_err(|e| MqttError::ValueConversion(format!("FLOAT parse: {e}")))?;
             Ok(DecodedValue::Float64(v))
         }
         ValueType::Digital => {
-            if let Some(b) = boolean_payload_to_int(trimmed) {
+            if let Some(b) = boolean_payload_to_int(raw) {
                 return Ok(DecodedValue::UInt32(b as u32));
             }
-            let v: u32 = trimmed
+            let v: u32 = raw
                 .parse()
                 .map_err(|e| MqttError::ValueConversion(format!("DIGITAL parse: {e}")))?;
             Ok(DecodedValue::UInt32(v))
@@ -343,10 +348,27 @@ mod tests {
     }
 
     #[test]
-    fn decode_flat_int_whitespace() {
+    fn decode_flat_int_whitespace_rejected() {
+        // C isInteger (drvMqtt.cpp:376-385) rejects any non-digit char, so a
+        // payload with surrounding whitespace/newline is refused and the prior
+        // VAL is kept -- it is NOT trimmed to 100.
         let addr = TopicAddress::parse("FLAT:INT test/t").unwrap();
-        let val = decode_payload("  100  \n", &addr).unwrap();
-        assert_eq!(val, DecodedValue::Int32(100));
+        assert!(decode_payload("  100  \n", &addr).is_err());
+        assert!(decode_payload("42\n", &addr).is_err());
+        // A clean integer still parses.
+        assert_eq!(
+            decode_payload("100", &addr).unwrap(),
+            DecodedValue::Int32(100)
+        );
+    }
+
+    #[test]
+    fn decode_flat_float_digital_whitespace_rejected() {
+        let f = TopicAddress::parse("FLAT:FLOAT test/t").unwrap();
+        assert!(decode_payload("4.2\n", &f).is_err());
+        assert!(decode_payload(" 4.2", &f).is_err());
+        let d = TopicAddress::parse("FLAT:DIGITAL test/t").unwrap();
+        assert!(decode_payload("7 ", &d).is_err());
     }
 
     #[test]

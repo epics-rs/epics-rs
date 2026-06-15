@@ -98,6 +98,10 @@ population). One commit per finding.
 | ADC-5 (NDDimensions posts fixed ND_ARRAY_MAX_DIMS=10 zero-filled, not ndims) | fix-low | Fixed | 600adb66 |
 | ADC-11 (file-plugin control attrs honor C string-typed read, ignore numeric) | verify→fix | Fixed | bc63c38f |
 | ADC-12 (destination_matches comparison must replicate C attrIsProcessingRequired: non-empty guard + "all" 3-char prefix) | fix-low | Fixed | a05b900c |
+| ADP-10 (overlay shape ordinals Text=2/Ellipse=3) | fix | Fixed | 7f0d95c4 |
+| ADP-20 (overlay Cross independent SizeX/SizeY arms) | fix | Fixed | 314b5912 |
+| ADP-21 (overlay Rectangle inclusive bounds, SizeX+1 wide) | fix | Fixed | ad15297a |
+| ADP-22 (overlay text skips codes ≥128, C signed-char rule) | fix | Fixed | 5d767953 |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -199,7 +203,7 @@ Rust: `crates/ad-plugins-rs/src/stats.rs:493-524` accumulates mu20/mu02/mu11/m30
 C: `NDPluginStats.cpp:224-241` — M20/M30/M40 from `profileX[profThreshold]`, M02/M03/M04 from `profileY[profThreshold]`; only M11 (`:215`) is a raw cross-sum.
 Impact: SIGMAXY/ECCENTRICITY/ORIENTATION diverge even at threshold 0; all marginal moments diverge for centroidThreshold>0.
 
-#### ADP-2: ColorConvert RGB→Mono luminance vs `(R+G+B)/3` (= ADC-6, fix in color.rs)
+#### ADP-2: ColorConvert RGB→Mono luminance vs `(R+G+B)/3` (= ADC-6, fix in color.rs) — FIXED 1273b533
 Severity: High — fix
 Rust: `crates/ad-core-rs/src/color.rs:131-132`; wired by `color_convert.rs:437`.
 C: `NDPluginColorConvert.cpp:393,462,533`.
@@ -247,8 +251,9 @@ Rust: `crates/ad-plugins-rs/src/ioc.rs:196` hardcodes `Rows1D`; `fft.rs:382-439`
 C: `NDPluginFFT.cpp:298-315,369-370` selects rank from ndims → `computeFFT_2D` → `nFreqX×nFreqY`.
 Impact: every 2-D input yields different dims AND magnitudes.
 
-#### ADP-10: Overlay shape ordinals Text/Ellipse swapped vs the C enum
+#### ADP-10: Overlay shape ordinals Text/Ellipse swapped vs the C enum — FIXED 7f0d95c4
 Severity: High — fix
+Fix: forward + inverse shape↔ordinal maps and the slot comment corrected to C `NDOverlayShape_t` (Cross=0, Rectangle=1, Text=2, Ellipse=3).
 Rust: `crates/ad-plugins-rs/src/overlay.rs:466-499` maps `2=Ellipse, 3=Text`.
 C: `NDPluginOverlay.h:9-13` `Cross=0,Rectangle=1,Text=2,Ellipse=3`.
 Impact: `OVERLAY_SHAPE=2/3` draws the wrong shape vs C.
@@ -307,19 +312,19 @@ Rust: `crates/ad-plugins-rs/src/roi.rs:138-273` ignores collapse_dims, keeps siz
 C: `NDPluginROI.cpp:180-215` forces collapseDims, ColorMode=Mono, removes size-1 dims.
 Impact: dim count, ColorMode readback, shape diverge.
 
-#### ADP-20: Overlay Cross collapses independent SizeX/SizeY into one square
+#### ADP-20: Overlay Cross collapses independent SizeX/SizeY into one square — FIXED 314b5912
 Severity: Medium — fix
 Rust: `crates/ad-plugins-rs/src/overlay.rs:188-217,467-471` uses `max(size_x,size_y)` for both arms.
 C: `NDPluginOverlay.cpp:95-116` independent arms.
 Impact: SizeX≠SizeY draws different pixels.
 
-#### ADP-21: Overlay Rectangle one pixel too narrow/short (exclusive vs inclusive)
+#### ADP-21: Overlay Rectangle one pixel too narrow/short (exclusive vs inclusive) — FIXED ad15297a
 Severity: Medium — fix
 Rust: `crates/ad-plugins-rs/src/overlay.rs:219-252` spans `x..x+width` exclusive.
 C: `NDPluginOverlay.cpp:120-144` `ix<=xmax` inclusive (Size+1 wide).
 Impact: border one px shorter each dim, right/bottom edges inboard.
 
-#### ADP-22: Overlay extended chars (≥128) render in Rust; C skips them (signed char)
+#### ADP-22: Overlay extended chars (≥128) render in Rust; C skips them (signed char) — FIXED 5d767953
 Severity: Medium — fix
 Rust: `crates/ad-plugins-rs/src/overlay.rs:82-95,309-329` renders codes 160..255.
 C: `NDPluginOverlay.cpp:210-211` signed `char` makes 128..255 negative → `<32` → skipped.

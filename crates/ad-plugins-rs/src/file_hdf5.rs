@@ -1721,6 +1721,10 @@ impl Hdf5Writer {
         // datatype `rust-hdf5` records (write_chunk copies bytes verbatim).
         let raw: Vec<u8> = flat.iter().flat_map(|v| v.to_le_bytes()).collect();
 
+        // C `writePerformanceDataset` chunks `[chunking, 5]` where `chunking`
+        // is the same `calculateAttributeChunking` value (NDFileHDF5.cpp:2645-2647),
+        // not one row per chunk.
+        let chunking = self.attribute_chunking();
         let perf_group = self.resolved_perf_group.clone();
         let h5file = match self.handle {
             Some(Hdf5Handle::Standard { ref file, .. }) => file,
@@ -1740,19 +1744,15 @@ impl Hdf5Writer {
         let ds = group
             .new_dataset::<f64>()
             .shape([n, 5])
-            .chunk(&[1, 5])
+            .chunk(&[chunking, 5])
             .max_shape(&[None, Some(5)])
             .create("timestamp")
             .map_err(|e| {
                 ADError::UnsupportedConversion(format!("HDF5 performance dataset error: {}", e))
             })?;
-        for f in 0..n {
-            let start = f * 5 * 8;
-            let end = start + 5 * 8;
-            ds.write_chunk(f, &raw[start..end]).map_err(|e| {
-                ADError::UnsupportedConversion(format!("HDF5 performance write error: {}", e))
-            })?;
-        }
+        // One chunk spans `chunking` rows of 5 doubles; the dataset is
+        // extensible so the final partial band is zero-padded to a full chunk.
+        write_chunked_buffer(&ds, &raw, chunking * 5 * 8)?;
         Ok(())
     }
 
@@ -3154,6 +3154,37 @@ mod tests {
         let h5 = H5File::open(&path).unwrap();
         let ts = h5.dataset("performance/timestamp").unwrap();
         assert_eq!(ts.shape(), vec![2, 5]);
+        let vals: Vec<f64> = ts.read_raw().unwrap();
+        assert_eq!(vals.len(), 10);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_performance_dataset_chunk_matches_capture_target() {
+        // C `writePerformanceDataset` chunks the timestamp dataset `[chunking,5]`
+        // (NDFileHDF5.cpp:2645-2647) where `chunking` is the same
+        // `calculateAttributeChunking` value (the capture target in non-Single
+        // mode), not one row per chunk. Capture target 8, 2 frames written: the
+        // chunk's leading dim must be 8, extent 2; doubles still round-trip.
+        let path = temp_path("hdf5_perf_chunk");
+        let mut writer = Hdf5Writer::new();
+        writer.set_store_performance(true);
+        writer.set_num_capture(8);
+
+        let arr = NDArray::new(
+            vec![NDDimension::new(8), NDDimension::new(8)],
+            NDDataType::UInt16,
+        );
+        writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let ts = h5.dataset("performance/timestamp").unwrap();
+        assert_eq!(ts.shape(), vec![2, 5]);
+        assert_eq!(ts.chunk_dims(), Some(vec![8, 5]));
         let vals: Vec<f64> = ts.read_raw().unwrap();
         assert_eq!(vals.len(), 10);
 

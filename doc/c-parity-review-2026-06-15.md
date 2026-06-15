@@ -84,6 +84,9 @@ population). One commit per finding.
 | OPT-T5 (table sqrt/asin domain clamps vs C bare NaN/Inf) | signoff | Signoff — keep Rust guards (user call) | — |
 | OPT-T6 (table speed-ratio NaN guard vs C 0/0 poison) | signoff | Signoff — keep Rust guard (user call) | — |
 | OPT-3 (orient invertArray x/det vs x*(1/det) de-precision) | signoff | Signoff — keep Rust precision (user call) | — |
+| MQTT-1 (FLAT inbound INT/FLOAT/DIGITAL parses raw, rejects surrounding ws) | fix | Fixed | cb9ba4e9 |
+| MQTT-2 (FLAT:STRING inbound stored verbatim) | fix | Fixed | db0fc076 |
+| MQTT-4 (octet value terminates at first NUL) | fix-low | Fixed | 36f96ca1 |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -601,6 +604,7 @@ Severity: Low — fix-low
 Rust: `crates/mqtt-rs/src/driver.rs:173-175` `from_utf8_lossy` publishes the full buffer.
 C: `drvMqtt.cpp:714-716` → `publish(const std::string&)` from `stringData.data()` truncates at the first `\0`.
 Impact: an embedded-NUL octet write publishes different bytes (Rust full, C up to NUL). Narrow.
+- **Fixed 36f96ca1.** Defect family "asyn octet value is a NUL-terminated C-string" has two C-truncation sites, not just the cited publish: outbound `publish(stringData.data())` (`:716`) AND inbound store `setStringParam(index, val.c_str())` (`:299`) — the inbound site was not in the original citation but exhibits the same defect (Rust stored the full inbound payload past an embedded NUL). Closed both by construction with one `octet_cstr` helper (prefix up to the first NUL), applied at the outbound publish + cached value and the inbound octet store. C's inbound INT/FLOAT/DIGITAL paths parse the full `val` (no NUL truncation) → those stay raw (MQTT-1), distinct.
 
 Verified-equivalent (mqtt): FLAT scalar float `%f` 6-decimal, FLAT float-array `%g`/6-sig (fixed/scientific + trailing-zero strip + C exponent), FLAT int/array/digital, masked-digital RMW merge, masked-write-on-undefined rejection, isBoolean INT/DIGITAL-only, JSON whole-key recursive search + explicit-null = not-found, QoS default 1 + retained=false, topic wildcard rejection.
 

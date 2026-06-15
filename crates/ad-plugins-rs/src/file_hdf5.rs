@@ -28,6 +28,10 @@ const COMPRESS_BSHUF: i32 = 5;
 const COMPRESS_LZ4: i32 = 6;
 const COMPRESS_JPEG: i32 = 7;
 
+/// SZIP nearest-neighbor coding option mask (`H5_SZIP_NN_OPTION_MASK`,
+/// H5Zpublic.h); C passes this to `H5Pset_szip` (NDFileHDF5.cpp:3372).
+const SZIP_NN_OPTION_MASK: u32 = 32;
+
 /// C ADCore BLOSC compressor sub-types.
 const BLOSC_LZ: i32 = 0;
 const BLOSC_LZ4: i32 = 1;
@@ -455,7 +459,11 @@ impl Hdf5Writer {
                 filters: vec![Filter {
                     id: FILTER_SZIP,
                     flags: 0,
-                    cd_values: vec![4, self.szip_num_pixels],
+                    // C calls H5Pset_szip(cparms, H5_SZIP_NN_OPTION_MASK, szipNumPixels)
+                    // (NDFileHDF5.cpp:3372): nearest-neighbor coding (mask 32), not
+                    // entropy coding (mask 4). cd_values[1] is pixels_per_block; the
+                    // rust-hdf5 SZIP filter defaults bits_per_pixel/pixels_per_scanline.
+                    cd_values: vec![SZIP_NN_OPTION_MASK, self.szip_num_pixels],
                 }],
             }),
             COMPRESS_LZ4 => Some(FilterPipeline::lz4()),
@@ -2967,6 +2975,37 @@ mod tests {
         assert_eq!(data[0], 0);
         assert_eq!(data[9], 1);
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_szip_uses_nearest_neighbor_mask() {
+        // C uses H5_SZIP_NN_OPTION_MASK (32); the SZIP filter's cd_values[0]
+        // must declare NN coding, and the data must round-trip.
+        let mut writer = Hdf5Writer::new();
+        writer.set_compression_type(COMPRESS_SZIP);
+        let pipeline = writer.build_pipeline(1).expect("szip pipeline");
+        assert_eq!(pipeline.filters[0].cd_values[0], SZIP_NN_OPTION_MASK);
+
+        let path = temp_path("hdf5_szip_nn");
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(64), NDDimension::new(64)],
+            NDDataType::UInt8,
+        );
+        if let NDDataBuffer::U8(ref mut v) = arr.data {
+            for (i, e) in v.iter_mut().enumerate() {
+                *e = (i % 13) as u8;
+            }
+        }
+        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
+
+        let h5file = H5File::open(&path).unwrap();
+        let ds = h5file.dataset("data").unwrap();
+        let data: Vec<u8> = ds.read_raw().unwrap();
+        assert_eq!(data.len(), 64 * 64);
+        assert_eq!(data[20], (20 % 13) as u8);
         std::fs::remove_file(&path).ok();
     }
 

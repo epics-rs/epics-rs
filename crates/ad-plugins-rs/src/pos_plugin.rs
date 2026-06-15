@@ -55,6 +55,9 @@ pub struct PosPluginProcessor {
     /// C `NDPos_IDStart` (default 1): the value `ExpectedID` is reset to on
     /// every Running write (NDPosPlugin.cpp:420,232-234).
     id_start: i32,
+    /// C `NDPos_IDDifference` (default 1): the step `ExpectedID` advances by
+    /// per frame and per dropped frame (NDPosPlugin.cpp:103,115,193).
+    id_difference: i32,
     missing_frames: usize,
     duplicate_frames: usize,
     params: PosParamIndices,
@@ -70,6 +73,7 @@ impl PosPluginProcessor {
             running: false,
             expected_id: 0,
             id_start: 1,
+            id_difference: 1,
             missing_frames: 0,
             duplicate_frames: 0,
             params: PosParamIndices::default(),
@@ -184,6 +188,16 @@ impl PosPluginProcessor {
                     None
                 }
             }
+        }
+    }
+
+    /// Whether a position remains to be consumed at the current cursor — C's
+    /// `size > 0` (Discard) / `index < size` (Keep) guard
+    /// (NDPosPlugin.cpp:99,113).
+    fn has_position(&self) -> bool {
+        match self.mode {
+            PosMode::Discard => !self.positions.is_empty(),
+            PosMode::Keep => self.index < self.all_positions.len(),
         }
     }
 
@@ -425,17 +439,16 @@ impl NDPluginProcess for PosPluginProcessor {
         // from IDStart is classified as missing/duplicate immediately.
         let uid = array.unique_id;
         if uid > self.expected_id {
-            let diff = (uid - self.expected_id) as usize;
-            self.missing_frames += diff;
-            for _ in 0..diff {
+            // Missing frame(s): step ExpectedID by IDDifference, dropping one
+            // position per step, until we catch up or run out
+            // (NDPosPlugin.cpp:99-126). ExpectedID is never re-anchored to uid.
+            while self.expected_id < uid && self.has_position() {
                 self.advance();
-                let has = match self.mode {
-                    PosMode::Discard => !self.positions.is_empty(),
-                    PosMode::Keep => !self.all_positions.is_empty(),
-                };
-                if !has {
-                    return ProcessResult::arrays(vec![Arc::new(array.clone())]);
-                }
+                self.expected_id += self.id_difference;
+                self.missing_frames += 1;
+            }
+            if !self.has_position() {
+                return ProcessResult::arrays(vec![Arc::new(array.clone())]);
             }
         } else if uid < self.expected_id {
             self.duplicate_frames += 1;
@@ -485,7 +498,9 @@ impl NDPluginProcess for PosPluginProcessor {
         current_pos.push(']');
 
         self.advance();
-        self.expected_id = array.unique_id + 1;
+        // C steps ExpectedID by IDDifference (NDPosPlugin.cpp:193), it does not
+        // re-anchor to the received uniqueId.
+        self.expected_id += self.id_difference;
 
         // C posts MissingFrames/DuplicateFrames and, after advancing, the new
         // CurrentQty (Discard) / CurrentIndex (Keep) (NDPosPlugin.cpp:126,134,
@@ -627,6 +642,9 @@ impl NDPluginProcess for PosPluginProcessor {
         } else if Some(reason) == self.params.id_start {
             // C stores IDStart; it is read on the next Running write.
             self.id_start = params.value.as_i32();
+        } else if Some(reason) == self.params.id_difference {
+            // C stores IDDifference; it is read each processCallbacks.
+            self.id_difference = params.value.as_i32();
         } else if Some(reason) == self.params.mode {
             // C writeInt32(NDPos_Mode): reset index to 0 (NDPosPlugin.cpp:235-237).
             self.mode = match params.value.as_i32() {
@@ -1087,6 +1105,36 @@ mod tests {
         let result = proc.process_array(&make_array(3), &pool);
         assert_eq!(proc.missing_frames(), 2);
         let x = result.output_arrays[0]
+            .attributes
+            .get("x")
+            .unwrap()
+            .value
+            .as_f64()
+            .unwrap();
+        assert!((x - 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_id_difference_stepping() {
+        // ADP-36: ExpectedID steps by IDDifference and is never re-anchored to
+        // uniqueId. With step 2, frames 1/3/5 are all on-sequence (no missing).
+        let mut proc = PosPluginProcessor::new(PosMode::Discard);
+        proc.id_difference = 2;
+        let mut p1 = HashMap::new();
+        p1.insert("x".into(), 1.0);
+        let mut p2 = HashMap::new();
+        p2.insert("x".into(), 2.0);
+        let mut p3 = HashMap::new();
+        p3.insert("x".into(), 3.0);
+        proc.load_positions(vec![p1, p2, p3]);
+        proc.start();
+
+        let pool = NDArrayPool::new(1_000_000);
+        proc.process_array(&make_array(1), &pool);
+        proc.process_array(&make_array(3), &pool);
+        let r = proc.process_array(&make_array(5), &pool);
+        assert_eq!(proc.missing_frames(), 0);
+        let x = r.output_arrays[0]
             .attributes
             .get("x")
             .unwrap()

@@ -344,9 +344,11 @@ impl NDPluginProcess for PosPluginProcessor {
 
         let mut out = array.clone();
         for (key, value) in &position {
+            // C NDPosPlugin.cpp:161 constructs each attribute with the fixed
+            // description "Position of NDArray".
             out.attributes.add(NDAttribute::new_static(
                 key.clone(),
-                String::new(),
+                "Position of NDArray",
                 NDAttrSource::Driver,
                 NDAttrValue::Float64(*value),
             ));
@@ -420,6 +422,21 @@ mod tests {
         assert!((x - 3.1).abs() < 1e-10);
 
         assert_eq!(proc.remaining_positions(), 0);
+    }
+
+    #[test]
+    fn test_attribute_description() {
+        // C NDPosPlugin.cpp:161 sets the attribute description "Position of NDArray".
+        let mut proc = PosPluginProcessor::new(PosMode::Discard);
+        let mut pos = HashMap::new();
+        pos.insert("X".into(), 1.5);
+        proc.load_positions(vec![pos]);
+        proc.start();
+
+        let pool = NDArrayPool::new(1_000_000);
+        let result = proc.process_array(&make_array(1), &pool);
+        let attr = result.output_arrays[0].attributes.get("X").unwrap();
+        assert_eq!(attr.description, "Position of NDArray");
     }
 
     #[test]

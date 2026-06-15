@@ -115,6 +115,8 @@ population). One commit per finding.
 | ADP-1 (stats centroid moments: raw-pixel vs threshold-profile) | fix→signoff | Signoff — precision-only fork, recommend keep Rust direct-central (OPT-3 precedent); routed to #58 | — |
 | ADP-3 (false-color Rainbow/Iron LUTs by index, not generated jet) | fix | Fixed | 81d90f28 |
 | ADP-4 (Bayer demosaic border keeps native channel only) | fix | Fixed | 3b1669c6 |
+| ADP-9 (FFT rank from input ndims, not a fixed mode; 2-D input → full 2-D FFT) | fix | Fixed | 7943d427 |
+| ADP-25 (FFT TimeSeries/TimeAxis posted at padded nTimeX) | fix | Fixed | 61b9964d |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -267,11 +269,12 @@ C: `NDPluginTimeSeries.cpp:191` `(epicsType)averageStore_[signal]/numAveraged_`.
 Impact: integer source, numAverage>1: UInt8 200,200,200 → C 29, Rust 200. Waveform values diverge (C can wrap).
 — NOT APPLICABLE (re-verified, no code change): the Rust generic `accumulate` (SharedTsState) is fed exclusively by Stats/ROIStat/Attribute, all of which send computed **f64** values (`TimeSeriesData.values: Vec<f64>`). This is the exact analogue of the C data flow: `NDPluginStats.cpp:549` allocates the per-frame time-series array as `NDFloat64` (all 23 stats stored as doubles) and feeds it to a downstream NDPluginTimeSeries — so `epicsType==epicsFloat64` there and C's `(epicsFloat64)sum/numAveraged_` is **float** division, no truncation. The integer-truncation case at `:191` only fires when NDPluginTimeSeries ingests a raw integer NDArray directly (`NDTimeSeriesConfigure` on a detector port). The Rust TS port can only attach to a pre-registered receiver (ioc.rs:516 `tsr.take`), and only Stats/Attr/ROIStat register one — there is no raw-array TS plugin (`time_series.rs` has no `process_array`). So the truncation path is unreachable; for every path the port implements, C also divides in f64 → output matches. The unimplemented raw-array-ingestion configuration is a missing-feature gap (a whole separate plugin), not this truncation finding; left for a follow-up round, not silently scope-expanded here.
 
-#### ADP-9: FFT processes 2-D input as per-row 1-D FFTs; C does a full 2-D FFT
+#### ADP-9: FFT processes 2-D input as per-row 1-D FFTs; C does a full 2-D FFT — FIXED (7943d427)
 Severity: High — fix
 Rust: `crates/ad-plugins-rs/src/ioc.rs:196` hardcodes `Rows1D`; `fft.rs:382-439` → dims `nFreqX×height`; the `Full2D` path is never selected.
 C: `NDPluginFFT.cpp:298-315,369-370` selects rank from ndims → `computeFFT_2D` → `nFreqX×nFreqY`.
 Impact: every 2-D input yields different dims AND magnitudes.
+FIXED: removed the `FFTMode` enum (the dual source of truth for rank — config mode vs the input's actual ndims) and derive the rank from `src.dims.len()` every frame, the single authority C uses. `compute_fft` dispatches `(rank, direction)`; the existing 2-D forward path (already C-equivalent: separable row-then-column = full 2-D FFT, `nFreqX×nFreqY`, normalised by `w*h`) is now reachable. `process_array` gates the whole frame on rank∈{1,2} up front, so a 3-D+ array yields no NDArray and no first-row waveforms (C's `default: error; return`). `FFTProcessor::new()` no longer takes a mode (crate-local API change; only ioc.rs constructs it). Tests: test_adp9_processor_selects_2d_fft_from_input_rank, test_adp9_processor_keeps_1d_input_1d, test_adp9_processor_rejects_rank_above_2.
 
 #### ADP-10: Overlay shape ordinals Text/Ellipse swapped vs the C enum — FIXED 7f0d95c4
 Severity: High — fix
@@ -369,11 +372,12 @@ C: `NDPluginProcess.cpp:172` `value *= scaleFlatField/flatField[i]` unconditiona
 Impact: SCALE_FLAT_FIELD≤0 — C all-zero, Rust mean-normalized.
 — FIXED bbd7fd5e: flat-field uses self.config.scale_flat_field directly; mean fallback removed; tests test_flat_field (rewritten to C-direct) + test_adp24_scale_flat_field_zero_zeroes_output.
 
-#### ADP-25: FFT FFTTimeSeries/FFTTimeAxis posted at unpadded width; C posts the padded length
+#### ADP-25: FFT FFTTimeSeries/FFTTimeAxis posted at unpadded width; C posts the padded length — FIXED (61b9964d)
 Severity: Medium — fix
 Rust: `crates/ad-plugins-rs/src/fft.rs:333-335,674,686` posts at `width`.
 C: `NDPluginFFT.cpp:224,245-253` posts at `nTimeX` (next-pow-2).
 Impact: non-pow-2 width — waveform length/content diverge.
+FIXED: `compute_row_spectrum` builds the time series at the padded length `nTimeX = next_pow2(width)`, zero-extending past the input (C's `timeSeries` is the nTimeX calloc buffer with input copied into [0,width)). `n_time` then drives FFTTimeAxis at the padded length. FFTReal/FFTImaginary/FFTAbsValue/FFTFreqAxis already used `nFreqX = padded/2` and are unchanged. Test: test_adp25_timeseries_and_timeaxis_use_padded_length (width=5 → length-8 zero-extended TimeSeries/TimeAxis, length-4 Real/FreqAxis).
 
 #### ADP-26: Codec implements zlib/lz4hdf5 codecs absent from the C reference
 Severity: Medium — signoff

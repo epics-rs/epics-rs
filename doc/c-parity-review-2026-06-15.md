@@ -127,9 +127,14 @@ population). One commit per finding.
 | ADP-28 (TIFF RGB2/RGB3 PlanarConfig=SEPARATE vs Rust chunky-RGB1) | fix→signoff | Resolved — keep Rust chunky-RGB1, decoded-image-equivalent (user 2026-06-15) | — |
 | ADP-30a (Stats HIST_BELOW/HIST_ABOVE Int32 param, not Float64) | fix-low | Fixed | 064b8011 |
 | ADP-30b (TIFF extra IFD tags / RowsPerStrip≠height) | signoff | Resolved — keep Rust IFD tags, decoded-equivalent (user 2026-06-15) | — |
+| STD-7/8 (time_of_day record-timestamp source + `<undefined>` sentinel) | signoff→fix | Fixed (user: Match C) | c079c35e |
+| ADC-8 (pool.convert binning sums in the target type, C-exact wrap/widen/precision) | verify→fix | Fixed (user: fix-now) | 515c1b5c |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
-`do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
+`do_pid`), so they land in one commit. STD-7/8 were re-dispositioned from
+signoff to fix (user: "Match C") and landed together in c079c35e: a single
+`recgbl::get_time_stamp` owner shared with `apply_timestamp`, the TSE-resolved
+stamp formatted by both device supports, and the `<undefined>` epoch sentinel.
 
 SCAL-1 added a `Record::log_swept_fields()` hook (LOG-only analogue of
 `force_posted_fields`), wired into the four monitor-snapshot builders — same
@@ -188,13 +193,15 @@ C: `NDPluginColorConvert.cpp` handles only Mono↔RGB1/2/3 + Bayer; no YUV anywh
 Impact: no divergence today (unwired). Conversely the C Bayer→RGB demosaic has a Rust counterpart only in ad-plugins (ADP-4). Flagged so the YUV paths are not mistaken for a faithful port.
 RESOLVED 2026-06-15 — keep the extra YUV paths (user): additive, unwired, no output-form divergence.
 
-#### ADC-8: `pool.convert` binning sums in f64 then casts once; C casts each element to the output type and accumulates there
+#### ADC-8: `pool.convert` binning sums in f64 then casts once; C casts each element to the output type and accumulates there — FIXED 515c1b5c
 Severity: Low — verify (unwired: wired ROI does pure cropping, no binning)
 Rust: `crates/ad-core-rs/src/ndarray_pool.rs:516-543` accumulates in f64 then `out=sum as T` (saturates).
 C: `NDArrayPool.cpp:460-466` `*pDOut += (dataTypeOut)*pDIn` (output-type arithmetic, integer wrap).
 Impact: a binning sum past the int range — C wraps, Rust saturates. Latent.
 
 VERIFIED 2026-06-15 — CONFIRMED REAL, production-unwired → surfaced for decision (#58). The Rust binning loop accumulates in `f64` and casts to the **source** type (`out[out_idx] = sum as $T` where `$T` = source type, ndarray_pool.rs:516-543), then a separate `convert_data_type` step (`:573-581`) casts to the target type. C instead accumulates directly in the **output** type (`*pDOut += (dataTypeOut)*pDIn`). Three divergences result when binning>1: (a) integer overflow — C wraps, Rust saturates; (b) **widening target** (e.g. u8 binned then converted to u16) — Rust clamps the bin sum to the *source* (u8) range before widening, so 4×100=400 → C 400 vs Rust 255; (c) i64/u64 values > 2^53 lose precision through the f64 round-trip even at binning=1. BUT no wired plugin reaches `NDArrayPool::convert` with binning>1 — the binning>1 sites are all in-crate tests (ndarray_pool.rs:982-1332); the wired ROI path does pure cropping (no binning). The faithful fix (accumulate in the output type with wrapping integer arithmetic across all source/target pairs) is a hot-loop rewrite of the convert macro and touches existing saturation-asserting tests, so per the "confirm before sprawling into a large structural change" rule it is surfaced rather than silently rewritten. Decision: fix-now (lock in C parity at the convert owner before binning is ever wired) vs defer-until-wired.
+
+FIXED 515c1b5c (user: fix-now) — the convert binning loop now accumulates directly in the target type via a `BinAcc` accumulator (i128 for integer targets, the target float type for float targets) and casts the accumulator once to the target element type, dropping the source-typed intermediate + separate `convert_data_type` step. The dispatch is now source-type × target-type so the per-element `(dataTypeOut)` cast happens in the output type, exactly like C `convertDim`. i128 + final narrowing cast reproduces C's per-step integer wrap by the `Z → Z/2^width` homomorphism. Regression tests: widening (u8×4→u16 = 800 not 255), overflow (u8×4 100s → 144 not 255), and i64 2^53+1 exact at binning==1 (the wired-path bug the f64 round-trip caused even for source==target).
 
 #### ADC-9: `pool.convert` rejects offset+size overrun; C does not bound-check
 Severity: Low — verify (unwired)
@@ -522,17 +529,21 @@ Rust: `crates/std-rs/src/records/timestamp.rs:206-211` always replaces VAL; Stri
 C: `timestampRecord.c:152-163` posts VAL/RVAL only when the new string differs from OVAL.
 Impact: a timestamp scanned faster than its format resolution gets redundant VAL updates in Rust.
 
-#### STD-7: time_of_day VAL uses wall clock, not the record timestamp (TSE source)
+#### STD-7: time_of_day VAL uses wall clock, not the record timestamp (TSE source) — FIXED c079c35e
 Severity: Low — signoff
 Rust: `crates/std-rs/src/device_support/time_of_day.rs:48,101` use `Local::now()`/`SystemTime::now()`.
 C: `devTimeOfDay.c:121,145` use `recGblGetTimeStamp` (TSE/TSEL-selected).
 Impact: default TSE=0 identical; diverge only for a non-current time source. Signoff.
 
-#### STD-8: time_of_day omits the C `<undefined>` epoch-zero sentinel
+FIXED c079c35e (user: Match C, same commit as STD-8) — both device supports now resolve the record's time stamp from TSE via a single owner `recgbl::get_time_stamp(tse, device_time)`, the `recGblGetTimeStamp` equivalent. `apply_timestamp` (database/mod.rs) was refactored to route through that same helper, so the value the support formats during `read()` and the stamp the framework applies one step later can never use two different TSE rules. `ProcessContext` now carries `dbCommon.time` (the device-time passthrough for TSE=-2). For TSE=0 the output is unchanged (current time); TSE!=0 now matches C instead of the wall clock.
+
+#### STD-8: time_of_day omits the C `<undefined>` epoch-zero sentinel — FIXED c079c35e
 Severity: Low — signoff
 Rust: `crates/std-rs/src/device_support/time_of_day.rs:56-60` always formats a date.
 C: `epicsTime.cpp:176-180` writes `"<undefined>"` for secPastEpoch==0 && nsec==0.
 Impact: unreachable given the wall-clock source (STD-7). Signoff.
+
+FIXED c079c35e (user: Match C, same commit as STD-7) — `createString` now emits the literal `"<undefined>"` when the TSE-resolved stamp's EPICS-epoch `secPastEpoch == 0 && nsec == 0` (`epicsTime.cpp:176`), matching `epicsTimeToStrftime`. The ai path (`aiReadTs`) needs no separate sentinel: an epoch stamp yields `secPastEpoch == 0`, so `val == 0.0`. Tests cover both the Unix and EPICS (1990) epochs and that a fixed device time formats its own year, not the wall-clock year.
 
 Verified-equivalent (std): epid PID arithmetic term-by-term (error/P/I windup+DRVL/DRVH/ki==0/derivative/MaxMin/ODEL/bumpless seeding), throttle record (limit gate, clip, DRVLS, CONSTANT-OUT/SENT/FLNK, delay timer, WAIT, last-value-wins), time_of_day format strings, SecPastEpoch ai.
 
@@ -768,5 +779,7 @@ Disposition tally (pre-fix): ~46 **fix**, ~7 **fix-low**, ~10 **signoff**,
 ~9 **verify** (incl. the 6 table-record T-candidates and the unwired ad-core
 library paths). Signoff items: ADC-7, ADC-10/ADP-26 (codec vocab), ADP-1
 (stats centroid precision fork), ADP-28 (TIFF planar config), ADP-30b (TIFF
-extra IFD tags), SCAL-4, SCAL-5, STD-7, STD-8, OPT-3, MQTT-3, PROC-3,
-MODB-1/2/3 — surfaced for the user rather than silently changed.
+extra IFD tags), SCAL-4, SCAL-5, OPT-3, MQTT-3, PROC-3,
+MODB-1/2/3 — surfaced for the user rather than silently changed. STD-7 and
+STD-8 were re-dispositioned signoff→fix (user: "Match C") and ADC-8 verify→fix
+(user: "fix-now"); all three are now Fixed (c079c35e, 515c1b5c).

@@ -535,11 +535,14 @@ impl<P: NDPluginProcess> SharedProcessorInner<P> {
     /// Direct interrupts (std_array_data_param) happen here (sync).
     /// The returned output must be published and flushed by the caller in async context.
     fn process_and_publish(&mut self, array: &Arc<NDArray>) -> Option<ProcessOutput> {
-        // B5: a MinCallbackTime-throttled array is dropped — count it.
+        // A MinCallbackTime-throttled array is silently skipped: C++
+        // driverCallback (NDPluginDriver.cpp:405-450) falls through the
+        // `deltaTime <= minCallbackTime` gate straight to callParamCallbacks()
+        // without touching any param — DroppedArrays is incremented ONLY on a
+        // compression-unaware array (:388) or a full message queue (:440), not
+        // on throttle. Post nothing and do not count the frame.
         if self.should_throttle() {
-            self.dropped_arrays
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            return Some(self.dropped_arrays_only_batch());
+            return None;
         }
         // R2/G5: cache the input array for ProcessPlugin re-injection only
         // for arrays that actually pass the MinCallbackTime gate and are
@@ -2686,10 +2689,14 @@ mod tests {
     }
 
     #[test]
-    fn test_min_callback_time_drop_counts() {
-        // B5: a MinCallbackTime-throttled array is dropped — verify the data
-        // loop does not emit it (silent loss is the bug being fixed; the
-        // DroppedArrays param increment is covered by the integration tests).
+    fn test_min_callback_time_throttle_not_counted() {
+        // A MinCallbackTime-throttled array is silently skipped, NOT counted.
+        // C++ driverCallback (NDPluginDriver.cpp:405-450) falls through the
+        // `deltaTime <= minCallbackTime` gate straight to callParamCallbacks()
+        // without touching DroppedArrays — that counter is incremented ONLY on
+        // a compression-unaware array (:388) or a full message queue (:440).
+        // Verify (a) the throttled array is not emitted and (b) DroppedArrays
+        // stays zero.
         let pool = Arc::new(NDArrayPool::new(1_000_000));
         let (downstream_sender, mut downstream_rx) = ndarray_channel("DOWNSTREAM", 10);
         let mut output = NDArrayOutput::new();
@@ -2705,6 +2712,7 @@ mod tests {
             test_wiring(),
         );
         enable_callbacks(&handle);
+        let dropped = handle.array_sender().dropped_arrays_counter().clone();
 
         // 10s minimum between callbacks — only the first array gets through.
         handle
@@ -2729,6 +2737,11 @@ mod tests {
         assert!(
             second.is_err(),
             "second array throttled out by MinCallbackTime"
+        );
+        assert_eq!(
+            dropped.load(Ordering::Acquire),
+            0,
+            "a MinCallbackTime-throttled frame must NOT increment DroppedArrays"
         );
     }
 

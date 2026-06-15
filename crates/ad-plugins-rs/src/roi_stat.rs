@@ -202,137 +202,194 @@ impl ROIStatProcessor {
         self.ts_sender = Some(sender);
     }
 
-    /// Compute statistics for a single ROI on a 2D data buffer.
+    /// Resolve a ROI's geometry against the array dimensions: clamp each
+    /// size to fit within the array, returning `None` if the ROI is
+    /// out of range (offset past the last pixel) or empty (zero size).
+    /// `dims` holds the array's [X, Y] sizes; `ndims` selects how many of
+    /// them are real (1 or 2).
+    fn roi_geometry(
+        roi: &ROIStatROI,
+        ndims: usize,
+        dims: [usize; 2],
+    ) -> Option<([usize; 2], [usize; 2])> {
+        let offset = roi.offset;
+        let mut size = roi.size;
+        for d in 0..ndims.min(2) {
+            let dim = dims[d];
+            if offset[d] >= dim || size[d] == 0 {
+                return None;
+            }
+            size[d] = size[d].min(dim - offset[d]);
+        }
+        Some((offset, size))
+    }
+
+    /// Compute statistics for one already-clamped ROI, mirroring the C
+    /// `doComputeStatistics` (NDPluginROIStat.cpp:30-139). `array_size_x`
+    /// is the array's X dimension (the row stride, = C `arraySize[0]`).
+    /// `ndims` selects the 1-D (single X strip) or 2-D (rectangle) layout.
+    /// Background pixels are summed exactly as C does: for 1-D the two
+    /// X-end strips, for 2-D the four-edge border. Both can double-count in
+    /// the degenerate thick-border case (`2*bgd_width > size`), matching C.
     pub fn compute_roi_stats(
         data: &NDDataBuffer,
-        x_size: usize,
-        y_size: usize,
-        roi: &ROIStatROI,
+        ndims: usize,
+        array_size_x: usize,
+        offset: [usize; 2],
+        size: [usize; 2],
+        bgd_width: usize,
     ) -> ROIStatResult {
-        let roi_x = roi.offset[0];
-        let roi_y = roi.offset[1];
-        let roi_w = roi.size[0];
-        let roi_h = roi.size[1];
-
-        // Clamp ROI to image bounds
-        if roi_x >= x_size || roi_y >= y_size || roi_w == 0 || roi_h == 0 {
-            return ROIStatResult::default();
-        }
-        let roi_w = roi_w.min(x_size - roi_x);
-        let roi_h = roi_h.min(y_size - roi_y);
+        let offset_x = offset[0];
+        let size_x = size[0];
 
         let mut min = f64::MAX;
         let mut max = f64::MIN;
         let mut total = 0.0f64;
-        let mut count = 0usize;
+        let mut bgd = 0.0f64;
+        let mut n_bgd = 0usize;
+        let n_elements;
 
-        for iy in roi_y..(roi_y + roi_h) {
-            for ix in roi_x..(roi_x + roi_w) {
-                let idx = iy * x_size + ix;
-                if let Some(val) = data.get_as_f64(idx) {
-                    if val < min {
-                        min = val;
-                    }
-                    if val > max {
-                        max = val;
-                    }
-                    total += val;
-                    count += 1;
+        if ndims == 1 {
+            if size_x == 0 {
+                return ROIStatResult::default();
+            }
+            n_elements = size_x;
+            for x in offset_x..offset_x + size_x {
+                let v = data.get_as_f64(x).unwrap_or(0.0);
+                min = min.min(v);
+                max = max.max(v);
+                total += v;
+            }
+            if bgd_width > 0 {
+                let bw_x = bgd_width.min(size_x);
+                for x in offset_x..offset_x + bw_x {
+                    n_bgd += 1;
+                    bgd += data.get_as_f64(x).unwrap_or(0.0);
+                }
+                for x in (offset_x + size_x - bw_x)..(offset_x + size_x) {
+                    n_bgd += 1;
+                    bgd += data.get_as_f64(x).unwrap_or(0.0);
                 }
             }
-        }
-
-        if count == 0 {
+        } else if ndims == 2 {
+            let offset_y = offset[1];
+            let size_y = size[1];
+            if size_x == 0 || size_y == 0 {
+                return ROIStatResult::default();
+            }
+            n_elements = size_x * size_y;
+            for y in offset_y..offset_y + size_y {
+                let row = y * array_size_x;
+                for x in offset_x..offset_x + size_x {
+                    let v = data.get_as_f64(row + x).unwrap_or(0.0);
+                    min = min.min(v);
+                    max = max.max(v);
+                    total += v;
+                }
+            }
+            if bgd_width > 0 {
+                let bw_x = bgd_width.min(size_x);
+                let bw_y = bgd_width.min(size_y);
+                // Top and bottom bw_y rows (full ROI width).
+                for y in offset_y..offset_y + bw_y {
+                    let row = y * array_size_x;
+                    for x in offset_x..offset_x + size_x {
+                        n_bgd += 1;
+                        bgd += data.get_as_f64(row + x).unwrap_or(0.0);
+                    }
+                }
+                for y in (offset_y + size_y - bw_y)..(offset_y + size_y) {
+                    let row = y * array_size_x;
+                    for x in offset_x..offset_x + size_x {
+                        n_bgd += 1;
+                        bgd += data.get_as_f64(row + x).unwrap_or(0.0);
+                    }
+                }
+                // Left and right bw_x columns of the middle rows.
+                for y in (offset_y + bw_y)..(offset_y + size_y - bw_y) {
+                    let row = y * array_size_x;
+                    for x in offset_x..offset_x + bw_x {
+                        n_bgd += 1;
+                        bgd += data.get_as_f64(row + x).unwrap_or(0.0);
+                    }
+                    for x in (offset_x + size_x - bw_x)..(offset_x + size_x) {
+                        n_bgd += 1;
+                        bgd += data.get_as_f64(row + x).unwrap_or(0.0);
+                    }
+                }
+            }
+        } else {
             return ROIStatResult::default();
         }
 
-        let mean = total / count as f64;
+        if n_elements == 0 {
+            return ROIStatResult::default();
+        }
 
-        // Background subtraction
-        let net = if roi.bgd_width > 0 {
-            let bgd = Self::compute_background(data, x_size, y_size, roi);
-            total - bgd * count as f64
+        // C (NDPluginROIStat.cpp:128-135):
+        //   if (nBgd > 0) bgd = bgd/nBgd * nElements;
+        //   net  = total - bgd;          (bgd stays 0 when bgdWidth == 0)
+        //   mean = total / nElements;
+        let bgd_scaled = if n_bgd > 0 {
+            bgd / n_bgd as f64 * n_elements as f64
         } else {
-            total
+            0.0
         };
-
         ROIStatResult {
             min,
             max,
-            mean,
+            mean: total / n_elements as f64,
             total,
-            net,
-        }
-    }
-
-    /// Compute average background from the border of the ROI.
-    fn compute_background(
-        data: &NDDataBuffer,
-        x_size: usize,
-        y_size: usize,
-        roi: &ROIStatROI,
-    ) -> f64 {
-        let roi_x = roi.offset[0];
-        let roi_y = roi.offset[1];
-        let roi_w = roi.size[0].min(x_size.saturating_sub(roi_x));
-        let roi_h = roi.size[1].min(y_size.saturating_sub(roi_y));
-        let bw = roi.bgd_width;
-
-        if bw == 0 || roi_w == 0 || roi_h == 0 {
-            return 0.0;
-        }
-
-        let mut bgd_total = 0.0f64;
-        let mut bgd_count = 0usize;
-
-        for iy in roi_y..(roi_y + roi_h) {
-            for ix in roi_x..(roi_x + roi_w) {
-                // Check if this pixel is in the border region
-                let dx_from_left = ix - roi_x;
-                let dx_from_right = (roi_x + roi_w - 1) - ix;
-                let dy_from_top = iy - roi_y;
-                let dy_from_bottom = (roi_y + roi_h - 1) - iy;
-
-                let in_border = dx_from_left < bw
-                    || dx_from_right < bw
-                    || dy_from_top < bw
-                    || dy_from_bottom < bw;
-
-                if in_border {
-                    let idx = iy * x_size + ix;
-                    if let Some(val) = data.get_as_f64(idx) {
-                        bgd_total += val;
-                        bgd_count += 1;
-                    }
-                }
-            }
-        }
-
-        if bgd_count == 0 {
-            0.0
-        } else {
-            bgd_total / bgd_count as f64
+            net: total - bgd_scaled,
         }
     }
 }
 
 impl NDPluginProcess for ROIStatProcessor {
     fn process_array(&mut self, array: &NDArray, _pool: &NDArrayPool) -> ProcessResult {
-        let info = array.info();
-        let x_size = info.x_size;
-        let y_size = info.y_size;
+        // NDPluginROIStat operates on the raw array dimensions like the C
+        // plugin (NDPluginROIStat.cpp): dims[0] = X, dims[1] = Y. Only 1-D
+        // or 2-D arrays are supported; C errors and yields zero stats for
+        // any other rank.
+        let ndims = array.dims.len();
+        let dims = [
+            array.dims.first().map(|d| d.size).unwrap_or(0),
+            array.dims.get(1).map(|d| d.size).unwrap_or(0),
+        ];
+        let array_size_x = dims[0];
+        let supported = ndims == 1 || ndims == 2;
 
         // Ensure results vec matches rois
         self.results
             .resize(self.rois.len(), ROIStatResult::default());
 
+        // Resolve each enabled ROI's geometry against the array bounds.
+        // `None` for disabled ROIs, unsupported ranks, or out-of-range /
+        // empty ROIs — those keep zero stats.
+        let clamped: Vec<Option<([usize; 2], [usize; 2])>> = self
+            .rois
+            .iter()
+            .map(|roi| {
+                if roi.enabled && supported {
+                    Self::roi_geometry(roi, ndims, dims)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         #[cfg(feature = "parallel")]
         {
-            let total_elements: usize = self
-                .rois
+            let total_elements: usize = clamped
                 .iter()
-                .filter(|r| r.enabled)
-                .map(|r| r.size[0] * r.size[1])
+                .flatten()
+                .map(|(_, size)| {
+                    if ndims == 1 {
+                        size[0]
+                    } else {
+                        size[0] * size[1]
+                    }
+                })
                 .sum();
 
             if par_util::should_parallelize(total_elements) {
@@ -340,34 +397,51 @@ impl NDPluginProcess for ROIStatProcessor {
                 let rois = &self.rois;
                 let new_results: Vec<ROIStatResult> = par_util::thread_pool().install(|| {
                     rois.par_iter()
-                        .map(|roi| {
-                            if roi.enabled {
-                                Self::compute_roi_stats(data, x_size, y_size, roi)
-                            } else {
-                                ROIStatResult::default()
-                            }
+                        .zip(clamped.par_iter())
+                        .map(|(roi, clamp)| match clamp {
+                            Some((offset, size)) => Self::compute_roi_stats(
+                                data,
+                                ndims,
+                                array_size_x,
+                                *offset,
+                                *size,
+                                roi.bgd_width,
+                            ),
+                            None => ROIStatResult::default(),
                         })
                         .collect()
                 });
                 self.results = new_results;
             } else {
-                for (i, roi) in self.rois.iter().enumerate() {
-                    if !roi.enabled {
-                        self.results[i] = ROIStatResult::default();
-                        continue;
-                    }
-                    self.results[i] = Self::compute_roi_stats(&array.data, x_size, y_size, roi);
+                for (i, (roi, clamp)) in self.rois.iter().zip(clamped.iter()).enumerate() {
+                    self.results[i] = match clamp {
+                        Some((offset, size)) => Self::compute_roi_stats(
+                            &array.data,
+                            ndims,
+                            array_size_x,
+                            *offset,
+                            *size,
+                            roi.bgd_width,
+                        ),
+                        None => ROIStatResult::default(),
+                    };
                 }
             }
         }
 
         #[cfg(not(feature = "parallel"))]
-        for (i, roi) in self.rois.iter().enumerate() {
-            if !roi.enabled {
-                self.results[i] = ROIStatResult::default();
-                continue;
-            }
-            self.results[i] = Self::compute_roi_stats(&array.data, x_size, y_size, roi);
+        for (i, (roi, clamp)) in self.rois.iter().zip(clamped.iter()).enumerate() {
+            self.results[i] = match clamp {
+                Some((offset, size)) => Self::compute_roi_stats(
+                    &array.data,
+                    ndims,
+                    array_size_x,
+                    *offset,
+                    *size,
+                    roi.bgd_width,
+                ),
+                None => ROIStatResult::default(),
+            };
         }
 
         // Accumulate time series (fixed-length: stop when full)
@@ -431,12 +505,12 @@ impl NDPluginProcess for ROIStatProcessor {
             updates.push(ParamUpdate::int32_addr(
                 p.dim0_max_size,
                 addr,
-                x_size as i32,
+                if ndims >= 1 { dims[0] as i32 } else { 0 },
             ));
             updates.push(ParamUpdate::int32_addr(
                 p.dim1_max_size,
                 addr,
-                y_size as i32,
+                if ndims >= 2 { dims[1] as i32 } else { 0 },
             ));
         }
         updates.push(ParamUpdate::int32(
@@ -983,5 +1057,40 @@ mod tests {
         assert!((data.values[3] - 112.0).abs() < 1e-10); // total
         // ROI2: 2x2 region, total=28 (2*2*7)
         assert!((data.values[8] - 28.0).abs() < 1e-10); // total
+    }
+
+    fn make_1d_array(n: usize, fill: impl Fn(usize) -> f64) -> NDArray {
+        let mut arr = NDArray::new(vec![NDDimension::new(n)], NDDataType::Float64);
+        if let NDDataBuffer::F64(ref mut v) = arr.data {
+            for (i, slot) in v.iter_mut().enumerate() {
+                *slot = fill(i);
+            }
+        }
+        arr
+    }
+
+    #[test]
+    fn test_adp17_1d_background_uses_x_strips_only() {
+        // Genuine 1-D array [10,0,0,0,0,10]. With bgd_width=1 the C 1-D path
+        // averages only the two X-end pixels (both 10): bgd = 10, scaled over
+        // 6 elements = 60, so net = total - 60 = 20 - 60 = -40. A 2-D
+        // border-ring would treat the single row as all-border (net = 0), and
+        // the old early-return would zero every stat for a 1-D array.
+        let arr = make_1d_array(6, |x| if x == 0 || x == 5 { 10.0 } else { 0.0 });
+        let rois = vec![ROIStatROI {
+            enabled: true,
+            offset: [0, 0],
+            size: [6, 0],
+            bgd_width: 1,
+        }];
+        let mut proc = ROIStatProcessor::new(rois, 0);
+        let pool = NDArrayPool::new(1_000_000);
+        proc.process_array(&arr, &pool);
+
+        let r = &proc.results()[0];
+        assert!((r.total - 20.0).abs() < 1e-10, "total={}", r.total);
+        assert!((r.min - 0.0).abs() < 1e-10);
+        assert!((r.max - 10.0).abs() < 1e-10);
+        assert!((r.net + 40.0).abs() < 1e-10, "net={}", r.net);
     }
 }

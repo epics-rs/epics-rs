@@ -125,6 +125,8 @@ population). One commit per finding.
 | ADP-23 (transform layout: array attr vs NDColorMode param) | verify→N/A | Not applicable (C refreshes the param from the array ColorMode attr each frame before use; same Mono default — equivalent, mismatch unreachable) | — |
 | ADP-27 (netCDF global-attr set: add NDNetCDFFileVersion=3.1; drop extra uniqueId/numArrays) | fix | Fixed | dbe09fd4 |
 | ADP-28 (TIFF RGB2/RGB3 PlanarConfig=SEPARATE vs Rust chunky-RGB1) | fix→signoff | Signoff — decoded-image-equivalent; byte-faithful planar needs hand-rolled writer (tiff crate is chunky-only); routed to #58 | — |
+| ADP-30a (Stats HIST_BELOW/HIST_ABOVE Int32 param, not Float64) | fix-low | Fixed | 064b8011 |
+| ADP-30b (TIFF extra IFD tags / RowsPerStrip≠height) | signoff | Signoff — decoded-equivalent, crate-controlled (ADP-28 family); routed to #58 | — |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -427,11 +429,15 @@ C: `NDPluginCodec.cpp:399-403,894` stores real params, default clevel 5.
 Impact: NTNDArray codec metadata 0/0/0 + different compressed bytes/size.
 Note: verified the codec level/shuffle/compressor fields are NOT serialized to the NTNDArray wire (`codec.parameters` carries only the original scalar type, `epics-pva-rs/src/nt/nd_array.rs`) nor read by the HDF5 writer (it uses its own `blosc_*` config). The observable divergence is the **default clevel 3→5** (changes compressed bytes + `compressedSize`); the stored-params 0→real change matches C `Codec_t` and removes a latent divergence if the fields are ever serialized.
 
-#### ADP-30: Stats HIST_BELOW/HIST_ABOVE param type Float64 vs C Int32; TIFF extra IFD tags / RowsPerStrip
+#### ADP-30: Stats HIST_BELOW/HIST_ABOVE param type Float64 vs C Int32 — FIXED 064b8011; TIFF extra IFD tags / RowsPerStrip — SIGNOFF (#58)
 Severity: Low — fix-low / signoff
-Rust: `crates/ad-plugins-rs/src/stats.rs:1045-1046,1196-1197` Float64; `file_tiff.rs` (via the `tiff` crate) emits Compression/Predictor/Resolution tags + RowsPerStrip≠height.
+Rust: `crates/ad-plugins-rs/src/stats.rs:1037-1038,1188-1189` Float64; `file_tiff.rs` (via the `tiff` crate) emits Compression/Predictor/Resolution tags + RowsPerStrip≠height.
 C: `NDPluginStats.cpp:627-628,827-828` asynInt32; `NDFileTIFF.cpp:231-238` exactly 8 tags, RowsPerStrip=sizeY.
 Impact: HIST value integer-equal but param type differs; TIFF IFD tag set differs (pixels identical).
+
+Part 1 (HIST_BELOW/HIST_ABOVE type) — FIXED 064b8011: registered both as `ParamType::Int32` and emitted via `ParamUpdate::int32` so the RBV is DBR_LONG, matching C asynParamInt32 + setIntegerParam. Defect-family sweep over the complete C `asynParamInt32, &NDPluginStats*` set (12 params) confirmed these two were the only sites still registered Float64; ProfileSizeX/Y and the control params were already Int32. Regression `test_adp30_hist_below_above_emitted_as_int32`.
+
+Part 2 (TIFF extra IFD tags / RowsPerStrip) — SIGNOFF, routed to #58: the `tiff` crate's high-level `ImageEncoder` writes Compression/Predictor/X-YResolution/ResolutionUnit and a default RowsPerStrip — a wider IFD tag set than C's, with identical decoded pixels. Same decoded-equivalent, crate-controlled family as ADP-28 (TIFF planar config); suppressing the extra tags / forcing RowsPerStrip=height needs the same hand-rolled IFD writer. Surfaced for the user rather than silently changed.
 
 Verified-equivalent (ad-plugins): bad_pixel formulas, overlay_font glyphs/bit order, transform index math (all 8×4), roi 2-D crop/bin/reverse/scale, fft butterfly/normalization/freq-axis/EMA, time_series wrap, TIFF/netCDF dataType maps, JPEG mono/RGB1, plain LZ4 framing.
 Not audited (lower numeric density / large): attr_plot, attribute, circular_buff, gather, scatter, pos_plugin, std_arrays, passthrough, file_hdf5+hdf5_layout, file_nexus, file_magick, pva — warrant a follow-up round (HDF5/Nexus especially).
@@ -747,6 +753,6 @@ Cluster summary:
 Disposition tally (pre-fix): ~46 **fix**, ~7 **fix-low**, ~10 **signoff**,
 ~9 **verify** (incl. the 6 table-record T-candidates and the unwired ad-core
 library paths). Signoff items: ADC-7, ADC-10/ADP-26 (codec vocab), ADP-1
-(stats centroid precision fork), ADP-28 (TIFF planar config), SCAL-4,
-SCAL-5, STD-7, STD-8, OPT-3, MQTT-3, PROC-3, MODB-1/2/3 — surfaced for the
-user rather than silently changed.
+(stats centroid precision fork), ADP-28 (TIFF planar config), ADP-30b (TIFF
+extra IFD tags), SCAL-4, SCAL-5, STD-7, STD-8, OPT-3, MQTT-3, PROC-3,
+MODB-1/2/3 — surfaced for the user rather than silently changed.

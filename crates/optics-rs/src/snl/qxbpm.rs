@@ -385,23 +385,15 @@ pub struct BeamPosition {
 /// - X = GX * (B - D) / (B + D)
 /// - Y = GY * (A - C) / (A + C)
 ///
-/// Returns (0, 0) if the denominator is zero to avoid division by zero.
+/// C (sncqxbpm.st:493-494) divides unguarded, so a zero quadrant sum yields
+/// NaN (0/0) or ±Inf (nonzero/0) and a tiny sum a large finite value. We
+/// reproduce that IEEE result rather than substituting 0.0, so pos:x / pos:y
+/// carry the same on-the-wire value as C under no-beam or cancelling currents.
 pub fn compute_position(currents: &DiodeCurrents, gx: f64, gy: f64) -> BeamPosition {
     let bd_sum = currents.b + currents.d;
     let ac_sum = currents.a + currents.c;
-
-    let x = if bd_sum.abs() > f64::EPSILON {
-        gx * (currents.b - currents.d) / bd_sum
-    } else {
-        0.0
-    };
-
-    let y = if ac_sum.abs() > f64::EPSILON {
-        gy * (currents.a - currents.c) / ac_sum
-    } else {
-        0.0
-    };
-
+    let x = gx * (currents.b - currents.d) / bd_sum;
+    let y = gy * (currents.a - currents.c) / ac_sum;
     BeamPosition { x, y }
 }
 
@@ -1289,7 +1281,8 @@ mod tests {
     }
 
     #[test]
-    fn position_zero_denominator() {
+    fn position_zero_denominator_is_nan_like_c() {
+        // No beam: both quadrant sums are 0. C divides 0/0 -> NaN; we match.
         let c = DiodeCurrents {
             a: 0.0,
             b: 0.0,
@@ -1297,8 +1290,21 @@ mod tests {
             d: 0.0,
         };
         let pos = compute_position(&c, 4.5, 4.5);
-        assert!((pos.x - 0.0).abs() < 1e-9);
-        assert!((pos.y - 0.0).abs() < 1e-9);
+        assert!(pos.x.is_nan(), "pos.x = {}", pos.x);
+        assert!(pos.y.is_nan(), "pos.y = {}", pos.y);
+    }
+
+    #[test]
+    fn position_nonzero_over_zero_is_infinite_like_c() {
+        // X numerator nonzero, B+D == 0 (cancelling currents) -> C yields +-Inf.
+        let c = DiodeCurrents {
+            a: 1.0,
+            b: 2.0,
+            c: 1.0,
+            d: -2.0,
+        };
+        let pos = compute_position(&c, 4.5, 4.5);
+        assert!(pos.x.is_infinite(), "pos.x = {}", pos.x);
     }
 
     #[test]

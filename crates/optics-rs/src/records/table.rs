@@ -420,6 +420,9 @@ pub struct TableRecord {
 
     // --- Internal: previous angle unit (for conversion) ---
     curr_aunit: AngleUnit,
+
+    // --- Internal: previous yaw angle (for the YANG offset rotation) ---
+    curr_yang: f64,
 }
 
 impl Default for TableRecord {
@@ -605,6 +608,7 @@ impl Default for TableRecord {
             b: [[0.0; 3]; 3],
             lnk_stat: [LinkStatus::default(); 6],
             curr_aunit: AngleUnit::Degrees,
+            curr_yang: 0.0,
         }
     }
 }
@@ -3680,11 +3684,21 @@ impl Record for TableRecord {
                 self.sync = 1;
             }
             "YANG" => {
-                // YANG changed: convert offsets lab->local (pre), then local->lab (post).
-                // Since on_put is called after, we do the full re-sync.
-                // The C code does: before: LabToLocal(ax0), after: LocalToLab(ax0).
-                // In the Rust model we handle this as a sync.
+                // C special() runs two passes around the YANG write:
+                //   before (old yang): LabToLocal(ax0)  = RotY(ax0, +old*D2R)
+                //   after  (new yang): LocalToLab(ax0)  = RotY(ax0, -new*D2R)
+                // Net: ax0 := RotY(ax0, (old - new)*D2R), mixing the X/Z and
+                // AX/AZ offset components so the user offsets stay physically
+                // fixed as the table yaw changes. on_put fires post-write, so the
+                // old yang is read from curr_yang (mirrors the AUNIT path above).
+                if self.curr_yang != self.yang {
+                    let ax0 = self.user_offset();
+                    let tmp = lab_to_local(self.curr_yang, &ax0);
+                    let rotated = local_to_lab(self.yang, &tmp);
+                    self.set_user_offset(&rotated);
+                }
                 self.sync = 1;
+                self.curr_yang = self.yang;
             }
             // Absolute user limits -> update relative
             "UHAX" | "UHAY" | "UHAZ" | "UHX" | "UHY" | "UHZ" | "ULAX" | "ULAY" | "ULAZ" | "ULX"
@@ -3813,6 +3827,7 @@ impl Record for TableRecord {
                 self.torad = 1.0e-6;
             }
             self.curr_aunit = self.aunit;
+            self.curr_yang = self.yang;
 
             // Initialize geometry
             self.do_init_geometry();
@@ -4362,6 +4377,29 @@ mod tests {
         );
         assert!((t.torad - 1.0e-6).abs() < 1e-15);
         assert_eq!(t.aegu, "ur");
+    }
+
+    #[test]
+    fn test_yang_rotates_user_offsets() {
+        // C special() rotates the ax0 user-offset block by (old_yang - new_yang)
+        // around Y (mixing X<->Z and AX<->AZ). With old=0, new=90deg the net is
+        // RotY(ax0, -90deg): an X/AX offset rotates fully into Z/AZ.
+        let mut t = TableRecord::new();
+        t.yang = 0.0;
+        t.curr_yang = 0.0;
+        t.ax0 = 1.0;
+        t.az0 = 0.0;
+        t.x0 = 2.0;
+        t.z0 = 0.0;
+
+        t.put_field("YANG", EpicsValue::Double(90.0)).unwrap();
+        t.on_put("YANG");
+
+        assert!(t.ax0.abs() < 1e-9, "ax0 = {}", t.ax0);
+        assert!((t.az0 - 1.0).abs() < 1e-9, "az0 = {}", t.az0);
+        assert!(t.x0.abs() < 1e-9, "x0 = {}", t.x0);
+        assert!((t.z0 - 2.0).abs() < 1e-9, "z0 = {}", t.z0);
+        assert_eq!(t.curr_yang, 90.0);
     }
 
     #[test]

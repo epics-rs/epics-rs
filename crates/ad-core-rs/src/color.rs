@@ -274,6 +274,21 @@ pub fn convert_rgb_layout(
     arr.time_stamp = src.time_stamp;
     arr.attributes = src.attributes.clone();
     arr.codec = src.codec.clone();
+    // The output is laid out as `dst_mode`, so its ColorMode attribute must say
+    // so. Cloning the source attributes copied the *source* ColorMode, which
+    // now contradicts the new dims; any consumer that resolves layout from the
+    // ColorMode attribute (e.g. NDArray::info) would mis-read the result (the
+    // NDFileJPEG RGB2/RGB3 grayscale bug). Replace it so dims and attribute
+    // agree by construction.
+    {
+        use crate::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+        arr.attributes.add(NDAttribute::new_static(
+            "ColorMode",
+            "Color mode",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(dst_mode as i32),
+        ));
+    }
     Ok(arr)
 }
 

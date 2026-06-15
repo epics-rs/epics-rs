@@ -372,4 +372,53 @@ mod tests {
         writer.close_file().unwrap();
         std::fs::remove_file(&path).ok();
     }
+
+    /// Write an RGB-mode array to JPEG and return the decoded array's dims.
+    fn jpeg_roundtrip_dims(prefix: &str, mode: NDColorMode, dims: Vec<usize>) -> Vec<usize> {
+        use ad_core_rs::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+        let path = temp_path(prefix);
+        let mut writer = JpegWriter::new(95);
+
+        let mut arr = NDArray::new(
+            dims.iter().map(|&d| NDDimension::new(d)).collect(),
+            NDDataType::UInt8,
+        );
+        arr.attributes.add(NDAttribute::new_static(
+            "ColorMode",
+            "Color mode",
+            NDAttrSource::Driver,
+            NDAttrValue::Int32(mode as i32),
+        ));
+        if let NDDataBuffer::U8(ref mut v) = arr.data {
+            for (i, x) in v.iter_mut().enumerate() {
+                *x = (i % 256) as u8;
+            }
+        }
+
+        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        let read_back = writer.read_file().unwrap();
+        writer.close_file().unwrap();
+        std::fs::remove_file(&path).ok();
+        read_back.dims.iter().map(|d| d.size).collect()
+    }
+
+    #[test]
+    fn test_adp12_rgb2_jpeg_written_as_rgb_not_grayscale() {
+        // RGB2 [x=5, c=3, y=4]: C writes width=5, height=4, 3 JCS_RGB
+        // components (NDFileJPEG.cpp:67-78). The Rust converts to RGB1 first;
+        // before the fix the stale ColorMode=RGB2 attribute made info() read
+        // the RGB1 dims as width=3, color=5 -> a 3x4 grayscale JPEG. Decoded
+        // dims must be RGB24 [3, 5, 4], not grayscale [3, 4].
+        let dims = jpeg_roundtrip_dims("jpeg_rgb2", NDColorMode::RGB2, vec![5, 3, 4]);
+        assert_eq!(dims, vec![3, 5, 4]);
+    }
+
+    #[test]
+    fn test_adp12_rgb3_jpeg_written_as_rgb_not_grayscale() {
+        // RGB3 [x=5, y=4, c=3]: C writes width=5, height=4, 3 components
+        // (NDFileJPEG.cpp:72-78). Decoded dims must be RGB24 [3, 5, 4].
+        let dims = jpeg_roundtrip_dims("jpeg_rgb3", NDColorMode::RGB3, vec![5, 4, 3]);
+        assert_eq!(dims, vec![3, 5, 4]);
+    }
 }

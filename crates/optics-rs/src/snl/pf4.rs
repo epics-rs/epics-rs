@@ -500,9 +500,21 @@ impl Pf4Controller {
         actions.write_labels = Some(labels);
         actions.write_transmission = Some(self.transmission);
         actions.write_inv_transmission = Some(self.inv_transmission);
-        actions.write_filter_al = Some(self.filter_al);
-        actions.write_filter_ti = Some(self.filter_ti);
-        actions.write_filter_glass = Some(self.filter_glass);
+        // C only PVPUTs filterAl/Ti/Gl when a blade uses that material
+        // (pf4.st:277-279: `if(z1==0||z2==0||z3==0||z4==0)` etc.), and only in
+        // the bankctl==2 recompute branch, which is reached solely while the bank
+        // is on. A material with no blade — or any material while the bank is off
+        // (thickZ returns 0) — is left at its prior value, not overwritten with 0.
+        let mats = &self.bank_config.material_indices;
+        if self.bank_on && mats.contains(&MAT_AL) {
+            actions.write_filter_al = Some(self.filter_al);
+        }
+        if self.bank_on && mats.contains(&MAT_TI) {
+            actions.write_filter_ti = Some(self.filter_ti);
+        }
+        if self.bank_on && mats.contains(&MAT_GLASS) {
+            actions.write_filter_glass = Some(self.filter_glass);
+        }
 
         actions
     }
@@ -1002,6 +1014,27 @@ mod tests {
 
         // With no filters inserted, transmission should be 1.0
         assert!((ctrl.transmission - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_filter_thickness_writes_gated_by_material_and_bank() {
+        // Bank on, all blades Al → only filterAl is posted; Ti/Glass left alone.
+        let mut ctrl = Pf4Controller::default();
+        ctrl.bank_on = true;
+        ctrl.energy_kev = 10.0;
+        ctrl.bank_config.thicknesses = [0.5, 1.0, 2.0, 4.0];
+        ctrl.bank_config.material_indices = [MAT_AL, MAT_AL, MAT_AL, MAT_AL];
+        let actions = ctrl.recalculate();
+        assert!(actions.write_filter_al.is_some());
+        assert!(actions.write_filter_ti.is_none());
+        assert!(actions.write_filter_glass.is_none());
+
+        // Bank off → none of the three are posted (no spurious 0.0 overwrite).
+        ctrl.bank_on = false;
+        let actions = ctrl.recalculate();
+        assert!(actions.write_filter_al.is_none());
+        assert!(actions.write_filter_ti.is_none());
+        assert!(actions.write_filter_glass.is_none());
     }
 
     #[test]

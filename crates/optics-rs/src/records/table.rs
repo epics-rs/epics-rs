@@ -2076,9 +2076,12 @@ impl TableRecord {
             }
         }
 
-        // Restore original speeds
+        // Restore original speeds. C RestoreMotorSpeeds writes the saved speed
+        // to every can_RW_speed motor, NOT just the ones that moved
+        // (tableRecord.c:998-1006, called unconditionally at :574) — a
+        // stationary speed-capable motor still has its speed link restored.
         for i in 0..6 {
-            if (motor_move_mask & (1 << i)) != 0 && self.lnk_stat[i].can_rw_speed {
+            if self.lnk_stat[i].can_rw_speed {
                 actions.push(ProcessAction::WriteDbLink {
                     link_field: SPEED_OUT_LINK[i],
                     value: EpicsValue::Double(saved_speeds[i]),
@@ -4400,6 +4403,34 @@ mod tests {
         assert!(t.x0.abs() < 1e-9, "x0 = {}", t.x0);
         assert!((t.z0 - 2.0).abs() < 1e-9, "z0 = {}", t.z0);
         assert_eq!(t.curr_yang, 90.0);
+    }
+
+    #[test]
+    fn test_speed_restore_covers_all_speed_capable_motors() {
+        // C RestoreMotorSpeeds restores the saved speed on EVERY can_RW_speed
+        // motor (tableRecord.c:998-1006), not just the ones in motor_move_mask.
+        let mut t = TableRecord::new();
+        for i in 0..6 {
+            t.lnk_stat[i].can_rw_speed = i < 2; // motors 0 and 1 speed-capable
+            t.lnk_stat[i].can_rw_drive = false;
+        }
+        let saved = [11.0, 22.0, 0.0, 0.0, 0.0, 0.0];
+
+        // Only motor 0 is in the move mask; motor 1 stays put.
+        let actions = t.build_output_actions(0b01, &saved);
+
+        let restored = |link: &str, want: f64| {
+            actions.iter().any(|a| {
+                matches!(a,
+                    ProcessAction::WriteDbLink { link_field, value: EpicsValue::Double(v) }
+                    if *link_field == link && (*v - want).abs() < 1e-12)
+            })
+        };
+        assert!(restored("V0XL", 11.0), "moving motor 0 speed restored");
+        assert!(
+            restored("V0YL", 22.0),
+            "stationary speed-capable motor 1 speed restored"
+        );
     }
 
     #[test]

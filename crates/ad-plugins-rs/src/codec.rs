@@ -791,7 +791,11 @@ impl Default for BloscConfig {
     fn default() -> Self {
         Self {
             compressor: 0,
-            clevel: 3,
+            // C NDPluginCodec sets the default NDCodecBloscCLevel to 5
+            // (NDPluginCodec.cpp:894); a lower default would yield different
+            // compressed bytes and NDCompressedSize than C for an unconfigured
+            // plugin.
+            clevel: 5,
             shuffle: 0,
         }
     }
@@ -830,9 +834,11 @@ pub fn compress_blosc(src: &NDArray, config: &BloscConfig) -> NDArray {
     arr.codec = Some(Codec {
         name: CodecName::Blosc,
         compressed_size,
-        level: 0,
-        shuffle: 0,
-        compressor: 0,
+        // C records the real Blosc params in the codec (NDPluginCodec.cpp:
+        // 400-402: codec.level = clevel; shuffle; compressor), not zeros.
+        level: config.clevel as i32,
+        shuffle: config.shuffle as i32,
+        compressor: config.compressor as i32,
         original_data_type,
     });
     arr
@@ -1190,6 +1196,33 @@ mod tests {
                 "no codec carrier attribute may be attached to a compressed frame"
             );
         }
+    }
+
+    #[test]
+    fn test_adp29_blosc_default_clevel_and_codec_params() {
+        // C NDPluginCodec default BloscCLevel = 5 (NDPluginCodec.cpp:894); a
+        // lower default would change the compressed bytes and NDCompressedSize.
+        assert_eq!(
+            BloscConfig::default().clevel,
+            5,
+            "default Blosc clevel must be 5 (C parity)"
+        );
+
+        // C records the real level/shuffle/compressor in the codec
+        // (NDPluginCodec.cpp:400-402), not zeros.
+        let mut arr = NDArray::new(vec![NDDimension::new(8)], NDDataType::UInt16);
+        if let NDDataBuffer::U16(ref mut v) = arr.data {
+            for (i, x) in v.iter_mut().enumerate() {
+                *x = (i * 7) as u16;
+            }
+        }
+        let out = compress_blosc(&arr, &BloscConfig::default());
+        let codec = out.codec.as_ref().expect("blosc codec metadata");
+        // codec.level = 5 (not the old hardcoded 0) proves the real clevel is
+        // recorded; shuffle/compressor likewise mirror the config.
+        assert_eq!(codec.level, 5, "codec.level records the default clevel 5");
+        assert_eq!(codec.shuffle, 0, "codec.shuffle records shuffle");
+        assert_eq!(codec.compressor, 0, "codec.compressor records compressor");
     }
 
     // ---- LZ4 tests ----

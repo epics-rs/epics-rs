@@ -93,6 +93,7 @@ population). One commit per finding.
 | ADC-6 / ADP-2 (RGB→Mono `(R+G+B)/3` truncated, not luminance+round) | fix | Fixed | 1273b533 |
 | ADC-4 (MinCallbackTime-throttled frame must not count as dropped) | fix | Fixed | a1cb7e0c |
 | ADC-1 (PARAM NDAttribute type follows configured `datatype`, not runtime type) | verify→fix | Fixed (option: honor datatype) | eecf79c8 |
+| ADC-2 (`NDArrayCallbacks=0` must stop downstream NDArray delivery, plugin path) | fix | Fixed | cf59bf78 |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -114,8 +115,9 @@ Rust: `crates/ad-core-rs/src/driver/ndarray_driver.rs:92-107` (`parse_attributes
 C: `ADApp/ADSrc/asynNDArrayDriver.cpp:445-446` reads `datatype` (default `"int"`); `paramAttribute.cpp:80-95,131-151` maps it to a fixed NDAttr type and reads the param accordingly.
 Impact: `<Attribute type="PARAM" source="GAIN"/>` on a Float64 param publishes, in C, an NDAttrInt32 (code 4) holding the truncated integer (default `datatype="int"`); Rust publishes NDAttrFloat64 (code 9) with the float. NTNDArray/file attribute carries a different dataType code AND value.
 
-#### ADC-2: `NDArrayCallbacks=0` does not stop downstream NDArray delivery (plugin path)
+#### ADC-2: `NDArrayCallbacks=0` does not stop downstream NDArray delivery (plugin path) — FIXED cf59bf78
 Severity: High — fix
+Fix: `SharedProcessorInner.array_callbacks` (updated from the ARRAY_CALLBACKS param write) gates the two downstream-delivery mechanisms at the single owner — `build_publish_batch(deliver)` skips the STD_ARRAY_DATA generic-pointer interrupt and empties `ProcessOutput.arrays`, and `process_and_publish` skips `route_output_arrays` (no throttle/sort admission) — while still publishing the begin metadata params. Matches C `endProcessCallbacks`:257-265. Sort-buffer flushes always deliver (admitted while on; C sort thread is flag-independent). Distinct from `enabled` (EnableCallbacks).
 Rust: `crates/ad-core-rs/src/plugin/runtime.rs:505,928` always emits the output array; `array_callbacks` (`:1022`) is never read in the data loop (only `enabled` gates output).
 C: `ADApp/pluginSrc/NDPluginDriver.cpp:257-265` — `endProcessCallbacks` caches the array and returns without `doCallbacksGenericPointer` when `NDArrayCallbacks==0`.
 Impact: with `ArrayCallbacks=0`, C withholds NDArrays from downstream; Rust keeps publishing every frame. (Driver-base path `driver/ndarray_driver.rs:523-537` honors the gate; only the plugin runtime diverges.)

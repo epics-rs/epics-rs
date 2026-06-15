@@ -954,37 +954,37 @@ Module note — `gather.rs`: output-form parity-clean on the pass-through path (
 ### attribute / array plugins — NDPluginStdArrays / NDPluginAttribute / NDPluginAttrPlot / passthrough (ADP-46..60)
 
 #### ADP-46: NDPluginStdArrays posts only the array's native element type, not all six asyn array types
-Severity: High — fix
+Severity: High — fix — **FIXED 44dee647** (asyn-rs array I/O Intr now converts the carried native array to the consuming record's interface element type via `convert_param_array_to_iface`, mirroring the polled `result_to_value` path; residual unsigned-native→wider-signed-FTVL edge noted in the commit since the ParamValue carrier holds no unsigned array variant)
 Rust: `plugin/runtime.rs:708-756` (`build_publish_batch`) fires a single `notify` whose `ParamValue` array variant is the NDArray's native `NDDataBuffer` type (F64→Float64Array, I32→Int32Array, …).
 C: `NDPluginStdArrays.cpp:169-197` calls `arrayInterruptCallback` for **all six** interfaces (int8/16/32/64, float32/64), each running `pNDArrayPool->convert(pArray, &pOutput, signedType)` and pushing the type-converted copy to every subscribed client.
 Impact: A waveform/aai record bound to STD_ARRAY_DATA whose FTVL differs from the array's native type (e.g. FTVL=SHORT fed by an F64 array) gets no correctly-converted update on the I/O Intr frame path. Confirmed: the interrupt consumer (`asyn-rs/adapter.rs:1249-1284`) takes the native-typed array verbatim and never routes through the typed `read_int16_array`/`read_int32_array` converters (those run only on the polled path, `runtime.rs:1393-1442`).
 
 #### ADP-47: NDAttrConfigure ignores `maxAttributes` arg; channel count hardcoded to 8
-Severity: High — fix
+Severity: High — fix — **FIXED c338aef3** (AttributeProcessor holds a Vec sized to maxAttributes; create_attribute_runtime threads num_channels=max(arg,1) + num_addr=max(arg,2); ioc reads arg 5 via the new C-faithful `attr_arg_defs`)
 Rust: `attribute.rs:20` `MAX_ATTR_CHANNELS = 8`; `attribute.rs:228-236` always builds the runtime with 8; `ioc.rs:409`/`helpers.rs:65-79` `extract_plugin_args` never reads arg index 5 (`maxAttributes`).
 C: `NDPluginAttribute.cpp:169-184` takes `maxAttributes`, sets `maxAttributes_` (floored ≥1), uses it as asyn address count `std::max<int>(maxAttributes,2)`; `processCallbacks` loops `i<maxAttributes_` (line 55).
 Impact: The number of attribute channels (and ATTR_VAL/ATTR_VAL_SUM/ATTR_ATTRNAME records serviced, per-channel `callParamCallbacks(i)` posts) is fixed at 8 regardless of the `NDAttrConfigure` arg. A db configured for 16 loses channels 8-15; one for 2 still allocates 8. Also drives the TS length (ADP-49).
 
 #### ADP-48: ATTR_RESET only clears on non-zero writes; C clears on every write
-Severity: Medium — fix
+Severity: Medium — fix — **FIXED 0802be4c** (removed the `value != 0` guard; defect family also covered `attr_plot.rs` AP_Reset, fixed in the same commit since C `reset_data()` also runs on any write, NDPluginAttrPlot.cpp:290-292)
 Rust: `attribute.rs:178-189` guards `if params.value.as_i32() != 0` before zeroing Val/ValSum.
 C: `NDPluginAttribute.cpp:123-128` zeros `NDPluginAttributeVal`/`ValSum` for all channels on **any** write to `NDPluginAttributeReset` (no value test), then `callParamCallbacks()`.
 Impact: `caput ATTR_RESET 0` in C zeros all Val/ValSum and posts monitors; in Rust it is a no-op. Downstream monitors observe a clear event in C that never fires in Rust for a zero write.
 
 #### ADP-49: Attribute time-series array length is fixed at 8, not `maxAttributes_`
-Severity: Medium — fix
+Severity: Medium — fix — **FIXED c338aef3** (subsumed by ADP-47: `attr_ts_channel_names(num_channels)` and the per-frame values Vec now track maxAttributes_)
 Rust: `attribute.rs:146` collects exactly 8 channel values; `attr_ts_channel_names()` (197-208) defines 8 TS channels.
 C: `NDPluginAttribute.cpp:93-110` `doTimeSeriesCallbacks` allocates an NDArray of `dims=maxAttributes_` NDFloat64 and posts via `doCallbacksGenericPointer`.
 Impact: The per-frame time-series waveform has `maxAttributes_` elements in C vs always 8 in Rust. For any `maxAttributes != 8` the element count differs. (Consequence of ADP-47.)
 
 #### ADP-50: Attribute plugin re-posts stale Val/ValSum for a missing attribute; C skips the post
-Severity: Low — fix-low
+Severity: Low — fix-low — **FIXED a3795c6a** (Val/ValSum post + accumulation moved inside the `Some(val)` arm so a missing/non-numeric attribute skips the post, matching C `continue`)
 Rust: `attribute.rs:131-142` — when `extract_value` returns `None` it keeps the previous `ch.value` but still pushes `ParamUpdate::float64_addr` for Val and ValSum (re-posting the old value).
 C: `NDPluginAttribute.cpp:72-80` — on a read error/missing attribute it `continue`s, skipping setDoubleParam(Val), the ValSum accumulation, and `callParamCallbacks(i)` for that channel.
 Impact: On a frame missing the tracked attribute, C emits no monitor update for that channel; Rust emits a redundant post of the unchanged value (extra monitor traffic / spurious timestamps).
 
 #### ADP-51: AttrPlot rejects DataSelect=0 when no attributes are tracked; C allows it
-Severity: Low — fix-low
+Severity: Low — fix-low — **FIXED 73243091** (`set_data_select` guard changed from `value >= 0` to `value > 0`, matching NDPluginAttrPlot.cpp:283)
 Rust: `attr_plot.rs:143-145` `set_data_select` rejects `value >= 0 && (value as usize) >= attributes.len()` — so `value==0` with empty list is rejected.
 C: `NDPluginAttrPlot.cpp:283-285` rejects only `value > 0 && (unsigned)value >= attributes_.size()` — `value==0` always accepted.
 Impact: `caput AP_DataSelect 0` before any frame (empty attribute list) succeeds in C but errors in Rust; divergent write status and stored DataSelect.

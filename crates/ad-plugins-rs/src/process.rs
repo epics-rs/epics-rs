@@ -342,13 +342,14 @@ impl ProcessState {
             self.save_flat_field(src);
             self.config.save_flat_field = false;
         }
-        // 0b. Auto offset/scale (one-shot): compute offset/scale from this
-        // input array and enable offset/scale + clipping (C++ writeInt32 for
-        // NDPluginProcessAutoOffsetScale).
-        if self.config.auto_offset_scale_pending {
-            self.auto_offset_scale(src);
-            self.config.auto_offset_scale_pending = false;
-        }
+        // 0b. Auto offset/scale (one-shot): C MEASURES this frame's min/max and
+        // ARMS scale/offset + clipping for the NEXT frame — the trigger frame
+        // itself is emitted with the pre-existing config, NOT the derived scale
+        // (NDPluginProcess.cpp:164-178 only updates min/max; 238-250 arms the
+        // params after the output array is built). Consume the one-shot here and
+        // defer the arming until after this frame's output is produced.
+        let auto_offset_scale_now = self.config.auto_offset_scale_pending;
+        self.config.auto_offset_scale_pending = false;
 
         // Recompute valid background / flat field each frame from the element
         // count (C NDPluginProcess.cpp:120-125): a saved buffer is usable only
@@ -528,6 +529,15 @@ impl ProcessState {
         arr.unique_id = src.unique_id;
         arr.timestamp = src.timestamp;
         arr.attributes = src.attributes.clone();
+
+        // Arm auto offset/scale from THIS frame's data for the NEXT frame
+        // (C NDPluginProcess.cpp:238-250 runs after the output array is built).
+        // Only on the emitted-output path: a suppressed frame produces no output
+        // array, so C (pArrayOut == NULL) does not arm either.
+        if auto_offset_scale_now {
+            self.auto_offset_scale(src);
+        }
+
         Some(arr)
     }
 }
@@ -1460,25 +1470,35 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_offset_scale_applied() {
-        // Regression: arming auto_offset_scale_pending must run
-        // auto_offset_scale() on the next process() call.
+    fn test_adp6_auto_offset_scale_arms_next_frame_not_trigger() {
+        // C measures the trigger frame's min/max and ARMS scale/offset + clipping
+        // for the NEXT frame; the trigger frame itself is emitted with the
+        // pre-existing config (NDPluginProcess.cpp:164-178 measures only, 238-250
+        // arms after the output array is built).
         let mut state = ProcessState::new(ProcessConfig {
             output_type: Some(NDDataType::UInt8),
             ..Default::default()
         });
         state.config.auto_offset_scale_pending = true;
 
-        // input range [10, 30] => offset=-10, scale=255/20=12.75, clipping on.
-        let out = state.process(&make_f64_array(&[10.0, 20.0, 30.0])).unwrap();
-        // The pending flag is consumed.
-        assert!(!state.config.auto_offset_scale_pending);
-        // offset/scale were computed and enabled.
+        // Trigger frame: input range [10, 30]. Offset/scale were OFF going in, so
+        // the frame is emitted UNSCALED — output == input converted to u8.
+        let out1 = state.process(&make_f64_array(&[10.0, 20.0, 30.0])).unwrap();
+        assert!(!state.config.auto_offset_scale_pending); // one-shot consumed
+        if let NDDataBuffer::U8(v) = &out1.data {
+            assert_eq!(v, &[10, 20, 30]); // trigger frame NOT transformed
+        } else {
+            panic!("expected u8 output");
+        }
+        // Params armed from the trigger frame for subsequent frames:
+        //   offset=-10, scale=255/20=12.75, offset/scale + clipping enabled.
         assert!(state.config.enable_offset_scale);
         assert!((state.config.offset - (-10.0)).abs() < 1e-9);
         assert!((state.config.scale - 255.0 / 20.0).abs() < 1e-9);
-        // value = (value + offset) * scale, clipped to [0, 255].
-        if let NDDataBuffer::U8(v) = &out.data {
+
+        // NEXT frame IS transformed with the armed params: (v-10)*12.75, clipped.
+        let out2 = state.process(&make_f64_array(&[10.0, 20.0, 30.0])).unwrap();
+        if let NDDataBuffer::U8(v) = &out2.data {
             assert_eq!(v[0], 0); // (10-10)*12.75 = 0
             assert_eq!(v[2], 255); // (30-10)*12.75 = 255
         } else {

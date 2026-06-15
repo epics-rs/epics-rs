@@ -103,6 +103,7 @@ impl CommonFields {
             udfs: self.udfs,
             phas: self.phas,
             tse: self.tse,
+            time: self.time,
             tsel: self.tsel.clone(),
             dtyp: self.dtyp.clone(),
         }

@@ -1409,6 +1409,7 @@ fn ctx_with_udf(udf: bool) -> ProcessContext {
         udfs: AlarmSeverity::Invalid,
         phas: 0,
         tse: 0,
+        time: std::time::SystemTime::UNIX_EPOCH,
         tsel: String::new(),
         dtyp: String::new(),
     }
@@ -1420,6 +1421,7 @@ fn ctx_with_dtyp(dtyp: &str) -> ProcessContext {
         udfs: AlarmSeverity::Invalid,
         phas: 0,
         tse: 0,
+        time: std::time::SystemTime::UNIX_EPOCH,
         tsel: String::new(),
         dtyp: dtyp.to_string(),
     }

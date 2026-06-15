@@ -270,6 +270,7 @@ fn ctx_with_tse(tse: i16) -> ProcessContext {
         udfs: epics_base_rs::server::record::AlarmSeverity::Invalid,
         phas: 0,
         tse,
+        time: std::time::SystemTime::UNIX_EPOCH,
         tsel: String::new(),
         dtyp: String::new(),
     }

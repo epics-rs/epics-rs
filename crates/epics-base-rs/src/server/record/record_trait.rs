@@ -234,6 +234,16 @@ pub struct ProcessContext {
     /// `dbCommon.tse` — time-stamp event. `timestampRecord.c:90`
     /// branches on `tse == epicsTimeEventDeviceTime`.
     pub tse: i16,
+    /// `dbCommon.time` — the record's current resolved time stamp at the
+    /// start of this cycle (the previous cycle's stamp, or `UNIX_EPOCH`
+    /// before the first process). Device support that has to format the
+    /// record's time during `read()` — the std module's `devTimeOfDay.c`
+    /// `recGblGetTimeStamp(psi)` call, which runs *before* the framework's
+    /// per-cycle timestamp application — resolves the stamp with
+    /// [`crate::server::recgbl::get_time_stamp`]`(tse, time)`. The `time`
+    /// member is the device-provided value that helper returns verbatim on
+    /// the `TSE == epicsTimeEventDeviceTime (-2)` branch.
+    pub time: std::time::SystemTime,
     /// `dbCommon.tsel` — time-stamp event link string.
     pub tsel: String,
     /// `dbCommon.dtyp` — device-support type name. A record's

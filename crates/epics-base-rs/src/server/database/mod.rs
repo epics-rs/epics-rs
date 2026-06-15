@@ -50,39 +50,12 @@ pub fn parse_pv_name(name: &str) -> (&str, &str) {
 /// is left untouched because the device support has already written
 /// the timestamp before `recGblGetTimeStamp` is called.
 fn apply_timestamp(common: &mut super::record::CommonFields, _is_soft: bool) {
-    match common.tse {
-        0 => {
-            // generalTime current time (default behavior).
-            // Always update — C EPICS recGblGetTimeStamp sets TIME on every process.
-            common.time = crate::runtime::general_time::get_current();
-        }
-        -1 => {
-            // C `epicsTimeEventBestTime` (epicsTime.h:103). The C path
-            // calls `epicsTimeGetEvent(-1)` unconditionally, which
-            // routes to `generalTimeGetEventPriority(-1)` — the
-            // BestTime ratchet across current-time providers.
-            //
-            // The pre-fix Rust port read this as "device-provided time
-            // with BestTime fallback" and gated the call on
-            // `common.time == UNIX_EPOCH`. That misreads C: device
-            // time is signalled by TSE=-2 (epicsTimeEventDeviceTime),
-            // not TSE=-1. The conditional fallback also produced
-            // monotonic stalls when a device incidentally wrote a
-            // stale (but non-epoch) time to `common.time` before the
-            // first BestTime call: BestTime was never queried and the
-            // record kept the stale stamp across every cycle.
-            common.time = crate::runtime::general_time::get_event(-1);
-        }
-        -2 => {
-            // `epicsTimeEventDeviceTime` (epicsTime.h:104). Device
-            // support has already written `common.time`; leave it
-            // alone (C recGbl.c:333-343 also skips the assignment).
-        }
-        _ => {
-            // Positive event number — event providers via generalTime.
-            common.time = crate::runtime::general_time::get_event(common.tse as i32);
-        }
-    }
+    // Single owner of TSE -> TIME resolution; device support that must
+    // format the record's resolved time during `read()` routes through the
+    // same helper so the two never drift (see `recgbl::get_time_stamp`).
+    // For TSE=-2 the helper returns `common.time` unchanged, preserving the
+    // device-time "leave it alone" semantics.
+    common.time = crate::server::recgbl::get_time_stamp(common.tse, common.time);
 }
 
 /// Unified entry in the PV database.

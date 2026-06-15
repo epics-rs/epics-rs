@@ -247,6 +247,48 @@ pub fn rec_gbl_check_udf(common: &mut CommonFields) {
     }
 }
 
+/// `recGblGetTimeStamp` (recGbl.c): resolve a record's time stamp from
+/// its `TSE` field.
+///
+/// `device_time` is the record's current `CommonFields.time` — the value
+/// device support has already written this cycle. It is returned verbatim
+/// only on the `TSE == epicsTimeEventDeviceTime (-2)` branch.
+///
+/// This is the single owner of "resolve TIME from TSE". Both the
+/// framework's per-cycle timestamp application
+/// (`database::apply_timestamp`) and device support that has to format
+/// the record's resolved time *during* `read()` (the std module's
+/// `devTimeOfDay.c` `recGblGetTimeStamp(psi)` call, before the
+/// record-level application runs) route through here, so the two never
+/// drift.
+pub fn get_time_stamp(tse: i16, device_time: std::time::SystemTime) -> std::time::SystemTime {
+    match tse {
+        0 => {
+            // generalTime current time (default behavior).
+            // C EPICS recGblGetTimeStamp sets TIME on every process.
+            crate::runtime::general_time::get_current()
+        }
+        -1 => {
+            // C `epicsTimeEventBestTime` (epicsTime.h:103). The C path
+            // calls `epicsTimeGetEvent(-1)` unconditionally, which routes
+            // to `generalTimeGetEventPriority(-1)` — the BestTime ratchet
+            // across current-time providers. Device time is signalled by
+            // TSE=-2 (`epicsTimeEventDeviceTime`), not TSE=-1.
+            crate::runtime::general_time::get_event(-1)
+        }
+        -2 => {
+            // `epicsTimeEventDeviceTime` (epicsTime.h:104). Device support
+            // has already written the time; leave it alone (C recGbl.c:333-343
+            // also skips the assignment).
+            device_time
+        }
+        _ => {
+            // Positive event number — event providers via generalTime.
+            crate::runtime::general_time::get_event(tse as i32)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

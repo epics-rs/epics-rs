@@ -207,10 +207,17 @@ impl<W: NDFileWriter> FilePluginController<W> {
             // string-typed; a numeric attribute is read as `ND_ERROR` and the
             // frame is processed (treated as "no destination set").
             Some(dest) => {
-                if dest.len() <= 1 {
+                // C runs the compare for any non-empty string (getValueInfo
+                // size = strlen+1, guarded `> 1`).
+                if dest.is_empty() {
                     return true;
                 }
-                dest.eq_ignore_ascii_case("all") || dest.eq_ignore_ascii_case(&self.port_name)
+                // C tests "all" with `epicsStrnCaseCmp(dest,"all",min(len,3))`
+                // — a 3-char (or shorter, for 1-2 char dest) prefix match — and
+                // the port name with a full-length compare.
+                let prefix = dest.len().min(3);
+                let matches_all = dest.as_bytes()[..prefix].eq_ignore_ascii_case(&b"all"[..prefix]);
+                matches_all || dest.eq_ignore_ascii_case(&self.port_name)
             }
             None => true,
         }
@@ -866,6 +873,32 @@ mod tests {
         assert!(
             updates.is_empty(),
             "numeric FilePluginFileName must not post a FileName param update"
+        );
+    }
+
+    #[test]
+    fn test_g9_destination_compare_matches_c_attr_is_processing_required() {
+        // ADC-12: replicate C `attrIsProcessingRequired` comparison exactly —
+        // "all" is a 3-char prefix match and any non-empty string is compared
+        // (no blanket `len <= 1 -> process`).
+        let mut c = FilePluginController::new(MockWriter::new(true));
+        c.set_port_name("MYFILE");
+        c.file_base.set_mode(NDFileMode::Single);
+        c.auto_save = true;
+
+        // "all" 3-char prefix (C: epicsStrnCaseCmp(dest,"all",3)==0) → processed.
+        c.process_array(&with_str_attr(array(1), "FilePluginDestination", "allfoo"));
+        assert_eq!(
+            c.writer.writes, 1,
+            "destination with \"all\" prefix is processed (C 3-char prefix match)"
+        );
+
+        // Non-empty 1-char destination that is neither an "all" prefix nor the
+        // port name → skipped (C compares it; Rust must not blanket-process).
+        c.process_array(&with_str_attr(array(2), "FilePluginDestination", "x"));
+        assert_eq!(
+            c.writer.writes, 1,
+            "1-char non-matching destination is skipped, not blanket-processed"
         );
     }
 

@@ -240,7 +240,12 @@ impl CircularBuffer {
                 // C posts TriggerAVal/BVal/CalcVal every evaluated frame
                 // (NDPluginCircularBuff.cpp:67-78), regardless of the outcome.
                 result.trigger_values = Some(TriggerValues { a, b, calc });
-                calc != 0.0
+                // C fires only when the result is a finite non-zero
+                // (NDPluginCircularBuff.cpp:77 `!isnan && !isinf && != 0`); a
+                // NaN/Inf result (e.g. a missing trigger attribute → epicsNAN,
+                // or an `A/B` with a zero denominator) must NOT trigger.
+                // `f64::is_finite` is exactly `!isnan && !isinf`.
+                calc.is_finite() && calc != 0.0
             }
         };
 
@@ -904,6 +909,38 @@ mod tests {
         assert!(tv.a.is_nan());
         assert!(tv.b.is_nan());
         assert!(tv.calc.is_nan());
+    }
+
+    #[test]
+    fn test_calc_trigger_skips_nan_and_inf_results() {
+        // C fires only on a finite non-zero calc result
+        // (NDPluginCircularBuff.cpp:77 `!isnan && !isinf && != 0`). A NaN or Inf
+        // result must NOT trigger, even though `NaN != 0.0` and `Inf != 0.0` are
+        // both true in Rust. Expression "A" surfaces the injected value directly.
+        // post_count = 2 so a single triggering push does not immediately
+        // complete the sequence and reset the triggered flag.
+        let push_calc = |val: f64| {
+            let expr = CalcExpression::parse("A").unwrap();
+            let mut cb = CircularBuffer::new(
+                2,
+                2,
+                TriggerCondition::Calc {
+                    attr_a: "attr_a".into(),
+                    attr_b: "attr_b".into(),
+                    expression: expr,
+                },
+            );
+            cb.push(make_array_with_attrs(1, val, 0.0));
+            cb.is_triggered()
+        };
+        // NaN and ±Inf results must not trigger.
+        assert!(!push_calc(f64::NAN));
+        assert!(!push_calc(f64::INFINITY));
+        assert!(!push_calc(f64::NEG_INFINITY));
+        // A finite non-zero result still triggers (the guard does not suppress
+        // a valid trigger); a finite zero still does not.
+        assert!(push_calc(1.0));
+        assert!(!push_calc(0.0));
     }
 
     #[test]

@@ -94,6 +94,7 @@ population). One commit per finding.
 | ADC-4 (MinCallbackTime-throttled frame must not count as dropped) | fix | Fixed | a1cb7e0c |
 | ADC-1 (PARAM NDAttribute type follows configured `datatype`, not runtime type) | verify→fix | Fixed (option: honor datatype) | eecf79c8 |
 | ADC-2 (`NDArrayCallbacks=0` must stop downstream NDArray delivery, plugin path) | fix | Fixed | cf59bf78 |
+| ADC-3 (plugin output must publish NDCodec / NDCompressedSize per array) | fix | Fixed | f3f44a39 |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -122,7 +123,7 @@ Rust: `crates/ad-core-rs/src/plugin/runtime.rs:505,928` always emits the output 
 C: `ADApp/pluginSrc/NDPluginDriver.cpp:257-265` — `endProcessCallbacks` caches the array and returns without `doCallbacksGenericPointer` when `NDArrayCallbacks==0`.
 Impact: with `ArrayCallbacks=0`, C withholds NDArrays from downstream; Rust keeps publishing every frame. (Driver-base path `driver/ndarray_driver.rs:523-537` honors the gate; only the plugin runtime diverges.)
 
-#### ADC-3: Plugin output array does not publish NDCodec / NDCompressedSize params
+#### ADC-3: Plugin output array does not publish NDCodec / NDCompressedSize params — FIXED f3f44a39
 Severity: Medium — fix
 Rust: `crates/ad-core-rs/src/plugin/runtime.rs:759-825` sets the standard params but never `codec`/`compressed_size` (both exist, `params/ndarray_driver.rs:119-120`).
 C: `NDPluginDriver.cpp:213-214` — `beginProcessCallbacks` sets `NDCodec`=codec name and `NDCompressedSize` on every array.

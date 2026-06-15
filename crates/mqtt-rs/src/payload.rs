@@ -210,7 +210,10 @@ fn decode_flat(raw: &str, value_type: ValueType) -> MqttResult<DecodedValue> {
                 .map_err(|e| MqttError::ValueConversion(format!("DIGITAL parse: {e}")))?;
             Ok(DecodedValue::UInt32(v))
         }
-        ValueType::String => Ok(DecodedValue::String(trimmed.to_string())),
+        // STRING stores the raw payload verbatim: C setStringParam(val) writes
+        // the unmodified payload (drvMqtt.cpp:297-299), so "  hello  " keeps its
+        // surrounding whitespace rather than being trimmed to "hello".
+        ValueType::String => Ok(DecodedValue::String(raw.to_string())),
         ValueType::IntArray => {
             let v = parse_int_array(trimmed)?;
             Ok(DecodedValue::Int32Array(v))
@@ -390,6 +393,14 @@ mod tests {
         let addr = TopicAddress::parse("FLAT:STRING test/t").unwrap();
         let val = decode_payload("hello world", &addr).unwrap();
         assert_eq!(val, DecodedValue::String("hello world".into()));
+    }
+
+    #[test]
+    fn decode_flat_string_preserves_surrounding_whitespace() {
+        // C setStringParam stores the raw payload verbatim (drvMqtt.cpp:297-299).
+        let addr = TopicAddress::parse("FLAT:STRING test/t").unwrap();
+        let val = decode_payload("  hello  ", &addr).unwrap();
+        assert_eq!(val, DecodedValue::String("  hello  ".into()));
     }
 
     #[test]

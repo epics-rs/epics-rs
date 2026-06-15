@@ -140,7 +140,9 @@ impl AttrPlotProcessor {
         if block >= self.n_data_blocks {
             return Err("data block index out of range");
         }
-        if value >= 0 && (value as usize) >= self.attributes.len() {
+        // C rejects only a strictly positive selection past the end; value 0 is
+        // always accepted, even with no tracked attributes (NDPluginAttrPlot.cpp:283).
+        if value > 0 && (value as usize) >= self.attributes.len() {
             return Err("attribute selection out of range");
         }
         self.data_selections[block] = value;
@@ -470,6 +472,16 @@ mod tests {
         // Valid: attribute 0 and the UID sentinel.
         assert!(proc.set_data_select(0, 0).is_ok());
         assert!(proc.set_data_select(1, ATTRPLOT_UID_INDEX).is_ok());
+    }
+
+    #[test]
+    fn test_data_select_zero_accepted_with_no_attributes() {
+        // C accepts DataSelect 0 before any frame, even with no tracked
+        // attributes (the reject is `value > 0`, NDPluginAttrPlot.cpp:283).
+        let mut proc = AttrPlotProcessor::new(8, 100, 2);
+        assert!(proc.attributes.is_empty());
+        assert!(proc.set_data_select(0, 0).is_ok());
+        assert_eq!(proc.data_selections[0], 0);
     }
 
     #[test]

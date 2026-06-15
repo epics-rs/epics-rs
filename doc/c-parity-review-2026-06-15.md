@@ -193,11 +193,15 @@ Rust: `crates/ad-core-rs/src/ndarray_pool.rs:516-543` accumulates in f64 then `o
 C: `NDArrayPool.cpp:460-466` `*pDOut += (dataTypeOut)*pDIn` (output-type arithmetic, integer wrap).
 Impact: a binning sum past the int range — C wraps, Rust saturates. Latent.
 
+VERIFIED 2026-06-15 — CONFIRMED REAL, production-unwired → surfaced for decision (#58). The Rust binning loop accumulates in `f64` and casts to the **source** type (`out[out_idx] = sum as $T` where `$T` = source type, ndarray_pool.rs:516-543), then a separate `convert_data_type` step (`:573-581`) casts to the target type. C instead accumulates directly in the **output** type (`*pDOut += (dataTypeOut)*pDIn`). Three divergences result when binning>1: (a) integer overflow — C wraps, Rust saturates; (b) **widening target** (e.g. u8 binned then converted to u16) — Rust clamps the bin sum to the *source* (u8) range before widening, so 4×100=400 → C 400 vs Rust 255; (c) i64/u64 values > 2^53 lose precision through the f64 round-trip even at binning=1. BUT no wired plugin reaches `NDArrayPool::convert` with binning>1 — the binning>1 sites are all in-crate tests (ndarray_pool.rs:982-1332); the wired ROI path does pure cropping (no binning). The faithful fix (accumulate in the output type with wrapping integer arithmetic across all source/target pairs) is a hot-loop rewrite of the convert macro and touches existing saturation-asserting tests, so per the "confirm before sprawling into a large structural change" rule it is surfaced rather than silently rewritten. Decision: fix-now (lock in C parity at the convert owner before binning is ever wired) vs defer-until-wired.
+
 #### ADC-9: `pool.convert` rejects offset+size overrun; C does not bound-check
 Severity: Low — verify (unwired)
 Rust: `crates/ad-core-rs/src/ndarray_pool.rs:450-455` returns `InvalidDimensions`.
 C: `NDArrayPool.cpp:602-737` validates only `size/binning>0`; reads past the region.
 Impact: error-vs-output, latent.
+
+VERIFIED 2026-06-15 — N/A (Rust is the safer side; do not replicate). C does not bound-check `offset+size` against the source dimension and reads past the array region — a latent out-of-bounds read on the C side. Rust returns a clean `InvalidDimensions` error instead. Matching C's "output form" here would mean deliberately introducing an OOB read (undefined behavior) into safe Rust to reproduce whatever garbage/crash C yields — that is a reference-side defect, not a parity target (cf. port-translation-lessons: the audit does not replicate C bugs). The bound-check stays; no code change.
 
 #### ADC-10: `CodecName` enum carries `Zlib`/`LZ4HDF5` not in C `codecName[]`, with a different ordinal order — STRUCTURAL CAUSE of ADP-11
 Severity: Low (enum) / High (the ordinal shift it causes, see ADP-11) — fix (fold into ADP-11)
@@ -596,11 +600,12 @@ Rust: `crates/optics-rs/src/snl/qxbpm.rs:571` `set_defaults` resets calibration 
 C: `sncqxbpm.st:559-583` set_defaults never touches `offset[]`.
 Impact: after a calibration, every `current:a..d` diverges by `trim*offset`.
 
-#### OPT-12: QXBPM zero-quadrant-sum publishes 0.0 where C publishes NaN/±Inf
-Severity: Low — verify
+#### OPT-12: QXBPM zero-quadrant-sum publishes 0.0 where C publishes NaN/±Inf — FIXED 3eeda648
+Severity: Low — verify→fix
 Rust: `crates/optics-rs/src/snl/qxbpm.rs:393-403` guards the sum and publishes 0.0.
 C: `sncqxbpm.st:493-494` unguarded → ±Inf/NaN to `pos:x`/`pos:y`.
 Impact: no-beam → C NaN, Rust 0.0. Verify whether the guard is intentional.
+Resolved: matched C (NaN/±Inf is the intentional no-beam sentinel a client reads on `pos:x`/`pos:y`; the 0.0 guard masked it as a real origin position). Removed the guard so the unguarded divide publishes the same IEEE result as C.
 
 #### OPT-13: Io startup init writes only `E_using`; C force-writes 19 default PVs
 Severity: Medium — verify

@@ -157,6 +157,12 @@ impl NDPluginProcess for AttributeProcessor {
         "NDPluginAttribute"
     }
 
+    /// C `NDPluginAttribute.cpp:203` sets `NDArrayCallbacks = 0`: this plugin
+    /// extracts attribute time series and does not deliver arrays downstream.
+    fn does_array_callbacks(&self) -> bool {
+        false
+    }
+
     fn register_params(&mut self, base: &mut PortDriverBase) -> Result<(), AsynError> {
         self.params.attr_name = base.create_param("ATTR_ATTRNAME", ParamType::Octet)?;
         self.params.value = base.create_param("ATTR_VAL", ParamType::Float64)?;

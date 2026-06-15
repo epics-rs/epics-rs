@@ -257,6 +257,16 @@ pub trait NDPluginProcess: Send + 'static {
         false
     }
 
+    /// Whether this plugin delivers arrays to downstream plugins, i.e. the
+    /// initial `NDArrayCallbacks` param value. Defaults to `true`: most plugins
+    /// do array callbacks. Terminal plugins that never deliver downstream
+    /// (`NDPluginStdArrays`, `NDPluginAttribute`, every `NDPluginFile` writer)
+    /// override this to `false` so the param reflects the behaviour, matching C
+    /// (e.g. `NDPluginFile.cpp:948` `setIntegerParam(NDArrayCallbacks, 0)`).
+    fn does_array_callbacks(&self) -> bool {
+        true
+    }
+
     /// Register plugin-specific params on the base. Called once during construction.
     fn register_params(
         &mut self,
@@ -1101,7 +1111,11 @@ impl PluginPortDriver {
         base.set_int32_param(plugin_params.dropped_arrays, 0, 0)?;
         base.set_int32_param(plugin_params.queue_use, 0, 0)?;
         base.set_string_param(plugin_params.plugin_type, 0, plugin_type_name.into())?;
-        base.set_int32_param(ndarray_params.array_callbacks, 0, 1)?;
+        base.set_int32_param(
+            ndarray_params.array_callbacks,
+            0,
+            processor.does_array_callbacks() as i32,
+        )?;
         base.set_int32_param(ndarray_params.write_file, 0, 0)?;
         base.set_int32_param(ndarray_params.read_file, 0, 0)?;
         base.set_int32_param(ndarray_params.capture, 0, 0)?;
@@ -1517,6 +1531,7 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
     // Capture plugin type and array data handle before mutable borrow
     let plugin_type_name = processor.plugin_type().to_string();
     let compression_aware = processor.compression_aware();
+    let does_array_callbacks = processor.does_array_callbacks();
     let array_data = processor.array_data_handle();
 
     // Create the port driver for control plane
@@ -1570,8 +1585,9 @@ pub fn create_plugin_runtime_multi_addr<P: NDPluginProcess>(
         port_handle,
         array_counter: 0,
         std_array_data_param,
-        // C++ default NDArrayCallbacks = 1 (deliver downstream).
-        array_callbacks: true,
+        // C++ default NDArrayCallbacks = 1 (deliver downstream); terminal
+        // plugins (StdArrays/Attribute/File) override `does_array_callbacks` to 0.
+        array_callbacks: does_array_callbacks,
         min_callback_time: 0.0,
         last_process_time: None,
         sort_mode: 0,
@@ -2047,6 +2063,7 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
 
     let plugin_type_name = processor.plugin_type().to_string();
     let compression_aware = processor.compression_aware();
+    let does_array_callbacks = processor.does_array_callbacks();
     let array_data = processor.array_data_handle();
     let driver = PluginPortDriver::new(
         port_name,
@@ -2090,8 +2107,9 @@ pub fn create_plugin_runtime_with_output<P: NDPluginProcess>(
         port_handle,
         array_counter: 0,
         std_array_data_param,
-        // C++ default NDArrayCallbacks = 1 (deliver downstream).
-        array_callbacks: true,
+        // C++ default NDArrayCallbacks = 1 (deliver downstream); terminal
+        // plugins (StdArrays/Attribute/File) override `does_array_callbacks` to 0.
+        array_callbacks: does_array_callbacks,
         min_callback_time: 0.0,
         last_process_time: None,
         sort_mode: 0,

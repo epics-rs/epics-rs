@@ -41,6 +41,12 @@ impl NDPluginProcess for StdArraysProcessor {
         "NDPluginStdArrays"
     }
 
+    /// C `NDPluginStdArrays.cpp:343` sets `NDArrayCallbacks = 0`: this plugin
+    /// serves pixel data via the StdArray waveforms, not downstream callbacks.
+    fn does_array_callbacks(&self) -> bool {
+        false
+    }
+
     fn array_data_handle(&self) -> Option<Arc<Mutex<Option<Arc<NDArray>>>>> {
         Some(self.latest_data.clone())
     }
@@ -120,5 +126,49 @@ mod tests {
         let latest = data.lock().clone();
         assert!(latest.is_some());
         assert_eq!(latest.unwrap().unique_id, 42);
+    }
+
+    #[test]
+    fn test_std_arrays_initial_array_callbacks_off() {
+        // C NDPluginStdArrays.cpp:343 sets NDArrayCallbacks=0 in the
+        // constructor; the initial param a client reads must be 0, not 1.
+        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let wiring = Arc::new(WiringRegistry::new());
+        let (handle, _data, _jh) = create_std_arrays_runtime("IMAGE1", pool, "", wiring);
+
+        let val = handle
+            .port_runtime()
+            .port_handle()
+            .read_int32_blocking(handle.ndarray_params.array_callbacks, 0)
+            .unwrap();
+        assert_eq!(val, 0, "StdArrays initial NDArrayCallbacks must be 0");
+    }
+
+    #[test]
+    fn test_terminal_plugins_do_not_do_array_callbacks() {
+        // C disables NDArrayCallbacks in the constructor of NDPluginStdArrays
+        // (:343), NDPluginAttribute (:203), and NDPluginFile (:948, base of
+        // every file writer). Each Rust counterpart overrides
+        // does_array_callbacks() to false so the initial param reflects this.
+        use crate::attribute::AttributeProcessor;
+        use crate::file_hdf5::Hdf5FileProcessor;
+        use crate::file_jpeg::JpegFileProcessor;
+        use crate::file_magick::MagickFileProcessor;
+        use crate::file_netcdf::NetcdfFileProcessor;
+        use crate::file_nexus::NexusFileProcessor;
+        use crate::file_tiff::TiffFileProcessor;
+        use crate::passthrough::PassthroughProcessor;
+
+        assert!(!StdArraysProcessor::new().does_array_callbacks());
+        assert!(!AttributeProcessor::new("attr", 1).does_array_callbacks());
+        assert!(!Hdf5FileProcessor::new().does_array_callbacks());
+        assert!(!JpegFileProcessor::new(85).does_array_callbacks());
+        assert!(!TiffFileProcessor::new().does_array_callbacks());
+        assert!(!NetcdfFileProcessor::new().does_array_callbacks());
+        assert!(!NexusFileProcessor::new().does_array_callbacks());
+        assert!(!MagickFileProcessor::new().does_array_callbacks());
+
+        // A non-terminal plugin keeps the default: it does deliver downstream.
+        assert!(PassthroughProcessor::new("NDPluginProcess").does_array_callbacks());
     }
 }

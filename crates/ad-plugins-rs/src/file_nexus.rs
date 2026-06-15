@@ -1006,6 +1006,12 @@ impl NDPluginProcess for NexusFileProcessor {
         "NDFileNexus"
     }
 
+    /// C `NDPluginFile.cpp:948` (base of every file writer) sets
+    /// `NDArrayCallbacks = 0`: file plugins write to disk, not downstream.
+    fn does_array_callbacks(&self) -> bool {
+        false
+    }
+
     fn register_params(
         &mut self,
         base: &mut asyn_rs::port::PortDriverBase,

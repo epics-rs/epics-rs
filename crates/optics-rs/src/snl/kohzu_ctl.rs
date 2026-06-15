@@ -600,6 +600,13 @@ pub async fn run(
     let mut _caused_move = false;
     let risk_averse = false;
 
+    // Last *accepted* motor setpoints. C kohzuCtl snapshots prev_thetaMotDesired/
+    // prev_yMotDesired/prev_zMotDesired at waitForCmnd entry (kohzuCtl.st:655-657)
+    // and restores them when a command would violate a limit (kohzuCtl.st:1004-1009).
+    let mut last_theta_set = theta_val;
+    let mut last_y_set = calc_y_position(geom, theta_val, y_offset_val);
+    let mut last_z_set = calc_z_position(geom, theta_val, y_offset_val);
+
     let _ = ch_seq_msg1.put_string("Kohzu Control Ready").await;
     let _ = ch_seq_msg2.put_string(" ").await;
 
@@ -632,6 +639,12 @@ pub async fn run(
     let mut deferred_events: HashMap<String, f64> = HashMap::new();
     let mut pending_retarget = false;
     loop {
+        // Snapshot the last-accepted bragg state so a limit-violating command can
+        // be rolled back (C kohzuCtl.st:652-657, snapshotted at waitForCmnd entry).
+        let prev_e = e_val;
+        let prev_theta = theta_val;
+        let prev_lambda = lambda_val;
+
         let mut proceed_to_theta_changed = false;
         if pending_retarget {
             // Retarget: values already updated, skip wait and go straight to move
@@ -816,6 +829,7 @@ pub async fn run(
 
         // -- Theta-changed processing --
         // Clamp theta to limits
+        let mut will_violate = false;
         let (clamped_theta, was_clamped) = clamp_theta(theta_val, theta_lo, theta_hi);
         if was_clamped {
             theta_val = clamped_theta;
@@ -825,6 +839,10 @@ pub async fn run(
                 auto_mode = false;
                 let _ = ch_auto_mode.put_i16(0).await;
                 let _ = ch_seq_msg2.put_string("Set to Manual Mode").await;
+            } else {
+                // C kohzuCtl.st:889-891 — outside risk-averse mode a theta-limit
+                // hit sets willViolateLimit, so the whole command is rolled back.
+                will_violate = true;
             }
         }
 
@@ -853,7 +871,6 @@ pub async fn run(
         let _ = ch_z_set_ao.put_f64(z_mot_desired).await;
 
         // Check Y and Z limits
-        let mut will_violate = false;
         let y_hi = ch_y_mot_hilim.get_f64().await;
         let y_lo = ch_y_mot_lolim.get_f64().await;
         let z_hi = ch_z_mot_hilim.get_f64().await;
@@ -903,17 +920,36 @@ pub async fn run(
         }
 
         if will_violate {
-            let blocked = format!(
-                "Move blocked: E={:.3} keV theta={:.3} deg",
-                e_val, theta_val
-            );
-            let _ = ch_seq_msg2.put_string(&blocked).await;
+            // C kohzuCtl.st:998-1012 (moveKohzu, `when (willViolateLimit)`):
+            // restore E/theta/lambda and the three motor setpoints to their
+            // pre-command values, pvPut each, and report "Command ignored".
+            // Without this the rejected out-of-range setpoints stay on the PVs.
+            e_val = prev_e;
+            theta_val = prev_theta;
+            lambda_val = prev_lambda;
+            let _ = ch_e.put_f64(e_val).await;
+            let _ = ch_theta.put_f64(theta_val).await;
+            let _ = ch_lambda.put_f64(lambda_val).await;
+            let _ = ch_theta_set_ao.put_f64(last_theta_set).await;
+            let _ = ch_y_set_ao.put_f64(last_y_set).await;
+            let _ = ch_z_set_ao.put_f64(last_z_set).await;
+            let _ = ch_seq_msg2.put_string("Command ignored").await;
             if ch_debug.get_i16().await > 0 {
-                eprintln!("kohzuCtl: {}", blocked);
+                eprintln!(
+                    "kohzuCtl: command ignored (limit violation); reverted to E={:.3} theta={:.3}",
+                    e_val, theta_val
+                );
             }
             let _ = ch_moving.put_i16(0).await;
             continue;
         }
+
+        // Command accepted — these motor setpoints become the values to revert
+        // to if the next command violates a limit (C snapshots them as
+        // prev_*MotDesired at the following waitForCmnd entry).
+        last_theta_set = theta_mot_desired;
+        last_y_set = y_mot_desired;
+        last_z_set = z_mot_desired;
 
         // -- Move motors if in auto or put mode --
         let put_requested = ch_put_vals.get_i16().await != 0;

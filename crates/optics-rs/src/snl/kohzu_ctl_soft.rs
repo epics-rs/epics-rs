@@ -309,6 +309,14 @@ pub async fn run(
     let mut _caused_move = false;
     let risk_averse = false;
 
+    // Last *accepted* motor setpoints, restored when a command would violate a
+    // limit. C kohzuCtl_soft snapshots prev_thetaMotDesired/prev_yMotDesired/
+    // prev_zMotDesired at waitForCmnd entry (kohzuCtl_soft.st:618-620) and
+    // restores them in the `when (willViolateLimit)` block (kohzuCtl_soft.st:899-903).
+    let mut last_theta_set = theta_val;
+    let mut last_y_set = calc_y_position(geom, theta_val, y_offset_val);
+    let mut last_z_set = calc_z_position(geom, theta_val, y_offset_val);
+
     let _ = ch_seq_msg1.put_string("Kohzu Control Ready").await;
     let _ = ch_seq_msg2.put_string(" ").await;
 
@@ -343,6 +351,12 @@ pub async fn run(
     let mut deferred_events: HashMap<String, f64> = HashMap::new();
     // -- Main loop --
     loop {
+        // Snapshot the last-accepted bragg state for limit-violation rollback
+        // (C kohzuCtl_soft.st:615-620, snapshotted at waitForCmnd entry).
+        let prev_e = e_val;
+        let prev_theta = theta_val;
+        let prev_lambda = lambda_val;
+
         let mut proceed_to_theta_changed = false;
 
         let (changed_pv, new_val) = if let Some(key) = deferred_events.keys().next().cloned() {
@@ -477,6 +491,7 @@ pub async fn run(
         }
 
         // -- Theta-changed processing --
+        let mut will_violate = false;
         let (clamped_theta, was_clamped) = clamp_theta(theta_val, theta_lo, theta_hi);
         if was_clamped {
             theta_val = clamped_theta;
@@ -486,6 +501,10 @@ pub async fn run(
                 auto_mode = false;
                 let _ = ch_auto_mode.put_i16(0).await;
                 let _ = ch_seq_msg2.put_string("Set to Manual Mode").await;
+            } else {
+                // C kohzuCtl_soft.st:783-784 — outside risk-averse mode a
+                // theta-limit hit sets willViolateLimit, rolling back the command.
+                will_violate = true;
             }
         }
 
@@ -511,7 +530,6 @@ pub async fn run(
         let _ = ch_z_set_ao.put_f64(z_mot_desired).await;
 
         // Check limits
-        let mut will_violate = false;
         let y_hi = ch_y_mot_hilim.get_f64().await;
         let y_lo = ch_y_mot_lolim.get_f64().await;
         let z_hi = ch_z_mot_hilim.get_f64().await;
@@ -529,10 +547,29 @@ pub async fn run(
         }
 
         if will_violate {
+            // C kohzuCtl_soft.st:892-905 (`when (willViolateLimit)`): restore
+            // E/theta/lambda and the three motor setpoints to their pre-command
+            // values, pvPut each, message "Command ignored". Without this the
+            // rejected out-of-range setpoints stay on the PVs.
+            e_val = prev_e;
+            theta_val = prev_theta;
+            lambda_val = prev_lambda;
+            let _ = ch_e.put_f64(e_val).await;
+            let _ = ch_theta.put_f64(theta_val).await;
+            let _ = ch_lambda.put_f64(lambda_val).await;
+            let _ = ch_theta_set_ao.put_f64(last_theta_set).await;
+            let _ = ch_y_set_ao.put_f64(last_y_set).await;
+            let _ = ch_z_set_ao.put_f64(last_z_set).await;
             let _ = ch_seq_msg2.put_string("Command ignored").await;
             let _ = ch_moving.put_i16(0).await;
             continue;
         }
+
+        // Command accepted — record the setpoints to revert to next time
+        // (C snapshots them as prev_*MotDesired at the next waitForCmnd entry).
+        last_theta_set = theta_mot_desired;
+        last_y_set = y_mot_desired;
+        last_z_set = z_mot_desired;
 
         // -- Move if appropriate --
         let put_requested = ch_put_vals.get_i16().await != 0;

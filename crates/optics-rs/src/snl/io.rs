@@ -369,7 +369,12 @@ fn photon(
 /// This is the main calculation function, ported from `EvalFlux` in `Io.st`.
 pub fn eval_flux(params: &IoParams, scaler_counts: &[f64], ticks: f64) -> IoResults {
     let energy = params.energy;
-    if energy <= 0.0 || ticks <= 0.0 || params.clock_rate <= 0.0 {
+    // C EvalFlux has no ticks guard: ionAbs is the gas transmission factor
+    // (Io.st:444), independent of counting, so ticks<=0 must still yield a
+    // finite ionAbs (it drives cps to 0, hence flux/detector/ionPhotons to 0,
+    // but leaves ionAbs intact). Only energy<=0 (log domain) and
+    // clock_rate<=0 short the whole calculation out.
+    if energy <= 0.0 || params.clock_rate <= 0.0 {
         return IoResults::default();
     }
 
@@ -381,16 +386,17 @@ pub fn eval_flux(params: &IoParams, scaler_counts: &[f64], ticks: f64) -> IoResu
     let d_air = params.air_path / 10.0;
     let d_be = params.be_thickness * CM_PER_INCH;
 
-    // Get counts per second from the selected scaler channel
-    let ch_idx = params.scaler_channel.saturating_sub(2);
-    let counts = if ch_idx < scaler_counts.len() {
-        scaler_counts[ch_idx]
-    } else {
-        0.0
-    };
+    // Counts per second from the selected scaler channel. C switch(icChannel)
+    // selects s2..s15 for channels 2-15 and falls through to cps=0 for any
+    // other channel, including 0/1 (Io.st:409-426). ticks<=0 (count_time<=0)
+    // likewise yields cps=0.
     let count_time = ticks / params.clock_rate;
-    let cps = if count_time > 0.0 {
-        counts / count_time
+    let cps = if (2..=15).contains(&params.scaler_channel) && count_time > 0.0 {
+        scaler_counts
+            .get(params.scaler_channel - 2)
+            .copied()
+            .unwrap_or(0.0)
+            / count_time
     } else {
         0.0
     };
@@ -661,7 +667,7 @@ pub async fn run(config: IoConfig) -> Result<(), Box<dyn std::error::Error + Sen
             params.he_path = get_f64(&ch_he_path).await;
             params.air_path = get_f64(&ch_air_path).await;
             params.be_thickness = get_f64(&ch_be).await;
-            params.scaler_channel = get_i32(&ch_scaler_ch).await.max(2) as usize;
+            params.scaler_channel = get_i32(&ch_scaler_ch).await.max(0) as usize;
             params.clock_rate = get_f64(&ch_clock_rate).await;
 
             // Read scaler values
@@ -798,9 +804,59 @@ mod tests {
 
     #[test]
     fn test_eval_flux_zero_ticks() {
+        // C EvalFlux computes ionAbs (the gas transmission factor, Io.st:444)
+        // independent of counting: ticks=0 drives cps->0 (flux/detector/
+        // ionPhotons = 0) but leaves ionAbs finite. Default params (energy=10,
+        // x_air=1) give a real gas column, so ionAbs is in (0,1].
         let params = IoParams::default();
         let results = eval_flux(&params, &[1e6; 14], 0.0);
         assert_eq!(results.flux, 0.0);
+        assert_eq!(results.detector, 0.0);
+        assert!(
+            results.ion_abs > 0.0 && results.ion_abs <= 1.0,
+            "ion_abs = {}",
+            results.ion_abs
+        );
+    }
+
+    #[test]
+    fn test_eval_flux_channel_window_boundaries() {
+        // 2-15 is the valid scaler-channel window (Io.st:409-423); a channel
+        // outside it falls to the C switch default cps=0 (Io.st:424-426), so it
+        // must NOT borrow an adjacent channel's counts.
+        let mk = |ch: usize| IoParams {
+            scaler_channel: ch,
+            ..Default::default()
+        };
+        // counts present only in s15 (index 13)
+        let mut counts15 = [0.0; 14];
+        counts15[13] = 1e6;
+        assert!(
+            eval_flux(&mk(15), &counts15, 1e7).flux > 0.0,
+            "channel 15 should use s15"
+        );
+        assert_eq!(
+            eval_flux(&mk(16), &counts15, 1e7).flux,
+            0.0,
+            "channel 16 is out of range"
+        );
+        // counts present only in s2 (index 0)
+        let mut counts2 = [0.0; 14];
+        counts2[0] = 1e6;
+        assert_eq!(
+            eval_flux(&mk(0), &counts2, 1e7).flux,
+            0.0,
+            "channel 0 must not borrow s2"
+        );
+        assert_eq!(
+            eval_flux(&mk(1), &counts2, 1e7).flux,
+            0.0,
+            "channel 1 must not borrow s2"
+        );
+        assert!(
+            eval_flux(&mk(2), &counts2, 1e7).flux > 0.0,
+            "channel 2 should use s2"
+        );
     }
 
     #[test]

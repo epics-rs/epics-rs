@@ -568,7 +568,10 @@ impl QxbpmController {
         self.gx = DEFAULT_GX;
         self.gy = DEFAULT_GY;
         self.settling = DEFAULT_SETTLING;
-        self.calibration = default_calibration();
+        // C set_defaults (sncqxbpm.st:559-583) rewrites only the gainTrim[] array;
+        // it never touches offset[]. The calibrated dark-current offsets survive a
+        // "restore defaults", so reset the trims alone and keep the offsets.
+        self.calibration.gain_trim = default_gain_trims();
     }
 
     /// Compute the command for the current signal mode.
@@ -1150,6 +1153,25 @@ mod tests {
                 assert_eq!(cal.get_offset(g, ch), 0);
             }
         }
+    }
+
+    #[test]
+    fn set_defaults_preserves_offsets_resets_trims() {
+        let mut ctrl = QxbpmController::default();
+        // Simulate a dark-current calibration on gain 2.
+        ctrl.calibration.set_offset(2, 0, 510);
+        ctrl.calibration.set_offset(2, 3, 622);
+        // Perturb a trim so we can confirm it is restored to the default factor.
+        ctrl.calibration.set_trim(2, 0, 0.123);
+
+        ctrl.set_defaults();
+
+        // Offsets survive (C set_defaults never touches offset[]).
+        assert_eq!(ctrl.calibration.get_offset(2, 0), 510);
+        assert_eq!(ctrl.calibration.get_offset(2, 3), 622);
+        // Trims are restored to the default gainTrim[] factors.
+        let defaults = default_gain_trims();
+        assert!((ctrl.calibration.get_trim(2, 0) - defaults[2 * NUM_CHANNELS]).abs() < 1e-18);
     }
 
     #[test]

@@ -1031,6 +1031,18 @@ impl NDPluginProcess for CodecProcessor {
         "NDPluginCodec"
     }
 
+    /// C `NDPluginCodec` passes `compressionAware=true` to the base constructor
+    /// (`NDPluginCodec.cpp:865-870`), unconditionally regardless of mode, so
+    /// compressed arrays reach it for decompression. Without this override the
+    /// runtime drop gate (`if compressed && !compression_aware`) would discard
+    /// every compressed input before `process_array`, making `Decompress` dead.
+    /// Returned unconditionally because the same instance can switch
+    /// Compress↔Decompress at runtime, while this flag is read once at
+    /// construction.
+    fn compression_aware(&self) -> bool {
+        true
+    }
+
     fn register_params(
         &mut self,
         base: &mut asyn_rs::port::PortDriverBase,
@@ -1241,6 +1253,78 @@ mod tests {
         assert!(decompressed.codec.is_none());
         assert_eq!(decompressed.data.data_type(), NDDataType::UInt8);
         assert_eq!(decompressed.data.as_u8_slice(), original_data.as_slice());
+    }
+
+    #[test]
+    fn test_decompress_runtime_does_not_drop_compressed_input() {
+        // ADP-98: a Codec plugin in Decompress mode is compression-aware
+        // (C NDPluginCodec passes compressionAware=true, NDPluginCodec.cpp:870),
+        // so the runtime drop gate (runtime.rs:1785 `if compressed &&
+        // !compression_aware`) must NOT discard its compressed input. Without the
+        // compression_aware() override the compressed array is dropped before
+        // process_array runs and the entire Decompress path is dead.
+        use ad_core_rs::plugin::channel::{NDArrayOutput, ndarray_channel};
+        use ad_core_rs::plugin::runtime::create_plugin_runtime_with_output;
+        use ad_core_rs::plugin::wiring::WiringRegistry;
+        use std::sync::atomic::Ordering;
+
+        // A genuinely-compressed input array (codec = LZ4).
+        let mut raw = make_u8_array(4, 4);
+        raw.unique_id = 1;
+        let original_data = raw.data.as_u8_slice().to_vec();
+        let compressed = compress_lz4(&raw);
+        assert_eq!(compressed.codec.as_ref().unwrap().name, CodecName::LZ4);
+        assert_eq!(compressed.unique_id, 1);
+
+        // Sentinel uncompressed array: even if the compressed one is dropped, this
+        // reaches downstream, so a wrong first unique_id pinpoints the drop (no
+        // reliance on a timeout).
+        let mut sentinel = make_u8_array(4, 4);
+        sentinel.unique_id = 2;
+
+        let pool = Arc::new(NDArrayPool::new(1_000_000));
+        let (ds_sender, mut ds_rx) = ndarray_channel("DS", 10);
+        let mut output = NDArrayOutput::new();
+        output.add(ds_sender);
+        let (handle, _jh) = create_plugin_runtime_with_output(
+            "CODEC_DECOMP",
+            CodecProcessor::new(CodecMode::Decompress),
+            pool,
+            10,
+            output,
+            "",
+            Arc::new(WiringRegistry::new()),
+        );
+        let dropped = handle.array_sender().dropped_arrays_counter().clone();
+        handle
+            .port_runtime()
+            .port_handle()
+            .write_int32_blocking(handle.plugin_params.enable_callbacks, 0, 1)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(handle.array_sender().publish(Arc::new(compressed)));
+        rt.block_on(handle.array_sender().publish(Arc::new(sentinel)));
+
+        let first = ds_rx.blocking_recv().expect("downstream array");
+        assert_eq!(
+            first.unique_id, 1,
+            "compressed input must be decompressed and delivered, not dropped"
+        );
+        assert!(
+            first.codec.is_none(),
+            "delivered array must be decompressed (codec cleared)"
+        );
+        assert_eq!(first.data.as_u8_slice(), original_data.as_slice());
+        assert_eq!(
+            dropped.load(Ordering::Acquire),
+            0,
+            "compression-aware Codec must not count its compressed input as dropped"
+        );
     }
 
     #[test]

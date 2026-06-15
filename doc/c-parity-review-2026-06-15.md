@@ -90,6 +90,8 @@ population). One commit per finding.
 | PROC-1 (telnet RFC1143 negotiation, not blanket option refusal) | fix | Fixed | 40770a28 |
 | PROC-2 (info file/PROCSERV_INFO manage-procs format) | fix | Fixed | 7bf565d8 |
 | PROC-3 (procServ branding/version string) | signoff | Signoff — keep Rust branding (user call) | — |
+| ADC-6 / ADP-2 (RGB→Mono `(R+G+B)/3` truncated, not luminance+round) | fix | Fixed | 1273b533 |
+| ADC-4 (MinCallbackTime-throttled frame must not count as dropped) | fix | Fixed | a1cb7e0c |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -122,11 +124,12 @@ Rust: `crates/ad-core-rs/src/plugin/runtime.rs:759-825` sets the standard params
 C: `NDPluginDriver.cpp:213-214` — `beginProcessCallbacks` sets `NDCodec`=codec name and `NDCompressedSize` on every array.
 Impact: a caget on a plugin's `Codec_RBV`/`CompressedSize_RBV` never updates in Rust; in C they track each array. (Driver-base path publishes them.)
 
-#### ADC-4: MinCallbackTime-throttled frame wrongly increments DroppedArrays
+#### ADC-4: MinCallbackTime-throttled frame wrongly increments DroppedArrays — FIXED a1cb7e0c
 Severity: Medium — fix
 Rust: `crates/ad-core-rs/src/plugin/runtime.rs:539-543` — a MinCallbackTime-throttled frame does `dropped_arrays.fetch_add(1)`.
 C: `NDPluginDriver.cpp:405-449` — a `deltaTime <= minCallbackTime` frame skips to `callParamCallbacks()`; `droppedArrays++` only on queue-full (`:440`) and compression-not-aware (`:388`).
 Impact: with nonzero MinCallbackTime under fast input, Rust's `DroppedArrays_RBV` over-counts vs C.
+Fix: `process_and_publish` throttle path returns `None` (no param post) and no longer increments `dropped_arrays`; the surviving increments (compression-unaware runtime path, queue-full channel.rs) match C:388/:440. Test `test_min_callback_time_throttle_not_counted` asserts DroppedArrays stays 0 after a throttled frame.
 
 #### ADC-5: NDDimensions int32-array post carries `ndims` elements, not `ND_ARRAY_MAX_DIMS` (10)
 Severity: Medium — fix-low
@@ -134,7 +137,7 @@ Rust: `crates/ad-core-rs/src/plugin/runtime.rs:742-757` (and `driver/ndarray_dri
 C: `NDPluginDriver.cpp:221-231` posts `dimsPrev_[ND_ARRAY_MAX_DIMS]` (zero-filled) → `readInt32Array` returns 10.
 Impact: caget on `Dimensions_RBV` reads NORD=ndims in Rust vs 10 (trailing zeros) in C.
 
-#### ADC-6: RGB1→Mono uses luminance weights + round; C uses unweighted `(R+G+B)/3` truncated — SAME CODE AS ADP-2
+#### ADC-6: RGB1→Mono uses luminance weights + round; C uses unweighted `(R+G+B)/3` truncated — SAME CODE AS ADP-2 — FIXED 1273b533
 Severity: High (wired via ad-plugins) — fix
 Rust: `crates/ad-core-rs/src/color.rs:114-160` (`rgb1_to_mono`) `0.299R+0.587G+0.114B` then `.round()`. Round-2 found this unwired *inside ad-core*, but **ad-plugins `color_convert.rs:437` wires it** (see ADP-2) — so it is reachable and High. Fix once, in `color.rs`.
 C: `NDPluginColorConvert.cpp:392-396` `value=(R+G+B)/3.` then `(epicsType)value`.

@@ -1075,16 +1075,18 @@ impl NDPluginProcess for CodecProcessor {
                 self.mode = CodecMode::Decompress;
             }
         } else if Some(reason) == self.params.compressor {
-            // C++ `NDCodecCompressor` ordinals (`NDCodec_t` in NDCodec.h):
-            // 0=None, 1=JPEG, 2=Zlib, 3=Blosc, 4=LZ4, 5=LZ4HDF5, 6=BSLZ4.
+            // C `NDCodecCompressor_t` (Codec.h:12-18): NONE=0, JPEG=1,
+            // BLOSC=2, LZ4=3, BSLZ4=4. The Rust-only zlib/lz4hdf5 codecs
+            // (ADP-26 sign-off) take ordinals after the C set so they never
+            // shadow a C ordinal — COMPRESSOR=2 must select Blosc as in C.
             let codec = match params.value.as_i32() {
                 0 => CodecName::None,
                 1 => CodecName::JPEG,
-                2 => CodecName::Zlib,
-                3 => CodecName::Blosc,
-                4 => CodecName::LZ4,
-                5 => CodecName::LZ4HDF5,
-                6 => CodecName::BSLZ4,
+                2 => CodecName::Blosc,
+                3 => CodecName::LZ4,
+                4 => CodecName::BSLZ4,
+                5 => CodecName::Zlib,
+                6 => CodecName::LZ4HDF5,
                 _ => CodecName::None,
             };
             if let CodecMode::Compress { .. } = self.mode {
@@ -1770,19 +1772,19 @@ mod tests {
 
     #[test]
     fn test_compressor_ordinal_mapping() {
-        // C++ `NDCodec_t` ordinals: 0=None, 1=JPEG, 2=Zlib, 3=Blosc, 4=LZ4,
-        // 5=LZ4HDF5, 6=BSLZ4. Selecting a compressor by its C-correct ordinal
-        // must pick the matching `CodecName`.
+        // C `NDCodecCompressor_t` (Codec.h:12-18): 0=None, 1=JPEG, 2=Blosc,
+        // 3=LZ4, 4=BSLZ4. Rust-only zlib/lz4hdf5 follow at 5/6. Selecting a
+        // compressor by its C ordinal must pick the matching `CodecName`.
         use ad_core_rs::plugin::runtime::{ParamChangeValue, PluginParamSnapshot};
 
         let cases = [
             (0i32, CodecName::None),
             (1, CodecName::JPEG),
-            (2, CodecName::Zlib),
-            (3, CodecName::Blosc),
-            (4, CodecName::LZ4),
-            (5, CodecName::LZ4HDF5),
-            (6, CodecName::BSLZ4),
+            (2, CodecName::Blosc),
+            (3, CodecName::LZ4),
+            (4, CodecName::BSLZ4),
+            (5, CodecName::Zlib),
+            (6, CodecName::LZ4HDF5),
         ];
 
         for (ordinal, expected) in cases {

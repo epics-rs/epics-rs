@@ -14,6 +14,10 @@ use netcdf3::{DataSet, FileReader, FileWriter, Version};
 
 const VAR_NAME: &str = "array_data";
 const DIM_UNLIMITED: &str = "numArrays";
+/// File-format version written as the NDNetCDFFileVersion global attribute so
+/// readers can gate on format changes (C NDFileNetCDF.h:19 `#define
+/// NDNetCDFFileVersion 3.1`).
+const ND_NETCDF_FILE_VERSION: f64 = 3.1;
 
 /// Dimension metadata captured from NDArray dimensions.
 struct DimMeta {
@@ -466,12 +470,13 @@ impl NDFileWriter for NetcdfWriter {
                 .map_err(map_def)?;
         }
 
-        // Global attributes
-        ds.add_global_attr_i32("uniqueId", vec![first.unique_id])
-            .map_err(map_def)?;
+        // Global attributes. C (NDFileNetCDF.cpp:92-101) writes only dataType
+        // then the NDNetCDFFileVersion double here; uniqueId is a per-frame
+        // variable (nc_def_var, :183) and numArrays is the leading unlimited
+        // dimension (nc_def_dim, :119), so neither is a global attribute.
         ds.add_global_attr_i32("dataType", vec![first.data_type as i32])
             .map_err(map_def)?;
-        ds.add_global_attr_i32("numArrays", vec![self.frames.len() as i32])
+        ds.add_global_attr_f64("NDNetCDFFileVersion", vec![ND_NETCDF_FILE_VERSION])
             .map_err(map_def)?;
 
         // Dimension metadata global attributes
@@ -976,6 +981,47 @@ mod tests {
         assert_eq!(var.get_dims().len(), 3);
         assert_eq!(var.get_dims()[0].name(), "numArrays");
         assert_eq!(var.get_dims()[0].size(), 1);
+
+        drop(reader);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_global_attrs_match_c_set() {
+        // C (NDFileNetCDF.cpp:92-101) writes dataType then the
+        // NDNetCDFFileVersion=3.1 double as global attributes. uniqueId is a
+        // per-frame variable (:183) and numArrays is the unlimited dimension
+        // (:119) — neither must appear as a global attribute.
+        let path = temp_path("nc_globals");
+        let mut writer = NetcdfWriter::new();
+
+        let arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(3)],
+            NDDataType::UInt8,
+        );
+        writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
+
+        let reader = FileReader::open(&path).unwrap();
+        let ds = reader.data_set();
+
+        assert_eq!(
+            ds.get_global_attr_f64("NDNetCDFFileVersion"),
+            Some([3.1f64].as_slice()),
+            "NDNetCDFFileVersion global must be the 3.1 double"
+        );
+        assert!(ds.has_global_attr("dataType"));
+        assert!(
+            !ds.has_global_attr("uniqueId"),
+            "uniqueId is a variable in C, not a global attribute"
+        );
+        assert!(
+            !ds.has_global_attr("numArrays"),
+            "numArrays is a dimension in C, not a global attribute"
+        );
+        // uniqueId must still be present as a variable.
+        assert!(ds.get_var("uniqueId").is_some());
 
         drop(reader);
         std::fs::remove_file(&path).ok();

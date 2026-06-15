@@ -606,6 +606,17 @@ pub async fn run(config: IoConfig) -> Result<(), Box<dyn std::error::Error + Sen
     }
     put_f64(&ch_e_using, params.energy).await;
 
+    // Seed the four computed-output PVs at startup (C Io.st:192-195) so they
+    // display sane values before the first update cycle. The 18 operator-tunable
+    // defaults C also force-writes at init (icChannel/VperA/v2f/xAir/.../ArPcntr,
+    // Io.st:174-191) are intentionally NOT written here: those are autosave-
+    // restored settings, and force-writing them on every boot would clobber a
+    // saved configuration. Operators get them from autosave/.db defaults instead.
+    put_f64(&ch_flux, 0.0).await;
+    put_f64(&ch_ion_photons, 0.0).await;
+    put_f64(&ch_ion_abs, 1.0).await;
+    put_f64(&ch_detector, 0.0).await;
+
     tracing::info!("Io state machine running for {p}");
 
     let update_rate = Duration::from_secs(10);

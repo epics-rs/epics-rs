@@ -378,9 +378,9 @@ impl FlexController {
                 let act_db = effective_deadband(self.deadband, self.coarse_mres);
 
                 if self.num_retries >= self.max_retries {
-                    // Give up, move fine to final position
-                    self.fine_pos = self.new_set_point - self.pos_monitor + self.fine_rbv;
-                    actions.move_fine = Some(self.fine_pos);
+                    // Give up. C maybeRetry (flexCombinedMotion.st:272-276) transitions
+                    // straight to resetBusy, which only PVPUTs busy=0 (`:325-336`) — it
+                    // does NOT write {FM}.VAL. Leave the fine motor where it is.
                     self.busy = false;
                     actions.set_busy = Some(false);
                     self.state = FlexState::Idle;
@@ -837,7 +837,8 @@ mod tests {
         ctrl.fine_rbv = 0.0;
 
         let actions = ctrl.handle_coarse_done();
-        assert!(actions.move_fine.is_some()); // Final fine positioning
+        // Give-up path: C goes maybeRetry -> resetBusy with no {FM}.VAL write.
+        assert!(actions.move_fine.is_none());
         assert_eq!(actions.set_busy, Some(false));
     }
 

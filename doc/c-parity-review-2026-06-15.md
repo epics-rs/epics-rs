@@ -97,7 +97,7 @@ population). One commit per finding.
 | ADC-3 (plugin output must publish NDCodec / NDCompressedSize per array) | fix | Fixed | f3f44a39 |
 | ADC-5 (NDDimensions posts fixed ND_ARRAY_MAX_DIMS=10 zero-filled, not ndims) | fix-low | Fixed | 600adb66 |
 | ADC-11 (file-plugin control attrs honor C string-typed read, ignore numeric) | verify→fix | Fixed | bc63c38f |
-| ADC-12 (destination_matches comparison must replicate C attrIsProcessingRequired: non-empty guard + "all" 3-char prefix) | fix-low | Open | — |
+| ADC-12 (destination_matches comparison must replicate C attrIsProcessingRequired: non-empty guard + "all" 3-char prefix) | fix-low | Fixed | a05b900c |
 
 STD-1/2/3 share one structural root (single-owner OUTL-write flag set only by
 `do_pid`), so they land in one commit. STD-7/8 are signoff (see tally).
@@ -183,7 +183,7 @@ C: `NDPluginFile.cpp:548,382` call `getValue(NDAttrString,…)`; `NDAttribute.cp
 Impact: a misconfigured numeric filename attribute changes the output filename in Rust, ignored in C. Edge (non-conformant typing).
 Fix: new `NDAttrValue::as_string_typed() -> Option<&str>` (Some only for the String variant, mirroring `getValue(NDAttrString)`); all three control-read sites (FilePluginDestination, FilePluginFileName, DriverFileName) route through it so numeric/undefined attributes are ignored as in C. Serialization sites (`NDArray::report`, NeXus/TIFF/HDF5 writers) keep `as_string()` — C stringifies for storage there too (distinct, not in family).
 
-#### ADC-12: `destination_matches` comparison diverges from C `attrIsProcessingRequired` (length guard + "all" prefix)
+#### ADC-12: `destination_matches` comparison diverges from C `attrIsProcessingRequired` (length guard + "all" prefix) — FIXED a05b900c
 Severity: Low — fix-low. Discovered while fixing ADC-11; distinct root cause (comparison semantics, not numeric stringification).
 Rust: `crates/ad-core-rs/src/plugin/file_controller.rs` `destination_matches` — `if dest.len() <= 1 { return true }` skips the compare for a 1-char destination, and `dest.eq_ignore_ascii_case("all")` is a full-string equality.
 C: `NDPluginFile.cpp:639-648` runs the compare whenever the attr is string-typed and non-empty (`getValueInfo` size = `strlen+1 > 1`, so size ≥ 1 / non-empty), tests "all" via `epicsStrnCaseCmp(dest,"all",min(len,3))` (a 3-char prefix match), and the port name via full-length compare.

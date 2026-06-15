@@ -52,6 +52,9 @@ pub struct PosPluginProcessor {
     index: usize,
     running: bool,
     expected_id: i32,
+    /// C `NDPos_IDStart` (default 1): the value `ExpectedID` is reset to on
+    /// every Running write (NDPosPlugin.cpp:420,232-234).
+    id_start: i32,
     missing_frames: usize,
     duplicate_frames: usize,
     params: PosParamIndices,
@@ -66,6 +69,7 @@ impl PosPluginProcessor {
             index: 0,
             running: false,
             expected_id: 0,
+            id_start: 1,
             missing_frames: 0,
             duplicate_frames: 0,
             params: PosParamIndices::default(),
@@ -133,11 +137,14 @@ impl PosPluginProcessor {
     }
 
     /// Start processing.
+    ///
+    /// C `writeInt32(NDPos_Running)` resets `ExpectedID` to `IDStart` and does
+    /// nothing else (NDPosPlugin.cpp:230-234) — in particular it does *not*
+    /// clear MissingFrames/DuplicateFrames, which persist across runs until a
+    /// client writes them (they are zeroed only in the constructor).
     pub fn start(&mut self) {
         self.running = true;
-        self.expected_id = 0;
-        self.missing_frames = 0;
-        self.duplicate_frames = 0;
+        self.expected_id = self.id_start;
     }
 
     /// Stop processing.
@@ -412,38 +419,39 @@ impl NDPluginProcess for PosPluginProcessor {
             return ProcessResult::arrays(vec![Arc::new(array.clone())]);
         }
 
-        // Frame ID tracking
-        if self.expected_id > 0 {
-            let uid = array.unique_id;
-            if uid > self.expected_id {
-                let diff = (uid - self.expected_id) as usize;
-                self.missing_frames += diff;
-                for _ in 0..diff {
-                    self.advance();
-                    let has = match self.mode {
-                        PosMode::Discard => !self.positions.is_empty(),
-                        PosMode::Keep => !self.all_positions.is_empty(),
-                    };
-                    if !has {
-                        return ProcessResult::arrays(vec![Arc::new(array.clone())]);
-                    }
-                }
-            } else if uid < self.expected_id {
-                self.duplicate_frames += 1;
-                // C sets skip=1 (no downstream emit) but still posts
-                // DuplicateFrames (NDPosPlugin.cpp:132-135).
-                let mut updates = Vec::new();
-                push_int(
-                    &mut updates,
-                    self.params.duplicate_frames,
-                    self.duplicate_frames as i32,
-                );
-                return ProcessResult {
-                    output_arrays: vec![],
-                    param_updates: updates,
-                    scatter_index: None,
+        // Frame ID tracking. C compares against ExpectedID = IDStart from the
+        // very first running frame (NDPosPlugin.cpp:90-135); there is no
+        // "skip the first frame" gate, so a first frame whose uniqueId differs
+        // from IDStart is classified as missing/duplicate immediately.
+        let uid = array.unique_id;
+        if uid > self.expected_id {
+            let diff = (uid - self.expected_id) as usize;
+            self.missing_frames += diff;
+            for _ in 0..diff {
+                self.advance();
+                let has = match self.mode {
+                    PosMode::Discard => !self.positions.is_empty(),
+                    PosMode::Keep => !self.all_positions.is_empty(),
                 };
+                if !has {
+                    return ProcessResult::arrays(vec![Arc::new(array.clone())]);
+                }
             }
+        } else if uid < self.expected_id {
+            self.duplicate_frames += 1;
+            // C sets skip=1 (no downstream emit) but still posts
+            // DuplicateFrames (NDPosPlugin.cpp:132-135).
+            let mut updates = Vec::new();
+            push_int(
+                &mut updates,
+                self.params.duplicate_frames,
+                self.duplicate_frames as i32,
+            );
+            return ProcessResult {
+                output_arrays: vec![],
+                param_updates: updates,
+                scatter_index: None,
+            };
         }
 
         let position = match self.current_position() {
@@ -608,12 +616,17 @@ impl NDPluginProcess for PosPluginProcessor {
 
         let mut updates = Vec::new();
         if Some(reason) == self.params.running {
-            // C writeInt32(NDPos_Running): start/stop (NDPosPlugin.cpp:230-234).
+            // C writeInt32(NDPos_Running): start/stop and reset ExpectedID to
+            // IDStart (NDPosPlugin.cpp:230-234).
             if params.value.as_i32() == 0 {
                 self.stop();
             } else {
                 self.start();
+                push_int(&mut updates, self.params.expected_id, self.id_start);
             }
+        } else if Some(reason) == self.params.id_start {
+            // C stores IDStart; it is read on the next Running write.
+            self.id_start = params.value.as_i32();
         } else if Some(reason) == self.params.mode {
             // C writeInt32(NDPos_Mode): reset index to 0 (NDPosPlugin.cpp:235-237).
             self.mode = match params.value.as_i32() {
@@ -1052,6 +1065,35 @@ mod tests {
             _ => None,
         });
         assert_eq!(s.as_deref(), Some("[x=1.5,y=2]"));
+    }
+
+    #[test]
+    fn test_first_frame_id_checked() {
+        // ADP-37: ExpectedID starts at IDStart (1); a first running frame whose
+        // uniqueId != IDStart is classified immediately (here frames 1,2 are
+        // missing), not silently accepted.
+        let mut proc = PosPluginProcessor::new(PosMode::Discard);
+        let mut p1 = HashMap::new();
+        p1.insert("x".into(), 1.0);
+        let mut p2 = HashMap::new();
+        p2.insert("x".into(), 2.0);
+        let mut p3 = HashMap::new();
+        p3.insert("x".into(), 3.0);
+        proc.load_positions(vec![p1, p2, p3]);
+        proc.start();
+
+        let pool = NDArrayPool::new(1_000_000);
+        // First frame arrives as uniqueId 3 → frames 1 and 2 counted missing.
+        let result = proc.process_array(&make_array(3), &pool);
+        assert_eq!(proc.missing_frames(), 2);
+        let x = result.output_arrays[0]
+            .attributes
+            .get("x")
+            .unwrap()
+            .value
+            .as_f64()
+            .unwrap();
+        assert!((x - 3.0).abs() < 1e-10);
     }
 
     #[test]

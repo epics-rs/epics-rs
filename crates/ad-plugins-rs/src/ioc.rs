@@ -12,7 +12,7 @@ use ad_core_rs::ioc::{
     PluginManager, attr_arg_defs, dtyp_from_port, extract_plugin_args, plugin_arg_defs,
     register_noop_commands,
 };
-use ad_core_rs::plugin::runtime::create_plugin_runtime;
+use ad_core_rs::plugin::runtime::{create_plugin_runtime, create_plugin_runtime_multi_addr};
 use ad_core_rs::plugin::wiring::WiringRegistry;
 use asyn_rs::trace::TraceManager;
 use epics_base_rs::error::CaResult;
@@ -308,6 +308,91 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
 
                 m.add_plugin(&dtyp, &handle);
                 println!("NDGatherConfigure: port={port_name}");
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+    }
+    // NDAttrPlotConfig: portName nAttributes cacheSize nDataBlocks NDArrayPort
+    //                   [NDArrayAddr] [queueSize] [blockingCallbacks] [priority] [stackSize]
+    // C arg order (NDPluginAttrPlot.cpp:308): port, n_attributes, cache_size,
+    // n_selected_blocks, in_port, in_addr, queue_size, ... — distinct from the
+    // generic portName/queueSize/blockingCallbacks/NDArrayPort layout, so this
+    // command parses its own positional args. The plugin tracks up to
+    // n_attributes numeric attributes and exposes n_data_blocks waveform blocks,
+    // so the asyn port needs max(n_attributes, n_data_blocks) addresses (C uses
+    // the same max, NDPluginAttrPlot.cpp:48).
+    {
+        let m = mgr.clone();
+        let int = |name| ArgDesc {
+            name,
+            arg_type: ArgType::Int,
+            optional: true,
+        };
+        let arg_defs = vec![
+            ArgDesc {
+                name: "portName",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            int("nAttributes"),
+            int("cacheSize"),
+            int("nDataBlocks"),
+            ArgDesc {
+                name: "NDArrayPort",
+                arg_type: ArgType::String,
+                optional: true,
+            },
+            int("NDArrayAddr"),
+            int("queueSize"),
+            int("blockingCallbacks"),
+            int("priority"),
+            int("stackSize"),
+        ];
+        let taken = std::mem::replace(&mut app, IocApplication::new());
+        app = taken.register_startup_command(CommandDef::new(
+            "NDAttrPlotConfig",
+            arg_defs,
+            "NDAttrPlotConfig portName nAttributes cacheSize nDataBlocks NDArrayPort \
+             [NDArrayAddr] [queueSize] [blockingCallbacks] [priority] [stackSize]"
+                .to_string(),
+            move |args: &[ArgValue], _ctx: &CommandContext| {
+                let AttrPlotArgs {
+                    port_name,
+                    n_attributes,
+                    cache_size,
+                    n_data_blocks,
+                    in_port,
+                    queue_size,
+                } = parse_attr_plot_args(args)?;
+
+                let dtyp = dtyp_from_port(&port_name);
+                if asyn_rs::asyn_record::get_port(&port_name).is_some() {
+                    println!("NDAttrPlotConfig: port={port_name} already configured, skipping");
+                    return Ok(CommandOutcome::Continue);
+                }
+                let drv = m.driver()?;
+                let pool = drv.pool();
+                // Addr 0 always exists, so at least one address even for a
+                // degenerate 0/0 request.
+                let max_addr = n_attributes.max(n_data_blocks).max(1);
+                let (handle, _jh) = create_plugin_runtime_multi_addr(
+                    &port_name,
+                    crate::attr_plot::AttrPlotProcessor::new(
+                        n_attributes,
+                        cache_size,
+                        n_data_blocks,
+                    ),
+                    pool,
+                    queue_size,
+                    &in_port,
+                    m.wiring().clone(),
+                    max_addr,
+                );
+                m.add_plugin(&dtyp, &handle);
+                if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &in_port) {
+                    eprintln!("NDAttrPlotConfig: wiring failed: {e}");
+                }
+                println!("NDAttrPlotConfig: port={port_name}");
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -632,6 +717,47 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
 }
 
 /// Helper: register a generic plugin configure command that follows the standard pattern.
+/// Parsed `NDAttrPlotConfig` arguments.
+struct AttrPlotArgs {
+    port_name: String,
+    n_attributes: usize,
+    cache_size: usize,
+    n_data_blocks: usize,
+    in_port: String,
+    queue_size: usize,
+}
+
+/// Parse `NDAttrPlotConfig` positional args in C order
+/// (`NDPluginAttrPlot.cpp:308`): `port, n_attributes, cache_size,
+/// n_selected_blocks, in_port, in_addr, queue_size, ...`.
+///
+/// A present integer is honoured exactly — including an explicit `0`, which is
+/// meaningful for `cache_size` (`0` = unlimited per-buffer cache). Fallbacks
+/// apply only when an arg is absent; a real st.cmd always passes them, so the
+/// fallbacks only affect malformed calls.
+fn parse_attr_plot_args(args: &[ArgValue]) -> Result<AttrPlotArgs, String> {
+    let port_name = match args.first() {
+        Some(ArgValue::String(s)) if !s.is_empty() => s.clone(),
+        _ => return Err("NDAttrPlotConfig: portName required".into()),
+    };
+    let usize_arg = |i: usize, default: usize| match args.get(i) {
+        Some(ArgValue::Int(n)) => (*n).max(0) as usize,
+        _ => default,
+    };
+    let in_port = match args.get(4) {
+        Some(ArgValue::String(s)) => s.clone(),
+        _ => String::new(),
+    };
+    Ok(AttrPlotArgs {
+        port_name,
+        n_attributes: usize_arg(1, 8),
+        cache_size: usize_arg(2, 1000),
+        n_data_blocks: usize_arg(3, 4),
+        in_port,
+        queue_size: usize_arg(6, 20),
+    })
+}
+
 fn register_generic_plugin<F>(
     app: &mut IocApplication,
     mgr: &Arc<PluginManager>,
@@ -947,5 +1073,62 @@ impl AdIoc {
             std::process::exit(1);
         };
         self.run_with_pva(&script).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_attr_plot_args_maps_c_positional_order() {
+        // C NDAttrPlotConfig(port, n_attributes, cache_size, n_selected_blocks,
+        // in_port, in_addr, queue_size, ...) — NDPluginAttrPlot.cpp:308. The
+        // distinct order (n_attributes/cache/blocks before in_port, queue at
+        // index 6) is the parity-critical mapping this guards.
+        let args = vec![
+            ArgValue::String("AP1".to_string()),
+            ArgValue::Int(10),                    // n_attributes
+            ArgValue::Int(500),                   // cache_size
+            ArgValue::Int(3),                     // n_selected_blocks
+            ArgValue::String("DET1".to_string()), // in_port
+            ArgValue::Int(0),                     // in_addr
+            ArgValue::Int(50),                    // queue_size
+            ArgValue::Int(0),                     // blocking_callbacks
+        ];
+        let p = parse_attr_plot_args(&args).unwrap();
+        assert_eq!(p.port_name, "AP1");
+        assert_eq!(p.n_attributes, 10);
+        assert_eq!(p.cache_size, 500);
+        assert_eq!(p.n_data_blocks, 3);
+        assert_eq!(p.in_port, "DET1");
+        assert_eq!(p.queue_size, 50);
+    }
+
+    #[test]
+    fn parse_attr_plot_args_requires_port_name() {
+        assert!(parse_attr_plot_args(&[]).is_err());
+        assert!(parse_attr_plot_args(&[ArgValue::String(String::new())]).is_err());
+        assert!(parse_attr_plot_args(&[ArgValue::Int(1)]).is_err());
+    }
+
+    #[test]
+    fn parse_attr_plot_args_honours_explicit_zero_and_defaults_absent() {
+        // Boundary: an explicit cache_size=0 is meaningful (unlimited) and must be
+        // honoured; absent n_attributes/n_data_blocks/queue_size fall back.
+        let args = vec![
+            ArgValue::String("AP2".to_string()),
+            ArgValue::Missing, // n_attributes absent
+            ArgValue::Int(0),  // cache_size = unlimited (explicit 0, not a fallback)
+        ];
+        let p = parse_attr_plot_args(&args).unwrap();
+        assert_eq!(p.n_attributes, 8, "absent n_attributes -> fallback");
+        assert_eq!(
+            p.cache_size, 0,
+            "explicit 0 cache_size honoured (unlimited)"
+        );
+        assert_eq!(p.n_data_blocks, 4, "absent n_data_blocks -> fallback");
+        assert_eq!(p.in_port, "", "absent in_port -> empty");
+        assert_eq!(p.queue_size, 20, "absent queue_size -> fallback");
     }
 }

@@ -216,6 +216,7 @@ Severity: Low (enum) / High (the ordinal shift it causes, see ADP-11) — fix (f
 Rust: `crates/ad-core-rs/src/codec.rs:5-31` — 7 variants; `as_str` emits `"zlib"`/`"lz4hdf5"`.
 C: `ADApp/ADSrc/Codec.h:4-18` — `{"","jpeg","blosc","lz4","bslz4"}`, `NDCODEC_{NONE=0,JPEG=1,BLOSC=2,LZ4=3,BSLZ4=4}`.
 Impact: the four real names round-trip; the extra variants + the ad-plugins ordinal map (ADP-11) cause `COMPRESSOR=2/3/4` to select the wrong codec.
+RESOLVED 2026-06-16 — the observable consequence is FIXED via ADP-11 (39e07250): the COMPRESSOR ordinal map at `codec.rs:1211-1220` aligns `0-4` to C (NONE/JPEG/BLOSC/LZ4/BSLZ4) with the Rust-only `Zlib=5`/`LZ4HDF5=6` after the C set so they never shadow a C ordinal. The structural cause — keeping the extra `Zlib`/`LZ4HDF5` enum variants at all — is signed off "keep" under ADP-26 (user, additive, Rust-to-Rust by design). No further code change.
 
 #### ADC-11: file-name NDAttribute path stringifies numeric attributes; C `getValue(NDAttrString)` errors and ignores them — FIXED bc63c38f
 Severity: Low — verify

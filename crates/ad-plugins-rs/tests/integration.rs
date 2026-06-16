@@ -591,6 +591,7 @@ fn test_circular_buff_trigger_flow() {
         2, // pre_count
         1, // post_count
         TriggerCondition::External,
+        100, // max_buffers (C maxBuffers_)
     );
 
     // Fill pre-buffer

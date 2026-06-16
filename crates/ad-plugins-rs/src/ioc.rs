@@ -210,7 +210,9 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             use crate::circular_buff::{CircularBuffProcessor, TriggerCondition};
             create_plugin_runtime(
                 port_name,
-                CircularBuffProcessor::new(100, 100, TriggerCondition::External),
+                // queue_size is C `maxBuffers_` (NDCircularBuffConfigure
+                // queueSize); the processor bounds the accepted pre-count by it.
+                CircularBuffProcessor::new(100, 100, TriggerCondition::External, queue_size),
                 pool,
                 queue_size,
                 ndarray_port,

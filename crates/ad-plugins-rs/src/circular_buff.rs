@@ -398,6 +398,10 @@ struct CBParamIndices {
 pub struct CircularBuffProcessor {
     buffer: CircularBuffer,
     params: CBParamIndices,
+    /// C `maxBuffers_` — the plugin's input NDArray queue size, passed to
+    /// `NDCircularBuffConfigure` as `queueSize`. Bounds the accepted pre-count:
+    /// C rejects `preCount > maxBuffers_ - 1` (NDPluginCircularBuff.cpp:284).
+    max_buffers: usize,
     // cached trigger attribute names and calc expression
     trigger_a_name: String,
     trigger_b_name: String,
@@ -405,10 +409,16 @@ pub struct CircularBuffProcessor {
 }
 
 impl CircularBuffProcessor {
-    pub fn new(pre_count: usize, post_count: usize, condition: TriggerCondition) -> Self {
+    pub fn new(
+        pre_count: usize,
+        post_count: usize,
+        condition: TriggerCondition,
+        max_buffers: usize,
+    ) -> Self {
         Self {
             buffer: CircularBuffer::new(pre_count, post_count, condition),
             params: CBParamIndices::default(),
+            max_buffers,
             trigger_a_name: String::new(),
             trigger_b_name: String::new(),
             trigger_calc_expr: String::new(),
@@ -601,10 +611,10 @@ impl NDPluginProcess for CircularBuffProcessor {
             }
         } else if Some(reason) == self.params.pre_trigger {
             // C writeInt32(NDCircBuffPreTrigger) validates before committing
-            // (NDPluginCircularBuff.cpp:280-292): reject while running or for a
-            // negative value (status string + leave the param at its old value),
-            // otherwise commit. The "Pre-count too high" (> maxBuffers_-1) check
-            // is not modelled — the Rust processor carries no maxBuffers bound.
+            // (NDPluginCircularBuff.cpp:280-292), in this exact order: reject
+            // while running, then a pre-count above `maxBuffers_-1`, then a
+            // negative value (each leaves the param at its old value with an
+            // explanatory status string), otherwise commit.
             let value = params.value.as_i32();
             let running = matches!(
                 self.buffer.status(),
@@ -612,6 +622,9 @@ impl NDPluginProcess for CircularBuffProcessor {
             );
             let reject_msg = if running {
                 Some("Stop acquisition to set pre-count")
+            } else if value > self.max_buffers as i32 - 1 {
+                // The pre-trigger ring cannot exceed the input queue (C 284).
+                Some("Pre-count too high")
             } else if value < 0 {
                 Some("Invalid pre-count value")
             } else {
@@ -1077,7 +1090,7 @@ mod tests {
         // CURRENT_IMAGE=0 and STATUS="Acquisition Stopped".
         use ad_core_rs::plugin::runtime::{ParamChangeValue, ParamUpdate, PluginParamSnapshot};
 
-        let mut processor = CircularBuffProcessor::new(2, 1, TriggerCondition::External);
+        let mut processor = CircularBuffProcessor::new(2, 1, TriggerCondition::External, 100);
         processor.params.control = Some(10);
         processor.params.current_image = Some(11);
         processor.params.status = Some(12);
@@ -1113,12 +1126,13 @@ mod tests {
     #[test]
     fn test_pre_count_validation() {
         // Regression for ADP-44: pre-count writes are rejected (status string +
-        // param reverted) while running and for negative values, accepted
-        // otherwise.
+        // param reverted) while running, above the maxBuffers-1 ceiling, and
+        // for negative values, accepted otherwise (C NDPluginCircularBuff.cpp:
+        // 280-292). maxBuffers_ is 10 here, so the ceiling is 9.
         use ad_core_rs::plugin::runtime::{ParamChangeValue, ParamUpdate, PluginParamSnapshot};
 
         let make_proc = || {
-            let mut p = CircularBuffProcessor::new(3, 1, TriggerCondition::External);
+            let mut p = CircularBuffProcessor::new(3, 1, TriggerCondition::External, 10);
             p.params.pre_trigger = Some(20);
             p.params.status = Some(12);
             p
@@ -1164,7 +1178,25 @@ mod tests {
             ParamUpdate::Octet { reason: 12, value, .. } if value == "Invalid pre-count value"
         )));
 
-        // Stopped + valid → accept.
+        // Stopped + above maxBuffers-1 (9) → reject with "Pre-count too high".
+        let mut p = make_proc();
+        p.buffer.status = BufferStatus::Idle;
+        let r = write(&mut p, 10);
+        assert_eq!(p.buffer.pre_count, 3, "too-high rejected, value unchanged");
+        assert!(r.param_updates.iter().any(|u| matches!(
+            u,
+            ParamUpdate::Octet { reason: 12, value, .. } if value == "Pre-count too high"
+        )));
+        assert!(r.param_updates.iter().any(|u| matches!(
+            u,
+            ParamUpdate::Int32 {
+                reason: 20,
+                value: 3,
+                ..
+            }
+        )));
+
+        // Stopped + exactly maxBuffers-1 (9) → accept (boundary).
         let mut p = make_proc();
         p.buffer.status = BufferStatus::Idle;
         write(&mut p, 9);

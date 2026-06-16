@@ -215,6 +215,18 @@ record(waveform, "REG:P:WF") {
     field(LOPR, "-100")
 }
 
+#### Family R — record-specific DBF_MENU field served as DBR_ENUM ##########
+# A *record-specific* DBF_MENU field (dfanout SELM, menu(dfanoutSELM)) must be
+# served as DBR_ENUM carrying that record's own menu choice labels — the
+# record-specific menu_field_choices branch, distinct from Family F's shared
+# .SCAN menu (shared_menu_choices). SELM=2 selects "Mask". The recurring
+# regression is a secondary/record-specific menu field losing its DBR_ENUM
+# typing or its choice labels.
+record(dfanout, "REG:R:DF") {
+    field(DESC, "record-specific DBF_MENU (SELM) as DBR_ENUM")
+    field(SELM, "2")
+}
+
 #### Family D — motor record moves on a caput to VAL (SCAN=Passive) #########
 # The v0.20.0 regression: a caput to a SCAN=Passive motor's VAL did not move
 # it (the I/O-Intr-vs-Passive dbPutField processing gate). Pins "caput to a

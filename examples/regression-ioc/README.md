@@ -26,6 +26,7 @@ regression in the same family fails a test instead of shipping.
 | N | an `MS` (maximize-severity) input link propagates the **source** record's severity into the reader (`recGblInheritSevrMsg`), distinct from G's own-limit severity | `REG:N:*` → `n_ms_link_propagates_source_severity` |
 | O | a record seeded nonzero (MLST/ALST seeded at init) must not post a duplicate VAL on an idempotent reprocess; a real change still posts (process-path no-change, vs B's write-path) | `REG:O:LO` → `o_seeded_record_suppresses_duplicate_post` |
 | P | an array (waveform) channel exposes its VAL display **and** control limit metadata over `DBR_GR`/`DBR_CTRL` (EGU/PREC/HOPR/LOPR + HOPR/LOPR control limits), not a collapsed `[0,0]` range | `REG:P:WF` → `p_array_exposes_gr_and_ctrl_limit_metadata` |
+| R | a **record-specific** `DBF_MENU` field (dfanout `SELM`) is served as `DBR_ENUM` by index over CA and as an NTEnum carrying that record's own choice labels over PVA (the per-record menu branch, vs F's shared `.SCAN`) | `REG:R:DF` → `r_record_specific_menu_field_served_as_dbr_enum` |
 
 Family C is pinned both by the periodic-scan test and by the motor's
 `io_intr_scan_independent` readback path (the actual v0.20.0 mechanism).

@@ -19,6 +19,8 @@
 //!   N — MS-class link propagates the source record's alarm severity
 //!   O — a seeded record suppresses a duplicate first-cycle/idempotent post
 //!   P — an array (waveform) exposes DBR_GR/DBR_CTRL limit metadata
+//!   R — a record-specific DBF_MENU (dfanout SELM) served as DBR_ENUM with
+//!       its own choice labels (distinct from F's shared .SCAN menu)
 
 use std::time::Duration;
 
@@ -702,4 +704,46 @@ async fn p_array_exposes_gr_and_ctrl_limit_metadata() {
         ctrl.lower_ctrl_limit, -100.0,
         "array control lower limit must be LOPR (-100), not 0"
     );
+}
+
+// ---- Family R: record-specific DBF_MENU served as DBR_ENUM ----------------
+
+/// A *record-specific* DBF_MENU field (dfanout `SELM`, `menu(dfanoutSELM)`)
+/// must be served over CA as DBR_ENUM by index, and over PVA as an NTEnum that
+/// carries that record's own choice labels. This exercises the record-specific
+/// `menu_field_choices` branch — distinct from Family F, which covers the
+/// shared `.SCAN` menu (`shared_menu_choices`) and asserts only the enum type,
+/// not the per-record choice table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn r_record_specific_menu_field_served_as_dbr_enum() {
+    let ioc = RegressionIoc::boot().await.expect("boot");
+    let ca = ioc.ca_client().await;
+
+    // CA: SELM is DBR_ENUM and round-trips by index (seeded SELM=2 = "Mask").
+    let (dbf, val) = ca.caget("REG:R:DF.SELM").await.expect("caget .SELM");
+    assert_eq!(
+        dbf,
+        DbFieldType::Enum,
+        "record-specific DBF_MENU SELM must be served as DBR_ENUM"
+    );
+    assert!(
+        matches!(val, EpicsValue::Enum(2)),
+        "SELM index round-trip (Mask = 2), got {val:?}"
+    );
+
+    // PVA: the NTEnum carries the record-specific menu's choice labels, proving
+    // the choices come from the record's own menu, not a shared one.
+    let pva = ioc.pva_client();
+    let field = tokio::time::timeout(Duration::from_secs(5), pva.pvget("REG:R:DF.SELM"))
+        .await
+        .expect("pvget timed out")
+        .expect("pvget");
+    let dbg = format!("{field:?}");
+    for choice in ["All", "Specified", "Mask"] {
+        assert!(
+            dbg.contains(choice),
+            "PVA NTEnum must carry record-specific choice {choice:?}, got {dbg}"
+        );
+    }
 }

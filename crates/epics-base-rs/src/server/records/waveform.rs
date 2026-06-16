@@ -236,6 +236,32 @@ static WAVEFORM_FIELDS_CHAR: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    // Display/control metadata fields. Typed storage + get_field/put_field
+    // already back these; they MUST be in field_list so the db loader applies
+    // field(EGU/HOPR/LOPR/PREC, ...) to that storage rather than routing them
+    // to common fields (where the record's own get_field shadows them with
+    // defaults, zeroing DBR_GR/DBR_CTRL limits). waveformRecord.c declares
+    // EGU/HOPR/LOPR/PREC as record fields.
+    FieldDesc {
+        name: "EGU",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "HOPR",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LOPR",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "PREC",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
 ];
 
 static WAVEFORM_FIELDS_SHORT: &[FieldDesc] = &[
@@ -256,6 +282,32 @@ static WAVEFORM_FIELDS_SHORT: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "FTVL",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    // Display/control metadata fields. Typed storage + get_field/put_field
+    // already back these; they MUST be in field_list so the db loader applies
+    // field(EGU/HOPR/LOPR/PREC, ...) to that storage rather than routing them
+    // to common fields (where the record's own get_field shadows them with
+    // defaults, zeroing DBR_GR/DBR_CTRL limits). waveformRecord.c declares
+    // EGU/HOPR/LOPR/PREC as record fields.
+    FieldDesc {
+        name: "EGU",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "HOPR",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LOPR",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "PREC",
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
@@ -282,6 +334,32 @@ static WAVEFORM_FIELDS_LONG: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    // Display/control metadata fields. Typed storage + get_field/put_field
+    // already back these; they MUST be in field_list so the db loader applies
+    // field(EGU/HOPR/LOPR/PREC, ...) to that storage rather than routing them
+    // to common fields (where the record's own get_field shadows them with
+    // defaults, zeroing DBR_GR/DBR_CTRL limits). waveformRecord.c declares
+    // EGU/HOPR/LOPR/PREC as record fields.
+    FieldDesc {
+        name: "EGU",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "HOPR",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LOPR",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "PREC",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
 ];
 
 static WAVEFORM_FIELDS_INT64: &[FieldDesc] = &[
@@ -302,6 +380,32 @@ static WAVEFORM_FIELDS_INT64: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "FTVL",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    // Display/control metadata fields. Typed storage + get_field/put_field
+    // already back these; they MUST be in field_list so the db loader applies
+    // field(EGU/HOPR/LOPR/PREC, ...) to that storage rather than routing them
+    // to common fields (where the record's own get_field shadows them with
+    // defaults, zeroing DBR_GR/DBR_CTRL limits). waveformRecord.c declares
+    // EGU/HOPR/LOPR/PREC as record fields.
+    FieldDesc {
+        name: "EGU",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "HOPR",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LOPR",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "PREC",
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
@@ -328,6 +432,32 @@ static WAVEFORM_FIELDS_UINT64: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    // Display/control metadata fields. Typed storage + get_field/put_field
+    // already back these; they MUST be in field_list so the db loader applies
+    // field(EGU/HOPR/LOPR/PREC, ...) to that storage rather than routing them
+    // to common fields (where the record's own get_field shadows them with
+    // defaults, zeroing DBR_GR/DBR_CTRL limits). waveformRecord.c declares
+    // EGU/HOPR/LOPR/PREC as record fields.
+    FieldDesc {
+        name: "EGU",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "HOPR",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LOPR",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "PREC",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
 ];
 
 static WAVEFORM_FIELDS_FLOAT: &[FieldDesc] = &[
@@ -351,6 +481,32 @@ static WAVEFORM_FIELDS_FLOAT: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    // Display/control metadata fields. Typed storage + get_field/put_field
+    // already back these; they MUST be in field_list so the db loader applies
+    // field(EGU/HOPR/LOPR/PREC, ...) to that storage rather than routing them
+    // to common fields (where the record's own get_field shadows them with
+    // defaults, zeroing DBR_GR/DBR_CTRL limits). waveformRecord.c declares
+    // EGU/HOPR/LOPR/PREC as record fields.
+    FieldDesc {
+        name: "EGU",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "HOPR",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LOPR",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "PREC",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
 ];
 
 static WAVEFORM_FIELDS_DOUBLE: &[FieldDesc] = &[
@@ -371,6 +527,32 @@ static WAVEFORM_FIELDS_DOUBLE: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "FTVL",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    // Display/control metadata fields. Typed storage + get_field/put_field
+    // already back these; they MUST be in field_list so the db loader applies
+    // field(EGU/HOPR/LOPR/PREC, ...) to that storage rather than routing them
+    // to common fields (where the record's own get_field shadows them with
+    // defaults, zeroing DBR_GR/DBR_CTRL limits). waveformRecord.c declares
+    // EGU/HOPR/LOPR/PREC as record fields.
+    FieldDesc {
+        name: "EGU",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "HOPR",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LOPR",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "PREC",
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
@@ -403,8 +585,9 @@ impl Record for WaveformRecord {
         }
     }
 
-    // EGU/HOPR/LOPR/PREC not exposed in get_field or put_field; populate_display_info
-    // gets None for all four, leaving DBR_GR display limits zeroed (waveformRecord.c:251-252).
+    // EGU/HOPR/LOPR/PREC are backed by typed storage and exposed through both
+    // get_field/put_field and field_list, so populate_display_info reads the
+    // loaded values for the DBR_GR display limits (waveformRecord.c:251-252).
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => {

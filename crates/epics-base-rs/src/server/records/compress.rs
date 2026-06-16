@@ -402,6 +402,32 @@ static COMPRESS_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Double,
         read_only: true,
     },
+    // Display/control metadata fields. Typed storage + get_field/put_field
+    // already back these; they MUST be in field_list so the db loader applies
+    // field(EGU/HOPR/LOPR/PREC, ...) to that storage rather than routing them
+    // to common fields (where the record's own get_field shadows them with
+    // defaults, zeroing DBR_GR/DBR_CTRL limits). compressRecord.c declares
+    // EGU/HOPR/LOPR/PREC as record fields.
+    FieldDesc {
+        name: "EGU",
+        dbf_type: DbFieldType::String,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "HOPR",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LOPR",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "PREC",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
 ];
 
 /// Choice labels for the compression algorithm menu, in index order.

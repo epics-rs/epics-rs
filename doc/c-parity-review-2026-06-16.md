@@ -20,7 +20,7 @@ different AND reachable.
 
 | Recurring family | history commits | coverage status |
 |---|---|---|
-| disconnect / teardown | 41 | mostly closed; **OPEN:** trap-write `AfterWrite` (R4-4, 3 sites) |
+| disconnect / teardown | 41 | trap-write `AfterWrite` on cancel/supersede/teardown **FIXED (R4-4, 02053a3d)** |
 | String / type-drop | 34 | common-field FIXED (49942183), P-array FIXED; compress INP-link **FIXED (R4-3, f388beab)** |
 | timestamp / utag | 33 | pinned (regr H), utag FIXED (regr Q) — closed |
 | init / load order | 30 | pinned (regr O), common-field-load FIXED — closed |
@@ -32,7 +32,7 @@ different AND reachable.
 | alarm / severity | 16 | pinned (regr G/N) — closed |
 | array / waveform | 15 | P-family FIXED — closed |
 
-7 of 11 families fully covered; **4 have open siblings (R4-1..R4-4 below).**
+7 of 11 families fully covered; the 4 with open siblings (R4-1..R4-4 below) are now **all FIXED** (R4-1 e7e20583, R4-2 90167988, R4-3 f388beab, R4-4 02053a3d; plus the R4-5 write-path sibling 86137c83).
 
 ## Open Findings
 
@@ -76,7 +76,7 @@ C ref: `compressRecord.c:342` `dbGetLink(&prec->inp, DBF_DOUBLE, …)` — C req
 Reachability: a compress record with `field(INP,"SRC.VAL")` where SRC is DBF_LONG (longin/calc) or waveform FTVL=LONG delivers `EpicsValue::Long(Array)` → VAL arm `_ => Err(TypeMismatch)` → discarded → buffer never advances, VAL stays zero. CA/PVA/OUT-link write paths are SAFE (they coerce via `field_io.rs:643-667` / `:101-127`); sseq's two `ReadDbLink` targets are covered by its own override. Structural fix: `put_field_internal` should coerce to the target field's `dbf_type` from `field_list()` (same pattern `put_pv_inner` uses), closing every `ReadDbLink` target by construction.
 
 ### R4-4: trapped put-callback `AfterWrite` finalizer skipped on abort/supersede/teardown (3 sites, one family)
-Severity: Medium — fix
+Severity: Medium — **FIXED (02053a3d)**
 Invariant (MUST): once `asTrapWrite`/`BeforeWrite` is dispatched for a trapped put, exactly one `AfterWrite` MUST follow on every exit path (completion, async-abort, supersede, teardown).
 Rust bypassing paths (no RAII finalizer — `AfterWrite` is a plain await-sequenced statement an `abort()` cuts):
 1. PVA QSRV blocking put — `crates/epics-bridge-rs/src/qsrv/trap_write.rs:112-118` (Before at :112, `write().await` parks at `channel.rs:701 rx.await`, After at :118); the PUT-EXEC task's `AbortOnDrop` (`epics-pva-rs/src/server_native/tcp.rs:1053`) cuts it on DestroyChannel/teardown. Group path `qsrv/group.rs:1189` same shape.
@@ -84,6 +84,7 @@ Rust bypassing paths (no RAII finalizer — `AfterWrite` is a plain await-sequen
 3. CA server connection teardown — `crates/epics-ca-rs/src/server/tcp.rs:3429-3479` dispatches `AfterWrite` only after `rx.await`; connection-drop abort (`tcp.rs:880`) cuts the parked task. C fires it from the disconnect branch (`camessage.c:1619-1620`).
 C ref: EPICS base `asTrapWriteAfter` on every cancel branch (`camessage.c:1400/1620/1700`); pvxs `SecurityLogger` RAII destructor (`ioc/securitylogger.h:28-29`).
 Observable: a caPutLog/trap-write listener records `BeforeWrite` with no paired `AfterWrite` on supersede/teardown of a slow (motor/async) put — a security-audit-trail divergence vs a real C IOC. Structural fix: a scope/Drop guard owning the Before/After pair (RAII equivalent of `SecurityLogger`), one helper covering all three sites.
+Fix (done): new `TrapWriteGuard` + `TrapWriteFields` in `epics-base-rs::server::access_security` — `begin()` dispatches `BeforeWrite`, `complete(status)` dispatches the normal-path `AfterWrite` and disarms, and `Drop` dispatches a cancel `AfterWrite` if still armed (the abort/supersede/teardown paths). `AfterWrite` therefore fires exactly once on every exit path by construction. The bridge `put_with_trap` holds the guard across `write().await`; the CA server moves it into the async completion task so a task `abort()` (supersede via `supersede_put_notify`, teardown via the `write_notify_tasks` drain) runs the guard's `Drop`. The three explicit Before/After dispatch sites are removed for the single owner. Pinned by `access_security::tests::trap_write_guard_{complete_fires_one_after_and_disarms_drop,drop_without_complete_fires_cancel_after}`, `qsrv::trap_write::tests::after_fires_when_write_future_cancelled`, and `server::tcp::put_notify_supersede_tests::supersede_fires_cancel_after_write_via_guard_drop`.
 
 ### R4-5: runtime `DBR_STRING` write to a `DBF_MENU` field mis-maps the label (write-path sibling of R4-1)
 Severity: Medium — **FIXED (86137c83)**
@@ -99,4 +100,4 @@ Fix (done): the three sites share `coerce_write_value`, which resolves a String 
 
 ## Review Log
 - Round 4 (2026-06-16): commit-history classification (11 recurring families) + 4-agent code hunt. 4 families have open siblings → R4-1 (menu-label, 12 menus + mis-map; the dominant one, structural), R4-2 (QSRV radix), R4-3 (compress INP coercion), R4-4 (trap-write AfterWrite, 3 sites). The classification and the independent code hunt converged on the same open set.
-- Round 4 fixes (2026-06-16): R4-1 db-load menu-label resolution FIXED (e7e20583). The [Fixes from reported defects] enumeration of the same root (field-blind `resolve_menu_string`) surfaced a runtime-write sibling on the `field_io` coercion path → filed + FIXED as R4-5 (86137c83). Both reuse the shared `resolve_menu_field_string` helper. R4-2/R4-3/R4-4 remain open.
+- Round 4 fixes (2026-06-16): R4-1 db-load menu-label resolution FIXED (e7e20583). The [Fixes from reported defects] enumeration of the same root (field-blind `resolve_menu_string`) surfaced a runtime-write sibling on the `field_io` coercion path → filed + FIXED as R4-5 (86137c83). Both reuse the shared `resolve_menu_field_string` helper. R4-2 QSRV String→int base-0 radix FIXED (90167988, shared `EpicsValue::parse_int`/`parse_uint`). R4-3 compress INP-link coercion FIXED (f388beab, `put_field_internal` coerces to the target field type). R4-4 trap-write AfterWrite-on-every-exit-path FIXED (02053a3d) — verifying the C reference (`camessage.c:1400/1620/1700` all call `asTrapWriteAfter`) confirmed the divergence and dictated the structural fix: a `TrapWriteGuard` RAII pair (BeforeWrite on `begin`, AfterWrite on `complete`-or-`Drop`) replacing the three explicit dispatch sites across epics-base-rs/epics-bridge-rs/epics-ca-rs. **All round-4 findings (R4-1..R4-5) now closed.**

@@ -598,7 +598,7 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
             plugin_arg_defs(),
             "NDTimeSeriesConfigure portName [queueSize] [blockingCallbacks] NDArrayPort",
             move |args: &[ArgValue], _ctx: &CommandContext| {
-                let (port_name, _queue_size, ndarray_port) = extract_plugin_args(args)?;
+                let (port_name, queue_size, ndarray_port) = extract_plugin_args(args)?;
                 let dtyp = dtyp_from_port(&port_name);
                 if asyn_rs::asyn_record::get_port(&port_name).is_some() {
                     println!(
@@ -611,9 +611,37 @@ pub fn register_all_plugins(mut app: IocApplication, mgr: &Arc<PluginManager>) -
                 let (ts_rx, channel_names) = match tsr.take(&ndarray_port) {
                     Some(entry) => entry,
                     None => {
-                        eprintln!(
-                            "NDTimeSeriesConfigure: no TS receiver for upstream '{ndarray_port}'. \
-                             Ensure the upstream plugin is configured first."
+                        // No upstream TS receiver registered: the upstream is a raw
+                        // NDArray source, so stand up the standalone
+                        // NDPluginTimeSeries which ingests the arrays directly
+                        // (C NDPluginTimeSeries.cpp). C's NDTimeSeriesConfigure
+                        // takes maxSignals at arg index 5.
+                        let max_signals = match args.get(5) {
+                            Some(ArgValue::Int(n)) if *n >= 1 => *n as usize,
+                            _ => 1,
+                        };
+                        let drv = m.driver()?;
+                        let pool = drv.pool();
+                        let (handle, _jh) = create_plugin_runtime_multi_addr(
+                            &port_name,
+                            crate::time_series_plugin::TimeSeriesProcessor::new(max_signals),
+                            pool,
+                            queue_size,
+                            &ndarray_port,
+                            m.wiring().clone(),
+                            // C maxAddr = maxSignals + 1 (the 2-D array callback
+                            // address is reserved at addr == maxSignals).
+                            max_signals + 1,
+                        );
+                        m.add_plugin(&dtyp, &handle);
+                        if let Err(e) = m.wiring().rewire(handle.array_sender(), "", &ndarray_port)
+                        {
+                            eprintln!("NDTimeSeriesConfigure: wiring failed: {e}");
+                        }
+                        println!(
+                            "NDTimeSeriesConfigure: port={port_name} \
+                             (standalone raw-array, maxSignals={max_signals}, \
+                             upstream={ndarray_port})"
                         );
                         return Ok(CommandOutcome::Continue);
                     }

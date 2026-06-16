@@ -1207,8 +1207,11 @@ impl EpicsValue {
         }
     }
 
-    /// Parse an integer string with C-style radix prefixes (0x for hex, 0 for octal).
-    fn parse_int(s: &str) -> CaResult<i64> {
+    /// Parse an integer string with C-style radix prefixes (0x for hex, 0 for
+    /// octal). Shared C base-0 parser for the `DBF_*` string PUT path and the
+    /// QSRV bridge's `ScalarValue::String` → integer conversion, matching
+    /// pvxs `parseTo<int64_t>` (`std::stoll(s,&idx,0)`). Rejects empty input.
+    pub fn parse_int(s: &str) -> CaResult<i64> {
         let s = s.trim();
         if s.starts_with("0x") || s.starts_with("0X") {
             i64::from_str_radix(&s[2..], 16).map_err(|e| CaError::InvalidValue(e.to_string()))
@@ -1232,8 +1235,11 @@ impl EpicsValue {
     /// the areaDetector "all-bits / undefined" convention). Parsing keeps the
     /// full unsigned 64-bit range — `i64`-based parsing would reject
     /// `DBF_UINT64` values above `i64::MAX`; callers cast to the field width,
-    /// matching C's final `(epicsUIntN)` cast of the wrapped value.
-    fn parse_uint(s: &str) -> CaResult<u64> {
+    /// matching C's final `(epicsUIntN)` cast of the wrapped value. Shared
+    /// with the QSRV bridge's `ScalarValue::String` → `DBF_UINT64` conversion
+    /// (pvxs `parseTo<uint64_t>` = `std::stoull(s,&idx,0)`). Rejects empty
+    /// input.
+    pub fn parse_uint(s: &str) -> CaResult<u64> {
         let s = s.trim();
         let (negative, body) = match s.strip_prefix('-') {
             Some(rest) => (true, rest),

@@ -227,13 +227,14 @@ fn scalar_to_i64(val: &ScalarValue) -> Result<i64, ScalarConvertError> {
             }
         }
         ScalarValue::String(s) => {
-            s.as_str_lossy()
-                .trim()
-                .parse()
-                .map_err(|_| ScalarConvertError {
-                    value: s.as_str_lossy().into_owned(),
-                    target: "i64",
-                })?
+            // pvxs `parseTo<int64_t>` = `std::stoll(s,&idx,0)`: base-0 radix
+            // (`0x` hex, leading-`0` octal). Reuse the CA path's C-radix
+            // parser so the QSRV PUT accepts the same forms (and still
+            // rejects empty/garbage).
+            EpicsValue::parse_int(&s.as_str_lossy()).map_err(|_| ScalarConvertError {
+                value: s.as_str_lossy().into_owned(),
+                target: "i64",
+            })?
         }
     })
 }
@@ -262,13 +263,13 @@ fn scalar_to_u64(val: &ScalarValue) -> Result<u64, ScalarConvertError> {
             }
         }
         ScalarValue::String(s) => {
-            s.as_str_lossy()
-                .trim()
-                .parse()
-                .map_err(|_| ScalarConvertError {
-                    value: s.as_str_lossy().into_owned(),
-                    target: "u64",
-                })?
+            // pvxs `parseTo<uint64_t>` = `std::stoull(s,&idx,0)`: base-0 radix.
+            // Reuse the CA path's C-radix unsigned parser (keeps the full
+            // 64-bit range and `strtoul` sign-wrap behavior).
+            EpicsValue::parse_uint(&s.as_str_lossy()).map_err(|_| ScalarConvertError {
+                value: s.as_str_lossy().into_owned(),
+                target: "u64",
+            })?
         }
     })
 }
@@ -687,6 +688,30 @@ mod tests {
         );
         assert_eq!(
             scalar_to_epics_typed(&ScalarValue::String("255".into()), DbFieldType::UInt64).unwrap(),
+            EpicsValue::UInt64(255)
+        );
+    }
+
+    /// pvxs `parseTo<int64_t/uint64_t>` use `stoll/stoull(s,&idx,0)` — base-0,
+    /// so a `0x` hex or leading-`0` octal string PUT converts (`pvput PV
+    /// "0x1F"` → 31). The bridge previously parsed base-10 only and rejected
+    /// these, while the CA sibling already did C-radix.
+    #[test]
+    fn string_to_numeric_put_accepts_c_radix() {
+        // Hex into a signed width (Long routes through scalar_to_i64).
+        assert_eq!(
+            scalar_to_epics_typed(&ScalarValue::String("0x1F".into()), DbFieldType::Long).unwrap(),
+            EpicsValue::Long(31)
+        );
+        // Leading-zero octal.
+        assert_eq!(
+            scalar_to_epics_typed(&ScalarValue::String("017".into()), DbFieldType::Int64).unwrap(),
+            EpicsValue::Int64(15)
+        );
+        // Hex into the full-range unsigned path (UInt64 → scalar_to_u64).
+        assert_eq!(
+            scalar_to_epics_typed(&ScalarValue::String("0xFF".into()), DbFieldType::UInt64)
+                .unwrap(),
             EpicsValue::UInt64(255)
         );
     }

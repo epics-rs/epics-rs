@@ -600,6 +600,24 @@ static SN_FIELD_NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
         .collect()
 });
 
+/// The scaler's value-change posts all use a literal `DBE_VALUE` in C
+/// (scalerRecord.c:316/322/329/334/372/425/427/430/478/530/582/588) —
+/// `DBE_LOG` appears only in the idle `monitor()` sweep (line 771,
+/// [`SN_FIELD_NAMES`]). The six scalar fields (always) plus the active
+/// `S1..Snch` channels are returned from `value_only_change_fields` so
+/// the framework strips the LOG bit from their change posts. The fixed
+/// names precede the `S1..S64` names contiguously so the slice
+/// `[0 .. 6 + nch]` yields the six scalars + active channels without a
+/// per-call allocation.
+static VALUE_ONLY_FIELD_NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    let mut v: Vec<&'static str> = vec!["CNT", "T", "VAL", "PR1", "TP", "FREQ"];
+    v.extend(SN_FIELD_NAMES.iter().copied());
+    v
+});
+
+/// Count of fixed scalar fields at the head of [`VALUE_ONLY_FIELD_NAMES`].
+const VALUE_ONLY_FIXED_COUNT: usize = 6;
+
 impl Record for ScalerRecord {
     fn record_type(&self) -> &'static str {
         "scaler"
@@ -1128,6 +1146,29 @@ impl Record for ScalerRecord {
             unsafe { std::slice::from_raw_parts(names.as_ptr(), self.active_channels()) }
         } else {
             &[]
+        }
+    }
+
+    /// C `scalerRecord.c` posts CNT/T/VAL/PR1/TP/FREQ and each active
+    /// channel `S1..Snch` with a literal `DBE_VALUE` on a value change
+    /// (scalerRecord.c:316/322/329/334/372/425/427/430/478/530/582/588) —
+    /// `DBE_LOG` is reserved for the idle sweep ([`Self::log_swept_fields`],
+    /// line 771). Returning these here makes the framework strip the LOG
+    /// bit from their change posts (and from `VAL`'s deadband post), so a
+    /// `DBE_LOG`-only subscriber sees `Sn` only on the idle sweep — never
+    /// on a counting-cycle value change, matching C. Unlike the idle-only
+    /// `log_swept_fields`, this set is state-independent: the six scalar
+    /// posts are always `DBE_VALUE`. Slicing the contiguous static to
+    /// `VALUE_ONLY_FIXED_COUNT + nch` avoids a per-call allocation (same
+    /// `'static` re-view as `log_swept_fields`; the `LazyLock` lives for
+    /// the program and `active_channels() <= SN_FIELD_NAMES.len()`).
+    fn value_only_change_fields(&self) -> &'static [&'static str] {
+        let names: &Vec<&'static str> = &VALUE_ONLY_FIELD_NAMES;
+        unsafe {
+            std::slice::from_raw_parts(
+                names.as_ptr(),
+                VALUE_ONLY_FIXED_COUNT + self.active_channels(),
+            )
         }
     }
 

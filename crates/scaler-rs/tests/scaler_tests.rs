@@ -333,6 +333,42 @@ fn test_log_swept_fields_idle_active_channels_only() {
     assert_eq!(rec.log_swept_fields().len(), MAX_SCALER_CHANNELS);
 }
 
+// C `scalerRecord.c` posts CNT/T/VAL/PR1/TP/FREQ and each active channel
+// S1..Snch with a literal `DBE_VALUE` on a value change
+// (scalerRecord.c:316/322/329/334/372/425/427/430/478/530/582/588); the
+// only `DBE_LOG` post is the idle `monitor()` sweep (line 771). The record
+// advertises that value-only set as the six scalar fields (always) plus
+// the active channels — state-independent, unlike the idle-only log sweep.
+#[test]
+fn test_value_only_change_fields_scalars_plus_active_channels() {
+    let mut rec = ScalerRecord::default();
+    rec.nch = 3;
+
+    // Counting, waiting, or idle: the value-only set is identical (the six
+    // scalar posts are always DBE_VALUE in C, not gated on the state).
+    for ss in [0i16, 1, 2] {
+        rec.ss = ss;
+        assert_eq!(
+            rec.value_only_change_fields(),
+            &["CNT", "T", "VAL", "PR1", "TP", "FREQ", "S1", "S2", "S3"]
+        );
+    }
+
+    // Zero active channels → just the six fixed scalar fields.
+    rec.nch = 0;
+    assert_eq!(
+        rec.value_only_change_fields(),
+        &["CNT", "T", "VAL", "PR1", "TP", "FREQ"]
+    );
+
+    // nch clamped to the channel cap; never out of bounds.
+    rec.nch = (MAX_SCALER_CHANNELS as i16) + 5;
+    assert_eq!(
+        rec.value_only_change_fields().len(),
+        6 + MAX_SCALER_CHANNELS
+    );
+}
+
 #[test]
 fn test_count_start_via_special() {
     let mut rec = ScalerRecord::default();

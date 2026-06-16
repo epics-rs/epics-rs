@@ -668,10 +668,14 @@ pub trait Record: Send + Sync + 'static {
     /// Distinct from [`Self::force_posted_fields`], which posts with
     /// `DBE_VALUE | DBE_LOG`: these post with `DBE_LOG` alone, so only a
     /// `DBE_LOG` (archiver) subscriber receives the unchanged-value
-    /// event. A field that ALSO changed this cycle is already delivered
-    /// by the change-detection post (`DBE_VALUE | DBE_LOG`, which carries
-    /// the LOG bit), so the framework does not double-post it — the LOG
-    /// sweep lands only for the fields that did not change.
+    /// event. The LOG sweep lands only for fields that did not change
+    /// this cycle (the change/no-change branches are disjoint), so a
+    /// field that also changed is not double-posted. For a field that is
+    /// ALSO a [`Self::value_only_change_fields`] member the change post
+    /// carries `DBE_VALUE` only, so this idle sweep is the sole source of
+    /// its `DBE_LOG` events — which is exactly C's split (counting cycle
+    /// → `DBE_VALUE`, idle `monitor()` → `DBE_LOG`); the scaler never
+    /// changes `Sn` on an idle cycle, so the two never collide.
     ///
     /// C `scalerRecord.c` `monitor()` (scalerRecord.c:770-787) runs on
     /// every IDLE process and posts each active channel `S1..Snch` with a
@@ -683,6 +687,33 @@ pub trait Record: Send + Sync + 'static {
     ///
     /// Default: empty — most record types have no LOG-only sweep.
     fn log_swept_fields(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Fields whose change-detected monitor post must carry `DBE_VALUE`
+    /// only — the LOG bit is stripped — instead of the framework default
+    /// `DBE_VALUE | DBE_LOG`.
+    ///
+    /// The generic change-detection post (and the deadband post for a
+    /// deadband field named here) normally bundles `DBE_LOG` so an
+    /// archiver subscribed `DBE_LOG` sees every value change. A record
+    /// whose C `db_post_events` calls pass a literal `DBE_VALUE` for
+    /// these fields names them here so the framework drops the LOG bit;
+    /// the cycle's alarm bits are still OR'd in (alarm posting is a
+    /// separate per-field contract, unaffected by this hook).
+    ///
+    /// C `scalerRecord.c` posts CNT/T/VAL/PR1/TP/FREQ and each active
+    /// channel `S1..Snch` with a literal `DBE_VALUE` on a value change
+    /// (scalerRecord.c:372,478,582,588 et al.); `DBE_LOG` appears ONLY in
+    /// the idle `monitor()` sweep ([`Self::log_swept_fields`],
+    /// scalerRecord.c:771). The two hooks are complementary: a `DBE_LOG`
+    /// subscriber on `Sn` is served by the idle sweep, never by a
+    /// counting-cycle value change — matching C.
+    ///
+    /// Default: empty — most record types post changes with
+    /// `DBE_VALUE | DBE_LOG` (C `monitor_mask | DBE_VALUE | DBE_LOG`,
+    /// calcRecord.c:420, subRecord.c:400).
+    fn value_only_change_fields(&self) -> &'static [&'static str] {
         &[]
     }
 

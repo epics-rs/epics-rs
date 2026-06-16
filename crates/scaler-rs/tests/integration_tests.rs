@@ -376,6 +376,102 @@ async fn test_count_start_posts_pr1_tp_freq_monitor_events() {
     }
 }
 
+/// Value-change monitor-mask regression — C `scalerRecord.c` posts
+/// CNT/T/VAL/PR1/TP/FREQ and each active channel with a literal
+/// `DBE_VALUE` on a value change
+/// (scalerRecord.c:430 for FREQ); `DBE_LOG` appears ONLY in the idle
+/// `monitor()` sweep (line 771). A value-change FREQ post must therefore
+/// carry `DBE_VALUE` with the LOG bit stripped — so a `DBE_LOG`-only
+/// subscriber gets no event on a counting change, while a `DBE_VALUE`
+/// subscriber does. Pre-fix the framework posted every changed field
+/// `DBE_VALUE | DBE_LOG`, so the LOG-only subscriber wrongly fired.
+#[tokio::test]
+async fn test_value_change_post_is_value_only_no_log_bit() {
+    let db = PvDatabase::new();
+    db.add_record("TEST:SCVO", Box::new(ScalerRecord::default()))
+        .await
+        .unwrap();
+
+    {
+        let rec = db.get_record("TEST:SCVO").await.unwrap();
+        let mut inst = rec.write().await;
+        let mut support = ScalerAsynDeviceSupport::new(Box::new(QuantizingDriver));
+        support.init(&mut *inst.record).unwrap(); // nch <- 8
+        let scaler = inst
+            .record
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<ScalerRecord>())
+            .unwrap();
+        scaler.freq = 1e7;
+        scaler.tp = 1.0;
+        scaler.init_record(1).unwrap();
+        inst.device = Some(Box::new(support));
+    }
+
+    // Two subscribers on the SAME value-only field (FREQ): one that
+    // accepts DBE_VALUE|DBE_LOG (so it always receives, and reports the
+    // posted mask), and one that accepts DBE_LOG ONLY (the boundary —
+    // it must NOT fire on a value change).
+    let (mut freq_vallog_rx, mut freq_logonly_rx) = {
+        let rec = db.get_record("TEST:SCVO").await.unwrap();
+        let mut inst = rec.write().await;
+        let vallog = inst
+            .add_subscriber(
+                "FREQ",
+                1,
+                DbFieldType::Double,
+                (EventMask::VALUE | EventMask::LOG).bits(),
+            )
+            .expect("FREQ VALUE|LOG subscription accepted");
+        let logonly = inst
+            .add_subscriber("FREQ", 2, DbFieldType::Double, EventMask::LOG.bits())
+            .expect("FREQ LOG-only subscription accepted");
+        (vallog, logonly)
+    };
+
+    {
+        let rec = db.get_record("TEST:SCVO").await.unwrap();
+        let mut inst = rec.write().await;
+        let scaler = inst
+            .record
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<ScalerRecord>())
+            .unwrap();
+        scaler.cnt = 1;
+        scaler.special("CNT", true).unwrap();
+    }
+
+    let mut visited = std::collections::HashSet::new();
+    db.process_record_with_links("TEST:SCVO", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // The VALUE|LOG subscriber receives the FREQ change; its posted mask
+    // carries DBE_VALUE but NOT DBE_LOG (the LOG bit is stripped).
+    let evt = freq_vallog_rx.try_recv().expect(
+        "FREQ change must reach a DBE_VALUE subscriber after the driver adopted its clock (C:430)",
+    );
+    assert!(
+        evt.mask.contains(EventMask::VALUE),
+        "FREQ post must carry DBE_VALUE, got {:?}",
+        evt.mask
+    );
+    assert!(
+        !evt.mask.contains(EventMask::LOG),
+        "FREQ value-change post must NOT carry DBE_LOG (C posts a literal DBE_VALUE, \
+         scalerRecord.c:430); got {:?}",
+        evt.mask
+    );
+
+    // The DBE_LOG-only subscriber must see nothing — the value-change post
+    // no longer intersects its mask. (Pre-fix it fired on every change.)
+    assert!(
+        freq_logonly_rx.try_recv().is_err(),
+        "a DBE_LOG-only subscriber must NOT receive a scaler value-change event \
+         (DBE_LOG is reserved for the idle monitor() sweep, scalerRecord.c:771)"
+    );
+}
+
 /// Bug 2 regression — C `scalerRecord.c:405-428`.
 ///
 /// `old_pr1` is captured at C `:406` BEFORE the `:409-410`

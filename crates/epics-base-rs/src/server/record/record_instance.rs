@@ -1959,12 +1959,20 @@ impl RecordInstance {
         // RBV — C motor `monitor()`, motorRecord.cc:3468-3507) leaves
         // VAL to the generic change-detection loop below.
         let deadband_field = self.record.monitor_deadband_field();
+        // Fields whose change post carries DBE_VALUE only (LOG stripped) —
+        // C `db_post_events(field, DBE_VALUE)` literal (e.g. scaler VAL,
+        // scalerRecord.c:478). Consulted in the deadband post here and the
+        // generic change loop below.
+        let value_only = self.record.value_only_change_fields();
         let deadband_mask = {
             let mut m = alarm_bits;
             if include_val {
                 m |= EventMask::VALUE;
             }
-            if include_archive {
+            // A value-only field's archive (ADEL) LOG bit is dropped — C
+            // posts it with a literal DBE_VALUE on a value change, never
+            // DBE_LOG (the LOG sweep is the idle `monitor()` path).
+            if include_archive && !value_only.contains(&deadband_field) {
                 m |= EventMask::LOG;
             }
             m
@@ -2071,7 +2079,16 @@ impl RecordInstance {
                         None => true,
                     };
                     if changed {
-                        sub_updates.push((field.clone(), val, aux_mask));
+                        // A value-only field posts DBE_VALUE (+ this
+                        // cycle's alarm bits) without the LOG bit —
+                        // `aux_mask` minus LOG is exactly
+                        // `alarm_bits | DBE_VALUE`.
+                        let mask = if value_only.contains(&field.as_str()) {
+                            alarm_bits | EventMask::VALUE
+                        } else {
+                            aux_mask
+                        };
+                        sub_updates.push((field.clone(), val, mask));
                     } else if force_fields.contains(&field.as_str()) {
                         // C `monitor()` posts a re-marked field with
                         // `monitor_mask | DBE_VAL_LOG` even when unchanged.
@@ -2081,10 +2098,12 @@ impl RecordInstance {
                     } else if log_swept.contains(&field.as_str()) {
                         // C scalerRecord.c:770-787 `monitor()`: every idle
                         // process re-posts each S1..Snch with a literal
-                        // DBE_LOG regardless of change. A changed field is
-                        // already delivered above with DBE_VALUE|DBE_LOG
-                        // (covering the LOG subscriber), so only the
-                        // unchanged sweep lands here — no double post.
+                        // DBE_LOG regardless of change. A value-only field
+                        // (e.g. Sn) posts DBE_VALUE only on a counting
+                        // change, so the DBE_LOG subscriber is served here
+                        // by the idle sweep — and Sn does not change on an
+                        // idle cycle, so changed/unchanged stay disjoint
+                        // (no double post).
                         sub_updates.push((field.clone(), val, EventMask::LOG));
                     }
                 }

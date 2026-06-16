@@ -789,6 +789,16 @@ pub trait Record: Send + Sync + 'static {
     /// [`Record::set_process_context`]). Default: ignore.
     fn set_resolved_input_links(&mut self, _resolved: &[&'static str]) {}
 
+    /// Report that a record which gates its value update on a *selected*
+    /// input read (currently sel in `Specified` mode) had that gating
+    /// fetch fail this cycle. C `selRecord.c::process` (line 114) runs
+    /// `do_sel` only when `fetch_values` succeeds; on failure VAL/UDF
+    /// freeze. `failed == true` ⇒ the configured selected input or NVL
+    /// link did not resolve, so `process()` must hold the previous output.
+    /// Default: ignore (records with no fetch gate). Same framework-set
+    /// hook pattern as [`Record::set_resolved_input_links`].
+    fn set_fetch_gate_failed(&mut self, _failed: bool) {}
+
     /// Called before/after a field put for side-effect processing.
     fn special(&mut self, _field: &str, _after: bool) -> CaResult<()> {
         Ok(())

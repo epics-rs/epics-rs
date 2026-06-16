@@ -59,6 +59,14 @@ pub struct SelRecord {
     /// True when `do_sel` detected an out-of-range SELN in Specified
     /// mode — raises `SOFT_ALARM/INVALID` in `check_alarms`.
     soft_alarm: bool,
+    /// Set by the framework (`set_fetch_gate_failed`) when the
+    /// Specified-mode selected input or NVL link was configured but did
+    /// not resolve this cycle. C `selRecord.c::process` (line 114) runs
+    /// `do_sel` only when `fetch_values` succeeds, so on failure VAL/UDF
+    /// must freeze. Consumed (reset to false) each `process()` so the
+    /// by-name dispatch path — which never reports a fetch outcome —
+    /// never freezes spuriously.
+    fetch_gate_failed: bool,
 }
 
 impl Default for SelRecord {
@@ -104,6 +112,7 @@ impl Default for SelRecord {
             hyst: 0.0,
             lalm: 0.0,
             soft_alarm: false,
+            fetch_gate_failed: false,
         }
     }
 }
@@ -322,6 +331,12 @@ impl Record for SelRecord {
     /// no valid input exists or the selected input is undefined.
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         self.soft_alarm = false;
+        // C `selRecord.c::process` (114) runs `do_sel` only when
+        // `fetch_values` succeeds. The framework reports a Specified-mode
+        // fetch failure here; consume it as a one-shot so the by-name
+        // path (no fetch report) never freezes.
+        let fetch_gate_failed = self.fetch_gate_failed;
+        self.fetch_gate_failed = false;
         let vals = self.get_values();
         match self.selm {
             0 => {
@@ -329,12 +344,22 @@ impl Record for SelRecord {
                 // SOFT_ALARM/INVALID and returns (VAL unchanged) when
                 // SELN >= SEL_MAX. SELN is `DBF_USHORT` (u16), so an
                 // out-of-range client value lands as a large index.
-                let idx = self.seln as usize;
-                if idx >= SEL_MAX {
-                    self.soft_alarm = true;
+                if fetch_gate_failed {
+                    // C `fetch_values` returned failure (configured
+                    // selected input or NVL link did not resolve): do_sel
+                    // is skipped, so VAL — and UDF, which derives from VAL
+                    // — freeze at the previous cycle's value. An *empty*
+                    // selected link is not a failure (C `dbGetLink` on an
+                    // unset link returns success), so the framework leaves
+                    // this flag clear and the NaN branch below runs.
                 } else {
-                    // C: `prec->val = val;` then `udf = isnan(val)`.
-                    self.val = vals[idx];
+                    let idx = self.seln as usize;
+                    if idx >= SEL_MAX {
+                        self.soft_alarm = true;
+                    } else {
+                        // C: `prec->val = val;` then `udf = isnan(val)`.
+                        self.val = vals[idx];
+                    }
                 }
             }
             1 => {
@@ -698,5 +723,17 @@ impl Record for SelRecord {
         } else {
             None
         }
+    }
+
+    /// C `selRecord.c::process` (line 114) gates `do_sel` on
+    /// `fetch_values` success. The framework reports here whether the
+    /// Specified-mode selected input / NVL link was configured but failed
+    /// to resolve this cycle; `process()` consumes the flag and freezes
+    /// VAL/UDF on failure. High/Low/Median never set it (those modes read
+    /// every input and skip NaNs, so a single broken link does not gate —
+    /// C's "freeze when the *last* link fails" is a reference-side quirk
+    /// of its overwritten `status`, not replicated here).
+    fn set_fetch_gate_failed(&mut self, failed: bool) {
+        self.fetch_gate_failed = failed;
     }
 }

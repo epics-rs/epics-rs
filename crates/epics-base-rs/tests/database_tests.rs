@@ -7473,3 +7473,105 @@ async fn sel_high_mode_fetches_all_inputs() {
         other => panic!("expected Double(42.0), got {other:?}"),
     }
 }
+
+// C `selRecord.c::process` (114) runs `do_sel` only when `fetch_values`
+// succeeds. In Specified mode a configured selected input that fails to
+// resolve (here INPA points at a non-existent record) is a fetch
+// failure, so do_sel is skipped and VAL — set to 5.0 on a prior cycle —
+// freezes. Pre-fix do_sel ran over the NaN-initialised A field and VAL
+// became NaN.
+#[tokio::test]
+async fn sel_specified_mode_freezes_value_when_selected_link_fails() {
+    use epics_base_rs::server::records::sel::SelRecord;
+
+    let db = PvDatabase::new();
+    let mut sel = SelRecord::default();
+    sel.selm = 0;
+    sel.seln = 0; // selects INPA
+    sel.val = 5.0; // value computed on a previous cycle
+    sel.inpa = "NO_SUCH_PV".to_string();
+    db.add_record("R8_SEL", Box::new(sel)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("R8_SEL", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let val = db.get_pv("R8_SEL").await.unwrap();
+    match val {
+        EpicsValue::Double(v) => assert!(
+            (v - 5.0).abs() < 1e-10,
+            "broken selected link must freeze VAL at 5.0 (C skips do_sel), got {v}"
+        ),
+        other => panic!("expected Double(5.0), got {other:?}"),
+    }
+}
+
+// Specified-mode NVL failure also gates: C `fetch_values` returns the
+// failed NVL read status BEFORE fetching any input, so do_sel is
+// skipped. Here NVL points at a non-existent record while INPA holds a
+// valid source (3.0). Pre-fix Rust fell back to the stale SELN, fetched
+// INPA, and recomputed VAL=3.0; post-fix VAL freezes at 7.0.
+#[tokio::test]
+async fn sel_specified_mode_freezes_value_when_nvl_link_fails() {
+    use epics_base_rs::server::records::sel::SelRecord;
+
+    let db = PvDatabase::new();
+    db.add_record("R8N_SRC", Box::new(AoRecord::new(3.0)))
+        .await
+        .unwrap();
+
+    let mut sel = SelRecord::default();
+    sel.selm = 0;
+    sel.seln = 0;
+    sel.val = 7.0;
+    sel.nvl = "NO_SUCH_NVL".to_string();
+    sel.inpa = "R8N_SRC".to_string();
+    db.add_record("R8N_SEL", Box::new(sel)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("R8N_SEL", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let val = db.get_pv("R8N_SEL").await.unwrap();
+    match val {
+        EpicsValue::Double(v) => assert!(
+            (v - 7.0).abs() < 1e-10,
+            "broken NVL link must freeze VAL at 7.0 (C skips do_sel), got {v}"
+        ),
+        other => panic!("expected Double(7.0), got {other:?}"),
+    }
+}
+
+// Control: an *empty* selected link is NOT a fetch failure. C
+// `dbGetLink` on an unset constant link returns success, so do_sel runs
+// and reads the NaN-initialised A field → VAL=NaN. This must NOT freeze
+// (contrast the broken-link case), proving the gate keys on
+// configured-but-unresolved, not merely unresolved.
+#[tokio::test]
+async fn sel_specified_mode_empty_selected_link_computes_nan_not_frozen() {
+    use epics_base_rs::server::records::sel::SelRecord;
+
+    let db = PvDatabase::new();
+    let mut sel = SelRecord::default();
+    sel.selm = 0;
+    sel.seln = 0;
+    sel.val = 5.0;
+    // inpa stays empty (unset link)
+    db.add_record("R8_SEL_EMPTY", Box::new(sel)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("R8_SEL_EMPTY", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let val = db.get_pv("R8_SEL_EMPTY").await.unwrap();
+    match val {
+        EpicsValue::Double(v) => assert!(
+            v.is_nan(),
+            "empty selected link still runs do_sel over the NaN input → VAL=NaN, got {v}"
+        ),
+        other => panic!("expected Double(NaN), got {other:?}"),
+    }
+}

@@ -135,6 +135,29 @@ record(calc, "REG:K:CALC") {
     field(CALC, "A")
 }
 
+#### Family N — MS-class link propagates alarm severity ####################
+# A reader whose input link carries the MS (maximize-severity) modifier must
+# inherit the SOURCE record's severity (recGblInheritSevrMsg), not just its
+# value. When N:SRC violates HIHI and goes MAJOR, processing N:READER folds its
+# MS input link and raises READER to MAJOR even though READER has no limits of
+# its own; clearing SRC drops READER back to NO_ALARM. Distinct from Family G,
+# which raises severity from the record's OWN limit violation. (The test forces
+# READER with a .PROC write so the pin does not depend on CP auto-reprocessing,
+# which the lightweight IocBuilder boot path does not wire.)
+record(ai, "REG:N:SRC") {
+    field(DESC, "MS-link severity source")
+    field(VAL,  "0")
+    field(HIHI, "90")
+    field(HHSV, "MAJOR")
+    field(HYST, "0")
+}
+record(calc, "REG:N:READER") {
+    field(DESC, "MS-link severity reader")
+    field(SCAN, "Passive")
+    field(INPA, "REG:N:SRC MS")
+    field(CALC, "A")
+}
+
 #### Family D — motor record moves on a caput to VAL (SCAN=Passive) #########
 # The v0.20.0 regression: a caput to a SCAN=Passive motor's VAL did not move
 # it (the I/O-Intr-vs-Passive dbPutField processing gate). Pins "caput to a

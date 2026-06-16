@@ -14,6 +14,7 @@
 //!   H — timestamp advances on each process
 //!   I — monitor event-MASK routing (MDEL/ADEL → DBE_VALUE/DBE_LOG class)
 //!   K — .PROC=0 forces a process; put-callback waits for completion
+//!   N — MS-class link propagates the source record's alarm severity
 
 use std::time::Duration;
 
@@ -461,4 +462,52 @@ async fn k_proc_zero_forces_process_and_put_completes() {
         "PROC=0 must force a process and the put-callback must complete it \
          before returning; immediate caget got {after:?}"
     );
+}
+
+// ---- Family N: MS-class link propagates alarm severity --------------------
+
+/// A reader whose input link carries `MS` must inherit the SOURCE record's
+/// severity (recGblInheritSevrMsg), not just its value. N:READER reads N:SRC
+/// through an `MS` link: when SRC violates HIHI and goes MAJOR, processing
+/// READER folds the link and raises it to MAJOR even though READER has no
+/// limits of its own; clearing SRC drops READER back to NO_ALARM. Distinct from
+/// Family G, which raises severity from the record's OWN limit violation. The
+/// reader is driven with a forced `.PROC` (the lightweight `IocBuilder` boot
+/// path used here does not wire CP auto-reprocessing).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn n_ms_link_propagates_source_severity() {
+    let ioc = RegressionIoc::boot().await.expect("boot");
+    let ca = ioc.ca_client().await;
+
+    let ch = ca.create_channel("REG:N:READER");
+    ch.wait_connected(Duration::from_secs(3))
+        .await
+        .expect("connect");
+    let mut mon = ch.subscribe().await.expect("subscribe");
+    let _init = recv_within(&mut mon, 1500).await;
+
+    // Drive SRC past HIHI=90 → SRC MAJOR, then process READER: its MS input link
+    // folds SRC's severity and raises READER to MAJOR (READER has no limits).
+    ca.caput("REG:N:SRC", "95").await.expect("caput SRC 95");
+    ca.caput("REG:N:READER.PROC", "0")
+        .await
+        .expect("process READER");
+    let hi = recv_until(&mut mon, 2000, |s| s.alarm.severity == 2)
+        .await
+        .expect("MS link must propagate SRC MAJOR severity into READER");
+    assert_eq!(
+        hi.alarm.severity, 2,
+        "READER must inherit SRC's MAJOR severity"
+    );
+
+    // Clear SRC and reprocess READER → MS folds NO_ALARM, READER drops back.
+    ca.caput("REG:N:SRC", "0").await.expect("caput SRC 0");
+    ca.caput("REG:N:READER.PROC", "0")
+        .await
+        .expect("reprocess READER");
+    let back = recv_until(&mut mon, 2000, |s| s.alarm.severity == 0)
+        .await
+        .expect("clearing SRC must drop READER back to NO_ALARM");
+    assert_eq!(back.alarm.severity, 0);
 }

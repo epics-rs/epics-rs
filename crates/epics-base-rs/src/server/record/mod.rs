@@ -18,7 +18,7 @@ pub use link::{
 };
 pub use menu_choices::{
     MENU_ALARM_SEVR, MENU_CONVERT, MENU_FTYPE, MENU_IVOA, MENU_OMSL, MENU_POST, MENU_PRIORITY,
-    MENU_SCAN, MENU_SIMM, MENU_YES_NO, shared_menu_choices,
+    MENU_SCAN, MENU_SIMM, MENU_YES_NO, resolve_menu_field_string, shared_menu_choices,
 };
 pub use record_instance::{NotifyWaitSet, RecordInstance};
 pub use record_trait::{

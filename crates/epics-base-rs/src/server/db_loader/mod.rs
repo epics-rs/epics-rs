@@ -970,12 +970,29 @@ pub fn apply_fields(
             .find(|f| f.name == upper_name.as_str());
 
         if let Some(desc) = field_desc {
-            let value = EpicsValue::parse(desc.dbf_type, value_str).map_err(|e| {
-                CaError::InvalidValue(format!(
-                    "field {upper_name} (type {:?}): cannot parse '{}': {e}",
-                    desc.dbf_type, value_str
-                ))
-            })?;
+            let dbf_type = desc.dbf_type;
+            // A `DBF_MENU` field's `.db` value resolves against THAT field's
+            // own menu (label-first, then a numeric index) — C dbStaticLib
+            // `dbPutStringNum`. Using the field's choices, not a cross-menu
+            // global table, is what keeps a menu-specific label from being
+            // dropped or mis-mapped (e.g. `field(SELM,"Specified")`).
+            let value = if let Some(choices) = record
+                .menu_field_choices(&upper_name)
+                .or_else(|| crate::server::record::shared_menu_choices(&upper_name))
+            {
+                crate::server::record::resolve_menu_field_string(choices, dbf_type, value_str)
+                    .ok_or_else(|| {
+                        CaError::InvalidValue(format!(
+                            "field {upper_name}: '{value_str}' is not a valid menu choice"
+                        ))
+                    })?
+            } else {
+                EpicsValue::parse(dbf_type, value_str).map_err(|e| {
+                    CaError::InvalidValue(format!(
+                        "field {upper_name} (type {dbf_type:?}): cannot parse '{value_str}': {e}"
+                    ))
+                })?
+            };
             record.put_field(&upper_name, value)?;
         } else {
             // Store as common field for RecordInstance to handle
@@ -1409,6 +1426,48 @@ mod tests {
             Some(EpicsValue::Double(v)) => assert!((v - 10.0).abs() < 1e-10), // min of finite values (A=10,B=30,C=20)
             other => panic!("expected near 0.0, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn db_load_menu_labels_resolve_against_field_menu() {
+        // A DBF_MENU field's `.db` value resolves against THAT field's own
+        // menu (C dbStaticLib dbPutStringNum: label-first, then a numeric
+        // index), not a cross-menu global table. Before the fix, the loader
+        // routed every menu label through one global table that mis-mapped
+        // menu-specific labels and dropped labels it did not carry.
+        use crate::server::record::Record;
+
+        let apply = |rt: &str, field: &str, value: &str| -> CaResult<Box<dyn Record>> {
+            let mut rec = create_record(rt).unwrap();
+            let mut common = Vec::new();
+            apply_fields(
+                &mut rec,
+                &[(field.to_string(), value.to_string())],
+                &mut common,
+            )?;
+            Ok(rec)
+        };
+
+        // sel.SELM (record-specific menu selSELM): "Specified" is index 0.
+        // The old global table returned 1 (from menuFanout's "Specified").
+        let rec = apply("sel", "SELM", "Specified").unwrap();
+        assert_eq!(rec.get_field("SELM"), Some(EpicsValue::Enum(0)));
+
+        // A later choice proves the whole menu, not just index 0.
+        let rec = apply("sel", "SELM", "High Signal").unwrap();
+        assert_eq!(rec.get_field("SELM"), Some(EpicsValue::Enum(1)));
+
+        // A bare numeric index still resolves (C epicsParseUInt16 fallback).
+        let rec = apply("sel", "SELM", "2").unwrap();
+        assert_eq!(rec.get_field("SELM"), Some(EpicsValue::Enum(2)));
+
+        // ai.LINR (shared menu menuConvert, SHORT-typed): "LINEAR" is index 2.
+        // The old global table lacked menuConvert, so the load errored.
+        let rec = apply("ai", "LINR", "LINEAR").unwrap();
+        assert_eq!(rec.get_field("LINR"), Some(EpicsValue::Short(2)));
+
+        // An unknown choice errors (C S_db_badChoice), never a silent mis-map.
+        assert!(apply("sel", "SELM", "Bogus").is_err());
     }
 
     #[test]

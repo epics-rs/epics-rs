@@ -35,6 +35,8 @@
 //! `.dbd` exactly: the index↔string mapping is wire-visible to clients.
 //! Each table cites its source.
 
+use crate::types::{DbFieldType, EpicsValue};
+
 /// `menu(menuAlarmSevr)` — `menuAlarmSevr.dbd.pod:21-24`.
 pub const MENU_ALARM_SEVR: &[&str] = &["NO_ALARM", "MINOR", "MAJOR", "INVALID"];
 
@@ -143,6 +145,53 @@ pub fn shared_menu_choices(field: &str) -> Option<&'static [&'static str]> {
         // Record scan priority (`menuPriority`).
         "PRIO" => Some(MENU_PRIORITY),
         _ => None,
+    }
+}
+
+/// Resolve a `DBF_MENU` field's textual value — a `.db` field directive or a
+/// `DBR_STRING` write — against THAT field's own choice table, exactly like C
+/// `dbStaticLib` `dbPutStringNum` and `dbConvert` `putStringMenu`: an exact,
+/// case-sensitive label match first (`dbGetMenuIndexFromString`'s `strcmp`),
+/// then a bare numeric index (`epicsParseUInt16`). The resolved index is typed
+/// to the field's stored `dbf_type` so it lands in the record's `put_field`
+/// without a second coercion.
+///
+/// Returns `None` when the text is neither a known label nor a numeric index —
+/// the caller then reports the C `S_db_badChoice` error rather than guessing.
+/// A menu label is menu-*specific*, so resolution MUST use the field's own
+/// `choices` (this function's argument), never a cross-menu global table: the
+/// same label can name different indices in different menus (e.g. "Specified"
+/// is index 1 of `menuFanout` but index 0 of `selSELM`).
+pub fn resolve_menu_field_string(
+    choices: &[&str],
+    dbf_type: DbFieldType,
+    s: &str,
+) -> Option<EpicsValue> {
+    let trimmed = s.trim();
+    let index = match choices.iter().position(|c| *c == trimmed) {
+        Some(i) => i as i64,
+        None => trimmed.parse::<i64>().ok()?,
+    };
+    Some(menu_index_value(dbf_type, index))
+}
+
+/// Type a resolved menu index to the field's stored `dbf_type`. A `DBF_MENU`
+/// field stores its `epicsEnum16` index as `Enum` (e.g. `sel.SELM`) or `Short`
+/// (e.g. `ai.LINR`); the other integer widths are covered defensively.
+fn menu_index_value(dbf_type: DbFieldType, index: i64) -> EpicsValue {
+    match dbf_type {
+        DbFieldType::Enum => EpicsValue::Enum(index as u16),
+        DbFieldType::Short => EpicsValue::Short(index as i16),
+        DbFieldType::UShort => EpicsValue::UShort(index as u16),
+        DbFieldType::Char => EpicsValue::Char(index as u8),
+        DbFieldType::Long => EpicsValue::Long(index as i32),
+        DbFieldType::ULong => EpicsValue::ULong(index as u32),
+        DbFieldType::Int64 => EpicsValue::Int64(index),
+        DbFieldType::UInt64 => EpicsValue::UInt64(index as u64),
+        // A menu field is always one of the integer widths above; an
+        // unexpected type means the caller mis-classified the field, so emit
+        // the index as `Short` and let `put_field` reject a true mismatch.
+        _ => EpicsValue::Short(index as i16),
     }
 }
 

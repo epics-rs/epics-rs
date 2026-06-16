@@ -5546,20 +5546,19 @@ mod tests {
     }
 
     #[test]
-    fn test_direct_chunk_write_bslz4_records_chunked_dataset() {
+    fn test_direct_chunk_write_bslz4_roundtrips() {
         // `compress_bslz4` emits the canonical bitshuffle+LZ4 on-disk format
         // (byte-for-byte the libhdf5/h5py/C-areaDetector bytes — locked by
-        // codec::tests::test_bitshuffle_matches_c_reference_vector), and the
-        // direct chunk write stores those bytes verbatim with the 12-byte chunk
-        // header (covered by test_codec_chunk_bytes_bslz4_header). Pixels cannot
-        // round-trip *here* because rust-hdf5's bitshuffle reverse filter uses a
-        // non-canonical (MSB-first) bit order and decodes canonical bytes to
-        // garbage; a real h5py/C reader recovers the frame. So verify the
-        // dataset is created with the correct original type/shape and chunked
-        // (one whole frame per chunk), like the JPEG case below.
+        // codec::tests::test_bitshuffle_matches_c_reference_vector), stored
+        // verbatim with the 12-byte chunk header (test_codec_chunk_bytes_bslz4_header).
+        // rust-hdf5 0.2.21's bitshuffle reverse filter is canonical (LSB-first),
+        // so it reads those bytes back to the original pixels. Use a whole-block
+        // frame: u16 blocks are 4096 elems, so 128*128 = 16384 = 4 full blocks
+        // with no partial tail.
         let path = temp_path("hdf5_dcw_bslz4");
         let mut writer = Hdf5Writer::new();
         let orig = ramp_u16(128, 128);
+        let expect = u16_pixels(&orig);
         let comp = crate::codec::compress_bslz4(&orig);
         assert_eq!(comp.codec.as_ref().unwrap().name, CodecName::BSLZ4);
         writer.open_file(&path, NDFileMode::Single, &comp).unwrap();
@@ -5571,6 +5570,8 @@ mod tests {
         assert_eq!(ds.shape(), vec![1, 128, 128]);
         assert!(ds.is_chunked());
         assert_eq!(ds.element_size(), 2, "dataset keeps the original u16 type");
+        let read = ds.read_raw::<u16>().unwrap();
+        assert_eq!(read, expect, "BSLZ4 direct-chunk-write must round-trip");
         std::fs::remove_file(&path).ok();
     }
 

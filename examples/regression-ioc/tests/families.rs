@@ -16,6 +16,7 @@
 //!   K — .PROC=0 forces a process; put-callback waits for completion
 //!   M — DBE_PROPERTY posts on a metadata-field change (not DBE_VALUE)
 //!   N — MS-class link propagates the source record's alarm severity
+//!   O — a seeded record suppresses a duplicate first-cycle/idempotent post
 
 use std::time::Duration;
 
@@ -568,5 +569,53 @@ async fn m_metadata_change_posts_dbe_property() {
         leaked.is_none(),
         "a property change must not post DBE_VALUE; a DBE_VALUE subscriber must \
          not receive it, got {leaked:?}"
+    );
+}
+
+// ---- Family O: seeded record suppresses a duplicate post ------------------
+
+/// An integer record seeded nonzero must NOT post a spurious duplicate VAL
+/// monitor when it processes an UNCHANGED value: C seeds MLST/ALST to VAL at
+/// init, so the first/idempotent process detects "no change". A real change
+/// (MDEL=0) still posts. Distinct from Family B, which suppresses a *no-op
+/// caput* (write-path no-change); this is the PROCESS-path no-change on a
+/// seeded longout — the recurring MLST/ALST-sentinel family.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn o_seeded_record_suppresses_duplicate_post() {
+    let ioc = RegressionIoc::boot().await.expect("boot");
+    let ca = ioc.ca_client().await;
+
+    let ch = ca.create_channel("REG:O:LO");
+    ch.wait_connected(Duration::from_secs(3))
+        .await
+        .expect("connect");
+    let mut mon = ch.subscribe().await.expect("subscribe");
+
+    // The initial subscription event is the seeded VAL=7.
+    let init = recv_within(&mut mon, 1500).await.expect("initial");
+    assert!(
+        val_is(7.0)(&init),
+        "initial event must be the seeded VAL=7, got {:?}",
+        init.value
+    );
+
+    // Force a reprocess of the UNCHANGED value: MLST was seeded at init, so
+    // this idempotent process must NOT post (no spurious duplicate).
+    ca.caput("REG:O:LO.PROC", "0")
+        .await
+        .expect("force reprocess");
+    let dup = recv_within(&mut mon, 700).await;
+    assert!(
+        dup.is_none(),
+        "an idempotent reprocess of the seeded value must not post, got {dup:?}"
+    );
+
+    // A real change still posts (the monitor is alive, MDEL=0).
+    ca.caput("REG:O:LO", "8").await.expect("caput 8");
+    let changed = recv_until(&mut mon, 1500, val_is(8.0)).await;
+    assert!(
+        changed.is_some(),
+        "a real value change (7 -> 8) must still post"
     );
 }

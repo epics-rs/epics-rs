@@ -173,6 +173,20 @@ record(ai, "REG:M:AI") {
     field(PREC, "2")
 }
 
+#### Family O — seeded record suppresses a duplicate first-cycle post ######
+# An integer record seeded nonzero (here VAL=7, PINI) must NOT post a spurious
+# duplicate VAL monitor when it processes an UNCHANGED value: C seeds MLST/ALST
+# to VAL at init, so the first/idempotent process detects "no change". With
+# MDEL=0 a real change still posts. Distinct from Family B, which suppresses a
+# no-op caput (write-path no-change) — this is the PROCESS-path no-change on a
+# seeded longin/longout/int64 (the recurring MLST/ALST-sentinel family).
+record(longout, "REG:O:LO") {
+    field(DESC, "first-cycle / idempotent suppression")
+    field(VAL,  "7")
+    field(PINI, "YES")
+    field(MDEL, "0")
+}
+
 #### Family D — motor record moves on a caput to VAL (SCAN=Passive) #########
 # The v0.20.0 regression: a caput to a SCAN=Passive motor's VAL did not move
 # it (the I/O-Intr-vs-Passive dbPutField processing gate). Pins "caput to a

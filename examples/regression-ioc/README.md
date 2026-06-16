@@ -23,6 +23,7 @@ regression in the same family fails a test instead of shipping.
 | K | a `caput REC.PROC 0` forces a process (was a silent no-op for 0); put-with-callback returns only after processing completes | `REG:K:*` → `k_proc_zero_forces_process_and_put_completes` |
 | M | a metadata-field write (`HOPR`) posts `DBE_PROPERTY` to a `DBE_PROPERTY` subscriber but **not** to a `DBE_VALUE`-only one (the `DBE_PROPERTY` axis of Family I) | `REG:M:AI` → `m_metadata_change_posts_dbe_property` |
 | N | an `MS` (maximize-severity) input link propagates the **source** record's severity into the reader (`recGblInheritSevrMsg`), distinct from G's own-limit severity | `REG:N:*` → `n_ms_link_propagates_source_severity` |
+| O | a record seeded nonzero (MLST/ALST seeded at init) must not post a duplicate VAL on an idempotent reprocess; a real change still posts (process-path no-change, vs B's write-path) | `REG:O:LO` → `o_seeded_record_suppresses_duplicate_post` |
 
 Family C is pinned both by the periodic-scan test and by the motor's
 `io_intr_scan_independent` readback path (the actual v0.20.0 mechanism).

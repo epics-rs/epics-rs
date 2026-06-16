@@ -170,7 +170,13 @@ impl Default for SeqRecord {
             seln: 0,
             sell: String::new(),
             offs: 0,
-            shft: 0,
+            // C `seqRecord.dbd.pod:287` `field(SHFT,DBF_SHORT){ initial("-1") }`:
+            // unset SHFT defaults to -1, so SELM=Mask shifts SELN bits LEFT by
+            // 1 (`seln << 1`). The POD note: "If not set, the SHFT field is -1
+            // so bits from SELN are shifted left by 1." A 0 default fires the
+            // wrong links (e.g. SELN=1 would drive DOL0/LNK0 instead of
+            // DOL1/LNK1).
+            shft: -1,
             dly0: 0.0,
             dly1: 0.0,
             dly2: 0.0,
@@ -242,5 +248,24 @@ impl Default for SeqRecord {
 impl SeqRecord {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::database::{SelmKind, select_link_indices_ex};
+
+    /// C dbd `initial("-1")` parity (seqRecord.dbd.pod:287): an unset SHFT
+    /// defaults to -1, so SELM=Mask shifts SELN bits LEFT by 1. With the
+    /// previous 0 default, SELN=1 drove DOL0/LNK0; the dbd default drives
+    /// DOL1/LNK1.
+    #[test]
+    fn default_shft_is_minus_one_and_mask_shifts_left() {
+        let rec = SeqRecord::default();
+        assert_eq!(rec.shft, -1);
+        // SELM=Mask(2), SELN=1, default SHFT=-1 → mask = 1<<1 = 0b10 → slot 1.
+        let sel = select_link_indices_ex(SelmKind::FanoutSeq, 2, 1, rec.offs, rec.shft, 16);
+        assert_eq!(sel.indices, vec![1]);
     }
 }

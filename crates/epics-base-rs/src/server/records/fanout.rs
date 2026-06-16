@@ -90,7 +90,12 @@ impl Default for FanoutRecord {
             lnkf: String::new(),
             sell: String::new(),
             offs: 0,
-            shft: 0,
+            // C `fanoutRecord.dbd.pod:133` `field(SHFT,DBF_SHORT){ initial("-1") }`:
+            // when SHFT is not set in the .db file it defaults to -1, so in
+            // SELM=Mask the SELN bits shift LEFT by 1 (`seln << 1`). A 0
+            // default would instead leave SELN unshifted and fire the wrong
+            // forward links.
+            shft: -1,
         }
     }
 }
@@ -111,5 +116,23 @@ impl FanoutRecord {
         .filter(|s| !s.is_empty())
         .map(|s| s.as_str())
         .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::database::{SelmKind, select_link_indices_ex};
+
+    /// C dbd `initial("-1")` parity: an unset SHFT defaults to -1, so a
+    /// SELM=Mask selection shifts SELN bits LEFT by 1. With the previous 0
+    /// default, SELN=1 fired LNK0; the dbd default fires LNK1.
+    #[test]
+    fn default_shft_is_minus_one_and_mask_shifts_left() {
+        let rec = FanoutRecord::default();
+        assert_eq!(rec.shft, -1);
+        // SELM=Mask(2), SELN=1, default SHFT=-1 → mask = 1<<1 = 0b10 → LNK1.
+        let sel = select_link_indices_ex(SelmKind::FanoutSeq, 2, 1, rec.offs, rec.shft, 16);
+        assert_eq!(sel.indices, vec![1]);
     }
 }

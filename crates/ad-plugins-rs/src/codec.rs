@@ -444,123 +444,204 @@ pub fn decompress_lz4hdf5(src: &NDArray) -> Option<NDArray> {
 const BSHUF_TARGET_BLOCK_SIZE_B: usize = 8192;
 /// Block element count must be a multiple of this (`BSHUF_BLOCKED_MULT`).
 const BSHUF_BLOCKED_MULT: usize = 8;
+/// Recommended minimum block size in elements (`BSHUF_MIN_RECOMMEND_BLOCK`).
+const BSHUF_MIN_RECOMMEND_BLOCK: usize = 128;
 
 /// Default bitshuffle block size in elements for a given element size.
 ///
-/// Mirrors `bshuf_default_block_size`: `TARGET / elem_size` rounded down to a
-/// multiple of `BSHUF_BLOCKED_MULT`, with a floor of `BSHUF_BLOCKED_MULT`.
-fn bshuf_default_block_size(elem_size: usize) -> usize {
-    let mut bs = BSHUF_TARGET_BLOCK_SIZE_B / elem_size.max(1);
-    bs -= bs % BSHUF_BLOCKED_MULT;
-    bs.max(BSHUF_BLOCKED_MULT)
+/// Mirrors `bshuf_default_block_size` (bitshuffle_core.c:2009): `TARGET /
+/// elem_size` rounded down to a multiple of `BSHUF_BLOCKED_MULT`, floored at
+/// `BSHUF_MIN_RECOMMEND_BLOCK`. This value must stay stable across versions or
+/// previously-encoded streams become undecodable.
+pub(crate) fn bshuf_default_block_size(elem_size: usize) -> usize {
+    let bs = BSHUF_TARGET_BLOCK_SIZE_B / elem_size.max(1);
+    let bs = (bs / BSHUF_BLOCKED_MULT) * BSHUF_BLOCKED_MULT;
+    bs.max(BSHUF_MIN_RECOMMEND_BLOCK)
 }
 
-/// Byte transpose of a block: group byte position `b` of every element.
-///
-/// `out[b*n + e] = input[e*elem_size + b]` (library `bshuf_trans_byte_elem`).
-fn trans_byte_elem(input: &[u8], n: usize, elem_size: usize) -> Vec<u8> {
-    let mut out = vec![0u8; n * elem_size];
-    for e in 0..n {
-        for b in 0..elem_size {
-            out[b * n + e] = input[e * elem_size + b];
+/// 8x8 bit-matrix transpose of a quadword, little-endian convention
+/// (library macro `TRANS_BIT_8X8`, bitshuffle_core.c:110).
+#[inline]
+fn trans_bit_8x8(mut x: u64) -> u64 {
+    let t = (x ^ (x >> 7)) & 0x00AA_00AA_00AA_00AA;
+    x = x ^ t ^ (t << 7);
+    let t = (x ^ (x >> 14)) & 0x0000_CCCC_0000_CCCC;
+    x = x ^ t ^ (t << 14);
+    let t = (x ^ (x >> 28)) & 0x0000_0000_F0F0_F0F0;
+    x = x ^ t ^ (t << 28);
+    x
+}
+
+/// Read 8 bytes at `off` as a little-endian quadword.
+#[inline]
+fn read_u64_le(b: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(b[off..off + 8].try_into().unwrap())
+}
+
+/// Transpose bytes within elements (library `bshuf_trans_byte_elem_scal`,
+/// bitshuffle_core.c:166). `size` is a multiple of 8 for every shuffled block.
+fn bshuf_trans_byte_elem(input: &[u8], out: &mut [u8], size: usize, elem_size: usize) {
+    let mut ii = 0;
+    while ii + 7 < size {
+        for jj in 0..elem_size {
+            for kk in 0..8 {
+                out[jj * size + ii + kk] = input[ii * elem_size + kk * elem_size + jj];
+            }
+        }
+        ii += 8;
+    }
+    // Remainder (size % 8); never taken for a shuffled block but kept faithful.
+    let mut ii = size - size % 8;
+    while ii < size {
+        for jj in 0..elem_size {
+            out[jj * size + ii] = input[ii * elem_size + jj];
+        }
+        ii += 1;
+    }
+}
+
+/// Transpose bits within bytes (library `bshuf_trans_bit_byte_scal`,
+/// bitshuffle_core.c:205, little-endian path).
+fn bshuf_trans_bit_byte(input: &[u8], out: &mut [u8], size: usize, elem_size: usize) {
+    let nbyte = elem_size * size;
+    let nbyte_bitrow = nbyte / 8;
+    for ii in 0..nbyte_bitrow {
+        let mut x = trans_bit_8x8(read_u64_le(input, ii * 8));
+        for kk in 0..8 {
+            out[kk * nbyte_bitrow + ii] = x as u8;
+            x >>= 8;
         }
     }
+}
+
+/// Transpose rows of shuffled bits within groups of eight (library
+/// `bshuf_trans_bitrow_eight` -> `bshuf_trans_elem`, lda=8, ldb=elem_size).
+fn bshuf_trans_bitrow_eight(input: &[u8], out: &mut [u8], size: usize, elem_size: usize) {
+    let nbyte_bitrow = size / 8;
+    for ii in 0..8 {
+        for jj in 0..elem_size {
+            let src = (ii * elem_size + jj) * nbyte_bitrow;
+            let dst = (jj * 8 + ii) * nbyte_bitrow;
+            out[dst..dst + nbyte_bitrow].copy_from_slice(&input[src..src + nbyte_bitrow]);
+        }
+    }
+}
+
+/// Bit-transpose one block of `size` elements (a multiple of 8) — library
+/// `bshuf_trans_bit_elem_scal` (bitshuffle_core.c:280): byte transpose, then
+/// bit-within-byte transpose, then bit-row transpose.
+fn bshuf_trans_bit_elem(input: &[u8], size: usize, elem_size: usize) -> Vec<u8> {
+    debug_assert_eq!(size % 8, 0);
+    let nbyte = size * elem_size;
+    let mut a = vec![0u8; nbyte];
+    bshuf_trans_byte_elem(input, &mut a, size, elem_size);
+    let mut b = vec![0u8; nbyte];
+    bshuf_trans_bit_byte(&a, &mut b, size, elem_size);
+    let mut out = vec![0u8; nbyte];
+    bshuf_trans_bitrow_eight(&b, &mut out, size, elem_size);
     out
 }
 
-/// Inverse byte transpose: `out[e*elem_size + b] = input[b*n + e]`.
-fn untrans_byte_elem(input: &[u8], n: usize, elem_size: usize) -> Vec<u8> {
-    let mut out = vec![0u8; n * elem_size];
-    for e in 0..n {
-        for b in 0..elem_size {
-            out[e * elem_size + b] = input[b * n + e];
-        }
-    }
-    out
-}
-
-/// Bit-transpose one block of `n` elements of `elem_size` bytes.
-///
-/// `n` must be a multiple of 8. The block is byte-transposed, then the bit
-/// matrix (`nbits = elem_size*8` rows after this step? no — see below) is
-/// transposed: viewing the byte-transposed buffer as an `(n*elem_size)` x 8
-/// bit matrix, the 8 bit-planes are separated. This is the composition the
-/// reference `bshuf_trans_bit_elem` performs and is its own structural
-/// inverse-free transform paired with `untrans_bit_elem` below.
-fn trans_bit_elem_block(input: &[u8], n: usize, elem_size: usize) -> Vec<u8> {
-    debug_assert_eq!(n % 8, 0);
-    // Step 1: byte transpose.
-    let byte_t = trans_byte_elem(input, n, elem_size);
-    // Step 2: bit transpose of the byte-transposed buffer.
-    // View byte_t as nbytes bytes; transpose the bit matrix nbytes x 8 -> 8 x nbytes.
-    let nbytes = byte_t.len();
-    let mut out = vec![0u8; nbytes];
-    let out_row = nbytes / 8; // bytes per bit-plane
-    for byte_idx in 0..nbytes {
-        let v = byte_t[byte_idx];
-        for bit in 0..8 {
-            if (v >> bit) & 1 != 0 {
-                // Destination: bit-plane `bit`, position `byte_idx`.
-                let dst = bit * out_row + byte_idx / 8;
-                out[dst] |= 1 << (byte_idx % 8);
+/// Transpose bytes for data organized as one row per bit (library
+/// `bshuf_trans_byte_bitrow_scal`, bitshuffle_core.c:306).
+fn bshuf_trans_byte_bitrow(input: &[u8], out: &mut [u8], size: usize, elem_size: usize) {
+    let nbyte_row = size / 8;
+    for jj in 0..elem_size {
+        for ii in 0..nbyte_row {
+            for kk in 0..8 {
+                out[ii * 8 * elem_size + jj * 8 + kk] = input[(jj * 8 + kk) * nbyte_row + ii];
             }
         }
     }
+}
+
+/// Shuffle bits within the bytes of eight-element groups (library
+/// `bshuf_shuffle_bit_eightelem_scal`, bitshuffle_core.c:331, LE path).
+fn bshuf_shuffle_bit_eightelem(input: &[u8], out: &mut [u8], size: usize, elem_size: usize) {
+    let nbyte = elem_size * size;
+    let mut jj = 0;
+    while jj < 8 * elem_size {
+        let mut ii = 0;
+        while ii + 8 * elem_size - 1 < nbyte {
+            let mut x = trans_bit_8x8(read_u64_le(input, ii + jj));
+            for kk in 0..8 {
+                out[ii + jj / 8 + kk * elem_size] = x as u8;
+                x >>= 8;
+            }
+            ii += 8 * elem_size;
+        }
+        jj += 8;
+    }
+}
+
+/// Inverse of [`bshuf_trans_bit_elem`] — library `bshuf_untrans_bit_elem_scal`
+/// (bitshuffle_core.c:373).
+fn bshuf_untrans_bit_elem(input: &[u8], size: usize, elem_size: usize) -> Vec<u8> {
+    debug_assert_eq!(size % 8, 0);
+    let nbyte = size * elem_size;
+    let mut tmp = vec![0u8; nbyte];
+    bshuf_trans_byte_bitrow(input, &mut tmp, size, elem_size);
+    let mut out = vec![0u8; nbyte];
+    bshuf_shuffle_bit_eightelem(&tmp, &mut out, size, elem_size);
     out
 }
 
-/// Inverse of [`trans_bit_elem_block`].
-fn untrans_bit_elem_block(input: &[u8], n: usize, elem_size: usize) -> Vec<u8> {
-    debug_assert_eq!(n % 8, 0);
-    let nbytes = n * elem_size;
-    let out_row = nbytes / 8;
-    // Step 1: invert the bit transpose -> byte-transposed buffer.
-    let mut byte_t = vec![0u8; nbytes];
-    for byte_idx in 0..nbytes {
-        for bit in 0..8 {
-            let src = bit * out_row + byte_idx / 8;
-            if (input[src] >> (byte_idx % 8)) & 1 != 0 {
-                byte_t[byte_idx] |= 1 << bit;
-            }
-        }
-    }
-    // Step 2: invert the byte transpose.
-    untrans_byte_elem(&byte_t, n, elem_size)
+/// Bit-transpose and LZ4-block-compress one block, framed `[u32 nbytes_BE][lz4]`
+/// (library `bshuf_compress_lz4_block`, bitshuffle.c:34). `size` is a multiple
+/// of 8.
+fn bshuf_compress_lz4_block(
+    out: &mut Vec<u8>,
+    raw: &[u8],
+    elem_start: usize,
+    size: usize,
+    elem_size: usize,
+) {
+    let off = elem_start * elem_size;
+    let shuffled = bshuf_trans_bit_elem(&raw[off..off + size * elem_size], size, elem_size);
+    let comp = compress(&shuffled);
+    out.extend_from_slice(&(comp.len() as u32).to_be_bytes());
+    out.extend_from_slice(&comp);
 }
 
-/// Bit-shuffle then LZ4-compress one block (library `bshuf_compress_lz4_block`).
-///
-/// Blocks whose element count is a multiple of 8 get the full bit transpose;
-/// a trailing partial block is byte-transposed only.
-fn bshuf_compress_block(input: &[u8], n: usize, elem_size: usize) -> Vec<u8> {
-    let shuffled = if n % 8 == 0 {
-        trans_bit_elem_block(input, n, elem_size)
-    } else {
-        trans_byte_elem(input, n, elem_size)
-    };
-    compress(&shuffled)
-}
-
-/// Inverse of [`bshuf_compress_block`].
-fn bshuf_decompress_block(compressed: &[u8], n: usize, elem_size: usize) -> Option<Vec<u8>> {
-    let raw_size = n * elem_size;
-    let shuffled = decompress(compressed, raw_size).ok()?;
-    if shuffled.len() != raw_size {
+/// Read one `[u32 nbytes_BE][lz4]` frame at `pos`, LZ4-decode and bit-untranspose
+/// it (library `bshuf_decompress_lz4_block`, bitshuffle.c:82). Returns the
+/// unshuffled block bytes and the buffer offset past the frame.
+fn bshuf_decompress_lz4_block(
+    buf: &[u8],
+    pos: usize,
+    size: usize,
+    elem_size: usize,
+) -> Option<(Vec<u8>, usize)> {
+    if pos + 4 > buf.len() {
         return None;
     }
-    Some(if n % 8 == 0 {
-        untrans_bit_elem_block(&shuffled, n, elem_size)
-    } else {
-        untrans_byte_elem(&shuffled, n, elem_size)
-    })
+    let clen = u32::from_be_bytes(buf[pos..pos + 4].try_into().ok()?) as usize;
+    let dstart = pos + 4;
+    if dstart + clen > buf.len() {
+        return None;
+    }
+    let shuffled = decompress(&buf[dstart..dstart + clen], size * elem_size).ok()?;
+    if shuffled.len() != size * elem_size {
+        return None;
+    }
+    Some((
+        bshuf_untrans_bit_elem(&shuffled, size, elem_size),
+        dstart + clen,
+    ))
 }
 
 /// Compress an NDArray with the Bitshuffle + LZ4 (`bslz4`) codec.
 ///
-/// Mirrors C++ `compressBSLZ4`. The data buffer is split into bitshuffle
-/// blocks, each block is bit-transposed and LZ4-compressed, and the bslz4
-/// container header is prepended. The original data type is stored as an
-/// attribute so decompression can rebuild the typed buffer.
+/// Produces the per-block stream exactly as the bitshuffle library's
+/// `bshuf_compress_lz4` emits it (bitshuffle.c:237, blocked via
+/// `bshuf_blocked_wrap_fun`, bitshuffle_core.c:1852): every full block plus one
+/// trailing partial block (the remainder rounded down to a multiple of 8) is
+/// bit-transposed, LZ4-block-compressed and framed `[u32 nbytes_BE][lz4]`; the
+/// final `size % 8` elements are copied verbatim. There is NO global
+/// `[total][block_bytes]` header — that HDF5-chunk framing is added by the file
+/// writer (NDFileHDF5Dataset::writeFile), so this payload matches C
+/// `pArray->pData`. The original element type is recorded in the codec so
+/// decompression can rebuild the typed buffer and derive the element count.
 pub fn compress_bslz4(src: &NDArray) -> NDArray {
     let raw = src.data.as_u8_slice();
     let data_type = src.data.data_type();
@@ -572,20 +653,24 @@ pub fn compress_bslz4(src: &NDArray) -> NDArray {
     };
     let block_size = bshuf_default_block_size(elem_size);
 
-    // bslz4 header: 8-byte total uncompressed size, 4-byte block size.
     let mut out: Vec<u8> = Vec::with_capacity(raw.len() / 2 + 16);
-    out.extend_from_slice(&(raw.len() as u64).to_be_bytes());
-    out.extend_from_slice(&(block_size as u32).to_be_bytes());
 
+    let n_full = total_elems / block_size;
     let mut elem = 0usize;
-    while elem < total_elems {
-        let n = block_size.min(total_elems - elem);
-        let byte_off = elem * elem_size;
-        let block = &raw[byte_off..byte_off + n * elem_size];
-        let comp = bshuf_compress_block(block, n, elem_size);
-        out.extend_from_slice(&(comp.len() as u32).to_be_bytes());
-        out.extend_from_slice(&comp);
-        elem += n;
+    for _ in 0..n_full {
+        bshuf_compress_lz4_block(&mut out, raw, elem, block_size, elem_size);
+        elem += block_size;
+    }
+    // One trailing partial block, rounded down to a multiple of 8.
+    let mut last_block = total_elems % block_size;
+    last_block -= last_block % BSHUF_BLOCKED_MULT;
+    if last_block > 0 {
+        bshuf_compress_lz4_block(&mut out, raw, elem, last_block, elem_size);
+        elem += last_block;
+    }
+    // The final `size % 8` elements are copied raw (no shuffle, no frame).
+    if elem < total_elems {
+        out.extend_from_slice(&raw[elem * elem_size..total_elems * elem_size]);
     }
 
     let compressed_size = out.len();
@@ -611,42 +696,50 @@ pub fn compress_bslz4(src: &NDArray) -> NDArray {
 
 /// Decompress a Bitshuffle + LZ4 (`bslz4`) NDArray.
 ///
-/// Returns `None` if the codec is not BSLZ4 or the container is malformed.
+/// Inverse of [`compress_bslz4`], mirroring `bshuf_decompress_lz4`
+/// (bitshuffle.c:244). The uncompressed element count comes from the preserved
+/// array dims (matching C, which passes `nElements` from the NDArray, not from
+/// the payload), so the codec buffer carries no global header. Returns `None`
+/// if the codec is not BSLZ4 or the stream is malformed.
 pub fn decompress_bslz4(src: &NDArray) -> Option<NDArray> {
-    if src.codec.as_ref().map(|c| c.name) != Some(CodecName::BSLZ4) {
+    let codec = src.codec.as_ref()?;
+    if codec.name != CodecName::BSLZ4 {
         return None;
     }
     let buf = src.data.as_u8_slice();
-    if buf.len() < 12 {
-        return None;
-    }
-    let total_bytes = u64::from_be_bytes(buf[0..8].try_into().ok()?) as usize;
-    let block_size = u32::from_be_bytes(buf[8..12].try_into().ok()?) as usize;
-
     let original_type = original_data_type(src);
     let elem_size = original_type.element_size();
-    if elem_size == 0 || block_size == 0 || total_bytes % elem_size != 0 {
+    if elem_size == 0 {
         return None;
     }
-    let total_elems = total_bytes / elem_size;
+    let total_elems: usize = src.dims.iter().map(|d| d.size).product();
+    let total_bytes = total_elems * elem_size;
+    let block_size = bshuf_default_block_size(elem_size);
 
     let mut out: Vec<u8> = Vec::with_capacity(total_bytes);
-    let mut pos = 12usize;
-    let mut elem = 0usize;
-    while elem < total_elems {
-        let n = block_size.min(total_elems - elem);
-        if pos + 4 > buf.len() {
-            return None;
-        }
-        let clen = u32::from_be_bytes(buf[pos..pos + 4].try_into().ok()?) as usize;
-        pos += 4;
-        if pos + clen > buf.len() {
-            return None;
-        }
-        let block = bshuf_decompress_block(&buf[pos..pos + clen], n, elem_size)?;
+    let mut pos = 0usize;
+
+    let n_full = total_elems / block_size;
+    for _ in 0..n_full {
+        let (block, next) = bshuf_decompress_lz4_block(buf, pos, block_size, elem_size)?;
         out.extend_from_slice(&block);
-        pos += clen;
-        elem += n;
+        pos = next;
+    }
+    // One trailing partial block, rounded down to a multiple of 8.
+    let mut last_block = total_elems % block_size;
+    last_block -= last_block % BSHUF_BLOCKED_MULT;
+    if last_block > 0 {
+        let (block, next) = bshuf_decompress_lz4_block(buf, pos, last_block, elem_size)?;
+        out.extend_from_slice(&block);
+        pos = next;
+    }
+    // The final `size % 8` elements were copied raw.
+    let leftover_bytes = (total_elems % BSHUF_BLOCKED_MULT) * elem_size;
+    if leftover_bytes > 0 {
+        if pos + leftover_bytes > buf.len() {
+            return None;
+        }
+        out.extend_from_slice(&buf[pos..pos + leftover_bytes]);
     }
     if out.len() != total_bytes {
         return None;
@@ -1494,26 +1587,34 @@ mod tests {
 
     #[test]
     fn test_bitshuffle_block_transpose_roundtrip() {
-        // The bit transpose must be its own paired inverse for a block whose
-        // element count is a multiple of 8.
-        let elem_size = 4;
-        let n = 16;
-        let input: Vec<u8> = (0..n * elem_size).map(|i| (i * 7 + 3) as u8).collect();
-        let shuffled = trans_bit_elem_block(&input, n, elem_size);
-        assert_eq!(shuffled.len(), input.len());
-        let restored = untrans_bit_elem_block(&shuffled, n, elem_size);
-        assert_eq!(restored, input);
+        // The canonical bit transpose must be its own paired inverse for a
+        // block whose element count is a multiple of 8, across element sizes.
+        for &(n, elem_size) in &[(16usize, 4usize), (8, 2), (256, 8), (128, 1)] {
+            let input: Vec<u8> = (0..n * elem_size).map(|i| (i * 7 + 3) as u8).collect();
+            let shuffled = bshuf_trans_bit_elem(&input, n, elem_size);
+            assert_eq!(shuffled.len(), input.len());
+            let restored = bshuf_untrans_bit_elem(&shuffled, n, elem_size);
+            assert_eq!(restored, input, "elem_size {elem_size}, n {n}");
+        }
     }
 
     #[test]
-    fn test_bitshuffle_partial_block_byte_transpose_roundtrip() {
-        // A trailing partial block (not a multiple of 8) is byte-transposed.
-        let elem_size = 2;
-        let n = 5;
-        let input: Vec<u8> = (0..n * elem_size).map(|i| (i * 13 + 1) as u8).collect();
-        let t = trans_byte_elem(&input, n, elem_size);
-        let restored = untrans_byte_elem(&t, n, elem_size);
-        assert_eq!(restored, input);
+    fn test_bitshuffle_matches_c_reference_vector() {
+        // Locks the on-disk byte format to the canonical bitshuffle library
+        // (the one h5py / libhdf5 / C areaDetector use). The expected vector was
+        // produced by compiling hdf5_plugins/BSHUF/src/bitshuffle_core.c
+        // (scalar path) and running `bshuf_bitshuffle(in, out, 16, 2, 0)` on the
+        // u16 ramp 0..15: bit-row 0 (LSB of each elem) packs elem k -> output
+        // bit k (little-endian element order), giving 0xAA/0xCC/0xF0 for the
+        // varying low nibble and 0xFF where bit 3 separates elems 8..15.
+        let input: Vec<u8> = (0..16u16).flat_map(|v| v.to_le_bytes()).collect();
+        let shuffled = bshuf_trans_bit_elem(&input, 16, 2);
+        let mut expected = vec![0u8; 32];
+        expected[..8].copy_from_slice(&[170, 170, 204, 204, 240, 240, 0, 255]);
+        assert_eq!(
+            shuffled, expected,
+            "canonical bitshuffle transpose must match the C library bytes"
+        );
     }
 
     #[test]

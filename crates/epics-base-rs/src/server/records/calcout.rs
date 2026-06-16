@@ -1,7 +1,9 @@
 use super::link_status::{LINK_CON, LINK_STATUS_CHOICES, LinkStatusGen, classify_link};
 use crate::error::{CaError, CaResult};
 use crate::server::database::AsyncDbHandle;
-use crate::server::record::{FieldDesc, ProcessAction, ProcessOutcome, Record};
+use crate::server::record::{
+    FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Per-input link-status diagnostic field names (`INAV`..`INUV`), one per
@@ -1045,9 +1047,26 @@ impl Record for CalcoutRecord {
             self.pending_output = true;
             self.cached_should_output = false;
             let delay = std::time::Duration::from_secs_f64(self.odly);
-            return Ok(ProcessOutcome::complete_with(vec![
-                ProcessAction::ReprocessAfter(delay),
-            ]));
+            // C `calcoutRecord.c::process` (lines 277-282): the delaying
+            // cycle sets DLYA, posts it (`db_post_events(&prec->dlya,
+            // DBE_VALUE)`), schedules the delayed callback, and `return 0`
+            // — BEFORE `monitor()` (306) and `recGblFwdLink()` (307). So
+            // VAL/OVAL monitors and the forward link are NOT emitted on the
+            // delaying cycle; they fire once on the delayed (callback) cycle.
+            // Model this as an async-pending-notify pass: the framework
+            // posts only DLYA now and defers the FLNK + VAL/OVAL snapshot to
+            // the Complete continuation (the `dlya == 1` branch at the top
+            // of process()). The previous `complete_with` ran the full
+            // snapshot + FLNK tail on the delaying cycle, so VAL/OVAL posted
+            // ODLY-seconds early and the forward link fired twice.
+            return Ok(ProcessOutcome {
+                result: RecordProcessResult::AsyncPendingNotify(vec![(
+                    "DLYA".to_string(),
+                    EpicsValue::Short(1),
+                )]),
+                actions: vec![ProcessAction::ReprocessAfter(delay)],
+                device_did_compute: false,
+            });
         }
 
         self.cached_should_output = do_output;

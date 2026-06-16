@@ -7283,3 +7283,73 @@ async fn init_applies_constant_dol_across_record_types() {
         "mbbo_direct constant DOL clears UDF (recGblInitConstantLink)"
     );
 }
+
+/// A calcout with ODLY > 0 defers its forward link (and VAL/OVAL monitors)
+/// to the delayed callback cycle. C `calcoutRecord.c::process` (lines
+/// 277-282) sets DLYA and `return 0` on the delaying cycle — BEFORE
+/// `monitor()`/`recGblFwdLink()` (lines 306-307) — so the FLNK target must
+/// NOT process on the delaying cycle; it processes exactly once on the
+/// delayed cycle. Before the fix the delaying cycle ran the full Complete
+/// snapshot + FLNK tail, firing the forward link twice (delaying + delayed).
+#[tokio::test]
+async fn calcout_odly_defers_forward_link_to_delayed_cycle() {
+    use epics_base_rs::server::records::calc::CalcRecord;
+    use epics_base_rs::server::records::calcout::CalcoutRecord;
+    let db = PvDatabase::new();
+
+    // FLNK target: a calc counter — VAL increments by 1 each time it is
+    // processed (the CALC `VAL` token reads the previous VAL).
+    let mut tgt = CalcRecord::new("VAL+1");
+    tgt.init_record(0).unwrap();
+    db.add_record("CO6_TGT", Box::new(tgt)).await.unwrap();
+
+    // Source calcout: output due (OOPT=Every Time) with ODLY > 0 and a
+    // forward link to the counter. ODLY is large so the real ReprocessAfter
+    // timer cannot fire during the test; the delayed cycle is driven
+    // explicitly via process_record_continuation.
+    let mut src = CalcoutRecord::default();
+    src.put_field("CALC", EpicsValue::String("A".into()))
+        .unwrap();
+    src.put_field("A", EpicsValue::Double(42.0)).unwrap();
+    src.put_field("ODLY", EpicsValue::Double(100.0)).unwrap();
+    db.add_record("CO6_SRC", Box::new(src)).await.unwrap();
+    {
+        let rec = db.get_record("CO6_SRC").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.put_common_field("FLNK", EpicsValue::String("CO6_TGT".into()))
+            .unwrap();
+    }
+
+    // Delaying cycle: output is due + ODLY > 0, so the cycle defers. The
+    // FLNK target must NOT process (C returns before recGblFwdLink). The
+    // delaying-cycle FLNK fires synchronously inside process_record_with_links
+    // if at all, so this assertion is race-free.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("CO6_SRC", &mut visited, 0)
+        .await
+        .unwrap();
+    assert!(
+        !visited.contains("CO6_TGT"),
+        "FLNK must not fire on the ODLY delaying cycle"
+    );
+    assert_eq!(
+        db.get_pv("CO6_TGT").await.unwrap().to_f64(),
+        Some(0.0),
+        "FLNK target must not be processed on the delaying cycle"
+    );
+
+    // Delayed (callback) cycle: C fires recGblFwdLink exactly once here.
+    let mut visited2 = HashSet::new();
+    db.process_record_continuation("CO6_SRC", &mut visited2, 0)
+        .await
+        .unwrap();
+    assert!(
+        visited2.contains("CO6_TGT"),
+        "FLNK must fire on the delayed cycle"
+    );
+    assert_eq!(
+        db.get_pv("CO6_TGT").await.unwrap().to_f64(),
+        Some(1.0),
+        "FLNK target processed exactly once (delayed cycle only), not on both cycles"
+    );
+}

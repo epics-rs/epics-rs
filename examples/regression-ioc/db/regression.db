@@ -158,6 +158,17 @@ record(calc, "REG:N:READER") {
     field(CALC, "A")
 }
 
+#### Family J — DBR_STRING byte-faithful round-trip ########################
+# A stringout VAL must round-trip a full-width (39-char) DBR_STRING over CA
+# byte-for-byte — no truncation, no reordering, no mangling. Pins the
+# string-fidelity family. (The non-UTF8 byte and `$` long-string paths are
+# CLI-scoped — the library client puts strings as &str — so they are covered by
+# caget-rs/caput-rs tests, not this in-process harness; see the Family E note.)
+record(stringout, "REG:J:SO") {
+    field(DESC, "string round-trip")
+    field(VAL,  "seed")
+}
+
 #### Family M — DBE_PROPERTY posts on a metadata-field change ##############
 # Writing a metadata/property field (here HOPR) must post a DBE_PROPERTY event
 # to a camonitor that subscribed with DBE_PROPERTY, so a client's cached

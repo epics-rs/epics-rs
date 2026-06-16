@@ -13,6 +13,7 @@
 //!   G — alarm severity raised on limit violation
 //!   H — timestamp advances on each process
 //!   I — monitor event-MASK routing (MDEL/ADEL → DBE_VALUE/DBE_LOG class)
+//!   J — DBR_STRING byte-faithful round-trip at full (39-char) width
 //!   K — .PROC=0 forces a process; put-callback waits for completion
 //!   M — DBE_PROPERTY posts on a metadata-field change (not DBE_VALUE)
 //!   N — MS-class link propagates the source record's alarm severity
@@ -425,6 +426,38 @@ async fn i_deadband_routes_value_vs_log_event_masks() {
     recv_until(&mut mon_val, 2000, val_is(120.0))
         .await
         .expect("DBE_VALUE sub must receive the supra-MDEL value post");
+}
+
+// ---- Family J: DBR_STRING byte-faithful round-trip ------------------------
+
+/// A stringout VAL must round-trip a full-width (39-char) DBR_STRING over CA
+/// byte-for-byte — the DBR_STRING payload is 40 bytes (39 usable + NUL), so 39
+/// chars exercises the boundary with no truncation, reordering, or mangling.
+/// Pins the string-fidelity family. (Non-UTF8 bytes and the `$` long-string
+/// path are CLI-scoped — the library client puts strings as `&str` — so they
+/// live in caget-rs/caput-rs tests, like the Family E caput-by-label note.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn j_stringout_dbr_string_round_trip() {
+    let ioc = RegressionIoc::boot().await.expect("boot");
+    let ca = ioc.ca_client().await;
+
+    // 39 distinct printable-ASCII bytes ('!'..'G') — fills DBR_STRING to its
+    // 39-usable-byte limit and would expose any truncation or reordering.
+    let s: String = ('!'..='~').take(39).collect();
+    assert_eq!(s.len(), 39, "test fixture must be exactly 39 bytes");
+
+    ca.caput("REG:J:SO", &s).await.expect("caput string");
+    let (dbf, v) = ca.caget("REG:J:SO").await.expect("caget string");
+    assert_eq!(dbf, DbFieldType::String, "stringout VAL must be DBR_STRING");
+    match v {
+        EpicsValue::String(pv) => assert_eq!(
+            pv.as_str_lossy(),
+            s,
+            "39-char DBR_STRING must round-trip byte-for-byte"
+        ),
+        other => panic!("expected EpicsValue::String, got {other:?}"),
+    }
 }
 
 // ---- Family K: .PROC=0 force-process + put-callback completion -------------

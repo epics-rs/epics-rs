@@ -1937,6 +1937,31 @@ impl PvDatabase {
                 instance.common.tse = -2;
             }
 
+            // dfanout drives its OUT links HERE — C `dfanoutRecord.c:127-146`
+            // runs `push_values` between `checkAlarms` and (in `monitor`)
+            // `recGblResetAlarms`, gating the push on the pending `nsev`. A
+            // failed `dbPutLink` raises LINK_ALARM/MAJOR (line 312), and a
+            // Specified `seln` out of range raises SOFT_ALARM/INVALID (line
+            // 317), both into that pending `nsev` — so the write alarm folds
+            // into THIS cycle's committed SEVR and its VAL monitor post. The
+            // fanout/seq multi-out dispatch stays in the forward-link tail:
+            // they drive no value and raise no write alarm. The OUT writes
+            // need this record's lock released (a self/cyclic OUT link would
+            // otherwise deadlock on the non-reentrant gate, exactly as the
+            // tail dispatch already runs unlocked), so release `instance`,
+            // dispatch, then re-acquire before the commit below.
+            if instance.record.record_type() == "dfanout" {
+                let pending_sevr = instance.common.nsev;
+                drop(instance);
+                let push_alarm = self
+                    .dispatch_multi_output(&rec, Some(pending_sevr), visited, depth)
+                    .await;
+                instance = rec.write().await;
+                if let Some((stat, sevr)) = push_alarm {
+                    crate::server::recgbl::rec_gbl_set_sevr(&mut instance.common, stat, sevr);
+                }
+            }
+
             // Transfer nsta/nsev -> sevr/stat, detect alarm change
             let alarm_result = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
 
@@ -2522,8 +2547,12 @@ impl PvDatabase {
         visited: &mut std::collections::HashSet<String>,
         depth: usize,
     ) {
-        // 4.5. Multi-output dispatch (fanout/dfanout/seq)
-        self.dispatch_multi_output(rec, visited, depth).await;
+        // 4.5. Multi-output dispatch (fanout/seq). dfanout dispatches
+        // pre-commit in `process_record_with_links_inner` so its OUT-link
+        // write failure folds LINK_ALARM/MAJOR into the same-cycle SEVR
+        // (C `dfanoutRecord.c` push_values runs before `recGblResetAlarms`);
+        // the `None` phase argument skips dfanout here.
+        let _ = self.dispatch_multi_output(rec, None, visited, depth).await;
 
         // 4.55. event record: post the named software event.
         self.dispatch_event_record(rec).await;
@@ -3483,8 +3512,13 @@ impl PvDatabase {
             .await;
         }
 
-        // Multi-output dispatch (fanout/dfanout/seq/sseq)
-        self.dispatch_multi_output(&rec, visited, depth).await;
+        // Multi-output dispatch (fanout/seq). This is the async-device
+        // write-completion path; dfanout has no device support so it never
+        // completes async — its OUT links are driven pre-commit on the
+        // synchronous process path. Pass `None` (tail phase): a dfanout
+        // reaching here would be skipped, which is correct (it has already
+        // dispatched, or never had a value to push).
+        let _ = self.dispatch_multi_output(&rec, None, visited, depth).await;
 
         // event record: post the named software event.
         self.dispatch_event_record(&rec).await;

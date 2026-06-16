@@ -688,6 +688,13 @@ impl PvDatabase {
 
     /// Write a value through a DbLink, optionally processing the target if PP and Passive.
     ///
+    /// Returns `true` when the write failed — C `dbPutLink` status `!= 0`:
+    /// the local `dbPut` was rejected (conversion error, missing field) or
+    /// the non-local external write returned `Err`. Callers that mirror a
+    /// record's `dbPutLink` status (e.g. dfanout `push_values` raising
+    /// `LINK_ALARM/MAJOR`, dfanoutRecord.c:312) fold this into the source's
+    /// alarm; the fanout/seq dispatch paths ignore it.
+    ///
     /// `src_putf` carries the source record's `PUTF` bit so the target inherits
     /// it the same way C `dbDbLink.c::processTarget` propagates it (lines 470-498):
     ///
@@ -710,7 +717,7 @@ impl PvDatabase {
         src: OutLinkSrc<'_>,
         visited: &mut HashSet<String>,
         depth: usize,
-    ) {
+    ) -> bool {
         let target_name = if link.field == "VAL" {
             link.record.clone()
         } else {
@@ -728,8 +735,9 @@ impl PvDatabase {
             let op = Self::external_put_op(src.notify);
             if let Err(e) = self.write_external_pv(&target_name, value, op).await {
                 eprintln!("OUT-link write to external PV '{target_name}' failed: {e}");
+                return true;
             }
-            return;
+            return false;
         }
         // an OUT-link write-back is an internal step of the
         // processing chain that already holds the entry record's
@@ -773,7 +781,7 @@ impl PvDatabase {
         // alarm inheritance above already ran (C folds it regardless of
         // status), matching the C ordering exactly.
         if put_result.is_err() {
-            return;
+            return true;
         }
 
         // C `dbDbPutValue` (`dbDbLink.c:387-390`) processes the target
@@ -827,6 +835,8 @@ impl PvDatabase {
                 }
             }
         }
+        // Successful local write (C `dbPutLink` status 0).
+        false
     }
 
     /// Write a value to an external (`ca://` / `pva://`) OUT link
@@ -1084,12 +1094,44 @@ impl PvDatabase {
     /// groups are kept as struct fields, NOT `\0`-packed strings
     /// (the pre-fix encoding could mis-split a link string that
     /// happened to contain an embedded NUL).
+    ///
+    /// `dfanout_pending_sevr` selects the dispatch phase and carries the
+    /// severity the dfanout `push_values` decision needs:
+    ///
+    /// * `Some(nsev)` — the **dfanout pre-commit** phase. C
+    ///   `dfanoutRecord.c:128-146` runs `push_values` between `checkAlarms`
+    ///   and `recGblResetAlarms`, gating the push on the *pending* `nsev`
+    ///   (`if nsev < INVALID push else switch(ivoa)`), and a failed
+    ///   `dbPutLink` raises `LINK_ALARM/MAJOR` into that same `nsev`. The
+    ///   caller runs this before the alarm commit and folds the returned
+    ///   failure flag into the record's `nsev`, so the write alarm lands in
+    ///   THIS cycle's committed SEVR and its VAL monitor post.
+    /// * `None` — the **fanout/seq tail** phase (post-commit forward-link
+    ///   tail). These drive no value and raise no write alarm.
+    ///
+    /// A dfanout reached with `None`, or a fanout/seq reached with `Some`,
+    /// is skipped: each type dispatches in exactly one phase. Returns the
+    /// single pending alarm `(stat, sevr)` C `push_values` would raise this
+    /// cycle — `LINK_ALARM/MAJOR` for a failed OUT write or
+    /// `SOFT_ALARM/INVALID` for a Specified `seln` out of range — for the
+    /// caller to fold into `nsev` before the alarm commit. Always `None` for
+    /// fanout/seq (they raise their own range alarm directly, post-commit).
     pub(crate) async fn dispatch_multi_output(
         &self,
         rec: &Arc<RwLock<RecordInstance>>,
+        dfanout_pending_sevr: Option<AlarmSeverity>,
         visited: &mut HashSet<String>,
         depth: usize,
-    ) {
+    ) -> Option<(u16, AlarmSeverity)> {
+        // Phase gate: dfanout drives its OUT links pre-commit (so a write
+        // failure folds into the same cycle's SEVR), fanout/seq in the
+        // forward-link tail. Skip the type that does not belong to the
+        // calling phase so each dispatches exactly once per cycle.
+        let is_dfanout = rec.read().await.record.record_type() == "dfanout";
+        if is_dfanout != dfanout_pending_sevr.is_some() {
+            return None;
+        }
+
         // Snapshot the source record's PUTF bit + put-notify wait-set so
         // every write_db_link_value call below propagates them to its
         // target — C `dbDbLink.c::processTarget` PUTF and `dbNotifyAdd`
@@ -1193,32 +1235,41 @@ impl PvDatabase {
                     let selm = Self::field_i16(&instance, "SELM");
                     let seln = Self::field_u16(&instance, "SELN");
                     // IVOA / IVOV — invalid output handling, mirrors
-                    // epics-base PR #688. When the record's SEVR is
-                    // INVALID, IVOA selects: 0 = continue (use VAL as
-                    // before), 1 = don't drive (suppress all OUT*),
+                    // epics-base PR #688. When the record's pending
+                    // severity is INVALID, IVOA selects: 0 = continue (use
+                    // VAL as before), 1 = don't drive (suppress all OUT*),
                     // 2 = set outputs to IVOV.
+                    //
+                    // C `dfanoutRecord.c:128` gates the push on the
+                    // *pending* `nsev` (`if (prec->nsev < INVALID_ALARM)
+                    // push_values(); else switch(ivoa)`), evaluated after
+                    // `checkAlarms` but before `recGblResetAlarms` commits
+                    // it. This dispatch runs in that same pre-commit window,
+                    // so the gate reads the caller-supplied pending
+                    // severity, not the still-stale committed `common.sevr`.
+                    let push_sevr = dfanout_pending_sevr
+                        .expect("dfanout dispatch carries the pending severity (phase gate)");
                     let raw_val = instance.record.val();
-                    let val =
-                        if instance.common.sevr == crate::server::record::AlarmSeverity::Invalid {
-                            let ivoa = instance
-                                .record
-                                .get_field("IVOA")
-                                .and_then(|v| {
-                                    if let EpicsValue::Short(s) = v {
-                                        Some(s)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .unwrap_or(0);
-                            match ivoa {
-                                1 => None, // suppress drive
-                                2 => instance.record.get_field("IVOV").or(raw_val),
-                                _ => raw_val, // 0 or unknown — Continue
-                            }
-                        } else {
-                            raw_val
-                        };
+                    let val = if push_sevr == crate::server::record::AlarmSeverity::Invalid {
+                        let ivoa = instance
+                            .record
+                            .get_field("IVOA")
+                            .and_then(|v| {
+                                if let EpicsValue::Short(s) = v {
+                                    Some(s)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+                        match ivoa {
+                            1 => None, // suppress drive
+                            2 => instance.record.get_field("IVOV").or(raw_val),
+                            _ => raw_val, // 0 or unknown — Continue
+                        }
+                    } else {
+                        raw_val
+                    };
                     let links: Vec<String> = [
                         "OUTA", "OUTB", "OUTC", "OUTD", "OUTE", "OUTF", "OUTG", "OUTH", "OUTI",
                         "OUTJ", "OUTK", "OUTL", "OUTM", "OUTN", "OUTO", "OUTP",
@@ -1287,7 +1338,7 @@ impl PvDatabase {
 
         let (sel, payload, val) = match dispatch_info {
             Some(info) => info,
-            None => return,
+            None => return None,
         };
         debug_assert!(sel.indices.iter().all(|&i| i < payload.len()));
         // Single-owner invariant: every record type that produces a
@@ -1302,10 +1353,21 @@ impl PvDatabase {
 
         // C raises SOFT_ALARM/INVALID_ALARM when SELN/OFFS/SHFT resolve
         // out of range (fanoutRecord.c:116, dfanoutRecord.c:317,
-        // seqRecord.c:157). Apply it before dispatching the (empty)
-        // selection.
-        Self::apply_selm_alarm(rec, sel.alarm).await;
+        // seqRecord.c:157). fanout/seq dispatch in the post-commit tail, so
+        // they raise it directly into the committed SEVR and post SEVR/STAT
+        // immediately (apply_selm_alarm). dfanout dispatches PRE-commit, so
+        // its out-of-range alarm must instead fold into the pending nsev the
+        // caller commits THIS cycle — captured here and returned below, not
+        // raised+posted now (a direct SEVR raise would be clobbered by the
+        // caller's `recGblResetAlarms`).
+        let dfanout_selm_alarm = sel.alarm;
+        if !is_dfanout {
+            Self::apply_selm_alarm(rec, sel.alarm).await;
+        }
         let indices = sel.indices;
+        // C `dfanoutRecord.c` push_values raises LINK_ALARM/MAJOR per failed
+        // dbPutLink; accumulated across the selected OUT links below.
+        let mut link_failed = false;
 
         match payload {
             MultiOut::Fanout(links) => {
@@ -1383,8 +1445,14 @@ impl PvDatabase {
                         let parsed = crate::server::record::parse_output_link_v2(link_str);
                         match parsed {
                             crate::server::record::ParsedLink::Db(ref db) => {
-                                self.write_db_link_value(db, val.clone(), out_src, visited, depth)
-                                    .await;
+                                // C `dfanoutRecord.c:311-312`: a failed
+                                // dbPutLink raises LINK_ALARM/MAJOR.
+                                if self
+                                    .write_db_link_value(db, val.clone(), out_src, visited, depth)
+                                    .await
+                                {
+                                    link_failed = true;
+                                }
                             }
                             // External `ca://`/`pva://` OUTn — C
                             // `dbPutLink` routes a CA-link write through
@@ -1405,6 +1473,11 @@ impl PvDatabase {
                                     eprintln!(
                                         "dfanout OUT-link write to external PV '{name}' failed: {e}"
                                     );
+                                    // C `dfanoutRecord.c:312` routes a CA OUT
+                                    // link through dbPutLink identically — a
+                                    // disconnected/rejected remote write
+                                    // returns nonzero → LINK_ALARM/MAJOR.
+                                    link_failed = true;
                                 }
                             }
                             _ => {}
@@ -1499,6 +1572,31 @@ impl PvDatabase {
                 }
             }
         }
+
+        // dfanout (pre-commit phase): return the single pending alarm C
+        // `push_values` would have raised this cycle for the caller to fold
+        // into `nsev` before `recGblResetAlarms`. C raises at most one:
+        // SOFT_ALARM/INVALID for a Specified `seln` out of range (line 317,
+        // no push) OR LINK_ALARM/MAJOR for a failed dbPutLink (line
+        // 312/324/333). They are mutually exclusive in C's control flow; if
+        // both were somehow set, fold the higher severity (recGblSetSevr is
+        // raise-only). fanout/seq already applied their range alarm directly
+        // above and drive no value, so they return None.
+        if is_dfanout {
+            let link_alarm = if link_failed {
+                Some((
+                    crate::server::recgbl::alarm_status::LINK_ALARM,
+                    AlarmSeverity::Major,
+                ))
+            } else {
+                None
+            };
+            return match (dfanout_selm_alarm, link_alarm) {
+                (Some(a), Some(b)) => Some(if (a.1 as u16) >= (b.1 as u16) { a } else { b }),
+                (a, b) => a.or(b),
+            };
+        }
+        None
     }
 
     /// Post the software event named by an `event` record's `VAL`.

@@ -4346,6 +4346,91 @@ async fn test_dfanout_omsl_supervisory_ignores_dol() {
     );
 }
 
+/// C `dfanoutRecord.c:308-339` `push_values` raises
+/// `recGblSetSevr(LINK_ALARM, MAJOR_ALARM)` on every failed `dbPutLink`,
+/// and `process()` (127-147) runs `push_values` between `checkAlarms` and
+/// `recGblResetAlarms`, so the write-failure alarm folds into the SAME
+/// cycle's committed SEVR and the VAL monitor post. The Rust dispatch
+/// previously only logged the failure (no alarm), and drove the OUT links
+/// in the post-commit forward-link tail where any alarm could not fold
+/// into this cycle. After ONE process, a broken OUT link must leave
+/// SEVR=MAJOR / STAT=LINK — proving the same-cycle fold (a one-cycle-late
+/// latch would read NO_ALARM here).
+#[tokio::test]
+async fn test_dfanout_out_link_write_failure_raises_link_major() {
+    use epics_base_rs::server::recgbl::alarm_status;
+    use epics_base_rs::server::records::dfanout::DfanoutRecord;
+
+    let db = PvDatabase::new();
+
+    // SELM=All pushes VAL to OUTA. OUTA targets a record that does not
+    // exist locally and no external link set is registered, so the write
+    // is rejected — C `dbPutLink` status != 0.
+    let mut dfan = DfanoutRecord::new(5.0);
+    dfan.selm = 0; // All
+    dfan.outa = "DFAN_NO_SUCH_DEST".to_string();
+    db.add_record("DFAN_LINKFAIL", Box::new(dfan))
+        .await
+        .unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("DFAN_LINKFAIL", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let rec = db.get_record("DFAN_LINKFAIL").await.expect("record exists");
+    let inst = rec.read().await;
+    assert_eq!(
+        inst.common.sevr,
+        AlarmSeverity::Major,
+        "failed dfanout OUT-link write must raise SEVR=MAJOR this cycle, got {:?}",
+        inst.common.sevr
+    );
+    assert_eq!(
+        inst.common.stat,
+        alarm_status::LINK_ALARM,
+        "failed dfanout OUT-link write must raise STAT=LINK, got {}",
+        inst.common.stat
+    );
+}
+
+/// Companion gate: a dfanout whose OUT links all write successfully must
+/// NOT raise a LINK alarm — SEVR stays NO_ALARM. Pins that the
+/// write-failure fold above only fires on a real `dbPutLink` failure.
+#[tokio::test]
+async fn test_dfanout_out_link_write_success_no_link_alarm() {
+    use epics_base_rs::server::records::dfanout::DfanoutRecord;
+
+    let db = PvDatabase::new();
+    db.add_record("DFAN_OK_DEST", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let mut dfan = DfanoutRecord::new(5.0);
+    dfan.selm = 0; // All
+    dfan.outa = "DFAN_OK_DEST".to_string();
+    db.add_record("DFAN_OK", Box::new(dfan)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("DFAN_OK", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let val = db.get_pv("DFAN_OK_DEST").await.unwrap();
+    assert!(
+        matches!(val, EpicsValue::Double(v) if (v - 5.0).abs() < 1e-10),
+        "successful OUT write must land VAL=5.0 on the target, got {val:?}"
+    );
+    let rec = db.get_record("DFAN_OK").await.expect("record exists");
+    let inst = rec.read().await;
+    assert_eq!(
+        inst.common.sevr,
+        AlarmSeverity::NoAlarm,
+        "successful dfanout OUT-link write must not raise any alarm, got {:?}",
+        inst.common.sevr
+    );
+}
+
 #[tokio::test]
 async fn test_seq_dol_lnk_dispatch() {
     use epics_base_rs::server::records::seq::SeqRecord;

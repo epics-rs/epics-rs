@@ -98,6 +98,40 @@ Fix (done): the three sites share `coerce_write_value`, which resolves a String 
 - PVA monitor pipeline-credit accounting, CA base dropped-monitor counter, bridge connection/pause-vote state machines: single-owner accounting sound, finalizers cover exits.
 - CA String→numeric radix (`value.rs:1163-1259`), integer narrowing, DBF_CHAR signedness, old-DBR promotions: match C `dbConvert`/pvxs `copyOut`. (R4-2 is the *bridge* path only.)
 
+## Round 5 Open Findings (record-processing field-output, 2026-06-16)
+
+Fresh-angle audit of `epics-base-rs/src/server/records/*` `process()` vs C
+`std/rec/*Record.c`, on the OBSERVABLE axes: processed field values, alarm
+severity/status, DBE monitor masks, UDF/INVALID. R5-1..R5-3 verified at the
+C+Rust source by me; R5-4..R5-14 reported by sub-agents (C-cited, pending
+independent re-verification before fix).
+
+### R5-1 (CRITICAL, VERIFIED): `sub`/`aSub` subroutine never runs on the normal process path
+`SubRecord::process`/`ASubRecord::process` are empty (`sub_record.rs:148`, `asub_record.rs:213`); they rely on `RecordInstance::subroutine`, which is invoked ONLY in `process_local()` (`record_instance.rs:1903`). The main engine `process_record_with_links_inner` calls `instance.record.process()` directly (`processing.rs:1619`) and bypasses `process_local` (its own comment, `processing.rs:1629-1632`). So sub/aSub run their SNAM only via the by-name/QSRV-group path (`processing.rs:322`), never on SCAN / event / CA-put-to-PP-INP / FLNK. C runs `do_sub()` every `process()` (`subRecord.c:147`, `aSubRecord.c:223`). Observable: VAL/VALA..VALU and OUTA..OUTU never update. Fix needs a design call (subroutine ownership: move onto the record, or invoke `instance.subroutine` from the main engine for sub/aSub). Cascading once it runs: `SubroutineFn` return-status (`subRecord.c:430` SOFT_ALARM, `aSubRecord.c:223` `val=status`) and sub HIHI/HIGH/LOLO/LOW/HYST/MDEL/ADEL limit-alarm fields are absent.
+
+### R5-2 (HIGH, VERIFIED): calc/calcout `VAL` token in CALC/OCAL always reads 0
+`calc.rs:674`/`calcout.rs` build `NumericInputs::with_vars(vars)` (`prev_val: 0.0`, `engine/mod.rs:100`) and never assign `inputs.prev_val = self.val`; the engine `FetchVal` reads `prev_val` (`engine/numeric.rs:37`). C `calcPerform.c:73-74` `FETCH_VAL: *++ptop = *presult` reads the previous VAL. Trigger: `CALC="VAL+1"` → C 1,2,3…; Rust 1,1,1…. Same `with_vars(prev_val=0)` pattern in swait/scalcout/transform (synApps crate, out of base scope — note as sibling).
+
+### R5-3 (HIGH, VERIFIED): fanout/seq SHFT default is 0; C dbd `initial("-1")`
+`fanout.rs:93`/`seq.rs:173` default `shft: 0`; C `fanoutRecord.dbd.pod:137`/`seqRecord.dbd.pod:291` `field(SHFT,DBF_SHORT){ initial("-1") }` (POD: "If not set, SHFT is -1 so bits shift left by 1"). Rust db_loader applies no dbd `initial()`, so the struct `Default` is the only source. Trigger: `SELM=Mask`, SHFT omitted → C `seln<<1` (SELN=1 → LNK1), Rust `seln>>0` (SELN=1 → LNK0): wrong forward links fire. NOTE possible larger family: ANY field whose Rust `Default` ≠ its C dbd `initial()` (db_loader ignores dbd initials) — a separate audit.
+
+### R5-4..R5-14 (REPORTED by sub-agent, C-cited, pending re-verify)
+- R5-4 (MED): ao closed-loop Incremental DOL adds to current VAL not PVAL (`processing.rs:1398` vs `aoRecord.c:442` `val=pval` then `+=`).
+- R5-5 (MED): ao constant DOL + Incremental loses the increment, behaves Full (`ao.rs:455-457`).
+- R5-6 (MED): calcout ODLY>0 posts VAL/OVAL monitors + FLNK on the delaying cycle AND again on the delayed cycle (`calcout.rs:1035` vs `calcoutRecord.c:276-282`).
+- R5-7 (MED): sel `Specified` mode fetches ALL inputs, not only INP[SELN] (`sel.rs:663` vs `selRecord.c:411`): extra input monitors + spurious SEVR from non-selected broken links.
+- R5-8 (MED): sel runs `do_sel` unconditionally; C gates on fetch success (`sel.rs:323` vs `selRecord.c:114`).
+- R5-9 (MED): seq never writes DOLn read-back into DOn nor posts DOn (`links.rs:1415` vs `seqRecord.c:256-268`).
+- R5-10 (MED): dfanout OUT-link write failure does not raise LINK_ALARM/MAJOR (`links.rs:1362` vs `dfanoutRecord.c:311`).
+- R5-11 (LOW): ai/ao/calc/calcout aux-field posts on alarm-transition cycle use a fixed `aux_mask` rather than VAL's `monitor_mask` (over/under-notify under non-default MDEL/ADEL).
+- R5-12 (LOW): ai writes `LALM=NaN` / drifts AFVL on a UDF cycle; C `aiRecord.c:319-323` sets `afvl=0`, returns early, leaves LALM.
+- R5-13 (LOW): waveform/aai/aao ignore MPST/APST "On Change" and never compute HASH (default "Always" matches).
+- R5-14 (LOW): seq reads SELL→SELN in SELM=All (C skips, `seqRecord.c:148`); dfanout OMSL/IVOA served as SHORT not ENUM; seq DOLn not coerced to DBR_DOUBLE.
+
+### R5 audited clean (sub-agent verified, no divergence)
+ai convert (RVAL+ROFF/ASLO+AOFF/LINR/ESLO+EOFF/SMOO all quadrants/HIHI-LOLO order+HYST+LALM/AFTC); ao convert (drive clamp/OROC/linearization/raw round/IVOA/RVAL+RBV masks); calc numeric domain (div/sqrt/log/mod/nint/atan2/NaN→UDF, OOPT 6 modes, DOPT, IVOA/IVOV, LA..LU); compress (all per-ALG arithmetic, ILIL/IHIL, PBUF tail, FIFO/LIFO+lin, RES); sel selection (High/Low/Median incl. even/odd index, all-NaN, out-of-range SOFT, HYST+LALM); fanout/dfanout/seq (SELM=All/Specified/Mask ordering+range, dfanout IVOA/checkAlarms/MDEL/ADEL/DOL, fanout Passive FLNK gate); waveform (UDF, NORD, subArray clamps, default MPST/APST).
+
 ## Review Log
 - Round 4 (2026-06-16): commit-history classification (11 recurring families) + 4-agent code hunt. 4 families have open siblings → R4-1 (menu-label, 12 menus + mis-map; the dominant one, structural), R4-2 (QSRV radix), R4-3 (compress INP coercion), R4-4 (trap-write AfterWrite, 3 sites). The classification and the independent code hunt converged on the same open set.
+- Round 5 (2026-06-16): fresh-angle record-processing field-output audit (alarm order, monitor masks, value edge cases, UDF). Found the port is NOT converged on record behaviour — R5-1 (sub/aSub subroutine inert on the normal process path, CRITICAL) + R5-2 (calc/calcout VAL token reads 0) + R5-3 (fanout/seq SHFT default) verified at source; R5-4..R5-14 reported by sub-agents pending re-verify. Contrast with the R4-4 finalizer-skip sweep, which found that family isolated — the record-output axis is where live divergences remain.
 - Round 4 fixes (2026-06-16): R4-1 db-load menu-label resolution FIXED (e7e20583). The [Fixes from reported defects] enumeration of the same root (field-blind `resolve_menu_string`) surfaced a runtime-write sibling on the `field_io` coercion path → filed + FIXED as R4-5 (86137c83). Both reuse the shared `resolve_menu_field_string` helper. R4-2 QSRV String→int base-0 radix FIXED (90167988, shared `EpicsValue::parse_int`/`parse_uint`). R4-3 compress INP-link coercion FIXED (f388beab, `put_field_internal` coerces to the target field type). R4-4 trap-write AfterWrite-on-every-exit-path FIXED (02053a3d) — verifying the C reference (`camessage.c:1400/1620/1700` all call `asTrapWriteAfter`) confirmed the divergence and dictated the structural fix: a `TrapWriteGuard` RAII pair (BeforeWrite on `begin`, AfterWrite on `complete`-or-`Drop`) replacing the three explicit dispatch sites across epics-base-rs/epics-bridge-rs/epics-ca-rs. **All round-4 findings (R4-1..R4-5) now closed.**

@@ -21,6 +21,8 @@
 //!   P — an array (waveform) exposes DBR_GR/DBR_CTRL limit metadata
 //!   R — a record-specific DBF_MENU (dfanout SELM) served as DBR_ENUM with
 //!       its own choice labels (distinct from F's shared .SCAN menu)
+//!   L — an unsigned DBF_ULONG field (mbbo MASK) keeps its native PVA uint
+//!       wire type (PVA-only; CA has no unsigned types)
 
 use std::time::Duration;
 
@@ -28,6 +30,7 @@ use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_ca_rs::client::MonitorHandle;
 use epics_ca_rs::protocol::{DBE_LOG, DBE_PROPERTY, DBE_VALUE};
 use epics_ca_rs::{DbFieldType, EpicsValue};
+use epics_pva_rs::{PvField, ScalarValue};
 use regression_ioc::RegressionIoc;
 use serial_test::serial;
 
@@ -745,5 +748,41 @@ async fn r_record_specific_menu_field_served_as_dbr_enum() {
             dbg.contains(choice),
             "PVA NTEnum must carry record-specific choice {choice:?}, got {dbg}"
         );
+    }
+}
+
+// ---- Family L: unsigned raw/mask field keeps native PVA uint typing --------
+
+/// A `DBF_ULONG` field (mbbo `MASK`) must be served over PVA with its native
+/// **unsigned** wire type (`uint`), not sign-collapsed to a signed `int`. CA
+/// has no unsigned wire types, so this is a PVA-only family. MASK is seeded to
+/// `0x80000000` (the i32-overflow boundary): a signed misread renders it
+/// negative, so the value alone discriminates `uint` from `int`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn l_unsigned_mask_field_keeps_native_pva_uint_type() {
+    let ioc = RegressionIoc::boot().await.expect("boot");
+    let pva = ioc.pva_client();
+
+    let field = tokio::time::timeout(Duration::from_secs(5), pva.pvget("REG:L:MBBO.MASK"))
+        .await
+        .expect("pvget timed out")
+        .expect("pvget");
+
+    // Navigate the NTScalar to its `value` leaf (a field channel still wraps
+    // the scalar in an NTScalar structure).
+    let value = match &field {
+        PvField::Structure(s) => s.get_field("value").expect("NTScalar value field"),
+        other => other,
+    };
+    match value.deref_selected() {
+        PvField::Scalar(ScalarValue::UInt(v)) => assert_eq!(
+            *v, 2_147_483_648,
+            "high-bit MASK must round-trip as an unsigned uint value"
+        ),
+        other => panic!(
+            "DBF_ULONG MASK must be served as a PVA uint (unsigned), not a signed \
+             int; got {other:?}"
+        ),
     }
 }

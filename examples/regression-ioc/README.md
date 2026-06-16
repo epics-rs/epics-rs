@@ -27,6 +27,7 @@ regression in the same family fails a test instead of shipping.
 | O | a record seeded nonzero (MLST/ALST seeded at init) must not post a duplicate VAL on an idempotent reprocess; a real change still posts (process-path no-change, vs B's write-path) | `REG:O:LO` → `o_seeded_record_suppresses_duplicate_post` |
 | P | an array (waveform) channel exposes its VAL display **and** control limit metadata over `DBR_GR`/`DBR_CTRL` (EGU/PREC/HOPR/LOPR + HOPR/LOPR control limits), not a collapsed `[0,0]` range | `REG:P:WF` → `p_array_exposes_gr_and_ctrl_limit_metadata` |
 | R | a **record-specific** `DBF_MENU` field (dfanout `SELM`) is served as `DBR_ENUM` by index over CA and as an NTEnum carrying that record's own choice labels over PVA (the per-record menu branch, vs F's shared `.SCAN`) | `REG:R:DF` → `r_record_specific_menu_field_served_as_dbr_enum` |
+| L | an unsigned `DBF_ULONG` field (mbbo `MASK`, seeded `0x80000000`) is served over PVA with its native **unsigned** `uint` wire type, not sign-collapsed to `int` (PVA-only — CA has no unsigned wire types) | `REG:L:MBBO` → `l_unsigned_mask_field_keeps_native_pva_uint_type` |
 
 Family C is pinned both by the periodic-scan test and by the motor's
 `io_intr_scan_independent` readback path (the actual v0.20.0 mechanism).

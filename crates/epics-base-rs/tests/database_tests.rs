@@ -4385,6 +4385,82 @@ async fn test_seq_dol_lnk_dispatch() {
     }
 }
 
+// C `seqRecord.c::processCallback` (256-268) reads DOLn into the DOn
+// value field (`dbGetLink(&dol, DBR_DOUBLE, &dov)`), drives LNKn with it,
+// then posts DOn on change. The Rust seq dispatch used DOLn only
+// transiently for the LNKn write and never wrote it back into DOn, so a
+// client reading/monitoring DOn saw a stale value.
+#[tokio::test]
+async fn test_seq_writes_dol_readback_into_don() {
+    use epics_base_rs::server::records::seq::SeqRecord;
+    let db = PvDatabase::new();
+    db.add_record("SEQ9_SRC", Box::new(AoRecord::new(42.0)))
+        .await
+        .unwrap();
+    db.add_record("SEQ9_DEST", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    let mut seq = SeqRecord::new();
+    seq.selm = 0; // All
+    seq.dol0 = "SEQ9_SRC".to_string();
+    seq.lnk0 = "SEQ9_DEST".to_string();
+    db.add_record("SEQ9_REC", Box::new(seq)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SEQ9_REC", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // LNK0 driven (existing behaviour).
+    let dest = db.get_pv("SEQ9_DEST").await.unwrap();
+    match dest {
+        EpicsValue::Double(v) => assert!((v - 42.0).abs() < 1e-10),
+        other => panic!("expected Double(42.0), got {other:?}"),
+    }
+    // DO0 read back from DOL0 — was stale (0.0) pre-fix.
+    let do0 = db.get_pv("SEQ9_REC.DO0").await.unwrap();
+    match do0 {
+        EpicsValue::Double(v) => assert!(
+            (v - 42.0).abs() < 1e-10,
+            "DO0 must hold the DOL0 read-back (C dbGetLink->dov), got {v}"
+        ),
+        other => panic!("expected Double(42.0), got {other:?}"),
+    }
+}
+
+// C `seqRecord.c:182-189` processes a group when its DOLn OR LNKn is a
+// real link. A DOL-only group (real DOLn, empty LNKn) still reads back
+// DOn and posts it, even though nothing is driven. The Rust dispatch
+// skipped any group with an empty LNKn, so DOn never updated.
+#[tokio::test]
+async fn test_seq_dol_only_group_updates_don_with_empty_lnk() {
+    use epics_base_rs::server::records::seq::SeqRecord;
+    let db = PvDatabase::new();
+    db.add_record("SEQ9B_SRC", Box::new(AoRecord::new(7.0)))
+        .await
+        .unwrap();
+    let mut seq = SeqRecord::new();
+    seq.selm = 0; // All
+    seq.dol0 = "SEQ9B_SRC".to_string();
+    // lnk0 stays empty — DOL-only group
+    db.add_record("SEQ9B_REC", Box::new(seq)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SEQ9B_REC", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let do0 = db.get_pv("SEQ9B_REC.DO0").await.unwrap();
+    match do0 {
+        EpicsValue::Double(v) => assert!(
+            (v - 7.0).abs() < 1e-10,
+            "DOL-only group must still read back DO0 (C processes a group \
+             when DOLn is real even with empty LNKn), got {v}"
+        ),
+        other => panic!("expected Double(7.0), got {other:?}"),
+    }
+}
+
 // A process-counting target. `process()` bumps the shared counter so a
 // test can prove whether a link DID or DID NOT process its target.
 struct CountingTarget {

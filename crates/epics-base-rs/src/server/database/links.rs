@@ -1413,9 +1413,32 @@ impl PvDatabase {
                 }
             }
             MultiOut::Seq(groups) => {
+                // DOn value-storage field names (`linkGrp.dov`),
+                // index-aligned with the LNKn/DOLn groups.
+                const DO_NAMES: [&str; 16] = [
+                    "DO0", "DO1", "DO2", "DO3", "DO4", "DO5", "DO6", "DO7", "DO8", "DO9", "DOA",
+                    "DOB", "DOC", "DOD", "DOE", "DOF",
+                ];
+                // C `dbLinkIsConstant` is true for empty and numeric-literal
+                // links; a real link is a DB/CA/PVA PV reference.
+                let is_real = |s: &str| {
+                    !s.is_empty()
+                        && !matches!(
+                            crate::server::record::parse_link_v2(s),
+                            crate::server::record::ParsedLink::Constant(_)
+                        )
+                };
+                let rec_name = rec.read().await.name.clone();
                 for idx in indices {
                     let grp = &groups[idx];
-                    if grp.lnk.is_empty() {
+                    // C `seqRecord.c:182-189`: a group is processed iff its
+                    // LNKn OR DOLn is a real (non-constant) link. When both
+                    // are constant/empty the group is skipped entirely — so
+                    // a DOL-only group (real DOLn, empty LNKn) still reads
+                    // back DOn and posts it, even though nothing is driven.
+                    let lnk_real = is_real(&grp.lnk);
+                    let dol_real = is_real(&grp.dol);
+                    if !lnk_real && !dol_real {
                         continue;
                     }
                     // Per-group DLYn staggering — C `seqRecord.c`
@@ -1425,31 +1448,52 @@ impl PvDatabase {
                     if grp.dly > 0.0 {
                         tokio::time::sleep(std::time::Duration::from_secs_f64(grp.dly)).await;
                     }
-                    // Value: read from DOLn link, else the stored DOn
-                    // value (linkGrp.dov) — C uses DOn as the value
-                    // when DOLn is a constant/empty link.
-                    let value = if !grp.dol.is_empty() {
+                    // C `seqRecord.c:259` `dbGetLink(&dol, DBR_DOUBLE,
+                    // &dov)`: read DOLn into the DOn value field. A
+                    // constant/empty DOL — or a failed read — leaves DOn at
+                    // its previous value.
+                    let new_dov = if dol_real {
                         let dol_parsed = crate::server::record::parse_link_v2(&grp.dol);
-                        self.read_link_value(&dol_parsed, visited, depth).await
+                        self.read_link_value(&dol_parsed, visited, depth)
+                            .await
+                            .and_then(|v| v.to_f64())
+                            .unwrap_or(grp.dov)
                     } else {
-                        Some(EpicsValue::Double(grp.dov))
+                        grp.dov
                     };
-                    if let Some(value) = value {
-                        // C `seqRecord.c:264` drives each LNKn via
-                        // `dbPutLink`, whose `DBF_OUTLINK` target is
-                        // processed by `dbDbPutValue` (`dbDbLink.c:388`)
-                        // only when the link carries an explicit `PP`
-                        // modifier. A bare `LNKn` is NPP — the value is
-                        // written but the target is NOT processed.
-                        // `parse_output_link_v2` applies that
-                        // OUT-link-correct NPP default (the dfanout arm
-                        // above open-codes the same downgrade).
-                        // LNKn may be a local DB link or an external
-                        // `ca://`/`pva://` link — C `dbPutLink` routes
-                        // both through the link set's `putValue`
-                        // (dbLink.c:434-448).
+                    // C `seqRecord.c:264` drives LNKn via `dbPutLink`
+                    // (`DBR_DOUBLE, &dov`), whose `DBF_OUTLINK` target is
+                    // processed by `dbDbPutValue` (`dbDbLink.c:388`) only
+                    // when the link carries an explicit `PP` modifier. A
+                    // bare `LNKn` is NPP — the value is written but the
+                    // target is NOT processed. `parse_output_link_v2`
+                    // applies that NPP default (the dfanout arm above
+                    // open-codes the same downgrade). LNKn may be a local DB
+                    // link or an external `ca://`/`pva://` link — C
+                    // `dbPutLink` routes both through the link set's
+                    // `putValue` (dbLink.c:434-448). Only a real LNK does
+                    // anything; a constant LNK is a no-op.
+                    if lnk_real {
                         let lnk_parsed = crate::server::record::parse_output_link_v2(&grp.lnk);
-                        self.write_out_link_value(&lnk_parsed, value, out_src, visited, depth)
+                        self.write_out_link_value(
+                            &lnk_parsed,
+                            EpicsValue::Double(new_dov),
+                            out_src,
+                            visited,
+                            depth,
+                        )
+                        .await;
+                    }
+                    // C `seqRecord.c:266-268`: store DOn and post a
+                    // DBE_VALUE|DBE_LOG monitor only when it changed. The
+                    // field already holds the old value (snapshot read), so
+                    // `post_fields` (write + post) is needed only on change.
+                    if new_dov != grp.dov {
+                        let _ = self
+                            .post_fields(
+                                &rec_name,
+                                vec![(DO_NAMES[idx].to_string(), EpicsValue::Double(new_dov))],
+                            )
                             .await;
                     }
                 }

@@ -217,6 +217,23 @@ impl Hdf5Layout {
         found
     }
 
+    /// Enumerate every detector-source dataset's full path (leading slash), in
+    /// document order. C `NDFileHDF5` holds one `NDFileHDF5Dataset` per
+    /// `<dataset source="detector">` node in `detDataMap`, each created by
+    /// `createDatasetDetector` (NDFileHDF5.cpp:1324-1357) and keyed by
+    /// `get_full_name()` — the same leading-slash full path produced here. The
+    /// writer creates *all* of them up front and routes each frame to one of
+    /// them by the `detector_data_destination` NDAttribute.
+    pub fn detector_dataset_paths(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        self.for_each_dataset(|path, d| {
+            if d.source == LayoutSource::Detector {
+                out.push(format!("{}/{}", path, d.name));
+            }
+        });
+        out
+    }
+
     /// Find the group path of the first dataset named `name`, returning the
     /// owning group's full path (the C `NDFileHDF5` performance dataset is a
     /// `<dataset name="timestamp">` in the layout tree).

@@ -246,14 +246,31 @@ impl rust_hdf5::types::H5Type for FixedStr256 {
     }
 }
 
+/// Write state for one detector-source dataset (C `NDFileHDF5Dataset` held in
+/// `detDataMap`). Each `<dataset source="detector">` node gets its own live
+/// dataset handle, leading-axis frame counter, and partial chunk band so
+/// `detector_data_destination` routing can send frames to different datasets,
+/// each extending independently. The on-disk datatype/dataspace/frame shape are
+/// shared (set from the first frame) and live on `Hdf5Writer`.
+struct DetectorDataset {
+    /// Live dataset handle, retained across frames so the leading dimension can
+    /// be extended (`H5File::dataset` cannot re-open a dataset in write mode).
+    ds: rust_hdf5::H5Dataset,
+    /// Frames routed to THIS dataset — its leading-axis index and final extent.
+    frame_count: usize,
+    /// LE bytes of frames buffered for THIS dataset until a `nFramesChunks`-deep
+    /// chunk band fills. With one frame per chunk this holds at most one frame.
+    frame_band: Vec<Vec<u8>>,
+}
+
 /// Internal handle: either a standard H5File or a SWMR streaming writer.
 enum Hdf5Handle {
     Standard {
         file: H5File,
-        /// Primary image dataset handle, created lazily on the first frame.
-        /// Retained across frames so the leading dimension can be extended
-        /// (`H5File::dataset` cannot re-open a dataset in write mode).
-        primary: Option<rust_hdf5::H5Dataset>,
+        /// Detector image datasets keyed by C full name (leading slash) — the
+        /// C `detDataMap`. Created lazily on the first frame; one entry for the
+        /// common single-`<dataset source="detector">` layout.
+        detectors: std::collections::HashMap<String, DetectorDataset>,
     },
     Swmr {
         // Boxed: `SwmrFileWriter` is much larger than the `Standard` variant.
@@ -269,11 +286,11 @@ enum Hdf5Handle {
 pub struct Hdf5Writer {
     current_path: Option<PathBuf>,
     handle: Option<Hdf5Handle>,
+    /// Total frames written to the file this open (C `nextRecord` across all
+    /// detector datasets): drives the create-on-first-frame gate, the
+    /// `frame_count()` accessor and the attribute-dataset row count. Per-dataset
+    /// leading-axis placement uses each [`DetectorDataset`]'s own `frame_count`.
     frame_count: usize,
-    /// Standard-mode frame band: LE bytes of frames buffered until a
-    /// `nFramesChunks`-deep chunk band fills. With one frame per chunk this
-    /// holds at most one frame.
-    frame_band: Vec<Vec<u8>>,
     dataset_name: String,
     /// Cached data type of the open primary dataset.
     open_data_type: Option<NDDataType>,
@@ -350,7 +367,6 @@ impl Hdf5Writer {
             current_path: None,
             handle: None,
             frame_count: 0,
-            frame_band: Vec::new(),
             dataset_name: "data".to_string(),
             open_data_type: None,
             open_frame_dims: None,
@@ -879,39 +895,40 @@ impl Hdf5Writer {
         Ok(())
     }
 
-    /// Flush any partial frame band and trim the primary dataset's logical
-    /// extent to the exact frame count. Called from `close_file`.
-    fn finalize_standard_primary(&mut self) -> ADResult<()> {
+    /// Flush each detector dataset's partial frame band and trim its logical
+    /// extent to its own frame count. Called from `close_file`. Every dataset in
+    /// `detDataMap` is finalised independently, each at the count of frames the
+    /// `detector_data_destination` routing sent it (C closes every
+    /// `NDFileHDF5Dataset` it created, not just the default).
+    fn finalize_standard_datasets(&mut self) -> ADResult<()> {
         let Some(frame_dims) = self.open_frame_dims.clone() else {
             return Ok(());
         };
         let (_, chunk, leading) = self.standard_layout(&frame_dims);
         let elem_size = self.open_data_type.map(|t| t.element_size()).unwrap_or(1);
-        let total = self.frame_count;
         let fc = chunk[0];
-        {
-            let ds = match &self.handle {
-                Some(Hdf5Handle::Standard {
-                    primary: Some(ds), ..
-                }) => ds,
-                _ => return Ok(()),
-            };
+        let Some(Hdf5Handle::Standard { detectors, .. }) = self.handle.as_mut() else {
+            return Ok(());
+        };
+        for det in detectors.values_mut() {
+            let total = det.frame_count;
             // A partial band only survives the extensible single-axis layout
             // (the fixed multi-dim layout writes one frame per call, `fc == 1`).
-            if !self.frame_band.is_empty() {
+            if !det.frame_band.is_empty() {
                 let last = total.saturating_sub(1);
                 let leading_coords = match &leading {
                     Some(lead) => Self::unravel(last, lead),
                     None => vec![last / fc],
                 };
                 Self::flush_band(
-                    ds,
+                    &det.ds,
                     &leading_coords,
-                    &self.frame_band,
+                    &det.frame_band,
                     &frame_dims,
                     &chunk,
                     elem_size,
                 )?;
+                det.frame_band.clear();
             }
             // Trim the logical extent: write_chunk_at rounds dims up to chunk
             // boundaries; set_extent restores the exact frame shape. The
@@ -920,12 +937,11 @@ impl Hdf5Writer {
             if total > 0 {
                 let mut dims = leading.clone().unwrap_or_else(|| vec![total]);
                 dims.extend_from_slice(&frame_dims);
-                ds.set_extent(&dims).map_err(|e| {
+                det.ds.set_extent(&dims).map_err(|e| {
                     ADError::UnsupportedConversion(format!("HDF5 set_extent error: {}", e))
                 })?;
             }
         }
-        self.frame_band.clear();
         Ok(())
     }
 
@@ -1390,10 +1406,14 @@ impl Hdf5Writer {
         current.ok_or_else(|| ADError::UnsupportedConversion("empty group path".into()))
     }
 
-    /// Create the primary image dataset on first frame in standard mode.
-    /// The dataset is a single extensible `[nframes, .., Y, X]` array; later
-    /// frames extend the leading dimension (C++ `NDFileHDF5Dataset`).
-    fn create_primary_dataset(&mut self, array: &NDArray) -> ADResult<()> {
+    /// Create every detector-source dataset on the first frame in standard
+    /// mode. Each is an extensible `[nframes, .., Y, X]` array whose leading
+    /// dimension later frames extend (C++ `NDFileHDF5Dataset`). C creates one
+    /// `NDFileHDF5Dataset` per `<dataset source="detector">` node up front
+    /// (`createDatasetDetector`, NDFileHDF5.cpp:1324-1357) and routes frames
+    /// among them; the common single-dataset layout produces exactly one. All
+    /// datasets share the datatype/dataspace/frame shape taken from this frame.
+    fn create_detector_datasets(&mut self, array: &NDArray) -> ADResult<()> {
         let frame_dims: Vec<usize> = array.dims.iter().rev().map(|d| d.size).collect();
         let (shape, chunk, leading) = self.standard_layout(&frame_dims);
         let element_size = array.data.data_type().element_size();
@@ -1426,47 +1446,51 @@ impl Hdf5Writer {
             _ => return Err(ADError::UnsupportedConversion("no HDF5 file open".into())),
         }
 
-        // Collect the `constant` HDF5 attributes the layout XML attaches to the
-        // primary image dataset (the one at `resolved_dataset_path`, e.g. the
-        // NeXus `signal=1` marker). Only constant attributes are materialised
-        // here; `ndattribute`-sourced attribute nodes carry per-frame values
-        // and are out of scope for the static dataset-creation path.
-        let resolved_ds = self.resolved_dataset_path.clone();
-        let layout_ds_attrs: Vec<(String, crate::hdf5_layout::LayoutDataType, String)> = self
-            .layout
-            .as_ref()
-            .map(|l| {
-                use crate::hdf5_layout::LayoutSource;
-                let mut out = Vec::new();
-                l.for_each_dataset(|path, d| {
-                    let full = format!("{}/{}", path, d.name);
-                    if full.trim_start_matches('/') == resolved_ds {
-                        for a in &d.attributes {
-                            if a.source == LayoutSource::Constant {
-                                out.push((a.name.clone(), a.data_type, a.value.clone()));
-                            }
-                        }
-                    }
-                });
-                out
-            })
-            .unwrap_or_default();
-
-        let h5file = match self.handle {
-            Some(Hdf5Handle::Standard { ref file, .. }) => file,
-            _ => return Err(ADError::UnsupportedConversion("no HDF5 file open".into())),
+        // Enumerate every detector-source dataset (C `detDataMap`), each with
+        // the `constant` HDF5 attributes the layout XML attaches to it (e.g. the
+        // NeXus `signal=1` marker). Keys are leading-slash full names so the
+        // `detector_data_destination` routing value matches C `detDataMap`.
+        // Only constant attributes are materialised here; `ndattribute`-sourced
+        // nodes carry per-frame values, out of scope for dataset creation.
+        let detector_keys: Vec<String> = match self.layout.as_ref() {
+            Some(l) => {
+                let mut keys = l.detector_dataset_paths();
+                if keys.is_empty() {
+                    keys.push(format!("/{}", self.resolved_dataset_path));
+                }
+                keys
+            }
+            None => vec![format!("/{}", self.resolved_dataset_path)],
         };
-
-        // Resolve the dataset's parent group and leaf name. `resolved_dataset_path`
-        // is e.g. `entry/instrument/detector/data` with a layout, or `data` flat.
-        let (ds_group, ds_name): (Option<rust_hdf5::H5Group>, String) =
-            match self.resolved_dataset_path.rsplit_once('/') {
-                Some((group_path, leaf)) => (
-                    Some(Self::open_write_group(h5file, group_path)?),
-                    leaf.to_string(),
-                ),
-                None => (None, self.resolved_dataset_path.clone()),
-            };
+        let detector_specs: Vec<(
+            String,
+            Vec<(String, crate::hdf5_layout::LayoutDataType, String)>,
+        )> = detector_keys
+            .iter()
+            .map(|key| {
+                let stripped = key.trim_start_matches('/').to_string();
+                let attrs = self
+                    .layout
+                    .as_ref()
+                    .map(|l| {
+                        use crate::hdf5_layout::LayoutSource;
+                        let mut out = Vec::new();
+                        l.for_each_dataset(|path, d| {
+                            let full = format!("{}/{}", path, d.name);
+                            if full.trim_start_matches('/') == stripped {
+                                for a in &d.attributes {
+                                    if a.source == LayoutSource::Constant {
+                                        out.push((a.name.clone(), a.data_type, a.value.clone()));
+                                    }
+                                }
+                            }
+                        });
+                        out
+                    })
+                    .unwrap_or_default();
+                (key.clone(), attrs)
+            })
+            .collect();
 
         let dtype_ordinal = array.data.data_type() as i32;
         let fill = self.fill_value;
@@ -1506,10 +1530,10 @@ impl Hdf5Writer {
         };
 
         macro_rules! create_ds {
-            ($t:ty) => {{
-                let mut builder = match ds_group.as_ref() {
+            ($t:ty, $h5file:expr, $ds_group:expr, $ds_name:expr, $constant_attrs:expr) => {{
+                let mut builder = match $ds_group.as_ref() {
                     Some(g) => g.new_dataset::<$t>(),
-                    None => h5file.new_dataset::<$t>(),
+                    None => $h5file.new_dataset::<$t>(),
                 }
                 .shape(&shape[..])
                 .chunk(&chunk[..])
@@ -1523,7 +1547,7 @@ impl Hdf5Writer {
                 if let Some(ref pl) = pipeline {
                     builder = builder.filter_pipeline(pl.clone());
                 }
-                let ds = builder.create(ds_name.as_str()).map_err(|e| {
+                let ds = builder.create($ds_name.as_str()).map_err(|e| {
                     ADError::UnsupportedConversion(format!("HDF5 dataset error: {}", e))
                 })?;
                 // Record the exact NDArray data type for lossless read-back.
@@ -1574,7 +1598,7 @@ impl Hdf5Writer {
                 }
                 // Materialise the layout XML's constant dataset attributes
                 // (e.g. NeXus `signal=1`), typed per the XML `type` attribute.
-                for (aname, atype, avalue) in &layout_ds_attrs {
+                for (aname, atype, avalue) in $constant_attrs {
                     use crate::hdf5_layout::LayoutDataType;
                     match atype {
                         LayoutDataType::Int => {
@@ -1625,32 +1649,103 @@ impl Hdf5Writer {
             }};
         }
 
-        let ds = match array.data {
-            NDDataBuffer::I8(_) => create_ds!(i8),
-            NDDataBuffer::U8(_) => create_ds!(u8),
-            NDDataBuffer::I16(_) => create_ds!(i16),
-            NDDataBuffer::U16(_) => create_ds!(u16),
-            NDDataBuffer::I32(_) => create_ds!(i32),
-            NDDataBuffer::U32(_) => create_ds!(u32),
-            NDDataBuffer::I64(_) => create_ds!(i64),
-            NDDataBuffer::U64(_) => create_ds!(u64),
-            NDDataBuffer::F32(_) => create_ds!(f32),
-            NDDataBuffer::F64(_) => create_ds!(f64),
+        let h5file = match self.handle {
+            Some(Hdf5Handle::Standard { ref file, .. }) => file,
+            _ => return Err(ADError::UnsupportedConversion("no HDF5 file open".into())),
         };
 
-        if let Some(Hdf5Handle::Standard { primary, .. }) = self.handle.as_mut() {
-            *primary = Some(ds);
+        let mut detectors: std::collections::HashMap<String, DetectorDataset> =
+            std::collections::HashMap::with_capacity(detector_specs.len());
+        for (key, constant_attrs) in &detector_specs {
+            // Resolve each dataset's parent group and leaf name. A key is e.g.
+            // `/entry/instrument/detector/data` with a layout, or `/data` flat.
+            let stripped = key.trim_start_matches('/');
+            let (ds_group, ds_name): (Option<rust_hdf5::H5Group>, String) =
+                match stripped.rsplit_once('/') {
+                    Some((group_path, leaf)) => (
+                        Some(Self::open_write_group(h5file, group_path)?),
+                        leaf.to_string(),
+                    ),
+                    None => (None, stripped.to_string()),
+                };
+            let ds = match array.data {
+                NDDataBuffer::I8(_) => create_ds!(i8, h5file, ds_group, ds_name, constant_attrs),
+                NDDataBuffer::U8(_) => create_ds!(u8, h5file, ds_group, ds_name, constant_attrs),
+                NDDataBuffer::I16(_) => create_ds!(i16, h5file, ds_group, ds_name, constant_attrs),
+                NDDataBuffer::U16(_) => create_ds!(u16, h5file, ds_group, ds_name, constant_attrs),
+                NDDataBuffer::I32(_) => create_ds!(i32, h5file, ds_group, ds_name, constant_attrs),
+                NDDataBuffer::U32(_) => create_ds!(u32, h5file, ds_group, ds_name, constant_attrs),
+                NDDataBuffer::I64(_) => create_ds!(i64, h5file, ds_group, ds_name, constant_attrs),
+                NDDataBuffer::U64(_) => create_ds!(u64, h5file, ds_group, ds_name, constant_attrs),
+                NDDataBuffer::F32(_) => create_ds!(f32, h5file, ds_group, ds_name, constant_attrs),
+                NDDataBuffer::F64(_) => create_ds!(f64, h5file, ds_group, ds_name, constant_attrs),
+            };
+            detectors.insert(
+                key.clone(),
+                DetectorDataset {
+                    ds,
+                    frame_count: 0,
+                    frame_band: Vec::new(),
+                },
+            );
+        }
+
+        if let Some(Hdf5Handle::Standard { detectors: d, .. }) = self.handle.as_mut() {
+            *d = detectors;
         }
         self.open_data_type = Some(array.data.data_type());
         self.open_frame_dims = Some(frame_dims);
         Ok(())
     }
 
-    /// Write a frame in standard (non-SWMR) mode into the single extensible
-    /// dataset, extending its leading dimension.
+    /// Resolve which detector dataset a frame is written to (C
+    /// `NDFileHDF5::writeFile`, NDFileHDF5.cpp:1449-1474). The default is
+    /// `defDsetName` — the leading-slash full name of the `det_default`/first
+    /// detector dataset (= `resolved_dataset_path`). When the layout's
+    /// `<global name="detector_data_destination" ndattribute="X"/>` names an
+    /// NDAttribute that the frame carries as a *string* whose value is an
+    /// existing detector-dataset key, that key is the destination; an unknown
+    /// value falls back to the default. A present-but-non-string attribute is
+    /// an error, matching C (`getValue(NDAttrString,…)` → `ND_ERROR`, which
+    /// aborts the write).
+    fn resolve_destination_key(&self, array: &NDArray) -> ADResult<String> {
+        let default = format!("/{}", self.resolved_dataset_path);
+        let attr_name = self
+            .layout
+            .as_ref()
+            .and_then(|l| l.detector_data_destination.as_deref())
+            .filter(|s| !s.is_empty());
+        let Some(attr_name) = attr_name else {
+            return Ok(default);
+        };
+        // C 1451-1452: a missing destination attribute keeps the default with
+        // no error (only a present-but-unreadable one aborts).
+        let Some(attr) = array.attributes.get(attr_name) else {
+            return Ok(default);
+        };
+        match attr.value.as_string_typed() {
+            Some(value) => {
+                let known = matches!(
+                    &self.handle,
+                    Some(Hdf5Handle::Standard { detectors, .. })
+                        if detectors.contains_key(value)
+                );
+                Ok(if known { value.to_string() } else { default })
+            }
+            None => Err(ADError::UnsupportedConversion(format!(
+                "HDF5 detector_data_destination attribute '{}' is not a string",
+                attr_name
+            ))),
+        }
+    }
+
+    /// Write a frame in standard (non-SWMR) mode, routing it to its detector
+    /// dataset (C `detector_data_destination`) and extending that dataset's
+    /// leading dimension. Each detector dataset keeps its own frame counter and
+    /// band; the file-wide `frame_count` is the total across all of them.
     fn write_standard(&mut self, array: &NDArray) -> ADResult<()> {
         if self.frame_count == 0 {
-            self.create_primary_dataset(array)?;
+            self.create_detector_datasets(array)?;
             self.create_attribute_datasets(array);
         }
 
@@ -1667,55 +1762,63 @@ impl Hdf5Writer {
         }
 
         let (_shape, chunk, leading) = self.standard_layout(&frame_dims);
-        let frame_idx = self.frame_count;
         let elem_size = array.data.data_type().element_size();
         let fc = chunk[0];
 
-        // With a fixed extra-dim layout, the frame counter must not exceed
-        // the product of the extra-dim sizes.
-        if let Some(ref lead) = leading {
-            let total: usize = lead.iter().product();
-            if frame_idx >= total {
-                return Err(ADError::UnsupportedConversion(format!(
-                    "HDF5 extra-dimension capacity exceeded: frame {} >= {}",
-                    frame_idx, total
-                )));
-            }
-        }
+        // Resolve the destination dataset and serialize the frame before
+        // borrowing the detector map mutably.
+        let dest_key = self.resolve_destination_key(array)?;
+        let frame_le = nd_buffer_to_le_bytes(&array.data);
 
-        // The dataset declares a little-endian element type; serialize the
-        // frame to LE explicitly rather than passing host-endian bytes
-        // (see `nd_buffer_to_le_bytes`). Frames accumulate in a band buffer
-        // and a full `fc`-deep band is flushed as a grid of write_chunk_at
-        // tiles; close_file flushes the partial final band. With a fixed
-        // multi-extra-dim layout every leading chunk is 1, so `fc == 1` and
-        // each frame is placed at its odometer position via `unravel`.
-        self.frame_band.push(nd_buffer_to_le_bytes(&array.data));
-        if self.frame_band.len() >= fc {
-            let leading_coords = match &leading {
-                Some(lead) => Self::unravel(frame_idx, lead),
-                None => vec![frame_idx / fc],
+        {
+            let Some(Hdf5Handle::Standard { detectors, .. }) = self.handle.as_mut() else {
+                return Err(ADError::UnsupportedConversion(
+                    "HDF5 detector datasets not initialised".into(),
+                ));
             };
-            let ds = match self.handle {
-                Some(Hdf5Handle::Standard {
-                    primary: Some(ref ds),
-                    ..
-                }) => ds,
-                _ => {
-                    return Err(ADError::UnsupportedConversion(
-                        "HDF5 primary dataset not initialised".into(),
-                    ));
+            let det = detectors.get_mut(&dest_key).ok_or_else(|| {
+                ADError::UnsupportedConversion(format!(
+                    "HDF5 destination dataset '{}' not found",
+                    dest_key
+                ))
+            })?;
+
+            // Per-dataset leading-axis index. With a fixed extra-dim layout the
+            // counter must not exceed the product of the extra-dim sizes.
+            let frame_idx = det.frame_count;
+            if let Some(ref lead) = leading {
+                let total: usize = lead.iter().product();
+                if frame_idx >= total {
+                    return Err(ADError::UnsupportedConversion(format!(
+                        "HDF5 extra-dimension capacity exceeded: frame {} >= {}",
+                        frame_idx, total
+                    )));
                 }
-            };
-            Self::flush_band(
-                ds,
-                &leading_coords,
-                &self.frame_band,
-                &frame_dims,
-                &chunk,
-                elem_size,
-            )?;
-            self.frame_band.clear();
+            }
+
+            // The dataset declares a little-endian element type. Frames
+            // accumulate in this dataset's band and a full `fc`-deep band is
+            // flushed as a grid of write_chunk_at tiles; close_file flushes the
+            // partial final band. With a fixed multi-extra-dim layout every
+            // leading chunk is 1, so `fc == 1` and each frame is placed at its
+            // odometer position via `unravel`.
+            det.frame_band.push(frame_le);
+            if det.frame_band.len() >= fc {
+                let leading_coords = match &leading {
+                    Some(lead) => Self::unravel(frame_idx, lead),
+                    None => vec![frame_idx / fc],
+                };
+                Self::flush_band(
+                    &det.ds,
+                    &leading_coords,
+                    &det.frame_band,
+                    &frame_dims,
+                    &chunk,
+                    elem_size,
+                )?;
+                det.frame_band.clear();
+            }
+            det.frame_count += 1;
         }
 
         // Append NDAttribute values for this frame.
@@ -1821,14 +1924,14 @@ impl Hdf5Writer {
     ///
     /// Group attributes are written through the file handle. Dataset attributes
     /// need a live dataset handle (rust-hdf5 cannot reopen a dataset by name in
-    /// write mode), which only the primary image dataset retains at close — so
-    /// dataset element-attrs are honoured for the detector dataset and skipped
-    /// for the lazily-created attribute/performance datasets (an exotic case,
-    /// recorded as a residual in the parity inventory).
+    /// write mode); every detector dataset retains its handle in `detectors` at
+    /// close, so dataset element-attrs are honoured for any detector dataset and
+    /// skipped only for the lazily-created attribute/performance datasets (an
+    /// exotic case, recorded as a residual in the parity inventory).
     fn flush_ndattr_element_attrs(
         &self,
         file: &H5File,
-        primary: Option<&rust_hdf5::H5Dataset>,
+        detectors: &std::collections::HashMap<String, DetectorDataset>,
     ) -> ADResult<()> {
         use crate::hdf5_layout::LayoutWhen;
         let Some(layout) = self.layout.as_ref() else {
@@ -1847,12 +1950,11 @@ impl Hdf5Writer {
             };
             let path = e.element_path.trim_start_matches('/');
             if e.is_dataset {
-                // Only the primary image dataset has a live write handle at
-                // close; other datasets are skipped (residual).
-                if path == self.resolved_dataset_path {
-                    if let Some(ds) = primary {
-                        write_ndattr_dataset_attr(ds, &e.attr_name, value);
-                    }
+                // A detector dataset retains a live write handle at close; the
+                // lazily-created attribute/performance datasets are skipped
+                // (residual). `detectors` is keyed by leading-slash full name.
+                if let Some(det) = detectors.get(&e.element_path) {
+                    write_ndattr_dataset_attr(&det.ds, &e.attr_name, value);
                 }
             } else {
                 let group = Self::open_write_group(file, path)?;
@@ -2364,7 +2466,6 @@ impl NDFileWriter for Hdf5Writer {
         self.current_path = Some(path.to_path_buf());
         self.open_mode = mode;
         self.frame_count = 0;
-        self.frame_band.clear();
         self.total_runtime = 0.0;
         self.total_bytes = 0;
         self.swmr_cb_counter = 0;
@@ -2388,7 +2489,7 @@ impl NDFileWriter for Hdf5Writer {
                 .map_err(|e| ADError::UnsupportedConversion(format!("HDF5 create error: {}", e)))?;
             self.handle = Some(Hdf5Handle::Standard {
                 file: h5file,
-                primary: None,
+                detectors: std::collections::HashMap::new(),
             });
             Ok(())
         }
@@ -2492,10 +2593,10 @@ impl NDFileWriter for Hdf5Writer {
     fn close_file(&mut self) -> ADResult<()> {
         match self.handle {
             Some(Hdf5Handle::Standard { .. }) => {
-                // Flush the partial frame band and trim the logical extent,
-                // then emit the accumulated attribute and performance
+                // Flush each detector dataset's partial frame band and trim its
+                // extent, then emit the accumulated attribute and performance
                 // datasets before the file is finalised.
-                self.finalize_standard_primary()?;
+                self.finalize_standard_datasets()?;
                 self.flush_attribute_datasets()?;
                 self.flush_performance_dataset()?;
                 // Materialise layout `<hardlink>` elements last, once every
@@ -2503,13 +2604,13 @@ impl NDFileWriter for Hdf5Writer {
                 match self.handle {
                     Some(Hdf5Handle::Standard {
                         ref file,
-                        ref primary,
+                        ref detectors,
                     }) => {
                         self.build_layout_hardlinks(file)?;
                         // Every group and dataset now exists, so layout
                         // `<attribute source="ndattribute">` element-attrs can
                         // be attached with their open/close values (ADP-79).
-                        self.flush_ndattr_element_attrs(file, primary.as_ref())?;
+                        self.flush_ndattr_element_attrs(file, detectors)?;
                     }
                     _ => unreachable!("handle is Standard in this arm"),
                 }
@@ -4481,6 +4582,155 @@ mod tests {
         reader.current_path = Some(path.clone());
         let read_arr = reader.read_file().unwrap();
         assert_eq!(read_arr.dims.len(), 3);
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&layout).ok();
+    }
+
+    /// Layout XML declaring two `<dataset source="detector">` nodes plus a
+    /// `<global name="detector_data_destination">`. C `NDFileHDF5` creates
+    /// every detector dataset up front (`detDataMap`) and routes each frame to
+    /// the one named by the destination NDAttribute, defaulting to the
+    /// `det_default` dataset for an absent or unknown value
+    /// (NDFileHDF5.cpp:1449-1519). Frames must land in the right dataset and
+    /// each dataset must extend to exactly the count it received.
+    #[test]
+    fn test_detector_data_destination_routes_by_attribute() {
+        let dir = std::env::temp_dir();
+        let layout = dir.join("adcore_layout_multidet.xml");
+        std::fs::write(
+            &layout,
+            r#"<hdf5_layout>
+              <global name="detector_data_destination" ndattribute="dest"/>
+              <group name="entry">
+                <dataset name="data1" source="detector" det_default="true"/>
+                <dataset name="data2" source="detector"/>
+              </group>
+            </hdf5_layout>"#,
+        )
+        .unwrap();
+
+        let path = temp_path("hdf5_multidet_route");
+        let mut writer = Hdf5Writer::new();
+        // Focus the test on image routing; no attribute time-series datasets.
+        writer.store_attributes = false;
+        assert!(
+            writer.set_layout_filename(layout.to_str().unwrap()),
+            "layout XML must parse: {}",
+            writer.layout_error
+        );
+
+        // Each frame is a uniform 2x2 UInt16 whose value identifies it, with an
+        // optional `dest` string attribute selecting the destination dataset.
+        let mk = |val: u16, dest: Option<&str>| {
+            let mut arr = NDArray::new(
+                vec![NDDimension::new(2), NDDimension::new(2)],
+                NDDataType::UInt16,
+            );
+            if let NDDataBuffer::U16(ref mut v) = arr.data {
+                for p in v.iter_mut() {
+                    *p = val;
+                }
+            }
+            if let Some(d) = dest {
+                arr.attributes.add(NDAttribute::new_static(
+                    "dest",
+                    "",
+                    NDAttrSource::Driver,
+                    NDAttrValue::String(d.to_string()),
+                ));
+            }
+            arr
+        };
+
+        // f0: no dest        -> default data1
+        // f1: /entry/data2   -> data2
+        // f2: /entry/data2   -> data2
+        // f3: /nonexistent   -> unknown, falls back to default data1
+        // f4: /entry/data1   -> explicit default data1
+        let f0 = mk(10, None);
+        writer.open_file(&path, NDFileMode::Stream, &f0).unwrap();
+        writer.write_file(&f0).unwrap();
+        writer.write_file(&mk(11, Some("/entry/data2"))).unwrap();
+        writer.write_file(&mk(12, Some("/entry/data2"))).unwrap();
+        writer.write_file(&mk(13, Some("/nonexistent"))).unwrap();
+        writer.write_file(&mk(14, Some("/entry/data1"))).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let names = h5.dataset_names();
+        assert!(
+            names.contains(&"entry/data1".to_string())
+                && names.contains(&"entry/data2".to_string()),
+            "both detector datasets must exist; got {:?}",
+            names
+        );
+
+        // data1 received f0, f3, f4 (in write order); data2 received f1, f2.
+        let d1 = h5.dataset("entry/data1").unwrap();
+        assert_eq!(d1.shape(), vec![3, 2, 2], "default dataset extent");
+        let v1: Vec<u16> = d1.read_raw().unwrap();
+        assert_eq!(
+            v1,
+            vec![10, 10, 10, 10, 13, 13, 13, 13, 14, 14, 14, 14],
+            "default dataset must hold the default-routed frames in order"
+        );
+
+        let d2 = h5.dataset("entry/data2").unwrap();
+        assert_eq!(d2.shape(), vec![2, 2, 2], "routed dataset extent");
+        let v2: Vec<u16> = d2.read_raw().unwrap();
+        assert_eq!(
+            v2,
+            vec![11, 11, 11, 11, 12, 12, 12, 12],
+            "routed dataset must hold only the frames addressed to it"
+        );
+
+        drop(h5);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&layout).ok();
+    }
+
+    /// A present-but-non-string `detector_data_destination` attribute aborts the
+    /// write, matching C `getValue(NDAttrString,…)` returning `ND_ERROR` →
+    /// `asynError` (NDFileHDF5.cpp:1465-1471).
+    #[test]
+    fn test_detector_data_destination_non_string_attribute_errors() {
+        let dir = std::env::temp_dir();
+        let layout = dir.join("adcore_layout_multidet_err.xml");
+        std::fs::write(
+            &layout,
+            r#"<hdf5_layout>
+              <global name="detector_data_destination" ndattribute="dest"/>
+              <group name="entry">
+                <dataset name="data1" source="detector" det_default="true"/>
+                <dataset name="data2" source="detector"/>
+              </group>
+            </hdf5_layout>"#,
+        )
+        .unwrap();
+
+        let path = temp_path("hdf5_multidet_err");
+        let mut writer = Hdf5Writer::new();
+        writer.store_attributes = false;
+        assert!(writer.set_layout_filename(layout.to_str().unwrap()));
+
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(2), NDDimension::new(2)],
+            NDDataType::UInt16,
+        );
+        arr.attributes.add(NDAttribute::new_static(
+            "dest",
+            "",
+            NDAttrSource::Driver,
+            NDAttrValue::Float64(2.0),
+        ));
+
+        writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+        assert!(
+            writer.write_file(&arr).is_err(),
+            "a non-string destination attribute must abort the write"
+        );
+        writer.close_file().ok();
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&layout).ok();

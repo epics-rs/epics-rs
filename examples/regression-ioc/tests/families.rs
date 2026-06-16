@@ -18,10 +18,11 @@
 //!   M — DBE_PROPERTY posts on a metadata-field change (not DBE_VALUE)
 //!   N — MS-class link propagates the source record's alarm severity
 //!   O — a seeded record suppresses a duplicate first-cycle/idempotent post
+//!   P — an array (waveform) exposes DBR_GR/DBR_CTRL limit metadata
 
 use std::time::Duration;
 
-use epics_base_rs::server::snapshot::Snapshot;
+use epics_base_rs::server::snapshot::{DbrClass, Snapshot};
 use epics_ca_rs::client::MonitorHandle;
 use epics_ca_rs::protocol::{DBE_LOG, DBE_PROPERTY, DBE_VALUE};
 use epics_ca_rs::{DbFieldType, EpicsValue};
@@ -650,5 +651,55 @@ async fn o_seeded_record_suppresses_duplicate_post() {
     assert!(
         changed.is_some(),
         "a real value change (7 -> 8) must still post"
+    );
+}
+
+// ---- Family P: array record exposes DBR_GR / DBR_CTRL limit metadata ------
+
+/// A `DBR_CTRL` GET against an *array* (waveform) channel must carry the same
+/// display AND control limit metadata a scalar would: EGU/PREC/HOPR/LOPR for
+/// the graphic limits and HOPR/LOPR for the control limits (C waveformRecord.c
+/// `get_graphic_double` / `get_control_double`, VAL case). The recurring
+/// regression is arrays dropping the control limits (served as 0/0), so a
+/// client's control range for an array channel collapses to `[0, 0]`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn p_array_exposes_gr_and_ctrl_limit_metadata() {
+    let ioc = RegressionIoc::boot().await.expect("boot");
+    let ca = ioc.ca_client().await;
+
+    let ch = ca.create_channel("REG:P:WF");
+    ch.wait_connected(Duration::from_secs(3))
+        .await
+        .expect("connect");
+
+    // DBR_CTRL is the superset: it carries the graphic (display) limits AND
+    // the control limits, so one GET pins both halves of the family.
+    let snap = ch
+        .get_with_metadata(DbrClass::Ctrl)
+        .await
+        .expect("DBR_CTRL get");
+
+    // Graphic/display half: EGU + PREC + HOPR/LOPR display limits.
+    let disp = snap
+        .display
+        .expect("an array DBR_CTRL must carry display metadata");
+    assert_eq!(disp.units.as_str_lossy(), "mm", "EGU must be served");
+    assert_eq!(disp.precision, 3, "PREC must be served");
+    assert_eq!(disp.upper_disp_limit, 100.0, "HOPR -> upper_disp_limit");
+    assert_eq!(disp.lower_disp_limit, -100.0, "LOPR -> lower_disp_limit");
+
+    // Control half: this is the regression. C maps the waveform VAL control
+    // limits to HOPR/LOPR; dropping them (control = None) collapses to 0/0.
+    let ctrl = snap
+        .control
+        .expect("an array DBR_CTRL must carry control limits, not drop them");
+    assert_eq!(
+        ctrl.upper_ctrl_limit, 100.0,
+        "array control upper limit must be HOPR (100), not 0"
+    );
+    assert_eq!(
+        ctrl.lower_ctrl_limit, -100.0,
+        "array control lower limit must be LOPR (-100), not 0"
     );
 }

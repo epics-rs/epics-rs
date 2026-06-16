@@ -25,6 +25,7 @@ regression in the same family fails a test instead of shipping.
 | M | a metadata-field write (`HOPR`) posts `DBE_PROPERTY` to a `DBE_PROPERTY` subscriber but **not** to a `DBE_VALUE`-only one (the `DBE_PROPERTY` axis of Family I) | `REG:M:AI` → `m_metadata_change_posts_dbe_property` |
 | N | an `MS` (maximize-severity) input link propagates the **source** record's severity into the reader (`recGblInheritSevrMsg`), distinct from G's own-limit severity | `REG:N:*` → `n_ms_link_propagates_source_severity` |
 | O | a record seeded nonzero (MLST/ALST seeded at init) must not post a duplicate VAL on an idempotent reprocess; a real change still posts (process-path no-change, vs B's write-path) | `REG:O:LO` → `o_seeded_record_suppresses_duplicate_post` |
+| P | an array (waveform) channel exposes its VAL display **and** control limit metadata over `DBR_GR`/`DBR_CTRL` (EGU/PREC/HOPR/LOPR + HOPR/LOPR control limits), not a collapsed `[0,0]` range | `REG:P:WF` → `p_array_exposes_gr_and_ctrl_limit_metadata` |
 
 Family C is pinned both by the periodic-scan test and by the motor's
 `io_intr_scan_independent` readback path (the actual v0.20.0 mechanism).

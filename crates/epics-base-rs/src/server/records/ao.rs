@@ -447,18 +447,13 @@ impl Record for AoRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
-        // DOL/OMSL handling is done by the framework (processing.rs) which:
-        // - Reads DOL link value before calling process()
-        // - Applies OIF=0 (Full) or OIF=1 (Incremental: VAL += DOL)
-        // The record only handles constant DOL values that the framework
-        // can't resolve (pure numeric strings without a PV target).
-        if self.omsl == 1 && !self.dol.is_empty() {
-            if let Some(v) = dol_as_constant(&self.dol) {
-                self.val = v;
-            }
-            // PV link DOL: framework already applied the value
-        }
-
+        // DOL/OMSL handling is done by the framework (processing.rs):
+        // - A real (DB/CA/PVA) link is fetched and applied to VAL before
+        //   process() (OIF=0 Full, or OIF=1 Incremental: VAL = PVAL + DOL).
+        // - A *constant* DOL is applied to VAL once at init_record
+        //   (`recGblInitConstantLink` parity) and is NOT re-sourced here;
+        //   C `aoRecord.c:442` gates fetch_value on `!dbLinkIsConstant`,
+        //   so a client caput to VAL is never clobbered by the constant.
         self.convert();
         Ok(ProcessOutcome::complete())
     }

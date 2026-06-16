@@ -1154,7 +1154,20 @@ impl PvDatabase {
                                 crate::server::record::parse_link_v2(s.as_str_lossy().as_ref())
                             })
                             .unwrap_or(crate::server::record::ParsedLink::None);
-                        Some((dol_parsed, oif))
+                        // C `!dbLinkIsConstant(&prec->dol)` gates the per-cycle
+                        // DOL fetch in every OMSL record (e.g.
+                        // `aoRecord.c:442`, `boRecord.c:227`,
+                        // `dfanoutRecord.c:115`): a *constant* DOL is applied to
+                        // VAL exactly once at init via `recGblInitConstantLink`
+                        // and never re-sourced at process — so a client caput to
+                        // VAL is not clobbered every cycle. Only a real
+                        // (DB/CA/PVA) link is fetched here. The per-record init
+                        // application lives in each record's `init_record`.
+                        if matches!(dol_parsed, crate::server::record::ParsedLink::Constant(_)) {
+                            None
+                        } else {
+                            Some((dol_parsed, oif))
+                        }
                     } else {
                         None
                     }

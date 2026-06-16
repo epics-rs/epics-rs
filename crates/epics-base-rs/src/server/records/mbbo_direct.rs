@@ -286,6 +286,23 @@ impl Record for MbboDirectRecord {
     /// bits in the .db file, fold those bits into VAL and clear UDF.
     /// Otherwise (VAL was set explicitly), derive bits from VAL.
     fn post_init_finalize_undef(&mut self, common_udf: &mut bool) -> CaResult<()> {
+        // C `mbboDirectRecord.c::init_record` applies a constant DOL to VAL
+        // once via `recGblInitConstantLink(&prec->dol, DBF_LONG, &prec->val)`,
+        // which clears UDF on success; the bit fields B0..B1F are then
+        // derived from VAL. The framework gate (`processing.rs`) excludes a
+        // constant DOL from the per-cycle closed-loop fetch (C
+        // `!dbLinkIsConstant`), so the constant must be seeded here. Clearing
+        // `common_udf` both matches C (recGblInitConstantLink → udf=FALSE)
+        // and routes the finalize below through `val_to_bits`, so the
+        // observable bit fields reflect the seeded VAL.
+        if let crate::server::record::ParsedLink::Constant(s) =
+            crate::server::record::parse_link_v2(&self.dol)
+        {
+            if let Ok(v) = s.trim().parse::<f64>() {
+                self.val = v as u32;
+                *common_udf = false;
+            }
+        }
         if !*common_udf {
             self.val_to_bits();
         } else {

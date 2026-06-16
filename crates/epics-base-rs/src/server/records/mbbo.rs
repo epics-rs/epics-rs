@@ -730,6 +730,19 @@ impl Record for MbboRecord {
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
+            // C `mbboRecord.c::init_record` applies a constant DOL to VAL
+            // (the state index) once via `recGblInitConstantLink(&prec->dol,
+            // DBF_USHORT, &prec->val)`. The framework gate (`processing.rs`)
+            // excludes a constant DOL from the per-cycle closed-loop fetch
+            // (C `!dbLinkIsConstant`), so it must be seeded here — before
+            // convert() maps the state index to RVAL.
+            if let crate::server::record::ParsedLink::Constant(s) =
+                crate::server::record::parse_link_v2(&self.dol)
+            {
+                if let Ok(v) = s.trim().parse::<f64>() {
+                    self.val = v as u16;
+                }
+            }
             if self.mask == 0 && self.nobt > 0 && self.nobt <= 32 {
                 self.mask = ((1i64 << self.nobt) - 1) as u32;
             }

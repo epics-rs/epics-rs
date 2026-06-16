@@ -180,6 +180,24 @@ impl Record for Int64outRecord {
         "int64out"
     }
 
+    /// C `int64outRecord.c::init_record` applies a constant DOL to VAL once
+    /// via `recGblInitConstantLink(&prec->dol, DBF_INT64, &prec->val)`. The
+    /// framework gate (`processing.rs`) excludes a constant DOL from the
+    /// per-cycle closed-loop fetch (C `!dbLinkIsConstant`), so the constant
+    /// must be seeded here or it would never reach VAL.
+    fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 0 {
+            if let crate::server::record::ParsedLink::Constant(s) =
+                crate::server::record::parse_link_v2(&self.dol)
+            {
+                if let Ok(v) = s.trim().parse::<f64>() {
+                    self.val = v as i64;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// C `int64outRecord.c::convert` (lines 418-423): clamp VAL into the
     /// drive-limit window `[DRVL, DRVH]` every process cycle, but only
     /// when `DRVH > DRVL` (equal limits = no clamping). DRVH/DRVL are

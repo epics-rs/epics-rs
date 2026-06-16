@@ -327,6 +327,24 @@ impl Record for LongoutRecord {
         "longout"
     }
 
+    /// C `longoutRecord.c::init_record` applies a constant DOL to VAL once
+    /// via `recGblInitConstantLink(&prec->dol, DBF_LONG, &prec->val)`. The
+    /// framework gate (`processing.rs`) excludes a constant DOL from the
+    /// per-cycle closed-loop fetch (C `!dbLinkIsConstant`), so the constant
+    /// must be seeded here or it would never reach VAL.
+    fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 0 {
+            if let crate::server::record::ParsedLink::Constant(s) =
+                crate::server::record::parse_link_v2(&self.dol)
+            {
+                if let Ok(v) = s.trim().parse::<f64>() {
+                    self.val = v as i32;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// C `longoutRecord.c::convert` (lines 436-441): clamp VAL into the
     /// drive-limit window `[DRVL, DRVH]` every process cycle, but only
     /// when `DRVH > DRVL` (equal limits = no clamping). Without this an

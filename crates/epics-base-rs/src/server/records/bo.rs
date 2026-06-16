@@ -295,12 +295,12 @@ impl Record for BoRecord {
             self.val = 0;
         }
 
-        // DOL/OMSL: constant DOL handling
-        if self.omsl == 1 && !self.dol.is_empty() {
-            if let Some(v) = dol_as_constant(&self.dol) {
-                self.val = if v != 0 { 1 } else { 0 };
-            }
-        }
+        // DOL/OMSL: a real (DB/CA/PVA) link is fetched and applied to VAL
+        // by the framework before process(). A *constant* DOL is applied
+        // once at init_record (`recGblInitConstantLink` parity) and is NOT
+        // re-sourced here; C `boRecord.c:227` gates the fetch on
+        // `!dbLinkIsConstant`, so a client caput to VAL is never clobbered
+        // by the constant every cycle.
 
         // Convert val to rval using mask
         self.val_to_rval();

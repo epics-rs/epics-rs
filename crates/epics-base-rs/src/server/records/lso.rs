@@ -232,6 +232,29 @@ impl Record for LsoRecord {
         (self.mpst == MENU_POST_ALWAYS, self.apst == MENU_POST_ALWAYS)
     }
 
+    /// C `lsoRecord.c::init_record` loads a constant DOL into VAL once via
+    /// `dbLoadLinkLS(&prec->dol, prec->val, prec->sizv, &prec->len)`. The
+    /// framework gate (`processing.rs`) excludes a constant DOL from the
+    /// per-cycle closed-loop fetch (C `!dbLinkIsConstant`), so the constant
+    /// text must be seeded here. A quoted (`"text"`) or bare-numeric (`5`)
+    /// DOL parses to `ParsedLink::Constant`; its text is copied into the
+    /// long-string VAL and LEN is set to the C `strlen+1` convention.
+    fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 0 {
+            if let crate::server::record::ParsedLink::Constant(s) =
+                crate::server::record::parse_link_v2(&self.dol)
+            {
+                self.val = PvString::from(s);
+                self.len = if self.val.is_empty() {
+                    0
+                } else {
+                    (self.val.len() + 1).min(256) as u32
+                };
+            }
+        }
+        Ok(())
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // C `lsoRecord.c::monitor` (lines 244-256): copy OVAL and bump
         // OLEN only when the value actually changed, and raise

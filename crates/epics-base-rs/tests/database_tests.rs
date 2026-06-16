@@ -7061,3 +7061,225 @@ async fn test_ao_incremental_dol_increments_from_pval_not_val() {
         "cycle 2 must increment from PVAL=10 (=>15), not caput VAL=100 (=>105); got {v2:?}"
     );
 }
+
+/// A *constant* DOL (`field(DOL,"7")`) with `OMSL=closed_loop` is applied to
+/// VAL exactly once at init (`recGblInitConstantLink`), and the framework's
+/// per-cycle closed-loop fetch is gated out for constants
+/// (C `!dbLinkIsConstant`, e.g. `aoRecord.c:442`). A client caput to VAL
+/// must therefore survive a subsequent process — the constant is NOT
+/// re-applied every cycle. Before the fix, both the framework
+/// (`read_link_value` resolving a constant) and `ao::process` re-stamped the
+/// constant each cycle, clobbering the caput. Record-level-removal path (ao).
+#[tokio::test]
+async fn ao_constant_dol_seeded_at_init_not_reapplied_at_process() {
+    let db = PvDatabase::new();
+    let mut ao = AoRecord::new(0.0);
+    ao.omsl = 1; // closed_loop
+    ao.dol = "7".to_string(); // constant DOL
+    ao.init_record(0).unwrap(); // recGblInitConstantLink: VAL = 7
+    db.add_record("AO_CONST", Box::new(ao)).await.unwrap();
+
+    let v0 = db.get_pv("AO_CONST").await.unwrap();
+    assert!(
+        matches!(v0, EpicsValue::Double(v) if (v - 7.0).abs() < 1e-10),
+        "constant DOL must seed VAL=7 at init, got {v0:?}"
+    );
+
+    // Process once: the constant must not be re-sourced; VAL stays 7.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("AO_CONST", &mut visited, 0)
+        .await
+        .unwrap();
+    let v1 = db.get_pv("AO_CONST").await.unwrap();
+    assert!(
+        matches!(v1, EpicsValue::Double(v) if (v - 7.0).abs() < 1e-10),
+        "process must not change a constant-DOL VAL, got {v1:?}"
+    );
+
+    // A client caputs VAL=42.
+    {
+        let arc = db.get_record("AO_CONST").await.unwrap();
+        let mut inst = arc.write().await;
+        inst.record
+            .put_field("VAL", EpicsValue::Double(42.0))
+            .unwrap();
+    }
+    // Reprocess: the constant DOL is never re-fetched, so the caput wins.
+    let mut visited2 = HashSet::new();
+    db.process_record_with_links("AO_CONST", &mut visited2, 0)
+        .await
+        .unwrap();
+    let v2 = db.get_pv("AO_CONST").await.unwrap();
+    assert!(
+        matches!(v2, EpicsValue::Double(v) if (v - 42.0).abs() < 1e-10),
+        "constant DOL must not clobber a client caput on reprocess; expected 42, got {v2:?}"
+    );
+}
+
+/// A constant DOL on an `OIF=Incremental` ao does NOT increment. C
+/// `aoRecord.c:181-187` gates `fetch_value` (which holds the Incremental
+/// `*pvalue += prec->val`) on `!dbLinkIsConstant`; a constant DOL takes the
+/// `else { value = prec->val; }` branch, so the OIF mode is irrelevant. The
+/// value tracks VAL (init constant, or a later caput) and never accumulates
+/// the constant each cycle.
+#[tokio::test]
+async fn ao_constant_dol_incremental_does_not_increment() {
+    let db = PvDatabase::new();
+    let mut ao = AoRecord::new(0.0);
+    ao.omsl = 1; // closed_loop
+    ao.oif = 1; // Incremental
+    ao.dol = "5".to_string(); // constant DOL
+    ao.init_record(0).unwrap(); // VAL = 5, PVAL = 5
+    db.add_record("AO_CONST_INCR", Box::new(ao)).await.unwrap();
+
+    // Process three times: a constant must not accumulate (5, 10, 15...).
+    for _ in 0..3 {
+        let mut visited = HashSet::new();
+        db.process_record_with_links("AO_CONST_INCR", &mut visited, 0)
+            .await
+            .unwrap();
+    }
+    let v = db.get_pv("AO_CONST_INCR").await.unwrap();
+    assert!(
+        matches!(v, EpicsValue::Double(x) if (x - 5.0).abs() < 1e-10),
+        "constant DOL + Incremental must stay at the constant (5), not accumulate; got {v:?}"
+    );
+}
+
+/// The framework-only path. `longout` never had a record-level DOL
+/// re-apply — the per-cycle constant re-stamp lived entirely in the
+/// framework (`read_link_value` resolving `ParsedLink::Constant`). The new
+/// `longout::init_record` seeds the constant once; the gate keeps it out of
+/// process. Before the fix, the framework re-applied the constant every
+/// cycle, clobbering a caput.
+#[tokio::test]
+async fn longout_constant_dol_seeded_at_init_not_reapplied_at_process() {
+    use epics_base_rs::server::records::longout::LongoutRecord;
+    let db = PvDatabase::new();
+    let mut lo = LongoutRecord::new(0);
+    lo.omsl = 1; // closed_loop
+    lo.dol = "9".to_string(); // constant DOL
+    lo.init_record(0).unwrap();
+    db.add_record("LO_CONST", Box::new(lo)).await.unwrap();
+
+    let v0 = db.get_pv("LO_CONST").await.unwrap();
+    assert_eq!(
+        v0.to_f64(),
+        Some(9.0),
+        "constant DOL must seed VAL=9 at init"
+    );
+
+    {
+        let arc = db.get_record("LO_CONST").await.unwrap();
+        let mut inst = arc.write().await;
+        inst.record.put_field("VAL", EpicsValue::Long(99)).unwrap();
+    }
+    let mut visited = HashSet::new();
+    db.process_record_with_links("LO_CONST", &mut visited, 0)
+        .await
+        .unwrap();
+    let v1 = db.get_pv("LO_CONST").await.unwrap();
+    assert_eq!(
+        v1.to_f64(),
+        Some(99.0),
+        "constant DOL must not clobber a caput on reprocess (framework-only path)"
+    );
+}
+
+/// The string path. A quoted constant DOL (`field(DOL,"\"hi\"")`) on a
+/// `stringout` is copied into VAL once at init (C
+/// `recGblInitConstantLink(..., DBF_STRING, ...)`); the gate keeps it out of
+/// process so a caput survives.
+#[tokio::test]
+async fn stringout_constant_dol_seeded_at_init_not_reapplied_at_process() {
+    use epics_base_rs::server::records::stringout::StringoutRecord;
+    let db = PvDatabase::new();
+    let mut so = StringoutRecord::new("");
+    so.omsl = 1; // closed_loop
+    so.dol = "\"hi\"".to_string(); // quoted string constant
+    so.init_record(0).unwrap();
+    db.add_record("SO_CONST", Box::new(so)).await.unwrap();
+
+    let v0 = db.get_pv("SO_CONST").await.unwrap();
+    assert!(
+        matches!(&v0, EpicsValue::String(s) if s.as_str_lossy() == "hi"),
+        "quoted constant DOL must seed VAL=\"hi\" at init, got {v0:?}"
+    );
+
+    {
+        let arc = db.get_record("SO_CONST").await.unwrap();
+        let mut inst = arc.write().await;
+        inst.record
+            .put_field("VAL", EpicsValue::String("world".into()))
+            .unwrap();
+    }
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SO_CONST", &mut visited, 0)
+        .await
+        .unwrap();
+    let v1 = db.get_pv("SO_CONST").await.unwrap();
+    assert!(
+        matches!(&v1, EpicsValue::String(s) if s.as_str_lossy() == "world"),
+        "constant DOL must not clobber a string caput on reprocess; got {v1:?}"
+    );
+}
+
+/// Init-time constant-DOL application across the remaining OMSL records that
+/// gained an `init_record`/`post_init` seed. One assertion per record's
+/// value-type boundary (f64 / i64 / long-string / state-index→RVAL /
+/// bit-field decomposition).
+#[tokio::test]
+async fn init_applies_constant_dol_across_record_types() {
+    use epics_base_rs::server::records::dfanout::DfanoutRecord;
+    use epics_base_rs::server::records::int64out::Int64outRecord;
+    use epics_base_rs::server::records::lso::LsoRecord;
+    use epics_base_rs::server::records::mbbo::MbboRecord;
+    use epics_base_rs::server::records::mbbo_direct::MbboDirectRecord;
+
+    // dfanout: DBF_DOUBLE.
+    let mut df = DfanoutRecord::default();
+    df.omsl = 1;
+    df.dol = "3.5".to_string();
+    df.init_record(0).unwrap();
+    assert_eq!(df.val, 3.5, "dfanout constant DOL → VAL=3.5");
+
+    // int64out: DBF_INT64.
+    let mut i64o = Int64outRecord::default();
+    i64o.omsl = 1;
+    i64o.dol = "42".to_string();
+    i64o.init_record(0).unwrap();
+    assert_eq!(i64o.val, 42, "int64out constant DOL → VAL=42");
+
+    // lso: quoted long-string constant.
+    let mut lso = LsoRecord::default();
+    lso.omsl = 1;
+    lso.dol = "\"hello\"".to_string();
+    lso.init_record(0).unwrap();
+    assert_eq!(lso.val.as_str_lossy(), "hello", "lso constant DOL → VAL");
+    assert_eq!(lso.len, 6, "lso LEN = strlen+1 (C convention)");
+
+    // mbbo: constant DOL is the state index; convert() maps it to RVAL
+    // (no state table defined → RVAL == state index).
+    let mut mb = MbboRecord::default();
+    mb.omsl = 1;
+    mb.dol = "2".to_string();
+    mb.init_record(0).unwrap();
+    assert_eq!(mb.val, 2, "mbbo constant DOL → VAL (state index) = 2");
+    assert_eq!(mb.rval, 2, "mbbo convert() maps state index → RVAL");
+
+    // mbbo_direct: constant seeds VAL and the bit fields decompose from it
+    // (5 = 0b101 → B0=1, B1=0, B2=1); UDF cleared.
+    let mut mbd = MbboDirectRecord::default();
+    mbd.omsl = 1;
+    mbd.dol = "5".to_string();
+    let mut udf = true;
+    mbd.post_init_finalize_undef(&mut udf).unwrap();
+    assert_eq!(mbd.val, 5, "mbbo_direct constant DOL → VAL=5");
+    assert_eq!(mbd.bits[0], 1, "mbbo_direct B0 from VAL=5");
+    assert_eq!(mbd.bits[1], 0, "mbbo_direct B1 from VAL=5");
+    assert_eq!(mbd.bits[2], 1, "mbbo_direct B2 from VAL=5");
+    assert!(
+        !udf,
+        "mbbo_direct constant DOL clears UDF (recGblInitConstantLink)"
+    );
+}

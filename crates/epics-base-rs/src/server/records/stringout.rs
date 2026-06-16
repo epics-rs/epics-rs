@@ -158,6 +158,24 @@ impl Record for StringoutRecord {
         }
     }
 
+    /// C `stringoutRecord.c::init_record` applies a constant DOL to VAL
+    /// once via `recGblInitConstantLink(&prec->dol, DBF_STRING, prec->val)`.
+    /// The framework gate (`processing.rs`) excludes a constant DOL from
+    /// the per-cycle closed-loop fetch (C `!dbLinkIsConstant`), so the
+    /// constant text must be seeded here. A bare-numeric (`5`) or quoted
+    /// (`"text"`) DOL parses to `ParsedLink::Constant`; its text is copied
+    /// verbatim into the `DBF_STRING` VAL (truncated to the field size).
+    fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 0 {
+            if let crate::server::record::ParsedLink::Constant(s) =
+                crate::server::record::parse_link_v2(&self.dol)
+            {
+                self.val = truncate_string(PvString::from(s));
+            }
+        }
+        Ok(())
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // C `stringoutRecord.c::monitor` copies VAL into OVAL.
         self.oval = self.val.clone();

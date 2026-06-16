@@ -382,6 +382,24 @@ impl Record for DfanoutRecord {
         true
     }
 
+    /// C `dfanoutRecord.c::init_record` applies a constant DOL to VAL once
+    /// via `recGblInitConstantLink(&prec->dol, DBF_DOUBLE, &prec->val)`.
+    /// The framework gate (`processing.rs`) excludes a constant DOL from
+    /// the per-cycle closed-loop fetch (C `!dbLinkIsConstant`), so the
+    /// constant must be seeded here or it would never reach VAL.
+    fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 0 {
+            if let crate::server::record::ParsedLink::Constant(s) =
+                crate::server::record::parse_link_v2(&self.dol)
+            {
+                if let Ok(v) = s.trim().parse::<f64>() {
+                    self.val = v;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// dfanout has no value computation in `process()` itself — VAL is
     /// either set by a CA/DB put or fetched from DOL by the framework's
     /// closed-loop binding. The output distribution to OUTA..OUTP is

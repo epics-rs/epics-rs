@@ -881,6 +881,27 @@ impl RecordInstance {
                     lower_ctrl_limit: lopr,
                 });
             }
+            // Array records map their VAL control limits to HOPR/LOPR, exactly
+            // like the display limits above (waveformRecord.c get_control_double
+            // VAL case; aaiRecord.c:293-303; aaoRecord.c; compressRecord.c:487-501).
+            // Without this arm an array DBR_CTRL collapses the control range to
+            // 0/0 while the scalar records expose it.
+            "waveform" | "aai" | "aao" | "compress" => {
+                let hopr = self
+                    .record
+                    .get_field("HOPR")
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0);
+                let lopr = self
+                    .record
+                    .get_field("LOPR")
+                    .and_then(|v| v.to_f64())
+                    .unwrap_or(0.0);
+                snap.control = Some(super::super::snapshot::ControlInfo {
+                    upper_ctrl_limit: hopr,
+                    lower_ctrl_limit: lopr,
+                });
+            }
             _ => {}
         }
     }

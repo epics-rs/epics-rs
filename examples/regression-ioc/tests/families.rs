@@ -14,13 +14,14 @@
 //!   H — timestamp advances on each process
 //!   I — monitor event-MASK routing (MDEL/ADEL → DBE_VALUE/DBE_LOG class)
 //!   K — .PROC=0 forces a process; put-callback waits for completion
+//!   M — DBE_PROPERTY posts on a metadata-field change (not DBE_VALUE)
 //!   N — MS-class link propagates the source record's alarm severity
 
 use std::time::Duration;
 
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_ca_rs::client::MonitorHandle;
-use epics_ca_rs::protocol::{DBE_LOG, DBE_VALUE};
+use epics_ca_rs::protocol::{DBE_LOG, DBE_PROPERTY, DBE_VALUE};
 use epics_ca_rs::{DbFieldType, EpicsValue};
 use regression_ioc::RegressionIoc;
 use serial_test::serial;
@@ -510,4 +511,62 @@ async fn n_ms_link_propagates_source_severity() {
         .await
         .expect("clearing SRC must drop READER back to NO_ALARM");
     assert_eq!(back.alarm.severity, 0);
+}
+
+// ---- Family M: DBE_PROPERTY metadata-change posting -----------------------
+
+/// Writing a metadata/property field (HOPR) must post a `DBE_PROPERTY` event to
+/// a subscriber that requested `DBE_PROPERTY`, while a `DBE_VALUE`-only
+/// subscriber must NOT see it (a property change is not a value change).
+/// Sibling of Family I on the `DBE_PROPERTY` axis: it pins that the
+/// metadata-change event class reaches exactly the subscribers that asked for
+/// it, so a client's cached display/control metadata stays fresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn m_metadata_change_posts_dbe_property() {
+    let ioc = RegressionIoc::boot().await.expect("boot");
+    let ca = ioc.ca_client().await;
+
+    let ch_prop = ca.create_channel("REG:M:AI");
+    ch_prop
+        .wait_connected(Duration::from_secs(3))
+        .await
+        .expect("connect PROPERTY");
+    let mut mon_prop = ch_prop
+        .subscribe_with_mask(0.0, DBE_PROPERTY)
+        .await
+        .expect("subscribe DBE_PROPERTY");
+
+    let ch_val = ca.create_channel("REG:M:AI");
+    ch_val
+        .wait_connected(Duration::from_secs(3))
+        .await
+        .expect("connect VALUE");
+    let mut mon_val = ch_val
+        .subscribe_with_mask(0.0, DBE_VALUE)
+        .await
+        .expect("subscribe DBE_VALUE");
+
+    // Drain the initial connection event on both.
+    let _ = recv_within(&mut mon_prop, 1500).await;
+    let _ = recv_within(&mut mon_val, 1500).await;
+
+    // Change a display/property field. This is a metadata write, not a value
+    // change and not a process.
+    ca.caput("REG:M:AI.HOPR", "200").await.expect("caput HOPR");
+
+    // The DBE_PROPERTY subscriber MUST receive an event...
+    let prop = recv_within(&mut mon_prop, 2000).await;
+    assert!(
+        prop.is_some(),
+        "a metadata (HOPR) change must post a DBE_PROPERTY event"
+    );
+    // ...and the DBE_VALUE-only subscriber MUST NOT (the receive above proves
+    // the property cycle already dispatched to all subscriptions).
+    let leaked = recv_within(&mut mon_val, 700).await;
+    assert!(
+        leaked.is_none(),
+        "a property change must not post DBE_VALUE; a DBE_VALUE subscriber must \
+         not receive it, got {leaked:?}"
+    );
 }

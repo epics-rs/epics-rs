@@ -158,6 +158,21 @@ record(calc, "REG:N:READER") {
     field(CALC, "A")
 }
 
+#### Family M — DBE_PROPERTY posts on a metadata-field change ##############
+# Writing a metadata/property field (here HOPR) must post a DBE_PROPERTY event
+# to a camonitor that subscribed with DBE_PROPERTY, so a client's cached
+# display/control metadata stays fresh — while a DBE_VALUE-only subscriber must
+# NOT see it (a property change is not a value change). Sibling of Family I's
+# per-field DBE-class routing, on the DBE_PROPERTY axis.
+record(ai, "REG:M:AI") {
+    field(DESC, "DBE_PROPERTY metadata change")
+    field(VAL,  "1")
+    field(EGU,  "V")
+    field(HOPR, "100")
+    field(LOPR, "0")
+    field(PREC, "2")
+}
+
 #### Family D — motor record moves on a caput to VAL (SCAN=Passive) #########
 # The v0.20.0 regression: a caput to a SCAN=Passive motor's VAL did not move
 # it (the I/O-Intr-vs-Passive dbPutField processing gate). Pins "caput to a

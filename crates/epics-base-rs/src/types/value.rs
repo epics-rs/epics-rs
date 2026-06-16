@@ -1083,6 +1083,10 @@ impl EpicsValue {
             "NO" => Some(0),
             "YES" => Some(1),
             "RAW" => Some(2),
+            // menuPriority (dbCommon PRIO)
+            "LOW" => Some(0),
+            "MEDIUM" => Some(1),
+            "HIGH" => Some(2),
             // menuOmsl
             "supervisory" => Some(0),
             "closed_loop" => Some(1),

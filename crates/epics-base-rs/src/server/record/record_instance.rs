@@ -169,6 +169,50 @@ fn parse_alarm_severity(value: &EpicsValue) -> AlarmSeverity {
     }
 }
 
+/// Coerce a db-loaded `String` for a numeric/menu **common** field to that
+/// field's canonical DBF type before [`RecordInstance::put_common_field`]
+/// dispatches on it.
+///
+/// The db loader applies a record's own fields with the typed
+/// `EpicsValue::parse(desc.dbf_type, value_str)` (`db_loader::apply_fields`),
+/// but a field absent from `field_list` is pushed to the common-field path as
+/// a raw `EpicsValue::String` — it has no `FieldDesc` to parse against. The
+/// numeric common-field arms in `put_common_field` match only their typed
+/// variant, so without this step a `.db` `field(PHAS, "1")`,
+/// `field(PRIO, "HIGH")`, `field(DISS, "MAJOR")`, `field(DISA, "1")`, … is
+/// silently dropped at IOC load. Routing the String through the same
+/// `EpicsValue::parse` the record-field path uses handles the numeric *and*
+/// menu-label forms uniformly, so the arm receives the value it expects.
+///
+/// Only fields whose canonical type is numeric/menu are listed; the
+/// String-typed common fields (DESC, ASG, OUT, TSEL, …) and already-typed
+/// non-String writes pass through untouched, and an unparseable String is
+/// returned as-is so the arm drops it exactly as before. The runtime
+/// alarm-output fields (SEVR/STAT/NSEV/NSTA/ACKS) and debug flags
+/// (RPRO/TPRO/BKPT) are deliberately omitted: they are recomputed every
+/// process, not `.db` init directives, so coercing a loaded value would be
+/// overwritten immediately.
+fn coerce_common_field_string(name: &str, value: EpicsValue) -> EpicsValue {
+    let s = match &value {
+        EpicsValue::String(s) => s,
+        _ => return value,
+    };
+    // Canonical DBF type per numeric/menu common field, chosen to match the
+    // variant its `put_common_field` arm binds (e.g. ACKT/UDFS resolve their
+    // menu labels through the `Short` branch's `resolve_menu_string`).
+    let dbf = match name {
+        "TSE" | "PHAS" | "PRIO" | "DISV" | "DISA" | "DISS" | "LCNT" | "UDFS" | "ACKT" => {
+            DbFieldType::Short
+        }
+        "DISP" | "UDF" => DbFieldType::Char,
+        _ => return value,
+    };
+    match EpicsValue::parse(dbf, s.as_str_lossy().trim()) {
+        Ok(parsed) => parsed,
+        Err(_) => value,
+    }
+}
+
 /// A type-erased record instance stored in the database.
 pub struct RecordInstance {
     pub name: String,
@@ -1147,6 +1191,13 @@ impl RecordInstance {
         let name = name.to_ascii_uppercase();
         self.record.validate_put(&name, &value)?;
         self.record.special(&name, false)?;
+        // The db loader hands every common field to this path as a raw
+        // `EpicsValue::String` (no per-field `FieldDesc` to parse against).
+        // Coerce it to the field's canonical numeric/menu type up front so the
+        // typed arms below apply a `field(PHAS, "1")` / `field(PRIO, "HIGH")`
+        // directive instead of silently dropping it at IOC load. String-typed
+        // and already-typed values pass through unchanged.
+        let value = coerce_common_field_string(&name, value);
         match name.as_str() {
             "SEVR" => {
                 if let EpicsValue::Short(v) = value {
@@ -3798,5 +3849,68 @@ mod check_deadband_tests {
     fn same_signed_infinity_does_not_fire() {
         assert!(!check_deadband(f64::INFINITY, f64::INFINITY, 1.0));
         assert!(!check_deadband(f64::NEG_INFINITY, f64::NEG_INFINITY, 1.0));
+    }
+}
+
+#[cfg(test)]
+mod common_field_dbload_tests {
+    use super::*;
+    use crate::server::records::ai::AiRecord;
+
+    /// The db loader feeds every common field to `put_common_field` as an
+    /// `EpicsValue::String`. Each numeric/menu common field directive must
+    /// take effect at load — both the integer form (`field(PHAS, "1")`) and
+    /// the menu-label form (`field(PRIO, "HIGH")`, `field(DISS, "MAJOR")`) —
+    /// rather than being silently dropped because the arm matched only its
+    /// typed variant. One assertion per affected common-field arm.
+    #[test]
+    fn db_loaded_string_common_fields_take_effect() {
+        let mut inst = RecordInstance::new("REC".to_string(), AiRecord::default());
+        let put = |inst: &mut RecordInstance, f: &str, v: &str| {
+            inst.put_common_field(f, EpicsValue::String(v.into()))
+                .unwrap_or_else(|e| panic!("put_common_field({f}, {v:?}) failed: {e}"));
+        };
+
+        // Integer-valued directives.
+        put(&mut inst, "PHAS", "1");
+        assert_eq!(inst.common.phas, 1, "field(PHAS, \"1\")");
+        put(&mut inst, "TSE", "-2");
+        assert_eq!(inst.common.tse, -2, "field(TSE, \"-2\")");
+        put(&mut inst, "DISV", "1");
+        assert_eq!(inst.common.disv, 1, "field(DISV, \"1\")");
+        put(&mut inst, "DISA", "1");
+        assert_eq!(inst.common.disa, 1, "field(DISA, \"1\")");
+        put(&mut inst, "LCNT", "3");
+        assert_eq!(inst.common.lcnt, 3, "field(LCNT, \"3\")");
+        put(&mut inst, "DISP", "1");
+        assert!(inst.common.disp, "field(DISP, \"1\")");
+        put(&mut inst, "UDF", "0");
+        assert!(!inst.common.udf, "field(UDF, \"0\")");
+
+        // Menu-label directives (resolved via resolve_menu_string).
+        put(&mut inst, "PRIO", "HIGH");
+        assert_eq!(inst.common.prio, 2, "field(PRIO, \"HIGH\")");
+        put(&mut inst, "DISS", "MAJOR");
+        assert_eq!(
+            inst.common.diss,
+            AlarmSeverity::Major,
+            "field(DISS, \"MAJOR\")"
+        );
+        put(&mut inst, "UDFS", "NO_ALARM");
+        assert_eq!(
+            inst.common.udfs,
+            AlarmSeverity::NoAlarm,
+            "field(UDFS, \"NO_ALARM\")"
+        );
+        put(&mut inst, "ACKT", "NO");
+        assert!(!inst.common.ackt, "field(ACKT, \"NO\")");
+
+        // Numeric form of a menu field still works (field(PRIO, "0")).
+        put(&mut inst, "PRIO", "0");
+        assert_eq!(inst.common.prio, 0, "field(PRIO, \"0\")");
+
+        // A String-typed common field is untouched by the coercion.
+        put(&mut inst, "DESC", "a description");
+        assert_eq!(inst.common.desc.as_str_lossy().as_ref(), "a description");
     }
 }

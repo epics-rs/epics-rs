@@ -821,3 +821,27 @@ async fn q_record_utag_served_as_pva_usertag() {
         other => panic!("timeStamp.userTag must be an int carrying UTAG, got {other:?}"),
     }
 }
+
+// ---- Family S: PVA monitor overrun bitset (documented limitation) ---------
+//
+// The PVA monitor overrun signal is intentionally NOT observable end-to-end
+// from a client, so it cannot be pinned in this harness:
+//
+//   * The server ALWAYS writes an empty overrun BitSet on the MONITOR DATA
+//     frame, regardless of any server-side squash — matching pvxs
+//     `servermon.cpp:174-176` (`// TODO: placeholder for overrun mask`). See
+//     `server_native::tcp::build_monitor_payload`. So the parity-correct wire
+//     form carries no overrun bits, ever.
+//   * A pvxs client therefore leaves its `nSrvSquash` counter at 0 against a
+//     real pvxs server; this client's `SubscriptionStat::n_srv_squash`
+//     (`client_native::ops_v2`) counts only NON-empty overrun sets, so it too
+//     stays 0 — there is no positive signal to assert.
+//   * The high-level `MonitorEvent::Data` carries `value` + `marked`, not a
+//     per-update overrun field, so even the empty bitset never surfaces to a
+//     consumer.
+//
+// The wire form is pinned where it lives: the decode round-trip (empty AND
+// non-empty overrun) by `client_native::decode::monitor_data_preserves_overrun_bitset`,
+// and the always-empty server emission by the hardcoded `BitSet::new()` writes
+// in `server_native::tcp`. Asserting an overrun e2e here would test behavior
+// pvxs itself does not produce, so Family S is documented, not tested.

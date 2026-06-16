@@ -1201,9 +1201,10 @@ impl Hdf5Writer {
         }
         self.write_swmr_layout_dataset_attrs(&mut swmr, ds_index)?;
         self.build_swmr_layout_hardlinks(&mut swmr)?;
-        // Open-time `<attribute source="ndattribute">` group element-attrs must
-        // be created before the SWMR lock (ADP-79); close-time ones cannot.
-        self.write_swmr_ndattr_element_attrs(&mut swmr)?;
+        // Open-time `<attribute source="ndattribute">` group and dataset
+        // element-attrs must be created before the SWMR lock; close-time ones
+        // cannot (HDF5 forbids attribute creation after the lock).
+        self.write_swmr_ndattr_element_attrs(&mut swmr, ds_index)?;
 
         swmr.start_swmr()
             .map_err(|e| ADError::UnsupportedConversion(format!("SWMR start error: {}", e)))?;
@@ -2162,11 +2163,11 @@ impl Hdf5Writer {
     /// the runtime type); an undefined/absent value is skipped.
     ///
     /// Group attributes are written through the file handle. Dataset attributes
-    /// need a live dataset handle (rust-hdf5 cannot reopen a dataset by name in
-    /// write mode); every detector dataset retains its handle in `detectors` at
-    /// close, so dataset element-attrs are honoured for any detector dataset and
-    /// skipped only for the lazily-created attribute/performance datasets (an
-    /// exotic case, recorded as a residual in the parity inventory).
+    /// need a live dataset handle: a detector dataset retains its create-time
+    /// handle in `detectors` at close, and the lazily-created attribute/
+    /// performance datasets are reopened by full path through
+    /// `H5File::dataset_writer` (rust-hdf5 0.2.22), so dataset element-attrs are
+    /// honoured for every dataset.
     fn flush_ndattr_element_attrs(
         &self,
         file: &H5File,
@@ -2189,11 +2190,16 @@ impl Hdf5Writer {
             };
             let path = e.element_path.trim_start_matches('/');
             if e.is_dataset {
-                // A detector dataset retains a live write handle at close; the
-                // lazily-created attribute/performance datasets are skipped
-                // (residual). `detectors` is keyed by leading-slash full name.
+                // A detector dataset retains its create-time write handle in
+                // `detectors` (keyed by leading-slash full name); the lazily-
+                // created attribute/performance datasets do not. Both exist on
+                // disk by now (close-path ordering), so reopen the latter by
+                // full path in write mode (rust-hdf5 0.2.22 `dataset_writer`,
+                // which registers names as slash-trimmed full paths).
                 if let Some(det) = detectors.get(&e.element_path) {
                     write_ndattr_dataset_attr(&det.ds, &e.attr_name, value);
+                } else if let Ok(ds) = file.dataset_writer(path) {
+                    write_ndattr_dataset_attr(&ds, &e.attr_name, value);
                 }
             } else {
                 let group = Self::open_write_group(file, path)?;
@@ -2205,28 +2211,40 @@ impl Hdf5Writer {
 
     /// SWMR counterpart of [`Hdf5Writer::flush_ndattr_element_attrs`], limited
     /// to the open-time set that can be written before `start_swmr()` locks the
-    /// file: `OnFileOpen`/`OnFrame` `<attribute source="ndattribute">` nodes on
-    /// groups, using the first-frame value. `OnFileClose` cannot be honoured in
-    /// SWMR (HDF5 forbids creating attributes after the SWMR lock — C's
-    /// close-time `H5Acreate2` fails identically), and dataset element-attrs are
-    /// not addressable through `SwmrFileWriter` (datasets are keyed by index,
-    /// not path); both are recorded as residuals in the parity inventory.
-    fn write_swmr_ndattr_element_attrs(&self, swmr: &mut SwmrFileWriter) -> ADResult<()> {
+    /// file: `OnFileOpen`/`OnFrame` `<attribute source="ndattribute">` nodes,
+    /// using the first-frame value. Group attrs address the group by path;
+    /// dataset attrs address the single streaming dataset by its index
+    /// (`ds_index`) when their element path matches it — rust-hdf5 0.2.22's
+    /// `set_dataset_attr_*` makes dataset element-attrs addressable in SWMR.
+    /// `OnFileClose` cannot be honoured in SWMR (HDF5 forbids creating
+    /// attributes after the SWMR lock — C's close-time `H5Acreate2` fails
+    /// identically); that one remains a recorded residual.
+    fn write_swmr_ndattr_element_attrs(
+        &self,
+        swmr: &mut SwmrFileWriter,
+        ds_index: usize,
+    ) -> ADResult<()> {
         use crate::hdf5_layout::LayoutWhen;
         let Some(layout) = self.layout.as_ref() else {
             return Ok(());
         };
         for e in layout.ndattribute_element_attrs() {
-            if e.is_dataset {
-                continue;
-            }
             if !matches!(e.when, LayoutWhen::OnFileOpen | LayoutWhen::OnFrame) {
                 continue;
             }
             let Some(value) = self.ndattr_first_values.get(&e.ndattribute) else {
                 continue;
             };
-            write_swmr_ndattr_group_attr(swmr, &e.element_path, &e.attr_name, value)?;
+            if e.is_dataset {
+                // Only the single streaming image dataset exists in SWMR; attach
+                // by its known index when the element path resolves to it.
+                // `resolved_dataset_path` is stored slash-trimmed.
+                if e.element_path.trim_start_matches('/') == self.resolved_dataset_path {
+                    write_swmr_ndattr_dataset_attr(swmr, ds_index, &e.attr_name, value)?;
+                }
+            } else {
+                write_swmr_ndattr_group_attr(swmr, &e.element_path, &e.attr_name, value)?;
+            }
         }
         Ok(())
     }
@@ -2708,6 +2726,40 @@ fn write_swmr_ndattr_group_attr(
         ADError::UnsupportedConversion(format!(
             "SWMR ndattribute group attribute '{}/{}': {}",
             group_path, attr_name, e
+        ))
+    })
+}
+
+/// SWMR counterpart of [`write_ndattr_dataset_attr`]: write a live NDAttribute
+/// value as a dataset HDF5 attribute, addressed by the dataset's index (the
+/// only handle `SwmrFileWriter` exposes for datasets). The datatype follows the
+/// runtime NDAttribute value (C `typeNd2Hdf`); `Undefined` is skipped. Must be
+/// called before `start_swmr()` — HDF5 forbids creating attributes after the
+/// SWMR lock.
+fn write_swmr_ndattr_dataset_attr(
+    swmr: &mut SwmrFileWriter,
+    ds_index: usize,
+    attr_name: &str,
+    value: &NDAttrValue,
+) -> ADResult<()> {
+    let res = match value {
+        NDAttrValue::Int8(v) => swmr.set_dataset_attr_numeric(ds_index, attr_name, v),
+        NDAttrValue::UInt8(v) => swmr.set_dataset_attr_numeric(ds_index, attr_name, v),
+        NDAttrValue::Int16(v) => swmr.set_dataset_attr_numeric(ds_index, attr_name, v),
+        NDAttrValue::UInt16(v) => swmr.set_dataset_attr_numeric(ds_index, attr_name, v),
+        NDAttrValue::Int32(v) => swmr.set_dataset_attr_numeric(ds_index, attr_name, v),
+        NDAttrValue::UInt32(v) => swmr.set_dataset_attr_numeric(ds_index, attr_name, v),
+        NDAttrValue::Int64(v) => swmr.set_dataset_attr_numeric(ds_index, attr_name, v),
+        NDAttrValue::UInt64(v) => swmr.set_dataset_attr_numeric(ds_index, attr_name, v),
+        NDAttrValue::Float32(v) => swmr.set_dataset_attr_numeric(ds_index, attr_name, v),
+        NDAttrValue::Float64(v) => swmr.set_dataset_attr_numeric(ds_index, attr_name, v),
+        NDAttrValue::String(s) => swmr.set_dataset_attr_string(ds_index, attr_name, s),
+        NDAttrValue::Undefined => return Ok(()),
+    };
+    res.map_err(|e| {
+        ADError::UnsupportedConversion(format!(
+            "SWMR ndattribute dataset attribute '{}': {}",
+            attr_name, e
         ))
     })
 }
@@ -4073,6 +4125,149 @@ mod tests {
             30
         );
 
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&layout).ok();
+    }
+
+    #[test]
+    fn test_ndattr_element_attr_on_lazily_created_dataset() {
+        // C storeOnOpenCloseAttribute attaches a layout `<attribute
+        // source="ndattribute">` to ANY element the layout names, not just the
+        // detector dataset. A lazily-created NDAttribute dataset has no retained
+        // create-time handle, so its element-attrs are attached by reopening the
+        // dataset by name in write mode (rust-hdf5 0.2.22 dataset_writer). Here
+        // a `GainTrace` NDAttribute dataset (sourced from Gain) carries two
+        // element-attrs sourced from ColorMode (open=first, close=last value).
+        let dir = std::env::temp_dir();
+        let layout = dir.join("adcore_layout_lazy_ds_attr.xml");
+        std::fs::write(
+            &layout,
+            r#"<hdf5_layout>
+              <group name="entry">
+                <group name="instrument">
+                  <group name="detector">
+                    <dataset name="data" source="detector" det_default="true"/>
+                    <dataset name="GainTrace" source="ndattribute" ndattribute="Gain">
+                      <attribute name="ModeAtOpen" source="ndattribute" ndattribute="ColorMode" when="OnFileOpen"/>
+                      <attribute name="ModeAtClose" source="ndattribute" ndattribute="ColorMode" when="OnFileClose"/>
+                    </dataset>
+                  </group>
+                  <group name="NDAttributes" ndattr_default="true"/>
+                </group>
+              </group>
+            </hdf5_layout>"#,
+        )
+        .unwrap();
+
+        let path = temp_path("hdf5_lazy_ds_attr");
+        let mut writer = Hdf5Writer::new();
+        assert!(
+            writer.set_layout_filename(layout.to_str().unwrap()),
+            "layout XML must parse: {}",
+            writer.layout_error
+        );
+
+        let mk = |mode: &str, gain: i32| {
+            let mut arr = NDArray::new(vec![NDDimension::new(4)], NDDataType::UInt8);
+            arr.attributes.add(NDAttribute::new_static(
+                "ColorMode",
+                "",
+                NDAttrSource::Driver,
+                NDAttrValue::String(mode.to_string()),
+            ));
+            arr.attributes.add(NDAttribute::new_static(
+                "Gain",
+                "",
+                NDAttrSource::Driver,
+                NDAttrValue::Int32(gain),
+            ));
+            arr
+        };
+
+        let a0 = mk("Mono", 10);
+        writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
+        writer.write_file(&a0).unwrap();
+        writer.write_file(&mk("RGB1", 20)).unwrap();
+        writer.write_file(&mk("Bayer", 30)).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        // The element-attrs are attached to the lazily-created NDAttribute
+        // dataset (not a detector dataset, so reopened by name at close).
+        let ds = h5.dataset("entry/instrument/detector/GainTrace").unwrap();
+        assert_eq!(
+            ds.attr("ModeAtOpen").unwrap().read_string().unwrap(),
+            "Mono"
+        );
+        assert_eq!(
+            ds.attr("ModeAtClose").unwrap().read_string().unwrap(),
+            "Bayer"
+        );
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&layout).ok();
+    }
+
+    #[test]
+    fn test_swmr_ndattr_element_attr_on_streaming_dataset() {
+        // In SWMR mode an open-time `<attribute source="ndattribute">` on the
+        // streaming dataset is attached before the SWMR lock via
+        // set_dataset_attr_* (rust-hdf5 0.2.22 addresses SWMR dataset attributes
+        // by index). OnFileClose stays impossible in SWMR (HDF5 forbids
+        // post-lock attribute creation; C's close-time H5Acreate2 fails too).
+        let dir = std::env::temp_dir();
+        let layout = dir.join("adcore_layout_swmr_ds_attr.xml");
+        std::fs::write(
+            &layout,
+            r#"<hdf5_layout>
+              <group name="entry">
+                <group name="instrument">
+                  <group name="detector">
+                    <dataset name="data" source="detector" det_default="true">
+                      <attribute name="ModeAtOpen" source="ndattribute" ndattribute="ColorMode" when="OnFileOpen"/>
+                    </dataset>
+                  </group>
+                  <group name="NDAttributes" ndattr_default="true"/>
+                </group>
+              </group>
+            </hdf5_layout>"#,
+        )
+        .unwrap();
+
+        let path = temp_path("hdf5_swmr_ds_attr");
+        let mut writer = Hdf5Writer::new();
+        writer.set_swmr_mode(true);
+        assert!(
+            writer.set_layout_filename(layout.to_str().unwrap()),
+            "layout XML must parse: {}",
+            writer.layout_error
+        );
+
+        let mk = |mode: &str| {
+            let mut arr = NDArray::new(
+                vec![NDDimension::new(4), NDDimension::new(4)],
+                NDDataType::UInt16,
+            );
+            arr.attributes.add(NDAttribute::new_static(
+                "ColorMode",
+                "",
+                NDAttrSource::Driver,
+                NDAttrValue::String(mode.to_string()),
+            ));
+            arr
+        };
+
+        let a0 = mk("Mono");
+        writer.open_file(&path, NDFileMode::Stream, &a0).unwrap();
+        writer.write_file(&a0).unwrap();
+        writer.write_file(&mk("RGB1")).unwrap();
+        writer.close_file().unwrap();
+
+        let h5 = H5File::open(&path).unwrap();
+        let ds = h5.dataset("entry/instrument/detector/data").unwrap();
+        assert_eq!(
+            ds.attr("ModeAtOpen").unwrap().read_string().unwrap(),
+            "Mono"
+        );
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&layout).ok();
     }

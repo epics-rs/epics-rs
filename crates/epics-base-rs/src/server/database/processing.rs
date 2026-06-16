@@ -1391,12 +1391,17 @@ impl PvDatabase {
             if let Some(dol_val) = dol_value {
                 let oif = dol_info.as_ref().map(|(_, oif)| *oif).unwrap_or(0);
                 if oif == 1 {
-                    // Incremental: VAL += DOL value
-                    if let (Some(cur), Some(dol_f)) = (
-                        instance.record.val().and_then(|v| v.to_f64()),
+                    // Incremental: C `fetch_value` (aoRecord.c:447-455) sets
+                    // `prec->val = prec->pval` first ("don't allow dbputs to
+                    // val field"), then `*pvalue += prec->val`, so the
+                    // increment is relative to PVAL — the last actual output —
+                    // not the current VAL a client may have just caput. OIF is
+                    // an ao-only field, so this branch always carries a PVAL.
+                    if let (Some(pval), Some(dol_f)) = (
+                        instance.record.get_field("PVAL").and_then(|v| v.to_f64()),
                         dol_val.to_f64(),
                     ) {
-                        let _ = instance.record.set_val(EpicsValue::Double(cur + dol_f));
+                        let _ = instance.record.set_val(EpicsValue::Double(pval + dol_f));
                     }
                 } else {
                     // Full: VAL = DOL value

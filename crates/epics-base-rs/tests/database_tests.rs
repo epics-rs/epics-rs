@@ -1351,6 +1351,11 @@ async fn test_ao_oif_incremental() {
     ao.omsl = 1;
     ao.oif = 1;
     ao.dol = "DELTA".to_string();
+    // C `aoRecord.c::init_record` ends with `prec->pval = prec->val`, so a
+    // fresh record's first Incremental cycle bases off its initial VAL.
+    // Without this the bypassed-init record has PVAL=0 and the increment
+    // (now correctly from PVAL, per aoRecord.c:447-455) would yield 10.
+    ao.init_record(0).unwrap();
     db.add_record("OUTPUT", Box::new(ao)).await.unwrap();
 
     let mut visited = HashSet::new();
@@ -1358,6 +1363,7 @@ async fn test_ao_oif_incremental() {
         .await
         .unwrap();
 
+    // Initial VAL=100 (=> PVAL=100 at init) + DOL delta 10 = 110.
     let val = db.get_pv("OUTPUT").await.unwrap();
     match val {
         EpicsValue::Double(v) => assert!((v - 110.0).abs() < 1e-10),
@@ -6992,4 +6998,66 @@ async fn sub_record_subroutine_runs_on_main_engine_path() {
         ),
         other => panic!("expected Double(10.0), got {other:?}"),
     }
+}
+
+/// ao OMSL=closed_loop + OIF=Incremental must add DOL to PVAL (the last
+/// actual output), not the current VAL. C `fetch_value`
+/// (aoRecord.c:447-455) sets `prec->val = prec->pval` before
+/// `*pvalue += prec->val`, discarding any client caput to VAL during a
+/// DOL-driven cycle. The Rust port previously incremented from the current
+/// VAL, so a caput between cycles shifted every subsequent increment.
+#[tokio::test]
+async fn test_ao_incremental_dol_increments_from_pval_not_val() {
+    let db = PvDatabase::new();
+
+    db.add_record("AO_INCR_SRC", Box::new(AoRecord::new(10.0)))
+        .await
+        .unwrap();
+
+    let mut dest = AoRecord::new(0.0);
+    dest.omsl = 1; // closed_loop
+    dest.oif = 1; // Incremental
+    dest.dol = "AO_INCR_SRC".to_string();
+    dest.init_record(0).unwrap(); // C init: PVAL = VAL (= 0 here)
+    db.add_record("AO_INCR_DST", Box::new(dest)).await.unwrap();
+
+    // Cycle 1: PVAL=0, DOL=10 -> VAL = 0 + 10 = 10, PVAL becomes 10.
+    let mut visited = HashSet::new();
+    db.process_record_with_links("AO_INCR_DST", &mut visited, 0)
+        .await
+        .unwrap();
+    let v1 = db.get_pv("AO_INCR_DST").await.unwrap();
+    assert!(
+        matches!(v1, EpicsValue::Double(v) if (v - 10.0).abs() < 1e-10),
+        "cycle 1 VAL must be 10, got {v1:?}"
+    );
+
+    // A client caputs VAL=100 between cycles; C discards it (val=pval).
+    {
+        let arc = db.get_record("AO_INCR_DST").await.unwrap();
+        let mut inst = arc.write().await;
+        inst.record
+            .put_field("VAL", EpicsValue::Double(100.0))
+            .unwrap();
+    }
+    // Upstream setpoint changes to 5.
+    {
+        let arc = db.get_record("AO_INCR_SRC").await.unwrap();
+        let mut inst = arc.write().await;
+        inst.record
+            .put_field("VAL", EpicsValue::Double(5.0))
+            .unwrap();
+    }
+
+    // Cycle 2: increment from PVAL(10), not the caput VAL(100):
+    // VAL = 10 + 5 = 15 (C), not 100 + 5 = 105 (pre-fix Rust).
+    let mut visited2 = HashSet::new();
+    db.process_record_with_links("AO_INCR_DST", &mut visited2, 0)
+        .await
+        .unwrap();
+    let v2 = db.get_pv("AO_INCR_DST").await.unwrap();
+    assert!(
+        matches!(v2, EpicsValue::Double(v) if (v - 15.0).abs() < 1e-10),
+        "cycle 2 must increment from PVAL=10 (=>15), not caput VAL=100 (=>105); got {v2:?}"
+    );
 }

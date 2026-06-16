@@ -672,6 +672,12 @@ impl Record for CalcRecord {
         if let Some(ref compiled) = self.rpcl {
             let vars = self.get_vars();
             let mut inputs = crate::calc::NumericInputs::with_vars(vars);
+            // C `calcPerform(&prec->a, &prec->val, rpcl)` passes `presult =
+            // &val`, so the `VAL` token (`FETCH_VAL`, calcPerform.c:73-74)
+            // pushes the *previous* VAL. Seed `prev_val` from the current
+            // `self.val` before it is overwritten below; otherwise
+            // `CALC="VAL+1"` reads 0 every cycle instead of incrementing.
+            inputs.prev_val = self.val;
             // C sets CALC_ALARM on failure but continues processing
             match crate::calc::eval(compiled, &mut inputs) {
                 Ok(v) => {
@@ -684,10 +690,11 @@ impl Record for CalcRecord {
             }
         } else if !self.calc.is_empty() {
             // Fallback: try to compile and eval (e.g., if CALC was set after init)
-            match crate::calc::calc(
-                &self.calc,
-                &mut crate::calc::NumericInputs::with_vars(self.get_vars()),
-            ) {
+            let mut inputs = crate::calc::NumericInputs::with_vars(self.get_vars());
+            // Same `VAL`-token previous-value seed as the cached-RPCL path
+            // above (C `presult = &val`).
+            inputs.prev_val = self.val;
+            match crate::calc::calc(&self.calc, &mut inputs) {
                 Ok(v) => {
                     self.val = v;
                     self.calc_alarm = false;
@@ -1394,5 +1401,26 @@ impl Record for CalcRecord {
             ("INPT", "T"),
             ("INPU", "U"),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `VAL` token in a CALC expression must read the *previous* result
+    /// value (C `calcPerform` `FETCH_VAL` with `presult = &val`), so a
+    /// self-referential `CALC="VAL+1"` counts up. Before the prev_val seed it
+    /// read 0 every cycle and stuck at 1.
+    #[test]
+    fn calc_val_token_reads_previous_val() {
+        let mut rec = CalcRecord::new("VAL+1");
+        rec.init_record(0).unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.val, 1.0);
+        rec.process().unwrap();
+        assert_eq!(rec.val, 2.0);
+        rec.process().unwrap();
+        assert_eq!(rec.val, 3.0);
     }
 }

@@ -967,6 +967,10 @@ impl Record for CalcoutRecord {
         // Evaluate CALC using cached RPCL
         if let Some(ref compiled) = self.rpcl {
             let mut inputs = crate::calc::NumericInputs::with_vars(self.get_vars());
+            // C `calcPerform(&prec->a, &prec->val, rpcl)` (calcoutRecord.c:238)
+            // passes `presult = &val`, so the CALC `VAL` token reads the
+            // *previous* VAL. Seed before `self.val` is overwritten below.
+            inputs.prev_val = self.val;
             match crate::calc::eval(compiled, &mut inputs) {
                 Ok(v) => {
                     self.val = v;
@@ -984,6 +988,10 @@ impl Record for CalcoutRecord {
                 // Use OCAL
                 if let Some(ref compiled) = self.orpc {
                     let mut inputs = crate::calc::NumericInputs::with_vars(self.get_vars());
+                    // C `calcPerform(&prec->a, &prec->oval, orpc)`
+                    // (calcoutRecord.c:621) passes `presult = &oval`, so the
+                    // OCAL `VAL` token reads the *previous* OVAL, not VAL.
+                    inputs.prev_val = self.oval;
                     match crate::calc::eval(compiled, &mut inputs) {
                         Ok(v) => self.oval = v,
                         Err(_) => self.calc_alarm = true,
@@ -1673,5 +1681,47 @@ mod link_status_tests {
             assert!(fd.read_only, "{name} must be read-only (SPC_NOMOD)");
         }
         assert_eq!(CALCOUT_INAV_FIELDS.len(), 21);
+    }
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+
+    /// CALC `VAL` token reads the previous VAL (C `presult = &val`,
+    /// calcoutRecord.c:238), so `CALC="VAL+1"` counts up.
+    #[test]
+    fn calc_val_token_reads_previous_val() {
+        let mut rec = CalcoutRecord {
+            calc: "VAL+1".to_string(),
+            ..Default::default()
+        };
+        rec.init_record(0).unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.val, 1.0);
+        rec.process().unwrap();
+        assert_eq!(rec.val, 2.0);
+    }
+
+    /// OCAL `VAL` token reads the previous OVAL, not VAL (C `presult =
+    /// &oval`, calcoutRecord.c:621). With DOPT="Use OCAL" and OOPT="Every
+    /// Time", `OCAL="VAL+1"` makes OVAL count up while VAL stays 0.
+    #[test]
+    fn ocal_val_token_reads_previous_oval() {
+        let mut rec = CalcoutRecord {
+            // CALC empty → VAL stays 0; only OCAL drives OVAL.
+            ocal: "VAL+1".to_string(),
+            dopt: 1, // Use OCAL
+            oopt: 0, // Every Time → should_output() always true
+            ..Default::default()
+        };
+        rec.init_record(0).unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.val, 0.0);
+        assert_eq!(rec.oval, 1.0);
+        rec.process().unwrap();
+        assert_eq!(rec.oval, 2.0);
+        rec.process().unwrap();
+        assert_eq!(rec.oval, 3.0);
     }
 }

@@ -23,6 +23,7 @@
 //!       its own choice labels (distinct from F's shared .SCAN menu)
 //!   L — an unsigned DBF_ULONG field (mbbo MASK) keeps its native PVA uint
 //!       wire type (PVA-only; CA has no unsigned types)
+//!   Q — a record's UTAG reaches the PVA timeStamp.userTag (PVA-only)
 
 use std::time::Duration;
 
@@ -784,5 +785,39 @@ async fn l_unsigned_mask_field_keeps_native_pva_uint_type() {
             "DBF_ULONG MASK must be served as a PVA uint (unsigned), not a signed \
              int; got {other:?}"
         ),
+    }
+}
+
+// ---- Family Q: record UTAG served as PVA timeStamp.userTag -----------------
+
+/// A record's `UTAG` (DBF_UINT64) must reach the PVA NTScalar
+/// `timeStamp.userTag` field, not be served as a constant 0. The db seeds
+/// `UTAG=0x12345678`; the low 32 bits land in the int32 `userTag` wire slot.
+/// CA has no userTag wire field, so this is a PVA-only family.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn q_record_utag_served_as_pva_usertag() {
+    let ioc = RegressionIoc::boot().await.expect("boot");
+    let pva = ioc.pva_client();
+
+    let field = tokio::time::timeout(Duration::from_secs(5), pva.pvget("REG:Q:AI"))
+        .await
+        .expect("pvget timed out")
+        .expect("pvget");
+
+    let s = match &field {
+        PvField::Structure(s) => s,
+        other => panic!("NTScalar must be a structure, got {other:?}"),
+    };
+    let ts = match s.get_field("timeStamp") {
+        Some(PvField::Structure(ts)) => ts,
+        other => panic!("NTScalar must carry a timeStamp structure, got {other:?}"),
+    };
+    match ts.get_field("userTag").map(PvField::deref_selected) {
+        Some(PvField::Scalar(ScalarValue::Int(v))) => assert_eq!(
+            *v, 305_419_896,
+            "timeStamp.userTag must carry the record's UTAG (0x12345678)"
+        ),
+        other => panic!("timeStamp.userTag must be an int carrying UTAG, got {other:?}"),
     }
 }

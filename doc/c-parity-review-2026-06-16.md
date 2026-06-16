@@ -26,7 +26,7 @@ different AND reachable.
 | init / load order | 30 | pinned (regr O), common-field-load FIXED — closed |
 | flow-control credit | 30 | audited sound (pipeline credit + dropped-monitor owner) — closed |
 | link locality / PP | 28 | non-local Db-link family closed — closed |
-| numeric convert | 26 | ADP-56 signed off; **OPEN:** QSRV String→int radix (R4-2) |
+| numeric convert | 26 | ADP-56 signed off; QSRV String→int radix **FIXED (R4-2, 90167988)** |
 | monitor DBE-mask | 24 | pinned (regr I/M), SCAL-1/2 closed — closed |
 | menu / enum label | 16 | enum *serving* pinned (regr E/F/R); db-load label resolution **FIXED (R4-1, e7e20583)**; runtime DBR_STRING-write label resolution **FIXED (R4-5, 86137c83)** |
 | alarm / severity | 16 | pinned (regr G/N) — closed |
@@ -62,7 +62,8 @@ C ref: dbStaticLib resolves a menu field's `.db` value against that field's own 
 Structural fix (done, e7e20583): `apply_fields`, when `record.menu_field_choices(field).or_else(shared_menu_choices)` is `Some(choices)`, resolves the value against the field's own menu — exact label first then a numeric index (matching C order; `dbGetMenuIndexFromString`'s `strcmp` precedes `epicsParseUInt16`) via the new shared `resolve_menu_field_string` (`record/menu_choices.rs`) — instead of `EpicsValue::parse`'s global table. An unknown choice errors (`S_db_badChoice`) instead of mis-mapping. No record edits were needed: every affected record's `menu_field_choices` was already complete. Pinned by `db_loader::tests::db_load_menu_labels_resolve_against_field_menu`.
 
 ### R4-2: QSRV PVA String→integer PUT is base-10-only; pvxs uses base-0 (hex/octal)
-Severity: Medium — fix
+Severity: Medium — **FIXED (90167988)**
+Fix: the two `scalar_to_i64`/`scalar_to_u64` String branches route through the CA path's existing base-0 parsers (`EpicsValue::parse_int`/`parse_uint`, now public). Empty/garbage/out-of-range still reject (pvxs parity); only the accepted set widens to hex/octal. Pinned by `convert::tests::string_to_numeric_put_accepts_c_radix`.
 Rust: `crates/epics-bridge-rs/src/convert.rs:229-237` (`scalar_to_i64`), `:264-272` (`scalar_to_u64`) — a `ScalarValue::String` is parsed `s.trim().parse::<i64>()/<u64>()` (decimal-only), rejecting `0x`/octal. Reached from `crates/epics-bridge-rs/src/qsrv/channel.rs:646-651`.
 C ref: pvxs `src/util.cpp:786-817` `parseTo<int64_t/uint64_t>` use `std::stoll/stoull(s,&idx,0)` — base-0 (auto hex/octal).
 Reachability: `pvput PV "0x1F"` into a numeric field → pvxs writes 31; Rust QSRV returns `PutRejected`. The convert.rs comment already claims pvxs parity, and the CA sibling (`value.rs:1210` `parse_int`/`parse_uint`) already does C-radix — the bridge path is inconsistent with both.

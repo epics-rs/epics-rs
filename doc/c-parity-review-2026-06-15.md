@@ -308,7 +308,7 @@ Impact: `OVERLAY_SHAPE=2/3` draws the wrong shape vs C.
 #### ADP-11: Codec COMPRESSOR ordinal mapping diverges (extra zlib/lz4hdf5 shift) — FIXED 39e07250
 Severity: High — fix
 Fix: ordinals 0-4 aligned to C `NDCodecCompressor_t` (NONE/JPEG/BLOSC/LZ4/BSLZ4); Rust-only zlib/lz4hdf5 moved to 5/6 so they never shadow a C ordinal. (Structural ADP-26 sign-off — keep vs remove the extra codecs — still open under #58.)
-Rust: `crates/ad-plugins-rs/src/codec.rs:1080-1088` maps `1=JPEG,2=Zlib,3=Blosc,4=LZ4,5=LZ4HDF5,6=BSLZ4` (the comment `:1078` mis-states the C ordinals).
+Rust (post-fix): `crates/ad-plugins-rs/src/codec.rs:1211-1220` maps `0=None,1=JPEG,2=Blosc,3=LZ4,4=BSLZ4` (aligned to C) with the Rust-only `5=Zlib,6=LZ4HDF5` after the C set so they never shadow a C ordinal.
 C: `Codec.h:12-18` `NONE=0,JPEG=1,BLOSC=2,LZ4=3,BSLZ4=4`.
 Impact: `COMPRESSOR=2` → Blosc in C, Zlib in Rust; `=3` → LZ4 vs Blosc; `=4` → BSLZ4 vs LZ4. Different codec + bytes. (Structural cause: ADC-10.)
 

@@ -126,7 +126,7 @@ C `subRecord.c::checkAlarmsAndMonitors` runs `recGblCheckAlarms` against HIHI/HI
 **STILL OPEN (larger family):** ANY field whose Rust `Default` ≠ its C dbd `initial()` (db_loader ignores dbd initials) — a separate audit, tracked as **R5-15** below.
 
 ### R5-4..R5-14 (REPORTED by sub-agent, C-cited, pending re-verify)
-- R5-4 (MED): ao closed-loop Incremental DOL adds to current VAL not PVAL (`processing.rs:1398` vs `aoRecord.c:442` `val=pval` then `+=`).
+- R5-4 (MED, FIXED 2b3a66a8): ao closed-loop Incremental DOL adds to current VAL not PVAL (`processing.rs:1398` vs `aoRecord.c:447-455` `val=pval` then `+=`). FIXED: Incremental branch reads `get_field("PVAL")` (OIF is ao-only → PVAL always present). Exposed that test-constructed ao records skip `init_record` (PVAL stays 0); the regression + the updated `test_ao_oif_incremental` now call `init_record(0)` (C init seeds `pval=val`). Reg test: caput VAL=100 between cycles → next increment bases off PVAL=10 (=>15), not 105.
 - R5-5 (MED): ao constant DOL + Incremental loses the increment, behaves Full (`ao.rs:455-457`).
 - R5-6 (MED): calcout ODLY>0 posts VAL/OVAL monitors + FLNK on the delaying cycle AND again on the delayed cycle (`calcout.rs:1035` vs `calcoutRecord.c:276-282`).
 - R5-7 (MED): sel `Specified` mode fetches ALL inputs, not only INP[SELN] (`sel.rs:663` vs `selRecord.c:411`): extra input monitors + spurious SEVR from non-selected broken links.

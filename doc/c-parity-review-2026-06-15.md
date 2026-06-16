@@ -139,8 +139,11 @@ stamp formatted by both device supports, and the `<undefined>` epoch sentinel.
 SCAL-1 added a `Record::log_swept_fields()` hook (LOG-only analogue of
 `force_posted_fields`), wired into the four monitor-snapshot builders — same
 monitor-post-fidelity family as round-1 MOT-1. SCAL-2 (fix-low) is the
-residual completion-cycle VALUE|LOG packet-bundling, left open; SCAL-4/5 are
-signoff (see tally).
+inverse of that hook and now FIXED: a `Record::value_only_change_fields()`
+hook, wired into the same four builders, strips the LOG bit from the
+scaler's value-change posts (CNT/T/VAL/PR1/TP/FREQ + active Sn) so DBE_LOG
+is reserved for the idle sweep, matching C. SCAL-4/5 are signoff (see tally).
+SCAL-1+2 together close the scaler's per-field monitor-mask contract.
 
 ## Open Findings
 
@@ -464,11 +467,12 @@ Rust: `crates/scaler-rs/src/records/scaler.rs:597-787` has no monitor/always-mar
 C: `scalerRecord.c:758-774` — `monitor()` (every idle process) unconditionally re-posts every S1..Sn with DBE_LOG.
 Impact: a DBE_LOG subscriber on `SCALER:Sn` gets an event every idle process in C, none in Rust. Same family as round-1 MOT-1.
 
-#### SCAL-2: Value-change monitor posts carry an extra DBE_LOG bit; C posts CNT/Sn/T/VAL/PR1/TP/FREQ with DBE_VALUE only
+#### SCAL-2: Value-change monitor posts carry an extra DBE_LOG bit; C posts CNT/Sn/T/VAL/PR1/TP/FREQ with DBE_VALUE only — FIXED
 Severity: Low — fix-low
 Rust: `crates/epics-base-rs/src/server/record/record_instance.rs:1914` — every changed scaler field posts VALUE|LOG (no per-field mask override).
 C: `scalerRecord.c` value-change posts use DBE_VALUE only (`:372,425,427,430,478,582,588`); DBE_LOG appears only in the Sn sweep.
 Impact: a DBE_LOG-only subscriber on CNT/T/VAL/PR1/TP/FREQ gets a value-change event in Rust where C delivers none. Inverse of SCAL-1; same root (per-field mask contract unmodeled).
+**FIXED**: completes the per-field mask contract SCAL-1 began. Added a `Record::value_only_change_fields()` hook (default empty — the LOG-only analogue inverse of `log_swept_fields`), wired into all four monitor-snapshot builders (`record_instance.rs` `process_local` + the three `processing.rs` builders): a changed field named here posts `alarm_bits | DBE_VALUE` instead of `aux_mask` (LOG stripped), and when the deadband field (scaler `VAL`) is named, the archive (ADEL) LOG bit is dropped from the deadband post too. The scaler returns CNT/T/VAL/PR1/TP/FREQ (always) + active `S1..Snch` — the literal `DBE_VALUE` set from scalerRecord.c:316/322/329/334/372/425/427/430/478/530/582/588; DBE_LOG stays reserved for the idle sweep (`log_swept_fields`, line 771). Complementary by C's design: a DBE_LOG subscriber sees `Sn` only on the idle sweep, never on a counting change. Tests: `test_value_only_change_fields_scalars_plus_active_channels` (hook set: 6 scalars + active channels, state-independent, clamped) and integration `test_value_change_post_is_value_only_no_log_bit` (FREQ change posts a mask with DBE_VALUE set / DBE_LOG clear through the real dispatch path; a DBE_LOG-only FREQ subscriber receives nothing — fails pre-fix).
 
 #### SCAL-3: `arm(0)` disarm does not clear counts; C clears unconditionally
 Severity: Medium — fix

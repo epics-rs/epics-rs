@@ -1332,8 +1332,12 @@ impl RecordInstance {
                 }
             }
             "UTAG" => {
-                // C UTAG is DBF_UINT64 — accept any integer-shaped
-                // value and store the unsigned 64-bit tag.
+                // C UTAG is DBF_UINT64 — accept any integer-shaped value and
+                // store the unsigned 64-bit tag. The db loader feeds every
+                // common field as EpicsValue::String, so parse field(UTAG, "N")
+                // rather than dropping it silently at IOC load; a CA write to
+                // this u64 field crosses as DBR_DOUBLE (CA has no uint64 wire
+                // type), so accept Double too.
                 match value {
                     EpicsValue::UInt64(v) => self.common.utag = v,
                     EpicsValue::Int64(v) => self.common.utag = v as u64,
@@ -1341,6 +1345,14 @@ impl RecordInstance {
                     EpicsValue::Short(v) => self.common.utag = v as u64,
                     EpicsValue::Enum(v) => self.common.utag = v as u64,
                     EpicsValue::Char(v) => self.common.utag = v as u64,
+                    EpicsValue::Double(v) => self.common.utag = v as u64,
+                    EpicsValue::String(s) => {
+                        if let Ok(EpicsValue::UInt64(v)) =
+                            EpicsValue::parse(DbFieldType::UInt64, s.as_str_lossy().trim())
+                        {
+                            self.common.utag = v;
+                        }
+                    }
                     _ => {}
                 }
             }

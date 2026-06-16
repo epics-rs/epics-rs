@@ -20,6 +20,7 @@ regression in the same family fails a test instead of shipping.
 | G | alarm severity raised on a limit violation | `REG:G:AI` → `g_alarm_severity_on_limit_violation` |
 | H | timestamp advances on each process (nsec `WallTime`) | `REG:H:AI` → `h_timestamp_advances_on_process` |
 | I | monitor event-**mask** routing: a sub-MDEL change posts `DBE_LOG` only, so a `DBE_VALUE`-only subscriber must not see it (a `DBE_LOG` one must); a supra-MDEL change posts `DBE_VALUE` | `REG:I:AI` → `i_deadband_routes_value_vs_log_event_masks` |
+| K | a `caput REC.PROC 0` forces a process (was a silent no-op for 0); put-with-callback returns only after processing completes | `REG:K:*` → `k_proc_zero_forces_process_and_put_completes` |
 
 Family C is pinned both by the periodic-scan test and by the motor's
 `io_intr_scan_independent` readback path (the actual v0.20.0 mechanism).

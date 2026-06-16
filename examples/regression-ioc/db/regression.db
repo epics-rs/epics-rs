@@ -118,6 +118,23 @@ record(ai, "REG:I:AI") {
     field(ADEL, "0")
 }
 
+#### Family K — .PROC write forces a process; put-callback waits ###########
+# A caput to REC.PROC with value 0 must force a process (it was once a silent
+# no-op for 0), and a put-with-callback (CA WRITE_NOTIFY) must return only after
+# processing completes. K:CALC mirrors K:SRC through INPA; after seeding SRC and
+# forcing K:CALC.PROC=0, an IMMEDIATE caget of K:CALC must already equal SRC
+# (no poll) — proving both the forced process and put-callback completion.
+record(longout, "REG:K:SRC") {
+    field(DESC, "proc-force source")
+    field(VAL,  "0")
+}
+record(calc, "REG:K:CALC") {
+    field(DESC, "proc-force / put-callback")
+    field(SCAN, "Passive")
+    field(INPA, "REG:K:SRC")
+    field(CALC, "A")
+}
+
 #### Family D — motor record moves on a caput to VAL (SCAN=Passive) #########
 # The v0.20.0 regression: a caput to a SCAN=Passive motor's VAL did not move
 # it (the I/O-Intr-vs-Passive dbPutField processing gate). Pins "caput to a

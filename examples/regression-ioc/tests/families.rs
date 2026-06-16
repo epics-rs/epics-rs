@@ -13,6 +13,7 @@
 //!   G — alarm severity raised on limit violation
 //!   H — timestamp advances on each process
 //!   I — monitor event-MASK routing (MDEL/ADEL → DBE_VALUE/DBE_LOG class)
+//!   K — .PROC=0 forces a process; put-callback waits for completion
 
 use std::time::Duration;
 
@@ -421,4 +422,43 @@ async fn i_deadband_routes_value_vs_log_event_masks() {
     recv_until(&mut mon_val, 2000, val_is(120.0))
         .await
         .expect("DBE_VALUE sub must receive the supra-MDEL value post");
+}
+
+// ---- Family K: .PROC=0 force-process + put-callback completion -------------
+
+/// A caput to `REC.PROC` with value **0** must force a process (a PROC write of
+/// 0 was once a silent no-op), and a put-with-callback (CA WRITE_NOTIFY) must
+/// return only after processing completes. Seed K:SRC, confirm the Passive
+/// K:CALC has not yet mirrored it, then force `K:CALC.PROC=0`; an IMMEDIATE
+/// caget (no polling) must already equal SRC — proving both the forced process
+/// and that the put waited for completion. Distinct from Family A, which forces
+/// with `.PROC=1` and then *polls* the OUT-link target.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn k_proc_zero_forces_process_and_put_completes() {
+    let ioc = RegressionIoc::boot().await.expect("boot");
+    let ca = ioc.ca_client().await;
+
+    // Seed the source. K:CALC is Passive with no link back from SRC, so this
+    // does NOT process K:CALC.
+    ca.caput("REG:K:SRC", "9").await.expect("caput SRC");
+    let (_dbf, before) = ca.caget("REG:K:CALC").await.expect("caget CALC before");
+    assert!(
+        !matches!(as_f64(&before), Some(x) if (x - 9.0).abs() < 1e-9),
+        "K:CALC must not mirror SRC until it is processed, got {before:?}"
+    );
+
+    // Force a process via a PROC write of *0* — the regression: 0 was a no-op.
+    ca.caput("REG:K:CALC.PROC", "0")
+        .await
+        .expect("force process via PROC=0");
+
+    // The put-callback has returned, so processing is complete: read ONCE, no
+    // poll. A correct WRITE_NOTIFY put makes this deterministic.
+    let (_dbf, after) = ca.caget("REG:K:CALC").await.expect("caget CALC after");
+    assert!(
+        matches!(as_f64(&after), Some(x) if (x - 9.0).abs() < 1e-9),
+        "PROC=0 must force a process and the put-callback must complete it \
+         before returning; immediate caget got {after:?}"
+    );
 }

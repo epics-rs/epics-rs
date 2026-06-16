@@ -1088,6 +1088,126 @@ pub fn dispatch_trap_write(msg: &TrapWriteMessage<'_>) {
     }
 }
 
+/// Owned trap-write identity used to construct a [`TrapWriteGuard`].
+///
+/// Unlike [`TrapWriteMessage`] (borrowed and `Copy`), these fields are
+/// owned so the guard can outlive the call frame that created it —
+/// survive a move into a spawned put-completion task and live across
+/// `.await` points until the put really finishes, is superseded, or the
+/// connection tears down.
+pub struct TrapWriteFields {
+    pub pv_name: String,
+    pub user: String,
+    pub host: String,
+    pub peer: String,
+    pub value_str: String,
+    pub dbr_type: u16,
+    pub no_elements: u32,
+    pub event_id: u64,
+    pub rule_was_trap: bool,
+    /// AfterWrite `status` dispatched when the guard is dropped without
+    /// a preceding [`TrapWriteGuard::complete`] — i.e. the put was
+    /// cancelled / superseded / torn down before its real status was
+    /// known. C `asTrapWriteAfter` carries no status; this Rust-only
+    /// field lets listeners distinguish a cancelled tail from a clean
+    /// completion.
+    pub cancel_status: String,
+}
+
+impl TrapWriteFields {
+    fn message<'a>(&'a self, op: TrapWriteOp, status: Option<&'a str>) -> TrapWriteMessage<'a> {
+        TrapWriteMessage {
+            op,
+            pv_name: &self.pv_name,
+            user: &self.user,
+            host: &self.host,
+            peer: &self.peer,
+            value_str: &self.value_str,
+            dbr_type: self.dbr_type,
+            no_elements: self.no_elements,
+            event_id: self.event_id,
+            status,
+            rule_was_trap: self.rule_was_trap,
+        }
+    }
+}
+
+/// RAII guard that pairs one `asTrapWrite` BeforeWrite/AfterWrite
+/// bracket so the AfterWrite fires on *every* exit path of a record
+/// put — normal completion, early return, async cancellation (the
+/// future that owns the guard is dropped mid-`.await`), or task abort
+/// (a superseding WRITE_NOTIFY or a client teardown aborting the
+/// completion task).
+///
+/// This makes the C invariant hold *by construction*: every
+/// `asTrapWriteWithData` (BeforeWrite) is matched by exactly one
+/// `asTrapWriteAfter` (AfterWrite) on all rsrv exit paths — normal
+/// completion (`rsrv/camessage.c:1400`), still-busy teardown
+/// (`rsrvFreePutNotify`, `camessage.c:1620`), and supersede-cancel
+/// (`write_notify_action`, `camessage.c:1700`) — and mirrors pvxs's
+/// `SecurityLogger`, whose destructor calls `asTrapWriteAfterWrite`
+/// (`ioc/securitylogger.h:23-59`). Before this guard the Rust emitters
+/// dispatched AfterWrite from an explicit call that an
+/// aborted/superseded/cancelled put skipped, leaving a BeforeWrite with
+/// no matching AfterWrite in the put-log.
+///
+/// Lifecycle:
+/// - [`TrapWriteGuard::begin`] fires BeforeWrite and arms the guard.
+/// - [`TrapWriteGuard::complete`] fires AfterWrite *now* with the real
+///   put status and disarms the guard (Drop becomes a no-op). Call it on
+///   the normal path once the put status is known.
+/// - If the guard is dropped while still armed (any cancel path), Drop
+///   fires AfterWrite with [`TrapWriteFields::cancel_status`].
+///
+/// AfterWrite therefore fires exactly once: either from `complete` or
+/// from Drop, never both, never neither.
+pub struct TrapWriteGuard {
+    /// `Some` while an AfterWrite is still owed. `begin` leaves it
+    /// `None` when no listener is registered (the whole bracket is a
+    /// no-op); `complete` takes it to fire-and-disarm.
+    armed: Option<Box<TrapWriteFields>>,
+}
+
+impl TrapWriteGuard {
+    /// Fire BeforeWrite and arm the AfterWrite finalizer.
+    ///
+    /// When no trap-write listener is registered this returns a
+    /// disarmed no-op guard (its `complete`/Drop dispatch nothing), so a
+    /// caller may hold a guard unconditionally. Callers still gate on
+    /// the ACF trap mask (`rule_was_trap`) before constructing one — a
+    /// non-trapped put must never open a bracket (C `asActive &&
+    /// trapMask`, `asLib.h:57`).
+    pub fn begin(fields: TrapWriteFields) -> Self {
+        if !has_trap_write_listeners() {
+            return Self { armed: None };
+        }
+        dispatch_trap_write(&fields.message(TrapWriteOp::BeforeWrite, None));
+        Self {
+            armed: Some(Box::new(fields)),
+        }
+    }
+
+    /// Fire AfterWrite now with the real put `status` and disarm the
+    /// guard so Drop does nothing. A no-op on an already-disarmed guard
+    /// (no listener at `begin`, or `complete` already called), so it is
+    /// safe to call on every normal-completion path.
+    pub fn complete(&mut self, status: &str) {
+        if let Some(fields) = self.armed.take() {
+            dispatch_trap_write(&fields.message(TrapWriteOp::AfterWrite, Some(status)));
+        }
+    }
+}
+
+impl Drop for TrapWriteGuard {
+    fn drop(&mut self) {
+        if let Some(fields) = self.armed.take() {
+            dispatch_trap_write(
+                &fields.message(TrapWriteOp::AfterWrite, Some(&fields.cancel_status)),
+            );
+        }
+    }
+}
+
 /// ASG-field change notifier.
 ///
 /// C `database/src/ioc/as/asDbLib.c:107-110,144` registers
@@ -2799,6 +2919,84 @@ ASG(G) {
         assert_eq!(
             config.check_access_method("A", "h", "u", 2, "", ""),
             AccessLevel::NoAccess
+        );
+    }
+
+    /// Collect (op, owned-status) pairs whose `pv_name` matches `pv`,
+    /// so a guard test is not polluted by trap dispatches from other
+    /// tests sharing the process-global listener registry.
+    fn trap_capture(
+        pv: &'static str,
+    ) -> (
+        std::sync::Arc<std::sync::Mutex<Vec<(TrapWriteOp, Option<String>)>>>,
+        TrapWriteListenerHandle,
+    ) {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let handle = register_trap_write_listener(std::sync::Arc::new(move |msg| {
+            if msg.pv_name == pv {
+                sink.lock()
+                    .unwrap()
+                    .push((msg.op, msg.status.map(str::to_owned)));
+            }
+        }));
+        (events, handle)
+    }
+
+    fn trap_fields(pv: &'static str) -> TrapWriteFields {
+        TrapWriteFields {
+            pv_name: pv.to_string(),
+            user: "u".to_string(),
+            host: "h".to_string(),
+            peer: "h:5064".to_string(),
+            value_str: "42".to_string(),
+            dbr_type: 5,
+            no_elements: 1,
+            event_id: next_trap_write_event_id(),
+            rule_was_trap: true,
+            cancel_status: "superseded".to_string(),
+        }
+    }
+
+    /// `complete` fires exactly one AfterWrite with the real status and
+    /// disarms Drop, so the bracket is Before+After("ok") and not a
+    /// second AfterWrite on scope exit. Owner-path of the invariant.
+    #[test]
+    fn trap_write_guard_complete_fires_one_after_and_disarms_drop() {
+        let (events, _handle) = trap_capture("guard:complete");
+        {
+            let mut guard = TrapWriteGuard::begin(trap_fields("guard:complete"));
+            guard.complete("ok");
+        } // guard dropped here — must NOT emit a second AfterWrite
+        let got = events.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec![
+                (TrapWriteOp::BeforeWrite, None),
+                (TrapWriteOp::AfterWrite, Some("ok".to_string())),
+            ]
+        );
+    }
+
+    /// A guard dropped without `complete` (the cancel / supersede /
+    /// teardown path) still fires its AfterWrite, carrying
+    /// `cancel_status`. Bypass-path of the invariant: this is the case
+    /// the pre-guard explicit-dispatch emitters skipped, leaving an
+    /// unbalanced BeforeWrite.
+    #[test]
+    fn trap_write_guard_drop_without_complete_fires_cancel_after() {
+        let (events, _handle) = trap_capture("guard:cancel");
+        {
+            let _guard = TrapWriteGuard::begin(trap_fields("guard:cancel"));
+            // no complete() — simulate an aborted/superseded put
+        }
+        let got = events.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec![
+                (TrapWriteOp::BeforeWrite, None),
+                (TrapWriteOp::AfterWrite, Some("superseded".to_string())),
+            ]
         );
     }
 }

@@ -3252,46 +3252,49 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 String::new()
             };
 
-            // pair the matching Before/After of this put with a
-            // monotonic event_id so listeners can correlate without
-            // racing on (peer, pv).
-            let trap_event_id = if trap_listeners_active {
-                epics_base_rs::server::access_security::next_trap_write_event_id()
-            } else {
-                0
-            };
-
-            // BeforeWrite notification.
-            // Pre-fix BeforeWrite fired unconditionally before the
-            // put was attempted, so write_hook rejections (and
-            // pre-storage record rejections inside
-            // `put_record_field_from_ca`) generated Before+After=fail
-            // pairs that C would have silenced. The dispatch still
-            // sits here because the alternative — moving inside each
-            // match arm — would over-narrow the bracket around the
-            // actual storage call without removing the over-log
+            // One RAII guard owns this put's BeforeWrite/AfterWrite
+            // pair. `begin` fires BeforeWrite now; the matching
+            // AfterWrite fires from `complete` (the synchronous paths
+            // and the async completion task, once the real status is
+            // known) or — if neither runs because the put was aborted
+            // first, a superseding WRITE_NOTIFY or a client teardown
+            // calling `abort` on the completion task — from the guard's
+            // Drop. This makes the C invariant hold by construction:
+            // every `asTrapWriteWithData` is matched by exactly one
+            // `asTrapWriteAfter` on all rsrv exit paths — completion
+            // (`camessage.c:1400`), still-busy teardown
+            // (`rsrvFreePutNotify`, :1620), and supersede-cancel
+            // (`write_notify_action`, :1700). Pre-fix the AfterWrite was
+            // an explicit dispatch that the abort paths skipped, leaving
+            // a BeforeWrite with no match in the put-log.
+            //
+            // BeforeWrite still sits here (not inside each write arm):
+            // C `asTrapWriteWithData` (`camessage.c:768-779`) fires
+            // before `dbChannel_put`, and narrowing the bracket into the
+            // match arms would not remove the pre-storage over-log
             // (RecordField pre-rejections happen inside the called
-            // function; we can't disentangle pre-vs-post without a
-            // refactor). The AfterWrite `status` is now carried as
-            // a specific code string (see below) so listeners can
-            // filter.
-            if trap_listeners_active {
-                epics_base_rs::server::access_security::dispatch_trap_write(
-                    &epics_base_rs::server::access_security::TrapWriteMessage {
-                        op: epics_base_rs::server::access_security::TrapWriteOp::BeforeWrite,
-                        pv_name: &audit_pv,
-                        user: &state.username,
-                        host: &state.hostname,
-                        peer: &state.peer,
-                        value_str: &display_value,
+            // function) without a deeper refactor.
+            let mut trap_guard = trap_listeners_active.then(|| {
+                epics_base_rs::server::access_security::TrapWriteGuard::begin(
+                    epics_base_rs::server::access_security::TrapWriteFields {
+                        pv_name: audit_pv.clone(),
+                        user: state.username.clone(),
+                        host: state.hostname.clone(),
+                        peer: state.peer.clone(),
+                        value_str: display_value.clone(),
                         dbr_type: write_type as u16,
                         no_elements: write_count,
-                        event_id: trap_event_id,
-                        status: None,
+                        event_id: epics_base_rs::server::access_security::next_trap_write_event_id(
+                        ),
                         rule_was_trap,
+                        // C carries no status on the cancelled-put
+                        // `asTrapWriteAfter`; this Rust enrichment marks
+                        // the supersede / teardown tail so listeners can
+                        // tell it from a clean completion.
+                        cancel_status: "cancel".to_string(),
                     },
-                );
-            }
+                )
+            });
 
             let write_result = match &entry.target {
                 ChannelTarget::SimplePv(pv) => {
@@ -3333,29 +3336,16 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                 .audit("caput", &audit_pv, &display_value, audit_result)
                 .await;
 
-            // for the SYNCHRONOUS write paths (no async record
-            // completion pending), dispatch AfterWrite immediately
-            // with the now-known status. The async path defers
-            // AfterWrite into the background task that awaits
-            // `rx.await` so caPutLog sees real device-side completion
-            // timing, matching `write_notify_reply:1400` semantics.
+            // SYNCHRONOUS write paths (no async record completion
+            // pending): fire AfterWrite now with the known status via
+            // the guard. The async path instead hands the guard to the
+            // completion task so AfterWrite reflects real device-side
+            // completion timing (C `write_notify_reply:1400`).
             let needs_async_after = is_notify && matches!(&write_result, Ok(Some(_)));
-            if trap_listeners_active && !needs_async_after {
-                epics_base_rs::server::access_security::dispatch_trap_write(
-                    &epics_base_rs::server::access_security::TrapWriteMessage {
-                        op: epics_base_rs::server::access_security::TrapWriteOp::AfterWrite,
-                        pv_name: &audit_pv,
-                        user: &state.username,
-                        host: &state.hostname,
-                        peer: &state.peer,
-                        value_str: &display_value,
-                        dbr_type: write_type as u16,
-                        no_elements: write_count,
-                        event_id: trap_event_id,
-                        status: Some(audit_result),
-                        rule_was_trap,
-                    },
-                );
+            if !needs_async_after {
+                if let Some(guard) = &mut trap_guard {
+                    guard.complete(audit_result);
+                }
             }
 
             // C `write_action` (`rsrv/camessage.c:781-789`):
@@ -3402,30 +3392,23 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                     let responded = Arc::new(AtomicBool::new(false));
                     let responded_task = responded.clone();
                     let writer_c = writer.clone();
-                    // snapshot the trap-dispatch inputs so the
-                    // async task can fire AfterWrite at *real*
-                    // completion time (matches C
-                    // `write_notify_reply:1400` semantics: the after-
-                    // hook fires from the extra-labor task after
-                    // `dbProcessNotify` invokes
-                    // `write_notify_done_callback`). Pre-fix Rust
-                    // dispatched AfterWrite synchronously with
-                    // `status=ok` the moment the put kicked off, so
+                    // Hand the guard to the completion task so its
+                    // AfterWrite fires at *real* device-side completion
+                    // via `complete` (C `write_notify_reply:1400`: the
+                    // after-hook fires from the extra-labor task once
+                    // `dbProcessNotify` invokes the done callback).
+                    // Pre-fix Rust dispatched AfterWrite synchronously
+                    // with `status=ok` the moment the put kicked off, so
                     // caPutLog measured latency=0 and never observed
-                    // device-side PUTFAIL.
-                    let trap_inputs = trap_listeners_active.then(|| {
-                        (
-                            audit_pv.clone(),
-                            state.username.clone(),
-                            state.hostname.clone(),
-                            state.peer.clone(),
-                            display_value.clone(),
-                            write_type as u16,
-                            write_count,
-                            trap_event_id,
-                            rule_was_trap,
-                        )
-                    });
+                    // device-side PUTFAIL. If the task is aborted before
+                    // it completes — a superseding WRITE_NOTIFY
+                    // (`supersede_put_notify`) or a client teardown
+                    // (`write_notify_tasks` drain) calling `abort` — the
+                    // guard's Drop fires the cancel AfterWrite instead,
+                    // so the put-log stays balanced (C `asTrapWriteAfter`
+                    // on the superseded / torn-down put,
+                    // `camessage.c:1700` / `:1620`).
+                    let mut task_guard = trap_guard.take();
                     let join = tokio::spawn(async move {
                         // Wait indefinitely for record processing to complete,
                         // matching C EPICS rsrv behavior. RecvError means the
@@ -3440,42 +3423,27 @@ async fn dispatch_message<W: AsyncWrite + Unpin + Send + 'static>(
                         // Claim this put-callback's single reply. If a
                         // superseding WRITE_NOTIFY already won the race it
                         // sent ECA_PUTCBINPROG for this ioid and aborted
-                        // this task; skip both the AfterWrite log and the
-                        // reply so the client never sees two replies for
-                        // one ioid.
+                        // this task; skip the reply so the client never
+                        // sees two replies for one ioid. Returning here
+                        // drops `task_guard` un-completed, so its Drop
+                        // still fires the cancel AfterWrite for this
+                        // superseded put (C `camessage.c:1700`).
                         if responded_task.swap(true, Ordering::AcqRel) {
                             return;
                         }
 
-                        // dispatch AfterWrite NOW, after real
-                        // device-side completion. `status` carries
-                        // "ok" for ECA_NORMAL or the ECA-code form
-                        // for anything else so listeners can filter
-                        // failed puts.
-                        if let Some((pv, user, host, peer, val, dbr, ne, ev_id, rule_was_trap)) =
-                            trap_inputs
-                        {
+                        // AfterWrite NOW, after real device-side
+                        // completion. `status` carries "ok" for
+                        // ECA_NORMAL or the ECA-code form otherwise so
+                        // listeners can filter failed puts. `complete`
+                        // disarms the guard so its later Drop is a no-op.
+                        if let Some(guard) = &mut task_guard {
                             let status_s = if final_status == ECA_NORMAL {
                                 "ok".to_string()
                             } else {
                                 format!("eca:0x{:04x}", final_status)
                             };
-                            epics_base_rs::server::access_security::dispatch_trap_write(
-                                &epics_base_rs::server::access_security::TrapWriteMessage {
-                                    op:
-                                        epics_base_rs::server::access_security::TrapWriteOp::AfterWrite,
-                                    pv_name: &pv,
-                                    user: &user,
-                                    host: &host,
-                                    peer: &peer,
-                                    value_str: &val,
-                                    dbr_type: dbr,
-                                    no_elements: ne,
-                                    event_id: ev_id,
-                                    status: Some(&status_s),
-                                    rule_was_trap,
-                                },
-                            );
+                            guard.complete(&status_s);
                         }
 
                         let _ = send_put_notify_response(
@@ -5495,6 +5463,88 @@ mod put_notify_supersede_tests {
         assert!(
             guard.get_ref().batches.is_empty(),
             "superseding path must not reply once the completion task has"
+        );
+    }
+
+    /// Superseding an in-flight put-callback whose completion task holds
+    /// a `TrapWriteGuard` fires the guard's cancel AfterWrite via Drop,
+    /// so the put-log carries a balanced Before/After for the superseded
+    /// put. C `write_notify_action` calls `asTrapWriteAfter` on the
+    /// cancelled put (`camessage.c:1700`); pre-guard Rust aborted the
+    /// task and dropped the AfterWrite, leaving an unbalanced
+    /// BeforeWrite. The same abort-then-Drop mechanism covers the
+    /// teardown path (`write_notify_tasks` drain → `abort`, C
+    /// `rsrvFreePutNotify`, `camessage.c:1620`).
+    #[tokio::test]
+    async fn supersede_fires_cancel_after_write_via_guard_drop() {
+        use epics_base_rs::server::access_security::{
+            TrapWriteFields, TrapWriteGuard, TrapWriteOp, next_trap_write_event_id,
+            register_trap_write_listener,
+        };
+
+        // Capture trap events for THIS test's unique pv only — the
+        // listener registry is process-global.
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let _handle = register_trap_write_listener(Arc::new(move |msg| {
+            if msg.pv_name == "supersede:trap" {
+                sink.lock()
+                    .unwrap()
+                    .push((msg.op, msg.status.map(str::to_owned)));
+            }
+        }));
+
+        // A completion task parked on a never-firing receiver, holding
+        // the guard exactly as the WRITE_NOTIFY completion task does.
+        let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _guard = TrapWriteGuard::begin(TrapWriteFields {
+                pv_name: "supersede:trap".to_string(),
+                user: "u".to_string(),
+                host: "h".to_string(),
+                peer: "h:5064".to_string(),
+                value_str: "1".to_string(),
+                dbr_type: epics_base_rs::types::DBR_LONG,
+                no_elements: 1,
+                event_id: next_trap_write_event_id(),
+                rule_was_trap: true,
+                cancel_status: "cancel".to_string(),
+            });
+            let _ = rx.await; // parked until aborted
+        });
+        let abort = task.abort_handle();
+        // Ensure the task ran far enough to fire BeforeWrite and park on
+        // `rx` BEFORE we abort — aborting an unpolled task would drop a
+        // future whose guard was never constructed (no Before, no
+        // After), which is a different scenario.
+        while events.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+
+        let prev = Some(InFlightPutNotify {
+            abort,
+            responded: Arc::new(AtomicBool::new(false)),
+            ioid: 0x77,
+            dbr_type: epics_base_rs::types::DBR_LONG,
+            count: 1,
+        });
+        supersede_put_notify(prev, &recording_writer())
+            .await
+            .unwrap();
+
+        // Joining the aborted task guarantees its guard Drop has run.
+        assert!(
+            task.await.unwrap_err().is_cancelled(),
+            "superseded completion task is cancelled"
+        );
+
+        let got = events.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec![
+                (TrapWriteOp::BeforeWrite, None),
+                (TrapWriteOp::AfterWrite, Some("cancel".to_string())),
+            ]
         );
     }
 }

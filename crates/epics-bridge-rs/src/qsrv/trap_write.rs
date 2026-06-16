@@ -33,7 +33,7 @@
 //! the access layer; this helper reads only that flag and never
 //! re-derives the trap mask at the emission site.
 
-use epics_base_rs::server::access_security::{self, TrapWriteMessage, TrapWriteOp};
+use epics_base_rs::server::access_security::{self, TrapWriteFields, TrapWriteGuard};
 use epics_base_rs::types::EpicsValue;
 
 use super::provider::WriteGrant;
@@ -93,29 +93,133 @@ where
     let no_elements = value.count();
     let event_id = access_security::next_trap_write_event_id();
 
-    // `TrapWriteMessage` is `Copy`; reuse one record for the Before/After
-    // pair, flipping only `op`/`status`, so the pair carries identical
-    // identity and the shared `event_id` by construction.
-    let mut msg = TrapWriteMessage {
-        op: TrapWriteOp::BeforeWrite,
-        pv_name: meta.pv_name,
-        user: meta.user,
-        host: meta.host,
-        peer: meta.peer,
-        value_str: &value_str,
+    // One RAII guard owns the Before/After pair: BeforeWrite on
+    // construction, AfterWrite on `complete` (normal path) OR on Drop
+    // (this future cancelled mid-write — the QSRV connection/RPC torn
+    // down while `write(...).await` is parked). The Drop arm is what
+    // keeps the put-log balanced; the pre-guard code dispatched the
+    // AfterWrite from an explicit call below the await, which a
+    // cancellation skipped, leaving a BeforeWrite with no match. The C
+    // invariant pairs every `asTrapWriteWithData` with one
+    // `asTrapWriteAfter` on all exit paths; pvxs `SecurityLogger`'s
+    // destructor enforces the same.
+    let mut guard = TrapWriteGuard::begin(TrapWriteFields {
+        pv_name: meta.pv_name.to_string(),
+        user: meta.user.to_string(),
+        host: meta.host.to_string(),
+        peer: meta.peer.to_string(),
+        value_str,
         dbr_type: meta.dbr_type,
         no_elements,
         event_id,
-        status: None,
         rule_was_trap: true,
-    };
-    access_security::dispatch_trap_write(&msg);
+        cancel_status: "cancel".to_string(),
+    });
 
     let result = write(value).await;
 
-    msg.op = TrapWriteOp::AfterWrite;
-    msg.status = Some(if result.is_ok() { "ok" } else { "fail" });
-    access_security::dispatch_trap_write(&msg);
+    guard.complete(if result.is_ok() { "ok" } else { "fail" });
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_base_rs::server::access_security::{
+        TrapWriteListenerHandle, TrapWriteOp, register_trap_write_listener,
+    };
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    type Captured = Arc<Mutex<Vec<(TrapWriteOp, Option<String>)>>>;
+
+    /// Capture (op, owned-status) for events on `pv` only, so the
+    /// process-global listener registry shared with other tests does not
+    /// pollute the assertion.
+    fn capture(pv: &'static str) -> (Captured, TrapWriteListenerHandle) {
+        let events: Captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let handle = register_trap_write_listener(Arc::new(move |msg| {
+            if msg.pv_name == pv {
+                sink.lock()
+                    .unwrap()
+                    .push((msg.op, msg.status.map(str::to_owned)));
+            }
+        }));
+        (events, handle)
+    }
+
+    fn meta(pv: &str) -> TrapWriteMeta<'_> {
+        TrapWriteMeta {
+            pv_name: pv,
+            user: "u",
+            host: "h",
+            peer: "h:5075",
+            dbr_type: 5,
+        }
+    }
+
+    /// A trapped put whose backing write is cancelled mid-`.await` (the
+    /// QSRV connection/RPC torn down) must still emit AfterWrite — the
+    /// guard's Drop arm fires it with the cancel status. Pre-guard this
+    /// path emitted only BeforeWrite, leaving the put-log unbalanced.
+    #[tokio::test]
+    async fn after_fires_when_write_future_cancelled() {
+        let (events, _handle) = capture("trap:cancel");
+        let grant = WriteGrant {
+            allowed: true,
+            rule_was_trap: true,
+        };
+        let fut = put_with_trap(
+            grant,
+            meta("trap:cancel"),
+            EpicsValue::Long(42),
+            |_v| async {
+                // never completes — models record processing still running
+                // when the client disconnects.
+                std::future::pending::<BridgeResult<()>>().await
+            },
+        );
+        // `timeout` polls `fut` (firing BeforeWrite) then drops it when
+        // the timer elapses (the inner write never resolves), running
+        // the guard's Drop.
+        let elapsed = tokio::time::timeout(Duration::from_millis(20), fut).await;
+        assert!(elapsed.is_err(), "write should not have completed");
+
+        let got = events.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec![
+                (TrapWriteOp::BeforeWrite, None),
+                (TrapWriteOp::AfterWrite, Some("cancel".to_string())),
+            ]
+        );
+    }
+
+    /// The normal path still emits exactly one AfterWrite carrying the
+    /// real put status (here "ok"), and no extra cancel AfterWrite when
+    /// the guard drops after `complete`.
+    #[tokio::test]
+    async fn after_fires_once_ok_on_normal_completion() {
+        let (events, _handle) = capture("trap:ok");
+        let grant = WriteGrant {
+            allowed: true,
+            rule_was_trap: true,
+        };
+        put_with_trap(grant, meta("trap:ok"), EpicsValue::Long(7), |_v| async {
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let got = events.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec![
+                (TrapWriteOp::BeforeWrite, None),
+                (TrapWriteOp::AfterWrite, Some("ok".to_string())),
+            ]
+        );
+    }
 }

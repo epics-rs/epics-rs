@@ -311,7 +311,7 @@ Impact: `OVERLAY_SHAPE=2/3` draws the wrong shape vs C.
 
 #### ADP-11: Codec COMPRESSOR ordinal mapping diverges (extra zlib/lz4hdf5 shift) — FIXED 39e07250
 Severity: High — fix
-Fix: ordinals 0-4 aligned to C `NDCodecCompressor_t` (NONE/JPEG/BLOSC/LZ4/BSLZ4); Rust-only zlib/lz4hdf5 moved to 5/6 so they never shadow a C ordinal. (Structural ADP-26 sign-off — keep vs remove the extra codecs — still open under #58.)
+Fix: ordinals 0-4 aligned to C `NDCodecCompressor_t` (NONE/JPEG/BLOSC/LZ4/BSLZ4); Rust-only zlib/lz4hdf5 moved to 5/6 so they never shadow a C ordinal. (Structural ADP-26 sign-off — keep vs remove the extra codecs — RESOLVED 2026-06-15 under ADP-26: keep them.)
 Rust (post-fix): `crates/ad-plugins-rs/src/codec.rs:1211-1220` maps `0=None,1=JPEG,2=Blosc,3=LZ4,4=BSLZ4` (aligned to C) with the Rust-only `5=Zlib,6=LZ4HDF5` after the C set so they never shadow a C ordinal.
 C: `Codec.h:12-18` `NONE=0,JPEG=1,BLOSC=2,LZ4=3,BSLZ4=4`.
 Impact: `COMPRESSOR=2` → Blosc in C, Zlib in Rust; `=3` → LZ4 vs Blosc; `=4` → BSLZ4 vs LZ4. Different codec + bytes. (Structural cause: ADC-10.)
@@ -571,6 +571,7 @@ Severity: Low — signoff
 Rust: `crates/optics-rs/src/math/matrix3.rs:68-85` multiplies by `1/det`.
 C: `matrix3.c:106-110` divides each element by det.
 Impact: last-ULP difference on published A0_*/OMTX_* elements. Signoff (de-precisioning to match C).
+RESOLVED 2026-06-16 — keep Rust `x*(1/det)` (user): a last-ULP difference is below meaningful observability (fails the "observably different" test in practice); de-precisioning would trade real accuracy for a cosmetic bit-match. Intentional signed-off divergence; not de-precisioned.
 
 #### OPT-4: kohzu/ml-mono soft-limit rejection leaves the rejected setpoints on the PVs (no prev-value revert)
 Severity: High — fix
@@ -664,8 +665,8 @@ Verified 2026-06-15 (all six confirmed REAL output-form divergences, each line-c
 - **T-2 Fixed d7318d2d** — C RestoreMotorSpeeds (tableRecord.c:998-1006, called unconditionally) restores saved speed on every can_RW_speed motor; Rust gated on motor_move_mask. Mask gate dropped.
 - **T-3 Fixed 9dc07384** — C GetMotorLimits (tableRecord.c:1024-1031) zeroes h0x/l0x on read failure; Rust kept the stale value. Pre-zero in pre_process_actions; reads overwrite on success.
 - **T-4 Fixed c82703ec** — C NaiveMotorToPivotPointVector (tableRecord.c:1281) rebuilds the Newport matrix from raw ax for the translation-limit norm; Rust reused the offset+yaw matrix. Rebuild from raw ax for Newport.
-- **T-5 OPEN (signoff)** — C does bare sqrt()/asin()/cos-division (tableRecord.c:1327,1333,1435-1438,...) producing NaN/±Inf at AY≈90° / asin round-off past ±1; Rust clamps to a finite value (Rust is the more-correct side; equivalent across the normal operating range, divergent only at the singular boundary). Matching C means reproducing its boundary NaN/Inf; keeping the clamp corrects a latent C round-off defect. Genuine fork — needs user sign-off (cf. OPT-12 matched C's NaN, but MODB-1/2/3 kept Rust's correction of a latent C defect).
-- **T-6 OPEN (signoff)** — C computes speed_ratio = MIN(speed_ratio, sv0x[i]/v0x[i]) for every can_RW_speed motor with no guard (tableRecord.c:556-566); a stationary zero-saved-speed motor gives 0/0 = NaN, MIN(real,NaN)=NaN poisons speed_ratio so C skips the `<1` down-scaling and writes un-scaled speeds. Rust guards `v[i] > 0.0` and scales correctly. Same Rust-is-more-correct fork as T-5 — needs user sign-off.
+- **T-5 RESOLVED 2026-06-16 — keep Rust's guards (user)** — C does bare sqrt()/asin()/cos-division (tableRecord.c:1327,1333,1435-1438,...) producing NaN/±Inf at AY≈90° / asin round-off past ±1; Rust clamps to a finite value (Rust is the more-correct side; equivalent across the normal operating range, divergent only at the singular boundary). Matching C means reproducing its boundary NaN/Inf; keeping the clamp corrects a latent C round-off defect. Signed off as an intentional divergence: Rust keeps the finite clamp (MODB-1/2/3 precedent — keep Rust's correction of a latent C defect; not OPT-12's match-C-NaN).
+- **T-6 RESOLVED 2026-06-16 — keep Rust's guard (user)** — C computes speed_ratio = MIN(speed_ratio, sv0x[i]/v0x[i]) for every can_RW_speed motor with no guard (tableRecord.c:556-566); a stationary zero-saved-speed motor gives 0/0 = NaN, MIN(real,NaN)=NaN poisons speed_ratio so C skips the `<1` down-scaling and writes un-scaled speeds. Rust guards `v[i] > 0.0` and scales correctly. Signed off as an intentional divergence: Rust keeps the `v>0` guard (same MODB-precedent resolution as T-5).
 
 Precision note (not a fixable finding): C `orient.c:15` `M_PI 3.14159265359` and kohzu/ml_mono `radConv 57.2958` are lower-precision than Rust's `std::f64::consts::PI`; Rust is *more* accurate. ~1e-6 relative on published angles. Surfaced, not "fixed" by de-precisioning.
 Verified-equivalent (optics): matrix3 ops, orient per-constraint math, table forward/inverse geometry (4 geometries incl. 5-motor Newport), xia_slit/xiahsc/hsc raw↔dial, chantler table (22 species digit-for-digit), filter_drive/hr_ctl math, db_access re-export.

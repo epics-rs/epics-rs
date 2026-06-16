@@ -12,11 +12,13 @@
 //!   F — DBF_MENU record field served as DBR_ENUM
 //!   G — alarm severity raised on limit violation
 //!   H — timestamp advances on each process
+//!   I — monitor event-MASK routing (MDEL/ADEL → DBE_VALUE/DBE_LOG class)
 
 use std::time::Duration;
 
 use epics_base_rs::server::snapshot::Snapshot;
 use epics_ca_rs::client::MonitorHandle;
+use epics_ca_rs::protocol::{DBE_LOG, DBE_VALUE};
 use epics_ca_rs::{DbFieldType, EpicsValue};
 use regression_ioc::RegressionIoc;
 use serial_test::serial;
@@ -65,6 +67,11 @@ fn as_f64(v: &EpicsValue) -> Option<f64> {
         EpicsValue::Enum(x) => Some(*x as f64),
         _ => None,
     }
+}
+
+/// Predicate: the snapshot's numeric value equals `want` (±eps).
+fn val_is(want: f64) -> impl Fn(&Snapshot) -> bool {
+    move |s: &Snapshot| as_f64(&s.value).is_some_and(|x| (x - want).abs() < 1e-9)
 }
 
 /// Poll `caget` until the numeric VAL equals `want` (±eps) or `ms` elapses.
@@ -334,4 +341,84 @@ async fn h_timestamp_advances_on_process() {
         t2 >= t1,
         "timestamp must not go backwards across processes: {t1:?} -> {t2:?}"
     );
+}
+
+// ---- Family I: monitor event-MASK routing (MDEL/ADEL → DBE class) ----------
+
+/// A field's monitor post must carry the correct DBE *class*, and a subscriber
+/// filtering by an explicit `DBE_*` mask must receive exactly the posts whose
+/// class intersects it. With `MDEL=10`/`ADEL=0`, a sub-MDEL VAL change crosses
+/// ADEL but not MDEL, so it posts `DBE_LOG` only: a `DBE_LOG` subscriber sees
+/// it, a `DBE_VALUE`-only subscriber must NOT; a supra-MDEL change posts
+/// `DBE_VALUE|DBE_LOG` and reaches the `DBE_VALUE` subscriber. Pins the
+/// per-field event-mask contract (which DBE class a field posts) — the family
+/// behind the motor force-post, the scaler idle-`DBE_LOG` sweep, and the scaler
+/// value-only change. Family B (post-only-on-change) does not cover the *class*
+/// of the post, so a field posting the wrong DBE class passes every other test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn i_deadband_routes_value_vs_log_event_masks() {
+    let ioc = RegressionIoc::boot().await.expect("boot");
+    let ca = ioc.ca_client().await;
+
+    // Two independent subscriptions on the same PV, like two `camonitor`
+    // processes: one DBE_VALUE-only, one DBE_LOG-only. deadband 0.0 leaves the
+    // server's MDEL/ADEL gate (not a client-side deadband) in control of which
+    // DBE class each VAL post carries.
+    let ch_val = ca.create_channel("REG:I:AI");
+    ch_val
+        .wait_connected(Duration::from_secs(3))
+        .await
+        .expect("connect VALUE");
+    let mut mon_val = ch_val
+        .subscribe_with_mask(0.0, DBE_VALUE)
+        .await
+        .expect("subscribe DBE_VALUE");
+
+    let ch_log = ca.create_channel("REG:I:AI");
+    ch_log
+        .wait_connected(Duration::from_secs(3))
+        .await
+        .expect("connect LOG");
+    let mut mon_log = ch_log
+        .subscribe_with_mask(0.0, DBE_LOG)
+        .await
+        .expect("subscribe DBE_LOG");
+
+    // Prime: the first process fires unconditionally (NaN MLST/ALST sentinel),
+    // advancing MLST=ALST=100 so the next change is gated by the real
+    // deadbands. Sync BOTH subscribers to the primed value before the
+    // discriminating puts, so any later event is strictly post-priming.
+    ca.caput("REG:I:AI", "100").await.expect("caput 100");
+    recv_until(&mut mon_val, 2000, val_is(100.0))
+        .await
+        .expect("DBE_VALUE sub primed at 100");
+    recv_until(&mut mon_log, 2000, val_is(100.0))
+        .await
+        .expect("DBE_LOG sub primed at 100");
+
+    // Sub-MDEL change 100 -> 105 (|Δ|=5 ≤ MDEL=10, > ADEL=0): VAL posts
+    // DBE_LOG only.
+    ca.caput("REG:I:AI", "105").await.expect("caput 105");
+    // The DBE_LOG subscriber MUST receive it...
+    recv_until(&mut mon_log, 2000, val_is(105.0))
+        .await
+        .expect("DBE_LOG sub must receive the sub-MDEL (archive-only) post");
+    // ...and the DBE_VALUE-only subscriber MUST NOT (a LOG-classed post does
+    // not intersect DBE_VALUE). The LOG receive above proves the post cycle
+    // already dispatched to all subscriptions, so this window is conclusive.
+    let leaked = recv_within(&mut mon_val, 700).await;
+    assert!(
+        leaked.is_none(),
+        "a sub-MDEL change posts DBE_LOG only; a DBE_VALUE subscriber must not \
+         receive it, got {leaked:?}"
+    );
+
+    // Supra-MDEL change 105 -> 120 (|Δ| from MLST=100 is 20 > 10): VAL posts
+    // DBE_VALUE|DBE_LOG, so the DBE_VALUE subscriber now DOES receive it —
+    // proving it was alive and correctly filtered the LOG-only post above.
+    ca.caput("REG:I:AI", "120").await.expect("caput 120");
+    recv_until(&mut mon_val, 2000, val_is(120.0))
+        .await
+        .expect("DBE_VALUE sub must receive the supra-MDEL value post");
 }

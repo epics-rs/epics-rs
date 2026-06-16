@@ -13,6 +13,7 @@
 #   F = field typing (raw/index fields keep their integer DBF type)
 #   G = alarm / SEVR / STAT (severity raised on limit violation)
 #   H = timestamp (advances on each process, nsec WallTime)
+#   I = monitor event-MASK routing (MDEL/ADEL -> DBE_VALUE/DBE_LOG class)
 # Families D (motor) and the motor SCAN=Passive regression live in db sections
 # added with their device support; asyn records likewise.
 
@@ -99,6 +100,22 @@ record(ai, "REG:G:AI") {
 record(ai, "REG:H:AI") {
     field(DESC, "timestamp advance")
     field(VAL,  "0")
+}
+
+#### Family I — monitor event-MASK routing (MDEL/ADEL -> DBE class) #########
+# Pins the per-field monitor event-MASK contract: which DBE class a field
+# posts, and that a subscriber filtering by an explicit DBE_* mask gets exactly
+# the posts whose class intersects it. With MDEL=10/ADEL=0, a sub-MDEL VAL
+# change crosses ADEL but not MDEL, so it posts DBE_LOG only — a DBE_VALUE-only
+# subscriber must NOT see it while a DBE_LOG subscriber must; a supra-MDEL
+# change posts DBE_VALUE|DBE_LOG and reaches both. This is the family behind the
+# motor force-post, the scaler idle-LOG sweep, and the scaler value-only change;
+# Family B (post-only-on-change) does not exercise the DBE class of the post.
+record(ai, "REG:I:AI") {
+    field(DESC, "deadband event-mask routing")
+    field(VAL,  "0")
+    field(MDEL, "10")
+    field(ADEL, "0")
 }
 
 #### Family D — motor record moves on a caput to VAL (SCAN=Passive) #########

@@ -12,6 +12,7 @@ use ad_core_rs::plugin::runtime::{
 };
 
 use rust_hdf5::H5File;
+use rust_hdf5::format::messages::datatype::{ByteOrder, DatatypeMessage};
 use rust_hdf5::format::messages::filter::{
     FILTER_BLOSC, FILTER_BSHUF, FILTER_JPEG, FILTER_SZIP, Filter, FilterPipeline,
 };
@@ -380,7 +381,9 @@ impl Hdf5Writer {
             compression_type: 0,
             z_compress_level: 6,
             szip_num_pixels: 16,
-            nbit_precision: 0,
+            // C default precision=8 bit, offset=0 (NDFileHDF5.cpp:2340-2341):
+            // a default-config N-bit request packs to 8 significant bits.
+            nbit_precision: 8,
             nbit_offset: 0,
             jpeg_quality: 90,
             // C default bloscShuffleType=1 (byte shuffle), NDFileHDF5.cpp:2344.
@@ -652,27 +655,17 @@ impl Hdf5Writer {
                 // narrowing the dataset DATATYPE — H5Tset_precision /
                 // H5Tset_offset — and then registering a parameterless
                 // H5Pset_nbit filter; libhdf5's set_local callback derives the
-                // nbit parameter tree from that reduced-precision datatype.
-                // rust-hdf5 0.2.17's high-level dataset builder
-                // (`DatasetBuilder<T: H5Type>`, the only dataset-creation path
-                // this writer has) hardcodes the full-width datatype returned by
-                // `T::hdf5_type()` and exposes no reduced-precision datatype
-                // message, so a faithful N-bit dataset (reduced-precision
-                // `FixedPoint` datatype + matching nbit parameter tree +
-                // bit-packed chunks) cannot be produced through this API. The
-                // filter expects `cd_values` to be that datatype parameter tree
-                // (`apply_nbit`), not `[precision, offset]`; emitting it over a
-                // full-width datatype yields a file no HDF5 reader can decode.
-                // N-bit therefore degrades to the unsupported-compressor
-                // fallback: the array is stored UNCOMPRESSED and lossless (SWMR
-                // mode additionally flags this via `compression_dropped`).
-                eprintln!(
-                    "NDFileHDF5: WARNING — N-bit compression (precision={} bit, \
-                     offset={} bit) is not supported by the rust-hdf5 backend \
-                     (no reduced-precision datatype path); the data will be \
-                     written UNCOMPRESSED and lossless.",
-                    self.nbit_precision, self.nbit_offset
-                );
+                // nbit `cd_values` parameter tree from that reduced-precision
+                // datatype. The filter therefore cannot be expressed by a
+                // pipeline alone: it must travel together with a reduced
+                // datatype override on the dataset builder. `build_pipeline` is
+                // shared with the SWMR streaming path, whose
+                // `create_streaming_dataset_chunked_compressed` hardcodes
+                // `T::hdf5_type()` and has no datatype-override hook — so N-bit
+                // is handled out of band by `nbit_packing` on the standard
+                // write path (which CAN override the datatype) and returns
+                // `None` here so SWMR keeps degrading N-bit to uncompressed
+                // instead of writing an nbit filter over a full-width datatype.
                 None
             }
             COMPRESS_JPEG => Some(FilterPipeline {
@@ -684,6 +677,62 @@ impl Hdf5Writer {
             }),
             _ => None,
         }
+    }
+
+    /// N-bit packing for the standard write path: the reduced-precision on-disk
+    /// datatype override and the matching nbit filter, derived together.
+    ///
+    /// C narrows `this->datatype` via `H5Tset_precision`/`H5Tset_offset` and
+    /// then registers a parameterless `H5Pset_nbit` (NDFileHDF5.cpp:3355-3357);
+    /// libhdf5's `set_local` callback reads the reduced datatype to build the
+    /// filter `cd_values`. Here `DatasetBuilder::datatype` supplies the reduced
+    /// `FixedPoint` datatype and `FilterPipeline::nbit` builds the matching
+    /// `cd_values` tree `[nparms, need_not_compress, d_nelmts, NBIT_ATOMIC,
+    /// size, order, precision, offset]`, so the dataset is byte-readable by
+    /// h5py / libhdf5.
+    ///
+    /// Returns `Some((datatype, pipeline))` only for `COMPRESS_NBIT` over an
+    /// integer (FixedPoint) element type. Float element types do not map to a
+    /// reduced-precision fixed-point datatype (N-bit over floats is not an
+    /// areaDetector use case), and an out-of-range precision (0, which HDF5's
+    /// `H5Tset_precision` rejects) cannot pack — both return `None`, leaving the
+    /// frame on the lossless uncompressed path.
+    ///
+    /// `chunk_nelmts` is the element count of one on-disk chunk (= `d_nelmts`);
+    /// `flush_band` always writes a full, zero-padded chunk, so every filtered
+    /// write supplies exactly `chunk_nelmts * element_size` bytes — the size
+    /// `apply_nbit` requires.
+    fn nbit_packing(
+        &self,
+        data_type: NDDataType,
+        chunk_nelmts: usize,
+    ) -> Option<(DatatypeMessage, FilterPipeline)> {
+        if self.compression_type != COMPRESS_NBIT {
+            return None;
+        }
+        let (size, signed) = match data_type {
+            NDDataType::Int8 => (1u32, true),
+            NDDataType::UInt8 => (1, false),
+            NDDataType::Int16 => (2, true),
+            NDDataType::UInt16 => (2, false),
+            NDDataType::Int32 => (4, true),
+            NDDataType::UInt32 => (4, false),
+            NDDataType::Int64 => (8, true),
+            NDDataType::UInt64 => (8, false),
+            NDDataType::Float32 | NDDataType::Float64 => return None,
+        };
+        if self.nbit_precision == 0 || self.nbit_precision > size * 8 {
+            return None;
+        }
+        let dt = DatatypeMessage::FixedPoint {
+            size,
+            byte_order: ByteOrder::LittleEndian,
+            signed,
+            bit_offset: self.nbit_offset as u16,
+            bit_precision: self.nbit_precision as u16,
+        };
+        let pipeline = FilterPipeline::nbit(&dt, chunk_nelmts);
+        Some((dt, pipeline))
     }
 
     /// Build the HDF5 filter pipeline that matches a **pre-compressed** input
@@ -1547,6 +1596,21 @@ impl Hdf5Writer {
                 )
             }
         };
+        // N-bit packing couples a reduced-precision datatype override with the
+        // nbit filter (C narrows `this->datatype` then `H5Pset_nbit`); only this
+        // standard, non-codec path can override the dataset datatype. For a
+        // pre-compressed array the codec pipeline already governs the dataset,
+        // so N-bit does not apply. `d_nelmts` is the per-chunk element count.
+        let (nbit_dt, pipeline): (Option<DatatypeMessage>, Option<FilterPipeline>) =
+            if array.codec.is_none() {
+                let chunk_nelmts: usize = chunk.iter().product();
+                match self.nbit_packing(ds_data_type, chunk_nelmts) {
+                    Some((dt, pl)) => (Some(dt), Some(pl)),
+                    None => (None, pipeline),
+                }
+            } else {
+                (None, pipeline)
+            };
         // Max shape: with extra dims the dataset is created at its full fixed
         // multi-dimensional size (every leading axis chunked at 1, so its
         // ceiling equals its size). Without extra dims the single leading frame
@@ -1673,6 +1737,12 @@ impl Hdf5Writer {
                 // DCPL fill-value message so unwritten chunks read back as
                 // `fill` rather than zero.
                 .fill_value(fill as $t);
+                // N-bit: store the reduced-precision datatype (C narrows
+                // `this->datatype`). The byte footprint stays `size_of::<$t>()`;
+                // the nbit filter packs the significant bits within it.
+                if let Some(ref dt) = nbit_dt {
+                    builder = builder.datatype(dt.clone());
+                }
                 if let Some(ref pl) = pipeline {
                     builder = builder.filter_pipeline(pl.clone());
                 }
@@ -4422,33 +4492,35 @@ mod tests {
     }
 
     #[test]
-    fn test_nbit_degrades_to_uncompressed_lossless() {
+    fn test_nbit_packs_to_reduced_precision_datatype() {
         // C's N-bit codec (NDFileHDF5.cpp:3355-3357) narrows the dataset
         // datatype (H5Tset_precision/H5Tset_offset) and registers a
-        // parameterless H5Pset_nbit filter. rust-hdf5 0.2.17's high-level
-        // builder cannot emit a reduced-precision datatype, so selecting N-bit
-        // must drop to lossless uncompressed (no filter pipeline) rather than
-        // emit a malformed nbit filter that no reader can decode. A 16-bit value
-        // above an 8-bit precision must survive intact — proof the bytes were
-        // NOT bit-truncated as a real (lossy) N-bit pack would.
+        // parameterless H5Pset_nbit filter. The standard write path reproduces
+        // that with rust-hdf5 0.2.22: `DatasetBuilder::datatype` stores a
+        // reduced-precision `FixedPoint` and `FilterPipeline::nbit` packs to it,
+        // so the file is byte-readable by h5py/libhdf5. `build_pipeline` still
+        // returns None for N-bit because the SWMR streaming builder cannot
+        // override the datatype — packing is applied out of band by the standard
+        // path only.
         let mut writer = Hdf5Writer::new();
         writer.set_compression_type(COMPRESS_NBIT);
-        writer.set_nbit_precision(8);
+        writer.set_nbit_precision(10);
         writer.set_nbit_offset(0);
         assert!(
             writer.build_pipeline(2).is_none(),
-            "N-bit must not build a filter pipeline (backend cannot narrow datatype)"
+            "N-bit packing is applied via a datatype override, not build_pipeline"
         );
 
-        let path = temp_path("hdf5_nbit_lossless");
+        let path = temp_path("hdf5_nbit_packed");
         let mut arr = NDArray::new(
             vec![NDDimension::new(8), NDDimension::new(8)],
             NDDataType::UInt16,
         );
         if let NDDataBuffer::U16(ref mut v) = arr.data {
             for (i, x) in v.iter_mut().enumerate() {
-                *x = i as u16 * 17 + 300; // values exceed the 8-bit range
+                *x = (i as u16 * 7) & 0x3FF; // within the 10-bit range
             }
+            v[0] = 0xFFFF; // above 10 bits: must pack to the low 10 bits (0x3FF)
         }
         writer.open_file(&path, NDFileMode::Single, &arr).unwrap();
         writer.write_file(&arr).unwrap();
@@ -4456,13 +4528,34 @@ mod tests {
 
         let h5file = H5File::open(&path).unwrap();
         let ds = h5file.dataset("entry/instrument/detector/data").unwrap();
+
+        // The on-disk datatype carries the reduced precision (C-observable
+        // narrower datatype) within the unchanged 2-byte footprint.
+        match ds.datatype().unwrap() {
+            DatatypeMessage::FixedPoint {
+                size,
+                bit_precision,
+                bit_offset,
+                signed,
+                ..
+            } => {
+                assert_eq!(size, 2, "byte footprint unchanged");
+                assert_eq!(bit_precision, 10, "precision narrowed to 10 bits");
+                assert_eq!(bit_offset, 0);
+                assert!(!signed, "u16 is unsigned");
+            }
+            other => panic!("expected reduced-precision FixedPoint, got {other:?}"),
+        }
+
         let data: Vec<u16> = ds.read_raw().unwrap();
         assert_eq!(data.len(), 8 * 8);
-        for (i, &v) in data.iter().enumerate() {
+        // Real bit-packing: the over-range first element truncates to 10 bits.
+        assert_eq!(data[0], 0x3FF, "0xFFFF must pack to the low 10 bits");
+        for i in 1..data.len() {
             assert_eq!(
-                v,
-                i as u16 * 17 + 300,
-                "value {i} must round-trip losslessly"
+                data[i],
+                (i as u16 * 7) & 0x3FF,
+                "in-range value {i} round-trips"
             );
         }
         std::fs::remove_file(&path).ok();

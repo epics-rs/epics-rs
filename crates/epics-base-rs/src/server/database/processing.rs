@@ -1278,6 +1278,47 @@ impl PvDatabase {
             None
         };
 
+        // 1.45. Sel NVL link: resolve NVL -> SELN BEFORE the input fetch.
+        // C `selRecord.c::fetch_values` reads NVL into SELN first, then in
+        // `Specified` mode fetches ONLY INP[SELN] (lines 421-431) — the
+        // non-selected inputs are never read. Resolving the selector here
+        // (rather than after the fetch) lets `select_input_links` restrict
+        // the fetch list, so non-selected links raise no monitors and no
+        // spurious link-alarm SEVR.
+        let sel_nvl_value: Option<EpicsValue> = {
+            let instance = rec.read().await;
+            if instance.record.record_type() == "sel" {
+                let nvl_str = instance
+                    .record
+                    .get_field("NVL")
+                    .and_then(|v| {
+                        if let EpicsValue::String(s) = v {
+                            Some(s)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+                if !nvl_str.is_empty() {
+                    drop(instance); // release read lock before async read
+                    let parsed =
+                        crate::server::record::parse_link_v2(nvl_str.as_str_lossy().as_ref());
+                    self.read_link_value(&parsed, visited, depth).await
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        // Selector index for `select_input_links`: the freshly-resolved NVL
+        // value when present, else `None` (the hook falls back to the
+        // record's current SELN).
+        let sel_selector: Option<u16> = sel_nvl_value
+            .as_ref()
+            .and_then(|v| v.to_f64())
+            .map(|f| f as u16);
+
         // 1.5. Multi-input link fetch (calc/calcout/sel/sub)
         // Also collect alarm info from source records for MS/NMS propagation.
         let multi_input_values: Vec<(String, EpicsValue)>;
@@ -1293,9 +1334,13 @@ impl PvDatabase {
         {
             let link_info: Vec<(String, &'static str, String)> = {
                 let instance = rec.read().await;
-                instance
+                // Restrict to the record's active inputs this cycle (sel
+                // `Specified` → only INP[SELN]); `None` = fetch every link.
+                let links = instance
                     .record
-                    .multi_input_links()
+                    .select_input_links(sel_selector)
+                    .unwrap_or_else(|| instance.record.multi_input_links().to_vec());
+                links
                     .iter()
                     .map(|(lf, vf)| {
                         let link_str = instance
@@ -1367,34 +1412,6 @@ impl PvDatabase {
         if let Some(pair) = inp_link_alarm {
             link_alarms.push(pair);
         }
-
-        // 1.6. Sel NVL link: resolve NVL -> SELN
-        let sel_nvl_value: Option<EpicsValue> = {
-            let instance = rec.read().await;
-            if instance.record.record_type() == "sel" {
-                let nvl_str = instance
-                    .record
-                    .get_field("NVL")
-                    .and_then(|v| {
-                        if let EpicsValue::String(s) = v {
-                            Some(s)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default();
-                if !nvl_str.is_empty() {
-                    drop(instance); // release read lock before async read
-                    let parsed =
-                        crate::server::record::parse_link_v2(nvl_str.as_str_lossy().as_ref());
-                    self.read_link_value(&parsed, visited, depth).await
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
 
         // 2. Lock record, apply INP/DOL, process, evaluate alarms, build snapshot
         let (snapshot, out_info, flnk_name, process_actions, alarm_posts) = {

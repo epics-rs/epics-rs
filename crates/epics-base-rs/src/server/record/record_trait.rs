@@ -870,6 +870,22 @@ pub trait Record: Send + Sync + 'static {
         &[]
     }
 
+    /// The subset of [`Self::multi_input_links`] the framework should
+    /// actually fetch this cycle, given an optional externally-resolved
+    /// selector index (sel's NVL→SELN value, or `None` when no NVL link
+    /// drove it). Default `None` = fetch every input link.
+    ///
+    /// C `selRecord.c::fetch_values` (lines 421-431) fetches ONLY INP[SELN]
+    /// in `Specified` mode and all inputs otherwise; sel returns
+    /// `Some(vec![INP[SELN]])` so the non-selected inputs are never read and
+    /// raise no monitors or link-alarm SEVR.
+    fn select_input_links(
+        &self,
+        _selector: Option<u16>,
+    ) -> Option<Vec<(&'static str, &'static str)>> {
+        None
+    }
+
     /// Return multi-output link field pairs: (link_field, value_field).
     /// Override in transform to return OUTA..OUTP → A..P mappings.
     fn multi_output_links(&self) -> &[(&'static str, &'static str)] {

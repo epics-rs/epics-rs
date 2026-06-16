@@ -676,4 +676,27 @@ impl Record for SelRecord {
             ("INPL", "L"),
         ]
     }
+
+    /// C `selRecord.c::fetch_values` (lines 421-431): in `Specified`
+    /// (SELM==0) mode only INP[SELN] is read; `High`/`Low`/`Median` read
+    /// every input to compare them. `selector` is the NVL-resolved SELN for
+    /// this cycle (the framework reads NVL before the input fetch), else the
+    /// record's current SELN. A SELN >= SEL_MAX fetches nothing — C
+    /// bounds-checks before the input read.
+    fn select_input_links(
+        &self,
+        selector: Option<u16>,
+    ) -> Option<Vec<(&'static str, &'static str)>> {
+        if self.selm == 0 {
+            let idx = selector.unwrap_or(self.seln) as usize;
+            Some(
+                self.multi_input_links()
+                    .get(idx)
+                    .map(|&pair| vec![pair])
+                    .unwrap_or_default(),
+            )
+        } else {
+            None
+        }
+    }
 }

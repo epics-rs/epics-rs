@@ -7353,3 +7353,123 @@ async fn calcout_odly_defers_forward_link_to_delayed_cycle() {
         "FLNK target processed exactly once (delayed cycle only), not on both cycles"
     );
 }
+
+// C `selRecord.c::fetch_values` (411-438): in Specified mode (SELM==0)
+// only INP[SELN] is read; the other input links are never fetched, so
+// their PP sources are never processed. A non-selected PP source that
+// computes 42-on-process must therefore stay at its default 0.
+#[tokio::test]
+async fn sel_specified_mode_fetches_only_the_selected_input() {
+    use epics_base_rs::server::records::calc::CalcRecord;
+    use epics_base_rs::server::records::sel::SelRecord;
+
+    let db = PvDatabase::new();
+
+    // Two passive sources that each compute 42 only when processed; both
+    // start at the default VAL=0.
+    db.add_record("R7_SRCA", Box::new(CalcRecord::new("42")))
+        .await
+        .unwrap();
+    db.add_record("R7_SRCB", Box::new(CalcRecord::new("42")))
+        .await
+        .unwrap();
+
+    // Specified mode, SELN=1 selects INPB. Both inputs are PP links.
+    let mut sel = SelRecord::default();
+    sel.selm = 0;
+    sel.seln = 1;
+    sel.inpa = "R7_SRCA PP".to_string();
+    sel.inpb = "R7_SRCB PP".to_string();
+    db.add_record("R7_SEL", Box::new(sel)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("R7_SEL", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // Selected input (INPB) source WAS processed by its PP link → 42.
+    let sel_val = db.get_pv("R7_SEL").await.unwrap();
+    match sel_val {
+        EpicsValue::Double(v) => assert!(
+            (v - 42.0).abs() < 1e-10,
+            "SEL value comes from the selected input INPB: expected 42, got {v}"
+        ),
+        other => panic!("expected Double(42.0), got {other:?}"),
+    }
+    let srcb = db.get_pv("R7_SRCB").await.unwrap();
+    match srcb {
+        EpicsValue::Double(v) => assert!(
+            (v - 42.0).abs() < 1e-10,
+            "selected source R7_SRCB must be processed by its PP link, VAL={v}"
+        ),
+        other => panic!("expected Double(42.0), got {other:?}"),
+    }
+    // KEY: the NON-selected input (INPA) source must NOT be fetched, so
+    // its PP link never fires and its VAL stays at the default 0. Pre-fix
+    // the framework fetched ALL inputs and this would be 42.
+    let srca = db.get_pv("R7_SRCA").await.unwrap();
+    match srca {
+        EpicsValue::Double(v) => assert!(
+            v.abs() < 1e-10,
+            "non-selected source R7_SRCA must NOT be processed (Specified \
+             mode reads only INP[SELN]), VAL={v}"
+        ),
+        other => panic!("expected Double(0.0), got {other:?}"),
+    }
+}
+
+// Control for the above: in High mode (SELM==1) C fetch_values reads
+// EVERY input to compare them, so all PP sources are processed.
+#[tokio::test]
+async fn sel_high_mode_fetches_all_inputs() {
+    use epics_base_rs::server::records::calc::CalcRecord;
+    use epics_base_rs::server::records::sel::SelRecord;
+
+    let db = PvDatabase::new();
+
+    db.add_record("R7H_SRCA", Box::new(CalcRecord::new("10")))
+        .await
+        .unwrap();
+    db.add_record("R7H_SRCB", Box::new(CalcRecord::new("42")))
+        .await
+        .unwrap();
+
+    // High mode ignores SELN and reads all inputs; both are PP links.
+    let mut sel = SelRecord::default();
+    sel.selm = 1;
+    sel.inpa = "R7H_SRCA PP".to_string();
+    sel.inpb = "R7H_SRCB PP".to_string();
+    db.add_record("R7H_SEL", Box::new(sel)).await.unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("R7H_SEL", &mut visited, 0)
+        .await
+        .unwrap();
+
+    // High picks the maximum of the fetched inputs → 42.
+    let sel_val = db.get_pv("R7H_SEL").await.unwrap();
+    match sel_val {
+        EpicsValue::Double(v) => assert!(
+            (v - 42.0).abs() < 1e-10,
+            "High mode selects max(10, 42) = 42, got {v}"
+        ),
+        other => panic!("expected Double(42.0), got {other:?}"),
+    }
+    // BOTH sources processed: the non-max source still got fetched.
+    let srca = db.get_pv("R7H_SRCA").await.unwrap();
+    match srca {
+        EpicsValue::Double(v) => assert!(
+            (v - 10.0).abs() < 1e-10,
+            "High mode must fetch ALL inputs: R7H_SRCA processed to 10, VAL={v}"
+        ),
+        other => panic!("expected Double(10.0), got {other:?}"),
+    }
+    let srcb = db.get_pv("R7H_SRCB").await.unwrap();
+    match srcb {
+        EpicsValue::Double(v) => assert!(
+            (v - 42.0).abs() < 1e-10,
+            "High mode must fetch ALL inputs: R7H_SRCB processed to 42, VAL={v}"
+        ),
+        other => panic!("expected Double(42.0), got {other:?}"),
+    }
+}

@@ -21,7 +21,7 @@ different AND reachable.
 | Recurring family | history commits | coverage status |
 |---|---|---|
 | disconnect / teardown | 41 | mostly closed; **OPEN:** trap-write `AfterWrite` (R4-4, 3 sites) |
-| String / type-drop | 34 | common-field FIXED (49942183), P-array FIXED; **OPEN:** compress INP-link (R4-3) |
+| String / type-drop | 34 | common-field FIXED (49942183), P-array FIXED; compress INP-link **FIXED (R4-3, f388beab)** |
 | timestamp / utag | 33 | pinned (regr H), utag FIXED (regr Q) — closed |
 | init / load order | 30 | pinned (regr O), common-field-load FIXED — closed |
 | flow-control credit | 30 | audited sound (pipeline credit + dropped-monitor owner) — closed |
@@ -69,7 +69,8 @@ C ref: pvxs `src/util.cpp:786-817` `parseTo<int64_t/uint64_t>` use `std::stoll/s
 Reachability: `pvput PV "0x1F"` into a numeric field → pvxs writes 31; Rust QSRV returns `PutRejected`. The convert.rs comment already claims pvxs parity, and the CA sibling (`value.rs:1210` `parse_int`/`parse_uint`) already does C-radix — the bridge path is inconsistent with both.
 
 ### R4-3: compress `INP`-link delivery drops a non-Double linked source
-Severity: Medium — fix
+Severity: Medium — **FIXED (f388beab)**
+Fix: `put_field_internal` (the single ReadDbLink-delivery owner) coerces the delivered value to the target field's `dbf_type` (from `field_list`), mirroring C `dbGetLink(DBF_<target>)`. sseq's `put_field_internal` override is the distinct owner for its own targets. Pinned by `compress::pbuf_tests::input_link_coerces_long_source_into_double_buffer`.
 Rust: input-link read delivery `crates/epics-base-rs/src/server/database/processing.rs:2730,2785` (`let _ = instance.record.put_field_internal(target, value)` — error discarded); `put_field_internal` (`record_trait.rs:896-908`) coerces only `EnumWithChoices`, not to the target field's DBF type; compress `VAL` arm accepts only Double/DoubleArray (`compress.rs:517-536`).
 C ref: `compressRecord.c:342` `dbGetLink(&prec->inp, DBF_DOUBLE, …)` — C requests DBF_DOUBLE, so the link layer converts any numeric/string source to double before the record sees it.
 Reachability: a compress record with `field(INP,"SRC.VAL")` where SRC is DBF_LONG (longin/calc) or waveform FTVL=LONG delivers `EpicsValue::Long(Array)` → VAL arm `_ => Err(TypeMismatch)` → discarded → buffer never advances, VAL stays zero. CA/PVA/OUT-link write paths are SAFE (they coerce via `field_io.rs:643-667` / `:101-127`); sseq's two `ReadDbLink` targets are covered by its own override. Structural fix: `put_field_internal` should coerce to the target field's `dbf_type` from `field_list()` (same pattern `put_pv_inner` uses), closing every `ReadDbLink` target by construction.

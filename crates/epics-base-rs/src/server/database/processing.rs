@@ -1615,6 +1615,14 @@ impl PvDatabase {
                 instance.record.set_process_context(&ctx);
             }
 
+            // Invoke the registered subroutine (sub/aSub SNAM) before the
+            // record body, on the same dispatch path as process_local. The
+            // framework owns the SubroutineFn registry (the record's own
+            // process() is a no-op for sub/aSub), so without this the main
+            // engine path — SCAN, event, CA-put-to-PP, FLNK — never ran the
+            // subroutine and VAL/VALA..VALU/OUTA..OUTU never updated.
+            instance.run_registered_subroutine()?;
+
             // Process
             let mut outcome = instance.record.process()?;
             // Merge deferred device actions into process outcome actions

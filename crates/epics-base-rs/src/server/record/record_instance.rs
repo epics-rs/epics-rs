@@ -1773,6 +1773,28 @@ impl RecordInstance {
         }
     }
 
+    /// Invoke the registered subroutine (`sub`/`aSub` `SNAM`) if one is
+    /// bound, before the record's `process()` body runs.
+    ///
+    /// C `subRecord.c::do_sub` / `aSubRecord.c::do_sub` call the named
+    /// subroutine on EVERY `process()`. The function registry lives on the
+    /// framework (`RecordInstance::subroutine`), not on the record, so the
+    /// record's own `process()` is a no-op for these two types and the
+    /// framework must drive the call. This is the SINGLE owner of that call
+    /// for every dispatch path: the main engine
+    /// (`process_record_with_links_inner`, the SCAN / event / CA-put-to-PP /
+    /// FLNK path) and the by-name `process_local` (`db.process_record`,
+    /// QSRV group / foreign-call path) both route through here, so a
+    /// `sub`/`aSub` runs identically regardless of how it is processed.
+    /// Previously only `process_local` invoked the subroutine, so on the
+    /// main engine path `VAL`/`VALA..VALU`/`OUTA..OUTU` never updated.
+    pub(crate) fn run_registered_subroutine(&mut self) -> CaResult<()> {
+        if let Some(ref sub_fn) = self.subroutine {
+            sub_fn(&mut *self.record)?;
+        }
+        Ok(())
+    }
+
     /// Basic process: process record, evaluate alarms, timestamp, build snapshot.
     /// This does NOT handle links — see process_with_context in database.rs.
     ///
@@ -1899,10 +1921,9 @@ impl RecordInstance {
         }
         let _guard = ProcessGuard(&self.processing as *const AtomicBool);
 
-        // Call subroutine if registered (for sub records)
-        if let Some(ref sub_fn) = self.subroutine {
-            sub_fn(&mut *self.record)?;
-        }
+        // Call subroutine if registered (for sub/aSub records). Single owner
+        // shared with the main engine path — see `run_registered_subroutine`.
+        self.run_registered_subroutine()?;
         // Soft-Channel input records must skip the RVAL->VAL convert
         // (C `devAiSoft.c` `read_ai` returns 2 = "don't convert" for
         // every Soft-Channel input record, incl. one with a constant /

@@ -6941,3 +6941,55 @@ async fn test_lsi_mpst_always_posts_value_on_unchanged_cycle() {
         "MPST == OnChange (default) must NOT post a VALUE monitor on an unchanged lsi cycle"
     );
 }
+
+/// A `sub` record's registered subroutine must run on the MAIN engine
+/// processing path (SCAN / event / CA-put / FLNK), not only on the by-name
+/// `process_local` path. C `subRecord.c::do_sub` runs the subroutine on
+/// every `process()`. Before the fix the main engine called
+/// `record.process()` (a no-op for `sub`) without invoking the framework's
+/// `SubroutineFn`, so VAL never updated when the record was scanned.
+#[tokio::test]
+async fn sub_record_subroutine_runs_on_main_engine_path() {
+    use epics_base_rs::server::records::sub_record::SubRecord;
+
+    let db = PvDatabase::new();
+    db.add_record("SUBM", Box::new(SubRecord::default()))
+        .await
+        .unwrap();
+
+    // SNAM + a VAL-doubling subroutine, plus a seed VAL so the change is
+    // observable.
+    {
+        let arc = db.get_record("SUBM").await.unwrap();
+        let mut inst = arc.write().await;
+        inst.record
+            .put_field("SNAM", EpicsValue::String("double_val".into()))
+            .unwrap();
+        inst.record
+            .put_field("VAL", EpicsValue::Double(5.0))
+            .unwrap();
+        let sub_fn: SubroutineFn = Box::new(|record: &mut dyn Record| {
+            if let Some(EpicsValue::Double(v)) = record.get_field("VAL") {
+                record.put_field("VAL", EpicsValue::Double(v * 2.0))?;
+            }
+            Ok(())
+        });
+        inst.subroutine = Some(Arc::new(sub_fn));
+    }
+
+    // Drive the MAIN engine path (not process_local).
+    let mut visited = HashSet::new();
+    db.process_record_with_links("SUBM", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let arc = db.get_record("SUBM").await.unwrap();
+    let inst = arc.read().await;
+    match inst.record.get_field("VAL") {
+        Some(EpicsValue::Double(v)) => assert!(
+            (v - 10.0).abs() < 1e-10,
+            "subroutine must double VAL on the main path: got {v}"
+        ),
+        other => panic!("expected Double(10.0), got {other:?}"),
+    }
+}

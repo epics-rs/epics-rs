@@ -281,7 +281,29 @@ enum Hdf5Handle {
         /// True only when a compression type was requested but no filter
         /// pipeline could be built for it; false when compression is applied.
         compression_dropped: bool,
+        /// `Some` when the streaming dataset is a fixed multi-extra-dimension
+        /// grid (`HDF5_nExtraDims >= 1`, uncompressed): frames are placed at
+        /// odometer positions via `write_chunk_at`. `None` for the common
+        /// single frame-axis case, which streams via `append_frame`.
+        grid: Option<SwmrGridLayout>,
     },
+}
+
+/// Fixed multi-extra-dimension grid layout for the SWMR write path. The
+/// streaming dataset is a `create_grid_dataset` of full shape
+/// `[eds[N], …, eds[0], Y, X]`; each frame is written at its odometer chunk
+/// position with `SwmrFileWriter::write_chunk_at`, mirroring the standard
+/// path's [`Hdf5Writer::flush_band`]. Compressed multi-extra-dim stays
+/// collapsed (no compressed grid constructor; backend-blocked).
+struct SwmrGridLayout {
+    /// Fixed leading axes, outermost-first (`extra_dim_axes`).
+    leading: Vec<usize>,
+    /// HDF5-order frame dims `[Y, X]` (fastest-varying last).
+    frame_dims: Vec<usize>,
+    /// Full per-chunk shape `[1, …, 1, rc, cc]` (same rank as the dataset).
+    chunk: Vec<usize>,
+    /// Element size in bytes.
+    elem_size: usize,
 }
 
 /// HDF5 file writer using the rust-hdf5 crate.
@@ -990,6 +1012,35 @@ impl Hdf5Writer {
         chunk: &[usize],
         elem_size: usize,
     ) -> ADResult<()> {
+        for (coords, buf) in
+            Self::band_chunk_writes(leading_coords, frames, frame_dims, chunk, elem_size)
+        {
+            ds.write_chunk_at(&coords, &buf).map_err(|e| {
+                ADError::UnsupportedConversion(format!("HDF5 write_chunk_at error: {}", e))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Compute the `(chunk_coords, chunk_bytes)` writes for one band of `frames`
+    /// at `leading_coords`. The single source of tile math shared by the
+    /// standard path's [`flush_band`](Self::flush_band) (writes each via
+    /// `H5Dataset::write_chunk_at`) and the SWMR grid path
+    /// ([`write_swmr`](Self::write_swmr), via `SwmrFileWriter::write_chunk_at`).
+    ///
+    /// `chunk` is the full per-chunk shape `[fc, frame_chunk…]`; `fc = chunk[0]`
+    /// frames stack along the first leading axis. A 2-D frame is split into
+    /// `ceil(Y/rc) x ceil(X/cc)` tiles `[fc, rc, cc]`; a non-2-D frame is one
+    /// chunk per band. Edge tiles and a partial final band (fewer than `fc`
+    /// frames) are zero-padded. Coords are in chunk units, row-major:
+    /// `leading_coords ++ [row_tile, col_tile]` (or `++ [0; frame_rank]`).
+    fn band_chunk_writes(
+        leading_coords: &[usize],
+        frames: &[Vec<u8>],
+        frame_dims: &[usize],
+        chunk: &[usize],
+        elem_size: usize,
+    ) -> Vec<(Vec<usize>, Vec<u8>)> {
         let lead = leading_coords.len();
         let fc = chunk[0];
         // Non-2-D frame: one chunk per band, frames stacked along the first
@@ -1002,15 +1053,14 @@ impl Hdf5Writer {
             }
             let mut coords = leading_coords.to_vec();
             coords.extend(std::iter::repeat_n(0, frame_dims.len()));
-            return ds.write_chunk_at(&coords, &buf).map_err(|e| {
-                ADError::UnsupportedConversion(format!("HDF5 write_chunk_at error: {}", e))
-            });
+            return vec![(coords, buf)];
         }
 
         let (y, x) = (frame_dims[0], frame_dims[1]);
         let (rc, cc) = (chunk[lead], chunk[lead + 1]);
         let row_tiles = y.div_ceil(rc);
         let col_tiles = x.div_ceil(cc);
+        let mut writes = Vec::with_capacity(row_tiles * col_tiles);
         for ry in 0..row_tiles {
             for cx in 0..col_tiles {
                 let mut tile = vec![0u8; fc * rc * cc * elem_size];
@@ -1037,12 +1087,10 @@ impl Hdf5Writer {
                 let mut coords = leading_coords.to_vec();
                 coords.push(ry);
                 coords.push(cx);
-                ds.write_chunk_at(&coords, &tile).map_err(|e| {
-                    ADError::UnsupportedConversion(format!("HDF5 write_chunk_at error: {}", e))
-                })?;
+                writes.push((coords, tile));
             }
         }
-        Ok(())
+        writes
     }
 
     /// Flush each detector dataset's partial frame band and trim its logical
@@ -1111,7 +1159,8 @@ impl Hdf5Writer {
         let mut swmr = SwmrFileWriter::create(path)
             .map_err(|e| ADError::UnsupportedConversion(format!("SWMR create error: {}", e)))?;
 
-        let frame_dims: Vec<u64> = array.dims.iter().rev().map(|d| d.size as u64).collect();
+        let usize_frame_dims: Vec<usize> = array.dims.iter().rev().map(|d| d.size).collect();
+        let frame_dims: Vec<u64> = usize_frame_dims.iter().map(|&d| d as u64).collect();
 
         // Full chunk geometry, `[fc, rc, cc]`: HDF5_nFramesChunks deep and
         // the row/column tile sizes. rust-hdf5 0.2.15
@@ -1121,10 +1170,20 @@ impl Hdf5Writer {
         let element_size = array.data.data_type().element_size();
         let pipeline = self.build_pipeline(element_size);
         let chunk: Vec<u64> = {
-            let usize_dims: Vec<usize> = array.dims.iter().rev().map(|d| d.size).collect();
-            let (_, c, _) = self.primary_layout(&usize_dims);
+            let (_, c, _) = self.primary_layout(&usize_frame_dims);
             c.iter().map(|&v| v as u64).collect()
         };
+
+        // With `HDF5_nExtraDims >= 1` and no compression, mirror the standard
+        // path's full multi-extra-dimension dataspace: a fixed grid of shape
+        // `[eds[N], …, eds[0], Y, X]` filled at odometer positions via
+        // `write_chunk_at`. Compressed multi-extra-dim has no grid constructor
+        // and stays collapsed to the single-axis streaming layout above.
+        let (grid_shape_usize, grid_chunk_usize, grid_leading) =
+            self.standard_layout(&usize_frame_dims);
+        let use_grid = grid_leading.is_some() && pipeline.is_none();
+        let grid_shape: Vec<u64> = grid_shape_usize.iter().map(|&v| v as u64).collect();
+        let grid_chunk: Vec<u64> = grid_chunk_usize.iter().map(|&v| v as u64).collect();
 
         // The streaming dataset is created with its full nested layout path
         // as the dataset name (default flat `data` without a layout). The
@@ -1141,28 +1200,38 @@ impl Hdf5Writer {
 
         macro_rules! create_ds {
             ($t:ty) => {
-                match pipeline.clone() {
-                    Some(pl) => swmr
-                        .create_streaming_dataset_chunked_compressed::<$t>(
-                            &ds_name,
-                            &frame_dims,
-                            &chunk,
-                            pl,
-                        )
+                if use_grid {
+                    swmr.create_grid_dataset::<$t>(&ds_name, &grid_shape, &grid_chunk)
                         .map_err(|e| {
                             ADError::UnsupportedConversion(format!(
-                                "SWMR create compressed dataset error: {}",
+                                "SWMR create grid dataset error: {}",
                                 e
                             ))
-                        }),
-                    None => swmr
-                        .create_streaming_dataset_chunked::<$t>(&ds_name, &frame_dims, &chunk)
-                        .map_err(|e| {
-                            ADError::UnsupportedConversion(format!(
-                                "SWMR create dataset error: {}",
-                                e
-                            ))
-                        }),
+                        })
+                } else {
+                    match pipeline.clone() {
+                        Some(pl) => swmr
+                            .create_streaming_dataset_chunked_compressed::<$t>(
+                                &ds_name,
+                                &frame_dims,
+                                &chunk,
+                                pl,
+                            )
+                            .map_err(|e| {
+                                ADError::UnsupportedConversion(format!(
+                                    "SWMR create compressed dataset error: {}",
+                                    e
+                                ))
+                            }),
+                        None => swmr
+                            .create_streaming_dataset_chunked::<$t>(&ds_name, &frame_dims, &chunk)
+                            .map_err(|e| {
+                                ADError::UnsupportedConversion(format!(
+                                    "SWMR create dataset error: {}",
+                                    e
+                                ))
+                            }),
+                    }
                 }
             };
         }
@@ -1224,10 +1293,22 @@ impl Hdf5Writer {
             );
         }
 
+        let grid = if use_grid {
+            // `use_grid` implies `grid_leading.is_some()`.
+            grid_leading.map(|leading| SwmrGridLayout {
+                leading,
+                frame_dims: usize_frame_dims.clone(),
+                chunk: grid_chunk_usize.clone(),
+                elem_size: element_size,
+            })
+        } else {
+            None
+        };
         self.handle = Some(Hdf5Handle::Swmr {
             writer: Box::new(swmr),
             ds_index,
             compression_dropped,
+            grid,
         });
         self.open_data_type = Some(array.data.data_type());
         self.open_frame_dims = Some(array.dims.iter().rev().map(|d| d.size).collect::<Vec<_>>());
@@ -2480,22 +2561,55 @@ impl Hdf5Writer {
             ));
         }
 
-        let (writer, ds_index) = match self.handle {
+        // This frame's 0-based odometer index (`frame_count` increments only
+        // after `write_swmr` returns); read before the mutable handle borrow.
+        let frame_idx = self.frame_count;
+
+        let (writer, ds_index, grid) = match self.handle {
             Some(Hdf5Handle::Swmr {
                 ref mut writer,
                 ds_index,
+                ref grid,
                 ..
-            }) => (writer, ds_index),
+            }) => (writer, ds_index, grid),
             _ => return Err(ADError::UnsupportedConversion("no SWMR writer open".into())),
         };
 
         // The SWMR streaming dataset declares a little-endian element type and
-        // `append_frame` copies the supplied `&[u8]` verbatim; serialize to LE
-        // explicitly (see `nd_buffer_to_le_bytes`) so the file is portable.
+        // both `append_frame` and `write_chunk_at` copy the supplied `&[u8]`
+        // verbatim; serialize to LE explicitly (see `nd_buffer_to_le_bytes`) so
+        // the file is portable.
         let frame_bytes = nd_buffer_to_le_bytes(&array.data);
-        writer
-            .append_frame(ds_index, &frame_bytes)
-            .map_err(|e| ADError::UnsupportedConversion(format!("SWMR append error: {}", e)))?;
+        match grid {
+            // Fixed multi-extra-dimension grid: place this frame at its odometer
+            // chunk position(s) via `write_chunk_at`, mirroring the standard
+            // path's `flush_band` (one frame per leading position, `fc == 1`).
+            Some(g) => {
+                let leading_coords = Self::unravel(frame_idx, &g.leading);
+                for (coords, tile) in Self::band_chunk_writes(
+                    &leading_coords,
+                    std::slice::from_ref(&frame_bytes),
+                    &g.frame_dims,
+                    &g.chunk,
+                    g.elem_size,
+                ) {
+                    let coords_u64: Vec<u64> = coords.iter().map(|&c| c as u64).collect();
+                    writer
+                        .write_chunk_at(ds_index, &coords_u64, &tile)
+                        .map_err(|e| {
+                            ADError::UnsupportedConversion(format!(
+                                "SWMR write_chunk_at error: {}",
+                                e
+                            ))
+                        })?;
+                }
+            }
+            None => {
+                writer.append_frame(ds_index, &frame_bytes).map_err(|e| {
+                    ADError::UnsupportedConversion(format!("SWMR append error: {}", e))
+                })?;
+            }
+        }
 
         // Periodic flush
         let count = self.frame_count + 1; // will be incremented after return
@@ -3033,7 +3147,16 @@ impl NDFileWriter for Hdf5Writer {
                 // `326`: `createHardLinks` then `startSWMR`), so SWMR readers
                 // see them for the whole streaming window. Closing the writer
                 // only finalises the streamed frames.
-                if let Some(Hdf5Handle::Swmr { writer, .. }) = self.handle.take() {
+                if let Some(Hdf5Handle::Swmr { mut writer, .. }) = self.handle.take() {
+                    // Commit any chunk writes made since the last periodic flush
+                    // before closing. `SwmrFileWriter::close` finalizes the
+                    // extensible-array index of the `append_frame` path but does
+                    // not flush the fixed-array index that the grid path's
+                    // `write_chunk_at` records, so a grid file's tail frames
+                    // would otherwise read back as fill.
+                    writer.flush().map_err(|e| {
+                        ADError::UnsupportedConversion(format!("SWMR flush-on-close error: {}", e))
+                    })?;
                     writer.close().map_err(|e| {
                         ADError::UnsupportedConversion(format!("SWMR close error: {}", e))
                     })?;
@@ -5053,6 +5176,166 @@ mod tests {
             }
         }
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_swmr_extra_dimensions_grid_layout() {
+        // SWMR mirror of `test_extra_dimensions_layout`: HDF5_nExtraDims=2 with
+        // eds[0]=2,eds[1]=3,eds[2]=4 must build the same rank-5 fixed grid
+        // [Y,X,N,frameY,frameX] = [4,3,2,4,4] as the standard path (C
+        // configureDims), not the old collapsed single leading axis. Each frame
+        // is placed at its odometer chunk position via write_chunk_at; frame `f`
+        // lands at flat leading index `f` (innermost "N" varies fastest).
+        let path = temp_path("hdf5_swmr_extradims");
+        let mut writer = Hdf5Writer::new();
+        writer.set_swmr_mode(true);
+        writer.set_n_extra_dims(2);
+        writer.set_extra_dim_size(0, 2); // N: frames per point
+        writer.set_extra_dim_size(1, 3); // X
+        writer.set_extra_dim_size(2, 4); // Y
+
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt16,
+        );
+        for f in 0..24u16 {
+            if let NDDataBuffer::U16(ref mut v) = arr.data {
+                for x in v.iter_mut() {
+                    *x = f;
+                }
+            }
+            if f == 0 {
+                writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+            }
+            writer.write_file(&arr).unwrap();
+        }
+        writer.close_file().unwrap();
+
+        let mut reader = rust_hdf5::swmr::SwmrFileReader::open(&path).unwrap();
+        assert_eq!(
+            reader
+                .dataset_shape("entry/instrument/detector/data")
+                .unwrap(),
+            vec![4, 3, 2, 4, 4]
+        );
+        let data: Vec<u16> = reader
+            .read_dataset("entry/instrument/detector/data")
+            .unwrap();
+        assert_eq!(data.len(), 24 * 16);
+        for f in 0..24usize {
+            for i in 0..16usize {
+                assert_eq!(data[f * 16 + i], f as u16, "frame {} elem {}", f, i);
+            }
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_swmr_extra_dimensions_grid_subtiled() {
+        // SWMR grid with frame sub-tiling: HDF5_nExtraDims=1 (rank-4 [3,2,4,4])
+        // and HDF5_nRowChunks=2 splits each 4-row frame into two row tiles, so
+        // the grid write path emits two write_chunk_at tiles per frame. The
+        // reassembled pixels must still be row-major-correct. 6 frames fill the
+        // 3x2 grid exactly; value==frame.
+        let path = temp_path("hdf5_swmr_extradims_tiled");
+        let mut writer = Hdf5Writer::new();
+        writer.set_swmr_mode(true);
+        writer.set_n_extra_dims(1);
+        writer.set_extra_dim_size(0, 2); // N
+        writer.set_extra_dim_size(1, 3); // X
+        writer.set_n_row_chunks(2); // split the 4-row frame into 2 tiles
+
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt16,
+        );
+        for f in 0..6u16 {
+            if let NDDataBuffer::U16(ref mut v) = arr.data {
+                // Distinct per-element values prove tile reassembly, not just a
+                // constant: value = frame*100 + (row*4 + col).
+                for (i, x) in v.iter_mut().enumerate() {
+                    *x = f * 100 + i as u16;
+                }
+            }
+            if f == 0 {
+                writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+            }
+            writer.write_file(&arr).unwrap();
+        }
+        writer.close_file().unwrap();
+
+        let mut reader = rust_hdf5::swmr::SwmrFileReader::open(&path).unwrap();
+        assert_eq!(
+            reader
+                .dataset_shape("entry/instrument/detector/data")
+                .unwrap(),
+            vec![3, 2, 4, 4]
+        );
+        let data: Vec<u16> = reader
+            .read_dataset("entry/instrument/detector/data")
+            .unwrap();
+        assert_eq!(data.len(), 6 * 16);
+        for f in 0..6usize {
+            for i in 0..16usize {
+                assert_eq!(
+                    data[f * 16 + i],
+                    f as u16 * 100 + i as u16,
+                    "frame {} elem {}",
+                    f,
+                    i
+                );
+            }
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_swmr_extra_dimensions_grid_partial_fill() {
+        // SWMR grid written with fewer frames than the grid capacity: the fixed
+        // extent stays [3,2,4,4] and the unwritten odometer positions read back
+        // as the fill value (0). Boundary: partial scan, capacity 6, write 4.
+        let path = temp_path("hdf5_swmr_extradims_partial");
+        let mut writer = Hdf5Writer::new();
+        writer.set_swmr_mode(true);
+        writer.set_n_extra_dims(1);
+        writer.set_extra_dim_size(0, 2); // N
+        writer.set_extra_dim_size(1, 3); // X
+
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(4), NDDimension::new(4)],
+            NDDataType::UInt16,
+        );
+        for f in 0..4u16 {
+            if let NDDataBuffer::U16(ref mut v) = arr.data {
+                for x in v.iter_mut() {
+                    *x = f + 1; // non-zero so fill (0) is distinguishable
+                }
+            }
+            if f == 0 {
+                writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+            }
+            writer.write_file(&arr).unwrap();
+        }
+        writer.close_file().unwrap();
+
+        let mut reader = rust_hdf5::swmr::SwmrFileReader::open(&path).unwrap();
+        assert_eq!(
+            reader
+                .dataset_shape("entry/instrument/detector/data")
+                .unwrap(),
+            vec![3, 2, 4, 4]
+        );
+        let data: Vec<u16> = reader
+            .read_dataset("entry/instrument/detector/data")
+            .unwrap();
+        assert_eq!(data.len(), 6 * 16);
+        for f in 0..6usize {
+            let expected = if f < 4 { f as u16 + 1 } else { 0 };
+            for i in 0..16usize {
+                assert_eq!(data[f * 16 + i], expected, "frame {} elem {}", f, i);
+            }
+        }
         std::fs::remove_file(&path).ok();
     }
 

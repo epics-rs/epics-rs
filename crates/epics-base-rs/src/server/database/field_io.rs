@@ -6,6 +6,36 @@ use crate::types::EpicsValue;
 
 use super::PvDatabase;
 
+/// Coerce a write `value` to a record field's stored `target` type. A
+/// `DBR_STRING` write to a `DBF_MENU` field resolves the label against THAT
+/// field's own menu first (C `dbConvert` `putStringMenu`: an exact label,
+/// then a numeric index) — never the field-blind global table that
+/// `EpicsValue::convert_to` would otherwise consult, which mis-maps a
+/// menu-specific label (e.g. `SELM "Specified"`). Every other value, and a
+/// string that names no choice, falls through to the single value-coercion
+/// owner `EpicsValue::convert_to`.
+fn coerce_write_value(
+    record: &dyn crate::server::record::Record,
+    field: &str,
+    target: crate::types::DbFieldType,
+    value: EpicsValue,
+) -> EpicsValue {
+    if let EpicsValue::String(s) = &value {
+        if let Some(choices) = record
+            .menu_field_choices(field)
+            .or_else(|| crate::server::record::shared_menu_choices(field))
+        {
+            let s = s.as_str_lossy();
+            if let Some(resolved) =
+                crate::server::record::resolve_menu_field_string(choices, target, &s)
+            {
+                return resolved;
+            }
+        }
+    }
+    value.convert_to(target)
+}
+
 impl PvDatabase {
     /// Get a PV value synchronously from a blocking thread.
     ///
@@ -117,7 +147,7 @@ impl PvDatabase {
                                 "empty array cannot be coerced to scalar field {field}"
                             )));
                         }
-                        value.convert_to(target)
+                        coerce_write_value(&*instance.record, &field, target, value)
                     } else {
                         value
                     }
@@ -339,7 +369,7 @@ impl PvDatabase {
                                 "empty array cannot be coerced to scalar field {field}"
                             )));
                         }
-                        value.convert_to(target)
+                        coerce_write_value(&*instance.record, &field, target, value)
                     } else {
                         value
                     }
@@ -657,7 +687,7 @@ impl PvDatabase {
                                 "empty array cannot be coerced to scalar field {field}"
                             )));
                         }
-                        value.convert_to(target)
+                        coerce_write_value(&*instance.record, &field, target, value)
                     } else {
                         value
                     }
@@ -1170,6 +1200,41 @@ mod tests {
             .unwrap();
         let v = db.get_pv("ALT.VAL").await.unwrap();
         assert!(matches!(v, EpicsValue::Double(x) if x == 13.0));
+    }
+
+    /// A `DBR_STRING` menu label written to a `DBF_MENU` field resolves
+    /// against THAT field's own menu (C `dbConvert` `putStringMenu`), not the
+    /// field-blind global table that `EpicsValue::convert_to` would consult.
+    /// Covers the `put_pv` (`put_pv_inner`) and `put_pv_and_post` coercion
+    /// sites; the CA field-put path (`put_record_field_from_ca_inner`) shares
+    /// the identical `coerce_write_value` helper.
+    #[tokio::test]
+    async fn write_path_menu_label_resolves_against_field_menu() {
+        use crate::server::records::sel::SelRecord;
+
+        let db = PvDatabase::new();
+        db.add_record("SEL", Box::new(SelRecord::default()))
+            .await
+            .unwrap();
+
+        // put_pv (put_pv_inner): "Specified" is selSELM index 0, NOT the
+        // menuFanout index 1 the global table would have returned.
+        db.put_pv("SEL.SELM", EpicsValue::String("Specified".into()))
+            .await
+            .unwrap();
+        assert_eq!(db.get_pv("SEL.SELM").await.unwrap(), EpicsValue::Enum(0));
+
+        // put_pv_and_post: a later choice, proving the whole menu.
+        db.put_pv_and_post("SEL.SELM", EpicsValue::String("High Signal".into()))
+            .await
+            .unwrap();
+        assert_eq!(db.get_pv("SEL.SELM").await.unwrap(), EpicsValue::Enum(1));
+
+        // A bare numeric string still resolves (C epicsParseUInt16 fallback).
+        db.put_pv("SEL.SELM", EpicsValue::String("2".into()))
+            .await
+            .unwrap();
+        assert_eq!(db.get_pv("SEL.SELM").await.unwrap(), EpicsValue::Enum(2));
     }
 
     /// `set_pv_metadata` installs the upstream `DBR_CTRL_*` metadata on a

@@ -1200,6 +1200,7 @@ impl Hdf5Writer {
                 })?;
         }
         self.write_swmr_layout_dataset_attrs(&mut swmr, ds_index)?;
+        self.write_swmr_ndarray_default_attrs(&mut swmr, ds_index, array)?;
         self.build_swmr_layout_hardlinks(&mut swmr)?;
         // Open-time `<attribute source="ndattribute">` group and dataset
         // element-attrs must be created before the SWMR lock; close-time ones
@@ -2205,6 +2206,43 @@ impl Hdf5Writer {
                 let group = Self::open_write_group(file, path)?;
                 write_ndattr_group_attr(&group, &e.attr_name, value);
             }
+        }
+        Ok(())
+    }
+
+    /// SWMR counterpart of C `writeDefaultDatasetAttributes`
+    /// (NDFileHDF5.cpp:3695-3719): attach `NDArrayNumDims` (scalar int32) and the
+    /// per-dimension `NDArrayDimOffset`/`NDArrayDimBinning`/`NDArrayDimReverse` to
+    /// the single streaming dataset (addressed by `ds_index`). A 1-D array writes
+    /// each as a scalar int32, a multi-dim array as a 1-D int32 array of length
+    /// ndims (C `writeH5attrInt32`, NDFileHDF5.cpp:1142-1191), native NDArray dim
+    /// order. Must run before `start_swmr()` — HDF5 forbids adding attributes
+    /// after the SWMR lock.
+    fn write_swmr_ndarray_default_attrs(
+        &self,
+        swmr: &mut SwmrFileWriter,
+        ds_index: usize,
+        array: &NDArray,
+    ) -> ADResult<()> {
+        let nd_num_dims = array.dims.len() as i32;
+        swmr.set_dataset_attr_numeric(ds_index, "NDArrayNumDims", &nd_num_dims)
+            .map_err(|e| {
+                ADError::UnsupportedConversion(format!("SWMR NDArrayNumDims attr: {}", e))
+            })?;
+        let dim_offsets: Vec<i32> = array.dims.iter().map(|d| d.offset as i32).collect();
+        let dim_binnings: Vec<i32> = array.dims.iter().map(|d| d.binning as i32).collect();
+        let dim_reverses: Vec<i32> = array.dims.iter().map(|d| d.reverse as i32).collect();
+        for (name, vals) in [
+            ("NDArrayDimOffset", &dim_offsets),
+            ("NDArrayDimBinning", &dim_binnings),
+            ("NDArrayDimReverse", &dim_reverses),
+        ] {
+            let res = if vals.len() == 1 {
+                swmr.set_dataset_attr_numeric(ds_index, name, &vals[0])
+            } else {
+                swmr.set_dataset_attr_array(ds_index, name, &[vals.len() as u64], vals)
+            };
+            res.map_err(|e| ADError::UnsupportedConversion(format!("SWMR {} attr: {}", name, e)))?;
         }
         Ok(())
     }
@@ -4273,6 +4311,73 @@ mod tests {
     }
 
     #[test]
+    fn test_swmr_ndarray_default_attrs_on_streaming_dataset() {
+        // C writeDefaultDatasetAttributes (NDFileHDF5.cpp:3695-3719) attaches
+        // NDArrayNumDims plus the per-dimension NDArrayDimOffset/Binning/Reverse
+        // to every detector dataset. In SWMR mode they are written on the single
+        // streaming dataset before start_swmr() locks the file, addressed by
+        // dataset index (rust-hdf5 0.2.22). writeH5attrInt32
+        // (NDFileHDF5.cpp:1142-1191): 1-D array => scalar int32, multi-dim => a
+        // 1-D int32 array of length ndims, native dim order.
+
+        // 1-D streaming array: all four attributes present and scalar.
+        let path = temp_path("hdf5_swmr_dimattr_1d");
+        let mut writer = Hdf5Writer::new();
+        writer.set_swmr_mode(true);
+        let mut d = NDDimension::new(8);
+        d.offset = 3;
+        d.binning = 2;
+        d.reverse = true;
+        let arr = NDArray::new(vec![d], NDDataType::UInt16);
+        writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
+        let h5 = H5File::open(&path).unwrap();
+        let ds = h5.dataset("entry/instrument/detector/data").unwrap();
+        let geti = |n: &str| -> i32 { ds.attr(n).unwrap().read_numeric().unwrap() };
+        assert_eq!(geti("NDArrayNumDims"), 1);
+        assert_eq!(geti("NDArrayDimOffset"), 3);
+        assert_eq!(geti("NDArrayDimBinning"), 2);
+        assert_eq!(geti("NDArrayDimReverse"), 1);
+        std::fs::remove_file(&path).ok();
+
+        // 2-D streaming array: NDArrayNumDims=2; the Dim* attributes are 1-D
+        // int32 arrays of length 2 in native dim order (dims[0] then dims[1]).
+        let path = temp_path("hdf5_swmr_dimattr_2d");
+        let mut writer = Hdf5Writer::new();
+        writer.set_swmr_mode(true);
+        let mut d0 = NDDimension::new(4);
+        d0.offset = 3;
+        d0.binning = 2;
+        d0.reverse = true;
+        let mut d1 = NDDimension::new(8);
+        d1.offset = 5;
+        d1.binning = 4;
+        d1.reverse = false;
+        let arr = NDArray::new(vec![d0, d1], NDDataType::UInt16);
+        writer.open_file(&path, NDFileMode::Stream, &arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.write_file(&arr).unwrap();
+        writer.close_file().unwrap();
+        let h5 = H5File::open(&path).unwrap();
+        let ds = h5.dataset("entry/instrument/detector/data").unwrap();
+        let numdims: i32 = ds.attr("NDArrayNumDims").unwrap().read_numeric().unwrap();
+        assert_eq!(numdims, 2);
+        let read_i32_arr = |n: &str| -> Vec<i32> {
+            let raw = ds.attr(n).unwrap().read_raw().unwrap();
+            assert_eq!(raw.len(), 2 * 4, "{n} must be a 2-element int32 array");
+            raw.chunks_exact(4)
+                .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect()
+        };
+        assert_eq!(read_i32_arr("NDArrayDimOffset"), vec![3, 5]);
+        assert_eq!(read_i32_arr("NDArrayDimBinning"), vec![2, 4]);
+        assert_eq!(read_i32_arr("NDArrayDimReverse"), vec![1, 0]);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn test_ndattr_descriptor_attributes_written() {
         // C attaches NDAttrName/NDAttrDescription/NDAttrSourceType/NDAttrSource
         // string HDF5 attributes (non-empty only) to every NDAttribute dataset
@@ -5542,13 +5647,24 @@ mod tests {
             .unwrap();
         assert_eq!(via_nested, via_alias);
         assert_eq!(via_nested.len(), 2 * 4 * 4);
-        // The constant dataset attribute materialised before start_swmr().
-        assert_eq!(
-            reader
-                .dataset_attr_names("entry/instrument/detector/data")
-                .unwrap(),
-            vec!["signal".to_string()],
-        );
+        // The constant layout dataset attribute and the C-parity NDArray default
+        // attributes (writeDefaultDatasetAttributes, NDFileHDF5.cpp:3695-3719) all
+        // materialised before start_swmr().
+        let attr_names = reader
+            .dataset_attr_names("entry/instrument/detector/data")
+            .unwrap();
+        for expected in [
+            "signal",
+            "NDArrayNumDims",
+            "NDArrayDimOffset",
+            "NDArrayDimBinning",
+            "NDArrayDimReverse",
+        ] {
+            assert!(
+                attr_names.iter().any(|n| n == expected),
+                "streaming dataset must carry the {expected} attribute; got {attr_names:?}",
+            );
+        }
 
         drop(reader);
         std::fs::remove_file(&path).ok();

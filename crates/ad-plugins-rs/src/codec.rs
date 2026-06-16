@@ -806,18 +806,24 @@ pub fn compress_blosc(src: &NDArray, config: &BloscConfig) -> NDArray {
     let raw = src.data.as_u8_slice();
     let element_size = src.data.data_type().element_size();
 
+    // Standard H5Zblosc cd_values layout (c-blosc `blosc_filter.c`):
+    // [filter_ver, blosc_ver, typesize, nbytes, clevel, shuffle, compcode].
+    // The HDF5 reader keys on typesize@2, doshuffle@5 and compcode@6; placing
+    // the sub-compressor anywhere but index 6 makes the pipeline compress with
+    // the wrong codec (e.g. clevel 5 at slot 6 selects ZSTD instead of the
+    // configured BloscLZ).
     let pipeline = FilterPipeline {
         filters: vec![Filter {
             id: FILTER_BLOSC,
             flags: 0,
             cd_values: vec![
-                2,                   // filter version
-                2,                   // blosc version
-                element_size as u32, // type size
-                raw.len() as u32,    // chunk size
-                config.shuffle,      // shuffle
-                config.compressor,   // compressor
-                config.clevel,       // level
+                2,                   // filter version (cd_values[0])
+                2,                   // blosc version (cd_values[1])
+                element_size as u32, // type size (cd_values[2])
+                raw.len() as u32,    // uncompressed chunk size (cd_values[3])
+                config.clevel,       // compression level (cd_values[4])
+                config.shuffle,      // shuffle (cd_values[5])
+                config.compressor,   // sub-compressor (cd_values[6])
             ],
         }],
     };
@@ -846,24 +852,36 @@ pub fn compress_blosc(src: &NDArray, config: &BloscConfig) -> NDArray {
 
 /// Decompress a Blosc-compressed NDArray via rust-hdf5's filter pipeline.
 pub fn decompress_blosc(src: &NDArray) -> Option<NDArray> {
-    if src.codec.as_ref().map(|c| c.name) != Some(CodecName::Blosc) {
+    let codec = src.codec.as_ref()?;
+    if codec.name != CodecName::Blosc {
         return None;
     }
 
     let compressed = src.data.as_u8_slice();
+    let original_type = original_data_type(src);
+    let element_size = original_type.element_size();
 
-    // Blosc header contains enough info for decompression
+    // The blosc chunk header self-describes typesize/nbytes/flags, but the HDF5
+    // reader takes the sub-compressor from cd_values[6] (defaulting to LZ4). An
+    // empty cd_values therefore mis-decodes any non-LZ4 buffer, so author the
+    // standard layout with the codec's recorded sub-compressor at index 6.
     let pipeline = FilterPipeline {
         filters: vec![Filter {
             id: FILTER_BLOSC,
             flags: 0,
-            cd_values: vec![],
+            cd_values: vec![
+                2,
+                2,
+                element_size as u32,
+                0,
+                codec.level as u32,
+                codec.shuffle as u32,
+                codec.compressor as u32,
+            ],
         }],
     };
 
     let decompressed = reverse_filters(&pipeline, compressed).ok()?;
-
-    let original_type = original_data_type(src);
 
     let buffer = buffer_from_bytes(&decompressed, original_type)?;
 
@@ -1235,6 +1253,64 @@ mod tests {
         assert_eq!(codec.level, 5, "codec.level records the default clevel 5");
         assert_eq!(codec.shuffle, 0, "codec.shuffle records shuffle");
         assert_eq!(codec.compressor, 0, "codec.compressor records compressor");
+    }
+
+    #[test]
+    fn test_blosc_roundtrip_u16_default_compressor() {
+        // Regression: the cd_values were mis-ordered so the sub-compressor slot
+        // (index 6) held the clevel, selecting ZSTD instead of the configured
+        // BloscLZ; the buffer then failed to reverse. Round-trip with the
+        // default config (compressor 0 = BloscLZ, clevel 5) must reconstruct the
+        // exact bytes.
+        let mut arr = NDArray::new(
+            vec![NDDimension::new(100), NDDimension::new(20)],
+            NDDataType::UInt16,
+        );
+        if let NDDataBuffer::U16(ref mut v) = arr.data {
+            for (i, x) in v.iter_mut().enumerate() {
+                *x = (i * 37 % 65521) as u16;
+            }
+        }
+        let original = arr.data.as_u8_slice().to_vec();
+
+        let compressed = compress_blosc(&arr, &BloscConfig::default());
+        assert_eq!(compressed.codec.as_ref().unwrap().name, CodecName::Blosc);
+        assert_ne!(
+            compressed.data.as_u8_slice(),
+            original.as_slice(),
+            "blosc must actually compress (not fall back to the raw clone)"
+        );
+
+        let decompressed = decompress_blosc(&compressed).expect("blosc round-trip");
+        assert!(decompressed.codec.is_none());
+        assert_eq!(decompressed.data.data_type(), NDDataType::UInt16);
+        assert_eq!(decompressed.data.as_u8_slice(), original.as_slice());
+    }
+
+    #[test]
+    fn test_blosc_roundtrip_u16_lz4_subcompressor() {
+        // A non-default sub-compressor (LZ4 = 1) must round-trip too — the
+        // recorded cd_values[6] drives the reader's sub-codec dispatch.
+        let cfg = BloscConfig {
+            compressor: 1,
+            clevel: 5,
+            shuffle: 1,
+        };
+        let mut arr = NDArray::new(vec![NDDimension::new(256)], NDDataType::UInt16);
+        if let NDDataBuffer::U16(ref mut v) = arr.data {
+            for (i, x) in v.iter_mut().enumerate() {
+                *x = (i * 13 % 65521) as u16;
+            }
+        }
+        let original = arr.data.as_u8_slice().to_vec();
+
+        let compressed = compress_blosc(&arr, &cfg);
+        let codec = compressed.codec.as_ref().unwrap();
+        assert_eq!(codec.compressor, 1, "records the LZ4 sub-compressor");
+        assert_eq!(codec.shuffle, 1, "records byte shuffle");
+
+        let decompressed = decompress_blosc(&compressed).expect("blosc lz4 round-trip");
+        assert_eq!(decompressed.data.as_u8_slice(), original.as_slice());
     }
 
     // ---- LZ4 tests ----

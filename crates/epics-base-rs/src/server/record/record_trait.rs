@@ -894,15 +894,35 @@ pub trait Record: Send + Sync + 'static {
     /// single-INP→VAL apply path reaches the same `convert_to` via
     /// `set_val`'s `TypeMismatch` auto-coerce.
     fn put_field_internal(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
-        let value = match value {
-            EpicsValue::EnumWithChoices { .. } => {
-                let target_type = self
-                    .get_field(name)
-                    .map(|v| v.db_field_type())
-                    .unwrap_or(DbFieldType::Long);
-                value.convert_to(target_type)
+        // Input-link / internal delivery coerces the source to the target
+        // field's stored type before `put_field`, mirroring C
+        // `dbGetLink(DBF_<target>)`: the link layer converts any numeric
+        // source to the requested type, so a record's typed `put_field`
+        // arm never sees a mismatched type. This is the single owner of
+        // that coercion, covering every `ReadDbLink` target by construction
+        // (e.g. a `compress` INP from a `DBF_LONG` record delivers a
+        // `Long`/`LongArray` that must become `Double`/`DoubleArray` for the
+        // Double-only VAL arm, which otherwise drops it and never advances
+        // the buffer). An `EnumWithChoices` carrier is always collapsed to a
+        // bare index by `convert_to`, even when the target is already `Enum`.
+        let target_type = self
+            .field_list()
+            .iter()
+            .find(|f| f.name.eq_ignore_ascii_case(name))
+            .map(|f| f.dbf_type)
+            .or_else(|| self.get_field(name).map(|v| v.db_field_type()));
+        let is_enum_carrier = matches!(value, EpicsValue::EnumWithChoices { .. });
+        let value = match target_type {
+            Some(target)
+                if is_enum_carrier
+                    || (value.db_field_type() != target && !value.is_empty_array()) =>
+            {
+                value.convert_to(target)
             }
-            other => other,
+            // Carrier with no known target field: collapse to a bare index
+            // (the prior fallback) rather than letting it reach storage.
+            None if is_enum_carrier => value.convert_to(DbFieldType::Long),
+            _ => value,
         };
         self.put_field(name, value)
     }

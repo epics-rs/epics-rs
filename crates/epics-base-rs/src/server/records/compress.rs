@@ -703,6 +703,29 @@ mod pbuf_tests {
         }
     }
 
+    /// C `compressRecord` reads its INP via `dbGetLink(&prec->inp,
+    /// DBF_DOUBLE, …)` (compressRecord.c:342), so a linked `DBF_LONG`
+    /// source is converted to double before the record sees it. The
+    /// input-link delivery owner `put_field_internal` must coerce a
+    /// `Long`/`LongArray` to the Double-only VAL arm; before the fix it
+    /// reached the typed `put_field` as `Long`, returned `TypeMismatch`,
+    /// and the caller discarded it so the buffer never advanced.
+    #[test]
+    fn input_link_coerces_long_source_into_double_buffer() {
+        let mut rec = CompressRecord::new(10, 4); // circular buffer NSAM=10
+
+        // Scalar Long delivery (e.g. INP from a longin/calc VAL).
+        rec.put_field_internal("VAL", EpicsValue::Long(42)).unwrap();
+        // Array Long delivery (e.g. INP from a waveform FTVL=LONG).
+        rec.put_field_internal("VAL", EpicsValue::LongArray(vec![10, 20, 30]))
+            .unwrap();
+
+        match rec.get_field("VAL").unwrap() {
+            EpicsValue::DoubleArray(v) => assert_eq!(v, vec![42.0, 10.0, 20.0, 30.0]),
+            other => panic!("expected DoubleArray, got {other:?}"),
+        }
+    }
+
     /// Buffer fill progresses incrementally; VAL grows with NUSE.
     /// When the buffer fills, VAL reaches its final NSAM length.
     #[test]

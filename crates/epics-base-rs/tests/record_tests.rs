@@ -1109,6 +1109,112 @@ fn test_ai_udf_cycle_leaves_lalm_and_zeroes_afvl() {
 }
 
 #[test]
+fn test_waveform_onchange_gates_val_and_posts_hash() {
+    // C waveform monitor() (waveformRecord.c:298-324): in On Change mode the
+    // VAL post (DBE_VALUE/DBE_LOG) and the HASH post (literal DBE_VALUE) fire
+    // only when the array-content hash differs from the stored HASH.
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::server::records::waveform::WaveformRecord;
+    use epics_base_rs::types::DbFieldType;
+    let mut rec = WaveformRecord::new(10, DbFieldType::Long);
+    rec.mpst = 1; // On Change
+    rec.apst = 1; // On Change
+    let mut instance = RecordInstance::new("WF".into(), rec);
+    let _val_rx = instance
+        .add_subscriber("VAL", 1, DbFieldType::Long, EventMask::VALUE.bits())
+        .expect("VAL subscriber");
+    let _hash_rx = instance
+        .add_subscriber("HASH", 2, DbFieldType::ULong, EventMask::VALUE.bits())
+        .expect("HASH subscriber");
+
+    // Cycle 1: write [1,2,3] → hash changes → VAL and HASH post.
+    instance
+        .record
+        .put_field("VAL", EpicsValue::LongArray(vec![1, 2, 3]))
+        .unwrap();
+    let (snap, _) = instance.process_local().unwrap();
+    assert!(
+        snap.changed_fields.iter().any(|(k, _, _)| k == "VAL"),
+        "On Change: VAL posts when content hash changes"
+    );
+    let hash_post = snap.changed_fields.iter().find(|(k, _, _)| k == "HASH");
+    assert!(hash_post.is_some(), "HASH posts on a hash change");
+    assert_eq!(
+        hash_post.unwrap().2,
+        EventMask::VALUE,
+        "HASH posts with a literal DBE_VALUE (waveformRecord.c:319)"
+    );
+    // HASH == epicsMemHash over the first NORD=3 i32 LE elements [1,2,3].
+    assert_eq!(
+        instance.record.get_field("HASH"),
+        Some(EpicsValue::ULong(0x3429_76d1)),
+        "HASH equals epicsMemHash(i32[1,2,3] LE)"
+    );
+
+    // Cycle 2: same content → hash unchanged → neither VAL nor HASH post.
+    instance
+        .record
+        .put_field("VAL", EpicsValue::LongArray(vec![1, 2, 3]))
+        .unwrap();
+    let (snap, _) = instance.process_local().unwrap();
+    assert!(
+        !snap.changed_fields.iter().any(|(k, _, _)| k == "VAL"),
+        "On Change: VAL suppressed when content hash is unchanged"
+    );
+    assert!(
+        !snap.changed_fields.iter().any(|(k, _, _)| k == "HASH"),
+        "HASH not posted when the hash is unchanged"
+    );
+
+    // Cycle 3: new content → hash changes → VAL and HASH post again.
+    instance
+        .record
+        .put_field("VAL", EpicsValue::LongArray(vec![1, 2, 4]))
+        .unwrap();
+    let (snap, _) = instance.process_local().unwrap();
+    assert!(
+        snap.changed_fields.iter().any(|(k, _, _)| k == "VAL"),
+        "On Change: VAL posts again on new content"
+    );
+    assert!(
+        snap.changed_fields.iter().any(|(k, _, _)| k == "HASH"),
+        "HASH posts again on new content"
+    );
+}
+
+#[test]
+fn test_waveform_always_mode_never_posts_hash() {
+    // C waveform monitor() in the default Always mode (mpst=apst=0) never
+    // enters the hash block: HASH is neither computed nor posted, and VAL
+    // posts every cycle with DBE_VALUE|DBE_LOG. A HASH subscriber must see
+    // no process-driven HASH event.
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::server::records::waveform::WaveformRecord;
+    use epics_base_rs::types::DbFieldType;
+    // mpst=apst=0 (Always) by default.
+    let rec = WaveformRecord::new(10, DbFieldType::Long);
+    let mut instance = RecordInstance::new("WF".into(), rec);
+    let _hash_rx = instance
+        .add_subscriber("HASH", 1, DbFieldType::ULong, EventMask::VALUE.bits())
+        .expect("HASH subscriber");
+
+    instance
+        .record
+        .put_field("VAL", EpicsValue::LongArray(vec![1, 2, 3]))
+        .unwrap();
+    let (snap, _) = instance.process_local().unwrap();
+    assert!(
+        !snap.changed_fields.iter().any(|(k, _, _)| k == "HASH"),
+        "Always mode: HASH is never posted (C never enters the hash block)"
+    );
+    assert_eq!(
+        instance.record.get_field("HASH"),
+        Some(EpicsValue::ULong(0)),
+        "Always mode: HASH stays 0 (never computed)"
+    );
+}
+
+#[test]
 fn test_pact_reads_zero_when_idle() {
     let instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
     match instance.get_common_field("PACT") {

@@ -93,6 +93,36 @@ const MENU_FTYPE_DOUBLE: i16 = 10;
 /// [`ArrayKind`].
 const WAVEFORM_POST: &[&str] = &["Always", "On Change"];
 
+/// `menu(waveformPOST)` indices: `Always` posts every cycle, `On Change`
+/// posts only when the array-content hash differs from the stored `HASH`.
+const WAVEFORM_POST_ALWAYS: i16 = 0;
+const WAVEFORM_POST_ONCHANGE: i16 = 1;
+
+/// `epicsOldString` width — a STRING-FTVL element occupies a fixed
+/// `MAX_STRING_SIZE`-byte slot in `bptr`, so the hash sees that many bytes
+/// per element (null-padded), matching C's raw buffer layout.
+const MAX_STRING_SIZE: usize = 40;
+
+/// Port of EPICS `epicsMemHash` (epicsString.c:378-388), the array-content
+/// hash used by waveform/aai/aao `monitor()` for On Change detection. It is
+/// a Jenkins one-at-a-time variant that consumes bytes in pairs, applying
+/// formula A to even byte positions and formula B to odd ones. C
+/// dereferences `char` — signed on the x86_64 / aarch64 reference builds —
+/// so each byte is sign-extended to 32 bits before the XOR; `b as i8 as
+/// u32` reproduces that exactly.
+fn epics_mem_hash(bytes: &[u8], seed: u32) -> u32 {
+    let mut hash = seed;
+    for (i, &b) in bytes.iter().enumerate() {
+        let c = b as i8 as u32;
+        if i % 2 == 0 {
+            hash ^= !((hash << 11) ^ c ^ (hash >> 5));
+        } else {
+            hash ^= (hash << 7) ^ c ^ (hash >> 3);
+        }
+    }
+    hash
+}
+
 impl Default for WaveformRecord {
     fn default() -> Self {
         Self {
@@ -212,6 +242,71 @@ impl WaveformRecord {
         if (self.nord as usize) > n {
             self.nord = n as i32;
         }
+    }
+
+    /// Serialize the first `NORD` elements of `VAL` to their native
+    /// (little-endian on the reference builds) byte layout — the bytes C
+    /// `monitor()` feeds to `epicsMemHash` over `nord * dbValueSize(ftvl)`
+    /// (waveformRecord.c:306-307). Each element contributes exactly its
+    /// `dbValueSize` bytes; a STRING element occupies a fixed
+    /// `MAX_STRING_SIZE` slot, null-padded.
+    fn array_content_bytes(&self) -> Vec<u8> {
+        let n = self.nord.max(0) as usize;
+        let mut out = Vec::new();
+        match &self.val {
+            EpicsValue::CharArray(v) => out.extend(v.iter().take(n).copied()),
+            EpicsValue::ShortArray(v) => {
+                for x in v.iter().take(n) {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+            EpicsValue::UShortArray(v) | EpicsValue::EnumArray(v) => {
+                for x in v.iter().take(n) {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+            EpicsValue::LongArray(v) => {
+                for x in v.iter().take(n) {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+            EpicsValue::ULongArray(v) => {
+                for x in v.iter().take(n) {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+            EpicsValue::FloatArray(v) => {
+                for x in v.iter().take(n) {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+            EpicsValue::DoubleArray(v) => {
+                for x in v.iter().take(n) {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+            EpicsValue::Int64Array(v) => {
+                for x in v.iter().take(n) {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+            EpicsValue::UInt64Array(v) => {
+                for x in v.iter().take(n) {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+            EpicsValue::StringArray(v) => {
+                for s in v.iter().take(n) {
+                    let mut slot = [0u8; MAX_STRING_SIZE];
+                    let bytes = s.as_bytes();
+                    let copy = bytes.len().min(MAX_STRING_SIZE - 1);
+                    slot[..copy].copy_from_slice(&bytes[..copy]);
+                    out.extend_from_slice(&slot);
+                }
+            }
+            _ => {}
+        }
+        out
     }
 }
 
@@ -585,6 +680,53 @@ impl Record for WaveformRecord {
         }
     }
 
+    /// C waveform/aai/aao `monitor()` (waveformRecord.c:291-326): MPST/APST
+    /// "Always vs On Change" posting. In Always mode the corresponding bit
+    /// posts every cycle; in On Change mode the array content is hashed
+    /// (`epicsMemHash` over `nord * dbValueSize(ftvl)` native bytes) and the
+    /// bit posts — plus `HASH` is updated and reported changed — only when
+    /// the hash differs from the stored `HASH`. `subArray` has no such
+    /// mechanism, so it (and every non-array record) keeps the default
+    /// `None` and the generic deadband decision.
+    fn array_monitor_post(&mut self) -> Option<crate::server::record::ArrayMonitorPost> {
+        if matches!(self.kind, ArrayKind::SubArray) {
+            return None;
+        }
+        let mut post_value = self.mpst == WAVEFORM_POST_ALWAYS;
+        let mut post_archive = self.apst == WAVEFORM_POST_ALWAYS;
+        let mut hash_changed = false;
+        if self.mpst == WAVEFORM_POST_ONCHANGE || self.apst == WAVEFORM_POST_ONCHANGE {
+            let h = epics_mem_hash(&self.array_content_bytes(), 0);
+            if h != self.hash {
+                self.hash = h;
+                hash_changed = true;
+                if self.mpst == WAVEFORM_POST_ONCHANGE {
+                    post_value = true;
+                }
+                if self.apst == WAVEFORM_POST_ONCHANGE {
+                    post_archive = true;
+                }
+            }
+        }
+        Some(crate::server::record::ArrayMonitorPost {
+            post_value,
+            post_archive,
+            hash_changed,
+        })
+    }
+
+    /// `HASH` is posted by C `monitor()` with a literal `DBE_VALUE` only on
+    /// a hash change (waveformRecord.c:317-319), never through VAL's change
+    /// detection — exclude it from the generic change-detection loop so it
+    /// is neither double-posted nor spuriously posted in Always mode.
+    fn event_posted_fields(&self) -> &'static [&'static str] {
+        if matches!(self.kind, ArrayKind::SubArray) {
+            &[]
+        } else {
+            &["HASH"]
+        }
+    }
+
     // EGU/HOPR/LOPR/PREC are backed by typed storage and exposed through both
     // get_field/put_field and field_list, so populate_display_info reads the
     // loaded values for the DBR_GR display limits (waveformRecord.c:251-252).
@@ -603,6 +745,11 @@ impl Record for WaveformRecord {
             "FTVL" => Some(EpicsValue::Short(self.ftvl)),
             "MPST" => Some(EpicsValue::Short(self.mpst)),
             "APST" => Some(EpicsValue::Short(self.apst)),
+            // HASH (DBF_ULONG) — the On Change content hash. Only the
+            // waveform/aai/aao kinds declare it; subArray has no such field.
+            "HASH" if !matches!(self.kind, ArrayKind::SubArray) => {
+                Some(EpicsValue::ULong(self.hash))
+            }
             // subArray-specific INDX/MALM fields. Other array record
             // kinds expose them as zero (matches C dbpr output for a
             // record type that doesn't declare the field).
@@ -917,6 +1064,29 @@ impl Record for WaveformRecord {
 #[cfg(test)]
 mod array_kind_tests {
     use super::*;
+
+    #[test]
+    fn epics_mem_hash_matches_c_reference_vectors() {
+        // Reference values produced by the verbatim C `epicsMemHash`
+        // (epicsString.c:378-388) compiled on this machine (signed char,
+        // little-endian). The CharArray vector includes high-bit bytes
+        // (0x80/0xFF) to pin the signed-char sign extension.
+        let mut da = Vec::new();
+        da.extend_from_slice(&1.0f64.to_le_bytes());
+        da.extend_from_slice(&2.0f64.to_le_bytes());
+        assert_eq!(epics_mem_hash(&da, 0), 0xa23a_aba6);
+
+        let mut la = Vec::new();
+        for x in [1i32, 2, 3] {
+            la.extend_from_slice(&x.to_le_bytes());
+        }
+        assert_eq!(epics_mem_hash(&la, 0), 0x3429_76d1);
+
+        assert_eq!(epics_mem_hash(&[0x00, 0x80, 0xFF, 0x7F], 0), 0x7be0_007f);
+        // Odd length exercises the mid-pair break in the C loop.
+        assert_eq!(epics_mem_hash(&[0xAA, 0xBB, 0xCC], 0), 0x06ab_0bfc);
+        assert_eq!(epics_mem_hash(&[], 0), 0);
+    }
 
     #[test]
     fn waveform_default_kind() {

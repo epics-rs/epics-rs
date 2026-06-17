@@ -2218,6 +2218,9 @@ impl PvDatabase {
             // inside C's `if (monitor_mask)` (ai RVAL, aiRecord.c:460-465) —
             // see `Record::fields_posted_with_value_mask`. Empty for most.
             let value_masked = instance.record.fields_posted_with_value_mask();
+            // Event-driven posts (HASH on a content-hash change) — excluded
+            // from generic change-detection (see `event_posted_fields`).
+            let event_posted = instance.record.event_posted_fields();
             let mut sub_updates: Vec<(String, EpicsValue, EventMask)> = Vec::new();
             for (field, subs) in &instance.subscribers {
                 if !subs.is_empty()
@@ -2226,6 +2229,7 @@ impl PvDatabase {
                     && field != "STAT"
                     && field != "AMSG"
                     && field != "UDF"
+                    && !event_posted.contains(&field.as_str())
                 {
                     if let Some(val) = instance.resolve_field(field) {
                         let changed = match instance.last_posted.get(field) {
@@ -2280,6 +2284,15 @@ impl PvDatabase {
                     instance.last_posted.insert(field.clone(), val.clone());
                 }
                 changed_fields.extend(sub_updates);
+            }
+            // C waveform/aai/aao `monitor()` posts HASH with a literal
+            // `DBE_VALUE` only on a content-hash change (waveformRecord.c:
+            // 317-319), independent of the VAL post mask. `array_hash_changed`
+            // was set by `check_deadband_ext` this cycle.
+            if instance.array_hash_changed {
+                if let Some(h) = instance.resolve_field("HASH") {
+                    changed_fields.push(("HASH".to_string(), h, EventMask::VALUE));
+                }
             }
             // C `recGblResetAlarms` (recGbl.c:201-220) posts each
             // alarm field with its own per-field mask:
@@ -3333,6 +3346,9 @@ impl PvDatabase {
             // inside C's `if (monitor_mask)` (ai RVAL, aiRecord.c:460-465) —
             // see `Record::fields_posted_with_value_mask`. Empty for most.
             let value_masked = instance.record.fields_posted_with_value_mask();
+            // Event-driven posts (HASH on a content-hash change) — excluded
+            // from generic change-detection (see `event_posted_fields`).
+            let event_posted = instance.record.event_posted_fields();
             let mut sub_updates: Vec<(String, EpicsValue, EventMask)> = Vec::new();
             for (field, subs) in &instance.subscribers {
                 if !subs.is_empty()
@@ -3341,6 +3357,7 @@ impl PvDatabase {
                     && field != "STAT"
                     && field != "AMSG"
                     && field != "UDF"
+                    && !event_posted.contains(&field.as_str())
                 {
                     if let Some(val) = instance.resolve_field(field) {
                         let changed = match instance.last_posted.get(field) {
@@ -3395,6 +3412,15 @@ impl PvDatabase {
                     instance.last_posted.insert(field.clone(), val.clone());
                 }
                 changed_fields.extend(sub_updates);
+            }
+            // C waveform/aai/aao `monitor()` posts HASH with a literal
+            // `DBE_VALUE` only on a content-hash change (waveformRecord.c:
+            // 317-319), independent of the VAL post mask. `array_hash_changed`
+            // was set by `check_deadband_ext` this cycle.
+            if instance.array_hash_changed {
+                if let Some(h) = instance.resolve_field("HASH") {
+                    changed_fields.push(("HASH".to_string(), h, EventMask::VALUE));
+                }
             }
             // UDF rides along whenever any monitored post fired this
             // cycle, carrying the union of the cycle's posted classes —
@@ -4244,6 +4270,9 @@ fn sim_process_tail(instance: &mut RecordInstance, sims: i16) {
     // C's `if (monitor_mask)` (ai RVAL, aiRecord.c:460-465) — see
     // `Record::fields_posted_with_value_mask`. Empty for most.
     let value_masked = instance.record.fields_posted_with_value_mask();
+    // Event-driven posts (HASH on a content-hash change) — excluded from
+    // generic change-detection (see `event_posted_fields`).
+    let event_posted = instance.record.event_posted_fields();
     let mut sub_updates: Vec<(String, EpicsValue, EventMask)> = Vec::new();
     for (field, subs) in &instance.subscribers {
         if !subs.is_empty()
@@ -4252,6 +4281,7 @@ fn sim_process_tail(instance: &mut RecordInstance, sims: i16) {
             && field != "STAT"
             && field != "AMSG"
             && field != "UDF"
+            && !event_posted.contains(&field.as_str())
         {
             if let Some(val) = instance.resolve_field(field) {
                 let changed = match instance.last_posted.get(field) {
@@ -4301,6 +4331,15 @@ fn sim_process_tail(instance: &mut RecordInstance, sims: i16) {
             instance.last_posted.insert(field.clone(), val.clone());
         }
         changed_fields.extend(sub_updates);
+    }
+    // C waveform/aai/aao `monitor()` posts HASH with a literal `DBE_VALUE`
+    // only on a content-hash change (waveformRecord.c:317-319), independent
+    // of the VAL post mask. `array_hash_changed` was set by
+    // `check_deadband_ext` this cycle.
+    if instance.array_hash_changed {
+        if let Some(h) = instance.resolve_field("HASH") {
+            changed_fields.push(("HASH".to_string(), h, EventMask::VALUE));
+        }
     }
     let cycle_mask = changed_fields
         .iter()

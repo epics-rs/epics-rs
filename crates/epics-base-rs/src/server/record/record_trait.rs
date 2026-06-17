@@ -11,6 +11,22 @@ pub struct FieldDesc {
     pub read_only: bool,
 }
 
+/// Outcome of a record's array-style monitor decision, returned by
+/// [`Record::array_monitor_post`] (C waveform/aai/aao `monitor()`,
+/// waveformRecord.c:291-326).
+#[derive(Debug, Clone, Copy)]
+pub struct ArrayMonitorPost {
+    /// Include `DBE_VALUE` on the VAL post this cycle (MPST = Always, or
+    /// MPST = On Change with a changed hash).
+    pub post_value: bool,
+    /// Include `DBE_LOG` on the VAL post this cycle (APST = Always, or
+    /// APST = On Change with a changed hash).
+    pub post_archive: bool,
+    /// The content hash changed this cycle (On Change mode) — the owner
+    /// posts `HASH` with a literal `DBE_VALUE`.
+    pub hash_changed: bool,
+}
+
 /// Per-field metadata deltas returned by
 /// [`Record::field_metadata_override`].
 ///
@@ -740,6 +756,32 @@ pub trait Record: Send + Sync + 'static {
     ///
     /// Default: empty.
     fn fields_posted_with_value_mask(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// The array-style monitor decision (C waveform/aai/aao `monitor()`,
+    /// waveformRecord.c:291-326). `None` (the default) means the record has
+    /// no MPST/APST/HASH mechanism and the generic MDEL/ADEL deadband
+    /// decision applies. `Some(_)` lets the record replace that with its
+    /// "Always vs On Change" rule: it hashes the array content, compares to
+    /// the stored `HASH`, updates it, and reports whether `DBE_VALUE` /
+    /// `DBE_LOG` should be on the VAL post this cycle and whether the hash
+    /// changed (so the owner posts `HASH` with `DBE_VALUE`). Called by
+    /// `check_deadband_ext` (the single owner of the VAL-mask decision).
+    fn array_monitor_post(&mut self) -> Option<ArrayMonitorPost> {
+        None
+    }
+
+    /// Fields the record posts itself via an event-driven, individually
+    /// masked path rather than the generic change-detection loop. The
+    /// framework excludes these from that loop so they are neither
+    /// double-posted nor spuriously posted on a cycle the event did not
+    /// fire. C waveform/aai/aao `monitor()` posts `HASH` this way —
+    /// `db_post_events(prec, &prec->hash, DBE_VALUE)` only when the content
+    /// hash changed (waveformRecord.c:317-319), never via VAL's change.
+    ///
+    /// Default: empty.
+    fn event_posted_fields(&self) -> &'static [&'static str] {
         &[]
     }
 

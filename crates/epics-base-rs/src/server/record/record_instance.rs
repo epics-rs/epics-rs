@@ -239,6 +239,13 @@ pub struct RecordInstance {
     pub notify: Option<Arc<NotifyWaitSet>>,
     // Last posted values for subscribed fields (generic change detection)
     pub last_posted: HashMap<String, EpicsValue>,
+    /// Set by `check_deadband_ext` for waveform/aai/aao when their
+    /// content hash changed this cycle (C `monitor()` On Change mode,
+    /// waveformRecord.c:310-319). The snapshot builders read it to post
+    /// `HASH` with a literal `DBE_VALUE` event, independent of the VAL
+    /// post mask. False for every record without the MPST/APST/HASH
+    /// mechanism.
+    pub(crate) array_hash_changed: bool,
     /// Generation counter for ReprocessAfter timer cancellation.
     /// Bumped each process cycle. Spawned timers check this to avoid
     /// stale re-processes from accumulated timers.
@@ -333,6 +340,7 @@ impl RecordInstance {
             processing: AtomicBool::new(false),
             notify: None,
             last_posted: HashMap::new(),
+            array_hash_changed: false,
             reprocess_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             info: HashMap::new(),
             metadata_cache: StdMutex::new(None),
@@ -2198,6 +2206,11 @@ impl RecordInstance {
         // inside C's `if (monitor_mask)` (ai RVAL, aiRecord.c:460-465) —
         // see `Record::fields_posted_with_value_mask`. Empty for most.
         let value_masked = self.record.fields_posted_with_value_mask();
+        // Fields the record posts itself via an event-driven path (HASH on
+        // a content-hash change, waveformRecord.c:317-319) — excluded from
+        // generic change-detection so they are neither double-posted nor
+        // spuriously posted. See `Record::event_posted_fields`.
+        let event_posted = self.record.event_posted_fields();
         let mut sub_updates: Vec<(String, EpicsValue, EventMask)> = Vec::new();
         for (field, subs) in &self.subscribers {
             if !subs.is_empty()
@@ -2206,6 +2219,7 @@ impl RecordInstance {
                 && field != "STAT"
                 && field != "AMSG"
                 && field != "UDF"
+                && !event_posted.contains(&field.as_str())
             {
                 if let Some(val) = self.resolve_field(field) {
                     let changed = match self.last_posted.get(field) {
@@ -2257,6 +2271,15 @@ impl RecordInstance {
                 self.last_posted.insert(field.clone(), val.clone());
             }
             changed_fields.extend(sub_updates);
+        }
+        // C waveform/aai/aao `monitor()` posts HASH with a literal
+        // `DBE_VALUE` only on a content-hash change (waveformRecord.c:
+        // 317-319), independent of the VAL post mask. `array_hash_changed`
+        // was set by `check_deadband_ext` this cycle.
+        if self.array_hash_changed {
+            if let Some(h) = self.resolve_field("HASH") {
+                changed_fields.push(("HASH".to_string(), h, EventMask::VALUE));
+            }
         }
 
         // Post UDF on the snapshot whenever any monitor event fires this
@@ -2325,6 +2348,21 @@ impl RecordInstance {
     /// silent compromise — `record_tests.rs::deadband_*` pins both
     /// the NaN-sentinel behaviour and the C four-quadrant transitions.
     pub fn check_deadband_ext(&mut self) -> (bool, bool) {
+        // C waveform/aai/aao `monitor()` (waveformRecord.c:291-326) replaces
+        // the analog MDEL/ADEL deadband with the MPST/APST "Always vs On
+        // Change" mechanism: the record hashes its array content and posts
+        // `DBE_VALUE`/`DBE_LOG` either always or only when the hash changed,
+        // and posts `HASH` (`DBE_VALUE`) on a hash change. The record owns
+        // the hash compute + `HASH` update; `array_hash_changed` carries the
+        // event to the snapshot builders, which post `HASH` (the field is
+        // excluded from the generic change-detection loop via
+        // `event_posted_fields`).
+        if let Some(post) = self.record.array_monitor_post() {
+            self.array_hash_changed = post.hash_changed;
+            return (post.post_value, post.post_archive);
+        }
+        self.array_hash_changed = false;
+
         // The deadband is evaluated against `monitor_deadband_value()`,
         // not `val()` directly: a record whose monitored quantity is
         // not its primary value (e.g. the motor record, VAL=setpoint /

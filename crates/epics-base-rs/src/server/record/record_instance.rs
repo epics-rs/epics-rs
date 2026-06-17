@@ -1667,6 +1667,31 @@ impl RecordInstance {
     fn evaluate_analog_alarm(&mut self, val: f64, cfg: &AnalogAlarmConfig) {
         use crate::server::recgbl::{self, alarm_status};
 
+        // C `checkAlarms` returns immediately on a UDF cycle: it raises
+        // `UDF_ALARM`/`UDFS` (already done by `rec_gbl_check_udf` in
+        // `evaluate_alarms`), zeroes `AFVL` on the AFTC-capable records, and
+        // returns BEFORE the range check — so `LALM` is left untouched and
+        // `AFVL` is not filtered this cycle. The identical guard appears in
+        // every record that shares this arm (`aiRecord.c:319-323`,
+        // `aoRecord.c:383-386`, `longinRecord.c:274-278`,
+        // `longoutRecord.c:317-320`, `int64inRecord.c:267-271`,
+        // `int64outRecord.c:298-301`, `calcRecord.c:300-304`,
+        // `calcoutRecord.c:563-566`). AFTC-capable records (ai/longin/
+        // int64in/calc) carry `AFVL` and zero it (`prec->afvl = 0`); the
+        // out records (ao/longout/int64out/calcout) have no `AFVL` and just
+        // return. Running the range check here would drift `LALM` to `val`
+        // (NaN on an undefined cycle) and filter `AFVL` — both observable.
+        if self.common.udf {
+            if matches!(
+                self.record.record_type(),
+                "calc" | "ai" | "longin" | "int64in"
+            ) && self.record.get_field("AFVL").and_then(|v| v.to_f64()) != Some(0.0)
+            {
+                let _ = self.record.put_field("AFVL", EpicsValue::Double(0.0));
+            }
+            return;
+        }
+
         let hyst = self.common.hyst;
         let lalm = self
             .record

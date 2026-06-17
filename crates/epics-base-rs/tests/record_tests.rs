@@ -1054,6 +1054,61 @@ fn test_ai_rval_alarm_only_cycle_posts_alarm_mask_not_value_log() {
 }
 
 #[test]
+fn test_ai_udf_cycle_leaves_lalm_and_zeroes_afvl() {
+    // C aiRecord.c:319-323: checkAlarms returns immediately on a UDF cycle —
+    // it raises UDF_ALARM/UDFS, sets AFVL=0, and never runs the range check,
+    // so LALM is left at its previous value. The same guard appears in
+    // ao/longin/longout/int64in/int64out/calc/calcout checkAlarms; the port
+    // ran the range check unconditionally, drifting LALM to val (NaN on an
+    // undefined cycle) and filtering AFVL.
+    let mut rec = AiRecord::default();
+    rec.aftc = 10.0; // AFTC-capable filter enabled (ai carries AFVL)
+    let mut instance = RecordInstance::new("TEST".into(), rec);
+    instance.common.analog_alarm = Some(AnalogAlarmConfig {
+        hihi: 1.0,
+        high: 0.5,
+        low: -1000.0,
+        lolo: -2000.0,
+        hhsv: AlarmSeverity::Major,
+        hsv: AlarmSeverity::Major,
+        lsv: AlarmSeverity::Minor,
+        llsv: AlarmSeverity::Major,
+    });
+    // Seed LALM/AFVL to sentinels, then force a UDF cycle.
+    instance
+        .record
+        .put_field("LALM", EpicsValue::Double(0.5))
+        .unwrap();
+    instance
+        .record
+        .put_field("AFVL", EpicsValue::Double(3.0))
+        .unwrap();
+    instance
+        .record
+        .set_val(EpicsValue::Double(f64::NAN))
+        .unwrap();
+    instance.common.udf = true;
+
+    instance.evaluate_alarms();
+
+    assert_eq!(
+        instance.record.get_field("LALM").and_then(|v| v.to_f64()),
+        Some(0.5),
+        "UDF cycle must leave LALM untouched (C returns before the range check)"
+    );
+    assert_eq!(
+        instance.record.get_field("AFVL").and_then(|v| v.to_f64()),
+        Some(0.0),
+        "UDF cycle zeroes AFVL (aiRecord.c:321)"
+    );
+    assert_eq!(
+        instance.common.nsev,
+        AlarmSeverity::Invalid,
+        "UDF cycle raises UDFS severity (default INVALID)"
+    );
+}
+
+#[test]
 fn test_pact_reads_zero_when_idle() {
     let instance = RecordInstance::new("TEST".into(), AoRecord::new(0.0));
     match instance.get_common_field("PACT") {

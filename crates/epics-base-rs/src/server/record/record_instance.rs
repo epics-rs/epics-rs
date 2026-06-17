@@ -2169,6 +2169,10 @@ impl RecordInstance {
         // names them, regardless of change — see `Record::log_swept_fields`
         // (the scaler's idle S1..Snch sweep). Empty for most records.
         let log_swept = self.record.log_swept_fields();
+        // Secondary value fields posted with VAL's monitor_mask, gated
+        // inside C's `if (monitor_mask)` (ai RVAL, aiRecord.c:460-465) —
+        // see `Record::fields_posted_with_value_mask`. Empty for most.
+        let value_masked = self.record.fields_posted_with_value_mask();
         let mut sub_updates: Vec<(String, EpicsValue, EventMask)> = Vec::new();
         for (field, subs) in &self.subscribers {
             if !subs.is_empty()
@@ -2183,7 +2187,16 @@ impl RecordInstance {
                         Some(prev) => prev != &val,
                         None => true,
                     };
-                    if changed {
+                    if value_masked.contains(&field.as_str()) {
+                        // C posts this secondary value field with VAL's own
+                        // monitor_mask, nested in `if (monitor_mask)` (ai
+                        // RVAL, aiRecord.c:460-465): only when VAL is posted
+                        // this cycle (deadband_mask non-empty) and the field
+                        // changed — never a forced DBE_VALUE|DBE_LOG.
+                        if changed && !deadband_mask.is_empty() {
+                            sub_updates.push((field.clone(), val, deadband_mask));
+                        }
+                    } else if changed {
                         // A value-only field posts DBE_VALUE (+ this
                         // cycle's alarm bits) without the LOG bit —
                         // `aux_mask` minus LOG is exactly

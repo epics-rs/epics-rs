@@ -611,6 +611,16 @@ impl Record for AiRecord {
     fn soft_channel_skips_convert(&self) -> bool {
         true
     }
+
+    /// C `aiRecord.c:460-465` posts `RVAL` with VAL's own `monitor_mask`,
+    /// nested in `if (monitor_mask)`: RVAL is posted only when VAL is
+    /// posted this cycle (alarm change or MDEL/ADEL crossing) and RVAL
+    /// changed — never with a forced `DBE_VALUE | DBE_LOG`. Under a
+    /// non-default MDEL the raw count can change while VAL stays inside the
+    /// deadband, so RVAL must NOT post on the default aux path.
+    fn fields_posted_with_value_mask(&self) -> &'static [&'static str] {
+        &["RVAL"]
+    }
 }
 
 #[cfg(test)]

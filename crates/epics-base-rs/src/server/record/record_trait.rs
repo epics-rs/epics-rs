@@ -717,6 +717,32 @@ pub trait Record: Send + Sync + 'static {
         &[]
     }
 
+    /// Secondary value fields a record posts with the *primary VAL
+    /// monitor mask*, gated INSIDE C's `if (monitor_mask)` guard — i.e.
+    /// only on a cycle where VAL itself is posted (an alarm change or an
+    /// MDEL/ADEL crossing) AND the field actually changed, NOT a forced
+    /// `DBE_VALUE | DBE_LOG` on every change.
+    ///
+    /// Mirrors C records that drive a raw secondary field with the shared
+    /// `monitor_mask` rather than `monitor_mask | DBE_VALUE | DBE_LOG`. The
+    /// canonical case is `ai` `RVAL`: `db_post_events(prec, &prec->rval,
+    /// monitor_mask)` nested in `if (monitor_mask)` (aiRecord.c:460-465).
+    /// Under a non-default MDEL the raw count (RVAL) can change while VAL
+    /// stays inside the deadband, so C is silent on RVAL that cycle and —
+    /// on an alarm-only cycle — posts RVAL with `DBE_ALARM` alone, never the
+    /// forced `DBE_VALUE | DBE_LOG`.
+    ///
+    /// Distinct from the default change-detected aux post (which carries
+    /// `DBE_VALUE | DBE_LOG` unconditionally): ao `RVAL`/`RBV`, mbbo/
+    /// mbboDirect/mbbiDirect `RVAL`/`RBV`, sel `SELN` and compress `NUSE`
+    /// are all posted by C with the `DBE_VALUE | DBE_LOG`-forced mask, so
+    /// they stay on the default path and must NOT be named here.
+    ///
+    /// Default: empty.
+    fn fields_posted_with_value_mask(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Initialize record (pass 0: field defaults; pass 1: dependent init).
     fn init_record(&mut self, _pass: u8) -> CaResult<()> {
         Ok(())

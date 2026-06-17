@@ -845,15 +845,20 @@ fn test_deadband_alarm_on_change_bypasses_value_deadband() {
 fn test_per_field_masks_narrow_deadband_and_aux_posts() {
     // C posts each field with its own mask in one `db_post_events`
     // call per field; one record-wide mask collapses that. Two rules
-    // pinned here (aiRecord.c `monitor()`; motorRecord.cc:3477-3645):
+    // pinned here (aiRecord.c `monitor()` 460-465):
     //   * the deadband-tracked field narrows to the deadbands that
     //     crossed — ADEL-only crossing posts DBE_LOG, NOT DBE_VALUE,
     //     even when another field changed in the same pass (the
     //     pre-fix record-wide mask leaked that field's DBE_VALUE into
     //     the deadband post, breaking the MDEL throttle for
     //     DBE_VALUE-only subscribers);
-    //   * a change-detected auxiliary field posts DBE_VALUE|DBE_LOG
-    //     (C `monitor_mask | DBE_VALUE | DBE_LOG`, calcRecord.c:420).
+    //   * ai posts RVAL with VAL's OWN monitor_mask, nested in
+    //     `if (monitor_mask)` (aiRecord.c:463) — NOT a forced
+    //     DBE_VALUE|DBE_LOG. With MDEL uncrossed and only ADEL crossed,
+    //     monitor_mask is DBE_LOG, so RVAL posts DBE_LOG alone (a
+    //     DBE_VALUE-only subscriber must not see it). The aux fields C
+    //     posts with `monitor_mask | DBE_VALUE | DBE_LOG` (calc A..L,
+    //     ao RVAL) are a different family, exercised elsewhere.
     use epics_base_rs::server::recgbl::EventMask;
     use epics_base_rs::types::DbFieldType;
     let mut rec = AiRecord::default();
@@ -892,8 +897,9 @@ fn test_per_field_masks_narrow_deadband_and_aux_posts() {
     );
     assert_eq!(
         mask_of("RVAL"),
-        Some(EventMask::VALUE | EventMask::LOG),
-        "change-detected auxiliary field posts DBE_VALUE|DBE_LOG"
+        Some(EventMask::LOG),
+        "ai RVAL posts with VAL's raw monitor_mask (DBE_LOG here, MDEL \
+         uncrossed), not a forced DBE_VALUE|DBE_LOG (aiRecord.c:463)"
     );
 }
 
@@ -956,6 +962,94 @@ fn test_alarm_cycle_does_not_fan_out_for_default_records() {
     assert!(
         !snap.changed_fields.iter().any(|(k, _, _)| k == "RVAL"),
         "ai has no alarm-cycle fanout list: unchanged RVAL must not post"
+    );
+}
+
+#[test]
+fn test_ai_rval_not_posted_when_val_within_deadband() {
+    // C aiRecord.c:460-465 nests the RVAL post inside `if (monitor_mask)`:
+    // when VAL stays within both MDEL and ADEL and no alarm changes,
+    // monitor_mask == 0 and C posts NOTHING — not even a changed RVAL. The
+    // pre-fix port posted RVAL through the generic aux path on any RVAL
+    // change, over-notifying a client monitoring ai.RVAL directly under a
+    // non-default MDEL.
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::types::DbFieldType;
+    let mut rec = AiRecord::default();
+    rec.mdel = 100.0;
+    rec.adel = 100.0;
+    let mut instance = RecordInstance::new("TEST".into(), rec);
+    let _rval_rx = instance
+        .add_subscriber("RVAL", 1, DbFieldType::Long, EventMask::VALUE.bits())
+        .expect("RVAL subscriber");
+    // Priming pass seeds MLST/ALST and last_posted[RVAL].
+    instance.record.set_device_did_compute(true);
+    let _ = instance.process_local().unwrap();
+
+    // VAL 0 -> 1: below MDEL and ADEL (no crossing), no alarm; RVAL 0 -> 42.
+    instance.record.set_val(EpicsValue::Double(1.0)).unwrap();
+    instance
+        .record
+        .put_field("RVAL", EpicsValue::Long(42))
+        .unwrap();
+    instance.record.set_device_did_compute(true);
+    let (snap, _) = instance.process_local().unwrap();
+    assert!(
+        !snap.changed_fields.iter().any(|(k, _, _)| k == "VAL"),
+        "VAL within both deadbands: monitor_mask == 0, VAL not posted"
+    );
+    assert!(
+        !snap.changed_fields.iter().any(|(k, _, _)| k == "RVAL"),
+        "RVAL must not post when monitor_mask == 0 (C nests it in `if(monitor_mask)`)"
+    );
+}
+
+#[test]
+fn test_ai_rval_alarm_only_cycle_posts_alarm_mask_not_value_log() {
+    // On an alarm transition with VAL inside MDEL/ADEL, C monitor_mask is
+    // DBE_ALARM, and ai posts RVAL with that raw mask (aiRecord.c:463) —
+    // DBE_ALARM alone, NOT a forced DBE_VALUE|DBE_LOG. A DBE_VALUE-only
+    // subscriber must not receive the RVAL event.
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::types::DbFieldType;
+    let mut rec = AiRecord::default();
+    rec.mdel = 100.0;
+    rec.adel = 100.0;
+    let mut instance = RecordInstance::new("TEST".into(), rec);
+    instance.common.analog_alarm = Some(AnalogAlarmConfig {
+        hihi: 1000.0,
+        high: 0.5,
+        low: -1000.0,
+        lolo: -2000.0,
+        hhsv: AlarmSeverity::Major,
+        hsv: AlarmSeverity::Major,
+        lsv: AlarmSeverity::Minor,
+        llsv: AlarmSeverity::Major,
+    });
+    let _rval_rx = instance
+        .add_subscriber("RVAL", 1, DbFieldType::Long, EventMask::ALARM.bits())
+        .expect("RVAL subscriber");
+    // Prime at VAL=0 (no alarm), seeding MLST/ALST and last_posted[RVAL].
+    instance.record.set_device_did_compute(true);
+    let _ = instance.process_local().unwrap();
+
+    // VAL=1.0 trips HIGH/Major; VAL stays within MDEL/ADEL of 0; RVAL 0 -> 7.
+    instance.record.set_val(EpicsValue::Double(1.0)).unwrap();
+    instance
+        .record
+        .put_field("RVAL", EpicsValue::Long(7))
+        .unwrap();
+    instance.record.set_device_did_compute(true);
+    let (snap, _) = instance.process_local().unwrap();
+    let rval_mask = snap
+        .changed_fields
+        .iter()
+        .find(|(k, _, _)| k == "RVAL")
+        .map(|(_, _, m)| *m);
+    assert_eq!(
+        rval_mask,
+        Some(EventMask::ALARM),
+        "alarm-only cycle posts RVAL with DBE_ALARM alone (raw monitor_mask), not VALUE|LOG"
     );
 }
 

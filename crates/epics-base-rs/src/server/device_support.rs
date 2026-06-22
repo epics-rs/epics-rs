@@ -206,6 +206,28 @@ pub trait DeviceSupport: Send + Sync + 'static {
         false
     }
 
+    /// Arm an output driver-callback (`asyn:READBACK`) cycle.
+    ///
+    /// Called by [`crate::server::database::PvDatabase::process_record_readback`]
+    /// immediately before the processing pass, mirroring C
+    /// `devAsynInt32.c::outputCallbackCallback` setting
+    /// `newOutputCallbackValue = 1` before `dbProcess`. Pair with
+    /// [`Self::reconcile_readback_callback`]: if the pass never reaches the
+    /// device read stage (the PACT entry guard bails because a put / FLNK
+    /// cycle still owns the record), the armed flag survives and reconcile
+    /// discards the stale callback-ring entry so a callback ring never
+    /// desyncs from the record's pop count. Default no-op — only output
+    /// callback-driven device support (asyn readback) needs it.
+    fn arm_readback_callback(&mut self) {}
+
+    /// Reconcile an armed output driver-callback cycle after processing.
+    ///
+    /// C `outputCallbackCallback` fallback (devEpics `devAsynInt32.c`): after
+    /// `dbProcess`, if `newOutputCallbackValue` is still set the record did
+    /// not process, so `getCallbackValue` is called to drop the stale ring
+    /// entry. Default no-op; see [`Self::arm_readback_callback`].
+    fn reconcile_readback_callback(&mut self) {}
+
     /// Begin an asynchronous write (submit only, no blocking).
     /// Returns `Some(handle)` if the write was submitted to a worker queue —
     /// the caller should wait on the handle outside any record lock.

@@ -392,9 +392,52 @@ impl PvDatabase {
         depth: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
         Box::pin(async move {
-            self.process_record_with_links_inner(name, visited, depth, false, true, true)
-                .await
+            // C `devAsynInt32.c::outputCallbackCallback` (asyn devEpics):
+            // arm the output-callback "expected pop" before dbProcess, then
+            // reconcile after. If this pass never reaches the device read
+            // stage — the PACT entry guard bails because a put / FLNK cycle
+            // still owns the record (e.g. the readback racing the bo's own
+            // put that started the driver) — the callback ring would keep the
+            // entry forever and desync the wakeup count from the pop count.
+            // The AD `Acquire` bo getting stuck at 1 after a fast acquire is
+            // exactly that: the start callback's readback bails on PACT, the
+            // finalize callback's pop then consumes the stale start value, and
+            // the finalize 0 is never popped. reconcile discards the stale
+            // entry (C fallback `getCallbackValue`) so 1 callback == 1 pop.
+            self.arm_readback_callback(name).await;
+            let result = self
+                .process_record_with_links_inner(name, visited, depth, false, true, true)
+                .await;
+            self.reconcile_readback_callback(name).await;
+            result
         })
+    }
+
+    /// Arm the entry record's output driver-callback cycle before a readback
+    /// process pass — see [`crate::server::device_support::DeviceSupport::arm_readback_callback`].
+    async fn arm_readback_callback(&self, name: &str) {
+        let canonical = self.resolve_alias(name).await;
+        let key: &str = canonical.as_deref().unwrap_or(name);
+        let records = self.inner.records.read().await;
+        if let Some(rec) = records.get(key) {
+            if let Some(dev) = rec.write().await.device.as_mut() {
+                dev.arm_readback_callback();
+            }
+        }
+    }
+
+    /// Reconcile the entry record's output driver-callback cycle after a
+    /// readback process pass — see
+    /// [`crate::server::device_support::DeviceSupport::reconcile_readback_callback`].
+    async fn reconcile_readback_callback(&self, name: &str) {
+        let canonical = self.resolve_alias(name).await;
+        let key: &str = canonical.as_deref().unwrap_or(name);
+        let records = self.inner.records.read().await;
+        if let Some(rec) = records.get(key) {
+            if let Some(dev) = rec.write().await.device.as_mut() {
+                dev.reconcile_readback_callback();
+            }
+        }
     }
 
     /// full-processing entry for a caller that already owns the

@@ -3642,6 +3642,7 @@ dependencies = [
  "epics-base-rs",
  "parking_lot",
  "rand 0.9.3",
+ "tokio",
 ]
 
 [[package]]

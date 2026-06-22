@@ -322,6 +322,20 @@ pub struct AsynDeviceSupport {
     /// **only** sent on a fresh-entry add (not on overflow
     /// overwrite) so the dbScan queue does not flood.
     interrupt_fifo: Arc<std::sync::Mutex<InterruptFifo>>,
+    /// C `devAsynInt32.c::newOutputCallbackValue` (asyn devEpics, the
+    /// `devPvt` flag). Set when a driver-callback readback cycle is armed
+    /// (`arm_readback_callback`, mirrors `outputCallbackCallback` setting
+    /// the flag to 1 before `dbProcess`) and cleared the moment the record
+    /// actually reaches its read stage (`read()` clears it, mirroring
+    /// `processBo` clearing the flag). If the cycle never reaches `read()`
+    /// — the PACT entry guard bailed because a put / FLNK cycle still owns
+    /// the record — the flag survives and `reconcile_readback_callback`
+    /// discards the stale ring entry (C `outputCallbackCallback`'s fallback
+    /// `getCallbackValue`), so every output callback consumes exactly one
+    /// ring entry (1 wakeup == 1 pop). Without it a readback that races the
+    /// record's own put leaves the FIFO desynced and the final driver value
+    /// (e.g. AD `Acquire` returning to 0) is never popped.
+    output_callback_pending: bool,
     /// True once the `asynFloat64` ai path has written VAL at least once.
     /// The SMOO filter primes on the first read (C `processAi` skips
     /// smoothing while `pr->udf`, devAsynFloat64.c:599); this is the
@@ -440,6 +454,7 @@ impl AsynDeviceSupport {
             write_only: false,
             interrupt_sub: None,
             interrupt_fifo: Arc::new(std::sync::Mutex::new(InterruptFifo::new())),
+            output_callback_pending: false,
             smoo_primed: false,
             enum_shape: None,
             enum_choices: None,
@@ -1302,6 +1317,12 @@ impl DeviceSupport for AsynDeviceSupport {
         // the FIFO here is the output-record analogue of
         // `processBo`'s `getCallbackValue` readback branch.
         if self.scan == ScanType::IoIntr || self.asyn_readback {
+            // The record reached its read stage, so this driver-callback
+            // cycle processed: clear the armed flag (C `processBo` clears
+            // `newOutputCallbackValue` when it runs). A survived flag after
+            // the cycle means the PACT guard bailed before here, which
+            // `reconcile_readback_callback` then repairs.
+            self.output_callback_pending = false;
             let (entry, overflows) = {
                 let mut fifo = self.interrupt_fifo.lock().unwrap();
                 (fifo.pop(), fifo.take_overflows())
@@ -1578,6 +1599,36 @@ impl DeviceSupport for AsynDeviceSupport {
     /// records (`asyn_readback == false`) keep the SCAN-gated behaviour.
     fn io_intr_scan_independent(&self) -> bool {
         self.asyn_readback
+    }
+
+    fn arm_readback_callback(&mut self) {
+        // C `devAsynInt32.c::outputCallbackCallback` sets
+        // `newOutputCallbackValue = 1` immediately before `dbProcess`. Only
+        // the output-readback path (asyn:READBACK, PRs #60 / #208) carries
+        // the C `newOutputCallbackValue` contract; input I/O-Intr records use
+        // the scan/RPRO reprocess model (`processCommon`), never the discard
+        // fallback, so they are left unarmed and `reconcile` is a no-op there.
+        if self.asyn_readback {
+            self.output_callback_pending = true;
+        }
+    }
+
+    fn reconcile_readback_callback(&mut self) {
+        // C `outputCallbackCallback` after `dbProcess`:
+        //   if (pPvt->newOutputCallbackValue != 0) { getCallbackValue(pPvt);
+        //       pPvt->newOutputCallbackValue = 0; }
+        // The flag still being set means the record never reached its read
+        // stage (the PACT entry guard bailed because a put / FLNK cycle still
+        // owned the record). Discard the oldest ring entry so the callback
+        // ring stays balanced — every armed callback consumes exactly one
+        // entry. `read()` already cleared the flag on the cycles that did
+        // process, so this only fires on a genuine bail.
+        if self.output_callback_pending {
+            if let Ok(mut fifo) = self.interrupt_fifo.lock() {
+                let _ = fifo.pop();
+            }
+            self.output_callback_pending = false;
+        }
     }
 
     fn property_post_receiver(
@@ -2435,6 +2486,85 @@ mod tests {
         let mut rec = LonginRecord::new(0);
         ads.init(&mut rec).unwrap();
         assert_eq!(ads.reason, 0); // "VAL" is param index 0
+    }
+
+    /// The output driver-callback ring must stay balanced: every armed
+    /// readback cycle consumes exactly one ring entry, even when the cycle
+    /// never reaches the read stage. C parity:
+    /// `devAsynInt32.c::outputCallbackCallback` sets `newOutputCallbackValue`
+    /// before `dbProcess` and, if the record did not process (PACT busy),
+    /// calls `getCallbackValue` to discard the ring entry anyway. Without
+    /// this fallback a start callback that bails on the PACT entry guard
+    /// (it raced the bo's own put) leaves its value stranded, the finalize
+    /// callback pops the stale start value, and the finalize value is never
+    /// popped — the AD `Acquire` bo getting stuck at 1 after a fast acquire.
+    /// Boundary cases: bail-with-entries, read-clears-flag, empty-ring,
+    /// and the input gate (non-asyn:READBACK is never armed).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn readback_reconcile_keeps_ring_balanced_on_bail() {
+        use epics_base_rs::server::records::bo::BoRecord;
+
+        fn push(ads: &AsynDeviceSupport, v: i32) {
+            ads.interrupt_fifo
+                .lock()
+                .unwrap()
+                .push_with_overflow(CachedInterrupt {
+                    value: crate::param::ParamValue::Int32(v),
+                    timestamp: SystemTime::UNIX_EPOCH,
+                    alarm_status: 0,
+                    alarm_severity: 0,
+                });
+        }
+        let len = |ads: &AsynDeviceSupport| ads.interrupt_fifo.lock().unwrap().entries.len();
+
+        // asyn:READBACK output adapter; init so reason_set is true (read pops).
+        let mut ads = make_adapter(ScanType::Passive);
+        let mut rec = BoRecord::new(1);
+        ads.init(&mut rec).unwrap();
+        ads.set_asyn_readback(true);
+
+        // Two output callbacks arrive: start=1 then finalize=0.
+        push(&ads, 1);
+        push(&ads, 0);
+        assert_eq!(len(&ads), 2);
+
+        // Cycle 1 — armed but the process bails before read() (the PACT entry
+        // guard fired). reconcile must discard the oldest (start) entry so the
+        // ring stays balanced: one callback == one consumed entry.
+        ads.arm_readback_callback();
+        ads.reconcile_readback_callback();
+        assert_eq!(len(&ads), 1, "a bailed cycle must still consume one entry");
+
+        // Cycle 2 — armed and the process reaches read(): it pops the finalize
+        // 0 into VAL and clears the armed flag, so reconcile is a no-op.
+        ads.arm_readback_callback();
+        ads.read(&mut rec).unwrap();
+        assert_eq!(len(&ads), 0, "read() pops the finalize entry");
+        ads.reconcile_readback_callback();
+        assert_eq!(
+            len(&ads),
+            0,
+            "reconcile after a real read must not double-pop"
+        );
+        assert_eq!(
+            rec.get_field("VAL"),
+            Some(EpicsValue::Enum(0)),
+            "VAL reads the finalize 0 back (Done)"
+        );
+
+        // Empty-ring boundary: an armed bail with nothing queued is a no-op.
+        ads.arm_readback_callback();
+        ads.reconcile_readback_callback();
+        assert_eq!(len(&ads), 0);
+
+        // Input gate: a non-asyn:READBACK device (plain I/O Intr / input) is
+        // never armed, so reconcile must NOT discard — inputs use the
+        // scan/RPRO reprocess model, not the output discard fallback.
+        let mut input = make_adapter(ScanType::IoIntr);
+        push(&input, 9);
+        input.arm_readback_callback();
+        input.reconcile_readback_callback();
+        assert_eq!(len(&input), 1, "input I/O Intr must not discard on a bail");
     }
 
     // --- ai LINEAR ESLO/EOFF from getBounds (C devAsynInt32.c::convertAi) ---

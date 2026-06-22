@@ -24,3 +24,6 @@ required-features = ["ioc"]
 [[example]]
 name = "demo"
 path = "examples/demo.rs"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

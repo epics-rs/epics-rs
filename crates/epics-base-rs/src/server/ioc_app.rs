@@ -1168,8 +1168,11 @@ async fn setup_io_intr(db: Arc<PvDatabase>) -> usize {
                                 continue;
                             }
                             let mut visited = std::collections::HashSet::new();
+                            // Driver-callback cycle: an output (`asyn:READBACK`)
+                            // record reads the value back into VAL and skips the
+                            // device write; input records are unaffected.
                             let _ = db_clone
-                                .process_record_with_links(&rec_name, &mut visited, 0)
+                                .process_record_readback(&rec_name, &mut visited, 0)
                                 .await;
                         }
                     });
@@ -1470,5 +1473,113 @@ mod tests {
         let observed = seen.lock().unwrap().clone();
         assert_eq!(observed.get("asyn:READBACK").map(String::as_str), Some("1"));
         assert_eq!(observed.get("Q:group").map(String::as_str), Some("demo"));
+    }
+
+    /// Regression: an `asyn:READBACK` OUTPUT record processed because of a
+    /// driver interrupt callback must READ the callback value back into VAL
+    /// and MUST NOT write it to the driver. Writing it re-asserts the
+    /// setpoint and re-triggers the driver — the AD `Acquire` loop where a
+    /// single `Acquire 1` produced ~6 acquisitions (`ArrayCounter` ≈ 6,
+    /// `Acquire` stuck at 1). C `devAsynInt32.c::processBo` takes the
+    /// `newOutputCallbackValue` readback branch and never calls
+    /// `processCallbackOutput`'s `write()` on a callback cycle; a
+    /// put/FLNK/scan cycle still writes the setpoint.
+    #[tokio::test]
+    async fn readback_output_cycle_reads_back_and_skips_device_write() {
+        use crate::server::device_support::{DeviceReadOutcome, DeviceSupport};
+        use crate::server::record::ScanType;
+        use crate::server::records::bo::BoRecord;
+        use crate::types::EpicsValue;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Mock asyn-style readback device: read() pushes the driver's
+        // callback value into VAL; write() counts how often the framework
+        // asked it to push VAL back out to the driver.
+        struct ReadbackDev {
+            writes: StdArc<AtomicUsize>,
+            readback_val: u16,
+        }
+        impl DeviceSupport for ReadbackDev {
+            fn dtyp(&self) -> &str {
+                "TestReadback"
+            }
+            // asyn:READBACK records follow driver-side changes regardless of
+            // SCAN (PRs #60/#208) — the trait flag the I/O Intr wiring keys on.
+            fn io_intr_scan_independent(&self) -> bool {
+                true
+            }
+            fn read(
+                &mut self,
+                record: &mut dyn crate::server::record::Record,
+            ) -> CaResult<DeviceReadOutcome> {
+                record.set_val(EpicsValue::Enum(self.readback_val))?;
+                Ok(DeviceReadOutcome::computed())
+            }
+            fn write(&mut self, _record: &mut dyn crate::server::record::Record) -> CaResult<()> {
+                self.writes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn set_record_info(&mut self, _name: &str, _scan: ScanType) {}
+        }
+
+        let writes = StdArc::new(AtomicUsize::new(0));
+        let db = Arc::new(PvDatabase::new());
+        // bo VAL starts at 1 — the setpoint (e.g. Acquire=1).
+        db.add_record("BO:RBK", Box::new(BoRecord::new(1)))
+            .await
+            .unwrap();
+        {
+            let rec = db.get_record("BO:RBK").await.unwrap();
+            let mut inst = rec.write().await;
+            // Non-soft DTYP so the read stage is eligible to run.
+            inst.common.dtyp = "TestReadback".to_string();
+            inst.device = Some(Box::new(ReadbackDev {
+                writes: writes.clone(),
+                readback_val: 0,
+            }));
+        }
+
+        // Driver-callback cycle: the driver reported Acquire=0 (acquisition
+        // done). The record must read 0 back into VAL and must NOT write.
+        {
+            let mut visited = std::collections::HashSet::new();
+            db.process_record_readback("BO:RBK", &mut visited, 0)
+                .await
+                .unwrap();
+        }
+        {
+            let rec = db.get_record("BO:RBK").await.unwrap();
+            let inst = rec.read().await;
+            assert_eq!(
+                inst.record.get_field("VAL"),
+                Some(EpicsValue::Enum(0)),
+                "readback cycle must pull the driver callback value (0) into VAL"
+            );
+        }
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            0,
+            "readback cycle must NOT write VAL back to the driver (no re-trigger)"
+        );
+
+        // Put/scan cycle: a normal process still writes the setpoint to the
+        // driver exactly once (device_callback == false).
+        {
+            let rec = db.get_record("BO:RBK").await.unwrap();
+            let mut inst = rec.write().await;
+            inst.record.put_field("VAL", EpicsValue::Enum(1)).unwrap();
+        }
+        {
+            let mut visited = std::collections::HashSet::new();
+            db.process_record_with_links("BO:RBK", &mut visited, 0)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            1,
+            "a put/scan cycle must write the setpoint to the driver exactly once"
+        );
     }
 }

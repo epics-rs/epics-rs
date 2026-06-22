@@ -393,8 +393,12 @@ impl IocBuilder {
                                     continue;
                                 }
                                 let mut visited = std::collections::HashSet::new();
+                                // Driver-callback cycle: an output
+                                // (`asyn:READBACK`) record reads the value back
+                                // into VAL and skips the device write; input
+                                // records are unaffected.
                                 let _ = db_clone
-                                    .process_record_with_links(&rec_name, &mut visited, 0)
+                                    .process_record_readback(&rec_name, &mut visited, 0)
                                     .await;
                             }
                         });

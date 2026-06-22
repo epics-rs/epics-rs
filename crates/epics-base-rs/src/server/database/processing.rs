@@ -360,7 +360,39 @@ impl PvDatabase {
         depth: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
         Box::pin(async move {
-            self.process_record_with_links_inner(name, visited, depth, false, true)
+            self.process_record_with_links_inner(name, visited, depth, false, true, false)
+                .await
+        })
+    }
+
+    /// Driver-callback (`asyn:READBACK`) full-processing entry.
+    ///
+    /// The single owner of this entry is the I/O Intr wiring
+    /// ([`crate::server::ioc_app::setup_io_intr`] and its `ioc_builder`
+    /// twin): the spawned task processes a record because the driver
+    /// fired an interrupt callback, not because of a client put / FLNK /
+    /// scan. `device_callback = true` tells
+    /// [`Self::process_record_with_links_inner`] that, for an *output*
+    /// record, this cycle must READ the callback value back into VAL and
+    /// MUST NOT write it to the driver — C `devAsynInt32.c::processBo`
+    /// (and `processAo`/`processLongout`/…) take the readback branch when
+    /// `newOutputCallbackValue` is set, never `processCallbackOutput`'s
+    /// `write()`. Without this, the readback re-asserts the setpoint and
+    /// re-triggers the driver (e.g. AD `Acquire` looping). Input records
+    /// (`!can_device_write`) are unaffected: their read stage already
+    /// runs, and the no-write gate is keyed on the record being an output.
+    ///
+    /// Acquires the entry record's advisory write gate exactly like
+    /// [`Self::process_record_with_links`] — the callback task is a
+    /// foreign caller w.r.t. any QSRV atomic group / pvalink epoch.
+    pub fn process_record_readback<'a>(
+        &'a self,
+        name: &'a str,
+        visited: &'a mut HashSet<String>,
+        depth: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
+        Box::pin(async move {
+            self.process_record_with_links_inner(name, visited, depth, false, true, true)
                 .await
         })
     }
@@ -381,7 +413,7 @@ impl PvDatabase {
         depth: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
         Box::pin(async move {
-            self.process_record_with_links_inner(name, visited, depth, false, false)
+            self.process_record_with_links_inner(name, visited, depth, false, false, false)
                 .await
         })
     }
@@ -401,7 +433,7 @@ impl PvDatabase {
         depth: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
         Box::pin(async move {
-            self.process_record_with_links_inner(name, visited, depth, false, false)
+            self.process_record_with_links_inner(name, visited, depth, false, false, false)
                 .await
         })
     }
@@ -429,7 +461,7 @@ impl PvDatabase {
         depth: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaResult<()>> + Send + 'a>> {
         Box::pin(async move {
-            self.process_record_with_links_inner(name, visited, depth, true, true)
+            self.process_record_with_links_inner(name, visited, depth, true, true, false)
                 .await
         })
     }
@@ -707,6 +739,12 @@ impl PvDatabase {
         depth: usize,
         is_continuation: bool,
         acquire_gate: bool,
+        // This cycle is driven by a driver interrupt callback
+        // (`asyn:READBACK` / SCAN="I/O Intr" output), not a put/FLNK/scan.
+        // For an output record it forces the read-back-no-write contract
+        // (C `devAsynInt32.c::processBo` `newOutputCallbackValue` branch).
+        // Always `false` for client/FLNK/scan entries.
+        device_callback: bool,
     ) -> CaResult<()> {
         const MAX_LINK_DEPTH: usize = 16;
         const MAX_LINK_OPS: usize = 256;
@@ -1580,7 +1618,13 @@ impl PvDatabase {
                 && !is_raw_soft
                 && instance.record.soft_channel_skips_convert();
             let mut device_did_compute = (soft_inp_applied && is_soft) || soft_input_skips_convert;
-            if !is_soft && !is_output {
+            // Input records read every cycle (`!is_output`). An OUTPUT record
+            // reads only on a driver-callback (`asyn:READBACK`) cycle: it pulls
+            // the callback value into VAL here and the OUT stage below skips the
+            // write — C `devAsynInt32.c::processBo` `getCallbackValue` readback
+            // branch. A put/FLNK/scan cycle (`device_callback == false`) leaves
+            // the output untouched here and writes below.
+            if !is_soft && (!is_output || device_callback) {
                 if let Some(mut dev) = instance.device.take() {
                     // Push framework-owned common state (PHAS/TSE/TSEL/
                     // UDF) so device support's read() can see it — C
@@ -2050,6 +2094,15 @@ impl PvDatabase {
                 } else {
                     None
                 }
+            } else if device_callback {
+                // Driver-callback (`asyn:READBACK`) cycle on a hardware output:
+                // the new value was read back into VAL by the read stage above;
+                // writing it here would re-assert the setpoint to the driver and
+                // re-trigger it (the AD `Acquire` loop). C
+                // `devAsynInt32.c::processBo` takes the `newOutputCallbackValue`
+                // readback branch and never calls `processCallbackOutput`'s
+                // `write()` on a callback cycle.
+                None
             } else if !record_should_output {
                 // OOPT gating for hardware outputs (longout DTYP=...).
                 // Skip the device write when the OOPT predicate is

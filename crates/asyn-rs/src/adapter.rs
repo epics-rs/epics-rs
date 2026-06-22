@@ -1296,8 +1296,12 @@ impl DeviceSupport for AsynDeviceSupport {
         // For I/O Intr records, pop the oldest entry from the ring
         // buffer. C parity: `devAsynInt32.c::getCallbackValue` —
         // returns the next FIFO entry, logs+resets the overflow
-        // counter on consume.
-        if self.scan == ScanType::IoIntr {
+        // counter on consume. An `asyn:READBACK` output record consumes
+        // from the same ring: the framework calls `read()` on it only on a
+        // driver-callback cycle (`process_record_readback`), so popping
+        // the FIFO here is the output-record analogue of
+        // `processBo`'s `getCallbackValue` readback branch.
+        if self.scan == ScanType::IoIntr || self.asyn_readback {
             let (entry, overflows) = {
                 let mut fifo = self.interrupt_fifo.lock().unwrap();
                 (fifo.pop(), fifo.take_overflows())

@@ -1,5 +1,111 @@
 # Changelog
 
+## v0.20.3 — 2026-06-22
+
+Patch release: 118 C-parity regression fixes plus 5 additive parity
+features on top of `v0.20.2`, one commit per finding (the `fix(...)` /
+`feat(...)` git log is the ledger). The sweep is dominated by a full
+areaDetector plugin pass (`ad-plugins` / `ad-core` against
+`epics-modules/ADCore` and the plugin suite) and the round-5
+record-processing field-output review of `base`. No breaking public API
+changes — one additive `DeviceSupport` trait-method pair (default no-op)
+for the asyn output-callback ring fix.
+
+### ad-plugins (areaDetector)
+
+Round-3 full-plugin parity sweep against the C plugin suite plus an HDF5
+file-writer overhaul:
+
+- **HDF5**: the default layout is the C NeXus tree (not flat `/data`);
+  multi-extra-dimension datasets build N+1 fixed leading axes on the
+  standard and uncompressed-SWMR paths (`configureDims`, via rust-hdf5
+  0.2.21→0.2.23 `write_chunk_at`); N-bit packs a reduced-precision
+  datatype (degrading to lossless when unrepresentable), SZIP uses the
+  nearest-neighbor mask, BLOSC defaults to byte shuffle with the correct
+  `cd_values` slot order; every dataset carries its ndattribute
+  element-attributes, `NDArrayNumDims` / `NDArrayDim*`, and the four
+  self-describing `NDAttr*` attributes; multi-detector frames route by
+  `detector_data_destination`; pre-compressed arrays take a direct chunk
+  write; performance / attribute datasets chunk at the C targets; string
+  attribute datasets are rank-1 fixed-length `H5T_C_S1`.
+- **Codec**: `bslz4` rewritten to the canonical bitshuffle+LZ4 byte
+  format, Blosc `cd_values` use the standard `H5Zblosc` slot order and
+  default clevel 5, and the codec processor is compression-aware so
+  Decompress receives compressed input.
+- **Plugins**: a full `NDPosPlugin` (17 params, XML position parsing,
+  `ExpectedID` stepping, `NDPos_CurrentPos`); ROI / ROIStat color
+  collapse, RGB `dataType`, edge clamping, and rank-dispatched stats;
+  Stats centroid/profile rank guards and `HIST_*` int32 typing; Process
+  auto offset/scale arming the next frame, per-frame flat-field validity,
+  and C clip order; Overlay shape ordinals, independent Cross arms,
+  inclusive Rectangle bounds, and `>=128` text skip; FFT rank from input
+  ndims at padded length; CircularBuff NaN/Inf trigger guard, pre-count
+  validation, octet status, and per-frame trigger posts;
+  Attribute / AttrPlot reset-on-any-write and missing-attribute skip;
+  plus JPEG RGB, Bayer borders, netCDF globals, standalone TimeSeries
+  ingest, Scatter rerouting, and false-color LUTs.
+
+### ad-core
+
+`NDArrayPool::convert` sums binning windows in the target type; RGB→mono
+is unweighted `(R+G+B)/3` truncated; `NDArrayCallbacks=0` withholds
+downstream delivery; plugin output publishes `NDCodec` /
+`NDCompressedSize`; `NDDimensions` post at fixed `ND_ARRAY_MAX_DIMS`; a
+`MinCallbackTime`- or StdArrays-throttled frame is not counted as
+dropped; StdArrays serves its waveform regardless of `NDArrayCallbacks`;
+scatter reroutes past full consumers; `destination_matches` replicates
+`attrIsProcessingRequired`; file-plugin control attrs honor C
+string-typed reads.
+
+### base/db
+
+Round-5 record-processing field-output review, one fix per finding:
+`calc` / `calcout` `VAL` token reads the previous result; `ao`
+Incremental `DOL` increments from `PVAL`; a constant `DOL` is applied
+once at init; a `calcout` `ODLY` delaying cycle defers `FLNK` and
+`VAL` / `OVAL` monitors; `sel` Specified mode fetches only the selected
+input and freezes on a failed fetch; `seq` reads `DOLn` back into `DOn`
+and coerces it; `dfanout` folds an `OUT`-link failure into the same-cycle
+`LINK_ALARM`; `ai` `RVAL` posts with `VAL`'s raw monitor mask; analog
+`checkAlarms` returns early on `UDF`; `waveform` / `aai` / `aao` post
+MPST/APST On-Change with a byte-exact `epicsMemHash`; `fanout` / `seq`
+`SHFT` defaults to -1; `sub` / `aSub` run on the main engine. Plus
+db-load common-field string coercion, `DBF_MENU` label resolution (load +
+runtime), `UTAG` load, array `DBR_GR` / `DBR_CTRL` limit metadata, and
+non-`Double` input-link coercion.
+
+### asyn
+
+Array I/O Intr converts to the record's interface element type; an
+`asyn:READBACK` output record reads the driver callback back into `VAL`
+instead of re-writing it (fixing the AD `Acquire` re-trigger loop), and
+its callback ring stays balanced when the readback races the record's own
+put so the bo returns to Done after a fast acquire (C
+`devAsynInt32.c::outputCallbackCallback`).
+
+### trap-write / std / scaler / bridge
+
+`asTrapWrite` Before/After is owned by an RAII guard that fires AfterWrite
+on every exit path; `devTimeOfDay` formats the TSE-resolved timestamp;
+scaler value-changes post `DBE_VALUE` only; QSRV `String`→integer PUT
+uses C base-0 radix.
+
+### optics / mqtt / procserv (synApps)
+
+`optics`: `Io` flux / absorption-coefficient and scaler-`DESC` parity,
+and `table` YANG offset rotation, limit zeroing, speed restore, and
+Newport user limits. `mqtt`: octet value terminates at the first NUL,
+FLAT STRING stores verbatim, FLAT numeric rejects surrounding whitespace.
+`procserv`: RFC1143 telnet negotiation and manage-procs info-file format.
+
+### tests
+
+`examples/regression-ioc` gains the J–S family batch (event-MASK routing,
+`.PROC` force-process, MS-link alarm propagation, `DBE_PROPERTY` posting,
+duplicate-post suppression, array `DBR_GR` / `DBR_CTRL` limits,
+record-specific `DBF_MENU`, `UTAG`→PVA userTag); `examples/sim-detector`
+gains an end-to-end `Acquire` readback regression.
+
 ## v0.20.2 — 2026-06-15
 
 Patch release: 46 C-parity regression fixes plus 2 additive parity

@@ -74,7 +74,10 @@ impl Default for CompressRecord {
             val: vec![0.0; 1],
             nsam: 1,
             inp: String::new(),
-            alg: 4, // Circular Buffer by default (menuCompressALG_Circular_Buffer)
+            // C `compressRecord.dbd.pod` `field(ALG,DBF_MENU){ menu(compressALG) }`
+            // has no `initial(...)`, so an unset ALG defaults to menu index 0 =
+            // `compressALG_N_to_1_Low_Value`, not Circular Buffer.
+            alg: 0,
             n: 1,
             nuse: 0,
             off: 0,
@@ -689,6 +692,15 @@ mod pbuf_tests {
         assert_eq!(rec.nsam, 1);
         assert_eq!(rec.val.len(), 1, "VAL is the NSAM-length buffer");
         assert_eq!(rec.get_field("NSAM"), Some(EpicsValue::Long(1)));
+    }
+
+    #[test]
+    fn alg_defaults_to_zero_per_absent_dbd_initial() {
+        // C `field(ALG,DBF_MENU){ menu(compressALG) }` has no `initial(...)`,
+        // so an unset ALG is menu index 0 = N-to-1 Low Value, not Circular
+        // Buffer (4).
+        let rec = CompressRecord::default();
+        assert_eq!(rec.alg, 0, "ALG has no C initial -> menu index 0");
     }
 
     /// C `get_array_info` (compressRecord.c:409-431) returns

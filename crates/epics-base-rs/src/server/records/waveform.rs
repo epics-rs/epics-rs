@@ -130,6 +130,14 @@ impl Default for WaveformRecord {
             val: EpicsValue::DoubleArray(Vec::new()),
             nelm: 1,
             nord: 0,
+            // Intentional deviation: C `field(FTVL,DBF_MENU){ menu(menuFtype) }`
+            // (waveform/aai/aao) carries no `initial(...)`, so C defaults FTVL
+            // to menuFtype index 0 = DBF_STRING. The port has no string-array
+            // waveform support (`reallocate_val` has no StringArray branch), so
+            // a STRING default would leave FTVL=STRING with a DoubleArray VAL —
+            // inconsistent. DOUBLE keeps FTVL and the VAL buffer type in sync;
+            // a .db that sets FTVL re-derives VAL via the FTVL put, so this
+            // default only applies to a (degenerate) omitted-FTVL waveform.
             ftvl: MENU_FTYPE_DOUBLE,
             mpst: 0,
             apst: 0,

@@ -246,6 +246,14 @@ pub struct RecordInstance {
     /// post mask. False for every record without the MPST/APST/HASH
     /// mechanism.
     pub(crate) array_hash_changed: bool,
+    /// One-shot "skip the registered subroutine this cycle" signal for aSub
+    /// `LFLG=READ`. The async processing path resolves the `SUBL` link before
+    /// taking this lock; when the resolved name is bad (C `fetch_values` ->
+    /// `S_db_BadSub`) or the link read failed, C `process` runs `do_sub` only
+    /// on `!status`, so the subroutine is skipped. Set by the resolution
+    /// apply, consumed (and cleared) by [`Self::run_registered_subroutine`];
+    /// `false` for every record without a pending bad re-resolution.
+    pub(crate) suppress_subroutine_run: bool,
     /// Generation counter for ReprocessAfter timer cancellation.
     /// Bumped each process cycle. Spawned timers check this to avoid
     /// stale re-processes from accumulated timers.
@@ -342,6 +350,7 @@ impl RecordInstance {
             notify: None,
             last_posted: HashMap::new(),
             array_hash_changed: false,
+            suppress_subroutine_run: false,
             reprocess_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             info: HashMap::new(),
             metadata_cache: StdMutex::new(None),
@@ -1825,6 +1834,16 @@ impl RecordInstance {
     /// main engine path `VAL`/`VALA..VALU`/`OUTA..OUTU` never updated.
     pub(crate) fn run_registered_subroutine(&mut self) -> CaResult<()> {
         use crate::server::recgbl::{self, alarm_status};
+
+        // aSub `LFLG=READ`: a `SUBL` re-resolution that found a bad/unregistered
+        // name (C `fetch_values` -> `S_db_BadSub`) or failed to read the link
+        // signals "skip do_sub this cycle" — C `process` runs `do_sub` only on
+        // `!status`. One-shot: taken (cleared) whether or not a subroutine is
+        // set, so it never leaks into the next cycle. The single consumer of
+        // the flag, shared by every process path.
+        if std::mem::take(&mut self.suppress_subroutine_run) {
+            return Ok(());
+        }
 
         // Clone the Arc so the borrow on `self.subroutine` is released
         // before we mutate `self.record` / `self.common` below.

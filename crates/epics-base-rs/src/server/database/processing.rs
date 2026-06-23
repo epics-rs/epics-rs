@@ -242,6 +242,30 @@ struct AsubDynamicSub {
     skip_run: bool,
 }
 
+/// Apply an aSub LFLG=READ resolution (from
+/// [`PvDatabase::resolve_asub_dynamic_subroutine`]) to a locked record: write
+/// the read-back SNAM, swap the subroutine + set ONAM when the name changed,
+/// and arm the one-shot suppress flag when the name was bad. The single apply
+/// owner, shared by the engine path ([`PvDatabase::process_record_with_links_inner`])
+/// and the foreign path ([`PvDatabase::process_record`]); the skip is consumed
+/// uniformly by `RecordInstance::run_registered_subroutine`.
+fn apply_asub_dynamic_sub(instance: &mut RecordInstance, ds: &AsubDynamicSub) {
+    if let Some(snam) = &ds.snam {
+        let _ = instance
+            .record
+            .put_field("SNAM", EpicsValue::String(snam.as_str().into()));
+    }
+    if let Some(func) = &ds.swap {
+        instance.subroutine = Some(func.clone());
+        if let Some(snam) = &ds.snam {
+            let _ = instance
+                .record
+                .put_field("ONAM", EpicsValue::String(snam.as_str().into()));
+        }
+    }
+    instance.suppress_subroutine_run = ds.skip_run;
+}
+
 /// If a CA TSEL link's pvname targets a record's `.TIME` field, return
 /// the record name with the `.TIME` suffix stripped; otherwise `None`.
 ///
@@ -334,8 +358,19 @@ impl PvDatabase {
             } else {
                 None
             };
+            // aSub LFLG=READ: re-read the subroutine name from the SUBL link
+            // and re-resolve it, before the process lock so the link read
+            // cannot deadlock this record. `process_local` runs the subroutine
+            // internally, so the result is applied to the instance (which arms
+            // the bad-sub skip `run_registered_subroutine` consumes) just
+            // before it. Same single owners as the engine path. `None` for
+            // everything that is not an aSub in READ mode.
+            let asub_dynamic = self.resolve_asub_dynamic_subroutine(&rec).await;
             let (snapshot, alarm_posts) = {
                 let mut instance = rec.write().await;
+                if let Some(ds) = &asub_dynamic {
+                    apply_asub_dynamic_sub(&mut instance, ds);
+                }
                 instance.process_local()?
             };
             // Notify outside lock
@@ -1877,26 +1912,10 @@ impl PvDatabase {
             }
 
             // Apply the aSub LFLG=READ resolution computed above (outside the
-            // lock): write the read-back SNAM, swap the subroutine + set ONAM
-            // when the name changed, and skip running it when the name was bad
-            // (C `fetch_values` returning `S_db_BadSub` → `process` skips
-            // `do_sub`).
-            let mut skip_subroutine = false;
+            // lock). The single apply owner; the bad-sub skip is carried on the
+            // instance and consumed by `run_registered_subroutine`.
             if let Some(ds) = &asub_dynamic {
-                if let Some(snam) = &ds.snam {
-                    let _ = instance
-                        .record
-                        .put_field("SNAM", EpicsValue::String(snam.as_str().into()));
-                }
-                if let Some(func) = &ds.swap {
-                    instance.subroutine = Some(func.clone());
-                    if let Some(snam) = &ds.snam {
-                        let _ = instance
-                            .record
-                            .put_field("ONAM", EpicsValue::String(snam.as_str().into()));
-                    }
-                }
-                skip_subroutine = ds.skip_run;
+                apply_asub_dynamic_sub(&mut instance, ds);
             }
 
             // Invoke the registered subroutine (sub/aSub SNAM) before the
@@ -1905,9 +1924,7 @@ impl PvDatabase {
             // process() is a no-op for sub/aSub), so without this the main
             // engine path — SCAN, event, CA-put-to-PP, FLNK — never ran the
             // subroutine and VAL/VALA..VALU/OUTA..OUTU never updated.
-            if !skip_subroutine {
-                instance.run_registered_subroutine()?;
-            }
+            instance.run_registered_subroutine()?;
 
             // Process
             let mut outcome = instance.record.process()?;

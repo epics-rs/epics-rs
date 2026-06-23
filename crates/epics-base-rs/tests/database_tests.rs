@@ -7808,6 +7808,80 @@ record(aSub, "ASUB_S") {
     );
 }
 
+/// The foreign process path (`process_record` -> `process_local`) re-resolves
+/// aSub LFLG=READ identically to the engine path: the SUBL re-read + swap +
+/// bad-sub skip are shared owners, not engine-path-only.
+#[tokio::test]
+async fn asub_lflg_read_reresolves_on_foreign_process_path() {
+    use epics_base_rs::server::records::asub_record::ASubRecord;
+    use epics_base_rs::server::records::stringout::StringoutRecord;
+    use std::collections::HashMap;
+
+    let db = PvDatabase::new();
+    let mk = |status: i64| -> Arc<SubroutineFn> {
+        Arc::new(Box::new(move |_: &mut dyn Record| Ok(status)) as SubroutineFn)
+    };
+    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    registry.insert("sub_a".into(), mk(11));
+    registry.insert("sub_b".into(), mk(22));
+    db.install_subroutine_registry(registry).await;
+
+    db.add_record("NAME_HOLDER2", Box::new(StringoutRecord::new("sub_a")))
+        .await
+        .unwrap();
+    let mut rec = ASubRecord::default();
+    rec.put_field("LFLG", EpicsValue::Short(1)).unwrap();
+    rec.put_field("SUBL", EpicsValue::String("NAME_HOLDER2".into()))
+        .unwrap();
+    db.add_record("ASUB_F", Box::new(rec)).await.unwrap();
+
+    let val = |db: &PvDatabase| {
+        let db = db.clone();
+        async move {
+            let arc = db.get_record("ASUB_F").await.unwrap();
+            let inst = arc.read().await;
+            inst.record.get_field("VAL")
+        }
+    };
+    let set_name = |db: &PvDatabase, name: &'static str| {
+        let db = db.clone();
+        async move {
+            let arc = db.get_record("NAME_HOLDER2").await.unwrap();
+            let mut inst = arc.write().await;
+            inst.record
+                .put_field("VAL", EpicsValue::String(name.into()))
+                .unwrap();
+        }
+    };
+
+    // Foreign path resolves + runs sub_a.
+    db.process_record("ASUB_F").await.unwrap();
+    assert_eq!(
+        val(&db).await,
+        Some(EpicsValue::Double(11.0)),
+        "foreign path: sub_a resolved and ran"
+    );
+
+    // Repoint -> sub_b: foreign path must re-resolve too.
+    set_name(&db, "sub_b").await;
+    db.process_record("ASUB_F").await.unwrap();
+    assert_eq!(
+        val(&db).await,
+        Some(EpicsValue::Double(22.0)),
+        "foreign path: re-resolved sub_b after the name changed"
+    );
+
+    // Bad sub: foreign path must skip do_sub, VAL frozen (shared one-shot
+    // suppress flag, not an engine-path-only gate).
+    set_name(&db, "missing").await;
+    db.process_record("ASUB_F").await.unwrap();
+    assert_eq!(
+        val(&db).await,
+        Some(EpicsValue::Double(22.0)),
+        "foreign path bad sub: subroutine skipped, VAL frozen"
+    );
+}
+
 /// ao OMSL=closed_loop + OIF=Incremental must add DOL to PVAL (the last
 /// actual output), not the current VAL. C `fetch_value`
 /// (aoRecord.c:447-455) sets `prec->val = prec->pval` before

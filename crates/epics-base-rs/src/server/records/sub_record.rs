@@ -54,6 +54,18 @@ pub struct SubRecord {
     pub inp: [String; INP_ARG_MAX],
     /// Input values `A..U`.
     pub a: [f64; INP_ARG_MAX],
+    /// Monitor / archive deadbands and last-posted trackers. C
+    /// `subRecord.c::monitor` (lines 386-394) gates the `VAL` post on the
+    /// MDEL/ADEL deadbands against MLST/ALST, and `checkAlarms` (319-373)
+    /// tracks LALM for the HIHI/HIGH/LOLO/LOW hysteresis. HIHI/HIGH/LOLO/LOW,
+    /// the HxSV/LxSV severities and HYST are framework-common fields
+    /// (`RecordInstance` allocates an `AnalogAlarmConfig` for `sub`); only
+    /// these record-owned trackers live here, mirroring `calc`.
+    pub mdel: f64,
+    pub adel: f64,
+    pub lalm: f64,
+    pub mlst: f64,
+    pub alst: f64,
 }
 
 impl Default for SubRecord {
@@ -63,6 +75,11 @@ impl Default for SubRecord {
             snam: PvString::new(),
             inp: std::array::from_fn(|_| String::new()),
             a: [0.0; INP_ARG_MAX],
+            mdel: 0.0,
+            adel: 0.0,
+            lalm: 0.0,
+            mlst: 0.0,
+            alst: 0.0,
         }
     }
 }
@@ -77,6 +94,33 @@ static SUB_FIELDS: &[FieldDesc] = &[
         name: "SNAM",
         dbf_type: DbFieldType::String,
         read_only: false,
+    },
+    // Monitor/archive deadbands (client-writable) + last-posted/alarm
+    // trackers (SPC_NOMOD in C, read-only to clients).
+    FieldDesc {
+        name: "MDEL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ADEL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "LALM",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "MLST",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
+    },
+    FieldDesc {
+        name: "ALST",
+        dbf_type: DbFieldType::Double,
+        read_only: true,
     },
     // INPA..INPU
     field_str("INPA"),
@@ -145,6 +189,18 @@ impl Record for SubRecord {
         "sub"
     }
 
+    fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 0 {
+            // C `subRecord.c::init_record` (lines 130-132) seeds the
+            // monitor/archive/alarm trackers from the loaded VAL so the
+            // first process does not post or alarm on an unchanged value.
+            self.mlst = self.val;
+            self.alst = self.val;
+            self.lalm = self.val;
+        }
+        Ok(())
+    }
+
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         // The subroutine is invoked by the framework via
         // `RecordInstance::subroutine` (it needs the registry of
@@ -156,6 +212,11 @@ impl Record for SubRecord {
         match name {
             "VAL" => return Some(EpicsValue::Double(self.val)),
             "SNAM" => return Some(EpicsValue::String(self.snam.clone())),
+            "MDEL" => return Some(EpicsValue::Double(self.mdel)),
+            "ADEL" => return Some(EpicsValue::Double(self.adel)),
+            "LALM" => return Some(EpicsValue::Double(self.lalm)),
+            "MLST" => return Some(EpicsValue::Double(self.mlst)),
+            "ALST" => return Some(EpicsValue::Double(self.alst)),
             _ => {}
         }
         if let Some(idx) = INP_NAMES.iter().position(|&n| n == name) {
@@ -186,6 +247,20 @@ impl Record for SubRecord {
                     }
                     _ => Err(CaError::TypeMismatch("SNAM".into())),
                 };
+            }
+            "MDEL" | "ADEL" | "LALM" | "MLST" | "ALST" => {
+                let v = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch(name.into()))?;
+                match name {
+                    "MDEL" => self.mdel = v,
+                    "ADEL" => self.adel = v,
+                    "LALM" => self.lalm = v,
+                    "MLST" => self.mlst = v,
+                    "ALST" => self.alst = v,
+                    _ => unreachable!(),
+                }
+                return Ok(());
             }
             _ => {}
         }
@@ -240,5 +315,29 @@ mod tests {
     fn twenty_one_multi_input_links() {
         let rec = SubRecord::default();
         assert_eq!(rec.multi_input_links().len(), 21);
+    }
+
+    /// The monitor/archive deadbands and the LALM/MLST/ALST trackers
+    /// round-trip through get/put (C `subRecord.c` MDEL/ADEL/LALM/MLST/ALST).
+    #[test]
+    fn deadband_and_tracker_fields_round_trip() {
+        let mut rec = SubRecord::default();
+        for name in ["MDEL", "ADEL", "LALM", "MLST", "ALST"] {
+            rec.put_field(name, EpicsValue::Double(3.5)).unwrap();
+            assert_eq!(rec.get_field(name), Some(EpicsValue::Double(3.5)));
+        }
+    }
+
+    /// `init_record(0)` seeds MLST/ALST/LALM from the loaded VAL so the
+    /// first process does not post or alarm on an unchanged value
+    /// (C `subRecord.c::init_record` lines 130-132).
+    #[test]
+    fn init_seeds_trackers_from_val() {
+        let mut rec = SubRecord::default();
+        rec.put_field("VAL", EpicsValue::Double(7.0)).unwrap();
+        rec.init_record(0).unwrap();
+        assert_eq!(rec.get_field("MLST"), Some(EpicsValue::Double(7.0)));
+        assert_eq!(rec.get_field("ALST"), Some(EpicsValue::Double(7.0)));
+        assert_eq!(rec.get_field("LALM"), Some(EpicsValue::Double(7.0)));
     }
 }

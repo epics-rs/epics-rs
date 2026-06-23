@@ -316,10 +316,11 @@ impl RecordInstance {
             // because `self.common.analog_alarm` was None at the
             // mutation site. Confirmed via
             // calcRecord.dbd.pod:716-744 (HIHI..LLSV) and
-            // calcoutRecord.dbd.pod:1103+ (same).
-            "ai" | "ao" | "longin" | "longout" | "int64in" | "int64out" | "calc" | "calcout" => {
-                Some(AnalogAlarmConfig::default())
-            }
+            // calcoutRecord.dbd.pod:1103+ (same). `sub` carries the same
+            // HIHI/HIGH/LOLO/LOW + HHSV/HSV/LSV/LLSV set
+            // (subRecord.dbd.pod:569-642) and runs the analog `checkAlarms`.
+            "ai" | "ao" | "longin" | "longout" | "int64in" | "int64out" | "calc" | "calcout"
+            | "sub" => Some(AnalogAlarmConfig::default()),
             _ => None,
         };
         let mut common = CommonFields::default();
@@ -1653,7 +1654,8 @@ impl RecordInstance {
         }
 
         match rtype {
-            "ai" | "ao" | "longin" | "longout" | "int64in" | "int64out" | "calc" | "calcout" => {
+            "ai" | "ao" | "longin" | "longout" | "int64in" | "int64out" | "calc" | "calcout"
+            | "sub" => {
                 if let Some(ref alarm_cfg) = self.common.analog_alarm.clone() {
                     let val = match self.record.val() {
                         Some(EpicsValue::Double(v)) => v,

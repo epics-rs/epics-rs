@@ -7161,6 +7161,137 @@ async fn sub_record_subroutine_runs_on_main_engine_path() {
     }
 }
 
+/// A `sub` record must run the shared analog `checkAlarms` (HIHI/HIGH/
+/// LOLO/LOW with HYST + LALM). C `subRecord.c::checkAlarms` (lines 319-373)
+/// is the standard analog limit check; the Rust port previously gave `sub`
+/// no limit fields and skipped the analog-alarm owner entirely, so a `sub`
+/// whose subroutine drove VAL past HIHI never alarmed (R5-1c).
+#[tokio::test]
+async fn sub_record_hihi_alarm_fires_via_shared_owner() {
+    use epics_base_rs::server::recgbl::alarm_status;
+    use epics_base_rs::server::records::sub_record::SubRecord;
+
+    let db = PvDatabase::new();
+
+    // FIRE: subroutine drives VAL to 100, HIHI=50/Major -> HIHI_ALARM.
+    db.add_record("SUB_HIHI", Box::new(SubRecord::default()))
+        .await
+        .unwrap();
+    // CONTROL: same VAL=100 but HIHI=200 -> no alarm, LALM tracks VAL.
+    db.add_record("SUB_OK", Box::new(SubRecord::default()))
+        .await
+        .unwrap();
+
+    for (name, hihi) in [("SUB_HIHI", 50.0), ("SUB_OK", 200.0)] {
+        let arc = db.get_record(name).await.unwrap();
+        let mut inst = arc.write().await;
+        inst.put_common_field("HIHI", EpicsValue::Double(hihi))
+            .unwrap();
+        inst.put_common_field("HHSV", EpicsValue::Short(AlarmSeverity::Major as i16))
+            .unwrap();
+        let sub_fn: SubroutineFn = Box::new(|record: &mut dyn Record| {
+            record.put_field("VAL", EpicsValue::Double(100.0))?;
+            Ok(())
+        });
+        inst.subroutine = Some(Arc::new(sub_fn));
+    }
+
+    for name in ["SUB_HIHI", "SUB_OK"] {
+        let mut visited = HashSet::new();
+        db.process_record_with_links(name, &mut visited, 0)
+            .await
+            .unwrap();
+    }
+
+    // FIRE record: severity Major, stat HIHI_ALARM, LALM pinned to the
+    // crossed threshold (C sets `prec->lalm = alev`).
+    {
+        let arc = db.get_record("SUB_HIHI").await.unwrap();
+        let inst = arc.read().await;
+        assert_eq!(
+            inst.common.sevr,
+            AlarmSeverity::Major,
+            "sub VAL=100 over HIHI=50 must raise MAJOR"
+        );
+        assert_eq!(
+            inst.common.stat,
+            alarm_status::HIHI_ALARM,
+            "sub over-HIHI must surface as HIHI_ALARM"
+        );
+        assert_eq!(
+            inst.record.get_field("LALM"),
+            Some(EpicsValue::Double(50.0)),
+            "C parity: LALM pins to the crossed alarm threshold (HIHI=50)"
+        );
+    }
+    // CONTROL record: no alarm, LALM tracks the current VAL.
+    {
+        let arc = db.get_record("SUB_OK").await.unwrap();
+        let inst = arc.read().await;
+        assert_eq!(
+            inst.common.sevr,
+            AlarmSeverity::NoAlarm,
+            "sub VAL=100 under HIHI=200 must not alarm"
+        );
+        assert_eq!(
+            inst.record.get_field("LALM"),
+            Some(EpicsValue::Double(100.0)),
+            "C parity: no alarm leaves LALM = current VAL"
+        );
+    }
+}
+
+/// A `sub` record must gate the `VAL` monitor on MDEL (C `subRecord.c::
+/// monitor` lines 386-394, `recGblCheckDeadband` against MLST). Before
+/// R5-1c the record carried no MDEL/MLST, so the deadband owner saw
+/// `mdel=0` and posted on every change. MLST tracks the last posted value,
+/// so it is the observable witness of the deadband decision.
+#[tokio::test]
+async fn sub_record_mdel_gates_val_monitor() {
+    use epics_base_rs::server::records::sub_record::SubRecord;
+
+    let db = PvDatabase::new();
+    let mut rec = SubRecord::default();
+    rec.val = 100.0;
+    rec.mdel = 10.0;
+    rec.init_record(0).unwrap(); // MLST seeded to 100
+    db.add_record("SUB_MDEL", Box::new(rec)).await.unwrap();
+
+    // Helper: set VAL directly (no subroutine), process, read back MLST.
+    async fn drive(db: &PvDatabase, val: f64) -> f64 {
+        {
+            let arc = db.get_record("SUB_MDEL").await.unwrap();
+            let mut inst = arc.write().await;
+            inst.record
+                .put_field("VAL", EpicsValue::Double(val))
+                .unwrap();
+        }
+        let mut visited = HashSet::new();
+        db.process_record_with_links("SUB_MDEL", &mut visited, 0)
+            .await
+            .unwrap();
+        let arc = db.get_record("SUB_MDEL").await.unwrap();
+        let inst = arc.read().await;
+        inst.record
+            .get_field("MLST")
+            .and_then(|v| v.to_f64())
+            .unwrap()
+    }
+
+    // Change 5 (< MDEL=10) from MLST=100: no monitor, MLST frozen at 100.
+    assert_eq!(
+        drive(&db, 105.0).await,
+        100.0,
+        "VAL change below MDEL must NOT post (MLST stays at last-posted 100)"
+    );
+    // Change 15 (>= MDEL=10) from MLST=100: monitor posts, MLST -> 115.
+    assert_eq!(
+        drive(&db, 115.0).await,
+        115.0,
+        "VAL change at/over MDEL must post and advance MLST to 115"
+    );
+}
+
 /// ao OMSL=closed_loop + OIF=Incremental must add DOL to PVAL (the last
 /// actual output), not the current VAL. C `fetch_value`
 /// (aoRecord.c:447-455) sets `prec->val = prec->pval` before

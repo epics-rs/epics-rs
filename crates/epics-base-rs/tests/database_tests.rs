@@ -8244,3 +8244,62 @@ async fn promptgroup_config_fields_load_settable_runtime_immutable() {
     let indx = rec.read().await.record.get_field("INDX");
     assert_eq!(indx, Some(EpicsValue::Long(2)), "runtime INDX caput landed");
 }
+
+/// NELM/FTVL runtime-writability must follow each ArrayKind's C dbd, even though
+/// waveform/aai/aao/subArray share one `WaveformRecord`. `field_list()` selects a
+/// kind-correct FieldDesc set so the field_io read_only gate blocks/allows the
+/// right caputs:
+///   - waveform/aai/aao NELM, FTVL: `special(SPC_NOMOD)` -> runtime-immutable.
+///   - subArray NELM: `pp(TRUE)` -> runtime-writable; subArray FTVL: SPC_NOMOD.
+/// Load (apply_fields) stays settable for all of them (SPC_NOMOD blocks only
+/// runtime dbPutField).
+#[tokio::test]
+async fn waveform_nelm_ftvl_runtime_immutable_subarray_nelm_writable() {
+    use epics_base_rs::server::db_loader::{apply_fields, create_record};
+
+    // Load still sets NELM/FTVL on a waveform (SPC_NOMOD is runtime-only).
+    let mut wf = create_record("waveform").expect("create waveform");
+    let mut common: Vec<(String, EpicsValue)> = Vec::new();
+    apply_fields(&mut wf, &[("NELM".into(), "4".into())], &mut common)
+        .expect("waveform NELM is .db-settable at load");
+    assert_eq!(wf.get_field("NELM"), Some(EpicsValue::Long(4)));
+
+    let db = PvDatabase::new();
+    db.add_record("WF", create_record("waveform").unwrap())
+        .await
+        .unwrap();
+    db.add_record("SA", create_record("subArray").unwrap())
+        .await
+        .unwrap();
+
+    // waveform/aai/aao: NELM and FTVL are SPC_NOMOD — runtime caput rejected.
+    assert!(
+        matches!(
+            db.put_record_field_from_ca("WF", "NELM", EpicsValue::Long(4))
+                .await,
+            Err(CaError::ReadOnlyField(_))
+        ),
+        "waveform NELM is special(SPC_NOMOD) — runtime caput must be rejected"
+    );
+    assert!(
+        matches!(
+            db.put_record_field_from_ca("WF", "FTVL", EpicsValue::Short(2))
+                .await,
+            Err(CaError::ReadOnlyField(_))
+        ),
+        "waveform FTVL is special(SPC_NOMOD) — runtime caput must be rejected"
+    );
+
+    // subArray: NELM is pp(TRUE) — runtime caput accepted; FTVL stays SPC_NOMOD.
+    db.put_record_field_from_ca("SA", "NELM", EpicsValue::Long(3))
+        .await
+        .expect("subArray NELM is pp(TRUE) — runtime caput must succeed");
+    assert!(
+        matches!(
+            db.put_record_field_from_ca("SA", "FTVL", EpicsValue::Short(2))
+                .await,
+            Err(CaError::ReadOnlyField(_))
+        ),
+        "subArray FTVL is special(SPC_NOMOD) — runtime caput must be rejected"
+    );
+}

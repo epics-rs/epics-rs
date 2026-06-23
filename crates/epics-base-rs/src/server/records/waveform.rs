@@ -331,7 +331,7 @@ static WAVEFORM_FIELDS_CHAR: &[FieldDesc] = &[
     FieldDesc {
         name: "NELM",
         dbf_type: DbFieldType::Long,
-        read_only: false,
+        read_only: true,
     },
     FieldDesc {
         name: "NORD",
@@ -341,7 +341,7 @@ static WAVEFORM_FIELDS_CHAR: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVL",
         dbf_type: DbFieldType::Short,
-        read_only: false,
+        read_only: true,
     },
     // Display/control metadata fields. Typed storage + get_field/put_field
     // already back these; they MUST be in field_list so the db loader applies
@@ -367,18 +367,6 @@ static WAVEFORM_FIELDS_CHAR: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    // subArray-only (MALM/INDX); see `field_list()` for why these live in every
-    // FTVL-keyed array. MALM `special(SPC_NOMOD)`, INDX `pp(TRUE)`.
-    FieldDesc {
-        name: "MALM",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INDX",
-        dbf_type: DbFieldType::Long,
         read_only: false,
     },
 ];
@@ -392,7 +380,7 @@ static WAVEFORM_FIELDS_SHORT: &[FieldDesc] = &[
     FieldDesc {
         name: "NELM",
         dbf_type: DbFieldType::Long,
-        read_only: false,
+        read_only: true,
     },
     FieldDesc {
         name: "NORD",
@@ -402,7 +390,7 @@ static WAVEFORM_FIELDS_SHORT: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVL",
         dbf_type: DbFieldType::Short,
-        read_only: false,
+        read_only: true,
     },
     // Display/control metadata fields. Typed storage + get_field/put_field
     // already back these; they MUST be in field_list so the db loader applies
@@ -428,18 +416,6 @@ static WAVEFORM_FIELDS_SHORT: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    // subArray-only (MALM/INDX); see `field_list()` for why these live in every
-    // FTVL-keyed array. MALM `special(SPC_NOMOD)`, INDX `pp(TRUE)`.
-    FieldDesc {
-        name: "MALM",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INDX",
-        dbf_type: DbFieldType::Long,
         read_only: false,
     },
 ];
@@ -453,7 +429,7 @@ static WAVEFORM_FIELDS_LONG: &[FieldDesc] = &[
     FieldDesc {
         name: "NELM",
         dbf_type: DbFieldType::Long,
-        read_only: false,
+        read_only: true,
     },
     FieldDesc {
         name: "NORD",
@@ -463,7 +439,7 @@ static WAVEFORM_FIELDS_LONG: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVL",
         dbf_type: DbFieldType::Short,
-        read_only: false,
+        read_only: true,
     },
     // Display/control metadata fields. Typed storage + get_field/put_field
     // already back these; they MUST be in field_list so the db loader applies
@@ -489,18 +465,6 @@ static WAVEFORM_FIELDS_LONG: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    // subArray-only (MALM/INDX); see `field_list()` for why these live in every
-    // FTVL-keyed array. MALM `special(SPC_NOMOD)`, INDX `pp(TRUE)`.
-    FieldDesc {
-        name: "MALM",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INDX",
-        dbf_type: DbFieldType::Long,
         read_only: false,
     },
 ];
@@ -514,7 +478,7 @@ static WAVEFORM_FIELDS_INT64: &[FieldDesc] = &[
     FieldDesc {
         name: "NELM",
         dbf_type: DbFieldType::Long,
-        read_only: false,
+        read_only: true,
     },
     FieldDesc {
         name: "NORD",
@@ -524,7 +488,7 @@ static WAVEFORM_FIELDS_INT64: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVL",
         dbf_type: DbFieldType::Short,
-        read_only: false,
+        read_only: true,
     },
     // Display/control metadata fields. Typed storage + get_field/put_field
     // already back these; they MUST be in field_list so the db loader applies
@@ -550,18 +514,6 @@ static WAVEFORM_FIELDS_INT64: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    // subArray-only (MALM/INDX); see `field_list()` for why these live in every
-    // FTVL-keyed array. MALM `special(SPC_NOMOD)`, INDX `pp(TRUE)`.
-    FieldDesc {
-        name: "MALM",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INDX",
-        dbf_type: DbFieldType::Long,
         read_only: false,
     },
 ];
@@ -575,7 +527,7 @@ static WAVEFORM_FIELDS_UINT64: &[FieldDesc] = &[
     FieldDesc {
         name: "NELM",
         dbf_type: DbFieldType::Long,
-        read_only: false,
+        read_only: true,
     },
     FieldDesc {
         name: "NORD",
@@ -585,7 +537,7 @@ static WAVEFORM_FIELDS_UINT64: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVL",
         dbf_type: DbFieldType::Short,
-        read_only: false,
+        read_only: true,
     },
     // Display/control metadata fields. Typed storage + get_field/put_field
     // already back these; they MUST be in field_list so the db loader applies
@@ -611,18 +563,6 @@ static WAVEFORM_FIELDS_UINT64: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    // subArray-only (MALM/INDX); see `field_list()` for why these live in every
-    // FTVL-keyed array. MALM `special(SPC_NOMOD)`, INDX `pp(TRUE)`.
-    FieldDesc {
-        name: "MALM",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INDX",
-        dbf_type: DbFieldType::Long,
         read_only: false,
     },
 ];
@@ -636,7 +576,7 @@ static WAVEFORM_FIELDS_FLOAT: &[FieldDesc] = &[
     FieldDesc {
         name: "NELM",
         dbf_type: DbFieldType::Long,
-        read_only: false,
+        read_only: true,
     },
     FieldDesc {
         name: "NORD",
@@ -646,7 +586,7 @@ static WAVEFORM_FIELDS_FLOAT: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVL",
         dbf_type: DbFieldType::Short,
-        read_only: false,
+        read_only: true,
     },
     // Display/control metadata fields. Typed storage + get_field/put_field
     // already back these; they MUST be in field_list so the db loader applies
@@ -672,18 +612,6 @@ static WAVEFORM_FIELDS_FLOAT: &[FieldDesc] = &[
     FieldDesc {
         name: "PREC",
         dbf_type: DbFieldType::Short,
-        read_only: false,
-    },
-    // subArray-only (MALM/INDX); see `field_list()` for why these live in every
-    // FTVL-keyed array. MALM `special(SPC_NOMOD)`, INDX `pp(TRUE)`.
-    FieldDesc {
-        name: "MALM",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INDX",
-        dbf_type: DbFieldType::Long,
         read_only: false,
     },
 ];
@@ -697,7 +625,7 @@ static WAVEFORM_FIELDS_DOUBLE: &[FieldDesc] = &[
     FieldDesc {
         name: "NELM",
         dbf_type: DbFieldType::Long,
-        read_only: false,
+        read_only: true,
     },
     FieldDesc {
         name: "NORD",
@@ -707,7 +635,7 @@ static WAVEFORM_FIELDS_DOUBLE: &[FieldDesc] = &[
     FieldDesc {
         name: "FTVL",
         dbf_type: DbFieldType::Short,
-        read_only: false,
+        read_only: true,
     },
     // Display/control metadata fields. Typed storage + get_field/put_field
     // already back these; they MUST be in field_list so the db loader applies
@@ -735,19 +663,79 @@ static WAVEFORM_FIELDS_DOUBLE: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
-    // subArray-only (MALM/INDX); see `field_list()` for why these live in every
-    // FTVL-keyed array. MALM `special(SPC_NOMOD)`, INDX `pp(TRUE)`.
-    FieldDesc {
-        name: "MALM",
-        dbf_type: DbFieldType::Long,
-        read_only: true,
-    },
-    FieldDesc {
-        name: "INDX",
-        dbf_type: DbFieldType::Long,
-        read_only: false,
-    },
 ];
+
+// subArray field set. subArray shares the `WaveformRecord` struct but its C dbd
+// differs from waveform/aai/aao: NELM is `pp(TRUE)` (runtime-writable) instead of
+// `special(SPC_NOMOD)`, and MALM (`special(SPC_NOMOD)`) / INDX (`pp(TRUE)`) exist.
+// FTVL/NORD stay `special(SPC_NOMOD)` (load-settable, runtime-immutable) as in
+// every kind. `field_list()` returns this set when `kind == SubArray`, so the
+// FieldDesc `read_only` flag is kind-correct by construction — it stays the single
+// source the field_io runtime gate reads, with no per-kind runtime override.
+macro_rules! subarray_field_list {
+    ($valty:expr) => {
+        &[
+            FieldDesc {
+                name: "VAL",
+                dbf_type: $valty,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "NELM",
+                dbf_type: DbFieldType::Long,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "NORD",
+                dbf_type: DbFieldType::Long,
+                read_only: true,
+            },
+            FieldDesc {
+                name: "FTVL",
+                dbf_type: DbFieldType::Short,
+                read_only: true,
+            },
+            FieldDesc {
+                name: "EGU",
+                dbf_type: DbFieldType::String,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "HOPR",
+                dbf_type: DbFieldType::Double,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "LOPR",
+                dbf_type: DbFieldType::Double,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "PREC",
+                dbf_type: DbFieldType::Short,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "MALM",
+                dbf_type: DbFieldType::Long,
+                read_only: true,
+            },
+            FieldDesc {
+                name: "INDX",
+                dbf_type: DbFieldType::Long,
+                read_only: false,
+            },
+        ]
+    };
+}
+
+static SUBARRAY_FIELDS_CHAR: &[FieldDesc] = subarray_field_list!(DbFieldType::Char);
+static SUBARRAY_FIELDS_SHORT: &[FieldDesc] = subarray_field_list!(DbFieldType::Short);
+static SUBARRAY_FIELDS_LONG: &[FieldDesc] = subarray_field_list!(DbFieldType::Long);
+static SUBARRAY_FIELDS_INT64: &[FieldDesc] = subarray_field_list!(DbFieldType::Int64);
+static SUBARRAY_FIELDS_UINT64: &[FieldDesc] = subarray_field_list!(DbFieldType::UInt64);
+static SUBARRAY_FIELDS_FLOAT: &[FieldDesc] = subarray_field_list!(DbFieldType::Float);
+static SUBARRAY_FIELDS_DOUBLE: &[FieldDesc] = subarray_field_list!(DbFieldType::Double);
 
 impl Record for WaveformRecord {
     fn record_type(&self) -> &'static str {
@@ -1086,18 +1074,26 @@ impl Record for WaveformRecord {
         }
     }
 
-    // `field_list` is keyed by FTVL element type, not by `ArrayKind` — one set
-    // of typed arrays is shared across the waveform/aai/aao/subArray kinds. The
-    // subArray-only fields MALM/INDX therefore live in every typed array (the
-    // `get_field`/`put_field` arms gate them on `ArrayKind::SubArray`, so they
-    // are inert for the other kinds, and `dbpr` skips the `None` they return).
-    // They MUST be in `field_list` so `db_loader::apply_fields` routes a
-    // `field(MALM/INDX, ...)` `.db` assignment to record storage instead of
-    // dropping it into common fields. C `subArrayRecord.dbd.pod`: MALM is
-    // `special(SPC_NOMOD)` (settable at load, runtime-immutable via the field_io
-    // `read_only` gate, hence `read_only: true`); INDX is `pp(TRUE)`
-    // (`read_only: false`, writable on both paths).
+    // `field_list` is keyed first by `ArrayKind`, then by FTVL element type.
+    // waveform/aai/aao use the `WAVEFORM_FIELDS_*` set; subArray uses the
+    // `SUBARRAY_FIELDS_*` set. The two differ only where the C dbd does: NELM is
+    // `special(SPC_NOMOD)` (`read_only: true`) for waveform/aai/aao but `pp(TRUE)`
+    // (`read_only: false`) for subArray, and MALM/INDX exist only on subArray.
+    // Selecting the set by kind makes the FieldDesc `read_only` flag kind-correct
+    // by construction, so it stays the single source the field_io runtime gate
+    // (`put_record_field_from_ca_inner`) reads — no per-kind runtime override.
     fn field_list(&self) -> &'static [FieldDesc] {
+        if matches!(self.kind, ArrayKind::SubArray) {
+            return match self.ftvl {
+                1 | 2 => SUBARRAY_FIELDS_CHAR,
+                3 | 4 => SUBARRAY_FIELDS_SHORT,
+                5 | 6 => SUBARRAY_FIELDS_LONG,
+                7 => SUBARRAY_FIELDS_INT64,
+                8 => SUBARRAY_FIELDS_UINT64,
+                9 => SUBARRAY_FIELDS_FLOAT,
+                _ => SUBARRAY_FIELDS_DOUBLE,
+            };
+        }
         match self.ftvl {
             1 | 2 => WAVEFORM_FIELDS_CHAR,
             3 | 4 => WAVEFORM_FIELDS_SHORT,

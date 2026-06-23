@@ -1,5 +1,5 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
+use crate::server::record::{FieldDesc, FieldMetadataOverride, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Number of aSub channels. C `aSubRecord.c`: `NUM_ARGS == 21`
@@ -59,6 +59,11 @@ pub struct ASubRecord {
     /// subroutine returns a negative status (applied by the framework's
     /// `run_registered_subroutine`, which also publishes the status as VAL).
     pub brsv: i16,
+    /// Display precision `PREC` for VAL. C `aSubRecord.c::get_precision`
+    /// returns `prec->prec` as the precision of VAL (and any non-link field);
+    /// the per-channel value fields use their link's precision, which the port
+    /// does not track.
+    pub prec: i16,
 }
 
 impl Default for ASubRecord {
@@ -78,6 +83,7 @@ impl Default for ASubRecord {
             nea: [1; NUM_ARGS],
             neva: [1; NUM_ARGS],
             brsv: 0,
+            prec: 0,
         }
     }
 }
@@ -153,6 +159,11 @@ impl ASubRecord {
             },
             FieldDesc {
                 name: "BRSV",
+                dbf_type: DbFieldType::Short,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "PREC",
                 dbf_type: DbFieldType::Short,
                 read_only: false,
             },
@@ -232,6 +243,7 @@ impl Record for ASubRecord {
             "SNAM" => return Some(EpicsValue::String(self.snam.clone())),
             "INAM" => return Some(EpicsValue::String(self.inam.clone())),
             "BRSV" => return Some(EpicsValue::Short(self.brsv)),
+            "PREC" => return Some(EpicsValue::Short(self.prec)),
             _ => {}
         }
         let (prefix, idx) = parse_channel(name)?;
@@ -280,6 +292,13 @@ impl Record for ASubRecord {
                 self.brsv = value
                     .to_f64()
                     .ok_or_else(|| CaError::TypeMismatch("BRSV".into()))?
+                    as i16;
+                return Ok(());
+            }
+            "PREC" => {
+                self.prec = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("PREC".into()))?
                     as i16;
                 return Ok(());
             }
@@ -337,6 +356,20 @@ impl Record for ASubRecord {
         use std::sync::OnceLock;
         static FIELDS: OnceLock<Vec<FieldDesc>> = OnceLock::new();
         FIELDS.get_or_init(ASubRecord::descriptors)
+    }
+
+    fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
+        // C `aSubRecord.c::get_precision` reports `prec->prec` as VAL's display
+        // precision. (The per-channel value fields use their link's precision
+        // in C; the port does not model per-link precision, so only VAL is
+        // served here.)
+        if field.eq_ignore_ascii_case("VAL") {
+            return Some(FieldMetadataOverride {
+                precision: Some(self.prec),
+                ..Default::default()
+            });
+        }
+        None
     }
 
     fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
@@ -407,6 +440,28 @@ mod tests {
     fn twenty_one_multi_input_links() {
         let rec = ASubRecord::default();
         assert_eq!(rec.multi_input_links().len(), 21);
+    }
+
+    /// PREC round-trips and is served as VAL's display precision (C
+    /// `aSubRecord.c::get_precision` returns `prec->prec` for VAL).
+    #[test]
+    fn prec_round_trips_and_serves_val_precision() {
+        let mut rec = ASubRecord::default();
+        assert_eq!(rec.get_field("PREC"), Some(EpicsValue::Short(0)));
+        assert_eq!(
+            rec.field_metadata_override("VAL").and_then(|o| o.precision),
+            Some(0)
+        );
+
+        rec.put_field("PREC", EpicsValue::Short(4)).unwrap();
+        assert_eq!(rec.get_field("PREC"), Some(EpicsValue::Short(4)));
+        assert_eq!(
+            rec.field_metadata_override("VAL").and_then(|o| o.precision),
+            Some(4),
+            "PREC must be served as VAL display precision"
+        );
+        // Non-VAL fields carry no precision override.
+        assert!(rec.field_metadata_override("SNAM").is_none());
     }
 
     /// BRSV round-trips as a `menuAlarmSevr` index (C `aSubRecord.c` BRSV,

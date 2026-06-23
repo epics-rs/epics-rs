@@ -1118,6 +1118,29 @@ async fn wire_subroutines(db: &PvDatabase, registry: &HashMap<String, Arc<Subrou
             // `init_record` -> `registryFunctionFind`).
             let rt = instance.record.record_type();
             if rt == "sub" || rt == "aSub" {
+                // INAM: invoke the init routine exactly once at init, before
+                // SNAM resolution (C `subRecord.c` / `aSubRecord.c`
+                // `init_record`: `registryFunctionFind(inam)` then
+                // `(*psubroutine)(prec)`, return value discarded; a missing
+                // function is an init error -> stderr).
+                if let Some(crate::types::EpicsValue::String(inam)) =
+                    instance.record.get_field("INAM")
+                {
+                    let inam = inam.as_str_lossy();
+                    if !inam.is_empty() {
+                        match registry.get(inam.as_ref()) {
+                            Some(init_fn) => {
+                                let init_fn = init_fn.clone();
+                                if let Err(e) = init_fn(&mut *instance.record) {
+                                    eprintln!(
+                                        "iocInit: {name}.INAM '{inam}' init routine failed: {e}"
+                                    );
+                                }
+                            }
+                            None => eprintln!("iocInit: {name}.INAM function '{inam}' not found"),
+                        }
+                    }
+                }
                 if let Some(crate::types::EpicsValue::String(snam)) =
                     instance.record.get_field("SNAM")
                 {

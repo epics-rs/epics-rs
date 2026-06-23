@@ -212,9 +212,10 @@ impl ASubRecord {
                 read_only: false,
             },
             FieldDesc {
+                // INAM: init-routine name, SPC_NOMOD (config; .db-load only).
                 name: "INAM",
                 dbf_type: DbFieldType::String,
-                read_only: false,
+                read_only: true,
             },
             FieldDesc {
                 name: "BRSV",

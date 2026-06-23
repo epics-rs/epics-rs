@@ -335,6 +335,30 @@ impl IocBuilder {
                 // `init_record` -> `registryFunctionFind` for both types).
                 let rt = instance.record.record_type();
                 if rt == "sub" || rt == "aSub" {
+                    // INAM: invoke the init routine once, before SNAM
+                    // resolution (C `init_record`: `registryFunctionFind(inam)`
+                    // then `(*psubroutine)(prec)`, return discarded; a missing
+                    // function is an init error -> stderr).
+                    if let Some(EpicsValue::String(inam)) = instance.record.get_field("INAM") {
+                        let inam = inam.as_str_lossy();
+                        if !inam.is_empty() {
+                            match self.subroutine_registry.get(inam.as_ref()) {
+                                Some(init_fn) => {
+                                    let init_fn = init_fn.clone();
+                                    if let Err(e) = init_fn(&mut *instance.record) {
+                                        eprintln!(
+                                            "iocInit: {}.INAM '{inam}' init routine failed: {e}",
+                                            def.name
+                                        );
+                                    }
+                                }
+                                None => eprintln!(
+                                    "iocInit: {}.INAM function '{inam}' not found",
+                                    def.name
+                                ),
+                            }
+                        }
+                    }
                     if let Some(EpicsValue::String(snam)) = instance.record.get_field("SNAM") {
                         if let Some(sub_fn) =
                             self.subroutine_registry.get(snam.as_str_lossy().as_ref())

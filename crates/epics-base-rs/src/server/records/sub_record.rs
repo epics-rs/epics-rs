@@ -50,6 +50,11 @@ const INP_VAL_PAIRS: [(&str, &str); INP_ARG_MAX] = [
 pub struct SubRecord {
     pub val: f64,
     pub snam: PvString,
+    /// Init-routine name `INAM` (C `subRecord.c::init_record`). When set, the
+    /// framework resolves it through the function registry and invokes it
+    /// exactly once at iocInit, before SNAM resolution. SPC_NOMOD: set at
+    /// `.db` load, not runtime-settable by clients.
+    pub inam: PvString,
     /// Input links `INPA..INPU`.
     pub inp: [String; INP_ARG_MAX],
     /// Input values `A..U`.
@@ -78,6 +83,7 @@ impl Default for SubRecord {
         Self {
             val: 0.0,
             snam: PvString::new(),
+            inam: PvString::new(),
             inp: std::array::from_fn(|_| String::new()),
             a: [0.0; INP_ARG_MAX],
             mdel: 0.0,
@@ -100,6 +106,12 @@ static SUB_FIELDS: &[FieldDesc] = &[
         name: "SNAM",
         dbf_type: DbFieldType::String,
         read_only: false,
+    },
+    // INAM: init-routine name, SPC_NOMOD (config; .db-load only).
+    FieldDesc {
+        name: "INAM",
+        dbf_type: DbFieldType::String,
+        read_only: true,
     },
     // Monitor/archive deadbands (client-writable) + last-posted/alarm
     // trackers (SPC_NOMOD in C, read-only to clients).
@@ -224,6 +236,7 @@ impl Record for SubRecord {
         match name {
             "VAL" => return Some(EpicsValue::Double(self.val)),
             "SNAM" => return Some(EpicsValue::String(self.snam.clone())),
+            "INAM" => return Some(EpicsValue::String(self.inam.clone())),
             "MDEL" => return Some(EpicsValue::Double(self.mdel)),
             "ADEL" => return Some(EpicsValue::Double(self.adel)),
             "LALM" => return Some(EpicsValue::Double(self.lalm)),
@@ -259,6 +272,15 @@ impl Record for SubRecord {
                         Ok(())
                     }
                     _ => Err(CaError::TypeMismatch("SNAM".into())),
+                };
+            }
+            "INAM" => {
+                return match value {
+                    EpicsValue::String(s) => {
+                        self.inam = s;
+                        Ok(())
+                    }
+                    _ => Err(CaError::TypeMismatch("INAM".into())),
                 };
             }
             "MDEL" | "ADEL" | "LALM" | "MLST" | "ALST" => {

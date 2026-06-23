@@ -7808,6 +7808,87 @@ record(aSub, "ASUB_S") {
     );
 }
 
+/// `sub` and `aSub` INAM init routine: resolved through the function registry
+/// and invoked exactly once at init, before SNAM resolution, return discarded
+/// (C `subRecord.c` / `aSubRecord.c::init_record`).
+#[tokio::test]
+async fn inam_init_routine_runs_once_at_init_for_sub_and_asub() {
+    use epics_base_rs::server::ioc_builder::IocBuilder;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let db_content = r#"
+record(sub, "SUB_INIT") {
+    field(INAM, "sub_init")
+    field(SNAM, "sub_proc")
+}
+record(aSub, "ASUB_INIT") {
+    field(INAM, "asub_init")
+    field(SNAM, "asub_proc")
+}
+"#;
+    let sub_init_calls = Arc::new(AtomicUsize::new(0));
+    let asub_init_calls = Arc::new(AtomicUsize::new(0));
+    let sic = sub_init_calls.clone();
+    let aic = asub_init_calls.clone();
+    let (db, _) = IocBuilder::new()
+        .db_string(db_content, &HashMap::new())
+        .unwrap()
+        .register_subroutine("sub_init", move |rec: &mut dyn Record| {
+            sic.fetch_add(1, Ordering::SeqCst);
+            rec.put_field("VAL", EpicsValue::Double(99.0))?;
+            Ok(0)
+        })
+        .register_subroutine("sub_proc", |_: &mut dyn Record| Ok(0))
+        .register_subroutine("asub_init", move |rec: &mut dyn Record| {
+            aic.fetch_add(1, Ordering::SeqCst);
+            rec.put_field("VAL", EpicsValue::Double(88.0))?;
+            Ok(0)
+        })
+        .register_subroutine("asub_proc", |_: &mut dyn Record| Ok(5))
+        .build()
+        .await
+        .unwrap();
+
+    // Both INAM routines ran exactly once at init, before any processing.
+    assert_eq!(
+        sub_init_calls.load(Ordering::SeqCst),
+        1,
+        "sub INAM init routine runs exactly once at init"
+    );
+    assert_eq!(
+        asub_init_calls.load(Ordering::SeqCst),
+        1,
+        "aSub INAM init routine runs exactly once at init"
+    );
+
+    // The init routine's write is visible after init, before any processing.
+    let sub = db.get_record("SUB_INIT").await.unwrap();
+    assert_eq!(
+        sub.read().await.record.get_field("VAL"),
+        Some(EpicsValue::Double(99.0)),
+        "sub INAM init write visible after init"
+    );
+    let asub = db.get_record("ASUB_INIT").await.unwrap();
+    assert_eq!(
+        asub.read().await.record.get_field("VAL"),
+        Some(EpicsValue::Double(88.0)),
+        "aSub INAM init write visible after init"
+    );
+
+    // SNAM process routine is still wired alongside INAM: aSub publishes its
+    // return status as VAL (C `aSubRecord.c:224`).
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ASUB_INIT", &mut visited, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        asub.read().await.record.get_field("VAL"),
+        Some(EpicsValue::Double(5.0)),
+        "aSub SNAM routine runs after INAM and publishes its status as VAL"
+    );
+}
+
 /// The foreign process path (`process_record` -> `process_local`) re-resolves
 /// aSub LFLG=READ identically to the engine path: the SUBL re-read + swap +
 /// bad-sub skip are shared owners, not engine-path-only.

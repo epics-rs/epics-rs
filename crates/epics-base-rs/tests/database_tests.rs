@@ -6718,6 +6718,74 @@ async fn test_fanout_resolves_sell_link_into_seln() {
     );
 }
 
+/// R5-14 — `seqRecord.c:148` places the SELL→SELN `dbGetLink` *inside* the
+/// `else` of `if (prec->selm == seqSELM_All)`, so an All-mode seq never
+/// refreshes SELN from SELL (unlike fanout/dfanout, whose `dbGetLink` runs
+/// before the SELM switch every cycle — pinned above). The port read SELL
+/// for all three unconditionally, so an All-mode seq spuriously updated SELN
+/// (and would post a SELN monitor) from a live SELL link. Boundary test: All
+/// freezes SELN, Specified refreshes it, with the same live SELL link.
+#[tokio::test]
+async fn test_seq_skips_sell_in_all_mode_reads_in_specified() {
+    use epics_base_rs::server::records::seq::SeqRecord;
+
+    // All mode: SELL is live (source value 5) but SELN must stay frozen at
+    // its init value (3) — C does not read SELL in All mode.
+    {
+        let db = PvDatabase::new();
+        db.add_record("SEQALL:SRC", Box::new(LonginRecord::new(5)))
+            .await
+            .unwrap();
+        let mut seq = SeqRecord::new();
+        seq.selm = 0; // All
+        seq.seln = 3; // distinct from the SELL source value (5)
+        seq.sell = "SEQALL:SRC".to_string();
+        db.add_record("SEQALL:REC", Box::new(seq)).await.unwrap();
+
+        let mut visited = HashSet::new();
+        db.process_record_with_links("SEQALL:REC", &mut visited, 0)
+            .await
+            .unwrap();
+
+        let rec = db.get_record("SEQALL:REC").await.unwrap();
+        let seln = rec.read().await.record.get_field("SELN").unwrap();
+        assert_eq!(
+            seln,
+            EpicsValue::UShort(3),
+            "All-mode seq must NOT refresh SELN from SELL (C seqRecord.c:148 \
+             reads SELL only in the non-All branch); the unconditional read \
+             would have set SELN=5"
+        );
+    }
+
+    // Specified mode: the same live SELL (source value 1) MUST refresh SELN.
+    {
+        let db = PvDatabase::new();
+        db.add_record("SEQSPEC:SRC", Box::new(LonginRecord::new(1)))
+            .await
+            .unwrap();
+        let mut seq = SeqRecord::new();
+        seq.selm = 1; // Specified
+        seq.seln = 0; // stale init value
+        seq.sell = "SEQSPEC:SRC".to_string();
+        db.add_record("SEQSPEC:REC", Box::new(seq)).await.unwrap();
+
+        let mut visited = HashSet::new();
+        db.process_record_with_links("SEQSPEC:REC", &mut visited, 0)
+            .await
+            .unwrap();
+
+        let rec = db.get_record("SEQSPEC:REC").await.unwrap();
+        let seln = rec.read().await.record.get_field("SELN").unwrap();
+        assert_eq!(
+            seln,
+            EpicsValue::UShort(1),
+            "Specified-mode seq MUST refresh SELN from SELL (C reads it in \
+             the else branch)"
+        );
+    }
+}
+
 /// BUG 5 — `putAcks` (C `dbAccess.c:1303-1315`) compares the written
 /// severity against the STORED unacknowledged severity `acks`, not
 /// against the current `sevr`; `putAckt` (C `dbAccess.c:1285-1301`)

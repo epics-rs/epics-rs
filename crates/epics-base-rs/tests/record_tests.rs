@@ -1726,6 +1726,43 @@ fn test_ai_simm_get_field_stays_short() {
     assert_eq!(rec.get_field("SIMM"), Some(EpicsValue::Short(2)));
 }
 
+// R5-14 re-verify: dfanout OMSL/IVOA are DBF_MENU (menuOmsl / menuIvoa), so
+// the snapshot boundary must serve them as DBR_ENUM with the menu labels,
+// not a bare DBR_SHORT. dfanout's own menu_field_choices overrides only
+// SELM, so OMSL/IVOA fall through to the shared (field-name) registry. A
+// sub-agent reported them served as SHORT; this pins the ENUM form (already
+// produced since the menu-serving owner landed) so the finding stays closed.
+#[test]
+fn test_snapshot_dfanout_omsl_ivoa_serve_as_enum() {
+    use epics_base_rs::server::records::dfanout::DfanoutRecord;
+    let mut rec = DfanoutRecord::new(0.0);
+    rec.omsl = 1; // closed_loop
+    rec.ivoa = 2; // Set output to IVOV
+    // Promotion is boundary-only: the raw record keeps Short so internal
+    // OMSL/IVOA match arms are unaffected.
+    assert_eq!(rec.get_field("OMSL"), Some(EpicsValue::Short(1)));
+    assert_eq!(rec.get_field("IVOA"), Some(EpicsValue::Short(2)));
+    let inst = RecordInstance::new("DFAN:MENU".into(), rec);
+
+    let omsl = inst.snapshot_for_field("OMSL").unwrap();
+    assert_eq!(omsl.value, EpicsValue::Enum(1));
+    assert_eq!(
+        omsl.enums.as_ref().unwrap().strings,
+        vec!["supervisory", "closed_loop"]
+    );
+
+    let ivoa = inst.snapshot_for_field("IVOA").unwrap();
+    assert_eq!(ivoa.value, EpicsValue::Enum(2));
+    assert_eq!(
+        ivoa.enums.as_ref().unwrap().strings,
+        vec![
+            "Continue normally",
+            "Don't drive outputs",
+            "Set output to IVOV"
+        ]
+    );
+}
+
 // MPST/APST on lsi are menu(menuPost): On Change (0), Always (1). The value
 // order is wire-visible; the array records' POST menus reverse it, which is
 // why MPST/APST are resolved per record rather than globally.

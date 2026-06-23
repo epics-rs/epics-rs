@@ -50,8 +50,8 @@ impl Default for HistogramRecord {
         // an unset NELM defaults to 1 bucket, not 10. NELM is read-only and
         // sizes VAL, so a .db that omits it must read back NELM=1 / a
         // 1-element VAL to match C. (ULIM/LLIM keep the Rust convenience
-        // defaults; their C initial() is 0 — a separate, out-of-scope
-        // divergence, see the R5-15 report.)
+        // defaults; their C initial() is 0 — a separate divergence the
+        // C-non-trivial-initial audit did not enumerate.)
         let nelm = 1;
         let ulim = 10.0;
         let llim = 0.0;

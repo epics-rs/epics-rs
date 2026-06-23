@@ -6718,7 +6718,7 @@ async fn test_fanout_resolves_sell_link_into_seln() {
     );
 }
 
-/// R5-14 — `seqRecord.c:148` places the SELL→SELN `dbGetLink` *inside* the
+/// `seqRecord.c:148` places the SELL→SELN `dbGetLink` *inside* the
 /// `else` of `if (prec->selm == seqSELM_All)`, so an All-mode seq never
 /// refreshes SELN from SELL (unlike fanout/dfanout, whose `dbGetLink` runs
 /// before the SELM switch every cycle — pinned above). The port read SELL
@@ -6786,7 +6786,7 @@ async fn test_seq_skips_sell_in_all_mode_reads_in_specified() {
     }
 }
 
-/// R5-15 — fanout/dfanout/seq `SELN` carries dbd `initial("1")`: a record
+/// fanout/dfanout/seq `SELN` carries dbd `initial("1")`: a record
 /// constructed without an explicit SELN must default to 1, not the
 /// hand-coded 0. Observable in SELM=Specified/Mask when the .db omits SELN
 /// (All ignores SELN). dfanout's Specified output is `seln - 1`, so 0 would
@@ -7261,7 +7261,7 @@ async fn sub_record_subroutine_runs_on_main_engine_path() {
 /// LOLO/LOW with HYST + LALM). C `subRecord.c::checkAlarms` (lines 319-373)
 /// is the standard analog limit check; the Rust port previously gave `sub`
 /// no limit fields and skipped the analog-alarm owner entirely, so a `sub`
-/// whose subroutine drove VAL past HIHI never alarmed (R5-1c).
+/// whose subroutine drove VAL past HIHI never alarmed.
 #[tokio::test]
 async fn sub_record_hihi_alarm_fires_via_shared_owner() {
     use epics_base_rs::server::recgbl::alarm_status;
@@ -7338,8 +7338,8 @@ async fn sub_record_hihi_alarm_fires_via_shared_owner() {
 }
 
 /// A `sub` record must gate the `VAL` monitor on MDEL (C `subRecord.c::
-/// monitor` lines 386-394, `recGblCheckDeadband` against MLST). Before
-/// R5-1c the record carried no MDEL/MLST, so the deadband owner saw
+/// monitor` lines 386-394, `recGblCheckDeadband` against MLST). The record
+/// previously carried no MDEL/MLST, so the deadband owner saw
 /// `mdel=0` and posted on every change. MLST tracks the last posted value,
 /// so it is the observable witness of the deadband decision.
 #[tokio::test]
@@ -7390,7 +7390,7 @@ async fn sub_record_mdel_gates_val_monitor() {
 
 /// A `sub` subroutine returning a negative status must raise SOFT_ALARM at
 /// the record's BRSV severity (C `subRecord.c::do_sub`: `if (status < 0)
-/// recGblSetSevr(SOFT_ALARM, prec->brsv)`). The pre-R5-1b `SubroutineFn`
+/// recGblSetSevr(SOFT_ALARM, prec->brsv)`). The earlier `SubroutineFn`
 /// returned `CaResult<()>`, so a subroutine could not signal an error and
 /// no SOFT_ALARM was ever raised.
 #[tokio::test]

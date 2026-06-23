@@ -1726,7 +1726,7 @@ fn test_ai_simm_get_field_stays_short() {
     assert_eq!(rec.get_field("SIMM"), Some(EpicsValue::Short(2)));
 }
 
-// R5-14 re-verify: dfanout OMSL/IVOA are DBF_MENU (menuOmsl / menuIvoa), so
+// dfanout OMSL/IVOA are DBF_MENU (menuOmsl / menuIvoa), so
 // the snapshot boundary must serve them as DBR_ENUM with the menu labels,
 // not a bare DBR_SHORT. dfanout's own menu_field_choices overrides only
 // SELM, so OMSL/IVOA fall through to the shared (field-name) registry. A

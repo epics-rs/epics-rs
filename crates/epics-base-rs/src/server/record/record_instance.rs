@@ -1849,8 +1849,9 @@ impl RecordInstance {
         // (C `do_sub`: `if (status < 0) recGblSetSevr(SOFT_ALARM,
         // prec->brsv)`). It accumulates into nsta/nsev for this cycle's
         // recGblResetAlarms commit and runs before checkAlarms, so a higher
-        // analog severity (R5-1c) still wins via the raise-only rule. BRSV
-        // defaults to NO_ALARM, under which recGblSetSevr is a no-op.
+        // analog severity (e.g. the shared analog-alarm owner) still wins via
+        // the raise-only rule. BRSV defaults to NO_ALARM, under which
+        // recGblSetSevr is a no-op.
         if status < 0 {
             let brsv = self
                 .record

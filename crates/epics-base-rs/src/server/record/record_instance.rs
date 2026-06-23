@@ -1824,8 +1824,41 @@ impl RecordInstance {
     /// Previously only `process_local` invoked the subroutine, so on the
     /// main engine path `VAL`/`VALA..VALU`/`OUTA..OUTU` never updated.
     pub(crate) fn run_registered_subroutine(&mut self) -> CaResult<()> {
-        if let Some(ref sub_fn) = self.subroutine {
-            sub_fn(&mut *self.record)?;
+        use crate::server::recgbl::{self, alarm_status};
+
+        // Clone the Arc so the borrow on `self.subroutine` is released
+        // before we mutate `self.record` / `self.common` below.
+        let Some(sub_fn) = self.subroutine.clone() else {
+            return Ok(());
+        };
+        // C `do_sub` returns the subroutine's `long` status.
+        let status = sub_fn(&mut *self.record)?;
+
+        // aSub publishes the status as VAL (C `aSubRecord.c:223`
+        // `prec->val = status`). The subroutine's computed outputs live in
+        // VALA..VALU, so VAL is the return code and overwrites whatever the
+        // closure may have written to VAL. `sub` does NOT do this — its VAL
+        // is the value the subroutine computed.
+        if self.record.record_type() == "aSub" {
+            let _ = self
+                .record
+                .put_field("VAL", EpicsValue::Double(status as f64));
+        }
+
+        // A negative status raises SOFT_ALARM at the record's BRSV severity
+        // (C `do_sub`: `if (status < 0) recGblSetSevr(SOFT_ALARM,
+        // prec->brsv)`). It accumulates into nsta/nsev for this cycle's
+        // recGblResetAlarms commit and runs before checkAlarms, so a higher
+        // analog severity (R5-1c) still wins via the raise-only rule. BRSV
+        // defaults to NO_ALARM, under which recGblSetSevr is a no-op.
+        if status < 0 {
+            let brsv = self
+                .record
+                .get_field("BRSV")
+                .and_then(|v| v.to_f64())
+                .map(|f| AlarmSeverity::from_u16(f as u16))
+                .unwrap_or(AlarmSeverity::NoAlarm);
+            recgbl::rec_gbl_set_sevr(&mut self.common, alarm_status::SOFT_ALARM, brsv);
         }
         Ok(())
     }

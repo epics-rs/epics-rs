@@ -1486,7 +1486,7 @@ mod tests {
             if let Some(EpicsValue::Double(v)) = record.get_field("VAL") {
                 record.put_field("VAL", EpicsValue::Double(v * 2.0))?;
             }
-            Ok(())
+            Ok(0)
         });
         instance.subroutine = Some(Arc::new(sub_fn));
 

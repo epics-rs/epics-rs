@@ -66,6 +66,11 @@ pub struct SubRecord {
     pub lalm: f64,
     pub mlst: f64,
     pub alst: f64,
+    /// Bad-return severity (`menuAlarmSevr`, default NO_ALARM). C
+    /// `subRecord.c::do_sub` raises `SOFT_ALARM` at this severity when the
+    /// subroutine returns a negative status (applied by the framework's
+    /// `run_registered_subroutine`).
+    pub brsv: i16,
 }
 
 impl Default for SubRecord {
@@ -80,6 +85,7 @@ impl Default for SubRecord {
             lalm: 0.0,
             mlst: 0.0,
             alst: 0.0,
+            brsv: 0,
         }
     }
 }
@@ -121,6 +127,12 @@ static SUB_FIELDS: &[FieldDesc] = &[
         name: "ALST",
         dbf_type: DbFieldType::Double,
         read_only: true,
+    },
+    // Bad-return severity menu (menuAlarmSevr).
+    FieldDesc {
+        name: "BRSV",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
     },
     // INPA..INPU
     field_str("INPA"),
@@ -217,6 +229,7 @@ impl Record for SubRecord {
             "LALM" => return Some(EpicsValue::Double(self.lalm)),
             "MLST" => return Some(EpicsValue::Double(self.mlst)),
             "ALST" => return Some(EpicsValue::Double(self.alst)),
+            "BRSV" => return Some(EpicsValue::Short(self.brsv)),
             _ => {}
         }
         if let Some(idx) = INP_NAMES.iter().position(|&n| n == name) {
@@ -260,6 +273,13 @@ impl Record for SubRecord {
                     "ALST" => self.alst = v,
                     _ => unreachable!(),
                 }
+                return Ok(());
+            }
+            "BRSV" => {
+                self.brsv = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("BRSV".into()))?
+                    as i16;
                 return Ok(());
             }
             _ => {}
@@ -339,5 +359,15 @@ mod tests {
         assert_eq!(rec.get_field("MLST"), Some(EpicsValue::Double(7.0)));
         assert_eq!(rec.get_field("ALST"), Some(EpicsValue::Double(7.0)));
         assert_eq!(rec.get_field("LALM"), Some(EpicsValue::Double(7.0)));
+    }
+
+    /// BRSV round-trips as a `menuAlarmSevr` index (C `subRecord.c` BRSV,
+    /// the severity used when the subroutine returns a negative status).
+    #[test]
+    fn brsv_round_trips() {
+        let mut rec = SubRecord::default();
+        assert_eq!(rec.get_field("BRSV"), Some(EpicsValue::Short(0)));
+        rec.put_field("BRSV", EpicsValue::Short(2)).unwrap();
+        assert_eq!(rec.get_field("BRSV"), Some(EpicsValue::Short(2)));
     }
 }

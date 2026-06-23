@@ -1146,5 +1146,13 @@ pub trait Record: Send + Sync + 'static {
     }
 }
 
-/// Subroutine function type for sub records.
-pub type SubroutineFn = Box<dyn Fn(&mut dyn Record) -> CaResult<()> + Send + Sync>;
+/// Subroutine function type for `sub`/`aSub` records.
+///
+/// The return value is the subroutine's C `long` status
+/// (`subRecord.c::do_sub` / `aSubRecord.c::do_sub`): `< 0` raises
+/// `SOFT_ALARM` at the record's `BRSV` severity, and for `aSub` the status
+/// is published as `VAL` (`aSubRecord.c:223`). Return `Ok(0)` for the
+/// normal no-alarm path. `Err(..)` is reserved for an infrastructure
+/// failure inside the closure (e.g. a field write error), which aborts
+/// processing — it is distinct from a negative status.
+pub type SubroutineFn = Box<dyn Fn(&mut dyn Record) -> CaResult<i64> + Send + Sync>;

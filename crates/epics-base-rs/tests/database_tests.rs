@@ -7139,7 +7139,7 @@ async fn sub_record_subroutine_runs_on_main_engine_path() {
             if let Some(EpicsValue::Double(v)) = record.get_field("VAL") {
                 record.put_field("VAL", EpicsValue::Double(v * 2.0))?;
             }
-            Ok(())
+            Ok(0)
         });
         inst.subroutine = Some(Arc::new(sub_fn));
     }
@@ -7191,7 +7191,7 @@ async fn sub_record_hihi_alarm_fires_via_shared_owner() {
             .unwrap();
         let sub_fn: SubroutineFn = Box::new(|record: &mut dyn Record| {
             record.put_field("VAL", EpicsValue::Double(100.0))?;
-            Ok(())
+            Ok(0)
         });
         inst.subroutine = Some(Arc::new(sub_fn));
     }
@@ -7290,6 +7290,145 @@ async fn sub_record_mdel_gates_val_monitor() {
         115.0,
         "VAL change at/over MDEL must post and advance MLST to 115"
     );
+}
+
+/// A `sub` subroutine returning a negative status must raise SOFT_ALARM at
+/// the record's BRSV severity (C `subRecord.c::do_sub`: `if (status < 0)
+/// recGblSetSevr(SOFT_ALARM, prec->brsv)`). The pre-R5-1b `SubroutineFn`
+/// returned `CaResult<()>`, so a subroutine could not signal an error and
+/// no SOFT_ALARM was ever raised.
+#[tokio::test]
+async fn sub_record_negative_status_raises_soft_alarm_at_brsv() {
+    use epics_base_rs::server::recgbl::alarm_status;
+    use epics_base_rs::server::records::sub_record::SubRecord;
+
+    let db = PvDatabase::new();
+
+    // FIRE: status -1 with BRSV=Major -> SOFT_ALARM/Major.
+    db.add_record("SUB_SOFT", Box::new(SubRecord::default()))
+        .await
+        .unwrap();
+    // CONTROL: status 0 with BRSV=Major -> no alarm.
+    db.add_record("SUB_OK0", Box::new(SubRecord::default()))
+        .await
+        .unwrap();
+
+    for (name, status) in [("SUB_SOFT", -1_i64), ("SUB_OK0", 0_i64)] {
+        let arc = db.get_record(name).await.unwrap();
+        let mut inst = arc.write().await;
+        inst.record
+            .put_field("BRSV", EpicsValue::Short(AlarmSeverity::Major as i16))
+            .unwrap();
+        let sub_fn: SubroutineFn = Box::new(move |_record: &mut dyn Record| Ok(status));
+        inst.subroutine = Some(Arc::new(sub_fn));
+    }
+
+    for name in ["SUB_SOFT", "SUB_OK0"] {
+        let mut visited = HashSet::new();
+        db.process_record_with_links(name, &mut visited, 0)
+            .await
+            .unwrap();
+    }
+
+    {
+        let arc = db.get_record("SUB_SOFT").await.unwrap();
+        let inst = arc.read().await;
+        assert_eq!(
+            inst.common.sevr,
+            AlarmSeverity::Major,
+            "sub status<0 must raise SOFT_ALARM at BRSV=Major"
+        );
+        assert_eq!(
+            inst.common.stat,
+            alarm_status::SOFT_ALARM,
+            "sub status<0 must set STAT=SOFT_ALARM"
+        );
+    }
+    {
+        let arc = db.get_record("SUB_OK0").await.unwrap();
+        let inst = arc.read().await;
+        assert_eq!(
+            inst.common.sevr,
+            AlarmSeverity::NoAlarm,
+            "sub status==0 must not raise SOFT_ALARM regardless of BRSV"
+        );
+    }
+}
+
+/// An `aSub` publishes the subroutine's return status as VAL (C
+/// `aSubRecord.c:223` `prec->val = status`), overwriting whatever the
+/// closure wrote to VAL, and a negative status raises SOFT_ALARM at BRSV.
+#[tokio::test]
+async fn asub_record_val_is_return_status_and_negative_soft_alarms() {
+    use epics_base_rs::server::recgbl::alarm_status;
+    use epics_base_rs::server::records::asub_record::ASubRecord;
+
+    let db = PvDatabase::new();
+
+    // POSITIVE: closure writes VAL=999 but returns 42 -> VAL must be 42.
+    db.add_record("ASUB_POS", Box::new(ASubRecord::default()))
+        .await
+        .unwrap();
+    // NEGATIVE: returns -5 with BRSV=Minor -> VAL=-5, SOFT_ALARM/Minor.
+    db.add_record("ASUB_NEG", Box::new(ASubRecord::default()))
+        .await
+        .unwrap();
+
+    {
+        let arc = db.get_record("ASUB_POS").await.unwrap();
+        let mut inst = arc.write().await;
+        let sub_fn: SubroutineFn = Box::new(|record: &mut dyn Record| {
+            // The closure's own VAL write is discarded by `prec->val = status`.
+            record.put_field("VAL", EpicsValue::Double(999.0))?;
+            Ok(42)
+        });
+        inst.subroutine = Some(Arc::new(sub_fn));
+    }
+    {
+        let arc = db.get_record("ASUB_NEG").await.unwrap();
+        let mut inst = arc.write().await;
+        inst.record
+            .put_field("BRSV", EpicsValue::Short(AlarmSeverity::Minor as i16))
+            .unwrap();
+        let sub_fn: SubroutineFn = Box::new(|_record: &mut dyn Record| Ok(-5));
+        inst.subroutine = Some(Arc::new(sub_fn));
+    }
+
+    for name in ["ASUB_POS", "ASUB_NEG"] {
+        let mut visited = HashSet::new();
+        db.process_record_with_links(name, &mut visited, 0)
+            .await
+            .unwrap();
+    }
+
+    {
+        let arc = db.get_record("ASUB_POS").await.unwrap();
+        let inst = arc.read().await;
+        assert_eq!(
+            inst.record.get_field("VAL"),
+            Some(EpicsValue::Double(42.0)),
+            "aSub VAL must be the return status (42), not the closure's 999"
+        );
+    }
+    {
+        let arc = db.get_record("ASUB_NEG").await.unwrap();
+        let inst = arc.read().await;
+        assert_eq!(
+            inst.record.get_field("VAL"),
+            Some(EpicsValue::Double(-5.0)),
+            "aSub VAL must carry the negative return status (-5)"
+        );
+        assert_eq!(
+            inst.common.sevr,
+            AlarmSeverity::Minor,
+            "aSub status<0 must raise SOFT_ALARM at BRSV=Minor"
+        );
+        assert_eq!(
+            inst.common.stat,
+            alarm_status::SOFT_ALARM,
+            "aSub status<0 must set STAT=SOFT_ALARM"
+        );
+    }
 }
 
 /// ao OMSL=closed_loop + OIF=Incremental must add DOL to PVAL (the last

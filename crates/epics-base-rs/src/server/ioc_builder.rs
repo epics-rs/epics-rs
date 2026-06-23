@@ -143,10 +143,12 @@ impl IocBuilder {
         self
     }
 
-    /// Register a subroutine function by name (for sub records).
+    /// Register a subroutine function by name (for sub/aSub records).
+    /// The closure returns the C `long` status (`Ok(0)` normal, `Ok(n<0)`
+    /// raises `SOFT_ALARM`/`BRSV`; `aSub` publishes it as `VAL`).
     pub fn register_subroutine<F>(mut self, name: &str, func: F) -> Self
     where
-        F: Fn(&mut dyn Record) -> CaResult<()> + Send + Sync + 'static,
+        F: Fn(&mut dyn Record) -> CaResult<i64> + Send + Sync + 'static,
     {
         self.subroutine_registry
             .insert(name.to_string(), Arc::new(Box::new(func)));

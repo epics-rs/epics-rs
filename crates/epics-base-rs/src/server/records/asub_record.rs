@@ -16,6 +16,36 @@ const SUFFIX: [char; NUM_ARGS] = [
     'T', 'U',
 ];
 
+/// `EFLG` (`menu(aSubEFLG)`) — when the record posts output-array DB events.
+/// C `aSubRecord.c::monitor` (the `switch (prec->eflg)`).
+const EFLG_NEVER: i16 = 0;
+const EFLG_ON_CHANGE: i16 = 1;
+const EFLG_ALWAYS: i16 = 2;
+
+/// `menu(aSubEFLG)` choice labels (`aSubRecord.dbd.pod`).
+const ASUB_EFLG_CHOICES: &[&str] = &["NEVER", "ON CHANGE", "ALWAYS"];
+
+/// The output-array fields whose monitor posting `EFLG` gates: `VALA..VALU`
+/// (the output values) and `NEVA..NEVU` (their element counts). C
+/// `aSubRecord.c::monitor` posts `vala[i]` and `neva[i]` together inside the
+/// `EFLG` switch. Leaked once for the `'static` lifetime the posting hooks
+/// require (mirrors `multi_input_links`).
+fn asub_output_event_fields() -> &'static [&'static str] {
+    use std::sync::OnceLock;
+    static FIELDS: OnceLock<Vec<&'static str>> = OnceLock::new();
+    FIELDS.get_or_init(|| {
+        SUFFIX
+            .iter()
+            .flat_map(|&c| {
+                [
+                    Box::leak(format!("VAL{c}").into_boxed_str()) as &'static str,
+                    Box::leak(format!("NEV{c}").into_boxed_str()) as &'static str,
+                ]
+            })
+            .collect()
+    })
+}
+
 /// aSub (array subroutine) record.
 ///
 /// C `aSubRecord.c` exposes 21 input channels `A..U` (fed from
@@ -64,6 +94,11 @@ pub struct ASubRecord {
     /// the per-channel value fields use their link's precision, which the port
     /// does not track.
     pub prec: i16,
+    /// Output event flag `EFLG` (`menu(aSubEFLG)`, default ON CHANGE). C
+    /// `aSubRecord.c::monitor` gates `VALA..VALU`/`NEVA..NEVU` event posting:
+    /// NEVER (never post), ON CHANGE (post on change — the framework default),
+    /// ALWAYS (post every process).
+    pub eflg: i16,
 }
 
 impl Default for ASubRecord {
@@ -84,6 +119,7 @@ impl Default for ASubRecord {
             neva: [1; NUM_ARGS],
             brsv: 0,
             prec: 0,
+            eflg: EFLG_ON_CHANGE,
         }
     }
 }
@@ -167,6 +203,11 @@ impl ASubRecord {
                 dbf_type: DbFieldType::Short,
                 read_only: false,
             },
+            FieldDesc {
+                name: "EFLG",
+                dbf_type: DbFieldType::Short,
+                read_only: false,
+            },
         ];
         // Per-channel field families. Names are leaked to obtain the
         // 'static lifetime FieldDesc requires; the table is built once.
@@ -244,6 +285,7 @@ impl Record for ASubRecord {
             "INAM" => return Some(EpicsValue::String(self.inam.clone())),
             "BRSV" => return Some(EpicsValue::Short(self.brsv)),
             "PREC" => return Some(EpicsValue::Short(self.prec)),
+            "EFLG" => return Some(EpicsValue::Short(self.eflg)),
             _ => {}
         }
         let (prefix, idx) = parse_channel(name)?;
@@ -302,6 +344,13 @@ impl Record for ASubRecord {
                     as i16;
                 return Ok(());
             }
+            "EFLG" => {
+                self.eflg = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("EFLG".into()))?
+                    as i16;
+                return Ok(());
+            }
             _ => {}
         }
         let (prefix, idx) =
@@ -356,6 +405,37 @@ impl Record for ASubRecord {
         use std::sync::OnceLock;
         static FIELDS: OnceLock<Vec<FieldDesc>> = OnceLock::new();
         FIELDS.get_or_init(ASubRecord::descriptors)
+    }
+
+    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
+        // EFLG is `menu(aSubEFLG)`; serve its labels so a `.db` `field(EFLG,
+        // "ON CHANGE")` resolves and a client reads it as a DBR_ENUM.
+        match field {
+            "EFLG" => Some(ASUB_EFLG_CHOICES),
+            _ => None,
+        }
+    }
+
+    fn force_posted_fields(&self) -> &'static [&'static str] {
+        // EFLG=ALWAYS: C `monitor()` posts every `vala[i]`/`neva[i]` each
+        // process regardless of change — the framework's force-post path.
+        if self.eflg == EFLG_ALWAYS {
+            asub_output_event_fields()
+        } else {
+            &[]
+        }
+    }
+
+    fn event_posted_fields(&self) -> &'static [&'static str] {
+        // EFLG=NEVER: C `monitor()` posts no `vala[i]`/`neva[i]` events.
+        // Excluding them from generic change-detection suppresses the post.
+        // (VAL, the scalar return status, is not in this set — C posts it on
+        // change independent of EFLG.)
+        if self.eflg == EFLG_NEVER {
+            asub_output_event_fields()
+        } else {
+            &[]
+        }
     }
 
     fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
@@ -462,6 +542,46 @@ mod tests {
         );
         // Non-VAL fields carry no precision override.
         assert!(rec.field_metadata_override("SNAM").is_none());
+    }
+
+    /// EFLG gates output-array posting. C `aSubRecord.c::monitor`:
+    /// NEVER posts no `VALx`/`NEVx`; ON CHANGE (default) leaves them to the
+    /// framework's change-detection; ALWAYS force-posts them every process.
+    #[test]
+    fn eflg_drives_output_event_posting_policy() {
+        let mut rec = ASubRecord::default();
+        // Default ON CHANGE: neither force-post nor suppress.
+        assert_eq!(rec.eflg, EFLG_ON_CHANGE);
+        assert!(rec.force_posted_fields().is_empty());
+        assert!(rec.event_posted_fields().is_empty());
+
+        // ALWAYS: VALx/NEVx force-posted every cycle (21 + 21 = 42 fields).
+        rec.put_field("EFLG", EpicsValue::Short(EFLG_ALWAYS))
+            .unwrap();
+        assert_eq!(rec.get_field("EFLG"), Some(EpicsValue::Short(2)));
+        assert_eq!(rec.force_posted_fields().len(), NUM_ARGS * 2);
+        assert!(rec.force_posted_fields().contains(&"VALA"));
+        assert!(rec.force_posted_fields().contains(&"NEVU"));
+        assert!(rec.event_posted_fields().is_empty());
+
+        // NEVER: VALx/NEVx excluded from posting; VAL scalar not in the set.
+        rec.put_field("EFLG", EpicsValue::Short(EFLG_NEVER))
+            .unwrap();
+        assert!(rec.force_posted_fields().is_empty());
+        assert_eq!(rec.event_posted_fields().len(), NUM_ARGS * 2);
+        assert!(rec.event_posted_fields().contains(&"VALA"));
+        assert!(!rec.event_posted_fields().contains(&"VAL"));
+    }
+
+    /// EFLG loads from a `.db` menu label (C `field(EFLG,"ALWAYS")`).
+    #[test]
+    fn eflg_loads_from_menu_label() {
+        use crate::server::db_loader::{apply_fields, create_record};
+        let mut rec = create_record("aSub").unwrap();
+        let mut common = Vec::new();
+        apply_fields(&mut rec, &[("EFLG".into(), "ALWAYS".into())], &mut common)
+            .expect("EFLG menu label must load");
+        assert_eq!(rec.get_field("EFLG"), Some(EpicsValue::Short(2)));
     }
 
     /// BRSV round-trips as a `menuAlarmSevr` index (C `aSubRecord.c` BRSV,

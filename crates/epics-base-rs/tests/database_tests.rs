@@ -7579,6 +7579,83 @@ async fn asub_record_val_is_return_status_and_negative_soft_alarms() {
     }
 }
 
+/// aSub `EFLG` gates `VALx` output-array monitor posting (C
+/// `aSubRecord.c::monitor`): NEVER suppresses it, ON CHANGE (default) posts on
+/// change, ALWAYS posts every process even when unchanged. Exercised through
+/// the real foreign-process monitor path (`process_record` -> `process_local`).
+#[tokio::test]
+async fn asub_eflg_gates_valx_output_monitor_posting() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::server::records::asub_record::ASubRecord;
+    use epics_base_rs::types::DbFieldType;
+    use std::sync::Mutex;
+
+    let db = PvDatabase::new();
+    db.add_record("ASUB_E", Box::new(ASubRecord::default()))
+        .await
+        .unwrap();
+
+    // Subroutine writes VALA from a shared cell so the test controls whether
+    // the output changes between processes.
+    let out = Arc::new(Mutex::new(vec![1.0_f64, 2.0]));
+    {
+        let arc = db.get_record("ASUB_E").await.unwrap();
+        let mut inst = arc.write().await;
+        let out2 = out.clone();
+        let sub_fn: SubroutineFn = Box::new(move |record: &mut dyn Record| {
+            let v = out2.lock().unwrap().clone();
+            record.put_field("VALA", EpicsValue::DoubleArray(v))?;
+            Ok(0)
+        });
+        inst.subroutine = Some(Arc::new(sub_fn));
+    }
+
+    let mut rx = {
+        let arc = db.get_record("ASUB_E").await.unwrap();
+        let mut inst = arc.write().await;
+        inst.add_subscriber("VALA", 31, DbFieldType::Double, EventMask::VALUE.bits())
+    }
+    .expect("VALA subscription must be accepted");
+
+    // ON CHANGE (default): first process changes VALA -> event.
+    db.process_record("ASUB_E").await.unwrap();
+    assert!(
+        rx.try_recv().is_ok(),
+        "ON CHANGE: VALA changed from empty default -> monitor event"
+    );
+    // Same VALA again -> no event.
+    db.process_record("ASUB_E").await.unwrap();
+    assert!(
+        rx.try_recv().is_err(),
+        "ON CHANGE: VALA unchanged -> no monitor event"
+    );
+
+    // ALWAYS: unchanged VALA still posts every process.
+    {
+        let arc = db.get_record("ASUB_E").await.unwrap();
+        let mut inst = arc.write().await;
+        inst.record.put_field("EFLG", EpicsValue::Short(2)).unwrap();
+    }
+    db.process_record("ASUB_E").await.unwrap();
+    assert!(
+        rx.try_recv().is_ok(),
+        "ALWAYS: unchanged VALA must still post a monitor event"
+    );
+
+    // NEVER: even a changed VALA is suppressed.
+    {
+        *out.lock().unwrap() = vec![9.0, 8.0];
+        let arc = db.get_record("ASUB_E").await.unwrap();
+        let mut inst = arc.write().await;
+        inst.record.put_field("EFLG", EpicsValue::Short(0)).unwrap();
+    }
+    db.process_record("ASUB_E").await.unwrap();
+    assert!(
+        rx.try_recv().is_err(),
+        "NEVER: changed VALA must post no monitor event"
+    );
+}
+
 /// ao OMSL=closed_loop + OIF=Incremental must add DOL to PVAL (the last
 /// actual output), not the current VAL. C `fetch_value`
 /// (aoRecord.c:447-455) sets `prec->val = prec->pval` before

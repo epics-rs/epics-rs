@@ -67,8 +67,12 @@ pub struct CompressRecord {
 impl Default for CompressRecord {
     fn default() -> Self {
         Self {
-            val: vec![0.0; 10],
-            nsam: 10,
+            // C `compressRecord.dbd.pod` `field(NSAM,DBF_ULONG){ initial("1") }`:
+            // an unset NSAM defaults to a 1-sample buffer, not 10. VAL is the
+            // NSAM-length buffer; a NSAM put resizes it (put_field below), so
+            // there is no load-order dependency.
+            val: vec![0.0; 1],
+            nsam: 1,
             inp: String::new(),
             alg: 4, // Circular Buffer by default (menuCompressALG_Circular_Buffer)
             n: 1,
@@ -675,6 +679,17 @@ impl Record for CompressRecord {
 #[cfg(test)]
 mod pbuf_tests {
     use super::*;
+
+    // C `compressRecord.dbd.pod` `field(NSAM,DBF_ULONG){ initial("1") }` — a
+    // compress built without an explicit NSAM defaults to a 1-sample buffer,
+    // not the old hand-coded 10. VAL is the NSAM-length buffer.
+    #[test]
+    fn nsam_defaults_to_one_per_dbd_initial() {
+        let rec = CompressRecord::default();
+        assert_eq!(rec.nsam, 1);
+        assert_eq!(rec.val.len(), 1, "VAL is the NSAM-length buffer");
+        assert_eq!(rec.get_field("NSAM"), Some(EpicsValue::Long(1)));
+    }
 
     /// C `get_array_info` (compressRecord.c:409-431) returns
     /// `*no_elements = nuse` regardless of PBUF — only the valid

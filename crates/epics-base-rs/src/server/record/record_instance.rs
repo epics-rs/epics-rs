@@ -16,7 +16,7 @@ use super::link::{ParsedLink, parse_link_v2, parse_output_link_v2};
 use super::record_trait::{
     CommonFieldPutResult, ProcessSnapshot, Record, RecordProcessResult, SubroutineFn,
 };
-use super::scan::ScanType;
+use super::scan::{ScanType, SimModeScan};
 
 /// Put-notify completion wait-set — the C `dbNotify.c` `processNotify`
 /// waitList analogue (`dbNotifyAdd` / `dbNotifyCompletion`).
@@ -1102,7 +1102,7 @@ impl RecordInstance {
             "UDF" => Some(EpicsValue::Char(if self.common.udf { 1 } else { 0 })),
             "UDFS" => Some(EpicsValue::Short(self.common.udfs as i16)),
             "SCAN" => Some(EpicsValue::Enum(self.common.scan as u16)),
-            "SSCN" => Some(EpicsValue::Enum(self.common.sscn as u16)),
+            "SSCN" => Some(EpicsValue::Enum(self.common.sscn.to_u16())),
             "PINI" => Some(EpicsValue::Char(if self.common.pini { 1 } else { 0 })),
             "TPRO" => Some(EpicsValue::Char(if self.common.tpro { 1 } else { 0 })),
             "BKPT" => Some(EpicsValue::Char(self.common.bkpt)),
@@ -1305,9 +1305,9 @@ impl RecordInstance {
             }
             "SSCN" => {
                 let new_sscn = match &value {
-                    EpicsValue::Short(v) => ScanType::from_u16(*v as u16),
-                    EpicsValue::Enum(v) => ScanType::from_u16(*v),
-                    EpicsValue::String(s) => ScanType::from_str(s.as_str_lossy().as_ref())?,
+                    EpicsValue::Short(v) => SimModeScan::from_u16(*v as u16),
+                    EpicsValue::Enum(v) => SimModeScan::from_u16(*v),
+                    EpicsValue::String(s) => SimModeScan::from_str(s.as_str_lossy().as_ref())?,
                     _ => return Ok(CommonFieldPutResult::NoChange),
                 };
                 self.common.sscn = new_sscn;

@@ -5494,7 +5494,9 @@ async fn test_new_common_fields_get_put() {
 
     {
         let inst = rec.read().await;
-        assert_eq!(inst.get_common_field("SSCN"), Some(EpicsValue::Enum(0)));
+        // C `field(SSCN,DBF_MENU){ menu(menuScan) initial("65535") }`: the
+        // default is the out-of-range "use SCAN" sentinel, not Passive(0).
+        assert_eq!(inst.get_common_field("SSCN"), Some(EpicsValue::Enum(65535)));
     }
     {
         let inst = rec.read().await;
@@ -5543,6 +5545,56 @@ async fn test_new_common_fields_get_put() {
         let inst = rec.read().await;
         assert_eq!(inst.get_common_field("RPRO"), Some(EpicsValue::Char(1)));
     }
+}
+
+/// SSCN (simulation-mode scan) is a `DBF_MENU`/`menuScan` field whose C dbd
+/// default is the out-of-range sentinel 65535 ("use SCAN"), not a real menu
+/// choice. The put path must round-trip both a real menuScan index and the
+/// sentinel, and a put of any out-of-menu value collapses to the sentinel —
+/// matching C `field(SSCN,DBF_MENU){ menu(menuScan) initial("65535") }`.
+#[tokio::test]
+async fn test_sscn_serves_menu_index_and_65535_sentinel() {
+    let db = PvDatabase::new();
+    db.add_record("REC", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    let rec = db.get_record("REC").await.unwrap();
+
+    // Default is the 65535 sentinel.
+    assert_eq!(
+        rec.read().await.get_common_field("SSCN"),
+        Some(EpicsValue::Enum(65535))
+    );
+
+    // A real menuScan index (2 == "I/O Intr") round-trips.
+    rec.write()
+        .await
+        .put_common_field("SSCN", EpicsValue::Enum(2))
+        .unwrap();
+    assert_eq!(
+        rec.read().await.get_common_field("SSCN"),
+        Some(EpicsValue::Enum(2))
+    );
+
+    // Putting the sentinel back restores "use SCAN".
+    rec.write()
+        .await
+        .put_common_field("SSCN", EpicsValue::Enum(65535))
+        .unwrap();
+    assert_eq!(
+        rec.read().await.get_common_field("SSCN"),
+        Some(EpicsValue::Enum(65535))
+    );
+
+    // An out-of-menu index (>9, not 65535) collapses to the sentinel.
+    rec.write()
+        .await
+        .put_common_field("SSCN", EpicsValue::Enum(12))
+        .unwrap();
+    assert_eq!(
+        rec.read().await.get_common_field("SSCN"),
+        Some(EpicsValue::Enum(65535))
+    );
 }
 
 /// epics-base PR #359 (commits 5ba8080f6, aff74638b, 51c5b8f1e,

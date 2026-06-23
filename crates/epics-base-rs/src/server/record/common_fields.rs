@@ -1,7 +1,7 @@
 use std::time::SystemTime;
 
 use super::alarm::{AlarmSeverity, AnalogAlarmConfig};
-use super::scan::ScanType;
+use super::scan::{ScanType, SimModeScan};
 use crate::types::PvString;
 
 /// Common fields shared by all records.
@@ -28,7 +28,9 @@ pub struct CommonFields {
     pub udfs: AlarmSeverity,
     // Scan
     pub scan: ScanType,
-    pub sscn: ScanType,
+    // SSCN's dbd default is the out-of-range sentinel 65535 ("use SCAN"),
+    // unrepresentable in `ScanType`; see [`SimModeScan`].
+    pub sscn: SimModeScan,
     pub pini: bool,
     pub tpro: bool,
     pub bkpt: u8,
@@ -124,7 +126,9 @@ impl Default for CommonFields {
             udf: true,
             udfs: AlarmSeverity::Invalid,
             scan: ScanType::Passive,
-            sscn: ScanType::Passive,
+            // C dbd `field(SSCN,DBF_MENU){ menu(menuScan) initial("65535") }`:
+            // the default is the out-of-range "use SCAN" sentinel, not Passive.
+            sscn: SimModeScan::DoNotUse,
             pini: false,
             tpro: false,
             bkpt: 0,

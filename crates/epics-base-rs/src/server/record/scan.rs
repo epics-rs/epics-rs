@@ -73,6 +73,68 @@ impl ScanType {
     }
 }
 
+/// `SSCN` — the simulation-mode scan field (`DBF_MENU`, `menu(menuScan)`).
+/// Unlike `SCAN`, its dbd default is the out-of-range sentinel `65535`
+/// (`field(SSCN,DBF_MENU){ menu(menuScan) initial("65535") }`, identical
+/// across all 21 records that carry SSCN), which C uses to mean "not set —
+/// keep scanning at SCAN while in simulation mode". Modeled as its own type
+/// so the `65535` sentinel can never leak into `SCAN`, whose value is always
+/// a valid menuScan index (0-9).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SimModeScan {
+    /// `menuScan(65535)` — "DO_NOT_USE": simulation mode keeps the SCAN rate.
+    /// This is the dbd default.
+    #[default]
+    DoNotUse,
+    /// A real menuScan choice, the same domain as `SCAN`.
+    Scan(ScanType),
+}
+
+impl SimModeScan {
+    /// C's sentinel value for "not set" (out of the 0-9 menuScan range).
+    pub const DO_NOT_USE: u16 = 65535;
+
+    /// Map a wire/menu index to a state. Only 0-9 are valid menuScan
+    /// choices; `65535` (and any other out-of-menu value) is the
+    /// "use SCAN" sentinel, matching the C dbd `initial("65535")`.
+    pub fn from_u16(v: u16) -> Self {
+        match v {
+            0..=9 => Self::Scan(ScanType::from_u16(v)),
+            _ => Self::DoNotUse,
+        }
+    }
+
+    pub fn from_str(s: &str) -> CaResult<Self> {
+        let s = s.trim();
+        // A numeric form (including "65535") resolves through `from_u16`
+        // so the sentinel round-trips; otherwise it is a menuScan label.
+        if let Ok(v) = s.parse::<u16>() {
+            return Ok(Self::from_u16(v));
+        }
+        Ok(Self::Scan(ScanType::from_str(s)?))
+    }
+
+    /// The `DBR_ENUM`/wire index: a real choice's menuScan index, or the
+    /// `65535` sentinel for [`Self::DoNotUse`].
+    pub fn to_u16(self) -> u16 {
+        match self {
+            Self::DoNotUse => Self::DO_NOT_USE,
+            Self::Scan(s) => s as u16,
+        }
+    }
+}
+
+impl std::fmt::Display for SimModeScan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // C serves the raw DBR_ENUM index 65535; there is no menuScan
+            // label for it, so render the sentinel value.
+            Self::DoNotUse => write!(f, "{}", Self::DO_NOT_USE),
+            Self::Scan(s) => s.fmt(f),
+        }
+    }
+}
+
 impl std::fmt::Display for ScanType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -87,5 +149,50 @@ impl std::fmt::Display for ScanType {
             Self::Sec02 => write!(f, ".2 second"),
             Self::Sec01 => write!(f, ".1 second"),
         }
+    }
+}
+
+#[cfg(test)]
+mod sim_mode_scan_tests {
+    use super::*;
+
+    #[test]
+    fn default_is_the_65535_sentinel() {
+        // C dbd `field(SSCN,DBF_MENU){ initial("65535") }`.
+        assert_eq!(SimModeScan::default(), SimModeScan::DoNotUse);
+        assert_eq!(SimModeScan::default().to_u16(), 65535);
+    }
+
+    #[test]
+    fn sentinel_round_trips_through_u16_and_str() {
+        assert_eq!(SimModeScan::from_u16(65535), SimModeScan::DoNotUse);
+        assert_eq!(
+            SimModeScan::from_str("65535").unwrap(),
+            SimModeScan::DoNotUse
+        );
+        assert_eq!(SimModeScan::DoNotUse.to_u16(), 65535);
+    }
+
+    #[test]
+    fn valid_menu_indices_map_to_scan_choices() {
+        for v in 0u16..=9 {
+            assert_eq!(
+                SimModeScan::from_u16(v),
+                SimModeScan::Scan(ScanType::from_u16(v))
+            );
+            assert_eq!(SimModeScan::from_u16(v).to_u16(), v);
+        }
+        // A menuScan label resolves to the matching choice.
+        assert_eq!(
+            SimModeScan::from_str(".1 second").unwrap(),
+            SimModeScan::Scan(ScanType::Sec01)
+        );
+    }
+
+    #[test]
+    fn out_of_menu_indices_collapse_to_the_sentinel() {
+        // 10..65534 are not menuScan choices; like 65535 they mean "use SCAN".
+        assert_eq!(SimModeScan::from_u16(10), SimModeScan::DoNotUse);
+        assert_eq!(SimModeScan::from_u16(40000), SimModeScan::DoNotUse);
     }
 }

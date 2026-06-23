@@ -24,9 +24,9 @@ use epics_base_rs::server::db_loader::{apply_fields, create_record};
 use epics_base_rs::types::EpicsValue;
 use std::path::PathBuf;
 
-/// Base records the Rust port models that also have a C dbd. `aSub` is handled
-/// separately (see `SKIP_RECORDS`). synApps records (busy, swait, scalcout,
-/// sseq, transform, asyn) have no epics-base dbd and are absent here by design.
+/// Base records the Rust port models that also have a C dbd. synApps records
+/// (busy, swait, scalcout, sseq, transform, asyn) have no epics-base dbd and are
+/// absent here by design.
 const BASE_RECORDS: &[&str] = &[
     "ai",
     "ao",
@@ -62,15 +62,6 @@ const BASE_RECORDS: &[&str] = &[
     "aSub",
 ];
 
-/// `aSub` carries ~148 per-argument initials (FTx=DOUBLE, NEx=1, NOx=1, ONVx,
-/// NEVx, NOVx, FTVx, EFLG) as fixed-size struct arrays (`[FTYPE_DOUBLE; N]`,
-/// `[1; N]`). Those array elements are not individually present in
-/// `field_list()`, so the loader's scalar field path cannot reach them and this
-/// dbd-parse loop cannot verify them. They are covered by `asub_record.rs` unit
-/// tests and their array `Default`. Skipped here, logged below — not silently
-/// dropped.
-const SKIP_RECORDS: &[&str] = &["aSub"];
-
 /// Common fields (shared `CommonFields`, not in any record's `field_list`) that
 /// legitimately carry a dbd initial. Verified outside this test:
 ///   - `SSCN`: `CommonFields.sscn` (=65535, `SimModeScan::DoNotUse`) — covered by
@@ -99,6 +90,37 @@ fn deviation_reason(record: &str, field: &str) -> Option<&'static str> {
 fn is_calcout_in_status(f: &str) -> bool {
     let b = f.as_bytes();
     f.len() == 4 && f.starts_with("IN") && f.ends_with('V') && (b'A'..=b'U').contains(&b[2])
+}
+
+/// A record field the port deliberately does not model: it is absent from
+/// `field_list()`, so a `.db` assignment lands in `common_fields` and has no
+/// effect. This is a *feature* gap, not a default divergence — the field has no
+/// modeled storage to diverge — so the dbd-initial check records it separately
+/// rather than flagging a mismatch. Returns the documented reason, or `None`.
+fn unmodeled_feature_reason(record: &str, field: &str) -> Option<&'static str> {
+    match record {
+        // aSub models the subroutine I/O arguments (`FTx`/`FTVx` element types,
+        // `NOx`/`NOVx` max counts, `NEx`/`NEVx` used counts, `INPx`/`OUTx`
+        // links, `A..U`/`VALx` values), all present in `field_list()` and
+        // verified by this test. It does not model the two output-monitoring
+        // features below.
+        "aSub" if field == "EFLG" => Some(
+            "EFLG (menu aSubEFLG: NEVER/ON_CHANGE/ALWAYS) selects when the record posts an \
+             output DB event after the subroutine runs; the port does not model subroutine \
+             output-event posting, so EFLG carries no state.",
+        ),
+        "aSub" if is_asub_onv(field) => Some(
+            "ONVx (Num. elements in OVLx) is SPC_NOMOD bookkeeping of the previous output-array \
+             length used to detect an output-size change; the port models neither the old \
+             output buffers OVLx nor their length, so ONVx carries no state.",
+        ),
+        _ => None,
+    }
+}
+
+/// `ONVA`..`ONVU` (single trailing letter A..U): aSub old-output-element counts.
+fn is_asub_onv(f: &str) -> bool {
+    f.len() == 4 && f.starts_with("ONV") && (b'A'..=b'U').contains(&f.as_bytes()[3])
 }
 
 /// Extract `(FIELD, initial_value)` for every `field(NAME,DBF_*) { … initial("V") … }`
@@ -199,7 +221,7 @@ fn rust_record_defaults_match_c_dbd_initials() {
     let mut checked = 0usize;
     let mut deviations: Vec<String> = Vec::new();
     let mut skipped_common: Vec<String> = Vec::new();
-    let mut skipped_records: Vec<String> = Vec::new();
+    let mut skipped_unmodeled: Vec<String> = Vec::new();
     // Fields whose default was verified by direct value comparison because the
     // loader's apply path could not reach them (not in field_list, or read-only
     // put_field). Logged so the loadability quirk stays visible.
@@ -207,11 +229,6 @@ fn rust_record_defaults_match_c_dbd_initials() {
     let mut mismatches: Vec<String> = Vec::new();
 
     for &record in BASE_RECORDS {
-        if SKIP_RECORDS.contains(&record) {
-            skipped_records.push(record.to_string());
-            continue;
-        }
-
         let path = dir.join(format!("{record}Record.dbd.pod"));
         let Ok(dbd) = std::fs::read_to_string(&path) else {
             mismatches.push(format!("{record}: dbd file missing at {}", path.display()));
@@ -230,6 +247,15 @@ fn rust_record_defaults_match_c_dbd_initials() {
             // elsewhere — see KNOWN_NON_FIELDLIST.
             if KNOWN_NON_FIELDLIST.contains(&field.as_str()) {
                 skipped_common.push(format!("{record}.{field} (C initial {initial:?})"));
+                continue;
+            }
+
+            // Record fields the port does not model at all (no field_list entry,
+            // no storage). A documented feature gap, not a default divergence.
+            if let Some(reason) = unmodeled_feature_reason(record, &field) {
+                skipped_unmodeled.push(format!(
+                    "{record}.{field} (C initial {initial:?}): {reason}"
+                ));
                 continue;
             }
 
@@ -289,15 +315,19 @@ fn rust_record_defaults_match_c_dbd_initials() {
 
     eprintln!(
         "dbd-initial parity: {checked} field defaults verified against C; \
-         {} documented deviations; {} common/unmodeled fields skipped; \
-         {} verified by value (loader can't set them: {value_fallback:?}); \
-         records skipped (array-backed, see SKIP_RECORDS): {skipped_records:?}",
+         {} documented deviations; {} common fields skipped; \
+         {} unmodeled-feature fields skipped; \
+         {} verified by value (loader can't set them: {value_fallback:?})",
         deviations.len(),
         skipped_common.len(),
+        skipped_unmodeled.len(),
         value_fallback.len(),
     );
     for d in &deviations {
         eprintln!("  deviation: {d}");
+    }
+    for u in &skipped_unmodeled {
+        eprintln!("  unmodeled feature: {u}");
     }
 
     assert!(

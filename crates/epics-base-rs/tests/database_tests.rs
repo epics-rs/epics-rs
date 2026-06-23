@@ -8303,3 +8303,43 @@ async fn waveform_nelm_ftvl_runtime_immutable_subarray_nelm_writable() {
         "subArray FTVL is special(SPC_NOMOD) — runtime caput must be rejected"
     );
 }
+
+/// aSub per-argument element-type fields `FTA..FTU` / `FTVA..FTVU` are
+/// `field(FTx,DBF_MENU){ menu(menuFtype) }` in C `aSubRecord.dbd`. A real `.db`
+/// sets them by menu *label* (`field(FTA,"DOUBLE")`), exactly like waveform
+/// `FTVL`. The loader resolves a menu label only when the record exposes the
+/// field's choice table; without it the label hits the integer parser, which
+/// rejects "DOUBLE" and fails the whole record load. This pins that the labels
+/// resolve through `menuFtype` (STRING=0, …, LONG=5, …, DOUBLE=10) and that the
+/// numeric per-argument fields (`NOx`/`NOVx`) keep loading.
+#[test]
+fn asub_ftype_menu_fields_load_by_label() {
+    use epics_base_rs::server::db_loader::{apply_fields, create_record};
+
+    let mut rec = create_record("aSub").expect("create aSub");
+    let mut common = Vec::new();
+    apply_fields(
+        &mut rec,
+        &[
+            ("FTA".into(), "LONG".into()), // input A element type, menuFtype label
+            ("FTVB".into(), "STRING".into()), // output B element type, menuFtype label
+            ("NOA".into(), "5".into()),    // input A max elements, numeric
+            ("NOVB".into(), "3".into()),   // output B max elements, numeric
+        ],
+        &mut common,
+    )
+    .expect("aSub FTx/FTVx menuFtype labels and NOx/NOVx counts must load from .db");
+
+    assert_eq!(
+        rec.get_field("FTA"),
+        Some(EpicsValue::Short(5)),
+        "FTA=\"LONG\" must resolve to menuFtype index 5"
+    );
+    assert_eq!(
+        rec.get_field("FTVB"),
+        Some(EpicsValue::Short(0)),
+        "FTVB=\"STRING\" must resolve to menuFtype index 0"
+    );
+    assert_eq!(rec.get_field("NOA"), Some(EpicsValue::Long(5)));
+    assert_eq!(rec.get_field("NOVB"), Some(EpicsValue::Long(3)));
+}

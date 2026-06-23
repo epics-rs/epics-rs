@@ -59,6 +59,11 @@ impl Default for LsoRecord {
         Self {
             val: PvString::new(),
             oval: PvString::new(),
+            // Intentional deviation from C `lsoRecord.dbd.pod`
+            // `field(SIZV,DBF_USHORT){ initial("41") }`: the port defaults to a
+            // larger 256-byte long-string buffer rather than C's 41. Kept by
+            // design (a .db that needs C's size sets SIZV explicitly); not a
+            // parity bug.
             sizv: 256,
             // C `lsoRecord.c:62-64`: `prec->len = 0; prec->olen = 0;`.
             len: 0,

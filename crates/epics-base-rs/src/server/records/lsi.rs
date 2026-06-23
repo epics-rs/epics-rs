@@ -56,6 +56,11 @@ impl Default for LsiRecord {
         Self {
             val: PvString::new(),
             oval: PvString::new(),
+            // Intentional deviation from C `lsiRecord.dbd.pod`
+            // `field(SIZV,DBF_USHORT){ initial("41") }`: the port defaults to a
+            // larger 256-byte long-string buffer rather than C's 41. Kept by
+            // design (a .db that needs C's size sets SIZV explicitly); not a
+            // parity bug.
             sizv: 256,
             // C `lsiRecord.c:58-60`: `prec->len = 0; prec->olen = 0;`
             // after the buffer is allocated. LEN only becomes

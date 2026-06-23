@@ -140,7 +140,11 @@ impl Default for WaveformRecord {
             lopr: 0.0,
             prec: 0,
             indx: 0,
-            malm: 0,
+            // C `subArrayRecord.dbd.pod` `field(MALM,DBF_ULONG){ initial("1") }`;
+            // C `init_record` also floors MALM to 1 (subArrayRecord.c:96-97), so
+            // MALM is never 0 — it is always a real source-view cap. (Ignored by
+            // non-subArray kinds, which never read the field.)
+            malm: 1,
             simm: 0,
             siml: String::new(),
             siol: String::new(),
@@ -658,6 +662,26 @@ impl Record for WaveformRecord {
         self.kind.as_record_type()
     }
 
+    /// subArray finalisation, mirroring C `subArrayRecord.c::init_record`
+    /// pass 0 (lines 96-104): MALM is floored to 1 (never 0), then NELM is
+    /// clamped down to MALM. This runs after the loader has applied every
+    /// field put, so the .db order of NELM/MALM/INDX no longer affects the
+    /// result. Process-time clamping in `set_val` (the readValue equivalent)
+    /// re-applies the same bounds each cycle. Non-subArray kinds have no MALM
+    /// and are untouched.
+    fn init_record(&mut self, pass: u8) -> CaResult<()> {
+        if pass == 0 && matches!(self.kind, ArrayKind::SubArray) {
+            if self.malm < 1 {
+                self.malm = 1;
+            }
+            if self.nelm > self.malm {
+                self.nelm = self.malm;
+                self.reallocate_val();
+            }
+        }
+        Ok(())
+    }
+
     /// `aao` is an output record; the rest of the array family read
     /// from INP. Output records take the device-write path in
     /// processing.rs (or fall through to the soft-link write when the
@@ -830,16 +854,15 @@ impl Record for WaveformRecord {
                             "NELM must be positive, got {n}"
                         )));
                     }
-                    // C parity for subArray: clamp NELM <= MALM
-                    // (subArrayRecord.c:310-311 in `readValue`,
-                    // init at line 103-104). Other array kinds do
-                    // not have MALM and are unaffected.
                     if matches!(self.kind, ArrayKind::SubArray) {
-                        // subArray: NELM is the slice length, clamped
-                        // to MALM; the buffer is re-derived from the
-                        // source on `set_val`, so a fresh zeroed
-                        // allocation here is correct.
-                        self.nelm = if self.malm > 0 { n.min(self.malm) } else { n };
+                        // subArray: NELM is the slice length; the buffer is
+                        // re-derived from the source on `set_val`, so a fresh
+                        // zeroed allocation here is correct. NO MALM clamp here
+                        // — C clamps NELM->MALM at init_record and at process
+                        // (subArrayRecord.c:103-104, 310-311), never at field
+                        // put, so the .db load order of NELM vs MALM cannot
+                        // matter. `init_record` and `set_val` apply the clamp.
+                        self.nelm = n;
                         self.reallocate_val();
                     } else {
                         // waveform/aai/aao: preserve the existing
@@ -888,16 +911,12 @@ impl Record for WaveformRecord {
                     EpicsValue::Short(v) => v as i32,
                     _ => return Err(CaError::TypeMismatch("INDX".into())),
                 };
-                // C parity (subArrayRecord.c::readValue:313-314):
-                // `if (indx >= malm) indx = malm - 1`. When MALM is
-                // 0 (not yet configured) keep the legacy `max(0)`
-                // floor only.
-                let v = v.max(0);
-                self.indx = if self.malm > 0 {
-                    v.min(self.malm - 1)
-                } else {
-                    v
-                };
+                // Store INDX as given (floored at 0). NO MALM clamp here — C
+                // clamps INDX->MALM-1 at process (subArrayRecord.c:313-314),
+                // never at field put, so the .db load order of INDX vs MALM
+                // cannot matter. `set_val` (the readValue equivalent) applies
+                // the clamp.
+                self.indx = v.max(0);
                 Ok(())
             }
             "MALM" if matches!(self.kind, ArrayKind::SubArray) => {
@@ -906,16 +925,11 @@ impl Record for WaveformRecord {
                     EpicsValue::Short(v) => v as i32,
                     _ => return Err(CaError::TypeMismatch("MALM".into())),
                 };
-                self.malm = v.max(0);
-                // C parity (subArrayRecord.c::init_record:103-104):
-                // shrinking MALM below NELM also clamps NELM. Apply
-                // the same re-clamp on each MALM put.
-                if self.malm > 0 && self.nelm > self.malm {
-                    self.nelm = self.malm;
-                }
-                if self.malm > 0 && self.indx >= self.malm {
-                    self.indx = self.malm - 1;
-                }
+                // C floors MALM to 1 (subArrayRecord.c:96-97); it is never 0.
+                // No NELM/INDX re-clamp here — both are clamped against MALM at
+                // `init_record` (post-load) and at process (310-314), so a MALM
+                // put in any .db load order is reconciled there, not here.
+                self.malm = v.max(1);
                 Ok(())
             }
             "EGU" => {
@@ -1013,15 +1027,21 @@ impl Record for WaveformRecord {
                 Err(e) => Err(e),
             };
         }
+        // C subArrayRecord.c process (readValue) clamps NELM and INDX against
+        // MALM every cycle (310-311, 313-314); MALM is always >= 1
+        // (init_record floors it, 96-97). This is the readValue equivalent, so
+        // apply the same clamps here — the slice is then correct regardless of
+        // the .db load order of NELM/MALM/INDX.
+        let malm = self.malm.max(1);
+        if self.nelm > malm {
+            self.nelm = malm;
+        }
+        if self.indx >= malm {
+            self.indx = malm - 1;
+        }
         let start = self.indx.max(0) as usize;
         let take = self.nelm.max(0) as usize;
-        // MALM=0 keeps the legacy "no extra cap" behaviour. When set,
-        // it bounds how much of the source we're allowed to look at.
-        let malm_cap = if self.malm > 0 {
-            self.malm as usize
-        } else {
-            usize::MAX
-        };
+        let malm_cap = malm as usize; // MALM is always a real source-view cap
         let nelm_buf = take; // physical buffer is sized to NELM
         macro_rules! slice {
             ($v:ident, $arr:ident, $variant:ident, $zero:expr) => {{
@@ -1136,6 +1156,10 @@ mod array_kind_tests {
     fn subarray_slices_input_at_indx_with_nelm_take() {
         let mut r = WaveformRecord::with_kind(ArrayKind::SubArray);
         // 4-element double buffer; consume up to 4 from offset 2.
+        // MALM is the source-view cap (C floors it to >= 1), so it must be at
+        // least the source length to expose the whole source — a real subArray
+        // .db sets MALM to the upstream waveform's NELM.
+        r.put_field("MALM", EpicsValue::Long(6)).unwrap();
         r.put_field("NELM", EpicsValue::Long(4)).unwrap();
         r.put_field("INDX", EpicsValue::Long(2)).unwrap();
         let source = EpicsValue::DoubleArray(vec![10.0, 11.0, 12.0, 13.0, 14.0, 15.0]);
@@ -1152,6 +1176,11 @@ mod array_kind_tests {
     #[test]
     fn subarray_indx_out_of_range_yields_nord_zero() {
         let mut r = WaveformRecord::with_kind(ArrayKind::SubArray);
+        // MALM=20 leaves INDX=10 un-clamped (10 < MALM), so the slice starts
+        // past the 3-element source and yields NORD=0. With MALM at/under the
+        // source length C would instead clamp INDX to MALM-1 (313-314) and read
+        // a tail; this case isolates the genuine "INDX beyond source" path.
+        r.put_field("MALM", EpicsValue::Long(20)).unwrap();
         r.put_field("NELM", EpicsValue::Long(3)).unwrap();
         r.put_field("INDX", EpicsValue::Long(10)).unwrap();
         let source = EpicsValue::LongArray(vec![1, 2, 3]);
@@ -1163,6 +1192,9 @@ mod array_kind_tests {
     #[test]
     fn subarray_partial_tail_zero_pads_to_nelm() {
         let mut r = WaveformRecord::with_kind(ArrayKind::SubArray);
+        // MALM=5 == source length: the whole source is visible, the slice from
+        // offset 3 has only 2 valid elements and zero-pads the rest to NELM.
+        r.put_field("MALM", EpicsValue::Long(5)).unwrap();
         r.put_field("NELM", EpicsValue::Long(5)).unwrap();
         r.put_field("INDX", EpicsValue::Long(3)).unwrap();
         let source = EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
@@ -1202,6 +1234,43 @@ mod array_kind_tests {
         r.put_field("MALM", EpicsValue::Long(100)).unwrap();
         assert_eq!(r.get_field("INDX"), Some(EpicsValue::Long(5)));
         assert_eq!(r.get_field("MALM"), Some(EpicsValue::Long(100)));
+    }
+
+    #[test]
+    fn subarray_malm_defaults_to_one_and_floors_zero() {
+        // C `subArrayRecord.dbd` `initial("1")` + `init_record` floor
+        // (subArrayRecord.c:96-97): MALM is never 0.
+        let r = WaveformRecord::with_kind(ArrayKind::SubArray);
+        assert_eq!(r.get_field("MALM"), Some(EpicsValue::Long(1)));
+        let mut z = WaveformRecord::with_kind(ArrayKind::SubArray);
+        z.put_field("MALM", EpicsValue::Long(0)).unwrap();
+        assert_eq!(
+            z.get_field("MALM"),
+            Some(EpicsValue::Long(1)),
+            "MALM put of 0 floors back to 1"
+        );
+    }
+
+    #[test]
+    fn subarray_init_record_clamps_nelm_to_malm_independent_of_load_order() {
+        // The defect this closes: per-put clamping made the clamped NELM depend
+        // on whether the .db set NELM before or after MALM. C clamps NELM->MALM
+        // in init_record (96-104) post-load, so the order is irrelevant. Both
+        // orders must converge to NELM == MALM after init_record.
+        let mut nelm_first = WaveformRecord::with_kind(ArrayKind::SubArray);
+        nelm_first.put_field("NELM", EpicsValue::Long(50)).unwrap();
+        nelm_first.put_field("MALM", EpicsValue::Long(8)).unwrap();
+        nelm_first.init_record(0).unwrap();
+        assert_eq!(nelm_first.nelm, 8, "NELM clamped down to MALM at init");
+
+        let mut malm_first = WaveformRecord::with_kind(ArrayKind::SubArray);
+        malm_first.put_field("MALM", EpicsValue::Long(8)).unwrap();
+        malm_first.put_field("NELM", EpicsValue::Long(50)).unwrap();
+        malm_first.init_record(0).unwrap();
+        assert_eq!(
+            malm_first.nelm, 8,
+            "same clamp regardless of NELM/MALM .db load order"
+        );
     }
 
     #[test]

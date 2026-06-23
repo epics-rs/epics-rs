@@ -1366,7 +1366,7 @@ impl PvDatabase {
         // (rather than after the fetch) lets `select_input_links` restrict
         // the fetch list, so non-selected links raise no monitors and no
         // spurious link-alarm SEVR.
-        // Captured for the Specified-mode fetch gate (R5-8): SELM==0 and
+        // Captured for the Specified-mode fetch gate: SELM==0 and
         // whether an NVL link is configured. C `selRecord.c::process`
         // (114) skips `do_sel` when `fetch_values` fails, and in
         // Specified mode a failed NVL read is one such failure.
@@ -1421,9 +1421,9 @@ impl PvDatabase {
         // record via `set_resolved_input_links` so its `process()` can
         // observe link-fetch success (C `RTN_SUCCESS(dbGetLink(...))`).
         let mut resolved_link_fields: Vec<&'static str> = Vec::new();
-        // R5-8: sel `Specified`-mode fetch gate. C `selRecord.c::process`
+        // sel `Specified`-mode fetch gate. C `selRecord.c::process`
         // (114) runs `do_sel` only when `fetch_values` succeeds. In
-        // Specified mode the fetch list is exactly INP[SELN] (R5-7
+        // Specified mode the fetch list is exactly INP[SELN] (via
         // `select_input_links`), so the gate fails when the NVL link or the
         // selected input was configured but did not resolve this cycle.
         let sel_fetch_failed: bool;
@@ -1501,7 +1501,7 @@ impl PvDatabase {
             }
             multi_input_values = results;
 
-            // R5-8: evaluate the Specified-mode fetch gate while
+            // Evaluate the Specified-mode fetch gate while
             // `link_info` is in scope. A *configured* (non-empty) selected
             // input that did not reach `resolved_link_fields`, or a
             // configured NVL link that did not resolve, means C
@@ -1728,7 +1728,7 @@ impl PvDatabase {
                 .record
                 .set_resolved_input_links(&resolved_link_fields);
 
-            // R5-8: report the sel Specified-mode fetch-gate outcome. C
+            // Report the sel Specified-mode fetch-gate outcome. C
             // `selRecord.c::process` (114) skips `do_sel` — freezing
             // VAL/UDF — when `fetch_values` fails. Non-sel records ignore
             // this (default no-op). Reported per cycle; sel consumes it.

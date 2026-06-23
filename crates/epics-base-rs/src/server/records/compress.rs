@@ -612,9 +612,26 @@ impl Record for CompressRecord {
                 }
                 _ => Err(CaError::TypeMismatch("IHIL".into())),
             },
-            "NSAM" | "OFF" | "NUSE" | "INX" | "CVB" => {
-                Err(CaError::ReadOnlyField(name.to_string()))
-            }
+            // C `field(NSAM,DBF_ULONG){ promptgroup special(SPC_NOMOD) }`:
+            // settable at `.db` load, runtime-immutable (the field_io
+            // `read_only` gate; the FieldDesc carries `read_only: true`). This
+            // arm serves only the load path, sizing the sample buffer like
+            // `new()`.
+            "NSAM" => match value {
+                EpicsValue::Long(n) => {
+                    let n = n.max(1);
+                    self.nsam = n as i32;
+                    self.val = vec![0.0; n as usize];
+                    // Resizing the ring invalidates the cursor and used count.
+                    self.nuse = 0;
+                    self.off = 0;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("NSAM".into())),
+            },
+            // OFF/NUSE/INX/CVB are runtime buffer state (no promptgroup) —
+            // never client-writable.
+            "OFF" | "NUSE" | "INX" | "CVB" => Err(CaError::ReadOnlyField(name.to_string())),
             "EGU" => {
                 if let EpicsValue::String(s) = value {
                     self.egu = s;

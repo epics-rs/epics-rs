@@ -394,8 +394,25 @@ impl Record for HistogramRecord {
                 }
                 _ => Err(CaError::TypeMismatch("SIMS".into())),
             },
-            // OLDSIMM is special(SPC_NOMOD) — saved copy, not client-writable.
-            "NELM" | "WDTH" | "MCNT" | "OLDSIMM" => Err(CaError::ReadOnlyField(name.to_string())),
+            // C `field(NELM,DBF_USHORT){ promptgroup special(SPC_NOMOD) }`:
+            // settable at `.db` load (dbStaticLib bypasses SPC_NOMOD), runtime-
+            // immutable. The runtime block is the field_io `read_only` gate (the
+            // FieldDesc carries `read_only: true`), so a CA/PVA caput is still
+            // rejected; this arm serves only the load path (`apply_fields`),
+            // sizing the bin array exactly like `new()`.
+            "NELM" => match value {
+                EpicsValue::Long(n) => {
+                    let n = n.max(1);
+                    self.nelm = n as i32;
+                    self.val = vec![0; n as usize];
+                    self.recompute_wdth();
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("NELM".into())),
+            },
+            // WDTH/MCNT are computed runtime fields (no promptgroup) and OLDSIMM
+            // is the SPC_NOMOD saved copy — never client-writable, even at load.
+            "WDTH" | "MCNT" | "OLDSIMM" => Err(CaError::ReadOnlyField(name.to_string())),
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
     }

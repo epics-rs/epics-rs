@@ -8154,3 +8154,93 @@ async fn sel_specified_mode_empty_selected_link_computes_nan_not_frozen() {
         other => panic!("expected Double(NaN), got {other:?}"),
     }
 }
+
+/// `promptgroup`/`special(SPC_NOMOD)` config fields must be settable at `.db`
+/// load (dbStaticLib bypasses SPC_NOMOD) yet runtime-immutable, while a `pp`
+/// config field stays writable on both paths. Closes the divergence where the
+/// port rejected the load assignment (`put_field` hard-error) or dropped it
+/// (field absent from `field_list`).
+///
+/// Covered fields (C dbd):
+///   - `histogram.NELM` — `promptgroup special(SPC_NOMOD)`: load resizes bins.
+///   - `compress.NSAM`   — `promptgroup special(SPC_NOMOD)`: load resizes buffer.
+///   - `subArray.MALM`   — `special(SPC_NOMOD)`: load sets, runtime rejects.
+///   - `subArray.INDX`   — `pp(TRUE)`: load AND runtime set.
+#[tokio::test]
+async fn promptgroup_config_fields_load_settable_runtime_immutable() {
+    use epics_base_rs::server::db_loader::{apply_fields, create_record};
+
+    // --- LOAD half: apply_fields (the `.db` load coercion) must store these
+    //     fields, resizing the backing array where one exists. ---
+    let mut hist = create_record("histogram").expect("create histogram");
+    let mut common: Vec<(String, EpicsValue)> = Vec::new();
+    apply_fields(&mut hist, &[("NELM".into(), "5".into())], &mut common)
+        .expect("histogram NELM is .db-settable (promptgroup)");
+    assert_eq!(hist.get_field("NELM"), Some(EpicsValue::Long(5)));
+    match hist.get_field("VAL") {
+        Some(EpicsValue::LongArray(v)) => assert_eq!(v.len(), 5, "NELM load resizes the bin array"),
+        other => panic!("histogram VAL should be a 5-element LongArray, got {other:?}"),
+    }
+
+    let mut comp = create_record("compress").expect("create compress");
+    let mut common = Vec::new();
+    apply_fields(&mut comp, &[("NSAM".into(), "7".into())], &mut common)
+        .expect("compress NSAM is .db-settable (promptgroup)");
+    assert_eq!(comp.get_field("NSAM"), Some(EpicsValue::Long(7)));
+
+    let mut sarr = create_record("subArray").expect("create subArray");
+    let mut common = Vec::new();
+    apply_fields(
+        &mut sarr,
+        &[("MALM".into(), "8".into()), ("INDX".into(), "3".into())],
+        &mut common,
+    )
+    .expect("subArray MALM/INDX are .db-settable (in field_list)");
+    assert_eq!(sarr.get_field("MALM"), Some(EpicsValue::Long(8)));
+    assert_eq!(sarr.get_field("INDX"), Some(EpicsValue::Long(3)));
+
+    // --- RUNTIME half: a CA caput is rejected for the SPC_NOMOD fields by the
+    //     field_io read_only gate, but accepted for the pp field (subArray INDX). ---
+    let db = PvDatabase::new();
+    db.add_record("HIST", create_record("histogram").unwrap())
+        .await
+        .unwrap();
+    db.add_record("COMP", create_record("compress").unwrap())
+        .await
+        .unwrap();
+    db.add_record("SARR", create_record("subArray").unwrap())
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            db.put_record_field_from_ca("HIST", "NELM", EpicsValue::Long(5))
+                .await,
+            Err(CaError::ReadOnlyField(_))
+        ),
+        "histogram NELM is SPC_NOMOD — runtime caput must be rejected"
+    );
+    assert!(
+        matches!(
+            db.put_record_field_from_ca("COMP", "NSAM", EpicsValue::Long(7))
+                .await,
+            Err(CaError::ReadOnlyField(_))
+        ),
+        "compress NSAM is SPC_NOMOD — runtime caput must be rejected"
+    );
+    assert!(
+        matches!(
+            db.put_record_field_from_ca("SARR", "MALM", EpicsValue::Long(8))
+                .await,
+            Err(CaError::ReadOnlyField(_))
+        ),
+        "subArray MALM is SPC_NOMOD — runtime caput must be rejected"
+    );
+
+    db.put_record_field_from_ca("SARR", "INDX", EpicsValue::Long(2))
+        .await
+        .expect("subArray INDX is pp(TRUE) — runtime caput must succeed");
+    let rec = db.get_record("SARR").await.expect("SARR exists");
+    let indx = rec.read().await.record.get_field("INDX");
+    assert_eq!(indx, Some(EpicsValue::Long(2)), "runtime INDX caput landed");
+}

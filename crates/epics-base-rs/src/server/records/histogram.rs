@@ -46,7 +46,13 @@ pub struct HistogramRecord {
 
 impl Default for HistogramRecord {
     fn default() -> Self {
-        let nelm = 10;
+        // C `histogramRecord.dbd.pod` `field(NELM,DBF_USHORT){ initial("1") }`:
+        // an unset NELM defaults to 1 bucket, not 10. NELM is read-only and
+        // sizes VAL, so a .db that omits it must read back NELM=1 / a
+        // 1-element VAL to match C. (ULIM/LLIM keep the Rust convenience
+        // defaults; their C initial() is 0 — a separate, out-of-scope
+        // divergence, see the R5-15 report.)
+        let nelm = 1;
         let ulim = 10.0;
         let llim = 0.0;
         Self {
@@ -418,6 +424,17 @@ impl Record for HistogramRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // C `histogramRecord.dbd.pod` `field(NELM,DBF_USHORT){ initial("1") }` —
+    // a histogram built without an explicit NELM defaults to 1 bucket (and a
+    // 1-element VAL), not the old hand-coded 10.
+    #[test]
+    fn nelm_defaults_to_one_per_dbd_initial() {
+        let rec = HistogramRecord::default();
+        assert_eq!(rec.nelm, 1);
+        assert_eq!(rec.val.len(), 1, "VAL is sized by NELM");
+        assert_eq!(rec.get_field("NELM"), Some(EpicsValue::Long(1)));
+    }
 
     /// a counter at the `UINT_MAX` bit pattern must wrap to 0,
     /// never panic the way a signed `i32 += 1` would at overflow.

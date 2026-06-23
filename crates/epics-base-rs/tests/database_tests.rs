@@ -6786,6 +6786,34 @@ async fn test_seq_skips_sell_in_all_mode_reads_in_specified() {
     }
 }
 
+/// R5-15 — fanout/dfanout/seq `SELN` carries dbd `initial("1")`: a record
+/// constructed without an explicit SELN must default to 1, not the
+/// hand-coded 0. Observable in SELM=Specified/Mask when the .db omits SELN
+/// (All ignores SELN). dfanout's Specified output is `seln - 1`, so 0 would
+/// drive nothing where C drives OUTA.
+#[tokio::test]
+async fn test_fanout_dfanout_seq_seln_default_is_one() {
+    use epics_base_rs::server::records::dfanout::DfanoutRecord;
+    use epics_base_rs::server::records::fanout::FanoutRecord;
+    use epics_base_rs::server::records::seq::SeqRecord;
+
+    assert_eq!(
+        FanoutRecord::new().get_field("SELN"),
+        Some(EpicsValue::UShort(1)),
+        "fanout SELN dbd initial(\"1\")"
+    );
+    assert_eq!(
+        DfanoutRecord::new(0.0).get_field("SELN"),
+        Some(EpicsValue::UShort(1)),
+        "dfanout SELN dbd initial(\"1\")"
+    );
+    assert_eq!(
+        SeqRecord::new().get_field("SELN"),
+        Some(EpicsValue::UShort(1)),
+        "seq SELN dbd initial(\"1\")"
+    );
+}
+
 /// BUG 5 — `putAcks` (C `dbAccess.c:1303-1315`) compares the written
 /// severity against the STORED unacknowledged severity `acks`, not
 /// against the current `sevr`; `putAckt` (C `dbAccess.c:1285-1301`)

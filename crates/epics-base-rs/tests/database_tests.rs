@@ -7656,6 +7656,158 @@ async fn asub_eflg_gates_valx_output_monitor_posting() {
     );
 }
 
+/// aSub `LFLG=READ` re-reads the subroutine name from the `SUBL` link each
+/// process and re-resolves the function from the registry when it changed
+/// (C `aSubRecord.c::fetch_values`). A name not in the registry is C
+/// `S_db_BadSub`: the subroutine is not run (VAL frozen), ONAM kept for retry.
+#[tokio::test]
+async fn asub_lflg_read_reresolves_subroutine_from_subl_link() {
+    use epics_base_rs::server::records::asub_record::ASubRecord;
+    use epics_base_rs::server::records::stringout::StringoutRecord;
+    use std::collections::HashMap;
+
+    let db = PvDatabase::new();
+
+    // Two registered subroutines; each publishes its identity via VAL (the
+    // aSub return-status -> VAL contract, C `aSubRecord.c:224`).
+    let mk = |status: i64| -> Arc<SubroutineFn> {
+        Arc::new(Box::new(move |_: &mut dyn Record| Ok(status)) as SubroutineFn)
+    };
+    let mut registry: HashMap<String, Arc<SubroutineFn>> = HashMap::new();
+    registry.insert("sub_a".into(), mk(11));
+    registry.insert("sub_b".into(), mk(22));
+    db.install_subroutine_registry(registry).await;
+
+    // A string record holds the current subroutine name; SUBL is a DB link
+    // to it (the realistic LFLG=READ wiring).
+    db.add_record("NAME_HOLDER", Box::new(StringoutRecord::new("sub_a")))
+        .await
+        .unwrap();
+
+    let mut rec = ASubRecord::default();
+    rec.put_field("LFLG", EpicsValue::Short(1)).unwrap(); // READ
+    rec.put_field("SUBL", EpicsValue::String("NAME_HOLDER".into()))
+        .unwrap();
+    db.add_record("ASUB_L", Box::new(rec)).await.unwrap();
+
+    let proc = |db: &PvDatabase| {
+        let db = db.clone();
+        async move {
+            let mut visited = HashSet::new();
+            db.process_record_with_links("ASUB_L", &mut visited, 0)
+                .await
+                .unwrap();
+        }
+    };
+    let field = |db: &PvDatabase, f: &'static str| {
+        let db = db.clone();
+        async move {
+            let arc = db.get_record("ASUB_L").await.unwrap();
+            let inst = arc.read().await;
+            inst.record.get_field(f)
+        }
+    };
+
+    // First process: name changed (""->sub_a) -> resolve + run sub_a.
+    proc(&db).await;
+    assert_eq!(
+        field(&db, "SNAM").await,
+        Some(EpicsValue::String("sub_a".into())),
+        "SNAM must track the SUBL link value"
+    );
+    assert_eq!(
+        field(&db, "ONAM").await,
+        Some(EpicsValue::String("sub_a".into())),
+        "ONAM must be set to the resolved name"
+    );
+    assert_eq!(
+        field(&db, "VAL").await,
+        Some(EpicsValue::Double(11.0)),
+        "sub_a must have run (VAL = its return status)"
+    );
+
+    // Repoint the holder to sub_b, process: re-resolve + run sub_b.
+    {
+        let arc = db.get_record("NAME_HOLDER").await.unwrap();
+        let mut inst = arc.write().await;
+        inst.record
+            .put_field("VAL", EpicsValue::String("sub_b".into()))
+            .unwrap();
+    }
+    proc(&db).await;
+    assert_eq!(
+        field(&db, "ONAM").await,
+        Some(EpicsValue::String("sub_b".into())),
+        "ONAM must follow the changed name"
+    );
+    assert_eq!(
+        field(&db, "VAL").await,
+        Some(EpicsValue::Double(22.0)),
+        "sub_b must have run after the name changed"
+    );
+
+    // Repoint to an unregistered name: C S_db_BadSub -> do_sub skipped.
+    {
+        let arc = db.get_record("NAME_HOLDER").await.unwrap();
+        let mut inst = arc.write().await;
+        inst.record
+            .put_field("VAL", EpicsValue::String("missing".into()))
+            .unwrap();
+    }
+    proc(&db).await;
+    assert_eq!(
+        field(&db, "SNAM").await,
+        Some(EpicsValue::String("missing".into())),
+        "SNAM still tracks the link value even when unresolvable"
+    );
+    assert_eq!(
+        field(&db, "ONAM").await,
+        Some(EpicsValue::String("sub_b".into())),
+        "ONAM must be kept (not advanced) on a bad sub, so it retries"
+    );
+    assert_eq!(
+        field(&db, "VAL").await,
+        Some(EpicsValue::Double(22.0)),
+        "bad sub: subroutine not run, VAL frozen at the last good result"
+    );
+}
+
+/// aSub `LFLG=IGNORE` (the default) resolves its subroutine from SNAM once at
+/// init via the function registry (C `aSubRecord.c::init_record` ->
+/// `registryFunctionFind`), wired by `wire_subroutines` on the `.db` path.
+#[tokio::test]
+async fn asub_lflg_ignore_subroutine_wired_by_snam_at_init() {
+    use epics_base_rs::server::ioc_builder::IocBuilder;
+    use std::collections::HashMap;
+
+    let db_content = r#"
+record(aSub, "ASUB_S") {
+    field(SNAM, "my_routine")
+}
+"#;
+    let (db, _) = IocBuilder::new()
+        .db_string(db_content, &HashMap::new())
+        .unwrap()
+        .register_subroutine("my_routine", |_: &mut dyn Record| Ok(7))
+        .build()
+        .await
+        .unwrap();
+
+    // The routine was wired at init; processing runs it and publishes its
+    // return status as VAL (C `aSubRecord.c:224`).
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ASUB_S", &mut visited, 0)
+        .await
+        .unwrap();
+    let arc = db.get_record("ASUB_S").await.unwrap();
+    let inst = arc.read().await;
+    assert_eq!(
+        inst.record.get_field("VAL"),
+        Some(EpicsValue::Double(7.0)),
+        "aSub LFLG=IGNORE: subroutine resolved from SNAM at init must run"
+    );
+}
+
 /// ao OMSL=closed_loop + OIF=Incremental must add DOL to PVAL (the last
 /// actual output), not the current VAL. C `fetch_value`
 /// (aoRecord.c:447-455) sets `prec->val = prec->pval` before

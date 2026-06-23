@@ -101,9 +101,9 @@ fn unmodeled_feature_reason(record: &str, field: &str) -> Option<&'static str> {
     match record {
         // aSub models the subroutine I/O arguments (`FTx`/`FTVx` element types,
         // `NOx`/`NOVx` max counts, `NEx`/`NEVx` used counts, `INPx`/`OUTx`
-        // links, `A..U`/`VALx` values, plus `EFLG`/`PREC`), all present in
-        // `field_list()` and verified by this test. It does not model the
-        // output-monitoring bookkeeping below.
+        // links, `A..U`/`VALx` values, plus `EFLG`/`PREC`/`LFLG`/`SUBL`/`ONAM`),
+        // all present in `field_list()`. It does not model the output-monitoring
+        // bookkeeping below.
         "aSub" if is_asub_onv(field) => Some(
             "ONVx (Num. elements in OVLx) is SPC_NOMOD bookkeeping of the previous output-array \
              length used to detect an output-size change; the port models neither the old \

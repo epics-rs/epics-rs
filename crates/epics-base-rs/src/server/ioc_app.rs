@@ -837,6 +837,11 @@ impl IocApplication {
         let record_count =
             wire_device_support(&db, &device_factories, &dynamic_device_factory).await?;
         announce!(InitHookState::AfterInitDevSup);
+        // Retain the registry in the database for runtime re-resolution
+        // (aSub LFLG=READ / SUBL); `wire_subroutines` then performs the
+        // static init-time SNAM resolution (C `init_record`).
+        db.install_subroutine_registry(subroutine_registry.clone())
+            .await;
         wire_subroutines(&db, &subroutine_registry).await;
         let io_intr_count = setup_io_intr(db.clone()).await;
         setup_property_posts(db.clone()).await;
@@ -1108,7 +1113,11 @@ async fn wire_subroutines(db: &PvDatabase, registry: &HashMap<String, Arc<Subrou
     for name in names {
         if let Some(rec_arc) = db.get_record(&name).await {
             let mut instance = rec_arc.write().await;
-            if instance.record.record_type() == "sub" {
+            // Both `sub` and `aSub` resolve their subroutine from SNAM via the
+            // function registry at init (C `subRecord.c` / `aSubRecord.c`
+            // `init_record` -> `registryFunctionFind`).
+            let rt = instance.record.record_type();
+            if rt == "sub" || rt == "aSub" {
                 if let Some(crate::types::EpicsValue::String(snam)) =
                     instance.record.get_field("SNAM")
                 {

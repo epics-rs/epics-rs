@@ -331,8 +331,10 @@ impl IocBuilder {
                         device_support::wire_device_to_record(&mut instance, dev);
                     }
                 }
-                // Subroutine resolution for sub records
-                if instance.record.record_type() == "sub" {
+                // Subroutine resolution for sub / aSub records (C
+                // `init_record` -> `registryFunctionFind` for both types).
+                let rt = instance.record.record_type();
+                if rt == "sub" || rt == "aSub" {
                     if let Some(EpicsValue::String(snam)) = instance.record.get_field("SNAM") {
                         if let Some(sub_fn) =
                             self.subroutine_registry.get(snam.as_str_lossy().as_ref())
@@ -343,6 +345,12 @@ impl IocBuilder {
                 }
             }
         }
+
+        // Retain the registry in the database for runtime re-resolution
+        // (aSub LFLG=READ / SUBL); the static SNAM wiring above already
+        // performed init-time resolution (C `init_record`).
+        db.install_subroutine_registry(self.subroutine_registry.clone())
+            .await;
 
         // 4. Autosave restore
         if let Some(ref autosave_cfg) = self.autosave_config {

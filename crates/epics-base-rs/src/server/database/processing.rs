@@ -225,6 +225,23 @@ fn complete_put_notify(inst: &mut RecordInstance) {
     }
 }
 
+/// Result of an aSub LFLG=READ subroutine re-resolution
+/// (C `aSubRecord.c::fetch_values`). Computed outside the record's process
+/// lock (the SUBL link read may touch another record) and applied inside it.
+struct AsubDynamicSub {
+    /// SNAM read from the SUBL link this cycle — written back to the record
+    /// (C `dbGetLink` writes SNAM every READ cycle). `None` only when the
+    /// link read failed (C `if (status) return status`), leaving SNAM as-is.
+    snam: Option<String>,
+    /// `Some` → swap the live subroutine and set ONAM to `snam` (the name
+    /// changed and was found in the registry).
+    swap: Option<Arc<crate::server::record::SubroutineFn>>,
+    /// `true` → do not run the subroutine this cycle, matching C skipping
+    /// `do_sub`: the link read failed, or the changed name was not registered
+    /// (`S_db_BadSub`).
+    skip_run: bool,
+}
+
 /// If a CA TSEL link's pvname targets a record's `.TIME` field, return
 /// the record name with the `.TIME` suffix stripped; otherwise `None`.
 ///
@@ -773,6 +790,87 @@ impl PvDatabase {
         // when the link was empty / the target completed synchronously.
         waitset.leave();
         Some(completion)
+    }
+
+    /// aSub LFLG=READ: read the subroutine name from the SUBL link and, when
+    /// it changed, re-resolve the function from the registry. C
+    /// `aSubRecord.c::fetch_values`. Returns `None` for any record that is
+    /// not an aSub in READ mode (the common case), so the caller pays only a
+    /// single brief read lock. Run BEFORE the process write lock so the SUBL
+    /// link read cannot deadlock against this record.
+    async fn resolve_asub_dynamic_subroutine(
+        &self,
+        rec: &Arc<RwLock<RecordInstance>>,
+    ) -> Option<AsubDynamicSub> {
+        let (subl, onam) = {
+            let inst = rec.read().await;
+            if inst.record.record_type() != "aSub" {
+                return None;
+            }
+            // LFLG: IGNORE=0 (static, resolved at init), READ=1 (dynamic).
+            let lflg = inst
+                .record
+                .get_field("LFLG")
+                .and_then(|v| v.to_f64())
+                .unwrap_or(0.0) as i16;
+            if lflg != 1 {
+                return None;
+            }
+            let read_str = |f: &str| match inst.record.get_field(f) {
+                Some(EpicsValue::String(s)) => s.as_str_lossy().into_owned(),
+                _ => String::new(),
+            };
+            (read_str("SUBL"), read_str("ONAM"))
+        };
+
+        // Read the current name from SUBL. A constant link's text IS the name
+        // (C `recGblInitConstantLink` / `dbGetLink` on a constant); a
+        // DB/CA/PVA link is read for its string value.
+        let name: Option<String> = if subl.is_empty() {
+            Some(String::new())
+        } else {
+            match crate::server::record::parse_link_v2(&subl) {
+                crate::server::record::ParsedLink::Constant(s) => Some(s),
+                other => self.read_link_with_alarm(&other).await.0.map(|v| match v {
+                    EpicsValue::String(s) => s.as_str_lossy().into_owned(),
+                    o => o.to_f64().map(|f| f.to_string()).unwrap_or_default(),
+                }),
+            }
+        };
+
+        let Some(name) = name else {
+            // Link read failed — C `if (status) return status` skips do_sub.
+            return Some(AsubDynamicSub {
+                snam: None,
+                swap: None,
+                skip_run: true,
+            });
+        };
+
+        // Re-resolve only when the name changed (C `strcmp(snam, onam)`); an
+        // empty name never resolves (do_sub's `snam[0]==0` short-circuit).
+        if !name.is_empty() && name != onam {
+            match self.find_subroutine_named(&name).await {
+                Some(f) => Some(AsubDynamicSub {
+                    snam: Some(name),
+                    swap: Some(f),
+                    skip_run: false,
+                }),
+                // Name changed but not registered — C returns S_db_BadSub,
+                // skipping do_sub; ONAM is left unchanged so it retries.
+                None => Some(AsubDynamicSub {
+                    snam: Some(name),
+                    swap: None,
+                    skip_run: true,
+                }),
+            }
+        } else {
+            Some(AsubDynamicSub {
+                snam: Some(name),
+                swap: None,
+                skip_run: false,
+            })
+        }
     }
 
     async fn process_record_with_links_inner(
@@ -1522,6 +1620,13 @@ impl PvDatabase {
             link_alarms.push(pair);
         }
 
+        // aSub LFLG=READ: re-read the subroutine name from the SUBL link and,
+        // if it changed, re-resolve the function — computed here, before the
+        // process write lock, so the SUBL link read cannot deadlock against
+        // this record (C `aSubRecord.c::fetch_values`). `None` for everything
+        // that is not an aSub in READ mode.
+        let asub_dynamic = self.resolve_asub_dynamic_subroutine(&rec).await;
+
         // 2. Lock record, apply INP/DOL, process, evaluate alarms, build snapshot
         let (snapshot, out_info, flnk_name, process_actions, alarm_posts) = {
             let mut instance = rec.write().await;
@@ -1771,13 +1876,38 @@ impl PvDatabase {
                 instance.record.set_process_context(&ctx);
             }
 
+            // Apply the aSub LFLG=READ resolution computed above (outside the
+            // lock): write the read-back SNAM, swap the subroutine + set ONAM
+            // when the name changed, and skip running it when the name was bad
+            // (C `fetch_values` returning `S_db_BadSub` → `process` skips
+            // `do_sub`).
+            let mut skip_subroutine = false;
+            if let Some(ds) = &asub_dynamic {
+                if let Some(snam) = &ds.snam {
+                    let _ = instance
+                        .record
+                        .put_field("SNAM", EpicsValue::String(snam.as_str().into()));
+                }
+                if let Some(func) = &ds.swap {
+                    instance.subroutine = Some(func.clone());
+                    if let Some(snam) = &ds.snam {
+                        let _ = instance
+                            .record
+                            .put_field("ONAM", EpicsValue::String(snam.as_str().into()));
+                    }
+                }
+                skip_subroutine = ds.skip_run;
+            }
+
             // Invoke the registered subroutine (sub/aSub SNAM) before the
             // record body, on the same dispatch path as process_local. The
             // framework owns the SubroutineFn registry (the record's own
             // process() is a no-op for sub/aSub), so without this the main
             // engine path — SCAN, event, CA-put-to-PP, FLNK — never ran the
             // subroutine and VAL/VALA..VALU/OUTA..OUTU never updated.
-            instance.run_registered_subroutine()?;
+            if !skip_subroutine {
+                instance.run_registered_subroutine()?;
+            }
 
             // Process
             let mut outcome = instance.record.process()?;

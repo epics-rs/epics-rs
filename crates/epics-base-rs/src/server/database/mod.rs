@@ -264,6 +264,12 @@ struct PvDatabaseInner {
     /// acquire these gates, so no two of them can interleave on a
     /// shared record. See [`record_lock`].
     record_locks: record_lock::RecordLockRegistry,
+    /// Subroutine functions by name, retained at runtime so the processing
+    /// path can re-resolve an aSub's subroutine when its name changes
+    /// (C `aSubRecord.c::fetch_values` `registryFunctionFind`, LFLG=READ /
+    /// SUBL). Populated once at iocInit from the IocApp/IocBuilder registry;
+    /// read-only thereafter.
+    subroutine_registry: RwLock<HashMap<String, Arc<crate::server::record::SubroutineFn>>>,
 }
 
 /// Database of all process variables hosted by this server.
@@ -427,8 +433,35 @@ impl PvDatabase {
                 pini_done: std::sync::atomic::AtomicBool::new(false),
                 pini_notify: tokio::sync::Notify::new(),
                 record_locks: record_lock::RecordLockRegistry::default(),
+                subroutine_registry: RwLock::new(HashMap::new()),
             }),
         }
+    }
+
+    /// Install the by-name subroutine registry, retained for runtime
+    /// re-resolution (aSub LFLG=READ / SUBL). Called once at iocInit with the
+    /// IocApp/IocBuilder registry. See [`Self::find_subroutine_named`].
+    pub async fn install_subroutine_registry(
+        &self,
+        registry: HashMap<String, Arc<crate::server::record::SubroutineFn>>,
+    ) {
+        *self.inner.subroutine_registry.write().await = registry;
+    }
+
+    /// Look up a registered subroutine by name. The processing path uses this
+    /// to re-resolve an aSub's subroutine when SNAM changes (C `fetch_values`
+    /// `registryFunctionFind`). `None` when the name is not registered, which
+    /// the caller treats as C's `S_db_BadSub` (skip running the subroutine).
+    pub(crate) async fn find_subroutine_named(
+        &self,
+        name: &str,
+    ) -> Option<Arc<crate::server::record::SubroutineFn>> {
+        self.inner
+            .subroutine_registry
+            .read()
+            .await
+            .get(name)
+            .cloned()
     }
 
     /// Atomically claim the right to start the scan scheduler for this DB.

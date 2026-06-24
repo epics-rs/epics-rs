@@ -184,6 +184,14 @@ pub fn pp_fields_for(record_type: &str) -> Option<&'static [&'static str]> {
             "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "AA", "BB", "CC", "DD", "EE", "FF",
             "GG", "HH", "II", "JJ", "KK", "LL",
         ],
+        // aCalcout pp(TRUE) set (aCalcoutRecord.dbd): scalar A..L + array
+        // AA..LL inputs, CALC/OCAL, alarm limits, plus the array result/sizing
+        // fields AVAL/OAV/PAVL/POAV/NUSE that C marks pp(TRUE).
+        "acalcout" => &[
+            "AVAL", "NUSE", "PAVL", "CALC", "OCAL", "HIHI", "LOLO", "HIGH", "LOW", "HHSV", "LLSV",
+            "HSV", "LSV", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "AA", "BB",
+            "CC", "DD", "EE", "FF", "GG", "HH", "II", "JJ", "KK", "LL", "OAV", "POAV",
+        ],
         "swait" => &["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"],
         "transform" => &[
             "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P",

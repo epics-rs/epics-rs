@@ -925,6 +925,7 @@ pub fn create_record(record_type: &str) -> CaResult<Box<dyn Record>> {
         "seq" => Ok(Box::new(seq::SeqRecord::default())),
         "sseq" => Ok(Box::new(sseq::SseqRecord::default())),
         "scalcout" => Ok(Box::new(scalcout::ScalcoutRecord::default())),
+        "acalcout" => Ok(Box::new(acalcout::AcalcoutRecord::default())),
         "transform" => Ok(Box::new(transform::TransformRecord::default())),
         "calcout" => Ok(Box::new(calcout::CalcoutRecord::default())),
         "dfanout" => Ok(Box::new(dfanout::DfanoutRecord::default())),

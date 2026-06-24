@@ -3911,6 +3911,40 @@ async fn test_calc_multi_input_pp_processes_passive_source() {
     }
 }
 
+/// `process_record` (the public direct-process API) fetches input links like
+/// the engine path. It used to call the reduced `process_local`, which fetched
+/// no INPx, so a direct process of a calc/sub read stale A..U inputs; it now
+/// delegates to the canonical link-fetching engine path.
+#[tokio::test]
+async fn process_record_fetches_input_links() {
+    use epics_base_rs::server::records::ao::AoRecord;
+    use epics_base_rs::server::records::calc::CalcRecord;
+
+    let db = PvDatabase::new();
+
+    // SRC_F latches the constructed VAL=10.
+    db.add_record("SRC_F", Box::new(AoRecord::new(10.0)))
+        .await
+        .unwrap();
+
+    // DST_F: CALC="A+1", INPA="SRC_F" (NPP — read the current source value).
+    let mut dst = CalcRecord::new("A+1");
+    dst.inpa = "SRC_F".to_string();
+    db.add_record("DST_F", Box::new(dst)).await.unwrap();
+
+    // Direct process via the public API. A=10 must be fetched from SRC_F,
+    // giving VAL=11; the old reduced path left A=0 -> VAL=1.
+    db.process_record("DST_F").await.unwrap();
+
+    match db.get_pv("DST_F").await.unwrap() {
+        EpicsValue::Double(v) => assert!(
+            (v - 11.0).abs() < 1e-10,
+            "process_record must fetch INPA (SRC_F=10): expected 11, got {v}"
+        ),
+        other => panic!("expected Double(11.0), got {other:?}"),
+    }
+}
+
 /// Defect 3 control: an `NPP` (no-process-passive) multi-input link
 /// must NOT process its passive source — it reads whatever stale
 /// value the source currently holds.
@@ -7889,9 +7923,9 @@ record(aSub, "ASUB_INIT") {
     );
 }
 
-/// The foreign process path (`process_record` -> `process_local`) re-resolves
-/// aSub LFLG=READ identically to the engine path: the SUBL re-read + swap +
-/// bad-sub skip are shared owners, not engine-path-only.
+/// The public direct-process API `process_record` re-resolves aSub LFLG=READ:
+/// it delegates to the canonical engine path, so a direct process re-reads the
+/// SUBL link, swaps the subroutine, and skips a bad sub like any other process.
 #[tokio::test]
 async fn asub_lflg_read_reresolves_on_foreign_process_path() {
     use epics_base_rs::server::records::asub_record::ASubRecord;

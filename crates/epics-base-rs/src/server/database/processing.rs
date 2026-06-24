@@ -327,7 +327,15 @@ impl PvDatabase {
     /// Process a record by name (process_local + notify).
     /// Alias-aware (epics-base PR #336).
     pub async fn process_record(&self, name: &str) -> CaResult<()> {
-        self.process_record_inner(name, true).await
+        // Delegate to the canonical engine path so a direct process fetches
+        // input links (DOL/INPx), runs the record body, evaluates alarms,
+        // writes outputs and dispatches FLNK exactly as a C `dbProcess` does.
+        // The reduced `process_local` path this used to call fetched no links,
+        // so a direct process of a calc/sub/aSub used stale A..U inputs; that
+        // path now exists only as an internal record-body unit-test helper.
+        // Acquires the entry record's advisory write gate (foreign caller).
+        let mut visited = HashSet::new();
+        self.process_record_with_links(name, &mut visited, 0).await
     }
 
     /// `process_record` variant for a caller that already
@@ -336,55 +344,11 @@ impl PvDatabase {
     /// reentrant; the atomic group path MUST use this entry. See
     /// [`crate::server::database::PvDatabase::lock_records`].
     pub async fn process_record_already_locked(&self, name: &str) -> CaResult<()> {
-        self.process_record_inner(name, false).await
-    }
-
-    async fn process_record_inner(&self, name: &str, acquire_gate: bool) -> CaResult<()> {
-        let rec = self.get_record(name).await;
-
-        if let Some(rec) = rec {
-            // advisory write gate (`dbScanLock` analogue). A
-            // QSRV atomic group with a `+proc` member holds this
-            // record's gate via `lock_records`; a direct
-            // `process_record` on the same backing record must block
-            // until the atomic group transaction completes. Skipped
-            // when the caller already owns the gate.
-            let _record_gate = if acquire_gate {
-                let canonical = self
-                    .resolve_alias(name)
-                    .await
-                    .unwrap_or_else(|| name.to_string());
-                Some(self.lock_record(&canonical).await)
-            } else {
-                None
-            };
-            // aSub LFLG=READ: re-read the subroutine name from the SUBL link
-            // and re-resolve it, before the process lock so the link read
-            // cannot deadlock this record. `process_local` runs the subroutine
-            // internally, so the result is applied to the instance (which arms
-            // the bad-sub skip `run_registered_subroutine` consumes) just
-            // before it. Same single owners as the engine path. `None` for
-            // everything that is not an aSub in READ mode.
-            let asub_dynamic = self.resolve_asub_dynamic_subroutine(&rec).await;
-            let (snapshot, alarm_posts) = {
-                let mut instance = rec.write().await;
-                if let Some(ds) = &asub_dynamic {
-                    apply_asub_dynamic_sub(&mut instance, ds);
-                }
-                instance.process_local()?
-            };
-            // Notify outside lock
-            let instance = rec.read().await;
-            instance.notify_from_snapshot(&snapshot);
-            // Post the alarm fields (SEVR/STAT/ACKS) with their
-            // individual C masks — see `process_local` / recGblResetAlarms.
-            for &(field, mask) in &alarm_posts {
-                instance.notify_field(field, mask);
-            }
-            Ok(())
-        } else {
-            Err(CaError::ChannelNotFound(name.to_string()))
-        }
+        // Same delegation as [`Self::process_record`], but to the gate-held
+        // engine entry since the caller already owns the advisory write gate.
+        let mut visited = HashSet::new();
+        self.process_record_with_links_already_locked(name, &mut visited, 0)
+            .await
     }
 
     /// Process a record with full link handling (INP -> process -> alarms -> OUT -> FLNK).

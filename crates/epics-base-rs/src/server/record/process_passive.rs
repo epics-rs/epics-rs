@@ -162,6 +162,8 @@ pub fn pp_fields_for(record_type: &str) -> Option<&'static [&'static str]> {
             "F", "G", "H", "I", "J", "K", "L",
         ],
         "seq" => &["VAL"],
+        // stateRecord.dbd.pod: only VAL is pp(TRUE) (OVAL is SPC_NOMOD).
+        "state" => &["VAL"],
         "stringin" => &["VAL", "SVAL"],
         "stringout" => &["VAL"],
         "sub" => &[

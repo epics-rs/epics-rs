@@ -30,6 +30,7 @@ pub mod scalcout;
 pub mod sel;
 pub mod seq;
 pub mod sseq;
+pub mod state;
 pub mod stringin;
 pub mod stringout;
 pub mod sub_record;

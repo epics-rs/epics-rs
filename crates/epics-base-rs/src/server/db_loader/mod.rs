@@ -934,6 +934,7 @@ pub fn create_record(record_type: &str) -> CaResult<Box<dyn Record>> {
         "sub" => Ok(Box::new(sub_record::SubRecord::default())),
         "aSub" => Ok(Box::new(asub_record::ASubRecord::default())),
         "permissive" => Ok(Box::new(permissive::PermissiveRecord::default())),
+        "state" => Ok(Box::new(state::StateRecord::default())),
         _ => Err(CaError::DbParseError {
             line: 0,
             column: 0,

@@ -127,6 +127,17 @@ impl Record for StateRecord {
         Some(self.value_changed)
     }
 
+    /// C `stateRecord.c::monitor` (lines 120-129) posts only `VAL`. `OVAL`
+    /// is a `SPC_NOMOD` tracker C never posts (no `db_post_events` call, and
+    /// `dbPut`'s written-field post can't reach a `SPC_NOMOD` field).
+    /// Declaring it here excludes it from the framework's generic
+    /// subscribed-field change loop (`processing.rs:2439`), so a client
+    /// subscribed to `.OVAL` receives only the one-shot value at subscribe —
+    /// never a change update — matching C. It stays readable on the GET path.
+    fn event_posted_fields(&self) -> &'static [&'static str] {
+        &["OVAL"]
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::String(self.val.clone())),

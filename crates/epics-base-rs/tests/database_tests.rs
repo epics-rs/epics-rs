@@ -8761,3 +8761,120 @@ fn asub_ftype_menu_fields_load_by_label() {
     assert_eq!(rec.get_field("NOA"), Some(EpicsValue::Long(5)));
     assert_eq!(rec.get_field("NOVB"), Some(EpicsValue::Long(3)));
 }
+
+/// permissive `OVAL`/`OFLG` are `SPC_NOMOD` trackers that C `monitor()`
+/// never posts (`permissiveRecord.c:90-117` posts only `&prec->val` and
+/// `&prec->wflg`). The framework's generic subscribed-field change loop
+/// would otherwise post any changed subscribed field, so the record lists
+/// them in `event_posted_fields()` to exclude them. A `.OVAL`/`.OFLG`
+/// subscriber must therefore receive no change update even though
+/// `process()` updates both trackers every cycle — while VAL and WFLG must
+/// still post on change.
+#[tokio::test]
+async fn test_permissive_oval_oflg_not_monitor_posted() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::server::records::permissive::PermissiveRecord;
+    use epics_base_rs::types::DbFieldType;
+
+    let db = PvDatabase::new();
+    db.add_record("PERM", Box::new(PermissiveRecord::default()))
+        .await
+        .unwrap();
+
+    let mask = (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits();
+    // Subscribe at baseline (VAL=WFLG=OVAL=OFLG=0); add_subscriber seeds
+    // last_posted to the current value, so the change must be staged AFTER
+    // subscribing to exercise the generic change loop.
+    let (mut val_rx, mut oval_rx, mut wflg_rx, mut oflg_rx) = {
+        let rec = db.get_record("PERM").await.unwrap();
+        let mut inst = rec.write().await;
+        (
+            inst.add_subscriber("VAL", 1, DbFieldType::UShort, mask)
+                .unwrap(),
+            inst.add_subscriber("OVAL", 2, DbFieldType::UShort, mask)
+                .unwrap(),
+            inst.add_subscriber("WFLG", 3, DbFieldType::UShort, mask)
+                .unwrap(),
+            inst.add_subscriber("OFLG", 4, DbFieldType::UShort, mask)
+                .unwrap(),
+        )
+    };
+    // Stage a change for this cycle: VAL 0->3, WFLG 0->1 (so process also
+    // moves OVAL 0->3 and OFLG 0->1).
+    {
+        let rec = db.get_record("PERM").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.record.put_field("VAL", EpicsValue::UShort(3)).unwrap();
+        inst.record
+            .put_field("WFLG", EpicsValue::UShort(1))
+            .unwrap();
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("PERM", &mut visited, 0)
+        .await
+        .unwrap();
+
+    assert!(val_rx.try_recv().is_ok(), "VAL change must post a monitor");
+    assert!(
+        wflg_rx.try_recv().is_ok(),
+        "WFLG change must post a monitor"
+    );
+    assert!(
+        oval_rx.try_recv().is_err(),
+        "OVAL is a SPC_NOMOD tracker C never posts; it must not monitor-post"
+    );
+    assert!(
+        oflg_rx.try_recv().is_err(),
+        "OFLG is a SPC_NOMOD tracker C never posts; it must not monitor-post"
+    );
+}
+
+/// state `OVAL` is a `SPC_NOMOD` tracker C `monitor()` never posts
+/// (`stateRecord.c:120-129` posts only `&prec->val[0]`). It is excluded
+/// from the generic subscribed-field change loop via `event_posted_fields()`,
+/// so a `.OVAL` subscriber receives no change update even though `process()`
+/// copies VAL into OVAL on change — while VAL must still post on change.
+#[tokio::test]
+async fn test_state_oval_not_monitor_posted() {
+    use epics_base_rs::server::recgbl::EventMask;
+    use epics_base_rs::server::records::state::StateRecord;
+    use epics_base_rs::types::DbFieldType;
+
+    let db = PvDatabase::new();
+    db.add_record("ST", Box::new(StateRecord::default()))
+        .await
+        .unwrap();
+
+    let mask = (EventMask::VALUE | EventMask::LOG | EventMask::ALARM).bits();
+    // Subscribe at baseline (VAL=OVAL=""); the change is staged afterwards
+    // so process moves OVAL ""->"Run" through the generic change loop.
+    let (mut val_rx, mut oval_rx) = {
+        let rec = db.get_record("ST").await.unwrap();
+        let mut inst = rec.write().await;
+        (
+            inst.add_subscriber("VAL", 1, DbFieldType::String, mask)
+                .unwrap(),
+            inst.add_subscriber("OVAL", 2, DbFieldType::String, mask)
+                .unwrap(),
+        )
+    };
+    {
+        let rec = db.get_record("ST").await.unwrap();
+        let mut inst = rec.write().await;
+        inst.record
+            .put_field("VAL", EpicsValue::String("Run".into()))
+            .unwrap();
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("ST", &mut visited, 0)
+        .await
+        .unwrap();
+
+    assert!(val_rx.try_recv().is_ok(), "VAL change must post a monitor");
+    assert!(
+        oval_rx.try_recv().is_err(),
+        "OVAL is a SPC_NOMOD tracker C never posts; it must not monitor-post"
+    );
+}

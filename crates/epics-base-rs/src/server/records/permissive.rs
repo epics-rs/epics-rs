@@ -122,6 +122,19 @@ impl Record for PermissiveRecord {
         Some(self.value_changed)
     }
 
+    /// C `permissiveRecord.c::monitor` (lines 90-117) posts only `VAL` and
+    /// `WFLG`. `OVAL`/`OFLG` are `SPC_NOMOD` trackers C never posts: no
+    /// record code calls `db_post_events` on them, and `dbPut`'s
+    /// written-field post (`dbAccess.c:1407-1414`) can't reach a `SPC_NOMOD`
+    /// field. Declaring them here excludes them from the framework's generic
+    /// subscribed-field change loop (`processing.rs:2439`), so a client
+    /// subscribed to `.OVAL`/`.OFLG` receives only the one-shot value at
+    /// subscribe — never a change update — matching C. They stay readable on
+    /// the GET path.
+    fn event_posted_fields(&self) -> &'static [&'static str] {
+        &["OVAL", "OFLG"]
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::UShort(self.val)),

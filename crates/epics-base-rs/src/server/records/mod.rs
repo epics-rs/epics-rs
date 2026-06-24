@@ -24,6 +24,7 @@ pub mod mbbi;
 pub mod mbbi_direct;
 pub mod mbbo;
 pub mod mbbo_direct;
+pub mod permissive;
 pub mod printf;
 pub mod scalcout;
 pub mod sel;

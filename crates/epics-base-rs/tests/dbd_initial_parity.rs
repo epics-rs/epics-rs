@@ -60,6 +60,7 @@ const BASE_RECORDS: &[&str] = &[
     "sel",
     "sub",
     "aSub",
+    "permissive",
 ];
 
 /// Common fields (shared `CommonFields`, not in any record's `field_list`) that

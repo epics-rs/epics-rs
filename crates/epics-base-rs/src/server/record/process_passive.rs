@@ -153,6 +153,9 @@ pub fn pp_fields_for(record_type: &str) -> Option<&'static [&'static str]> {
             "JVEL",
             "PCO_ENABLE",
         ],
+        // permissiveRecord.dbd.pod: VAL, WFLG, LABL are pp(TRUE)
+        // (OVAL/OFLG are SPC_NOMOD trackers).
+        "permissive" => &["VAL", "WFLG", "LABL"],
         "printf" => &["VAL", "FMT"],
         "sel" => &[
             "HIHI", "LOLO", "HIGH", "LOW", "HHSV", "LLSV", "HSV", "LSV", "A", "B", "C", "D", "E",

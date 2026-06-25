@@ -113,9 +113,19 @@ impl DeviceSupport for DbStateDeviceSupport {
         // dbStateGet(dpvt); prec->udf = FALSE; } return 2`. Writing VAL
         // directly + returning `computed()` skips the bi conversion (C return
         // 2); the framework then derives `udf` from the now-defined VAL
-        // (`clears_udf()` → `value_is_undefined()` is false for an Enum). With
-        // no state (empty instio name) VAL is left untouched, matching C's
-        // `if (dpvt)` guard.
+        // (`clears_udf()` → `value_is_undefined()` is false for an Enum) —
+        // matching C clearing `udf = FALSE` on the configured path.
+        //
+        // With no state (empty instio name) VAL is left untouched, matching C's
+        // `if (dpvt)` guard for VAL — but `udf` DIVERGES on this misconfig:
+        // C leaves `udf` untouched, so an unconfigured bi stays `udf = TRUE`
+        // (UDF_ALARM), whereas base-rs's framework recomputes `udf` from the
+        // (always-defined) Enum VAL every cycle and clears it. This is the
+        // framework's `value_is_undefined()`-derived udf model vs C's sticky
+        // flag — pre-existing and workspace-wide, not specific to Db State, and
+        // not cleanly special-caseable here (the recompute at processing.rs is
+        // gated on `clears_udf()`, not the read outcome). Surfaces only on the
+        // empty-INP misconfiguration.
         if let Some(state) = &self.state {
             let bit = u16::from(state.get());
             record.put_field("VAL", EpicsValue::Enum(bit))?;

@@ -5,16 +5,21 @@ use crate::server::record::{AlarmSeverity, ProcessAction, Record, RecordInstance
 /// that doesn't require an explicit device support registration.
 /// Matches C EPICS built-in soft device support names.
 pub fn is_soft_dtyp(dtyp: &str) -> bool {
+    // Only the four genuine base soft-channel DTYPs. Timestamp-producing
+    // DTYPs are NOT soft channels — they are real device support that writes
+    // a resolved time stamp into VAL, so they must reach the device-lookup
+    // path rather than short-circuit here:
+    //  - "Soft Timestamp" (base `devTimestamp.c`) — served by the
+    //    pre-registered `builtin_devices::builtin_dynamic_factory`.
+    //  - "Sec Past Epoch" / "Time of Day" (epics-modules/std `devTimeOfDay.c`)
+    //    — served by `std_rs::std_device_supports()`; if the IOC has not
+    //    registered them they correctly warn as "no device support", not
+    //    silently no-op as a soft channel. base-rs must not special-case a
+    //    std-module DTYP (layering leak).
     dtyp.is_empty()
         || dtyp == "Soft Channel"
         || dtyp == "Raw Soft Channel"
         || dtyp == "Async Soft Channel"
-        // NOTE: "Soft Timestamp" (base `devTimestamp.c`) is NOT a soft
-        // channel — it is a real built-in device support that writes the
-        // resolved time stamp into VAL. It is served by the pre-registered
-        // `builtin_devices::builtin_dynamic_factory`, so it must reach the
-        // device-lookup path rather than short-circuit here.
-        || dtyp == "Sec Past Epoch"
 }
 
 /// Handle for waiting on asynchronous write completion.

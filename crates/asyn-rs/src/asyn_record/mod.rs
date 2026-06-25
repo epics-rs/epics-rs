@@ -138,8 +138,10 @@ const ASYN_FMT_BINARY: i32 = 2;
 /// escape sequences `\r \n \t \\ \" \0` plus octal `\NNN`. Used by
 /// asynRecord OEOS/IEOS writes (C asynRecord.c:374-393) and ASCII octet
 /// output (`:1489`) so a configured `\r\n` reaches the driver as the two
-/// raw bytes `0x0D 0x0A`, not the four-byte literal.
-fn translate_escape(s: &str) -> Vec<u8> {
+/// raw bytes `0x0D 0x0A`, not the four-byte literal. Also used by the
+/// `asynOctetCmdResponse` factory to escape the literal command (C
+/// `initCmdBuffer`, devAsynOctet.c) once at build time.
+pub(crate) fn translate_escape(s: &str) -> Vec<u8> {
     translate_escape_bytes(s.as_bytes())
 }
 

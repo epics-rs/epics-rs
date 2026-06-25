@@ -300,6 +300,11 @@ pub struct AsynDeviceSupport {
     /// SIZV at init time when available; otherwise fall back to the
     /// stringin-grade 256-byte default.
     octet_max_size: usize,
+    /// `Some` ⟹ this is `asynOctetCmdResponse`: an escape-translated literal
+    /// command (C `initCmdBuffer`, devAsynOctet.c) written before each read so
+    /// the reply lands in VAL. `read_op` emits `OctetWriteRead` instead of a
+    /// plain `OctetRead` when present. `None` for ordinary `asynOctetRead`.
+    octet_cmd: Option<Vec<u8>>,
     /// If true, read back the current driver value during init (for output records).
     initial_readback: bool,
     /// `info(asyn:READBACK, "1")` flag, asyn upstream PRs #60 / #208.
@@ -444,6 +449,7 @@ impl AsynDeviceSupport {
             int32_mask: None,
             max_array_elements: 307200,
             octet_max_size: 256,
+            octet_cmd: None,
             last_alarm_status: 0,
             last_alarm_severity: 0,
             last_ts: None,
@@ -924,8 +930,17 @@ impl AsynDeviceSupport {
             "asynInt32" => Some(RequestOp::Int32Read),
             "asynInt64" => Some(RequestOp::Int64Read),
             "asynFloat64" => Some(RequestOp::Float64Read),
-            "asynOctet" => Some(RequestOp::OctetRead {
-                buf_size: self.octet_max_size,
+            // asynOctet: a plain read, OR a write-then-read when a literal
+            // command is cached (asynOctetCmdResponse, C `callbackSiCmdResponse`
+            // devAsynOctet.c — write the command, then read the reply into VAL).
+            "asynOctet" => Some(match &self.octet_cmd {
+                Some(cmd) => RequestOp::OctetWriteRead {
+                    data: cmd.clone(),
+                    buf_size: self.octet_max_size,
+                },
+                None => RequestOp::OctetRead {
+                    buf_size: self.octet_max_size,
+                },
             }),
             "asynUInt32Digital" => Some(RequestOp::UInt32DigitalRead { mask: self.mask }),
             "asynEnum" => Some(RequestOp::EnumRead),
@@ -1711,8 +1726,11 @@ fn normalize_asyn_dtyp(dtyp: &str) -> String {
             return base.to_string();
         }
     }
-    // Octet direction suffixes: asynOctetRead/Write → asynOctet
-    if dtyp == "asynOctetRead" || dtyp == "asynOctetWrite" {
+    // Octet direction suffixes: asynOctetRead/Write → asynOctet.
+    // asynOctetCmdResponse also resolves to the asynOctet interface — its
+    // write-then-read behavior is carried by `octet_cmd`, not a distinct
+    // interface (C devAsynOctet.c registers it on asynOctet like the others).
+    if dtyp == "asynOctetRead" || dtyp == "asynOctetWrite" || dtyp == "asynOctetCmdResponse" {
         return "asynOctet".to_string();
     }
     dtyp.to_string()
@@ -1771,6 +1789,18 @@ pub fn universal_asyn_factory(
     let dtyp = normalize_asyn_dtyp(ctx.dtyp);
 
     let mut adapter = AsynDeviceSupport::from_handle(entry.handle, link, &dtyp);
+
+    // asynOctetCmdResponse: the DRVINFO is a LITERAL command, not a param name
+    // (C `asynSiOctetCmdResponse` passes useDrvUser=0 → no drvUserCreate). Escape-
+    // translate it once (C `initCmdBuffer`, devAsynOctet.c) and cache it; each
+    // process writes the command then reads the reply into VAL (`read_op` emits
+    // `OctetWriteRead`). Pre-set `reason_set` so `init()` skips the param
+    // resolution that would fail on a command string — reason stays 0, and octet
+    // I/O keys off the addr, not the reason.
+    if ctx.dtyp == "asynOctetCmdResponse" {
+        adapter.octet_cmd = Some(crate::asyn_record::translate_escape(&adapter.drv_info));
+        adapter.reason_set = true;
+    }
 
     if is_output {
         if ctx.dtyp == "asynOctetWrite" {
@@ -3544,5 +3574,216 @@ mod tests {
         // (C EPICS lsi/lso/printf adapter convention).
         assert_eq!(normalize_asyn_dtyp("asynOctetRead"), "asynOctet");
         assert_eq!(normalize_asyn_dtyp("asynOctetWrite"), "asynOctet");
+        // asynOctetCmdResponse also collapses to asynOctet — the write-then-read
+        // is carried by octet_cmd, not a distinct interface.
+        assert_eq!(normalize_asyn_dtyp("asynOctetCmdResponse"), "asynOctet");
+    }
+
+    /// Mock octet port for asynOctetCmdResponse: records every write payload and
+    /// the flush/write/read call order, and returns a fixed reply on read.
+    struct CmdResponsePort {
+        base: PortDriverBase,
+        writes: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        sequence: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        reply: Vec<u8>,
+    }
+    impl PortDriver for CmdResponsePort {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
+            self.sequence.lock().unwrap().push("flush");
+            Ok(())
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+            self.writes.lock().unwrap().push(data.to_vec());
+            self.sequence.lock().unwrap().push("write");
+            Ok(())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            self.sequence.lock().unwrap().push("read");
+            let n = self.reply.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.reply[..n]);
+            Ok(n)
+        }
+    }
+
+    type CmdRecorder = (
+        Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        Arc<std::sync::Mutex<Vec<&'static str>>>,
+    );
+
+    /// Spawn a [`CmdResponsePort`] actor and return its [`PortHandle`] plus the
+    /// shared write-payload / call-order recorders.
+    fn spawn_cmd_response_port(name: &str, reply: &[u8]) -> (PortHandle, CmdRecorder) {
+        let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sequence = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let port = CmdResponsePort {
+            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            writes: writes.clone(),
+            sequence: sequence.clone(),
+            reply: reply.to_vec(),
+        };
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let actor = PortActor::new(Box::new(port), rx);
+        std::thread::Builder::new()
+            .name("cmdresp-actor".into())
+            .spawn(move || actor.run())
+            .unwrap();
+        let handle = PortHandle::new(tx, name.into(), interrupts);
+        (handle, (writes, sequence))
+    }
+
+    /// `read_op` emits a write-then-read (`OctetWriteRead`) carrying the cached
+    /// command when one is present (asynOctetCmdResponse), and a plain
+    /// `OctetRead` otherwise (asynOctetRead) — the one routing decision the
+    /// feature adds.
+    #[test]
+    fn read_op_selects_write_read_only_when_command_present() {
+        let (handle, _) = spawn_cmd_response_port("cmdresp_readop", b"");
+        let link = AsynLink {
+            port_name: "cmdresp_readop".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: String::new(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
+        ads.octet_max_size = 128;
+
+        // No command → plain read.
+        match ads.read_op() {
+            Some(RequestOp::OctetRead { buf_size }) => assert_eq!(buf_size, 128),
+            other => panic!("expected OctetRead, got {other:?}"),
+        }
+
+        // Command cached → write-then-read carrying the command bytes.
+        ads.octet_cmd = Some(b"*IDN?\r\n".to_vec());
+        match ads.read_op() {
+            Some(RequestOp::OctetWriteRead { data, buf_size }) => {
+                assert_eq!(data, b"*IDN?\r\n".to_vec());
+                assert_eq!(buf_size, 128);
+            }
+            other => panic!("expected OctetWriteRead, got {other:?}"),
+        }
+    }
+
+    /// Full asynOctetCmdResponse chain through the factory: the literal DRVINFO
+    /// command is escape-translated and cached (octet_cmd) with reason_set
+    /// pre-set (C useDrvUser=0), so init() skips param resolution and each
+    /// process writes the command then reads the reply into VAL (C
+    /// `callbackSiCmdResponse`, devAsynOctet.c). Asserted end-to-end on stringin.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cmd_response_factory_writes_escaped_command_then_reads_reply() {
+        use epics_base_rs::server::ioc_app::DeviceSupportContext;
+        use epics_base_rs::server::records::stringin::StringinRecord;
+
+        let (handle, (writes, sequence)) = spawn_cmd_response_port("cmdresp_factory", b"IDN-OK");
+        crate::asyn_record::register_port(
+            "cmdresp_factory",
+            handle,
+            Arc::new(crate::trace::TraceManager::new()),
+        );
+
+        // The DRVINFO tail "*IDN?\r\n" is the literal command — the "\r\n" is two
+        // escape sequences (four chars) in the link, decoded to 0x0D 0x0A.
+        let ctx = DeviceSupportContext {
+            dtyp: "asynOctetCmdResponse",
+            inp: "@asyn(cmdresp_factory,0)*IDN?\\r\\n",
+            out: "",
+        };
+        let mut dev = universal_asyn_factory(&ctx).expect("factory builds the device");
+
+        let mut rec = StringinRecord::new("");
+        // init() must succeed without the command being a real param — proves the
+        // reason_set pre-set (useDrvUser=0) skips drv_user_create.
+        dev.init(&mut rec).unwrap();
+        dev.read(&mut rec).unwrap();
+
+        // The escaped command was written once (\r\n → 0x0D 0x0A), before the read.
+        assert_eq!(
+            writes.lock().unwrap().clone(),
+            vec![b"*IDN?\x0d\x0a".to_vec()],
+            "the escaped literal command is written once"
+        );
+        let seq = sequence.lock().unwrap().clone();
+        let w = seq.iter().position(|&s| s == "write").unwrap();
+        let r = seq.iter().position(|&s| s == "read").unwrap();
+        assert!(w < r, "command write must precede the reply read: {seq:?}");
+
+        // The reply landed in VAL.
+        assert_eq!(
+            rec.get_field("VAL"),
+            Some(EpicsValue::String("IDN-OK".into())),
+            "the device reply must be stored in VAL"
+        );
+    }
+
+    /// The asynOctetCmdResponse reply reaches an array-backed (waveform CHAR)
+    /// record's VAL, not only a string record — the octet reply→VAL coercion
+    /// holds for the CharArray shape. Built with the factory's octet_cmd +
+    /// reason_set wiring applied directly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cmd_response_reply_reaches_waveform_char_val() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let (handle, (writes, _)) = spawn_cmd_response_port("cmdresp_wf", b"PONG");
+        let link = AsynLink {
+            port_name: "cmdresp_wf".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: String::new(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
+        // Mirror the factory: cache the escaped command + pre-set reason_set.
+        ads.octet_cmd = Some(crate::asyn_record::translate_escape("PING\\r"));
+        ads.reason_set = true;
+        ads.set_record_info("TEST:WF", ScanType::Passive);
+
+        let mut rec = WaveformRecord::new(64, DbFieldType::Char);
+        ads.read(&mut rec).unwrap();
+
+        assert_eq!(writes.lock().unwrap().clone(), vec![b"PING\x0d".to_vec()]);
+        assert_eq!(
+            rec.get_field("VAL"),
+            Some(EpicsValue::CharArray(b"PONG".to_vec())),
+            "reply bytes must populate the waveform CHAR VAL"
+        );
+    }
+
+    /// The asynOctetCmdResponse reply reaches an lsi (long string in) VAL — the
+    /// third C-registered record row (stringin/waveform/lsi). The reply is short,
+    /// so no SIZV truncation applies.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cmd_response_reply_reaches_lsi_val() {
+        use epics_base_rs::server::records::lsi::LsiRecord;
+
+        let (handle, (writes, _)) = spawn_cmd_response_port("cmdresp_lsi", b"STATUS=OK");
+        let link = AsynLink {
+            port_name: "cmdresp_lsi".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: String::new(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
+        ads.octet_cmd = Some(crate::asyn_record::translate_escape("READ?\\n"));
+        ads.reason_set = true;
+        ads.set_record_info("TEST:LSI", ScanType::Passive);
+
+        let mut rec = LsiRecord::new("");
+        ads.read(&mut rec).unwrap();
+
+        assert_eq!(writes.lock().unwrap().clone(), vec![b"READ?\x0a".to_vec()]);
+        // lsi backs VAL with a byte buffer, so the reply reads back as a
+        // CharArray (matching the waveform CHAR shape, not a fixed String).
+        assert_eq!(
+            rec.get_field("VAL"),
+            Some(EpicsValue::CharArray(b"STATUS=OK".to_vec())),
+            "reply must populate the lsi VAL"
+        );
     }
 }

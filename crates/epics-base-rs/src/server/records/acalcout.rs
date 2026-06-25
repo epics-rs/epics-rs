@@ -43,9 +43,10 @@
 //!   (CA put-callback wait, post-event) and the async `acalcPerformTask`
 //!   thread are not modeled; those fields are stored but inert.
 //! - Link-status fields (`INAV..INLV`, `IAAV..ILLV`, `OUTV`) are static at
-//!   their dbd initials (`Constant`-class default per the dbd, see
-//!   `AcalcoutRecord::default`); the C `init_record`/`checkLinks` per-link
-//!   CA-connectivity classification is not modeled.
+//!   their C post-`init_record` value: an unconfigured (constant) link
+//!   reports `Constant`(3), matching C overwriting the dbd `initial("1")`
+//!   for every CONSTANT link (see `AcalcoutRecord::default`). Live per-link
+//!   CA-connectivity reclassification (C `checkLinks`) is not modeled.
 //! - Array MDEL/ADEL deadband (C `monitor()` per-element delta) is replaced
 //!   by the framework's generic array change-detection (post on any change).
 //! - `IVOA` is applied on a CALC/OCAL evaluation failure (the C
@@ -61,6 +62,9 @@ use crate::server::record::{FieldDesc, ProcessOutcome, Record};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 use crate::calc::{ArrayInputs, CompiledExpr, acalc_compile, acalc_eval};
+// `LINK_CON` (= 3, the `Constant` link-status index) is the value C
+// `init_record` writes for an unconfigured link; shared with `calcout`.
+use super::link_status::LINK_CON;
 
 /// Code version reported by `VERS` (C `#define VERSION 1.4`).
 const VERSION: f64 = 1.4;
@@ -196,10 +200,15 @@ impl Default for AcalcoutRecord {
             pa: [0.0; 12],
             arr_vals: Default::default(),
             ina_links: Default::default(),
-            // INAV..ILLV dbd initial("1") = "Ext PV OK"; OUTV has no initial → 0.
-            inav: [1; 12],
-            iaav: [1; 12],
-            outv: 0,
+            // Link status reports `Constant` for an unconfigured link: C
+            // `init_record` rewrites the dbd static `initial("1")` to
+            // `acalcoutINAV_CON` (= 3) for every CONSTANT link
+            // (aCalcoutRecord.c:210-216,242), and a default record has all
+            // links constant. The dbd `1` is never observed. Matches sibling
+            // `calcout` (`in_status: [LINK_CON; 21]`).
+            inav: [LINK_CON; 12],
+            iaav: [LINK_CON; 12],
+            outv: LINK_CON,
             out: String::new(),
             oopt: 0,
             odly: 0.0,
@@ -1846,10 +1855,11 @@ mod tests {
         assert_eq!(rec.get_field("NELM"), Some(EpicsValue::ULong(1)));
         assert_eq!(rec.get_field("NUSE"), Some(EpicsValue::ULong(0)));
         assert_eq!(rec.get_field("VERS"), Some(EpicsValue::Double(1.4)));
-        // INAV..ILLV dbd initial("1"); OUTV has no initial → 0.
-        assert_eq!(rec.get_field("INAV"), Some(EpicsValue::Short(1)));
-        assert_eq!(rec.get_field("ILLV"), Some(EpicsValue::Short(1)));
-        assert_eq!(rec.get_field("OUTV"), Some(EpicsValue::Short(0)));
+        // Link status = Constant(3): C init_record overwrites the dbd
+        // initial("1") to acalcoutINAV_CON for the (default) constant links.
+        assert_eq!(rec.get_field("INAV"), Some(EpicsValue::Short(3)));
+        assert_eq!(rec.get_field("ILLV"), Some(EpicsValue::Short(3)));
+        assert_eq!(rec.get_field("OUTV"), Some(EpicsValue::Short(3)));
         assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Double(0.0)));
     }
 

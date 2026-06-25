@@ -1,15 +1,24 @@
-//! Guard: every `device()` row in EPICS base's `devSoft.dbd` must be accounted
-//! for by the Rust port — served by one of base-rs's device-support mechanisms,
-//! or an explicitly tracked known gap.
+//! Guards: every `device()` row in EPICS base's `devSoft.dbd` must be accounted
+//! for by the Rust port on TWO axes — REGISTRATION (the DTYP is served by a
+//! device-support mechanism, or a tracked known gap) and ROUTING (a served
+//! record reaches its device in the correct I/O direction). `devSoft.dbd` is
+//! the single source of truth for both.
 //!
 //! Background — base-rs maps a record's DTYP to its device support through
 //! THREE mechanisms, and nothing keeps them in sync with the C
-//! `device(recordType, linkType, dset, "DTYP")` rows. A new base device row, or
-//! a dropped/renamed registration, silently means a record's device never runs
-//! and VAL is wrong — the exact `is_soft_dtyp` / stdio-completeness family this
-//! port just closed (stdio, then Db State). This test closes that family
-//! structurally for base: `devSoft.dbd` is the single source of truth, and
-//! every device row is classified against the live Rust coverage.
+//! `device(recordType, linkType, dset, "DTYP")` rows. Two distinct failure
+//! families result, each closed by one test here:
+//!   - `base_devsoft_device_rows_are_all_accounted_for` (REGISTRATION): a new
+//!     base device row, or a dropped/renamed registration, silently means a
+//!     record's DTYP resolves to no device — VAL stays at its default.
+//!   - `base_devsoft_device_routing_matches_c_dset_direction` (ROUTING): even a
+//!     registered device is silently dropped if it is routed the wrong way. The
+//!     processing loop derives `is_output = can_device_write()`, so an output
+//!     record absent from `can_device_write()` (the stdio printf bug) is treated
+//!     as an input — its device write never runs. The registration test is
+//!     blind to this (printf's DTYP still resolved); the routing test catches it
+//!     by asserting `can_device_write()` matches the C dset's read/write
+//!     direction for every served, device-attaching row.
 //!
 //! base's coverage is split across three mechanisms, not one registry (unlike
 //! the std module's `std_device_supports()` guard), so the "served" set is the
@@ -25,6 +34,10 @@
 //!      `IocApplication::new` register from, which neither (1) nor (2) reports.
 //!      Probing the registration list (not a const copy) means dropping `getenv`
 //!      both unregisters it and fails this guard, in lockstep.
+//!
+//! Residual: there is no phantom-DYNAMIC check — a `builtin_dynamic_factory`
+//! arm for a DTYP with no devSoft.dbd row passes silently, because the match
+//! arms are not enumerable. The static and allowlist sides ARE phantom-checked.
 //!
 //! Pair-keyed allowlist, by design and for consistency with the std guard:
 //! EPICS selects device support by the (recordType, DTYP) PAIR. base's
@@ -45,6 +58,7 @@ use std::path::PathBuf;
 use epics_base_rs::server::builtin_devices::{
     builtin_dynamic_factory, static_builtin_device_supports,
 };
+use epics_base_rs::server::db_loader::create_record;
 use epics_base_rs::server::device_support::is_soft_dtyp;
 use epics_base_rs::server::ioc_app::DeviceSupportContext;
 
@@ -234,6 +248,138 @@ fn base_devsoft_device_rows_are_all_accounted_for() {
     assert!(
         failures.is_empty(),
         "devSoft.dbd device rows unaccounted for:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// C dset I/O direction for every served, device-attaching (non-soft,
+/// non-allowlisted) devSoft.dbd row: `true` = the C dset writes (the record's
+/// device support IS its output, a `write_xxx` entry), `false` = it reads (a
+/// `read_xxx` entry). This is C REFERENCE data — it cannot be probed from Rust
+/// (matching it is the whole point) — so each entry cites its C dset.
+///
+/// The processing loop sets `is_output = record.can_device_write()`
+/// (processing.rs), so the routing is correct iff `can_device_write()` equals
+/// the C direction: an output dset whose record is missing from
+/// `can_device_write()` is misrouted to the no-op read path (the printf bug),
+/// and an input dset whose record is wrongly in it would skip its `dev.read`.
+const DEVICE_IO_DIRECTION: &[(&str, &str, bool)] = &[
+    ("ai", "Soft Timestamp", false),       // devTimestampAI read_ai
+    ("stringin", "Soft Timestamp", false), // devTimestampSI read_stringin
+    ("lso", "stdio", true),                // devLsoStdio write_string
+    ("printf", "stdio", true),             // devPrintfStdio write_string
+    ("stringout", "stdio", true),          // devSoStdio write_string
+    ("lsi", "getenv", false),              // devLsiEnviron read
+    ("stringin", "getenv", false),         // devSiEnviron read
+    ("bi", "Db State", false),             // devBiDbState read_bi
+    ("bo", "Db State", true),              // devBoDbState write_bo
+];
+
+#[test]
+fn base_devsoft_device_routing_matches_c_dset_direction() {
+    let Some(path) = dbd_path() else {
+        eprintln!(
+            "SKIP base_devsoft_device_routing_matches_c_dset_direction: \
+             devSoft.dbd not found (set EPICS_BASE or place the reference \
+             checkout). No routing verified."
+        );
+        return;
+    };
+    let dbd = std::fs::read_to_string(&path).expect("read devSoft.dbd");
+    let rows = parse_device_rows(&dbd);
+    assert!(
+        !rows.is_empty(),
+        "parsed zero device() rows from {}",
+        path.display()
+    );
+
+    let static_supports = static_builtin_device_supports();
+    let static_dtyps: BTreeSet<&str> = static_supports.iter().map(|(d, _)| *d).collect();
+
+    let mut failures: Vec<String> = Vec::new();
+    // Direction entries actually matched by a served row — to catch a stale
+    // entry that no longer corresponds to any served device-attaching row.
+    let mut direction_hit: BTreeSet<(String, String)> = BTreeSet::new();
+
+    for (record_type, dtyp) in &rows {
+        // Soft channels short-circuit the device (the soft-link path, not
+        // dev.write/dev.read), and allowlisted rows are unserved — neither has a
+        // device direction to route.
+        if is_soft_dtyp(dtyp)
+            || ALLOWLIST
+                .iter()
+                .any(|(rt, dt, _)| *rt == record_type.as_str() && *dt == dtyp.as_str())
+        {
+            continue;
+        }
+        // A served, device-attaching row. It MUST be classified, or its routing
+        // cannot be checked (the printf-class blind spot).
+        let Some((_, _, expected_output)) = DEVICE_IO_DIRECTION
+            .iter()
+            .find(|(rt, dt, _)| *rt == record_type.as_str() && *dt == dtyp.as_str())
+        else {
+            assert!(
+                served_by_base(dtyp, &static_dtyps),
+                "({record_type}, {dtyp:?}) is neither soft, allowlisted, nor \
+                 served — the registration guard should have caught this first"
+            );
+            failures.push(format!(
+                "({record_type}, {dtyp:?}) is a served device-attaching row with \
+                 no DEVICE_IO_DIRECTION entry — classify its C dset as read \
+                 (false) or write (true) so its routing can be checked."
+            ));
+            continue;
+        };
+        direction_hit.insert((record_type.clone(), dtyp.clone()));
+
+        let record = match create_record(record_type) {
+            Ok(r) => r,
+            Err(e) => {
+                failures.push(format!(
+                    "({record_type}, {dtyp:?}): create_record failed ({e}) — \
+                     cannot verify routing for a record type devSoft.dbd binds."
+                ));
+                continue;
+            }
+        };
+        let actual_output = record.can_device_write();
+        if actual_output != *expected_output {
+            let (c_dir, mis) = if *expected_output {
+                (
+                    "write (output)",
+                    "absent from can_device_write() → routed to \
+                 the no-op read path; its device write never runs (the printf \
+                 bug)",
+                )
+            } else {
+                (
+                    "read (input)",
+                    "present in can_device_write() → treated as an \
+                 output; its dev.read never runs",
+                )
+            };
+            failures.push(format!(
+                "({record_type}, {dtyp:?}) routing mismatch: C dset is {c_dir} \
+                 but can_device_write()={actual_output} — {mis}."
+            ));
+        }
+    }
+
+    // No stale direction entry: every DEVICE_IO_DIRECTION pair must match a
+    // served row (else the classification drifted from devSoft.dbd).
+    for (rt, dtyp, _) in DEVICE_IO_DIRECTION {
+        if !direction_hit.contains(&(rt.to_string(), dtyp.to_string())) {
+            failures.push(format!(
+                "DEVICE_IO_DIRECTION entry ({rt}, {dtyp:?}) matches no served \
+                 devSoft.dbd row — stale entry; the row was renamed/removed or \
+                 became soft/allowlisted."
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "devSoft.dbd device routing mismatches:\n{}",
         failures.join("\n")
     );
 }

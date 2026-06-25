@@ -444,6 +444,11 @@ struct CachedInterrupt {
     /// read path's `RequestResult` alarm carrier.
     alarm_status: u16,
     alarm_severity: u16,
+    /// asyn transport status carried by the ring element (C
+    /// `ringBuffer[].status = pasynUser->auxStatus`, devAsynInt32.c:600). The
+    /// read maps it to an alarm and gates the value store on `Success`, exactly
+    /// as C `processAi`/`processBo`/array `process()` gate on `result.status`.
+    aux_status: crate::error::AsynStatus,
 }
 
 /// Per-record ring buffer for I/O Intr callbacks. Mirrors C
@@ -708,12 +713,18 @@ fn asyn_to_ca_error(e: AsynError) -> CaError {
 /// MAJOR(2) instead of INVALID(3) — and Disabled was lumped with
 /// Disconnected as COMM_ALARM(9) instead of DISABLE_ALARM(18).
 /// Map an asyn transport status to the EPICS (alarm condition, severity) it
-/// implies — C `asynStatusToEpicsAlarm` with `defaultStat = READ_ALARM`,
-/// `defaultSevr = INVALID_ALARM` (asynEpicsUtils.c:238-265). `asynSuccess` →
-/// (NO_ALARM, NO severity). This is the per-status mapping only; C's fill-in
-/// rule (overwrite a field only while it is still NO_ALARM, so a sample's own
-/// EPICS alarm is preserved) is applied by callers that carry a base alarm.
-fn asyn_status_to_alarm(status: crate::error::AsynStatus) -> (u16, u16) {
+/// implies — C `asynStatusToEpicsAlarm` with `defaultSevr = INVALID_ALARM`
+/// (asynEpicsUtils.c:238-265). `default_stat` is the condition C uses for the
+/// `asynError`/unknown arm: `READ_ALARM` for input device support,
+/// `WRITE_ALARM` for output. `Timeout`/`Overflow`/`Disconnected`/`Disabled`
+/// map to fixed conditions regardless of direction; `asynSuccess` → (NO_ALARM,
+/// NO severity). This is the per-status mapping only; C's fill-in rule
+/// (overwrite a field only while it is still NO_ALARM, so a sample's own EPICS
+/// alarm is preserved) is applied by callers that carry a base alarm.
+fn asyn_status_to_alarm_with_default(
+    status: crate::error::AsynStatus,
+    default_stat: u16,
+) -> (u16, u16) {
     use crate::error::AsynStatus;
     use epics_base_rs::server::recgbl::alarm_status;
     use epics_base_rs::server::record::AlarmSeverity;
@@ -724,8 +735,46 @@ fn asyn_status_to_alarm(status: crate::error::AsynStatus) -> (u16, u16) {
         AsynStatus::Overflow => (alarm_status::HW_LIMIT_ALARM, invalid),
         AsynStatus::Disconnected => (alarm_status::COMM_ALARM, invalid),
         AsynStatus::Disabled => (alarm_status::DISABLE_ALARM, invalid),
-        AsynStatus::Error => (alarm_status::READ_ALARM, invalid),
+        AsynStatus::Error => (default_stat, invalid),
     }
+}
+
+/// [`asyn_status_to_alarm_with_default`] with C's input default (`READ_ALARM`).
+fn asyn_status_to_alarm(status: crate::error::AsynStatus) -> (u16, u16) {
+    asyn_status_to_alarm_with_default(
+        status,
+        epics_base_rs::server::recgbl::alarm_status::READ_ALARM,
+    )
+}
+
+/// Resolve the EPICS alarm an interrupt sample raises from its own EPICS alarm
+/// (`sample_alarm`) and its asyn transport status (`aux`), mirroring C
+/// `asynStatusToEpicsAlarm`'s fill-in (asynEpicsUtils.c:238-265): on
+/// `asynSuccess` the sample's alarm passes through unchanged; otherwise the
+/// transport-mapped alarm fills a field only while it is still `NO_ALARM`, so a
+/// sample's own EPICS alarm wins. Shared by the averaging drain and the regular
+/// I/O Intr ring read; each caller owns its own value-discard gate.
+fn resolve_intr_alarm(
+    sample_alarm: (u16, u16),
+    aux: crate::error::AsynStatus,
+    default_stat: u16,
+) -> (u16, u16) {
+    if aux == crate::error::AsynStatus::Success {
+        return sample_alarm;
+    }
+    let (mstat, msev) = asyn_status_to_alarm_with_default(aux, default_stat);
+    (
+        if sample_alarm.0 == 0 {
+            mstat
+        } else {
+            sample_alarm.0
+        },
+        if sample_alarm.1 == 0 {
+            msev
+        } else {
+            sample_alarm.1
+        },
+    )
 }
 
 fn asyn_error_to_alarm(e: &AsynError) -> (u16, u16) {
@@ -1499,29 +1548,13 @@ impl DeviceSupport for AsynDeviceSupport {
             match drained {
                 Some(val) => {
                     // Final alarm = last sample's EPICS alarm, with C's
-                    // `asynStatusToEpicsAlarm` fill-in: the transport status
-                    // fills a field only while it is still NO_ALARM, so a
-                    // sample's own EPICS alarm wins (asynEpicsUtils.c:238-265).
-                    // On transport success the alarm passes through unchanged
-                    // (the `asynSuccess: break` arm).
-                    let (status, severity) = match transport {
-                        None => last_alarm,
-                        Some(err) => {
-                            let (mstat, msev) = asyn_status_to_alarm(err);
-                            (
-                                if last_alarm.0 == 0 {
-                                    mstat
-                                } else {
-                                    last_alarm.0
-                                },
-                                if last_alarm.1 == 0 {
-                                    msev
-                                } else {
-                                    last_alarm.1
-                                },
-                            )
-                        }
-                    };
+                    // `asynStatusToEpicsAlarm` fill-in (shared resolver). Average
+                    // dsets are ai-only, so the input default READ_ALARM applies.
+                    let (status, severity) = resolve_intr_alarm(
+                        last_alarm,
+                        transport.unwrap_or(crate::error::AsynStatus::Success),
+                        epics_base_rs::server::recgbl::alarm_status::READ_ALARM,
+                    );
                     self.last_alarm_status = status;
                     self.last_alarm_severity = severity;
                     if transport.is_some() {
@@ -1589,22 +1622,56 @@ impl DeviceSupport for AsynDeviceSupport {
             }
             let mut skip_convert = true;
             if let Some(ci) = entry {
-                // Array interrupts carry the native element type; convert to this
-                // record's interface type so a mismatched FTVL gets the same
-                // per-type `convert` the polled path applies (C fires all six
-                // array interfaces, NDPluginStdArrays.cpp:169-197). Scalar
-                // interfaces fall back to the verbatim mapping.
-                let val = convert_param_array_to_iface(&self.iface_type, &ci.value)
-                    .or_else(|| param_value_to_epics_value(&ci.value));
-                if let Some(val) = val {
-                    skip_convert = self.store_read_value(record, val);
-                }
+                // Direction-aware default for the transport-status mapping: C
+                // `asynStatusToEpicsAlarm` takes READ_ALARM for input device
+                // support (processAi, devAsynInt32.c:844) and WRITE_ALARM for
+                // scalar output readback (processBo/Lo/Mbbo, :1201). Array dsets
+                // use READ_ALARM even for aao output (devAsynXXXArray.cpp's
+                // single shared process(), :330-331), so an array iface is
+                // always READ_ALARM; otherwise an asyn:READBACK output is
+                // WRITE_ALARM and a plain input I/O Intr is READ_ALARM. The
+                // default only affects the asynError/unknown arm.
+                let default_stat = if self.iface_type.ends_with("Array") {
+                    epics_base_rs::server::recgbl::alarm_status::READ_ALARM
+                } else if self.asyn_readback {
+                    epics_base_rs::server::recgbl::alarm_status::WRITE_ALARM
+                } else {
+                    epics_base_rs::server::recgbl::alarm_status::READ_ALARM
+                };
+                // Apply the sample's alarm with the transport-status fill-in
+                // (C devAsynInt32.c:844-847; sample EPICS alarm wins, transport
+                // status fills only NO_ALARM fields). Unconditional, like the
+                // pop/overflow/output_callback_pending/timestamp above and here
+                // — C sets `time` even on a transport error (devAsynXXXArray.c:
+                // 327) and always recGblSetSevr's the mapped alarm.
+                let (status, severity) = resolve_intr_alarm(
+                    (ci.alarm_status, ci.alarm_severity),
+                    ci.aux_status,
+                    default_stat,
+                );
+                self.last_alarm_status = status;
+                self.last_alarm_severity = severity;
                 self.last_ts = Some(ci.timestamp);
-                // C devAsynInt32.c:843-847 — apply the driver alarm carried
-                // by the ring-buffer element. Symmetric with the polled
-                // read path (last_alarm_* set from RequestResult below).
-                self.last_alarm_status = ci.alarm_status;
-                self.last_alarm_severity = ci.alarm_severity;
+                // C gates the value store on the transport status:
+                // `if (result.status == asynSuccess) { pr->rval = … } else
+                // return -1` (processAi devAsynInt32.c:844-855, processBo
+                // :1201-1204), and the array process() copies bptr/nord only
+                // `if (rp->status == asynSuccess)` (devAsynXXXArray.cpp:317).
+                // On a transport error keep the prior value (skip the store);
+                // `skip_convert` stays true so the record skips the RVAL→VAL
+                // convert and keeps its previous value = C return -1.
+                if ci.aux_status == crate::error::AsynStatus::Success {
+                    // Array interrupts carry the native element type; convert to
+                    // this record's interface type so a mismatched FTVL gets the
+                    // same per-type `convert` the polled path applies (C fires
+                    // all six array interfaces, NDPluginStdArrays.cpp:169-197).
+                    // Scalar interfaces fall back to the verbatim mapping.
+                    let val = convert_param_array_to_iface(&self.iface_type, &ci.value)
+                        .or_else(|| param_value_to_epics_value(&ci.value));
+                    if let Some(val) = val {
+                        skip_convert = self.store_read_value(record, val);
+                    }
+                }
             }
             // Honor store_read_value's skip-convert decision: computed()
             // (skip RVAL→VAL convert, C return 2) for paths that produced
@@ -1881,6 +1948,10 @@ impl DeviceSupport for AsynDeviceSupport {
                     // NO_ALARM even when the driver flagged an alarm.
                     alarm_status: iv.alarm_status,
                     alarm_severity: iv.alarm_severity,
+                    // Carry the transport status too (C ring `rp->status =
+                    // pasynUser->auxStatus`, devAsynInt32.c:600); the read maps
+                    // it and gates the value store.
+                    aux_status: iv.aux_status,
                 };
                 // C parity (devAsynInt32.c:564-576):
                 //   - On overflow (ring full), drop oldest +
@@ -2930,6 +3001,7 @@ mod tests {
                     timestamp: SystemTime::UNIX_EPOCH,
                     alarm_status: 0,
                     alarm_severity: 0,
+                    aux_status: crate::error::AsynStatus::Success,
                 });
         }
         let len = |ads: &AsynDeviceSupport| ads.interrupt_fifo.lock().unwrap().entries.len();
@@ -3802,6 +3874,7 @@ mod tests {
             timestamp: SystemTime::UNIX_EPOCH + Duration::from_millis(t_ms),
             alarm_status: 0,
             alarm_severity: 0,
+            aux_status: crate::error::AsynStatus::Success,
         }
     }
 
@@ -4065,6 +4138,7 @@ mod tests {
                 timestamp: SystemTime::UNIX_EPOCH,
                 alarm_status: 3,   // e.g. READ_ALARM
                 alarm_severity: 1, // e.g. MINOR
+                aux_status: crate::error::AsynStatus::Success,
             });
         }
         ads.read(&mut rec).unwrap();
@@ -4089,6 +4163,245 @@ mod tests {
         ads.read(&mut rec).unwrap();
         assert_eq!(rec.val(), Some(EpicsValue::Long(9)));
         assert_eq!(ads.last_alarm(), None, "clean entry => no alarm");
+    }
+
+    /// A transport-error I/O Intr sample (`aux_status != Success`): C `processAi`
+    /// maps the status via `asynStatusToEpicsAlarm` and returns -1, DISCARDING
+    /// the value so RVAL/VAL keep their prior content (devAsynInt32.c:844-855).
+    /// The port dropped `iv.aux_status`, storing the bad value with no alarm.
+    #[test]
+    fn io_intr_read_transport_error_discards_value_and_maps_timeout() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut ads = make_adapter(ScanType::IoIntr); // asynInt32 input
+        let mut rec = LonginRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        // Seed a known prior value with a clean interrupt.
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(intr_entry(11, 0));
+        ads.read(&mut rec).unwrap();
+        assert_eq!(rec.val(), Some(EpicsValue::Long(11)));
+        assert_eq!(ads.last_alarm(), None);
+        // Now a transport-error interrupt carrying a different value.
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32(99),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Timeout,
+            });
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            rec.val(),
+            Some(EpicsValue::Long(11)),
+            "transport error must keep the prior value (C return -1), not store 99"
+        );
+        assert_eq!(
+            ads.last_alarm(),
+            Some((10, 3)),
+            "transport Timeout maps to TIMEOUT_ALARM(10)/INVALID(3)"
+        );
+    }
+
+    /// The `asynError`/unknown transport status takes C's direction-dependent
+    /// `defaultStat`: READ_ALARM for an input I/O Intr record (processAi,
+    /// devAsynInt32.c:844).
+    #[test]
+    fn io_intr_read_input_error_default_is_read_alarm() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut ads = make_adapter(ScanType::IoIntr); // input, asyn_readback=false
+        let mut rec = LonginRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32(99),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Error,
+            });
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            ads.last_alarm(),
+            Some((1, 3)),
+            "input asynError default => READ_ALARM(1)/INVALID(3)"
+        );
+    }
+
+    /// Contrast with the input case: a scalar `asyn:READBACK` OUTPUT record takes
+    /// WRITE_ALARM for the `asynError`/unknown default (processBo, devAsynInt32.c:
+    /// 1201). Same shared ring read, direction picked from `asyn_readback`.
+    #[test]
+    fn io_intr_readback_output_error_default_is_write_alarm() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut ads = make_adapter(ScanType::Passive); // scalar asynInt32
+        ads.set_asyn_readback(true); // output readback path
+        let mut rec = LonginRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32(99),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Error,
+            });
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            ads.last_alarm(),
+            Some((2, 3)),
+            "scalar output readback asynError default => WRITE_ALARM(2)/INVALID(3)"
+        );
+    }
+
+    /// C `asynStatusToEpicsAlarm` fills a field only while it is still NO_ALARM
+    /// (asynEpicsUtils.c:242-264), so a sample's own EPICS alarm wins over the
+    /// transport-status mapping.
+    #[test]
+    fn io_intr_read_sample_epics_alarm_wins_over_transport_mapping() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut ads = make_adapter(ScanType::IoIntr);
+        let mut rec = LonginRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32(99),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 7,   // STATE_ALARM (sample's own)
+                alarm_severity: 2, // MAJOR
+                aux_status: crate::error::AsynStatus::Timeout, // would map to (10, 3)
+            });
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            ads.last_alarm(),
+            Some((7, 2)),
+            "sample STATE_ALARM/MAJOR must win over the transport Timeout mapping"
+        );
+    }
+
+    /// The discard skips only the value store, NEVER the entry consume: C resets
+    /// the ring tail on every `getCallbackValue` regardless of status. A
+    /// transport-error entry is popped, and the next clean entry is the value
+    /// stored — the ring stays balanced.
+    #[test]
+    fn io_intr_read_transport_error_consumes_entry_keeps_ring_balanced() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut ads = make_adapter(ScanType::IoIntr);
+        let mut rec = LonginRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        {
+            let mut g = ads.interrupt_fifo.lock().unwrap();
+            g.push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32(99),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Disconnected,
+            });
+            g.push_with_overflow(intr_entry(50, 0)); // clean follow-up
+        }
+        // First read: error entry consumed (popped), value discarded.
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            rec.val(),
+            Some(EpicsValue::Long(0)),
+            "error value discarded"
+        );
+        assert_eq!(
+            ads.last_alarm(),
+            Some((9, 3)),
+            "Disconnected maps to COMM_ALARM(9)/INVALID(3)"
+        );
+        assert_eq!(
+            ads.interrupt_fifo.lock().unwrap().entries.len(),
+            1,
+            "the error entry must be consumed, leaving exactly the clean follow-up"
+        );
+        // Second read: the clean entry is the value stored.
+        ads.read(&mut rec).unwrap();
+        assert_eq!(rec.val(), Some(EpicsValue::Long(50)));
+        assert_eq!(ads.last_alarm(), None);
+    }
+
+    /// Array dsets gate the same way (devAsynXXXArray.cpp:317 copies bptr/nord
+    /// only on `rp->status == asynSuccess`) but use READ_ALARM as the default
+    /// EVEN for aao output (the single shared process(), :330-331). So an array
+    /// `asyn:READBACK` output discards the array on error and raises READ_ALARM,
+    /// not WRITE_ALARM.
+    #[test]
+    fn io_intr_array_transport_error_discards_array_and_maps_read_alarm() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+        // Build an asynInt32Array adapter on the readback (output) path.
+        let driver = TestPort::new();
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let actor = PortActor::new(Box::new(driver), rx);
+        std::thread::Builder::new()
+            .name("test-arr-actor".into())
+            .spawn(move || actor.run())
+            .unwrap();
+        let handle = PortHandle::new(tx, "test".into(), interrupts);
+        let link = AsynLink {
+            port_name: "test".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: "VAL".into(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynInt32Array");
+        ads.set_record_info("TEST:ARR", ScanType::Passive);
+        ads.set_asyn_readback(true); // array OUTPUT readback (aao)
+        let mut rec = WaveformRecord::new(8, DbFieldType::Long);
+        ads.init(&mut rec).unwrap();
+
+        // Seed a known prior array via a clean interrupt.
+        let clean = std::sync::Arc::from([1i32, 2, 3].as_slice());
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32Array(clean),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Success,
+            });
+        ads.read(&mut rec).unwrap();
+        assert_eq!(rec.val(), Some(EpicsValue::LongArray(vec![1, 2, 3])));
+
+        // A transport-error array interrupt carrying different data.
+        let bad = std::sync::Arc::from([9i32, 9, 9].as_slice());
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32Array(bad),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Error,
+            });
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            rec.val(),
+            Some(EpicsValue::LongArray(vec![1, 2, 3])),
+            "transport error must keep the prior array (C devAsynXXXArray.cpp:317)"
+        );
+        assert_eq!(
+            ads.last_alarm(),
+            Some((1, 3)),
+            "array dset uses READ_ALARM(1) even for aao output, not WRITE_ALARM"
+        );
     }
 
     /// A `ScanType::IoIntr` adapter on `asynFloat64` whose driver exposes a
@@ -4140,6 +4453,7 @@ mod tests {
             timestamp: SystemTime::UNIX_EPOCH,
             alarm_status: 0,
             alarm_severity: 0,
+            aux_status: crate::error::AsynStatus::Success,
         });
     }
 

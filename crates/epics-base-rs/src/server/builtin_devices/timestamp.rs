@@ -148,10 +148,11 @@ fn format_strftime_prefix(prefix: &str, dt: &DateTime<Local>) -> String {
 
 /// Append `s` to `out` truncated so it occupies at most `buf_len_left - 1`
 /// bytes, mirroring C's `memcpy`/`strncpy` cap that always leaves room for
-/// the NUL (`epicsTime.cpp:256-262`, `:268-274`). Returns the bytes
-/// appended. Every caller passes ASCII (`<undefined>`, the `OVF`/`*`/
-/// `<invalid format>` sentinels, a decimal digit string), so a byte cut is
-/// also a char boundary.
+/// the NUL (`epicsTime.cpp:268-274`). Returns the bytes appended. Every
+/// caller passes ASCII (`<undefined>`, the `************` sentinel, a decimal
+/// digit string), so a byte cut is also a char boundary. (The
+/// `<invalid format>` sentinel does NOT go through here — like C, it flows
+/// through the strftime step, which omits it whole rather than cutting it.)
 fn push_truncated(out: &mut String, s: &str, buf_len_left: usize) -> usize {
     let n = s.len().min(buf_len_left.saturating_sub(1));
     out.push_str(&s[..n]);
@@ -188,14 +189,25 @@ fn epics_time_to_strftime(format: &str, ts: SystemTime) -> String {
     let mut rest = format;
     // C `epicsTime.cpp:185`: `while (*pFmt != '\0' && bufLenLeft > 1)`.
     while !rest.is_empty() && buf_len_left > 1 {
-        let (prefix, frac, after) = frac_format_find(rest);
+        let (raw_prefix, mut frac, after) = frac_format_find(rest);
 
-        // C `epicsTime.cpp:144-161`/`:156-161`: a strftime prefix segment
-        // that does not fit `strftimePrefixBuf[256]` formats to
-        // `<invalid format>`, drops the fractional token, and stops.
-        if prefix.len() >= STRFTIME_PREFIX_BUF {
-            push_truncated(&mut out, "<invalid format>", buf_len_left);
-            break;
+        // C `fracFormatFind` (`epicsTime.cpp:144-161`): a strftime prefix
+        // segment that overflows `strftimePrefixBuf[256]` is REPLACED by the
+        // literal `<invalid format>`, the fractional token is dropped, and
+        // `pAfter` becomes "" so the loop ends. The substituted text is then
+        // an ordinary strftime prefix — it flows through the strftime step
+        // below and obeys the same omit-whole-if-no-room rule (C feeds it to
+        // `::strftime`, which writes nothing when it does not fit), NOT a
+        // mid-field cut.
+        let prefix;
+        let stop;
+        if raw_prefix.len() >= STRFTIME_PREFIX_BUF {
+            prefix = "<invalid format>";
+            frac = None;
+            stop = true;
+        } else {
+            prefix = raw_prefix;
+            stop = false;
         }
 
         // C `epicsTime.cpp:196`: nothing more to format → quit.
@@ -245,6 +257,11 @@ fn epics_time_to_strftime(format: &str, ts: SystemTime) -> String {
             }
         }
 
+        // C `fracFormatFind` set `pAfter=""` for the `<invalid format>` case;
+        // the loop then ends. Otherwise continue with the postfix.
+        if stop {
+            break;
+        }
         rest = after.unwrap_or("");
     }
     out
@@ -534,11 +551,33 @@ mod tests {
     }
 
     /// C `epicsTime.cpp:156-161`: a strftime prefix segment that overflows
-    /// `strftimePrefixBuf[256]` formats to `<invalid format>` and stops.
+    /// `strftimePrefixBuf[256]` formats to `<invalid format>` — and, since C
+    /// feeds it back through `::strftime`, it is written WHOLE when it fits
+    /// (here a fresh 40-byte buffer holds all 16 chars).
     #[test]
     fn strftime_prefix_too_long_emits_invalid_format() {
         let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
         let out = epics_time_to_strftime(&format!("{}%f", "a".repeat(256)), t);
         assert_eq!(out, "<invalid format>");
+    }
+
+    /// `<invalid format>` obeys the strftime omit-whole-if-no-room rule, NOT a
+    /// mid-field cut. A 35-char prefix + `%1f` leaves 4 bytes; the following
+    /// 256-char segment's `<invalid format>` (16 chars) does not fit 4 bytes,
+    /// so C's `::strftime` writes NOTHING — no truncated `<inv…` fragment.
+    #[test]
+    fn strftime_invalid_format_omitted_whole_when_no_room() {
+        let t = SystemTime::UNIX_EPOCH
+            + Duration::from_secs(1_000_000_000)
+            + Duration::from_nanos(250_000_000);
+        let fmt = format!("{}%1f{}%f", "x".repeat(35), "a".repeat(256));
+        let out = epics_time_to_strftime(&fmt, t);
+        // 35 x's fit (buf_len_left 40→5); `%1f` writes "3" (buf_len_left→4);
+        // the `<invalid format>` segment does not fit 4 bytes → omitted whole.
+        assert_eq!(out, format!("{}3", "x".repeat(35)));
+        assert!(
+            !out.contains('<'),
+            "no truncated sentinel fragment, got {out:?}"
+        );
     }
 }

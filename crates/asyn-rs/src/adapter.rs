@@ -1815,7 +1815,18 @@ pub fn universal_asyn_factory(
     // resolution that would fail on a command string — reason stays 0, and octet
     // I/O keys off the addr, not the reason.
     if ctx.dtyp == "asynOctetCmdResponse" {
-        adapter.octet_cmd = Some(crate::asyn_record::translate_escape(&adapter.drv_info));
+        // C initCmdBuffer (devAsynOctet.c:639-641) runs dbTranslateEscape then
+        // bufLen = strlen(buffer): an escaped NUL (\0 / \000) terminates the
+        // command, so only the bytes up to the first NUL are written. Truncate
+        // at the first NUL to match the bytes C actually puts on the wire. A
+        // command that is empty after this (DRVINFO empty, or a leading NUL ->
+        // strlen 0) is rejected by the read() guard with LINK_ALARM/INVALID,
+        // mirroring C's INIT_ERROR path for an empty command.
+        let mut cmd = crate::asyn_record::translate_escape(&adapter.drv_info);
+        if let Some(nul) = cmd.iter().position(|&b| b == 0) {
+            cmd.truncate(nul);
+        }
+        adapter.octet_cmd = Some(cmd);
         adapter.reason_set = true;
     }
 
@@ -3749,6 +3760,42 @@ mod tests {
             rec.get_field("VAL"),
             Some(EpicsValue::String("IDN-OK".into())),
             "the device reply must be stored in VAL"
+        );
+    }
+
+    /// An escaped NUL in the asynOctetCmdResponse command terminates it: C
+    /// initCmdBuffer (devAsynOctet.c:639-641) sets bufLen = strlen(buffer) after
+    /// dbTranslateEscape, so the bytes from the NUL onward are never written.
+    /// The factory truncates at the first NUL to match the wire bytes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cmd_response_command_truncates_at_embedded_nul() {
+        use epics_base_rs::server::ioc_app::DeviceSupportContext;
+        use epics_base_rs::server::records::stringin::StringinRecord;
+
+        let (handle, (writes, _sequence)) = spawn_cmd_response_port("cmdresp_nul", b"R");
+        crate::asyn_record::register_port(
+            "cmdresp_nul",
+            handle,
+            Arc::new(crate::trace::TraceManager::new()),
+        );
+
+        // "AB\000CD": dbTranslateEscape yields A B 0x00 C D; C strlen stops at the
+        // NUL, so only "AB" reaches the wire.
+        let ctx = DeviceSupportContext {
+            dtyp: "asynOctetCmdResponse",
+            inp: "@asyn(cmdresp_nul,0)AB\\000CD",
+            out: "",
+        };
+        let mut dev = universal_asyn_factory(&ctx).expect("factory builds the device");
+
+        let mut rec = StringinRecord::new("");
+        dev.init(&mut rec).unwrap();
+        dev.read(&mut rec).unwrap();
+
+        assert_eq!(
+            writes.lock().unwrap().clone(),
+            vec![b"AB".to_vec()],
+            "the command is truncated at the embedded NUL (C strlen)"
         );
     }
 

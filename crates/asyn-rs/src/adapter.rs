@@ -1266,13 +1266,13 @@ impl AsynDeviceSupport {
     ///   convert, which would otherwise recompute RVAL from the stale VAL and
     ///   discard the readback. Outputs: ao (engineering inverse), mbbo/bo/
     ///   mbboDirect (state table / 0-1 / bit map). Inputs: bi (0/1 map,
-    ///   `processBi`), mbbiDirect (mask/shift/bits, `processMbbiDirect`). The
-    ///   hook is the *device-distinct* entry — the Soft Channel path stays on
-    ///   `set_val`, so it does not collide with a soft-link value write.
-    /// - everything else (input mbbi, longin/longout): set VAL directly, return
-    ///   `true` (device support produced the final value, as before) — mbbi's
-    ///   `set_val` re-derives from RVAL + the state table internally; longin/
-    ///   longout VAL *is* the raw (no convert).
+    ///   `processBi`), mbbi (mask/shift/state index, `processMbbi`), mbbiDirect
+    ///   (mask/shift/bits, `processMbbiDirect`). The hook is the *device-distinct*
+    ///   entry — the Soft Channel path stays on `set_val`, so it does not
+    ///   collide with a soft-link value write.
+    /// - everything else (longin/longout): set VAL directly, return `true`
+    ///   (device support produced the final value, as before) — longin/longout
+    ///   VAL *is* the raw (no convert).
     fn store_read_value(&mut self, record: &mut dyn Record, val: EpicsValue) -> bool {
         if self.iface_type == "asynFloat64" {
             if let EpicsValue::Double(raw) = val {
@@ -1287,22 +1287,24 @@ impl AsynDeviceSupport {
             if let EpicsValue::Long(raw) = val {
                 // Records own their `raw -> record-value` mapping: ao's
                 // engineering inverse, mbbo/bo/mbboDirect's state-table / 0-1 /
-                // bit map (outputs), and bi's 0/1 map + mbbiDirect's mask/shift/
-                // bits (inputs). `apply_raw_readback` stores RVAL and computes
-                // VAL, and we return `true` (computed) so the framework skips
-                // the record's forward convert, which would recompute RVAL from
-                // the stale VAL and discard the readback. C `processAo`
-                // (devAsynInt32.c:973-994), `processMbbo`/`processBo`
+                // bit map (outputs), and bi's 0/1 map + mbbi's state index +
+                // mbbiDirect's mask/shift/bits (inputs). `apply_raw_readback`
+                // stores RVAL and computes VAL, and we return `true` (computed)
+                // so the framework skips the record's forward convert, which
+                // would recompute RVAL from the stale VAL and discard the
+                // readback. C `processAo` (devAsynInt32.c:973-994),
+                // `processMbbo`/`processBo`
                 // (devAsynInt32.c:1310-1330,1202-1203 /
                 // devAsynUInt32Digital.c:945-962,731-732),
                 // `processMbboDirect` (devAsynUInt32Digital.c:1084-1090),
-                // `processBi` (devAsynInt32.c / devAsynUInt32Digital.c:689) and
-                // `processMbbiDirect` (devAsynUInt32Digital.c:1031) all set both
-                // fields from the callback and return without re-converting.
+                // `processBi` (devAsynInt32.c / devAsynUInt32Digital.c:689),
+                // `processMbbi` (devAsynInt32.c:1270 / devAsynUInt32Digital.c:903)
+                // and `processMbbiDirect` (devAsynUInt32Digital.c:1031) all set
+                // both fields from the callback and return without re-converting.
                 // The hook is iface-agnostic (it uses the record's own
                 // MASK/SHFT/state table), so the one dispatch covers both the
                 // asynInt32 and the asynUInt32Digital readback. ai routes via
-                // the ESLO branch below; mbbi/longin decline (default `false`).
+                // the ESLO branch below; longin declines (default `false`).
                 if record.apply_raw_readback(raw) {
                     return true;
                 }
@@ -5194,6 +5196,43 @@ mod tests {
         );
         assert_eq!(rec.bits[0], 1);
         assert_eq!(rec.bits[3], 1);
+    }
+
+    /// An `asynInt32` I/O Intr `mbbi` input: the device raw enters RVAL masked
+    /// (C `processMbbi` `rval = value & mask`, devAsynInt32.c:1270) and
+    /// mbbiRecord's convert shifts (>>SHFT) then resolves the state index.
+    /// Before the fix mbbi mapped the raw inside its own `set_val` with NO
+    /// mask, leaking out-of-mask bits; `apply_raw_readback` masks like C.
+    #[test]
+    fn io_intr_readback_mbbi_asynint32_masks_and_maps_state() {
+        use epics_base_rs::server::records::mbbi::MbbiRecord;
+        let mut ads = make_adapter(ScanType::IoIntr); // input, asynInt32
+        let mut rec = MbbiRecord::new(0);
+        rec.put_field("ONVL", EpicsValue::ULong(1)).unwrap();
+        rec.put_field("TWVL", EpicsValue::ULong(2)).unwrap();
+        rec.init_record(0).unwrap(); // computes sdef=true
+        ads.init(&mut rec).unwrap();
+        // asynInt32: no adapter mask propagation; set the state mask/shift.
+        rec.mask = 0x0C; // bits 2-3
+        rec.shft = 2;
+        // raw 0x88 -> masked 0x08 (0x80 stripped) -> shifted 2 -> TWVL=2 -> idx 2.
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32(0x88),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Success,
+            });
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(outcome.did_compute, "mbbi readback computed");
+        assert_eq!(
+            rec.rval, 0x08,
+            "RVAL = raw & mask (out-of-mask 0x80 stripped)"
+        );
+        assert_eq!(rec.val, 2, "state index 2 (TWVL), not leaked/unknown");
     }
 
     /// A `ScanType::IoIntr` adapter on `asynFloat64` whose driver exposes a

@@ -833,25 +833,25 @@ impl Record for MbbiRecord {
         Ok(())
     }
 
-    /// Override set_val: convert raw value from hardware → enum index.
+    /// Soft Channel VAL entry — a pass-through, NOT a raw->state map. C
+    /// `devMbbiSoft::read_mbbi` (devMbbiSoft.c:51) does
+    /// `dbGetLink(DBR_USHORT, &prec->val); return 2`: the link value is
+    /// written straight to VAL as the state index, with no mask/shift/state
+    /// lookup. The asyn DEVICE raw path is the separate `apply_raw_readback`
+    /// hook below, so `set_val` carries one meaning only (soft-link / SIOL-sim
+    /// pass-through). A Soft Channel mbbi whose INP resolves to a numeric
+    /// source is therefore no longer reverse-mapped through the state table
+    /// (the prior dual meaning, which diverged from C `return 2`).
     fn set_val(&mut self, value: EpicsValue) -> CaResult<()> {
-        // RVAL is DBF_ULONG (mbbiRecord.dbd.pod:604): a raw value from
-        // hardware is an unsigned 32-bit word. Accept the native ULong and
-        // the legacy signed carriers; the signed→unsigned reinterpret
-        // preserves the bit pattern (a sign-extended Short fills the upper
-        // bits, matching the prior i32 path).
-        let raw: u32 = match value {
-            EpicsValue::ULong(v) => v,
-            EpicsValue::Long(v) => v as u32,
-            EpicsValue::Short(v) => v as u32,
-            EpicsValue::Enum(v) => {
-                // Already an index — store directly
-                self.val = v;
-                return Ok(());
-            }
-            // epics-base PR/issue #183 — DBF_MENU ↔ DBF_STRING.
-            // Match the string against ZRST..FFST and store the
-            // corresponding state index.
+        // VAL is DBF_ENUM (mbbiRecord.dbd.pod): the state index. C reads the
+        // link as DBR_USHORT, so every numeric carrier coerces to u16.
+        match value {
+            EpicsValue::Enum(v) => self.val = v,
+            EpicsValue::ULong(v) => self.val = v as u16,
+            EpicsValue::Long(v) => self.val = v as u16,
+            EpicsValue::Short(v) => self.val = v as u16,
+            // epics-base PR/issue #183 — DBF_MENU ↔ DBF_STRING. Match the
+            // string against ZRST..FFST and store the corresponding index.
             EpicsValue::String(s) => {
                 let strs: [&PvString; 16] = [
                     &self.zrst, &self.onst, &self.twst, &self.thst, &self.frst, &self.fvst,
@@ -860,23 +860,41 @@ impl Record for MbbiRecord {
                 ];
                 if let Some(idx) = strs.iter().position(|st| **st == s) {
                     self.val = idx as u16;
-                    return Ok(());
+                } else {
+                    return Err(CaError::TypeMismatch(format!(
+                        "mbbi VAL: '{s}' matches no ZRST..FFST state string"
+                    )));
                 }
-                return Err(CaError::TypeMismatch(format!(
-                    "mbbi VAL: '{s}' matches no ZRST..FFST state string"
-                )));
             }
             _ => return Err(CaError::TypeMismatch("VAL".into())),
-        };
-        self.rval = raw;
+        }
+        Ok(())
+    }
+
+    /// asyn device readback: a raw hardware word read through `asynInt32` or
+    /// `asynUInt32Digital`. C `processMbbi` sets `rval = value & mask` on
+    /// BOTH ifaces (devAsynInt32.c:1270 with the record's NOBT-derived mask /
+    /// devAsynUInt32Digital.c:903 with the `@asynMask`), and mbbiRecord's
+    /// convert (mbbiRecord.c:172-190) then shifts `rval >> SHFT` and resolves
+    /// the state index. The hook performs the (identical) mask + shift +
+    /// lookup inline and returns `true` so the framework skips the forward
+    /// convert.
+    ///
+    /// This is the *device-distinct* entry, separate from the Soft Channel
+    /// `set_val` pass-through above — routing the device raw here is what lets
+    /// `set_val` stay single-meaning. Input twin of `mbbo::apply_raw_readback`,
+    /// with an **unconditional** `& mask` (unlike `bi`, whose asynInt32 dset
+    /// leaves mask 0 and reads the value unmasked — `processMbbi` masks on both
+    /// ifaces). The `& mask` here is the masking the prior `set_val` omitted.
+    fn apply_raw_readback(&mut self, raw: i32) -> bool {
+        let masked = (raw as u32) & self.mask;
+        self.rval = masked;
         let shifted = if self.shft > 0 {
-            // See `process` — `checked_shr` so a CA-written SHFT >= 32
-            // yields 0 instead of panicking in debug builds.
-            raw.checked_shr(self.shft as u32).unwrap_or(0)
+            masked.checked_shr(self.shft as u32).unwrap_or(0)
         } else {
-            raw
+            masked
         };
         self.val = self.raw_to_val(shifted);
-        Ok(())
+        true
     }
 }

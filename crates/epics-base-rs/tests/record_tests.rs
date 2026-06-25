@@ -358,21 +358,71 @@ fn test_mbbi_direct_readback_maps_raw_mask_shift_bits() {
     assert_eq!(rec.val, 0, "out-of-mask bits do not reach VAL");
 }
 
-// Family boundary: mbbi maps the raw inside its own set_val (state table) and
-// longin's VAL *is* the raw — neither claims apply_raw_readback, so the asyn
-// store keeps routing them through set_val (the default hook returns false).
+// Family boundary: longin's VAL *is* the raw (C processLi sets pr->val, no
+// RVAL->VAL convert), so it declines apply_raw_readback and the asyn store
+// keeps routing it through set_val (the default hook returns false).
 #[test]
-fn test_mbbi_and_longin_decline_raw_readback() {
+fn test_longin_declines_raw_readback() {
     use epics_base_rs::server::records::longin::LonginRecord;
-    use epics_base_rs::server::records::mbbi::MbbiRecord;
-    assert!(
-        !MbbiRecord::new(0).apply_raw_readback(3),
-        "mbbi maps the raw via set_val, not the readback hook"
-    );
     assert!(
         !LonginRecord::new(0).apply_raw_readback(3),
         "longin VAL is the raw — no convert to claim"
     );
+}
+
+// mbbi asyn device readback (input twin of mbbo): C processMbbi masks on both
+// ifaces (rval = value & mask, devAsynInt32.c:1270 / devAsynUInt32Digital.c:903)
+// then mbbiRecord convert shifts (>>SHFT) and resolves the state index. The
+// `& mask` is the masking the prior set_val omitted — out-of-mask bits are
+// stripped, not leaked into the state lookup.
+#[test]
+fn test_mbbi_readback_masks_shifts_and_maps_state() {
+    use epics_base_rs::server::records::mbbi::MbbiRecord;
+    let mut rec = MbbiRecord::new(0);
+    rec.put_field("ONVL", EpicsValue::ULong(1)).unwrap();
+    rec.put_field("TWVL", EpicsValue::ULong(2)).unwrap();
+    rec.init_record(0).unwrap(); // computes sdef=true
+    rec.mask = 0x0C; // bits 2-3
+    rec.shft = 2;
+    // raw 0x08 -> masked 0x08 -> shifted (>>2) = 2 -> TWVL=2 -> state index 2.
+    assert!(
+        rec.apply_raw_readback(0x08),
+        "mbbi claims the device readback"
+    );
+    assert_eq!(rec.rval, 0x08, "RVAL = raw & mask (C processMbbi)");
+    assert_eq!(rec.val, 2, "shifted raw 2 -> state index 2 (TWVL)");
+    // Mask gating: an out-of-mask 0x80 bit is stripped, NOT leaked. Before the
+    // fix set_val left rval unmasked, so 0x88 would have shifted to 0x22 and
+    // missed the state table (val 65535).
+    assert!(rec.apply_raw_readback(0x88));
+    assert_eq!(rec.rval, 0x08, "out-of-mask 0x80 bit masked away");
+    assert_eq!(rec.val, 2, "still resolves to TWVL, not an unknown state");
+}
+
+// mbbi Soft Channel set_val is now a pass-through (C devMbbiSoft read_mbbi
+// returns 2: the link value lands in VAL as the index, no state-table map).
+// Before the fix set_val reverse-mapped a numeric link through raw_to_val,
+// diverging from C whenever the source value was not a state RVAL.
+#[test]
+fn test_mbbi_set_val_is_soft_channel_passthrough() {
+    use epics_base_rs::server::records::mbbi::MbbiRecord;
+    let mut rec = MbbiRecord::new(0);
+    rec.put_field("ONVL", EpicsValue::ULong(1)).unwrap();
+    rec.put_field("TWVL", EpicsValue::ULong(2)).unwrap();
+    rec.init_record(0).unwrap();
+    // A numeric soft-link value is the index, verbatim.
+    rec.set_val(EpicsValue::Long(2)).unwrap();
+    assert_eq!(rec.val, 2, "soft-link value is the index, not state-mapped");
+    // A value matching no state RVAL still passes through (old: raw_to_val ->
+    // 65535 unknown-state; C devMbbiSoft -> the value itself).
+    rec.set_val(EpicsValue::Long(7)).unwrap();
+    assert_eq!(
+        rec.val, 7,
+        "pass-through, not the 65535 unknown-state sentinel"
+    );
+    // Enum and ZRST..FFST string puts still resolve to the index directly.
+    rec.set_val(EpicsValue::Enum(1)).unwrap();
+    assert_eq!(rec.val, 1);
 }
 
 #[test]

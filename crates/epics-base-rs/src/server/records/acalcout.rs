@@ -47,15 +47,45 @@
 //!   reports `Constant`(3), matching C overwriting the dbd `initial("1")`
 //!   for every CONSTANT link (see `AcalcoutRecord::default`). Live per-link
 //!   CA-connectivity reclassification (C `checkLinks`) is not modeled.
-//! - Array MDEL/ADEL deadband (C `monitor()` per-element delta) is replaced
-//!   by the framework's generic array change-detection (post on any change).
+//! - Array `AVAL`/`OAV` MDEL/ADEL deadband (C `monitor()` per-element delta
+//!   vs `pavl`/`poav`, aCalcoutRecord.c:987-1021) is replaced by the
+//!   framework's generic array change-detection (post on any change). Differs
+//!   only when MDEL/ADEL > 0; the default 0 posts on any change in both.
 //! - `IVOA` is applied on a CALC/OCAL evaluation failure (the C
-//!   `CALC_ALARM`=INVALID path), matching sibling `scalcout`; the
-//!   limit-alarm-driven `INVALID` IVOA gate of C `execOutput` is not
-//!   modeled. Don't-Drive suppresses the OUT write via
+//!   `CALC_ALARM`=INVALID path), matching siblings `scalcout`/`calcout`; the
+//!   limit-alarm/MS-link-driven `INVALID` IVOA gate of C `execOutput` is not
+//!   modeled, because the framework runs `check_alarms` after `process()` so
+//!   the output decision cannot see limit/link severity (a framework-wide
+//!   trait shared with `scalcout`). Don't-Drive suppresses the OUT write via
 //!   `cached_should_output` (the generic `multi_output_links` writeback does
 //!   not honour the framework's severity skip_out); SetIVOV writes `IVOV`
-//!   into the field OUT consumes — see `set_output_to_ivov`.
+//!   into the field OUT consumes — see `set_output_to_ivov`. Under `DOPT=Use
+//!   CALC`, SetIVOV drives `IVOV` to OUT; literal C sets only the unused
+//!   `oval` there and drives the failed `aval`, so its IVOV substitution is a
+//!   no-op — this port deliberately does NOT replicate that C quirk.
+//! - `SIZE` (NELM vs NUSE) is stored but does not gate the client-advertised
+//!   array capacity: the served element count is always
+//!   `acalcGetNumElements()` (C `get_array_info`), matching C's served data.
+//!   C `cvt_dbaddr` additionally advertises `NELM` as the channel capacity
+//!   under the default `SIZE=NELM`; the single-length model serves that count
+//!   directly, so the advertised capacity differs only when `NUSE` is set to
+//!   `0 < NUSE < NELM` under `SIZE=NELM`. `NELM=0` (degenerate; dbd
+//!   initial 1) serves a 1-element array, where C serves 0.
+//! - `UDF` follows the framework `value_is_undefined()` (NaN VAL ⇒ UDF). A
+//!   NaN result correctly keeps UDF; but a compile-failure/empty `CALC` on the
+//!   first process shows `UDF=0` (VAL still 0.0) where C keeps `UDF=1` (C sets
+//!   `udf=FALSE` only on a successful calc). Narrow: only before the first
+//!   successful calc.
+//! - `LALM` advances on every matched alarm level; C gates it on
+//!   `if (recGblSetSevr(...))` (advance only when that severity actually
+//!   raised `nsev`). Mirrors the framework-wide `rec_gbl_set_sevr` (returns
+//!   void); a higher pre-existing severity can thus perturb next-cycle
+//!   hysteresis vs C.
+//! - In-place array-variable mutation: C `aCalcPerform` may modify the input
+//!   arrays `aa..ll`, and `monitor()` re-posts each array flagged in `newm`
+//!   (aCalcoutRecord.c:1031-1035). The engine evaluates over a clone, so
+//!   mutations are dropped and `AMASK`/`NEWM` stay inert (only `AVAL`/`OAV`
+//!   results are captured). Advanced/uncommon aCalc usage.
 
 use crate::error::{CaError, CaResult};
 use crate::server::record::{FieldDesc, ProcessOutcome, Record};

@@ -22,6 +22,7 @@
 use std::collections::{HashMap, HashSet};
 
 use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::recgbl::alarm_status;
 use epics_base_rs::server::record::AlarmSeverity;
 use epics_base_rs::types::EpicsValue;
 
@@ -98,5 +99,58 @@ record(ai, "GETENV_AI") {
         inst.common.sevr,
         AlarmSeverity::Invalid,
         "ai with DTYP=getenv must be INVALID (no getenv device support for ai)"
+    );
+}
+
+/// An unset env var: C raises UDF_ALARM at UDFS (default INVALID) and clears
+/// VAL, returning success (read_lsi devEnviron.c:62-67 / read_stringin
+/// :114-118). base-rs surfaces the SAME UDF_ALARM via the device `last_alarm()`
+/// channel — not READ_ALARM (which the earlier soft-Err path produced) and with
+/// no per-cycle stderr spam.
+#[tokio::test]
+async fn getenv_unset_var_raises_udf_alarm_not_read_alarm() {
+    // SAFETY: nextest isolates each test in its own process (see module doc), so
+    // removing this variable cannot race another test.
+    unsafe {
+        std::env::remove_var("GETENV_E2E_DEFINITELY_UNSET_VAR");
+    }
+
+    let (db, _) = IocBuilder::new()
+        .db_string(
+            r#"
+record(stringin, "GETENV_UNSET") {
+    field(DTYP, "getenv")
+    field(INP, "@GETENV_E2E_DEFINITELY_UNSET_VAR")
+}
+"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("GETENV_UNSET", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let rec = db.get_record("GETENV_UNSET").await.expect("record exists");
+    let inst = rec.read().await;
+    assert_eq!(
+        inst.common.stat,
+        alarm_status::UDF_ALARM,
+        "unset env var must raise UDF_ALARM (C recGblSetSevrMsg UDF_ALARM), not \
+         READ_ALARM"
+    );
+    assert_eq!(
+        inst.common.sevr,
+        AlarmSeverity::Invalid,
+        "unset-var severity must be UDFS (default INVALID)"
+    );
+    assert_eq!(
+        inst.record.get_field("VAL"),
+        Some(EpicsValue::String(String::new().into())),
+        "unset env var clears VAL to empty (C val[0]=0)"
     );
 }

@@ -17,7 +17,7 @@
 //! The INP payload is the env-var name, with an optional leading `@`
 //! (carried over from C macro syntax) silently stripped. Empty payload
 //! is treated as "unknown env var" and produces an empty VAL with a
-//! READ_ALARM. Supported record types: `stringin`, `lsi`. Anything
+//! UDF_ALARM. Supported record types: `stringin`, `lsi`. Anything
 //! else returns an [`UnsupportedRecord`](epics-base style) error and
 //! flags the record alarm.
 //!
@@ -31,7 +31,8 @@
 
 use crate::error::{CaError, CaResult};
 use crate::server::device_support::{DeviceReadOutcome, DeviceSupport};
-use crate::server::record::Record;
+use crate::server::recgbl::alarm_status;
+use crate::server::record::{AlarmSeverity, ProcessContext, Record};
 use crate::types::EpicsValue;
 
 /// Reads the environment variable named by the INST_IO `INP` on every record
@@ -40,6 +41,15 @@ pub struct GetenvDeviceSupport {
     /// Env-var name resolved from `INP` (post-`@`, trimmed); empty when the
     /// INP payload was empty (treated as "unknown env var").
     var: String,
+    /// `prec->udfs` — the severity C raises an unset env var at
+    /// (`recGblSetSevrMsg(prec, UDF_ALARM, prec->udfs, …)`). Captured from the
+    /// process context before each read so a user-set UDFS is honored; defaults
+    /// to INVALID (the dbCommon UDFS default) until the first context push.
+    udfs: AlarmSeverity,
+    /// Alarm surfaced via [`last_alarm`](DeviceSupport::last_alarm) this cycle:
+    /// `Some((UDF_ALARM, udfs))` while the env var is unset, `None` once it
+    /// resolves. The framework applies it via `rec_gbl_set_sevr`.
+    unset_alarm: Option<(u16, u16)>,
 }
 
 impl GetenvDeviceSupport {
@@ -48,12 +58,14 @@ impl GetenvDeviceSupport {
     pub fn new(inp: &str) -> Self {
         Self {
             var: Self::resolve_var_name(inp).to_string(),
+            udfs: AlarmSeverity::Invalid,
+            unset_alarm: None,
         }
     }
 
     /// Strip the optional leading `@` (libCom INP convention) and any
     /// surrounding whitespace. Empty result means "no env var
-    /// specified" which the caller flags as READ_ALARM.
+    /// specified" which the caller flags as UDF_ALARM.
     fn resolve_var_name(inp: &str) -> &str {
         let trimmed = inp.trim();
         trimmed.strip_prefix('@').unwrap_or(trimmed).trim()
@@ -90,45 +102,52 @@ impl DeviceSupport for GetenvDeviceSupport {
         };
         match val {
             Some(s) => {
+                // C set path (read_lsi devEnviron.c:56-61 / read_stringin
+                // :109-112): copy value into VAL, udf=FALSE. Clear our pending
+                // unset alarm so `last_alarm()` stops raising it once the var
+                // reappears.
+                self.unset_alarm = None;
                 record.put_field("VAL", EpicsValue::String(s.into()))?;
                 Ok(DeviceReadOutcome::ok())
             }
             None => {
-                // Unset env var. C clears VAL and raises UDF, returning SUCCESS:
-                //   read_lsi      (devEnviron.c:62-67):  val[0]=0; len=1;
-                //     udf=TRUE; recGblSetSevrMsg(prec, UDF_ALARM, prec->udfs,
-                //     "No such ENV");  return 0;
-                //   read_stringin (devEnviron.c:114-118): same, without len.
+                // C unset path (read_lsi devEnviron.c:62-67 / read_stringin
+                // :114-118): `val[0]=0; udf=TRUE; recGblSetSevrMsg(prec,
+                // UDF_ALARM, prec->udfs, "No such ENV"); return 0` (read_lsi also
+                // sets len=1). Clear the stale value (a var set then later unset
+                // must not keep showing the old value) and surface UDF_ALARM at
+                // `udfs` through `last_alarm()` — the device→framework alarm
+                // channel the processing loop applies via `rec_gbl_set_sevr`
+                // (the same recGblSetSevr merge C uses, processing.rs) — instead
+                // of returning Err, which would raise READ_ALARM (wrong STAT) and
+                // log to stderr every cycle (C is silent). This matches C's STAT
+                // (UDF_ALARM) and severity (`prec->udfs`, captured in
+                // set_process_context).
                 //
-                // base-rs cannot reproduce that exactly, and the gap is the same
-                // `value_is_undefined`-derived udf model already disclosed for
-                // Db State (dbstate.rs): a device sees only the inner record (no
-                // `dbCommon`, and no alarm/udf-setting `ProcessAction`), so it
-                // cannot force `udf=TRUE` on a *defined* value. The framework
-                // recomputes `udf = value_is_undefined()` after process, and for
-                // a string ANY value — including the empty string C writes — is
-                // defined (record_trait.rs `value_is_undefined`: `Some(_) =>
-                // false`), so clearing VAL to "" would clear udf and raise NO
-                // alarm at all. To still flag the record we clear the stale value
-                // (a var that was set then later unset must not keep showing the
-                // old value) and return a soft Err, which the framework turns
-                // into READ_ALARM at INVALID (processing.rs). Accepted DIVERGENCE
-                // vs C (disclosed, not faked):
-                //   - alarm STAT:  READ_ALARM vs C UDF_ALARM (wire-observable);
-                //   - severity:    INVALID vs C `prec->udfs` (coincide on the
-                //     default UDFS=INVALID; diverge only if the user lowers it);
-                //   - udf flag:    stays FALSE (defined empty VAL) vs C udf=TRUE;
-                //   - AMSG "No such ENV" + lsi LEN=1: not modeled.
-                // Closing this fully needs a framework device-settable udf/alarm
-                // path (the same root as the Db State divergence), out of scope
-                // for getenv alone.
+                // Residual divergences vs C (narrow, deferred — not the alarm):
+                //   - the `udf` field itself reads 0, not C's TRUE: base-rs
+                //     derives `udf` from `value_is_undefined()`, and a string —
+                //     including the empty string written here — is defined
+                //     (record_trait.rs `Some(_) => false`); the *alarm* is raised
+                //     directly, but the raw UDF field has no device→udf channel.
+                //   - AMSG "No such ENV" is not carried (`last_alarm()` is
+                //     (status, severity) only), and lsi LEN=1 is not modeled.
+                self.unset_alarm = Some((alarm_status::UDF_ALARM, self.udfs as u16));
                 record.put_field("VAL", EpicsValue::String(String::new().into()))?;
-                Err(CaError::InvalidValue(format!(
-                    "getenv: variable '{}' is unset",
-                    self.var
-                )))
+                Ok(DeviceReadOutcome::ok())
             }
         }
+    }
+
+    fn set_process_context(&mut self, ctx: &ProcessContext) {
+        // Capture `prec->udfs` so the unset-var alarm is raised at the record's
+        // configured UDF severity (C `recGblSetSevrMsg(..., prec->udfs, ...)`),
+        // honoring a user-lowered UDFS rather than hardcoding INVALID.
+        self.udfs = ctx.udfs;
+    }
+
+    fn last_alarm(&self) -> Option<(u16, u16)> {
+        self.unset_alarm
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {

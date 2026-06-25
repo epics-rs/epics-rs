@@ -60,8 +60,6 @@ pub struct StdioDeviceSupport {
     /// Resolved output stream; `None` when `OUT` named no known stream
     /// (C `dpvt == NULL` → `write_xxx` is a no-op).
     stream: Option<StdioStream>,
-    /// The post-`@` instio name, kept for the unresolved-stream diagnostic.
-    name: String,
 }
 
 impl StdioDeviceSupport {
@@ -70,9 +68,10 @@ impl StdioDeviceSupport {
     /// A leading `@` (the INST_IO link marker the field carries) is stripped,
     /// matching C reading `out.value.instio.string` (the post-`@` content).
     pub fn new(out: &str) -> Self {
-        let name = out.strip_prefix('@').unwrap_or(out).trim().to_string();
-        let stream = StdioStream::from_name(&name);
-        Self { stream, name }
+        let name = out.strip_prefix('@').unwrap_or(out).trim();
+        Self {
+            stream: StdioStream::from_name(name),
+        }
     }
 }
 
@@ -93,16 +92,10 @@ impl DeviceSupport for StdioDeviceSupport {
                 "DTYP='stdio': unsupported record type '{rt}' (use lso, printf, or stringout)"
             )));
         }
-        // C `add_xxx` returns -1 (a logged init failure) with `dpvt = NULL`
-        // when OUT names no known stream, but sets no record alarm — the
-        // record simply writes nothing. Mirror the logged diagnostic without
-        // alarming the record.
-        if self.stream.is_none() {
-            errlog_printf(&format!(
-                "DTYP='stdio': OUT '{}' names no known stream (use stdout, stderr, or errlog); writes ignored",
-                self.name
-            ));
-        }
+        // An OUT naming no known stream leaves `stream = None`. C `add_xxx`
+        // returns -1 in that case, but iocInit's `doResolveLinks` discards the
+        // return value (no `recGblRecordError`, no alarm) — so C is silent and
+        // the record simply writes nothing. Match that: no diagnostic, no alarm.
         Ok(())
     }
 

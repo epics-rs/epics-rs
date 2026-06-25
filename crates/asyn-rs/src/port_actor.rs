@@ -391,18 +391,28 @@ impl PortActor {
                 buf.truncate(n);
                 Ok(RequestResult::octet_read_eom(buf, n, eom.bits()))
             }
-            RequestOp::OctetWriteRead { data, buf_size } => {
-                // C parity: asynOctetSyncIO::writeRead (asynOctetSyncIO.c:250)
-                // does flush() → write() → read() under a single
-                // queueLockPort. The flush drains any stale bytes
-                // left in the driver's input buffer from a prior
-                // read so that the post-write read returns only the
-                // response to *this* command (e.g. echoes from a
-                // serial line, leftover prompts from a TCP device).
-                // Skipping the flush leaks pre-existing input into
-                // the response and breaks every command-response
-                // protocol when the line was warm.
-                self.driver.io_flush(user)?;
+            RequestOp::OctetWriteRead {
+                data,
+                buf_size,
+                flush,
+            } => {
+                // Two C patterns share this op, distinguished by `flush`:
+                //   flush=true  — asynOctetSyncIO::writeRead (asynOctetSyncIO.c:250)
+                //     does flush() → write() → read() under a single
+                //     queueLockPort. The flush drains stale bytes left in the
+                //     driver's input buffer so the post-write read returns only
+                //     the response to *this* command (the StreamDevice /
+                //     asynRecord writeRead pattern).
+                //   flush=false — devAsynOctet command-response
+                //     (callbackSiCmdResponse, devAsynOctet.c:853-855) does plain
+                //     writeIt → readIt on the raw asynOctet interface with NO
+                //     flush, so the read returns whatever the device sends,
+                //     including bytes already on the warm line.
+                // Both run atomically here: the actor owns the port for the whole
+                // op, the queueLockPort equivalent.
+                if *flush {
+                    self.driver.io_flush(user)?;
+                }
                 self.driver.io_write_octet(user, data)?;
                 let mut buf = vec![0u8; *buf_size];
                 let (n, eom) = self.driver.io_read_octet_eom(user, &mut buf)?;
@@ -1141,6 +1151,7 @@ mod tests {
             RequestOp::OctetWriteRead {
                 data: b"CMD".to_vec(),
                 buf_size: 16,
+                flush: true,
             },
             user,
         )

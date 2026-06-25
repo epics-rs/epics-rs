@@ -932,11 +932,15 @@ impl AsynDeviceSupport {
             "asynFloat64" => Some(RequestOp::Float64Read),
             // asynOctet: a plain read, OR a write-then-read when a literal
             // command is cached (asynOctetCmdResponse, C `callbackSiCmdResponse`
-            // devAsynOctet.c — write the command, then read the reply into VAL).
+            // devAsynOctet.c:853-855 — write the command, then read the reply
+            // into VAL). flush=false: C does plain writeIt → readIt on the raw
+            // asynOctet interface with NO pre-flush, so the reply includes any
+            // bytes already on the warm line (unlike asynOctetSyncIO::writeRead).
             "asynOctet" => Some(match &self.octet_cmd {
                 Some(cmd) => RequestOp::OctetWriteRead {
                     data: cmd.clone(),
                     buf_size: self.octet_max_size,
+                    flush: false,
                 },
                 None => RequestOp::OctetRead {
                     buf_size: self.octet_max_size,
@@ -3663,9 +3667,16 @@ mod tests {
         // Command cached → write-then-read carrying the command bytes.
         ads.octet_cmd = Some(b"*IDN?\r\n".to_vec());
         match ads.read_op() {
-            Some(RequestOp::OctetWriteRead { data, buf_size }) => {
+            Some(RequestOp::OctetWriteRead {
+                data,
+                buf_size,
+                flush,
+            }) => {
                 assert_eq!(data, b"*IDN?\r\n".to_vec());
                 assert_eq!(buf_size, 128);
+                // C devAsynOctet command-response does NOT flush before the write
+                // (raw writeIt → readIt), unlike asynOctetSyncIO::writeRead.
+                assert!(!flush, "CmdResponse must not pre-flush the input buffer");
             }
             other => panic!("expected OctetWriteRead, got {other:?}"),
         }
@@ -3713,6 +3724,12 @@ mod tests {
         let w = seq.iter().position(|&s| s == "write").unwrap();
         let r = seq.iter().position(|&s| s == "read").unwrap();
         assert!(w < r, "command write must precede the reply read: {seq:?}");
+        // C devAsynOctet command-response does plain writeIt → readIt with NO
+        // flush — the warm-line bytes are part of the reply, not discarded.
+        assert!(
+            !seq.contains(&"flush"),
+            "CmdResponse must not pre-flush the input buffer: {seq:?}"
+        );
 
         // The reply landed in VAL.
         assert_eq!(

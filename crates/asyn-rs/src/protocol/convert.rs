@@ -25,9 +25,14 @@ impl From<&RequestOp> for PortCommand {
                 buf_size: *buf_size,
             },
             RequestOp::OctetWrite { data } => Self::OctetWrite { data: data.clone() },
-            RequestOp::OctetWriteRead { data, buf_size } => Self::OctetWriteRead {
+            RequestOp::OctetWriteRead {
+                data,
+                buf_size,
+                flush,
+            } => Self::OctetWriteRead {
                 data: data.clone(),
                 buf_size: *buf_size,
+                flush: *flush,
             },
             RequestOp::OctetWriteBinary { data } => Self::OctetWriteBinary { data: data.clone() },
             RequestOp::OctetReadBinary { buf_size } => Self::OctetReadBinary {
@@ -115,9 +120,14 @@ impl From<&PortCommand> for RequestOp {
                 buf_size: *buf_size,
             },
             PortCommand::OctetWrite { data } => Self::OctetWrite { data: data.clone() },
-            PortCommand::OctetWriteRead { data, buf_size } => Self::OctetWriteRead {
+            PortCommand::OctetWriteRead {
+                data,
+                buf_size,
+                flush,
+            } => Self::OctetWriteRead {
                 data: data.clone(),
                 buf_size: *buf_size,
+                flush: *flush,
             },
             PortCommand::OctetWriteBinary { data } => Self::OctetWriteBinary { data: data.clone() },
             PortCommand::OctetReadBinary { buf_size } => Self::OctetReadBinary {
@@ -309,6 +319,7 @@ mod tests {
             RequestOp::OctetWriteRead {
                 data: vec![4, 5],
                 buf_size: 128,
+                flush: true,
             },
             RequestOp::UInt32DigitalRead { mask: 0xFF },
             RequestOp::UInt32DigitalWrite {

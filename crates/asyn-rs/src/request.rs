@@ -59,6 +59,13 @@ pub enum RequestOp {
     OctetWriteRead {
         data: Vec<u8>,
         buf_size: usize,
+        /// Whether to drain the driver's input buffer before the write.
+        /// `true` = `asynOctetSyncIO::writeRead` (flush → write → read), the
+        /// StreamDevice/asynRecord pattern that discards stale warm-line bytes.
+        /// `false` = `devAsynOctet` raw write-then-read (no flush) — the
+        /// command-response dset (`callbackSiCmdResponse`) returns whatever the
+        /// device sends, including bytes already in the buffer.
+        flush: bool,
     },
     /// Binary octet write: writes `data` raw with the driver's output EOS
     /// temporarily suppressed. C parity: asynRecord binary output

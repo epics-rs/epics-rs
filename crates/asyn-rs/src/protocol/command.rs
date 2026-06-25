@@ -24,6 +24,10 @@ pub enum PortCommand {
     OctetWriteRead {
         data: Vec<u8>,
         buf_size: usize,
+        /// Flush the input buffer before the write (asynOctetSyncIO::writeRead)
+        /// vs raw write-then-read (devAsynOctet command-response). See
+        /// [`crate::request::RequestOp::OctetWriteRead`].
+        flush: bool,
     },
     /// Binary octet write with the driver's output EOS suppressed
     /// (asynRecord binary output, asynRecord.c:1528-1541).
@@ -158,6 +162,7 @@ mod tests {
             PortCommand::OctetWriteRead {
                 data: vec![4, 5],
                 buf_size: 128,
+                flush: true,
             },
             PortCommand::UInt32DigitalRead { mask: 0xFF },
             PortCommand::UInt32DigitalWrite {

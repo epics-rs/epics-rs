@@ -55,6 +55,15 @@ pub struct AoRecord {
     /// raises `SOFT_ALARM/MAJOR_ALARM` on a BPT failure; `check_alarms`
     /// consumes this flag to do the same.
     bpt_error: bool,
+    /// Set by [`Record::set_device_did_compute`] when asyn device support has
+    /// already produced the final `VAL`/`RVAL` from a raw device readback (the
+    /// `raw → eng` inverse convert, [`AoRecord::convert_readback`]). When set,
+    /// `process()` skips its forward `VAL → RVAL` `convert()` so the readback is
+    /// not overwritten — the output analogue of `ai`'s `skip_convert`, and the
+    /// faithful mirror of C `processAo`'s readback branch, which sets `rval`/
+    /// `val` directly and returns without calling `convertAo` (devAsynInt32.c:
+    /// 970-994). One-shot: cleared at the end of `process()`.
+    skip_convert: bool,
     // Simulation
     pub simm: i16,
     pub siml: String,
@@ -99,6 +108,7 @@ impl Default for AoRecord {
             mlst: 0.0,
             init: false,
             bpt_error: false,
+            skip_convert: false,
             simm: 0,
             siml: String::new(),
             siol: String::new(),
@@ -190,6 +200,37 @@ impl AoRecord {
 
         self.oraw = self.rval;
         self.init = true;
+    }
+
+    /// C `processAo` readback `raw → eng` inverse convert (devAsynInt32.c:
+    /// 973-994), the exact inverse of [`AoRecord::convert`] in reverse field
+    /// order: un-ROFF, un-ASLO/AOFF, then the raw→engineering linearisation.
+    /// Used when asyn device support reads the device's current value back
+    /// into an output record (init seed + driver readback callback) — the
+    /// output analogue of `ai`'s `RVAL → VAL` `convert()`. Sets `VAL` from
+    /// `RVAL`; the caller has already stored the raw value into `RVAL`.
+    fn convert_readback(&mut self) {
+        // C: value = rval + roff; if(aslo!=0) value *= aslo; value += aoff;
+        let mut value = self.rval as f64 + self.roff as f64;
+        if self.aslo != 0.0 {
+            value *= self.aslo;
+        }
+        value += self.aoff;
+
+        // C: NO_CONVERSION → passthrough; LINEAR/SLOPE → value*eslo + eoff;
+        // a breakpoint table (LINR >= 3) is unresolvable here, same as
+        // convert() — flag it so check_alarms raises SOFT_ALARM/MAJOR.
+        self.bpt_error = false;
+        match self.linr {
+            0 => {}
+            1 | 2 => {
+                value = value * self.eslo + self.eoff;
+            }
+            _ => {
+                self.bpt_error = true;
+            }
+        }
+        self.val = value;
     }
 }
 
@@ -454,8 +495,35 @@ impl Record for AoRecord {
         //   (`recGblInitConstantLink` parity) and is NOT re-sourced here;
         //   C `aoRecord.c:442` gates fetch_value on `!dbLinkIsConstant`,
         //   so a client caput to VAL is never clobbered by the constant.
-        self.convert();
+        //
+        // skip_convert: asyn device support has already produced VAL/RVAL from
+        // a raw device readback via convert_readback(); running the forward
+        // convert() would recompute RVAL from VAL (and apply OROC/drive limits
+        // C's readback path does not). C `processAo` returns from its readback
+        // branch without calling convertAo (devAsynInt32.c:970-994) — mirror
+        // that by skipping the forward convert this cycle.
+        if !self.skip_convert {
+            self.convert();
+        }
+        self.skip_convert = false;
         Ok(ProcessOutcome::complete())
+    }
+
+    fn set_device_did_compute(&mut self, did_compute: bool) {
+        self.skip_convert = did_compute;
+    }
+
+    /// Apply a raw device readback to this output record: store the raw value
+    /// into `RVAL` and compute the engineering `VAL` via the `raw → eng`
+    /// inverse convert ([`AoRecord::convert_readback`]). Returns `true` so the
+    /// asyn store path treats `VAL` as final and skips the framework's forward
+    /// convert (paired with `skip_convert` for the process-time readback). C
+    /// `processAo`/`initAo` readback: `pr->rval = value; <raw→eng>; pr->val =
+    /// value` (devAsynInt32.c:973-994, :955-957).
+    fn apply_raw_readback(&mut self, raw: i32) -> bool {
+        self.rval = raw;
+        self.convert_readback();
+        true
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {

@@ -84,6 +84,93 @@ fn test_ao_record() {
     }
 }
 
+// asyn output readback (devAsynInt32.c processAo/initAo): an asynInt32 output
+// record reads the device's current value back through the `raw → eng` INVERSE
+// of convert(). AoRecord::apply_raw_readback stores the raw to RVAL and
+// computes VAL; the skip_convert gate stops process()'s forward convert from
+// overwriting the readback.
+#[test]
+fn test_ao_readback_inverts_full_conversion_chain() {
+    // C processAo readback (devAsynInt32.c:973-994) is convert() inverted in
+    // reverse field order — un-ROFF, un-ASLO/AOFF, then ESLO/EOFF.
+    // raw=10: (10+1)*2 + 3 = 25; LINEAR: 25*5 + 7 = 132.
+    let mut rec = AoRecord::new(0.0);
+    rec.roff = 1;
+    rec.aslo = 2.0;
+    rec.aoff = 3.0;
+    rec.linr = 2; // LINEAR
+    rec.eslo = 5.0;
+    rec.eoff = 7.0;
+    assert!(
+        rec.apply_raw_readback(10),
+        "ao owns the raw->eng readback convert"
+    );
+    assert_eq!(rec.rval, 10, "raw value stored to RVAL");
+    match rec.get_field("VAL") {
+        Some(EpicsValue::Double(v)) => assert!((v - 132.0).abs() < 1e-9, "got {v}"),
+        other => panic!("expected Double(132.0), got {other:?}"),
+    }
+}
+
+#[test]
+fn test_ao_readback_no_conversion_passthrough() {
+    // LINR=NO_CONVERSION, default ASLO=1/AOFF=0/ROFF=0 → VAL == raw.
+    let mut rec = AoRecord::new(0.0);
+    rec.linr = 0;
+    assert!(rec.apply_raw_readback(42));
+    assert_eq!(rec.rval, 42);
+    match rec.get_field("VAL") {
+        Some(EpicsValue::Double(v)) => assert!((v - 42.0).abs() < 1e-9, "got {v}"),
+        other => panic!("expected Double(42.0), got {other:?}"),
+    }
+}
+
+#[test]
+fn test_ao_readback_skip_convert_bypasses_forward_convert() {
+    // C `processAo` returns from its readback branch WITHOUT calling convertAo
+    // (devAsynInt32.c:970-994): the readback applies neither drive limits nor
+    // OROC. The skip_convert gate (set via set_device_did_compute) mirrors that
+    // — process() must not run the forward convert that would clamp VAL.
+    let mut rec = AoRecord::new(0.0);
+    rec.linr = 2; // LINEAR
+    rec.eslo = 1.0;
+    rec.eoff = 0.0;
+    rec.drvl = 0.0;
+    rec.drvh = 100.0; // a forward convert would clamp VAL to this
+    assert!(rec.apply_raw_readback(150)); // eng VAL = 150 (eslo=1, eoff=0)
+    assert_eq!(rec.rval, 150);
+    assert!((rec.val - 150.0).abs() < 1e-9);
+
+    // did_compute → skip the forward convert this cycle.
+    rec.set_device_did_compute(true);
+    let _ = rec.process().unwrap();
+    assert!(
+        (rec.val - 150.0).abs() < 1e-9,
+        "readback VAL must not be drive-clamped by a skipped forward convert"
+    );
+    assert_eq!(rec.rval, 150, "readback RVAL preserved");
+
+    // One-shot: the next normal process runs the forward convert, which DOES
+    // drive-clamp VAL (150 → 100) — proving the gate was what bypassed it.
+    let _ = rec.process().unwrap();
+    assert!(
+        (rec.val - 100.0).abs() < 1e-9,
+        "forward convert now clamps VAL to DRVH"
+    );
+}
+
+// The default apply_raw_readback returns false: an input record (ai) whose own
+// convert() is already raw->eng must NOT claim to handle the readback, or the
+// asyn store would skip the framework's RVAL->VAL convert that ai relies on.
+#[test]
+fn test_ai_does_not_claim_raw_readback() {
+    let mut rec = AiRecord::new(0.0);
+    assert!(
+        !rec.apply_raw_readback(5),
+        "ai keeps the legacy raw->RVAL + framework-convert path"
+    );
+}
+
 #[test]
 fn test_bi_record() {
     let mut rec = BiRecord::new(0);

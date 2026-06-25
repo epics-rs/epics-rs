@@ -480,6 +480,25 @@ pub trait Record: Send + Sync + 'static {
         self.set_val(value)
     }
 
+    /// Apply a raw device value read *back* from an output record's device
+    /// support (the asyn init seed and driver readback callback), the output
+    /// analogue of [`Record::apply_raw_input`]. An output record whose
+    /// `convert()` is forward (engineering → raw) must invert it here — store
+    /// the raw value into `RVAL` and compute the engineering `VAL` — because
+    /// the framework's forward convert would otherwise recompute `RVAL` from
+    /// the stale `VAL` and discard the readback (C `processAo`/`initAo` set
+    /// `rval`/`val` directly, devAsynInt32.c:955-957/:973-994).
+    ///
+    /// Returns `true` when the record fully produced `VAL` from the raw value
+    /// (the asyn store path then reports `computed` so the forward convert is
+    /// skipped). The default returns `false`: records whose own `convert()` is
+    /// already `raw → eng` (`ai`) or that need no conversion (`longout`,
+    /// `mbbo`, whose `set_val` re-derives from the raw value) keep the legacy
+    /// raw → `RVAL` / direct-`VAL` path.
+    fn apply_raw_readback(&mut self, _raw: i32) -> bool {
+        false
+    }
+
     /// Apply IVOA=2 ("set outputs to IVOV") semantics: copy the
     /// IVOV value into whatever output staging field the OUT
     /// writeback consumes for this record type. Mirrors the

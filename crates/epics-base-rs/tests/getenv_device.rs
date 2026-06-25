@@ -1,0 +1,102 @@
+//! End-to-end wiring for the `getenv` built-in device support (base
+//! `getenvDevSup` / `devLsiEnviron` / `devSiEnviron`): a `stringin`/`lsi`
+//! record with `DTYP="getenv"` must route through the dynamic builtin factory
+//! (`builtin_dynamic_factory`), get the device wired with its INST_IO `INP`,
+//! and have its `VAL` written from the named environment variable — the
+//! factory→`wire_device_to_record`→`read` path.
+//!
+//! This test caught a real latent bug: getenv was originally registered as a
+//! context-free *static* factory and read the env-var name from
+//! `record.get_field("INP")` — but the inner typed record handed to the device
+//! does NOT expose `INP` (it lives on the `RecordInstance` common header), so
+//! `INP` resolved to empty and every getenv record came up INVALID through
+//! `IocBuilder`. The fix moves getenv to the dynamic factory so it receives the
+//! `INP` from `DeviceSupportContext`, like its INP/OUT-needing siblings (stdio /
+//! Db State / Soft Timestamp). getenv was the only one of the four base builtins
+//! whose siblings all had an IOC-build e2e test while it had only direct-call
+//! unit tests that bypass `IocBuilder`; this closes that asymmetry.
+//!
+//! `std::env::set_var` is race-free here: nextest runs each `#[test]` in its own
+//! process, so the variable set below is private to this test's process.
+
+use std::collections::{HashMap, HashSet};
+
+use epics_base_rs::server::ioc_builder::IocBuilder;
+use epics_base_rs::server::record::AlarmSeverity;
+use epics_base_rs::types::EpicsValue;
+
+/// A processed `stringin` with `DTYP="getenv"` and `INP="@VAR"` reads the
+/// environment variable into `VAL` — proving the static builtin factory wired
+/// the device and its read ran end-to-end (the pre-wiring default `VAL` is an
+/// empty string, so a non-empty match proves the device ran).
+#[tokio::test]
+async fn getenv_stringin_reads_env_var_through_iocbuilder() {
+    // SAFETY: nextest isolates each test in its own process (see module doc),
+    // so this set_var cannot race another test.
+    unsafe {
+        std::env::set_var("GETENV_E2E_TEST_VAR", "hello-from-env");
+    }
+
+    let (db, _) = IocBuilder::new()
+        .db_string(
+            r#"
+record(stringin, "GETENV_SI") {
+    field(DTYP, "getenv")
+    field(INP, "@GETENV_E2E_TEST_VAR")
+}
+"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("GETENV_SI", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let rec = db.get_record("GETENV_SI").await.expect("record exists");
+    let inst = rec.read().await;
+    assert_ne!(
+        inst.common.sevr,
+        AlarmSeverity::Invalid,
+        "stringin/getenv with a set env var must not be INVALID"
+    );
+    assert_eq!(
+        inst.record.get_field("VAL"),
+        Some(EpicsValue::String("hello-from-env".into())),
+        "VAL must be the environment variable value read by the wired device"
+    );
+}
+
+/// C registers a getenv dset only for `stringin`/`lsi`; the device's
+/// record-type gate Errs in `init()`, so `wire_device_to_record` flags an
+/// `ai` with `DTYP="getenv"` INVALID at build time — proving the device
+/// attached and gated rather than being silently accepted.
+#[tokio::test]
+async fn getenv_wrong_record_type_is_invalid() {
+    let (db, _) = IocBuilder::new()
+        .db_string(
+            r#"
+record(ai, "GETENV_AI") {
+    field(DTYP, "getenv")
+    field(INP, "@PATH")
+}
+"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let ai = db.get_record("GETENV_AI").await.expect("ai exists");
+    let inst = ai.read().await;
+    assert_eq!(
+        inst.common.sevr,
+        AlarmSeverity::Invalid,
+        "ai with DTYP=getenv must be INVALID (no getenv device support for ai)"
+    );
+}

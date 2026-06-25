@@ -383,23 +383,22 @@ pub struct IocApplication {
 
 impl IocApplication {
     pub fn new() -> Self {
-        let mut device_factories: HashMap<String, DeviceSupportFactory> = HashMap::new();
-        // epics-base 3.15.4: the statically auto-registered built-in device
-        // support (currently `getenv` for stringin/lsi), from the shared
-        // `static_builtin_device_supports` list — the single source of truth the
-        // `base_device_parity` guard also probes.
-        for (dtyp, factory) in crate::server::builtin_devices::static_builtin_device_supports() {
-            device_factories.insert(dtyp.to_string(), factory);
-        }
+        // No context-free built-in device support: every base builtin
+        // (`Soft Timestamp`, `stdio`, `Db State`, `getenv`) needs the record's
+        // INST_IO `INP`/`OUT`, which only the dynamic factory's
+        // `DeviceSupportContext` carries — so all base builtins are dispatched
+        // below, and this static map starts empty (users register their own
+        // context-free device support into it via `register_device_support`).
+        let device_factories: HashMap<String, DeviceSupportFactory> = HashMap::new();
         Self {
             // SERVER-side port: caservertask.c:491-498 honours
             // EPICS_CAS_SERVER_PORT > EPICS_CA_SERVER_PORT > 5064.
             port: cas_server_port(),
             tcp_port: None,
             device_factories,
-            // Built-in device support that needs the runtime context (INP):
-            // `Soft Timestamp` (base `devTimestamp.c`). Pre-registered as
-            // the base of the dynamic-factory chain so a user's
+            // The base built-in device support — all needing the runtime
+            // context (INP/OUT). Pre-registered as the base of the
+            // dynamic-factory chain so a user's
             // `register_dynamic_device_support` factory takes priority and
             // falls through to here.
             dynamic_device_factory: Some(Box::new(

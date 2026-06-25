@@ -21,41 +21,22 @@ pub use getenv::GetenvDeviceSupport;
 pub use stdio::StdioDeviceSupport;
 pub use timestamp::SoftTimestampDeviceSupport;
 
-use crate::server::DeviceSupportFactory;
 use crate::server::device_support::DeviceSupport;
 use crate::server::ioc_app::DeviceSupportContext;
-
-/// The statically auto-registered built-in device support — those needing no
-/// runtime context (no INP/OUT), so a plain `Fn() -> Box<dyn DeviceSupport>`
-/// factory suffices and they are registered eagerly by `IocBuilder::new` and
-/// `IocApplication::new` (a `.db` file can name the DTYP with zero setup).
-/// Currently just `getenv` (base `devSiEnviron` / `devLsiEnviron`, stringin /
-/// lsi).
-///
-/// This is the SINGLE source of truth for the static builtins: both
-/// registration sites iterate it, and the `base_device_parity` guard probes it
-/// for coverage — so removing an entry both unregisters the device AND fails
-/// the guard (the devSoft.dbd row it served becomes unaccounted for), keeping
-/// the two in lockstep instead of a hand-maintained list drifting from the
-/// registration.
-pub fn static_builtin_device_supports() -> Vec<(&'static str, DeviceSupportFactory)> {
-    vec![(
-        "getenv",
-        Box::new(|| -> Box<dyn DeviceSupport> { Box::new(getenv::GetenvDeviceSupport::new()) })
-            as DeviceSupportFactory,
-    )]
-}
 
 /// Built-in device support that must be dispatched by the runtime
 /// [`DeviceSupportContext`] because it needs the record's `INP`/`OUT`.
 ///
 /// `Soft Timestamp` (base `devTimestamp.c`) needs its INST_IO `INP` strftime
 /// format string, `stdio` (base `devStdio.c`) needs its INST_IO `OUT` stream
-/// name, and `Db State` (base `devBiDbState.c` / `devBoDbState.c`) needs its
-/// INST_IO `INP` (bi) / `OUT` (bo) state name — none of which the static
-/// `register_device_support` factory (a `Fn() -> Box<dyn DeviceSupport>`) can
-/// see; only the context carries them. Both
-/// [`IocBuilder::new`](crate::server::IocBuilder) and
+/// name, `Db State` (base `devBiDbState.c` / `devBoDbState.c`) needs its
+/// INST_IO `INP` (bi) / `OUT` (bo) state name, and `getenv` (base
+/// `devSiEnviron.c` / `devLsiEnviron.c`) needs its INST_IO `INP` env-var name —
+/// none of which a context-free static `Fn() -> Box<dyn DeviceSupport>` factory
+/// can see. The inner typed record handed to `init`/`read` does NOT expose
+/// `INP`/`OUT` either (those live on the `RecordInstance` common header, not the
+/// record body), so every base builtin is dispatched here and receives the link
+/// at construction. Both [`IocBuilder::new`](crate::server::IocBuilder) and
 /// [`IocApplication::new`](crate::server::IocApplication) pre-register this as
 /// the *base* of the dynamic-factory chain, so a user's
 /// `register_dynamic_device_support` factory takes priority and falls through
@@ -69,6 +50,7 @@ pub fn builtin_dynamic_factory(ctx: &DeviceSupportContext) -> Option<Box<dyn Dev
         "Db State" => Some(Box::new(dbstate::DbStateDeviceSupport::new(
             ctx.inp, ctx.out,
         ))),
+        "getenv" => Some(Box::new(getenv::GetenvDeviceSupport::new(ctx.inp))),
         _ => None,
     }
 }

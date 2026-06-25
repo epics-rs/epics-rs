@@ -5,7 +5,7 @@
 //! the single source of truth for both.
 //!
 //! Background — base-rs maps a record's DTYP to its device support through
-//! THREE mechanisms, and nothing keeps them in sync with the C
+//! TWO mechanisms, and nothing keeps them in sync with the C
 //! `device(recordType, linkType, dset, "DTYP")` rows. Two distinct failure
 //! families result, each closed by one test here:
 //!   - `base_devsoft_device_rows_are_all_accounted_for` (REGISTRATION): a new
@@ -20,24 +20,23 @@
 //!     by asserting `can_device_write()` matches the C dset's read/write
 //!     direction for every served, device-attaching row.
 //!
-//! base's coverage is split across three mechanisms, not one registry (unlike
+//! base's coverage is split across two mechanisms, not one registry (unlike
 //! the std module's `std_device_supports()` guard), so the "served" set is the
-//! union of all three — each computed by calling the real function/list base-rs
-//! itself uses, never a guard-local hardcoded copy, so the guard self-updates
-//! as builtins are added and goes RED if one is dropped:
+//! union of both — each computed by calling the real function base-rs itself
+//! uses, never a guard-local hardcoded copy, so the guard self-updates as
+//! builtins are added and goes RED if one is dropped:
 //!   1. `is_soft_dtyp(dtyp)` — the soft-channel short-circuit (Soft Channel /
 //!      Raw Soft Channel / Async Soft Channel never attach a device).
-//!   2. `builtin_dynamic_factory(ctx)` — the dynamic builtins that need the
-//!      record's INP/OUT (Soft Timestamp, stdio, Db State).
-//!   3. `static_builtin_device_supports()` — the static auto-registered
-//!      builtins (`getenv`), the SAME list `IocBuilder::new` /
-//!      `IocApplication::new` register from, which neither (1) nor (2) reports.
-//!      Probing the registration list (not a const copy) means dropping `getenv`
-//!      both unregisters it and fails this guard, in lockstep.
+//!   2. `builtin_dynamic_factory(ctx)` — the dynamic builtins, every one of
+//!      which needs the record's INST_IO `INP`/`OUT` (Soft Timestamp, stdio, Db
+//!      State, getenv). The inner typed record handed to a device's `init` /
+//!      `read` does NOT expose `INP`/`OUT` (those live on the `RecordInstance`
+//!      common header), so there is no context-free static builtin: every base
+//!      builtin is dispatched through this factory.
 //!
 //! Residual: there is no phantom-DYNAMIC check — a `builtin_dynamic_factory`
 //! arm for a DTYP with no devSoft.dbd row passes silently, because the match
-//! arms are not enumerable. The static and allowlist sides ARE phantom-checked.
+//! arms are not enumerable. The allowlist side IS phantom-checked.
 //!
 //! Pair-keyed allowlist, by design and for consistency with the std guard:
 //! EPICS selects device support by the (recordType, DTYP) PAIR. base's
@@ -55,9 +54,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use epics_base_rs::server::builtin_devices::{
-    builtin_dynamic_factory, static_builtin_device_supports,
-};
+use epics_base_rs::server::builtin_devices::builtin_dynamic_factory;
 use epics_base_rs::server::db_loader::create_record;
 use epics_base_rs::server::device_support::is_soft_dtyp;
 use epics_base_rs::server::ioc_app::DeviceSupportContext;
@@ -143,10 +140,9 @@ fn parse_device_rows(dbd: &str) -> Vec<(String, String)> {
     rows
 }
 
-/// Is `dtyp` served by one of base-rs's three device-support mechanisms?
-/// `static_dtyps` is the live set from `static_builtin_device_supports()`.
-fn served_by_base(dtyp: &str, static_dtyps: &BTreeSet<&str>) -> bool {
-    if is_soft_dtyp(dtyp) || static_dtyps.contains(dtyp) {
+/// Is `dtyp` served by one of base-rs's two device-support mechanisms?
+fn served_by_base(dtyp: &str) -> bool {
+    if is_soft_dtyp(dtyp) {
         return true;
     }
     // The dynamic builtins need INP/OUT; probing with empty strings only
@@ -178,11 +174,6 @@ fn base_devsoft_device_rows_are_all_accounted_for() {
         path.display()
     );
 
-    // Live static-builtin DTYP set — the SAME list both IOC constructors
-    // register from, so a dropped entry fails here in lockstep.
-    let static_supports = static_builtin_device_supports();
-    let static_dtyps: BTreeSet<&str> = static_supports.iter().map(|(d, _)| *d).collect();
-
     let mut failures: Vec<String> = Vec::new();
     let mut tracked: Vec<String> = Vec::new();
     // Allowlist entries actually matched by a row — to catch a stale allowlist
@@ -190,7 +181,7 @@ fn base_devsoft_device_rows_are_all_accounted_for() {
     let mut allowlist_hit: BTreeSet<(String, String)> = BTreeSet::new();
 
     for (record_type, dtyp) in &rows {
-        if served_by_base(dtyp, &static_dtyps) {
+        if served_by_base(dtyp) {
             continue;
         }
         if let Some((_, _, reason)) = ALLOWLIST
@@ -201,12 +192,12 @@ fn base_devsoft_device_rows_are_all_accounted_for() {
             tracked.push(format!("({record_type}, {dtyp:?}) — {reason}"));
         } else {
             failures.push(format!(
-                "({record_type}, {dtyp:?}) is served by none of base-rs's \
+                "({record_type}, {dtyp:?}) is served by neither of base-rs's \
                  device-support mechanisms (is_soft_dtyp / builtin_dynamic_\
-                 factory / static builtins) and is not on the (recordType, \
-                 DTYP) allowlist — a base device row with no Rust coverage (the \
-                 record's device never runs; VAL silently wrong). Add the \
-                 device support or allowlist it with a reason."
+                 factory) and is not on the (recordType, DTYP) allowlist — a \
+                 base device row with no Rust coverage (the record's device \
+                 never runs; VAL silently wrong). Add the device support or \
+                 allowlist it with a reason."
             ));
         }
     }
@@ -217,18 +208,6 @@ fn base_devsoft_device_rows_are_all_accounted_for() {
             failures.push(format!(
                 "allowlist entry ({rt}, {dtyp:?}) matches no devSoft.dbd row — \
                  stale entry; the gap was closed or the row was renamed/removed."
-            ));
-        }
-    }
-
-    // No stale static builtin: every static_builtin_device_supports() entry
-    // must back a real row (a renamed/removed getenv DTYP would otherwise pass).
-    let dtyps: BTreeSet<&str> = rows.iter().map(|(_, d)| d.as_str()).collect();
-    for b in &static_dtyps {
-        if !dtyps.contains(b) {
-            failures.push(format!(
-                "static builtin {b:?} backs no devSoft.dbd row — phantom \
-                 registration or a renamed DTYP."
             ));
         }
     }
@@ -293,9 +272,6 @@ fn base_devsoft_device_routing_matches_c_dset_direction() {
         path.display()
     );
 
-    let static_supports = static_builtin_device_supports();
-    let static_dtyps: BTreeSet<&str> = static_supports.iter().map(|(d, _)| *d).collect();
-
     let mut failures: Vec<String> = Vec::new();
     // Direction entries actually matched by a served row — to catch a stale
     // entry that no longer corresponds to any served device-attaching row.
@@ -319,7 +295,7 @@ fn base_devsoft_device_routing_matches_c_dset_direction() {
             .find(|(rt, dt, _)| *rt == record_type.as_str() && *dt == dtyp.as_str())
         else {
             assert!(
-                served_by_base(dtyp, &static_dtyps),
+                served_by_base(dtyp),
                 "({record_type}, {dtyp:?}) is neither soft, allowlisted, nor \
                  served — the registration guard should have caught this first"
             );

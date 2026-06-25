@@ -20,28 +20,35 @@
 //! READ_ALARM. Supported record types: `stringin`, `lsi`. Anything
 //! else returns an [`UnsupportedRecord`](epics-base style) error and
 //! flags the record alarm.
+//!
+//! The env-var name comes from the record's INST_IO `INP`, which only the
+//! runtime [`DeviceSupportContext`](crate::server::ioc_app::DeviceSupportContext)
+//! carries (the inner record handed to `init`/`read` does NOT expose `INP` —
+//! `INP` lives on the `RecordInstance` common header, not the typed record).
+//! So getenv is dispatched by the dynamic factory alongside the other
+//! INP/OUT-needing builtins (`Soft Timestamp`, `stdio`, `Db State`), receiving
+//! `ctx.inp` at construction — not registered as a context-free static factory.
 
 use crate::error::{CaError, CaResult};
 use crate::server::device_support::{DeviceReadOutcome, DeviceSupport};
 use crate::server::record::Record;
 use crate::types::EpicsValue;
 
-/// Reads an environment variable named by `INP` on every record process.
-///
-/// One instance per record is fine — there's no per-driver state to
-/// share. The factory closure used at registration time can simply
-/// `|| Box::new(GetenvDeviceSupport::new())`.
-#[derive(Default)]
+/// Reads the environment variable named by the INST_IO `INP` on every record
+/// process. The variable name is resolved once from `ctx.inp` at construction.
 pub struct GetenvDeviceSupport {
-    /// Cached last-seen env-var name. Lets the device re-read on every
-    /// process without rebuilding the lookup key from the INP string,
-    /// which itself never changes after init.
-    cached_var: Option<String>,
+    /// Env-var name resolved from `INP` (post-`@`, trimmed); empty when the
+    /// INP payload was empty (treated as "unknown env var").
+    var: String,
 }
 
 impl GetenvDeviceSupport {
-    pub fn new() -> Self {
-        Self::default()
+    /// Construct from the record's INST_IO `INP`
+    /// ([`DeviceSupportContext::inp`](crate::server::ioc_app::DeviceSupportContext)).
+    pub fn new(inp: &str) -> Self {
+        Self {
+            var: Self::resolve_var_name(inp).to_string(),
+        }
     }
 
     /// Strip the optional leading `@` (libCom INP convention) and any
@@ -50,22 +57,6 @@ impl GetenvDeviceSupport {
     fn resolve_var_name(inp: &str) -> &str {
         let trimmed = inp.trim();
         trimmed.strip_prefix('@').unwrap_or(trimmed).trim()
-    }
-
-    fn fetch(&self, record: &dyn Record) -> Option<String> {
-        let inp = record
-            .get_field("INP")
-            .and_then(|v| match v {
-                EpicsValue::String(s) => Some(s),
-                _ => None,
-            })
-            .unwrap_or_default();
-        let inp = inp.as_str_lossy();
-        let name = Self::resolve_var_name(&inp);
-        if name.is_empty() {
-            return None;
-        }
-        std::env::var(name).ok()
     }
 }
 
@@ -81,55 +72,18 @@ impl DeviceSupport for GetenvDeviceSupport {
                 "DTYP=getenv: unsupported record type '{rtype}' (use stringin or lsi)"
             )));
         }
-        // Capture the INP-resolved env-var name once at init so the
-        // hot read path can skip the get_field round-trip.
-        let inp = record
-            .get_field("INP")
-            .and_then(|v| match v {
-                EpicsValue::String(s) => Some(s),
-                _ => None,
-            })
-            .unwrap_or_default();
-        let inp = inp.as_str_lossy();
-        let name = Self::resolve_var_name(&inp);
-        if !name.is_empty() {
-            self.cached_var = Some(name.to_string());
-        }
-        // Perform the initial read so PINI / first monitor sees the
-        // resolved value rather than the empty default. Mirrors C
-        // getenvDevSup's `init_record` behaviour.
-        let value = self
-            .cached_var
-            .as_ref()
-            .and_then(|var| std::env::var(var).ok());
-        match value {
-            Some(s) => {
-                record.put_field("VAL", EpicsValue::String(s.into()))?;
-                Ok(())
-            }
-            None => {
-                // L2: an unset env var (or empty INP) at init is
-                // signalled the SAME way as on `read()` — VAL is
-                // cleared to empty and an `Err` is returned so the
-                // framework flags the record. Previously init wrote
-                // an empty VAL and returned `Ok`, producing a
-                // healthy-looking record with no alarm while the
-                // same condition on a later `read()` raised
-                // READ_ALARM. C flags the alarm at init too.
-                record.put_field("VAL", EpicsValue::String(String::new().into()))?;
-                Err(CaError::InvalidValue(format!(
-                    "getenv: variable '{}' is unset",
-                    self.cached_var.as_deref().unwrap_or("")
-                )))
-            }
-        }
+        // Perform the initial read so PINI / first monitor sees the resolved
+        // value rather than the empty default. Mirrors C getenvDevSup's
+        // `init_record`; an unset var is flagged at init the same way as on
+        // `read()` (VAL cleared + Err → the framework raises READ_ALARM).
+        self.read(record).map(|_| ())
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
-        let val = if let Some(ref var) = self.cached_var {
-            std::env::var(var).ok()
+        let val = if self.var.is_empty() {
+            None
         } else {
-            self.fetch(record)
+            std::env::var(&self.var).ok()
         };
         match val {
             Some(s) => {
@@ -137,16 +91,15 @@ impl DeviceSupport for GetenvDeviceSupport {
                 Ok(DeviceReadOutcome::ok())
             }
             None => {
-                // L1: an env var that was set at init and later
-                // unset must not leave the record showing the stale
-                // value. C `getenv` devsup re-reads every process
-                // and reflects the current (empty) value. Clear VAL
-                // to empty, then signal the framework via a soft Err
-                // so it sets READ_ALARM / INVALID severity.
+                // An env var unset at init, or later unset, must not leave the
+                // record showing a stale value. C `getenv` devsup re-reads
+                // every process and reflects the current (empty) value: clear
+                // VAL to empty, then signal the framework via a soft Err so it
+                // sets READ_ALARM / INVALID severity.
                 record.put_field("VAL", EpicsValue::String(String::new().into()))?;
                 Err(CaError::InvalidValue(format!(
                     "getenv: variable '{}' is unset",
-                    self.cached_var.as_deref().unwrap_or("")
+                    self.var
                 )))
             }
         }
@@ -162,19 +115,7 @@ impl DeviceSupport for GetenvDeviceSupport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::records::stringin::StringinRecord;
-
-    fn make_record(inp: &str) -> StringinRecord {
-        let mut r = StringinRecord::new("");
-        // StringinRecord doesn't expose INP directly; the common
-        // header carries it. For unit tests we exercise the parsing
-        // helper directly instead of going through put_field on a
-        // record type that wouldn't carry INP in its derived field
-        // list.
-        let _ = inp;
-        r.val = crate::types::PvString::new();
-        r
-    }
+    use crate::server::records::ai::AiRecord;
 
     #[test]
     fn resolve_var_name_strips_at_prefix() {
@@ -195,13 +136,19 @@ mod tests {
     }
 
     #[test]
-    fn init_rejects_unsupported_record_types() {
-        // We can't easily construct an arbitrary record here without
-        // pulling in the full registry; rely on resolve_var_name
-        // tests + integration coverage in the runtime tests for the
-        // record-type gate. Smoke test the dtyp identifier.
-        let dev = GetenvDeviceSupport::new();
-        assert_eq!(dev.dtyp(), "getenv");
-        let _ = make_record("@PATH");
+    fn new_resolves_var_from_inp() {
+        assert_eq!(GetenvDeviceSupport::new("@HOSTNAME").var, "HOSTNAME");
+        assert_eq!(GetenvDeviceSupport::new("  PATH  ").var, "PATH");
+        assert!(GetenvDeviceSupport::new("@").var.is_empty());
+        assert_eq!(GetenvDeviceSupport::new("@PATH").dtyp(), "getenv");
+    }
+
+    #[test]
+    fn init_rejects_unsupported_record_type() {
+        // ai is not a supported getenv record type → init Errs (the same gate
+        // wire_device_to_record turns into an INVALID record at build time).
+        let mut dev = GetenvDeviceSupport::new("@PATH");
+        let mut rec = AiRecord::new(0.0);
+        assert!(dev.init(&mut rec).is_err());
     }
 }

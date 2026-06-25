@@ -57,6 +57,13 @@ pub struct AoRecord {
     /// cases (aoRecord.c:494-499); `check_alarms` consumes this flag to do
     /// the same.
     bpt_error: bool,
+    /// Set by `convert_readback()` when the asyn `raw → eng` readback's
+    /// `LINR >= 3` breakpoint conversion fails (out of range or unresolvable
+    /// table). C `processAo` raises `WRITE_ALARM/INVALID_ALARM` and returns,
+    /// leaving `VAL` unchanged (devAsynInt32.c:988-990) — a different alarm
+    /// from the forward `convert()`'s `SOFT/MAJOR`, so it has its own flag.
+    /// `check_alarms` consumes it.
+    readback_bpt_error: bool,
     /// The database breakpoint-table registry (`install_breaktable_registry`),
     /// used to resolve the `LINR >= 3` table lazily.
     bpt_registry: Option<std::sync::Arc<crate::server::cvt_bpt::BreakTableRegistry>>,
@@ -118,6 +125,7 @@ impl Default for AoRecord {
             mlst: 0.0,
             init: false,
             bpt_error: false,
+            readback_bpt_error: false,
             bpt_registry: None,
             bpt_table: None,
             lbrk: 0,
@@ -169,6 +177,9 @@ impl AoRecord {
         // convert(): engineering units to raw value
         // Step 1: linearization (SLOPE or LINEAR)
         self.bpt_error = false;
+        // Clear the readback-failure flag so a stale prior readback alarm
+        // cannot survive into this forward convert's check_alarms.
+        self.readback_bpt_error = false;
         match self.linr {
             1 | 2 => {
                 // SLOPE/LINEAR: (value - eoff) / eslo
@@ -256,14 +267,15 @@ impl AoRecord {
         value += self.aoff;
 
         // C: NO_CONVERSION → passthrough; LINEAR/SLOPE → value*eslo + eoff;
-        // LINR >= 3 → `cvtRawToEngBpt`. Unlike the forward `convert()`, C's
-        // asyn ao readback (`processAo`, devAsynInt32.c:977-991) does NOT
-        // early-return or set record severity on a BPT failure — it logs and
-        // still assigns `pr->val = value`. So here the readback applies the
-        // table when resolved and otherwise leaves the un-linearised value;
-        // it does not raise `bpt_error` (the C readback's errlog has no
-        // record-alarm side effect, so omitting it is value-faithful).
+        // LINR >= 3 → `cvtRawToEngBpt`. On a breakpoint failure (out of range
+        // OR unresolvable table) C's asyn ao readback (`processAo`,
+        // devAsynInt32.c:988-990) raises `recGblSetSevr(WRITE_ALARM,
+        // INVALID_ALARM)` and `return -1`, which SKIPS `pr->val = value`
+        // (:993) — so VAL is left unchanged and the record goes INVALID. This
+        // is a different alarm from the forward `convert()`'s SOFT/MAJOR, so
+        // it sets `readback_bpt_error` (consumed by `check_alarms`).
         self.bpt_error = false;
+        self.readback_bpt_error = false;
         match self.linr {
             0 => {}
             1 | 2 => {
@@ -276,10 +288,26 @@ impl AoRecord {
                         .as_ref()
                         .and_then(|reg| reg.table_for_linr(self.linr));
                 }
-                if let Some(table) = &self.bpt_table {
-                    let (eng, _status) =
-                        crate::server::cvt_bpt::cvt_raw_to_eng_bpt(value, table, &mut self.lbrk);
-                    value = eng;
+                match &self.bpt_table {
+                    Some(table) => {
+                        let (eng, status) = crate::server::cvt_bpt::cvt_raw_to_eng_bpt(
+                            value,
+                            table,
+                            &mut self.lbrk,
+                        );
+                        if status == crate::server::cvt_bpt::BptStatus::OutOfRange {
+                            // C `return -1`: VAL frozen, WRITE/INVALID alarm.
+                            self.readback_bpt_error = true;
+                            return;
+                        }
+                        value = eng;
+                    }
+                    None => {
+                        // Unresolvable table: same failure path as C
+                        // `cvtRawToEngBpt != 0`.
+                        self.readback_bpt_error = true;
+                        return;
+                    }
                 }
             }
         }
@@ -922,17 +950,26 @@ impl Record for AoRecord {
         }
     }
 
-    /// C `aoRecord.c::convert` raises `SOFT_ALARM/MAJOR_ALARM` when the
-    /// breakpoint-table conversion fails. epics-base-rs has no
-    /// breakpoint-table registry, so any `LINR >= 3` is an unresolvable
-    /// table — `convert()` flags `bpt_error` and this hook raises the
-    /// C-equivalent alarm so the misconfiguration is visible.
+    /// Breakpoint-table failures raise the same alarms C does. The forward
+    /// `convert()` (eng→raw) raises `SOFT_ALARM/MAJOR_ALARM` (aoRecord.c:
+    /// 494-499); the asyn `convert_readback()` (raw→eng) raises
+    /// `WRITE_ALARM/INVALID_ALARM` (devAsynInt32.c:988). The two are mutually
+    /// exclusive within a single process (forward XOR readback), each clearing
+    /// the other's flag, so at most one fires.
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
         if self.bpt_error {
             crate::server::recgbl::rec_gbl_set_sevr_msg(
                 common,
                 crate::server::recgbl::alarm_status::SOFT_ALARM,
                 crate::server::record::AlarmSeverity::Major,
+                "BPT Error",
+            );
+        }
+        if self.readback_bpt_error {
+            crate::server::recgbl::rec_gbl_set_sevr_msg(
+                common,
+                crate::server::recgbl::alarm_status::WRITE_ALARM,
+                crate::server::record::AlarmSeverity::Invalid,
                 "BPT Error",
             );
         }
@@ -1051,11 +1088,10 @@ mod tests {
         );
     }
 
-    /// The asyn readback inverse `convert_readback()` (raw -> eng) applies the
-    /// table for LINR >= 3 and, per C `processAo`, does NOT raise a record
-    /// alarm on the readback path.
+    /// In-range asyn readback `convert_readback()` (raw -> eng) applies the
+    /// table and raises no error.
     #[test]
-    fn linr_breaktable_readback_converts_raw_to_eng_without_alarm() {
+    fn linr_breaktable_readback_converts_raw_to_eng_in_range() {
         let mut rec = AoRecord::default();
         rec.install_breaktable_registry(ramp_registry());
         rec.aslo = 1.0;
@@ -1068,9 +1104,67 @@ mod tests {
 
         // raw 200 in [100,300] -> eng = 10 + (200-100)*0.1 = 20.0.
         assert_eq!(rec.val, 20.0);
+        assert!(!rec.readback_bpt_error, "in-range readback must not error");
+        assert!(!rec.bpt_error);
+    }
+
+    /// Out-of-range asyn readback: C `processAo` raises WRITE/INVALID and
+    /// `return -1`, leaving VAL unchanged (devAsynInt32.c:988-993).
+    #[test]
+    fn linr_breaktable_readback_out_of_range_freezes_val_and_flags() {
+        let mut rec = AoRecord::default();
+        rec.install_breaktable_registry(ramp_registry());
+        rec.aslo = 1.0;
+        rec.aoff = 0.0;
+        rec.roff = 0;
+        rec.put_field("LINR", EpicsValue::Short(3)).unwrap();
+        rec.val = 99.0; // sentinel: must survive the readback failure
+        rec.rval = 400; // raw past the table's high end (300)
+
+        rec.convert_readback();
+
         assert!(
-            !rec.bpt_error,
-            "the asyn readback path must not raise a BPT alarm"
+            rec.readback_bpt_error,
+            "out-of-range readback must raise the readback BPT error"
         );
+        assert_eq!(rec.val, 99.0, "C return -1 skips VAL update on failure");
+    }
+
+    /// Unresolvable-table asyn readback: same WRITE/INVALID + VAL-frozen path.
+    #[test]
+    fn linr_breaktable_readback_not_found_freezes_val_and_flags() {
+        let mut rec = AoRecord::default();
+        rec.install_breaktable_registry(ramp_registry());
+        rec.aslo = 1.0;
+        rec.put_field("LINR", EpicsValue::Short(4)).unwrap(); // no table at index 4
+        rec.val = 42.0;
+        rec.rval = 200;
+
+        rec.convert_readback();
+
+        assert!(
+            rec.readback_bpt_error,
+            "unresolved table must flag readback"
+        );
+        assert_eq!(rec.val, 42.0, "VAL frozen when the table is missing");
+    }
+
+    /// The readback failure flag maps to WRITE_ALARM/INVALID_ALARM in
+    /// check_alarms — distinct from the forward path's SOFT/MAJOR.
+    #[test]
+    fn readback_bpt_error_raises_write_invalid_alarm() {
+        use crate::server::recgbl::alarm_status;
+        use crate::server::record::{AlarmSeverity, CommonFields};
+
+        let mut rec = AoRecord::default();
+        rec.readback_bpt_error = true;
+        let mut common = CommonFields::default();
+
+        rec.check_alarms(&mut common);
+
+        // check_alarms raises the *pending* alarm (nsev/nsta); the commit to
+        // sevr/stat happens later in rec_gbl_reset_alarms.
+        assert_eq!(common.nsev, AlarmSeverity::Invalid);
+        assert_eq!(common.nsta, alarm_status::WRITE_ALARM);
     }
 }

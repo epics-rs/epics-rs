@@ -396,17 +396,39 @@ pub struct AsynDeviceSupport {
 /// runs off the record-process thread, exactly like `interrupt_fifo`.
 struct AverageState {
     averager: crate::interfaces::average::SumAverager,
-    /// Last sample's `(alarm_status, alarm_severity)`. C captures these in the
-    /// accumulating callback and `processAiAverage` applies them via
-    /// `recGblSetSevr` (devAsynInt32.c:915-918, devAsynFloat64.c:732-735).
-    last_alarm: std::sync::Mutex<(u16, u16)>,
+    /// The two status channels C `processAiAverage` reads, held under one lock
+    /// so the drain reads them atomically against the accumulating callback.
+    status: std::sync::Mutex<AverageStatus>,
+}
+
+/// The two status channels C's averaging device support accumulates across a
+/// period. C `interruptCallbackAverage` does
+/// `result.status |= auxStatus; result.alarmStatus = alarmStatus;
+/// result.alarmSeverity = alarmSeverity` per sample (devAsynInt32.c:705-707,
+/// devAsynFloat64.c:516-518); `processAiAverage` then maps `result.status` via
+/// `asynStatusToEpicsAlarm` and gates the store on `result.status ==
+/// asynSuccess` (devAsynInt32.c:915-927, devAsynFloat64.c:732-754).
+#[derive(Default)]
+struct AverageStatus {
+    /// Last sample's EPICS `(alarm_status, alarm_severity)` (C
+    /// `result.alarmStatus`/`alarmSeverity`). On a transport-success period
+    /// these pass straight through; on a transport error C's
+    /// `asynStatusToEpicsAlarm` fills only the still-`NO_ALARM` fields, so a
+    /// sample's own EPICS alarm still wins.
+    last_alarm: (u16, u16),
+    /// Accumulated asyn transport status (C `result.status |= auxStatus`).
+    /// `None` ⟹ every sample this period was `asynSuccess`; `Some(s)` ⟹ a
+    /// non-success transport status occurred, which makes the period a
+    /// transport error (discard the averaged value, raise the mapped alarm).
+    /// Reset each consumed period (C resets `result.status = asynSuccess`).
+    aux_error: Option<crate::error::AsynStatus>,
 }
 
 impl AverageState {
     fn new() -> Self {
         Self {
             averager: crate::interfaces::average::SumAverager::new(),
-            last_alarm: std::sync::Mutex::new((0, 0)),
+            status: std::sync::Mutex::new(AverageStatus::default()),
         }
     }
 }
@@ -685,38 +707,34 @@ fn asyn_to_ca_error(e: AsynError) -> CaError {
 /// (7, 2) — condition 7 is STATE_ALARM, not READ_ALARM (which is 1), and
 /// MAJOR(2) instead of INVALID(3) — and Disabled was lumped with
 /// Disconnected as COMM_ALARM(9) instead of DISABLE_ALARM(18).
-fn asyn_error_to_alarm(e: &AsynError) -> (u16, u16) {
+/// Map an asyn transport status to the EPICS (alarm condition, severity) it
+/// implies — C `asynStatusToEpicsAlarm` with `defaultStat = READ_ALARM`,
+/// `defaultSevr = INVALID_ALARM` (asynEpicsUtils.c:238-265). `asynSuccess` →
+/// (NO_ALARM, NO severity). This is the per-status mapping only; C's fill-in
+/// rule (overwrite a field only while it is still NO_ALARM, so a sample's own
+/// EPICS alarm is preserved) is applied by callers that carry a base alarm.
+fn asyn_status_to_alarm(status: crate::error::AsynStatus) -> (u16, u16) {
     use crate::error::AsynStatus;
     use epics_base_rs::server::recgbl::alarm_status;
     use epics_base_rs::server::record::AlarmSeverity;
     let invalid = AlarmSeverity::Invalid as u16;
+    match status {
+        AsynStatus::Success => (alarm_status::NO_ALARM, AlarmSeverity::NoAlarm as u16),
+        AsynStatus::Timeout => (alarm_status::TIMEOUT_ALARM, invalid),
+        AsynStatus::Overflow => (alarm_status::HW_LIMIT_ALARM, invalid),
+        AsynStatus::Disconnected => (alarm_status::COMM_ALARM, invalid),
+        AsynStatus::Disabled => (alarm_status::DISABLE_ALARM, invalid),
+        AsynStatus::Error => (alarm_status::READ_ALARM, invalid),
+    }
+}
+
+fn asyn_error_to_alarm(e: &AsynError) -> (u16, u16) {
+    use epics_base_rs::server::recgbl::alarm_status;
+    use epics_base_rs::server::record::AlarmSeverity;
     match e {
-        AsynError::Status {
-            status: AsynStatus::Success,
-            ..
-        } => (alarm_status::NO_ALARM, AlarmSeverity::NoAlarm as u16),
-        AsynError::Status {
-            status: AsynStatus::Timeout,
-            ..
-        } => (alarm_status::TIMEOUT_ALARM, invalid),
-        AsynError::Status {
-            status: AsynStatus::Overflow,
-            ..
-        } => (alarm_status::HW_LIMIT_ALARM, invalid),
-        AsynError::Status {
-            status: AsynStatus::Disconnected,
-            ..
-        } => (alarm_status::COMM_ALARM, invalid),
-        AsynError::Status {
-            status: AsynStatus::Disabled,
-            ..
-        } => (alarm_status::DISABLE_ALARM, invalid),
-        AsynError::Status {
-            status: AsynStatus::Error,
-            ..
-        } => (alarm_status::READ_ALARM, invalid),
+        AsynError::Status { status, .. } => asyn_status_to_alarm(*status),
         // Non-status asyn errors take C's asynError/default branch.
-        _ => (alarm_status::READ_ALARM, invalid),
+        _ => (alarm_status::READ_ALARM, AlarmSeverity::Invalid as u16),
     }
 }
 
@@ -1451,6 +1469,10 @@ impl DeviceSupport for AsynDeviceSupport {
         // (ASLO/AOFF/SMOO applied in-dset) — averaging only changes the *source*
         // of the raw value, exactly as CmdResponse reused the octet reply→VAL.
         if let Some(acc) = self.average.clone() {
+            // C `processAiAverage` computes and RESETS the accumulator
+            // (numAverage=0, sum=0) BEFORE the transport-status check, so the
+            // period's samples are consumed even on a transport-error cycle —
+            // the checked drain already resets the averager.
             let drained = if self.iface_type == "asynInt32" {
                 acc.averager
                     .read_and_reset_int32_checked()
@@ -1460,15 +1482,60 @@ impl DeviceSupport for AsynDeviceSupport {
                     .read_and_reset_checked()
                     .map(EpicsValue::Double)
             };
+            // Snapshot the two status channels atomically against the callback.
+            // Reset the accumulated transport status only when a period was
+            // consumed (C resets `result.status = asynSuccess` on the
+            // failure branch; on the success branch it was already success).
+            // A zero-samples cycle leaves it untouched — and count==0 means no
+            // sample was pushed, so `aux_error` is `None` there regardless.
+            let (last_alarm, transport) = {
+                let mut st = acc.status.lock().unwrap();
+                let snap = (st.last_alarm, st.aux_error);
+                if drained.is_some() {
+                    st.aux_error = None;
+                }
+                snap
+            };
             match drained {
                 Some(val) => {
-                    // Apply the last sample's driver alarm (C recGblSetSevr,
-                    // devAsynInt32.c:915-918). Non-sticky: a NO_ALARM sample
-                    // clears any prior alarm on the next cycle.
-                    let (status, severity) = *acc.last_alarm.lock().unwrap();
-                    let skip_convert = self.store_read_value(record, val);
+                    // Final alarm = last sample's EPICS alarm, with C's
+                    // `asynStatusToEpicsAlarm` fill-in: the transport status
+                    // fills a field only while it is still NO_ALARM, so a
+                    // sample's own EPICS alarm wins (asynEpicsUtils.c:238-265).
+                    // On transport success the alarm passes through unchanged
+                    // (the `asynSuccess: break` arm).
+                    let (status, severity) = match transport {
+                        None => last_alarm,
+                        Some(err) => {
+                            let (mstat, msev) = asyn_status_to_alarm(err);
+                            (
+                                if last_alarm.0 == 0 {
+                                    mstat
+                                } else {
+                                    last_alarm.0
+                                },
+                                if last_alarm.1 == 0 {
+                                    msev
+                                } else {
+                                    last_alarm.1
+                                },
+                            )
+                        }
+                    };
                     self.last_alarm_status = status;
                     self.last_alarm_severity = severity;
+                    if transport.is_some() {
+                        // Transport-error period: C `processAiAverage` discards
+                        // the averaged value — `if (result.status ==
+                        // asynSuccess) { store } else { result.status =
+                        // asynSuccess; return -1 }` (devAsynInt32.c:919-927,
+                        // devAsynFloat64.c:736-754). `computed()` skips the
+                        // store so RVAL/VAL keep their previous value; the
+                        // mapped READ/TIMEOUT/...@INVALID alarm above stands.
+                        return Ok(DeviceReadOutcome::computed());
+                    }
+                    // Transport success: store the mean (C return 0/2).
+                    let skip_convert = self.store_read_value(record, val);
                     return Ok(if skip_convert {
                         DeviceReadOutcome::computed()
                     } else {
@@ -1734,9 +1801,19 @@ impl DeviceSupport for AsynDeviceSupport {
                     };
                     if let Some(s) = sample {
                         acc.averager.push(s);
-                        // Capture the sample's driver alarm for passthrough
-                        // (devAsynInt32.c:705-707).
-                        *acc.last_alarm.lock().unwrap() = (iv.alarm_status, iv.alarm_severity);
+                        // C `interruptCallbackAverage` per sample:
+                        //   result.status |= auxStatus;       (transport status)
+                        //   result.alarmStatus = alarmStatus; (last sample's
+                        //   result.alarmSeverity = alarmSeverity; EPICS alarm)
+                        // (devAsynInt32.c:705-707, devAsynFloat64.c:516-518).
+                        // OR-accumulating the transport status means: once any
+                        // sample is non-success the period stays a transport
+                        // error (asynSuccess == 0, so the OR is sticky).
+                        let mut st = acc.status.lock().unwrap();
+                        st.last_alarm = (iv.alarm_status, iv.alarm_severity);
+                        if iv.aux_status != crate::error::AsynStatus::Success {
+                            st.aux_error = Some(iv.aux_status);
+                        }
                     }
                 });
             self.average_callback_sub = Some(sub);
@@ -3303,6 +3380,116 @@ mod tests {
             ads.last_alarm(),
             Some((9, 3)),
             "the sample's driver alarm (COMM/INVALID) must propagate on read"
+        );
+    }
+
+    /// A transport-error period (a sample carries `aux_status != Success`):
+    /// C `processAiAverage` discards the averaged value (RVAL/VAL stay stale,
+    /// return -1) and raises the transport-mapped alarm via
+    /// `asynStatusToEpicsAlarm` (devAsynInt32.c:919-927, devAsynFloat64.c:736-754;
+    /// asynEpicsUtils.c:238-265). The period is still consumed (sum/numAverage
+    /// reset before the status check), so the next read sees no samples.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn average_transport_error_discards_value_and_raises_mapped_alarm() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut ads = make_average_adapter("asynFloat64");
+        let mut rec = AiRecord::new(42.0); // pre-existing VAL
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let acc = ads.average.clone().unwrap();
+        assert!(ads.io_intr_receiver().is_none());
+
+        // A sample with a transport error (Timeout) during the period.
+        interrupts.notify(InterruptValue {
+            reason,
+            addr: 0,
+            value: crate::param::ParamValue::Float64(5.0),
+            timestamp: SystemTime::now(),
+            aux_status: crate::error::AsynStatus::Timeout,
+            ..Default::default()
+        });
+        await_average_count(&acc, 1).await;
+
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(
+            outcome.did_compute,
+            "transport-error period skips the store (C return -1)"
+        );
+        let val = match rec.get_field("VAL").unwrap() {
+            EpicsValue::Double(v) => v,
+            _ => panic!(),
+        };
+        assert!(
+            (val - 42.0).abs() < 1e-9,
+            "transport error must discard the averaged value (VAL stays stale), got {val}"
+        );
+        assert_eq!(
+            ads.last_alarm(),
+            Some((10, 3)),
+            "transport Timeout must map to TIMEOUT_ALARM/INVALID"
+        );
+        assert_eq!(
+            acc.averager.count(),
+            0,
+            "the period is consumed even on a transport error (sum/numAverage reset)"
+        );
+
+        // The accumulated transport status reset with the period: a subsequent
+        // read with no samples is the ordinary zero-samples UDF case.
+        let outcome2 = ads.read(&mut rec).unwrap();
+        assert!(outcome2.did_compute);
+        assert_eq!(
+            ads.last_alarm(),
+            Some((
+                epics_base_rs::server::recgbl::alarm_status::UDF_ALARM,
+                epics_base_rs::server::record::AlarmSeverity::Invalid as u16
+            )),
+            "transport status reset → next empty read is zero-samples UDF, not a stale transport error"
+        );
+    }
+
+    /// C `asynStatusToEpicsAlarm` only fills a still-`NO_ALARM` field, so a
+    /// sample's own EPICS alarm wins over the transport-status mapping
+    /// (asynEpicsUtils.c:242-264). A Timeout transport status with a sample
+    /// EPICS alarm of COMM/MAJOR surfaces as COMM/MAJOR — not TIMEOUT/INVALID —
+    /// while the transport error still gates the store off.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn average_sample_epics_alarm_wins_over_transport_mapping() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut ads = make_average_adapter("asynFloat64");
+        let mut rec = AiRecord::new(42.0);
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let acc = ads.average.clone().unwrap();
+        assert!(ads.io_intr_receiver().is_none());
+
+        interrupts.notify(InterruptValue {
+            reason,
+            addr: 0,
+            value: crate::param::ParamValue::Float64(5.0),
+            timestamp: SystemTime::now(),
+            aux_status: crate::error::AsynStatus::Timeout, // would map to (10, 3)
+            alarm_status: 9,                               // COMM_ALARM (sample's own)
+            alarm_severity: 2,                             // MAJOR
+            ..Default::default()
+        });
+        await_average_count(&acc, 1).await;
+
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            ads.last_alarm(),
+            Some((9, 2)),
+            "the sample's EPICS alarm (COMM/MAJOR) must win over the transport Timeout mapping"
+        );
+        let val = match rec.get_field("VAL").unwrap() {
+            EpicsValue::Double(v) => v,
+            _ => panic!(),
+        };
+        assert!(
+            (val - 42.0).abs() < 1e-9,
+            "the transport error still discards the value regardless of which alarm wins"
         );
     }
 

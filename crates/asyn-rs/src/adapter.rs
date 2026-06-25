@@ -1313,6 +1313,19 @@ impl DeviceSupport for AsynDeviceSupport {
             return Ok(DeviceReadOutcome::ok());
         }
 
+        // asynOctetCmdResponse with an EMPTY command is a misconfiguration: C
+        // initCmdBuffer (devAsynOctet.c:632-637) rejects it outright —
+        // recGblSetSevr(prec, LINK_ALARM, INVALID_ALARM) + INIT_ERROR so the
+        // record comes up dead. Hold the record at LINK_ALARM/INVALID and do no
+        // I/O: writing an empty command to the device every process is
+        // meaningless. octet_cmd is None for a plain asynOctetRead, so this only
+        // fires for a CmdResponse record whose DRVINFO escaped to nothing.
+        if self.octet_cmd.as_deref().is_some_and(|c| c.is_empty()) {
+            self.last_alarm_status = epics_base_rs::server::recgbl::alarm_status::LINK_ALARM;
+            self.last_alarm_severity = epics_base_rs::server::record::AlarmSeverity::Invalid as u16;
+            return Ok(DeviceReadOutcome::ok());
+        }
+
         // Write-only (asynOctetWrite): waveform is an input record type so
         // process calls read(), not write(). Perform the write here instead.
         if self.write_only {
@@ -3801,6 +3814,51 @@ mod tests {
             rec.get_field("VAL"),
             Some(EpicsValue::CharArray(b"STATUS=OK".to_vec())),
             "reply must populate the lsi VAL"
+        );
+    }
+
+    /// An asynOctetCmdResponse record with an EMPTY command (DRVINFO escaped to
+    /// nothing) is a misconfiguration: C initCmdBuffer (devAsynOctet.c:632-637)
+    /// rejects it with LINK_ALARM/INVALID + INIT_ERROR. base-rs holds the record
+    /// at LINK_ALARM/INVALID and performs NO I/O (no empty command is written).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cmd_response_empty_command_holds_link_alarm_and_writes_nothing() {
+        use epics_base_rs::server::record::AlarmSeverity;
+        use epics_base_rs::server::records::stringin::StringinRecord;
+
+        let (handle, (writes, sequence)) = spawn_cmd_response_port("cmdresp_empty", b"unused");
+        let link = AsynLink {
+            port_name: "cmdresp_empty".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: String::new(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
+        // What the factory builds for an empty DRVINFO: octet_cmd = Some(empty).
+        ads.octet_cmd = Some(Vec::new());
+        ads.reason_set = true;
+        ads.set_record_info("TEST:EMPTY", ScanType::Passive);
+
+        let mut rec = StringinRecord::new("");
+        ads.read(&mut rec).unwrap();
+
+        // No I/O at all — not even an empty write.
+        assert!(
+            writes.lock().unwrap().is_empty(),
+            "empty command must not write to the device"
+        );
+        assert!(
+            sequence.lock().unwrap().is_empty(),
+            "empty command must perform no driver I/O"
+        );
+        // Held at LINK_ALARM / INVALID (C recGblSetSevr(LINK_ALARM, INVALID)).
+        assert_eq!(
+            ads.last_alarm(),
+            Some((
+                epics_base_rs::server::recgbl::alarm_status::LINK_ALARM,
+                AlarmSeverity::Invalid as u16
+            )),
+            "empty command must hold the record at LINK_ALARM/INVALID"
         );
     }
 }

@@ -131,7 +131,8 @@ impl DeviceSupport for GetenvDeviceSupport {
                 //     (record_trait.rs `Some(_) => false`); the *alarm* is raised
                 //     directly, but the raw UDF field has no device→udf channel.
                 //   - AMSG "No such ENV" is not carried (`last_alarm()` is
-                //     (status, severity) only), and lsi LEN=1 is not modeled.
+                //     (status, severity) only), and lsi LEN is not modeled (C
+                //     sets it to strlen(val) on the set path, 1 on unset).
                 self.unset_alarm = Some((alarm_status::UDF_ALARM, self.udfs as u16));
                 record.put_field("VAL", EpicsValue::String(String::new().into()))?;
                 Ok(DeviceReadOutcome::ok())

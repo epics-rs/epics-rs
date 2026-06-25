@@ -46,6 +46,13 @@ pub struct BoRecord {
     // when `mlst != val`. Captured during process() because the framework
     // reads monitor_value_changed() after process() has committed mlst.
     value_changed: bool,
+    /// Set by `set_device_did_compute(true)` when a device readback has
+    /// already produced both RVAL and VAL (`apply_raw_readback`). One-shot:
+    /// `process()` then skips the forward `VAL -> RVAL` `val_to_rval()` that
+    /// would recompute RVAL from VAL and discard the readback — C `processBo`
+    /// sets `rval`/`val` from the callback and returns without re-converting
+    /// (devAsynInt32.c:1201-1204 / devAsynUInt32Digital.c:730-733).
+    skip_convert: bool,
 }
 
 impl Default for BoRecord {
@@ -75,6 +82,7 @@ impl Default for BoRecord {
             sims: 0,
             high_reset_pending: false,
             value_changed: false,
+            skip_convert: false,
         }
     }
 }
@@ -302,8 +310,15 @@ impl Record for BoRecord {
         // `!dbLinkIsConstant`, so a client caput to VAL is never clobbered
         // by the constant every cycle.
 
-        // Convert val to rval using mask
-        self.val_to_rval();
+        // Convert val to rval using mask — unless a device readback
+        // (`apply_raw_readback`) already set both RVAL and VAL, in which case
+        // skip the forward convert that would recompute RVAL from VAL and
+        // discard the readback. One-shot (C `processBo` readback returns
+        // without re-converting; a normal process always converts).
+        if !self.skip_convert {
+            self.val_to_rval();
+        }
+        self.skip_convert = false;
 
         self.oraw = self.rval;
         self.orbv = self.rbv;
@@ -332,6 +347,29 @@ impl Record for BoRecord {
             actions,
             device_did_compute: false,
         })
+    }
+
+    fn set_device_did_compute(&mut self, did: bool) {
+        self.skip_convert = did;
+    }
+
+    /// Device readback (`asyn:READBACK` / SCAN="I/O Intr" / init seed): store
+    /// the raw and resolve VAL to 0/1, mirroring C `processBo`/`initBo`
+    /// (devAsynInt32.c:1202-1203,1187 / devAsynUInt32Digital.c:731-732,716).
+    /// When MASK is set (the digital `asynUInt32Digital` config) RVAL keeps the
+    /// masked raw and VAL is `(masked != 0)`; when MASK is 0 (the typical
+    /// `asynInt32` `bo`, whose `initBo`/`processBo` do not mask) RVAL is the raw
+    /// and VAL is `(raw != 0)` — the `mask != 0` split reproduces both device
+    /// supports exactly. Returns `true` so the store reports `computed` and the
+    /// framework skips the forward convert (via `set_device_did_compute`).
+    fn apply_raw_readback(&mut self, raw: i32) -> bool {
+        self.rval = if self.mask != 0 {
+            (raw as u32) & self.mask
+        } else {
+            raw as u32
+        };
+        self.val = if self.rval != 0 { 1 } else { 0 };
+        true
     }
 
     /// C `boRecord.c::checkAlarms` — STATE alarm (ZSV for VAL=0,

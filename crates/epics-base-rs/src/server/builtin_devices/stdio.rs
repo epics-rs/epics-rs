@@ -1,0 +1,188 @@
+//! `stdio` device support — EPICS base `devStdio.c` (`devSoft.dbd`).
+//!
+//! One DTYP (`"stdio"`, INST_IO) shared by three output records — `lso`,
+//! `printf`, `stringout` (C `devLsoStdio` / `devPrintfStdio` / `devSoStdio`).
+//! The INST_IO `OUT` instio string names an output stream; on each write the
+//! record's `VAL` string is printed to that stream followed by a newline.
+//!
+//! C `write_xxx` (`devStdio.c:98-104` / `:148-154` / `:198-204`):
+//! `if (pstream) pstream->print("%s\n", prec->val)`. The stream is resolved
+//! once by `add_xxx` (`:64-79` etc.) from `out.value.instio.string` against
+//! the fixed table `outStreams[]` (`:29-37`): `stdout` → `printf`,
+//! `stderr` → `vfprintf(stderr)`, `errlog` → `errlogVprintf`. An OUT naming
+//! no known stream leaves `dpvt = NULL`, so the record writes nothing.
+
+use crate::error::{CaError, CaResult};
+use crate::runtime::log::errlog_printf;
+use crate::server::device_support::DeviceSupport;
+use crate::server::record::Record;
+use crate::types::EpicsValue;
+
+/// The output stream named by the INST_IO `OUT` instio string —
+/// C `outStreams[]` (`devStdio.c:29-37`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StdioStream {
+    /// `"stdout"` → C `printf` (process stdout).
+    Stdout,
+    /// `"stderr"` → C `stderrPrintf` → `vfprintf(stderr)` (process stderr).
+    Stderr,
+    /// `"errlog"` → C `logPrintf` → `errlogVprintf` (the EPICS errlog).
+    Errlog,
+}
+
+impl StdioStream {
+    /// Resolve the instio string to a stream, or `None` for an unknown name
+    /// (C `add_xxx` loops `outStreams` and leaves `dpvt = NULL` on no match).
+    fn from_name(name: &str) -> Option<StdioStream> {
+        match name {
+            "stdout" => Some(StdioStream::Stdout),
+            "stderr" => Some(StdioStream::Stderr),
+            "errlog" => Some(StdioStream::Errlog),
+            _ => None,
+        }
+    }
+
+    /// Print `line` followed by a newline — C `pstream->print("%s\n", val)`.
+    /// stdout/stderr terminate the line themselves; the errlog stream routes
+    /// through `tracing`, which owns line termination, so the C format's
+    /// trailing `\n` is the line break here too.
+    fn print_line(self, line: &str) {
+        match self {
+            StdioStream::Stdout => println!("{line}"),
+            StdioStream::Stderr => eprintln!("{line}"),
+            StdioStream::Errlog => errlog_printf(line),
+        }
+    }
+}
+
+/// `stdio` device support for the `lso` / `printf` / `stringout` records.
+pub struct StdioDeviceSupport {
+    /// Resolved output stream; `None` when `OUT` named no known stream
+    /// (C `dpvt == NULL` → `write_xxx` is a no-op).
+    stream: Option<StdioStream>,
+    /// The post-`@` instio name, kept for the unresolved-stream diagnostic.
+    name: String,
+}
+
+impl StdioDeviceSupport {
+    /// Construct from the INST_IO `OUT` string
+    /// ([`DeviceSupportContext::out`](crate::server::ioc_app::DeviceSupportContext)).
+    /// A leading `@` (the INST_IO link marker the field carries) is stripped,
+    /// matching C reading `out.value.instio.string` (the post-`@` content).
+    pub fn new(out: &str) -> Self {
+        let name = out.strip_prefix('@').unwrap_or(out).trim().to_string();
+        let stream = StdioStream::from_name(&name);
+        Self { stream, name }
+    }
+}
+
+impl DeviceSupport for StdioDeviceSupport {
+    fn dtyp(&self) -> &str {
+        "stdio"
+    }
+
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+        // C registers a SEPARATE dset per record type (devLsoStdio /
+        // devPrintfStdio / devSoStdio); a DTYP="stdio" on any other record
+        // type has no matching dset and fails to init. The Rust dynamic
+        // factory builds one device for the DTYP regardless of record type,
+        // so gate the record type here.
+        let rt = record.record_type();
+        if !matches!(rt, "lso" | "printf" | "stringout") {
+            return Err(CaError::InvalidValue(format!(
+                "DTYP='stdio': unsupported record type '{rt}' (use lso, printf, or stringout)"
+            )));
+        }
+        // C `add_xxx` returns -1 (a logged init failure) with `dpvt = NULL`
+        // when OUT names no known stream, but sets no record alarm — the
+        // record simply writes nothing. Mirror the logged diagnostic without
+        // alarming the record.
+        if self.stream.is_none() {
+            errlog_printf(&format!(
+                "DTYP='stdio': OUT '{}' names no known stream (use stdout, stderr, or errlog); writes ignored",
+                self.name
+            ));
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, record: &mut dyn Record) -> CaResult<()> {
+        // C `write_xxx`: `if (pstream) pstream->print("%s\n", prec->val)`.
+        let Some(stream) = self.stream else {
+            return Ok(());
+        };
+        if let Some(EpicsValue::String(s)) = record.get_field("VAL") {
+            stream.print_line(&s.as_str_lossy());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::records::stringin::StringinRecord;
+    use crate::server::records::stringout::StringoutRecord;
+
+    #[test]
+    fn from_name_resolves_the_three_streams() {
+        assert_eq!(StdioStream::from_name("stdout"), Some(StdioStream::Stdout));
+        assert_eq!(StdioStream::from_name("stderr"), Some(StdioStream::Stderr));
+        assert_eq!(StdioStream::from_name("errlog"), Some(StdioStream::Errlog));
+        assert_eq!(StdioStream::from_name("bogus"), None);
+        assert_eq!(StdioStream::from_name(""), None);
+    }
+
+    #[test]
+    fn new_strips_inst_io_at_and_resolves_stream() {
+        assert_eq!(
+            StdioDeviceSupport::new("@stdout").stream,
+            Some(StdioStream::Stdout)
+        );
+        assert_eq!(
+            StdioDeviceSupport::new("stderr").stream,
+            Some(StdioStream::Stderr)
+        );
+        assert_eq!(
+            StdioDeviceSupport::new("@errlog").stream,
+            Some(StdioStream::Errlog)
+        );
+        assert_eq!(StdioDeviceSupport::new("@nope").stream, None);
+    }
+
+    /// C registers no `(stringin, stdio)` dset; the record-type gate Errs so
+    /// `wire_device_to_record` flags the record INVALID, matching "no device
+    /// support for this DTYP".
+    #[test]
+    fn init_rejects_non_stdio_record_type() {
+        let mut dev = StdioDeviceSupport::new("@stdout");
+        let mut rec = StringinRecord::new("");
+        assert!(dev.init(&mut rec).is_err());
+    }
+
+    #[test]
+    fn init_accepts_stringout() {
+        let mut dev = StdioDeviceSupport::new("@stdout");
+        let mut rec = StringoutRecord::new("hello");
+        assert!(dev.init(&mut rec).is_ok());
+    }
+
+    /// C `write_xxx` with `dpvt == NULL` (unknown stream) prints nothing and
+    /// returns 0 — no alarm. Here `write` is a clean no-op.
+    #[test]
+    fn write_is_noop_on_unresolved_stream() {
+        let mut dev = StdioDeviceSupport::new("@bogus");
+        let mut rec = StringoutRecord::new("ignored");
+        assert!(dev.write(&mut rec).is_ok());
+    }
+
+    /// A resolved stream prints VAL; assert the call path runs cleanly (the
+    /// printed bytes go to the process stream — the `errlog` stream is
+    /// asserted end-to-end via tracing capture in `tests/stdio_device.rs`).
+    #[test]
+    fn write_to_resolved_stream_succeeds() {
+        let mut dev = StdioDeviceSupport::new("@stderr");
+        let mut rec = StringoutRecord::new("hello stdio");
+        assert!(dev.write(&mut rec).is_ok());
+    }
+}

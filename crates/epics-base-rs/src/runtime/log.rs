@@ -106,6 +106,20 @@ pub fn errlog_sev_printf(severity: ErrlogSevEnum, message: &str) -> bool {
     true
 }
 
+/// Emit a pre-formatted message through the errlog facility
+/// unconditionally — C `errlogVprintf`/`errlogPrintf`
+/// (`errlog.c:333-364`), the *no-severity* variant.
+///
+/// Unlike [`errlog_sev_printf`] this carries no `sevr=` prefix and is
+/// never gated by the [`errlog_get_sev_to_log`] threshold (C
+/// `errlogVprintf` always enqueues). Routed through `tracing` at info
+/// level on the same `epics_base_rs::errlog` target, so an application's
+/// subscriber sees it on the errlog sink. Used by `stdio` device support
+/// for the `"errlog"` output stream (`devStdio.c` `logPrintf`).
+pub fn errlog_printf(message: &str) {
+    tracing::info!(target: "epics_base_rs::errlog", "{message}");
+}
+
 /// Debug-level runtime log line. Routes through the `tracing` facade.
 #[macro_export]
 macro_rules! rt_debug {

@@ -1458,9 +1458,7 @@ impl DeviceSupport for AsynDeviceSupport {
         //     if (pr->nobt == 0) pr->mask = 0xffffffff;
         //     pr->mask <<= pr->shft;
         //
-        // mbbiRecord/mbboRecord init leaves MASK = (1<<NOBT)-1 *unshifted*
-        // (the record convention — the RVAL→VAL convert shifts RVAL down and
-        // never masks). The asynInt32 device support POSITIONS the mask so
+        // The asynInt32 device support POSITIONS the record's mask so
         // `rval = value & mask` (processMbbi/processMbbo) selects the field at
         // bits [SHFT, SHFT+NOBT). Without it, `apply_raw_readback`'s
         // `raw & mask` strips exactly the SHFT-selected bits (and a NOBT=0
@@ -1468,18 +1466,29 @@ impl DeviceSupport for AsynDeviceSupport {
         // already-positioned `@asynMask` above instead; only mbbi/mbbo carry
         // NOBT under asynInt32 (bi/bo/ai/ao/longin have none; mbbiDirect/
         // mbboDirect are uint32digital-only), so NOBT presence selects them.
-        // The base mask is rebuilt from NOBT (= the `(1<<NOBT)-1` mbbiRecord
-        // computes) so the positioning is idempotent across init calls.
+        //
+        // C shifts the record's CURRENT mask, overriding to 0xffffffff only
+        // when NOBT==0. mbbiRecord/mbboRecord init (mbbiRecord.c:128-130) sets
+        // that current mask to a `.db`-loaded MASK, or to `(1<<NOBT)-1` only
+        // when MASK was 0 — so mirroring `current << SHFT` here (rather than
+        // rebuilding `(1<<NOBT)-1`) preserves a `.db`-set custom MASK and
+        // yields 0 for the degenerate NOBT>32 (record mask stays 0), both
+        // exactly C. `wire_device_to_record` (device_support.rs) calls `init`
+        // exactly once per record, like C's once-only `initMbbi`, so the
+        // in-place positioning is never re-applied (no double-shift).
         if self.iface_type == "asynInt32" {
             if let Some(EpicsValue::UShort(nobt)) = record.get_field("NOBT") {
                 let shft = match record.get_field("SHFT") {
                     Some(EpicsValue::UShort(s)) => s as u32,
                     _ => 0,
                 };
-                let base: u32 = if nobt == 0 || nobt >= 32 {
+                let base: u32 = if nobt == 0 {
                     0xFFFF_FFFF
                 } else {
-                    (1u32 << nobt) - 1
+                    match record.get_field("MASK") {
+                        Some(EpicsValue::ULong(m)) => m,
+                        _ => 0,
+                    }
                 };
                 let positioned = base.checked_shl(shft).unwrap_or(0);
                 let _ = record.put_field("MASK", EpicsValue::Long(positioned as i32));
@@ -5349,6 +5358,29 @@ mod tests {
             rec.get_field("MASK"),
             Some(EpicsValue::ULong(0xE0)),
             "asynInt32 mbbo MASK positioned: ((1<<NOBT)-1) << SHFT"
+        );
+    }
+
+    /// Positioning shifts the record's CURRENT mask, so a `.db`-set custom
+    /// MASK (≠ (1<<NOBT)-1) is preserved and shifted — exactly C initMbbi,
+    /// which does `pr->mask <<= shft` over the .db-loaded mask (mbbiRecord
+    /// init only recomputes (1<<NOBT)-1 when MASK==0, mbbiRecord.c:128-130).
+    /// Rebuilding from NOBT would clobber it (the Round 27 divergence).
+    #[test]
+    fn mbbi_asynint32_preserves_db_set_mask() {
+        use epics_base_rs::server::records::mbbi::MbbiRecord;
+        let mut ads = make_adapter(ScanType::IoIntr); // asynInt32
+        let mut rec = MbbiRecord::new(0);
+        // A .db that sets a custom (non-contiguous) MASK alongside NOBT/SHFT.
+        rec.put_field("MASK", EpicsValue::ULong(0x05)).unwrap();
+        rec.put_field("NOBT", EpicsValue::UShort(4)).unwrap();
+        rec.put_field("SHFT", EpicsValue::UShort(4)).unwrap();
+        rec.init_record(0).unwrap(); // MASK!=0 -> mbbiRecord leaves it 0x05
+        ads.init(&mut rec).unwrap(); // positions the CURRENT mask: 0x05 << 4 = 0x50
+        assert_eq!(
+            rec.get_field("MASK"),
+            Some(EpicsValue::ULong(0x50)),
+            "custom .db MASK 0x05 shifted (0x05<<4), not rebuilt to ((1<<4)-1)<<4 = 0xF0"
         );
     }
 

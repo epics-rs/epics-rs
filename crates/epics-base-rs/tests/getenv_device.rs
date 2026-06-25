@@ -154,3 +154,54 @@ record(stringin, "GETENV_UNSET") {
         "unset env var clears VAL to empty (C val[0]=0)"
     );
 }
+
+/// The unset-var alarm fires at the record's *configured* UDFS, not a hardcoded
+/// INVALID — getenv captures `prec->udfs` in set_process_context, matching C
+/// `recGblSetSevrMsg(prec, UDF_ALARM, prec->udfs, …)`. A `field(UDFS,"MINOR")`
+/// record with an unset var must raise UDF_ALARM at MINOR. This guards the
+/// reason `set_process_context` exists: drop the `ctx.udfs` capture and the
+/// severity reverts to the INVALID default, failing this assertion (the
+/// default-UDFS test above would still pass, so it cannot catch that regression).
+#[tokio::test]
+async fn getenv_unset_var_honors_user_lowered_udfs() {
+    // SAFETY: nextest isolates each test in its own process (see module doc), so
+    // removing this variable cannot race another test.
+    unsafe {
+        std::env::remove_var("GETENV_E2E_UDFS_MINOR_UNSET");
+    }
+
+    let (db, _) = IocBuilder::new()
+        .db_string(
+            r#"
+record(stringin, "GETENV_UDFS") {
+    field(DTYP, "getenv")
+    field(INP, "@GETENV_E2E_UDFS_MINOR_UNSET")
+    field(UDFS, "MINOR")
+}
+"#,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("GETENV_UDFS", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let rec = db.get_record("GETENV_UDFS").await.expect("record exists");
+    let inst = rec.read().await;
+    assert_eq!(
+        inst.common.stat,
+        alarm_status::UDF_ALARM,
+        "unset env var must raise UDF_ALARM regardless of the UDFS severity"
+    );
+    assert_eq!(
+        inst.common.sevr,
+        AlarmSeverity::Minor,
+        "unset-var severity must follow the record's UDFS (MINOR), not a hardcoded \
+         INVALID"
+    );
+}

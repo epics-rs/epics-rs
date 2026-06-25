@@ -21,8 +21,30 @@ pub use getenv::GetenvDeviceSupport;
 pub use stdio::StdioDeviceSupport;
 pub use timestamp::SoftTimestampDeviceSupport;
 
+use crate::server::DeviceSupportFactory;
 use crate::server::device_support::DeviceSupport;
 use crate::server::ioc_app::DeviceSupportContext;
+
+/// The statically auto-registered built-in device support — those needing no
+/// runtime context (no INP/OUT), so a plain `Fn() -> Box<dyn DeviceSupport>`
+/// factory suffices and they are registered eagerly by `IocBuilder::new` and
+/// `IocApplication::new` (a `.db` file can name the DTYP with zero setup).
+/// Currently just `getenv` (base `devSiEnviron` / `devLsiEnviron`, stringin /
+/// lsi).
+///
+/// This is the SINGLE source of truth for the static builtins: both
+/// registration sites iterate it, and the `base_device_parity` guard probes it
+/// for coverage — so removing an entry both unregisters the device AND fails
+/// the guard (the devSoft.dbd row it served becomes unaccounted for), keeping
+/// the two in lockstep instead of a hand-maintained list drifting from the
+/// registration.
+pub fn static_builtin_device_supports() -> Vec<(&'static str, DeviceSupportFactory)> {
+    vec![(
+        "getenv",
+        Box::new(|| -> Box<dyn DeviceSupport> { Box::new(getenv::GetenvDeviceSupport::new()) })
+            as DeviceSupportFactory,
+    )]
+}
 
 /// Built-in device support that must be dispatched by the runtime
 /// [`DeviceSupportContext`] because it needs the record's `INP`/`OUT`.

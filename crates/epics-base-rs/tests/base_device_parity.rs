@@ -13,15 +13,18 @@
 //!
 //! base's coverage is split across three mechanisms, not one registry (unlike
 //! the std module's `std_device_supports()` guard), so the "served" set is the
-//! union of all three — checked by calling the real functions, not a hardcoded
-//! list, so the guard self-updates as builtins are added:
+//! union of all three — each computed by calling the real function/list base-rs
+//! itself uses, never a guard-local hardcoded copy, so the guard self-updates
+//! as builtins are added and goes RED if one is dropped:
 //!   1. `is_soft_dtyp(dtyp)` — the soft-channel short-circuit (Soft Channel /
 //!      Raw Soft Channel / Async Soft Channel never attach a device).
 //!   2. `builtin_dynamic_factory(ctx)` — the dynamic builtins that need the
 //!      record's INP/OUT (Soft Timestamp, stdio, Db State).
-//!   3. The static auto-registered builtins (`getenv`), which both
-//!      `IocBuilder::new` and `IocApplication::new` register via `.n(dtyp, …)`
-//!      and which neither (1) nor (2) reports — the one small explicit set.
+//!   3. `static_builtin_device_supports()` — the static auto-registered
+//!      builtins (`getenv`), the SAME list `IocBuilder::new` /
+//!      `IocApplication::new` register from, which neither (1) nor (2) reports.
+//!      Probing the registration list (not a const copy) means dropping `getenv`
+//!      both unregisters it and fails this guard, in lockstep.
 //!
 //! Pair-keyed allowlist, by design and for consistency with the std guard:
 //! EPICS selects device support by the (recordType, DTYP) PAIR. base's
@@ -39,17 +42,11 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use epics_base_rs::server::builtin_devices::builtin_dynamic_factory;
+use epics_base_rs::server::builtin_devices::{
+    builtin_dynamic_factory, static_builtin_device_supports,
+};
 use epics_base_rs::server::device_support::is_soft_dtyp;
 use epics_base_rs::server::ioc_app::DeviceSupportContext;
-
-/// Statically auto-registered builtins that `is_soft_dtyp` and
-/// `builtin_dynamic_factory` do not report. `getenv` (base `devSiEnviron` /
-/// `devLsiEnviron` for stringin/lsi) is registered by `IocBuilder::new` /
-/// `IocApplication::new` via `.n("getenv", …)` — a `Fn() -> Box<dyn
-/// DeviceSupport>` that needs no INP/OUT, so it is not in the dynamic factory.
-/// The only static builtin; listed so a renamed/removed registration surfaces.
-const STATIC_BUILTINS: &[&str] = &["getenv"];
 
 /// (recordType, DTYP) device rows base-rs does NOT serve, each a tracked known
 /// gap with the reason it is acceptable to leave unported (for now). Keyed on
@@ -133,8 +130,9 @@ fn parse_device_rows(dbd: &str) -> Vec<(String, String)> {
 }
 
 /// Is `dtyp` served by one of base-rs's three device-support mechanisms?
-fn served_by_base(dtyp: &str) -> bool {
-    if is_soft_dtyp(dtyp) || STATIC_BUILTINS.contains(&dtyp) {
+/// `static_dtyps` is the live set from `static_builtin_device_supports()`.
+fn served_by_base(dtyp: &str, static_dtyps: &BTreeSet<&str>) -> bool {
+    if is_soft_dtyp(dtyp) || static_dtyps.contains(dtyp) {
         return true;
     }
     // The dynamic builtins need INP/OUT; probing with empty strings only
@@ -166,6 +164,11 @@ fn base_devsoft_device_rows_are_all_accounted_for() {
         path.display()
     );
 
+    // Live static-builtin DTYP set — the SAME list both IOC constructors
+    // register from, so a dropped entry fails here in lockstep.
+    let static_supports = static_builtin_device_supports();
+    let static_dtyps: BTreeSet<&str> = static_supports.iter().map(|(d, _)| *d).collect();
+
     let mut failures: Vec<String> = Vec::new();
     let mut tracked: Vec<String> = Vec::new();
     // Allowlist entries actually matched by a row — to catch a stale allowlist
@@ -173,7 +176,7 @@ fn base_devsoft_device_rows_are_all_accounted_for() {
     let mut allowlist_hit: BTreeSet<(String, String)> = BTreeSet::new();
 
     for (record_type, dtyp) in &rows {
-        if served_by_base(dtyp) {
+        if served_by_base(dtyp, &static_dtyps) {
             continue;
         }
         if let Some((_, _, reason)) = ALLOWLIST
@@ -204,10 +207,10 @@ fn base_devsoft_device_rows_are_all_accounted_for() {
         }
     }
 
-    // No stale static builtin: every STATIC_BUILTINS entry must back a real row
-    // (a renamed/removed getenv DTYP would otherwise pass silently).
+    // No stale static builtin: every static_builtin_device_supports() entry
+    // must back a real row (a renamed/removed getenv DTYP would otherwise pass).
     let dtyps: BTreeSet<&str> = rows.iter().map(|(_, d)| d.as_str()).collect();
-    for b in STATIC_BUILTINS {
+    for b in &static_dtyps {
         if !dtyps.contains(b) {
             failures.push(format!(
                 "static builtin {b:?} backs no devSoft.dbd row — phantom \

@@ -44,13 +44,13 @@ impl IocBuilder {
     /// names with zero extra setup.
     pub fn new() -> Self {
         let mut device_factories: HashMap<String, DeviceSupportFactory> = HashMap::new();
-        // epics-base 3.15.4: built-in `getenv` device support.
-        device_factories.insert(
-            "getenv".to_string(),
-            Box::new(|| -> Box<dyn device_support::DeviceSupport> {
-                Box::new(super::builtin_devices::GetenvDeviceSupport::new())
-            }),
-        );
+        // epics-base 3.15.4: the statically auto-registered built-in device
+        // support (currently `getenv` for stringin/lsi), from the shared
+        // `static_builtin_device_supports` list — the single source of truth the
+        // `base_device_parity` guard also probes.
+        for (dtyp, factory) in super::builtin_devices::static_builtin_device_supports() {
+            device_factories.insert(dtyp.to_string(), factory);
+        }
         Self {
             pvs: Vec::new(),
             records: Vec::new(),

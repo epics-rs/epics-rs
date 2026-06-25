@@ -399,6 +399,13 @@ struct AverageState {
     /// The two status channels C `processAiAverage` reads, held under one lock
     /// so the drain reads them atomically against the accumulating callback.
     status: std::sync::Mutex<AverageStatus>,
+    /// Mode 1 (SCAN="I/O Intr") decimation count: C `numToAverage =
+    /// (int)(pai->sval + 0.5)`, floored at 1 (devAsynInt32.c:674-675). C reads
+    /// `pai->sval` live in the callback; the Rust analogue snapshots SVAL from
+    /// the record at init and on each process (`refresh_average_decimation_threshold`),
+    /// so a runtime SVAL change takes effect at the next process. Default 1.
+    /// Unused in Mode 2 (periodic SCAN).
+    num_to_average: std::sync::atomic::AtomicI64,
 }
 
 /// The two status channels C's averaging device support accumulates across a
@@ -429,6 +436,7 @@ impl AverageState {
         Self {
             averager: crate::interfaces::average::SumAverager::new(),
             status: std::sync::Mutex::new(AverageStatus::default()),
+            num_to_average: std::sync::atomic::AtomicI64::new(1),
         }
     }
 }
@@ -1326,6 +1334,23 @@ impl AsynDeviceSupport {
             let _ = record.put_field(&field, value);
         }
     }
+
+    /// Snapshot the Mode 1 averaging decimation threshold from the record's
+    /// SVAL. C `interruptCallbackAverage` reads `pai->sval` live each callback
+    /// (devAsynInt32.c:674); the callback runs off the record thread here, so
+    /// the count is snapshotted into the shared atomic at init and on each
+    /// process instead — a runtime SVAL change takes effect at the next
+    /// process. `numToAverage = (int)(sval + 0.5)`, floored at 1
+    /// (devAsynInt32.c:674-675). No-op for non-averaging records.
+    fn refresh_average_decimation_threshold(&self, record: &dyn Record) {
+        if let Some(acc) = &self.average {
+            if let Some(EpicsValue::Double(sval)) = record.get_field("SVAL") {
+                let n = (sval + 0.5) as i64;
+                acc.num_to_average
+                    .store(n.max(1), std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 impl DeviceSupport for AsynDeviceSupport {
@@ -1462,6 +1487,13 @@ impl DeviceSupport for AsynDeviceSupport {
                 }
             }
         }
+
+        // Mode 1 averaging: snapshot the SVAL decimation count so the first
+        // decimation period uses the configured value before the first process
+        // refreshes it (C reads pai->sval live; devAsynInt32.c:674).
+        if self.scan == ScanType::IoIntr {
+            self.refresh_average_decimation_threshold(record);
+        }
         Ok(())
     }
 
@@ -1532,16 +1564,27 @@ impl DeviceSupport for AsynDeviceSupport {
             return Ok(DeviceReadOutcome::ok());
         }
 
-        // Averaging device support (asynInt32Average / asynFloat64Average): the
-        // always-on interrupt callback (io_intr_receiver) has been accumulating
-        // samples into the SumAverager since iocInit. On each periodic record
-        // process, drain the arithmetic mean since the last process and reset —
-        // C `processAiAverage` (devAsynInt32.c:895-918, devAsynFloat64.c:716-735).
-        // Reuses the normal ai store paths: int32 routes the rounded mean to RVAL
-        // (the ai record's convert applies ESLO/EOFF), float64 sets VAL directly
-        // (ASLO/AOFF/SMOO applied in-dset) — averaging only changes the *source*
-        // of the raw value, exactly as CmdResponse reused the octet reply→VAL.
-        if let Some(acc) = self.average.clone() {
+        // Mode 1 averaging (SCAN="I/O Intr"): the decimated mean is delivered
+        // through the IoIntr ring — `io_intr_receiver` decimates every
+        // round(SVAL) samples into `interrupt_fifo` and wakes the record (C
+        // `interruptCallbackAverage` isIOIntrScan branch, devAsynInt32.c:
+        // 673-702). Refresh the live SVAL threshold, then fall through to the
+        // ring-pop path below which drains the decimated value (C
+        // `processAiAverage` `getCallbackValue` branch, :895-898). Do NOT drain
+        // the running mean here — that is the Mode 2 periodic model.
+        if self.average.is_some() && self.scan == ScanType::IoIntr {
+            self.refresh_average_decimation_threshold(record);
+        }
+        // Mode 2 averaging (periodic SCAN): the always-on interrupt callback
+        // (io_intr_receiver) has been accumulating samples into the SumAverager
+        // since iocInit. On each periodic record process, drain the arithmetic
+        // mean since the last process and reset — C `processAiAverage`
+        // (devAsynInt32.c:895-918, devAsynFloat64.c:716-735). Reuses the normal
+        // ai store paths: int32 routes the rounded mean to RVAL (the ai record's
+        // convert applies ESLO/EOFF), float64 sets VAL directly (ASLO/AOFF/SMOO
+        // applied in-dset) — averaging only changes the *source* of the raw
+        // value, exactly as CmdResponse reused the octet reply→VAL.
+        else if let Some(acc) = self.average.clone() {
             // C `processAiAverage` computes and RESETS the accumulator
             // (numAverage=0, sum=0) BEFORE the transport-status check, so the
             // period's samples are consumed even on a transport-error cycle —
@@ -1869,12 +1912,7 @@ impl DeviceSupport for AsynDeviceSupport {
         // It is SYNCHRONOUS (register_sync_callback / C registerInterruptUser),
         // not a mailbox subscription: averaging must observe every sample, and
         // the mailbox coalesces rapid updates to the latest — which would drop
-        // samples and corrupt the mean. The callback pushes each sample into the
-        // SumAverager and stashes its driver alarm; the record processes on its
-        // own periodic SCAN and drains the mean in read(). Return None: there is
-        // no per-callback reprocess wakeup (the periodic-SCAN model; C
-        // `interruptCallbackAverage` only `scanIoRequest`s on the I/O Intr
-        // decimation path, which is the documented residual).
+        // samples and corrupt the mean.
         if let Some(acc) = self.average.clone() {
             let filter = InterruptFilter {
                 reason: Some(self.reason),
@@ -1884,14 +1922,93 @@ impl DeviceSupport for AsynDeviceSupport {
             // asynInt32Average applies the same @asynMask nbits the polled
             // read does (devAsynInt32.c:537-540); asynFloat64Average has no mask.
             let int32_mask = self.int32_mask;
+            let is_int32 = self.iface_type == "asynInt32";
+
+            // Mode 1 — SCAN="I/O Intr": C `interruptCallbackAverage` isIOIntrScan
+            // branch (devAsynInt32.c:673-702). Accumulate every sample, and every
+            // round(SVAL) samples decimate the mean into the IoIntr ring and
+            // `scanIoRequest` the record; read() drains the ring
+            // (`getCallbackValue`). The ring entry carries the TRIGGERING sample's
+            // status/alarm — C `rp->status = pasynUser->auxStatus` (:685-687), NOT
+            // the Mode 2 OR-accumulation.
+            if self.scan == ScanType::IoIntr {
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
+                let fifo = self.interrupt_fifo.clone();
+                let sub = self
+                    .handle
+                    .interrupts()
+                    .register_sync_callback(filter, move |iv| {
+                        use std::sync::atomic::Ordering;
+                        let sample = match &iv.value {
+                            crate::param::ParamValue::Int32(v) => {
+                                Some(int32_mask.map_or(*v, |m| m.apply(*v)) as f64)
+                            }
+                            crate::param::ParamValue::Float64(v) => Some(*v),
+                            _ => None,
+                        };
+                        let Some(s) = sample else {
+                            return;
+                        };
+                        // C: numAverage++; sum += value (devAsynInt32.c:665-666).
+                        acc.averager.push(s);
+                        // C: numToAverage = (int)(sval+0.5), min 1; decimate
+                        // when numAverage >= numToAverage (devAsynInt32.c:674-676).
+                        let n = acc.num_to_average.load(Ordering::Relaxed).max(1) as u64;
+                        if acc.averager.count() < n {
+                            return;
+                        }
+                        // C: dval = round(sum/numAverage); reset sum/count
+                        // (devAsynInt32.c:679-683). The checked drains reset
+                        // atomically and return Some (count >= n >= 1 here).
+                        let value = if is_int32 {
+                            crate::param::ParamValue::Int32(
+                                acc.averager.read_and_reset_int32_checked().unwrap_or(0),
+                            )
+                        } else {
+                            crate::param::ParamValue::Float64(
+                                acc.averager.read_and_reset_checked().unwrap_or(0.0),
+                            )
+                        };
+                        let entry = CachedInterrupt {
+                            value,
+                            timestamp: iv.timestamp,
+                            // C takes the triggering sample's status/alarm, NOT
+                            // an OR-accumulation (rp->status = pasynUser->
+                            // auxStatus, devAsynInt32.c:685-687).
+                            alarm_status: iv.alarm_status,
+                            alarm_severity: iv.alarm_severity,
+                            aux_status: iv.aux_status,
+                        };
+                        // C: ring full → evict oldest + overflow, NO
+                        // scanIoRequest; fresh add → scanIoRequest
+                        // (devAsynInt32.c:688-701).
+                        let was_fresh = {
+                            let mut g = fifo.lock().unwrap();
+                            g.push_with_overflow(entry)
+                        };
+                        // try_send: the callback runs inline in the driver
+                        // notify() and must not block; a full wakeup channel
+                        // means a process is already pending and will drain the
+                        // ring (C does not re-request when one is pending).
+                        if was_fresh {
+                            let _ = tx.try_send(());
+                        }
+                    });
+                self.average_callback_sub = Some(sub);
+                return Some(rx);
+            }
+
+            // Mode 2 — periodic SCAN: accumulate every sample; the periodic
+            // record process drains the running mean in read(). The callback
+            // OR-accumulates the transport status and stashes the last sample's
+            // EPICS alarm (devAsynInt32.c:705-707, devAsynFloat64.c:516-518) —
+            // once any sample is non-success the period stays a transport error
+            // (asynSuccess == 0, so the OR is sticky). Return None: no
+            // per-callback reprocess wakeup (the record scans on its own period).
             let sub = self
                 .handle
                 .interrupts()
                 .register_sync_callback(filter, move |iv| {
-                    // C `interruptCallbackAverage`: numAverage++; sum += value
-                    // (devAsynInt32.c:665-666). The two averaging dsets only ever
-                    // carry Int32 / Float64 samples (ai-only); anything else is
-                    // not an averaging sample and is ignored.
                     let sample = match &iv.value {
                         crate::param::ParamValue::Int32(v) => {
                             Some(int32_mask.map_or(*v, |m| m.apply(*v)) as f64)
@@ -1901,14 +2018,6 @@ impl DeviceSupport for AsynDeviceSupport {
                     };
                     if let Some(s) = sample {
                         acc.averager.push(s);
-                        // C `interruptCallbackAverage` per sample:
-                        //   result.status |= auxStatus;       (transport status)
-                        //   result.alarmStatus = alarmStatus; (last sample's
-                        //   result.alarmSeverity = alarmSeverity; EPICS alarm)
-                        // (devAsynInt32.c:705-707, devAsynFloat64.c:516-518).
-                        // OR-accumulating the transport status means: once any
-                        // sample is non-success the period stays a transport
-                        // error (asynSuccess == 0, so the OR is sticky).
                         let mut st = acc.status.lock().unwrap();
                         st.last_alarm = (iv.alarm_status, iv.alarm_severity);
                         if iv.aux_status != crate::error::AsynStatus::Success {
@@ -3673,6 +3782,172 @@ mod tests {
         assert!(
             (val - 42.0).abs() < 1e-9,
             "the transport error still discards the value regardless of which alarm wins"
+        );
+    }
+
+    // --- asyn Average Mode 1 (SCAN="I/O Intr" SVAL-decimation,
+    //     C `interruptCallbackAverage` isIOIntrScan branch) ---
+
+    /// Mode 1 decimates the running mean into the IoIntr ring every
+    /// `round(SVAL)` samples (C devAsynInt32.c:673-702): below the threshold
+    /// the ring stays empty; the `round(SVAL)`-th sample pushes the mean and
+    /// resets the accumulator. Unlike Mode 2, the averaging adapter returns a
+    /// per-decimation reprocess wakeup (`io_intr_receiver` → `Some`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn average_mode1_io_intr_decimates_every_sval_samples_into_ring() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut ads = make_average_adapter("asynInt32");
+        ads.set_record_info("TEST:AVG", ScanType::IoIntr); // Mode 1
+        let mut rec = AiRecord::new(0.0);
+        rec.sval = 4.0; // numToAverage = round(4.0) = 4
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let acc = ads.average.clone().unwrap();
+        let fifo = ads.interrupt_fifo.clone();
+
+        // Mode 1 delivers a reprocess wakeup channel (Mode 2 returns None).
+        assert!(
+            ads.io_intr_receiver().is_some(),
+            "Mode 1 (SCAN=I/O Intr) averaging delivers a per-decimation reprocess wakeup"
+        );
+
+        // 3 samples (< SVAL=4): accumulate, no decimation, ring stays empty.
+        for v in [10, 20, 30] {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::Int32(v),
+                timestamp: SystemTime::now(),
+                ..Default::default()
+            });
+        }
+        await_average_count(&acc, 3).await;
+        assert!(
+            fifo.lock().unwrap().pop().is_none(),
+            "3 < SVAL=4: no decimation yet, the ring is empty"
+        );
+
+        // 4th sample reaches the threshold: mean of [10,20,30,40] = 25 is
+        // pushed and the accumulator resets.
+        interrupts.notify(InterruptValue {
+            reason,
+            addr: 0,
+            value: crate::param::ParamValue::Int32(40),
+            timestamp: SystemTime::now(),
+            ..Default::default()
+        });
+        let value = await_fifo_value(&fifo).await;
+        assert!(
+            matches!(value, crate::param::ParamValue::Int32(25)),
+            "the SVAL-th sample decimates the rounded mean (round((10+20+30+40)/4) = 25) into the ring, got {value:?}"
+        );
+        assert_eq!(
+            acc.averager.count(),
+            0,
+            "decimation resets the accumulator (C numAverage=0, sum=0)"
+        );
+    }
+
+    /// C floors the decimation count at 1: `numToAverage = (int)(sval+0.5); if
+    /// (numToAverage < 1) numToAverage = 1` (devAsynInt32.c:674-675). With
+    /// SVAL=0 every single sample decimates (the mean of one sample is itself).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn average_mode1_sval_below_one_floors_to_one_sample() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut ads = make_average_adapter("asynInt32");
+        ads.set_record_info("TEST:AVG", ScanType::IoIntr);
+        let mut rec = AiRecord::new(0.0);
+        rec.sval = 0.0; // round(0.0) = 0 → floored to 1
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let fifo = ads.interrupt_fifo.clone();
+        assert!(ads.io_intr_receiver().is_some());
+
+        interrupts.notify(InterruptValue {
+            reason,
+            addr: 0,
+            value: crate::param::ParamValue::Int32(42),
+            timestamp: SystemTime::now(),
+            ..Default::default()
+        });
+        let value = await_fifo_value(&fifo).await;
+        assert!(
+            matches!(value, crate::param::ParamValue::Int32(42)),
+            "SVAL=0 floors to 1: every sample decimates, mean of one sample is itself, got {value:?}"
+        );
+    }
+
+    /// The decimated ring entry carries the TRIGGERING sample's transport
+    /// status and EPICS alarm — C `rp->status = pasynUser->auxStatus`
+    /// (devAsynInt32.c:685-687), NOT the Mode 2 OR-accumulation. Earlier
+    /// samples' error statuses are summed into the *value* but do not taint the
+    /// entry's status: only the triggering (4th) sample's status rides the ring.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn average_mode1_decimated_entry_carries_triggering_sample_status() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut ads = make_average_adapter("asynInt32");
+        ads.set_record_info("TEST:AVG", ScanType::IoIntr);
+        let mut rec = AiRecord::new(0.0);
+        rec.sval = 4.0;
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let fifo = ads.interrupt_fifo.clone();
+        assert!(ads.io_intr_receiver().is_some());
+
+        // Samples 1-3 carry a transport Timeout; they are still summed into the
+        // mean, but their status must NOT survive to the ring entry.
+        for v in [10, 20, 30] {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::Int32(v),
+                timestamp: SystemTime::now(),
+                aux_status: crate::error::AsynStatus::Timeout,
+                ..Default::default()
+            });
+        }
+        // The 4th (triggering) sample is clean (Success) but carries its own
+        // EPICS alarm; the ring entry must reflect THIS sample.
+        interrupts.notify(InterruptValue {
+            reason,
+            addr: 0,
+            value: crate::param::ParamValue::Int32(40),
+            timestamp: SystemTime::now(),
+            aux_status: crate::error::AsynStatus::Success,
+            alarm_status: 9,   // COMM_ALARM (triggering sample's own)
+            alarm_severity: 2, // MAJOR
+            ..Default::default()
+        });
+
+        // Pop the full decimated entry (await_fifo_value returns only the value).
+        let entry = {
+            let mut got = None;
+            for _ in 0..200 {
+                if let Some(e) = fifo.lock().unwrap().pop() {
+                    got = Some(e);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            got.expect("decimated entry never reached the ring")
+        };
+        assert!(
+            matches!(entry.value, crate::param::ParamValue::Int32(25)),
+            "all four samples are summed into the mean (round((10+20+30+40)/4) = 25), got {:?}",
+            entry.value
+        );
+        assert_eq!(
+            entry.aux_status,
+            crate::error::AsynStatus::Success,
+            "the entry takes the triggering sample's transport status (Success), not the OR of the earlier Timeouts"
+        );
+        assert_eq!(
+            (entry.alarm_status, entry.alarm_severity),
+            (9, 2),
+            "the entry takes the triggering sample's EPICS alarm (COMM/MAJOR)"
         );
     }
 

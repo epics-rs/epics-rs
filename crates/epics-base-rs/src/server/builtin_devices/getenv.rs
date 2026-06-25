@@ -66,17 +66,20 @@ impl DeviceSupport for GetenvDeviceSupport {
     }
 
     fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+        // C's getenv dset has a NULL `init_record` slot ({5, NULL, init_lsi,
+        // NULL, NULL}); per-record setup is the dsxt `add_lsi` / `add_stringin`
+        // (devEnviron.c), which only validate `inp.type == INST_IO` and write
+        // neither VAL nor an alarm. The env var is read lazily at record
+        // process (`read_lsi` / `read_stringin`), so init only gates the record
+        // type here — matching C and the `Soft Timestamp` sibling. VAL is
+        // populated on the record's first process (PINI / scan), not at build.
         let rtype = record.record_type();
         if !matches!(rtype, "stringin" | "lsi") {
             return Err(CaError::InvalidValue(format!(
                 "DTYP=getenv: unsupported record type '{rtype}' (use stringin or lsi)"
             )));
         }
-        // Perform the initial read so PINI / first monitor sees the resolved
-        // value rather than the empty default. Mirrors C getenvDevSup's
-        // `init_record`; an unset var is flagged at init the same way as on
-        // `read()` (VAL cleared + Err → the framework raises READ_ALARM).
-        self.read(record).map(|_| ())
+        Ok(())
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {

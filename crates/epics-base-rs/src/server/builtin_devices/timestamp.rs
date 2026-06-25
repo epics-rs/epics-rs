@@ -332,12 +332,15 @@ impl DeviceSupport for SoftTimestampDeviceSupport {
             }
             "stringin" => {
                 // C `devTimestamp.c:57-66` `read_stringin`: format the
-                // resolved stamp with the INP instio string, then return 2
-                // (VAL written directly). `epics_time_to_strftime` bounds the
-                // result to ≤39 bytes (C's `bufLenLeft` accounting), so C's
-                // `if (len >= sizeof prec->val)` overflow check is dead code
-                // — it never sets `udf`/`UDF_ALARM`/`return -1`, and neither
-                // do we: a too-long format silently truncates with no alarm.
+                // resolved stamp with the INP instio string, then return 0
+                // (stringin has no RVAL→VAL conversion to skip, so unlike
+                // `read_ai`'s `return 2` this is a plain success — `computed()`
+                // is behaviorally inert here, just consistent with `read_ai`).
+                // `epics_time_to_strftime` bounds the result to ≤39 bytes (C's
+                // `bufLenLeft` accounting), so C's `if (len >= sizeof
+                // prec->val)` overflow check is dead code — it never sets
+                // `udf`/`UDF_ALARM`/`return -1`, and neither do we: a too-long
+                // format silently truncates with no alarm.
                 let s = epics_time_to_strftime(&self.format, ts);
                 record.put_field("VAL", EpicsValue::String(s.into()))?;
                 Ok(DeviceReadOutcome::computed())

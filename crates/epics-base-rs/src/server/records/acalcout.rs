@@ -94,9 +94,10 @@ pub struct AcalcoutRecord {
     // --- result ---
     pub val: f64,
     aval: Vec<f64>,
-    /// `PVAL` — previous `VAL`. Drives the `OOPT` On-Change/Transition tests
-    /// and feeds the array engine's `VAL` token (C `aCalcPerform` reads
-    /// `prec->val` before overwriting it; `pval == val` at that point).
+    /// `PVAL` — previous `VAL`, captured at the end of `process()`. Drives the
+    /// `OOPT` On-Change/Transition tests (C `afterCalc`). The engine's `VAL`
+    /// token is fed directly from `val`/`oval` per pass (see `build_inputs`),
+    /// not from `pval`.
     pval: f64,
 
     // --- array sizing ---
@@ -275,7 +276,7 @@ impl AcalcoutRecord {
         EpicsValue::DoubleArray(out)
     }
 
-    fn build_inputs(&self, n: usize) -> ArrayInputs {
+    fn build_inputs(&self, n: usize, prev_val: f64) -> ArrayInputs {
         let mut inputs = ArrayInputs::new(n);
         for i in 0..12 {
             inputs.num_vars[i] = self.num_vals[i];
@@ -285,16 +286,21 @@ impl AcalcoutRecord {
             arr.resize(n, 0.0);
             inputs.arrays[i] = arr;
         }
-        // C `aCalcPerform`'s `VAL`/`FETCH_VAL` token reads the previous result.
-        inputs.prev_val = self.pval;
+        // C `aCalcPerform`'s `VAL`/`FETCH_VAL` token reads `*p_dresult` — the
+        // field this pass writes its result into: `prec->val` for the CALC
+        // pass, `prec->oval` for the OCAL pass (aCalcoutRecord.c CALC vs OCAL
+        // `aCalcPerform` calls; `aCalcPerform.c:528-532`). The caller supplies
+        // that field's pre-write value as `prev_val`.
+        inputs.prev_val = prev_val;
         inputs
     }
 
     /// Evaluate a compiled expression over the current inputs, returning
-    /// `(scalar, array)`. `None` ⇒ evaluation failed (C `aCalcPerform`
+    /// `(scalar, array)`. `prev_val` seeds the `VAL` token (see
+    /// [`Self::build_inputs`]). `None` ⇒ evaluation failed (C `aCalcPerform`
     /// non-zero return: an engine error OR a NaN/Inf scalar result).
-    fn eval(&self, compiled: &CompiledExpr, n: usize) -> Option<(f64, Vec<f64>)> {
-        let mut inputs = self.build_inputs(n);
+    fn eval(&self, compiled: &CompiledExpr, n: usize, prev_val: f64) -> Option<(f64, Vec<f64>)> {
+        let mut inputs = self.build_inputs(n, prev_val);
         match acalc_eval(compiled, &mut inputs) {
             Ok(result) => {
                 let v = result.as_f64().unwrap_or(0.0);
@@ -1161,7 +1167,9 @@ impl Record for AcalcoutRecord {
             if let Some(ref compiled) = self.compiled_calc {
                 // NLL: `compiled`'s last use is `eval`, so the immutable
                 // borrow ends before the `self.val`/`self.aval` writes.
-                match self.eval(compiled, n) {
+                // CALC pass: the `VAL` token reads `prec->val` (this pass's
+                // result field) before it is overwritten.
+                match self.eval(compiled, n, self.val) {
                     Some((v, arr)) => {
                         self.val = v;
                         self.aval = arr;
@@ -1177,7 +1185,10 @@ impl Record for AcalcoutRecord {
         //     OCAL, before afterCalc → oval, oav) ---
         if self.dopt == 1 && !self.ocal.is_empty() {
             if let Some(ref compiled) = self.compiled_ocal {
-                match self.eval(compiled, n) {
+                // OCAL pass: the `VAL` token reads `prec->oval` (this pass's
+                // result field, C `p_dresult = &oval`), NOT `prec->val`, so an
+                // OCAL accumulator like "VAL+1" runs on OVAL.
+                match self.eval(compiled, n, self.oval) {
                     Some((v, arr)) => {
                         self.oval = v;
                         self.oav = arr;
@@ -1973,6 +1984,26 @@ mod tests {
         rec.put_field("DOPT", EpicsValue::Short(1)).unwrap();
         rec.process().unwrap();
         assert_eq!(rec.multi_output_links(), &[("OUT", "OAV")]);
+    }
+
+    /// The OCAL pass's `VAL` token reads the previous `OVAL` (C `p_dresult =
+    /// &oval`), not the previous `VAL`, so an `OCAL` accumulator runs on OVAL.
+    /// CALC pins VAL=5 each cycle; OVAL must accumulate 10/20/30. If `VAL` read
+    /// `prec->val` it would stall at 15.
+    #[test]
+    fn test_acalcout_ocal_val_token_reads_oval() {
+        let mut rec = AcalcoutRecord::new();
+        rec.put_field("CALC", EpicsValue::String("5".into()))
+            .unwrap();
+        rec.put_field("OCAL", EpicsValue::String("VAL+10".into()))
+            .unwrap();
+        rec.put_field("DOPT", EpicsValue::Short(1)).unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.get_field("OVAL"), Some(EpicsValue::Double(10.0)));
+        rec.process().unwrap();
+        assert_eq!(rec.get_field("OVAL"), Some(EpicsValue::Double(20.0)));
+        rec.process().unwrap();
+        assert_eq!(rec.get_field("OVAL"), Some(EpicsValue::Double(30.0)));
     }
 
     #[test]

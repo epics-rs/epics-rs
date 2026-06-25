@@ -1685,8 +1685,14 @@ impl DeviceSupport for AsynDeviceSupport {
         // record type so process calls read(), not write(). Perform the write
         // here instead. The binary variant sends the full NORD bytes (no NUL-trim);
         // the text variant trims at the first NUL via write_op.
+        //
+        // Route through `device_output_value` like the write()/write_begin()
+        // entries so the raw-output anchor invariant holds by construction, not
+        // by "this path is octet-only": for asynOctet it returns VAL unchanged
+        // (the `_` arm), but a future scalar write_only DTYP would then anchor on
+        // RVAL/OVAL automatically instead of silently bypassing it.
         if self.write_only {
-            if let Some(val) = record.val() {
+            if let Some(val) = self.device_output_value(&*record) {
                 let op = if self.octet_binary {
                     self.binary_write_op(&*record, &val)
                 } else {

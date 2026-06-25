@@ -45,9 +45,19 @@ const EPICS_EPOCH_OFFSET_SECS: u64 = 631_152_000;
 /// (nanoseconds). A `%f` token wider than this is clamped to it.
 const NSEC_FRAC_DIGITS: u32 = 9;
 
-/// `stringin` `VAL` is a `char[40]` buffer in C; `read_stringin` flags
-/// `UDF` when the formatted length reaches the full buffer size.
+/// `stringin` `VAL` is a `char[40]` buffer in C; it is the `bufLength`
+/// passed to `epicsTimeToStrftime`, which writes into it with running
+/// `bufLenLeft` accounting and always leaves room for the NUL — so the
+/// formatted output is bounded to `STRINGIN_VAL_BYTES - 1` = 39 visible
+/// bytes. C `read_stringin`'s `if (len >= sizeof prec->val)` overflow check
+/// is therefore structurally unreachable (dead code) and never raises an
+/// alarm; this port mirrors the bounded write so the same holds.
 const STRINGIN_VAL_BYTES: usize = 40;
+
+/// C `epicsTimeToStrftime`'s `char strftimePrefixBuf[256]` — the temporary
+/// buffer the strftime prefix (the text between fractional tokens) is built
+/// in. A prefix segment that does not fit it formats to `<invalid format>`.
+const STRFTIME_PREFIX_BUF: usize = 256;
 
 /// `(secPastEpoch, nsec)` of a resolved time stamp counted from the EPICS
 /// epoch (1990-01-01), exactly as C `epicsTimeStamp`. A stamp at or before
@@ -77,6 +87,15 @@ fn epics_time_parts(ts: SystemTime) -> (u64, u32) {
 /// A `%%` is a literal percent and stays in the prefix (C advances past
 /// both characters); a `%0f`/`%f`-less specifier with `n == 0` is a normal
 /// strftime field, not a fractional token (C requires `result > 0`).
+///
+/// Width parsing is a plain ASCII-digit scan, where C uses `strtoul`. This
+/// diverges only on widths no real format carries: C's `strtoul` skips
+/// leading whitespace and accepts a sign (`% 3f`/`%+3f` → 3, `%-3f` →
+/// huge→clamped to 9) and parses the full 64-bit range (`%9999999999f` →
+/// clamped to 9), whereas this scan treats those as literal strftime text.
+/// Deliberately not replicated — matching `strtoul`'s sign/whitespace/64-bit
+/// quirks for a malformed fractional-width token is complexity against
+/// inputs that never occur.
 fn frac_format_find(fmt: &str) -> (&str, Option<u32>, Option<&str>) {
     let bytes = fmt.as_bytes();
     let mut i = 0;
@@ -127,47 +146,106 @@ fn format_strftime_prefix(prefix: &str, dt: &DateTime<Local>) -> String {
     dt.format_with_items(items.into_iter()).to_string()
 }
 
-/// C `epicsTimeToStrftime` (`epicsTime.cpp:169-270`): format `ts` with a
-/// (possibly fractional-second-bearing) strftime format string.
+/// Append `s` to `out` truncated so it occupies at most `buf_len_left - 1`
+/// bytes, mirroring C's `memcpy`/`strncpy` cap that always leaves room for
+/// the NUL (`epicsTime.cpp:256-262`, `:268-274`). Returns the bytes
+/// appended. Every caller passes ASCII (`<undefined>`, the `OVF`/`*`/
+/// `<invalid format>` sentinels, a decimal digit string), so a byte cut is
+/// also a char boundary.
+fn push_truncated(out: &mut String, s: &str, buf_len_left: usize) -> usize {
+    let n = s.len().min(buf_len_left.saturating_sub(1));
+    out.push_str(&s[..n]);
+    n
+}
+
+/// C `epicsTimeToStrftime` (`epicsTime.cpp:169-279`): format `ts` with a
+/// (possibly fractional-second-bearing) strftime format string, into a
+/// bounded `STRINGIN_VAL_BYTES` buffer.
+///
+/// The C routine writes into a caller-supplied `char[bufLength]` tracking
+/// `bufLenLeft`, so its result is always `< bufLength` bytes and a field
+/// that does not fit is either omitted whole (strftime returns 0) or
+/// replaced by a sentinel (`<invalid format>` for a ≥256-byte prefix
+/// segment, `************` for a fractional field with no room). This port
+/// reproduces that bounded accounting so the formatted string is ≤39 bytes
+/// and `read_stringin`'s `len >= 40` overflow branch stays unreachable — C
+/// never raises an alarm from it, and neither does this port.
 fn epics_time_to_strftime(format: &str, ts: SystemTime) -> String {
     let (sec_past_epoch, nsec) = epics_time_parts(ts);
+    let mut out = String::new();
+    // C `bufLength` = `sizeof prec->val` = STRINGIN_VAL_BYTES; `bufLenLeft`
+    // counts the NUL slot. `bufLength == 0` cannot occur here.
+    let mut buf_len_left = STRINGIN_VAL_BYTES;
+
     // C `epicsTime.cpp:176`: an epoch (uninitialized) stamp formats to the
     // literal sentinel.
     if sec_past_epoch == 0 && nsec == 0 {
-        return "<undefined>".to_string();
+        push_truncated(&mut out, "<undefined>", buf_len_left);
+        return out;
     }
 
     let dt: DateTime<Local> = ts.into();
-    let mut out = String::new();
     let mut rest = format;
-    loop {
+    // C `epicsTime.cpp:185`: `while (*pFmt != '\0' && bufLenLeft > 1)`.
+    while !rest.is_empty() && buf_len_left > 1 {
         let (prefix, frac, after) = frac_format_find(rest);
+
+        // C `epicsTime.cpp:144-161`/`:156-161`: a strftime prefix segment
+        // that does not fit `strftimePrefixBuf[256]` formats to
+        // `<invalid format>`, drops the fractional token, and stops.
+        if prefix.len() >= STRFTIME_PREFIX_BUF {
+            push_truncated(&mut out, "<invalid format>", buf_len_left);
+            break;
+        }
+
         // C `epicsTime.cpp:196`: nothing more to format → quit.
         if prefix.is_empty() && frac.is_none() {
             break;
         }
+
+        // C `epicsTime.cpp:200-208`: strftime the prefix. `strftime` writes
+        // only when the result (incl. NUL) fits `bufLenLeft`, otherwise it
+        // returns 0 and writes nothing — the whole field is omitted, never
+        // cut mid-field.
         if !prefix.is_empty() {
-            out.push_str(&format_strftime_prefix(prefix, &dt));
-        }
-        if let Some(w) = frac {
-            // Bare `%f` (u32::MAX) clamps to NSEC_FRAC_DIGITS; `%Nf` keeps N.
-            let width = w.min(NSEC_FRAC_DIGITS) as usize;
-            // C `epicsTime.cpp:222-239`: `div = 10^(9-width)`,
-            // `frac = nsec + div/2` clamped below 1e9, then `frac /= div` —
-            // rounding the nanosecond field to `width` digits without a
-            // carry into whole seconds.
-            let div = 10u64.pow(NSEC_FRAC_DIGITS - width as u32);
-            let mut f = nsec as u64 + div / 2;
-            if f >= 1_000_000_000 {
-                f = 1_000_000_000 - 1;
+            let formatted = format_strftime_prefix(prefix, &dt);
+            if formatted.len() < buf_len_left {
+                out.push_str(&formatted);
+                buf_len_left -= formatted.len();
             }
-            f /= div;
-            out.push_str(&format!("{f:0width$}"));
         }
-        match after {
-            Some(a) if !a.is_empty() => rest = a,
-            _ => break,
+
+        // C `epicsTime.cpp:210-277`: fractional seconds.
+        if let Some(w) = frac {
+            if buf_len_left > 1 {
+                // Bare `%f` (u32::MAX) clamps to NSEC_FRAC_DIGITS; `%Nf` keeps N.
+                let width = w.min(NSEC_FRAC_DIGITS) as usize;
+                if width < buf_len_left {
+                    // C `epicsTime.cpp:222-239`: `div = 10^(9-width)`,
+                    // `frac = nsec + div/2` clamped below 1e9, then
+                    // `frac /= div` — rounding the nanosecond field to
+                    // `width` digits without a carry into whole seconds.
+                    // `nsec < 1e9` always (`subsec_nanos`), so the C `OVF`
+                    // branch (`:253-263`) is dead here exactly as in C.
+                    let div = 10u64.pow(NSEC_FRAC_DIGITS - width as u32);
+                    let mut f = nsec as u64 + div / 2;
+                    if f >= 1_000_000_000 {
+                        f = 1_000_000_000 - 1;
+                    }
+                    f /= div;
+                    // `"%0<width>lu"` of `f < 10^width` → exactly `width` digits.
+                    let digits = format!("{f:0width$}");
+                    buf_len_left -= push_truncated(&mut out, &digits, buf_len_left);
+                } else {
+                    // C `epicsTime.cpp:265-276`: fractional field does not fit
+                    // the remaining buffer → `************`, then stop.
+                    push_truncated(&mut out, "************", buf_len_left);
+                    break;
+                }
+            }
         }
+
+        rest = after.unwrap_or("");
     }
     out
 }
@@ -237,19 +315,14 @@ impl DeviceSupport for SoftTimestampDeviceSupport {
             }
             "stringin" => {
                 // C `devTimestamp.c:57-66` `read_stringin`: format the
-                // resolved stamp with the INP instio string.
+                // resolved stamp with the INP instio string, then return 2
+                // (VAL written directly). `epics_time_to_strftime` bounds the
+                // result to ≤39 bytes (C's `bufLenLeft` accounting), so C's
+                // `if (len >= sizeof prec->val)` overflow check is dead code
+                // — it never sets `udf`/`UDF_ALARM`/`return -1`, and neither
+                // do we: a too-long format silently truncates with no alarm.
                 let s = epics_time_to_strftime(&self.format, ts);
-                // C: `if (len >= sizeof prec->val) { udf = TRUE;
-                // recGblSetSevr(UDF_ALARM); return -1; }`. The stringin body
-                // truncates the write to 39 visible bytes (as C leaves the
-                // buffer); the Err signals the framework to flag the record.
-                let overflow = s.len() >= STRINGIN_VAL_BYTES;
                 record.put_field("VAL", EpicsValue::String(s.into()))?;
-                if overflow {
-                    return Err(CaError::InvalidValue(
-                        "Soft Timestamp: formatted time does not fit the 40-byte VAL".into(),
-                    ));
-                }
                 Ok(DeviceReadOutcome::computed())
             }
             // init() gated the record type to ai / stringin.
@@ -413,5 +486,59 @@ mod tests {
         assert!(epics_time_to_strftime("%S.%9f", t).ends_with(".250000000"));
         // width 1: round(2.5) → 3 (0.25 s to 1 digit, C +div/2 rounds up)
         assert!(epics_time_to_strftime("%S.%1f", t).ends_with(".3"));
+    }
+
+    /// C `epicsTimeToStrftime` writes into a fixed 40-byte buffer, so its
+    /// result is ALWAYS ≤39 bytes and `read_stringin`'s `len >= 40` check is
+    /// dead code — a too-long format truncates silently with NO alarm. A
+    /// `stringin` processed with a format whose natural output exceeds 39
+    /// bytes must therefore return `Ok(computed())` (not the old spurious
+    /// `Err`) and leave VAL ≤39 bytes.
+    #[test]
+    fn stringin_long_format_truncates_without_alarm() {
+        // A `%3f` token splits the format: the date segment + 3-digit
+        // fraction fit, but the long trailing literal overflows the 40-byte
+        // buffer and is omitted whole (C strftime returns 0 → writes nothing).
+        let fmt = "@%Y-%m-%d %H:%M:%S.%3f trailing zzzzzzzzzzzzzzzzzzzzzzzzz";
+        let mut dev = SoftTimestampDeviceSupport::new(fmt);
+        let mut rec = StringinRecord::new("");
+        dev.set_process_context(&ctx_device_time(fixed_device_time()));
+        let outcome = dev.read(&mut rec).expect("no alarm on a too-long format");
+        assert!(outcome.did_compute, "stringin read returns computed (C: 2)");
+        match rec.get_field("VAL") {
+            Some(EpicsValue::String(s)) => {
+                let s = s.as_str_lossy();
+                assert!(s.starts_with("2001-"), "date segment kept, got {s:?}");
+                assert!(s.ends_with(".250"), "3-digit fraction kept, got {s:?}");
+                assert!(
+                    !s.contains('z'),
+                    "overflowing tail omitted whole, got {s:?}"
+                );
+                assert!(s.len() <= 39, "VAL bounded to ≤39 bytes, got {}", s.len());
+            }
+            other => panic!("expected String VAL, got {other:?}"),
+        }
+    }
+
+    /// C `epicsTime.cpp:265-276`: when a fractional field has no room left in
+    /// the buffer, C emits `************` (capped to fit) and stops. A 35-byte
+    /// literal prefix leaves 5 bytes (`bufLenLeft`); a `%9f` (width 9 ≥ 5)
+    /// does not fit → `****` (capped to `bufLenLeft - 1 = 4`).
+    #[test]
+    fn strftime_fractional_field_overflow_emits_stars() {
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let prefix = "x".repeat(35);
+        let out = epics_time_to_strftime(&format!("{prefix}%9f"), t);
+        assert_eq!(out, format!("{prefix}****"));
+        assert_eq!(out.len(), 39);
+    }
+
+    /// C `epicsTime.cpp:156-161`: a strftime prefix segment that overflows
+    /// `strftimePrefixBuf[256]` formats to `<invalid format>` and stops.
+    #[test]
+    fn strftime_prefix_too_long_emits_invalid_format() {
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let out = epics_time_to_strftime(&format!("{}%f", "a".repeat(256)), t);
+        assert_eq!(out, "<invalid format>");
     }
 }

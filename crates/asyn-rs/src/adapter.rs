@@ -1364,35 +1364,61 @@ impl AsynDeviceSupport {
         out
     }
 
-    /// Reverse the `asynFloat64` ao `ASLO`/`AOFF` linear scaling before the
-    /// device write — the inverse of [`Record::apply_float64_readback`]. C
-    /// `processAo` writes `val64 = pr->oval - pr->aoff; if(aslo!=0) val64 /=
-    /// aslo` to the device (devAsynFloat64.c:651-654). Without this the asyn
-    /// readback (forward scaling) and the device write would be asymmetric: a
-    /// `VAL` written out, read back, and re-scaled would not round-trip. Only
-    /// the `asynFloat64` path with a `Double` value scales; everything else is
-    /// returned unchanged. `ASLO`/`AOFF` are read live (the unconfigured ao
-    /// defaults ASLO=1/AOFF=0 → identity, no behaviour change). `VAL` is the
-    /// device anchor (Rust writes `VAL`, not the OROC-rate-limited `OVAL`, for
-    /// every output — an orthogonal pre-existing divergence).
-    fn apply_float64_output_reverse(&self, record: &dyn Record, val: EpicsValue) -> EpicsValue {
-        if self.iface_type != "asynFloat64" {
-            return val;
+    /// The raw value an output record sends to the device — the write-side
+    /// twin of [`AsynDeviceSupport::store_read_value`]'s readback. C device
+    /// support writes the record's raw, post-OROC output, **not** the
+    /// engineering `VAL`:
+    /// - `asynInt32` / `asynUInt32Digital`: `pr->rval`, the raw the record's
+    ///   convert produced from `OVAL` — `processAo` (devAsynInt32.c:997),
+    ///   `processMbbo` (:1332), `processBo` (:1206), `processMbboDirect`
+    ///   (devAsynUInt32Digital.c). `longout`/`int64out` carry no `RVAL` (VAL
+    ///   *is* the raw) so they keep `VAL`, matching `processLongout`.
+    /// - `asynFloat64` ao: `(OVAL - AOFF) / ASLO`, anchored on the
+    ///   OROC-rate-limited `OVAL` (devAsynFloat64.c:651-654) — the inverse of
+    ///   [`Record::apply_float64_readback`], so a value written, read back, and
+    ///   re-scaled round-trips.
+    ///
+    /// `RVAL`/`OVAL` are current here: the OUT stage runs after the record's
+    /// convert (the soft OUT-link write already anchors on `OVAL`). Default
+    /// ASLO=1/AOFF=0 and an identity LINR keep `rval == val`, so the
+    /// unconfigured output is unchanged. The previous `record.val()` anchor
+    /// dropped the eng→raw conversion (int32 ao/mbbo) and OROC ramping
+    /// (float64 ao) at the device.
+    fn device_output_value(&self, record: &dyn Record) -> Option<EpicsValue> {
+        match self.iface_type.as_str() {
+            "asynFloat64" => {
+                // Anchor on OVAL (post-OROC); fall back to VAL if absent.
+                let oval = match record.get_field("OVAL") {
+                    Some(EpicsValue::Double(o)) => Some(o),
+                    _ => match record.val() {
+                        Some(EpicsValue::Double(v)) => Some(v),
+                        _ => None,
+                    },
+                };
+                match oval {
+                    Some(oval) => {
+                        let field = |name: &str| match record.get_field(name) {
+                            Some(EpicsValue::Double(x)) => x,
+                            _ => 0.0,
+                        };
+                        let aslo = field("ASLO");
+                        let aoff = field("AOFF");
+                        let mut out = oval - aoff;
+                        if aslo != 0.0 {
+                            out /= aslo;
+                        }
+                        Some(EpicsValue::Double(out))
+                    }
+                    None => record.val(),
+                }
+            }
+            "asynInt32" | "asynUInt32Digital" => match record.get_field("RVAL") {
+                Some(EpicsValue::Long(r)) => Some(EpicsValue::Long(r)),
+                Some(EpicsValue::ULong(r)) => Some(EpicsValue::Long(r as i32)),
+                _ => record.val(),
+            },
+            _ => record.val(),
         }
-        let EpicsValue::Double(v) = val else {
-            return val;
-        };
-        let field = |name: &str| match record.get_field(name) {
-            Some(EpicsValue::Double(x)) => x,
-            _ => 0.0,
-        };
-        let aslo = field("ASLO");
-        let aoff = field("AOFF");
-        let mut out = v - aoff;
-        if aslo != 0.0 {
-            out /= aslo;
-        }
-        EpicsValue::Double(out)
     }
 
     /// Push a driver's asynEnum table onto the record's state fields at init
@@ -1930,8 +1956,7 @@ impl DeviceSupport for AsynDeviceSupport {
         if !self.reason_set {
             return Ok(());
         }
-        if let Some(val) = record.val() {
-            let val = self.apply_float64_output_reverse(record, val);
+        if let Some(val) = self.device_output_value(record) {
             if let Some(op) = self.write_op(&val) {
                 let user = AsynUser::new(self.reason)
                     .with_addr(self.addr)
@@ -2003,7 +2028,9 @@ impl DeviceSupport for AsynDeviceSupport {
         &mut self,
         record: &mut dyn Record,
     ) -> CaResult<Option<Box<dyn WriteCompletion>>> {
-        let val = match record.val() {
+        // Same raw-output anchor as the synchronous write() — the async path
+        // (blocking ports, e.g. motors) must not bypass the RVAL/OVAL anchor.
+        let val = match self.device_output_value(record) {
             Some(v) => v,
             None => return Ok(None),
         };
@@ -5571,10 +5598,11 @@ mod tests {
         );
     }
 
-    /// The device write for an `asynFloat64` ao applies the reverse `ASLO`/`AOFF`
-    /// scaling (`device = (VAL - AOFF) / ASLO`), the inverse of the readback. C
-    /// `processAo` (devAsynFloat64.c:651-654). Together they round-trip: a VAL
-    /// written out, read back, re-scaled returns the same VAL.
+    /// The device write for an `asynFloat64` ao reverses `ASLO`/`AOFF` and
+    /// anchors on the OROC-rate-limited `OVAL`: `device = (OVAL - AOFF) / ASLO`
+    /// (C `processAo`, devAsynFloat64.c:651-654) — the inverse of the readback.
+    /// Together they round-trip: a value written out, read back, re-scaled
+    /// returns the same value.
     #[test]
     fn float64_ao_write_reverses_aslo_aoff_and_round_trips() {
         use epics_base_rs::server::records::ao::AoRecord;
@@ -5582,14 +5610,15 @@ mod tests {
         let mut rec = AoRecord::new(0.0);
         rec.aslo = 2.0;
         rec.aoff = 1.0;
-        // VAL = 21 -> device = (21 - 1) / 2 = 10.
-        let written = ads.apply_float64_output_reverse(&rec, EpicsValue::Double(21.0));
+        rec.oval = 21.0; // post-OROC output the device write anchors on
+        // OVAL = 21 -> device = (21 - 1) / 2 = 10.
+        let written = ads.device_output_value(&rec).unwrap();
         assert_eq!(
             written,
             EpicsValue::Double(10.0),
-            "device = (VAL - AOFF) / ASLO = (21 - 1) / 2 = 10"
+            "device = (OVAL - AOFF) / ASLO = (21 - 1) / 2 = 10"
         );
-        // Round-trip: that device value, read back, re-scales to the original VAL.
+        // Round-trip: that device value, read back, re-scales to the original.
         let mut readback = AoRecord::new(0.0);
         readback.aslo = 2.0;
         readback.aoff = 1.0;
@@ -5600,7 +5629,26 @@ mod tests {
         assert_eq!(
             readback.val(),
             Some(EpicsValue::Double(21.0)),
-            "readback of (VAL-AOFF)/ASLO re-scales to the original VAL"
+            "readback of (OVAL-AOFF)/ASLO re-scales to the original output"
+        );
+    }
+
+    /// The asynFloat64 ao write anchors on OVAL (post-OROC), not VAL: when OROC
+    /// has rate-limited the output, the device receives the ramped OVAL while
+    /// VAL holds the (jumped) setpoint. C `processAo` uses `pr->oval`
+    /// (devAsynFloat64.c:651).
+    #[test]
+    fn float64_ao_write_anchors_on_oval_not_val() {
+        use epics_base_rs::server::records::ao::AoRecord;
+        let ads = make_float64_io_intr_adapter();
+        let mut rec = AoRecord::new(0.0);
+        // ASLO=1/AOFF=0 (identity scaling) to isolate the OVAL-vs-VAL anchor.
+        rec.put_field("VAL", EpicsValue::Double(100.0)).unwrap(); // setpoint
+        rec.oval = 40.0; // OROC ramped only partway this cycle
+        assert_eq!(
+            ads.device_output_value(&rec).unwrap(),
+            EpicsValue::Double(40.0),
+            "device receives the OROC-rate-limited OVAL (40), not the VAL setpoint (100)"
         );
     }
 
@@ -5620,10 +5668,63 @@ mod tests {
             Some(EpicsValue::Double(7.5)),
             "default readback is identity (raw*1 + 0)"
         );
+        rec.oval = 7.5;
         assert_eq!(
-            ads.apply_float64_output_reverse(&rec, EpicsValue::Double(7.5)),
+            ads.device_output_value(&rec).unwrap(),
             EpicsValue::Double(7.5),
             "default write is identity ((7.5-0)/1)"
+        );
+    }
+
+    /// An asynInt32 ao writes its raw RVAL (the convert output from OVAL), not
+    /// the engineering VAL. C `processAo` writes `pr->rval`
+    /// (devAsynInt32.c:997). With a LINEAR conversion VAL≠RVAL, so this is
+    /// observable. (RVAL = convert(VAL) is exercised by the ao convert/readback
+    /// tests; here it is seeded directly to isolate the device-write anchor.)
+    #[test]
+    fn int32_ao_write_sends_rval_not_eng_val() {
+        use epics_base_rs::server::records::ao::AoRecord;
+        let ads = make_adapter(ScanType::Passive); // asynInt32
+        let mut rec = AoRecord::new(0.0);
+        rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap(); // engineering
+        rec.rval = 20; // raw counts (e.g. ESLO=0.5: 10 / 0.5 = 20)
+        assert_eq!(
+            ads.device_output_value(&rec).unwrap(),
+            EpicsValue::Long(20),
+            "device receives RVAL (20 counts), not eng VAL (10)"
+        );
+    }
+
+    /// An asynInt32 mbbo writes its state-mapped RVAL, not the VAL index. C
+    /// `processMbbo` writes `pr->rval` (devAsynInt32.c:1332). RVAL is ULong and
+    /// must be coerced to the Int32 write type.
+    #[test]
+    fn int32_mbbo_write_sends_state_rval_not_index() {
+        use epics_base_rs::server::records::mbbo::MbboRecord;
+        let ads = make_adapter(ScanType::Passive); // asynInt32
+        let mut rec = MbboRecord::new(0);
+        // RVAL holds the state value (e.g. 0x2A) while VAL holds the index.
+        rec.put_field("RVAL", EpicsValue::ULong(0x2A)).unwrap();
+        assert_eq!(
+            ads.device_output_value(&rec).unwrap(),
+            EpicsValue::Long(0x2A),
+            "device receives the state-mapped RVAL (0x2A), not the VAL index"
+        );
+    }
+
+    /// longout carries no RVAL (VAL *is* the raw), so the device write stays on
+    /// VAL — matching C `processLongout` (writes `pr->val`). Confirms the
+    /// RVAL-anchor does not over-reach to conversion-less outputs.
+    #[test]
+    fn int32_longout_write_keeps_val() {
+        use epics_base_rs::server::records::longout::LongoutRecord;
+        let ads = make_adapter(ScanType::Passive); // asynInt32
+        let rec = LongoutRecord::new(77);
+        assert!(rec.get_field("RVAL").is_none(), "longout has no RVAL");
+        assert_eq!(
+            ads.device_output_value(&rec).unwrap(),
+            EpicsValue::Long(77),
+            "longout device write stays on VAL (no RVAL to anchor)"
         );
     }
 

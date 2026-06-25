@@ -1313,14 +1313,18 @@ impl DeviceSupport for AsynDeviceSupport {
             return Ok(DeviceReadOutcome::ok());
         }
 
-        // asynOctetCmdResponse with an EMPTY command is a misconfiguration: C
-        // initCmdBuffer (devAsynOctet.c:632-637) rejects it outright —
-        // recGblSetSevr(prec, LINK_ALARM, INVALID_ALARM) + INIT_ERROR so the
-        // record comes up dead. Hold the record at LINK_ALARM/INVALID and do no
-        // I/O: writing an empty command to the device every process is
-        // meaningless. octet_cmd is None for a plain asynOctetRead, so this only
-        // fires for a CmdResponse record whose DRVINFO escaped to nothing.
-        if self.octet_cmd.as_deref().is_some_and(|c| c.is_empty()) {
+        // asynOctetCmdResponse misconfiguration: C initCmdBuffer
+        // (devAsynOctet.c:631-637) rejects the command outright —
+        // recGblSetSevr(prec, LINK_ALARM, INVALID_ALARM) + INIT_ERROR — when, and
+        // ONLY when, the RAW userParam (the pre-escape DRVINFO) is empty:
+        // `strlen(pPvt->userParam) == 0`. The translated byte length (bufLen) is
+        // computed later (:641) and may be 0 for a non-empty DRVINFO that escapes
+        // to a leading NUL — that case is NOT rejected; C does a 0-byte
+        // writeIt+readIt. So gate the reject on the raw DRVINFO, not on the
+        // post-truncation command: a Some(empty) octet_cmd from a leading-NUL
+        // command falls through to a 0-byte OctetWriteRead. octet_cmd is None for
+        // a plain asynOctetRead, so this only fires for a CmdResponse record.
+        if self.octet_cmd.is_some() && self.drv_info.is_empty() {
             self.last_alarm_status = epics_base_rs::server::recgbl::alarm_status::LINK_ALARM;
             self.last_alarm_severity = epics_base_rs::server::record::AlarmSeverity::Invalid as u16;
             return Ok(DeviceReadOutcome::ok());
@@ -1818,10 +1822,11 @@ pub fn universal_asyn_factory(
         // C initCmdBuffer (devAsynOctet.c:639-641) runs dbTranslateEscape then
         // bufLen = strlen(buffer): an escaped NUL (\0 / \000) terminates the
         // command, so only the bytes up to the first NUL are written. Truncate
-        // at the first NUL to match the bytes C actually puts on the wire. A
-        // command that is empty after this (DRVINFO empty, or a leading NUL ->
-        // strlen 0) is rejected by the read() guard with LINK_ALARM/INVALID,
-        // mirroring C's INIT_ERROR path for an empty command.
+        // at the first NUL to match the bytes C actually puts on the wire. The
+        // truncated command may be empty (a leading-NUL command, strlen 0); that
+        // is NOT a misconfiguration — C still writes 0 bytes then reads. Only a
+        // raw-empty DRVINFO is rejected, and that is gated in read() on the raw
+        // drv_info (C `strlen(userParam)`), not on this truncated command.
         let mut cmd = crate::asyn_record::translate_escape(&adapter.drv_info);
         if let Some(nul) = cmd.iter().position(|&b| b == 0) {
             cmd.truncate(nul);
@@ -3799,6 +3804,60 @@ mod tests {
         );
     }
 
+    /// A LEADING-NUL command (raw DRVINFO non-empty, escapes to a leading NUL so
+    /// the truncated command is empty) is NOT a misconfiguration: C keys the
+    /// empty-reject on strlen(userParam) — the RAW pre-escape DRVINFO
+    /// (devAsynOctet.c:631-632) — which is non-empty here, so it computes
+    /// bufLen=0 and does a 0-byte writeIt+readIt with NO alarm. base-rs must do
+    /// the same, NOT raise LINK_ALARM (which is reserved for a raw-empty DRVINFO).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cmd_response_leading_nul_command_writes_zero_bytes_no_alarm() {
+        use epics_base_rs::server::ioc_app::DeviceSupportContext;
+        use epics_base_rs::server::records::stringin::StringinRecord;
+
+        let (handle, (writes, sequence)) = spawn_cmd_response_port("cmdresp_lnul", b"OK");
+        crate::asyn_record::register_port(
+            "cmdresp_lnul",
+            handle,
+            Arc::new(crate::trace::TraceManager::new()),
+        );
+
+        // Raw DRVINFO "\000CD" is non-empty (C strlen != 0 -> no reject); it
+        // escapes to [0x00,'C','D'] and truncates at the leading NUL -> empty
+        // command -> C writes 0 bytes then reads.
+        let ctx = DeviceSupportContext {
+            dtyp: "asynOctetCmdResponse",
+            inp: "@asyn(cmdresp_lnul,0)\\000CD",
+            out: "",
+        };
+        let mut dev = universal_asyn_factory(&ctx).expect("factory builds the device");
+
+        let mut rec = StringinRecord::new("");
+        dev.init(&mut rec).unwrap();
+        dev.read(&mut rec).unwrap();
+
+        // A single 0-byte write, then the read — no LINK_ALARM, unlike a
+        // raw-empty DRVINFO.
+        assert_eq!(
+            writes.lock().unwrap().clone(),
+            vec![Vec::<u8>::new()],
+            "a leading-NUL command writes exactly 0 bytes (C bufLen=0)"
+        );
+        let seq = sequence.lock().unwrap().clone();
+        assert_eq!(
+            seq,
+            vec!["write", "read"],
+            "0-byte write then read: {seq:?}"
+        );
+        assert_eq!(
+            dev.last_alarm(),
+            None,
+            "a leading-NUL command must NOT raise LINK_ALARM (C does not reject it)"
+        );
+        // The reply still lands in VAL.
+        assert_eq!(rec.get_field("VAL"), Some(EpicsValue::String("OK".into())));
+    }
+
     /// The asynOctetCmdResponse reply reaches an array-backed (waveform CHAR)
     /// record's VAL, not only a string record — the octet reply→VAL coercion
     /// holds for the CharArray shape. Built with the factory's octet_cmd +
@@ -3813,7 +3872,9 @@ mod tests {
             port_name: "cmdresp_wf".into(),
             addr: 0,
             timeout: Duration::from_secs(1),
-            drv_info: String::new(),
+            // Raw DRVINFO must match the cached command: the empty-reject guard
+            // keys on a non-empty raw drv_info (C strlen(userParam)).
+            drv_info: "PING\\r".to_string(),
         };
         let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
         // Mirror the factory: cache the escaped command + pre-set reason_set.
@@ -3844,7 +3905,8 @@ mod tests {
             port_name: "cmdresp_lsi".into(),
             addr: 0,
             timeout: Duration::from_secs(1),
-            drv_info: String::new(),
+            // Raw DRVINFO must match the cached command (see the waveform case).
+            drv_info: "READ?\\n".to_string(),
         };
         let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
         ads.octet_cmd = Some(crate::asyn_record::translate_escape("READ?\\n"));

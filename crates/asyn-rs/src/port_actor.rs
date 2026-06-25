@@ -787,7 +787,15 @@ impl PortActor {
                 // /timeout) read returned clean (no INVALID, UDF-clearing).
                 let (alarm_status, alarm_severity) =
                     combine_read_alarm(status, alarm_status, alarm_severity);
-                return Ok(r.with_alarm(alarm_status, alarm_severity, ts));
+                // Carry the device read status (C pasynUser->auxStatus) to the
+                // device-support consumer so it can gate the value store the way
+                // C processAi does (store iff result.status == asynSuccess,
+                // devAsynInt32.c:848-855). Kept distinct from `status` (the
+                // op/request outcome) so the network reply path — which keys on
+                // `status` to emit an Error reply — is unaffected.
+                let mut out = r.with_alarm(alarm_status, alarm_severity, ts);
+                out.aux_status = status;
+                return Ok(out);
             }
         }
 
@@ -954,6 +962,15 @@ mod tests {
         assert_eq!(result.int_val, Some(5));
         assert_eq!(result.alarm_status, al::READ_ALARM);
         assert_eq!(result.alarm_severity, AlarmSeverity::Invalid as u16);
+        // The transport status is also carried as aux_status (distinct from the
+        // op-level `status`, which stays Success) so device support can gate the
+        // value store on it — C processAi (devAsynInt32.c:848-855).
+        assert_eq!(result.aux_status, AsynStatus::Error);
+        assert_eq!(
+            result.status,
+            AsynStatus::Success,
+            "op-level status stays Success so the network reply path is unaffected"
+        );
     }
 
     #[test]

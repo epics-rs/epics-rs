@@ -1705,8 +1705,17 @@ impl DeviceSupport for AsynDeviceSupport {
                 .with_timeout(self.timeout);
             match self.handle.submit_blocking(op, user) {
                 Ok(result) => {
-                    if let Some(val) = self.result_to_value(&result) {
-                        skip_convert = self.store_read_value(record, val);
+                    // Gate the value store on the device read status, mirroring
+                    // C processAi: `if (result.status == asynSuccess) { pr->rval
+                    // = value } else { return -1 }` keeps the prior value on a
+                    // non-success read (devAsynInt32.c:848-855). The alarm/time
+                    // are applied unconditionally (C maps the alarm and
+                    // recGblSetSevr's it before the status gate, :844-847) — same
+                    // store-only gate as the I/O Intr ring.
+                    if result.aux_status == crate::error::AsynStatus::Success {
+                        if let Some(val) = self.result_to_value(&result) {
+                            skip_convert = self.store_read_value(record, val);
+                        }
                     }
                     self.last_alarm_status = result.alarm_status;
                     self.last_alarm_severity = result.alarm_severity;
@@ -2816,6 +2825,41 @@ mod tests {
         };
         let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynInt32");
         ads.set_record_info("TEST:REC", scan);
+        ads
+    }
+
+    /// Build a Passive asynInt32 input adapter whose port has VAL pre-seeded to
+    /// `value` with the given device read `status`. Used to exercise the polled
+    /// read value-discard gate: a non-success param status must keep the prior
+    /// record value (C processAi return -1) while still raising the alarm.
+    fn make_seeded_int32_adapter(
+        value: i32,
+        status: crate::error::AsynStatus,
+    ) -> AsynDeviceSupport {
+        let mut driver = TestPort::new();
+        driver.base.params.set_int32(0, 0, value).unwrap();
+        driver
+            .base
+            .params
+            .set_param_status(0, 0, status, 0, 0)
+            .unwrap();
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let actor = PortActor::new(Box::new(driver), rx);
+        std::thread::Builder::new()
+            .name("test-seeded-actor".into())
+            .spawn(move || actor.run())
+            .unwrap();
+        let handle = PortHandle::new(tx, "test".into(), interrupts);
+        let link = AsynLink {
+            port_name: "test".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: "VAL".into(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynInt32");
+        ads.set_record_info("TEST:SEED", ScanType::Passive);
+        ads.reason_set = true; // reason defaults to 0 = VAL; skip init's drv_user_create
         ads
     }
 
@@ -4459,6 +4503,48 @@ mod tests {
             Some((1, 3)),
             "array dset uses READ_ALARM(1) even for aao output, not WRITE_ALARM"
         );
+    }
+
+    /// Polled (non-interrupt) read with a non-success device status must DISCARD
+    /// the value and keep the record's prior value, mirroring C processAi:
+    /// `if (result.status == asynSuccess) { pr->rval = value } else { return -1 }`
+    /// (devAsynInt32.c:848-855). The alarm is still raised (mapped + recGblSetSevr
+    /// before the gate, :844-847). This is the polled-read sibling of the I/O
+    /// Intr ring's aux_status store gate.
+    #[test]
+    fn polled_read_transport_error_discards_value_keeps_prior() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut ads = make_seeded_int32_adapter(5, crate::error::AsynStatus::Error);
+        let mut rec = LonginRecord::new(0);
+        rec.put_field("VAL", EpicsValue::Long(77)).unwrap(); // prior value
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            rec.val(),
+            Some(EpicsValue::Long(77)),
+            "non-success device read must keep the prior VAL (C return -1), not store 5"
+        );
+        assert_eq!(
+            ads.last_alarm(),
+            Some((1, 3)),
+            "the alarm is still raised: READ_ALARM(1)/INVALID(3)"
+        );
+    }
+
+    /// Boundary contrast to the discard case: a success device status on the same
+    /// polled-read harness stores the value and raises no alarm.
+    #[test]
+    fn polled_read_success_stores_value() {
+        use epics_base_rs::server::records::longin::LonginRecord;
+        let mut ads = make_seeded_int32_adapter(5, crate::error::AsynStatus::Success);
+        let mut rec = LonginRecord::new(0);
+        rec.put_field("VAL", EpicsValue::Long(77)).unwrap();
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            rec.val(),
+            Some(EpicsValue::Long(5)),
+            "a success device read stores the value"
+        );
+        assert_eq!(ads.last_alarm(), None, "success read raises no alarm");
     }
 
     /// A `ScanType::IoIntr` adapter on `asynFloat64` whose driver exposes a

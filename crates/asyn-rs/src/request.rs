@@ -287,6 +287,15 @@ pub struct RequestResult {
     pub alarm_severity: u16,
     /// Timestamp from the driver param store (populated on reads).
     pub timestamp: Option<SystemTime>,
+    /// Device read auxiliary status (C `pasynUser->auxStatus`), populated on
+    /// reads from the param store alongside the value. Distinct from
+    /// [`Self::status`] (the request/op outcome that drives an `Err`/Error
+    /// reply): a read OP can succeed and return a value while `aux_status`
+    /// flags that value invalid. Device support gates the value store on this —
+    /// C `processAi` stores the value only when `result.status == asynSuccess`
+    /// and otherwise returns -1 keeping the prior value (devAsynInt32.c:848-855)
+    /// — the same way the I/O Intr ring gates on `CachedInterrupt.aux_status`.
+    pub aux_status: AsynStatus,
     /// Option value string (from GetOption).
     pub option_value: Option<String>,
     /// Int64 bounds (from GetBoundsInt32/Int64).
@@ -325,6 +334,7 @@ impl RequestResult {
             alarm_status: 0,
             alarm_severity: 0,
             timestamp: None,
+            aux_status: AsynStatus::Success,
             option_value: None,
             bounds: None,
             eom_reason: 0,

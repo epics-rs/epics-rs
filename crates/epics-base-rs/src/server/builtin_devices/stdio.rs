@@ -82,10 +82,15 @@ impl DeviceSupport for StdioDeviceSupport {
 
     fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
         // C registers a SEPARATE dset per record type (devLsoStdio /
-        // devPrintfStdio / devSoStdio); a DTYP="stdio" on any other record
-        // type has no matching dset and fails to init. The Rust dynamic
-        // factory builds one device for the DTYP regardless of record type,
-        // so gate the record type here.
+        // devPrintfStdio / devSoStdio), and "stdio" is not a valid DTYP menu
+        // choice for any other record type — so C rejects a DTYP="stdio" on
+        // e.g. a stringin at db-LOAD time (illegal choice); were such a record
+        // to reach init, its own init_record would raise S_dev_noDSET. base-rs
+        // has no per-(recordType, DTYP) menu validation and so cannot replicate
+        // the load-time rejection; the closest available enforcement is to gate
+        // the record type here and Err, which `wire_device_to_record` turns
+        // into a record INVALID alarm. Not a literal mirror of C's load-time
+        // rejection, but the record is visibly unusable either way.
         let rt = record.record_type();
         if !matches!(rt, "lso" | "printf" | "stringout") {
             return Err(CaError::InvalidValue(format!(

@@ -513,6 +513,7 @@ pub trait Record: Send + Sync + 'static {
                 | "mbboDirect"
                 | "stringout"
                 | "lso"
+                | "printf"
                 | "aao"
         )
     }

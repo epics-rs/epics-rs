@@ -111,16 +111,34 @@ impl DeviceSupport for StdioDeviceSupport {
         let Some(stream) = self.stream else {
             return Ok(());
         };
-        if let Some(EpicsValue::String(s)) = record.get_field("VAL") {
-            stream.print_line(&s.as_str_lossy());
+        if let Some(line) = val_string(record) {
+            stream.print_line(&line);
         }
         Ok(())
+    }
+}
+
+/// The record's `VAL` as the string `write()` prints. The three stdio
+/// records carry VAL in two shapes: `stringout` as an `EpicsValue::String`,
+/// `lso` and `printf` as an `EpicsValue::CharArray` (UTF-8 bytes). For a char
+/// array, decode up to the first NUL — matching C `printf("%s\n", prec->val)`
+/// reading the NUL-terminated `char *` VAL. Any other VAL shape yields `None`
+/// (the record-type gate already restricts this to the three string records).
+fn val_string(record: &dyn Record) -> Option<String> {
+    match record.get_field("VAL")? {
+        EpicsValue::String(s) => Some(s.as_str_lossy().into_owned()),
+        EpicsValue::CharArray(bytes) => {
+            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+            Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
+        }
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::records::lso::LsoRecord;
     use crate::server::records::stringin::StringinRecord;
     use crate::server::records::stringout::StringoutRecord;
 
@@ -184,5 +202,18 @@ mod tests {
         let mut dev = StdioDeviceSupport::new("@stderr");
         let mut rec = StringoutRecord::new("hello stdio");
         assert!(dev.write(&mut rec).is_ok());
+    }
+
+    /// VAL extraction must read BOTH `EpicsValue::String` (`stringout`) and
+    /// `EpicsValue::CharArray` (`lso`/`printf`) — a String-only match prints
+    /// nothing for the two char-array records (C `print("%s\n", prec->val)`
+    /// is the same for all three).
+    #[test]
+    fn val_string_reads_string_and_char_array_vals() {
+        let so = StringoutRecord::new("from stringout");
+        assert_eq!(val_string(&so).as_deref(), Some("from stringout"));
+
+        let lso = LsoRecord::new("from lso");
+        assert_eq!(val_string(&lso).as_deref(), Some("from lso"));
     }
 }

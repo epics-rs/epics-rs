@@ -1259,17 +1259,20 @@ impl AsynDeviceSupport {
     ///   record exposing `ESLO` (the ai linearization field, same discriminator
     ///   as the init-time [`Self::apply_linear_eslo_eoff`]); without it the raw
     ///   counts reached VAL straight and the computed ESLO/EOFF were dead.
-    /// - output records (`asynInt32` or `asynUInt32Digital`) with a non-trivial
-    ///   `raw -> VAL` readback — ao (engineering inverse), mbbo/bo/mbboDirect
-    ///   (state table / 0-1 / bit map) — claim the raw via `apply_raw_readback`
-    ///   (`true`): it sets both RVAL and VAL the way C's `processXxx` readback
-    ///   does, and returning `true` (computed) makes the framework skip the
-    ///   record's forward convert, which would otherwise recompute RVAL from the
-    ///   stale VAL and discard the readback. Input records decline the hook.
-    /// - everything else (incl. input mbbi/bi, longin/longout): set VAL
-    ///   directly, return `true` (device support produced the final value, as
-    ///   before) — for input mbbi/bi the record's `set_val` re-derives from
-    ///   RVAL + state table internally.
+    /// - records (`asynInt32` or `asynUInt32Digital`) with a non-trivial
+    ///   `raw -> VAL` convert claim the raw via `apply_raw_readback` (`true`):
+    ///   it sets both RVAL and VAL the way C's `processXxx` does, and returning
+    ///   `true` (computed) makes the framework skip the record's forward
+    ///   convert, which would otherwise recompute RVAL from the stale VAL and
+    ///   discard the readback. Outputs: ao (engineering inverse), mbbo/bo/
+    ///   mbboDirect (state table / 0-1 / bit map). Inputs: bi (0/1 map,
+    ///   `processBi`), mbbiDirect (mask/shift/bits, `processMbbiDirect`). The
+    ///   hook is the *device-distinct* entry — the Soft Channel path stays on
+    ///   `set_val`, so it does not collide with a soft-link value write.
+    /// - everything else (input mbbi, longin/longout): set VAL directly, return
+    ///   `true` (device support produced the final value, as before) — mbbi's
+    ///   `set_val` re-derives from RVAL + the state table internally; longin/
+    ///   longout VAL *is* the raw (no convert).
     fn store_read_value(&mut self, record: &mut dyn Record, val: EpicsValue) -> bool {
         if self.iface_type == "asynFloat64" {
             if let EpicsValue::Double(raw) = val {
@@ -1282,21 +1285,24 @@ impl AsynDeviceSupport {
         }
         if self.iface_type == "asynInt32" || self.iface_type == "asynUInt32Digital" {
             if let EpicsValue::Long(raw) = val {
-                // Output records own their `raw -> record-value` readback: ao's
-                // engineering inverse, and mbbo/bo/mbboDirect's state-table /
-                // 0-1 / bit map. `apply_raw_readback` stores RVAL and computes
+                // Records own their `raw -> record-value` mapping: ao's
+                // engineering inverse, mbbo/bo/mbboDirect's state-table / 0-1 /
+                // bit map (outputs), and bi's 0/1 map + mbbiDirect's mask/shift/
+                // bits (inputs). `apply_raw_readback` stores RVAL and computes
                 // VAL, and we return `true` (computed) so the framework skips
                 // the record's forward convert, which would recompute RVAL from
                 // the stale VAL and discard the readback. C `processAo`
                 // (devAsynInt32.c:973-994), `processMbbo`/`processBo`
                 // (devAsynInt32.c:1310-1330,1202-1203 /
-                // devAsynUInt32Digital.c:945-962,731-732), and
-                // `processMbboDirect` (devAsynUInt32Digital.c:1084-1090) all set
-                // both fields from the callback and return without re-converting.
+                // devAsynUInt32Digital.c:945-962,731-732),
+                // `processMbboDirect` (devAsynUInt32Digital.c:1084-1090),
+                // `processBi` (devAsynInt32.c / devAsynUInt32Digital.c:689) and
+                // `processMbbiDirect` (devAsynUInt32Digital.c:1031) all set both
+                // fields from the callback and return without re-converting.
                 // The hook is iface-agnostic (it uses the record's own
                 // MASK/SHFT/state table), so the one dispatch covers both the
-                // asynInt32 and the asynUInt32Digital readback. Input records
-                // (ai/mbbi/bi/longin) decline the hook (default `false`).
+                // asynInt32 and the asynUInt32Digital readback. ai routes via
+                // the ESLO branch below; mbbi/longin decline (default `false`).
                 if record.apply_raw_readback(raw) {
                     return true;
                 }
@@ -5074,6 +5080,120 @@ mod tests {
         assert!(outcome.did_compute, "bo readback computed");
         assert_eq!(rec.rval, 0x2A, "RVAL keeps the raw");
         assert_eq!(rec.val, 1, "VAL = (raw != 0) = 1, not the raw 42");
+    }
+
+    /// An `asynInt32` I/O Intr `bi` input: the device raw enters RVAL and
+    /// biRecord's `rval -> 0/1` convert resolves VAL. C `processBi`
+    /// (devAsynInt32.c) sets `rval = value` (mask 0) and returns 0. Before the
+    /// fix the raw fell to the default `set_val` and landed in VAL verbatim
+    /// (raw 5 → val 5); now VAL is the 0/1 the record exposes.
+    #[test]
+    fn io_intr_readback_bi_asynint32_maps_raw_to_binary() {
+        use epics_base_rs::server::records::bi::BiRecord;
+        let mut ads = make_adapter(ScanType::IoIntr); // input, asynInt32
+        let mut rec = BiRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        // mask stays 0 (asynInt32 bi): RVAL = raw, VAL = (raw != 0).
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32(5),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Success,
+            });
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(
+            outcome.did_compute,
+            "bi readback resolves VAL itself → computed"
+        );
+        assert_eq!(rec.rval, 5, "RVAL keeps the unmasked raw");
+        assert_eq!(rec.val, 1, "VAL = (raw != 0) = 1, not the raw 5");
+    }
+
+    /// An `asynUInt32Digital` I/O Intr `bi` input: `processBi` masks
+    /// (`rval = value & mask`, devAsynUInt32Digital.c:689), then VAL =
+    /// (rval != 0). The dispatch's one iface-agnostic hook covers this iface
+    /// too. A high-bit raw resolves to 1 (not stored as 128).
+    #[test]
+    fn io_intr_readback_bi_uint32digital_applies_mask() {
+        use epics_base_rs::server::records::bi::BiRecord;
+        let mut ads = make_adapter(ScanType::IoIntr);
+        ads.set_iface_type("asynUInt32Digital");
+        let mut rec = BiRecord::new(0);
+        ads.init(&mut rec).unwrap();
+        // Set MASK after init: `init` propagates the adapter's default full
+        // mask (0xFFFFFFFF) onto the record (devAsynUInt32Digital MASK/SHFT
+        // wiring). Override it to a single high bit to prove MASK gating.
+        rec.mask = 0x80;
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::UInt32Digital(0x80),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Success,
+            });
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(outcome.did_compute, "uint32digital bi readback computed");
+        assert_eq!(rec.rval, 0x80, "RVAL = raw & mask");
+        assert_eq!(rec.val, 1, "high-bit mask hit → val 1, not 128");
+        // A raw whose set bits fall entirely outside MASK → masked 0 → val 0.
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::UInt32Digital(0x01),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Success,
+            });
+        ads.read(&mut rec).unwrap();
+        assert_eq!(rec.rval, 0, "out-of-mask bits masked away");
+        assert_eq!(rec.val, 0, "masked-to-zero raw → val 0");
+    }
+
+    /// An `asynUInt32Digital` I/O Intr `mbbiDirect` input (its only dset,
+    /// `asynMbbiDirectUInt32Digital`): `processMbbiDirect` sets
+    /// `rval = value & mask` (devAsynUInt32Digital.c:1031); mbbiDirectRecord
+    /// resolves VAL = (masked >> SHFT) and the bit fields. Before the fix the
+    /// raw landed in VAL verbatim (no MASK, no SHFT, wrong bits).
+    #[test]
+    fn io_intr_readback_mbbi_direct_uint32digital_maps_mask_shift_bits() {
+        use epics_base_rs::server::records::mbbi_direct::MbbiDirectRecord;
+        let mut ads = make_adapter(ScanType::IoIntr);
+        ads.set_iface_type("asynUInt32Digital");
+        let mut rec = MbbiDirectRecord::default();
+        ads.init(&mut rec).unwrap();
+        // Set MASK/SHFT after init: `init` propagates the adapter's default
+        // full mask (0xFFFFFFFF → SHFT 0) onto the record. Override to bits 2-5
+        // / SHFT 2 to exercise the mask + shift path.
+        rec.mask = 0x3C; // bits 2-5
+        rec.shft = 2;
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::UInt32Digital(0x3C),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Success,
+            });
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(outcome.did_compute, "mbbiDirect readback computed");
+        assert_eq!(rec.rval, 0x3C, "RVAL keeps the masked (unshifted) raw");
+        assert_eq!(
+            rec.val, 0x0F,
+            "VAL = (raw & mask) >> SHFT, not the raw 0x3C"
+        );
+        assert_eq!(rec.bits[0], 1);
+        assert_eq!(rec.bits[3], 1);
     }
 
     /// A `ScanType::IoIntr` adapter on `asynFloat64` whose driver exposes a

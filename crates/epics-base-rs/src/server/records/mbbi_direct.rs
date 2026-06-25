@@ -377,6 +377,32 @@ impl Record for MbbiDirectRecord {
         self.skip_convert = did;
     }
 
+    /// asyn device readback (asynUInt32Digital only — `asynMbbiDirectUInt32Digital`
+    /// is the sole mbbiDirect dset, devAsynUInt32Digital.c:165): `processMbbiDirect`
+    /// sets `pr->rval = value & mask` (devAsynUInt32Digital.c:1031) and returns 0,
+    /// so mbbiDirectRecord's `rval -> (>> SHFT) -> VAL` + bit-field convert resolves
+    /// VAL. The hook runs that convert inline and returns `true` so the framework's
+    /// `set_device_did_compute(true)` makes `process()` skip the (identical) forward
+    /// pass. Without it the raw word lands verbatim in VAL via the default `set_val`
+    /// (no MASK, no SHFT, wrong bits). Device-distinct entry — the Soft Channel path
+    /// stays on `set_val` (C `devMbbiDirectSoft` returns 2). Input twin of
+    /// `mbbo_direct::apply_raw_readback`.
+    fn apply_raw_readback(&mut self, raw: i32) -> bool {
+        let masked = if self.mask != 0 {
+            (raw as u32) & self.mask
+        } else {
+            raw as u32
+        };
+        self.rval = masked;
+        self.val = if self.shft > 0 {
+            masked.checked_shr(self.shft as u32).unwrap_or(0)
+        } else {
+            masked
+        };
+        self.val_to_bits();
+        true
+    }
+
     /// `mbbiDirect` has an `RVAL → VAL` `convert()` step. A `Soft
     /// Channel` `mbbiDirect` must skip it — C `devMbbiDirectSoft.c`
     /// `read_mbbiDirect` returns 2.

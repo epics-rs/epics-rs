@@ -292,6 +292,89 @@ fn test_mbbo_direct_readback_maps_raw_and_skip_convert_preserves_low_bits() {
     );
 }
 
+// INPUT twin of the bo readback. C processBi sets rval then biRecord converts
+// val = (rval != 0): asynInt32 processBi does NOT mask (rval = value, initBi
+// passes a NULL mask → mask 0); asynUInt32Digital processBi masks (rval =
+// value & mask, devAsynUInt32Digital.c:689). The `mask != 0` split reproduces
+// both. Before this fix the device raw fell to the default set_val and landed
+// the raw count in VAL (e.g. 0x80 → val=128) instead of the 0/1 bi exposes.
+#[test]
+fn test_bi_readback_maps_raw_to_binary_both_mask_modes() {
+    // asynInt32 bi (mask == 0): rval = raw, val = (raw != 0). A non-binary raw
+    // resolves to 1, it is NOT stored verbatim.
+    let mut rec = BiRecord::new(0);
+    rec.mask = 0;
+    assert!(rec.apply_raw_readback(5), "bi claims the device readback");
+    assert_eq!(rec.rval, 5, "asynInt32 bi keeps the unmasked raw in RVAL");
+    assert_eq!(rec.val, 1, "VAL is 0/1, not the raw count");
+    assert!(rec.apply_raw_readback(0));
+    assert_eq!(rec.val, 0);
+    // asynUInt32Digital bi (mask != 0): rval = raw & mask, val = (rval != 0).
+    let mut rec2 = BiRecord::new(0);
+    rec2.mask = 0x80;
+    assert!(rec2.apply_raw_readback(0x80));
+    assert_eq!(rec2.rval, 0x80);
+    assert_eq!(
+        rec2.val, 1,
+        "high-bit mask hit → val 1 (C gives 1, not 128)"
+    );
+    // A raw whose set bits are all outside the mask → masked 0 → val 0.
+    assert!(rec2.apply_raw_readback(0x01));
+    assert_eq!(rec2.rval, 0);
+    assert_eq!(rec2.val, 0, "bits outside MASK do not set VAL");
+}
+
+// INPUT twin of the mbboDirect readback (asynUInt32Digital only). C
+// processMbbiDirect sets rval = value & mask (devAsynUInt32Digital.c:1031);
+// mbbiDirectRecord convert resolves val = (masked >> SHFT) and the bit fields.
+// Before this fix the raw fell to the default set_val → VAL = raw verbatim (no
+// MASK, no SHFT, wrong bits).
+#[test]
+fn test_mbbi_direct_readback_maps_raw_mask_shift_bits() {
+    use epics_base_rs::server::records::mbbi_direct::MbbiDirectRecord;
+    let mut rec = MbbiDirectRecord::default();
+    rec.mask = 0x3C; // bits 2-5
+    rec.shft = 2;
+    // raw 0x3C → masked 0x3C → val = 0x3C >> 2 = 0x0F; bits 0-3 set.
+    assert!(
+        rec.apply_raw_readback(0x3C),
+        "mbbiDirect claims the readback"
+    );
+    assert_eq!(rec.rval, 0x3C, "RVAL keeps the masked (unshifted) raw");
+    assert_eq!(rec.val, 0x0F, "VAL = masked raw >> SHFT");
+    assert_eq!(rec.bits[0], 1);
+    assert_eq!(rec.bits[3], 1);
+    assert_eq!(rec.bits[4], 0);
+    // The skip_convert gate preserves the readback RVAL (incl. sub-SHFT bits a
+    // forward convert would truncate) — C processMbbiDirect returns 0 from its
+    // readback without re-converting.
+    rec.set_device_did_compute(true);
+    let _ = rec.process().unwrap();
+    assert_eq!(rec.rval, 0x3C, "skip_convert preserves the readback RVAL");
+    assert_eq!(rec.val, 0x0F);
+    // Bits outside MASK are dropped: raw 0xC0 (bits 6-7) & 0x3C = 0 → val 0.
+    assert!(rec.apply_raw_readback(0xC0));
+    assert_eq!(rec.rval, 0);
+    assert_eq!(rec.val, 0, "out-of-mask bits do not reach VAL");
+}
+
+// Family boundary: mbbi maps the raw inside its own set_val (state table) and
+// longin's VAL *is* the raw — neither claims apply_raw_readback, so the asyn
+// store keeps routing them through set_val (the default hook returns false).
+#[test]
+fn test_mbbi_and_longin_decline_raw_readback() {
+    use epics_base_rs::server::records::longin::LonginRecord;
+    use epics_base_rs::server::records::mbbi::MbbiRecord;
+    assert!(
+        !MbbiRecord::new(0).apply_raw_readback(3),
+        "mbbi maps the raw via set_val, not the readback hook"
+    );
+    assert!(
+        !LonginRecord::new(0).apply_raw_readback(3),
+        "longin VAL is the raw — no convert to claim"
+    );
+}
+
 #[test]
 fn test_bi_record() {
     let mut rec = BiRecord::new(0);

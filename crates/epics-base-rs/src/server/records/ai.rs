@@ -49,6 +49,11 @@ pub struct AiRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
+    /// Simulation value (`field(SVAL,DBF_DOUBLE)`, aiRecord.dbd). The value
+    /// used when `SIMM=YES` and `SIOL` is unset; also repurposed by asyn's
+    /// averaging device support as the I/O-Intr decimation count
+    /// (devAsynInt32.c:667). Settable, no special/menu, C default 0.0.
+    pub sval: f64,
 }
 
 impl Default for AiRecord {
@@ -84,6 +89,7 @@ impl Default for AiRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
+            sval: 0.0,
         }
     }
 }
@@ -239,6 +245,11 @@ static FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    FieldDesc {
+        name: "SVAL",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
 ];
 
 impl Record for AiRecord {
@@ -349,6 +360,7 @@ impl Record for AiRecord {
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
+            "SVAL" => Some(EpicsValue::Double(self.sval)),
             _ => None,
         }
     }
@@ -561,6 +573,13 @@ impl Record for AiRecord {
             "SIMS" => match value {
                 EpicsValue::Short(v) => {
                     self.sims = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "SVAL" => match value {
+                EpicsValue::Double(v) => {
+                    self.sval = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

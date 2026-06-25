@@ -322,6 +322,21 @@ pub struct AsynDeviceSupport {
     /// versus asynOctetWrite which trims at the first NUL (`my_strnlen`). Only
     /// meaningful together with `write_only`.
     octet_binary: bool,
+    /// `Some` ⟹ averaging device support (`asynInt32Average` /
+    /// `asynFloat64Average`, both ai-only). The always-on interrupt callback
+    /// accumulates samples into the [`SumAverager`](crate::interfaces::average::SumAverager);
+    /// the periodic record process drains the arithmetic mean — C
+    /// `interruptCallbackAverage` (devAsynInt32.c:870-872 /
+    /// devAsynFloat64.c:687-694) + `processAiAverage` (devAsynInt32.c:895-918 /
+    /// devAsynFloat64.c:716-735). Only the periodic-SCAN model (mean of all
+    /// samples since the last process) is ported; the I/O Intr SVAL-decimation
+    /// model is a documented residual.
+    average: Option<Arc<AverageState>>,
+    /// RAII handle for the averaging synchronous interrupt callback — dropping
+    /// unregisters it. Distinct from `interrupt_sub` (the mailbox/value path):
+    /// averaging needs every sample, so it registers a synchronous callback
+    /// (C `registerInterruptUser`), not a coalescing mailbox subscription.
+    average_callback_sub: Option<crate::interrupt::SyncCallbackSubscription>,
     /// RAII interrupt subscription — dropping unsubscribes.
     interrupt_sub: Option<InterruptSubscription>,
     /// Per-record ring buffer of interrupt values, FIFO-ordered. The
@@ -368,6 +383,32 @@ pub struct AsynDeviceSupport {
     /// unsubscribes. Distinct from `interrupt_sub` (the value I/O Intr
     /// subscription); C registers the asynEnum callback separately.
     enum_interrupt_sub: Option<InterruptSubscription>,
+}
+
+/// Shared state for an averaging (`asynInt32Average` / `asynFloat64Average`)
+/// record. The always-on interrupt callback (registered in
+/// [`AsynDeviceSupport::io_intr_receiver`]) pushes each driver sample into
+/// `averager` and stashes the sample's driver alarm in `last_alarm`; the
+/// periodic record-process `read()` drains the arithmetic mean and applies
+/// the alarm. Mirrors C `devPvt.sum`/`numAverage` (devAsynInt32.c:98-99) plus
+/// the `alarmStatus`/`alarmSeverity` captured in `interruptCallbackAverage`
+/// (devAsynInt32.c:705-707). Behind an `Arc` because the interrupt callback
+/// runs off the record-process thread, exactly like `interrupt_fifo`.
+struct AverageState {
+    averager: crate::interfaces::average::SumAverager,
+    /// Last sample's `(alarm_status, alarm_severity)`. C captures these in the
+    /// accumulating callback and `processAiAverage` applies them via
+    /// `recGblSetSevr` (devAsynInt32.c:915-918, devAsynFloat64.c:732-735).
+    last_alarm: std::sync::Mutex<(u16, u16)>,
+}
+
+impl AverageState {
+    fn new() -> Self {
+        Self {
+            averager: crate::interfaces::average::SumAverager::new(),
+            last_alarm: std::sync::Mutex::new((0, 0)),
+        }
+    }
 }
 
 /// Cached interrupt value with metadata for alarm/timestamp propagation.
@@ -464,6 +505,8 @@ impl AsynDeviceSupport {
             asyn_readback: false,
             write_only: false,
             octet_binary: false,
+            average: None,
+            average_callback_sub: None,
             interrupt_sub: None,
             interrupt_fifo: Arc::new(std::sync::Mutex::new(InterruptFifo::new())),
             output_callback_pending: false,
@@ -1398,6 +1441,57 @@ impl DeviceSupport for AsynDeviceSupport {
             return Ok(DeviceReadOutcome::ok());
         }
 
+        // Averaging device support (asynInt32Average / asynFloat64Average): the
+        // always-on interrupt callback (io_intr_receiver) has been accumulating
+        // samples into the SumAverager since iocInit. On each periodic record
+        // process, drain the arithmetic mean since the last process and reset —
+        // C `processAiAverage` (devAsynInt32.c:895-918, devAsynFloat64.c:716-735).
+        // Reuses the normal ai store paths: int32 routes the rounded mean to RVAL
+        // (the ai record's convert applies ESLO/EOFF), float64 sets VAL directly
+        // (ASLO/AOFF/SMOO applied in-dset) — averaging only changes the *source*
+        // of the raw value, exactly as CmdResponse reused the octet reply→VAL.
+        if let Some(acc) = self.average.clone() {
+            let drained = if self.iface_type == "asynInt32" {
+                acc.averager
+                    .read_and_reset_int32_checked()
+                    .map(EpicsValue::Long)
+            } else {
+                acc.averager
+                    .read_and_reset_checked()
+                    .map(EpicsValue::Double)
+            };
+            match drained {
+                Some(val) => {
+                    // Apply the last sample's driver alarm (C recGblSetSevr,
+                    // devAsynInt32.c:915-918). Non-sticky: a NO_ALARM sample
+                    // clears any prior alarm on the next cycle.
+                    let (status, severity) = *acc.last_alarm.lock().unwrap();
+                    let skip_convert = self.store_read_value(record, val);
+                    self.last_alarm_status = status;
+                    self.last_alarm_severity = severity;
+                    return Ok(if skip_convert {
+                        DeviceReadOutcome::computed()
+                    } else {
+                        DeviceReadOutcome::ok()
+                    });
+                }
+                None => {
+                    // No samples since the last process. C `processAiAverage`
+                    // sets UDF_ALARM/INVALID and returns -2 (VAL untouched) —
+                    // devAsynInt32.c:900-904, devAsynFloat64.c:721-725.
+                    // `computed()` skips the RVAL→VAL convert so VAL keeps its
+                    // previous value (no store_read_value call). NOTE: C also
+                    // sets the record's `udf=1` boolean; device support has no
+                    // channel to set that field here — the UDF_ALARM/INVALID
+                    // alarm is raised, the `udf` boolean is the documented gap.
+                    self.last_alarm_status = epics_base_rs::server::recgbl::alarm_status::UDF_ALARM;
+                    self.last_alarm_severity =
+                        epics_base_rs::server::record::AlarmSeverity::Invalid as u16;
+                    return Ok(DeviceReadOutcome::computed());
+                }
+            }
+        }
+
         // For I/O Intr records, pop the oldest entry from the ring
         // buffer. C parity: `devAsynInt32.c::getCallbackValue` —
         // returns the next FIFO entry, logs+resets the overflow
@@ -1601,6 +1695,54 @@ impl DeviceSupport for AsynDeviceSupport {
         if !self.reason_set {
             return None;
         }
+
+        // Averaging device support (asynInt32Average / asynFloat64Average):
+        // register an ALWAYS-ON accumulating callback regardless of SCAN (C
+        // enables the averaging callback unconditionally, devAsynInt32.c:385-386).
+        // It is SYNCHRONOUS (register_sync_callback / C registerInterruptUser),
+        // not a mailbox subscription: averaging must observe every sample, and
+        // the mailbox coalesces rapid updates to the latest — which would drop
+        // samples and corrupt the mean. The callback pushes each sample into the
+        // SumAverager and stashes its driver alarm; the record processes on its
+        // own periodic SCAN and drains the mean in read(). Return None: there is
+        // no per-callback reprocess wakeup (the periodic-SCAN model; C
+        // `interruptCallbackAverage` only `scanIoRequest`s on the I/O Intr
+        // decimation path, which is the documented residual).
+        if let Some(acc) = self.average.clone() {
+            let filter = InterruptFilter {
+                reason: Some(self.reason),
+                addr: Some(self.addr),
+                uint32_mask: None,
+            };
+            // asynInt32Average applies the same @asynMask nbits the polled
+            // read does (devAsynInt32.c:537-540); asynFloat64Average has no mask.
+            let int32_mask = self.int32_mask;
+            let sub = self
+                .handle
+                .interrupts()
+                .register_sync_callback(filter, move |iv| {
+                    // C `interruptCallbackAverage`: numAverage++; sum += value
+                    // (devAsynInt32.c:665-666). The two averaging dsets only ever
+                    // carry Int32 / Float64 samples (ai-only); anything else is
+                    // not an averaging sample and is ignored.
+                    let sample = match &iv.value {
+                        crate::param::ParamValue::Int32(v) => {
+                            Some(int32_mask.map_or(*v, |m| m.apply(*v)) as f64)
+                        }
+                        crate::param::ParamValue::Float64(v) => Some(*v),
+                        _ => None,
+                    };
+                    if let Some(s) = sample {
+                        acc.averager.push(s);
+                        // Capture the sample's driver alarm for passthrough
+                        // (devAsynInt32.c:705-707).
+                        *acc.last_alarm.lock().unwrap() = (iv.alarm_status, iv.alarm_severity);
+                    }
+                });
+            self.average_callback_sub = Some(sub);
+            return None;
+        }
+
         if self.scan != ScanType::IoIntr && !self.asyn_readback {
             return None;
         }
@@ -1687,8 +1829,16 @@ impl DeviceSupport for AsynDeviceSupport {
     /// Decouple its poll-feedback wiring from the `SCAN` menu so the callback
     /// processes it even when `SCAN != "I/O Intr"`. Plain `SCAN="I/O Intr"`
     /// records (`asyn_readback == false`) keep the SCAN-gated behaviour.
+    ///
+    /// Averaging records (`average.is_some()`) also need the driver-callback
+    /// path wired regardless of SCAN — the accumulating interrupt must run on
+    /// every driver sample while the record scans periodically. C enables the
+    /// averaging callback always, independent of SCAN (devAsynInt32.c:385-386).
+    /// `io_intr_receiver` returns `None` for the average case, so this only
+    /// arms the accumulating subscription; it spawns no reprocess task (the
+    /// record scans on its own period, not per callback).
     fn io_intr_scan_independent(&self) -> bool {
-        self.asyn_readback
+        self.asyn_readback || self.average.is_some()
     }
 
     fn arm_readback_callback(&mut self) {
@@ -1814,6 +1964,16 @@ fn normalize_asyn_dtyp(dtyp: &str) -> String {
     {
         return "asynOctet".to_string();
     }
+    // Averaging DTYPs use the base interface for driver I/O; averaging is a
+    // device-support behaviour carried by `average`, not a distinct interface
+    // (C `asynInt32Average` registers on asynInt32, `asynFloat64Average` on
+    // asynFloat64 — devAsynInt32.c:870-872 / devAsynFloat64.c:687-694).
+    if dtyp == "asynInt32Average" {
+        return "asynInt32".to_string();
+    }
+    if dtyp == "asynFloat64Average" {
+        return "asynFloat64".to_string();
+    }
     dtyp.to_string()
 }
 
@@ -1895,6 +2055,17 @@ pub fn universal_asyn_factory(
         }
         adapter.octet_cmd = Some(cmd);
         adapter.reason_set = true;
+    }
+
+    // asynInt32Average / asynFloat64Average: averaging device support. C
+    // `initAiAverage` (devAsynInt32.c:760+, devAsynFloat64.c) registers an
+    // always-on accumulating interrupt; the periodic record process drains
+    // the mean. The DRVINFO is a real param (useDrvUser=1), so `reason_set`
+    // is left false and `init()` runs `drv_user_create` as for a plain
+    // asynInt32/asynFloat64 ai. The accumulating subscription is registered
+    // in `io_intr_receiver` (which `io_intr_scan_independent` enables here).
+    if ctx.dtyp == "asynInt32Average" || ctx.dtyp == "asynFloat64Average" {
+        adapter.average = Some(Arc::new(AverageState::new()));
     }
 
     if is_output {
@@ -2443,6 +2614,45 @@ mod tests {
         ads
     }
 
+    /// Build an averaging (`asynInt32Average` / `asynFloat64Average`) adapter:
+    /// a plain ai adapter on the base interface with `average` set, on a
+    /// periodic (non-IoIntr) SCAN. The accumulating interrupt is armed by
+    /// calling `io_intr_receiver()` (which `io_intr_scan_independent` would
+    /// gate in production); the port is never read by the average path.
+    fn make_average_adapter(iface: &str) -> AsynDeviceSupport {
+        let driver = TestPort::new();
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let actor = PortActor::new(Box::new(driver), rx);
+        std::thread::Builder::new()
+            .name("test-average-actor".into())
+            .spawn(move || actor.run())
+            .unwrap();
+        let handle = PortHandle::new(tx, "test".into(), interrupts);
+        let link = AsynLink {
+            port_name: "test".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: "VAL".into(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, iface);
+        ads.average = Some(Arc::new(AverageState::new()));
+        ads.set_record_info("TEST:AVG", ScanType::Passive);
+        ads
+    }
+
+    /// Poll the averager until at least `n` samples have accumulated (the
+    /// interrupt callback runs on a spawned task). Panics if `n` never arrives.
+    async fn await_average_count(acc: &Arc<AverageState>, n: u64) {
+        for _ in 0..200 {
+            if acc.averager.count() >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("averager never reached {n} samples");
+    }
+
     #[test]
     fn test_io_intr_receiver_none_when_passive() {
         let mut ads = make_adapter(ScanType::Passive);
@@ -2919,6 +3129,181 @@ mod tests {
             _ => panic!(),
         };
         assert_eq!(val, 77, "longin VAL set directly to the raw count");
+    }
+
+    // --- averaging device support (asynInt32Average / asynFloat64Average)
+    //     C interruptCallbackAverage + processAiAverage, periodic-SCAN model ---
+
+    /// asynInt32Average: the always-on interrupt accumulates samples; the
+    /// periodic process drains the rounded arithmetic mean to RVAL and runs
+    /// the ai convert (C `processAiAverage` `pr->rval = dval; return 0`,
+    /// devAsynInt32.c:906-910). Mean of [10,20,30,40] = 25 → RVAL → VAL
+    /// (LINR=NO_CONVERSION). The drain resets the accumulator.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn average_int32_drains_rounded_mean_to_rval_and_resets() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut ads = make_average_adapter("asynInt32");
+        let mut rec = AiRecord::new(0.0);
+        rec.linr = 0; // NO_CONVERSION: VAL == RVAL after convert
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let acc = ads.average.clone().unwrap();
+        // Average arms the accumulating interrupt but returns no reprocess
+        // wakeup — the record scans periodically (periodic-SCAN model).
+        assert!(
+            ads.io_intr_receiver().is_none(),
+            "averaging records get no per-callback reprocess channel"
+        );
+
+        for v in [10, 20, 30, 40] {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::Int32(v),
+                timestamp: SystemTime::now(),
+                ..Default::default()
+            });
+        }
+        await_average_count(&acc, 4).await;
+
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(
+            !outcome.did_compute,
+            "int32 average routes the mean→RVAL and runs the ai convert (C return 0)"
+        );
+        let rval = match rec.get_field("RVAL").unwrap() {
+            EpicsValue::Long(v) => v,
+            _ => panic!(),
+        };
+        assert_eq!(rval, 25, "mean of [10,20,30,40] = 25 → RVAL");
+        rec.process().unwrap();
+        let val = match rec.get_field("VAL").unwrap() {
+            EpicsValue::Double(v) => v,
+            _ => panic!(),
+        };
+        assert!(
+            (val - 25.0).abs() < 1e-9,
+            "NO_CONVERSION ai: VAL == RVAL = 25"
+        );
+        assert_eq!(
+            acc.averager.count(),
+            0,
+            "the drain must reset the accumulator (C numAverage=0, sum=0)"
+        );
+    }
+
+    /// asynFloat64Average: the periodic process drains the mean directly to
+    /// VAL (C `processAiAverage` applies ASLO/AOFF/SMOO and returns `2`,
+    /// devAsynFloat64.c:727-735). Mean of [1,2,6] = 3.0. ASLO=1/AOFF=0/SMOO=0
+    /// leave the mean unscaled. The drain resets the accumulator.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn average_float64_drains_mean_to_val_and_resets() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut ads = make_average_adapter("asynFloat64");
+        let mut rec = AiRecord::new(0.0);
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let acc = ads.average.clone().unwrap();
+        assert!(ads.io_intr_receiver().is_none());
+
+        for v in [1.0, 2.0, 6.0] {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::Float64(v),
+                timestamp: SystemTime::now(),
+                ..Default::default()
+            });
+        }
+        await_average_count(&acc, 3).await;
+
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(
+            outcome.did_compute,
+            "float64 average sets VAL directly and skips the convert (C return 2)"
+        );
+        let val = match rec.get_field("VAL").unwrap() {
+            EpicsValue::Double(v) => v,
+            _ => panic!(),
+        };
+        assert!((val - 3.0).abs() < 1e-9, "mean of [1,2,6] = 3.0 → VAL");
+        assert_eq!(
+            acc.averager.count(),
+            0,
+            "the drain must reset the accumulator"
+        );
+    }
+
+    /// Zero samples since the last process: C `processAiAverage` sets
+    /// `UDF_ALARM`/`INVALID` and returns `-2` — VAL is left untouched
+    /// (devAsynFloat64.c:721-725). No averaging into a zero-divide, no
+    /// stale-value reuse.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn average_zero_samples_raises_udf_invalid_and_keeps_val() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut ads = make_average_adapter("asynFloat64");
+        let mut rec = AiRecord::new(7.5); // pre-existing VAL
+        ads.init(&mut rec).unwrap();
+        assert!(ads.io_intr_receiver().is_none());
+
+        // No samples notified → the accumulator is empty.
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(
+            outcome.did_compute,
+            "zero-samples skips the convert so VAL is not overwritten from RVAL"
+        );
+        assert_eq!(
+            ads.last_alarm(),
+            Some((
+                epics_base_rs::server::recgbl::alarm_status::UDF_ALARM,
+                epics_base_rs::server::record::AlarmSeverity::Invalid as u16
+            )),
+            "zero-samples must raise UDF_ALARM/INVALID (C return -2)"
+        );
+        let val = match rec.get_field("VAL").unwrap() {
+            EpicsValue::Double(v) => v,
+            _ => panic!(),
+        };
+        assert!(
+            (val - 7.5).abs() < 1e-9,
+            "zero-samples must leave VAL untouched, got {val}"
+        );
+    }
+
+    /// The driver alarm carried by a sample propagates through the average:
+    /// `interruptCallbackAverage` captures `alarmStatus`/`alarmSeverity`
+    /// (devAsynInt32.c:705-707) and `processAiAverage` applies it
+    /// (recGblSetSevr, :915-918). A COMM/INVALID sample must surface on read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn average_propagates_last_sample_driver_alarm() {
+        use epics_base_rs::server::records::ai::AiRecord;
+        let mut ads = make_average_adapter("asynFloat64");
+        let mut rec = AiRecord::new(0.0);
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let acc = ads.average.clone().unwrap();
+        assert!(ads.io_intr_receiver().is_none());
+
+        interrupts.notify(InterruptValue {
+            reason,
+            addr: 0,
+            value: crate::param::ParamValue::Float64(5.0),
+            timestamp: SystemTime::now(),
+            alarm_status: 9,   // COMM_ALARM
+            alarm_severity: 3, // INVALID
+            ..Default::default()
+        });
+        await_average_count(&acc, 1).await;
+
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            ads.last_alarm(),
+            Some((9, 3)),
+            "the sample's driver alarm (COMM/INVALID) must propagate on read"
+        );
     }
 
     // --- driver enum-string table -> record state fields

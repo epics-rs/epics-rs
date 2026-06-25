@@ -20,6 +20,30 @@ pub struct InterruptFilter {
     pub uint32_mask: Option<u32>,
 }
 
+impl InterruptFilter {
+    /// Whether an interrupt value passes this filter (reason + addr +
+    /// UInt32Digital changed-bit mask). Shared by the mailbox and the
+    /// synchronous-callback delivery paths.
+    fn matches(&self, iv: &InterruptValue) -> bool {
+        if let Some(r) = self.reason {
+            if iv.reason != r {
+                return false;
+            }
+        }
+        if let Some(a) = self.addr {
+            if iv.addr != a {
+                return false;
+            }
+        }
+        if let Some(m) = self.uint32_mask {
+            if iv.uint32_changed_mask & m == 0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// Value delivered through the interrupt system.
 ///
 /// C parity: every `asynPortDriver::int32Callback` /
@@ -86,22 +110,44 @@ struct SubscriptionMailbox {
 
 impl SubscriptionMailbox {
     fn matches(&self, iv: &InterruptValue) -> bool {
-        if let Some(r) = self.filter.reason {
-            if iv.reason != r {
-                return false;
-            }
-        }
-        if let Some(a) = self.filter.addr {
-            if iv.addr != a {
-                return false;
-            }
-        }
-        if let Some(m) = self.filter.uint32_mask {
-            if iv.uint32_changed_mask & m == 0 {
-                return false;
-            }
-        }
-        true
+        self.filter.matches(iv)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Synchronous callback subscription (averaging device support)
+// ---------------------------------------------------------------------------
+
+/// A synchronous interrupt callback, invoked INLINE inside `notify()` for every
+/// matching value — no coalescing, no channel, no sample loss. This is the
+/// faithful analogue of C `registerInterruptUser`: the driver calls the
+/// callback directly per sample (asynPortDriver.cpp). Required by averaging
+/// device support (`asynInt32Average` / `asynFloat64Average`), which must
+/// accumulate EVERY sample (C `interruptCallbackAverage` does `sum += value`
+/// per callback, devAsynInt32.c:665-666). The mailbox path coalesces rapid
+/// updates to the latest, and the broadcast path drops on lag — either would
+/// silently corrupt the mean, so averaging cannot use them.
+struct SyncCallback {
+    filter: InterruptFilter,
+    callback: Box<dyn Fn(&InterruptValue) + Send + Sync>,
+    active: AtomicBool,
+}
+
+/// RAII handle for a synchronous interrupt callback. Dropping it deactivates
+/// the callback and removes it from the shared list (mirrors
+/// [`InterruptSubscription`]).
+pub struct SyncCallbackSubscription {
+    callback: Arc<SyncCallback>,
+    state: Arc<InterruptSharedState>,
+}
+
+impl Drop for SyncCallbackSubscription {
+    fn drop(&mut self) {
+        self.callback.active.store(false, Ordering::Release);
+        self.state
+            .sync_callbacks
+            .lock()
+            .retain(|c| c.active.load(Ordering::Relaxed));
     }
 }
 
@@ -170,6 +216,9 @@ pub struct InterruptSharedState {
     async_tx: broadcast::Sender<InterruptValue>,
     /// Mailbox-based subscriptions for filtered subscribers (I/O Intr records).
     mailboxes: parking_lot::Mutex<Vec<Arc<SubscriptionMailbox>>>,
+    /// Synchronous callbacks invoked inline in `notify()` (averaging device
+    /// support — every sample, no coalescing). See [`SyncCallback`].
+    sync_callbacks: parking_lot::Mutex<Vec<Arc<SyncCallback>>>,
     /// Total number of notify() calls.
     notify_count: AtomicU64,
     /// Number of times a mailbox value was overwritten before the consumer read it.
@@ -199,6 +248,7 @@ impl InterruptManager {
             state: Arc::new(InterruptSharedState {
                 async_tx,
                 mailboxes: parking_lot::Mutex::new(Vec::new()),
+                sync_callbacks: parking_lot::Mutex::new(Vec::new()),
                 notify_count: AtomicU64::new(0),
                 coalesce_count: AtomicU64::new(0),
             }),
@@ -225,6 +275,7 @@ impl InterruptManager {
             state: Arc::new(InterruptSharedState {
                 async_tx: sender,
                 mailboxes: parking_lot::Mutex::new(Vec::new()),
+                sync_callbacks: parking_lot::Mutex::new(Vec::new()),
                 notify_count: AtomicU64::new(0),
                 coalesce_count: AtomicU64::new(0),
             }),
@@ -242,9 +293,58 @@ impl InterruptManager {
         self.state.async_tx.clone()
     }
 
+    /// Register a synchronous interrupt callback (averaging device support).
+    ///
+    /// The callback is invoked INLINE inside every matching [`notify`](Self::notify)
+    /// — synchronously, on the notifying thread, with no coalescing and no
+    /// channel. This is the faithful analogue of C `registerInterruptUser`
+    /// (asynPortDriver.cpp), required where the consumer must observe every
+    /// sample (e.g. `interruptCallbackAverage`'s `sum += value`). Returns an
+    /// RAII [`SyncCallbackSubscription`]; dropping it unregisters the callback.
+    /// The callback must be cheap (it runs on the port-actor thread) and must
+    /// not call back into the interrupt system.
+    pub fn register_sync_callback<F>(
+        &self,
+        filter: InterruptFilter,
+        callback: F,
+    ) -> SyncCallbackSubscription
+    where
+        F: Fn(&InterruptValue) + Send + Sync + 'static,
+    {
+        let cb = Arc::new(SyncCallback {
+            filter,
+            callback: Box::new(callback),
+            active: AtomicBool::new(true),
+        });
+        self.state.sync_callbacks.lock().push(cb.clone());
+        SyncCallbackSubscription {
+            callback: cb,
+            state: self.state.clone(),
+        }
+    }
+
     /// Send an interrupt to all subscribers (both broadcast and mailbox).
     pub fn notify(&self, value: InterruptValue) {
         self.state.notify_count.fetch_add(1, Ordering::Relaxed);
+
+        // Synchronous callbacks (averaging device support): invoke inline for
+        // every matching value, no coalescing — C registerInterruptUser. Snapshot
+        // the active callbacks under the lock, then invoke after releasing it so a
+        // callback cannot block concurrent register/drop. The snapshot is empty
+        // (no allocation) in the common no-averaging case.
+        let sync_cbs: Vec<Arc<SyncCallback>> = {
+            let guard = self.state.sync_callbacks.lock();
+            guard
+                .iter()
+                .filter(|c| c.active.load(Ordering::Relaxed))
+                .cloned()
+                .collect()
+        };
+        for cb in &sync_cbs {
+            if cb.filter.matches(&value) {
+                (cb.callback)(&value);
+            }
+        }
 
         // Deliver to mailbox subscribers (filtered, coalescing).
         let subs = self.state.mailboxes.lock();

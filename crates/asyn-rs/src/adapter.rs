@@ -1276,6 +1276,18 @@ impl AsynDeviceSupport {
         if self.iface_type == "asynInt32" {
             if let EpicsValue::Long(raw) = val {
                 if record.get_field("ESLO").is_some() {
+                    // Output records (ao) own the `raw -> eng` INVERSE convert:
+                    // `apply_raw_readback` stores RVAL and computes VAL, then we
+                    // return `true` (computed) so the framework skips the
+                    // record's forward `eng -> raw` convert that would otherwise
+                    // recompute RVAL from the stale VAL and discard the readback
+                    // (C `processAo` readback, devAsynInt32.c:973-994). Input
+                    // records (ai) decline the hook (default `false`) and keep
+                    // the `raw -> RVAL` route, letting the framework run their
+                    // `raw -> eng` convert (C `processAi` return 0).
+                    if record.apply_raw_readback(raw) {
+                        return true;
+                    }
                     let _ = record.put_field("RVAL", EpicsValue::Long(raw));
                     return false;
                 }
@@ -1481,7 +1493,21 @@ impl DeviceSupport for AsynDeviceSupport {
                     // paths).
                     if result.aux_status == crate::error::AsynStatus::Success {
                         if let Some(val) = self.result_to_value(&result) {
-                            let _ = record.set_val(val);
+                            // ao seeds VAL from the raw readback via its
+                            // `raw -> eng` inverse: C `initAo` sets `rval=value`
+                            // and returns INIT_OK so aoRecord runs the readback
+                            // convert (devAsynInt32.c:947-957). longout/mbbo
+                            // have no such inverse (VAL == raw / state-map) and
+                            // float64 outputs carry no Long here — they seed VAL
+                            // directly, unchanged.
+                            let seeded = if let EpicsValue::Long(raw) = val {
+                                record.apply_raw_readback(raw)
+                            } else {
+                                false
+                            };
+                            if !seeded {
+                                let _ = record.set_val(val);
+                            }
                         }
                     }
                 }
@@ -4864,6 +4890,78 @@ mod tests {
             Some(EpicsValue::Long(5)),
             "a successful initial read seeds the device value"
         );
+    }
+
+    /// An asynInt32 ao with a non-trivial ESLO/EOFF: the init seed must store
+    /// the raw to RVAL and run the `raw -> eng` inverse, seeding VAL with the
+    /// engineering value (C `initAo`: rval=value, INIT_OK → readback convert,
+    /// devAsynInt32.c:947-957), NOT the raw counts.
+    #[test]
+    fn init_readback_ao_seeds_engineering_val_not_raw() {
+        use epics_base_rs::server::records::ao::AoRecord;
+        let mut ads = make_seeded_int32_adapter(5, crate::error::AsynStatus::Success);
+        ads.initial_readback = true;
+        let mut rec = AoRecord::new(0.0);
+        rec.linr = 2; // LINEAR
+        rec.eslo = 2.0;
+        rec.eoff = 10.0;
+        ads.init(&mut rec).unwrap();
+        assert_eq!(
+            rec.get_field("RVAL"),
+            Some(EpicsValue::Long(5)),
+            "raw readback stored to RVAL"
+        );
+        match rec.get_field("VAL") {
+            Some(EpicsValue::Double(v)) => assert!(
+                (v - 20.0).abs() < 1e-9,
+                "VAL = raw*ESLO + EOFF = 5*2 + 10 = 20 (engineering), got {v}"
+            ),
+            other => panic!("expected Double(20.0), got {other:?}"),
+        }
+    }
+
+    /// The process-time driver readback (asyn:READBACK) for an asynInt32 ao:
+    /// the ring-pop store routes the raw through `apply_raw_readback`, so VAL
+    /// gets the engineering value and the outcome is `computed` (the framework
+    /// then skips ao's forward convert via `set_device_did_compute`). Contrast
+    /// the input ai path, which routes raw -> RVAL and returns `ok` (convert).
+    #[test]
+    fn io_intr_readback_ao_inverts_raw_to_engineering_val() {
+        use epics_base_rs::server::records::ao::AoRecord;
+        let mut ads = make_adapter(ScanType::Passive); // scalar asynInt32
+        ads.set_asyn_readback(true); // output readback path
+        let mut rec = AoRecord::new(0.0);
+        ads.init(&mut rec).unwrap();
+        rec.linr = 2; // LINEAR
+        rec.eslo = 2.0;
+        rec.eoff = 10.0;
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32(5),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Success,
+            });
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(
+            outcome.did_compute,
+            "ao readback produces VAL itself → computed (framework skips the forward convert)"
+        );
+        assert_eq!(
+            rec.get_field("RVAL"),
+            Some(EpicsValue::Long(5)),
+            "raw readback stored to RVAL"
+        );
+        match rec.get_field("VAL") {
+            Some(EpicsValue::Double(v)) => assert!(
+                (v - 20.0).abs() < 1e-9,
+                "VAL = 5*2 + 10 = 20 (engineering), not the raw 5, got {v}"
+            ),
+            other => panic!("expected Double(20.0), got {other:?}"),
+        }
     }
 
     /// A `ScanType::IoIntr` adapter on `asynFloat64` whose driver exposes a

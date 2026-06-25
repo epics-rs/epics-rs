@@ -50,11 +50,21 @@ pub struct AoRecord {
     pub mlst: f64,
     // Runtime
     pub init: bool,
-    /// Set by `convert()` when `LINR >= 3` selects a breakpoint-table
-    /// linearisation this port cannot resolve. C `aoRecord.c::convert`
-    /// raises `SOFT_ALARM/MAJOR_ALARM` on a BPT failure; `check_alarms`
-    /// consumes this flag to do the same.
+    /// Set by `convert()` when a `LINR >= 3` breakpoint-table conversion
+    /// fails — the table could not be resolved, or the engineering value
+    /// fell past an end of the table. C `aoRecord.c::convert` raises
+    /// `SOFT_ALARM/MAJOR_ALARM` and returns (rval left unchanged) in both
+    /// cases (aoRecord.c:494-499); `check_alarms` consumes this flag to do
+    /// the same.
     bpt_error: bool,
+    /// The database breakpoint-table registry (`install_breaktable_registry`),
+    /// used to resolve the `LINR >= 3` table lazily.
+    bpt_registry: Option<std::sync::Arc<crate::server::cvt_bpt::BreakTableRegistry>>,
+    /// The resolved breakpoint table for the current `LINR` (C `pbrk` cache);
+    /// reset to `None` when `LINR` changes so the next conversion re-resolves.
+    bpt_table: Option<std::sync::Arc<crate::server::cvt_bpt::BrkTable>>,
+    /// Cached last breakpoint interval index (C `lbrk`).
+    lbrk: usize,
     /// Set by [`Record::set_device_did_compute`] when asyn device support has
     /// already produced the final `VAL`/`RVAL` from a raw device readback (the
     /// `raw → eng` inverse convert, [`AoRecord::convert_readback`]). When set,
@@ -108,6 +118,9 @@ impl Default for AoRecord {
             mlst: 0.0,
             init: false,
             bpt_error: false,
+            bpt_registry: None,
+            bpt_table: None,
+            lbrk: 0,
             skip_convert: false,
             simm: 0,
             siml: String::new(),
@@ -167,14 +180,39 @@ impl AoRecord {
             }
             0 => {} // NO_CONVERSION
             _ => {
-                // LINR >= 3 selects a breakpoint-table linearisation.
-                // epics-base-rs has no breakpoint-table registry, so the
-                // table cannot be applied — the value passes through
-                // unconverted. C `aoRecord.c::convert` (lines 494-499)
-                // raises `SOFT_ALARM/MAJOR_ALARM` and returns on a BPT
-                // failure; flag it here so `check_alarms` raises the same
-                // alarm rather than leaving the misconfiguration silent.
-                self.bpt_error = true;
+                // LINR >= 3 selects a breakpoint-table linearisation. Resolve
+                // the table lazily and cache it (C `cvtEngToRawBpt` resolves
+                // via `findBrkTable` on the first call / after a LINR change).
+                if self.bpt_table.is_none() {
+                    self.bpt_table = self
+                        .bpt_registry
+                        .as_ref()
+                        .and_then(|reg| reg.table_for_linr(self.linr));
+                }
+                match &self.bpt_table {
+                    Some(table) => {
+                        let (raw, status) = crate::server::cvt_bpt::cvt_eng_to_raw_bpt(
+                            value,
+                            table,
+                            &mut self.lbrk,
+                        );
+                        if status == crate::server::cvt_bpt::BptStatus::OutOfRange {
+                            // C `aoRecord.c:494-499`: a non-zero
+                            // `cvtEngToRawBpt` raises SOFT/MAJOR and returns,
+                            // leaving RVAL/ORAW unchanged. OVAL was already
+                            // updated above (the OROC step), matching C which
+                            // sets `oval` before the linearisation switch.
+                            self.bpt_error = true;
+                            return;
+                        }
+                        value = raw;
+                    }
+                    None => {
+                        // Table not found: same early return (rval unchanged).
+                        self.bpt_error = true;
+                        return;
+                    }
+                }
             }
         }
 
@@ -218,8 +256,13 @@ impl AoRecord {
         value += self.aoff;
 
         // C: NO_CONVERSION → passthrough; LINEAR/SLOPE → value*eslo + eoff;
-        // a breakpoint table (LINR >= 3) is unresolvable here, same as
-        // convert() — flag it so check_alarms raises SOFT_ALARM/MAJOR.
+        // LINR >= 3 → `cvtRawToEngBpt`. Unlike the forward `convert()`, C's
+        // asyn ao readback (`processAo`, devAsynInt32.c:977-991) does NOT
+        // early-return or set record severity on a BPT failure — it logs and
+        // still assigns `pr->val = value`. So here the readback applies the
+        // table when resolved and otherwise leaves the un-linearised value;
+        // it does not raise `bpt_error` (the C readback's errlog has no
+        // record-alarm side effect, so omitting it is value-faithful).
         self.bpt_error = false;
         match self.linr {
             0 => {}
@@ -227,7 +270,17 @@ impl AoRecord {
                 value = value * self.eslo + self.eoff;
             }
             _ => {
-                self.bpt_error = true;
+                if self.bpt_table.is_none() {
+                    self.bpt_table = self
+                        .bpt_registry
+                        .as_ref()
+                        .and_then(|reg| reg.table_for_linr(self.linr));
+                }
+                if let Some(table) = &self.bpt_table {
+                    let (eng, _status) =
+                        crate::server::cvt_bpt::cvt_raw_to_eng_bpt(value, table, &mut self.lbrk);
+                    value = eng;
+                }
             }
         }
         self.val = value;
@@ -513,6 +566,16 @@ impl Record for AoRecord {
         self.skip_convert = did_compute;
     }
 
+    fn install_breaktable_registry(
+        &mut self,
+        registry: std::sync::Arc<crate::server::cvt_bpt::BreakTableRegistry>,
+    ) {
+        self.bpt_registry = Some(registry);
+        // Force a re-resolve on the next conversion in case LINR was already
+        // set to a breakpoint table before the registry was installed.
+        self.bpt_table = None;
+    }
+
     /// Apply a raw device readback to this output record: store the raw value
     /// into `RVAL` and compute the engineering `VAL` via the `raw → eng`
     /// inverse convert ([`AoRecord::convert_readback`]). Returns `true` so the
@@ -670,6 +733,11 @@ impl Record for AoRecord {
                     if self.linr == 2 {
                         self.eoff = self.egul;
                     }
+                    // A LINR change re-selects the breakpoint table (C
+                    // `special_linconv`); drop the cached table + interval
+                    // index so the next conversion resolves the new LINR.
+                    self.bpt_table = None;
+                    self.lbrk = 0;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -907,6 +975,102 @@ mod tests {
         assert_eq!(
             rec.eoff, 1.5,
             "EGUL put under SLOPE must leave user-configured eoff alone"
+        );
+    }
+
+    /// A monotonic-up ramp table: raw 0..300 -> eng 0..30, slope 0.1.
+    fn ramp_registry() -> std::sync::Arc<crate::server::cvt_bpt::BreakTableRegistry> {
+        let mut reg = crate::server::cvt_bpt::BreakTableRegistry::new();
+        reg.insert(
+            crate::server::cvt_bpt::BrkTable::build(
+                "ramp",
+                &[(0.0, 0.0), (100.0, 10.0), (300.0, 30.0)],
+            )
+            .unwrap(),
+        );
+        std::sync::Arc::new(reg)
+    }
+
+    /// LINR >= 3 forward `convert()` (eng -> raw) resolves the table and
+    /// inverts it (C `cvtEngToRawBpt`).
+    #[test]
+    fn linr_breaktable_converts_eng_to_raw_in_range() {
+        let mut rec = AoRecord::default();
+        rec.install_breaktable_registry(ramp_registry());
+        rec.aslo = 1.0;
+        rec.aoff = 0.0;
+        rec.roff = 0;
+        rec.put_field("LINR", EpicsValue::Short(3)).unwrap();
+        rec.val = 5.0; // engineering
+
+        rec.convert();
+
+        // eng 5 -> raw 50 (inverse of the ramp).
+        assert_eq!(rec.rval, 50);
+        assert!(
+            !rec.bpt_error,
+            "in-range conversion must not raise BPT error"
+        );
+    }
+
+    /// Out of range: ao DOES early-return (aoRecord.c:494-499) — RVAL is left
+    /// unchanged and the error is flagged, unlike ai which keeps the
+    /// extrapolated value.
+    #[test]
+    fn linr_breaktable_out_of_range_early_returns_keeping_rval() {
+        let mut rec = AoRecord::default();
+        rec.install_breaktable_registry(ramp_registry());
+        rec.aslo = 1.0;
+        rec.put_field("LINR", EpicsValue::Short(3)).unwrap();
+        rec.rval = 12345; // sentinel: must survive the early return
+        rec.val = 1000.0; // eng past the table's high end (30)
+
+        rec.convert();
+
+        assert!(rec.bpt_error, "out-of-range must raise BPT error");
+        assert_eq!(rec.rval, 12345, "ao must NOT update RVAL on a BPT failure");
+    }
+
+    /// A LINR selecting no registered table early-returns with the error
+    /// flagged and RVAL unchanged.
+    #[test]
+    fn linr_breaktable_not_found_early_returns_keeping_rval() {
+        let mut rec = AoRecord::default();
+        rec.install_breaktable_registry(ramp_registry());
+        rec.aslo = 1.0;
+        rec.put_field("LINR", EpicsValue::Short(4)).unwrap(); // no table at index 4
+        rec.rval = 777;
+        rec.val = 5.0;
+
+        rec.convert();
+
+        assert!(rec.bpt_error, "unresolved table must raise BPT error");
+        assert_eq!(
+            rec.rval, 777,
+            "ao must NOT update RVAL when table is missing"
+        );
+    }
+
+    /// The asyn readback inverse `convert_readback()` (raw -> eng) applies the
+    /// table for LINR >= 3 and, per C `processAo`, does NOT raise a record
+    /// alarm on the readback path.
+    #[test]
+    fn linr_breaktable_readback_converts_raw_to_eng_without_alarm() {
+        let mut rec = AoRecord::default();
+        rec.install_breaktable_registry(ramp_registry());
+        rec.aslo = 1.0;
+        rec.aoff = 0.0;
+        rec.roff = 0;
+        rec.put_field("LINR", EpicsValue::Short(3)).unwrap();
+        rec.rval = 200; // raw from the device
+
+        rec.convert_readback();
+
+        // raw 200 in [100,300] -> eng = 10 + (200-100)*0.1 = 20.0.
+        assert_eq!(rec.val, 20.0);
+        assert!(
+            !rec.bpt_error,
+            "the asyn readback path must not raise a BPT alarm"
         );
     }
 }

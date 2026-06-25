@@ -11,6 +11,7 @@ use crate::error::{CaError, CaResult};
 use crate::server::record::{self, Record, SubroutineFn};
 use crate::types::EpicsValue;
 
+use super::cvt_bpt::BrkTable;
 use super::database::PvDatabase;
 use super::device_support;
 use super::ioc_app::{DeviceSupportContext, DynamicDeviceSupportFactory};
@@ -25,6 +26,10 @@ pub struct IocBuilder {
     pvs: Vec<(String, EpicsValue)>,
     records: Vec<(String, Box<dyn Record>)>,
     db_defs: Vec<db_loader::DbRecordDef>,
+    /// `breaktable(...)` definitions parsed from the loaded `.db`/`.dbd` text,
+    /// used to populate the breakpoint-table registry for `ai`/`ao` records
+    /// with `LINR >= 3`.
+    breaktables: Vec<BrkTable>,
     device_factories: HashMap<String, DeviceSupportFactory>,
     /// Fallback factory consulted when the static `device_factories`
     /// map has no entry for a record's DTYP. Mirrors
@@ -54,6 +59,7 @@ impl IocBuilder {
             pvs: Vec::new(),
             records: Vec::new(),
             db_defs: Vec::new(),
+            breaktables: Vec::new(),
             device_factories,
             // The base built-in device support — all needing the runtime
             // context (INP/OUT). Pre-registered as the base of the
@@ -88,15 +94,17 @@ impl IocBuilder {
     /// Load records from a .db file.
     pub fn db_file(mut self, path: &str, macros: &HashMap<String, String>) -> CaResult<Self> {
         let content = std::fs::read_to_string(path).map_err(CaError::Io)?;
-        let defs = db_loader::parse_db(&content, macros)?;
+        let (defs, breaktables) = db_loader::parse_db_with_breaktables(&content, macros)?;
         self.db_defs.extend(defs);
+        self.breaktables.extend(breaktables);
         Ok(self)
     }
 
     /// Load records from a .db string.
     pub fn db_string(mut self, content: &str, macros: &HashMap<String, String>) -> CaResult<Self> {
-        let defs = db_loader::parse_db(content, macros)?;
+        let (defs, breaktables) = db_loader::parse_db_with_breaktables(content, macros)?;
         self.db_defs.extend(defs);
+        self.breaktables.extend(breaktables);
         Ok(self)
     }
 
@@ -181,6 +189,15 @@ impl IocBuilder {
     pub async fn build(self) -> CaResult<(Arc<PvDatabase>, Option<autosave::SaveSetConfig>)> {
         let db = Arc::new(PvDatabase::new());
 
+        // Breakpoint-table registry (C `bptList`): merge every loaded
+        // `breaktable(...)` into the database's shared registry (the single
+        // owner — also grown later by runtime `dbLoadRecords`) and take a
+        // snapshot to install on this build's `ai`/`ao` records. Name-sorted by
+        // `BreakTableRegistry`, so `LINR = 3` selects the first table. When no
+        // tables were loaded the snapshot is empty and never installed (zero
+        // overhead for IOCs that use none).
+        let breaktable_registry = db.add_breaktables(self.breaktables).await;
+
         // 1. Simple PVs
         for (name, value) in self.pvs {
             db.add_pv(&name, value).await?;
@@ -212,9 +229,24 @@ impl IocBuilder {
         }
 
         // 3. .db definitions — create records, apply fields, init, wire device support & subs
-        for def in self.db_defs {
+        for mut def in self.db_defs {
             let mut record =
                 db_loader::create_record_with_factories(&def.record_type, &self.record_factories)?;
+
+            // Resolve a `LINR` field that names a loaded breakpoint table to the
+            // numeric `menuConvert` index that selects it, then hand the record
+            // the registry snapshot so a `LINR >= 3` conversion can resolve its
+            // table. The install trait default is a no-op, so records without a
+            // `LINR` field ignore it.
+            db_loader::resolve_linr_breaktable_names(
+                &def.record_type,
+                &mut def.fields,
+                &breaktable_registry,
+            );
+            if !breaktable_registry.is_empty() {
+                record.install_breaktable_registry(breaktable_registry.clone());
+            }
+
             let mut common_fields = Vec::new();
             db_loader::apply_fields(&mut record, &def.fields, &mut common_fields)?;
 
@@ -525,6 +557,41 @@ record(ai, "AI:WITH:INFO") {
         assert_eq!(inst.get_info("asyn:READBACK"), Some("1"));
         assert_eq!(inst.get_info("Q:group"), Some("myGroup"));
         assert_eq!(inst.get_info("missing"), None);
+    }
+
+    /// End-to-end breakpoint table: a `breaktable(...)` plus an `ai` whose
+    /// `LINR` names it must, after `build()`, resolve the name to its
+    /// `menuConvert` index AND convert raw -> eng through the installed
+    /// registry. Proves the full loader -> registry -> record wiring.
+    #[tokio::test]
+    async fn db_string_breaktable_linr_resolves_and_converts() {
+        let db_content = r#"
+breaktable(ramp) {
+    0    0
+    100  10
+    300  30
+}
+record(ai, "AI:BPT") {
+    field(LINR, "ramp")
+}
+"#;
+        let (db, _) = IocBuilder::new()
+            .register_record_type("ai", ai_factory)
+            .db_string(db_content, &HashMap::new())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let rec = db.get_record("AI:BPT").await.unwrap();
+        let mut inst = rec.write().await;
+        // The "ramp" name resolved to the first menuConvert table index (3).
+        assert_eq!(inst.record.get_field("LINR"), Some(EpicsValue::Short(3)));
+        // The installed registry makes the conversion work end-to-end:
+        // raw 50 in [0,100] -> eng 5.0.
+        inst.record.put_field("RVAL", EpicsValue::Long(50)).unwrap();
+        inst.record.process().unwrap();
+        assert_eq!(inst.record.get_field("VAL"), Some(EpicsValue::Double(5.0)));
     }
 
     /// Regression: IocBuilder must consult the dynamic

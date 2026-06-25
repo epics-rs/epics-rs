@@ -1002,17 +1002,32 @@ fn cmd_db_load_records() -> CommandDef {
                     p.to_path_buf()
                 }
             };
-            let mut defs = db_loader::parse_db_file(&file_path, &macros, &config)
-                .map_err(|e| format!("parse error: {e}"))?;
+            let (mut defs, breaktables) =
+                db_loader::parse_db_file_with_breaktables(&file_path, &macros, &config)
+                    .map_err(|e| format!("parse error: {e}"))?;
 
             // DTYP override: if macros contain DTYP, override existing DTYP fields
             if let Some(dtyp) = macros.get("DTYP") {
                 db_loader::override_dtyp(&mut defs, dtyp);
             }
 
+            // Merge any `breaktable(...)` definitions into the database's shared
+            // breakpoint-table registry (C `bptList`) and snapshot it for the
+            // records loaded by this command. A record resolves a table loaded
+            // by an earlier or the same `dbLoadRecords` (C ordering).
+            let breaktable_registry =
+                ctx.block_on(async { ctx.db().add_breaktables(breaktables).await });
+
             let count = defs.len();
 
-            for def in defs {
+            for mut def in defs {
+                // Resolve a `LINR` field naming a loaded breakpoint table to its
+                // menuConvert index (shared with the IocBuilder load path).
+                db_loader::resolve_linr_breaktable_names(
+                    &def.record_type,
+                    &mut def.fields,
+                    &breaktable_registry,
+                );
                 let added: Result<(), String> = ctx.block_on(async {
                     // C-parity (dbLexRoutines.c:1170-1188): the SAME
                     // record name re-loaded with the SAME record_type
@@ -1059,6 +1074,13 @@ fn cmd_db_load_records() -> CommandDef {
                     } else {
                         let mut record = db_loader::create_record(&def.record_type)
                             .map_err(|e| format!("{e}"))?;
+                        // Hand a new `ai`/`ao` record the breakpoint-table
+                        // registry before its fields are applied so a
+                        // `LINR >= 3` conversion can resolve its table. (Merge
+                        // reloads keep the record's first-load registry.)
+                        if !breaktable_registry.is_empty() {
+                            record.install_breaktable_registry(breaktable_registry.clone());
+                        }
                         if let Err(e) =
                             db_loader::apply_fields(&mut record, &def.fields, &mut common_fields)
                         {

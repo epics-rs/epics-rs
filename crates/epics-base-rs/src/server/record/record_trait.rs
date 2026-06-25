@@ -517,6 +517,19 @@ pub trait Record: Send + Sync + 'static {
         false
     }
 
+    /// Hand the record the database's breakpoint-table registry so an `ai`/`ao`
+    /// with `LINR >= 3` can resolve and cache the table its `LINR` selects.
+    /// Called once at iocInit, before the first `process`/`convert`. The record
+    /// resolves the table lazily on the first conversion (and re-resolves when
+    /// `LINR` changes at runtime), mirroring C `cvtRawToEngBpt`'s
+    /// `init || *ppbrk == NULL` cache. The default is a no-op: only `ai`/`ao`
+    /// carry `LINR`.
+    fn install_breaktable_registry(
+        &mut self,
+        _registry: std::sync::Arc<crate::server::cvt_bpt::BreakTableRegistry>,
+    ) {
+    }
+
     /// Apply IVOA=2 ("set outputs to IVOV") semantics: copy the
     /// IVOV value into whatever output staging field the OUT
     /// writeback consumes for this record type. Mirrors the

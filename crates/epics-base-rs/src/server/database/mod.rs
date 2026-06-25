@@ -270,6 +270,13 @@ struct PvDatabaseInner {
     /// SUBL). Populated once at iocInit from the IocApp/IocBuilder registry;
     /// read-only thereafter.
     subroutine_registry: RwLock<HashMap<String, Arc<crate::server::record::SubroutineFn>>>,
+    /// Breakpoint tables by name (C `bptList`), shared by every db-load path so
+    /// `ai`/`ao` records with `LINR >= 3` resolve their linearisation table. An
+    /// `Arc` snapshot is installed on each record at creation; the master grows
+    /// (copy-on-write via [`PvDatabase::add_breaktables`]) as `dbLoadRecords`
+    /// loads more `breaktable(...)` definitions, so build-time and runtime
+    /// loads share one registry.
+    breaktable_registry: RwLock<Arc<crate::server::cvt_bpt::BreakTableRegistry>>,
 }
 
 /// Database of all process variables hosted by this server.
@@ -434,8 +441,42 @@ impl PvDatabase {
                 pini_notify: tokio::sync::Notify::new(),
                 record_locks: record_lock::RecordLockRegistry::default(),
                 subroutine_registry: RwLock::new(HashMap::new()),
+                breaktable_registry: RwLock::new(Arc::new(
+                    crate::server::cvt_bpt::BreakTableRegistry::new(),
+                )),
             }),
         }
+    }
+
+    /// Merge `tables` into the shared breakpoint-table registry (C `bptList`
+    /// accumulation across `dbLoadDatabase`/`dbLoadRecords`) and return the new
+    /// snapshot. Copy-on-write: existing record snapshots keep their `Arc`
+    /// while later records get one that includes the added tables. A record
+    /// only needs the table it references, which a correctly-ordered IOC loads
+    /// before the record (matching C). Returns the current snapshot unchanged
+    /// when `tables` is empty.
+    pub async fn add_breaktables(
+        &self,
+        tables: Vec<crate::server::cvt_bpt::BrkTable>,
+    ) -> Arc<crate::server::cvt_bpt::BreakTableRegistry> {
+        let mut guard = self.inner.breaktable_registry.write().await;
+        if tables.is_empty() {
+            return guard.clone();
+        }
+        let mut next = (**guard).clone();
+        for table in tables {
+            next.insert(table);
+        }
+        let snapshot = Arc::new(next);
+        *guard = snapshot.clone();
+        snapshot
+    }
+
+    /// The current breakpoint-table registry snapshot.
+    pub async fn breaktable_registry_snapshot(
+        &self,
+    ) -> Arc<crate::server::cvt_bpt::BreakTableRegistry> {
+        self.inner.breaktable_registry.read().await.clone()
     }
 
     /// Install the by-name subroutine registry, retained for runtime

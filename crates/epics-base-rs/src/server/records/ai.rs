@@ -38,12 +38,23 @@ pub struct AiRecord {
     pub mlst: f64,
     pub init: bool,
     skip_convert: bool,
-    /// Set by `process()` when `LINR >= 3` selects a breakpoint-table
-    /// linearisation that this port cannot resolve (no breakpoint-table
-    /// registry). C `aiRecord.c::convert` raises `SOFT_ALARM/MAJOR_ALARM`
-    /// on a BPT failure; `check_alarms` consumes this flag to do the
-    /// same so the misconfiguration is not silent.
+    /// Set by `process()` when a `LINR >= 3` breakpoint-table conversion
+    /// fails — the table could not be resolved, or the raw value fell past
+    /// an end of the table. C `aiRecord.c::convert` raises
+    /// `SOFT_ALARM/MAJOR_ALARM` ("BPT Error") in both cases
+    /// (aiRecord.c:434-435); `check_alarms` consumes this flag to do the
+    /// same so the misconfiguration / out-of-range is not silent.
     bpt_error: bool,
+    /// The database breakpoint-table registry (`install_breaktable_registry`),
+    /// used to resolve the `LINR >= 3` table lazily.
+    bpt_registry: Option<std::sync::Arc<crate::server::cvt_bpt::BreakTableRegistry>>,
+    /// The resolved breakpoint table for the current `LINR` (C `pbrk` cache).
+    /// `None` until the first `LINR >= 3` conversion resolves it; reset to
+    /// `None` when `LINR` changes so the next conversion re-resolves.
+    bpt_table: Option<std::sync::Arc<crate::server::cvt_bpt::BrkTable>>,
+    /// Cached last breakpoint interval index (C `lbrk`), so a monotonic input
+    /// does not re-scan the table from the start each conversion.
+    lbrk: usize,
     // Simulation
     pub simm: i16,
     pub siml: String,
@@ -85,6 +96,9 @@ impl Default for AiRecord {
             init: false,
             skip_convert: false,
             bpt_error: false,
+            bpt_registry: None,
+            bpt_table: None,
+            lbrk: 0,
             simm: 0,
             siml: String::new(),
             siol: String::new(),
@@ -303,16 +317,39 @@ impl Record for AiRecord {
                     v = v * self.eslo + self.eoff;
                 }
                 _ => {
-                    // LINR >= 3 selects a breakpoint-table linearisation
-                    // (a `.dbd` breakpoint-menu choice). epics-base-rs
-                    // has no breakpoint-table registry, so the table
-                    // cannot be applied — the value passes through
-                    // unconverted. C `aiRecord.c::convert` (lines
-                    // 433-436) treats a BPT failure as
-                    // `SOFT_ALARM/MAJOR_ALARM`; flag it here so
-                    // `check_alarms` raises the same alarm rather than
-                    // leaving the misconfiguration silent.
-                    self.bpt_error = true;
+                    // LINR >= 3 selects a breakpoint-table linearisation.
+                    // Resolve the table lazily from the registry and cache it
+                    // (C `cvtRawToEngBpt` resolves via `findBrkTable` on the
+                    // first call / after a LINR change, then caches `pbrk`).
+                    if self.bpt_table.is_none() {
+                        self.bpt_table = self
+                            .bpt_registry
+                            .as_ref()
+                            .and_then(|reg| reg.table_for_linr(self.linr));
+                    }
+                    match &self.bpt_table {
+                        Some(table) => {
+                            // C applies the (possibly extrapolated) value even
+                            // out of range, but still raises the alarm
+                            // (aiRecord.c:434-435 does not early-return).
+                            let (eng, status) = crate::server::cvt_bpt::cvt_raw_to_eng_bpt(
+                                v,
+                                table,
+                                &mut self.lbrk,
+                            );
+                            v = eng;
+                            if status == crate::server::cvt_bpt::BptStatus::OutOfRange {
+                                self.bpt_error = true;
+                            }
+                        }
+                        None => {
+                            // Table not found: C `cvtRawToEngBpt` returns
+                            // `S_dbLib_badField` before touching `*pval`, so the
+                            // value is left at the pre-linearisation `v`; the
+                            // record raises `SOFT_ALARM/MAJOR_ALARM`.
+                            self.bpt_error = true;
+                        }
+                    }
                 }
             }
 
@@ -429,6 +466,13 @@ impl Record for AiRecord {
                     if self.linr == 2 {
                         self.eoff = self.egul;
                     }
+                    // A LINR change re-selects the breakpoint table (C
+                    // `special_linconv` sets `init=TRUE`, which makes the next
+                    // `cvtRawToEngBpt` re-resolve via `findBrkTable`). Drop the
+                    // cached table + interval index so the next conversion
+                    // resolves the new LINR.
+                    self.bpt_table = None;
+                    self.lbrk = 0;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),
@@ -624,6 +668,16 @@ impl Record for AiRecord {
         self.skip_convert = did_compute;
     }
 
+    fn install_breaktable_registry(
+        &mut self,
+        registry: std::sync::Arc<crate::server::cvt_bpt::BreakTableRegistry>,
+    ) {
+        self.bpt_registry = Some(registry);
+        // Force a re-resolve on the next conversion in case LINR was already
+        // set to a breakpoint table before the registry was installed.
+        self.bpt_table = None;
+    }
+
     /// `ai` has an `RVAL → VAL` `convert()` step (raw → engineering
     /// units). A `Soft Channel` `ai` must skip it — C `devAiSoft.c`
     /// `read_ai` returns 2 ("don't convert").
@@ -698,5 +752,83 @@ mod tests {
             rec.eoff, 1.5,
             "EGUL put under SLOPE must leave user-configured eoff alone"
         );
+    }
+
+    /// A monotonic-up ramp table: raw 0..300 -> eng 0..30, slope 0.1.
+    fn ramp_registry() -> std::sync::Arc<crate::server::cvt_bpt::BreakTableRegistry> {
+        let mut reg = crate::server::cvt_bpt::BreakTableRegistry::new();
+        reg.insert(
+            crate::server::cvt_bpt::BrkTable::build(
+                "ramp",
+                &[(0.0, 0.0), (100.0, 10.0), (300.0, 30.0)],
+            )
+            .unwrap(),
+        );
+        std::sync::Arc::new(reg)
+    }
+
+    /// LINR >= 3 resolves the named breakpoint table from the installed
+    /// registry and converts raw -> eng in range (C `cvtRawToEngBpt`).
+    #[test]
+    fn linr_breaktable_converts_raw_to_eng_in_range() {
+        let mut rec = AiRecord::default();
+        rec.install_breaktable_registry(ramp_registry());
+        rec.aslo = 1.0;
+        rec.aoff = 0.0;
+        rec.roff = 0;
+        // LINR = 3 is the first (only) registered table, "ramp".
+        rec.put_field("LINR", EpicsValue::Short(3)).unwrap();
+        rec.put_field("RVAL", EpicsValue::Long(50)).unwrap();
+
+        rec.process().unwrap();
+
+        // raw 50 in [0,100] -> eng = 0 + (50-0)*0.1 = 5.0.
+        assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Double(5.0)));
+        assert!(
+            !rec.bpt_error,
+            "in-range conversion must not raise BPT error"
+        );
+    }
+
+    /// Out of range: ai still applies the extrapolated value (C does NOT
+    /// early-return, aiRecord.c:432-437) but raises SOFT_ALARM/MAJOR via
+    /// `bpt_error`.
+    #[test]
+    fn linr_breaktable_out_of_range_extrapolates_and_flags() {
+        let mut rec = AiRecord::default();
+        rec.install_breaktable_registry(ramp_registry());
+        rec.aslo = 1.0;
+        rec.put_field("LINR", EpicsValue::Short(3)).unwrap();
+        rec.put_field("RVAL", EpicsValue::Long(400)).unwrap();
+
+        rec.process().unwrap();
+
+        // raw 400 past the high end (300): eng = 30 + (400-300)*0.1 = 40.0.
+        assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Double(40.0)));
+        assert!(
+            rec.bpt_error,
+            "out-of-range conversion must raise BPT error"
+        );
+    }
+
+    /// A LINR that selects no registered table flags the error and leaves the
+    /// value at the pre-linearisation raw (C `cvtRawToEngBpt` returns before
+    /// touching `*pval`).
+    #[test]
+    fn linr_breaktable_not_found_flags_and_passes_raw_through() {
+        let mut rec = AiRecord::default();
+        rec.install_breaktable_registry(ramp_registry());
+        rec.aslo = 1.0;
+        rec.aoff = 0.0;
+        rec.roff = 0;
+        // Only one table is registered (index 3); index 4 is unresolvable.
+        rec.put_field("LINR", EpicsValue::Short(4)).unwrap();
+        rec.put_field("RVAL", EpicsValue::Long(50)).unwrap();
+
+        rec.process().unwrap();
+
+        // Value left at the raw (no linearisation applied), error flagged.
+        assert_eq!(rec.get_field("VAL"), Some(EpicsValue::Double(50.0)));
+        assert!(rec.bpt_error, "unresolved table must raise BPT error");
     }
 }

@@ -317,6 +317,11 @@ pub struct AsynDeviceSupport {
     /// If true, this is a write-only device support (e.g. asynOctetWrite).
     /// read() returns no-op to avoid overwriting the record's native value type.
     write_only: bool,
+    /// asynOctetWriteBinary: write the record's full NORD bytes with NO NUL-trim
+    /// (C `callbackWfWriteBinary`, devAsynOctet.c:1086-1091, `writeIt(bptr, nord)`),
+    /// versus asynOctetWrite which trims at the first NUL (`my_strnlen`). Only
+    /// meaningful together with `write_only`.
+    octet_binary: bool,
     /// RAII interrupt subscription — dropping unsubscribes.
     interrupt_sub: Option<InterruptSubscription>,
     /// Per-record ring buffer of interrupt values, FIFO-ordered. The
@@ -458,6 +463,7 @@ impl AsynDeviceSupport {
             initial_readback: false,
             asyn_readback: false,
             write_only: false,
+            octet_binary: false,
             interrupt_sub: None,
             interrupt_fifo: Arc::new(std::sync::Mutex::new(InterruptFifo::new())),
             output_callback_pending: false,
@@ -1008,6 +1014,31 @@ impl AsynDeviceSupport {
     }
 
     /// Build a `RequestOp` for writing an `EpicsValue` for the current interface type.
+    /// asynOctetWriteBinary: build the write op for exactly NORD bytes, INCLUDING
+    /// any interior NUL. C `callbackWfWriteBinary` (devAsynOctet.c:1086-1091) does
+    /// `writeIt(pasynUser, pwf->bptr, pwf->nord)` — no `my_strnlen` NUL-trim
+    /// (contrast `callbackWfWrite`, :1071-1076, which trims). A plain `OctetWrite`
+    /// is emitted, NOT `OctetWriteBinary`: devAsynOctet does NO output-EOS
+    /// suppression, so the port's configured OEOS is still appended. (The name
+    /// collides with asynRecord OFMT=Binary, which DOES clear OEOS — a different
+    /// dset with different semantics; routing here to `OctetWriteBinary` would
+    /// wrongly strip the terminator.)
+    fn binary_write_op(&self, record: &dyn Record, val: &EpicsValue) -> Option<RequestOp> {
+        let EpicsValue::CharArray(data) = val else {
+            // Not a CHAR waveform value (not expected for this dset): fall back to
+            // the text path rather than silently dropping the write.
+            return self.write_op(val);
+        };
+        // Size by the record's NORD (C `pwf->nord`), clamped to the value length.
+        let nord = match record.get_field("NORD") {
+            Some(EpicsValue::Long(n)) => (n.max(0) as usize).min(data.len()),
+            _ => data.len(),
+        };
+        Some(RequestOp::OctetWrite {
+            data: data[..nord].to_vec(),
+        })
+    }
+
     fn write_op(&self, val: &EpicsValue) -> Option<RequestOp> {
         // First try exact match, then coerce numeric types to match the interface.
         // C EPICS always converts record VAL to the interface type (e.g. ao→double).
@@ -1330,11 +1361,18 @@ impl DeviceSupport for AsynDeviceSupport {
             return Ok(DeviceReadOutcome::ok());
         }
 
-        // Write-only (asynOctetWrite): waveform is an input record type so
-        // process calls read(), not write(). Perform the write here instead.
+        // Write-only (asynOctetWrite / asynOctetWriteBinary): waveform is an input
+        // record type so process calls read(), not write(). Perform the write
+        // here instead. The binary variant sends the full NORD bytes (no NUL-trim);
+        // the text variant trims at the first NUL via write_op.
         if self.write_only {
             if let Some(val) = record.val() {
-                if let Some(op) = self.write_op(&val) {
+                let op = if self.octet_binary {
+                    self.binary_write_op(&*record, &val)
+                } else {
+                    self.write_op(&val)
+                };
+                if let Some(op) = op {
                     let user = AsynUser::new(self.reason)
                         .with_addr(self.addr)
                         .with_timeout(self.timeout);
@@ -1748,10 +1786,16 @@ fn normalize_asyn_dtyp(dtyp: &str) -> String {
         }
     }
     // Octet direction suffixes: asynOctetRead/Write → asynOctet.
-    // asynOctetCmdResponse also resolves to the asynOctet interface — its
-    // write-then-read behavior is carried by `octet_cmd`, not a distinct
-    // interface (C devAsynOctet.c registers it on asynOctet like the others).
-    if dtyp == "asynOctetRead" || dtyp == "asynOctetWrite" || dtyp == "asynOctetCmdResponse" {
+    // asynOctetCmdResponse (write-then-read, carried by `octet_cmd`) and
+    // asynOctetWriteBinary (write-only, no-NUL-trim, carried by `octet_binary`)
+    // also resolve to the asynOctet interface — C devAsynOctet.c registers every
+    // one of these dsets on asynOctet; the direction/behavior is record state,
+    // not a distinct interface.
+    if dtyp == "asynOctetRead"
+        || dtyp == "asynOctetWrite"
+        || dtyp == "asynOctetWriteBinary"
+        || dtyp == "asynOctetCmdResponse"
+    {
         return "asynOctet".to_string();
     }
     dtyp.to_string()
@@ -1781,8 +1825,10 @@ pub fn universal_asyn_factory(
     let (link_str, is_output) = if ctx.out.contains("@asyn") || ctx.out.contains("@asynMask") {
         (ctx.out, true)
     } else if ctx.inp.contains("@asyn") || ctx.inp.contains("@asynMask") {
-        // asynOctetWrite uses INP field for output (C EPICS convention for waveform records)
-        let is_write_dtyp = ctx.dtyp == "asynOctetWrite";
+        // asynOctetWrite / asynOctetWriteBinary use the INP field for output
+        // (C waveform-output-via-INP convention; initWfWrite / initWfWriteBinary
+        // both pass &pwf->inp with isOutput=1, devAsynOctet.c:1065,1080).
+        let is_write_dtyp = ctx.dtyp == "asynOctetWrite" || ctx.dtyp == "asynOctetWriteBinary";
         (ctx.inp, is_write_dtyp)
     } else {
         return None;
@@ -1836,10 +1882,15 @@ pub fn universal_asyn_factory(
     }
 
     if is_output {
-        if ctx.dtyp == "asynOctetWrite" {
-            // asynOctetWrite is write-only — no reads allowed.
-            // Reading would replace waveform CharArray with String, breaking element_count.
+        if ctx.dtyp == "asynOctetWrite" || ctx.dtyp == "asynOctetWriteBinary" {
+            // asynOctetWrite / asynOctetWriteBinary are write-only — no reads
+            // allowed. Reading would replace the waveform CharArray with a String,
+            // breaking element_count.
             adapter.write_only = true;
+            // asynOctetWriteBinary writes the full NORD bytes with NO NUL-trim
+            // (C callbackWfWriteBinary, devAsynOctet.c:1086-1091), unlike
+            // asynOctetWrite which trims at the first NUL (my_strnlen, :1071-1076).
+            adapter.octet_binary = ctx.dtyp == "asynOctetWriteBinary";
         } else {
             // Output records: read back current driver value on init.
             // Mirrors C `initAo` / `initBo` / `initLongout` / `initMbbo`
@@ -3610,6 +3661,154 @@ mod tests {
         // asynOctetCmdResponse also collapses to asynOctet — the write-then-read
         // is carried by octet_cmd, not a distinct interface.
         assert_eq!(normalize_asyn_dtyp("asynOctetCmdResponse"), "asynOctet");
+        // asynOctetWriteBinary likewise — write-only/no-NUL-trim is carried by
+        // octet_binary, not a distinct interface.
+        assert_eq!(normalize_asyn_dtyp("asynOctetWriteBinary"), "asynOctet");
+    }
+
+    /// Mock octet port for asynOctetWriteBinary / asynOctetWrite: records every
+    /// write payload and accepts any DRVINFO as a param (useDrvUser=1, so init's
+    /// drv_user_create succeeds and the write-only read() path runs).
+    struct BinaryWritePort {
+        base: PortDriverBase,
+        writes: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+    impl PortDriver for BinaryWritePort {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        // useDrvUser=1: the DRVINFO is a real param. Accept any name (reason 0) so
+        // the test need not pre-register params on the mock.
+        fn drv_user_create(&self, _drv_info: &str) -> AsynResult<usize> {
+            Ok(0)
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+            self.writes.lock().unwrap().push(data.to_vec());
+            Ok(())
+        }
+    }
+
+    /// Spawn a [`BinaryWritePort`] actor; returns its handle + the write recorder.
+    fn spawn_binary_write_port(name: &str) -> (PortHandle, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+        let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let port = BinaryWritePort {
+            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            writes: writes.clone(),
+        };
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let actor = PortActor::new(Box::new(port), rx);
+        std::thread::Builder::new()
+            .name("binwrite-actor".into())
+            .spawn(move || actor.run())
+            .unwrap();
+        let handle = PortHandle::new(tx, name.into(), interrupts);
+        (handle, writes)
+    }
+
+    /// asynOctetWriteBinary writes the full NORD bytes — INCLUDING an interior NUL
+    /// — through the whole factory→init→read path, matching C callbackWfWriteBinary
+    /// (devAsynOctet.c:1086-1091, writeIt(bptr, nord), no my_strnlen trim).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn octet_write_binary_writes_full_nord_bytes_including_interior_nul() {
+        use epics_base_rs::server::ioc_app::DeviceSupportContext;
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let (handle, writes) = spawn_binary_write_port("binwrite_wb");
+        crate::asyn_record::register_port(
+            "binwrite_wb",
+            handle,
+            Arc::new(crate::trace::TraceManager::new()),
+        );
+
+        let ctx = DeviceSupportContext {
+            dtyp: "asynOctetWriteBinary",
+            inp: "@asyn(binwrite_wb,0)REG",
+            out: "",
+        };
+        let mut dev = universal_asyn_factory(&ctx).expect("factory builds the device");
+
+        let mut rec = WaveformRecord::new(64, DbFieldType::Char);
+        // NORD = 3, with an interior NUL; asynOctetWrite would trim at the NUL.
+        rec.put_field("VAL", EpicsValue::CharArray(vec![0x01, 0x00, 0x02]))
+            .unwrap();
+        dev.init(&mut rec).unwrap();
+        dev.read(&mut rec).unwrap();
+
+        assert_eq!(
+            writes.lock().unwrap().clone(),
+            vec![vec![0x01, 0x00, 0x02]],
+            "binary write must send the full NORD bytes, interior NUL included"
+        );
+    }
+
+    /// Contrast: the text asynOctetWrite trims the same payload at the first NUL
+    /// (C callbackWfWrite my_strnlen) — proving octet_binary is the only switch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn octet_write_text_trims_at_first_nul() {
+        use epics_base_rs::server::ioc_app::DeviceSupportContext;
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let (handle, writes) = spawn_binary_write_port("binwrite_text");
+        crate::asyn_record::register_port(
+            "binwrite_text",
+            handle,
+            Arc::new(crate::trace::TraceManager::new()),
+        );
+
+        let ctx = DeviceSupportContext {
+            dtyp: "asynOctetWrite",
+            inp: "@asyn(binwrite_text,0)REG",
+            out: "",
+        };
+        let mut dev = universal_asyn_factory(&ctx).expect("factory builds the device");
+
+        let mut rec = WaveformRecord::new(64, DbFieldType::Char);
+        rec.put_field("VAL", EpicsValue::CharArray(vec![0x01, 0x00, 0x02]))
+            .unwrap();
+        dev.init(&mut rec).unwrap();
+        dev.read(&mut rec).unwrap();
+
+        assert_eq!(
+            writes.lock().unwrap().clone(),
+            vec![vec![0x01]],
+            "text write must trim at the first NUL"
+        );
+    }
+
+    /// binary_write_op emits a plain OctetWrite (EOS-appending), NOT
+    /// OctetWriteBinary (EOS-suppressing). devAsynOctet does no EOS manipulation;
+    /// routing to OctetWriteBinary would wrongly strip the port's configured OEOS.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn octet_write_binary_op_is_plain_octetwrite_not_eos_suppressed() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let (handle, _writes) = spawn_binary_write_port("binwrite_op");
+        let link = AsynLink {
+            port_name: "binwrite_op".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: "REG".into(),
+        };
+        let ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
+
+        let mut rec = WaveformRecord::new(64, DbFieldType::Char);
+        rec.put_field("VAL", EpicsValue::CharArray(vec![0x01, 0x00, 0x02]))
+            .unwrap();
+        let val = rec.val().unwrap();
+        let op = ads.binary_write_op(&rec, &val);
+        match op {
+            Some(RequestOp::OctetWrite { data }) => {
+                assert_eq!(data, vec![0x01, 0x00, 0x02], "full NORD bytes, no trim");
+            }
+            other => panic!("expected plain OctetWrite (EOS appended), got {other:?}"),
+        }
     }
 
     /// Mock octet port for asynOctetCmdResponse: records every write payload and

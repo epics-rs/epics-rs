@@ -1446,8 +1446,18 @@ impl DeviceSupport for AsynDeviceSupport {
                     .with_addr(self.addr)
                     .with_timeout(self.timeout);
                 if let Ok(result) = self.handle.submit_blocking(op, user) {
-                    if let Some(val) = self.result_to_value(&result) {
-                        let _ = record.set_val(val);
+                    // Seed the output record's value only on a successful read,
+                    // mirroring C initAo/initLongout/initMbbo: `if (status ==
+                    // asynSuccess) { pao->rval = value } return
+                    // INIT_DO_NOT_CONVERT` (devAsynInt32.c:955-959, :1080-1082).
+                    // A non-success initial read leaves the .db default — the
+                    // init-time member of the aux_status value-store family
+                    // (process-time members gated in the ring/polled/average
+                    // paths).
+                    if result.aux_status == crate::error::AsynStatus::Success {
+                        if let Some(val) = self.result_to_value(&result) {
+                            let _ = record.set_val(val);
+                        }
                     }
                 }
             }
@@ -4545,6 +4555,40 @@ mod tests {
             "a success device read stores the value"
         );
         assert_eq!(ads.last_alarm(), None, "success read raises no alarm");
+    }
+
+    /// Init-time output readback (asyn:READBACK) seeds the record's value only on
+    /// a successful read, mirroring C initAo/initLongout/initMbbo: `if (status ==
+    /// asynSuccess) { pao->rval = value } return INIT_DO_NOT_CONVERT`
+    /// (devAsynInt32.c:955-959, :1080-1082). A non-success initial read leaves the
+    /// .db default — the init-time member of the aux_status value-store family.
+    #[test]
+    fn init_readback_transport_error_keeps_db_default() {
+        use epics_base_rs::server::records::longout::LongoutRecord;
+        let mut ads = make_seeded_int32_adapter(5, crate::error::AsynStatus::Error);
+        ads.initial_readback = true;
+        let mut rec = LongoutRecord::new(77); // .db default
+        ads.init(&mut rec).unwrap();
+        assert_eq!(
+            rec.val(),
+            Some(EpicsValue::Long(77)),
+            "a non-success initial read must leave the .db default (C INIT_DO_NOT_CONVERT)"
+        );
+    }
+
+    /// Boundary contrast: a successful initial read seeds the device value.
+    #[test]
+    fn init_readback_success_seeds_value() {
+        use epics_base_rs::server::records::longout::LongoutRecord;
+        let mut ads = make_seeded_int32_adapter(5, crate::error::AsynStatus::Success);
+        ads.initial_readback = true;
+        let mut rec = LongoutRecord::new(77);
+        ads.init(&mut rec).unwrap();
+        assert_eq!(
+            rec.val(),
+            Some(EpicsValue::Long(5)),
+            "a successful initial read seeds the device value"
+        );
     }
 
     /// A `ScanType::IoIntr` adapter on `asynFloat64` whose driver exposes a

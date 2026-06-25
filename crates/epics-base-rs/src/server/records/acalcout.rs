@@ -295,19 +295,30 @@ impl AcalcoutRecord {
         inputs
     }
 
-    /// Evaluate a compiled expression over the current inputs, returning
-    /// `(scalar, array)`. `prev_val` seeds the `VAL` token (see
-    /// [`Self::build_inputs`]). `None` ⇒ evaluation failed (C `aCalcPerform`
-    /// non-zero return: an engine error OR a NaN/Inf scalar result).
-    fn eval(&self, compiled: &CompiledExpr, n: usize, prev_val: f64) -> Option<(f64, Vec<f64>)> {
+    /// Evaluate a compiled expression over the current inputs. `prev_val` seeds
+    /// the `VAL` token (see [`Self::build_inputs`]).
+    ///
+    /// `Some((scalar, array, finite))` — the result is returned even when
+    /// non-finite, because C `aCalcPerform` stores `*p_dresult`/`aval`
+    /// unconditionally and only *then* returns -1 for a NaN/Inf scalar
+    /// (`aCalcPerform.c:1622-1644`). `finite=false` carries that -1 so the
+    /// caller writes the NaN/Inf into VAL/AVAL (matching C, which drives it to
+    /// OUT under the default `IVOA=Continue`) and still raises CALC_ALARM.
+    /// `None` — the engine could not produce any result (rare for a compiled
+    /// expression); the caller leaves VAL/AVAL unchanged.
+    fn eval(
+        &self,
+        compiled: &CompiledExpr,
+        n: usize,
+        prev_val: f64,
+    ) -> Option<(f64, Vec<f64>, bool)> {
         let mut inputs = self.build_inputs(n, prev_val);
         match acalc_eval(compiled, &mut inputs) {
             Ok(result) => {
                 let v = result.as_f64().unwrap_or(0.0);
                 let mut arr = result.broadcast(n);
                 arr.resize(n, 0.0);
-                // C `aCalcPerform.c:1644`: NaN/Inf scalar → status -1.
-                if v.is_finite() { Some((v, arr)) } else { None }
+                Some((v, arr, v.is_finite()))
             }
             Err(_) => None,
         }
@@ -1170,9 +1181,12 @@ impl Record for AcalcoutRecord {
                 // CALC pass: the `VAL` token reads `prec->val` (this pass's
                 // result field) before it is overwritten.
                 match self.eval(compiled, n, self.val) {
-                    Some((v, arr)) => {
+                    Some((v, arr, finite)) => {
                         self.val = v;
                         self.aval = arr;
+                        if !finite {
+                            calc_failed = true; // NaN/Inf result: C returns -1
+                        }
                     }
                     None => calc_failed = true,
                 }
@@ -1189,9 +1203,12 @@ impl Record for AcalcoutRecord {
                 // result field, C `p_dresult = &oval`), NOT `prec->val`, so an
                 // OCAL accumulator like "VAL+1" runs on OVAL.
                 match self.eval(compiled, n, self.oval) {
-                    Some((v, arr)) => {
+                    Some((v, arr, finite)) => {
                         self.oval = v;
                         self.oav = arr;
+                        if !finite {
+                            calc_failed = true; // NaN/Inf result: C returns -1
+                        }
                     }
                     None => calc_failed = true,
                 }
@@ -2015,6 +2032,25 @@ mod tests {
         rec.process().unwrap();
         assert!(rec.calc_alarm);
         assert_eq!(rec.cstat, -1);
+    }
+
+    /// A NaN/Inf calc result is written into VAL/AVAL (not left stale): C
+    /// `aCalcPerform` stores `*p_dresult` before returning -1, so VAL holds the
+    /// non-finite value and CALC_ALARM is raised. (`1/0` → NaN in the array
+    /// engine.)
+    #[test]
+    fn test_acalcout_nonfinite_result_written_to_val() {
+        let mut rec = AcalcoutRecord::new();
+        rec.put_field("CALC", EpicsValue::String("1/0".into()))
+            .unwrap();
+        rec.process().unwrap();
+        match rec.get_field("VAL") {
+            Some(EpicsValue::Double(v)) => {
+                assert!(!v.is_finite(), "VAL = {v}, expected non-finite")
+            }
+            other => panic!("expected Double VAL, got {other:?}"),
+        }
+        assert!(rec.calc_alarm);
     }
 
     #[test]

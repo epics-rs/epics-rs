@@ -1376,7 +1376,23 @@ impl DeviceSupport for AsynDeviceSupport {
                     let user = AsynUser::new(self.reason)
                         .with_addr(self.addr)
                         .with_timeout(self.timeout);
-                    let _ = self.handle.submit_blocking(op, user);
+                    // Apply the write result's alarm, mirroring the read path
+                    // (and C callbackWfWrite/WriteBinary: writeIt -> result.status
+                    // -> finish recGblSetSevr, devAsynOctet.c:1071-1076,1086-1091).
+                    // A successful write carries NO_ALARM (clears any prior); a
+                    // failure maps via asyn_error_to_alarm. Without this the
+                    // write-only path swallowed every write failure silently.
+                    match self.handle.submit_blocking(op, user) {
+                        Ok(result) => {
+                            self.last_alarm_status = result.alarm_status;
+                            self.last_alarm_severity = result.alarm_severity;
+                        }
+                        Err(e) => {
+                            let (alarm_status, alarm_severity) = asyn_error_to_alarm(&e);
+                            self.last_alarm_status = alarm_status;
+                            self.last_alarm_severity = alarm_severity;
+                        }
+                    }
                 }
             }
             return Ok(DeviceReadOutcome::ok());
@@ -3672,6 +3688,9 @@ mod tests {
     struct BinaryWritePort {
         base: PortDriverBase,
         writes: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        /// When true, every write fails with a Timeout status (to exercise the
+        /// write-only alarm path).
+        fail: bool,
     }
     impl PortDriver for BinaryWritePort {
         fn base(&self) -> &PortDriverBase {
@@ -3686,6 +3705,12 @@ mod tests {
             Ok(0)
         }
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+            if self.fail {
+                return Err(AsynError::Status {
+                    status: crate::protocol::status::AsynStatus::Timeout,
+                    message: "mock write timeout".into(),
+                });
+            }
             self.writes.lock().unwrap().push(data.to_vec());
             Ok(())
         }
@@ -3693,10 +3718,23 @@ mod tests {
 
     /// Spawn a [`BinaryWritePort`] actor; returns its handle + the write recorder.
     fn spawn_binary_write_port(name: &str) -> (PortHandle, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+        spawn_binary_write_port_inner(name, false)
+    }
+
+    /// Spawn a [`BinaryWritePort`] whose writes always fail (Timeout).
+    fn spawn_failing_write_port(name: &str) -> PortHandle {
+        spawn_binary_write_port_inner(name, true).0
+    }
+
+    fn spawn_binary_write_port_inner(
+        name: &str,
+        fail: bool,
+    ) -> (PortHandle, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
         let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let port = BinaryWritePort {
             base: PortDriverBase::new(name, 1, PortFlags::default()),
             writes: writes.clone(),
+            fail,
         };
         let interrupts = Arc::new(InterruptManager::new(256));
         let (tx, rx) = tokio::sync::mpsc::channel(256);
@@ -3809,6 +3847,44 @@ mod tests {
             }
             other => panic!("expected plain OctetWrite (EOS appended), got {other:?}"),
         }
+    }
+
+    /// A failing octet write on the write-only path must surface the driver's
+    /// alarm via last_alarm(), matching C callbackWfWrite/WriteBinary
+    /// (writeIt -> result.status -> finish recGblSetSevr). The path previously
+    /// swallowed the submit result, so a write failure raised no alarm. Shared by
+    /// asynOctetWrite (tested here) and asynOctetWriteBinary.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn octet_write_failure_raises_alarm_on_write_only_path() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let handle = spawn_failing_write_port("binwrite_fail");
+        let link = AsynLink {
+            port_name: "binwrite_fail".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: "REG".into(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, "asynOctet");
+        ads.write_only = true;
+        ads.reason_set = true;
+        ads.set_record_info("TEST:WFAIL", ScanType::Passive);
+
+        let mut rec = WaveformRecord::new(64, DbFieldType::Char);
+        rec.put_field("VAL", EpicsValue::CharArray(vec![0x41, 0x42]))
+            .unwrap();
+        ads.read(&mut rec).unwrap();
+
+        // The mock failed the write with Timeout -> TIMEOUT_ALARM/INVALID.
+        assert_eq!(
+            ads.last_alarm(),
+            Some((
+                epics_base_rs::server::recgbl::alarm_status::TIMEOUT_ALARM,
+                epics_base_rs::server::record::AlarmSeverity::Invalid as u16
+            )),
+            "a write failure must surface the driver alarm, not be swallowed"
+        );
     }
 
     /// Mock octet port for asynOctetCmdResponse: records every write payload and

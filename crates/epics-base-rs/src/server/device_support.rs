@@ -9,7 +9,11 @@ pub fn is_soft_dtyp(dtyp: &str) -> bool {
         || dtyp == "Soft Channel"
         || dtyp == "Raw Soft Channel"
         || dtyp == "Async Soft Channel"
-        || dtyp == "Soft Timestamp"
+        // NOTE: "Soft Timestamp" (base `devTimestamp.c`) is NOT a soft
+        // channel — it is a real built-in device support that writes the
+        // resolved time stamp into VAL. It is served by the pre-registered
+        // `builtin_devices::builtin_dynamic_factory`, so it must reach the
+        // device-lookup path rather than short-circuit here.
         || dtyp == "Sec Past Epoch"
 }
 

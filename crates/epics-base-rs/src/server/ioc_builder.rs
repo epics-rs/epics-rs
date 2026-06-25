@@ -56,7 +56,12 @@ impl IocBuilder {
             records: Vec::new(),
             db_defs: Vec::new(),
             device_factories,
-            dynamic_device_factory: None,
+            // Built-in device support that needs the runtime context (INP):
+            // `Soft Timestamp` (base `devTimestamp.c`). Pre-registered as
+            // the base of the dynamic-factory chain so a user's
+            // `register_dynamic_device_support` factory takes priority and
+            // falls through to here.
+            dynamic_device_factory: Some(Box::new(super::builtin_devices::builtin_dynamic_factory)),
             record_factories: HashMap::new(),
             subroutine_registry: HashMap::new(),
             autosave_config: None,

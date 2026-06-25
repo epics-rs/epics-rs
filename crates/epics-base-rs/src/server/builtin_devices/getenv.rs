@@ -94,11 +94,34 @@ impl DeviceSupport for GetenvDeviceSupport {
                 Ok(DeviceReadOutcome::ok())
             }
             None => {
-                // An env var unset at init, or later unset, must not leave the
-                // record showing a stale value. C `getenv` devsup re-reads
-                // every process and reflects the current (empty) value: clear
-                // VAL to empty, then signal the framework via a soft Err so it
-                // sets READ_ALARM / INVALID severity.
+                // Unset env var. C clears VAL and raises UDF, returning SUCCESS:
+                //   read_lsi      (devEnviron.c:62-67):  val[0]=0; len=1;
+                //     udf=TRUE; recGblSetSevrMsg(prec, UDF_ALARM, prec->udfs,
+                //     "No such ENV");  return 0;
+                //   read_stringin (devEnviron.c:114-118): same, without len.
+                //
+                // base-rs cannot reproduce that exactly, and the gap is the same
+                // `value_is_undefined`-derived udf model already disclosed for
+                // Db State (dbstate.rs): a device sees only the inner record (no
+                // `dbCommon`, and no alarm/udf-setting `ProcessAction`), so it
+                // cannot force `udf=TRUE` on a *defined* value. The framework
+                // recomputes `udf = value_is_undefined()` after process, and for
+                // a string ANY value — including the empty string C writes — is
+                // defined (record_trait.rs `value_is_undefined`: `Some(_) =>
+                // false`), so clearing VAL to "" would clear udf and raise NO
+                // alarm at all. To still flag the record we clear the stale value
+                // (a var that was set then later unset must not keep showing the
+                // old value) and return a soft Err, which the framework turns
+                // into READ_ALARM at INVALID (processing.rs). Accepted DIVERGENCE
+                // vs C (disclosed, not faked):
+                //   - alarm STAT:  READ_ALARM vs C UDF_ALARM (wire-observable);
+                //   - severity:    INVALID vs C `prec->udfs` (coincide on the
+                //     default UDFS=INVALID; diverge only if the user lowers it);
+                //   - udf flag:    stays FALSE (defined empty VAL) vs C udf=TRUE;
+                //   - AMSG "No such ENV" + lsi LEN=1: not modeled.
+                // Closing this fully needs a framework device-settable udf/alarm
+                // path (the same root as the Db State divergence), out of scope
+                // for getenv alone.
                 record.put_field("VAL", EpicsValue::String(String::new().into()))?;
                 Err(CaError::InvalidValue(format!(
                     "getenv: variable '{}' is unset",

@@ -499,6 +499,24 @@ pub trait Record: Send + Sync + 'static {
         false
     }
 
+    /// Apply a float64 device value read *back* from an output record's asyn
+    /// device support — the `asynFloat64` analogue of
+    /// [`Record::apply_raw_readback`]. A float64 output (`ao`) whose device
+    /// value carries an `ASLO`/`AOFF` linear scaling must seed the engineering
+    /// `VAL` here (`VAL = value * ASLO + AOFF`), because the asyn store path
+    /// would otherwise write the raw device value straight into `VAL` and drop
+    /// the scaling. Sets `VAL` only (a float64 `ao` carries no `RVAL`); the
+    /// reverse scaling `(OVAL - AOFF) / ASLO` is applied on the device-write
+    /// side. Mirrors C `initAo`/`processAo` (devAsynFloat64.c:627-629/:646-649).
+    ///
+    /// Returns `true` when the record produced `VAL` from the raw value (the
+    /// asyn store path then reports `computed`, skipping the forward convert).
+    /// The default returns `false`: records with no float64 readback scaling
+    /// keep the raw `set_val` path.
+    fn apply_float64_readback(&mut self, _raw: f64) -> bool {
+        false
+    }
+
     /// Apply IVOA=2 ("set outputs to IVOV") semantics: copy the
     /// IVOV value into whatever output staging field the OUT
     /// writeback consumes for this record type. Mirrors the

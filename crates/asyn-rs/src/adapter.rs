@@ -1281,6 +1281,15 @@ impl AsynDeviceSupport {
                     let _ = record.set_val(EpicsValue::Double(eng));
                     return true;
                 }
+                // asynFloat64 ao output readback: the record owns the forward
+                // ASLO/AOFF scaling (`VAL = value*ASLO + AOFF`), the float64
+                // twin of `apply_raw_readback`. ai is caught above (it carries
+                // SMOO); ao has ASLO/AOFF but no SMOO so it lands here. C
+                // `processAo` (devAsynFloat64.c:646-649). Returning `true`
+                // skips the forward convert, matching INIT_DO_NOT_CONVERT.
+                if record.apply_float64_readback(raw) {
+                    return true;
+                }
             }
         }
         if self.iface_type == "asynInt32" || self.iface_type == "asynUInt32Digital" {
@@ -1353,6 +1362,37 @@ impl AsynDeviceSupport {
         };
         self.smoo_primed = true;
         out
+    }
+
+    /// Reverse the `asynFloat64` ao `ASLO`/`AOFF` linear scaling before the
+    /// device write — the inverse of [`Record::apply_float64_readback`]. C
+    /// `processAo` writes `val64 = pr->oval - pr->aoff; if(aslo!=0) val64 /=
+    /// aslo` to the device (devAsynFloat64.c:651-654). Without this the asyn
+    /// readback (forward scaling) and the device write would be asymmetric: a
+    /// `VAL` written out, read back, and re-scaled would not round-trip. Only
+    /// the `asynFloat64` path with a `Double` value scales; everything else is
+    /// returned unchanged. `ASLO`/`AOFF` are read live (the unconfigured ao
+    /// defaults ASLO=1/AOFF=0 → identity, no behaviour change). `VAL` is the
+    /// device anchor (Rust writes `VAL`, not the OROC-rate-limited `OVAL`, for
+    /// every output — an orthogonal pre-existing divergence).
+    fn apply_float64_output_reverse(&self, record: &dyn Record, val: EpicsValue) -> EpicsValue {
+        if self.iface_type != "asynFloat64" {
+            return val;
+        }
+        let EpicsValue::Double(v) = val else {
+            return val;
+        };
+        let field = |name: &str| match record.get_field(name) {
+            Some(EpicsValue::Double(x)) => x,
+            _ => 0.0,
+        };
+        let aslo = field("ASLO");
+        let aoff = field("AOFF");
+        let mut out = v - aoff;
+        if aslo != 0.0 {
+            out /= aslo;
+        }
+        EpicsValue::Double(out)
     }
 
     /// Push a driver's asynEnum table onto the record's state fields at init
@@ -1566,12 +1606,14 @@ impl DeviceSupport for AsynDeviceSupport {
                             // and returns INIT_OK so aoRecord runs the readback
                             // convert (devAsynInt32.c:947-957). longout/mbbo
                             // have no such inverse (VAL == raw / state-map) and
-                            // float64 outputs carry no Long here — they seed VAL
-                            // directly, unchanged.
-                            let seeded = if let EpicsValue::Long(raw) = val {
-                                record.apply_raw_readback(raw)
-                            } else {
-                                false
+                            // decline the hook (default `false`). An asynFloat64
+                            // ao seeds VAL with the forward ASLO/AOFF scaling
+                            // (C `initAo`, devAsynFloat64.c:627-629) via the
+                            // float64 readback hook.
+                            let seeded = match val {
+                                EpicsValue::Long(raw) => record.apply_raw_readback(raw),
+                                EpicsValue::Double(raw) => record.apply_float64_readback(raw),
+                                _ => false,
                             };
                             if !seeded {
                                 let _ = record.set_val(val);
@@ -1889,6 +1931,7 @@ impl DeviceSupport for AsynDeviceSupport {
             return Ok(());
         }
         if let Some(val) = record.val() {
+            let val = self.apply_float64_output_reverse(record, val);
             if let Some(op) = self.write_op(&val) {
                 let user = AsynUser::new(self.reason)
                     .with_addr(self.addr)
@@ -5498,6 +5541,90 @@ mod tests {
         push_f64(&ads, 20.0);
         ads.read(&mut rec).unwrap();
         assert_eq!(rec.val(), Some(EpicsValue::Double(15.0)));
+    }
+
+    /// The process-time driver readback for an `asynFloat64` ao: the store path
+    /// routes the raw double through `apply_float64_readback`, which applies the
+    /// forward `ASLO`/`AOFF` scaling (`VAL = value*ASLO + AOFF`) and the outcome
+    /// is `computed` (the framework skips ao's forward convert). C `processAo`
+    /// (devAsynFloat64.c:646-649). ao carries no SMOO so it never enters the ai
+    /// branch above.
+    #[test]
+    fn io_intr_readback_float64_ao_applies_aslo_aoff() {
+        use epics_base_rs::server::records::ao::AoRecord;
+        let mut ads = make_float64_io_intr_adapter();
+        let mut rec = AoRecord::new(0.0);
+        ads.init(&mut rec).unwrap();
+        rec.aslo = 2.0;
+        rec.aoff = 1.0;
+
+        push_f64(&ads, 10.0);
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(
+            outcome.did_compute,
+            "float64 ao readback produces VAL itself → computed"
+        );
+        assert_eq!(
+            rec.val(),
+            Some(EpicsValue::Double(21.0)),
+            "VAL = raw*ASLO + AOFF = 10*2 + 1 = 21"
+        );
+    }
+
+    /// The device write for an `asynFloat64` ao applies the reverse `ASLO`/`AOFF`
+    /// scaling (`device = (VAL - AOFF) / ASLO`), the inverse of the readback. C
+    /// `processAo` (devAsynFloat64.c:651-654). Together they round-trip: a VAL
+    /// written out, read back, re-scaled returns the same VAL.
+    #[test]
+    fn float64_ao_write_reverses_aslo_aoff_and_round_trips() {
+        use epics_base_rs::server::records::ao::AoRecord;
+        let ads = make_float64_io_intr_adapter();
+        let mut rec = AoRecord::new(0.0);
+        rec.aslo = 2.0;
+        rec.aoff = 1.0;
+        // VAL = 21 -> device = (21 - 1) / 2 = 10.
+        let written = ads.apply_float64_output_reverse(&rec, EpicsValue::Double(21.0));
+        assert_eq!(
+            written,
+            EpicsValue::Double(10.0),
+            "device = (VAL - AOFF) / ASLO = (21 - 1) / 2 = 10"
+        );
+        // Round-trip: that device value, read back, re-scales to the original VAL.
+        let mut readback = AoRecord::new(0.0);
+        readback.aslo = 2.0;
+        readback.aoff = 1.0;
+        let EpicsValue::Double(dev) = written else {
+            panic!("expected Double");
+        };
+        assert!(readback.apply_float64_readback(dev));
+        assert_eq!(
+            readback.val(),
+            Some(EpicsValue::Double(21.0)),
+            "readback of (VAL-AOFF)/ASLO re-scales to the original VAL"
+        );
+    }
+
+    /// The default ao (ASLO=1, AOFF=0) is an identity in both directions — no
+    /// behaviour change for the unconfigured float64 ao.
+    #[test]
+    fn float64_ao_default_scaling_is_identity() {
+        use epics_base_rs::server::records::ao::AoRecord;
+        let mut ads = make_float64_io_intr_adapter();
+        let mut rec = AoRecord::new(0.0);
+        ads.init(&mut rec).unwrap();
+        // Defaults: ASLO=1.0, AOFF=0.0.
+        push_f64(&ads, 7.5);
+        ads.read(&mut rec).unwrap();
+        assert_eq!(
+            rec.val(),
+            Some(EpicsValue::Double(7.5)),
+            "default readback is identity (raw*1 + 0)"
+        );
+        assert_eq!(
+            ads.apply_float64_output_reverse(&rec, EpicsValue::Double(7.5)),
+            EpicsValue::Double(7.5),
+            "default write is identity ((7.5-0)/1)"
+        );
     }
 
     /// PR #162: `aai` (array analog input) and `aao` (array analog output)

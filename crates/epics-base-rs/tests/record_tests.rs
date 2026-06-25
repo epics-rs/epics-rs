@@ -159,6 +159,39 @@ fn test_ao_readback_skip_convert_bypasses_forward_convert() {
     );
 }
 
+// The asynFloat64 ao readback hook applies the forward ASLO/AOFF scaling
+// (VAL = value*ASLO + AOFF) and sets VAL only — a float64 ao carries no raw
+// path, so RVAL is untouched. C `initAo`/`processAo` (devAsynFloat64.c:627-629
+// / :646-649). Contrast apply_raw_readback (int32), which also seeds RVAL.
+#[test]
+fn test_ao_float64_readback_applies_aslo_aoff_val_only() {
+    let mut rec = AoRecord::new(0.0);
+    rec.aslo = 2.0;
+    rec.aoff = 1.0;
+    rec.rval = 999; // sentinel: the float64 readback must not touch RVAL
+    assert!(rec.apply_float64_readback(10.0));
+    match rec.get_field("VAL") {
+        Some(EpicsValue::Double(v)) => assert!(
+            (v - 21.0).abs() < 1e-9,
+            "VAL = raw*ASLO + AOFF = 10*2 + 1 = 21, got {v}"
+        ),
+        other => panic!("expected Double(21.0), got {other:?}"),
+    }
+    assert_eq!(rec.rval, 999, "float64 ao readback leaves RVAL untouched");
+}
+
+// The default apply_float64_readback declines (returns false): a non-float64
+// output (e.g. mbbo) keeps the int32 raw path and must not be re-routed here.
+#[test]
+fn test_mbbo_declines_float64_readback() {
+    use epics_base_rs::server::records::mbbo::MbboRecord;
+    let mut rec = MbboRecord::new(0);
+    assert!(
+        !rec.apply_float64_readback(3.0),
+        "mbbo declines the float64 readback hook (keeps the int32 raw path)"
+    );
+}
+
 // The default apply_raw_readback returns false: an input record (ai) whose own
 // convert() is already raw->eng must NOT claim to handle the readback, or the
 // asyn store would skip the framework's RVAL->VAL convert that ai relies on.

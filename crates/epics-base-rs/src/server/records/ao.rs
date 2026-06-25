@@ -526,6 +526,24 @@ impl Record for AoRecord {
         true
     }
 
+    /// Apply an `asynFloat64` device readback: seed `VAL` with the forward
+    /// `ASLO`/`AOFF` linear scaling (`VAL = value * ASLO + AOFF`). C `initAo`
+    /// (devAsynFloat64.c:627-629) seeds the init read and `processAo`
+    /// (:646-649) the output-callback read with the identical conversion;
+    /// neither touches `RVAL` (float64 `ao` has no raw path). Returns `true` so
+    /// the asyn store path skips the forward convert. The reverse scaling
+    /// `(OVAL - AOFF) / ASLO` lives on the device-write side
+    /// (devAsynFloat64.c:651-654).
+    fn apply_float64_readback(&mut self, raw: f64) -> bool {
+        let mut value = raw;
+        if self.aslo != 0.0 {
+            value *= self.aslo;
+        }
+        value += self.aoff;
+        self.val = value;
+        true
+    }
+
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         match name {
             "VAL" => Some(EpicsValue::Double(self.val)),

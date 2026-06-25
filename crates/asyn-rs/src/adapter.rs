@@ -1452,6 +1452,40 @@ impl DeviceSupport for AsynDeviceSupport {
             let _ = record.put_field("SHFT", EpicsValue::Short(shft as i16));
         }
 
+        // asynInt32 mbbi/mbbo MASK positioning. C devAsynInt32.c initMbbi
+        // (1246-1247) / initMbbo (1290-1291):
+        //
+        //     if (pr->nobt == 0) pr->mask = 0xffffffff;
+        //     pr->mask <<= pr->shft;
+        //
+        // mbbiRecord/mbboRecord init leaves MASK = (1<<NOBT)-1 *unshifted*
+        // (the record convention — the RVAL→VAL convert shifts RVAL down and
+        // never masks). The asynInt32 device support POSITIONS the mask so
+        // `rval = value & mask` (processMbbi/processMbbo) selects the field at
+        // bits [SHFT, SHFT+NOBT). Without it, `apply_raw_readback`'s
+        // `raw & mask` strips exactly the SHFT-selected bits (and a NOBT=0
+        // record masks every bit to 0). uint32digital records get their
+        // already-positioned `@asynMask` above instead; only mbbi/mbbo carry
+        // NOBT under asynInt32 (bi/bo/ai/ao/longin have none; mbbiDirect/
+        // mbboDirect are uint32digital-only), so NOBT presence selects them.
+        // The base mask is rebuilt from NOBT (= the `(1<<NOBT)-1` mbbiRecord
+        // computes) so the positioning is idempotent across init calls.
+        if self.iface_type == "asynInt32" {
+            if let Some(EpicsValue::UShort(nobt)) = record.get_field("NOBT") {
+                let shft = match record.get_field("SHFT") {
+                    Some(EpicsValue::UShort(s)) => s as u32,
+                    _ => 0,
+                };
+                let base: u32 = if nobt == 0 || nobt >= 32 {
+                    0xFFFF_FFFF
+                } else {
+                    (1u32 << nobt) - 1
+                };
+                let positioned = base.checked_shl(shft).unwrap_or(0);
+                let _ = record.put_field("MASK", EpicsValue::Long(positioned as i32));
+            }
+        }
+
         // ai/ao LINEAR ESLO/EOFF wiring.
         //
         // C devAsynInt32.c::initAi (line 822-828) / initAo / initAiAverage:
@@ -5198,11 +5232,12 @@ mod tests {
         assert_eq!(rec.bits[3], 1);
     }
 
-    /// An `asynInt32` I/O Intr `mbbi` input: the device raw enters RVAL masked
-    /// (C `processMbbi` `rval = value & mask`, devAsynInt32.c:1270) and
-    /// mbbiRecord's convert shifts (>>SHFT) then resolves the state index.
-    /// Before the fix mbbi mapped the raw inside its own `set_val` with NO
-    /// mask, leaking out-of-mask bits; `apply_raw_readback` masks like C.
+    /// The `apply_raw_readback` hook in isolation: given an already-positioned
+    /// mask/shift, the device raw enters RVAL masked (C `processMbbi`
+    /// `rval = value & mask`, devAsynInt32.c:1270) and mbbiRecord's convert
+    /// shifts (>>SHFT) then resolves the state index — out-of-mask bits are
+    /// stripped. (The init path that POSITIONS the mask is covered by
+    /// `io_intr_readback_mbbi_asynint32_positions_nobt_mask`.)
     #[test]
     fn io_intr_readback_mbbi_asynint32_masks_and_maps_state() {
         use epics_base_rs::server::records::mbbi::MbbiRecord;
@@ -5212,7 +5247,8 @@ mod tests {
         rec.put_field("TWVL", EpicsValue::ULong(2)).unwrap();
         rec.init_record(0).unwrap(); // computes sdef=true
         ads.init(&mut rec).unwrap();
-        // asynInt32: no adapter mask propagation; set the state mask/shift.
+        // Set an already-positioned mask/shift directly to exercise the hook
+        // (init-path positioning is tested separately).
         rec.mask = 0x0C; // bits 2-3
         rec.shft = 2;
         // raw 0x88 -> masked 0x08 (0x80 stripped) -> shifted 2 -> TWVL=2 -> idx 2.
@@ -5233,6 +5269,87 @@ mod tests {
             "RVAL = raw & mask (out-of-mask 0x80 stripped)"
         );
         assert_eq!(rec.val, 2, "state index 2 (TWVL), not leaked/unknown");
+    }
+
+    /// asynInt32 mbbi MASK positioning through the REAL init path. C
+    /// devAsynInt32 initMbbi (devAsynInt32.c:1246-1247): `if(nobt==0)
+    /// mask=0xffffffff; mask <<= shft`. mbbiRecord leaves MASK = (1<<NOBT)-1
+    /// unshifted; the device support positions it. Goes through `init_record`
+    /// then `ads.init` with NOBT/SHFT set (no manual `rec.mask =`), so it
+    /// exercises the unshifted mask the real init path produces.
+    #[test]
+    fn io_intr_readback_mbbi_asynint32_positions_nobt_mask() {
+        use epics_base_rs::server::records::mbbi::MbbiRecord;
+        let mut ads = make_adapter(ScanType::IoIntr); // asynInt32
+        let mut rec = MbbiRecord::new(0);
+        rec.put_field("ONVL", EpicsValue::ULong(1)).unwrap();
+        rec.put_field("TWVL", EpicsValue::ULong(2)).unwrap();
+        rec.put_field("THVL", EpicsValue::ULong(3)).unwrap();
+        rec.put_field("NOBT", EpicsValue::UShort(4)).unwrap();
+        rec.put_field("SHFT", EpicsValue::UShort(4)).unwrap();
+        rec.init_record(0).unwrap(); // mbbiRecord: MASK = (1<<4)-1 = 0x0F unshifted
+        ads.init(&mut rec).unwrap(); // positions MASK to 0x0F << 4 = 0xF0
+        assert_eq!(
+            rec.get_field("MASK"),
+            Some(EpicsValue::ULong(0xF0)),
+            "asynInt32 mbbi MASK positioned: ((1<<NOBT)-1) << SHFT"
+        );
+        // value 0x30 = field 3 at bits 4-7 -> rval = 0x30 & 0xF0 = 0x30 -> >>4
+        // = 3 -> THVL=3 -> state index 3. Before the fix the unshifted 0x0F
+        // mask gave 0x30 & 0x0F = 0 -> index 0 (the SHFT>0 regression).
+        ads.interrupt_fifo
+            .lock()
+            .unwrap()
+            .push_with_overflow(CachedInterrupt {
+                value: crate::param::ParamValue::Int32(0x30),
+                timestamp: SystemTime::UNIX_EPOCH,
+                alarm_status: 0,
+                alarm_severity: 0,
+                aux_status: crate::error::AsynStatus::Success,
+            });
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(outcome.did_compute, "mbbi readback computed");
+        assert_eq!(rec.rval, 0x30, "RVAL = value & positioned mask");
+        assert_eq!(rec.val, 3, "field 3 at bits 4-7 -> state index 3 (THVL)");
+    }
+
+    /// asynInt32 mbbi NOBT=0 edge: C initMbbi sets `mask=0xffffffff` before
+    /// the shift (devAsynInt32.c:1246). mbbiRecord leaves MASK=0 for NOBT=0,
+    /// so without the fallback `raw & 0` would zero every readback.
+    #[test]
+    fn mbbi_asynint32_nobt0_positions_full_mask() {
+        use epics_base_rs::server::records::mbbi::MbbiRecord;
+        let mut ads = make_adapter(ScanType::IoIntr);
+        let mut rec = MbbiRecord::new(0);
+        rec.put_field("NOBT", EpicsValue::UShort(0)).unwrap();
+        rec.put_field("SHFT", EpicsValue::UShort(4)).unwrap();
+        rec.init_record(0).unwrap(); // NOBT=0 -> mbbiRecord leaves MASK=0
+        ads.init(&mut rec).unwrap();
+        assert_eq!(
+            rec.get_field("MASK"),
+            Some(EpicsValue::ULong(0xFFFF_FFF0)),
+            "NOBT=0 -> mask 0xffffffff << SHFT (C initMbbi), not 0"
+        );
+    }
+
+    /// The same positioning applies to asynInt32 mbbo — R24's mbbo readback
+    /// had the identical unshifted-mask gap (its `apply_raw_readback` also
+    /// does `raw & mask`). One adapter owner positions both records, mirroring
+    /// C devAsynInt32 initMbbo (devAsynInt32.c:1290-1291).
+    #[test]
+    fn mbbo_asynint32_positions_nobt_mask() {
+        use epics_base_rs::server::records::mbbo::MbboRecord;
+        let mut ads = make_adapter(ScanType::Passive); // output
+        let mut rec = MbboRecord::new(0);
+        rec.put_field("NOBT", EpicsValue::UShort(3)).unwrap();
+        rec.put_field("SHFT", EpicsValue::UShort(5)).unwrap();
+        rec.init_record(0).unwrap(); // mbboRecord: MASK = (1<<3)-1 = 0x07 unshifted
+        ads.init(&mut rec).unwrap(); // positions to 0x07 << 5 = 0xE0
+        assert_eq!(
+            rec.get_field("MASK"),
+            Some(EpicsValue::ULong(0xE0)),
+            "asynInt32 mbbo MASK positioned: ((1<<NOBT)-1) << SHFT"
+        );
     }
 
     /// A `ScanType::IoIntr` adapter on `asynFloat64` whose driver exposes a

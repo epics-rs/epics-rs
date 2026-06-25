@@ -739,14 +739,6 @@ fn asyn_status_to_alarm_with_default(
     }
 }
 
-/// [`asyn_status_to_alarm_with_default`] with C's input default (`READ_ALARM`).
-fn asyn_status_to_alarm(status: crate::error::AsynStatus) -> (u16, u16) {
-    asyn_status_to_alarm_with_default(
-        status,
-        epics_base_rs::server::recgbl::alarm_status::READ_ALARM,
-    )
-}
-
 /// Resolve the EPICS alarm an interrupt sample raises from its own EPICS alarm
 /// (`sample_alarm`) and its asyn transport status (`aux`), mirroring C
 /// `asynStatusToEpicsAlarm`'s fill-in (asynEpicsUtils.c:238-265): on
@@ -777,14 +769,28 @@ fn resolve_intr_alarm(
     )
 }
 
-fn asyn_error_to_alarm(e: &AsynError) -> (u16, u16) {
-    use epics_base_rs::server::recgbl::alarm_status;
+/// Map an asyn transport error to an EPICS alarm with an explicit direction
+/// default. C `devAsynOctet` (processCommon, devAsynOctet.c:806-807) maps a
+/// transfer failure with `pPvt->isOutput ? WRITE_ALARM : READ_ALARM`, so an
+/// output (write-only) record raises WRITE_ALARM where an input read raises
+/// READ_ALARM. `default_stat` carries that direction; it feeds both the
+/// `asynError`/unknown arm and the status-mapped `asynError`/default within
+/// [`asyn_status_to_alarm_with_default`] (specific statuses —
+/// Timeout/Overflow/Disconnected/Disabled — map direction-independently).
+fn asyn_error_to_alarm_with_default(e: &AsynError, default_stat: u16) -> (u16, u16) {
     use epics_base_rs::server::record::AlarmSeverity;
     match e {
-        AsynError::Status { status, .. } => asyn_status_to_alarm(*status),
+        AsynError::Status { status, .. } => {
+            asyn_status_to_alarm_with_default(*status, default_stat)
+        }
         // Non-status asyn errors take C's asynError/default branch.
-        _ => (alarm_status::READ_ALARM, AlarmSeverity::Invalid as u16),
+        _ => (default_stat, AlarmSeverity::Invalid as u16),
     }
+}
+
+/// [`asyn_error_to_alarm_with_default`] with C's input default (`READ_ALARM`).
+fn asyn_error_to_alarm(e: &AsynError) -> (u16, u16) {
+    asyn_error_to_alarm_with_default(e, epics_base_rs::server::recgbl::alarm_status::READ_ALARM)
 }
 
 /// Convert an asyn ParamValue to an EpicsValue.
@@ -1492,13 +1498,21 @@ impl DeviceSupport for AsynDeviceSupport {
                     // A successful write carries NO_ALARM (clears any prior); a
                     // failure maps via asyn_error_to_alarm. Without this the
                     // write-only path swallowed every write failure silently.
+                    // This is an output (isOutput=1) record, so a generic
+                    // transport failure raises WRITE_ALARM, not READ_ALARM
+                    // (C processCommon: isOutput ? WRITE_ALARM : READ_ALARM,
+                    // devAsynOctet.c:806-807; partial write recGblSetSevr
+                    // WRITE_ALARM, :685).
                     match self.handle.submit_blocking(op, user) {
                         Ok(result) => {
                             self.last_alarm_status = result.alarm_status;
                             self.last_alarm_severity = result.alarm_severity;
                         }
                         Err(e) => {
-                            let (alarm_status, alarm_severity) = asyn_error_to_alarm(&e);
+                            let (alarm_status, alarm_severity) = asyn_error_to_alarm_with_default(
+                                &e,
+                                epics_base_rs::server::recgbl::alarm_status::WRITE_ALARM,
+                            );
                             self.last_alarm_status = alarm_status;
                             self.last_alarm_severity = alarm_severity;
                         }
@@ -2329,6 +2343,49 @@ mod tests {
             asyn_error_to_alarm(&AsynError::PortNotFound("p".into())),
             (1, 3)
         );
+    }
+
+    /// Output (write-only) device support maps a transfer failure with C's
+    /// WRITE_ALARM default (processCommon: `isOutput ? WRITE_ALARM : READ_ALARM`,
+    /// devAsynOctet.c:806-807). Only the generic-`asynError` arm and the
+    /// non-status arm change with direction; the specific transport statuses
+    /// (Timeout/Overflow/Disconnected/Disabled) map direction-independently.
+    #[test]
+    fn asyn_error_to_alarm_write_default_is_write_alarm() {
+        use crate::error::AsynStatus;
+        use epics_base_rs::server::recgbl::alarm_status::WRITE_ALARM;
+        let mk = |s: AsynStatus| {
+            asyn_error_to_alarm_with_default(
+                &AsynError::Status {
+                    status: s,
+                    message: String::new(),
+                },
+                WRITE_ALARM,
+            )
+        };
+        // Generic asynError -> the direction default = WRITE_ALARM(2), INVALID(3).
+        assert_eq!(
+            mk(AsynStatus::Error),
+            (2, 3),
+            "output asynError default => WRITE_ALARM(2), not READ_ALARM(1)"
+        );
+        // Non-status error also takes the direction default.
+        assert_eq!(
+            asyn_error_to_alarm_with_default(&AsynError::PortNotFound("p".into()), WRITE_ALARM),
+            (2, 3)
+        );
+        // Specific statuses stay direction-independent.
+        assert_eq!(
+            mk(AsynStatus::Timeout),
+            (10, 3),
+            "Timeout independent of dir"
+        );
+        assert_eq!(
+            mk(AsynStatus::Disconnected),
+            (9, 3),
+            "Disconnected independent of dir"
+        );
+        assert_eq!(mk(AsynStatus::Success), (0, 0));
     }
 
     /// Regression: the IocBuilder companion helper exists
@@ -4592,9 +4649,12 @@ mod tests {
         }
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
             if self.fail {
+                // A generic asynError (not a specific Timeout/Overflow/…): this
+                // is the only arm whose alarm depends on the direction default,
+                // so it exercises the WRITE_ALARM-for-output mapping.
                 return Err(AsynError::Status {
-                    status: crate::protocol::status::AsynStatus::Timeout,
-                    message: "mock write timeout".into(),
+                    status: crate::protocol::status::AsynStatus::Error,
+                    message: "mock write error".into(),
                 });
             }
             self.writes.lock().unwrap().push(data.to_vec());
@@ -4740,8 +4800,13 @@ mod tests {
     /// (writeIt -> result.status -> finish recGblSetSevr). The path previously
     /// swallowed the submit result, so a write failure raised no alarm. Shared by
     /// asynOctetWrite (tested here) and asynOctetWriteBinary.
+    ///
+    /// The mock fails with a generic asynError, whose alarm is the only one that
+    /// depends on the direction default: because this is an output (isOutput=1)
+    /// record, C maps it to WRITE_ALARM, not READ_ALARM (processCommon,
+    /// devAsynOctet.c:806-807).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn octet_write_failure_raises_alarm_on_write_only_path() {
+    async fn octet_write_failure_raises_write_alarm_on_write_only_path() {
         use epics_base_rs::server::records::waveform::WaveformRecord;
         use epics_base_rs::types::DbFieldType;
 
@@ -4762,14 +4827,15 @@ mod tests {
             .unwrap();
         ads.read(&mut rec).unwrap();
 
-        // The mock failed the write with Timeout -> TIMEOUT_ALARM/INVALID.
+        // Generic asynError on an output record -> WRITE_ALARM/INVALID (NOT
+        // READ_ALARM, which the path used before the direction fix).
         assert_eq!(
             ads.last_alarm(),
             Some((
-                epics_base_rs::server::recgbl::alarm_status::TIMEOUT_ALARM,
+                epics_base_rs::server::recgbl::alarm_status::WRITE_ALARM,
                 epics_base_rs::server::record::AlarmSeverity::Invalid as u16
             )),
-            "a write failure must surface the driver alarm, not be swallowed"
+            "a write failure on an output record must raise WRITE_ALARM, not be swallowed or READ_ALARM"
         );
     }
 

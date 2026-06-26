@@ -31,18 +31,18 @@ use crate::types::DbFieldType;
 /// lock, so the `fetch_add` that issues tokens is serialized and tokens are
 /// strictly increasing.
 #[derive(Clone, Default)]
-pub(crate) struct LinkStatusGen(Arc<AtomicU64>);
+pub struct LinkStatusGen(Arc<AtomicU64>);
 
 impl LinkStatusGen {
     /// Issue the token for a newly spawned refresh, superseding any token
     /// already in flight. Call on the issuing thread, before `tokio::spawn`.
-    pub(crate) fn next(&self) -> u64 {
+    pub fn next(&self) -> u64 {
         self.0.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     /// True while `token` is still the latest issued — i.e. no later refresh
     /// has started. Check inside the spawned task immediately before posting.
-    pub(crate) fn is_current(&self, token: u64) -> bool {
+    pub fn is_current(&self, token: u64) -> bool {
         self.0.load(Ordering::SeqCst) == token
     }
 }
@@ -51,7 +51,7 @@ impl LinkStatusGen {
 /// C `menu(sseqLNKV)` (sseqRecord.dbd:20) and `menu(calcoutINAV)`
 /// (calcoutRecord.dbd.pod:45-50): 0=Ext PV NC, 1=Ext PV OK, 2=Local PV,
 /// 3=Constant.
-pub(crate) const LINK_STATUS_CHOICES: &[&str] = &["Ext PV NC", "Ext PV OK", "Local PV", "Constant"];
+pub const LINK_STATUS_CHOICES: &[&str] = &["Ext PV NC", "Ext PV OK", "Local PV", "Constant"];
 
 /// Link-status menu indices. Index 1 (`EXT`, external PV connected) is a
 /// valid menu value but is never *produced* by this port: epics-base-rs has
@@ -59,9 +59,9 @@ pub(crate) const LINK_STATUS_CHOICES: &[&str] = &["Ext PV NC", "Ext PV OK", "Loc
 /// link always reports `EXT_NC` (see [`classify_link`]). The choice label is
 /// still served via [`LINK_STATUS_CHOICES`], so the `EXT` constant is
 /// intentionally omitted here — nothing emits it.
-pub(crate) const LINK_EXT_NC: i16 = 0; // external PV, not connected
-pub(crate) const LINK_LOC: i16 = 2; // local PV (this IOC's database)
-pub(crate) const LINK_CON: i16 = 3; // constant / unset link
+pub const LINK_EXT_NC: i16 = 0; // external PV, not connected
+pub const LINK_LOC: i16 = 2; // local PV (this IOC's database)
+pub const LINK_CON: i16 = 3; // constant / unset link
 
 /// Sentinel for "no resolvable target field type", C `DBF_unknown` (-1).
 /// Used for every constant, external, and unresolvable link. C
@@ -110,7 +110,7 @@ fn dbf_static_code(ft: DbFieldType) -> i16 {
 /// Returns `(status, field_type)`. An external (CA/PVA) link is reported as
 /// not-connected: epics-base-rs has no client to confirm a remote field's
 /// connection state or type.
-pub(crate) async fn classify_link(handle: &AsyncDbHandle, link: &str) -> (i16, i16) {
+pub async fn classify_link(handle: &AsyncDbHandle, link: &str) -> (i16, i16) {
     match parse_link_v2(link).link_type() {
         // Empty / constant link: C → CON, no resolvable field type.
         LinkType::Empty | LinkType::Constant => (LINK_CON, DBF_UNKNOWN),

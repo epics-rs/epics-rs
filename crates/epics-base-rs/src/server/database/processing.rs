@@ -142,6 +142,19 @@ impl AsyncDbHandle {
         }
     }
 
+    /// Read a link's value WITHOUT processing its source record — the C
+    /// `dbGetLink` semantics. Parses `link` and reads it via
+    /// [`PvDatabase::read_link_value_no_process`]; `None` if the link is
+    /// constant-less / external-unresolvable or the database has been
+    /// dropped. Used by module-crate records (e.g. std `throttle` SYNC →
+    /// `SINP`→`VAL`) that must pull an input link from `special()` without
+    /// triggering a process cycle.
+    pub async fn read_link_value(&self, link: &str) -> Option<EpicsValue> {
+        let db = self.db()?;
+        let parsed = crate::server::record::parse_link_v2(link);
+        db.read_link_value_no_process(&parsed).await
+    }
+
     /// Mint an async re-entry token — see [`PvDatabase::mint_async_token`].
     /// `None` if the record is absent or the database has been dropped.
     pub async fn mint_async_token(&self, name: &str) -> Option<AsyncToken> {

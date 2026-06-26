@@ -19,7 +19,7 @@ pub struct TransformRecord {
     compiled: [Option<CompiledExpr>; NUM_CHANNELS],
     pub inp_links: [String; NUM_CHANNELS],
     pub out_links: [String; NUM_CHANNELS],
-    pub copt: i16, // 0=Conditional (only if calc non-empty), 1=Always
+    pub copt: i16, // calc option: 0=Conditional (calc only an unlinked, unchanged channel), 1=Always. Gates CALC-eval, NOT the OUTx write.
     pub ivla: i16, // 0=Ignore error, 1=Do Nothing
     pub prec: i16,
     /// Per-channel "value field A..P was written by a `put` since the
@@ -470,14 +470,28 @@ impl Record for TransformRecord {
         // Snapshot and clear the fresh-put flags for this cycle.
         let fresh_put = std::mem::take(&mut self.fresh_put);
 
-        // Evaluate each calc expression A-P.
+        // Evaluate each calc expression A-P. synApps `transformRecord.c`
+        // (the `if (((no_inlink && !new_value) || copt==ALWAYS) &&
+        // postfix_ok)` gate) uses COPT to decide whether CLCx is
+        // EVALUATED — it does NOT gate the OUTx write below.
+        //   Conditional (COPT=0): compute a channel only when it has NO
+        //     input link AND was not freshly put (`no_inlink &&
+        //     !new_value`); a channel driven by its INPx link or by a
+        //     fresh `put` keeps that value instead of being overwritten
+        //     by its CLCx.
+        //   Always (COPT=1): compute whenever CLCx is valid, regardless.
+        // C's `new_value = !same || map_bit`; for a no-input channel the
+        // value changes between cycles only via a `put` (which also sets
+        // `map_bit` = our `fresh_put`; the framework's INPx propagation
+        // does NOT mark `fresh_put`), so `new_value` reduces to
+        // `fresh_put` and `no_inlink && !new_value` is exactly
+        // `no_inlink && !fresh_put`, needing no separate last-value
+        // tracking. For an input-linked channel `no_inlink` is false, so
+        // that term is false and `new_value` is unused.
         for i in 0..NUM_CHANNELS {
-            // S5 — synApps `transformRecord` does NOT re-compute a
-            // channel whose value field (A..P) was directly written by
-            // a `put` since the last process. Skip it so a CA put to a
-            // transform value field survives one cycle instead of being
-            // immediately overwritten by its CLCx.
-            if fresh_put[i] {
+            let no_inlink = self.inp_links[i].is_empty();
+            let do_calc = (no_inlink && !fresh_put[i]) || self.copt == 1;
+            if !do_calc {
                 continue;
             }
             if let Some(ref compiled) = self.compiled[i] {
@@ -488,10 +502,10 @@ impl Record for TransformRecord {
                         self.vals[i] = result;
                     }
                     Err(_) => {
-                        // S6 — IVLA=Do_Nothing applies the no-op
-                        // PER FAILING CHANNEL (synApps semantics), not
-                        // globally: restore only this channel's value
-                        // and continue with the rest.
+                        // IVLA=Do_Nothing applies the no-op PER FAILING
+                        // CHANNEL (synApps semantics), not globally:
+                        // restore only this channel's value and continue
+                        // with the rest.
                         if self.ivla == 1 {
                             self.vals[i] = self.prev_vals[i];
                         }
@@ -501,26 +515,22 @@ impl Record for TransformRecord {
             }
         }
 
-        // S4 — COPT semantics for the OUT links. Emit a WriteDbLink per
-        // channel that should drive its OUTx link:
-        //   COPT=Always (1):       every channel with a non-empty OUTx.
-        //   COPT=Conditional (0):  only channels whose CLCx is non-empty
-        //                          AND have a non-empty OUTx.
-        // Previously `multi_output_links()` returned the full 16-entry
-        // slice for both modes, so a Conditional channel with an empty
-        // CLCx still had its OUTx written — diverging from synApps.
+        // Write every channel with a non-constant OUTx, UNCONDITIONALLY.
+        // synApps `transformRecord.c` consults COPT only for calc-eval
+        // (above); its output loop writes every `plink->type != CONSTANT`
+        // OUTx each process, COPT untouched. The classic INPx -> A -> OUTx
+        // passthrough / fan-out (empty CLCx) must therefore drive its OUTx
+        // even in the default Conditional mode; the prior COPT/CLCx gate
+        // here silently dropped it.
         let mut actions = Vec::new();
         for i in 0..NUM_CHANNELS {
             if self.out_links[i].is_empty() {
                 continue;
             }
-            let write = self.copt == 1 || !self.calcs[i].is_empty();
-            if write {
-                actions.push(ProcessAction::WriteDbLink {
-                    link_field: OUT_FIELD_NAMES[i],
-                    value: EpicsValue::Double(self.vals[i]),
-                });
-            }
+            actions.push(ProcessAction::WriteDbLink {
+                link_field: OUT_FIELD_NAMES[i],
+                value: EpicsValue::Double(self.vals[i]),
+            });
         }
         Ok(ProcessOutcome::complete_with(actions))
     }

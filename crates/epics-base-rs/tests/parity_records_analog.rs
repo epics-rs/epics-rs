@@ -443,34 +443,47 @@ fn s3_scalcout_suppresses_out_link_when_oopt_not_met() {
     );
 }
 
-// ─── S4: transform COPT=Conditional enforcement ──────────────────────
+// ─── S4: transform OUTx write is unconditional (COPT gates calc only) ─
+//
+// synApps `transformRecord.c` writes every channel with a non-constant
+// OUTx every process — its output loop never consults COPT (COPT gates
+// only whether CLCx is *evaluated*). The default Conditional mode (COPT=0)
+// must therefore still drive the classic `INPx -> A -> OUTx` passthrough
+// of an empty-CLCx channel; the prior gate (`write = copt==1 ||
+// !calcs[i].is_empty()`) silently dropped it.
 
 #[test]
-fn s4_transform_conditional_skips_channels_without_calc() {
+fn s4_transform_conditional_writes_empty_clc_channel() {
     let mut r = TransformRecord::new();
-    r.put_field("COPT", EpicsValue::Short(0)).unwrap(); // Conditional
-    // Channel A: has a calc. Channel B: no calc, but an OUT link.
+    r.put_field("COPT", EpicsValue::Short(0)).unwrap(); // Conditional (default)
+    // Channel A: a calc + an OUT link. Channel B: NO calc, but an OUT link
+    // fed by an external value (the INPx -> field -> OUTx passthrough).
     r.put_field("CLCA", EpicsValue::String("3".into())).unwrap();
     r.put_field("OUTA", EpicsValue::String("a.VAL".into()))
         .unwrap();
+    r.put_field("B", EpicsValue::Double(7.0)).unwrap();
     r.put_field("OUTB", EpicsValue::String("b.VAL".into()))
         .unwrap();
     let outcome = r.process().unwrap();
-    let written: Vec<&str> = outcome
+    let writes: Vec<(&str, f64)> = outcome
         .actions
         .iter()
         .filter_map(|a| match a {
-            ProcessAction::WriteDbLink { link_field, .. } => Some(*link_field),
+            ProcessAction::WriteDbLink {
+                link_field,
+                value: EpicsValue::Double(v),
+            } => Some((*link_field, *v)),
             _ => None,
         })
         .collect();
     assert!(
-        written.contains(&"OUTA"),
-        "Conditional: channel with CLCx writes OUT"
+        writes.contains(&("OUTA", 3.0)),
+        "Conditional: channel with CLCx evaluates and writes OUT (=3)"
     );
     assert!(
-        !written.contains(&"OUTB"),
-        "Conditional: channel without CLCx must NOT write OUT"
+        writes.contains(&("OUTB", 7.0)),
+        "Conditional: empty-CLCx channel still writes its OUT unconditionally \
+         (passthrough of B=7) — C transformRecord.c output loop ignores COPT"
     );
 }
 
@@ -492,6 +505,40 @@ fn s4_transform_always_writes_all_linked_channels() {
     assert!(
         written.contains(&"OUTB"),
         "COPT=Always: channel without CLCx still writes OUT"
+    );
+}
+
+// COPT gates whether CLCx is EVALUATED. In Conditional mode an
+// input-linked channel keeps its INPx value — its CLCx must NOT overwrite
+// it (C `transformRecord.c:590` `no_inlink && !new_value`: an input link
+// makes `no_inlink` false, so the calc is skipped). In Always mode the
+// calc runs and overwrites.
+#[test]
+fn s4_transform_conditional_input_linked_channel_skips_calc() {
+    let mut r = TransformRecord::new();
+    r.put_field("COPT", EpicsValue::Short(0)).unwrap(); // Conditional
+    // Channel A has an INPx link (so `no_inlink` is false) and a CLCx.
+    r.put_field("INPA", EpicsValue::String("src.VAL".into()))
+        .unwrap();
+    r.put_field("CLCA", EpicsValue::String("A+1".into()))
+        .unwrap();
+    // Simulate the framework having propagated the input link into A.
+    r.put_field("A", EpicsValue::Double(5.0)).unwrap();
+    r.process().unwrap();
+    assert_eq!(
+        r.get_field("A"),
+        Some(EpicsValue::Double(5.0)),
+        "Conditional + input-linked: CLCx must NOT overwrite the input value"
+    );
+
+    // Always mode: the same setup now evaluates CLCA (A+1 = 6).
+    r.put_field("COPT", EpicsValue::Short(1)).unwrap();
+    r.put_field("A", EpicsValue::Double(5.0)).unwrap();
+    r.process().unwrap();
+    assert_eq!(
+        r.get_field("A"),
+        Some(EpicsValue::Double(6.0)),
+        "Always: CLCx evaluates regardless of the input link"
     );
 }
 

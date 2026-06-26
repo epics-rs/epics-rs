@@ -9,11 +9,11 @@
 //!
 //! `LINR` (`menuConvert`) selects the conversion: `0 = NO_CONVERSION`,
 //! `1 = SLOPE`, `2 = LINEAR` (all handled by the record's `ESLO`/`EOFF`), and
-//! `>= 3` names a loaded breakpoint table. C extends the `menuConvert` menu
-//! with one choice per loaded table in name-sorted order, so `LINR = 3` is the
-//! first table, `4` the second, and so on ([`BreakTableRegistry`]).
+//! `>= 3` names a loaded breakpoint table. A table's index is assigned in
+//! load (insertion) order and is STABLE — later loads never shift it — so a
+//! resolved record always points at the same table (see
+//! [`BreakTableRegistry`]).
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// One breakpoint interval: the converted value `eng` at raw input `raw`, and
@@ -211,15 +211,28 @@ pub fn cvt_eng_to_raw_bpt(val: f64, table: &BrkTable, lbrk: &mut usize) -> (f64,
     (p.raw + (val - p.eng) / p.slope, status)
 }
 
-/// Registry of loaded breakpoint tables, name-sorted to match C's
-/// `menuConvert` extension order. `LINR >= 3` indexes into the sorted table
-/// list: `LINR = 3` is the first table, `4` the second, and so on (the three
-/// fixed `menuConvert` choices `NO_CONVERSION`/`SLOPE`/`LINEAR` occupy indices
-/// 0..=2). C builds the same order via the name-sorted `bptList`
-/// (`dbLexRoutines.c:1065-1075`).
+/// Registry of loaded breakpoint tables in INSERTION (load) order. A table's
+/// `LINR` index is `LINR_FIRST_BREAKTABLE + insertion_position` and is STABLE:
+/// loading more tables appends them and never shifts an existing table's
+/// index, so a record already resolved to a table keeps pointing at the same
+/// table after later loads (the three fixed `menuConvert` choices
+/// `NO_CONVERSION`/`SLOPE`/`LINEAR` occupy indices 0..=2).
+///
+/// This mirrors C's stability: `LINR` indexes the STATIC `menuConvert` menu
+/// (menuConvert.dbd declaration order) via `findBrkTable`/`papChoiceValue[linr]`
+/// (cvtBpt.c:25-39), and only the name->table lookup (`dbFindBrkTable` over
+/// `bptList`) is dynamic — a record's index never moves when more tables load.
+/// A name-sorted index (the original model here) violated that: adding a table
+/// re-sorted the list and silently re-pointed already-resolved records.
+///
+/// epics-base-rs does not port the standard menuConvert names
+/// (`typeKdegF`=3 .. `typeSdegC`=15), so the absolute LINR *value* of a
+/// dynamically-loaded table follows load order rather than C's static
+/// declaration order; the table is still resolved correctly by name. Porting
+/// the standard menu/tables to align the absolute value is a separate gap.
 #[derive(Debug, Clone, Default)]
 pub struct BreakTableRegistry {
-    tables: BTreeMap<String, Arc<BrkTable>>,
+    tables: Vec<Arc<BrkTable>>,
 }
 
 /// The first `LINR` value that selects a breakpoint table (after the three
@@ -237,25 +250,29 @@ impl BreakTableRegistry {
         self.tables.is_empty()
     }
 
-    /// Insert a table, replacing any existing one of the same name (C
-    /// `dbBreakBody` treats a redefinition as a duplicate; the simpler
-    /// last-wins here is observably equivalent for distinct names, which is
-    /// the only supported case).
+    /// Insert a table. A same-name redefinition replaces the existing table
+    /// IN PLACE, keeping its stable index; a new name is APPENDED at the next
+    /// free index. Append-only growth is what keeps every existing table's
+    /// `LINR` index fixed across later loads.
     pub fn insert(&mut self, table: BrkTable) {
-        self.tables.insert(table.name.clone(), Arc::new(table));
+        if let Some(slot) = self.tables.iter_mut().find(|t| t.name == table.name) {
+            *slot = Arc::new(table);
+        } else {
+            self.tables.push(Arc::new(table));
+        }
     }
 
     /// Look up a table by name.
     pub fn get(&self, name: &str) -> Option<Arc<BrkTable>> {
-        self.tables.get(name).cloned()
+        self.tables.iter().find(|t| t.name == name).cloned()
     }
 
     /// The `LINR` index that selects the named table, or `None` if it is not
-    /// registered. The index is `3 + sorted_position`.
+    /// registered. The index is `3 + insertion_position` and never shifts.
     pub fn linr_index_of(&self, name: &str) -> Option<i16> {
         self.tables
-            .keys()
-            .position(|k| k == name)
+            .iter()
+            .position(|t| t.name == name)
             .map(|pos| LINR_FIRST_BREAKTABLE + pos as i16)
     }
 
@@ -266,7 +283,7 @@ impl BreakTableRegistry {
             return None;
         }
         let pos = (linr - LINR_FIRST_BREAKTABLE) as usize;
-        self.tables.values().nth(pos).cloned()
+        self.tables.get(pos).cloned()
     }
 }
 
@@ -370,17 +387,44 @@ mod tests {
     }
 
     #[test]
-    fn registry_sorts_and_indexes_from_three() {
+    fn registry_indexes_in_insertion_order_from_three() {
         let mut reg = BreakTableRegistry::new();
-        // Insert out of order; BTreeMap sorts: "alpha" < "zeta".
+        // Insertion order (NOT name-sorted): "zeta" loaded first -> index 3.
         reg.insert(BrkTable::build("zeta", &[(0.0, 0.0), (1.0, 1.0)]).unwrap());
         reg.insert(BrkTable::build("alpha", &[(0.0, 0.0), (1.0, 1.0)]).unwrap());
-        assert_eq!(reg.linr_index_of("alpha"), Some(3));
-        assert_eq!(reg.linr_index_of("zeta"), Some(4));
+        assert_eq!(reg.linr_index_of("zeta"), Some(3));
+        assert_eq!(reg.linr_index_of("alpha"), Some(4));
         assert_eq!(reg.linr_index_of("missing"), None);
-        assert_eq!(reg.table_for_linr(3).unwrap().name, "alpha");
-        assert_eq!(reg.table_for_linr(4).unwrap().name, "zeta");
+        assert_eq!(reg.table_for_linr(3).unwrap().name, "zeta");
+        assert_eq!(reg.table_for_linr(4).unwrap().name, "alpha");
         assert!(reg.table_for_linr(5).is_none());
         assert!(reg.table_for_linr(2).is_none());
+    }
+
+    /// Stability: a later insert must NOT shift an existing table's index —
+    /// the regression behind the wrong-table-across-loads bug. A name-sorted
+    /// registry would move "zeta" from 3 to 4 when "alpha" loads.
+    #[test]
+    fn registry_index_is_stable_across_later_inserts() {
+        let mut reg = BreakTableRegistry::new();
+        reg.insert(BrkTable::build("zeta", &[(0.0, 0.0), (1.0, 1.0)]).unwrap());
+        assert_eq!(reg.linr_index_of("zeta"), Some(3));
+        // Loading an alphabetically-earlier table must leave zeta at 3.
+        reg.insert(BrkTable::build("alpha", &[(0.0, 0.0), (1.0, 1.0)]).unwrap());
+        assert_eq!(
+            reg.linr_index_of("zeta"),
+            Some(3),
+            "zeta index must not shift"
+        );
+        assert_eq!(reg.table_for_linr(3).unwrap().name, "zeta");
+        assert_eq!(reg.linr_index_of("alpha"), Some(4));
+        // A same-name redefinition keeps the stable index, replaces the data.
+        reg.insert(BrkTable::build("zeta", &[(0.0, 0.0), (2.0, 20.0)]).unwrap());
+        assert_eq!(
+            reg.linr_index_of("zeta"),
+            Some(3),
+            "redefinition keeps index"
+        );
+        assert_eq!(reg.get("zeta").unwrap().points[1].eng, 20.0);
     }
 }

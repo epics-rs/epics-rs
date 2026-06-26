@@ -1280,17 +1280,24 @@ impl Record for AcalcoutRecord {
             self.cstat = -1;
         }
 
-        // --- OOPT decision (C afterCalc switch, using the just-computed VAL
-        //     and the previous PVAL — before IVOA substitutes IVOV) ---
-        let mut do_output = self.oopt_should_output();
+        // --- OOPT decision (C afterCalc switch :313-335, using the
+        //     just-computed VAL and the previous PVAL). `oopt_fires` is the
+        //     OOPT-only decision — it IS C's `doOutput`, and gates the ODLY
+        //     delay + DLYA pulse + completion (afterCalc :338). The
+        //     IVOA=Don't_drive veto removes only the OUT write (C checks it
+        //     inside execOutput, :920-921), NOT the defer — so it folds into
+        //     `write_out`, never the defer gate.
+        let oopt_fires = self.oopt_should_output();
+        let mut write_out = oopt_fires;
         if calc_failed && self.ivoa == 1 {
-            // menuIvoaDon_t_drive_outputs. C execOutput skips writeValue; the
-            // generic `multi_output_links` block (processing.rs) does not
-            // honour the framework's severity skip_out, so the OUT write is
-            // suppressed here via `cached_should_output`.
-            do_output = false;
+            // menuIvoaDon_t_drive_outputs: suppress the OUT write (and OEVT) via
+            // `cached_should_output`, since the generic `multi_output_links`
+            // block (processing.rs) does not honour the framework severity
+            // skip_out. C still defers under Don't_drive and runs the forward
+            // link ODLY-late, so the defer stays gated on `oopt_fires`.
+            write_out = false;
         }
-        self.cached_should_output = do_output;
+        self.cached_should_output = write_out;
 
         // C afterCalc line 336: pval = val, captured BEFORE execOutput's IVOA
         // can overwrite VAL (so PVAL holds the failed VAL, matching C).
@@ -1322,9 +1329,9 @@ impl Record for AcalcoutRecord {
         // `dlya == 1` branch at the top then emits. IVOV substitution (C
         // `execOutput`) likewise runs on the continuation via the framework
         // hook, not now. Mirrors `scalcout`/`calcout`.
-        if do_output && self.odly > 0.0 {
+        if oopt_fires && self.odly > 0.0 {
             self.dlya = 1;
-            self.pending_output = do_output;
+            self.pending_output = write_out;
             self.cached_should_output = false;
             let delay = std::time::Duration::from_secs_f64(self.odly);
             return Ok(ProcessOutcome {

@@ -225,3 +225,84 @@ async fn acalcout_odly_ivov_substitutes_on_continuation_not_delaying_cycle() {
         "continuation writes IVOV=99 to OUT (substituted on the continuation, not early)"
     );
 }
+
+/// D2: IVOA=Don't_drive must NOT cancel the ODLY defer. C `aCalcoutRecord.c`
+/// gates the defer on the OOPT-only `doOutput` (afterCalc:338); the Don't_drive
+/// veto is checked separately inside `execOutput` (:920-921) and removes only
+/// the OUT write. So with Don't_drive + OOPT-fires + ODLY>0 the record still
+/// pulses DLYA and holds PACT across the delay; the OUT write simply never
+/// fires (delaying cycle or continuation).
+#[tokio::test]
+async fn acalcout_odly_dont_drive_still_defers() {
+    let db = PvDatabase::new();
+
+    let writes = Arc::new(AtomicUsize::new(0));
+    let last = Arc::new(Mutex::new(None));
+    db.add_record(
+        "PROBE",
+        Box::new(OutProbe {
+            writes: writes.clone(),
+            last: last.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    // acalcout: CALC="1/0" → non-finite → calc_failed → INVALID; IVOA=1
+    // (Don't_drive); OOPT=Every → output due; ODLY=100; OUT→PROBE.
+    let mut a = AcalcoutRecord::default();
+    a.put_field("CALC", EpicsValue::String("1/0".into()))
+        .unwrap();
+    a.put_field("IVOA", EpicsValue::Short(1)).unwrap();
+    a.put_field("ODLY", EpicsValue::Double(100.0)).unwrap();
+    a.put_field("OUT", EpicsValue::String("PROBE".into()))
+        .unwrap();
+    db.add_record("AC", Box::new(a)).await.unwrap();
+
+    // Delaying cycle: must STILL defer (DLYA=1) even though the OUT write is
+    // vetoed — C gates the defer on the OOPT decision, not IVOA.
+    let mut v1 = HashSet::new();
+    db.process_record_with_links("AC", &mut v1, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_record("AC")
+            .await
+            .unwrap()
+            .read()
+            .await
+            .record
+            .get_field("DLYA"),
+        Some(EpicsValue::UShort(1)),
+        "IVOA=Don't_drive + OOPT-fires + ODLY>0 must STILL defer (C gates the \
+         defer on doOutput, the Don't_drive veto is inside execOutput)"
+    );
+    assert_eq!(
+        writes.load(Ordering::SeqCst),
+        0,
+        "OUT not written on the delaying cycle"
+    );
+
+    // Continuation: completes (DLYA cleared); Don't_drive suppresses the OUT
+    // write, so it never fires.
+    let mut v3 = HashSet::new();
+    db.process_record_continuation("AC", &mut v3, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_record("AC")
+            .await
+            .unwrap()
+            .read()
+            .await
+            .record
+            .get_field("DLYA"),
+        Some(EpicsValue::UShort(0)),
+        "continuation clears DLYA"
+    );
+    assert_eq!(
+        writes.load(Ordering::SeqCst),
+        0,
+        "IVOA=Don't_drive: OUT never written, even on the continuation"
+    );
+}

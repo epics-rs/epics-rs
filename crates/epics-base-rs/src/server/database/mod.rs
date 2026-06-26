@@ -450,25 +450,43 @@ impl PvDatabase {
 
     /// Merge `tables` into the shared breakpoint-table registry (C `bptList`
     /// accumulation across `dbLoadDatabase`/`dbLoadRecords`) and return the new
-    /// snapshot. Copy-on-write: existing record snapshots keep their `Arc`
-    /// while later records get one that includes the added tables. A record
-    /// only needs the table it references, which a correctly-ordered IOC loads
-    /// before the record (matching C). Returns the current snapshot unchanged
-    /// when `tables` is empty.
+    /// snapshot. Copy-on-write: a new merged registry replaces the old one.
+    ///
+    /// `add_breaktables` is the single registry-mutation owner, so it also
+    /// restores the invariant *every record can resolve against the current
+    /// registry* on mutation: the new snapshot is re-installed into every
+    /// existing record. That covers a record created before its table was
+    /// loaded (an inline record added before `dbLoadRecords`, or a merge-reload
+    /// that repoints `LINR` to a table loaded in the same command) — neither
+    /// of which goes back through `add_record`'s install. `install_*` is a
+    /// no-op for non-ai/ao records and resets the cached table so the new
+    /// registry wins. Returns the current snapshot unchanged when `tables` is
+    /// empty (no mutation, so no re-install).
     pub async fn add_breaktables(
         &self,
         tables: Vec<crate::server::cvt_bpt::BrkTable>,
     ) -> Arc<crate::server::cvt_bpt::BreakTableRegistry> {
-        let mut guard = self.inner.breaktable_registry.write().await;
-        if tables.is_empty() {
-            return guard.clone();
+        let snapshot = {
+            let mut guard = self.inner.breaktable_registry.write().await;
+            if tables.is_empty() {
+                return guard.clone();
+            }
+            let mut next = (**guard).clone();
+            for table in tables {
+                next.insert(table);
+            }
+            let snapshot = Arc::new(next);
+            *guard = snapshot.clone();
+            snapshot
+        };
+        // Re-install into existing records (registry write lock released
+        // above so this only contends on the per-record locks).
+        for inst in self.inner.records.read().await.values() {
+            inst.write()
+                .await
+                .record
+                .install_breaktable_registry(snapshot.clone());
         }
-        let mut next = (**guard).clone();
-        for table in tables {
-            next.insert(table);
-        }
-        let snapshot = Arc::new(next);
-        *guard = snapshot.clone();
         snapshot
     }
 
@@ -1726,6 +1744,35 @@ mod tests {
         inst.record.process().unwrap();
         // raw 50 in [0,100] -> eng 5.0, proving the registry was installed by
         // add_record alone.
+        assert_eq!(inst.record.get_field("VAL"), Some(EpicsValue::Double(5.0)));
+    }
+
+    /// `add_breaktables` re-installs the new snapshot into records that
+    /// already exist, so a record created BEFORE its table was loaded (inline
+    /// records added before dbLoadRecords; merge-reloads repointing LINR) can
+    /// still resolve `LINR >= 3`. Without the re-install the record keeps an
+    /// empty registry and never linearises.
+    #[tokio::test]
+    async fn add_breaktables_reinstalls_registry_into_existing_records() {
+        let db = PvDatabase::new();
+        // Record added while the registry is still empty: add_record installs
+        // nothing (the inline-record / pre-load ordering case).
+        let mut rec = crate::server::records::ai::AiRecord::new(0.0);
+        rec.put_field("LINR", EpicsValue::Short(3)).unwrap();
+        db.add_record("AI:BPT", Box::new(rec)).await.unwrap();
+
+        // Load the table afterwards — re-install must reach the existing record.
+        let ramp = crate::server::cvt_bpt::BrkTable::build(
+            "ramp",
+            &[(0.0, 0.0), (100.0, 10.0), (300.0, 30.0)],
+        )
+        .unwrap();
+        db.add_breaktables(vec![ramp]).await;
+
+        let arc = db.get_record("AI:BPT").await.unwrap();
+        let mut inst = arc.write().await;
+        inst.record.put_field("RVAL", EpicsValue::Long(50)).unwrap();
+        inst.record.process().unwrap();
         assert_eq!(inst.record.get_field("VAL"), Some(EpicsValue::Double(5.0)));
     }
 

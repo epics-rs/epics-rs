@@ -1888,6 +1888,77 @@ record(mbbo, "DUP:CM") {{
         });
     }
 
+    /// Q2: a merge-reload that loads a new breakpoint table AND repoints an
+    /// existing record's LINR to it. The merge branch updates the existing
+    /// instance in place (it never goes back through `add_record`'s install),
+    /// so the registry must reach it via `add_breaktables`' re-install. Proves
+    /// the repointed record linearises through the table loaded in the same
+    /// reload.
+    #[test]
+    fn test_db_load_records_merge_repoints_linr_to_new_breaktable() {
+        use std::io::Write;
+        let (db, ctx) = make_ctx();
+
+        let mut registry = CommandRegistry::new();
+        register_builtins(&mut registry);
+        let cmd = registry.get("dbLoadRecords").unwrap();
+
+        // First load: an `ao` with no breakpoint table.
+        let tmp1 = tempfile::Builder::new()
+            .suffix(".db")
+            .tempfile()
+            .expect("tempfile");
+        writeln!(
+            tmp1.as_file(),
+            r#"record(ao, "BPT:RBK") {{ field(DESC, "first") }}"#
+        )
+        .expect("write tempfile 1");
+        let args = parse_args(&[tmp1.path().to_string_lossy().to_string()], &cmd.args).unwrap();
+        assert!(matches!(
+            cmd.handler.call(&args, &ctx),
+            Ok(CommandOutcome::Continue)
+        ));
+
+        // Second load: define the table AND repoint the existing record's LINR.
+        let tmp2 = tempfile::Builder::new()
+            .suffix(".db")
+            .tempfile()
+            .expect("tempfile");
+        writeln!(
+            tmp2.as_file(),
+            r#"
+breaktable(ramp) {{ 0 0  100 10  300 30 }}
+record(ao, "BPT:RBK") {{ field(LINR, "ramp") }}
+"#
+        )
+        .expect("write tempfile 2");
+        let args = parse_args(&[tmp2.path().to_string_lossy().to_string()], &cmd.args).unwrap();
+        assert!(matches!(
+            cmd.handler.call(&args, &ctx),
+            Ok(CommandOutcome::Continue)
+        ));
+
+        ctx.block_on(async {
+            let rec = db.get_record("BPT:RBK").await.expect("BPT:RBK exists");
+            let mut inst = rec.write().await;
+            // The merge resolved "ramp" to the first table index.
+            assert_eq!(
+                inst.record.get_field("LINR"),
+                Some(crate::types::EpicsValue::Short(3))
+            );
+            // eng 5.0 -> raw 50 through the re-installed registry.
+            inst.record
+                .put_field("VAL", crate::types::EpicsValue::Double(5.0))
+                .unwrap();
+            inst.record.process().unwrap();
+            assert_eq!(
+                inst.record.get_field("RVAL"),
+                Some(crate::types::EpicsValue::Long(50)),
+                "merge-repointed LINR must linearise through the new table"
+            );
+        });
+    }
+
     /// Different record type for the same name is fatal — mirrors C
     /// `dbLexRoutines.c:1173-1180` "record '%s' already exists, can't
     /// load %s record".

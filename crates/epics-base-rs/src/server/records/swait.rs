@@ -18,6 +18,12 @@ pub struct SwaitRecord {
     pub dopt: i16,
     pub dold: f64,
     pub oval: f64,
+    // OEVT ("Output Event") — C `swaitRecord.c` `pwait->oevt` (DBF_USHORT).
+    // When output fires and `oevt > 0`, `execOutput` posts the numeric
+    // software event (`post_event((int)oevt)`, swaitRecord.c:797); see
+    // [`Record::output_event`]. swait has no IVOA field, so the post is
+    // never suppressed by the framework Don't_drive veto.
+    pub oevt: u16,
     pub out: String,
     pub prec: i16,
     // INxN: input link names; INxP: process passive flags (0/1)
@@ -39,6 +45,7 @@ impl Default for SwaitRecord {
             dopt: 0,
             dold: 0.0,
             oval: 0.0,
+            oevt: 0,
             out: String::new(),
             prec: 0,
             inp_names: Default::default(),
@@ -138,6 +145,11 @@ static SWAIT_FIELDS_SCALAR: &[FieldDesc] = &[
         name: "OVAL",
         dbf_type: DbFieldType::Double,
         read_only: true,
+    },
+    FieldDesc {
+        name: "OEVT",
+        dbf_type: DbFieldType::UShort,
+        read_only: false,
     },
     // OUT and OUTN are intentionally absent: both route to RecordInstance::common.out
     // via put_common_field so that parsed_out is populated for output dispatch.
@@ -404,6 +416,21 @@ impl Record for SwaitRecord {
         self.cached_should_output
     }
 
+    /// `OEVT` ("Output Event"): post the numeric output event when output
+    /// fires. C `swaitRecord.c` `execOutput` runs `if (pwait->oevt > 0)
+    /// post_event((int)pwait->oevt);` (swaitRecord.c:797) right after the OUT
+    /// write / forward link, on every cycle where output fires
+    /// (`cached_should_output`). swait has no IVOA field, so — like its C —
+    /// the post is never IVOA-suppressed. Stringified so the numeric event
+    /// matches a `SCAN="Event"` record's `EVNT`.
+    fn output_event(&self) -> Option<String> {
+        if self.cached_should_output && self.oevt > 0 {
+            Some(self.oevt.to_string())
+        } else {
+            None
+        }
+    }
+
     fn val(&self) -> Option<EpicsValue> {
         Some(EpicsValue::Double(self.val))
     }
@@ -416,6 +443,7 @@ impl Record for SwaitRecord {
             "DOPT" => Some(EpicsValue::Short(self.dopt)),
             "DOLD" => Some(EpicsValue::Double(self.dold)),
             "OVAL" => Some(EpicsValue::Double(self.oval)),
+            "OEVT" => Some(EpicsValue::UShort(self.oevt)),
             // OUTN is aliased to common.out via RecordInstance; not stored locally.
             "PREC" => Some(EpicsValue::Short(self.prec)),
             _ => {
@@ -462,6 +490,12 @@ impl Record for SwaitRecord {
                 self.dold = value
                     .to_f64()
                     .ok_or_else(|| CaError::TypeMismatch("DOLD".into()))?;
+            }
+            "OEVT" => {
+                self.oevt = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("OEVT".into()))?
+                    as u16;
             }
             // OUTN falls through to put_common_field which mirrors to common.out.
             "PREC" => {

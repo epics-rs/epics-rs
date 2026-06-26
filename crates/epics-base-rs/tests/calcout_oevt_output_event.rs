@@ -24,6 +24,7 @@ use epics_base_rs::server::record::{AlarmSeverity, FieldDesc, ProcessOutcome, Re
 use epics_base_rs::server::records::acalcout::AcalcoutRecord;
 use epics_base_rs::server::records::calcout::CalcoutRecord;
 use epics_base_rs::server::records::scalcout::ScalcoutRecord;
+use epics_base_rs::server::records::swait::SwaitRecord;
 use epics_base_rs::types::EpicsValue;
 
 /// A `SCAN="Event"` sibling that counts how many times it is processed — one
@@ -212,5 +213,34 @@ async fn acalcout_oevt_posts_numeric_event_on_output() {
         count.load(Ordering::SeqCst),
         1,
         "acalcout OEVT=7 must wake the EVNT=\"7\" sibling exactly once (numeric event)"
+    );
+}
+
+/// `swait`: numeric OEVT=3 wakes a `SCAN="Event"`/`EVNT="3"` sibling once.
+/// swait has no IVOA field, so OEVT posts whenever output fires — C
+/// swaitRecord.c:797 posts unconditionally after the OUT write / forward
+/// link, the 4th member of the OEVT-output family.
+#[tokio::test]
+async fn swait_oevt_posts_numeric_event_on_output() {
+    let db = PvDatabase::new();
+    let count = Arc::new(AtomicUsize::new(0));
+    add_event_sibling(&db, "W_SIB", "3", count.clone()).await;
+
+    let mut w = SwaitRecord::default();
+    w.put_field("CALC", EpicsValue::String("1".into())).unwrap();
+    w.put_field("OEVT", EpicsValue::UShort(3)).unwrap();
+    w.put_field("OOPT", EpicsValue::Short(0)).unwrap(); // Every_Time
+    db.add_record("W_OEVT", Box::new(w)).await.unwrap();
+
+    let mut v = HashSet::new();
+    db.process_record_with_links("W_OEVT", &mut v, 0)
+        .await
+        .unwrap();
+    settle(|| count.load(Ordering::SeqCst) >= 1).await;
+
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "swait OEVT=3 must wake the EVNT=\"3\" sibling exactly once (numeric event)"
     );
 }

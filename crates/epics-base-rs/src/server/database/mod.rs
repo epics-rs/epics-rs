@@ -490,13 +490,6 @@ impl PvDatabase {
         snapshot
     }
 
-    /// The current breakpoint-table registry snapshot.
-    pub async fn breaktable_registry_snapshot(
-        &self,
-    ) -> Arc<crate::server::cvt_bpt::BreakTableRegistry> {
-        self.inner.breaktable_registry.read().await.clone()
-    }
-
     /// Install the by-name subroutine registry, retained for runtime
     /// re-resolution (aSub LFLG=READ / SUBL). Called once at iocInit with the
     /// IocApp/IocBuilder registry. See [`Self::find_subroutine_named`].

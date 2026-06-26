@@ -466,6 +466,17 @@ impl PvDatabase {
         &self,
         tables: Vec<crate::server::cvt_bpt::BrkTable>,
     ) -> Arc<crate::server::cvt_bpt::BreakTableRegistry> {
+        // Hold the registration gate across the registry write AND the record
+        // snapshot below so this mutation cannot interleave with `add_record`'s
+        // [registry read -> records-map insert] — both are gated by the same
+        // mutex. Without it a record created concurrently could read the
+        // pre-mutation registry (miss the just-loaded table) while not yet
+        // being in the records map for the re-install below, leaving a
+        // table-not-found alarm until the next load / LINR put. `add_record`
+        // holds this gate across its whole body (registry read + map insert),
+        // so taking it here closes that TOCTOU window. No `add_breaktables`
+        // caller already holds the gate, so this is reentrancy-safe.
+        let _gate = self.inner.registration_mutex.lock().await;
         let snapshot = {
             let mut guard = self.inner.breaktable_registry.write().await;
             if tables.is_empty() {
@@ -481,11 +492,12 @@ impl PvDatabase {
         };
         // Re-install into existing records. Snapshot the instance handles
         // under a brief read, then release the map lock BEFORE taking any
-        // per-record write lock — holding `records.read()` across `inst.write()`
-        // would invert the processing path's `inst.write -> records.read` order
-        // (get_record) and deadlock under the write-preferring RwLock. Same
-        // collect-then-act idiom as `all_record_names`. (The registry write
-        // lock was already released above.)
+        // per-record write lock — collect-then-act, keeping the invariant
+        // "never hold the records-map lock across a per-record lock" uniform
+        // across the codebase (a7f5a74f). This is defensive: no current path
+        // takes the per-record lock then the records-map lock, so there is no
+        // confirmed cycle; uniform order forecloses one. Same idiom as
+        // `all_record_names`. (The registry write lock was released above.)
         let instances: Vec<_> = self.inner.records.read().await.values().cloned().collect();
         for inst in instances {
             inst.write()

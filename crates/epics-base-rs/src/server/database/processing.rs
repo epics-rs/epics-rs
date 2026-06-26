@@ -321,19 +321,39 @@ struct PutNotifyCtx<'a> {
 
 /// Result of the simulation-mode check.
 ///
-/// C `aiRecord.c:151-168` handles simulation entirely inside
-/// `readValue()`; `process()` then ALWAYS runs `convert`/`checkAlarms`/
-/// `monitor`/`recGblFwdLink(prec)`. A simulated record therefore must
-/// NOT skip the forward-link / CP / RPRO tail — only the device read
-/// and record-support body are replaced by the SIOL round-trip.
+/// C handles simulation entirely inside `readValue()` / `writeValue()` —
+/// the device-I/O step — and `process()` ALWAYS runs the rest of the body
+/// (`convert`/OROC/the record's own state machine) plus
+/// `checkAlarms`/`monitor`/`recGblFwdLink(prec)`. SIMM replaces ONLY the
+/// device read/write with the SIOL link, never the record-support body.
+/// The two substitution points differ by direction: an INPUT record's
+/// `readValue()` runs at the START of `process()` (before the body), so
+/// [`SimOutcome::Simulated`] does the SIOL read here and short-circuits;
+/// an OUTPUT record's `writeValue()` runs at the END (after the body has
+/// computed OVAL / armed bo HIGH), so [`SimOutcome::RedirectOutputToSiol`]
+/// lets the uniform flow run the body and redirects only the final write.
 enum SimOutcome {
     /// SIMM disabled / no simulation link configured: run the record
     /// body normally.
     NotSimulated,
-    /// Simulation handled the record value (SIOL read/write done).
-    /// The caller must still run the forward-link / CP / RPRO tail
-    /// exactly as `recGblFwdLink` does for a real process cycle.
+    /// Simulated INPUT record: the SIOL read + convert already ran here
+    /// (`readValue` precedes the body). The caller must still run the
+    /// forward-link / CP / RPRO tail exactly as `recGblFwdLink` does for a
+    /// real process cycle, but skips the (already-substituted) body.
     Simulated,
+    /// Simulated OUTPUT record (`SIMM`=YES/RAW, not deferring). C
+    /// `writeValue` substitutes the device write with
+    /// `dbPutLink(&prec->siol, ..., &prec->oval)` — but at the END of
+    /// `process()`, AFTER the body (OROC, bo HIGH momentary reset, OVAL).
+    /// Unlike the input read, the output write cannot be done up-front, so
+    /// the caller runs the uniform record body and redirects only the final
+    /// output write to SIOL. Carries the SIOL link, the SIMS severity, and
+    /// the RAW-mode flag (write RVAL vs OVAL).
+    RedirectOutputToSiol {
+        siol: crate::server::record::ParsedLink,
+        sims: i16,
+        raw_mode: bool,
+    },
     /// Asynchronous simulation: `SIMM`=YES/RAW with `SDLY` >= 0 on the
     /// fresh (non-continuation) cycle. C `aiRecord.c::readValue` (488-508)
     /// / `aoRecord.c::writeValue` (571-587) `callbackRequestProcessCallbackDelayed`:
@@ -1303,16 +1323,25 @@ impl PvDatabase {
 
         // 0.5. Simulation mode check.
         //
-        // C `aiRecord.c:151-168`: simulation is handled inside
-        // `readValue()`, then `process()` ALWAYS runs `convert` /
-        // `checkAlarms` / `monitor` / `recGblFwdLink(prec)`. A
-        // simulated record therefore must still run the forward-link /
-        // CP / RPRO tail — only the device read and record-support
-        // body are replaced by the SIOL round-trip. Returning early
-        // here would silently break every FLNK / CP chain downstream
+        // C handles simulation inside `readValue()` / `writeValue()` — the
+        // device-I/O step — then `process()` ALWAYS runs the rest of the
+        // body (`convert` / OROC / the record's own state machine) plus
+        // `checkAlarms` / `monitor` / `recGblFwdLink(prec)`. SIMM replaces
+        // ONLY the device read/write, never the body. The substitution
+        // point differs by direction: an INPUT `readValue()` precedes the
+        // body, so `Simulated` does the SIOL read here and short-circuits;
+        // an OUTPUT `writeValue()` follows the body, so
+        // `RedirectOutputToSiol` falls through to run the uniform body and
+        // redirects only the final output write to SIOL (see below). Either
+        // way the forward-link / CP / RPRO tail still runs — returning early
+        // without it would silently break every FLNK / CP chain downstream
         // of any record in SIMM mode.
-        match self.check_simulation_mode(&rec).await {
-            SimOutcome::NotSimulated => {}
+        //
+        // `sim_output` carries the OUTPUT redirect (SIOL link, SIMS, RAW
+        // flag) from this point to the OUT stage / alarm epilogue below;
+        // `None` for a non-simulated record or a simulated INPUT.
+        let sim_output = match self.check_simulation_mode(&rec).await {
+            SimOutcome::NotSimulated => None,
             SimOutcome::Simulated => {
                 self.run_forward_link_tail(name, &rec, visited, depth).await;
                 return Ok(());
@@ -1337,7 +1366,12 @@ impl PvDatabase {
                 self.schedule_delayed_reprocess(name, delay).await;
                 return Ok(());
             }
-        }
+            SimOutcome::RedirectOutputToSiol {
+                siol,
+                sims,
+                raw_mode,
+            } => Some((siol, sims, raw_mode)),
+        };
 
         // 1. Read INP link value and DOL link (outside lock)
         let (inp_parsed, is_soft, dol_info) = {
@@ -1705,7 +1739,15 @@ impl PvDatabase {
         let asub_dynamic = self.resolve_asub_dynamic_subroutine(&rec).await;
 
         // 2. Lock record, apply INP/DOL, process, evaluate alarms, build snapshot
-        let (snapshot, out_info, flnk_name, process_actions, alarm_posts, result_is_defer_output) = {
+        let (
+            snapshot,
+            out_info,
+            flnk_name,
+            process_actions,
+            alarm_posts,
+            result_is_defer_output,
+            sim_skip_out,
+        ) = {
             let mut instance = rec.write().await;
 
             // Apply DOL value for output records (OMSL=CLOSED_LOOP)
@@ -2196,6 +2238,22 @@ impl PvDatabase {
                 instance.common.udf = instance.record.value_is_undefined();
             }
 
+            // SIMM simulation severity on a redirected OUTPUT record. C
+            // `writeValue` raises `recGblSetSevr(prec, SIMM_ALARM, prec->sims)`
+            // BEFORE `checkAlarms`, so the SIMM stat/amsg wins on a severity
+            // tie (the same ordering `sim_process_tail` documents for the
+            // input branch). A simulated INPUT already raised this inside
+            // `check_simulation_mode` and short-circuited; this is the output
+            // twin, raised here at the equivalent point in the uniform flow.
+            if let Some((_, sims, _)) = &sim_output {
+                let sev = crate::server::record::AlarmSeverity::from_u16(*sims as u16);
+                crate::server::recgbl::rec_gbl_set_sevr(
+                    &mut instance.common,
+                    crate::server::recgbl::alarm_status::SIMM_ALARM,
+                    sev,
+                );
+            }
+
             // Per-record alarm hook — record-type-specific STATE / COS
             // / limit / SOFT alarms (C `checkAlarms()`). Records that
             // have migrated their alarm logic here raise into
@@ -2368,7 +2426,15 @@ impl PvDatabase {
             let is_soft_out =
                 instance.common.dtyp.is_empty() || instance.common.dtyp == "Soft Channel";
             let record_should_output = instance.record.should_output();
-            let out_info = if skip_out {
+            let out_info = if sim_output.is_some() {
+                // Simulated OUTPUT record: C `writeValue` redirects the output
+                // to SIOL (`dbPutLink(&prec->siol, ..., &prec->oval)`) INSTEAD
+                // of the real device write / soft OUT-link write. The redirect
+                // is applied from the OUT epilogue by `write_simulated_output_siol`
+                // (it reads the post-body OVAL/RVAL), so the normal device/OUT
+                // write is suppressed here.
+                None
+            } else if skip_out {
                 None
             } else if !can_dev_write {
                 // Non-output records (calcout, etc.) may still have a
@@ -2732,6 +2798,7 @@ impl PvDatabase {
                 process_actions,
                 alarm_posts,
                 result_is_defer_output,
+                skip_out,
             )
         };
 
@@ -2824,6 +2891,18 @@ impl PvDatabase {
                 instance.record.on_output_complete();
             }
         }
+
+        // Simulated OUTPUT record: apply the SIOL redirect. C `writeValue` does
+        // `dbPutLink(&prec->siol, ..., &prec->oval)` before `recGblFwdLink`, so
+        // it runs here — after the OUT-link write point, before the forward-link
+        // tail below. `out_info` is `None` for a simulated record (the device /
+        // soft-OUT write was suppressed above), so this is the record's single
+        // output this cycle. The read-of-OVAL + write lives in a dedicated
+        // helper so the `EpicsValue` it materialises stays out of this giant
+        // function's async state (which is polled MAX_LINK_DEPTH-deep on a FLNK
+        // chain — see the depth-limit tests).
+        self.write_simulated_output_siol(&rec, &sim_output, sim_skip_out)
+            .await;
 
         // 7b. C record support performs a record's OUT/link writes BEFORE
         // its forward link: `transformRecord` calls `dbPutLink()`
@@ -4341,10 +4420,62 @@ impl PvDatabase {
         }
     }
 
+    /// Apply the SIMM-mode OUTPUT redirect (the `writeValue` half of
+    /// simulation). C `writeValue` substitutes the device write with
+    /// `dbPutLink(&prec->siol, ..., &prec->oval)` at the END of `process()`,
+    /// so this runs from the OUT epilogue after the body computed OVAL/RVAL.
+    /// `sim_output` is `None` for a non-simulated record or a simulated INPUT
+    /// (whose `readValue` ran up-front); `skip_out` carries the IVOA
+    /// Don't_drive veto so the SIOL write is suppressed exactly as the real
+    /// device write would be.
+    ///
+    /// Kept as its own `async fn` so the `EpicsValue` it reads out of the
+    /// record never enters `process_record_with_links_inner`'s async state —
+    /// that future is polled `MAX_LINK_DEPTH` frames deep on a FLNK chain, and
+    /// bloating it overflows the stack (the depth-limit regression tests).
+    async fn write_simulated_output_siol(
+        &self,
+        rec: &Arc<RwLock<RecordInstance>>,
+        sim_output: &Option<(crate::server::record::ParsedLink, i16, bool)>,
+        skip_out: bool,
+    ) {
+        let Some((siol, _sims, raw_mode)) = sim_output else {
+            return;
+        };
+        // IVOA Don't_drive veto (C skips `writeValue` entirely) and a
+        // non-writable SIOL (empty / constant — C `dbPutLink` no-op) both
+        // suppress the write.
+        if skip_out || !siol.is_writable_out_link() {
+            return;
+        }
+        // Post-body OVAL (RAW: RVAL), falling back to VAL — matching C
+        // `writeValue` (`&prec->oval`) and the soft OUT-link `OVAL.or(VAL)`
+        // selection.
+        let value = {
+            let instance = rec.read().await;
+            if *raw_mode {
+                instance
+                    .record
+                    .get_field("RVAL")
+                    .or_else(|| instance.record.val())
+            } else {
+                instance
+                    .record
+                    .get_field("OVAL")
+                    .or_else(|| instance.record.val())
+            }
+        };
+        if let Some(value) = value {
+            self.write_sim_siol_value(siol, value).await;
+        }
+    }
+
     /// Check simulation mode for a record. Returns
-    /// `SimOutcome::Simulated` when simulation handled the value (the
-    /// caller must still run the forward-link tail), or
-    /// `SimOutcome::NotSimulated` when normal processing should proceed.
+    /// `SimOutcome::Simulated` when a simulated INPUT handled the value (the
+    /// caller still runs the forward-link tail),
+    /// `SimOutcome::RedirectOutputToSiol` when a simulated OUTPUT needs the
+    /// uniform body to run first, or `SimOutcome::NotSimulated` when normal
+    /// processing should proceed.
     async fn check_simulation_mode(&self, rec: &Arc<RwLock<RecordInstance>>) -> SimOutcome {
         // Read SIML, SIMM, SIOL, SIMS, SDLY from the record
         let (siml_link, siol_link, sims, sdly, _rtype, is_input, pact_held) = {
@@ -4498,7 +4629,6 @@ impl PvDatabase {
         //             a raw value as "YES" since there's nothing
         //             else to copy.
         let raw_mode = simm == 2;
-        let raw_field = if raw_mode { "RVAL" } else { "VAL" };
 
         // SDLY async simulation — C `aiRecord.c::readValue` (488) /
         // `aoRecord.c::writeValue` (571): `if (prec->pact || prec->sdly < 0)`
@@ -4514,122 +4644,113 @@ impl PvDatabase {
             return SimOutcome::DeferRead(std::time::Duration::from_secs_f64(sdly));
         }
 
-        // SIMM=YES(1) / SIMM=RAW(2): read/write the SIOL link. C
-        // `readValue`/`writeValue` for a SIMM-mode record go through
-        // `dbGetLink`/`dbPutLink`, which dispatch by link type — a local
-        // DB target, a CA target (a bare non-local name or an explicit
-        // `CA`/`ca://` link), or a constant. The pre-fix port special-
-        // cased a local `ParsedLink::Db` SIOL only, so a non-local or
-        // external SIOL neither read nor wrote yet still returned
-        // `Simulated` — the record froze with no value and no alarm.
-        // Dispatch uniformly through the same link read/write owners as
-        // every other link; the alarm/timestamp/notify tail below now
-        // runs for every SIOL link type.
-        {
-            if is_input {
-                // Input record: read from SIOL -> set VAL/RVAL. Uniform
-                // across Db (with locality fallback) / Ca / Pva / constant
-                // via `read_link_value_no_process` (C `dbGetLink`).
-                if let Some(siol_val) = self.read_link_value_no_process(&siol_link).await {
-                    let mut instance = rec.write().await;
-                    let target_supports_raw =
-                        raw_mode && instance.record.get_field("RVAL").is_some();
-                    if target_supports_raw {
-                        // PR #ac92e3e follow-up: SIMM=RAW on records
-                        // with RVAL (ai/ao/etc.) writes the raw value
-                        // into RVAL and runs the record's own
-                        // process() so the LINR / ESLO / EOFF / ASLO
-                        // / AOFF conversion chain computes VAL. The
-                        // pre-fix path additionally called set_val
-                        // here, which overwrote VAL with the raw
-                        // count and silently bypassed conversion —
-                        // the visible failure mode was "SIMM=RAW
-                        // simulation returns counts instead of EGU".
-                        //
-                        // Coerce to RVAL's native DBR type before
-                        // put_field — ai.RVAL is Long, but SIOL on a
-                        // soft channel typically yields Double. Without
-                        // the coerce step the put_field rejects with
-                        // TypeMismatch and leaves RVAL at 0, so
-                        // process() computes VAL = 0*ESLO + EOFF
-                        // (the offset only), not the intended
-                        // RAW*ESLO + EOFF.
-                        let rval_type = instance
-                            .record
-                            .field_list()
-                            .iter()
-                            .find(|f| f.name == "RVAL")
-                            .map(|f| f.dbf_type)
-                            .unwrap_or(crate::types::DbFieldType::Long);
-                        // C parity (aiRecord.c:495): `rval = (long)floor(sval)`.
-                        // Rust `convert_to(Long)` truncates toward zero,
-                        // diverging for negative bipolar-ADC raw values
-                        // (sval=-1.5 → C: -2, Rust as-cast: -1).
-                        // Floor explicitly when narrowing a float to
-                        // an integer RVAL.
-                        let coerced = match (&siol_val, rval_type) {
-                            (EpicsValue::Double(d), crate::types::DbFieldType::Long) => {
-                                EpicsValue::Long(d.floor() as i32)
-                            }
-                            (EpicsValue::Double(d), crate::types::DbFieldType::Int64) => {
-                                EpicsValue::Int64(d.floor() as i64)
-                            }
-                            (EpicsValue::Float(d), crate::types::DbFieldType::Long) => {
-                                EpicsValue::Long((*d as f64).floor() as i32)
-                            }
-                            (EpicsValue::Float(d), crate::types::DbFieldType::Int64) => {
-                                EpicsValue::Int64((*d as f64).floor() as i64)
-                            }
-                            _ if siol_val.db_field_type() != rval_type => {
-                                siol_val.convert_to(rval_type)
-                            }
-                            _ => siol_val,
-                        };
-                        let _ = instance.record.put_field("RVAL", coerced);
-                        let ctx = instance.common.process_context();
-                        instance.record.set_process_context(&ctx);
-                        let _ = instance.record.process();
-                    } else {
-                        // Records without RVAL fall back to SIMM=YES
-                        // semantics: the SIOL value goes straight into
-                        // VAL; no conversion to run.
-                        let _ = instance.record.set_val(siol_val);
-                    }
-                    // Simulation alarm + per-field monitor tail — see
-                    // `sim_process_tail`.
-                    sim_process_tail(&mut instance, sims);
-                }
-            } else {
-                // Output record: write VAL (or RVAL for SIMM=RAW) to
-                // SIOL (skip device write).
-                let out_val = {
-                    let instance = rec.read().await;
-                    if raw_mode {
-                        // RAW path: prefer RVAL when the record has
-                        // one. Otherwise fall through to VAL.
-                        instance
-                            .record
-                            .get_field(raw_field)
-                            .or_else(|| instance.record.val())
-                    } else {
-                        instance.record.val()
-                    }
-                };
-                if let Some(val) = out_val {
-                    // Write VAL to the SIOL target, dispatching by link
-                    // type/locality (C `dbPutLink`). A local DB target
-                    // uses the `_already_locked` write — writing VAL is an
-                    // internal step of this record's processing chain,
-                    // which already holds the entry record's advisory
-                    // write gate, so a SIOL that points back at a chain
-                    // record cannot dead-lock on a non-reentrant gate
-                    // (same reasoning as the OUT-link write in
-                    // `write_db_link_value`). A non-local or external
-                    // SIOL routes through the lset put path.
-                    self.write_sim_siol_value(&siol_link, val).await;
-                }
+        // OUTPUT record: C `writeValue` substitutes the device write with the
+        // SIOL write, but it runs at the END of `process()` — after the body
+        // has computed OVAL (OROC) and armed any record state machine (bo HIGH
+        // momentary reset). The output write therefore CANNOT be done here, up
+        // front, the way the input read can: doing so would write the stale
+        // pre-body VAL and skip the body entirely (the divergence this path
+        // closes). Hand the redirect back so the uniform flow runs the body and
+        // the OUT-stage epilogue writes the fresh OVAL/RVAL to SIOL. Clear the
+        // SDLY-held PACT first (C `writeValue` sets `pact = FALSE` on the sync
+        // continuation) so the body runs on an idle record.
+        if !is_input {
+            if pact_held {
+                let instance = rec.write().await;
+                instance
+                    .processing
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
+            return SimOutcome::RedirectOutputToSiol {
+                siol: siol_link,
+                sims,
+                raw_mode,
+            };
+        }
 
+        // SIMM=YES(1) / SIMM=RAW(2): read the SIOL link into VAL/RVAL. C
+        // `readValue` for a SIMM-mode INPUT record goes through `dbGetLink`,
+        // which dispatches by link type — a local DB target, a CA target (a
+        // bare non-local name or an explicit `CA`/`ca://` link), or a
+        // constant. The pre-fix port special-cased a local `ParsedLink::Db`
+        // SIOL only, so a non-local or external SIOL never read yet still
+        // returned `Simulated` — the record froze with no value and no alarm.
+        // Dispatch uniformly through the same link read owner as every other
+        // link; the alarm/timestamp/notify tail below now runs for every SIOL
+        // link type.
+        //
+        // Output records returned `RedirectOutputToSiol` above (the output
+        // write follows the body), so only an INPUT record reaches here — its
+        // `readValue` precedes the body, so the SIOL read + convert are done
+        // in place and the caller short-circuits.
+        {
+            // Read from SIOL -> set VAL/RVAL. Uniform across Db (with
+            // locality fallback) / Ca / Pva / constant via
+            // `read_link_value_no_process` (C `dbGetLink`).
+            if let Some(siol_val) = self.read_link_value_no_process(&siol_link).await {
                 let mut instance = rec.write().await;
+                let target_supports_raw = raw_mode && instance.record.get_field("RVAL").is_some();
+                if target_supports_raw {
+                    // PR #ac92e3e follow-up: SIMM=RAW on records
+                    // with RVAL (ai/ao/etc.) writes the raw value
+                    // into RVAL and runs the record's own
+                    // process() so the LINR / ESLO / EOFF / ASLO
+                    // / AOFF conversion chain computes VAL. The
+                    // pre-fix path additionally called set_val
+                    // here, which overwrote VAL with the raw
+                    // count and silently bypassed conversion —
+                    // the visible failure mode was "SIMM=RAW
+                    // simulation returns counts instead of EGU".
+                    //
+                    // Coerce to RVAL's native DBR type before
+                    // put_field — ai.RVAL is Long, but SIOL on a
+                    // soft channel typically yields Double. Without
+                    // the coerce step the put_field rejects with
+                    // TypeMismatch and leaves RVAL at 0, so
+                    // process() computes VAL = 0*ESLO + EOFF
+                    // (the offset only), not the intended
+                    // RAW*ESLO + EOFF.
+                    let rval_type = instance
+                        .record
+                        .field_list()
+                        .iter()
+                        .find(|f| f.name == "RVAL")
+                        .map(|f| f.dbf_type)
+                        .unwrap_or(crate::types::DbFieldType::Long);
+                    // C parity (aiRecord.c:495): `rval = (long)floor(sval)`.
+                    // Rust `convert_to(Long)` truncates toward zero,
+                    // diverging for negative bipolar-ADC raw values
+                    // (sval=-1.5 → C: -2, Rust as-cast: -1).
+                    // Floor explicitly when narrowing a float to
+                    // an integer RVAL.
+                    let coerced = match (&siol_val, rval_type) {
+                        (EpicsValue::Double(d), crate::types::DbFieldType::Long) => {
+                            EpicsValue::Long(d.floor() as i32)
+                        }
+                        (EpicsValue::Double(d), crate::types::DbFieldType::Int64) => {
+                            EpicsValue::Int64(d.floor() as i64)
+                        }
+                        (EpicsValue::Float(d), crate::types::DbFieldType::Long) => {
+                            EpicsValue::Long((*d as f64).floor() as i32)
+                        }
+                        (EpicsValue::Float(d), crate::types::DbFieldType::Int64) => {
+                            EpicsValue::Int64((*d as f64).floor() as i64)
+                        }
+                        _ if siol_val.db_field_type() != rval_type => {
+                            siol_val.convert_to(rval_type)
+                        }
+                        _ => siol_val,
+                    };
+                    let _ = instance.record.put_field("RVAL", coerced);
+                    let ctx = instance.common.process_context();
+                    instance.record.set_process_context(&ctx);
+                    let _ = instance.record.process();
+                } else {
+                    // Records without RVAL fall back to SIMM=YES
+                    // semantics: the SIOL value goes straight into
+                    // VAL; no conversion to run.
+                    let _ = instance.record.set_val(siol_val);
+                }
                 // Simulation alarm + per-field monitor tail — see
                 // `sim_process_tail`.
                 sim_process_tail(&mut instance, sims);

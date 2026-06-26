@@ -76,6 +76,19 @@ pub struct CompressRecord {
     // each cycle in `pre_process_actions`.
     cycle_ingested: bool,
     cycle_emitted: bool,
+    // C `prec->inpn`: the INP source's element count from the previous
+    // INP-driven ingest. When the count changes between cycles the
+    // accumulation buffer is reset and restarted at the new length
+    // (compressRecord.c:334-340).
+    inpn: usize,
+    // True only while applying this cycle's INP read (set in
+    // `pre_process_actions`, consumed in `push_array`, cleared in `process`).
+    // C's element-count reset lives in `process` and keys on `prec->wptr` (the
+    // INP read buffer) — a CA put to VAL goes through `put_array_info`, never
+    // `process`, so it must NOT reset. In Rust both the INP read and a direct
+    // VAL put reach `push_array` via `put_field("VAL")`; this flag is how
+    // `push_array` tells them apart so only the INP-driven ingest can reset.
+    inp_read_pending: bool,
 }
 
 impl Default for CompressRecord {
@@ -109,6 +122,8 @@ impl Default for CompressRecord {
             accum: Vec::new(),
             cycle_ingested: false,
             cycle_emitted: false,
+            inpn: 0,
+            inp_read_pending: false,
         }
     }
 }
@@ -126,6 +141,23 @@ impl CompressRecord {
             nsam,
             alg,
             ..Default::default()
+        }
+    }
+
+    /// Clear the running accumulator and output buffer — the body of C
+    /// `reset()` (compressRecord.c:85-99). Single owner shared by the
+    /// SPC_RESET path (`RES` write) and the INP element-count-change path in
+    /// `push_array`. Does NOT touch the C-1 completion gate
+    /// (`cycle_ingested`/`cycle_emitted`): a reset emits nothing, so the gate
+    /// stays whatever the surrounding cycle set it to.
+    fn reset_accumulators(&mut self) {
+        self.off = 0;
+        self.nuse = 0;
+        self.inx = 0;
+        self.cvb = 0.0;
+        self.accum.clear();
+        for v in &mut self.val {
+            *v = 0.0;
         }
     }
 
@@ -291,6 +323,25 @@ impl CompressRecord {
         // A non-empty ingestion happened this cycle; whether it emitted is
         // recorded by `put_one`. See `cycle_ingested`/`cycle_emitted`.
         self.cycle_ingested = true;
+        // C compressRecord.c:334-340: when the INP source's element count
+        // changes between INP-driven cycles, C frees the buffer and `reset()`s,
+        // restarting accumulation clean at the new length. Without this the
+        // rolling Average (ALG=3) keeps stale per-element partial sums from the
+        // old length and blends them with the new waveform → a corrupt average.
+        // C gates the reset on `prec->wptr` already being allocated (a prior
+        // INP read), so the FIRST INP read does not reset; and the reset lives
+        // in `process` (the INP path), NOT in a CA put to VAL (`put_array_info`).
+        // `inp_read_pending` confines the reset to the INP-driven ingest: a
+        // direct VAL put / unit-test `push_array` is a raw buffer op and never
+        // resets. The reset clears no completion-gate state, so C-1's emit gate
+        // holds (a reset cycle still ingests, then the algorithm decides emit).
+        if self.inp_read_pending {
+            self.inp_read_pending = false;
+            if self.inpn != 0 && input.len() != self.inpn {
+                self.reset_accumulators();
+            }
+            self.inpn = input.len();
+        }
         match self.alg {
             // Circular Buffer (alg=4): every sample independent.
             4 => {
@@ -505,18 +556,15 @@ impl Record for CompressRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
+        // Safety net: clear the INP-read marker for any cycle whose read never
+        // reached `push_array` (no INP, empty/error read, scalar via
+        // `push_value`), so a later direct VAL put cannot inherit a stale mark.
+        self.inp_read_pending = false;
         if self.res != 0 {
             // C `reset` (compressRecord.c:85-99) clears the running
             // accumulator state too — `inx`, `cvb` and the summing
             // buffer — not just `off`/`nuse`.
-            self.off = 0;
-            self.nuse = 0;
-            self.inx = 0;
-            self.cvb = 0.0;
-            self.accum.clear();
-            for v in &mut self.val {
-                *v = 0.0;
-            }
+            self.reset_accumulators();
             self.res = 0;
             // A reset publishes the cleared buffer (C `reset` is followed by
             // `monitor`); never suppress on a reset cycle.
@@ -744,6 +792,10 @@ impl Record for CompressRecord {
         if self.inp.is_empty() {
             return Vec::new();
         }
+        // Mark the upcoming INP read so `push_array` knows this ingest is the
+        // INP-driven one that may trigger the element-count reset (vs a direct
+        // VAL put). Cleared in `process` if the read never reaches `push_array`.
+        self.inp_read_pending = true;
         vec![crate::server::record::ProcessAction::ReadDbLink {
             link_field: "INP",
             target_field: "VAL",
@@ -806,6 +858,41 @@ mod pbuf_tests {
             snap.changed_fields
         );
         assert!(actions.is_empty(), "compress is soft → no process actions");
+    }
+
+    /// C compressRecord.c:334-340: a change in the INP source's element count
+    /// between cycles must reset the accumulation buffer and restart clean.
+    /// The rolling Average (ALG=3) is the victim — without the reset it keeps
+    /// stale per-element partial sums from the old length and blends them with
+    /// the new waveform. Feed a 4-element waveform mid-window, switch to 2
+    /// elements; the emitted average must reflect only the post-resize data.
+    #[test]
+    fn average_resets_on_inp_element_count_change() {
+        let mut rec = CompressRecord::new(4, 3); // NSAM=4, ALG=3 (Average)
+        rec.n = 2; // average over 2 cycles
+
+        // `inp_read_pending` marks each push as the INP-driven ingest (what
+        // `pre_process_actions` sets in the real process path); only those may
+        // trigger the element-count reset.
+        // Cycle 1: length 4, mid-window (inx 0 -> 1, no emit).
+        rec.inp_read_pending = true;
+        rec.push_array(&[10.0, 20.0, 30.0, 40.0]);
+        // Cycle 2: length CHANGES to 2 -> reset + restart (inx 0 -> 1, no emit).
+        rec.inp_read_pending = true;
+        rec.push_array(&[2.0, 2.0]);
+        // Cycle 3: length 2 again -> inx 1 -> 2 -> emit mean([2,2],[4,4])=[3,3].
+        rec.inp_read_pending = true;
+        rec.push_array(&[4.0, 4.0]);
+
+        // Clean restart: the average is the mean of the two post-resize
+        // 2-element waveforms, NOT a blend with the stale length-4 cycle-1 data
+        // (which would yield [6, 11] emitted a cycle early).
+        assert_eq!(
+            rec.val[0], 3.0,
+            "element 0 must be mean(2,4)=3 from the clean post-resize window, \
+             not a blend with the stale length-4 partial sum"
+        );
+        assert_eq!(rec.val[1], 3.0, "element 1 must be mean(2,4)=3");
     }
 
     /// C `get_array_info` (compressRecord.c:409-431) returns

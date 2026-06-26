@@ -204,6 +204,21 @@ pub fn pp_fields_for(record_type: &str) -> Option<&'static [&'static str]> {
         // process(), whose autocount block could re-arm the counter / send
         // device commands. CNT (start/stop) and CONT (rescan) still process.
         "scaler" => &["CNT", "CONT"],
+        // optics module tableRecord.dbd: the 45 pp(TRUE) fields are the user
+        // motion drives + geometry params (LX..Z, YANG), the absolute and
+        // relative user limits (UHAX..ULZ, UHAXR..ULZR), the action flags
+        // (INIT/ZERO/SYNC/READ) and the menus (GEOM/AUNIT). Every other field
+        // — including the SPC_MOD-but-not-pp VAL/L2Z/SSET/SUSE and all the
+        // SPC_NOMOD readbacks — is applied by `on_put` (table's special()
+        // equivalent) and must NOT process. Without this a put to a config or
+        // readback field ran process(), whose "Calc & Move" branch drives the
+        // motor output links — a spurious motion command.
+        "table" => &[
+            "LX", "LZ", "SX", "SY", "SZ", "RX", "RY", "RZ", "YANG", "AX", "AY", "AZ", "X", "Y",
+            "Z", "UHAX", "UHAY", "UHAZ", "UHX", "UHY", "UHZ", "ULAX", "ULAY", "ULAZ", "ULX", "ULY",
+            "ULZ", "UHAXR", "UHAYR", "UHAZR", "UHXR", "UHYR", "UHZR", "ULAXR", "ULAYR", "ULAZR",
+            "ULXR", "ULYR", "ULZR", "INIT", "ZERO", "SYNC", "READ", "GEOM", "AUNIT",
+        ],
         // std module epidRecord.dbd: only VAL is pp(TRUE); every other
         // field is plain or special(SPC_NOMOD) with no pp. Without this a
         // put to a gain (KP/KI/KD), a limit, or a link (STPL/INP/OUTL/TRIG)

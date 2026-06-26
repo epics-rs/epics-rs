@@ -776,8 +776,12 @@ mod tests {
         rec.aslo = 1.0;
         rec.aoff = 0.0;
         rec.roff = 0;
-        // LINR = 3 is the first (only) registered table, "ramp".
-        rec.put_field("LINR", EpicsValue::Short(3)).unwrap();
+        // "ramp" is the only registered table -> first user-table index (15).
+        rec.put_field(
+            "LINR",
+            EpicsValue::Short(crate::server::cvt_bpt::LINR_FIRST_USER_TABLE),
+        )
+        .unwrap();
         rec.put_field("RVAL", EpicsValue::Long(50)).unwrap();
 
         rec.process().unwrap();
@@ -798,7 +802,11 @@ mod tests {
         let mut rec = AiRecord::default();
         rec.install_breaktable_registry(ramp_registry());
         rec.aslo = 1.0;
-        rec.put_field("LINR", EpicsValue::Short(3)).unwrap();
+        rec.put_field(
+            "LINR",
+            EpicsValue::Short(crate::server::cvt_bpt::LINR_FIRST_USER_TABLE),
+        )
+        .unwrap();
         rec.put_field("RVAL", EpicsValue::Long(400)).unwrap();
 
         rec.process().unwrap();
@@ -821,8 +829,12 @@ mod tests {
         rec.aslo = 1.0;
         rec.aoff = 0.0;
         rec.roff = 0;
-        // Only one table is registered (index 3); index 4 is unresolvable.
-        rec.put_field("LINR", EpicsValue::Short(4)).unwrap();
+        // "ramp" is at index 15; this user-block index has no loaded table.
+        rec.put_field(
+            "LINR",
+            EpicsValue::Short(crate::server::cvt_bpt::LINR_FIRST_USER_TABLE + 1),
+        )
+        .unwrap();
         rec.put_field("RVAL", EpicsValue::Long(50)).unwrap();
 
         rec.process().unwrap();

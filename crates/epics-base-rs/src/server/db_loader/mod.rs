@@ -1651,10 +1651,12 @@ record(ai, "T") { field(LINR, "typeJdegC") }
         let mut reg = BreakTableRegistry::new();
         reg.insert(BrkTable::build("alpha", &[(0.0, 0.0), (1.0, 1.0)]).unwrap());
 
-        // A registered table name on an ai/ao LINR is rewritten to its index.
+        // A registered non-standard table name on an ai/ao LINR is rewritten to
+        // its index — the first user-table slot (15), since the standard
+        // menuConvert names reserve 3..=14.
         let mut fields = vec![("LINR".to_string(), "alpha".to_string())];
         resolve_linr_breaktable_names("ai", &mut fields, &reg);
-        assert_eq!(fields[0].1, "3");
+        assert_eq!(fields[0].1, "15");
 
         // A fixed menuConvert label matches no table name and is untouched.
         let mut fixed = vec![("LINR".to_string(), "LINEAR".to_string())];

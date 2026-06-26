@@ -1040,7 +1040,11 @@ mod tests {
         rec.aslo = 1.0;
         rec.aoff = 0.0;
         rec.roff = 0;
-        rec.put_field("LINR", EpicsValue::Short(3)).unwrap();
+        rec.put_field(
+            "LINR",
+            EpicsValue::Short(crate::server::cvt_bpt::LINR_FIRST_USER_TABLE),
+        )
+        .unwrap(); // "ramp" -> first user-table index (15)
         rec.val = 5.0; // engineering
 
         rec.convert();
@@ -1061,7 +1065,11 @@ mod tests {
         let mut rec = AoRecord::default();
         rec.install_breaktable_registry(ramp_registry());
         rec.aslo = 1.0;
-        rec.put_field("LINR", EpicsValue::Short(3)).unwrap();
+        rec.put_field(
+            "LINR",
+            EpicsValue::Short(crate::server::cvt_bpt::LINR_FIRST_USER_TABLE),
+        )
+        .unwrap(); // "ramp" -> first user-table index (15)
         rec.rval = 12345; // sentinel: must survive the early return
         rec.val = 1000.0; // eng past the table's high end (30)
 
@@ -1078,7 +1086,11 @@ mod tests {
         let mut rec = AoRecord::default();
         rec.install_breaktable_registry(ramp_registry());
         rec.aslo = 1.0;
-        rec.put_field("LINR", EpicsValue::Short(4)).unwrap(); // no table at index 4
+        rec.put_field(
+            "LINR",
+            EpicsValue::Short(crate::server::cvt_bpt::LINR_FIRST_USER_TABLE + 1),
+        )
+        .unwrap(); // user-block index with no loaded table
         rec.rval = 777;
         rec.val = 5.0;
 
@@ -1100,7 +1112,11 @@ mod tests {
         rec.aslo = 1.0;
         rec.aoff = 0.0;
         rec.roff = 0;
-        rec.put_field("LINR", EpicsValue::Short(3)).unwrap();
+        rec.put_field(
+            "LINR",
+            EpicsValue::Short(crate::server::cvt_bpt::LINR_FIRST_USER_TABLE),
+        )
+        .unwrap(); // "ramp" -> first user-table index (15)
         rec.rval = 200; // raw from the device
 
         rec.convert_readback();
@@ -1120,7 +1136,11 @@ mod tests {
         rec.aslo = 1.0;
         rec.aoff = 0.0;
         rec.roff = 0;
-        rec.put_field("LINR", EpicsValue::Short(3)).unwrap();
+        rec.put_field(
+            "LINR",
+            EpicsValue::Short(crate::server::cvt_bpt::LINR_FIRST_USER_TABLE),
+        )
+        .unwrap(); // "ramp" -> first user-table index (15)
         rec.val = 99.0; // sentinel: must survive the readback failure
         rec.rval = 400; // raw past the table's high end (300)
 
@@ -1139,7 +1159,11 @@ mod tests {
         let mut rec = AoRecord::default();
         rec.install_breaktable_registry(ramp_registry());
         rec.aslo = 1.0;
-        rec.put_field("LINR", EpicsValue::Short(4)).unwrap(); // no table at index 4
+        rec.put_field(
+            "LINR",
+            EpicsValue::Short(crate::server::cvt_bpt::LINR_FIRST_USER_TABLE + 1),
+        )
+        .unwrap(); // user-block index with no loaded table
         rec.val = 42.0;
         rec.rval = 200;
 

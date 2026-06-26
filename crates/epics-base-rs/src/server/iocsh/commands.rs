@@ -1941,10 +1941,11 @@ record(ao, "BPT:RBK") {{ field(LINR, "ramp") }}
         ctx.block_on(async {
             let rec = db.get_record("BPT:RBK").await.expect("BPT:RBK exists");
             let mut inst = rec.write().await;
-            // The merge resolved "ramp" to the first table index.
+            // The merge resolved "ramp" (non-standard) to the first user-table
+            // index (15); standard menuConvert names reserve 3..=14.
             assert_eq!(
                 inst.record.get_field("LINR"),
-                Some(crate::types::EpicsValue::Short(3))
+                Some(crate::types::EpicsValue::Short(15))
             );
             // eng 5.0 -> raw 50 through the re-installed registry.
             inst.record
@@ -1962,9 +1963,9 @@ record(ao, "BPT:RBK") {{ field(LINR, "ramp") }}
     /// Regression: a record resolved to a breakpoint table in load #1 must
     /// keep converting through THAT table after load #2 adds an
     /// alphabetically-earlier table. With the old name-sorted index, loading
-    /// "alpha" shifted "zebra" from index 3 to 4 while the record's frozen
-    /// LINR stayed 3, so re-install silently re-pointed it to "alpha".
-    /// Insertion-order indices keep "zebra" at 3.
+    /// "alpha" shifted "zebra" from index 15 to 16 while the record's frozen
+    /// LINR stayed 15, so re-install silently re-pointed it to "alpha".
+    /// Load-order user-table indices keep "zebra" at 15.
     #[test]
     fn test_db_load_records_later_table_does_not_repoint_resolved_record() {
         use std::io::Write;

@@ -1746,7 +1746,7 @@ mod tests {
         db.add_breaktables(vec![ramp]).await;
 
         let mut rec = crate::server::records::ai::AiRecord::new(0.0);
-        rec.put_field("LINR", EpicsValue::Short(3)).unwrap(); // ramp = first table index
+        rec.put_field("LINR", EpicsValue::Short(15)).unwrap(); // ramp = first user-table index
         db.add_record("AI:BPT", Box::new(rec)).await.unwrap();
 
         let arc = db.get_record("AI:BPT").await.unwrap();
@@ -1769,7 +1769,7 @@ mod tests {
         // Record added while the registry is still empty: add_record installs
         // nothing (the inline-record / pre-load ordering case).
         let mut rec = crate::server::records::ai::AiRecord::new(0.0);
-        rec.put_field("LINR", EpicsValue::Short(3)).unwrap();
+        rec.put_field("LINR", EpicsValue::Short(15)).unwrap(); // ramp = first user-table index
         db.add_record("AI:BPT", Box::new(rec)).await.unwrap();
 
         // Load the table afterwards — re-install must reach the existing record.

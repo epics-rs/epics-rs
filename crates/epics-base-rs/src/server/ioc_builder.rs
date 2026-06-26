@@ -581,8 +581,9 @@ record(ai, "AI:BPT") {
 
         let rec = db.get_record("AI:BPT").await.unwrap();
         let mut inst = rec.write().await;
-        // The "ramp" name resolved to the first menuConvert table index (3).
-        assert_eq!(inst.record.get_field("LINR"), Some(EpicsValue::Short(3)));
+        // "ramp" is a non-standard name -> first user-table index (15); the
+        // standard menuConvert names reserve 3..=14.
+        assert_eq!(inst.record.get_field("LINR"), Some(EpicsValue::Short(15)));
         // The installed registry makes the conversion work end-to-end:
         // raw 50 in [0,100] -> eng 5.0.
         inst.record.put_field("RVAL", EpicsValue::Long(50)).unwrap();

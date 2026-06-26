@@ -14,6 +14,7 @@
 //! resolved record always points at the same table (see
 //! [`BreakTableRegistry`]).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// One breakpoint interval: the converted value `eng` at raw input `raw`, and
@@ -211,33 +212,71 @@ pub fn cvt_eng_to_raw_bpt(val: f64, table: &BrkTable, lbrk: &mut usize) -> (f64,
     (p.raw + (val - p.eng) / p.slope, status)
 }
 
-/// Registry of loaded breakpoint tables in INSERTION (load) order. A table's
-/// `LINR` index is `LINR_FIRST_BREAKTABLE + insertion_position` and is STABLE:
-/// loading more tables appends them and never shifts an existing table's
-/// index, so a record already resolved to a table keeps pointing at the same
-/// table after later loads (the three fixed `menuConvert` choices
-/// `NO_CONVERSION`/`SLOPE`/`LINEAR` occupy indices 0..=2).
-///
-/// This mirrors C's stability: `LINR` indexes the STATIC `menuConvert` menu
-/// (menuConvert.dbd declaration order) via `findBrkTable`/`papChoiceValue[linr]`
-/// (cvtBpt.c:25-39), and only the name->table lookup (`dbFindBrkTable` over
-/// `bptList`) is dynamic — a record's index never moves when more tables load.
-/// A name-sorted index (the original model here) violated that: adding a table
-/// re-sorted the list and silently re-pointed already-resolved records.
-///
-/// epics-base-rs does not port the standard menuConvert names
-/// (`typeKdegF`=3 .. `typeSdegC`=15), so the absolute LINR *value* of a
-/// dynamically-loaded table follows load order rather than C's static
-/// declaration order; the table is still resolved correctly by name. Porting
-/// the standard menu/tables to align the absolute value is a separate gap.
-#[derive(Debug, Clone, Default)]
-pub struct BreakTableRegistry {
-    tables: Vec<Arc<BrkTable>>,
+/// The first `LINR` value that selects a breakpoint table (after the three
+/// fixed `menuConvert` choices `NO_CONVERSION`=0, `SLOPE`=1, `LINEAR`=2).
+pub const LINR_FIRST_BREAKTABLE: i16 = 3;
+
+/// The first `LINR` value available to a NON-standard (user-loaded) table.
+/// The 12 standard `menuConvert` breakpoint-table names occupy
+/// `LINR_FIRST_BREAKTABLE ..= 14`; a loaded table whose name is not one of
+/// them is appended starting here. Mirrors C `menuConvert`, where
+/// `typeKdegF`=3 .. `typeSdegC`=14 are reserved and an IOC application adds
+/// further choices after the standard ones.
+pub const LINR_FIRST_USER_TABLE: i16 = LINR_FIRST_BREAKTABLE + STANDARD_CONVERT_NAMES.len() as i16;
+
+/// The 12 standard `menuConvert` breakpoint-table names, in `menuConvert.dbd`
+/// declaration order — `LINR` 3..=14. These are exactly the entries of
+/// [`MENU_CONVERT`](crate::server::record::MENU_CONVERT) (the `LINR` enum
+/// labels) past the three fixed conversions; the
+/// `standard_names_match_menu_convert_tail` test pins the two in sync so the
+/// registry index and the caget `LINR` display can never disagree.
+const STANDARD_CONVERT_NAMES: &[&str] = &[
+    "typeKdegF",
+    "typeKdegC",
+    "typeJdegF",
+    "typeJdegC",
+    "typeEdegF(ixe only)",
+    "typeEdegC(ixe only)",
+    "typeTdegF",
+    "typeTdegC",
+    "typeRdegF",
+    "typeRdegC",
+    "typeSdegF",
+    "typeSdegC",
+];
+
+/// The fixed `LINR` index of a standard `menuConvert` breakpoint-table name
+/// (3..=14), or `None` if `name` is not one of the standard 12. Independent of
+/// whether the table's DATA is loaded — the menu choice always exists, exactly
+/// like C's built-in `menuConvert` menu.
+fn standard_index_of(name: &str) -> Option<i16> {
+    STANDARD_CONVERT_NAMES
+        .iter()
+        .position(|n| *n == name)
+        .map(|pos| LINR_FIRST_BREAKTABLE + pos as i16)
 }
 
-/// The first `LINR` value that selects a breakpoint table (after the three
-/// fixed `menuConvert` choices `NO_CONVERSION`, `SLOPE`, `LINEAR`).
-pub const LINR_FIRST_BREAKTABLE: i16 = 3;
+/// Registry of breakpoint tables. Two structures mirror C exactly:
+///
+/// - `tables` is the load-on-demand DATA map (C `bptList`): name -> table,
+///   populated by [`Self::insert`], first-wins on redefinition.
+/// - the `LINR` index -> name map is the `menuConvert` menu. Its first 12
+///   breakpoint slots (`LINR` 3..=14) are the fixed [`STANDARD_CONVERT_NAMES`];
+///   a loaded table whose name is NOT standard extends the menu in `extra_menu`
+///   at `LINR_FIRST_USER_TABLE +` load position (C: an IOC adds menuConvert
+///   choices after the standard ones).
+///
+/// So `LINR` indexes the STATIC menu (stable: a name never moves once placed),
+/// and only the name->DATA lookup is dynamic — matching C
+/// `findBrkTable`/`papChoiceValue[linr]` (cvtBpt.c:25-39) +
+/// `dbFindBrkTable`/`bptList`. A standard `LINR` (e.g. 3 = `typeKdegF`) whose
+/// data was never loaded resolves to no table and the conversion fails, exactly
+/// like C `dbFindBrkTable` returning NULL.
+#[derive(Debug, Clone, Default)]
+pub struct BreakTableRegistry {
+    tables: BTreeMap<String, Arc<BrkTable>>,
+    extra_menu: Vec<String>,
+}
 
 impl BreakTableRegistry {
     /// An empty registry.
@@ -245,15 +284,17 @@ impl BreakTableRegistry {
         Self::default()
     }
 
-    /// Whether no tables have been registered.
+    /// Whether no table DATA has been loaded. The standard `menuConvert` names
+    /// always reserve `LINR` 3..=14 regardless; this reports whether any
+    /// breakpoint data exists to install into a record.
     pub fn is_empty(&self) -> bool {
         self.tables.is_empty()
     }
 
     /// Insert a table. A redefinition of an existing name is silently IGNORED
-    /// (the first-loaded table wins); a new name is APPENDED at the next free
-    /// index. Append-only growth keeps every existing table's `LINR` index
-    /// fixed across later loads.
+    /// (the first-loaded table wins); a genuinely new non-standard name extends
+    /// the menu at the next free user index. Append-only menu growth keeps
+    /// every existing table's `LINR` index fixed across later loads.
     ///
     /// First-wins matches C: `dbBreakHead` (dbLexRoutines.c:982-985) finds the
     /// name already in `bptList`, sets `duplicate=TRUE`, and returns without
@@ -261,34 +302,60 @@ impl BreakTableRegistry {
     /// keeps the original. A second `breaktable(name){…}` with different data
     /// is therefore a no-op, not an override.
     pub fn insert(&mut self, table: BrkTable) {
-        if self.tables.iter().any(|t| t.name == table.name) {
+        if self.tables.contains_key(&table.name) {
             return;
         }
-        self.tables.push(Arc::new(table));
+        // A non-standard name extends the menu past the standard block (C: an
+        // IOC adds a menuConvert choice). A standard name fills its reserved
+        // slot and does not extend the menu.
+        if standard_index_of(&table.name).is_none() && !self.extra_menu.contains(&table.name) {
+            self.extra_menu.push(table.name.clone());
+        }
+        self.tables.insert(table.name.clone(), Arc::new(table));
     }
 
-    /// Look up a table by name.
+    /// Look up a table's DATA by name.
     pub fn get(&self, name: &str) -> Option<Arc<BrkTable>> {
-        self.tables.iter().find(|t| t.name == name).cloned()
+        self.tables.get(name).cloned()
     }
 
-    /// The `LINR` index that selects the named table, or `None` if it is not
-    /// registered. The index is `3 + insertion_position` and never shifts.
+    /// The `LINR` index that selects the named table: a standard `menuConvert`
+    /// name's fixed index (3..=14, even if its data is not loaded), else a
+    /// loaded non-standard table's `LINR_FIRST_USER_TABLE +` load position,
+    /// else `None`.
     pub fn linr_index_of(&self, name: &str) -> Option<i16> {
-        self.tables
+        if let Some(idx) = standard_index_of(name) {
+            return Some(idx);
+        }
+        self.extra_menu
             .iter()
-            .position(|t| t.name == name)
-            .map(|pos| LINR_FIRST_BREAKTABLE + pos as i16)
+            .position(|n| n == name)
+            .map(|pos| LINR_FIRST_USER_TABLE + pos as i16)
     }
 
-    /// The table selected by a `LINR` value (`>= 3`), or `None` if the index
-    /// is out of range. The inverse of [`Self::linr_index_of`].
+    /// The table selected by a `LINR` value (`>= 3`): resolve the index to a
+    /// menuConvert name (standard block or user extension) and look up its
+    /// loaded DATA. `None` if the index names nothing, or the named table's
+    /// data was never loaded (C `dbFindBrkTable` -> NULL -> conversion fails).
     pub fn table_for_linr(&self, linr: i16) -> Option<Arc<BrkTable>> {
+        let name = self.name_for_linr(linr)?;
+        self.tables.get(name).cloned()
+    }
+
+    /// The `menuConvert` name a `LINR` value selects, or `None` if out of the
+    /// menu. The inverse of [`Self::linr_index_of`].
+    fn name_for_linr(&self, linr: i16) -> Option<&str> {
         if linr < LINR_FIRST_BREAKTABLE {
             return None;
         }
-        let pos = (linr - LINR_FIRST_BREAKTABLE) as usize;
-        self.tables.get(pos).cloned()
+        if linr < LINR_FIRST_USER_TABLE {
+            return STANDARD_CONVERT_NAMES
+                .get((linr - LINR_FIRST_BREAKTABLE) as usize)
+                .copied();
+        }
+        self.extra_menu
+            .get((linr - LINR_FIRST_USER_TABLE) as usize)
+            .map(|s| s.as_str())
     }
 }
 
@@ -391,44 +458,88 @@ mod tests {
         assert!((eng - 10.0).abs() < 1e-12, "eng={eng}");
     }
 
+    /// The standard breakpoint-table names MUST equal the `LINR` enum labels
+    /// past the three fixed conversions — otherwise the registry index and the
+    /// caget `LINR` display would disagree (e.g. `LINR`=3 converting through one
+    /// table while the enum shows another). Pins the single source.
     #[test]
-    fn registry_indexes_in_insertion_order_from_three() {
+    fn standard_names_match_menu_convert_tail() {
+        assert_eq!(
+            STANDARD_CONVERT_NAMES,
+            &crate::server::record::MENU_CONVERT[LINR_FIRST_BREAKTABLE as usize..]
+        );
+        assert_eq!(LINR_FIRST_USER_TABLE, 15);
+    }
+
+    /// A loaded NON-standard table extends the menu past the standard block
+    /// (`LINR` 15+) in load order, never colliding with the reserved standard
+    /// indices 3..=14.
+    #[test]
+    fn user_tables_index_from_fifteen_in_load_order() {
         let mut reg = BreakTableRegistry::new();
-        // Insertion order (NOT name-sorted): "zeta" loaded first -> index 3.
+        // "zeta" loaded first -> first user slot (15); "alpha" -> 16.
         reg.insert(BrkTable::build("zeta", &[(0.0, 0.0), (1.0, 1.0)]).unwrap());
         reg.insert(BrkTable::build("alpha", &[(0.0, 0.0), (1.0, 1.0)]).unwrap());
-        assert_eq!(reg.linr_index_of("zeta"), Some(3));
-        assert_eq!(reg.linr_index_of("alpha"), Some(4));
+        assert_eq!(reg.linr_index_of("zeta"), Some(15));
+        assert_eq!(reg.linr_index_of("alpha"), Some(16));
         assert_eq!(reg.linr_index_of("missing"), None);
-        assert_eq!(reg.table_for_linr(3).unwrap().name, "zeta");
-        assert_eq!(reg.table_for_linr(4).unwrap().name, "alpha");
-        assert!(reg.table_for_linr(5).is_none());
+        assert_eq!(reg.table_for_linr(15).unwrap().name, "zeta");
+        assert_eq!(reg.table_for_linr(16).unwrap().name, "alpha");
+        assert!(reg.table_for_linr(17).is_none());
         assert!(reg.table_for_linr(2).is_none());
     }
 
+    /// A standard `menuConvert` name binds to its FIXED reserved index
+    /// (`typeKdegF`=3 .. `typeSdegC`=14) regardless of load order, and never
+    /// extends the user block — so `field(LINR,"typeKdegF")` converts through
+    /// the typeKdegF data, not whatever loaded first.
+    #[test]
+    fn standard_named_table_binds_to_reserved_index() {
+        let mut reg = BreakTableRegistry::new();
+        // A non-standard table loaded FIRST must not steal index 3.
+        reg.insert(BrkTable::build("ramp", &[(0.0, 0.0), (1.0, 1.0)]).unwrap());
+        reg.insert(BrkTable::build("typeKdegF", &[(0.0, 0.0), (1.0, 2.0)]).unwrap());
+        assert_eq!(reg.linr_index_of("typeKdegF"), Some(3));
+        assert_eq!(reg.linr_index_of("typeSdegC"), Some(14));
+        assert_eq!(reg.linr_index_of("ramp"), Some(15));
+        assert_eq!(reg.table_for_linr(3).unwrap().name, "typeKdegF");
+        assert_eq!(reg.table_for_linr(15).unwrap().name, "ramp");
+    }
+
+    /// A reserved standard index whose DATA was never loaded resolves to no
+    /// table — exactly like C `dbFindBrkTable` returning NULL, so the
+    /// conversion fails rather than silently using a different table.
+    #[test]
+    fn standard_index_without_data_resolves_to_no_table() {
+        let mut reg = BreakTableRegistry::new();
+        reg.insert(BrkTable::build("ramp", &[(0.0, 0.0), (1.0, 1.0)]).unwrap());
+        // typeKdegF (3) is a valid menu choice but no data was loaded for it.
+        assert_eq!(reg.linr_index_of("typeKdegF"), Some(3));
+        assert!(reg.table_for_linr(3).is_none());
+    }
+
     /// Stability: a later insert must NOT shift an existing table's index —
-    /// the regression behind the wrong-table-across-loads bug. A name-sorted
-    /// registry would move "zeta" from 3 to 4 when "alpha" loads.
+    /// the regression behind the wrong-table-across-loads bug.
     #[test]
     fn registry_index_is_stable_across_later_inserts() {
         let mut reg = BreakTableRegistry::new();
         reg.insert(BrkTable::build("zeta", &[(0.0, 0.0), (1.0, 1.0)]).unwrap());
-        assert_eq!(reg.linr_index_of("zeta"), Some(3));
-        // Loading an alphabetically-earlier table must leave zeta at 3.
+        assert_eq!(reg.linr_index_of("zeta"), Some(15));
+        // Loading another user table must leave zeta at 15.
         reg.insert(BrkTable::build("alpha", &[(0.0, 0.0), (1.0, 1.0)]).unwrap());
         assert_eq!(
             reg.linr_index_of("zeta"),
-            Some(3),
+            Some(15),
             "zeta index must not shift"
         );
-        assert_eq!(reg.table_for_linr(3).unwrap().name, "zeta");
-        assert_eq!(reg.linr_index_of("alpha"), Some(4));
+        assert_eq!(reg.table_for_linr(15).unwrap().name, "zeta");
+        assert_eq!(reg.linr_index_of("alpha"), Some(16));
         // A same-name redefinition is IGNORED (C first-wins): index unchanged,
         // ORIGINAL data kept (the new eng=20.0 is discarded).
         reg.insert(BrkTable::build("zeta", &[(0.0, 0.0), (2.0, 20.0)]).unwrap());
         assert_eq!(
             reg.linr_index_of("zeta"),
-            Some(3),
+            Some(15),
             "redefinition keeps index"
         );
         assert_eq!(

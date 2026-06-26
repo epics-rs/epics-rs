@@ -976,6 +976,22 @@ impl PvDatabase {
         instance
             .record
             .set_async_context(name.to_string(), self.async_handle());
+
+        // Hand the record the current breakpoint-table registry snapshot so a
+        // LINR>=3 ai/ao record can resolve its table lazily at convert time.
+        // add_record is the single creation sink (IocBuilder, dbLoadRecords,
+        // dbCreateRecord, inline records all funnel through here), so this one
+        // install covers every creation path uniformly. The trait default is a
+        // no-op for records that don't use it; skipped when no tables are
+        // loaded so the common case pays no Arc clone. A record created before
+        // its table is loaded is re-installed by `add_breaktables`.
+        {
+            let snapshot = self.inner.breaktable_registry.read().await.clone();
+            if !snapshot.is_empty() {
+                instance.record.install_breaktable_registry(snapshot);
+            }
+        }
+
         let scan = instance.common.scan;
         let phas = instance.common.phas;
         self.inner
@@ -1683,6 +1699,34 @@ mod tests {
         assert!(via_alias.is_some(), "get_record must resolve alias");
         // Both calls return the same Arc (pointer equality).
         assert!(Arc::ptr_eq(&via_canonical.unwrap(), &via_alias.unwrap()));
+    }
+
+    /// `add_record` is the single creation sink: a record added AFTER its
+    /// breakpoint table is loaded must receive the registry snapshot so a
+    /// `LINR >= 3` conversion resolves — without any explicit per-call-site
+    /// `install_breaktable_registry`. This covers the dbCreateRecord and
+    /// inline-record creation paths that previously skipped the install.
+    #[tokio::test]
+    async fn add_record_installs_breaktable_registry_from_snapshot() {
+        let db = PvDatabase::new();
+        let ramp = crate::server::cvt_bpt::BrkTable::build(
+            "ramp",
+            &[(0.0, 0.0), (100.0, 10.0), (300.0, 30.0)],
+        )
+        .unwrap();
+        db.add_breaktables(vec![ramp]).await;
+
+        let mut rec = crate::server::records::ai::AiRecord::new(0.0);
+        rec.put_field("LINR", EpicsValue::Short(3)).unwrap(); // ramp = first table index
+        db.add_record("AI:BPT", Box::new(rec)).await.unwrap();
+
+        let arc = db.get_record("AI:BPT").await.unwrap();
+        let mut inst = arc.write().await;
+        inst.record.put_field("RVAL", EpicsValue::Long(50)).unwrap();
+        inst.record.process().unwrap();
+        // raw 50 in [0,100] -> eng 5.0, proving the registry was installed by
+        // add_record alone.
+        assert_eq!(inst.record.get_field("VAL"), Some(EpicsValue::Double(5.0)));
     }
 
     #[tokio::test]

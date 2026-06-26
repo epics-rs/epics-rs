@@ -1074,13 +1074,9 @@ fn cmd_db_load_records() -> CommandDef {
                     } else {
                         let mut record = db_loader::create_record(&def.record_type)
                             .map_err(|e| format!("{e}"))?;
-                        // Hand a new `ai`/`ao` record the breakpoint-table
-                        // registry before its fields are applied so a
-                        // `LINR >= 3` conversion can resolve its table. (Merge
-                        // reloads keep the record's first-load registry.)
-                        if !breaktable_registry.is_empty() {
-                            record.install_breaktable_registry(breaktable_registry.clone());
-                        }
+                        // The breakpoint-table registry is installed by
+                        // `add_record` (the single creation sink); apply_fields
+                        // only needs the LINR index, already resolved above.
                         if let Err(e) =
                             db_loader::apply_fields(&mut record, &def.fields, &mut common_fields)
                         {

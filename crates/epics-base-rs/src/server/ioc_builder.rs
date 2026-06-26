@@ -234,18 +234,14 @@ impl IocBuilder {
                 db_loader::create_record_with_factories(&def.record_type, &self.record_factories)?;
 
             // Resolve a `LINR` field that names a loaded breakpoint table to the
-            // numeric `menuConvert` index that selects it, then hand the record
-            // the registry snapshot so a `LINR >= 3` conversion can resolve its
-            // table. The install trait default is a no-op, so records without a
-            // `LINR` field ignore it.
+            // numeric `menuConvert` index that selects it (before apply_fields,
+            // which only knows the fixed menuConvert labels). The registry
+            // itself is installed by `add_record` (the single creation sink).
             db_loader::resolve_linr_breaktable_names(
                 &def.record_type,
                 &mut def.fields,
                 &breaktable_registry,
             );
-            if !breaktable_registry.is_empty() {
-                record.install_breaktable_registry(breaktable_registry.clone());
-            }
 
             let mut common_fields = Vec::new();
             db_loader::apply_fields(&mut record, &def.fields, &mut common_fields)?;

@@ -555,7 +555,14 @@ impl Record for ScalcoutRecord {
         // non-Don't_drive path, so OVAL/OUT behaviour is unchanged there.
         let oopt_fires = self.should_output();
         let write_out = oopt_fires && !ivoa_veto_out;
-        if write_out {
+        // C `execOutput` (sCalcoutRecord.c:760-777) computes OVAL/OSV via the
+        // DOPT switch on EVERY output cycle, *before* the IVOA decision (the
+        // Don't_drive `break` is at :795). So OVAL is recomputed even when the
+        // OUT write is vetoed — gate this on `oopt_fires`, not `write_out`.
+        // (`write_out` still gates the OUT write below via cached_should_output;
+        // on every non-Don't_drive path the two are equal, so OVAL is unchanged
+        // there.)
+        if oopt_fires {
             if self.dopt == 1 {
                 // Use OCAL. A broken OCAL (compile OR eval failure)
                 // raises CALC_ALARM — sibling calcout.rs does the same,
@@ -948,9 +955,22 @@ mod tests {
         rec.calc = "???invalid".into();
         rec.compiled_calc = None;
         rec.put_field("IVOA", EpicsValue::Short(1)).unwrap();
+        rec.put_field("OUT", EpicsValue::String("sink.VAL".into()))
+            .unwrap();
         rec.process().unwrap();
-        // No compiled calc → nothing happens, oval stays 0
-        assert_eq!(rec.oval, 0.0);
+        // Don't_drive suppresses only the OUT *write* — multi_output_links is
+        // empty (cached_should_output false).
+        assert!(
+            rec.multi_output_links().is_empty(),
+            "IVOA=Don't_drive suppresses the OUT write"
+        );
+        // C `execOutput` still runs the DOPT switch on this output cycle
+        // (sCalcoutRecord.c:760-777, before the Don't_drive break at :795), so
+        // OVAL is recomputed from VAL (=-1 calc-fail sentinel), NOT left stale.
+        assert_eq!(
+            rec.oval, -1.0,
+            "Don't_drive recomputes OVAL from the calc-fail VAL=-1, not 0"
+        );
     }
 
     #[test]

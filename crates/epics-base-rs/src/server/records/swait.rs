@@ -2,7 +2,9 @@ use crate::calc::StringInputs;
 use crate::calc::engine::value::StackValue;
 use crate::calc::{CompiledExpr, scalc_compile, scalc_eval};
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
+use crate::server::record::{
+    FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+};
 use crate::types::{DbFieldType, EpicsValue};
 
 // swait (string wait) record from synApps calc module.
@@ -24,6 +26,13 @@ pub struct SwaitRecord {
     // [`Record::output_event`]. swait has no IVOA field, so the post is
     // never suppressed by the framework Don't_drive veto.
     pub oevt: u16,
+    // ODLY ("Output Execute Delay", seconds) — C `swaitRecord.c` `pwait->odly`
+    // (DBF_FLOAT). When output fires and `odly > 0`, `schedOutput`
+    // (swaitRecord.c:719) defers the OUT write + forward link + OEVT post by
+    // `odly` seconds via the watchdog, holding the record active (PACT=1); when
+    // `odly == 0` it calls `execOutput` immediately. `f32` mirrors the C
+    // `float` field so a CA client sees DBR_FLOAT (not DBR_DOUBLE).
+    pub odly: f32,
     pub out: String,
     pub prec: i16,
     // INxN: input link names; INxP: process passive flags (0/1)
@@ -33,6 +42,13 @@ pub struct SwaitRecord {
     pub num_vals: [f64; 12],
     prev_val: f64,
     cached_should_output: bool,
+    // ODLY delay state (C `cbStruct.outputWait`, an internal flag — swait has
+    // no DLYA database field, unlike scalcout). `output_wait` marks that the
+    // current `process()` call is the watchdog continuation re-entry; on it the
+    // captured `pending_output` decision is restored so the framework writes
+    // OUT + posts OEVT exactly once after the delay.
+    output_wait: bool,
+    pending_output: bool,
 }
 
 impl Default for SwaitRecord {
@@ -46,6 +62,7 @@ impl Default for SwaitRecord {
             dold: 0.0,
             oval: 0.0,
             oevt: 0,
+            odly: 0.0,
             out: String::new(),
             prec: 0,
             inp_names: Default::default(),
@@ -53,6 +70,8 @@ impl Default for SwaitRecord {
             num_vals: [0.0; 12],
             prev_val: 0.0,
             cached_should_output: true,
+            output_wait: false,
+            pending_output: false,
         }
     }
 }
@@ -149,6 +168,11 @@ static SWAIT_FIELDS_SCALAR: &[FieldDesc] = &[
     FieldDesc {
         name: "OEVT",
         dbf_type: DbFieldType::UShort,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "ODLY",
+        dbf_type: DbFieldType::Float,
         read_only: false,
     },
     // OUT and OUTN are intentionally absent: both route to RecordInstance::common.out
@@ -391,6 +415,21 @@ impl Record for SwaitRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
+        // ODLY continuation: this is the watchdog re-process scheduled by a
+        // previous cycle (C `swaitRecord.c::process` `if (pact && outputWait)
+        // execOutput`, line 394). Do NOT re-evaluate CALC / OOPT — C runs
+        // `execOutput` directly. Restore the captured output decision so the
+        // framework writes the OUT link + posts OEVT this cycle, then clear the
+        // wait flag. Mirrors scalcout's `dlya == 1` branch (swait has no DLYA
+        // field — the wait state is the internal `output_wait` flag, as C uses
+        // `cbStruct.outputWait`).
+        if self.output_wait {
+            self.output_wait = false;
+            self.cached_should_output = self.pending_output;
+            self.pending_output = false;
+            return Ok(ProcessOutcome::complete());
+        }
+
         self.prev_val = self.val;
 
         if let Some(ref compiled) = self.compiled_calc {
@@ -407,6 +446,27 @@ impl Record for SwaitRecord {
         self.cached_should_output = self.eval_should_output();
         if self.cached_should_output {
             self.oval = if self.dopt == 1 { self.dold } else { self.val };
+        }
+
+        // ODLY (C `swaitRecord.c::schedOutput`, lines 719-729): when output
+        // should fire and ODLY > 0, defer the OUT write + forward link + OEVT
+        // post by ODLY seconds via the watchdog, holding the record active
+        // (C keeps PACT=1). The delaying cycle captures the output decision,
+        // suppresses this cycle's output (`cached_should_output = false`, so the
+        // framework writes neither OUT nor OEVT now), and re-processes after the
+        // delay; the `output_wait` branch above then emits exactly once. swait
+        // has no DLYA field (C's wait state is the internal `cbStruct.outputWait`
+        // flag), so nothing is posted on the delaying cycle.
+        if self.cached_should_output && self.odly > 0.0 {
+            self.pending_output = self.cached_should_output;
+            self.output_wait = true;
+            self.cached_should_output = false;
+            let delay = std::time::Duration::from_secs_f64(self.odly as f64);
+            return Ok(ProcessOutcome {
+                result: RecordProcessResult::AsyncPendingNotify(vec![]),
+                actions: vec![ProcessAction::ReprocessAfter(delay)],
+                device_did_compute: false,
+            });
         }
 
         Ok(ProcessOutcome::complete())
@@ -444,6 +504,7 @@ impl Record for SwaitRecord {
             "DOLD" => Some(EpicsValue::Double(self.dold)),
             "OVAL" => Some(EpicsValue::Double(self.oval)),
             "OEVT" => Some(EpicsValue::UShort(self.oevt)),
+            "ODLY" => Some(EpicsValue::Float(self.odly)),
             // OUTN is aliased to common.out via RecordInstance; not stored locally.
             "PREC" => Some(EpicsValue::Short(self.prec)),
             _ => {
@@ -496,6 +557,12 @@ impl Record for SwaitRecord {
                     .to_f64()
                     .ok_or_else(|| CaError::TypeMismatch("OEVT".into()))?
                     as u16;
+            }
+            "ODLY" => {
+                self.odly = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("ODLY".into()))?
+                    as f32;
             }
             // OUTN falls through to put_common_field which mirrors to common.out.
             "PREC" => {

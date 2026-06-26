@@ -16,6 +16,7 @@ use epics_base_rs::server::records::calcout::CalcoutRecord;
 use epics_base_rs::server::records::int64out::Int64outRecord;
 use epics_base_rs::server::records::longout::LongoutRecord;
 use epics_base_rs::server::records::scalcout::ScalcoutRecord;
+use epics_base_rs::server::records::swait::SwaitRecord;
 use epics_base_rs::server::records::transform::TransformRecord;
 use epics_base_rs::types::EpicsValue;
 
@@ -179,6 +180,63 @@ fn m1b_scalcout_no_odly_outputs_synchronously() {
         &[("OUT", "OVAL")],
         "ODLY=0: OUT write fires this cycle"
     );
+    assert!(
+        !outcome
+            .actions
+            .iter()
+            .any(|a| matches!(a, ProcessAction::ReprocessAfter(_))),
+        "ODLY=0: no delayed re-process scheduled"
+    );
+}
+
+// ─── M1c: swait ODLY output delay (swaitRecord.c:719-729 schedOutput) ─
+
+#[test]
+fn m1c_swait_odly_defers_output_via_reprocess() {
+    let mut r = SwaitRecord::default();
+    r.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    r.put_field("A", EpicsValue::Double(42.0)).unwrap();
+    r.put_field("ODLY", EpicsValue::Float(0.05)).unwrap();
+    // OOPT=0 (Every Time): output should fire.
+    let outcome = r.process().unwrap();
+    // ODLY > 0: this cycle defers — output suppressed, ReprocessAfter
+    // scheduled. swait's OUT-write gate is should_output() (single
+    // parsed_out, no multi_output_links); swait has no DLYA field.
+    assert!(
+        !r.should_output(),
+        "ODLY cycle suppresses the OUT-link write (cached_should_output=false)"
+    );
+    assert!(
+        outcome
+            .actions
+            .iter()
+            .any(|a| matches!(a, ProcessAction::ReprocessAfter(_))),
+        "ODLY cycle schedules a delayed re-process"
+    );
+    // The delayed re-process: process() runs again, hits the output_wait
+    // continuation branch and emits the captured output.
+    let outcome2 = r.process().unwrap();
+    assert!(
+        r.should_output(),
+        "delayed re-process drives the deferred output"
+    );
+    assert!(
+        !outcome2
+            .actions
+            .iter()
+            .any(|a| matches!(a, ProcessAction::ReprocessAfter(_))),
+        "continuation does not re-schedule a delay"
+    );
+}
+
+#[test]
+fn m1c_swait_no_odly_outputs_synchronously() {
+    let mut r = SwaitRecord::default();
+    r.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    r.put_field("A", EpicsValue::Double(7.0)).unwrap();
+    // ODLY default 0: output is synchronous, no delay.
+    let outcome = r.process().unwrap();
+    assert!(r.should_output(), "ODLY=0: OUT write fires this cycle");
     assert!(
         !outcome
             .actions

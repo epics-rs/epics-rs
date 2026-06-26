@@ -65,6 +65,17 @@ pub struct CompressRecord {
     // their running state in `cvb`/`inx` (`compress_scalar`) or work
     // a whole waveform in one call (`compress_array`).
     accum: Vec<f64>,
+    // Per-cycle completion gate mirroring C `compressRecord.c::process`
+    // `status`. The ingestion (`push_value`/`push_array`, run during the
+    // pre-process INP read) sets `cycle_ingested`; `put_one` (the single emit
+    // point) sets `cycle_emitted`. `process()` suppresses the publication
+    // epilogue iff `cycle_ingested && !cycle_emitted` — C `status == 1`, the
+    // record accumulated this cycle without emitting. No ingestion at all
+    // (link error / empty read / no INP) leaves `cycle_ingested` false, so the
+    // epilogue runs — C forces `status = 0` on those paths. Both are reset
+    // each cycle in `pre_process_actions`.
+    cycle_ingested: bool,
+    cycle_emitted: bool,
 }
 
 impl Default for CompressRecord {
@@ -96,6 +107,8 @@ impl Default for CompressRecord {
             lopr: 0.0,
             prec: 0,
             accum: Vec::new(),
+            cycle_ingested: false,
+            cycle_emitted: false,
         }
     }
 }
@@ -118,7 +131,13 @@ impl CompressRecord {
 
     /// Write one value into the circular buffer, advancing `off`
     /// and `nuse` per BALG. Mirrors C `put_value` (compressRecord.c).
+    ///
+    /// This is the single point at which a compressed sample is emitted, so it
+    /// owns the per-cycle `cycle_emitted` flag that drives the completion gate
+    /// (C `compressRecord.c::process` `status == 0`). Every algorithm path —
+    /// circular, N-to-1 array/scalar, rolling average — emits through here.
     fn put_one(&mut self, value: f64) {
+        self.cycle_emitted = true;
         let nsam = self.nsam.max(1) as usize;
         if self.balg == 1 {
             // LIFO: pre-decrement modulo nsam, then write.
@@ -143,6 +162,10 @@ impl CompressRecord {
     /// **not** applied on the scalar path — C's skip loop lives only
     /// in `compress_array` (the `nelements > 1` branch).
     pub fn push_value(&mut self, input: f64) {
+        // A scalar push ingests one sample this cycle; emission is recorded by
+        // `put_one`. This covers the C `nelements == 1` → `compress_scalar`
+        // path, which accumulates across cycles and emits only every Nth.
+        self.cycle_ingested = true;
         match self.alg {
             // menuCompressALG_Circular_Buffer
             4 => self.put_one(input),
@@ -229,6 +252,8 @@ impl CompressRecord {
         self.inx += 1;
         let n = self.n.max(1);
         if self.inx < n {
+            // C `array_average` `return 1`: still accumulating, no emit
+            // (no `put_one`, so the completion gate stays unset this cycle).
             return;
         }
         // N waveforms accumulated — divide and emit.
@@ -257,6 +282,15 @@ impl CompressRecord {
     /// samples available" behaviour — partial accumulation persists
     /// for the next array.
     pub fn push_array(&mut self, input: &[f64]) {
+        if input.is_empty() {
+            // C treats a zero-element read as a link error (status forced 0 →
+            // completion epilogue runs). Mark no ingestion so `process()`
+            // publishes rather than suppressing.
+            return;
+        }
+        // A non-empty ingestion happened this cycle; whether it emitted is
+        // recorded by `put_one`. See `cycle_ingested`/`cycle_emitted`.
+        self.cycle_ingested = true;
         match self.alg {
             // Circular Buffer (alg=4): every sample independent.
             4 => {
@@ -484,6 +518,18 @@ impl Record for CompressRecord {
                 *v = 0.0;
             }
             self.res = 0;
+            // A reset publishes the cleared buffer (C `reset` is followed by
+            // `monitor`); never suppress on a reset cycle.
+            return Ok(ProcessOutcome::complete());
+        }
+        // C `compressRecord.c:365` `if (status != 1)`: when this cycle's
+        // ingestion (run during the pre-process INP read) accumulated without
+        // emitting a compressed sample (C `status == 1`), the framework must
+        // skip the value-publication epilogue (UDF clear / timestamp / monitor
+        // / FLNK). An emit, or no ingestion at all (link error / no INP — C
+        // forces `status = 0`), publishes.
+        if self.cycle_ingested && !self.cycle_emitted {
+            return Ok(ProcessOutcome::complete_no_emit());
         }
         Ok(ProcessOutcome::complete())
     }
@@ -689,6 +735,12 @@ impl Record for CompressRecord {
     /// through `push_array`, so the data is ingested by the configured
     /// compression algorithm (NOT a raw buffer overwrite).
     fn pre_process_actions(&mut self) -> Vec<crate::server::record::ProcessAction> {
+        // Reset the per-cycle completion gate before the INP read below feeds
+        // `push_value`/`push_array`. If the read never happens (no INP, or a
+        // link error that skips the put), both stay false and `process()`
+        // publishes — mirroring C, which forces `status = 0` on those paths.
+        self.cycle_ingested = false;
+        self.cycle_emitted = false;
         if self.inp.is_empty() {
             return Vec::new();
         }

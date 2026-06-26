@@ -151,6 +151,13 @@ pub enum RecordProcessResult {
     /// Async pending, but notify these intermediate field changes immediately.
     /// Used by motor records to flush DMOV=0 before the move completes.
     AsyncPendingNotify(Vec<(String, EpicsValue)>),
+    /// Completed synchronously (PACT cleared, unlike `AsyncPending`), but the
+    /// record produced no new value to publish this cycle — the framework must
+    /// skip the value-publication epilogue (UDF clear / timestamp / monitor /
+    /// FLNK). C parity `compressRecord.c:365` `if (status != 1)`: a compress
+    /// record still accumulating toward its next compressed sample runs none of
+    /// `recGblGetTimeStamp` / `monitor` / `recGblFwdLink` on that cycle.
+    CompleteNoEmit,
 }
 
 /// Complete outcome of a record's process() call.
@@ -183,6 +190,17 @@ impl ProcessOutcome {
         Self {
             result: RecordProcessResult::Complete,
             actions,
+            device_did_compute: false,
+        }
+    }
+
+    /// Completed synchronously, but no new value was emitted this cycle, so
+    /// the framework skips the value-publication epilogue (UDF clear /
+    /// timestamp / monitor / FLNK). See `RecordProcessResult::CompleteNoEmit`.
+    pub fn complete_no_emit() -> Self {
+        Self {
+            result: RecordProcessResult::CompleteNoEmit,
+            actions: Vec::new(),
             device_did_compute: false,
         }
     }

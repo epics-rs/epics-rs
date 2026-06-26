@@ -1944,6 +1944,28 @@ impl PvDatabase {
                     .await;
                 return Ok(());
             }
+            if process_result == crate::server::record::RecordProcessResult::CompleteNoEmit {
+                // C `compressRecord.c:365` `if (status != 1)`: the record
+                // completed synchronously but emitted no new value this cycle
+                // (a compress still accumulating toward its next compressed
+                // sample). C runs none of `prec->udf = FALSE`,
+                // `recGblGetTimeStamp`, `monitor`, nor `recGblFwdLink` — so the
+                // entire value-publication epilogue (UDF clear / alarm commit /
+                // timestamp / monitor / FLNK) is skipped. PACT is already clear
+                // on this synchronous path (only the async branches set it), so
+                // there is nothing to release. `complete_no_emit()` carries no
+                // actions and compress is soft (no deferred device actions), so
+                // there is nothing to run — return without awaiting
+                // `execute_process_actions`, which would enlarge this hot
+                // recursive function's async frame (the FLNK chain nests one
+                // poll frame per hop up to MAX_LINK_DEPTH; the write guard
+                // `instance` is released on return).
+                debug_assert!(
+                    process_actions.is_empty(),
+                    "CompleteNoEmit must carry no process actions"
+                );
+                return Ok(());
+            }
             if let crate::server::record::RecordProcessResult::AsyncPendingNotify(fields) =
                 process_result
             {

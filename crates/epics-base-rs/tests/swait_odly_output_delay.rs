@@ -3,9 +3,10 @@
 //! `swaitRecord.c::schedOutput` (lines 719-729): when `odly > 0` the OUT write,
 //! forward link, and OEVT post are scheduled `odly` seconds later via the
 //! watchdog, with the record held active (PACT=1); when `odly == 0` they fire
-//! immediately. The Rust port models this with an `AsyncPendingNotify` plus
-//! `ReprocessAfter` defer on the delaying cycle and an `output_wait`
-//! continuation branch that emits exactly once.
+//! immediately. The Rust port models this with a bare `AsyncPending` (which
+//! holds PACT, matching C's "RECORD REMAINS ACTIVE") plus `ReprocessAfter`
+//! defer on the delaying cycle and an `output_wait` continuation branch that
+//! emits exactly once.
 //!
 //! This test pins the framework-observable effect: on the delaying cycle the
 //! OUT target keeps its seed and the OEVT event does NOT fire; on the
@@ -137,6 +138,90 @@ async fn swait_odly_defers_out_write_and_oevt_to_continuation() {
         count.load(Ordering::SeqCst),
         1,
         "continuation must post OEVT exactly once after the ODLY delay"
+    );
+}
+
+/// PACT is held during the ODLY delay (bare `AsyncPending`, not
+/// `AsyncPendingNotify`): a foreign `dbProcess` inside the delay window BAILS at
+/// the PACT entry guard (C `swaitRecord.c:716` "THE RECORD REMAINS ACTIVE WHILE
+/// WAITING ON THE WATCHDOG") instead of re-entering the `output_wait`
+/// continuation and firing the deferred OUT / OEVT early. Without the PACT hold
+/// the foreign process drives the target to OVAL before the delay elapses.
+#[tokio::test]
+async fn swait_odly_holds_pact_foreign_process_does_not_fire_early() {
+    let db = PvDatabase::new();
+    let count = Arc::new(AtomicUsize::new(0));
+    add_event_sibling(&db, "W3_SIB", "13", count.clone()).await;
+
+    db.add_record("W3_TGT", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    let mut w = SwaitRecord::default();
+    w.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    w.put_field("A", EpicsValue::Double(42.0)).unwrap();
+    w.put_field("OOPT", EpicsValue::Short(0)).unwrap();
+    w.put_field("ODLY", EpicsValue::Float(100.0)).unwrap();
+    w.put_field("OEVT", EpicsValue::UShort(13)).unwrap();
+    db.add_record("W3_ODLY", Box::new(w)).await.unwrap();
+    {
+        let r = db.get_record("W3_ODLY").await.unwrap();
+        let mut inst = r.write().await;
+        inst.put_common_field("OUT", EpicsValue::String("W3_TGT".into()))
+            .unwrap();
+    }
+
+    // Delaying cycle: PACT held, output deferred.
+    let mut v1 = HashSet::new();
+    db.process_record_with_links("W3_ODLY", &mut v1, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_pv("W3_TGT").await.unwrap().to_f64(),
+        Some(0.0),
+        "output deferred on the delaying cycle"
+    );
+
+    // Foreign dbProcess DURING the delay (is_continuation=false): must bail at
+    // the PACT entry guard, NOT fire the deferred output early.
+    let mut v2 = HashSet::new();
+    db.process_record_with_links("W3_ODLY", &mut v2, 0)
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    assert_eq!(
+        db.get_pv("W3_TGT").await.unwrap().to_f64(),
+        Some(0.0),
+        "PACT held: a foreign dbProcess during the ODLY delay must NOT fire the \
+         deferred OUT early (it bails at the entry guard, as C does)"
+    );
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        0,
+        "PACT held: a foreign dbProcess must NOT post OEVT early"
+    );
+
+    // Continuation (bypasses the PACT guard): fires the deferred output once.
+    let mut v3 = HashSet::new();
+    db.process_record_continuation("W3_ODLY", &mut v3, 0)
+        .await
+        .unwrap();
+    for _ in 0..400 {
+        if count.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert_eq!(
+        db.get_pv("W3_TGT").await.unwrap().to_f64(),
+        Some(42.0),
+        "continuation drives OUT to OVAL=42 after the delay"
+    );
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "continuation posts OEVT exactly once"
     );
 }
 

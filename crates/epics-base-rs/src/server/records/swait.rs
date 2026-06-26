@@ -462,8 +462,20 @@ impl Record for SwaitRecord {
             self.output_wait = true;
             self.cached_should_output = false;
             let delay = std::time::Duration::from_secs_f64(self.odly as f64);
+            // Bare `AsyncPending`, NOT `AsyncPendingNotify(vec![])`: swait posts
+            // no DLYA on the delaying cycle (it has no DLYA database field — C
+            // tracks the wait with the internal `cbStruct.outputWait`), so there
+            // is nothing to notify, and the bare branch holds PACT
+            // (`processing = true`) for the watchdog window. That matches C
+            // `swaitRecord.c:716` "THE RECORD REMAINS ACTIVE WHILE WAITING ON
+            // THE WATCHDOG": a concurrent `dbProcess` during the delay then
+            // bails at the PACT entry guard (as C does) instead of re-entering
+            // the `output_wait` branch and firing the deferred output early.
+            // (scalcout/acalcout must use `AsyncPendingNotify` to pulse DLYA, so
+            // they cannot hold PACT this way; that shared timer-ODLY gap is
+            // framework-level, not swait-local.)
             return Ok(ProcessOutcome {
-                result: RecordProcessResult::AsyncPendingNotify(vec![]),
+                result: RecordProcessResult::AsyncPending,
                 actions: vec![ProcessAction::ReprocessAfter(delay)],
                 device_did_compute: false,
             });

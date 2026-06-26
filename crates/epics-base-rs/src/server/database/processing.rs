@@ -2257,6 +2257,25 @@ impl PvDatabase {
                 false
             };
 
+            // OEVT: queue the output event when the output fires — the
+            // event-subsystem twin of the OUT write, gated by the SAME IVOA
+            // Don't_drive veto (`skip_out`). C
+            // `calcout`/`sCalcout`/`aCalcout` `execOutput` posts
+            // `postEvent(epvt)` / `post_event(oevt)` right after `writeValue`
+            // in every OUT-driving branch and never on Don't_drive;
+            // `output_event()` folds in the record's own OOPT/calc-fail/ODLY
+            // output-fire decision. Spawned (not inline) like
+            // `dispatch_event_record` so the woken `SCAN="Event"` records run
+            // on the callback path, not recursively inside this cycle.
+            if !skip_out {
+                if let Some(event_name) = instance.record.output_event() {
+                    let db = self.clone();
+                    crate::runtime::task::spawn(async move {
+                        db.post_event_named(&event_name).await;
+                    });
+                }
+            }
+
             // OUT stage: soft channel -> link put, non-soft -> device.write()
             // Must run BEFORE check_deadband_ext so MLST is not prematurely
             // updated for async writes that return early.
@@ -3743,6 +3762,20 @@ impl PvDatabase {
             } else {
                 false
             };
+
+            // OEVT: queue the output event when the output fires — same
+            // IVOA-gated event-twin of the OUT write as
+            // `process_record_with_links_inner`. This is the async-completion
+            // path (`complete_async_record_inner`), where the §4.6
+            // multi-output OUT write also runs, so OEVT must post here too.
+            if !skip_out {
+                if let Some(event_name) = instance.record.output_event() {
+                    let db = self.clone();
+                    crate::runtime::task::spawn(async move {
+                        db.post_event_named(&event_name).await;
+                    });
+                }
+            }
 
             let can_dev_write = instance.record.can_device_write();
             let is_soft_out =

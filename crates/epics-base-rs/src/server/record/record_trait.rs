@@ -1039,6 +1039,25 @@ pub trait Record: Send + Sync + 'static {
         &[]
     }
 
+    /// Return the name of the output event (`OEVT`) to post this cycle, or
+    /// `None`. The event-subsystem twin of the OUT write: a downstream
+    /// `SCAN="Event"` / `EVNT="<name>"` record is woken each time the record
+    /// drives output. Mirrors C `calcout`/`sCalcout`/`aCalcout` `execOutput`,
+    /// which calls `postEvent(epvt)` / `post_event(oevt)` immediately after
+    /// `writeValue` in every OUT-driving branch.
+    ///
+    /// The override MUST fold in the record's own output-fire decision
+    /// (`should_output()` for `calcout`; the cached OOPT/calc-fail/ODLY
+    /// decision for `sCalcout`/`aCalcout`) and return `None` when output did
+    /// not fire or when `OEVT` is unset. The framework adds the only gate the
+    /// record cannot see — the IVOA `Don't_drive` veto on an INVALID cycle —
+    /// so the post fires on exactly the cycles the OUT write does. Numeric
+    /// `OEVT` (DBF_USHORT) stringifies to match the `EVNT` ingest; a string
+    /// `OEVT` (DBF_STRING) is the event name verbatim.
+    fn output_event(&self) -> Option<String> {
+        None
+    }
+
     /// Internal field write that bypasses read-only checks.
     /// Used by the framework to write values from ReadDbLink actions
     /// into fields that are normally read-only (e.g., epid.CVAL).

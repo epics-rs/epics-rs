@@ -39,9 +39,10 @@
 //!
 //! ## Modeled simplifications (vs. C)
 //!
-//! - Output is synchronous: `ODLY`/`DLYA` (delayed output), `WAIT`/`OEVT`
-//!   (CA put-callback wait, post-event) and the async `acalcPerformTask`
-//!   thread are not modeled; those fields are stored but inert.
+//! - Output is synchronous: `ODLY`/`DLYA` (delayed output), `WAIT` (CA
+//!   put-callback wait) and the async `acalcPerformTask` thread are not
+//!   modeled; those fields are stored but inert. `OEVT` (post-event) IS
+//!   modeled — see [`AcalcoutRecord::output_event`].
 //! - Link-status fields (`INAV..INLV`, `IAAV..ILLV`, `OUTV`) are static at
 //!   their C post-`init_record` value: an unconfigured (constant) link
 //!   reports `Constant`(3), matching C overwriting the dbd `initial("1")`
@@ -1864,6 +1865,20 @@ impl Record for AcalcoutRecord {
             &[("OUT", "OAV")]
         } else {
             &[("OUT", "AVAL")]
+        }
+    }
+
+    /// `OEVT` ("Event To Issue"): post the numeric output event when output
+    /// fires. C `aCalcoutRecord.c` `execOutput` does `if (pcalc->oevt > 0)
+    /// post_event((int)pcalc->oevt);` right after `writeValue`, gated to the
+    /// same OOPT/calc-fail/ODLY decision as the OUT write (`cached_should_output`)
+    /// — the framework adds the IVOA `Don't_drive` veto. Stringified so the
+    /// numeric event matches a `SCAN="Event"` record's `EVNT`.
+    fn output_event(&self) -> Option<String> {
+        if self.cached_should_output && self.oevt > 0 {
+            Some(self.oevt.to_string())
+        } else {
+            None
         }
     }
 

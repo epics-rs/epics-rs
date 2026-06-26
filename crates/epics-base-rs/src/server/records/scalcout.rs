@@ -62,6 +62,11 @@ pub struct ScalcoutRecord {
     /// `cached_should_output` on the continuation so the deferred OUT write
     /// honours the original cycle's OOPT result. Mirrors calcout.rs.
     pending_output: bool,
+    /// `OEVT` ("Event To Issue") — C `sCalcoutRecord.c` `prec->oevt`
+    /// (DBF_USHORT). When output fires and `oevt > 0`, `execOutput` posts
+    /// the numeric software event (`post_event((int)oevt)`); see
+    /// [`Record::output_event`].
+    oevt: u16,
 }
 
 impl Default for ScalcoutRecord {
@@ -92,6 +97,7 @@ impl Default for ScalcoutRecord {
             odly: 0.0,
             dlya: 0,
             pending_output: false,
+            oevt: 0,
         }
     }
 }
@@ -245,6 +251,11 @@ static SCALCOUT_FIELDS: &[FieldDesc] = &[
         name: "DLYA",
         dbf_type: DbFieldType::Short,
         read_only: true,
+    },
+    FieldDesc {
+        name: "OEVT",
+        dbf_type: DbFieldType::UShort,
+        read_only: false,
     },
     // Input links
     FieldDesc {
@@ -656,6 +667,7 @@ impl Record for ScalcoutRecord {
             "PREC" => Some(EpicsValue::Short(self.prec)),
             "ODLY" => Some(EpicsValue::Double(self.odly)),
             "DLYA" => Some(EpicsValue::Short(self.dlya)),
+            "OEVT" => Some(EpicsValue::UShort(self.oevt)),
             "CALC_ALARM" => Some(EpicsValue::Char(if self.calc_alarm { 1 } else { 0 })),
             _ => {
                 if let Some(idx) = Self::var_index(name) {
@@ -769,6 +781,13 @@ impl Record for ScalcoutRecord {
                 Ok(())
             }
             "DLYA" => Err(CaError::ReadOnlyField("DLYA".into())),
+            "OEVT" => {
+                self.oevt = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("OEVT".into()))?
+                    as u16;
+                Ok(())
+            }
             _ => {
                 if let Some(idx) = Self::var_index(name) {
                     self.num_vals[idx] = value
@@ -828,6 +847,20 @@ impl Record for ScalcoutRecord {
             &[("OUT", "OVAL")]
         } else {
             &[]
+        }
+    }
+
+    /// `OEVT` ("Event To Issue"): post the numeric output event when output
+    /// fires. C `sCalcoutRecord.c` `execOutput` does `if (pcalc->oevt > 0)
+    /// post_event((int)pcalc->oevt);` right after `writeValue`, gated to the
+    /// same OOPT/calc-fail/ODLY decision as the OUT write (`cached_should_output`)
+    /// — the framework adds the IVOA `Don't_drive` veto. Stringified so the
+    /// numeric event matches a `SCAN="Event"` record's `EVNT`.
+    fn output_event(&self) -> Option<String> {
+        if self.cached_should_output && self.oevt > 0 {
+            Some(self.oevt.to_string())
+        } else {
+            None
         }
     }
 

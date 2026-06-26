@@ -1311,7 +1311,7 @@ impl PvDatabase {
         // body are replaced by the SIOL round-trip. Returning early
         // here would silently break every FLNK / CP chain downstream
         // of any record in SIMM mode.
-        match self.check_simulation_mode(&rec, is_continuation).await {
+        match self.check_simulation_mode(&rec).await {
             SimOutcome::NotSimulated => {}
             SimOutcome::Simulated => {
                 self.run_forward_link_tail(name, &rec, visited, depth).await;
@@ -4340,19 +4340,24 @@ impl PvDatabase {
     /// `SimOutcome::Simulated` when simulation handled the value (the
     /// caller must still run the forward-link tail), or
     /// `SimOutcome::NotSimulated` when normal processing should proceed.
-    async fn check_simulation_mode(
-        &self,
-        rec: &Arc<RwLock<RecordInstance>>,
-        // C `prec->pact` at process entry: `false` on the fresh first cycle
-        // (where an `SDLY` >= 0 async simulation defers), `true` on the
-        // `ReprocessAfter` continuation (where the SIOL round-trip runs
-        // synchronously). See `SimOutcome::DeferRead`.
-        is_continuation: bool,
-    ) -> SimOutcome {
+    async fn check_simulation_mode(&self, rec: &Arc<RwLock<RecordInstance>>) -> SimOutcome {
         // Read SIML, SIMM, SIOL, SIMS, SDLY from the record
-        let (siml_link, siol_link, sims, sdly, _rtype, is_input) = {
+        let (siml_link, siol_link, sims, sdly, _rtype, is_input, pact_held) = {
             let instance = rec.read().await;
             let rtype = instance.record.record_type().to_string();
+            // C `prec->pact` at process entry — the value every readValue/
+            // writeValue simulation guard keys on. The framework holds the
+            // `processing` flag across an async wait owned by PACT (the SDLY
+            // defer, the ODLY/swait ReprocessAfter), and the entry guard in
+            // `process_record_with_links_inner` lets only such a held
+            // continuation reach this point with the flag set. A fresh cycle
+            // reads `false`; so does a `pact=FALSE` delayed re-trigger that does
+            // NOT own PACT (e.g. the bo HIGH one-shot, which re-enters via the
+            // same token mechanism but returned `Complete`). So `is_processing()`
+            // is the faithful analog of `prec->pact` — finer than "re-entered via
+            // a token" (`is_continuation`), which conflates the PACT-owning
+            // continuation with the pact=FALSE re-trigger.
+            let pact_held = instance.is_processing();
             // Every input record whose DBD declares SIML/SIOL/SIMM/SIMS.
             // `mbbi`/`mbbiDirect` are input records: `mbbiRecord.c:125-126`
             // (and mbbiDirectRecord.c) declare SIML+SIOL, and
@@ -4424,19 +4429,39 @@ impl PvDatabase {
             let siml_parsed = crate::server::record::parse_link_v2(siml.as_str_lossy().as_ref());
             let siol_parsed = crate::server::record::parse_link_v2(siol.as_str_lossy().as_ref());
 
-            (siml_parsed, siol_parsed, sims, sdly, rtype, is_input)
+            (
+                siml_parsed,
+                siol_parsed,
+                sims,
+                sdly,
+                rtype,
+                is_input,
+                pact_held,
+            )
         };
 
-        // Read SIML -> update SIMM. C `dbGetLink(&prec->siml, DBR_USHORT,
-        // &prec->simm, 0, 0)` reads the SIML link for any type; the
-        // pre-fix port only read a `ParsedLink::Db` SIML, ignoring a
-        // CA/PVA/constant simulation-mode source.
-        if let Some(val) = self.read_link_value_no_process(&siml_link).await {
-            let simm_val = val.to_f64().unwrap_or(0.0) as i16;
-            let mut instance = rec.write().await;
-            let _ = instance
-                .record
-                .put_field("SIMM", EpicsValue::Short(simm_val));
+        // Read SIML -> update SIMM, but only when PACT is not held. C resolves
+        // the simulation mode in `recGblGetSimm` (`dbGetLink(&prec->siml,
+        // DBR_USHORT, &prec->simm, 0, 0)`, reads the SIML link for any type)
+        // guarded by `if (!prec->pact)` (aiRecord.c:475 / aoRecord.c:558): SIMM
+        // is latched whenever the record re-enters with PACT held and is
+        // re-resolved on every `pact=FALSE` entry. Gate the re-read on
+        // `!pact_held` to match exactly: on the SDLY async continuation (PACT
+        // held) the latch holds, so a SIML source that flips during the delay
+        // cannot switch the deferred SIOL round-trip into a real device read;
+        // on a `pact=FALSE` delayed re-trigger (the bo HIGH one-shot) the
+        // re-resolve runs, matching C's fresh `recGblGetSimm`. The non-held
+        // entry persists SIMM via `put_field` below, so a later held
+        // continuation reads it back latched. (The pre-fix port only read a
+        // `ParsedLink::Db` SIML, ignoring a CA/PVA/constant source.)
+        if !pact_held {
+            if let Some(val) = self.read_link_value_no_process(&siml_link).await {
+                let simm_val = val.to_f64().unwrap_or(0.0) as i16;
+                let mut instance = rec.write().await;
+                let _ = instance
+                    .record
+                    .put_field("SIMM", EpicsValue::Short(simm_val));
+            }
         }
 
         // Check SIMM
@@ -4474,13 +4499,13 @@ impl PvDatabase {
         // `aoRecord.c::writeValue` (571): `if (prec->pact || prec->sdly < 0)`
         // takes the synchronous SIOL branch; otherwise (`!pact && sdly >= 0`)
         // it schedules `callbackRequestProcessCallbackDelayed(..., sdly)` and
-        // sets `pact = TRUE`. `is_continuation` is the framework analog of the
-        // entry `pact`: on the fresh cycle it is false, so a non-negative SDLY
-        // defers the whole SIOL round-trip (input read OR output write — both
-        // C paths share this branch) by `SDLY` seconds and holds PACT; on the
-        // `ReprocessAfter` re-entry it is true, falling through to the
-        // synchronous branch below.
-        if !is_continuation && sdly >= 0.0 {
+        // sets `pact = TRUE`. Key the defer on the same `!pact_held && sdly >= 0`
+        // as C: a non-held entry (fresh cycle, or a `pact=FALSE` re-trigger)
+        // with a non-negative SDLY defers the whole SIOL round-trip (input read
+        // OR output write — both C paths share this branch) by `SDLY` seconds
+        // and holds PACT; the resulting PACT-held continuation falls through to
+        // the synchronous branch below.
+        if !pact_held && sdly >= 0.0 {
             return SimOutcome::DeferRead(std::time::Duration::from_secs_f64(sdly));
         }
 
@@ -4611,9 +4636,10 @@ impl PvDatabase {
         // SDLY continuation this releases the PACT held across the delay so the
         // forward-link tail and any subsequent foreign process see the record
         // idle (C posts `monitor()` + `recGblFwdLink` with pact already
-        // FALSE). A fresh `sdly < 0` cycle never held PACT, so the clear is
-        // gated on `is_continuation` to avoid a needless write-lock there.
-        if is_continuation {
+        // FALSE). An entry that never held PACT (a fresh `sdly < 0` cycle, or a
+        // `pact=FALSE` re-trigger) has nothing to release, so the clear is gated
+        // on `pact_held` to avoid a needless write-lock there.
+        if pact_held {
             let instance = rec.write().await;
             instance
                 .processing

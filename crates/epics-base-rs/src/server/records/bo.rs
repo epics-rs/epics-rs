@@ -36,6 +36,7 @@ pub struct BoRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
+    pub sdly: f64,
     /// Set when a HIGH one-shot timer is in flight. The next
     /// `process()` (the timer-driven reprocess) forces `VAL = 0`,
     /// mirroring C `boRecord.c::myCallbackFunc` which sets
@@ -80,6 +81,7 @@ impl Default for BoRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
+            sdly: -1.0,
             high_reset_pending: false,
             value_changed: false,
             skip_convert: false,
@@ -254,6 +256,11 @@ static FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    FieldDesc {
+        name: "SDLY",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
 ];
 
 impl Record for BoRecord {
@@ -420,6 +427,7 @@ impl Record for BoRecord {
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
+            "SDLY" => Some(EpicsValue::Double(self.sdly)),
             _ => None,
         }
     }
@@ -602,6 +610,13 @@ impl Record for BoRecord {
             "SIMS" => match value {
                 EpicsValue::Short(v) => {
                     self.sims = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "SDLY" => match value {
+                EpicsValue::Double(v) => {
+                    self.sdly = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

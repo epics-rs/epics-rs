@@ -35,6 +35,7 @@ pub struct LsiRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
+    pub sdly: f64,
     /// `menuPost` Post Value Monitors: `menuPost_OnChange` (0, default)
     /// posts DBE_VALUE only on a real change; `menuPost_Always` (1) posts
     /// DBE_VALUE every write (C `lsiRecord.dbd.pod` MPST, monitor:
@@ -71,6 +72,7 @@ impl Default for LsiRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
+            sdly: -1.0,
             mpst: 0,
             apst: 0,
             value_changed: false,
@@ -151,6 +153,11 @@ static LSI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SDLY",
+        dbf_type: DbFieldType::Double,
         read_only: false,
     },
     // `menuPost` menu fields (DBF_MENU). Exposed as Short, matching the
@@ -243,6 +250,7 @@ impl Record for LsiRecord {
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
+            "SDLY" => Some(EpicsValue::Double(self.sdly)),
             "MPST" => Some(EpicsValue::Short(self.mpst)),
             "APST" => Some(EpicsValue::Short(self.apst)),
             _ => None,
@@ -309,6 +317,13 @@ impl Record for LsiRecord {
                     self.sims = v;
                 } else {
                     return Err(CaError::TypeMismatch("SIMS".into()));
+                }
+            }
+            "SDLY" => {
+                if let EpicsValue::Double(v) = value {
+                    self.sdly = v;
+                } else {
+                    return Err(CaError::TypeMismatch("SDLY".into()));
                 }
             }
             "MPST" => {

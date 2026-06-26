@@ -27,6 +27,7 @@ pub struct BiRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
+    pub sdly: f64,
     // Internal: skip RVAL->VAL when soft INP set VAL directly
     skip_convert: bool,
     // VAL change gate. C
@@ -54,6 +55,7 @@ impl Default for BiRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
+            sdly: -1.0,
             skip_convert: false,
             value_changed: false,
         }
@@ -143,6 +145,11 @@ static FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SDLY",
+        dbf_type: DbFieldType::Double,
         read_only: false,
     },
 ];
@@ -294,6 +301,7 @@ impl Record for BiRecord {
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
+            "SDLY" => Some(EpicsValue::Double(self.sdly)),
             _ => None,
         }
     }
@@ -439,6 +447,13 @@ impl Record for BiRecord {
             "SIMS" => match value {
                 EpicsValue::Short(v) => {
                     self.sims = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "SDLY" => match value {
+                EpicsValue::Double(v) => {
+                    self.sdly = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

@@ -86,6 +86,7 @@ pub struct AoRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
+    pub sdly: f64,
 }
 
 impl Default for AoRecord {
@@ -134,6 +135,7 @@ impl Default for AoRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
+            sdly: -1.0,
         }
     }
 }
@@ -501,6 +503,11 @@ static FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    FieldDesc {
+        name: "SDLY",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
 ];
 
 /// Try to parse a DOL string as a constant value.
@@ -674,6 +681,7 @@ impl Record for AoRecord {
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
+            "SDLY" => Some(EpicsValue::Double(self.sdly)),
             _ => None,
         }
     }
@@ -926,6 +934,13 @@ impl Record for AoRecord {
             "SIMS" => match value {
                 EpicsValue::Short(v) => {
                     self.sims = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            },
+            "SDLY" => match value {
+                EpicsValue::Double(v) => {
+                    self.sdly = v;
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch(name.into())),

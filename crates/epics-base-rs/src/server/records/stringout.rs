@@ -38,6 +38,7 @@ pub struct StringoutRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
+    pub sdly: f64,
     /// `menu(stringoutPOST)` Post Value Monitors (0=On Change, 1=Always).
     pub mpst: i16,
     /// `menu(stringoutPOST)` Post Archive Monitors (0=On Change, 1=Always).
@@ -57,6 +58,7 @@ impl Default for StringoutRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
+            sdly: -1.0,
             mpst: 0,
             apst: 0,
         }
@@ -121,6 +123,11 @@ static STRINGOUT_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SDLY",
+        dbf_type: DbFieldType::Double,
         read_only: false,
     },
     FieldDesc {
@@ -194,6 +201,7 @@ impl Record for StringoutRecord {
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
+            "SDLY" => Some(EpicsValue::Double(self.sdly)),
             "MPST" => Some(EpicsValue::Short(self.mpst)),
             "APST" => Some(EpicsValue::Short(self.apst)),
             _ => None,
@@ -272,6 +280,13 @@ impl Record for StringoutRecord {
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SIMS".into())),
+            },
+            "SDLY" => match value {
+                EpicsValue::Double(v) => {
+                    self.sdly = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("SDLY".into())),
             },
             "MPST" => match value {
                 EpicsValue::Short(v) => {

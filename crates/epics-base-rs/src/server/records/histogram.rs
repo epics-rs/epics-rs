@@ -41,6 +41,7 @@ pub struct HistogramRecord {
     pub sval: f64,
     pub siml: String,
     pub sims: i16,
+    pub sdly: f64,
     pub oldsimm: i16,
 }
 
@@ -76,6 +77,7 @@ impl Default for HistogramRecord {
             sval: 0.0,
             siml: String::new(),
             sims: 0,
+            sdly: -1.0,
             oldsimm: 0,
         }
     }
@@ -235,6 +237,11 @@ static HISTOGRAM_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    FieldDesc {
+        name: "SDLY",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
     // OLDSIMM is special(SPC_NOMOD) — the saved previous simulation mode,
     // not client-writable (histogramRecord.dbd.pod:270-274).
     FieldDesc {
@@ -283,6 +290,7 @@ impl Record for HistogramRecord {
             "SVAL" => Some(EpicsValue::Double(self.sval)),
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
+            "SDLY" => Some(EpicsValue::Double(self.sdly)),
             "OLDSIMM" => Some(EpicsValue::Short(self.oldsimm)),
             _ => None,
         }
@@ -393,6 +401,13 @@ impl Record for HistogramRecord {
                     Ok(())
                 }
                 _ => Err(CaError::TypeMismatch("SIMS".into())),
+            },
+            "SDLY" => match value {
+                EpicsValue::Double(v) => {
+                    self.sdly = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("SDLY".into())),
             },
             // C `field(NELM,DBF_USHORT){ promptgroup special(SPC_NOMOD) }`:
             // settable at `.db` load (dbStaticLib bypasses SPC_NOMOD), runtime-

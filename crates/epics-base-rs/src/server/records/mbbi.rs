@@ -77,6 +77,7 @@ pub struct MbbiRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
+    pub sdly: f64,
     skip_convert: bool,
     // VAL change gate. C
     // mbbiRecord.c:355-358 monitor() raises DBE_VALUE|DBE_LOG for VAL only
@@ -153,6 +154,7 @@ impl Default for MbbiRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
+            sdly: -1.0,
             skip_convert: false,
             value_changed: false,
         }
@@ -261,6 +263,11 @@ static MBBI_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SDLY",
+        dbf_type: DbFieldType::Double,
         read_only: false,
     },
     FieldDesc {
@@ -725,6 +732,7 @@ impl Record for MbbiRecord {
             "NOBT" => nobt: UShort,
             "SIMM" => simm: Short, "SIML" => siml: String, "SIOL" => siol: String,
             "SIMS" => sims: Short,
+            "SDLY" => sdly: Double,
             "ZRSV" => zrsv: Short, "ONSV" => onsv: Short, "TWSV" => twsv: Short, "THSV" => thsv: Short,
             "FRSV" => frsv: Short, "FVSV" => fvsv: Short, "SXSV" => sxsv: Short, "SVSV" => svsv: Short,
             "EISV" => eisv: Short, "NISV" => nisv: Short, "TESV" => tesv: Short, "ELSV" => elsv: Short,
@@ -749,6 +757,7 @@ impl Record for MbbiRecord {
             "NOBT" => nobt: UShort,
             "SIMM" => simm: Short, "SIML" => siml: String, "SIOL" => siol: String,
             "SIMS" => sims: Short,
+            "SDLY" => sdly: Double,
             "ZRSV" => zrsv: Short, "ONSV" => onsv: Short, "TWSV" => twsv: Short, "THSV" => thsv: Short,
             "FRSV" => frsv: Short, "FVSV" => fvsv: Short, "SXSV" => sxsv: Short, "SVSV" => svsv: Short,
             "EISV" => eisv: Short, "NISV" => nisv: Short, "TESV" => tesv: Short, "ELSV" => elsv: Short,

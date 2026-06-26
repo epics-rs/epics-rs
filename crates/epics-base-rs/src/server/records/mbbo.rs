@@ -79,6 +79,7 @@ pub struct MbboRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
+    pub sdly: f64,
     /// Set by `convert()` when VAL is an illegal state (`> 15` with a
     /// defined state table). C `mbboRecord.c::convert` raises
     /// `SOFT_ALARM/INVALID` for this case; the alarm is actually
@@ -171,6 +172,7 @@ impl Default for MbboRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
+            sdly: -1.0,
             soft_alarm: false,
             value_changed: false,
             skip_convert: false,
@@ -612,6 +614,11 @@ static MBBO_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    FieldDesc {
+        name: "SDLY",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
 ];
 
 /// Helper macro: maps EPICS field name strings to struct fields.
@@ -828,6 +835,7 @@ impl Record for MbboRecord {
             "UNSV" => unsv: Short, "COSV" => cosv: Short,
             "OMSL" => omsl: Short, "DOL" => dol: String,
             "SIMM" => simm: Short, "SIML" => siml: String, "SIOL" => siol: String, "SIMS" => sims: Short,
+            "SDLY" => sdly: Double,
             "ZRVL" => zrvl: ULong, "ONVL" => onvl: ULong, "TWVL" => twvl: ULong, "THVL" => thvl: ULong,
             "FRVL" => frvl: ULong, "FVVL" => fvvl: ULong, "SXVL" => sxvl: ULong, "SVVL" => svvl: ULong,
             "EIVL" => eivl: ULong, "NIVL" => nivl: ULong, "TEVL" => tevl: ULong, "ELVL" => elvl: ULong,
@@ -854,6 +862,7 @@ impl Record for MbboRecord {
             "UNSV" => unsv: Short, "COSV" => cosv: Short,
             "OMSL" => omsl: Short, "DOL" => dol: String,
             "SIMM" => simm: Short, "SIML" => siml: String, "SIOL" => siol: String, "SIMS" => sims: Short,
+            "SDLY" => sdly: Double,
             "ZRVL" => zrvl: ULong, "ONVL" => onvl: ULong, "TWVL" => twvl: ULong, "THVL" => thvl: ULong,
             "FRVL" => frvl: ULong, "FVVL" => fvvl: ULong, "SXVL" => sxvl: ULong, "SVVL" => svvl: ULong,
             "EIVL" => eivl: ULong, "NIVL" => nivl: ULong, "TEVL" => tevl: ULong, "ELVL" => elvl: ULong,

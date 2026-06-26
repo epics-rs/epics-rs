@@ -334,6 +334,15 @@ enum SimOutcome {
     /// The caller must still run the forward-link / CP / RPRO tail
     /// exactly as `recGblFwdLink` does for a real process cycle.
     Simulated,
+    /// Asynchronous simulation: `SIMM`=YES/RAW with `SDLY` >= 0 on the
+    /// fresh (non-continuation) cycle. C `aiRecord.c::readValue` (488-508)
+    /// / `aoRecord.c::writeValue` (571-587) `callbackRequestProcessCallbackDelayed`:
+    /// hold PACT, schedule a re-process `SDLY` seconds out, and post nothing
+    /// this cycle (C `process()` returns 0 on the async-start pass). The
+    /// SIOL round-trip + alarm/monitor tail run on the continuation, which
+    /// re-enters with `is_continuation = true` and takes the synchronous
+    /// branch. The wrapped [`Duration`] is the `SDLY` delay.
+    DeferRead(std::time::Duration),
 }
 
 impl PvDatabase {
@@ -593,6 +602,25 @@ impl PvDatabase {
                 .reprocess_generation
                 .fetch_add(1, Ordering::AcqRel);
         }
+    }
+
+    /// Schedule a delayed re-process of `name` — the single owner of the
+    /// "mint a fresh [`AsyncToken`], sleep, then fire" pattern. Used by both
+    /// [`ProcessAction::ReprocessAfter`] (record-driven owner re-entry: ODLY
+    /// output delay, swait, sequence DLYn) and the `SDLY` async-simulation
+    /// defer ([`SimOutcome::DeferRead`]). Minting advances the record's
+    /// generation so a newer schedule supersedes any pending one; a stale
+    /// token's `fire` is a structural no-op. No-op if the record is absent.
+    async fn schedule_delayed_reprocess(&self, name: &str, delay: std::time::Duration) {
+        let token = match self.mint_async_token(name).await {
+            Some(t) => t,
+            None => return,
+        };
+        let db = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = token.fire(&db).await;
+        });
     }
 
     /// Post an async-side field update for `name` — the C `db_post_events`
@@ -1283,10 +1311,30 @@ impl PvDatabase {
         // body are replaced by the SIOL round-trip. Returning early
         // here would silently break every FLNK / CP chain downstream
         // of any record in SIMM mode.
-        match self.check_simulation_mode(&rec).await {
+        match self.check_simulation_mode(&rec, is_continuation).await {
             SimOutcome::NotSimulated => {}
             SimOutcome::Simulated => {
                 self.run_forward_link_tail(name, &rec, visited, depth).await;
+                return Ok(());
+            }
+            SimOutcome::DeferRead(delay) => {
+                // C `readValue`/`writeValue` async path: hold PACT and
+                // schedule the SIOL round-trip `SDLY` seconds out. Post
+                // nothing this cycle — C `process()` returns 0 on the
+                // async-start pass (`if (!pact && prec->pact) return 0`), so
+                // no value, no alarm, no monitor, no forward link. The
+                // continuation re-enters via `process_record_continuation`
+                // (`is_continuation = true`) and runs the synchronous branch
+                // + tail. The PACT hold is gated on the scheduled re-entry
+                // that releases it, the same construction-time invariant as
+                // the `ReprocessAfter` ODLY defers.
+                {
+                    let instance = rec.write().await;
+                    instance
+                        .processing
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                self.schedule_delayed_reprocess(name, delay).await;
                 return Ok(());
             }
         }
@@ -3366,23 +3414,11 @@ impl PvDatabase {
                 ProcessAction::ReprocessAfter(delay) => {
                     // Owner-driven delayed re-entry, mirroring C
                     // `callbackRequestDelayed` dispatching to
-                    // `(*prset->process)(prec)` directly (callback.c). Mint
-                    // a fresh token — which advances the record's generation
-                    // and so supersedes any prior pending re-entry for this
-                    // record (a newer ReprocessAfter replaces the older
-                    // timer) — then fire it after the delay. A newer mint or
-                    // an explicit `cancel_async_reentry` makes this fire a
-                    // structural no-op: the gate lives entirely in
-                    // `AsyncToken`, not in an inline generation compare here.
-                    let token = match self.mint_async_token(record_name).await {
-                        Some(t) => t,
-                        None => continue,
-                    };
-                    let db = self.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(delay).await;
-                        let _ = token.fire(&db).await;
-                    });
+                    // `(*prset->process)(prec)` directly (callback.c). The
+                    // mint-token + delayed-fire is the single
+                    // `schedule_delayed_reprocess` owner, shared with the
+                    // SDLY async-simulation defer.
+                    self.schedule_delayed_reprocess(record_name, delay).await;
                 }
                 ProcessAction::WriteDbLinkNotify { link_field, value } => {
                     // C `sseqRecord.c` WAITn put-callback dependency: write
@@ -4304,9 +4340,17 @@ impl PvDatabase {
     /// `SimOutcome::Simulated` when simulation handled the value (the
     /// caller must still run the forward-link tail), or
     /// `SimOutcome::NotSimulated` when normal processing should proceed.
-    async fn check_simulation_mode(&self, rec: &Arc<RwLock<RecordInstance>>) -> SimOutcome {
-        // Read SIML, SIMM, SIOL, SIMS from the record
-        let (siml_link, siol_link, sims, _rtype, is_input) = {
+    async fn check_simulation_mode(
+        &self,
+        rec: &Arc<RwLock<RecordInstance>>,
+        // C `prec->pact` at process entry: `false` on the fresh first cycle
+        // (where an `SDLY` >= 0 async simulation defers), `true` on the
+        // `ReprocessAfter` continuation (where the SIOL round-trip runs
+        // synchronously). See `SimOutcome::DeferRead`.
+        is_continuation: bool,
+    ) -> SimOutcome {
+        // Read SIML, SIMM, SIOL, SIMS, SDLY from the record
+        let (siml_link, siol_link, sims, sdly, _rtype, is_input) = {
             let instance = rec.read().await;
             let rtype = instance.record.record_type().to_string();
             // Every input record whose DBD declares SIML/SIOL/SIMM/SIMS.
@@ -4362,6 +4406,16 @@ impl PvDatabase {
                     }
                 })
                 .unwrap_or(0);
+            // SDLY ("Sim. Mode Async Delay", DBF_DOUBLE, dbd initial
+            // "-1.0"). Absent on record types whose SIMM group Rust does not
+            // yet fully model — default to -1.0 (synchronous) so the async
+            // branch is a no-op there, exactly as a record with the C default
+            // behaves.
+            let sdly = instance
+                .record
+                .get_field("SDLY")
+                .and_then(|v| v.to_f64())
+                .unwrap_or(-1.0);
 
             if siml.is_empty() && siol.is_empty() {
                 return SimOutcome::NotSimulated; // No simulation configured
@@ -4370,7 +4424,7 @@ impl PvDatabase {
             let siml_parsed = crate::server::record::parse_link_v2(siml.as_str_lossy().as_ref());
             let siol_parsed = crate::server::record::parse_link_v2(siol.as_str_lossy().as_ref());
 
-            (siml_parsed, siol_parsed, sims, rtype, is_input)
+            (siml_parsed, siol_parsed, sims, sdly, rtype, is_input)
         };
 
         // Read SIML -> update SIMM. C `dbGetLink(&prec->siml, DBR_USHORT,
@@ -4415,6 +4469,20 @@ impl PvDatabase {
         //             else to copy.
         let raw_mode = simm == 2;
         let raw_field = if raw_mode { "RVAL" } else { "VAL" };
+
+        // SDLY async simulation — C `aiRecord.c::readValue` (488) /
+        // `aoRecord.c::writeValue` (571): `if (prec->pact || prec->sdly < 0)`
+        // takes the synchronous SIOL branch; otherwise (`!pact && sdly >= 0`)
+        // it schedules `callbackRequestProcessCallbackDelayed(..., sdly)` and
+        // sets `pact = TRUE`. `is_continuation` is the framework analog of the
+        // entry `pact`: on the fresh cycle it is false, so a non-negative SDLY
+        // defers the whole SIOL round-trip (input read OR output write — both
+        // C paths share this branch) by `SDLY` seconds and holds PACT; on the
+        // `ReprocessAfter` re-entry it is true, falling through to the
+        // synchronous branch below.
+        if !is_continuation && sdly >= 0.0 {
+            return SimOutcome::DeferRead(std::time::Duration::from_secs_f64(sdly));
+        }
 
         // SIMM=YES(1) / SIMM=RAW(2): read/write the SIOL link. C
         // `readValue`/`writeValue` for a SIMM-mode record go through
@@ -4536,6 +4604,20 @@ impl PvDatabase {
                 // `sim_process_tail`.
                 sim_process_tail(&mut instance, sims);
             }
+        }
+
+        // C `readValue`/`writeValue` clears `pact` on the synchronous branch
+        // (`prec->pact = FALSE`, aiRecord.c:496 / aoRecord.c:578). On the
+        // SDLY continuation this releases the PACT held across the delay so the
+        // forward-link tail and any subsequent foreign process see the record
+        // idle (C posts `monitor()` + `recGblFwdLink` with pact already
+        // FALSE). A fresh `sdly < 0` cycle never held PACT, so the clear is
+        // gated on `is_continuation` to avoid a needless write-lock there.
+        if is_continuation {
+            let instance = rec.write().await;
+            instance
+                .processing
+                .store(false, std::sync::atomic::Ordering::Release);
         }
 
         SimOutcome::Simulated

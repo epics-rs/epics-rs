@@ -33,6 +33,7 @@ pub struct MbboDirectRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
+    pub sdly: f64,
     // VAL change gate. C
     // mbboDirectRecord.c:311-314 monitor() raises DBE_VALUE|DBE_LOG for VAL
     // only when `mlst != val`. Captured during process() because the
@@ -68,6 +69,7 @@ impl Default for MbboDirectRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
+            sdly: -1.0,
             value_changed: false,
             skip_convert: false,
         }
@@ -220,6 +222,11 @@ static MBBO_DIRECT_HEAD_FIELDS: &[FieldDesc] = &[
     FieldDesc {
         name: "SIMS",
         dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "SDLY",
+        dbf_type: DbFieldType::Double,
         read_only: false,
     },
 ];
@@ -411,6 +418,7 @@ impl Record for MbboDirectRecord {
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
+            "SDLY" => Some(EpicsValue::Double(self.sdly)),
             _ => BIT_NAMES
                 .iter()
                 .position(|&n| n == name)
@@ -522,6 +530,13 @@ impl Record for MbboDirectRecord {
                     self.sims = v;
                 } else {
                     return Err(CaError::TypeMismatch("SIMS".into()));
+                }
+            }
+            "SDLY" => {
+                if let EpicsValue::Double(v) = value {
+                    self.sdly = v;
+                } else {
+                    return Err(CaError::TypeMismatch("SDLY".into()));
                 }
             }
             _ => {

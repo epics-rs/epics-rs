@@ -68,8 +68,13 @@ const BASE_RECORDS: &[&str] = &[
 /// legitimately carry a dbd initial. Verified outside this test:
 ///   - `SSCN`: `CommonFields.sscn` (=65535, `SimModeScan::DoNotUse`) — covered by
 ///     the SSCN serve/round-trip tests and `test_new_common_fields_get_put`.
-///   - `SDLY`: scan-delay (SPC_NOMOD), unmodeled in the port.
-const KNOWN_NON_FIELDLIST: &[&str] = &["SSCN", "SDLY"];
+///
+/// `SDLY` ("Sim. Mode Async Delay") is no longer here: the port now models it as
+/// a per-record `field_list` entry on the 15 record types that carry the SIMM
+/// simulation-field group, so its `-1.0` default is verified by the regular
+/// default-check path. Record types that do not model that group route SDLY
+/// through `unmodeled_feature_reason` instead.
+const KNOWN_NON_FIELDLIST: &[&str] = &["SSCN"];
 
 /// `(record, field)` whose Rust `Default` deliberately differs from the C dbd
 /// `initial(...)`. Returns the documented reason, or `None` if not a deviation.
@@ -110,6 +115,16 @@ fn unmodeled_feature_reason(record: &str, field: &str) -> Option<&'static str> {
             "ONVx (Num. elements in OVLx) is SPC_NOMOD bookkeeping of the previous output-array \
              length used to detect an output-size change; the port models neither the old \
              output buffers OVLx nor their length, so ONVx carries no state.",
+        ),
+        // SDLY ("Sim. Mode Async Delay") is part of the SIMM simulation-field
+        // group. The port models that group — and SDLY's async-defer behavior —
+        // on the 15 record types that declare SIML/SIMM/SIOL/SIMS in
+        // `field_list()`. These record types do not model the SIMM group at
+        // all, so SDLY carries no state here (a documented feature gap, the same
+        // status the rest of the group has on these records).
+        "longin" | "int64in" | "event" | "waveform" | "aai" | "aao" if field == "SDLY" => Some(
+            "SDLY is part of the SIMM simulation-field group, which the port does not model on \
+             this record type (no SIML/SIMM/SIOL/SIMS in field_list); SDLY carries no state.",
         ),
         _ => None,
     }

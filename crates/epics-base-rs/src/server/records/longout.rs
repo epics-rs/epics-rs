@@ -40,6 +40,7 @@ pub struct LongoutRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
+    pub sdly: f64,
     /// Output Execution Option (epics-base 7.0.8):
     ///
     /// | OOPT | Meaning                |
@@ -111,6 +112,7 @@ impl Default for LongoutRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
+            sdly: -1.0,
             oopt: 0,
             pval: 0,
             first_output_done: false,
@@ -300,6 +302,11 @@ static LONGOUT_FIELDS: &[FieldDesc] = &[
         read_only: false,
     },
     FieldDesc {
+        name: "SDLY",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
         name: "OOPT",
         dbf_type: DbFieldType::Short,
         read_only: false,
@@ -412,6 +419,7 @@ impl Record for LongoutRecord {
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
+            "SDLY" => Some(EpicsValue::Double(self.sdly)),
             "OOPT" => Some(EpicsValue::Short(self.oopt)),
             "PVAL" => Some(EpicsValue::Long(self.pval)),
             "OOCH" => Some(EpicsValue::Short(self.ooch)),
@@ -560,6 +568,11 @@ impl Record for LongoutRecord {
             "SIMS" => {
                 if let EpicsValue::Short(v) = value {
                     self.sims = v;
+                }
+            }
+            "SDLY" => {
+                if let EpicsValue::Double(v) = value {
+                    self.sdly = v;
                 }
             }
             "OOPT" => {

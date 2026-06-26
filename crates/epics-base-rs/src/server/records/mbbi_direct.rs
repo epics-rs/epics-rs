@@ -24,6 +24,7 @@ pub struct MbbiDirectRecord {
     pub siml: String,
     pub siol: String,
     pub sims: i16,
+    pub sdly: f64,
     skip_convert: bool,
     // VAL change gate. C
     // mbbiDirectRecord.c:228-231 monitor() raises DBE_VALUE|DBE_LOG for VAL
@@ -47,6 +48,7 @@ impl Default for MbbiDirectRecord {
             siml: String::new(),
             siol: String::new(),
             sims: 0,
+            sdly: -1.0,
             skip_convert: false,
             value_changed: false,
         }
@@ -179,6 +181,11 @@ static MBBI_DIRECT_HEAD_FIELDS: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    FieldDesc {
+        name: "SDLY",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
 ];
 
 /// Full field table: the 11 scalar fields followed by the 32 bit fields.
@@ -277,6 +284,7 @@ impl Record for MbbiDirectRecord {
             "SIML" => Some(EpicsValue::String(self.siml.clone().into())),
             "SIOL" => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" => Some(EpicsValue::Short(self.sims)),
+            "SDLY" => Some(EpicsValue::Double(self.sdly)),
             _ => BIT_NAMES
                 .iter()
                 .position(|&n| n == name)
@@ -353,6 +361,13 @@ impl Record for MbbiDirectRecord {
                     self.sims = v;
                 } else {
                     return Err(CaError::TypeMismatch("SIMS".into()));
+                }
+            }
+            "SDLY" => {
+                if let EpicsValue::Double(v) = value {
+                    self.sdly = v;
+                } else {
+                    return Err(CaError::TypeMismatch("SDLY".into()));
                 }
             }
             _ => {

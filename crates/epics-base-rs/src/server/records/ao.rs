@@ -957,20 +957,23 @@ impl Record for AoRecord {
     /// exclusive within a single process (forward XOR readback), each clearing
     /// the other's flag, so at most one fires.
     fn check_alarms(&mut self, common: &mut crate::server::record::CommonFields) {
+        // C uses the no-message `recGblSetSevr` on BOTH ao bpt paths —
+        // forward `aoRecord.c:497` and asyn readback `devAsynInt32.c:988` —
+        // so the ao AMSG stays empty on a bpt failure. This is asymmetric
+        // with ai (`aiRecord.c:435` uses `recGblSetSevrMsg(…,"BPT Error")`):
+        // ai carries the message, ao does not. Match C — no message here.
         if self.bpt_error {
-            crate::server::recgbl::rec_gbl_set_sevr_msg(
+            crate::server::recgbl::rec_gbl_set_sevr(
                 common,
                 crate::server::recgbl::alarm_status::SOFT_ALARM,
                 crate::server::record::AlarmSeverity::Major,
-                "BPT Error",
             );
         }
         if self.readback_bpt_error {
-            crate::server::recgbl::rec_gbl_set_sevr_msg(
+            crate::server::recgbl::rec_gbl_set_sevr(
                 common,
                 crate::server::recgbl::alarm_status::WRITE_ALARM,
                 crate::server::record::AlarmSeverity::Invalid,
-                "BPT Error",
             );
         }
     }
@@ -1166,5 +1169,29 @@ mod tests {
         // sevr/stat happens later in rec_gbl_reset_alarms.
         assert_eq!(common.nsev, AlarmSeverity::Invalid);
         assert_eq!(common.nsta, alarm_status::WRITE_ALARM);
+        // C uses no-message recGblSetSevr on the ao readback bpt path
+        // (devAsynInt32.c:988) — AMSG stays empty, unlike ai's "BPT Error".
+        assert!(
+            common.namsg.is_empty(),
+            "ao bpt readback AMSG must be empty"
+        );
+    }
+
+    /// The forward-convert failure (`bpt_error`) raises SOFT/MAJOR with an
+    /// empty AMSG — C `aoRecord.c:497` uses no-message `recGblSetSevr`.
+    #[test]
+    fn forward_bpt_error_raises_soft_major_with_empty_amsg() {
+        use crate::server::recgbl::alarm_status;
+        use crate::server::record::{AlarmSeverity, CommonFields};
+
+        let mut rec = AoRecord::default();
+        rec.bpt_error = true;
+        let mut common = CommonFields::default();
+
+        rec.check_alarms(&mut common);
+
+        assert_eq!(common.nsev, AlarmSeverity::Major);
+        assert_eq!(common.nsta, alarm_status::SOFT_ALARM);
+        assert!(common.namsg.is_empty(), "ao bpt forward AMSG must be empty");
     }
 }

@@ -250,16 +250,21 @@ impl BreakTableRegistry {
         self.tables.is_empty()
     }
 
-    /// Insert a table. A same-name redefinition replaces the existing table
-    /// IN PLACE, keeping its stable index; a new name is APPENDED at the next
-    /// free index. Append-only growth is what keeps every existing table's
-    /// `LINR` index fixed across later loads.
+    /// Insert a table. A redefinition of an existing name is silently IGNORED
+    /// (the first-loaded table wins); a new name is APPENDED at the next free
+    /// index. Append-only growth keeps every existing table's `LINR` index
+    /// fixed across later loads.
+    ///
+    /// First-wins matches C: `dbBreakHead` (dbLexRoutines.c:982-985) finds the
+    /// name already in `bptList`, sets `duplicate=TRUE`, and returns without
+    /// allocating; `dbBreakBody` (:1012-1014) then discards the new points and
+    /// keeps the original. A second `breaktable(name){…}` with different data
+    /// is therefore a no-op, not an override.
     pub fn insert(&mut self, table: BrkTable) {
-        if let Some(slot) = self.tables.iter_mut().find(|t| t.name == table.name) {
-            *slot = Arc::new(table);
-        } else {
-            self.tables.push(Arc::new(table));
+        if self.tables.iter().any(|t| t.name == table.name) {
+            return;
         }
+        self.tables.push(Arc::new(table));
     }
 
     /// Look up a table by name.
@@ -418,13 +423,18 @@ mod tests {
         );
         assert_eq!(reg.table_for_linr(3).unwrap().name, "zeta");
         assert_eq!(reg.linr_index_of("alpha"), Some(4));
-        // A same-name redefinition keeps the stable index, replaces the data.
+        // A same-name redefinition is IGNORED (C first-wins): index unchanged,
+        // ORIGINAL data kept (the new eng=20.0 is discarded).
         reg.insert(BrkTable::build("zeta", &[(0.0, 0.0), (2.0, 20.0)]).unwrap());
         assert_eq!(
             reg.linr_index_of("zeta"),
             Some(3),
             "redefinition keeps index"
         );
-        assert_eq!(reg.get("zeta").unwrap().points[1].eng, 20.0);
+        assert_eq!(
+            reg.get("zeta").unwrap().points[1].eng,
+            1.0,
+            "first-wins: original zeta data kept, redefinition discarded"
+        );
     }
 }

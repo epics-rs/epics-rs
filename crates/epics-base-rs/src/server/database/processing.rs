@@ -1362,9 +1362,14 @@ impl PvDatabase {
             // re-read the input.
             //
             // The `aao` (array analog output) record is the only other
-            // OMSL-bearing C record; the Rust port does not implement
-            // aao (confirmed: no `crates/epics-base-rs/src/server/records/aao*.rs`),
-            // so it is a future gap, not a same-defect-not-fixed site.
+            // OMSL-bearing C record, and it IS implemented (a `WaveformRecord`
+            // alias, `waveform.rs` `pub type AaoRecord`). Its
+            // `OMSL=closed_loop` pull is an ARRAY copy — C
+            // `aaoRecord.c::fetchValue` reads `DOL` into the value array — not
+            // the scalar `dbGetLink(&prec->dol, DBR_DOUBLE, &prec->val)` this
+            // arm models, so aao sources DOL record-locally via
+            // `WaveformRecord::pre_input_link_actions` and is deliberately
+            // absent from this scalar match. Not a missing record.
             let dol = match rtype {
                 "ao" | "longout" | "int64out" | "bo" | "mbbo" | "mbboDirect" | "stringout"
                 | "lso" | "dfanout" => {

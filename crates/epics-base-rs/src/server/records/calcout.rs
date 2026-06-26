@@ -21,6 +21,12 @@ pub struct CalcoutRecord {
     pub calc: String,
     pub oopt: i16, // Output Option: 0=Every, 1=OnChange, 2=WhenZero, 3=WhenNonzero, 4=TransZero, 5=TransNonzero
     cached_should_output: bool, // Cached result from process() for framework
+    // C `calcoutRecord.c::execOutput:620-625`: on a DOPT=Use_OVAL output cycle,
+    // a successful OCAL `calcPerform` sets `udf = isnan(oval)` (NOT VAL-based),
+    // which raises UDF_ALARM and lets IVOA gate the OUT write. `Some(_)` carries
+    // that per-cycle decision to `value_is_undefined()`; `None` (Use_VAL, an OCAL
+    // calc error, or a non-output cycle) leaves udf VAL-based, matching C.
+    ocal_udf_override: Option<bool>,
     pub dopt: i16, // Data Option: 0=Use CALC, 1=Use OCAL
     pub ocal: String,
     pub oval: f64,
@@ -153,6 +159,7 @@ impl Default for CalcoutRecord {
             calc: String::new(),
             oopt: 0,
             cached_should_output: false,
+            ocal_udf_override: None,
             dopt: 0,
             ocal: String::new(),
             oval: 0.0,
@@ -926,6 +933,18 @@ impl Record for CalcoutRecord {
         "calcout"
     }
 
+    // C `calcoutRecord.c::execOutput:620-625`: on a DOPT=Use_OVAL output cycle,
+    // udf tracks the OCAL result (`udf = isnan(oval)`), not VAL — so a finite
+    // VAL with a NaN OVAL still raises UDF_ALARM and IVOA gates the OUT write.
+    // `ocal_udf_override` carries that decision (set in process()); otherwise
+    // udf is VAL-based, matching the trait default.
+    fn value_is_undefined(&self) -> bool {
+        match self.ocal_udf_override {
+            Some(undef) => undef,
+            None => self.val.is_nan(),
+        }
+    }
+
     // C recCalcout.c IVOA=set_to_IVOV: oval = ivov; the OUT writeback
     // then sends OVAL. VAL is the calc *result* and remains intact.
     fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
@@ -984,7 +1003,11 @@ impl Record for CalcoutRecord {
             }
         }
 
-        // Determine output and evaluate OCAL if needed
+        // Determine output and evaluate OCAL if needed. C runs this in
+        // `execOutput`, called only when the OOPT predicate (`should_output`)
+        // fired — so the OCAL-derived udf below is reset every cycle and set
+        // only on an actual Use_OVAL output cycle.
+        self.ocal_udf_override = None;
         if self.should_output() {
             if self.dopt == 1 {
                 // Use OCAL
@@ -995,7 +1018,17 @@ impl Record for CalcoutRecord {
                     // OCAL `VAL` token reads the *previous* OVAL, not VAL.
                     inputs.prev_val = self.oval;
                     match crate::calc::eval(compiled, &mut inputs) {
-                        Ok(v) => self.oval = v,
+                        Ok(v) => {
+                            self.oval = v;
+                            // C `execOutput:624`: `prec->udf = isnan(prec->oval)`
+                            // on the successful-OCAL branch. A NaN OVAL then
+                            // raises UDF_ALARM (execOutput:628) so IVOA gates the
+                            // OUT write — without this a finite VAL but NaN OVAL
+                            // drives NaN to OUT with NO_ALARM (silent-wrong-value).
+                            self.ocal_udf_override = Some(self.oval.is_nan());
+                        }
+                        // C `execOutput:622`: OCAL calcPerform failure raises
+                        // CALC_ALARM and leaves udf VAL-based (no override).
                         Err(_) => self.calc_alarm = true,
                     }
                 }

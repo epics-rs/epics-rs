@@ -1652,7 +1652,7 @@ impl PvDatabase {
         let asub_dynamic = self.resolve_asub_dynamic_subroutine(&rec).await;
 
         // 2. Lock record, apply INP/DOL, process, evaluate alarms, build snapshot
-        let (snapshot, out_info, flnk_name, process_actions, alarm_posts) = {
+        let (snapshot, out_info, flnk_name, process_actions, alarm_posts, result_is_defer_output) = {
             let mut instance = rec.write().await;
 
             // Apply DOL value for output records (OMSL=CLOSED_LOOP)
@@ -1921,6 +1921,11 @@ impl PvDatabase {
             outcome.actions.extend(deferred_device_actions);
             let process_result = outcome.result;
             let process_actions = outcome.actions;
+            // Captured before the `AsyncPendingNotify` `if let` below moves
+            // `process_result`; consulted after the monitor epilogue to defer
+            // the OUT/OEVT/FLNK tail (swait ODLY — see `CompleteDeferOutput`).
+            let result_is_defer_output =
+                process_result == crate::server::record::RecordProcessResult::CompleteDeferOutput;
 
             if process_result == crate::server::record::RecordProcessResult::AsyncPending {
                 // C `dbProcess` contract: when device support / record body
@@ -2667,7 +2672,14 @@ impl PvDatabase {
             // target it drives has joined. See `complete_put_notify`
             // at the tail.
 
-            (snapshot, out_info, flnk_name, process_actions, alarm_posts)
+            (
+                snapshot,
+                out_info,
+                flnk_name,
+                process_actions,
+                alarm_posts,
+                result_is_defer_output,
+            )
         };
 
         // 3. Notify subscribers (outside lock)
@@ -2678,6 +2690,38 @@ impl PvDatabase {
             // individual C masks — see recGblResetAlarms above.
             for &(field, mask) in &alarm_posts {
                 instance.notify_field(field, mask);
+            }
+        }
+
+        // C `swaitRecord.c::process` (lines 425-481): `schedOutput` armed the
+        // ODLY watchdog (`async=TRUE`), so `process` ran `monitor()` — the
+        // value-publication epilogue above just posted VAL + the alarm fields at
+        // the START of the delay — but SKIPPED the `if(!async){recGblFwdLink;
+        // pact=FALSE;}` tail. The OUT write / OEVT are already gated out this
+        // cycle by `should_output()==false`; `recGblFwdLink` is NOT
+        // should_output-gated, so the forward-link tail below is skipped when
+        // deferring (`result_is_defer_output`). The deferred `execOutput` — the
+        // scheduled `ReprocessAfter` reprocess at delay-END — runs the OUT write
+        // + OEVT + FLNK. Hold PACT across the wait so a foreign `dbProcess` bails
+        // at the entry guard (C keeps the record ACTIVE on the watchdog,
+        // swaitRecord.c:716); the hold is gated on the `ReprocessAfter` that
+        // releases it (the same by-construction invariant as the
+        // `AsyncPendingNotify` ODLY defer above). The `ReprocessAfter` itself is
+        // dispatched by the shared deferred-actions site at the tail, NOT a
+        // separate `execute_process_actions().await` here — adding one would
+        // enlarge this hot recursive function's async frame (see the
+        // `CompleteNoEmit` note above; it overflowed the chain-depth guard).
+        // Holding `processing=true` also makes the tail's putf-clear (gated on
+        // `!is_processing()`) a no-op, leaving putf for the continuation.
+        if result_is_defer_output {
+            let holds_pact_until_continuation = process_actions
+                .iter()
+                .any(|a| matches!(a, crate::server::record::ProcessAction::ReprocessAfter(_)));
+            if holds_pact_until_continuation {
+                let instance = rec.write().await;
+                instance
+                    .processing
+                    .store(true, std::sync::atomic::Ordering::Release);
             }
         }
 
@@ -2756,18 +2800,26 @@ impl PvDatabase {
         // CP / RPRO tail. Shared with the simulation-mode path so a
         // simulated record runs the exact same `recGblFwdLink`
         // equivalent (C `aiRecord.c:168`).
-        self.run_forward_link_tail_with_putf(
-            name,
-            &rec,
-            flnk_name.as_deref(),
-            PutNotifyCtx {
-                putf: src_putf,
-                notify: src_notify.as_ref(),
-            },
-            visited,
-            depth,
-        )
-        .await;
+        //
+        // Skipped on a `CompleteDeferOutput` (swait ODLY) delaying cycle: the
+        // multi-output / OEVT are already gated out by `should_output()==false`,
+        // and `recGblFwdLink` runs only at delay-END (C `execOutput`) — the
+        // continuation drives the whole tail. The deferred-actions site below
+        // still runs (it dispatches this cycle's `ReprocessAfter`).
+        if !result_is_defer_output {
+            self.run_forward_link_tail_with_putf(
+                name,
+                &rec,
+                flnk_name.as_deref(),
+                PutNotifyCtx {
+                    putf: src_putf,
+                    notify: src_notify.as_ref(),
+                },
+                visited,
+                depth,
+            )
+            .await;
+        }
 
         // 8. Execute the deferred ProcessActions after the FLNK tail:
         // `ReprocessAfter` schedules a later reprocess (the current

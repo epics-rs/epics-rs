@@ -158,6 +158,22 @@ pub enum RecordProcessResult {
     /// record still accumulating toward its next compressed sample runs none of
     /// `recGblGetTimeStamp` / `monitor` / `recGblFwdLink` on that cycle.
     CompleteNoEmit,
+    /// Ran the value-publication epilogue NOW (UDF clear / timestamp / monitor —
+    /// VAL and the alarm fields are posted this cycle), but the OUTPUT side (OUT
+    /// link write / OEVT / forward link) is deferred to a scheduled
+    /// reprocess, with PACT held across the wait. C parity `swaitRecord.c::process`
+    /// (lines 425-481): when `schedOutput` arms the ODLY watchdog it sets
+    /// `async=TRUE`, so `process` still runs `monitor()` (line 475) — posting the
+    /// value side at the START of the delay — but skips the `if(!async)
+    /// {recGblFwdLink; pact=FALSE;}` tail; the deferred `execOutput` (watchdog,
+    /// at delay-END) does the OUT write + OEVT + forward link and posts no
+    /// monitors. Unlike the calcout/scalcout/acalcout family, whose C `process`
+    /// `return`s BEFORE `monitor()` (calcoutRecord.c:282, only `dlya` posted), so
+    /// they defer the value side too and use `AsyncPendingNotify`. The deferral
+    /// must carry a [`ProcessAction::ReprocessAfter`] — that scheduled reprocess
+    /// is the continuation that releases the held PACT (same by-construction
+    /// invariant as the `AsyncPendingNotify` ODLY defer).
+    CompleteDeferOutput,
 }
 
 /// Complete outcome of a record's process() call.

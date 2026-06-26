@@ -3,17 +3,21 @@
 //! `swaitRecord.c::schedOutput` (lines 719-729): when `odly > 0` the OUT write,
 //! forward link, and OEVT post are scheduled `odly` seconds later via the
 //! watchdog, with the record held active (PACT=1); when `odly == 0` they fire
-//! immediately. The Rust port models this with a bare `AsyncPending` (which
-//! holds PACT, matching C's "RECORD REMAINS ACTIVE") plus `ReprocessAfter`
-//! defer on the delaying cycle and an `output_wait` continuation branch that
-//! emits exactly once.
+//! immediately. The value side is NOT deferred: C `process` runs `monitor()`
+//! (line 475) on the delay-START cycle — only `execOutput` (the watchdog, at
+//! delay-end) is delayed, and it posts no monitors. The Rust port models this
+//! with `CompleteDeferOutput` (which runs the full monitor epilogue this cycle —
+//! posting VAL at delay-start — while holding PACT and deferring only the
+//! OUT/OEVT/FLNK tail via `ReprocessAfter`) plus an `output_wait` continuation
+//! branch that emits the output exactly once.
 //!
-//! This test pins the framework-observable effect: on the delaying cycle the
-//! OUT target keeps its seed and the OEVT event does NOT fire; on the
-//! continuation the target is driven to OVAL and the event posts once. The
-//! continuation is driven directly (`process_record_continuation`, as the
-//! scalcout ODLY test does) so the assertion is deterministic and does not
-//! race the real timer (ODLY=100s makes the timer unfireable here).
+//! These tests pin the framework-observable effects: on the delaying cycle the
+//! OUT target keeps its seed and the OEVT event does NOT fire (output deferred),
+//! while VAL IS posted to monitors (value side at delay-start, not delay-end);
+//! on the continuation the target is driven to OVAL and the event posts once.
+//! The continuation is driven directly (`process_record_continuation`, as the
+//! scalcout ODLY test does) so the assertion is deterministic and does not race
+//! the real timer (ODLY=100s makes the timer unfireable here).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -141,12 +145,13 @@ async fn swait_odly_defers_out_write_and_oevt_to_continuation() {
     );
 }
 
-/// PACT is held during the ODLY delay (bare `AsyncPending`, not
-/// `AsyncPendingNotify`): a foreign `dbProcess` inside the delay window BAILS at
-/// the PACT entry guard (C `swaitRecord.c:716` "THE RECORD REMAINS ACTIVE WHILE
-/// WAITING ON THE WATCHDOG") instead of re-entering the `output_wait`
-/// continuation and firing the deferred OUT / OEVT early. Without the PACT hold
-/// the foreign process drives the target to OVAL before the delay elapses.
+/// PACT is held during the ODLY delay (`CompleteDeferOutput` holds PACT via its
+/// `ReprocessAfter` continuation): a foreign `dbProcess` inside the delay window
+/// BAILS at the PACT entry guard (C `swaitRecord.c:716` "THE RECORD REMAINS
+/// ACTIVE WHILE WAITING ON THE WATCHDOG") instead of re-entering the
+/// `output_wait` continuation and firing the deferred OUT / OEVT early. Without
+/// the PACT hold the foreign process drives the target to OVAL before the delay
+/// elapses.
 #[tokio::test]
 async fn swait_odly_holds_pact_foreign_process_does_not_fire_early() {
     let db = PvDatabase::new();
@@ -222,6 +227,155 @@ async fn swait_odly_holds_pact_foreign_process_does_not_fire_early() {
         count.load(Ordering::SeqCst),
         1,
         "continuation posts OEVT exactly once"
+    );
+}
+
+/// The value side posts at delay-START, not delay-end. C `swaitRecord.c::process`
+/// runs `monitor()` (line 475) on the delaying cycle — `schedOutput` armed the
+/// watchdog with `async=TRUE` but `process` falls through to `monitor()` before
+/// the `if(!async)` forward-link tail — so a CA/PVA monitor client sees VAL the
+/// moment the record processes, with only the OUT write/OEVT/FLNK delayed by
+/// ODLY. (Unlike calcout/scalcout/acalcout, whose C `process` returns BEFORE
+/// `monitor()` and so post VAL at delay-end.) This is the regression guard for
+/// the gross divergence the bare-`AsyncPending` port had: VAL arriving ODLY
+/// seconds late.
+#[tokio::test]
+async fn swait_odly_posts_val_at_delay_start_not_delay_end() {
+    use epics_base_rs::server::database::db_access::DbSubscription;
+
+    let db = PvDatabase::new();
+    let count = Arc::new(AtomicUsize::new(0));
+    add_event_sibling(&db, "W4_SIB", "17", count.clone()).await;
+    db.add_record("W4_TGT", Box::new(AiRecord::new(0.0)))
+        .await
+        .unwrap();
+
+    // swait: CALC="A", A=42 → VAL=42; OOPT=Every → output due; ODLY=100; OUT→tgt.
+    let mut w = SwaitRecord::default();
+    w.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    w.put_field("A", EpicsValue::Double(42.0)).unwrap();
+    w.put_field("OOPT", EpicsValue::Short(0)).unwrap();
+    w.put_field("ODLY", EpicsValue::Float(100.0)).unwrap();
+    w.put_field("OEVT", EpicsValue::UShort(17)).unwrap();
+    db.add_record("W4_ODLY", Box::new(w)).await.unwrap();
+    {
+        let r = db.get_record("W4_ODLY").await.unwrap();
+        let mut inst = r.write().await;
+        inst.put_common_field("OUT", EpicsValue::String("W4_TGT".into()))
+            .unwrap();
+    }
+
+    // Subscribe to VAL (DBE_VALUE|DBE_LOG) BEFORE processing.
+    let mut sub = DbSubscription::subscribe(&db, "W4_ODLY.VAL")
+        .await
+        .expect("VAL subscription");
+
+    // Delaying cycle: ODLY>0 defers the OUTPUT, but the value side posts NOW.
+    let mut v1 = HashSet::new();
+    db.process_record_with_links("W4_ODLY", &mut v1, 0)
+        .await
+        .unwrap();
+
+    // Decisive: VAL=42 must reach the monitor on the delaying cycle. The buggy
+    // bare-`AsyncPending` port posted nothing here (VAL only at the continuation),
+    // so this recv would time out.
+    let posted = tokio::time::timeout(std::time::Duration::from_millis(500), sub.recv_f64())
+        .await
+        .expect("VAL must be posted at delay-START (not deferred to the watchdog)");
+    assert_eq!(
+        posted,
+        Some(42.0),
+        "swait posts VAL at the START of the ODLY delay (C monitor() line 475), \
+         not at delay-end"
+    );
+    // The OUTPUT is still deferred: target keeps its seed on the delaying cycle.
+    assert_eq!(
+        db.get_pv("W4_TGT").await.unwrap().to_f64(),
+        Some(0.0),
+        "the OUT write stays deferred even though VAL posted at delay-start"
+    );
+
+    // Continuation: drives OUT, but must NOT re-post VAL (C execOutput posts no
+    // monitors; the value was already posted at delay-start, so VAL is unchanged
+    // and the framework's change-detection skips it).
+    let mut v2 = HashSet::new();
+    db.process_record_continuation("W4_ODLY", &mut v2, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_pv("W4_TGT").await.unwrap().to_f64(),
+        Some(42.0),
+        "continuation drives OUT to OVAL=42 after the delay"
+    );
+    let re_post = tokio::time::timeout(std::time::Duration::from_millis(150), sub.recv_f64()).await;
+    assert!(
+        re_post.is_err(),
+        "continuation must NOT re-post VAL — it was already posted at delay-start \
+         (C execOutput posts no monitors); got {re_post:?}"
+    );
+}
+
+/// The forward link (FLNK) is deferred to the continuation too. C swait runs
+/// `recGblFwdLink` inside `execOutput` (delay-end), not in `process` on the
+/// delaying cycle — when the watchdog is armed (`async=TRUE`) the
+/// `if(!async){recGblFwdLink; pact=FALSE;}` tail is skipped. The Rust
+/// `CompleteDeferOutput` runs the monitor epilogue at delay-start but skips the
+/// forward-link tail, so a passive FLNK target processes only after the delay,
+/// alongside the OUT write and OEVT. (Regression guard for the
+/// `run_forward_link_tail` skip in the defer branch: without it the new
+/// Complete-epilogue path would fire FLNK at delay-start.)
+#[tokio::test]
+async fn swait_odly_defers_forward_link_to_continuation() {
+    let db = PvDatabase::new();
+    let fcount = Arc::new(AtomicUsize::new(0));
+    // Passive FLNK target counting each process (no SCAN=Event — FLNK processes
+    // it directly).
+    db.add_record(
+        "W5_FLNK",
+        Box::new(ProcCounter {
+            count: fcount.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    // swait: CALC="A", A=42 → output due; ODLY=100; FLNK→W5_FLNK.
+    let mut w = SwaitRecord::default();
+    w.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    w.put_field("A", EpicsValue::Double(42.0)).unwrap();
+    w.put_field("OOPT", EpicsValue::Short(0)).unwrap();
+    w.put_field("ODLY", EpicsValue::Float(100.0)).unwrap();
+    db.add_record("W5_ODLY", Box::new(w)).await.unwrap();
+    {
+        let r = db.get_record("W5_ODLY").await.unwrap();
+        let mut inst = r.write().await;
+        inst.put_common_field("FLNK", EpicsValue::String("W5_FLNK".into()))
+            .unwrap();
+    }
+
+    // Delaying cycle: FLNK must NOT fire (C defers recGblFwdLink to execOutput).
+    let mut v1 = HashSet::new();
+    db.process_record_with_links("W5_ODLY", &mut v1, 0)
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    assert_eq!(
+        fcount.load(Ordering::SeqCst),
+        0,
+        "FLNK deferred on the delaying cycle (C runs recGblFwdLink in execOutput, \
+         at delay-end)"
+    );
+
+    // Continuation: FLNK fires exactly once, at delay-end.
+    let mut v2 = HashSet::new();
+    db.process_record_continuation("W5_ODLY", &mut v2, 0)
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    assert_eq!(
+        fcount.load(Ordering::SeqCst),
+        1,
+        "FLNK fires exactly once on the continuation (delay-end)"
     );
 }
 

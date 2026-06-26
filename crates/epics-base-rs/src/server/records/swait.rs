@@ -449,33 +449,35 @@ impl Record for SwaitRecord {
         }
 
         // ODLY (C `swaitRecord.c::schedOutput`, lines 719-729): when output
-        // should fire and ODLY > 0, defer the OUT write + forward link + OEVT
-        // post by ODLY seconds via the watchdog, holding the record active
-        // (C keeps PACT=1). The delaying cycle captures the output decision,
-        // suppresses this cycle's output (`cached_should_output = false`, so the
-        // framework writes neither OUT nor OEVT now), and re-processes after the
-        // delay; the `output_wait` branch above then emits exactly once. swait
-        // has no DLYA field (C's wait state is the internal `cbStruct.outputWait`
-        // flag), so nothing is posted on the delaying cycle.
+        // should fire and ODLY > 0, defer ONLY the OUT write + OEVT + forward
+        // link by ODLY seconds via the watchdog, holding the record active
+        // (C keeps PACT=1). The value side (VAL + changed inputs + alarm fields)
+        // is NOT deferred: C `process` calls `monitor()` (line 475) on THIS
+        // (delay-start) cycle, before returning async — only `execOutput`
+        // (delay-end) is delayed, and it posts no monitors. The delaying cycle
+        // captures the output decision and suppresses this cycle's OUT/OEVT
+        // (`cached_should_output = false`), then re-processes after the delay;
+        // the `output_wait` branch above emits the output exactly once.
         if self.cached_should_output && self.odly > 0.0 {
             self.pending_output = self.cached_should_output;
             self.output_wait = true;
             self.cached_should_output = false;
             let delay = std::time::Duration::from_secs_f64(self.odly as f64);
-            // Bare `AsyncPending`, NOT `AsyncPendingNotify(vec![])`: swait posts
-            // no DLYA on the delaying cycle (it has no DLYA database field — C
-            // tracks the wait with the internal `cbStruct.outputWait`), so there
-            // is nothing to notify, and the bare branch holds PACT
-            // (`processing = true`) for the watchdog window. That matches C
-            // `swaitRecord.c:716` "THE RECORD REMAINS ACTIVE WHILE WAITING ON
-            // THE WATCHDOG": a concurrent `dbProcess` during the delay then
-            // bails at the PACT entry guard (as C does) instead of re-entering
-            // the `output_wait` branch and firing the deferred output early.
-            // (scalcout/acalcout must use `AsyncPendingNotify` to pulse DLYA, so
-            // they cannot hold PACT this way; that shared timer-ODLY gap is
-            // framework-level, not swait-local.)
+            // `CompleteDeferOutput`, NOT bare `AsyncPending`: swait posts the
+            // value side at the START of the delay (C `monitor()` at line 475,
+            // reached because `schedOutput` set `async=TRUE` but `process` falls
+            // through to `monitor()` before the `if(!async)` forward-link tail).
+            // The framework therefore runs its full monitor epilogue this cycle
+            // (VAL with MDEL/ADEL deadband + alarm mask, changed inputs) and
+            // defers only the OUT/OEVT/FLNK tail, holding PACT for the watchdog
+            // window via the `ReprocessAfter` continuation that releases it —
+            // matching C `swaitRecord.c:716` "THE RECORD REMAINS ACTIVE WHILE
+            // WAITING ON THE WATCHDOG". A bare `AsyncPending` would have deferred
+            // the value side to delay-end too (the calcout/scalcout/acalcout
+            // shape, whose C `process` returns BEFORE `monitor()`); swait's C
+            // does not, so VAL must post now.
             return Ok(ProcessOutcome {
-                result: RecordProcessResult::AsyncPending,
+                result: RecordProcessResult::CompleteDeferOutput,
                 actions: vec![ProcessAction::ReprocessAfter(delay)],
                 device_did_compute: false,
             });

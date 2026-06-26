@@ -1004,42 +1004,45 @@ impl Record for WaveformRecord {
                     (EpicsValue::String(s), 1 | 2) => EpicsValue::CharArray(s.as_bytes().to_vec()),
                     _ => value,
                 };
-                // Update NORD based on actual data length, but keep array
-                // at NELM size to preserve CA channel element count.
+                // Update NORD based on actual data length, capped at NELM
+                // (a VAL buffer holds at most NELM elements; C dbPutField and
+                // dbGetLink both bound the request to NELM, so NORD <= NELM by
+                // construction). The buffer itself is resized to NELM to
+                // preserve the CA channel element count.
                 let nelm = self.nelm.max(0) as usize;
                 match value {
                     EpicsValue::CharArray(mut arr) => {
-                        self.nord = arr.len() as i32;
+                        self.nord = arr.len().min(nelm) as i32;
                         arr.resize(nelm, 0);
                         self.val = EpicsValue::CharArray(arr);
                     }
                     EpicsValue::ShortArray(mut arr) => {
-                        self.nord = arr.len() as i32;
+                        self.nord = arr.len().min(nelm) as i32;
                         arr.resize(nelm, 0);
                         self.val = EpicsValue::ShortArray(arr);
                     }
                     EpicsValue::LongArray(mut arr) => {
-                        self.nord = arr.len() as i32;
+                        self.nord = arr.len().min(nelm) as i32;
                         arr.resize(nelm, 0);
                         self.val = EpicsValue::LongArray(arr);
                     }
                     EpicsValue::Int64Array(mut arr) => {
-                        self.nord = arr.len() as i32;
+                        self.nord = arr.len().min(nelm) as i32;
                         arr.resize(nelm, 0);
                         self.val = EpicsValue::Int64Array(arr);
                     }
                     EpicsValue::UInt64Array(mut arr) => {
-                        self.nord = arr.len() as i32;
+                        self.nord = arr.len().min(nelm) as i32;
                         arr.resize(nelm, 0);
                         self.val = EpicsValue::UInt64Array(arr);
                     }
                     EpicsValue::FloatArray(mut arr) => {
-                        self.nord = arr.len() as i32;
+                        self.nord = arr.len().min(nelm) as i32;
                         arr.resize(nelm, 0.0);
                         self.val = EpicsValue::FloatArray(arr);
                     }
                     EpicsValue::DoubleArray(mut arr) => {
-                        self.nord = arr.len() as i32;
+                        self.nord = arr.len().min(nelm) as i32;
                         arr.resize(nelm, 0.0);
                         self.val = EpicsValue::DoubleArray(arr);
                     }
@@ -1563,6 +1566,40 @@ mod array_kind_tests {
         aao.put_field("VAL", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
             .unwrap();
         assert_eq!(aao.nord, 3, "NORD must equal the pulled element count");
+    }
+
+    /// NORD is capped at NELM by construction at every VAL array write
+    /// (C dbPutField / dbGetLink bound the request to NELM). Boundary
+    /// cases: source < NELM (NORD = source), == NELM, and > NELM
+    /// (NORD = NELM, the previously over-reported case). Exercised here
+    /// on a plain waveform — the cap lives in the shared put_field VAL
+    /// arm, so it covers aao DOL pulls and every other internal delivery.
+    #[test]
+    fn put_val_caps_nord_at_nelm() {
+        let mut wf = WaveformRecord::with_kind(ArrayKind::Waveform);
+        wf.nelm = 4;
+
+        // source < NELM
+        wf.put_field("VAL", EpicsValue::LongArray(vec![1, 2]))
+            .unwrap();
+        assert_eq!(wf.nord, 2, "source < NELM: NORD == source length");
+
+        // source == NELM
+        wf.put_field("VAL", EpicsValue::LongArray(vec![1, 2, 3, 4]))
+            .unwrap();
+        assert_eq!(wf.nord, 4, "source == NELM: NORD == NELM");
+
+        // source > NELM: NORD must clamp to NELM, not the source length
+        wf.put_field("VAL", EpicsValue::LongArray(vec![1, 2, 3, 4, 5, 6, 7]))
+            .unwrap();
+        assert_eq!(wf.nord, 4, "source > NELM: NORD must clamp to NELM");
+        // and the served VAL holds exactly NORD (== NELM) valid elements
+        let val = wf.get_field("VAL").unwrap();
+        if let EpicsValue::LongArray(v) = val {
+            assert_eq!(v, vec![1, 2, 3, 4], "VAL serves exactly NELM elements");
+        } else {
+            panic!("VAL should be LongArray, got {val:?}");
+        }
     }
 
     /// PR #a02c310 follow-up: subArray slices source[INDX..INDX+NELM]

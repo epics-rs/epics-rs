@@ -2110,6 +2110,24 @@ impl RecordInstance {
             // _guard drops here, clearing the processing flag
             return Ok((ProcessSnapshot { changed_fields }, Vec::new()));
         }
+        if process_result == RecordProcessResult::CompleteNoEmit {
+            // The record accumulated this cycle without emitting (compress
+            // `status == 1`). C `compressRecord.c:365` runs the completion
+            // epilogue (udf clear, timestamp, monitor, FLNK) only on an emit
+            // cycle (`if (status != 1)`), so a non-emitting cycle must publish
+            // nothing — skip the epilogue and return an empty snapshot, exactly
+            // as the production engine path does in `processing.rs`. This keeps
+            // the emit-gate uniform across both process-dispatch paths so the
+            // invariant holds by construction, not by "process_local never
+            // produces it". CompleteNoEmit is synchronous (PACT already
+            // cleared); the `_guard` drops here, clearing the processing flag.
+            return Ok((
+                ProcessSnapshot {
+                    changed_fields: Vec::new(),
+                },
+                Vec::new(),
+            ));
+        }
 
         // UDF update before alarm evaluation — C parity (see
         // `processing.rs`). A NaN / undefined value keeps UDF true so

@@ -775,6 +775,39 @@ mod pbuf_tests {
         assert_eq!(rec.alg, 0, "ALG has no C initial -> menu index 0");
     }
 
+    /// `process_local` (the test-only record-body dispatch path) must honor the
+    /// same emit-gate as the production engine path: a compress that ingested
+    /// but did not emit (`CompleteNoEmit`, C `compressRecord.c:365` the
+    /// `if (status != 1)` epilogue gate) publishes nothing. Construct the
+    /// non-emit state by ingesting one sample of a 4-wide rolling Average, then
+    /// dispatch via `process_local`. Without the `CompleteNoEmit` early-return
+    /// in `process_local` this falls through to the publication epilogue and
+    /// posts the buffer — the regression this pins.
+    #[test]
+    fn process_local_suppresses_publication_on_non_emit_cycle() {
+        use crate::server::record::RecordInstance;
+
+        // Rolling Average (ALG 3), N=4: one sample ingested, no emit yet.
+        let mut cmp = CompressRecord::new(1, 3);
+        cmp.n = 4;
+        cmp.push_value(1.0);
+        assert!(
+            cmp.cycle_ingested && !cmp.cycle_emitted,
+            "1/4 samples → accumulating (CompleteNoEmit), not emitting"
+        );
+
+        let mut inst = RecordInstance::new("CMP".into(), cmp);
+        let (snap, actions) = inst.process_local().unwrap();
+
+        assert!(
+            snap.changed_fields.is_empty(),
+            "a non-emit (CompleteNoEmit) cycle must publish no field changes via \
+             process_local — got {:?}",
+            snap.changed_fields
+        );
+        assert!(actions.is_empty(), "compress is soft → no process actions");
+    }
+
     /// C `get_array_info` (compressRecord.c:409-431) returns
     /// `*no_elements = nuse` regardless of PBUF — only the valid
     /// elements are exposed on the wire. PBUF is a processing-time

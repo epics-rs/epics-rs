@@ -2020,6 +2020,33 @@ impl PvDatabase {
                         ));
                     }
                 }
+                // C parity (calcoutRecord.c:277-282, sCalcoutRecord.c:400-404):
+                // a record that defers its output by ODLY via a timer
+                // (`callbackRequestProcessCallbackDelayed`) keeps `pact=TRUE`
+                // across the whole delay — it `return 0`s with pact still set,
+                // so the record stays ACTIVE and a concurrent `dbProcess`
+                // bails; the delayed callback re-enters (`pact==TRUE`, `dlya`
+                // branch) and clears pact. Mirror that: when this notify
+                // schedules a `ReprocessAfter` (the continuation that clears
+                // PACT at the `is_continuation` arm below), hold PACT now.
+                //
+                // The gate is the `ReprocessAfter` itself, not a flag: holding
+                // PACT is sound ONLY because a continuation is scheduled to
+                // release it. A notify WITHOUT a `ReprocessAfter` (motor's
+                // DMOV-pulse pass, which completes via its device callback and
+                // returns Complete on later passes — no timer continuation)
+                // gets no PACT-clearing re-entry, so it must NOT hold PACT or
+                // it would stick forever (spurious SCAN_ALARM). Tying the hold
+                // to the presence of its own release keeps the invariant by
+                // construction and leaves motor's path untouched.
+                let holds_pact_until_continuation = process_actions
+                    .iter()
+                    .any(|a| matches!(a, crate::server::record::ProcessAction::ReprocessAfter(_)));
+                if holds_pact_until_continuation {
+                    instance
+                        .processing
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
                 let snapshot = crate::server::record::ProcessSnapshot { changed_fields };
                 let rec_name = instance.name.clone();
                 let rec_clone = rec.clone();

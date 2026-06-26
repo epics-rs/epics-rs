@@ -197,6 +197,13 @@ pub fn pp_fields_for(record_type: &str) -> Option<&'static [&'static str]> {
             "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P",
         ],
         "sseq" => &["VAL"],
+        // scaler module scalerRecord.dbd: only CNT and CONT are pp(TRUE).
+        // Every preset/gate/config field (PR1..PR64, G1..G64, TP, RATE, …)
+        // is special(SPC_MOD) and fully applied by scaler `special()` — a
+        // put to one must NOT process. Without this a preset put ran
+        // process(), whose autocount block could re-arm the counter / send
+        // device commands. CNT (start/stop) and CONT (rescan) still process.
+        "scaler" => &["CNT", "CONT"],
         // std module epidRecord.dbd: only VAL is pp(TRUE); every other
         // field is plain or special(SPC_NOMOD) with no pp. Without this a
         // put to a gain (KP/KI/KD), a limit, or a link (STPL/INP/OUTL/TRIG)

@@ -1,5 +1,7 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
+use crate::server::record::{
+    FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 use crate::calc::StringInputs;
@@ -48,6 +50,18 @@ pub struct ScalcoutRecord {
     /// unconditionally, so this caches the OOPT decision and gates
     /// the OUT-link write on it.
     cached_should_output: bool,
+    /// Output delay in seconds — C `sCalcoutRecord.c` `prec->odly`. When
+    /// an output should fire and `odly > 0`, the OUT-link write is deferred
+    /// by `odly` seconds (C `process` lines 400-408).
+    pub odly: f64,
+    /// Delay-active flag — C `prec->dlya`. Set to 1 on the delaying cycle
+    /// (posted DBE_VALUE) and cleared to 0 on the delayed continuation
+    /// (C `process` lines 401/425). Distinguishes the continuation re-entry.
+    dlya: i16,
+    /// Snapshot of the delaying cycle's output decision, restored into
+    /// `cached_should_output` on the continuation so the deferred OUT write
+    /// honours the original cycle's OOPT result. Mirrors calcout.rs.
+    pending_output: bool,
 }
 
 impl Default for ScalcoutRecord {
@@ -75,6 +89,9 @@ impl Default for ScalcoutRecord {
             prev_sval: PvString::new(),
             calc_alarm: false,
             cached_should_output: false,
+            odly: 0.0,
+            dlya: 0,
+            pending_output: false,
         }
     }
 }
@@ -218,6 +235,16 @@ static SCALCOUT_FIELDS: &[FieldDesc] = &[
         name: "PREC",
         dbf_type: DbFieldType::Short,
         read_only: false,
+    },
+    FieldDesc {
+        name: "ODLY",
+        dbf_type: DbFieldType::Double,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "DLYA",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
     },
     // Input links
     FieldDesc {
@@ -449,6 +476,19 @@ impl Record for ScalcoutRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
+        // ODLY continuation: this is the delayed re-process scheduled by a
+        // previous cycle (C `sCalcoutRecord.c::process` `pact==TRUE` + `dlya`
+        // branch, lines 421-432). Do NOT re-evaluate CALC / OCAL / should_output
+        // — C clears DLYA and runs `execOutput` directly. Honour the output
+        // decision the original cycle captured, clear DLYA, and let the
+        // framework write the OUT link. Mirrors calcout.rs.
+        if self.dlya == 1 {
+            self.dlya = 0;
+            self.cached_should_output = self.pending_output;
+            self.pending_output = false;
+            return Ok(ProcessOutcome::complete());
+        }
+
         self.prev_val = self.val;
         self.prev_sval = self.sval.clone();
 
@@ -496,7 +536,6 @@ impl Record for ScalcoutRecord {
 
         // Determine output
         let do_output = self.should_output();
-        self.cached_should_output = do_output;
         if do_output {
             if self.dopt == 1 {
                 // Use OCAL. A broken OCAL (compile OR eval failure)
@@ -534,6 +573,32 @@ impl Record for ScalcoutRecord {
                 self.osv = self.sval.clone();
             }
         }
+
+        // ODLY (C `sCalcoutRecord.c::process` lines 399-408): when an output
+        // should fire and ODLY > 0, defer the OUT-link write by ODLY seconds.
+        // The delaying cycle sets DLYA=1, posts it (DBE_VALUE), schedules the
+        // delayed callback, and `return 0` BEFORE `monitor()`/`recGblFwdLink()`
+        // — so VAL/OVAL monitors and the forward link fire once on the delayed
+        // (continuation) cycle, not now. Model this as an async-pending-notify
+        // pass: post only DLYA now, suppress this cycle's output, and re-process
+        // after the delay; the `dlya == 1` branch at the top then emits.
+        // Mirrors calcout.rs.
+        if do_output && self.odly > 0.0 {
+            self.dlya = 1;
+            self.pending_output = true;
+            self.cached_should_output = false;
+            let delay = std::time::Duration::from_secs_f64(self.odly);
+            return Ok(ProcessOutcome {
+                result: RecordProcessResult::AsyncPendingNotify(vec![(
+                    "DLYA".to_string(),
+                    EpicsValue::Short(1),
+                )]),
+                actions: vec![ProcessAction::ReprocessAfter(delay)],
+                device_did_compute: false,
+            });
+        }
+
+        self.cached_should_output = do_output;
         Ok(ProcessOutcome::complete())
     }
 
@@ -552,6 +617,8 @@ impl Record for ScalcoutRecord {
             "OUT" => Some(EpicsValue::String(self.out.clone().into())),
             "WAIT" => Some(EpicsValue::Short(self.wait)),
             "PREC" => Some(EpicsValue::Short(self.prec)),
+            "ODLY" => Some(EpicsValue::Double(self.odly)),
+            "DLYA" => Some(EpicsValue::Short(self.dlya)),
             "CALC_ALARM" => Some(EpicsValue::Char(if self.calc_alarm { 1 } else { 0 })),
             _ => {
                 if let Some(idx) = Self::var_index(name) {
@@ -658,6 +725,13 @@ impl Record for ScalcoutRecord {
                 }
                 _ => Err(CaError::TypeMismatch("PREC".into())),
             },
+            "ODLY" => {
+                self.odly = value
+                    .to_f64()
+                    .ok_or_else(|| CaError::TypeMismatch("ODLY".into()))?;
+                Ok(())
+            }
+            "DLYA" => Err(CaError::ReadOnlyField("DLYA".into())),
             _ => {
                 if let Some(idx) = Self::var_index(name) {
                     self.num_vals[idx] = value

@@ -117,6 +117,77 @@ fn m1_calcout_no_odly_outputs_synchronously() {
     );
 }
 
+// ─── M1b: scalcout ODLY / DLYA output delay (sCalcoutRecord.c:399-432) ─
+
+#[test]
+fn m1b_scalcout_odly_defers_output_via_reprocess() {
+    let mut r = ScalcoutRecord::default();
+    r.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    r.put_field("A", EpicsValue::Double(42.0)).unwrap();
+    r.put_field("OUT", EpicsValue::String("sink.VAL".into()))
+        .unwrap();
+    r.put_field("ODLY", EpicsValue::Double(0.05)).unwrap();
+    // OOPT=0 (Every Time): output should fire.
+    let outcome = r.process().unwrap();
+    // ODLY > 0: this cycle defers — DLYA set, OUT write suppressed,
+    // ReprocessAfter scheduled. scalcout's should_output() is a recompute
+    // helper, so the OUT-write gate is observed through multi_output_links()
+    // (which reads cached_should_output).
+    assert_eq!(
+        r.get_field("DLYA"),
+        Some(EpicsValue::Short(1)),
+        "DLYA set while ODLY delay pending"
+    );
+    assert!(
+        r.multi_output_links().is_empty(),
+        "ODLY cycle suppresses the OUT-link write"
+    );
+    assert!(
+        outcome
+            .actions
+            .iter()
+            .any(|a| matches!(a, ProcessAction::ReprocessAfter(_))),
+        "ODLY cycle schedules a delayed re-process"
+    );
+    // The delayed re-process: process() runs again, hits the DLYA
+    // continuation branch and emits the captured output.
+    r.process().unwrap();
+    assert_eq!(
+        r.get_field("DLYA"),
+        Some(EpicsValue::Short(0)),
+        "DLYA cleared after delayed re-process"
+    );
+    assert_eq!(
+        r.multi_output_links(),
+        &[("OUT", "OVAL")],
+        "delayed re-process drives the deferred OUT write"
+    );
+}
+
+#[test]
+fn m1b_scalcout_no_odly_outputs_synchronously() {
+    let mut r = ScalcoutRecord::default();
+    r.put_field("CALC", EpicsValue::String("A".into())).unwrap();
+    r.put_field("A", EpicsValue::Double(7.0)).unwrap();
+    r.put_field("OUT", EpicsValue::String("sink.VAL".into()))
+        .unwrap();
+    // ODLY default 0: output is synchronous, no delay.
+    let outcome = r.process().unwrap();
+    assert_eq!(r.get_field("DLYA"), Some(EpicsValue::Short(0)));
+    assert_eq!(
+        r.multi_output_links(),
+        &[("OUT", "OVAL")],
+        "ODLY=0: OUT write fires this cycle"
+    );
+    assert!(
+        !outcome
+            .actions
+            .iter()
+            .any(|a| matches!(a, ProcessAction::ReprocessAfter(_))),
+        "ODLY=0: no delayed re-process scheduled"
+    );
+}
+
 // ─── M3: ao IVOA=2 re-converts RVAL from IVOV ────────────────────────
 
 #[test]

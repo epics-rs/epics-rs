@@ -25,22 +25,30 @@
 //! - motor: `epics-modules/motor/motorApp/MotorSrc/motorRecord.dbd`
 //!   (plus motor-rs extension fields documented at the entry)
 //!
-//! A record type that is **not** listed here returns `None`: the put gate
-//! then falls back to the legacy "process on every put" behavior. Every
-//! instantiable record type — base records plus the module-crate records
-//! (scaler, std epid/throttle/timestamp, optics table, asyn) — is now
-//! modeled, so `None` is reached only by future/test record types that have
-//! not yet declared their pp set. `asynRecord` has two impls across crates
+//! The table is **total and fail-safe**: an unlisted record type returns the
+//! empty slice (`&[]`) and emits a one-time `tracing::warn!`, so a put to its
+//! fields never auto-processes (only `PROC` does). This makes spurious
+//! processing **opt-in** — a record type must declare its `pp(TRUE)` set to
+//! get any field-triggered processing — instead of the former fail-dangerous
+//! default where an unmodeled type processed on *every* put (the structural
+//! root of the process-on-every-put defect family: throttle/epid/timestamp/
+//! scaler/table/asyn). Every instantiable record type is modeled (base records
+//! plus the module-crate records scaler, std epid/throttle/timestamp, optics
+//! table, asyn), and `create_record` rejects unknown types, so the warning
+//! path is reachable only by a *future* record type registered without an
+//! entry — where the loud warning surfaces the omission in testing rather than
+//! as silent under-processing. `asynRecord` has two impls across crates
 //! (`epics-base-rs` stub + `asyn-rs` functional) but both report the type
 //! string `"asyn"`, so the single `"asyn"` entry covers both.
 
-/// `pp(TRUE)` field names for `record_type`, sourced from the upstream DBD,
-/// or `None` when the type has not been modeled (legacy always-process).
+/// `pp(TRUE)` field names for `record_type`, transcribed verbatim from the
+/// upstream DBD. **Total**: an unmodeled type returns `&[]` (and warns once),
+/// so the put gate processes it on `PROC` only — never on a field put.
 ///
-/// The empty slice (`Some(&[])`, e.g. `event`, `histogram`) is distinct
-/// from `None`: it means "modeled, no field forces processing" — a put to
-/// any field of such a record never drives processing (only `PROC` does).
-pub fn pp_fields_for(record_type: &str) -> Option<&'static [&'static str]> {
+/// A modeled type with no processing field (`event`, `histogram`) also
+/// returns `&[]`, but silently: it is a deliberate "PROC-only" entry in the
+/// match, not the warned fallthrough.
+pub fn pp_fields_for(record_type: &str) -> &'static [&'static str] {
     // mbbi and mbbo share the identical 50-name pp(TRUE) set.
     const MBB_PP: &[&str] = &[
         "VAL", "ZRVL", "ONVL", "TWVL", "THVL", "FRVL", "FVVL", "SXVL", "SVVL", "EIVL", "NIVL",
@@ -50,7 +58,7 @@ pub fn pp_fields_for(record_type: &str) -> Option<&'static [&'static str]> {
         "ELSV", "TVSV", "TTSV", "FTSV", "FFSV", "UNSV", "COSV", "RVAL",
     ];
 
-    Some(match record_type {
+    match record_type {
         "ai" => &[
             "VAL", "LINR", "EGUF", "EGUL", "AOFF", "ASLO", "HIHI", "LOLO", "HIGH", "LOW", "HHSV",
             "LLSV", "HSV", "LSV", "ESLO", "EOFF", "ROFF", "RVAL",
@@ -247,6 +255,75 @@ pub fn pp_fields_for(record_type: &str) -> Option<&'static [&'static str]> {
         "asyn" => &[
             "AOUT", "BOUT", "I32OUT", "UI32OUT", "F64OUT", "UCMD", "ACMD",
         ],
-        _ => return None,
-    })
+        // Fail-safe fallthrough: an unmodeled type processes on PROC only.
+        // Unreachable for any instantiable record (create_record rejects
+        // unknown types and every built/registered type is listed above), so
+        // this fires only for a future record type registered without an
+        // entry — the one-time warning surfaces that omission loudly.
+        other => {
+            warn_unknown_record_type_once(other);
+            &[]
+        }
+    }
+}
+
+/// Emit a one-time `tracing::warn!` the first time an unmodeled `record_type`
+/// reaches [`pp_fields_for`]'s fallthrough. Deduplicated per type string so a
+/// hot put path does not spam the log.
+fn warn_unknown_record_type_once(record_type: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let warned = WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+    let is_new = warned
+        .lock()
+        .map(|mut set| set.insert(record_type.to_string()))
+        .unwrap_or(true);
+    if is_new {
+        tracing::warn!(
+            record_type,
+            "record type has no pp_fields_for entry; its field puts will never \
+             auto-process (PROC-only). Add its pp(TRUE) set to pp_fields_for."
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pp_fields_for;
+
+    /// The flip's core contract: the table is total and fail-safe. An
+    /// unmodeled type returns the empty slice (was `None` → process-on-every-
+    /// put), so the put gate processes it on `PROC` only. Against the former
+    /// `Option` signature this would not even compile.
+    #[test]
+    fn unmodeled_type_returns_empty_not_processing() {
+        assert!(
+            pp_fields_for("__definitely_not_a_record_type__").is_empty(),
+            "an unmodeled record type must return &[] (fail-safe, PROC-only)"
+        );
+    }
+
+    /// A modeled type that declares pp fields is non-empty, so its pp puts
+    /// still process — the flip narrows nothing for modeled types.
+    #[test]
+    fn modeled_type_with_pp_is_non_empty() {
+        assert!(
+            pp_fields_for("ai").contains(&"VAL"),
+            "ai declares VAL pp(TRUE); the modeled set must survive the flip"
+        );
+        assert!(
+            pp_fields_for("asyn").contains(&"AOUT"),
+            "asyn declares AOUT pp(TRUE); a put to AOUT must still process"
+        );
+    }
+
+    /// A modeled type with no processing field (`event`, `histogram`) also
+    /// returns `&[]` — same value as the unmodeled fallthrough, but a
+    /// deliberate match arm (no warning). Distinguishes the two `&[]` sources.
+    #[test]
+    fn modeled_empty_type_returns_empty() {
+        assert!(pp_fields_for("event").is_empty());
+        assert!(pp_fields_for("histogram").is_empty());
+    }
 }

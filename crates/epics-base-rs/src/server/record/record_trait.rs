@@ -399,17 +399,17 @@ pub trait Record: Send + Sync + 'static {
         &[]
     }
 
-    /// Field names declared `pp(TRUE)` in this record type's DBD, or
-    /// `None` if the type's pp-flags have not been modeled.
+    /// Field names declared `pp(TRUE)` in this record type's DBD (empty if
+    /// none, e.g. `event`/`histogram`, or if the type is unmodeled).
     ///
-    /// Drives the `dbPutField` processing gate: C
-    /// `dbAccess.c:1263` re-processes a record on a put only when the put
-    /// field is `PROC` or it is `pp(TRUE)` **and** `SCAN == Passive`. A
-    /// `None` return tells the put path to fall back to the legacy
-    /// "process on every put" behavior, so un-modeled record types keep
-    /// working unchanged. The default consults the central DBD-sourced
-    /// table keyed by [`Record::record_type`]; record types can override.
-    fn process_passive_fields(&self) -> Option<&'static [&'static str]> {
+    /// Drives the `dbPutField` processing gate: C `dbAccess.c:1263`
+    /// re-processes a record on a put only when the put field is `PROC` or it
+    /// is `pp(TRUE)` **and** `SCAN == Passive`. The table is total and
+    /// fail-safe — an unmodeled type returns `&[]` (and warns once), so its
+    /// field puts never auto-process (only `PROC` does). The default consults
+    /// the central DBD-sourced table keyed by [`Record::record_type`]; record
+    /// types can override.
+    fn process_passive_fields(&self) -> &'static [&'static str] {
         super::process_passive::pp_fields_for(self.record_type())
     }
 

@@ -2691,6 +2691,14 @@ impl Record for AsyncRecord {
     fn record_type(&self) -> &'static str {
         "async_test"
     }
+    /// `VAL` is `pp(TRUE)`: a put to VAL processes the record (goes async-
+    /// pending), as it does for any real async record. The put gate is total
+    /// and fail-safe — an unmodeled type processes on PROC only — so this mock
+    /// must declare the pp set its tests rely on rather than free-ride on the
+    /// former process-on-every-put default.
+    fn process_passive_fields(&self) -> &'static [&'static str] {
+        &["VAL"]
+    }
     fn process(&mut self) -> epics_base_rs::error::CaResult<ProcessOutcome> {
         Ok(ProcessOutcome::async_pending())
     }

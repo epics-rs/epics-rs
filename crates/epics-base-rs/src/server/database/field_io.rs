@@ -829,16 +829,17 @@ impl PvDatabase {
                     }
                 }
             } else {
+                // Suppress the immediate value-field post only when this put
+                // will itself drive a reprocess (the cycle re-posts the field).
+                // `process_passive_fields()` is total/fail-safe: a put to a
+                // non-pp field — including any field of an unmodeled type
+                // (`&[]`) — does not reprocess, so it is not suppressed here.
                 let suppress_value_field_post = field == instance.record.primary_field()
-                    && match instance.record.process_passive_fields() {
-                        Some(pp) => pp.iter().any(|f| f.eq_ignore_ascii_case(&field)),
-                        // Un-modeled record types keep the legacy "process on
-                        // every put" behavior (`should_process = true` below),
-                        // so the reprocess cycle posts the value field —
-                        // suppress the immediate post here to avoid a
-                        // duplicate event.
-                        None => true,
-                    };
+                    && instance
+                        .record
+                        .process_passive_fields()
+                        .iter()
+                        .any(|f| f.eq_ignore_ascii_case(&field));
                 if !suppress_value_field_post {
                     instance.notify_field(
                         &field,
@@ -907,18 +908,15 @@ impl PvDatabase {
         // `dbrType < DBR_PUT_ACKT`.) Processing on every put would
         // double-process scanned records and spuriously process puts to
         // non-`pp` fields (extra FLNK / monitors / device writes /
-        // timestamps). A record type whose DBD pp-flags are not modeled
-        // returns `None` and keeps the legacy "process on every put"
-        // behavior so un-modeled types (other crates, tests) are unchanged.
+        // timestamps). `process_passive_fields()` is total and fail-safe: an
+        // unmodeled type returns `&[]` (and warns once), so it processes on
+        // `PROC` only — spurious processing is opt-in (a type must declare its
+        // pp set), never the default.
         let should_process = {
             let instance = rec.read().await;
-            match instance.record.process_passive_fields() {
-                Some(pp) => {
-                    instance.common.scan == crate::server::record::ScanType::Passive
-                        && pp.iter().any(|f| f.eq_ignore_ascii_case(&field))
-                }
-                None => true,
-            }
+            let pp = instance.record.process_passive_fields();
+            instance.common.scan == crate::server::record::ScanType::Passive
+                && pp.iter().any(|f| f.eq_ignore_ascii_case(&field))
         };
 
         if !should_process {

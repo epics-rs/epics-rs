@@ -1296,11 +1296,14 @@ impl Record for AcalcoutRecord {
         // can overwrite VAL (so PVAL holds the failed VAL, matching C).
         self.pval = self.val;
 
-        // --- IVOA on invalid output (C execOutput: runs only when the OOPT
-        //     decision said to output). menuIvoaSet_output_to_IVOV. ---
-        if calc_failed && self.ivoa == 2 && do_output {
-            self.set_output_to_ivov();
-        }
+        // IVOA=Set_output_to_IVOV is owned by the framework IVOA dispatch via
+        // `apply_invalid_output_value` (processing.rs) on the Complete path,
+        // matching C `execOutput` (aCalcoutRecord.c:923-924) which runs the
+        // `oval=ivov` substitution inside execOutput — on the ODLY
+        // *continuation*, never the delaying cycle. An earlier inline
+        // `set_output_to_ivov()` here ran on the delaying cycle, so a direct get
+        // of VAL/OVAL during the ODLY window observed IVOV ODLY-seconds early;
+        // it was also redundant with the hook. The hook is the single owner.
 
         // POVL tracks OVAL (C monitor line 1039-1042) AFTER execOutput; the
         // framework posts OVAL on change, so this is the exposed previous-OVAL
@@ -1316,10 +1319,9 @@ impl Record for AcalcoutRecord {
         // (continuation) cycle, not now. Model this as an async-pending-notify
         // pass: post only DLYA now, suppress this cycle's output via
         // `cached_should_output=false`, and re-process after the delay; the
-        // `dlya == 1` branch at the top then emits. The IVOV substitution above
-        // (part of C `execOutput`) already mutated AVAL/OAV; since the OUT write
-        // and OVAL monitor are PACT-held until the continuation, computing it on
-        // this cycle is not observable. Mirrors `scalcout`/`calcout`.
+        // `dlya == 1` branch at the top then emits. IVOV substitution (C
+        // `execOutput`) likewise runs on the continuation via the framework
+        // hook, not now. Mirrors `scalcout`/`calcout`.
         if do_output && self.odly > 0.0 {
             self.dlya = 1;
             self.pending_output = do_output;
@@ -2181,6 +2183,13 @@ mod tests {
         rec.put_field("IVOA", EpicsValue::Short(2)).unwrap(); // Set to IVOV
         rec.put_field("IVOV", EpicsValue::Double(9.0)).unwrap();
         rec.process().unwrap();
+        // IVOV substitution is owned by the framework IVOA dispatch via
+        // `apply_invalid_output_value` on the Complete path (matching C
+        // `execOutput`, aCalcoutRecord.c:923-924); `process()` no longer
+        // substitutes inline. Drive the hook as the framework does on an
+        // INVALID + IVOA=Set cycle.
+        rec.apply_invalid_output_value(EpicsValue::Double(9.0))
+            .unwrap();
         assert_eq!(rec.val, 9.0);
         assert_eq!(
             rec.get_field("AVAL"),

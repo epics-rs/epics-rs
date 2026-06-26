@@ -152,3 +152,76 @@ async fn acalcout_odly_holds_pact_foreign_process_does_not_fire_early() {
         "continuation clears DLYA"
     );
 }
+
+/// D1: IVOA=Set_output_to_IVOV substitution must run on the ODLY *continuation*
+/// (C `aCalcoutRecord.c` execOutput line 924, reached on the continuation at
+/// line 428), NOT on the delaying cycle. A direct get of VAL during the ODLY
+/// window must still show the calc-fail value, not IVOV.
+#[tokio::test]
+async fn acalcout_odly_ivov_substitutes_on_continuation_not_delaying_cycle() {
+    let db = PvDatabase::new();
+
+    let writes = Arc::new(AtomicUsize::new(0));
+    let last = Arc::new(Mutex::new(None));
+    db.add_record(
+        "PROBE",
+        Box::new(OutProbe {
+            writes: writes.clone(),
+            last: last.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    // acalcout: CALC="1/0" → non-finite → calc_failed → INVALID; IVOA=2
+    // (Set_output_to_IVOV), IVOV=99; OOPT=Every → output due; ODLY=100; OUT→PROBE.
+    let mut a = AcalcoutRecord::default();
+    a.put_field("CALC", EpicsValue::String("1/0".into()))
+        .unwrap();
+    a.put_field("IVOA", EpicsValue::Short(2)).unwrap();
+    a.put_field("IVOV", EpicsValue::Double(99.0)).unwrap();
+    a.put_field("ODLY", EpicsValue::Double(100.0)).unwrap();
+    a.put_field("OUT", EpicsValue::String("PROBE".into()))
+        .unwrap();
+    db.add_record("AC", Box::new(a)).await.unwrap();
+
+    // Delaying cycle: IVOA=Set + OOPT-fires + ODLY>0 still defers (DLYA=1), and
+    // IVOV must NOT be substituted into VAL yet.
+    let mut v1 = HashSet::new();
+    db.process_record_with_links("AC", &mut v1, 0)
+        .await
+        .unwrap();
+    {
+        let rec = db.get_record("AC").await.unwrap();
+        let guard = rec.read().await;
+        assert_eq!(
+            guard.record.get_field("DLYA"),
+            Some(EpicsValue::UShort(1)),
+            "IVOA=Set + OOPT-fires + ODLY>0 must still defer"
+        );
+        assert_ne!(
+            guard.record.get_field("VAL"),
+            Some(EpicsValue::Double(99.0)),
+            "IVOV must NOT be substituted on the ODLY delaying cycle (C substitutes \
+             oval=ivov inside execOutput, on the continuation)"
+        );
+    }
+    assert_eq!(writes.load(Ordering::SeqCst), 0, "OUT deferred");
+
+    // Continuation: the framework IVOA dispatch substitutes IVOV and OUT fires
+    // with it.
+    let mut v3 = HashSet::new();
+    db.process_record_continuation("AC", &mut v3, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        writes.load(Ordering::SeqCst),
+        1,
+        "OUT fires once on the continuation"
+    );
+    assert_eq!(
+        *last.lock().unwrap(),
+        Some(vec![99.0]),
+        "continuation writes IVOV=99 to OUT (substituted on the continuation, not early)"
+    );
+}

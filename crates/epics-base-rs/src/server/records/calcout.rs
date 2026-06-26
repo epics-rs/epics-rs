@@ -956,8 +956,23 @@ impl Record for CalcoutRecord {
 
     // C recCalcout.c IVOA=set_to_IVOV: oval = ivov; the OUT writeback
     // then sends OVAL. VAL is the calc *result* and remains intact.
+    //
+    // The `oval = ivov` substitution lives inside `execOutput`
+    // (calcoutRecord.c:646), which `process` calls ONLY under the
+    // `if (doOutput)` gate (calcoutRecord.c:276). So a non-output INVALID
+    // cycle (OOPT condition not met) must NOT clobber OVAL to IVOV — the
+    // retained OVAL stands and no spurious OVAL monitor is posted.
+    // `cached_should_output` is this cycle's doOutput decision. This is NOT
+    // additionally gated on a calc-failure (unlike acalcout): calcout's hook
+    // runs after the framework's `evaluate_alarms`, so the INVALID severity it
+    // sees already covers calc/limit/MS — exactly as C `execOutput` applies
+    // IVOA on any `nsev >= INVALID_ALARM`.
     fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
-        self.put_field("OVAL", ivov)
+        if self.cached_should_output {
+            self.put_field("OVAL", ivov)
+        } else {
+            Ok(())
+        }
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {

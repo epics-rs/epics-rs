@@ -434,8 +434,18 @@ impl Record for ScalcoutRecord {
 
     // C recScalcout.c IVOA=set_to_IVOV: oval = ivov (and osv = isvv
     // for string output side, but OUT writeback only reads OVAL).
+    //
+    // As in `calcout`, C's `oval = ivov` lives inside the `if (doOutput)`-gated
+    // `execOutput` (sCalcoutRecord.c), so a non-output INVALID cycle must NOT
+    // clobber OVAL to IVOV. Gate on `cached_should_output` (this cycle's
+    // doOutput decision). The calc-failure `val = ivov` substitution earlier in
+    // `process()` is a separate, pre-existing path and is unaffected here.
     fn apply_invalid_output_value(&mut self, ivov: EpicsValue) -> CaResult<()> {
-        self.put_field("OVAL", ivov)
+        if self.cached_should_output {
+            self.put_field("OVAL", ivov)
+        } else {
+            Ok(())
+        }
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {

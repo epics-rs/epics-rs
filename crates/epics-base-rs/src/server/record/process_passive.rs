@@ -197,6 +197,11 @@ pub fn pp_fields_for(record_type: &str) -> Option<&'static [&'static str]> {
             "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P",
         ],
         "sseq" => &["VAL"],
+        // std module throttleRecord.dbd: only VAL is pp(TRUE). OUT, SINP,
+        // DLY and SYNC are special(SPC_MOD) with no pp — a put to them is
+        // handled by throttle `special()` (link re-classify / valueSync /
+        // delay clamp) and must NOT process the record.
+        "throttle" => &["VAL"],
         _ => return None,
     })
 }

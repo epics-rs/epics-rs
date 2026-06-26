@@ -458,26 +458,12 @@ fn test_limit_clipping_low_bound_order() {
     assert_eq!(rec.drvls, 1, "DRVLS Low");
 }
 
-#[test]
-fn test_sync_pre_process_actions_and_reset() {
-    use epics_base_rs::server::record::Record;
-
-    let mut rec = ThrottleRecord::default();
-    rec.sync = 1; // Process
-
-    // pre_process_actions() returns ReadDbLink for SINP→VAL
-    // and resets sync to 0.
-    let actions = rec.pre_process_actions();
-    assert_eq!(actions.len(), 1, "Should have one ReadDbLink action");
-    assert_eq!(
-        rec.sync, 0,
-        "sync should be reset after pre_process_actions"
-    );
-
-    // Calling again with sync=0 returns empty
-    let actions = rec.pre_process_actions();
-    assert!(actions.is_empty());
-}
+// SYNC (`valueSync`) and OV/SIV link classification are async, DB-backed
+// operations (C `dbGetLink`/`dbNameToAddr`); they are exercised end-to-end
+// through the framework in `tests/integration_tests.rs`, not as a
+// `process()`-only unit test. The old `pre_process_actions` SINP-read
+// mechanism was removed: SYNC must NOT process the record (only VAL is
+// pp(TRUE)), so the read moved into `special()`.
 
 // ============================================================
 // can_device_write

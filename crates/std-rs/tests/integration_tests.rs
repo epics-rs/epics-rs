@@ -675,3 +675,198 @@ record(epid, "PID") {
          process tail as well as the reprocess pass)"
     );
 }
+
+// ============================================================
+// Throttle: SYNC (`valueSync`) — read SINP into VAL, no OUT write.
+//
+// C `throttleRecord.c:376-389,616-656`: a put of SYNC=Process reads
+// SINP into VAL as DBR_DOUBLE, sets STS=Success and SYNC=Idle, and does
+// NOT write OUT or process the record. Modelled by throttle `special()`
+// (SYNC is no longer pp(TRUE), so it cannot process).
+// ============================================================
+
+#[tokio::test]
+async fn test_throttle_sync_reads_sinp_into_val_no_out_write() {
+    let db_str = r#"
+record(ao, "TEST:THRSYNC:SRC") {
+    field(VAL, "7.5")
+}
+record(ao, "TEST:THRSYNC:TGT") {
+    field(VAL, "0")
+}
+record(throttle, "TEST:THRSYNC") {
+    field(SINP, "TEST:THRSYNC:SRC")
+    field(OUT, "TEST:THRSYNC:TGT PP")
+}
+"#;
+    let macros = HashMap::new();
+    let server = CaServerBuilder::new()
+        .register_record_type("throttle", || Box::new(std_rs::ThrottleRecord::default()))
+        .register_record_type("ao", || Box::new(AoRecord::default()))
+        .db_string(db_str, &macros)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let db = server.database().clone();
+
+    // The OV/SIV classification is async (spawned at registration, C does
+    // it synchronously in init_record). Let it complete so the SYNC put
+    // sees SIV=Local rather than the default.
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert_eq!(
+        server.get("TEST:THRSYNC.SIV").await.unwrap(),
+        EpicsValue::Short(2),
+        "a local SINP must classify as SIV=Local PV(2)"
+    );
+
+    // Put SYNC=Process via the field path (triggers special()).
+    db.put_record_field_from_ca("TEST:THRSYNC", "SYNC", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    assert_eq!(
+        server.get("TEST:THRSYNC.VAL").await.unwrap(),
+        EpicsValue::Double(7.5),
+        "SYNC must read SINP (7.5) into VAL"
+    );
+    assert_eq!(
+        server.get("TEST:THRSYNC.STS").await.unwrap(),
+        EpicsValue::Short(2),
+        "a successful SINP read sets STS=Success(2)"
+    );
+    assert_eq!(
+        server.get("TEST:THRSYNC.SYNC").await.unwrap(),
+        EpicsValue::Short(0),
+        "SYNC resets to Idle(0) after the sync"
+    );
+    // The decisive C-parity assertion: valueSync does NOT write OUT or
+    // process — SENT must not advance and the OUT target stays 0.
+    assert_eq!(
+        server.get("TEST:THRSYNC.SENT").await.unwrap(),
+        EpicsValue::Double(0.0),
+        "valueSync must NOT write OUT — SENT must not advance"
+    );
+    assert_eq!(
+        server.get("TEST:THRSYNC:TGT.VAL").await.unwrap(),
+        EpicsValue::Double(0.0),
+        "valueSync must NOT process — the OUT target stays unwritten"
+    );
+}
+
+// ============================================================
+// Throttle: OV/SIV link-status classification.
+//
+// C `throttleRecord.c:171-205`: init_record classifies OUT→OV and
+// SINP→SIV — CONSTANT→Constant(3), a PV on this IOC→Local PV(2), an
+// unresolvable/external link→Ext PV NC(0). epics-base-rs has no CA
+// client, so an external link never reaches Ext PV OK(1).
+// ============================================================
+
+#[tokio::test]
+async fn test_throttle_ov_siv_link_classification() {
+    let db_str = r#"
+record(ao, "TEST:THROV:TGT") {
+    field(VAL, "0")
+}
+record(throttle, "TEST:THROV") {
+    field(OUT, "TEST:THROV:TGT")
+    field(SINP, "2.5")
+}
+record(throttle, "TEST:THROV2") {
+    field(OUT, "TEST:THROV:NOSUCHPV")
+}
+"#;
+    let macros = HashMap::new();
+    let server = CaServerBuilder::new()
+        .register_record_type("throttle", || Box::new(std_rs::ThrottleRecord::default()))
+        .register_record_type("ao", || Box::new(AoRecord::default()))
+        .db_string(db_str, &macros)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    // Classification is async (spawned at registration); let it settle.
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    assert_eq!(
+        server.get("TEST:THROV.OV").await.unwrap(),
+        EpicsValue::Short(2),
+        "a local OUT PV must classify as OV=Local PV(2)"
+    );
+    assert_eq!(
+        server.get("TEST:THROV.SIV").await.unwrap(),
+        EpicsValue::Short(3),
+        "a constant SINP must classify as SIV=Constant(3)"
+    );
+    assert_eq!(
+        server.get("TEST:THROV2.OV").await.unwrap(),
+        EpicsValue::Short(0),
+        "an unresolvable OUT link must classify as OV=Ext PV NC(0)"
+    );
+    // An empty SINP (default) is an unset/constant link → Constant(3).
+    assert_eq!(
+        server.get("TEST:THROV2.SIV").await.unwrap(),
+        EpicsValue::Short(3),
+        "an empty SINP link classifies as SIV=Constant(3)"
+    );
+}
+
+// ============================================================
+// Throttle: a put to a non-VAL field must NOT process the record.
+//
+// C throttleRecord.dbd marks only VAL pp(TRUE); OUT/SINP/DLY/SYNC are
+// special(SPC_MOD) no-pp. A put to DLY must not run process()/write OUT.
+// ============================================================
+
+#[tokio::test]
+async fn test_throttle_non_val_put_does_not_process() {
+    let db_str = r#"
+record(ao, "TEST:THRPP:TGT") {
+    field(VAL, "0")
+}
+record(throttle, "TEST:THRPP") {
+    field(DLY, "0")
+    field(OUT, "TEST:THRPP:TGT PP")
+}
+"#;
+    let macros = HashMap::new();
+    let server = CaServerBuilder::new()
+        .register_record_type("throttle", || Box::new(std_rs::ThrottleRecord::default()))
+        .register_record_type("ao", || Box::new(AoRecord::default()))
+        .db_string(db_str, &macros)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let db = server.database().clone();
+
+    // Stage a VAL but do NOT process it.
+    server
+        .put("TEST:THRPP", EpicsValue::Double(42.0))
+        .await
+        .unwrap();
+    // A put to DLY (a non-pp special field) must not process the record.
+    db.put_record_field_from_ca("TEST:THRPP", "DLY", EpicsValue::Double(1.0))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    assert_eq!(
+        server.get("TEST:THRPP.SENT").await.unwrap(),
+        EpicsValue::Double(0.0),
+        "a put to DLY must NOT process the throttle — nothing sent"
+    );
+    assert_eq!(
+        server.get("TEST:THRPP:TGT.VAL").await.unwrap(),
+        EpicsValue::Double(0.0),
+        "a put to DLY must NOT write the OUT target"
+    );
+    assert_eq!(
+        server.get("TEST:THRPP.DLY").await.unwrap(),
+        EpicsValue::Double(1.0),
+        "the DLY put itself still stored the new value"
+    );
+}

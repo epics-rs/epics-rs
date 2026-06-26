@@ -434,8 +434,15 @@ impl PvDatabase {
     async fn arm_readback_callback(&self, name: &str) {
         let canonical = self.resolve_alias(name).await;
         let key: &str = canonical.as_deref().unwrap_or(name);
-        let records = self.inner.records.read().await;
-        if let Some(rec) = records.get(key) {
+        // Collect-then-act: clone the instance handle under a brief map read,
+        // then drop the map lock before taking the per-record write. Never
+        // hold `records.read()` across `rec.write()` — same lock discipline
+        // as `add_breaktables` / `all_record_names`.
+        let rec = {
+            let records = self.inner.records.read().await;
+            records.get(key).cloned()
+        };
+        if let Some(rec) = rec {
             if let Some(dev) = rec.write().await.device.as_mut() {
                 dev.arm_readback_callback();
             }
@@ -448,8 +455,13 @@ impl PvDatabase {
     async fn reconcile_readback_callback(&self, name: &str) {
         let canonical = self.resolve_alias(name).await;
         let key: &str = canonical.as_deref().unwrap_or(name);
-        let records = self.inner.records.read().await;
-        if let Some(rec) = records.get(key) {
+        // Collect-then-act: clone the handle under a brief map read, drop the
+        // map lock, then take the per-record write — see `arm_readback_callback`.
+        let rec = {
+            let records = self.inner.records.read().await;
+            records.get(key).cloned()
+        };
+        if let Some(rec) = rec {
             if let Some(dev) = rec.write().await.device.as_mut() {
                 dev.reconcile_readback_callback();
             }

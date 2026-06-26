@@ -614,8 +614,13 @@ impl PvDatabase {
                     let (completion_tx, completion_rx) = crate::runtime::sync::oneshot::channel();
                     let notify = crate::server::record::NotifyWaitSet::new(completion_tx);
                     {
-                        let rec = self.inner.records.read().await;
-                        if let Some(rec_arc) = rec.get(record_name) {
+                        // Collect-then-act: clone the handle under a brief map
+                        // read, drop the map lock before the per-record write.
+                        let rec_arc = {
+                            let recs = self.inner.records.read().await;
+                            recs.get(record_name).cloned()
+                        };
+                        if let Some(rec_arc) = rec_arc {
                             let mut guard = rec_arc.write().await;
                             if guard.notify.is_some() {
                                 return Err(CaError::PutCallbackInProgress(
@@ -920,8 +925,13 @@ impl PvDatabase {
             // No processing cycle. C never sets `putf` on this path, so
             // clear the flag the field-put set at entry, and report
             // immediate (synchronous) completion to a WRITE_NOTIFY caller.
-            let recs = self.inner.records.read().await;
-            if let Some(rec_arc) = recs.get(record_name) {
+            // Collect-then-act: clone the handle under a brief map read, drop
+            // the map lock before the per-record write.
+            let rec_arc = {
+                let recs = self.inner.records.read().await;
+                recs.get(record_name).cloned()
+            };
+            if let Some(rec_arc) = rec_arc {
                 let mut guard = rec_arc.write().await;
                 if !guard.is_processing() {
                     guard.common.putf = false;
@@ -948,8 +958,13 @@ impl PvDatabase {
             let (completion_tx, completion_rx) = crate::runtime::sync::oneshot::channel();
             let notify = crate::server::record::NotifyWaitSet::new(completion_tx);
             {
-                let rec = self.inner.records.read().await;
-                if let Some(rec_arc) = rec.get(record_name) {
+                // Collect-then-act: clone the handle under a brief map read,
+                // drop the map lock before the per-record write.
+                let rec_arc = {
+                    let recs = self.inner.records.read().await;
+                    recs.get(record_name).cloned()
+                };
+                if let Some(rec_arc) = rec_arc {
                     let mut guard = rec_arc.write().await;
                     if guard.notify.is_some() {
                         return Err(CaError::PutCallbackInProgress(record_name.to_string()));
@@ -983,8 +998,13 @@ impl PvDatabase {
         // matches the identical gates in processing.rs (line 694) and
         // record_instance.rs (line 1381).
         if field == "VAL" {
-            let recs = self.inner.records.read().await;
-            if let Some(rec_arc) = recs.get(record_name) {
+            // Collect-then-act: clone the handle under a brief map read, drop
+            // the map lock before the per-record write.
+            let rec_arc = {
+                let recs = self.inner.records.read().await;
+                recs.get(record_name).cloned()
+            };
+            if let Some(rec_arc) = rec_arc {
                 let mut guard = rec_arc.write().await;
                 if guard.record.soft_channel_skips_convert() {
                     guard.record.set_device_did_compute(true);
@@ -1038,8 +1058,13 @@ impl PvDatabase {
         // the completion path) so the PUTF marker survives the
         // device-write round trip.
         if !originating_pending {
-            let rec = self.inner.records.read().await;
-            if let Some(rec_arc) = rec.get(record_name) {
+            // Collect-then-act: clone the handle under a brief map read, drop
+            // the map lock before the per-record write.
+            let rec_arc = {
+                let recs = self.inner.records.read().await;
+                recs.get(record_name).cloned()
+            };
+            if let Some(rec_arc) = rec_arc {
                 let mut guard = rec_arc.write().await;
                 if !guard.is_processing() {
                     guard.common.putf = false;

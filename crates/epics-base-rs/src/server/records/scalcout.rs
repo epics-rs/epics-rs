@@ -534,13 +534,18 @@ impl Record for ScalcoutRecord {
             // sentinel, diverging from C.
             self.val = -1.0;
             self.sval = PvString::from("***ERROR***");
-            // Invalid calc — check IVOA
-            match self.ivoa {
-                1 => ivoa_veto_out = true, // Don't drive outputs
-                2 => {
-                    self.val = self.ivov;
-                }
-                _ => {} // Continue
+            // IVOA on the INVALID cycle. C applies it inside `execOutput`
+            // (sCalcoutRecord.c:786-808): Don't_drive skips the write,
+            // Set_to_IVOV sets `oval = ivov` (line 798) — NOT `val`. Only the
+            // Don't_drive veto needs an in-record flag here; the OVAL=IVOV
+            // substitution is owned by the framework's IVOA gate
+            // (`apply_invalid_output_value`), which fires because the
+            // CALC_ALARM the framework raises in `evaluate_alarms` drives this
+            // cycle INVALID. Setting `self.val = ivov` here was wrong: it
+            // clobbered VAL (C keeps VAL=-1) and duplicated the framework's
+            // OVAL write.
+            if self.ivoa == 1 {
+                ivoa_veto_out = true; // Don't drive outputs
             }
         }
 

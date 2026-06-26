@@ -26,12 +26,13 @@
 //!   (plus motor-rs extension fields documented at the entry)
 //!
 //! A record type that is **not** listed here returns `None`: the put gate
-//! then falls back to the legacy "process on every put" behavior, so
-//! record types whose DBD pp-flags have not been modeled (records in other
-//! crates — scaler, std, optics — and test records) keep working
-//! unchanged. `asynRecord` is intentionally omitted: it has two impls
-//! across crates (`epics-base-rs` and `asyn-rs`) and is covered by the
-//! ASYN parity findings, so it stays on the legacy path here.
+//! then falls back to the legacy "process on every put" behavior. Every
+//! instantiable record type — base records plus the module-crate records
+//! (scaler, std epid/throttle/timestamp, optics table, asyn) — is now
+//! modeled, so `None` is reached only by future/test record types that have
+//! not yet declared their pp set. `asynRecord` has two impls across crates
+//! (`epics-base-rs` stub + `asyn-rs` functional) but both report the type
+//! string `"asyn"`, so the single `"asyn"` entry covers both.
 
 /// `pp(TRUE)` field names for `record_type`, sourced from the upstream DBD,
 /// or `None` when the type has not been modeled (legacy always-process).
@@ -235,6 +236,17 @@ pub fn pp_fields_for(record_type: &str) -> Option<&'static [&'static str]> {
         // handled by throttle `special()` (link re-classify / valueSync /
         // delay clamp) and must NOT process the record.
         "throttle" => &["VAL"],
+        // asyn module asynRecord.dbd: the 7 pp(TRUE) fields are the output /
+        // command fields AOUT, BOUT, I32OUT, UI32OUT, F64OUT (octet/register
+        // writes) and UCMD, ACMD (GPIB commands). Every config field
+        // (PORT/ADDR/TMOD/IFACE/options/trace…) is non-pp and applied by
+        // asyn-rs `special()` off the process path. Without this a put to a
+        // non-pp config field ran process(), which for TMOD != NoI/O performs
+        // real port read/write — a spurious device-I/O command. Both the
+        // asyn-rs functional impl and the epics-base-rs stub report "asyn".
+        "asyn" => &[
+            "AOUT", "BOUT", "I32OUT", "UI32OUT", "F64OUT", "UCMD", "ACMD",
+        ],
         _ => return None,
     })
 }

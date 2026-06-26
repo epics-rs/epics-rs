@@ -216,6 +216,7 @@ dependencies = [
  "bitflags",
  "criterion",
  "epics-base-rs",
+ "epics-ca-rs",
  "libc",
  "parking_lot",
  "serde",

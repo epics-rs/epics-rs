@@ -52,6 +52,10 @@ libc = "0.2"
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 criterion = { version = "0.5", features = ["html_reports"] }
+# Integration tests that drive the asyn record through a real CA server's
+# put gate (the process-passive `should_process` path). No dependency cycle:
+# epics-ca-rs does not depend on asyn-rs.
+epics-ca-rs = { workspace = true }
 
 [[bench]]
 name = "throughput"

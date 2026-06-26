@@ -933,16 +933,25 @@ impl Record for CalcoutRecord {
         "calcout"
     }
 
-    // C `calcoutRecord.c::execOutput:620-625`: on a DOPT=Use_OVAL output cycle,
-    // udf tracks the OCAL result (`udf = isnan(oval)`), not VAL — so a finite
-    // VAL with a NaN OVAL still raises UDF_ALARM and IVOA gates the OUT write.
-    // `ocal_udf_override` carries that decision (set in process()); otherwise
-    // udf is VAL-based, matching the trait default.
+    // C raises UDF_ALARM from BOTH `checkAlarms` and `execOutput`, and
+    // `recGblSetSevr` only raises (never lowers), so the effective UDF
+    // condition is the OR of the two:
+    //   * `checkAlarms` (`calcoutRecord.c:244`, BEFORE the output switch) sees
+    //     `udf = isnan(VAL)` (set at line 241) and raises UDF_ALARM if VAL is
+    //     NaN — independent of OVAL.
+    //   * `execOutput` (`calcoutRecord.c:620-630`, Use_OVAL output cycle) then
+    //     sets `udf = isnan(OVAL)` and raises UDF_ALARM if OVAL is NaN.
+    // So a NaN VAL keeps the record INVALID even when OCAL yields a finite OVAL
+    // (the `checkAlarms` raise stands). `ocal_udf_override` carries the
+    // execOutput half — `Some(true)` when a Use_OVAL output cycle produced a
+    // NaN OVAL — and is OR'd with the VAL-NaN half. `None` (Use_VAL / OCAL calc
+    // error / non-output cycle) leaves udf purely VAL-based, matching the trait
+    // default. (Residual: C's udf *field* ends at `isnan(OVAL)` on a Use_OVAL
+    // output cycle, so for NaN VAL + finite OVAL C reports UDF field 0 with
+    // SEVR INVALID; Rust's single value_is_undefined() reports the field as 1.
+    // The SEVR/STAT — the parity-critical observables — match.)
     fn value_is_undefined(&self) -> bool {
-        match self.ocal_udf_override {
-            Some(undef) => undef,
-            None => self.val.is_nan(),
-        }
+        self.val.is_nan() || matches!(self.ocal_udf_override, Some(true))
     }
 
     // C recCalcout.c IVOA=set_to_IVOV: oval = ivov; the OUT writeback

@@ -2839,8 +2839,10 @@ impl PvDatabase {
         // 4.55. event record: post the named software event.
         self.dispatch_event_record(rec).await;
 
-        // 4.6. Generic multi-output links (transform OUTA..OUTP -> A..P,
-        // scalcout OUT->OVAL, epid OUTL).
+        // 4.6. Generic multi-output links (scalcout / acalcout OUT->OVAL).
+        // Only scalcout + acalcout implement `Record::multi_output_links`
+        // (the trait default is empty), so they are the only record types
+        // that reach this dispatch.
         //
         // SINGLE-OWNER INVARIANT: a record type whose link groups are
         // dispatched by `dispatch_multi_output` (§4.5 above) MUST be

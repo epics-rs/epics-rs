@@ -479,9 +479,15 @@ impl PvDatabase {
             *guard = snapshot.clone();
             snapshot
         };
-        // Re-install into existing records (registry write lock released
-        // above so this only contends on the per-record locks).
-        for inst in self.inner.records.read().await.values() {
+        // Re-install into existing records. Snapshot the instance handles
+        // under a brief read, then release the map lock BEFORE taking any
+        // per-record write lock — holding `records.read()` across `inst.write()`
+        // would invert the processing path's `inst.write -> records.read` order
+        // (get_record) and deadlock under the write-preferring RwLock. Same
+        // collect-then-act idiom as `all_record_names`. (The registry write
+        // lock was already released above.)
+        let instances: Vec<_> = self.inner.records.read().await.values().cloned().collect();
+        for inst in instances {
             inst.write()
                 .await
                 .record

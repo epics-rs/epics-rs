@@ -527,6 +527,13 @@ impl Record for ScalcoutRecord {
         let mut ivoa_veto_out = false;
         if calc_failed {
             self.calc_alarm = true;
+            // C `sCalcoutRecord.c:361-363`: a failed sCalcPerform forces
+            // VAL=-1 and SVAL="***ERROR***" (the CALC_ALARM severity itself
+            // is raised by the framework from the CALC_ALARM field). Before
+            // this the failed cycle kept the previous VAL/SVAL with no value
+            // sentinel, diverging from C.
+            self.val = -1.0;
+            self.sval = PvString::from("***ERROR***");
             // Invalid calc — check IVOA
             match self.ivoa {
                 1 => ivoa_veto_out = true, // Don't drive outputs
@@ -996,5 +1003,24 @@ mod tests {
         rec.put_field("IVOV", EpicsValue::Double(99.0)).unwrap();
         assert_eq!(rec.get_field("IVOA"), Some(EpicsValue::Short(2)));
         assert_eq!(rec.get_field("IVOV"), Some(EpicsValue::Double(99.0)));
+    }
+
+    #[test]
+    fn scalcout_calc_fail_sets_error_sentinel() {
+        // C `sCalcoutRecord.c:361-363`: a failed sCalcPerform forces VAL=-1
+        // and SVAL="***ERROR***". Start VAL from a known-good value so the
+        // sentinel is unambiguous (not just the default 0).
+        let mut rec = ScalcoutRecord::new();
+        rec.put_field("CALC", EpicsValue::String("A".into()))
+            .unwrap();
+        rec.put_field("A", EpicsValue::Double(7.0)).unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.val, 7.0, "good calc seeds VAL");
+        // Now break the CALC: a bare binary operator underflows the stack.
+        rec.put_field("CALC", EpicsValue::String("+".into()))
+            .unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.val, -1.0, "calc-fail forces VAL=-1 (C:361)");
+        assert_eq!(rec.sval, "***ERROR***", "calc-fail forces SVAL (C:363)");
     }
 }

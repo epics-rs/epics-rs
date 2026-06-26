@@ -202,6 +202,12 @@ pub fn pp_fields_for(record_type: &str) -> Option<&'static [&'static str]> {
         // put to a gain (KP/KI/KD), a limit, or a link (STPL/INP/OUTL/TRIG)
         // spuriously ran the PID compute and could write the OUTL actuator.
         "epid" => &["VAL"],
+        // std module timestampRecord.dbd: VAL and RVAL are pp(TRUE); OVAL
+        // is special(SPC_NOMOD) and TST is a plain menu. Without this a put
+        // to TST (the time format) spuriously re-read the clock and fired
+        // FLNK. No output link, so no external write — but still a
+        // wire-observable spurious FLNK/clock-read divergence.
+        "timestamp" => &["VAL", "RVAL"],
         // std module throttleRecord.dbd: only VAL is pp(TRUE). OUT, SINP,
         // DLY and SYNC are special(SPC_MOD) with no pp — a put to them is
         // handled by throttle `special()` (link re-classify / valueSync /

@@ -587,6 +587,63 @@ record(timestamp, "TEST:TS") {
 }
 
 // ============================================================
+// Timestamp: a put to a non-pp field must NOT process the record.
+//
+// C timestampRecord.dbd marks VAL and RVAL pp(TRUE); TST (the time
+// format menu) is not pp. Before the `"timestamp" => &["VAL", "RVAL"]`
+// pp_fields_for entry the record had no entry and ran process() on every
+// put, so a put to TST spuriously re-read the clock (RVAL) and fired
+// FLNK. Decisive signal: RVAL is 0 until a real process sets it to the
+// current epoch seconds.
+// ============================================================
+
+#[tokio::test]
+async fn test_timestamp_non_pp_put_does_not_process() {
+    let db_str = r#"
+record(timestamp, "TEST:TSNP") {
+    field(TST, "0")
+}
+"#;
+    let macros = HashMap::new();
+    let server = CaServerBuilder::new()
+        .register_record_type("timestamp", || Box::new(std_rs::TimestampRecord::default()))
+        .db_string(db_str, &macros)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let db = server.database().clone();
+
+    // RVAL starts 0 — no PINI, nothing has processed yet.
+    assert_eq!(
+        server.get("TEST:TSNP.RVAL").await.unwrap(),
+        EpicsValue::Long(0),
+        "RVAL must be 0 before any process"
+    );
+
+    // Put to TST (a non-pp menu field) — must NOT process.
+    db.put_record_field_from_ca("TEST:TSNP", "TST", EpicsValue::Short(4))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert_eq!(
+        server.get("TEST:TSNP.RVAL").await.unwrap(),
+        EpicsValue::Long(0),
+        "a put to TST must NOT process — RVAL must stay 0 (clock not re-read)"
+    );
+
+    // Sanity: a real process (PROC) DOES set RVAL to the current time.
+    db.put_record_field_from_ca("TEST:TSNP", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    match server.get("TEST:TSNP.RVAL").await.unwrap() {
+        EpicsValue::Long(v) => assert!(v > 0, "PROC must process and set RVAL > 0"),
+        other => panic!("expected Long, got {other:?}"),
+    }
+}
+
+// ============================================================
 // CRITICAL 1 — a CA-TRIG epid process cycle fires FLNK exactly
 // once, through the framework.
 //

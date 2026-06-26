@@ -1,5 +1,7 @@
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, MENU_YES_NO, Record};
+use crate::server::record::{
+    FieldDesc, MENU_YES_NO, ParsedLink, ProcessAction, Record, parse_link_v2,
+};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 /// Which EPICS record-type name an [`ArrayRecord`] reports. The four
@@ -72,6 +74,17 @@ pub struct WaveformRecord {
     pub siol: String,
     pub sims: i16,
     pub oldsimm: i16,
+    /// aao-only: output mode select, `menu(menuOmsl)` (0=supervisory,
+    /// 1=closed_loop). When `closed_loop`, aao sources VAL from `DOL`
+    /// before each write (C `aaoRecord.c::fetchValue`, 357). waveform/aai/
+    /// subArray declare no OMSL — `aaoRecord.dbd.pod:355` is the only one
+    /// of the four that does — so the field is exposed only when
+    /// `kind == Aao`.
+    pub omsl: i16,
+    /// aao-only: desired-output-location input link. Pulled into VAL each
+    /// process cycle when `omsl == closed_loop` and the link is a real
+    /// (non-constant) link (C `aaoRecord.c::fetchValue` `dbGetLink`, 366).
+    pub dol: String,
 }
 
 /// Type aliases for documentation / pattern-match clarity. All point
@@ -158,6 +171,11 @@ impl Default for WaveformRecord {
             siol: String::new(),
             sims: 0,
             oldsimm: 0,
+            // C `aaoRecord.dbd.pod` declares OMSL `menu(menuOmsl)` and DOL
+            // `DBF_INLINK` with no `initial(...)`, so both default to the
+            // zero value: OMSL=supervisory (no DOL fetch), DOL=constant/empty.
+            omsl: 0,
+            dol: String::new(),
         }
     }
 }
@@ -737,6 +755,106 @@ static SUBARRAY_FIELDS_UINT64: &[FieldDesc] = subarray_field_list!(DbFieldType::
 static SUBARRAY_FIELDS_FLOAT: &[FieldDesc] = subarray_field_list!(DbFieldType::Float);
 static SUBARRAY_FIELDS_DOUBLE: &[FieldDesc] = subarray_field_list!(DbFieldType::Double);
 
+/// `menu(menuOmsl)` index for `closed_loop` (`MENU_OMSL[1]`,
+/// `menu_choices.rs:61`). When `aao.omsl == closed_loop` the record sources
+/// VAL from DOL each cycle (C `aaoRecord.c::fetchValue`).
+const MENU_OMSL_CLOSED_LOOP: i16 = 1;
+
+/// C `dbLinkIsConstant(&prec->dol)`: is the aao DOL a constant rather than a
+/// fetchable link? Used to gate the process-time fetch (`!isConst`), so a
+/// constant is never re-applied per cycle over a client caput.
+///
+/// [`parse_link_v2`] classifies a *scalar* numeric / quoted-string / JSON
+/// constant as [`ParsedLink::Constant`], but NOT a whitespace-separated
+/// numeric array literal (`"1 2 3"`) — which the C db loader parses as a
+/// constant array (loaded once at init via `dbLoadLinkArray`). Recognise that
+/// array form here so a constant array DOL also yields no per-cycle fetch. An
+/// empty DOL has no source and is treated as constant (nothing to fetch).
+fn dol_is_constant(dol: &str) -> bool {
+    let trimmed = dol.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if matches!(parse_link_v2(dol), ParsedLink::Constant(_)) {
+        return true;
+    }
+    trimmed
+        .split_whitespace()
+        .all(|tok| tok.parse::<f64>().is_ok())
+}
+
+// aao field set. aao shares the `WaveformRecord` struct and the
+// waveform/aai field shape (NELM `special(SPC_NOMOD)` read_only, FTVL/NORD
+// load-settable-runtime-immutable), but its C dbd ALSO declares OMSL
+// `menu(menuOmsl)` and DOL `DBF_INLINK` (`aaoRecord.dbd.pod:355-360`) — the
+// desired-output mode + link absent from the other three array types.
+// `field_list()` returns this set only when `kind == Aao`, so OMSL/DOL are
+// loadable (apply_fields gates on field_list membership) for aao alone.
+macro_rules! aao_field_list {
+    ($valty:expr) => {
+        &[
+            FieldDesc {
+                name: "VAL",
+                dbf_type: $valty,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "NELM",
+                dbf_type: DbFieldType::Long,
+                read_only: true,
+            },
+            FieldDesc {
+                name: "NORD",
+                dbf_type: DbFieldType::Long,
+                read_only: true,
+            },
+            FieldDesc {
+                name: "FTVL",
+                dbf_type: DbFieldType::Short,
+                read_only: true,
+            },
+            FieldDesc {
+                name: "EGU",
+                dbf_type: DbFieldType::String,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "HOPR",
+                dbf_type: DbFieldType::Double,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "LOPR",
+                dbf_type: DbFieldType::Double,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "PREC",
+                dbf_type: DbFieldType::Short,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "OMSL",
+                dbf_type: DbFieldType::Short,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "DOL",
+                dbf_type: DbFieldType::String,
+                read_only: false,
+            },
+        ]
+    };
+}
+
+static AAO_FIELDS_CHAR: &[FieldDesc] = aao_field_list!(DbFieldType::Char);
+static AAO_FIELDS_SHORT: &[FieldDesc] = aao_field_list!(DbFieldType::Short);
+static AAO_FIELDS_LONG: &[FieldDesc] = aao_field_list!(DbFieldType::Long);
+static AAO_FIELDS_INT64: &[FieldDesc] = aao_field_list!(DbFieldType::Int64);
+static AAO_FIELDS_UINT64: &[FieldDesc] = aao_field_list!(DbFieldType::UInt64);
+static AAO_FIELDS_FLOAT: &[FieldDesc] = aao_field_list!(DbFieldType::Float);
+static AAO_FIELDS_DOUBLE: &[FieldDesc] = aao_field_list!(DbFieldType::Double);
+
 impl Record for WaveformRecord {
     fn record_type(&self) -> &'static str {
         self.kind.as_record_type()
@@ -869,6 +987,11 @@ impl Record for WaveformRecord {
             "SIOL" if self.has_sim_block() => Some(EpicsValue::String(self.siol.clone().into())),
             "SIMS" if self.has_sim_block() => Some(EpicsValue::Short(self.sims)),
             "OLDSIMM" if self.has_sim_block() => Some(EpicsValue::Short(self.oldsimm)),
+            // aao-only output-mode / desired-output link (aaoRecord.dbd.pod).
+            "OMSL" if matches!(self.kind, ArrayKind::Aao) => Some(EpicsValue::Short(self.omsl)),
+            "DOL" if matches!(self.kind, ArrayKind::Aao) => {
+                Some(EpicsValue::String(self.dol.clone().into()))
+            }
             _ => None,
         }
     }
@@ -1070,6 +1193,24 @@ impl Record for WaveformRecord {
             },
             // OLDSIMM is special(SPC_NOMOD) — saved copy, not client-writable.
             "OLDSIMM" if self.has_sim_block() => Err(CaError::ReadOnlyField(name.to_string())),
+            // aao-only OMSL (menu, resolved to a Short index by the central
+            // shared_menu_choices("OMSL") path) and DOL link string. The
+            // field_list AAO set carries these so apply_fields routes
+            // field(OMSL/DOL,...) here rather than to common fields.
+            "OMSL" if matches!(self.kind, ArrayKind::Aao) => match value {
+                EpicsValue::Short(v) => {
+                    self.omsl = v;
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("OMSL".into())),
+            },
+            "DOL" if matches!(self.kind, ArrayKind::Aao) => match value {
+                EpicsValue::String(s) => {
+                    self.dol = s.as_str_lossy().into_owned();
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch("DOL".into())),
+            },
             _ => Err(CaError::FieldNotFound(name.to_string())),
         }
     }
@@ -1094,6 +1235,18 @@ impl Record for WaveformRecord {
                 _ => SUBARRAY_FIELDS_DOUBLE,
             };
         }
+        // aao adds OMSL/DOL to the waveform/aai shape (aaoRecord.dbd.pod).
+        if matches!(self.kind, ArrayKind::Aao) {
+            return match self.ftvl {
+                1 | 2 => AAO_FIELDS_CHAR,
+                3 | 4 => AAO_FIELDS_SHORT,
+                5 | 6 => AAO_FIELDS_LONG,
+                7 => AAO_FIELDS_INT64,
+                8 => AAO_FIELDS_UINT64,
+                9 => AAO_FIELDS_FLOAT,
+                _ => AAO_FIELDS_DOUBLE,
+            };
+        }
         match self.ftvl {
             1 | 2 => WAVEFORM_FIELDS_CHAR,
             3 | 4 => WAVEFORM_FIELDS_SHORT,
@@ -1103,6 +1256,40 @@ impl Record for WaveformRecord {
             9 => WAVEFORM_FIELDS_FLOAT,
             _ => WAVEFORM_FIELDS_DOUBLE,
         }
+    }
+
+    /// aao `OMSL=closed_loop` desired-output pull. C `aaoRecord.c::fetchValue`
+    /// (357-377): an aao whose `omsl == closed_loop` sources its array from
+    /// `DOL` before writing. At PROCESS time C fetches only when DOL is a
+    /// *non-constant* link (`!init && !isConst` → `dbGetLink`); a constant DOL
+    /// is loaded once at init via `dbLoadLinkArray` and is a per-cycle no-op.
+    /// This pre-input hook mirrors the process-time `!isConst` arm: it emits a
+    /// `ReadDbLink { DOL -> VAL }` only for a real link — the framework reads
+    /// the link's native array and applies it via `put_field("VAL", ...)`,
+    /// which sets `NORD = element count` exactly as C's `nord = nReq`. A
+    /// constant or empty DOL emits nothing, so a constant is never re-applied
+    /// over a client caput to VAL (C's `!dbLinkIsConstant` gate). Supervisory
+    /// mode and the other three array kinds (no OMSL/DOL) return no actions.
+    ///
+    /// Residual: the init-time constant-array load (`dbLoadLinkArray`, the
+    /// `init && isConst` arm) is not ported — this record has no array-literal
+    /// constant-link parser, so a `field(DOL,"1 2 3")` constant array is not
+    /// seeded into VAL at init. A non-constant closed_loop DOL (the common
+    /// tracking case) is fully covered.
+    fn pre_input_link_actions(&mut self) -> Vec<ProcessAction> {
+        if !matches!(self.kind, ArrayKind::Aao) || self.omsl != MENU_OMSL_CLOSED_LOOP {
+            return Vec::new();
+        }
+        // C `!dbLinkIsConstant(&prec->dol)`: only a real (DB/CA/PVA) link is
+        // fetched at process time; a constant (scalar, array literal, or
+        // empty) is not re-applied each cycle.
+        if dol_is_constant(&self.dol) {
+            return Vec::new();
+        }
+        vec![ProcessAction::ReadDbLink {
+            link_field: "DOL",
+            target_field: "VAL",
+        }]
     }
 
     /// epics-base PR #a02c310 follow-up: subArray slices its input
@@ -1245,6 +1432,137 @@ mod array_kind_tests {
         assert_eq!(a.record_type(), "aai");
         assert_eq!(b.record_type(), "aao");
         assert_eq!(c.record_type(), "subArray");
+    }
+
+    /// aao alone declares OMSL/DOL (`aaoRecord.dbd.pod`). `apply_fields` gates
+    /// `field(OMSL/DOL,...)` on `field_list` membership, so the aao set must
+    /// carry both names and the waveform/aai set must not — otherwise the
+    /// loader would misroute them to common fields and the fetch would never
+    /// arm.
+    #[test]
+    fn aao_field_list_includes_omsl_dol_other_kinds_do_not() {
+        let aao = WaveformRecord::with_kind(ArrayKind::Aao);
+        let names: Vec<&str> = aao.field_list().iter().map(|f| f.name).collect();
+        assert!(names.contains(&"OMSL"), "aao field_list must carry OMSL");
+        assert!(names.contains(&"DOL"), "aao field_list must carry DOL");
+
+        for kind in [ArrayKind::Waveform, ArrayKind::Aai, ArrayKind::SubArray] {
+            let r = WaveformRecord::with_kind(kind);
+            let names: Vec<&str> = r.field_list().iter().map(|f| f.name).collect();
+            assert!(
+                !names.contains(&"OMSL") && !names.contains(&"DOL"),
+                "{kind:?} must not declare OMSL/DOL"
+            );
+        }
+    }
+
+    /// OMSL (resolved to a Short index by the central menu path) and DOL
+    /// round-trip through aao's get/put; non-aao kinds expose neither.
+    #[test]
+    fn aao_omsl_dol_round_trip_and_kind_gated() {
+        let mut aao = WaveformRecord::with_kind(ArrayKind::Aao);
+        aao.put_field("OMSL", EpicsValue::Short(MENU_OMSL_CLOSED_LOOP))
+            .unwrap();
+        aao.put_field("DOL", EpicsValue::String("src.VAL".into()))
+            .unwrap();
+        assert_eq!(
+            aao.get_field("OMSL"),
+            Some(EpicsValue::Short(MENU_OMSL_CLOSED_LOOP))
+        );
+        assert_eq!(
+            aao.get_field("DOL"),
+            Some(EpicsValue::String("src.VAL".into()))
+        );
+
+        // waveform has no OMSL/DOL: get returns None, put is FieldNotFound.
+        let mut wf = WaveformRecord::with_kind(ArrayKind::Waveform);
+        assert_eq!(wf.get_field("OMSL"), None);
+        assert_eq!(wf.get_field("DOL"), None);
+        assert!(wf.put_field("OMSL", EpicsValue::Short(1)).is_err());
+        assert!(
+            wf.put_field("DOL", EpicsValue::String("src.VAL".into()))
+                .is_err()
+        );
+    }
+
+    /// C `aaoRecord.c::fetchValue` process arm (`!init && !isConst`): an aao
+    /// with `omsl == closed_loop` and a real (non-constant) DOL link emits a
+    /// `ReadDbLink { DOL -> VAL }` pre-input action so the framework pulls the
+    /// source array into VAL (which sets NORD) before the write.
+    #[test]
+    fn aao_closed_loop_real_link_emits_read_db_link() {
+        let mut aao = WaveformRecord::with_kind(ArrayKind::Aao);
+        aao.omsl = MENU_OMSL_CLOSED_LOOP;
+        aao.dol = "srcWaveform.VAL".to_string();
+        assert_eq!(
+            aao.pre_input_link_actions(),
+            vec![ProcessAction::ReadDbLink {
+                link_field: "DOL",
+                target_field: "VAL",
+            }]
+        );
+
+        // A bare record name parses to a DB link too (parse_link_v2), so it
+        // also arms the fetch.
+        aao.dol = "srcWaveform".to_string();
+        assert_eq!(aao.pre_input_link_actions().len(), 1);
+    }
+
+    /// C gates the process-time fetch on `!dbLinkIsConstant`: a constant DOL
+    /// (numeric/array literal) is loaded once at init, never re-applied per
+    /// cycle. An empty DOL has no source at all. Both emit no action, so a
+    /// client caput to VAL is not clobbered.
+    #[test]
+    fn aao_closed_loop_constant_or_empty_dol_emits_nothing() {
+        let mut aao = WaveformRecord::with_kind(ArrayKind::Aao);
+        aao.omsl = MENU_OMSL_CLOSED_LOOP;
+
+        aao.dol = "1 2 3".to_string(); // constant array literal
+        assert!(aao.pre_input_link_actions().is_empty());
+
+        aao.dol = "42".to_string(); // constant scalar literal
+        assert!(aao.pre_input_link_actions().is_empty());
+
+        aao.dol = String::new(); // unset
+        assert!(aao.pre_input_link_actions().is_empty());
+
+        aao.dol = "   ".to_string(); // whitespace-only
+        assert!(aao.pre_input_link_actions().is_empty());
+    }
+
+    /// Supervisory mode (the default) never fetches DOL, even with a real
+    /// link configured (C `if(prec->omsl != menuOmslclosed_loop) return 0`).
+    /// And the other three array kinds have no OMSL/DOL, so they never fetch
+    /// regardless of the struct's `omsl` value.
+    #[test]
+    fn supervisory_and_non_aao_kinds_emit_nothing() {
+        let mut aao = WaveformRecord::with_kind(ArrayKind::Aao);
+        aao.omsl = 0; // supervisory
+        aao.dol = "srcWaveform.VAL".to_string();
+        assert!(aao.pre_input_link_actions().is_empty());
+
+        for kind in [ArrayKind::Waveform, ArrayKind::Aai, ArrayKind::SubArray] {
+            let mut r = WaveformRecord::with_kind(kind);
+            // Force the would-be fetch state; the kind gate must still win.
+            r.omsl = MENU_OMSL_CLOSED_LOOP;
+            r.dol = "srcWaveform.VAL".to_string();
+            assert!(
+                r.pre_input_link_actions().is_empty(),
+                "{kind:?} has no OMSL/DOL and must not fetch"
+            );
+        }
+    }
+
+    /// The framework applies the fetched array through `put_field("VAL", ...)`,
+    /// which sets `NORD = element count` — the contract C `fetchValue` relies
+    /// on (`prec->nord = nReq`). Pin it for the aao DOL-pull path.
+    #[test]
+    fn aao_val_put_sets_nord_for_dol_pull() {
+        let mut aao = WaveformRecord::with_kind(ArrayKind::Aao);
+        aao.nelm = 8;
+        aao.put_field("VAL", EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0]))
+            .unwrap();
+        assert_eq!(aao.nord, 3, "NORD must equal the pulled element count");
     }
 
     /// PR #a02c310 follow-up: subArray slices source[INDX..INDX+NELM]

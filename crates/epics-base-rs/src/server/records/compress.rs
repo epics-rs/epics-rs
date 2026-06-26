@@ -8,9 +8,12 @@ use crate::types::{DbFieldType, EpicsValue, PvString};
 ///   0 = N to 1 Low Value
 ///   1 = N to 1 High Value
 ///   2 = N to 1 Average
-///   3 = Average (rolling) — not yet implemented; falls through to 0.0
+///   3 = Average (rolling element-wise mean of N waveforms — `array_average`,
+///       C `array_average` compressRecord.c:223)
 ///   4 = Circular Buffer
-///   5 = N to 1 Median — not yet implemented; falls through to 0.0
+///   5 = N to 1 Median (sort each N-element chunk, take the middle
+///       `psource[n/2]` — `compress_array`, C compressRecord.c:209-211; a
+///       scalar input degrades to Average, matching C `compress_scalar`)
 ///
 /// The numeric values are CA-wire-visible (DBR_SHORT) and must match
 /// `menuCompressALG` so a C client setting `ALG=4` reaches the
@@ -966,6 +969,41 @@ mod pbuf_tests {
             assert!((v[1] - 74.0).abs() < 1e-9);
             assert!((v[2] - 111.0).abs() < 1e-9);
             assert!((v[3] - 148.0).abs() < 1e-9);
+        } else {
+            panic!("expected DoubleArray");
+        }
+    }
+
+    /// N-to-1 Median (alg=5) array path — C `compress_array`
+    /// (compressRecord.c:209-211): sort each N-element chunk and emit the
+    /// middle element `psource[n/2]`. This pins the algorithm the struct
+    /// doc once wrongly described as "not implemented; falls through to
+    /// 0.0" — it has always been the `_ =>` arm of `compress_array`.
+    #[test]
+    fn n_to_1_median_array_takes_sorted_middle_of_each_chunk() {
+        // ALG=5, N=3 (odd): unambiguous middle of each chunk.
+        let mut rec = CompressRecord::new(8, 5);
+        rec.n = 3;
+        // [3,1,2] -> sorted [1,2,3] -> middle 2; [6,5,4] -> [4,5,6] -> 5.
+        rec.push_array(&[3.0, 1.0, 2.0, 6.0, 5.0, 4.0]);
+        if let Some(EpicsValue::DoubleArray(v)) = rec.get_field("VAL") {
+            assert_eq!(v, vec![2.0, 5.0]);
+        } else {
+            panic!("expected DoubleArray");
+        }
+
+        // Even N: C takes `psource[n/2]` = the UPPER of the two middles
+        // (index 2 of 4), NOT their average. [10,40,30,20] -> sorted
+        // [10,20,30,40] -> index 2 -> 30 (not the interpolated 25).
+        let mut rec = CompressRecord::new(8, 5);
+        rec.n = 4;
+        rec.push_array(&[10.0, 40.0, 30.0, 20.0]);
+        if let Some(EpicsValue::DoubleArray(v)) = rec.get_field("VAL") {
+            assert_eq!(
+                v,
+                vec![30.0],
+                "even-N median is the upper-middle (C psource[n/2]), not a mean"
+            );
         } else {
             panic!("expected DoubleArray");
         }

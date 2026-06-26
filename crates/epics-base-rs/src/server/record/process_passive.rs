@@ -197,6 +197,11 @@ pub fn pp_fields_for(record_type: &str) -> Option<&'static [&'static str]> {
             "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P",
         ],
         "sseq" => &["VAL"],
+        // std module epidRecord.dbd: only VAL is pp(TRUE); every other
+        // field is plain or special(SPC_NOMOD) with no pp. Without this a
+        // put to a gain (KP/KI/KD), a limit, or a link (STPL/INP/OUTL/TRIG)
+        // spuriously ran the PID compute and could write the OUTL actuator.
+        "epid" => &["VAL"],
         // std module throttleRecord.dbd: only VAL is pp(TRUE). OUT, SINP,
         // DLY and SYNC are special(SPC_MOD) with no pp — a put to them is
         // handled by throttle `special()` (link re-classify / valueSync /

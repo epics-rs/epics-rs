@@ -870,3 +870,73 @@ record(throttle, "TEST:THRPP") {
         "the DLY put itself still stored the new value"
     );
 }
+
+// ============================================================
+// Epid: a put to a non-VAL field must NOT process the record.
+//
+// C epidRecord.dbd marks only VAL pp(TRUE); gains/limits/links are not
+// pp. Before the `"epid" => &["VAL"]` pp_fields_for entry the record had
+// no entry and ran process() on EVERY put (process-on-every-put
+// default), spuriously re-running the PID compute and potentially
+// writing the OUTL actuator.
+// ============================================================
+
+#[tokio::test]
+async fn test_epid_non_val_put_does_not_process() {
+    let db_str = r#"
+record(ao, "TEST:PIDNV:SRC") {
+    field(VAL, "100")
+}
+record(epid, "TEST:PIDNV") {
+    field(SMSL, "1")
+    field(STPL, "TEST:PIDNV:SRC.VAL")
+    field(KP, "2.0")
+    field(KI, "0")
+    field(KD, "0")
+    field(FBON, "1")
+    field(DRVH, "1000")
+    field(DRVL, "-1000")
+}
+"#;
+    let macros = HashMap::new();
+    let server = CaServerBuilder::new()
+        .register_record_type("epid", || Box::new(std_rs::EpidRecord::default()))
+        .register_record_type("ao", || Box::new(AoRecord::default()))
+        .db_string(db_str, &macros)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let db = server.database().clone();
+
+    // Process once: P = KP*(VAL-CVAL) = 2.0*(100-0) = 200.
+    db.put_record_field_from_ca("TEST:PIDNV", "PROC", EpicsValue::Short(1))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let p_before = server.get("TEST:PIDNV.P").await.unwrap();
+    assert!(
+        matches!(p_before, EpicsValue::Double(v) if (v - 200.0).abs() < 1.0),
+        "after one process P should be ~200 (KP=2.0), got {p_before:?}"
+    );
+
+    // Put a NEW gain KP=5.0 (a non-VAL, non-pp field) WITHOUT processing.
+    db.put_record_field_from_ca("TEST:PIDNV", "KP", EpicsValue::Double(5.0))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    // The put stored the new gain...
+    assert_eq!(
+        server.get("TEST:PIDNV.KP").await.unwrap(),
+        EpicsValue::Double(5.0),
+        "the KP put itself still stored the new gain"
+    );
+    // ...but must NOT have processed: P must NOT recompute to 5.0*100=500.
+    let p_after = server.get("TEST:PIDNV.P").await.unwrap();
+    assert!(
+        matches!(p_after, EpicsValue::Double(v) if (v - 200.0).abs() < 1.0),
+        "a put to KP must NOT process the epid — P must stay ~200, not \
+         recompute to ~500 (got {p_after:?})"
+    );
+}

@@ -52,14 +52,16 @@
 //!   framework's generic array change-detection (post on any change). Differs
 //!   only when MDEL/ADEL > 0; the default 0 posts on any change in both.
 //! - `IVOA` is applied on a CALC/OCAL evaluation failure (the C
-//!   `CALC_ALARM`=INVALID path), matching siblings `scalcout`/`calcout`; the
-//!   limit-alarm/MS-link-driven `INVALID` IVOA gate of C `execOutput` is not
-//!   modeled, because the framework runs `check_alarms` after `process()` so
-//!   the output decision cannot see limit/link severity (a framework-wide
-//!   trait shared with `scalcout`). Don't-Drive suppresses the OUT write via
-//!   `cached_should_output` (the generic `multi_output_links` writeback does
-//!   not honour the framework's severity skip_out); SetIVOV writes `IVOV`
-//!   into the field OUT consumes — see `set_output_to_ivov`. Under `DOPT=Use
+//!   `CALC_ALARM`=INVALID path), matching siblings `scalcout`/`calcout`. The
+//!   limit-alarm/MS-link-driven `INVALID` IVOA gate of C `execOutput` is now
+//!   honoured too: the framework's §4.6 `multi_output_links` dispatch applies
+//!   the same `IVOA=Don't_drive` veto the single-OUT `skip_out` path enforces,
+//!   reading the committed `sevr` after `check_alarms`/`evaluate_alarms`. So a
+//!   non-calc-fail `INVALID` (NaN-VAL UDF, limit, MS link) suppresses the OUT
+//!   write for every severity source — not only a failed evaluation. The
+//!   record-level `cached_should_output` still gates the OOPT/calc-fail
+//!   decision; the framework layer is the IVOA backstop on top. SetIVOV writes
+//!   `IVOV` into the field OUT consumes — see `set_output_to_ivov`. Under `DOPT=Use
 //!   CALC`, SetIVOV drives `IVOV` to OUT; literal C sets only the unused
 //!   `oval` there and drives the failed `aval`, so its IVOV substitution is a
 //!   no-op — this port deliberately does NOT replicate that C quirk.

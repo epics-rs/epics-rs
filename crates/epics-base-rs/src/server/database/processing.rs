@@ -2854,12 +2854,30 @@ impl PvDatabase {
         {
             let multi_out = {
                 let instance = rec.read().await;
-                let links =
-                    if super::links::multi_output_dispatch_owned(instance.record.record_type()) {
-                        &[][..]
-                    } else {
-                        instance.record.multi_output_links()
-                    };
+                // Framework IVOA=Don't_drive veto for the multi-output OUT
+                // path, mirroring the single-OUT `skip_out` gate in the IVOA
+                // block: on an INVALID cycle with IVOA=Don't_drive the OUT
+                // write is suppressed. The parsed_out single-OUT path is
+                // already gated, but `multi_output_links` (scalcout/acalcout
+                // OUT) was not — so a non-calc-fail INVALID (INP LINK_ALARM,
+                // SIMM, NaN-VAL UDF, …) + Don't_drive wrote OUT where C
+                // suppresses (execOutput nsev>=INVALID → Don't_drive break,
+                // sCalcoutRecord.c:794). The record-level OOPT/calc-fail
+                // decision still gates via `multi_output_links()` itself; this
+                // is the framework IVOA layer on top, for every INVALID source.
+                let ivoa_dont_drive = instance.common.sevr
+                    == crate::server::record::AlarmSeverity::Invalid
+                    && matches!(
+                        instance.record.get_field("IVOA"),
+                        Some(EpicsValue::Short(1))
+                    );
+                let links = if ivoa_dont_drive
+                    || super::links::multi_output_dispatch_owned(instance.record.record_type())
+                {
+                    &[][..]
+                } else {
+                    instance.record.multi_output_links()
+                };
                 if links.is_empty() {
                     None
                 } else {
@@ -3843,12 +3861,30 @@ impl PvDatabase {
         {
             let multi_out = {
                 let instance = rec.read().await;
-                let links =
-                    if super::links::multi_output_dispatch_owned(instance.record.record_type()) {
-                        &[][..]
-                    } else {
-                        instance.record.multi_output_links()
-                    };
+                // Framework IVOA=Don't_drive veto for the multi-output OUT
+                // path, mirroring the single-OUT `skip_out` gate in the IVOA
+                // block: on an INVALID cycle with IVOA=Don't_drive the OUT
+                // write is suppressed. The parsed_out single-OUT path is
+                // already gated, but `multi_output_links` (scalcout/acalcout
+                // OUT) was not — so a non-calc-fail INVALID (INP LINK_ALARM,
+                // SIMM, NaN-VAL UDF, …) + Don't_drive wrote OUT where C
+                // suppresses (execOutput nsev>=INVALID → Don't_drive break,
+                // sCalcoutRecord.c:794). The record-level OOPT/calc-fail
+                // decision still gates via `multi_output_links()` itself; this
+                // is the framework IVOA layer on top, for every INVALID source.
+                let ivoa_dont_drive = instance.common.sevr
+                    == crate::server::record::AlarmSeverity::Invalid
+                    && matches!(
+                        instance.record.get_field("IVOA"),
+                        Some(EpicsValue::Short(1))
+                    );
+                let links = if ivoa_dont_drive
+                    || super::links::multi_output_dispatch_owned(instance.record.record_type())
+                {
+                    &[][..]
+                } else {
+                    instance.record.multi_output_links()
+                };
                 if links.is_empty() {
                     None
                 } else {

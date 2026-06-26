@@ -39,7 +39,10 @@
 //!
 //! ## Modeled simplifications (vs. C)
 //!
-//! - Output is synchronous: `ODLY`/`DLYA` (delayed output), `WAIT` (CA
+//! - `ODLY`/`DLYA` (delayed output) IS modeled: when an output is due and
+//!   ODLY > 0, the OUT write/OEVT/forward-link are deferred by ODLY seconds
+//!   via an async-pending-notify pass (DLYA=1) and a re-process continuation,
+//!   matching C `aCalcoutRecord.c::process` lines 338-346/421-430. `WAIT` (CA
 //!   put-callback wait) and the async `acalcPerformTask` thread are not
 //!   modeled; those fields are stored but inert. `OEVT` (post-event) IS
 //!   modeled — see [`AcalcoutRecord::output_event`].
@@ -91,7 +94,9 @@
 //!   results are captured). Advanced/uncommon aCalc usage.
 
 use crate::error::{CaError, CaResult};
-use crate::server::record::{FieldDesc, ProcessOutcome, Record};
+use crate::server::record::{
+    FieldDesc, ProcessAction, ProcessOutcome, Record, RecordProcessResult,
+};
 use crate::types::{DbFieldType, EpicsValue, PvString};
 
 use crate::calc::{ArrayInputs, CompiledExpr, acalc_compile, acalc_eval};
@@ -209,6 +214,10 @@ pub struct AcalcoutRecord {
     // --- process flags ---
     calc_alarm: bool,
     cached_should_output: bool,
+    /// The output decision captured on an ODLY delaying cycle, restored into
+    /// `cached_should_output` on the continuation so the deferred OUT write
+    /// fires once after the delay. Mirrors `scalcout`/`calcout`.
+    pending_output: bool,
 }
 
 impl Default for AcalcoutRecord {
@@ -278,6 +287,7 @@ impl Default for AcalcoutRecord {
             newm: 0,
             calc_alarm: false,
             cached_should_output: false,
+            pending_output: false,
         }
     }
 }
@@ -1190,6 +1200,19 @@ impl Record for AcalcoutRecord {
     }
 
     fn process(&mut self) -> CaResult<ProcessOutcome> {
+        // ODLY continuation: the delayed re-process scheduled by a previous
+        // cycle (C `aCalcoutRecord.c::process` `pact==TRUE` + `dlya` branch,
+        // lines 421-430). Do NOT re-evaluate CALC/OCAL/OOPT — C clears DLYA and
+        // runs `execOutput` directly; the alarm state captured by the delaying
+        // cycle persists. Restore the captured output decision, clear DLYA, and
+        // let the framework write the OUT link + post OEVT. Mirrors `scalcout`.
+        if self.dlya == 1 {
+            self.dlya = 0;
+            self.cached_should_output = self.pending_output;
+            self.pending_output = false;
+            return Ok(ProcessOutcome::complete());
+        }
+
         let n = self.num_elements();
 
         self.calc_alarm = false;
@@ -1283,6 +1306,34 @@ impl Record for AcalcoutRecord {
         // framework posts OVAL on change, so this is the exposed previous-OVAL
         // value only.
         self.povl = self.oval;
+
+        // ODLY (C `aCalcoutRecord.c::process`/`afterCalc` lines 338-346): when
+        // an output should fire and ODLY > 0, defer the OUT-link write by ODLY
+        // seconds. The delaying cycle sets DLYA=1, posts it (DBE_VALUE),
+        // schedules the delayed callback, and `return(ASYNC)` BEFORE
+        // `monitor()`/`recGblFwdLink()`/`execOutput` — so VAL/AVAL/OVAL monitors,
+        // the OUT write, OEVT, and the forward link all fire on the delayed
+        // (continuation) cycle, not now. Model this as an async-pending-notify
+        // pass: post only DLYA now, suppress this cycle's output via
+        // `cached_should_output=false`, and re-process after the delay; the
+        // `dlya == 1` branch at the top then emits. The IVOV substitution above
+        // (part of C `execOutput`) already mutated AVAL/OAV; since the OUT write
+        // and OVAL monitor are PACT-held until the continuation, computing it on
+        // this cycle is not observable. Mirrors `scalcout`/`calcout`.
+        if do_output && self.odly > 0.0 {
+            self.dlya = 1;
+            self.pending_output = do_output;
+            self.cached_should_output = false;
+            let delay = std::time::Duration::from_secs_f64(self.odly);
+            return Ok(ProcessOutcome {
+                result: RecordProcessResult::AsyncPendingNotify(vec![(
+                    "DLYA".to_string(),
+                    EpicsValue::UShort(1),
+                )]),
+                actions: vec![ProcessAction::ReprocessAfter(delay)],
+                device_did_compute: false,
+            });
+        }
 
         Ok(ProcessOutcome::complete())
     }

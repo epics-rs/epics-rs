@@ -585,11 +585,22 @@ impl Record for ScalcoutRecord {
                                 }
                             },
                             Err(_) => {
+                                // C execOutput Use_OVAL (sCalcoutRecord.c:771-773):
+                                // a failed OCAL sCalcPerform forces OVAL=-1 and
+                                // OSV="***ERROR***" — the OCAL-side mirror of the
+                                // CALC-fail VAL=-1 sentinel. Previously OVAL/OSV
+                                // were left stale.
+                                self.oval = -1.0;
+                                self.osv = PvString::from("***ERROR***");
                                 self.calc_alarm = true;
                             }
                         }
                     } else {
-                        // OCAL non-empty but compile failed.
+                        // OCAL non-empty but compile failed — C's sCalcPerform
+                        // fails identically on an unparsable expression, so the
+                        // same OVAL=-1/OSV="***ERROR***" sentinel applies.
+                        self.oval = -1.0;
+                        self.osv = PvString::from("***ERROR***");
                         self.calc_alarm = true;
                     }
                 }
@@ -1047,5 +1058,34 @@ mod tests {
         rec.process().unwrap();
         assert_eq!(rec.val, -1.0, "calc-fail forces VAL=-1 (C:361)");
         assert_eq!(rec.sval, "***ERROR***", "calc-fail forces SVAL (C:363)");
+    }
+
+    #[test]
+    fn scalcout_ocal_fail_sets_oval_error_sentinel() {
+        // C execOutput Use_OVAL (sCalcoutRecord.c:771-773): a failed OCAL
+        // sCalcPerform forces OVAL=-1 and OSV="***ERROR***" — the OCAL-side
+        // mirror of the CALC-fail VAL sentinel. CALC itself stays valid here,
+        // so only the OCAL/OVAL side carries the sentinel.
+        let mut rec = ScalcoutRecord::new();
+        rec.put_field("CALC", EpicsValue::String("A".into()))
+            .unwrap();
+        rec.put_field("A", EpicsValue::Double(3.0)).unwrap();
+        rec.put_field("DOPT", EpicsValue::Short(1)).unwrap(); // Use OCAL
+        rec.put_field("OCAL", EpicsValue::String("5".into()))
+            .unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.oval, 5.0, "good OCAL seeds OVAL");
+        assert_eq!(rec.val, 3.0, "CALC side is unaffected");
+        // Break OCAL: a bare binary operator underflows the stack.
+        rec.put_field("OCAL", EpicsValue::String("+".into()))
+            .unwrap();
+        rec.process().unwrap();
+        assert_eq!(rec.oval, -1.0, "OCAL-fail forces OVAL=-1 (C:771)");
+        assert_eq!(rec.osv, "***ERROR***", "OCAL-fail forces OSV (C:772)");
+        // VAL stays at the good CALC result — the sentinel is OCAL-side only.
+        assert_eq!(
+            rec.val, 3.0,
+            "OCAL-fail must NOT touch VAL (C sets oval, not val)"
+        );
     }
 }

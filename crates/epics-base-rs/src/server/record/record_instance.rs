@@ -2129,6 +2129,21 @@ impl RecordInstance {
             ));
         }
 
+        // `CompleteDeferOutput` (swait ODLY delay-start) is NOT special-cased
+        // here: it deliberately shares the Complete value-side snapshot builder
+        // below. C `swaitRecord.c::process` posts the value side (`monitor()`,
+        // line 475) on the delaying cycle, so building the snapshot now is the
+        // correct, parity-matching behavior — unlike `CompleteNoEmit` above,
+        // whose fall-through would wrongly emit. The variant's *other* halves —
+        // holding PACT across the delay and deferring OUT/OEVT/FLNK to the
+        // `ReprocessAfter` continuation — are the engine path's responsibility
+        // (`processing.rs::process_record_with_links_inner`); `process_local` is
+        // a body-only test helper that dispatches no FLNK/output and no
+        // `ProcessAction`, and no test drives a swait ODLY record through it. So
+        // the invariant still holds by construction across both dispatch paths:
+        // both publish the value side here, both leave the output side to the
+        // engine.
+
         // UDF update before alarm evaluation — C parity (see
         // `processing.rs`). A NaN / undefined value keeps UDF true so
         // `recGblCheckUDF` raises UDF_ALARM this cycle instead of the

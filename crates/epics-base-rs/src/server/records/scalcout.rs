@@ -518,15 +518,18 @@ impl Record for ScalcoutRecord {
             true
         };
 
+        // IVOA=Don't_drive on a failed calc vetoes the OUT WRITE only. C
+        // applies the veto inside `execOutput` (sCalcoutRecord.c:430), which
+        // runs AFTER the ODLY decision — so an OOPT-fires + ODLY>0 cycle must
+        // still schedule the delay, pulse DLYA, and fire FLNK on the
+        // continuation; only the OUT link stays unwritten. Modelling the veto
+        // as an early `return` skipped the ODLY branch entirely.
+        let mut ivoa_veto_out = false;
         if calc_failed {
             self.calc_alarm = true;
             // Invalid calc — check IVOA
             match self.ivoa {
-                1 => {
-                    // Don't drive output — suppress the OUT write.
-                    self.cached_should_output = false;
-                    return Ok(ProcessOutcome::complete());
-                }
+                1 => ivoa_veto_out = true, // Don't drive outputs
                 2 => {
                     self.val = self.ivov;
                 }
@@ -534,9 +537,13 @@ impl Record for ScalcoutRecord {
             }
         }
 
-        // Determine output
-        let do_output = self.should_output();
-        if do_output {
+        // OOPT decides whether output fires — this gates the ODLY delay + DLYA
+        // pulse + completion (C `doOutput`). The IVOA=Don't_drive veto removes
+        // only the OUT write. `write_out == oopt_fires` on every
+        // non-Don't_drive path, so OVAL/OUT behaviour is unchanged there.
+        let oopt_fires = self.should_output();
+        let write_out = oopt_fires && !ivoa_veto_out;
+        if write_out {
             if self.dopt == 1 {
                 // Use OCAL. A broken OCAL (compile OR eval failure)
                 // raises CALC_ALARM — sibling calcout.rs does the same,
@@ -583,9 +590,9 @@ impl Record for ScalcoutRecord {
         // pass: post only DLYA now, suppress this cycle's output, and re-process
         // after the delay; the `dlya == 1` branch at the top then emits.
         // Mirrors calcout.rs.
-        if do_output && self.odly > 0.0 {
+        if oopt_fires && self.odly > 0.0 {
             self.dlya = 1;
-            self.pending_output = true;
+            self.pending_output = write_out;
             self.cached_should_output = false;
             let delay = std::time::Duration::from_secs_f64(self.odly);
             return Ok(ProcessOutcome {
@@ -598,7 +605,7 @@ impl Record for ScalcoutRecord {
             });
         }
 
-        self.cached_should_output = do_output;
+        self.cached_should_output = write_out;
         Ok(ProcessOutcome::complete())
     }
 
@@ -932,6 +939,53 @@ mod tests {
         rec.process().unwrap();
         // No compiled calc → nothing happens, oval stays 0
         assert_eq!(rec.oval, 0.0);
+    }
+
+    #[test]
+    fn scalcout_ivoa_dont_drive_still_delays_via_odly() {
+        // R47 gap: calc-fail + IVOA=Don't_drive + OOPT-fires + ODLY>0. C
+        // schedules the ODLY delay regardless of IVOA (sCalcoutRecord.c:399-408
+        // is upstream of execOutput, where the Don't_drive veto applies at
+        // :430 on the continuation) — so the record still pulses DLYA 1→0 and
+        // fires FLNK on the continuation; only the OUT write is suppressed. It
+        // must NOT complete immediately as the old IVOA==1 early-return did.
+        let mut rec = ScalcoutRecord::new();
+        rec.calc = "???invalid".into();
+        rec.compiled_calc = None; // calc fails
+        rec.put_field("IVOA", EpicsValue::Short(1)).unwrap(); // Don't drive
+        rec.put_field("OUT", EpicsValue::String("sink.VAL".into()))
+            .unwrap();
+        rec.put_field("ODLY", EpicsValue::Double(0.05)).unwrap();
+        // OOPT=0 (Every): output fires.
+        let outcome = rec.process().unwrap();
+        // Delaying cycle: DLYA set, ReprocessAfter scheduled, OUT suppressed.
+        assert_eq!(
+            rec.get_field("DLYA"),
+            Some(EpicsValue::Short(1)),
+            "Don't_drive must still delay: DLYA set"
+        );
+        assert!(
+            rec.multi_output_links().is_empty(),
+            "Don't_drive suppresses the OUT write on the delaying cycle"
+        );
+        assert!(
+            outcome
+                .actions
+                .iter()
+                .any(|a| matches!(a, ProcessAction::ReprocessAfter(_))),
+            "Don't_drive + ODLY>0 schedules the delayed re-process"
+        );
+        // Continuation: DLYA clears; OUT stays unwritten (the veto holds).
+        rec.process().unwrap();
+        assert_eq!(
+            rec.get_field("DLYA"),
+            Some(EpicsValue::Short(0)),
+            "DLYA cleared on the continuation"
+        );
+        assert!(
+            rec.multi_output_links().is_empty(),
+            "Don't_drive: OUT stays unwritten on the continuation"
+        );
     }
 
     #[test]

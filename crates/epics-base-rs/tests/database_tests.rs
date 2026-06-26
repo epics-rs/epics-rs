@@ -3762,6 +3762,45 @@ async fn test_udf_cleared_by_process_with_links() {
     assert!(!rec.read().await.common.udf);
 }
 
+/// An asyn int32 readback delivers its value via `apply_raw_readback`
+/// (sets VAL, requests skip-convert), then the record processes. C
+/// `devAsynInt32.c::processAo` sets `pr->udf = isnan(value)` *inside* the
+/// readback (:994); epics-rs sets UDF in the framework process loop instead
+/// (`clears_udf()` true + `value_is_undefined() == val.is_nan()`), so a
+/// finite readback value clears UDF exactly as C does — the device body
+/// does not own UDF. Regression guard for the int32-ao udf-on-readback path
+/// (the recurring "int32-ao udf-on-NaN" residual is framework-handled, not
+/// a divergence).
+#[tokio::test]
+async fn test_ao_asyn_readback_clears_udf_via_framework() {
+    let db = PvDatabase::new();
+    db.add_record("REC", Box::new(AoRecord::new(0.0)))
+        .await
+        .unwrap();
+    let rec = db.get_record("REC").await.unwrap();
+    assert!(rec.read().await.common.udf, "ao starts undefined");
+
+    // Simulate the asyn readback: device sets VAL from the raw and asks the
+    // framework to skip the forward VAL->RVAL convert.
+    {
+        let mut g = rec.write().await;
+        assert!(g.record.apply_raw_readback(150), "ao claims the readback");
+        g.record.set_device_did_compute(true);
+    }
+
+    let mut visited = HashSet::new();
+    db.process_record_with_links("REC", &mut visited, 0)
+        .await
+        .unwrap();
+
+    let g = rec.read().await;
+    assert!(
+        !g.common.udf,
+        "finite readback value clears UDF (isnan(value)==false)"
+    );
+    assert_eq!(g.record.get_field("VAL"), Some(EpicsValue::Double(150.0)));
+}
+
 #[tokio::test]
 async fn test_udf_not_cleared_by_clears_udf_false() {
     struct NoClearRecord {

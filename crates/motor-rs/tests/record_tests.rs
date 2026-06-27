@@ -3491,7 +3491,7 @@ fn test_move_to_home_defaults_to_move_absolute() {
     let mut sim = motor_rs::sim_motor::SimMotor::new();
     let user = AsynUser::new(0);
     // move_to_home's default impl delegates to move_absolute(position=3.0).
-    sim.move_to_home(&user, 3.0, 1.0, 0.5).unwrap();
+    sim.move_to_home(&user, 3.0, 0.0, 1.0, 0.5).unwrap();
     let status = sim.poll(&user).unwrap();
     // The sim must now be moving toward 3.0 from its start at 0.0.
     assert!(status.moving, "move_to_home should start a move");
@@ -3593,10 +3593,18 @@ fn test_default_asyn_motor_enable_pco_is_noop() {
             _: f64,
             _: f64,
             _: f64,
+            _: f64,
         ) -> asyn_rs::error::AsynResult<()> {
             Ok(())
         }
-        fn home(&mut self, _: &AsynUser, _: f64, _: bool) -> asyn_rs::error::AsynResult<()> {
+        fn home(
+            &mut self,
+            _: &AsynUser,
+            _: f64,
+            _: f64,
+            _: f64,
+            _: bool,
+        ) -> asyn_rs::error::AsynResult<()> {
             Ok(())
         }
         fn stop(&mut self, _: &AsynUser, _: f64) -> asyn_rs::error::AsynResult<()> {

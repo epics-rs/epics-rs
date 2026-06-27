@@ -80,36 +80,40 @@ impl MotorDeviceSupport {
             let result = match cmd {
                 MotorCommand::MoveAbsolute {
                     position,
+                    min_velocity,
                     velocity,
                     acceleration,
                 } => {
                     tracing::info!("motor command: MoveAbsolute pos={position}, vel={velocity}");
-                    motor.move_absolute(&user, *position, *velocity, *acceleration)
+                    motor.move_absolute(&user, *position, *min_velocity, *velocity, *acceleration)
                 }
                 MotorCommand::MoveRelative {
                     distance,
+                    min_velocity,
                     velocity,
                     acceleration,
                 } => {
                     tracing::info!("motor command: MoveRelative dist={distance}, vel={velocity}");
-                    motor.move_relative(&user, *distance, *velocity, *acceleration)
+                    motor.move_relative(&user, *distance, *min_velocity, *velocity, *acceleration)
                 }
                 MotorCommand::MoveVelocity {
                     direction,
+                    min_velocity,
                     velocity,
                     acceleration,
                 } => {
                     let signed_vel = if *direction { *velocity } else { -*velocity };
                     tracing::info!("motor command: MoveVelocity dir={direction}, vel={velocity}");
-                    motor.move_velocity(&user, signed_vel, *acceleration)
+                    motor.move_velocity(&user, *min_velocity, signed_vel, *acceleration)
                 }
                 MotorCommand::Home {
                     forward,
+                    min_velocity,
                     velocity,
-                    acceleration: _,
+                    acceleration,
                 } => {
                     tracing::info!("motor command: Home forward={forward}");
-                    motor.home(&user, *velocity, *forward)
+                    motor.home(&user, *min_velocity, *velocity, *acceleration, *forward)
                 }
                 MotorCommand::Stop { acceleration } => {
                     tracing::info!("motor command: Stop");
@@ -149,13 +153,14 @@ impl MotorDeviceSupport {
                 }
                 MotorCommand::MoveToHome {
                     position,
+                    min_velocity,
                     velocity,
                     acceleration,
                 } => {
                     tracing::info!(
                         "motor command: MoveToHome position={position} velocity={velocity} accel={acceleration}"
                     );
-                    motor.move_to_home(&user, *position, *velocity, *acceleration)
+                    motor.move_to_home(&user, *position, *min_velocity, *velocity, *acceleration)
                 }
                 MotorCommand::EnablePco { enable } => {
                     tracing::info!("motor command: EnablePco({enable})");

@@ -1008,6 +1008,7 @@ impl MotorRecord {
         self.stat.cdir = dial_forward != (self.conv.mres < 0.0);
         effects.commands.push(MotorCommand::MoveVelocity {
             direction: dial_forward,
+            min_velocity: self.effective_vbas(),
             velocity: self.vel.jvel,
             acceleration: self.jog_accel_egu(),
         });
@@ -1285,6 +1286,7 @@ impl MotorRecord {
 
         effects.commands.push(MotorCommand::Home {
             forward: hw_forward,
+            min_velocity: self.effective_vbas(),
             velocity: self.vel.hvel,
             acceleration: self.home_accel_egu(),
         });
@@ -1508,15 +1510,18 @@ impl MotorRecord {
         velocity: f64,
         acceleration: f64,
     ) {
+        let min_velocity = self.effective_vbas();
         if use_rel {
             effects.commands.push(MotorCommand::MoveRelative {
                 distance: rel_distance,
+                min_velocity,
                 velocity,
                 acceleration,
             });
         } else {
             effects.commands.push(MotorCommand::MoveAbsolute {
                 position: abs_position,
+                min_velocity,
                 velocity,
                 acceleration,
             });
@@ -2019,6 +2024,7 @@ impl MotorRecord {
             let dial_forward = forward != (self.conv.dir == MotorDir::Neg);
             effects.commands.push(MotorCommand::MoveVelocity {
                 direction: dial_forward,
+                min_velocity: self.effective_vbas(),
                 velocity: self.vel.jvel,
                 acceleration: self.jog_accel_egu(),
             });

@@ -289,7 +289,9 @@ impl AxisRuntime {
                     acceleration,
                 } => self
                     .motor
-                    .move_absolute(&user, *position, *velocity, *acceleration),
+                    // The generic axis runtime carries no base velocity
+                    // (VBAS) — that lives in the motor record — so min is 0.
+                    .move_absolute(&user, *position, 0.0, *velocity, *acceleration),
                 AxisMotorCommand::MoveVelocity {
                     direction,
                     velocity,
@@ -297,13 +299,15 @@ impl AxisRuntime {
                 } => {
                     let target = if *direction { 1e9 } else { -1e9 };
                     self.motor
-                        .move_absolute(&user, target, *velocity, *acceleration)
+                        .move_absolute(&user, target, 0.0, *velocity, *acceleration)
                 }
                 AxisMotorCommand::Home {
                     forward,
                     velocity,
-                    acceleration: _,
-                } => self.motor.home(&user, *velocity, *forward),
+                    acceleration,
+                } => self
+                    .motor
+                    .home(&user, 0.0, *velocity, *acceleration, *forward),
                 AxisMotorCommand::Stop { acceleration } => self.motor.stop(&user, *acceleration),
                 AxisMotorCommand::SetPosition { position } => {
                     self.motor.set_position(&user, *position)
@@ -374,6 +378,7 @@ mod tests {
             &mut self,
             _user: &AsynUser,
             pos: f64,
+            _min_vel: f64,
             _vel: f64,
             _acc: f64,
         ) -> AsynResult<()> {
@@ -381,7 +386,14 @@ mod tests {
             self.moving = true;
             Ok(())
         }
-        fn home(&mut self, _user: &AsynUser, _vel: f64, _forward: bool) -> AsynResult<()> {
+        fn home(
+            &mut self,
+            _user: &AsynUser,
+            _min_vel: f64,
+            _vel: f64,
+            _acc: f64,
+            _forward: bool,
+        ) -> AsynResult<()> {
             self.target = 0.0;
             self.moving = true;
             Ok(())

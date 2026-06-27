@@ -250,11 +250,15 @@ pub enum CommandSource {
 pub enum MotorCommand {
     MoveAbsolute {
         position: f64,
+        /// Base/start velocity (VBAS, EGU/sec) sent to the driver ahead of the
+        /// move — canonical asyn `SET_VEL_BASE`/`minVelocity`.
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     },
     MoveRelative {
         distance: f64,
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     },
@@ -264,17 +268,20 @@ pub enum MotorCommand {
         /// commands `jogv = (jvel * dir) / mres` — the velocity sign
         /// carries DIR).
         direction: bool,
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     },
     Home {
         forward: bool,
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     },
     /// Absolute move to a controller-defined home position (C: a6f64591).
     MoveToHome {
         position: f64,
+        min_velocity: f64,
         velocity: f64,
         acceleration: f64,
     },

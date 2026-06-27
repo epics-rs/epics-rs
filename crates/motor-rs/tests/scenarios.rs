@@ -1106,12 +1106,13 @@ fn sim_motor_end_to_end() {
     // Execute command on motor — use very high velocity for test speed
     if let MotorCommand::MoveAbsolute {
         position,
+        min_velocity,
         acceleration,
         ..
     } = &effects.commands[0]
     {
         motor
-            .move_absolute(&user, *position, 100000.0, *acceleration)
+            .move_absolute(&user, *position, *min_velocity, 100000.0, *acceleration)
             .unwrap();
     }
 
@@ -1293,12 +1294,13 @@ fn sim_motor_sequential_moves() {
         for cmd in &effects.commands {
             if let MotorCommand::MoveAbsolute {
                 position,
+                min_velocity,
                 velocity,
                 acceleration,
             } = cmd
             {
                 motor
-                    .move_absolute(&user, *position, *velocity, *acceleration)
+                    .move_absolute(&user, *position, *min_velocity, *velocity, *acceleration)
                     .unwrap();
             }
         }
@@ -1338,12 +1340,13 @@ fn rbv_updates_during_move() {
     for cmd in &effects.commands {
         if let MotorCommand::MoveAbsolute {
             position,
+            min_velocity,
             velocity,
             acceleration,
         } = cmd
         {
             motor
-                .move_absolute(&user, *position, *velocity, *acceleration)
+                .move_absolute(&user, *position, *min_velocity, *velocity, *acceleration)
                 .unwrap();
         }
     }
@@ -1398,12 +1401,13 @@ fn sim_motor_homing() {
     for cmd in &effects.commands {
         if let MotorCommand::MoveAbsolute {
             position,
+            min_velocity,
             velocity,
             acceleration,
         } = cmd
         {
             motor
-                .move_absolute(&user, *position, *velocity, *acceleration)
+                .move_absolute(&user, *position, *min_velocity, *velocity, *acceleration)
                 .unwrap();
         }
     }
@@ -1433,10 +1437,15 @@ fn sim_motor_homing() {
 
     for cmd in &effects.commands {
         if let MotorCommand::Home {
-            velocity, forward, ..
+            min_velocity,
+            velocity,
+            acceleration,
+            forward,
         } = cmd
         {
-            motor.home(&user, *velocity, *forward).unwrap();
+            motor
+                .home(&user, *min_velocity, *velocity, *acceleration, *forward)
+                .unwrap();
         }
     }
 

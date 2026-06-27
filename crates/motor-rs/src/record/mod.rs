@@ -920,6 +920,25 @@ mod tests {
         assert!(common.udf, "a pass without a DOL read leaves udf alone");
     }
 
+    // R61: a settled-idle record keeps the poller alive (Start), never Stop.
+    // C asynMotorController::asynMotorPoller (asynMotorController.cpp:615-696)
+    // is a while(1) that never stops idle polling, so the MIP_EXTERNAL detector
+    // and the idle-poll button resume keep firing. Pre-R61 the settled pass
+    // emitted PollDirective::Stop, stranding both end-to-end.
+    #[test]
+    fn settled_idle_keeps_poller_alive_not_stopped() {
+        let mut rec = MotorRecord::new();
+        rec.stat.dmov = true;
+        // No commands, no schedule_delay, no request_poll / status_refresh.
+        let effects = ProcessEffects::default();
+        let actions = rec.effects_to_actions(&effects);
+        assert_eq!(
+            actions.poll,
+            PollDirective::Start,
+            "a settled idle record must keep the poller alive, not stop it"
+        );
+    }
+
     // R44: C never derives motor UDF from VAL — motorRecord.cc touches udf
     // only at init_record (677-681), the closed-loop DOL collection
     // (1994-2005), and alarm_sub (3372). clears_udf() opts out of the

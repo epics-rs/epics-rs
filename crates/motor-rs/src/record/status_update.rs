@@ -85,7 +85,21 @@ impl MotorRecord {
             PollDirective::Start
         } else if effects.commands.is_empty() && effects.schedule_delay.is_none() && self.stat.dmov
         {
-            PollDirective::Stop
+            // C asynMotorController::asynMotorPoller (asynMotorController.cpp:
+            // 615-696) is a while(1) that NEVER stops idle polling — it polls
+            // every idlePollPeriod_ when !anyMoving, so an external move / limit
+            // trip / encoder drift while the record is idle is still detected.
+            // The MIP_EXTERNAL detector (status_update.rs:239) and the idle-poll
+            // button resume (the Idle-arm dispatch_latent_collection) both
+            // depend on this poll. Keep the poller alive at the idle rate
+            // (effective_poll_interval returns idle_poll_interval once the
+            // completing poll cleared last_moving) instead of stopping it; Start
+            // is idempotent via the polling_active dedup while already polling,
+            // and resumes the poller after a settle delay (ScheduleDelay reset
+            // polling_active). The record intentionally never emits Stop — C has
+            // no record-driven poller stop; idle_poll_interval == 0 gives C's
+            // event-only idle mode (idlePollPeriod_ == 0) at the loop's timed arm.
+            PollDirective::Start
         } else {
             PollDirective::None
         };

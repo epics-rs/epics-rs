@@ -317,6 +317,61 @@ async fn test_poll_loop_lifecycle() {
     assert!(result.is_ok(), "poll loop should terminate after Shutdown");
 }
 
+/// R61: a zero idle poll interval is event-only, never a busy-spin.
+/// C `asynMotorController::asynMotorPoller` (asynMotorController.cpp:633-634)
+/// treats `idlePollPeriod_ == 0` as "block on the event, no timed poll". The
+/// Rust loop guards the `sleep(interval)` select arm on `!interval.is_zero()`,
+/// so with a settled (done, not-moving) motor StartPolling triggers exactly
+/// one poll and the loop then blocks on the command channel. Without the guard
+/// `sleep(Duration::ZERO)` would fire immediately on every iteration, spinning
+/// the CPU and flooding io_intr.
+#[tokio::test]
+async fn test_zero_idle_interval_is_event_only_not_busy_spin() {
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new()));
+    let (poll_cmd_tx, poll_cmd_rx) = mpsc::channel(16);
+    let device_state = motor_rs::device_state::new_shared_state();
+    let (io_intr_tx, mut io_intr_rx) = mpsc::channel::<()>(16);
+
+    // idle interval 0 == C idlePollPeriod_ == 0 (event-only); moving 5ms.
+    let poll_loop = motor_rs::poll_loop::MotorPollLoop::new(
+        poll_cmd_rx,
+        io_intr_tx,
+        motor,
+        device_state.clone(),
+        Duration::from_millis(5),
+        Duration::ZERO,
+        0,
+    );
+    let poll_handle = tokio::spawn(poll_loop.run());
+
+    // Continuously drain io_intr so a (would-be) busy-spin is NOT throttled by
+    // channel backpressure — without draining, a spin stalls on the full
+    // channel and masks itself.
+    tokio::spawn(async move { while io_intr_rx.recv().await.is_some() {} });
+
+    poll_cmd_tx.send(PollCommand::StartPolling).await.unwrap();
+
+    // Give any erroneous busy-spin a 100ms window to accumulate polls.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // seq starts at 1 (init), +1 for the single StartPolling poll → 2.
+    // A busy-spin would drive it into the hundreds/thousands.
+    let seq = device_state
+        .lock()
+        .unwrap()
+        .latest_status
+        .as_ref()
+        .map(|s| s.seq)
+        .unwrap_or(0);
+    assert_eq!(
+        seq, 2,
+        "zero idle interval must poll once on StartPolling then block (event-only), got seq {seq}"
+    );
+
+    let _ = poll_cmd_tx.send(PollCommand::Shutdown).await;
+    let _ = poll_handle.await;
+}
+
 // Helper: read the SimMotor's current dial position.
 fn read_motor_pos(motor: &Arc<Mutex<dyn AsynMotor>>) -> f64 {
     let mut m = motor.lock().unwrap();

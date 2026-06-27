@@ -149,7 +149,11 @@ impl MotorPollLoop {
                             }
                         }
                     }
-                    _ = tokio::time::sleep(interval) => {
+                    // C asynMotorController.cpp:633-634: idlePollPeriod_ == 0
+                    // blocks on the event (no timed poll). A zero effective
+                    // interval disables this timed arm so the loop is
+                    // event-driven only, never busy-spinning on sleep(0).
+                    _ = tokio::time::sleep(interval), if !interval.is_zero() => {
                         self.poll_and_notify().await;
                     }
                 }

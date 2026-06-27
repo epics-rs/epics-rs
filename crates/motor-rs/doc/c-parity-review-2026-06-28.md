@@ -33,6 +33,11 @@ rather than re-sequenced.
 
 22 distinct active findings.
 
+**Cleared so far (10):** R1, R23, R43, R59 (all DEFECTs); R21, R22, R24, R41
+(CONCERNs); R46, R62 (NITs). **Remaining open (12):** R2, R3, R5, R25, R42,
+R44, R45, R60, R61 (CONCERNs), R6, R26, R27 (NITs) — R25/R45/R60/R61 are
+cross-crate (asyn-rs); R5/R6/R42/R44 need decisions; R2/R3/R26/R27 mechanical.
+
 ---
 
 ## Review Log
@@ -178,8 +183,15 @@ routes into `plan_absolute_move`. No defect.
 - **Impact:** stale ACCU slave-field readback (the master field and the accel sent to the
   driver are unaffected) — wrong slave-field value, not wrong motion.
 
-#### R22 — ACCL/ACCS puts auto-switch ACCU and seed ACCS=1.0 — neither is in the reference C
+#### R22 — ACCL/ACCS puts auto-switch ACCU and seed ACCS=1.0 — neither is in the reference C — CLEARED (`70f3dfc9`)
 - **Severity:** CONCERN (needs decision — verify upstream before fixing)
+- **Resolution:** Verified upstream — C commit `63bfe5d0` ("Changed ACCU from a
+  readback to a control") deliberately removed the 2018 `36177f7b` auto-switch
+  from `updateACCSfromACCL`/`updateACCLfromACCS`. Current C `special()` never
+  assigns `pmr->accu` (only reads at 489/525); a non-positive ACCS is derived
+  from ACCL (`updateACCSfromACCL`, `accs=velo/accl`), not a literal `1.0`. The
+  Rust was a half-port (it adopted 63bfe5d0 for the ACCU put but kept 36177f7b
+  for ACCL/ACCS puts). Aligned to current C; not a C bug.
 - **Rust:** `field_access.rs:1455` (ACCL→`accu=Accl`) and `:1467-1469`
   (ACCS→`accs = if v<=0 {1.0} else {v}; accu=Accs`).
 - **C:** `motorRecord.cc:2735-2742`/`2745-2752` — neither case assigns `pmr->accu`
@@ -256,7 +268,7 @@ routes into `plan_absolute_move`. No defect.
 
 ### Category C — Status / readback / monitor / MSTA-MIP / alarm
 
-#### R41 — URIP RDBL readback scaling runs during the initial readback (C suppresses it via `initcall`)
+#### R41 — URIP RDBL readback scaling runs during the initial readback (C suppresses it via `initcall`) — CLEARED (`f93eea9b`)
 - **Severity:** CONCERN
 - **Rust:** `record/status_update.rs:155` — URIP path gates on `self.initialized`, but
   `determine_event` flips `self.initialized=true` *before* returning `Startup` (`:59-61`),
@@ -343,7 +355,7 @@ routes into `plan_absolute_move`. No defect.
 > (`device_support.rs:275-277`, `asyn-rs/motor.rs:93-95`). Findings judge SEMANTIC equivalence
 > of the command/status contract, not the raw-vs-EGU frame.
 
-#### R59 — `device_support.init()` reseeds the controller position ignoring RSTM, loadpos_blocked (#231), and the #196 MRES guard
+#### R59 — `device_support.init()` reseeds the controller position ignoring RSTM, loadpos_blocked (#231), and the #196 MRES guard — CLEARED (`3644f3a7`)
 - **Severity:** DEFECT
 - **Rust:** `device_support.rs:262-278` — at device init, if `was_position_restored()`
   (any pass0 VAL/DVAL/RVAL/RLV write, `mod.rs:158-165`) it calls `motor.set_position(&user,

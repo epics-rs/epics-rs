@@ -555,6 +555,20 @@ impl Record for MotorRecord {
             .any(|f| f.eq_ignore_ascii_case(field))
     }
 
+    /// C never derives the motor's UDF from VAL. `motorRecord.cc` touches
+    /// `udf` in exactly three places: init_record (677-681, CONSTANT .dol →
+    /// FALSE), the closed-loop DOL collection (1994-2005, DB_LINK read
+    /// fail → TRUE / success → FALSE), and alarm_sub (3372 consumes it).
+    /// The framework's default `clears_udf()` would instead recompute
+    /// `udf = value_is_undefined()` (VAL.is_nan()) every process pass — a
+    /// divergence that both fabricates UDF on a transient NaN VAL and, on a
+    /// no-DOL-read pass, clobbers the legitimate closed-loop DOL outcome.
+    /// Opt out so motor UDF is owned solely by the DOL channel
+    /// (`dol_udf` → check_alarms) and the init clear in `initial_readback`.
+    fn clears_udf(&self) -> bool {
+        false
+    }
+
     /// C `alarm_sub()` (motorRecord.cc:3367-3406) — motor-specific alarm
     /// severities, raised into `nsta`/`nsev` before the framework's
     /// `evaluate_alarms`.
@@ -904,6 +918,74 @@ mod tests {
         rec.set_resolved_input_links(&[]);
         rec.check_alarms(&mut common);
         assert!(common.udf, "a pass without a DOL read leaves udf alone");
+    }
+
+    // R44: C never derives motor UDF from VAL — motorRecord.cc touches udf
+    // only at init_record (677-681), the closed-loop DOL collection
+    // (1994-2005), and alarm_sub (3372). clears_udf() opts out of the
+    // framework's value_is_undefined() per-cycle derivation.
+    #[test]
+    fn motor_opts_out_of_val_derived_udf() {
+        let rec = MotorRecord::new();
+        assert!(
+            !rec.clears_udf(),
+            "motor UDF must not be recomputed from VAL each process pass"
+        );
+    }
+
+    // C init_record (677-681): a CONSTANT .dol clears UDF at init. An unset
+    // DOL is CONSTANT, so the common (no-DOL) axis is defined after init.
+    #[test]
+    fn constant_dol_clears_udf_at_init() {
+        use epics_base_rs::server::record::CommonFields;
+        let mut rec = MotorRecord::new();
+        rec.links.dol = String::new(); // unset DOL == CONSTANT
+        let status = asyn_rs::interfaces::motor::MotorStatus {
+            position: 0.0,
+            encoder_position: 0.0,
+            done: true,
+            moving: false,
+            ..Default::default()
+        };
+        rec.initial_readback(&status);
+        assert_eq!(
+            rec.internal.dol_udf,
+            Some(false),
+            "init arms the UDF clear for a CONSTANT DOL"
+        );
+        let mut common = CommonFields::default(); // udf == true (dbCommon default)
+        rec.check_alarms(&mut common);
+        assert!(!common.udf, "CONSTANT DOL motor is defined after init");
+    }
+
+    // C leaves udf TRUE for a non-CONSTANT .dol (init_record only clears for
+    // CONSTANT, 677-681); only the closed-loop collection's first successful
+    // read clears it (1994-2005).
+    #[test]
+    fn db_link_dol_leaves_udf_undefined_at_init() {
+        use epics_base_rs::server::record::CommonFields;
+        let mut rec = MotorRecord::new();
+        rec.links.omsl = 1; // closed_loop
+        rec.links.dol = "setpoint_src.VAL".to_string(); // DB_LINK
+        let status = asyn_rs::interfaces::motor::MotorStatus {
+            position: 0.0,
+            encoder_position: 0.0,
+            done: true,
+            moving: false,
+            ..Default::default()
+        };
+        rec.initial_readback(&status);
+        assert_ne!(
+            rec.internal.dol_udf,
+            Some(false),
+            "a DB_LINK DOL is not cleared at init"
+        );
+        let mut common = CommonFields::default(); // udf == true
+        rec.check_alarms(&mut common);
+        assert!(
+            common.udf,
+            "DB_LINK DOL motor stays undefined until the first DOL read"
+        );
     }
 
     // C reads DOL only when dol.type == DB_LINK; a constant DOL is initialised

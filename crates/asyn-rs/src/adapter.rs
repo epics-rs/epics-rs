@@ -1837,6 +1837,15 @@ impl DeviceSupport for AsynDeviceSupport {
                 // cannot carry RARM/BUSY — nothing to commit.
                 return Ok(DeviceReadOutcome::ok());
             };
+            // Invalid FTVL leaves `buf` None: the record cannot acquire. C makes
+            // it DEAD at init (`goto bad; pr->pact=1`, devAsynXXXTimeSeries.h:73-77,
+            // 118-120) so it never processes and BUSY stays 0. The port has no
+            // device-driven dead-record, so read() is inert here — leaving BUSY,
+            // NORD, VAL and RARM untouched — so a stray `caput RARM` cannot flip
+            // BUSY or emit completion traffic on a misconfigured record.
+            if ts.inner.lock().unwrap().buf.is_none() {
+                return Ok(DeviceReadOutcome::computed());
+            }
             let rarm = wf.rarm;
             let (arr, busy, status) = {
                 let mut st = ts.inner.lock().unwrap();
@@ -3801,8 +3810,14 @@ mod tests {
         );
         assert!(ads.io_intr_receiver().is_some());
 
+        // A caput RARM=1 must not bring the misconfigured record to life: C's
+        // record is dead (pact=1) so BUSY stays 0 and it never processes.
         rec.rarm = 1;
         ads.read(&mut rec).unwrap();
+        assert!(
+            !rec.busy,
+            "invalid-FTVL record stays inert (BUSY=0) like C's dead record"
+        );
         interrupts.notify(InterruptValue {
             reason,
             addr: 0,
@@ -3816,6 +3831,10 @@ mod tests {
             "no buffer → nothing accumulates"
         );
         assert_eq!(rec.nord, 0, "NORD untouched when the record cannot acquire");
+        assert!(
+            !rec.busy,
+            "BUSY remains 0 — the inert read() never flips it"
+        );
     }
 
     /// The factory maps each TimeSeries DTYP to its base interface and arms the

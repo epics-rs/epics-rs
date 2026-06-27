@@ -92,6 +92,20 @@ pub const HSC_ERROR_MESSAGES: [&str; 14] = [
     "Invalid Motor Specified",
 ];
 
+/// Classify a controller `ERROR;` response into `(error_code, message)`,
+/// matching C's `numWords`-based handling (xia_slit.st:1253-1262): a code-less
+/// `ERROR;` (`None`) reports `ERROR_UNKNOWN` with "<id>: unknown error", while a
+/// code present in the 0..13 table reports that code and its `hscErrors[]` text.
+/// An out-of-table code also maps to `ERROR_UNKNOWN` (C indexes `hscErrors[]`
+/// unguarded there — a C boundary bug we deliberately do not copy). Shared by
+/// both HSC ports so they cannot disagree on the code-less case.
+pub fn classify_hsc_error(code: Option<i32>, id: &str) -> (i32, String) {
+    match code {
+        Some(c) if (0..14).contains(&c) => (c, HSC_ERROR_MESSAGES[c as usize].to_string()),
+        _ => (ERROR_UNKNOWN, format!("{id}: unknown error")),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // HSC1 Control/Status Word bits
 // ---------------------------------------------------------------------------
@@ -951,13 +965,8 @@ impl HscController {
                 }
             }
             HscResponse::Error { id, code } => {
-                let code_val = code.unwrap_or(0);
-                let msg = if (0..14).contains(&code_val) {
-                    HSC_ERROR_MESSAGES[code_val as usize].to_string()
-                } else {
-                    format!("{}: unknown error", id)
-                };
-                self.error = code.unwrap_or(ERROR_UNKNOWN);
+                let (err, msg) = classify_hsc_error(*code, id);
+                self.error = err;
                 self.error_msg = msg;
                 // Mark the axis as idle on error
                 if id == &self.h_id {
@@ -1942,6 +1951,26 @@ mod tests {
         assert!(!ctrl.h_busy);
         assert_eq!(ctrl.error, 6);
         assert_eq!(ctrl.error_msg, "Value Out of Range");
+    }
+
+    #[test]
+    fn classify_hsc_error_codeless_is_unknown_not_index_zero() {
+        // Code-less "ERROR;" -> ERROR_UNKNOWN + "<id>: unknown error"
+        // (xia_slit.st:1253-1256), NOT error 0 / "Missing Command".
+        assert_eq!(
+            classify_hsc_error(None, "H-1"),
+            (ERROR_UNKNOWN, "H-1: unknown error".to_string())
+        );
+        // In-table code -> that code + its hscErrors[] text.
+        assert_eq!(
+            classify_hsc_error(Some(9), "H-1"),
+            (9, "No Movement Required".to_string())
+        );
+        // Out-of-table code -> ERROR_UNKNOWN (no unguarded index like C).
+        assert_eq!(
+            classify_hsc_error(Some(14), "V-1"),
+            (ERROR_UNKNOWN, "V-1: unknown error".to_string())
+        );
     }
 
     #[test]

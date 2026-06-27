@@ -87,7 +87,10 @@ Four call-graph clusters audited in parallel:
 ### Category A — Process & motion engine
 
 #### R1 — Positional move stopped by a limit switch never syncs VAL/DVAL/RVAL ← readback
-- **Severity:** DEFECT
+- **Severity:** DEFECT — **CLEARED** (commit `dbfff1dd`): `ls_blocks_retry` branch of
+  `evaluate_position_error` now calls `postprocess_sync()`. Scoped to the LS-stop alone
+  (a plain `MOVE_ABS` never sets C `pp`, so close-enough/rtry-disabled stay un-synced,
+  matching C). MIP_STOP Pause-at-limit split out as R64.
 - **Rust:** `record/state_machine.rs:660-671` — `evaluate_position_error` ls-blocked
   branch calls `finalize_motion` (`:437-476`), which sets `mip=empty`/`dmov=true` and
   `lval/ldvl/lrvl = current val/dval/rval` (`:461-463`) but never calls
@@ -189,7 +192,7 @@ routes into `plan_absolute_move`. No defect.
   carried forward. **Decide:** is Rust tracking a post-R7-4-5 upstream, or is this a bug?
   Resolve against the actual C before any edit.
 
-#### R23 — NTMF served as DBF_DOUBLE — the C field is DBF_USHORT
+#### R23 — NTMF served as DBF_DOUBLE — the C field is DBF_USHORT — **CLEARED** (`9cb719b2`)
 - **Severity:** DEFECT
 - **Rust:** `field_access.rs:531-534` `FieldDesc{name:"NTMF", dbf_type:Double}`; read `:789`
   returns `EpicsValue::Double`; put `:1985-1990` clamps as float; stored `f64`
@@ -204,7 +207,7 @@ routes into `plan_absolute_move`. No defect.
   wrong for any client introspecting it. Fix: `DbFieldType::UShort`. (Spot-check: NTMF is the
   ONLY DBF_USHORT field; SREV=Long✓, RTRY=Short✓.)
 
-#### R24 — STUP-after-write (≠ON) and NTMF (<2) return Ok where C returns ERROR to block processing
+#### R24 — STUP-after-write (≠ON) and NTMF (<2) return Ok where C returns ERROR to block processing — **CLEARED** (`d68cdfde`)
 - **Severity:** CONCERN
 - **Rust:** `field_access.rs:1866-1870` (STUP `!=1` → set 0, `Ok(())`); `:1985-1990`
   (NTMF `<2` → set 2, `Ok(())`).
@@ -279,7 +282,7 @@ routes into `plan_absolute_move`. No defect.
 - **Impact:** init-time DMOV differs; FLNK fires only on DMOV=true, so C fires the forward link
   once at init for a moving axis and Rust does not. Transient; init monitor/FLNK not C-faithful.
 
-#### R43 — MSTA RA_HOMED (bit 14) is latched at the record level; C copies the driver word wholesale
+#### R43 — MSTA RA_HOMED (bit 14) is latched at the record level; C copies the driver word wholesale — **CLEARED** (`65df336b`)
 - **Severity:** DEFECT
 - **Rust:** `status_update.rs:284-286` — building MSTA each poll: `if msta.contains(HOMED) ||
   status.homed { msta |= HOMED }` — OR-ed from the *previous* MSTA, so once set it is never
@@ -323,7 +326,7 @@ routes into `plan_absolute_move`. No defect.
   EA_SLIP_STALL); only `camonitor MSTA` diverges by one bit. Fix requires a new `MotorStatus`
   field (cross-crate, asyn-rs).
 
-#### R46 — CNEN refreshed from EA_POSITION on every poll, not only on an MSTA-post cycle
+#### R46 — CNEN refreshed from EA_POSITION on every poll, not only on an MSTA-post cycle — **CLEARED** (`5123734a`)
 - **Severity:** NIT
 - **Rust:** `status_update.rs:293-295` — `if msta.contains(GAIN_SUPPORT) { cnen =
   msta.contains(POSITION) }` runs every `process_motor_info`.
@@ -391,7 +394,7 @@ routes into `plan_absolute_move`. No defect.
   dead in exactly the state it exists for. May be an intentional efficiency choice; documented
   C-semantics divergence (parity-review.md already flags MIP_EXTERNAL as a regression risk).
 
-#### R62 — RMP/REP rounding mode — `round()` (half away from zero) vs C `floor(x+0.5)` (half toward +∞)
+#### R62 — RMP/REP rounding mode — `round()` (half away from zero) vs C `floor(x+0.5)` (half toward +∞) — **CLEARED** (`7259f9ed`)
 - **Severity:** NIT
 - **Rust:** `status_update.rs:127` `rmp=(position/mres).round()`; `:144` `rep=(enc/eres).round()`
   — `f64::round` is half away from zero.
@@ -400,6 +403,25 @@ routes into `plan_absolute_move`. No defect.
 - **Impact:** 1-raw-step RMP/REP discrepancy only at exact .5 boundaries; negligible.
 
 #### R63 — MERGED into R45 (MSTA EA_SLIP bit 4 unrepresentable). Same root, found independently.
+
+#### R64 — MIP_STOP Pause that coasts onto a limit switch does not sync VAL/DVAL/RVAL ← readback
+- **Severity:** CONCERN (candidate; reachability + design-intent to verify)
+- **Rust:** `record/state_machine.rs:246-265` — the MIP_STOP completion handler's `pp == false`
+  (Pause) branch runs an inline `maybeRetry`; its `ls_blocks` else-arm (`:256-264`) clears MISS
+  and restores SPMG Move→Pause but never calls `postprocess_sync()`. The comment (`:208-211`)
+  reasons "a Pause never set pp → postProcess skipped → LS just blocks the retry."
+- **C:** `motorRecord.cc:1366-1380` fires on *any* motor-stopped callback with `mip != MIP_DONE`
+  and a struck limit in direction — independent of `pp` — forcing `pp=TRUE` + GET_INFO and
+  `mip=MIP_DONE` (`:1377`). The next callback's `postProcess` (`:826-849`) then syncs val=rbv.
+  So a paused axis that ends ON a limit in the commanded direction is a *terminal* LS-completion
+  in C (synced, DONE), not a resumable pause.
+- **Divergence:** Rust treats "paused at a limit in direction" as a resumable-pause with blocked
+  retry (target preserved, no sync); C treats it as a terminal LS-stop (synced, mip=DONE).
+- **Impact:** Edge — requires a Pause-stop to complete exactly on a limit switch in the commanded
+  direction. If reachable, VAL stays at the unreached target after the limit, and Go would
+  attempt to resume toward it. Distinct trigger from R1 (commanded Pause vs positional
+  auto-completion); fixing it changes Pause-at-limit from resumable to terminal, so it needs the
+  review round to confirm reachability before any edit. Found during the R1 defect-family sweep.
 
 ---
 

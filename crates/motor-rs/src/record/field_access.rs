@@ -1453,9 +1453,17 @@ pub(crate) fn motor_put_field(
                 rec.vel.accl = if v <= 0.0 { 0.1 } else { v };
                 // C: 36177f7b — writing ACCL switches ACCU to Accl and recalcs ACCS
                 rec.vel.accu = AccsUsed::Accl;
-                let span = rec.vel.velo - rec.effective_vbas();
-                if rec.vel.accl > 0.0 && span > 0.0 {
-                    rec.vel.accs = span / rec.vel.accl;
+                // C updateACCSfromACCL (motorRecord.cc:512-521): numerator is
+                // (velo - vbas) only while velo > vbas; at velo <= vbas C uses
+                // the full velo and still recomputes ACCS.
+                let vbas = rec.effective_vbas();
+                let numerator = if rec.vel.velo > vbas {
+                    rec.vel.velo - vbas
+                } else {
+                    rec.vel.velo
+                };
+                if rec.vel.accl > 0.0 {
+                    rec.vel.accs = numerator / rec.vel.accl;
                 }
                 Ok(())
             }
@@ -1467,9 +1475,17 @@ pub(crate) fn motor_put_field(
                 rec.vel.accs = if v <= 0.0 { 1.0 } else { v };
                 // C: 36177f7b — writing ACCS switches ACCU to Accs and recalcs ACCL
                 rec.vel.accu = AccsUsed::Accs;
-                let span = rec.vel.velo - rec.effective_vbas();
-                if rec.vel.accs > 0.0 && span > 0.0 {
-                    rec.vel.accl = span / rec.vel.accs;
+                // C updateACCLfromACCS (motorRecord.cc:499-510): numerator is
+                // (velo - vbas) only while velo > vbas; at velo <= vbas C uses
+                // the full velo and still recomputes ACCL.
+                let vbas = rec.effective_vbas();
+                let numerator = if rec.vel.velo > vbas {
+                    rec.vel.velo - vbas
+                } else {
+                    rec.vel.velo
+                };
+                if rec.vel.accs > 0.0 {
+                    rec.vel.accl = numerator / rec.vel.accs;
                 }
                 Ok(())
             }
@@ -2144,19 +2160,24 @@ fn put_link_string(value: EpicsValue, slot: &mut String, name: &str) -> CaResult
 /// Recalc the slave of ACCL/ACCS after VELO or VBAS changes.
 /// C: `7291b556` (2023-05-19) — when ACCU=Accl, ACCS follows; when ACCU=Accs, ACCL follows.
 fn apply_accu_cascade(rec: &mut MotorRecord) {
-    let span = rec.vel.velo - rec.effective_vbas();
-    if span <= 0.0 {
-        return; // C: span must be positive; otherwise leave master untouched
-    }
+    // C updateACCL_ACCSfromVELO (motorRecord.cc:523-546): the accel-rate
+    // numerator is (velo - vbas) only while velo > vbas; at velo <= vbas C
+    // uses the full velo, and recomputes/posts the slave field in BOTH cases.
+    let vbas = rec.effective_vbas();
+    let numerator = if rec.vel.velo > vbas {
+        rec.vel.velo - vbas
+    } else {
+        rec.vel.velo
+    };
     match rec.vel.accu {
         AccsUsed::Accl => {
             if rec.vel.accl > 0.0 {
-                rec.vel.accs = span / rec.vel.accl;
+                rec.vel.accs = numerator / rec.vel.accl;
             }
         }
         AccsUsed::Accs => {
             if rec.vel.accs > 0.0 {
-                rec.vel.accl = span / rec.vel.accs;
+                rec.vel.accl = numerator / rec.vel.accs;
             }
         }
     }

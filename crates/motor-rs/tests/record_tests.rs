@@ -3746,17 +3746,46 @@ fn test_accl_stays_positive_when_velo_equals_vbas() {
 }
 
 #[test]
-fn test_accu_cascade_safe_when_velo_equals_vbas() {
-    // span <= 0.0 → apply_accu_cascade leaves master untouched.
+fn test_accu_cascade_recomputes_slave_with_full_velo_when_velo_equals_vbas() {
+    // C updateACCL_ACCSfromVELO (motorRecord.cc:523-546): at velo <= vbas the
+    // numerator is the full velo (not the span), and the slave is STILL
+    // recomputed/posted — it is not left at its stale value.
     let mut rec = MotorRecord::new();
     rec.vel.accu = AccsUsed::Accl;
     rec.vel.accl = 2.0;
-    rec.vel.accs = 5.0; // pre-existing slave value
+    rec.vel.accs = 5.0; // pre-existing slave value (must be overwritten)
     rec.vel.vbas = 5.0;
     rec.put_field("VELO", EpicsValue::Double(5.0)).unwrap();
-    // ACCS slave should not be set to 0 just because span == 0
-    assert!(rec.vel.accs > 0.0);
-    assert!((rec.vel.accs - 5.0).abs() < 1e-12);
+    // velo == vbas → numerator = velo = 5.0; ACCS = 5.0 / 2.0 = 2.5
+    assert!((rec.vel.accs - 2.5).abs() < 1e-12, "ACCS={}", rec.vel.accs);
+}
+
+#[test]
+fn test_put_accl_recomputes_accs_with_full_velo_when_velo_le_vbas() {
+    // C updateACCSfromACCL (motorRecord.cc:512-521): writing ACCL recomputes
+    // ACCS; at velo <= vbas the numerator is the full velo, not the span.
+    let mut rec = MotorRecord::new();
+    rec.vel.vbas = 8.0;
+    rec.put_field("VELO", EpicsValue::Double(5.0)).unwrap(); // velo < vbas
+    rec.vel.accs = 99.0; // stale slave that must be overwritten
+    rec.put_field("ACCL", EpicsValue::Double(2.0)).unwrap();
+    assert_eq!(rec.vel.accu, AccsUsed::Accl);
+    // velo < vbas → numerator = velo = 5.0; ACCS = 5.0 / 2.0 = 2.5
+    assert!((rec.vel.accs - 2.5).abs() < 1e-12, "ACCS={}", rec.vel.accs);
+}
+
+#[test]
+fn test_put_accs_recomputes_accl_with_full_velo_when_velo_le_vbas() {
+    // C updateACCLfromACCS (motorRecord.cc:499-510): writing ACCS recomputes
+    // ACCL; at velo <= vbas the numerator is the full velo, not the span.
+    let mut rec = MotorRecord::new();
+    rec.vel.vbas = 8.0;
+    rec.put_field("VELO", EpicsValue::Double(5.0)).unwrap(); // velo < vbas
+    rec.vel.accl = 99.0; // stale slave that must be overwritten
+    rec.put_field("ACCS", EpicsValue::Double(4.0)).unwrap();
+    assert_eq!(rec.vel.accu, AccsUsed::Accs);
+    // velo < vbas → numerator = velo = 5.0; ACCL = 5.0 / 4.0 = 1.25
+    assert!((rec.vel.accl - 1.25).abs() < 1e-12, "ACCL={}", rec.vel.accl);
 }
 
 // --- Home ignores soft limit error (C: dbcf4bc2 2011-10, 85511023 2013-06) ---

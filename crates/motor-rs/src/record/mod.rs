@@ -278,6 +278,13 @@ impl Record for MotorRecord {
                 ("RVAL".to_string(), EpicsValue::Int64(self.pos.rval)),
                 ("RBV".to_string(), EpicsValue::Double(self.pos.rbv)),
                 ("DRBV".to_string(), EpicsValue::Double(self.pos.drbv)),
+                // C do_work move block (motorRecord.cc:2248-2256) recomputes
+                // diff=dval-drbv + MARK(M_DIFF) and rdif=NINT(diff/mres) +
+                // MARK(M_RDIF) before too_small/LVIO, so monitor() posts the
+                // new full-distance following error on the move-start pass.
+                // `plan_absolute_move` already refreshed pos.diff/pos.rdif.
+                ("DIFF".to_string(), EpicsValue::Double(self.pos.diff)),
+                ("RDIF".to_string(), EpicsValue::Int64(self.pos.rdif)),
                 // C do_work marks M_MIP on every move dispatch and
                 // M_RCNT when the retry count resets (motorRecord.cc:
                 // 1929-1932), so the move-start monitor() pass posts

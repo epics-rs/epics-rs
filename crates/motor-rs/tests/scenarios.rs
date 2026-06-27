@@ -968,6 +968,44 @@ fn coalesced_put_and_status_split_into_two_passes() {
 }
 
 #[test]
+fn move_start_notify_posts_diff_and_rdif() {
+    // R2: C do_work move block (motorRecord.cc:2248-2256) marks M_DIFF/M_RDIF
+    // before too_small/LVIO, so monitor() posts the new full-distance
+    // following error on the move-start pass. The Rust DMOV 1->0 notify must
+    // carry DIFF and RDIF, not just the position triplet.
+    use epics_base_rs::server::record::RecordProcessResult;
+    use motor_rs::device_state::new_shared_state;
+
+    let state = new_shared_state();
+    state.lock().unwrap().latest_status = Some(idle_status_at(1, 0.0));
+
+    let mut rec = make_record(); // mres = 0.001
+    rec.set_device_state(state.clone());
+    rec.process().unwrap(); // startup: drbv = 0.0
+    state.lock().unwrap().pending_actions.take();
+
+    rec.put_field("VAL", EpicsValue::Double(10.0)).unwrap();
+    let outcome = rec.process().unwrap();
+    let fields = match outcome.result {
+        RecordProcessResult::AsyncPendingNotify(fields) => fields,
+        other => panic!("expected move-start AsyncPendingNotify, got {other:?}"),
+    };
+    // diff = dval - drbv = 10 - 0 = 10; rdif = NINT(diff/mres) = 10/0.001 = 10000.
+    let diff = fields.iter().find(|(n, _)| n == "DIFF").map(|(_, v)| v);
+    let rdif = fields.iter().find(|(n, _)| n == "RDIF").map(|(_, v)| v);
+    assert_eq!(
+        diff,
+        Some(&EpicsValue::Double(10.0)),
+        "move-start notify posts DIFF = dval - drbv"
+    );
+    assert_eq!(
+        rdif,
+        Some(&EpicsValue::Int64(10000)),
+        "move-start notify posts RDIF = NINT(diff/mres)"
+    );
+}
+
+#[test]
 fn coalesced_put_and_delay_expiry_keeps_watchdog() {
     // The settle-delay timer is one-shot (poll_loop::spawn_delay): an
     // expiry consumed by a put-owned pass has no second chance, and

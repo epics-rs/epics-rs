@@ -852,13 +852,24 @@ impl PvDatabase {
                 // (e.g. compress RES reset zeroing NUSE/VAL) get their monitors
                 // posted here, mirroring the explicit `db_post_events` a C
                 // `special()` makes — these fields are not pp(TRUE), so no
-                // process cycle would otherwise post them.
+                // process cycle would otherwise post them. Each post carries
+                // VALUE|LOG unless the record names the field in
+                // `value_only_change_fields()` — a record whose C `special()`
+                // posts the field with a literal `DBE_VALUE` (e.g. table SET,
+                // tableRecord.c:659) gets the LOG bit stripped, honoring the
+                // same value-only contract as the change-detection path.
+                let side_effect_value_only = instance.record.value_only_change_fields();
                 for sf in instance.record.monitor_side_effect_fields(&field) {
-                    instance.notify_field(
-                        sf,
-                        crate::server::recgbl::EventMask::VALUE
-                            | crate::server::recgbl::EventMask::LOG,
-                    );
+                    use crate::server::recgbl::EventMask;
+                    let mask = if side_effect_value_only
+                        .iter()
+                        .any(|f| f.eq_ignore_ascii_case(sf))
+                    {
+                        EventMask::VALUE
+                    } else {
+                        EventMask::VALUE | EventMask::LOG
+                    };
+                    instance.notify_field(sf, mask);
                 }
             }
 

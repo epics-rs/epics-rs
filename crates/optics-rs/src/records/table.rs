@@ -3883,6 +3883,19 @@ impl Record for TableRecord {
         TABLE_VALUE_ONLY_FIELDS
     }
 
+    /// C `tableRecord.c::special()` flips SET mode on an `SSET`/`SUSE` write
+    /// and posts `SET` with `DBE_VALUE` (tableRecord.c:658-663). Neither
+    /// `SSET` nor `SUSE` is `pp(TRUE)`, so no process cycle posts `SET`; the
+    /// framework posts it here as a side effect of the put. `SET` is named in
+    /// [`TABLE_VALUE_ONLY_FIELDS`], so the side-effect post carries
+    /// `DBE_VALUE` only — matching C's literal mask.
+    fn monitor_side_effect_fields(&self, put_field: &str) -> &'static [&'static str] {
+        match put_field {
+            "SSET" | "SUSE" => &["SET"],
+            _ => &[],
+        }
+    }
+
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
             self.vers = VERSION;
@@ -4653,6 +4666,25 @@ mod tests {
                 "value-only field {f} absent from field_list"
             );
         }
+    }
+
+    #[test]
+    fn test_sset_suse_post_set_as_side_effect() {
+        let t = TableRecord::new();
+
+        // C special() flips SET mode on SSET/SUSE and posts SET with
+        // DBE_VALUE; SSET/SUSE are not pp, so the SET monitor must come from
+        // the side-effect post, not a process cycle.
+        assert_eq!(t.monitor_side_effect_fields("SSET"), &["SET"]);
+        assert_eq!(t.monitor_side_effect_fields("SUSE"), &["SET"]);
+        // Unrelated puts trigger no side-effect post.
+        assert!(t.monitor_side_effect_fields("AX").is_empty());
+        assert!(t.monitor_side_effect_fields("SYNC").is_empty());
+
+        // SET is a value-only field, so the framework strips the LOG bit from
+        // the side-effect post — the SET monitor carries DBE_VALUE alone,
+        // matching C's literal db_post_events(set, DBE_VALUE).
+        assert!(t.value_only_change_fields().contains(&"SET"));
     }
 
     #[test]

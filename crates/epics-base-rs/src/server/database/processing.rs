@@ -2238,22 +2238,6 @@ impl PvDatabase {
                 instance.common.udf = instance.record.value_is_undefined();
             }
 
-            // SIMM simulation severity on a redirected OUTPUT record. C
-            // `writeValue` raises `recGblSetSevr(prec, SIMM_ALARM, prec->sims)`
-            // BEFORE `checkAlarms`, so the SIMM stat/amsg wins on a severity
-            // tie (the same ordering `sim_process_tail` documents for the
-            // input branch). A simulated INPUT already raised this inside
-            // `check_simulation_mode` and short-circuited; this is the output
-            // twin, raised here at the equivalent point in the uniform flow.
-            if let Some((_, sims, _)) = &sim_output {
-                let sev = crate::server::record::AlarmSeverity::from_u16(*sims as u16);
-                crate::server::recgbl::rec_gbl_set_sevr(
-                    &mut instance.common,
-                    crate::server::recgbl::alarm_status::SIMM_ALARM,
-                    sev,
-                );
-            }
-
             // Per-record alarm hook — record-type-specific STATE / COS
             // / limit / SOFT alarms (C `checkAlarms()`). Records that
             // have migrated their alarm logic here raise into
@@ -2350,6 +2334,35 @@ impl PvDatabase {
                 }
             }
 
+            // IVOA gate severity for a redirected SIMM output. C decides
+            // `if (prec->nsev < INVALID_ALARM)` at the `writeValue` call
+            // (aoRecord.c:197) using the severity `checkAlarms` produced —
+            // BEFORE `writeValue` raises SIMM_ALARM. Snapshot the real
+            // (pre-SIMM) pending severity here so a `SIMS=INVALID` never flips
+            // the IVOA decision: with a finite, in-range VAL the IVOA veto must
+            // NOT fire and C still writes OVAL to SIOL. For a non-simulated
+            // record no SIMM_ALARM is raised below, so `nsev` here equals the
+            // committed `sevr`, leaving the IVOA gate unchanged.
+            let real_sev = instance.common.nsev;
+
+            // SIMM simulation severity on a redirected OUTPUT record. C
+            // `writeValue` raises `recGblSetSevr(prec, SIMM_ALARM, prec->sims)`
+            // AFTER `checkAlarms` (aoRecord.c:196 -> :582 / boRecord.c:219 ->
+            // :436), so a coincident limit/state alarm of equal severity keeps
+            // its stat/amsg (set first; `rec_gbl_set_sevr` is strict-greater).
+            // A simulated INPUT instead raises this inside
+            // `check_simulation_mode` before its body, because `readValue`
+            // precedes the body. Raised here (after the alarm hooks, before the
+            // commit) it still folds into this cycle's committed SEVR.
+            if let Some((_, sims, _)) = &sim_output {
+                let sev = crate::server::record::AlarmSeverity::from_u16(*sims as u16);
+                crate::server::recgbl::rec_gbl_set_sevr(
+                    &mut instance.common,
+                    crate::server::recgbl::alarm_status::SIMM_ALARM,
+                    sev,
+                );
+            }
+
             // Transfer nsta/nsev -> sevr/stat, detect alarm change
             let alarm_result = crate::server::recgbl::rec_gbl_reset_alarms(&mut instance.common);
 
@@ -2360,9 +2373,13 @@ impl PvDatabase {
             // keeps UDF true and UDF_ALARM is raised this cycle. Do
             // NOT clear UDF unconditionally here.
 
-            // IVOA check for output records with INVALID alarm
-            let skip_out = if instance.common.sevr == crate::server::record::AlarmSeverity::Invalid
-            {
+            // IVOA check for output records with INVALID alarm. Gate on the
+            // real (pre-SIMM) severity `real_sev` snapshotted above — C decides
+            // IVOA from `prec->nsev` at the `writeValue` call, before
+            // `writeValue` raises SIMM_ALARM, so a `SIMS=INVALID` simulation
+            // severity does not trigger the veto (the committed `sevr` may be
+            // INVALID from SIMM while the record's own alarm is not).
+            let skip_out = if real_sev == crate::server::record::AlarmSeverity::Invalid {
                 let ivoa = instance
                     .record
                     .get_field("IVOA")

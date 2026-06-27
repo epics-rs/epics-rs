@@ -127,13 +127,16 @@ async fn sim_output_runs_bo_high_momentary_reset_in_sim_mode() {
     );
 }
 
-/// Output IVOA veto parity: a SIMM=YES `ao` whose simulation severity SIMS is
-/// INVALID raises SIMM_ALARM to INVALID; with IVOA = "Don't drive outputs" C
-/// skips `writeValue` entirely (the SIOL write included), so the SIOL target is
-/// NOT updated. The redirect runs through the same `skip_out` IVOA gate as a
-/// real device write, so the simulated write is suppressed identically.
+/// IVOA is decided from the record's OWN alarm severity, NOT from a
+/// `SIMS=INVALID` simulation severity. C `aoRecord.c::process` evaluates the
+/// IVOA gate `if (prec->nsev < INVALID_ALARM)` (:197) using the severity
+/// `checkAlarms` produced, and only THEN does `writeValue` raise
+/// `recGblSetSevr(SIMM_ALARM, sims)` (:582). So a SIMM=YES `ao` with a finite,
+/// in-range VAL (`nsev < INVALID` at the gate) takes the normal `writeValue`
+/// branch and DOES write OVAL to SIOL, even though SIMS=INVALID makes the
+/// final SEVR=INVALID. The IVOA Don't_drive veto is never consulted.
 #[tokio::test]
-async fn sim_output_ivoa_dont_drive_suppresses_siol_write() {
+async fn sim_output_sims_invalid_does_not_veto_siol_write() {
     let db = PvDatabase::new();
     db.add_record("AOIV_SW", Box::new(AoRecord::new(1.0)))
         .await
@@ -142,11 +145,11 @@ async fn sim_output_ivoa_dont_drive_suppresses_siol_write() {
         .await
         .unwrap();
 
-    let mut ao = AoRecord::new(5.0);
+    let mut ao = AoRecord::new(5.0); // finite, in range -> own alarm NoAlarm
     ao.siml = "AOIV_SW".to_string();
     ao.siol = "AOIV_TGT".to_string();
     ao.sims = 3; // SIMM severity = INVALID
-    ao.ivoa = 1; // Don't drive outputs
+    ao.ivoa = 1; // Don't drive outputs — must NOT fire (own nsev is NoAlarm)
     db.add_record("AOIV", Box::new(ao)).await.unwrap();
 
     let mut v1 = HashSet::new();
@@ -154,16 +157,109 @@ async fn sim_output_ivoa_dont_drive_suppresses_siol_write() {
         .await
         .unwrap();
 
-    // SIMM_ALARM raised to INVALID.
+    // SIMM_ALARM makes the committed SEVR INVALID...
     let sevr = db.get_pv("AOIV.SEVR").await.unwrap();
     assert!(
         matches!(sevr, EpicsValue::Short(3)),
-        "SIMM_ALARM raised to INVALID from SIMS, got {sevr:?}"
+        "SIMM_ALARM raised the committed SEVR to INVALID, got {sevr:?}"
     );
-    // IVOA=Don't_drive vetoed the (simulated) write: target untouched.
+    // ...but the IVOA gate saw the record's own NoAlarm severity, so C writes
+    // OVAL to SIOL. The veto must NOT have fired.
     let tgt = db.get_pv("AOIV_TGT").await.unwrap();
     assert!(
+        matches!(tgt, EpicsValue::Double(v) if (v - 5.0).abs() < 1e-10),
+        "SIMS=INVALID did NOT trigger the IVOA veto; OVAL=5 written to SIOL, got {tgt:?}"
+    );
+}
+
+/// The IVOA Don't_drive veto DOES fire when the record's OWN alarm is INVALID.
+/// A `bo` with `OSV=INVALID` and `VAL=1` raises STATE_ALARM/INVALID in
+/// `checkAlarms`, so the IVOA gate (`nsev == INVALID`) selects Don't_drive and
+/// C skips `writeValue` — no SIOL write, and (because `writeValue` is skipped)
+/// SIMM_ALARM is never raised, so STAT stays STATE_ALARM. This guards that the
+/// switch to the pre-SIMM `real_sev` did not disable the genuine veto.
+#[tokio::test]
+async fn sim_output_real_invalid_alarm_ivoa_dont_drive_suppresses() {
+    use epics_base_rs::server::records::bo::BoRecord;
+
+    const STATE_ALARM: i16 = 7;
+    let db = PvDatabase::new();
+    db.add_record("BOIV_SW", Box::new(AoRecord::new(1.0)))
+        .await
+        .unwrap();
+    db.add_record("BOIV_TGT", Box::new(AoRecord::new(-99.0)))
+        .await
+        .unwrap();
+
+    let mut bo = BoRecord::new(1);
+    bo.siml = "BOIV_SW".to_string();
+    bo.siol = "BOIV_TGT".to_string();
+    bo.osv = 3; // one-state severity = INVALID -> real STATE_ALARM/INVALID
+    bo.sims = 0; // isolate: INVALID comes from the record's own alarm
+    bo.ivoa = 1; // Don't drive outputs
+    db.add_record("BOIV", Box::new(bo)).await.unwrap();
+
+    let mut v1 = HashSet::new();
+    db.process_record_with_links("BOIV", &mut v1, 0)
+        .await
+        .unwrap();
+
+    let sevr = db.get_pv("BOIV.SEVR").await.unwrap();
+    assert!(
+        matches!(sevr, EpicsValue::Short(3)),
+        "record's own STATE_ALARM/INVALID, got {sevr:?}"
+    );
+    let stat = db.get_pv("BOIV.STAT").await.unwrap();
+    assert!(
+        matches!(stat, EpicsValue::Short(STATE_ALARM)),
+        "STAT is the record's STATE_ALARM (writeValue/SIMM_ALARM skipped under Don't_drive), got {stat:?}"
+    );
+    let tgt = db.get_pv("BOIV_TGT").await.unwrap();
+    assert!(
         matches!(tgt, EpicsValue::Double(v) if (v + 99.0).abs() < 1e-10),
-        "IVOA Don't_drive suppressed the simulated SIOL write (target untouched), got {tgt:?}"
+        "IVOA Don't_drive on a real INVALID alarm suppressed the SIOL write, got {tgt:?}"
+    );
+}
+
+/// SIMM_ALARM is raised AFTER `checkAlarms` for outputs (C `writeValue` runs at
+/// process end), so on a severity TIE the record's own limit/state alarm — set
+/// first — owns STAT/AMSG (`recGblSetSevr` is strict-greater). A `bo` with
+/// `OSV=MINOR`, `VAL=1`, `SIMS=MINOR` must report STAT=STATE_ALARM, not
+/// STAT=SIMM_ALARM. (Pre-fix the SIMM raise preceded `checkAlarms`, so SIMM won
+/// the tie and STAT was wrongly SIMM_ALARM.)
+#[tokio::test]
+async fn sim_output_simm_alarm_loses_stat_on_severity_tie() {
+    use epics_base_rs::server::records::bo::BoRecord;
+
+    const STATE_ALARM: i16 = 7;
+    let db = PvDatabase::new();
+    db.add_record("BOTIE_SW", Box::new(AoRecord::new(1.0)))
+        .await
+        .unwrap();
+    db.add_record("BOTIE_TGT", Box::new(AoRecord::new(-99.0)))
+        .await
+        .unwrap();
+
+    let mut bo = BoRecord::new(1);
+    bo.siml = "BOTIE_SW".to_string();
+    bo.siol = "BOTIE_TGT".to_string();
+    bo.osv = 1; // one-state severity = MINOR -> STATE_ALARM/MINOR (set first)
+    bo.sims = 1; // SIMM severity = MINOR -> ties; must NOT override STAT
+    db.add_record("BOTIE", Box::new(bo)).await.unwrap();
+
+    let mut v1 = HashSet::new();
+    db.process_record_with_links("BOTIE", &mut v1, 0)
+        .await
+        .unwrap();
+
+    let sevr = db.get_pv("BOTIE.SEVR").await.unwrap();
+    assert!(
+        matches!(sevr, EpicsValue::Short(1)),
+        "tied MINOR severity, got {sevr:?}"
+    );
+    let stat = db.get_pv("BOTIE.STAT").await.unwrap();
+    assert!(
+        matches!(stat, EpicsValue::Short(STATE_ALARM)),
+        "on a tie the record's STATE_ALARM owns STAT (SIMM raised after checkAlarms), got {stat:?}"
     );
 }

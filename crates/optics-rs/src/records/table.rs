@@ -10,7 +10,9 @@ use std::f64::consts::PI;
 use std::sync::LazyLock;
 
 use epics_base_rs::error::{CaError, CaResult};
-use epics_base_rs::server::record::{FieldDesc, ProcessAction, ProcessOutcome, Record};
+use epics_base_rs::server::record::{
+    FieldDesc, FieldMetadataOverride, ProcessAction, ProcessOutcome, Record,
+};
 use epics_base_rs::types::{DbFieldType, EpicsValue, PvString};
 
 // ---------------------------------------------------------------------------
@@ -3107,6 +3109,14 @@ const TABLE_VALUE_ONLY_FIELDS: &[&str] = &[
     "LVIO", "SYNC", "INIT", "ZERO", "READ", "SET", "AEGU",
 ];
 
+/// Angle-class fields for which C `tableRecord.c::get_units` reports the
+/// angular engineering units `aegu` (tableRecord.c:758-768); every other
+/// field reports the linear units `legu` (the default branch, :770).
+const TABLE_ANGULAR_UNIT_FIELDS: &[&str] = &[
+    "AX", "AY", "AZ", "AX0", "AY0", "AZ0", "AXL", "AYL", "AZL", "AXRB", "AYRB", "AZRB", "EAX",
+    "EAY", "EAZ", "HLAX", "HLAY", "HLAZ", "LLAX", "LLAY", "LLAZ", "YANG",
+];
+
 impl Record for TableRecord {
     fn record_type(&self) -> &'static str {
         "table"
@@ -3894,6 +3904,47 @@ impl Record for TableRecord {
             "SSET" | "SUSE" => &["SET"],
             _ => &[],
         }
+    }
+
+    /// Per-field metadata C `tableRecord.c` serves through its RSET callbacks:
+    /// `get_units` (angle-class fields → `aegu`, all others → `legu`;
+    /// tableRecord.c:758-772), `get_graphic_double` / `get_control_double`
+    /// (the six user coordinates AX,AY,AZ,X,Y,Z report disp & ctrl limits =
+    /// `(hlax[i], llax[i])`; :784-787, :801-804), and `get_precision`
+    /// (`VERS` → 2; :820-821). The framework has no record-level metadata for
+    /// the `table` type, so without this hook a DBR_GR/CTRL/units request
+    /// returned no units and default (unset) limits.
+    fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
+        // C get_units: angle-class fields → aegu, every other field → legu.
+        let units = if TABLE_ANGULAR_UNIT_FIELDS
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(field))
+        {
+            self.aegu.clone()
+        } else {
+            self.legu.clone()
+        };
+        let mut ov = FieldMetadataOverride {
+            units: Some(units),
+            ..Default::default()
+        };
+
+        // C get_precision: VERS reports precision 2 (not the record PREC).
+        if field.eq_ignore_ascii_case("VERS") {
+            ov.precision = Some(2);
+        }
+
+        // C get_graphic_double / get_control_double: the six user-coordinate
+        // fields (the first six after AX) report disp & ctrl limits drawn from
+        // the calculated user limits hlax[i] (upper) / llax[i] (lower).
+        const COORDS: [&str; 6] = ["AX", "AY", "AZ", "X", "Y", "Z"];
+        if let Some(i) = COORDS.iter().position(|c| c.eq_ignore_ascii_case(field)) {
+            let limits = (self.calc_hi_limit()[i], self.calc_lo_limit()[i]);
+            ov.disp_limits = Some(limits);
+            ov.ctrl_limits = Some(limits);
+        }
+
+        Some(ov)
     }
 
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
@@ -4685,6 +4736,45 @@ mod tests {
         // the side-effect post — the SET monitor carries DBE_VALUE alone,
         // matching C's literal db_post_events(set, DBE_VALUE).
         assert!(t.value_only_change_fields().contains(&"SET"));
+    }
+
+    #[test]
+    fn test_field_metadata_override_units_limits_precision() {
+        let mut t = TableRecord::new();
+        t.aegu = "degrees".into();
+        t.legu = "mm".into();
+        t.set_calc_hi_limit(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        t.set_calc_lo_limit(&[-1.0, -2.0, -3.0, -4.0, -5.0, -6.0]);
+        let deg: PvString = "degrees".into();
+        let mm: PvString = "mm".into();
+
+        // Angular coordinate AX (i=0): aegu units + (hlax[0], llax[0]) limits.
+        let ax = t.field_metadata_override("AX").unwrap();
+        assert_eq!(ax.units, Some(deg.clone()));
+        assert_eq!(ax.disp_limits, Some((1.0, -1.0)));
+        assert_eq!(ax.ctrl_limits, Some((1.0, -1.0)));
+
+        // Linear coordinate X (i=3): legu units + (hlax[3], llax[3]) limits.
+        let x = t.field_metadata_override("X").unwrap();
+        assert_eq!(x.units, Some(mm.clone()));
+        assert_eq!(x.disp_limits, Some((4.0, -4.0)));
+        assert_eq!(x.ctrl_limits, Some((4.0, -4.0)));
+
+        // Angular non-coordinate field: aegu units, no limit override.
+        let axrb = t.field_metadata_override("AXRB").unwrap();
+        assert_eq!(axrb.units, Some(deg.clone()));
+        assert_eq!(axrb.disp_limits, None);
+        assert_eq!(axrb.ctrl_limits, None);
+
+        // Linear non-coordinate field: legu units.
+        let llz = t.field_metadata_override("LLZ").unwrap();
+        assert_eq!(llz.units, Some(mm.clone()));
+
+        // VERS: precision 2 (C get_precision), legu units, no limits.
+        let vers = t.field_metadata_override("VERS").unwrap();
+        assert_eq!(vers.precision, Some(2));
+        assert_eq!(vers.units, Some(mm));
+        assert_eq!(vers.disp_limits, None);
     }
 
     #[test]

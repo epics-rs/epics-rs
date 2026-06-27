@@ -45,10 +45,18 @@ pub struct WaveformRecord {
     pub nelm: i32,
     pub nord: i32,
     pub ftvl: i16,
-    pub mpst: i16,  // Monitor Post Mode: 0=Always, 1=OnChange
-    pub apst: i16,  // Archive Post Mode: 0=Always, 1=OnChange
-    pub hash: u32,  // Hash of array for OnChange detection
-    pub busy: bool, // Record is busy (async operation pending)
+    pub mpst: i16, // Monitor Post Mode: 0=Always, 1=OnChange
+    pub apst: i16, // Archive Post Mode: 0=Always, 1=OnChange
+    pub hash: u32, // Hash of array for OnChange detection
+    /// C `BUSY` (`DBF_SHORT`, `special(SPC_NOMOD)`): waveform acquisition-active
+    /// flag, set by waveform device support (e.g. `devAsynXXXTimeSeries`) and
+    /// read-only to CA clients. waveformRecord.dbd.pod:461. Waveform kind only.
+    pub busy: bool,
+    /// C `RARM` (`DBF_SHORT`, `pp(TRUE)`): re-arm acquisition control read by
+    /// waveform device support: 1=start (clear, arm), 2=stop, 3=resume, 0=no-op.
+    /// The device resets it to 0 each process. waveformRecord.dbd.pod:411.
+    /// Waveform kind only (aai/aao/subArray do not declare it).
+    pub rarm: i16,
     pub egu: PvString,
     pub hopr: f64,
     pub lopr: f64,
@@ -156,6 +164,7 @@ impl Default for WaveformRecord {
             apst: 0,
             hash: 0,
             busy: false,
+            rarm: 0,
             egu: PvString::new(),
             hopr: 0.0,
             lopr: 0.0,
@@ -387,6 +396,20 @@ static WAVEFORM_FIELDS_CHAR: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    // Waveform-only TimeSeries acquisition control (devAsynXXXTimeSeries):
+    // RARM `pp(TRUE)` client-settable, BUSY `special(SPC_NOMOD)` device-set.
+    // aai/aao/subArray do not declare these (they use their own field sets).
+    // waveformRecord.dbd.pod:411,461.
+    FieldDesc {
+        name: "RARM",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "BUSY",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
 ];
 
 static WAVEFORM_FIELDS_SHORT: &[FieldDesc] = &[
@@ -435,6 +458,20 @@ static WAVEFORM_FIELDS_SHORT: &[FieldDesc] = &[
         name: "PREC",
         dbf_type: DbFieldType::Short,
         read_only: false,
+    },
+    // Waveform-only TimeSeries acquisition control (devAsynXXXTimeSeries):
+    // RARM `pp(TRUE)` client-settable, BUSY `special(SPC_NOMOD)` device-set.
+    // aai/aao/subArray do not declare these (they use their own field sets).
+    // waveformRecord.dbd.pod:411,461.
+    FieldDesc {
+        name: "RARM",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "BUSY",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
     },
 ];
 
@@ -485,6 +522,20 @@ static WAVEFORM_FIELDS_LONG: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    // Waveform-only TimeSeries acquisition control (devAsynXXXTimeSeries):
+    // RARM `pp(TRUE)` client-settable, BUSY `special(SPC_NOMOD)` device-set.
+    // aai/aao/subArray do not declare these (they use their own field sets).
+    // waveformRecord.dbd.pod:411,461.
+    FieldDesc {
+        name: "RARM",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "BUSY",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
 ];
 
 static WAVEFORM_FIELDS_INT64: &[FieldDesc] = &[
@@ -533,6 +584,20 @@ static WAVEFORM_FIELDS_INT64: &[FieldDesc] = &[
         name: "PREC",
         dbf_type: DbFieldType::Short,
         read_only: false,
+    },
+    // Waveform-only TimeSeries acquisition control (devAsynXXXTimeSeries):
+    // RARM `pp(TRUE)` client-settable, BUSY `special(SPC_NOMOD)` device-set.
+    // aai/aao/subArray do not declare these (they use their own field sets).
+    // waveformRecord.dbd.pod:411,461.
+    FieldDesc {
+        name: "RARM",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "BUSY",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
     },
 ];
 
@@ -583,6 +648,20 @@ static WAVEFORM_FIELDS_UINT64: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    // Waveform-only TimeSeries acquisition control (devAsynXXXTimeSeries):
+    // RARM `pp(TRUE)` client-settable, BUSY `special(SPC_NOMOD)` device-set.
+    // aai/aao/subArray do not declare these (they use their own field sets).
+    // waveformRecord.dbd.pod:411,461.
+    FieldDesc {
+        name: "RARM",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "BUSY",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
 ];
 
 static WAVEFORM_FIELDS_FLOAT: &[FieldDesc] = &[
@@ -632,6 +711,20 @@ static WAVEFORM_FIELDS_FLOAT: &[FieldDesc] = &[
         dbf_type: DbFieldType::Short,
         read_only: false,
     },
+    // Waveform-only TimeSeries acquisition control (devAsynXXXTimeSeries):
+    // RARM `pp(TRUE)` client-settable, BUSY `special(SPC_NOMOD)` device-set.
+    // aai/aao/subArray do not declare these (they use their own field sets).
+    // waveformRecord.dbd.pod:411,461.
+    FieldDesc {
+        name: "RARM",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "BUSY",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
+    },
 ];
 
 static WAVEFORM_FIELDS_DOUBLE: &[FieldDesc] = &[
@@ -680,6 +773,20 @@ static WAVEFORM_FIELDS_DOUBLE: &[FieldDesc] = &[
         name: "PREC",
         dbf_type: DbFieldType::Short,
         read_only: false,
+    },
+    // Waveform-only TimeSeries acquisition control (devAsynXXXTimeSeries):
+    // RARM `pp(TRUE)` client-settable, BUSY `special(SPC_NOMOD)` device-set.
+    // aai/aao/subArray do not declare these (they use their own field sets).
+    // waveformRecord.dbd.pod:411,461.
+    FieldDesc {
+        name: "RARM",
+        dbf_type: DbFieldType::Short,
+        read_only: false,
+    },
+    FieldDesc {
+        name: "BUSY",
+        dbf_type: DbFieldType::Short,
+        read_only: true,
     },
 ];
 
@@ -855,6 +962,68 @@ static AAO_FIELDS_UINT64: &[FieldDesc] = aao_field_list!(DbFieldType::UInt64);
 static AAO_FIELDS_FLOAT: &[FieldDesc] = aao_field_list!(DbFieldType::Float);
 static AAO_FIELDS_DOUBLE: &[FieldDesc] = aao_field_list!(DbFieldType::Double);
 
+// aai field set. aai shares the `WaveformRecord` struct and the
+// waveform/aao field shape (NELM `special(SPC_NOMOD)` read_only, FTVL/NORD
+// load-settable-runtime-immutable), but unlike waveform it does NOT declare
+// RARM/BUSY (those are waveform-only TimeSeries control fields), and unlike
+// aao it has no OMSL/DOL. So aai gets its own set — the bare common shape —
+// rather than sharing the `WAVEFORM_FIELDS_*` set, keeping the FieldDesc
+// `read_only`/membership kind-correct by construction (aaiRecord.dbd.pod).
+macro_rules! aai_field_list {
+    ($valty:expr) => {
+        &[
+            FieldDesc {
+                name: "VAL",
+                dbf_type: $valty,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "NELM",
+                dbf_type: DbFieldType::Long,
+                read_only: true,
+            },
+            FieldDesc {
+                name: "NORD",
+                dbf_type: DbFieldType::Long,
+                read_only: true,
+            },
+            FieldDesc {
+                name: "FTVL",
+                dbf_type: DbFieldType::Short,
+                read_only: true,
+            },
+            FieldDesc {
+                name: "EGU",
+                dbf_type: DbFieldType::String,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "HOPR",
+                dbf_type: DbFieldType::Double,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "LOPR",
+                dbf_type: DbFieldType::Double,
+                read_only: false,
+            },
+            FieldDesc {
+                name: "PREC",
+                dbf_type: DbFieldType::Short,
+                read_only: false,
+            },
+        ]
+    };
+}
+
+static AAI_FIELDS_CHAR: &[FieldDesc] = aai_field_list!(DbFieldType::Char);
+static AAI_FIELDS_SHORT: &[FieldDesc] = aai_field_list!(DbFieldType::Short);
+static AAI_FIELDS_LONG: &[FieldDesc] = aai_field_list!(DbFieldType::Long);
+static AAI_FIELDS_INT64: &[FieldDesc] = aai_field_list!(DbFieldType::Int64);
+static AAI_FIELDS_UINT64: &[FieldDesc] = aai_field_list!(DbFieldType::UInt64);
+static AAI_FIELDS_FLOAT: &[FieldDesc] = aai_field_list!(DbFieldType::Float);
+static AAI_FIELDS_DOUBLE: &[FieldDesc] = aai_field_list!(DbFieldType::Double);
+
 impl Record for WaveformRecord {
     fn record_type(&self) -> &'static str {
         self.kind.as_record_type()
@@ -977,6 +1146,15 @@ impl Record for WaveformRecord {
             // record type that doesn't declare the field).
             "INDX" if matches!(self.kind, ArrayKind::SubArray) => Some(EpicsValue::Long(self.indx)),
             "MALM" if matches!(self.kind, ArrayKind::SubArray) => Some(EpicsValue::Long(self.malm)),
+            // Waveform-only RARM (re-arm control) / BUSY (acquisition-active),
+            // used by waveform device support (devAsynXXXTimeSeries). aai/aao/
+            // subArray do not declare them, so they are not exposed there.
+            "RARM" if matches!(self.kind, ArrayKind::Waveform) => {
+                Some(EpicsValue::Short(self.rarm))
+            }
+            "BUSY" if matches!(self.kind, ArrayKind::Waveform) => {
+                Some(EpicsValue::Short(self.busy as i16))
+            }
             "EGU" => Some(EpicsValue::String(self.egu.clone())),
             "HOPR" => Some(EpicsValue::Double(self.hopr)),
             "LOPR" => Some(EpicsValue::Double(self.lopr)),
@@ -1138,6 +1316,21 @@ impl Record for WaveformRecord {
                 self.malm = v.max(1);
                 Ok(())
             }
+            // Waveform-only RARM (re-arm control, pp(TRUE) — client-settable) and
+            // BUSY (acquisition-active, special(SPC_NOMOD) — device-set, not
+            // client-writable). The device support reads RARM and resets it to 0.
+            "RARM" if matches!(self.kind, ArrayKind::Waveform) => {
+                let v = match value {
+                    EpicsValue::Short(v) => v,
+                    EpicsValue::Long(v) => v as i16,
+                    _ => return Err(CaError::TypeMismatch("RARM".into())),
+                };
+                self.rarm = v;
+                Ok(())
+            }
+            "BUSY" if matches!(self.kind, ArrayKind::Waveform) => {
+                Err(CaError::ReadOnlyField(name.to_string()))
+            }
             "EGU" => {
                 if let EpicsValue::String(s) = value {
                     self.egu = s;
@@ -1219,13 +1412,14 @@ impl Record for WaveformRecord {
     }
 
     // `field_list` is keyed first by `ArrayKind`, then by FTVL element type.
-    // waveform/aai/aao use the `WAVEFORM_FIELDS_*` set; subArray uses the
-    // `SUBARRAY_FIELDS_*` set. The two differ only where the C dbd does: NELM is
-    // `special(SPC_NOMOD)` (`read_only: true`) for waveform/aai/aao but `pp(TRUE)`
-    // (`read_only: false`) for subArray, and MALM/INDX exist only on subArray.
-    // Selecting the set by kind makes the FieldDesc `read_only` flag kind-correct
-    // by construction, so it stays the single source the field_io runtime gate
-    // (`put_record_field_from_ca_inner`) reads — no per-kind runtime override.
+    // Each array kind selects its own field set, keyed then by FTVL element type:
+    // subArray -> `SUBARRAY_FIELDS_*` (NELM `pp(TRUE)`, plus MALM/INDX), aao ->
+    // `AAO_FIELDS_*` (common shape + OMSL/DOL), aai -> `AAI_FIELDS_*` (bare common
+    // shape), waveform -> `WAVEFORM_FIELDS_*` (common shape + RARM/BUSY). The sets
+    // differ exactly where the C dbd does. Selecting the set by kind makes each
+    // FieldDesc `read_only`/membership kind-correct by construction, so it stays
+    // the single source the field_io runtime gate (`put_record_field_from_ca_inner`)
+    // reads — no per-kind runtime override.
     fn field_list(&self) -> &'static [FieldDesc] {
         if matches!(self.kind, ArrayKind::SubArray) {
             return match self.ftvl {
@@ -1238,7 +1432,7 @@ impl Record for WaveformRecord {
                 _ => SUBARRAY_FIELDS_DOUBLE,
             };
         }
-        // aao adds OMSL/DOL to the waveform/aai shape (aaoRecord.dbd.pod).
+        // aao adds OMSL/DOL to the common shape (aaoRecord.dbd.pod).
         if matches!(self.kind, ArrayKind::Aao) {
             return match self.ftvl {
                 1 | 2 => AAO_FIELDS_CHAR,
@@ -1250,6 +1444,20 @@ impl Record for WaveformRecord {
                 _ => AAO_FIELDS_DOUBLE,
             };
         }
+        // aai is the bare common shape — no RARM/BUSY (waveform-only) and no
+        // OMSL/DOL (aao-only) (aaiRecord.dbd.pod).
+        if matches!(self.kind, ArrayKind::Aai) {
+            return match self.ftvl {
+                1 | 2 => AAI_FIELDS_CHAR,
+                3 | 4 => AAI_FIELDS_SHORT,
+                5 | 6 => AAI_FIELDS_LONG,
+                7 => AAI_FIELDS_INT64,
+                8 => AAI_FIELDS_UINT64,
+                9 => AAI_FIELDS_FLOAT,
+                _ => AAI_FIELDS_DOUBLE,
+            };
+        }
+        // waveform: common shape + RARM/BUSY (waveformRecord.dbd.pod).
         match self.ftvl {
             1 | 2 => WAVEFORM_FIELDS_CHAR,
             3 | 4 => WAVEFORM_FIELDS_SHORT,
@@ -1456,6 +1664,54 @@ mod array_kind_tests {
                 !names.contains(&"OMSL") && !names.contains(&"DOL"),
                 "{kind:?} must not declare OMSL/DOL"
             );
+        }
+    }
+
+    /// RARM (re-arm, `pp(TRUE)` settable) and BUSY (acquisition-active,
+    /// `special(SPC_NOMOD)` read-only) are waveform-only TimeSeries control
+    /// fields. They appear in the waveform field set with the correct read_only
+    /// flags and nowhere else; aai/aao/subArray expose neither.
+    #[test]
+    fn waveform_rarm_busy_fields_waveform_only() {
+        let wf = WaveformRecord::with_kind(ArrayKind::Waveform);
+        let rarm = wf
+            .field_list()
+            .iter()
+            .find(|f| f.name == "RARM")
+            .expect("waveform field_list must carry RARM");
+        let busy = wf
+            .field_list()
+            .iter()
+            .find(|f| f.name == "BUSY")
+            .expect("waveform field_list must carry BUSY");
+        assert!(!rarm.read_only, "RARM is pp(TRUE) — client-settable");
+        assert!(busy.read_only, "BUSY is special(SPC_NOMOD) — read-only");
+
+        // RARM round-trips through put/get; BUSY is read-only (device-set) and
+        // reflects the struct flag.
+        let mut wf = WaveformRecord::with_kind(ArrayKind::Waveform);
+        wf.put_field("RARM", EpicsValue::Short(1)).unwrap();
+        assert_eq!(wf.get_field("RARM"), Some(EpicsValue::Short(1)));
+        assert_eq!(wf.get_field("BUSY"), Some(EpicsValue::Short(0)));
+        assert!(
+            wf.put_field("BUSY", EpicsValue::Short(1)).is_err(),
+            "BUSY must reject CA puts (SPC_NOMOD)"
+        );
+        wf.busy = true;
+        assert_eq!(wf.get_field("BUSY"), Some(EpicsValue::Short(1)));
+
+        // aai/aao/subArray declare neither field: not in field_list, get None,
+        // put errors.
+        for kind in [ArrayKind::Aai, ArrayKind::Aao, ArrayKind::SubArray] {
+            let mut r = WaveformRecord::with_kind(kind);
+            let names: Vec<&str> = r.field_list().iter().map(|f| f.name).collect();
+            assert!(
+                !names.contains(&"RARM") && !names.contains(&"BUSY"),
+                "{kind:?} must not declare RARM/BUSY"
+            );
+            assert_eq!(r.get_field("RARM"), None, "{kind:?} RARM get must be None");
+            assert_eq!(r.get_field("BUSY"), None, "{kind:?} BUSY get must be None");
+            assert!(r.put_field("RARM", EpicsValue::Short(1)).is_err());
         }
     }
 

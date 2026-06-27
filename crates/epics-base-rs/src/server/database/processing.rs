@@ -4533,6 +4533,22 @@ impl PvDatabase {
             // bin accumulation). That residual is pre-existing and unmodeled;
             // the classification only ensures a simulated histogram no longer
             // performs the real device read or corrupts the SIOL target.
+            //
+            // `aai` is also a SIOL-reading input, but the SIOL read lives in
+            // its soft DEVICE support, not the record support. `aaiRecord.c::
+            // readValue` (:348) raises SIMM_ALARM then calls `read_aai`, and
+            // `devAaiSoft.c::read_aai` (:88) reads
+            // `simm == YES ? &prec->siol : &prec->inp` — i.e. SIMM=YES reads
+            // the SIOL array into VAL, observably identical to `waveform`. (The
+            // record-support `readValue` alone looks device-only, which is
+            // misleading: the soft device is what redirects to SIOL, exactly as
+            // `devAaoSoft.c::write_aao` (:56) writes `simm == YES ? &siol :
+            // &out` for the `aao` OUTPUT twin.) So `aai` is classified as an
+            // input alongside `waveform`; its SIOL array lands in VAL via the
+            // same `set_val` path. `aao` is correctly EXCLUDED: its soft device
+            // writes VAL out to SIOL, which the OUTPUT redirect (`!is_input` ->
+            // `RedirectOutputToSiol` -> `write_simulated_output_siol`, VAL array
+            // -> SIOL) already reproduces.
             let is_input = matches!(
                 rtype.as_str(),
                 "ai" | "bi"
@@ -4545,6 +4561,7 @@ impl PvDatabase {
                     | "event"
                     | "waveform"
                     | "histogram"
+                    | "aai"
             );
 
             let siml = instance

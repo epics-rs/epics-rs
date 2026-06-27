@@ -1317,6 +1317,45 @@ fn test_miss_when_retries_exhausted() {
 }
 
 #[test]
+fn test_ls_stop_syncs_drive_values_to_readback() {
+    // C motorRecord.cc:1366-1380 → postProcess (826-849): a positional
+    // move halted by a hardware limit switch in the travel direction
+    // forces pp=TRUE and re-arms GET_INFO, and the next callback adopts
+    // the limit readback into VAL/DVAL/RVAL (DIFF/RDIF zeroed). Without
+    // this sync the record advertises the unreached target forever.
+    let mut rec = MotorRecord::new();
+    rec.stat.msta = MstaFlags::DONE;
+    rec.stat.phase = MotionPhase::MainMove;
+    rec.conv.mres = 1.0;
+    rec.retry.rtry = 3; // retry would fire on a 1.0 error...
+    // Commanded the +direction into the high limit; the switch is struck.
+    rec.stat.cdir = true;
+    rec.limits.hls = true;
+    // Target 10, but the axis stopped at the limit (9.0) one EGU short.
+    rec.pos.dval = 10.0;
+    rec.pos.val = 10.0;
+    rec.pos.rval = 10;
+    rec.pos.drbv = 9.0;
+    rec.pos.rbv = 9.0;
+
+    let _ = rec.check_completion();
+
+    assert_eq!(rec.stat.phase, MotionPhase::Idle, "LS-stop finalizes");
+    assert!(
+        !rec.stat.mip.contains(MipFlags::RETRY),
+        "the limit suppresses the retry"
+    );
+    assert_eq!(
+        rec.pos.val, 9.0,
+        "VAL adopts the limit readback (C postProcess)"
+    );
+    assert_eq!(rec.pos.dval, 9.0, "DVAL adopts the dial limit readback");
+    assert_eq!(rec.pos.rval, 9, "RVAL = NINT(DVAL/MRES) at the limit");
+    assert_eq!(rec.pos.diff, 0.0, "DIFF zeroed at the limit");
+    assert_eq!(rec.pos.rdif, 0, "RDIF zeroed at the limit");
+}
+
+#[test]
 fn test_ntm_retarget_direction_change() {
     let mut rec = MotorRecord::new();
     rec.timing.ntm = true;

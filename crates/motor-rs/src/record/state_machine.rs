@@ -667,6 +667,22 @@ impl MotorRecord {
                 self.retry.miss = false;
                 self.restore_spmg_move_to_pause();
             }
+            if ls_blocks_retry {
+                // C motorRecord.cc:1366-1380 — a positional move halted by a
+                // hardware limit switch in the travel direction forces
+                // `pp = TRUE` and re-arms a GET_INFO cycle; the next callback
+                // runs postProcess (826-849), which adopts the limit readback
+                // into VAL/DVAL/RVAL and zeroes DIFF/RDIF. The Rust poll
+                // already carries the fresh limit readback (process_motor_info
+                // ran this cycle), so postprocess_sync() applies it directly.
+                //
+                // Scope is the LS-stop ALONE: a plain MOVE_ABS never sets `pp`
+                // (the dispatch sites at C 1983/2025/2110/2125 are SET-mode,
+                // HOME, and JOG — not positional moves), so C does NOT sync a
+                // close-enough or rtry-disabled completion. Do not extend the
+                // sync to those branches.
+                self.postprocess_sync();
+            }
             self.finalize_motion(effects);
         }
     }

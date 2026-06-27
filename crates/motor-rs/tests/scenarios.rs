@@ -448,7 +448,7 @@ fn spmg_pause_sends_stop_and_arms_paused_resume() {
 fn ntm_retargets_while_in_motion() {
     let mut rec = make_record();
     rec.timing.ntm = true;
-    rec.timing.ntmf = 2.0;
+    rec.timing.ntmf = 2;
 
     // Start move to 50
     rec.pos.dval = 50.0;

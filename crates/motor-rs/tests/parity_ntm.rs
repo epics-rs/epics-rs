@@ -21,7 +21,7 @@ fn make_record() -> MotorRecord {
     rec.vel.bacc = 0.5;
     rec.stat.msta = MstaFlags::DONE;
     rec.timing.ntm = true;
-    rec.timing.ntmf = 2.0;
+    rec.timing.ntmf = 2;
     rec
 }
 

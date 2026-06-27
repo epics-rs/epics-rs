@@ -86,7 +86,7 @@ impl MotorRecord {
             if self.timing.ntm
                 && (self.pos.rdif >= 0) != self.stat.cdir
                 && self.pos.diff.abs()
-                    > self.timing.ntmf * (self.retry.bdst.abs() + self.retry.rdbd)
+                    > self.timing.ntmf as f64 * (self.retry.bdst.abs() + self.retry.rdbd)
                 && self.stat.mip.intersects(MipFlags::MOVE | MipFlags::RETRY)
                 && !self.stat.mip.contains(MipFlags::STOP)
             {

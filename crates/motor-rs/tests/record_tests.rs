@@ -1320,7 +1320,7 @@ fn test_miss_when_retries_exhausted() {
 fn test_ntm_retarget_direction_change() {
     let mut rec = MotorRecord::new();
     rec.timing.ntm = true;
-    rec.timing.ntmf = 2.0;
+    rec.timing.ntmf = 2;
     rec.retry.bdst = 0.0;
     rec.retry.rdbd = 0.0;
     rec.internal.ldvl = 10.0;
@@ -1402,7 +1402,7 @@ fn test_val_write_during_stop_replan_supersedes_parked_target() {
     rec.limits.dhlm = 100.0;
     rec.limits.dllm = -100.0;
     rec.timing.ntm = true;
-    rec.timing.ntmf = 2.0;
+    rec.timing.ntmf = 2;
     rec.stat.msta = MstaFlags::DONE;
 
     rec.pos.dval = 50.0;

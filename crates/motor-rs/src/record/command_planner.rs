@@ -1877,7 +1877,7 @@ impl MotorRecord {
         }
 
         let diff = new_dval - self.pos.drbv;
-        let deadband = self.timing.ntmf * (self.retry.bdst.abs() + self.retry.rdbd);
+        let deadband = self.timing.ntmf as f64 * (self.retry.bdst.abs() + self.retry.rdbd);
 
         // C `movn`-block STOP_AXIS gate: opposite direction AND error
         // beyond the NTM deadband AND NTM enabled. The direction sign is

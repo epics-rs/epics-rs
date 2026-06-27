@@ -530,7 +530,7 @@ pub(crate) static FIELDS: &[FieldDesc] = &[
     },
     FieldDesc {
         name: "NTMF",
-        dbf_type: DbFieldType::Double,
+        dbf_type: DbFieldType::UShort,
         read_only: false,
     },
     // Public C motorRecord.dbd link / menu surface (motorRecord.dbd:233-265,
@@ -786,7 +786,7 @@ pub(crate) fn motor_get_field(rec: &MotorRecord, name: &str) -> Option<EpicsValu
         // Timing
         "DLY" => Some(EpicsValue::Double(rec.timing.dly)),
         "NTM" => Some(EpicsValue::Short(if rec.timing.ntm { 1 } else { 0 })),
-        "NTMF" => Some(EpicsValue::Double(rec.timing.ntmf)),
+        "NTMF" => Some(EpicsValue::UShort(rec.timing.ntmf)),
         // Public C motorRecord.dbd link / menu / string surface.
         "OUT" => Some(EpicsValue::String(rec.links.out.clone().into())),
         "RDBL" => Some(EpicsValue::String(rec.links.rdbl.clone().into())),
@@ -1983,9 +1983,11 @@ pub(crate) fn motor_put_field(
             _ => Err(CaError::TypeMismatch(name.into())),
         },
         "NTMF" => match value {
-            EpicsValue::Double(v) => {
-                // C: NTMF minimum is 2.0
-                rec.timing.ntmf = if v < 2.0 { 2.0 } else { v };
+            EpicsValue::UShort(v) => {
+                // C motorRecord.cc:3093-3100: integer compare, minimum 2.
+                // The DBF_USHORT field already truncated any fractional CA
+                // put before special() runs.
+                rec.timing.ntmf = if v < 2 { 2 } else { v };
                 Ok(())
             }
             _ => Err(CaError::TypeMismatch(name.into())),

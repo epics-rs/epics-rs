@@ -33,10 +33,12 @@ rather than re-sequenced.
 
 22 distinct active findings.
 
-**Cleared so far (10):** R1, R23, R43, R59 (all DEFECTs); R21, R22, R24, R41
-(CONCERNs); R46, R62 (NITs). **Remaining open (12):** R2, R3, R5, R25, R42,
-R44, R45, R60, R61 (CONCERNs), R6, R26, R27 (NITs) — R25/R45/R60/R61 are
-cross-crate (asyn-rs); R5/R6/R42/R44 need decisions; R2/R3/R26/R27 mechanical.
+**Cleared so far (11):** R1, R23, R43, R59 (all DEFECTs); R2, R21, R22, R24,
+R41 (CONCERNs); R46, R62 (NITs). **Dispositioned, no code change (2):** R26
+(keep Rust — C truncation is a CA-DBR artifact), R27 (defer — systemic
+DBF_MENU baseline). **Remaining open (9):** R3, R5, R25, R42, R44, R45, R60,
+R61 (CONCERNs), R6 (NIT) — R25/R45/R60/R61 are cross-crate (asyn-rs);
+R3/R5/R6/R42/R44 are motor-rs decisions for the review round.
 
 ---
 
@@ -246,15 +248,20 @@ routes into `plan_absolute_move`. No defect.
   swap, a negative-MRES axis programs inverted travel limits. Record-internal dial/user/raw
   math is correct under MRES<0 (negative confirmation). Needs a bridge-side check.
 
-#### R26 — get_units omits the C `dbr_units_size` truncation
+#### R26 — get_units omits the C `dbr_units_size` truncation — DISPOSITION: keep Rust (do not copy C artifact)
 - **Severity:** NIT
 - **Rust:** `field_access.rs:2514-2526` (`units_for`) builds `EGU+"/sec"` uncapped.
 - **C:** `motorRecord.cc:3159/3205/3206` truncates to `dbr_units_size-1` (7 chars + NUL).
 - **Divergence:** EGU≥4 chars overflows: `"mrad"` → C `"mrad/se"` vs Rust `"mrad/sec"`.
 - **Impact:** CA masks it (fixed 8-byte field); a PVA variable-length units reader sees the
   extra byte. C truncation is arguably an artifact; recorded for completeness.
+- **Disposition (keep Rust):** the C truncation exists only to fit the fixed 8-byte CA DBR
+  units field — a wire-format artifact, not a semantic intent. On the CA path Rust truncates
+  at the same 8 bytes anyway; on the PVA variable-length path the full `"mrad/sec"` is the more
+  correct value. Copying the record-level truncation would degrade the PVA units string, which
+  the "don't copy C's bugs/artifacts" steer forbids. No code change.
 
-#### R27 — Menu fields modeled as DBF_SHORT — graphic/precision metadata differ from DBF_MENU
+#### R27 — Menu fields modeled as DBF_SHORT — graphic/precision metadata differ from DBF_MENU — DISPOSITION: defer (systemic baseline, out of remit)
 - **Severity:** NIT (systemic baseline modeling choice)
 - **Rust:** DIR/FOFF/SET/SPMG/HLSV/RMOD/UEIP/URIP/RSTM/CNEN/STUP/NTM are `DbFieldType::Short`
   in `FIELDS` (`field_access.rs:80-528`).
@@ -265,6 +272,10 @@ routes into `plan_absolute_move`. No defect.
   case is meaningless for an enum field served as DBR_ENUM.
 - **Impact:** negligible (graphic limits unused in the enum wire path). Flagged once for the
   family; enum-vs-short modeling is a baseline decision, out of this category's remit.
+- **Disposition (defer):** DIR/FOFF/SET/SPMG/… as DBF_SHORT is a port-wide baseline modeling
+  choice (every menu field in every record), not a motor-specific bug, and the observable
+  effect is nil on the enum wire path. A fix is a systemic DBF_MENU migration well beyond this
+  audit's scope; deferred as a separate baseline task. No code change here.
 
 ### Category C — Status / readback / monitor / MSTA-MIP / alarm
 

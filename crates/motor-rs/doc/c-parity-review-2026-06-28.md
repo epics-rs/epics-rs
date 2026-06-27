@@ -33,16 +33,21 @@ rather than re-sequenced.
 
 22 distinct active findings.
 
-**Cleared so far (14):** R1, R23, R43, R59 (all DEFECTs); R2, R3, R21, R22, R24,
-R41, R44 (CONCERNs); R46, R62 (NITs). **Dispositioned, no code change (4):** R5
-(KEEP — don't copy C's redundant SPMG=Move stop), R6 (KEEP — don't copy C's
+**Cleared so far (15):** R1, R23, R43, R59 (all DEFECTs); R2, R3, R21, R22, R24,
+R41, R44, R61 (CONCERNs); R46, R62 (NITs). **Dispositioned, no code change (7):**
+R5 (KEEP — don't copy C's redundant SPMG=Move stop), R6 (KEEP — don't copy C's
 accel≤0 artifact), R26 (keep Rust — C truncation is a CA-DBR artifact), R27
-(defer — systemic DBF_MENU baseline). **Rejected (1):** R42 (empirically
-falsified — the MIP_EXTERNAL detector fires during init via the default
-`dmov=true`, so the boot-mid-motion axis closes the loop; no defect).
-**Remaining open (4):** R25, R45, R60, R61 (CONCERNs) — all cross-crate
-(asyn-rs / driver boundary): MRES<0 limit-register swap, MotorStatus EA_SLIP
-field, encoder-ratio command + hook, idle-poll policy.
+(defer — systemic DBF_MENU baseline), R25 (KEEP — user/dial forward folds DIR
+only; the sign(MRES) limit-register swap is a dial→raw flip the DRIVER owns at
+its register boundary, and no in-repo driver mis-programs it), R45 (KEEP —
+MSTA EA_SLIP bit 4 is an inert informational bit with no in-repo consumer;
+adding a MotorStatus field with no producer would be fake parity), R60 (defer —
+SET_ENC_RATIO is a real controller-config command but no in-repo controller
+consumes it; hook spec recorded in the finding for when a driver needs it).
+**Rejected (1):** R42 (empirically falsified — the MIP_EXTERNAL detector fires
+during init via the default `dmov=true`, so the boot-mid-motion axis closes the
+loop; no defect). **Remaining open (0):** all 22 findings cleared,
+dispositioned, or rejected — converged.
 
 ---
 
@@ -254,7 +259,13 @@ routes into `plan_absolute_move`. No defect.
 - **Impact:** `caput STUP 2`/`STUP 0`/`NTMF 1` triggers a spurious process in Rust that C
   suppresses; largely a no-op extra cycle, not wrong state.
 
-#### R25 — User/dial soft-limit forward picks the command side by DIR only — C also folds sign(MRES)
+#### R25 — User/dial soft-limit forward picks the command side by DIR only — C also folds sign(MRES) — **DISPOSITION-KEEP**
+- **Disposition:** KEEP. The record speaks dial-EGU to the driver and folds DIR (user→dial) only;
+  the `sign(MRES)` high/low swap is a dial→raw register flip that belongs to the driver at its
+  register boundary (C does it because `motorRecord.cc` talks raw-steps directly). No in-repo
+  driver (`sim_motor.rs`, asyn-rs `runtime/axis.rs`) re-swaps or mis-programs the register, so the
+  current selection is correct for every in-repo path. Re-open only when a real MRES<0 raw-register
+  driver is ported. Confirmed by the 01KW5P9 review round.
 - **Severity:** CONCERN (negative space; MRES<0 driver path untested)
 - **Rust:** `field_access.rs:2438-2446` (`queue_limit_forward`) emits `SetHighLimit/SetLowLimit`
   carrying dial-EGU, side chosen by DIR only (`:1635-1643`/`1655-1663`/`1673`/`1692`). The raw
@@ -373,7 +384,13 @@ routes into `plan_absolute_move`. No defect.
 - **Impact:** transient loss of a closed-loop DOL-failure UDF alarm. Structural fix: motor
   override `clears_udf()`→false (UDF owned solely by init + the `dol_udf` hook).
 
-#### R45 — MSTA EA_SLIP (bit 4) can never be set — no backing driver field
+#### R45 — MSTA EA_SLIP (bit 4) can never be set — no backing driver field — **DISPOSITION-KEEP**
+- **Disposition:** KEEP. EA_SLIP bit 4 ("encoder slip enabled") is an inert informational status
+  bit; no in-repo record logic or test consumes it, and no in-repo driver produces it. Adding a
+  `MotorStatus` encoder-slip field with no producer would be fake parity (a field that is always
+  false). The bit becomes representable for free if/when a real model-3 driver that reports it is
+  ported (add the `MotorStatus` field + map it at `status_update.rs:234`). Confirmed by the
+  01KW5P9 review round.
 - **Severity:** CONCERN (independently confirmed by Category D as R63)
 - **Rust:** `status_update.rs:234-279` builds MSTA from `MotorStatus`; bit 4 (`MstaFlags::SLIP
   = 0x0010`, `flags.rs:37`) is never assigned. `asyn-rs` `MotorStatus`
@@ -424,7 +441,15 @@ routes into `plan_absolute_move`. No defect.
   Structural fix: delete the `init()` reseed; let `initial_readback` own it (it already routes
   `SetPosition` through the normal command path).
 
-#### R60 — Encoder ratio (SET_ENC_RATIO / motorEncoderRatio_) is never forwarded to the driver
+#### R60 — Encoder ratio (SET_ENC_RATIO / motorEncoderRatio_) is never forwarded to the driver — **DEFER**
+- **Disposition:** DEFER (cross-crate, no in-repo consumer). `SET_ENC_RATIO` is a real
+  controller-config command, but no in-repo driver (`sim_motor.rs`, asyn-rs `runtime/axis.rs`)
+  has an encoder-ratio register to receive it, and the dial-EGU boundary already makes the record
+  do the scaling — so emitting it now would be a command into the void. Hook spec for when a
+  model-1/2 driver needs it: add `AsynMotor::set_encoder_ratio(ratio: f64)` default no-op +
+  `MotorCommand::EncoderRatio { ratio: f64 }`; emit at init `ratio = if eres == 0 { 1.0 } else
+  { mres / eres }` and re-emit on a resolution change, gated on `has_encoder` (carry the scalar
+  `mres`/`eres`, not C's two-element `ep_mp[]`). Confirmed DEFER by the 01KW5P9 review round.
 - **Severity:** CONCERN (negative space; partly mitigated by the dial-EGU boundary)
 - **Rust:** `asyn-rs/src/interfaces/motor.rs:96-271` — `AsynMotor` has no `set_encoder_ratio`;
   `flags.rs:250-341` `MotorCommand` has no `EncoderRatio` variant; `init()` never forwards one.
@@ -440,8 +465,17 @@ routes into `plan_absolute_move`. No defect.
   job now — but the C contract is dropped with no replacement/hook; a model-1/2 driver expecting
   SET_ENC_RATIO cannot be ported faithfully.
 
-#### R61 — Idle polling stops entirely — C's always-on idlePollPeriod poller never stops
+#### R61 — Idle polling stops entirely — C's always-on idlePollPeriod poller never stops — **CLEARED** (`bcad9556`)
 - **Severity:** CONCERN
+- **Fix:** `effects_to_actions` now emits `PollDirective::Start` on the settled idle pass instead
+  of `Stop`, so the poller stays alive at `idle_poll_interval` once a move completes — the
+  MIP_EXTERNAL detector and the idle-poll button resume keep firing, matching C's always-on
+  `asynMotorPoller` (the record never drives a poller stop; C has no record-driven stop). Companion
+  poll-loop guard: the `select!` `sleep(interval)` arm is gated on `!interval.is_zero()`, so
+  `idle_poll_interval == 0` is C's event-only idle mode (`idlePollPeriod_ == 0`,
+  asynMotorController.cpp:633-634 blocks on the event) rather than a `sleep(0)` busy-spin.
+  Tests: `settled_idle_keeps_poller_alive_not_stopped` (record-side Start, not Stop),
+  `test_zero_idle_interval_is_event_only_not_busy_spin` (zero interval polls once then blocks).
 - **Rust:** `status_update.rs:86-90` emits `PollDirective::Stop` once `commands.is_empty() &&
   schedule_delay.is_none() && dmov`; `device_support.rs:218-221` sends `StopPolling`;
   `poll_loop.rs:156-174` idle branch is `cmd_rx.recv().await` only — no periodic poll

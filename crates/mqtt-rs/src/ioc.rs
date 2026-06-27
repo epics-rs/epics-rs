@@ -122,6 +122,20 @@ pub fn mqtt_driver_configure_command(
     )
 }
 
+/// Resolve the iocsh `qos` argument to a [`QoS`].
+///
+/// C registers `qos` as an optional `iocshArgInt` and passes `args[3].ival`
+/// straight through (drvMqtt.cpp:745,764). iocsh zero-fills an omitted int arg,
+/// so `mqttDriverConfigure` with no qos uses QoS 0 / AtMostOnce — not the
+/// library-ergonomic `QoS::default()` (AtLeastOnce), which would publish and
+/// subscribe one delivery tier above C on the omitted-arg path.
+fn resolve_iocsh_qos(arg: &ArgValue) -> QoS {
+    match arg {
+        ArgValue::Int(v) => QoS::from_int(*v as i32),
+        _ => QoS::from_int(0),
+    }
+}
+
 struct MqttConfigHandler {
     handle: epics_base_rs::runtime::task::RuntimeHandle,
     trace: Arc<TraceManager>,
@@ -141,10 +155,7 @@ impl CommandHandler for MqttConfigHandler {
             ArgValue::String(s) => s.clone(),
             _ => return Err("clientId required".into()),
         };
-        let qos = match &args[3] {
-            ArgValue::Int(v) => QoS::from_int(*v as i32),
-            _ => QoS::default(),
-        };
+        let qos = resolve_iocsh_qos(&args[3]);
         let conn_pv_name = match &args[4] {
             ArgValue::String(s) if !s.is_empty() => Some(s.clone()),
             _ => None,
@@ -268,4 +279,24 @@ pub fn register_mqtt_commands(
 ) -> epics_ca_rs::server::ioc_app::IocApplication {
     app.register_startup_command(mqtt_add_topic_command())
         .register_startup_command(mqtt_driver_configure_command(handle, trace))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn omitted_qos_defaults_to_atmostonce_like_c_iocsh_zerofill() {
+        // C iocsh zero-fills the omitted `iocshArgInt` qos to 0 → AtMostOnce.
+        assert_eq!(resolve_iocsh_qos(&ArgValue::Missing), QoS::AtMostOnce);
+    }
+
+    #[test]
+    fn explicit_qos_arg_is_honoured() {
+        assert_eq!(resolve_iocsh_qos(&ArgValue::Int(0)), QoS::AtMostOnce);
+        assert_eq!(resolve_iocsh_qos(&ArgValue::Int(1)), QoS::AtLeastOnce);
+        assert_eq!(resolve_iocsh_qos(&ArgValue::Int(2)), QoS::ExactlyOnce);
+        // Out-of-range falls back to AtLeastOnce via QoS::from_int.
+        assert_eq!(resolve_iocsh_qos(&ArgValue::Int(99)), QoS::AtLeastOnce);
+    }
 }

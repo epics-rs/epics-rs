@@ -870,14 +870,14 @@ pub async fn run<R, W>(
                     tokio::time::sleep(Duration::from_secs(30)).await;
                     continue;
                 }
-                if !validate_hsc_id(&ctrl.h_id) {
+                if !validate_hsc_id(&ctrl.h_id, true) {
                     ctrl.error = ERROR_BAD_ID;
                     ctrl.error_msg = "H ID not a valid HSC ID".to_string();
                     publish_status(&ctrl, &status_tx);
                     tokio::time::sleep(Duration::from_secs(30)).await;
                     continue;
                 }
-                if !validate_hsc_id(&ctrl.v_id) {
+                if !validate_hsc_id(&ctrl.v_id, true) {
                     ctrl.error = ERROR_BAD_ID;
                     ctrl.error_msg = "V ID not a valid HSC ID".to_string();
                     publish_status(&ctrl, &status_tx);

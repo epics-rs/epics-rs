@@ -317,68 +317,119 @@ async fn test_poll_loop_lifecycle() {
     assert!(result.is_ok(), "poll loop should terminate after Shutdown");
 }
 
-/// BUG 5 regression: device-support `init()` must reseed the controller
-/// with the pass0-restored DVAL even when that restored value is exactly
-/// `0.0`. C `init_record` always syncs the controller to the restored
-/// position. An earlier Rust version gated the sync on `dval != 0.0`, so
-/// a genuine restored position of `0.0` was treated as "no restored
-/// value" and the controller was left at its stale position.
+// Helper: read the SimMotor's current dial position.
+fn read_motor_pos(motor: &Arc<Mutex<dyn AsynMotor>>) -> f64 {
+    let mut m = motor.lock().unwrap();
+    m.poll(&asyn_rs::user::AsynUser::new(0)).unwrap().position
+}
+
+/// R59 regression: device-support `init()` must NOT reseed the controller.
+/// The RSTM/loadpos(#231)/MRES(#196) restore decision is owned by
+/// `initial_readback` (C `devMotorAsyn.c::init_controller`), which fires on
+/// the Startup process and tests the controller's *actual current position*.
+/// A controller that kept its true absolute position across an IOC restart
+/// must not be clobbered by a stale autosaved DVAL: with the controller far
+/// from zero, RSTM=NearZero's `dval_non_zero_pos_near_zero` gate is false, so
+/// no reseed occurs and the record adopts the controller readback. (An
+/// earlier Rust `init()` reseeded unconditionally on any pass0 restore,
+/// before the first poll — the exact data loss RSTM prevents. C does NOT
+/// reseed here: a saved DVAL that the live controller contradicts, with the
+/// controller nowhere near zero, fails `initPos`.)
 #[tokio::test]
-async fn init_reseeds_controller_when_restored_dval_is_zero() {
-    // Controller (SimMotor) starts at a stale position of 5.0 — as if the
-    // hardware powered up somewhere other than the saved 0.0.
+async fn init_does_not_clobber_live_controller_position() {
+    // The controller (SimMotor) kept its true position 5.0 across the restart.
     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new().with_position(5.0)));
     let mut setup = make_builder(motor.clone()).build();
+    setup.record.conv.mres = 1.0; // dial == raw for a clean assertion
+    setup.record.conv.rstm = RestoreMode::NearZero;
+    setup.record.retry.rdbd = 0.05;
 
-    // Simulate autosave restoring a saved position of exactly 0.0 during
-    // pass0: a DVAL field write records `last_write = Some(Dval)`, which
-    // is the proper "a position was restored" signal.
+    // Autosave restored a STALE DVAL (2.0) that disagrees with the hardware.
     setup
         .record
-        .put_field("DVAL", EpicsValue::Double(0.0))
+        .put_field("DVAL", EpicsValue::Double(2.0))
         .unwrap();
+    assert!(setup.record.was_position_restored());
+
+    // init() polls the controller (true 5.0) and reseeds nothing.
+    setup.device_support.init(&mut setup.record).unwrap();
     assert!(
-        setup.record.was_position_restored(),
-        "DVAL write must register as a restored position"
+        (read_motor_pos(&motor) - 5.0).abs() < 1e-9,
+        "init() must not reseed — controller stays at its true 5.0"
     );
 
-    // init() must reseed the controller to the restored 0.0.
-    setup.device_support.init(&mut setup.record).unwrap();
-
-    // The SimMotor must have been driven to 0.0 by set_position.
-    let pos = {
-        let mut m = motor.lock().unwrap();
-        m.poll(&asyn_rs::user::AsynUser::new(0)).unwrap().position
-    };
+    // The Startup process applies the RSTM gate: the controller is far from
+    // zero, so NearZero does not restore — no SetPosition reaches the driver.
+    setup.record.process().unwrap();
+    setup.device_support.write(&mut setup.record).unwrap();
     assert!(
-        pos.abs() < 1e-9,
-        "controller must be reseeded to restored DVAL 0.0, got {pos}"
+        (read_motor_pos(&motor) - 5.0).abs() < 1e-9,
+        "RSTM=NearZero with a live controller far from zero must not reseed"
+    );
+    assert!(
+        (setup.record.pos.dval - 5.0).abs() < 1e-9,
+        "record adopts the controller readback (5.0), discarding the stale 2.0"
     );
 }
 
-/// BUG 5 companion: when NO position was restored during pass0, `init()`
-/// must NOT reseed the controller — it leaves the hardware position
-/// untouched. This proves the fix keys off the restore signal, not the
-/// DVAL value.
+/// R59 companion (positive path): when the controller lost its position
+/// across the restart (reads near zero) and a meaningful DVAL was restored,
+/// the RSTM=NearZero gate DOES reseed — and the SetPosition now reaches the
+/// driver through the Startup process → pending_actions → write path, not the
+/// deleted `init()` reseed.
+#[tokio::test]
+async fn startup_reseeds_controller_that_lost_position() {
+    // Controller powered up at 0.0 (lost its absolute position).
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new().with_position(0.0)));
+    let mut setup = make_builder(motor.clone()).build();
+    setup.record.conv.mres = 1.0;
+    setup.record.conv.rstm = RestoreMode::NearZero;
+    setup.record.retry.rdbd = 0.05;
+
+    // Autosave restored a meaningful DVAL the controller no longer holds.
+    setup
+        .record
+        .put_field("DVAL", EpicsValue::Double(5.0))
+        .unwrap();
+
+    setup.device_support.init(&mut setup.record).unwrap();
+    assert!(
+        read_motor_pos(&motor).abs() < 1e-9,
+        "init() does not reseed; controller still at 0.0"
+    );
+
+    // The Startup process restores: controller near zero + meaningful DVAL.
+    setup.record.process().unwrap();
+    setup.device_support.write(&mut setup.record).unwrap();
+    assert!(
+        (read_motor_pos(&motor) - 5.0).abs() < 1e-9,
+        "RSTM=NearZero reseeds the lost controller to the autosaved 5.0"
+    );
+    assert!(
+        (setup.record.pos.dval - 5.0).abs() < 1e-9,
+        "record keeps the autosaved DVAL after the restore"
+    );
+}
+
+/// R59 companion: when NO position was restored during pass0, neither
+/// `init()` nor the Startup process reseeds — the controller keeps its
+/// hardware position and the record adopts the readback.
 #[tokio::test]
 async fn init_does_not_reseed_controller_when_nothing_restored() {
     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new().with_position(5.0)));
     let mut setup = make_builder(motor.clone()).build();
+    setup.record.conv.mres = 1.0;
 
     // No put_field("DVAL", ...) — nothing was restored.
     assert!(!setup.record.was_position_restored());
 
     setup.device_support.init(&mut setup.record).unwrap();
+    setup.record.process().unwrap();
+    setup.device_support.write(&mut setup.record).unwrap();
 
-    // Controller position must be left at its stale 5.0 — init did not
-    // call set_position.
-    let pos = {
-        let mut m = motor.lock().unwrap();
-        m.poll(&asyn_rs::user::AsynUser::new(0)).unwrap().position
-    };
     assert!(
-        (pos - 5.0).abs() < 1e-9,
-        "controller must be untouched when nothing was restored, got {pos}"
+        (read_motor_pos(&motor) - 5.0).abs() < 1e-9,
+        "controller untouched when nothing was restored"
     );
 }
 

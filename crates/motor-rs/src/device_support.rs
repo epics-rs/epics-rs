@@ -245,37 +245,26 @@ impl DeviceSupport for MotorDeviceSupport {
             motor_rec.set_device_state(self.device_state.clone());
         }
 
-        // Sync driver position with pass0-restored DVAL (if any).
-        // C: set_position uses dval/mres (raw steps), not val (user coordinates)
+        // NO controller reseed here. The RSTM/loadpos(#231)/MRES(#196)
+        // restore decision is owned entirely by `initial_readback`
+        // (status_update.rs), which fires on the record `Startup` event and
+        // emits `MotorCommand::SetPosition` through the normal command path
+        // (effects → pending_actions → DeviceSupport::write → set_position).
         //
-        // The reseed must be gated on whether a position was actually
-        // *restored* during pass0 — NOT on `dval != 0.0`. C `init_record`
-        // syncs the controller to the restored position regardless of its
-        // value; a genuine restored position of exactly 0.0 must still
-        // reseed the controller. An earlier Rust version used
-        // `if dval != 0.0`, which silently skipped the controller sync
-        // for a legitimate 0.0 restore. `was_position_restored()` is the
-        // proper signal: it reports whether a VAL/DVAL/RVAL/RLV field was
-        // written during pass0 (autosave restore), independent of the
-        // restored value. It is queried here, before `clear_last_write()`
-        // runs later in this `init()`.
+        // C `devMotorAsyn.c::init_controller` (166-239) reseeds only when
+        // `initPos == 1`, decided by the RSTM switch testing the controller's
+        // *actual current position* (`pPvt->status.position`, fetched before
+        // init_controller). RSTM=Never never reseeds; NearZero reseeds only
+        // when the controller currently sits near zero (`dval_non_zero_pos_
+        // near_zero`) while DVAL is meaningful. An earlier Rust version
+        // reseeded *unconditionally* on any pass0 restore, before the first
+        // poll — so a controller that kept its true absolute position across
+        // an IOC restart (default RSTM=NearZero, or RSTM=Never, or an
+        // absolute encoder with LOADPOS_BLOCK) was clobbered with the stale
+        // autosaved DVAL every boot — the exact failure RSTM/#231 prevent.
+        // The poll below now reads the controller's true position into the
+        // shared status so `initial_readback` can apply the RSTM gate to it.
         let user = self.make_user();
-        let restored_dval = record
-            .as_any_mut()
-            .and_then(|a| a.downcast_mut::<crate::record::MotorRecord>())
-            .filter(|rec| rec.was_position_restored())
-            .map(|rec| match rec.get_field("DVAL") {
-                Some(EpicsValue::Double(d)) => d,
-                _ => 0.0,
-            });
-        if let Some(dval) = restored_dval {
-            let mut motor = self.motor.lock().map_err(|e| {
-                epics_base_rs::error::CaError::InvalidValue(format!("motor lock: {e}"))
-            })?;
-            // Send dial position directly — the AsynMotor interface
-            // operates in dial coordinates, not raw steps
-            let _ = motor.set_position(&user, dval);
-        }
 
         let status = {
             let mut motor = self.motor.lock().map_err(|e| {

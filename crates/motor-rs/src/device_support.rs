@@ -287,11 +287,13 @@ impl DeviceSupport for MotorDeviceSupport {
         // Apply initial status to record (sets RBV, clears LVIO, etc.)
         // Clear last_write so pass0-restored values are not interpreted as
         // move commands during PINI processing (matches C EPICS init_record).
+        // This is part of the C init readback, so it uses `initcall = true`
+        // (URIP RDBL scaling suppressed, motor position adopted).
         if let Some(motor_rec) = record
             .as_any_mut()
             .and_then(|a| a.downcast_mut::<crate::record::MotorRecord>())
         {
-            motor_rec.process_motor_info(&status);
+            motor_rec.process_motor_info_initcall(&status, true);
             motor_rec.clear_last_write();
         }
 

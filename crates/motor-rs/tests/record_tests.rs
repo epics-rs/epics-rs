@@ -4114,6 +4114,39 @@ fn test_val_write_does_not_clear_buttons_when_not_homing() {
     assert!(!rec.ctrl.homr);
 }
 
+#[test]
+fn test_urip_skipped_at_init_readback_applied_on_poll() {
+    use asyn_rs::interfaces::motor::MotorStatus;
+    // R41 / C process_motor_info(pmr, initcall): the URIP RDBL scaling is
+    // gated `else if (urip==Yes && initcall==false)` (motorRecord.cc:3682),
+    // so the init readback seeds RRBV/DRBV from the MOTOR position, not the
+    // external readback link. Subsequent runtime polls (initcall=false) DO
+    // apply the link. An earlier Rust gate on `self.initialized` never
+    // skipped the init readback because `determine_event` flips it true
+    // before dispatching Startup.
+    let status = MotorStatus {
+        position: 3.0, // motor dial position
+        done: true,
+        moving: false,
+        ..Default::default()
+    };
+
+    // Init readback: URIP suppressed, DRBV adopts the motor position (3.0).
+    let mut rec = MotorRecord::new();
+    rec.conv.mres = 1.0;
+    rec.conv.urip = true;
+    rec.conv.rres = 1.0;
+    rec.conv.rdbl_value = Some(7.0); // external link disagrees with the motor
+    rec.initial_readback(&status);
+    assert_eq!(rec.pos.rrbv, 3, "init readback adopts the motor position");
+    assert_eq!(rec.pos.drbv, 3.0, "init DRBV from motor position, not RDBL");
+
+    // A runtime poll on the same record DOES apply the URIP link (7.0).
+    rec.process_motor_info(&status);
+    assert_eq!(rec.pos.rrbv, 7, "runtime poll applies the URIP RDBL link");
+    assert_eq!(rec.pos.drbv, 7.0, "runtime DRBV from the external link");
+}
+
 // --- URIP RDBL error (C: db5da2f0 2017-05, 7493d50b 2018-04) ---
 
 #[test]

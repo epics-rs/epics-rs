@@ -112,8 +112,30 @@ impl MotorRecord {
         driver_done && no_pending
     }
 
-    /// Update readback positions from driver status.
+    /// Update readback positions from driver status. The runtime poll path
+    /// uses this (`initcall = false`).
+    ///
+    /// C `process_motor_info(pmr, initcall)` (motorRecord.cc:3650+) takes the
+    /// init flag explicitly; the URIP RDBL scaling is gated `else if
+    /// (urip==Yes && initcall==false)` (3682), so the init readback seeds RRBV
+    /// from the motor position rather than the external link. The init path
+    /// (`device_support::init` + `initial_readback`) therefore calls
+    /// `process_motor_info_initcall(.., true)`. (An earlier Rust version gated
+    /// URIP on `self.initialized`, but `determine_event` flips that true
+    /// *before* dispatching the Startup readback, so the gate never skipped
+    /// the call that actually seeds DVAL/VAL.)
     pub fn process_motor_info(&mut self, status: &asyn_rs::interfaces::motor::MotorStatus) {
+        self.process_motor_info_initcall(status, false);
+    }
+
+    /// `process_motor_info` with C's explicit `initcall`. `initcall = true`
+    /// suppresses the URIP RDBL readback scaling (the init readback adopts the
+    /// motor position, not the external readback link).
+    pub(crate) fn process_motor_info_initcall(
+        &mut self,
+        status: &asyn_rs::interfaces::motor::MotorStatus,
+        initcall: bool,
+    ) {
         // C 3671-3675: UEIP=Yes is demoted to No on any poll where the
         // driver reports no encoder. This — not the put handler — is
         // what vets a .db-loaded UEIP=Yes: dbLoadRecords writes field()
@@ -156,8 +178,9 @@ impl MotorRecord {
             self.pos.rmp
         };
 
-        // URIP path: use external readback link value with RRES conversion
-        if !self.conv.ueip && self.conv.urip && self.initialized {
+        // URIP path: use external readback link value with RRES conversion.
+        // C 3682: skipped on the init call (`initcall == false` required).
+        if !self.conv.ueip && self.conv.urip && !initcall {
             if let Some(rdbl_value) = self.conv.rdbl_value {
                 let rres = if self.conv.rres != 0.0 {
                     self.conv.rres
@@ -384,7 +407,9 @@ impl MotorRecord {
         // Capture the autosaved target before the driver readback overwrites it.
         let autosaved_dval = self.pos.dval;
         let autosaved_rval = self.pos.rval;
-        self.process_motor_info(status);
+        // C init_record runs `process_motor_info(pmr, true)` — the init call
+        // skips URIP RDBL scaling and seeds the readback from motor position.
+        self.process_motor_info_initcall(status, true);
 
         // C: devMotorAsyn.c init_controller — RSTM restore decision.
         // rdbd = max(|RDBD|, |MRES|); dval_non_zero_pos_near_zero is true when

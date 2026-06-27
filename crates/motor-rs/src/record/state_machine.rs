@@ -226,6 +226,15 @@ impl MotorRecord {
                     self.retry.rcnt += 1;
                     self.retry.miss = true;
                     self.finalize_or_delay(&mut effects);
+                    // C maybeRetry give-up (1063-1065) re-arms MIP_JOG_REQ
+                    // from the held field and do_work re-fires same-pass —
+                    // identical to the evaluate_position_error give-up, since
+                    // both reach the one maybeRetry. The gate inside
+                    // dispatch_latent_collection (can_accept_command) keeps
+                    // this Pause-reached path parked until Go (matching the
+                    // retry branch's can_accept_command gate at 240) while an
+                    // NTM-stop give-up under Go re-fires the held jog now.
+                    self.dispatch_latent_collection(&mut effects, false);
                 } else {
                     // C 1077-1082 with 1356's dmov=TRUE UNMARKed and
                     // reversed: DMOV never posts 1 — the move stays "not
@@ -628,6 +637,19 @@ impl MotorRecord {
                 self.retry.rcnt += 1;
                 self.retry.miss = true;
                 self.finalize_motion(effects);
+                // C maybeRetry give-up (motorRecord.cc:1063-1065):
+                // `mip = MIP_DONE` then re-arm `MIP_JOG_REQ` from the held
+                // jogf/jogr field — unlike the close-enough/rtry==0 branches
+                // (1055/1088 `mip &= MIP_JOG_REQ`), which only PRESERVE an
+                // already-set bit and during a positional move read 0 because
+                // special() arms MIP_JOG_REQ only at mip==MIP_DONE (3042-3053).
+                // dmov stays TRUE through give-up, so do_work re-fires the
+                // armed jog/home in the SAME process pass (1489 `pmr->dmov`).
+                // dispatch_latent_collection is the Rust same-pass do_work
+                // re-fire: finalize_motion above set dmov=true and cleared
+                // mip, so the gate passes and a held jog/home replays now
+                // instead of waiting for the next idle poll.
+                self.dispatch_latent_collection(effects, false);
                 return;
             }
             if self.retry.rmod == RetryMode::InPosition {

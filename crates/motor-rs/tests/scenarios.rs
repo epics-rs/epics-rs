@@ -1505,3 +1505,198 @@ fn sim_motor_homing() {
         rec.pos.drbv
     );
 }
+
+// --- R3: maybeRetry give-up re-arms a held jog/home same-pass ---
+//
+// C `maybeRetry` give-up (motorRecord.cc:1063-1065) sets `mip = MIP_DONE`
+// then re-arms `MIP_JOG_REQ` from the held jogf/jogr field; dmov stays
+// TRUE so `do_work` re-fires the armed motion in the SAME process pass
+// (1489). The close-enough/rtry==0 branches instead do
+// `mip &= MIP_JOG_REQ` (1055/1088), which during a positional move reads
+// 0 — special() arms MIP_JOG_REQ only at mip==MIP_DONE (3042-3053) — so
+// they drop the jog this pass and let the next idle poll pick it up.
+
+/// Drive a positional move to the retry-exhaustion (give-up) edge.
+/// Returns with the record one short-completion away from give-up:
+/// rtry=1, rcnt already 1, phase back in MainMove.
+fn arm_give_up(rec: &mut MotorRecord) {
+    rec.retry.rdbd = 0.01;
+    rec.retry.rtry = 1;
+    rec.retry.frac = 1.0;
+    rec.pos.dval = 10.0;
+    rec.plan_motion(CommandSource::Val);
+    // First short completion: retries (rcnt -> 1), re-dispatches the move.
+    complete_move(rec, 9.5);
+    let _ = rec.check_completion();
+    assert_eq!(rec.retry.rcnt, 1, "first short completion retries");
+    assert_eq!(rec.stat.phase, MotionPhase::MainMove);
+}
+
+#[test]
+fn give_up_refires_held_jogf_same_pass() {
+    let mut rec = make_record();
+    arm_give_up(&mut rec);
+
+    // Operator holds JOGF during the move; SPMG stays Go (default).
+    rec.ctrl.jogf = true;
+
+    // Second short completion: rcnt(1) >= rtry(1) -> give up.
+    complete_move(&mut rec, 9.5);
+    let effects = rec.check_completion();
+
+    assert!(rec.retry.miss, "give-up latches MISS");
+    assert_eq!(
+        rec.stat.phase,
+        MotionPhase::Jog,
+        "held JOGF re-fires in the give-up pass"
+    );
+    assert!(
+        effects.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveVelocity {
+                direction: true,
+                ..
+            }
+        )),
+        "give-up must re-fire the held jog same-pass, got {:?}",
+        effects.commands
+    );
+}
+
+#[test]
+fn give_up_refires_held_homf_same_pass() {
+    let mut rec = make_record();
+    arm_give_up(&mut rec);
+
+    rec.ctrl.homf = true;
+
+    complete_move(&mut rec, 9.5);
+    let effects = rec.check_completion();
+
+    assert!(rec.retry.miss);
+    assert_eq!(rec.stat.phase, MotionPhase::Homing);
+    assert!(
+        effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::Home { forward: true, .. })),
+        "give-up must re-fire the held home same-pass, got {:?}",
+        effects.commands
+    );
+}
+
+#[test]
+fn give_up_no_button_finalizes_quietly() {
+    let mut rec = make_record();
+    arm_give_up(&mut rec);
+
+    // No button held.
+    complete_move(&mut rec, 9.5);
+    let effects = rec.check_completion();
+
+    assert!(rec.retry.miss);
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert_eq!(rec.stat.mip, MipFlags::empty());
+    assert!(
+        effects.commands.is_empty(),
+        "no held button: give-up emits no command, got {:?}",
+        effects.commands
+    );
+    assert!(
+        !effects.status_refresh,
+        "CALLBACK_DATA give-up must not fire the implicit GET_INFO"
+    );
+}
+
+#[test]
+fn close_enough_defers_held_jog_to_next_idle_poll() {
+    let mut rec = make_record();
+    rec.retry.rdbd = 0.5;
+    rec.retry.rtry = 3;
+    rec.pos.dval = 10.0;
+    rec.plan_motion(CommandSource::Val);
+
+    // Operator holds JOGF during the move; SPMG stays Go.
+    rec.ctrl.jogf = true;
+
+    // Close-enough completion (within rdbd): C drops the jog this pass.
+    complete_move(&mut rec, 10.0);
+    let effects = rec.check_completion();
+    assert!(rec.stat.dmov);
+    assert_eq!(rec.stat.phase, MotionPhase::Idle);
+    assert!(
+        !effects
+            .commands
+            .iter()
+            .any(|c| matches!(c, MotorCommand::MoveVelocity { .. })),
+        "close-enough must NOT re-fire the jog in the completion pass, got {:?}",
+        effects.commands
+    );
+
+    // The next idle poll (level-triggered) re-fires the held jog.
+    complete_move(&mut rec, 10.0);
+    let effects = rec.check_completion();
+    assert_eq!(rec.stat.phase, MotionPhase::Jog);
+    assert!(
+        effects.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveVelocity {
+                direction: true,
+                ..
+            }
+        )),
+        "idle poll must resume the held jog, got {:?}",
+        effects.commands
+    );
+}
+
+#[test]
+fn close_enough_move_oneshot_jog_waits_for_spmg_go() {
+    let mut rec = make_record();
+    rec.retry.rdbd = 0.5;
+    rec.retry.rtry = 3;
+    // Motion initiated by the Move button (one-shot): SPMG = Move.
+    rec.ctrl.spmg = SpmgMode::Move;
+    rec.internal.lspg = SpmgMode::Move;
+    rec.pos.dval = 10.0;
+    rec.plan_motion(CommandSource::Val);
+
+    rec.ctrl.jogf = true;
+
+    // Close-enough completion: restore_spmg_move_to_pause flips Move->Pause.
+    complete_move(&mut rec, 10.0);
+    let _ = rec.check_completion();
+    assert_eq!(
+        rec.ctrl.spmg,
+        SpmgMode::Pause,
+        "Move one-shot restores SPMG to Pause at close-enough"
+    );
+
+    // Idle poll while Paused: the held jog must NOT re-fire.
+    complete_move(&mut rec, 10.0);
+    let effects = rec.check_completion();
+    assert_ne!(rec.stat.phase, MotionPhase::Jog);
+    assert!(
+        effects.commands.is_empty(),
+        "Paused: held jog must wait for SPMG=Go, got {:?}",
+        effects.commands
+    );
+
+    // Operator presses Go: the held jog now re-fires.
+    rec.ctrl.spmg = SpmgMode::Go;
+    complete_move(&mut rec, 10.0);
+    let effects = rec.check_completion();
+    assert_eq!(rec.stat.phase, MotionPhase::Jog);
+    assert!(
+        effects.commands.iter().any(|c| matches!(
+            c,
+            MotorCommand::MoveVelocity {
+                direction: true,
+                ..
+            }
+        )),
+        "SPMG=Go resumes the held jog, got {:?}",
+        effects.commands
+    );
+}

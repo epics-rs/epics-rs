@@ -46,8 +46,17 @@ pub const NUM_GAINS: usize = 6;
 /// Number of diode channels.
 pub const NUM_CHANNELS: usize = 4;
 
-/// Delay after a gain change before reading (seconds).
+/// C's `NEW_GAIN_DELAY` — the nominal "time to fill the buffer" after a gain
+/// (range) change (sncqxbpm.st:427). Kept for fidelity, but C immediately
+/// overrides it (see `GAIN_SETTLE_DELAY`), so it is not the effective delay.
 pub const NEW_GAIN_DELAY: f64 = 3.0;
+
+/// Effective settle delay after a gain (range) change before reading currents.
+/// C assigns `NEW_GAIN_DELAY` then immediately overrides it to 0.01 s
+/// ("ignore for now", sncqxbpm.st:428), so the buffer-fill wait is intentionally
+/// disabled. Using the full 3 s instead froze the position/current PVs for ~3 s
+/// after every gain change and at startup — behavior the C device never showed.
+pub const GAIN_SETTLE_DELAY: f64 = 0.01;
 
 /// Absolute fastest sample time (measured ~50ms).
 pub const BASE_SAMPLE_TIME: f64 = 0.05;
@@ -704,8 +713,8 @@ pub async fn run<R, W>(
     ctrl.state = QxbpmState::Init;
     publish_status(&ctrl, &status_tx);
 
-    // Extra delay after gain change
-    let mut update_delay: f64 = NEW_GAIN_DELAY;
+    // Extra delay after gain change (C's effective 0.01 s, not the disabled 3 s)
+    let mut update_delay: f64 = GAIN_SETTLE_DELAY;
 
     loop {
         match ctrl.state {
@@ -748,7 +757,7 @@ pub async fn run<R, W>(
                     continue;
                 }
 
-                update_delay = NEW_GAIN_DELAY;
+                update_delay = GAIN_SETTLE_DELAY;
                 ctrl.init_requested = false;
                 ctrl.state = QxbpmState::Idle;
                 publish_status(&ctrl, &status_tx);
@@ -827,7 +836,7 @@ pub async fn run<R, W>(
                         publish_status(&ctrl, &status_tx);
                         continue;
                     }
-                    update_delay = NEW_GAIN_DELAY;
+                    update_delay = GAIN_SETTLE_DELAY;
                 }
 
                 // Process mode change

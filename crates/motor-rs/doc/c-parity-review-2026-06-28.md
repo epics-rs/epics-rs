@@ -33,12 +33,16 @@ rather than re-sequenced.
 
 22 distinct active findings.
 
-**Cleared so far (11):** R1, R23, R43, R59 (all DEFECTs); R2, R21, R22, R24,
-R41 (CONCERNs); R46, R62 (NITs). **Dispositioned, no code change (2):** R26
-(keep Rust — C truncation is a CA-DBR artifact), R27 (defer — systemic
-DBF_MENU baseline). **Remaining open (9):** R3, R5, R25, R42, R44, R45, R60,
-R61 (CONCERNs), R6 (NIT) — R25/R45/R60/R61 are cross-crate (asyn-rs);
-R3/R5/R6/R42/R44 are motor-rs decisions for the review round.
+**Cleared so far (14):** R1, R23, R43, R59 (all DEFECTs); R2, R3, R21, R22, R24,
+R41, R44 (CONCERNs); R46, R62 (NITs). **Dispositioned, no code change (4):** R5
+(KEEP — don't copy C's redundant SPMG=Move stop), R6 (KEEP — don't copy C's
+accel≤0 artifact), R26 (keep Rust — C truncation is a CA-DBR artifact), R27
+(defer — systemic DBF_MENU baseline). **Rejected (1):** R42 (empirically
+falsified — the MIP_EXTERNAL detector fires during init via the default
+`dmov=true`, so the boot-mid-motion axis closes the loop; no defect).
+**Remaining open (4):** R25, R45, R60, R61 (CONCERNs) — all cross-crate
+(asyn-rs / driver boundary): MRES<0 limit-register swap, MotorStatus EA_SLIP
+field, encoder-ratio command + hook, idle-poll policy.
 
 ---
 
@@ -128,18 +132,24 @@ Four call-graph clusters audited in parallel:
 - **Impact:** Clients monitoring DIFF/RDIF see move-start following-error one poll late.
   No end-state divergence.
 
-#### R3 — Held jog re-activates one poll late after a positional move gives up
+#### R3 — Held jog re-activates one poll late after a positional move gives up — CLEARED (`555b1bad`)
 - **Severity:** CONCERN (timing; jog not lost)
-- **Rust:** `record/state_machine.rs:623-631` (give-up) and `:660-671` (close-enough/rtry==0)
-  call `finalize_motion`, which clears `mip` wholesale and ignores a held jog button.
-  Re-activation happens on a later idle poll via `dispatch_latent_buttons`
-  (`command_planner.rs:1076-1110`).
+- **Resolution:** Both maybeRetry give-up analogs now re-fire same-pass via
+  `dispatch_latent_collection` after `finalize_motion`: `evaluate_position_error`
+  give-up (the normal positional completion) and the Pause/NTM-stop give-up
+  (`state_machine.rs:226`). The `can_accept_command` gate inside
+  `dispatch_latent_collection` keeps a Pause-reached give-up parked until Go
+  (matching the retry branch) while a Go give-up re-fires now. The
+  close-enough/rtry==0 branches were deliberately NOT changed: C does
+  `mip &= MIP_JOG_REQ` there (`:1055`/`:1088`), which during a positional move is 0
+  (special() arms MIP_JOG_REQ only at `mip==MIP_DONE`, 3042-3053), so C drops the jog
+  that pass and the next idle poll (Idle-arm `dispatch_latent_collection`) resumes it —
+  already matched. 5 tests: give-up+JOGF/HOMF held re-fire same-pass; give-up no-button
+  finalizes quiet (no command, no implicit GET_INFO); close-enough defers to the next
+  idle poll; Move one-shot close-enough waits for SPMG=Go.
 - **C:** `maybeRetry` `motorRecord.cc:1063-1065` re-arms `mip |= MIP_JOG_REQ` in the give-up
-  branch (and `:1055`/`:1088` preserve it); because `maybeRetry` is called from `process`
-  (`:1431`) and the same pass falls into `do_work`, the jog re-fires in the *same* pass.
-- **Divergence:** C re-activates a held jog in the completion pass; Rust defers to the next
-  poll. If polling quiesces after give-up, restart could be later than ~one poll.
-- **Impact:** Narrow (jog held across a positional give-up/close-enough). Jog not dropped.
+  branch; because `maybeRetry` is called from `process` (`:1431`) and the same pass falls
+  into `do_work` with dmov still TRUE (`:1489`), the jog re-fires in the *same* pass.
 
 #### R4 — WITHDRAWN (verified false positive)
 RMOD_I dispatch suppression: C `motorRecord.cc:2384-2385` (`else if(rmod==motorRMOD_I)
@@ -147,8 +157,12 @@ return(OK)`) is structurally unnecessary in Rust — RMOD_I is handled earlier i
 `evaluate_position_error:633-647` (re-arm settle watchdog, `mip=RETRY|DELAY_REQ`) and never
 routes into `plan_absolute_move`. No defect.
 
-#### R5 — Rust suppresses C's redundant STOP_AXIS + transient MIP=STOP after an SPMG=Move completion
-- **Severity:** CONCERN (intentional, in-code-documented — for sign-off)
+#### R5 — Rust suppresses C's redundant STOP_AXIS + transient MIP=STOP after an SPMG=Move completion — DISPOSITION: KEEP
+- **Severity:** CONCERN (intentional, in-code-documented — signed off, keep)
+- **Disposition:** KEEP (don't copy C's redundant stop). C's extra STOP_AXIS + transient
+  MIP=MIP_STOP under SPMG=Move is wire/transient noise only; Rust's `lspg=Pause` co-set
+  cleanly suppresses it. Per the "don't copy C's bugs" steer, the Rust behavior is
+  preferred. Strict-wire-parity would require re-emitting the redundant stop — not done.
 - **Rust:** `record/state_machine.rs:486-494` — `restore_spmg_move_to_pause` sets
   `spmg=Pause` AND `lspg=Pause`, so no top-block stop fires and no STOP_AXIS/transient-MIP
   is emitted.
@@ -159,8 +173,14 @@ routes into `plan_absolute_move`. No defect.
 - **Impact:** Wire-traffic / transient-MIP only. Rust is arguably cleaner; surfaced for
   sign-off, not a bug. **Likely keep (don't copy C's redundant stop).**
 
-#### R6 — Move/backlash/home acceleration floored positive; C omits SET_ACCEL at ≤0
-- **Severity:** NIT (degenerate-config-only, documented)
+#### R6 — Move/backlash/home acceleration floored positive; C omits SET_ACCEL at ≤0 — DISPOSITION: KEEP
+- **Severity:** NIT (degenerate-config-only, documented — signed off, keep)
+- **Disposition:** KEEP. The floor is only reachable on a degenerate/misconfigured axis
+  (VELO=0, or ACCU=Accs with ACCS≤0); the Rust positive-rate fallback avoids C's
+  `accel≤0` artifact (C `if(accel>0.0) WRITE_MSG(SET_ACCEL)` leaves the driver at a stale
+  rate, and an `ACCL==0` path can compute `+inf`). Strict-parity option (make
+  `MotorCommand.acceleration: Option<f64>` and skip the asyn-rs SET_ACCEL when None) is
+  larger than the NIT warrants and is flagged for sign-off only — not implemented.
 - **Rust:** `command_planner.rs:1554-1574`/`1578-1595`/`1602-1619` — each falls back to a
   strictly positive rate and always carries an `acceleration`.
 - **C:** `motorRecord.cc:2529` — `if(accel>0.0) WRITE_MSG(SET_ACCEL,&accel)`; a computed
@@ -294,16 +314,25 @@ routes into `plan_absolute_move`. No defect.
 - **Impact:** a URIP motor whose RDBL source differs from controller position gets a different
   startup VAL/DVAL than C. Part of the init-order seam (see R42/R59).
 
-#### R42 — Initial DMOV derived from driver status instead of C's unconditional `dmov=TRUE`
-- **Severity:** CONCERN
-- **Rust:** `status_update.rs:447` — `initial_readback` ends `self.stat.dmov = status.done &&
-  !status.moving` (then `request_poll` if moving).
-- **C:** `motorRecord.cc:721` — `init_record` sets `pmr->dmov=TRUE; MARK(M_DMOV)`
-  unconditionally after `process_motor_info`.
-- **Divergence:** an axis moving at IOC start seeds DMOV=false in Rust, TRUE in C (corrected on
-  first CALLBACK_DATA poll, `:1316-1317`).
-- **Impact:** init-time DMOV differs; FLNK fires only on DMOV=true, so C fires the forward link
-  once at init for a moving axis and Rust does not. Transient; init monitor/FLNK not C-faithful.
+#### R42 — Initial DMOV derived from driver status instead of C's unconditional `dmov=TRUE` — REJECTED (empirically falsified)
+- **Severity:** CONCERN → not a defect
+- **Resolution:** The premise (a boot-mid-motion axis strands DMOV=0 forever) is
+  falsified by tracing the actual code. `initial_readback` calls `process_motor_info`
+  at `status_update.rs:412` BEFORE the `dmov = status.done && !status.moving`
+  assignment at `:484`; the MIP_EXTERNAL detector (`:239-246`, gated
+  `movn && dmov && phase==Idle && !EXTERNAL`) runs INSIDE that call while the
+  fresh-record default `dmov` is still `true` (fields.rs:293) and `phase` is `Idle`.
+  So a moving-at-init status FIRES the detector during init — empirically:
+  AFTER INIT `dmov=false mip=EXTERNAL`; AFTER the external move completes `dmov=true
+  mip=empty val=10 dval=10`. The axis closes the loop correctly (the EXTERNAL
+  completion arm at `:401-416` reseeds VAL/DVAL and finalizes). C's `dmov=TRUE` at
+  init is corrected on the first poll to the same end state; the Rust driver-derived
+  init dmov reaches the same place via the EXTERNAL path. Blindly writing
+  `dmov=true` would have broken `startup_moving_starts_polling` and gained nothing.
+- **C:** `motorRecord.cc:721` — `init_record` sets `pmr->dmov=TRUE` unconditionally;
+  the MIP_EXTERNAL detector lives in `process()` (~1316, commit ea063f5f), not in
+  `process_motor_info`. The init-order seam differs but the observable end state
+  (DMOV=1 + reseeded drive values after the external move) matches.
 
 #### R43 — MSTA RA_HOMED (bit 14) is latched at the record level; C copies the driver word wholesale — **CLEARED** (`65df336b`)
 - **Severity:** DEFECT
@@ -319,8 +348,17 @@ routes into `plan_absolute_move`. No defect.
   C clears bit 14, Rust reports a permanently-homed axis on `camonitor MSTA`. Fix: drop the
   `|| msta.contains(HOMED)` term (rely on `status.homed`).
 
-#### R44 — `udf` re-derived from `VAL.is_nan()` every cycle; C manages motor UDF only at init + DOL block
+#### R44 — `udf` re-derived from `VAL.is_nan()` every cycle; C manages motor UDF only at init + DOL block — CLEARED (`66279d1a`)
 - **Severity:** CONCERN
+- **Resolution:** Paired structural fix. `MotorRecord::clears_udf()` overridden to
+  `false` so the framework no longer recomputes `common.udf = value_is_undefined()`
+  per pass; motor UDF is owned solely by the DOL channel (`dol_udf` → `check_alarms`)
+  and an init clear. `initial_readback` arms `dol_udf=Some(false)` when DOL is CONSTANT
+  (C init 677-681); an unset DOL is C link type CONSTANT, so `ParsedLink::None` counts
+  with a literal `Constant`. A DB_LINK/CA DOL is left undefined until the closed-loop
+  collection's first successful read, mirroring C leaving `udf` TRUE for a non-CONSTANT
+  `.dol`. 3 tests: motor opts out of VAL-derived UDF; CONSTANT/unset DOL clears UDF at
+  init; DB_LINK DOL stays undefined until the first DOL read.
 - **Rust:** `epics-base-rs/.../processing.rs:2237-2239` — for any record whose `clears_udf()` is
   true, `common.udf = value_is_undefined()` every Complete cycle. Motor overrides neither
   `clears_udf` (default true) nor `value_is_undefined` (default `VAL.is_nan()`). Motor UDF logic

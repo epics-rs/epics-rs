@@ -1029,6 +1029,16 @@ impl Record for WaveformRecord {
         self.kind.as_record_type()
     }
 
+    /// Expose the concrete record so device support can drive the
+    /// device-only control fields that have no generic put path — `BUSY`
+    /// is `special(SPC_NOMOD)`/read-only and `RARM` is reset by the
+    /// device's own process. The time-series device support
+    /// (`devAsynXXXTimeSeries`) downcasts here to apply its RARM state
+    /// machine and reflect BUSY, mirroring the MotorRecord precedent.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
     /// subArray finalisation, mirroring C `subArrayRecord.c::init_record`
     /// pass 0 (lines 96-104): MALM is floored to 1 (never 0), then NELM is
     /// clamped down to MALM. This runs after the loader has applied every
@@ -1713,6 +1723,24 @@ mod array_kind_tests {
             assert_eq!(r.get_field("BUSY"), None, "{kind:?} BUSY get must be None");
             assert!(r.put_field("RARM", EpicsValue::Short(1)).is_err());
         }
+    }
+
+    /// `as_any_mut` exposes the concrete record so device support can drive the
+    /// fields with no generic put path — read-only BUSY and the device-reset
+    /// RARM (the TimeSeries device support uses exactly this downcast).
+    #[test]
+    fn waveform_as_any_mut_downcasts_to_concrete_record() {
+        let mut r: Box<dyn Record> = Box::new(WaveformRecord::with_kind(ArrayKind::Waveform));
+        let wf = r
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<WaveformRecord>())
+            .expect("waveform must expose itself via as_any_mut");
+        // Device-only writes that the generic put path cannot do: BUSY is
+        // read-only, RARM is reset by the device after applying it.
+        wf.busy = true;
+        wf.rarm = 0;
+        assert_eq!(r.get_field("BUSY"), Some(EpicsValue::Short(1)));
+        assert_eq!(r.get_field("RARM"), Some(EpicsValue::Short(0)));
     }
 
     /// OMSL (resolved to a Short index by the central menu path) and DOL

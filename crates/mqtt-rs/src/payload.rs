@@ -194,11 +194,11 @@ fn boolean_payload_to_int(s: &str) -> Option<i64> {
 fn decode_flat(raw: &str, value_type: ValueType) -> MqttResult<DecodedValue> {
     let trimmed = raw.trim();
     match value_type {
-        // INT/FLOAT/DIGITAL parse the RAW payload: C's isInteger/isFloat
-        // (drvMqtt.cpp:376-401) require the whole string to be digits/number
-        // with no surrounding whitespace, so a payload like "42\n" is rejected
-        // (the prior value is kept), not silently accepted as 42. Rust's
-        // integer/float FromStr rejects leading/trailing whitespace identically.
+        // INT/DIGITAL parse the RAW payload: C's isInteger (drvMqtt.cpp:376-387)
+        // is a hand-rolled digit scan with no whitespace skip, so a payload like
+        // " 42" or "42\n" is rejected (the prior value is kept), not silently
+        // accepted as 42. Rust's integer FromStr rejects surrounding whitespace
+        // identically. FLOAT differs (C uses strtof) -- see its arm below.
         ValueType::Int => {
             if let Some(b) = boolean_payload_to_int(raw) {
                 return Ok(DecodedValue::Int32(b as i32));
@@ -209,7 +209,13 @@ fn decode_flat(raw: &str, value_type: ValueType) -> MqttResult<DecodedValue> {
             Ok(DecodedValue::Int32(v))
         }
         ValueType::Float => {
+            // C validates floats with isFloat -> strtof (drvMqtt.cpp:393-401),
+            // which SKIPS leading whitespace but requires the parse to reach
+            // end-of-string (trailing whitespace/garbage rejected). So " 4.2"
+            // is a valid 4.2 in C while "4.2 " is refused. trim_start() before
+            // parse() mirrors that: accept leading ws, still reject trailing.
             let v: f64 = raw
+                .trim_start()
                 .parse()
                 .map_err(|e| MqttError::ValueConversion(format!("FLOAT parse: {e}")))?;
             Ok(DecodedValue::Float64(v))
@@ -389,12 +395,21 @@ mod tests {
     }
 
     #[test]
-    fn decode_flat_float_digital_whitespace_rejected() {
+    fn decode_flat_float_leading_ws_ok_trailing_rejected() {
+        // C isFloat -> strtof (drvMqtt.cpp:393-401) skips leading whitespace
+        // but requires whole-string consumption: " 4.2" is a valid 4.2, while
+        // "4.2\n"/"4.2 " (trailing) are refused and the prior VAL kept.
         let f = TopicAddress::parse("FLAT:FLOAT test/t").unwrap();
+        assert_eq!(
+            decode_payload(" 4.2", &f).unwrap(),
+            DecodedValue::Float64(4.2)
+        );
         assert!(decode_payload("4.2\n", &f).is_err());
-        assert!(decode_payload(" 4.2", &f).is_err());
+        assert!(decode_payload("4.2 ", &f).is_err());
+        // DIGITAL uses isInteger (no ws skip), so any surrounding ws is refused.
         let d = TopicAddress::parse("FLAT:DIGITAL test/t").unwrap();
         assert!(decode_payload("7 ", &d).is_err());
+        assert!(decode_payload(" 7", &d).is_err());
     }
 
     #[test]

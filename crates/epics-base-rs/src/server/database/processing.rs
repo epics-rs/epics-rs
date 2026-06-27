@@ -4519,6 +4519,20 @@ impl PvDatabase {
             // semantics. Omitting them sent a simulated mbbi down the
             // OUTPUT branch, which writes VAL out to SIOL instead of
             // reading the value in from it.
+            //
+            // `waveform`/`histogram` are also `readValue` inputs: both call
+            // `readValue` at the START of `process()` and read SIOL in
+            // (`waveformRecord.c:139`->`:351` `dbGetLink(&siol, ftvl, bptr)`;
+            // `histogramRecord.c:209`->`:384` `dbGetLink(&siol, DBR_DOUBLE,
+            // &sval)`). They are classified as inputs so a simulated cycle
+            // reads SIOL rather than running the real device read and writing
+            // VAL back out. `waveform` is exact: the SIOL array lands in VAL via
+            // `set_val`. `histogram` reads SIOL but lands the scalar in VAL via
+            // the shared `set_val` path, which no-ops against the bin-count
+            // array — so a simulated histogram is frozen (no SIOL->SVAL feed, no
+            // bin accumulation). That residual is pre-existing and unmodeled;
+            // the classification only ensures a simulated histogram no longer
+            // performs the real device read or corrupts the SIOL target.
             let is_input = matches!(
                 rtype.as_str(),
                 "ai" | "bi"
@@ -4529,6 +4543,8 @@ impl PvDatabase {
                     | "stringin"
                     | "lsi"
                     | "event"
+                    | "waveform"
+                    | "histogram"
             );
 
             let siml = instance

@@ -532,6 +532,22 @@ impl Record for MotorRecord {
         }
     }
 
+    /// C `special()` STUP after-write (motorRecord.cc:3084-3090): a STUP put
+    /// of any value other than ON is clamped to OFF and returns ERROR, which
+    /// suppresses the pp(TRUE) reprocess — only a `STUP == ON` put runs the
+    /// status-update process. `field_access` has already clamped `stup` to 0
+    /// for any non-ON put by the time this gate runs, so the post-clamp value
+    /// is the deterministic discriminator. Every other pp(TRUE) field
+    /// reprocesses normally (default membership test).
+    fn processes_after_put(&self, field: &str) -> bool {
+        if field.eq_ignore_ascii_case("STUP") {
+            return self.stat.stup == 1;
+        }
+        self.process_passive_fields()
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(field))
+    }
+
     /// C `alarm_sub()` (motorRecord.cc:3367-3406) — motor-specific alarm
     /// severities, raised into `nsta`/`nsev` before the framework's
     /// `evaluate_alarms`.
@@ -624,6 +640,29 @@ mod tests {
         // C motorRecord.cc:1509-1510: DMOV is the only FLNK gate.
         rec.stat.dmov = false;
         assert!(!rec.should_fire_forward_link());
+    }
+
+    // C special() STUP after-write (motorRecord.cc:3084-3090): only a
+    // STUP==ON put runs the pp(TRUE) reprocess; any other value is clamped to
+    // OFF and C returns ERROR so the record does not process. R24. Fresh
+    // records per case so the STUP-in-flight before-write veto (stup != OFF)
+    // does not reject the second put.
+    #[test]
+    fn test_stup_processes_after_put_only_when_on() {
+        // STUP == ON -> reprocess.
+        let mut on = MotorRecord::new();
+        on.put_field("STUP", EpicsValue::Short(1)).unwrap();
+        assert_eq!(on.stat.stup, 1);
+        assert!(on.processes_after_put("STUP"));
+
+        // STUP == BUSY -> clamped to OFF, no reprocess (C return ERROR).
+        let mut off = MotorRecord::new();
+        off.put_field("STUP", EpicsValue::Short(2)).unwrap();
+        assert_eq!(off.stat.stup, 0);
+        assert!(!off.processes_after_put("STUP"));
+
+        // A non-pp(TRUE) config field never reprocesses (default membership).
+        assert!(!off.processes_after_put("VELO"));
     }
 
     // C motorRecord.cc:1495 — every process pass fires the RLNK readback

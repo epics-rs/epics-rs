@@ -447,6 +447,22 @@ pub trait Record: Send + Sync + 'static {
         super::process_passive::pp_fields_for(self.record_type())
     }
 
+    /// Whether a put to `field` should reprocess this Passive record.
+    ///
+    /// The default is pure `pp(TRUE)` membership — the put gate's
+    /// `field in process_passive_fields()` test. A record type overrides this
+    /// when its C `special()` conditionally returns ERROR to suppress the
+    /// reprocess for a `pp(TRUE)` field on certain values (e.g. motor STUP:
+    /// only a `STUP == ON` put runs the status-update process; any other value
+    /// is clamped to OFF and C returns ERROR so no process runs). Modeling that
+    /// here keeps the suppression at the same gate as the pp test, with no
+    /// per-put one-shot state — the post-clamp field value is deterministic.
+    fn processes_after_put(&self, field: &str) -> bool {
+        self.process_passive_fields()
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(field))
+    }
+
     /// Validate a put before it is applied. Return Err to reject.
     fn validate_put(&self, _field: &str, _value: &EpicsValue) -> CaResult<()> {
         Ok(())

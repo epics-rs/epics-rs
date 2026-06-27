@@ -925,9 +925,8 @@ impl PvDatabase {
         // pp set), never the default.
         let should_process = {
             let instance = rec.read().await;
-            let pp = instance.record.process_passive_fields();
             instance.common.scan == crate::server::record::ScanType::Passive
-                && pp.iter().any(|f| f.eq_ignore_ascii_case(&field))
+                && instance.record.processes_after_put(&field)
         };
 
         if !should_process {

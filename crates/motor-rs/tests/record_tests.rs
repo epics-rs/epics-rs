@@ -2959,28 +2959,49 @@ fn test_accs_default_mirrors_accl() {
 }
 
 #[test]
-fn test_put_accl_recalculates_accs_and_switches_accu() {
+fn test_put_accl_recalculates_accs_and_leaves_accu_untouched() {
+    // C special() motorRecordACCL (motorRecord.cc:2735-2742): recompute ACCS
+    // from ACCL but DO NOT change ACCU (63bfe5d0 made ACCU a user control).
     let mut rec = MotorRecord::new();
     rec.vel.velo = 10.0;
     rec.vel.vbas = 0.0;
-    rec.vel.accu = AccsUsed::Accs; // start from Accs
+    rec.vel.accu = AccsUsed::Accs; // start from Accs — must survive the put
     rec.put_field("ACCL", EpicsValue::Double(2.0)).unwrap();
-    assert_eq!(rec.vel.accu, AccsUsed::Accl);
+    assert_eq!(rec.vel.accu, AccsUsed::Accs);
     assert!((rec.vel.accl - 2.0).abs() < 1e-12);
     // ACCS = (10 - 0) / 2 = 5
     assert!((rec.vel.accs - 5.0).abs() < 1e-12);
 }
 
 #[test]
-fn test_put_accs_recalculates_accl_and_switches_accu() {
+fn test_put_accs_recalculates_accl_and_leaves_accu_untouched() {
+    // C special() motorRecordACCS (motorRecord.cc:2745-2752): recompute ACCL
+    // from ACCS but DO NOT change ACCU.
     let mut rec = MotorRecord::new();
     rec.vel.velo = 10.0;
     rec.vel.vbas = 0.0;
+    rec.vel.accu = AccsUsed::Accl; // default master — must survive the put
     rec.put_field("ACCS", EpicsValue::Double(4.0)).unwrap();
-    assert_eq!(rec.vel.accu, AccsUsed::Accs);
+    assert_eq!(rec.vel.accu, AccsUsed::Accl);
     assert!((rec.vel.accs - 4.0).abs() < 1e-12);
     // ACCL = (10 - 0) / 4 = 2.5
     assert!((rec.vel.accl - 2.5).abs() < 1e-12);
+}
+
+#[test]
+fn test_put_accs_nonpositive_derives_from_accl_not_literal() {
+    // C special() motorRecordACCS (motorRecord.cc:2745-2748): a non-positive
+    // ACCS is derived from ACCL via updateACCSfromACCL (accs = velo/accl), NOT
+    // forced to a literal 1.0.
+    let mut rec = MotorRecord::new();
+    rec.vel.velo = 10.0;
+    rec.vel.vbas = 0.0;
+    rec.vel.accl = 2.0;
+    rec.put_field("ACCS", EpicsValue::Double(0.0)).unwrap();
+    // accs <= 0 → accs = (10 - 0) / 2 = 5 (from ACCL), not 1.0
+    assert!((rec.vel.accs - 5.0).abs() < 1e-12, "ACCS={}", rec.vel.accs);
+    // ACCL stays consistent: (10 - 0) / 5 = 2 (round-trip)
+    assert!((rec.vel.accl - 2.0).abs() < 1e-12, "ACCL={}", rec.vel.accl);
 }
 
 #[test]
@@ -3382,7 +3403,8 @@ fn test_move_accel_uses_accs_directly_when_accu_is_accs() {
     let mut rec = MotorRecord::new();
     rec.vel.vbas = 0.0;
     rec.put_field("VELO", EpicsValue::Double(10.0)).unwrap();
-    rec.put_field("ACCS", EpicsValue::Double(7.0)).unwrap(); // ACCU→Accs
+    rec.put_field("ACCS", EpicsValue::Double(7.0)).unwrap();
+    rec.put_field("ACCU", EpicsValue::Short(1)).unwrap(); // select ACCS as master
     rec.put_field("VAL", EpicsValue::Double(50.0)).unwrap();
     let effects = rec.plan_motion(CommandSource::Val);
     let accel = effects.commands.iter().find_map(|c| match c {
@@ -3398,10 +3420,10 @@ fn test_move_accel_accu_accs_ignores_velo_vbas() {
     // C accEGUfromVelo: ACCU=Accs returns ACCS unconditionally — VELO/VBAS
     // do not enter the calculation.
     let mut rec = MotorRecord::new();
-    rec.put_field("ACCS", EpicsValue::Double(4.0)).unwrap(); // ACCU→Accs
+    rec.put_field("ACCS", EpicsValue::Double(4.0)).unwrap();
     rec.put_field("VELO", EpicsValue::Double(99.0)).unwrap();
     rec.put_field("VBAS", EpicsValue::Double(50.0)).unwrap();
-    // re-assert ACCU=Accs (VELO/VBAS puts cascade but must not change accu)
+    // select ACCS as master (ACCS/VELO/VBAS puts do not change ACCU themselves)
     rec.put_field("ACCU", EpicsValue::Short(1)).unwrap();
     rec.put_field("VAL", EpicsValue::Double(500.0)).unwrap();
     let effects = rec.plan_motion(CommandSource::Val);
@@ -3783,7 +3805,8 @@ fn test_put_accs_recomputes_accl_with_full_velo_when_velo_le_vbas() {
     rec.put_field("VELO", EpicsValue::Double(5.0)).unwrap(); // velo < vbas
     rec.vel.accl = 99.0; // stale slave that must be overwritten
     rec.put_field("ACCS", EpicsValue::Double(4.0)).unwrap();
-    assert_eq!(rec.vel.accu, AccsUsed::Accs);
+    // ACCS put no longer switches ACCU (R22 / 63bfe5d0); default master survives.
+    assert_eq!(rec.vel.accu, AccsUsed::Accl);
     // velo < vbas → numerator = velo = 5.0; ACCL = 5.0 / 4.0 = 1.25
     assert!((rec.vel.accl - 1.25).abs() < 1e-12, "ACCL={}", rec.vel.accl);
 }
@@ -5965,6 +5988,10 @@ fn test_accs_roundtrip_via_pv() {
     rec.vel.vbas = 0.0;
     rec.put_field("ACCS", EpicsValue::Double(4.0)).unwrap();
     assert_eq!(rec.get_field("ACCS"), Some(EpicsValue::Double(4.0)));
+    // ACCS put does not switch ACCU (R22 / 63bfe5d0); it stays the default Accl.
+    assert_eq!(rec.get_field("ACCU"), Some(EpicsValue::Short(0)));
+    // ACCU is an independent user/autosave control.
+    rec.put_field("ACCU", EpicsValue::Short(1)).unwrap();
     assert_eq!(rec.get_field("ACCU"), Some(EpicsValue::Short(1)));
 }
 

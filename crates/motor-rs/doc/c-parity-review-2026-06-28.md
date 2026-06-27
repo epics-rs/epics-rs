@@ -164,7 +164,7 @@ routes into `plan_absolute_move`. No defect.
 
 ### Category B — Field access / special / coordinate / limits
 
-#### R21 — ACCU cascade skips the slave-accel recompute when VELO ≤ VBAS
+#### R21 — ACCU cascade skips the slave-accel recompute when VELO ≤ VBAS — CLEARED (`f23f51f1`)
 - **Severity:** CONCERN
 - **Rust:** `record/field_access.rs:2144-2148` (`apply_accu_cascade`):
   `span = velo - effective_vbas; if span <= 0.0 { return; }` — leaves ACCL/ACCS untouched.

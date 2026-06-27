@@ -1449,10 +1449,11 @@ pub(crate) fn motor_put_field(
         },
         "ACCL" => match value {
             EpicsValue::Double(v) => {
-                // C: ACCL must be > 0 (forces to 0.1 if <= 0)
+                // C special() motorRecordACCL (motorRecord.cc:2735-2742): floor
+                // ACCL to 0.1 if <= 0, then updateACCSfromACCL. ACCU is NOT
+                // touched — 63bfe5d0 made ACCU a user/autosave control and
+                // dropped the 36177f7b auto-switch from the accel helpers.
                 rec.vel.accl = if v <= 0.0 { 0.1 } else { v };
-                // C: 36177f7b — writing ACCL switches ACCU to Accl and recalcs ACCS
-                rec.vel.accu = AccsUsed::Accl;
                 // C updateACCSfromACCL (motorRecord.cc:512-521): numerator is
                 // (velo - vbas) only while velo > vbas; at velo <= vbas C uses
                 // the full velo and still recomputes ACCS.
@@ -1471,19 +1472,26 @@ pub(crate) fn motor_put_field(
         },
         "ACCS" => match value {
             EpicsValue::Double(v) => {
-                // C: ACCS must be > 0 (use 1.0 fallback)
-                rec.vel.accs = if v <= 0.0 { 1.0 } else { v };
-                // C: 36177f7b — writing ACCS switches ACCU to Accs and recalcs ACCL
-                rec.vel.accu = AccsUsed::Accs;
-                // C updateACCLfromACCS (motorRecord.cc:499-510): numerator is
-                // (velo - vbas) only while velo > vbas; at velo <= vbas C uses
-                // the full velo and still recomputes ACCL.
+                // C special() motorRecordACCS (motorRecord.cc:2745-2752): the
+                // raw put lands in ACCS; if it is non-positive C derives ACCS
+                // from ACCL (updateACCSfromACCL, accs = velo/accl — NOT a
+                // literal 1.0), then recomputes ACCL from ACCS
+                // (updateACCLfromACCS). ACCU is NOT touched (63bfe5d0 dropped
+                // the 36177f7b auto-switch).
+                rec.vel.accs = v;
+                // C numerator is (velo - vbas) only while velo > vbas; at
+                // velo <= vbas C uses the full velo.
                 let vbas = rec.effective_vbas();
                 let numerator = if rec.vel.velo > vbas {
                     rec.vel.velo - vbas
                 } else {
                     rec.vel.velo
                 };
+                // updateACCSfromACCL: sanitize a non-positive ACCS from ACCL.
+                if rec.vel.accs <= 0.0 && rec.vel.accl > 0.0 {
+                    rec.vel.accs = numerator / rec.vel.accl;
+                }
+                // updateACCLfromACCS: keep ACCL consistent with ACCS.
                 if rec.vel.accs > 0.0 {
                     rec.vel.accl = numerator / rec.vel.accs;
                 }

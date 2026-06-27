@@ -123,8 +123,13 @@ impl MotorRecord {
             self.conv.ueip = false;
         }
 
-        // Layer 1: update raw positions
-        self.pos.rmp = (status.position / self.conv.mres).round() as i64;
+        // Layer 1: update raw positions. C devMotorAsyn.c:452/459 rounds the
+        // raw motor and encoder counts with floor(x + 0.5) (half toward +inf),
+        // NOT NINT (half away from zero). They differ only at an exact .5 on a
+        // negative count (raw -2.5 -> C -2, Rust .round() -> -3). The other raw
+        // conversions in this file (rdif, rval, URIP rrbv) use C NINT
+        // (motorRecord.cc) == Rust .round(), so they must stay .round().
+        self.pos.rmp = (status.position / self.conv.mres + 0.5).floor() as i64;
 
         // C devMotorAsyn.c:459-464 — REP is the raw encoder count,
         // independent of UEIP (C rounds the count the asyn layer already
@@ -133,7 +138,7 @@ impl MotorRecord {
         // it). MRES is only a fallback for an invalid runtime ERES.
         let eres_valid = self.conv.eres.is_finite() && self.conv.eres != 0.0;
         if eres_valid {
-            self.pos.rep = (status.encoder_position / self.conv.eres).round() as i64;
+            self.pos.rep = (status.encoder_position / self.conv.eres + 0.5).floor() as i64;
         } else {
             if self.conv.ueip {
                 tracing::warn!(
@@ -141,7 +146,7 @@ impl MotorRecord {
                     self.conv.eres
                 );
             }
-            self.pos.rep = (status.encoder_position / self.conv.mres).round() as i64;
+            self.pos.rep = (status.encoder_position / self.conv.mres + 0.5).floor() as i64;
         }
 
         // RRBV depends on UEIP

@@ -3911,7 +3911,9 @@ impl Record for TableRecord {
     /// tableRecord.c:758-772), `get_graphic_double` / `get_control_double`
     /// (the six user coordinates AX,AY,AZ,X,Y,Z report disp & ctrl limits =
     /// `(hlax[i], llax[i])`; :784-787, :801-804), and `get_precision`
-    /// (`VERS` → 2; :820-821). The framework has no record-level metadata for
+    /// (`VERS` → 2, every other record-specific field → the `PREC` field,
+    /// dbCommon → `recGblGetPrec`; :818-826). The framework has no record-level
+    /// metadata for
     /// the `table` type, so without this hook a DBR_GR/CTRL/units request
     /// returned no units and default (unset) limits.
     fn field_metadata_override(&self, field: &str) -> Option<FieldMetadataOverride> {
@@ -3929,9 +3931,20 @@ impl Record for TableRecord {
             ..Default::default()
         };
 
-        // C get_precision: VERS reports precision 2 (not the record PREC).
+        // C get_precision (tableRecord.c:818-826): VERS reports precision 2;
+        // every other record-specific field (fieldIndex >= tableRecordVAL)
+        // reports the record's PREC field; dbCommon fields (index < VAL) fall
+        // through to the framework's recGblGetPrec. `field_list()` holds exactly
+        // the record-specific fields (no dbCommon names), so membership is the
+        // `>= tableRecordVAL` boundary.
         if field.eq_ignore_ascii_case("VERS") {
             ov.precision = Some(2);
+        } else if self
+            .field_list()
+            .iter()
+            .any(|d| d.name.eq_ignore_ascii_case(field))
+        {
+            ov.precision = Some(self.prec);
         }
 
         // C get_graphic_double / get_control_double: the six user-coordinate
@@ -4743,16 +4756,20 @@ mod tests {
         let mut t = TableRecord::new();
         t.aegu = "degrees".into();
         t.legu = "mm".into();
+        t.prec = 4;
         t.set_calc_hi_limit(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         t.set_calc_lo_limit(&[-1.0, -2.0, -3.0, -4.0, -5.0, -6.0]);
         let deg: PvString = "degrees".into();
         let mm: PvString = "mm".into();
 
         // Angular coordinate AX (i=0): aegu units + (hlax[0], llax[0]) limits.
+        // AX is a record-specific field (>= tableRecordVAL), so C get_precision
+        // serves the PREC field (4 here), not VERS's fixed 2.
         let ax = t.field_metadata_override("AX").unwrap();
         assert_eq!(ax.units, Some(deg.clone()));
         assert_eq!(ax.disp_limits, Some((1.0, -1.0)));
         assert_eq!(ax.ctrl_limits, Some((1.0, -1.0)));
+        assert_eq!(ax.precision, Some(4));
 
         // Linear coordinate X (i=3): legu units + (hlax[3], llax[3]) limits.
         let x = t.field_metadata_override("X").unwrap();
@@ -4770,11 +4787,23 @@ mod tests {
         let llz = t.field_metadata_override("LLZ").unwrap();
         assert_eq!(llz.units, Some(mm.clone()));
 
-        // VERS: precision 2 (C get_precision), legu units, no limits.
+        // VERS: precision 2 (C get_precision special-case), legu units, no
+        // limits — VERS is NOT served the PREC field even though it is
+        // record-specific.
         let vers = t.field_metadata_override("VERS").unwrap();
         assert_eq!(vers.precision, Some(2));
-        assert_eq!(vers.units, Some(mm));
+        assert_eq!(vers.units, Some(mm.clone()));
         assert_eq!(vers.disp_limits, None);
+
+        // Linear coordinate X is also record-specific → PREC field, not VERS's 2.
+        assert_eq!(t.field_metadata_override("X").unwrap().precision, Some(4));
+
+        // dbCommon field (index < tableRecordVAL, not in field_list()): C falls
+        // through to recGblGetPrec, so the hook serves no precision override
+        // (units are still served, matching C get_units for all fields).
+        let phas = t.field_metadata_override("PHAS").unwrap();
+        assert_eq!(phas.precision, None);
+        assert_eq!(phas.units, Some(mm));
     }
 
     #[test]

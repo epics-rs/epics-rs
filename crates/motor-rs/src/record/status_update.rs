@@ -277,11 +277,14 @@ impl MotorRecord {
         if !status.vbas_supported {
             msta |= MstaFlags::VBAS_UNSUPPORTED;
         }
-        // Preserve record-managed bits. EA_PRESENT is NOT preserved:
-        // C overwrites pmr->msta wholesale from the driver each poll,
-        // and the UEIP demotion above depends on that bit being pure
-        // driver truth rather than a record-side latch.
-        if self.stat.msta.contains(MstaFlags::HOMED) || status.homed {
+        // RA_HOMED (bit 14) mirrors the driver status word like every
+        // other MSTA bit. C copies pmr->msta wholesale from the driver
+        // each poll (devMotorAsyn.c:467) and never record-manages
+        // RA_HOMED — motorRecord.cc writes it nowhere. A record-side
+        // sticky latch would report a permanently-homed axis after the
+        // driver de-asserts homed (re-home, controller reset, a
+        // SetPosition redefine the controller treats as un-homed).
+        if status.homed {
             msta |= MstaFlags::HOMED;
         }
         self.stat.msta = msta;

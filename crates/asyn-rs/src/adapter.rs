@@ -337,6 +337,17 @@ pub struct AsynDeviceSupport {
     /// averaging needs every sample, so it registers a synchronous callback
     /// (C `registerInterruptUser`), not a coalescing mailbox subscription.
     average_callback_sub: Option<crate::interrupt::SyncCallbackSubscription>,
+    /// `Some` ⟹ time-series device support (`asynInt32TimeSeries` /
+    /// `asynFloat64TimeSeries` / `asynInt64TimeSeries`, all waveform-only). The
+    /// always-on interrupt callback appends each driver sample into the array
+    /// while `BUSY`; the record process (RARM-driven + the completion callback)
+    /// commits the buffer to VAL/NORD/BUSY — C `devAsynXXXTimeSeries.h`
+    /// `interruptCallback` + `process`. `None` for every other DTYP.
+    time_series: Option<Arc<TimeSeriesState>>,
+    /// RAII handle for the time-series synchronous accumulating callback —
+    /// dropping unregisters it (mirrors `average_callback_sub`; the time-series
+    /// support also needs every sample, so a synchronous callback, not a mailbox).
+    time_series_sub: Option<crate::interrupt::SyncCallbackSubscription>,
     /// RAII interrupt subscription — dropping unsubscribes.
     interrupt_sub: Option<InterruptSubscription>,
     /// Per-record ring buffer of interrupt values, FIFO-ordered. The
@@ -437,6 +448,103 @@ impl AverageState {
             averager: crate::interfaces::average::SumAverager::new(),
             status: std::sync::Mutex::new(AverageStatus::default()),
             num_to_average: std::sync::atomic::AtomicI64::new(1),
+        }
+    }
+}
+
+/// Time-series accumulation buffer, typed to the record's FTVL. Resolved at
+/// `init()` from FTVL (which C requires be the signed/unsigned EPICS type of the
+/// interface: Int32→LONG/ULONG, Float64→DOUBLE, Int64→INT64/UINT64). The driver
+/// sample is appended in the element type so the committed VAL matches FTVL.
+enum TsBuf {
+    Long(Vec<i32>),
+    Int64(Vec<i64>),
+    UInt64(Vec<u64>),
+    Double(Vec<f64>),
+}
+
+impl TsBuf {
+    fn len(&self) -> usize {
+        match self {
+            Self::Long(v) => v.len(),
+            Self::Int64(v) => v.len(),
+            Self::UInt64(v) => v.len(),
+            Self::Double(v) => v.len(),
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Self::Long(v) => v.clear(),
+            Self::Int64(v) => v.clear(),
+            Self::UInt64(v) => v.clear(),
+            Self::Double(v) => v.clear(),
+        }
+    }
+
+    /// Append one driver sample (C `interruptCallback`: `pData[nord] = value`).
+    /// The interface and FTVL are paired by construction (validated at init), so
+    /// the matching arm always fires; a non-matching ParamValue is ignored.
+    fn push(&mut self, value: &crate::param::ParamValue) {
+        use crate::param::ParamValue;
+        match (self, value) {
+            (Self::Long(v), ParamValue::Int32(x)) => v.push(*x),
+            (Self::Int64(v), ParamValue::Int64(x)) => v.push(*x),
+            (Self::UInt64(v), ParamValue::Int64(x)) => v.push(*x as u64),
+            (Self::Double(v), ParamValue::Float64(x)) => v.push(*x),
+            _ => {}
+        }
+    }
+
+    /// Snapshot the accumulated samples as the record VAL value. `set_val`/
+    /// `put_field("VAL")` then sets `NORD = len` (C `pwf->nord = pPvt->nord`).
+    fn to_epics_value(&self) -> EpicsValue {
+        match self {
+            Self::Long(v) => EpicsValue::LongArray(v.clone()),
+            Self::Int64(v) => EpicsValue::Int64Array(v.clone()),
+            Self::UInt64(v) => EpicsValue::UInt64Array(v.clone()),
+            Self::Double(v) => EpicsValue::DoubleArray(v.clone()),
+        }
+    }
+}
+
+/// Shared state for a time-series (`asynInt32TimeSeries` /
+/// `asynFloat64TimeSeries` / `asynInt64TimeSeries`) waveform record. The
+/// always-on accumulating callback (registered in `io_intr_receiver`) appends
+/// samples while `busy`; the record process commits them. Mirrors C
+/// `devAsynXXXTimeSeries.h`'s `devAsynWfPvt` (busy/nord live here; the array is
+/// `buf`, committed to the record VAL each process rather than written into the
+/// record buffer from the callback — the asyn-rs callback runs inline in the
+/// driver notify and holds no record lock).
+struct TimeSeriesState {
+    inner: std::sync::Mutex<TimeSeriesInner>,
+}
+
+struct TimeSeriesInner {
+    /// Acquisition active (C `pPvt->busy`). The callback appends only while set;
+    /// the process state machine sets it from RARM and the callback clears it
+    /// when the buffer fills.
+    busy: bool,
+    /// Buffer capacity = record NELM, captured at init.
+    nelm: usize,
+    /// Accumulated samples, typed to FTVL (set at init; `None` until then or if
+    /// FTVL is invalid — the record then never acquires, matching C's dead record).
+    buf: Option<TsBuf>,
+    /// Transport status of the most recent erroring sample (C `pPvt->status =
+    /// pasynUser->auxStatus`), applied as a READ_ALARM and cleared by the next
+    /// process.
+    status: crate::error::AsynStatus,
+}
+
+impl TimeSeriesState {
+    fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(TimeSeriesInner {
+                busy: false,
+                nelm: 0,
+                buf: None,
+                status: crate::error::AsynStatus::Success,
+            }),
         }
     }
 }
@@ -542,6 +650,8 @@ impl AsynDeviceSupport {
             octet_binary: false,
             average: None,
             average_callback_sub: None,
+            time_series: None,
+            time_series_sub: None,
             interrupt_sub: None,
             interrupt_fifo: Arc::new(std::sync::Mutex::new(InterruptFifo::new())),
             output_callback_pending: false,
@@ -1484,6 +1594,51 @@ impl DeviceSupport for AsynDeviceSupport {
             }
         }
 
+        // Time-series FTVL validation + buffer sizing. C `initRecord`
+        // (devAsynXXXTimeSeries.h:73-77) requires FTVL be the signed or unsigned
+        // EPICS type of the interface, else errlogPrintf + pact=1 (dead record).
+        // Mirror that: on an invalid FTVL the buffer stays `None`, so the record
+        // never accumulates or commits. menuFtype indices: LONG=5, ULONG=6,
+        // INT64=7, UINT64=8, DOUBLE=10.
+        if let Some(ts) = self.time_series.clone() {
+            let ftvl = match record.get_field("FTVL") {
+                Some(EpicsValue::Short(v)) => v,
+                _ => -1,
+            };
+            let buf = match self.iface_type.as_str() {
+                "asynInt32" => match ftvl {
+                    5 | 6 => Some(TsBuf::Long(Vec::new())),
+                    _ => None,
+                },
+                "asynInt64" => match ftvl {
+                    7 => Some(TsBuf::Int64(Vec::new())),
+                    8 => Some(TsBuf::UInt64(Vec::new())),
+                    _ => None,
+                },
+                "asynFloat64" => match ftvl {
+                    10 => Some(TsBuf::Double(Vec::new())),
+                    _ => None,
+                },
+                _ => None,
+            };
+            match buf {
+                Some(b) => {
+                    let mut st = ts.inner.lock().unwrap();
+                    st.nelm = self.max_array_elements;
+                    st.buf = Some(b);
+                }
+                None => {
+                    eprintln!(
+                        "[asyn] TimeSeries port='{}' drv_info='{}': FTVL must be the \
+                         signed/unsigned EPICS type of {} — record will not acquire",
+                        self.handle.port_name(),
+                        self.drv_info,
+                        self.iface_type
+                    );
+                }
+            }
+        }
+
         // Read SIZV from lsi/lso/printf records to size the asynOctet
         // read buffer. C parity: devAsynOctet.c:1103 passes
         // `plsi->sizv` to initCommon as the per-record buffer size;
@@ -1662,6 +1817,73 @@ impl DeviceSupport for AsynDeviceSupport {
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         if !self.reason_set {
             return Ok(DeviceReadOutcome::ok());
+        }
+
+        // Time-series device support: the record process. C
+        // `devAsynXXXTimeSeries.h::process` applies RARM, commits NORD/BUSY, and
+        // resets RARM — the accumulating callback owns the array. RARM is a
+        // process-passive field (waveformRecord.dbd.pod RARM pp(TRUE)), so a
+        // `caput RARM` lands here; the buffer-full callback and the Read FLNK
+        // also drive process. The buffer is committed to VAL (which sets NORD)
+        // rather than the callback writing the record array directly — the
+        // asyn-rs sync callback holds no record lock.
+        if let Some(ts) = self.time_series.clone() {
+            use epics_base_rs::server::records::waveform::WaveformRecord;
+            let Some(wf) = record
+                .as_any_mut()
+                .and_then(|a| a.downcast_mut::<WaveformRecord>())
+            else {
+                // TimeSeries dsets are waveform-only; a non-waveform record
+                // cannot carry RARM/BUSY — nothing to commit.
+                return Ok(DeviceReadOutcome::ok());
+            };
+            let rarm = wf.rarm;
+            let (arr, busy, status) = {
+                let mut st = ts.inner.lock().unwrap();
+                // C process RARM switch (devAsynXXXTimeSeries.h): 1=start
+                // (zero nord + arm), 2=stop, 3=resume, 0=no-op. "Start" clears
+                // the buffer; the others only flip BUSY.
+                match rarm {
+                    1 => {
+                        if let Some(buf) = st.buf.as_mut() {
+                            buf.clear();
+                        }
+                        st.busy = true;
+                    }
+                    2 => st.busy = false,
+                    3 => st.busy = true,
+                    _ => {}
+                }
+                let arr = st.buf.as_ref().map(TsBuf::to_epics_value);
+                let busy = st.busy;
+                // Consume the accumulated transport status (C applies it then
+                // resets pPvt->status = asynSuccess).
+                let status = std::mem::replace(&mut st.status, crate::error::AsynStatus::Success);
+                (arr, busy, status)
+            };
+            // Commit the current samples to VAL — `set_val` routes to
+            // put_field("VAL") for waveform and sets NORD = len (C
+            // `pwf->nord = pPvt->nord`). A None buffer (invalid FTVL) commits
+            // nothing, leaving VAL/NORD untouched.
+            if let Some(arr) = arr {
+                let _ = wf.set_val(arr);
+            }
+            // Sync the device-only fields the framework does not touch: BUSY
+            // reflects acquisition; RARM resets to 0 (C `pwf->rarm = 0`).
+            wf.busy = busy;
+            wf.rarm = 0;
+            // C `if (pPvt->status != asynSuccess) recGblSetSevr(prec, READ_ALARM,
+            // INVALID_ALARM)`; success clears to NO_ALARM. Input default
+            // READ_ALARM (waveform is an input record).
+            let (a_status, a_sev) = resolve_intr_alarm(
+                (0, 0),
+                status,
+                epics_base_rs::server::recgbl::alarm_status::READ_ALARM,
+            );
+            self.last_alarm_status = a_status;
+            self.last_alarm_severity = a_sev;
+            // VAL written directly → skip the record's RVAL→VAL convert.
+            return Ok(DeviceReadOutcome::computed());
         }
 
         // asynOctetCmdResponse misconfiguration: C initCmdBuffer
@@ -2076,6 +2298,78 @@ impl DeviceSupport for AsynDeviceSupport {
             return None;
         }
 
+        // Time-series device support (asynInt32/Float64/Int64TimeSeries):
+        // register an ALWAYS-ON synchronous accumulating callback (C
+        // `registerInterruptUser(interruptCallback)`, devAsynXXXTimeSeries.h:159).
+        // Like averaging it must observe EVERY sample, so a sync callback, not a
+        // coalescing mailbox. The callback appends to the buffer only while BUSY
+        // (C `if (pPvt->busy)`) and, when the buffer fills, clears BUSY and wakes
+        // the record to process (C `callbackRequestProcessCallback`,
+        // devAsynXXXTimeSeries.h:201-211). Process registration/cancellation by
+        // BUSY (C process) is folded into this always-on callback's BUSY gate —
+        // a not-busy sample is a no-op either way, so the observable behaviour is
+        // identical without dynamic register/cancel churn.
+        if let Some(ts) = self.time_series.clone() {
+            let filter = InterruptFilter {
+                reason: Some(self.reason),
+                addr: Some(self.addr),
+                uint32_mask: None,
+            };
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            let sub = self
+                .handle
+                .interrupts()
+                .register_sync_callback(filter, move |iv| {
+                    let mut st = ts.inner.lock().unwrap();
+                    // Not acquiring (C `if (pPvt->busy)` guard): nothing to do.
+                    if !st.busy {
+                        return;
+                    }
+                    let nelm = st.nelm;
+                    // Append while room remains (C `if (pPvt->nord < pwf->nelm)`).
+                    // A None buffer (FTVL invalid) or a full buffer returns.
+                    let full = match st.buf.as_mut() {
+                        Some(buf) if buf.len() < nelm => {
+                            buf.push(&iv.value);
+                            buf.len() >= nelm
+                        }
+                        _ => return,
+                    };
+                    // Transport status: C updates `pPvt->status = pasynUser->
+                    // auxStatus` on EVERY callback, even when not acquiring
+                    // (devAsynXXXTimeSeries.h:213 is outside the `if(busy)`).
+                    // Here it is reached only while acquiring (the not-busy guard
+                    // returned above) — a deliberate divergence: an error on a
+                    // sample received while stopped does not leak into the next
+                    // acquisition's alarm. Within acquisition the behaviour is C's:
+                    // keep the first non-success status until the next process.
+                    if st.status == crate::error::AsynStatus::Success
+                        && iv.aux_status != crate::error::AsynStatus::Success
+                    {
+                        st.status = iv.aux_status;
+                    }
+                    // Completion. DIVERGENCE from C: C completes LAZILY — the
+                    // sample that fills the last slot is stored and acquisition
+                    // stays busy; the NEXT sample finds `nord == nelm`, is
+                    // discarded, and only then clears busy + processes
+                    // (devAsynXXXTimeSeries.h:203-211). That delays completion by
+                    // one sample and hangs busy=1 forever if the stream stops at
+                    // exactly NELM. This port completes EAGERLY on the filling
+                    // sample: identical stored data (the first NELM samples; the
+                    // would-be C trigger sample is dropped by the not-busy guard
+                    // either way) but deterministic completion. try_send: the
+                    // callback runs inline in the driver notify and must not block;
+                    // a full wakeup channel means a process is already pending.
+                    if full {
+                        st.busy = false;
+                        drop(st);
+                        let _ = tx.try_send(());
+                    }
+                });
+            self.time_series_sub = Some(sub);
+            return Some(rx);
+        }
+
         // Averaging device support (asynInt32Average / asynFloat64Average):
         // register an ALWAYS-ON accumulating callback regardless of SCAN (C
         // enables the averaging callback unconditionally, devAsynInt32.c:385-386).
@@ -2298,7 +2592,10 @@ impl DeviceSupport for AsynDeviceSupport {
     /// arms the accumulating subscription; it spawns no reprocess task (the
     /// record scans on its own period, not per callback).
     fn io_intr_scan_independent(&self) -> bool {
-        self.asyn_readback || self.average.is_some()
+        // Time-series records are SCAN="Passive" (driven by RARM puts, the Read
+        // FLNK, and the completion callback) but must still receive the
+        // accumulating callback regardless of SCAN — same as averaging.
+        self.asyn_readback || self.average.is_some() || self.time_series.is_some()
     }
 
     fn arm_readback_callback(&mut self) {
@@ -2434,6 +2731,20 @@ fn normalize_asyn_dtyp(dtyp: &str) -> String {
     if dtyp == "asynFloat64Average" {
         return "asynFloat64".to_string();
     }
+    // Time-series DTYPs likewise use the base interface for driver I/O; the
+    // scalar-into-array accumulation is a device-support behaviour carried by
+    // `time_series` (C `asynInt32TimeSeries` registers on asynInt32, etc. —
+    // devAsynXXXTimeSeries.h INTERFACE_TYPE: asynInt32Type/asynFloat64Type/
+    // asynInt64Type).
+    if dtyp == "asynInt32TimeSeries" {
+        return "asynInt32".to_string();
+    }
+    if dtyp == "asynFloat64TimeSeries" {
+        return "asynFloat64".to_string();
+    }
+    if dtyp == "asynInt64TimeSeries" {
+        return "asynInt64".to_string();
+    }
     dtyp.to_string()
 }
 
@@ -2526,6 +2837,19 @@ pub fn universal_asyn_factory(
     // in `io_intr_receiver` (which `io_intr_scan_independent` enables here).
     if ctx.dtyp == "asynInt32Average" || ctx.dtyp == "asynFloat64Average" {
         adapter.average = Some(Arc::new(AverageState::new()));
+    }
+
+    // asynInt32TimeSeries / asynFloat64TimeSeries / asynInt64TimeSeries:
+    // time-series device support (waveform-only). The DRVINFO is a real param
+    // (useDrvUser=1), so `reason_set` is left false and `init()` runs
+    // `drv_user_create` as for a plain scalar record; init also validates FTVL
+    // and sizes the buffer from NELM. The accumulating subscription is armed in
+    // `io_intr_receiver` (which `io_intr_scan_independent` enables here).
+    if ctx.dtyp == "asynInt32TimeSeries"
+        || ctx.dtyp == "asynFloat64TimeSeries"
+        || ctx.dtyp == "asynInt64TimeSeries"
+    {
+        adapter.time_series = Some(Arc::new(TimeSeriesState::new()));
     }
 
     if is_output {
@@ -3189,6 +3513,348 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("averager never reached {n} samples");
+    }
+
+    /// Build a time-series adapter on the given (already normalized) base
+    /// interface, with `time_series` armed and a Passive record scan — the
+    /// shape the factory produces for `asynXxxTimeSeries`.
+    fn make_timeseries_adapter(iface: &str) -> AsynDeviceSupport {
+        let driver = TestPort::new();
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let actor = PortActor::new(Box::new(driver), rx);
+        std::thread::Builder::new()
+            .name("test-ts-actor".into())
+            .spawn(move || actor.run())
+            .unwrap();
+        let handle = PortHandle::new(tx, "test".into(), interrupts);
+        let link = AsynLink {
+            port_name: "test".into(),
+            addr: 0,
+            timeout: Duration::from_secs(1),
+            drv_info: "VAL".into(),
+        };
+        let mut ads = AsynDeviceSupport::from_handle(handle, link, iface);
+        ads.time_series = Some(Arc::new(TimeSeriesState::new()));
+        ads.set_record_info("TEST:TS", ScanType::Passive);
+        ads
+    }
+
+    /// Poll the time-series buffer until it holds at least `n` samples (the
+    /// accumulating callback runs on a spawned task). Panics if `n` never arrives.
+    async fn await_ts_len(ts: &Arc<TimeSeriesState>, n: usize) {
+        for _ in 0..200 {
+            let len = ts
+                .inner
+                .lock()
+                .unwrap()
+                .buf
+                .as_ref()
+                .map(TsBuf::len)
+                .unwrap_or(0);
+            if len >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("time-series buffer never reached {n} samples");
+    }
+
+    /// asynInt32TimeSeries happy path: RARM=1 starts acquisition (BUSY=1,
+    /// NORD=0), the callback appends only while BUSY, the buffer fills at NELM
+    /// (BUSY auto-clears), and the completion process commits VAL/NORD. C
+    /// `devAsynXXXTimeSeries.h` interruptCallback + process.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_series_int32_accumulates_while_armed_then_commits_on_full() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+        let mut ads = make_timeseries_adapter("asynInt32");
+        let mut rec = WaveformRecord::new(4, DbFieldType::Long); // FTVL=LONG
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let ts = ads.time_series.clone().unwrap();
+
+        // Arming returns a reprocess wakeup channel (unlike averaging).
+        assert!(
+            ads.io_intr_receiver().is_some(),
+            "time-series records get a per-callback reprocess channel"
+        );
+
+        // A sample before RARM=1 (not BUSY) must be dropped (C `if (pPvt->busy)`).
+        interrupts.notify(InterruptValue {
+            reason,
+            addr: 0,
+            value: crate::param::ParamValue::Int32(99),
+            timestamp: SystemTime::now(),
+            ..Default::default()
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            ts.inner.lock().unwrap().buf.as_ref().unwrap().len(),
+            0,
+            "samples before RARM=1 are not accumulated"
+        );
+
+        // caput RARM=1 → start: BUSY=1, NORD=0, RARM reset to 0.
+        rec.rarm = 1;
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(
+            outcome.did_compute,
+            "VAL written directly → convert skipped"
+        );
+        assert_eq!(rec.rarm, 0, "process resets RARM to 0");
+        assert!(rec.busy, "RARM=1 sets BUSY (acquiring)");
+        assert_eq!(rec.nord, 0, "start zeroes NORD");
+
+        // Stream NELM samples → buffer fills, BUSY auto-clears on the last.
+        for v in [10, 20, 30, 40] {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::Int32(v),
+                timestamp: SystemTime::now(),
+                ..Default::default()
+            });
+        }
+        await_ts_len(&ts, 4).await;
+        assert!(
+            !ts.inner.lock().unwrap().busy,
+            "buffer full clears BUSY (acquisition complete)"
+        );
+
+        // The completion process commits the array.
+        let outcome = ads.read(&mut rec).unwrap();
+        assert!(outcome.did_compute);
+        assert_eq!(rec.nord, 4, "NORD = samples accumulated");
+        assert!(!rec.busy, "BUSY cleared after completion");
+        match &rec.val {
+            EpicsValue::LongArray(v) => {
+                assert_eq!(&v[..4], &[10, 20, 30, 40], "VAL holds the samples")
+            }
+            other => panic!("VAL should be LongArray, got {other:?}"),
+        }
+    }
+
+    /// RARM=2 stops acquisition mid-fill: the partial buffer commits (NORD =
+    /// samples so far), BUSY clears, and a later RARM=3 resumes appending into
+    /// the same buffer. C process RARM 2=stop / 3=resume.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_series_rarm_stop_commits_partial_then_resume_continues() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+        let mut ads = make_timeseries_adapter("asynInt32");
+        let mut rec = WaveformRecord::new(8, DbFieldType::Long);
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let ts = ads.time_series.clone().unwrap();
+        assert!(ads.io_intr_receiver().is_some());
+
+        // Start, accumulate 2 of 8.
+        rec.rarm = 1;
+        ads.read(&mut rec).unwrap();
+        for v in [11, 22] {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::Int32(v),
+                timestamp: SystemTime::now(),
+                ..Default::default()
+            });
+        }
+        await_ts_len(&ts, 2).await;
+
+        // Stop: BUSY=0, partial commit (NORD=2, VAL[..2] = samples).
+        rec.rarm = 2;
+        ads.read(&mut rec).unwrap();
+        assert!(!rec.busy, "RARM=2 clears BUSY");
+        assert_eq!(rec.nord, 2, "stop commits the partial buffer (NORD=2)");
+        match &rec.val {
+            EpicsValue::LongArray(v) => assert_eq!(&v[..2], &[11, 22]),
+            other => panic!("got {other:?}"),
+        }
+
+        // A sample while stopped is dropped.
+        interrupts.notify(InterruptValue {
+            reason,
+            addr: 0,
+            value: crate::param::ParamValue::Int32(99),
+            timestamp: SystemTime::now(),
+            ..Default::default()
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            ts.inner.lock().unwrap().buf.as_ref().unwrap().len(),
+            2,
+            "stopped acquisition does not accumulate"
+        );
+
+        // Resume: BUSY=1, appends continue into the same buffer.
+        rec.rarm = 3;
+        ads.read(&mut rec).unwrap();
+        assert!(rec.busy, "RARM=3 re-arms BUSY");
+        for v in [33, 44] {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::Int32(v),
+                timestamp: SystemTime::now(),
+                ..Default::default()
+            });
+        }
+        await_ts_len(&ts, 4).await;
+        ads.read(&mut rec).unwrap();
+        assert_eq!(rec.nord, 4, "resume continued the same buffer");
+        match &rec.val {
+            EpicsValue::LongArray(v) => assert_eq!(&v[..4], &[11, 22, 33, 44]),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// asynFloat64TimeSeries commits a DOUBLE array (FTVL=DOUBLE).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_series_float64_commits_double_array() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+        let mut ads = make_timeseries_adapter("asynFloat64");
+        let mut rec = WaveformRecord::new(3, DbFieldType::Double);
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let ts = ads.time_series.clone().unwrap();
+        assert!(ads.io_intr_receiver().is_some());
+
+        rec.rarm = 1;
+        ads.read(&mut rec).unwrap();
+        for v in [1.5, 2.5, 3.5] {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::Float64(v),
+                timestamp: SystemTime::now(),
+                ..Default::default()
+            });
+        }
+        await_ts_len(&ts, 3).await;
+        ads.read(&mut rec).unwrap();
+        assert_eq!(rec.nord, 3);
+        assert!(!rec.busy, "BUSY clears when the buffer fills");
+        match &rec.val {
+            EpicsValue::DoubleArray(v) => assert_eq!(&v[..3], &[1.5, 2.5, 3.5]),
+            other => panic!("VAL should be DoubleArray, got {other:?}"),
+        }
+    }
+
+    /// asynInt64TimeSeries commits an INT64 array (FTVL=INT64).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_series_int64_commits_int64_array() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+        let mut ads = make_timeseries_adapter("asynInt64");
+        let mut rec = WaveformRecord::new(2, DbFieldType::Int64);
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let ts = ads.time_series.clone().unwrap();
+        assert!(ads.io_intr_receiver().is_some());
+
+        rec.rarm = 1;
+        ads.read(&mut rec).unwrap();
+        for v in [9_000_000_000_i64, -9_000_000_000_i64] {
+            interrupts.notify(InterruptValue {
+                reason,
+                addr: 0,
+                value: crate::param::ParamValue::Int64(v),
+                timestamp: SystemTime::now(),
+                ..Default::default()
+            });
+        }
+        await_ts_len(&ts, 2).await;
+        ads.read(&mut rec).unwrap();
+        assert_eq!(rec.nord, 2);
+        match &rec.val {
+            EpicsValue::Int64Array(v) => {
+                assert_eq!(&v[..2], &[9_000_000_000_i64, -9_000_000_000_i64])
+            }
+            other => panic!("VAL should be Int64Array, got {other:?}"),
+        }
+    }
+
+    /// FTVL not the signed/unsigned EPICS type of the interface → C errors the
+    /// record (dead). The port leaves the buffer unset, so the record never
+    /// acquires: no sample is accumulated even after RARM=1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_series_invalid_ftvl_never_acquires() {
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+        // asynInt32 requires FTVL LONG/ULONG; DOUBLE is invalid.
+        let mut ads = make_timeseries_adapter("asynInt32");
+        let mut rec = WaveformRecord::new(4, DbFieldType::Double);
+        ads.init(&mut rec).unwrap();
+        let reason = ads.reason;
+        let interrupts = ads.handle.interrupts().clone();
+        let ts = ads.time_series.clone().unwrap();
+        assert!(
+            ts.inner.lock().unwrap().buf.is_none(),
+            "invalid FTVL leaves the buffer unset (record does not acquire)"
+        );
+        assert!(ads.io_intr_receiver().is_some());
+
+        rec.rarm = 1;
+        ads.read(&mut rec).unwrap();
+        interrupts.notify(InterruptValue {
+            reason,
+            addr: 0,
+            value: crate::param::ParamValue::Int32(7),
+            timestamp: SystemTime::now(),
+            ..Default::default()
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            ts.inner.lock().unwrap().buf.is_none(),
+            "no buffer → nothing accumulates"
+        );
+        assert_eq!(rec.nord, 0, "NORD untouched when the record cannot acquire");
+    }
+
+    /// The factory maps each TimeSeries DTYP to its base interface and arms the
+    /// accumulation: a Passive waveform built through `universal_asyn_factory`
+    /// gets a reprocess channel only via the time-series path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_series_factory_arms_accumulation_for_waveform() {
+        use epics_base_rs::server::ioc_app::DeviceSupportContext;
+        use epics_base_rs::server::records::waveform::WaveformRecord;
+        use epics_base_rs::types::DbFieldType;
+
+        let driver = TestPort::new();
+        let interrupts = Arc::new(InterruptManager::new(256));
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let actor = PortActor::new(Box::new(driver), rx);
+        std::thread::Builder::new()
+            .name("ts-factory-actor".into())
+            .spawn(move || actor.run())
+            .unwrap();
+        let handle = PortHandle::new(tx, "ts_factory".into(), interrupts);
+        crate::asyn_record::register_port(
+            "ts_factory",
+            handle,
+            Arc::new(crate::trace::TraceManager::new()),
+        );
+
+        let ctx = DeviceSupportContext {
+            dtyp: "asynInt32TimeSeries",
+            inp: "@asyn(ts_factory,0)VAL",
+            out: "",
+        };
+        let mut dev = universal_asyn_factory(&ctx).expect("factory builds the device");
+        dev.set_record_info("TEST:TS:FACTORY", ScanType::Passive);
+        let mut rec = WaveformRecord::new(4, DbFieldType::Long);
+        dev.init(&mut rec).unwrap();
+        assert!(
+            dev.io_intr_receiver().is_some(),
+            "factory must map asynInt32TimeSeries → asynInt32 and arm accumulation"
+        );
     }
 
     #[test]
@@ -5780,6 +6446,11 @@ mod tests {
         // asynOctetWriteBinary likewise — write-only/no-NUL-trim is carried by
         // octet_binary, not a distinct interface.
         assert_eq!(normalize_asyn_dtyp("asynOctetWriteBinary"), "asynOctet");
+        // TimeSeries DTYPs map to their base interface — the scalar-into-array
+        // accumulation is carried by `time_series`, not a distinct interface.
+        assert_eq!(normalize_asyn_dtyp("asynInt32TimeSeries"), "asynInt32");
+        assert_eq!(normalize_asyn_dtyp("asynFloat64TimeSeries"), "asynFloat64");
+        assert_eq!(normalize_asyn_dtyp("asynInt64TimeSeries"), "asynInt64");
     }
 
     /// Mock octet port for asynOctetWriteBinary / asynOctetWrite: records every

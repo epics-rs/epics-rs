@@ -285,16 +285,26 @@ fn decode_json(raw: &str, value_type: ValueType, field_path: &str) -> MqttResult
 /// like `a.b` is one literal key (C parses jsonField as the entire
 /// arguments-remainder, drvMqtt.cpp:92), never a dot-separated path. At
 /// each object level the key is checked before recursing into its value,
-/// so traversal order mirrors C; serde_json's default `Map` is a sorted
-/// `BTreeMap`, matching nlohmann's default sorted `std::map` iteration.
+/// and keys are visited in SORTED order to mirror C's iteration (see the
+/// `Object` arm).
 fn extract_json_field<'a>(
     json: &'a serde_json::Value,
     target_key: &str,
 ) -> Option<&'a serde_json::Value> {
     match json {
         serde_json::Value::Object(map) => {
-            for (key, value) in map {
-                if key == target_key {
+            // C `findJsonField` iterates an `nlohmann::json` object whose
+            // default backing is a sorted `std::map` (drvMqtt.h:19
+            // `using json = nlohmann::json`), so keys are visited in sorted
+            // order, each checked before descending into its value. serde_json's
+            // `Map` is an `IndexMap` (document order) whenever `preserve_order`
+            // is enabled — which the shipped IOC build is, transitively via
+            // `epics-base-rs` — so iterate a sorted key view to reproduce C's
+            // order deterministically, independent of the linked feature set.
+            let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (key, value) in entries {
+                if key.as_str() == target_key {
                     return Some(value);
                 }
                 if let Some(found) = extract_json_field(value, target_key) {
@@ -478,6 +488,20 @@ mod tests {
         let addr = TopicAddress::parse("JSON:FLOAT device/data c").unwrap();
         let val = decode_payload(r#"{"a": {"b": {"c": 9.99}}}"#, &addr).unwrap();
         assert_eq!(val, DecodedValue::Float64(9.99));
+    }
+
+    #[test]
+    fn decode_json_field_search_is_sorted_order() {
+        // C `findJsonField` iterates a sorted `std::map` (drvMqtt.h:19), so a
+        // key that recurs at two depths resolves in C's sorted-DFS order, NOT
+        // document order. For target `value` in `{"value":1,"data":{"value":2}}`
+        // the sorted top-level keys are [`data`, `value`]; C descends `data`
+        // first and returns the nested 2 before ever reaching the top `value`.
+        // Document-order iteration (serde_json `preserve_order`, the IOC build)
+        // would wrongly return 1 — this pins the build-independent sorted order.
+        let addr = TopicAddress::parse("JSON:INT dev/data value").unwrap();
+        let val = decode_payload(r#"{"value": 1, "data": {"value": 2}}"#, &addr).unwrap();
+        assert_eq!(val, DecodedValue::Int32(2));
     }
 
     #[test]

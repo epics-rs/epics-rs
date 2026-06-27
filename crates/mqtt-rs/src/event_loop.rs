@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use asyn_rs::port_handle::PortHandle;
 use asyn_rs::request::ParamSetValue;
-use rumqttc::{AsyncClient, Event, Incoming, MqttOptions};
+use rumqttc::v5::{AsyncClient, Event, Incoming, MqttOptions};
 use tokio::sync::mpsc;
 
 use crate::address::{TopicAddress, ValueType};
@@ -28,7 +28,10 @@ pub async fn mqtt_event_loop(
     let mut mqttoptions =
         MqttOptions::new(&config.client_id, &config.broker_host, config.broker_port);
     mqttoptions.set_keep_alive(Duration::from_secs(config.keep_alive_secs));
-    mqttoptions.set_clean_session(config.clean_session);
+    // C connects with MQTT v5 connOpts (mqttClient.cpp:20-22): clean_start +
+    // keepAlive, no will. rumqttc's v5 client uses `clean_start` (the v5
+    // spelling) in place of v3.1.1's `clean_session`.
+    mqttoptions.set_clean_start(config.clean_session);
 
     let (client, mut eventloop) = AsyncClient::new(mqttoptions, 256);
 
@@ -57,8 +60,16 @@ pub async fn mqtt_event_loop(
                     mark_connected(&port_handle, connected_param).await;
                     is_connected = true;
                 }
-                handle_incoming_message(&publish.topic, &publish.payload, &topic_map, &port_handle)
-                    .await;
+                // v5 Publish.topic is raw bytes; a declared topic_map key (the
+                // asyn drvInfo) is UTF-8 text, so a non-UTF-8 topic can never
+                // match and is dropped (mirrors the non-UTF-8 payload guard).
+                match std::str::from_utf8(&publish.topic) {
+                    Ok(topic) => {
+                        handle_incoming_message(topic, &publish.payload, &topic_map, &port_handle)
+                            .await;
+                    }
+                    Err(e) => tracing::warn!("Non-UTF8 MQTT topic: {e}"),
+                }
             }
             Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                 tracing::info!("MQTT connected, subscribing to {} topics", topics.len());
@@ -74,7 +85,7 @@ pub async fn mqtt_event_loop(
                     subscribe_all(&sub_client, &sub_topics, sub_qos).await;
                 });
             }
-            Ok(Event::Incoming(Incoming::PingResp)) => {
+            Ok(Event::Incoming(Incoming::PingResp(_))) => {
                 if !is_connected {
                     tracing::debug!(
                         "MQTT PingResp received while Connected=0 — restoring Connected=1"
@@ -125,18 +136,23 @@ async fn publish_task(
     mut publish_rx: mpsc::UnboundedReceiver<PublishRequest>,
 ) {
     while let Some(req) = publish_rx.recv().await {
-        let qos: rumqttc::QoS = req.qos.into();
-        if let Err(e) = client
-            .publish(&req.topic, qos, req.retained, req.payload.as_bytes())
-            .await
-        {
-            tracing::warn!("MQTT publish to '{}' failed: {e}", req.topic);
+        let PublishRequest {
+            topic,
+            payload,
+            qos,
+            retained,
+        } = req;
+        let qos: rumqttc::v5::mqttbytes::QoS = qos.into();
+        // v5 publish wants `P: Into<Bytes>`; the owned `String` payload
+        // satisfies it directly (no borrow held across the await).
+        if let Err(e) = client.publish(&topic, qos, retained, payload).await {
+            tracing::warn!("MQTT publish to '{topic}' failed: {e}");
         }
     }
 }
 
 async fn subscribe_all(client: &AsyncClient, topics: &[String], qos: crate::config::QoS) {
-    let rqos: rumqttc::QoS = qos.into();
+    let rqos: rumqttc::v5::mqttbytes::QoS = qos.into();
     for topic in topics {
         if let Err(e) = client.subscribe(topic, rqos).await {
             tracing::warn!("MQTT subscribe to '{topic}' failed: {e}");

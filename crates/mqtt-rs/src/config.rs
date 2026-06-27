@@ -17,12 +17,13 @@ impl QoS {
     }
 }
 
-impl From<QoS> for rumqttc::QoS {
+impl From<QoS> for rumqttc::v5::mqttbytes::QoS {
     fn from(q: QoS) -> Self {
+        use rumqttc::v5::mqttbytes::QoS as V5;
         match q {
-            QoS::AtMostOnce => rumqttc::QoS::AtMostOnce,
-            QoS::AtLeastOnce => rumqttc::QoS::AtLeastOnce,
-            QoS::ExactlyOnce => rumqttc::QoS::ExactlyOnce,
+            QoS::AtMostOnce => V5::AtMostOnce,
+            QoS::AtLeastOnce => V5::AtLeastOnce,
+            QoS::ExactlyOnce => V5::ExactlyOnce,
         }
     }
 }

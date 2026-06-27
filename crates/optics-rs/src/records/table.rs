@@ -3074,6 +3074,39 @@ const TABLE_SET_CHOICES: &[&str] = &["Use", "Set"];
 const TABLE_GEOM_CHOICES: &[&str] = &["SRI", "GEOCARS", "NEWPORT", "PNC"];
 const TABLE_AUNIT_CHOICES: &[&str] = &["degrees", "ur"];
 
+/// Record-internal monitor posts that C `tableRecord.c` emits with a
+/// literal `DBE_VALUE` — never `DBE_LOG`. `monitor()` posts the thirteen
+/// six-element arrays plus `LVIO` with `monitor_mask = recGblResetAlarms |
+/// DBE_VALUE` (tableRecord.c:882-915), and `special()` posts
+/// `SET`/`SYNC`/`INIT`/`ZERO`/`READ`/`AEGU` with `DBE_VALUE`
+/// (tableRecord.c:659,663,667,671,675,679,690); `DBE_LOG` appears nowhere in
+/// the C record. Naming these fields makes the framework strip the LOG bit
+/// from their change-detected posts, so an archiver / `DBE_LOG` subscriber
+/// no longer sees a spurious archive event on every readback / limit /
+/// offset change — matching C. This is exactly the scaler SCAL-2 contract.
+/// Client puts are unaffected (the generic put path still posts `VALUE|LOG`,
+/// matching C's `dbPutField`); this governs only the record-internal change
+/// path. Field names follow the C arrays in `monitor()` order.
+const TABLE_VALUE_ONLY_FIELDS: &[&str] = &[
+    // ax — user drive / coordinates
+    "AX", "AY", "AZ", "X", "Y", "Z", // axrb — readback
+    "AXRB", "AYRB", "AZRB", "XRB", "YRB", "ZRB", // hlax — high limit
+    "HLAX", "HLAY", "HLAZ", "HLX", "HLY", "HLZ", // llax — low limit
+    "LLAX", "LLAY", "LLAZ", "LLX", "LLY", "LLZ", // m0x — motor drive
+    "M0X", "M0Y", "M1Y", "M2X", "M2Y", "M2Z", // e0x — encoder readback
+    "E0X", "E0Y", "E1Y", "E2X", "E2Y", "E2Z", // eax — encoder user coordinates
+    "EAX", "EAY", "EAZ", "EX", "EY", "EZ", // ax0 — user-coordinate offset
+    "AX0", "AY0", "AZ0", "X0", "Y0", "Z0", // axl — lab-frame angle/coordinate
+    "AXL", "AYL", "AZL", "XL", "YL", "ZL", // uhax — absolute high user limit
+    "UHAX", "UHAY", "UHAZ", "UHX", "UHY", "UHZ", // uhaxr — relative high user limit
+    "UHAXR", "UHAYR", "UHAZR", "UHXR", "UHYR", "UHZR",
+    // ulax — absolute low user limit
+    "ULAX", "ULAY", "ULAZ", "ULX", "ULY", "ULZ", // ulaxr — relative low user limit
+    "ULAXR", "ULAYR", "ULAZR", "ULXR", "ULYR", "ULZR",
+    // scalar limit-violation flag + special()-posted command/unit fields
+    "LVIO", "SYNC", "INIT", "ZERO", "READ", "SET", "AEGU",
+];
+
 impl Record for TableRecord {
     fn record_type(&self) -> &'static str {
         "table"
@@ -3844,6 +3877,12 @@ impl Record for TableRecord {
         }
     }
 
+    /// C `tableRecord.c` posts every record-internal change with a literal
+    /// `DBE_VALUE` (no `DBE_LOG`); see [`TABLE_VALUE_ONLY_FIELDS`].
+    fn value_only_change_fields(&self) -> &'static [&'static str] {
+        TABLE_VALUE_ONLY_FIELDS
+    }
+
     fn init_record(&mut self, pass: u8) -> CaResult<()> {
         if pass == 0 {
             self.vers = VERSION;
@@ -4584,6 +4623,36 @@ mod tests {
     fn test_record_type() {
         let t = TableRecord::new();
         assert_eq!(t.record_type(), "table");
+    }
+
+    #[test]
+    fn test_value_only_change_fields_match_c_dbe_value_posts() {
+        let t = TableRecord::new();
+        let value_only = t.value_only_change_fields();
+
+        // C posts the 13 six-element arrays + LVIO + the six special()-posted
+        // command/unit fields with a literal DBE_VALUE (tableRecord.c:882-915,
+        // :659-690): 13*6 + 1 + 6 = 85 fields.
+        assert_eq!(value_only.len(), 85, "value-only field count");
+
+        // Representatives across every array group + the scalar/special set.
+        for f in [
+            "AX", "Z", "AXRB", "ZRB", "HLAX", "LLZ", "M1Y", "E1Y", "EAX", "EZ", "AX0", "Z0", "AXL",
+            "ZL", "UHAX", "UHZR", "ULAX", "ULZR", "LVIO", "SYNC", "INIT", "ZERO", "READ", "SET",
+            "AEGU",
+        ] {
+            assert!(value_only.contains(&f), "{f} must be value-only");
+        }
+
+        // Every named field must be a real record field — guards against a
+        // typo silently failing to strip the LOG bit.
+        let names: Vec<&str> = t.field_list().iter().map(|fd| fd.name).collect();
+        for f in value_only {
+            assert!(
+                names.contains(f),
+                "value-only field {f} absent from field_list"
+            );
+        }
     }
 
     #[test]

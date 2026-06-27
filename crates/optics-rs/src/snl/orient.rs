@@ -835,6 +835,18 @@ pub async fn run(
     let ch_beta = DbChannel::new(&db, &format!("{p}beta"));
     let ch_gamma = DbChannel::new(&db, &format!("{p}gamma"));
 
+    // Computed-matrix element display PVs. C copies the A0 / OMTX arrays into
+    // the per-element PVs {P}A0_11..A0_33 / {P}OMTX_11..OMTX_33 and pvPut's each
+    // (orient_st.st:265-283 ASSIGN_MONITOR, :497-503/534-539 publish). These are
+    // display readouts, so a posting put (value + monitor, no process) is the
+    // C-faithful call.
+    let ch_a0: [[DbChannel; 3]; 3] = std::array::from_fn(|i| {
+        std::array::from_fn(|j| DbChannel::new(&db, &format!("{p}A0_{}{}", i + 1, j + 1)))
+    });
+    let ch_omtx: [[DbChannel; 3]; 3] = std::array::from_fn(|i| {
+        std::array::from_fn(|j| DbChannel::new(&db, &format!("{p}OMTX_{}{}", i + 1, j + 1)))
+    });
+
     // Mode, busy, message
     let _ch_mode = DbChannel::new(&db, &format!("{p}Mode"));
     let ch_busy = DbChannel::new(&db, &format!("{p}Busy"));
@@ -1022,7 +1034,21 @@ pub async fn run(
                 let _ = ch_msg.put_string(msg.as_str()).await;
             }
             if let Some(a0) = actions.write_a0 {
-                let _ = ch_a.put_f64(a0[0][0]).await;
+                // C: A0[i][j] -> {P}A0_ij, pvPut each (orient_st.st:497-503,
+                // 671-679). NOT into {P}a, which is a user lattice-param input.
+                for (i, row) in ch_a0.iter().enumerate() {
+                    for (j, ch) in row.iter().enumerate() {
+                        let _ = ch.put_f64_post(a0[i][j]).await;
+                    }
+                }
+            }
+            if let Some(omtx) = actions.write_omtx {
+                // C: OMTX[i][j] -> {P}OMTX_ij, pvPut each (orient_st.st:534-539).
+                for (i, row) in ch_omtx.iter().enumerate() {
+                    for (j, ch) in row.iter().enumerate() {
+                        let _ = ch.put_f64_post(omtx[i][j]).await;
+                    }
+                }
             }
             if let Some(hkl) = actions.write_hkl {
                 let _ = ch_h.put_f64(hkl[0]).await;

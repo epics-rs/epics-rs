@@ -561,21 +561,42 @@ impl ModbusEngine {
         loop {
             match transport.read_frame(READ_TIMEOUT) {
                 Ok(raw) => {
-                    let unwrapped = self.framer.unwrap_response(&raw)?;
-                    match unwrapped.transaction_id {
-                        // TCP/UDP: a stale reply from an earlier request —
-                        // keep reading without retransmitting. Bound the skip
-                        // count so a peer that keeps sending mismatched-TXID
-                        // frames cannot trap us in an unbounded loop (each
-                        // `read_frame` succeeds, so the timeout never fires).
-                        Some(tid) if tid != expected_txid => {
+                    match self.framer.unwrap_response(&raw) {
+                        Ok(unwrapped) => match unwrapped.transaction_id {
+                            // TCP/UDP: a stale reply from an earlier request —
+                            // keep reading without retransmitting. Bound the
+                            // skip count so a peer that keeps sending
+                            // mismatched-TXID frames cannot trap us in an
+                            // unbounded loop (each `read_frame` succeeds, so the
+                            // timeout never fires).
+                            Some(tid) if tid != expected_txid => {
+                                stale_frames += 1;
+                                if stale_frames > MAX_STALE_FRAMES {
+                                    return Err(ModbusError::Timeout);
+                                }
+                                continue;
+                            }
+                            _ => return Ok(unwrapped.pdu),
+                        },
+                        // C's TCP/UDP read loop (modbusInterpose.c:366) only
+                        // breaks when the reply is >= 2 bytes AND its
+                        // transaction ID matches; a reply too short to yield a
+                        // matching TXID falls through and re-reads. Mirror that
+                        // for the MBAP-framed links: skip a too-short frame
+                        // (bounded by the same stale-frame guard) instead of
+                        // ending the transaction on a single spurious short
+                        // read. RTU/ASCII read once in C (no loop), so their
+                        // short-frame / CRC failures still propagate.
+                        Err(ModbusError::FrameTooShort { .. })
+                            if matches!(self.framer.link_type(), LinkType::Tcp | LinkType::Udp) =>
+                        {
                             stale_frames += 1;
                             if stale_frames > MAX_STALE_FRAMES {
                                 return Err(ModbusError::Timeout);
                             }
                             continue;
                         }
-                        _ => return Ok(unwrapped.pdu),
+                        Err(e) => return Err(e),
                     }
                 }
                 Err(e) => {
@@ -1033,6 +1054,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(words, vec![0x1234]);
+    }
+
+    /// R1: a spurious too-short TCP reply (one that cannot yield a matching
+    /// transaction ID) is skipped and the loop re-reads, mirroring C's
+    /// `if (nbytesActual >= 2)` fall-through (modbusInterpose.c:366). A single
+    /// short read must not end the transaction.
+    #[test]
+    fn do_modbus_io_skips_too_short_tcp_frame() {
+        let mut engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReadHoldingRegisters, 1),
+            LinkType::Tcp,
+        )
+        .unwrap();
+        let resp_pdu = [0x01u8, 0x03, 0x02, 0x12, 0x34];
+        // First reply is a spurious short frame (below the MBAP header); the
+        // second is the real, txid-matching reply.
+        let mut transport = MockTransport::new(vec![
+            Ok(vec![0xAA, 0xBB, 0xCC]),
+            Ok(tcp_response(1, &resp_pdu)),
+        ]);
+        let words = engine
+            .do_modbus_io(
+                &mut transport,
+                ModbusFunctionCode::ReadHoldingRegisters,
+                0,
+                &[],
+                1,
+            )
+            .unwrap();
+        assert_eq!(words, vec![0x1234]);
+    }
+
+    /// R1 boundary: RTU reads exactly once in C (no MBAP loop), so a too-short
+    /// RTU frame is a hard error, not a re-read. If it wrongly re-read, the
+    /// queue would drain to the `Timeout` fallback; assert it surfaces the
+    /// `FrameTooShort` instead.
+    #[test]
+    fn do_modbus_io_rtu_short_frame_errors_without_reread() {
+        let mut engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReadHoldingRegisters, 1),
+            LinkType::Rtu,
+        )
+        .unwrap();
+        let mut transport = MockTransport::new(vec![Ok(vec![0x01, 0x03])]);
+        let err = engine
+            .do_modbus_io(
+                &mut transport,
+                ModbusFunctionCode::ReadHoldingRegisters,
+                0,
+                &[],
+                1,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, ModbusError::FrameTooShort { .. }),
+            "RTU short frame must error, not re-read into a timeout: {err:?}"
+        );
     }
 
     #[test]

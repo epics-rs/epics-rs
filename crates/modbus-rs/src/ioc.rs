@@ -112,17 +112,38 @@ fn is_array_write_function(function: ModbusFunctionCode) -> bool {
 /// interpose required).
 pub struct SyncIoTransport {
     handle: SyncIOHandle,
+    /// Slept before each frame write, mirroring C's pre-write
+    /// `epicsThreadSleep(writeDelay)` (`modbusInterpose.c:246`); zero disables
+    /// it. Needed by slow serial PLCs that require an inter-frame gap.
+    write_delay: Duration,
 }
 
 impl SyncIoTransport {
-    /// Wrap a sync-I/O handle to the underlying octet port.
+    /// Wrap a sync-I/O handle to the underlying octet port, with no pre-write
+    /// delay (the `modbusInterposeConfig writeDelayMsec` default).
     pub fn new(handle: SyncIOHandle) -> Self {
-        Self { handle }
+        Self::with_write_delay(handle, Duration::ZERO)
+    }
+
+    /// Wrap a sync-I/O handle with an explicit pre-write delay
+    /// (C `modbusInterposeConfig writeDelayMsec`).
+    pub fn with_write_delay(handle: SyncIOHandle, write_delay: Duration) -> Self {
+        Self {
+            handle,
+            write_delay,
+        }
     }
 }
 
 impl OctetTransport for SyncIoTransport {
     fn write_frame(&mut self, data: &[u8]) -> crate::error::ModbusResult<()> {
+        // C sleeps before every write (modbusInterpose.c:246); the modbus
+        // driver runs on a blocking sync-I/O thread (the same one that blocks
+        // in `write_octet`/`read_octet`), so a blocking sleep here matches
+        // `epicsThreadSleep` without stalling the async executor.
+        if !self.write_delay.is_zero() {
+            std::thread::sleep(self.write_delay);
+        }
         self.handle
             .write_octet(0, data)
             .map_err(|e| ModbusError::Io(e.to_string()))
@@ -1122,26 +1143,50 @@ impl PortDriver for ModbusPortDriver {
 // iocsh commands
 // ---------------------------------------------------------------------------
 
-/// Link types declared by `modbusInterposeConfig`, keyed by octet port name,
-/// consumed by `drvModbusAsynConfigure`.
-static PENDING_LINKS: Mutex<Option<HashMap<String, LinkType>>> = Mutex::new(None);
+/// The settings declared by `modbusInterposeConfig` for one octet port: the
+/// Modbus link type, the I/O timeout, and the pre-write delay. C stores these
+/// on the interpose `modbusPvt` (`modbusInterpose.c:83-85`).
+#[derive(Clone, Copy)]
+struct InterposeSettings {
+    link: LinkType,
+    /// Applied to each transport read/write (C `pasynUser->timeout`,
+    /// `modbusInterpose.c:248/337`); `READ_TIMEOUT` when unset (C `DEFAULT_TIMEOUT`).
+    timeout: Duration,
+    /// Slept before each frame write (C `epicsThreadSleep(writeDelay)`,
+    /// `modbusInterpose.c:246`); zero disables it.
+    write_delay: Duration,
+}
+
+impl Default for InterposeSettings {
+    fn default() -> Self {
+        Self {
+            link: LinkType::Tcp,
+            timeout: crate::driver::READ_TIMEOUT,
+            write_delay: Duration::ZERO,
+        }
+    }
+}
+
+/// Interpose settings declared by `modbusInterposeConfig`, keyed by octet port
+/// name, consumed by `drvModbusAsynConfigure`.
+static PENDING_LINKS: Mutex<Option<HashMap<String, InterposeSettings>>> = Mutex::new(None);
 
 /// Port runtime handles — dropping one shuts the actor down, so they are kept.
 static PORT_RUNTIMES: Mutex<Option<Vec<PortRuntimeHandle>>> = Mutex::new(None);
 
-fn record_link(octet_port: &str, link: LinkType) {
+fn record_interpose(octet_port: &str, settings: InterposeSettings) {
     let mut g = PENDING_LINKS.lock().unwrap();
     g.get_or_insert_with(HashMap::new)
-        .insert(octet_port.to_string(), link);
+        .insert(octet_port.to_string(), settings);
 }
 
-fn take_link(octet_port: &str) -> LinkType {
+fn take_interpose(octet_port: &str) -> InterposeSettings {
     PENDING_LINKS
         .lock()
         .unwrap()
         .as_ref()
         .and_then(|m| m.get(octet_port).copied())
-        .unwrap_or(LinkType::Tcp)
+        .unwrap_or_default()
 }
 
 fn keep_runtime(handle: PortRuntimeHandle) {
@@ -1179,21 +1224,51 @@ pub fn modbus_interpose_config_command() -> CommandDef {
         ],
         "modbusInterposeConfig portName linkType timeoutMsec writeDelayMsec",
         |args: &[ArgValue], _ctx: &CommandContext| -> CommandResult {
-            let port = match &args[0] {
-                ArgValue::String(s) => s.clone(),
-                _ => return Err("portName required".into()),
-            };
-            let link = match &args[1] {
-                ArgValue::Int(v) => {
-                    LinkType::from_i32(*v as i32).ok_or_else(|| format!("invalid link type {v}"))?
-                }
-                _ => return Err("linkType required".into()),
-            };
-            record_link(&port, link);
-            println!("modbusInterposeConfig: octet port '{port}' link={link:?}");
+            let (port, settings) = parse_interpose_args(args)?;
+            record_interpose(&port, settings);
+            println!(
+                "modbusInterposeConfig: octet port '{port}' link={:?} \
+                 timeout={:?} write_delay={:?}",
+                settings.link, settings.timeout, settings.write_delay
+            );
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+/// Parse the `modbusInterposeConfig portName linkType timeoutMsec
+/// writeDelayMsec` arguments into the octet port name and its
+/// [`InterposeSettings`]. Mirrors C `modbusInterposeConfig`
+/// (modbusInterpose.c:134-136): the timeout is `timeoutMsec/1000`, falling
+/// back to `DEFAULT_TIMEOUT` (2 s = `READ_TIMEOUT`) when 0/unset; the write
+/// delay is `writeDelayMsec/1000`, zero when 0/unset.
+fn parse_interpose_args(args: &[ArgValue]) -> Result<(String, InterposeSettings), String> {
+    let port = match args.first() {
+        Some(ArgValue::String(s)) => s.clone(),
+        _ => return Err("portName required".into()),
+    };
+    let link = match args.get(1) {
+        Some(ArgValue::Int(v)) => {
+            LinkType::from_i32(*v as i32).ok_or_else(|| format!("invalid link type {v}"))?
+        }
+        _ => return Err("linkType required".into()),
+    };
+    let timeout = match args.get(2) {
+        Some(ArgValue::Int(v)) if *v > 0 => Duration::from_millis(*v as u64),
+        _ => crate::driver::READ_TIMEOUT,
+    };
+    let write_delay = match args.get(3) {
+        Some(ArgValue::Int(v)) if *v > 0 => Duration::from_millis(*v as u64),
+        _ => Duration::ZERO,
+    };
+    Ok((
+        port,
+        InterposeSettings {
+            link,
+            timeout,
+            write_delay,
+        },
+    ))
 }
 
 /// `drvModbusAsynConfigure portName octetPortName slave function startAddr
@@ -1317,7 +1392,8 @@ impl CommandHandler for ModbusConfigHandler {
     fn call(&self, args: &[ArgValue], _ctx: &CommandContext) -> CommandResult {
         let (port_name, octet_port, config) =
             parse_configure_args(args).map_err(|e| e.to_string())?;
-        let link = take_link(&octet_port);
+        let interpose = take_interpose(&octet_port);
+        let link = interpose.link;
         let initial_poll_delay = config.poll_delay;
         // The read poller is started only for a relative-addressing read port.
         // An absolute-addressing port has no poller (drvModbusAsyn.cpp:1121,
@@ -1328,8 +1404,14 @@ impl CommandHandler for ModbusConfigHandler {
         // Find the underlying octet port and build the framed transport.
         let entry = asyn_rs::asyn_record::get_port(&octet_port)
             .ok_or_else(|| format!("octet port '{octet_port}' not found"))?;
-        let sync = SyncIOHandle::from_handle(entry.handle.clone(), 0, crate::driver::READ_TIMEOUT);
-        let transport = Box::new(SyncIoTransport::new(sync));
+        // The configured timeout (C `modbusInterposeConfig timeoutMsec`) drives
+        // both the underlying read and write; the write delay is applied by the
+        // transport before each frame write (R53).
+        let sync = SyncIOHandle::from_handle(entry.handle.clone(), 0, interpose.timeout);
+        let transport = Box::new(SyncIoTransport::with_write_delay(
+            sync,
+            interpose.write_delay,
+        ));
 
         let driver = ModbusPortDriver::new(&port_name, config, link, transport)
             .map_err(|e| e.to_string())?;
@@ -2828,6 +2910,65 @@ mod tests {
         assert_eq!(cfg.length, 10);
         assert_eq!(cfg.poll_delay, Duration::from_millis(100));
         assert_eq!(cfg.readback_offset(), 0);
+    }
+
+    /// R53: `modbusInterposeConfig` reads the optional `timeoutMsec` and
+    /// `writeDelayMsec` args (C modbusInterpose.c:134-136) instead of dropping
+    /// them — a configured read timeout and inter-frame write delay must reach
+    /// the transport.
+    #[test]
+    fn parse_interpose_args_reads_timeout_and_write_delay() {
+        // All four args: timeout 500 ms, write delay 50 ms.
+        let (port, s) = parse_interpose_args(&args(vec![
+            ArgValue::String("OCTET1".into()),
+            ArgValue::Int(0), // TCP
+            ArgValue::Int(500),
+            ArgValue::Int(50),
+        ]))
+        .unwrap();
+        assert_eq!(port, "OCTET1");
+        assert_eq!(s.link, LinkType::Tcp);
+        assert_eq!(s.timeout, Duration::from_millis(500));
+        assert_eq!(s.write_delay, Duration::from_millis(50));
+
+        // Omitted/zero timeout falls back to DEFAULT_TIMEOUT (READ_TIMEOUT);
+        // omitted/zero write delay is zero.
+        let (_, s) = parse_interpose_args(&args(vec![
+            ArgValue::String("OCTET2".into()),
+            ArgValue::Int(0),
+            ArgValue::Int(0),
+        ]))
+        .unwrap();
+        assert_eq!(s.timeout, crate::driver::READ_TIMEOUT);
+        assert_eq!(s.write_delay, Duration::ZERO);
+
+        // Bare two-arg form: defaults for both.
+        let (_, s) = parse_interpose_args(&args(vec![
+            ArgValue::String("OCTET3".into()),
+            ArgValue::Int(1), // RTU
+        ]))
+        .unwrap();
+        assert_eq!(s.link, LinkType::Rtu);
+        assert_eq!(s.timeout, crate::driver::READ_TIMEOUT);
+        assert_eq!(s.write_delay, Duration::ZERO);
+
+        // record/take round-trip preserves the settings.
+        record_interpose(
+            "OCTET_RT",
+            InterposeSettings {
+                link: LinkType::Rtu,
+                timeout: Duration::from_millis(750),
+                write_delay: Duration::from_millis(20),
+            },
+        );
+        let got = take_interpose("OCTET_RT");
+        assert_eq!(got.timeout, Duration::from_millis(750));
+        assert_eq!(got.write_delay, Duration::from_millis(20));
+        // An unconfigured port yields the defaults.
+        let def = take_interpose("OCTET_NEVER_SET");
+        assert_eq!(def.link, LinkType::Tcp);
+        assert_eq!(def.timeout, crate::driver::READ_TIMEOUT);
+        assert_eq!(def.write_delay, Duration::ZERO);
     }
 
     #[test]

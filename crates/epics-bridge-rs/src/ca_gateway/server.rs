@@ -116,9 +116,11 @@ pub struct GatewayConfig {
     /// Rust-only `--no-report` — keeps the log-only behaviour.
     pub report_path: Option<PathBuf>,
     /// Optional path to a file containing literal upstream PV names to
-    /// pre-subscribe (one per line). When set, the gateway pre-fetches
-    /// each name on startup. Used because lazy resolution is not yet
-    /// supported (see `downstream.rs` doc comment).
+    /// pre-subscribe (one per line). When set, the gateway eagerly
+    /// pre-fetches each name on startup. This is an opt-in convenience,
+    /// not a requirement: resolution is otherwise lazy on-demand via
+    /// `GatewayServer::install_search_resolver` (see `downstream.rs` doc
+    /// comment).
     pub preload_path: Option<PathBuf>,
     /// CA server port (downstream side). 0 = use EPICS default.
     pub server_port: u16,

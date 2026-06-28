@@ -77,7 +77,7 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   an I/O error. The txid-mismatch half of the loop *is* reproduced
   (`stale_frames`, `driver.rs:558-564`); only the short-frame skip is missing.
 
-### R16 — Acknowledge exception (code 5) wrongly increments READ_OK/WRITE_OK
+### R16 — Acknowledge exception (code 5) wrongly increments READ_OK/WRITE_OK — CLEARED (f2361013 do_modbus_io control-flow rewrite, closes R16+R17+R18+R33)
 - **Severity:** DEFECT (wrong statistic value) — corroborated by R33 and the
   protocol reviewer's out-of-category aside (3 independent finds)
 - **Rust:** `driver.rs:502-509`
@@ -87,7 +87,7 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   Rust's Acknowledge arm bumps both, and also resets `current_io_errors`. READ_OK/
   WRITE_OK over-count vs C on every Acknowledge.
 
-### R17 — IO_ERRORS / currentIOErrors over-incremented on exception + malformed frames
+### R17 — IO_ERRORS / currentIOErrors over-incremented on exception + malformed frames — CLEARED (with R16)
 - **Severity:** DEFECT (wrong statistic value; false error-rate can trip alarms)
 - **Rust:** `driver.rs:511-515` and `520-524`
 - **C:** `drvModbusAsyn.cpp:2204-2209` (the only `IOErrors_++` site, gated on the
@@ -97,7 +97,7 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   word-count mismatch (`:2284-2290/2306-2312`) set `asynError; goto done` without
   touching the counters. Rust increments on both paths.
 
-### R18 — READ_OK pre-increment ordering on count-mismatch frames
+### R18 — READ_OK pre-increment ordering on count-mismatch frames — CLEARED (with R16)
 - **Severity:** DEFECT (wrong statistic value, diverges opposite to R17)
 - **Rust:** `driver.rs:518-530` (`read_ok`/`write_ok` only after `parse_response` Ok)
 - **C:** `drvModbusAsyn.cpp:2278` (`readOK_++`) before the `:2284` mismatch check;
@@ -123,7 +123,7 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   INT_MIN (0x80000000) on x86 for NaN / out-of-range. The `read_int64` doc comment
   claiming "exactly as the C code does" is imprecise at this boundary.
 
-### R33 — (DUPLICATE of R16) Acknowledge bumps READ_OK/WRITE_OK
+### R33 — (DUPLICATE of R16) Acknowledge bumps READ_OK/WRITE_OK — CLEARED (with R16)
 - Folded into **R16**. Same defect, found independently by the datatype reviewer
   (`datatype.rs`/`driver.rs:503-507` ↔ `drvModbusAsyn.cpp:2237/2245`). Not counted
   separately; listed so the cross-reference is on record.

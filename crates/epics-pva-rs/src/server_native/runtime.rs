@@ -446,7 +446,30 @@ pub async fn run_pva_server<S>(source: Arc<S>, config: PvaServerConfig) -> PvaRe
 where
     S: ChannelSource + 'static,
 {
+    run_pva_server_reporting(source, config, |_| {}).await
+}
+
+/// Like [`run_pva_server`], but invokes `on_started` once with a cheap,
+/// shareable [`ServerReportHandle`] *after* the listeners are bound — so
+/// the actually-bound TCP/TLS ports (which may differ from the requested
+/// ones under the ephemeral-fallback path) are already known. The
+/// callback runs synchronously between `start()` and `wait()`, before any
+/// `.await`, so the handle is published the instant the server is live.
+///
+/// This is the seam the iocsh `pvxsr` command rides on: the native
+/// `PvaServer` is born here and consumed by `wait()`, so a shell command
+/// running inside the server has no other way to reach the report state.
+pub(crate) async fn run_pva_server_reporting<S, F>(
+    source: Arc<S>,
+    config: PvaServerConfig,
+    on_started: F,
+) -> PvaResult<()>
+where
+    S: ChannelSource + 'static,
+    F: FnOnce(ServerReportHandle),
+{
     let server = PvaServer::start(source, config)?;
+    on_started(server.report_handle());
     server.wait().await
 }
 
@@ -1058,6 +1081,34 @@ impl PvaServer {
         }
     }
 
+    /// A cheap, cloneable handle that reproduces [`Self::report`] from
+    /// outside this server's owning task.
+    ///
+    /// It captures the shared peer registry (`Arc`), the bound
+    /// ports/config scalars, and the per-task `AbortHandle`s. Unlike a
+    /// `&PvaServer` it stays valid after `run`/`wait` have consumed the
+    /// `PvaServer` value — which is exactly the iocsh `pvxsr` situation:
+    /// the native server is created and `wait()`-consumed deep inside
+    /// [`run_pva_server`], two layers below the shell registration point,
+    /// so the report state is otherwise unreachable from the shell.
+    /// Liveness reads the same `AbortHandle`s that `Drop`/[`Self::stop`]
+    /// act on, equivalent to the JoinHandle `is_finished` that
+    /// [`Self::report_zeroed`] reads for the same tasks.
+    pub fn report_handle(&self) -> ServerReportHandle {
+        ServerReportHandle {
+            bound_tcp_port: self.bound_tcp_port,
+            udp_port: self.effective_config.udp_port,
+            bound_tls_port: self.bound_tls_port,
+            tls_enabled: self.effective_config.tls.is_some(),
+            ignore_addrs: self.effective_config.ignore_addrs.len(),
+            beacon_period_secs: self.effective_config.beacon_period.as_secs(),
+            peers: self.peers.clone(),
+            tcp_abort: self.tcp_abort.clone(),
+            udp_abort: self.udp_abort.clone(),
+            udp_v6_abort: self.udp_v6_abort.clone(),
+        }
+    }
+
     /// Stop accepting new connections. Aborts both background tasks;
     /// per-client tasks already spawned continue independently and
     /// unwind on their next failed I/O. Mirrors pvxs `Server::stop`
@@ -1138,6 +1189,57 @@ pub struct ServerReport {
     pub peer_count: usize,
 }
 
+/// Cheap, cloneable, `Send + Sync` handle to a running [`PvaServer`]'s
+/// diagnostics, produced by [`PvaServer::report_handle`].
+///
+/// Unlike a `&PvaServer` it survives the `run`/`wait` consumption of the
+/// server, so an in-process iocsh command (`pvxsr`) running inside the
+/// live server can snapshot the report even though the owning `PvaServer`
+/// value lives — and is `wait()`-consumed — inside [`run_pva_server`].
+#[derive(Clone)]
+pub struct ServerReportHandle {
+    bound_tcp_port: u16,
+    udp_port: u16,
+    bound_tls_port: u16,
+    tls_enabled: bool,
+    ignore_addrs: usize,
+    beacon_period_secs: u64,
+    peers: Arc<crate::server_native::peers::PeerRegistry>,
+    tcp_abort: tokio::task::AbortHandle,
+    udp_abort: tokio::task::AbortHandle,
+    udp_v6_abort: Option<tokio::task::AbortHandle>,
+}
+
+impl ServerReportHandle {
+    /// Snapshot the same [`ServerReport`] as [`PvaServer::report`], read
+    /// through the shared registry and per-task `AbortHandle`s. Liveness
+    /// uses `AbortHandle::is_finished` — the task-completion signal
+    /// `Drop`/[`PvaServer::stop`] act on — which is equivalent to the
+    /// JoinHandle `is_finished` that [`PvaServer::report_zeroed`] reads
+    /// for the very same tasks. Counters are never zeroed through this
+    /// handle (`zero = false`); the resetting variant stays on
+    /// [`PvaServer::report_zeroed`], which owns the JoinHandles.
+    pub fn report(&self) -> ServerReport {
+        ServerReport {
+            tcp_port: self.bound_tcp_port,
+            udp_port: self.udp_port,
+            tls_port: self.bound_tls_port,
+            tls_enabled: self.tls_enabled,
+            ignore_addrs: self.ignore_addrs,
+            beacon_period_secs: self.beacon_period_secs,
+            udp_alive: !self.udp_abort.is_finished(),
+            udp_v6_alive: self
+                .udp_v6_abort
+                .as_ref()
+                .map(|a| !a.is_finished())
+                .unwrap_or(false),
+            tcp_alive: !self.tcp_abort.is_finished(),
+            peers: self.peers.snapshot_zeroed(false),
+            peer_count: self.peers.len(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tcp_fallback_tests {
     //! pvxs parity for multi-server-on-one-host: when the requested
@@ -1190,6 +1292,88 @@ mod tcp_fallback_tests {
 
         drop(server);
         drop(blocker);
+    }
+
+    /// `PvaServer::report_handle()` produces a detached handle whose
+    /// `report()` mirrors `PvaServer::report()` field-for-field on a live
+    /// server. This is the property the iocsh `pvxsr` command rides on:
+    /// the handle outlives the `PvaServer` value that `run`/`wait`
+    /// consume, so it must report the same thing the server would.
+    #[tokio::test]
+    async fn report_handle_mirrors_live_server_report() {
+        let source = Arc::new(SharedSource::new());
+        let config = PvaServerConfig {
+            tcp_port: 0,
+            udp_port: 0,
+            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            auto_beacon: false,
+            beacon_destinations: Vec::new(),
+            ..Default::default()
+        };
+        let server = PvaServer::start(source, config).expect("server must start");
+
+        let direct = server.report();
+        let via_handle = server.report_handle().report();
+
+        assert_eq!(via_handle.tcp_port, direct.tcp_port);
+        assert_eq!(via_handle.udp_port, direct.udp_port);
+        assert_eq!(via_handle.tls_port, direct.tls_port);
+        assert_eq!(via_handle.tls_enabled, direct.tls_enabled);
+        assert_eq!(via_handle.beacon_period_secs, direct.beacon_period_secs);
+        assert_eq!(via_handle.ignore_addrs, direct.ignore_addrs);
+        assert_eq!(via_handle.peer_count, direct.peer_count);
+        assert_eq!(via_handle.tcp_alive, direct.tcp_alive);
+        assert_eq!(via_handle.udp_alive, direct.udp_alive);
+        assert!(
+            via_handle.tcp_alive,
+            "tcp task must be live on a fresh server"
+        );
+
+        // A clone keeps answering after the PvaServer value is gone — the
+        // ports are immutable scalars captured at bind, and the call must
+        // not panic even though the backing tasks have been aborted.
+        let detached = server.report_handle();
+        drop(server);
+        let post = detached.report();
+        assert_eq!(
+            post.tcp_port, direct.tcp_port,
+            "handle ports stay fixed after the server value drops"
+        );
+    }
+
+    /// `run_pva_server_reporting` fires `on_started` with a usable
+    /// `ServerReportHandle` the instant the listeners bind — before
+    /// `wait()` — which is exactly how the wrapper publishes the handle to
+    /// the iocsh `pvxsr` command.
+    #[tokio::test]
+    async fn run_pva_server_reporting_publishes_handle_at_bind() {
+        let source = Arc::new(SharedSource::new());
+        let config = PvaServerConfig {
+            tcp_port: 0,
+            udp_port: 0,
+            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            auto_beacon: false,
+            beacon_destinations: Vec::new(),
+            ..Default::default()
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(run_pva_server_reporting(source, config, move |handle| {
+            let _ = tx.send(handle);
+        }));
+
+        let handle = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("handle must be published promptly")
+            .expect("callback must send the handle");
+        let report = handle.report();
+        assert!(report.tcp_alive, "server reports live right after bind");
+        assert_ne!(
+            report.tcp_port, 0,
+            "bound TCP port is concrete, not the sentinel"
+        );
+
+        server_task.abort();
+        let _ = server_task.await;
     }
 
     /// epics-base PR #205 IPv6 Stage 1 — `PvaServerConfig::bind_ip`

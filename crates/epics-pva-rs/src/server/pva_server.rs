@@ -12,8 +12,9 @@ use epics_base_rs::server::record::Record;
 use epics_base_rs::server::scan::ScanScheduler;
 use epics_base_rs::server::{access_security, autosave, iocsh};
 use epics_base_rs::types::EpicsValue;
+use tokio::sync::watch;
 
-use crate::server_native::{ChannelSource, PvaServerConfig, run_pva_server};
+use crate::server_native::{ChannelSource, PvaServerConfig, ServerReportHandle};
 
 use super::native_source::PvDatabaseSource;
 
@@ -180,18 +181,43 @@ impl PvaServer {
     /// source via [`Self::run_with_source`] are responsible for
     /// installing ACF themselves.
     pub async fn run(&self) -> CaResult<()> {
+        self.run_reporting(None).await
+    }
+
+    /// As [`Self::run`], but publishes a [`ServerReportHandle`] into
+    /// `report_tx` the instant the native server binds. Backs the iocsh
+    /// `pvxsr` command on the default-source shell path
+    /// ([`Self::run_with_shell`]).
+    async fn run_reporting(
+        &self,
+        report_tx: Option<watch::Sender<Option<ServerReportHandle>>>,
+    ) -> CaResult<()> {
         let source = Arc::new(PvDatabaseSource::new_with_acf_and_version(
             self.db.clone(),
             self.acf.clone(),
             self.acl_version.clone(),
         ));
-        self.run_with_source(source).await
+        self.run_with_source_inner(source, report_tx).await
     }
 
     /// Run with a caller-supplied [`ChannelSource`] (e.g. qsrv group source).
     pub async fn run_with_source<S: ChannelSource + 'static>(
         &self,
         source: Arc<S>,
+    ) -> CaResult<()> {
+        self.run_with_source_inner(source, None).await
+    }
+
+    /// As [`Self::run_with_source`], but publishes a
+    /// [`ServerReportHandle`] into `report_tx` the instant the native
+    /// server binds its listeners (so the actually-bound ports are
+    /// known). [`Self::run_with_source_and_shell`] uses this to back the
+    /// iocsh `pvxsr` command; the plain [`Self::run_with_source`] passes
+    /// `None`.
+    async fn run_with_source_inner<S: ChannelSource + 'static>(
+        &self,
+        source: Arc<S>,
+        report_tx: Option<watch::Sender<Option<ServerReportHandle>>>,
     ) -> CaResult<()> {
         let config = PvaServerConfig {
             tcp_port: self.port,
@@ -217,7 +243,17 @@ impl PvaServer {
         };
 
         let result = tokio::select! {
-            res = run_pva_server(source, config) => res.map_err(|e| CaError::InvalidValue(e.to_string())),
+            res = crate::server_native::runtime::run_pva_server_reporting(
+                source,
+                config,
+                move |handle| {
+                    if let Some(tx) = report_tx {
+                        // Best-effort: a dropped receiver (no shell) just
+                        // means nobody is watching the report.
+                        let _ = tx.send(Some(handle));
+                    }
+                },
+            ) => res.map_err(|e| CaError::InvalidValue(e.to_string())),
             _ = scanner.run() => {
                 eprintln!("Scan scheduler exited");
                 Ok(())
@@ -244,9 +280,11 @@ impl PvaServer {
 
         let server = Arc::new(self);
 
+        let (report_tx, report_rx) = watch::channel(None);
         let server_clone = server.clone();
-        let server_handle =
-            epics_base_rs::runtime::task::spawn(async move { server_clone.run().await });
+        let server_handle = epics_base_rs::runtime::task::spawn(async move {
+            server_clone.run_reporting(Some(report_tx)).await
+        });
 
         let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
         std::thread::spawn(move || {
@@ -257,6 +295,7 @@ impl PvaServer {
                     shell.register(cmd);
                 }
             }
+            shell.register(super::iocsh::pvxsr_command(report_rx));
             let result = shell.run_repl();
             let _ = tx.send(result);
         });
@@ -298,9 +337,12 @@ impl PvaServer {
 
         let server = Arc::new(self);
 
+        let (report_tx, report_rx) = watch::channel(None);
         let server_clone = server.clone();
         let server_handle = epics_base_rs::runtime::task::spawn(async move {
-            server_clone.run_with_source(source).await
+            server_clone
+                .run_with_source_inner(source, Some(report_tx))
+                .await
         });
 
         let (tx, rx) = epics_base_rs::runtime::sync::oneshot::channel();
@@ -312,6 +354,7 @@ impl PvaServer {
                     shell.register(cmd);
                 }
             }
+            shell.register(super::iocsh::pvxsr_command(report_rx));
             let result = shell.run_repl();
             let _ = tx.send(result);
         });

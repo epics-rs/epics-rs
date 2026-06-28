@@ -513,6 +513,21 @@ mod app {
         cfg.foreground = cfg.foreground || debug;
         let foreground = cfg.foreground;
 
+        // Reject a config that cannot run (no control endpoint, empty
+        // program) HERE in the foreground process, before binding or
+        // forking. `ProcServ::new`'s own `validate()` runs post-fork in the
+        // daemon child (procserv_rs.rs build below), where the parent has
+        // already written the pidfile and `exit(0)`'d — a failure there is a
+        // headless-daemon false-success (PS-51, sibling of PS-49's pre-fork
+        // bind). C makes the control port a required positional, rejected
+        // during getopt before `forkAndGo` (procServ.cc:551). Same
+        // validation owner (`ProcServConfig::validate`) as the library path,
+        // run at the foreground gate here for both modes.
+        if let Err(e) = cfg.validate() {
+            eprintln!("procserv-rs: {e}");
+            return ExitCode::FAILURE;
+        }
+
         // Bind every control + log listener in THIS (foreground) process,
         // before daemonizing, so a bind failure (EADDRINUSE, abstract socket
         // on a non-Linux host, bad UNIX path) aborts startup with a real
@@ -874,6 +889,26 @@ mod app {
                 Args::try_parse_from(["procserv-rs", "--ignore", "^X", "/bin/echo"]).unwrap();
             let cfg = build_config(args).unwrap();
             assert_eq!(cfg.child.ignore_chars, vec![0x18]);
+        }
+
+        /// PS-51: a config with a command but no control endpoint
+        /// (`-P`/`--unixpath`) is accepted by `build_config` (control ends
+        /// up empty) yet must be rejected by the validation owner — so the
+        /// binary's pre-fork `cfg.validate()` gate fail-fasts in the
+        /// foreground process rather than daemonizing into a headless child
+        /// that dies post-fork after the parent already wrote the pidfile.
+        #[test]
+        fn no_control_endpoint_is_rejected_by_validate() {
+            let args = Args::try_parse_from(["procserv-rs", "/bin/echo"]).unwrap();
+            let cfg = build_config(args).unwrap();
+            assert!(
+                cfg.listen.control.is_empty(),
+                "no -P/--unixpath ⟹ empty control"
+            );
+            assert!(
+                cfg.validate().is_err(),
+                "a no-control-endpoint config must be rejected pre-fork"
+            );
         }
 
         /// No `--killsig` → C default SIGKILL (procServ.cc:71).

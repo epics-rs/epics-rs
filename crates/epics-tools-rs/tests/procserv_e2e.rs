@@ -188,7 +188,7 @@ async fn cat_round_trip_via_tcp_console() {
     let initial = read_for(&mut conn, Duration::from_millis(500)).await;
     let cleaned = String::from_utf8_lossy(&strip_iac(&initial)).to_string();
     assert!(
-        cleaned.contains("Welcome to procserv-rs"),
+        cleaned.contains("Welcome to procServ ("),
         "missing welcome banner; got: {cleaned:?}"
     );
     // The banner reports start times and connected-peer counts

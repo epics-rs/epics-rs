@@ -46,6 +46,7 @@ use crate::procserv::client::{
 use crate::procserv::config::ProcServConfig;
 use crate::procserv::error::{ProcServError, ProcServResult};
 use crate::procserv::menu::{Action, scan as menu_scan};
+use crate::procserv::messages;
 use crate::procserv::restart::{RestartMode, RestartTracker};
 use crate::procserv::sidecar::{
     InfoSnapshot, LogFile, remove_pid_file, render_procserv_info_env, write_info_file,
@@ -128,6 +129,10 @@ struct SupervisorState {
     /// `clientFactory.cc:131-132`). Distinct from any monotonic
     /// `Instant`: this is for human display, not elapsed-time math.
     proc_started: DateTime<Local>,
+    /// Directory the server was launched from, for infoMessage1's
+    /// "@@@ Server startup directory:" line (C `myDir = getcwd(...)`,
+    /// `procServ.cc:220`). Captured once at bootstrap.
+    startup_dir: String,
 }
 
 /// A scheduled-but-not-yet-fired child relaunch: the holdoff deadline
@@ -236,6 +241,12 @@ impl SupervisorState {
             child_exit_code: 0,
             pending_restart: None,
             proc_started: Local::now(),
+            // C `myDir = getcwd(NULL, 512)` (procServ.cc:220). A failure
+            // to read the cwd is non-fatal display data, so fall back to
+            // "." rather than aborting startup.
+            startup_dir: std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| ".".to_string()),
         };
 
         // Initial child spawn unless `--wait` (manual start).
@@ -580,66 +591,64 @@ impl SupervisorState {
     }
 
     /// Build the welcome banner per C `clientItem::clientItem`
-    /// (`clientFactory.cc:95-165`). A read-only (log/viewer) client gets a
-    /// trimmed banner: C gates the greeting + key hints and the
-    /// connected-peer count on `!_readonly` (`clientFactory.cc:152-163`),
-    /// so a logger sees only the start-time lines.
+    /// (`clientFactory.cc:95-165`). The C-exact text lives in
+    /// [`messages::welcome`]; this method only assembles the live state
+    /// (key bindings, child PID/start time, peer counts) the banner
+    /// reports. A read-only (log/viewer) client gets a trimmed banner — C
+    /// gates the greeting + key hints and the connected-peer count on
+    /// `!_readonly` (`clientFactory.cc:151-163`), handled inside
+    /// `messages::welcome`.
     fn welcome_banner(&self, readonly: bool) -> String {
-        let mut s = String::new();
-
-        // Greeting + key hints — interactive (read/write) clients only.
-        if !readonly {
-            s.push_str("@@@ Welcome to procserv-rs\r\n");
-            s.push_str(&format!(
-                "@@@ Wrapping: {} (mode: {})\r\n",
-                self.config.child.name,
-                self.restart_mode.label()
-            ));
-            if let Some(c) = self.config.keys.kill {
-                s.push_str(&format!(
-                    "@@@ Use ^{} to kill the child\r\n",
-                    ascii_caret(c)
-                ));
-            }
-            if let Some(c) = self.config.keys.toggle_restart {
-                s.push_str(&format!(
-                    "@@@ Use ^{} to toggle auto restart\r\n",
-                    ascii_caret(c)
-                ));
-            }
-            if let Some(c) = self.config.keys.logout {
-                s.push_str(&format!("@@@ Use ^{} to logout\r\n", ascii_caret(c)));
-            }
-        }
-
-        // Start times — shown to every client (C `buf1`,
-        // clientFactory.cc:131-145), formatted with the banner-facing
-        // `time_format` (un-bracketed, distinct from the log stamp).
         let tf = &self.config.logging.time_format;
-        s.push_str(&format!(
-            "@@@ procServ server started at: {}\r\n",
-            self.proc_started.format(tf)
-        ));
-        if let Some(slot) = &self.child {
-            s.push_str(&format!(
-                "@@@ Child \"{}\" started at: {}\r\n",
-                self.config.child.name,
-                slot.started_wall.format(tf)
-            ));
-        }
+        // C `command` is argv[optind] (procServ.cc:455) — the program path.
+        let command = self.config.child.program.display().to_string();
+        // C `chDir` defaults to `myDir` when `--chdir` is absent
+        // (procServ.cc:221).
+        let child_dir = self
+            .config
+            .child
+            .cwd
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| self.startup_dir.clone());
+        let log_path = self
+            .config
+            .logging
+            .log_path
+            .as_ref()
+            .map(|p| p.display().to_string());
+        let proc_started = self.proc_started.format(tf).to_string();
+        // `Some` ⟹ child alive (its PID + start time); `None` ⟹ shut down.
+        let child_started = self
+            .child
+            .as_ref()
+            .map(|slot| slot.started_wall.format(tf).to_string());
+        let child = self.child.as_ref().and_then(|slot| {
+            child_started.as_deref().map(|started| messages::ChildLine {
+                pid: slot.handle.pid(),
+                started,
+            })
+        });
 
-        // Connected-peer counts — interactive clients only (C `buf2`,
-        // clientFactory.cc:143-144,162-163). Counted before the new client
-        // is registered, so they exclude it → C's "(plus you)".
-        if !readonly {
-            let users = self.clients.values().filter(|e| !e.meta.readonly).count();
-            let loggers = self.clients.values().filter(|e| e.meta.readonly).count();
-            s.push_str(&format!(
-                "@@@ {users} user(s) and {loggers} logger(s) connected (plus you)\r\n"
-            ));
-        }
-
-        s
+        let ctx = messages::WelcomeCtx {
+            readonly,
+            version: env!("CARGO_PKG_VERSION"),
+            keys: &self.config.keys,
+            restart_mode: self.restart_mode,
+            pid: std::process::id() as i32,
+            startup_dir: &self.startup_dir,
+            child_dir: &child_dir,
+            name: &self.config.child.name,
+            command: &command,
+            log_path: log_path.as_deref(),
+            proc_started: &proc_started,
+            child,
+            // Counted before the new client is registered, so they exclude
+            // it → C's "(plus you)" (clientFactory.cc:143-144).
+            users: self.clients.values().filter(|e| !e.meta.readonly).count(),
+            loggers: self.clients.values().filter(|e| e.meta.readonly).count(),
+        };
+        messages::welcome(&ctx)
     }
 
     /// Send `bytes` to every connected client, and record them to the
@@ -736,15 +745,6 @@ fn remaining_holdoff(
     uptime: std::time::Duration,
 ) -> std::time::Duration {
     holdoff.saturating_sub(uptime)
-}
-
-/// Format byte `c` for `^c` notation (C `CTL_SC` macro).
-fn ascii_caret(c: u8) -> char {
-    if c < 32 {
-        (c + b'@') as char
-    } else {
-        c as char
-    }
 }
 
 impl Drop for SupervisorState {

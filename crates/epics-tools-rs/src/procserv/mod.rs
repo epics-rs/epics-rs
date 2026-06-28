@@ -11,6 +11,7 @@ pub mod daemon;
 pub mod error;
 pub mod listener;
 pub mod menu;
+pub mod messages;
 pub mod restart;
 pub mod sidecar;
 pub mod supervisor;

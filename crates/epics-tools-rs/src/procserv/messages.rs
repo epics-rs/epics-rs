@@ -1,0 +1,361 @@
+//! Single owner of procServ's `@@@`-prefixed console text.
+//!
+//! Every string here is ported byte-for-byte from upstream C procServ so
+//! that log scrapers and telnet front-ends written against it (e.g.
+//! `manage-procs`, which greps for `Received a sigChild` and `The PID of
+//! new child`) recognise the Rust port's output. Each builder cites its C
+//! origin. `NL` is C's `NL` macro = `"\r\n"` (procServ.h:65); control keys
+//! render via [`ctl_sc`], the port of C's `CTL_SC` macro (procServ.h:67).
+//!
+//! Keeping the text in one module (rather than scattered `format!`s in the
+//! supervisor) makes it the lone place a divergence from C can be
+//! introduced — and the lone place a parity test has to check.
+
+use crate::procserv::config::KeyBindings;
+use crate::procserv::restart::RestartMode;
+
+/// C `NL` macro (procServ.h:65) — telnet line ending.
+pub const NL: &str = "\r\n";
+
+/// Render a control byte the way C's `CTL_SC` macro does
+/// (procServ.h:67): a control char `0 < c < 32` becomes `^` followed by
+/// `c + 64` (so `0x12` → `^R`); any other byte prints literally.
+///
+/// C's macro expands `CTL_SC(0)` to `"" + '\0'`, emitting a literal NUL
+/// into the stream. The port returns an empty string for byte 0 instead —
+/// injecting a NUL is a C quirk, not a feature, and disabled keys are the
+/// only callers that pass 0.
+pub fn ctl_sc(c: u8) -> String {
+    if c > 0 && c < 32 {
+        format!("^{}", (c + 64) as char)
+    } else if c == 0 {
+        String::new()
+    } else {
+        (c as char).to_string()
+    }
+}
+
+/// Identity lines for a connecting client — C `infoMessage1`
+/// (procServ.cc:572-595): server PID, the server + child startup
+/// directories, how the child was launched, and the log file if any.
+pub fn info_message1(
+    pid: i32,
+    startup_dir: &str,
+    child_dir: &str,
+    name: &str,
+    command: &str,
+    log_path: Option<&str>,
+) -> String {
+    let mut s = format!(
+        "@@@ procServ server PID: {pid}{NL}\
+         @@@ Server startup directory: {startup_dir}{NL}\
+         @@@ Child startup directory: {child_dir}{NL}"
+    );
+    // C only names the child when `-n` gave it a name distinct from the
+    // command (procServ.cc:579-584).
+    if name != command {
+        s.push_str(&format!("@@@ Child \"{name}\" started as: {command}{NL}"));
+    } else {
+        s.push_str(&format!("@@@ Child started as: {command}{NL}"));
+    }
+    // C also has an "unable to open log file" variant, but the port aborts
+    // startup if the log can't open, so a running server only ever has a
+    // good path to report here.
+    if let Some(p) = log_path {
+        s.push_str(&format!("@@@ Child log file: {p}{NL}"));
+    }
+    s
+}
+
+/// The child PID / shutdown state line — C `infoMessage2`
+/// (procServ.cc:586, processFactory.cc:109,191). `Some(pid)` ⟹ child
+/// alive; `None` ⟹ child shut down.
+pub fn info_message2(name: &str, child_pid: Option<i32>) -> String {
+    match child_pid {
+        Some(pid) => format!("@@@ Child \"{name}\" PID: {pid}{NL}"),
+        None => format!("@@@ Child \"{name}\" is SHUT DOWN{NL}"),
+    }
+}
+
+/// The command-key menu — C `infoMessage3` (procServ.cc:442-450). Shown
+/// at connect time while the child is dead, and again in the shutdown
+/// block of every non-oneshot child death.
+pub fn info_message3(keys: &KeyBindings) -> String {
+    let restart = keys.restart.map(ctl_sc).unwrap_or_default();
+    let kill = keys.kill.map(ctl_sc).unwrap_or_default();
+    let quit = keys.quit.map(ctl_sc).unwrap_or_default();
+    let mut s = format!("@@@ {restart} or {kill} restarts the child, {quit} quits the server");
+    if let Some(l) = keys.logout {
+        s.push_str(&format!(", {} closes this connection", ctl_sc(l)));
+    }
+    s.push_str(NL);
+    s
+}
+
+/// One child line for the welcome banner: its PID and wall-clock start
+/// time. Absence ([`WelcomeCtx::child`] = `None`) means the child is dead.
+pub struct ChildLine<'a> {
+    pub pid: i32,
+    pub started: &'a str,
+}
+
+/// Everything the connect-time welcome banner needs. Built by the
+/// supervisor, which owns the live state; this module owns the text.
+pub struct WelcomeCtx<'a> {
+    pub readonly: bool,
+    pub version: &'a str,
+    pub keys: &'a KeyBindings,
+    pub restart_mode: RestartMode,
+    pub pid: i32,
+    pub startup_dir: &'a str,
+    pub child_dir: &'a str,
+    pub name: &'a str,
+    pub command: &'a str,
+    pub log_path: Option<&'a str>,
+    pub proc_started: &'a str,
+    pub child: Option<ChildLine<'a>>,
+    pub users: usize,
+    pub loggers: usize,
+}
+
+/// The full connect-time welcome banner, composed in C's exact order and
+/// with C's readonly / child-exists gating (clientFactory.cc:100-163):
+/// greeting + key hints (interactive only) → infoMessage1 → infoMessage2
+/// → start times → peer counts (interactive only) → command menu (only
+/// while the child is dead).
+pub fn welcome(ctx: &WelcomeCtx) -> String {
+    let mut s = String::new();
+
+    // greeting1 + greeting2 — C writes these only to non-readonly
+    // (interactive) clients (clientFactory.cc:151-154).
+    if !ctx.readonly {
+        s.push_str(&format!("@@@ Welcome to procServ ({}){NL}", ctx.version));
+        s.push_str(&greeting2(ctx.keys, ctx.restart_mode));
+    }
+
+    // infoMessage1 + infoMessage2 — every client (clientFactory.cc:157-158).
+    s.push_str(&info_message1(
+        ctx.pid,
+        ctx.startup_dir,
+        ctx.child_dir,
+        ctx.name,
+        ctx.command,
+        ctx.log_path,
+    ));
+    s.push_str(&info_message2(ctx.name, ctx.child.as_ref().map(|c| c.pid)));
+
+    // buf1: start times — every client (clientFactory.cc:134-141,159).
+    s.push_str(&format!(
+        "@@@ procServ server started at: {}{NL}",
+        ctx.proc_started
+    ));
+    if let Some(c) = &ctx.child {
+        s.push_str(&format!(
+            "@@@ Child \"{}\" started at: {}{NL}",
+            ctx.name, c.started
+        ));
+    }
+
+    // buf2: connected-peer counts — interactive clients only
+    // (clientFactory.cc:143-144,160-161). Counted excluding the joining
+    // client → C's "(plus you)".
+    if !ctx.readonly {
+        s.push_str(&format!(
+            "@@@ {} user(s) and {} logger(s) connected (plus you){NL}",
+            ctx.users, ctx.loggers
+        ));
+    }
+
+    // infoMessage3: the command menu — only when no child is running
+    // (clientFactory.cc:162-163).
+    if ctx.child.is_none() {
+        s.push_str(&info_message3(ctx.keys));
+    }
+
+    s
+}
+
+/// The kill/restart-mode/toggle/logout hint block — C `greeting2`
+/// (clientFactory.cc:108-124). Packed onto combined lines exactly as C
+/// builds it: the kill hint and restart-mode share a line with the toggle
+/// hint, then an optional logout line.
+fn greeting2(keys: &KeyBindings, mode: RestartMode) -> String {
+    let mut s = String::new();
+    match keys.kill {
+        Some(k) => s.push_str(&format!("@@@ Use {} to kill the child, ", ctl_sc(k))),
+        None => s.push_str("@@@ Kill command disabled, "),
+    }
+    s.push_str(&format!("auto restart mode is {}, ", mode.label()));
+    match keys.toggle_restart {
+        Some(t) => s.push_str(&format!("use {} to toggle auto restart{NL}", ctl_sc(t))),
+        None => s.push_str(&format!("auto restart toggle disabled{NL}")),
+    }
+    if let Some(l) = keys.logout {
+        s.push_str(&format!(
+            "@@@ Use {} to logout from procServ server{NL}",
+            ctl_sc(l)
+        ));
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys() -> KeyBindings {
+        // C defaults: kill ^X, toggle ^T, restart ^R, quit ^Q, logout off.
+        KeyBindings {
+            kill: Some(0x18),
+            toggle_restart: Some(0x14),
+            restart: Some(0x12),
+            quit: Some(0x11),
+            logout: None,
+        }
+    }
+
+    #[test]
+    fn ctl_sc_renders_control_chars_with_caret() {
+        assert_eq!(ctl_sc(0x12), "^R");
+        assert_eq!(ctl_sc(0x18), "^X");
+        assert_eq!(ctl_sc(0x11), "^Q");
+        assert_eq!(ctl_sc(0x1d), "^]");
+    }
+
+    #[test]
+    fn ctl_sc_passes_printable_chars_literally_and_drops_nul() {
+        assert_eq!(ctl_sc(b'a'), "a");
+        // C would emit a NUL; the port emits nothing (don't copy the quirk).
+        assert_eq!(ctl_sc(0), "");
+    }
+
+    #[test]
+    fn info_message3_matches_c_menu_with_logout_off() {
+        // C procServ.cc:443-444 with logout disabled.
+        assert_eq!(
+            info_message3(&keys()),
+            "@@@ ^R or ^X restarts the child, ^Q quits the server\r\n"
+        );
+    }
+
+    #[test]
+    fn info_message3_appends_logout_clause_when_enabled() {
+        let mut k = keys();
+        k.logout = Some(0x1d);
+        assert_eq!(
+            info_message3(&k),
+            "@@@ ^R or ^X restarts the child, ^Q quits the server, ^] closes this connection\r\n"
+        );
+    }
+
+    #[test]
+    fn info_message2_distinguishes_alive_from_shutdown() {
+        assert_eq!(
+            info_message2("ioc", Some(4242)),
+            "@@@ Child \"ioc\" PID: 4242\r\n"
+        );
+        assert_eq!(
+            info_message2("ioc", None),
+            "@@@ Child \"ioc\" is SHUT DOWN\r\n"
+        );
+    }
+
+    #[test]
+    fn info_message1_names_the_child_only_when_distinct_from_command() {
+        // Distinct name → "@@@ Child \"name\" started as: cmd".
+        let named = info_message1(
+            7,
+            "/srv",
+            "/srv",
+            "ioc",
+            "/bin/st.cmd",
+            Some("/var/log/ioc"),
+        );
+        assert_eq!(
+            named,
+            "@@@ procServ server PID: 7\r\n\
+             @@@ Server startup directory: /srv\r\n\
+             @@@ Child startup directory: /srv\r\n\
+             @@@ Child \"ioc\" started as: /bin/st.cmd\r\n\
+             @@@ Child log file: /var/log/ioc\r\n"
+        );
+        // name == command → bare "@@@ Child started as: cmd", no log line.
+        let bare = info_message1(7, "/srv", "/run", "/bin/st.cmd", "/bin/st.cmd", None);
+        assert_eq!(
+            bare,
+            "@@@ procServ server PID: 7\r\n\
+             @@@ Server startup directory: /srv\r\n\
+             @@@ Child startup directory: /run\r\n\
+             @@@ Child started as: /bin/st.cmd\r\n"
+        );
+    }
+
+    #[test]
+    fn welcome_interactive_with_live_child_matches_c_order() {
+        let ctx = WelcomeCtx {
+            readonly: false,
+            version: "2.8.0",
+            keys: &keys(),
+            restart_mode: RestartMode::OnExit,
+            pid: 100,
+            startup_dir: "/srv",
+            child_dir: "/srv",
+            name: "/bin/st.cmd",
+            command: "/bin/st.cmd",
+            log_path: None,
+            proc_started: "Mon Jun 28 10:00:00 2026",
+            child: Some(ChildLine {
+                pid: 200,
+                started: "Mon Jun 28 10:00:01 2026",
+            }),
+            users: 1,
+            loggers: 0,
+        };
+        assert_eq!(
+            welcome(&ctx),
+            "@@@ Welcome to procServ (2.8.0)\r\n\
+             @@@ Use ^X to kill the child, auto restart mode is ON, use ^T to toggle auto restart\r\n\
+             @@@ procServ server PID: 100\r\n\
+             @@@ Server startup directory: /srv\r\n\
+             @@@ Child startup directory: /srv\r\n\
+             @@@ Child started as: /bin/st.cmd\r\n\
+             @@@ Child \"/bin/st.cmd\" PID: 200\r\n\
+             @@@ procServ server started at: Mon Jun 28 10:00:00 2026\r\n\
+             @@@ Child \"/bin/st.cmd\" started at: Mon Jun 28 10:00:01 2026\r\n\
+             @@@ 1 user(s) and 0 logger(s) connected (plus you)\r\n"
+        );
+    }
+
+    #[test]
+    fn welcome_readonly_trims_greeting_counts_and_shows_menu_when_dead() {
+        // A logger (readonly) with a dead child: no greeting/key hints, no
+        // peer-count line, but the command menu IS shown because the child
+        // is down (clientFactory.cc:151-163).
+        let ctx = WelcomeCtx {
+            readonly: true,
+            version: "2.8.0",
+            keys: &keys(),
+            restart_mode: RestartMode::Disabled,
+            pid: 100,
+            startup_dir: "/srv",
+            child_dir: "/srv",
+            name: "ioc",
+            command: "/bin/st.cmd",
+            log_path: None,
+            proc_started: "Mon Jun 28 10:00:00 2026",
+            child: None,
+            users: 2,
+            loggers: 1,
+        };
+        assert_eq!(
+            welcome(&ctx),
+            "@@@ procServ server PID: 100\r\n\
+             @@@ Server startup directory: /srv\r\n\
+             @@@ Child startup directory: /srv\r\n\
+             @@@ Child \"ioc\" started as: /bin/st.cmd\r\n\
+             @@@ Child \"ioc\" is SHUT DOWN\r\n\
+             @@@ procServ server started at: Mon Jun 28 10:00:00 2026\r\n\
+             @@@ ^R or ^X restarts the child, ^Q quits the server\r\n"
+        );
+    }
+}

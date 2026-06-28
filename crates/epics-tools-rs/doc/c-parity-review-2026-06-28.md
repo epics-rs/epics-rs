@@ -271,11 +271,12 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - C: `procServ.cc:225` (`getenv("PROCSERV_DEBUG")`→inDebugMode), `:291-293` (`-d`), `:390-392,889-895` (`-q` suppresses the spawn banner & log warnings)
 - Impact: `-d` (debug/foreground+printf), `-q` (suppress the `spawning daemon process: <pid>` / no-logfile warnings), and `PROCSERV_DEBUG` are accepted by C and silently unavailable in Rust (clap rejects `-d`/`-q`).
 
-#### PS-29 `--allow` not compile-gated; Rust always binds all interfaces
+#### PS-29 `--allow` not compile-gated; Rust always binds all interfaces — CLEARED (intentional divergence, doc-only)
 - Severity: CONCERN
 - Rust: `src/bin/procserv_rs.rs:166-172` (`--allow` → bind `0.0.0.0` unconditionally)
 - C: `procServ.cc:43-47` (`enableAllow=false` unless `ALLOW_FROM_ANYWHERE` build), `:272-277` (`--allow` prints "not supported" / no-op in the default build)
 - Impact: In the default C build `--allow` is refused and the control port stays localhost-only (a deliberate security default). Rust honors `--allow` always. A wrapper carrying `--allow` that was inert on stock procServ now exposes the control console to the network.
+- Disposition: kept — `--allow` is honored as a genuine runtime opt-in. C's behavior is a *build-time* gate (`ALLOW_FROM_ANYWHERE`): in the common stock build `--allow` is inert and prints "not supported", so the flag's effect depends on how the binary was compiled rather than on the operator's intent. The Rust port has no compile-time variants, so it treats `--allow` as what it plainly reads as — an explicit request to bind all interfaces — and the secure default (localhost-only) still holds whenever `--allow` is absent. The default stays safe; only an operator who explicitly passes `--allow` gets the broad bind, which is the documented intent of the flag. The README flag table and the source (`procserv_rs.rs:50-53`, C-citation) document the localhost default + the `--allow` opt-in. Recorded as a deliberate divergence; no code change. (If a site needs C's "refuse `--allow`" posture, that is a future opt-in build/runtime flag, not a silent default.)
 
 #### PS-30 `PROCSERV_PID` env not consulted for the pidfile default
 - Severity: CONCERN — CLEARED (this round)

@@ -485,8 +485,17 @@ impl SupervisorState {
                         }
                     }
                     RestartMode::Disabled => {
-                        self.banner("@@@ Auto restart disabled — exiting").await;
-                        Ok(ChildLoopOutcome::Shutdown)
+                        // C `norestart`: the child stays dead but the
+                        // SERVER stays up. processFactoryNeedsRestart()
+                        // returns false forever after the first launch
+                        // (`norestart && _restartTime`,
+                        // processFactory.cc:51), so shutdownServer is
+                        // never set (procServ.cc:654-669) — operators
+                        // reconnect and ^R to relaunch. Only `oneshot`
+                        // exits the server, never `norestart`.
+                        self.banner("@@@ Child process is shutting down, auto restart is disabled")
+                            .await;
+                        Ok(ChildLoopOutcome::Continue)
                     }
                 }
             }

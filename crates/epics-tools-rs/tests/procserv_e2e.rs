@@ -536,6 +536,45 @@ async fn two_clients_share_same_party_line() {
 }
 
 #[tokio::test]
+async fn norestart_keeps_server_alive_after_child_exit() {
+    // C `norestart` (Rust RestartMode::Disabled): the child exits but
+    // the SERVER stays up — only `oneshot` sets shutdownServer. The
+    // operator reconnects and ^R relaunches (processFactory.cc:51,
+    // procServ.cc:654-669).
+    let port = pick_port().await;
+    let mut cfg = cat_config(port); // Disabled == norestart
+    cfg.child.program = PathBuf::from("/bin/sh");
+    cfg.child.args = vec!["-c".into(), "exit 0".into()];
+    let server = ProcServ::new(cfg).expect("build");
+    let server_task = tokio::spawn(async move { server.run().await });
+
+    // Connect AFTER the child has already exited; the server must still
+    // be accepting connections and serving a banner.
+    sleep(Duration::from_millis(400)).await;
+    let mut conn = {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(50)).await,
+                Err(e) => panic!("connect: {e}"),
+            }
+        }
+    };
+    let banner = read_for(&mut conn, Duration::from_millis(300)).await;
+    assert!(
+        !banner.is_empty(),
+        "server should still serve a banner after the child exited under norestart"
+    );
+    assert!(
+        !server_task.is_finished(),
+        "norestart must NOT shut the server down on child exit"
+    );
+
+    server_task.abort();
+}
+
+#[tokio::test]
 async fn child_exit_code_becomes_server_exit_code() {
     // C procServ returns the child's last exit code as its own process
     // exit status (childExitCode → main return, procServ.cc:798,701).

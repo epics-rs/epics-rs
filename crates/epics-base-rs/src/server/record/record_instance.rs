@@ -107,10 +107,12 @@ pub(crate) struct MetadataSnapshot {
 /// below feed the live-computed `field_metadata_override`, never the
 /// cache — its invalidation on their write is harmless).
 ///
-/// Currently uncovered (because they are not yet populated by any
+/// Currently uncovered (because it is not yet populated by any
 /// `populate_*` function): `DESC` (would map to `display.description`
-/// — populate hook missing), `Q:form` info tag (would map to
-/// `display.form`). Add to this set if/when those are wired up.
+/// — populate hook missing). The `Q:form` info tag is now wired
+/// (`populate_display_info` -> `display.form`), but as an immutable
+/// load-time info tag — not a runtime field — it needs no cache
+/// invalidation and so is intentionally absent from this field set.
 fn is_metadata_field(name: &str) -> bool {
     matches!(
         name,
@@ -302,10 +304,10 @@ pub struct RecordInstance {
     ///
     /// If a future change adds a new field to `populate_display_info`,
     /// `populate_control_info`, or `populate_enum_info` (e.g. populating
-    /// `display.form` from a record's `Q:form` info tag, or
     /// `display.description` from DESC), the new source field name MUST
     /// also be added to `is_metadata_field` so writes to it invalidate
-    /// the cache.
+    /// the cache. (The `Q:form` -> `display.form` mapping is exempt: it
+    /// reads an immutable load-time info tag, not a runtime field.)
     pub(crate) metadata_cache: StdMutex<Option<MetadataSnapshot>>,
 }
 
@@ -645,6 +647,32 @@ impl RecordInstance {
     }
 
     /// Populate DisplayInfo from record fields if applicable.
+    /// Resolve the `Q:form` info-tag value to a `display.form` menu index.
+    ///
+    /// pvxs publishes the fixed seven-entry form menu
+    /// (Default/String/Binary/Decimal/Hex/Exponential/Engineering) for every
+    /// numeric value and, for the VAL field only, sets `display.form.index`
+    /// to the slot whose name equals the field's `Q:form` info tag
+    /// (`iocsource.cpp:42-62`, case-sensitive). Unset or unrecognised ->
+    /// `None` (form stays 0 = Default), exactly as pvxs leaves the index
+    /// untouched on no match.
+    fn q_form_index(&self) -> Option<i16> {
+        const FORM_NAMES: [&str; 7] = [
+            "Default",
+            "String",
+            "Binary",
+            "Decimal",
+            "Hex",
+            "Exponential",
+            "Engineering",
+        ];
+        let tag = self.info.get("Q:form")?;
+        FORM_NAMES
+            .iter()
+            .position(|name| name == tag)
+            .map(|i| i as i16)
+    }
+
     fn populate_display_info(&self, snap: &mut super::super::snapshot::Snapshot) {
         let rtype = self.record.record_type();
         match rtype {
@@ -851,6 +879,17 @@ impl RecordInstance {
                 });
             }
             _ => {}
+        }
+        // Apply the `Q:form` display-format hint. The match above builds
+        // `snap.display` only for numeric record types — the same set for
+        // which pvxs emits `display.form.choices` — so a present `Q:form`
+        // tag maps to `display.form.index` exactly when pvxs applies it
+        // (`iocsource.cpp:42-62`, VAL-only; the per-record DisplayInfo here
+        // *is* the VAL field's metadata).
+        if let Some(display) = snap.display.as_mut() {
+            if let Some(form) = self.q_form_index() {
+                display.form = form;
+            }
         }
     }
 
@@ -2981,6 +3020,32 @@ mod metadata_cache_tests {
 
         // Cache is now populated
         assert!(inst.metadata_cache.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn q_form_info_tag_sets_display_form_index() {
+        // pvxs maps the `Q:form` info tag to `display.form.index` for the
+        // VAL field (iocsource.cpp:42-62). "Hex" is slot 4 of the
+        // seven-entry menu (Default/String/Binary/Decimal/Hex/...).
+        let mut inst = ai_instance();
+        inst.set_info("Q:form", "Hex");
+        let snap = inst.snapshot_for_field("VAL").unwrap();
+        let display = snap.display.expect("ai snapshot must have display");
+        assert_eq!(display.form, 4, "Q:form=Hex -> display.form index 4");
+    }
+
+    #[test]
+    fn q_form_absent_or_unknown_leaves_form_default() {
+        // No `Q:form` tag -> form stays 0 (Default).
+        let inst = ai_instance();
+        let snap = inst.snapshot_for_field("VAL").unwrap();
+        assert_eq!(snap.display.expect("ai display").form, 0);
+
+        // Unrecognised tag -> pvxs leaves the index untouched (0).
+        let mut inst2 = ai_instance();
+        inst2.set_info("Q:form", "Nonsense");
+        let snap2 = inst2.snapshot_for_field("VAL").unwrap();
+        assert_eq!(snap2.display.expect("ai display").form, 0);
     }
 
     /// the served `timeStamp.userTag` defaults to the record's `utag`

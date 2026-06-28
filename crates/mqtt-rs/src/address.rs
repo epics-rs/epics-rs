@@ -171,7 +171,15 @@ impl TopicAddress {
             .split_once(':')
             .ok_or_else(|| MqttError::InvalidAddress(format!("missing ':' in {s:?}")))?;
 
-        let format = match fmt_str.to_ascii_uppercase().as_str() {
+        // C parity: `supportedTopicTypes.find(type)` (drvMqtt.cpp:362-364) is a
+        // case-sensitive lookup over the uppercase-only set (drvMqtt.cpp:24-37),
+        // so `flat:int` / `Json:Float` are rejected (record device-init fails).
+        // Matching exact case here also removes a Rust-internal inconsistency:
+        // `mqttAddTopic` canonicalises the key to uppercase via `to_drv_info()`,
+        // but `drv_user_create` looks up a record's verbatim drvInfo, so an
+        // accepted lowercase form would store under a key the record can never
+        // find (`ParamNotFound`) after a false "success".
+        let format = match fmt_str {
             "FLAT" => PayloadFormat::Flat,
             "JSON" => PayloadFormat::Json,
             _ => {
@@ -181,7 +189,7 @@ impl TopicAddress {
             }
         };
 
-        let value_type = match type_str.to_ascii_uppercase().as_str() {
+        let value_type = match type_str {
             "INT" => ValueType::Int,
             "FLOAT" => ValueType::Float,
             "DIGITAL" => ValueType::Digital,
@@ -278,11 +286,14 @@ mod tests {
         assert_eq!(addr.json_field.as_deref(), Some("key with spaces"));
     }
 
+    /// C parity: FORMAT:TYPE is matched case-sensitively against the
+    /// uppercase-only `supportedTopicTypes` set (drvMqtt.cpp:24-37,362-364),
+    /// so a lowercase form is rejected, not silently canonicalised.
     #[test]
-    fn parse_case_insensitive() {
-        let addr = TopicAddress::parse("flat:int test/topic").unwrap();
-        assert_eq!(addr.format, PayloadFormat::Flat);
-        assert_eq!(addr.value_type, ValueType::Int);
+    fn parse_rejects_lowercase_format_type() {
+        assert!(TopicAddress::parse("flat:int test/topic").is_err());
+        assert!(TopicAddress::parse("Json:Float sensors/data humidity").is_err());
+        assert!(TopicAddress::parse("FLAT:int test/topic").is_err());
     }
 
     #[test]

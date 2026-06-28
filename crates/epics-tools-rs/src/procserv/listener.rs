@@ -7,12 +7,18 @@
 
 use std::net::SocketAddr;
 
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::{TcpListener, TcpSocket, UnixListener};
 use tokio::sync::mpsc;
 
 use crate::procserv::client::{ClientPeer, ClientStream, IncomingClient};
 use crate::procserv::endpoint::UnixEndpoint;
 use crate::procserv::error::{ProcServError, ProcServResult};
+
+/// `listen(2)` backlog. C uses 5 (`acceptFactory.cc:216,363`); the Rust
+/// port keeps tokio's larger default so a connection burst is queued
+/// rather than refused past the 6th — a deliberate, strictly-more-tolerant
+/// divergence (PS-34), not bug-copied down to 5.
+const LISTEN_BACKLOG: u32 = 1024;
 
 /// Run the TCP listener loop until the supervisor's `out` channel
 /// closes. Each accepted socket is wrapped in [`IncomingClient`] and
@@ -27,9 +33,7 @@ pub async fn run_tcp(
     readonly: bool,
     out: mpsc::Sender<IncomingClient>,
 ) -> ProcServResult<()> {
-    let listener = TcpListener::bind(bind)
-        .await
-        .map_err(|e| ProcServError::ListenerBind(format!("TCP {bind}: {e}")))?;
+    let listener = tcp_listen(bind)?;
     tracing::info!(addr = %bind, readonly, "procserv-rs: TCP listener accepted");
 
     loop {
@@ -53,6 +57,29 @@ pub async fn run_tcp(
             }
         }
     }
+}
+
+/// Bind a TCP listen socket with `SO_REUSEADDR` set before `bind`, exactly
+/// as C `acceptItemTCP::remakeConnection` (`acceptFactory.cc:187-191,207`).
+/// procServ is itself frequently restarted (systemd); without
+/// `SO_REUSEADDR`, a restart while prior client connections linger in
+/// `TIME_WAIT` can fail `bind` with `EADDRINUSE` and abort startup. tokio's
+/// `TcpListener::bind` does not set the option, so go through `TcpSocket`.
+fn tcp_listen(bind: SocketAddr) -> ProcServResult<TcpListener> {
+    let socket = match bind {
+        SocketAddr::V4(_) => TcpSocket::new_v4(),
+        SocketAddr::V6(_) => TcpSocket::new_v6(),
+    }
+    .map_err(|e| ProcServError::ListenerBind(format!("TCP {bind}: {e}")))?;
+    socket
+        .set_reuseaddr(true)
+        .map_err(|e| ProcServError::ListenerBind(format!("TCP {bind} SO_REUSEADDR: {e}")))?;
+    socket
+        .bind(bind)
+        .map_err(|e| ProcServError::ListenerBind(format!("TCP {bind}: {e}")))?;
+    socket
+        .listen(LISTEN_BACKLOG)
+        .map_err(|e| ProcServError::ListenerBind(format!("TCP {bind} listen: {e}")))
 }
 
 /// UNIX-socket listener. Binds a filesystem or abstract socket per the
@@ -224,6 +251,20 @@ mod tests {
         assert_eq!(buf[0], b'x');
 
         server.abort();
+    }
+
+    /// The rewritten bind path (`TcpSocket` + `SO_REUSEADDR`, PS-23) must
+    /// still bind and report a concrete local address. The rebind-over-
+    /// `TIME_WAIT` effect of `SO_REUSEADDR` itself is OS/timing-dependent
+    /// and not deterministically unit-testable; the accept test below
+    /// exercises the full `run_tcp` path end-to-end.
+    #[tokio::test]
+    async fn tcp_listen_binds_via_reuseaddr_path() {
+        let bind = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+        let listener = tcp_listen(bind).unwrap();
+        let actual = listener.local_addr().unwrap();
+        assert_eq!(actual.ip(), bind.ip());
+        assert_ne!(actual.port(), 0);
     }
 
     #[tokio::test]

@@ -226,7 +226,8 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - Impact: On SIGTERM/quit, C sends `killSig` then an unconditional hardcoded SIGKILL during teardown — a guaranteed kill even if `killSig` is catchable. Rust signals the group once with the configurable `kill_signal`. With default SIGKILL this is fine, but `--killsig SIGINT` (if implemented per PS-12) that the child ignores would survive procserv-rs shutdown in Rust.
 
 #### PS-23 TCP listen socket omits SO_REUSEADDR
-- Severity: CONCERN
+- Severity: CONCERN — CLEARED (this round)
+- Resolution: `run_tcp` now binds through a new `tcp_listen` helper that creates a `TcpSocket`, calls `set_reuseaddr(true)` before `bind`, then `listen(LISTEN_BACKLOG)` — the exact order of C `acceptItemTCP::remakeConnection` (`acceptFactory.cc:187-191,207`). A systemd restart while prior client sockets linger in `TIME_WAIT` now rebinds immediately instead of failing `bind` with `EADDRINUSE` and aborting startup. The backlog stays tokio's 1024 (PS-34 intentional divergence, not C's 5). Test: `tcp_listen_binds_via_reuseaddr_path` exercises the new bind path (the rebind-over-`TIME_WAIT` effect itself is OS/timing-dependent and not deterministically unit-testable; the accept test covers the full path).
 - Rust: `src/procserv/listener.rs:30-32` (`TcpListener::bind` — std/tokio do not set SO_REUSEADDR)
 - C: `acceptFactory.cc:187-191` (`setsockopt(SO_REUSEADDR)` before `bind`)
 - Impact: procServ is itself frequently restarted (systemd). After a restart while prior client connections linger in TIME_WAIT, C rebinds immediately; the Rust port can fail `bind` with `EADDRINUSE` and exit at startup (`ProcServError::ListenerBind`) until TIME_WAIT drains.

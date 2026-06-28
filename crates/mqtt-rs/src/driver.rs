@@ -55,8 +55,13 @@ impl MqttDriver {
         topics: Vec<TopicAddress>,
         publish_tx: mpsc::UnboundedSender<PublishRequest>,
     ) -> Self {
+        // C parity: drvMqtt sets `.setBlocking(false)` (drvMqtt.cpp:122) — the
+        // MQTT port is non-blocking. The Rust write path only `send`s on an
+        // mpsc channel (publish_value) and reads serve from the param cache, so
+        // nothing blocks; declaring ASYN_CANBLOCK would needlessly defer record
+        // I/O two-phase (PACT) where C completes inline.
         let flags = PortFlags {
-            can_block: true,
+            can_block: false,
             ..PortFlags::default()
         };
         let mut base = PortDriverBase::new(port_name, 1, flags);

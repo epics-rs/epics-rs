@@ -861,9 +861,17 @@ impl Drop for SupervisorState {
             remove_pid_file(p);
         }
         if let Some(slot) = self.child.as_ref() {
-            // Best-effort: signal the child group on supervisor drop
-            // so a panic in the supervisor doesn't leave a zombie.
+            // C teardown is two-step: send the configurable `killSig`
+            // (procServ.cc:637), then an unconditional `SIGKILL` to the
+            // group in the processClass destructor (processFactory.cc:117).
+            // The follow-up SIGKILL guarantees the group dies even when
+            // `killSig` is catchable/ignorable (e.g. `--killsig 2` SIGINT
+            // a child traps) — without it such a child would survive
+            // supervisor shutdown. When `kill_signal` is already SIGKILL
+            // the second send is a harmless ESRCH no-op (group already
+            // gone), exactly as in C.
             let _ = slot.handle.signal(self.config.child.kill_signal);
+            let _ = slot.handle.signal(libc::SIGKILL);
         }
     }
 }

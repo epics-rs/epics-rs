@@ -210,7 +210,8 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - Impact: A transient `forkpty` failure (pty exhaustion, brief ENOENT) at startup or on an auto-restart propagates via `?` out of the event loop and terminates procserv-rs, where C retries after holdoff. Inconsistency is auto/initial-only.
 
 #### PS-22 Shutdown teardown uses the configurable kill signal, not C's final hardcoded SIGKILL
-- Severity: CONCERN
+- Severity: CONCERN — CLEARED (this round)
+- Resolution: `SupervisorState::Drop` now sends the configurable `kill_signal` *then* an unconditional `libc::SIGKILL` to the group, mirroring C's two-step teardown (`processFactorySendSignal(killSig)` procServ.cc:637 + the destructor's unconditional `kill(-_pid, SIGKILL)` processFactory.cc:117). Without the follow-up, a child that traps a catchable `--killsig` (e.g. SIGINT) would survive supervisor shutdown. When `kill_signal` is already SIGKILL the second send is a harmless ESRCH no-op, exactly as in C. Drop is the single teardown finalizer for the child resource, so the guarantee holds on every exit path. Test: e2e `teardown_sigkills_a_child_that_traps_the_configurable_kill_signal` (child traps SIGTERM, teardown's SIGKILL still reaps it). Enabled by PS-12 making `kill_signal` configurable.
 - Rust: `src/procserv/supervisor.rs:720-724` (`Drop` → `signal(self.config.child.kill_signal)`)
 - C: `procServ.cc:637` (`processFactorySendSignal(killSig)`) **then** `processFactory.cc:117` (unconditional `kill(-_pid, SIGKILL)` in the destructor during teardown)
 - Impact: On SIGTERM/quit, C sends `killSig` then an unconditional hardcoded SIGKILL during teardown — a guaranteed kill even if `killSig` is catchable. Rust signals the group once with the configurable `kill_signal`. With default SIGKILL this is fine, but `--killsig SIGINT` (if implemented per PS-12) that the child ignores would survive procserv-rs shutdown in Rust.

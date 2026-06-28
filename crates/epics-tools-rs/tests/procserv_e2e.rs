@@ -745,6 +745,64 @@ async fn child_exit_sigkills_orphaned_process_group() {
 }
 
 #[tokio::test]
+async fn teardown_sigkills_a_child_that_traps_the_configurable_kill_signal() {
+    // C shutdown is two-step: `processFactorySendSignal(killSig)`
+    // (procServ.cc:637) then an unconditional group `SIGKILL` in the
+    // processClass destructor (processFactory.cc:117). With a catchable
+    // `--killsig` (e.g. SIGTERM) that the child ignores, only the
+    // follow-up SIGKILL guarantees death. The child traps SIGTERM and
+    // loops forever; supervisor teardown (Drop, fired by aborting the
+    // run task) must still kill it.
+    let port = pick_port().await;
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("childpid");
+    let pf = pidfile.to_str().unwrap().to_string();
+
+    let mut cfg = cat_config(port);
+    cfg.child.kill_signal = 15; // SIGTERM — catchable, the child ignores it
+    cfg.child.program = PathBuf::from("/bin/sh");
+    cfg.child.args = vec![
+        "-c".into(),
+        format!("trap '' TERM; echo $$ > '{pf}'; while true; do sleep 1; done"),
+    ];
+    let server = ProcServ::new(cfg).expect("build");
+    let server_task = tokio::spawn(async move { server.run().await });
+
+    // Wait for the child to record its PID (proves it installed the trap).
+    let child_pid: i32 = {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(s) = std::fs::read_to_string(&pidfile)
+                && let Some(p) = s.split_whitespace().next().and_then(|x| x.parse().ok())
+            {
+                break p;
+            }
+            assert!(Instant::now() < deadline, "child pid never recorded");
+            sleep(Duration::from_millis(50)).await;
+        }
+    };
+
+    // Tear the supervisor down: abort the run task and await it so
+    // SupervisorState::Drop (the two-step kill) has fully run.
+    server_task.abort();
+    let _ = server_task.await;
+
+    // Give the OS time to reap the SIGKILLed child.
+    sleep(Duration::from_millis(700)).await;
+
+    let still_alive = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("kill -0 {child_pid} 2>/dev/null"))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(
+        !still_alive,
+        "child {child_pid} traps SIGTERM, so teardown's follow-up SIGKILL must kill it"
+    );
+}
+
+#[tokio::test]
 async fn norestart_keeps_server_alive_after_child_exit() {
     // C `norestart` (Rust RestartMode::Disabled): the child exits but
     // the SERVER stays up — only `oneshot` sets shutdownServer. The

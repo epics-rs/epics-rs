@@ -534,3 +534,23 @@ async fn two_clients_share_same_party_line() {
 
     server_task.abort();
 }
+
+#[tokio::test]
+async fn child_exit_code_becomes_server_exit_code() {
+    // C procServ returns the child's last exit code as its own process
+    // exit status (childExitCode → main return, procServ.cc:798,701).
+    // Under one-shot the supervisor runs the child once then exits, so
+    // `run()` resolves to the child's code. `sh -c 'exit 7'` → 7.
+    let port = pick_port().await;
+    let mut cfg = cat_config(port);
+    cfg.child.program = PathBuf::from("/bin/sh");
+    cfg.child.args = vec!["-c".into(), "exit 7".into()];
+    cfg.restart_mode = RestartMode::OneShot;
+    let server = ProcServ::new(cfg).expect("build");
+
+    let code = timeout(Duration::from_secs(5), server.run())
+        .await
+        .expect("one-shot supervisor should exit promptly")
+        .expect("run ok");
+    assert_eq!(code, 7, "server exit code should mirror the child's");
+}

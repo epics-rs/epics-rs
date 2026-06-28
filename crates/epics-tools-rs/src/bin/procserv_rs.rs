@@ -303,11 +303,14 @@ mod app {
             };
 
             // Race the supervisor against the shutdown signal. The
-            // supervisor's own `quit` keystroke also returns Ok(())
-            // from .run(), so either branch ends the process cleanly.
+            // supervisor's own `quit` keystroke also returns from
+            // .run(), so either branch ends the process cleanly.
             tokio::select! {
                 res = server.run() => match res {
-                    Ok(()) => ExitCode::SUCCESS,
+                    // Return the child's last exit code as our own, like
+                    // C procServ (childExitCode, procServ.cc:701). Exit
+                    // codes are 0-255; clamp the byte cast accordingly.
+                    Ok(code) => ExitCode::from(code as u8),
                     Err(e) => {
                         tracing::error!(error = %e, "procserv-rs: runtime error");
                         ExitCode::FAILURE

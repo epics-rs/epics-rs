@@ -67,12 +67,15 @@ impl ProcServ {
         })
     }
 
-    /// Run until shutdown. Returns when:
+    /// Run until shutdown. Returns the last child exit code (procserv's
+    /// own process exit status, C `childExitCode` — `procServ.cc:701`).
+    /// Returns when:
     /// - the configured restart policy refuses a respawn (limit hit)
     /// - the user issues the `quit` keystroke
+    /// - one-shot / no-restart mode ends the supervisor
     /// - SIGTERM/SIGINT arrives (only when running with the daemon
     ///   wrapper that wires those into a shutdown signal)
-    pub async fn run(self) -> ProcServResult<()> {
+    pub async fn run(self) -> ProcServResult<i32> {
         let mut state = SupervisorState::bootstrap(self.config).await?;
         state.event_loop().await
     }
@@ -102,6 +105,11 @@ struct SupervisorState {
     /// the policy (so `OneShot` selected mid-run still launches
     /// once); subsequent exits with `OneShot` exit the supervisor.
     has_run_once: bool,
+    /// Last child exit code, returned as procserv's own process exit
+    /// status on shutdown. Mirrors C `childExitCode`: updated only on a
+    /// normal exit (`WIFEXITED`), so a signal death leaves the prior
+    /// value, and `main` returns it (`procServ.cc:798,701`). Defaults 0.
+    child_exit_code: i32,
     /// A respawn that is waiting out the crash-loop holdoff. Mirrors C
     /// procServ's `_restartTime` deadline (`processFactory.cc:188`): the
     /// child has exited and an auto/one-shot relaunch is due once
@@ -225,6 +233,7 @@ impl SupervisorState {
             log,
             sighup,
             has_run_once: false,
+            child_exit_code: 0,
             pending_restart: None,
             proc_started: Local::now(),
         };
@@ -237,7 +246,7 @@ impl SupervisorState {
         Ok(state)
     }
 
-    async fn event_loop(&mut self) -> ProcServResult<()> {
+    async fn event_loop(&mut self) -> ProcServResult<i32> {
         loop {
             // Snapshot the pending-restart deadline (Copy) before
             // borrowing `self.child` mutably below, so the timer arm
@@ -275,7 +284,7 @@ impl SupervisorState {
                 //    output, especially the kill keystroke).
                 Some((peer_id, event)) = self.inbound_rx.recv() => {
                     if self.handle_inbound(peer_id, event).await? {
-                        return Ok(()); // quit key
+                        return Ok(self.child_exit_code); // quit key
                     }
                 }
 
@@ -284,7 +293,7 @@ impl SupervisorState {
                     if let Some(ev) = ev {
                         match self.handle_child_event(ev).await? {
                             ChildLoopOutcome::Continue => {}
-                            ChildLoopOutcome::Shutdown => return Ok(()),
+                            ChildLoopOutcome::Shutdown => return Ok(self.child_exit_code),
                         }
                     } else {
                         // child rx closed but slot still there — drop it
@@ -433,6 +442,11 @@ impl SupervisorState {
                 // C's SIGCHLD reaper distinguishes a normal exit from a
                 // signal death (procServ.cc:794-805); never collapse a
                 // signal into 128+sig.
+                // C updates childExitCode only under WIFEXITED
+                // (procServ.cc:798); a signal death leaves the prior value.
+                if let ChildExit::Exited(code) = exit {
+                    self.child_exit_code = code;
+                }
                 let detail = match exit {
                     ChildExit::Exited(code) => format!("exit status = {code}"),
                     ChildExit::Signaled(sig) => format!("killed by signal {sig}"),

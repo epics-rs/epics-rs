@@ -142,7 +142,8 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - Impact: C disables logout by default; `^]` does nothing unless `--logoutcmd` is given. Rust defaults `logout_char=0x1d` **enabled**, so a stock Rust server disconnects a client on `0x1d` (a byte many telnet clients send as their own escape) that C passes through to the child. The config comment falsely attributes Rust's behavior to C.
 
 #### PS-12 Kill signal hardcoded SIGKILL; `--killsig` / `-K` absent
-- Severity: DEFECT
+- Severity: DEFECT — CLEARED (this round)
+- Resolution: added `--killsig <n>` (long-only in C; `-K` convenience short like `-F`/`-S`, as 'K' is absent from C's optstring). `build_config` applies C's exact rule (`procServ.cc:346-355`): `i = abs(n)`, accept only `i < 32`, else `tracing::warn!` and keep the SIGKILL default. The vetted value feeds the already-live `ChildConfig.kill_signal` (used at the kill keystroke `supervisor.rs:398` and teardown `:866`). Tests: `killsig_defaults_to_sigkill`, `killsig_sets_signal_number`, `killsig_short_flag_is_accepted`, `killsig_above_31_falls_back_to_default`, `killsig_negative_is_abs`. (Teardown's final hardcoded SIGKILL is the separate PS-22.)
 - Merged from: telnet PS-60, config PS-79
 - Rust: `src/bin/procserv_rs.rs:191` (`kill_signal: 9`, hardcoded; no flag) — `ChildConfig.kill_signal` exists but is wired to a constant
 - C: `procServ.cc:71,243,346-355` (`--killsig <n>` / `-K`, default SIGKILL, validated `<32`)

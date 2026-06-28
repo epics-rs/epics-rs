@@ -148,6 +148,16 @@ mod app {
         #[arg(long, default_value_t = 0)]
         logout_char: u8,
 
+        /// Signal sent to the child on the `^X` kill keystroke and on
+        /// shutdown teardown (C `--killsig`, default SIGKILL = 9). C
+        /// exposes this long-only; `-K` is a Rust convenience short like
+        /// `-F`/`-S`, as 'K' is absent from C's getopt optstring
+        /// (procServ.cc:264). A value ≥ 32 is rejected with a warning and
+        /// the SIGKILL default kept; negative values are abs'd
+        /// (procServ.cc:346-355).
+        #[arg(short = 'K', long = "killsig", value_name = "SIGNUM")]
+        killsig: Option<i32>,
+
         /// Characters to strip from the child's stdin (`-i` / `--ignore`).
         /// `^`-escaping mirrors C (procServ.cc:322-336): `^A`..`^Z` → the
         /// control byte (letter − 64), `^^` → a literal `^`, any other byte
@@ -230,12 +240,32 @@ mod app {
             unix_path: args.unix_path,
         };
 
+        // C `--killsig` (procServ.cc:346-355): `i = abs(atoi(optarg))`;
+        // accept only `i < 32`, else warn to stderr and keep the SIGKILL
+        // default. Validating here keeps the rule at the single config
+        // build, so the supervisor always receives a vetted signal.
+        let kill_signal = match args.killsig {
+            Some(n) => {
+                let i = n.abs();
+                if i < 32 {
+                    i
+                } else {
+                    tracing::warn!(
+                        "procserv-rs: invalid kill signal {i} (>31) - using default ({})",
+                        libc::SIGKILL
+                    );
+                    libc::SIGKILL
+                }
+            }
+            None => libc::SIGKILL,
+        };
+
         let child = ChildConfig {
             name: display_name,
             program,
             args: argv,
             cwd: args.chdir,
-            kill_signal: 9, // SIGKILL — match C default
+            kill_signal,
             // Explicit `--ignore` bytes only; the supervisor auto-adds the
             // command keys (kill/toggle/logout) on top at spawn time.
             ignore_chars: args
@@ -448,6 +478,51 @@ mod app {
                 Args::try_parse_from(["procserv-rs", "--ignore", "^X", "/bin/echo"]).unwrap();
             let cfg = build_config(args).unwrap();
             assert_eq!(cfg.child.ignore_chars, vec![0x18]);
+        }
+
+        /// No `--killsig` → C default SIGKILL (procServ.cc:71).
+        #[test]
+        fn killsig_defaults_to_sigkill() {
+            let args = Args::try_parse_from(["procserv-rs", "/bin/echo"]).unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.child.kill_signal, libc::SIGKILL);
+        }
+
+        /// `--killsig <n>` sets the child's kill signal (e.g. SIGINT=2 for
+        /// a graceful IOC shutdown), the use case config.rs documents.
+        #[test]
+        fn killsig_sets_signal_number() {
+            let args =
+                Args::try_parse_from(["procserv-rs", "--killsig", "2", "/bin/echo"]).unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.child.kill_signal, 2);
+        }
+
+        /// `-K` is the convenience short for `--killsig`.
+        #[test]
+        fn killsig_short_flag_is_accepted() {
+            let args = Args::try_parse_from(["procserv-rs", "-K", "15", "/bin/echo"]).unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.child.kill_signal, 15);
+        }
+
+        /// A signal ≥ 32 is rejected and the SIGKILL default kept
+        /// (C `i < 32` gate, procServ.cc:348-354).
+        #[test]
+        fn killsig_above_31_falls_back_to_default() {
+            let args =
+                Args::try_parse_from(["procserv-rs", "--killsig", "99", "/bin/echo"]).unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.child.kill_signal, libc::SIGKILL);
+        }
+
+        /// A negative signal is abs'd before validation (C `abs(atoi(...))`,
+        /// procServ.cc:347): `--killsig=-2` → 2.
+        #[test]
+        fn killsig_negative_is_abs() {
+            let args = Args::try_parse_from(["procserv-rs", "--killsig=-2", "/bin/echo"]).unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.child.kill_signal, 2);
         }
 
         /// `-n`/`--name` still overrides the default.

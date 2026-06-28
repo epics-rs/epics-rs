@@ -320,18 +320,33 @@ impl ModbusPortDriver {
     /// `absoluteAddressing_` read branch shared by every read accessor.
     fn read_absolute_words(&mut self, addr: i32, count: usize) -> AsynResult<Vec<u16>> {
         let function = self.absolute_read_function()?;
-        self.engine
-            .read_absolute(self.transport.as_mut(), function, addr, count)
-            .map_err(to_asyn)
+        let result = self
+            .engine
+            .read_absolute(self.transport.as_mut(), function, addr, count);
+        // C `doModbusIO` setIntegerParams the statistics counters inline on
+        // every I/O — success OR failure — before it returns
+        // (drvModbusAsyn.cpp:2206/2214/2255/2279/2301). The relative-mode
+        // poller publishes them via `poll_cycle`, but an absolute-addressing
+        // port has no poller (`poll_cycle` early-returns), so the per-record
+        // read is the only place an I/O happens. Publish here too, or the
+        // statistics records read 0 forever (R50).
+        self.publish_stats()?;
+        result.map_err(to_asyn)
     }
 
     /// Absolute-mode per-record write: issue one Modbus request carrying
     /// `regs` at the wire address `addr` with the configured write function.
     fn write_absolute_regs(&mut self, addr: i32, regs: &[u16]) -> AsynResult<()> {
         let function = self.engine.config().function;
-        self.engine
-            .write_absolute(self.transport.as_mut(), function, addr, regs)
-            .map_err(to_asyn)
+        let result = self
+            .engine
+            .write_absolute(self.transport.as_mut(), function, addr, regs);
+        // Publish the statistics counters after the I/O, same as the read
+        // path — C `doModbusIO` setIntegerParams them inline on every write
+        // too (drvModbusAsyn.cpp:2326/2334/2341), and the absolute-mode write
+        // has no poller to publish them otherwise (R50).
+        self.publish_stats()?;
+        result.map_err(to_asyn)
     }
 
     /// One acquisition cycle: read all registers, refresh every touched
@@ -1321,6 +1336,81 @@ mod tests {
         assert!(
             driver.active.is_empty(),
             "absolute reads must not touch the poller `active` set"
+        );
+    }
+
+    /// R50: an absolute-addressing port has no poller, so the statistics
+    /// counters were only ever published from `poll_cycle` and read 0 forever.
+    /// C `doModbusIO` setIntegerParams them inline on every I/O
+    /// (drvModbusAsyn.cpp:2255/2279/2301), so the per-record absolute read must
+    /// publish them too. After one successful absolute read, READ_OK must be 1
+    /// and IO_ERRORS 0.
+    #[test]
+    fn absolute_read_publishes_statistics() {
+        let pdu = [0x01u8, 0x03, 0x04, 0xBE, 0xEF, 0x00, 0x00];
+        let mut driver = ModbusPortDriver::new(
+            "MB_ABS_STATS",
+            test_config(-1, 16),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))])),
+        )
+        .expect("absolute config must build");
+        let data_reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let mut user = AsynUser::new(data_reason);
+        user.addr = 0x2710;
+        driver
+            .read_int32(&user)
+            .expect("absolute read must succeed");
+
+        // The statistics longins read their params (asyn addr 0) on scan.
+        let read_ok_reason = driver.base.find_param(PARAM_READ_OK).unwrap();
+        let io_errors_reason = driver.base.find_param(PARAM_IO_ERRORS).unwrap();
+        assert_eq!(
+            driver.read_int32(&AsynUser::new(read_ok_reason)).unwrap(),
+            1,
+            "READ_OK must be published after an absolute read (R50)"
+        );
+        assert_eq!(
+            driver.read_int32(&AsynUser::new(io_errors_reason)).unwrap(),
+            0,
+        );
+    }
+
+    /// R50 error path: C setIntegerParams P_IOErrors inside `doModbusIO` on a
+    /// transport failure *before* it returns the error (drvModbusAsyn.cpp:
+    /// 2206), so a failed absolute read must still publish IO_ERRORS = 1.
+    #[test]
+    fn absolute_read_failure_publishes_io_errors() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_ABS_STATS_ERR",
+            test_config(-1, 16),
+            LinkType::Tcp,
+            Box::new(ReplayTransport::new(vec![Err(ModbusError::Timeout)])),
+        )
+        .expect("absolute config must build");
+        let data_reason = driver
+            .base
+            .find_param(ModbusDataType::UInt16.as_str())
+            .expect("UINT16 parameter must exist");
+        let mut user = AsynUser::new(data_reason);
+        user.addr = 0x2710;
+        driver
+            .read_int32(&user)
+            .expect_err("a timed-out absolute read must fail");
+
+        let io_errors_reason = driver.base.find_param(PARAM_IO_ERRORS).unwrap();
+        let read_ok_reason = driver.base.find_param(PARAM_READ_OK).unwrap();
+        assert_eq!(
+            driver.read_int32(&AsynUser::new(io_errors_reason)).unwrap(),
+            1,
+            "IO_ERRORS must be published even on a failed absolute read (R50)"
+        );
+        assert_eq!(
+            driver.read_int32(&AsynUser::new(read_ok_reason)).unwrap(),
+            0,
         );
     }
 

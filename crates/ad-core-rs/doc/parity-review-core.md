@@ -1,5 +1,21 @@
 # ad-core-rs vs ADCore (NDArray/driver core) — Review
 
+> **STATUS (2026-06-28): round-1 RAW review — SUPERSEDED, mostly fixed.**
+> The findings below are stated present-tense but are *not* the live open
+> list. They were triaged into the dispositioned **ADC-1..ADC-12** inventory
+> in `doc/c-parity-review-2026-06-15.md` (round 2), where every item is
+> **Fixed / signoff / N-A — zero open**, and closed via the ad-core-rs fix
+> stream. Spot-verified fixed in current source: **B1** convert reverse flag
+> is now cumulative (`ndarray_pool.rs:515` `reverse ^ src.reverse`); **B6**
+> `convert`/`convert_type` now route output through `self.alloc` so it is
+> pool-tracked (`ndarray_pool.rs:376,436`); **B8** `convert_type` now rejects
+> compressed input (`ndarray_pool.rs:425-428`, C `NDArrayPool.cpp:620-625`);
+> **ADC-8** binning sums in the target type (515c1b5c); pool reuse keeps the
+> requested `dataSize` (44295f37). Do NOT treat a present-tense finding here as
+> open without checking the ADC-N inventory AND current source. The one
+> genuine keep-Rust re-design is **G1** NDArray refcount→`Arc<PooledNDArray>`
+> (ownership replaces `reserve`/`release`). Kept verbatim for audit provenance.
+
 Scope: NDArray/driver core only (`ndarray*.rs`, `attributes.rs`, `codec.rs`,
 `color*.rs`, `pixel_cast.rs`, `roi.rs`, `timestamp.rs`, `driver/*`, `params/*`,
 `error.rs`, `runtime.rs`, `lib.rs`). C++ reference: `epics-modules/ADCore/ADApp/ADSrc`.

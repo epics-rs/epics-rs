@@ -37,6 +37,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
+use asyn_rs::interpose::EomReason;
 use asyn_rs::param::ParamType;
 use asyn_rs::port::{PortDriver, PortDriverBase, PortFlags};
 use asyn_rs::runtime::config::RuntimeConfig;
@@ -645,6 +646,22 @@ impl PortDriver for ModbusPortDriver {
         let n = bytes.len().min(buf.len());
         buf[..n].copy_from_slice(&bytes[..n]);
         Ok(n)
+    }
+
+    fn io_read_octet_eom(
+        &mut self,
+        user: &AsynUser,
+        buf: &mut [u8],
+    ) -> AsynResult<(usize, EomReason)> {
+        // C `readOctet` sets `*eomReason = ASYN_EOM_CNT` on every successful
+        // P_Data read (drvModbusAsyn.cpp:1480), and the poller octet callback
+        // passes `ASYN_EOM_CNT` too (:1921): a register-snapshot read is always
+        // a complete logical message, never a stream fragment. The generic
+        // `PortDriver::io_read_octet_eom` only synthesises `CNT` when the buffer
+        // fills, so a modbus string shorter than the record buffer would lose
+        // the flag. Override to flag every successful read complete.
+        let n = self.read_octet(user, buf)?;
+        Ok((n, EomReason::CNT))
     }
 
     fn read_int32_array(&mut self, user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
@@ -1655,6 +1672,47 @@ mod tests {
             &[0x01, 0x03, 0x30, 0x00, 0x00, 0x0A],
             "request must target wire addr 0x3000 with a 10-register count"
         );
+    }
+
+    /// `io_read_octet_eom` must report `ASYN_EOM_CNT` even when the decoded
+    /// string is SHORTER than the record buffer — mirroring C `readOctet`
+    /// (drvModbusAsyn.cpp:1480) which sets `*eomReason = ASYN_EOM_CNT`
+    /// unconditionally. The generic `PortDriver` synthesis would return `empty`
+    /// here because the buffer did not fill (R55).
+    #[test]
+    fn read_octet_eom_always_flags_cnt_for_short_string() {
+        // High bytes spell "ABCD\0FGHIJ": the embedded NUL truncates the
+        // decoded string to 4 chars, well under the 10-char buffer.
+        let chars = b"ABCD\0FGHIJ";
+        let mut pdu = vec![0x01u8, 0x03, (chars.len() * 2) as u8];
+        for &c in chars {
+            pdu.push(c); // high byte = char (StringHigh)
+            pdu.push(0x00); // low byte unused
+        }
+        let transport = ReplayTransport::new(vec![Ok(tcp_response(1, &pdu))]);
+        let mut cfg = test_config(-1, 64);
+        cfg.data_type = ModbusDataType::StringHigh;
+        let mut driver =
+            ModbusPortDriver::new("MB_ABS_STR_EOM", cfg, LinkType::Tcp, Box::new(transport))
+                .expect("absolute config must build");
+        let reason = driver
+            .base
+            .find_param(ModbusDataType::StringHigh.as_str())
+            .expect("STRING_HIGH parameter must exist");
+        let mut user = AsynUser::new(reason);
+        user.addr = 0x3000;
+        let mut buf = [0u8; 10];
+        let (n, eom) = driver
+            .io_read_octet_eom(&user, &mut buf)
+            .expect("absolute octet read must succeed");
+        assert_eq!(n, 4, "string truncates at the embedded NUL to 4 chars");
+        assert!(n < buf.len(), "test must exercise the not-full-buffer case");
+        assert_eq!(
+            eom,
+            EomReason::CNT,
+            "modbus octet read must always flag ASYN_EOM_CNT (R55)"
+        );
+        assert_eq!(&buf[..4], b"ABCD");
     }
 
     /// Absolute-mode `read_int32` issues a fixed-length request of

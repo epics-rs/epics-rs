@@ -50,10 +50,14 @@ record(throttle, "TEST:THR") {
     );
 
     let wait = server.get("TEST:THR.WAIT").await.unwrap();
+    // C `valuePut` clears `prec->wait = FALSE` right after the OUT write
+    // (throttleRecord.c:575): the first value is written immediately, so
+    // WAIT is clear through the cooldown even though the delay timer is
+    // armed. C's WAIT means "an un-written value is pending".
     assert_eq!(
         wait,
-        EpicsValue::Short(1),
-        "WAIT should be 1 during delay period"
+        EpicsValue::Short(0),
+        "WAIT clear after the immediate send — no value queued yet"
     );
 
     // Second put during delay period — must process to queue the value
@@ -65,6 +69,16 @@ record(throttle, "TEST:THR") {
         .await
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    let wait = server.get("TEST:THR.WAIT").await.unwrap();
+    // A value is now queued, un-written: C `process()` set `prec->wait =
+    // TRUE` (:287) and the in-progress delay means `enterValue` never
+    // calls `valuePut` to clear it (:525).
+    assert_eq!(
+        wait,
+        EpicsValue::Short(1),
+        "WAIT set while a value is queued during the delay"
+    );
 
     let sent = server.get("TEST:THR.SENT").await.unwrap();
     assert_eq!(

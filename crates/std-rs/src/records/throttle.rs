@@ -533,9 +533,18 @@ impl Record for ThrottleRecord {
                             value: EpicsValue::Double(self.sent),
                         });
                     }
+                    // C `valuePut` clears `prec->wait = FALSE` immediately
+                    // after the OUT write (throttleRecord.c:575) and only
+                    // THEN re-arms the timer (:592-593). WAIT means "an
+                    // un-written value is pending", not "a delay timer is
+                    // running": the just-drained value is now written, the
+                    // queue is empty (`pending_value` was taken), so WAIT
+                    // stays clear through the new cooldown. A value that
+                    // arrives during it re-sets WAIT in the queue branch
+                    // below.
                     if self.dly > 0.0 {
                         self.delay_active = true;
-                        self.wait = 1;
+                        self.wait = 0;
                         let delay = std::time::Duration::from_secs_f64(self.dly);
                         actions.push(ProcessAction::ReprocessAfter(delay));
                     }
@@ -586,8 +595,13 @@ impl Record for ThrottleRecord {
         // `wait_flag = 1` and returns; the running `delayFuncCb` will
         // call `valuePut()` and send whatever `prec->val` is when it
         // fires. The port stashes the latest limit-checked value (last
-        // value wins, as in C) so the drain re-process sends it. WAIT
-        // stays True; the in-flight ReprocessAfter is left to fire.
+        // value wins, as in C) so the drain re-process sends it. This is
+        // the ONE state where C leaves WAIT set: `process()` set
+        // `prec->wait = TRUE` (throttleRecord.c:287) and, with a delay in
+        // progress, `enterValue` does NOT call `valuePut` (:525), so
+        // nothing clears it — the value is now queued, un-written. WAIT=1
+        // therefore means exactly `pending_value.is_some()`; the
+        // in-flight ReprocessAfter is left to fire.
         if self.delay_active {
             self.pending_value = Some(self.val);
             self.wait = 1;
@@ -614,14 +628,18 @@ impl Record for ThrottleRecord {
         }
 
         // Arm the delay timer (C `callbackRequestDelayed`, lines 592-593)
-        // when DLY > 0. WAIT is True for the duration of the delay: C
-        // sets `prec->wait = TRUE` before enterValue, and although
-        // `valuePut` clears it after the OUT write, the freshly-armed
-        // timer means the operator-visible post-cycle state is Busy
-        // until the drain completes.
+        // when DLY > 0, and clear WAIT. C `process()` sets `prec->wait =
+        // TRUE` before `enterValue` (throttleRecord.c:287), but on this
+        // immediate path `valuePut` runs in the same cycle and clears
+        // `prec->wait = FALSE` right after the OUT write (:575) BEFORE
+        // re-arming the timer. C's WAIT means "an un-written value is
+        // pending", not "a delay timer is running": the value just
+        // written is no longer pending, so WAIT is clear through the
+        // cooldown even though the timer is armed. WAIT is re-set only
+        // when a value is queued during the delay (the branch above).
         if self.dly > 0.0 {
             self.delay_active = true;
-            self.wait = 1;
+            self.wait = 0;
             let delay = std::time::Duration::from_secs_f64(self.dly);
             actions.push(ProcessAction::ReprocessAfter(delay));
             return Ok(ProcessOutcome::complete_with(actions));

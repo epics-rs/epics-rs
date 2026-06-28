@@ -606,6 +606,20 @@ impl PortDriver for ModbusPortDriver {
         Ok(reason)
     }
 
+    fn connect_addr(&mut self, user: &AsynUser) -> AsynResult<()> {
+        // C `connect` (drvModbusAsyn.cpp:455-467) validates the register offset
+        // (the asyn `addr`) against the addressing-mode bounds and returns
+        // `asynError` for an out-of-range offset, so a misconfigured record
+        // fails to connect instead of connecting and alarming on every I/O
+        // (R52). modbus is a multi-device port, so `connect_addr` is the
+        // per-`addr` connect the framework drives; reject before marking the
+        // address connected. The bounds are the same `check_offset` enforces
+        // per I/O (absolute `0..=0xFFFF`, relative `0..length`).
+        self.engine.check_offset(user.addr).map_err(to_asyn)?;
+        self.base.connect_addr(user.addr);
+        Ok(())
+    }
+
     fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
         // C `drvModbusAsyn::readInt32` (drvModbusAsyn.cpp:653-723): only the
         // `P_Data` reason runs the Modbus decode path; every other reason
@@ -1499,6 +1513,60 @@ mod tests {
         assert!(driver.drv_user_create("UINT16=0").is_err());
         // Still rejected: an unknown type name.
         assert!(driver.drv_user_create("NOPE").is_err());
+    }
+
+    /// R52: `connect_addr` rejects an out-of-range register offset (the asyn
+    /// `addr`), mirroring C `connect` (drvModbusAsyn.cpp:455-467) which returns
+    /// `asynError` so a misconfigured record fails to connect rather than
+    /// connecting and alarming on every I/O.
+    #[test]
+    fn connect_addr_rejects_out_of_range_offset() {
+        // Relative mode: valid offsets are 0..length (here 16).
+        let mut relative = ModbusPortDriver::new(
+            "MB_CONN_REL",
+            test_config(0, 16),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("relative config must build");
+        assert!(
+            relative
+                .connect_addr(&AsynUser::new(0).with_addr(5))
+                .is_ok()
+        );
+        assert!(
+            relative
+                .connect_addr(&AsynUser::new(0).with_addr(16))
+                .is_err(),
+            "offset == length is out of range in relative mode"
+        );
+        assert!(
+            relative
+                .connect_addr(&AsynUser::new(0).with_addr(99))
+                .is_err()
+        );
+
+        // Absolute mode: the full 16-bit wire range 0..=0xFFFF is valid.
+        let mut absolute = ModbusPortDriver::new(
+            "MB_CONN_ABS",
+            test_config(-1, 16),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("absolute config must build");
+        assert!(absolute.is_absolute());
+        assert!(
+            absolute
+                .connect_addr(&AsynUser::new(0).with_addr(0xFFFF))
+                .is_ok(),
+            "0xFFFF is the top of the absolute wire range"
+        );
+        assert!(
+            absolute
+                .connect_addr(&AsynUser::new(0).with_addr(0x1_0000))
+                .is_err(),
+            "0x10000 is one past the 16-bit wire range"
+        );
     }
 
     /// Unit-level coverage of the `strtol` base-0 accept/reject set the

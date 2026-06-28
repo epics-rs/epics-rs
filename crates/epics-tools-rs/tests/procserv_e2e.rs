@@ -377,6 +377,60 @@ async fn log_port_client_is_readonly_but_receives_output() {
 }
 
 #[tokio::test]
+async fn logstamp_prefixes_logger_client_stream_not_control() {
+    // PS-9: under `--logstamp` C prepends the timestamp at every newline
+    // on a LOGGER (readonly) client's network stream (procServ.cc:760-761
+    // → `clientItem::Send`, clientFactory.cc:261-279), while a control
+    // (read/write) client receives the bytes verbatim. A literal
+    // `stamp_format` (no `%` specifiers) lets the prefix be asserted
+    // exactly.
+    let ctl_port = pick_port().await;
+    let log_port = pick_port().await;
+    let mut cfg = cat_config(ctl_port);
+    cfg.listen.log_port = Some(log_port);
+    cfg.listen.log_bind = Some(SocketAddr::from(([127, 0, 0, 1], log_port)));
+    cfg.logging.stamp_log = true;
+    cfg.logging.stamp_format = "STAMP> ".into();
+
+    let server = ProcServ::new(cfg).expect("build");
+    let server_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let connect = |port: u16| async move {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(50)).await,
+                Err(e) => panic!("could not connect to {port}: {e}"),
+            }
+        }
+    };
+    let mut ctl = connect(ctl_port).await;
+    let mut log = connect(log_port).await;
+    let _ = read_for(&mut ctl, Duration::from_millis(400)).await;
+    let _ = read_for(&mut log, Duration::from_millis(400)).await;
+
+    // Control types; `cat` echoes the line back as child output, which the
+    // supervisor broadcasts. The logger sees it stamped; control raw.
+    ctl.write_all(b"stamp me\n").await.unwrap();
+    let log_seen = read_until(&mut log, "stamp me", Duration::from_secs(2)).await;
+    let ctl_seen = read_until(&mut ctl, "stamp me", Duration::from_secs(2)).await;
+
+    assert!(
+        log_seen.contains("STAMP> stamp me"),
+        "logger stream must be timestamped under --logstamp, got: {log_seen:?}"
+    );
+    assert!(
+        !ctl_seen.contains("STAMP>"),
+        "control client must NOT be stamped, got: {ctl_seen:?}"
+    );
+
+    server_task.abort();
+}
+
+#[tokio::test]
 async fn timefmt_controls_banner_timestamp_format() {
     // C `--timefmt` sets `timeFormat` (procServ.cc:254,303-305), used to
     // render the banner start-time lines (clientFactory.cc:124-130). A

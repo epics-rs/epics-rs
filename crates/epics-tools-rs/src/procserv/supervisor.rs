@@ -50,7 +50,7 @@ use crate::procserv::menu::{Action, scan as menu_scan};
 use crate::procserv::messages;
 use crate::procserv::restart::{RestartMode, RestartTracker};
 use crate::procserv::sidecar::{
-    InfoSnapshot, LogFile, remove_pid_file, render_procserv_info_env, write_info_file,
+    InfoSnapshot, LogFile, remove_pid_file, render_procserv_info_env, stamp_lines, write_info_file,
     write_pid_file,
 };
 
@@ -145,6 +145,13 @@ struct ClientEntry {
     /// welcome banner's connected-peer counts (user vs logger), so this
     /// field is live rather than purely future-facing.
     meta: ClientMeta,
+    /// Mid-line state for `--logstamp` on this client's network stream:
+    /// `true` ⟹ the last byte sent was not a newline, so the next chunk
+    /// continues the line without a fresh timestamp. Per-client, mirroring
+    /// C's `_log_stamp_sent` member (`clientFactory.cc:138`). Only logger
+    /// (readonly) clients are stamped, so it stays `false` for control
+    /// clients.
+    stamp_in_line: bool,
 }
 
 struct ChildSlot {
@@ -620,6 +627,7 @@ impl SupervisorState {
             ClientEntry {
                 out_tx,
                 meta: meta.clone(),
+                stamp_in_line: false,
             },
         );
         tracing::debug!(client = meta.id.raw(), peer = ?meta.peer, readonly = meta.readonly, "procserv-rs: client connected");
@@ -700,12 +708,18 @@ impl SupervisorState {
     /// - [`Origin::Server`] / [`Origin::Child`] — a NULL (server `@@@`
     ///   annotation) or process (child output) sender reaches every
     ///   connected client (`procServ.cc:759-763`) and the log/debug
-    ///   stream (`procServ.cc:725-749`), never the child itself.
+    ///   stream (`procServ.cc:725-749`), never the child itself. Under
+    ///   `--logstamp` each logger (readonly) client's stream is prefixed
+    ///   with the timestamp at every newline, exactly as C stamps only
+    ///   `isLogger()` connections (`procServ.cc:760-761` →
+    ///   `clientItem::Send`, `clientFactory.cc:261-279`); control clients
+    ///   get the bytes verbatim.
     ///
     /// This method is the single owner of the recipient matrix, so the
     /// rule that a client's keystrokes never reach other clients holds
-    /// by construction rather than per call site.
-    async fn send_to_all(&self, bytes: &[u8], origin: Origin) {
+    /// by construction rather than per call site. Takes `&mut self`
+    /// because logger stamping mutates each client's mid-line state.
+    async fn send_to_all(&mut self, bytes: &[u8], origin: Origin) {
         if let Origin::Client = origin {
             // Client → child only (C's loop forwards a non-process
             // sender's bytes solely to the process recipient,
@@ -721,11 +735,29 @@ impl SupervisorState {
         // Server or child sender → every network client + the log,
         // never the child (C procServ.cc:759-763 for clients, :725 for
         // the log; the child branch excludes a process/NULL sender).
-        for entry in self.clients.values() {
-            let _ = entry
-                .out_tx
-                .send(OutboundFrame::Bytes(bytes.to_vec()))
-                .await;
+        //
+        // C computes one timestamp per `SendToAll` and shares it between
+        // the log file and the logger clients (procServ.cc:715-722). We
+        // compute it once here too; the log file re-stamps with its own
+        // `Local::now()` read inside `write_chunk`, so the file and a
+        // logger socket can differ by the sub-microsecond gap between the
+        // two reads (only observable across a 1-second boundary — a
+        // documented residual, PS-9).
+        let stamp = self.config.logging.stamp_log.then(|| {
+            Local::now()
+                .format(&self.config.logging.stamp_format)
+                .to_string()
+        });
+        for entry in self.clients.values_mut() {
+            let frame = match &stamp {
+                // Logger client under --logstamp: prefix each new line.
+                Some(s) if entry.meta.readonly => {
+                    OutboundFrame::Bytes(stamp_lines(bytes, s.as_bytes(), &mut entry.stamp_in_line))
+                }
+                // Control client, or stamping off: verbatim bytes.
+                _ => OutboundFrame::Bytes(bytes.to_vec()),
+            };
+            let _ = entry.out_tx.send(frame).await;
         }
         if let Some(log) = &self.log
             && let Err(e) = log.write_chunk(bytes).await

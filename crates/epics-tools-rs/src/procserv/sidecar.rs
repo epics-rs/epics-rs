@@ -30,6 +30,34 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::procserv::config::ListenConfig;
 use crate::procserv::error::{ProcServError, ProcServResult};
 
+/// Prefix every new line in `chunk` with `stamp`, tracking mid-line
+/// state across calls via `in_line`. This is the one stamp-at-newline
+/// algorithm C applies in two places — the log file write
+/// (`procServ.cc:732-744`) and each logger client's stream
+/// (`clientItem::Send`, `clientFactory.cc:264-276`) — each with its own
+/// `_log_stamp_sent` flag. A stamp is emitted only at the start of a
+/// line, so a chunk that does not end in `\n` leaves `*in_line == true`
+/// and the next chunk continues the line without a fresh stamp.
+pub(crate) fn stamp_lines(chunk: &[u8], stamp: &[u8], in_line: &mut bool) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::with_capacity(chunk.len() + stamp.len());
+    let mut prev = 0usize;
+    for (i, &b) in chunk.iter().enumerate() {
+        if !*in_line {
+            buf.extend_from_slice(stamp);
+            *in_line = true;
+        }
+        if b == b'\n' {
+            buf.extend_from_slice(&chunk[prev..=i]);
+            prev = i + 1;
+            *in_line = false;
+        }
+    }
+    if prev < chunk.len() {
+        buf.extend_from_slice(&chunk[prev..]);
+    }
+    buf
+}
+
 /// Per-line writer to the supervisor log. Wraps a file with timestamp
 /// prefixing — every line emitted by the child PTY is prefixed with
 /// the configured timestamp format. Multiple writers are serialized
@@ -131,24 +159,8 @@ impl LogFile {
         // would refuse to schedule it.
         let out: Vec<u8> = {
             let stamp = self.format_stamp();
-            let mut buf: Vec<u8> = Vec::with_capacity(chunk.len() + 32);
             let mut in_line = self.in_line.lock();
-            let mut prev = 0usize;
-            for (i, &b) in chunk.iter().enumerate() {
-                if !*in_line {
-                    buf.extend_from_slice(stamp.as_bytes());
-                    *in_line = true;
-                }
-                if b == b'\n' {
-                    buf.extend_from_slice(&chunk[prev..=i]);
-                    prev = i + 1;
-                    *in_line = false;
-                }
-            }
-            if prev < chunk.len() {
-                buf.extend_from_slice(&chunk[prev..]);
-            }
-            buf
+            stamp_lines(chunk, stamp.as_bytes(), &mut in_line)
         }; // in_line guard dropped here
 
         // Hold file lock across the IO; tokio mutex serializes
@@ -319,6 +331,28 @@ pub fn listen_addresses(listen: &ListenConfig) -> Vec<ListenAddress> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stamp_lines_prefixes_each_new_line_and_tracks_continuation() {
+        // The shared stamp-at-newline helper (C's loop, procServ.cc:732-744
+        // / clientFactory.cc:264-276). Boundaries: full lines, a partial
+        // chunk that leaves the line open, and the continuation that
+        // completes it without a fresh stamp.
+        let mut in_line = false;
+        let a = stamp_lines(b"line1\nline2\n", b"S> ", &mut in_line);
+        assert_eq!(a, b"S> line1\nS> line2\n");
+        assert!(!in_line, "a trailing newline closes the line");
+
+        // Partial chunk: stamped at the start, no newline → stays open.
+        let b = stamp_lines(b"partial", b"S> ", &mut in_line);
+        assert_eq!(b, b"S> partial");
+        assert!(in_line, "no newline ⟹ line still open");
+
+        // Continuation: NO new stamp until the next newline.
+        let c = stamp_lines(b" continued\n", b"S> ", &mut in_line);
+        assert_eq!(c, b" continued\n");
+        assert!(!in_line);
+    }
 
     #[test]
     fn info_file_matches_manage_procs_format() {

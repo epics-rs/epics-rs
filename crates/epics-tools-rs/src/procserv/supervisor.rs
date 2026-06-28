@@ -749,7 +749,16 @@ impl SupervisorState {
                 .format(&self.config.logging.stamp_format)
                 .to_string()
         });
-        for entry in self.clients.values_mut() {
+        // Bound each client send at C's SO_SNDTIMEO (10s, clientFactory.cc:147)
+        // so a stuck/dead peer cannot wedge the whole party-line on an
+        // unbounded `.await` — the PS-25 head-of-line block. A client whose
+        // 64-deep channel stays full for the timeout (its write task pending
+        // on a dead socket) is dropped, exactly as C marks a timed-out client
+        // `_markedForDeletion` and moves on. A healthy client drains within
+        // the buffer and never hits the timeout. Removal is deferred until
+        // after the loop so the iteration borrow stays valid.
+        let mut dead: Vec<ClientId> = Vec::new();
+        for (id, entry) in self.clients.iter_mut() {
             let frame = match &stamp {
                 // Logger client under --logstamp: prefix each new line.
                 Some(s) if entry.meta.readonly => {
@@ -758,7 +767,19 @@ impl SupervisorState {
                 // Control client, or stamping off: verbatim bytes.
                 _ => OutboundFrame::Bytes(bytes.to_vec()),
             };
-            let _ = entry.out_tx.send(frame).await;
+            if !send_bounded(&entry.out_tx, frame, CLIENT_SEND_TIMEOUT).await {
+                tracing::warn!(
+                    client = id.raw(),
+                    "procserv-rs: client send stalled or closed; dropping"
+                );
+                dead.push(*id);
+            }
+        }
+        for id in dead {
+            // Dropping the entry closes its outbound channel, ending the
+            // write task and shutting the socket; the read task then reaps
+            // itself on EOF (its later `Disconnected` remove is a no-op).
+            self.clients.remove(&id);
         }
         if let Some(log) = &self.log
             && let Err(e) = log.write_chunk(bytes).await
@@ -794,6 +815,31 @@ impl SupervisorState {
 enum ChildLoopOutcome {
     Continue,
     Shutdown,
+}
+
+/// Per-client fanout send bound. C arms `SO_SNDTIMEO` at 10s on every
+/// accepted socket (`clientFactory.cc:147`) so a blocking `write()` to a
+/// wedged peer cannot hang the process; on timeout it sets
+/// `_markedForDeletion` and drops the client. tokio sockets are
+/// non-blocking, so the async analogue of that timeout is bounding the
+/// channel send here.
+const CLIENT_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Push one frame to a client's write task, bounded by `timeout`. Returns
+/// `false` when the client should be dropped: either the channel is closed
+/// (write task already gone) or the buffer stayed full for the whole
+/// timeout (peer not draining — C's `SO_SNDTIMEO` expiry). Returns `true`
+/// once the frame is queued. Factored out so the timeout boundary is unit
+/// testable without a real 10s wait.
+async fn send_bounded(
+    tx: &mpsc::Sender<OutboundFrame>,
+    frame: OutboundFrame,
+    timeout: std::time::Duration,
+) -> bool {
+    matches!(
+        tokio::time::timeout(timeout, tx.send(frame)).await,
+        Ok(Ok(())),
+    )
 }
 
 /// Run the accept loop for one [`Endpoint`], dispatching to the TCP or
@@ -890,9 +936,12 @@ impl Drop for SupervisorState {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_ignore_chars, remaining_holdoff};
-    use crate::procserv::config::KeyBindings;
+    use super::{effective_ignore_chars, remaining_holdoff, send_bounded};
+    use crate::procserv::client::OutboundFrame;
     use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    use crate::procserv::config::KeyBindings;
 
     fn full_keys() -> KeyBindings {
         KeyBindings {
@@ -974,6 +1023,53 @@ mod tests {
         assert_eq!(
             remaining_holdoff(Duration::from_secs(15), Duration::from_secs(3600)),
             Duration::ZERO
+        );
+    }
+
+    // PS-25: a client whose write task drains keeps `send_bounded` true; a
+    // closed channel or a buffer that stays full for the timeout returns
+    // false so the supervisor drops the client (C SO_SNDTIMEO expiry).
+    #[tokio::test]
+    async fn send_bounded_queues_when_buffer_has_room() {
+        let (tx, mut rx) = mpsc::channel::<OutboundFrame>(1);
+        let ok = send_bounded(
+            &tx,
+            OutboundFrame::Bytes(b"x".to_vec()),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(ok, "send into an empty buffer must succeed");
+        assert!(matches!(rx.recv().await, Some(OutboundFrame::Bytes(_))));
+    }
+
+    #[tokio::test]
+    async fn send_bounded_drops_on_closed_channel() {
+        let (tx, rx) = mpsc::channel::<OutboundFrame>(1);
+        drop(rx); // write task gone
+        let ok = send_bounded(
+            &tx,
+            OutboundFrame::Bytes(b"x".to_vec()),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(!ok, "send to a closed channel must report the client dead");
+    }
+
+    #[tokio::test]
+    async fn send_bounded_drops_on_full_buffer_timeout() {
+        // Fill the single slot, then a second send blocks until the (tiny)
+        // timeout elapses — the wedged-peer case. No receiver ever drains.
+        let (tx, _rx) = mpsc::channel::<OutboundFrame>(1);
+        tx.send(OutboundFrame::Bytes(b"a".to_vec())).await.unwrap();
+        let ok = send_bounded(
+            &tx,
+            OutboundFrame::Bytes(b"b".to_vec()),
+            Duration::from_millis(20),
+        )
+        .await;
+        assert!(
+            !ok,
+            "a buffer that stays full past the timeout drops the client"
         );
     }
 }

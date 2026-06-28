@@ -130,12 +130,47 @@ pub fn spawn_client(
     let (out_tx, out_rx) = mpsc::channel::<OutboundFrame>(64);
 
     match incoming.stream {
-        ClientStream::Tcp(s) => spawn_split(s, id, incoming.readonly, inbound_tx, out_rx),
+        ClientStream::Tcp(s) => {
+            // C enables SO_KEEPALIVE on every accepted client socket
+            // (clientFactory.cc:146) so a silently-dropped peer (cable
+            // pull) is eventually surfaced as a write error instead of
+            // pending forever. UNIX sockets have no meaningful keepalive,
+            // so this is TCP-only, as in C.
+            set_keepalive(&s);
+            spawn_split(s, id, incoming.readonly, inbound_tx, out_rx)
+        }
         #[cfg(unix)]
         ClientStream::Unix(s) => spawn_split(s, id, incoming.readonly, inbound_tx, out_rx),
     }
 
     (meta, out_tx)
+}
+
+/// Enable `SO_KEEPALIVE` on a TCP client socket (C `clientFactory.cc:146`).
+/// tokio's `TcpStream` exposes no keepalive setter, so go through the raw
+/// fd. A failure is logged and tolerated — keepalive is a liveness
+/// optimization, not a correctness requirement.
+fn set_keepalive(stream: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    let on: libc::c_int = 1;
+    // SAFETY: `stream` owns a valid open socket fd for the duration of the
+    // borrow; `setsockopt` with a `c_int` optval is the standard
+    // SO_KEEPALIVE call and does not retain the pointer.
+    let rc = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            std::ptr::addr_of!(on).cast(),
+            std::mem::size_of_val(&on) as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        tracing::debug!(
+            error = %std::io::Error::last_os_error(),
+            "procserv-rs: SO_KEEPALIVE failed"
+        );
+    }
 }
 
 /// Generic helper that splits any AsyncRead+AsyncWrite stream and
@@ -247,6 +282,30 @@ mod tests {
         let (server, _) = listener.accept().await.unwrap();
         let client = connect.await.unwrap();
         (server, client)
+    }
+
+    /// PS-25: `set_keepalive` must actually set `SO_KEEPALIVE` on the
+    /// socket. Read it back with `getsockopt`.
+    #[tokio::test]
+    async fn set_keepalive_enables_so_keepalive() {
+        use std::os::fd::AsRawFd;
+        let (server, _client) = paired_streams().await;
+        set_keepalive(&server);
+
+        let mut val: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: valid fd, correctly-sized optval/optlen out-params.
+        let rc = unsafe {
+            libc::getsockopt(
+                server.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_KEEPALIVE,
+                std::ptr::addr_of_mut!(val).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt failed");
+        assert_ne!(val, 0, "SO_KEEPALIVE not enabled");
     }
 
     #[tokio::test]

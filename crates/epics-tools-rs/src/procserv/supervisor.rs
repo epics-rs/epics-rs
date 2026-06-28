@@ -96,6 +96,14 @@ struct SupervisorState {
     child: Option<ChildSlot>,
     restart_mode: RestartMode,
     restart_tracker: RestartTracker,
+    /// C `firstRun` (`procServ.cc:59`): "has the child run for the purpose
+    /// of oneshot mode". `true` ⟹ a launch is owed that must NOT count as
+    /// the oneshot run. Set at startup (`procServ.cc:597`) and whenever the
+    /// operator toggles *into* oneshot mid-run (`clientFactory.cc:226-227`,
+    /// granting exactly one more launch), and cleared by the single launch
+    /// owner [`Self::respawn_child`] after each spawn (`procServ.cc:665`).
+    /// Only the `OneShot` exit arm reads it; `OnExit`/`Disabled` ignore it.
+    first_run: bool,
     log: Option<LogFile>,
     /// SIGHUP stream. A hangup means "reopen the log file" (logrotate),
     /// NOT shutdown — C `OnSigHup` → `openLogFile()`
@@ -230,6 +238,10 @@ impl SupervisorState {
             clients: HashMap::new(),
             child: None,
             restart_tracker: RestartTracker::new(),
+            // C `firstRun = true` (procServ.cc:597), cleared by the first
+            // `respawn_child` below — so the initial child's exit "counts"
+            // and `-o`/oneshot at startup runs the child exactly once.
+            first_run: true,
             log,
             sighup,
             child_exit_code: 0,
@@ -405,6 +417,16 @@ impl SupervisorState {
                         }
                         Action::ToggleRestartMode => {
                             self.restart_mode = self.restart_mode.next();
+                            // C sets `firstRun = true` when toggling INTO
+                            // oneshot (clientFactory.cc:226-227) so the child
+                            // is granted exactly one more run after the
+                            // current exit; only the *next* exit shuts the
+                            // server. The toggle cycle reaches oneshot only
+                            // via Disabled→OneShot, so keying on the new mode
+                            // is equivalent to C's `norestart→oneshot` branch.
+                            if self.restart_mode == RestartMode::OneShot {
+                                self.first_run = true;
+                            }
                             let msg = format!(
                                 "\r\n@@@ Toggled auto restart mode to {}\r\n",
                                 self.restart_mode.label()
@@ -493,8 +515,8 @@ impl SupervisorState {
                 )
                 .await;
 
-                match self.restart_mode {
-                    RestartMode::OnExit => {
+                match exit_disposition(self.restart_mode, self.first_run) {
+                    ExitDisposition::AutoRestart => {
                         match self.restart_tracker.try_record(&self.config.restart) {
                             Ok(()) => {
                                 // Schedule the relaunch behind the holdoff
@@ -510,18 +532,19 @@ impl SupervisorState {
                             }),
                         }
                     }
-                    RestartMode::OneShot => {
-                        // C `oneshot`: the child launches once, and the
-                        // first exit shuts the server down — `needsRestart`
-                        // sees `oneshot && !firstRun` (firstRun is cleared
-                        // right after the first launch) and sets
-                        // `shutdownServer` (procServ.cc:656-658,
-                        // processFactory.cc:51). The supervisor only reaches
-                        // this arm after a real spawn, so the child has
-                        // already run once; exit ⟹ shut down.
-                        Ok(ChildLoopOutcome::Shutdown)
+                    ExitDisposition::OneShotRerun => {
+                        // C's oneshot "one more run" granted by a mid-run
+                        // toggle into oneshot (clientFactory.cc:226-227):
+                        // relaunch behind the same holdoff C applies via
+                        // `_restartTime` (processFactory.cc:188), keeping
+                        // keystrokes live during the wait. `respawn_child`
+                        // clears `first_run`, so the next exit shuts down.
+                        // No crash-loop cap here — C has no restart limit,
+                        // and this is a single operator-requested run.
+                        self.schedule_restart(started_at);
+                        Ok(ChildLoopOutcome::Continue)
                     }
-                    RestartMode::Disabled => {
+                    ExitDisposition::StayDead => {
                         // C `norestart`: the child stays dead but the
                         // SERVER stays up. processFactoryNeedsRestart()
                         // returns false forever after the first launch
@@ -532,6 +555,7 @@ impl SupervisorState {
                         // exits the server, never `norestart`.
                         Ok(ChildLoopOutcome::Continue)
                     }
+                    ExitDisposition::Shutdown => Ok(ChildLoopOutcome::Shutdown),
                 }
             }
         }
@@ -601,6 +625,10 @@ impl SupervisorState {
         // this transition) so a manual restart that fires mid-holdoff
         // cancels the pending auto relaunch instead of double-spawning.
         self.pending_restart = None;
+        // C clears `firstRun` after every (re)launch (procServ.cc:665-667):
+        // the launch this owns is the oneshot "one more run", so its own
+        // exit must now count toward the oneshot shutdown.
+        self.first_run = false;
         // C `processClass` ctor, parent branch (processFactory.cc:193-196):
         // the new child PID line followed by the ruler.
         self.send_to_all(
@@ -817,6 +845,35 @@ enum ChildLoopOutcome {
     Shutdown,
 }
 
+/// What a child exit means for the supervisor — the pure core of C's
+/// `processFactoryNeedsRestart` gate (`procServ.cc:654-669`,
+/// `processFactory.cc:51`). Extracted from `handle_child_event` so the
+/// oneshot off-by-one (PS-20) is unit-testable without a live child.
+#[derive(Debug, PartialEq, Eq)]
+enum ExitDisposition {
+    /// `restart`: relaunch after the holdoff, subject to the Rust-only
+    /// crash-loop cap (`RestartTracker`).
+    AutoRestart,
+    /// `oneshot` with `first_run` still set: relaunch exactly once more
+    /// (the run granted by a mid-run toggle into oneshot), no cap.
+    OneShotRerun,
+    /// `norestart`: leave the child dead but keep the server up.
+    StayDead,
+    /// `oneshot` with the granted run already spent: shut the server down.
+    Shutdown,
+}
+
+/// Map (restart mode, oneshot `first_run`) to the exit disposition. Only
+/// `OneShot` consults `first_run`; `OnExit`/`Disabled` ignore it.
+fn exit_disposition(mode: RestartMode, first_run: bool) -> ExitDisposition {
+    match mode {
+        RestartMode::OnExit => ExitDisposition::AutoRestart,
+        RestartMode::Disabled => ExitDisposition::StayDead,
+        RestartMode::OneShot if first_run => ExitDisposition::OneShotRerun,
+        RestartMode::OneShot => ExitDisposition::Shutdown,
+    }
+}
+
 /// Per-client fanout send bound. C arms `SO_SNDTIMEO` at 10s on every
 /// accepted socket (`clientFactory.cc:147`) so a blocking `write()` to a
 /// wedged peer cannot hang the process; on timeout it sets
@@ -936,8 +993,11 @@ impl Drop for SupervisorState {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_ignore_chars, remaining_holdoff, send_bounded};
+    use super::{
+        ExitDisposition, effective_ignore_chars, exit_disposition, remaining_holdoff, send_bounded,
+    };
     use crate::procserv::client::OutboundFrame;
+    use crate::procserv::restart::RestartMode;
     use std::time::Duration;
     use tokio::sync::mpsc;
 
@@ -1023,6 +1083,52 @@ mod tests {
         assert_eq!(
             remaining_holdoff(Duration::from_secs(15), Duration::from_secs(3600)),
             Duration::ZERO
+        );
+    }
+
+    // PS-20: the oneshot off-by-one. `first_run` only matters for OneShot;
+    // it grants exactly one more run (the mid-run-toggle grant), and once
+    // spent the next exit shuts down.
+    #[test]
+    fn exit_disposition_onexit_always_restarts() {
+        assert_eq!(
+            exit_disposition(RestartMode::OnExit, true),
+            ExitDisposition::AutoRestart
+        );
+        assert_eq!(
+            exit_disposition(RestartMode::OnExit, false),
+            ExitDisposition::AutoRestart
+        );
+    }
+
+    #[test]
+    fn exit_disposition_disabled_stays_dead() {
+        assert_eq!(
+            exit_disposition(RestartMode::Disabled, true),
+            ExitDisposition::StayDead
+        );
+        assert_eq!(
+            exit_disposition(RestartMode::Disabled, false),
+            ExitDisposition::StayDead
+        );
+    }
+
+    #[test]
+    fn exit_disposition_oneshot_first_run_grants_one_rerun() {
+        // Mid-run toggle into oneshot set first_run: relaunch once more.
+        assert_eq!(
+            exit_disposition(RestartMode::OneShot, true),
+            ExitDisposition::OneShotRerun
+        );
+    }
+
+    #[test]
+    fn exit_disposition_oneshot_spent_shuts_down() {
+        // first_run already cleared (child started in oneshot, or the
+        // granted rerun already happened): exit shuts the server down.
+        assert_eq!(
+            exit_disposition(RestartMode::OneShot, false),
+            ExitDisposition::Shutdown
         );
     }
 

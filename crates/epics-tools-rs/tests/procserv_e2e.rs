@@ -858,3 +858,87 @@ async fn child_exit_code_becomes_server_exit_code() {
         .expect("run ok");
     assert_eq!(code, 7, "server exit code should mirror the child's");
 }
+
+#[tokio::test]
+async fn toggle_into_oneshot_grants_one_more_run() {
+    // PS-20. C clientFactory.cc:226-227: toggling INTO oneshot sets
+    // firstRun=true, granting the child exactly one more launch after the
+    // current exit; only the *next* exit shuts the server down
+    // (procServ.cc:656-667). Start in OnExit so the toggle cycle reaches
+    // oneshot via OnExit→Disabled→OneShot.
+    let port = pick_port().await;
+    let mut cfg = cat_config(port);
+    cfg.restart_mode = RestartMode::OnExit;
+    cfg.holdoff = Duration::from_millis(50);
+
+    let server = ProcServ::new(cfg).expect("build");
+    let server_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut conn = {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(50)).await,
+                Err(e) => panic!("could not connect: {e}"),
+            }
+        }
+    };
+    // Drain the banner + the first child's "@@@ The PID of new child".
+    let _ = read_until(&mut conn, "The PID of new child", Duration::from_secs(2)).await;
+
+    // ^T → OnExit→Disabled (OFF); ^T → Disabled→OneShot (sets first_run).
+    conn.write_all(&[0x14]).await.unwrap();
+    let off = read_until(
+        &mut conn,
+        "Toggled auto restart mode to OFF",
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(
+        off.contains("Toggled auto restart mode to OFF"),
+        "got: {off:?}"
+    );
+    conn.write_all(&[0x14]).await.unwrap();
+    let on = read_until(
+        &mut conn,
+        "Toggled auto restart mode to ONESHOT",
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(
+        on.contains("Toggled auto restart mode to ONESHOT"),
+        "got: {on:?}"
+    );
+
+    // First kill: the child exits but oneshot+first_run grants one more
+    // run — a SECOND "@@@ The PID of new child" must appear (no shutdown).
+    conn.write_all(&[0x18]).await.unwrap();
+    let relaunch = read_until(&mut conn, "The PID of new child", Duration::from_secs(3)).await;
+    assert!(
+        relaunch.contains("The PID of new child"),
+        "toggle-into-oneshot must grant one more run, got: {relaunch:?}"
+    );
+
+    // Second kill: the granted run is spent (first_run cleared by the
+    // relaunch's respawn_child) — this exit shuts the server down.
+    conn.write_all(&[0x18]).await.unwrap();
+    let shutdown = read_until(
+        &mut conn,
+        "oneshot mode: server will exit",
+        Duration::from_secs(3),
+    )
+    .await;
+    assert!(
+        shutdown.contains("oneshot mode: server will exit"),
+        "spent oneshot must shut the server down, got: {shutdown:?}"
+    );
+
+    // run() resolves once the spent oneshot shuts the supervisor down.
+    timeout(Duration::from_secs(3), server_task)
+        .await
+        .expect("supervisor should exit after the spent oneshot")
+        .expect("server task join");
+}

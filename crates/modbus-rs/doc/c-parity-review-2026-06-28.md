@@ -155,19 +155,19 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
 - `poll_delay.template` binds an `ao` to POLL_DELAY; C retunes the poll period live,
   Rust fails the write (WRITE/INVALID alarm) and the period stays frozen.
 
-### R47 — ENABLE_HISTOGRAM rising edge does not clear the histogram
+### R47 — ENABLE_HISTOGRAM rising edge does not clear the histogram — CLEARED (c8345ecb)
 - **Severity:** CONCERN (stale diagnostic counts carried across re-enable)
 - **Rust:** `ioc.rs:819-822` (only sets `histogram_enabled`)
 - **C:** `drvModbusAsyn.cpp:633-641` (on OFF→ON, zeros `timeHistogram_` before enabling)
 
-### R48 — HISTOGRAM_BIN_TIME change does not clear the histogram (R47 family)
+### R48 — HISTOGRAM_BIN_TIME change does not clear the histogram (R47 family) — CLEARED (e6b106d7)
 - **Severity:** CONCERN (stale counts misattributed to new bins)
 - **Rust:** `ioc.rs:785-788` (sets `histogram_ms_per_bin` only)
 - **C:** `drvModbusAsyn.cpp:794-803` (sets, clamps `<1→1`, then erases `timeHistogram_`)
 - The axis rebuild is unneeded in Rust (axis computed on demand `ioc.rs:629-636`); the
   count erase is the missing part.
 
-### R49 — READ_HISTOGRAM / HISTOGRAM_TIME_AXIS not served on Float64Array
+### R49 — READ_HISTOGRAM / HISTOGRAM_TIME_AXIS not served on Float64Array — CLEARED (0067a437)
 - **Severity:** CONCERN (missing route; aai/waveform FTVL=DOUBLE binding errors)
 - **Rust:** `ioc.rs:670-671` (`read_float64_array` does `datatype_of(reason)?` with no
   histogram case; only `read_int32_array` handles them at `ioc.rs:621-636`)

@@ -365,6 +365,14 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - C: `procServ.h:67` (`CTL_SC` `%c` writes the raw byte)
 - Disposition: a key bound to a byte ≥ 0x80 renders as a 2-byte UTF-8 sequence vs C's one raw byte. Not reachable with default keys; left as a documented residual rather than reworking the `String`-based builders for an exotic binding.
 
+#### PS-47 C strips a raw `NUL` from child stdin via the `index()` terminator quirk; Rust does not
+- Severity: NOTE (telnet-layer concern, distinct from PS-10; do NOT copy the C quirk)
+- Found: round-3 caucus review (rev-ps-process) of the PS-10 landing
+- Rust: `src/procserv/child.rs` `write_stdin` filter (`!ignore_chars.contains(b)`); `src/procserv/telnet.rs` (IAC-only strip, no CR-NUL translation)
+- C: `processFactory.cc:256-261` (`index(ignChars, buf[i]) == NULL` copy gate — `index`/`strchr` also matches the string's `'\0'` terminator)
+- Impact: C's filter uses `index(ignChars, byte)`, which returns non-NULL for `byte == 0x00` because it matches `ignChars`'s terminating NUL — so whenever `ignChars` is non-empty (the default, since kill/toggle are set) C silently drops every raw `NUL` byte from child stdin. Rust's `contains` only drops bytes explicitly in the set, so a bare `NUL` reaches the child. Reachable: a telnet client sending a bare CR encodes it as `CR NUL` (RFC 854); libtelnet/`telnet.rs` both deliver `\r\0` as data (neither translates CR-NUL→CR), so the child sees `\r\0` in Rust vs `\r` in C-default.
+- Disposition: C's NUL-stripping is an UNINTENTIONAL artifact of `index()` matching the terminator — it is conditional on `ignChars` being non-empty (disable all command keys and C stops stripping NUL too), so it is plainly not a deliberate telnet feature. Copying it would be bug-copying (steering: find divergences, don't copy C's bugs). The legitimate underlying question — should procServ translate telnet `CR NUL`→`CR` before feeding the child — belongs to the telnet input layer (`client.rs`/`telnet.rs`), not the ignore filter, and is its own future finding if pursued. Impact is negligible (shells ignore NUL; most clients send CR-LF). Recorded so it is not mistaken for a strip-path gap in PS-10.
+
 ---
 
 ## Review Log
@@ -468,3 +476,39 @@ Intentional / residual, no code change:
 
 `epics-tools-rs` after this round: 74 nextest green, clippy `-D warnings`
 clean. Nothing pushed.
+
+### Round 3 — 2026-06-28 — party-line cluster review (caucus round 01KW79D3F7NPK9XR7QGX7V8S1W)
+
+Two read-only opus reviewers byte-traced the party-line cluster (PS-8/PS-9/PS-10)
+against `procServ.cc`/`clientFactory.cc`/`processFactory.cc`. **Verdict: all three
+fixes byte-faithful to upstream C — no DEFECT, no CONCERN.**
+
+- **rev-ps-conn** (PS-8 routing + PS-9 stamping): confirmed `send_to_all(Origin)`
+  reproduces C `SendToAll`'s recipient matrix exactly (client→child-only with no
+  log write; server/child→clients+log, never the child; sender NOT excluded from
+  the PTY-echo broadcast). Audited every `out_tx.send` site — no client→client
+  path remains. `stamp_lines` is a byte-exact port of `clientItem::Send`; only
+  loggers stamped, per-client mid-line state correct across partial chunks,
+  one stamp shared per call. PS-9 sub-second file-vs-socket stamp residual
+  re-confirmed acceptable.
+- **rev-ps-process** (PS-10 stripping): confirmed the auto-append set is exactly
+  `{kill, toggle, logout}` (restart/quit correctly excluded — they fire only when
+  the child is dead); the `^`-escaping matches C including `^]`/lowercase as
+  literals; and `write_stdin` is the single chokepoint with no bypass now that
+  `send_to_all(Origin::Client)` is the only child writer.
+
+One new finding surfaced (out of cluster scope, recorded not fixed):
+
+- **PS-47** (rev-ps-process NOTE) — C's `index()`/`strchr` ignore filter also
+  matches the string's NUL terminator, so C silently strips a raw `NUL` from
+  child stdin whenever `ignChars` is non-empty (the default); Rust's `contains`
+  does not, so a telnet `CR NUL` reaches the child as `\r\0` vs C's `\r`. C's
+  behaviour is an accidental `index()` artifact — copying it would be
+  bug-copying; the legitimate concern (telnet `CR NUL`→`CR` translation) is a
+  telnet-layer matter for a future round. Negligible impact (shells ignore NUL).
+
+rev-ps-conn also re-flagged the command-keys-not-in-`ignChars` gap (it had only
+PS-8/PS-9 in its brief) — that IS PS-10, fixed concurrently in this same batch.
+
+`epics-tools-rs` after this round: 83 nextest green, clippy `-D warnings` clean.
+Party-line cluster converged. Nothing pushed.

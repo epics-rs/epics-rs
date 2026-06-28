@@ -135,11 +135,12 @@ struct SupervisorState {
     startup_dir: String,
 }
 
-/// A scheduled-but-not-yet-fired child relaunch: the holdoff deadline
-/// plus the banner to announce when it fires (e.g. `@@@ Auto restart`).
+/// A scheduled-but-not-yet-fired child relaunch: just the holdoff
+/// deadline. The relaunch announcement is C's `@@@ Restarting child`,
+/// emitted by [`SupervisorState::respawn_child`] when it fires (C
+/// processFactory), so nothing else needs carrying here.
 struct PendingRestart {
     at: tokio::time::Instant,
-    banner: &'static str,
 }
 
 struct ClientEntry {
@@ -333,8 +334,9 @@ impl SupervisorState {
                 //    restarts once `now >= _restartTime`, unless
                 //    `restartOnce()` already zeroed it.
                 _ = restart_due => {
-                    if let Some(pending) = self.pending_restart.take() {
-                        self.banner(pending.banner).await;
+                    if self.pending_restart.take().is_some() {
+                        // `respawn_child` emits C's `@@@ Restarting child`
+                        // announcement itself — no separate banner here.
                         self.respawn_child().await?;
                     }
                 }
@@ -396,11 +398,15 @@ impl SupervisorState {
                         }
                         Action::RestartChild => {
                             // Force a respawn (clears any holdoff).
-                            if self.child.is_none() {
-                                self.banner("@@@ Manual restart").await;
-                                if let Err(e) = self.respawn_child().await {
-                                    tracing::error!(error = %e, "procserv-rs: manual respawn failed");
-                                }
+                            // `respawn_child` emits C's `@@@ Restarting
+                            // child` announcement itself — matching C, where
+                            // a manual `restartOnce()` just zeros
+                            // `_restartTime` and the next poll routes through
+                            // processFactory, which prints it.
+                            if self.child.is_none()
+                                && let Err(e) = self.respawn_child().await
+                            {
+                                tracing::error!(error = %e, "procserv-rs: manual respawn failed");
                             }
                         }
                         Action::ToggleRestartMode => {
@@ -449,31 +455,47 @@ impl SupervisorState {
                 Ok(ChildLoopOutcome::Continue)
             }
             ChildEvent::Exited { exit } => {
-                let started_at = self.child.take().map(|slot| {
-                    // C ~processClass SIGKILLs the child's whole process
-                    // group on every death to reap grandchildren the child
-                    // spawned, before the next launch (processFactory.cc:117).
-                    // Hardcoded SIGKILL, independent of killSig. The pgid
-                    // equals the (now-reaped) leader pid and stays valid
-                    // while any group member survives.
-                    let _ = slot.handle.signal(libc::SIGKILL);
-                    slot.started_at
-                });
-                // C's SIGCHLD reaper distinguishes a normal exit from a
-                // signal death (procServ.cc:794-805); never collapse a
-                // signal into 128+sig.
+                let (started_at, pid) = match self.child.take() {
+                    Some(slot) => {
+                        let pid = slot.handle.pid();
+                        // C ~processClass SIGKILLs the child's whole process
+                        // group on every death to reap grandchildren the
+                        // child spawned, before the next launch
+                        // (processFactory.cc:117). Hardcoded SIGKILL,
+                        // independent of killSig. The pgid equals the
+                        // (now-reaped) leader pid and stays valid while any
+                        // group member survives.
+                        let _ = slot.handle.signal(libc::SIGKILL);
+                        (Some(slot.started_at), pid)
+                    }
+                    // An exit event implies a child existed; default the pid
+                    // only to keep the arm total.
+                    None => (None, 0),
+                };
                 // C updates childExitCode only under WIFEXITED
                 // (procServ.cc:798); a signal death leaves the prior value.
                 if let ChildExit::Exited(code) = exit {
                     self.child_exit_code = code;
                 }
-                let detail = match exit {
-                    ChildExit::Exited(code) => format!("exit status = {code}"),
-                    ChildExit::Signaled(sig) => format!("killed by signal {sig}"),
-                    ChildExit::Unknown => "unknown status".to_string(),
-                };
-                let msg = format!("\r\n@@@ Child exited ({detail})\r\n");
-                self.fanout_to_all(msg.as_bytes()).await;
+
+                // C SIGCHLD reaper block (procServ.cc:788-807): blank line +
+                // ruler + the `Received a sigChild` line. Distinguishes a
+                // normal exit from a signal death; never 128+sig.
+                self.fanout_to_all(messages::child_reaped(pid, exit).as_bytes())
+                    .await;
+                // C ~processClass shutdown block (processFactory.cc:111-114):
+                // current time + mode-dependent reason + the command menu
+                // redisplayed unless oneshot. This is the single owner of the
+                // per-mode shutdown line — the restart_mode arms below no
+                // longer emit their own ad-hoc shutdown banners.
+                let info3 = messages::info_message3(&self.config.keys);
+                let now = Local::now()
+                    .format(&self.config.logging.time_format)
+                    .to_string();
+                self.fanout_to_all(
+                    messages::child_shutting_down(&now, self.restart_mode, &info3).as_bytes(),
+                )
+                .await;
 
                 match self.restart_mode {
                     RestartMode::OnExit => {
@@ -483,7 +505,7 @@ impl SupervisorState {
                                 // deadline rather than sleeping inline, so
                                 // the event loop keeps servicing keystrokes
                                 // during the wait (C polls continuously).
-                                self.schedule_restart(started_at, "@@@ Auto restart");
+                                self.schedule_restart(started_at);
                                 Ok(ChildLoopOutcome::Continue)
                             }
                             Err((max, win)) => Err(ProcServError::RestartLimitExceeded {
@@ -497,10 +519,9 @@ impl SupervisorState {
                             // First-ever exit under OneShot —
                             // permitted to relaunch once more.
                             self.has_run_once = true;
-                            self.schedule_restart(started_at, "@@@ One-shot relaunch");
+                            self.schedule_restart(started_at);
                             Ok(ChildLoopOutcome::Continue)
                         } else {
-                            self.banner("@@@ One-shot mode: exiting").await;
                             Ok(ChildLoopOutcome::Shutdown)
                         }
                     }
@@ -513,8 +534,6 @@ impl SupervisorState {
                         // never set (procServ.cc:654-669) — operators
                         // reconnect and ^R to relaunch. Only `oneshot`
                         // exits the server, never `norestart`.
-                        self.banner("@@@ Child process is shutting down, auto restart is disabled")
-                            .await;
                         Ok(ChildLoopOutcome::Continue)
                     }
                 }
@@ -544,6 +563,18 @@ impl SupervisorState {
         // a torn read in another supervisor thread is harmless.
         unsafe { std::env::set_var("PROCSERV_INFO", render_procserv_info_env(&info)) };
 
+        // C `processFactory` announces the (re)launch BEFORE forking
+        // (processFactory.cc:66-72), naming the executable when it differs
+        // from the display name. C prints this on the first launch too,
+        // where it reaches only the log (no clients yet) — `fanout_to_all`
+        // does the same here. This is the single restart-announce site,
+        // matching C where every relaunch routes through processFactory.
+        let command = self.config.child.program.display().to_string();
+        self.fanout_to_all(
+            messages::restarting_child(&self.config.child.name, &command).as_bytes(),
+        )
+        .await;
+
         // Spawn — child inherits the env var.
         let spec = ChildSpec {
             program: self.config.child.program.clone(),
@@ -563,8 +594,12 @@ impl SupervisorState {
         // this transition) so a manual restart that fires mid-holdoff
         // cancels the pending auto relaunch instead of double-spawning.
         self.pending_restart = None;
-        self.banner(&format!("@@@ Child started (pid {})", handle.pid()))
-            .await;
+        // C `processClass` ctor, parent branch (processFactory.cc:193-196):
+        // the new child PID line followed by the ruler.
+        self.fanout_to_all(
+            messages::new_child_pid(&self.config.child.name, handle.pid()).as_bytes(),
+        )
+        .await;
         self.child = Some(ChildSlot {
             handle,
             rx,
@@ -710,22 +745,14 @@ impl SupervisorState {
     /// event loop keep polling input during the wait (C's poll loop
     /// re-checks the deadline every iteration), so a manual restart or
     /// kill keystroke is honored live instead of queued behind the sleep.
-    fn schedule_restart(&mut self, started_at: Option<tokio::time::Instant>, banner: &'static str) {
+    fn schedule_restart(&mut self, started_at: Option<tokio::time::Instant>) {
         let remaining = match started_at {
             Some(t) => remaining_holdoff(self.config.holdoff, t.elapsed()),
             None => self.config.holdoff,
         };
         self.pending_restart = Some(PendingRestart {
             at: tokio::time::Instant::now() + remaining,
-            banner,
         });
-    }
-
-    /// Convenience: emit a `@@@`-prefixed banner line to all clients.
-    async fn banner(&self, text: &str) {
-        let mut line = text.trim_end_matches('\n').to_string();
-        line.push_str("\r\n");
-        self.fanout_to_all(line.as_bytes()).await;
     }
 }
 

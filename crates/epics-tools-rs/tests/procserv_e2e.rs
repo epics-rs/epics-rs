@@ -256,14 +256,14 @@ async fn kill_keystroke_signals_child() {
     // Send Ctrl-X (0x18) — kills the child.
     conn.write_all(&[0x18]).await.unwrap();
 
-    // Within 2s we should see the "@@@ Child exited" banner from
-    // the supervisor. With `RestartMode::Disabled` configured, no
-    // respawn follows.
+    // Within 2s we should see C's SIGCHLD reaper line from the
+    // supervisor (procServ.cc:792). With `RestartMode::Disabled`
+    // configured, no respawn follows.
     let out = read_for(&mut conn, Duration::from_secs(3)).await;
     let cleaned = String::from_utf8_lossy(&strip_iac(&out)).to_string();
     assert!(
-        cleaned.contains("Child exited"),
-        "expected 'Child exited' banner, got: {cleaned:?}"
+        cleaned.contains("Received a sigChild"),
+        "expected the 'Received a sigChild' reaper line, got: {cleaned:?}"
     );
     // C broadcasts a kill notice to all clients before signalling
     // (clientFactory.cc:236-239).
@@ -279,8 +279,8 @@ async fn kill_keystroke_signals_child() {
 async fn server_messages_are_written_to_the_log() {
     // C `SendToAll` logs every message whose sender is NULL or the
     // child process (procServ.cc:725), so supervisor `@@@` annotations
-    // land in the log alongside child output. The "@@@ Child started"
-    // banner is emitted from the supervisor (sender == server) at spawn,
+    // land in the log alongside child output. C's birth announcement
+    // "@@@ The PID of new child" is emitted at spawn (processFactory.cc:193),
     // so it must appear in the configured log file.
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("procserv.log");
@@ -298,14 +298,14 @@ async fn server_messages_are_written_to_the_log() {
     let mut contents = String::new();
     while Instant::now() < deadline {
         contents = std::fs::read_to_string(&log_path).unwrap_or_default();
-        if contents.contains("@@@ Child started") {
+        if contents.contains("@@@ The PID of new child") {
             break;
         }
         sleep(Duration::from_millis(50)).await;
     }
     assert!(
-        contents.contains("@@@ Child started"),
-        "supervisor start banner must be logged; got: {contents:?}"
+        contents.contains("@@@ The PID of new child"),
+        "supervisor birth announcement must be logged; got: {contents:?}"
     );
 
     server_task.abort();
@@ -423,7 +423,8 @@ async fn manual_restart_preempts_active_holdoff() {
     // is pending — if the holdoff were a blocking `sleep`, the byte
     // would queue until the deadline and then pass through as a no-op
     // (the child would already have auto-restarted and be alive), so the
-    // "@@@ Manual restart" banner would never appear.
+    // manual "@@@ Restarting child" announcement would not appear before
+    // the holdoff elapses.
     let port = pick_port().await;
     let mut cfg = cat_config(port);
     cfg.restart_mode = RestartMode::OnExit;
@@ -451,23 +452,24 @@ async fn manual_restart_preempts_active_holdoff() {
     let _ = read_for(&mut conn, Duration::from_millis(500)).await;
 
     // Kill the child (Ctrl-X). Under OnExit this schedules an auto
-    // restart 3s out; "@@@ Child exited" confirms the child died and the
-    // holdoff deadline is now pending.
+    // restart 3s out; the "Received a sigChild" reaper line confirms the
+    // child died and the holdoff deadline is now pending.
     conn.write_all(&[0x18]).await.unwrap();
-    let exited = read_until(&mut conn, "Child exited", Duration::from_secs(3)).await;
+    let exited = read_until(&mut conn, "Received a sigChild", Duration::from_secs(3)).await;
     assert!(
-        exited.contains("Child exited"),
+        exited.contains("Received a sigChild"),
         "child should exit on kill keystroke, got: {exited:?}"
     );
 
     // Well within the 3s holdoff, press the manual restart key
-    // (Ctrl-R = 0x12). The non-blocking deadline lets this fire now.
+    // (Ctrl-R = 0x12). The non-blocking deadline lets this fire now —
+    // `respawn_child` emits C's "@@@ Restarting child" announcement.
     let t0 = Instant::now();
     conn.write_all(&[0x12]).await.unwrap();
-    let restarted = read_until(&mut conn, "Manual restart", Duration::from_secs(2)).await;
+    let restarted = read_until(&mut conn, "Restarting child", Duration::from_secs(2)).await;
     let elapsed = t0.elapsed();
     assert!(
-        restarted.contains("Manual restart"),
+        restarted.contains("Restarting child"),
         "manual restart key must fire during the active holdoff, got: {restarted:?}"
     );
     assert!(

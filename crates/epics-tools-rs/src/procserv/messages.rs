@@ -11,11 +11,16 @@
 //! supervisor) makes it the lone place a divergence from C can be
 //! introduced — and the lone place a parity test has to check.
 
+use crate::procserv::child::ChildExit;
 use crate::procserv::config::KeyBindings;
 use crate::procserv::restart::RestartMode;
 
 /// C `NL` macro (procServ.h:65) — telnet line ending.
 pub const NL: &str = "\r\n";
+
+/// The `@@@ @@@ @@@ @@@ @@@` separator C prints around child
+/// birth/death (procServ.cc:789, processFactory.cc:195).
+pub const RULER: &str = "@@@ @@@ @@@ @@@ @@@\r\n";
 
 /// Render a control byte the way C's `CTL_SC` macro does
 /// (procServ.h:67): a control char `0 < c < 32` becomes `^` followed by
@@ -90,6 +95,57 @@ pub fn info_message3(keys: &KeyBindings) -> String {
     }
     s.push_str(NL);
     s
+}
+
+/// The SIGCHLD reaper block — C `OnPollTimeout` (procServ.cc:788-807): a
+/// blank line, the ruler, then the `Received a sigChild` line whose tail
+/// reports the normal exit status or the killing signal. A normal exit
+/// reads `Normal exit status = K`; a signal death reads `The process was
+/// killed by signal N`; an unknown status (neither `WIFEXITED` nor
+/// `WIFSIGNALED`, as C tests them) appends nothing.
+pub fn child_reaped(pid: i32, exit: ChildExit) -> String {
+    let detail = match exit {
+        ChildExit::Exited(code) => format!(" Normal exit status = {code}"),
+        ChildExit::Signaled(sig) => format!(" The process was killed by signal {sig}"),
+        ChildExit::Unknown => String::new(),
+    };
+    format!("{NL}{RULER}@@@ Received a sigChild for process {pid}.{detail}{NL}")
+}
+
+/// The child-shutdown block — C `~processClass` (processFactory.cc:82-114):
+/// the current time, the mode-dependent shutdown reason, and (unless
+/// oneshot) the command menu redisplayed. `now` is preformatted with the
+/// banner time format; `info3` is [`info_message3`] for the active keys.
+pub fn child_shutting_down(now: &str, mode: RestartMode, info3: &str) -> String {
+    let reason = match mode {
+        RestartMode::OnExit => "a new one will be restarted shortly",
+        RestartMode::Disabled => "auto restart is disabled",
+        RestartMode::OneShot => "oneshot mode: server will exit",
+    };
+    let mut s =
+        format!("@@@ Current time: {now}{NL}@@@ Child process is shutting down, {reason}{NL}");
+    if mode != RestartMode::OneShot {
+        s.push_str(info3);
+    }
+    s
+}
+
+/// The restart announcement — C `processFactory` (processFactory.cc:66-72):
+/// printed just before a (re)launch, naming the child and, when the
+/// display name differs from the executable, the executable too. C prints
+/// this even on the first launch, where it reaches only the log.
+pub fn restarting_child(name: &str, command: &str) -> String {
+    let mut s = format!("@@@ Restarting child \"{name}\"{NL}");
+    if name != command {
+        s.push_str(&format!("@@@    (as {command}){NL}"));
+    }
+    s
+}
+
+/// Post-fork birth announcement — C `processClass` constructor
+/// (processFactory.cc:193-196): the new child's PID followed by the ruler.
+pub fn new_child_pid(name: &str, pid: i32) -> String {
+    format!("@@@ The PID of new child \"{name}\" is: {pid}{NL}{RULER}")
 }
 
 /// One child line for the welcome banner: its PID and wall-clock start
@@ -245,6 +301,74 @@ mod tests {
         assert_eq!(
             info_message3(&k),
             "@@@ ^R or ^X restarts the child, ^Q quits the server, ^] closes this connection\r\n"
+        );
+    }
+
+    #[test]
+    fn child_reaped_reports_normal_exit_and_signal() {
+        // Normal exit (C procServ.cc:794-798): "Normal exit status = K".
+        assert_eq!(
+            child_reaped(4242, ChildExit::Exited(3)),
+            "\r\n@@@ @@@ @@@ @@@ @@@\r\n\
+             @@@ Received a sigChild for process 4242. Normal exit status = 3\r\n"
+        );
+        // Signal death (C procServ.cc:801-804): "killed by signal N".
+        assert_eq!(
+            child_reaped(4242, ChildExit::Signaled(9)),
+            "\r\n@@@ @@@ @@@ @@@ @@@\r\n\
+             @@@ Received a sigChild for process 4242. The process was killed by signal 9\r\n"
+        );
+        // Unknown status: C tests only WIFEXITED/WIFSIGNALED, so neither
+        // tail clause is appended.
+        assert_eq!(
+            child_reaped(4242, ChildExit::Unknown),
+            "\r\n@@@ @@@ @@@ @@@ @@@\r\n@@@ Received a sigChild for process 4242.\r\n"
+        );
+    }
+
+    #[test]
+    fn child_shutting_down_picks_reason_and_redisplays_menu_unless_oneshot() {
+        let info3 = info_message3(&keys());
+        // Auto-restart mode: reason + menu redisplayed.
+        assert_eq!(
+            child_shutting_down("Mon Jun 28 10:00:00 2026", RestartMode::OnExit, &info3),
+            format!(
+                "@@@ Current time: Mon Jun 28 10:00:00 2026\r\n\
+                 @@@ Child process is shutting down, a new one will be restarted shortly\r\n{info3}"
+            )
+        );
+        // norestart: different reason, menu still shown.
+        assert_eq!(
+            child_shutting_down("T", RestartMode::Disabled, &info3),
+            format!(
+                "@@@ Current time: T\r\n\
+                 @@@ Child process is shutting down, auto restart is disabled\r\n{info3}"
+            )
+        );
+        // oneshot: reason line only, NO menu (C processFactory.cc:113).
+        assert_eq!(
+            child_shutting_down("T", RestartMode::OneShot, &info3),
+            "@@@ Current time: T\r\n@@@ Child process is shutting down, oneshot mode: server will exit\r\n"
+        );
+    }
+
+    #[test]
+    fn restarting_child_names_executable_only_when_distinct() {
+        assert_eq!(
+            restarting_child("ioc", "/bin/st.cmd"),
+            "@@@ Restarting child \"ioc\"\r\n@@@    (as /bin/st.cmd)\r\n"
+        );
+        assert_eq!(
+            restarting_child("/bin/st.cmd", "/bin/st.cmd"),
+            "@@@ Restarting child \"/bin/st.cmd\"\r\n"
+        );
+    }
+
+    #[test]
+    fn new_child_pid_appends_ruler() {
+        assert_eq!(
+            new_child_pid("ioc", 200),
+            "@@@ The PID of new child \"ioc\" is: 200\r\n@@@ @@@ @@@ @@@ @@@\r\n"
         );
     }
 

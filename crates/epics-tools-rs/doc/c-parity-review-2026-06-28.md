@@ -362,6 +362,7 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - Rust: `src/bin/procserv_rs.rs:120-132,235-243` (`RestartPolicy{ max_restarts, window, delay: 1s }`)
 - C: `procServ.cc:599` (`while(!shutdownServer)` never caps), `processFactory.cc:48-56` (gate only on mode + holdoff)
 - Impact: No C analog. Defaults inert (`max_restarts = u32::MAX`), and procserv times relaunches off `holdoff` (`supervisor.rs:669-678`) not `RestartPolicy.delay`, so `delay: 1s` appears unused on the procserv path. Correctly declines C's never-give-up as an opt-in cap; noted so the extra surface isn't mistaken for parity (and so the unused `delay` isn't read as a behavior).
+- Disposition: KEEP (intentional divergence, no code change). The default leaves C's never-give-up behaviour intact; the cap is operator opt-in. Recorded so the extra CLI surface is not mistaken for a parity gap on later review rounds.
 
 #### PS-42 Intentional-divergence asides — redundant `setsid` skipped; `RestartTracker` opt-in (intentional)
 - Severity: NOTE (not Rust defects)

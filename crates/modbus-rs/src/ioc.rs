@@ -798,7 +798,13 @@ impl PortDriver for ModbusPortDriver {
         }
         // HISTOGRAM_BIN_TIME sets the histogram bin width.
         if user.reason == self.histogram_bin_reason {
+            // C `writeInt32` (drvModbusAsyn.cpp:794-803): set the bin width
+            // (clamp <1 to 1), then erase the existing counts — the old counts
+            // no longer map to the rebinned widths. (C also rebuilds the time
+            // axis; here the axis is recomputed on demand in read_int32_array /
+            // read_float64_array, so only the count erase is needed.)
             self.engine.stats.histogram_ms_per_bin = value.max(1) as u32;
+            self.engine.stats.clear_histogram();
             return Ok(());
         }
         let dt = self.datatype_of(user.reason)?;
@@ -1450,6 +1456,33 @@ mod tests {
         driver.write_uint32_digital(&mut user, 1, 0xFFFF).unwrap();
         assert_eq!(driver.engine.stats.histogram[3], 0);
         assert!(driver.engine.stats.histogram_enabled);
+    }
+
+    /// R48: changing HISTOGRAM_BIN_TIME must set the (clamped) bin width and
+    /// erase the existing counts, which no longer map to the new bins
+    /// (C drvModbusAsyn.cpp:794-803).
+    #[test]
+    fn histogram_bin_time_change_clears_counts() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_HIST_BIN",
+            test_config(0, 16),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("config must build");
+        let reason = driver.base.find_param(PARAM_HISTOGRAM_BIN_TIME).unwrap();
+        let mut user = AsynUser::new(reason);
+        driver.engine.stats.histogram[7] = 9;
+
+        driver.write_int32(&mut user, 5).unwrap();
+        assert_eq!(driver.engine.stats.histogram_ms_per_bin, 5);
+        assert_eq!(driver.engine.stats.histogram[7], 0, "counts must be erased");
+
+        // A value below 1 clamps to 1 (C `if (histogramMsPerBin_ < 1) = 1`).
+        driver.engine.stats.histogram[7] = 4;
+        driver.write_int32(&mut user, 0).unwrap();
+        assert_eq!(driver.engine.stats.histogram_ms_per_bin, 1);
+        assert_eq!(driver.engine.stats.histogram[7], 0);
     }
 
     /// Absolute-mode `read_octet` for a single-byte string encoding

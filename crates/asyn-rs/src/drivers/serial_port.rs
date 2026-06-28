@@ -937,8 +937,15 @@ impl PortDriver for DrvAsynSerialPort {
             | "rs485_delay_rts_after_send" => {
                 self.set_rs485_option(&key, value)?;
             }
-            _ => {
-                self.base.options.insert(key.to_string(), value.to_string());
+            other => {
+                // C drvAsynSerialPort.c::setOption (lines 594-598): the empty
+                // key is a silent no-op (the `epicsStrCaseCmp(key,"") != 0`
+                // guard); any other unsupported key returns asynError
+                // "Unsupported key". The real handlers above own every
+                // supported key, so there is no generic option store.
+                if !other.is_empty() {
+                    return Err(AsynError::OptionNotFound(other.to_string()));
+                }
             }
         }
         Ok(())
@@ -1364,9 +1371,18 @@ mod tests {
 
     #[test]
     fn test_set_option_unknown() {
+        // C drvAsynSerialPort.c::setOption (594-598) rejects any non-empty
+        // unsupported key (asynError "Unsupported key") and never stores it,
+        // so a later getOption cannot echo it back; the empty key is a
+        // silent no-op.
         let mut drv = DrvAsynSerialPort::new("s1", "/dev/ttyS0").unwrap();
-        drv.set_option("custom", "value").unwrap();
-        assert_eq!(drv.get_option("custom").unwrap(), "value");
+
+        let err = drv.set_option("custom", "value").unwrap_err();
+        assert!(matches!(err, AsynError::OptionNotFound(_)));
+        assert!(drv.get_option("custom").is_err());
+
+        // Empty key is a silent no-op (C `epicsStrCaseCmp(key,"") != 0`).
+        drv.set_option("", "ignored").unwrap();
     }
 
     #[test]

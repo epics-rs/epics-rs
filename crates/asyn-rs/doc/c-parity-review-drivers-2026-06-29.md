@@ -243,4 +243,11 @@ contracts / behavioral models, not just a driver site.
   divergence rather than fixed. The HTTP path (ip_port.rs:740) sets NODELAY
   unconditionally like C; the conditional only governs the configurable
   TCP/TcpReusePort path.
+- **DRV-12** (LOW, ip connect double-open guard) — CLEARED. F6 "reject
+  double-open" half. C `drvAsynIPPort.c::connectIt` (424-427) returns asynError
+  "Link already open!" when `tty->fd != INVALID_SOCKET`; the Rust `connect`
+  opened a second socket unconditionally, overwriting `io.inner` and leaking
+  the first. Added the guard at the top of `connect` (mirror: `io.inner.is_some()`).
+  Reconnect is unaffected — the F1 teardown clears `io.inner` before the actor's
+  `!connected`-gated reconnect runs. Test: `connect_rejects_double_open`.
 

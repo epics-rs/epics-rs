@@ -683,6 +683,15 @@ impl PortDriver for DrvAsynIPPort {
     }
 
     fn connect(&mut self, _user: &AsynUser) -> AsynResult<()> {
+        // C drvAsynIPPort.c::connectIt (424-427): reject a connect on an
+        // already-open link ("Link already open!") rather than opening a
+        // second socket and leaking the first.
+        if self.io.inner.is_some() {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("{}: Link already open!", self.base.port_name),
+            });
+        }
         match self.config.protocol {
             IpProtocol::Tcp | IpProtocol::TcpReusePort => {
                 let stream = self.connect_tcp()?;
@@ -1365,6 +1374,28 @@ mod tests {
         }
         // The last accepted value (N) is unchanged by the rejected sets.
         assert_eq!(drv.get_option("disconnectOnReadTimeout").unwrap(), "N");
+    }
+
+    #[test]
+    fn connect_rejects_double_open() {
+        // C drvAsynIPPort.c::connectIt (424-427) returns asynError
+        // "Link already open!" on a connect to an already-open link,
+        // rather than opening a second socket and leaking the first.
+        let (listener, port) = start_echo_server();
+        let _handle = thread::spawn(move || {
+            let _ = listener.accept();
+            thread::sleep(Duration::from_secs(1));
+        });
+
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
+        let user = AsynUser::default();
+        drv.connect(&user).unwrap();
+        assert!(drv.base().connected);
+
+        let err = drv.connect(&user).unwrap_err();
+        assert!(matches!(err, AsynError::Status { .. }));
+        // The original socket is left intact (still connected).
+        assert!(drv.base().connected);
     }
 
     // --- hostInfo option tests ---

@@ -215,16 +215,46 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
 - A user-set read timeout and the inter-frame write delay (needed by slow serial PLCs) are
   discarded; the arg slots are accepted so there is no error signalling the loss.
 
-### R54 — MODBUS_DATA modelled as Float64/Octet params, not C's single asynParamInt32 (routing risk UNVERIFIED)
-- **Severity:** NOTE (intentional design divergence) — **but flags a routing risk to verify**
-- **Rust:** `ioc.rs:202-209` (MODBUS_DATA + 37 type strings each their own param, numeric→Float64,
-  string→Octet); poll fan-out sets the param then `call_param_callbacks(addr)` (`ioc.rs:366-389`)
-- **C:** `drvModbusAsyn.cpp:213` (MODBUS_DATA is one `asynParamInt32` `P_Data`); `readPoller`
-  manually fans `P_Data` to int32/int64/float64/octet/array/uint32digital interrupt clients
-  (`:1674-1894`)
-- **Risk:** whether asyn-rs delivers a Float64 param change to an asynInt32/asynInt64 I/O-Intr
-  client (longin/bi/mbbi) is NOT verified. If it does not, those I/O-Intr records never update —
-  a severe bug, not a NOTE. **Verify the asyn-rs param-routing before dispositioning.**
+### R54 — single Float64/Octet param per data reason collapses C's per-interface I/O-Intr callbacks (CONFIRMED DEFECT)
+- **Severity:** DEFECT (wrong VAL on I/O-Intr integer-interface records) — structural, spans the
+  `modbus-rs` ↔ `asyn-rs` boundary
+- **Rust:** `ioc.rs:186-213` registers each data reason as ONE param — numeric→Float64, string→Octet.
+  `poll_cycle` (`ioc.rs:371-374`) decodes the registers with the **float64** decode
+  (`datatype::read_float`) and stores that single Float64, then `call_param_callbacks(addr)`
+  (`ioc.rs:384-388`) fires one `InterruptValue{ value: Float64(v) }`.
+- **C:** the read poller decodes the SAME register data **once per interface** and fires each
+  interrupt user's interface-correct callback: UInt32Digital → masked `uInt32Value`
+  (`drvModbusAsyn.cpp:1705-1706`), Int32 → `readPlcInt32`-decoded `int32Value` (`:1736-1743`),
+  Int64 → `readPlcInt64`-decoded `int64Value` (`:1772-1779`), Float64 → `float64Value`
+  (`:1814-1815`), Int32Array (`:1841-1850`), Float64Array (`:1884-1885`), Octet (`:1920-1921`).
+  So an asynInt32 longin gets the exact int32 decode; an asynUInt32Digital bi/mbbi gets the
+  masked value; an asynInt64 record gets the exact 64-bit value.
+- **Verified routing (asyn-rs):** delivery is NOT the problem — `InterruptFilter::matches`
+  (`asyn-rs/src/interrupt.rs:27-44`) keys on `(reason, addr, uint32_mask)` only, with NO interface
+  field, so the Float64 `InterruptValue` DOES reach asynInt32/asynInt64/asynUInt32Digital
+  subscribers. The "never updates" hypothesis is **refuted**. The defect is the VALUE, not delivery:
+  the I/O-Intr read path (`asyn-rs/src/adapter.rs:2135-2138`) consumes the cached `InterruptValue`
+  directly via `param_value_to_epics_value(Float64(v)) → EpicsValue::Double(v)`, and
+  `store_read_value` (`adapter.rs:1405-1438`) only applies the interface-correct decode
+  (`apply_raw_readback` mask/shift/state-table, the `ESLO` linear RVAL store) under
+  `if let EpicsValue::Long(raw) = val`. A `Double` fails that gate and falls through to
+  `set_val(Double)` (`adapter.rs:1440`).
+- **Impact (I/O-Intr only; the polled path is correct — `read_int32`/`read_int64`/
+  `read_uint32_digital` at `ioc.rs:505+` re-decode the raw registers per interface):**
+  - asynUInt32Digital `bi`/`mbbi`/`mbbiDirect` — `apply_raw_readback` mask/shift is bypassed →
+    wrong VAL for any masked/multi-bit field.
+  - asynInt32 `ai` with `ESLO` linearization — the RVAL store + forward convert is bypassed →
+    VAL holds the raw float, unconverted.
+  - asynInt64 `int64in` — not handled in `store_read_value` at all → `set_val(Double)`; values
+    `> 2^53` lose precision the polled `read_int64` keeps exact.
+  - Plain `longin` (no ESLO/readback) and asynFloat64 `ai` are unaffected (the Double coerces to
+    the right value).
+- **Fix level:** structural, and larger than a modbus-rs patch — asyn-rs's interrupt layer is
+  single-valued per `(reason, addr)` (one `ParamValue`, no per-interface routing), so faithfully
+  mirroring C's per-interface callbacks needs either (a) an asyn-rs mechanism to fire multiple
+  interface-typed callbacks for one reason, or (b) modbus-rs registering per-interface reasons.
+  **Surface for design sign-off before fixing** (per the structural-fix-needs-sign-off rule); do
+  not collapse it into an unrelated commit.
 
 ---
 
@@ -263,8 +293,13 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
 4. **Control param** (R46) — POLL_DELAY write path broken end-to-end (write rejects + no runtime
    poll-period update).
 5. **Conversion boundaries** (R31, R32) — string NUL count, float→int boundary cast.
-6. **R54 routing risk** — verify FIRST: if asyn-rs Float64 params don't reach asynInt32 I/O-Intr
-   clients, MODBUS_DATA for integer records is broken (severe), not a NOTE.
+6. **R54 single-param vs per-interface callbacks** — VERIFIED CONFIRMED DEFECT (was "verify-first
+   routing risk"). Routing is fine (`InterruptFilter` keys on reason+addr only, no interface), so
+   the "never updates" hypothesis is refuted; the defect is the VALUE — modbus-rs fires one Float64
+   callback where C fires per-interface-decoded callbacks, and asyn-rs's `store_read_value` only
+   applies the interface-correct decode for a `Long`, so I/O-Intr asynUInt32Digital/asynInt32-ESLO/
+   asynInt64 records get the wrong VAL. Structural, spans the modbus-rs↔asyn-rs boundary →
+   surfaced for design sign-off (asyn-rs interrupt layer is single-valued per reason).
 
 Wire-byte path verified clean end-to-end (PDU, MBAP, CRC/LRC, ASCII, function codes, conversions
 in-range). All defects are in statistics/diagnostics/config/lifecycle, not the data path. No DEFECT

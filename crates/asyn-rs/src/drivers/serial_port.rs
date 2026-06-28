@@ -315,43 +315,59 @@ impl OctetNext for SerialIoState {
         let fd = self.fd_or_err()?;
         let timeout_ms = duration_to_poll_ms(user.timeout);
 
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
+        // C parity (drvAsynSerialPort.c): retry poll/read on EINTR (a signal
+        // interrupted the call) and EAGAIN/EWOULDBLOCK (spurious wakeup);
+        // only a real error is fatal. Without this, a benign signal would be
+        // surfaced as a fatal Io error and tear the connection down.
+        loop {
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
 
-        let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-        if ret < 0 {
-            return Err(AsynError::Io(std::io::Error::last_os_error()));
-        }
-        if ret == 0 {
-            return Err(AsynError::Status {
-                status: AsynStatus::Timeout,
-                message: "serial read timeout".into(),
+            let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(AsynError::Io(err));
+            }
+            if ret == 0 {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "serial read timeout".into(),
+                });
+            }
+
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted
+                    || err.kind() == std::io::ErrorKind::WouldBlock
+                {
+                    continue;
+                }
+                return Err(AsynError::Io(err));
+            }
+            if n == 0 {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Disconnected,
+                    message: "serial port EOF".into(),
+                });
+            }
+
+            return Ok(OctetReadResult {
+                nbytes_transferred: n as usize,
+                // C parity: CNT only when the requested count was reached.
+                eom_reason: if n as usize >= buf.len() {
+                    EomReason::CNT
+                } else {
+                    EomReason::empty()
+                },
             });
         }
-
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if n < 0 {
-            return Err(AsynError::Io(std::io::Error::last_os_error()));
-        }
-        if n == 0 {
-            return Err(AsynError::Status {
-                status: AsynStatus::Disconnected,
-                message: "serial port EOF".into(),
-            });
-        }
-
-        Ok(OctetReadResult {
-            nbytes_transferred: n as usize,
-            // C parity: CNT only when the requested count was reached.
-            eom_reason: if n as usize >= buf.len() {
-                EomReason::CNT
-            } else {
-                EomReason::empty()
-            },
-        })
     }
 
     fn write(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -368,7 +384,11 @@ impl OctetNext for SerialIoState {
 
             let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
             if ret < 0 {
-                return Err(AsynError::Io(std::io::Error::last_os_error()));
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(AsynError::Io(err));
             }
             if ret == 0 {
                 return Err(AsynError::Status {
@@ -385,7 +405,14 @@ impl OctetNext for SerialIoState {
                 )
             };
             if n < 0 {
-                return Err(AsynError::Io(std::io::Error::last_os_error()));
+                // C parity: retry on EINTR/EAGAIN; only a real error is fatal.
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted
+                    || err.kind() == std::io::ErrorKind::WouldBlock
+                {
+                    continue;
+                }
+                return Err(AsynError::Io(err));
             }
             total += n as usize;
         }
@@ -416,7 +443,37 @@ pub struct DrvAsynSerialPort {
     saved_termios: Option<libc::termios>,
 }
 
+/// A transport error meaning the serial line is broken and the connection
+/// must be torn down (vs a timeout, which leaves it open). C parity:
+/// `drvAsynSerialPort.c` calls `closeConnection` on a real read/write error
+/// or EOF but returns `asynTimeout` with the fd intact on a poll timeout.
+/// Mirrors the same predicate in `ip_port.rs` (both transports share the
+/// `closeConnection`-on-fatal-error contract).
+fn is_fatal_transport_error(e: &AsynError) -> bool {
+    matches!(
+        e,
+        AsynError::Status {
+            status: AsynStatus::Disconnected,
+            ..
+        } | AsynError::Io(_)
+    )
+}
+
 impl DrvAsynSerialPort {
+    /// Close the fd and mark the port disconnected so the actor's
+    /// auto-reconnect re-opens it on the next request. C parity:
+    /// `drvAsynSerialPort.c::closeConnection` (close, fd=-1,
+    /// `exceptionDisconnect`). Unlike the graceful `disconnect`, a
+    /// fatal-error teardown does not restore termios — the device is gone
+    /// and the fd is being closed.
+    fn drop_connection(&mut self) {
+        if let Some(fd) = self.io.fd.take() {
+            unsafe { libc::close(fd) };
+        }
+        self.saved_termios = None;
+        self.base.set_connected(false);
+    }
+
     /// Create a new serial port driver.
     ///
     /// The driver starts disconnected with `auto_connect = true` and `can_block = true`.
@@ -604,10 +661,29 @@ impl PortDriver for DrvAsynSerialPort {
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
         self.base.check_ready()?;
-        let result = self
+        let result = match self
             .base
             .interpose_octet
-            .dispatch_read(user, buf, &mut self.io)?;
+            .dispatch_read(user, buf, &mut self.io)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // C parity: drvAsynSerialPort.c::closeConnection on a fatal
+                // read error / EOF so the actor's auto-reconnect re-opens the
+                // device. EINTR/EAGAIN are already retried inside
+                // SerialIoState::read, so an error reaching here is fatal.
+                if is_fatal_transport_error(&e) && self.base.connected {
+                    asyn_trace!(
+                        Some(self.base.trace),
+                        &self.base.port_name,
+                        TraceMask::FLOW,
+                        "read error, disconnecting: {e}"
+                    );
+                    self.drop_connection();
+                }
+                return Err(e);
+            }
+        };
         asyn_trace_io!(
             Some(self.base.trace),
             &self.base.port_name,
@@ -627,10 +703,28 @@ impl PortDriver for DrvAsynSerialPort {
             data,
             "write"
         );
-        self.base
+        match self
+            .base
             .interpose_octet
-            .dispatch_write(user, data, &mut self.io)?;
-        Ok(())
+            .dispatch_write(user, data, &mut self.io)
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // C parity: closeConnection on a fatal write error so the
+                // next request reconnects (symmetric with read; matches
+                // ip_port DRV-5).
+                if is_fatal_transport_error(&e) && self.base.connected {
+                    asyn_trace!(
+                        Some(self.base.trace),
+                        &self.base.port_name,
+                        TraceMask::FLOW,
+                        "write error, disconnecting: {e}"
+                    );
+                    self.drop_connection();
+                }
+                Err(e)
+            }
+        }
     }
 
     fn io_flush(&mut self, user: &mut AsynUser) -> AsynResult<()> {
@@ -1435,6 +1529,41 @@ mod tests {
             } => {}
             other => panic!("expected Timeout, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_pty_read_error_disconnects() {
+        // DRV-31: a fatal read error / EOF must tear the connection down so
+        // the actor's auto-reconnect re-opens the device. Without it the port
+        // stays `connected` with a dead fd and never self-heals.
+        let (master, slave, slave_name) = match create_pty_pair() {
+            Some(v) => v,
+            None => {
+                eprintln!("openpty not available, skipping test");
+                return;
+            }
+        };
+        unsafe { libc::close(slave) };
+
+        let mut drv = DrvAsynSerialPort::new("pty_test", &slave_name).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+        assert!(drv.base().connected);
+
+        // Break the link: closing the master makes the driver's slave fd
+        // return EOF (macOS) or EIO (Linux) on the next read — both fatal.
+        unsafe { libc::close(master) };
+
+        let user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let mut buf = [0u8; 32];
+        let err = drv.read_octet(&user, &mut buf).unwrap_err();
+        assert!(
+            is_fatal_transport_error(&err),
+            "expected a fatal transport error, got {err:?}"
+        );
+        assert!(
+            !drv.base().connected,
+            "DRV-31: fatal read error must set connected=false"
+        );
     }
 
     #[test]

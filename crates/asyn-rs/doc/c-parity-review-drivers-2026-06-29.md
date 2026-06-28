@@ -173,4 +173,17 @@ contracts / behavioral models, not just a driver site.
   (port_actor.rs:311-322) re-establishes it on the next request — symmetric
   with the read path. Tests: `test_is_fatal_transport_error_classification`,
   `test_write_error_disconnects`.
+- **DRV-31** (DEFECT, serial error→disconnect + EINTR retry) — CLEARED. Sibling
+  of DRV-5 in the F1 family. (a) `read_octet`/`write_octet` now tear down the
+  connection (`drop_connection`: close fd + `connected=false`, matching C
+  `closeConnection`) on a fatal read/write error or EOF, so the actor's
+  auto-reconnect re-opens the device — previously the port stayed `connected`
+  with a dead fd forever. (b) `SerialIoState::read`/`write` now retry
+  `poll`/`read`/`write` on EINTR (signal) and EAGAIN/EWOULDBLOCK (spurious),
+  matching C; this is required so a benign signal isn't misclassified as a fatal
+  Io error and doesn't spuriously trip the new teardown. The classifier is
+  duplicated from ip_port (a trivial pure predicate over exactly two raw-fd
+  transports — promote to a shared owner only if a third caller appears). Test:
+  `test_pty_read_error_disconnects` (close pty master → fatal read → connected
+  flips false).
 

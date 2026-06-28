@@ -21,7 +21,7 @@ mod app {
     use epics_tools_rs::procserv::{
         ProcServ, ProcServConfig,
         config::{ChildConfig, KeyBindings, ListenConfig, LoggingConfig},
-        daemon::{fork_and_go, install_signal_handlers},
+        daemon::{DaemonParent, fork_and_go, install_signal_handlers},
         endpoint::{Endpoint, UnixEndpoint, parse_endpoint},
         restart::{RestartMode, RestartPolicy},
     };
@@ -506,29 +506,24 @@ mod app {
         cfg.foreground = cfg.foreground || debug;
         let foreground = cfg.foreground;
 
-        // C warns (unless `quiet`) when it is about to daemonize with no
-        // log file, naming whether a log *port* exists either
-        // (procServ.cc:889-893). Foreground/debug mode does not daemonize,
-        // so it does not warn. (The daemon-spawn pid notice C also prints
-        // here needs the forking rework tracked as PS-32.)
-        if !foreground && cfg.logging.log_path.is_none() && !quiet {
-            eprintln!(
-                "Warning: No log file{} specified.",
-                if cfg.listen.log.is_some() {
-                    ""
-                } else {
-                    " and no port for log connections"
-                }
-            );
-        }
-
         // Daemonize BEFORE starting the tokio runtime — the runtime's
-        // worker threads don't survive fork(). After fork_and_go
-        // returns we're in the grandchild (or directly in foreground
-        // mode) and safe to start tokio.
-        if !foreground && let Err(e) = fork_and_go() {
-            eprintln!("procserv-rs: daemonize failed: {e}");
-            return ExitCode::FAILURE;
+        // worker threads don't survive fork(). After fork_and_go returns
+        // we're in the daemon child (or directly in foreground mode) and
+        // safe to start tokio. The foreground parent prints the spawn
+        // notice + no-log-file warning (unless `quiet`) and writes the pid
+        // file with the daemon's pid before exiting (procServ.cc:887-899).
+        if !foreground {
+            let parent = DaemonParent {
+                name: "procserv-rs",
+                pid_path: cfg.logging.pid_path.as_deref(),
+                quiet,
+                has_logfile: cfg.logging.log_path.is_some(),
+                has_logport: cfg.listen.log.is_some(),
+            };
+            if let Err(e) = fork_and_go(parent) {
+                eprintln!("procserv-rs: daemonize failed: {e}");
+                return ExitCode::FAILURE;
+            }
         }
 
         let runtime = match tokio::runtime::Builder::new_multi_thread()

@@ -182,7 +182,13 @@ impl SupervisorState {
         let (inbound_tx, inbound_rx) = mpsc::channel::<(ClientId, InboundEvent)>(256);
         let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingClient>(8);
 
-        // Side-cars
+        // Side-cars. The daemon writes its own pid here. In daemon mode the
+        // foreground parent already published this _same_ pid in
+        // `daemon::fork_and_go` (so a `Type=forking` systemd unit sees the
+        // pid file the instant the parent exits, procServ.cc:896-898); this
+        // write re-publishes the identical value (atomic rename, no torn
+        // read) and is the sole writer in foreground / library use, where
+        // there is no parent to write it.
         if let Some(p) = &config.logging.pid_path {
             write_pid_file(p, std::process::id() as i32)?;
         }

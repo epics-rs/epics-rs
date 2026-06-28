@@ -272,6 +272,14 @@ impl IoStatistics {
 pub trait OctetTransport: Send + Sync {
     /// Send a fully framed request.
     fn write_frame(&mut self, data: &[u8]) -> ModbusResult<()>;
+    /// Re-send an already-transmitted frame after a UDP read failure. C
+    /// resends via the raw `pasynOctet->write` (`modbusInterpose.c:358`),
+    /// bypassing `writeIt` and therefore its pre-write `writeDelay` pacing
+    /// (`:246`). The default mirrors `write_frame`; a transport that paces
+    /// writes overrides this to skip the delay so retransmits are not slowed.
+    fn resend_frame(&mut self, data: &[u8]) -> ModbusResult<()> {
+        self.write_frame(data)
+    }
     /// Receive one framed response, waiting up to `timeout`.
     fn read_frame(&mut self, timeout: Duration) -> ModbusResult<Vec<u8>>;
 }
@@ -611,7 +619,11 @@ impl ModbusEngine {
                     if is_udp {
                         udp_retries += 1;
                         if udp_retries < UDP_MAX_RETRIES {
-                            transport.write_frame(framed)?;
+                            // C resends through the raw octet write
+                            // (modbusInterpose.c:358), not `writeIt`, so the
+                            // pre-write `writeDelay` pacing (:246) is skipped on
+                            // a retransmit. `resend_frame` is the no-delay path.
+                            transport.resend_frame(framed)?;
                             continue;
                         }
                     }
@@ -707,9 +719,11 @@ impl ModbusEngine {
 mod tests {
     use super::*;
 
-    /// A mock transport: records writes, replays a queue of canned responses.
+    /// A mock transport: records initial writes and retransmits separately,
+    /// and replays a queue of canned responses.
     struct MockTransport {
         written: Vec<Vec<u8>>,
+        resent: Vec<Vec<u8>>,
         responses: std::collections::VecDeque<ModbusResult<Vec<u8>>>,
     }
 
@@ -717,6 +731,7 @@ mod tests {
         fn new(responses: Vec<ModbusResult<Vec<u8>>>) -> Self {
             Self {
                 written: Vec::new(),
+                resent: Vec::new(),
                 responses: responses.into_iter().collect(),
             }
         }
@@ -725,6 +740,10 @@ mod tests {
     impl OctetTransport for MockTransport {
         fn write_frame(&mut self, data: &[u8]) -> ModbusResult<()> {
             self.written.push(data.to_vec());
+            Ok(())
+        }
+        fn resend_frame(&mut self, data: &[u8]) -> ModbusResult<()> {
+            self.resent.push(data.to_vec());
             Ok(())
         }
         fn read_frame(&mut self, _timeout: Duration) -> ModbusResult<Vec<u8>> {
@@ -1412,10 +1431,45 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, ModbusError::Timeout));
-        // 1 initial send + 4 retransmits; the success frame stays queued.
-        assert_eq!(transport.written.len(), 5);
+        // 1 initial send via `write_frame` + 4 retransmits via `resend_frame`;
+        // the success frame stays queued.
+        assert_eq!(transport.written.len(), 1);
+        assert_eq!(transport.resent.len(), 4);
         assert_eq!(transport.responses.len(), 1);
         assert_eq!(engine.stats.io_errors, 1);
+    }
+
+    #[test]
+    fn udp_retransmit_resends_via_no_delay_path() {
+        // R53/3a regression: C applies `writeDelay` only in `writeIt`
+        // (modbusInterpose.c:246); the UDP read-failure retransmit resends
+        // through the raw `pasynOctet->write` (:358), bypassing the delay.
+        // `transact` must therefore issue retransmits via `resend_frame`
+        // (the no-delay path), not `write_frame`, and resend the exact same
+        // framed bytes as the initial send.
+        let mut engine = ModbusEngine::new(
+            read_config(ModbusFunctionCode::ReadHoldingRegisters, 1),
+            LinkType::Udp,
+        )
+        .unwrap();
+        let valid = tcp_response(1, &[0x01, 0x03, 0x02, 0x12, 0x34]);
+        // One read failure forces a single retransmit, then a valid reply.
+        let mut transport = MockTransport::new(vec![Err(ModbusError::Timeout), Ok(valid)]);
+        engine
+            .do_modbus_io(
+                &mut transport,
+                ModbusFunctionCode::ReadHoldingRegisters,
+                0,
+                &[],
+                1,
+            )
+            .unwrap();
+        assert_eq!(transport.written.len(), 1, "initial send via write_frame");
+        assert_eq!(transport.resent.len(), 1, "retransmit via resend_frame");
+        // The retransmit must resend the identical framed request.
+        assert_eq!(transport.resent[0], transport.written[0]);
+        assert_eq!(engine.stats.read_ok, 1);
+        assert_eq!(engine.stats.io_errors, 0);
     }
 
     #[test]

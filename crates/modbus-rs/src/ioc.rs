@@ -149,6 +149,15 @@ impl OctetTransport for SyncIoTransport {
             .map_err(|e| ModbusError::Io(e.to_string()))
     }
 
+    fn resend_frame(&mut self, data: &[u8]) -> crate::error::ModbusResult<()> {
+        // UDP retransmit after a read failure: C resends via the raw octet
+        // write (modbusInterpose.c:358), bypassing writeIt's pre-write
+        // epicsThreadSleep(writeDelay) (:246). No pacing delay on a retransmit.
+        self.handle
+            .write_octet(0, data)
+            .map_err(|e| ModbusError::Io(e.to_string()))
+    }
+
     fn read_frame(&mut self, _timeout: Duration) -> crate::error::ModbusResult<Vec<u8>> {
         let buf = self
             .handle

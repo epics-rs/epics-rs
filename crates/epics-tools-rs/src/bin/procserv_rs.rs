@@ -159,20 +159,29 @@ mod app {
         #[arg(long, default_value_t = 600)]
         restart_window: u64,
 
-        /// Kill character (Ctrl-X = 24). Use 0 to disable.
-        #[arg(long, default_value_t = 24)]
-        kill_char: u8,
+        /// Kill command key (`-k` / `--killcmd`, C `killChar`,
+        /// procServ.cc:342-344). Accepts C caret notation via
+        /// `getOptionChar` (procServ.cc:142-152): `^X` → 0x18, `^^` → `^`,
+        /// a bare char verbatim, empty string → disabled. Default `^X`.
+        #[arg(short = 'k', long = "killcmd", value_name = "CHAR")]
+        killcmd: Option<String>,
 
-        /// Toggle restart-mode character (Ctrl-T = 20). 0 to disable.
-        #[arg(long, default_value_t = 20)]
-        toggle_restart_char: u8,
+        /// Toggle-autorestart command key (`--autorestartcmd`, C
+        /// `toggleRestartChar`, procServ.cc:406-407). Same `getOptionChar`
+        /// caret parsing. C exposes this long-only (val 'T' absent from the
+        /// optstring); `-T` is a Rust convenience short like `-F`/`-S`.
+        /// Default `^T`.
+        #[arg(short = 'T', long = "autorestartcmd", value_name = "CHAR")]
+        autorestartcmd: Option<String>,
 
-        /// Logout character. Disabled by default to match C, whose
-        /// `logoutChar` starts at `0x00` and is enabled only by
-        /// `--logoutcmd` (procServ.cc:70,403). Give a non-zero byte to
-        /// enable `^]`-style client logout; `0` keeps it off.
-        #[arg(long, default_value_t = 0)]
-        logout_char: u8,
+        /// Logout command key (`-x` / `--logoutcmd`, C `logoutChar`,
+        /// procServ.cc:402-403). Same `getOptionChar` caret parsing.
+        /// Default disabled (C `logoutChar = 0x00`). Caret notation only
+        /// covers `^A`..`^Z` (→ 0x01..0x1a); Ctrl-] (0x1d), the value the
+        /// C docs suggest, is NOT `^]` (which parses to `^`, since `]` is
+        /// above `Z`) — pass the raw 0x1d byte, e.g. `--logoutcmd=$'\x1d'`.
+        #[arg(short = 'x', long = "logoutcmd", value_name = "CHAR")]
+        logoutcmd: Option<String>,
 
         /// Core-dump size limit (bytes) applied to the child's
         /// `RLIMIT_CORE` soft limit before exec (C `--coresize`,
@@ -233,6 +242,20 @@ mod app {
             i += 1;
         }
         out
+    }
+
+    /// Parse a single command-key character with C's `getOptionChar`
+    /// semantics (`procServ.cc:142-152`): empty → `0` (disabled), `^^` →
+    /// `^`, `^A`..`^Z` → the control byte (letter − 64), anything else →
+    /// the first byte verbatim. Only the first one or two bytes matter,
+    /// exactly like C reading `buf[0]`/`buf[1]`.
+    fn get_option_char(buf: &str) -> u8 {
+        match buf.as_bytes() {
+            [] => 0,
+            [b'^', b'^', ..] => b'^',
+            [b'^', c, ..] if c.is_ascii_uppercase() => c - 64,
+            [first, ..] => *first,
+        }
     }
 
     fn build_config(args: Args) -> Result<ProcServConfig, String> {
@@ -345,6 +368,22 @@ mod app {
 
         let nz = |c: u8| if c == 0 { None } else { Some(c) };
 
+        // Command-key characters, parsed with C's `getOptionChar` caret
+        // notation. Absent → the C default byte (kill ^X, toggle ^T,
+        // logout disabled, procServ.cc:66-70); an explicit empty value or
+        // a value that parses to 0 disables the key (nz → None).
+        let kill_char = args.killcmd.as_deref().map(get_option_char).unwrap_or(0x18);
+        let toggle_char = args
+            .autorestartcmd
+            .as_deref()
+            .map(get_option_char)
+            .unwrap_or(0x14);
+        let logout_char = args
+            .logoutcmd
+            .as_deref()
+            .map(get_option_char)
+            .unwrap_or(0x00);
+
         // Startup restart mode (C `restartMode = restart` default,
         // overridden by `-N` → norestart / `-o` → oneshot,
         // procServ.cc:58,369-375). The two flags conflict at the clap
@@ -361,15 +400,15 @@ mod app {
             foreground: args.foreground,
             listen,
             keys: KeyBindings {
-                kill: nz(args.kill_char),
-                toggle_restart: nz(args.toggle_restart_char),
+                kill: nz(kill_char),
+                toggle_restart: nz(toggle_char),
                 restart: Some(0x12), // Ctrl-R when child dead
                 // C `quitChar` = ^Q (0x11), hardwired and never exposed
                 // on the CLI (procServ.cc:69; absent from long_options).
                 // Fires only while the child is shut down
                 // (clientFactory.cc:214-217); the menu scan gates it.
                 quit: Some(0x11),
-                logout: nz(args.logout_char),
+                logout: nz(logout_char),
             },
             child,
             logging,
@@ -577,6 +616,71 @@ mod app {
             let args = Args::try_parse_from(["procserv-rs", "--killsig=-2", "/bin/echo"]).unwrap();
             let cfg = build_config(args).unwrap();
             assert_eq!(cfg.child.kill_signal, 2);
+        }
+
+        /// `getOptionChar` caret notation (procServ.cc:142-152): empty →
+        /// 0, `^^` → `^`, `^A`..`^Z` → byte−64, else the first byte.
+        /// `^]`/lowercase are NOT escapes (C gates `^`-notation to A–Z).
+        #[test]
+        fn get_option_char_matches_c_semantics() {
+            assert_eq!(get_option_char(""), 0); // disabled
+            assert_eq!(get_option_char("^X"), 0x18); // Ctrl-X
+            assert_eq!(get_option_char("^T"), 0x14); // Ctrl-T
+            assert_eq!(get_option_char("^^"), b'^'); // literal caret
+            assert_eq!(get_option_char("q"), b'q'); // bare char verbatim
+            // `]` is above `Z`, so `^]` is NOT 0x1d — C returns buf[0]='^'.
+            assert_eq!(get_option_char("^]"), b'^');
+            // Lowercase after `^` is not an escape either.
+            assert_eq!(get_option_char("^a"), b'^');
+            // Only the first one/two bytes matter (C reads buf[0]/buf[1]).
+            assert_eq!(get_option_char("abc"), b'a');
+        }
+
+        /// Defaults match C (`killChar=^X`, `toggleRestartChar=^T`,
+        /// `logoutChar=0x00`, procServ.cc:66-70) when no command-key flag
+        /// is given.
+        #[test]
+        fn command_keys_default_to_c_values() {
+            let args = Args::try_parse_from(["procserv-rs", "/bin/echo"]).unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.keys.kill, Some(0x18));
+            assert_eq!(cfg.keys.toggle_restart, Some(0x14));
+            assert_eq!(cfg.keys.logout, None);
+        }
+
+        /// `-k`/`--killcmd` accepts caret notation; an empty value
+        /// disables the key (C getOptionChar → 0 → nz → None).
+        #[test]
+        fn killcmd_parses_caret_and_disable() {
+            let caret =
+                Args::try_parse_from(["procserv-rs", "--killcmd", "^X", "/bin/echo"]).unwrap();
+            assert_eq!(build_config(caret).unwrap().keys.kill, Some(0x18));
+            let bare = Args::try_parse_from(["procserv-rs", "-k", "q", "/bin/echo"]).unwrap();
+            assert_eq!(build_config(bare).unwrap().keys.kill, Some(b'q'));
+            let off = Args::try_parse_from(["procserv-rs", "--killcmd=", "/bin/echo"]).unwrap();
+            assert_eq!(build_config(off).unwrap().keys.kill, None);
+        }
+
+        /// `--autorestartcmd` (long-only in C; `-T` convenience short)
+        /// sets the toggle-restart key.
+        #[test]
+        fn autorestartcmd_sets_toggle_key() {
+            let long = Args::try_parse_from(["procserv-rs", "--autorestartcmd", "^G", "/bin/echo"])
+                .unwrap();
+            assert_eq!(build_config(long).unwrap().keys.toggle_restart, Some(0x07));
+            let short = Args::try_parse_from(["procserv-rs", "-T", "x", "/bin/echo"]).unwrap();
+            assert_eq!(build_config(short).unwrap().keys.toggle_restart, Some(b'x'));
+        }
+
+        /// `-x`/`--logoutcmd` enables the per-client logout key via caret
+        /// notation; `^G` → 0x07 (a real control char in the A–Z range).
+        #[test]
+        fn logoutcmd_enables_logout_key() {
+            let args =
+                Args::try_parse_from(["procserv-rs", "--logoutcmd", "^G", "/bin/echo"]).unwrap();
+            assert_eq!(build_config(args).unwrap().keys.logout, Some(0x07));
+            let short = Args::try_parse_from(["procserv-rs", "-x", "z", "/bin/echo"]).unwrap();
+            assert_eq!(build_config(short).unwrap().keys.logout, Some(b'z'));
         }
 
         /// C binds `-P` (uppercase) to the control port and `-p`

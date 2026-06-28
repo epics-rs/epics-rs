@@ -246,7 +246,8 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - Impact: First bytes differ. C: `[banner text][IAC WILL ECHO][IAC DO LINEMODE]`. Rust: `FF FB 01 FF FD 22` then banner. Functionally tolerated by most telnet clients, but a byte-exact connect-sequence capture sees the IAC bytes interleaved before the greeting.
 
 #### PS-27 Control-char CLI uses decimal `u8` + renamed flags (no `^X` caret notation)
-- Severity: CONCERN
+- Severity: CONCERN — CLEARED (this round)
+- Resolution: replaced the decimal-`u8` `--kill-char`/`--toggle-restart-char`/`--logout-char` flags with C's names + caret notation — `-k`/`--killcmd` (killChar), `--autorestartcmd` (toggleRestartChar; long-only in C, `-T` convenience short), `-x`/`--logoutcmd` (logoutChar). Added `get_option_char`, a byte-exact port of C `getOptionChar` (procServ.cc:142-152): empty → 0 (disabled), `^^` → `^`, `^A`..`^Z` → byte−64, else first byte. Defaults preserved (kill `^X`, toggle `^T`, logout disabled). **Faithful C quirk documented (not a bug):** Ctrl-] (0x1d) is NOT producible from `^]` — C gates `^`-notation to A–Z, so `^]` parses to `^`; the logoutcmd help directs operators to pass the raw 0x1d byte. README flag table updated. Tests: `get_option_char_matches_c_semantics`, `command_keys_default_to_c_values`, `killcmd_parses_caret_and_disable`, `autorestartcmd_sets_toggle_key`, `logoutcmd_enables_logout_key`.
 - Merged from: telnet PS-61, config PS-87
 - Rust: `src/bin/procserv_rs.rs:134-144` (`--kill-char`/`--toggle-restart-char`/`--logout-char` as decimal `u8`)
 - C: `procServ.cc:142-152` (`getOptionChar`: `^X`→0x18, `^^`→`^`), options `--killcmd`/`-k`, `--autorestartcmd`/`-T`, `--logoutcmd`/`-x`

@@ -73,9 +73,9 @@ Everything after `--` is the child program and its argv.
 | `--name <NAME>` | Display name in banners | child basename |
 | `--max-restarts <N>` | Max restarts inside `--restart-window` | 10 |
 | `--restart-window <SEC>` | Sliding window for `--max-restarts` | 600 |
-| `--kill-char <BYTE>` | Force-kill key (Ctrl-X = 24, 0 disables) | 24 |
-| `--toggle-restart-char <BYTE>` | Toggle restart-mode key (Ctrl-T = 20) | 20 |
-| `--logout-char <BYTE>` | Per-client logout key (Ctrl-] = 29) | 29 |
+| `-k, --killcmd <CHAR>` | Kill key, caret notation (`^X`; empty disables) | `^X` |
+| `-T, --autorestartcmd <CHAR>` | Toggle restart-mode key (caret notation) | `^T` |
+| `-x, --logoutcmd <CHAR>` | Per-client logout key (caret notation; disabled by default) | none |
 
 ### Connecting to the console
 

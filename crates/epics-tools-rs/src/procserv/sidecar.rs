@@ -58,17 +58,46 @@ pub(crate) fn stamp_lines(chunk: &[u8], stamp: &[u8], in_line: &mut bool) -> Vec
     buf
 }
 
-/// Per-line writer to the supervisor log. Wraps a file with timestamp
-/// prefixing — every line emitted by the child PTY is prefixed with
-/// the configured timestamp format. Multiple writers are serialized
-/// via a parking_lot mutex around the file handle, but the typical
+/// Destination for the supervisor log: a real file, or stdout (fd 1)
+/// when the operator passes `--logfile -`. C `openLogFile`
+/// (`procServ.cc:920-922`) special-cases `logFile == "-"` to
+/// `logFileFD = 1` and otherwise `open()`s the path; this enum is the
+/// port of that fork. Both arms implement `AsyncWrite`, so the writer
+/// path is identical once the sink is chosen.
+enum LogSink {
+    /// Regular append-mode log file. Keeps its own path so
+    /// [`LogFile::reopen`] (logrotate) can re-open the same target.
+    File { handle: File, path: PathBuf },
+    /// `--logfile -` → fd 1. In daemon mode fd 1 is `/dev/null`
+    /// (`daemon::fork_and_go`), in foreground it is the terminal — the
+    /// same as C, which writes to whatever fd 1 points at.
+    Stdout(tokio::io::Stdout),
+}
+
+impl LogSink {
+    /// Append `buf` and flush, regardless of the underlying sink.
+    async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        match self {
+            LogSink::File { handle, .. } => {
+                handle.write_all(buf).await?;
+                handle.flush().await
+            }
+            LogSink::Stdout(out) => {
+                out.write_all(buf).await?;
+                out.flush().await
+            }
+        }
+    }
+}
+
+/// Per-line writer to the supervisor log. Wraps a [`LogSink`] with
+/// timestamp prefixing — every line emitted by the child PTY is
+/// prefixed with the configured timestamp format. Multiple writers are
+/// serialized via a parking_lot mutex around the sink, but the typical
 /// case is single-supervisor → single-log so contention is nil.
 pub struct LogFile {
-    /// Async mutex because the file write is held across `.await`.
-    file: AsyncMutex<File>,
-    /// Path the log was opened from, kept so [`Self::reopen`] (the
-    /// SIGHUP/logrotate path) can re-open the same target.
-    path: PathBuf,
+    /// Async mutex because the sink write is held across `.await`.
+    sink: AsyncMutex<LogSink>,
     /// Whether to prefix each line with a timestamp. C `stampLog`
     /// (`procServ.cc:82`), default off: when `false` the chunk is written
     /// verbatim (`procServ.cc:744`) and [`Self::stamp_format`] is unused.
@@ -89,19 +118,28 @@ pub struct LogFile {
 }
 
 impl LogFile {
-    /// Open / create the log at `path` in append mode. Errors if the
-    /// path's parent directory doesn't exist (we don't `mkdir -p`;
-    /// matches C procServ which expects the operator to set up the
-    /// directory).
+    /// Open / create the log at `path` in append mode. The path `-` is
+    /// special-cased to stdout (fd 1), matching C `openLogFile`
+    /// (`procServ.cc:920-922`, help text "'-' logs to stdout"); without
+    /// it the Rust port would create a regular file literally named `-`
+    /// in the cwd. For a real file, errors if the parent directory
+    /// doesn't exist (we don't `mkdir -p`; matches C procServ which
+    /// expects the operator to set up the directory).
     pub async fn open(
         path: &Path,
         stamp_log: bool,
         stamp_format: impl Into<String>,
     ) -> ProcServResult<Self> {
-        let file = Self::open_handle(path).await?;
+        let sink = if path.as_os_str() == "-" {
+            LogSink::Stdout(tokio::io::stdout())
+        } else {
+            LogSink::File {
+                handle: Self::open_handle(path).await?,
+                path: path.to_path_buf(),
+            }
+        };
         Ok(Self {
-            file: AsyncMutex::new(file),
-            path: path.to_path_buf(),
+            sink: AsyncMutex::new(sink),
             stamp_log,
             stamp_format: stamp_format.into(),
             in_line: SyncMutex::new(false),
@@ -129,10 +167,17 @@ impl LogFile {
     /// to a freshly-created file at the original path, not the renamed
     /// inode the old handle still points at. Resets the mid-line state
     /// so the new file starts with a timestamp on its first line.
+    ///
+    /// For a stdout sink (`--logfile -`) this is a no-op: C `openLogFile`
+    /// guards `1 != logFileFD` before `close()` and re-sets
+    /// `logFileFD = 1` (`procServ.cc:917,920-921`), so fd 1 is never
+    /// closed or reopened.
     pub async fn reopen(&self) -> ProcServResult<()> {
-        let fresh = Self::open_handle(&self.path).await?;
-        *self.file.lock().await = fresh;
-        *self.in_line.lock() = false;
+        let mut sink = self.sink.lock().await;
+        if let LogSink::File { handle, path } = &mut *sink {
+            *handle = Self::open_handle(path).await?;
+            *self.in_line.lock() = false;
+        }
         Ok(())
     }
 
@@ -145,9 +190,8 @@ impl LogFile {
         // no per-line timestamp (`procServ.cc:744`). The log is then
         // byte-identical to the child output.
         if !self.stamp_log {
-            let mut file = self.file.lock().await;
-            file.write_all(chunk).await.map_err(ProcServError::Io)?;
-            file.flush().await.map_err(ProcServError::Io)?;
+            let mut sink = self.sink.lock().await;
+            sink.write_all(chunk).await.map_err(ProcServError::Io)?;
             return Ok(());
         }
 
@@ -163,11 +207,10 @@ impl LogFile {
             stamp_lines(chunk, stamp.as_bytes(), &mut in_line)
         }; // in_line guard dropped here
 
-        // Hold file lock across the IO; tokio mutex serializes
+        // Hold the sink lock across the IO; tokio mutex serializes
         // concurrent writers without blocking other tasks.
-        let mut file = self.file.lock().await;
-        file.write_all(&out).await.map_err(ProcServError::Io)?;
-        file.flush().await.map_err(ProcServError::Io)?;
+        let mut sink = self.sink.lock().await;
+        sink.write_all(&out).await.map_err(ProcServError::Io)?;
         Ok(())
     }
 
@@ -178,6 +221,12 @@ impl LogFile {
         // so the writer must not add any of its own or a caller-supplied
         // un-bracketed format could never be honored.
         Local::now().format(&self.stamp_format).to_string()
+    }
+
+    /// True when the log was opened against `--logfile -` (fd 1).
+    #[cfg(test)]
+    async fn logs_to_stdout(&self) -> bool {
+        matches!(&*self.sink.lock().await, LogSink::Stdout(_))
     }
 }
 
@@ -529,6 +578,26 @@ mod tests {
         assert!(
             !old.contains("after"),
             "rotated file must not gain new writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn logfile_dash_logs_to_stdout_not_a_file_named_dash() {
+        // C `openLogFile` (procServ.cc:920-922): `--logfile -` → fd 1, not
+        // a regular file named "-". The sink must be Stdout, no file is
+        // created, write succeeds, and reopen (logrotate) is a no-op that
+        // never tries to open "-".
+        let log = LogFile::open(Path::new("-"), false, "[%c] ".to_string())
+            .await
+            .unwrap();
+        assert!(log.logs_to_stdout().await, "`-` must map to stdout");
+        // Writing to stdout succeeds and creates no file.
+        log.write_chunk(b"to stdout\n").await.unwrap();
+        // Reopen is a no-op for stdout; must not error trying to open "-".
+        log.reopen().await.unwrap();
+        assert!(
+            !Path::new("-").exists(),
+            "`--logfile -` must not create a file named `-`"
         );
     }
 

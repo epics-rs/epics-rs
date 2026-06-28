@@ -64,7 +64,9 @@ mod app {
         #[arg(short = 'f', long)]
         foreground: bool,
 
-        /// Log file (`-L` / `--logfile`).
+        /// Log file (`-L` / `--logfile`). The value `-` logs to stdout
+        /// (C `openLogFile`, procServ.cc:920-922) rather than creating a
+        /// file literally named `-`.
         #[arg(short = 'L', long)]
         logfile: Option<PathBuf>,
 

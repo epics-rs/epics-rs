@@ -187,7 +187,8 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - Impact: C execs `childExec` while passing the original command as argv. Rust always execs `cmd[0]`, so `-e` deployments (launch a wrapper while presenting a different argv[0]) are unsupported.
 
 #### PS-19 `--logfile -` (log to stdout) creates a file literally named "-"
-- Severity: DEFECT
+- Severity: DEFECT — CLEARED (this round)
+- Resolution: `LogFile::open` now special-cases `path == "-"` to a new `LogSink::Stdout(tokio::io::stdout())` arm (fd 1), mirroring C `openLogFile` (`procServ.cc:920-922`). The sink is an enum (`File { handle, path }` | `Stdout`) so the write/flush path is identical once chosen; `reopen` (logrotate) is a no-op for stdout, matching C's `1 != logFileFD` guard before `close()`. fd 1 in daemon mode is `/dev/null` (`daemon::fork_and_go`), in foreground the terminal — same as C writing to whatever fd 1 points at. Bin `--logfile` help documents the `-` form. Test: `logfile_dash_logs_to_stdout_not_a_file_named_dash` (sink is Stdout, write succeeds, no file `-` created, reopen is a no-op).
 - Rust: `src/procserv/sidecar.rs:85-92` (opens the path verbatim, no `"-"` special-case); `supervisor.rs:162-176`
 - C: `procServ.cc:920-922` (`if logFile=="-" → logFileFD = 1`), help `:184` ("'-' logs to stdout")
 - Impact: C documents+implements `-L -` as "log to stdout". Rust passes `-` to `OpenOptions::open`, creating/appending a regular file `-` in the cwd (a stray `-` file in daemon mode). The documented stdout-logging form is broken.

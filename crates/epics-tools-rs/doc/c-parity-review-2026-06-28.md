@@ -301,11 +301,12 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 
 ### NOTES
 
-#### PS-33 PTY EOF on a still-running child doesn't terminate it
+#### PS-33 PTY EOF on a still-running child doesn't terminate it — CLEARED (accepted edge-case divergence, doc-only)
 - Severity: NOTE
 - Rust: `src/procserv/child.rs:281-323` (reader breaks on EOF/EIO, no death signal) + `supervisor.rs:251-256`
 - C: `processFactory.cc:227-242` (`readFromFd` sets `_markedForDeletion` on EOF/err) → `~processClass` SIGKILLs the group
 - Impact: When the child closes its controlling tty but keeps running, C marks it dead → destructor SIGKILLs the group, ending the child. Rust's reader task just stops while the reaper blocks on `waitpid`; the child is neither killed nor reported and output forwarding silently stops. Edge case (child detaching its tty while alive).
+- Disposition: accepted as a benign edge divergence. The triggering condition — the PTY **master read** returning EOF/EIO while the child is **still alive** — requires the child to *release its controlling terminal while running* (close all slave fds AND detach the ctty via `setsid`/`TIOCNOTTY`). As established in the PS-37 investigation, a child merely closing its fds keeps the ctty reference, so the master neither errors nor EOFs; the master read EOFs in practice only when the child **exits**, and then the reaper's `waitpid` reaps it and marks it dead through the normal path. So the "reader stops but child lives" state is effectively unreachable for any normal child. C's `_markedForDeletion → SIGKILL` is defensive cover for the exotic ctty-detach case; the Rust port relies on the reaper for the common exit case and accepts the exotic detached-child case (an operator can still `^X`/`^R`). Re-creating C's auto-SIGKILL-on-EOF would risk killing a child that legitimately re-opened its tty, for a path that does not arise in practice. No code change; revisit only if a real workload is found that detaches its tty while expecting to keep running.
 
 #### PS-34 Listen backlog differs (C=5, Rust=tokio default ~1024) — CLEARED (intentional divergence, doc-only)
 - Severity: NOTE

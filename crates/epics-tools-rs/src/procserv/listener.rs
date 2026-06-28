@@ -6,12 +6,12 @@
 //! C `acceptFactory.cc` (`acceptItemTCP` / `acceptItemUNIX`).
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::mpsc;
 
 use crate::procserv::client::{ClientPeer, ClientStream, IncomingClient};
+use crate::procserv::endpoint::UnixEndpoint;
 use crate::procserv::error::{ProcServError, ProcServResult};
 
 /// Run the TCP listener loop until the supervisor's `out` channel
@@ -55,28 +55,36 @@ pub async fn run_tcp(
     }
 }
 
-/// UNIX-socket listener. Removes any existing socket file at `path`
-/// (the C version `unlink`s up front for the same reason — stale
-/// socket files block `bind`). On graceful shutdown the runtime
-/// drops the listener; we make a best-effort `unlink` here too,
-/// but in case of a hard kill the next start cleans it up.
+/// UNIX-socket listener. Binds a filesystem or abstract socket per the
+/// parsed [`UnixEndpoint`], then accepts in a loop (C `acceptItemUNIX`,
+/// `acceptFactory.cc:229-381`).
+///
+/// For a filesystem socket, any existing socket file is `unlink`ed up
+/// front for the same reason C does it — a stale node blocks `bind`. An
+/// abstract socket (Linux-only) has no filesystem presence, so neither
+/// the unlink nor the permission step applies.
 pub async fn run_unix(
-    path: PathBuf,
+    ep: UnixEndpoint,
     readonly: bool,
     out: mpsc::Sender<IncomingClient>,
 ) -> ProcServResult<()> {
-    // Best-effort unlink of stale socket — ignore "not found".
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path)
-        .map_err(|e| ProcServError::ListenerBind(format!("UNIX {}: {e}", path.display())))?;
-    tracing::info!(path = %path.display(), readonly, "procserv-rs: UNIX listener accepted");
+    let listener = bind_unix(&ep)?;
+    // `ClientPeer::Unix` is display-only; an abstract socket has no
+    // filesystem path, so report `None` for it.
+    let peer_path = (!ep.abstract_socket).then(|| ep.name.clone());
+    tracing::info!(
+        name = %ep.name.display(),
+        abstract_socket = ep.abstract_socket,
+        readonly,
+        "procserv-rs: UNIX listener accepted"
+    );
 
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 let inc = IncomingClient {
                     stream: ClientStream::Unix(stream),
-                    peer: ClientPeer::Unix(Some(path.clone())),
+                    peer: ClientPeer::Unix(peer_path.clone()),
                     readonly,
                 };
                 if out.send(inc).await.is_err() {
@@ -88,6 +96,51 @@ pub async fn run_unix(
             }
         }
     }
+}
+
+/// Bind a [`UnixEndpoint`] to a tokio [`UnixListener`]. Filesystem and
+/// abstract sockets take different paths; the abstract form is Linux-only
+/// (C errors out elsewhere, `acceptFactory.cc:294-299`).
+fn bind_unix(ep: &UnixEndpoint) -> ProcServResult<UnixListener> {
+    if ep.abstract_socket {
+        bind_abstract(&ep.name)
+    } else {
+        // Best-effort unlink of a stale socket — ignore "not found"
+        // (C `acceptFactory.cc:341-346`).
+        let _ = std::fs::remove_file(&ep.name);
+        UnixListener::bind(&ep.name)
+            .map_err(|e| ProcServError::ListenerBind(format!("UNIX {}: {e}", ep.name.display())))
+    }
+}
+
+/// Bind a Linux abstract-namespace UNIX socket (leading-NUL address).
+/// tokio has no direct API, so build a std listener via `bind_addr` and
+/// adopt it (`acceptFactory.cc:316-325`).
+#[cfg(target_os = "linux")]
+fn bind_abstract(name: &std::path::Path) -> ProcServResult<UnixListener> {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::net::{SocketAddr as StdSocketAddr, UnixListener as StdUnixListener};
+
+    let label = || format!("UNIX abstract @{}", name.display());
+    let addr = StdSocketAddr::from_abstract_name(name.as_os_str().as_bytes())
+        .map_err(|e| ProcServError::ListenerBind(format!("{}: {e}", label())))?;
+    let std_listener = StdUnixListener::bind_addr(&addr)
+        .map_err(|e| ProcServError::ListenerBind(format!("{}: {e}", label())))?;
+    std_listener
+        .set_nonblocking(true)
+        .map_err(ProcServError::Io)?;
+    UnixListener::from_std(std_listener).map_err(ProcServError::Io)
+}
+
+/// Non-Linux hosts have no abstract namespace; C exits with the same
+/// diagnostic (`acceptFactory.cc:294-298`).
+#[cfg(not(target_os = "linux"))]
+fn bind_abstract(name: &std::path::Path) -> ProcServResult<UnixListener> {
+    Err(ProcServError::ListenerBind(format!(
+        "Abstract unix sockets not supported by this host (@{})",
+        name.display()
+    )))
 }
 
 #[cfg(test)]
@@ -127,6 +180,34 @@ mod tests {
         let mut buf = [0u8; 1];
         server_stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(buf[0], b'x');
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unix_filesystem_listener_forwards_accepted_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ioc.sock");
+        let ep = UnixEndpoint::filesystem(path.clone());
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let server = tokio::spawn(async move { run_unix(ep, false, tx).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut conn = tokio::net::UnixStream::connect(&path).await.unwrap();
+        let inc = rx.recv().await.expect("got incoming");
+        assert!(matches!(inc.stream, ClientStream::Unix(_)));
+        assert!(matches!(inc.peer, ClientPeer::Unix(Some(_))));
+        assert!(!inc.readonly);
+
+        let mut server_stream = match inc.stream {
+            ClientStream::Unix(s) => s,
+            _ => unreachable!(),
+        };
+        conn.write_all(b"y").await.unwrap();
+        let mut buf = [0u8; 1];
+        server_stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf[0], b'y');
 
         server.abort();
     }

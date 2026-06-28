@@ -17,6 +17,7 @@ use std::time::Duration;
 use epics_tools_rs::procserv::{
     ProcServ, ProcServConfig,
     config::{ChildConfig, KeyBindings, ListenConfig, LoggingConfig},
+    endpoint::Endpoint,
     restart::{RestartMode, RestartPolicy},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -28,11 +29,8 @@ fn cat_config(port: u16) -> ProcServConfig {
     ProcServConfig {
         foreground: true,
         listen: ListenConfig {
-            tcp_port: Some(port),
-            tcp_bind: Some(SocketAddr::from(([127, 0, 0, 1], port))),
-            log_port: None,
-            log_bind: None,
-            unix_path: None,
+            control: vec![Endpoint::Tcp(SocketAddr::from(([127, 0, 0, 1], port)))],
+            log: None,
         },
         keys: KeyBindings {
             kill: Some(0x18),
@@ -324,8 +322,7 @@ async fn log_port_client_is_readonly_but_receives_output() {
     let ctl_port = pick_port().await;
     let log_port = pick_port().await;
     let mut cfg = cat_config(ctl_port);
-    cfg.listen.log_port = Some(log_port);
-    cfg.listen.log_bind = Some(SocketAddr::from(([127, 0, 0, 1], log_port)));
+    cfg.listen.log = Some(Endpoint::Tcp(SocketAddr::from(([127, 0, 0, 1], log_port))));
 
     let server = ProcServ::new(cfg).expect("build");
     let server_task = tokio::spawn(async move {
@@ -389,8 +386,7 @@ async fn logstamp_prefixes_logger_client_stream_not_control() {
     let ctl_port = pick_port().await;
     let log_port = pick_port().await;
     let mut cfg = cat_config(ctl_port);
-    cfg.listen.log_port = Some(log_port);
-    cfg.listen.log_bind = Some(SocketAddr::from(([127, 0, 0, 1], log_port)));
+    cfg.listen.log = Some(Endpoint::Tcp(SocketAddr::from(([127, 0, 0, 1], log_port))));
     cfg.logging.stamp_log = true;
     cfg.logging.stamp_format = "STAMP> ".into();
 

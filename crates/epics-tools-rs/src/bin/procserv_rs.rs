@@ -22,6 +22,7 @@ mod app {
         ProcServ, ProcServConfig,
         config::{ChildConfig, KeyBindings, ListenConfig, LoggingConfig},
         daemon::{fork_and_go, install_signal_handlers},
+        endpoint::{Endpoint, UnixEndpoint, parse_endpoint},
         restart::{RestartMode, RestartPolicy},
     };
 
@@ -35,21 +36,29 @@ mod app {
         version
     )]
     struct Args {
-        /// TCP port to listen on (`-P` / `--port` in C procServ,
-        /// procServ.cc:251,264). Note `-P` (uppercase): C binds the
+        /// Control endpoint(s) to listen on (`-P` / `--port` in C procServ,
+        /// procServ.cc:251,264,386). Repeatable — each `-P` adds a control
+        /// listener (C `ctlSpecs`). Each value is an `acceptFactory` spec:
+        /// a bare TCP port (`4051`), an interface bind (`192.168.1.5:4051`,
+        /// honored only with `--allow`), or a UNIX socket
+        /// (`unix:/run/ioc.sock`, `unix:user:grp:0660:/run/ioc.sock`, or
+        /// abstract `unix:@name`). Note `-P` (uppercase): C binds the
         /// control port to `-P` and the PID file to `-p` (lowercase).
-        #[arg(short = 'P', long)]
-        port: Option<u16>,
+        #[arg(short = 'P', long = "port", value_name = "ENDPOINT")]
+        port: Vec<String>,
 
         /// Bind to all interfaces; default is localhost only.
         /// (C procServ `--allow`).
         #[arg(long)]
         allow: bool,
 
-        /// Read-only viewer/log TCP port (`-l` / `--logport` in C).
-        /// Clients here see all output but cannot inject input.
-        #[arg(short = 'l', long = "logport")]
-        log_port: Option<u16>,
+        /// Read-only viewer/log endpoint (`-l` / `--logport` in C). Clients
+        /// here see all output but cannot inject input. Same `acceptFactory`
+        /// spec grammar as `-P`; the log port binds all interfaces by
+        /// default (C `logPortLocal` defaults false), `--restrict` flips it
+        /// to localhost.
+        #[arg(short = 'l', long = "logport", value_name = "ENDPOINT")]
+        log_port: Option<String>,
 
         /// Restrict the log/viewer port to localhost (C `--restrict`).
         /// Unlike the control port, the log port binds all interfaces by
@@ -275,27 +284,33 @@ mod app {
         // program string so the identity matches C.
         let display_name = args.name.unwrap_or_else(|| program.display().to_string());
 
-        let listen = ListenConfig {
-            tcp_port: args.port,
-            tcp_bind: args.port.map(|p| {
-                if args.allow {
-                    std::net::SocketAddr::from(([0, 0, 0, 0], p))
-                } else {
-                    std::net::SocketAddr::from(([127, 0, 0, 1], p))
-                }
-            }),
-            log_port: args.log_port,
-            // C `logPortLocal` defaults false → all interfaces; `--restrict`
-            // flips it to localhost (acceptFactory.cc:116, procServ.cc:377).
-            log_bind: args.log_port.map(|p| {
-                if args.restrict {
-                    std::net::SocketAddr::from(([127, 0, 0, 1], p))
-                } else {
-                    std::net::SocketAddr::from(([0, 0, 0, 0], p))
-                }
-            }),
-            unix_path: args.unix_path,
+        // Control endpoints: each `-P <spec>` is parsed via `acceptFactory`
+        // (C `ctlSpecs`, procServ.cc:386,515-518), plus the `--unixpath`
+        // convenience — a plain filesystem UNIX control socket, equivalent
+        // to `-P unix:<path>`. C `ctlPortLocal` is localhost unless
+        // `--allow`; that decision is baked into each TCP endpoint here.
+        let ctl_local = !args.allow;
+        let mut control = Vec::new();
+        for spec in &args.port {
+            control.push(
+                parse_endpoint(spec, ctl_local)
+                    .map_err(|e| format!("control endpoint '{spec}': {e}"))?,
+            );
+        }
+        if let Some(path) = args.unix_path {
+            control.push(Endpoint::Unix(UnixEndpoint::filesystem(path)));
+        }
+        // Log endpoint: `logPortLocal` binds all interfaces unless
+        // `--restrict` flips it to localhost (acceptFactory.cc:116,
+        // procServ.cc:377), the inverse of the control port's default.
+        let log = match &args.log_port {
+            Some(spec) => Some(
+                parse_endpoint(spec, args.restrict)
+                    .map_err(|e| format!("log endpoint '{spec}': {e}"))?,
+            ),
+            None => None,
         };
+        let listen = ListenConfig { control, log };
 
         // C `--killsig` (procServ.cc:346-355): `i = abs(atoi(optarg))`;
         // accept only `i < 32`, else warn to stderr and keep the SIGKILL
@@ -508,6 +523,149 @@ mod app {
     mod tests {
         use super::*;
 
+        /// Unwrap an [`Endpoint`] expected to be TCP.
+        fn as_tcp(ep: &Endpoint) -> std::net::SocketAddr {
+            match ep {
+                Endpoint::Tcp(a) => *a,
+                other => panic!("expected TCP endpoint, got {other:?}"),
+            }
+        }
+
+        /// Unwrap a config's single control endpoint as a TCP address.
+        fn only_control_tcp(cfg: &ProcServConfig) -> std::net::SocketAddr {
+            assert_eq!(
+                cfg.listen.control.len(),
+                1,
+                "expected exactly one control endpoint"
+            );
+            as_tcp(&cfg.listen.control[0])
+        }
+
+        /// `-P` is repeatable: each occurrence adds a control endpoint, in
+        /// CLI order (C `ctlSpecs`, procServ.cc:386). A bare port binds
+        /// loopback by default; an `iface:port` is honored only with
+        /// `--allow`.
+        #[test]
+        fn port_flag_is_repeatable_into_control_endpoints() {
+            let args =
+                Args::try_parse_from(["procserv-rs", "-P", "4051", "-P", "4052", "/bin/echo"])
+                    .unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.listen.control.len(), 2);
+            assert_eq!(
+                as_tcp(&cfg.listen.control[0]),
+                "127.0.0.1:4051".parse().unwrap()
+            );
+            assert_eq!(
+                as_tcp(&cfg.listen.control[1]),
+                "127.0.0.1:4052".parse().unwrap()
+            );
+        }
+
+        /// `--allow` clears `ctlPortLocal`, so a bare port binds all
+        /// interfaces and an `iface:port` binds the named interface
+        /// (acceptFactory.cc:116,129).
+        #[test]
+        fn allow_binds_any_interface_and_honors_explicit_interface() {
+            let bare = Args::try_parse_from(["procserv-rs", "--allow", "-P", "4051", "/bin/echo"])
+                .unwrap();
+            assert_eq!(
+                only_control_tcp(&build_config(bare).unwrap()),
+                "0.0.0.0:4051".parse().unwrap()
+            );
+            let iface = Args::try_parse_from([
+                "procserv-rs",
+                "--allow",
+                "-P",
+                "192.168.1.5:4051",
+                "/bin/echo",
+            ])
+            .unwrap();
+            assert_eq!(
+                only_control_tcp(&build_config(iface).unwrap()),
+                "192.168.1.5:4051".parse().unwrap()
+            );
+        }
+
+        /// Without `--allow`, an explicit interface is ignored and the port
+        /// binds loopback — C's `local ? INADDR_LOOPBACK : A.B.C.D`.
+        #[test]
+        fn interface_bind_forced_to_loopback_without_allow() {
+            let args = Args::try_parse_from(["procserv-rs", "-P", "192.168.1.5:4051", "/bin/echo"])
+                .unwrap();
+            assert_eq!(
+                only_control_tcp(&build_config(args).unwrap()),
+                "127.0.0.1:4051".parse().unwrap()
+            );
+        }
+
+        /// `-P unix:<spec>` and `--unixpath <path>` both produce a UNIX
+        /// control endpoint; the spec form carries the full access-control
+        /// surface.
+        #[test]
+        fn unix_endpoints_via_port_spec_and_unixpath() {
+            let spec = Args::try_parse_from([
+                "procserv-rs",
+                "-P",
+                "unix:::0660:/run/ioc.sock",
+                "/bin/echo",
+            ])
+            .unwrap();
+            let cfg = build_config(spec).unwrap();
+            match &cfg.listen.control[0] {
+                Endpoint::Unix(u) => {
+                    assert_eq!(u.name, PathBuf::from("/run/ioc.sock"));
+                    assert_eq!(u.perms, 0o660);
+                    assert!(!u.abstract_socket);
+                }
+                other => panic!("expected UNIX endpoint, got {other:?}"),
+            }
+
+            let path =
+                Args::try_parse_from(["procserv-rs", "--unixpath", "/run/ioc.sock", "/bin/echo"])
+                    .unwrap();
+            let cfg = build_config(path).unwrap();
+            match &cfg.listen.control[0] {
+                Endpoint::Unix(u) => {
+                    assert_eq!(u.name, PathBuf::from("/run/ioc.sock"));
+                    assert_eq!(u.perms, 0o666);
+                }
+                other => panic!("expected UNIX endpoint, got {other:?}"),
+            }
+        }
+
+        /// A `-P` and a `--unixpath` together yield two control endpoints,
+        /// `-P` first then the unix path (the build order).
+        #[test]
+        fn port_and_unixpath_combine_into_two_control_endpoints() {
+            let args = Args::try_parse_from([
+                "procserv-rs",
+                "-P",
+                "4051",
+                "--unixpath",
+                "/run/ioc.sock",
+                "/bin/echo",
+            ])
+            .unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.listen.control.len(), 2);
+            assert_eq!(
+                as_tcp(&cfg.listen.control[0]),
+                "127.0.0.1:4051".parse().unwrap()
+            );
+            assert!(matches!(&cfg.listen.control[1], Endpoint::Unix(_)));
+        }
+
+        /// An unparsable endpoint spec is a build error, mirroring C's
+        /// `exit(1)` on a bad spec (acceptFactory.cc:147-148).
+        #[test]
+        fn bad_endpoint_spec_is_a_build_error() {
+            let args =
+                Args::try_parse_from(["procserv-rs", "-P", "not-a-port", "/bin/echo"]).unwrap();
+            let err = build_config(args).unwrap_err();
+            assert!(err.contains("Invalid socket spec"), "{err}");
+        }
+
         /// With no `--max-restarts`, the count limiter is unlimited
         /// (`u32::MAX`) so the supervisor never gives up on a count —
         /// matching C procServ (processFactory.cc:48-56, procServ.cc:599).
@@ -699,19 +857,19 @@ mod app {
             ])
             .unwrap();
             let cfg = build_config(args).unwrap();
-            assert_eq!(cfg.listen.tcp_port, Some(4051));
+            assert_eq!(only_control_tcp(&cfg), "127.0.0.1:4051".parse().unwrap());
             assert_eq!(cfg.logging.pid_path, Some(PathBuf::from("/run/ioc.pid")));
         }
 
         /// `-p` no longer parses as the port: a path value is rejected by
         /// the u16 port parser only if mis-routed, but here `-p` must take
-        /// the pidfile path and leave the port unset.
+        /// the pidfile path and leave the control endpoints empty.
         #[test]
         fn short_p_does_not_set_the_port() {
             let args =
                 Args::try_parse_from(["procserv-rs", "-p", "/run/ioc.pid", "/bin/echo"]).unwrap();
             let cfg = build_config(args).unwrap();
-            assert_eq!(cfg.listen.tcp_port, None);
+            assert!(cfg.listen.control.is_empty());
             assert_eq!(cfg.logging.pid_path, Some(PathBuf::from("/run/ioc.pid")));
         }
 
@@ -864,10 +1022,9 @@ mod app {
             let args =
                 Args::try_parse_from(["procserv-rs", "--logport", "7000", "/bin/echo"]).unwrap();
             let cfg = build_config(args).unwrap();
-            assert_eq!(cfg.listen.log_port, Some(7000));
             assert_eq!(
-                cfg.listen.log_bind,
-                Some(std::net::SocketAddr::from(([0, 0, 0, 0], 7000)))
+                as_tcp(cfg.listen.log.as_ref().unwrap()),
+                std::net::SocketAddr::from(([0, 0, 0, 0], 7000))
             );
         }
 
@@ -884,8 +1041,8 @@ mod app {
             .unwrap();
             let cfg = build_config(args).unwrap();
             assert_eq!(
-                cfg.listen.log_bind,
-                Some(std::net::SocketAddr::from(([127, 0, 0, 1], 7000)))
+                as_tcp(cfg.listen.log.as_ref().unwrap()),
+                std::net::SocketAddr::from(([127, 0, 0, 1], 7000))
             );
         }
 

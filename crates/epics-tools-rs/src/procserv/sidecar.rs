@@ -28,6 +28,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::procserv::config::ListenConfig;
+use crate::procserv::endpoint::Endpoint;
 use crate::procserv::error::{ProcServError, ProcServResult};
 
 /// Prefix every new line in `chunk` with `stamp`, tracking mid-line
@@ -292,23 +293,17 @@ pub struct ListenAddress {
 }
 
 impl ListenAddress {
-    /// `tcp:<ip>:<port>` — C `inet_ntop` + `ntohs(port)`, bare (no `[]`),
-    /// `acceptFactory.cc:45-49,52-61`.
-    pub fn tcp(addr: std::net::SocketAddr, readonly: bool) -> Self {
-        Self {
-            readonly,
-            addr: format!("tcp:{}:{}", addr.ip(), addr.port()),
-        }
-    }
-
-    /// `unix:<path>` — filesystem socket (`acceptFactory.cc:80-85`). The
-    /// `unix:@<abstract>` form is not produced; the Rust port binds only
-    /// filesystem sockets.
-    pub fn unix(path: &Path, readonly: bool) -> Self {
-        Self {
-            readonly,
-            addr: format!("unix:{}", path.display()),
-        }
+    /// Format one parsed [`Endpoint`] as C's `writeAddress` / `writeAddressEnv`
+    /// token (`acceptFactory.cc:45-99`): `tcp:<ip>:<port>` (bare, no `[]`),
+    /// `unix:<path>` for a filesystem socket, or `unix:@<name>` for an
+    /// abstract socket.
+    pub fn from_endpoint(ep: &Endpoint, readonly: bool) -> Self {
+        let addr = match ep {
+            Endpoint::Tcp(a) => format!("tcp:{}:{}", a.ip(), a.port()),
+            Endpoint::Unix(u) if u.abstract_socket => format!("unix:@{}", u.name.display()),
+            Endpoint::Unix(u) => format!("unix:{}", u.name.display()),
+        };
+        Self { readonly, addr }
     }
 }
 
@@ -356,23 +351,18 @@ pub fn render_procserv_info_env(info: &InfoSnapshot) -> String {
 /// Build the listener address list in C `connectionItem::head` iteration
 /// order. C prepends each acceptItem on creation (`procServ.cc:824-832`) and
 /// creates the control listeners before the log listener
-/// (`procServ.cc:515-534`), so head order is the reverse: the log port first,
-/// then the control listeners. The Rust supervisor creates control TCP,
-/// control UNIX, then log (`supervisor.rs:178-206`); reversed, that is log,
-/// UNIX, control TCP. `manage-procs` is order-independent (`manage.py:68`
-/// joins all ports), so this ordering is functional parity for any
-/// combination and byte-exact for the common control-only / control+log
-/// cases.
+/// (`procServ.cc:515-534`), so head order is the reverse: the log endpoint
+/// first, then the control endpoints in reverse of their `ctlSpecs` order.
+/// `manage-procs` is order-independent (`manage.py:68` joins all ports), so
+/// this ordering is functional parity for any combination and byte-exact for
+/// the common control-only / control+log cases.
 pub fn listen_addresses(listen: &ListenConfig) -> Vec<ListenAddress> {
     let mut out = Vec::new();
-    if let Some(addr) = listen.log_bind {
-        out.push(ListenAddress::tcp(addr, true));
+    if let Some(ep) = &listen.log {
+        out.push(ListenAddress::from_endpoint(ep, true));
     }
-    if let Some(path) = &listen.unix_path {
-        out.push(ListenAddress::unix(path, false));
-    }
-    if let Some(addr) = listen.tcp_bind {
-        out.push(ListenAddress::tcp(addr, false));
+    for ep in listen.control.iter().rev() {
+        out.push(ListenAddress::from_endpoint(ep, false));
     }
     out
 }
@@ -410,8 +400,11 @@ mod tests {
         let info = InfoSnapshot {
             procserv_pid: 1234,
             addresses: vec![
-                ListenAddress::tcp("0.0.0.0:7001".parse().unwrap(), true),
-                ListenAddress::tcp("127.0.0.1:7000".parse().unwrap(), false),
+                ListenAddress::from_endpoint(&Endpoint::Tcp("0.0.0.0:7001".parse().unwrap()), true),
+                ListenAddress::from_endpoint(
+                    &Endpoint::Tcp("127.0.0.1:7000".parse().unwrap()),
+                    false,
+                ),
             ],
         };
         assert_eq!(
@@ -427,8 +420,11 @@ mod tests {
         let info = InfoSnapshot {
             procserv_pid: 1234,
             addresses: vec![
-                ListenAddress::tcp("0.0.0.0:7001".parse().unwrap(), true),
-                ListenAddress::tcp("127.0.0.1:7000".parse().unwrap(), false),
+                ListenAddress::from_endpoint(&Endpoint::Tcp("0.0.0.0:7001".parse().unwrap()), true),
+                ListenAddress::from_endpoint(
+                    &Endpoint::Tcp("127.0.0.1:7000".parse().unwrap()),
+                    false,
+                ),
             ],
         };
         assert_eq!(
@@ -448,13 +444,16 @@ mod tests {
     }
 
     #[test]
-    fn listen_addresses_orders_log_then_unix_then_control() {
+    fn listen_addresses_orders_log_first_then_control_reversed() {
+        use crate::procserv::endpoint::UnixEndpoint;
+        // Control specs in CLI order: TCP 7000 then a UNIX socket; the log
+        // endpoint is 7001. C head order is log first, then control reversed.
         let listen = ListenConfig {
-            tcp_port: Some(7000),
-            tcp_bind: Some("127.0.0.1:7000".parse().unwrap()),
-            log_port: Some(7001),
-            log_bind: Some("0.0.0.0:7001".parse().unwrap()),
-            unix_path: Some(PathBuf::from("/run/ioc.sock")),
+            control: vec![
+                Endpoint::Tcp("127.0.0.1:7000".parse().unwrap()),
+                Endpoint::Unix(UnixEndpoint::filesystem(PathBuf::from("/run/ioc.sock"))),
+            ],
+            log: Some(Endpoint::Tcp("0.0.0.0:7001".parse().unwrap())),
         };
         let addrs = listen_addresses(&listen);
         let tokens: Vec<(&str, bool)> = addrs
@@ -468,6 +467,22 @@ mod tests {
                 ("unix:/run/ioc.sock", false),
                 ("tcp:127.0.0.1:7000", false),
             ]
+        );
+    }
+
+    #[test]
+    fn abstract_unix_address_uses_the_at_prefix() {
+        use crate::procserv::endpoint::UnixEndpoint;
+        let ep = Endpoint::Unix(UnixEndpoint {
+            name: PathBuf::from("ioc-console"),
+            abstract_socket: true,
+            uid: None,
+            gid: None,
+            perms: 0o666,
+        });
+        assert_eq!(
+            ListenAddress::from_endpoint(&ep, false).addr,
+            "unix:@ioc-console"
         );
     }
 

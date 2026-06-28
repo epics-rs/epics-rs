@@ -45,6 +45,7 @@ use crate::procserv::client::{
     ClientId, ClientMeta, InboundEvent, IncomingClient, OutboundFrame, spawn_client,
 };
 use crate::procserv::config::{KeyBindings, ProcServConfig};
+use crate::procserv::endpoint::Endpoint;
 use crate::procserv::error::{ProcServError, ProcServResult};
 use crate::procserv::menu::{Action, scan as menu_scan};
 use crate::procserv::messages;
@@ -192,34 +193,24 @@ impl SupervisorState {
             None
         };
 
-        // Listeners — TCP + UNIX in parallel.
-        if let Some(addr) = config.listen.tcp_bind {
+        // Control endpoints — one listener task each (C `ctlSpecs` loop,
+        // procServ.cc:515-518). TCP and UNIX both flow through the same
+        // accept→IncomingClient path.
+        for ep in config.listen.control.iter().cloned() {
             let tx = incoming_tx.clone();
             tokio::spawn(async move {
-                if let Err(e) = super::listener::run_tcp(addr, false, tx).await {
-                    tracing::error!(error = %e, "procserv-rs: TCP listener exited");
-                }
+                spawn_endpoint(ep, false, tx, "control").await;
             });
         }
-        if let Some(path) = config.listen.unix_path.clone() {
-            let tx = incoming_tx.clone();
-            tokio::spawn(async move {
-                if let Err(e) = super::listener::run_unix(path, false, tx).await {
-                    tracing::error!(error = %e, "procserv-rs: UNIX listener exited");
-                }
-            });
-        }
-        // Read-only viewer/log port: a second TCP listener whose clients
-        // receive output but whose input is discarded. C creates this as
+        // Read-only viewer/log endpoint: clients receive output but their
+        // input is discarded. C creates this as
         // `acceptFactory(logPort, logPortLocal, /*readonly=*/true)`
         // (procServ.cc:533); the `readonly` flag flows to each accepted
         // client and gates its input (client.rs read task).
-        if let Some(addr) = config.listen.log_bind {
+        if let Some(ep) = config.listen.log.clone() {
             let tx = incoming_tx.clone();
             tokio::spawn(async move {
-                if let Err(e) = super::listener::run_tcp(addr, true, tx).await {
-                    tracing::error!(error = %e, "procserv-rs: log listener exited");
-                }
+                spawn_endpoint(ep, true, tx, "log").await;
             });
         }
         // Drop our copy so listeners' txs are the only owners.
@@ -803,6 +794,25 @@ impl SupervisorState {
 enum ChildLoopOutcome {
     Continue,
     Shutdown,
+}
+
+/// Run the accept loop for one [`Endpoint`], dispatching to the TCP or
+/// UNIX listener. A listener that exits with an error is logged; the
+/// supervisor keeps running its other endpoints (C `acceptFactory`
+/// failures during steady-state are per-listener).
+async fn spawn_endpoint(
+    ep: Endpoint,
+    readonly: bool,
+    tx: mpsc::Sender<IncomingClient>,
+    role: &'static str,
+) {
+    let res = match ep {
+        Endpoint::Tcp(addr) => super::listener::run_tcp(addr, readonly, tx).await,
+        Endpoint::Unix(u) => super::listener::run_unix(u, readonly, tx).await,
+    };
+    if let Err(e) = res {
+        tracing::error!(error = %e, role, "procserv-rs: listener exited");
+    }
 }
 
 /// Originator of a party-line message — the Rust model of C

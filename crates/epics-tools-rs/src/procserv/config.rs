@@ -4,38 +4,33 @@
 //! deployments can switch to `procserv-rs` with the same wrapper
 //! scripts. Defaults match C procServ's defaults.
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::procserv::endpoint::Endpoint;
 use crate::procserv::restart::{RestartMode, RestartPolicy};
 
-/// Listen-side configuration. procServ historically accepts both TCP
-/// (`--port` / `--allow`) and Unix-socket (`--unixpath`) consoles
-/// concurrently. The Rust port keeps both, gated by which fields the
-/// caller supplies.
+/// Listen-side configuration. C procServ collects control endpoints into
+/// a `ctlSpecs` vector built from repeatable `-P` plus the legacy
+/// positional port (`procServ.cc:211,386,453`), and a single optional log
+/// endpoint from `-l`; each spec is parsed by `acceptFactory`. The Rust
+/// port mirrors that shape: a vector of control endpoints (read/write) and
+/// one optional log endpoint (read-only).
 #[derive(Debug, Clone, Default)]
 pub struct ListenConfig {
-    /// TCP listen port (`--port`). `None` disables TCP.
-    pub tcp_port: Option<u16>,
-    /// Bind address for the TCP listener. C procServ `--allow`
-    /// flips between localhost-only and any-interface; the Rust port
-    /// takes the explicit `SocketAddr` so both forms collapse onto
-    /// one field. Defaults to `127.0.0.1` if `tcp_port` is set.
-    pub tcp_bind: Option<SocketAddr>,
-    /// Read-only viewer/log TCP port (`-l` / `--logport`). Clients on
-    /// this port receive all output but their input is discarded —
-    /// C procServ's log listener, created with `readonly=true`
-    /// (`procServ.cc:533`, `acceptFactory.cc:395`). `None` disables it.
-    pub log_port: Option<u16>,
-    /// Bind address for the log/viewer port. C's `logPortLocal` defaults
-    /// to *false* — the log port binds all interfaces (`INADDR_ANY`)
-    /// unless `--restrict` restricts it to localhost
-    /// (`procServ.cc:51,377`, `acceptFactory.cc:116`), the inverse of the
-    /// control port's localhost-by-default + `--allow`.
-    pub log_bind: Option<SocketAddr>,
-    /// Unix-domain socket path (`--unixpath`). `None` disables UNIX.
-    pub unix_path: Option<PathBuf>,
+    /// Control endpoints (read/write). Each is a fully-resolved
+    /// [`Endpoint`] — TCP (bare port or `A.B.C.D:port` interface bind) or
+    /// UNIX (filesystem, access-controlled, or abstract). At least one is
+    /// required (C's arg-count check, `procServ.cc:420`). C `ctlSpecs`.
+    pub control: Vec<Endpoint>,
+    /// Read-only viewer/log endpoint (`-l` / `--logport`). Clients here
+    /// receive all output but their input is discarded — C procServ's log
+    /// listener, created with `readonly=true` (`procServ.cc:533`,
+    /// `acceptFactory.cc:395`). Its localhost-vs-any decision is C's
+    /// `logPortLocal`: all interfaces by default, localhost under
+    /// `--restrict` (the inverse of the control port's localhost default +
+    /// `--allow`). `None` disables it.
+    pub log: Option<Endpoint>,
 }
 
 /// Per-input-key bindings. Matches C procServ's `restartChar`
@@ -152,8 +147,8 @@ impl ProcServConfig {
     /// Validate the config — bail at construction time rather than
     /// surfacing an error mid-run.
     pub fn validate(&self) -> Result<(), String> {
-        if self.listen.tcp_port.is_none() && self.listen.unix_path.is_none() {
-            return Err("at least one of tcp_port / unix_path must be set".into());
+        if self.listen.control.is_empty() {
+            return Err("at least one control endpoint is required".into());
         }
         if self.child.program.as_os_str().is_empty() {
             return Err("child.program is required".into());

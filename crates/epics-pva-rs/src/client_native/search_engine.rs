@@ -1117,7 +1117,12 @@ async fn run_engine(
     // ambient `EPICS_PVA_*` reads in the broadcast path.
     udp: UdpSearchParams,
 ) {
-    static NEXT_SEARCH_ID: AtomicU32 = AtomicU32::new(1);
+    // pvxs has no separate search counter: it reuses each channel's CID as
+    // its searchID (`clientimpl.h:181`). The port keeps searchInstanceID a
+    // distinct namespace, so — in the spirit of pvxs 3b641bed — seed it from
+    // its own distinct non-zero base (port-specific, not a pvxs constant) so
+    // a searchID can never silently alias a CID/SID/IOID.
+    static NEXT_SEARCH_ID: AtomicU32 = AtomicU32::new(0x5EA5_0000);
 
     let codec = PvaCodec { big_endian: false };
     // All NICs share one ephemeral port (bind_ephemeral_same_port), so

@@ -77,7 +77,9 @@ fn decode_get_field_or_reset(server: &ServerConn, frame: &Frame) -> PvaResult<Ge
     decode_get_field_response(frame).inspect_err(|_| server.close())
 }
 
-static NEXT_IOID: AtomicU32 = AtomicU32::new(1);
+// pvxs seeds each ID namespace from a distinct non-zero base (commit
+// 3b641bed). IOID base = pvxs `clientimpl.h:106` `nextIOID=0x10002000`.
+static NEXT_IOID: AtomicU32 = AtomicU32::new(0x1000_2000);
 fn alloc_ioid() -> u32 {
     NEXT_IOID.fetch_add(1, Ordering::Relaxed)
 }

@@ -37,14 +37,19 @@ use crate::pvdata::{FieldDesc, PvField};
 use super::runtime::PvaServerConfig;
 use super::source::{ChannelInvalidator, DynSource, OpError};
 
-static NEXT_SID: AtomicU32 = AtomicU32::new(1);
+// pvxs seeds each ID namespace from a distinct non-zero base (commit
+// 3b641bed) so a value used as the wrong ID type fails loudly instead of
+// silently aliasing a live id of another kind. SID base = pvxs
+// `serverconn.h:141` `nextSID=0x07050301`.
+static NEXT_SID: AtomicU32 = AtomicU32::new(0x0705_0301);
 fn alloc_sid() -> u32 {
     NEXT_SID.fetch_add(1, Ordering::Relaxed)
 }
 
 // serverChannelID sentinel in a CREATE_CHANNEL failure reply. pvxs
 // uses `sid = -1` (serverchan.cpp:273/338) and wires it as 0xFFFFFFFF;
-// `NEXT_SID` starts at 1, so this value can never be a live channel id.
+// `NEXT_SID` climbs monotonically from 0x07050301 and could never reach
+// 0xFFFFFFFF in any real session, so this value can never alias a live id.
 const CREATE_CHANNEL_NO_SID: u32 = u32::MAX;
 
 /// A pvxs `ServerConn::logRemote()` diagnostic emitted during MONITOR

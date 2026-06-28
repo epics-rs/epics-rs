@@ -683,6 +683,26 @@ impl PortDriver for ModbusPortDriver {
     }
 
     fn read_float64_array(&mut self, user: &AsynUser, buf: &mut [f64]) -> AsynResult<usize> {
+        // C `readFloat64Array` serves the diagnostic histogram arrays too
+        // (drvModbusAsyn.cpp:1181-1191), exactly like `readInt32Array`
+        // (:1350-1360) — an aai/waveform with FTVL=DOUBLE binding to
+        // READ_HISTOGRAM / HISTOGRAM_TIME_AXIS must work, not just the LONG one.
+        if user.reason == self.read_histogram_reason {
+            let h = &self.engine.stats.histogram;
+            let n = h.len().min(buf.len());
+            for (slot, &v) in buf[..n].iter_mut().zip(h) {
+                *slot = v as f64;
+            }
+            return Ok(n);
+        }
+        if user.reason == self.histogram_axis_reason {
+            let bin = self.engine.stats.histogram_ms_per_bin.max(1) as f64;
+            let n = crate::driver::HISTOGRAM_LENGTH.min(buf.len());
+            for (i, slot) in buf[..n].iter_mut().enumerate() {
+                *slot = i as f64 * bin;
+            }
+            return Ok(n);
+        }
         let dt = self.datatype_of(user.reason)?;
         let rc = dt.register_count().max(1);
         // Absolute mode: per-record read at the wire address (see
@@ -1483,6 +1503,42 @@ mod tests {
         driver.write_int32(&mut user, 0).unwrap();
         assert_eq!(driver.engine.stats.histogram_ms_per_bin, 1);
         assert_eq!(driver.engine.stats.histogram[7], 0);
+    }
+
+    /// R49: READ_HISTOGRAM and HISTOGRAM_TIME_AXIS must serve a Float64 array
+    /// binding (aai/waveform FTVL=DOUBLE), not only the LONG path — C
+    /// `readFloat64Array` serves both (drvModbusAsyn.cpp:1181-1191).
+    #[test]
+    fn read_float64_array_serves_histogram() {
+        let mut driver = ModbusPortDriver::new(
+            "MB_HIST_F64",
+            test_config(0, 16),
+            LinkType::Tcp,
+            Box::new(NullTransport),
+        )
+        .expect("config must build");
+        driver.engine.stats.histogram_ms_per_bin = 4;
+        driver.engine.stats.histogram[0] = 11;
+        driver.engine.stats.histogram[2] = 22;
+
+        let hist_reason = driver.base.find_param(PARAM_READ_HISTOGRAM).unwrap();
+        let axis_reason = driver.base.find_param(PARAM_HISTOGRAM_TIME_AXIS).unwrap();
+
+        let mut hbuf = [0.0f64; 5];
+        let n = driver
+            .read_float64_array(&AsynUser::new(hist_reason), &mut hbuf)
+            .unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(hbuf[0], 11.0);
+        assert_eq!(hbuf[2], 22.0);
+
+        let mut abuf = [0.0f64; 5];
+        let n = driver
+            .read_float64_array(&AsynUser::new(axis_reason), &mut abuf)
+            .unwrap();
+        assert_eq!(n, 5);
+        // axis[i] = i * bin, bin = 4.
+        assert_eq!(abuf, [0.0, 4.0, 8.0, 12.0, 16.0]);
     }
 
     /// Absolute-mode `read_octet` for a single-byte string encoding

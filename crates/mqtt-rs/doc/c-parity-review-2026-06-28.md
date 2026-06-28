@@ -393,21 +393,24 @@ no fix):
 NOTE — low-priority documented divergences (no fix this round): MQ3, MQ4, MQ5,
 MQ36, MQ48, MQ49.
 
-**Deferred — fixable, batch 2:**
+**Cleared — round 2 (batch 2, 2026-06-28):**
 
-- **MQ40** — JSON composite carrier serialized in doc order vs C sorted-key
-  `dump()` (STRING-topic only); needs a recursive sorted re-serialize. Niche.
-- **MQ32** — array double-space (`"1  2"`) rejected where C accepts; fix is to
-  collapse empty split elements, but must avoid turning an empty payload into
-  `[]` — needs the C empty-payload behaviour checked first.
-- **MQ39** — outbound octet publish corrupts non-UTF-8 bytes via
-  `String::from_utf8_lossy(data)` before NUL-truncation; C publishes
-  `std::string(stringData.data())` = raw bytes up to the first NUL
-  (`drvMqtt.cpp:716`). The wire path is **mqtt-rs-local**: `write_octet` already
-  receives `data: &[u8]`, so widening `PublishRequest.payload` to `Vec<u8>` and
-  encoding FLAT octet as the raw NUL-truncated bytes makes the wire
-  byte-identical with no framework change. (The write-side *cache* readback stays
-  `String`-lossy — that part belongs to the MQ38 octet family below.)
+- **MQ32 — CLEARED** `6e82dc8c` — the space-separator branch uses
+  `split_whitespace` (collapses a run of inter-number whitespace like C's
+  loop-top skip, drvMqtt.cpp:447/532), so `"1  2"` decodes to `[1,2]`. The comma
+  branch is unchanged (double comma still rejects, the `"1 ,2"` leniency kept),
+  and an empty result errors so an empty / all-whitespace / `"[]"` payload never
+  becomes `[]` (C rejects those). Fixed both array parsers.
+- **MQ40 — CLEARED** `2148c2e7` — a JSON object/array carrier on a STRING topic
+  is serialized with object keys sorted recursively (new `dump_sorted`), matching
+  C `fieldAddr->dump()` over a `std::map`-backed json (drvMqtt.cpp:265); arrays
+  keep element order, scalars unchanged.
+- **MQ39 — CLEARED** `f4d207f9` — `PublishRequest.payload` widened to `Vec<u8>`;
+  a FLAT octet write publishes the raw NUL-truncated bytes (new
+  `octet_bytes_cstr`) with no `from_utf8_lossy` re-encoding, matching C
+  `std::string(stringData.data())` (drvMqtt.cpp:714-716). JSON octet keeps the
+  String encoding (C leaves it unimplemented). The cache readback stays a lossy
+  `String` — the MQ38 framework residual below.
 
 **Structural / framework — asyn-rs contract change, design sign-off (the SAME
 asyn-rs gap as modbus R34/R52/R54):**

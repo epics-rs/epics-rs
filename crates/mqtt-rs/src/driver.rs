@@ -128,18 +128,31 @@ impl MqttDriver {
         &self.topic_map
     }
 
+    /// Gate every write while the broker is down.
+    ///
+    /// C parity: a publish while disconnected throws "MQTT client not
+    /// connected" (mqttClient.cpp:70-72), surfaced as asynError by the *Write
+    /// handlers (drvMqtt.cpp:590-595/632-637) so the output record fails with a
+    /// WRITE/INVALID alarm. This is the single owner of the gate condition; a
+    /// write handler MUST reach it before producing any observable side effect
+    /// (param-cache commit, callback, channel send) so a disconnected write
+    /// fails cleanly and is never silently buffered — exactly as in C.
+    fn ensure_connected(&self) -> AsynResult<()> {
+        if self.connected.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(MqttError::NotConnected.into())
+        }
+    }
+
     /// Encode and publish a value for the given parameter reason.
     /// Uses FLAT or JSON encoding depending on the topic address format.
     fn publish_value(&self, reason: usize, value: &DecodedValue) -> AsynResult<()> {
-        // C parity: a publish while the broker is down throws
-        // "MQTT client not connected" (mqttClient.cpp:70-72), surfaced as
-        // asynError by the *Write handlers (drvMqtt.cpp:590-595/632-637) so the
-        // output record fails with a WRITE/INVALID alarm. Gate here — before
-        // touching the unbounded publish channel — so a disconnected write fails
-        // (and is not silently buffered) exactly as in C.
-        if !self.connected.load(Ordering::Acquire) {
-            return Err(MqttError::NotConnected.into());
-        }
+        // Gate before touching the unbounded publish channel. The five
+        // commit-after-publish handlers reach the gate here first; the digital
+        // handler (which commits its cache before publishing) gates explicitly
+        // at its top.
+        self.ensure_connected()?;
 
         let addr = self
             .reason_to_addr
@@ -215,6 +228,15 @@ impl PortDriver for MqttDriver {
         value: u32,
         mask: u32,
     ) -> AsynResult<()> {
+        // Unlike the other five write handlers, the digital path mutates the
+        // param cache (set_uint32 below marks the entry *defined*) before it
+        // publishes, so the gate inside publish_value would run too late: a
+        // disconnected write would leave a phantom value behind that defeats the
+        // uninitialized-masked-write guard on the next write. Gate here, before
+        // any side effect, so the invariant "no observable effect precedes the
+        // connection gate" holds on this handler too.
+        self.ensure_connected()?;
+
         // C parity: MqttDriver::digitalWrite (drvMqtt.cpp:608-622) refuses a
         // partial-mask digital write until the current full value is known.
         // It reads getUIntDigitalParam(idx, &cur, 0xFFFFFFFF); if that returns
@@ -318,6 +340,60 @@ mod tests {
         connected.store(true, Ordering::Release);
         driver.write_int32(&mut user, 42).unwrap();
         assert_eq!(rx.try_recv().unwrap().payload, "42");
+    }
+
+    /// The digital handler commits its param cache before publishing, so the
+    /// connection gate must run at its top — otherwise a disconnected write
+    /// leaves a phantom "defined" value behind that defeats the
+    /// uninitialized-masked-write guard. Prove the cache stays untouched: a
+    /// disconnected full-mask write fails without committing, so a later masked
+    /// write (after reconnect) still hits the uninitialized guard rather than
+    /// merging against a phantom.
+    #[test]
+    fn disconnected_digital_write_does_not_commit_cache() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let config = MqttConfig::default();
+        let connected = Arc::new(AtomicBool::new(false));
+        let addrs = vec![TopicAddress::parse("FLAT:DIGITAL test/digital_topic").unwrap()];
+        let mut driver = MqttDriver::new("TEST", &config, addrs, tx, connected.clone());
+        let reason = driver
+            .drv_user_create("FLAT:DIGITAL test/digital_topic")
+            .unwrap();
+        let mut user = AsynUser::new(reason);
+
+        // Disconnected full-mask write: must fail, must not publish, must not
+        // commit the param cache.
+        let r = driver.write_uint32_digital(&mut user, 0x00f0, 0xFFFF_FFFF);
+        assert!(
+            r.is_err(),
+            "disconnected digital write must fail, got {r:?}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a failed digital write must not enqueue a publish"
+        );
+
+        // Reconnect, then attempt a masked write. If the disconnected write had
+        // committed 0x00f0 (the defect), the cache would now be defined and this
+        // masked write would succeed by merging. Because the cache stayed
+        // untouched, the uninitialized guard fires and the masked write fails.
+        connected.store(true, Ordering::Release);
+        let masked = driver.write_uint32_digital(&mut user, 0x0005, 0x000f);
+        assert!(
+            masked.is_err(),
+            "masked write must fail on an uninitialized value — a phantom commit \
+             from the disconnected write would have let it merge, got {masked:?}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the rejected masked write must not enqueue a publish"
+        );
+
+        // A full-mask write supplies every bit, so it proceeds and publishes.
+        driver
+            .write_uint32_digital(&mut user, 0x00f0, 0xFFFF_FFFF)
+            .unwrap();
+        assert_eq!(rx.try_recv().unwrap().payload, "240");
     }
 
     #[test]

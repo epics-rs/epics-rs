@@ -144,15 +144,24 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   (`datatype.rs`/`driver.rs:503-507` ↔ `drvModbusAsyn.cpp:2237/2245`). Not counted
   separately; listed so the cross-reference is on record.
 
-### R34 — per-record drvUser string length cap (`LEN=N`) dropped
+### R34 — per-record drvUser string length cap (`LEN=N`) dropped — STRUCTURAL BLOCK (asyn-rs contract; sign-off, sibling of R54)
 - **Severity:** NOTE → CONCERN (changes wire register count for LEN-configured records)
-- **Rust:** `ioc.rs:15-18` (the `=N` length is dropped; length comes from the record
-  buffer only)
-- **C:** `drvModbusAsyn.cpp:2367-2377` (`getStringLen` caps to `drvlen`), applied at
-  `:1456` (readOctet) and `:1521/1524/1531` (writeOctet)
-- A string record with explicit `LEN=N` smaller than its buffer reads/writes more
-  chars (more/fewer wire registers) in Rust than C caps to. Tied to R51 (the
-  validation half).
+- **Rust:** module docs (the `=N` length *value* is dropped; length comes from the record
+  buffer `NELM` only)
+- **C:** `drvModbusAsyn.cpp:2367-2377` (`getStringLen` caps the asyn `maxLen` to the per-record
+  `drvUser->len`), applied at `:1456` (readOctet) and `:1521/1524/1531` (writeOctet)
+- A string record with explicit `LEN=N` smaller than its buffer reads/writes more chars (more/
+  fewer wire registers) in Rust than C caps to.
+- **Blocker:** C stores the per-record cap in `pasynUser->drvUser` (`modbusDrvUser_t.len`), set in
+  `drvUserCreate` per record. The asyn-rs `PortDriver::drv_user_create(&self, drv_info) -> usize`
+  contract returns only a **shared reason index** with no per-record state slot — two records both
+  `STRING_HIGH` with different `LEN` resolve to the same reason, and the accessor sees only the
+  record buffer length (`buf.len()`), never the cap. Honouring `LEN=N` needs an asyn-rs mechanism
+  to carry per-record driver data (C's `drvUser`) — a framework change spanning `modbus-rs` ↔
+  `asyn-rs`, the same class as R54. The *validation* half is closed (R51); the *value* application
+  is **surfaced for design sign-off**, not patched. (`AsynUser.user_data: Option<Box<dyn Any>>`
+  exists but `drv_user_create` neither receives the `AsynUser` nor returns per-user data, so there
+  is no wiring path today.)
 
 ### R35 — BCD encode masks each digit to a nibble (intentional; aside)
 - **Severity:** NOTE — intentional-divergence aside, **not a defect**
@@ -203,23 +212,31 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   `engine.stats`, but they are never copied to the params → the `statistics.template`
   longins read 0 forever; C shows real counts.
 
-### R51 — drvUser `=N` suffix validation dropped (C error routes missing)
+### R51 — drvUser `=N` suffix validation dropped (C error routes missing) — CLEARED (903efea0)
 - **Severity:** CONCERN (negative space; invalid drvInfo silently accepted)
-- **Rust:** `ioc.rs:499-503` (splits on `=`, keeps prefix, drops the rest unvalidated)
+- **Rust:** `ioc.rs` `drv_user_create` (splits on `=`, keeps prefix, drops the rest unvalidated)
 - **C:** `drvModbusAsyn.cpp:387-413` (`=` valid only for the 8 string types → `asynError`
   for non-string; for string types `strtol` base-0 with `asynError` on garbage/negative)
-- `INT16=5`, `STRING_HIGH=abc`, `STRING_HIGH=-3` all resolve in Rust where C rejects.
-  (Dropping the length *value* is intentional, `ioc.rs:15-18` / R34; the missing piece is
-  the *validation*.)
+- `INT16=5`, `STRING_HIGH=abc`, `STRING_HIGH=-3` all resolved in Rust where C rejects.
+- **Fix:** `drv_user_create` now requires a suffix's resolved reason to be a string type and the
+  suffix to parse as `strtol`-base-0 non-negative (`parse_drvuser_string_len`: 0x/0X hex, leading-0
+  octal, else decimal; empty = 0 as C accepts), else `AsynError::Status{Error}` fails record init.
+  The length *value* is still discarded — no asyn-rs home (R34). Tests
+  `drv_user_create_validates_string_length_suffix`, `parse_drvuser_string_len_matches_strtol_base0`.
 
-### R52 — drvUser bind does not reject an out-of-range offset (error deferred to first I/O)
+### R52 — drvUser bind does not reject an out-of-range offset (error deferred to first I/O) — CLEARED (e633e601)
 - **Severity:** CONCERN (error at I/O time instead of init)
-- **Rust:** `ioc.rs:496-503` (`drv_user_create` runs no `checkOffset`; offsets validated per
-  accessor, e.g. `ioc.rs:513`)
-- **C:** `drvModbusAsyn.cpp:378-384` (`drvUserCreate` does `getAddr`+`checkOffset`, returns
-  `asynError`, failing record init)
-- An over-range `addr` fails record init in C; in Rust it initializes and alarms on every
-  I/O (never-connected vs alive-but-always-alarming).
+- **Rust:** `drv_user_create` runs no `checkOffset` (it has no `addr` — the asyn-rs
+  `drv_user_create -> usize` contract resolves a shared reason, not a per-record bind); offsets
+  were validated only per accessor.
+- **C:** `drvModbusAsyn.cpp:378-384` (`drvUserCreate` `getAddr`+`checkOffset`) **and** `connect`
+  (`:455-467`, the per-pasynUser offset gate) both reject an over-range offset with `asynError`.
+- An over-range `addr` failed record init in C; in Rust it initialized and alarmed on every I/O.
+- **Fix:** modbus is a multi-device port (`ASYN_MULTIDEVICE`), so the framework drives the per-`addr`
+  connect through `connect_addr`. The driver overrides it to run `check_offset` and reject before
+  marking the address connected — the faithful analogue of C's `connect` offset gate (the asyn-rs
+  `drv_user_create` has no `addr`, so the connect path is where the per-record offset lives). Test
+  `connect_addr_rejects_out_of_range_offset`.
 
 ### R53 — modbusInterposeConfig accepts timeoutMsec + writeDelayMsec but silently drops both
 - **Severity:** CONCERN (configured timeout + inter-frame write delay ignored)

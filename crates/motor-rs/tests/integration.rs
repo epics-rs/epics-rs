@@ -372,6 +372,175 @@ async fn test_zero_idle_interval_is_event_only_not_busy_spin() {
     let _ = poll_handle.await;
 }
 
+/// Idle change-detection: a stationary axis polled at a NON-zero idle interval
+/// must not re-post on every poll. C `asynMotorAxis::callParamCallbacks`
+/// (asynMotorAxis.cpp:316-322) fires the status callback — which drives the
+/// record's process() — only when `statusChanged_` is set; on an unchanging
+/// idle poll C posts nothing. A *forced* poll (StartPolling, the analogue of
+/// C `motorUpdateStatus_` forcing `statusChanged_=1`) still posts even when the
+/// status is identical, so STUP/GET_INFO acks and readback refreshes are never
+/// stranded.
+#[tokio::test]
+async fn test_idle_poll_change_detection_suppresses_unchanged_reposts() {
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new()));
+    let (poll_cmd_tx, poll_cmd_rx) = mpsc::channel(16);
+    let device_state = motor_rs::device_state::new_shared_state();
+    let (io_intr_tx, mut io_intr_rx) = mpsc::channel::<()>(64);
+
+    // Non-zero idle interval so the timed arm fires repeatedly; moving 5ms.
+    let poll_loop = motor_rs::poll_loop::MotorPollLoop::new(
+        poll_cmd_rx,
+        io_intr_tx,
+        motor,
+        device_state.clone(),
+        Duration::from_millis(5),
+        Duration::from_millis(5),
+        0,
+    );
+    let poll_handle = tokio::spawn(poll_loop.run());
+
+    // Drain io_intr so a (would-be) re-post spree is not throttled by the
+    // channel and is observable through the seq.
+    tokio::spawn(async move { while io_intr_rx.recv().await.is_some() {} });
+
+    let seq = |ds: &motor_rs::device_state::SharedDeviceState| {
+        ds.lock()
+            .unwrap()
+            .latest_status
+            .as_ref()
+            .map(|s| s.seq)
+            .unwrap_or(0)
+    };
+
+    // StartPolling forces one post → seq 1→2.
+    poll_cmd_tx.send(PollCommand::StartPolling).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        seq(&device_state),
+        2,
+        "a stationary axis must not re-post on every idle poll (change-gated)"
+    );
+
+    // A second StartPolling is a FORCED poll → re-posts even though the status
+    // is byte-identical → seq 2→3.
+    poll_cmd_tx.send(PollCommand::StartPolling).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        seq(&device_state),
+        3,
+        "a forced poll must post even when status is unchanged (STUP/GET_INFO ack)"
+    );
+
+    let _ = poll_cmd_tx.send(PollCommand::Shutdown).await;
+    let _ = poll_handle.await;
+}
+
+/// Held-jog resume must survive the idle-poll change-gate. The operator holds
+/// JOGF during a positional move; on a close-enough completion the jog resumes
+/// on a follow-up record pass (the Idle-arm `dispatch_latent_collection`). C
+/// strands this (special() arms MIP_JOG_REQ only at mip==MIP_DONE,
+/// motorRecord.cc:3045, so a button pressed during a move is never armed); Rust
+/// preserves the resume as a deliberate divergence. With the change-gate, a
+/// now-stationary axis no longer notifies on an unchanged poll, so the resume
+/// would strand unless `finalize_motion` requests one forced poll.
+///
+/// This test drives the record ONLY on `io_intr` — the production wiring —
+/// unlike the unit test `close_enough_defers_held_jog_to_next_idle_poll`, which
+/// calls `check_completion()` directly and so cannot observe a missing forced
+/// poll. Without the `finalize_motion` request_poll the settle poll is
+/// suppressed, no `io_intr` fires, and the axis stays Idle until the deadline.
+#[tokio::test]
+async fn test_held_jog_resumes_through_poll_loop_after_close_enough() {
+    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new()));
+    let mut setup = make_builder(motor).build();
+
+    setup.device_support.init(&mut setup.record).unwrap();
+    // Drive the record only when the poll loop fires io_intr (production wiring).
+    let mut io_intr_rx = setup
+        .device_support
+        .io_intr_receiver()
+        .expect("device support owns the io_intr receiver until iocInit wiring");
+    let poll_handle = tokio::spawn(setup.poll_loop.run());
+
+    // Startup pass.
+    setup.record.process().unwrap();
+    setup.device_support.write(&mut setup.record).unwrap();
+
+    // Move SLOWLY (≈40ms over several 5ms polls) so the test loop keeps up with
+    // io_intr and the channel does not back up: a backlog of moving-phase
+    // notifications would give the record free extra passes after completion
+    // and mask the dependency on the forced poll. Lands within RDBD of the
+    // target (close-enough on arrival).
+    setup.record.vel.velo = 50.0;
+    setup.record.retry.rdbd = 0.5;
+    setup
+        .record
+        .put_field("VAL", EpicsValue::Double(2.0))
+        .unwrap();
+    setup.record.process().unwrap();
+    setup.device_support.write(&mut setup.record).unwrap();
+
+    // Operator holds JOGF DURING the move (mip == MOVE, not DONE): MIP_JOG_REQ
+    // is never armed — exactly the case C strands.
+    setup.record.ctrl.jogf = true;
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+
+    // Phase 1: process io_intr until the move completes (finalize runs; the jog
+    // is NOT fired in the completion pass).
+    let mut completed = false;
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(100), io_intr_rx.recv()).await {
+            Ok(Some(())) => {
+                setup.record.process().unwrap();
+                setup.device_support.write(&mut setup.record).unwrap();
+                if setup.record.stat.dmov && setup.record.stat.phase == MotionPhase::Idle {
+                    completed = true;
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+    assert!(completed, "the positional move must complete close-enough");
+
+    // Drain any moving-phase io_intr still buffered. This runs synchronously,
+    // before the next await, so the forced poll the completion just requested
+    // (write → StartPolling, serviced by the poll-loop task only at the next
+    // await point) is NOT yet in the channel and is not drained. After this,
+    // the only way a fresh io_intr arrives on the now-stationary, change-gated
+    // axis is that forced poll.
+    while io_intr_rx.try_recv().is_ok() {}
+
+    // Phase 2: the held jog must resume. Without the finalize_motion forced
+    // poll, no io_intr fires and the axis stays Idle until the deadline.
+    let mut resumed = false;
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), io_intr_rx.recv()).await {
+            Ok(Some(())) => {
+                setup.record.process().unwrap();
+                setup.device_support.write(&mut setup.record).unwrap();
+                if setup.record.stat.phase == MotionPhase::Jog {
+                    resumed = true;
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+
+    assert!(
+        resumed,
+        "held JOGF must resume via the real poll loop after a close-enough completion (phase={:?}, jogf={})",
+        setup.record.stat.phase, setup.record.ctrl.jogf
+    );
+
+    let _ = setup.poll_cmd_tx.send(PollCommand::Shutdown).await;
+    let _ = poll_handle.await;
+}
+
 // Helper: read the SimMotor's current dial position.
 fn read_motor_pos(motor: &Arc<Mutex<dyn AsynMotor>>) -> f64 {
     let mut m = motor.lock().unwrap();

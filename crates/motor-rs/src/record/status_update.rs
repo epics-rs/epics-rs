@@ -80,9 +80,18 @@ impl MotorRecord {
     /// Convert ProcessEffects to DeviceActions for the shared mailbox.
     pub(crate) fn effects_to_actions(&mut self, effects: &ProcessEffects) -> DeviceActions {
         let poll = if effects.request_poll {
-            PollDirective::Start
+            // An explicit poll request (move dispatch, LOAD_POS readback,
+            // retarget) wants a fresh status post — Refresh forces it through
+            // even if the polled status is unchanged.
+            PollDirective::Refresh
         } else if effects.status_refresh {
-            PollDirective::Start
+            // STUP / implicit GET_INFO / DELAY_ACK settle-resume. C's
+            // motorUpdateStatus_ forces statusChanged_=1 (asynMotorController
+            // .cpp:217-222) so the ack callback always fires and clears
+            // STUP=BUSY; Refresh is the analogue. A plain Start would dedup
+            // against the already-running poller and leave STUP stranded on a
+            // stationary axis whose status never changes.
+            PollDirective::Refresh
         } else if effects.commands.is_empty() && effects.schedule_delay.is_none() && self.stat.dmov
         {
             // C asynMotorController::asynMotorPoller (asynMotorController.cpp:

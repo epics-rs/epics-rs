@@ -5,7 +5,15 @@ use crate::user::AsynUser;
 
 /// Motor axis status.
 /// Fields match the C asynMotorController MotorStatus structure.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` backs the poll loop's idle change-detection: the loop notifies
+/// the record only when a freshly polled status differs from the last one
+/// delivered, the analogue of C `asynMotorAxis::callParamCallbacks`
+/// (asynMotorAxis.cpp:316-322) firing the generic-pointer status callback only
+/// when `statusChanged_` is set. f64 `!=` matches C's field comparisons
+/// (`value != status_.position`), including the `NaN != NaN` always-changed
+/// case.
+#[derive(Debug, Clone, PartialEq)]
 pub struct MotorStatus {
     /// Current position in user coordinates.
     pub position: f64,

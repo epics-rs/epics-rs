@@ -443,7 +443,7 @@ impl MotorRecord {
     }
 
     /// Finalize motion: set Idle, DMOV=true.
-    pub(crate) fn finalize_motion(&mut self, _effects: &mut ProcessEffects) {
+    pub(crate) fn finalize_motion(&mut self, effects: &mut ProcessEffects) {
         self.set_phase(MotionPhase::Idle);
         self.stat.mip = MipFlags::empty();
         self.stat.dmov = true;
@@ -482,6 +482,31 @@ impl MotorRecord {
         // stop_or_pause return on that pass; completions that keep
         // SPMG=Move reach the chain end and apply, like C.
         self.apply_latent_sync();
+
+        // A button (jog/home/tweak) latched across this completion resumes
+        // only on a subsequent record pass, where the Idle-arm
+        // dispatch_latent_collection re-fires it. The idle poll is that pass,
+        // but the poll loop now notifies the record only on a changed status
+        // (the C `statusChanged_` gate, asynMotorAxis.cpp:316-322), so a
+        // now-stationary axis would never deliver it and the held button would
+        // strand. Request one forced poll so the deferred level-triggered
+        // action gets its pass. C strands this case (special() arms
+        // MIP_JOG_REQ only at mip==MIP_DONE, motorRecord.cc:3045, so a button
+        // pressed during a move is never armed); preserving the resume is a
+        // deliberate divergence from C's strand of an actively-held button.
+        // SYNC is already consumed above; queued_motion was cleared; the
+        // closed-loop DOL pull is intentionally left to the change-gate (C
+        // tracks it via CP-link/SCAN on a stationary axis, not the poller).
+        if self.can_accept_command()
+            && (self.ctrl.jogf
+                || self.ctrl.jogr
+                || self.ctrl.homf
+                || self.ctrl.homr
+                || self.ctrl.twf
+                || self.ctrl.twr)
+        {
+            effects.request_poll = true;
+        }
     }
 
     /// C maybeRetry close-enough restore (motorRecord.cc:1096-1101): a

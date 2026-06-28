@@ -215,6 +215,18 @@ impl MotorDeviceSupport {
                     }
                 }
             }
+            // Forced refresh (request_poll / status_refresh): send StartPolling
+            // UNCONDITIONALLY — the dedup is bypassed so the forced status post
+            // reaches the loop even while it is already polling (C
+            // motorUpdateStatus_ forces a poll+callback regardless of the
+            // poller's running state). The poll loop force-notifies on a
+            // StartPolling-triggered poll, so STUP=BUSY clears on a stationary
+            // axis. request_poll / status_refresh are discrete events (not set
+            // every in-motion pass), so this does not flood the poller.
+            PollDirective::Refresh => match self.poll_cmd_tx.try_send(PollCommand::StartPolling) {
+                Ok(()) => self.polling_active = true,
+                Err(e) => tracing::error!("motor: failed to send forced poll: {e}"),
+            },
             PollDirective::Stop => match self.poll_cmd_tx.try_send(PollCommand::StopPolling) {
                 Ok(()) => self.polling_active = false,
                 Err(e) => tracing::error!("motor: failed to send StopPolling: {e}"),

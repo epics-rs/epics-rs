@@ -939,6 +939,34 @@ mod tests {
         );
     }
 
+    // An explicit refresh request (request_poll / status_refresh — STUP,
+    // implicit GET_INFO, settle-resume) must emit PollDirective::Refresh, the
+    // forced-post directive (C motorUpdateStatus_ forces statusChanged_=1), not
+    // the deduped keep-alive Start — otherwise STUP=BUSY strands on a stationary
+    // axis whose status never changes.
+    #[test]
+    fn refresh_request_forces_poll_directive() {
+        let mut rec = MotorRecord::new();
+        let status_refresh = ProcessEffects {
+            status_refresh: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            rec.effects_to_actions(&status_refresh).poll,
+            PollDirective::Refresh,
+            "status_refresh must force a poll"
+        );
+        let request_poll = ProcessEffects {
+            request_poll: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            rec.effects_to_actions(&request_poll).poll,
+            PollDirective::Refresh,
+            "request_poll must force a poll"
+        );
+    }
+
     // R44: C never derives motor UDF from VAL — motorRecord.cc touches udf
     // only at init_record (677-681), the closed-loop DOL collection
     // (1994-2005), and alarm_sub (3372). clears_udf() opts out of the

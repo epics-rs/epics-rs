@@ -227,6 +227,57 @@ async fn cat_round_trip_via_tcp_console() {
     server_task.abort();
 }
 
+/// PS-48: C `writePidFile` / `openLogFile` warn and run anyway on an
+/// unwritable path ("Don't stop here - just go without",
+/// procServ.cc:131-136,925). The port previously `?`-aborted in
+/// `bootstrap` — which, post-fork in daemon mode, is a silent false-start
+/// (the foreground parent has already reported success and exited). A pid
+/// file AND a log file pointed at a nonexistent directory must both fail
+/// to open without preventing the child from starting.
+#[tokio::test]
+async fn unwritable_pid_and_log_paths_do_not_abort_startup() {
+    let port = pick_port().await;
+    let mut cfg = cat_config(port);
+    // A missing intermediate directory makes both opens fail with ENOENT,
+    // exercising the pid-file and log-file sites of the same defect family.
+    let dir = tempfile::tempdir().unwrap();
+    let bad = dir.path().join("does-not-exist");
+    cfg.logging.log_path = Some(bad.join("ioc.log"));
+    cfg.logging.pid_path = Some(bad.join("ioc.pid"));
+    let server = ProcServ::new(cfg).expect("build");
+
+    let server_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    let mut conn = {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(50)).await,
+                Err(e) => panic!("could not connect: {e}"),
+            }
+        }
+    };
+
+    // The child (cat) must be running despite the unopenable side files:
+    // round-trip a line through the party-line proves startup completed.
+    conn.write_all(b"still alive\n").await.unwrap();
+    let out = read_for(&mut conn, Duration::from_secs(2)).await;
+    let cleaned = String::from_utf8_lossy(&strip_iac(&out)).to_string();
+    assert!(
+        cleaned.contains("still alive"),
+        "child should have started despite unopenable pid/log files; got: {cleaned:?}"
+    );
+
+    // The unwritable side files were not created.
+    assert!(!bad.join("ioc.log").exists());
+    assert!(!bad.join("ioc.pid").exists());
+
+    server_task.abort();
+}
+
 #[tokio::test]
 async fn kill_keystroke_signals_child() {
     let port = pick_port().await;

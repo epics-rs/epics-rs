@@ -189,21 +189,46 @@ impl SupervisorState {
         // write re-publishes the identical value (atomic rename, no torn
         // read) and is the sole writer in foreground / library use, where
         // there is no parent to write it.
-        if let Some(p) = &config.logging.pid_path {
-            write_pid_file(p, std::process::id() as i32)?;
+        if let Some(p) = &config.logging.pid_path
+            && let Err(e) = write_pid_file(p, std::process::id() as i32)
+        {
+            // C `writePidFile` warns and runs anyway on an unwritable path
+            // ("Don't stop here - just go without", procServ.cc:131-136). A
+            // pid file we cannot publish must not abort the IOC — otherwise,
+            // in daemon mode, the foreground parent has already reported
+            // success and exited, so aborting here is a silent false-start.
+            tracing::error!(
+                path = %p.display(),
+                error = %e,
+                "procserv-rs: unable to write PID file; continuing without it"
+            );
         }
         let log = if let Some(p) = &config.logging.log_path {
             // The LOG uses `stamp_log` + `stamp_format` (raw line prefix),
             // not the banner-facing `time_format`. With `stamp_log` off
             // (C default) the log is written verbatim.
-            Some(
-                LogFile::open(
-                    p,
-                    config.logging.stamp_log,
-                    config.logging.stamp_format.clone(),
-                )
-                .await?,
+            match LogFile::open(
+                p,
+                config.logging.stamp_log,
+                config.logging.stamp_format.clone(),
             )
+            .await
+            {
+                Ok(lf) => Some(lf),
+                Err(e) => {
+                    // C `openLogFile` warns and runs anyway ("Don't stop
+                    // here - just go without", procServ.cc:925). Same as the
+                    // pid file above: a log we cannot open must not abort the
+                    // IOC, especially post-fork where the parent already
+                    // exited with success.
+                    tracing::error!(
+                        path = %p.display(),
+                        error = %e,
+                        "procserv-rs: unable to open log file; continuing without a log"
+                    );
+                    None
+                }
+            }
         } else {
             None
         };

@@ -350,27 +350,70 @@ fn extract_json_field<'a>(
 /// Also handles bracket-wrapped arrays like `[1,2,3]`.
 fn parse_int_array(s: &str) -> MqttResult<Vec<i32>> {
     let s = s.trim_start_matches('[').trim_end_matches(']');
-    let separator = if s.contains(',') { ',' } else { ' ' };
-    s.split(separator)
-        .map(|part| {
-            part.trim()
-                .parse::<i32>()
-                .map_err(|e| MqttError::ValueConversion(format!("INTARRAY element: {e}")))
-        })
-        .collect()
+    let out: MqttResult<Vec<i32>> = if s.contains(',') {
+        // First-seen comma locks the comma separator (C drvMqtt.cpp:473); a
+        // comma skips trailing spaces (`:481-483`), so trim each element. A
+        // double comma leaves an empty element that fails to parse — rejected,
+        // matching C. The `"1 ,2"` leniency (space-then-comma) is kept.
+        s.split(',')
+            .map(|part| {
+                part.trim()
+                    .parse::<i32>()
+                    .map_err(|e| MqttError::ValueConversion(format!("INTARRAY element: {e}")))
+            })
+            .collect()
+    } else {
+        // Space separator: C skips a *run* of whitespace between numbers
+        // (loop-top `while isspace` skip, drvMqtt.cpp:447), so `"1  2"` is
+        // `[1,2]`. `split_whitespace` collapses consecutive whitespace and
+        // ignores leading/trailing, reproducing that (vs `split(' ')`, which
+        // emitted an empty element on a double space and rejected the value).
+        s.split_whitespace()
+            .map(|part| {
+                part.parse::<i32>()
+                    .map_err(|e| MqttError::ValueConversion(format!("INTARRAY element: {e}")))
+            })
+            .collect()
+    };
+    let out = out?;
+    if out.is_empty() {
+        // C rejects an empty / all-whitespace / `"[]"` payload
+        // (drvMqtt.cpp:428,444,448); never yield an empty array.
+        return Err(MqttError::ValueConversion("INTARRAY: empty value".into()));
+    }
+    Ok(out)
 }
 
 /// Parse a comma-separated or space-separated list of floats.
 fn parse_float_array(s: &str) -> MqttResult<Vec<f64>> {
     let s = s.trim_start_matches('[').trim_end_matches(']');
-    let separator = if s.contains(',') { ',' } else { ' ' };
-    s.split(separator)
-        .map(|part| {
-            part.trim()
-                .parse::<f64>()
-                .map_err(|e| MqttError::ValueConversion(format!("FLOATARRAY element: {e}")))
-        })
-        .collect()
+    let out: MqttResult<Vec<f64>> = if s.contains(',') {
+        // First-seen comma locks the comma separator (C drvMqtt.cpp:550); see
+        // `parse_int_array` for the comma/double-comma/`"1 ,2"` rationale.
+        s.split(',')
+            .map(|part| {
+                part.trim()
+                    .parse::<f64>()
+                    .map_err(|e| MqttError::ValueConversion(format!("FLOATARRAY element: {e}")))
+            })
+            .collect()
+    } else {
+        // Space separator collapses whitespace runs (C drvMqtt.cpp:532); see
+        // `parse_int_array`.
+        s.split_whitespace()
+            .map(|part| {
+                part.parse::<f64>()
+                    .map_err(|e| MqttError::ValueConversion(format!("FLOATARRAY element: {e}")))
+            })
+            .collect()
+    };
+    let out = out?;
+    if out.is_empty() {
+        // C rejects an empty / all-whitespace / `"[]"` payload
+        // (drvMqtt.cpp:511,527,533); never yield an empty array.
+        return Err(MqttError::ValueConversion("FLOATARRAY: empty value".into()));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -498,6 +541,57 @@ mod tests {
         let addr = TopicAddress::parse("FLAT:FLOATARRAY test/t").unwrap();
         let val = decode_payload("1.1,2.2,3.3", &addr).unwrap();
         assert_eq!(val, DecodedValue::Float64Array(vec![1.1, 2.2, 3.3]));
+    }
+
+    /// MQ32: a space separator collapses a run of whitespace between numbers,
+    /// matching C's loop-top `while isspace` skip (drvMqtt.cpp:447). `split(' ')`
+    /// previously emitted an empty element on a double space and rejected the
+    /// value — a Rust-worse-than-C regression.
+    #[test]
+    fn decode_flat_int_array_double_space() {
+        let addr = TopicAddress::parse("FLAT:INTARRAY test/t").unwrap();
+        assert_eq!(
+            decode_payload("1  2", &addr).unwrap(),
+            DecodedValue::Int32Array(vec![1, 2])
+        );
+        // Inside brackets too, after the bracket strip.
+        assert_eq!(
+            decode_payload("[1   2   3]", &addr).unwrap(),
+            DecodedValue::Int32Array(vec![1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn decode_flat_float_array_double_space() {
+        let addr = TopicAddress::parse("FLAT:FLOATARRAY test/t").unwrap();
+        assert_eq!(
+            decode_payload("1.5   2.5", &addr).unwrap(),
+            DecodedValue::Float64Array(vec![1.5, 2.5])
+        );
+    }
+
+    /// MQ32: collapsing whitespace must NOT turn an empty / all-whitespace /
+    /// `"[]"` payload into an empty array — C rejects those (drvMqtt.cpp:428,
+    /// 444,448 for ints; :511,527,533 for floats).
+    #[test]
+    fn decode_flat_array_empty_is_rejected() {
+        let int_addr = TopicAddress::parse("FLAT:INTARRAY test/t").unwrap();
+        assert!(decode_payload("", &int_addr).is_err());
+        assert!(decode_payload("   ", &int_addr).is_err());
+        assert!(decode_payload("[]", &int_addr).is_err());
+        assert!(decode_payload("[ ]", &int_addr).is_err());
+        let flt_addr = TopicAddress::parse("FLAT:FLOATARRAY test/t").unwrap();
+        assert!(decode_payload("", &flt_addr).is_err());
+        assert!(decode_payload("[]", &flt_addr).is_err());
+    }
+
+    /// MQ32: the comma branch is unchanged — a double comma still rejects
+    /// (empty element fails to parse, matching C's strictness), so the fix did
+    /// not loosen the comma path.
+    #[test]
+    fn decode_flat_int_array_double_comma_still_rejected() {
+        let addr = TopicAddress::parse("FLAT:INTARRAY test/t").unwrap();
+        assert!(decode_payload("1,,2", &addr).is_err());
     }
 
     #[test]

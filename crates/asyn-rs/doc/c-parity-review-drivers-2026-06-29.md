@@ -162,3 +162,15 @@ architecture), F8 (write_octet count contract), and F3 (UDP redesign) are
 surfaced for sign-off before implementation because they change framework
 contracts / behavioral models, not just a driver site.
 
+## Fix Log
+
+- **DRV-5** (DEFECT, ip_port write-side teardown) — CLEARED. Added a single
+  owner for the fatal-transport-error classification
+  (`is_fatal_transport_error`) and teardown (`drop_connection`), shared by the
+  read path (refactored to call them) and the write path (new). On a fatal
+  write error (`ECONNRESET`/`EPIPE`) the port now closes the socket + sets
+  `connected=false` so the actor's `!connected`-gated auto-reconnect
+  (port_actor.rs:311-322) re-establishes it on the next request — symmetric
+  with the read path. Tests: `test_is_fatal_transport_error_classification`,
+  `test_write_error_disconnects`.
+

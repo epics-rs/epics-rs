@@ -464,7 +464,31 @@ pub struct DrvAsynIPPort {
     host_info: String,
 }
 
+/// A transport error meaning the socket is broken and the connection must
+/// be torn down (vs a timeout / would-block, which leaves it intact). C
+/// parity: `drvAsynIPPort.c` calls `closeConnection` on any real
+/// `recv`/`send` error but returns `asynTimeout` with the socket intact on
+/// a poll/timeout expiry.
+fn is_fatal_transport_error(e: &AsynError) -> bool {
+    matches!(
+        e,
+        AsynError::Status {
+            status: AsynStatus::Disconnected,
+            ..
+        } | AsynError::Io(_)
+    )
+}
+
 impl DrvAsynIPPort {
+    /// Tear down the live socket and mark the port disconnected so the
+    /// actor's auto-reconnect (`port_actor.rs`) re-establishes it on the
+    /// next request. C parity: `drvAsynIPPort.c::closeConnection`, which
+    /// closes the fd and fires `exceptionDisconnect`.
+    fn drop_connection(&mut self) {
+        self.io.inner = None;
+        self.base.set_connected(false);
+    }
+
     /// Create a new IP port driver.
     ///
     /// The driver starts disconnected with `auto_connect = true` and `can_block = true`.
@@ -779,19 +803,13 @@ impl PortDriver for DrvAsynIPPort {
                         ..
                     }
                 );
-                let is_disconnect = matches!(
-                    e,
-                    AsynError::Status {
-                        status: AsynStatus::Disconnected,
-                        ..
-                    }
-                );
                 // C parity: auto-disconnect on:
                 // 1. disconnectOnReadTimeout AND timeout error
-                // 2. Any real error that isn't timeout/WouldBlock (e.g. connection reset, EOF)
-                let should_disconnect = (self.disconnect_on_read_timeout && is_timeout)
-                    || is_disconnect
-                    || (!is_timeout && matches!(e, AsynError::Io(_)));
+                // 2. Any fatal transport error (connection reset, EOF) —
+                //    `is_fatal_transport_error` is the single owner of that
+                //    classification, shared with the write path.
+                let should_disconnect =
+                    (self.disconnect_on_read_timeout && is_timeout) || is_fatal_transport_error(e);
                 if should_disconnect && self.base.connected {
                     asyn_trace!(
                         Some(self.base.trace),
@@ -799,8 +817,7 @@ impl PortDriver for DrvAsynIPPort {
                         TraceMask::FLOW,
                         "read error, disconnecting: {e}"
                     );
-                    self.io.inner = None;
-                    self.base.set_connected(false);
+                    self.drop_connection();
                 }
                 result.map(|r| r.nbytes_transferred)
             }
@@ -821,10 +838,31 @@ impl PortDriver for DrvAsynIPPort {
             data,
             "write"
         );
-        self.base
+        match self
+            .base
             .interpose_octet
-            .dispatch_write(user, data, &mut self.io)?;
-        Ok(())
+            .dispatch_write(user, data, &mut self.io)
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // C parity: drvAsynIPPort.c::writeIt closes the connection
+                // on a real send error (ECONNRESET/EPIPE) so the next
+                // request reconnects. The read path already tears down on a
+                // fatal error; without the symmetric write-side teardown a
+                // wedged socket reports `connected` forever and never
+                // self-heals.
+                if is_fatal_transport_error(&e) && self.base.connected {
+                    asyn_trace!(
+                        Some(self.base.trace),
+                        &self.base.port_name,
+                        TraceMask::FLOW,
+                        "write error, disconnecting: {e}"
+                    );
+                    self.drop_connection();
+                }
+                Err(e)
+            }
+        }
     }
 
     fn io_flush(&mut self, user: &mut AsynUser) -> AsynResult<()> {
@@ -1109,6 +1147,57 @@ mod tests {
         }
 
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_is_fatal_transport_error_classification() {
+        // DRV-5/DRV-31 family: a broken-socket error tears the connection
+        // down; a timeout leaves it intact (the actor reconnects on the
+        // next request only when `connected` flips to false).
+        assert!(is_fatal_transport_error(&AsynError::Status {
+            status: AsynStatus::Disconnected,
+            message: "EOF".into(),
+        }));
+        assert!(is_fatal_transport_error(&AsynError::Io(
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "rst")
+        )));
+        assert!(!is_fatal_transport_error(&AsynError::Status {
+            status: AsynStatus::Timeout,
+            message: "read timeout".into(),
+        }));
+    }
+
+    #[test]
+    fn test_write_error_disconnects() {
+        // DRV-5: a fatal write error must tear down the connection so the
+        // actor's auto-reconnect fires — symmetric with the read path,
+        // which already disconnects on a fatal error.
+        let (listener, port) = start_echo_server();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream); // peer closes → our later writes get RST/EPIPE
+        });
+
+        let mut drv = DrvAsynIPPort::new("iptest", &format!("127.0.0.1:{port}")).unwrap();
+        drv.connect(&AsynUser::default()).unwrap();
+        assert!(drv.base().connected);
+        handle.join().unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let mut user = AsynUser::new(0).with_timeout(Duration::from_secs(1));
+        let mut last = Ok(());
+        for _ in 0..200 {
+            last = drv.write_octet(&mut user, b"ping\n");
+            if last.is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(last.is_err(), "expected a write to the dead peer to fail");
+        assert!(
+            !drv.base().connected,
+            "DRV-5: fatal write error must set connected=false"
+        );
     }
 
     #[test]

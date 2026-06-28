@@ -127,10 +127,22 @@ pub fn fork_and_go(parent: DaemonParent<'_>) -> ProcServResult<()> {
             // at function return, after the dup2s have copied it onto 0/1/2.
             let null_fd = null.as_raw_fd();
             for fd in [0, 1, 2] {
-                dup2(null_fd, fd)
-                    .map_err(|e| ProcServError::Forkpty(format!("dup2(/dev/null, {fd}): {e}")))?;
+                // C `ignore_result( dup(fh) )` (procServ.cc:906) — unchecked.
+                // The parent has already written the pidfile with this child's
+                // pid and `exit(0)`'d, so aborting here is a headless-daemon
+                // false-success (PS-52, sibling of PS-50). The IOC's stdio
+                // comes from the PTY, not the daemon's 0/1/2, so a failed
+                // redirect doesn't break it — warn and continue.
+                if let Err(e) = dup2(null_fd, fd) {
+                    eprintln!("procserv-rs: dup2(/dev/null, {fd}) failed: {e}; continuing");
+                }
             }
-            setsid().map_err(|e| ProcServError::Forkpty(format!("setsid: {e}")))?;
+            // C `setsid();` (procServ.cc:910) — also unchecked. Failing to
+            // detach from the controlling terminal does not break the daemon;
+            // warn and continue rather than abort the already-published child.
+            if let Err(e) = setsid() {
+                eprintln!("procserv-rs: setsid failed: {e}; continuing");
+            }
             Ok(())
         }
     }

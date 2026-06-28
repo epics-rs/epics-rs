@@ -417,9 +417,17 @@ MQ36, MQ48, MQ49.
 - **MQ32 — CLEARED** `6e82dc8c` — the space-separator branch uses
   `split_whitespace` (collapses a run of inter-number whitespace like C's
   loop-top skip, drvMqtt.cpp:447/532), so `"1  2"` decodes to `[1,2]`. The comma
-  branch is unchanged (double comma still rejects, the `"1 ,2"` leniency kept),
-  and an empty result errors so an empty / all-whitespace / `"[]"` payload never
-  becomes `[]` (C rejects those). Fixed both array parsers.
+  branch is unchanged (double comma still rejects), and an empty result errors so
+  an empty / all-whitespace / `"[]"` payload never becomes `[]` (C rejects those).
+  Fixed both array parsers. The *only* divergence the fix targeted — `"1  2"`
+  being Rust-**worse** than C — is closed. The comma branch's per-element
+  `.trim()` keeps several Rust-**more-lenient**-than-C inputs unchanged (so Rust ≥
+  C, never worse), and these stay KEPT, consistent with MQ33's bracket
+  disposition: `"1 ,2"` and `"1, 2 "` (trailing space) → Rust `[1,2]`, C rejects
+  (separator mismatch, drvMqtt.cpp:479); `"[[1,2]]"` / `"[1,2"` (unbalanced
+  brackets) → see **MQ33** (Rust strips brackets greedily where C requires one
+  balanced pair). No real broker emits these; matching C's character-state-machine
+  strictness would be a rewrite for no functional gain.
 - **MQ40 — CLEARED** `2148c2e7` — a JSON object/array carrier on a STRING topic
   is serialized with object keys sorted recursively (new `dump_sorted`), matching
   C `fieldAddr->dump()` over a `std::map`-backed json (drvMqtt.cpp:265); arrays

@@ -285,7 +285,8 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - Impact: C lets the PID-file path come from `PROCSERV_PID` (used by some service wrappers). Rust ignores the env entirely, so an environment-driven pidfile is never written.
 
 #### PS-31 Log file requested mode 0666 (vs C 0644) and no `fsync`
-- Severity: CONCERN
+- Severity: CONCERN — CLEARED (this round)
+- Resolution: (1) `open_handle` now requests mode `0o644` via `OpenOptions::mode` (`S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH`, C procServ.cc:924) instead of the platform default 0666; `mode()` applies only on creation, like the mode arg to C's `open()`, so a permissive umask no longer yields a group/other-writable log. (2) `LogSink::write_all`'s File arm now `sync_all()`s (fsync) after the write/flush, matching C's `fsync(logFileFD)` after every log write (procServ.cc:748) — a power loss can no longer lose lines the server already accepted; tokio's `flush` is not an fsync. The Stdout arm (`--logfile -`) stays flush-only: C's `fsync(1)` on the tty/pipe case is an error-ignored no-op, and tokio's `Stdout` exposes no sync (a `--logfile -` redirected to a regular file is the lone residual — minor, fd-1 case only). Test: `log_file_is_created_mode_0644` (umask cleared for determinism under nextest's process-per-test, asserts the created file is exactly `0o644`).
 - Rust: `src/procserv/sidecar.rs:86-89` (`create(true).append(true)` → mode 0666 & ~umask), `:121-122/:157-158` (`flush()` only)
 - C: `procServ.cc:924` (`open(..., S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH)` = 0644), `:748` (`fsync` after every write)
 - Impact: (1) C requests 0644 (no group/other write); Rust 0666, so under a permissive umask the log is group/other-writable where C's is not. (2) C `fsync`s after each write; Rust only `flush`es (tokio File flush is not an fsync), so on power loss buffered lines C would have synced can be lost.

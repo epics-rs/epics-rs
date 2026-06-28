@@ -81,7 +81,12 @@ impl LogSink {
         match self {
             LogSink::File { handle, .. } => {
                 handle.write_all(buf).await?;
-                handle.flush().await
+                handle.flush().await?;
+                // C `fsync(logFileFD)` after every log write
+                // (procServ.cc:748): a power loss must not lose lines the
+                // server already accepted. tokio's `flush` only pushes the
+                // userspace buffer to the OS — `sync_all` is the fsync.
+                handle.sync_all().await
             }
             LogSink::Stdout(out) => {
                 out.write_all(buf).await?;
@@ -153,6 +158,13 @@ impl LogFile {
         OpenOptions::new()
             .create(true)
             .append(true)
+            // C opens the log 0644 (S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH,
+            // procServ.cc:924) — owner rw, group/other read-only. The
+            // platform default (0666 & ~umask) leaves it group/other
+            // writable under a permissive umask, where C's does not.
+            // `mode()` applies only when the file is created, exactly like
+            // the mode arg to C's `open()`.
+            .mode(0o644)
             .open(path)
             .await
             .map_err(ProcServError::Io)
@@ -553,6 +565,25 @@ mod tests {
 
         let content = std::fs::read(&path).unwrap();
         assert_eq!(content, b"line1\nline2\npartial continued\n");
+    }
+
+    #[tokio::test]
+    async fn log_file_is_created_mode_0644() {
+        // PS-31: C opens the log 0644 (S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH,
+        // procServ.cc:924). The platform default 0666 would be
+        // group/other-writable under a permissive umask, where C's is not.
+        // Clear the umask so the requested creation mode is observed
+        // exactly — nextest runs each test in its own process, so this
+        // global change is isolated.
+        use std::os::unix::fs::PermissionsExt;
+        let prev = unsafe { libc::umask(0) };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mode.log");
+        let log = LogFile::open(&path, false, String::new()).await.unwrap();
+        log.write_chunk(b"x\n").await.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        unsafe { libc::umask(prev) };
+        assert_eq!(mode, 0o644, "log file must be created rw-r--r-- (0644)");
     }
 
     #[tokio::test]

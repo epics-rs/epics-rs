@@ -45,7 +45,7 @@ on the user's call. STD-9 is the same shape and is surfaced the same way.
 
 ## Open findings (this round)
 
-### STD-9 — throttle WAIT held for the whole delay; C clears it after the immediate send — CONCERN (surface for sign-off)
+### STD-9 — throttle WAIT held for the whole delay; C clears it after the immediate send — CONCERN — **FIXED 67cd226d (user: Match C)**
 
 Round 1 listed throttle "WAIT" under "verified-equivalent (std)" (round-1 doc
 line 553). A line-by-line re-read shows it is **not** equivalent.
@@ -83,12 +83,16 @@ line 553). A line-by-line re-read shows it is **not** equivalent.
   `:522/538/593/624/633`, read once at `:716` for the WAIT field) — no control
   flow depends on it, so the choice affects only the observable WAIT field.
 
-- **Disposition: surface for sign-off (Match C vs keep Rust).** If Match C: set
-  `wait = 0` at `:624` and `:538` (clear after the OUT write), keep `wait = 1`
-  at `:593` (value queued); update the three `throttle_tests.rs` asserts and
-  the `:617-621` comment. If keep Rust: record the WAIT-semantic divergence as
-  an accepted deviation. Per the STD-7/8 precedent the campaign default is
-  Match C, but the WAIT field meaning is a semantic choice the user owns.
+- **Disposition: Match C — FIXED 67cd226d.** User chose Match C (same as the
+  STD-7/8 precedent). `wait = 0` at `:624` (immediate send) and `:538` (drain
+  re-arm), `wait = 1` kept at `:593` (value queued), so the invariant is now
+  uniform: WAIT=1 ⟺ `pending_value.is_some()`. The `:617-621`/`:583-590`
+  comments were rewritten and four asserts updated (`throttle_tests.rs`
+  test_process_sends_value_with_delay / test_process_queues_during_delay /
+  the clip-on drain test / test_dly_huge_finite…process, plus
+  `integration_tests.rs` test_throttle_delayed_reprocess) — each immediate-send
+  assert flipped to WAIT=0 with a positive WAIT=1 queued-state check added.
+  std-rs nextest 183/183.
 
 ### STD-10 — throttle SYNC requested during a queued value is read immediately, not deferred to the drain — NOTE (keep-Rust, end-state equivalent)
 
@@ -124,12 +128,14 @@ line 553). A line-by-line re-read shows it is **not** equivalent.
   the first callback. Entirely within the asyn-driver-wired fast path (needs a
   real/sim asyn Float64 port to exercise, like the unported scaler hardware
   driver in SCAL-9).
-- **STD-11a (clean, optional):** source `epid.dt` from
-  `pvt.time_per_point_actual` in `update_record_from_params` to match
-  `update_params:330` directly. **STD-11b (hardware-path, deferred):** seed
-  `callback_interval` from the asyn input port at init like
-  `devEpidFast.c:254-256`; requires the asyn driver wiring and is untestable
-  without it.
+- **STD-11a — FIXED a6dc15f0:** `epid.dt` now sourced from
+  `pvt.time_per_point_actual` in `update_record_from_params`, matching
+  `update_params:330` directly (closes the post-interval / pre-data-callback
+  window). **STD-11b (hardware-path, deferred):** seed `callback_interval`
+  from the asyn input port at init like `devEpidFast.c:254-256`; requires the
+  asyn driver wiring and is untestable without it, and it shadows STD-11a in
+  the pre-first-interval-callback window (`time_per_point_actual` is itself 0
+  until `callback_interval` is seeded).
 
 ### STD-12 — SNL programs ported as native Rust FSMs (intentional redesign) — DESIGN
 
@@ -183,5 +189,8 @@ verified-equivalent), **two NOTEs** (STD-10 throttle SYNC deferral,
 end-state-equivalent; STD-11 epid_fast DT-source transient on the
 asyn-hardware path), and **one DESIGN** (STD-12 SNL sequencer→FSM redesign).
 The epid_soft_callback TRIG/PACT path and the epid_fast PID/averaging body are
-verified-equivalent. No silent fixes: STD-9 requires the user's Match-C-vs-keep
-call before any source/test change.
+verified-equivalent. STD-9 was surfaced (not silently fixed) — user chose
+Match C, fixed at 67cd226d. STD-11a fixed at a6dc15f0. STD-10 (keep-Rust),
+STD-11b (hardware-deferred) and STD-12 (SNL redesign DESIGN; femto deferred)
+remain as documented dispositions. Round-2 converged: one CONCERN fixed to
+C, one NOTE fixed, the rest dispositioned.

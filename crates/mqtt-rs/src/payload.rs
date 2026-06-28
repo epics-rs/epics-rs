@@ -285,7 +285,7 @@ fn decode_json(raw: &str, value_type: ValueType, field_path: &str) -> MqttResult
     }
     let carrier = match value {
         serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
+        other => dump_sorted(other),
     };
 
     // Octet/String is C's one non-parsing arm: `setStringParam(val)` uses
@@ -295,6 +295,38 @@ fn decode_json(raw: &str, value_type: ValueType, field_path: &str) -> MqttResult
         return Ok(DecodedValue::String(carrier));
     }
     decode_flat(&carrier, value_type)
+}
+
+/// Serialize a JSON value the way C's `fieldAddr->dump()` does (drvMqtt.cpp:265):
+/// compact, with object keys in **sorted** order at every level, because
+/// nlohmann's `json` is backed by a `std::map` (drvMqtt.h:19). serde_json with
+/// the `preserve_order` feature — which the shipped IOC build links transitively
+/// via `epics-base-rs` — would otherwise emit keys in document order, so a JSON
+/// object/array carrier on a STRING topic stored different bytes than C. Rebuild
+/// the value with sorted keys first, then serialize. Scalars are unaffected (the
+/// rebuild clones them), so only composite carriers change.
+fn dump_sorted(value: &serde_json::Value) -> String {
+    fn sort_value(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(map) => {
+                let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+                // With `preserve_order`, `Map` is an `IndexMap` that keeps
+                // insertion order, so inserting in sorted order yields sorted
+                // output; without it `Map` is a `BTreeMap` (already sorted).
+                let sorted: serde_json::Map<String, serde_json::Value> = entries
+                    .into_iter()
+                    .map(|(k, v)| (k.clone(), sort_value(v)))
+                    .collect();
+                serde_json::Value::Object(sorted)
+            }
+            serde_json::Value::Array(elems) => {
+                serde_json::Value::Array(elems.iter().map(sort_value).collect())
+            }
+            other => other.clone(),
+        }
+    }
+    sort_value(value).to_string()
 }
 
 /// Recursively search for `target_key` anywhere in the JSON value,
@@ -681,6 +713,42 @@ mod tests {
         let addr = TopicAddress::parse("JSON:STRING device/data count").unwrap();
         let val = decode_payload(r#"{"count": 42}"#, &addr).unwrap();
         assert_eq!(val, DecodedValue::String("42".into()));
+    }
+
+    /// MQ40: a JSON field resolving to an object/array on a STRING topic is
+    /// stored as C's `dump()` does — compact with object keys SORTED at every
+    /// level (nlohmann std::map backing, drvMqtt.cpp:265) — not in serde
+    /// document order.
+    #[test]
+    fn decode_json_object_carrier_keys_sorted() {
+        let addr = TopicAddress::parse("JSON:STRING dev/data obj").unwrap();
+        // Document order is b,a but the stored carrier must be sorted a,b.
+        let val = decode_payload(r#"{"obj": {"b": 1, "a": 2}}"#, &addr).unwrap();
+        assert_eq!(val, DecodedValue::String(r#"{"a":2,"b":1}"#.into()));
+    }
+
+    #[test]
+    fn decode_json_nested_object_carrier_keys_sorted() {
+        let addr = TopicAddress::parse("JSON:STRING dev/data obj").unwrap();
+        // Sorting is recursive: the nested object's keys sort too.
+        let val = decode_payload(r#"{"obj": {"b": {"d": 1, "c": 2}, "a": 3}}"#, &addr).unwrap();
+        assert_eq!(
+            val,
+            DecodedValue::String(r#"{"a":3,"b":{"c":2,"d":1}}"#.into())
+        );
+    }
+
+    #[test]
+    fn decode_json_array_of_objects_carrier_keys_sorted() {
+        let addr = TopicAddress::parse("JSON:STRING dev/data arr").unwrap();
+        // Objects nested inside an array carrier are sorted too; array element
+        // order is preserved.
+        let val =
+            decode_payload(r#"{"arr": [{"y": 1, "x": 2}, {"b": 3, "a": 4}]}"#, &addr).unwrap();
+        assert_eq!(
+            val,
+            DecodedValue::String(r#"[{"x":2,"y":1},{"a":4,"b":3}]"#.into())
+        );
     }
 
     #[test]

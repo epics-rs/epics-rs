@@ -176,7 +176,7 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
 - Shipped `statistics.template` uses FTVL=LONG so the default path works; a Float64
   binding diverges.
 
-### R50 — statistics counters never published in absolute-addressing mode (frozen at 0)
+### R50 — statistics counters never published in absolute-addressing mode (frozen at 0) — CLEARED (bb081061)
 - **Severity:** CONCERN → wrong value (diagnostics read 0 vs live)
 - **Rust:** `ioc.rs:394-411` (`publish_stats`, only writer) called only from `poll_cycle`
   (`ioc.rs:378`), which early-returns in absolute mode (`ioc.rs:343-345`); constructor

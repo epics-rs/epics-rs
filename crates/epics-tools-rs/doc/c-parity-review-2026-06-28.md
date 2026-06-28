@@ -177,7 +177,8 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - Impact: C applies `--coresize` to the child's core-dump rlimit. Rust has no option or field, so operators relying on `--coresize` get no effect (and clap rejects the unknown flag).
 
 #### PS-17 `-N`/`--noautorestart` and `-o`/`--oneshot` startup modes absent
-- Severity: DEFECT
+- Severity: DEFECT — CLEARED (this round)
+- Resolution: added `--noautorestart` (long-only in C; `-N` convenience short) → `RestartMode::Disabled` and `--oneshot`/`-o` → `RestartMode::OneShot`; `build_config` resolves the startup `restart_mode` from them (default `OnExit` = C `restart`, procServ.cc:58,369-375). The two flags `conflicts_with` at the clap layer (both set the same C `restartMode`). Also corrected the stale `RestartMode::Disabled` doc comment in restart.rs (it wrongly said "child exit shuts the supervisor down"; C `norestart` keeps the supervisor up — only `oneshot` shuts it down, as the `norestart_keeps_server_alive_after_child_exit` e2e test already asserts). Tests: `restart_mode_defaults_to_on_exit`, `noautorestart_starts_in_disabled_mode`, `oneshot_starts_in_oneshot_mode`, `noautorestart_and_oneshot_conflict`. (The runtime OneShot relaunch bug is the separate open PS-20.)
 - Rust: `src/bin/procserv_rs.rs:244` (`restart_mode: RestartMode::OnExit`, hardcoded; no flags)
 - C: `procServ.cc:248-249,369-375` (`-N`→norestart, `-o`→oneshot)
 - Impact: C can start directly in no-restart or one-shot mode. Rust hardcodes `OnExit`; these modes are reachable only via the runtime toggle key. `procServ --oneshot …` / `procServ -N …` wrappers lose their startup mode.

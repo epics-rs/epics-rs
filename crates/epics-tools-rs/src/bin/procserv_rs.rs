@@ -111,6 +111,20 @@ mod app {
         #[arg(short = 'w', long)]
         wait: bool,
 
+        /// Start with auto-restart disabled (C `-N` / `--noautorestart`,
+        /// procServ.cc:369-371): the child is not relaunched on exit, but
+        /// the supervisor stays up; toggle back at runtime with `^T`.
+        /// `--noautorestart` is long-only in C; `-N` is a Rust convenience
+        /// short like `-F`/`-S`.
+        #[arg(short = 'N', long = "noautorestart", conflicts_with = "oneshot")]
+        noautorestart: bool,
+
+        /// Start in one-shot mode (C `-o` / `--oneshot`,
+        /// procServ.cc:373-375): the supervisor exits when the child
+        /// exits.
+        #[arg(short = 'o', long = "oneshot")]
+        oneshot: bool,
+
         /// chdir to this directory before exec'ing the child.
         #[arg(long)]
         chdir: Option<PathBuf>,
@@ -318,6 +332,18 @@ mod app {
 
         let nz = |c: u8| if c == 0 { None } else { Some(c) };
 
+        // Startup restart mode (C `restartMode = restart` default,
+        // overridden by `-N` → norestart / `-o` → oneshot,
+        // procServ.cc:58,369-375). The two flags conflict at the clap
+        // layer, so at most one is set here.
+        let restart_mode = if args.oneshot {
+            RestartMode::OneShot
+        } else if args.noautorestart {
+            RestartMode::Disabled
+        } else {
+            RestartMode::OnExit
+        };
+
         Ok(ProcServConfig {
             foreground: args.foreground,
             listen,
@@ -343,7 +369,7 @@ mod app {
                 window: Duration::from_secs(args.restart_window),
                 delay: Duration::from_secs(1),
             },
-            restart_mode: RestartMode::OnExit,
+            restart_mode,
             holdoff: Duration::from_secs(args.holdoff),
             wait_for_manual_start: args.wait,
         })
@@ -538,6 +564,56 @@ mod app {
             let args = Args::try_parse_from(["procserv-rs", "--killsig=-2", "/bin/echo"]).unwrap();
             let cfg = build_config(args).unwrap();
             assert_eq!(cfg.child.kill_signal, 2);
+        }
+
+        /// No mode flag → C default `restart` (Rust `OnExit`,
+        /// procServ.cc:58).
+        #[test]
+        fn restart_mode_defaults_to_on_exit() {
+            let args = Args::try_parse_from(["procserv-rs", "/bin/echo"]).unwrap();
+            let cfg = build_config(args).unwrap();
+            assert_eq!(cfg.restart_mode, RestartMode::OnExit);
+        }
+
+        /// `-N`/`--noautorestart` starts in no-restart mode (C `norestart`,
+        /// procServ.cc:369-371): server stays up, child not relaunched.
+        #[test]
+        fn noautorestart_starts_in_disabled_mode() {
+            let long =
+                Args::try_parse_from(["procserv-rs", "--noautorestart", "/bin/echo"]).unwrap();
+            assert_eq!(
+                build_config(long).unwrap().restart_mode,
+                RestartMode::Disabled
+            );
+            let short = Args::try_parse_from(["procserv-rs", "-N", "/bin/echo"]).unwrap();
+            assert_eq!(
+                build_config(short).unwrap().restart_mode,
+                RestartMode::Disabled
+            );
+        }
+
+        /// `-o`/`--oneshot` starts in one-shot mode (C `oneshot`,
+        /// procServ.cc:373-375): server exits when the child exits.
+        #[test]
+        fn oneshot_starts_in_oneshot_mode() {
+            let long = Args::try_parse_from(["procserv-rs", "--oneshot", "/bin/echo"]).unwrap();
+            assert_eq!(
+                build_config(long).unwrap().restart_mode,
+                RestartMode::OneShot
+            );
+            let short = Args::try_parse_from(["procserv-rs", "-o", "/bin/echo"]).unwrap();
+            assert_eq!(
+                build_config(short).unwrap().restart_mode,
+                RestartMode::OneShot
+            );
+        }
+
+        /// `-N` and `-o` are mutually exclusive (clap rejects the combo);
+        /// the two modes set the same C `restartMode` field.
+        #[test]
+        fn noautorestart_and_oneshot_conflict() {
+            let res = Args::try_parse_from(["procserv-rs", "-N", "-o", "/bin/echo"]);
+            assert!(res.is_err(), "-N and -o must conflict");
         }
 
         /// No `--coresize` → no RLIMIT_CORE change (C `setCoreSize`

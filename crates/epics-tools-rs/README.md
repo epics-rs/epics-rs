@@ -72,13 +72,13 @@ Everything after `--` is the child program and its argv.
 | `-S, --logstamp[=FMT]` | Timestamp each log line (FMT attached with `=`) | off |
 | `-F, --timefmt <FMT>` | strftime for banner / start-time lines | `%c` |
 | `-p, --pidfile <PATH>` | PID file (note: lowercase `-p`) | — |
-| `--info-file <PATH>` | `PROCSERV_INFO` info file | — |
+| `-I, --info-file <PATH>` | `PROCSERV_INFO` info file | — |
 | `--holdoff <SEC>` | Hold-off between restarts | 15 |
 | `-w, --wait` | Do not start child until first console request | off |
 | `-N, --noautorestart` | Start with auto-restart disabled (server stays up) | off |
 | `-o, --oneshot` | Exit the supervisor when the child exits | off |
-| `--chdir <DIR>` | `chdir` before exec'ing child | — |
-| `--name <NAME>` | Display name in banners | command |
+| `-c, --chdir <DIR>` | `chdir` before exec'ing child | — |
+| `-n, --name <NAME>` | Display name in banners | command |
 | `-e, --exec <PATH>` | Executable to run instead of the command | command |
 | `--max-restarts <N>` | Max restarts inside `--restart-window` | unlimited |
 | `--restart-window <SEC>` | Sliding window for `--max-restarts` | 600 |

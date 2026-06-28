@@ -130,8 +130,10 @@ mod app {
         #[arg(short = 'p', long)]
         pidfile: Option<PathBuf>,
 
-        /// Info file (`--info-file`).
-        #[arg(long)]
+        /// Info file (`-I` / `--info-file`, C procServ.cc:241,264). Unlike
+        /// the convenience shorts, `I` *is* in C's getopt optstring, so the
+        /// short is C-faithful, not a Rust addition.
+        #[arg(short = 'I', long)]
         info_file: Option<PathBuf>,
 
         /// Hold-off time between restarts in seconds (`--holdoff`).
@@ -157,12 +159,16 @@ mod app {
         #[arg(short = 'o', long = "oneshot")]
         oneshot: bool,
 
-        /// chdir to this directory before exec'ing the child.
-        #[arg(long)]
+        /// chdir to this directory before exec'ing the child (`-c` /
+        /// `--chdir`, C procServ.cc:234,264 — `c` is in C's optstring, so
+        /// the short is C-faithful).
+        #[arg(short = 'c', long)]
         chdir: Option<PathBuf>,
 
-        /// Display name for the child in banners.
-        #[arg(long)]
+        /// Display name for the child in banners (`-n` / `--name`, C
+        /// procServ.cc:247,264 — `n` is in C's optstring, so the short is
+        /// C-faithful).
+        #[arg(short = 'n', long)]
         name: Option<String>,
 
         /// Executable to launch instead of the positional command
@@ -947,6 +953,49 @@ mod app {
             assert_eq!(build_config(args).unwrap().keys.logout, Some(0x07));
             let short = Args::try_parse_from(["procserv-rs", "-x", "z", "/bin/echo"]).unwrap();
             assert_eq!(build_config(short).unwrap().keys.logout, Some(b'z'));
+        }
+
+        /// PS-40: `-c`/`-I`/`-n` are C's real short options (present in the
+        /// getopt optstring, procServ.cc:264), so a wrapper invoking
+        /// `-c <dir>` / `-I <file>` / `-n <name>` — inert on clap before —
+        /// must now parse to the same config as the long forms.
+        #[test]
+        fn c_faithful_short_aliases_parse() {
+            let short = Args::try_parse_from([
+                "procserv-rs",
+                "-c",
+                "/work",
+                "-I",
+                "/run/x.info",
+                "-n",
+                "myioc",
+                "/bin/echo",
+            ])
+            .unwrap();
+            let cfg = build_config(short).unwrap();
+            assert_eq!(cfg.child.cwd, Some(PathBuf::from("/work")));
+            assert_eq!(cfg.logging.info_path, Some(PathBuf::from("/run/x.info")));
+            assert_eq!(cfg.child.name, "myioc");
+
+            // The long forms still produce the identical config.
+            let long = Args::try_parse_from([
+                "procserv-rs",
+                "--chdir",
+                "/work",
+                "--info-file",
+                "/run/x.info",
+                "--name",
+                "myioc",
+                "/bin/echo",
+            ])
+            .unwrap();
+            let cfg_long = build_config(long).unwrap();
+            assert_eq!(cfg_long.child.cwd, Some(PathBuf::from("/work")));
+            assert_eq!(
+                cfg_long.logging.info_path,
+                Some(PathBuf::from("/run/x.info"))
+            );
+            assert_eq!(cfg_long.child.name, "myioc");
         }
 
         /// C binds `-P` (uppercase) to the control port and `-p`

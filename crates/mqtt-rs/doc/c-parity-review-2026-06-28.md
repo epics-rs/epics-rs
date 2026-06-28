@@ -317,6 +317,25 @@ The behavioural core is faithful where it matters most:
   output-readback C does not. Left as an open verification item pending the
   autoparam source path.
 
+### MQ52 — JSON-format writes succeed in Rust where every C write handler throws "not implemented"
+- **Severity:** NOTE — **intentional-divergence aside** (Rust extension, required by z2m)
+- Found in round-2 verification (both panels); absent from the round-1 MQ1–MQ51 sweep.
+- Rust: `driver.rs` `write_int32`/`write_float64`/`write_uint32_digital`/
+  `write_int32_array`/`write_float64_array`/`write_octet` → `publish_value` →
+  `encode_payload`, which encodes JSON for `PayloadFormat::Json`.
+- C: `drvMqtt.cpp:585-588` (`integerWrite`), `627-630` (`digitalWrite`),
+  `654-657` (`floatWrite`), `690-693` (`arrayWrite`), `720-723` (`stringWrite`)
+  — every JSON branch is `throw std::logic_error("JSON support not implemented")`
+  → asynError.
+- Impact: a `JSON:<type> topic field` OUTPUT record's caput publishes
+  `{"field":value}` in Rust but raises a WRITE/INVALID alarm (nothing published)
+  in C. Rust implements the JSON write C left as a TODO — required for
+  zigbee2mqtt device control (publishing to `.../set` needs JSON), and consistent
+  with the other Rust extensions (z2m support, the connection-status PV). The
+  MQ39 JSON-octet branch is a deliberate instance of this. Documented, not
+  "fixed": failing JSON writes to match C would copy C's incompleteness and break
+  z2m. Keep.
+
 ---
 
 ## Disposition summary
@@ -325,7 +344,7 @@ The behavioural core is faithful where it matters most:
   MQ39, MQ40, and the double-space half of MQ32.
 - **Intentional-divergence aside (Rust declines a C bug / is more robust — keep):**
   MQ31, MQ33, MQ35, MQ37, the `"1 ,2"` half of MQ32, the quoted-topic extension of
-  MQ18.
+  MQ18, MQ52 (Rust implements JSON writes C left unimplemented — z2m extension).
 - **NOTE (low-priority documented divergence):** MQ3, MQ4, MQ5, MQ16, MQ36, MQ48,
   MQ49.
 - **Structural / framework — asyn-rs contract change, design sign-off:** MQ2

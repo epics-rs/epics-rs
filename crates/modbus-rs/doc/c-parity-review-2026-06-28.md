@@ -272,7 +272,7 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   **Surface for design sign-off before fixing** (per the structural-fix-needs-sign-off rule); do
   not collapse it into an unrelated commit.
 
-### R55 — readOctet always reports `ASYN_EOM_CNT`; the asyn-rs default only synthesises CNT when the buffer fills
+### R55 — readOctet always reports `ASYN_EOM_CNT`; the asyn-rs default only synthesises CNT when the buffer fills — CLEARED (8f15ba0d)
 - **Severity:** CONCERN (EOMR/eom-flag divergence; record string content unaffected)
 - **Rust:** `ioc.rs` `read_octet` returns only a count; the modbus driver does NOT override
   `io_read_octet_eom`, so it inherits the generic synthesis in `asyn-rs/src/port.rs:1184-1191`
@@ -284,9 +284,9 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
 - **Impact:** a modbus string shorter than the record buffer (the common case) → C reports
   `ASYN_EOM_CNT`, Rust reports no EOM flag. Observable on `asynRecord.EOMR` and anything keying on
   the EOM reason. Record VAL/string content is identical. Found while grounding R31.
-- **Disposition:** OPEN — small structural fix (override `io_read_octet_eom` in `ModbusPortDriver`
-  to return `EomReason::CNT` for a successful P_Data octet read, mirroring C). Distinct from R31's
-  count semantics; fix separately.
+- **Fix:** `ModbusPortDriver::io_read_octet_eom` override returns `EomReason::CNT` for every
+  successful P_Data octet read, mirroring C. Distinct from R31's count semantics. Test
+  `read_octet_eom_always_flags_cnt_for_short_string` pins the not-full-buffer case (8f15ba0d).
 
 ---
 

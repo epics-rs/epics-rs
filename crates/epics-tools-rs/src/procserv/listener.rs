@@ -108,8 +108,50 @@ fn bind_unix(ep: &UnixEndpoint) -> ProcServResult<UnixListener> {
         // Best-effort unlink of a stale socket — ignore "not found"
         // (C `acceptFactory.cc:341-346`).
         let _ = std::fs::remove_file(&ep.name);
-        UnixListener::bind(&ep.name)
-            .map_err(|e| ProcServError::ListenerBind(format!("UNIX {}: {e}", ep.name.display())))
+        let listener = UnixListener::bind(&ep.name)
+            .map_err(|e| ProcServError::ListenerBind(format!("UNIX {}: {e}", ep.name.display())))?;
+        apply_unix_perms(ep);
+        Ok(listener)
+    }
+}
+
+/// Apply C's post-bind access control to a filesystem UNIX socket
+/// (`acceptFactory.cc:368-377`): `chmod 0` → `chown` → `chmod perms`. The
+/// 0-then-perms order closes the window in which the socket already
+/// carries its final mode but still has the pre-`chown` owner. A
+/// `chmod`/`chown` failure is logged and tolerated, exactly as C's
+/// PRINTF-and-continue (a non-root server cannot `chown`, but the default
+/// `0o666` still makes the socket usable). Abstract sockets have no
+/// filesystem node, so this is never called for them.
+fn apply_unix_perms(ep: &UnixEndpoint) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = ep.name.as_path();
+    // Lock the socket down (mode 0) before the ownership change.
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o0));
+
+    // C always `chown`s (default uid/gid = `getuid`/`getgid` = a no-op);
+    // we skip the syscall when no owner override was requested, which is
+    // behaviourally identical to chowning to self.
+    if ep.uid.is_some() || ep.gid.is_some() {
+        let uid = ep.uid.map(nix::unistd::Uid::from_raw);
+        let gid = ep.gid.map(nix::unistd::Gid::from_raw);
+        if let Err(e) = nix::unistd::chown(path, uid, gid) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "procserv-rs: chown unix socket failed"
+            );
+        }
+    }
+
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(ep.perms)) {
+        tracing::warn!(
+            path = %path.display(),
+            perms = format!("{:o}", ep.perms),
+            error = %e,
+            "procserv-rs: chmod unix socket failed"
+        );
     }
 }
 
@@ -210,5 +252,32 @@ mod tests {
         assert_eq!(buf[0], b'y');
 
         server.abort();
+    }
+
+    /// PS-24: C `chmod`s a filesystem socket to its `perms` after bind
+    /// (default `0o666`, "equivalent to tcp bind to localhost",
+    /// acceptFactory.cc:233,368-377). The default and an explicit octal
+    /// must both land on the socket node.
+    #[tokio::test]
+    async fn unix_socket_mode_is_applied_after_bind() {
+        use std::os::unix::fs::PermissionsExt;
+
+        async fn bound_mode(perms: u32) -> u32 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ioc.sock");
+            let mut ep = UnixEndpoint::filesystem(path.clone());
+            ep.perms = perms;
+            let (tx, _rx) = mpsc::channel(4);
+            let server = tokio::spawn(async move { run_unix(ep, false, tx).await });
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            server.abort();
+            mode
+        }
+
+        // Default 0o666 (UnixEndpoint::filesystem) and an explicit 0o660 —
+        // both must equal the requested mode, independent of the umask.
+        assert_eq!(bound_mode(0o666).await, 0o666);
+        assert_eq!(bound_mode(0o660).await, 0o660);
     }
 }

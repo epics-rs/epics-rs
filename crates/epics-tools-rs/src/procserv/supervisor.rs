@@ -45,8 +45,8 @@ use crate::procserv::client::{
     ClientId, ClientMeta, InboundEvent, IncomingClient, OutboundFrame, spawn_client,
 };
 use crate::procserv::config::{KeyBindings, ProcServConfig};
-use crate::procserv::endpoint::Endpoint;
 use crate::procserv::error::{ProcServError, ProcServResult};
+use crate::procserv::listener::{PreboundListener, bind_endpoints};
 use crate::procserv::menu::{Action, scan as menu_scan};
 use crate::procserv::messages;
 use crate::procserv::restart::{RestartMode, RestartTracker};
@@ -58,16 +58,34 @@ use crate::procserv::sidecar::{
 /// Top-level handle. Construct via [`Self::new`], drive with [`Self::run`].
 pub struct ProcServ {
     config: Arc<ProcServConfig>,
+    /// Listeners bound before this handle was built. The daemon binary
+    /// binds them in the foreground parent *before* `fork_and_go` so a bind
+    /// failure fail-fasts there (PS-49) and the bound fds are inherited by
+    /// the daemon child; `None` (foreground/library use) makes `bootstrap`
+    /// bind them itself, where a `?` failure already reaches the launching
+    /// process directly.
+    prebound: Option<Vec<PreboundListener>>,
 }
 
 impl ProcServ {
     /// Construct from validated config. Does not yet open listeners
-    /// or spawn the child — call [`Self::run`].
+    /// or spawn the child — call [`Self::run`]. Listeners are bound by
+    /// `run`/`bootstrap` unless supplied via [`Self::with_prebound`].
     pub fn new(config: ProcServConfig) -> ProcServResult<Self> {
         config.validate().map_err(ProcServError::Config)?;
         Ok(Self {
             config: Arc::new(config),
+            prebound: None,
         })
+    }
+
+    /// Adopt listeners already bound in the foreground process (see
+    /// [`crate::procserv::listener::bind_endpoints`]). The daemon binary
+    /// uses this so the fail-fast bind happens before `fork_and_go` and the
+    /// bound fds cross the fork into the daemon child (PS-49).
+    pub fn with_prebound(mut self, listeners: Vec<PreboundListener>) -> Self {
+        self.prebound = Some(listeners);
+        self
     }
 
     /// Run until shutdown. Returns the last child exit code (procserv's
@@ -79,7 +97,7 @@ impl ProcServ {
     /// - SIGTERM/SIGINT arrives (only when running with the daemon
     ///   wrapper that wires those into a shutdown signal)
     pub async fn run(self) -> ProcServResult<i32> {
-        let mut state = SupervisorState::bootstrap(self.config).await?;
+        let mut state = SupervisorState::bootstrap(self.config, self.prebound).await?;
         state.event_loop().await
     }
 }
@@ -178,7 +196,10 @@ struct ChildSlot {
 }
 
 impl SupervisorState {
-    async fn bootstrap(config: Arc<ProcServConfig>) -> ProcServResult<Self> {
+    async fn bootstrap(
+        config: Arc<ProcServConfig>,
+        prebound: Option<Vec<PreboundListener>>,
+    ) -> ProcServResult<Self> {
         let (inbound_tx, inbound_rx) = mpsc::channel::<(ClientId, InboundEvent)>(256);
         let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingClient>(8);
 
@@ -233,25 +254,25 @@ impl SupervisorState {
             None
         };
 
-        // Control endpoints — one listener task each (C `ctlSpecs` loop,
-        // procServ.cc:515-518). TCP and UNIX both flow through the same
-        // accept→IncomingClient path.
-        for ep in config.listen.control.iter().cloned() {
+        // Listeners. In daemon mode the foreground parent already bound
+        // them (pre-fork, fail-fast — PS-49) and the fds were inherited
+        // across the fork; here we just adopt them. In foreground/library
+        // mode `prebound` is `None`, so bind them now — a bind failure `?`s
+        // out of `bootstrap` to the launching process directly, which is
+        // the correct fail-fast (there is no daemon parent that already
+        // reported success). C binds every acceptItem before `forkAndGo`
+        // (`procServ.cc:513-543`); control specs first, then the log spec.
+        let listeners = match prebound {
+            Some(listeners) => listeners,
+            None => bind_endpoints(&config)?,
+        };
+        // One accept loop task per listener. The readonly flag (set for the
+        // log endpoint in `bind_endpoints`, C `acceptFactory(..., true)`
+        // procServ.cc:533) flows to each accepted client and gates its input
+        // (client.rs read task).
+        for pl in listeners {
             let tx = incoming_tx.clone();
-            tokio::spawn(async move {
-                spawn_endpoint(ep, false, tx, "control").await;
-            });
-        }
-        // Read-only viewer/log endpoint: clients receive output but their
-        // input is discarded. C creates this as
-        // `acceptFactory(logPort, logPortLocal, /*readonly=*/true)`
-        // (procServ.cc:533); the `readonly` flag flows to each accepted
-        // client and gates its input (client.rs read task).
-        if let Some(ep) = config.listen.log.clone() {
-            let tx = incoming_tx.clone();
-            tokio::spawn(async move {
-                spawn_endpoint(ep, true, tx, "log").await;
-            });
+            tokio::spawn(pl.accept(tx));
         }
         // Drop our copy so listeners' txs are the only owners.
         drop(incoming_tx);
@@ -1013,25 +1034,6 @@ async fn send_bounded(
         tokio::time::timeout(timeout, tx.send(frame)).await,
         Ok(Ok(())),
     )
-}
-
-/// Run the accept loop for one [`Endpoint`], dispatching to the TCP or
-/// UNIX listener. A listener that exits with an error is logged; the
-/// supervisor keeps running its other endpoints (C `acceptFactory`
-/// failures during steady-state are per-listener).
-async fn spawn_endpoint(
-    ep: Endpoint,
-    readonly: bool,
-    tx: mpsc::Sender<IncomingClient>,
-    role: &'static str,
-) {
-    let res = match ep {
-        Endpoint::Tcp(addr) => super::listener::run_tcp(addr, readonly, tx).await,
-        Endpoint::Unix(u) => super::listener::run_unix(u, readonly, tx).await,
-    };
-    if let Err(e) = res {
-        tracing::error!(error = %e, role, "procserv-rs: listener exited");
-    }
 }
 
 /// Originator of a party-line message — the Rust model of C

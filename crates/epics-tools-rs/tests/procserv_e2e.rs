@@ -227,6 +227,28 @@ async fn cat_round_trip_via_tcp_console() {
     server_task.abort();
 }
 
+/// PS-49: a listener bind failure must fail-fast, not be swallowed into a
+/// silently-headless IOC. Occupy the control port, then a supervisor
+/// configured for the same port must return an error from `run()` rather
+/// than coming up unreachable. This exercises the foreground/library path
+/// (bind in `bootstrap`); the daemon path binds the same way before
+/// `fork_and_go`, so its parent `exit(error)`s before daemonizing.
+#[tokio::test]
+async fn occupied_control_port_fails_fast_not_headless() {
+    // Hold the port for the whole test so the conflict is real.
+    let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = occupied.local_addr().unwrap().port();
+
+    let cfg = cat_config(port); // same loopback port → bind conflict
+    let server = ProcServ::new(cfg).expect("build");
+
+    match timeout(Duration::from_secs(2), server.run()).await {
+        Ok(Err(_)) => {} // fail-fast: run() surfaced the bind error
+        Ok(Ok(code)) => panic!("expected a bind failure, got a clean exit code {code}"),
+        Err(_) => panic!("run() did not fail-fast within 2s — came up headless?"),
+    }
+}
+
 /// PS-48: C `writePidFile` / `openLogFile` warn and run anyway on an
 /// unwritable path ("Don't stop here - just go without",
 /// procServ.cc:131-136,925). The port previously `?`-aborted in

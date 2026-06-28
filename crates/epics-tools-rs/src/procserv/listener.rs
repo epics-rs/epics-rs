@@ -6,12 +6,15 @@
 //! C `acceptFactory.cc` (`acceptItemTCP` / `acceptItemUNIX`).
 
 use std::net::SocketAddr;
+use std::net::TcpListener as StdTcpListener;
+use std::os::unix::net::UnixListener as StdUnixListener;
 
 use tokio::net::{TcpListener, TcpSocket, UnixListener};
 use tokio::sync::mpsc;
 
 use crate::procserv::client::{ClientPeer, ClientStream, IncomingClient};
-use crate::procserv::endpoint::UnixEndpoint;
+use crate::procserv::config::ProcServConfig;
+use crate::procserv::endpoint::{Endpoint, UnixEndpoint};
 use crate::procserv::error::{ProcServError, ProcServResult};
 
 /// `listen(2)` backlog. C uses 5 (`acceptFactory.cc:216,363`); the Rust
@@ -43,20 +46,111 @@ impl Drop for UnlinkOnDrop {
     }
 }
 
-/// Run the TCP listener loop until the supervisor's `out` channel
-/// closes. Each accepted socket is wrapped in [`IncomingClient`] and
-/// forwarded.
+/// A listener that is bound but not yet accepting — the bind half split
+/// from the accept loop. Holding the `std` listener (whose fd survives
+/// `fork(2)`) lets the bind happen in the foreground parent *before*
+/// `daemon::fork_and_go`, so a bind failure fail-fasts there instead of
+/// leaving a daemonized-but-headless IOC (PS-49). C binds every
+/// `acceptItem` before `forkAndGo` and `exit(error)`s on failure
+/// (`procServ.cc:513-543,551`).
+enum BoundEndpoint {
+    Tcp(StdTcpListener),
+    Unix(StdUnixListener, UnixEndpoint),
+}
+
+/// One bound-but-not-accepting listener plus the metadata its accept loop
+/// needs. Produced by [`bind_endpoints`] (eager, fail-fast) and consumed by
+/// [`PreboundListener::accept`] (the async loop). Not `Clone` — it owns a
+/// listening fd.
+pub struct PreboundListener {
+    listener: BoundEndpoint,
+    readonly: bool,
+    role: &'static str,
+}
+
+impl PreboundListener {
+    /// Run this listener's accept loop until the supervisor's `out` channel
+    /// closes. A loop that exits with an error is logged; the supervisor
+    /// keeps running its other endpoints (steady-state accept failures are
+    /// per-listener in C too).
+    pub async fn accept(self, out: mpsc::Sender<IncomingClient>) {
+        let res = match self.listener {
+            BoundEndpoint::Tcp(l) => run_tcp_accept(l, self.readonly, out).await,
+            BoundEndpoint::Unix(l, ep) => run_unix_accept(l, ep, self.readonly, out).await,
+        };
+        if let Err(e) = res {
+            tracing::error!(error = %e, role = self.role, "procserv-rs: listener exited");
+        }
+    }
+}
+
+/// Bind every configured control and log endpoint, returning the bound
+/// (std) listeners or the first bind error. Binds control specs first,
+/// then the log spec (C order, `procServ.cc:513-543`).
+///
+/// Call this in the foreground process — directly in foreground/library
+/// mode, or *before* `daemon::fork_and_go` in daemon mode — so a bind
+/// failure (`EADDRINUSE`, abstract-socket-on-non-Linux, bad UNIX path)
+/// aborts startup with a real exit status instead of being swallowed in a
+/// detached task (PS-49). The bound fds are inherited by the daemon child
+/// across the fork.
+///
+/// Requires an active tokio runtime: the TCP `SO_REUSEADDR` bind and the
+/// UNIX/abstract binds go through tokio listeners (reused verbatim for
+/// their tested option/permission handling) which are then detached to
+/// their `std` form via `into_std`.
+pub fn bind_endpoints(config: &ProcServConfig) -> ProcServResult<Vec<PreboundListener>> {
+    let mut bound = Vec::new();
+    for ep in &config.listen.control {
+        bound.push(bind_one(ep.clone(), false, "control")?);
+    }
+    if let Some(ep) = &config.listen.log {
+        bound.push(bind_one(ep.clone(), true, "log")?);
+    }
+    Ok(bound)
+}
+
+/// Bind a single [`Endpoint`] to its `std` listener form, applying UNIX
+/// permissions at bind time (as C does, pre-fork).
+fn bind_one(ep: Endpoint, readonly: bool, role: &'static str) -> ProcServResult<PreboundListener> {
+    let listener = match ep {
+        Endpoint::Tcp(addr) => {
+            BoundEndpoint::Tcp(tcp_listen(addr)?.into_std().map_err(ProcServError::Io)?)
+        }
+        Endpoint::Unix(u) => {
+            let std_listener = bind_unix(&u)?.into_std().map_err(ProcServError::Io)?;
+            BoundEndpoint::Unix(std_listener, u)
+        }
+    };
+    Ok(PreboundListener {
+        listener,
+        readonly,
+        role,
+    })
+}
+
+/// Run the TCP accept loop on a pre-bound listener until the supervisor's
+/// `out` channel closes. Each accepted socket is wrapped in
+/// [`IncomingClient`] and forwarded.
+///
+/// The listener was bound earlier by [`bind_endpoints`] (so a bind failure
+/// already fail-fasted in the foreground process, PS-49); here it is just
+/// re-adopted into the current runtime via `from_std`.
 ///
 /// `readonly`: when true, every accepted client is read-only —
 /// matches C procServ's `--readonly` deployment for sites that want
 /// only log-style viewers (separate listening port for observers
 /// vs operators).
-pub async fn run_tcp(
-    bind: SocketAddr,
+async fn run_tcp_accept(
+    std_listener: StdTcpListener,
     readonly: bool,
     out: mpsc::Sender<IncomingClient>,
 ) -> ProcServResult<()> {
-    let listener = tcp_listen(bind)?;
+    std_listener
+        .set_nonblocking(true)
+        .map_err(ProcServError::Io)?;
+    let listener = TcpListener::from_std(std_listener).map_err(ProcServError::Io)?;
+    let bind = listener.local_addr().map_err(ProcServError::Io)?;
     tracing::info!(addr = %bind, readonly, "procserv-rs: TCP listener accepted");
 
     loop {
@@ -107,20 +201,26 @@ fn tcp_listen(bind: SocketAddr) -> ProcServResult<TcpListener> {
         .map_err(|e| ProcServError::ListenerBind(format!("TCP {bind} listen: {e}")))
 }
 
-/// UNIX-socket listener. Binds a filesystem or abstract socket per the
-/// parsed [`UnixEndpoint`], then accepts in a loop (C `acceptItemUNIX`,
-/// `acceptFactory.cc:229-381`).
+/// UNIX-socket accept loop on a pre-bound listener (C `acceptItemUNIX`,
+/// `acceptFactory.cc:229-381`). The socket was bound — and, for a
+/// filesystem socket, had its permissions applied — earlier by
+/// [`bind_endpoints`]; here it is re-adopted into the current runtime via
+/// `from_std` and accepted in a loop.
 ///
-/// For a filesystem socket, any existing socket file is `unlink`ed up
-/// front for the same reason C does it — a stale node blocks `bind`. An
-/// abstract socket (Linux-only) has no filesystem presence, so neither
-/// the unlink nor the permission step applies.
-pub async fn run_unix(
+/// The filesystem socket node is `unlink`ed when this task ends (the
+/// [`UnlinkOnDrop`] guard below) for the same reason C does it in
+/// `~acceptItemUNIX` — a clean shutdown leaves no stale node. An abstract
+/// socket (Linux-only) has no filesystem presence, so it gets no guard.
+async fn run_unix_accept(
+    std_listener: StdUnixListener,
     ep: UnixEndpoint,
     readonly: bool,
     out: mpsc::Sender<IncomingClient>,
 ) -> ProcServResult<()> {
-    let listener = bind_unix(&ep)?;
+    std_listener
+        .set_nonblocking(true)
+        .map_err(ProcServError::Io)?;
+    let listener = UnixListener::from_std(std_listener).map_err(ProcServError::Io)?;
     // Unlink the filesystem socket node when this task ends, so a clean
     // shutdown leaves no stale node behind (C `~acceptItemUNIX`,
     // acceptFactory.cc:331-335). Abstract sockets have no filesystem
@@ -262,7 +362,8 @@ mod tests {
         drop(listener);
 
         let (tx, mut rx) = mpsc::channel(4);
-        let server = tokio::spawn(async move { run_tcp(actual, false, tx).await });
+        let std_l = tcp_listen(actual).unwrap().into_std().unwrap();
+        let server = tokio::spawn(async move { run_tcp_accept(std_l, false, tx).await });
 
         // Give the listener a moment to bind.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -307,7 +408,8 @@ mod tests {
         let ep = UnixEndpoint::filesystem(path.clone());
 
         let (tx, mut rx) = mpsc::channel(4);
-        let server = tokio::spawn(async move { run_unix(ep, false, tx).await });
+        let std_l = bind_unix(&ep).unwrap().into_std().unwrap();
+        let server = tokio::spawn(async move { run_unix_accept(std_l, ep, false, tx).await });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let mut conn = tokio::net::UnixStream::connect(&path).await.unwrap();
@@ -339,7 +441,8 @@ mod tests {
         let ep = UnixEndpoint::filesystem(path.clone());
 
         let (tx, _rx) = mpsc::channel(4);
-        let server = tokio::spawn(async move { run_unix(ep, false, tx).await });
+        let std_l = bind_unix(&ep).unwrap().into_std().unwrap();
+        let server = tokio::spawn(async move { run_unix_accept(std_l, ep, false, tx).await });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(path.exists(), "socket file should exist while listening");
 
@@ -367,7 +470,8 @@ mod tests {
             let mut ep = UnixEndpoint::filesystem(path.clone());
             ep.perms = perms;
             let (tx, _rx) = mpsc::channel(4);
-            let server = tokio::spawn(async move { run_unix(ep, false, tx).await });
+            let std_l = bind_unix(&ep).unwrap().into_std().unwrap();
+            let server = tokio::spawn(async move { run_unix_accept(std_l, ep, false, tx).await });
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             server.abort();
@@ -378,5 +482,45 @@ mod tests {
         // both must equal the requested mode, independent of the umask.
         assert_eq!(bound_mode(0o666).await, 0o666);
         assert_eq!(bound_mode(0o660).await, 0o660);
+    }
+
+    /// PS-49: a bind failure must surface as an error from the (pre-fork)
+    /// bind step, not be swallowed. Occupy a port, then a second bind to it
+    /// (with `SO_REUSEADDR`, which does NOT permit stealing an active
+    /// listener) must return `Err` so the caller can fail-fast.
+    #[tokio::test]
+    async fn bind_one_fails_fast_on_address_in_use() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = occupied.local_addr().unwrap();
+        let res = bind_one(Endpoint::Tcp(addr), false, "control");
+        assert!(
+            res.is_err(),
+            "a second bind to an occupied port must fail-fast, not be swallowed"
+        );
+    }
+
+    /// The happy path of the same bind step: a free port binds, and the
+    /// resulting `PreboundListener` accepts a real connection (proving the
+    /// bound `std` listener re-adopts cleanly via `from_std`).
+    #[tokio::test]
+    async fn bind_one_binds_a_free_port_and_accepts() {
+        let bind = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+        let pl = bind_one(Endpoint::Tcp(bind), false, "control").expect("free port binds");
+        // Recover the actual port to connect to: re-read it from the bound
+        // std listener before the accept loop consumes `pl`.
+        let actual = match &pl.listener {
+            BoundEndpoint::Tcp(l) => l.local_addr().unwrap(),
+            _ => unreachable!(),
+        };
+        let (tx, mut rx) = mpsc::channel(4);
+        let server = tokio::spawn(pl.accept(tx));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let _conn = TcpStream::connect(actual).await.unwrap();
+        let inc = rx.recv().await.expect("got incoming");
+        assert!(matches!(inc.stream, ClientStream::Tcp(_)));
+        assert!(!inc.readonly);
+
+        server.abort();
     }
 }

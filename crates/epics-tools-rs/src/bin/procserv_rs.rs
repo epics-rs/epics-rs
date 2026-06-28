@@ -23,6 +23,7 @@ mod app {
         config::{ChildConfig, KeyBindings, ListenConfig, LoggingConfig},
         daemon::{DaemonParent, fork_and_go, install_signal_handlers},
         endpoint::{Endpoint, UnixEndpoint, parse_endpoint},
+        listener::bind_endpoints,
         restart::{RestartMode, RestartPolicy},
     };
 
@@ -512,12 +513,44 @@ mod app {
         cfg.foreground = cfg.foreground || debug;
         let foreground = cfg.foreground;
 
+        // Bind every control + log listener in THIS (foreground) process,
+        // before daemonizing, so a bind failure (EADDRINUSE, abstract socket
+        // on a non-Linux host, bad UNIX path) aborts startup with a real
+        // non-zero exit instead of leaving a daemonized-but-headless IOC
+        // (PS-49). C binds every acceptItem before `forkAndGo` and
+        // `exit(error)`s on failure (procServ.cc:513-543,551). A short-lived
+        // current-thread runtime supplies the reactor the bind helpers need;
+        // it is fully dropped (no tokio worker thread) before the fork, and
+        // the bound fds are inherited by the daemon child across it.
+        let prebound = {
+            let bind_rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("procserv-rs: bind runtime build failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let result = bind_rt.block_on(async { bind_endpoints(&cfg) });
+            // `bind_rt` drops here, before `fork_and_go`.
+            match result {
+                Ok(listeners) => listeners,
+                Err(e) => {
+                    eprintln!("procserv-rs: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        };
+
         // Daemonize BEFORE starting the tokio runtime — the runtime's
         // worker threads don't survive fork(). After fork_and_go returns
         // we're in the daemon child (or directly in foreground mode) and
         // safe to start tokio. The foreground parent prints the spawn
         // notice + no-log-file warning (unless `quiet`) and writes the pid
         // file with the daemon's pid before exiting (procServ.cc:887-899).
+        // The listeners bound above are inherited by the daemon child here.
         if !foreground {
             let parent = DaemonParent {
                 name: "procserv-rs",
@@ -545,7 +578,7 @@ mod app {
 
         runtime.block_on(async move {
             let server = match ProcServ::new(cfg) {
-                Ok(s) => s,
+                Ok(s) => s.with_prebound(prebound),
                 Err(e) => {
                     tracing::error!(error = %e, "procserv-rs: build failed");
                     return ExitCode::FAILURE;

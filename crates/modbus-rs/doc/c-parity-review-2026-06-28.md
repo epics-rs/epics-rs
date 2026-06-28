@@ -107,13 +107,26 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   `asynError` (no `IOErrors_` bump). Rust leaves `read_ok` unchanged and bumps
   `io_errors`. The two records diverge from C in opposite directions per bad frame.
 
-### R31 — read_string drops the trailing NUL from the char count (NORD off-by-one)
-- **Severity:** CONCERN (content identical; count off by one)
-- **Rust:** `datatype.rs:558-560` feeding `ioc.rs:606/614`
+### R31 — read_string drops the trailing NUL from the char count — CLEARED (intentional divergence, asyn-rs octet contract)
+- **Severity:** NOTE — intentional-divergence aside, **not a defect**
+- **Rust:** `datatype.rs` `read_string` feeding `ioc.rs` `read_octet` (:636/:644)
 - **C:** `drvModbusAsyn.cpp:3050` (`*bufferLen = strlen(data)+1`) consumed at `:1479`
-- C reports the char count **including** the terminating NUL; Rust reports `strlen`.
-  A CHAR/UCHAR waveform gets `NORD=strlen` vs C `strlen+1`; asyn octet
-  `ASYN_EOM_CNT` is one short.
+- C reports the char count **including** the terminating NUL because the C
+  consumer (`devAsynOctet`) treats the read buffer as a NUL-terminated C-string —
+  the extra count is the terminator the consumer then strips. The asyn-rs octet
+  interface contract is different: `asyn-rs/src/adapter.rs:1228-1231`
+  (`result_to_value` for `"asynOctet"`) builds
+  `EpicsValue::String(String::from_utf8_lossy(&d[..n]))`, so the returned count
+  `n` is the **exact payload byte length** with no separate NUL-terminator
+  convention. Reporting C's `strlen+1` in Rust would feed the framework one extra
+  byte and **embed a spurious NUL** into the delivered String (corrupting every
+  `stringin`/CHAR-waveform VAL). modbus-rs correctly returns `strlen`; the
+  record-visible string content is byte-identical to C. The only C-observable
+  effect of the `+1` is a trailing zero element in a CHAR-waveform `NORD`, which
+  cannot be replicated under the asyn-rs contract without that NUL corruption — a
+  C convention deliberately not copied. (The separate "C always sets
+  `ASYN_EOM_CNT`, asyn-rs synthesises CNT only when the buffer fills" gap is a
+  distinct EOM-reason concern, not this count off-by-one — see R55.)
 
 ### R32 — float→integer saturates instead of C's truncating cast — CLEARED (bf98cffa, intentional divergence)
 - **Severity:** NOTE — intentional-divergence aside, **not a defect**
@@ -258,6 +271,22 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
   interface-typed callbacks for one reason, or (b) modbus-rs registering per-interface reasons.
   **Surface for design sign-off before fixing** (per the structural-fix-needs-sign-off rule); do
   not collapse it into an unrelated commit.
+
+### R55 — readOctet always reports `ASYN_EOM_CNT`; the asyn-rs default only synthesises CNT when the buffer fills
+- **Severity:** CONCERN (EOMR/eom-flag divergence; record string content unaffected)
+- **Rust:** `ioc.rs` `read_octet` returns only a count; the modbus driver does NOT override
+  `io_read_octet_eom`, so it inherits the generic synthesis in `asyn-rs/src/port.rs:1184-1191`
+  which sets `EomReason::CNT` only when `n >= cap` (buffer full) and `empty` otherwise.
+- **C:** `drvModbusAsyn.cpp:1480` sets `*eomReason = ASYN_EOM_CNT` **unconditionally** on every
+  successful P_Data octet read (and the poller callback at `:1921` passes `ASYN_EOM_CNT` too).
+  Modbus reads are register-snapshot reads (always a complete logical message), so C always
+  flags the read complete.
+- **Impact:** a modbus string shorter than the record buffer (the common case) → C reports
+  `ASYN_EOM_CNT`, Rust reports no EOM flag. Observable on `asynRecord.EOMR` and anything keying on
+  the EOM reason. Record VAL/string content is identical. Found while grounding R31.
+- **Disposition:** OPEN — small structural fix (override `io_read_octet_eom` in `ModbusPortDriver`
+  to return `EomReason::CNT` for a successful P_Data octet read, mirroring C). Distinct from R31's
+  count semantics; fix separately.
 
 ---
 

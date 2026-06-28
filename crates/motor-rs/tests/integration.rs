@@ -449,7 +449,11 @@ async fn test_idle_poll_change_detection_suppresses_unchanged_reposts() {
 /// calls `check_completion()` directly and so cannot observe a missing forced
 /// poll. Without the `finalize_motion` request_poll the settle poll is
 /// suppressed, no `io_intr` fires, and the axis stays Idle until the deadline.
-#[tokio::test]
+// current_thread is required: the synchronous drain below is race-free only
+// because the poll-loop task cannot run during it (no await). On a multi_thread
+// runtime the forced poll could fire concurrently mid-drain and be drained,
+// flaking the assertion.
+#[tokio::test(flavor = "current_thread")]
 async fn test_held_jog_resumes_through_poll_loop_after_close_enough() {
     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(SimMotor::new()));
     let mut setup = make_builder(motor).build();
@@ -466,10 +470,11 @@ async fn test_held_jog_resumes_through_poll_loop_after_close_enough() {
     setup.record.process().unwrap();
     setup.device_support.write(&mut setup.record).unwrap();
 
-    // Move SLOWLY (≈40ms over several 5ms polls) so the test loop keeps up with
-    // io_intr and the channel does not back up: a backlog of moving-phase
-    // notifications would give the record free extra passes after completion
-    // and mask the dependency on the forced poll. Lands within RDBD of the
+    // Move at a moderate speed (≈40ms over several 5ms polls) so the loop
+    // traverses genuine moving-phase notifications before completion. Strand
+    // detection does NOT depend on this speed — the Phase-2 drain below is what
+    // prevents a buffered moving-phase io_intr from masking the strand, so a
+    // near-instant move detects it just as reliably. Lands within RDBD of the
     // target (close-enough on arrival).
     setup.record.vel.velo = 50.0;
     setup.record.retry.rdbd = 0.5;
@@ -505,12 +510,14 @@ async fn test_held_jog_resumes_through_poll_loop_after_close_enough() {
     }
     assert!(completed, "the positional move must complete close-enough");
 
-    // Drain any moving-phase io_intr still buffered. This runs synchronously,
-    // before the next await, so the forced poll the completion just requested
-    // (write → StartPolling, serviced by the poll-loop task only at the next
-    // await point) is NOT yet in the channel and is not drained. After this,
-    // the only way a fresh io_intr arrives on the now-stationary, change-gated
-    // axis is that forced poll.
+    // Drain any moving-phase io_intr still buffered (the load-bearing step that
+    // stops a leftover notification from handing the resume a free pass). This
+    // runs synchronously, before the next await, so the forced poll the
+    // completion just requested (write → StartPolling, serviced by the poll-loop
+    // task only at the next await point) is NOT yet in the channel and is not
+    // drained — see the current_thread requirement on the test. After this, the
+    // only way a fresh io_intr arrives on the now-stationary, change-gated axis
+    // is that forced poll.
     while io_intr_rx.try_recv().is_ok() {}
 
     // Phase 2: the held jog must resume. Without the finalize_motion forced

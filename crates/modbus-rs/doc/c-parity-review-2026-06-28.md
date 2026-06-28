@@ -67,15 +67,18 @@ The wire path is byte-faithful to C. Confirmed against C lines actually read:
 
 ## Open Findings
 
-### R1 — read loop aborts on a too-short reply where C re-reads
+### R1 — read loop aborts on a too-short reply where C re-reads — CLEARED (6ed4c056)
 - **Severity:** CONCERN (no wrong wire bytes; noisy/fragmented links only)
-- **Rust:** `driver.rs:550-551` (parse `interpose.rs:188-193`)
+- **Rust:** `transact` (parse `interpose.rs:188-193`)
 - **C:** `modbusInterpose.c:366-369`
 - C's TCP `readIt` loop falls through a successful read with `nbytesActual < 2`
-  and reads again; Rust calls `unwrap_response` on every `Ok(raw)` and propagates
-  `FrameTooShort` via `?`, so a single spurious short read ends the transaction as
-  an I/O error. The txid-mismatch half of the loop *is* reproduced
-  (`stale_frames`, `driver.rs:558-564`); only the short-frame skip is missing.
+  and reads again; Rust called `unwrap_response` on every `Ok(raw)` and propagated
+  `FrameTooShort` via `?`, so a single spurious short read ended the transaction as
+  an I/O error. The txid-mismatch half of the loop *was* reproduced (`stale_frames`).
+- **Fix:** the `Ok(raw)` arm now catches `FrameTooShort` and, for the MBAP-framed links
+  (`Tcp`/`Udp`), re-reads (bounded by the same `MAX_STALE_FRAMES` guard) instead of aborting.
+  RTU/ASCII read once in C, so their short/CRC failures still propagate. Tests
+  `do_modbus_io_skips_too_short_tcp_frame`, `do_modbus_io_rtu_short_frame_errors_without_reread`.
 
 ### R16 — Acknowledge exception (code 5) wrongly increments READ_OK/WRITE_OK — CLEARED (f2361013 do_modbus_io control-flow rewrite, closes R16+R17+R18+R33)
 - **Severity:** DEFECT (wrong statistic value) — corroborated by R33 and the

@@ -369,6 +369,7 @@ Rust-correctly-declines case as an intentional-divergence aside, not a defect).
 - Rust: `src/procserv/child.rs:213-216`; `src/bin/procserv_rs.rs:235-243`
 - C: `processFactory.cc:204`; `processFactory.cc:48-56`
 - Impact: (a) C redundantly calls `setsid()` in the child after `forkpty` (returns EPERM, harmless); Rust correctly skips it since `forkpty` already creates the session — same resulting pgid. (b) `RestartTracker` has no C analog; default `max_restarts = u32::MAX` keeps parity with C's never-give-up. Neither is a parity defect; flagged so they aren't re-reported. (`sidecar.rs` is pure pid/info/log/env file management — C `writePidFile`/`writeInfoFile`/`setEnvVar`/`openLogFile`, not a child-lifecycle counterpart.)
+- Disposition: KEEP (intentional divergence, no code change). (a) Skipping the EPERM-returning `setsid()` yields the same session/pgid C ends up with — copying the redundant call would be copying a no-op. (b) Tracked under PS-41. Recorded so neither is re-reported as a parity defect on later review rounds.
 
 #### PS-43 Default child name was the program basename; C uses the whole command string
 - Severity: DEFECT — CLEARED (1a0a9587)

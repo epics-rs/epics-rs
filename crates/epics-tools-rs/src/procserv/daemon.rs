@@ -3,8 +3,10 @@
 //! Mirrors C `forkAndGo()` (`procServ.cc:870`) and the
 //! `OnSig{Pipe,Term,Hup}` handlers. Concretely:
 //!
-//! 1. **Detach from controlling terminal**: double `fork` + `setsid`
-//!    + `chdir("/")` + redirect 0/1/2 to `/dev/null`.
+//! 1. **Detach from controlling terminal**: double `fork` + `setsid`,
+//!    redirect 0/1/2 to `/dev/null`. Like C `forkAndGo`, it does NOT
+//!    `chdir("/")` — the daemon stays in the launch directory so
+//!    relative paths resolve as C's do.
 //! 2. **Signal forwarding**:
 //!    - `SIGTERM`/`SIGINT` — graceful shutdown
 //!    - `SIGPIPE` — ignored (PTY writes to dead clients raise it)
@@ -18,7 +20,7 @@ use std::os::fd::AsRawFd;
 use nix::fcntl::{OFlag, open};
 use nix::sys::signal::{SigHandler, Signal, signal};
 use nix::sys::stat::Mode;
-use nix::unistd::{ForkResult, chdir, close, dup2, fork, setsid};
+use nix::unistd::{ForkResult, close, dup2, fork, setsid};
 use tokio::sync::oneshot;
 
 use crate::procserv::error::{ProcServError, ProcServResult};
@@ -26,14 +28,15 @@ use crate::procserv::error::{ProcServError, ProcServResult};
 /// Daemonize the current process. Equivalent to C `forkAndGo()`
 /// when `--foreground` is not set.
 ///
-/// Steps (canonical Stevens-style daemonization):
+/// Steps (Stevens-style daemonization, minus the `chdir("/")` C omits):
 /// 1. `fork()`; parent exits, child continues
 /// 2. `setsid()` — child becomes session leader, no controlling tty
 /// 3. Second `fork()` — grandchild can never re-acquire a tty
-/// 4. `chdir("/")` — don't pin a mount
-/// 5. `umask(0)` — clear inherited umask (procserv-rs leaves this
-///    to the caller; matches C procServ which doesn't do it either)
-/// 6. Redirect stdin/stdout/stderr to `/dev/null`
+/// 4. Redirect stdin/stdout/stderr to `/dev/null`
+///
+/// We deliberately do NOT `chdir("/")` (nor `umask(0)`), matching C
+/// `forkAndGo`: the daemon must stay in the launch directory so the
+/// child and relative log/pid/info paths resolve there (procServ PS-15).
 ///
 /// MUST be called BEFORE the tokio runtime starts; otherwise the
 /// runtime's worker threads survive in the parent (they don't
@@ -60,7 +63,13 @@ pub fn fork_and_go() -> ProcServResult<()> {
         ForkResult::Child => {}
     }
 
-    chdir("/").map_err(|e| ProcServError::Forkpty(format!("chdir(/): {e}")))?;
+    // Deliberately NO `chdir("/")`. C `forkAndGo` never chdir's
+    // (procServ.cc:870-912), so the daemon stays in the launch directory.
+    // That is load-bearing: C defaults the child's `chDir` to `myDir` (the
+    // startup cwd, procServ.cc:220-221) and relative log/pid/info paths
+    // resolve against it. chdir-ing to `/` here would break a child started
+    // with a relative `st.cmd` and mis-report the startup directory in the
+    // welcome banner (procServ PS-15).
 
     // Redirect stdin/stdout/stderr to /dev/null.
     let null = open("/dev/null", OFlag::O_RDWR, Mode::empty())

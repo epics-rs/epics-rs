@@ -535,6 +535,16 @@ routes into `plan_absolute_move`. No defect.
   enumerated (`state_machine.rs:63/205/270/315/340/364/708`, `command_planner.rs:867`). The prior unit
   test passed for the wrong reason (called `check_completion()` directly); a real-poll-loop integration
   test now drives the record only on `io_intr` and fails without the forced poll.
+- **Confirming round `01KW5V2`** (3 opus panels) verified the implementation and surfaced one missed
+  family member: the SET-mode pp-resync early-return (`state_machine.rs:401`, reached when
+  `dispatch_res_reanchor` sets `pp=true`+`request_poll` under `SET && !IGSET`) quiesces the axis
+  without `finalize_motion`. Closed in `90d9fd2d` by extracting the predicate into
+  `request_poll_for_held_button` (the single owner of the resume rule) and calling it at both quiescing
+  sites — refactor, not a per-site patch — guarded by `pp_resync_requests_forced_poll_for_held_jog`.
+  Test hardening (`640aa84e`): the unit test now asserts the completion requested the forced poll, and
+  the integration-test rationale was corrected (the Phase-2 drain, not the move speed, is load-bearing;
+  runtime pinned to `current_thread`). Panel A VERIFIED-CORRECT, Panel B TEST SOUND, Panel C 3/4
+  attacks SAFE with the 4th (pp-resync) now closed.
 - **Severity:** CONCERN (monitor-semantics + CPU divergence; not a wrong-value bug). Surfaced by the
   `01KW5QV` confirming round on R61 (the always-on idle poller). Downstream of R61: once the idle
   poller never stops, the unconditional notify path turns "poller alive" into "record processed

@@ -63,6 +63,11 @@ pub fn encode_flat(value: &DecodedValue) -> String {
         DecodedValue::Int32(v) => v.to_string(),
         // C parity: FLAT scalar float publishes `std::to_string(epicsFloat64)`
         // (drvMqtt.cpp:651), specified as sprintf "%f" — always 6 decimals.
+        // Rust's `{:.6}` matches C for every finite value and for ±inf
+        // ("inf"/"-inf"), but prints "NaN" where glibc "%f" prints lowercase
+        // "nan"; normalise the NaN spelling to match C's wire bytes (the
+        // FLOATARRAY path already lowercases via `format_ostream_double`).
+        DecodedValue::Float64(v) if v.is_nan() => "nan".to_string(),
         DecodedValue::Float64(v) => format!("{v:.6}"),
         DecodedValue::UInt32(v) => v.to_string(),
         DecodedValue::String(v) => v.clone(),
